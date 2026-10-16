@@ -110,7 +110,10 @@ CTE/derived column lists, `ORDER BY` expressions and ordinals, `INSERT ... SELEC
 other select items (`SELECT *, total * 2 AS doubled FROM orders`). Wildcard outputs use bare
 column names, as PostgreSQL returns them; only a name that two sources both contribute — `id` in
 `SELECT *` over a join on `id` — is returned as `alias.column`, since one result row cannot
-carry two columns of the same name.
+carry two columns of the same name. For the same reason, when two select items share an output
+name (`SELECT a AS c, b AS c`, or `SELECT *, total FROM orders`), both columns are returned and
+each later one is numbered: `c` and `c_2`, `total` and `total_2`. Unnamed expressions are
+numbered the same way (`expression`, `expression_2`).
 
 ## Joins
 
@@ -193,7 +196,10 @@ and `LIMIT` applied to the distinct rows, as in PostgreSQL.
 
 `GROUP BY` items follow PostgreSQL's resolution: an integer is a select-list ordinal
 (`GROUP BY 1`), and a name that is an output alias but not a source column stands for the aliased
-expression (`SELECT DATE_TRUNC('month', placed_at) AS month … GROUP BY month`). A selected
+expression (`SELECT DATE_TRUNC('month', placed_at) AS month … GROUP BY month`). A name that is
+both an alias and a source column is the source column, as in PostgreSQL and SQLite:
+`SELECT LOWER(status) AS status, COUNT(*) … GROUP BY status` counts each stored spelling of
+`status` separately. Group by the expression (or `GROUP BY 1`) to merge them. A selected
 expression built over a grouping expression is grouped, so `FLOOR(total / 50) * 50` may be
 selected beside `GROUP BY FLOOR(total / 50)`, and `COALESCE(region, 'all')` labels a `ROLLUP`
 total. A grouped column may be spelled bare on one side and qualified on the other

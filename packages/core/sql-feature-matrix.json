@@ -13,6 +13,12 @@
       "example": "SELECT amount AS total FROM rows"
     },
     {
+      "id": "select.repeated-output-name",
+      "status": "supported",
+      "example": "SELECT amount AS v, region AS v FROM rows",
+      "notes": "Two select items may share an output name, including a column repeated beside a wildcard (SELECT *, amount). A result row is keyed by name, so the first keeps the name and each later one is numbered: v and v_2."
+    },
+    {
       "id": "select.all",
       "status": "supported",
       "example": "SELECT ALL region, amount FROM rows",
@@ -1864,7 +1870,7 @@
       "id": "group-by.alias",
       "status": "supported",
       "example": "SELECT COALESCE(region, 'none') AS place, COUNT(*) AS c FROM rows GROUP BY place ORDER BY place",
-      "notes": "A bare GROUP BY name that is an output alias stands for the aliased expression. A name that is both an alias and a source column keeps its source-column meaning, which is also what PostgreSQL does."
+      "notes": "A bare GROUP BY name that is an output alias stands for the aliased expression. A name that is both an alias and a source column is the source column, as in PostgreSQL and SQLite: SELECT LOWER(region) AS region ... GROUP BY region groups by the stored region."
     },
     {
       "id": "group-by.qualified-spelling",

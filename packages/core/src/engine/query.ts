@@ -4030,6 +4030,20 @@ export function integerTypedExpression(
 ): boolean {
   const typed = (candidate: Expression): boolean =>
     integerTypedExpression(candidate, columnInteger, tableIntegerColumns);
+  // PostgreSQL resolves CASE branches and COALESCE-style arguments to one common type, and a
+  // NULL or a placeholder has none of its own: `CASE x WHEN 1 THEN NULL ELSE qty END` is an
+  // integer. At least one value must carry the integer type.
+  const unifiesToInteger = (values: readonly Expression[]): boolean => {
+    let integer = false;
+    for (const value of values) {
+      if (value.kind === "parameter" || (value.kind === "literal" && value.value === null)) {
+        continue;
+      }
+      if (!typed(value)) return false;
+      integer = true;
+    }
+    return integer;
+  };
   switch (expression.kind) {
     case "subquery": {
       // A scalar subquery has the type of its one output, read in the inner block's scope. An
@@ -4080,15 +4094,15 @@ export function integerTypedExpression(
       }
       if (name === "MOD") return args.length === 2 && args.every(typed);
       if (name === "COALESCE" || name === "NULLIF" || name === "GREATEST" || name === "LEAST") {
-        return args.length > 0 && args.every(typed);
+        return unifiesToInteger(args);
       }
       return false;
     }
     case "case":
-      return (
-        expression.branches.every((branch) => typed(branch.then)) &&
-        (expression.otherwise === undefined || typed(expression.otherwise))
-      );
+      return unifiesToInteger([
+        ...expression.branches.map((branch) => branch.then),
+        ...(expression.otherwise === undefined ? [] : [expression.otherwise]),
+      ]);
     default:
       return false;
   }
@@ -8735,42 +8749,30 @@ class Parser {
 
   #selectList(): SelectItem[] {
     const items: SelectItem[] = [];
-    const explicitAliases: boolean[] = [];
     for (;;) {
       const expression = this.#expression();
       let alias = defaultAlias(expression);
-      let explicitAlias = false;
       if (this.#isKeyword("AS")) {
         this.#keyword("AS");
         alias = this.#identifier();
-        explicitAlias = true;
       } else if (this.#bareLabelAhead()) {
         // `SELECT amount total`: a label needs no AS, as in PostgreSQL and SQLite.
         alias = this.#identifier();
-        explicitAlias = true;
       }
       items.push({ expression, alias });
-      explicitAliases.push(explicitAlias);
       if (!this.#punctuation(",")) break;
     }
-    const aliases = new Set<string>();
-    for (const [index, item] of items.entries()) {
+    for (const item of items) {
       if (item.expression.kind === "list") {
         throw new TypeError("A row constructor is only allowed in a comparison or IN list");
       }
-      // A qualified wildcard has no single output name until expansion resolves its columns.
-      if (item.expression.kind === "wildcard" && item.expression.table !== undefined) continue;
-      if (aliases.has(item.alias)) {
-        if (explicitAliases[index] === true) {
-          throw new TypeError(`Duplicate output column: ${item.alias}`);
-        }
-        const base = item.alias;
-        let suffix = 2;
-        while (aliases.has(`${base}_${String(suffix)}`)) suffix++;
-        item.alias = `${base}_${String(suffix)}`;
-      }
-      aliases.add(item.alias);
     }
+    // A qualified wildcard has no single output name until expansion resolves its columns.
+    numberRepeatedOutputs(
+      items.filter(
+        (item) => item.expression.kind !== "wildcard" || item.expression.table === undefined,
+      ),
+    );
     return items;
   }
 
@@ -10454,7 +10456,15 @@ class Parser {
       right: structuredClone(argument),
     });
     const total = aggregate("SUM", argument);
-    const count = aggregate("COUNT", argument);
+    // COUNT is an integer, and over an integer argument so are both sums: left integer-typed, the
+    // two divisions below would truncate as integer `/` does. PostgreSQL computes these in
+    // NUMERIC, so the count is read through a decimal-typed one, which leaves its value alone.
+    const count: Expression = {
+      kind: "binary",
+      operator: "*",
+      left: aggregate("COUNT", argument),
+      right: { kind: "literal", value: 1, decimal: true },
+    };
     // sum(x²) − sum(x)² / n
     const spread: Expression = {
       kind: "binary",
@@ -10742,6 +10752,8 @@ interface SelectBlockParts {
   limitWithTies?: boolean;
   /** GROUP BY GROUPING SETS/ROLLUP/CUBE: the grouping lists to union; groupBy is then unused. */
   groupingSets?: Expression[][];
+  /** GROUP BY ordinals and aliases are already resolved (resolveGroupByReferences). */
+  groupByResolved?: true;
 }
 
 /**
@@ -10930,14 +10942,21 @@ function resolveOrderQualifiers(
  * Resolves GROUP BY items the way PostgreSQL does: an integer literal is a select-list ordinal,
  * and a bare name that is an output alias — but not itself the selected column of that name —
  * stands for the aliased expression. `GROUP BY 1` and `GROUP BY bucket` over
- * `SELECT FLOOR(amount / 25) AS bucket` therefore group by the expression. A name that is both
- * an alias and a source column keeps its source-column meaning, as it does in PostgreSQL.
+ * `SELECT FLOOR(amount / 25) AS bucket` therefore group by the expression.
+ *
+ * A name that is both an alias and an input column is the input column, in PostgreSQL and SQLite
+ * alike: `SELECT LOWER(status) AS status … GROUP BY status` groups by the stored `status`, and
+ * `SELECT 10 AS qty … GROUP BY qty` keeps one row per stored qty. Which names are input columns
+ * needs the source schemas: `sourceHasColumn` answers undefined while a source's columns are
+ * still unknown, and the result is then undefined so the caller holds the block until binding.
  */
 function resolveGroupByReferences(
   groupBy: readonly Expression[],
   select: readonly SelectItem[],
-): Expression[] {
-  return groupBy.map((expression) => {
+  sourceHasColumn: (name: string) => boolean | undefined,
+): Expression[] | undefined {
+  const resolved: Expression[] = [];
+  for (const expression of groupBy) {
     if (expression.kind === "literal" && typeof expression.value === "number") {
       const ordinal = expression.value;
       const item = Number.isInteger(ordinal) ? select[ordinal - 1] : undefined;
@@ -10947,27 +10966,49 @@ function resolveGroupByReferences(
       if (hasAggregate(item.expression) || containsWindow(item.expression)) {
         throw new TypeError("GROUP BY ordinals cannot name an aggregate or window column");
       }
-      return structuredClone(item.expression);
+      resolved.push(structuredClone(item.expression));
+      continue;
     }
-    if (expression.kind !== "column" || expression.reference.includes(".")) return expression;
+    if (expression.kind !== "column" || expression.reference.includes(".")) {
+      resolved.push(expression);
+      continue;
+    }
     const aliased = select.filter((item) => item.alias === expression.reference);
     const item = aliased.length === 1 ? aliased[0] : undefined;
     if (
       item === undefined ||
       item.expression.kind === "wildcard" ||
       hasAggregate(item.expression) ||
-      containsWindow(item.expression)
+      containsWindow(item.expression) ||
+      // `SELECT region … GROUP BY region` names the same column either way.
+      (item.expression.kind === "column" && item.expression.reference === expression.reference)
     ) {
-      return expression;
+      resolved.push(expression);
+      continue;
     }
-    // `SELECT region AS r ... GROUP BY r` groups by region. Were r also a source column,
-    // PostgreSQL would group by that column and then reject the ungrouped region, so reading
-    // the alias never changes an answer PostgreSQL gives.
-    if (item.expression.kind === "column" && item.expression.reference === expression.reference) {
-      return expression;
-    }
-    return structuredClone(item.expression);
-  });
+    const inputColumn = sourceHasColumn(expression.reference);
+    if (inputColumn === undefined) return undefined;
+    resolved.push(inputColumn ? expression : structuredClone(item.expression));
+  }
+  return resolved;
+}
+
+/**
+ * Whether a block's sources expose a column name: true or false once every source's columns are
+ * known, undefined while a base table's columns still wait on the catalog.
+ */
+function sourceColumnPresence(
+  sources: readonly TableSource[],
+  columnsOf: ((tableName: string) => readonly string[] | undefined) | undefined,
+): (name: string) => boolean | undefined {
+  const unknownTable = (): undefined => undefined;
+  const lists = sources.map(
+    (source) => source.columnAliases ?? sourceWildcardColumns(source, columnsOf ?? unknownTable),
+  );
+  return (name) => {
+    if (lists.some((columns) => columns?.includes(name) === true)) return true;
+    return lists.some((columns) => columns === undefined) ? undefined : false;
+  };
 }
 
 /**
@@ -11344,36 +11385,68 @@ function desugarFullJoin(parts: SelectBlockParts, nextSequence: () => number): C
   );
 }
 
+/**
+ * The raw block, held until schema binding expands it and lowers it through assembleSelectBlock
+ * again (bindPendingSelectShapes).
+ */
+function pendingSelectBlock(parts: SelectBlockParts): CompiledQuery {
+  const wildcard = parts.select.some((item) => item.expression.kind === "wildcard");
+  return {
+    sql: parts.sql,
+    base: parts.base,
+    joins: parts.joins,
+    select: parts.select,
+    predicates: parts.predicates,
+    groupBy: parts.groupBy,
+    having: parts.having,
+    orderBy: parts.orderBy,
+    ...(parts.limit === undefined ? {} : { limit: parts.limit }),
+    ...(parts.offset === undefined ? {} : { offset: parts.offset }),
+    ...(parts.limitParameter === undefined ? {} : { limitParameter: parts.limitParameter }),
+    ...(parts.offsetParameter === undefined ? {} : { offsetParameter: parts.offsetParameter }),
+    ...(parts.limitWithTies === true ? { limitWithTies: true } : {}),
+    pendingSelectShape: {
+      distinct: parts.distinct,
+      ...(parts.groupingSets === undefined
+        ? {}
+        : { groupingSets: structuredClone(parts.groupingSets) }),
+    },
+    ...(parts.distinct && wildcard ? { distinctWildcard: true } : {}),
+  };
+}
+
 export function assembleSelectBlock(
   parts: SelectBlockParts,
   nextSequence: () => number,
+  columnsOf?: (tableName: string) => readonly string[] | undefined,
 ): CompiledQuery {
   if (parts.select.some((item) => item.expression.kind === "wildcard")) {
     // A wildcard's width and names come from source schemas, but ordinals, hidden ORDER BY
     // columns, DISTINCT grouping, windows, grouping sets, and FULL JOIN lowering all depend on
     // that width. Preserve the raw block until schema binding instead of teaching each lowering
     // a different late wildcard exception.
-    return {
-      sql: parts.sql,
-      base: parts.base,
-      joins: parts.joins,
-      select: parts.select,
-      predicates: parts.predicates,
-      groupBy: parts.groupBy,
-      having: parts.having,
-      orderBy: parts.orderBy,
-      ...(parts.limit === undefined ? {} : { limit: parts.limit }),
-      ...(parts.offset === undefined ? {} : { offset: parts.offset }),
-      ...(parts.limitParameter === undefined ? {} : { limitParameter: parts.limitParameter }),
-      ...(parts.offsetParameter === undefined ? {} : { offsetParameter: parts.offsetParameter }),
-      ...(parts.limitWithTies === true ? { limitWithTies: true } : {}),
-      pendingSelectShape: {
-        distinct: parts.distinct,
-        ...(parts.groupingSets === undefined
-          ? {}
-          : { groupingSets: structuredClone(parts.groupingSets) }),
-      },
-      ...(parts.distinct ? { distinctWildcard: true } : {}),
+    return pendingSelectBlock(parts);
+  }
+  if (parts.groupByResolved !== true) {
+    const sourceHasColumn = sourceColumnPresence([parts.base, ...parts.joins], columnsOf);
+    const groupBy = resolveGroupByReferences(parts.groupBy, parts.select, sourceHasColumn);
+    const groupingSets = parts.groupingSets?.map((set) =>
+      resolveGroupByReferences(set, parts.select, sourceHasColumn),
+    );
+    if (groupBy === undefined || groupingSets?.includes(undefined) === true) {
+      // A GROUP BY name that is an output alias and may also be an input column: which one it
+      // means waits on the source schemas, as a wildcard's width does.
+      return pendingSelectBlock(parts);
+    }
+    parts = {
+      ...parts,
+      groupBy,
+      ...(groupingSets === undefined
+        ? {}
+        : { groupingSets: groupingSets.filter((set) => set !== undefined) }),
+      // Lowering re-enters this function with these parts (DISTINCT over a grouped block,
+      // grouping-set members); a substituted constant must not be read as an ordinal again.
+      groupByResolved: true,
     };
   }
   parts = {
@@ -11383,14 +11456,6 @@ export function assembleSelectBlock(
       parts.select,
       [parts.base, ...parts.joins].map((source) => source.alias),
     ),
-    groupBy: resolveGroupByReferences(parts.groupBy, parts.select),
-    ...(parts.groupingSets === undefined
-      ? {}
-      : {
-          groupingSets: parts.groupingSets.map((set) =>
-            resolveGroupByReferences(set, parts.select),
-          ),
-        }),
   };
   parts = unifyBlockGroupedReferences(parts);
   if (parts.joins.some((join) => join.full === true)) {
@@ -11842,11 +11907,7 @@ export function bindPendingSelectShapes(
         })),
       );
     });
-    const aliases = new Set<string>();
-    for (const item of items) {
-      if (aliases.has(item.alias)) throw new TypeError(`Duplicate output column: ${item.alias}`);
-      aliases.add(item.alias);
-    }
+    numberRepeatedOutputs(items);
     return items;
   };
 
@@ -11892,6 +11953,7 @@ export function bindPendingSelectShapes(
           ...(pending.groupingSets === undefined ? {} : { groupingSets: pending.groupingSets }),
         },
         nextSequence,
+        columnsOf,
       );
       carryPlanFlags(block, lowered);
     }
@@ -12086,11 +12148,7 @@ function expandQualifiedWildcards(
         };
       });
     });
-    const aliases = new Set<string>();
-    for (const item of block.select) {
-      if (aliases.has(item.alias)) throw new TypeError(`Duplicate output column: ${item.alias}`);
-      aliases.add(item.alias);
-    }
+    numberRepeatedOutputs(block.select);
   };
   const expanded = structuredClone(plan);
   expandBlock(expanded);
@@ -12659,6 +12717,25 @@ export function splitCondition(expression: Expression): Predicate[] {
     ];
   }
   return [{ left: expression, operator: "IS TRUE", right: { kind: "literal", value: null } }];
+}
+
+/**
+ * Numbers every output name that repeats an earlier one: `SELECT a AS c, b AS c` and
+ * `SELECT *, total` are valid in PostgreSQL and SQLite, which both return two columns of the same
+ * name. A result row is an object keyed by name, so the first keeps the name and each later one
+ * becomes `c_2`, `c_3`, … — the rule unnamed expressions (`expression`, `expression_2`) follow.
+ */
+function numberRepeatedOutputs(items: readonly SelectItem[]): void {
+  const aliases = new Set<string>();
+  for (const item of items) {
+    if (aliases.has(item.alias)) {
+      const base = item.alias;
+      let suffix = 2;
+      while (aliases.has(`${base}_${String(suffix)}`)) suffix++;
+      item.alias = `${base}_${String(suffix)}`;
+    }
+    aliases.add(item.alias);
+  }
 }
 
 function defaultAlias(expression: Expression): string {

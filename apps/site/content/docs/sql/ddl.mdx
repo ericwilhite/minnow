@@ -228,7 +228,8 @@ PostgreSQL's `int8` and `NUMERIC` typing of large constants, and writing one to 
 is rejected rather than rounded.
 
 Integer division is PostgreSQL's. When both operands of `/` are integers — integer columns,
-integer constants, `COUNT`, an integer `CAST`, or integer arithmetic and aggregates over them —
+integer constants, `COUNT`, an integer `CAST`, or integer arithmetic and aggregates over them,
+including a `CASE`, `COALESCE`, or `NULLIF` whose non-`NULL` values are all integers —
 the quotient truncates toward zero: `7 / 2` is `3`, `-7 / 2` is `-3`, and `SUM(qty) / COUNT(*)`
 is a whole number. Write `7 / 2.0`, divide by a `DOUBLE PRECISION` or `NUMERIC` column, or cast
 an operand when a fractional quotient is wanted. A bound parameter takes the type of its integer

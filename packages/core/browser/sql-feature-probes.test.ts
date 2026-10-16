@@ -34,6 +34,7 @@ const expectedFeatureIds = [
   "transaction.show-setting",
   "expression.arithmetic",
   "expression.round",
+  "select.repeated-output-name",
   "parameter.positional",
   "predicate.match",
   "predicate.match-star",
@@ -86,7 +87,7 @@ describe("browser SQL feature behavior probes", () => {
   it("keeps the independently authored feature and step populations fixed", () => {
     expect(featureBehaviorProbes.map(({ featureId }) => featureId)).toEqual(expectedFeatureIds);
     expect(new Set(expectedFeatureIds).size).toBe(expectedFeatureIds.length);
-    expect(featureBehaviorProbes.reduce((total, probe) => total + probe.steps.length, 0)).toBe(147);
+    expect(featureBehaviorProbes.reduce((total, probe) => total + probe.steps.length, 0)).toBe(148);
     expect(
       featureBehaviorProbes
         .flatMap(({ steps }) => steps)

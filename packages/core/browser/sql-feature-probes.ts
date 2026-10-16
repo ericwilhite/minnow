@@ -553,6 +553,25 @@ export const featureBehaviorProbes: readonly FeatureBehaviorProbe[] = [
     ],
   },
   {
+    featureId: "select.repeated-output-name",
+    steps: [
+      {
+        kind: "query",
+        sql: "SELECT amount AS v, region AS v FROM rows ORDER BY amount",
+        expected: {
+          columns: ["v", "v_2"],
+          rows: [
+            [3, "east"],
+            [6, "west"],
+            [8, null],
+            [10, "west"],
+          ],
+          ordered: true,
+        },
+      },
+    ],
+  },
+  {
     featureId: "parameter.positional",
     steps: [
       {

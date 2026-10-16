@@ -742,6 +742,18 @@ const templates: Template[] = [
     ordered: false,
     skip: ["sqlite"],
   }),
+  () => ({
+    // Over an INTEGER column both sums and the count are integers, and the variance must still
+    // divide exactly: PostgreSQL computes it in NUMERIC, never with integer `/`.
+    sql: `SELECT VARIANCE(id) AS v, VAR_POP(id) AS vp, STDDEV(id) AS s, STDDEV_POP(id) AS sp FROM data WHERE id % 7 <> 0`,
+    ordered: false,
+    skip: ["sqlite"],
+  }),
+  () => ({
+    sql: `SELECT region, VAR_SAMP(id) AS v, STDDEV_POP(id) AS sp FROM data WHERE region IS NOT NULL GROUP BY region`,
+    ordered: false,
+    skip: ["sqlite"],
+  }),
   (rng) => ({
     // F866 over a column with ties, ordered so the tie set is unambiguous.
     sql: `SELECT region FROM data WHERE region IS NOT NULL ORDER BY region DESC FETCH FIRST ${String(1 + Math.floor(rng() * 3))} ROWS WITH TIES`,
@@ -1502,6 +1514,7 @@ function buildCorpus(seed: number): Case[] {
   corpus.push(...combinationCases());
   corpus.push(...divisionCases());
   corpus.push(...resolutionCases());
+  corpus.push(...groupByPrecedenceCases());
   corpus.push(...jsonSpellingCases());
   corpus.push(...distinctOnCases());
   return corpus;
@@ -1588,6 +1601,55 @@ function divisionCases(): Case[] {
     ordered(`SELECT id, id / 2 AS half FROM data UNION ALL SELECT 9, 9 / 2 ORDER BY id, half`),
     ordered(
       `SELECT id, id % 3 AS remainder, -id % 3 AS neg_remainder, id / 3 * 3 + id % 3 AS rebuilt FROM data ORDER BY id`,
+    ),
+    // A NULL branch has no type of its own, so a CASE, COALESCE, or NULLIF whose other values
+    // are integers is an integer, and `/` over it truncates.
+    ordered(
+      `SELECT id, CASE id WHEN 3 THEN NULL ELSE id END / 2 AS simple, CASE WHEN id > 4 THEN NULL ELSE -id END / 2 AS searched, COALESCE(NULL, id) / 2 AS coalesced, 7 / CASE 1 WHEN 2 THEN NULL ELSE 2 END AS constant FROM data ORDER BY id`,
+    ),
+    ordered(
+      `SELECT id + CASE 42 WHEN id THEN NULL ELSE -id END / 17 AS shifted FROM data GROUP BY id ORDER BY id`,
+    ),
+    ordered(
+      `SELECT COUNT(*) / CASE WHEN COUNT(*) > 0 THEN NULL ELSE 7 END AS none, SUM(id) / CASE MIN(id) WHEN 0 THEN NULL ELSE 7 END AS sevenths FROM data ORDER BY 1`,
+    ),
+  ];
+}
+
+/**
+ * A GROUP BY name that is both an output alias and an input column means the input column, in
+ * PostgreSQL and SQLite alike; an alias that names no input column means the aliased expression.
+ * `LENGTH(label) AS label` collapses labels of equal length, so reading the alias changes counts.
+ */
+function groupByPrecedenceCases(): Case[] {
+  const ordered = (sql: string, skip?: readonly OracleName[]): Case => ({
+    sql,
+    ordered: true,
+    ...(skip === undefined ? {} : { skip }),
+  });
+  return [
+    ordered(`SELECT LENGTH(label) AS label, COUNT(*) AS n FROM data GROUP BY label ORDER BY 1, 2`),
+    ordered(`SELECT LENGTH(label) AS len, COUNT(*) AS n FROM data GROUP BY len ORDER BY 1, 2`),
+    ordered(`SELECT id % 3 AS id, COUNT(*) AS n FROM data GROUP BY id ORDER BY 1, 2`),
+    ordered(`SELECT 10 AS id FROM data GROUP BY id ORDER BY 1`),
+    ordered(`SELECT DISTINCT 10 AS id FROM data GROUP BY id ORDER BY 1`),
+    ordered(`SELECT DISTINCT LENGTH(label) AS label FROM data GROUP BY label ORDER BY 1`),
+    ordered(
+      `SELECT UPPER(region) AS region, LENGTH(label) AS label, COUNT(*) AS n FROM data WHERE region IS NOT NULL GROUP BY region, label ORDER BY 1, 2, 3`,
+    ),
+    ordered(
+      `SELECT LENGTH(label) AS label, COUNT(*) AS n FROM data GROUP BY label HAVING COUNT(*) > 1 ORDER BY 1, 2`,
+    ),
+    // A derived table's columns are known while the query compiles; a table's wait on binding.
+    ordered(
+      `SELECT LENGTH(d.label) AS label, COUNT(*) AS n FROM (SELECT label FROM data) d GROUP BY label ORDER BY 1, 2`,
+    ),
+    ordered(
+      `SELECT LENGTH(d.tag) AS tag, COUNT(*) AS n FROM (SELECT label AS name, label AS tag FROM data) d GROUP BY tag ORDER BY 1, 2`,
+    ),
+    ordered(
+      `SELECT LENGTH(label) AS label, COUNT(*) AS n FROM data GROUP BY ROLLUP(label) ORDER BY 1, 2`,
+      ["sqlite"],
     ),
   ];
 }
@@ -2052,6 +2114,14 @@ function writesData(id: string): boolean {
  * fails for any supported feature that is neither executed nor listed.
  */
 const matrixSkips = new Map<string, { oracles: readonly OracleName[]; reason: string }>([
+  [
+    "select.repeated-output-name",
+    {
+      oracles: ["sqlite", "pglite"],
+      reason:
+        "Both oracles' row objects collapse a repeated name; the repeated-names test compares by position",
+    },
+  ],
   // --- PostgreSQL forms SQLite does not spell -----------------------------------------------
   ["function.char-length", { oracles: ["sqlite"], reason: "SQLite spells it LENGTH" }],
   ["limit.all", { oracles: ["sqlite"], reason: "SQLite has no LIMIT ALL" }],
@@ -2535,6 +2605,93 @@ describe("SQL conformance against SQLite and PGlite", () => {
     240_000,
   );
 
+  it("keeps every select item when output names repeat, as both oracles do", async () => {
+    // PostgreSQL and SQLite both return two columns named `c` for `SELECT a AS c, b AS c`. A
+    // Minnow row is keyed by name, so each later repeat is numbered (`c_2`). Values are compared
+    // by position, since node:sqlite and PGlite row objects would collapse the repeated name.
+    const cases: Array<{ sql: string; columns?: readonly string[] }> = [
+      { sql: `SELECT id AS c, amount AS c FROM data ORDER BY id`, columns: ["c", "c_2"] },
+      { sql: `SELECT 30 AS c, 42 AS c, id FROM data ORDER BY id`, columns: ["c", "c_2", "id"] },
+      { sql: `SELECT id, region AS id, label AS id_2 FROM data ORDER BY 1` },
+      { sql: `SELECT *, amount FROM data ORDER BY id` },
+      { sql: `SELECT amount, * FROM data ORDER BY id` },
+      { sql: `SELECT d.*, d.id FROM data d ORDER BY id` },
+      {
+        sql: `SELECT DISTINCT region AS r, region AS r FROM data WHERE region IS NOT NULL ORDER BY 1`,
+        columns: ["r", "r_2"],
+      },
+      {
+        sql: `SELECT region AS n, COUNT(*) AS n FROM data WHERE region IS NOT NULL GROUP BY region ORDER BY 1`,
+      },
+      { sql: `SELECT * FROM (SELECT id AS c, label AS c FROM data) t ORDER BY 1` },
+      { sql: `SELECT id AS c, id / 2 AS c FROM data UNION ALL SELECT 0, 0 ORDER BY 1, 2` },
+    ];
+    const fixture = buildFixture(DEFAULT_FIXTURE_SEED);
+    const rowTables = rowTablesFor(fixture);
+    const database = await minnowFixture(fixture);
+    const sqlite = sqliteFixture(fixture);
+    const { PGlite } = await import("@electric-sql/pglite");
+    const pg = await PGlite.create();
+    try {
+      await pg.exec(`SET TIME ZONE 'UTC'`);
+      await pg.exec(
+        `CREATE TABLE data ("id" INTEGER PRIMARY KEY, "region" TEXT, "amount" DOUBLE PRECISION, "active" BOOLEAN, "joined" TIMESTAMPTZ, "label" TEXT)`,
+      );
+      for (const row of fixture) {
+        await pg.query(`INSERT INTO data VALUES ($1, $2, $3, $4, $5, $6)`, [
+          row.id,
+          row.region,
+          row.amount,
+          row.active,
+          row.joined,
+          row.label,
+        ]);
+      }
+      const positional = (result: QueryResult): string[] =>
+        result.rows.map((row) =>
+          JSON.stringify(result.columns.map((column) => normalize(row[column]))),
+        );
+      const failures: string[] = [];
+      for (const { sql, columns } of cases) {
+        const vectorized = await database.query(sql);
+        const rowExecutor = executeRowQuery(catalogBoundPlan(sql, undefined), rowTables);
+        const minnowRows = positional(vectorized);
+        if (new Set(vectorized.columns).size !== vectorized.columns.length) {
+          failures.push(`${sql}\n  repeated result key: ${vectorized.columns.join(", ")}`);
+        }
+        if (columns !== undefined && !sameColumns(vectorized.columns, columns)) {
+          failures.push(`${sql}\n  columns: ${vectorized.columns.join(", ")}`);
+        }
+        if (!sameColumns(vectorized.columns, rowExecutor.columns)) {
+          failures.push(`${sql}\n  row executor columns: ${rowExecutor.columns.join(", ")}`);
+        }
+        if (positional(rowExecutor).join("\n") !== minnowRows.join("\n")) {
+          failures.push(
+            `${sql}\n${diffSummary("vectorized vs row", minnowRows, positional(rowExecutor))}`,
+          );
+        }
+        const statement = sqlite.prepare(sql);
+        statement.setReturnArrays(true);
+        const sqliteRows = (statement.all() as unknown as unknown[][]).map((row) =>
+          JSON.stringify(row.map(normalize)),
+        );
+        if (sqliteRows.join("\n") !== minnowRows.join("\n")) {
+          failures.push(`${sql}\n${diffSummary("minnow vs sqlite", minnowRows, sqliteRows)}`);
+        }
+        const pgResult = await pg.query<unknown[]>(sql, [], { rowMode: "array" });
+        const pgRows = pgResult.rows.map((row) => JSON.stringify(row.map(normalize)));
+        if (pgRows.join("\n") !== minnowRows.join("\n")) {
+          failures.push(`${sql}\n${diffSummary("minnow vs pglite", minnowRows, pgRows)}`);
+        }
+      }
+      expect(failures).toEqual([]);
+    } finally {
+      await database.close();
+      sqlite.close();
+      await pg.close();
+    }
+  });
+
   it("agrees with the oracles on every read-only feature the matrix claims", async () => {
     const covered = matrixFeatures.filter(
       (feature) =>
@@ -2630,6 +2787,7 @@ describe("SQL conformance against SQLite and PGlite", () => {
       "predicate.match",
       "predicate.match-parameter",
       "predicate.match-star",
+      "select.repeated-output-name",
       "subquery.correlated-json-aggregate",
       "type.array",
       "type.date",
@@ -2664,24 +2822,26 @@ describe("SQL conformance against SQLite and PGlite", () => {
                   ? ["day", "at"]
                   : feature.id === "function.to-date-timestamp"
                     ? ["day", "at", "epoch"]
-                    : [
-                        {
-                          "aggregate.any-value": "sample",
-                          "aggregate.json": "regions",
-                          "function.trim-multi-character": "trimmed",
-                          "json.arrow": "element",
-                          "json.object": "document",
-                          "json.query": "a",
-                          "predicate.match": "region",
-                          "predicate.match-parameter": "region",
-                          "predicate.match-star": "region",
-                          "type.array": "pair",
-                          "type.date": "day",
-                          "type.exact-numeric": "amount",
-                          "type.interval": "next_day",
-                          "type.json-jsonb": "document",
-                        }[feature.id] ?? "",
-                      ],
+                    : feature.id === "select.repeated-output-name"
+                      ? ["v", "v_2"]
+                      : [
+                          {
+                            "aggregate.any-value": "sample",
+                            "aggregate.json": "regions",
+                            "function.trim-multi-character": "trimmed",
+                            "json.arrow": "element",
+                            "json.object": "document",
+                            "json.query": "a",
+                            "predicate.match": "region",
+                            "predicate.match-parameter": "region",
+                            "predicate.match-star": "region",
+                            "type.array": "pair",
+                            "type.date": "day",
+                            "type.exact-numeric": "amount",
+                            "type.interval": "next_day",
+                            "type.json-jsonb": "document",
+                          }[feature.id] ?? "",
+                        ],
       );
 
       if (feature.id === "function.trim-multi-character") {
@@ -2734,6 +2894,13 @@ describe("SQL conformance against SQLite and PGlite", () => {
         ]);
       } else if (feature.id === "type.array") {
         expect(JSON.parse(String(result.rows[0]?.pair)), feature.id).toEqual([1, 2]);
+      } else if (feature.id === "select.repeated-output-name") {
+        expect(resultKeys(result.rows, false), feature.id).toEqual(
+          resultKeys(
+            matrixRows.map(({ amount, region }) => ({ v: amount, v_2: region })),
+            false,
+          ),
+        );
       } else if (feature.id.startsWith("predicate.match")) {
         expect(result.rows, feature.id).toEqual([{ region: "west" }, { region: "west" }]);
       } else if (feature.id === "function.bm25") {
