@@ -1153,6 +1153,34 @@ describe("vector query execution", () => {
     ]);
   });
 
+  it("filters number arithmetic against a literal exactly as the row executor does", () => {
+    // NULL operands, zero divisors, fractional quotients, negative remainders, signed zeros,
+    // and products that overflow to infinity (and from there to NaN) all have to land exactly
+    // where the per-row evaluator puts them.
+    const rows: DatabaseRow[] = Array.from({ length: 5_000 }, (_, index) => ({
+      a: index % 13 === 0 ? null : (index % 97) - 40,
+      b: index % 17 === 0 ? null : index % 9,
+      c: index % 50 === 0 ? 1e308 : (index % 31) / 4,
+      z: index % 2 === 0 ? -0 : 0,
+    }));
+    const tables = new Map([["rows", rows]]);
+    for (const sql of [
+      "SELECT COUNT(*) AS n FROM rows WHERE a * 2 > 10",
+      "SELECT COUNT(*) AS n FROM rows WHERE a / b >= 3",
+      "SELECT COUNT(*) AS n FROM rows WHERE a % b = 1",
+      "SELECT COUNT(*) AS n FROM rows WHERE a % b < 0",
+      "SELECT COUNT(*) AS n FROM rows WHERE 7 < a + b",
+      "SELECT COUNT(*) AS n FROM rows WHERE c * c * 10 > 1",
+      "SELECT COUNT(*) AS n FROM rows WHERE c * c - c * c <> 0",
+      "SELECT COUNT(*) AS n FROM rows WHERE z * 1 = 0",
+      "SELECT COUNT(*) AS n FROM rows WHERE (a - b) / 2 <= -5 AND b * 3 != 6",
+      "SELECT a, b FROM rows WHERE a * b = 0 ORDER BY a, b LIMIT 20",
+    ]) {
+      const plan = compileQuery(sql);
+      expect(executeQuery(plan, tables), sql).toEqual(executeRowQuery(plan, tables));
+    }
+  });
+
   it("counts distinct numbers exactly through the batch kernel", () => {
     // Small integers differ only in their high float64 word; a table of them, negative and
     // fractional values, both zeros, NULLs, and enough distinct values to grow the slot table

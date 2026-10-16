@@ -427,6 +427,8 @@ interface BoundPredicate {
   readonly primitive?: PrimitiveComparison;
   /** Unboxed membership of a bare numeric/datetime column in a literal list. */
   readonly primitiveIn?: PrimitiveInList;
+  /** Number arithmetic over columns and literals compared against a number literal. */
+  readonly numericExpression?: NumericExpressionComparison;
   /** OR of AND-groups, each group's predicates compiled like any other. */
   readonly disjunction?: BoundDisjunction;
   /**
@@ -461,6 +463,17 @@ interface PrimitiveComparison {
   readonly vector: NumberVector | DateTimeVector | BooleanVector;
   readonly operator: ComparisonOperator;
   /** The literal as a float: numbers as-is, datetimes as epoch millis, booleans as 0/1. */
+  readonly value: number;
+}
+
+/**
+ * `arithmetic <op> number`: the arithmetic is compiled to a closure over raw float64 reads, NaN
+ * standing for anything the closure cannot answer exactly — a NULL operand, a zero divisor, or
+ * a genuine NaN from overflowed operands — which the per-row evaluator then decides.
+ */
+interface NumericExpressionComparison {
+  readonly evaluate: (rowsBySource: readonly Int32Array[], row: number) => number;
+  readonly operator: ComparisonOperator;
   readonly value: number;
 }
 
@@ -1235,12 +1248,20 @@ function bindPlan(
     if (primitive !== undefined) return { ...bound, primitive };
     const primitiveIn = detectPrimitiveInList(bound);
     if (primitiveIn !== undefined) return { ...bound, primitiveIn };
+    const numericExpression = detectNumericExpressionComparison(bound);
+    if (numericExpression !== undefined) return { ...bound, numericExpression };
     const dictionaryPredicate = detectDictionaryPredicate(bound);
     return dictionaryPredicate === undefined ? bound : { ...bound, dictionaryPredicate };
   };
   const predicates = plan.predicates.map((predicate) => {
     const bound = bindPredicate(predicate);
-    if (bound.primitive !== undefined || bound.primitiveIn !== undefined) return bound;
+    if (
+      bound.primitive !== undefined ||
+      bound.primitiveIn !== undefined ||
+      bound.numericExpression !== undefined
+    ) {
+      return bound;
+    }
     if (
       bound.dictionaryEquality !== undefined ||
       bound.dictionaryLike !== undefined ||
@@ -3921,6 +3942,33 @@ function applyPredicateKernel(
   if (predicate.primitiveIn !== undefined) {
     return filterPrimitiveInList(predicate.primitiveIn, batch, selection, survivors);
   }
+  if (predicate.numericExpression !== undefined) {
+    const { evaluate, operator, value: target } = predicate.numericExpression;
+    const rowsBySource = batch.rowsBySource;
+    let kept = 0;
+    for (let index = 0; index < survivors; index += 1) {
+      const row = selection[index] ?? 0;
+      const value = evaluate(rowsBySource, row);
+      const holds =
+        value !== value
+          ? evaluateBatchPredicate(plan, predicate, batch, row)
+          : operator === "="
+            ? value === target
+            : operator === "!=" || operator === "<>"
+              ? value !== target
+              : operator === ">"
+                ? value > target
+                : operator === ">="
+                  ? value >= target
+                  : operator === "<"
+                    ? value < target
+                    : value <= target;
+      if (!holds) continue;
+      selection[kept] = row;
+      kept += 1;
+    }
+    return kept;
+  }
   if (predicate.dictionaryEquality !== undefined) {
     return filterDictionaryEquality(predicate.dictionaryEquality, batch, selection, survivors);
   }
@@ -6591,6 +6639,76 @@ function detectPrimitiveInList(predicate: BoundPredicate): PrimitiveInList | und
     if (member > maximum) maximum = member;
   }
   return { source: predicate.left.source, vector, members, minimum, maximum, negated };
+}
+
+/** Detects `arithmetic <op> number` (either side) over number columns and literals. */
+function detectNumericExpressionComparison(
+  predicate: BoundPredicate,
+): NumericExpressionComparison | undefined {
+  if (!primitiveOperators.has(predicate.operator)) return undefined;
+  const comparison = predicate.operator as ComparisonOperator;
+  const sides = [
+    { expression: predicate.left, literal: predicate.right, operator: comparison },
+    {
+      expression: predicate.right,
+      literal: predicate.left,
+      operator: reverseComparisonOperator(comparison),
+    },
+  ];
+  for (const { expression, literal, operator } of sides) {
+    if (expression.kind !== "binary" || literal.kind !== "literal") continue;
+    if (typeof literal.value !== "number" || !Number.isFinite(literal.value)) continue;
+    const evaluate = compileNumericArithmetic(expression);
+    if (evaluate !== undefined) return { evaluate, operator, value: literal.value };
+  }
+  return undefined;
+}
+
+/**
+ * Number arithmetic as a closure over raw float64 reads, mirroring binaryValue for two numbers:
+ * `/` is NULL on a zero divisor (truncating for integer division) and `%` likewise. NaN stands
+ * for NULL. Undefined for any node that is not a number column, a finite number literal, or
+ * `+ - * / %` of such nodes.
+ */
+function compileNumericArithmetic(
+  expression: BoundExpression,
+): ((rowsBySource: readonly Int32Array[], row: number) => number) | undefined {
+  if (expression.kind === "literal") {
+    const value = expression.value;
+    if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+    return () => value;
+  }
+  if (expression.kind === "column") {
+    const vector = expression.vector;
+    if (vector.kind !== "number") return undefined;
+    const source = expression.source;
+    return (rowsBySource, row) =>
+      rawPrimitiveValue(vector, rowsBySource[source]?.[row] ?? -1) ?? NaN;
+  }
+  if (expression.kind !== "binary") return undefined;
+  const left = compileNumericArithmetic(expression.left);
+  const right = compileNumericArithmetic(expression.right);
+  if (left === undefined || right === undefined) return undefined;
+  const operator = expression.operator as string;
+  if (operator === "+") return (rows, row) => left(rows, row) + right(rows, row);
+  if (operator === "-") return (rows, row) => left(rows, row) - right(rows, row);
+  if (operator === "*") return (rows, row) => left(rows, row) * right(rows, row);
+  if (operator === "/") {
+    if (expression.integer === true) {
+      return (rows, row) => integerQuotient(left(rows, row), right(rows, row)) ?? NaN;
+    }
+    return (rows, row) => {
+      const divisor = right(rows, row);
+      return divisor === 0 ? NaN : left(rows, row) / divisor;
+    };
+  }
+  if (operator === "%") {
+    return (rows, row) => {
+      const divisor = right(rows, row);
+      return divisor === 0 ? NaN : left(rows, row) % divisor;
+    };
+  }
+  return undefined;
 }
 
 function reverseComparisonOperator(operator: ComparisonOperator): ComparisonOperator {
