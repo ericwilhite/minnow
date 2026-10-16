@@ -31,6 +31,7 @@ import {
   VisibleSegmentCursorStaleError,
 } from "./errors.js";
 import { QueryMemoryBudgetError } from "./memory.js";
+import { TYPED_COLUMN_MIN_ROWS } from "./result-wire.js";
 import { compileQuery, compileStatement, type QueryResult } from "./query.js";
 import { column, schema, table, typedTable } from "./schema.js";
 import {
@@ -2901,19 +2902,31 @@ describe("MinnowDatabaseClient", () => {
     channel.port2.start();
     const client = new MinnowDatabaseClient(channel.port2);
     await createPeopleTable(client);
-    await client.insertBatch("people", {
-      columns: {
-        id: [1, 2],
-        name: ["Ada", "Grace"],
-        joined: [new Date("2024-01-02T03:04:05Z"), new Date("2024-06-07T08:09:10Z")],
+    // Enough rows for the bulk form; a smaller result travels as plain arrays (below).
+    const people = Array.from({ length: TYPED_COLUMN_MIN_ROWS }, (_, index) => ({
+      id: index + 1,
+      name: `person ${String(index + 1)}`,
+      joined: new Date(Date.UTC(2024, 0, 1 + index)),
+    }));
+    await client.insertBatch("people", people);
+    const result = await client.query("SELECT id, name, joined FROM people ORDER BY id");
+    expect(result.rows).toEqual(people);
+    expect(transfers).toEqual([true]);
+    // A statement result's rows take the same columnar frame: Kysely reads through execute().
+    const executed = await client.execute("SELECT id, name, joined FROM people ORDER BY id");
+    expect(executed).toEqual({
+      kind: "rows",
+      result: {
+        columns: ["id", "name", "joined"],
+        columnDomains: [null, null, null],
+        rows: people,
       },
     });
-    const result = await client.query("SELECT id, name, joined FROM people ORDER BY id");
-    expect(result.rows).toEqual([
-      { id: 1, name: "Ada", joined: new Date("2024-01-02T03:04:05Z") },
-      { id: 2, name: "Grace", joined: new Date("2024-06-07T08:09:10Z") },
-    ]);
-    expect(transfers).toEqual([true]);
+    expect(transfers).toEqual([true, true]);
+    // A point read has nothing worth transferring.
+    const one = await client.query("SELECT id, name, joined FROM people WHERE id = 2");
+    expect(one.rows).toEqual([people[1]]);
+    expect(transfers).toEqual([true, true]);
     await client.close();
     channel.port1.close();
     channel.port2.close();

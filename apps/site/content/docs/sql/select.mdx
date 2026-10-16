@@ -100,7 +100,11 @@ optional zone after the time, `Z` or an offset in PostgreSQL's spellings (`+00`,
 `+05:30`, with or without a space before it). Text without a zone is UTC. Timestamp inputs and
 `MAKE_TIMESTAMP` validate calendar dates, clock fields, and offsets up to ±15:59.
 Invalid dates such as February 30 throw. Supported calendar years are 1–9999; years below 100
-keep their requested year. Explicit TEXT casts retain text comparison semantics: comparing
+keep their requested year. `DATE` input also accepts a timestamp's text and keeps its day, as
+PostgreSQL does: `'2026-10-15 08:00:00'::date` and `day = '2026-10-15T08:00:00Z'` both read
+2026-10-15. A `DATE` compared with a `TIMESTAMP` value is midnight of its day, so
+`day < TIMESTAMP '2026-10-15 00:00:01'` holds for 2026-10-15; a `Date` bound to a placeholder
+beside a `DATE` column is read as that column's type, a day. Explicit TEXT casts retain text comparison semantics: comparing
 `'1'::TEXT` to the number `1` throws rather than interpreting the text as a number.
 
 `ORDER BY` takes expressions, `ASC` / `DESC`, `NULLS FIRST` / `NULLS LAST`, ordinals, and explicit
@@ -121,7 +125,16 @@ CTE/derived column lists, `ORDER BY` expressions and ordinals, `INSERT ... SELEC
 other select items (`SELECT *, total * 2 AS doubled FROM orders`). Wildcard outputs use bare
 column names, as PostgreSQL returns them; only a name that two sources both contribute — `id` in
 `SELECT *` over a join on `id` — is returned as `alias.column`, since one result row cannot
-carry two columns of the same name.
+carry two columns of the same name. For the same reason, when two select items share an output
+name (`SELECT a AS c, b AS c`, or `SELECT *, total FROM orders`), both columns are returned and
+each later one is numbered: `c` and `c_2`, `total` and `total_2`.
+
+A select item without a label is named the way PostgreSQL names it: a column keeps its name, a
+function call takes the function's name as written (`COUNT(*)` is `count`, `ARRAY_AGG(id)` is
+`array_agg`, `ROW_NUMBER() OVER w` is `row_number`), and a cast takes the name of what it casts
+(`placed_at::date` is `placed_at`, `COUNT(*)::int` is `count`). Any other expression is
+`expression`, numbered like any repeated name (`expression`, `expression_2`), where PostgreSQL
+would say `?column?`.
 
 ## Joins
 
@@ -139,6 +152,12 @@ ORDER BY revenue DESC
 `ON`. Minnow estimates how many rows each side will produce, then orders the joins and builds its
 lookup table from the smaller side. Equality joins can use the unique-key lookup when one side has
 one.
+
+A `USING` or `NATURAL` join merges its join columns, as PostgreSQL and SQLite do: an unqualified
+`customer_id` after `JOIN customers USING (customer_id)` is one column — the left side's value for
+an inner or left join, the right side's for a right join, and the first non-null of the two for a
+full join — and `SELECT *` lists it once, first. A later `USING` may name a column any earlier
+source supplies. The qualified `o.customer_id` and `c.customer_id` still name each side.
 
 A parenthesized join group — `FROM (orders o CROSS JOIN stores s)` — is accepted as the first
 source or as the operand of a comma, `CROSS JOIN`, or `INNER JOIN`, whose `ON` condition then
@@ -204,7 +223,10 @@ and `LIMIT` applied to the distinct rows, as in PostgreSQL.
 
 `GROUP BY` items follow PostgreSQL's resolution: an integer is a select-list ordinal
 (`GROUP BY 1`), and a name that is an output alias but not a source column stands for the aliased
-expression (`SELECT DATE_TRUNC('month', placed_at) AS month … GROUP BY month`). A selected
+expression (`SELECT DATE_TRUNC('month', placed_at) AS month … GROUP BY month`). A name that is
+both an alias and a source column is the source column, as in PostgreSQL and SQLite:
+`SELECT LOWER(status) AS status, COUNT(*) … GROUP BY status` counts each stored spelling of
+`status` separately. Group by the expression (or `GROUP BY 1`) to merge them. A selected
 expression built over a grouping expression is grouped, so `FLOOR(total / 50) * 50` may be
 selected beside `GROUP BY FLOOR(total / 50)`, and `COALESCE(region, 'all')` labels a `ROLLUP`
 total. A grouped column may be spelled bare on one side and qualified on the other

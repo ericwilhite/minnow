@@ -922,7 +922,7 @@ describe("ON CONFLICT", () => {
       database.execute(
         "INSERT INTO people (name, score) VALUES ('x', 1) ON CONFLICT (score) DO NOTHING",
       ),
-    ).rejects.toThrow("unique key column");
+    ).rejects.toThrow("matches no primary key or UNIQUE constraint");
     await database.execute(
       "INSERT INTO people (name, score) VALUES ('Ada', 3) ON CONFLICT (name) DO UPDATE SET score = score + EXCLUDED.score + ?",
       [2],

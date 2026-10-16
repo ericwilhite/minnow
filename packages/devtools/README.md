@@ -17,14 +17,14 @@ The panel can attach to `MinnowDatabase` or `MinnowDatabaseClient`.
 
 - Browse tables and views: columns with their declared SQL types, keys, indexes, foreign keys,
   checks, and triggers.
-- Filter and sort with typed controls, cursor paging, and a live mode that reloads on every
-  commit.
+- Filter and sort with typed controls, cursor paging, and a live mode that updates the loaded
+  rows in place, keeping your scroll position and selection, whenever a commit changes them.
 - Follow a foreign key from a cell to its parent row, or from a row to the rows that reference
   it, and read any row in full beside the grid.
 - Insert, edit, duplicate, and delete rows, with enum and boolean menus, and a confirmation that
   spells out every change first.
 - Run SQL with catalog completion, inline diagnostics, scripts, run-the-selection, a row cap,
-  cancel, and query plans.
+  cancel, query plans, and results you can sort by clicking a header.
 - Copy or download results as CSV, JSON, or INSERT statements; save queries beside the history.
 - Read storage and maintenance statistics, and export or restore database snapshots.
 - Use `permissions: { write: false }` for a read-only panel.

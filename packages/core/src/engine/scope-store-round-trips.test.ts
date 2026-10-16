@@ -76,3 +76,57 @@ it("reads a guarded upsert's pre-images by point read over a long committed hist
   ]);
   await db.close();
 });
+
+it("carries a table's visible segments across its own commits instead of re-proving them", async () => {
+  const { store, calls, reset } = countingStore();
+  const db = new MinnowDatabase(store, { autoCompact: false });
+  await db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, amount INTEGER NOT NULL)");
+  for (let batch = 0; batch < 4; batch += 1) {
+    await db.insertBatch(
+      "items",
+      Array.from({ length: 50 }, (_, index) => ({ id: batch * 50 + index, amount: 0 })),
+    );
+  }
+  for (let index = 0; index < 30; index += 1) {
+    await db.execute("UPDATE items SET amount = amount + 1 WHERE id = ?", [index]);
+  }
+  reset();
+  // Each read-first keyed UPDATE reads the table's visible segments. A commit that retires no
+  // block only adds its own, so the list carries forward: re-proving it asked the store about
+  // every block of every segment on every statement, a cost that grew with the history.
+  for (let index = 0; index < 20; index += 1) {
+    await db.execute("UPDATE items SET amount = amount + 1 WHERE id = ?", [index]);
+  }
+  expect(calls.get("hasManifestBlocks") ?? 0).toBe(0);
+  // The keys an UPDATE writes are the ones its own read returned, so no presence probe follows.
+  expect(calls.get("getExistingUniqueKeys") ?? 0).toBe(0);
+  // A data commit leaves the catalog as it was: the table record, the catalog facts, and the
+  // absence of a key-forwards table all carry across it, rather than being read per statement.
+  expect(calls.get("getTableByName") ?? 0).toBe(0);
+  expect(calls.get("listTables") ?? 0).toBe(0);
+  expect(calls.get("getTable") ?? 0).toBe(0);
+  expect((await db.query("SELECT SUM(amount) AS total FROM items")).rows).toEqual([{ total: 50 }]);
+  await db.close();
+});
+
+it("probes a keyed INSERT's keys and resolves its table once per statement", async () => {
+  const { store, calls, reset } = countingStore();
+  const db = new MinnowDatabase(store, { autoCompact: false });
+  await db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, amount INTEGER NOT NULL)");
+  for (let id = 0; id < 5; id += 1) {
+    await db.execute("INSERT INTO items (id, amount) VALUES (?, 0)", [id]);
+  }
+  reset();
+  for (let id = 5; id < 25; id += 1) {
+    await db.execute("INSERT INTO items (id, amount) VALUES (?, 0)", [id]);
+  }
+  // The statement and the session write ask about the same keys with nothing staged between,
+  // and share one table lookup.
+  expect(calls.get("getExistingUniqueKeys") ?? 0).toBe(20);
+  expect(calls.get("getTableByName") ?? 0).toBeLessThanOrEqual(20);
+  await expect(db.execute("INSERT INTO items (id, amount) VALUES (7, 1)")).rejects.toThrow(
+    /Duplicate/,
+  );
+  expect((await db.query("SELECT COUNT(*) AS n FROM items")).rows).toEqual([{ n: 25 }]);
+  await db.close();
+});

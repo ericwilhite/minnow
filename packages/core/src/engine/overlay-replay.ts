@@ -15,9 +15,17 @@
 import type { SegmentRecord } from "../storage/types.js";
 import type { ColumnVector } from "./vector.js";
 import { maybeYieldToEventLoop } from "../work-slicer.js";
+import { valuesAreAscending } from "./point-read.js";
 
 /** A unique key read straight out of a vector: no per-row string token, no allocation. */
 export type OverlayKey = string | number | boolean;
+
+/**
+ * A scan block is searched per touched key, rather than walked row by row, once it has at least
+ * this many rows per key: about two binary searches' worth of comparisons per key, which keeps
+ * the search cheaper than the walk it replaces.
+ */
+const ASCENDING_SEARCH_ROWS_PER_KEY = 32;
 
 /** "No slot" and "no patch" in the typed arrays below. Slots and locations stay below it. */
 export const OVERLAY_NONE = 0xffffffff;
@@ -872,6 +880,8 @@ export class OverlayReplay extends OverlayKeyState {
   deadCount = 0;
   #minimum = Number.POSITIVE_INFINITY;
   #maximum = Number.NEGATIVE_INFINITY;
+  /** The collected number keys, sorted once for the binary-search replay of ordered blocks. */
+  #ascendingKeys: Float64Array | undefined;
 
   constructor(options: {
     readonly numeric: boolean;
@@ -965,6 +975,39 @@ export class OverlayReplay extends OverlayKeyState {
     const numbers = this.numbers;
     const validity = vector.validity;
     const scans = kind === "insert" || kind === "base" || kind === "upsert";
+    if (
+      scans &&
+      values !== undefined &&
+      numbers !== undefined &&
+      vector.nullCount === 0 &&
+      values.length === rows &&
+      this.size * ASCENDING_SEARCH_ROWS_PER_KEY < rows &&
+      valuesAreAscending(values)
+    ) {
+      // A scan block written in key order, against far fewer touched keys than it has rows:
+      // find each key's rows by binary search instead of probing the key index once per row.
+      // Each key's rows are replayed in row order and keys touch disjoint state, so the result
+      // is exactly the row-by-row walk's.
+      const keys = (this.#ascendingKeys ??= numbers.keys().sort());
+      let from = 0;
+      for (const key of keys) {
+        let low = from;
+        let high = rows;
+        while (low < high) {
+          const middle = (low + high) >>> 1;
+          if ((values[middle] ?? 0) < key) low = middle + 1;
+          else high = middle;
+        }
+        if (low >= rows) break;
+        from = low;
+        if (values[low] !== key) continue;
+        const entry = numbers.find(key, overlayNumberHash(key));
+        for (let row = low; row < rows && values[row] === key; row += 1) {
+          this.#replayScanRow(kind, entry, row, baseSlot, source, locationStart);
+        }
+      }
+      return;
+    }
     for (let row = 0; row < rows; row += 1) {
       let entry: number;
       if (values !== undefined && numbers !== undefined) {
@@ -977,14 +1020,7 @@ export class OverlayReplay extends OverlayKeyState {
       if (entry < 0) continue;
       const slot = this.slot[entry] ?? OVERLAY_NONE;
       if (scans) {
-        if (slot === OVERLAY_NONE) {
-          this.slot[entry] = baseSlot + row;
-        } else if (kind === "upsert") {
-          this.layer(entry, locationStart + row, source);
-          this.#markDead(baseSlot + row);
-        } else {
-          throw new Error(`Stored table contains a duplicate unique key: ${this.#tableName}`);
-        }
+        this.#replayScanRow(kind, entry, row, baseSlot, source, locationStart);
       } else if (kind === "delete") {
         if (slot !== OVERLAY_NONE) {
           this.#markDead(slot);
@@ -998,6 +1034,26 @@ export class OverlayReplay extends OverlayKeyState {
       } else if (!this.#zonePruned) {
         throw new Error(`Update segment references a missing key: ${segmentId}`);
       }
+    }
+  }
+
+  /** One scan row whose key the deltas name: its first appearance is the key's slot. */
+  #replayScanRow(
+    kind: SegmentRecord["kind"],
+    entry: number,
+    row: number,
+    baseSlot: number,
+    source: number,
+    locationStart: number,
+  ): void {
+    const slot = this.slot[entry] ?? OVERLAY_NONE;
+    if (slot === OVERLAY_NONE) {
+      this.slot[entry] = baseSlot + row;
+    } else if (kind === "upsert") {
+      this.layer(entry, locationStart + row, source);
+      this.#markDead(baseSlot + row);
+    } else {
+      throw new Error(`Stored table contains a duplicate unique key: ${this.#tableName}`);
     }
   }
 

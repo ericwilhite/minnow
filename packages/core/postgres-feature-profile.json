@@ -29,6 +29,11 @@
   },
   "overrides": [
     {
+      "id": "select.repeated-output-name",
+      "classification": "different",
+      "reason": "PostgreSQL returns every repeated name as written; Minnow numbers each later repeat (v, v_2) because a result row is an object keyed by column name. The values are the same."
+    },
+    {
       "id": "expression.arithmetic",
       "classification": "different",
       "reason": "Division by zero returns NULL instead of raising PostgreSQL's error. Integer division itself follows PostgreSQL: two integer operands truncate toward zero."

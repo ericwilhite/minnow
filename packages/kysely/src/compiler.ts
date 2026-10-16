@@ -387,8 +387,8 @@ export class MinnowQueryCompiler extends PostgresQueryCompiler {
   protected override visitOnConflict(node: OnConflictNode): void {
     if (node.constraint !== undefined || node.indexExpression !== undefined) {
       throw new TypeError(
-        "Minnow supports ON CONFLICT only with an explicit column target. Name the unique " +
-          "key's columns instead of a constraint or index expression.",
+        "Minnow supports ON CONFLICT only with an explicit column target. Name the columns " +
+          "of the primary key or UNIQUE constraint instead of a constraint or index expression.",
       );
     }
     super.visitOnConflict(node);
@@ -540,12 +540,6 @@ export class MinnowQueryCompiler extends PostgresQueryCompiler {
           "generatedByDefaultAsIdentity().",
       );
     }
-    if (node.ifNotExists === true) {
-      throw new TypeError(
-        "Minnow does not support ADD COLUMN IF NOT EXISTS. Check db.introspection.getTables() " +
-          "for the column first, or declare the schema and let database.migrate() add it.",
-      );
-    }
     if (node.unsigned === true) {
       throw new TypeError(
         "Minnow does not support MySQL's UNSIGNED integers. Use a plain integer column and a " +
@@ -650,12 +644,6 @@ export class MinnowQueryCompiler extends PostgresQueryCompiler {
       );
     }
     for (const alteration of node.columnAlterations ?? []) {
-      if (alteration.kind === "RenameColumnNode") {
-        throw new TypeError(
-          "Minnow does not support ALTER TABLE ... RENAME COLUMN. Add the new column, copy the " +
-            "values with UPDATE, and drop the old column.",
-        );
-      }
       if (alteration.kind === "AlterColumnNode" || alteration.kind === "ModifyColumnNode") {
         throw new TypeError(
           "Minnow does not support altering a column's type, default, or nullability in " +

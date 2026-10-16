@@ -17,13 +17,22 @@ export interface PointReadEquality {
   value: PointReadValue;
 }
 
+/**
+ * Projected columns, "*" for a bare wildcard the catalog expands at execution, or a lone
+ * `COUNT(*)` under its output alias.
+ */
+export type PointReadSelect = Array<{ column: string; alias: string }> | "*" | { count: string };
+
 export interface PointReadShape {
   table: string;
   /** Conjunctive equalities, in predicate order; may repeat a column. */
   equalities: PointReadEquality[];
-  /** Plain column projections, in select order. */
-  /** Projected columns, or "*" for a bare wildcard the catalog expands at execution. */
-  select: Array<{ column: string; alias: string }> | "*";
+  select: PointReadSelect;
+  /**
+   * The statement shape without its values: equality columns and projection. Resolved
+   * per-table read plans are cached under it, so every execution of one statement shares one.
+   */
+  signature?: string;
 }
 
 /** The statement-shaped half of the analysis, computed once per cached plan. */
@@ -32,8 +41,33 @@ interface PointReadTemplate {
   equalities: Array<
     { column: string; value: PointReadValue } | { column: string; parameter: number }
   >;
-  /** Projected columns, or "*" for a bare wildcard the catalog expands at execution. */
-  select: Array<{ column: string; alias: string }> | "*";
+  select: PointReadSelect;
+  signature: string;
+}
+
+/**
+ * The value-free identity of a point read: which columns it pins and what it projects. Two
+ * shapes with one signature over one table resolve to the same columns, blocks, and output.
+ */
+export function pointReadSignature(shape: {
+  readonly table: string;
+  readonly equalities: ReadonlyArray<{ readonly column: string }>;
+  readonly select: PointReadSelect;
+  readonly signature?: string;
+}): string {
+  const select = shape.select;
+  return (
+    shape.signature ??
+    JSON.stringify([
+      shape.table,
+      shape.equalities.map((equality) => equality.column),
+      select === "*"
+        ? "*"
+        : Array.isArray(select)
+          ? select.map((item) => [item.column, item.alias])
+          : { count: select.count },
+    ])
+  );
 }
 
 /**
@@ -120,22 +154,40 @@ function pointReadTemplate(plan: CompiledQuery): PointReadTemplate | undefined {
   ) {
     return undefined;
   }
-  let select: PointReadTemplate["select"] = [];
+  let select: PointReadTemplate["select"];
   const first = plan.select[0];
+  const firstExpression = first?.expression;
   if (
     plan.select.length === 1 &&
-    first?.expression.kind === "wildcard" &&
-    (first.expression.table === undefined || first.expression.table === base.alias)
+    firstExpression?.kind === "wildcard" &&
+    (firstExpression.table === undefined || firstExpression.table === base.alias)
   ) {
     // `SELECT * FROM t WHERE key = ?` is the commonest point lookup; the catalog names the
     // columns when the read is served, in declaration order like the ordinary executor.
     select = "*";
+  } else if (
+    plan.select.length === 1 &&
+    first !== undefined &&
+    firstExpression?.kind === "call" &&
+    firstExpression.name === "COUNT" &&
+    firstExpression.distinct !== true &&
+    (firstExpression.aggregateOrderBy?.length ?? 0) === 0 &&
+    firstExpression.arguments.length === 1 &&
+    firstExpression.arguments[0]?.kind === "wildcard" &&
+    firstExpression.arguments[0].table === undefined &&
+    plan.pendingSelectShape === undefined &&
+    plan.pendingOutputAliases === undefined
+  ) {
+    // `SELECT COUNT(*) FROM t WHERE col = ?` counts the rows the same lookup would return.
+    select = { count: first.alias };
   } else {
+    const columns: Array<{ column: string; alias: string }> = [];
     for (const item of plan.select) {
       const column = baseColumnReference(item.expression, base.alias);
       if (column === undefined) return undefined;
-      select.push({ column, alias: item.alias });
+      columns.push({ column, alias: item.alias });
     }
+    select = columns;
   }
   const equalities: PointReadTemplate["equalities"] = [];
   for (const predicate of plan.predicates) {
@@ -152,7 +204,12 @@ function pointReadTemplate(plan: CompiledQuery): PointReadTemplate | undefined {
     if (operand === undefined || column === undefined) return undefined;
     equalities.push({ column, ...operand });
   }
-  return { table: base.table, equalities, select };
+  return {
+    table: base.table,
+    equalities,
+    select,
+    signature: pointReadSignature({ table: base.table, equalities, select }),
+  };
 }
 
 const templates = new WeakMap<CompiledQuery, PointReadTemplate | null>();
@@ -188,7 +245,12 @@ export function resolvePointReadShape(
     if (value === undefined) return undefined;
     equalities.push({ column: entry.column, value });
   }
-  return { table: template.table, equalities, select: template.select };
+  return {
+    table: template.table,
+    equalities,
+    select: template.select,
+    signature: template.signature,
+  };
 }
 
 const ascendingRuns = new WeakMap<Float64Array, boolean>();

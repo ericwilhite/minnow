@@ -144,8 +144,8 @@ machines: https://minnowdb.com/llms.txt
   `DELETE` statements coalesce into a few segments per table. Chunking only multiplies commits. Worker calls have a 60-second default `requestTimeoutMs` that counts
   silence, not wall time; close has a five-second default silence `timeoutMs` and the same
   ten-timeout absolute cap. An unknown mutation outcome requires reconciliation by durable
-  application ID, never blind replay. Deploy matching client/worker builds (wire protocol 7 in
-  core 0.9.0).
+  application ID, never blind replay. Deploy matching client/worker builds: the wire protocol
+  is versioned and refuses a mismatch on every call.
 - An idle SQL transaction rolls back and rejects subsequent statements with
   `TransactionExpiredError` until explicit `ROLLBACK` or `BEGIN`. The 30-second default counts from
   the connection's last statement, and no other connection's crash, reopen, or maintenance ends
@@ -237,7 +237,8 @@ machines: https://minnowdb.com/llms.txt
   integers and timestamps in FROM, `date - date` (days), `date ± integer`, `timestamp - timestamp`
   (an interval), SIMILAR TO, COLLATE, constant
   JSON_TABLE, the `->`/`->>` JSON operators (which also accept plain JSON text, and error on
-  a non-JSON document), `DISTINCT ON`, `UPDATE … FROM` and `DELETE … USING`, `TRUNCATE`,
+  a non-JSON document), `DISTINCT ON`, `JOIN … USING` and `NATURAL JOIN` with merged join
+  columns, `UPDATE … FROM` and `DELETE … USING`, `TRUNCATE`,
   PostgreSQL's `json_agg`/`json_build_object`/`to_json`/`row_to_json` spellings with a table
   alias as a row value (Kysely's `jsonArrayFrom`/`jsonObjectFrom`), integer division that
   truncates, `GROUP BY` a primary key with the row's other columns ungrouped, case-insensitive
@@ -258,11 +259,12 @@ machines: https://minnowdb.com/llms.txt
   `jsonb_set`/`jsonb_typeof`/`json_object_agg`, `regexp_match` and the other array-returning
   regex functions, `ROW(…)` as a value, bit-string literals, arithmetic between intervals such
   as interval-plus-interval, `AT TIME ZONE`, `version()` and other
-  server introspection, `TABLESAMPLE`, `SET column = DEFAULT` and `SET (a, b) = (…)` in
-  `UPDATE`, data-modifying CTEs, `ALTER TABLE` beyond ADD/DROP COLUMN, `CREATE TABLE … (LIKE …)`,
+  server introspection, `TABLESAMPLE`, `SET (a, b) = (SELECT …)` in `UPDATE`, `RETURNING` a
+  column of an `UPDATE … FROM` or `DELETE … USING` source, data-modifying CTEs, `ALTER TABLE`
+  beyond ADD/RENAME/DROP COLUMN (no table rename), `CREATE TABLE … (LIKE …)`,
   `SERIAL` on a non-key column, `ON UPDATE` actions other than `CASCADE`, `DEFERRABLE`
   foreign keys, partial and
-  expression indexes, `ON CONFLICT` on a non-key UNIQUE column, `DROP TABLE a, b`, view column
+  expression indexes, `ON CONFLICT ON CONSTRAINT`, `DROP TABLE a, b`, view column
   lists and materialized views, `setval`, domains, functions, `EXCLUDE` constraints, schemas,
   schema-qualified names, and `information_schema`, `EXPLAIN`/`VACUUM`/`ANALYZE`, `corr` and
   the other two-argument statistical aggregates, bitwise operators, `bytea`, enum evolution,

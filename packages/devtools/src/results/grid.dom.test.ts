@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createGrid } from "./grid.js";
 
 const rows = Array.from({ length: 6 }, (_, index) => ({ id: index, name: `row ${String(index)}` }));
@@ -104,9 +104,12 @@ describe("header", () => {
     });
     view.setColumns([{ name: "id", type: "number", sortable: true }, { name: "name" }]);
     view.setRows(rows);
-    const header = document.querySelector<HTMLElement>("button.grid-th");
+    const header = document.querySelector<HTMLElement>(".grid-th.sortable");
     const handle = header?.querySelector<HTMLElement>(".grid-resize");
-    if (handle === null || handle === undefined || header === null) throw new Error("no handle");
+    const press = header?.querySelector<HTMLElement>("button.grid-th-label");
+    if (handle === null || handle === undefined || header === null || press == null) {
+      throw new Error("no handle");
+    }
     header.getBoundingClientRect = () => ({ width: 100 }) as DOMRect;
     handle.dispatchEvent(
       new PointerEvent("pointerdown", { button: 0, clientX: 10, clientY: 0, bubbles: true }),
@@ -121,8 +124,159 @@ describe("header", () => {
     expect(rowNode(0).style.gridTemplateColumns).toBe("130px minmax(120px, 260px)");
     expect(onSort).not.toHaveBeenCalled();
     // A press on the header itself still sorts.
-    header.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    press.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     expect(onSort).toHaveBeenCalledWith("id");
+  });
+
+  it("is a columnheader holding a button, so sorting is announced as something to press", () => {
+    const view = createGrid({ onSort: vi.fn() });
+    document.body.append(view.node);
+    view.setColumns([
+      { name: "id", type: "number", sortable: true, sorted: "desc", isKey: true },
+      { name: "name" },
+    ]);
+    const [id, name] = [...document.querySelectorAll<HTMLElement>(".grid-th")];
+    expect(id?.getAttribute("role")).toBe("columnheader");
+    expect(id?.getAttribute("aria-sort")).toBe("descending");
+    expect(id?.querySelector("button")?.getAttribute("aria-label")).toBe(
+      "Sort by id, sorted descending",
+    );
+    expect(name?.querySelector("button")).toBeNull();
+    // A key in the first column is pinned for sideways scrolling, header and cells alike.
+    expect(id?.classList.contains("pinned")).toBe(true);
+  });
+});
+
+/** A grid over `count` rows in a viewport `height` rows tall, scrollable by setting `scrollTop`. */
+function tallGrid(count: number, height: number, deps: Parameters<typeof createGrid>[0] = {}) {
+  const view = createGrid(deps);
+  document.body.append(view.node);
+  const viewport = view.node.querySelector<HTMLElement>(".grid-viewport");
+  if (viewport === null) throw new Error("no viewport");
+  let clientHeight = height * 26;
+  let scrollTop = 0;
+  Object.defineProperty(viewport, "clientHeight", { get: () => clientHeight });
+  Object.defineProperty(viewport, "scrollTop", {
+    get: () => scrollTop,
+    set: (value: number) => {
+      scrollTop = Math.max(0, Math.min(value, count * 26 - clientHeight));
+    },
+  });
+  view.setColumns([
+    { name: "id", type: "number", isKey: true },
+    { name: "name", type: "string" },
+  ]);
+  const data = Array.from({ length: count }, (_, id) => ({ id, name: `row ${String(id)}` }));
+  view.setRows(data);
+  return {
+    view,
+    data,
+    viewport,
+    scrollTo: (top: number) => {
+      viewport.scrollTop = top;
+      view.layout();
+      vi.runAllTimers();
+    },
+    resize: (rows: number) => {
+      clientHeight = rows * 26;
+      view.layout();
+      vi.runAllTimers();
+    },
+  };
+}
+
+/** Rows in view that have no visible node at the right place: a blank gap in the grid. */
+function gaps(viewport: HTMLElement): number[] {
+  const first = Math.floor(viewport.scrollTop / 26);
+  const last = first + Math.ceil(viewport.clientHeight / 26);
+  const rendered = new Map<number, HTMLElement>();
+  for (const node of document.querySelectorAll<HTMLElement>(".grid-row")) {
+    if (!node.hidden) rendered.set(Number(node.dataset.index), node);
+  }
+  const missing: number[] = [];
+  for (let index = first; index < last; index += 1) {
+    const node = rendered.get(index);
+    if (node?.style.transform !== `translateY(${String(index * 26)}px)`) missing.push(index);
+  }
+  return missing;
+}
+
+describe("windowing", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["requestAnimationFrame"] });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("leaves no gap when rows that scrolled past the end of the window scroll back in", () => {
+    // At the end the window is shorter than the ring of pooled nodes, so some are hidden; they
+    // must not still claim the rows they showed, or those rows stay blank when scrolled back to.
+    // Scrolled a little at a time, the way a wheel does, so the rows just above the window are
+    // the ones the hidden nodes last showed.
+    const { viewport, scrollTo } = tallGrid(200, 19);
+    const end = 200 * 26 - 19 * 26;
+    for (let top = 0; top <= end; top += 130) scrollTo(top);
+    scrollTo(end);
+    expect(gaps(viewport)).toEqual([]);
+    for (let top = end; top >= end - 1300; top -= 130) {
+      scrollTo(top);
+      expect(gaps(viewport)).toEqual([]);
+    }
+  });
+
+  it("leaves no gap after the grid was hidden while scrolled and is shown again", () => {
+    // A hidden tab measures 0px tall and reports no scroll; showing it restores both.
+    const { viewport, scrollTo, resize } = tallGrid(200, 19);
+    scrollTo(3000);
+    resize(0);
+    resize(19);
+    expect(gaps(viewport)).toEqual([]);
+  });
+
+  it("replaces rows where they stand, keeping the scroll and the selection by key", () => {
+    const { view, data, viewport, scrollTo } = tallGrid(400, 19);
+    scrollTo(2600);
+    view.setSelected(120);
+    // A live re-read: one row before the selection is gone, so the selected row moved up one.
+    const next = data.filter((row) => row.id !== 10).map((row) => ({ ...row, name: "changed" }));
+    view.replaceRows(next, (row) => String(row.id));
+    expect(viewport.scrollTop).toBe(2600);
+    expect(view.selectedIndexes()).toEqual([119]);
+    expect(view.rowAt(view.selectedIndex() ?? -1)?.id).toBe(120);
+    expect(gaps(viewport)).toEqual([]);
+    expect(document.querySelector('.grid-row[data-index="100"]')?.textContent).toContain("changed");
+  });
+
+  it("is one tab stop, and moves it with the keys, scrolling the row into view", () => {
+    const { viewport } = tallGrid(200, 10);
+    const stops = () => [...document.querySelectorAll<HTMLElement>('.cell[tabindex="0"]')];
+    expect(stops()).toHaveLength(1);
+    const start = stops()[0];
+    start?.focus();
+    const press = (key: string, init: KeyboardEventInit = {}) => {
+      (document.activeElement ?? start)?.dispatchEvent(
+        new KeyboardEvent("keydown", { key, bubbles: true, ...init }),
+      );
+    };
+    press("ArrowRight");
+    press("PageDown");
+    press("PageDown");
+    press("PageDown");
+    const focused = document.activeElement as HTMLElement | null;
+    const row = focused?.closest<HTMLElement>(".grid-row");
+    // A page is the rows in view below the header (which has no height here), less one kept for
+    // context: three pages of nine from row 0.
+    expect(row?.dataset.index).toBe("27");
+    expect(focused?.getAttribute("aria-colindex")).toBe("2");
+    expect(stops()).toEqual([focused]);
+    expect(viewport.scrollTop).toBeGreaterThan(0);
+    press("End", { ctrlKey: true });
+    expect(
+      (document.activeElement as HTMLElement | null)?.closest<HTMLElement>(".grid-row")?.dataset
+        .index,
+    ).toBe("199");
+    expect(gaps(viewport)).toEqual([]);
   });
 });
 

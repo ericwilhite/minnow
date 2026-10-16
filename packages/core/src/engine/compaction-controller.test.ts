@@ -1,11 +1,14 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { CompactionController } from "./compaction-controller.js";
+import { CompactionController, QUIET_COMPACTION_FAILURE_LIMIT } from "./compaction-controller.js";
 import {
+  CompactionJobConflictError,
   OpfsUncertainOutcomeError,
   SchemaConflictError,
   StorageUnresponsiveError,
+  TransactionRecordConflictError,
   type TableRecord,
 } from "../storage/types.js";
+import { TransactionClosedError } from "../transactions/index.js";
 const table = { id: "t", name: "table" } as TableRecord;
 afterEach(() => vi.useRealTimers());
 it("owns retry and debounce timers and drains admitted checks before disposal", async () => {
@@ -201,5 +204,68 @@ it("retries a failed fold on time alone but holds a declined one until the table
   controller.schedule(table, visible.t);
   await controller.drain();
   expect(run).toHaveBeenCalledTimes(4);
+  controller.stop();
+});
+
+it("retries folds that lose the shared job to another connection quietly, unless they never stop", async () => {
+  vi.useFakeTimers();
+  const races = [
+    new CompactionJobConflictError("job", 3, 4),
+    new TransactionRecordConflictError("txn", 5, 6),
+    new TransactionClosedError("txn"),
+  ];
+  let attempt = 0;
+  let outcome: "race" | "fold" = "race";
+  const run = vi.fn(async () => {
+    if (outcome === "fold") return true;
+    const race = races[attempt % races.length] ?? new Error("no race fixture");
+    attempt += 1;
+    throw race;
+  });
+  const report = vi.fn();
+  const controller: CompactionController = new CompactionController({
+    enabled: true,
+    maximumLevelZeroSegments: 256,
+    dropping: () => false,
+    run,
+    check: async () => {
+      controller.schedule(table, 48);
+    },
+    yield: async () => undefined,
+    report,
+  });
+  // One backoff period: exactly the next retry timer fires.
+  const retry = async () => {
+    await vi.advanceTimersToNextTimerAsync();
+    await controller.drain();
+  };
+
+  const losses = async (count: number) => {
+    controller.schedule(table, 48);
+    await controller.drain();
+    for (let index = 1; index < count; index += 1) await retry();
+  };
+
+  // Another connection advanced the job each time: retried on the timer, nothing reported.
+  await losses(QUIET_COMPACTION_FAILURE_LIMIT - 1);
+  expect(run).toHaveBeenCalledTimes(QUIET_COMPACTION_FAILURE_LIMIT - 1);
+  expect(report).not.toHaveBeenCalled();
+
+  // A fold in between proves progress and starts the count again.
+  outcome = "fold";
+  await retry();
+  expect(run).toHaveBeenCalledTimes(QUIET_COMPACTION_FAILURE_LIMIT);
+  expect(controller.retryPending("t")).toBe(false);
+  outcome = "race";
+  await losses(QUIET_COMPACTION_FAILURE_LIMIT - 1);
+  expect(report).not.toHaveBeenCalled();
+
+  // The limit-th loss in a row is a job that is not making progress: the app hears of it.
+  await retry();
+  expect(report).toHaveBeenCalledExactlyOnceWith(
+    races[(attempt - 1) % races.length],
+    `automatic compaction for table (${String(QUIET_COMPACTION_FAILURE_LIMIT)} attempts in a row without progress)`,
+  );
+  expect(controller.retryPending("t")).toBe(true);
   controller.stop();
 });

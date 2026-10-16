@@ -949,6 +949,45 @@ describe("secondary-index SQL", () => {
   }
 
   for (const implementation of implementations()) {
+    // A fold rewrites rows without changing them, but the store refuses any commit that stages
+    // segments for a table without naming each enforced UNIQUE namespace. Folds of a table with
+    // a UNIQUE column were refused outright, and once its level-zero segments reached the
+    // ceiling (4,096 single-row commits) every write to the table was refused as well.
+    it(`${implementation.name} compacts a table with an enforced UNIQUE index`, async () => {
+      const store = await implementation.create();
+      const database = new MinnowDatabase(store, { autoCompact: false });
+      try {
+        await database.execute(
+          "CREATE TABLE compacted_unique (id INTEGER PRIMARY KEY, email TEXT UNIQUE, n INTEGER)",
+        );
+        await database.execute("CREATE UNIQUE INDEX compacted_n ON compacted_unique(n)");
+        for (let row = 0; row < 12; row += 1) {
+          await database.execute(
+            `INSERT INTO compacted_unique VALUES (${String(row)}, 'e${String(row)}', ${String(row)})`,
+          );
+        }
+        await database.execute("UPDATE compacted_unique SET email = NULL WHERE id % 3 = 0");
+        await database.execute("DELETE FROM compacted_unique WHERE id = 4");
+        expect((await database.compactTable("compacted_unique")).compacted).toBe(true);
+        // Membership survives the fold: duplicates are still refused, freed values reusable.
+        await expect(
+          database.execute("INSERT INTO compacted_unique VALUES (100, 'e5', 100)"),
+        ).rejects.toBeInstanceOf(UniqueConstraintError);
+        await expect(
+          database.execute("INSERT INTO compacted_unique VALUES (100, 'e100', 7)"),
+        ).rejects.toBeInstanceOf(UniqueConstraintError);
+        await database.execute("INSERT INTO compacted_unique VALUES (100, 'e0', 4)");
+        expect((await database.query("SELECT COUNT(*) AS n FROM compacted_unique")).rows).toEqual([
+          { n: 12 },
+        ]);
+      } finally {
+        await database.close();
+        store.close();
+      }
+    });
+  }
+
+  for (const implementation of implementations()) {
     it(`${implementation.name} keeps equality/range results correct across every mutation`, async () => {
       const store = await implementation.create();
       const database = new MinnowDatabase(store, { rowsPerBlock: 2 });

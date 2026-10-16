@@ -32,12 +32,12 @@ export interface ConfirmLayer {
 export function createConfirmLayer(): ConfirmLayer {
   const heading = el("h2");
   const facts = el("div", { class: "plate" });
-  const statement = el("div", { class: "plate" });
+  const statement = el("div", { class: "plate statement" });
   const warning = el("div", { class: "dialog-warning" });
   const cancel = button("btn", "Cancel");
   const confirm = button("btn primary", "Confirm");
   const body = el("div", { class: "dialog-body" }, [facts, statement, warning]);
-  const dialog = el("div", { class: "dialog", attrs: { role: "dialog", "aria-modal": "false" } }, [
+  const dialog = el("div", { class: "dialog", attrs: { role: "dialog", "aria-modal": "true" } }, [
     el("div", { class: "dialog-head" }, [heading]),
     body,
     el("div", { class: "dialog-foot" }, [
@@ -54,12 +54,31 @@ export function createConfirmLayer(): ConfirmLayer {
 
   let settle: ((confirmed: boolean) => void) | undefined;
   let returnFocus: HTMLElement | undefined;
+  /** The rest of the panel, made inert while a prompt is open so nothing behind it is reachable. */
+  let silenced: HTMLElement[] = [];
+
+  /**
+   * The prompt is modal to the panel, not to the page: everything else in the panel stops taking
+   * focus and clicks, so Tab cannot wander behind the backdrop and Escape there cannot close the
+   * panel out from under an unanswered question. The host page stays usable.
+   */
+  function silence(on: boolean): void {
+    for (const sibling of silenced) sibling.inert = false;
+    silenced = [];
+    if (!on) return;
+    for (const sibling of node.parentElement?.children ?? []) {
+      if (sibling === node || !(sibling instanceof HTMLElement) || sibling.inert) continue;
+      sibling.inert = true;
+      silenced.push(sibling);
+    }
+  }
 
   function close(confirmed: boolean): void {
     if (settle === undefined) return;
     const resolve = settle;
     settle = undefined;
     node.hidden = true;
+    silence(false);
     resolve(confirmed);
     if (returnFocus?.isConnected === true) returnFocus.focus();
     returnFocus = undefined;
@@ -78,6 +97,12 @@ export function createConfirmLayer(): ConfirmLayer {
     if (event.key === "Escape") {
       event.stopPropagation();
       close(false);
+    }
+    // Two buttons are the only things to reach; Tab cycles between them rather than leaving.
+    if (event.key === "Tab") {
+      event.preventDefault();
+      const root = node.getRootNode() as ShadowRoot | Document;
+      (root.activeElement === cancel ? confirm : cancel).focus();
     }
   });
 
@@ -137,7 +162,16 @@ export function createConfirmLayer(): ConfirmLayer {
         confirm.className = request.destructive === true ? "btn danger" : "btn primary";
 
         node.hidden = false;
-        confirm.focus();
+        silence(true);
+        statement.scrollTop = 0;
+        // Focus moves once the key press that opened the prompt is over. Moved during it, the
+        // rest of that press — an Enter that submitted a form — lands on the button and answers
+        // the prompt before it was ever seen. A destructive prompt starts on Cancel.
+        const mine = settle;
+        const first = request.destructive === true ? cancel : confirm;
+        setTimeout(() => {
+          if (settle === mine) first.focus({ preventScroll: true });
+        }, 0);
       }),
   };
 }

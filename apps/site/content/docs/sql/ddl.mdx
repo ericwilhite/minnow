@@ -148,7 +148,10 @@ CREATE UNIQUE INDEX orders_customer_time ON orders (customer_id, placed_at);
 ```
 
 Composite planning follows the leftmost-prefix rule: equality or `IN` can constrain the leading
-columns, followed by one range (`<`, `<=`, `>`, `>=`) on the next column. `ASC` and `DESC` are part
+columns, followed by one range (`<`, `<=`, `>`, `>=`) on the next column. A case-sensitive `LIKE`
+whose pattern starts with literal text (`email LIKE 'ann%'`) reads that prefix's range of an
+index on a text column, and an `OR` whose every branch an index serves reads the union of their
+candidates. `ASC` and `DESC` are part
 of the physical tuple order. On a keyed table the postings name the matching rows exactly: an
 equality or `IN` lookup visits those rows and no others, and when the indexed table is the
 other side of a join, only those rows are read before the join. Minnow still evaluates the SQL
@@ -228,11 +231,16 @@ PostgreSQL's `int8` and `NUMERIC` typing of large constants, and writing one to 
 is rejected rather than rounded.
 
 Integer division is PostgreSQL's. When both operands of `/` are integers — integer columns,
-integer constants, `COUNT`, an integer `CAST`, or integer arithmetic and aggregates over them —
+integer constants, `COUNT`, an integer `CAST`, or integer arithmetic and aggregates over them,
+including a `CASE`, `COALESCE`, or `NULLIF` whose non-`NULL` values are all integers —
 the quotient truncates toward zero: `7 / 2` is `3`, `-7 / 2` is `-3`, and `SUM(qty) / COUNT(*)`
-is a whole number. Write `7 / 2.0`, divide by a `DOUBLE PRECISION` or `NUMERIC` column, or cast
-an operand when a fractional quotient is wanted. A bound parameter takes the type of its integer
-partner, so `qty / $1` truncates when `$1` is bound to an integer.
+is a whole number. The same holds for functions that return an integer (`LENGTH`, `POSITION`,
+`STRPOS`, `ASCII`, `OCTET_LENGTH`), for `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, and `COUNT`
+windows, for `SUM`, `MIN`, `MAX`, `LAG`, and `FIRST_VALUE` windows over an integer, and for the
+columns of a recursive CTE whose first member selects integers. Write `7 / 2.0`, divide by a
+`DOUBLE PRECISION` or `NUMERIC` column, or cast an operand (`qty / 2::float`) when a fractional
+quotient is wanted. A bound parameter takes the type of its integer partner, so `qty / $1`
+truncates when `$1` is bound to an integer.
 
 Exact decimals never pass through Float64. Precision and scale are enforced on writes, and exact
 comparison, arithmetic, aggregates, windows, grouping, and sorting retain decimal semantics.
@@ -406,7 +414,16 @@ ALTER TABLE orders ADD COLUMN channel TEXT NOT NULL DEFAULT 'web'
 
 An expression default such as `NOW()` is evaluated per write, so it fills only the rows written
 afterwards; a column with one, or with no default at all, is added nullable and the rows already
-stored read `NULL`.
+stored read `NULL`. `ADD COLUMN IF NOT EXISTS` leaves an existing column of that name as it is.
+
+```sql
+ALTER TABLE orders RENAME COLUMN channel TO sales_channel
+```
+
+Renaming a column is a catalog-only step too: stored rows, indexes, keys, and `UNIQUE`
+constraints refer to the column by a stable id and follow it. PostgreSQL also rewrites a `CHECK`,
+generated column, foreign key, trigger, or view that names the column; Minnow refuses the rename
+instead, naming the dependent. Renaming a table (`ALTER TABLE … RENAME TO`) is not supported.
 
 `ALTER TABLE orders DROP COLUMN channel` performs the same guarded metadata step as an explicitly
 authorized schema migration. It refuses the unique key, the last column, and anything a check,

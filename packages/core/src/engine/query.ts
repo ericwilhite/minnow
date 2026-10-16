@@ -1436,6 +1436,8 @@ export type CompiledStatement =
   | {
       kind: "insert";
       table: string;
+      /** `INSERT INTO t AS a`: the name ON CONFLICT and RETURNING may qualify the target by. */
+      alias?: string;
       columns: string[];
       rows: InsertValue[][];
       /** PostgreSQL's one-row `DEFAULT VALUES` form; execution expands it to omitted columns. */
@@ -1614,6 +1616,15 @@ export type CompiledStatement =
       };
       /** Schema migrations may add a proven non-null column by supplying a backfill. */
       allowNonNullableWithBackfill?: boolean;
+      /** ADD COLUMN IF NOT EXISTS: an existing column of that name is left alone. */
+      ifNotExists?: true;
+      parameterCount?: number;
+    }
+  | {
+      kind: "rename-column";
+      table: string;
+      from: string;
+      to: string;
       parameterCount?: number;
     }
   | {
@@ -1838,6 +1849,27 @@ function parseTransactionStatement(keyword: string, tokens: Token[]): CompiledSt
     throw new TypeError("Expected START TRANSACTION");
   }
   return { kind: "transaction", action: action as "begin" | "commit" | "rollback" };
+}
+
+/**
+ * `UPDATE … SET column = DEFAULT`, as the parser leaves it: a reference no identifier can spell,
+ * which execution replaces with the column's catalog default before anything evaluates it. A
+ * path that missed the replacement fails on an unknown column rather than writing a value.
+ */
+export const UPDATE_DEFAULT_MARKER = "\u0000default";
+
+/** Whether an UPDATE assignment is SQL `DEFAULT` rather than an expression. */
+export function isUpdateDefaultAssignment(expression: Expression): boolean {
+  return expression.kind === "column" && expression.reference === UPDATE_DEFAULT_MARKER;
+}
+
+/**
+ * Compiles a stored catalog default — already validated by `validateDefaultExpression` when it
+ * was declared — into the expression an UPDATE's `SET column = DEFAULT` assigns.
+ */
+export function compileDefaultExpression(sql: string): Expression {
+  const parser = new Parser(tokenize(sql), sql);
+  return resolveExactNumericConstants(parser.parseExpression());
 }
 
 /**
@@ -2451,7 +2483,7 @@ export function blockHasSubqueries(plan: CompiledQuery): boolean {
 }
 
 /** True when any `?`/`$n` placeholder remains anywhere in the expression tree. */
-function containsParameter(expression: Expression): boolean {
+export function containsParameter(expression: Expression): boolean {
   if (expression.kind === "parameter") return true;
   if (expression.kind === "subquery" || expression.kind === "exists") {
     return blockHasParameters(expression.block);
@@ -2724,6 +2756,10 @@ function bindBlock(block: CompiledQuery, values: readonly QueryParameter[]): voi
     join.left = bindExpression(join.left, values);
     join.right = bindExpression(join.right, values);
     if (join.on !== undefined) join.on = bindExpression(join.on, values);
+    for (const hint of join.inputHints ?? []) {
+      hint.left = bindExpression(hint.left, values);
+      hint.right = bindExpression(hint.right, values);
+    }
   }
   for (const source of [block.base, ...block.joins]) {
     if (source.derived !== undefined) bindBlock(source.derived, values);
@@ -3672,6 +3708,7 @@ export function createPreparedQuery(
   assertTailParametersBound(plan);
   plan = resolveStatementDatetimes(plan);
   plan = bindPendingSelectShapes(plan, wildcardRowColumns(tables));
+  plan = mergeJoinColumns(plan, wildcardRowColumns(tables));
   plan = unifyPlanGroupedReferences(plan, wildcardRowColumns(tables));
   validateGrouping(plan);
   // The schema-dependent rewrites run before derived sources materialize, because both can
@@ -4209,6 +4246,20 @@ export function integerTypedExpression(
 ): boolean {
   const typed = (candidate: Expression): boolean =>
     integerTypedExpression(candidate, columnInteger, tableIntegerColumns);
+  // PostgreSQL resolves CASE branches and COALESCE-style arguments to one common type, and a
+  // NULL or a placeholder has none of its own: `CASE x WHEN 1 THEN NULL ELSE qty END` is an
+  // integer. At least one value must carry the integer type.
+  const unifiesToInteger = (values: readonly Expression[]): boolean => {
+    let integer = false;
+    for (const value of values) {
+      if (value.kind === "parameter" || (value.kind === "literal" && value.value === null)) {
+        continue;
+      }
+      if (!typed(value)) return false;
+      integer = true;
+    }
+    return integer;
+  };
   switch (expression.kind) {
     case "subquery": {
       // A scalar subquery has the type of its one output, read in the inner block's scope. An
@@ -4260,16 +4311,64 @@ export function integerTypedExpression(
       if (name === "PERCENTILE_DISC" || name === "MODE") {
         return args[0] !== undefined && typed(args[0]);
       }
-      if (name === "MOD") return args.length === 2 && args.every(typed);
+      if (integerResultFunctionNames.has(name)) return true;
+      if (name === "MOD" || name === "GCD" || name === "LCM") {
+        return args.length === 2 && args.every(typed);
+      }
       if (name === "COALESCE" || name === "NULLIF" || name === "GREATEST" || name === "LEAST") {
-        return args.length > 0 && args.every(typed);
+        return unifiesToInteger(args);
       }
       return false;
     }
     case "case":
+      return unifiesToInteger([
+        ...expression.branches.map((branch) => branch.then),
+        ...(expression.otherwise === undefined ? [] : [expression.otherwise]),
+      ]);
+    default:
+      return false;
+  }
+}
+
+/**
+ * Scalar functions PostgreSQL declares as returning `integer` whatever their arguments:
+ * `LENGTH(name) / 2` truncates there and in SQLite. INSTR is POSITION's compiled form.
+ */
+const integerResultFunctionNames: ReadonlySet<string> = new Set([
+  "LENGTH",
+  "OCTET_LENGTH",
+  "INSTR",
+  "STRPOS",
+  "ASCII",
+  "NUM_NULLS",
+  "NUM_NONNULLS",
+  "WIDTH_BUCKET",
+]);
+
+/**
+ * Whether a window column is integer-typed, PostgreSQL's way: the ranking functions and COUNT
+ * always are, and SUM, MIN, MAX and the value functions are when their argument is.
+ */
+function windowIntegerTyped(window: WindowSpec, inputIntegers: ReadonlySet<string>): boolean {
+  switch (window.name) {
+    case "ROW_NUMBER":
+    case "RANK":
+    case "DENSE_RANK":
+    case "NTILE":
+    case "COUNT":
+      return true;
+    case "SUM":
+    case "MIN":
+    case "MAX":
+    case "LAG":
+    case "LEAD":
+    case "FIRST_VALUE":
+    case "LAST_VALUE":
+    case "NTH_VALUE":
       return (
-        expression.branches.every((branch) => typed(branch.then)) &&
-        (expression.otherwise === undefined || typed(expression.otherwise))
+        window.argumentAlias !== undefined &&
+        inputIntegers.has(window.argumentAlias) &&
+        (typeof window.fallback !== "number" || Number.isSafeInteger(window.fallback))
       );
     default:
       return false;
@@ -4366,9 +4465,22 @@ function sourceIntegerColumns(
       : blockIntegerOutputs(first, tableIntegerColumns, source.columnAliases);
   }
   if (source.windowed !== undefined) {
-    return blockIntegerOutputs(source.windowed.block, tableIntegerColumns, source.columnAliases);
+    const inputs = blockIntegerOutputs(
+      source.windowed.block,
+      tableIntegerColumns,
+      source.columnAliases,
+    );
+    if (inputs === true || source.columnAliases !== undefined) return inputs;
+    const outputs = new Set(inputs);
+    for (const window of source.windowed.windows) {
+      if (windowIntegerTyped(window, inputs)) outputs.add(window.alias);
+    }
+    return outputs;
   }
-  if (source.recursive !== undefined) return new Set();
+  if (source.recursive !== undefined) {
+    // A recursive CTE's columns take their types from its non-recursive term.
+    return blockIntegerOutputs(source.recursive.base, tableIntegerColumns, source.columnAliases);
+  }
   return tableIntegerColumns?.(source.table) ?? new Set();
 }
 
@@ -5373,6 +5485,7 @@ export function executeRowQueryInternal(
   assertTailParametersBound(plan);
   plan = resolveStatementDatetimes(plan);
   plan = bindPendingSelectShapes(plan, wildcardRowColumns(tables));
+  plan = mergeJoinColumns(plan, wildcardRowColumns(tables));
   plan = unifyPlanGroupedReferences(plan, wildcardRowColumns(tables));
   validateGrouping(plan);
   plan = expandSourceColumnAliases(plan, wildcardRowColumns(tables));
@@ -5390,7 +5503,7 @@ export function executeRowQueryInternal(
   // executions against different rows.
   plan =
     resolution.plan === plan && planContainsFts(plan, "bm25")
-      ? structuredClone(plan)
+      ? clonePlanTree(plan)
       : resolution.plan;
   tables = resolveDerivedRowTables(plan, tables, memory);
   plan = expandDistinctWildcard(plan, wildcardRowColumns(tables));
@@ -6860,7 +6973,11 @@ function resolveColumn(context: RowContext, reference: string): unknown {
     return context[alias]?.[parts[1] ?? ""];
   }
   const name = parts[0] ?? "";
-  const matches = Object.values(context).filter((row) => row !== undefined && name in row);
+  const rows = Object.values(context);
+  const matches = rows.filter((row) => row !== undefined && name in row);
+  // An outer join's missing side has no row to name its columns; a bare name no present row
+  // has is that side's NULL, as the vectorized executor resolves it from the schema.
+  if (matches.length === 0 && rows.includes(undefined)) return null;
   if (matches.length !== 1) throw new TypeError(`Ambiguous or missing column: ${reference}`);
   return matches[0]?.[name];
 }
@@ -7076,7 +7193,11 @@ export function externalizeQueryResult(result: QueryResult): QueryResult {
 }
 
 /** Gives bare conflict-update columns the target-row meaning SQL assigns them. */
-function rewriteUpsertExpression(expression: Expression, table: string): Expression {
+function rewriteUpsertExpression(
+  expression: Expression,
+  table: string,
+  alias?: string,
+): Expression {
   if (hasAggregate(expression)) {
     throw new TypeError("ON CONFLICT DO UPDATE expressions cannot contain aggregates");
   }
@@ -7087,7 +7208,11 @@ function rewriteUpsertExpression(expression: Expression, table: string): Express
       if (parts.length === 2 && parts[0]?.toUpperCase() === "EXCLUDED") {
         return { ...node, reference: `EXCLUDED.${parts[1] ?? ""}` };
       }
-      if (parts.length === 2 && parts[0]?.toUpperCase() === table.toUpperCase()) {
+      if (
+        parts.length === 2 &&
+        (parts[0]?.toUpperCase() === table.toUpperCase() ||
+          (alias !== undefined && parts[0] === alias))
+      ) {
         return { ...node, reference: `${table}.${parts[1] ?? ""}` };
       }
       return node;
@@ -7910,11 +8035,28 @@ class Parser {
     return { kind: "drop-table", table, ...(ifExists ? { ifExists: true } : {}) };
   }
 
-  /** ALTER TABLE name ADD/DROP [COLUMN] (F031). */
+  /** ALTER TABLE name ADD/DROP [COLUMN] (F031), or RENAME [COLUMN] a TO b. */
   parseAlterTable(): CompiledStatement {
     this.#keyword("ALTER");
     this.#keyword("TABLE");
     const table = this.#identifier();
+    if (this.#isKeyword("RENAME")) {
+      this.#keyword("RENAME");
+      if (this.#isKeyword("TO")) {
+        throw new TypeError(
+          "ALTER TABLE RENAME TO is not supported; create the new table and copy the rows with INSERT … SELECT",
+        );
+      }
+      if (this.#isKeyword("CONSTRAINT")) {
+        throw new TypeError("ALTER TABLE RENAME CONSTRAINT is not supported");
+      }
+      if (this.#isKeyword("COLUMN")) this.#keyword("COLUMN");
+      const from = this.#identifier();
+      this.#keyword("TO");
+      const to = this.#identifier();
+      this.#take("eof");
+      return { kind: "rename-column", table, from, to };
+    }
     if (this.#isKeyword("DROP")) {
       this.#keyword("DROP");
       if (this.#isKeyword("COLUMN")) this.#keyword("COLUMN");
@@ -7941,6 +8083,13 @@ class Parser {
     }
     this.#keyword("ADD");
     if (this.#isKeyword("COLUMN")) this.#keyword("COLUMN");
+    let ifNotExists = false;
+    if (this.#isKeyword("IF")) {
+      this.#keyword("IF");
+      this.#keyword("NOT");
+      this.#keyword("EXISTS");
+      ifNotExists = true;
+    }
     const name = this.#identifier();
     const columnType = this.#columnType();
     let nullable = true;
@@ -7980,6 +8129,7 @@ class Parser {
         ...(backfill === undefined ? {} : { backfill }),
       },
       ...(backfill === undefined ? {} : { allowNonNullableWithBackfill: true }),
+      ...(ifNotExists ? { ifNotExists: true } : {}),
     };
   }
 
@@ -8123,6 +8273,14 @@ class Parser {
     this.#keyword("INSERT");
     this.#keyword("INTO");
     const table = this.#identifier();
+    // PostgreSQL's `INSERT INTO t AS alias`: the name ON CONFLICT and RETURNING may qualify the
+    // target row by. Unlike UPDATE and DELETE, the AS is required, as it is in PostgreSQL.
+    let alias: string | undefined;
+    if (this.#isKeyword("AS")) {
+      this.#keyword("AS");
+      alias = this.#identifier();
+    }
+    const aliased = alias === undefined ? {} : { alias };
     const columns: string[] = [];
     if (this.#punctuation("(")) {
       for (;;) {
@@ -8143,8 +8301,9 @@ class Parser {
         columns,
         rows: [[]],
         defaultValues: true,
-        ...this.#onConflictClause(table),
-        ...this.#returningClause(table),
+        ...aliased,
+        ...this.#onConflictClause(table, alias),
+        ...this.#returningClause(table, alias),
       };
     }
     if (this.#isKeyword("SELECT") || this.#isKeyword("WITH") || this.#peek().text === "(") {
@@ -8172,8 +8331,9 @@ class Parser {
         columns,
         rows: [],
         query,
-        ...this.#onConflictClause(table),
-        ...this.#returningClause(table),
+        ...aliased,
+        ...this.#onConflictClause(table, alias),
+        ...this.#returningClause(table, alias),
       };
     }
     this.#keyword("VALUES");
@@ -8197,12 +8357,16 @@ class Parser {
       table,
       columns,
       rows,
-      ...this.#onConflictClause(table),
-      ...this.#returningClause(table),
+      ...aliased,
+      ...this.#onConflictClause(table, alias),
+      ...this.#returningClause(table, alias),
     };
   }
 
-  #onConflictClause(table: string): {
+  #onConflictClause(
+    table: string,
+    alias?: string,
+  ): {
     onConflict?: {
       column: string;
       columns?: string[];
@@ -8215,6 +8379,11 @@ class Parser {
     if (!this.#isKeyword("ON")) return {};
     this.#keyword("ON");
     this.#keyword("CONFLICT");
+    if (this.#isKeyword("ON")) {
+      throw new TypeError(
+        "ON CONFLICT ON CONSTRAINT is not supported; name the constraint's columns: ON CONFLICT (column, …)",
+      );
+    }
     if (this.#isKeyword("DO")) {
       // PostgreSQL lets DO NOTHING omit the conflict target (any unique key); DO UPDATE has to
       // name one. Kysely's `onConflict((oc) => oc.doNothing())` emits exactly this spelling.
@@ -8259,14 +8428,14 @@ class Parser {
       assigned.add(target);
       assignments.push({
         column: target,
-        expression: rewriteUpsertExpression(this.#expression(), table),
+        expression: rewriteUpsertExpression(this.#expression(), table, alias),
       });
       if (!this.#punctuation(",")) break;
     }
     let where: Expression | undefined;
     if (this.#isKeyword("WHERE")) {
       this.#keyword("WHERE");
-      where = rewriteUpsertExpression(this.#expression(), table);
+      where = rewriteUpsertExpression(this.#expression(), table, alias);
     }
     return {
       onConflict: {
@@ -8330,7 +8499,12 @@ class Parser {
         else if (parts.length === 2 && (parts[0] === table || parts[0] === alias))
           column = parts[1];
         else {
-          throw new TypeError(`RETURNING qualifier must name the target table: ${alias ?? table}`);
+          // PostgreSQL's RETURNING may also read UPDATE … FROM and DELETE … USING sources;
+          // Minnow returns the target's rows only, so say which qualifier was refused.
+          throw new TypeError(
+            `RETURNING qualifier must name the target table: ${alias ?? table} ` +
+              `(RETURNING reads only the target's rows, not ${parts.slice(0, -1).join(".")})`,
+          );
         }
       }
       if (column === undefined || explicit) plain = false;
@@ -8486,16 +8660,42 @@ class Parser {
     this.#keyword("SET");
     const assignments: Array<{ column: string; expression: Expression }> = [];
     for (;;) {
-      const column = this.#mutationTargetColumn(table, alias);
-      this.#operator("=");
-      const expression = this.#expression();
-      if (hasAggregate(expression)) {
-        throw new TypeError("Aggregate functions are not allowed in UPDATE assignments");
+      if (this.#punctuation("(")) {
+        // The row-value form, SET (a, b) = (x, y) or = ROW(x, y): one assignment per column.
+        const columns: string[] = [];
+        for (;;) {
+          columns.push(this.#mutationTargetColumn(table, alias));
+          if (!this.#punctuation(",")) break;
+        }
+        this.#expectPunctuation(")");
+        this.#operator("=");
+        if (this.#isKeyword("ROW")) this.#keyword("ROW");
+        this.#expectPunctuation("(");
+        if (this.#isKeyword("SELECT") || this.#isKeyword("WITH") || this.#isKeyword("VALUES")) {
+          throw new TypeError(
+            "UPDATE SET (columns) = (SELECT …) is not supported; assign each column its own scalar subquery",
+          );
+        }
+        const values: Expression[] = [];
+        for (;;) {
+          values.push(this.#updateAssignmentValue());
+          if (!this.#punctuation(",")) break;
+        }
+        this.#expectPunctuation(")");
+        if (values.length !== columns.length) {
+          throw new TypeError(
+            `UPDATE SET assigns ${String(columns.length)} columns from ${String(values.length)} values`,
+          );
+        }
+        columns.forEach((column, index) => {
+          const expression = values[index];
+          if (expression !== undefined) assignments.push({ column, expression });
+        });
+      } else {
+        const column = this.#mutationTargetColumn(table, alias);
+        this.#operator("=");
+        assignments.push({ column, expression: this.#updateAssignmentValue() });
       }
-      if (containsWindow(expression)) {
-        throw new TypeError("Window functions are not allowed in UPDATE assignments");
-      }
-      assignments.push({ column, expression });
       if (!this.#punctuation(",")) break;
     }
     if (new Set(assignments.map(({ column }) => column)).size !== assignments.length) {
@@ -8512,6 +8712,26 @@ class Parser {
       ...(from === undefined ? {} : { from }),
       ...this.#returningClause(table, alias),
     };
+  }
+
+  /**
+   * One UPDATE assignment's value: an expression, or the bare keyword DEFAULT, which stands for
+   * the column's catalog default and is resolved once the statement meets its table.
+   */
+  #updateAssignmentValue(): Expression {
+    const token = this.#peek();
+    if (token.kind === "identifier" && token.quoted !== true && this.#isKeyword("DEFAULT")) {
+      this.#keyword("DEFAULT");
+      return { kind: "column", reference: UPDATE_DEFAULT_MARKER };
+    }
+    const expression = this.#expression();
+    if (hasAggregate(expression)) {
+      throw new TypeError("Aggregate functions are not allowed in UPDATE assignments");
+    }
+    if (containsWindow(expression)) {
+      throw new TypeError("Window functions are not allowed in UPDATE assignments");
+    }
+    return expression;
   }
 
   /** `FROM sources` after UPDATE's SET list, or `USING sources` after DELETE's target. */
@@ -9195,9 +9415,12 @@ class Parser {
         });
         continue;
       }
-      const condition = this.#isKeyword("USING")
-        ? this.#usingCondition(base.alias, source.alias)
-        : (this.#keyword("ON"), this.#expression());
+      const using = this.#isKeyword("USING") ? this.#usingColumns() : undefined;
+      const condition =
+        using === undefined
+          ? (this.#keyword("ON"), this.#expression())
+          : usingCondition(base.alias, source.alias, using);
+      const merged = using === undefined ? {} : { using };
       if (condition.kind === "condition" && condition.operator === "=") {
         joins.push({
           ...source,
@@ -9205,6 +9428,7 @@ class Parser {
           left: condition.left,
           right: condition.right,
           ...(full ? { full } : {}),
+          ...merged,
         });
       } else {
         // Any other boolean condition becomes a nested-loop join.
@@ -9215,6 +9439,7 @@ class Parser {
           right: { kind: "literal", value: null },
           on: condition,
           ...(full ? { full } : {}),
+          ...merged,
         });
       }
       if (right) {
@@ -9227,16 +9452,19 @@ class Parser {
         }
         const [only] = joins;
         if (only !== undefined) {
-          const { kind: joinKind, left, right: rightSide, ...joinSource } = only;
+          const { kind: joinKind, left, right: rightSide, using, ...joinSource } = only;
           void joinKind;
           const previousBase = base;
           base = joinSource;
+          // The merged USING columns are the right side's values, which is now the base: the
+          // marker stays on the join, whose left owner binding finds in the new base.
           joins[0] = {
             ...previousBase,
             kind: "left",
             left,
             right: rightSide,
             ...(only.on === undefined ? {} : { on: only.on }),
+            ...(using === undefined ? {} : { using }),
           };
         }
       }
@@ -9306,43 +9534,92 @@ class Parser {
 
   #selectList(): SelectItem[] {
     const items: SelectItem[] = [];
-    const explicitAliases: boolean[] = [];
     for (;;) {
+      const start = this.#index;
       const expression = this.#expression();
-      let alias = defaultAlias(expression);
-      let explicitAlias = false;
+      let alias = this.#spelledCallName(start, expression) ?? defaultAlias(expression);
       if (this.#isKeyword("AS")) {
         this.#keyword("AS");
         alias = this.#identifier();
-        explicitAlias = true;
       } else if (this.#bareLabelAhead()) {
         // `SELECT amount total`: a label needs no AS, as in PostgreSQL and SQLite.
         alias = this.#identifier();
-        explicitAlias = true;
       }
       items.push({ expression, alias });
-      explicitAliases.push(explicitAlias);
       if (!this.#punctuation(",")) break;
     }
-    const aliases = new Set<string>();
-    for (const [index, item] of items.entries()) {
+    for (const item of items) {
       if (item.expression.kind === "list") {
         throw new TypeError("A row constructor is only allowed in a comparison or IN list");
       }
-      // A qualified wildcard has no single output name until expansion resolves its columns.
-      if (item.expression.kind === "wildcard" && item.expression.table !== undefined) continue;
-      if (aliases.has(item.alias)) {
-        if (explicitAliases[index] === true) {
-          throw new TypeError(`Duplicate output column: ${item.alias}`);
-        }
-        const base = item.alias;
-        let suffix = 2;
-        while (aliases.has(`${base}_${String(suffix)}`)) suffix++;
-        item.alias = `${base}_${String(suffix)}`;
-      }
-      aliases.add(item.alias);
     }
+    // A qualified wildcard has no single output name until expansion resolves its columns.
+    numberRepeatedOutputs(
+      items.filter(
+        (item) => item.expression.kind !== "wildcard" || item.expression.table === undefined,
+      ),
+    );
     return items;
+  }
+
+  /**
+   * The output name PostgreSQL gives a select item that is one function call: the function's
+   * name as written, whatever the call compiles to. `ARRAY_AGG(id)` is `array_agg`,
+   * `POSITION('a' IN s)` is `position`, `ROW_NUMBER() OVER w` is `row_number`, and
+   * `COUNT(*)::int` is `count`, so a row read by those keys finds its value. Anything after
+   * the call other than FILTER, WITHIN GROUP, OVER, or a `::` cast makes it an expression.
+   */
+  #spelledCallName(start: number, expression: Expression): string | undefined {
+    const head = this.tokens[start];
+    const open = this.tokens[start + 1];
+    if (head?.kind !== "identifier" || open?.kind !== "punctuation" || open.text !== "(") {
+      return undefined;
+    }
+    if (head.quoted !== true && ["CAST", "NOT"].includes(head.text.toUpperCase())) {
+      return undefined;
+    }
+    const end = this.#index;
+    const closing = (index: number): number => {
+      let depth = 0;
+      for (let at = index; at < end; at += 1) {
+        const token = this.tokens[at];
+        if (token?.kind !== "punctuation") continue;
+        if (token.text === "(") depth += 1;
+        else if (token.text === ")" && --depth === 0) return at + 1;
+      }
+      return end + 1;
+    };
+    let at = closing(start + 1);
+    while (at < end) {
+      const token = this.tokens[at];
+      const word = token?.kind === "identifier" && token.quoted !== true ? token.text : "";
+      const next = this.tokens[at + 1];
+      if (word.toUpperCase() === "FILTER" && next?.text === "(") {
+        at = closing(at + 1);
+      } else if (
+        word.toUpperCase() === "WITHIN" &&
+        next?.text.toUpperCase() === "GROUP" &&
+        this.tokens[at + 2]?.text === "("
+      ) {
+        at = closing(at + 2);
+      } else if (word.toUpperCase() === "OVER" && next?.text === "(") {
+        at = closing(at + 1);
+      } else if (word.toUpperCase() === "OVER" && next?.kind === "identifier") {
+        at += 2;
+      } else if (
+        token?.kind === "operator" &&
+        token.text === "::" &&
+        expression.kind === "call" &&
+        expression.name === "CAST"
+      ) {
+        // `::` binds tighter than every operator, so a top-level CAST here casts the call.
+        at = end;
+      } else {
+        return undefined;
+      }
+    }
+    if (at !== end) return undefined;
+    return head.quoted === true ? head.text : head.text.toLowerCase();
   }
 
   /**
@@ -9451,12 +9728,8 @@ class Parser {
     renameBlockOutputs(derived, names, "derived table");
   }
 
-  /**
-   * `JOIN t USING (a, b)`: the named columns must exist on both sides, and the join condition
-   * is their conjunction (F401-04). Unlike the standard, the joined columns still appear once
-   * per side in a `SELECT *`, because this engine names wildcard outputs per source anyway.
-   */
-  #usingCondition(leftAlias: string, rightAlias: string): Expression {
+  /** The column list of `USING (a, b)`. */
+  #usingColumns(): string[] {
     this.#keyword("USING");
     this.#expectPunctuation("(");
     const names: string[] = [];
@@ -9465,19 +9738,7 @@ class Parser {
       if (!this.#punctuation(",")) break;
     }
     this.#expectPunctuation(")");
-    return names
-      .map<Expression>((name) => ({
-        kind: "condition",
-        operator: "=",
-        left: { kind: "column", reference: `${leftAlias}.${name}` },
-        right: { kind: "column", reference: `${rightAlias}.${name}` },
-      }))
-      .reduce((accumulated, condition) => ({
-        kind: "logical",
-        operator: "and",
-        left: accumulated,
-        right: condition,
-      }));
+    return names;
   }
 
   #source(): TableSource {
@@ -9703,7 +9964,7 @@ class Parser {
     const alias = this.#sourceAlias() ?? table;
     const cte = this.#ctes.get(table);
     if (cte !== undefined) {
-      const source = structuredClone(cte);
+      const source = clonePlanTree(cte);
       if (this.#peek().text === "(") {
         this.#expectPunctuation("(");
         this.#applyColumnAliases(source);
@@ -9715,7 +9976,7 @@ class Parser {
       return {
         table: `(recursive ${String(this.nextDerivedSequence())}) ${table}`,
         alias,
-        recursive: structuredClone(recursive),
+        recursive: clonePlanTree(recursive),
       };
     }
     if (this.#peek().text === "(") {
@@ -9815,8 +10076,8 @@ class Parser {
     const pair = (index: number, op: ComparisonOperator): Expression => ({
       kind: "condition",
       operator: op,
-      left: structuredClone(left[index] ?? { kind: "literal", value: null }),
-      right: structuredClone(right[index] ?? { kind: "literal", value: null }),
+      left: clonePlanTree(left[index] ?? { kind: "literal", value: null }),
+      right: clonePlanTree(right[index] ?? { kind: "literal", value: null }),
     });
     if (operator === "=" || operator === "!=" || operator === "<>") {
       const join = operator === "=" ? "and" : "or";
@@ -10022,8 +10283,8 @@ class Parser {
       const rangeOver = (low: Expression, high: Expression): Expression => ({
         kind: "logical",
         operator: "and",
-        left: { kind: "condition", operator: ">=", left: structuredClone(left), right: low },
-        right: { kind: "condition", operator: "<=", left: structuredClone(left), right: high },
+        left: { kind: "condition", operator: ">=", left: clonePlanTree(left), right: low },
+        right: { kind: "condition", operator: "<=", left: clonePlanTree(left), right: high },
       });
       // SYMMETRIC also accepts the bounds reversed.
       const range: Expression = symmetric
@@ -10031,7 +10292,7 @@ class Parser {
             kind: "logical",
             operator: "or",
             left: rangeOver(lower, upper),
-            right: rangeOver(structuredClone(upper), structuredClone(lower)),
+            right: rangeOver(clonePlanTree(upper), clonePlanTree(lower)),
           }
         : rangeOver(lower, upper);
       return negated ? { kind: "not", operand: range } : range;
@@ -10417,7 +10678,7 @@ class Parser {
         let when = this.#expression();
         // The simple form CASE x WHEN v desugars to searched equality comparisons.
         if (operand !== undefined) {
-          when = { kind: "condition", operator: "=", left: structuredClone(operand), right: when };
+          when = { kind: "condition", operator: "=", left: clonePlanTree(operand), right: when };
         }
         this.#keyword("THEN");
         branches.push({ when, then: this.#expression() });
@@ -10598,7 +10859,11 @@ class Parser {
       };
     }
     if ((upper === "TIMESTAMP" || upper === "DATETIME") && this.#peek().kind === "string") {
-      return { kind: "literal", value: timestampLiteral(this.#take("string").text) };
+      return {
+        kind: "literal",
+        value: timestampLiteral(this.#take("string").text),
+        timestamp: true,
+      };
     }
     if (upper === "TIME" && this.#peek().kind === "string") {
       return {
@@ -11107,16 +11372,24 @@ class Parser {
     const aggregate = (fn: AggregateName, operand: Expression): Expression => ({
       kind: "call",
       name: fn,
-      arguments: [structuredClone(operand)],
+      arguments: [clonePlanTree(operand)],
     });
     const squares = aggregate("SUM", {
       kind: "binary",
       operator: "*",
-      left: structuredClone(argument),
-      right: structuredClone(argument),
+      left: clonePlanTree(argument),
+      right: clonePlanTree(argument),
     });
     const total = aggregate("SUM", argument);
-    const count = aggregate("COUNT", argument);
+    // COUNT is an integer, and over an integer argument so are both sums: left integer-typed, the
+    // two divisions below would truncate as integer `/` does. PostgreSQL computes these in
+    // NUMERIC, so the count is read through a decimal-typed one, which leaves its value alone.
+    const count: Expression = {
+      kind: "binary",
+      operator: "*",
+      left: aggregate("COUNT", argument),
+      right: { kind: "literal", value: 1, decimal: true },
+    };
     // sum(x²) − sum(x)² / n
     const spread: Expression = {
       kind: "binary",
@@ -11129,9 +11402,9 @@ class Parser {
           kind: "binary",
           operator: "*",
           left: total,
-          right: structuredClone(total),
+          right: clonePlanTree(total),
         },
-        right: structuredClone(count),
+        right: clonePlanTree(count),
       },
     };
     // Bare VARIANCE and STDDEV are the sample forms, as in PostgreSQL.
@@ -11140,10 +11413,10 @@ class Parser {
       ? {
           kind: "binary",
           operator: "-",
-          left: structuredClone(count),
+          left: clonePlanTree(count),
           right: { kind: "literal", value: 1 },
         }
-      : structuredClone(count);
+      : clonePlanTree(count);
     const variance: Expression = { kind: "binary", operator: "/", left: spread, right: divisor };
     if (name.startsWith("VAR")) return variance;
     return { kind: "call", name: "SQRT", arguments: [variance] };
@@ -11404,6 +11677,8 @@ interface SelectBlockParts {
   limitWithTies?: boolean;
   /** GROUP BY GROUPING SETS/ROLLUP/CUBE: the grouping lists to union; groupBy is then unused. */
   groupingSets?: Expression[][];
+  /** GROUP BY ordinals and aliases are already resolved (resolveGroupByReferences). */
+  groupByResolved?: true;
 }
 
 /**
@@ -11484,12 +11759,12 @@ function desugarGroupingSets(parts: SelectBlockParts, nextSequence: () => number
             return {
               kind: "call",
               name: "NULLIF",
-              arguments: [structuredClone(expression), structuredClone(expression)],
+              arguments: [clonePlanTree(expression), clonePlanTree(expression)],
             };
           }
           return mapChildExpressions(expression, nullify);
         };
-        const nullified = nullify(structuredClone(item.expression));
+        const nullified = nullify(clonePlanTree(item.expression));
         if (away.count === 0) return item;
         return {
           alias: item.alias,
@@ -11501,7 +11776,7 @@ function desugarGroupingSets(parts: SelectBlockParts, nextSequence: () => number
         ...blockParts,
         sql: "(grouping set)",
         select,
-        groupBy: structuredClone(set),
+        groupBy: clonePlanTree(set),
         orderBy: [],
       },
       nextSequence,
@@ -11592,14 +11867,21 @@ function resolveOrderQualifiers(
  * Resolves GROUP BY items the way PostgreSQL does: an integer literal is a select-list ordinal,
  * and a bare name that is an output alias — but not itself the selected column of that name —
  * stands for the aliased expression. `GROUP BY 1` and `GROUP BY bucket` over
- * `SELECT FLOOR(amount / 25) AS bucket` therefore group by the expression. A name that is both
- * an alias and a source column keeps its source-column meaning, as it does in PostgreSQL.
+ * `SELECT FLOOR(amount / 25) AS bucket` therefore group by the expression.
+ *
+ * A name that is both an alias and an input column is the input column, in PostgreSQL and SQLite
+ * alike: `SELECT LOWER(status) AS status … GROUP BY status` groups by the stored `status`, and
+ * `SELECT 10 AS qty … GROUP BY qty` keeps one row per stored qty. Which names are input columns
+ * needs the source schemas: `sourceHasColumn` answers undefined while a source's columns are
+ * still unknown, and the result is then undefined so the caller holds the block until binding.
  */
 function resolveGroupByReferences(
   groupBy: readonly Expression[],
   select: readonly SelectItem[],
-): Expression[] {
-  return groupBy.map((expression) => {
+  sourceHasColumn: (name: string) => boolean | undefined,
+): Expression[] | undefined {
+  const resolved: Expression[] = [];
+  for (const expression of groupBy) {
     if (expression.kind === "literal" && typeof expression.value === "number") {
       const ordinal = expression.value;
       const item = Number.isInteger(ordinal) ? select[ordinal - 1] : undefined;
@@ -11609,27 +11891,49 @@ function resolveGroupByReferences(
       if (hasAggregate(item.expression) || containsWindow(item.expression)) {
         throw new TypeError("GROUP BY ordinals cannot name an aggregate or window column");
       }
-      return structuredClone(item.expression);
+      resolved.push(clonePlanTree(item.expression));
+      continue;
     }
-    if (expression.kind !== "column" || expression.reference.includes(".")) return expression;
+    if (expression.kind !== "column" || expression.reference.includes(".")) {
+      resolved.push(expression);
+      continue;
+    }
     const aliased = select.filter((item) => item.alias === expression.reference);
     const item = aliased.length === 1 ? aliased[0] : undefined;
     if (
       item === undefined ||
       item.expression.kind === "wildcard" ||
       hasAggregate(item.expression) ||
-      containsWindow(item.expression)
+      containsWindow(item.expression) ||
+      // `SELECT region … GROUP BY region` names the same column either way.
+      (item.expression.kind === "column" && item.expression.reference === expression.reference)
     ) {
-      return expression;
+      resolved.push(expression);
+      continue;
     }
-    // `SELECT region AS r ... GROUP BY r` groups by region. Were r also a source column,
-    // PostgreSQL would group by that column and then reject the ungrouped region, so reading
-    // the alias never changes an answer PostgreSQL gives.
-    if (item.expression.kind === "column" && item.expression.reference === expression.reference) {
-      return expression;
-    }
-    return structuredClone(item.expression);
-  });
+    const inputColumn = sourceHasColumn(expression.reference);
+    if (inputColumn === undefined) return undefined;
+    resolved.push(inputColumn ? expression : clonePlanTree(item.expression));
+  }
+  return resolved;
+}
+
+/**
+ * Whether a block's sources expose a column name: true or false once every source's columns are
+ * known, undefined while a base table's columns still wait on the catalog.
+ */
+function sourceColumnPresence(
+  sources: readonly TableSource[],
+  columnsOf: ((tableName: string) => readonly string[] | undefined) | undefined,
+): (name: string) => boolean | undefined {
+  const unknownTable = (): undefined => undefined;
+  const lists = sources.map(
+    (source) => source.columnAliases ?? sourceWildcardColumns(source, columnsOf ?? unknownTable),
+  );
+  return (name) => {
+    if (lists.some((columns) => columns?.includes(name) === true)) return true;
+    return lists.some((columns) => columns === undefined) ? undefined : false;
+  };
 }
 
 /**
@@ -11915,6 +12219,7 @@ function desugarComposedFullJoin(
 }
 
 function desugarFullJoin(parts: SelectBlockParts, nextSequence: () => number): CompiledQuery {
+  if (parts.joins[0]?.using !== undefined) parts = mergeFullJoinUsing(parts);
   const join = parts.joins[0];
   if (parts.joins.length !== 1 || join?.full !== true) {
     throw new TypeError("FULL JOIN is only supported as the sole join");
@@ -12006,36 +12311,79 @@ function desugarFullJoin(parts: SelectBlockParts, nextSequence: () => number): C
   );
 }
 
+/**
+ * The raw block, held until schema binding expands it and lowers it through assembleSelectBlock
+ * again (bindPendingSelectShapes).
+ */
+function pendingSelectBlock(parts: SelectBlockParts): CompiledQuery {
+  const wildcard = parts.select.some((item) => item.expression.kind === "wildcard");
+  return {
+    sql: parts.sql,
+    base: parts.base,
+    joins: parts.joins,
+    select: parts.select,
+    predicates: parts.predicates,
+    groupBy: parts.groupBy,
+    having: parts.having,
+    orderBy: parts.orderBy,
+    ...(parts.limit === undefined ? {} : { limit: parts.limit }),
+    ...(parts.offset === undefined ? {} : { offset: parts.offset }),
+    ...(parts.limitParameter === undefined ? {} : { limitParameter: parts.limitParameter }),
+    ...(parts.offsetParameter === undefined ? {} : { offsetParameter: parts.offsetParameter }),
+    ...(parts.limitWithTies === true ? { limitWithTies: true } : {}),
+    pendingSelectShape: {
+      distinct: parts.distinct,
+      ...(parts.groupingSets === undefined
+        ? {}
+        : { groupingSets: clonePlanTree(parts.groupingSets) }),
+    },
+    ...(parts.distinct && wildcard ? { distinctWildcard: true } : {}),
+  };
+}
+
 export function assembleSelectBlock(
   parts: SelectBlockParts,
   nextSequence: () => number,
+): CompiledQuery {
+  return lowerSelectBlock(parts, nextSequence, undefined);
+}
+
+/**
+ * assembleSelectBlock with the source schemas, when they are known: schema binding passes them so
+ * a GROUP BY name that is both an alias and an input column can resolve.
+ */
+function lowerSelectBlock(
+  parts: SelectBlockParts,
+  nextSequence: () => number,
+  columnsOf: ((tableName: string) => readonly string[] | undefined) | undefined,
 ): CompiledQuery {
   if (parts.select.some((item) => item.expression.kind === "wildcard")) {
     // A wildcard's width and names come from source schemas, but ordinals, hidden ORDER BY
     // columns, DISTINCT grouping, windows, grouping sets, and FULL JOIN lowering all depend on
     // that width. Preserve the raw block until schema binding instead of teaching each lowering
     // a different late wildcard exception.
-    return {
-      sql: parts.sql,
-      base: parts.base,
-      joins: parts.joins,
-      select: parts.select,
-      predicates: parts.predicates,
-      groupBy: parts.groupBy,
-      having: parts.having,
-      orderBy: parts.orderBy,
-      ...(parts.limit === undefined ? {} : { limit: parts.limit }),
-      ...(parts.offset === undefined ? {} : { offset: parts.offset }),
-      ...(parts.limitParameter === undefined ? {} : { limitParameter: parts.limitParameter }),
-      ...(parts.offsetParameter === undefined ? {} : { offsetParameter: parts.offsetParameter }),
-      ...(parts.limitWithTies === true ? { limitWithTies: true } : {}),
-      pendingSelectShape: {
-        distinct: parts.distinct,
-        ...(parts.groupingSets === undefined
-          ? {}
-          : { groupingSets: structuredClone(parts.groupingSets) }),
-      },
-      ...(parts.distinct ? { distinctWildcard: true } : {}),
+    return pendingSelectBlock(parts);
+  }
+  if (parts.groupByResolved !== true) {
+    const sourceHasColumn = sourceColumnPresence([parts.base, ...parts.joins], columnsOf);
+    const groupBy = resolveGroupByReferences(parts.groupBy, parts.select, sourceHasColumn);
+    const groupingSets = parts.groupingSets?.map((set) =>
+      resolveGroupByReferences(set, parts.select, sourceHasColumn),
+    );
+    if (groupBy === undefined || groupingSets?.includes(undefined) === true) {
+      // A GROUP BY name that is an output alias and may also be an input column: which one it
+      // means waits on the source schemas, as a wildcard's width does.
+      return pendingSelectBlock(parts);
+    }
+    parts = {
+      ...parts,
+      groupBy,
+      ...(groupingSets === undefined
+        ? {}
+        : { groupingSets: groupingSets.filter((set) => set !== undefined) }),
+      // Lowering re-enters this function with these parts (DISTINCT over a grouped block,
+      // grouping-set members); a substituted constant must not be read as an ordinal again.
+      groupByResolved: true,
     };
   }
   parts = {
@@ -12045,14 +12393,6 @@ export function assembleSelectBlock(
       parts.select,
       [parts.base, ...parts.joins].map((source) => source.alias),
     ),
-    groupBy: resolveGroupByReferences(parts.groupBy, parts.select),
-    ...(parts.groupingSets === undefined
-      ? {}
-      : {
-          groupingSets: parts.groupingSets.map((set) =>
-            resolveGroupByReferences(set, parts.select),
-          ),
-        }),
   };
   parts = unifyBlockGroupedReferences(parts);
   if (parts.joins.some((join) => join.full === true)) {
@@ -12268,7 +12608,7 @@ export function expandViewSources(
       if (source.derived !== undefined || source.union !== undefined) continue;
       const body = viewFor(source.table);
       if (body === undefined) continue;
-      const expanded = structuredClone(body);
+      const expanded = clonePlanTree(body);
       expandBlock(expanded, depth + 1);
       Object.assign(source, derivedTableSource(expanded, source.alias, nextSequence));
     }
@@ -12276,7 +12616,7 @@ export function expandViewSources(
       expandBlock(inner, depth);
     });
   };
-  const resolved = structuredClone(plan);
+  const resolved = clonePlanTree(plan);
   expandBlock(resolved, 0);
   return resolved;
 }
@@ -12416,7 +12756,7 @@ export function bindPendingSelectShapes(
   columnsOf: (tableName: string) => readonly string[] | undefined,
 ): CompiledQuery {
   if (!planHasPendingSelectShapes(plan)) return plan;
-  const bound = structuredClone(plan);
+  const bound = clonePlanTree(plan);
   const preserveUnoptimizedShape = bound.preserveUnoptimizedShape === true;
   delete bound.preserveUnoptimizedShape;
   let sequence = 0;
@@ -12477,6 +12817,11 @@ export function bindPendingSelectShapes(
     if (unknown !== undefined) {
       throw new TypeError(`SELECT * requires known columns for: ${unknown.source.table}`);
     }
+    const merged = mergedWildcardColumns(
+      block,
+      (source) => source.columnAliases ?? sourceWildcardColumns(source, columnsOf),
+    );
+    if (merged !== undefined) return mergedWildcardSelect(block, merged, shaped);
     // Wildcard outputs keep their bare column names, as PostgreSQL returns them; only a name
     // that two sources both contribute (`SELECT *` over a join on `id`) is alias-qualified, since
     // a result row cannot carry two columns named `id`.
@@ -12504,11 +12849,7 @@ export function bindPendingSelectShapes(
         })),
       );
     });
-    const aliases = new Set<string>();
-    for (const item of items) {
-      if (aliases.has(item.alias)) throw new TypeError(`Duplicate output column: ${item.alias}`);
-      aliases.add(item.alias);
-    }
+    numberRepeatedOutputs(items);
     return items;
   };
 
@@ -12535,7 +12876,7 @@ export function bindPendingSelectShapes(
       void pendingSelectShape;
       void pendingOutputAliases;
       void distinctWildcard;
-      lowered = assembleSelectBlock(
+      lowered = lowerSelectBlock(
         {
           sql: rest.sql,
           base: rest.base,
@@ -12554,6 +12895,7 @@ export function bindPendingSelectShapes(
           ...(pending.groupingSets === undefined ? {} : { groupingSets: pending.groupingSets }),
         },
         nextSequence,
+        columnsOf,
       );
       carryPlanFlags(block, lowered);
     }
@@ -12639,7 +12981,7 @@ export function expandNaturalJoins(
       }));
     });
   };
-  const expanded = structuredClone(plan);
+  const expanded = clonePlanTree(plan);
   expandBlock(expanded);
   return expanded;
 }
@@ -12670,7 +13012,7 @@ export function expandSourceColumnAliases(
     }
     // The projection reads from the source exactly as it stands — which for an expanded view is
     // a derived block, not a table name — so the rename wraps it rather than replacing it.
-    const inner: TableSource = structuredClone(source);
+    const inner: TableSource = clonePlanTree(source);
     delete inner.columnAliases;
     const projection: CompiledQuery = {
       sql: "(column aliases)",
@@ -12697,7 +13039,7 @@ export function expandSourceColumnAliases(
     forEachNestedBlock(block, renameBlock);
     for (const source of [block.base, ...block.joins]) rename(source);
   };
-  const expanded = structuredClone(plan);
+  const expanded = clonePlanTree(plan);
   renameBlock(expanded);
   return expanded;
 }
@@ -12748,15 +13090,51 @@ function expandQualifiedWildcards(
         };
       });
     });
-    const aliases = new Set<string>();
-    for (const item of block.select) {
-      if (aliases.has(item.alias)) throw new TypeError(`Duplicate output column: ${item.alias}`);
-      aliases.add(item.alias);
-    }
+    numberRepeatedOutputs(block.select);
   };
-  const expanded = structuredClone(plan);
+  const expanded = clonePlanTree(plan);
   expandBlock(expanded);
   return expanded;
+}
+
+/**
+ * The select list of a block whose joins merge columns: an unqualified `*` is the merged column
+ * list, `alias.*` that source's own columns. A name more than one item contributes is
+ * alias-qualified, the rule a plain `*` over a join follows.
+ */
+function mergedWildcardSelect(
+  block: CompiledQuery,
+  merged: ReadonlyArray<{ name: string; reference: string }>,
+  shaped: ReadonlyArray<{ source: TableSource; columns: readonly string[] | undefined }>,
+): SelectItem[] {
+  const expanded = block.select.map((item) => {
+    if (item.expression.kind !== "wildcard") return [{ item }];
+    const table = item.expression.table;
+    if (table === undefined) return merged.map((column) => ({ column }));
+    const selected = shaped.filter(({ source }) => source.alias === table);
+    if (selected.length === 0) throw new TypeError(`Unknown table for ${table}.*: ${table}`);
+    return selected.flatMap(({ source, columns }) =>
+      (columns ?? []).map((name) => ({
+        column: { name, reference: `${source.alias}.${name}` },
+      })),
+    );
+  });
+  const contributed = new Map<string, number>();
+  for (const entry of expanded.flat()) {
+    if ("column" in entry) {
+      contributed.set(entry.column.name, (contributed.get(entry.column.name) ?? 0) + 1);
+    }
+  }
+  const items = expanded.flat().map((entry): SelectItem => {
+    if ("item" in entry) return entry.item;
+    const { name, reference } = entry.column;
+    return {
+      expression: { kind: "column", reference },
+      alias: (contributed.get(name) ?? 0) > 1 ? reference : name,
+    };
+  });
+  numberRepeatedOutputs(items);
+  return items;
 }
 
 /** Wraps compound members into the set-operation source the executor folds left to right. */
@@ -13323,9 +13701,264 @@ export function splitCondition(expression: Expression): Predicate[] {
   return [{ left: expression, operator: "IS TRUE", right: { kind: "literal", value: null } }];
 }
 
+/**
+ * Rewrites a block's unqualified references to merged join columns. A select-list name is left
+ * alone in ORDER BY, which reads output columns first; nested query blocks keep their own scope.
+ */
+function rewriteMergedReferences(
+  parts: Pick<CompiledQuery, "select" | "predicates" | "groupBy" | "having" | "orderBy" | "joins">,
+  replacements: ReadonlyMap<string, Expression>,
+): void {
+  const rewrite = (expression: Expression): Expression => {
+    if (expression.kind === "column") {
+      const replacement = expression.reference.includes(".")
+        ? undefined
+        : replacements.get(expression.reference);
+      return replacement === undefined ? expression : clonePlanTree(replacement);
+    }
+    if (expression.kind === "subquery" || expression.kind === "exists") return expression;
+    return mapChildExpressions(expression, rewrite);
+  };
+  const aliases = new Set(parts.select.map((item) => item.alias));
+  for (const item of parts.select) {
+    if (item.expression.kind !== "wildcard") item.expression = rewrite(item.expression);
+  }
+  for (const predicate of [...parts.predicates, ...parts.having]) {
+    predicate.left = rewrite(predicate.left);
+    predicate.right = rewrite(predicate.right);
+  }
+  parts.groupBy = parts.groupBy.map(rewrite);
+  for (const order of parts.orderBy) {
+    const expression = order.expression;
+    if (expression.kind === "column" && aliases.has(expression.reference)) continue;
+    order.expression = rewrite(expression);
+  }
+  for (const join of parts.joins) {
+    join.left = rewrite(join.left);
+    join.right = rewrite(join.right);
+    if (join.on !== undefined) join.on = rewrite(join.on);
+  }
+}
+
+/** `FULL JOIN t USING (a)`: the merged `a` is `COALESCE(left.a, t.a)`, PostgreSQL's rule. */
+function mergeFullJoinUsing(parts: SelectBlockParts): SelectBlockParts {
+  const [join] = parts.joins;
+  if (join?.using === undefined) return parts;
+  const { using, ...plain } = join;
+  const merged = clonePlanTree({ ...parts, joins: [plain] });
+  const replacements = new Map<string, Expression>(
+    using.map((name) => [
+      name,
+      {
+        kind: "call",
+        name: "COALESCE",
+        arguments: [
+          { kind: "column", reference: `${parts.base.alias}.${name}` },
+          { kind: "column", reference: `${join.alias}.${name}` },
+        ],
+      },
+    ]),
+  );
+  rewriteMergedReferences(merged, replacements);
+  return merged;
+}
+
+/** Whether any block joins with USING or NATURAL, whose shared columns merge. */
+function planHasMergedJoins(plan: CompiledQuery): boolean {
+  if (plan.joins.some((join) => join.using !== undefined || join.natural === true)) return true;
+  let found = false;
+  forEachNestedBlock(plan, (nested) => {
+    found ||= planHasMergedJoins(nested);
+  });
+  const inspect = (expression: Expression): void => {
+    if (found) return;
+    if (expression.kind === "subquery" || expression.kind === "exists") {
+      found = planHasMergedJoins(expression.block);
+      return;
+    }
+    childExpressions(expression).forEach(inspect);
+  };
+  forEachBlockExpression(plan, inspect);
+  return found;
+}
+
+/**
+ * The merged column names of the join at `index` of `sources` (the block's base first): USING's
+ * list, or the names a NATURAL join's source shares with the sources before it.
+ */
+function joinMergedNames(
+  sources: readonly TableSource[],
+  index: number,
+  columnsFor: (source: TableSource) => readonly string[] | undefined,
+): string[] {
+  const join = sources[index] as JoinPlan | undefined;
+  if (join === undefined) return [];
+  if (join.using !== undefined) return join.using;
+  if (join.natural !== true) return [];
+  const preceding = sources.slice(0, index);
+  return (columnsFor(join) ?? []).filter((name) =>
+    preceding.some((source) => columnsFor(source)?.includes(name) === true),
+  );
+}
+
+/**
+ * `SELECT *` over USING and NATURAL joins, PostgreSQL's way: each join puts its merged columns
+ * first, once, then the rest of its left side, then the rest of its right side. Undefined for a
+ * block that merges nothing.
+ */
+function mergedWildcardColumns(
+  block: Pick<CompiledQuery, "base" | "joins">,
+  columnsFor: (source: TableSource) => readonly string[] | undefined,
+): Array<{ name: string; reference: string }> | undefined {
+  if (!block.joins.some((join) => join.using !== undefined || join.natural === true)) {
+    return undefined;
+  }
+  const sources = [block.base, ...block.joins];
+  const own = (source: TableSource): Array<{ name: string; reference: string }> =>
+    (columnsFor(source) ?? []).map((name) => ({ name, reference: `${source.alias}.${name}` }));
+  let columns = own(block.base);
+  block.joins.forEach((join, index) => {
+    const right = own(join);
+    const names = joinMergedNames(sources, index + 1, columnsFor);
+    if (names.length === 0) {
+      columns = [...columns, ...right];
+      return;
+    }
+    const merged = names.flatMap((name) => {
+      const column = columns.find((candidate) => candidate.name === name);
+      return column === undefined ? [] : [column];
+    });
+    columns = [
+      ...merged,
+      ...columns.filter((column) => !names.includes(column.name)),
+      ...right.filter((column) => !names.includes(column.name)),
+    ];
+  });
+  return columns;
+}
+
+/**
+ * USING and NATURAL join columns merge, as in PostgreSQL and SQLite: an unqualified reference to
+ * one names the left side's value (`SELECT id … JOIN customers USING (id)`), which for an inner
+ * or left join is the column of the earlier source that has it. Each name's left owner needs the
+ * schemas, so binding resolves it here, and rewrites a USING condition the parser wrote against
+ * the first source when an earlier join supplied the column instead.
+ */
+export function mergeJoinColumns(
+  plan: CompiledQuery,
+  columnsOf: (tableName: string) => readonly string[] | undefined,
+): CompiledQuery {
+  if (!planHasMergedJoins(plan)) return plan;
+  const columnsFor = (source: TableSource): readonly string[] | undefined =>
+    source.columnAliases ?? sourceWildcardColumns(source, columnsOf);
+  const mergeBlock = (block: CompiledQuery): void => {
+    forEachNestedBlock(block, mergeBlock);
+    const nested = (expression: Expression): void => {
+      if (expression.kind === "subquery" || expression.kind === "exists") {
+        mergeBlock(expression.block);
+        return;
+      }
+      childExpressions(expression).forEach(nested);
+    };
+    forEachBlockExpression(block, nested);
+    const sources = [block.base, ...block.joins];
+    const replacements = new Map<string, Expression>();
+    block.joins.forEach((join, index) => {
+      if (join.using === undefined && join.natural !== true) return;
+      const names = joinMergedNames(sources, index + 1, columnsFor);
+      const owners = names.map((name) => {
+        const owner = sources
+          .slice(0, index + 1)
+          .find((source) => columnsFor(source)?.includes(name) === true);
+        if (owner === undefined) {
+          throw new TypeError(`Join column ${name} is not a column of the join's left side`);
+        }
+        if (columnsFor(join)?.includes(name) !== true) {
+          throw new TypeError(`Join column ${name} is not a column of ${join.alias}`);
+        }
+        if (!replacements.has(name)) {
+          replacements.set(name, { kind: "column", reference: `${owner.alias}.${name}` });
+        }
+        return owner;
+      });
+      if (join.using !== undefined && owners.some((owner) => owner !== block.base)) {
+        const condition = usingCondition(
+          "",
+          join.alias,
+          names,
+          owners.map((owner) => owner.alias),
+        );
+        if (condition.kind === "condition") {
+          join.left = condition.left;
+          join.right = condition.right;
+          delete join.on;
+        } else {
+          join.left = { kind: "literal", value: null };
+          join.right = { kind: "literal", value: null };
+          join.on = condition;
+        }
+      }
+    });
+    if (replacements.size > 0) rewriteMergedReferences(block, replacements);
+  };
+  const merged = clonePlanTree(plan);
+  mergeBlock(merged);
+  return merged;
+}
+
+/**
+ * `JOIN t USING (a, b)` (F401-04): the conjunction of `left.a = t.a` per name. The parser writes
+ * it against the block's first source; schema binding rewrites it when an earlier join supplied
+ * the column instead (mergeJoinColumns).
+ */
+function usingCondition(
+  leftAlias: string,
+  rightAlias: string,
+  names: readonly string[],
+  leftAliases?: readonly string[],
+): Expression {
+  return names
+    .map<Expression>((name, index) => ({
+      kind: "condition",
+      operator: "=",
+      left: { kind: "column", reference: `${leftAliases?.[index] ?? leftAlias}.${name}` },
+      right: { kind: "column", reference: `${rightAlias}.${name}` },
+    }))
+    .reduce((accumulated, condition) => ({
+      kind: "logical",
+      operator: "and",
+      left: accumulated,
+      right: condition,
+    }));
+}
+
+/**
+ * Numbers every output name that repeats an earlier one: `SELECT a AS c, b AS c` and
+ * `SELECT *, total` are valid in PostgreSQL and SQLite, which both return two columns of the same
+ * name. A result row is an object keyed by name, so the first keeps the name and each later one
+ * becomes `c_2`, `c_3`, … — the rule unnamed expressions (`expression`, `expression_2`) follow.
+ */
+function numberRepeatedOutputs(items: readonly SelectItem[]): void {
+  const aliases = new Set<string>();
+  for (const item of items) {
+    if (aliases.has(item.alias)) {
+      const base = item.alias;
+      let suffix = 2;
+      while (aliases.has(`${base}_${String(suffix)}`)) suffix++;
+      item.alias = `${base}_${String(suffix)}`;
+    }
+    aliases.add(item.alias);
+  }
+}
+
 function defaultAlias(expression: Expression): string {
   if (expression.kind === "column")
     return expression.reference.split(".").at(-1) ?? expression.reference;
+  if (expression.kind === "call" && expression.name === "CAST") {
+    // PostgreSQL names `CAST(placed AS DATE)` and `placed::date` after what they cast.
+    const operand = expression.arguments[0];
+    if (operand?.kind === "column" || operand?.kind === "call") return defaultAlias(operand);
+  }
   if (expression.kind === "call") return expression.name.toLowerCase();
   if (expression.kind === "wildcard")
     return expression.table === undefined ? "*" : `${expression.table}.*`;

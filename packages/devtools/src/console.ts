@@ -11,8 +11,9 @@ import { createFollower, isLiveTarget, type Follower } from "./live.js";
 import { draggable } from "./panel/drag.js";
 import { resizeSplit } from "./panel/window.js";
 import { columnsOf } from "./results/columns.js";
-import { createGrid } from "./results/grid.js";
+import { createGrid, type GridColumn } from "./results/grid.js";
 import { toCsv, toJson } from "./results/serialize.js";
+import { nextSort, sortRows, type RowSort } from "./results/sort.js";
 import { splitStatements, withAppendedClause, type ScriptStatement } from "./sql/split.js";
 import type { StatementIntent } from "./statements.js";
 import { readStored, writeStored } from "./storage.js";
@@ -72,6 +73,9 @@ function describeExecuteResult(result: ExecuteResult): string {
   if (result.kind === "create-trigger") return `created trigger ${result.name} on ${result.table}`;
   if (result.kind === "drop-trigger") return `dropped trigger ${result.name}`;
   if (result.kind === "add-column") return `added column ${result.table}.${result.column}`;
+  if (result.kind === "rename-column") {
+    return `renamed column ${result.table}.${result.from} to ${result.to}`;
+  }
   if (result.kind === "create-view") return `created view ${result.view}`;
   if (result.kind === "drop-view") {
     return result.dropped ? `dropped view ${result.view}` : `no view ${result.view}`;
@@ -163,7 +167,11 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
 
   const notice = el("div", { class: "notice", attrs: { "aria-live": "polite" } });
   notice.hidden = true;
-  const grid = createGrid();
+  const grid = createGrid({
+    onSort: (column) => {
+      sortShown(column);
+    },
+  });
   const status = el(
     "div",
     { class: "statusbar", attrs: { role: "status", "aria-live": "polite" } },
@@ -178,7 +186,7 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
       editor.focus();
       const cached = history.resultFor(entry.id);
       if (cached === undefined) {
-        grid.setMessage("Rows for this run are no longer cached. Run it again to see them.");
+        showMessage("Rows for this run are no longer cached. Run it again to see them.");
         setStatus(entry.sql.length === 0 ? "ready" : "recalled");
       } else {
         renderRows(cached);
@@ -385,25 +393,81 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
     status.replaceChildren(el("span", { text }), ...extras);
   }
 
-  /** The last rows shown, for the copy and download actions. */
+  /** The last rows shown, in the order the statement returned them. */
   let shown: QueryResult | undefined;
+  /**
+   * The header the rows are sorted by, in memory. The result is already in hand, so sorting it
+   * costs nothing and runs nothing; a new result starts unsorted, and a live re-run keeps it.
+   */
+  let resultSort: RowSort | undefined;
+  /** The rows as the grid shows them — sorted when a header says so — for copying. */
+  let displayed: QueryResult | undefined;
   /** The statement the shown rows came from, uncapped, for a whole-result download. */
   let shownSql: string | undefined;
   let shownCapped = false;
 
-  function renderRows(result: QueryResult, sql?: string, capped = false): void {
+  /**
+   * Shows a result. A live re-run of the same statement keeps its columns, so its rows are swapped
+   * in where they stand — scroll position, selection, and column widths all stay — rather than
+   * rebuilt from the top.
+   */
+  function renderRows(result: QueryResult, sql?: string, capped = false, live = false): void {
+    const sameShape =
+      live &&
+      shown !== undefined &&
+      shown.rows.length > 0 &&
+      result.rows.length > 0 &&
+      shown.columns.length === result.columns.length &&
+      shown.columns.every((name, index) => name === result.columns[index]);
     shown = result;
     shownSql = sql;
     shownCapped = capped;
     resultActions.hidden = false;
     download.hidden = sql === undefined;
+    if (!sameShape) resultSort = undefined;
+    displayed =
+      resultSort === undefined ? result : { ...result, rows: sortRows(result.rows, resultSort) };
+    if (sameShape) {
+      grid.replaceRows(displayed.rows);
+      return;
+    }
+    grid.setColumns(gridColumns(result));
     if (result.rows.length === 0) {
-      grid.setColumns(columnsOf(result));
       grid.setMessage("No rows.");
       return;
     }
-    grid.setColumns(columnsOf(result));
-    grid.setRows(result.rows);
+    grid.setRows(displayed.rows);
+  }
+
+  /**
+   * Replaces the rows with a message. The rows they replace are forgotten with them, so a header
+   * left over from them cannot sort them back into view, and nothing is copied that is not shown.
+   */
+  function showMessage(message: string): void {
+    shown = undefined;
+    displayed = undefined;
+    resultSort = undefined;
+    resultActions.hidden = true;
+    grid.setColumns([]);
+    grid.setMessage(message);
+  }
+
+  function gridColumns(result: QueryResult): GridColumn[] {
+    return columnsOf(result).map((column) => ({
+      ...column,
+      sortable: true,
+      ...(resultSort?.column === column.name ? { sorted: resultSort.direction } : {}),
+    }));
+  }
+
+  function sortShown(column: string): void {
+    const result = shown;
+    if (result === undefined || result.rows.length === 0) return;
+    resultSort = nextSort(resultSort, column);
+    displayed =
+      resultSort === undefined ? result : { ...result, rows: sortRows(result.rows, resultSort) };
+    grid.setColumns(gridColumns(result));
+    grid.setRows(displayed.rows);
   }
 
   /**
@@ -450,7 +514,7 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
       (result) => {
         const capped = result.rows.length > rowCap;
         const rows = capped ? { ...result, rows: result.rows.slice(0, rowCap) } : result;
-        renderRows(rows, sql, capped);
+        renderRows(rows, sql, capped, true);
         setStatus(
           `live · ${describeRows(rows.rows.length, capped)} · ${new Date().toLocaleTimeString()}`,
         );
@@ -649,8 +713,7 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
     if (last?.rows !== undefined) {
       renderRows(last.rows, lastPart?.sql, last.capped === true);
     } else if (outcomes.length > 0) {
-      grid.setMessage("Statement ran.");
-      resultActions.hidden = true;
+      showMessage("Statement ran.");
     }
     if (parts.length > 1 && outcomes.length > 0) {
       setNotice(
@@ -711,12 +774,14 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
     }
   }
   copyCsv.addEventListener("click", () => {
-    if (shown === undefined) return;
-    void copy(toCsv(shown.columns, shown.rows), `${formatCount(shown.rows.length)} rows as CSV`);
+    const rows = displayed;
+    if (rows === undefined) return;
+    void copy(toCsv(rows.columns, rows.rows), `${formatCount(rows.rows.length)} rows as CSV`);
   });
   copyJson.addEventListener("click", () => {
-    if (shown === undefined) return;
-    void copy(toJson(shown.columns, shown.rows), `${formatCount(shown.rows.length)} rows as JSON`);
+    const rows = displayed;
+    if (rows === undefined) return;
+    void copy(toJson(rows.columns, rows.rows), `${formatCount(rows.rows.length)} rows as JSON`);
   });
   download.addEventListener("click", () => {
     void downloadShown();
@@ -731,8 +796,9 @@ export function createConsole(deps: ConsoleDeps): ConsoleView {
     if (shown === undefined) return;
     const fileName = `minnow-query-${new Date().toISOString().slice(0, 19).replaceAll(":", "-")}.csv`;
     if (!shownCapped || shownSql === undefined || !isCursorTarget(deps.target)) {
-      downloadText(toCsv(shown.columns, shown.rows), fileName, "text/csv");
-      setStatus(`saved ${formatCount(shown.rows.length)} rows`);
+      const rows = displayed ?? shown;
+      downloadText(toCsv(rows.columns, rows.rows), fileName, "text/csv");
+      setStatus(`saved ${formatCount(rows.rows.length)} rows`);
       return;
     }
     setStatus("reading every row…");

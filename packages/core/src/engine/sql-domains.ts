@@ -608,7 +608,12 @@ export function dateDomainValue(value: unknown): string | null {
   } else {
     throw new TypeError("DATE accepts a YYYY-MM-DD string value");
   }
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(source);
+  // PostgreSQL's date input also takes a timestamp's text and keeps its day: the time of day and
+  // any zone after it are read and dropped (`'2026-02-05 10:00:00'::date` is 2026-02-05).
+  const match =
+    /^(\d{4})-(\d{2})-(\d{2})(?:[ T](?:[01]\d|2[0-4]):[0-5]\d(?::[0-5]\d(?:\.\d{1,6})?)?(?: ?(?:Z|[+-]\d{2}(?::?\d{2})?))?)?$/.exec(
+      source,
+    );
   const year = Number(match?.[1]);
   const month = Number(match?.[2]);
   const day = Number(match?.[3]);
@@ -624,7 +629,7 @@ export function dateDomainValue(value: unknown): string | null {
   ) {
     throw new TypeError(`Invalid DATE value: ${String(value)}`);
   }
-  return DATE_VALUE + source;
+  return DATE_VALUE + source.slice(0, 10);
 }
 
 export function isDateDomainValue(value: unknown): value is string {

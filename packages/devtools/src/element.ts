@@ -30,7 +30,8 @@ const observedAttributes = [
  * `MinnowDatabaseClient`, or `Minnow` facade); everything else reads from attributes.
  *
  * Attributes are live: a framework that re-renders `hotkey` or `corner` remounts the panel with
- * the new value, and `theme` repaints in place so the query being written survives the switch.
+ * the new value, while `theme` repaints and `open` opens or closes it in place, so the query being
+ * written survives either.
  */
 export class MinnowDevtoolsElement extends HTMLElement {
   static get observedAttributes(): readonly string[] {
@@ -69,6 +70,9 @@ export class MinnowDevtoolsElement extends HTMLElement {
   }
 
   set options(value: DevtoolsOptions) {
+    // A framework hands over a fresh object on every render; one that says the same thing must
+    // not rebuild the panel and throw away the query being written.
+    if (sameOptions(this.#options, value)) return;
     this.#options = value;
     if (this.isConnected) this.#mount();
   }
@@ -107,7 +111,11 @@ export class MinnowDevtoolsElement extends HTMLElement {
     // page flips while a query is half-written; everything else describes how the panel was
     // built and takes a remount.
     if (name === "theme") this.#handle.setTheme(themeFromAttribute(next));
-    else this.#mount();
+    // `open` says whether the panel is showing, which the panel can change where it stands.
+    else if (name === "open") {
+      if (next === null || next === "false") this.#handle.close();
+      else this.#handle.open();
+    } else this.#mount();
   }
 
   #mount(): void {
@@ -124,6 +132,26 @@ export class MinnowDevtoolsElement extends HTMLElement {
       this.#mounting = false;
     }
   }
+}
+
+/** Equal when every option is the same value, comparing one level into nested objects. */
+function sameOptions(a: DevtoolsOptions, b: DevtoolsOptions): boolean {
+  const left = a as Record<string, unknown>;
+  const right = b as Record<string, unknown>;
+  const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
+  for (const key of keys) {
+    const x = left[key];
+    const y = right[key];
+    if (Object.is(x, y)) continue;
+    if (typeof x !== "object" || typeof y !== "object" || x === null || y === null) return false;
+    const inner = new Set([...Object.keys(x), ...Object.keys(y)]);
+    for (const name of inner) {
+      if (!Object.is((x as Record<string, unknown>)[name], (y as Record<string, unknown>)[name])) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 /** Registers the element. Safe to call more than once; a second call is a no-op. */

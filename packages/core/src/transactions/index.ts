@@ -170,12 +170,17 @@ export class LeasedSnapshot extends Snapshot {
   }
 
   get expiresAt(): Date {
+    return new Date(this.expiresAtMilliseconds);
+  }
+
+  /** The expiry as epoch milliseconds, without allocating a Date on the read path. */
+  get expiresAtMilliseconds(): number {
     const iso = this.#record.expiresAt;
     if (iso !== this.#expiresAtIso) {
       this.#expiresAtIso = iso;
       this.#expiresAtMs = Date.parse(iso);
     }
-    return new Date(this.#expiresAtMs);
+    return this.#expiresAtMs;
   }
 
   override async getBlock(id: string): Promise<Uint8Array | undefined> {
@@ -466,7 +471,11 @@ export class DatabaseTransaction {
     return this.#initialCatalogProbe === undefined ? undefined : { ...this.#initialCatalogProbe };
   }
 
-  /** Exact local commit contribution; undefined until this transaction commits. */
+  /**
+   * Exact local commit contribution; undefined until this transaction commits. The records are
+   * this transaction's own copies, shared rather than cloned on every commit: both are replaced,
+   * never changed in place, and the engine reads them and copies before changing anything.
+   */
   get committedCatalogContribution():
     | {
         transaction: TransactionRecord;
@@ -480,8 +489,8 @@ export class DatabaseTransaction {
     | undefined {
     if (this.#record.status !== "committed") return undefined;
     return {
-      transaction: structuredClone(this.#record),
-      segments: structuredClone([...this.#knownSegments.values()]),
+      transaction: this.#record,
+      segments: [...this.#knownSegments.values()],
       ...(this.#initialCatalogProbe === undefined
         ? {}
         : { initialCatalogProbe: { ...this.#initialCatalogProbe } }),
@@ -1037,13 +1046,15 @@ export class DatabaseTransaction {
   }
 
   /** Appends one operation's key changes; entries commit in operation order. */
-  setUniqueKeyChanges(changes: UniqueKeyChanges): void {
+  setUniqueKeyChanges(changes: UniqueKeyChanges, options: { distinct?: boolean } = {}): void {
     this.#assertActive();
     const normalized: UniqueKeyChanges = {
       tableId: changes.tableId,
       // Deduplicated, not sorted: membership is all a store reads from these, and sorting fifty
-      // thousand tokens cost a bulk delete a fifth of its time.
-      keyTokens: [...new Set(changes.keyTokens)],
+      // thousand tokens cost a bulk delete a fifth of its time. With `distinct`, the caller
+      // vouches that no token repeats — a map's keys — and hashing them all again is skipped.
+      keyTokens:
+        options.distinct === true ? [...changes.keyTokens] : [...new Set(changes.keyTokens)],
       requireAbsent: changes.requireAbsent,
       ...(changes.remove === undefined ? {} : { remove: changes.remove }),
     };
@@ -1458,18 +1469,31 @@ export class DatabaseTransaction {
 
   /** A commit whose acknowledgement was lost still committed: answer from the persisted record. */
   async #recoverCommitted(error: unknown): Promise<ManifestSummary> {
-    const persisted = await this.store.getTransaction(this.id);
-    if (persisted?.status === "committed" && persisted.committedVersion !== null) {
-      const manifest = await this.store.getManifest(persisted.committedVersion);
-      if (manifest !== undefined) {
-        this.#record = persisted;
-        this.#persisted = true;
-        this.#stopHeartbeat();
-        await this.#releaseSnapshotLease().catch(() => undefined);
-        return manifest;
-      }
-    }
+    const manifest = await this.#adoptPersistedCommit();
+    if (manifest !== undefined) return manifest;
     throw error;
+  }
+
+  /**
+   * The manifest this transaction's durable record says it committed, when another coordinator
+   * sharing the record committed it -- a tab driving the same compaction job published first.
+   * Adopts that outcome as a lost acknowledgement would be; `undefined` while it is uncommitted.
+   */
+  async committedElsewhere(): Promise<ManifestSummary | undefined> {
+    if (!this.#persisted || this.#record.status !== "active") return undefined;
+    return this.#adoptPersistedCommit();
+  }
+
+  async #adoptPersistedCommit(): Promise<ManifestSummary | undefined> {
+    const persisted = await this.store.getTransaction(this.id);
+    if (persisted?.status !== "committed" || persisted.committedVersion === null) return undefined;
+    const manifest = await this.store.getManifest(persisted.committedVersion);
+    if (manifest === undefined) return undefined;
+    this.#record = persisted;
+    this.#persisted = true;
+    this.#stopHeartbeat();
+    await this.#releaseSnapshotLease().catch(() => undefined);
+    return manifest;
   }
 
   async #renewOwnership(force = false): Promise<void> {

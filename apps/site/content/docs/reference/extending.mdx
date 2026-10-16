@@ -139,10 +139,9 @@ whether to apply. Anything it cannot prove safe throws with a message naming the
 appearing as a step — see [the rejected list](/docs/schema#what-migrate-does).
 
 **Applying still goes through the engine.** `database.migrate(schema)` plans and applies in one
-call. Some steps have no SQL spelling — a rename happens through the column's stable ID, which
-`ALTER TABLE` cannot express — so there is no equivalent statement list to run yourself. If you
-need the split, plan with `planMigration` to decide and inspect, then hand the same schema to
-`migrate()` to apply.
+call. Some steps have no SQL spelling — widening an enum, adopting a generated expression — so
+there is no equivalent statement list to run yourself. If you need the split, plan with
+`planMigration` to decide and inspect, then hand the same schema to `migrate()` to apply.
 
 ## Transactions
 

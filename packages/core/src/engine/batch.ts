@@ -106,32 +106,86 @@ export function* toColumnarBatchSteps(input: InsertBatchInputLike): Generator<vo
   if (input.length === 0) throw new TypeError("A batch needs at least one row");
   // One pass over the rows, discovering columns in first-seen order. Values and omission are
   // separate so an explicit NULL can never accidentally invoke a default.
-  const columnsByName = new Map<string, BatchValue[]>();
-  const omittedByName = new Map<string, boolean[]>();
-  for (let index = 0; index < input.length; index += 1) {
+  const rowCount = input.length;
+  /** Columns in first-seen order. */
+  const found: PivotColumn[] = [];
+  const byName = new Map<string, PivotColumn>();
+  for (let index = 0; index < rowCount; index += 1) {
     if ((index & PIVOT_SLICE_MASK) === PIVOT_SLICE_MASK) yield;
     const row = input[index];
-    if (row === undefined) continue;
-    for (const name of Object.keys(row)) {
+    if (row === undefined) {
+      for (const column of found) omitRow(column, index, rowCount);
+      continue;
+    }
+    const keys = Object.keys(row);
+    // Rows of one batch nearly always carry the same keys in the same order; then each value
+    // goes straight to its column without a name lookup.
+    let sameShape = keys.length === found.length;
+    for (let position = 0; sameShape && position < keys.length; position += 1) {
+      sameShape = keys[position] === found[position]?.name;
+    }
+    if (sameShape) {
+      for (const column of found) {
+        const value: unknown = row[column.name];
+        if (value === undefined) omitRow(column, index, rowCount);
+        else column.values[index] = value as BatchValue;
+      }
+      continue;
+    }
+    for (const name of keys) {
       const value: unknown = row[name];
       if (value === undefined) continue;
-      let values = columnsByName.get(name);
-      if (values === undefined) {
-        values = new Array<BatchValue>(input.length).fill(null);
-        columnsByName.set(name, values);
-        omittedByName.set(name, new Array<boolean>(input.length).fill(true));
+      let column = byName.get(name);
+      if (column === undefined) {
+        column = {
+          name,
+          values: new Array<BatchValue>(rowCount).fill(null),
+          // A column first seen past row 0 was omitted by every row before it.
+          omitted:
+            index === 0 ? undefined : new Array<boolean>(rowCount).fill(false).fill(true, 0, index),
+          seenIn: -1,
+        };
+        found.push(column);
+        byName.set(name, column);
       }
-      values[index] = value as BatchValue;
-      const omitted = omittedByName.get(name);
-      if (omitted !== undefined) omitted[index] = false;
+      column.values[index] = value as BatchValue;
+      column.seenIn = index;
     }
+    for (const column of found) if (column.seenIn !== index) omitRow(column, index, rowCount);
   }
-  const omitted = Object.fromEntries(
-    [...omittedByName].filter(([, values]) => values.some(Boolean)),
-  );
+  const columns: Record<string, BatchValue[]> = {};
+  const omitted: Record<string, boolean[]> = {};
+  for (const column of found) {
+    defineVector(columns, column.name, column.values);
+    if (column.omitted !== undefined) defineVector(omitted, column.name, column.omitted);
+  }
   return {
-    columns: Object.fromEntries(columnsByName),
+    columns,
     ...(Object.keys(omitted).length === 0 ? {} : { omitted }),
-    rowCount: input.length,
+    rowCount,
   };
+}
+
+interface PivotColumn {
+  readonly name: string;
+  readonly values: BatchValue[];
+  /** Allocated on the column's first omission; most batches never omit anything. */
+  omitted: boolean[] | undefined;
+  /** The last row the column was present in, to find the columns a row left out. */
+  seenIn: number;
+}
+
+function omitRow(column: PivotColumn, index: number, rowCount: number): void {
+  column.omitted ??= new Array<boolean>(rowCount).fill(false);
+  column.omitted[index] = true;
+}
+
+/** Stores a column vector under its name, `__proto__` included, as an own property. */
+function defineVector<T>(target: Record<string, T>, name: string, vector: T): void {
+  Object.defineProperty(target, name, {
+    value: vector,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  });
 }

@@ -1,4 +1,5 @@
 import type { QueryValue } from "@minnowdb/core";
+import { dateIsoString } from "../date-value.js";
 import { sqlColumn, sqlLiteral, type ColumnType } from "../sql/literal.js";
 
 /** Every comparison the engine's WHERE clause supports, in the forms a column filter needs. */
@@ -129,7 +130,11 @@ export function renderFilters(table: string, filters: readonly Filter[]): string
 export function describeFilter(filter: Filter): string {
   const arity = operatorArity(filter.operator);
   if (arity === 0) return `${filter.column} ${operatorLabel(filter.operator)}`;
-  const values = filter.values.map((value) => (value === null ? "NULL" : String(value)));
+  // A date reads back the way it was typed — ISO, in UTC — not as the browser's local rendering
+  // of the instant, which can name a different day.
+  const values = filter.values.map((value) =>
+    value === null ? "NULL" : value instanceof Date ? dateIsoString(value) : String(value),
+  );
   if (filter.operator === "between") return `${filter.column} between ${values.join(" and ")}`;
   if (filter.operator === "in") return `${filter.column} in (${values.join(", ")})`;
   return `${filter.column} ${operatorLabel(filter.operator)} ${values[0] ?? ""}`;

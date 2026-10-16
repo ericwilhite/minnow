@@ -141,7 +141,7 @@ import type {
   QueryRow,
   QueryParameter,
 } from "./query.js";
-import { decodeQueryResult } from "./result-wire.js";
+import { decodeExecuteResult, decodeQueryResult } from "./result-wire.js";
 import type {
   AnySchema,
   UntypedSchema,
@@ -911,10 +911,12 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
     options: ExecuteOptions = {},
   ): Promise<ExecuteResult> {
     const { signal, onStats, ...wireOptions } = options;
-    return (await this.#call("execute", [sql, params, wireOptions, onStats !== undefined], {
-      signal,
-      onStats,
-    })) as ExecuteResult;
+    return decodeExecuteResult(
+      await this.#call("execute", [sql, params, wireOptions, onStats !== undefined], {
+        signal,
+        onStats,
+      }),
+    );
   }
 
   /** Executes a compiled statement from the typed mutation builders in the worker. */
@@ -922,10 +924,9 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
     statement: CompiledStatement,
     options?: RunStatementOptions,
   ): Promise<ExecuteResult> {
-    return (await this.#call(
-      "runStatement",
-      options === undefined ? [statement] : [statement, options],
-    )) as ExecuteResult;
+    return decodeExecuteResult(
+      await this.#call("runStatement", options === undefined ? [statement] : [statement, options]),
+    );
   }
 
   /**
@@ -1026,13 +1027,14 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
           );
         }),
       execute: (sql, params) =>
-        enqueue(
-          () =>
-            this._invoke(
+        enqueue(async () =>
+          decodeExecuteResult(
+            await this._invoke(
               opened.handleId,
               "execute",
               params === undefined ? [sql] : [sql, params],
-            ) as Promise<ExecuteResult>,
+            ),
+          ),
         ),
       insertBatch: (tableName, input) => stage("insertBatch", tableName, input),
       upsertBatch: (tableName, input, options) =>

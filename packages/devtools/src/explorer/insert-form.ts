@@ -12,6 +12,8 @@ export interface InsertForm {
 export interface InsertFormDeps {
   /** Called with the parsed row once every field is valid. */
   onSubmit(values: Record<string, QueryValue>): void;
+  /** Called when the form is dismissed — Cancel or Escape — so focus can go back where it was. */
+  onDismiss?(): void;
 }
 
 /** The control for one column: a menu where the values are a closed set, a box otherwise. */
@@ -104,16 +106,31 @@ export function createInsertForm(deps: InsertFormDeps): InsertForm {
   }
 
   save.addEventListener("click", submit);
-  cancel.addEventListener("click", close);
+  function dismiss(): void {
+    close();
+    deps.onDismiss?.();
+  }
+
+  cancel.addEventListener("click", dismiss);
   node.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       // Closing the form is the whole of what Escape does here; the panel behind it must not
       // read the same press as its own dismissal.
       event.preventDefault();
       event.stopPropagation();
-      close();
+      dismiss();
     }
-    if (event.key === "Enter" && !(event.target instanceof HTMLSelectElement)) submit();
+    // Enter in a field submits; on a button it presses that button, which for Cancel must not
+    // also submit. The default is taken away so the press cannot go on to activate whatever the
+    // confirmation focuses next.
+    if (
+      event.key === "Enter" &&
+      !(event.target instanceof HTMLSelectElement) &&
+      !(event.target instanceof HTMLButtonElement)
+    ) {
+      event.preventDefault();
+      submit();
+    }
   });
 
   return {

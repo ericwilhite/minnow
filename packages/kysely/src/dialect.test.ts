@@ -1493,7 +1493,7 @@ describe("compile-time refusals for unsupported PostgreSQL forms", () => {
         .values({ id: 1, name: "n", doc: null })
         .onConflict((conflict) => conflict.constraint("person_pkey").doNothing())
         .compile(),
-    ).toThrow("Name the unique key's columns");
+    ).toThrow("Name the columns of the primary key or UNIQUE constraint");
     expect(() => db.selectFrom("person").selectAll().where("id", "in", []).compile()).toThrow(
       "HandleEmptyInListsPlugin",
     );
@@ -1501,9 +1501,6 @@ describe("compile-time refusals for unsupported PostgreSQL forms", () => {
       "Minnow has no schemas",
     );
     expect(() => db.schema.alterTable("person").renameTo("people").compile()).toThrow("RENAME TO");
-    expect(() => db.schema.alterTable("person").renameColumn("name", "title").compile()).toThrow(
-      "RENAME COLUMN",
-    );
   });
 
   it("refuses JSON path operators that Minnow's -> and ->> would read as one key", () => {

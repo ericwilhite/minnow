@@ -8,8 +8,40 @@ interface ArtifactCacheStats {
   evictions: number;
 }
 
+/**
+ * Per-block artifact families. Each family is its own key space, keyed by the bare block id:
+ * a lookup then hashes a string the catalog already holds (its hash is cached in the string)
+ * instead of building and hashing a fresh `prefix + id` string per touch, which was the
+ * dominant cost of a cache hit on every scan and point read.
+ */
+export const ArtifactFamily = {
+  /** Free-form string keys: memoized results, derived tables, overlay states. */
+  keyed: 0,
+  /** A decoded physical block. */
+  decodedBlock: 1,
+  /** A block's decoded column vector. */
+  blockVector: 2,
+  /** A block's header description (row count, zone map), read without decoding. */
+  zoneDescription: 3,
+  /** A string block's reverse dictionary, value to code. */
+  reverseDictionary: 4,
+  /** A segment's key locator table, keyed by segment id. */
+  segmentKeyLocators: 5,
+} as const;
+
+export type ArtifactFamily = (typeof ArtifactFamily)[keyof typeof ArtifactFamily];
+
+const FAMILY_COUNT = 6;
+
+/**
+ * What a family key is charged beyond its id: the short prefix the flat key space used to
+ * spell out, so a family entry costs the residency budget what it always has.
+ */
+const FAMILY_KEY_PREFIX_CHARACTERS = 4;
+
 /** One resident artifact on the recency list; `previous` is older, `next` is newer. */
 interface ArtifactCacheEntry {
+  family: ArtifactFamily;
   key: string;
   payload: unknown;
   bytes: number;
@@ -24,16 +56,20 @@ interface ArtifactCacheEntry {
  * Recency lives on an intrusive doubly-linked list rather than Map insertion order: a hit
  * relinks four pointers instead of deleting and re-inserting the key, which re-hashed the
  * long block-identity keys twice per touch and was the single hottest frame of a cached point
- * lookup.
+ * lookup. One recency list and one byte budget span every family.
  */
 export class ArtifactCache {
   readonly #limitBytes: number;
-  readonly #entries = new Map<string, ArtifactCacheEntry>();
+  readonly #families: Array<Map<string, ArtifactCacheEntry>> = Array.from(
+    { length: FAMILY_COUNT },
+    () => new Map<string, ArtifactCacheEntry>(),
+  );
   /** Least recently used end of the recency list. */
   #oldest: ArtifactCacheEntry | undefined;
   /** Most recently used end of the recency list. */
   #newest: ArtifactCacheEntry | undefined;
   #usedBytes = 0;
+  #entryCount = 0;
   #hits = 0;
   #misses = 0;
   #evictions = 0;
@@ -67,8 +103,13 @@ export class ArtifactCache {
   }
 
   get(key: string): unknown {
+    return this.getIn(ArtifactFamily.keyed, key);
+  }
+
+  /** The payload under `key` in one family's key space, renewing its recency. */
+  getIn(family: ArtifactFamily, key: string): unknown {
     if (!this.enabled) return undefined;
-    const entry = this.#entries.get(key);
+    const entry = this.#families[family]?.get(key);
     if (entry === undefined) {
       this.#misses += 1;
       return undefined;
@@ -82,14 +123,23 @@ export class ArtifactCache {
   }
 
   put(key: string, payload: unknown, bytes: number): void {
+    this.putIn(ArtifactFamily.keyed, key, payload, bytes);
+  }
+
+  /** Stores `payload` under `key` in one family's key space, evicting to the byte limit. */
+  putIn(family: ArtifactFamily, key: string, payload: unknown, bytes: number): void {
     if (!Number.isSafeInteger(bytes) || bytes < 0) {
       throw new RangeError("Artifact cache entry bytes must be a non-negative whole number");
     }
+    const entries = this.#families[family];
+    if (entries === undefined) throw new RangeError("Unknown artifact cache family");
     // Payload estimates belong to callers; keys and the LRU/Map entry belong to the cache.
     // Tiny results with long SQL/plan keys must not escape the residency budget.
-    bytes += 96 + key.length * 2;
+    const keyCharacters =
+      key.length + (family === ArtifactFamily.keyed ? 0 : FAMILY_KEY_PREFIX_CHARACTERS);
+    bytes += 96 + keyCharacters * 2;
     if (!this.enabled || !Number.isSafeInteger(bytes) || bytes > this.#limitBytes) return;
-    const existing = this.#entries.get(key);
+    const existing = entries.get(key);
     if (existing !== undefined) {
       this.#usedBytes -= existing.bytes;
       existing.payload = payload;
@@ -101,22 +151,25 @@ export class ArtifactCache {
       }
     } else {
       const entry: ArtifactCacheEntry = {
+        family,
         key,
         payload,
         bytes,
         previous: undefined,
         next: undefined,
       };
-      this.#entries.set(key, entry);
+      entries.set(key, entry);
+      this.#entryCount += 1;
       this.#appendNewest(entry);
       this.#usedBytes += bytes;
     }
     let oldest = this.#oldest;
     while (this.#usedBytes > this.#limitBytes && oldest !== undefined) {
       const next = oldest.next;
-      if (oldest.key !== key) {
+      if (oldest.family !== family || oldest.key !== key) {
         this.#unlink(oldest);
-        this.#entries.delete(oldest.key);
+        this.#families[oldest.family]?.delete(oldest.key);
+        this.#entryCount -= 1;
         this.#usedBytes -= oldest.bytes;
         this.#evictions += 1;
       }
@@ -130,7 +183,7 @@ export class ArtifactCache {
    * for the same identity — is left alone. Counts as neither a hit nor a miss.
    */
   retain(key: string, payload: unknown, bytes: number): void {
-    const existing = this.#entries.get(key);
+    const existing = this.#families[ArtifactFamily.keyed]?.get(key);
     if (existing === undefined) {
       this.put(key, payload, bytes);
       return;
@@ -142,7 +195,8 @@ export class ArtifactCache {
 
   /** Releases every retained payload while preserving lifetime counters for final diagnostics. */
   clear(): void {
-    this.#entries.clear();
+    for (const entries of this.#families) entries.clear();
+    this.#entryCount = 0;
     this.#oldest = undefined;
     this.#newest = undefined;
     this.#usedBytes = 0;
@@ -152,7 +206,7 @@ export class ArtifactCache {
     return {
       limitBytes: this.#limitBytes,
       usedBytes: this.#usedBytes,
-      entries: this.#entries.size,
+      entries: this.#entryCount,
       hits: this.#hits,
       misses: this.#misses,
       evictions: this.#evictions,

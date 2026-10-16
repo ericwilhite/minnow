@@ -88,3 +88,23 @@ export const icons = {
 export function clear(node: Element): void {
   node.replaceChildren();
 }
+
+/**
+ * Re-renders a list without dropping keyboard focus. A list rebuilt from scratch removes the
+ * button that was pressed, which sends focus to the document body and the next Tab back to the
+ * top of the page; marking buttons with `data-focus-key` lets the rebuilt one take focus again.
+ */
+export function keepingFocus(list: HTMLElement, rebuild: () => void): void {
+  const root = list.getRootNode() as Document | ShadowRoot;
+  const active = root.activeElement;
+  const key =
+    active instanceof HTMLElement && list.contains(active) ? active.dataset.focusKey : undefined;
+  rebuild();
+  if (key === undefined) return;
+  for (const candidate of list.querySelectorAll<HTMLElement>("[data-focus-key]")) {
+    if (candidate.dataset.focusKey === key) {
+      candidate.focus({ preventScroll: true });
+      return;
+    }
+  }
+}

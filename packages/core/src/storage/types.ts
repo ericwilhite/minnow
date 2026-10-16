@@ -779,21 +779,32 @@ export function validateTableForeignKey(
 
 const catalogRecordTextEncoder = new TextEncoder();
 
-function durableRecordRetainedBytes(record: unknown, label: string): number {
+function durableRecordBigIntReplacer(_key: string, entry: unknown): unknown {
+  if (typeof entry !== "bigint") return entry;
+  if (entry < 0n || entry > MAX_ROW_ID_EXCLUSIVE_END) {
+    throw new RangeError("Record bigint exceeds the unsigned 64-bit persisted range");
+  }
+  return { $n: entry.toString() };
+}
+
+function durableRecordRetainedBytes(
+  record: unknown,
+  label: string,
+  containsBigInt = false,
+): number {
   // Keep this byte accounting identical to the canonical record-wire JSON codec without
   // importing the toolkit codec back into this leaf contract module. Segment records always
-  // contain bigint row envelopes, so plain JSON.stringify is not sufficient.
+  // contain bigint row envelopes, so plain JSON.stringify is not sufficient: they go straight
+  // to the replacer instead of paying for the TypeError a plain attempt throws.
   let json: string | undefined;
-  try {
-    json = JSON.stringify(record);
-  } catch {
-    json = JSON.stringify(record, (_key, entry: unknown) => {
-      if (typeof entry !== "bigint") return entry;
-      if (entry < 0n || entry > MAX_ROW_ID_EXCLUSIVE_END) {
-        throw new RangeError("Record bigint exceeds the unsigned 64-bit persisted range");
-      }
-      return { $n: entry.toString() };
-    });
+  if (containsBigInt) {
+    json = JSON.stringify(record, durableRecordBigIntReplacer);
+  } else {
+    try {
+      json = JSON.stringify(record);
+    } catch {
+      json = JSON.stringify(record, durableRecordBigIntReplacer);
+    }
   }
   if (typeof json !== "string") throw new TypeError(`${label} is not JSON-serializable`);
   return catalogRecordTextEncoder.encode(json).byteLength;
@@ -813,13 +824,33 @@ export function manifestRecordRetainedBytes(record: Manifest): number {
  * later reclamation may add. Reserving them up front prevents quota deadlock at the byte ceiling.
  */
 export function manifestRecordRetainedReservationBytes(record: Manifest): number {
-  return manifestRecordRetainedBytes(
+  // Manifest records, like segment records, are replaced rather than changed in place, and a
+  // commit charges its new manifest at plan and again at apply: measured once per object.
+  const cached = manifestReservationBytesCache.get(record);
+  if (cached !== undefined) return cached;
+  const bytes = manifestRecordRetainedBytes(
     record.prunedAt === undefined ? { ...record, prunedAt: "1970-01-01T00:00:00.000Z" } : record,
   );
+  manifestReservationBytesCache.set(record, bytes);
+  return bytes;
 }
 
+const manifestReservationBytesCache = new WeakMap<Manifest, number>();
+
+/**
+ * Exact retained bytes per segment record object. Segment records are never changed in place
+ * (a change publishes a new object), and one commit charges the same record several times —
+ * plan, apply, replace — so the size is computed once per object. Charging a removal with the
+ * bytes recorded at admission also keeps the running totals exact by construction.
+ */
+const segmentRecordRetainedBytesCache = new WeakMap<SegmentRecord, number>();
+
 export function segmentRecordRetainedBytes(record: SegmentRecord): number {
-  return durableRecordRetainedBytes(record, "Segment record");
+  const cached = segmentRecordRetainedBytesCache.get(record);
+  if (cached !== undefined) return cached;
+  const bytes = durableRecordRetainedBytes(record, "Segment record", true);
+  segmentRecordRetainedBytesCache.set(record, bytes);
+  return bytes;
 }
 
 /** Hard catalog cardinality/text bounds shared by engine, adapters, checkpoints, and snapshots. */
@@ -3261,12 +3292,51 @@ export function collectFtsCandidates(
       `Full-text candidate limit must be between 1 and ${String(MAX_FTS_CANDIDATE_ROW_IDS)}`,
     );
   }
-  const sets = terms.map(() => new Set<bigint>());
-  let retainedRowIds = 0;
   // Every chunk is strictly sorted by term (the write path refuses anything else), so each
   // query seeks to its first possible posting by binary search and walks forward only while
   // postings can still match: an exact term touches one posting, a prefix or range its run.
-  for (const postings of chunkLists) {
+  // The common case gathers each term's row ids into a list and sorts it as unsigned 64-bit
+  // integers, which is a native numeric sort; hashing every id into a Set and sorting boxed
+  // BigInts through a comparator cost most of a wide range lookup. Only a gather larger than
+  // the limit — duplicates included — needs the exact distinct count, which the Set path keeps.
+  const chunks = [...chunkLists];
+  const lists = terms.map((): bigint[] => []);
+  let gathered = 0;
+  gather: for (const postings of chunks) {
+    for (let index = 0; index < terms.length; index += 1) {
+      const term = terms[index];
+      const list = lists[index];
+      if (term === undefined || list === undefined) continue;
+      for (
+        let position = seekFtsPostingQuery(postings, term);
+        position < postings.length;
+        position += 1
+      ) {
+        const posting = postings[position];
+        if (posting === undefined || !ftsPostingQueryMatches(posting.term, term)) break;
+        gathered += posting.rowIds.length;
+        if (gathered > maxRowIds) break gather;
+        for (const rowId of posting.rowIds) list.push(rowId);
+      }
+    }
+  }
+  if (gathered <= maxRowIds) {
+    return {
+      rowIdsByTerm: lists.map((list) => {
+        const sorted = BigUint64Array.from(list).sort();
+        const unique: bigint[] = [];
+        for (let index = 0; index < sorted.length; index += 1) {
+          const rowId = sorted[index] ?? 0n;
+          if (index === 0 || rowId !== sorted[index - 1]) unique.push(rowId);
+        }
+        return unique;
+      }),
+      overflow: false,
+    };
+  }
+  const sets = terms.map(() => new Set<bigint>());
+  let retainedRowIds = 0;
+  for (const postings of chunks) {
     for (let index = 0; index < terms.length; index += 1) {
       const term = terms[index];
       const set = sets[index];

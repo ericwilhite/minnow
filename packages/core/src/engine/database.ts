@@ -25,7 +25,7 @@ import {
 export type { ColumnDefinition } from "./catalog-mutations.js";
 export type { CreateTableInput } from "./catalog-mutations.js";
 import { CompactionController } from "./compaction-controller.js";
-import { BackgroundDiagnostics } from "./background-diagnostics.js";
+import { BackgroundDiagnostics, isLivePostingBuildRefusal } from "./background-diagnostics.js";
 import { CollectionController } from "./collection-controller.js";
 import { databaseInternals } from "./internals.js";
 import {
@@ -48,7 +48,7 @@ import {
   type InsertBatchInput,
   type InsertBatchInputLike,
 } from "./batch.js";
-import { ArtifactCache } from "./artifact-cache.js";
+import { ArtifactCache, ArtifactFamily } from "./artifact-cache.js";
 import {
   estimateBatchBytes,
   estimateBatchBytesSliced,
@@ -225,6 +225,7 @@ import {
   type TableRecord,
   type TransactionRecord,
   validateStorageId,
+  PostingBuildConflictError,
   SnapshotManifestMissingError,
   SchemaConflictError,
   TableInUseError,
@@ -261,11 +262,15 @@ import {
   combineUnionResults,
   compileCheckExpression,
   compileQuery,
+  containsParameter,
   hasAggregate,
+  splitCondition,
   createRecursiveCteState,
   generateSeriesRows,
   annotateAvgArgumentScales,
   compileStatement,
+  compileDefaultExpression,
+  isUpdateDefaultAssignment,
   comparisonHolds,
   createPreparedColumnarQuery,
   evaluateJoinedRowExpression,
@@ -283,6 +288,7 @@ import {
   mapChildExpressions,
   expandFtsColumns,
   expandNaturalJoins,
+  mergeJoinColumns,
   expandSourceColumnAliases,
   expandViewSources,
   forEachBlockExpression,
@@ -438,6 +444,7 @@ import {
   secondaryIndexTermsCoverNulls,
   secondaryIndexUpdateNeedsPreImages,
   secondaryKeyLocator,
+  secondaryKeyLocatorNumber,
   secondaryTupleComponent,
   secondaryUniqueTerm,
   sortedFtsPostings,
@@ -455,8 +462,13 @@ import {
   type LiveMaintenanceOrderTerm,
   type LiveMaintenanceState,
   filterLiveRows,
+  liveKeyPins,
+  liveKeyPinsAdmit,
+  liveReadColumns,
+  liveWindowLeavesReadColumns,
   liveKeyToken,
   liveMaintainedOutcome,
+  liveMaintenanceTestHooks,
   liveOrderComparator,
   liveRowStateBytes,
   mergeLiveRows,
@@ -464,8 +476,18 @@ import {
   trimLiveRows,
 } from "./live-maintenance.js";
 import {
+  ascendingRangeSlots,
+  inOrderedRange,
+  orderedSelectionShape,
+  orderedSelectionTestHooks,
+  zoneMeetsOrderedRange,
+  zoneWithinOrderedRange,
+  type OrderedRange,
+} from "./ordered-selection.js";
+import {
   cachedPointReadTemplate,
   equalRunRange,
+  pointReadSignature,
   pointReadTestHooks,
   resolvePointReadShape,
   valuesAreAscending,
@@ -513,6 +535,200 @@ const MAX_POINT_READ_CANDIDATES = 1_024;
 /** A keyed replay decoding more blocks than this leaves the read to the ordinary path. */
 const MAX_POINT_READ_DELTA_BLOCKS = 256;
 const MAX_POINT_READ_DELTA_HEADER_BLOCKS = 1_024;
+/** An OR with more branches than this is scanned rather than unioned through indexes. */
+const MAX_INDEXED_DISJUNCTION_BRANCHES = 16;
+/**
+ * Resolved point-read plans kept per visible history. Each distinct statement shape over the
+ * table is one entry; a workload with more shapes than this simply re-resolves.
+ */
+const POINT_READ_PLANS_PER_HISTORY = 64;
+
+/** The per-prepare key of one table's visible segments at one snapshot version. */
+function visibleSegmentsMemoKey(tableId: string, version: number | null): string {
+  return `${tableId}\u0000${String(version ?? -1)}`;
+}
+
+/** A `COUNT(*)` answer over the rows a point or index read matched. */
+function countResult(alias: string, count: number): QueryResult {
+  const row: QueryRow = {};
+  if (alias === "__proto__") defineSqlResultProperty(row, alias, count);
+  else row[alias] = count;
+  return { columns: [alias], columnDomains: [null], rows: [row] };
+}
+
+/**
+ * The catalog-state cache key of a table-name set. Table names are only trimmed, never
+ * charset-restricted, so no join separator is collision-free; JSON encoding is. A lone name is
+ * its own key unless it could be mistaken for an encoded list.
+ */
+function catalogStateCacheKey(names: readonly string[]): string {
+  const only = names.length === 1 ? names[0] : undefined;
+  return only !== undefined && !only.startsWith("[") ? only : JSON.stringify(names);
+}
+
+/** One block of an ordered-selection column: its scan position and header statistics. */
+interface OrderedSelectionBlock {
+  readonly id: string;
+  readonly rowStart: number;
+  readonly rowCount: number;
+  readonly nullCount: number;
+  readonly zone: { readonly min: number; readonly max: number } | undefined;
+}
+
+/**
+ * The `take`-th best in-range value of a block (the worst of them when fewer qualify) under the
+ * given direction, or undefined when no slot qualifies: a bounded heap holds the best `take`
+ * values seen, so one pass decides which rows can matter.
+ */
+function boundedOrderedEdge(
+  values: Float64Array,
+  length: number,
+  valid: ((slot: number) => boolean) | undefined,
+  range: OrderedRange,
+  take: number,
+  descending: boolean,
+): number | undefined {
+  // A heap whose root is the worst kept value: the minimum when keeping the largest.
+  const heap = new Float64Array(take);
+  let size = 0;
+  const worse = (left: number, right: number): boolean =>
+    descending ? left < right : left > right;
+  for (let slot = 0; slot < length; slot += 1) {
+    const value = values[slot] ?? 0;
+    if (size === take && !worse(heap[0] ?? 0, value)) continue;
+    if (!inOrderedRange(range, value) || valid?.(slot) === false) continue;
+    let position: number;
+    if (size < take) {
+      position = size;
+      size += 1;
+      // Sift up.
+      while (position > 0) {
+        const parent = (position - 1) >>> 1;
+        if (!worse(value, heap[parent] ?? 0)) break;
+        heap[position] = heap[parent] ?? 0;
+        position = parent;
+      }
+      heap[position] = value;
+      continue;
+    }
+    // Replace the root and sift down.
+    position = 0;
+    for (;;) {
+      const left = position * 2 + 1;
+      if (left >= size) break;
+      const right = left + 1;
+      const child = right < size && worse(heap[right] ?? 0, heap[left] ?? 0) ? right : left;
+      if (!worse(heap[child] ?? 0, value)) break;
+      heap[position] = heap[child] ?? 0;
+      position = child;
+    }
+    heap[position] = value;
+  }
+  return size === 0 ? undefined : heap[0];
+}
+
+/**
+ * A segment's key locators: each row's 32-bit locator and an open-addressing table from
+ * locator to row (slot value row + 1, zero empty), so a candidate probes once per segment.
+ */
+interface SegmentKeyLocators {
+  readonly anchorIds: readonly string[];
+  readonly rowCount: number;
+  /** Row offset of each key block within the segment; the last entry is the row count. */
+  readonly blockStarts: Uint32Array;
+  readonly locators: Uint32Array;
+  /** Rows whose key is NULL, which no locator names; absent when there are none. */
+  readonly nullRows?: Uint8Array;
+  readonly slots: Int32Array;
+  readonly mask: number;
+}
+
+/** Calls `hit` with every row whose key locator is `locator`, in insertion (row) order. */
+function probeSegmentKeyLocators(
+  index: SegmentKeyLocators,
+  locator: number,
+  hit: (row: number) => void,
+): void {
+  let probe = locator & index.mask;
+  for (;;) {
+    const entry = index.slots[probe] ?? 0;
+    if (entry === 0) return;
+    if (index.locators[entry - 1] === locator) hit(entry - 1);
+    probe = (probe + 1) & index.mask;
+  }
+}
+
+/** One append segment of a resolved point read: its search blocks and their zone bounds. */
+interface ResolvedPointReadSegment {
+  readonly searchBlockIds: readonly string[];
+  /** Zone bounds per search block (NaN where a header has none); absent for one block. */
+  readonly zoneMin?: Float64Array;
+  readonly zoneMax?: Float64Array;
+  /** Block ids of every other column the read touches, per block. */
+  readonly otherBlockIds: ReadonlyArray<readonly string[]>;
+}
+
+interface ResolvedPointReadCommon {
+  /** The snapshot version whose visible history this plan resolved. */
+  readonly version: number | null;
+  readonly keyColumn: TableColumnRecord;
+  readonly equalityColumns: ReadonlyMap<string, TableColumnRecord>;
+  /** Storage type of each equality's column, in equality order. */
+  readonly equalityTypes: ReadonlyArray<TableColumnRecord["type"]>;
+  readonly projected: ReadonlyArray<{ column: TableColumnRecord; alias: string }>;
+  /** Set for `SELECT COUNT(*)`: the answer is the matched rows' count under this alias. */
+  readonly count?: string;
+  readonly columns: readonly string[];
+  readonly columnDomains: ReadonlyArray<SqlDomain | null>;
+}
+
+/** One append segment of an index read: its key blocks and every needed column's blocks. */
+interface ResolvedIndexReadSegment {
+  readonly segment: SegmentRecord;
+  readonly anchorIds: readonly string[];
+  /** Block ids per needed column (`neededColumns` order), aligned with `anchorIds`. */
+  readonly blockIds: ReadonlyArray<readonly string[]>;
+}
+
+/**
+ * The value-independent half of a point read over one visible history: either proof that the
+ * shape cannot be served, a keyed replay through mutation deltas, or the append-only search
+ * plan with every block id, zone bound, and buffer-pool key the probes need.
+ */
+type ResolvedPointRead =
+  | { readonly kind: "ineligible"; readonly version: number | null }
+  | (ResolvedPointReadCommon & {
+      readonly kind: "delta";
+      readonly segments: readonly SegmentRecord[];
+    })
+  | (ResolvedPointReadCommon & {
+      readonly kind: "index";
+      readonly table: TableRecord;
+      readonly indexId: string;
+      readonly index: SecondaryIndexRecord;
+      /** The index's leading columns the equalities pin, with the equality pinning each. */
+      readonly prefixColumns: readonly TableColumnRecord[];
+      readonly prefixEqualities: readonly number[];
+      /** Whether the pinned columns leave trailing index columns open (a prefix term). */
+      readonly partial: boolean;
+      /** Equality and projected columns, read per candidate block. */
+      readonly neededColumns: readonly TableColumnRecord[];
+      readonly equalityVectors: readonly number[];
+      readonly projectedVectors: readonly number[];
+      readonly segments: readonly ResolvedIndexReadSegment[];
+    })
+  | (ResolvedPointReadCommon & {
+      readonly kind: "base";
+      readonly searchColumn: TableColumnRecord;
+      /** Index of the equality naming the search column. */
+      readonly searchEquality: number;
+      /** Needed columns other than the search column, in vector order after it. */
+      readonly otherColumns: readonly TableColumnRecord[];
+      /** Per equality and per projection: 0 for the search vector, else 1 + otherColumns index. */
+      readonly equalityVectors: readonly number[];
+      readonly projectedVectors: readonly number[];
+      readonly segments: readonly ResolvedPointReadSegment[];
+    });
 /** Delta-chunk tail length past which a search schedules a fold-by-rebuild of the base. */
 const FTS_FOLD_DELTA_CHUNKS = 16;
 /** Candidate lists wider than this scan their blocks instead of probing for exact rows. */
@@ -712,7 +928,11 @@ class BoundedWriteBlockStager {
   #pendingBytes = 0;
   #earlyStageMs = 0;
 
-  constructor(private readonly transaction: DatabaseTransaction) {}
+  constructor(
+    private readonly transaction: DatabaseTransaction,
+    /** Sees each block as it is accepted, so the writer can remember what it just encoded. */
+    private readonly accepted?: (block: BlockWrite) => void,
+  ) {}
 
   get earlyStageMs(): number {
     return this.#earlyStageMs;
@@ -741,6 +961,7 @@ class BoundedWriteBlockStager {
     }
     this.#pending.push(block);
     this.#pendingBytes += block.bytes.byteLength;
+    this.accepted?.(block);
   }
 
   pendingBlocks(): readonly BlockWrite[] {
@@ -858,6 +1079,11 @@ interface LiveProofContext {
   readonly until: number;
   /** Versions in (after, until] that recorded a change to each table. */
   readonly changedVersions: ReadonlyMap<string, ReadonlySet<number>>;
+  /**
+   * False when a manifest in the window is gone (garbage collection removes old ones), so
+   * `changedVersions` may omit a version that changed any table: nothing can be proven.
+   */
+  readonly complete: boolean;
   readonly tables: Map<string, Promise<LiveProofTable | undefined>>;
 }
 
@@ -1552,6 +1778,17 @@ class CompactionSourceChangedError extends Error {
   }
 }
 
+/**
+ * The manifest a job planned against is gone. An active job roots it, so this means the job
+ * ended -- another tab published or abandoned it -- after this step selected it, unless the job
+ * record says otherwise.
+ */
+class CompactionSourceManifestUnavailableError extends Error {
+  constructor(version: number) {
+    super(`Compaction source manifest is unavailable: ${String(version)}`);
+  }
+}
+
 function isCompactionCoordinationRefusal(error: unknown): boolean {
   return (
     error instanceof CompactionSourceChangedError ||
@@ -1584,6 +1821,7 @@ function isCatalogStatement(statement: CompiledStatement): boolean {
     case "create-table-as":
     case "drop-index":
     case "add-column":
+    case "rename-column":
     case "drop-column":
     case "create-view":
     case "drop-view":
@@ -1629,6 +1867,7 @@ export type ExecuteResult =
     }
   | { kind: "drop-index"; index: string; dropped: boolean }
   | { kind: "add-column"; table: string; column: string }
+  | { kind: "rename-column"; table: string; from: string; to: string }
   | { kind: "drop-column"; table: string; column: string; dropped: boolean }
   | { kind: "drop-table"; table: string; dropped: boolean }
   | { kind: "merge"; table: string; rowCount: number; version?: number }
@@ -1992,6 +2231,11 @@ export interface StatementWriter extends WriteSession {
 interface TransactionStatementWriter extends StatementWriter {
   /** Snapshot-only scalar projection; undefined keeps the ordinary row-shaped fallback. */
   queryFirstColumn(plan: CompiledQuery): Promise<QueryValue[] | undefined>;
+  /**
+   * `updateBatch` for keys the statement's own read of this scope just returned: that read saw
+   * every one of them present, so the separate key-presence probe is skipped.
+   */
+  updateReadKeysBatch(tableName: string, input: UpdateBatchInput): Promise<StagedWriteResult>;
   executeStatement(statement: TransactionalStatement): Promise<ExecuteResult>;
   checkpoint(): Promise<TransactionCheckpoint>;
   checkpointRetainedBytes(): number;
@@ -2369,6 +2613,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   readonly #ftsBuildsInFlight = new Map<string, Promise<void>>();
   /** Highest authoritative commit hint observed while a postings fold is in flight. */
   readonly #postingDeltaTailCounts = new Map<string, number>();
+  /**
+   * Build sessions this engine claimed and has not yet finished or aborted, by build ID. A
+   * secondary-index build claims its session before it marks the catalog; the writer that
+   * streams the base begins the same session again with the identical lifetime, which every
+   * store accepts as a replay.
+   */
+  readonly #postingBuildSessions = new Map<string, { createdAt: string; expiresAt: string }>();
 
   readonly #compaction: CompactionController;
   readonly #accountedCompactionVersions = new Set<number>();
@@ -2400,6 +2651,22 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     SegmentVisibilityCatalog,
     Map<string, SegmentRecord[]>
   >();
+  /**
+   * Resolved point reads per (visibility catalog, table record, statement signature), checked
+   * against the snapshot version. A visibility catalog is immutable and shared by every
+   * statement until the catalog moves; the weak key retires its plans with it.
+   */
+  readonly #pointReadPlans = new WeakMap<
+    SegmentVisibilityCatalog,
+    Map<TableRecord, Map<string, ResolvedPointRead>>
+  >();
+  /** Zone map ranges of a segment's blocks, per column (see #segmentKeyZones). */
+  readonly #segmentZoneCache = new WeakMap<SegmentRecord, Map<string, Float64Array>>();
+  /** Block descriptions of a segment's column, in block order (see #zonePrunedStreamSegments). */
+  readonly #segmentDescriptionCache = new WeakMap<
+    SegmentRecord,
+    Map<string, Array<ReturnType<typeof inspectBlock>>>
+  >();
   /** Per-snapshot postings reads: statistics and pruning share one result per (column, terms). */
   readonly #ftsCandidatesMemo = new WeakMap<Snapshot, Map<string, Promise<FtsCandidatesResult>>>();
   #sharedLease: SharedLeaseEntry | undefined;
@@ -2420,6 +2687,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    */
   readonly #catalogStateCache = new Map<string, QueryCatalogState>();
   #catalogStateEpoch: number | undefined;
+  /** The most recently used key of #catalogStateCache, which a repeat hit need not re-insert. */
+  #catalogStateNewest: string | undefined;
   /**
    * Immutable maps derived from one epoch-gated catalog state. A settled table can retain many
    * historical segment and transaction records after their payloads are reclaimed; rebuilding
@@ -3521,14 +3790,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const transaction = await this.#transactions.beginDeferred({ durableSnapshot: false });
     this.#transactionAdmissions.set(transaction, admission);
     transaction.limitLevelZeroSegments(table.id, MAX_LEVEL_ZERO_SEGMENTS);
-    const blockStager = new BoundedWriteBlockStager(transaction);
+    const blockStager = new BoundedWriteBlockStager(transaction, this.#rememberWrittenBlock);
     const segmentId = this.#createId();
-    transaction.setUniqueKeyChanges({
-      tableId: table.id,
-      keyTokens: [...keys.keys()],
-      requireAbsent: false,
-      remove: true,
-    });
+    transaction.setUniqueKeyChanges(
+      { tableId: table.id, keyTokens: [...keys.keys()], requireAbsent: false, remove: true },
+      { distinct: true },
+    );
     const secondaryCoverage = buildSecondaryDeleteCoverage(table);
     if (secondaryCoverage.length > 0) {
       await transaction.setFtsChangesSliced({ tableId: table.id, columns: secondaryCoverage });
@@ -3734,7 +4001,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const transaction = await this.#transactions.beginDeferred({ durableSnapshot: false });
     this.#transactionAdmissions.set(transaction, admission);
     transaction.limitLevelZeroSegments(table.id, MAX_LEVEL_ZERO_SEGMENTS);
-    const blockStager = new BoundedWriteBlockStager(transaction);
+    const blockStager = new BoundedWriteBlockStager(transaction, this.#rememberWrittenBlock);
     const segmentId = this.#createId();
     const columnBlockIds: Record<string, string[]> = {};
     let storedBytes = 0;
@@ -4012,7 +4279,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     );
     this.#transactionAdmissions.set(transaction, admission);
     transaction.limitLevelZeroSegments(table.id, MAX_LEVEL_ZERO_SEGMENTS);
-    const blockStager = new BoundedWriteBlockStager(transaction);
+    const blockStager = new BoundedWriteBlockStager(transaction, this.#rememberWrittenBlock);
     let resolvedKeys = keys;
     let segmentId: string | null = null;
     const columnBlockIds: Record<string, string[]> = {};
@@ -4540,6 +4807,24 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     // but must not give equivalent join permutations different cache identities. Keep the
     // positional table records aligned with this canonical order when reading and unpacking it.
     const catalogNames = names.length > 1 ? [...names].sort() : names;
+    // Steady state: the catalog is unchanged since the last statement and the shared lease
+    // still pins its version with time to spare. Nothing here needs storage, so nothing awaits
+    // before the action itself.
+    if (probe !== undefined) {
+      const state = this.#cachedCatalogStateHit(catalogNames, probe.catalogEpoch);
+      const prepared = state === undefined ? undefined : this.#preparedCatalogStates.get(state);
+      const entry =
+        state === undefined || prepared === undefined
+          ? undefined
+          : this.#acquireCurrentSharedLease(state.manifestVersion);
+      if (entry !== undefined && prepared !== undefined) {
+        try {
+          return await action(entry.lease, prepared.realTables, prepared.visibility);
+        } finally {
+          this.#releaseSharedLease(entry);
+        }
+      }
+    }
     for (;;) {
       const state = await this.#cachedCatalogState(catalogNames, probe);
       let prepared = this.#preparedCatalogStates.get(state);
@@ -4550,19 +4835,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           if (table === undefined) throw new UnknownTableError(name);
           realTables.set(table.name, table);
         });
-        const segmentsByTable = new Map<string, SegmentRecord[]>();
-        for (const segment of state.segments) {
-          const tableSegments = segmentsByTable.get(segment.tableId) ?? [];
-          tableSegments.push(segment);
-          segmentsByTable.set(segment.tableId, tableSegments);
-        }
-        prepared = {
-          realTables,
-          visibility: {
-            transactions: new Map(state.transactions.map((record) => [record.id, record] as const)),
-            segmentsByTable,
-          },
-        };
+        prepared = { realTables, visibility: catalogStateVisibility(state) };
         this.#preparedCatalogStates.set(state, prepared);
       }
       const entry = await this.#acquireSharedLease(state.manifestVersion);
@@ -4595,17 +4868,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     // A probe the caller read moments earlier in the same statement serves: a state read under
     // it is at least as fresh, and the cache is only consulted under its epoch.
     const { catalogEpoch } = probe ?? (await this.store.getCatalogProbe());
-    // Table names are only trimmed, never charset-restricted, so no join separator is
-    // collision-free; JSON encoding is.
-    const key = JSON.stringify(names);
-    if (catalogEpoch === this.#catalogStateEpoch) {
-      const cached = this.#catalogStateCache.get(key);
-      if (cached !== undefined) {
-        this.#catalogStateCache.delete(key);
-        this.#catalogStateCache.set(key, cached);
-        return cached;
-      }
-    }
+    const cached = this.#cachedCatalogStateHit(names, catalogEpoch);
+    if (cached !== undefined) return cached;
+    const key = catalogStateCacheKey(names);
     const state = await this.#queryCatalogState(names);
     // Only a state carrying its own epoch (read atomically with the records) can be cached;
     // the sequential fallback shape cannot prove which epoch it observed.
@@ -4615,11 +4880,31 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       this.#catalogStateEpoch = state.catalogEpoch;
     }
     this.#catalogStateCache.set(key, state);
+    this.#catalogStateNewest = key;
     if (this.#catalogStateCache.size > CATALOG_STATE_CACHE_LIMIT) {
       const oldest = this.#catalogStateCache.keys().next().value;
       if (oldest !== undefined) this.#catalogStateCache.delete(oldest);
     }
     return state;
+  }
+
+  /** The cached catalog state for these names when it is provably current at this epoch. */
+  #cachedCatalogStateHit(
+    names: readonly string[],
+    catalogEpoch: number,
+  ): QueryCatalogState | undefined {
+    if (catalogEpoch !== this.#catalogStateEpoch) return undefined;
+    const key = catalogStateCacheKey(names);
+    const cached = this.#catalogStateCache.get(key);
+    if (cached === undefined) return undefined;
+    // Recency: the oldest entry is the one evicted when the cache is full. Touching the most
+    // recent entry again would only re-hash its key.
+    if (this.#catalogStateNewest !== key) {
+      this.#catalogStateCache.delete(key);
+      this.#catalogStateCache.set(key, cached);
+      this.#catalogStateNewest = key;
+    }
+    return cached;
   }
 
   /** One coherent catalog read assembled from bounded pages under a stable epoch probe. */
@@ -4657,8 +4942,29 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * version and the old one retires as they finish. Returns undefined when the version's
    * manifest disappeared between the catalog read and the lease, so the caller can re-read.
    */
-  async #acquireSharedLease(version: number | null): Promise<SharedLeaseEntry | undefined> {
+  /**
+   * The shared lease, taken without storage work: only when it already pins `version`, no
+   * re-pin is in flight, and it has more than half its time left, so no renewal is due.
+   */
+  #acquireCurrentSharedLease(version: number | null): SharedLeaseEntry | undefined {
     if (this.#closed) throw new DatabaseClosedError();
+    const current = this.#sharedLease;
+    if (
+      current?.version !== version ||
+      this.#sharedLeaseMove !== undefined ||
+      current.lease.expiresAtMilliseconds - dateMilliseconds(this.#now()) <=
+        INTERNAL_READ_LEASE_TTL_MS / 2
+    ) {
+      return undefined;
+    }
+    current.refCount += 1;
+    this.#sharedLeaseUses += 1;
+    return current;
+  }
+
+  async #acquireSharedLease(version: number | null): Promise<SharedLeaseEntry | undefined> {
+    const reused = this.#acquireCurrentSharedLease(version);
+    if (reused !== undefined) return reused;
     this.#sharedLeaseAcquisitions += 1;
     try {
       for (;;) {
@@ -4671,7 +4977,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         const current = this.#sharedLease;
         if (
           current?.version === version &&
-          dateMilliseconds(current.lease.expiresAt) - dateMilliseconds(this.#now()) > 0
+          current.lease.expiresAtMilliseconds - dateMilliseconds(this.#now()) > 0
         ) {
           current.refCount += 1;
           this.#sharedLeaseUses += 1;
@@ -5198,7 +5504,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             if (!(error instanceof UnknownTableError)) throw error;
           }
           throwIfAborted(options.signal);
-          if (point !== undefined) return externalizeQueryResult(point);
+          // A point read never returns a NUL-prefixed value outside a domain column, so a
+          // result with no domain columns is already public, and stays so under re-reading.
+          if (point !== undefined) {
+            return point.columnDomains.every((domain) => domain === null)
+              ? point
+              : externalizeQueryResult(point);
+          }
         }
       }
     }
@@ -5557,6 +5869,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       return columns;
     };
     rewritten = bindPendingSelectShapes(rewritten, columnsOf);
+    rewritten = mergeJoinColumns(rewritten, columnsOf);
     if (aliased) rewritten = expandSourceColumnAliases(rewritten, columnsOf);
     if (natural) rewritten = expandNaturalJoins(rewritten, columnsOf);
     // With every subquery name resolved, the rewrites compilation had to hold back can run:
@@ -5582,8 +5895,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       return result;
     }
     const table = await this.#findTable(statement.table);
-    const alias =
-      statement.kind !== "insert" && statement.alias !== undefined ? statement.alias : table.name;
+    const alias = statement.alias ?? table.name;
     const facts = await this.#catalogFacts();
     return {
       ...result,
@@ -5920,6 +6232,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    */
   async #keyForwardChanges(after: number, until: number): Promise<KeyForwardChange[] | undefined> {
     const context = await this.#liveProofContext(after, until);
+    // A collected manifest may have been the one that wrote forwards: read the table whole.
+    if (!context.complete) return undefined;
     const versions = context.changedVersions.get(KEY_FORWARDS_TABLE_ID);
     if (versions === undefined || versions.size === 0) return [];
     const entry = await this.#liveProofTable(context, KEY_FORWARDS_TABLE_ID);
@@ -6401,6 +6715,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       cascadeBudget,
       true,
     );
+    // The moved rows' own references were pointed at the new keys above; a new key can also
+    // be a key another moved row gave up (a shift or a swap), so the pass over the table's
+    // referencing rows must leave the moved rows alone or it would move them a second time.
+    const movedRows = new Set(
+      moved.map((index) => keyToken(keyColumn.type, presentAt(newKeys, index))),
+    );
     await this.#moveReferences(
       transaction,
       table,
@@ -6408,6 +6728,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       renamed,
       cascadeBudget,
       referentialBudget,
+      movedRows,
     );
     await this.#stageKeyForwards(transaction, table, [...renamed.values()]);
     await this.#stageTriggerDerivedInserts(
@@ -6441,6 +6762,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     renamed: ReadonlyMap<string, { fromValues: BatchValue[]; toValues: BatchValue[] }>,
     cascadeBudget: number,
     referentialBudget: number,
+    /** Key tokens of the parent's moved rows, whose references to their own table already moved. */
+    movedRows: ReadonlySet<string>,
   ): Promise<void> {
     const quote = quoteSqlIdentifier;
     const sources = [...renamed.values()];
@@ -6485,7 +6808,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           keyToken(address.keyColumn.type, addressStorageKey(address, tuple)),
         );
         if (target === undefined) continue;
-        keys.push(storedSqlValueFromExecution(childKey, row[REKEY_CHILD_KEY] ?? null));
+        const childRowKey = storedSqlValueFromExecution(childKey, row[REKEY_CHILD_KEY] ?? null);
+        if (
+          child.id === parent.id &&
+          childRowKey !== null &&
+          movedRows.has(keyToken(childKey.type, childRowKey))
+        ) {
+          continue;
+        }
+        keys.push(childRowKey);
         for (const [position, column] of key.columns.entries()) {
           changes[column]?.push(target.toValues[position] ?? null);
         }
@@ -6590,7 +6921,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   ): Promise<QueryResult | undefined> {
     pointReadTestHooks.attempted += 1;
     const probe = await this.store.getCatalogProbe();
-    const forwards = await this.#pointReadForwards(probe);
+    // A database that has never rekeyed proves the absence of forwards once per catalog epoch.
+    const forwards =
+      !this.#keyForwardsTableSeen && this.#keyForwardsTableAbsentAt === probe.catalogEpoch
+        ? undefined
+        : await this.#pointReadForwards(probe);
     const forwardedTables =
       forwards === undefined ? undefined : await this.#forwardedTableNames(forwards, probe);
     const result = await this.#withSharedCatalogSnapshot(
@@ -6680,75 +7015,76 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const equalities = forwardKeyEqualities(table, shape.equalities, NO_TABLES, forwards);
       if (equalities !== shape.equalities) shape = { ...shape, equalities: [...equalities] };
     }
-    // Short projections cost fewer allocations as direct lookups. Wide projections keep
-    // a name map so SELECT * never turns catalog binding into quadratic work.
-    const byName =
-      shape.select === "*" || shape.select.length + shape.equalities.length > 8
-        ? new Map(table.columns.map((column) => [column.name, column]))
-        : undefined;
-    const findColumn = (name: string): TableColumnRecord | undefined =>
-      byName === undefined
-        ? table.columns.find((column) => column.name === name)
-        : byName.get(name);
-    const matchesStorageType = (
-      column: TableColumnRecord,
-      value: PointReadEquality["value"],
-    ): boolean =>
-      column.sqlDomain === undefined &&
-      column.hidden !== true &&
-      ((column.type === "number" && typeof value === "number") ||
-        (column.type === "string" && typeof value === "string") ||
-        (column.type === "boolean" && typeof value === "boolean") ||
-        (column.type === "datetime" && value instanceof Date));
-    const equalityColumns = new Map<string, TableColumnRecord>();
-    for (const equality of shape.equalities) {
-      const column = findColumn(equality.column);
-      if (column === undefined || !matchesStorageType(column, equality.value)) return undefined;
-      equalityColumns.set(column.name, column);
+    // Visible history is a function of (visibility catalog, table, snapshot version), and the
+    // resolved plan of that history plus the statement's value-free signature.
+    const signature = pointReadSignature(shape);
+    let byTable = this.#pointReadPlans.get(visibility);
+    let plans = byTable?.get(table);
+    let plan = plans?.get(signature);
+    if (plan?.version !== snapshot.version) {
+      // The history is listed only once the statement's columns prove it a point read.
+      plan = await this.#resolvePointRead(shape, table, snapshot, () =>
+        this.#visibleSegmentRecords(table, snapshot, visibility),
+      );
+      if (byTable === undefined) {
+        byTable = new Map();
+        this.#pointReadPlans.set(visibility, byTable);
+      }
+      if (plans === undefined) {
+        plans = new Map();
+        byTable.set(table, plans);
+      } else if (plans.size >= POINT_READ_PLANS_PER_HISTORY) {
+        plans.clear();
+      }
+      plans.set(signature, plan);
     }
-    // Key coverage is the selectivity proof: the conjunction addresses at most one row, so
-    // per-row candidate verification cannot degrade into an unvectorized table scan.
-    const keyColumn = getUniqueKeyColumn(table);
-    if (keyColumn === undefined) return undefined;
-    const keyComponents = keyColumn.hidden === true ? primaryKeyColumns(table) : [keyColumn];
-    if (keyComponents.length === 0) return undefined;
-    if (!keyComponents.every((component) => equalityColumns.has(component.name))) {
-      return undefined;
+    if (plan.kind === "ineligible") return undefined;
+    const result = await this.#servePointRead(plan, shape, snapshot, visibility, options);
+    if (result === undefined || plan.count === undefined) return result;
+    return countResult(plan.count, result.rows.length);
+  }
+
+  /** Executes a resolved point read: a key search, a keyed delta replay, or an index lookup. */
+  async #servePointRead(
+    plan: Exclude<ResolvedPointRead, { kind: "ineligible" }>,
+    shape: PointReadShape,
+    snapshot: LeasedSnapshot,
+    visibility: SegmentVisibilityCatalog,
+    options: QueryOptions,
+  ): Promise<QueryResult | undefined> {
+    // Each execution's literals must match their columns' storage types exactly; any coercion
+    // case belongs to the ordinary executor.
+    const equalities = shape.equalities;
+    for (let index = 0; index < equalities.length; index += 1) {
+      const type = plan.equalityTypes[index];
+      const value = equalities[index]?.value;
+      if (!(
+        (type === "number" && typeof value === "number") ||
+        (type === "string" && typeof value === "string") ||
+        (type === "boolean" && typeof value === "boolean") ||
+        (type === "datetime" && value instanceof Date)
+      )) {
+        return undefined;
+      }
     }
-    // A logical-domain projection is served too: the stored scalar is the tagged internal
-    // value the ordinary executor's pipeline carries for a bare column reference, and both
-    // paths cross the result boundary through the same externalizeQueryResult call, so
-    // reporting the column's domain below makes the answers identical by construction.
-    const projected: Array<{ column: TableColumnRecord; alias: string }> = [];
-    const selected =
-      shape.select === "*"
-        ? visibleTableColumns(table).map((column) => ({ column: column.name, alias: column.name }))
-        : shape.select;
-    for (const item of selected) {
-      const column = findColumn(item.column);
-      if (column === undefined || column.hidden === true) return undefined;
-      projected.push({ column, alias: item.alias });
+    if (plan.kind === "index") {
+      // A scope's staged rows are in no index until it commits, so its reads scan.
+      if (visibility.overlayTransactionId !== undefined) return undefined;
+      return this.#indexReadAtSnapshot(plan, shape, snapshot, options);
     }
-    const segments = await this.#visibleSegmentRecords(table, snapshot, visibility);
-    if (
-      segments.some((segment) => {
-        const kind = segment.kind;
-        return kind !== "insert" && kind !== "base";
-      })
-    ) {
+    if (plan.kind === "delta") {
       // Update and delete deltas are replayed for the one key instead of the whole table: a
       // scalar key identifies its row in every segment, so the row's history is a handful of
       // small blocks. A composite (hidden) key keeps the ordinary replay.
-      if (keyColumn.hidden === true) return undefined;
       // Outside a scope, a history too long to replay cheaply is one compaction should have
       // folded, and the scan is the honest answer. Inside one, the staged segments cannot fold
       // before the commit and the scan would walk the same segments in full: replay them all.
       return this.#pointReadThroughDeltas(
         shape,
-        keyColumn,
-        segments,
-        equalityColumns,
-        projected,
+        plan.keyColumn,
+        plan.segments,
+        plan.equalityColumns,
+        plan.projected,
         snapshot,
         options,
         visibility.overlayTransactionId === undefined
@@ -6756,84 +7092,70 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           : Number.POSITIVE_INFINITY,
       );
     }
-    // The most selective searchable component wins nothing provable without statistics, so
-    // prefer a numeric component (zone-map pruning plus binary search) over a string one
-    // (per-block reverse dictionary), and fall back to any equality column on the key.
-    const searchColumn =
-      keyComponents.find(
-        (component) => component.type === "number" || component.type === "datetime",
-      ) ??
-      keyComponents.find((component) => component.type === "string") ??
-      keyComponents[0];
-    if (searchColumn === undefined) return undefined;
-    const searchEquality = shape.equalities.find(
-      (equality) => equality.column === searchColumn.name,
-    );
-    if (searchEquality === undefined) return undefined;
-    const searchTarget =
-      searchEquality.value instanceof Date
-        ? dateMilliseconds(searchEquality.value)
-        : searchEquality.value;
-    const neededColumns = [
-      ...new Set([...equalityColumns.values(), ...projected.map((item) => item.column)]),
-    ];
+    const searchValue = equalities[plan.searchEquality]?.value;
+    if (searchValue === undefined) return undefined;
+    const searchTarget = searchValue instanceof Date ? dateMilliseconds(searchValue) : searchValue;
+    const numericTarget = typeof searchTarget === "number";
     const rows: QueryRow[] = [];
     let candidateBudget = MAX_POINT_READ_CANDIDATES;
-    for (const segment of segments) {
+    const vectors: ColumnVector[] = [];
+    for (const segment of plan.segments) {
       throwIfAborted(options.signal);
-      if (segment.rowCount === 0) continue;
-      const searchBlockIds = segment.columnBlockIds[searchColumn.id] ?? [];
-      if (searchBlockIds.length === 0) return undefined;
-      for (const column of neededColumns) {
-        if ((segment.columnBlockIds[column.id]?.length ?? 0) !== searchBlockIds.length) {
-          return undefined;
+      const blockCount = segment.searchBlockIds.length;
+      let blockIndexes: number[] | undefined;
+      for (let blockIndex = 0; blockIndex < blockCount; blockIndex += 1) {
+        // A block whose zone map excludes the key cannot hold it. A header without a zone map
+        // carries NaN bounds, which exclude nothing.
+        if (
+          numericTarget &&
+          segment.zoneMin !== undefined &&
+          segment.zoneMax !== undefined &&
+          (searchTarget < (segment.zoneMin[blockIndex] ?? Number.NaN) ||
+            searchTarget > (segment.zoneMax[blockIndex] ?? Number.NaN))
+        ) {
+          continue;
         }
+        (blockIndexes ??= []).push(blockIndex);
       }
-      let blockIndexes = searchBlockIds.map((_, index) => index);
-      // A single block cannot be pruned, so skip the zone lookup entirely for the hot
-      // one-block OLTP table shape.
-      if (typeof searchTarget === "number" && searchBlockIds.length > 1) {
-        const descriptions = await this.#zoneDescriptions(searchBlockIds, snapshot);
-        blockIndexes = blockIndexes.filter((blockIndex) => {
-          const zone = descriptions.get(searchBlockIds[blockIndex] ?? "")?.metadata.zoneMap;
-          return zone === undefined || (zone.min <= searchTarget && searchTarget <= zone.max);
-        });
-      }
-      if (blockIndexes.length === 0) continue;
-      const searchBlocks = await this.#pointReadVectors(
-        blockIndexes.map((blockIndex) => searchBlockIds[blockIndex] ?? ""),
+      if (blockIndexes === undefined) continue;
+      const searchBlocks = await this.#pointReadBlockVectors(
+        segment.searchBlockIds,
+        blockIndexes,
         snapshot,
       );
-      for (const [position, blockIndex] of blockIndexes.entries()) {
+      for (let position = 0; position < blockIndexes.length; position += 1) {
         throwIfAborted(options.signal);
+        const blockIndex = blockIndexes[position] ?? 0;
         const vector = searchBlocks[position];
         if (vector === undefined) return undefined;
-        const blockId = searchBlockIds[blockIndex] ?? "";
-        if (vector.kind !== searchColumn.type) return undefined;
-        const candidates = this.#keySlotsInBlock(blockId, vector, searchTarget);
+        if (vector.kind !== plan.searchColumn.type) return undefined;
+        const candidates = this.#keySlotsInBlock(
+          segment.searchBlockIds[blockIndex] ?? "",
+          vector,
+          searchTarget,
+        );
         if (candidates === undefined) return undefined;
         if (candidates.length === 0) continue;
         candidateBudget -= candidates.length;
         if (candidateBudget < 0) return undefined;
-        const remainingColumns = neededColumns.filter((column) => column.id !== searchColumn.id);
-        const rowBlockIds = remainingColumns.map(
-          (column) => segment.columnBlockIds[column.id]?.[blockIndex] ?? "",
-        );
-        const rowBlocks = await this.#pointReadVectors(rowBlockIds, snapshot);
-        const vectors = new Map<string, ColumnVector>([[searchColumn.name, vector]]);
-        for (const [index, column] of remainingColumns.entries()) {
-          const columnVector = rowBlocks[index];
+        vectors.length = 0;
+        vectors.push(vector);
+        for (let column = 0; column < plan.otherColumns.length; column += 1) {
+          const blockId = segment.otherBlockIds[column]?.[blockIndex] ?? "";
+          const columnVector =
+            (this.#blockCacheGet(ArtifactFamily.blockVector, blockId) as
+              ColumnVector | undefined) ?? (await this.#pointReadVectors([blockId], snapshot))[0];
           if (columnVector === undefined) return undefined;
-          if (columnVector.kind !== column.type) return undefined;
-          vectors.set(column.name, columnVector);
+          if (columnVector.kind !== plan.otherColumns[column]?.type) return undefined;
+          vectors.push(columnVector);
         }
         for (const slot of candidates) {
           let matches = true;
-          for (const equality of shape.equalities) {
-            const columnVector = vectors.get(equality.column);
+          for (let index = 0; index < equalities.length; index += 1) {
+            const columnVector = vectors[plan.equalityVectors[index] ?? 0];
             if (columnVector === undefined) return undefined;
             const stored = vectorValue(columnVector, slot);
-            const wanted = equality.value;
+            const wanted = equalities[index]?.value;
             const equal =
               wanted instanceof Date
                 ? stored instanceof Date && dateMilliseconds(stored) === dateMilliseconds(wanted)
@@ -6845,9 +7167,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           }
           if (!matches) continue;
           const row: QueryRow = {};
-          for (const item of projected) {
-            const columnVector = vectors.get(item.column.name);
-            if (columnVector === undefined) return undefined;
+          for (let index = 0; index < plan.projected.length; index += 1) {
+            const item = plan.projected[index];
+            const columnVector = vectors[plan.projectedVectors[index] ?? 0];
+            if (item === undefined || columnVector === undefined) return undefined;
             const value = vectorValue(columnVector, slot);
             if (typeof value === "string" && value.charCodeAt(0) === 0) {
               // A domain column's stored scalar is expected here: it carries the internal
@@ -6867,10 +7190,396 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
     }
     return {
-      columns: projected.map((item) => item.alias),
-      columnDomains: projected.map((item) => item.column.sqlDomain ?? null),
+      columns: [...plan.columns],
+      columnDomains: [...plan.columnDomains],
       rows,
     };
+  }
+
+  /**
+   * Vectors for some blocks of one column, from the buffer pool where resident. Misses are
+   * decoded in one batch, so a cold lookup still costs one storage round trip.
+   */
+  async #pointReadBlockVectors(
+    ids: readonly string[],
+    blockIndexes: readonly number[],
+    snapshot: LeasedSnapshot,
+  ): Promise<Array<ColumnVector | undefined>> {
+    const vectors: Array<ColumnVector | undefined> = [];
+    let missing = false;
+    for (const blockIndex of blockIndexes) {
+      const vector = this.#blockCacheGet(ArtifactFamily.blockVector, ids[blockIndex] ?? "") as
+        ColumnVector | undefined;
+      if (vector === undefined) missing = true;
+      vectors.push(vector);
+    }
+    if (!missing) return vectors;
+    return this.#pointReadVectors(
+      blockIndexes.map((blockIndex) => ids[blockIndex] ?? ""),
+      snapshot,
+    );
+  }
+
+  /**
+   * Everything about a point read that does not depend on its values, resolved once per
+   * (visible history, statement shape): the columns its equalities and projection name, the
+   * key proof, and for each segment the search blocks with their zone bounds and the
+   * buffer-pool keys of every block the read may touch. Executions then do no catalog work,
+   * no header reads, and no key-string building — only the probes for their own key.
+   */
+  async #resolvePointRead(
+    shape: PointReadShape,
+    table: TableRecord,
+    snapshot: LeasedSnapshot,
+    visibleSegments: () => Promise<readonly SegmentRecord[]>,
+  ): Promise<ResolvedPointRead> {
+    const version = snapshot.version;
+    const ineligible: ResolvedPointRead = { kind: "ineligible", version };
+    // Short projections cost fewer allocations as direct lookups. Wide projections keep
+    // a name map so SELECT * never turns catalog binding into quadratic work.
+    const select = shape.select;
+    const byName =
+      !Array.isArray(select) || select.length + shape.equalities.length > 8
+        ? new Map(table.columns.map((column) => [column.name, column]))
+        : undefined;
+    const findColumn = (name: string): TableColumnRecord | undefined =>
+      byName === undefined
+        ? table.columns.find((column) => column.name === name)
+        : byName.get(name);
+    const equalityColumns = new Map<string, TableColumnRecord>();
+    const equalityTypes: Array<TableColumnRecord["type"]> = [];
+    for (const equality of shape.equalities) {
+      const column = findColumn(equality.column);
+      if (column === undefined || column.sqlDomain !== undefined || column.hidden === true) {
+        return ineligible;
+      }
+      equalityColumns.set(column.name, column);
+      equalityTypes.push(column.type);
+    }
+    const keyColumn = getUniqueKeyColumn(table);
+    if (keyColumn === undefined) return ineligible;
+    // A logical-domain projection is served too: the stored scalar is the tagged internal
+    // value the ordinary executor's pipeline carries for a bare column reference, and both
+    // paths cross the result boundary through the same externalizeQueryResult call, so
+    // reporting the column's domain below makes the answers identical by construction.
+    const projected: Array<{ column: TableColumnRecord; alias: string }> = [];
+    const selected = Array.isArray(select)
+      ? select
+      : select === "*"
+        ? visibleTableColumns(table).map((column) => ({ column: column.name, alias: column.name }))
+        : [];
+    for (const item of selected) {
+      const column = findColumn(item.column);
+      if (column === undefined || column.hidden === true) return ineligible;
+      projected.push({ column, alias: item.alias });
+    }
+    const common = {
+      version,
+      keyColumn,
+      equalityColumns,
+      equalityTypes,
+      projected,
+      ...(!Array.isArray(select) && select !== "*" ? { count: select.count } : {}),
+      columns: projected.map((item) => item.alias),
+      columnDomains: projected.map((item) => item.column.sqlDomain ?? null),
+    };
+    // Key coverage is the selectivity proof: the conjunction addresses at most one row, so
+    // per-row candidate verification cannot degrade into an unvectorized table scan. Without
+    // it, a ready secondary index on the pinned columns names the candidate rows instead.
+    const keyComponents = keyColumn.hidden === true ? primaryKeyColumns(table) : [keyColumn];
+    if (keyComponents.length === 0) return ineligible;
+    if (!keyComponents.every((component) => equalityColumns.has(component.name))) {
+      return this.#resolveIndexRead(shape, table, common, await visibleSegments());
+    }
+    const segments = await visibleSegments();
+    if (
+      segments.some((segment) => {
+        const kind = segment.kind;
+        return kind !== "insert" && kind !== "base";
+      })
+    ) {
+      return keyColumn.hidden === true ? ineligible : { kind: "delta", ...common, segments };
+    }
+    // The most selective searchable component wins nothing provable without statistics, so
+    // prefer a numeric component (zone-map pruning plus binary search) over a string one
+    // (per-block reverse dictionary), and fall back to any equality column on the key.
+    const searchColumn =
+      keyComponents.find(
+        (component) => component.type === "number" || component.type === "datetime",
+      ) ??
+      keyComponents.find((component) => component.type === "string") ??
+      keyComponents[0];
+    if (searchColumn === undefined) return ineligible;
+    const searchEquality = shape.equalities.findIndex(
+      (equality) => equality.column === searchColumn.name,
+    );
+    if (searchEquality < 0) return ineligible;
+    const otherColumns = [
+      ...new Set([...equalityColumns.values(), ...projected.map((item) => item.column)]),
+    ].filter((column) => column.id !== searchColumn.id);
+    const vectorIndex = (column: TableColumnRecord): number =>
+      column.id === searchColumn.id
+        ? 0
+        : otherColumns.findIndex((other) => other.id === column.id) + 1;
+    const equalityVectors = shape.equalities.map((equality) =>
+      vectorIndex(equalityColumns.get(equality.column) ?? searchColumn),
+    );
+    const projectedVectors = projected.map((item) => vectorIndex(item.column));
+    const resolvedSegments: ResolvedPointReadSegment[] = [];
+    for (const segment of segments) {
+      if (segment.rowCount === 0) continue;
+      const searchBlockIds = segment.columnBlockIds[searchColumn.id] ?? [];
+      if (searchBlockIds.length === 0) return ineligible;
+      for (const column of otherColumns) {
+        if ((segment.columnBlockIds[column.id]?.length ?? 0) !== searchBlockIds.length) {
+          return ineligible;
+        }
+      }
+      let zones: { zoneMin: Float64Array; zoneMax: Float64Array } | undefined;
+      // A single block cannot be pruned, so skip the zone lookup entirely for the hot
+      // one-block OLTP table shape.
+      if (
+        (searchColumn.type === "number" || searchColumn.type === "datetime") &&
+        searchBlockIds.length > 1
+      ) {
+        const descriptions = await this.#zoneDescriptions(searchBlockIds, snapshot);
+        zones = {
+          zoneMin: new Float64Array(searchBlockIds.length).fill(Number.NaN),
+          zoneMax: new Float64Array(searchBlockIds.length).fill(Number.NaN),
+        };
+        for (const [blockIndex, blockId] of searchBlockIds.entries()) {
+          const zone = descriptions.get(blockId)?.metadata.zoneMap;
+          if (zone === undefined) continue;
+          zones.zoneMin[blockIndex] = zone.min;
+          zones.zoneMax[blockIndex] = zone.max;
+        }
+      }
+      const otherBlockIds = otherColumns.map((column) => segment.columnBlockIds[column.id] ?? []);
+      resolvedSegments.push({ searchBlockIds, ...zones, otherBlockIds });
+    }
+    return {
+      kind: "base",
+      ...common,
+      searchColumn,
+      searchEquality,
+      otherColumns,
+      equalityVectors,
+      projectedVectors,
+      segments: resolvedSegments,
+    };
+  }
+
+  /**
+   * The value-independent half of an index read: a conjunction of equalities that does not cover
+   * the key, over an append-only history, served through a ready key-locator secondary index whose
+   * leading columns it pins. The postings name candidate keys; each candidate row is verified
+   * against every equality, so a stale posting or a locator collision costs a check, never an
+   * answer. Ineligible whenever the general path's index pruning would not apply either.
+   */
+  #resolveIndexRead(
+    shape: PointReadShape,
+    table: TableRecord,
+    common: ResolvedPointReadCommon,
+    segments: readonly SegmentRecord[],
+  ): ResolvedPointRead {
+    const ineligible: ResolvedPointRead = { kind: "ineligible", version: common.version };
+    if (
+      segments.some((segment) => {
+        const kind = segment.kind;
+        return kind !== "insert" && kind !== "base";
+      })
+    ) {
+      return ineligible;
+    }
+    // The longest pinned prefix of any ready key-locator index, as index pruning would choose.
+    let best:
+      { indexId: string; index: SecondaryIndexRecord; columns: TableColumnRecord[] } | undefined;
+    for (const [indexId, index] of Object.entries(table.secondaryIndexes ?? {})) {
+      if (index.state !== "ready" || index.locator !== "key-hash-v1") continue;
+      const indexColumns = secondaryIndexColumnIds(index).map((columnId) =>
+        table.columns.find((column) => column.id === columnId),
+      );
+      if (indexColumns.some((column) => column === undefined)) continue;
+      const columns: TableColumnRecord[] = [];
+      for (const column of indexColumns as TableColumnRecord[]) {
+        if (!common.equalityColumns.has(column.name)) break;
+        columns.push(column);
+      }
+      if (columns.length === 0) continue;
+      // tuple-v1 postings omit rows NULL in a trailing column, so a prefix read through such an
+      // index could miss a matching row; the general path refuses the same lookup.
+      if (
+        columns.length < indexColumns.length &&
+        !secondaryIndexTermsCoverNulls(index) &&
+        (indexColumns as TableColumnRecord[])
+          .slice(columns.length)
+          .some((column) => column.nullable)
+      ) {
+        continue;
+      }
+      if (best === undefined || columns.length > best.columns.length) {
+        best = { indexId, index, columns };
+      }
+    }
+    if (best === undefined) return ineligible;
+    const prefixEqualities = best.columns.map((column) =>
+      shape.equalities.findIndex((equality) => equality.column === column.name),
+    );
+    if (prefixEqualities.some((position) => position < 0)) return ineligible;
+    const neededColumns = [
+      ...new Set([
+        ...common.equalityColumns.values(),
+        ...common.projected.map((item) => item.column),
+      ]),
+    ];
+    const vectorIndex = (column: TableColumnRecord): number =>
+      neededColumns.findIndex((candidate) => candidate.id === column.id);
+    const resolved: ResolvedIndexReadSegment[] = [];
+    for (const segment of segments) {
+      if (segment.rowCount === 0) continue;
+      const anchorIds = segment.columnBlockIds[common.keyColumn.id] ?? [];
+      if (anchorIds.length === 0) return ineligible;
+      if (Object.values(segment.columnBlockIds).some((ids) => ids.length !== anchorIds.length)) {
+        return ineligible;
+      }
+      const blockIds = neededColumns.map((column) => segment.columnBlockIds[column.id]);
+      if (blockIds.some((ids) => ids === undefined)) return ineligible;
+      resolved.push({ segment, anchorIds, blockIds: blockIds as string[][] });
+    }
+    const indexColumnCount = secondaryIndexColumnIds(best.index).length;
+    return {
+      kind: "index",
+      ...common,
+      table,
+      indexId: best.indexId,
+      index: best.index,
+      prefixColumns: best.columns,
+      prefixEqualities,
+      partial: best.columns.length < indexColumnCount,
+      neededColumns,
+      equalityVectors: shape.equalities.map((equality) =>
+        vectorIndex(common.equalityColumns.get(equality.column) ?? common.keyColumn),
+      ),
+      projectedVectors: common.projected.map((item) => vectorIndex(item.column)),
+      segments: resolved,
+    };
+  }
+
+  /** Executes an index read: postings for the pinned prefix, then exact checks per candidate. */
+  async #indexReadAtSnapshot(
+    plan: Extract<ResolvedPointRead, { kind: "index" }>,
+    shape: PointReadShape,
+    snapshot: LeasedSnapshot,
+    options: QueryOptions,
+  ): Promise<QueryResult | undefined> {
+    const equalities = shape.equalities;
+    let term = "";
+    try {
+      for (const [position, column] of plan.prefixColumns.entries()) {
+        const value = equalities[plan.prefixEqualities[position] ?? -1]?.value;
+        if (value === undefined) return undefined;
+        term += secondaryIndexComponentTerm(plan.index, column, position, value);
+      }
+    } catch {
+      return undefined;
+    }
+    const upToVersion = snapshot.version ?? -1;
+    const result = await this.#readFtsCandidatesMemoized(
+      snapshot,
+      plan.table.id,
+      plan.index.storageColumnId,
+      [{ term, prefix: plan.partial }],
+      upToVersion,
+    );
+    if (result.overflow || !result.hasBase || result.coversVersion > upToVersion) return undefined;
+    const candidates = result.rowIdsByTerm[0] ?? [];
+    if (candidates.length > MAX_POINT_READ_CANDIDATES) return undefined;
+    const rows: QueryRow[] = [];
+    if (candidates.length === 0) {
+      return { columns: [...plan.columns], columnDomains: [...plan.columnDomains], rows };
+    }
+    const locatorNumbers = candidates.map((candidate) =>
+      candidate <= 0xffff_ffffn ? Number(candidate) : -1,
+    );
+    let budget = MAX_POINT_READ_CANDIDATES;
+    const vectors: ColumnVector[] = [];
+    for (const entry of plan.segments) {
+      throwIfAborted(options.signal);
+      const locators = await this.#segmentKeyLocators(
+        entry.segment,
+        entry.anchorIds,
+        plan.keyColumn,
+        snapshot,
+      );
+      if (locators === undefined) return undefined;
+      const hits: number[] = [];
+      for (const locator of locatorNumbers) {
+        if (locator >= 0) probeSegmentKeyLocators(locators, locator, (row) => hits.push(row));
+      }
+      if (hits.length === 0) continue;
+      budget -= hits.length;
+      if (budget < 0) return undefined;
+      // Scan order within the segment, as the ordinary executor would return the rows.
+      const ordered = Uint32Array.from(hits).sort();
+      let blockIndex = -1;
+      for (let position = 0; position < ordered.length; position += 1) {
+        const row = ordered[position] ?? 0;
+        if (position > 0 && row === ordered[position - 1]) continue;
+        let block = blockIndex < 0 ? 0 : blockIndex;
+        while (
+          block + 1 < entry.anchorIds.length &&
+          (locators.blockStarts[block + 1] ?? 0) <= row
+        ) {
+          block += 1;
+        }
+        if (block !== blockIndex) {
+          blockIndex = block;
+          vectors.length = 0;
+          for (const [column, ids] of entry.blockIds.entries()) {
+            const blockId = ids[block] ?? "";
+            const vector =
+              (this.#blockCacheGet(ArtifactFamily.blockVector, blockId) as
+                ColumnVector | undefined) ?? (await this.#pointReadVectors([blockId], snapshot))[0];
+            if (vector === undefined || vector.kind !== plan.neededColumns[column]?.type) {
+              return undefined;
+            }
+            vectors.push(vector);
+          }
+        }
+        const slot = row - (locators.blockStarts[block] ?? 0);
+        let matches = true;
+        for (let index = 0; index < equalities.length; index += 1) {
+          const columnVector = vectors[plan.equalityVectors[index] ?? -1];
+          if (columnVector === undefined) return undefined;
+          const stored = vectorValue(columnVector, slot);
+          const wanted = equalities[index]?.value;
+          const equal =
+            wanted instanceof Date
+              ? stored instanceof Date && dateMilliseconds(stored) === dateMilliseconds(wanted)
+              : stored === wanted;
+          if (!equal) {
+            matches = false;
+            break;
+          }
+        }
+        if (!matches) continue;
+        const output: QueryRow = {};
+        for (let index = 0; index < plan.projected.length; index += 1) {
+          const item = plan.projected[index];
+          const columnVector = vectors[plan.projectedVectors[index] ?? -1];
+          if (item === undefined || columnVector === undefined) return undefined;
+          const value = vectorValue(columnVector, slot);
+          if (typeof value === "string" && value.charCodeAt(0) === 0) {
+            // As for a key read: only a domain column's tagged scalar is provably reproduced.
+            if (item.column.sqlDomain === undefined || !isSqlDomainValue(value)) return undefined;
+          }
+          if (item.alias === "__proto__") defineSqlResultProperty(output, item.alias, value);
+          else output[item.alias] = value;
+        }
+        rows.push(output);
+      }
+    }
+    return { columns: [...plan.columns], columnDomains: [...plan.columnDomains], rows };
   }
 
   /**
@@ -6943,28 +7652,32 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     let decodedBlocks = 0;
     // Read bounded batches of headers once, including single-block deltas. Unrelated keys
     // cannot affect this row and must not exhaust its unchanged decoded-block replay cap.
-    let descriptions: Map<string, ReturnType<typeof inspectBlock>> | undefined;
+    let zones: Float64Array[] | undefined;
     if (typeof target === "number") {
-      const ids: string[] = [];
+      let headerBlocks = 0;
       for (const segment of segments) {
-        for (const id of segment.columnBlockIds[keyColumn.id] ?? []) {
-          if (ids.length === MAX_POINT_READ_DELTA_HEADER_BLOCKS) return undefined;
-          ids.push(id);
-        }
+        headerBlocks += segment.columnBlockIds[keyColumn.id]?.length ?? 0;
+        if (headerBlocks > MAX_POINT_READ_DELTA_HEADER_BLOCKS) return undefined;
       }
-      descriptions = await this.#zoneDescriptions(ids, snapshot);
+      zones = await this.#segmentKeyZones(segments, keyColumn.id, snapshot);
     }
-    for (const segment of segments) {
+    for (const [segmentIndex, segment] of segments.entries()) {
       throwIfAborted(options.signal);
       if (segment.rowCount === 0) continue;
       const keyBlockIds = segment.columnBlockIds[keyColumn.id] ?? [];
       if (keyBlockIds.length === 0) return undefined;
-      let blockIndexes = keyBlockIds.map((_, index) => index);
-      if (typeof target === "number" && descriptions !== undefined) {
-        blockIndexes = blockIndexes.filter((blockIndex) => {
-          const zone = descriptions.get(keyBlockIds[blockIndex] ?? "")?.metadata.zoneMap;
-          return zone === undefined || (zone.min <= target && target <= zone.max);
-        });
+      let blockIndexes: number[];
+      const segmentZones = zones?.[segmentIndex];
+      if (typeof target === "number" && segmentZones !== undefined) {
+        // Most deltas in a long history hold other keys: rule them out before allocating.
+        blockIndexes = [];
+        for (let blockIndex = 0; blockIndex < keyBlockIds.length; blockIndex += 1) {
+          const min = segmentZones[blockIndex * 2] ?? Number.NEGATIVE_INFINITY;
+          const max = segmentZones[blockIndex * 2 + 1] ?? Number.POSITIVE_INFINITY;
+          if (min <= target && target <= max) blockIndexes.push(blockIndex);
+        }
+      } else {
+        blockIndexes = keyBlockIds.map((_, index) => index);
       }
       if (blockIndexes.length === 0) continue;
       decodedBlocks += blockIndexes.length;
@@ -7061,13 +7774,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     vector: ColumnVector & { kind: "string" },
     value: string,
   ): number | undefined {
-    let reverse = this.#cacheGet(`drd ${blockId}`) as Map<string, number> | undefined;
+    let reverse = this.#blockCacheGet(ArtifactFamily.reverseDictionary, blockId) as
+      Map<string, number> | undefined;
     if (reverse === undefined) {
       reverse = new Map<string, number>();
       for (const [code, entry] of vector.dictionary.entries()) reverse.set(entry, code);
       let bytes = 64;
       for (const entry of vector.dictionary) bytes += 32 + entry.length;
-      this.#cachePut(`drd ${blockId}`, reverse, bytes);
+      this.#blockCachePut(ArtifactFamily.reverseDictionary, blockId, reverse, bytes);
     }
     return reverse.get(value);
   }
@@ -7464,14 +8178,30 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
     }
     const table = await this.#findTable(base.table);
+    // A patch re-evaluates only the base rows whose keys a commit touched, which is sound only
+    // while a change to the lookup side always runs the statement in full. When the lookup is
+    // the base table itself, every change looks like a base-only change, and a row joined to a
+    // changed row (a child whose parent was deleted, say) would keep its old partner.
+    for (const join of plan.joins) {
+      if ((await this.#findTable(join.table)).id === table.id) {
+        return decline("self-join; the lookup side is the base table");
+      }
+    }
     const keyColumn = getUniqueKeyColumn(table);
     if (keyColumn === undefined) return decline(`${table.name} has no unique key`);
     if (keyColumn.hidden === true) return decline(`${table.name} has a composite unique key`);
     if (keyColumn.sqlDomain !== undefined) {
       return decline(`the unique key of ${table.name} has a SQL domain`);
     }
+    // A generated column changes with the columns it is computed from, not only when written.
+    const readableColumns = new Map(
+      visibleTableColumns(table)
+        .filter((column) => column.generatedValue === undefined)
+        .map((column) => [column.name, column.id]),
+    );
     const aggregate = LiveAggregate.plan(plan, `${base.alias}.${keyColumn.name}`);
-    if (aggregate !== undefined)
+    if (aggregate !== undefined) {
+      const readColumns = liveReadColumns(plan, base.alias, keyColumn.name, readableColumns, true);
       return {
         tableId: table.id,
         keyColumnId: keyColumn.id,
@@ -7490,7 +8220,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         positions: new Map(),
         order: [],
         aggregate,
+        ...(readColumns === undefined ? {} : { readColumns }),
       };
+    }
     if (plan.groupBy.length > 0 || plan.having.length > 0) {
       return decline(
         "GROUP BY or HAVING without additive aggregates (COUNT, SUM, AVG of one row-local argument)",
@@ -7556,6 +8288,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         ? 0
         : Math.max(LIVE_WINDOW_MARGIN_MIN, Math.min(plan.limit, LIVE_WINDOW_MARGIN_MAX));
     if (margin > 0) fullPlan.limit = (plan.limit ?? 0) + margin;
+    // Pins come from the plan after catalog rewrites, so a retired key literal already names the
+    // row it forwards to; a rekey moves the forwards table, re-running and re-planning this.
+    const keyPins = liveKeyPins(plan, base.alias, keyColumn.name);
+    const readColumns = liveReadColumns(plan, base.alias, keyColumn.name, readableColumns);
     return {
       tableId: table.id,
       keyColumnId: keyColumn.id,
@@ -7573,6 +8309,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       keys: [],
       positions: new Map(),
       order: [],
+      ...(keyPins === undefined ? {} : { keyPins }),
+      ...(readColumns === undefined ? {} : { readColumns }),
     };
   }
 
@@ -7651,6 +8389,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   ): Promise<LiveMaintainedChange | undefined> {
     if (tableIds.length !== 1 || tableIds[0] !== state.tableId) return undefined;
     const context = await this.#liveProofContext(after, until);
+    if (!context.complete) return undefined;
     const entry = await this.#liveProofTable(context, state.tableId);
     if (entry === undefined) return undefined;
     for (const version of context.changedVersions.get(state.tableId) ?? []) {
@@ -7660,6 +8399,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (changed === undefined) return undefined;
     const { changedKeys, existingKeys } = changed;
     if (changedKeys.size === 0) return { result: retained, state, changed: false };
+    // Updates that write no column the statement reads leave every row where it was: in or out
+    // of the result, at its place, contributing what it did. Deletes qualify too, except to an
+    // aggregate (a deleted row's contribution leaves it) or a row the result holds (below).
+    const leavesReadColumns =
+      state.readColumns !== undefined &&
+      liveWindowLeavesReadColumns(entry.windowSegments, state.readColumns, state.keyColumnId);
+    if (state.aggregate !== undefined && leavesReadColumns) {
+      return { result: retained, state, changed: false };
+    }
     if (state.aggregate !== undefined) {
       const deltaPlan: CompiledQuery = {
         ...state.deltaPlan,
@@ -7675,7 +8423,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           },
         ],
       };
-      const input = await this.#withReadReservation(() => this.#queries.run(deltaPlan, {}, probe));
+      const input = await this.#withReadReservation(() => {
+        liveMaintenanceTestHooks.deltaQueries += 1;
+        return this.#queries.run(deltaPlan, {}, probe);
+      });
       const aggregate = await state.aggregate.patch(
         input,
         new Set(changedKeys.keys()),
@@ -7715,6 +8466,25 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       // shifts the window onto a row this result never held.
       for (const token of existingKeys) if (!retainedTokens.has(token)) return undefined;
     }
+    // No retained row changed, and the WHERE pins the key to values no changed key has: the
+    // delta query below would match nothing, so the result stands without running it.
+    if (
+      affected.size === 0 &&
+      state.keyPins !== undefined &&
+      !liveKeyPinsAdmit(state.keyPins, changedKeys)
+    ) {
+      return { result: retained, state, changed: false };
+    }
+    // Nor does it when the window only updated columns the WHERE and ORDER BY never read, or
+    // deleted rows: a row the result does not hold kept its membership and its place. A complete
+    // result holds every row that matched; a truncated one ordered by its key holds a prefix.
+    if (
+      affected.size === 0 &&
+      leavesReadColumns &&
+      (state.complete || state.readColumns.totalOrder)
+    ) {
+      return { result: retained, state, changed: false };
+    }
     const deltaPlan: CompiledQuery = {
       ...state.deltaPlan,
       predicates: [
@@ -7730,7 +8500,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       ],
     };
     const delta = splitLiveHiddenColumns(
-      await this.#withReadReservation(() => this.#queries.run(deltaPlan, {}, probe)),
+      await this.#withReadReservation(() => {
+        liveMaintenanceTestHooks.deltaQueries += 1;
+        return this.#queries.run(deltaPlan, {}, probe);
+      }),
       state,
     );
     if (affected.size === 0 && delta.result.rows.length === 0)
@@ -7818,13 +8591,25 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     after: number | null,
     until: number,
   ): Promise<boolean> {
-    const plan = this.#compileLiveQuery(query);
+    let plan = this.#compileLiveQuery(query);
     if (planContainsFts(plan)) return true;
+    // The zone proof must test the statement as it runs: a key constant naming a retired key
+    // reads the row at the forward's target, and a row written there is one the statement
+    // returns, whatever the constant as written says. The current forwards are the right ones:
+    // a later rekey changes the forwards table, which this statement depends on and re-runs for.
+    const { tables, keyForwardsTableId } = await this.#catalogFacts();
+    if (keyForwardsTableId !== undefined && planHasKeyLiterals(plan, tables)) {
+      const forwards = await this.#committedForwards();
+      if (forwards !== undefined && !forwards.isEmpty()) {
+        plan = forwardPlanKeyLiterals(plan, tables, forwards);
+      }
+    }
     // Base-scan zone proofs are unsound when the plan reads the table anywhere else — a
     // subquery, EXISTS/IN, derived table, or set-operation branch can observe a row the base
     // predicates reject (e.g. `value > (SELECT AVG(value) FROM t)`).
     if (planReadsBeyondSingleScan(plan)) return true;
     const context = await this.#liveProofContext(after, until);
+    if (!context.complete) return true;
     for (const tableId of tableIds) {
       const entry = await this.#liveProofTable(context, tableId);
       if (entry === undefined) return true;
@@ -7859,7 +8644,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           ...new Set(
             predicates.flatMap((predicate) =>
               (segment.columnBlockIds[predicate.column.id] ?? []).filter(
-                (blockId) => this.#cacheGet(`zi ${blockId}`) === undefined,
+                (blockId) =>
+                  this.#blockCacheGet(ArtifactFamily.zoneDescription, blockId) === undefined,
               ),
             ),
           ),
@@ -7869,14 +8655,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           for (const [index, blockId] of uncachedIds.entries()) {
             const bytes = fetched[index];
             if (bytes === undefined) return true;
-            this.#cachePut(`zi ${blockId}`, inspectBlock(bytes), ZONE_DESCRIPTION_CACHE_BYTES);
+            this.#blockCachePut(
+              ArtifactFamily.zoneDescription,
+              blockId,
+              inspectBlock(bytes),
+              ZONE_DESCRIPTION_CACHE_BYTES,
+            );
           }
         }
         for (let blockIndex = 0; blockIndex < firstIds.length; blockIndex += 1) {
           let canMatch = true;
           for (const predicate of predicates) {
             const blockId = segment.columnBlockIds[predicate.column.id]?.[blockIndex] ?? "";
-            const description = this.#cacheGet(`zi ${blockId}`) as
+            const description = this.#blockCacheGet(ArtifactFamily.zoneDescription, blockId) as
               ReturnType<typeof inspectBlock> | undefined;
             if (description === undefined) return true;
             if (description.type !== predicate.column.type) return true;
@@ -7914,12 +8705,20 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       // Proof requires every version to be accounted for by a surviving, inspected segment:
       // garbage collection deletes reclaimed segments outright, so "no segment in the window"
       // is absence of evidence, not evidence of neutrality.
+      //
+      // The same holds for the manifests themselves: a collected one leaves no record of the
+      // tables it changed. Versions are consecutive (`createManifest` publishes
+      // `expectedVersion + 1`), so a gap in the window is detectable.
       const changedVersions = new Map<string, Set<number>>();
+      let expected = after === null ? 0 : after + 1;
+      let complete = true;
       let cursor = after;
       pages: for (;;) {
         const page = await this.store.listManifestPage(cursor, 64);
         for (const manifest of page.records) {
           if (manifest.version > until) break pages;
+          if (manifest.version !== expected) complete = false;
+          expected = manifest.version + 1;
           for (const tableId of manifest.changedTableIds) {
             const versions = changedVersions.get(tableId) ?? new Set<number>();
             versions.add(manifest.version);
@@ -7930,7 +8729,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         if (page.nextCursor === null) break;
         cursor = page.nextCursor;
       }
-      return { after, until, changedVersions, tables: new Map() };
+      if (expected !== until + 1) complete = false;
+      return { after, until, changedVersions, complete, tables: new Map() };
     })();
     this.#liveProofContexts.set(key, context);
     if (this.#liveProofContexts.size > LIVE_PROOF_CONTEXT_LIMIT) {
@@ -8256,6 +9056,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       manifest.changedTableIds.every((tableId) => contributedTableIds.has(tableId))
     ) {
       const nextEpoch = initial.catalogEpoch + 1;
+      // An ordinary commit publishes level-zero segments and retires no block, so every segment
+      // visible before it stays visible and its own segments join them: the visible-segment lists
+      // carry forward instead of re-proving every block of every segment on the next statement.
+      // A compaction's commit retires its sources and never takes this path.
+      const carryVisibility =
+        transaction?.compactionSourceBlockIds.length === 0 &&
+        contribution.segments.every((segment) => segment.level === 0);
       for (const state of this.#catalogStateCache.values()) {
         if (
           state.catalogEpoch !== initial.catalogEpoch ||
@@ -8266,6 +9073,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         // The state object is retained so cache/LRU identity stays stable, but its derived maps
         // are immutable snapshots. Drop them before appending the newly committed owner/segment;
         // otherwise the same database instance keeps reading the pre-commit visibility graph.
+        const previousPrepared = this.#preparedCatalogStates.get(state);
         this.#preparedCatalogStates.delete(state);
         const tableIds = new Set(
           state.tables.flatMap((table) => (table === undefined ? [] : [table.id])),
@@ -8293,8 +9101,22 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             state.segments[index] = replacement;
             additionsById.delete(current.id);
           }
-          state.segments.push(...additionsById.values());
-          state.segments.sort((left, right) => left.id.localeCompare(right.id));
+          // The list is kept in id order; the few new records go in by binary search rather than
+          // re-sorting the table's whole history on every commit.
+          for (const segment of additionsById.values()) {
+            let low = 0;
+            let high = state.segments.length;
+            while (low < high) {
+              const middle = (low + high) >>> 1;
+              const current = state.segments[middle];
+              if (current !== undefined && current.id.localeCompare(segment.id) < 0) {
+                low = middle + 1;
+              } else {
+                high = middle;
+              }
+            }
+            state.segments.splice(low, 0, segment);
+          }
           const ownerIndex = state.transactions.findIndex(
             (record) => record.id === contribution.transaction.id,
           );
@@ -8306,8 +9128,31 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
         state.manifestVersion = manifest.version;
         state.catalogEpoch = nextEpoch;
+        if (carryVisibility && previousPrepared !== undefined) {
+          this.#carryVisibleSegments(
+            state,
+            previousPrepared,
+            initial.manifestVersion,
+            manifest.version,
+            contribution.transaction,
+            additions,
+          );
+        }
       }
       this.#catalogStateEpoch = nextEpoch;
+      // The epoch moved for this commit's manifest alone; no table record changed with it unless
+      // the commit created one. What the catalog says, and that no rekey has created the forwards
+      // table, therefore still hold at the next epoch — reading them again costs every keyed write
+      // a scan of the whole catalog and a forwards-table read.
+      if (contribution.transaction.pendingTable === undefined) {
+        const facts = this.#catalogCache;
+        if (facts?.epoch === initial.catalogEpoch) {
+          this.#catalogCache = { epoch: nextEpoch, facts: facts.facts };
+        }
+        if (this.#keyForwardsTableAbsentAt === initial.catalogEpoch) {
+          this.#keyForwardsTableAbsentAt = nextEpoch;
+        }
+      }
     }
     this.#notifyLiveCommit();
     for (const hint of manifest.ftsDeltaCounts ?? []) {
@@ -9029,7 +9874,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
     const segmentId = this.#createId();
     const columnBlockIds: Record<string, string[]> = {};
-    const blockStager = new BoundedWriteBlockStager(transaction);
+    const blockStager = new BoundedWriteBlockStager(transaction, this.#rememberWrittenBlock);
     const plannedColumns = table.columns.map((column) =>
       writeColumnValues(column.type, batch.columns[column.name] ?? []),
     );
@@ -9364,6 +10209,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         open();
         return guarded(() => this.runStatement(statement, { writer }));
       },
+      updateReadKeysBatch: async (tableName, input) => {
+        open();
+        staged += 1;
+        return guarded(() => this.#sessionUpdate(transaction, tableName, input, 1, true));
+      },
       stagedKeyPresence: (table, keyColumn, keys) =>
         this.#scopeKeyPresence(transaction, table, keyColumn, keys),
       checkpoint: async () => {
@@ -9453,6 +10303,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       queryPlan: (plan) => enqueue(() => writer.queryPlan(plan), "read"),
       queryFirstColumn: (plan) => enqueue(() => writer.queryFirstColumn(plan), "read"),
       executeStatement: (statement) => enqueue(() => writer.executeStatement(statement)),
+      updateReadKeysBatch: (name, input) => enqueue(() => writer.updateReadKeysBatch(name, input)),
       checkpoint: () => enqueue(() => writer.checkpoint()),
       stagedKeyPresence: (table, keyColumn, keys) =>
         enqueue(async () => writer.stagedKeyPresence?.(table, keyColumn, keys), "read"),
@@ -10664,15 +11515,35 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       // The committed probe reads the store's current unique-key index, as #assertKeysExist
       // does: a key another writer committed meanwhile counts as present here, and the scope's
       // commit then fails on that writer's conflict rather than publishing over it.
-      const existing = await this.#existingKeyTokens(
-        table,
-        transaction.snapshotVersion,
-        unresolved,
-      );
-      for (const token of existing) present.add(token);
+      //
+      // An INSERT asks twice in a row — the statement before it builds its batch, the session
+      // write before it registers keys — with nothing staged in between. The second asks about
+      // the same keys, so it is answered from the first rather than from another store read.
+      const generation = this.#scopeWriteState(transaction)?.generation ?? -1;
+      const staged = transaction.stagedWorkCount;
+      let memo = this.#committedKeyProbes.get(transaction);
+      if (memo?.tableId !== table.id || memo.generation !== generation || memo.staged !== staged) {
+        memo = { tableId: table.id, generation, staged, present: new Map() };
+      }
+      const known = memo.present;
+      const probe = unresolved.filter((token) => !known.has(token));
+      if (probe.length > 0) {
+        const existing = new Set(
+          await this.#existingKeyTokens(table, transaction.snapshotVersion, probe),
+        );
+        for (const token of probe) known.set(token, existing.has(token));
+      }
+      this.#committedKeyProbes.set(transaction, memo);
+      for (const token of unresolved) if (known.get(token) === true) present.add(token);
     }
     return present;
   }
+
+  /** The last committed key probe of each scope, while nothing has been staged since. */
+  readonly #committedKeyProbes = new WeakMap<
+    DatabaseTransaction,
+    { tableId: string; generation: number; staged: number; present: Map<string, boolean> }
+  >();
 
   async #runScopeKeyedMutation(
     transaction: DatabaseTransaction,
@@ -10724,7 +11595,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     /** The insert half of a rekey: its UPDATE triggers fire around it, not INSERT triggers. */
     rekey = false,
   ): Promise<StagedUpsertResult> {
-    const table = await this.#findTable(tableName);
+    const table = await this.#findTable(tableName, transaction);
     // Session upserts classify against the scope's own staged state, so a row inserted
     // earlier in the scope makes a later upsert of its key fire as an UPDATE.
     const sessionUpsertKeyColumn = kind === "upsert" ? getUniqueKeyColumn(table) : undefined;
@@ -10810,11 +11681,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (kind === "insert") await this.#assertInsertKeysAbsent(transaction, table, batch, keys);
     else assertBatchSecondaryTermsDistinct(table, batch);
     if (keys !== undefined) {
-      transaction.setUniqueKeyChanges({
-        tableId: table.id,
-        keyTokens: [...keys.keys()],
-        requireAbsent: kind === "insert",
-      });
+      transaction.setUniqueKeyChanges(
+        { tableId: table.id, keyTokens: [...keys.keys()], requireAbsent: kind === "insert" },
+        { distinct: true },
+      );
     }
     const insertValueAt = (source: "new" | "old", column: string, rowIndex: number): BatchValue =>
       source === "new" ? (batch.columns[column]?.[rowIndex] ?? null) : null;
@@ -10973,8 +11843,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         ),
       this.#scopeKeyLookup(transaction, table, keyColumn),
     );
-    input = applyStoredGeneratedUpdateChanges(table, input, preImages);
-    validateUpdateBatch(table, keyColumn, input);
+    const generatedInput = applyStoredGeneratedUpdateChanges(table, input, preImages);
+    // Only stored generated columns add values to check; without them the batch is unchanged.
+    if (generatedInput !== input) validateUpdateBatch(table, keyColumn, generatedInput);
+    input = generatedInput;
     changedForeignKey = (table.foreignKeys ?? []).some(
       (key) =>
         key.enforced !== false &&
@@ -11126,12 +11998,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (keyStringByteLengths !== undefined) {
       validatedStringByteLengths.set(input.keys, keyStringByteLengths);
     }
-    transaction.setUniqueKeyChanges({
-      tableId: table.id,
-      keyTokens: [...keys.keys()],
-      requireAbsent: false,
-      remove: true,
-    });
+    transaction.setUniqueKeyChanges(
+      { tableId: table.id, keyTokens: [...keys.keys()], requireAbsent: false, remove: true },
+      { distinct: true },
+    );
     const secondaryCoverage = buildSecondaryDeleteCoverage(table);
     if (secondaryCoverage.length > 0) {
       await transaction.setFtsChangesSliced({ tableId: table.id, columns: secondaryCoverage });
@@ -11206,7 +12076,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const columns = [keyColumn, ...changedColumns.map((name) => findColumn(table, name))];
     const segmentId = this.#createId();
     const columnBlockIds: Record<string, string[]> = {};
-    const blockStager = new BoundedWriteBlockStager(transaction);
+    const blockStager = new BoundedWriteBlockStager(transaction, this.#rememberWrittenBlock);
     const plannedColumns = columns.map((column) =>
       writeColumnValues(
         column.type,
@@ -11275,7 +12145,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   ): Promise<string> {
     const segmentId = this.#createId();
     const blockIds: string[] = [];
-    const blockStager = new BoundedWriteBlockStager(transaction);
+    const blockStager = new BoundedWriteBlockStager(transaction, this.#rememberWrittenBlock);
     const plannedColumn = writeColumnValues(keyColumn.type, values);
     const ranges = await writeBlockRangesSliced(
       [plannedColumn],
@@ -11906,6 +12776,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
         if (secondaryIndexPredicates(reported, record).length > 0) {
           notes.push("a ready secondary index prunes the scan to candidate row groups");
+        }
+        if (secondaryIndexDisjunctions(reported, record).length > 0) {
+          notes.push("ready secondary indexes serve every branch of an OR");
         }
         const referenced = referencedColumns(
           reported,
@@ -12570,22 +13443,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const keyColumn = getUniqueKeyColumn(table);
     const onConflict = statement.onConflict;
     if (onConflict === undefined) throw new Error("ON CONFLICT update metadata is missing");
-    const conflictColumns = onConflict.columns ?? [onConflict.column];
-    const addressColumns =
-      keyColumn?.hidden === true
-        ? primaryKeyColumns(table).map(({ name }) => name)
-        : keyColumn === undefined
-          ? []
-          : [keyColumn.name];
-    if (
-      keyColumn === undefined ||
-      conflictColumns.length !== addressColumns.length ||
-      conflictColumns.some((name, index) => name !== addressColumns[index])
-    ) {
-      throw new TypeError(
-        `ON CONFLICT targets the table's primary or unique key columns: ${addressColumns.join(", ") || "(none)"}`,
-      );
+    if (keyColumn === undefined) {
+      throw new TypeError("ON CONFLICT needs a table with a primary or unique key");
     }
+    const arbiter = conflictArbiter(table, keyColumn, onConflict.columns ?? [onConflict.column]);
     statement = foldInsertColumns(table, statement);
     for (const name of statement.columns) {
       if (!table.columns.some((column) => column.name === name)) {
@@ -12625,7 +13486,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const keyToken = (value: QueryValue): string =>
       value instanceof Date ? `d${dateIsoString(value)}` : `${typeof value} ${String(value)}`;
     const proposedKeys = new Set<string>();
-    for (const key of keyValues) {
+    // Under a UNIQUE arbiter the proposals' own keys decide nothing: a repeated key among rows
+    // that update existing holders is harmless, and among fresh rows the insert refuses it.
+    for (const key of arbiter.kind === "key" ? keyValues : []) {
       if (key === null) continue;
       const token = keyToken(key);
       if (proposedKeys.has(token)) {
@@ -12634,6 +13497,30 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         );
       }
       proposedKeys.add(token);
+    }
+    // PostgreSQL proposes rows one at a time, so a second proposal of the same UNIQUE tuple
+    // conflicts with the first — whether that one updated a stored row or was inserted — and
+    // the statement would affect one row twice.
+    const arbiterTuple = (rowIndex: number): BatchValue[] | undefined => {
+      if (arbiter.kind !== "unique") return undefined;
+      const tuple = arbiter.columns.map(({ name }) => proposed.columns[name]?.[rowIndex] ?? null);
+      return tuple.some((value) => value === null) ? undefined : tuple;
+    };
+    if (arbiter.kind === "unique") {
+      const proposedTuples = new Set<string>();
+      for (const rowIndex of statement.rows.keys()) {
+        const tuple = arbiterTuple(rowIndex);
+        if (tuple === undefined) continue;
+        const token = sqlTupleToken(tuple);
+        if (proposedTuples.has(token)) {
+          throw new TypeError(
+            `ON CONFLICT DO UPDATE cannot affect the row holding ${arbiter.name} (${tuple
+              .map(String)
+              .join(", ")}) twice`,
+          );
+        }
+        proposedTuples.add(token);
+      }
     }
     const returningColumns =
       options.returning === undefined
@@ -12682,6 +13569,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       (column) => !(table.primaryKeyColumnIds ?? [keyColumn.id]).includes(column.id),
     );
     const wholeRowReplacement =
+      arbiter.kind === "key" &&
       conflictWhere === undefined &&
       assignments.length === replacementColumns.length &&
       replacementColumns.every((column) =>
@@ -12753,20 +13641,46 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const apply = async (
       transaction: WriteSession,
     ): Promise<{ affectedRows: number[]; returnedRows?: QueryRow[] }> => {
-      const present = await transaction.query(
-        `SELECT ${quoteSqlIdentifier(keyColumn.name)} AS key FROM ${quoteSqlIdentifier(
-          table.name,
-        )} WHERE ${quoteSqlIdentifier(keyColumn.name)} IN (${keyValues.map(() => "?").join(", ")})`,
-        { params: keyValues },
-      );
-      const existing = new Set(present.rows.map((row) => keyToken(row.key ?? null)));
+      // The stored row each conflicting proposal targets, by its row-addressing key: the
+      // proposal's own key for a primary-key arbiter, the holder of its tuple for a UNIQUE one.
+      const conflictKeys = new Map<number, QueryValue>();
+      if (arbiter.kind === "key") {
+        const present = await transaction.query(
+          `SELECT ${quoteSqlIdentifier(keyColumn.name)} AS key FROM ${quoteSqlIdentifier(
+            table.name,
+          )} WHERE ${quoteSqlIdentifier(keyColumn.name)} IN (${keyValues.map(() => "?").join(", ")})`,
+          { params: keyValues },
+        );
+        const existing = new Set(present.rows.map((row) => keyToken(row.key ?? null)));
+        for (const rowIndex of statement.rows.keys()) {
+          const key = keyValues[rowIndex] ?? null;
+          if (key !== null && existing.has(keyToken(key))) conflictKeys.set(rowIndex, key);
+        }
+      } else {
+        const tuples = [...statement.rows.keys()].flatMap((rowIndex) => {
+          const tuple = arbiterTuple(rowIndex);
+          return tuple === undefined ? [] : [tuple];
+        });
+        const holders = await this.#uniqueTupleHolders(
+          table,
+          keyColumn,
+          arbiter.columns,
+          tuples,
+          transaction,
+        );
+        for (const rowIndex of statement.rows.keys()) {
+          const tuple = arbiterTuple(rowIndex);
+          const holder = tuple === undefined ? undefined : holders.get(sqlTupleToken(tuple));
+          if (holder !== undefined) conflictKeys.set(rowIndex, holder);
+        }
+      }
       const freshRows: number[] = [];
       const conflictingRows: number[] = [];
       const updatedRows: number[] = [];
       const seenConflicts = new Set<string>();
       for (const rowIndex of statement.rows.keys()) {
-        const key = keyValues[rowIndex] ?? null;
-        if (key !== null && existing.has(keyToken(key))) {
+        const key = conflictKeys.get(rowIndex);
+        if (key !== undefined) {
           const token = keyToken(key);
           if (seenConflicts.has(token)) {
             throw new TypeError(
@@ -12779,7 +13693,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
       if (conflictingRows.length > 0) {
         const keys = conflictingRows.map((rowIndex) => {
-          const value = keyValues[rowIndex] ?? null;
+          const value = conflictKeys.get(rowIndex) ?? null;
           if (value === null) {
             throw new TypeError(`Unique key values must not be null: ${keyColumn.name}`);
           }
@@ -12848,7 +13762,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
       const affectedRows = [...freshRows, ...updatedRows].sort((left, right) => left - right);
       if (returningColumns === undefined) return { affectedRows };
-      const keys = affectedRows.map((rowIndex) => keyValues[rowIndex] ?? null);
+      const keys = affectedRows.map(
+        (rowIndex) => conflictKeys.get(rowIndex) ?? keyValues[rowIndex] ?? null,
+      );
       if (keys.length === 0) return { affectedRows, returnedRows: [] };
       const selectedColumns = [...new Set([keyColumn.name, ...returningColumns])];
       const selected = selectedColumns.map(quoteSqlIdentifier).join(", ");
@@ -12888,34 +13804,26 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     };
   }
 
-  /** ON CONFLICT DO NOTHING: drops insert rows whose unique key already exists at a snapshot. */
+  /**
+   * ON CONFLICT DO NOTHING: drops insert rows that would violate an arbiter constraint at the
+   * statement's snapshot — the table's key, the one UNIQUE constraint a target names, or, for a
+   * targetless DO NOTHING, every unique constraint the table has, as in PostgreSQL.
+   */
   async #filterConflictingInsertRows(
     statement: Extract<CompiledStatement, { kind: "insert" }>,
     writer?: StatementWriter,
   ): Promise<Extract<CompiledStatement, { kind: "insert" }>> {
     const table = await this.#findTable(statement.table);
     const keyColumn = getUniqueKeyColumn(table);
-    const addressColumns =
-      keyColumn?.hidden === true
-        ? primaryKeyColumns(table).map(({ name }) => name)
-        : keyColumn === undefined
-          ? []
-          : [keyColumn.name];
-    // A targetless DO NOTHING means "any unique key", which for a Minnow table is its key.
-    const conflictColumns =
-      statement.onConflict?.anyTarget === true
-        ? addressColumns
-        : (statement.onConflict?.columns ??
-          (statement.onConflict === undefined ? [] : [statement.onConflict.column]));
-    if (
-      keyColumn === undefined ||
-      conflictColumns.length !== addressColumns.length ||
-      conflictColumns.some((name, index) => name !== addressColumns[index])
-    ) {
-      throw new TypeError(
-        `ON CONFLICT targets the table's primary or unique key columns: ${addressColumns.join(", ") || "(none)"}`,
-      );
+    const onConflict = statement.onConflict;
+    if (keyColumn === undefined || onConflict === undefined) {
+      throw new TypeError("ON CONFLICT needs a table with a primary or unique key");
     }
+    const arbiters =
+      onConflict.anyTarget === true
+        ? [{ kind: "key" } as const, ...uniqueConflictArbiters(table)]
+        : [conflictArbiter(table, keyColumn, onConflict.columns ?? [onConflict.column])];
+    const checksKey = arbiters.some((arbiter) => arbiter.kind === "key");
     const proposed = insertStatementBatch(statement);
     coerceSqlWriteBatch(table, proposed);
     const statementNow = this.#now();
@@ -12952,6 +13860,68 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         ),
     );
     const keys = filled.batch.columns[keyColumn.name] ?? [];
+    // Each arbiter answers "is this proposal taken?" and records a retained proposal: UPSERT
+    // makes its choice per proposed row, so a later duplicate in the same VALUES list conflicts
+    // with the first retained proposal and takes DO NOTHING too. A proposal that conflicts on
+    // any arbiter is dropped without claiming anything.
+    const keyCheck = checksKey
+      ? await this.#doNothingKeyCheck(table, keyColumn, keys, writer)
+      : undefined;
+    // A UNIQUE arbiter's tuple per proposal (undefined when any component is NULL, which never
+    // conflicts), and the tuples already held — stored, staged, or retained earlier in this list.
+    const uniqueChecks: Array<{ tokens: Array<string | undefined>; taken: Set<string> }> = [];
+    for (const arbiter of arbiters) {
+      if (arbiter.kind !== "unique") continue;
+      const tuples = materializedRows.map((_, index) => {
+        const tuple = arbiter.columns.map(
+          ({ name }) => filled.batch.columns[name]?.[index] ?? null,
+        );
+        return tuple.some((value) => value === null) ? undefined : tuple;
+      });
+      const present = tuples.filter((tuple): tuple is BatchValue[] => tuple !== undefined);
+      const holders = await this.#uniqueTupleHolders(
+        table,
+        keyColumn,
+        arbiter.columns,
+        present,
+        writer,
+      );
+      uniqueChecks.push({
+        tokens: tuples.map((tuple) => (tuple === undefined ? undefined : sqlTupleToken(tuple))),
+        taken: new Set(holders.keys()),
+      });
+    }
+    return {
+      ...statement,
+      columns,
+      rows: materializedRows.filter((_, index) => {
+        const key = keys[index] ?? null;
+        if (key !== null && keyCheck?.taken(key) === true) return false;
+        const collides = uniqueChecks.some(({ tokens, taken }) => {
+          const token = tokens[index];
+          return token !== undefined && taken.has(token);
+        });
+        if (collides) return false;
+        if (key !== null) keyCheck?.claim(key);
+        for (const { tokens, taken } of uniqueChecks) {
+          const token = tokens[index];
+          if (token !== undefined) taken.add(token);
+        }
+        return true;
+      }),
+    };
+  }
+
+  /** DO NOTHING's key arbiter: which proposed keys the scope already holds, as a claimable set. */
+  async #doNothingKeyCheck(
+    table: TableRecord,
+    keyColumn: TableColumnRecord,
+    keys: readonly BatchValue[],
+    writer: StatementWriter | undefined,
+  ): Promise<{
+    taken(key: Exclude<BatchValue, null>): boolean;
+    claim(key: Exclude<BatchValue, null>): void;
+  }> {
     const presence = await writer?.stagedKeyPresence?.(
       table,
       keyColumn,
@@ -12960,18 +13930,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (presence !== undefined) {
       const taken = new Set(presence);
       return {
-        ...statement,
-        columns,
-        rows: materializedRows.filter((_, index) => {
-          const value = keys[index] ?? null;
-          if (value === null) return true;
-          const token = keyToken(keyColumn.type, value);
-          if (taken.has(token)) return false;
-          // UPSERT makes its choice per proposed row. A later duplicate in the same VALUES list
-          // therefore conflicts with the first retained proposal and takes DO NOTHING too.
-          taken.add(token);
-          return true;
-        }),
+        taken: (key) => taken.has(keyToken(keyColumn.type, key)),
+        claim: (key) => taken.add(keyToken(keyColumn.type, key)),
       };
     }
     const plan: CompiledQuery = {
@@ -13000,20 +13960,64 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         return value instanceof Date ? dateIsoString(value) : value;
       }),
     );
+    const normalized = (key: Exclude<BatchValue, null>): QueryValue | string =>
+      key instanceof Date ? dateIsoString(key) : key;
     return {
-      ...statement,
-      columns,
-      rows: materializedRows.filter((_, index) => {
-        const value = keys[index] ?? null;
-        if (value === null) return true;
-        const normalized = value instanceof Date ? dateIsoString(value) : value;
-        if (existing.has(normalized)) return false;
-        // UPSERT makes its choice per proposed row. A later duplicate in the same VALUES list
-        // therefore conflicts with the first retained proposal and takes DO NOTHING too.
-        existing.add(normalized);
-        return true;
-      }),
+      taken: (key) => existing.has(normalized(key)),
+      claim: (key) => existing.add(normalized(key)),
     };
+  }
+
+  /**
+   * The stored rows holding any of the given non-null tuples over a UNIQUE constraint's
+   * columns, read through the statement's writer so rows it staged count: tuple token (as
+   * `sqlTupleToken` spells it for the proposal) to the holder's row-addressing key.
+   */
+  async #uniqueTupleHolders(
+    table: TableRecord,
+    keyColumn: TableColumnRecord,
+    columns: readonly TableColumnRecord[],
+    tuples: ReadonlyArray<readonly BatchValue[]>,
+    writer: Pick<WriteSession, "query"> | undefined,
+  ): Promise<Map<string, QueryValue>> {
+    const holders = new Map<string, QueryValue>();
+    const first = columns[0];
+    if (first === undefined || tuples.length === 0) return holders;
+    const leading = [
+      ...new Map(
+        tuples.map((tuple) => [sqlTupleToken([tuple[0] ?? null]), tuple[0] ?? null] as const),
+      ).values(),
+    ];
+    const keyColumns = keyColumn.hidden === true ? primaryKeyColumns(table) : [keyColumn];
+    const selected = [...keyColumns, ...columns];
+    const projection = selected
+      .map((column, index) => `${quoteSqlIdentifier(column.name)} AS c${String(index)}`)
+      .join(", ");
+    // The leading column narrows the read (and can use the index); the full tuple decides.
+    const chunk = Math.max(1, MAX_SQL_PARAMETERS - 1);
+    for (let start = 0; start < leading.length; start += chunk) {
+      const params = leading.slice(start, start + chunk);
+      const sql =
+        `SELECT ${projection} FROM ${quoteSqlIdentifier(table.name)} ` +
+        `WHERE ${quoteSqlIdentifier(first.name)} IN (${params.map(() => "?").join(", ")})`;
+      const result =
+        writer === undefined
+          ? await this.query(sql, { params })
+          : await writer.query(sql, { params });
+      for (const row of result.rows) {
+        const values = selected.map((column, index) =>
+          normalizeColumnLogicalValue(column, row[`c${String(index)}`] ?? null),
+        );
+        const keyValues = values.slice(0, keyColumns.length);
+        const key =
+          keyColumn.hidden === true
+            ? compositeKeyValue(keyColumns, keyValues)
+            : (keyValues[0] ?? null);
+        if (key === null) continue;
+        holders.set(sqlTupleToken(values.slice(keyColumns.length)), key);
+      }
+    }
+    return holders;
   }
 
   /** Rejects an INSERT staged into a scope whose keys already exist there or in committed rows. */
@@ -13242,6 +14246,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       if (this.#statementTransactionExpired && statement.kind !== "transaction")
         throw new TransactionExpiredError();
       const statementNow = this.#now();
+      if (
+        statement.kind === "update" &&
+        statement.assignments.some(({ expression }) => isUpdateDefaultAssignment(expression))
+      ) {
+        statement = {
+          ...statement,
+          assignments: resolveUpdateDefaults(
+            await this.#findTable(statement.table),
+            statement.assignments,
+          ),
+        };
+      }
       statement = resolveMutationStatementDatetimes(statement, statementNow);
       if (statement.kind === "select") {
         return { kind: "rows", result: await this.query(statement.sql) };
@@ -13629,6 +14645,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               );
             }
             if (record.columns.some(({ name }) => name === added.name)) {
+              if (addColumnStatement.ifNotExists === true) {
+                return { kind: "add-column", table: addColumnStatement.table, column: added.name };
+              }
               throw new TypeError(
                 `Column already exists: ${addColumnStatement.table}.${added.name}`,
               );
@@ -13689,6 +14708,54 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               expectedCatalogEpoch: proof.catalogEpoch,
             });
             return { kind: "add-column", table: addColumnStatement.table, column: added.name };
+          } catch (error) {
+            if (!(error instanceof TableRecordConflictError) || attempt >= this.#maxCommitRetries) {
+              throw error;
+            }
+          }
+        }
+      }
+      if (statement.kind === "rename-column") {
+        // A metadata-only step: stored blocks and every index, key, and unique constraint name
+        // the column by its id, so only the catalog record's name changes. What names it by
+        // text — a CHECK, a generated column, a foreign key, a trigger, a view — would be left
+        // pointing at nothing, so a rename those depend on is refused instead.
+        const rename = statement;
+        let pinnedTableId: string | undefined;
+        for (let attempt = 0; ; attempt += 1) {
+          const proof = await this.#catalogMutations.readProof();
+          try {
+            const record = proof.records.find((candidate) => candidate.name === rename.table);
+            if (record === undefined) throw new UnknownTableError(rename.table);
+            if (record.view !== undefined) {
+              throw new TypeError(`${rename.table} is a view, not a table`);
+            }
+            pinnedTableId ??= record.id;
+            if (record.id !== pinnedTableId) {
+              throw new TableRecordConflictError(pinnedTableId, 0, record.revision);
+            }
+            const column = record.columns.find(({ name }) => name === rename.from);
+            if (column === undefined) {
+              throw new TypeError(`Column not found: ${rename.table}.${rename.from}`);
+            }
+            if (record.columns.some(({ name }) => name === rename.to)) {
+              throw new TypeError(`Column already exists: ${rename.table}.${rename.to}`);
+            }
+            assertColumnRenameSafe(proof.records, record, column);
+            const columns = record.columns.map((candidate) =>
+              candidate.id === column.id
+                ? { ...structuredClone(candidate), name: rename.to }
+                : structuredClone(candidate),
+            );
+            assertTriggerBodiesAcceptTableSchema(proof.records, record, columns);
+            const candidateSchemas = catalogQuerySchemas(proof.records);
+            candidateSchemas.set(record.name, columns);
+            assertDependentViewsKeepSchema(proof.records, record, candidateSchemas);
+            await this.store.updateTable(record.id, record.revision, {
+              columns,
+              expectedCatalogEpoch: proof.catalogEpoch,
+            });
+            return { kind: "rename-column", table: rename.table, from: rename.from, to: rename.to };
           } catch (error) {
             if (!(error instanceof TableRecordConflictError) || attempt >= this.#maxCommitRetries) {
               throw error;
@@ -13807,10 +14874,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         const columns = visibleTableColumns(table).map((column) => column.name);
         if (statement.defaultValues === true) {
           // Keep the empty column list: omission, not NULL, is what invokes catalog defaults.
-        } else if (statement.rows.some((row) => row.length !== columns.length)) {
-          throw new TypeError("Each INSERT row must match the table column count");
         } else {
-          statement = { ...statement, columns };
+          // Without a column list the values fill the table's leading columns in declaration
+          // order, and any columns after them take their defaults, as in PostgreSQL.
+          const width = statement.rows[0]?.length ?? 0;
+          if (statement.rows.some((row) => row.length !== width)) {
+            throw new TypeError("VALUES lists must all be the same length");
+          }
+          if (width > columns.length) {
+            throw new TypeError(
+              `INSERT has ${String(width)} values but ${statement.table} has ${String(columns.length)} columns`,
+            );
+          }
+          statement = { ...statement, columns: columns.slice(0, width) };
         }
       }
       if (statement.kind === "insert") {
@@ -13850,27 +14926,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         };
       }
       if (statement.kind === "insert") {
-        const table = await this.#findTable(statement.table);
+        const table = await this.#findTable(statement.table, this.#statementScope(options.writer));
         const viaUpsert = statement.onConflict?.action === "replace";
         if (viaUpsert) {
           const keyColumn = getUniqueKeyColumn(table);
+          if (keyColumn === undefined) {
+            throw new TypeError("ON CONFLICT needs a table with a primary or unique key");
+          }
           const conflictColumns =
             statement.onConflict?.columns ??
             (statement.onConflict === undefined ? [] : [statement.onConflict.column]);
-          const addressColumns =
-            keyColumn?.hidden === true
-              ? primaryKeyColumns(table).map(({ name }) => name)
-              : keyColumn === undefined
-                ? []
-                : [keyColumn.name];
-          if (
-            keyColumn === undefined ||
-            conflictColumns.length !== addressColumns.length ||
-            conflictColumns.some((name, index) => name !== addressColumns[index])
-          ) {
-            throw new TypeError(
-              `ON CONFLICT targets the table's primary or unique key columns: ${addressColumns.join(", ") || "(none)"}`,
-            );
+          if (conflictArbiter(table, keyColumn, conflictColumns).kind !== "key") {
+            throw new TypeError("ON CONFLICT DO REPLACE targets the table's primary key");
           }
         }
         // Narrowing does not survive a reassignment inside the closures below, so the folded
@@ -13968,7 +15035,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               }),
         };
       }
-      const table = await this.#findTable(statement.table);
+      const table = await this.#findTable(statement.table, this.#statementScope(options.writer));
       const keyColumn = getUniqueKeyColumn(table);
       if (keyColumn === undefined) {
         throw new TypeError(
@@ -13990,7 +15057,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
                 return spelled;
               }
               const { domains } = await this.#catalogFacts();
-              if (!domains.has(table.name)) return statement.assignments;
+              if (!domains.has(table.name)) return spelled;
               const normalized = normalizePlanDomainLiterals(
                 {
                   sql: `UPDATE ${table.name}`,
@@ -14166,7 +15233,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           // the column's type. RETURNING echoes the same form, as PostgreSQL returns the typed value.
           const stored = storedSqlValueFromExecution(column, value);
           executionValues?.push(
-            column.type === "string" && column.sqlDomain === undefined ? value : stored,
+            column.type === "string" && column.sqlDomain === undefined && typeof value === "string"
+              ? value
+              : // A number or boolean assigned to TEXT echoes the text it was stored as.
+                executionSqlValueFromStorage(column, stored),
           );
           return stored;
         });
@@ -14174,6 +15244,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           returnedChanges[assignment.column] = executionValues;
         }
       }
+      // Every key came from the read just above, so a scope writer need not probe for them again.
+      const readKeysWriter = (
+        options.writer as
+          | (StatementWriter & Partial<Pick<TransactionStatementWriter, "updateReadKeysBatch">>)
+          | undefined
+      )?.updateReadKeysBatch;
       const updated: {
         updatedRowCount?: number;
         rowCount?: number;
@@ -14182,7 +15258,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       } =
         options.writer === undefined
           ? await this.#erased.updateBatch(table.name, { keys, changes })
-          : await options.writer.updateBatch(table.name, { keys, changes });
+          : readKeysWriter === undefined
+            ? await options.writer.updateBatch(table.name, { keys, changes })
+            : await readKeysWriter(table.name, { keys, changes });
       const returnedRows =
         returningColumns === undefined
           ? undefined
@@ -14488,7 +15566,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const requestedBaseColumns = columns.get(baseTable.name) ?? [];
     const projectedBaseColumns =
       requestedBaseColumns.length === 0 ? [] : resolveReadColumns(baseTable, requestedBaseColumns);
-    if (cursor === undefined && plan.sql === "(update)" && !pointReadTestHooks.disabled) {
+    // A keyed DELETE reads only the keys it removes, through the first-column consumer; the
+    // point reader answers it as it answers a keyed UPDATE, instead of a scan of the key's block
+    // and a replay of the table's whole delta history.
+    const keyedDelete =
+      plan.sql === "(delete)" &&
+      cursor?.consumeFirstColumn !== undefined &&
+      plan.select.length === 1;
+    if (
+      (keyedDelete || (cursor === undefined && plan.sql === "(update)")) &&
+      !pointReadTestHooks.disabled
+    ) {
       const point = await this.#queryKeyedUpdateAtSnapshot(
         plan,
         options,
@@ -14498,7 +15586,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         projectedBaseColumns,
         typedSchemas,
       );
-      if (point !== undefined) return point;
+      if (point !== undefined) {
+        if (cursor === undefined) return point;
+        const column = point.columns[0] ?? "";
+        const keys = point.rows.map((row) => row[column] ?? null);
+        if (keys.length > 0) await cursor.consumeFirstColumn?.(keys);
+        else await cursor.consume({ ...point, rows: [] });
+        return { ...point, rows: [] };
+      }
     }
     if (secondaryIndexOrderForPlan(plan, baseTable, projectedBaseColumns, false) !== undefined) {
       return undefined;
@@ -14531,7 +15626,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         visibleByTable.get(freshBaseTable.name) ??
         (await this.#visibleSegmentRecords(freshBaseTable, snapshot, visibility));
       this.#maybeScheduleAutoCompaction(freshBaseTable, visibleBaseSegments);
-      const indexed = await this.#indexPrunedSegments(
+      let indexed = await this.#indexPrunedSegments(
         freshBaseTable,
         visibleBaseSegments,
         plan,
@@ -14539,12 +15634,45 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         visibility,
       );
       throwIfAborted(options.signal);
+      // An exact row selection comes with only the deltas of the selected rows: a row outside
+      // it may sit in a kept block with its update or delete dropped. Only the buffered
+      // streamed executor visits exactly the selected rows. A cursor (and the key read a DELETE
+      // runs) and the spilling executors sweep every row of the kept blocks, so for them the
+      // selection falls back to block pruning, which replays every delta.
+      if (
+        indexed.rows !== undefined &&
+        (cursor !== undefined ||
+          (options.spillToStorage ?? options.executionMemoryBudgetBytes !== undefined))
+      ) {
+        indexed = {
+          segments: withEveryDelta(visibleBaseSegments, indexed.segments),
+          pruned: indexed.pruned,
+        };
+      }
       const baseSegments = indexed.segments;
+      // A statement decided by one end of a column's values — a top-N, a keyset page, MIN or
+      // MAX — reads only the rows that can hold those values. The selection is numbered over
+      // the whole (unpruned) append history, as an index selection is over its own segments.
+      const ordered =
+        cursor === undefined &&
+        indexed.rows === undefined &&
+        !indexed.pruned &&
+        visibility.overlayTransactionId === undefined &&
+        !orderedSelectionTestHooks.disabled
+          ? await this.#orderedRowSelection(plan, freshBaseTable, baseSegments, snapshot)
+          : undefined;
+      if (ordered !== undefined) {
+        orderedSelectionTestHooks.served += 1;
+        // Rows counted past rather than selected leave only the rest of the OFFSET to apply.
+        if (ordered.offset !== undefined) plan = { ...plan, offset: ordered.offset };
+      }
+      throwIfAborted(options.signal);
+      const selectedRows = indexed.rows ?? ordered?.rows;
       // Zone-map elimination composes after index pruning: whole row groups whose statistics
-      // reject the plan's predicates never stream at all. An exact index row selection is
-      // numbered over the pruned blocks, so it is used as is.
+      // reject the plan's predicates never stream at all. An exact row selection is numbered
+      // over the segments it was taken from, so it is used as is.
       const zonePruned =
-        indexed.rows === undefined
+        selectedRows === undefined
           ? await this.#zonePrunedStreamSegments(
               plan,
               freshBaseTable,
@@ -14627,7 +15755,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
                 snapshot,
                 requestedColumns.length === 0 ? [] : resolveReadColumns(table, requestedColumns),
                 visibility,
-                plan,
+                await this.#withJoinInputHints(plan, table),
               ),
             );
             throwIfAborted(options.signal);
@@ -14676,9 +15804,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             try {
               const streamedResult = await prepared.executeAsync({
                 loadScanWindow: streamed.load,
-                ...(indexed.rows === undefined
+                ...(selectedRows === undefined
                   ? {}
-                  : { scanRows: streamed.remapScanRows?.(indexed.rows) ?? indexed.rows }),
+                  : { scanRows: streamed.remapScanRows?.(selectedRows) ?? selectedRows }),
                 ...(options.signal === undefined ? {} : { signal: options.signal }),
               });
               options.onStats?.({ peakMemoryBytes: memory.usage.peakBytes });
@@ -14692,9 +15820,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             ...(spillPageRows === undefined ? {} : { spillPageRows }),
             spillStore: this.#leasedSpillStore(),
             loadScanWindow: streamed.load,
-            ...(indexed.rows === undefined
+            ...(selectedRows === undefined
               ? {}
-              : { scanRows: streamed.remapScanRows?.(indexed.rows) ?? indexed.rows }),
+              : { scanRows: streamed.remapScanRows?.(selectedRows) ?? selectedRows }),
             ...(options.signal === undefined ? {} : { signal: options.signal }),
           });
           options.onStats?.({ peakMemoryBytes: memory.usage.peakBytes });
@@ -14724,6 +15852,73 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   /**
+   * The plan a LEFT join side is prepared under: its key's inherited constants (`inputHints`)
+   * join the predicates that index and key pruning read, so the side is read for the pinned keys
+   * only. The hints are never evaluated, and a superset is harmless — a side row outside them
+   * matches no surviving outer row — so only hints whose literal is exactly the column's storage
+   * type are used; anything a coercion could make equal to a pruned row stays out. Key forwards
+   * are left to the ordinary read: a constant naming a retired key forwards in WHERE, not here.
+   */
+  async #withJoinInputHints(plan: CompiledQuery, table: TableRecord): Promise<CompiledQuery> {
+    const joins = plan.joins.filter((join) => join.table === table.name);
+    const join = joins[0];
+    const hints = join?.inputHints;
+    if (
+      join === undefined ||
+      hints === undefined ||
+      joins.length !== 1 ||
+      plan.base.table === table.name ||
+      join.derived !== undefined ||
+      join.union !== undefined ||
+      join.recursive !== undefined ||
+      join.windowed !== undefined ||
+      join.columnAliases !== undefined
+    ) {
+      return plan;
+    }
+    if (
+      this.#keyForwardsTableSeen ||
+      (await this.#catalogFacts()).keyForwardsTableId !== undefined
+    ) {
+      return plan;
+    }
+    const usable = hints.filter((hint) => {
+      const column = hint.left.kind === "column" ? hint.left : hint.right;
+      const value = hint.left.kind === "column" ? hint.right : hint.left;
+      if (column.kind !== "column" || !column.reference.startsWith(`${join.alias}.`)) return false;
+      const record = table.columns.find(
+        (candidate) => candidate.name === column.reference.slice(join.alias.length + 1),
+      );
+      if (record === undefined || record.sqlDomain !== undefined || record.hidden === true) {
+        return false;
+      }
+      const literals =
+        value.kind === "literal" ? [value] : value.kind === "list" ? value.items : undefined;
+      return (
+        literals !== undefined &&
+        literals.length > 0 &&
+        literals.every(
+          (literal) =>
+            literal.kind === "literal" &&
+            literal.internalSqlValue !== true &&
+            literal.sqlDomain === undefined &&
+            ((record.type === "number" &&
+              typeof literal.value === "number" &&
+              Number.isFinite(literal.value)) ||
+              (record.type === "string" &&
+                typeof literal.value === "string" &&
+                !literal.value.startsWith("\u0000")) ||
+              (record.type === "boolean" && typeof literal.value === "boolean") ||
+              (record.type === "datetime" &&
+                literal.value instanceof Date &&
+                Number.isFinite(dateMilliseconds(literal.value)))),
+        )
+      );
+    });
+    return usable.length === 0 ? plan : { ...plan, predicates: [...plan.predicates, ...usable] };
+  }
+
+  /**
    * Zone-map row-group pruning for the streamed scan: header-only inspection of the
    * predicate columns' blocks selects the block indexes that can match, and the scan then
    * streams only those row groups — the same elimination the materialized pruned projection
@@ -14748,6 +15943,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       return kind === "insert" || kind === "base";
     });
     if (appends.length + mutations.length !== segments.length) return undefined;
+    // One row group in all can only be dropped whole, which the scan's own predicate pass
+    // settles as cheaply as its header would; the small tables most OLTP reads hit skip the work.
+    const anchor = table.columns[0];
+    if (
+      mutations.length === 0 &&
+      anchor !== undefined &&
+      appends.reduce(
+        (total, segment) => total + (segment.columnBlockIds[anchor.id]?.length ?? 0),
+        0,
+      ) <= 1
+    ) {
+      return undefined;
+    }
     const predicates = zonePredicates(plan, table);
     if (predicates.length === 0) return undefined;
     if (planContainsFts(plan, "bm25") && !this.#ftsIndexServesScoring(plan, table, segments)) {
@@ -14806,32 +16014,48 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       keyColumn === undefined
         ? []
         : predicates.filter((predicate) => predicate.column.id === keyColumn.id);
-    const predicateBlockIds = [
-      ...new Set([
-        ...appends.flatMap((segment) =>
-          predicateColumns.flatMap((column) => segment.columnBlockIds[column.id] ?? []),
-        ),
-        // A mutation never changes the unique key it carries. Its key block can therefore
-        // prove that the whole delta cannot affect a key-range query, before the replay loads
-        // any patched columns. The descriptions are header-only and stay in the byte-bounded
-        // cache, so a long point-update history costs one new header per commit rather than a
-        // replay of every old patch on every following statement.
-        ...(keyColumn === undefined || keyPredicates.length === 0
-          ? []
-          : mutations.flatMap((segment) => segment.columnBlockIds[keyColumn.id] ?? [])),
-      ]),
+    const describedColumns: Array<readonly [SegmentRecord, string]> = [
+      ...appends.flatMap((segment) =>
+        predicateColumns.map((column) => [segment, column.id] as const),
+      ),
+      // A mutation never changes the unique key it carries. Its key block can therefore
+      // prove that the whole delta cannot affect a key-range query, before the replay loads
+      // any patched columns. The descriptions are header-only and stay in the byte-bounded
+      // cache, so a long point-update history costs one new header per commit rather than a
+      // replay of every old patch on every following statement.
+      ...(keyColumn === undefined || keyPredicates.length === 0
+        ? []
+        : mutations.map((segment) => [segment, keyColumn.id] as const)),
     ];
     // Block descriptions are immutable per id, like decoded blocks, so a repeated pruned
-    // query pays zero store reads for elimination once its descriptions are resident.
-    const missingIds = predicateBlockIds.filter((id) => {
-      const cached = this.#cacheGet(`zi ${id}`) as ReturnType<typeof inspectBlock> | undefined;
-      if (cached === undefined) return true;
-      descriptions.set(id, cached);
-      return false;
-    });
-    for (let start = 0; start < missingIds.length; start += 16) {
+    // query pays zero store reads for elimination once its descriptions are resident. The ones
+    // a segment's column already resolved stay on the segment record: a long delta history
+    // otherwise builds and hashes a buffer-pool key per block on every statement.
+    const missingIds = new Set<string>();
+    const undescribed: Array<readonly [SegmentRecord, string]> = [];
+    for (const [segment, columnId] of describedColumns) {
+      const ids = segment.columnBlockIds[columnId] ?? [];
+      const known = this.#segmentDescriptionCache.get(segment)?.get(columnId);
+      if (known !== undefined) {
+        for (const [index, id] of ids.entries()) {
+          const description = known[index];
+          if (description !== undefined) descriptions.set(id, description);
+        }
+        continue;
+      }
+      undescribed.push([segment, columnId]);
+      for (const id of ids) {
+        if (descriptions.has(id)) continue;
+        const cached = this.#blockCacheGet(ArtifactFamily.zoneDescription, id) as
+          ReturnType<typeof inspectBlock> | undefined;
+        if (cached === undefined) missingIds.add(id);
+        else descriptions.set(id, cached);
+      }
+    }
+    const missing = [...missingIds];
+    for (let start = 0; start < missing.length; start += 16) {
       await this.#renewInternalLeaseIfNeeded(snapshot);
-      const ids = missingIds.slice(start, start + 16);
+      const ids = missing.slice(start, start + 16);
       const blocks = await this.#getSnapshotBlocksWindowed(snapshot, ids);
       for (let index = 0; index < ids.length; index += 1) {
         const id = ids[index] ?? "";
@@ -14842,8 +16066,23 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         // checksum, and payload-validation cost of blocks it is about to discard.
         const description = inspectBlock(bytes);
         descriptions.set(id, description);
-        this.#cachePut(`zi ${id}`, description, ZONE_DESCRIPTION_CACHE_BYTES);
+        this.#blockCachePut(
+          ArtifactFamily.zoneDescription,
+          id,
+          description,
+          ZONE_DESCRIPTION_CACHE_BYTES,
+        );
       }
+    }
+    for (const [segment, columnId] of undescribed) {
+      const resolved = (segment.columnBlockIds[columnId] ?? []).map((id) => descriptions.get(id));
+      if (resolved.some((description) => description === undefined)) continue;
+      let byColumn = this.#segmentDescriptionCache.get(segment);
+      if (byColumn === undefined) {
+        byColumn = new Map();
+        this.#segmentDescriptionCache.set(segment, byColumn);
+      }
+      byColumn.set(columnId, resolved as Array<ReturnType<typeof inspectBlock>>);
     }
     const prunedSegments: SegmentRecord[] = [];
     for (const segment of segments) {
@@ -15142,27 +16381,82 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * own predicate settles such collisions. Hashing a block's keys yields to the event loop, so
    * the first indexed lookup on a large table does not hold it for every block.
    */
-  async #blockKeyLocators(
-    blockId: string,
-    vector: ColumnVector,
-    type: SimpleDataType,
-  ): Promise<Map<bigint, number | number[]>> {
-    const cached = this.#cacheGet(`dkl ${blockId}`) as Map<bigint, number | number[]> | undefined;
-    if (cached !== undefined) return cached;
-    const locators = new Map<bigint, number | number[]>();
-    for (let row = 0; row < vector.length; row += 1) {
-      if ((row & 4095) === 0) await maybeYieldToEventLoop();
-      const value = vectorValue(vector, row);
-      if (value === null) continue;
-      const locator = secondaryKeyLocator(type, value);
-      const existing = locators.get(locator);
-      if (existing === undefined) locators.set(locator, row);
-      else if (typeof existing === "number") locators.set(locator, [existing, row]);
-      else existing.push(row);
+  /**
+   * One segment's key locators as an open-addressing hash table over its rows, pooled per
+   * segment. Undefined when a key block's physical type is not the key column's.
+   */
+  async #segmentKeyLocators(
+    segment: SegmentRecord,
+    anchorIds: readonly string[],
+    keyColumn: TableColumnRecord,
+    snapshot: LeasedSnapshot,
+  ): Promise<SegmentKeyLocators | undefined> {
+    const cached = this.#blockCacheGet(ArtifactFamily.segmentKeyLocators, segment.id) as
+      SegmentKeyLocators | undefined;
+    // Segment ids are unique, but the entry is checked against the blocks it hashed anyway: a
+    // pooled table is only ever reused for exactly the key blocks it was built from.
+    if (
+      cached?.anchorIds.length === anchorIds.length &&
+      cached.anchorIds.every((id, index) => id === anchorIds[index])
+    ) {
+      return cached;
     }
-    // A Map entry for a small bigint and a row number: key, value, hash slot, chain pointer.
-    this.#cachePut(`dkl ${blockId}`, locators, 64 + locators.size * 48);
-    return locators;
+    const decoded = await this.#decodedBlocksThroughCache(anchorIds, snapshot);
+    const vectors: ColumnVector[] = [];
+    const blockStarts = new Uint32Array(anchorIds.length + 1);
+    let rowCount = 0;
+    for (const [blockIndex, block] of decoded.entries()) {
+      if (block.column.type !== keyColumn.type) return undefined;
+      const vector = this.#blockColumnVector(anchorIds[blockIndex] ?? "", block);
+      vectors.push(vector);
+      blockStarts[blockIndex] = rowCount;
+      rowCount += vector.length;
+    }
+    blockStarts[anchorIds.length] = rowCount;
+    const locators = new Uint32Array(rowCount);
+    let nullRows: Uint8Array | undefined;
+    // Load factor at most one half keeps linear probe runs short.
+    let capacity = 2;
+    while (capacity < rowCount * 2) capacity *= 2;
+    const slots = new Int32Array(capacity);
+    const mask = capacity - 1;
+    let row = 0;
+    for (const vector of vectors) {
+      for (let slot = 0; slot < vector.length; slot += 1, row += 1) {
+        if ((row & 4095) === 0) await maybeYieldToEventLoop();
+        const value = vectorValue(vector, slot);
+        if (value === null) {
+          (nullRows ??= new Uint8Array(rowCount))[row] = 1;
+          continue;
+        }
+        const locator = secondaryKeyLocatorNumber(keyColumn.type, value);
+        locators[row] = locator;
+        let probe = locator & mask;
+        while (slots[probe] !== 0) probe = (probe + 1) & mask;
+        slots[probe] = row + 1;
+      }
+    }
+    const index: SegmentKeyLocators = {
+      anchorIds: [...anchorIds],
+      rowCount,
+      blockStarts,
+      locators,
+      ...(nullRows === undefined ? {} : { nullRows }),
+      slots,
+      mask,
+    };
+    this.#blockCachePut(
+      ArtifactFamily.segmentKeyLocators,
+      segment.id,
+      index,
+      64 +
+        anchorIds.reduce((total, id) => total + 32 + id.length * 2, 0) +
+        blockStarts.byteLength +
+        locators.byteLength +
+        (nullRows?.byteLength ?? 0) +
+        slots.byteLength,
+    );
+    return index;
   }
 
   /** Reuse the existing block-vector cache before loading decoded blocks. No second cache
@@ -15171,7 +16465,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     ids: readonly string[],
     snapshot: LeasedSnapshot,
   ): Promise<ColumnVector[]> {
-    const vectors = ids.map((id) => this.#cacheGet(`dbv ${id}`) as ColumnVector | undefined);
+    const vectors = ids.map(
+      (id) => this.#blockCacheGet(ArtifactFamily.blockVector, id) as ColumnVector | undefined,
+    );
     const missing: string[] = [];
     const positions: number[] = [];
     for (let index = 0; index < ids.length; index += 1) {
@@ -15189,7 +16485,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   #blockColumnVector(blockId: string, decoded: DecodedPhysicalBlock): ColumnVector {
-    const cached = this.#cacheGet(`dbv ${blockId}`) as ColumnVector | undefined;
+    const cached = this.#blockCacheGet(ArtifactFamily.blockVector, blockId) as
+      ColumnVector | undefined;
     if (cached !== undefined) return cached;
     const column = decoded.column;
     const rows = column.rowCount;
@@ -15210,7 +16507,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         ? { kind: "string", length: rows, validity, codes, dictionary: builder.dictionary }
         : { kind: column.type, length: rows, validity, values }),
     } as ColumnVector;
-    this.#cachePut(`dbv ${blockId}`, vector, blockVectorRetainedBytes(vector));
+    this.#blockCachePut(
+      ArtifactFamily.blockVector,
+      blockId,
+      vector,
+      blockVectorRetainedBytes(vector),
+    );
     return vector;
   }
 
@@ -15354,6 +16656,53 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * no payload validation. Descriptions are immutable per block id, so a repeated query pays
    * nothing — including the await, which is why the misses are batched rather than looped.
    */
+  /**
+   * Each segment's zone map ranges for one column's blocks, as `[min, max]` pairs; a block with
+   * no zone map spans everything. A segment's blocks never change, so the ranges live on the
+   * record itself rather than behind one buffer-pool lookup per block: a keyed read over a long
+   * delta history would otherwise build a key and probe the pool for every delta it skips.
+   */
+  async #segmentKeyZones(
+    segments: readonly SegmentRecord[],
+    columnId: string,
+    snapshot: LeasedSnapshot,
+  ): Promise<Float64Array[]> {
+    const zones = new Array<Float64Array>(segments.length);
+    const missing: number[] = [];
+    const missingIds: string[] = [];
+    for (const [index, segment] of segments.entries()) {
+      const cached = this.#segmentZoneCache.get(segment);
+      const known = cached?.get(columnId);
+      if (known !== undefined) {
+        zones[index] = known;
+        continue;
+      }
+      missing.push(index);
+      for (const id of segment.columnBlockIds[columnId] ?? []) missingIds.push(id);
+    }
+    if (missing.length === 0) return zones;
+    const descriptions = await this.#zoneDescriptions(missingIds, snapshot);
+    for (const index of missing) {
+      const segment = segments[index];
+      if (segment === undefined) continue;
+      const blockIds = segment.columnBlockIds[columnId] ?? [];
+      const ranges = new Float64Array(blockIds.length * 2);
+      for (const [blockIndex, blockId] of blockIds.entries()) {
+        const zone = descriptions.get(blockId)?.metadata.zoneMap;
+        ranges[blockIndex * 2] = zone === undefined ? Number.NEGATIVE_INFINITY : zone.min;
+        ranges[blockIndex * 2 + 1] = zone === undefined ? Number.POSITIVE_INFINITY : zone.max;
+      }
+      let byColumn = this.#segmentZoneCache.get(segment);
+      if (byColumn === undefined) {
+        byColumn = new Map();
+        this.#segmentZoneCache.set(segment, byColumn);
+      }
+      byColumn.set(columnId, ranges);
+      zones[index] = ranges;
+    }
+    return zones;
+  }
+
   async #zoneDescriptions(
     blockIds: readonly string[],
     snapshot: LeasedSnapshot,
@@ -15361,7 +16710,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const descriptions = new Map<string, ReturnType<typeof inspectBlock>>();
     const missing: string[] = [];
     for (const blockId of blockIds) {
-      const cached = this.#cacheGet(`zi ${blockId}`) as ReturnType<typeof inspectBlock> | undefined;
+      const cached = this.#blockCacheGet(ArtifactFamily.zoneDescription, blockId) as
+        ReturnType<typeof inspectBlock> | undefined;
       if (cached === undefined) missing.push(blockId);
       else descriptions.set(blockId, cached);
     }
@@ -15375,7 +16725,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         if (bytes === undefined) throw new Error(`Visible block is missing: ${id}`);
         const description = inspectBlock(bytes);
         descriptions.set(id, description);
-        this.#cachePut(`zi ${id}`, description, ZONE_DESCRIPTION_CACHE_BYTES);
+        this.#blockCachePut(
+          ArtifactFamily.zoneDescription,
+          id,
+          description,
+          ZONE_DESCRIPTION_CACHE_BYTES,
+        );
       }
     }
     return descriptions;
@@ -19971,7 +21326,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           latestOwner?.status !== "active" ||
           Date.parse(latestOwner.expiresAt) <= dateMilliseconds(this.#now())
         ) {
-          return await this.#runCompactionJob(table, latestJob, maxBlocks);
+          // Pass the active record this step held, as above: the fresh read then sees a job
+          // another coordinator abandoned (a schema change) as the revision race it is, not as
+          // this step's own failure.
+          return await this.#runCompactionJob(table, job, maxBlocks);
         }
       }
       throw error;
@@ -20130,6 +21488,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
 
       transaction.setCompactionIntent(job.id, job.sourceBlockIds);
       transaction.markLogicallyUnchanged();
+      stageCompactionUniqueCoverage(transaction, table);
       let publicationConflict: WriteConflictError | undefined;
       const publish = async (): Promise<ManifestSummary | undefined> => {
         try {
@@ -20185,6 +21544,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
         transaction.setCompactionIntent(job.id, job.sourceBlockIds);
         transaction.markLogicallyUnchanged();
+        stageCompactionUniqueCoverage(transaction, table);
       };
       // Publication is a writer's turn like any other (#withCompactionPublicationSlot): the
       // rebase and the commit run with no coordinated writer in flight anywhere, so the
@@ -20198,6 +21558,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             conflicts > 0 ||
             (await this.store.getCurrentManifestVersion()) !== transaction.snapshotVersion
           ) {
+            // Every tab driving this job shares its transaction, and they take the turn one at
+            // a time: the manifest a later one finds moved may be the job's own publication.
+            // Its sources are gone then because the fold already replaced them -- adopt that
+            // outcome rather than abandon the job over it.
+            const publishedElsewhere = await transaction.committedElsewhere();
+            if (publishedElsewhere !== undefined) {
+              this.#afterCompactionCommit(publishedElsewhere, table.id);
+              return publishedElsewhere;
+            }
             await rebaseOverConcurrentCommits();
           }
           const published = await publish();
@@ -20752,9 +22121,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const visibleById = new Map(visibleSegments.map((segment) => [segment.id, segment]));
     const sourceManifest = await this.store.getManifest(job.sourceManifestVersion);
     if (sourceManifest === undefined || sourceManifest.prunedAt !== undefined) {
-      throw new Error(
-        `Compaction source manifest is unavailable: ${String(job.sourceManifestVersion)}`,
-      );
+      throw new CompactionSourceManifestUnavailableError(job.sourceManifestVersion);
     }
     const plannedVisible = await this.#visibleSegmentRecords(
       table,
@@ -20850,9 +22217,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (table === undefined) throw new CompactionSourceChangedError(job.tableId, true);
     const sourceManifest = await this.store.getManifest(job.sourceManifestVersion);
     if (sourceManifest === undefined || sourceManifest.prunedAt !== undefined) {
-      throw new Error(
-        `Compaction source manifest is unavailable: ${String(job.sourceManifestVersion)}`,
-      );
+      throw new CompactionSourceManifestUnavailableError(job.sourceManifestVersion);
     }
     const plannedSnapshot = new Snapshot(this.store, sourceManifest.version);
     const plannedVisible = await this.#visibleSegmentRecords(table, plannedSnapshot);
@@ -20959,7 +22324,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     } catch (error) {
       if (candidate.status === "active") await candidate.abort();
       const latest = await this.store.getCompactionJob(job.id);
-      if (error instanceof CompactionSourceChangedError) {
+      // A source or the planning manifest gone because the job itself moved on -- another tab
+      // advanced, published, or abandoned it after this step selected it -- is that tab's
+      // outcome to report: run again from the newer record.
+      if (
+        error instanceof CompactionSourceChangedError ||
+        error instanceof CompactionSourceManifestUnavailableError
+      ) {
         if (latest === undefined) throw new CompactionJobConflictError(job.id, job.revision, null);
         if (latest.revision !== job.revision) return { job: latest, transaction: null };
       }
@@ -21328,6 +22699,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     return this.#artifactCache.get(key);
   }
 
+  /** A per-block (or per-segment) artifact, keyed by the bare id within its family. */
+  #blockCacheGet(family: ArtifactFamily, id: string): unknown {
+    return this.#artifactCache.getIn(family, id);
+  }
+
+  #blockCachePut(family: ArtifactFamily, id: string, payload: unknown, bytes: number): void {
+    this.#artifactCache.putIn(family, id, payload, bytes);
+  }
+
   /**
    * Buffer pool observability: byte budget and residency plus lifetime hit/miss/eviction
    * counters across every entry family (decoded blocks, block vectors, zone descriptions,
@@ -21345,6 +22725,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   #cachePut(key: string, payload: unknown, bytes: number): void {
     this.#artifactCache.put(key, payload, bytes);
   }
+
+  /**
+   * Records the zone description of a block this engine just encoded for a write. The next read
+   * of the table prunes by every segment's zone maps, and fetching a new segment's blocks back
+   * only to read their headers cost every write a block read — an IndexedDB transaction. Block
+   * ids are never reused, so a write that then fails leaves an entry nothing ever asks for.
+   */
+  readonly #rememberWrittenBlock = (block: BlockWrite): void => {
+    this.#cachePut(`zi ${block.id}`, inspectBlock(block.bytes), ZONE_DESCRIPTION_CACHE_BYTES);
+  };
 
   /**
    * Creates and fully builds a durable secondary index. The catalog's global
@@ -21572,13 +22962,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     indexId: string,
     index: SecondaryIndexRecord,
     ownedBuildId?: string,
-  ): Promise<void> {
+  ): Promise<"deferred" | undefined> {
     // Marking and publishing are catalog steps, each taken as one writer turn; the build in
     // between reads a leased snapshot outside any turn, so a large table never holds every
     // other writer for the whole scan.
     const entered = await this.#admissions.admit(
       "catalog",
-      async (): Promise<{ marked: TableRecord; buildId: string } | undefined> => {
+      async (): Promise<{ marked: TableRecord; buildId: string } | "deferred" | undefined> => {
         // (background: the maintenance signal below keeps this turn available during close)
         const current = await this.store.getTable(table.id);
         if (current === undefined) return undefined;
@@ -21586,21 +22976,68 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         if (held === undefined) return undefined;
         const ownsMarkedBuild =
           ownedBuildId !== undefined && held.state === "building" && held.buildId === ownedBuildId;
-        const buildId = ownsMarkedBuild ? ownedBuildId : this.#createId();
-        const marked = ownsMarkedBuild
-          ? current
-          : await this.store.updateTable(current.id, current.revision, {
-              secondaryIndexes: {
-                ...current.secondaryIndexes,
-                [indexId]: { ...held, state: "building", buildId, buildFromVersion: -1 },
-              },
-            });
-        return { marked, buildId };
+        if (ownsMarkedBuild) return { marked: current, buildId: ownedBuildId };
+        const buildId = this.#createId();
+        // Claim the build session before taking the catalog mark. A claim refused because
+        // another connection's build of this index is live means that connection is doing this
+        // work right now: marking over it would only make its publication miss, and the two
+        // builds would undo each other. Whoever crosses the trigger next -- a commit past the
+        // delta-tail bound, a query over an index that is not ready -- tries again, and a build
+        // whose owner died stops blocking the claim once its session expires. An invalid index
+        // has no session to claim until the mark makes it active again. Any other refusal is
+        // left to the build itself: it begins the session again after the mark, and a failure
+        // there invalidates the index and is reported, as a failed build always is.
+        if (held.state !== "invalid") {
+          try {
+            await this.#beginPostingBuild(current.id, held.storageColumnId, buildId);
+          } catch (error) {
+            if (isLivePostingBuildRefusal(error)) return "deferred";
+          }
+        }
+        try {
+          const marked = await this.store.updateTable(current.id, current.revision, {
+            secondaryIndexes: {
+              ...current.secondaryIndexes,
+              [indexId]: { ...held, state: "building", buildId, buildFromVersion: -1 },
+            },
+          });
+          return { marked, buildId };
+        } catch (error) {
+          await this.#releaseClaimedPostingBuild(current.id, held.storageColumnId, buildId);
+          throw error;
+        }
       },
       this.#maintenanceSignal,
     );
-    if (entered === undefined) return;
+    if (entered === undefined || entered === "deferred") return entered;
     const { marked, buildId } = entered;
+    try {
+      return await this.#buildMarkedSecondaryIndexBase(table, indexId, index, marked, buildId);
+    } finally {
+      // A build that returned before streaming (its columns are gone) never used its claim.
+      await this.#releaseClaimedPostingBuild(table.id, index.storageColumnId, buildId);
+    }
+  }
+
+  /** Aborts a session this engine claimed but never finished or aborted. */
+  async #releaseClaimedPostingBuild(
+    tableId: string,
+    columnId: string,
+    buildId: string,
+  ): Promise<void> {
+    if (!this.#postingBuildSessions.has(buildId)) return;
+    await this.#abortPostingBuild(tableId, columnId, buildId).catch(
+      this.#postingCleanupFailure(tableId, columnId),
+    );
+  }
+
+  async #buildMarkedSecondaryIndexBase(
+    table: TableRecord,
+    indexId: string,
+    index: SecondaryIndexRecord,
+    marked: TableRecord,
+    buildId: string,
+  ): Promise<"deferred" | undefined> {
     // Set while a UNIQUE key set is staged and not yet published; written inside the snapshot.
     const uniqueBuild = { staged: false };
     try {
@@ -21708,41 +23145,52 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       });
       // Still staged after the publication turn: the index was dropped or rebuilt meanwhile.
       if (uniqueBuild.staged) await this.#abortUniqueKeyBuild(table.id, index, buildId);
+      return undefined;
     } catch (error) {
       if (uniqueBuild.staged) await this.#abortUniqueKeyBuild(table.id, index, buildId);
-      const fresh = await this.store
-        .getTable(table.id)
+      const superseded = Symbol("superseded");
+      // Read the record inside the turn that rewrites it: read outside, any catalog step that
+      // lands between the two (another index's build publishing) refuses the rewrite.
+      const invalidatedColumnId = await this.#admissions
+        .admit(
+          "catalog",
+          async () => {
+            const fresh = await this.store.getTable(table.id);
+            const freshIndex = fresh?.secondaryIndexes?.[indexId];
+            if (
+              fresh === undefined ||
+              freshIndex?.state !== "building" ||
+              freshIndex.buildId !== buildId
+            ) {
+              return superseded;
+            }
+            const { buildId: _failedBuild, ...invalidIndex } = freshIndex;
+            void _failedBuild;
+            await this.store.updateTable(fresh.id, fresh.revision, {
+              secondaryIndexes: {
+                ...fresh.secondaryIndexes,
+                [indexId]: { ...invalidIndex, state: "invalid" },
+              },
+            });
+            return freshIndex.storageColumnId;
+          },
+          this.#maintenanceSignal,
+        )
         .catch(this.#postingCleanupFailure(table.id, index.storageColumnId));
-      const freshIndex = fresh?.secondaryIndexes?.[indexId];
-      if (
-        fresh !== undefined &&
-        freshIndex?.state === "building" &&
-        freshIndex.buildId === buildId
-      ) {
-        const { buildId: _failedBuild, ...invalidIndex } = freshIndex;
-        void _failedBuild;
-        const invalidated = await this.#admissions
-          .admit(
-            "catalog",
-            () =>
-              this.store.updateTable(fresh.id, fresh.revision, {
-                secondaryIndexes: {
-                  ...fresh.secondaryIndexes,
-                  [indexId]: { ...invalidIndex, state: "invalid" },
-                },
-              }),
-            this.#maintenanceSignal,
-          )
-          .then(() => true)
+      // The catalog no longer names this build -- the index was dropped, its oversized tail cut,
+      // or another connection's build took it over -- and that same change took the build's
+      // session away. The build lost a race with whatever owns the index now; there is nothing
+      // to clean up, and a query that finds the index not ready schedules the next build.
+      if (invalidatedColumnId === superseded && error instanceof PostingBuildConflictError) {
+        return "deferred";
+      }
+      // Catalog first: every intermediate reader scans. Once invalid, postings are neither
+      // truth nor maintained; removing their base and deltas bounds a persistently failing
+      // rebuild without touching a UNIQUE index's separate membership namespace.
+      if (typeof invalidatedColumnId === "string") {
+        await this.store
+          .removeFtsColumn(table.id, invalidatedColumnId)
           .catch(this.#postingCleanupFailure(table.id, index.storageColumnId));
-        // Catalog first: every intermediate reader scans. Once invalid, postings are neither
-        // truth nor maintained; removing their base and deltas bounds a persistently failing
-        // rebuild without touching a UNIQUE index's separate membership namespace.
-        if (invalidated) {
-          await this.store
-            .removeFtsColumn(fresh.id, freshIndex.storageColumnId)
-            .catch(this.#postingCleanupFailure(table.id, index.storageColumnId));
-        }
       }
       throw error;
     }
@@ -21829,15 +23277,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   async #beginPostingBuild(tableId: string, columnId: string, buildId: string): Promise<void> {
-    const now = this.#now();
+    let lifetime = this.#postingBuildSessions.get(buildId);
+    if (lifetime === undefined) {
+      const now = this.#now();
+      lifetime = { createdAt: dateIsoString(now), expiresAt: this.#postingBuildExpiry(now) };
+    }
     await this.store.beginFtsBaseBuild({
       tableId,
       columnId,
       buildId,
       ownerId: this.#internalLeaseOwnerId,
-      createdAt: dateIsoString(now),
-      expiresAt: this.#postingBuildExpiry(now),
+      ...lifetime,
     });
+    this.#postingBuildSessions.set(buildId, lifetime);
   }
 
   async #writePostingBuildChunk(
@@ -21868,25 +23320,33 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     input: { coversVersion: number; chunkCount: number; totalTokens: number },
   ): Promise<void> {
     const now = this.#now();
-    await this.store.finishFtsBaseBuild({
-      tableId,
-      columnId,
-      buildId,
-      ownerId: this.#internalLeaseOwnerId,
-      expiresAtCutoff: dateIsoString(now),
-      ...input,
-      completedAt: dateIsoString(now),
-    });
+    try {
+      await this.store.finishFtsBaseBuild({
+        tableId,
+        columnId,
+        buildId,
+        ownerId: this.#internalLeaseOwnerId,
+        expiresAtCutoff: dateIsoString(now),
+        ...input,
+        completedAt: dateIsoString(now),
+      });
+    } finally {
+      this.#postingBuildSessions.delete(buildId);
+    }
   }
 
   async #abortPostingBuild(tableId: string, columnId: string, buildId: string): Promise<void> {
-    await this.store.abortFtsBaseBuild({
-      tableId,
-      columnId,
-      buildId,
-      ownerId: this.#internalLeaseOwnerId,
-      expiresAtCutoff: dateIsoString(this.#now()),
-    });
+    try {
+      await this.store.abortFtsBaseBuild({
+        tableId,
+        columnId,
+        buildId,
+        ownerId: this.#internalLeaseOwnerId,
+        expiresAtCutoff: dateIsoString(this.#now()),
+      });
+    } finally {
+      this.#postingBuildSessions.delete(buildId);
+    }
   }
 
   /**
@@ -22713,8 +24173,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const ftsSegments = await this.#ftsPrunedSegments(table, committed, plan, snapshot);
     const indexed = await this.#secondaryIndexPrunedSegments(table, ftsSegments, plan, snapshot);
     // An exact row selection is numbered without the scope's rows; block pruning is all that
-    // carries over.
-    return { segments: [...indexed.segments, ...own], pruned: indexed.pruned };
+    // carries over. Block pruning replays every delta: an exact selection keeps only the deltas
+    // of its candidate rows, and a kept block also holds rows whose dropped delta changed them.
+    const pruned =
+      indexed.rows === undefined ? indexed.segments : withEveryDelta(committed, indexed.segments);
+    return { segments: [...pruned, ...own], pruned: indexed.pruned };
   }
 
   async #secondaryIndexPrunedSegments(
@@ -22724,7 +24187,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     snapshot: LeasedSnapshot,
   ): Promise<{ segments: SegmentRecord[]; pruned: boolean; rows?: number[] }> {
     const predicates = secondaryIndexPredicates(plan, table);
-    if (predicates.length === 0) {
+    const disjunctions = secondaryIndexDisjunctions(plan, table);
+    if (predicates.length === 0 && disjunctions.length === 0) {
       // A killed build or a stale-writer invalidation self-heals on the next relevant query.
       for (const [indexId, index] of Object.entries(table.secondaryIndexes ?? {})) {
         if (index.state === "ready") continue;
@@ -22743,6 +24207,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       return { segments, pruned: false };
     }
     const keyColumn = getUniqueKeyColumn(table);
+    const everyPredicate = [...predicates, ...disjunctions.flat(2)];
     if (keyColumn === undefined) {
       if (
         segments.some((segment) => {
@@ -22752,10 +24217,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       ) {
         return { segments, pruned: false };
       }
-      if (predicates.some((predicate) => predicate.index.locator !== "row-id")) {
+      if (everyPredicate.some((predicate) => predicate.index.locator !== "row-id")) {
         return { segments, pruned: false };
       }
-    } else if (predicates.some((predicate) => predicate.index.locator !== "key-hash-v1")) {
+    } else if (everyPredicate.some((predicate) => predicate.index.locator !== "key-hash-v1")) {
       return { segments, pruned: false };
     }
 
@@ -22776,8 +24241,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
 
     const upToVersion = snapshot.version ?? -1;
-    let candidates: bigint[] | undefined;
-    for (const predicate of predicates) {
+    /** One predicate's candidate locators, or undefined when the index cannot serve it now. */
+    const candidatesFor = async (
+      predicate: SecondaryIndexPredicate,
+    ): Promise<bigint[] | undefined> => {
       const result = await this.#readFtsCandidatesMemoized(
         snapshot,
         table.id,
@@ -22785,25 +24252,57 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         predicate.queries,
         upToVersion,
       );
-      if (result.overflow) return { segments, pruned: false };
+      if (result.overflow) return undefined;
       if (!result.hasBase) {
         this.#scheduleSecondaryIndexBuild(table, predicate.indexId);
-        return { segments, pruned: false };
+        return undefined;
       }
       // A newer rebuild may omit rows an old time-travel snapshot still saw.
-      if (result.coversVersion > upToVersion) return { segments, pruned: false };
+      if (result.coversVersion > upToVersion) return undefined;
       if (result.deltaChunkCount > FTS_FOLD_DELTA_CHUNKS) {
         this.#scheduleSecondaryIndexBuild(table, predicate.indexId);
       }
-      const forPredicate = predicate.union
+      return predicate.union
         ? unionSortedRowIds(result.rowIdsByTerm)
         : (result.rowIdsByTerm[0] ?? []);
+    };
+    let candidates: bigint[] | undefined;
+    for (const predicate of predicates) {
+      const forPredicate = await candidatesFor(predicate);
+      if (forPredicate === undefined) return { segments, pruned: false };
       candidates =
         candidates === undefined ? forPredicate : intersectSortedRowIds(candidates, forPredicate);
       if (candidates.length === 0) return { segments: [], pruned: true };
     }
+    // A disjunction every branch of which an index serves matches only rows some branch's
+    // candidates name: the union of the branches, each the intersection of its own predicates.
+    for (const alternatives of disjunctions) {
+      const branches: bigint[][] = [];
+      for (const branch of alternatives) {
+        let forBranch: bigint[] | undefined;
+        for (const predicate of branch) {
+          const forPredicate = await candidatesFor(predicate);
+          if (forPredicate === undefined) return { segments, pruned: false };
+          forBranch =
+            forBranch === undefined ? forPredicate : intersectSortedRowIds(forBranch, forPredicate);
+          if (forBranch.length === 0) break;
+        }
+        branches.push(forBranch ?? []);
+      }
+      const forDisjunction = unionSortedRowIds(branches);
+      if (forDisjunction.length > MAX_FTS_CANDIDATE_ROW_IDS) return { segments, pruned: false };
+      candidates =
+        candidates === undefined
+          ? forDisjunction
+          : intersectSortedRowIds(candidates, forDisjunction);
+      if (candidates.length === 0) return { segments: [], pruned: true };
+    }
     if (candidates === undefined) return { segments, pruned: false };
-    const candidateSet = keyColumn === undefined ? undefined : new Set(candidates);
+    // Key locators are 32-bit hashes; a posting outside that range names no row.
+    const candidateNumbers =
+      keyColumn === undefined
+        ? []
+        : candidates.map((candidate) => (candidate <= 0xffff_ffffn ? Number(candidate) : -1));
     // With a key column and only appended segments, the block locator maps give the exact scan
     // rows, in the streamed scan's numbering over the kept blocks: an equality lookup then
     // visits a handful of rows instead of every block that holds one. Mutation segments replay
@@ -22858,47 +24357,55 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           rowStart += rowCount;
         }
       } else {
-        const decoded = await this.#decodedBlocksThroughCache(anchorIds, snapshot);
-        for (const [blockIndex, block] of decoded.entries()) {
-          if (block.column.type !== keyColumn.type) {
-            return { segments, pruned: false };
+        // A segment's key locators are a pure function of its immutable key blocks, so they
+        // are hashed once into one table per segment; a lookup then probes each (of the few)
+        // candidates once per segment instead of once per block. A candidate list wider than
+        // the segment walks the segment's locators against the candidate set instead.
+        const locators = await this.#segmentKeyLocators(segment, anchorIds, keyColumn, snapshot);
+        if (locators === undefined) return { segments, pruned: false };
+        const blockCount = anchorIds.length;
+        const hits: Array<number[] | undefined> = [];
+        const hitBlock = (row: number): void => {
+          // The last block starting at or before the row.
+          let low = 0;
+          let high = blockCount - 1;
+          while (low < high) {
+            const middle = (low + high + 1) >>> 1;
+            if ((locators.blockStarts[middle] ?? 0) <= row) low = middle;
+            else high = middle - 1;
           }
-          const blockId = anchorIds[blockIndex] ?? "";
-          const vector = this.#blockColumnVector(blockId, block);
-          // A block's key locators are a pure function of its immutable bytes, so they are
-          // hashed once and pooled; a lookup then probes the (few) candidates against the
-          // block's set instead of re-hashing every stored key on every query. A candidate
-          // list wider than the block walks the block's locators against the candidate set.
-          const locators = await this.#blockKeyLocators(blockId, vector, keyColumn.type);
-          const positions: number[] = [];
-          const collect = (hit: number | number[] | undefined): boolean => {
-            if (hit === undefined) return false;
-            if (typeof hit === "number") positions.push(hit);
-            else positions.push(...hit);
-            return rowPositions === undefined;
-          };
-          if (candidates.length <= locators.size) {
-            for (const candidate of candidates) if (collect(locators.get(candidate))) break;
-          } else if (candidateSet !== undefined) {
-            for (const [locator, hit] of locators) {
-              if (candidateSet.has(locator) && collect(hit)) break;
+          (hits[low] ??= []).push(row - (locators.blockStarts[low] ?? 0));
+        };
+        if (candidateNumbers.length <= locators.rowCount) {
+          for (const candidate of candidateNumbers) {
+            if (candidate >= 0) probeSegmentKeyLocators(locators, candidate, hitBlock);
+          }
+        } else {
+          const wanted = new Set(candidateNumbers);
+          for (let row = 0; row < locators.rowCount; row += 1) {
+            if (locators.nullRows?.[row] !== 1 && wanted.has(locators.locators[row] ?? -1)) {
+              hitBlock(row);
             }
           }
-          if (positions.length > 0) {
+        }
+        for (let blockIndex = 0; blockIndex < blockCount; blockIndex += 1) {
+          const blockRows =
+            (locators.blockStarts[blockIndex + 1] ?? 0) - (locators.blockStarts[blockIndex] ?? 0);
+          const positions = hits[blockIndex];
+          if (positions !== undefined && positions.length > 0) {
             if (
               rowPositions !== undefined &&
               (segment.kind === "insert" || segment.kind === "base")
             ) {
-              positions.sort((a, b) => a - b);
               const keptRows = rowCounts.reduce((total, count) => total + count, 0);
-              for (const position of positions) {
+              for (const position of Uint32Array.from(positions).sort()) {
                 rowPositions.push(selectedRowStart + keptRows + position);
               }
             }
             blockIndexes.push(blockIndex);
-            rowCounts.push(vector.length);
+            rowCounts.push(blockRows);
           }
-          rowStart += vector.length;
+          rowStart += blockRows;
         }
       }
       if (rowStart !== segment.rowCount) return { segments, pruned: false };
@@ -22928,9 +24435,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (index === undefined) return;
     const key = `${table.id}/${index.storageColumnId}`;
     if (this.#ftsBuildsInFlight.has(key)) return;
+    // A build deferred to another connection's live one settles quietly; the key is released
+    // either way, so the next query that finds the index still not ready tries again.
     const build = this.#buildSecondaryIndexBase(table, indexId, index)
-      .catch((error: unknown) =>
-        this.#reportBackgroundError(error, `secondary index build for ${table.name}/${indexId}`),
+      .then(
+        () => undefined,
+        (error: unknown) =>
+          this.#reportBackgroundError(error, `secondary index build for ${table.name}/${indexId}`),
       )
       .finally(() => {
         if (this.#ftsBuildsInFlight.get(key) === build) this.#ftsBuildsInFlight.delete(key);
@@ -22984,6 +24495,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     let observedCount: number | undefined;
     let invalidated = false;
     const build = (async () => {
+      let folded: boolean;
       try {
         const table = await this.store.getTable(tableId);
         // Once scheduled, finish even if close() starts: close joins this promise specifically so
@@ -22997,34 +24509,44 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         if (state !== undefined && state.state !== "invalid") {
           const column = table.columns.find((candidate) => candidate.id === columnId);
           if (column !== undefined) await this.#buildFtsIndex(table, column);
+          folded = true;
         } else {
           const secondary = Object.entries(table.secondaryIndexes ?? {}).find(
             ([, index]) => index.storageColumnId === columnId && index.state !== "invalid",
           );
-          if (secondary !== undefined) {
-            await this.#buildSecondaryIndexBase(table, secondary[0], secondary[1]);
-          } else {
+          if (secondary === undefined) {
             invalidated = true;
             this.#postingDeltaTailCounts.delete(key);
             return;
           }
+          // "deferred": another connection's build is folding this tail already -- with several
+          // tabs writing, every commit past the bound lands here. Nothing failed, so nothing is
+          // reported; if that build fails, the next commit past the bound asks again.
+          folded =
+            (await this.#buildSecondaryIndexBase(table, secondary[0], secondary[1])) !== "deferred";
         }
-        const version = (await this.store.getCurrentManifestVersion()) ?? -1;
-        observedCount = (await this.store.readFtsCandidates(tableId, columnId, [], version))
-          .deltaChunkCount;
-        this.#postingDeltaTailCounts.set(key, observedCount);
+        if (folded) {
+          const version = (await this.store.getCurrentManifestVersion()) ?? -1;
+          observedCount = (await this.store.readFtsCandidates(tableId, columnId, [], version))
+            .deltaChunkCount;
+          this.#postingDeltaTailCounts.set(key, observedCount);
+        }
       } catch (error) {
+        folded = false;
         this.#reportBackgroundError(error, `posting delta fold for ${key}`);
-        if ((this.#postingDeltaTailCounts.get(key) ?? 0) >= FTS_HARD_DELTA_CHUNKS) {
-          try {
-            await this.#invalidateOversizedPostingTail(tableId, columnId);
-            invalidated = true;
-            this.#postingDeltaTailCounts.delete(key);
-          } catch (error) {
-            this.#reportBackgroundError(error, `posting tail invalidation for ${key}`);
-            // Keep the hard-threshold marker. A later commit or relevant read will retry; losing
-            // it here would turn a transient catalog/cleanup refusal into silent unbounded growth.
-          }
+      }
+      // A tail that reached the hard bound without this fold bringing it down is cut, whether
+      // the fold failed or another connection's has not caught up: the index falls back to scans
+      // rather than append one durable delta per commit.
+      if (!folded && (this.#postingDeltaTailCounts.get(key) ?? 0) >= FTS_HARD_DELTA_CHUNKS) {
+        try {
+          await this.#invalidateOversizedPostingTail(tableId, columnId);
+          invalidated = true;
+          this.#postingDeltaTailCounts.delete(key);
+        } catch (error) {
+          this.#reportBackgroundError(error, `posting tail invalidation for ${key}`);
+          // Keep the hard-threshold marker. A later commit or relevant read will retry; losing
+          // it here would turn a transient catalog/cleanup refusal into silent unbounded growth.
         }
       }
     })().finally(() => {
@@ -23911,7 +25433,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const fetchIds: string[] = [];
     for (let index = 0; index < ids.length; index += 1) {
       const id = ids[index] ?? "";
-      const cached = this.#cacheGet(`dpb\0${id}`) as DecodedPhysicalBlock | undefined;
+      const cached = this.#blockCacheGet(ArtifactFamily.decodedBlock, id) as
+        DecodedPhysicalBlock | undefined;
       if (cached !== undefined) {
         decodedBlocks[index] = cached;
         continue;
@@ -23937,7 +25460,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const bytes = fetchedBytes.get(id) ?? storedBlocks?.get(id);
       if (bytes === undefined) throw new Error(`Visible block is missing: ${id}`);
       const decoded = await decodePhysicalBlock(bytes);
-      this.#cachePut(`dpb\0${id}`, decoded, decodedPhysicalBlockRetainedBytes(decoded));
+      this.#blockCachePut(
+        ArtifactFamily.decodedBlock,
+        id,
+        decoded,
+        decodedPhysicalBlockRetainedBytes(decoded),
+      );
       decodedBlocks[index] = decoded;
     }
     return decodedBlocks.map((decoded, index) => {
@@ -24038,6 +25566,278 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   /**
+   * Scan positions of the only rows an ordered-selection statement can return (see
+   * ordered-selection.ts), over append-only segments: for a top-N, the first `take` rows in
+   * column order plus every row tied with the last; for MIN/MAX, one row holding each extreme.
+   * Zone maps order the blocks and stop the walk once no further block can beat what is held;
+   * an ascending block is searched by bisection and any other is scanned once. Undefined when
+   * the statement or the history does not qualify, or the selection would be wide.
+   */
+  async #orderedRowSelection(
+    plan: CompiledQuery,
+    table: TableRecord,
+    segments: readonly SegmentRecord[],
+    snapshot: LeasedSnapshot,
+  ): Promise<{ rows: number[]; offset?: number } | undefined> {
+    if (planContainsFts(plan)) return undefined;
+    const shape = orderedSelectionShape(plan, table, SECONDARY_INDEX_ROW_SELECTION_CAP);
+    if (shape === undefined) return undefined;
+    if (
+      segments.some((segment) => {
+        const kind = segment.kind;
+        return kind !== "insert" && kind !== "base";
+      })
+    ) {
+      return undefined;
+    }
+    const columns =
+      shape.kind === "top"
+        ? [shape.column]
+        : [...new Map(shape.extremes.map(({ column }) => [column.id, column])).values()];
+    const blocksByColumn = new Map<string, OrderedSelectionBlock[]>();
+    for (const column of columns) {
+      const blocks: OrderedSelectionBlock[] = [];
+      let rowStart = 0;
+      for (const segment of segments) {
+        const ids = segment.columnBlockIds[column.id] ?? [];
+        if (ids.length === 0 && segment.rowCount > 0) return undefined;
+        if (Object.values(segment.columnBlockIds).some((other) => other.length !== ids.length)) {
+          return undefined;
+        }
+        const descriptions = await this.#zoneDescriptions(ids, snapshot);
+        let segmentRows = 0;
+        for (const id of ids) {
+          const description = descriptions.get(id);
+          if (description?.type !== column.type) return undefined;
+          blocks.push({
+            id,
+            rowStart: rowStart + segmentRows,
+            rowCount: description.rowCount,
+            nullCount: description.nullCount,
+            zone: description.metadata.zoneMap,
+          });
+          segmentRows += description.rowCount;
+        }
+        if (segmentRows !== segment.rowCount) return undefined;
+        rowStart += segmentRows;
+      }
+      blocksByColumn.set(column.id, blocks);
+    }
+    const blockValues = async (
+      block: OrderedSelectionBlock,
+      column: TableColumnRecord,
+    ): Promise<ColumnVector | undefined> => {
+      const [vector] = await this.#pointReadVectors([block.id], snapshot);
+      return vector?.kind === column.type && vector.length === block.rowCount ? vector : undefined;
+    };
+    const range = shape.range;
+    if (shape.kind === "extremes") {
+      const rows = new Set<number>();
+      for (const { column, max } of shape.extremes) {
+        const blocks = (blocksByColumn.get(column.id) ?? []).filter(
+          (block) =>
+            block.zone !== undefined &&
+            zoneMeetsOrderedRange(range, block.zone.min, block.zone.max),
+        );
+        blocks.sort((left, right) =>
+          max
+            ? (right.zone?.max ?? 0) - (left.zone?.max ?? 0)
+            : (left.zone?.min ?? 0) - (right.zone?.min ?? 0),
+        );
+        let best: { value: number; row: number } | undefined;
+        for (const block of blocks) {
+          const zone = block.zone;
+          if (zone === undefined) continue;
+          if (best !== undefined && (max ? zone.max <= best.value : zone.min >= best.value)) break;
+          const vector = await blockValues(block, column);
+          if (vector === undefined || vector.kind === "string" || vector.kind === "boolean") {
+            return undefined;
+          }
+          const values = vector.values;
+          let slot = -1;
+          if (vector.nullCount === 0 && valuesAreAscending(values)) {
+            const { begin, end } = ascendingRangeSlots(values, vector.length, range);
+            if (begin < end) slot = max ? end - 1 : begin;
+          } else {
+            for (let index = 0; index < vector.length; index += 1) {
+              const value = values[index] ?? 0;
+              if (vector.nullCount !== 0 && vectorValue(vector, index) === null) continue;
+              if (!inOrderedRange(range, value)) continue;
+              if (slot < 0 || (max ? value > (values[slot] ?? 0) : value < (values[slot] ?? 0))) {
+                slot = index;
+              }
+            }
+          }
+          if (slot < 0) continue;
+          const value = values[slot] ?? 0;
+          if (best === undefined || (max ? value > best.value : value < best.value)) {
+            best = { value, row: block.rowStart + slot };
+          }
+        }
+        if (best !== undefined) rows.add(best.row);
+      }
+      return { rows: [...rows].sort((left, right) => left - right) };
+    }
+    const { column, descending } = shape;
+    const blocks = blocksByColumn.get(column.id) ?? [];
+    // A range predicate never admits a NULL; without one, a NULL row can sort into the answer
+    // (or fill a short one), and the zone maps that steer this walk do not describe NULLs.
+    if (!range.constrained && blocks.some((block) => block.nullCount > 0)) return undefined;
+    if (shape.limit === 0) return { rows: [] };
+    const candidates = blocks.filter(
+      (block) =>
+        block.zone !== undefined && zoneMeetsOrderedRange(range, block.zone.min, block.zone.max),
+    );
+    candidates.sort((left, right) =>
+      descending
+        ? (right.zone?.max ?? 0) - (left.zone?.max ?? 0)
+        : (left.zone?.min ?? 0) - (right.zone?.min ?? 0),
+    );
+    let take = shape.take;
+    // A deep page starts past rows that are only counted (see #orderedPageStart).
+    let start: { block: number; slot: number; skipped: number } | undefined;
+    if (shape.offset > 0) {
+      const page = await this.#orderedPageStart(
+        candidates,
+        range,
+        descending,
+        shape.offset,
+        (block) => blockValues(block, column),
+      );
+      if (page === "past") return { rows: [], offset: 0 };
+      if (page !== undefined) {
+        start = page;
+        take -= page.skipped;
+      }
+    }
+    if (take > SECONDARY_INDEX_ROW_SELECTION_CAP) return undefined;
+    let picked: Array<{ value: number; row: number }> = [];
+    let edge: number | undefined;
+    for (let index = start?.block ?? 0; index < candidates.length; index += 1) {
+      const block = candidates[index];
+      const zone = block?.zone;
+      if (block === undefined || zone === undefined) continue;
+      // Ties with the held edge value still belong to the answer's candidates.
+      if (edge !== undefined && (descending ? zone.max < edge : zone.min > edge)) break;
+      const vector = await blockValues(block, column);
+      if (vector === undefined || vector.kind === "string" || vector.kind === "boolean") {
+        return undefined;
+      }
+      const values = vector.values;
+      if (vector.nullCount === 0 && valuesAreAscending(values)) {
+        let { begin, end } = ascendingRangeSlots(values, vector.length, range);
+        if (start?.block === index) {
+          if (descending) end = start.slot + 1;
+          else begin = start.slot;
+        }
+        if (begin >= end) continue;
+        if (descending) {
+          let first = Math.max(begin, end - take);
+          const boundary = values[first];
+          while (first > begin && values[first - 1] === boundary) first -= 1;
+          for (let slot = first; slot < end; slot += 1) {
+            picked.push({ value: values[slot] ?? 0, row: block.rowStart + slot });
+          }
+        } else {
+          let last = Math.min(end, begin + take);
+          const boundary = values[last - 1];
+          while (last < end && values[last] === boundary) last += 1;
+          for (let slot = begin; slot < last; slot += 1) {
+            picked.push({ value: values[slot] ?? 0, row: block.rowStart + slot });
+          }
+        }
+      } else {
+        const valid =
+          vector.nullCount === 0 ? undefined : (slot: number) => vectorValue(vector, slot) !== null;
+        const boundary = boundedOrderedEdge(values, vector.length, valid, range, take, descending);
+        if (boundary === undefined) continue;
+        for (let slot = 0; slot < vector.length; slot += 1) {
+          const value = values[slot] ?? 0;
+          if (descending ? value < boundary : value > boundary) continue;
+          if (!inOrderedRange(range, value) || valid?.(slot) === false) continue;
+          picked.push({ value, row: block.rowStart + slot });
+        }
+      }
+      if (picked.length >= take) {
+        picked.sort((left, right) =>
+          descending ? right.value - left.value : left.value - right.value,
+        );
+        const boundary = picked[take - 1]?.value ?? 0;
+        let keep = take;
+        while (keep < picked.length && picked[keep]?.value === boundary) keep += 1;
+        picked = picked.slice(0, keep);
+        edge = boundary;
+      }
+      if (picked.length > SECONDARY_INDEX_ROW_SELECTION_CAP) return undefined;
+    }
+    return {
+      rows: picked.map(({ row }) => row).sort((left, right) => left - right),
+      ...(start === undefined ? {} : { offset: shape.offset - start.skipped }),
+    };
+  }
+
+  /**
+   * Where a deep page begins when the column's in-range blocks are pairwise disjoint (each one's
+   * values all precede the next one's in ORDER BY order): every row before the page is counted —
+   * a whole block from its header when all of it is in range, otherwise by bisecting its sorted
+   * values — and never selected. The start backs off to the first row of its tie group, since the
+   * executor orders ties by the remaining ORDER BY terms; `skipped` counts only rows strictly
+   * ahead of the page's first value. "past" means the page starts beyond the last row; undefined
+   * means the blocks are not provably in one global order.
+   */
+  async #orderedPageStart(
+    blocks: readonly OrderedSelectionBlock[],
+    range: OrderedRange,
+    descending: boolean,
+    offset: number,
+    load: (block: OrderedSelectionBlock) => Promise<ColumnVector | undefined>,
+  ): Promise<{ block: number; slot: number; skipped: number } | "past" | undefined> {
+    for (let index = 1; index < blocks.length; index += 1) {
+      const previous = blocks[index - 1]?.zone;
+      const current = blocks[index]?.zone;
+      if (previous === undefined || current === undefined) return undefined;
+      if (descending ? current.max >= previous.min : current.min <= previous.max) return undefined;
+    }
+    let skipped = 0;
+    for (let index = 0; index < blocks.length; index += 1) {
+      const block = blocks[index];
+      const zone = block?.zone;
+      if (block === undefined || zone === undefined) return undefined;
+      const remaining = offset - skipped;
+      if (
+        block.nullCount === 0 &&
+        zoneWithinOrderedRange(range, zone.min, zone.max) &&
+        remaining >= block.rowCount
+      ) {
+        skipped += block.rowCount;
+        continue;
+      }
+      const vector = await load(block);
+      if (vector === undefined || vector.kind === "string" || vector.kind === "boolean") {
+        return undefined;
+      }
+      const values = vector.values;
+      if (vector.nullCount !== 0 || !valuesAreAscending(values)) return undefined;
+      const { begin, end } = ascendingRangeSlots(values, vector.length, range);
+      if (remaining >= end - begin) {
+        skipped += end - begin;
+        continue;
+      }
+      if (descending) {
+        let slot = end - 1 - remaining;
+        const first = values[slot];
+        while (slot < end - 1 && values[slot + 1] === first) slot += 1;
+        return { block: index, slot, skipped: skipped + (end - 1 - slot) };
+      }
+      let slot = begin + remaining;
+      const first = values[slot];
+      while (slot > begin && values[slot - 1] === first) slot -= 1;
+      return { block: index, slot, skipped: skipped + (slot - begin) };
+    }
+    return "past";
+  }
+
+  /**
    * Materializes the rows at ascending scan positions over append-only segments, reading only
    * the blocks that hold a selected row. Undefined when the block layout does not line up,
    * which sends the caller to the whole-segment path.
@@ -24114,8 +25914,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     expectedRows?: ReadonlyMap<string, number>,
   ): Promise<ColumnVector> {
     const poolable = storedBlocks === undefined && expectedRows === undefined;
+    // Keyed by the blocks themselves, not only the segments: index pruning hands this a
+    // segment narrowed to the blocks holding one lookup's candidates, under the segment's own
+    // id. Two lookups whose kept blocks differ but add up to the same row count shared one
+    // pooled vector, and the second answered from the first one's rows.
     const key = poolable
-      ? `mav\0${column.id}\0${String(rowCount)}\0${segments.map((segment) => segment.id).join("\0")}`
+      ? `mav\0${column.id}\0${String(rowCount)}\0${segments
+          .map((segment) => `${segment.id}:${(segment.columnBlockIds[column.id] ?? []).join("+")}`)
+          .join("\0")}`
       : undefined;
     if (key !== undefined) {
       const cached = this.#cacheGet(key) as ColumnVector | undefined;
@@ -24375,6 +26181,77 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
   }
 
+  /**
+   * Prepares an advanced catalog state from the one it replaces after a local commit that
+   * retired no block: each table's memoized visible segments at the old version, plus the
+   * segments the commit published, are exactly its visible segments at the new version.
+   */
+  #carryVisibleSegments(
+    state: QueryCatalogState,
+    previous: {
+      readonly realTables: Map<string, TableRecord>;
+      readonly visibility: SegmentVisibilityCatalog;
+    },
+    previousVersion: number | null,
+    version: number,
+    owner: TransactionRecord,
+    published: readonly SegmentRecord[],
+  ): void {
+    // The state changed by exactly this owner and its segments, so the lookup maps are the
+    // previous ones with those replaced, rather than rebuilt from the table's whole history.
+    let visibility: SegmentVisibilityCatalog = {
+      transactions: previous.visibility.transactions,
+      segmentsByTable: previous.visibility.segmentsByTable,
+    };
+    if (published.length > 0) {
+      const publishedIds = new Set(published.map((segment) => segment.id));
+      const segmentsByTable = new Map(previous.visibility.segmentsByTable);
+      for (const segment of published) {
+        const tableSegments = segmentsByTable.get(segment.tableId);
+        segmentsByTable.set(
+          segment.tableId,
+          tableSegments === undefined
+            ? [segment]
+            : previous.visibility.segmentsByTable.get(segment.tableId) === tableSegments
+              ? [...tableSegments.filter((current) => !publishedIds.has(current.id)), segment]
+              : [...tableSegments, segment],
+        );
+      }
+      const transactions = new Map(previous.visibility.transactions);
+      transactions.set(owner.id, owner);
+      visibility = { transactions, segmentsByTable };
+    }
+    this.#preparedCatalogStates.set(state, { realTables: previous.realTables, visibility });
+    const previousMemo = this.#visibleSegmentsMemo.get(previous.visibility);
+    if (previousMemo === undefined) return;
+    const memo = new Map<string, SegmentRecord[]>();
+    for (const table of state.tables) {
+      if (table === undefined) continue;
+      const visible = previousMemo.get(visibleSegmentsMemoKey(table.id, previousVersion));
+      if (visible === undefined) continue;
+      const added = published
+        .filter((segment) => segment.tableId === table.id)
+        .sort((left, right) => compareVisibleSegments(visibility.transactions, left, right));
+      let next: SegmentRecord[] = visible;
+      if (added.length > 0) {
+        const addedIds = new Set(added.map((segment) => segment.id));
+        const kept = visible.filter((segment) => !addedIds.has(segment.id));
+        const last = kept.at(-1);
+        const first = added[0];
+        next = [...kept, ...added];
+        if (
+          last !== undefined &&
+          first !== undefined &&
+          compareVisibleSegments(visibility.transactions, last, first) > 0
+        ) {
+          next.sort((left, right) => compareVisibleSegments(visibility.transactions, left, right));
+        }
+      }
+      memo.set(visibleSegmentsMemoKey(table.id, version), next);
+    }
+    this.#visibleSegmentsMemo.set(visibility, memo);
+  }
+
   async #visibleSegmentRecords(
     table: TableRecord,
     snapshot: Snapshot,
@@ -24389,7 +26266,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         memo = new Map<string, SegmentRecord[]>();
         this.#visibleSegmentsMemo.set(catalog, memo);
       }
-      const key = `${table.id}\u0000${String(snapshot.version ?? -1)}`;
+      const key = visibleSegmentsMemoKey(table.id, snapshot.version);
       const cached = memo.get(key);
       if (cached !== undefined) return cached;
       const computed = await this.#visibleSegmentRecordsUncached(table, snapshot, catalog);
@@ -24437,18 +26314,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       );
     });
     const visible = [...(await filterSnapshotSegments(snapshot, versionEligible)), ...overlay];
-    return visible.sort((left, right) => {
-      const leftVersion = transactions.get(left.transactionId)?.committedVersion ?? -1;
-      const rightVersion = transactions.get(right.transactionId)?.committedVersion ?? -1;
-      const leftOrder = left.logicalOrder;
-      const rightOrder = right.logicalOrder;
-      return (
-        leftOrder - rightOrder ||
-        leftVersion - rightVersion ||
-        left.commitOrdinal - right.commitOrdinal ||
-        left.id.localeCompare(right.id)
-      );
-    });
+    return visible.sort((left, right) => compareVisibleSegments(transactions, left, right));
   }
 
   async #transactionRecordsForSegments(
@@ -24625,6 +26491,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    */
   readonly #scopeTableRecords = new WeakMap<DatabaseTransaction, Map<string, TableRecord>>();
 
+  /**
+   * The write scope a statement's writer belongs to, so the statement and the session paths it
+   * calls resolve its table once between them rather than once each.
+   */
+  #statementScope(writer: StatementWriter | undefined): DatabaseTransaction | undefined {
+    return writer === undefined ? undefined : this.#writerTransactions.get(writer);
+  }
+
   async #findTable(name: string, scope?: DatabaseTransaction): Promise<TableRecord> {
     validateName(name, "Table");
     const cache =
@@ -24638,7 +26512,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           })());
     const cached = cache?.get(name);
     if (cached !== undefined) return cached;
+    // A scope reads at the catalog probe it began with; when the catalog facts are current at
+    // that probe they hold exactly the record a read would return, without a store round trip.
+    const probe = scope?.initialCatalogProbe;
+    const known =
+      probe !== undefined && this.#catalogCache?.epoch === probe.catalogEpoch
+        ? this.#catalogCache.facts.tables.get(name)
+        : undefined;
     const table =
+      known ??
       (await this.store.getTableByName(name)) ??
       (await this.store.getTableByName(await this.#foldTableName(name)));
     if (table === undefined) throw new UnknownTableError(name);
@@ -25439,29 +27321,38 @@ function storedSqlValueFromExecution(
  * a string bound to `$1` — as PostgreSQL types an unknown-typed literal by its target. Text that
  * does not parse is left for validation to refuse. Domain columns (DATE, NUMERIC, …) already
  * normalize their text through the domain, and the typed programmatic API never passes here.
+ *
+ * The other direction is PostgreSQL's assignment cast to text: a number or boolean written to a
+ * plain TEXT column — `VALUES (42)`, `SET label = quantity`, a number bound to `$1` — stores its
+ * text form, `'42'` or `'true'`.
  */
 function coerceSqlWriteValue(
   column: Pick<TableColumnRecord, "type" | "sqlDomain"> | undefined,
   value: BatchValue,
 ): BatchValue {
-  if (
-    column === undefined ||
-    column.sqlDomain !== undefined ||
-    column.type === "string" ||
-    typeof value !== "string" ||
-    isSqlDomainValue(value)
-  ) {
+  if (column === undefined || column.sqlDomain !== undefined) return value;
+  if (column.type === "string") {
+    if (typeof value === "boolean") return value ? "true" : "false";
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
     return value;
   }
+  if (typeof value !== "string" || isSqlDomainValue(value)) return value;
   return readUntypedText(column.type, value) as BatchValue;
 }
 
 /** Applies `coerceSqlWriteValue` to every typed column of a SQL INSERT batch, in place. */
 function coerceSqlWriteBatch(table: TableRecord, input: ColumnarBatch): void {
   for (const column of table.columns) {
-    if (column.type === "string" || column.sqlDomain !== undefined) continue;
+    if (column.sqlDomain !== undefined) continue;
     const values = input.columns[column.name];
-    if (!values?.some((value) => typeof value === "string")) continue;
+    if (
+      values === undefined ||
+      (column.type === "string"
+        ? !values.some((value) => typeof value === "number" || typeof value === "boolean")
+        : !values.some((value) => typeof value === "string"))
+    ) {
+      continue;
+    }
     (input.columns as Record<string, readonly BatchValue[]>)[column.name] = values.map((value) =>
       coerceSqlWriteValue(column, value),
     );
@@ -25612,6 +27503,115 @@ function foldColumnName(table: TableRecord, name: string): string {
   return matches.length === 1 ? (matches[0]?.name ?? name) : name;
 }
 
+/**
+ * A compaction rewrite changes no row, so it changes no UNIQUE membership. The store still
+ * requires every commit that stages segments for a table to name each of its enforced UNIQUE
+ * namespaces — its guard against a writer that never saw the index — so the fold names each one
+ * with an empty change. Without it every fold of such a table was refused, and once its
+ * level-zero segments reached the ceiling every write to the table was refused too.
+ */
+function stageCompactionUniqueCoverage(transaction: DatabaseTransaction, table: TableRecord): void {
+  const covered = new Set(transaction.accumulatedUniqueKeyChanges.map(({ tableId }) => tableId));
+  for (const { indexId } of readyUniqueSecondaryIndexes(table)) {
+    const namespaceId = secondaryUniqueKeyNamespace(table.id, indexId);
+    if (covered.has(namespaceId)) continue;
+    transaction.setUniqueKeyChanges({ tableId: namespaceId, keyTokens: [], requireAbsent: false });
+  }
+}
+
+/**
+ * Refuses a column rename that would leave a dependent naming the old spelling. Indexes, keys,
+ * and UNIQUE constraints hold column ids and follow the rename; CHECK constraints, generated
+ * columns, foreign keys (either side), and triggers hold names, so they block it. Views are
+ * checked by the caller against the renamed schema.
+ */
+function assertColumnRenameSafe(
+  records: readonly TableRecord[],
+  table: TableRecord,
+  column: TableColumnRecord,
+): void {
+  const where = `${table.name}.${column.name}`;
+  const names = (sql: string, label: string): readonly string[] => {
+    try {
+      return expressionColumnNames(compileCheckExpression(sql, label)).map(
+        (name) => name.split(".").at(-1) ?? name,
+      );
+    } catch {
+      // An expression that can no longer be read cannot prove it does not use the column.
+      return [column.name];
+    }
+  };
+  for (const check of table.checks ?? []) {
+    if (names(check.sql, check.name).includes(column.name)) {
+      throw new TypeError(`Cannot rename ${where}: CHECK ${check.name} uses it`);
+    }
+  }
+  for (const dependent of table.columns) {
+    if (dependent.generatedValue === undefined) continue;
+    if (names(dependent.generatedValue.sql, dependent.name).includes(column.name)) {
+      throw new TypeError(`Cannot rename ${where}: generated column ${dependent.name} uses it`);
+    }
+  }
+  for (const owner of records) {
+    for (const key of owner.foreignKeys ?? []) {
+      const uses =
+        (owner.id === table.id && foreignKeyColumns(key).includes(column.name)) ||
+        (key.parentTable === table.name && foreignKeyParentColumns(key).includes(column.name));
+      if (uses) throw new TypeError(`Cannot rename ${where}: FOREIGN KEY ${key.name} uses it`);
+    }
+    for (const trigger of owner.triggers ?? []) {
+      if (triggerReferencesColumn(owner, trigger, table, column.name, false)) {
+        throw new TypeError(`Cannot rename ${where}: trigger ${trigger.name} references it`);
+      }
+    }
+  }
+}
+
+/**
+ * The constraint an ON CONFLICT target names. PostgreSQL infers the arbiter from the target's
+ * column set, in any order: the row-addressing primary key, or one UNIQUE constraint or unique
+ * index over exactly those columns.
+ */
+type ConflictArbiter =
+  | { readonly kind: "key" }
+  | { readonly kind: "unique"; readonly name: string; readonly columns: TableColumnRecord[] };
+
+function uniqueConflictArbiters(table: TableRecord): ConflictArbiter[] {
+  const arbiters: ConflictArbiter[] = [];
+  for (const index of Object.values(table.secondaryIndexes ?? {})) {
+    if (index.unique !== true) continue;
+    const columns = secondaryIndexColumnIds(index).map((columnId) =>
+      table.columns.find((column) => column.id === columnId),
+    );
+    if (columns.some((column) => column === undefined)) continue;
+    arbiters.push({ kind: "unique", name: index.name, columns: columns as TableColumnRecord[] });
+  }
+  return arbiters;
+}
+
+function conflictArbiter(
+  table: TableRecord,
+  keyColumn: TableColumnRecord,
+  target: readonly string[],
+): ConflictArbiter {
+  const names = target.map((name) => foldColumnName(table, name));
+  const wanted = new Set(names);
+  const matches = (columns: readonly string[]): boolean =>
+    wanted.size === names.length &&
+    columns.length === wanted.size &&
+    columns.every((name) => wanted.has(name));
+  const addressColumns =
+    keyColumn.hidden === true ? primaryKeyColumns(table).map(({ name }) => name) : [keyColumn.name];
+  if (matches(addressColumns)) return { kind: "key" };
+  const unique = uniqueConflictArbiters(table).find(
+    (arbiter) => arbiter.kind === "unique" && matches(arbiter.columns.map(({ name }) => name)),
+  );
+  if (unique !== undefined) return unique;
+  throw new TypeError(
+    `ON CONFLICT (${target.join(", ")}) matches no primary key or UNIQUE constraint of ${table.name}`,
+  );
+}
+
 function foldInsertColumns<T extends { columns: readonly string[] }>(
   table: TableRecord,
   statement: T,
@@ -25620,6 +27620,43 @@ function foldInsertColumns<T extends { columns: readonly string[] }>(
   return columns.some((name, index) => name !== statement.columns[index])
     ? { ...statement, columns }
     : statement;
+}
+
+/**
+ * Replaces each `SET column = DEFAULT` with what an omitted INSERT slot would receive: the
+ * column's literal or expression default, or NULL when it has none. A stored generated column
+ * recomputes on every update anyway, so assigning it DEFAULT is dropped, as PostgreSQL allows.
+ */
+function resolveUpdateDefaults(
+  table: TableRecord,
+  assignments: ReadonlyArray<{ column: string; expression: Expression }>,
+): Array<{ column: string; expression: Expression }> {
+  return assignments.flatMap((assignment) => {
+    if (!isUpdateDefaultAssignment(assignment.expression)) return [assignment];
+    const name = foldColumnName(table, assignment.column);
+    const column = table.columns.find((candidate) => candidate.name === name);
+    if (column === undefined) throw new TypeError(`Column not found: ${table.name}.${name}`);
+    if (column.generatedValue !== undefined) return [];
+    const defaultValue = column.defaultValue;
+    if (defaultValue?.kind === "autoincrement") {
+      throw new TypeError(
+        `SET ${column.name} = DEFAULT is not supported for an auto-increment column`,
+      );
+    }
+    const expression: Expression =
+      defaultValue === undefined
+        ? { kind: "literal", value: null }
+        : defaultValue.kind === "literal"
+          ? {
+              kind: "literal",
+              value:
+                defaultValue.value instanceof Date
+                  ? new Date(defaultValue.value.getTime())
+                  : defaultValue.value,
+            }
+          : compileDefaultExpression(defaultValue.sql);
+    return [{ column: assignment.column, expression }];
+  });
 }
 
 function foldAssignmentColumns<T extends { column: string }>(
@@ -25904,9 +27941,12 @@ function normalizePlanDomainLiterals(
     const expressionSchema = (expression: Expression): SqlColumnSchema | undefined => {
       // Derived and correlated sources acquire their schemas later in the execution pipeline.
       // Validate only known types here; the completed block is checked when those sources bind.
+      // A placeholder has no type until it is bound (explain() reports on unbound plans); the
+      // bound statement is checked when it executes.
       if (
         expression.kind === "subquery" ||
         expression.kind === "exists" ||
+        containsParameter(expression) ||
         expressionColumns(expression).some((reference) => lookup(reference, types) === undefined)
       )
         return undefined;
@@ -25967,7 +28007,13 @@ function normalizePlanDomainLiterals(
         coerceTyped(column, value);
         return;
       }
+      // A DATE meeting a TIMESTAMP constant is promoted to midnight of that day, as in
+      // PostgreSQL; narrowing the timestamp to its day would make `day < TIMESTAMP '… 00:00:01'`
+      // false. A placeholder's Date has no type of its own and reads as the DATE.
+      const timestampAgainstDate = (literal: Expression): boolean =>
+        domain.kind === "date" && literal.kind === "literal" && literal.timestamp === true;
       if (value.kind === "literal") {
+        if (timestampAgainstDate(value)) return;
         if (pass.probing) {
           pass.needed = true;
           return;
@@ -25977,7 +28023,7 @@ function normalizePlanDomainLiterals(
         value.sqlDomain = domain;
       } else if (value.kind === "list") {
         for (const item of value.items) {
-          if (item.kind === "literal") {
+          if (item.kind === "literal" && !timestampAgainstDate(item)) {
             if (pass.probing) {
               pass.needed = true;
               return;
@@ -26130,6 +28176,37 @@ function tryKeyToken(type: SimpleDataType, value: BatchValue): string | undefine
   }
 }
 
+/** The immutable lookup maps one catalog state's queries share. */
+function catalogStateVisibility(state: QueryCatalogState): SegmentVisibilityCatalog {
+  const segmentsByTable = new Map<string, SegmentRecord[]>();
+  for (const segment of state.segments) {
+    const tableSegments = segmentsByTable.get(segment.tableId);
+    if (tableSegments === undefined) segmentsByTable.set(segment.tableId, [segment]);
+    else tableSegments.push(segment);
+  }
+  return {
+    transactions: new Map(state.transactions.map((record) => [record.id, record] as const)),
+    segmentsByTable,
+  };
+}
+
+/** The read order of visible segments: logical order, then publication, then staging order. */
+function compareVisibleSegments(
+  transactions: SegmentVisibilityCatalog["transactions"],
+  left: SegmentRecord,
+  right: SegmentRecord,
+): number {
+  const leftVersion = transactions.get(left.transactionId)?.committedVersion ?? -1;
+  const rightVersion = transactions.get(right.transactionId)?.committedVersion ?? -1;
+  return (
+    left.logicalOrder - right.logicalOrder ||
+    leftVersion - rightVersion ||
+    left.commitOrdinal - right.commitOrdinal ||
+    left.id.localeCompare(right.id)
+  );
+}
+
+/** Memo key of one table's visible segments at one snapshot version. */
 /**
  * Whether a table's visible history warrants a background fold: enough level-zero segments to
  * fragment a scan, enough deltas to cost one, or deltas as large as the data they overlay.
@@ -27610,6 +29687,8 @@ function secondaryIndexPredicates(
     members?: BatchValue[];
     lower?: { value: BatchValue; inclusive: boolean };
     upper?: { value: BatchValue; inclusive: boolean };
+    /** A case-sensitive LIKE pattern's literal prefix: every match starts with it. */
+    prefix?: string;
   }
   const constraints = new Map<string, Constraint>();
   const literalValue = (
@@ -27631,6 +29710,22 @@ function secondaryIndexPredicates(
     }
   };
   for (const predicate of plan.predicates) {
+    if (
+      predicate.operator === "LIKE" &&
+      predicate.left.kind === "column" &&
+      predicate.right.kind === "literal" &&
+      predicate.right.internalSqlValue !== true &&
+      typeof predicate.right.value === "string"
+    ) {
+      const column = resolveColumn(predicate.left.reference);
+      if (column?.type !== "string" || column.sqlDomain !== undefined) continue;
+      const prefix = likeLiteralPrefix(predicate.right.value, predicate.escape);
+      if (prefix === undefined || prefix.length === 0 || prefix.startsWith("\u0000")) continue;
+      const current = constraints.get(column.id) ?? {};
+      current.prefix ??= prefix;
+      constraints.set(column.id, current);
+      continue;
+    }
     if (predicate.operator === "IN" && predicate.left.kind === "column") {
       const column = resolveColumn(predicate.left.reference);
       if (column === undefined || predicate.right.kind !== "list") continue;
@@ -27709,7 +29804,24 @@ function secondaryIndexPredicates(
       // (notably exact NUMERIC and declaration-ordered ENUM). Range pruning on them would be
       // unsound, so preserve equality acceleration and let range predicates scan/recheck.
       if (column.sqlDomain !== undefined) break;
-      if (constraint.lower === undefined && constraint.upper === undefined) break;
+      if (constraint.lower === undefined && constraint.upper === undefined) {
+        const prefix = constraint.prefix;
+        if (prefix === undefined) break;
+        // A string component is its UTF-16 code units followed by a terminator, so every value
+        // starting with the prefix encodes to a term starting with the prefix's units.
+        const full = secondaryIndexComponentTerm(index, column, position, prefix);
+        const terminator = secondaryIndexComponentTerm(index, column, position, "");
+        if (!full.endsWith(terminator)) break;
+        const units = full.slice(0, full.length - terminator.length);
+        queries = prefixes.map((term) => ({
+          lower: term + units,
+          lowerInclusive: true,
+          upper: `${term}${units}\uffff`,
+          upperInclusive: false,
+        }));
+        matchedColumns += 1;
+        break;
+      }
       const direction = secondaryIndexDirections(index)[position] ?? "asc";
       const descending = direction === "desc";
       queries = prefixes.map((prefix) => {
@@ -27779,6 +29891,66 @@ function secondaryIndexPredicates(
     if (ids.every((columnId) => usedColumns.has(columnId))) continue;
     ids.forEach((columnId) => usedColumns.add(columnId));
     output.push(candidate);
+  }
+  return output;
+}
+
+/**
+ * The literal text every match of a case-sensitive LIKE pattern starts with: the characters
+ * before its first wildcard. Undefined when an escape character appears before it — the prefix
+ * would then depend on escape rules this reading does not model.
+ */
+function likeLiteralPrefix(pattern: string, escape: string | undefined): string | undefined {
+  let prefix = "";
+  for (const character of pattern) {
+    if (character === "%" || character === "_") return prefix;
+    if (character === "\\" || (escape !== undefined && character === escape)) return undefined;
+    prefix += character;
+  }
+  return prefix;
+}
+
+/**
+ * The OR predicates an index can narrow: for each one whose every branch (a conjunction) has at
+ * least one index-servable predicate, those predicates per branch. A row satisfying the OR
+ * satisfies some branch, so it is among that branch's candidates; a branch no index serves would
+ * leave the union unbounded, so such an OR is skipped whole.
+ */
+function secondaryIndexDisjunctions(
+  plan: CompiledQuery,
+  table: TableRecord,
+): SecondaryIndexPredicate[][][] {
+  const output: SecondaryIndexPredicate[][][] = [];
+  for (const predicate of plan.predicates) {
+    const condition = predicate.left;
+    if (
+      predicate.operator !== "IS TRUE" ||
+      condition.kind !== "logical" ||
+      condition.operator !== "or"
+    ) {
+      continue;
+    }
+    const branches: Expression[] = [];
+    const flatten = (expression: Expression): void => {
+      if (expression.kind === "logical" && expression.operator === "or") {
+        flatten(expression.left);
+        flatten(expression.right);
+      } else {
+        branches.push(expression);
+      }
+    };
+    flatten(condition);
+    if (branches.length > MAX_INDEXED_DISJUNCTION_BRANCHES) continue;
+    const alternatives: SecondaryIndexPredicate[][] = [];
+    for (const branch of branches) {
+      const served = secondaryIndexPredicates(
+        { ...plan, predicates: splitCondition(branch) },
+        table,
+      );
+      if (served.length === 0) break;
+      alternatives.push(served);
+    }
+    if (alternatives.length === branches.length) output.push(alternatives);
   }
   return output;
 }

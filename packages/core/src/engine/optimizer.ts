@@ -5,6 +5,7 @@ import {
   blockHasRowWindow,
   blockHasSubqueries,
   childExpressions,
+  clonePlanTree,
   DUAL_TABLE,
   expressionAliases,
   forEachBlockExpression,
@@ -49,7 +50,7 @@ import { simpleScalarFunctions } from "./sql-functions.js";
  * predicates containing subqueries stay self-contained when they move.
  */
 export function optimizePlan(plan: CompiledQuery, options: OptimizeOptions = {}): CompiledQuery {
-  const optimized = structuredClone(plan);
+  const optimized = clonePlanTree(plan);
   const aliases = new Set<string>();
   collectPlanAliases(optimized, aliases);
   optimizeBlock(optimized, correlationAliasFactory(aliases, options.resolvedNames === true));
@@ -102,7 +103,7 @@ export function qualifyCorrelatedReferences(
   tableColumns: ReadonlyMap<string, readonly string[]>,
 ): CompiledQuery {
   if (!blockHasSubqueries(plan)) return plan;
-  const qualified = structuredClone(plan);
+  const qualified = clonePlanTree(plan);
   const changedReferences: string[] = [];
   type Scope = ReadonlyMap<string, readonly string[]>;
   const outputColumns = (source: TableSource): readonly string[] => {
@@ -321,7 +322,7 @@ function decorrelateLateralSources(block: CompiledQuery): void {
       }
     }
     if (grouped || globalAggregate) {
-      for (const key of keys) inner.groupBy.push(structuredClone(key.inner));
+      for (const key of keys) inner.groupBy.push(clonePlanTree(key.inner));
     }
     keys.forEach((key, index) => {
       inner.select.push({ expression: key.inner, alias: keyAliases[index] ?? "" });
@@ -357,7 +358,7 @@ function decorrelateLateralSources(block: CompiledQuery): void {
       const visible = new Set(derived.select.map((item) => item.alias));
       for (const item of inner.select) {
         if (item.alias.startsWith("\u0000") || !visible.has(item.alias)) continue;
-        const empty = emptyScalarExpression(structuredClone(item.expression));
+        const empty = emptyScalarExpression(clonePlanTree(item.expression));
         if (empty.kind === "literal" && empty.value === null) continue;
         replacements.set(`${join.alias}.${item.alias}`, {
           kind: "case",
@@ -366,7 +367,7 @@ function decorrelateLateralSources(block: CompiledQuery): void {
               when: {
                 kind: "condition",
                 operator: "IS NULL",
-                left: structuredClone(keyReference),
+                left: clonePlanTree(keyReference),
                 right: { kind: "literal", value: null },
               },
               then: empty,
@@ -442,7 +443,7 @@ function rankLateralRows(
       return order.expression.reference;
     }
     const alias = `\u0000lateral_order_${String(sequence)}_${String(index + 1)}`;
-    inner.select.push({ expression: structuredClone(order.expression), alias });
+    inner.select.push({ expression: clonePlanTree(order.expression), alias });
     return alias;
   });
   const windows = [
@@ -479,7 +480,7 @@ function rankLateralRows(
         ? { kind: "literal", value: limit ?? 0 }
         : { kind: "parameter", index: limitParameter };
     predicates.push({
-      left: structuredClone(rowNumber),
+      left: clonePlanTree(rowNumber),
       operator: "<=",
       right:
         offset === undefined && offsetParameter === undefined
@@ -487,7 +488,7 @@ function rankLateralRows(
           : {
               kind: "binary",
               operator: "+",
-              left: structuredClone(offsetExpression),
+              left: clonePlanTree(offsetExpression),
               right: limitExpression,
             },
     });
@@ -521,7 +522,7 @@ function replaceOuterReferences(
   const rewrite = (expression: Expression): Expression => {
     if (expression.kind === "column") {
       const replacement = replacements.get(expression.reference);
-      return replacement === undefined ? expression : structuredClone(replacement);
+      return replacement === undefined ? expression : clonePlanTree(replacement);
     }
     if (expression.kind === "subquery" || expression.kind === "exists") {
       replaceOuterReferences(expression.block, alias, replacements);
@@ -632,12 +633,12 @@ function rewriteCalendarEqualities(block: CompiledQuery): void {
     }
     rewritten.push(
       {
-        left: structuredClone(range.column),
+        left: clonePlanTree(range.column),
         operator: ">=",
         right: { kind: "literal", value: range.start },
       },
       {
-        left: structuredClone(range.column),
+        left: clonePlanTree(range.column),
         operator: "<",
         right: { kind: "literal", value: range.end },
       },
@@ -737,8 +738,25 @@ function addCalendarUnit(start: Date, unit: string): Date {
 function propagateJoinKeyConstants(block: CompiledQuery): void {
   const earlier = new Set([block.base.alias]);
   const pairs: Array<{ inner: string; outer: string; toInner: boolean; toOuter: boolean }> = [];
+  // A LEFT join's key equal to a constant-pinned preserved key: a pruning hint, not a predicate.
+  const hinted: Array<{ inner: string; outer: string; join: JoinPlan }> = [];
   for (const join of block.joins) {
     const ownAlias = join.alias;
+    if (
+      join.on === undefined &&
+      join.kind === "left" &&
+      join.full !== true &&
+      join.left.kind === "column" &&
+      join.right.kind === "column"
+    ) {
+      const leftOwn = join.left.reference.startsWith(`${ownAlias}.`);
+      const rightOwn = join.right.reference.startsWith(`${ownAlias}.`);
+      if (leftOwn !== rightOwn) {
+        const inner = leftOwn ? join.left.reference : join.right.reference;
+        const outer = leftOwn ? join.right.reference : join.left.reference;
+        if (earlier.has(outer.slice(0, outer.indexOf(".")))) hinted.push({ inner, outer, join });
+      }
+    }
     // Only joins that drop an unmatched outer row qualify: a mirrored predicate is applied to
     // the join's output, where a LEFT or anti join's null-extended row would fail it.
     if (
@@ -760,7 +778,7 @@ function propagateJoinKeyConstants(block: CompiledQuery): void {
     }
     earlier.add(ownAlias);
   }
-  if (pairs.length === 0) return;
+  if (pairs.length === 0 && hinted.length === 0) return;
   const signature = (predicate: Predicate): string => encodeQueryIdentity(predicate);
   const present = new Set(block.predicates.map(signature));
   const implied: Predicate[] = [];
@@ -793,12 +811,21 @@ function propagateJoinKeyConstants(block: CompiledQuery): void {
       const replacement: Expression = { kind: "column", reference: target };
       const mirrored: Predicate =
         side === "right"
-          ? { ...predicate, left: replacement, right: structuredClone(predicate.right) }
-          : { ...predicate, left: structuredClone(predicate.left), right: replacement };
+          ? { ...predicate, left: replacement, right: clonePlanTree(predicate.right) }
+          : { ...predicate, left: clonePlanTree(predicate.left), right: replacement };
       const key = signature(mirrored);
       if (present.has(key)) continue;
       present.add(key);
       implied.push(mirrored);
+    }
+    for (const hint of hinted) {
+      if (column.reference !== hint.outer) continue;
+      const replacement: Expression = { kind: "column", reference: hint.inner };
+      (hint.join.inputHints ??= []).push(
+        side === "right"
+          ? { ...predicate, left: replacement, right: clonePlanTree(predicate.right) }
+          : { ...predicate, left: clonePlanTree(predicate.left), right: replacement },
+      );
     }
   }
   block.predicates.push(...implied);
@@ -1086,7 +1113,7 @@ function decorrelateBlock(block: CompiledQuery, nextAlias: NextAlias): void {
     item.expression = rewriteCorrelatedExpression(block, item.expression, scope, nextAlias);
     // The decorrelated value is functionally determined by the outer grouping keys. Carrying it
     // as one additional key makes that dependency explicit to both grouped executors.
-    if (grouped) block.groupBy.push(structuredClone(item.expression));
+    if (grouped) block.groupBy.push(clonePlanTree(item.expression));
   }
   assertNoCorrelation(block);
 }
@@ -1389,7 +1416,7 @@ function decorrelatePredicate(
     const comparison: Expression = {
       kind: "condition",
       operator: quantified.comparison,
-      left: structuredClone(predicate.left),
+      left: clonePlanTree(predicate.left),
       right: value,
     };
     let quantifiedCondition: Expression = comparison;
@@ -1403,7 +1430,7 @@ function decorrelatePredicate(
           left: {
             kind: "condition",
             operator: "IS NULL",
-            left: structuredClone(predicate.left),
+            left: clonePlanTree(predicate.left),
             right: { kind: "literal", value: null },
           },
           right: {
@@ -1461,17 +1488,17 @@ function decorrelateNotIn(
   const valuesAlias = nextAlias();
   const values: CompiledQuery = {
     sql: "(correlated not in values)",
-    base: structuredClone(inner.base),
-    joins: structuredClone(inner.joins),
+    base: clonePlanTree(inner.base),
+    joins: clonePlanTree(inner.joins),
     select: [
       ...keys.map((key, index) => ({
-        expression: structuredClone(key.inner),
+        expression: clonePlanTree(key.inner),
         alias: correlationKeyAlias(index),
       })),
-      { expression: structuredClone(item), alias: correlationValueAlias },
+      { expression: clonePlanTree(item), alias: correlationValueAlias },
     ],
-    predicates: structuredClone(inner.predicates),
-    groupBy: [...keys.map((key) => structuredClone(key.inner)), structuredClone(item)],
+    predicates: clonePlanTree(inner.predicates),
+    groupBy: [...keys.map((key) => clonePlanTree(key.inner)), clonePlanTree(item)],
     having: [],
     orderBy: [],
   };
@@ -1485,7 +1512,7 @@ function decorrelateNotIn(
     alias: valuesAlias,
     derived: values,
     kind: "anti",
-    left: tuple([...keys.map((key) => structuredClone(key.outer)), structuredClone(probe)]),
+    left: tuple([...keys.map((key) => clonePlanTree(key.outer)), clonePlanTree(probe)]),
     right: tuple([
       ...keys.map((_, index) => ({
         kind: "column" as const,
@@ -1498,11 +1525,11 @@ function decorrelateNotIn(
   const flagsAlias = nextAlias();
   const flags: CompiledQuery = {
     sql: "(correlated not in flags)",
-    base: structuredClone(inner.base),
-    joins: structuredClone(inner.joins),
+    base: clonePlanTree(inner.base),
+    joins: clonePlanTree(inner.joins),
     select: [
       ...keys.map((key, index) => ({
-        expression: structuredClone(key.inner),
+        expression: clonePlanTree(key.inner),
         alias: correlationKeyAlias(index),
       })),
       {
@@ -1510,12 +1537,12 @@ function decorrelateNotIn(
         alias: correlationCountAlias,
       },
       {
-        expression: { kind: "call", name: "COUNT", arguments: [structuredClone(item)] },
+        expression: { kind: "call", name: "COUNT", arguments: [clonePlanTree(item)] },
         alias: correlationNonNullCountAlias,
       },
     ],
-    predicates: structuredClone(inner.predicates),
-    groupBy: keys.map((key) => structuredClone(key.inner)),
+    predicates: clonePlanTree(inner.predicates),
+    groupBy: keys.map((key) => clonePlanTree(key.inner)),
     having: [],
     orderBy: [],
   };
@@ -1544,7 +1571,7 @@ function decorrelateNotIn(
       left: {
         kind: "condition",
         operator: "IS NOT NULL",
-        left: structuredClone(probe),
+        left: clonePlanTree(probe),
         right: { kind: "literal", value: null },
       },
       right: { kind: "condition", operator: "=", left: total, right: nonNull },
@@ -1572,17 +1599,17 @@ function decorrelateRangeNotIn(
   const valuesAlias = nextAlias();
   const values: CompiledQuery = {
     sql: "(range-correlated not in values)",
-    base: structuredClone(inner.base),
-    joins: structuredClone(inner.joins),
+    base: clonePlanTree(inner.base),
+    joins: clonePlanTree(inner.joins),
     select: [
       ...keys.map((key, index) => ({
-        expression: structuredClone(key.inner),
+        expression: clonePlanTree(key.inner),
         alias: correlationKeyAlias(index),
       })),
-      { expression: structuredClone(item), alias: correlationValueAlias },
+      { expression: clonePlanTree(item), alias: correlationValueAlias },
     ],
-    predicates: structuredClone(inner.predicates),
-    groupBy: [...keys.map((key) => structuredClone(key.inner)), structuredClone(item)],
+    predicates: clonePlanTree(inner.predicates),
+    groupBy: [...keys.map((key) => clonePlanTree(key.inner)), clonePlanTree(item)],
     having: [],
     orderBy: [],
   };
@@ -1596,7 +1623,7 @@ function decorrelateRangeNotIn(
       })),
       { kind: "column", reference: `${valuesAlias}.${correlationValueAlias}` },
     ],
-    [...keys.map((key) => structuredClone(key.outer)), structuredClone(probe)],
+    [...keys.map((key) => clonePlanTree(key.outer)), clonePlanTree(probe)],
     [...keys.map((key) => key.operator), "="],
   );
   exactMatch.kind = "anti";
@@ -1696,7 +1723,7 @@ function decorrelateRangeNotIn(
         left: {
           kind: "condition",
           operator: "IS NOT NULL",
-          left: structuredClone(probe),
+          left: clonePlanTree(probe),
           right: { kind: "literal", value: null },
         },
         right: { kind: "condition", operator: "=", left: total, right: nonNull },
@@ -1732,10 +1759,7 @@ function decorrelateQuantifiedExpression(
     );
   }
   const keys = extractCorrelation(inner, scope, label, true);
-  const outerExpressions = [
-    ...keys.map((key) => structuredClone(key.outer)),
-    structuredClone(probe),
-  ];
+  const outerExpressions = [...keys.map((key) => clonePlanTree(key.outer)), clonePlanTree(probe)];
   const probes = outerProbeBlockForExpressions(block, outerExpressions, nextAlias.resolvedNames);
   const probesAlias = nextAlias();
   const probeReferences = outerExpressions.map<Expression>((_, index) => ({
@@ -1781,8 +1805,8 @@ function decorrelateQuantifiedExpression(
   };
   const decisiveComparison: Expression =
     quantified.quantifier === "any"
-      ? structuredClone(comparison)
-      : { kind: "not", operand: structuredClone(comparison) };
+      ? clonePlanTree(comparison)
+      : { kind: "not", operand: clonePlanTree(comparison) };
   const truthMarker: Expression = {
     kind: "case",
     branches: [{ when: decisiveComparison, then: { kind: "literal", value: 1 } }],
@@ -1892,7 +1916,7 @@ function decorrelateScalarSubquery(
   ) {
     return decorrelateGeneralScalar(block, inner, scope, nextAlias);
   }
-  const previewKeys = extractCorrelation(structuredClone(inner), scope, "scalar", true);
+  const previewKeys = extractCorrelation(clonePlanTree(inner), scope, "scalar", true);
   if (
     previewKeys.some((key) => key.operator !== "=") &&
     (item.expression.arguments.length !== 1 || item.expression.aggregateOrderBy !== undefined)
@@ -1965,7 +1989,7 @@ function scalarPassthrough(inner: CompiledQuery): Expression | undefined {
   ) {
     return undefined;
   }
-  return structuredClone(item.expression);
+  return clonePlanTree(item.expression);
 }
 
 interface ScalarShape {
@@ -1985,7 +2009,7 @@ function scalarShape(inner: CompiledQuery): ScalarShape {
     throw new TypeError("A scalar subquery must select exactly one column");
   }
   let rows = inner;
-  let expression: Expression = structuredClone(item.expression);
+  let expression: Expression = clonePlanTree(item.expression);
   for (;;) {
     const derived = rows.base.derived;
     if (
@@ -2018,7 +2042,7 @@ function inlineDerivedProjection(
       if (parts.length === 2 && parts[0] !== alias) return node;
       const name = parts.length === 2 ? (parts[1] ?? "") : (parts[0] ?? "");
       const matches = derived.select.filter((item) => item.alias === name);
-      if (matches.length === 1) return structuredClone(matches[0]?.expression ?? node);
+      if (matches.length === 1) return clonePlanTree(matches[0]?.expression ?? node);
       return node;
     }
     return mapChildExpressions(node, rewrite);
@@ -2029,12 +2053,12 @@ function inlineDerivedProjection(
 /** ORDER BY may name a hidden or visible select alias; recover its row-level expression. */
 function scalarOrderExpression(expression: Expression, rows: CompiledQuery): Expression {
   if (expression.kind !== "column" || expression.reference.includes(".")) {
-    return structuredClone(expression);
+    return clonePlanTree(expression);
   }
   const matches = rows.select.filter((item) => item.alias === expression.reference);
   return matches.length === 1
-    ? structuredClone(matches[0]?.expression ?? expression)
-    : structuredClone(expression);
+    ? clonePlanTree(matches[0]?.expression ?? expression)
+    : clonePlanTree(expression);
 }
 
 /** The value a scalar aggregate expression produces for an empty correlated input. */
@@ -2047,7 +2071,7 @@ function emptyScalarExpression(
   }
   if (expression.kind === "column") {
     return preservedColumns.has(expression.reference)
-      ? structuredClone(expression)
+      ? clonePlanTree(expression)
       : { kind: "literal", value: null };
   }
   if (expression.kind === "wildcard") {
@@ -2092,8 +2116,8 @@ function decorrelateGeneralScalar(
     : extractCorrelation(rows, scope, "scalar", true);
   const outerExpressions = probeLifted
     ? references.map<Expression>((reference) => ({ kind: "column", reference }))
-    : keys.map((key) => structuredClone(key.outer));
-  const originalExpression = structuredClone(shape.expression);
+    : keys.map((key) => clonePlanTree(key.outer));
+  const originalExpression = clonePlanTree(shape.expression);
   const probes = outerProbeBlockForExpressions(block, outerExpressions, nextAlias.resolvedNames);
   const probesAlias = nextAlias();
   const probeReferences = outerExpressions.map<Expression>((_, index) => ({
@@ -2143,7 +2167,7 @@ function decorrelateGeneralScalar(
   const finalRowsAlias = nextAlias();
   const projected: Array<{ expression: Expression; alias: string }> = [];
   const project = (expression: Expression, alias: string): Expression => {
-    projected.push({ expression: structuredClone(expression), alias });
+    projected.push({ expression: clonePlanTree(expression), alias });
     return { kind: "column", reference: `${finalRowsAlias}.${alias}` };
   };
   const orderInputs = rows.orderBy.map((order, index) => ({
@@ -2157,7 +2181,7 @@ function decorrelateGeneralScalar(
     if (isAggregateCall(expression)) {
       const arguments_ = expression.arguments.map((argument) =>
         argument.kind === "wildcard"
-          ? structuredClone(argument)
+          ? clonePlanTree(argument)
           : project(argument, correlationInputAlias(inputSequence++)),
       );
       const ownOrder = expression.aggregateOrderBy?.map((order) => ({
@@ -2168,7 +2192,7 @@ function decorrelateGeneralScalar(
       const inheritedOrder =
         expression.name === "JSON_ARRAYAGG" || expression.name === "STRING_AGG"
           ? orderInputs.map(({ reference, direction, nulls }) => ({
-              expression: structuredClone(reference),
+              expression: clonePlanTree(reference),
               direction,
               ...(nulls === undefined ? {} : { nulls }),
             }))
@@ -2321,12 +2345,12 @@ function decorrelateGeneralScalar(
           ? { kind: "literal", value: rows.limit ?? 0 }
           : { kind: "parameter", index: rows.limitParameter };
       predicates.push({
-        left: structuredClone(rowNumber),
+        left: clonePlanTree(rowNumber),
         operator: "<=",
         right:
           rows.offset === undefined && rows.offsetParameter === undefined
             ? limit
-            : { kind: "binary", operator: "+", left: structuredClone(offset), right: limit },
+            : { kind: "binary", operator: "+", left: clonePlanTree(offset), right: limit },
       });
     }
     finalRows = {
@@ -2701,7 +2725,7 @@ function replaceExpressionReferences(
   const rewrite = (expression: Expression): Expression => {
     if (expression.kind === "column") {
       const replacement = replacements.get(expression.reference);
-      return replacement == null ? expression : structuredClone(replacement);
+      return replacement == null ? expression : clonePlanTree(replacement);
     }
     if (expression.kind === "subquery" || expression.kind === "exists") {
       replacePlanReferences(expression.block, replacements);
@@ -2746,11 +2770,11 @@ function outerProbeBlockForExpressions(
   resolvedNames: boolean,
 ): CompiledQuery {
   const prefix = outerProbePrefix(block, outerExpressions, resolvedNames);
-  const expressions = outerExpressions.map((expression) => structuredClone(expression));
+  const expressions = outerExpressions.map((expression) => clonePlanTree(expression));
   return {
     sql: "(correlation probes)",
-    base: structuredClone(block.base),
-    joins: structuredClone(block.joins.slice(0, prefix.lastSource)),
+    base: clonePlanTree(block.base),
+    joins: clonePlanTree(block.joins.slice(0, prefix.lastSource)),
     select: expressions.map((expression, index) => ({
       expression,
       alias: correlationProbeAlias(index),
@@ -2832,7 +2856,7 @@ function probePredicates(
         probeSafeExpression(predicate.left, retained, retainsAll) &&
         probeSafeExpression(predicate.right, retained, retainsAll),
     )
-    .map((predicate) => structuredClone(predicate));
+    .map((predicate) => clonePlanTree(predicate));
 }
 
 /**
@@ -2916,10 +2940,10 @@ function substituteColumns(
 ): Expression | undefined {
   if (expression.kind === "column") {
     const replacement = substitutions.get(expression.reference);
-    return replacement === undefined ? undefined : structuredClone(replacement);
+    return replacement === undefined ? undefined : clonePlanTree(replacement);
   }
   if (expression.kind === "literal" || expression.kind === "parameter") {
-    return structuredClone(expression);
+    return clonePlanTree(expression);
   }
   if (
     expression.kind === "wildcard" ||
@@ -2931,7 +2955,7 @@ function substituteColumns(
     return undefined;
   }
   const progress = { complete: true };
-  const mapped = mapChildExpressions(structuredClone(expression), (child) => {
+  const mapped = mapChildExpressions(clonePlanTree(expression), (child) => {
     const substituted = substituteColumns(child, substitutions);
     if (substituted === undefined) {
       progress.complete = false;
@@ -2952,7 +2976,7 @@ function pushNullSafeProbeJoin(
   const conditions = outerExpressions.map<Expression>((outer, index) => ({
     kind: "condition",
     operator: "IS NOT DISTINCT FROM",
-    left: structuredClone(outer),
+    left: clonePlanTree(outer),
     right: { kind: "column", reference: `${alias}.${correlationKeyAlias(index)}` },
   }));
   let on = conditions[0];
@@ -3157,7 +3181,7 @@ function canExtractCorrelation(
   comparisons: boolean,
 ): boolean {
   try {
-    extractCorrelation(structuredClone(inner), outerScope, label, comparisons);
+    extractCorrelation(clonePlanTree(inner), outerScope, label, comparisons);
     return true;
   } catch (error) {
     if (error instanceof TypeError) return false;
@@ -3248,7 +3272,7 @@ function rewriteUncorrelatedIn(
     joins: [],
     select: [{ expression: value, alias: correlationValueAlias }],
     predicates: [],
-    groupBy: [structuredClone(value)],
+    groupBy: [clonePlanTree(value)],
     having: [],
     orderBy: [],
   };
@@ -3257,7 +3281,7 @@ function rewriteUncorrelatedIn(
     alias,
     derived,
     kind: "inner",
-    left: structuredClone(predicate.left),
+    left: clonePlanTree(predicate.left),
     right: { kind: "column", reference: `${alias}.${correlationValueAlias}` },
   });
   return "consumed";
@@ -3324,6 +3348,8 @@ function foldExpression(expression: Expression): Expression {
           ...(isSqlDomainValue(folded) ? { internalSqlValue: true as const } : {}),
           ...(domain === undefined ? {} : { sqlDomain: domain }),
           ...(left.decimal === true || right.decimal === true ? { decimal: true as const } : {}),
+          // Compile-time folding never sees a placeholder, so a Date here is a typed timestamp.
+          ...(folded instanceof Date ? { timestamp: true as const } : {}),
         };
       }
     }
@@ -3400,11 +3426,20 @@ function foldExpression(expression: Expression): Expression {
                       : simpleScalarFunctions.get(expression.name)?.returns === "interval"
                         ? ({ kind: "interval" } as const)
                         : undefined;
+          // A constant cast to DOUBLE PRECISION, REAL, or NUMERIC keeps that type once folded:
+          // `qty / CAST(2 AS DOUBLE PRECISION)` divides exactly, never as integer `/`.
+          const fractional =
+            typeof folded === "number" &&
+            (targetWord === "number" ||
+              targetWord === "numeric" ||
+              targetWord?.startsWith("numeric:") === true);
           return {
             kind: "literal",
             value: folded,
             ...(isSqlDomainValue(folded) ? { internalSqlValue: true as const } : {}),
             ...(sqlDomain === undefined ? {} : { sqlDomain }),
+            ...(fractional ? { decimal: true as const } : {}),
+            ...(folded instanceof Date ? { timestamp: true as const } : {}),
           };
         }
       } catch {
@@ -3583,7 +3618,7 @@ function rewriteForInner(
         return undefined;
       }
     }
-    return structuredClone(item.expression);
+    return clonePlanTree(item.expression);
   }
   if (expression.kind === "binary") {
     const left = rewriteForInner(expression.left, source, derived, singleSource);

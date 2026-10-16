@@ -401,8 +401,13 @@ describe("SQLLogicTest runner", () => {
         { id: 2, name: "two" },
       ],
     });
-    await expect(database.execute("INSERT INTO items VALUES (3)")).rejects.toThrow(
-      "table column count",
+    // PostgreSQL fills the leading columns of a short positional VALUES row and defaults the rest.
+    await database.execute("INSERT INTO items VALUES (3)");
+    await expect(database.query("SELECT id, name FROM items WHERE id = 3")).resolves.toMatchObject({
+      rows: [{ id: 3, name: null }],
+    });
+    await expect(database.execute("INSERT INTO items VALUES (4, 'four', 'extra')")).rejects.toThrow(
+      "INSERT has 3 values but items has 2 columns",
     );
     await database.close();
   });

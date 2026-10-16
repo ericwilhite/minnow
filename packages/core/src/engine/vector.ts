@@ -430,6 +430,8 @@ interface BoundPredicate {
   readonly primitive?: PrimitiveComparison;
   /** Unboxed membership of a bare numeric/datetime column in a literal list. */
   readonly primitiveIn?: PrimitiveInList;
+  /** Number arithmetic over columns and literals compared against a number literal. */
+  readonly numericExpression?: NumericExpressionComparison;
   /** OR of AND-groups, each group's predicates compiled like any other. */
   readonly disjunction?: BoundDisjunction;
   /**
@@ -464,6 +466,17 @@ interface PrimitiveComparison {
   readonly vector: NumberVector | DateTimeVector | BooleanVector;
   readonly operator: ComparisonOperator;
   /** The literal as a float: numbers as-is, datetimes as epoch millis, booleans as 0/1. */
+  readonly value: number;
+}
+
+/**
+ * `arithmetic <op> number`: the arithmetic is compiled to a closure over raw float64 reads, NaN
+ * standing for anything the closure cannot answer exactly — a NULL operand, a zero divisor, or
+ * a genuine NaN from overflowed operands — which the per-row evaluator then decides.
+ */
+interface NumericExpressionComparison {
+  readonly evaluate: (rowsBySource: readonly Int32Array[], row: number) => number;
+  readonly operator: ComparisonOperator;
   readonly value: number;
 }
 
@@ -587,7 +600,7 @@ type MultiCodeColumn =
 const NUMBER_KEY_CODE_CAP = 1 << 20;
 
 interface FastAggregateSpec {
-  readonly kind: "star" | "column" | "conditional";
+  readonly kind: "star" | "column" | "conditional" | "extreme" | "distinct";
   readonly sums: boolean;
 }
 
@@ -606,7 +619,7 @@ interface GroupState {
    * carries its own set, so they no longer compete for the single deduplicating GROUP BY that
    * `COUNT(DISTINCT x)` used to be rewritten into.
    */
-  readonly distincts: Array<Set<unknown> | undefined> | undefined;
+  readonly distincts: Array<DistinctValues | undefined> | undefined;
 }
 
 interface BoundPlan {
@@ -902,20 +915,36 @@ export function vectorValue(vector: ColumnVector, rowIndex: number): QueryValue 
   return code === NULL_STRING_CODE ? null : (vector.dictionary[code] ?? null);
 }
 
+/**
+ * Each immutable vector's payload size, measured once: a pooled build side or a resident table
+ * re-enters every query, and summing a large string dictionary per query was a visible share of
+ * a small join's cost. Windowed vectors change their residency in place and are never memoized.
+ */
+const vectorPayloadBytes = new WeakMap<ColumnVector, number>();
+
+function columnVectorPayloadSize(vector: ColumnVector): number {
+  const memoize = vector.window === undefined;
+  const cached = memoize ? vectorPayloadBytes.get(vector) : undefined;
+  if (cached !== undefined) return cached;
+  let total = vector.validity.byteLength;
+  if (vector.kind === "string") {
+    total = safeMemorySum(total, vector.codes.byteLength, "Column vector payload");
+    // One byte per UTF-16 code unit, matching queryValuePayloadBytes: exact for Latin-1
+    // and O(1) per entry instead of a throwaway UTF-8 encode of the whole dictionary.
+    for (const value of vector.dictionary) {
+      total = safeMemorySum(total, value.length, "String dictionary payload");
+    }
+  } else {
+    total = safeMemorySum(total, vector.values.byteLength, "Column vector payload");
+  }
+  if (memoize) vectorPayloadBytes.set(vector, total);
+  return total;
+}
+
 function columnarTablePayloadBytes(table: ColumnarTable): number {
   let total = table.scanOrder?.byteLength ?? 0;
   for (const vector of table.columns.values()) {
-    total = safeMemorySum(total, vector.validity.byteLength, "Column vector payload");
-    if (vector.kind === "string") {
-      total = safeMemorySum(total, vector.codes.byteLength, "Column vector payload");
-      // One byte per UTF-16 code unit, matching queryValuePayloadBytes: exact for Latin-1
-      // and O(1) per entry instead of a throwaway UTF-8 encode of the whole dictionary.
-      for (const value of vector.dictionary) {
-        total = safeMemorySum(total, value.length, "String dictionary payload");
-      }
-    } else {
-      total = safeMemorySum(total, vector.values.byteLength, "Column vector payload");
-    }
+    total = safeMemorySum(total, columnVectorPayloadSize(vector), "Column vector payload");
   }
   return total;
 }
@@ -1224,12 +1253,20 @@ function bindPlan(
     if (primitive !== undefined) return { ...bound, primitive };
     const primitiveIn = detectPrimitiveInList(bound);
     if (primitiveIn !== undefined) return { ...bound, primitiveIn };
+    const numericExpression = detectNumericExpressionComparison(bound);
+    if (numericExpression !== undefined) return { ...bound, numericExpression };
     const dictionaryPredicate = detectDictionaryPredicate(bound);
     return dictionaryPredicate === undefined ? bound : { ...bound, dictionaryPredicate };
   };
   const predicates = plan.predicates.map((predicate) => {
     const bound = bindPredicate(predicate);
-    if (bound.primitive !== undefined || bound.primitiveIn !== undefined) return bound;
+    if (
+      bound.primitive !== undefined ||
+      bound.primitiveIn !== undefined ||
+      bound.numericExpression !== undefined
+    ) {
+      return bound;
+    }
     if (
       bound.dictionaryEquality !== undefined ||
       bound.dictionaryLike !== undefined ||
@@ -2261,11 +2298,58 @@ function createJoinLookup(
   };
 }
 
+/**
+ * Direct key-to-row tables per immutable key vector. A build side materialized from pooled
+ * blocks is the same vector on every execution, and rebuilding its table was most of a small
+ * keyed join. Null marks a vector that cannot take one. The table is charged to each query
+ * that uses it, exactly as when it was built per query.
+ */
+const directLookupTables = new WeakMap<
+  ColumnVector,
+  { readonly minimum: number; readonly rowByKey: Int32Array } | null
+>();
+
 function createDirectLookup(
   vector: ColumnVector,
   memory: QueryMemoryContext,
 ): JoinLookup | undefined {
   if (vector.kind !== "number") return undefined;
+  const memoize = vector.window === undefined;
+  const cached = memoize ? directLookupTables.get(vector) : undefined;
+  if (cached === null) return undefined;
+  if (cached !== undefined) {
+    memory.reserve(
+      safeMemoryProduct(cached.rowByKey.length, Int32Array.BYTES_PER_ELEMENT, "Direct join lookup"),
+      "Direct join lookup",
+    );
+    return directLookup(cached.minimum, cached.rowByKey);
+  }
+  const built = buildDirectLookup(vector, memory);
+  if (memoize) directLookupTables.set(vector, built ?? null);
+  return built === undefined
+    ? undefined
+    : built.rowByKey.length === 0
+      ? { unique: true, firstRow: () => -1, nextRow: () => -1 }
+      : directLookup(built.minimum, built.rowByKey);
+}
+
+function directLookup(minimum: number, rowByKey: Int32Array): JoinLookup {
+  return {
+    unique: true,
+    firstRow(key) {
+      if (typeof key !== "number" || !Number.isSafeInteger(key)) return -1;
+      const slot = key - minimum;
+      return slot < 0 || slot >= rowByKey.length ? -1 : (rowByKey[slot] ?? -1);
+    },
+    nextRow: () => -1,
+  };
+}
+
+/** The dense key-to-row table of a unique safe-integer key vector, or undefined. */
+function buildDirectLookup(
+  vector: NumberVector,
+  memory: QueryMemoryContext,
+): { minimum: number; rowByKey: Int32Array } | undefined {
   let minimum = Number.POSITIVE_INFINITY;
   let maximum = Number.NEGATIVE_INFINITY;
   for (let index = 0; index < vector.length; index += 1) {
@@ -2275,9 +2359,7 @@ function createDirectLookup(
     minimum = Math.min(minimum, value);
     maximum = Math.max(maximum, value);
   }
-  if (!Number.isFinite(minimum)) {
-    return { unique: true, firstRow: () => -1, nextRow: () => -1 };
-  }
+  if (!Number.isFinite(minimum)) return { minimum: 0, rowByKey: new Int32Array(0) };
   const range = maximum - minimum + 1;
   if (range > Math.max(1_024, vector.length * 4) || range > 10_000_000) return undefined;
   const reservation = memory.reserve(
@@ -2295,15 +2377,7 @@ function createDirectLookup(
     }
     rowByKey[slot] = index;
   }
-  return {
-    unique: true,
-    firstRow(key) {
-      if (typeof key !== "number" || !Number.isSafeInteger(key)) return -1;
-      const slot = key - minimum;
-      return slot < 0 || slot >= rowByKey.length ? -1 : (rowByKey[slot] ?? -1);
-    },
-    nextRow: () => -1,
-  };
+  return { minimum, rowByKey };
 }
 
 interface ScanResultSink {
@@ -2322,6 +2396,8 @@ function runScanBatch(
   groups: GroupAccumulator,
   output: ScanResultSink,
   memory: QueryMemoryContext,
+  /** Scan positions to visit instead of `start`..`start + length` (`length` of them from `start`). */
+  rows?: readonly number[],
 ): boolean {
   const batchMemory = memory.createChild();
   try {
@@ -2338,7 +2414,8 @@ function runScanBatch(
     if (scan === undefined) return false;
     const order = plan.sourceTables[plan.scanSource]?.scanOrder;
     for (let index = 0; index < length; index += 1) {
-      scan[index] = order?.[start + index] ?? start + index;
+      const position = rows === undefined ? start + index : (rows[start + index] ?? 0);
+      scan[index] = order?.[position] ?? position;
     }
     const batch: BatchRows = { length, rowsBySource: sourceRows, memory: batchMemory };
     return consumeJoinedBatches(plan, batch, 0, groups, output, memory);
@@ -2465,18 +2542,20 @@ async function scanSelectedRows(
       typeof residentEnd === "number" && residentEnd > first
         ? Math.min(residentEnd, scanRows)
         : first + 1;
+    // Every selected row of the resident window runs in one batch of exactly those rows: a
+    // scattered selection used to cost a batch — a child memory context and a row-index array
+    // per source — for every row it named.
     while (index < selection.length) {
-      const begin = selection[index] ?? 0;
-      if (begin >= windowEnd) break;
-      let end = begin + 1;
-      index += 1;
-      while (index < selection.length) {
-        const next = selection[index] ?? 0;
-        if (next !== end || next >= windowEnd || next >= begin + DEFAULT_BATCH_ROWS) break;
-        end = next + 1;
+      const from = index;
+      while (
+        index < selection.length &&
+        (selection[index] ?? 0) < windowEnd &&
+        index - from < DEFAULT_BATCH_ROWS
+      ) {
         index += 1;
       }
-      if (runScanBatch(plan, begin, end - begin, groups, output, memory)) return;
+      if (index === from) break;
+      if (runScanBatch(plan, from, index - from, groups, output, memory, selection)) return;
     }
   }
 }
@@ -3705,6 +3784,34 @@ function filterPrimitiveInList(
 }
 
 /** Compacts the selection to rows where the dictionary-equality comparison holds. */
+/**
+ * Reverse indexes of large, immutable block dictionaries, built on a dictionary's second lookup:
+ * a pooled block's dictionary is searched again by every equality that reads the block, and a
+ * linear search of a ten-thousand-entry dictionary per block per query dominated a selective
+ * lookup. A dictionary searched once is never indexed.
+ */
+const dictionaryCodes = new WeakMap<readonly string[], Map<string, number> | number>();
+const DICTIONARY_INDEX_MIN_ENTRIES = 64;
+
+/** The code of `value` in `dictionary`, or -1. */
+function dictionaryCodeOf(dictionary: readonly string[], value: string): number {
+  if (dictionary.length < DICTIONARY_INDEX_MIN_ENTRIES) return dictionary.indexOf(value);
+  const known = dictionaryCodes.get(dictionary);
+  if (known === undefined) {
+    dictionaryCodes.set(dictionary, 1);
+    return dictionary.indexOf(value);
+  }
+  if (typeof known === "number") {
+    const index = new Map<string, number>();
+    for (let code = dictionary.length - 1; code >= 0; code -= 1) {
+      index.set(dictionary[code] ?? "", code);
+    }
+    dictionaryCodes.set(dictionary, index);
+    return index.get(value) ?? -1;
+  }
+  return known.get(value) ?? -1;
+}
+
 function filterDictionaryEquality(
   fast: DictionaryEquality,
   batch: BatchRows,
@@ -3714,7 +3821,7 @@ function filterDictionaryEquality(
   const vector = fast.vector;
   if (fast.cache.dictionary !== vector.dictionary) {
     fast.cache.dictionary = vector.dictionary;
-    fast.cache.code = vector.dictionary.indexOf(fast.value);
+    fast.cache.code = dictionaryCodeOf(vector.dictionary, fast.value);
   }
   const target = fast.cache.code;
   const negated = fast.negated;
@@ -3848,6 +3955,33 @@ function applyPredicateKernel(
   }
   if (predicate.primitiveIn !== undefined) {
     return filterPrimitiveInList(predicate.primitiveIn, batch, selection, survivors);
+  }
+  if (predicate.numericExpression !== undefined) {
+    const { evaluate, operator, value: target } = predicate.numericExpression;
+    const rowsBySource = batch.rowsBySource;
+    let kept = 0;
+    for (let index = 0; index < survivors; index += 1) {
+      const row = selection[index] ?? 0;
+      const value = evaluate(rowsBySource, row);
+      const holds =
+        value !== value
+          ? evaluateBatchPredicate(plan, predicate, batch, row)
+          : operator === "="
+            ? value === target
+            : operator === "!=" || operator === "<>"
+              ? value !== target
+              : operator === ">"
+                ? value > target
+                : operator === ">="
+                  ? value >= target
+                  : operator === "<"
+                    ? value < target
+                    : value <= target;
+      if (!holds) continue;
+      selection[kept] = row;
+      kept += 1;
+    }
+    return kept;
   }
   if (predicate.dictionaryEquality !== undefined) {
     return filterDictionaryEquality(predicate.dictionaryEquality, batch, selection, survivors);
@@ -5092,15 +5226,21 @@ class GroupAccumulator {
   }
 
   /**
-   * Fast aggregate specs for the batch kernel: every aggregate is COUNT(*) or a bare numeric
-   * column under COUNT/SUM/AVG. MIN/MAX keep the generic path for its comparison and memory
-   * accounting semantics. Undefined when any aggregate needs the generic path.
+   * Fast aggregate specs for the batch kernel: every aggregate is COUNT(*), a bare numeric
+   * column under COUNT/SUM/AVG/MIN/MAX, or a bare datetime column under COUNT/MIN/MAX. MIN/MAX
+   * compare exactly as the per-row path does (NaN after every finite number) and replace the
+   * kept value through the same reservation. Undefined when any aggregate needs the generic path.
    */
   #fastAggregates(): FastAggregateSpec[] | undefined {
     const specs: FastAggregateSpec[] = [];
     for (const spec of this.#plan.aggregates) {
-      // The kernel counts every row it is given; deduplication needs the per-row path.
-      if (spec.distinct === true) return undefined;
+      // COUNT(DISTINCT number) deduplicates through the slot's numeric table; any other
+      // DISTINCT aggregate needs the per-row path.
+      if (spec.distinct === true) {
+        if (spec.name !== "COUNT" || spec.rawNumber === undefined) return undefined;
+        specs.push({ kind: "distinct", sums: false });
+        continue;
+      }
       if (spec.argument.kind === "wildcard" && spec.name === "COUNT") {
         specs.push({ kind: "star", sums: false });
         continue;
@@ -5110,6 +5250,17 @@ class GroupAccumulator {
         (spec.name === "COUNT" || spec.name === "SUM" || spec.name === "AVG")
       ) {
         specs.push({ kind: "column", sums: spec.name !== "COUNT" });
+        continue;
+      }
+      if (spec.rawDatetime !== undefined && spec.name === "COUNT") {
+        specs.push({ kind: "column", sums: false });
+        continue;
+      }
+      if (
+        (spec.rawNumber !== undefined || spec.rawDatetime !== undefined) &&
+        (spec.name === "MIN" || spec.name === "MAX")
+      ) {
+        specs.push({ kind: "extreme", sums: false });
         continue;
       }
       if (spec.conditional !== undefined) {
@@ -5180,11 +5331,69 @@ class GroupAccumulator {
       readonly nullSlot: number;
       readonly truths: Array<(batch: BatchRows, row: number) => boolean | null>;
     }> = [];
+    // MIN/MAX over a bare number or datetime column: unboxed comparisons against the kept
+    // value, which is replaced (and its reservation resized) only when a row improves on it.
+    const extremes: Array<{
+      readonly index: number;
+      readonly max: boolean;
+      /** Datetime epoch milliseconds compare plainly; numbers place NaN after every value. */
+      readonly datetime: boolean;
+      readonly label: string;
+      readonly rows: Int32Array | undefined;
+      readonly values: Float64Array;
+      readonly validity: Uint8Array;
+      readonly windowStart: number;
+      readonly length: number;
+      readonly slots: number;
+    }> = [];
+    // COUNT(DISTINCT number): a row counts when its value is new to the group's slot table.
+    const distincts: Array<{
+      readonly index: number;
+      readonly rows: Int32Array | undefined;
+      readonly values: Float64Array;
+      readonly validity: Uint8Array;
+      readonly windowStart: number;
+      readonly length: number;
+      readonly slots: number;
+    }> = [];
+    let firstSeen = 0;
     let stars = 0;
     for (let index = 0; index < specs.length; index += 1) {
       const spec = specs[index];
       if (spec === undefined || spec.kind === "star") {
         stars += 1;
+        continue;
+      }
+      if (spec.kind === "distinct") {
+        const raw = plan.aggregates[index]?.rawNumber;
+        if (raw === undefined) return false;
+        distincts.push({
+          index,
+          rows: batch.rowsBySource[raw.source],
+          values: raw.vector.values,
+          validity: raw.vector.validity,
+          windowStart: raw.vector.window?.start ?? 0,
+          length: raw.vector.length,
+          slots: raw.vector.values.length,
+        });
+        continue;
+      }
+      if (spec.kind === "extreme") {
+        const aggregate = plan.aggregates[index];
+        const raw = aggregate?.rawNumber ?? aggregate?.rawDatetime;
+        if (aggregate === undefined || raw === undefined) return false;
+        extremes.push({
+          index,
+          max: aggregate.name === "MAX",
+          datetime: aggregate.rawNumber === undefined,
+          label: `${aggregate.name} aggregate value`,
+          rows: batch.rowsBySource[raw.source],
+          values: raw.vector.values,
+          validity: raw.vector.validity,
+          windowStart: raw.vector.window?.start ?? 0,
+          length: raw.vector.length,
+          slots: raw.vector.values.length,
+        });
         continue;
       }
       if (spec.kind === "conditional") {
@@ -5206,7 +5415,7 @@ class GroupAccumulator {
         });
         continue;
       }
-      const raw = plan.aggregates[index]?.rawNumber;
+      const raw = plan.aggregates[index]?.rawNumber ?? plan.aggregates[index]?.rawDatetime;
       if (raw === undefined) return false;
       columns.push({
         index,
@@ -5269,6 +5478,47 @@ class GroupAccumulator {
           state.sums[column.index] = (state.sums[column.index] ?? 0) + (column.values[slot] ?? 0);
         }
       }
+      for (const distinct of distincts) {
+        const sourceRow = distinct.rows?.[row] ?? -1;
+        if (sourceRow < 0 || sourceRow >= distinct.length) continue;
+        const slot = sourceRow - distinct.windowStart;
+        if (slot < 0 || slot >= distinct.slots) {
+          throw new RangeError("Streamed vector row is outside the resident window");
+        }
+        if (!isValid(distinct.validity, slot)) continue;
+        const seen = state.distincts?.[distinct.index];
+        if (seen === undefined) return false;
+        if (!seen.addNumber(distinct.values[slot] ?? 0)) continue;
+        counts[distinct.index] = (counts[distinct.index] ?? 0) + 1;
+        firstSeen += 1;
+      }
+      for (const extreme of extremes) {
+        const sourceRow = extreme.rows?.[row] ?? -1;
+        if (sourceRow < 0 || sourceRow >= extreme.length) continue;
+        const slot = sourceRow - extreme.windowStart;
+        if (slot < 0 || slot >= extreme.slots) {
+          throw new RangeError("Streamed vector row is outside the resident window");
+        }
+        if (!isValid(extreme.validity, slot)) continue;
+        const value = extreme.values[slot] ?? 0;
+        counts[extreme.index] = (counts[extreme.index] ?? 0) + 1;
+        const current = state.values[extreme.index];
+        const better =
+          typeof current !== "number"
+            ? true
+            : extreme.datetime
+              ? extreme.max
+                ? value > current
+                : value < current
+              : Number.isNaN(value)
+                ? extreme.max && !Number.isNaN(current)
+                : Number.isNaN(current)
+                  ? !extreme.max
+                  : extreme.max
+                    ? value > current
+                    : value < current;
+        if (better) replaceAggregateValue(state, extreme.index, value, extreme.label, this.#memory);
+      }
       for (const conditional of conditionals) {
         const code =
           stringCodeAt(conditional.spec.vector, conditional.rows?.[row] ?? -1) ??
@@ -5301,6 +5551,21 @@ class GroupAccumulator {
           state.sums[conditional.index] = (state.sums[conditional.index] ?? 0) + value;
         }
       }
+    }
+    // Distinct values are tallied as the per-row path tallies them, once per batch.
+    if (firstSeen > 0) {
+      this.#memory.tally(
+        safeMemoryProduct(
+          firstSeen,
+          safeMemorySum(
+            QUERY_REFERENCE_BYTES,
+            queryValuePayloadBytes(0),
+            "Distinct aggregate value",
+          ),
+          "Distinct aggregate value",
+        ),
+        "Distinct aggregate value",
+      );
     }
     return true;
   }
@@ -5654,11 +5919,11 @@ function createGroupState(
   }
   // Only DISTINCT slots get a set, and only when the plan has one at all — an ordinary grouped
   // query allocates nothing extra for a feature it does not use.
-  let distincts: Array<Set<unknown> | undefined> | undefined;
+  let distincts: Array<DistinctValues | undefined> | undefined;
   for (let index = 0; index < plan.aggregates.length; index += 1) {
     if (plan.aggregates[index]?.distinct !== true) continue;
-    distincts ??= new Array<Set<unknown> | undefined>(plan.aggregates.length);
-    distincts[index] = new Set<unknown>();
+    distincts ??= new Array<DistinctValues | undefined>(plan.aggregates.length);
+    distincts[index] = new DistinctValues();
   }
   return {
     groupValues,
@@ -5672,6 +5937,73 @@ function createGroupState(
     valueReservationBytes: new Float64Array(plan.aggregates.length),
     distincts,
   };
+}
+
+const distinctBits = new Float64Array(1);
+const distinctWords = new Uint32Array(distinctBits.buffer);
+
+/**
+ * The values one DISTINCT aggregate slot has seen, with exactly a Set's SameValueZero identity.
+ * Numbers — the common DISTINCT input — live in an open-addressing table of raw float64s, which
+ * costs a hash and a probe per value instead of a boxed Set entry; anything else uses a Set.
+ */
+class DistinctValues {
+  #slots = new Float64Array(16);
+  #used = new Uint8Array(16);
+  #numbers = 0;
+  #nan = false;
+  #others: Set<unknown> | undefined;
+
+  /** Adds the value; false when an equal one was already present. */
+  add(value: unknown): boolean {
+    if (typeof value === "number") return this.addNumber(value);
+    this.#others ??= new Set<unknown>();
+    if (this.#others.has(value)) return false;
+    this.#others.add(value);
+    return true;
+  }
+
+  addNumber(value: number): boolean {
+    if (value !== value) {
+      if (this.#nan) return false;
+      this.#nan = true;
+      return true;
+    }
+    // +0 and -0 are one value, as in a Set.
+    const key = value === 0 ? 0 : value;
+    distinctBits[0] = key;
+    const mask = this.#slots.length - 1;
+    // Murmur3's finalizer over both words: small integers differ only in the high word's high
+    // bits, which a plain multiply would never carry down into the masked low bits.
+    let hash = (distinctWords[0] ?? 0) ^ (distinctWords[1] ?? 0);
+    hash ^= hash >>> 16;
+    hash = Math.imul(hash, 0x85ebca6b);
+    hash ^= hash >>> 13;
+    hash = Math.imul(hash, 0xc2b2ae35);
+    hash ^= hash >>> 16;
+    let probe = hash & mask;
+    for (;;) {
+      if (this.#used[probe] === 0) break;
+      if (this.#slots[probe] === key) return false;
+      probe = (probe + 1) & mask;
+    }
+    this.#used[probe] = 1;
+    this.#slots[probe] = key;
+    this.#numbers += 1;
+    if (this.#numbers * 2 > this.#slots.length) this.#grow();
+    return true;
+  }
+
+  #grow(): void {
+    const slots = this.#slots;
+    const used = this.#used;
+    this.#slots = new Float64Array(slots.length * 2);
+    this.#used = new Uint8Array(slots.length * 2);
+    this.#numbers = 0;
+    for (let index = 0; index < slots.length; index += 1) {
+      if (used[index] === 1) this.addNumber(slots[index] ?? 0);
+    }
+  }
 }
 
 /**
@@ -5699,8 +6031,7 @@ function firstOfItsKind(
   const seen = state.distincts?.[index];
   if (seen === undefined) return true;
   const key = distinctKey(value);
-  if (seen.has(key)) return false;
-  seen.add(key);
+  if (!seen.add(key)) return false;
   memory.tally(
     safeMemorySum(
       QUERY_REFERENCE_BYTES,
@@ -6358,6 +6689,76 @@ function detectPrimitiveInList(predicate: BoundPredicate): PrimitiveInList | und
   return { source: predicate.left.source, vector, members, minimum, maximum, negated };
 }
 
+/** Detects `arithmetic <op> number` (either side) over number columns and literals. */
+function detectNumericExpressionComparison(
+  predicate: BoundPredicate,
+): NumericExpressionComparison | undefined {
+  if (!primitiveOperators.has(predicate.operator)) return undefined;
+  const comparison = predicate.operator as ComparisonOperator;
+  const sides = [
+    { expression: predicate.left, literal: predicate.right, operator: comparison },
+    {
+      expression: predicate.right,
+      literal: predicate.left,
+      operator: reverseComparisonOperator(comparison),
+    },
+  ];
+  for (const { expression, literal, operator } of sides) {
+    if (expression.kind !== "binary" || literal.kind !== "literal") continue;
+    if (typeof literal.value !== "number" || !Number.isFinite(literal.value)) continue;
+    const evaluate = compileNumericArithmetic(expression);
+    if (evaluate !== undefined) return { evaluate, operator, value: literal.value };
+  }
+  return undefined;
+}
+
+/**
+ * Number arithmetic as a closure over raw float64 reads, mirroring binaryValue for two numbers:
+ * `/` is NULL on a zero divisor (truncating for integer division) and `%` likewise. NaN stands
+ * for NULL. Undefined for any node that is not a number column, a finite number literal, or
+ * `+ - * / %` of such nodes.
+ */
+function compileNumericArithmetic(
+  expression: BoundExpression,
+): ((rowsBySource: readonly Int32Array[], row: number) => number) | undefined {
+  if (expression.kind === "literal") {
+    const value = expression.value;
+    if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+    return () => value;
+  }
+  if (expression.kind === "column") {
+    const vector = expression.vector;
+    if (vector.kind !== "number") return undefined;
+    const source = expression.source;
+    return (rowsBySource, row) =>
+      rawPrimitiveValue(vector, rowsBySource[source]?.[row] ?? -1) ?? NaN;
+  }
+  if (expression.kind !== "binary") return undefined;
+  const left = compileNumericArithmetic(expression.left);
+  const right = compileNumericArithmetic(expression.right);
+  if (left === undefined || right === undefined) return undefined;
+  const operator = expression.operator as string;
+  if (operator === "+") return (rows, row) => left(rows, row) + right(rows, row);
+  if (operator === "-") return (rows, row) => left(rows, row) - right(rows, row);
+  if (operator === "*") return (rows, row) => left(rows, row) * right(rows, row);
+  if (operator === "/") {
+    if (expression.integer === true) {
+      return (rows, row) => integerQuotient(left(rows, row), right(rows, row)) ?? NaN;
+    }
+    return (rows, row) => {
+      const divisor = right(rows, row);
+      return divisor === 0 ? NaN : left(rows, row) / divisor;
+    };
+  }
+  if (operator === "%") {
+    return (rows, row) => {
+      const divisor = right(rows, row);
+      return divisor === 0 ? NaN : left(rows, row) % divisor;
+    };
+  }
+  return undefined;
+}
+
 function reverseComparisonOperator(operator: ComparisonOperator): ComparisonOperator {
   if (operator === ">") return "<";
   if (operator === ">=") return "<=";
@@ -6808,7 +7209,7 @@ function evaluateBatchPredicate(
     if (code === undefined) return false;
     if (fast.cache.dictionary !== fast.vector.dictionary) {
       fast.cache.dictionary = fast.vector.dictionary;
-      fast.cache.code = fast.vector.dictionary.indexOf(fast.value);
+      fast.cache.code = dictionaryCodeOf(fast.vector.dictionary, fast.value);
     }
     const matches = fast.cache.code >= 0 && code === fast.cache.code;
     return fast.negated ? !matches : matches;

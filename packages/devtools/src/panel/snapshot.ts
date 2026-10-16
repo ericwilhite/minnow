@@ -118,7 +118,16 @@ export function createSnapshotActions(deps: SnapshotActionsDeps): SnapshotAction
   /** One at a time: both actions move the whole database, and neither is quick. */
   let busy = false;
 
+  let fade: ReturnType<typeof setTimeout> | undefined;
+
+  /** A finished save or restore says so for a few seconds; progress and failures stay up. */
   function setStatus(text: string, kind = ""): void {
+    clearTimeout(fade);
+    if (kind === " ok") {
+      fade = setTimeout(() => {
+        status.hidden = true;
+      }, 6000);
+    }
     status.className = `badge snap-status${kind}`;
     status.textContent = text;
     // The chip is narrow, so the full text — an error message especially — lives in the tooltip.

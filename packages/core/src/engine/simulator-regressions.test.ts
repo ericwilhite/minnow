@@ -339,6 +339,116 @@ describe.each(stores)("index pruning keeps every delete on $name", ({ open }) =>
   });
 });
 
+describe.each(stores)(
+  "an exact index selection outside the row-at-a-time scan on $name",
+  ({ open }) => {
+    it("never serves a row whose update the index pruned away", async () => {
+      // Interaction seed 720016 (and 740013, 740037). The index names the live rows exactly, so
+      // pruning kept only the update segments of candidate rows and handed the scan the exact
+      // rows to visit. Only the buffered streamed executor honoured that selection: a cursor,
+      // the key read a DELETE runs before it writes, and the spilling executors swept every row
+      // of the kept blocks -- including row 2, whose update the pruning had dropped, so they
+      // saw its old value, which still matched. DELETE removed a row its WHERE did not match.
+      const store = await open();
+      const database = new MinnowDatabase(store, { rowsPerBlock: 4, autoCompact: false });
+      await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c0 DOUBLE PRECISION)");
+      await database.execute(
+        "INSERT INTO t VALUES (1, 20), (2, 20), (3, 20), (4, 20), (5, 20), (6, 20), (7, 20), (8, 20)",
+      );
+      await database.execute("UPDATE t SET c0 = 7 WHERE id = 2");
+      // Built after the update, as a rebuilt base is: it names row 2 under 7 only.
+      await database.execute("CREATE INDEX t_c0 ON t (c0)");
+      const expected = [1, 3, 4, 5, 6, 7, 8];
+      const cursorRows: Array<Record<string, unknown>> = [];
+      for await (const batch of database.queryCursor("SELECT id, c0 FROM t WHERE c0 > 10")) {
+        cursorRows.push(...batch.rows);
+      }
+      expect(cursorRows.map((row) => row.id).sort((a, b) => Number(a) - Number(b))).toEqual(
+        expected,
+      );
+      expect(cursorRows.every((row) => row.c0 === 20)).toBe(true);
+      const spilled = await database.query("SELECT id FROM t WHERE c0 > 10 ORDER BY c0, id", {
+        memoize: false,
+        spillToStorage: true,
+      });
+      expect(spilled.rows.map((row) => row.id)).toEqual(expected);
+      const grouped = await database.query(
+        "SELECT c0, COUNT(*) AS n FROM t WHERE c0 > 10 GROUP BY c0",
+        { memoize: false, spillToStorage: true },
+      );
+      expect(grouped.rows).toEqual([{ c0: 20, n: 7 }]);
+      const deleted = await database.execute("DELETE FROM t WHERE c0 > 10");
+      expect(deleted.kind === "delete" && deleted.rowCount).toBe(7);
+      const rest = await database.query("SELECT id, c0 FROM t ORDER BY id", { memoize: false });
+      expect(rest.rows).toEqual([{ id: 2, c0: 7 }]);
+      await database.close();
+      store.close();
+    });
+
+    it("never serves a row whose update the index pruned away, inside a write scope", async () => {
+      // Interaction seed 750001. Once a scope has staged an insert, its reads prune the committed
+      // segments by index and append the scope's own rows; the exact row selection is dropped
+      // because it is numbered without them. The pruned segments still held only the candidate
+      // rows' deltas, so the block scan saw row 2 at the value its dropped update replaced, and
+      // the scope's DELETE removed a row its WHERE did not match.
+      const store = await open();
+      const database = new MinnowDatabase(store, { rowsPerBlock: 4, autoCompact: false });
+      await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c0 DOUBLE PRECISION)");
+      await database.execute(
+        "INSERT INTO t VALUES (1, 20), (2, 20), (3, 20), (4, 20), (5, 20), (6, 20), (7, 20), (8, 20)",
+      );
+      await database.execute("UPDATE t SET c0 = 7 WHERE id = 2");
+      await database.execute("CREATE INDEX t_c0 ON t (c0)");
+      await database.execute("BEGIN");
+      await database.execute("INSERT INTO t VALUES (9, 30)");
+      const selected = await database.query("SELECT id FROM t WHERE c0 > 10 ORDER BY id", {
+        memoize: false,
+      });
+      expect(selected.rows.map((row) => row.id)).toEqual([1, 3, 4, 5, 6, 7, 8, 9]);
+      const deleted = await database.execute("DELETE FROM t WHERE c0 > 10");
+      expect(deleted.kind === "delete" && deleted.rowCount).toBe(8);
+      const rest = await database.query("SELECT id, c0 FROM t ORDER BY id", { memoize: false });
+      expect(rest.rows).toEqual([{ id: 2, c0: 7 }]);
+      await database.execute("COMMIT");
+      await database.close();
+      store.close();
+    });
+  },
+);
+
+describe.each(stores)("a commit window whose manifests were collected on $name", ({ open }) => {
+  it("keeps a retired key reserved on the connection that rekeyed it", async () => {
+    // Rekeying interaction seed 800027. Connection A rekeyed 10 to -10 and kept the forwards it
+    // had read inside that write, proven at the version before its own commit. Connection B
+    // wrote and collected garbage, which removed the manifests up to the current one. A then
+    // brought its forwards up to date by replaying the window's commits, found no manifest in
+    // the window naming the forwards table -- the one that did was gone -- and concluded
+    // nothing had changed: key 10 stopped forwarding on A, a read of it found nothing, and an
+    // insert of 10 was accepted while every other connection still held it reserved.
+    const store = await open();
+    const a = new MinnowDatabase(store);
+    const b = new MinnowDatabase(store);
+    await a.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c INTEGER)");
+    await a.execute("INSERT INTO t VALUES (10, 1), (20, 2)");
+    await a.execute("UPDATE t SET id = -10 WHERE id = 10");
+    for (let round = 0; round < 3; round += 1) {
+      await b.execute(`UPDATE t SET c = ${String(3 + round)} WHERE id = 20`);
+      // A reads on, without naming a key, so it pins nothing older.
+      await a.query("SELECT count(*) AS n FROM t", { memoize: false });
+      await b.compactTable("t");
+      await b.collectGarbage();
+    }
+    for (const database of [a, b]) {
+      const rows = await database.query("SELECT id, c FROM t WHERE id = 10", { memoize: false });
+      expect(rows.rows).toEqual([{ id: -10, c: 1 }]);
+    }
+    await expect(a.execute("INSERT INTO t VALUES (10, 9)")).rejects.toThrow(/duplicate/iu);
+    await a.close();
+    await b.close();
+    store.close();
+  });
+});
+
 describe.each(stores.map(({ name, open }) => ({ name, create: open })))(
   "compaction planning races on $name",
   ({ create }) => {

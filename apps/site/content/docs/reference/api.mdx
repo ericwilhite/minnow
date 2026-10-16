@@ -370,9 +370,10 @@ The versioned, structured-clone-safe RPC frames between client and worker: `prot
 request/response/event frame types, `parseRpcRequest` / `parseRpcResponse`,
 `serializeError` / `rehydrateError`, the worker diagnostic frame (`workerErrorEvent`,
 `WorkerErrorReport`), and the frame constructors. Method dispatch is whitelisted per handle — the
-worker never dispatches arbitrary property access. Query results and live change events travel
-inside these frames in a columnar form (one array per column, typed arrays transferred) that the
-client turns back into `QueryResult` rows; see [Workers](/docs/engine/workers).
+worker never dispatches arbitrary property access. Query results, the rows of `execute()` and
+`RETURNING` results, and live change events travel inside these frames in a columnar form (one
+array per column, typed arrays transferred; a result under 32 rows as one plain value array) that
+the client turns back into `QueryResult` rows; see [Workers](/docs/engine/workers).
 
 ## `@minnowdb/core/testing`
 

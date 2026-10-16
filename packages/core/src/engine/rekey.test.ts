@@ -358,6 +358,53 @@ describe("references follow a rekey", () => {
     ]);
   });
 
+  it("moves each reference once when a rekey reuses keys of its own table (shift, swap)", async () => {
+    // A moved row's reference to another moved row is pointed at the new key before the row is
+    // written; the pass over referencing rows must not move it a second time when that new key
+    // is also a key another moved row gave up.
+    for (const enforced of ["", " NOT ENFORCED"]) {
+      const database = new MinnowDatabase(new MemoryBlockStore());
+      await database.execute(
+        `CREATE TABLE nodes (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES nodes(id)${enforced}, label TEXT)`,
+      );
+      await database.execute(
+        "CREATE TABLE tags (id INTEGER PRIMARY KEY, node_id INTEGER REFERENCES nodes(id))",
+      );
+      await database.execute(
+        "INSERT INTO nodes VALUES (1, 1, 'one'), (2, 1, 'two'), (3, 2, 'three'), (9, NULL, 'nine')",
+      );
+      await database.execute("INSERT INTO tags VALUES (10, 1), (20, 2), (30, 3)");
+      const parents = async (): Promise<unknown> =>
+        await rows(
+          database,
+          "SELECT n.label, p.label AS parent FROM nodes n LEFT JOIN nodes p ON p.id = n.parent_id ORDER BY n.label",
+        );
+      const before = await parents();
+      // A shift: 1 → 2, 2 → 3, 3 → 4.
+      await database.execute("UPDATE nodes SET id = id + 1 WHERE id <= 3");
+      expect(await parents(), `shift${enforced}`).toEqual(before);
+      expect(await rows(database, "SELECT id, parent_id FROM nodes ORDER BY id")).toEqual([
+        { id: 2, parent_id: 2 },
+        { id: 3, parent_id: 2 },
+        { id: 4, parent_id: 3 },
+        { id: 9, parent_id: null },
+      ]);
+      // A swap: 2 ↔ 3.
+      await database.execute("UPDATE nodes SET id = 5 - id WHERE id IN (2, 3)");
+      expect(await parents(), `swap${enforced}`).toEqual(before);
+      expect(
+        await rows(
+          database,
+          "SELECT t.id, n.label FROM tags t JOIN nodes n ON n.id = t.node_id ORDER BY t.id",
+        ),
+      ).toEqual([
+        { id: 10, label: "one" },
+        { id: 20, label: "two" },
+        { id: 30, label: "three" },
+      ]);
+    }
+  });
+
   it("follows a composite key, through predicates that pin every column", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore());
     await database.execute(
@@ -773,6 +820,36 @@ describe("live queries over a key that a rekey redirects", () => {
     expect(ids).toEqual([[], [1]]);
     live.close();
   });
+
+  it.each([true, false])(
+    "re-run when a row is written at the key a retired key forwards to (incremental=%s)",
+    async (incremental) => {
+      // Found by live-differential.test.ts. A forward outlives its row, so a new row at the
+      // forward's target is what the retired key names. The window proof checked the inserted
+      // keys' zone maps against the statement as written -- `id = 3` -- rather than as it runs,
+      // `id = -8`, proved the insert irrelevant, and kept the empty result.
+      const database = new MinnowDatabase(new MemoryBlockStore(), { autoCompact: false });
+      await database.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER)");
+      await database.execute("INSERT INTO a VALUES (3, 1), (5, 5)");
+      await database.execute("UPDATE a SET id = -8 WHERE id = 3");
+      const live = database.liveQueries({ incremental });
+      const sql = "SELECT id, x FROM a WHERE id = 3";
+      const seen: unknown[] = [];
+      await live.subscribe(sql, { onChange: (result) => seen.push(result.rows) });
+      for (const write of [
+        "DELETE FROM a WHERE id = -8",
+        "INSERT INTO a VALUES (-8, 9)",
+        "UPDATE a SET x = 10 WHERE id = -8",
+      ]) {
+        await database.execute(write);
+        await live.refresh();
+        expect(seen.at(-1), write).toEqual((await database.query(sql, { memoize: false })).rows);
+      }
+      expect(seen.at(-1)).toEqual([{ id: -8, x: 10 }]);
+      live.close();
+      await database.close();
+    },
+  );
 });
 
 describe("retired keys in every SQL shape (read-path audit)", () => {
@@ -804,6 +881,46 @@ describe("retired keys in every SQL shape (read-path audit)", () => {
     expect(
       await rows(database, "SELECT coalesce((SELECT note FROM orders WHERE id = -1), 'none') AS n"),
     ).toEqual([{ n: "offline" }]);
+  });
+
+  it("follows a key under OR, NOT, and IS in a WHERE and in HAVING", async () => {
+    const database = await negative();
+    // A WHERE that is not a plain conjunction reaches the plan as one `IS TRUE` predicate
+    // wrapping the whole expression; the equality inside it must still follow.
+    for (const [sql, n] of [
+      ["SELECT count(*) AS n FROM orders WHERE id = -1 OR note = 'none'", 1],
+      ["SELECT count(*) AS n FROM orders WHERE note = 'none' OR id IN (-1)", 1],
+      // The optimizer turns `NOT (id = -1)` into `id <> -1`; the negations follow as well.
+      ["SELECT count(*) AS n FROM orders WHERE NOT (id = -1)", 1],
+      ["SELECT count(*) AS n FROM orders WHERE id <> -1", 1],
+      ["SELECT count(*) AS n FROM orders WHERE id NOT IN (-1, 4)", 1],
+      ["SELECT count(*) AS n FROM orders WHERE id IS DISTINCT FROM -1", 1],
+      ["SELECT count(*) AS n FROM items WHERE order_id <> -1", 1],
+      ["SELECT count(*) AS n FROM orders WHERE (id = -1 OR note IS NULL) IS TRUE", 1],
+      ["SELECT count(*) AS n FROM items WHERE order_id = -1 OR id = 3", 3],
+      ["SELECT count(*) AS n FROM items WHERE NOT (order_id = -1 OR id = 3)", 0],
+      [
+        "SELECT count(*) AS n FROM (SELECT order_id FROM items GROUP BY order_id HAVING order_id = -1 OR count(*) > 5) g",
+        1,
+      ],
+    ] as const) {
+      expect(await rows(database, sql), sql).toEqual([{ n }]);
+    }
+    // Writes resolve their WHERE the same way.
+    await database.execute("UPDATE orders SET note = 'synced' WHERE id = -1 OR id = 5");
+    expect(await rows(database, "SELECT id, note FROM orders ORDER BY id")).toEqual([
+      { id: 5, note: "synced" },
+      { id: 900, note: "synced" },
+    ]);
+    // The three-valued partition holds: p, NOT p, and p IS NULL count every row exactly once.
+    await database.execute("INSERT INTO orders VALUES (7, NULL)");
+    await database.execute("UPDATE orders SET note = NULL WHERE id = 900");
+    const p = "(id = -1 OR note = 'synced')";
+    const count = async (where: string): Promise<unknown> =>
+      (await rows(database, `SELECT count(*) AS n FROM orders WHERE ${where}`))[0]?.n;
+    expect([await count(p), await count(`NOT ${p}`), await count(`${p} IS NULL`)]).toEqual([
+      2, 0, 1,
+    ]);
   });
 
   it("pins a composite key per source, not per table", async () => {

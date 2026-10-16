@@ -18,9 +18,9 @@ import { externalSqlTextValue } from "./sql-domains.js";
  * names — before planning, so the keyed point read, index probes, and zone pruning all see the
  * current key. Stored rows only ever hold current keys, so joins and ranges need nothing here.
  *
- * Recognized: `column = value`, `value = column`, `column IN (values)`, and
- * `IS NOT DISTINCT FROM`, wherever they appear in a block's WHERE, HAVING, or ON, nested under
- * AND, OR, and NOT, in every block of the statement — subqueries, derived tables, CTEs, and view
+ * Recognized: `column = value`, `value = column`, `column IN (values)`, `IS NOT DISTINCT FROM`,
+ * and their negations (`<>`, `NOT IN`, `IS DISTINCT FROM`), wherever they appear in a block's
+ * WHERE, HAVING, or ON, nested under AND, OR, NOT, and `IS` tests, in every block of the statement — subqueries, derived tables, CTEs, and view
  * bodies included. A value is a constant or a bound parameter, negated or not (`-1`, `-$1`). A
  * column of a derived table or view that passes a key column through counts as that key column.
  * A composite key is followed when one block's top-level conjunction pins every one of its
@@ -54,7 +54,22 @@ interface ResolvedColumn {
   readonly source: TableSource;
 }
 
-const EQUALITY_OPERATORS = new Set(["=", "IS NOT DISTINCT FROM", "IN"]);
+/**
+ * Equality and its negations. The optimizer turns `NOT (id = -1)` into `id <> -1` before this
+ * pass runs, so a negation must follow too, or `p` and `NOT p` would disagree about a row.
+ */
+const EQUALITY_OPERATORS = new Set([
+  "=",
+  "IS NOT DISTINCT FROM",
+  "IN",
+  "<>",
+  "!=",
+  "IS DISTINCT FROM",
+  "NOT IN",
+]);
+
+/** The operators whose value side is a list of alternatives. */
+const LIST_OPERATORS = new Set(["IN", "NOT IN"]);
 
 /** Whether a source is a catalog table rather than a derived, set, windowed, or recursive one. */
 function isTableSource(source: TableSource): boolean {
@@ -255,7 +270,7 @@ function visitKeySites(
     const scalarSite = (columnSide: Expression, valueSide: Expression, operator: string): void => {
       if (columnSide.kind !== "column") return;
       const constants: KeyConstant[] = [];
-      if (operator === "IN") {
+      if (LIST_OPERATORS.has(operator)) {
         if (valueSide.kind !== "list") return;
         for (const item of valueSide.items) {
           const constant = keyConstant(item);
@@ -284,10 +299,16 @@ function visitKeySites(
         case "condition":
           if (EQUALITY_OPERATORS.has(expression.operator)) {
             scalarSite(expression.left, expression.right, expression.operator);
-            if (expression.operator !== "IN") {
+            if (!LIST_OPERATORS.has(expression.operator)) {
               scalarSite(expression.right, expression.left, expression.operator);
             }
           }
+          // A boolean operand of a condition is a predicate too. A WHERE or HAVING that is not
+          // a plain conjunction reaches the plan as one `(expression) IS TRUE` predicate, and
+          // `(p) IS NULL` wraps `p` the same way: the equalities inside must follow alike, or
+          // `p`, `NOT p`, and `p IS NULL` would stop partitioning the rows.
+          walkPredicate(expression.left);
+          walkPredicate(expression.right);
           return;
         case "logical":
           walkPredicate(expression.left);

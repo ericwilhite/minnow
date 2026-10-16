@@ -544,6 +544,7 @@ export {
   type InteractionPlanOptions,
   type InteractionRunOptions,
   type InteractionRunResult,
+  type KeyAssignment,
   type KeyedMutation,
   type PlanColumn,
   type PlanRow,

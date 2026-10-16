@@ -191,6 +191,14 @@ that left are removed, rows that entered or changed are merged in order, and eve
 keeps its object. A commit that touches one row in a table of a million costs one keyed lookup
 per subscription, not one scan.
 
+Most subscriptions can skip even that lookup. A statement that pins its key — `WHERE id = 5`, or
+`id IN (…)` — ignores commits to every other key. And an update that writes none of the columns
+a statement's `WHERE` and `ORDER BY` read (every column it reads, for an aggregate) cannot move a
+row in or out of its result or change its place, so it costs nothing unless it touched a row the
+result holds: editing one card's title runs one patch for the list that shows it, not one per
+list on the board. Two hundred per-row detail queries on one table answer a one-row commit in
+about the time one does.
+
 A window (`ORDER BY … LIMIT n`) keeps a margin of rows beyond its visible edge, so a member that
 is deleted or edited out of the window is replaced from rows already held. The statement runs in
 full only when a patch would have to reach past what is held — the margin ran dry, an `OFFSET`
