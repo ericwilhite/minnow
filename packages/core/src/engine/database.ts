@@ -14525,7 +14525,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         visibleByTable.get(freshBaseTable.name) ??
         (await this.#visibleSegmentRecords(freshBaseTable, snapshot, visibility));
       this.#maybeScheduleAutoCompaction(freshBaseTable, visibleBaseSegments);
-      const indexed = await this.#indexPrunedSegments(
+      let indexed = await this.#indexPrunedSegments(
         freshBaseTable,
         visibleBaseSegments,
         plan,
@@ -14533,6 +14533,21 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         visibility,
       );
       throwIfAborted(options.signal);
+      // An exact row selection comes with only the deltas of the selected rows: a row outside
+      // it may sit in a kept block with its update or delete dropped. Only the buffered
+      // streamed executor visits exactly the selected rows. A cursor (and the key read a DELETE
+      // runs) and the spilling executors sweep every row of the kept blocks, so for them the
+      // selection falls back to block pruning, which replays every delta.
+      if (
+        indexed.rows !== undefined &&
+        (cursor !== undefined ||
+          (options.spillToStorage ?? options.executionMemoryBudgetBytes !== undefined))
+      ) {
+        indexed = {
+          segments: withEveryDelta(visibleBaseSegments, indexed.segments),
+          pruned: indexed.pruned,
+        };
+      }
       const baseSegments = indexed.segments;
       // Zone-map elimination composes after index pruning: whole row groups whose statistics
       // reject the plan's predicates never stream at all. An exact index row selection is

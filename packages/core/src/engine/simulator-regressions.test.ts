@@ -339,6 +339,54 @@ describe.each(stores)("index pruning keeps every delete on $name", ({ open }) =>
   });
 });
 
+describe.each(stores)(
+  "an exact index selection outside the row-at-a-time scan on $name",
+  ({ open }) => {
+    it("never serves a row whose update the index pruned away", async () => {
+      // Interaction seed 720016 (and 740013, 740037). The index names the live rows exactly, so
+      // pruning kept only the update segments of candidate rows and handed the scan the exact
+      // rows to visit. Only the buffered streamed executor honoured that selection: a cursor,
+      // the key read a DELETE runs before it writes, and the spilling executors swept every row
+      // of the kept blocks -- including row 2, whose update the pruning had dropped, so they
+      // saw its old value, which still matched. DELETE removed a row its WHERE did not match.
+      const store = await open();
+      const database = new MinnowDatabase(store, { rowsPerBlock: 4, autoCompact: false });
+      await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c0 DOUBLE PRECISION)");
+      await database.execute(
+        "INSERT INTO t VALUES (1, 20), (2, 20), (3, 20), (4, 20), (5, 20), (6, 20), (7, 20), (8, 20)",
+      );
+      await database.execute("UPDATE t SET c0 = 7 WHERE id = 2");
+      // Built after the update, as a rebuilt base is: it names row 2 under 7 only.
+      await database.execute("CREATE INDEX t_c0 ON t (c0)");
+      const expected = [1, 3, 4, 5, 6, 7, 8];
+      const cursorRows: Array<Record<string, unknown>> = [];
+      for await (const batch of database.queryCursor("SELECT id, c0 FROM t WHERE c0 > 10")) {
+        cursorRows.push(...batch.rows);
+      }
+      expect(cursorRows.map((row) => row.id).sort((a, b) => Number(a) - Number(b))).toEqual(
+        expected,
+      );
+      expect(cursorRows.every((row) => row.c0 === 20)).toBe(true);
+      const spilled = await database.query("SELECT id FROM t WHERE c0 > 10 ORDER BY c0, id", {
+        memoize: false,
+        spillToStorage: true,
+      });
+      expect(spilled.rows.map((row) => row.id)).toEqual(expected);
+      const grouped = await database.query(
+        "SELECT c0, COUNT(*) AS n FROM t WHERE c0 > 10 GROUP BY c0",
+        { memoize: false, spillToStorage: true },
+      );
+      expect(grouped.rows).toEqual([{ c0: 20, n: 7 }]);
+      const deleted = await database.execute("DELETE FROM t WHERE c0 > 10");
+      expect(deleted.kind === "delete" && deleted.rowCount).toBe(7);
+      const rest = await database.query("SELECT id, c0 FROM t ORDER BY id", { memoize: false });
+      expect(rest.rows).toEqual([{ id: 2, c0: 7 }]);
+      await database.close();
+      store.close();
+    });
+  },
+);
+
 describe.each(stores.map(({ name, open }) => ({ name, create: open })))(
   "compaction planning races on $name",
   ({ create }) => {
