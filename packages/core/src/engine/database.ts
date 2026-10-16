@@ -262,6 +262,7 @@ import {
   compileCheckExpression,
   compileQuery,
   hasAggregate,
+  splitCondition,
   createRecursiveCteState,
   annotateAvgArgumentScales,
   compileStatement,
@@ -521,6 +522,8 @@ const MAX_POINT_READ_CANDIDATES = 1_024;
 /** A keyed replay decoding more blocks than this leaves the read to the ordinary path. */
 const MAX_POINT_READ_DELTA_BLOCKS = 256;
 const MAX_POINT_READ_DELTA_HEADER_BLOCKS = 1_024;
+/** An OR with more branches than this is scanned rather than unioned through indexes. */
+const MAX_INDEXED_DISJUNCTION_BRANCHES = 16;
 /**
  * Resolved point-read plans kept per visible history. Each distinct statement shape over the
  * table is one entry; a workload with more shapes than this simply re-resolves.
@@ -23257,7 +23260,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     snapshot: LeasedSnapshot,
   ): Promise<{ segments: SegmentRecord[]; pruned: boolean; rows?: number[] }> {
     const predicates = secondaryIndexPredicates(plan, table);
-    if (predicates.length === 0) {
+    const disjunctions = secondaryIndexDisjunctions(plan, table);
+    if (predicates.length === 0 && disjunctions.length === 0) {
       // A killed build or a stale-writer invalidation self-heals on the next relevant query.
       for (const [indexId, index] of Object.entries(table.secondaryIndexes ?? {})) {
         if (index.state === "ready") continue;
@@ -23276,6 +23280,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       return { segments, pruned: false };
     }
     const keyColumn = getUniqueKeyColumn(table);
+    const everyPredicate = [...predicates, ...disjunctions.flat(2)];
     if (keyColumn === undefined) {
       if (
         segments.some((segment) => {
@@ -23285,10 +23290,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       ) {
         return { segments, pruned: false };
       }
-      if (predicates.some((predicate) => predicate.index.locator !== "row-id")) {
+      if (everyPredicate.some((predicate) => predicate.index.locator !== "row-id")) {
         return { segments, pruned: false };
       }
-    } else if (predicates.some((predicate) => predicate.index.locator !== "key-hash-v1")) {
+    } else if (everyPredicate.some((predicate) => predicate.index.locator !== "key-hash-v1")) {
       return { segments, pruned: false };
     }
 
@@ -23309,8 +23314,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
 
     const upToVersion = snapshot.version ?? -1;
-    let candidates: bigint[] | undefined;
-    for (const predicate of predicates) {
+    /** One predicate's candidate locators, or undefined when the index cannot serve it now. */
+    const candidatesFor = async (
+      predicate: SecondaryIndexPredicate,
+    ): Promise<bigint[] | undefined> => {
       const result = await this.#readFtsCandidatesMemoized(
         snapshot,
         table.id,
@@ -23318,21 +23325,49 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         predicate.queries,
         upToVersion,
       );
-      if (result.overflow) return { segments, pruned: false };
+      if (result.overflow) return undefined;
       if (!result.hasBase) {
         this.#scheduleSecondaryIndexBuild(table, predicate.indexId);
-        return { segments, pruned: false };
+        return undefined;
       }
       // A newer rebuild may omit rows an old time-travel snapshot still saw.
-      if (result.coversVersion > upToVersion) return { segments, pruned: false };
+      if (result.coversVersion > upToVersion) return undefined;
       if (result.deltaChunkCount > FTS_FOLD_DELTA_CHUNKS) {
         this.#scheduleSecondaryIndexBuild(table, predicate.indexId);
       }
-      const forPredicate = predicate.union
+      return predicate.union
         ? unionSortedRowIds(result.rowIdsByTerm)
         : (result.rowIdsByTerm[0] ?? []);
+    };
+    let candidates: bigint[] | undefined;
+    for (const predicate of predicates) {
+      const forPredicate = await candidatesFor(predicate);
+      if (forPredicate === undefined) return { segments, pruned: false };
       candidates =
         candidates === undefined ? forPredicate : intersectSortedRowIds(candidates, forPredicate);
+      if (candidates.length === 0) return { segments: [], pruned: true };
+    }
+    // A disjunction every branch of which an index serves matches only rows some branch's
+    // candidates name: the union of the branches, each the intersection of its own predicates.
+    for (const alternatives of disjunctions) {
+      const branches: bigint[][] = [];
+      for (const branch of alternatives) {
+        let forBranch: bigint[] | undefined;
+        for (const predicate of branch) {
+          const forPredicate = await candidatesFor(predicate);
+          if (forPredicate === undefined) return { segments, pruned: false };
+          forBranch =
+            forBranch === undefined ? forPredicate : intersectSortedRowIds(forBranch, forPredicate);
+          if (forBranch.length === 0) break;
+        }
+        branches.push(forBranch ?? []);
+      }
+      const forDisjunction = unionSortedRowIds(branches);
+      if (forDisjunction.length > MAX_FTS_CANDIDATE_ROW_IDS) return { segments, pruned: false };
+      candidates =
+        candidates === undefined
+          ? forDisjunction
+          : intersectSortedRowIds(candidates, forDisjunction);
       if (candidates.length === 0) return { segments: [], pruned: true };
     }
     if (candidates === undefined) return { segments, pruned: false };
@@ -28431,6 +28466,8 @@ function secondaryIndexPredicates(
     members?: BatchValue[];
     lower?: { value: BatchValue; inclusive: boolean };
     upper?: { value: BatchValue; inclusive: boolean };
+    /** A case-sensitive LIKE pattern's literal prefix: every match starts with it. */
+    prefix?: string;
   }
   const constraints = new Map<string, Constraint>();
   const literalValue = (
@@ -28452,6 +28489,22 @@ function secondaryIndexPredicates(
     }
   };
   for (const predicate of plan.predicates) {
+    if (
+      predicate.operator === "LIKE" &&
+      predicate.left.kind === "column" &&
+      predicate.right.kind === "literal" &&
+      predicate.right.internalSqlValue !== true &&
+      typeof predicate.right.value === "string"
+    ) {
+      const column = resolveColumn(predicate.left.reference);
+      if (column?.type !== "string" || column.sqlDomain !== undefined) continue;
+      const prefix = likeLiteralPrefix(predicate.right.value, predicate.escape);
+      if (prefix === undefined || prefix.length === 0 || prefix.startsWith("\u0000")) continue;
+      const current = constraints.get(column.id) ?? {};
+      current.prefix ??= prefix;
+      constraints.set(column.id, current);
+      continue;
+    }
     if (predicate.operator === "IN" && predicate.left.kind === "column") {
       const column = resolveColumn(predicate.left.reference);
       if (column === undefined || predicate.right.kind !== "list") continue;
@@ -28530,7 +28583,24 @@ function secondaryIndexPredicates(
       // (notably exact NUMERIC and declaration-ordered ENUM). Range pruning on them would be
       // unsound, so preserve equality acceleration and let range predicates scan/recheck.
       if (column.sqlDomain !== undefined) break;
-      if (constraint.lower === undefined && constraint.upper === undefined) break;
+      if (constraint.lower === undefined && constraint.upper === undefined) {
+        const prefix = constraint.prefix;
+        if (prefix === undefined) break;
+        // A string component is its UTF-16 code units followed by a terminator, so every value
+        // starting with the prefix encodes to a term starting with the prefix's units.
+        const full = secondaryIndexComponentTerm(index, column, position, prefix);
+        const terminator = secondaryIndexComponentTerm(index, column, position, "");
+        if (!full.endsWith(terminator)) break;
+        const units = full.slice(0, full.length - terminator.length);
+        queries = prefixes.map((term) => ({
+          lower: term + units,
+          lowerInclusive: true,
+          upper: `${term}${units}\uffff`,
+          upperInclusive: false,
+        }));
+        matchedColumns += 1;
+        break;
+      }
       const direction = secondaryIndexDirections(index)[position] ?? "asc";
       const descending = direction === "desc";
       queries = prefixes.map((prefix) => {
@@ -28600,6 +28670,66 @@ function secondaryIndexPredicates(
     if (ids.every((columnId) => usedColumns.has(columnId))) continue;
     ids.forEach((columnId) => usedColumns.add(columnId));
     output.push(candidate);
+  }
+  return output;
+}
+
+/**
+ * The literal text every match of a case-sensitive LIKE pattern starts with: the characters
+ * before its first wildcard. Undefined when an escape character appears before it — the prefix
+ * would then depend on escape rules this reading does not model.
+ */
+function likeLiteralPrefix(pattern: string, escape: string | undefined): string | undefined {
+  let prefix = "";
+  for (const character of pattern) {
+    if (character === "%" || character === "_") return prefix;
+    if (character === "\\" || (escape !== undefined && character === escape)) return undefined;
+    prefix += character;
+  }
+  return prefix;
+}
+
+/**
+ * The OR predicates an index can narrow: for each one whose every branch (a conjunction) has at
+ * least one index-servable predicate, those predicates per branch. A row satisfying the OR
+ * satisfies some branch, so it is among that branch's candidates; a branch no index serves would
+ * leave the union unbounded, so such an OR is skipped whole.
+ */
+function secondaryIndexDisjunctions(
+  plan: CompiledQuery,
+  table: TableRecord,
+): SecondaryIndexPredicate[][][] {
+  const output: SecondaryIndexPredicate[][][] = [];
+  for (const predicate of plan.predicates) {
+    const condition = predicate.left;
+    if (
+      predicate.operator !== "IS TRUE" ||
+      condition.kind !== "logical" ||
+      condition.operator !== "or"
+    ) {
+      continue;
+    }
+    const branches: Expression[] = [];
+    const flatten = (expression: Expression): void => {
+      if (expression.kind === "logical" && expression.operator === "or") {
+        flatten(expression.left);
+        flatten(expression.right);
+      } else {
+        branches.push(expression);
+      }
+    };
+    flatten(condition);
+    if (branches.length > MAX_INDEXED_DISJUNCTION_BRANCHES) continue;
+    const alternatives: SecondaryIndexPredicate[][] = [];
+    for (const branch of branches) {
+      const served = secondaryIndexPredicates(
+        { ...plan, predicates: splitCondition(branch) },
+        table,
+      );
+      if (served.length === 0) break;
+      alternatives.push(served);
+    }
+    if (alternatives.length === branches.length) output.push(alternatives);
   }
   return output;
 }

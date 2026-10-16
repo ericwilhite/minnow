@@ -3749,6 +3749,34 @@ function filterPrimitiveInList(
 }
 
 /** Compacts the selection to rows where the dictionary-equality comparison holds. */
+/**
+ * Reverse indexes of large, immutable block dictionaries, built on a dictionary's second lookup:
+ * a pooled block's dictionary is searched again by every equality that reads the block, and a
+ * linear search of a ten-thousand-entry dictionary per block per query dominated a selective
+ * lookup. A dictionary searched once is never indexed.
+ */
+const dictionaryCodes = new WeakMap<readonly string[], Map<string, number> | number>();
+const DICTIONARY_INDEX_MIN_ENTRIES = 64;
+
+/** The code of `value` in `dictionary`, or -1. */
+function dictionaryCodeOf(dictionary: readonly string[], value: string): number {
+  if (dictionary.length < DICTIONARY_INDEX_MIN_ENTRIES) return dictionary.indexOf(value);
+  const known = dictionaryCodes.get(dictionary);
+  if (known === undefined) {
+    dictionaryCodes.set(dictionary, 1);
+    return dictionary.indexOf(value);
+  }
+  if (typeof known === "number") {
+    const index = new Map<string, number>();
+    for (let code = dictionary.length - 1; code >= 0; code -= 1) {
+      index.set(dictionary[code] ?? "", code);
+    }
+    dictionaryCodes.set(dictionary, index);
+    return index.get(value) ?? -1;
+  }
+  return known.get(value) ?? -1;
+}
+
 function filterDictionaryEquality(
   fast: DictionaryEquality,
   batch: BatchRows,
@@ -3758,7 +3786,7 @@ function filterDictionaryEquality(
   const vector = fast.vector;
   if (fast.cache.dictionary !== vector.dictionary) {
     fast.cache.dictionary = vector.dictionary;
-    fast.cache.code = vector.dictionary.indexOf(fast.value);
+    fast.cache.code = dictionaryCodeOf(vector.dictionary, fast.value);
   }
   const target = fast.cache.code;
   const negated = fast.negated;
@@ -6894,7 +6922,7 @@ function evaluateBatchPredicate(
     if (code === undefined) return false;
     if (fast.cache.dictionary !== fast.vector.dictionary) {
       fast.cache.dictionary = fast.vector.dictionary;
-      fast.cache.code = fast.vector.dictionary.indexOf(fast.value);
+      fast.cache.code = dictionaryCodeOf(fast.vector.dictionary, fast.value);
     }
     const matches = fast.cache.code >= 0 && code === fast.cache.code;
     return fast.negated ? !matches : matches;
