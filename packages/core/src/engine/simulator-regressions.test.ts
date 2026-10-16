@@ -384,6 +384,35 @@ describe.each(stores)(
       await database.close();
       store.close();
     });
+
+    it("never serves a row whose update the index pruned away, inside a write scope", async () => {
+      // Interaction seed 750001. Once a scope has staged an insert, its reads prune the committed
+      // segments by index and append the scope's own rows; the exact row selection is dropped
+      // because it is numbered without them. The pruned segments still held only the candidate
+      // rows' deltas, so the block scan saw row 2 at the value its dropped update replaced, and
+      // the scope's DELETE removed a row its WHERE did not match.
+      const store = await open();
+      const database = new MinnowDatabase(store, { rowsPerBlock: 4, autoCompact: false });
+      await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c0 DOUBLE PRECISION)");
+      await database.execute(
+        "INSERT INTO t VALUES (1, 20), (2, 20), (3, 20), (4, 20), (5, 20), (6, 20), (7, 20), (8, 20)",
+      );
+      await database.execute("UPDATE t SET c0 = 7 WHERE id = 2");
+      await database.execute("CREATE INDEX t_c0 ON t (c0)");
+      await database.execute("BEGIN");
+      await database.execute("INSERT INTO t VALUES (9, 30)");
+      const selected = await database.query("SELECT id FROM t WHERE c0 > 10 ORDER BY id", {
+        memoize: false,
+      });
+      expect(selected.rows.map((row) => row.id)).toEqual([1, 3, 4, 5, 6, 7, 8, 9]);
+      const deleted = await database.execute("DELETE FROM t WHERE c0 > 10");
+      expect(deleted.kind === "delete" && deleted.rowCount).toBe(8);
+      const rest = await database.query("SELECT id, c0 FROM t ORDER BY id", { memoize: false });
+      expect(rest.rows).toEqual([{ id: 2, c0: 7 }]);
+      await database.execute("COMMIT");
+      await database.close();
+      store.close();
+    });
   },
 );
 

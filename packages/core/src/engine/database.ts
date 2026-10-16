@@ -22760,8 +22760,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const ftsSegments = await this.#ftsPrunedSegments(table, committed, plan, snapshot);
     const indexed = await this.#secondaryIndexPrunedSegments(table, ftsSegments, plan, snapshot);
     // An exact row selection is numbered without the scope's rows; block pruning is all that
-    // carries over.
-    return { segments: [...indexed.segments, ...own], pruned: indexed.pruned };
+    // carries over. Block pruning replays every delta: an exact selection keeps only the deltas
+    // of its candidate rows, and a kept block also holds rows whose dropped delta changed them.
+    const pruned =
+      indexed.rows === undefined ? indexed.segments : withEveryDelta(committed, indexed.segments);
+    return { segments: [...pruned, ...own], pruned: indexed.pruned };
   }
 
   async #secondaryIndexPrunedSegments(
