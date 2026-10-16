@@ -108,3 +108,25 @@ it("carries a table's visible segments across its own commits instead of re-prov
   expect((await db.query("SELECT SUM(amount) AS total FROM items")).rows).toEqual([{ total: 50 }]);
   await db.close();
 });
+
+it("probes a keyed INSERT's keys and resolves its table once per statement", async () => {
+  const { store, calls, reset } = countingStore();
+  const db = new MinnowDatabase(store, { autoCompact: false });
+  await db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, amount INTEGER NOT NULL)");
+  for (let id = 0; id < 5; id += 1) {
+    await db.execute("INSERT INTO items (id, amount) VALUES (?, 0)", [id]);
+  }
+  reset();
+  for (let id = 5; id < 25; id += 1) {
+    await db.execute("INSERT INTO items (id, amount) VALUES (?, 0)", [id]);
+  }
+  // The statement and the session write ask about the same keys with nothing staged between,
+  // and share one table lookup.
+  expect(calls.get("getExistingUniqueKeys") ?? 0).toBe(20);
+  expect(calls.get("getTableByName") ?? 0).toBeLessThanOrEqual(20);
+  await expect(db.execute("INSERT INTO items (id, amount) VALUES (7, 1)")).rejects.toThrow(
+    /Duplicate/,
+  );
+  expect((await db.query("SELECT COUNT(*) AS n FROM items")).rows).toEqual([{ n: 25 }]);
+  await db.close();
+});
