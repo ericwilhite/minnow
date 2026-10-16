@@ -7465,6 +7465,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
     }
     const table = await this.#findTable(base.table);
+    // A patch re-evaluates only the base rows whose keys a commit touched, which is sound only
+    // while a change to the lookup side always runs the statement in full. When the lookup is
+    // the base table itself, every change looks like a base-only change, and a row joined to a
+    // changed row (a child whose parent was deleted, say) would keep its old partner.
+    for (const join of plan.joins) {
+      if ((await this.#findTable(join.table)).id === table.id) {
+        return decline("self-join; the lookup side is the base table");
+      }
+    }
     const keyColumn = getUniqueKeyColumn(table);
     if (keyColumn === undefined) return decline(`${table.name} has no unique key`);
     if (keyColumn.hidden === true) return decline(`${table.name} has a composite unique key`);

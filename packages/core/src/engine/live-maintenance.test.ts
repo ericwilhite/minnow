@@ -554,3 +554,41 @@ describe("why a live statement re-executes", () => {
     }
   });
 });
+
+describe("a join whose lookup side is the base table", () => {
+  it.each([
+    "SELECT a.id, p.id AS parent FROM a LEFT JOIN a AS p ON p.id = a.p ORDER BY a.id",
+    "SELECT a.id, p.id AS parent FROM a JOIN a AS p ON p.id = a.p ORDER BY a.id",
+  ])("re-executes, so a row joined to a changed row moves with it: %s", async (sql) => {
+    // Found by the live differential property (live-differential.test.ts). Maintenance treats
+    // a change to the base table as a change to the rows whose keys it touched; with the
+    // lookup being the same table, deleting row 3 left row 4 joined to it.
+    const database = new MinnowDatabase(new MemoryBlockStore(), { autoCompact: false });
+    const live = database.liveQueries();
+    try {
+      await database.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER, p INTEGER)");
+      await database.execute(
+        "INSERT INTO a VALUES (1, 5, NULL), (2, 12, 1), (3, -3, 2), (4, 20, 3)",
+      );
+      let latest: QueryResult | undefined;
+      await live.subscribe(sql, {
+        onChange: (result) => {
+          latest = result;
+        },
+      });
+      for (const write of [
+        "DELETE FROM a WHERE x < 0",
+        "INSERT INTO a VALUES (3, 7, 4)",
+        "UPDATE a SET p = 1 WHERE id = 4",
+      ]) {
+        await database.execute(write);
+        await live.refresh();
+        expect(latest?.rows, write).toEqual((await database.query(sql, { memoize: false })).rows);
+      }
+      expect(live.stats.groups[0]?.reasons.join("; ")).toContain("self-join");
+    } finally {
+      live.close();
+      await database.close();
+    }
+  });
+});
