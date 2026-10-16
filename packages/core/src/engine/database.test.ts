@@ -8160,10 +8160,15 @@ it("prunes numeric row groups and late-loads projected blocks after predicate se
   }
   const segment = (await allVisibleSegments(database, "pruned_metrics"))[0];
   if (segment === undefined) throw new Error("Expected pruning segment");
+  // The writing engine remembers the zone maps of the blocks it wrote; a reader that did not
+  // write them (another tab, a reopened database) learns them from the stored headers, which
+  // is what this test counts.
+  await database.close();
+  const reader = new MinnowDatabase(store, { compression: "raw", rowsPerBlock: 2 });
 
   store.blockReadCalls = 0;
   store.blockIdsRead = [];
-  expect(await database.query("SELECT label FROM pruned_metrics WHERE score = 7")).toEqual({
+  expect(await reader.query("SELECT label FROM pruned_metrics WHERE score = 7")).toEqual({
     columns: ["label"],
     columnDomains: [null],
     rows: [{ label: "seven" }],
@@ -8178,7 +8183,7 @@ it("prunes numeric row groups and late-loads projected blocks after predicate se
   store.blockReadCalls = 0;
   store.blockIdsRead = [];
   expect(
-    await database.query(
+    await reader.query(
       "SELECT label FROM pruned_metrics WHERE DATE '2026-01-07' <= recordedAt ORDER BY label",
     ),
   ).toEqual({
@@ -8192,7 +8197,7 @@ it("prunes numeric row groups and late-loads projected blocks after predicate se
 
   store.blockReadCalls = 0;
   store.blockIdsRead = [];
-  expect(await database.query("SELECT score FROM pruned_metrics WHERE label = 'seven'")).toEqual({
+  expect(await reader.query("SELECT score FROM pruned_metrics WHERE label = 'seven'")).toEqual({
     columns: ["score"],
     columnDomains: [null],
     rows: [{ score: 7 }],
@@ -8200,7 +8205,7 @@ it("prunes numeric row groups and late-loads projected blocks after predicate se
   // Full scan over both columns (4 blocks each), minus the score and label blocks already in
   // the decoded-block cache from the pruned queries above.
   expect(store.blockIdsRead.flat()).toHaveLength(6);
-  store.close();
+  await reader.close();
 });
 
 for (const implementation of [

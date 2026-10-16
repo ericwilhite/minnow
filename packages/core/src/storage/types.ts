@@ -779,21 +779,32 @@ export function validateTableForeignKey(
 
 const catalogRecordTextEncoder = new TextEncoder();
 
-function durableRecordRetainedBytes(record: unknown, label: string): number {
+function durableRecordBigIntReplacer(_key: string, entry: unknown): unknown {
+  if (typeof entry !== "bigint") return entry;
+  if (entry < 0n || entry > MAX_ROW_ID_EXCLUSIVE_END) {
+    throw new RangeError("Record bigint exceeds the unsigned 64-bit persisted range");
+  }
+  return { $n: entry.toString() };
+}
+
+function durableRecordRetainedBytes(
+  record: unknown,
+  label: string,
+  containsBigInt = false,
+): number {
   // Keep this byte accounting identical to the canonical record-wire JSON codec without
   // importing the toolkit codec back into this leaf contract module. Segment records always
-  // contain bigint row envelopes, so plain JSON.stringify is not sufficient.
+  // contain bigint row envelopes, so plain JSON.stringify is not sufficient: they go straight
+  // to the replacer instead of paying for the TypeError a plain attempt throws.
   let json: string | undefined;
-  try {
-    json = JSON.stringify(record);
-  } catch {
-    json = JSON.stringify(record, (_key, entry: unknown) => {
-      if (typeof entry !== "bigint") return entry;
-      if (entry < 0n || entry > MAX_ROW_ID_EXCLUSIVE_END) {
-        throw new RangeError("Record bigint exceeds the unsigned 64-bit persisted range");
-      }
-      return { $n: entry.toString() };
-    });
+  if (containsBigInt) {
+    json = JSON.stringify(record, durableRecordBigIntReplacer);
+  } else {
+    try {
+      json = JSON.stringify(record);
+    } catch {
+      json = JSON.stringify(record, durableRecordBigIntReplacer);
+    }
   }
   if (typeof json !== "string") throw new TypeError(`${label} is not JSON-serializable`);
   return catalogRecordTextEncoder.encode(json).byteLength;
@@ -813,13 +824,33 @@ export function manifestRecordRetainedBytes(record: Manifest): number {
  * later reclamation may add. Reserving them up front prevents quota deadlock at the byte ceiling.
  */
 export function manifestRecordRetainedReservationBytes(record: Manifest): number {
-  return manifestRecordRetainedBytes(
+  // Manifest records, like segment records, are replaced rather than changed in place, and a
+  // commit charges its new manifest at plan and again at apply: measured once per object.
+  const cached = manifestReservationBytesCache.get(record);
+  if (cached !== undefined) return cached;
+  const bytes = manifestRecordRetainedBytes(
     record.prunedAt === undefined ? { ...record, prunedAt: "1970-01-01T00:00:00.000Z" } : record,
   );
+  manifestReservationBytesCache.set(record, bytes);
+  return bytes;
 }
 
+const manifestReservationBytesCache = new WeakMap<Manifest, number>();
+
+/**
+ * Exact retained bytes per segment record object. Segment records are never changed in place
+ * (a change publishes a new object), and one commit charges the same record several times —
+ * plan, apply, replace — so the size is computed once per object. Charging a removal with the
+ * bytes recorded at admission also keeps the running totals exact by construction.
+ */
+const segmentRecordRetainedBytesCache = new WeakMap<SegmentRecord, number>();
+
 export function segmentRecordRetainedBytes(record: SegmentRecord): number {
-  return durableRecordRetainedBytes(record, "Segment record");
+  const cached = segmentRecordRetainedBytesCache.get(record);
+  if (cached !== undefined) return cached;
+  const bytes = durableRecordRetainedBytes(record, "Segment record", true);
+  segmentRecordRetainedBytesCache.set(record, bytes);
+  return bytes;
 }
 
 /** Hard catalog cardinality/text bounds shared by engine, adapters, checkpoints, and snapshots. */
