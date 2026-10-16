@@ -3390,11 +3390,19 @@ function foldExpression(expression: Expression): Expression {
                       : simpleScalarFunctions.get(expression.name)?.returns === "interval"
                         ? ({ kind: "interval" } as const)
                         : undefined;
+          // A constant cast to DOUBLE PRECISION, REAL, or NUMERIC keeps that type once folded:
+          // `qty / CAST(2 AS DOUBLE PRECISION)` divides exactly, never as integer `/`.
+          const fractional =
+            typeof folded === "number" &&
+            (targetWord === "number" ||
+              targetWord === "numeric" ||
+              targetWord?.startsWith("numeric:") === true);
           return {
             kind: "literal",
             value: folded,
             ...(isSqlDomainValue(folded) ? { internalSqlValue: true as const } : {}),
             ...(sqlDomain === undefined ? {} : { sqlDomain }),
+            ...(fractional ? { decimal: true as const } : {}),
           };
         }
       } catch {

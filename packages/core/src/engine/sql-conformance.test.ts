@@ -1613,6 +1613,16 @@ function divisionCases(): Case[] {
     ordered(
       `SELECT COUNT(*) / CASE WHEN COUNT(*) > 0 THEN NULL ELSE 7 END AS none, SUM(id) / CASE MIN(id) WHEN 0 THEN NULL ELSE 7 END AS sevenths FROM data ORDER BY 1`,
     ),
+    // A constant cast to a float type keeps that type when the cast is folded away.
+    ordered(
+      `SELECT id, id / CAST(2 AS DOUBLE PRECISION) AS a, id / CAST(2 AS REAL) AS b, id / CAST('2' AS FLOAT) AS c, id / CAST(2 AS INTEGER) AS d, SUM(id) / CAST(4 AS FLOAT) AS e FROM data GROUP BY id ORDER BY id`,
+    ),
+    {
+      // SQLite gives NUMERIC integer affinity, so its `/` truncates; PostgreSQL's does not.
+      sql: `SELECT id, id / CAST(2 AS NUMERIC) AS a, id / CAST(4 AS NUMERIC(4, 1)) AS b FROM data ORDER BY id`,
+      ordered: true,
+      skip: ["sqlite"],
+    },
   ];
 }
 
