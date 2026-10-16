@@ -387,6 +387,39 @@ describe.each(stores)(
   },
 );
 
+describe.each(stores)("a commit window whose manifests were collected on $name", ({ open }) => {
+  it("keeps a retired key reserved on the connection that rekeyed it", async () => {
+    // Rekeying interaction seed 800027. Connection A rekeyed 10 to -10 and kept the forwards it
+    // had read inside that write, proven at the version before its own commit. Connection B
+    // wrote and collected garbage, which removed the manifests up to the current one. A then
+    // brought its forwards up to date by replaying the window's commits, found no manifest in
+    // the window naming the forwards table -- the one that did was gone -- and concluded
+    // nothing had changed: key 10 stopped forwarding on A, a read of it found nothing, and an
+    // insert of 10 was accepted while every other connection still held it reserved.
+    const store = await open();
+    const a = new MinnowDatabase(store);
+    const b = new MinnowDatabase(store);
+    await a.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c INTEGER)");
+    await a.execute("INSERT INTO t VALUES (10, 1), (20, 2)");
+    await a.execute("UPDATE t SET id = -10 WHERE id = 10");
+    for (let round = 0; round < 3; round += 1) {
+      await b.execute(`UPDATE t SET c = ${String(3 + round)} WHERE id = 20`);
+      // A reads on, without naming a key, so it pins nothing older.
+      await a.query("SELECT count(*) AS n FROM t", { memoize: false });
+      await b.compactTable("t");
+      await b.collectGarbage();
+    }
+    for (const database of [a, b]) {
+      const rows = await database.query("SELECT id, c FROM t WHERE id = 10", { memoize: false });
+      expect(rows.rows).toEqual([{ id: -10, c: 1 }]);
+    }
+    await expect(a.execute("INSERT INTO t VALUES (10, 9)")).rejects.toThrow(/duplicate/iu);
+    await a.close();
+    await b.close();
+    store.close();
+  });
+});
+
 describe.each(stores.map(({ name, open }) => ({ name, create: open })))(
   "compaction planning races on $name",
   ({ create }) => {

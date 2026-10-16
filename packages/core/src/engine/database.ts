@@ -855,6 +855,11 @@ interface LiveProofContext {
   readonly until: number;
   /** Versions in (after, until] that recorded a change to each table. */
   readonly changedVersions: ReadonlyMap<string, ReadonlySet<number>>;
+  /**
+   * False when a manifest in the window is gone (garbage collection removes old ones), so
+   * `changedVersions` may omit a version that changed any table: nothing can be proven.
+   */
+  readonly complete: boolean;
   readonly tables: Map<string, Promise<LiveProofTable | undefined>>;
 }
 
@@ -5897,6 +5902,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    */
   async #keyForwardChanges(after: number, until: number): Promise<KeyForwardChange[] | undefined> {
     const context = await this.#liveProofContext(after, until);
+    // A collected manifest may have been the one that wrote forwards: read the table whole.
+    if (!context.complete) return undefined;
     const versions = context.changedVersions.get(KEY_FORWARDS_TABLE_ID);
     if (versions === undefined || versions.size === 0) return [];
     const entry = await this.#liveProofTable(context, KEY_FORWARDS_TABLE_ID);
@@ -7645,6 +7652,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   ): Promise<LiveMaintainedChange | undefined> {
     if (tableIds.length !== 1 || tableIds[0] !== state.tableId) return undefined;
     const context = await this.#liveProofContext(after, until);
+    if (!context.complete) return undefined;
     const entry = await this.#liveProofTable(context, state.tableId);
     if (entry === undefined) return undefined;
     for (const version of context.changedVersions.get(state.tableId) ?? []) {
@@ -7819,6 +7827,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     // predicates reject (e.g. `value > (SELECT AVG(value) FROM t)`).
     if (planReadsBeyondSingleScan(plan)) return true;
     const context = await this.#liveProofContext(after, until);
+    if (!context.complete) return true;
     for (const tableId of tableIds) {
       const entry = await this.#liveProofTable(context, tableId);
       if (entry === undefined) return true;
@@ -7908,12 +7917,20 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       // Proof requires every version to be accounted for by a surviving, inspected segment:
       // garbage collection deletes reclaimed segments outright, so "no segment in the window"
       // is absence of evidence, not evidence of neutrality.
+      //
+      // The same holds for the manifests themselves: a collected one leaves no record of the
+      // tables it changed. Versions are consecutive (`createManifest` publishes
+      // `expectedVersion + 1`), so a gap in the window is detectable.
       const changedVersions = new Map<string, Set<number>>();
+      let expected = after === null ? 0 : after + 1;
+      let complete = true;
       let cursor = after;
       pages: for (;;) {
         const page = await this.store.listManifestPage(cursor, 64);
         for (const manifest of page.records) {
           if (manifest.version > until) break pages;
+          if (manifest.version !== expected) complete = false;
+          expected = manifest.version + 1;
           for (const tableId of manifest.changedTableIds) {
             const versions = changedVersions.get(tableId) ?? new Set<number>();
             versions.add(manifest.version);
@@ -7924,7 +7941,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         if (page.nextCursor === null) break;
         cursor = page.nextCursor;
       }
-      return { after, until, changedVersions, tables: new Map() };
+      if (expected !== until + 1) complete = false;
+      return { after, until, changedVersions, complete, tables: new Map() };
     })();
     this.#liveProofContexts.set(key, context);
     if (this.#liveProofContexts.size > LIVE_PROOF_CONTEXT_LIMIT) {
