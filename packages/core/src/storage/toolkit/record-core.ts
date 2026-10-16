@@ -930,6 +930,8 @@ interface CommitPlan {
   removedManifestBlocks: ManifestBlockRecord[];
   committed: TransactionRecord;
   pendingSegments: SegmentRecord[];
+  /** The pending segments as published: level-zero ones stamped with the new version's order. */
+  committedSegments: SegmentRecord[];
   uniqueKeyDeltas: Map<string, { added: Set<string>; removed: Set<string> }>;
   ftsChanges: readonly FtsChanges[] | undefined;
   pendingTable?: TableRecord;
@@ -4802,12 +4804,15 @@ export class RecordCore {
       changedTableIds: [...logicallyChangedTableIds],
     });
     this.#manifestUsageAfter([manifest]);
-    this.#segmentUsageAfter(
-      pendingSegments.map((segment) => ({
-        ...segment,
-        logicalOrder: segment.level === 0 ? manifest.version : segment.logicalOrder,
-      })),
-    );
+    // Level-zero records are staged before their publication version exists. Their durable
+    // read order is the manifest that first makes them visible. Compaction output already
+    // carries its exact level/order and keeps it. Made once, here, so the apply publishes the
+    // very records this plan accounted for.
+    const committedSegments = pendingSegments.map((segment) => ({
+      ...segment,
+      logicalOrder: segment.level === 0 ? manifest.version : segment.logicalOrder,
+    }));
+    this.#segmentUsageAfter(committedSegments);
     const committed = updateTransactionRecord(transaction, {
       status: "committed",
       committedVersion: manifest.version,
@@ -4819,6 +4824,7 @@ export class RecordCore {
       removedManifestBlocks,
       committed,
       pendingSegments,
+      committedSegments,
       uniqueKeyDeltas,
       ftsChanges,
       ...(pendingTable === undefined
@@ -4848,13 +4854,7 @@ export class RecordCore {
       plan.pendingTable === undefined
         ? this.#schemaEpoch
         : safeWholeIncrement(this.#schemaEpoch, "Schema epoch");
-    const committedSegments = pendingSegments.map((segment) => ({
-      ...segment,
-      // Level-zero records are staged before their publication version exists. Their durable
-      // read order is the manifest that first makes them visible. Compaction output already
-      // carries its exact level/order and keeps it.
-      logicalOrder: segment.level === 0 ? manifest.version : segment.logicalOrder,
-    }));
+    const committedSegments = plan.committedSegments;
     this.#setManifest(manifest);
     this.#replaceSegments(committedSegments);
     for (const record of addedManifestBlocks) this.#manifestBlocks.set(record.blockId, record);

@@ -824,10 +824,18 @@ export function manifestRecordRetainedBytes(record: Manifest): number {
  * later reclamation may add. Reserving them up front prevents quota deadlock at the byte ceiling.
  */
 export function manifestRecordRetainedReservationBytes(record: Manifest): number {
-  return manifestRecordRetainedBytes(
+  // Manifest records, like segment records, are replaced rather than changed in place, and a
+  // commit charges its new manifest at plan and again at apply: measured once per object.
+  const cached = manifestReservationBytesCache.get(record);
+  if (cached !== undefined) return cached;
+  const bytes = manifestRecordRetainedBytes(
     record.prunedAt === undefined ? { ...record, prunedAt: "1970-01-01T00:00:00.000Z" } : record,
   );
+  manifestReservationBytesCache.set(record, bytes);
+  return bytes;
 }
+
+const manifestReservationBytesCache = new WeakMap<Manifest, number>();
 
 /**
  * Exact retained bytes per segment record object. Segment records are never changed in place
