@@ -89,7 +89,11 @@ optional zone after the time, `Z` or an offset in PostgreSQL's spellings (`+00`,
 `+05:30`, with or without a space before it). Text without a zone is UTC. Timestamp inputs and
 `MAKE_TIMESTAMP` validate calendar dates, clock fields, and offsets up to ±15:59.
 Invalid dates such as February 30 throw. Supported calendar years are 1–9999; years below 100
-keep their requested year. Explicit TEXT casts retain text comparison semantics: comparing
+keep their requested year. `DATE` input also accepts a timestamp's text and keeps its day, as
+PostgreSQL does: `'2026-10-15 08:00:00'::date` and `day = '2026-10-15T08:00:00Z'` both read
+2026-10-15. A `DATE` compared with a `TIMESTAMP` value is midnight of its day, so
+`day < TIMESTAMP '2026-10-15 00:00:01'` holds for 2026-10-15; a `Date` bound to a placeholder
+beside a `DATE` column is read as that column's type, a day. Explicit TEXT casts retain text comparison semantics: comparing
 `'1'::TEXT` to the number `1` throws rather than interpreting the text as a number.
 
 `ORDER BY` takes expressions, `ASC` / `DESC`, `NULLS FIRST` / `NULLS LAST`, ordinals, and explicit

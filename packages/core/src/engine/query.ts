@@ -10109,7 +10109,11 @@ class Parser {
       };
     }
     if ((upper === "TIMESTAMP" || upper === "DATETIME") && this.#peek().kind === "string") {
-      return { kind: "literal", value: timestampLiteral(this.#take("string").text) };
+      return {
+        kind: "literal",
+        value: timestampLiteral(this.#take("string").text),
+        timestamp: true,
+      };
     }
     if (upper === "TIME" && this.#peek().kind === "string") {
       return {

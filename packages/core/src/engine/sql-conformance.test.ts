@@ -2791,6 +2791,73 @@ describe("SQL conformance against SQLite and PGlite", () => {
     }
   });
 
+  it("compares a DATE column with timestamps and timestamp text as PostgreSQL does", async () => {
+    // A DATE meets a TIMESTAMP as midnight of its day, and DATE input keeps the day of a
+    // timestamp's text. SQLite has neither type, so PGlite alone judges these; the fixture
+    // has no DATE column, so the table is built here.
+    const days = ["2024-01-03", "2024-02-05", null, "2024-03-06"];
+    const minnow = new MinnowDatabase(new MemoryBlockStore());
+    const { PGlite } = await import("@electric-sql/pglite");
+    const pg = await PGlite.create();
+    try {
+      await pg.exec(`SET TIME ZONE 'UTC'`);
+      await pg.exec(`CREATE TABLE days (id INTEGER PRIMARY KEY, day DATE)`);
+      await minnow.execute(`CREATE TABLE days (id INTEGER PRIMARY KEY, day DATE)`);
+      const values = days
+        .map((day, index) => `(${String(index + 1)}, ${day === null ? "NULL" : `'${day}'`})`)
+        .join(", ");
+      await minnow.execute(`INSERT INTO days VALUES ${values}`);
+      await pg.exec(`INSERT INTO days VALUES ${values}`);
+      const cases: Array<{ sql: string; params?: QueryValue[] }> = [
+        { sql: `SELECT id FROM days WHERE day < TIMESTAMP '2024-02-05 00:00:01' ORDER BY id` },
+        { sql: `SELECT id FROM days WHERE TIMESTAMP '2024-02-05 00:00:01' > day ORDER BY id` },
+        {
+          sql: `SELECT id FROM days WHERE day < TIMESTAMP '2024-02-05 00:00:00' + INTERVAL '1 second' ORDER BY id`,
+        },
+        {
+          sql: `SELECT id FROM days WHERE day IN (TIMESTAMP '2024-02-05 00:00:00', TIMESTAMP '2024-03-06 00:00:01') ORDER BY id`,
+        },
+        {
+          sql: `SELECT id FROM days WHERE day BETWEEN TIMESTAMP '2024-02-04 12:00:00' AND TIMESTAMP '2024-02-05 12:00:00' ORDER BY id`,
+        },
+        {
+          sql: `SELECT id FROM days WHERE day < $1 ORDER BY id`,
+          params: [new Date("2024-02-05T00:00:01.000Z")],
+        },
+        { sql: `SELECT id FROM days WHERE day = '2024-02-05 10:00:00' ORDER BY id` },
+        { sql: `SELECT id FROM days WHERE day >= '2024-02-05T00:00:00Z' ORDER BY id` },
+        { sql: `SELECT id FROM days WHERE day IN ('2024-01-03 08:00', '2024-03-06') ORDER BY id` },
+        {
+          sql: `SELECT id, CAST('2024-02-05 10:00:00' AS DATE) = day AS same, day < CAST('2024-02-05 10:00:00' AS TIMESTAMP) AS earlier FROM days ORDER BY id`,
+        },
+      ];
+      const failures: string[] = [];
+      for (const { sql, params } of cases) {
+        let minnowRows: string[];
+        try {
+          const result = await minnow.query(sql, params === undefined ? {} : { params });
+          minnowRows = result.rows.map((row) =>
+            JSON.stringify(result.columns.map((column) => normalize(row[column]))),
+          );
+        } catch (error) {
+          failures.push(`${sql}\n  minnow threw: ${String(error)}`);
+          continue;
+        }
+        const pgResult = await pg.query<unknown[]>(sql, (params ?? []) as unknown[], {
+          rowMode: "array",
+        });
+        const pgRows = pgResult.rows.map((row) => JSON.stringify(row.map(normalize)));
+        if (pgRows.join("\n") !== minnowRows.join("\n")) {
+          failures.push(`${sql}\n${diffSummary("minnow vs pglite", minnowRows, pgRows)}`);
+        }
+      }
+      expect(failures).toEqual([]);
+    } finally {
+      await minnow.close();
+      await pg.close();
+    }
+  });
+
   it("agrees with the oracles on every read-only feature the matrix claims", async () => {
     const covered = matrixFeatures.filter(
       (feature) =>

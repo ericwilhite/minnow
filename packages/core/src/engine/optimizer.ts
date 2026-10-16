@@ -3314,6 +3314,8 @@ function foldExpression(expression: Expression): Expression {
           ...(isSqlDomainValue(folded) ? { internalSqlValue: true as const } : {}),
           ...(domain === undefined ? {} : { sqlDomain: domain }),
           ...(left.decimal === true || right.decimal === true ? { decimal: true as const } : {}),
+          // Compile-time folding never sees a placeholder, so a Date here is a typed timestamp.
+          ...(folded instanceof Date ? { timestamp: true as const } : {}),
         };
       }
     }
@@ -3403,6 +3405,7 @@ function foldExpression(expression: Expression): Expression {
             ...(isSqlDomainValue(folded) ? { internalSqlValue: true as const } : {}),
             ...(sqlDomain === undefined ? {} : { sqlDomain }),
             ...(fractional ? { decimal: true as const } : {}),
+            ...(folded instanceof Date ? { timestamp: true as const } : {}),
           };
         }
       } catch {
