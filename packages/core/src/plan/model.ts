@@ -166,6 +166,12 @@ export type Expression =
        * (`7 / 2.0` is 3.5 where `7 / 2` is 3).
        */
       decimal?: true;
+      /**
+       * A TIMESTAMP-typed constant (`TIMESTAMP '…'`, or a constant expression folded to a
+       * timestamp). Beside a DATE column it promotes the DATE to midnight, as PostgreSQL does,
+       * where a placeholder's Date has no type of its own and reads as the DATE.
+       */
+      timestamp?: true;
     }
   /** A `?` or `$n` placeholder; `index` is 0-based. Replaced by a literal at bind time. */
   | { kind: "parameter"; index: number }
@@ -307,6 +313,12 @@ export interface JoinPlan extends TableSource {
   on?: Expression;
   full?: boolean;
   natural?: boolean;
+  /**
+   * `JOIN t USING (a, b)`: the named columns. Each is one merged column of the join, as in
+   * PostgreSQL, so an unqualified `a` names the left side's value; schema binding resolves the
+   * references and the left owner of each name (mergeJoinColumns).
+   */
+  using?: string[];
 }
 
 /**

@@ -284,6 +284,7 @@ import {
   mapChildExpressions,
   expandFtsColumns,
   expandNaturalJoins,
+  mergeJoinColumns,
   expandSourceColumnAliases,
   expandViewSources,
   forEachBlockExpression,
@@ -5548,6 +5549,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       return columns;
     };
     rewritten = bindPendingSelectShapes(rewritten, columnsOf);
+    rewritten = mergeJoinColumns(rewritten, columnsOf);
     if (aliased) rewritten = expandSourceColumnAliases(rewritten, columnsOf);
     if (natural) rewritten = expandNaturalJoins(rewritten, columnsOf);
     // With every subquery name resolved, the rewrites compilation had to hold back can run:
@@ -26428,7 +26430,13 @@ function normalizePlanDomainLiterals(
         coerceTyped(column, value);
         return;
       }
+      // A DATE meeting a TIMESTAMP constant is promoted to midnight of that day, as in
+      // PostgreSQL; narrowing the timestamp to its day would make `day < TIMESTAMP '… 00:00:01'`
+      // false. A placeholder's Date has no type of its own and reads as the DATE.
+      const timestampAgainstDate = (literal: Expression): boolean =>
+        domain.kind === "date" && literal.kind === "literal" && literal.timestamp === true;
       if (value.kind === "literal") {
+        if (timestampAgainstDate(value)) return;
         if (pass.probing) {
           pass.needed = true;
           return;
@@ -26438,7 +26446,7 @@ function normalizePlanDomainLiterals(
         value.sqlDomain = domain;
       } else if (value.kind === "list") {
         for (const item of value.items) {
-          if (item.kind === "literal") {
+          if (item.kind === "literal" && !timestampAgainstDate(item)) {
             if (pass.probing) {
               pass.needed = true;
               return;

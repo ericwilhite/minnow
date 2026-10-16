@@ -13,6 +13,12 @@
       "example": "SELECT amount AS total FROM rows"
     },
     {
+      "id": "select.repeated-output-name",
+      "status": "supported",
+      "example": "SELECT amount AS v, region AS v FROM rows",
+      "notes": "Two select items may share an output name, including a column repeated beside a wildcard (SELECT *, amount). A result row is keyed by name, so the first keeps the name and each later one is numbered: v and v_2."
+    },
+    {
       "id": "select.all",
       "status": "supported",
       "example": "SELECT ALL region, amount FROM rows",
@@ -1108,13 +1114,13 @@
       "id": "join.using",
       "status": "supported",
       "example": "SELECT rows.amount AS amount FROM rows JOIN dims USING (region)",
-      "notes": "Unlike PostgreSQL, joined columns stay one per side: `SELECT *` returns both and an unqualified reference to a join column is ambiguous. Qualify it, or name the side you want."
+      "notes": "The joined columns merge, as in PostgreSQL: an unqualified reference names the left side's value (the right side's for RIGHT JOIN, COALESCE of both for FULL JOIN), and SELECT * lists each once, first. A later USING may name a column of any earlier source."
     },
     {
       "id": "join.natural",
       "status": "supported",
       "example": "SELECT rows.amount AS amount FROM rows NATURAL JOIN dims",
-      "notes": "The shared columns are compared but not merged, so an unqualified reference to one is ambiguous \u2014 qualify it. NATURAL RIGHT JOIN is rejected, because the right-join mirror rewrites the sources the shared-column search reads."
+      "notes": "The shared columns merge as USING's do: an unqualified reference names the left side's value, and SELECT * lists each once, first. NATURAL RIGHT JOIN is rejected, because the right-join mirror rewrites the sources the shared-column search reads."
     },
     {
       "id": "join.full-compound-on",
@@ -1864,7 +1870,7 @@
       "id": "group-by.alias",
       "status": "supported",
       "example": "SELECT COALESCE(region, 'none') AS place, COUNT(*) AS c FROM rows GROUP BY place ORDER BY place",
-      "notes": "A bare GROUP BY name that is an output alias stands for the aliased expression. A name that is both an alias and a source column keeps its source-column meaning, which is also what PostgreSQL does."
+      "notes": "A bare GROUP BY name that is an output alias stands for the aliased expression. A name that is both an alias and a source column is the source column, as in PostgreSQL and SQLite: SELECT LOWER(region) AS region ... GROUP BY region groups by the stored region."
     },
     {
       "id": "group-by.qualified-spelling",
