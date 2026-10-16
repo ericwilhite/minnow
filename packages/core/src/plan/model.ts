@@ -7,6 +7,12 @@ import type { SqlDomain } from "../storage/types.js";
 
 export type QueryValue = boolean | number | string | Date | null;
 export type QueryRow = Record<string, QueryValue>;
+/**
+ * A value bound to one `?` or `$n` placeholder. An array binds only where PostgreSQL takes an
+ * array operand — `expr = ANY($1)`, `expr <> ALL($1)` — and is how one placeholder carries a
+ * whole IN list.
+ */
+export type QueryParameter = QueryValue | readonly QueryValue[];
 
 export interface QueryResult {
   columns: string[];
@@ -25,6 +31,14 @@ export type AggregateName =
   | "MAX"
   | "JSON_ARRAYAGG"
   | "STRING_AGG"
+  /**
+   * Ordered-set aggregates, `f(direct) WITHIN GROUP (ORDER BY x)`: the sorted input is
+   * `arguments[0]` (also the one `aggregateOrderBy` term, which carries the direction), and a
+   * percentile's fraction is `arguments[1]`.
+   */
+  | "PERCENTILE_CONT"
+  | "PERCENTILE_DISC"
+  | "MODE"
   /** Optimizer-only aggregate that enforces scalar-subquery cardinality. */
   | "MINNOW_SINGLE_VALUE";
 export type ScalarFunctionName =
@@ -369,6 +383,13 @@ export interface RecursiveCte {
   base: CompiledQuery;
   step: CompiledQuery;
   all: boolean;
+  /**
+   * Set when this recursion is GENERATE_SERIES over integers or timestamps: the base block
+   * selects the start, stop, and step, and the step block adds the step while within stop. An
+   * executor may run the base block once and produce every row in one loop; base and step remain
+   * the definition.
+   */
+  series?: "integer" | "timestamp";
 }
 
 export type PredicateOperator =

@@ -725,6 +725,36 @@ export function intervalDomainValue(value: unknown): string | null {
   );
 }
 
+/** The [months, days, microseconds] fields of a tagged INTERVAL, or undefined for any other value. */
+export function intervalDomainParts(value: unknown): readonly [number, number, number] | undefined {
+  if (typeof value !== "string" || !value.startsWith(INTERVAL_VALUE)) return undefined;
+  return JSON.parse(value.slice(INTERVAL_VALUE.length)) as [number, number, number];
+}
+
+/** A tagged INTERVAL from its three fields, each a safe integer. */
+export function intervalDomainFromParts(
+  months: number,
+  days: number,
+  microseconds: number,
+): string {
+  if (
+    !Number.isSafeInteger(months) ||
+    !Number.isSafeInteger(days) ||
+    !Number.isSafeInteger(microseconds)
+  ) {
+    throw new RangeError("INTERVAL value is out of range");
+  }
+  // JSON.stringify writes -0 as 0, so the canonical text never carries a signed zero.
+  return INTERVAL_VALUE + JSON.stringify([months, days, microseconds]);
+}
+
+/** The JSON array text inside a tagged ARRAY value, or undefined for any other value. */
+export function arrayDomainText(value: unknown): string | undefined {
+  return typeof value === "string" && value.startsWith(ARRAY_VALUE)
+    ? value.slice(ARRAY_VALUE.length)
+    : undefined;
+}
+
 export function arrayDomainValue(values: readonly unknown[]): string {
   return boundedTaggedDomainValue(
     ARRAY_VALUE,

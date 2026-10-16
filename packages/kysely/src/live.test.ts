@@ -121,6 +121,38 @@ describe("Kysely live queries", () => {
     store.close();
   });
 
+  it("keeps an array parameter bound under = ANY across live refreshes", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store);
+    await database.migrate(shopSchema);
+    const db = createKysely({ driver: database, schema: shopSchema });
+    const live = createKyselyLiveQueries({ driver: database });
+    const watched = live(
+      db
+        .selectFrom("orders")
+        .select("id")
+        .where((eb) => eb("id", "=", eb.fn.any(eb.val([2, 3]))))
+        .orderBy("id"),
+    );
+    const unsubscribe = watched.subscribe(() => undefined);
+    await until(() => expect(watched.getSnapshot().status).toBe("ready"));
+    expect(watched.getSnapshot().rows).toEqual([]);
+    await db
+      .insertInto("orders")
+      .values([
+        { id: 1, status: "pending", total: 1 },
+        { id: 3, status: "pending", total: 3 },
+      ])
+      .execute();
+    await live.refresh();
+    await until(() => expect(watched.getSnapshot().rows).toEqual([{ id: 3 }]));
+    unsubscribe();
+    watched.close();
+    await live.close();
+    await db.destroy();
+    store.close();
+  });
+
   it("executes through Kysely so result plugins remain part of live semantics", async () => {
     const runtimeSchema = schema([
       table("person_record", {

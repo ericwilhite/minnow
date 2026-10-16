@@ -8,6 +8,7 @@ import {
   compileStatement,
   executeQuery,
   executeRowQuery,
+  type QueryParameter,
 } from "./query.js";
 
 interface MatrixFeature {
@@ -16,8 +17,8 @@ interface MatrixFeature {
   example: string;
   /** Statements executed before the example, for examples that need prior state. */
   setup?: string[];
-  /** Bound values for the example's placeholders, in order. */
-  params?: Array<string | number | boolean | null>;
+  /** Bound values for the example's placeholders, in order; an array binds under ANY/ALL. */
+  params?: QueryParameter[];
   error?: string;
   notes?: string;
 }

@@ -57,6 +57,24 @@ Interpolating values produces a new statement string every time and throws that 
 A statement's placeholders must all be bound: passing too few or too many is an error, not a
 silently-null column.
 
+A value is `null`, a boolean, a number, a string, or a `Date`. An IN list of any length binds to
+one placeholder as a JavaScript array, through PostgreSQL's `= ANY($1)`:
+
+```ts
+await db.query("SELECT order_id, total FROM orders WHERE order_id = ANY($1)", {
+  params: [[1001, 1002, 1005]],
+});
+
+await db.execute("DELETE FROM carts WHERE cart_id = ANY($1::int[])", [staleCartIds]);
+```
+
+The statement text stays the same whatever the list's length, so its plan is cached once, and the
+members bind exactly as `order_id IN (1001, 1002, 1005)` would: a key or index lookup, block
+pruning, and the vectorized membership test all apply. `<> ALL($1)` is `NOT IN`, and the other
+comparisons (`> ANY`, `<= ALL`, …) work too. An empty array matches nothing under `ANY` and
+everything under `ALL`; a `null` array compares as `NULL`. An array binds only as the operand of
+`ANY` or `ALL`, and its members must be scalars — a nested array is refused.
+
 ## Fixed compilation and value limits
 
 SQL compilation happens before a query has an execution-memory account, and scalar functions can

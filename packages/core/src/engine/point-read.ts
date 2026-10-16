@@ -8,7 +8,7 @@
  * the ordinary executor, which stays the authority on errors and semantics.
  */
 import { dateMilliseconds } from "../date-value.js";
-import type { CompiledQuery, Expression, QueryValue } from "../plan/model.js";
+import type { CompiledQuery, Expression, QueryParameter, QueryValue } from "../plan/model.js";
 
 type PointReadValue = boolean | number | string | Date;
 
@@ -230,7 +230,7 @@ export function cachedPointReadTemplate(plan: CompiledQuery): PointReadTemplate 
  */
 export function resolvePointReadShape(
   template: PointReadTemplate,
-  params: readonly QueryValue[],
+  params: readonly QueryParameter[],
 ): PointReadShape | undefined {
   const equalities: PointReadEquality[] = [];
   for (const entry of template.equalities) {
@@ -239,8 +239,9 @@ export function resolvePointReadShape(
       continue;
     }
     const raw = params[entry.parameter];
-    if (raw === undefined) return undefined;
-    const value = equalityValue(raw);
+    // An array binds only under ANY/ALL; the ordinary binder reports it anywhere else.
+    if (raw === undefined || Array.isArray(raw)) return undefined;
+    const value = equalityValue(raw as QueryValue);
     if (value === undefined) return undefined;
     equalities.push({ column: entry.column, value });
   }

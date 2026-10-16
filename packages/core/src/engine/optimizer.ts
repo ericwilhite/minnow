@@ -1,5 +1,5 @@
 import { encodeQueryIdentity } from "./query-identity.js";
-import { dateIsoString, dateMilliseconds } from "../date-value.js";
+import { dateIsoString } from "../date-value.js";
 import { crossJoinPlan } from "../plan/model.js";
 import {
   blockHasRowWindow,
@@ -34,7 +34,13 @@ import {
   dateTruncValue,
   integerQuotient,
 } from "./query.js";
-import { concatenatedSqlValue, isSqlDomainValue } from "./sql-domains.js";
+import {
+  concatenatedSqlValue,
+  intervalDomainParts,
+  isDateDomainValue,
+  isSqlDomainValue,
+} from "./sql-domains.js";
+import { datetimeArithmeticValue } from "./sql-datetime-arithmetic.js";
 import { simpleScalarFunctions } from "./sql-functions.js";
 
 /**
@@ -3331,7 +3337,11 @@ function foldExpression(expression: Expression): Expression {
         const domain =
           left.sqlDomain?.kind === "numeric" || right.sqlDomain?.kind === "numeric"
             ? ({ kind: "numeric" } as const)
-            : undefined;
+            : isDateDomainValue(folded)
+              ? ({ kind: "date" } as const)
+              : intervalDomainParts(folded) !== undefined
+                ? ({ kind: "interval" } as const)
+                : undefined;
         return {
           kind: "literal",
           value: folded,
@@ -3500,9 +3510,24 @@ function foldBinary(
     return undefined;
   }
   if (typeof leftValue === "boolean" || typeof rightValue === "boolean") return undefined;
+  if (
+    leftValue instanceof Date ||
+    rightValue instanceof Date ||
+    isSqlDomainValue(leftValue) ||
+    isSqlDomainValue(rightValue)
+  ) {
+    // Date and timestamp arithmetic folds through the executors' own helper; a shape it
+    // refuses stays unfolded and raises the same error at execution.
+    try {
+      const temporal = datetimeArithmeticValue(operator, leftValue, rightValue);
+      return temporal === undefined ? undefined : (temporal as QueryValue);
+    } catch {
+      return undefined;
+    }
+  }
   if (typeof leftValue === "string" || typeof rightValue === "string") return undefined;
-  const left = leftValue instanceof Date ? dateMilliseconds(leftValue) : leftValue;
-  const right = rightValue instanceof Date ? dateMilliseconds(rightValue) : rightValue;
+  const left = leftValue;
+  const right = rightValue;
   if ((operator === "/" || operator === "%") && right === 0) return null;
   if (operator === "/" && integer && typeof left === "number" && typeof right === "number") {
     return integerQuotient(left, right);

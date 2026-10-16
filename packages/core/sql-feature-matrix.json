@@ -343,6 +343,13 @@
       "notes": "DELETE \u2026 USING joins extra sources to the target as PostgreSQL does; a target row matched by several source rows is deleted once."
     },
     {
+      "id": "mutation.delete-any-parameter",
+      "status": "supported",
+      "example": "DELETE FROM keyed WHERE name = ANY($1) RETURNING name",
+      "params": [["y", "absent"]],
+      "notes": "UPDATE and DELETE take = ANY($1) with an array parameter like SELECT does, keyed lookups included."
+    },
+    {
       "id": "mutation.truncate",
       "status": "supported",
       "setup": ["INSERT INTO keyed (name, score) VALUES ('z', 3)"],
@@ -1390,14 +1397,14 @@
       "id": "type.interval",
       "status": "supported",
       "example": "SELECT joined + INTERVAL '1 day' AS next_day FROM rows",
-      "notes": "Preserves separate month, day, and microsecond fields, and a date or datetime accepts + and - INTERVAL. Interval-valued arithmetic is not supported (see type.interval-arithmetic)."
+      "notes": "Preserves separate month, day, and microsecond fields. A date or datetime accepts + and - INTERVAL, and timestamp - timestamp returns one. Arithmetic between intervals is not supported (see type.interval-arithmetic)."
     },
     {
       "id": "type.interval-arithmetic",
       "status": "unsupported",
       "example": "SELECT INTERVAL '1 day' + INTERVAL '2 hours' AS total",
       "error": "Date arithmetic requires a date or datetime value",
-      "notes": "PostgreSQL adds intervals into a combined interval and subtracts timestamps into an interval. Minnow's interval arithmetic only shifts a date or datetime by + or - INTERVAL, so an interval-valued result is refused."
+      "notes": "PostgreSQL adds intervals into a combined interval and scales them by numbers. Minnow produces intervals from timestamp subtraction and applies them to dates and timestamps, but an interval + interval result is refused."
     },
     {
       "id": "ddl.enum",
@@ -1567,16 +1574,22 @@
     },
     {
       "id": "aggregate.ordered-set",
+      "status": "supported",
+      "example": "SELECT region, percentile_cont(0.5) WITHIN GROUP (ORDER BY amount) AS median, percentile_disc(0.5) WITHIN GROUP (ORDER BY amount DESC) AS upper_median, mode() WITHIN GROUP (ORDER BY active) AS usual FROM rows GROUP BY region",
+      "notes": "PERCENTILE_CONT(f) interpolates between the two inputs around position f \u00d7 (n \u2212 1) and returns a double; PERCENTILE_DISC(f) returns the first input at or past fraction f of the sorted group; MODE() returns the most frequent input, a tie going to the one that sorts first. NULL inputs are ignored, an empty group is NULL, and a fraction outside 0..1 is an error. The array-of-fractions forms, FILTER, and hypothetical-set aggregates (rank(x) WITHIN GROUP) are not supported."
+    },
+    {
+      "id": "aggregate.corr",
       "status": "unsupported",
-      "example": "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY amount) AS median FROM rows",
-      "error": "Unsupported function: percentile_cont",
-      "notes": "Ordered-set aggregates (percentile_cont, percentile_disc, mode) and corr are not supported; a window over ROW_NUMBER() and COUNT() OVER () computes a median."
+      "example": "SELECT corr(amount, amount) AS r FROM rows",
+      "error": "Unsupported function: corr",
+      "notes": "The two-argument statistical aggregates (corr, covar_pop, covar_samp, regr_*) are not supported; VAR_POP, VAR_SAMP, STDDEV_POP, and STDDEV_SAMP are."
     },
     {
       "id": "type.array",
       "status": "supported",
       "example": "SELECT ARRAY[1, 2] AS pair",
-      "notes": "Constructors and array columns use canonical JSON text at the JavaScript boundary. One-based scalar subscripts and ARRAY_AGG are supported. Array operators such as concatenation and ANY/ALL remain unsupported."
+      "notes": "Constructors and array columns use canonical JSON text at the JavaScript boundary. One-based scalar subscripts, ARRAY_AGG, and ANY/ALL over an array are supported. Array concatenation and array functions such as array_length are not."
     },
     {
       "id": "type.array-subscript",
@@ -1586,10 +1599,9 @@
     },
     {
       "id": "type.array-any",
-      "status": "unsupported",
-      "example": "SELECT 2 = ANY(ARRAY[1, 2, 3]) AS found",
-      "error": "ANY/ALL take a subquery",
-      "notes": "PostgreSQL's ANY, ALL, and SOME accept an array operand as well as a subquery. Minnow implements only the subquery form, so the array variant is refused at compile time."
+      "status": "supported",
+      "example": "SELECT 2 = ANY(ARRAY[1, 2, 3]) AS found, 5 > ALL(ARRAY[1, 2, 3]) AS above, 'west' <> ALL(ARRAY['east', NULL]) AS unknown",
+      "notes": "expr op ANY (array) and expr op ALL (array), with SOME as ANY's synonym, over an ARRAY constructor or an array-valued column or expression. = ANY is the same test as IN and <> ALL as NOT IN, NULL members included; an empty array is false for ANY and true for ALL, and a NULL array is NULL."
     },
     {
       "id": "array.concat",
@@ -1654,10 +1666,10 @@
     },
     {
       "id": "type.array-any-parameter",
-      "status": "unsupported",
-      "example": "SELECT region FROM rows WHERE amount = ANY(ARRAY[1, 2])",
-      "error": "ANY/ALL take a subquery",
-      "notes": "= ANY(array) is not supported; use IN (\u2026) with a list or a subquery."
+      "status": "supported",
+      "example": "SELECT region, amount FROM rows WHERE amount = ANY($1) ORDER BY amount",
+      "params": [[3, 10]],
+      "notes": "Bind a JavaScript array to one placeholder to pass a whole IN list: = ANY($1), <> ALL($1), or with a typed cast, = ANY($1::int[]). The members bind as literals, so the plan takes every IN fast path (key and index lookups, block pruning, vectorized membership). An array binds only as the operand of ANY or ALL; it must be one-dimensional, and its members are null, boolean, number, string, or Date."
     },
     {
       "id": "ddl.sequence",
@@ -1755,14 +1767,31 @@
       "status": "unsupported",
       "example": "SELECT INTERVAL '1 day' + INTERVAL '2 hours' AS total FROM rows",
       "error": "Date arithmetic requires a date or datetime value",
-      "notes": "Interval-valued arithmetic \u2014 interval + interval, timestamp - timestamp, date - date, date + integer, justify_days \u2014 is not supported. A date or datetime plus or minus an INTERVAL is; subtract two EXTRACT(EPOCH \u2026) readings for a duration in seconds."
+      "notes": "Interval-valued arithmetic between intervals \u2014 interval + interval, interval * number, justify_days \u2014 is not supported. timestamp - timestamp, date - date, date \u00b1 integer, and a date or timestamp \u00b1 an interval are; see expression.timestamp-minus-timestamp."
     },
     {
       "id": "expression.date-minus-date",
-      "status": "unsupported",
-      "example": "SELECT DATE '2026-01-10' - DATE '2026-01-05' AS days FROM rows",
-      "error": "Arithmetic and numeric aggregates require numbers",
-      "notes": "date - date and timestamp - timestamp are not supported; see expression.interval-values."
+      "status": "supported",
+      "example": "SELECT DATE '2026-01-10' - DATE '2026-01-05' AS days, CAST(joined AS DATE) - DATE '2026-01-01' AS since_new_year FROM rows WHERE joined IS NOT NULL",
+      "notes": "date - date is the whole number of days between them, as an integer."
+    },
+    {
+      "id": "expression.date-plus-integer",
+      "status": "supported",
+      "example": "SELECT CAST(joined AS DATE) + 30 AS due, DATE '2024-02-28' + 1 AS leap_day, DATE '2026-03-01' - 1 AS last_of_february FROM rows WHERE joined IS NOT NULL",
+      "notes": "date + integer, integer + date, and date - integer shift a DATE by whole days and return a DATE (YYYY-MM-DD text at the JavaScript boundary). A fractional day count is an error."
+    },
+    {
+      "id": "expression.timestamp-minus-timestamp",
+      "status": "supported",
+      "example": "SELECT EXTRACT(EPOCH FROM joined - TIMESTAMP '2026-01-01') AS seconds, EXTRACT(DAY FROM TIMESTAMP '2026-03-01' - joined) AS days, joined - TIMESTAMP '2026-01-01' > INTERVAL '7 days' AS after_first_week FROM rows WHERE joined IS NOT NULL",
+      "notes": "timestamp - timestamp, and a date minus a timestamp or the reverse, is an INTERVAL of days and microseconds: whole 24-hour days, then the rest, as PostgreSQL's timestamp subtraction produces. The interval compares, extracts, and shifts a timestamp like any other."
+    },
+    {
+      "id": "expression.datetime-plus-interval-value",
+      "status": "supported",
+      "example": "SELECT joined + (TIMESTAMP '2026-01-02 06:00:00' - TIMESTAMP '2026-01-01') AS shifted, CAST(joined AS DATE) + (TIMESTAMP '2026-01-01 12:00:00' - TIMESTAMP '2026-01-01') AS noon FROM rows WHERE joined IS NOT NULL",
+      "notes": "A date or timestamp plus or minus an INTERVAL value (a column, a parameter cast to INTERVAL, or a timestamp difference) returns a timestamp: months first, clamping to the month's last day, then days, then the time part."
     },
     {
       "id": "expression.at-time-zone",
@@ -1841,10 +1870,15 @@
     },
     {
       "id": "function.generate-series",
-      "status": "unsupported",
-      "example": "SELECT n FROM generate_series(1, 3) AS n",
-      "error": "Expected identifier, found 1",
-      "notes": "generate_series is not supported; a recursive CTE produces a series."
+      "status": "supported",
+      "example": "SELECT n FROM generate_series(1, 9, 4) AS n",
+      "notes": "generate_series(start, stop[, step]) in FROM over integers, stepping by 1 by default and down with a negative step; an empty range or a NULL argument yields no rows and a zero step is an error. AS name names the column, and AS t(name) names both. Arguments are constants, placeholders, or uncorrelated subqueries: they cannot refer to other FROM items (no implicit LATERAL), and the function is not allowed in the select list. Numeric (decimal) series are not supported."
+    },
+    {
+      "id": "function.generate-series-timestamps",
+      "status": "supported",
+      "example": "SELECT t FROM generate_series(TIMESTAMP '2026-01-31', TIMESTAMP '2026-04-30', INTERVAL '1 month') AS t",
+      "notes": "With an INTERVAL step the series is timestamps, each the previous plus the step as PostgreSQL computes it, so a monthly series from 31 January clamps to 28 February and stays on the 28th. DATE bounds are read as midnight UTC."
     },
     {
       "id": "function.regexp-arrays",

@@ -139,7 +139,7 @@ import type {
   CompiledStatement,
   QueryResult,
   QueryRow,
-  QueryValue,
+  QueryParameter,
 } from "./query.js";
 import { decodeExecuteResult, decodeQueryResult } from "./result-wire.js";
 import type {
@@ -907,7 +907,7 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
 
   async execute(
     sql: string,
-    params?: readonly QueryValue[],
+    params?: readonly QueryParameter[],
     options: ExecuteOptions = {},
   ): Promise<ExecuteResult> {
     const { signal, onStats, ...wireOptions } = options;
@@ -1674,7 +1674,7 @@ function rpcMayPublish(method: string, args: unknown[]): boolean {
 export interface ClientWriteSession<TSchema extends AnySchema = UntypedSchema> {
   /** Read-your-writes: observes the pre-scope snapshot plus everything staged so far. */
   query(sql: string, options?: QueryOptions): Promise<QueryResult>;
-  execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult>;
+  execute(sql: string, params?: readonly QueryParameter[]): Promise<ExecuteResult>;
   insertBatch<TName extends TableName<TSchema>>(
     tableName: TName,
     input: BatchInsertInput<TSchema, TName>,

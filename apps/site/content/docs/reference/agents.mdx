@@ -232,7 +232,10 @@ machines: https://minnowdb.com/llms.txt
   IN/NOT IN/ANY/ALL and EXISTS/NOT EXISTS at nested expression depth, correlated scalar JSON
   projections with multiple qualified outer-column references and per-probe ordering/limits,
   subquery predicates in UPDATE/DELETE,
-  range-correlated LATERAL, ordered STRING_AGG/JSON_ARRAYAGG, SIMILAR TO, COLLATE, constant
+  range-correlated LATERAL, ordered STRING_AGG/JSON_ARRAYAGG, the ordered-set aggregates
+  PERCENTILE_CONT/PERCENTILE_DISC/MODE `WITHIN GROUP (ORDER BY …)`, `generate_series` over
+  integers and timestamps in FROM, `date - date` (days), `date ± integer`, `timestamp - timestamp`
+  (an interval), SIMILAR TO, COLLATE, constant
   JSON_TABLE, the `->`/`->>` JSON operators (which also accept plain JSON text, and error on
   a non-JSON document), `DISTINCT ON`, `JOIN … USING` and `NATURAL JOIN` with merged join
   columns, `UPDATE … FROM` and `DELETE … USING`, `TRUNCATE`,
@@ -241,17 +244,21 @@ machines: https://minnowdb.com/llms.txt
   truncates, `GROUP BY` a primary key with the row's other columns ungrouped, case-insensitive
   unquoted identifiers, `SET`/`RESET`/`SHOW` session settings (accepted and ignored, except a
   non-UTC time zone), `FOR UPDATE` (ignored), and `E'…'`/`$$…$$` strings.
-- Array values use canonical JSON text. Scalar subscripts, ARRAY_AGG, and typed UNNEST over
-  ARRAY constructors are supported. Numeric RANGE offsets need one numeric ordering expression.
+- Array values use canonical JSON text. Scalar subscripts, ARRAY_AGG, typed UNNEST over
+  ARRAY constructors, and `ANY`/`ALL` over arrays are supported. Pass an IN list as one array
+  parameter — `WHERE id = ANY($1)` with `params: [[1, 2, 3]]`, or `$1::int[]` — rather than
+  building `IN ($1, $2, …)` per length; it binds to the same plan as the IN list. An array binds
+  only under ANY/ALL. Numeric RANGE offsets need one numeric ordering expression.
   FULL JOIN supports grouping, DISTINCT, wildcards, and compound ON in its sole-join form.
 - Unsupported: keyless `UPDATE`/`DELETE`, `GRANT`, `SERIALIZABLE` isolation, `LOCK TABLE`, DDL
   inside `BEGIN … COMMIT`, several statements in one call, range-correlated LATERAL
   grouping/order/limit, correlated JSON_TABLE documents, array slices and multidimensional access,
-  `ANY`/`ALL` over array values, `ARRAY(SELECT …)`, UNNEST outside ARRAY constructor sources,
-  `generate_series`, `||` on array or JSONB operands and the `#>`/`@>`/`?` operators,
+  `ARRAY(SELECT …)`, UNNEST outside ARRAY constructor sources, `generate_series` with
+  arguments from another FROM item or over decimals, `||` on array or JSONB operands and the
+  `#>`/`@>`/`?` operators,
   `jsonb_set`/`jsonb_typeof`/`json_object_agg`, `regexp_match` and the other array-returning
-  regex functions, `ROW(…)` as a value, bit-string literals, interval-valued arithmetic such as
-  interval-plus-interval or timestamp-minus-timestamp, `AT TIME ZONE`, `version()` and other
+  regex functions, `ROW(…)` as a value, bit-string literals, arithmetic between intervals such
+  as interval-plus-interval, `AT TIME ZONE`, `version()` and other
   server introspection, `TABLESAMPLE`, `SET (a, b) = (SELECT …)` in `UPDATE`, `RETURNING` a
   column of an `UPDATE … FROM` or `DELETE … USING` source, data-modifying CTEs, `ALTER TABLE`
   beyond ADD/RENAME/DROP COLUMN (no table rename), `CREATE TABLE … (LIKE …)`,
@@ -259,8 +266,9 @@ machines: https://minnowdb.com/llms.txt
   foreign keys, partial and
   expression indexes, `ON CONFLICT ON CONSTRAINT`, `DROP TABLE a, b`, view column
   lists and materialized views, `setval`, domains, functions, `EXCLUDE` constraints, schemas,
-  schema-qualified names, and `information_schema`, `EXPLAIN`/`VACUUM`/`ANALYZE`, ordered-set
-  aggregates, bitwise operators, `bytea`, enum evolution, sequence options, `RIGHT JOIN` or
+  schema-qualified names, and `information_schema`, `EXPLAIN`/`VACUUM`/`ANALYZE`, `corr` and
+  the other two-argument statistical aggregates, bitwise operators, `bytea`, enum evolution,
+  sequence options, `RIGHT JOIN` or
   `FULL JOIN` beside another join, `RIGHT JOIN` combined with `SELECT *`, temporal interval
   `RANGE` frame offsets, `DISTINCT` window aggregates, windows in WHERE/GROUP BY/HAVING, and
   `ON DELETE SET DEFAULT`. Every rejected form is an `unsupported` row of the feature matrix
