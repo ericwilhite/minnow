@@ -26292,12 +26292,6 @@ function tryKeyToken(type: SimpleDataType, value: BatchValue): string | undefine
   }
 }
 
-/**
- * Whether a table's visible history warrants a background fold: enough level-zero segments to
- * fragment a scan, enough deltas to cost one, or deltas as large as the data they overlay.
- * Partitions compaction itself published (level one and above) are the folded state, not
- * fragmentation, and do not count — a large keyed table is many partitions by design.
- */
 /** The immutable lookup maps one catalog state's queries share. */
 function catalogStateVisibility(state: QueryCatalogState): SegmentVisibilityCatalog {
   const segmentsByTable = new Map<string, SegmentRecord[]>();
@@ -26333,6 +26327,12 @@ function visibleSegmentsMemoKey(tableId: string, version: number | null): string
   return `${tableId}\u0000${String(version ?? -1)}`;
 }
 
+/**
+ * Whether a table's visible history warrants a background fold: enough level-zero segments to
+ * fragment a scan, enough deltas to cost one, or deltas as large as the data they overlay.
+ * Partitions compaction itself published (level one and above) are the folded state, not
+ * fragmentation, and do not count — a large keyed table is many partitions by design.
+ */
 function autoCompactionHint(
   version: number | null,
   segments: readonly SegmentRecord[],
