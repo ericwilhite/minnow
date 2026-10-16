@@ -709,7 +709,11 @@ class BoundedWriteBlockStager {
   #pendingBytes = 0;
   #earlyStageMs = 0;
 
-  constructor(private readonly transaction: DatabaseTransaction) {}
+  constructor(
+    private readonly transaction: DatabaseTransaction,
+    /** Sees each block as it is accepted, so the writer can remember what it just encoded. */
+    private readonly accepted?: (block: BlockWrite) => void,
+  ) {}
 
   get earlyStageMs(): number {
     return this.#earlyStageMs;
@@ -738,6 +742,7 @@ class BoundedWriteBlockStager {
     }
     this.#pending.push(block);
     this.#pendingBytes += block.bytes.byteLength;
+    this.accepted?.(block);
   }
 
   pendingBlocks(): readonly BlockWrite[] {
@@ -1989,6 +1994,11 @@ export interface StatementWriter extends WriteSession {
 interface TransactionStatementWriter extends StatementWriter {
   /** Snapshot-only scalar projection; undefined keeps the ordinary row-shaped fallback. */
   queryFirstColumn(plan: CompiledQuery): Promise<QueryValue[] | undefined>;
+  /**
+   * `updateBatch` for keys the statement's own read of this scope just returned: that read saw
+   * every one of them present, so the separate key-presence probe is skipped.
+   */
+  updateReadKeysBatch(tableName: string, input: UpdateBatchInput): Promise<StagedWriteResult>;
   executeStatement(statement: TransactionalStatement): Promise<ExecuteResult>;
   checkpoint(): Promise<TransactionCheckpoint>;
   checkpointRetainedBytes(): number;
@@ -3520,14 +3530,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const transaction = await this.#transactions.beginDeferred({ durableSnapshot: false });
     this.#transactionAdmissions.set(transaction, admission);
     transaction.limitLevelZeroSegments(table.id, MAX_LEVEL_ZERO_SEGMENTS);
-    const blockStager = new BoundedWriteBlockStager(transaction);
+    const blockStager = new BoundedWriteBlockStager(transaction, this.#rememberWrittenBlock);
     const segmentId = this.#createId();
-    transaction.setUniqueKeyChanges({
-      tableId: table.id,
-      keyTokens: [...keys.keys()],
-      requireAbsent: false,
-      remove: true,
-    });
+    transaction.setUniqueKeyChanges(
+      { tableId: table.id, keyTokens: [...keys.keys()], requireAbsent: false, remove: true },
+      { distinct: true },
+    );
     const secondaryCoverage = buildSecondaryDeleteCoverage(table);
     if (secondaryCoverage.length > 0) {
       await transaction.setFtsChangesSliced({ tableId: table.id, columns: secondaryCoverage });
@@ -3733,7 +3741,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const transaction = await this.#transactions.beginDeferred({ durableSnapshot: false });
     this.#transactionAdmissions.set(transaction, admission);
     transaction.limitLevelZeroSegments(table.id, MAX_LEVEL_ZERO_SEGMENTS);
-    const blockStager = new BoundedWriteBlockStager(transaction);
+    const blockStager = new BoundedWriteBlockStager(transaction, this.#rememberWrittenBlock);
     const segmentId = this.#createId();
     const columnBlockIds: Record<string, string[]> = {};
     let storedBytes = 0;
@@ -4011,7 +4019,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     );
     this.#transactionAdmissions.set(transaction, admission);
     transaction.limitLevelZeroSegments(table.id, MAX_LEVEL_ZERO_SEGMENTS);
-    const blockStager = new BoundedWriteBlockStager(transaction);
+    const blockStager = new BoundedWriteBlockStager(transaction, this.#rememberWrittenBlock);
     let resolvedKeys = keys;
     let segmentId: string | null = null;
     const columnBlockIds: Record<string, string[]> = {};
@@ -8311,6 +8319,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
       }
       this.#catalogStateEpoch = nextEpoch;
+      // The epoch moved for this commit's manifest alone; no table record changed with it unless
+      // the commit created one. What the catalog says, and that no rekey has created the forwards
+      // table, therefore still hold at the next epoch — reading them again costs every keyed write
+      // a scan of the whole catalog and a forwards-table read.
+      if (contribution.transaction.pendingTable === undefined) {
+        const facts = this.#catalogCache;
+        if (facts?.epoch === initial.catalogEpoch) {
+          this.#catalogCache = { epoch: nextEpoch, facts: facts.facts };
+        }
+        if (this.#keyForwardsTableAbsentAt === initial.catalogEpoch) {
+          this.#keyForwardsTableAbsentAt = nextEpoch;
+        }
+      }
     }
     this.#notifyLiveCommit();
     for (const hint of manifest.ftsDeltaCounts ?? []) {
@@ -9032,7 +9053,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
     const segmentId = this.#createId();
     const columnBlockIds: Record<string, string[]> = {};
-    const blockStager = new BoundedWriteBlockStager(transaction);
+    const blockStager = new BoundedWriteBlockStager(transaction, this.#rememberWrittenBlock);
     const plannedColumns = table.columns.map((column) =>
       writeColumnValues(column.type, batch.columns[column.name] ?? []),
     );
@@ -9367,6 +9388,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         open();
         return guarded(() => this.runStatement(statement, { writer }));
       },
+      updateReadKeysBatch: async (tableName, input) => {
+        open();
+        staged += 1;
+        return guarded(() => this.#sessionUpdate(transaction, tableName, input, 1, true));
+      },
       stagedKeyPresence: (table, keyColumn, keys) =>
         this.#scopeKeyPresence(transaction, table, keyColumn, keys),
       checkpoint: async () => {
@@ -9456,6 +9482,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       queryPlan: (plan) => enqueue(() => writer.queryPlan(plan), "read"),
       queryFirstColumn: (plan) => enqueue(() => writer.queryFirstColumn(plan), "read"),
       executeStatement: (statement) => enqueue(() => writer.executeStatement(statement)),
+      updateReadKeysBatch: (name, input) => enqueue(() => writer.updateReadKeysBatch(name, input)),
       checkpoint: () => enqueue(() => writer.checkpoint()),
       stagedKeyPresence: (table, keyColumn, keys) =>
         enqueue(async () => writer.stagedKeyPresence?.(table, keyColumn, keys), "read"),
@@ -10813,11 +10840,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (kind === "insert") await this.#assertInsertKeysAbsent(transaction, table, batch, keys);
     else assertBatchSecondaryTermsDistinct(table, batch);
     if (keys !== undefined) {
-      transaction.setUniqueKeyChanges({
-        tableId: table.id,
-        keyTokens: [...keys.keys()],
-        requireAbsent: kind === "insert",
-      });
+      transaction.setUniqueKeyChanges(
+        { tableId: table.id, keyTokens: [...keys.keys()], requireAbsent: kind === "insert" },
+        { distinct: true },
+      );
     }
     const insertValueAt = (source: "new" | "old", column: string, rowIndex: number): BatchValue =>
       source === "new" ? (batch.columns[column]?.[rowIndex] ?? null) : null;
@@ -10976,8 +11002,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         ),
       this.#scopeKeyLookup(transaction, table, keyColumn),
     );
-    input = applyStoredGeneratedUpdateChanges(table, input, preImages);
-    validateUpdateBatch(table, keyColumn, input);
+    const generatedInput = applyStoredGeneratedUpdateChanges(table, input, preImages);
+    // Only stored generated columns add values to check; without them the batch is unchanged.
+    if (generatedInput !== input) validateUpdateBatch(table, keyColumn, generatedInput);
+    input = generatedInput;
     changedForeignKey = (table.foreignKeys ?? []).some(
       (key) =>
         key.enforced !== false &&
@@ -11129,12 +11157,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (keyStringByteLengths !== undefined) {
       validatedStringByteLengths.set(input.keys, keyStringByteLengths);
     }
-    transaction.setUniqueKeyChanges({
-      tableId: table.id,
-      keyTokens: [...keys.keys()],
-      requireAbsent: false,
-      remove: true,
-    });
+    transaction.setUniqueKeyChanges(
+      { tableId: table.id, keyTokens: [...keys.keys()], requireAbsent: false, remove: true },
+      { distinct: true },
+    );
     const secondaryCoverage = buildSecondaryDeleteCoverage(table);
     if (secondaryCoverage.length > 0) {
       await transaction.setFtsChangesSliced({ tableId: table.id, columns: secondaryCoverage });
@@ -11209,7 +11235,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const columns = [keyColumn, ...changedColumns.map((name) => findColumn(table, name))];
     const segmentId = this.#createId();
     const columnBlockIds: Record<string, string[]> = {};
-    const blockStager = new BoundedWriteBlockStager(transaction);
+    const blockStager = new BoundedWriteBlockStager(transaction, this.#rememberWrittenBlock);
     const plannedColumns = columns.map((column) =>
       writeColumnValues(
         column.type,
@@ -11278,7 +11304,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   ): Promise<string> {
     const segmentId = this.#createId();
     const blockIds: string[] = [];
-    const blockStager = new BoundedWriteBlockStager(transaction);
+    const blockStager = new BoundedWriteBlockStager(transaction, this.#rememberWrittenBlock);
     const plannedColumn = writeColumnValues(keyColumn.type, values);
     const ranges = await writeBlockRangesSliced(
       [plannedColumn],
@@ -13853,7 +13879,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         };
       }
       if (statement.kind === "insert") {
-        const table = await this.#findTable(statement.table);
+        const table = await this.#findTable(statement.table, this.#statementScope(options.writer));
         const viaUpsert = statement.onConflict?.action === "replace";
         if (viaUpsert) {
           const keyColumn = getUniqueKeyColumn(table);
@@ -13971,7 +13997,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               }),
         };
       }
-      const table = await this.#findTable(statement.table);
+      const table = await this.#findTable(statement.table, this.#statementScope(options.writer));
       const keyColumn = getUniqueKeyColumn(table);
       if (keyColumn === undefined) {
         throw new TypeError(
@@ -14177,6 +14203,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           returnedChanges[assignment.column] = executionValues;
         }
       }
+      // Every key came from the read just above, so a scope writer need not probe for them again.
+      const readKeysWriter = (
+        options.writer as
+          | (StatementWriter & Partial<Pick<TransactionStatementWriter, "updateReadKeysBatch">>)
+          | undefined
+      )?.updateReadKeysBatch;
       const updated: {
         updatedRowCount?: number;
         rowCount?: number;
@@ -14185,7 +14217,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       } =
         options.writer === undefined
           ? await this.#erased.updateBatch(table.name, { keys, changes })
-          : await options.writer.updateBatch(table.name, { keys, changes });
+          : readKeysWriter === undefined
+            ? await options.writer.updateBatch(table.name, { keys, changes })
+            : await readKeysWriter(table.name, { keys, changes });
       const returnedRows =
         returningColumns === undefined
           ? undefined
@@ -21397,6 +21431,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   /**
+   * Records the zone description of a block this engine just encoded for a write. The next read
+   * of the table prunes by every segment's zone maps, and fetching a new segment's blocks back
+   * only to read their headers cost every write a block read — an IndexedDB transaction. Block
+   * ids are never reused, so a write that then fails leaves an entry nothing ever asks for.
+   */
+  readonly #rememberWrittenBlock = (block: BlockWrite): void => {
+    this.#cachePut(`zi ${block.id}`, inspectBlock(block.bytes), ZONE_DESCRIPTION_CACHE_BYTES);
+  };
+
+  /**
    * Creates and fully builds a durable secondary index. The catalog's global
    * index-name namespace matches the SQL DDL: a duplicate name is rejected even on another
    * table. The building state makes the operation crash-safe; readers scan until the base and
@@ -24735,6 +24779,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    */
   readonly #scopeTableRecords = new WeakMap<DatabaseTransaction, Map<string, TableRecord>>();
 
+  /**
+   * The write scope a statement's writer belongs to, so the statement and the session paths it
+   * calls resolve its table once between them rather than once each.
+   */
+  #statementScope(writer: StatementWriter | undefined): DatabaseTransaction | undefined {
+    return writer === undefined ? undefined : this.#writerTransactions.get(writer);
+  }
+
   async #findTable(name: string, scope?: DatabaseTransaction): Promise<TableRecord> {
     validateName(name, "Table");
     const cache =
@@ -24748,7 +24800,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           })());
     const cached = cache?.get(name);
     if (cached !== undefined) return cached;
+    // A scope reads at the catalog probe it began with; when the catalog facts are current at
+    // that probe they hold exactly the record a read would return, without a store round trip.
+    const probe = scope?.initialCatalogProbe;
+    const known =
+      probe !== undefined && this.#catalogCache?.epoch === probe.catalogEpoch
+        ? this.#catalogCache.facts.tables.get(name)
+        : undefined;
     const table =
+      known ??
       (await this.store.getTableByName(name)) ??
       (await this.store.getTableByName(await this.#foldTableName(name)));
     if (table === undefined) throw new UnknownTableError(name);

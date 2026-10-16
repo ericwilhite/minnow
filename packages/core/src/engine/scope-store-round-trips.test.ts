@@ -98,6 +98,13 @@ it("carries a table's visible segments across its own commits instead of re-prov
     await db.execute("UPDATE items SET amount = amount + 1 WHERE id = ?", [index]);
   }
   expect(calls.get("hasManifestBlocks") ?? 0).toBe(0);
+  // The keys an UPDATE writes are the ones its own read returned, so no presence probe follows.
+  expect(calls.get("getExistingUniqueKeys") ?? 0).toBe(0);
+  // A data commit leaves the catalog as it was: the table record, the catalog facts, and the
+  // absence of a key-forwards table all carry across it, rather than being read per statement.
+  expect(calls.get("getTableByName") ?? 0).toBe(0);
+  expect(calls.get("listTables") ?? 0).toBe(0);
+  expect(calls.get("getTable") ?? 0).toBe(0);
   expect((await db.query("SELECT SUM(amount) AS total FROM items")).rows).toEqual([{ total: 50 }]);
   await db.close();
 });
