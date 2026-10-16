@@ -648,6 +648,19 @@ export const featureBehaviorProbes: readonly FeatureBehaviorProbe[] = [
     ],
   },
   {
+    featureId: "expression.date-plus-integer",
+    steps: [
+      {
+        kind: "query",
+        sql: "SELECT DATE '2024-02-28' + 1 AS leap_day, DATE '2026-03-01' - 1 AS last_of_february, 30 + DATE '2026-01-01' AS shifted",
+        expected: {
+          columns: ["leap_day", "last_of_february", "shifted"],
+          rows: [["2024-02-29", "2026-02-28", "2026-01-31"]],
+        },
+      },
+    ],
+  },
+  {
     featureId: "expression.modulo",
     steps: [
       {
@@ -1224,6 +1237,58 @@ export const featureBehaviorProbes: readonly FeatureBehaviorProbe[] = [
           ],
           ordered: true,
         },
+      },
+    ],
+  },
+  {
+    featureId: "ddl.alter-table-rename-column",
+    steps: [
+      {
+        kind: "execute",
+        sql: "CREATE TABLE renamed_columns (id INTEGER PRIMARY KEY, old_name TEXT)",
+      },
+      {
+        kind: "mutation",
+        sql: "INSERT INTO renamed_columns VALUES (1, 'kept')",
+        affectedRows: 1,
+        expected: emptyMutationResult,
+      },
+      { kind: "execute", sql: "ALTER TABLE renamed_columns RENAME COLUMN old_name TO new_name" },
+      {
+        kind: "query",
+        sql: "SELECT id, new_name FROM renamed_columns",
+        expected: { columns: ["id", "new_name"], rows: [[1, "kept"]] },
+      },
+      {
+        kind: "error",
+        sql: "SELECT old_name FROM renamed_columns",
+        errorName: "TypeError",
+        includes: "Ambiguous or missing column: old_name",
+      },
+    ],
+  },
+  {
+    featureId: "ddl.add-column-if-not-exists",
+    steps: [
+      { kind: "execute", sql: "CREATE TABLE optional_columns (id INTEGER PRIMARY KEY)" },
+      {
+        kind: "mutation",
+        sql: "INSERT INTO optional_columns VALUES (1)",
+        affectedRows: 1,
+        expected: emptyMutationResult,
+      },
+      {
+        kind: "execute",
+        sql: "ALTER TABLE optional_columns ADD COLUMN IF NOT EXISTS flag BOOLEAN",
+      },
+      {
+        kind: "execute",
+        sql: "ALTER TABLE optional_columns ADD COLUMN IF NOT EXISTS flag BOOLEAN",
+      },
+      {
+        kind: "query",
+        sql: "SELECT id, flag FROM optional_columns",
+        expected: { columns: ["id", "flag"], rows: [[1, null]] },
       },
     ],
   },

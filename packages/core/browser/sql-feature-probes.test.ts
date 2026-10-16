@@ -41,6 +41,7 @@ const expectedFeatureIds = [
   "predicate.match-parameter",
   "function.bm25",
   "subquery.correlated-json-aggregate",
+  "expression.date-plus-integer",
   "expression.modulo",
   "function.numeric-core",
   "function.string-extended",
@@ -77,6 +78,8 @@ const expectedFeatureIds = [
   "ddl.composite-primary-key",
   "ddl.composite-foreign-key",
   "ddl.alter-table-drop-column",
+  "ddl.alter-table-rename-column",
+  "ddl.add-column-if-not-exists",
   "ddl.drop-table",
   "ddl.drop-view",
   "ddl.foreign-key-on-update",
@@ -87,7 +90,7 @@ describe("browser SQL feature behavior probes", () => {
   it("keeps the independently authored feature and step populations fixed", () => {
     expect(featureBehaviorProbes.map(({ featureId }) => featureId)).toEqual(expectedFeatureIds);
     expect(new Set(expectedFeatureIds).size).toBe(expectedFeatureIds.length);
-    expect(featureBehaviorProbes.reduce((total, probe) => total + probe.steps.length, 0)).toBe(148);
+    expect(featureBehaviorProbes.reduce((total, probe) => total + probe.steps.length, 0)).toBe(159);
     expect(
       featureBehaviorProbes
         .flatMap(({ steps }) => steps)
@@ -312,6 +315,7 @@ describe("browser SQL feature behavior probes", () => {
         "TypeError",
         "FOREIGN KEY composite_child_shop_receipt_fkey has no composite_key row with (shop, receipt) (1, 2)",
       ],
+      ["ddl.alter-table-rename-column", "TypeError", "Ambiguous or missing column: old_name"],
     ]);
   });
 });
