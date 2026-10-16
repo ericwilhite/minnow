@@ -2409,6 +2409,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   >();
   /** Zone map ranges of a segment's blocks, per column (see #segmentKeyZones). */
   readonly #segmentZoneCache = new WeakMap<SegmentRecord, Map<string, Float64Array>>();
+  /** Block descriptions of a segment's column, in block order (see #zonePrunedStreamSegments). */
+  readonly #segmentDescriptionCache = new WeakMap<
+    SegmentRecord,
+    Map<string, Array<ReturnType<typeof inspectBlock>>>
+  >();
   /** Per-snapshot postings reads: statistics and pruning share one result per (column, terms). */
   readonly #ftsCandidatesMemo = new WeakMap<Snapshot, Map<string, Promise<FtsCandidatesResult>>>();
   #sharedLease: SharedLeaseEntry | undefined;
@@ -14843,32 +14848,47 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       keyColumn === undefined
         ? []
         : predicates.filter((predicate) => predicate.column.id === keyColumn.id);
-    const predicateBlockIds = [
-      ...new Set([
-        ...appends.flatMap((segment) =>
-          predicateColumns.flatMap((column) => segment.columnBlockIds[column.id] ?? []),
-        ),
-        // A mutation never changes the unique key it carries. Its key block can therefore
-        // prove that the whole delta cannot affect a key-range query, before the replay loads
-        // any patched columns. The descriptions are header-only and stay in the byte-bounded
-        // cache, so a long point-update history costs one new header per commit rather than a
-        // replay of every old patch on every following statement.
-        ...(keyColumn === undefined || keyPredicates.length === 0
-          ? []
-          : mutations.flatMap((segment) => segment.columnBlockIds[keyColumn.id] ?? [])),
-      ]),
+    const describedColumns: Array<readonly [SegmentRecord, string]> = [
+      ...appends.flatMap((segment) =>
+        predicateColumns.map((column) => [segment, column.id] as const),
+      ),
+      // A mutation never changes the unique key it carries. Its key block can therefore
+      // prove that the whole delta cannot affect a key-range query, before the replay loads
+      // any patched columns. The descriptions are header-only and stay in the byte-bounded
+      // cache, so a long point-update history costs one new header per commit rather than a
+      // replay of every old patch on every following statement.
+      ...(keyColumn === undefined || keyPredicates.length === 0
+        ? []
+        : mutations.map((segment) => [segment, keyColumn.id] as const)),
     ];
     // Block descriptions are immutable per id, like decoded blocks, so a repeated pruned
-    // query pays zero store reads for elimination once its descriptions are resident.
-    const missingIds = predicateBlockIds.filter((id) => {
-      const cached = this.#cacheGet(`zi ${id}`) as ReturnType<typeof inspectBlock> | undefined;
-      if (cached === undefined) return true;
-      descriptions.set(id, cached);
-      return false;
-    });
-    for (let start = 0; start < missingIds.length; start += 16) {
+    // query pays zero store reads for elimination once its descriptions are resident. The ones
+    // a segment's column already resolved stay on the segment record: a long delta history
+    // otherwise builds and hashes a buffer-pool key per block on every statement.
+    const missingIds = new Set<string>();
+    const undescribed: Array<readonly [SegmentRecord, string]> = [];
+    for (const [segment, columnId] of describedColumns) {
+      const ids = segment.columnBlockIds[columnId] ?? [];
+      const known = this.#segmentDescriptionCache.get(segment)?.get(columnId);
+      if (known !== undefined) {
+        for (const [index, id] of ids.entries()) {
+          const description = known[index];
+          if (description !== undefined) descriptions.set(id, description);
+        }
+        continue;
+      }
+      undescribed.push([segment, columnId]);
+      for (const id of ids) {
+        if (descriptions.has(id)) continue;
+        const cached = this.#cacheGet(`zi ${id}`) as ReturnType<typeof inspectBlock> | undefined;
+        if (cached === undefined) missingIds.add(id);
+        else descriptions.set(id, cached);
+      }
+    }
+    const missing = [...missingIds];
+    for (let start = 0; start < missing.length; start += 16) {
       await this.#renewInternalLeaseIfNeeded(snapshot);
-      const ids = missingIds.slice(start, start + 16);
+      const ids = missing.slice(start, start + 16);
       const blocks = await this.#getSnapshotBlocksWindowed(snapshot, ids);
       for (let index = 0; index < ids.length; index += 1) {
         const id = ids[index] ?? "";
@@ -14881,6 +14901,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         descriptions.set(id, description);
         this.#cachePut(`zi ${id}`, description, ZONE_DESCRIPTION_CACHE_BYTES);
       }
+    }
+    for (const [segment, columnId] of undescribed) {
+      const resolved = (segment.columnBlockIds[columnId] ?? []).map((id) => descriptions.get(id));
+      if (resolved.some((description) => description === undefined)) continue;
+      let byColumn = this.#segmentDescriptionCache.get(segment);
+      if (byColumn === undefined) {
+        byColumn = new Map();
+        this.#segmentDescriptionCache.set(segment, byColumn);
+      }
+      byColumn.set(columnId, resolved as Array<ReturnType<typeof inspectBlock>>);
     }
     const prunedSegments: SegmentRecord[] = [];
     for (const segment of segments) {
