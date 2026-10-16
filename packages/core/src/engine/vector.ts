@@ -897,20 +897,36 @@ export function vectorValue(vector: ColumnVector, rowIndex: number): QueryValue 
   return code === NULL_STRING_CODE ? null : (vector.dictionary[code] ?? null);
 }
 
+/**
+ * Each immutable vector's payload size, measured once: a pooled build side or a resident table
+ * re-enters every query, and summing a large string dictionary per query was a visible share of
+ * a small join's cost. Windowed vectors change their residency in place and are never memoized.
+ */
+const vectorPayloadBytes = new WeakMap<ColumnVector, number>();
+
+function columnVectorPayloadSize(vector: ColumnVector): number {
+  const memoize = vector.window === undefined;
+  const cached = memoize ? vectorPayloadBytes.get(vector) : undefined;
+  if (cached !== undefined) return cached;
+  let total = vector.validity.byteLength;
+  if (vector.kind === "string") {
+    total = safeMemorySum(total, vector.codes.byteLength, "Column vector payload");
+    // One byte per UTF-16 code unit, matching queryValuePayloadBytes: exact for Latin-1
+    // and O(1) per entry instead of a throwaway UTF-8 encode of the whole dictionary.
+    for (const value of vector.dictionary) {
+      total = safeMemorySum(total, value.length, "String dictionary payload");
+    }
+  } else {
+    total = safeMemorySum(total, vector.values.byteLength, "Column vector payload");
+  }
+  if (memoize) vectorPayloadBytes.set(vector, total);
+  return total;
+}
+
 function columnarTablePayloadBytes(table: ColumnarTable): number {
   let total = table.scanOrder?.byteLength ?? 0;
   for (const vector of table.columns.values()) {
-    total = safeMemorySum(total, vector.validity.byteLength, "Column vector payload");
-    if (vector.kind === "string") {
-      total = safeMemorySum(total, vector.codes.byteLength, "Column vector payload");
-      // One byte per UTF-16 code unit, matching queryValuePayloadBytes: exact for Latin-1
-      // and O(1) per entry instead of a throwaway UTF-8 encode of the whole dictionary.
-      for (const value of vector.dictionary) {
-        total = safeMemorySum(total, value.length, "String dictionary payload");
-      }
-    } else {
-      total = safeMemorySum(total, vector.values.byteLength, "Column vector payload");
-    }
+    total = safeMemorySum(total, columnVectorPayloadSize(vector), "Column vector payload");
   }
   return total;
 }
@@ -2247,11 +2263,58 @@ function createJoinLookup(
   };
 }
 
+/**
+ * Direct key-to-row tables per immutable key vector. A build side materialized from pooled
+ * blocks is the same vector on every execution, and rebuilding its table was most of a small
+ * keyed join. Null marks a vector that cannot take one. The table is charged to each query
+ * that uses it, exactly as when it was built per query.
+ */
+const directLookupTables = new WeakMap<
+  ColumnVector,
+  { readonly minimum: number; readonly rowByKey: Int32Array } | null
+>();
+
 function createDirectLookup(
   vector: ColumnVector,
   memory: QueryMemoryContext,
 ): JoinLookup | undefined {
   if (vector.kind !== "number") return undefined;
+  const memoize = vector.window === undefined;
+  const cached = memoize ? directLookupTables.get(vector) : undefined;
+  if (cached === null) return undefined;
+  if (cached !== undefined) {
+    memory.reserve(
+      safeMemoryProduct(cached.rowByKey.length, Int32Array.BYTES_PER_ELEMENT, "Direct join lookup"),
+      "Direct join lookup",
+    );
+    return directLookup(cached.minimum, cached.rowByKey);
+  }
+  const built = buildDirectLookup(vector, memory);
+  if (memoize) directLookupTables.set(vector, built ?? null);
+  return built === undefined
+    ? undefined
+    : built.rowByKey.length === 0
+      ? { unique: true, firstRow: () => -1, nextRow: () => -1 }
+      : directLookup(built.minimum, built.rowByKey);
+}
+
+function directLookup(minimum: number, rowByKey: Int32Array): JoinLookup {
+  return {
+    unique: true,
+    firstRow(key) {
+      if (typeof key !== "number" || !Number.isSafeInteger(key)) return -1;
+      const slot = key - minimum;
+      return slot < 0 || slot >= rowByKey.length ? -1 : (rowByKey[slot] ?? -1);
+    },
+    nextRow: () => -1,
+  };
+}
+
+/** The dense key-to-row table of a unique safe-integer key vector, or undefined. */
+function buildDirectLookup(
+  vector: NumberVector,
+  memory: QueryMemoryContext,
+): { minimum: number; rowByKey: Int32Array } | undefined {
   let minimum = Number.POSITIVE_INFINITY;
   let maximum = Number.NEGATIVE_INFINITY;
   for (let index = 0; index < vector.length; index += 1) {
@@ -2261,9 +2324,7 @@ function createDirectLookup(
     minimum = Math.min(minimum, value);
     maximum = Math.max(maximum, value);
   }
-  if (!Number.isFinite(minimum)) {
-    return { unique: true, firstRow: () => -1, nextRow: () => -1 };
-  }
+  if (!Number.isFinite(minimum)) return { minimum: 0, rowByKey: new Int32Array(0) };
   const range = maximum - minimum + 1;
   if (range > Math.max(1_024, vector.length * 4) || range > 10_000_000) return undefined;
   const reservation = memory.reserve(
@@ -2281,15 +2342,7 @@ function createDirectLookup(
     }
     rowByKey[slot] = index;
   }
-  return {
-    unique: true,
-    firstRow(key) {
-      if (typeof key !== "number" || !Number.isSafeInteger(key)) return -1;
-      const slot = key - minimum;
-      return slot < 0 || slot >= rowByKey.length ? -1 : (rowByKey[slot] ?? -1);
-    },
-    nextRow: () => -1,
-  };
+  return { minimum, rowByKey };
 }
 
 interface ScanResultSink {
@@ -2308,6 +2361,8 @@ function runScanBatch(
   groups: GroupAccumulator,
   output: ScanResultSink,
   memory: QueryMemoryContext,
+  /** Scan positions to visit instead of `start`..`start + length` (`length` of them from `start`). */
+  rows?: readonly number[],
 ): boolean {
   const batchMemory = memory.createChild();
   try {
@@ -2324,7 +2379,8 @@ function runScanBatch(
     if (scan === undefined) return false;
     const order = plan.sourceTables[plan.scanSource]?.scanOrder;
     for (let index = 0; index < length; index += 1) {
-      scan[index] = order?.[start + index] ?? start + index;
+      const position = rows === undefined ? start + index : (rows[start + index] ?? 0);
+      scan[index] = order?.[position] ?? position;
     }
     const batch: BatchRows = { length, rowsBySource: sourceRows, memory: batchMemory };
     return consumeJoinedBatches(plan, batch, 0, groups, output, memory);
@@ -2451,18 +2507,20 @@ async function scanSelectedRows(
       typeof residentEnd === "number" && residentEnd > first
         ? Math.min(residentEnd, scanRows)
         : first + 1;
+    // Every selected row of the resident window runs in one batch of exactly those rows: a
+    // scattered selection used to cost a batch — a child memory context and a row-index array
+    // per source — for every row it named.
     while (index < selection.length) {
-      const begin = selection[index] ?? 0;
-      if (begin >= windowEnd) break;
-      let end = begin + 1;
-      index += 1;
-      while (index < selection.length) {
-        const next = selection[index] ?? 0;
-        if (next !== end || next >= windowEnd || next >= begin + DEFAULT_BATCH_ROWS) break;
-        end = next + 1;
+      const from = index;
+      while (
+        index < selection.length &&
+        (selection[index] ?? 0) < windowEnd &&
+        index - from < DEFAULT_BATCH_ROWS
+      ) {
         index += 1;
       }
-      if (runScanBatch(plan, begin, end - begin, groups, output, memory)) return;
+      if (index === from) break;
+      if (runScanBatch(plan, from, index - from, groups, output, memory, selection)) return;
     }
   }
 }

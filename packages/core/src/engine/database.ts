@@ -23435,9 +23435,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               rowPositions !== undefined &&
               (segment.kind === "insert" || segment.kind === "base")
             ) {
-              positions.sort((a, b) => a - b);
               const keptRows = rowCounts.reduce((total, count) => total + count, 0);
-              for (const position of positions) {
+              for (const position of Uint32Array.from(positions).sort()) {
                 rowPositions.push(selectedRowStart + keptRows + position);
               }
             }
