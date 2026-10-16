@@ -16,7 +16,7 @@ interface MatrixFeature {
   status: "supported" | "unsupported";
   example: string;
   setup?: string[];
-  params?: Array<string | number | boolean | null>;
+  params?: Array<string | number | boolean | null | Array<string | number | boolean | null>>;
   notes?: string;
 }
 

@@ -163,6 +163,10 @@ const removed = await db
 // Array<{ order_id: number }>
 ```
 
+`eb.fn.any(eb.val([1, 2, 3]))` binds a whole list to one placeholder (`= any($1)`), so the
+statement text stays the same whatever the list's length, and it runs exactly as the equivalent
+`IN` list does.
+
 The adapter compiles these builders to ordinary PostgreSQL SQL for Minnow's shared planner.
 Kysely has no first-class `ALL (subquery)` builder or correlated `selectNoFrom` on an
 expression builder. Those
@@ -471,8 +475,9 @@ Minnow uses PostgreSQL-style SQL, but it is an embedded database rather than a P
 - `mergeInto(...).returning(...)` is rejected with an explicit error before execution: Minnow's
   `MERGE` reports an affected-row count but returns no rows, and silently yielding `[]` would
   hide that. `MERGE` without `RETURNING` executes normally.
-- Parameters must be `boolean`, `number`, `string`, `Date`, or `null`; BigInt, byte arrays, and
-  driver-native PostgreSQL objects have no Minnow parameter representation. Exact decimals accept
+- Parameters must be `boolean`, `number`, `string`, `Date`, or `null`, or a one-dimensional
+  array of those as the operand of `ANY`/`ALL`; BigInt, byte arrays, and driver-native PostgreSQL
+  objects have no Minnow parameter representation. Exact decimals accept
   numbers or strings as inputs and return lossless strings by default. JSON/JSONB also return
   strings by default; opt into native number/JSON results with `resultDecoding`. UUID, arrays,
   `DATE`, `TIME`, intervals, and enums cross this adapter as strings.

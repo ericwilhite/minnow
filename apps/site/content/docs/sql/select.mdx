@@ -23,7 +23,18 @@ LIMIT 50
 ```
 
 `WHERE` supports comparison, `BETWEEN`, `IN`, `LIKE`, `ILIKE`, `SIMILAR TO`, `IS NULL`,
-`AND` / `OR` / `NOT`, and `CASE`. Filters on columns with recorded value ranges can skip whole groups of rows without decoding
+`AND` / `OR` / `NOT`, and `CASE`. `x = ANY(array)` is `x IN (…)` over an array's members and
+`x <> ALL(array)` is `NOT IN`; the array is an `ARRAY[…]` constructor, an array column, or one
+bound parameter holding the whole list (see [parameters](/docs/sql#parameters)):
+
+```sql
+SELECT order_id, status
+FROM orders
+WHERE status = ANY(ARRAY['returned', 'cancelled'])
+  AND store_id <> ALL(ARRAY[1, 2])
+```
+
+Filters on columns with recorded value ranges can skip whole groups of rows without decoding
 them — see [Query plans](/docs/sql/plans).
 
 A string constant beside a typed value reads in that value's type, the way PostgreSQL types an
@@ -170,8 +181,8 @@ ORDER BY revenue DESC
 ```
 
 `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `STRING_AGG`, `JSON_ARRAYAGG`, the statistical spreads
-(`VARIANCE`, `STDDEV`, and their `_POP` / `_SAMP` forms), and per-aggregate `DISTINCT` are
-available.
+(`VARIANCE`, `STDDEV`, and their `_POP` / `_SAMP` forms), the ordered-set aggregates
+(`PERCENTILE_CONT`, `PERCENTILE_DISC`, `MODE`), and per-aggregate `DISTINCT` are available.
 The numeric and counting aggregates accept `FILTER (WHERE …)` for conditional aggregation.
 `JSON_ARRAYAGG(value ORDER BY expression)` returns JSON text, keeps SQL nulls as JSON nulls by
 default, and returns SQL `NULL` for an empty input. Its `ORDER BY` list follows the same direction
@@ -251,6 +262,27 @@ but unlike `JSON_VALUE`'s quiet `NULL`, a document that is not JSON at all is an
 `STRING_AGG(value, delimiter ORDER BY expression)` skips NULL values, supports `DISTINCT`, and
 spills under the same query-memory bound as other grouped aggregates.
 
+The ordered-set aggregates take their input from `WITHIN GROUP (ORDER BY …)` — a median, a
+percentile, or the most common value per group:
+
+```sql
+SELECT p.category,
+       PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY i.line_total) AS median_line,
+       PERCENTILE_DISC(0.9) WITHIN GROUP (ORDER BY i.line_total) AS p90_line,
+       MODE() WITHIN GROUP (ORDER BY i.quantity) AS usual_quantity
+FROM order_items i
+JOIN products p ON p.product_id = i.product_id
+GROUP BY p.category
+ORDER BY median_line DESC
+```
+
+`PERCENTILE_CONT(f)` interpolates between the two values around fraction `f` of the sorted
+group and returns a double; `PERCENTILE_DISC(f)` returns the first actual value at or past `f`;
+`MODE()` returns the most frequent value, a tie going to the one that sorts first. `DESC` in the
+`ORDER BY` reverses which end `f` counts from. NULL inputs are skipped, an empty group is `NULL`,
+and `f` must lie between 0 and 1. Each group holds its sorted input in memory, under the query's
+memory budget; the array-of-fractions forms and `FILTER` are not supported.
+
 `DISTINCT` is per aggregate, not per query: each one keeps its own set of values, so a select can
 carry several of them beside ordinary aggregates, inside expressions, and in `HAVING` —
 `COUNT(DISTINCT r.return_id) / COUNT(DISTINCT i.order_item_id)` counts two different things.
@@ -323,7 +355,7 @@ FROM monthly
 ORDER BY month
 ```
 
-`WITH RECURSIVE` is supported too, for hierarchies and generated series:
+`WITH RECURSIVE` is supported too, for hierarchies and generated sequences:
 
 ```sql
 WITH RECURSIVE months(month) AS (
@@ -342,6 +374,26 @@ or subtracted from either does calendar arithmetic, so 31 January plus a month i
 February. `DATE ± INTERVAL` always returns a timestamp, including whole-day and zero intervals.
 `EXTRACT` reads fractional seconds from timestamps and reads the stored fields of `TIME` and
 `INTERVAL` without converting them to dates.
+
+Dates and timestamps do PostgreSQL's arithmetic: `date - date` is a whole number of days,
+`date + 7` and `date - 7` shift a `DATE` by days, and `timestamp - timestamp` is an `INTERVAL` of
+days and time that compares, extracts, and shifts another timestamp. For a plain series of
+numbers or timestamps, `generate_series` in `FROM` is shorter than a recursive CTE and produces
+its rows in one pass — here, every day of a month with that day's order count, zero included:
+
+```sql
+SELECT day, COUNT(o.order_id) AS orders,
+       EXTRACT(EPOCH FROM MAX(o.placed_at) - MIN(o.placed_at)) / 3600 AS busy_hours
+FROM generate_series(TIMESTAMP '2025-03-01', TIMESTAMP '2025-03-31', INTERVAL '1 day') AS day
+LEFT JOIN orders o ON DATE_TRUNC('day', o.placed_at) = day
+GROUP BY day
+ORDER BY day
+```
+
+`generate_series(start, stop[, step])` counts integers by 1 unless a step is given, downward with a
+negative one, and walks timestamps by an `INTERVAL` step. `AS name` names its column. Its
+arguments are constants, parameters, or uncorrelated subqueries — not columns of another `FROM`
+item.
 
 ## Window functions
 

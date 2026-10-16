@@ -263,6 +263,7 @@ import {
   compileQuery,
   hasAggregate,
   createRecursiveCteState,
+  generateSeriesRows,
   annotateAvgArgumentScales,
   compileStatement,
   comparisonHolds,
@@ -304,6 +305,7 @@ import {
   windowOutputType,
   type ComparisonOperator,
   type PredicateOperator,
+  parseQuantified,
   type CompiledQuery,
   type CompiledStatement,
   type ReturningItem,
@@ -312,6 +314,7 @@ import {
   type PreparedQuery,
   type QueryResult,
   type QueryRow,
+  type QueryParameter,
   type QueryValue,
   type SqlColumnSchema,
   volatileScalarFunctionNames,
@@ -1111,7 +1114,7 @@ export interface WriteSession<TSchema extends AnySchema = UntypedSchema> {
    */
   query(sql: string, options?: QueryOptions): Promise<QueryResult>;
   /** Runs a SELECT, INSERT, UPDATE, or DELETE inside this write scope. */
-  execute(sql: string, params?: readonly QueryValue[]): Promise<ExecuteResult>;
+  execute(sql: string, params?: readonly QueryParameter[]): Promise<ExecuteResult>;
   insertBatch<TName extends TableName<TSchema>>(
     tableName: TName,
     input: BatchInsertInput<TSchema, TName>,
@@ -4851,6 +4854,26 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           signal,
         );
         typedSchemas.set(reference, schema);
+        // GENERATE_SERIES: the base row holds the evaluated start, stop, and step, so the rows
+        // come from one loop rather than one step-block execution per row.
+        const series = source.recursive.series;
+        if (series !== undefined) {
+          const generated = generateSeriesRows(series, baseResult.rows, baseResult.columns);
+          typedSchemas.set(source.table, schema);
+          inputs.set(
+            source.table,
+            derivedColumnarTable(
+              source.table,
+              {
+                columns: [...baseResult.columns],
+                columnDomains: schema.map(({ sqlDomain }) => sqlDomain ?? null),
+                rows: generated,
+              },
+              schema,
+            ),
+          );
+          continue;
+        }
         const state = createRecursiveCteState(baseResult, all);
         while (state.frontier.length > 0) {
           throwIfAborted(signal);
@@ -11969,7 +11992,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    */
   async execute(
     sql: string,
-    params?: readonly QueryValue[],
+    params?: readonly QueryParameter[],
     options: ExecuteOptions = {},
   ): Promise<ExecuteResult> {
     if (this.#closed) throw new DatabaseClosedError();
@@ -11992,7 +12015,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
 
   async #executeSerial(
     sql: string,
-    params: readonly QueryValue[] | undefined,
+    params: readonly QueryParameter[] | undefined,
     options: ExecuteOptions,
   ): Promise<ExecuteResult> {
     if (this.#closed) throw new DatabaseClosedError();
@@ -25966,6 +25989,10 @@ function normalizePlanDomainLiterals(
         }
       }
     };
+    // `x op ANY(array)` compares x with the array's members, not the array: its members are
+    // read at execution, so there is no operand pair to type here.
+    const arrayQuantified = (operator: PredicateOperator, right: Expression): boolean =>
+      parseQuantified(operator) !== undefined && right.kind !== "list" && right.kind !== "subquery";
     const rewrite = (expression: Expression): Expression => {
       if (expression.kind === "binary") {
         expression.left = rewrite(expression.left);
@@ -25977,8 +26004,10 @@ function normalizePlanDomainLiterals(
       } else if (expression.kind === "condition") {
         expression.left = rewrite(expression.left);
         expression.right = rewrite(expression.right);
-        coercePair(expression.left, expression.right);
-        coercePair(expression.right, expression.left);
+        if (!arrayQuantified(expression.operator, expression.right)) {
+          coercePair(expression.left, expression.right);
+          coercePair(expression.right, expression.left);
+        }
       } else if (expression.kind === "logical") {
         expression.left = rewrite(expression.left);
         expression.right = rewrite(expression.right);
@@ -26013,8 +26042,10 @@ function normalizePlanDomainLiterals(
     for (const predicate of [...block.predicates, ...block.having]) {
       predicate.left = rewrite(predicate.left);
       predicate.right = rewrite(predicate.right);
-      coercePair(predicate.left, predicate.right);
-      coercePair(predicate.right, predicate.left);
+      if (!arrayQuantified(predicate.operator, predicate.right)) {
+        coercePair(predicate.left, predicate.right);
+        coercePair(predicate.right, predicate.left);
+      }
     }
     block.groupBy = block.groupBy.map(rewrite);
     for (const order of block.orderBy) order.expression = rewrite(order.expression);
@@ -30237,12 +30268,18 @@ function maximumWriteBlockStoredBytes(
   );
 }
 
-function cacheableQueryInput(sql: string, params: readonly QueryValue[]): boolean {
+function cacheableQueryInput(sql: string, params: readonly QueryParameter[]): boolean {
   let characters = sql.length;
   if (characters > MAX_CACHEABLE_TEXT_CHARACTERS) return false;
   for (const value of params) {
-    if (typeof value !== "string") continue;
-    characters += value.length;
+    if (Array.isArray(value)) {
+      // Every member is part of the key, so a long ANY list costs key text like a long string.
+      for (const member of value as readonly QueryValue[]) {
+        characters += typeof member === "string" ? member.length : 16;
+      }
+    } else if (typeof value === "string") {
+      characters += value.length;
+    }
     if (characters > MAX_CACHEABLE_TEXT_CHARACTERS) return false;
   }
   return true;

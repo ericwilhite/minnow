@@ -151,7 +151,8 @@ Notable supporting exports:
   `pagehide`.
 - `QueryOptions` and `QueryCursorOptions` — including execution memory, spill, batch, abort, and
   execution-stat callback configuration;
-  `QueryResult` / `QueryRow` / `QueryValue` for results. `QueryResult.columnDomains` is aligned
+  `QueryResult` / `QueryRow` / `QueryValue` for results, and `QueryParameter` for bound values
+  (a `QueryValue`, or an array of them for `= ANY($n)`). `QueryResult.columnDomains` is aligned
   with `columns` and exposes each `SqlDomain` (or `null` for an ordinary primitive), including
   aliased JSON constructors. Mutation results with `RETURNING` carry the equivalent aligned
   `returnedColumns` and `returnedColumnDomains`; `WriteMetrics` appears on every batch result.
@@ -239,13 +240,13 @@ Tools for building a typed layer over the engine. They are the same plan-buildin
 checks used by the SQL parser, so a hand-built plan is checked just like parsed SQL. See
 [Extending Minnow](/docs/reference/extending#building-plans-directly).
 
-| Export                                                                                    | Description                                             |
-| ----------------------------------------------------------------------------------------- | ------------------------------------------------------- |
-| `assembleSelectBlock, compoundSelectBlock, derivedTableSource`                            | Assemble one select block, a set operation, a subquery. |
-| `splitCondition, validateLimit, validateOffset, validateFtsQuery, hasAggregate`           | Checks and helpers used by the parser.                  |
-| `optimizePlan, renderPlan`                                                                | Optimize a plan; render one for display.                |
-| `CompiledQuery, Expression, JoinPlan, Predicate, SelectItem, SetOperator, TableSource`    | Plan types.                                             |
-| `AggregateName, PredicateOperator, WindowFunctionName, QueryValue, QueryRow, QueryResult` | Supporting types.                                       |
+| Export                                                                                                    | Description                                             |
+| --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
+| `assembleSelectBlock, compoundSelectBlock, derivedTableSource`                                            | Assemble one select block, a set operation, a subquery. |
+| `splitCondition, validateLimit, validateOffset, validateFtsQuery, hasAggregate`                           | Checks and helpers used by the parser.                  |
+| `optimizePlan, renderPlan`                                                                                | Optimize a plan; render one for display.                |
+| `CompiledQuery, Expression, JoinPlan, Predicate, SelectItem, SetOperator, TableSource`                    | Plan types.                                             |
+| `AggregateName, PredicateOperator, WindowFunctionName, QueryValue, QueryParameter, QueryRow, QueryResult` | Supporting types.                                       |
 
 ## `@minnowdb/kysely`
 

@@ -38,6 +38,7 @@ import {
   foldIdentifierCase,
   executeRowQuery,
   transparentProjectionSource,
+  type QueryParameter,
   type QueryResult,
   type QueryValue,
 } from "./query.js";
@@ -126,7 +127,7 @@ async function minnowFixture(fixture: readonly FixtureRow[]): Promise<MinnowData
  * The row executor has no catalog, so it receives what catalog binding would have added: the
  * integer-division marks that `data.id` (an INTEGER on every engine) implies.
  */
-function catalogBoundPlan(sql: string, params: QueryValue[] | undefined, optimize = true) {
+function catalogBoundPlan(sql: string, params: CaseParameter[] | undefined, optimize = true) {
   let plan = compileQuery(sql, optimize ? {} : { optimize: false });
   plan = foldIdentifierCase(plan, catalogColumnNames);
   annotatePlanIntegerDivision(plan, (table) => (table === "data" ? new Set(["id"]) : undefined));
@@ -177,9 +178,12 @@ function sqliteFixture(fixture: readonly FixtureRow[]): DatabaseSync {
 
 type OracleName = "sqlite" | "pglite";
 
+/** A bound value: a scalar, or an array for a placeholder used as `= ANY($n)`. */
+type CaseParameter = QueryParameter;
+
 interface Case {
   sql: string;
-  params?: QueryValue[];
+  params?: CaseParameter[];
   /** Compare row order exactly; requires an ORDER BY ending in a unique key. */
   ordered: boolean;
   /** Oracles to skip, each for a documented semantic or dialect divergence. */
@@ -1316,6 +1320,251 @@ function jsonSpellingCases(): Case[] {
   ];
 }
 
+/**
+ * PostgreSQL date and timestamp arithmetic: date - date is whole days, date ± integer is a date,
+ * and a timestamp difference is an interval a timestamp can be shifted by again. Intervals render
+ * differently on each engine, so they are compared through EXTRACT and comparisons; DATE values
+ * compare as YYYY-MM-DD text (the oracle's DATE parser keeps PostgreSQL's text). SQLite spells
+ * all of these with julianday() and strftime(), so it sits these out.
+ */
+function dateArithmeticCases(): Case[] {
+  const pg = (sql: string, params?: CaseParameter[]): Case => ({
+    sql,
+    ordered: true,
+    skip: ["sqlite"],
+    ...(params === undefined ? {} : { params }),
+  });
+  return [
+    pg(
+      `SELECT id, CAST(joined AS DATE) - DATE '2026-01-01' AS days, DATE '2026-03-01' - CAST(joined AS DATE) AS until, CAST(joined AS DATE) - CAST(joined AS DATE) AS zero FROM data WHERE joined IS NOT NULL ORDER BY id`,
+    ),
+    pg(
+      `SELECT id, CAST(joined AS DATE) + id AS later, CAST(joined AS DATE) - 30 AS earlier, 7 + CAST(joined AS DATE) AS week, CAST(joined AS DATE) - -2 AS minus_negative FROM data WHERE joined IS NOT NULL ORDER BY id`,
+    ),
+    pg(
+      `SELECT id, DATE '2024-02-28' + 1 AS leap, DATE '2026-01-01' - 1 AS eve FROM data ORDER BY id`,
+    ),
+    pg(
+      `SELECT id FROM data WHERE CAST(joined AS DATE) + 10 > DATE '2026-01-10' AND CAST(joined AS DATE) - DATE '2025-12-01' < 90 ORDER BY id`,
+    ),
+    pg(
+      `SELECT id, CAST(joined AS DATE) - CAST(? AS DATE) AS since, CAST(joined AS DATE) + CAST(? AS INTEGER) AS shifted FROM data WHERE joined IS NOT NULL ORDER BY id`,
+      ["2026-01-01", 3],
+    ),
+    pg(
+      `SELECT id, EXTRACT(EPOCH FROM joined - TIMESTAMP '2026-01-01') AS seconds, EXTRACT(DAY FROM TIMESTAMP '2026-04-01' - joined) AS days, EXTRACT(HOUR FROM TIMESTAMP '2026-04-01' - joined) AS hours, EXTRACT(MINUTE FROM joined - TIMESTAMP '2027-01-01') AS minutes FROM data WHERE joined IS NOT NULL ORDER BY id`,
+    ),
+    pg(
+      `SELECT id, joined - TIMESTAMP '2026-01-01' > INTERVAL '10 days' AS later, joined - TIMESTAMP '2026-01-01' < INTERVAL '-30 days' AS much_earlier FROM data WHERE joined IS NOT NULL ORDER BY id`,
+    ),
+    pg(
+      `SELECT id, EXTRACT(EPOCH FROM joined - CAST(joined AS DATE)) AS into_day, EXTRACT(EPOCH FROM CAST(joined AS DATE) - TIMESTAMP '2026-01-01 12:00:00') AS from_noon FROM data WHERE joined IS NOT NULL ORDER BY id`,
+    ),
+    pg(
+      `SELECT id, joined + (TIMESTAMP '2026-01-02 06:00:00' - TIMESTAMP '2026-01-01') AS shifted, joined - (TIMESTAMP '2026-01-03' - TIMESTAMP '2026-01-01') AS back, CAST(joined AS DATE) + (TIMESTAMP '2026-01-01 01:00:00' - TIMESTAMP '2026-01-01') AS from_date FROM data WHERE joined IS NOT NULL ORDER BY id`,
+    ),
+    pg(
+      `SELECT region, EXTRACT(EPOCH FROM MAX(joined) - MIN(joined)) AS span, MAX(CAST(joined AS DATE)) - MIN(CAST(joined AS DATE)) AS day_span FROM data GROUP BY region ORDER BY region`,
+    ),
+    pg(
+      `SELECT id, NULL - CAST(joined AS DATE) AS gone, CAST(joined AS DATE) + CAST(NULL AS INTEGER) AS none FROM data WHERE id <= 5 ORDER BY id`,
+    ),
+  ];
+}
+
+/**
+ * `expr op ANY(array)` and `op ALL(array)`: an ARRAY constructor, an array bound to a single
+ * placeholder (the usual way an application passes an IN list), a cast placeholder, and an
+ * array-valued column. SQLite has no ANY.
+ */
+function arrayQuantifierCases(): Case[] {
+  const pg = (sql: string, params?: CaseParameter[]): Case => ({
+    sql,
+    ordered: true,
+    skip: ["sqlite"],
+    ...(params === undefined ? {} : { params }),
+  });
+  return [
+    pg(`SELECT id FROM data WHERE id = ANY(ARRAY[1, 5, 9, 200]) ORDER BY id`),
+    pg(`SELECT id FROM data WHERE region = ANY(ARRAY['west', 'north']) ORDER BY id`),
+    pg(`SELECT id FROM data WHERE region = SOME(ARRAY['east']) ORDER BY id`),
+    pg(`SELECT id FROM data WHERE region <> ALL(ARRAY['west', 'north']) ORDER BY id`),
+    pg(`SELECT id FROM data WHERE amount > ANY(ARRAY[90, 95]) ORDER BY id`),
+    pg(`SELECT id FROM data WHERE amount < ALL(ARRAY[10, 20]) ORDER BY id`),
+    pg(`SELECT id FROM data WHERE NOT (id = ANY(ARRAY[1, 2, 3])) AND id < 8 ORDER BY id`),
+    pg(
+      `SELECT id, region = ANY(ARRAY['west', NULL]) AS hit, region <> ALL(ARRAY['east', NULL]) AS miss, amount >= ALL(ARRAY[10, 50]) AS above FROM data ORDER BY id`,
+    ),
+    pg(`SELECT id FROM data WHERE 'west' = ANY(ARRAY[region, label]) ORDER BY id`),
+    pg(`SELECT id FROM data WHERE id = ANY(?) ORDER BY id`, [[3, 7, 11, 150, 999]]),
+    pg(`SELECT id FROM data WHERE id = ANY($1) AND region = ANY($2) ORDER BY id`, [
+      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+      ["west", "east"],
+    ]),
+    pg(`SELECT id FROM data WHERE region <> ALL(?) ORDER BY id`, [["west", "south"]]),
+    pg(`SELECT id FROM data WHERE id = ANY(?) ORDER BY id`, [[]]),
+    pg(`SELECT id FROM data WHERE id <> ALL(?) ORDER BY id`, [[]]),
+    pg(`SELECT id FROM data WHERE id = ANY(?) ORDER BY id`, [null]),
+    pg(`SELECT id FROM data WHERE id = ANY($1::int[]) ORDER BY id`, [[1, 2, 3]]),
+    pg(`SELECT id FROM data WHERE label = ANY($1::text[]) ORDER BY id`, [["alpha", "echo"]]),
+    pg(`SELECT id FROM data WHERE amount >= ANY(?) ORDER BY id`, [[50.5, 99]]),
+    pg(`SELECT id FROM data WHERE amount < ALL(?) ORDER BY id`, [[10, 20.25]]),
+    pg(`SELECT id, id = ANY(?) AS chosen, id <> ALL(?) AS other FROM data ORDER BY id`, [
+      [1, null, 3],
+      [2, null],
+    ]),
+    pg(`SELECT id FROM data WHERE joined = ANY(?) ORDER BY id`, [
+      [new Date("2025-12-30T00:00:00.000Z"), new Date("2026-03-15T23:59:59.000Z")],
+    ]),
+    pg(`SELECT id FROM data WHERE active = ANY(?) AND id < 20 ORDER BY id`, [[true]]),
+    pg(`SELECT region, COUNT(*) AS n FROM data WHERE id = ANY(?) GROUP BY region ORDER BY region`, [
+      [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 40, 80],
+    ]),
+    pg(
+      `SELECT d.id FROM data d JOIN dims m ON m.region = d.region WHERE m.rank = ANY(?) ORDER BY d.id`,
+      [[1, 3]],
+    ),
+    pg(
+      `SELECT id, (SELECT COUNT(*) FROM dims m WHERE m.rank = ANY(?) AND m.region = d.region) AS ranked FROM data d WHERE id <= 12 ORDER BY id`,
+      [[2, 3]],
+    ),
+    pg(
+      `WITH a AS (SELECT ARRAY[1, 2, 3, 40] AS ids, ARRAY['east', 'south'] AS regions) SELECT d.id FROM data d CROSS JOIN a WHERE d.id = ANY(a.ids) OR d.region = ANY(a.regions) ORDER BY d.id`,
+    ),
+    pg(
+      `WITH a AS (SELECT ARRAY[10, 20] AS bounds) SELECT d.id, d.amount > ALL(a.bounds) AS high FROM data d CROSS JOIN a WHERE d.id <= 10 ORDER BY d.id`,
+    ),
+  ];
+}
+
+/** GENERATE_SERIES in FROM over integers and timestamps. SQLite's series is an extension. */
+function generateSeriesCases(): Case[] {
+  const pg = (sql: string, params?: CaseParameter[], ordered = true): Case => ({
+    sql,
+    ordered,
+    skip: ["sqlite"],
+    ...(params === undefined ? {} : { params }),
+  });
+  return [
+    pg(`SELECT n FROM generate_series(1, 5) AS n ORDER BY n`),
+    pg(`SELECT n FROM GENERATE_SERIES(10, 1, -3) AS n ORDER BY n`),
+    pg(`SELECT n FROM generate_series(0, 20, 7) n ORDER BY n`),
+    pg(`SELECT * FROM generate_series(1, 3) ORDER BY 1`),
+    pg(`SELECT generate_series FROM generate_series(-2, 2) ORDER BY generate_series`),
+    pg(`SELECT g.n FROM generate_series(0, 20, 5) AS g(n) ORDER BY g.n`),
+    pg(`SELECT n FROM generate_series(5, 1) AS n`, undefined, false),
+    pg(`SELECT n FROM generate_series(1, 5, -1) AS n`, undefined, false),
+    pg(`SELECT n FROM generate_series(3, 3) AS n`, undefined, false),
+    pg(
+      `SELECT COUNT(*) AS c, SUM(n) AS total, MAX(n) AS top FROM generate_series(1, 2500) AS n`,
+      undefined,
+      false,
+    ),
+    pg(`SELECT n * 2 AS doubled FROM generate_series(1, 4) AS n WHERE n % 2 = 0 ORDER BY doubled`),
+    pg(
+      `SELECT n, COUNT(d.id) AS c FROM generate_series(1, 6) AS n LEFT JOIN data d ON d.id % 6 + 1 = n GROUP BY n ORDER BY n`,
+    ),
+    pg(
+      `SELECT d.id, n FROM data d CROSS JOIN generate_series(1, 2) AS n WHERE d.id < 4 ORDER BY d.id, n`,
+    ),
+    pg(
+      `SELECT n FROM generate_series(CAST(? AS INTEGER), CAST(? AS INTEGER)) AS n ORDER BY n`,
+      [3, 6],
+    ),
+    pg(`SELECT n FROM generate_series(1, 10, CAST(? AS INTEGER)) AS n ORDER BY n`, [4]),
+    pg(`SELECT n FROM generate_series(1, (SELECT COUNT(*) FROM dims)) AS n ORDER BY n`),
+    pg(`SELECT n FROM generate_series(7 / 2, 13 / 2, 6 / 4) AS n ORDER BY n`),
+    pg(
+      `SELECT COUNT(*) AS c, MAX(n) AS hi FROM generate_series(1, (SELECT MAX(id) * 100 FROM data)) AS n`,
+      undefined,
+      false,
+    ),
+    pg(
+      `WITH s AS (SELECT n FROM generate_series(1, 4) AS n) SELECT a.n AS lo, b.n AS hi FROM s a JOIN s b ON b.n = a.n + 1 ORDER BY a.n`,
+    ),
+    pg(
+      `SELECT t FROM generate_series(TIMESTAMP '2026-01-01', TIMESTAMP '2026-01-05', INTERVAL '1 day') AS t ORDER BY t`,
+    ),
+    pg(
+      `SELECT t FROM generate_series(TIMESTAMP '2026-01-31', TIMESTAMP '2026-07-01', INTERVAL '1 month') AS t ORDER BY t`,
+    ),
+    pg(
+      `SELECT t FROM generate_series(TIMESTAMP '2026-01-02 00:00:00', TIMESTAMP '2026-01-01 12:00:00', INTERVAL '-5 hours') AS t ORDER BY t`,
+    ),
+    pg(
+      `SELECT t, COUNT(d.id) AS joined_that_month FROM generate_series(TIMESTAMP '2025-11-01', TIMESTAMP '2026-03-01', INTERVAL '1 month') AS t LEFT JOIN data d ON DATE_TRUNC('month', d.joined) = t GROUP BY t ORDER BY t`,
+    ),
+  ];
+}
+
+/**
+ * PostgreSQL's ordered-set aggregates: PERCENTILE_CONT interpolates, PERCENTILE_DISC returns
+ * an input value, and MODE returns the most frequent one, ties to the first in sort order.
+ * SQLite's percentile extension spells them as ordinary two-argument calls.
+ */
+function orderedSetAggregateCases(): Case[] {
+  const pg = (sql: string, params?: CaseParameter[], ordered = true): Case => ({
+    sql,
+    ordered,
+    skip: ["sqlite"],
+    ...(params === undefined ? {} : { params }),
+  });
+  return [
+    pg(
+      `SELECT region, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY amount) AS median, PERCENTILE_DISC(0.25) WITHIN GROUP (ORDER BY amount) AS q1, MODE() WITHIN GROUP (ORDER BY label) AS common FROM data GROUP BY region ORDER BY region`,
+    ),
+    pg(
+      `SELECT PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY amount DESC) AS p, PERCENTILE_DISC(0) WITHIN GROUP (ORDER BY id) AS lo, PERCENTILE_DISC(1) WITHIN GROUP (ORDER BY id) AS hi, PERCENTILE_CONT(1) WITHIN GROUP (ORDER BY id) AS top, PERCENTILE_CONT(0) WITHIN GROUP (ORDER BY id DESC) AS bottom FROM data`,
+      undefined,
+      false,
+    ),
+    pg(
+      `SELECT active, PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY joined) AS mid_joined, MODE() WITHIN GROUP (ORDER BY region DESC) AS top_region, MODE() WITHIN GROUP (ORDER BY region) AS first_region FROM data GROUP BY active ORDER BY active`,
+    ),
+    pg(
+      `SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY amount) AS m, MODE() WITHIN GROUP (ORDER BY amount) AS mo FROM data WHERE id > 1000`,
+      undefined,
+      false,
+    ),
+    pg(
+      `SELECT region, COUNT(*) AS n, PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY amount) AS q FROM data GROUP BY region HAVING PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY amount) > 40 ORDER BY region`,
+    ),
+    pg(
+      `SELECT region, PERCENTILE_CONT(?) WITHIN GROUP (ORDER BY amount) AS p FROM data GROUP BY region ORDER BY region`,
+      [0.3],
+    ),
+    pg(
+      `SELECT label, PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY id) AS p, PERCENTILE_DISC(0.75) WITHIN GROUP (ORDER BY id DESC) AS d, MODE() WITHIN GROUP (ORDER BY active) AS a FROM data GROUP BY label ORDER BY label`,
+    ),
+    pg(
+      `SELECT region, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY amount) - AVG(amount) AS skew, MIN(amount) AS lo FROM data WHERE active GROUP BY region ORDER BY region`,
+    ),
+    pg(
+      `SELECT PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY CAST(joined AS DATE)) AS mid_day, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY id % 7) AS mid_mod FROM data`,
+      undefined,
+      false,
+    ),
+    pg(
+      `SELECT r.region, r.median FROM (SELECT region, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY amount) AS median FROM data GROUP BY region) r WHERE r.median > 30 ORDER BY r.region`,
+    ),
+    pg(
+      `SELECT m.region, (SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY d.amount) FROM data d WHERE d.region = m.region) AS median, (SELECT MODE() WITHIN GROUP (ORDER BY d.label) FROM data d WHERE d.region = m.region) AS common FROM dims m ORDER BY m.rank`,
+    ),
+    pg(
+      `SELECT id FROM data WHERE amount > (SELECT PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY amount) FROM data) ORDER BY id`,
+    ),
+  ];
+}
+
+function postgresFormCases(): Case[] {
+  return [
+    ...dateArithmeticCases(),
+    ...arrayQuantifierCases(),
+    ...generateSeriesCases(),
+    ...orderedSetAggregateCases(),
+  ];
+}
+
 /** DISTINCT ON: the first row per key in ORDER BY order. SQLite has no such form. */
 function distinctOnCases(): Case[] {
   const pg = (sql: string, ordered = true): Case => ({ sql, ordered, skip: ["sqlite"] });
@@ -1504,6 +1753,7 @@ function buildCorpus(seed: number): Case[] {
   corpus.push(...resolutionCases());
   corpus.push(...jsonSpellingCases());
   corpus.push(...distinctOnCases());
+  corpus.push(...postgresFormCases());
   return corpus;
 }
 
@@ -1786,8 +2036,10 @@ function diffSummary(label: string, left: string[], right: string[]): string {
   ].join("\n");
 }
 
-function sqliteParams(params: QueryValue[] | undefined): Array<string | number | null> {
-  return (params ?? []).map((value) => {
+function sqliteParams(params: CaseParameter[] | undefined): Array<string | number | null> {
+  return (params ?? []).map((parameter) => {
+    if (Array.isArray(parameter)) throw new TypeError("SQLite has no array parameters");
+    const value = parameter as QueryValue;
     if (value === null) return null;
     if (value === true) return 1;
     if (value === false) return 0;
@@ -1851,8 +2103,10 @@ async function pgliteOracle(fixture: readonly FixtureRow[]): Promise<Oracle> {
   // int8 and numeric arrive as numbers, so counts and numeric-typed math compare directly, and a
   // timestamp without a zone (what `TIMESTAMP '…' + INTERVAL` returns) is read as UTC rather than
   // in whatever zone the machine running the tests happens to be in.
+  // DATE (1082) stays PostgreSQL's YYYY-MM-DD text, the zoneless value Minnow returns too.
   const parsers = {
     20: (value: string) => Number(value),
+    1082: (value: string) => value,
     1700: (value: string) => Number(value),
     1114: (value: string) => new Date(`${value.replace(" ", "T")}Z`),
   };
@@ -1888,7 +2142,7 @@ interface MatrixFeature {
   status: "supported" | "unsupported";
   example: string;
   setup?: string[];
-  params?: QueryValue[];
+  params?: CaseParameter[];
 }
 
 const matrixFeatures = (rawMatrix as { features: MatrixFeature[] }).features;
@@ -2012,8 +2266,10 @@ async function matrixPglite(): Promise<Oracle> {
       dim.amount,
     ]);
   }
+  // DATE (1082) stays PostgreSQL's YYYY-MM-DD text, the zoneless value Minnow returns too.
   const parsers = {
     20: (value: string) => Number(value),
+    1082: (value: string) => value,
     1700: (value: string) => Number(value),
     1114: (value: string) => new Date(`${value.replace(" ", "T")}Z`),
   };
@@ -2343,6 +2599,39 @@ const matrixSkips = new Map<string, { oracles: readonly OracleName[]; reason: st
     },
   ],
   ["function.date-part", { oracles: ["sqlite"], reason: "SQLite has no DATE_PART or EXTRACT" }],
+  [
+    "expression.date-minus-date",
+    { oracles: ["sqlite"], reason: "SQLite subtracts dates through julianday()" },
+  ],
+  [
+    "expression.date-plus-integer",
+    { oracles: ["sqlite"], reason: "SQLite shifts dates through date(x, '+n days')" },
+  ],
+  [
+    "expression.timestamp-minus-timestamp",
+    { oracles: ["sqlite"], reason: "SQLite has no INTERVAL or EXTRACT" },
+  ],
+  [
+    "expression.datetime-plus-interval-value",
+    { oracles: ["sqlite"], reason: "SQLite has no INTERVAL" },
+  ],
+  ["type.array-any", { oracles: ["sqlite"], reason: "SQLite has no arrays or ANY" }],
+  [
+    "type.array-any-parameter",
+    { oracles: ["sqlite"], reason: "SQLite has no arrays or array parameters" },
+  ],
+  [
+    "function.generate-series",
+    { oracles: ["sqlite"], reason: "SQLite's generate_series is a loadable extension" },
+  ],
+  [
+    "function.generate-series-timestamps",
+    { oracles: ["sqlite"], reason: "SQLite has no timestamp series or INTERVAL" },
+  ],
+  [
+    "aggregate.ordered-set",
+    { oracles: ["sqlite"], reason: "SQLite has no WITHIN GROUP ordered-set aggregates" },
+  ],
   ["expression.cast-postfix", { oracles: ["sqlite"], reason: "SQLite has no :: cast syntax" }],
   [
     "expression.concat-typed",
@@ -2406,7 +2695,13 @@ describe("SQL conformance against SQLite and PGlite", () => {
       try {
         for (const [index, testCase] of corpus.entries()) {
           const caseLabel = `#${String(index)} ${testCase.sql} :: ${JSON.stringify(testCase.params ?? [])}`;
-          const hasTopLevelOrder = hasResultOrder(compileQuery(testCase.sql, { optimize: false }));
+          let hasTopLevelOrder: boolean;
+          try {
+            hasTopLevelOrder = hasResultOrder(compileQuery(testCase.sql, { optimize: false }));
+          } catch (error) {
+            failures.push(`${caseLabel}\n  minnow threw: ${String(error)}`);
+            continue;
+          }
           if (testCase.ordered !== hasTopLevelOrder) {
             failures.push(
               `${caseLabel}\n  harness ordering flag is ${String(testCase.ordered)}, compiled outer ORDER BY is ${String(hasTopLevelOrder)}`,

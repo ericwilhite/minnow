@@ -10,7 +10,7 @@ import {
   type StoragePage,
 } from "../storage/types.js";
 import { LiveQueryLimitError } from "./errors.js";
-import { type CompiledQuery, type QueryResult, type QueryValue } from "./query.js";
+import { type CompiledQuery, type QueryParameter, type QueryResult } from "./query.js";
 import { KEY_FORWARDS_TABLE_ID, type KeyChange } from "./key-change.js";
 export type { KeyChange } from "./key-change.js";
 
@@ -200,7 +200,7 @@ export interface LiveQueryGroupStats {
 /** A live query: plain SQL, parameterized SQL, or a compiled-plan envelope. */
 export type LiveQueryInput =
   | string
-  | { kind: "sql-query"; sql: string; params: readonly QueryValue[] }
+  | { kind: "sql-query"; sql: string; params: readonly QueryParameter[] }
   | { kind: "typed-query"; plan: CompiledQuery };
 
 /** What the set already knows when it asks the host to execute a statement. */
