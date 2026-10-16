@@ -234,7 +234,8 @@ machines: https://minnowdb.com/llms.txt
   subquery predicates in UPDATE/DELETE,
   range-correlated LATERAL, ordered STRING_AGG/JSON_ARRAYAGG, SIMILAR TO, COLLATE, constant
   JSON_TABLE, the `->`/`->>` JSON operators (which also accept plain JSON text, and error on
-  a non-JSON document), `DISTINCT ON`, `UPDATE … FROM` and `DELETE … USING`, `TRUNCATE`,
+  a non-JSON document), `DISTINCT ON`, `JOIN … USING` and `NATURAL JOIN` with merged join
+  columns, `UPDATE … FROM` and `DELETE … USING`, `TRUNCATE`,
   PostgreSQL's `json_agg`/`json_build_object`/`to_json`/`row_to_json` spellings with a table
   alias as a row value (Kysely's `jsonArrayFrom`/`jsonObjectFrom`), integer division that
   truncates, `GROUP BY` a primary key with the row's other columns ungrouped, case-insensitive
