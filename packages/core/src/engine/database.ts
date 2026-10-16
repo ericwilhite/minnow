@@ -7829,8 +7829,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     after: number | null,
     until: number,
   ): Promise<boolean> {
-    const plan = this.#compileLiveQuery(query);
+    let plan = this.#compileLiveQuery(query);
     if (planContainsFts(plan)) return true;
+    // The zone proof must test the statement as it runs: a key constant naming a retired key
+    // reads the row at the forward's target, and a row written there is one the statement
+    // returns, whatever the constant as written says. The current forwards are the right ones:
+    // a later rekey changes the forwards table, which this statement depends on and re-runs for.
+    const { tables, keyForwardsTableId } = await this.#catalogFacts();
+    if (keyForwardsTableId !== undefined && planHasKeyLiterals(plan, tables)) {
+      const forwards = await this.#committedForwards();
+      if (forwards !== undefined && !forwards.isEmpty()) {
+        plan = forwardPlanKeyLiterals(plan, tables, forwards);
+      }
+    }
     // Base-scan zone proofs are unsound when the plan reads the table anywhere else — a
     // subquery, EXISTS/IN, derived table, or set-operation branch can observe a row the base
     // predicates reject (e.g. `value > (SELECT AVG(value) FROM t)`).

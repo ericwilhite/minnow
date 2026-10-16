@@ -820,6 +820,36 @@ describe("live queries over a key that a rekey redirects", () => {
     expect(ids).toEqual([[], [1]]);
     live.close();
   });
+
+  it.each([true, false])(
+    "re-run when a row is written at the key a retired key forwards to (incremental=%s)",
+    async (incremental) => {
+      // Found by live-differential.test.ts. A forward outlives its row, so a new row at the
+      // forward's target is what the retired key names. The window proof checked the inserted
+      // keys' zone maps against the statement as written -- `id = 3` -- rather than as it runs,
+      // `id = -8`, proved the insert irrelevant, and kept the empty result.
+      const database = new MinnowDatabase(new MemoryBlockStore(), { autoCompact: false });
+      await database.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER)");
+      await database.execute("INSERT INTO a VALUES (3, 1), (5, 5)");
+      await database.execute("UPDATE a SET id = -8 WHERE id = 3");
+      const live = database.liveQueries({ incremental });
+      const sql = "SELECT id, x FROM a WHERE id = 3";
+      const seen: unknown[] = [];
+      await live.subscribe(sql, { onChange: (result) => seen.push(result.rows) });
+      for (const write of [
+        "DELETE FROM a WHERE id = -8",
+        "INSERT INTO a VALUES (-8, 9)",
+        "UPDATE a SET x = 10 WHERE id = -8",
+      ]) {
+        await database.execute(write);
+        await live.refresh();
+        expect(seen.at(-1), write).toEqual((await database.query(sql, { memoize: false })).rows);
+      }
+      expect(seen.at(-1)).toEqual([{ id: -8, x: 10 }]);
+      live.close();
+      await database.close();
+    },
+  );
 });
 
 describe("retired keys in every SQL shape (read-path audit)", () => {
