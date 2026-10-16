@@ -1050,6 +1050,7 @@ describe("DML conformance against SQLite and PGlite", () => {
           if (failures.length >= 10) break; // Divergence cascades; stop at a useful sample.
         }
       } finally {
+        await minnow.close();
         sqlite.close();
         await pglite.close();
       }
