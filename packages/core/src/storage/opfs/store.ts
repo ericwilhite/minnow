@@ -390,6 +390,8 @@ export class OpfsBlockStore {
   readonly #onDiagnostic: ((error: unknown, context: string) => void) | undefined;
   readonly #instanceId = crypto.randomUUID();
   readonly #channelName: string;
+  /** Held by every judgement and every write of this database's format marker. */
+  readonly #markerLockName: string;
   /** The database-wide channel: leadership traffic every connection listens to. */
   #channel: BroadcastChannel | undefined;
   /** This connection's own channel: operations when leading, results when following. */
@@ -457,6 +459,7 @@ export class OpfsBlockStore {
     this.#dispatchBudgetMs = options.dispatchBudgetMs ?? DISPATCH_BUDGET_MS;
     this.#onDiagnostic = options.onDiagnostic;
     this.#channelName = `minnowdb-store:${options.name}`;
+    this.#markerLockName = markerLockName(options.name);
     this.liveQueryChannelName = `minnowdb-live:opfs:${options.name}`;
   }
 
@@ -585,7 +588,9 @@ export class OpfsBlockStore {
       // them in sequence; the brief retry covers the gap.
       slotA = await this.#openWithRetry(["checkpoint-a"]);
       slotB = await this.#openWithRetry(["checkpoint-b"]);
-      const upgraded = await upgradeOpfsLayout(this.#tree, { wal, slotA, slotB });
+      const upgraded = await upgradeOpfsLayout(this.#tree, { wal, slotA, slotB }, (publish) =>
+        this.#withMarkerLock(publish),
+      );
       this.#upgradePending = false;
       acknowledgements = await this.#openWithRetry(["wal-acknowledgements"]);
       this.#leader = await OpfsLeader.recover(
@@ -2041,7 +2046,80 @@ export class OpfsBlockStore {
     this.#releaseWhenHandlesClose();
   }
 
+  /**
+   * Validates the format marker, or writes it into a database directory that has none yet.
+   *
+   * Writing the marker takes several steps — create the file, take its handle, truncate, write,
+   * flush, close — and so does judging one that does not read whole: look for an upgrade
+   * witness, then list the directory. Run side by side, a judge could read the marker empty or
+   * held while another connection was creating it, then list the WAL that connection made next,
+   * and refuse a healthy database as a torn marker beside storage artifacts; or it could write
+   * the marker a second time, truncating it beside a live WAL. So a marker that reads whole is
+   * accepted as read, and anything else is judged again under the marker lock, which every
+   * marker write holds too. Under the lock no marker write is in flight: a marker that still
+   * does not read whole was left that way by a writer that died, and the recovery rules apply.
+   */
   async #ensureFormatMarker(): Promise<void> {
+    if (await this.#acceptWholeFormatMarker()) return;
+    await this.#withMarkerLock(() => this.#settleFormatMarker());
+  }
+
+  /** Whether the marker reads whole and valid; partial bytes fail to parse and return false. */
+  async #acceptWholeFormatMarker(): Promise<boolean> {
+    const existing = await this.#tree.readFile(["format.json"], {
+      lockedMeansAbsent: true,
+      maxBytes: 1024,
+    });
+    if (existing === undefined) return false;
+    try {
+      this.#validateFormatMarker(existing);
+    } catch (error) {
+      if (error instanceof SyntaxError) return false;
+      throw error;
+    }
+    this.#upgradePending ||= await hasPreparedOpfsUpgrade(this.#tree);
+    return true;
+  }
+
+  /**
+   * Runs `steps` while no other connection judges or writes this database's format marker.
+   * Every holder does a few small file operations, so a wait that outlasts the dispatch budget
+   * means a stalled holder, and fails rather than hangs. Without Web Locks there is nothing to
+   * serialize with, and the steps simply run.
+   */
+  async #withMarkerLock<T>(steps: () => Promise<T>): Promise<T> {
+    const locks = webLocks();
+    if (locks === undefined) return steps();
+    const abort = new AbortController();
+    const timer = setTimeout(() => {
+      abort.abort();
+    }, this.#dispatchBudgetMs);
+    try {
+      return await locks.request(
+        this.#markerLockName,
+        { mode: "exclusive", signal: abort.signal },
+        () => {
+          // Granted: from here the steps run to completion, however long they take.
+          clearTimeout(timer);
+          return steps();
+        },
+      );
+    } catch (error) {
+      // The timer is cleared on grant, so an aborted signal means the lock never came.
+      if (abort.signal.aborted && isDomError(error, "AbortError")) {
+        throw new Error(
+          "Another connection is holding the OPFS format marker; close stalled connections and reopen",
+          { cause: error },
+        );
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** The marker judgement, under the marker lock. */
+  async #settleFormatMarker(): Promise<void> {
     const existing = await this.#tree.readFile(["format.json"], {
       lockedMeansAbsent: true,
       maxBytes: 1024,
@@ -2082,8 +2160,9 @@ export class OpfsBlockStore {
       await this.#tree.writeFile(["format.json"], bytes, { flush: true });
     } catch (error) {
       if (!isLockContention(error)) throw error;
-      // Another opener owns the marker write. Do not assume it writes this build's version:
-      // wait until its handle closes, then validate the bytes it actually published.
+      // A writer outside the marker lock — an older build, or a context without Web Locks —
+      // owns the marker write. Do not assume it writes this build's version: wait until its
+      // handle closes, then validate the bytes it actually published.
       for (let attempt = 0; attempt < 40; attempt += 1) {
         await sleep(5 + Math.random() * 10);
         const published = await this.#tree.readFile(["format.json"], {
@@ -2165,7 +2244,7 @@ export async function deleteOpfsDatabase(options: {
   root?: FileSystemDirectoryHandle;
 }): Promise<void> {
   const encodedName = encodeSegment(validateStorageDatabaseName(options.name));
-  const locks = (globalThis as { navigator?: { locks?: LockManager } }).navigator?.locks;
+  const locks = webLocks();
   if (locks === undefined) throw new Error("Deleting an OPFS database requires Web Locks");
   const abort = new AbortController();
   const timer = setTimeout(() => {
@@ -2201,9 +2280,22 @@ function connectionLockName(name: string): string {
   return `minnowdb-opfs-connections:${name}`;
 }
 
+function markerLockName(name: string): string {
+  return `minnowdb-opfs-marker:${name}`;
+}
+
+/**
+ * The context's Web Locks, where it has them (every browser with OPFS, and Node from 24). DOM
+ * emulations define `navigator.locks` as null or as a stub, which counts as having none.
+ */
+function webLocks(): LockManager | undefined {
+  const locks = (globalThis as { navigator?: { locks?: LockManager | null } }).navigator?.locks;
+  return typeof locks?.request === "function" ? locks : undefined;
+}
+
 /** Shared lifetime locks keep deletion exclusive with both leaders and idle followers. */
 async function holdConnectionLock(name: string): Promise<(() => void) | undefined> {
-  const locks = (globalThis as { navigator?: { locks?: LockManager } }).navigator?.locks;
+  const locks = webLocks();
   if (locks === undefined) return undefined;
   return new Promise<() => void>((resolve, reject) => {
     void locks
