@@ -4,8 +4,9 @@ export interface QueryMemoryUsage {
   readonly peakBytes: number;
 }
 
+// 64 MiB, written as a literal rather than a product so a bundle that never reads it can drop it.
 /** Finite default for every public engine execution path. */
-export const DEFAULT_QUERY_MEMORY_BUDGET_BYTES = 64 * 1024 * 1024;
+export const DEFAULT_QUERY_MEMORY_BUDGET_BYTES = 67_108_864 as number;
 
 export class QueryMemoryBudgetError extends Error {
   override readonly name = "QueryMemoryBudgetError";

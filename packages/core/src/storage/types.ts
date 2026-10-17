@@ -1199,17 +1199,22 @@ export interface RowIdRange {
   endExclusive: bigint;
 }
 
-/** Largest persisted row ID/posting value; the wire format is canonical unsigned 64-bit. */
-export const MAX_ROW_ID = (1n << 64n) - 1n;
-/** One past `MAX_ROW_ID`, allowed only for exclusive range/counter ends. */
-export const MAX_ROW_ID_EXCLUSIVE_END = 1n << 64n;
+// The limits below are written as literals rather than products or calls: a bundler cannot prove
+// `a * b` or `BigInt(x)` free of side effects, so it would keep every such constant, used or not,
+// in each bundle that imports this module, the main-thread client included. `as number` and
+// `as bigint` keep their published declarations at the general type rather than the literal.
+
+/** Largest persisted row ID/posting value (2^64 - 1); the wire format is canonical unsigned 64-bit. */
+export const MAX_ROW_ID = 18_446_744_073_709_551_615n as bigint;
+/** One past `MAX_ROW_ID` (2^64), allowed only for exclusive range/counter ends. */
+export const MAX_ROW_ID_EXCLUSIVE_END = 18_446_744_073_709_551_616n as bigint;
 /** Auto-increment values are exposed as exact JavaScript numbers and therefore stop here. */
-export const MAX_AUTO_INCREMENT_VALUE = BigInt(Number.MAX_SAFE_INTEGER);
-export const MAX_AUTO_INCREMENT_EXCLUSIVE_END = MAX_AUTO_INCREMENT_VALUE + 1n;
+export const MAX_AUTO_INCREMENT_VALUE = 9_007_199_254_740_991n as bigint; // Number.MAX_SAFE_INTEGER
+export const MAX_AUTO_INCREMENT_EXCLUSIVE_END = 9_007_199_254_740_992n as bigint;
 
 export type LeaseKind = "reader" | "backup";
 /** A live owner renews; an abandoned durable pin expires within one hour. */
-export const MAX_LEASE_TTL_MS = 60 * 60 * 1_000;
+export const MAX_LEASE_TTL_MS = 3_600_000 as number; // one hour
 /** Durable resource ceilings; adapters sweep expired owners before atomically refusing creation. */
 export const MAX_ACTIVE_LEASES = 4_096;
 export const MAX_ACTIVE_TEMP_OWNERS = 1_024;
@@ -1217,27 +1222,27 @@ export const MAX_TEMP_RUNS_PER_OWNER = 1_024;
 export const MAX_TEMP_PAGES_PER_OWNER = 16_384;
 export const MAX_TEMP_RUNS_TOTAL = 65_536;
 export const MAX_TEMP_PAGES_TOTAL = 262_144;
-export const MAX_TEMP_BYTES_PER_OWNER = 512 * 1024 * 1024;
-export const MAX_TEMP_BYTES_TOTAL = 1024 * 1024 * 1024;
+export const MAX_TEMP_BYTES_PER_OWNER = 536_870_912 as number; // 512 MiB
+export const MAX_TEMP_BYTES_TOTAL = 1_073_741_824 as number; // 1 GiB
 export const MAX_ACTIVE_COMPACTION_JOBS = 1_024;
 export const MAX_ACTIVE_GARBAGE_COLLECTION_JOBS = 1;
 export const MAX_ACTIVE_UNIQUE_KEY_BUILDS = 1_024;
 export const MAX_ACTIVE_FTS_BASE_BUILDS = 128;
 export const MAX_ACTIVE_SECONDARY_INDEX_BUILDS = 128;
-export const MAX_ACCELERATOR_BUILD_STAGED_BYTES_TOTAL = 1024 * 1024 * 1024;
+export const MAX_ACCELERATOR_BUILD_STAGED_BYTES_TOTAL = 1_073_741_824 as number; // 1 GiB
 export const MAX_ACCELERATOR_BUILD_STAGED_ENTRIES_TOTAL = 16_777_216;
 export const MAX_ACTIVE_TRANSACTIONS = 4_096;
-export const MAX_GLOBAL_STAGED_ARTIFACT_BYTES = 512 * 1024 * 1024;
+export const MAX_GLOBAL_STAGED_ARTIFACT_BYTES = 536_870_912 as number; // 512 MiB
 export const MAX_GLOBAL_STAGED_BLOCKS = 1_048_576;
 export const MAX_GLOBAL_STAGED_SEGMENTS = 1_048_576;
 /** Catalog enumeration remains bounded even for cold public inspection APIs. */
 export const MAX_CATALOG_RECORDS = 4_096;
 /** Total canonical UTF-8 record-wire bytes retained by the durable catalog. */
-export const MAX_CATALOG_RETAINED_BYTES = 64 * 1024 * 1024;
+export const MAX_CATALOG_RETAINED_BYTES = 67_108_864 as number; // 64 MiB
 export const MAX_MANIFEST_RECORDS = 65_536;
-export const MAX_MANIFEST_RETAINED_BYTES = 64 * 1024 * 1024;
+export const MAX_MANIFEST_RETAINED_BYTES = 67_108_864 as number; // 64 MiB
 export const MAX_SEGMENT_RECORDS = 1_048_576;
-export const MAX_SEGMENT_RETAINED_BYTES = 512 * 1024 * 1024;
+export const MAX_SEGMENT_RETAINED_BYTES = 536_870_912 as number; // 512 MiB
 /** Durable diagnostic/provenance tails are pruned before admitting more terminal records. */
 export const MAX_TERMINAL_TRANSACTION_RECORDS = 65_536;
 export const MAX_TERMINAL_COMPACTION_JOB_RECORDS = 4_096;
@@ -1245,9 +1250,9 @@ export const MAX_COMPLETED_GARBAGE_COLLECTION_JOB_RECORDS = 1_024;
 /** An old renewable pin may not force unbounded history retention while writes continue. */
 export const MAX_PINNED_MANIFEST_VERSION_LAG = 4_096;
 export const MAX_PINNED_RETIRED_BLOCKS = 65_536;
-export const MAX_PINNED_RETIRED_BYTES = 512 * 1024 * 1024;
+export const MAX_PINNED_RETIRED_BYTES = 536_870_912 as number; // 512 MiB
 /** Total obsolete physical history is refused before it can consume an origin indefinitely. */
-export const MAX_RETIRED_HISTORY_BYTES = 1024 * 1024 * 1024;
+export const MAX_RETIRED_HISTORY_BYTES = 1_073_741_824 as number; // 1 GiB
 
 /** A durable resource family reached its fixed corruption/growth safety ceiling. */
 export class StorageResourceLimitError extends Error {
@@ -2425,7 +2430,7 @@ export interface InterruptedSnapshotImportAbortResult {
 }
 
 /** A snapshot session is renewable but can never pin storage for more than one hour unattended. */
-export const MAX_SNAPSHOT_SESSION_TTL_MS = 60 * 60 * 1_000;
+export const MAX_SNAPSHOT_SESSION_TTL_MS = 3_600_000 as number; // one hour
 
 /** Snapshot v1 is an ordered bounded record stream; no database-sized collection is in header. */
 export const SNAPSHOT_FRAME_KINDS = [
@@ -2438,9 +2443,9 @@ export const SNAPSHOT_FRAME_KINDS = [
 ] as const;
 export type SnapshotFrameKind = (typeof SNAPSHOT_FRAME_KINDS)[number];
 export const MAX_SNAPSHOT_FRAME_ITEMS = 1_024;
-export const MAX_SNAPSHOT_METADATA_FRAME_BYTES = 4 * 1024 * 1024;
+export const MAX_SNAPSHOT_METADATA_FRAME_BYTES = 4_194_304 as number; // 4 MiB
 export const MAX_SNAPSHOT_FRAME_BATCH_ITEMS = 64;
-export const MAX_SNAPSHOT_METADATA_BATCH_BYTES = 16 * 1024 * 1024;
+export const MAX_SNAPSHOT_METADATA_BATCH_BYTES = 16_777_216 as number; // 16 MiB
 /** One block frame is permitted; metadata frames still use MAX_SNAPSHOT_METADATA_BATCH_BYTES. */
 export const MAX_SNAPSHOT_FRAME_BATCH_BYTES = MAX_STORED_BLOCK_BYTE_LENGTH + 8 * 1024;
 /**
@@ -2926,10 +2931,10 @@ export interface UniqueKeyChanges {
 
 /** Bounded calls used to seed an arbitrarily large UNIQUE namespace without heap materialization. */
 export const MAX_UNIQUE_KEY_BUILD_TOKENS_PER_CHUNK = 4_096;
-export const MAX_UNIQUE_KEY_BUILD_CHUNK_BYTES = 4 * 1024 * 1024;
-export const MAX_UNIQUE_KEY_BUILD_TTL_MS = 60 * 60 * 1_000;
-export const MAX_UNIQUE_KEY_BUILD_STAGED_BYTES = 512 * 1024 * 1024;
-export const MAX_UNIQUE_KEY_BUILD_STAGED_BYTES_TOTAL = 1024 * 1024 * 1024;
+export const MAX_UNIQUE_KEY_BUILD_CHUNK_BYTES = 4_194_304 as number; // 4 MiB
+export const MAX_UNIQUE_KEY_BUILD_TTL_MS = 3_600_000 as number; // one hour
+export const MAX_UNIQUE_KEY_BUILD_STAGED_BYTES = 536_870_912 as number; // 512 MiB
+export const MAX_UNIQUE_KEY_BUILD_STAGED_BYTES_TOTAL = 1_073_741_824 as number; // 1 GiB
 
 export interface UniqueKeyBuildRecord {
   buildId: string;
@@ -3105,7 +3110,7 @@ export interface FtsPosting {
   tf: number[];
 }
 
-export const MAX_POSTING_BUILD_TTL_MS = 60 * 60 * 1_000;
+export const MAX_POSTING_BUILD_TTL_MS = 3_600_000 as number; // one hour
 
 export interface BeginPostingBuildInput {
   tableId: string;
@@ -3196,7 +3201,7 @@ export const MAX_FTS_CANDIDATE_ROW_IDS = 65_536;
 /** Query-term cardinality shared by the parser and every postings adapter boundary. */
 export const MAX_FTS_QUERY_TERMS = 32;
 /** Retained metadata/value ceiling for one ordered postings read. Overflow falls back to a scan. */
-export const MAX_FTS_ORDERED_READ_BYTES = 64 * 1024 * 1024;
+export const MAX_FTS_ORDERED_READ_BYTES = 67_108_864 as number; // 64 MiB
 /** Hard public mutation bounds for one streamed postings-build chunk. */
 export const MAX_FTS_POSTINGS_PER_CHUNK = 65_536;
 export const MAX_FTS_POSTING_ROW_IDS_PER_CHUNK = 1_048_576;
@@ -3779,7 +3784,7 @@ export interface TempOwnerRecord {
   revision: number;
 }
 
-export const MAX_TEMP_OWNER_TTL_MS = 60 * 60 * 1_000;
+export const MAX_TEMP_OWNER_TTL_MS = 3_600_000 as number; // one hour
 
 export interface RenewTempOwnerInput {
   ownerId: string;
