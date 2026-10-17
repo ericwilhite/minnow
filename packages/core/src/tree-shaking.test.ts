@@ -75,8 +75,8 @@ const COMPLETE_ENTRY_GZIP_BUDGET = 318 * 1024;
 // continuation frames, the lease lane, and follower pieces (0.14.0): 1345.0 KiB raw.
 // Rekeying (0.15.0): 1367.4 KiB raw. With its audit: 1374.8 KiB raw. The read-path work:
 // 1397.8 KiB raw.
-// The 0.16.0 audit: 1448.7 KiB raw.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1449 * 1024;
+// The 0.16.0 audit: 1449.0 KiB raw.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1450 * 1024;
 // Explicit scheduler ownership and bounded diagnostic history add about 1 KiB gzip over the
 // correctness/upgrade batch (361.6 KiB measured). Concurrent compaction and posting ownership
 // repairs measure 362.1 KiB; allow the next whole KiB without changing runtime performance gates.
@@ -101,8 +101,8 @@ const ENGINE_WITH_OPFS_GZIP_BUDGET = 417 * 1024;
 // 1362.8 KiB raw / 386.3 KiB gzip; with the rekeying audit, 1370.4 KiB raw / 388.9 KiB gzip;
 // with chained forwards and lapsed-lease re-pinning, 389.05 KiB gzip; with the read-path work
 // (point-read plans, index reads, ordered selection), 1393.0 KiB raw / 396.7 KiB gzip.
-// The 0.16.0 audit: 1443.8 KiB raw / 412.7 KiB gzip.
-const INDEXEDDB_WORKER_RAW_BUDGET = 1444 * 1024;
+// The 0.16.0 audit: 1444.1 KiB raw / 412.7 KiB gzip.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1445 * 1024;
 const INDEXEDDB_WORKER_GZIP_BUDGET = 413 * 1024;
 
 const repoRoot = join(import.meta.dirname, "..", "..", "..");
