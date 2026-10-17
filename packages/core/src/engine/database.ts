@@ -29,6 +29,7 @@ import { CompactionController, QUIET_COMPACTION_FAILURE_LIMIT } from "./compacti
 import { BackgroundDiagnostics, isLivePostingBuildRefusal } from "./background-diagnostics.js";
 import { CollectionController } from "./collection-controller.js";
 import { databaseInternals } from "./internals.js";
+import { asIndexCreator, OwnerPresence, ownerDeparted } from "./owner-presence.js";
 import {
   writeCoordinationScope,
   type WriteCoordinationScope,
@@ -2657,6 +2658,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   readonly #createId: () => string;
   readonly #diagnostics: BackgroundDiagnostics;
   readonly #internalLeaseOwnerId: string;
+  /** Shows other connections this engine is alive, so its index builds are never taken over. */
+  readonly #presence: OwnerPresence;
   readonly #liveSets = new Set<LiveQuerySet>();
   /** Live proof inputs per commit window, keyed `after:until`; see #liveProofContext. */
   readonly #liveProofContexts = new Map<string, Promise<LiveProofContext>>();
@@ -2939,6 +2942,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       yield: () => this.#yieldMaintenance(),
       report: (error, context) => this.#reportBackgroundError(error, context),
     });
+    // Last, once nothing above can throw: a presence is released only by close().
+    this.#presence = new OwnerPresence(this.#internalLeaseOwnerId);
     this.#collection.start();
     databaseInternals.set(this, {
       cancelCrossContextWaits: (reason) => {
@@ -2956,7 +2961,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     if (this.#closePromise !== undefined) return this.#closePromise;
     this.#closed = true;
     this.#shutdown.abort(new DatabaseClosedError());
-    const closing = this.#closeResources();
+    // Let go of liveness only once every build this engine began has settled: until then another
+    // connection must not take one over.
+    const closing = this.#closeResources().finally(() => this.#presence.release());
     this.#closePromise = closing;
     return closing;
   }
@@ -14857,35 +14864,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
       }
       if (statement.kind === "create-index") {
-        const indexStatement = statement;
-        const existing = (await this.store.listTables()).some((table) =>
-          Object.values(table.secondaryIndexes ?? {}).some(
-            (index) => index.name === indexStatement.index,
-          ),
-        );
-        if (existing && statement.ifNotExists === true) {
-          return {
-            kind: "create-index",
-            index: statement.index,
-            table: statement.table,
-            column: statement.columns[0]?.name ?? "",
-            columns: statement.columns.map((column) => column.name),
-            unique: statement.unique === true,
-          };
-        }
-        try {
-          await this.createIndex(statement.index, statement.table, statement.columns, {
-            unique: statement.unique === true,
-          });
-        } catch (error) {
-          const admitted =
-            statement.ifNotExists === true &&
-            (await this.store.listTables()).some((table) =>
-              Object.values(table.secondaryIndexes ?? {}).some(
-                (index) => index.name === indexStatement.index,
-              ),
-            );
-          if (!admitted) throw error;
+        const indexOptions = { unique: statement.unique === true };
+        if (statement.ifNotExists === true) {
+          await this.#createIndexIfNotExists(
+            statement.index,
+            statement.table,
+            statement.columns,
+            indexOptions,
+          );
+        } else {
+          await this.createIndex(statement.index, statement.table, statement.columns, indexOptions);
         }
         return {
           kind: "create-index",
@@ -23301,77 +23289,191 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const indexId = this.#createId();
       const storageColumnId = `secondary-index:${indexId}`;
       const buildId = this.#createId();
-      // Another connection's fold or index build may move the table record between the read
-      // above and this update; the marking is re-based on the fresh record rather than failing
-      // the DDL for a race it did not lose anything to.
-      let current = table;
-      const marked = await this.#admissions.admit("catalog", async (): Promise<TableRecord> => {
-        for (let attempt = 0; ; attempt += 1) {
-          try {
-            const created = await this.store.updateTable(current.id, current.revision, {
-              secondaryIndexes: {
-                ...current.secondaryIndexes,
-                [indexId]: {
-                  name: indexName,
-                  columnId: columns[0]?.id ?? "",
-                  columnIds: columns.map((column) => column.id),
-                  directions: indexColumns.map((column) => column.direction),
-                  ...(options.unique === true ? { unique: true as const } : {}),
-                  termEncoding: "tuple-v2",
-                  storage: "postings-v1",
-                  storageColumnId,
-                  locator: current.uniqueKeyColumnId === undefined ? "row-id" : "key-hash-v1",
-                  state: "building",
-                  buildId,
-                  buildFromVersion: -1,
-                },
-              },
-            });
-            // Claim the build session in the turn that marks the index, so no other
-            // connection's build can take it over before this one starts streaming. A claim
-            // refused here is retried by the build's own begin, which reports a real failure.
-            await this.#beginPostingBuild(created.id, storageColumnId, buildId).catch(
-              () => undefined,
-            );
-            return created;
-          } catch (error) {
-            if (!(error instanceof TableRecordConflictError) || attempt >= this.#maxCommitRetries) {
-              throw error;
-            }
-            const fresh = await this.store.getTable(current.id);
-            if (fresh === undefined) throw new UnknownTableError(tableName);
+      // Held from before the index is marked until this statement settles: a
+      // `CREATE INDEX IF NOT EXISTS` that finds the index meanwhile waits for this outcome
+      // instead of reporting an index whose build may still fail.
+      const signal = this.#shutdown.signal;
+      await asIndexCreator(this.store, storageColumnId, this.#presence, signal, async () => {
+        // Another connection's fold or index build may move the table record between the read
+        // above and this update; the marking is re-based on the fresh record rather than failing
+        // the DDL for a race it did not lose anything to.
+        const marked = await this.#admissions.admit("catalog", async (): Promise<TableRecord> => {
+          for (let attempt = 0; ; attempt += 1) {
+            // Index names are global. Checked again inside the turn that marks, so two
+            // connections creating one name at once -- on one table or two -- cannot both win.
+            const records = await this.store.listTables();
             if (
-              Object.values(fresh.secondaryIndexes ?? {}).some((index) => index.name === indexName)
+              records.some((record) =>
+                Object.values(record.secondaryIndexes ?? {}).some(
+                  (index) => index.name === indexName,
+                ),
+              )
             ) {
-              throw new TypeError(`Index already exists: ${indexName}`, { cause: error });
+              throw new TypeError(`Index already exists: ${indexName}`);
             }
-            current = fresh;
+            const current = records.find((candidate) => candidate.id === table.id);
+            if (current === undefined) throw new UnknownTableError(tableName);
+            const dropped = columns.find(
+              (column) => !current.columns.some((candidate) => candidate.id === column.id),
+            );
+            if (dropped !== undefined) throw new TypeError(`Unknown column: ${dropped.name}`);
+            try {
+              const created = await this.store.updateTable(current.id, current.revision, {
+                secondaryIndexes: {
+                  ...current.secondaryIndexes,
+                  [indexId]: {
+                    name: indexName,
+                    columnId: columns[0]?.id ?? "",
+                    columnIds: columns.map((column) => column.id),
+                    directions: indexColumns.map((column) => column.direction),
+                    ...(options.unique === true ? { unique: true as const } : {}),
+                    termEncoding: "tuple-v2",
+                    storage: "postings-v1",
+                    storageColumnId,
+                    locator: current.uniqueKeyColumnId === undefined ? "row-id" : "key-hash-v1",
+                    state: "building",
+                    buildId,
+                    buildFromVersion: -1,
+                  },
+                },
+              });
+              // Claim the build session in the turn that marks the index, so no other
+              // connection's build can take it over before this one starts streaming. A claim
+              // refused here is retried by the build's own begin, which reports a real failure.
+              await this.#beginPostingBuild(created.id, storageColumnId, buildId).catch(
+                () => undefined,
+              );
+              return created;
+            } catch (error) {
+              if (
+                !(error instanceof TableRecordConflictError) ||
+                attempt >= this.#maxCommitRetries
+              ) {
+                throw error;
+              }
+            }
           }
+        });
+        try {
+          await this.#buildSecondaryIndex(marked, indexId, buildId).finally(() =>
+            // A no-op once the first attempt used or released the claim.
+            this.#releaseClaimedPostingBuild(marked.id, storageColumnId, buildId),
+          );
+        } catch (error) {
+          // A caller that sees CREATE INDEX fail must not inherit an unusable schema object. An
+          // abandoned tab is different: it never runs this catch, so the durable `building`
+          // marker remains for another connection to take over.
+          await this.#removeSecondaryIndexIfOwned(
+            marked.id,
+            indexId,
+            indexName,
+            storageColumnId,
+          ).catch((cleanupError: unknown) => {
+            throw new AggregateError(
+              [error, cleanupError],
+              `CREATE INDEX ${indexName} failed and its catalog cleanup also failed`,
+            );
+          });
+          throw error;
         }
       });
-      try {
-        await this.#buildSecondaryIndex(marked, indexId).finally(() =>
-          // A no-op once the first attempt used or released the claim.
-          this.#releaseClaimedPostingBuild(marked.id, storageColumnId, buildId),
-        );
-      } catch (error) {
-        // A caller that sees CREATE INDEX fail must not inherit an unusable schema object. An
-        // abandoned tab is different: it never runs this catch, so the durable `building` marker
-        // remains available for another connection to take over.
+    });
+  }
+
+  /**
+   * `CREATE INDEX IF NOT EXISTS`. Success means what `CREATE INDEX`'s does: the index is ready,
+   * and a UNIQUE one enforces. An index of that name that another statement is still creating is
+   * waited for; one whose creator's connection is gone is built here; and when that build fails,
+   * the creator's statement fails and so does this one, or this one creates the index itself and
+   * reports its own outcome. Reporting the name alone let a caller go on writing duplicates into
+   * an index that was never going to enforce.
+   */
+  async #createIndexIfNotExists(
+    indexName: string,
+    tableName: string,
+    columns: ReadonlyArray<{ name: string; direction: "asc" | "desc" }>,
+    options: { unique?: boolean },
+  ): Promise<void> {
+    for (;;) {
+      if (this.#closed) throw new DatabaseClosedError();
+      const found = await this.#secondaryIndexNamed(indexName);
+      if (found === undefined) {
+        try {
+          await this.createIndex(indexName, tableName, columns, options);
+          return;
+        } catch (error) {
+          // Another connection created it first: that one's outcome decides, below.
+          if ((await this.#secondaryIndexNamed(indexName)) === undefined) throw error;
+          continue;
+        }
+      }
+      if (secondaryIndexServes(found.index)) return;
+      const { table, indexId, index } = found;
+      const outcome = await asIndexCreator(
+        this.store,
+        index.storageColumnId,
+        this.#presence,
+        this.#shutdown.signal,
+        (exclusive) => this.#finishIndexCreation(table.id, indexId, index, exclusive),
+      );
+      // "gone": its creator's build failed and removed it, or it was dropped. Create it here.
+      if (outcome === "ready") return;
+    }
+  }
+
+  /** The secondary index of this name, on whichever table it is: index names are global. */
+  async #secondaryIndexNamed(
+    name: string,
+  ): Promise<{ table: TableRecord; indexId: string; index: SecondaryIndexRecord } | undefined> {
+    for (const table of await this.store.listTables()) {
+      for (const [indexId, index] of Object.entries(table.secondaryIndexes ?? {})) {
+        if (index.name === name) return { table, indexId, index };
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Runs holding the creation lock of an index another statement created, so that statement has
+   * settled or its connection is gone. "ready" once the index serves; "gone" once it no longer
+   * exists. One still not ready is built here, as its creator would have.
+   *
+   * A UNIQUE index that never enforced is still in its first build: the statement that created it
+   * never succeeded. When the lock covers every context (`exclusive`), no creator is left to fail
+   * and clean up, so this statement does both: a first build that fails -- the table holds a
+   * duplicate -- leaves no index, just as a failed `CREATE UNIQUE INDEX` leaves none. Without that
+   * proof the index is left for its creator, and this statement still reports the failure. So is
+   * an index this connection stops building because it is closing, as a closed tab leaves it.
+   */
+  async #finishIndexCreation(
+    tableId: string,
+    indexId: string,
+    created: SecondaryIndexRecord,
+    exclusive: boolean,
+  ): Promise<"ready" | "gone"> {
+    const table = await this.store.getTable(tableId);
+    const index = table?.secondaryIndexes?.[indexId];
+    if (table === undefined || index?.storageColumnId !== created.storageColumnId) return "gone";
+    if (secondaryIndexServes(index)) return "ready";
+    const firstBuild = index.unique === true && index.uniqueEnforced !== true;
+    try {
+      return await this.#buildSecondaryIndex(table, indexId);
+    } catch (error) {
+      if (exclusive && firstBuild && !this.#closed) {
         await this.#removeSecondaryIndexIfOwned(
-          marked.id,
+          tableId,
           indexId,
-          indexName,
-          storageColumnId,
+          index.name,
+          index.storageColumnId,
         ).catch((cleanupError: unknown) => {
           throw new AggregateError(
             [error, cleanupError],
-            `CREATE INDEX ${indexName} failed and its catalog cleanup also failed`,
+            `CREATE INDEX ${index.name} failed and its catalog cleanup also failed`,
           );
         });
-        throw error;
       }
-    });
+      throw error;
+    }
   }
 
   /** Removes only the exact failed build this caller created, retrying catalog CAS races. */
@@ -23460,9 +23562,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * while it scanned, or took the index over -- is followed by one that holds the writer turn
    * from its snapshot to its publication, which nothing can take over and no commit can outrun.
    * Writers wait for that one as for any DDL; readers never do.
+   *
+   * `ownedBuildId` is the build the caller marked the index with, when it did: only the
+   * statement that created the index may build under that mark. Another statement finishing the
+   * index begins a build of its own, which defers to the marked one while its owner lives.
+   * "gone" means the index no longer exists: dropped, or removed by its failed creator.
    */
-  async #buildSecondaryIndex(table: TableRecord, indexId: string): Promise<void> {
-    let ownedBuildId = table.secondaryIndexes?.[indexId]?.buildId;
+  async #buildSecondaryIndex(
+    table: TableRecord,
+    indexId: string,
+    ownedBuildId?: string,
+  ): Promise<"ready" | "gone"> {
     let holdTurn = false;
     let conflicts = 0;
     for (let waits = 0; ;) {
@@ -23470,8 +23580,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const current = await this.store.getTable(table.id);
       const held = current?.secondaryIndexes?.[indexId];
       // Dropped meanwhile (DROP INDEX, DROP TABLE): nothing is left to build.
-      if (current === undefined || held === undefined) return;
-      if (secondaryIndexServes(held)) return;
+      if (current === undefined || held === undefined) return "gone";
+      if (secondaryIndexServes(held)) return "ready";
       const key = `${current.id}/${held.storageColumnId}`;
       const inFlight = this.#ftsBuildsInFlight.get(key);
       if (inFlight !== undefined) {
@@ -23521,12 +23631,35 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
   }
 
-  /** Whether a UNIQUE build's staged key set is still owned by a live session. */
+  /**
+   * Whether a UNIQUE build's staged key set is still owned by a live session. One whose owner is
+   * gone (its tab closed mid-build) is ended here, on the owner's behalf, so the index can be
+   * built again now rather than once the set's lease runs out.
+   */
   async #uniqueKeyBuildLive(buildId: string): Promise<boolean> {
     const staged = await this.store.getUniqueKeyBuild(buildId);
-    return (
-      staged?.state === "active" && Date.parse(staged.expiresAt) > dateMilliseconds(this.#now())
-    );
+    const now = this.#now();
+    if (staged?.state !== "active" || Date.parse(staged.expiresAt) <= dateMilliseconds(now)) {
+      return false;
+    }
+    if (
+      staged.ownerId === this.#internalLeaseOwnerId ||
+      !(await ownerDeparted(this.store, staged.ownerId))
+    ) {
+      return true;
+    }
+    try {
+      await this.store.abortUniqueKeyBuild({
+        buildId,
+        ownerId: staged.ownerId,
+        expiresAtCutoff: dateIsoString(now),
+      });
+    } catch (error) {
+      // Completed or taken over meanwhile: whichever build holds it now is live.
+      if (error instanceof UniqueKeyBuildConflictError) return true;
+      throw error;
+    }
+    return false;
   }
 
   /**
@@ -23892,6 +24025,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * returns when its lease started.
    */
   async #beginUniqueKeyBuild(tableId: string, indexId: string, buildId: string): Promise<Date> {
+    await this.#presence.ready;
     const begun = this.#now();
     await this.store.beginUniqueKeyBuild({
       buildId,
@@ -23955,20 +24089,82 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       .catch(this.#postingCleanupFailure(tableId, index.storageColumnId));
   }
 
+  /**
+   * Claims the column's build session for `buildId`. A session another build holds is ended
+   * first when its owner is gone (see owner-presence.ts) -- its tab closed or crashed mid-build --
+   * or when it is one this engine began and lost track of; any other refusal is the caller's.
+   */
   async #beginPostingBuild(tableId: string, columnId: string, buildId: string): Promise<void> {
-    let lifetime = this.#postingBuildSessions.get(buildId);
+    const known = this.#postingBuildSessions.get(buildId);
+    let lifetime = known;
     if (lifetime === undefined) {
       const now = this.#now();
       lifetime = { createdAt: dateIsoString(now), expiresAt: this.#postingBuildExpiry(now) };
     }
-    await this.store.beginFtsBaseBuild({
-      tableId,
-      columnId,
-      buildId,
-      ownerId: this.#internalLeaseOwnerId,
-      ...lifetime,
-    });
+    const input = { tableId, columnId, buildId, ownerId: this.#internalLeaseOwnerId, ...lifetime };
+    await this.#presence.ready;
+    // Recorded before the store call, so a concurrent claim of this engine's never reads this
+    // session as one it lost track of.
     this.#postingBuildSessions.set(buildId, lifetime);
+    try {
+      try {
+        await this.store.beginFtsBaseBuild(input);
+      } catch (error) {
+        if (
+          !isLivePostingBuildRefusal(error) ||
+          !(await this.#endAbandonedPostingBuild(
+            tableId,
+            columnId,
+            buildId,
+            error as PostingBuildConflictError,
+          ))
+        ) {
+          throw error;
+        }
+        await this.store.beginFtsBaseBuild(input);
+      }
+    } catch (error) {
+      if (known === undefined) this.#postingBuildSessions.delete(buildId);
+      throw error;
+    }
+  }
+
+  /**
+   * Ends the session that refused `buildId`'s claim when nobody will ever finish it: its owner
+   * is gone, or it is this engine's own and no build of this engine holds it (its release
+   * failed). True when it ended; false when it is live, or when a store that names the caller
+   * rather than the holder in its refusal leaves nothing to act on.
+   */
+  async #endAbandonedPostingBuild(
+    tableId: string,
+    columnId: string,
+    buildId: string,
+    refusal: PostingBuildConflictError,
+  ): Promise<boolean> {
+    const { buildId: holder, ownerId } = refusal;
+    if (holder === buildId) return false;
+    if (
+      ownerId === this.#internalLeaseOwnerId
+        ? !this.#presence.sole || this.#postingBuildSessions.has(holder)
+        : !(await ownerDeparted(this.store, ownerId))
+    ) {
+      return false;
+    }
+    try {
+      // On the owner's behalf: the store lets only the owner end a session before it expires.
+      await this.store.abortFtsBaseBuild({
+        tableId,
+        columnId,
+        buildId: holder,
+        ownerId,
+        expiresAtCutoff: dateIsoString(this.#now()),
+      });
+    } catch (error) {
+      // Another connection ended it and began its own first.
+      if (error instanceof PostingBuildConflictError) return false;
+      throw error;
+    }
+    return true;
   }
 
   async #writePostingBuildChunk(

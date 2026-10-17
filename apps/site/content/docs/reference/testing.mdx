@@ -793,6 +793,18 @@ holders: a progressing queue is waited out without a report, a holder that never
 reported once and never bypassed, and a waiter that gives up leaves at once. The interaction
 simulator asserts zero lost commit races in Node and, for complete campaigns, across real tabs.
 
+`index-create-concurrency.test.ts` races `CREATE [UNIQUE] INDEX IF NOT EXISTS` against another
+connection's build on memory, IndexedDB, and OPFS: it must wait while that build runs, succeed
+only once the index enforces, fail when that build finds a duplicate (leaving no index), create
+the index itself when that build fails, and stop waiting when its own connection closes. Its
+second half parks a build mid-write and then marks its connection gone, as a closed tab would
+leave it: the index — UNIQUE or not, staged key set or postings, `CREATE`, a query's rebuild, or
+a full-text build — must be finished by another connection within seconds, and a live builder
+must never lose its build to the queries and statements waiting on it.
+`index-takeover.spec.ts` closes a real Chromium or WebKit tab in the middle of
+`CREATE UNIQUE INDEX` over IndexedDB and OPFS, and requires the other tab's waiting
+`CREATE UNIQUE INDEX IF NOT EXISTS` to finish within seconds with the index enforcing.
+
 ## The fault sweep
 
 `packages/core/src/testing/fault-sweep.ts` runs a fixed workload once without faults, then

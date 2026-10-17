@@ -3156,6 +3156,13 @@ export interface AbortPostingBuildInput {
   expiresAtCutoff: string;
 }
 
+/**
+ * A postings build step refused because the column's build session is not the caller's. When
+ * `beginFtsBaseBuild` refuses because another session is live, `buildId` and `ownerId` name
+ * that session: the engine ends a session whose owner's connection is gone (its tab closed
+ * mid-build) on the owner's behalf through `abortFtsBaseBuild`, instead of waiting for its
+ * lease to run out. An adapter that names the caller instead stays correct, only slower.
+ */
 export class PostingBuildConflictError extends Error {
   override readonly name = "PostingBuildConflictError";
 

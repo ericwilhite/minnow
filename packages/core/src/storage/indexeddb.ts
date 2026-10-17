@@ -2403,7 +2403,12 @@ export class IndexedDbBlockStore implements BlockStore {
           Date.parse(existing.updatedAt),
         )))
     ) {
-      throw new PostingBuildConflictError(buildId, input.ownerId, "owned by another caller");
+      // Names the holder, as every store's refusal does: the engine asks whether it is alive.
+      throw new PostingBuildConflictError(
+        existing.buildId,
+        existing.ownerId,
+        "owned by another caller",
+      );
     }
     const transaction = this.#transaction("catalog", "readwrite");
     const store = transaction.objectStore("catalog");
@@ -2434,10 +2439,18 @@ export class IndexedDbBlockStore implements BlockStore {
         activeLimit,
       );
     }
-    if ((await requestResult(store.getKey(markerKey))) !== undefined) {
+    const raced = asOptionalFtsBaseBuildMarker(
+      await requestResult<unknown>(store.get(markerKey)),
+      markerKey,
+    );
+    if (raced !== undefined) {
       transaction.abort();
       await ignoreAbort(transaction);
-      throw new PostingBuildConflictError(buildId, input.ownerId, "another live build exists");
+      throw new PostingBuildConflictError(
+        raced.buildId,
+        raced.ownerId,
+        "another live build exists",
+      );
     }
     store.put(
       {

@@ -104,7 +104,8 @@ export function isStoreUncoordinatedForTests(store: BlockStore): boolean {
   return uncoordinated.has(store);
 }
 
-function lockManager(): LockManager | undefined {
+/** The context's Web Locks, where it has them (every current browser, and Node from 24). */
+export function lockManager(): LockManager | undefined {
   return typeof navigator === "undefined" ? undefined : navigator.locks;
 }
 

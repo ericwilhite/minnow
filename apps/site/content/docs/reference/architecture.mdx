@@ -185,6 +185,13 @@ Minnow assumes several tabs, unaware of each other, some frozen or already gone.
   heartbeat or a lifecycle notification. A tab that sleeps past its lease and wakes pins the same
   version again if it is still there and carries on; if collection reclaimed it meanwhile, the
   read fails with `SnapshotManifestMissingError` and can simply be run again.
+- **A dead tab's index build is taken over at once.** An index build stages its work under a
+  session with a one-hour lease, so a large build never stops to renew it. Each connection also
+  holds the Web Lock `minnowdb-owner:<id>` while it is open, and the browser releases that lock
+  when the tab goes away. A session whose owner holds no such lock is ended and built again by
+  whichever connection needs the index next; a live owner's build is never taken. Ending a
+  session wrongly could not corrupt anything — the store refuses the displaced build's later
+  steps — so the lock decides only whether waiting is worthwhile.
 
 ## How queries run
 

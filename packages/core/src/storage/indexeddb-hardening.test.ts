@@ -6347,8 +6347,10 @@ describe("IndexedDB postings build recovery hardening", () => {
         ownerId: "competing-owner",
       }),
     ).rejects.toMatchObject({
+      // The refusal names the live session's holder, which the engine asks about.
       name: "PostingBuildConflictError",
-      ownerId: "competing-owner",
+      buildId: "search-build",
+      ownerId: "search-owner",
       reason: "owned by another caller",
     });
     await expect(

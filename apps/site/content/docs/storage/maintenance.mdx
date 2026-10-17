@@ -328,12 +328,18 @@ store, and the retry resolves them on its own:
   again, so a build that fails in the other tab is retried here; the next commit past the tail
   bound asks too, while the index still has a tail to fold (an invalid one keeps none). A build
   whose index was dropped, invalidated, or taken over while it ran stops quietly for the same
-  reason.
+  reason. A session whose tab closed or crashed mid-build is not live: every connection holds a
+  Web Lock while it is open, and a claim that finds the session's owner holding none ends that
+  session and builds at once, instead of waiting out the session's one-hour lease. Only where
+  Web Locks are missing (older Node releases, very old browsers) does the lease remain the way
+  out.
 - **Commits during a `UNIQUE` index's first build.** Its key set can be published only over the
   snapshot it was read from. `CREATE UNIQUE INDEX` that finds commits landed meanwhile does not
   fail: it builds again inside the write turn, where none can land. Background work never holds
-  writers that long, so another tab finishing a `CREATE UNIQUE INDEX` whose tab closed mid-build
-  leaves the index scanning and tries again at the next query over it. Eight such losses in a
+  writers that long, so a query finishing a `CREATE UNIQUE INDEX` whose tab closed mid-build
+  leaves the index scanning and tries again at the next query over it; a
+  `CREATE UNIQUE INDEX IF NOT EXISTS` finishing it builds inside the turn, as `CREATE` does.
+  Eight such losses in a
   row with no publication between them are reported with the context
   `secondary index build for <table>/<index> (8 attempts in a row without progress)`. Folding an
   existing `UNIQUE` index's delta tail rebuilds only its postings; its key set is the separately
