@@ -173,7 +173,8 @@ suites against both.
 - Kysely 0.6.0 accepts `renameColumn()`, `ifNotExists()` on `addColumn`, and array parameters for
   `fn.any`.
 - Devtools 0.3.7 confirms and reports `RENAME COLUMN` like the other catalog statements, and its
-  console no longer warns about the SQL forms this release supports.
+  console no longer warns about the SQL forms this release supports. It also carries the 0.3.6
+  changes listed below, which were never published on their own.
 
 ### Performance
 
@@ -272,9 +273,10 @@ gaps.
 
 ## Devtools 0.3.6 — October 16, 2026
 
-Published packages: `@minnowdb/devtools@0.3.6`.
+Not published: this release's run failed on unrelated real-browser tests, so `@minnowdb/devtools`
+went from 0.3.5 to 0.3.7. Everything below ships in 0.3.7 with core 0.16.0.
 
-A devtools-only release: `@minnowdb/core` stays at 0.15.0, stored formats are unchanged, and no
+A devtools-only change set: `@minnowdb/core` stayed at 0.15.0, stored formats are unchanged, and no
 migration is needed.
 
 ### Fixed
