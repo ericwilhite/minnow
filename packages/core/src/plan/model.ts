@@ -93,6 +93,12 @@ export type ScalarFunctionName =
   | "MINNOW_TUPLE_KEY"
   /** Parser-produced wrapper carrying one explicit collation through ordering/comparison. */
   | "MINNOW_COLLATE"
+  /**
+   * Compiler-produced wrapper around a `timestamp without time zone` operand of a text or JSON
+   * rendering: renders its Date without the `+00` a `timestamp with time zone` carries. The
+   * second argument is the literal style, "text" or "json"; any other value passes through.
+   */
+  | "MINNOW_TIMESTAMP_TEXT"
   | "NEXTVAL"
   | "CURRVAL"
   | "RANDOM"
@@ -186,6 +192,12 @@ export type Expression =
        * where a placeholder's Date has no type of its own and reads as the DATE.
        */
       timestamp?: true;
+      /**
+       * With `timestamp`: a constant folded from a `timestamp with time zone` expression
+       * (`CAST('…' AS TIMESTAMPTZ)`, `TO_TIMESTAMP(0)`). The instant is the same; its text keeps
+       * the `+00` a TIMESTAMP constant's text does not carry.
+       */
+      zoned?: true;
     }
   /** A `?` or `$n` placeholder; `index` is 0-based. Replaced by a literal at bind time. */
   | { kind: "parameter"; index: number }

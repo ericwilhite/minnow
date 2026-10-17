@@ -1187,6 +1187,47 @@ const SCENARIOS: Scenario[] = [
       "SELECT id, state, owner, n FROM tasks ORDER BY id",
     ],
   },
+  {
+    // What a write stores when it renders a datetime as text or divides a date difference:
+    // a DEFAULT, INSERT … SELECT, UPDATE SET, RETURNING, and a generated column. SQLite has no
+    // DATE, INTERVAL, or timestamp text of PostgreSQL's shape, so PostgreSQL alone judges.
+    name: "datetime text and date division in written values",
+    statements: [
+      { sql: "SET TIME ZONE 'UTC'", sqlite: null },
+      {
+        sql: "CREATE TABLE stamps (id INTEGER PRIMARY KEY, at TIMESTAMPTZ, day DATE, until DATE, span INTERVAL, note TEXT DEFAULT CAST(TIMESTAMP '2026-05-06 07:08:09.5' AS TEXT), weeks INTEGER GENERATED ALWAYS AS ((until - day) / 7) STORED)",
+        sqlite: null,
+      },
+      {
+        sql: "INSERT INTO stamps (id, at, day, until, span) VALUES (1, '2026-01-02 03:04:05.25+00', '2026-01-01', '2026-02-15', '1 day 02:00:00') RETURNING id, note, weeks",
+        sqlite: null,
+      },
+      {
+        sql: "INSERT INTO stamps (id, at, day, until, note) SELECT 2, at + INTERVAL '1 hour', day, until + 30, CAST(at AS TEXT) || ' / ' || CAST(day + INTERVAL '1 day' AS TEXT) || ' / ' || span FROM stamps WHERE id = 1 RETURNING id, note, weeks",
+        sqlite: null,
+      },
+      {
+        sql: "UPDATE stamps SET note = CONCAT(day, ' ', until - day, ' ', (until - day) / 7, ' ', span, ' ', at) WHERE id = 1 RETURNING note, weeks",
+        sqlite: null,
+      },
+      {
+        sql: "UPDATE stamps SET until = until + 7, span = '-3 days 4 hours' WHERE id = 2 RETURNING weeks, CAST(span AS TEXT) AS span",
+        sqlite: null,
+      },
+      {
+        sql: "UPDATE stamps SET note = CAST(TO_JSON(at) AS TEXT) WHERE id = 2 RETURNING note",
+        sqlite: null,
+      },
+      {
+        sql: "INSERT INTO stamps (id, day, until) VALUES (3, '2026-03-01', '2026-01-01') RETURNING note, weeks",
+        sqlite: null,
+      },
+      {
+        sql: "SELECT id, CAST(at AS TEXT) AS at, CAST(day AS TEXT) AS day, CAST(until AS TEXT) AS until, CAST(span AS TEXT) AS span, note, weeks, (until - day) / 7 AS computed FROM stamps ORDER BY id",
+        sqlite: null,
+      },
+    ],
+  },
 ];
 
 interface ScenarioEngines {

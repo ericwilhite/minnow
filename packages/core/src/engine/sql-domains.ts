@@ -1,7 +1,13 @@
 import type { SqlDomain } from "../storage/types.js";
 import { parseJson } from "../block-format/json-parse.js";
 import { assertWellFormedString } from "../block-format/unicode.js";
-import { dateIsoString } from "../date-value.js";
+import { dateIsoString, dateMilliseconds } from "../date-value.js";
+import {
+  postgresIntervalText,
+  postgresTimeText,
+  postgresTimestampJsonText,
+  postgresTimestampText,
+} from "./sql-datetime-text.js";
 import { JsonNumber, parseJsonValue } from "./json-values.js";
 import {
   MAX_SQL_SCALAR_RESULT_CHARACTERS,
@@ -456,7 +462,8 @@ function encodeBoundedJson(
     return;
   }
   if (value instanceof Date) {
-    const timestamp = dateIsoString(value);
+    // to_json's ISO 8601 rendering of a timestamp with time zone in a UTC session.
+    const timestamp = postgresTimestampJsonText(dateMilliseconds(value), true);
     appendJsonPiece(state, JSON.stringify(timestamp), label);
     return;
   }
@@ -680,50 +687,149 @@ export function intervalDomainValue(value: unknown): string | null {
     }
     return value;
   }
-  const source = value.trim();
+  const [months, days, microseconds] = parsedIntervalText(value);
+  return boundedTaggedDomainValue(
+    INTERVAL_VALUE,
+    JSON.stringify([months, days, microseconds]),
+    "INTERVAL value",
+  );
+}
+
+const MICROSECONDS_PER_DAY = 86_400_000_000;
+
+/** One interval unit: how many months, days, or microseconds one of it is. */
+interface IntervalUnit {
+  readonly months?: number;
+  readonly days?: number;
+  readonly usecs?: number;
+}
+
+function intervalUnitNames(
+  names: readonly string[],
+  unit: IntervalUnit,
+): Array<[string, IntervalUnit]> {
+  return names.map((name) => [name, unit]);
+}
+
+/** The interval units PostgreSQL's input accepts, by every spelling it accepts. */
+const intervalUnits: ReadonlyMap<string, IntervalUnit> = new Map([
+  ...intervalUnitNames(["millennium", "millennia", "millenniums", "mil", "mils"], {
+    months: 12_000,
+  }),
+  ...intervalUnitNames(["century", "centuries", "cent", "c"], { months: 1_200 }),
+  ...intervalUnitNames(["decade", "decades", "dec", "decs"], { months: 120 }),
+  ...intervalUnitNames(["year", "years", "yr", "yrs", "y"], { months: 12 }),
+  // Not PostgreSQL's: interval arithmetic here has always read a quarter as three months.
+  ...intervalUnitNames(["quarter", "quarters"], { months: 3 }),
+  ...intervalUnitNames(["month", "months", "mon", "mons"], { months: 1 }),
+  ...intervalUnitNames(["week", "weeks", "w"], { days: 7 }),
+  ...intervalUnitNames(["day", "days", "d"], { days: 1 }),
+  ...intervalUnitNames(["hour", "hours", "hr", "hrs", "h"], { usecs: 3_600_000_000 }),
+  ...intervalUnitNames(["minute", "minutes", "min", "mins", "m"], { usecs: 60_000_000 }),
+  ...intervalUnitNames(["second", "seconds", "sec", "secs", "s"], { usecs: 1_000_000 }),
+  ...intervalUnitNames(["millisecond", "milliseconds", "msec", "msecs", "ms"], { usecs: 1_000 }),
+  ...intervalUnitNames(["microsecond", "microseconds", "usec", "usecs", "us"], { usecs: 1 }),
+]);
+
+const INTERVAL_TIME_FIELD = /([+-]?)(\d+):(\d{1,2})(?::(\d{1,2})(?:\.(\d*))?)?/y;
+const INTERVAL_UNIT_FIELD = /([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*([a-z]+)/y;
+
+/**
+ * Reads PostgreSQL's interval input into [months, days, microseconds]: number-unit pairs
+ * (`2 years`, `3 mons`, `-1 day`, `1.5 hours`), a signed `HH:MM[:SS[.ffffff]]` time field, an
+ * optional leading `@`, and a trailing `ago`. That covers every interval PostgreSQL's own output
+ * writes, so `CAST(CAST(i AS TEXT) AS INTERVAL)` returns `i`. A fraction cascades down the way
+ * PostgreSQL's does: a fractional year to whole months, a fractional month to 30-day days, a
+ * fractional day or week to time.
+ */
+function parsedIntervalText(value: string): [number, number, number] {
+  const source = value.trim().toLowerCase();
   let months = 0;
   let days = 0;
   let microseconds = 0;
   let matched = 0;
-  const partPattern = /([+-]?\d+(?:\.\d+)?)\s*([a-zA-Z]+)/g;
-  const units = new Map<string, (amount: number) => void>([
-    ["year", (amount) => (months += amount * 12)],
-    ["month", (amount) => (months += amount)],
-    ["week", (amount) => (days += amount * 7)],
-    ["day", (amount) => (days += amount)],
-    ["hour", (amount) => (microseconds += amount * 3_600_000_000)],
-    ["minute", (amount) => (microseconds += amount * 60_000_000)],
-    ["second", (amount) => (microseconds += amount * 1_000_000)],
-  ]);
-  for (const part of source.matchAll(partPattern)) {
-    const unit = (part[2] ?? "").toLowerCase().replace(/s$/, "");
-    const apply = units.get(unit);
-    if (apply === undefined) throw new TypeError(`Unknown INTERVAL unit: ${unit}`);
-    const amount = Number(part[1]);
-    if (
-      (unit === "year" || unit === "month" || unit === "week" || unit === "day") &&
-      !Number.isInteger(amount)
-    ) {
-      throw new TypeError(`INTERVAL ${unit} must be a whole number`);
+  let at = source.startsWith("@") ? 1 : 0;
+  let ago = false;
+  const addDays = (amount: number): void => {
+    const whole = Math.trunc(amount);
+    days += whole;
+    microseconds += Math.round((amount - whole) * MICROSECONDS_PER_DAY);
+  };
+  while (at < source.length) {
+    const code = source.charCodeAt(at);
+    if (code === 32 || (code >= 9 && code <= 13)) {
+      at += 1;
+      continue;
     }
-    apply(amount);
+    if (source.startsWith("ago", at) && source.slice(at + 3).trim() === "" && matched > 0) {
+      ago = true;
+      break;
+    }
+    INTERVAL_TIME_FIELD.lastIndex = at;
+    const time = INTERVAL_TIME_FIELD.exec(source);
+    if (time !== null) {
+      const minutes = Number(time[3]);
+      const seconds = Number(time[4] ?? "0");
+      if (minutes > 59 || seconds > 59) throw new TypeError(`Invalid INTERVAL value: ${value}`);
+      const fraction = time[5] ?? "";
+      const fractionMicroseconds =
+        fraction === "" ? 0 : Math.round(Number(`0.${fraction}`) * 1_000_000);
+      const magnitude =
+        Number(time[2]) * 3_600_000_000 + minutes * 60_000_000 + seconds * 1_000_000;
+      microseconds += (time[1] === "-" ? -1 : 1) * (magnitude + fractionMicroseconds);
+      at = INTERVAL_TIME_FIELD.lastIndex;
+      matched += 1;
+      continue;
+    }
+    INTERVAL_UNIT_FIELD.lastIndex = at;
+    const part = INTERVAL_UNIT_FIELD.exec(source);
+    if (part === null) throw new TypeError(`Invalid INTERVAL value: ${value}`);
+    const unit = part[2] ?? "";
+    const scale = intervalUnits.get(unit);
+    if (scale === undefined) throw new TypeError(`Unknown INTERVAL unit: ${unit}`);
+    const amount = Number(part[1]);
+    if (scale.months !== undefined) {
+      const whole = Math.trunc(amount);
+      const fraction = amount - whole;
+      if (scale.months === 1) {
+        months += whole;
+        addDays(fraction * 30);
+      } else {
+        months += whole * scale.months + Math.round(fraction * scale.months);
+      }
+    } else if (scale.days !== undefined) {
+      addDays(amount * scale.days);
+    } else {
+      microseconds += Math.round(amount * (scale.usecs ?? 1));
+    }
+    at = INTERVAL_UNIT_FIELD.lastIndex;
     matched += 1;
   }
-  const residue = source.replace(partPattern, "").trim();
   if (
     matched === 0 ||
-    residue !== "" ||
     !Number.isSafeInteger(months) ||
     !Number.isSafeInteger(days) ||
     !Number.isSafeInteger(microseconds)
   ) {
     throw new TypeError(`Invalid INTERVAL value: ${value}`);
   }
-  return boundedTaggedDomainValue(
-    INTERVAL_VALUE,
-    JSON.stringify([months, days, microseconds]),
-    "INTERVAL value",
-  );
+  // JSON.stringify writes -0 as 0, but the parts are compared as numbers before that.
+  return ago
+    ? [months === 0 ? 0 : -months, days === 0 ? 0 : -days, microseconds === 0 ? 0 : -microseconds]
+    : [months === 0 ? 0 : months, days === 0 ? 0 : days, microseconds === 0 ? 0 : microseconds];
+}
+
+/**
+ * An interval text read as months and milliseconds, for date arithmetic that applies a
+ * literal interval directly: days fold into milliseconds, which is exact because every
+ * datetime here is UTC and a day is always 24 hours.
+ */
+export function intervalTextMonthsAndMilliseconds(text: string): {
+  months: number;
+  milliseconds: number;
+} {
+  const [months, days, microseconds] = parsedIntervalText(text);
+  return { months, milliseconds: days * 86_400_000 + microseconds / 1_000 };
 }
 
 /** The [months, days, microseconds] fields of a tagged INTERVAL, or undefined for any other value. */
@@ -976,12 +1082,14 @@ export function externalSqlDomainColumnValue(
 export function externalSqlDomainValue(value: unknown): unknown {
   if (typeof value !== "string") return value;
   if (value.startsWith(TEXT_VALUE)) return value.slice(TEXT_VALUE.length);
-  for (const prefix of [NUMERIC, JSON_VALUE, JSONB_VALUE, UUID_VALUE, DATE_VALUE, TIME_VALUE]) {
+  for (const prefix of [NUMERIC, JSON_VALUE, JSONB_VALUE, UUID_VALUE, DATE_VALUE]) {
     if (value.startsWith(prefix)) return value.slice(prefix.length);
   }
+  // TIME and INTERVAL render as PostgreSQL writes them: `10:00:00.5`, `1 mon 14 days 12:00:00`.
+  if (value.startsWith(TIME_VALUE)) return postgresTimeText(value.slice(TIME_VALUE.length));
   if (value.startsWith(INTERVAL_VALUE)) {
     const decoded = parseJson(value.slice(INTERVAL_VALUE.length)) as [number, number, number];
-    return `${String(decoded[0])} mons ${String(decoded[1])} days ${String(decoded[2])} usecs`;
+    return postgresIntervalText(decoded[0], decoded[1], decoded[2]);
   }
   if (value.startsWith(ARRAY_VALUE)) return value.slice(ARRAY_VALUE.length);
   if (value.startsWith(COLLATION_VALUE)) {
@@ -991,6 +1099,20 @@ export function externalSqlDomainValue(value: unknown): unknown {
     return (parseJson(value.slice(ENUM_VALUE.length)) as [string, number, string])[2];
   }
   return value;
+}
+
+/**
+ * The text a full-text document indexed for a TIME or INTERVAL value before SQL text followed
+ * PostgreSQL: the canonical TIME as stored, and `M mons D days U usecs`. Persisted postings hold
+ * terms of exactly this text, so full-text search keeps reading these two domains this way;
+ * undefined for any other value.
+ */
+export function fullTextDomainText(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  if (value.startsWith(TIME_VALUE)) return value.slice(TIME_VALUE.length);
+  if (!value.startsWith(INTERVAL_VALUE)) return undefined;
+  const decoded = parseJson(value.slice(INTERVAL_VALUE.length)) as [number, number, number];
+  return `${String(decoded[0])} mons ${String(decoded[1])} days ${String(decoded[2])} usecs`;
 }
 
 /**
@@ -1044,7 +1166,7 @@ export function concatenatedSqlValue(leftValue: unknown, rightValue: unknown): s
 function concatenationOperandText(value: unknown): string {
   if (typeof value === "number") return String(value);
   if (typeof value === "boolean") return value ? "true" : "false";
-  if (value instanceof Date) return dateIsoString(value);
+  if (value instanceof Date) return postgresTimestampText(dateMilliseconds(value), true);
   throw new TypeError("|| requires a string operand");
 }
 

@@ -649,7 +649,7 @@ describe("CREATE TABLE", () => {
           document: '{"a":1,"b":2}',
           choices: "[1,2]",
           at: "12:34:56",
-          span: "1 mons 2 days 0 usecs",
+          span: "1 mon 2 days",
           feeling: "happy",
         },
       ],

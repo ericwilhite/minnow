@@ -134,7 +134,7 @@ describe("PostgreSQL value domains and predicates", () => {
         u: "550e8400-e29b-41d4-a716-446655440000",
         a: "[1,2,null]",
         t: "12:34:56.25",
-        i: "1 mons 2 days 0 usecs",
+        i: "1 mon 2 days",
       },
     ]);
   });

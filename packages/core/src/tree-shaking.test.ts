@@ -60,8 +60,11 @@ const DATABASE_MARKER = "A database cannot queue more than";
 // The 0.16.0 audit (prepared read templates, ordered selection, index reads, columnar statement
 // results, PostgreSQL forms, schema-change folds): 1067.0 KiB raw / 317.3 KiB gzip.
 // The V8 JSON key guard (block-format/json-parse.ts): 1069.6 KiB raw / 318.4 KiB gzip.
-const COMPLETE_ENTRY_RAW_BUDGET = 1070 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 319 * 1024;
+// PostgreSQL datetime text (timestamp, interval, and TIME output and input, the static
+// timestamp-without-time-zone typing, date - date integer division): 1080.0 KiB raw / 321.7 KiB
+// gzip.
+const COMPLETE_ENTRY_RAW_BUDGET = 1081 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 322 * 1024;
 // Measured with the larger durable adapter: 1211.9 KiB raw / 337.5 KiB gzip. The durable
 // served-request ledger (OPFS layout 6) adds about 20 KiB raw: 1231.3 KiB raw. With the scope
 // write set: 346.0 KiB gzip. The unbounded journal (memoized RecordCore journal, bounded served
@@ -78,7 +81,8 @@ const COMPLETE_ENTRY_GZIP_BUDGET = 319 * 1024;
 // 1397.8 KiB raw.
 // The 0.16.0 audit: 1449.0 KiB raw.
 // The V8 JSON key guard: 1451.2 KiB raw.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1452 * 1024;
+// PostgreSQL datetime text: 1461.6 KiB raw.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1462 * 1024;
 // Explicit scheduler ownership and bounded diagnostic history add about 1 KiB gzip over the
 // correctness/upgrade batch (361.6 KiB measured). Concurrent compaction and posting ownership
 // repairs measure 362.1 KiB; allow the next whole KiB without changing runtime performance gates.
@@ -91,7 +95,8 @@ const ENGINE_WITH_OPFS_RAW_BUDGET = 1452 * 1024;
 // work: 399.9 KiB measured.
 // The 0.16.0 audit: 416.2 KiB measured.
 // With the V8 JSON key guard: 417.2 KiB measured.
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 418 * 1024;
+// With PostgreSQL datetime text: 420.5 KiB measured.
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 421 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
 // code splitting the way Vite's default iife worker format does. The generic entry inlined the
 // same way measured 1546.4 KiB raw / 422.3 KiB gzip. Measured with typed coordination recovery: about 1239 KiB raw / 344.1 KiB gzip.
@@ -106,8 +111,9 @@ const ENGINE_WITH_OPFS_GZIP_BUDGET = 418 * 1024;
 // (point-read plans, index reads, ordered selection), 1393.0 KiB raw / 396.7 KiB gzip.
 // The 0.16.0 audit: 1444.1 KiB raw / 412.7 KiB gzip.
 // The V8 JSON key guard: 1446.3 KiB raw / 413.8 KiB gzip.
-const INDEXEDDB_WORKER_RAW_BUDGET = 1447 * 1024;
-const INDEXEDDB_WORKER_GZIP_BUDGET = 414 * 1024;
+// PostgreSQL datetime text: 1456.7 KiB raw / 417.2 KiB gzip.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1457 * 1024;
+const INDEXEDDB_WORKER_GZIP_BUDGET = 418 * 1024;
 
 const repoRoot = join(import.meta.dirname, "..", "..", "..");
 

@@ -235,8 +235,8 @@ machines: https://minnowdb.com/llms.txt
   subquery predicates in UPDATE/DELETE,
   range-correlated LATERAL, ordered STRING_AGG/JSON_ARRAYAGG, the ordered-set aggregates
   PERCENTILE_CONT/PERCENTILE_DISC/MODE `WITHIN GROUP (ORDER BY …)`, `generate_series` over
-  integers and timestamps in FROM, `date - date` (days), `date ± integer`, `timestamp - timestamp`
-  (an interval), SIMILAR TO, COLLATE, constant
+  integers and timestamps in FROM, `date - date` (an integer count of days, so `/` truncates),
+  `date ± integer`, `timestamp - timestamp` (an interval), SIMILAR TO, COLLATE, constant
   JSON_TABLE, the `->`/`->>` JSON operators (which also accept plain JSON text, and error on
   a non-JSON document), `DISTINCT ON`, `JOIN … USING` and `NATURAL JOIN` with merged join
   columns, `UPDATE … FROM` and `DELETE … USING`, `TRUNCATE`,
@@ -251,6 +251,10 @@ machines: https://minnowdb.com/llms.txt
   building `IN ($1, $2, …)` per length; it binds to the same plan as the IN list. An array binds
   only under ANY/ALL. Numeric RANGE offsets need one numeric ordering expression.
   FULL JOIN supports grouping, DISTINCT, wildcards, and compound ON in its sole-join form.
+- A datetime cast or concatenated to text is PostgreSQL's text in UTC: `2026-01-02 03:04:05+00`
+  for a stored value, no `+00` for a `TIMESTAMP` literal or cast, and
+  `"2026-01-02T03:04:05+00:00"` in JSON. INTERVAL values read and render as `1 day 02:00:00`.
+  Query results return datetimes as `Date` objects; use those rather than parsing SQL text.
 - Unsupported: keyless `UPDATE`/`DELETE`, `GRANT`, `SERIALIZABLE` isolation, `LOCK TABLE`, DDL
   inside `BEGIN … COMMIT`, several statements in one call, range-correlated LATERAL
   grouping/order/limit, correlated JSON_TABLE documents, array slices and multidimensional access,

@@ -1283,7 +1283,7 @@
       "id": "json.row-reference",
       "status": "supported",
       "example": "SELECT r.region, JSON_AGG(r ORDER BY r.amount) AS rows_doc, JSON_AGG(ROW_TO_JSON(r) ORDER BY r.amount) AS row_docs FROM (SELECT region, amount FROM rows) r GROUP BY r.region",
-      "notes": "A table alias used as a value is the row as a JSON object with the source's columns in order, as PostgreSQL treats it \u2014 the shape json_agg(agg) and to_json(obj) take in Kysely's jsonArrayFrom and jsonObjectFrom. Datetime members render as ISO 8601 with a Z suffix."
+      "notes": "A table alias used as a value is the row as a JSON object with the source's columns in order, as PostgreSQL treats it \u2014 the shape json_agg(agg) and to_json(obj) take in Kysely's jsonArrayFrom and jsonObjectFrom. Datetime members render as to_json renders a timestamp with time zone: ISO 8601 with a +00:00 offset."
     },
     {
       "id": "json.value",
@@ -1396,8 +1396,8 @@
     {
       "id": "type.interval",
       "status": "supported",
-      "example": "SELECT joined + INTERVAL '1 day' AS next_day FROM rows",
-      "notes": "Preserves separate month, day, and microsecond fields. A date or datetime accepts + and - INTERVAL, and timestamp - timestamp returns one. Arithmetic between intervals is not supported (see type.interval-arithmetic)."
+      "example": "SELECT joined + INTERVAL '1 day' AS next_day, joined - TIMESTAMP '2026-01-01' AS since, INTERVAL '1 year 2 months 3 days 04:05:06.5' AS span, CAST(INTERVAL '-3 days 4 hours' AS TEXT) AS said FROM rows",
+      "notes": "Preserves separate month, day, and microsecond fields. A date or datetime accepts + and - INTERVAL, and timestamp - timestamp returns one. An interval is returned, cast, and concatenated as PostgreSQL's text: 1 year 2 mons 3 days 04:05:06.5, -00:00:01, -3 days +04:00:00. INTERVAL input reads that text back, as well as unit spellings such as 2 hours 30 minutes. Arithmetic between intervals is not supported (see type.interval-arithmetic)."
     },
     {
       "id": "type.interval-arithmetic",
@@ -1655,8 +1655,14 @@
     {
       "id": "type.time",
       "status": "supported",
-      "example": "SELECT TIME '12:00:00' AS at",
-      "notes": "A time of day without a time zone, returned as canonical text."
+      "example": "SELECT TIME '12:00:00' AS at, CAST(TIME '12:00:00.500' AS TEXT) AS half",
+      "notes": "A time of day without a time zone, returned as PostgreSQL's text: HH:MM:SS, with fractional seconds only when nonzero and without trailing zeros."
+    },
+    {
+      "id": "type.timestamp-text",
+      "status": "supported",
+      "example": "SELECT CAST(joined AS TEXT) AS at, 'joined ' || joined AS said, CAST(TIMESTAMP '2026-01-02 03:04:05.5' AS TEXT) AS local_at, TO_JSON(joined) AS doc FROM rows",
+      "notes": "A datetime becomes text the way PostgreSQL writes it in a UTC session, through CAST and ::text, ||, CONCAT, FORMAT, string functions over the cast, and the JSON constructors. A stored datetime is an instant, PostgreSQL's timestamp with time zone: 2026-01-02 03:04:05+00, fractional seconds only when nonzero (03:04:05.5+00), and 2026-01-02T03:04:05+00:00 in JSON. A TIMESTAMP literal, a cast to TIMESTAMP, MAKE_TIMESTAMP, LOCALTIMESTAMP, and a date plus an interval are timestamps without time zone and carry no zone: 2026-01-02 03:04:05.5. That text reads back as the same instant. Values returned to JavaScript stay Date objects."
     },
     {
       "id": "type.date",
@@ -1772,8 +1778,8 @@
     {
       "id": "expression.date-minus-date",
       "status": "supported",
-      "example": "SELECT DATE '2026-01-10' - DATE '2026-01-05' AS days, CAST(joined AS DATE) - DATE '2026-01-01' AS since_new_year FROM rows WHERE joined IS NOT NULL",
-      "notes": "date - date is the whole number of days between them, as an integer."
+      "example": "SELECT DATE '2026-01-10' - DATE '2026-01-05' AS days, CAST(joined AS DATE) - DATE '2026-01-01' AS since_new_year, (CAST(joined AS DATE) - DATE '2025-12-01') / 7 AS weeks FROM rows WHERE joined IS NOT NULL",
+      "notes": "date - date is the whole number of days between them, as an integer, so dividing it truncates toward zero as integer division does: (shipped - placed) / 7 counts whole weeks. That holds for DATE columns, constants, casts, and parameters cast to DATE."
     },
     {
       "id": "expression.date-plus-integer",
@@ -1848,7 +1854,7 @@
       "id": "function.age",
       "status": "supported",
       "example": "SELECT AGE(TIMESTAMP '2026-03-15 12:00:00', joined) AS since, AGE(joined) AS so_far FROM rows WHERE joined IS NOT NULL",
-      "notes": "The calendar difference PostgreSQL's AGE reports (years and months, then days borrowed from the earlier date's month, then time); AGE(x) measures from the statement's CURRENT_DATE. The result is Minnow's canonical interval text."
+      "notes": "The calendar difference PostgreSQL's AGE reports (years and months, then days borrowed from the earlier date's month, then time); AGE(x) measures from the statement's CURRENT_DATE. The result is an interval in PostgreSQL's text, such as 2 mons 13 days 12:00:00."
     },
     {
       "id": "where.calendar-equality",

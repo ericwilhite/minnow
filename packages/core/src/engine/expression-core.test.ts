@@ -34,7 +34,7 @@ describe("CAST", () => {
       run(
         "SELECT CAST(amount AS TEXT) AS t, CAST('7' AS INTEGER) AS i, CAST(TRUE AS TEXT) AS b, CAST(joined AS TEXT) AS d FROM rows WHERE id = 1",
       ),
-    ).toEqual([{ t: "10", i: 7, b: "true", d: "2026-01-02T03:04:05.000Z" }]);
+    ).toEqual([{ t: "10", i: 7, b: "true", d: "2026-01-02 03:04:05+00" }]);
     expect(
       run("SELECT CAST('2026-01-02T03:04:05.000Z' AS TIMESTAMP) AS d FROM rows WHERE id = 1"),
     ).toEqual([{ d: new Date("2026-01-02T03:04:05.000Z") }]);

@@ -202,21 +202,34 @@ Those restrictions affect speed only, never the accepted SQL or its result.
 Blocks retain four compact physical kinds—number, string, boolean, and datetime—but SQL domains
 add validation and semantics without widening hot scan vectors:
 
-| SQL domain         | Spellings                                               | JavaScript result                 |
-| ------------------ | ------------------------------------------------------- | --------------------------------- |
-| exact whole number | `INTEGER`, `BIGINT`, `SMALLINT`, `INT4`, `INT8`, `INT2` | `number`                          |
-| approximate number | `DOUBLE PRECISION`, `REAL`, `FLOAT`, `FLOAT8`, `FLOAT4` | `number`                          |
-| exact decimal      | `NUMERIC(p, s)`, `DECIMAL(p, s)`                        | decimal `string`                  |
-| string             | `VARCHAR(n)`, `CHARACTER VARYING(n)`, `TEXT`, `CHAR(n)` | `string`                          |
-| boolean            | `BOOLEAN`, `BOOL`                                       | `boolean`                         |
-| calendar date      | `DATE`                                                  | canonical `YYYY-MM-DD` `string`   |
-| datetime           | `TIMESTAMP`, `TIMESTAMPTZ`, `TIMESTAMP WITH TIME ZONE`  | `Date`                            |
-| time of day        | `TIME`                                                  | canonical `string`                |
-| JSON               | `JSON`, `JSONB`                                         | JSON `string`                     |
-| UUID               | `UUID`                                                  | lowercase `string`                |
-| interval           | `INTERVAL`                                              | months/days/microseconds `string` |
-| array              | `INTEGER[]`, `TEXT[]`, and other core arrays            | JSON `string`                     |
-| enum               | a name declared by `CREATE TYPE … AS ENUM`              | member `string`                   |
+| SQL domain         | Spellings                                               | JavaScript result                          |
+| ------------------ | ------------------------------------------------------- | ------------------------------------------ |
+| exact whole number | `INTEGER`, `BIGINT`, `SMALLINT`, `INT4`, `INT8`, `INT2` | `number`                                   |
+| approximate number | `DOUBLE PRECISION`, `REAL`, `FLOAT`, `FLOAT8`, `FLOAT4` | `number`                                   |
+| exact decimal      | `NUMERIC(p, s)`, `DECIMAL(p, s)`                        | decimal `string`                           |
+| string             | `VARCHAR(n)`, `CHARACTER VARYING(n)`, `TEXT`, `CHAR(n)` | `string`                                   |
+| boolean            | `BOOLEAN`, `BOOL`                                       | `boolean`                                  |
+| calendar date      | `DATE`                                                  | canonical `YYYY-MM-DD` `string`            |
+| datetime           | `TIMESTAMP`, `TIMESTAMPTZ`, `TIMESTAMP WITH TIME ZONE`  | `Date`                                     |
+| time of day        | `TIME`                                                  | `HH:MM:SS[.ffffff]` `string`               |
+| JSON               | `JSON`, `JSONB`                                         | JSON `string`                              |
+| UUID               | `UUID`                                                  | lowercase `string`                         |
+| interval           | `INTERVAL`                                              | PostgreSQL text `string`, `1 day 02:00:00` |
+| array              | `INTEGER[]`, `TEXT[]`, and other core arrays            | JSON `string`                              |
+| enum               | a name declared by `CREATE TYPE … AS ENUM`              | member `string`                            |
+
+A datetime becomes text the way PostgreSQL writes it in a UTC session — through `CAST(x AS TEXT)`
+or `x::text`, `||`, `CONCAT`, `FORMAT`, and the JSON constructors. A stored datetime is an
+instant, PostgreSQL's `timestamp with time zone`, so `CAST(placed_at AS TEXT)` is
+`2025-03-14 09:30:00+00`, with fractional seconds only when they are nonzero
+(`2025-03-14 09:30:00.25+00`), and `TO_JSON(placed_at)` is `"2025-03-14T09:30:00+00:00"`. A
+`TIMESTAMP '…'` literal, a cast to `TIMESTAMP`, `MAKE_TIMESTAMP`, `LOCALTIMESTAMP`, and a date plus
+an interval are timestamps without time zone, and their text carries no zone:
+`2025-03-14 09:30:00`. `TIMESTAMP` and `TIMESTAMPTZ` columns store the same instant, so a column
+declared `TIMESTAMP` also renders with `+00`, where PostgreSQL would write no zone. Every text
+form reads back as the same instant. An interval renders as `1 year 2 mons 3 days 04:05:06.5`,
+`-00:00:01`, or `-3 days +04:00:00`, and a time of day as `09:30:00.5`. A datetime returned to
+JavaScript is still a `Date`, not text.
 
 Widths in `VARCHAR(80)` are accepted and ignored — they document intent, and nothing truncates.
 So are `CREATE TEMP`, `TEMPORARY`, and `UNLOGGED TABLE`: every table lives in the one database
@@ -231,10 +244,12 @@ PostgreSQL's `int8` and `NUMERIC` typing of large constants, and writing one to 
 is rejected rather than rounded.
 
 Integer division is PostgreSQL's. When both operands of `/` are integers — integer columns,
-integer constants, `COUNT`, an integer `CAST`, or integer arithmetic and aggregates over them,
-including a `CASE`, `COALESCE`, or `NULLIF` whose non-`NULL` values are all integers —
-the quotient truncates toward zero: `7 / 2` is `3`, `-7 / 2` is `-3`, and `SUM(qty) / COUNT(*)`
-is a whole number. The same holds for functions that return an integer (`LENGTH`, `POSITION`,
+integer constants, `COUNT`, an integer `CAST`, a `date - date` difference, or integer arithmetic
+and aggregates over them, including a `CASE`, `COALESCE`, or `NULLIF` whose non-`NULL` values are
+all integers —
+the quotient truncates toward zero: `7 / 2` is `3`, `-7 / 2` is `-3`, `SUM(qty) / COUNT(*)`
+is a whole number, and `(shipped - placed) / 7` over two `DATE` columns counts whole weeks.
+Generated columns and `CHECK` constraints divide the same way. The same holds for functions that return an integer (`LENGTH`, `POSITION`,
 `STRPOS`, `ASCII`, `OCTET_LENGTH`), for `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, and `COUNT`
 windows, for `SUM`, `MIN`, `MAX`, `LAG`, and `FIRST_VALUE` windows over an integer, and for the
 columns of a recursive CTE whose first member selects integers. Write `7 / 2.0`, divide by a
@@ -288,8 +303,10 @@ remain unsupported. Arrays compare their represented scalar elements lexicograph
 NULL elements last; JSONB compares structural values, using numeric comparison for JSON numbers.
 JSON continues to compare its text representation. `||` remains text concatenation and is
 refused on two array or JSONB operands. Intervals retain separate
-month, day, and microsecond fields. A date or datetime accepts `+ INTERVAL` and `- INTERVAL`,
-`timestamp - timestamp` returns an interval, `date - date` returns whole days, and
+month, day, and microsecond fields and read PostgreSQL's input spellings, including its own
+output (`1 year 2 mons 3 days 04:05:06.5`) and fractional units (`1.5 days` is
+`1 day 12:00:00`). A date or datetime accepts `+ INTERVAL` and `- INTERVAL`,
+`timestamp - timestamp` returns an interval, `date - date` returns whole days as an integer, and
 `date ± integer` returns a date; arithmetic between intervals, such as interval-plus-interval, is
 unsupported.
 

@@ -100,12 +100,30 @@ optional zone after the time, `Z` or an offset in PostgreSQL's spellings (`+00`,
 `+05:30`, with or without a space before it). Text without a zone is UTC. Timestamp inputs and
 `MAKE_TIMESTAMP` validate calendar dates, clock fields, and offsets up to ±15:59.
 Invalid dates such as February 30 throw. Supported calendar years are 1–9999; years below 100
-keep their requested year. `DATE` input also accepts a timestamp's text and keeps its day, as
+keep their requested year. Timestamp text also reads the years PostgreSQL writes outside that
+range, a five- or six-digit year and a `BC` suffix, so every timestamp Minnow writes as text reads
+back as the same instant. `DATE` input also accepts a timestamp's text and keeps its day, as
 PostgreSQL does: `'2026-10-15 08:00:00'::date` and `day = '2026-10-15T08:00:00Z'` both read
 2026-10-15. A `DATE` compared with a `TIMESTAMP` value is midnight of its day, so
 `day < TIMESTAMP '2026-10-15 00:00:01'` holds for 2026-10-15; a `Date` bound to a placeholder
 beside a `DATE` column is read as that column's type, a day. Explicit TEXT casts retain text comparison semantics: comparing
 `'1'::TEXT` to the number `1` throws rather than interpreting the text as a number.
+
+Going the other way, a datetime turned into text reads as PostgreSQL writes it in a UTC session:
+`CAST(placed_at AS TEXT)` is `2025-03-14 09:30:00+00`, an interval is `5 days 02:30:00`, and
+`date - date` is a whole number of days, so dividing it counts whole weeks.
+[Column types](/docs/sql/ddl#column-types) has every form, including timestamps without time zone.
+
+```sql
+SELECT r.return_id,
+       CAST(r.returned_at AS TEXT) AS returned,
+       r.returned_at - o.placed_at AS elapsed,
+       (CAST(r.returned_at AS DATE) - CAST(o.placed_at AS DATE)) / 7 AS weeks_to_return
+FROM returns r
+JOIN orders o ON o.order_id = r.order_id
+ORDER BY r.return_id
+LIMIT 5
+```
 
 `ORDER BY` takes expressions, `ASC` / `DESC`, `NULLS FIRST` / `NULLS LAST`, ordinals, and explicit
 `COLLATE` on string expressions. A sort key may name a selected column through its source alias
@@ -397,9 +415,10 @@ February. `DATE ± INTERVAL` always returns a timestamp, including whole-day and
 `EXTRACT` reads fractional seconds from timestamps and reads the stored fields of `TIME` and
 `INTERVAL` without converting them to dates.
 
-Dates and timestamps do PostgreSQL's arithmetic: `date - date` is a whole number of days,
-`date + 7` and `date - 7` shift a `DATE` by days, and `timestamp - timestamp` is an `INTERVAL` of
-days and time that compares, extracts, and shifts another timestamp. For a plain series of
+Dates and timestamps do PostgreSQL's arithmetic: `date - date` is a whole number of days, an
+integer that divides as one, `date + 7` and `date - 7` shift a `DATE` by days, and
+`timestamp - timestamp` is an `INTERVAL` of days and time that compares, extracts, and shifts
+another timestamp. For a plain series of
 numbers or timestamps, `generate_series` in `FROM` is shorter than a recursive CTE and produces
 its rows in one pass — here, every day of a month with that day's order count, zero included:
 

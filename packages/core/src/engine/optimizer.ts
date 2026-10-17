@@ -32,6 +32,7 @@ import {
   type TableSource,
   transparentProjectionSource,
   dateTruncValue,
+  datetimeTypeKind,
   integerQuotient,
 } from "./query.js";
 import {
@@ -3322,6 +3323,16 @@ function foldBlockConstants(block: CompiledQuery): void {
   for (const order of block.orderBy) order.expression = foldExpression(order.expression);
 }
 
+/**
+ * The literal flags of a constant folded to a Date: always a typed timestamp, and `zoned` unless
+ * the expression it came from is a timestamp without time zone, so its text keeps its type.
+ */
+function foldedTimestampFlags(expression: Expression): { timestamp: true; zoned?: true } {
+  return datetimeTypeKind(expression) === "local"
+    ? { timestamp: true }
+    : { timestamp: true, zoned: true };
+}
+
 function foldExpression(expression: Expression): Expression {
   if (expression.kind === "binary") {
     const left = foldExpression(expression.left);
@@ -3349,7 +3360,7 @@ function foldExpression(expression: Expression): Expression {
           ...(domain === undefined ? {} : { sqlDomain: domain }),
           ...(left.decimal === true || right.decimal === true ? { decimal: true as const } : {}),
           // Compile-time folding never sees a placeholder, so a Date here is a typed timestamp.
-          ...(folded instanceof Date ? { timestamp: true as const } : {}),
+          ...(folded instanceof Date ? foldedTimestampFlags({ ...expression, left, right }) : {}),
         };
       }
     }
@@ -3419,6 +3430,7 @@ function foldExpression(expression: Expression): Expression {
                   : expression.name === "JSON_QUERY" ||
                       expression.name === "JSON_OBJECT" ||
                       expression.name === "JSON_ARRAY" ||
+                      expression.name === "TO_JSON" ||
                       expression.name === "MINNOW_JSON_GET"
                     ? ({ kind: "json" } as const)
                     : simpleScalarFunctions.get(expression.name)?.returns === "date"
@@ -3439,7 +3451,9 @@ function foldExpression(expression: Expression): Expression {
             ...(isSqlDomainValue(folded) ? { internalSqlValue: true as const } : {}),
             ...(sqlDomain === undefined ? {} : { sqlDomain }),
             ...(fractional ? { decimal: true as const } : {}),
-            ...(folded instanceof Date ? { timestamp: true as const } : {}),
+            ...(folded instanceof Date
+              ? foldedTimestampFlags({ ...expression, arguments: foldedArguments })
+              : {}),
           };
         }
       } catch {

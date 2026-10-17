@@ -174,10 +174,15 @@ export function jsonIsValid(document: unknown, kind: string): boolean {
   }
 }
 
-/** A SQL value as its JSON counterpart: datetimes serialize as ISO text, like every cast. */
+/**
+ * A SQL value as its JSON counterpart. A datetime is the ISO 8601 text PostgreSQL's to_json
+ * writes for a timestamp with time zone in a UTC session, `2024-01-02T10:00:00.5+00:00`.
+ */
 function jsonValueOf(value: unknown): unknown {
   const external = externalSqlDomainValue(value);
-  return external instanceof Date ? dateIsoString(external) : external;
+  return external instanceof Date
+    ? postgresTimestampJsonText(dateMilliseconds(external), true)
+    : external;
 }
 
 /**
@@ -200,7 +205,8 @@ export function jsonConstructor(
       throw new TypeError("JSON_OBJECT keys cannot be NULL");
     }
     let key: string;
-    if (rawKey instanceof Date) key = dateIsoString(rawKey);
+    // PostgreSQL writes a datetime key as it writes a datetime value: ISO 8601 with the offset.
+    if (rawKey instanceof Date) key = postgresTimestampJsonText(dateMilliseconds(rawKey), true);
     else if (typeof rawKey === "string") key = rawKey;
     else if (typeof rawKey === "number" || typeof rawKey === "boolean") key = String(rawKey);
     else throw new TypeError("JSON_OBJECT keys must be scalar values");
@@ -288,4 +294,5 @@ function joinBoundedJson(
   }
   return `${prefix}${members.join(",")}${suffix}`;
 }
-import { dateIsoString } from "../date-value.js";
+import { dateMilliseconds } from "../date-value.js";
+import { postgresTimestampJsonText } from "./sql-datetime-text.js";

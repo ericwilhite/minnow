@@ -723,7 +723,7 @@ describe("point-read fast path", () => {
         document: '{"seq":11,"tag":"p-11"}',
         booked: "2026-01-12",
         at: "12:34:56",
-        span: "1 mons 2 days 0 usecs",
+        span: "1 mon 2 days",
         feeling: "happy",
         choices: "[11,12]",
       },

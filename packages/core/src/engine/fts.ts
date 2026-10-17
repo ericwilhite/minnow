@@ -14,7 +14,7 @@
 
 import { assertWellFormedString } from "../block-format/unicode.js";
 import { MAX_CACHEABLE_TEXT_CHARACTERS, MAX_SQL_PATTERN_CHARACTERS } from "./cache-limits.js";
-import { externalSqlDomainValue } from "./sql-domains.js";
+import { externalSqlDomainValue, fullTextDomainText } from "./sql-domains.js";
 import {
   MAX_FTS_QUERY_TERMS,
   MAX_FTS_TOKENS_PER_DOCUMENT,
@@ -336,8 +336,15 @@ export function ftsBm25Row(
   return bm25DocumentScore(frequencies, docLength, stats);
 }
 
-/** Renders one cell for the document, per column type. Booleans are excluded from documents. */
+/**
+ * Renders one cell for the document, per column type. Booleans are excluded from documents.
+ * Persisted postings store the terms of this text, so it stays the text they were built from:
+ * a datetime's ISO 8601 form and the stored TIME and INTERVAL text, even though SQL text output
+ * renders those as PostgreSQL does.
+ */
 export function renderDocumentValue(value: unknown): string | undefined {
+  const domainText = fullTextDomainText(value);
+  if (domainText !== undefined) return domainText;
   value = externalSqlDomainValue(value);
   if (value === null || value === undefined || typeof value === "boolean") return undefined;
   if (value instanceof Date) return dateIsoString(value);

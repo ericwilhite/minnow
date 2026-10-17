@@ -39,10 +39,11 @@ describe("compressed download budgets", () => {
     // 486.0 KiB measured. Rekeying (0.15.0): 493.5 KiB measured; with its audit, 496.4 KiB.
     // The read-path work (point-read plans, index reads, ordered selection): 504.3 KiB. The
     // 0.16.0 audit as a whole (with prepared templates, PostgreSQL forms, schema-change folds):
-    // 521.1 KiB; with the V8 JSON key guard, 522.3 KiB.
+    // 521.1 KiB; with the V8 JSON key guard, 522.3 KiB. PostgreSQL datetime text (timestamp,
+    // interval, and TIME output and input, timestamp-without-time-zone typing): 525.6 KiB.
     expect(
       worker.totalGzipBytes + client.totalGzipBytes,
       "worker plus client gzip bytes",
-    ).toBeLessThanOrEqual(523 * 1024);
+    ).toBeLessThanOrEqual(526 * 1024);
   });
 });

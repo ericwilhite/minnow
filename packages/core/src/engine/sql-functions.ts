@@ -7,7 +7,6 @@
  */
 import { minimallyQuoteSqlIdentifier } from "./sql-quote.js";
 import {
-  dateIsoString,
   dateMilliseconds,
   dateUtcDate,
   dateUtcDay,
@@ -30,6 +29,7 @@ import {
   protectedSqlTextValue,
 } from "./sql-domains.js";
 import { compileRegexPattern, parseSqlTimestampText, stringArgument } from "./sql-semantics.js";
+import { postgresTimestampJsonText, postgresTimestampText } from "./sql-datetime-text.js";
 
 export type SimpleScalarResult =
   "string" | "number" | "boolean" | "datetime" | "date" | "interval" | "argument";
@@ -106,7 +106,7 @@ function rendered(value: unknown): string {
   if (typeof external === "string") return external;
   if (typeof external === "number") return String(external);
   if (typeof external === "boolean") return external ? "t" : "f";
-  if (external instanceof Date) return dateIsoString(external);
+  if (external instanceof Date) return postgresTimestampText(dateMilliseconds(external), true);
   return String(external);
 }
 
@@ -1247,6 +1247,24 @@ export const simpleScalarFunctions: ReadonlyMap<string, SimpleScalarFunction> = 
     },
   ],
   ["PI", { minArgs: 0, maxArgs: 0, returns: "number", evaluate: () => Math.PI }],
+  [
+    // The compiler wraps a `timestamp without time zone` operand of a text or JSON rendering in
+    // this call (see annotatePlanTimestampText); a stored datetime is an instant, so every other
+    // Date renders as `timestamp with time zone`. Anything that is not a Date passes through.
+    "MINNOW_TIMESTAMP_TEXT",
+    {
+      minArgs: 2,
+      maxArgs: 2,
+      returns: "string",
+      evaluate: (values) => {
+        const value = values[0];
+        if (!(value instanceof Date)) return value;
+        return values[1] === "json"
+          ? postgresTimestampJsonText(dateMilliseconds(value), false)
+          : postgresTimestampText(dateMilliseconds(value), false);
+      },
+    },
+  ],
   [
     "CBRT",
     {

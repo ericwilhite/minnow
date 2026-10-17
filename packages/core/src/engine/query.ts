@@ -127,6 +127,7 @@ import {
   intervalDomainCompare,
   intervalDomainFromParts,
   intervalDomainParts,
+  intervalTextMonthsAndMilliseconds,
   boundedJsonText,
   collatedDomainValue,
   concatenatedSqlValue,
@@ -891,44 +892,13 @@ const dateTruncUnits: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Truncates a datetime to the start of the given unit, in UTC — the engine stores and
- * compares datetimes by instant and has no session time zone. Weeks start on Monday,
- * matching Postgres.
- */
-const intervalUnits = new Map<string, { months: number; milliseconds: number }>([
-  ["year", { months: 12, milliseconds: 0 }],
-  ["quarter", { months: 3, milliseconds: 0 }],
-  ["month", { months: 1, milliseconds: 0 }],
-  ["week", { months: 0, milliseconds: 7 * 86_400_000 }],
-  ["day", { months: 0, milliseconds: 86_400_000 }],
-  ["hour", { months: 0, milliseconds: 3_600_000 }],
-  ["minute", { months: 0, milliseconds: 60_000 }],
-  ["second", { months: 0, milliseconds: 1_000 }],
-]);
-
-/**
- * `INTERVAL '1 month'`, `INTERVAL '2 years 3 days'`. Months are kept apart from milliseconds
- * rather than converted, because a month is not a fixed number of them: adding one to January 31
- * has to land on the end of February, which only calendar arithmetic can do.
+ * `INTERVAL '1 month'`, `INTERVAL '2 years 3 days'`, `INTERVAL '1 day 02:00:00'`: the INTERVAL
+ * column's own input reading. Months are kept apart from milliseconds rather than converted,
+ * because a month is not a fixed number of them: adding one to January 31 has to land on the
+ * end of February, which only calendar arithmetic can do.
  */
 function intervalLiteral(text: string): { months: number; milliseconds: number } {
-  let months = 0;
-  let milliseconds = 0;
-  let matched = 0;
-  for (const [, amount, unit] of text.trim().matchAll(/(-?\d+(?:\.\d+)?)\s*([a-zA-Z]+)/g)) {
-    const singular = (unit ?? "").toLowerCase().replace(/s$/, "");
-    const scale = intervalUnits.get(singular);
-    if (scale === undefined) throw new TypeError(`Unknown INTERVAL unit: ${String(unit)}`);
-    const count = Number(amount);
-    if (scale.months !== 0 && !Number.isInteger(count * scale.months)) {
-      throw new TypeError(`INTERVAL ${String(unit)} must be a whole number`);
-    }
-    months += count * scale.months;
-    milliseconds += count * scale.milliseconds;
-    matched += 1;
-  }
-  if (matched === 0) throw new TypeError(`Invalid INTERVAL literal: ${text}`);
-  return { months, milliseconds };
+  return intervalTextMonthsAndMilliseconds(text);
 }
 
 /**
@@ -965,6 +935,11 @@ function dateAddValue(
   return result;
 }
 
+/**
+ * Truncates a datetime to the start of the given unit, in UTC — the engine stores and
+ * compares datetimes by instant and has no session time zone. Weeks start on Monday,
+ * matching Postgres.
+ */
 export function dateTruncValue(unit: unknown, value: unknown): Date | null {
   if (typeof unit !== "string" || !dateTruncUnits.has(unit.toLowerCase())) {
     throw new TypeError(
@@ -1321,6 +1296,7 @@ export function compileQuery(sql: string, options: CompileQueryOptions = {}): Co
     // A derived source's alias used as a value (`json_agg(agg)`) expands here, where its
     // columns are already known; a plain table's alias waits for the catalog.
     plan = expandRowReferences(plan, () => undefined);
+    annotatePlanTimestampText(plan);
     annotatePlanIntegerDivision(plan);
     resolvePlanExactNumericConstants(plan);
     if (options.optimize === false && planHasPendingSelectShapes(plan)) {
@@ -1884,7 +1860,7 @@ export function isUpdateDefaultAssignment(expression: Expression): boolean {
  */
 export function compileDefaultExpression(sql: string): Expression {
   const parser = new Parser(tokenize(sql), sql);
-  return resolveExactNumericConstants(parser.parseExpression());
+  return resolveExactNumericConstants(annotateTimestampText(parser.parseExpression()));
 }
 
 /**
@@ -1898,7 +1874,7 @@ export function compileCheckExpression(sql: string, name: string): Expression {
   if (hasAggregate(expression) || containsWindow(expression) || containsParameter(expression)) {
     throw new TypeError(`CHECK ${name} takes a row condition over this table's own columns`);
   }
-  return resolveExactNumericConstants(expression);
+  return resolveExactNumericConstants(annotateTimestampText(expression));
 }
 
 interface DefaultExpressionTarget {
@@ -3059,6 +3035,11 @@ export function inferBlockSchema(
     );
     return matches.length === 1 ? matches[0]?.sqlDomain : undefined;
   };
+  // `date - date` is an integer; a DATE column itself is not.
+  const resolveColumnDatetime = (reference: string): DatetimeTypeKind | undefined => {
+    const domain = resolveColumnDomain(reference)?.kind;
+    return domain === "date" || domain === "interval" ? domain : undefined;
+  };
   const castDomain = (target: string): SqlDomain | undefined => {
     if (target.startsWith("numeric:")) {
       const [, precisionWord = "", scaleWord = ""] = target.split(":");
@@ -3524,7 +3505,12 @@ export function inferBlockSchema(
         },
       ];
     }
-    const integer = integerTypedExpression(item.expression, resolveColumnInteger);
+    const integer = integerTypedExpression(
+      item.expression,
+      resolveColumnInteger,
+      undefined,
+      resolveColumnDatetime,
+    );
     return [
       {
         name: item.alias,
@@ -4286,16 +4272,26 @@ export function forEachNestedBlock(
  * SMALLINT column, an integer constant, COUNT, an integer CAST, SUM/MIN/MAX/ABS over an
  * integer, MOD over integers, a CASE/COALESCE/NULLIF/GREATEST/LEAST whose every branch is an
  * integer, or `+ - * / %` over two integers. A bound parameter takes the type of its integer
- * partner, as PostgreSQL infers `qty / $1`. A column the caller cannot type is not an integer,
- * so the compiler's static answer only ever widens once the catalog is known.
+ * partner, as PostgreSQL infers `qty / $1`. `date - date` is the integer count of days between
+ * them, so `(shipped - placed) / 7` truncates too; `columnDatetime` and `tableDatetimes` say which
+ * columns are DATE. A column the caller cannot type is not an integer, so the compiler's static
+ * answer only ever widens once the catalog is known.
  */
 export function integerTypedExpression(
   expression: Expression,
   columnInteger: (reference: string) => boolean = () => false,
   tableIntegerColumns?: (table: string) => IntegerColumns | undefined,
+  columnDatetime: (reference: string) => DatetimeTypeKind | undefined = () => undefined,
+  tableDatetimes?: (table: string) => DatetimeColumns | undefined,
 ): boolean {
   const typed = (candidate: Expression): boolean =>
-    integerTypedExpression(candidate, columnInteger, tableIntegerColumns);
+    integerTypedExpression(
+      candidate,
+      columnInteger,
+      tableIntegerColumns,
+      columnDatetime,
+      tableDatetimes,
+    );
   // PostgreSQL resolves CASE branches and COALESCE-style arguments to one common type, and a
   // NULL or a placeholder has none of its own: `CASE x WHEN 1 THEN NULL ELSE qty END` is an
   // integer. At least one value must carry the integer type.
@@ -4320,8 +4316,10 @@ export function integerTypedExpression(
         item !== undefined &&
         integerTypedExpression(
           item.expression,
-          blockColumnIntegerResolver(expression.block, tableIntegerColumns),
+          blockColumnIntegerResolver(expression.block, tableIntegerColumns, tableDatetimes),
           tableIntegerColumns,
+          blockColumnDatetimeResolver(expression.block, tableDatetimes),
+          tableDatetimes,
         )
       );
     }
@@ -4337,17 +4335,18 @@ export function integerTypedExpression(
       return columnInteger(expression.reference);
     case "binary": {
       if (expression.operator === "||") return false;
+      if (
+        expression.operator === "-" &&
+        dateDifference(expression, columnDatetime, tableDatetimes)
+      ) {
+        return true;
+      }
       const left = typed(expression.left);
       const right = typed(expression.right);
       if (left && right) return true;
-      // A placeholder or an untyped string constant takes its integer partner's type, as
-      // PostgreSQL infers `qty / $1` and `'7' / 2`.
-      const untyped = (candidate: Expression): boolean =>
-        candidate.kind === "parameter" ||
-        (candidate.kind === "literal" &&
-          typeof candidate.value === "string" &&
-          candidate.internalSqlValue !== true);
-      return (left && untyped(expression.right)) || (right && untyped(expression.left));
+      return (
+        (left && untypedOperand(expression.right)) || (right && untypedOperand(expression.left))
+      );
     }
     case "call": {
       const { name, arguments: args } = expression;
@@ -4378,6 +4377,36 @@ export function integerTypedExpression(
     default:
       return false;
   }
+}
+
+/**
+ * A placeholder or an untyped string constant: it takes its partner's type, as PostgreSQL
+ * infers `qty / $1`, `'7' / 2`, and `placed - '2026-01-01'`.
+ */
+function untypedOperand(candidate: Expression): boolean {
+  return (
+    candidate.kind === "parameter" ||
+    (candidate.kind === "literal" &&
+      typeof candidate.value === "string" &&
+      candidate.internalSqlValue !== true)
+  );
+}
+
+/**
+ * Whether `left - right` is PostgreSQL's `date - date`, the integer number of days between
+ * two dates: both sides DATE, or one DATE beside an untyped constant or placeholder.
+ */
+function dateDifference(
+  expression: Extract<Expression, { kind: "binary" }>,
+  columnDatetime: (reference: string) => DatetimeTypeKind | undefined,
+  tableDatetimes: ((table: string) => DatetimeColumns | undefined) | undefined,
+): boolean {
+  const left = datetimeTypeKind(expression.left, columnDatetime, tableDatetimes) === "date";
+  const right = datetimeTypeKind(expression.right, columnDatetime, tableDatetimes) === "date";
+  return (
+    (left && (right || untypedOperand(expression.right))) ||
+    (right && untypedOperand(expression.left))
+  );
 }
 
 /**
@@ -4445,19 +4474,33 @@ export function annotateIntegerDivision(
   expression: Expression,
   columnInteger: (reference: string) => boolean = () => false,
   tableIntegerColumns?: (table: string) => IntegerColumns | undefined,
+  columnDatetime: (reference: string) => DatetimeTypeKind | undefined = () => undefined,
+  tableDatetimes?: (table: string) => DatetimeColumns | undefined,
 ): void {
   if (expression.kind === "subquery" || expression.kind === "exists") {
-    annotatePlanIntegerDivision(expression.block, tableIntegerColumns);
+    annotatePlanIntegerDivision(expression.block, tableIntegerColumns, tableDatetimes);
     return;
   }
   for (const child of childExpressions(expression)) {
-    annotateIntegerDivision(child, columnInteger, tableIntegerColumns);
+    annotateIntegerDivision(
+      child,
+      columnInteger,
+      tableIntegerColumns,
+      columnDatetime,
+      tableDatetimes,
+    );
   }
   if (
     expression.kind === "binary" &&
     expression.operator === "/" &&
     expression.integer !== true &&
-    integerTypedExpression(expression, columnInteger, tableIntegerColumns)
+    integerTypedExpression(
+      expression,
+      columnInteger,
+      tableIntegerColumns,
+      columnDatetime,
+      tableDatetimes,
+    )
   ) {
     expression.integer = true;
   }
@@ -4471,22 +4514,32 @@ export function annotateIntegerDivision(
 function blockIntegerOutputs(
   block: CompiledQuery,
   tableIntegerColumns: ((table: string) => IntegerColumns | undefined) | undefined,
-  columnAliases?: readonly string[],
+  columnAliases: readonly string[] | undefined,
+  tableDatetimes: ((table: string) => DatetimeColumns | undefined) | undefined,
 ): IntegerColumns {
-  const resolver = blockColumnIntegerResolver(block, tableIntegerColumns);
+  const resolver = blockColumnIntegerResolver(block, tableIntegerColumns, tableDatetimes);
+  const datetimeResolver = blockColumnDatetimeResolver(block, tableDatetimes);
   const names: string[] = [];
   for (const item of block.select) {
     if (item.expression.kind === "wildcard") {
       const table = item.expression.table;
       for (const source of [block.base, ...block.joins]) {
         if (table !== undefined && source.alias !== table) continue;
-        const columns = sourceIntegerColumns(source, tableIntegerColumns);
+        const columns = sourceIntegerColumns(source, tableIntegerColumns, tableDatetimes);
         if (columns === true) return true;
         for (const name of columns) if (resolver(name)) names.push(name);
       }
       continue;
     }
-    if (integerTypedExpression(item.expression, resolver, tableIntegerColumns)) {
+    if (
+      integerTypedExpression(
+        item.expression,
+        resolver,
+        tableIntegerColumns,
+        datetimeResolver,
+        tableDatetimes,
+      )
+    ) {
       names.push(item.alias);
     }
   }
@@ -4504,21 +4557,28 @@ function blockIntegerOutputs(
 function sourceIntegerColumns(
   source: TableSource,
   tableIntegerColumns: ((table: string) => IntegerColumns | undefined) | undefined,
+  tableDatetimes: ((table: string) => DatetimeColumns | undefined) | undefined,
 ): IntegerColumns {
   if (source.derived !== undefined) {
-    return blockIntegerOutputs(source.derived, tableIntegerColumns, source.columnAliases);
+    return blockIntegerOutputs(
+      source.derived,
+      tableIntegerColumns,
+      source.columnAliases,
+      tableDatetimes,
+    );
   }
   if (source.union !== undefined) {
     const first = source.union.blocks[0];
     return first === undefined
       ? new Set()
-      : blockIntegerOutputs(first, tableIntegerColumns, source.columnAliases);
+      : blockIntegerOutputs(first, tableIntegerColumns, source.columnAliases, tableDatetimes);
   }
   if (source.windowed !== undefined) {
     const inputs = blockIntegerOutputs(
       source.windowed.block,
       tableIntegerColumns,
       source.columnAliases,
+      tableDatetimes,
     );
     if (inputs === true || source.columnAliases !== undefined) return inputs;
     const outputs = new Set(inputs);
@@ -4529,7 +4589,12 @@ function sourceIntegerColumns(
   }
   if (source.recursive !== undefined) {
     // A recursive CTE's columns take their types from its non-recursive term.
-    return blockIntegerOutputs(source.recursive.base, tableIntegerColumns, source.columnAliases);
+    return blockIntegerOutputs(
+      source.recursive.base,
+      tableIntegerColumns,
+      source.columnAliases,
+      tableDatetimes,
+    );
   }
   return tableIntegerColumns?.(source.table) ?? new Set();
 }
@@ -4538,6 +4603,7 @@ function sourceIntegerColumns(
 function blockColumnIntegerResolver(
   block: CompiledQuery,
   tableIntegerColumns: ((table: string) => IntegerColumns | undefined) | undefined,
+  tableDatetimes: ((table: string) => DatetimeColumns | undefined) | undefined,
 ): (reference: string) => boolean {
   const sources = [block.base, ...block.joins];
   const cache = new Map<TableSource, IntegerColumns>();
@@ -4546,7 +4612,7 @@ function blockColumnIntegerResolver(
   const columnsOf = (source: TableSource): IntegerColumns => {
     let columns = cache.get(source);
     if (columns === undefined) {
-      columns = sourceIntegerColumns(source, tableIntegerColumns);
+      columns = sourceIntegerColumns(source, tableIntegerColumns, tableDatetimes);
       cache.set(source, columns);
     }
     return columns;
@@ -4567,17 +4633,28 @@ function blockColumnIntegerResolver(
 
 /**
  * Marks integer division throughout a plan, nested blocks first. Without a catalog only
- * constants, COUNT, and integer CASTs type as integers; with one, INTEGER columns do too, and
- * a derived source's outputs follow from its own select list.
+ * constants, COUNT, integer CASTs, and differences of DATE constants type as integers; with
+ * one, INTEGER columns and differences of DATE columns do too, and a derived source's outputs
+ * follow from its own select list.
  */
 export function annotatePlanIntegerDivision(
   plan: CompiledQuery,
   tableIntegerColumns?: (table: string) => IntegerColumns | undefined,
+  tableDatetimes?: (table: string) => DatetimeColumns | undefined,
 ): void {
-  forEachNestedBlock(plan, (nested) => annotatePlanIntegerDivision(nested, tableIntegerColumns));
-  const resolver = blockColumnIntegerResolver(plan, tableIntegerColumns);
+  forEachNestedBlock(plan, (nested) =>
+    annotatePlanIntegerDivision(nested, tableIntegerColumns, tableDatetimes),
+  );
+  const resolver = blockColumnIntegerResolver(plan, tableIntegerColumns, tableDatetimes);
+  const datetimeResolver = blockColumnDatetimeResolver(plan, tableDatetimes);
   forEachBlockExpression(plan, (expression) =>
-    annotateIntegerDivision(expression, resolver, tableIntegerColumns),
+    annotateIntegerDivision(
+      expression,
+      resolver,
+      tableIntegerColumns,
+      datetimeResolver,
+      tableDatetimes,
+    ),
   );
 }
 
@@ -4590,6 +4667,9 @@ export function planMayHaveIntegerDivision(plan: CompiledQuery): boolean {
   const state = { found: false };
   const optimistic = (): boolean => true;
   const everyColumn = (): IntegerColumns => true;
+  // Every column might be a DATE too, which makes `day - DATE '2026-01-01'` a candidate.
+  const optimisticDate = (): DatetimeTypeKind => "date";
+  const everyColumnDate = (): DatetimeColumns => EVERY_COLUMN_DATE;
   const probe = (expression: Expression): void => {
     if (state.found) return;
     if (expression.kind === "subquery" || expression.kind === "exists") {
@@ -4600,7 +4680,7 @@ export function planMayHaveIntegerDivision(plan: CompiledQuery): boolean {
       expression.kind === "binary" &&
       expression.operator === "/" &&
       expression.integer !== true &&
-      integerTypedExpression(expression, optimistic, everyColumn)
+      integerTypedExpression(expression, optimistic, everyColumn, optimisticDate, everyColumnDate)
     ) {
       state.found = true;
       return;
@@ -4609,6 +4689,496 @@ export function planMayHaveIntegerDivision(plan: CompiledQuery): boolean {
   };
   forEachNestedBlock(plan, (nested) => {
     if (!state.found && planMayHaveIntegerDivision(nested)) state.found = true;
+  });
+  if (!state.found) forEachBlockExpression(plan, probe);
+  return state.found;
+}
+
+// --- Datetime types: date arithmetic and timestamp text ---------------------------------------
+
+/**
+ * What PostgreSQL types a datetime-valued expression as, where that is known before it runs:
+ * `date`, `interval`, or `local` — a `timestamp` without time zone (a TIMESTAMP literal, a cast
+ * to TIMESTAMP, MAKE_TIMESTAMP, LOCALTIMESTAMP, a DATE or TIMESTAMP plus an interval). Every
+ * other datetime, a stored column above all, is an instant: PostgreSQL's `timestamp with time
+ * zone` in a UTC session. The difference shows only in text, where a zoned value ends in `+00`.
+ */
+export type DatetimeTypeKind = "date" | "interval" | "local";
+
+/** A table's DATE and INTERVAL columns by name, from the catalog. */
+export interface DatetimeColumns {
+  get(name: string): DatetimeTypeKind | undefined;
+}
+
+const NO_DATETIME_COLUMNS: DatetimeColumns = { get: () => undefined };
+/** The bind-time probe's assumption: any column might be a DATE. */
+const EVERY_COLUMN_DATE: DatetimeColumns = { get: () => "date" };
+
+/** The value functions whose result has their argument's type. */
+const datetimeValueFunctions: ReadonlySet<string> = new Set([
+  "FIRST_VALUE",
+  "LAST_VALUE",
+  "NTH_VALUE",
+  "LAG",
+  "LEAD",
+  "MIN",
+  "MAX",
+]);
+
+/**
+ * PostgreSQL's common type of two datetime kinds, as CASE, COALESCE, and UNION resolve it: the
+ * same kind, or `timestamp` for a DATE beside a TIMESTAMP. Anything else is not one of these.
+ */
+function unifiedDatetimeKind(
+  left: DatetimeTypeKind | undefined,
+  right: DatetimeTypeKind | undefined,
+): DatetimeTypeKind | undefined {
+  if (left === right) return left;
+  if ((left === "date" && right === "local") || (left === "local" && right === "date")) {
+    return "local";
+  }
+  return undefined;
+}
+
+/**
+ * The PostgreSQL datetime type of an expression, read without running it; undefined for
+ * anything that is not a DATE, an INTERVAL, or a timestamp without time zone. `column` names
+ * the DATE and INTERVAL columns in scope and `tables` the catalog's, for nested blocks.
+ */
+export function datetimeTypeKind(
+  expression: Expression,
+  column: (reference: string) => DatetimeTypeKind | undefined = () => undefined,
+  tables?: (table: string) => DatetimeColumns | undefined,
+): DatetimeTypeKind | undefined {
+  const kind = (candidate: Expression): DatetimeTypeKind | undefined =>
+    datetimeTypeKind(candidate, column, tables);
+  // A NULL or a placeholder has no type of its own; at least one value must carry one.
+  const unify = (values: readonly Expression[]): DatetimeTypeKind | undefined => {
+    let resolved: DatetimeTypeKind | undefined;
+    let typed = false;
+    for (const value of values) {
+      if (value.kind === "parameter" || (value.kind === "literal" && value.value === null)) {
+        continue;
+      }
+      const next = kind(value);
+      if (next === undefined) return undefined;
+      resolved = typed ? unifiedDatetimeKind(resolved, next) : next;
+      if (resolved === undefined) return undefined;
+      typed = true;
+    }
+    return resolved;
+  };
+  switch (expression.kind) {
+    case "literal": {
+      if (expression.timestamp === true) return expression.zoned === true ? undefined : "local";
+      const domain = expression.sqlDomain?.kind;
+      if (domain === "date" || domain === "interval") return domain;
+      if (expression.internalSqlValue === true) {
+        if (isDateDomainValue(expression.value)) return "date";
+        if (intervalDomainParts(expression.value) !== undefined) return "interval";
+      }
+      return undefined;
+    }
+    case "column":
+      return column(expression.reference);
+    case "subquery": {
+      const item = expression.block.select[0];
+      return expression.block.select.length === 1 &&
+        item !== undefined &&
+        item.expression.kind !== "wildcard"
+        ? datetimeTypeKind(
+            item.expression,
+            blockColumnDatetimeResolver(expression.block, tables),
+            tables,
+          )
+        : undefined;
+    }
+    case "binary": {
+      const { operator } = expression;
+      if (operator === "*" || operator === "/") {
+        const left = kind(expression.left);
+        return left === "interval" || (operator === "*" && kind(expression.right) === "interval")
+          ? "interval"
+          : undefined;
+      }
+      if (operator !== "+" && operator !== "-") return undefined;
+      const left = kind(expression.left);
+      // An untyped constant or placeholder beside a DATE reads as a DATE (`day - '2026-01-01'`).
+      const untypedRight = untypedOperand(expression.right);
+      const right = untypedRight ? undefined : kind(expression.right);
+      if (operator === "-") {
+        if (left === "date") {
+          if (right === "date" || untypedRight) return undefined;
+          return right === "interval" ? "local" : right === "local" ? "interval" : "date";
+        }
+        if (left === "local") {
+          return right === "local" || right === "date" || untypedRight ? "interval" : "local";
+        }
+        return left === "interval" && right === "interval" ? "interval" : undefined;
+      }
+      if (left === "date" || right === "date") {
+        const other = left === "date" ? right : left;
+        if (other === "interval") return "local";
+        if (other === "date" || other === "local") return undefined;
+        return "date";
+      }
+      if (left === "local" || right === "local") return "local";
+      return left === "interval" && right === "interval" ? "interval" : undefined;
+    }
+    case "call": {
+      const { name, arguments: args } = expression;
+      const first = args[0];
+      switch (name) {
+        case "CAST": {
+          const target = args[1];
+          if (target?.kind !== "literal") return undefined;
+          if (target.value === "date") return "date";
+          if (target.value === "interval") return "interval";
+          return target.value === "datetime" && target.timestamp === true ? "local" : undefined;
+        }
+        case "MAKE_TIMESTAMP":
+          return "local";
+        case "CURRENT_DATE":
+          return "date";
+        case "DATE_TRUNC":
+          // PostgreSQL truncates a DATE as a timestamp with time zone.
+          return args[1] !== undefined && kind(args[1]) === "local" ? "local" : undefined;
+        case "DATE_ADD": {
+          const base = first === undefined ? undefined : kind(first);
+          return base === "local" || base === "date" ? "local" : undefined;
+        }
+        case "NULLIF":
+          return first === undefined ? undefined : kind(first);
+        case "COALESCE":
+        case "GREATEST":
+        case "LEAST":
+        case "MIN":
+        case "MAX":
+        case "MODE":
+        case "PERCENTILE_DISC":
+        case "MINNOW_SINGLE_VALUE":
+          return unify(args);
+        default:
+          break;
+      }
+      const simple = simpleScalarFunctions.get(name);
+      if (simple?.returns === "date" || simple?.returns === "interval") return simple.returns;
+      if (simple?.returns === "argument") return first === undefined ? undefined : kind(first);
+      return undefined;
+    }
+    case "case":
+      return unify([
+        ...expression.branches.map((branch) => branch.then),
+        ...(expression.otherwise === undefined ? [] : [expression.otherwise]),
+      ]);
+    case "window":
+      return datetimeValueFunctions.has(expression.name) && expression.argument !== undefined
+        ? kind(expression.argument)
+        : undefined;
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * The DATE, INTERVAL, and timestamp-without-time-zone outputs of a block, for a source that
+ * reads it. A wildcard passes through the columns of the sources it covers; a positional
+ * column-alias list renames the outputs before the first wildcard.
+ */
+function blockDatetimeOutputs(
+  block: CompiledQuery,
+  tables: ((table: string) => DatetimeColumns | undefined) | undefined,
+  columnAliases?: readonly string[],
+): DatetimeColumns {
+  const resolver = blockColumnDatetimeResolver(block, tables);
+  const named = new Map<string, DatetimeTypeKind>();
+  const covered: TableSource[] = [];
+  let positional = columnAliases !== undefined;
+  block.select.forEach((item, index) => {
+    if (item.expression.kind === "wildcard") {
+      positional = false;
+      const table = item.expression.table;
+      for (const source of [block.base, ...block.joins]) {
+        if (table === undefined || source.alias === table) covered.push(source);
+      }
+      return;
+    }
+    const kind = datetimeTypeKind(item.expression, resolver, tables);
+    if (kind === undefined) return;
+    if (columnAliases === undefined) named.set(item.alias, kind);
+    else if (positional && columnAliases[index] !== undefined) {
+      named.set(columnAliases[index], kind);
+    }
+  });
+  if (covered.length === 0 || columnAliases !== undefined) return named;
+  const sources = covered.map((source) => sourceDatetimeColumns(source, tables));
+  return {
+    get: (name) => {
+      const explicit = named.get(name);
+      if (explicit !== undefined) return explicit;
+      for (const source of sources) {
+        const kind = source.get(name);
+        if (kind !== undefined) return kind;
+      }
+      return undefined;
+    },
+  };
+}
+
+function sourceDatetimeColumns(
+  source: TableSource,
+  tables: ((table: string) => DatetimeColumns | undefined) | undefined,
+): DatetimeColumns {
+  if (source.derived !== undefined) {
+    return blockDatetimeOutputs(source.derived, tables, source.columnAliases);
+  }
+  if (source.union !== undefined) {
+    // A set operation's column has the members' common type: each member must agree.
+    const [first, ...rest] = source.union.blocks;
+    if (first === undefined) return NO_DATETIME_COLUMNS;
+    const firstOutputs = blockDatetimeOutputs(first, tables);
+    const names = source.columnAliases ?? first.select.map((item) => item.alias);
+    const unified = new Map<string, DatetimeTypeKind>();
+    first.select.forEach((item, index) => {
+      const name = names[index];
+      if (name === undefined || item.expression.kind === "wildcard") return;
+      let kind = firstOutputs.get(item.alias);
+      for (const member of rest) {
+        const other = member.select[index];
+        if (other === undefined || other.expression.kind === "wildcard") return;
+        const otherKind = datetimeTypeKind(
+          other.expression,
+          blockColumnDatetimeResolver(member, tables),
+          tables,
+        );
+        // An untyped NULL member takes the others' type.
+        if (other.expression.kind === "literal" && other.expression.value === null) continue;
+        kind = unifiedDatetimeKind(kind, otherKind);
+      }
+      if (kind !== undefined) unified.set(name, kind);
+    });
+    return unified;
+  }
+  if (source.windowed !== undefined) {
+    const inputs = blockDatetimeOutputs(source.windowed.block, tables, source.columnAliases);
+    if (source.columnAliases !== undefined) return inputs;
+    const windows = new Map<string, DatetimeTypeKind>();
+    for (const window of source.windowed.windows) {
+      if (!datetimeValueFunctions.has(window.name) || window.argumentAlias === undefined) continue;
+      const kind = inputs.get(window.argumentAlias);
+      if (kind !== undefined) windows.set(window.alias, kind);
+    }
+    if (windows.size === 0) return inputs;
+    return { get: (name) => windows.get(name) ?? inputs.get(name) };
+  }
+  if (source.recursive !== undefined) {
+    // A recursive CTE's columns take their types from its non-recursive term.
+    return blockDatetimeOutputs(source.recursive.base, tables, source.columnAliases);
+  }
+  return tables?.(source.table) ?? NO_DATETIME_COLUMNS;
+}
+
+/** Resolves a column reference of one block to its DATE, INTERVAL, or local-timestamp kind. */
+function blockColumnDatetimeResolver(
+  block: CompiledQuery,
+  tables: ((table: string) => DatetimeColumns | undefined) | undefined,
+): (reference: string) => DatetimeTypeKind | undefined {
+  return sourcesDatetimeResolver([block.base, ...block.joins], tables);
+}
+
+/** `blockColumnDatetimeResolver` over a block's sources, before the block itself exists. */
+function sourcesDatetimeResolver(
+  sources: readonly TableSource[],
+  tables: ((table: string) => DatetimeColumns | undefined) | undefined,
+): (reference: string) => DatetimeTypeKind | undefined {
+  const cache = new Map<TableSource, DatetimeColumns>();
+  const columnsOf = (source: TableSource): DatetimeColumns => {
+    let columns = cache.get(source);
+    if (columns === undefined) {
+      columns = sourceDatetimeColumns(source, tables);
+      cache.set(source, columns);
+    }
+    return columns;
+  };
+  return (reference) => {
+    const separator = reference.indexOf(".");
+    if (separator !== -1) {
+      const alias = reference.slice(0, separator);
+      const source = sources.find((candidate) => candidate.alias === alias);
+      return source === undefined
+        ? undefined
+        : columnsOf(source).get(reference.slice(separator + 1));
+    }
+    let found: DatetimeTypeKind | undefined;
+    let count = 0;
+    for (const source of sources) {
+      const kind = columnsOf(source).get(reference);
+      if (kind === undefined) continue;
+      found = kind;
+      count += 1;
+    }
+    return count === 1 ? found : undefined;
+  };
+}
+
+/**
+ * How a text or JSON rendering reads each argument of one call: "text" for PostgreSQL's text
+ * output (CAST to text, CONCAT, FORMAT, QUOTE_LITERAL, a JSON object key), "json" for to_json's
+ * (JSON constructors and aggregates, ARRAY, whose values are JSON text here), undefined for an
+ * argument no rendering reads.
+ */
+function timestampTextStyle(
+  expression: Extract<Expression, { kind: "call" }>,
+  index: number,
+): "text" | "json" | undefined {
+  switch (expression.name) {
+    case "CAST": {
+      const target = expression.arguments[1];
+      return index === 0 && target?.kind === "literal" && target.value === "string"
+        ? "text"
+        : undefined;
+    }
+    case "CONCAT":
+    case "CONCAT_WS":
+      return "text";
+    case "FORMAT":
+      return index > 0 ? "text" : undefined;
+    case "QUOTE_LITERAL":
+      return index === 0 ? "text" : undefined;
+    case "TO_JSON":
+    case "JSON_ARRAY":
+    case "ARRAY":
+      return "json";
+    case "JSON_ARRAYAGG":
+      return index === 0 ? "json" : undefined;
+    case "JSON_OBJECT":
+      // PostgreSQL writes a datetime key in its JSON form too, `{"2026-01-02T03:04:05":1}`.
+      return "json";
+    default:
+      return undefined;
+  }
+}
+
+function timestampTextCall(operand: Expression, style: "text" | "json"): Expression {
+  return {
+    kind: "call",
+    name: "MINNOW_TIMESTAMP_TEXT",
+    arguments: [operand, { kind: "literal", value: style }],
+  };
+}
+
+/**
+ * Wraps the `timestamp without time zone` operands one node renders as text or JSON. A Date
+ * carries no type, and every stored datetime is an instant, so a rendering otherwise writes the
+ * `timestamp with time zone` form; this is where the compiler, which knows the operand's type,
+ * says otherwise. `timestamp || timestamp` keeps both sides as they are: PostgreSQL has no
+ * such operator, and the runtime refusal stands.
+ */
+function timestampTextSite(
+  node: Expression,
+  column: (reference: string) => DatetimeTypeKind | undefined,
+  tables: ((table: string) => DatetimeColumns | undefined) | undefined,
+): Expression {
+  const local = (operand: Expression): boolean =>
+    datetimeTypeKind(operand, column, tables) === "local";
+  if (node.kind === "binary" && node.operator === "||") {
+    const left = local(node.left);
+    const right = local(node.right);
+    if (left === right) return node;
+    return {
+      ...node,
+      left: left ? timestampTextCall(node.left, "text") : node.left,
+      right: right ? timestampTextCall(node.right, "text") : node.right,
+    };
+  }
+  if (node.kind !== "call") return node;
+  let wrapped: Expression[] | undefined;
+  node.arguments.forEach((argument, index) => {
+    const style = timestampTextStyle(node, index);
+    if (style === undefined || !local(argument)) return;
+    wrapped ??= [...node.arguments];
+    wrapped[index] = timestampTextCall(argument, style);
+  });
+  return wrapped === undefined ? node : { ...node, arguments: wrapped };
+}
+
+/**
+ * Marks the timestamp-without-time-zone operands of every text and JSON rendering in one
+ * expression, children first, subquery blocks included. Returns the expression, rebuilt only
+ * where something changed; nested blocks and window clauses are rewritten in place.
+ */
+export function annotateTimestampText(
+  expression: Expression,
+  column: (reference: string) => DatetimeTypeKind | undefined = () => undefined,
+  tables?: (table: string) => DatetimeColumns | undefined,
+): Expression {
+  if (expression.kind === "subquery" || expression.kind === "exists") {
+    annotatePlanTimestampText(expression.block, tables);
+    return expression;
+  }
+  const visit = (child: Expression): Expression => annotateTimestampText(child, column, tables);
+  if (expression.kind === "window") {
+    expression.partitionBy = expression.partitionBy.map(visit);
+    for (const order of expression.orderBy) order.expression = visit(order.expression);
+    if (expression.argument !== undefined) expression.argument = visit(expression.argument);
+    return expression;
+  }
+  let replacements: Map<Expression, Expression> | undefined;
+  for (const child of childExpressions(expression)) {
+    const next = visit(child);
+    if (next === child) continue;
+    replacements ??= new Map();
+    replacements.set(child, next);
+  }
+  const node =
+    replacements === undefined
+      ? expression
+      : mapChildExpressions(expression, (child) => replacements.get(child) ?? child);
+  return timestampTextSite(node, column, tables);
+}
+
+/**
+ * Marks timestamp text throughout a plan, nested blocks first. Without a catalog the TIMESTAMP
+ * constants, casts, and functions are known, and so are a derived source's outputs; with one,
+ * `date_column + INTERVAL '1 day'` is too.
+ */
+export function annotatePlanTimestampText(
+  plan: CompiledQuery,
+  tables?: (table: string) => DatetimeColumns | undefined,
+): void {
+  forEachNestedBlock(plan, (nested) => annotatePlanTimestampText(nested, tables));
+  const resolver = blockColumnDatetimeResolver(plan, tables);
+  mapBlockExpressions(plan, (expression) => annotateTimestampText(expression, resolver, tables));
+}
+
+/**
+ * Whether catalog binding could still mark timestamp text in this plan: an unmarked rendering
+ * whose operand would be a timestamp without time zone if its columns were DATEs (`day +
+ * INTERVAL '1 day'`) or were a view's timestamp-without-time-zone outputs. Plans without one —
+ * nearly all — need no clone at bind time.
+ */
+export function planMayHaveTimestampText(plan: CompiledQuery): boolean {
+  const optimisticDate = (): DatetimeTypeKind => "date";
+  const everyColumnDate = (): DatetimeColumns => EVERY_COLUMN_DATE;
+  const optimisticLocal = (): DatetimeTypeKind => "local";
+  const state = { found: false };
+  const probe = (expression: Expression): void => {
+    if (state.found) return;
+    if (expression.kind === "subquery" || expression.kind === "exists") {
+      if (planMayHaveTimestampText(expression.block)) state.found = true;
+      return;
+    }
+    if (
+      timestampTextSite(expression, optimisticDate, everyColumnDate) !== expression ||
+      timestampTextSite(expression, optimisticLocal, everyColumnDate) !== expression
+    ) {
+      state.found = true;
+      return;
+    }
+    childExpressions(expression).forEach(probe);
+  };
+  forEachNestedBlock(plan, (nested) => {
+    if (!state.found && planMayHaveTimestampText(nested)) state.found = true;
   });
   if (!state.found) forEachBlockExpression(plan, probe);
   return state.found;
@@ -5378,8 +5948,9 @@ function resolvePlanExactNumericConstants(plan: CompiledQuery): void {
  * division, so the fold must see the mark, or it would store 3.5 where PostgreSQL stores 3.
  */
 function resolveStatementExpression(expression: Expression): Expression {
-  annotateIntegerDivision(expression);
-  return resolveExactNumericConstants(expression);
+  const marked = annotateTimestampText(expression);
+  annotateIntegerDivision(marked);
+  return resolveExactNumericConstants(marked);
 }
 
 function resolveStatementExactNumericConstants(statement: CompiledStatement): void {
@@ -6484,12 +7055,21 @@ function generateSeriesSource(
   }
   const step: Expression = given ?? { kind: "literal", value: 1 };
   if (seriesStepIsZero(step)) throw new TypeError("GENERATE_SERIES step size cannot equal zero");
+  // PostgreSQL's timestamp series returns `timestamp` when both bounds are timestamps without
+  // time zone, and `timestamp with time zone` otherwise; only the text of a value shows which.
+  const local =
+    timestamps && unifiedDatetimeKind(datetimeTypeKind(start), datetimeTypeKind(stop)) === "local";
   const typed = (expression: Expression): Expression =>
     timestamps
       ? {
           kind: "call",
           name: "CAST",
-          arguments: [expression, { kind: "literal", value: "datetime" }],
+          arguments: [
+            expression,
+            local
+              ? { kind: "literal", value: "datetime", timestamp: true }
+              : { kind: "literal", value: "datetime" },
+          ],
         }
       : expression;
   const zero: Expression = timestamps
@@ -8212,6 +8792,23 @@ class Parser {
     return Number(token.text);
   }
 
+  /**
+   * A CAST target as the literal second argument of the CAST call. TIMESTAMP, TIMESTAMP WITHOUT
+   * TIME ZONE, and DATETIME carry the `timestamp` mark: the value is the same instant as a
+   * TIMESTAMPTZ cast's, but PostgreSQL renders it as text without the zone.
+   */
+  #castTargetLiteral(): Extract<Expression, { kind: "literal" }> {
+    const start = this.#index;
+    const value = this.#castTarget();
+    if (value !== "datetime") return { kind: "literal", value };
+    const words = this.tokens
+      .slice(start, this.#index)
+      .map((token) => token.text.toUpperCase())
+      .join(" ");
+    const local = !words.startsWith("TIMESTAMPTZ") && !words.startsWith("TIMESTAMP WITH");
+    return local ? { kind: "literal", value, timestamp: true } : { kind: "literal", value };
+  }
+
   /** A CAST target: the SqlColumnType, or "number-integer" for the truncating integer names. */
   #castTarget(): string {
     const word = this.#identifier().toUpperCase();
@@ -8376,6 +8973,7 @@ class Parser {
       // Any query expression feeds INSERT: a plain SELECT, a WITH, a set operation, or a
       // parenthesized member; ON CONFLICT then applies to the produced rows as it does to VALUES.
       const insertSource = this.#queryExpression("(insert select)");
+      annotatePlanTimestampText(insertSource);
       annotatePlanIntegerDivision(insertSource);
       resolvePlanExactNumericConstants(insertSource);
       const query = planHasPendingSelectShapes(insertSource)
@@ -10564,7 +11162,7 @@ class Parser {
         left = {
           kind: "call",
           name: "CAST",
-          arguments: [left, { kind: "literal", value: this.#castTarget() }],
+          arguments: [left, this.#castTargetLiteral()],
         };
         continue;
       }
@@ -10816,11 +11414,20 @@ class Parser {
         this.#expectPunctuation(")");
       }
       this.usesStatementDatetime = true;
-      return {
+      const call: Expression = {
         kind: "call",
         name: statementDatetimeAliases.get(upper) as ScalarFunctionName,
         arguments: [],
       };
+      // LOCALTIMESTAMP is the same instant typed as a timestamp without time zone, which only
+      // its text shows: the cast carries that type, as a written TIMESTAMP cast does.
+      return upper === "LOCALTIMESTAMP"
+        ? {
+            kind: "call",
+            name: "CAST",
+            arguments: [call, { kind: "literal", value: "datetime", timestamp: true }],
+          }
+        : call;
     }
     if (upper === "POSITION" && this.#peek().text === "(") {
       // E021-11. POSITION(sub IN str) is INSTR's argument order reversed. The needle parses
@@ -10907,14 +11514,10 @@ class Parser {
       this.#expectPunctuation("(");
       const operand = this.#expression();
       this.#keyword("AS");
-      const target = this.#castTarget();
+      const target = this.#castTargetLiteral();
       this.#expectPunctuation(")");
       // CAST rides the call machinery: the target travels as a literal second argument.
-      return {
-        kind: "call",
-        name: "CAST",
-        arguments: [operand, { kind: "literal", value: target }],
-      };
+      return { kind: "call", name: "CAST", arguments: [operand, target] };
     }
     if (upper === "DATE" && this.#peek().kind === "string") {
       return {
@@ -11123,7 +11726,8 @@ class Parser {
         name === "MINNOW_SINGLE_VALUE" ||
         name === "MINNOW_JSON_GET" ||
         name === "MINNOW_JSON_GET_TEXT" ||
-        name === "MINNOW_REGEX_MATCH"
+        name === "MINNOW_REGEX_MATCH" ||
+        name === "MINNOW_TIMESTAMP_TEXT"
       ) {
         throw new TypeError(`Unsupported function: ${identifier}`);
       }
@@ -12564,6 +13168,12 @@ function lowerSelectBlock(
     ...(parts.limitWithTies === true ? { limitWithTies: true } : {}),
   };
   if (select.some((item) => containsWindow(item.expression))) {
+    // Window desugaring moves every operand — a CAST's target type included — into an inner
+    // block, where a text rendering can no longer be recognized: mark timestamp text first.
+    const datetimeResolver = sourcesDatetimeResolver([base, ...joins], undefined);
+    for (const item of select) {
+      item.expression = annotateTimestampText(item.expression, datetimeResolver);
+    }
     return desugarWindows(
       sql,
       base,
