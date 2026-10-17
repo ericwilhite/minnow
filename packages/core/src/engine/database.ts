@@ -17,6 +17,7 @@ import {
   normalizedColumnBackfill,
   type CreateTableInput,
   catalogQuerySchemas,
+  querySchemaColumn,
   assertDependentViewsKeepSchema,
   triggerReferencesColumn,
   validateName,
@@ -121,7 +122,7 @@ import {
 } from "../block-format/index.js";
 import { dateIsoString, dateMilliseconds } from "../date-value.js";
 import { crc32Continue } from "../block-format/checksum.js";
-import { maybeYieldToEventLoop, yieldToEventLoop } from "../work-slicer.js";
+import { maybeYieldToEventLoop, runStepsSliced, yieldToEventLoop } from "../work-slicer.js";
 import {
   NUMBER_INDEX_CELL_BYTES,
   OVERLAY_PATCH_BYTES,
@@ -168,6 +169,7 @@ import {
   secondaryUniqueKeyNamespace,
   CompactionJobConflictError,
   CompactionBacklogError,
+  compactionOutputSegmentIds,
   compactionPlanMatchesTableSchema,
   type CompactionJobRecord,
   type CompactionJobState,
@@ -221,6 +223,7 @@ import {
   SNAPSHOT_FRAME_KINDS,
   type StorageIntegrityMode,
   type StorageIntegrityReport,
+  type StoragePage,
   type StorageStats,
   type InterruptedSnapshotImport,
   type InterruptedSnapshotImportAbortResult,
@@ -366,6 +369,7 @@ import {
   optimizePlan,
   qualifyCorrelatedReferences,
   renderPlan,
+  reverseComparison,
 } from "./optimizer.js";
 import {
   defineSqlResultProperty,
@@ -443,6 +447,7 @@ import {
   postingFrequencyTotal,
   readyUniqueSecondaryIndexes,
   rowIdSpanEnvelope,
+  safeWholeNumberSum,
   secondaryIndexComponentTerm,
   secondaryIndexTerm,
   secondaryIndexTermsCoverNulls,
@@ -1995,15 +2000,7 @@ function projectReturningItems(
   );
   const input = createColumnarTable(table.name, columns);
   const typedSchemas = new Map<string, SqlColumnSchema[]>([
-    [
-      table.name,
-      visible.map(({ name, type, integer, sqlDomain }) => ({
-        name,
-        type,
-        ...(integer === true ? { integer: true as const } : {}),
-        ...(sqlDomain === undefined ? {} : { sqlDomain }),
-      })),
-    ],
+    [table.name, visible.map(querySchemaColumn)],
   ]);
   const memory = new QueryMemoryContext(undefined);
   const prepared = createPreparedColumnarQuery(plan, new Map([[table.name, input]]), memory);
@@ -8169,36 +8166,28 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         options.maxOwners === undefined
           ? Number.MAX_SAFE_INTEGER
           : positiveWholeNumber(options.maxOwners, "Spill cleanup owner limit");
-      const cutoff = dateIsoString(this.#now());
-      const result: QuerySpillCleanupResult = {
-        ownersExamined: 0,
-        ownersReclaimed: 0,
-        ownersRetained: 0,
-      };
-      let cursor: string | null = null;
-      while (result.ownersExamined < maxOwners) {
-        const page = await this.store.listTempOwnerIdsPage(
-          cursor,
-          Math.min(64, maxOwners - result.ownersExamined),
-        );
-        for (const ownerId of page.records) {
-          result.ownersExamined += 1;
-          if (await this.store.removeTempOwnerIfExpired(ownerId, cutoff)) {
-            result.ownersReclaimed += 1;
-          } else {
-            result.ownersRetained += 1;
-          }
-        }
-        if (page.nextCursor === null) break;
-        cursor = page.nextCursor;
-        await this.#yieldMaintenance();
-      }
-      return result;
+      return this.#reclaimExpiredTempOwners(maxOwners, (cursor, limit) =>
+        this.store.listTempOwnerIdsPage(cursor, limit),
+      );
     });
   }
 
   /** Automatic cleanup visits only actual expired candidates, so a live prefix cannot starve it. */
-  async #cleanupExpiredQuerySpill(maxOwners: number): Promise<QuerySpillCleanupResult> {
+  #cleanupExpiredQuerySpill(maxOwners: number): Promise<QuerySpillCleanupResult> {
+    return this.#reclaimExpiredTempOwners(maxOwners, (cursor, limit, cutoff) =>
+      this.store.listExpiredTempOwnerPage(cutoff, cursor, limit),
+    );
+  }
+
+  /** Removes the expired spill owners among up to `maxOwners` candidates, a page at a time. */
+  async #reclaimExpiredTempOwners(
+    maxOwners: number,
+    listPage: (
+      cursor: string | null,
+      limit: number,
+      cutoff: string,
+    ) => Promise<StoragePage<string, string>>,
+  ): Promise<QuerySpillCleanupResult> {
     const cutoff = dateIsoString(this.#now());
     const result: QuerySpillCleanupResult = {
       ownersExamined: 0,
@@ -8207,11 +8196,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     };
     let cursor: string | null = null;
     while (result.ownersExamined < maxOwners) {
-      const page = await this.store.listExpiredTempOwnerPage(
-        cutoff,
-        cursor,
-        Math.min(64, maxOwners - result.ownersExamined),
-      );
+      const page = await listPage(cursor, Math.min(64, maxOwners - result.ownersExamined), cutoff);
       for (const ownerId of page.records) {
         result.ownersExamined += 1;
         if (await this.store.removeTempOwnerIfExpired(ownerId, cutoff)) {
@@ -10917,17 +10902,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     options = this.#effectiveQueryOptions(options);
     throwIfAborted(options.signal);
     plan = expandFtsColumns(plan, (name) => searchableFtsColumns(realTables.get(name)));
-    const typedSchemas = new Map<string, SqlColumnSchema[]>(
-      [...realTables.values()].map((table) => [
-        table.name,
-        table.columns.map(({ name, type, integer, sqlDomain }) => ({
-          name,
-          type,
-          ...(integer === true ? { integer: true as const } : {}),
-          ...(sqlDomain === undefined ? {} : { sqlDomain }),
-        })),
-      ]),
-    );
+    const typedSchemas = catalogQuerySchemas([...realTables.values()]);
     const memory = new QueryMemoryContext(options.executionMemoryBudgetBytes);
     const allowSpill = options.spillToStorage !== false;
     const forceSpill = options.spillToStorage === true;
@@ -12595,12 +12570,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       ...(definition.integer ? { integer: true as const } : {}),
       ...(definition.sqlDomain === undefined ? {} : { sqlDomain: definition.sqlDomain }),
     }));
-    const inferred = record.columns.map(({ name, type, integer, sqlDomain }) => ({
-      name,
-      type,
-      ...(integer === true ? { integer: true as const } : {}),
-      ...(sqlDomain === undefined ? {} : { sqlDomain }),
-    }));
+    const inferred = record.columns.map(querySchemaColumn);
     const render = (
       columns: Array<{
         name: string;
@@ -14710,17 +14680,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             }
             continue;
           }
-          const schemas = new Map(
-            records.map((record) => [
-              record.name,
-              record.columns.map(({ name, type, integer, sqlDomain }) => ({
-                name,
-                type,
-                ...(integer === true ? { integer: true as const } : {}),
-                ...(sqlDomain === undefined ? {} : { sqlDomain }),
-              })),
-            ]),
-          );
+          const schemas = catalogQuerySchemas(records);
           const plan = await this.#applyCatalogRewrites(statement.query, before);
           const tableColumns: TableColumnRecord[] = inferBlockSchema(plan, schemas).map(
             ({ name, type, integer, sqlDomain }) => ({
@@ -15839,17 +15799,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
     const { schemas, typedSchemas } = analysis("schemas", () => ({
       schemas: new Map(tables.map((table) => [table.name, table.columns.map(({ name }) => name)])),
-      typedSchemas: new Map<string, SqlColumnSchema[]>(
-        tables.map((table) => [
-          table.name,
-          table.columns.map(({ name, type, integer, sqlDomain }) => ({
-            name,
-            type,
-            ...(integer === true ? { integer: true as const } : {}),
-            ...(sqlDomain === undefined ? {} : { sqlDomain }),
-          })),
-        ]),
-      ),
+      typedSchemas: catalogQuerySchemas(tables),
     }));
     // Streamed plans scan real tables only, so the catalog schemas resolve every AVG argument.
     // The scales are a function of the shape: a prepared plan whose template needs none skips
@@ -28400,15 +28350,7 @@ function normalizePlanDomainLiterals(
   };
   const rewriteBlock = (block: CompiledQuery): void => {
     if (pass.probing && pass.needed) return;
-    for (const source of [block.base, ...block.joins]) {
-      if (source.derived !== undefined) rewriteBlock(source.derived);
-      source.union?.blocks.forEach(rewriteBlock);
-      if (source.windowed !== undefined) rewriteBlock(source.windowed.block);
-      if (source.recursive !== undefined) {
-        rewriteBlock(source.recursive.base);
-        rewriteBlock(source.recursive.step);
-      }
-    }
+    forEachNestedBlock(block, rewriteBlock);
     const sources = [block.base, ...block.joins];
     const lookup = <T>(
       reference: string,
@@ -30693,14 +30635,6 @@ function uniqueKeyMembers(
   return members;
 }
 
-function reverseComparison(operator: ComparisonOperator): ComparisonOperator {
-  if (operator === ">") return "<";
-  if (operator === ">=") return "<=";
-  if (operator === "<") return ">";
-  if (operator === "<=") return ">=";
-  return operator;
-}
-
 function zoneMapCanMatch(
   description: ReturnType<typeof inspectBlock>,
   predicate: ZonePredicate,
@@ -30778,17 +30712,6 @@ function isPhysicalColumnLimitError(error: unknown): boolean {
   return (
     error instanceof RangeError && error.message === "Physical column exceeds maximum byte length"
   );
-}
-
-function safeWholeNumberSum(values: readonly number[], name: string): number {
-  let total = 0;
-  for (const value of values) {
-    if (!Number.isSafeInteger(value) || value < 0 || total > Number.MAX_SAFE_INTEGER - value) {
-      throw new RangeError(`${name} exceeds the safe integer range`);
-    }
-    total += value;
-  }
-  return total;
 }
 
 function safeWholeNumberProduct(left: number, right: number, name: string): number {
@@ -31479,15 +31402,6 @@ async function mapKeysSliced<Key>(map: ReadonlyMap<Key, unknown>): Promise<Key[]
     if (keys.length % ARRAY_BUILD_SLICE === 0) await maybeYieldToEventLoop();
   }
   return keys;
-}
-
-async function runStepsSliced<T>(steps: Generator<void, T>): Promise<T> {
-  let step = steps.next();
-  while (step.done !== true) {
-    await maybeYieldToEventLoop();
-    step = steps.next();
-  }
-  return step.value;
 }
 
 /** Postings per stored chunk while the base stays far from MAX_FTS_BASE_CHUNKS. */
@@ -32324,19 +32238,6 @@ function physicalOutputColumns(
 /** The segment ID partition `index` of a partitioned merge publishes under. */
 function partitionOutputSegmentId(outputSegmentId: string, index: number): string {
   return index === 0 ? outputSegmentId : `${outputSegmentId}/${String(index)}`;
-}
-
-/** Every segment a job publishes: one per output partition, or the single output segment. */
-function compactionOutputSegmentIds(job: CompactionJobRecord): string[] {
-  if (job.outputSegmentId === null) return [];
-  const plan = job.rewritePlan;
-  if (plan.kind === "copy-v1" || plan.partitions === undefined) {
-    return [job.outputSegmentId];
-  }
-  const outputSegmentId = job.outputSegmentId;
-  return plan.partitions.map((_partition, index) =>
-    partitionOutputSegmentId(outputSegmentId, index),
-  );
 }
 
 /**

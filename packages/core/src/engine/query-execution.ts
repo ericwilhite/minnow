@@ -35,7 +35,7 @@ import { QueryMemoryBudgetError, QueryMemoryContext } from "./memory.js";
 import { type ColumnarTable, type QuerySpillStore } from "./vector.js";
 import { type FtsStats } from "./fts.js";
 import { type LeasedSnapshot } from "../transactions/index.js";
-import { collectRealTableNames } from "./catalog-mutations.js";
+import { catalogQuerySchemas, collectRealTableNames } from "./catalog-mutations.js";
 import { chooseJoinOrder } from "./optimizer.js";
 import type { BlockStore } from "../storage/types.js";
 
@@ -157,6 +157,32 @@ export function searchableFtsColumns(
 
 export function visibleTableColumns(table: TableRecord): TableColumnRecord[] {
   return table.columns.filter((column) => column.hidden !== true);
+}
+
+/**
+ * One SQL text's compiled form through a least-recently-used cache: a hit moves to the newest
+ * end, and text past the cacheable length compiles every time without displacing anything.
+ */
+function compiledThroughCache<T>(
+  cache: Map<string, T>,
+  sql: string,
+  compile: (sql: string) => T,
+): T {
+  const cacheable = sql.length <= MAX_CACHEABLE_TEXT_CHARACTERS;
+  const cached = cacheable ? cache.get(sql) : undefined;
+  if (cached !== undefined) {
+    cache.delete(sql);
+    cache.set(sql, cached);
+    return cached;
+  }
+  const compiled = compile(sql);
+  if (!cacheable) return compiled;
+  cache.set(sql, compiled);
+  if (cache.size > PLAN_CACHE_LIMIT) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  return compiled;
 }
 
 export function positiveWholeNumber(value: number, name: string): number {
@@ -344,39 +370,11 @@ export class QueryExecution {
   }
 
   compile(sql: string): CompiledQuery {
-    const cacheable = sql.length <= MAX_CACHEABLE_TEXT_CHARACTERS;
-    const cached = cacheable ? this.#planCache.get(sql) : undefined;
-    if (cached !== undefined) {
-      this.#planCache.delete(sql);
-      this.#planCache.set(sql, cached);
-      return cached;
-    }
-    const plan = compileQuery(sql);
-    if (!cacheable) return plan;
-    this.#planCache.set(sql, plan);
-    if (this.#planCache.size > PLAN_CACHE_LIMIT) {
-      const oldest = this.#planCache.keys().next().value;
-      if (oldest !== undefined) this.#planCache.delete(oldest);
-    }
-    return plan;
+    return compiledThroughCache(this.#planCache, sql, compileQuery);
   }
 
   compileStatement(sql: string): CompiledStatement {
-    const cacheable = sql.length <= MAX_CACHEABLE_TEXT_CHARACTERS;
-    const cached = cacheable ? this.#statementCache.get(sql) : undefined;
-    if (cached !== undefined) {
-      this.#statementCache.delete(sql);
-      this.#statementCache.set(sql, cached);
-      return cached;
-    }
-    const statement = compileStatement(sql);
-    if (!cacheable) return statement;
-    this.#statementCache.set(sql, statement);
-    if (this.#statementCache.size > PLAN_CACHE_LIMIT) {
-      const oldest = this.#statementCache.keys().next().value;
-      if (oldest !== undefined) this.#statementCache.delete(oldest);
-    }
-    return statement;
+    return compiledThroughCache(this.#statementCache, sql, compileStatement);
   }
 
   async prepare(
@@ -426,17 +424,7 @@ export class QueryExecution {
         visibility: SegmentVisibilityCatalog,
       ): Promise<void> => {
         throwIfAborted(options.signal);
-        const typedSchemas = new Map<string, SqlColumnSchema[]>(
-          [...realTables.values()].map((table) => [
-            table.name,
-            table.columns.map(({ name, type, integer, sqlDomain }) => ({
-              name,
-              type,
-              ...(integer === true ? { integer: true as const } : {}),
-              ...(sqlDomain === undefined ? {} : { sqlDomain }),
-            })),
-          ]),
-        );
+        const typedSchemas = catalogQuerySchemas([...realTables.values()]);
         // MATCH(*)/BM25(*) expand against the catalog first — copy-on-write, so the compile
         // cache's plan (and the parity tests) keep "*" — and subquery resolution then collects
         // its steps from the expanded plan so substitutions land in the object that executes.
