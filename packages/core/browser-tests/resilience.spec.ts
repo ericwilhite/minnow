@@ -114,13 +114,12 @@ for (const kind of ["indexeddb", "opfs"] as const) {
       (error: unknown) => (error instanceof Error ? error : new Error(String(error))),
     );
     if (reopenFailure !== undefined) {
-      // WebKit can keep a transaction the terminated worker still had queued registered, and it
-      // then blocks this reopen's first read until the tab that ran the worker closes. The
-      // adapter no longer queues a worker's transactions behind its own, which removed the
-      // case this test met; a queue through another tab's write remains possible. The store
-      // reports that as StorageUnresponsiveError, the browser wedge the interaction spec's
-      // crash campaign also accepts. Accepted only here: WebKit, IndexedDB, the reopen right
-      // after the injected crash, and only that error. Anything else fails.
+      // WebKit can keep a transaction the terminated worker still had queued registered — in
+      // this test, background reads queued behind the worker's own commit — and it then blocks
+      // this reopen's first read until the tab that ran the worker closes. The store reports
+      // that as StorageUnresponsiveError, the browser wedge the interaction spec's crash
+      // campaign also accepts. Accepted only here: WebKit, IndexedDB, the reopen right after the
+      // injected crash, and only that error. Anything else fails.
       const wedged =
         browserName === "webkit" &&
         kind === "indexeddb" &&
