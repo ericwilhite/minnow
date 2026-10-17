@@ -220,8 +220,9 @@ export interface MinnowDatabaseClientOptions<TSchema extends AnySchema = Untyped
   /**
    * How long a call may go without a word from the worker before the connection is declared
    * dead; defaults to 60 seconds and also covers initialization. The worker reports every few
-   * seconds while it works on a call, so a large batch write is bounded by progress, not by wall
-   * time — up to ten times this value in all.
+   * seconds while it works on a call or opens the store, so a large batch write or a slow open is
+   * bounded by progress, not by wall time — up to ten times this value in all. A store that
+   * answers nothing fails initialization with its own error (`StorageUnresponsiveError`).
    */
   requestTimeoutMs?: number;
   /**

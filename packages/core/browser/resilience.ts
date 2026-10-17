@@ -175,6 +175,71 @@ export async function closeWhileAdmissionBlocked(name: string): Promise<string> 
   return pending;
 }
 
+let releaseHold: (() => Promise<void>) | undefined;
+/**
+ * Holds a readwrite transaction on the database's catalog from this page's own connection, and
+ * keeps it alive with one read after another until `releaseDatabase()`: every transaction that
+ * overlaps it, in any tab, waits meanwhile — what a transaction a browser never finishes does.
+ */
+export async function holdDatabase(name: string): Promise<void> {
+  const db = await new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open(name);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error ?? new Error("open failed"));
+  });
+  const transaction = db.transaction("catalog", "readwrite");
+  const catalog = transaction.objectStore("catalog");
+  let holding = true;
+  const done = new Promise<void>((resolve, reject) => {
+    transaction.oncomplete = () => resolve();
+    transaction.onabort = () => reject(transaction.error ?? new Error("hold aborted"));
+  });
+  await new Promise<void>((started) => {
+    const next = (): void => {
+      catalog.get("hold").onsuccess = () => {
+        started();
+        if (holding) next();
+      };
+    };
+    next();
+  });
+  releaseHold = async () => {
+    holding = false;
+    await done;
+    db.close();
+  };
+}
+export async function releaseDatabase(): Promise<void> {
+  await releaseHold?.();
+  releaseHold = undefined;
+}
+/**
+ * The stalled worker stays alive: its schema read is still queued behind the hold, and
+ * terminating a worker with a queued transaction is what wedges WebKit in the first place.
+ */
+const stalledWorkers: Worker[] = [];
+/** Opens a client whose store gives up after two seconds of silence; returns how init ended. */
+export async function openWhileHeld(name: string): Promise<{ name: string; message: string }> {
+  const stalled = new Worker(new URL("./unresponsive-worker.ts", import.meta.url), {
+    type: "module",
+  });
+  stalledWorkers.push(stalled);
+  // A client deadline shorter than the store's: only the worker's progress reports keep the
+  // client from calling a live worker dead before the store names the stall.
+  const stalledClient = new MinnowDatabaseClient(stalled, {
+    store: { kind: "indexeddb", name },
+    requestTimeoutMs: 1_000,
+  });
+  try {
+    await stalledClient.ready();
+    return { name: "ready", message: "" };
+  } catch (error) {
+    return error instanceof Error
+      ? { name: error.name, message: error.message }
+      : { name: "unknown", message: String(error) };
+  }
+}
+
 export async function receipts() {
   return client.snapshot(async (snapshot) => ({
     sales: (await snapshot.query("SELECT id, total FROM sales ORDER BY id")).rows,

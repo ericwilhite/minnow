@@ -1597,7 +1597,10 @@ export function attachWorkerHost(
   options: WorkerStoreOptions = {},
 ): void {
   let initialized: Promise<DatabaseRpcServer> | undefined;
+  /** Set once `initialized` has resolved: no request needs to be told to keep waiting. */
+  let opened = false;
   let initFailure: unknown;
+  let initKeepaliveMs = WORKER_KEEPALIVE_INTERVAL_MS;
   const report = workerErrorReporter(scope);
   const storeOptions: WorkerStoreOptions = {
     ...options,
@@ -1619,23 +1622,24 @@ export function attachWorkerHost(
     if (request === null) return;
     if (request.kind === "rpc-init" && initialized === undefined) {
       initFailure = undefined;
-      const attempt = createServer(
-        scope,
-        request.payload as DatabaseInitPayload,
-        createStore,
-        storeOptions,
-        report,
-      );
+      const payload = request.payload as DatabaseInitPayload;
+      initKeepaliveMs = keepaliveInterval(payload.keepaliveIntervalMs);
+      const attempt = createServer(scope, payload, createStore, storeOptions, report);
       initialized = attempt;
-      attempt.catch((error: unknown) => {
-        // Leave the worker reusable: a failed store open (quota, blocked upgrade) may be
-        // retried. Remember why it failed — the client pipelines calls behind init, so the
-        // ones that land after this reset must carry the real reason, not a generic refusal.
-        if (initialized === attempt) {
-          initialized = undefined;
-          initFailure = error;
-        }
-      });
+      attempt.then(
+        () => {
+          if (initialized === attempt) opened = true;
+        },
+        (error: unknown) => {
+          // Leave the worker reusable: a failed store open (quota, blocked upgrade) may be
+          // retried. Remember why it failed — the client pipelines calls behind init, so the
+          // ones that land after this reset must carry the real reason, not a generic refusal.
+          if (initialized === attempt) {
+            initialized = undefined;
+            initFailure = error;
+          }
+        },
+      );
     }
     const pending = initialized;
     if (pending === undefined) {
@@ -1654,6 +1658,14 @@ export function attachWorkerHost(
             );
       scope.postMessage(rpcFailure(request.requestId, failure));
       return;
+    }
+    // Opening the store can wait on storage for a long time — IndexedDB answers nothing at all
+    // while a transaction another connection left behind is stuck. Report on the init call, and
+    // on every call pipelined behind it, the way a running call is reported: the worker is
+    // alive, so the client's silence deadline must not call it dead, and the store's own
+    // deadline gets to name the cause (`StorageUnresponsiveError`) instead.
+    if (!opened && request.kind !== "rpc-cancel") {
+      reportUntilSettled(scope, request.requestId, pending, initKeepaliveMs);
     }
     void pending
       .then((server) => server.handle(request))
@@ -1706,6 +1718,27 @@ async function createServer(
       ? {}
       : { keepaliveIntervalMs: payload.keepaliveIntervalMs }),
   });
+}
+
+/** Posts keepalive events for `requestId` every `intervalMs` until `pending` settles. */
+function reportUntilSettled(
+  scope: RpcScope,
+  requestId: string,
+  pending: Promise<unknown>,
+  intervalMs: number,
+): void {
+  const timer = setInterval(() => {
+    try {
+      scope.postMessage(workerKeepaliveEvent(requestId));
+    } catch {
+      // The scope is gone; the call's own outcome can no longer be delivered either.
+    }
+  }, intervalMs);
+  unrefTimer(timer);
+  const stop = (): void => {
+    clearInterval(timer);
+  };
+  pending.then(stop, stop);
 }
 
 /** A wire-supplied interval is clamped to a sane range; anything else means the default. */

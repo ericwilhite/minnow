@@ -618,16 +618,19 @@ fails as an unknown outcome instead of waiting out the client's silence deadline
 produces the same plan in both.
 
 The browser driver recovers a crash by reloading the document. A new worker in the same document
-is enough on Chromium and Firefox, but WebKit can keep an unfinished transaction of the dead
-worker registered — seen when the worker had more than one in flight — and blocks every
-transaction that overlaps it, in every tab, until the tab that ran the worker closes; a reload
-does not always release it. The engine bounds that wait with `StorageUnresponsiveError`, raised
-by the reopen itself when the stuck transaction blocks the open's first read. A deliberate
+is enough on Chromium and Firefox, but WebKit can keep a transaction the dead worker still had
+queued — behind another of its own, or behind another tab's write that waited on it — registered,
+and blocks every transaction that overlaps it, in every tab, until the tab that ran the worker
+closes; a reload does not always release it. The engine bounds that wait with
+`StorageUnresponsiveError`, raised by the reopen itself when the stuck transaction blocks the
+open's first read. A deliberate
 WebKit/IndexedDB crash campaign that meets an unresponsive store records it in
 `transientsAccepted` and stops, with `interactions` counting the steps it judged; background
 maintenance in other tabs that was waiting on the same database reports the same
 `StorageUnresponsiveError`, and that report is accepted with it. This exception is limited to that
-browser, store, and deliberate crash campaign.
+browser, store, and deliberate crash campaign. The resilience spec's crash-recovery test makes
+the same exception, and only for the reopen right after its injected worker crash on WebKit's
+IndexedDB.
 Every browser/store pair also runs a separate campaign without fault steps that must complete
 the entire plan; a crash exception cannot replace that coverage. Other early stops fail.
 

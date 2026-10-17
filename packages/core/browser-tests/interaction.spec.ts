@@ -160,12 +160,13 @@ async function openTab(
       ),
     /**
      * A crash is recovered by reloading the document. A new worker in the same document is
-     * enough on Chromium and Firefox, but WebKit can keep an unfinished transaction of the
-     * terminated worker registered -- seen when the worker had more than one in flight -- and
-     * every transaction that overlaps it blocks, in every tab, new connections included. A
-     * reload does not always release it (closing the tab does), so the engine bounds the wait and
-     * reports `StorageUnresponsiveError`, from the reopen itself when the stuck transaction
-     * blocks the open's first read, and the plan runner stops there as an accepted transient.
+     * enough on Chromium and Firefox, but WebKit can keep a transaction the terminated worker
+     * still had queued -- behind another of its own, or behind another tab's write that waited
+     * on it -- registered, and every transaction that overlaps it blocks, in every tab, new
+     * connections included. A reload does not always release it (closing the tab does), so the
+     * engine bounds the wait and reports `StorageUnresponsiveError`, from the reopen itself when
+     * the stuck transaction blocks the open's first read, and the plan runner stops there as an
+     * accepted transient.
      */
     reopen: async () => {
       if (!crashed) {
