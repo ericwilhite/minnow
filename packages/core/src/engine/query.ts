@@ -2423,15 +2423,7 @@ export function subqueryResolutionSteps(plan: CompiledQuery): {
     }
   };
   const collectBlock = (block: CompiledQuery): void => {
-    for (const source of [block.base, ...block.joins]) {
-      if (source.derived !== undefined) collectBlock(source.derived);
-      source.union?.blocks.forEach(collectBlock);
-      if (source.windowed !== undefined) collectBlock(source.windowed.block);
-      if (source.recursive !== undefined) {
-        collectBlock(source.recursive.base);
-        collectBlock(source.recursive.step);
-      }
-    }
+    forEachNestedBlock(block, collectBlock);
     for (const item of block.select) {
       rewrite(item.expression, (next) => (item.expression = next));
     }
@@ -2486,14 +2478,7 @@ export function blockHasSubqueries(plan: CompiledQuery): boolean {
       (predicate) => expressionHas(predicate.left) || expressionHas(predicate.right),
     ) ||
     block.orderBy.some((order) => expressionHas(order.expression)) ||
-    [block.base, ...block.joins].some(
-      (source) =>
-        (source.derived !== undefined && blockHas(source.derived)) ||
-        source.union?.blocks.some(blockHas) === true ||
-        (source.windowed !== undefined && blockHas(source.windowed.block)) ||
-        (source.recursive !== undefined &&
-          (blockHas(source.recursive.base) || blockHas(source.recursive.step))),
-    );
+    someNestedBlock(block, blockHas);
   return blockHas(plan);
 }
 
@@ -2517,17 +2502,7 @@ function blockHasParameters(block: CompiledQuery): boolean {
   }
   const expressions: Expression[] = [];
   forEachBlockExpression(block, (expression) => expressions.push(expression));
-  return (
-    expressions.some(containsParameter) ||
-    [block.base, ...block.joins].some(
-      (source) =>
-        (source.derived !== undefined && blockHasParameters(source.derived)) ||
-        source.union?.blocks.some(blockHasParameters) === true ||
-        (source.windowed !== undefined && blockHasParameters(source.windowed.block)) ||
-        (source.recursive !== undefined &&
-          (blockHasParameters(source.recursive.base) || blockHasParameters(source.recursive.step))),
-    )
-  );
+  return expressions.some(containsParameter) || someNestedBlock(block, blockHasParameters);
 }
 
 export function validateParameters(
@@ -4281,6 +4256,15 @@ export function forEachNestedBlock(
   }
 }
 
+/** Whether any nested block of one block's sources passes `test`, in visiting order. */
+function someNestedBlock(block: CompiledQuery, test: (nested: CompiledQuery) => boolean): boolean {
+  let found = false;
+  forEachNestedBlock(block, (nested) => {
+    if (!found) found = test(nested);
+  });
+  return found;
+}
+
 /**
  * Whether an expression is integer-typed the way PostgreSQL types it: an INTEGER, BIGINT, or
  * SMALLINT column, an integer constant, COUNT, an integer CAST, SUM/MIN/MAX/ABS over an
@@ -5990,17 +5974,8 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
             });
           }
           if ((expression.aggregateOrderBy?.length ?? 0) > 0) {
-            members.sort((left, right) => {
-              for (const [index, order] of (expression.aggregateOrderBy ?? []).entries()) {
-                const a = left.order[index];
-                const b = right.order[index];
-                const placed = nullOrder(a, b, order.nulls, order.direction);
-                if (placed !== undefined && placed !== 0) return placed;
-                const compared = compareValues(a, b);
-                if (compared !== 0) return order.direction === "desc" ? -compared : compared;
-              }
-              return 0;
-            });
+            const orderBy = expression.aggregateOrderBy ?? [];
+            members.sort((left, right) => compareAggregateOrder(orderBy, left.order, right.order));
           }
           if (members.length === 0) return null;
           return protectedSqlTextValue(
@@ -6031,17 +6006,8 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
             });
           }
           if ((expression.aggregateOrderBy?.length ?? 0) > 0) {
-            members.sort((left, right) => {
-              for (const [index, order] of (expression.aggregateOrderBy ?? []).entries()) {
-                const a = left.order[index];
-                const b = right.order[index];
-                const placed = nullOrder(a, b, order.nulls, order.direction);
-                if (placed !== undefined && placed !== 0) return placed;
-                const compared = compareValues(a, b);
-                if (compared !== 0) return order.direction === "desc" ? -compared : compared;
-              }
-              return 0;
-            });
+            const orderBy = expression.aggregateOrderBy ?? [];
+            members.sort((left, right) => compareAggregateOrder(orderBy, left.order, right.order));
           }
           return members.length === 0
             ? null
@@ -6974,8 +6940,23 @@ export function comparisonHolds(
     rightValue === undefined
   )
     return false;
+  // NaN keeps the general path: SQL treats it as one value equal to itself.
+  if (
+    typeof leftValue === "number" &&
+    typeof rightValue === "number" &&
+    leftValue === leftValue &&
+    rightValue === rightValue
+  ) {
+    if (operator === "=") return leftValue === rightValue;
+    if (operator === "!=" || operator === "<>") return leftValue !== rightValue;
+    if (operator === ">") return leftValue > rightValue;
+    if (operator === ">=") return leftValue >= rightValue;
+    if (operator === "<") return leftValue < rightValue;
+    return leftValue <= rightValue;
+  }
   // An untyped string beside a datetime, number, or boolean reads in that value's type, as
-  // PostgreSQL types an unknown-typed literal by its context (`joined >= '2026-01-01'`).
+  // PostgreSQL types an unknown-typed literal by its context (`joined >= '2026-01-01'`). Both
+  // executors compare through this one function.
   [leftValue, rightValue] = coerceComparisonOperands(leftValue, rightValue);
   const left = comparable(leftValue);
   const right = comparable(rightValue);
@@ -7148,7 +7129,7 @@ export function expressionAliases(expression: Expression): Set<string> {
   );
 }
 
-function comparable(value: unknown): unknown {
+export function comparable(value: unknown): unknown {
   if (value instanceof Date) return dateMilliseconds(value);
   if (isDateDomainValue(value)) {
     const external = externalSqlDomainValue(value);
@@ -7177,7 +7158,30 @@ export function nullOrder(
   return (leftNull ? -1 : 1) * (placement === "first" ? 1 : -1);
 }
 
-function numeric(value: unknown): number {
+/**
+ * Orders two members of an ordered aggregate (STRING_AGG, JSON_ARRAYAGG) by their evaluated
+ * ORDER BY keys, NULL placement first; both executors sort through this one comparison.
+ */
+export function compareAggregateOrder(
+  orderBy: ReadonlyArray<{
+    readonly direction: "asc" | "desc";
+    readonly nulls?: "first" | "last" | undefined;
+  }>,
+  left: readonly unknown[],
+  right: readonly unknown[],
+): number {
+  for (const [index, order] of orderBy.entries()) {
+    const a = left[index];
+    const b = right[index];
+    const placed = nullOrder(a, b, order.nulls, order.direction);
+    if (placed !== undefined && placed !== 0) return placed;
+    const compared = compareValues(a, b);
+    if (compared !== 0) return order.direction === "desc" ? -compared : compared;
+  }
+  return 0;
+}
+
+export function numeric(value: unknown): number {
   if (typeof value !== "number")
     throw new TypeError("Arithmetic and numeric aggregates require numbers");
   return value;
@@ -7194,7 +7198,7 @@ function sumNumericValues(values: readonly unknown[]): unknown {
   return total;
 }
 
-function asQueryValue(value: unknown): QueryValue {
+export function asQueryValue(value: unknown): QueryValue {
   if (
     value === null ||
     typeof value === "boolean" ||

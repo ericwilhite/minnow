@@ -36,7 +36,7 @@ import type { DatabaseTransaction } from "../transactions/index.js";
 import type { UpdateBatchInput } from "./database.js";
 
 /** A whole-number total that refuses to leave the range a stored count can round-trip. */
-function safeWholeNumberSum(values: readonly number[], name: string): number {
+export function safeWholeNumberSum(values: readonly number[], name: string): number {
   let total = 0;
   for (const value of values) {
     if (!Number.isSafeInteger(value) || value < 0 || total > Number.MAX_SAFE_INTEGER - value) {

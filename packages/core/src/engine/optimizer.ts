@@ -227,17 +227,7 @@ export function chooseJoinOrder(
 function optimizeBlock(block: CompiledQuery, nextCorrelationAlias: NextAlias): void {
   decorrelateLateralSources(block);
   decorrelateBlock(block, nextCorrelationAlias);
-  for (const source of [block.base, ...block.joins]) {
-    if (source.derived !== undefined) optimizeBlock(source.derived, nextCorrelationAlias);
-    source.union?.blocks.forEach((member) => optimizeBlock(member, nextCorrelationAlias));
-    if (source.windowed !== undefined) {
-      optimizeBlock(source.windowed.block, nextCorrelationAlias);
-    }
-    if (source.recursive !== undefined) {
-      optimizeBlock(source.recursive.base, nextCorrelationAlias);
-      optimizeBlock(source.recursive.step, nextCorrelationAlias);
-    }
-  }
+  forEachNestedBlock(block, (nested) => optimizeBlock(nested, nextCorrelationAlias));
   const optimizeExpressionBlock = (expression: Expression): void => {
     if (expression.kind === "subquery" || expression.kind === "exists") {
       optimizeBlock(expression.block, nextCorrelationAlias);
@@ -1066,6 +1056,18 @@ interface CorrelationKey {
 const comparisonOperators = new Set(["=", "!=", "<>", ">", ">=", "<", "<="]);
 const correlationKeyAlias = (index: number): string => `\0correlation_key_${String(index)}`;
 const correlationProbeAlias = (index: number): string => `\0correlation_probe_${String(index)}`;
+/** `alias.<key i>` for each entry: the correlation-key columns a derived block selects. */
+const correlationKeyColumns = (alias: string, entries: readonly unknown[]): Expression[] =>
+  entries.map((_, index): Expression => ({
+    kind: "column",
+    reference: `${alias}.${correlationKeyAlias(index)}`,
+  }));
+/** `alias.<probe i>` for each entry: the columns of an outer probe block. */
+const correlationProbeColumns = (alias: string, entries: readonly unknown[]): Expression[] =>
+  entries.map((_, index): Expression => ({
+    kind: "column",
+    reference: `${alias}.${correlationProbeAlias(index)}`,
+  }));
 const correlationInputAlias = (index: number): string => `\0correlation_input_${String(index)}`;
 const correlationOrderAlias = (index: number): string => `\0correlation_order_${String(index)}`;
 const correlationValueAlias = "\0correlation_value";
@@ -1349,10 +1351,7 @@ function decorrelatePredicate(
         alias,
         derived,
         [
-          ...keys.map((_, index): Expression => ({
-            kind: "column",
-            reference: `${alias}.${correlationKeyAlias(index)}`,
-          })),
+          ...correlationKeyColumns(alias, keys),
           { kind: "column", reference: `${alias}.${correlationValueAlias}` },
         ],
         [...keys.map((key) => key.outer), predicate.left],
@@ -1402,10 +1401,7 @@ function decorrelatePredicate(
     const join = generalCorrelationJoin(
       alias,
       derived,
-      keys.map((_, index): Expression => ({
-        kind: "column",
-        reference: `${alias}.${correlationKeyAlias(index)}`,
-      })),
+      correlationKeyColumns(alias, keys),
       keys.map((key) => key.outer),
       keys.map((key) => key.operator),
     );
@@ -1469,25 +1465,17 @@ function decorrelatePredicate(
 }
 
 /**
- * Rewrites `probe NOT IN (correlated values)` without losing SQL's empty-set and NULL rules.
- *
- * One hash anti-join removes exact matches using a prefix-free composite key containing every
- * correlation key plus the compared value. A grouped left join then carries two counts for the
- * correlated set: total rows and non-null values. An absent group means the set is empty (true,
- * even for a NULL probe); otherwise the probe must be non-null and the two counts equal. The two
- * derived scans are bounded set-at-a-time work—no per-outer-row subquery or nested-loop join.
+ * The distinct (correlation keys, value) pairs of a correlated NOT IN set: the exact-match side
+ * of both NOT IN rewrites.
  */
-function decorrelateNotIn(
-  block: CompiledQuery,
-  probe: Expression,
+function notInValuesBlock(
+  sql: string,
   inner: CompiledQuery,
   item: Expression,
   keys: CorrelationKey[],
-  nextAlias: NextAlias,
-): Predicate {
-  const valuesAlias = nextAlias();
-  const values: CompiledQuery = {
-    sql: "(correlated not in values)",
+): CompiledQuery {
+  return {
+    sql,
     base: clonePlanTree(inner.base),
     joins: clonePlanTree(inner.joins),
     select: [
@@ -1501,204 +1489,15 @@ function decorrelateNotIn(
     groupBy: [...keys.map((key) => clonePlanTree(key.inner)), clonePlanTree(item)],
     having: [],
     orderBy: [],
-  };
-  const tuple = (arguments_: Expression[]): Expression => ({
-    kind: "call",
-    name: "MINNOW_TUPLE_KEY",
-    arguments: arguments_,
-  });
-  block.joins.push({
-    table: valuesAlias,
-    alias: valuesAlias,
-    derived: values,
-    kind: "anti",
-    left: tuple([...keys.map((key) => clonePlanTree(key.outer)), clonePlanTree(probe)]),
-    right: tuple([
-      ...keys.map((_, index) => ({
-        kind: "column" as const,
-        reference: `${valuesAlias}.${correlationKeyAlias(index)}`,
-      })),
-      { kind: "column", reference: `${valuesAlias}.${correlationValueAlias}` },
-    ]),
-  });
-
-  const flagsAlias = nextAlias();
-  const flags: CompiledQuery = {
-    sql: "(correlated not in flags)",
-    base: clonePlanTree(inner.base),
-    joins: clonePlanTree(inner.joins),
-    select: [
-      ...keys.map((key, index) => ({
-        expression: clonePlanTree(key.inner),
-        alias: correlationKeyAlias(index),
-      })),
-      {
-        expression: { kind: "call", name: "COUNT", arguments: [{ kind: "wildcard" }] },
-        alias: correlationCountAlias,
-      },
-      {
-        expression: { kind: "call", name: "COUNT", arguments: [clonePlanTree(item)] },
-        alias: correlationNonNullCountAlias,
-      },
-    ],
-    predicates: clonePlanTree(inner.predicates),
-    groupBy: keys.map((key) => clonePlanTree(key.inner)),
-    having: [],
-    orderBy: [],
-  };
-  pushCorrelationJoin(block, flagsAlias, flags, keys, "left");
-
-  const total: Expression = {
-    kind: "column",
-    reference: `${flagsAlias}.${correlationCountAlias}`,
-  };
-  const nonNull: Expression = {
-    kind: "column",
-    reference: `${flagsAlias}.${correlationNonNullCountAlias}`,
-  };
-  const safe: Expression = {
-    kind: "logical",
-    operator: "or",
-    left: {
-      kind: "condition",
-      operator: "IS NULL",
-      left: total,
-      right: { kind: "literal", value: null },
-    },
-    right: {
-      kind: "logical",
-      operator: "and",
-      left: {
-        kind: "condition",
-        operator: "IS NOT NULL",
-        left: clonePlanTree(probe),
-        right: { kind: "literal", value: null },
-      },
-      right: { kind: "condition", operator: "=", left: total, right: nonNull },
-    },
-  };
-  return {
-    left: safe,
-    operator: "IS TRUE",
-    right: { kind: "literal", value: true },
   };
 }
 
 /**
- * Range-correlated NOT IN uses a general anti-join for exact matches, then joins back one flag row
- * per distinct outer probe tuple. The counts preserve empty-set and NULL poisoning semantics.
+ * A NOT IN that survived its exact-match anti-join holds when the joined flag row is absent (an
+ * empty set, true even for a NULL probe), or when the probe is non-null and the set holds no NULL
+ * (its total and non-null counts agree).
  */
-function decorrelateRangeNotIn(
-  block: CompiledQuery,
-  probe: Expression,
-  inner: CompiledQuery,
-  item: Expression,
-  keys: CorrelationKey[],
-  nextAlias: NextAlias,
-): Predicate {
-  const valuesAlias = nextAlias();
-  const values: CompiledQuery = {
-    sql: "(range-correlated not in values)",
-    base: clonePlanTree(inner.base),
-    joins: clonePlanTree(inner.joins),
-    select: [
-      ...keys.map((key, index) => ({
-        expression: clonePlanTree(key.inner),
-        alias: correlationKeyAlias(index),
-      })),
-      { expression: clonePlanTree(item), alias: correlationValueAlias },
-    ],
-    predicates: clonePlanTree(inner.predicates),
-    groupBy: [...keys.map((key) => clonePlanTree(key.inner)), clonePlanTree(item)],
-    having: [],
-    orderBy: [],
-  };
-  const exactMatch = generalCorrelationJoin(
-    valuesAlias,
-    values,
-    [
-      ...keys.map((_, index): Expression => ({
-        kind: "column",
-        reference: `${valuesAlias}.${correlationKeyAlias(index)}`,
-      })),
-      { kind: "column", reference: `${valuesAlias}.${correlationValueAlias}` },
-    ],
-    [...keys.map((key) => clonePlanTree(key.outer)), clonePlanTree(probe)],
-    [...keys.map((key) => key.operator), "="],
-  );
-  exactMatch.kind = "anti";
-  block.joins.push(exactMatch);
-
-  const probes = outerProbeBlock(block, keys, nextAlias.resolvedNames);
-  const probesAlias = nextAlias();
-  const innerRowsAlias = nextAlias();
-  const innerRows: CompiledQuery = {
-    sql: "(range-correlated not in rows)",
-    base: inner.base,
-    joins: inner.joins,
-    select: [
-      ...keys.map((key, index) => ({
-        expression: key.inner,
-        alias: correlationKeyAlias(index),
-      })),
-      { expression: item, alias: correlationValueAlias },
-    ],
-    predicates: inner.predicates,
-    groupBy: [],
-    having: [],
-    orderBy: [],
-  };
-  const probeReferences = keys.map((_, index): Expression => ({
-    kind: "column",
-    reference: `${probesAlias}.${correlationProbeAlias(index)}`,
-  }));
-  const flags: CompiledQuery = {
-    sql: "(range-correlated not in flags)",
-    base: { table: probesAlias, alias: probesAlias, derived: probes },
-    joins: [
-      generalCorrelationJoin(
-        innerRowsAlias,
-        innerRows,
-        keys.map((_, index): Expression => ({
-          kind: "column",
-          reference: `${innerRowsAlias}.${correlationKeyAlias(index)}`,
-        })),
-        probeReferences,
-        keys.map(({ operator }) => operator),
-      ),
-    ],
-    select: [
-      ...probeReferences.map((expression, index) => ({
-        expression,
-        alias: correlationKeyAlias(index),
-      })),
-      {
-        expression: { kind: "call", name: "COUNT", arguments: [{ kind: "wildcard" }] },
-        alias: correlationCountAlias,
-      },
-      {
-        expression: {
-          kind: "call",
-          name: "COUNT",
-          arguments: [{ kind: "column", reference: `${innerRowsAlias}.${correlationValueAlias}` }],
-        },
-        alias: correlationNonNullCountAlias,
-      },
-    ],
-    predicates: [],
-    groupBy: probeReferences,
-    having: [],
-    orderBy: [],
-  };
-  const flagsAlias = nextAlias();
-  pushCorrelationJoin(
-    block,
-    flagsAlias,
-    flags,
-    keys.map((key) => ({ ...key, operator: "=" })),
-    "left",
-  );
-
+function notInHolds(flagsAlias: string, probe: Expression): Predicate {
   const total: Expression = {
     kind: "column",
     reference: `${flagsAlias}.${correlationCountAlias}`,
@@ -1735,6 +1534,165 @@ function decorrelateRangeNotIn(
 }
 
 /**
+ * Rewrites `probe NOT IN (correlated values)` without losing SQL's empty-set and NULL rules.
+ *
+ * One hash anti-join removes exact matches using a prefix-free composite key containing every
+ * correlation key plus the compared value. A grouped left join then carries two counts for the
+ * correlated set: total rows and non-null values. An absent group means the set is empty (true,
+ * even for a NULL probe); otherwise the probe must be non-null and the two counts equal. The two
+ * derived scans are bounded set-at-a-time work—no per-outer-row subquery or nested-loop join.
+ */
+function decorrelateNotIn(
+  block: CompiledQuery,
+  probe: Expression,
+  inner: CompiledQuery,
+  item: Expression,
+  keys: CorrelationKey[],
+  nextAlias: NextAlias,
+): Predicate {
+  const valuesAlias = nextAlias();
+  const values = notInValuesBlock("(correlated not in values)", inner, item, keys);
+  const tuple = (arguments_: Expression[]): Expression => ({
+    kind: "call",
+    name: "MINNOW_TUPLE_KEY",
+    arguments: arguments_,
+  });
+  block.joins.push({
+    table: valuesAlias,
+    alias: valuesAlias,
+    derived: values,
+    kind: "anti",
+    left: tuple([...keys.map((key) => clonePlanTree(key.outer)), clonePlanTree(probe)]),
+    right: tuple([
+      ...correlationKeyColumns(valuesAlias, keys),
+      { kind: "column", reference: `${valuesAlias}.${correlationValueAlias}` },
+    ]),
+  });
+
+  const flagsAlias = nextAlias();
+  const flags: CompiledQuery = {
+    sql: "(correlated not in flags)",
+    base: clonePlanTree(inner.base),
+    joins: clonePlanTree(inner.joins),
+    select: [
+      ...keys.map((key, index) => ({
+        expression: clonePlanTree(key.inner),
+        alias: correlationKeyAlias(index),
+      })),
+      {
+        expression: { kind: "call", name: "COUNT", arguments: [{ kind: "wildcard" }] },
+        alias: correlationCountAlias,
+      },
+      {
+        expression: { kind: "call", name: "COUNT", arguments: [clonePlanTree(item)] },
+        alias: correlationNonNullCountAlias,
+      },
+    ],
+    predicates: clonePlanTree(inner.predicates),
+    groupBy: keys.map((key) => clonePlanTree(key.inner)),
+    having: [],
+    orderBy: [],
+  };
+  pushCorrelationJoin(block, flagsAlias, flags, keys, "left");
+
+  return notInHolds(flagsAlias, probe);
+}
+
+/**
+ * Range-correlated NOT IN uses a general anti-join for exact matches, then joins back one flag row
+ * per distinct outer probe tuple. The counts preserve empty-set and NULL poisoning semantics.
+ */
+function decorrelateRangeNotIn(
+  block: CompiledQuery,
+  probe: Expression,
+  inner: CompiledQuery,
+  item: Expression,
+  keys: CorrelationKey[],
+  nextAlias: NextAlias,
+): Predicate {
+  const valuesAlias = nextAlias();
+  const values = notInValuesBlock("(range-correlated not in values)", inner, item, keys);
+  const exactMatch = generalCorrelationJoin(
+    valuesAlias,
+    values,
+    [
+      ...correlationKeyColumns(valuesAlias, keys),
+      { kind: "column", reference: `${valuesAlias}.${correlationValueAlias}` },
+    ],
+    [...keys.map((key) => clonePlanTree(key.outer)), clonePlanTree(probe)],
+    [...keys.map((key) => key.operator), "="],
+  );
+  exactMatch.kind = "anti";
+  block.joins.push(exactMatch);
+
+  const probes = outerProbeBlock(block, keys, nextAlias.resolvedNames);
+  const probesAlias = nextAlias();
+  const innerRowsAlias = nextAlias();
+  const innerRows: CompiledQuery = {
+    sql: "(range-correlated not in rows)",
+    base: inner.base,
+    joins: inner.joins,
+    select: [
+      ...keys.map((key, index) => ({
+        expression: key.inner,
+        alias: correlationKeyAlias(index),
+      })),
+      { expression: item, alias: correlationValueAlias },
+    ],
+    predicates: inner.predicates,
+    groupBy: [],
+    having: [],
+    orderBy: [],
+  };
+  const probeReferences = correlationProbeColumns(probesAlias, keys);
+  const flags: CompiledQuery = {
+    sql: "(range-correlated not in flags)",
+    base: { table: probesAlias, alias: probesAlias, derived: probes },
+    joins: [
+      generalCorrelationJoin(
+        innerRowsAlias,
+        innerRows,
+        correlationKeyColumns(innerRowsAlias, keys),
+        probeReferences,
+        keys.map(({ operator }) => operator),
+      ),
+    ],
+    select: [
+      ...probeReferences.map((expression, index) => ({
+        expression,
+        alias: correlationKeyAlias(index),
+      })),
+      {
+        expression: { kind: "call", name: "COUNT", arguments: [{ kind: "wildcard" }] },
+        alias: correlationCountAlias,
+      },
+      {
+        expression: {
+          kind: "call",
+          name: "COUNT",
+          arguments: [{ kind: "column", reference: `${innerRowsAlias}.${correlationValueAlias}` }],
+        },
+        alias: correlationNonNullCountAlias,
+      },
+    ],
+    predicates: [],
+    groupBy: probeReferences,
+    having: [],
+    orderBy: [],
+  };
+  const flagsAlias = nextAlias();
+  pushCorrelationJoin(
+    block,
+    flagsAlias,
+    flags,
+    keys.map((key) => ({ ...key, operator: "=" })),
+    "left",
+  );
+
+  return notInHolds(flagsAlias, probe);
+}
+
+/**
  * Produces the three-valued result of a correlated IN/ANY/ALL expression at any expression
  * position. Distinct outer probe tuples join the correlated set once, and grouped counts retain
  * the difference between true, false, unknown, and an empty set. Top-level WHERE predicates keep
@@ -1762,10 +1720,7 @@ function decorrelateQuantifiedExpression(
   const outerExpressions = [...keys.map((key) => clonePlanTree(key.outer)), clonePlanTree(probe)];
   const probes = outerProbeBlockForExpressions(block, outerExpressions, nextAlias.resolvedNames);
   const probesAlias = nextAlias();
-  const probeReferences = outerExpressions.map<Expression>((_, index) => ({
-    kind: "column",
-    reference: `${probesAlias}.${correlationProbeAlias(index)}`,
-  }));
+  const probeReferences = correlationProbeColumns(probesAlias, outerExpressions);
 
   const innerRowsAlias = nextAlias();
   const innerRows: CompiledQuery = {
@@ -1788,10 +1743,7 @@ function decorrelateQuantifiedExpression(
   const setJoin = generalCorrelationJoin(
     innerRowsAlias,
     innerRows,
-    keys.map((_, index): Expression => ({
-      kind: "column",
-      reference: `${innerRowsAlias}.${correlationKeyAlias(index)}`,
-    })),
+    correlationKeyColumns(innerRowsAlias, keys),
     probeReferences.slice(0, keys.length),
     keys.map(({ operator }) => operator),
   );
@@ -2120,10 +2072,7 @@ function decorrelateGeneralScalar(
   const originalExpression = clonePlanTree(shape.expression);
   const probes = outerProbeBlockForExpressions(block, outerExpressions, nextAlias.resolvedNames);
   const probesAlias = nextAlias();
-  const probeReferences = outerExpressions.map<Expression>((_, index) => ({
-    kind: "column",
-    reference: `${probesAlias}.${correlationProbeAlias(index)}`,
-  }));
+  const probeReferences = correlationProbeColumns(probesAlias, outerExpressions);
   if (probeLifted) {
     const replacements = new Map(
       references.map((reference, index) => [reference, probeReferences[index] ?? null]),
@@ -2276,10 +2225,7 @@ function decorrelateGeneralScalar(
           generalCorrelationJoin(
             innerRowsAlias,
             rawRows,
-            keys.map((_, index): Expression => ({
-              kind: "column",
-              reference: `${innerRowsAlias}.${correlationKeyAlias(index)}`,
-            })),
+            correlationKeyColumns(innerRowsAlias, keys),
             probeReferences,
             keys.map(({ operator }) => operator),
           ),
@@ -2383,10 +2329,7 @@ function decorrelateGeneralScalar(
     };
   }
 
-  const finalProbeReferences = outerExpressions.map((_, index): Expression => ({
-    kind: "column",
-    reference: `${finalRowsAlias}.${correlationKeyAlias(index)}`,
-  }));
+  const finalProbeReferences = correlationKeyColumns(finalRowsAlias, outerExpressions);
   const aggregate: CompiledQuery = {
     sql: "(correlated scalar result)",
     base: { table: finalRowsAlias, alias: finalRowsAlias, derived: finalRows },
@@ -2478,10 +2421,7 @@ function decorrelateNonEqualityScalar(
     ...aggregate,
     arguments: [{ kind: "column", reference: `${innerRowsAlias}.${correlationValueAlias}` }],
   };
-  const probeReferences = keys.map((_, index): Expression => ({
-    kind: "column",
-    reference: `${probesAlias}.${correlationProbeAlias(index)}`,
-  }));
+  const probeReferences = correlationProbeColumns(probesAlias, keys);
   const aggregateBlock: CompiledQuery = {
     sql: "(range-correlated scalar aggregate)",
     base: { table: probesAlias, alias: probesAlias, derived: probes },
@@ -2489,10 +2429,7 @@ function decorrelateNonEqualityScalar(
       generalCorrelationJoin(
         innerRowsAlias,
         innerRows,
-        keys.map((_, index): Expression => ({
-          kind: "column",
-          reference: `${innerRowsAlias}.${correlationKeyAlias(index)}`,
-        })),
+        correlationKeyColumns(innerRowsAlias, keys),
         probeReferences,
         keys.map(({ operator }) => operator),
       ),
@@ -2585,10 +2522,7 @@ function decorrelateExistsExpression(
     having: [],
     orderBy: [],
   };
-  const probeReferences = keys.map((_, index): Expression => ({
-    kind: "column",
-    reference: `${probesAlias}.${correlationProbeAlias(index)}`,
-  }));
+  const probeReferences = correlationProbeColumns(probesAlias, keys);
   const flags: CompiledQuery = {
     sql: "(nested correlated exists flags)",
     base: { table: probesAlias, alias: probesAlias, derived: probes },
@@ -2596,10 +2530,7 @@ function decorrelateExistsExpression(
       generalCorrelationJoin(
         innerRowsAlias,
         innerRows,
-        keys.map((_, index): Expression => ({
-          kind: "column",
-          reference: `${innerRowsAlias}.${correlationKeyAlias(index)}`,
-        })),
+        correlationKeyColumns(innerRowsAlias, keys),
         probeReferences,
         keys.map(({ operator }) => operator),
       ),
@@ -2653,10 +2584,7 @@ function decorrelateExistsWithProbes(
   }));
   const probes = outerProbeBlockForExpressions(block, outerExpressions, nextAlias.resolvedNames);
   const probesAlias = nextAlias();
-  const probeReferences = references.map<Expression>((_, index) => ({
-    kind: "column",
-    reference: `${probesAlias}.${correlationProbeAlias(index)}`,
-  }));
+  const probeReferences = correlationProbeColumns(probesAlias, references);
   replacePlanReferences(
     inner,
     new Map(references.map((reference, index) => [reference, probeReferences[index] ?? null])),
@@ -2680,10 +2608,7 @@ function decorrelateExistsWithProbes(
     having: [],
     orderBy: [],
   };
-  const flagKeys = outerExpressions.map<Expression>((_, index) => ({
-    kind: "column",
-    reference: `${flagsAlias}.${correlationKeyAlias(index)}`,
-  }));
+  const flagKeys = correlationKeyColumns(flagsAlias, outerExpressions);
   const probeConditions = outerExpressions.map<Expression>((outer, index) => ({
     kind: "condition",
     operator: "IS NOT DISTINCT FROM",
@@ -3222,7 +3147,7 @@ function correlationComparison(
   return undefined;
 }
 
-function reverseComparison(operator: ComparisonOperator): ComparisonOperator {
+export function reverseComparison(operator: ComparisonOperator): ComparisonOperator {
   switch (operator) {
     case ">":
       return "<";

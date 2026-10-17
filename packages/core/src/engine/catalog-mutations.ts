@@ -117,20 +117,30 @@ function viewReadsTable(sql: string, table: string): boolean {
 
 type QueryColumnShape = SqlColumnSchema;
 
+/** One stored column as the compiler types a reference to it: name, type, and SQL domain. */
+export function querySchemaColumn({
+  name,
+  type,
+  integer,
+  sqlDomain,
+}: {
+  readonly name: string;
+  readonly type: QueryColumnShape["type"];
+  readonly integer?: true | undefined;
+  readonly sqlDomain?: SqlDomain | undefined;
+}): QueryColumnShape {
+  return {
+    name,
+    type,
+    ...(integer === true ? { integer: true as const } : {}),
+    ...(sqlDomain === undefined ? {} : { sqlDomain }),
+  };
+}
+
 export function catalogQuerySchemas(
   records: readonly TableRecord[],
 ): Map<string, QueryColumnShape[]> {
-  return new Map(
-    records.map((record) => [
-      record.name,
-      record.columns.map(({ name, type, integer, sqlDomain }) => ({
-        name,
-        type,
-        ...(integer === true ? { integer: true as const } : {}),
-        ...(sqlDomain === undefined ? {} : { sqlDomain }),
-      })),
-    ]),
-  );
+  return new Map(records.map((record) => [record.name, record.columns.map(querySchemaColumn)]));
 }
 
 function querySchemasEqual(
@@ -964,22 +974,12 @@ export class CatalogMutations {
             (record.id === table.id
               ? record.columns.filter((candidate) => candidate.id !== column.id)
               : record.columns
-            ).map(({ name, type, integer, sqlDomain }) => ({
-              name,
-              type,
-              ...(integer === true ? { integer: true as const } : {}),
-              ...(sqlDomain === undefined ? {} : { sqlDomain }),
-            })),
+            ).map(querySchemaColumn),
           ]),
         );
         try {
           const inferred = inferBlockSchema(compileQuery(owner.view.sql), schemas);
-          const stored = owner.columns.map(({ name, type, integer, sqlDomain }) => ({
-            name,
-            type,
-            ...(integer === true ? { integer: true as const } : {}),
-            ...(sqlDomain === undefined ? {} : { sqlDomain }),
-          }));
+          const stored = owner.columns.map(querySchemaColumn);
           if (JSON.stringify(inferred) !== JSON.stringify(stored)) {
             throw new TypeError("view output would change");
           }

@@ -182,8 +182,9 @@ describe("published core tarball", () => {
       // Existing publication budgets also cover declaration pruning. Raised from 870,000 and
       // 4,300,000 with 0.10.1's coordination and recovery fixes, then to 920,000 and 4,500,000
       // when the interaction-plan simulator joined the published testing entry, then to 955,000
-      // with the 0.16.0 audit (951,556 measured); ratchets, not targets.
-      expect(report?.size, "packed bytes").toBeLessThanOrEqual(955_000);
+      // with the 0.16.0 audit (951,556 measured), then lowered to 954,000 when shared engine
+      // helpers replaced duplicated copies (953,067 measured); ratchets, not targets.
+      expect(report?.size, "packed bytes").toBeLessThanOrEqual(954_000);
       expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_500_000);
       const emitted = await readFile(join(isolatedCore, "dist", "engine", "optimizer.js"), "utf8");
       expect(emitted).not.toContain("/**");

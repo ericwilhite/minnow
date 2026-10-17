@@ -25,8 +25,12 @@ import type {
   TableSource,
 } from "./query.js";
 import {
+  asQueryValue,
   cachedListMembership,
   childExpressions,
+  comparable,
+  compareAggregateOrder,
+  comparisonHolds,
   distinctFromComparison,
   nullOrder,
   isScalarFunctionName,
@@ -40,6 +44,7 @@ import {
   scalarFunctionValue,
   unknownColumnDomains,
   integerQuotient,
+  numeric,
 } from "./query.js";
 import { jsonConstructor } from "./sql-json.js";
 import { datetimeArithmeticValue } from "./sql-datetime-arithmetic.js";
@@ -75,7 +80,6 @@ import {
   concatenatedSqlValue,
   exactNumericBinary,
   externalSqlDomainValue,
-  isDateDomainValue,
   isExactNumeric,
   preservedJsonDomainValue,
   protectedSqlTextValue,
@@ -4353,18 +4357,7 @@ function* joinBatches(
     const ensureOutput = (): Int32Array[] => {
       if (outputRows !== undefined) return outputRows;
       outputMemory = memory.createChild();
-      outputMemory.reserve(
-        safeMemoryProduct(
-          safeMemoryProduct(
-            plan.sourceTables.length,
-            DEFAULT_BATCH_ROWS,
-            "Join fan-out row-index count",
-          ),
-          Int32Array.BYTES_PER_ELEMENT,
-          "Join fan-out row indexes",
-        ),
-        "Join fan-out row indexes",
-      );
+      reserveJoinFanOut(plan, outputMemory);
       outputRows = plan.sourceTables.map(() => new Int32Array(DEFAULT_BATCH_ROWS));
       return outputRows;
     };
@@ -4409,6 +4402,22 @@ function* joinBatches(
   }
 }
 
+/** Reserves one output batch of join fan-out row indexes, one array per source table. */
+function reserveJoinFanOut(plan: BoundPlan, outputMemory: QueryMemoryContext): void {
+  outputMemory.reserve(
+    safeMemoryProduct(
+      safeMemoryProduct(
+        plan.sourceTables.length,
+        DEFAULT_BATCH_ROWS,
+        "Join fan-out row-index count",
+      ),
+      Int32Array.BYTES_PER_ELEMENT,
+      "Join fan-out row indexes",
+    ),
+    "Join fan-out row indexes",
+  );
+}
+
 /**
  * Nested-loop join for general ON conditions: every probe row scans the whole build table and
  * keeps the pairs whose condition evaluates true under three-valued logic. Output batches reuse
@@ -4438,18 +4447,7 @@ function* loopJoinBatches(
     const ensureOutput = (): Int32Array[] => {
       if (outputRows !== undefined) return outputRows;
       outputMemory = memory.createChild();
-      outputMemory.reserve(
-        safeMemoryProduct(
-          safeMemoryProduct(
-            plan.sourceTables.length,
-            DEFAULT_BATCH_ROWS,
-            "Join fan-out row-index count",
-          ),
-          Int32Array.BYTES_PER_ELEMENT,
-          "Join fan-out row indexes",
-        ),
-        "Join fan-out row indexes",
-      );
+      reserveJoinFanOut(plan, outputMemory);
       outputRows = plan.sourceTables.map(() => new Int32Array(DEFAULT_BATCH_ROWS));
       return outputRows;
     };
@@ -5576,10 +5574,6 @@ class GroupAccumulator {
     return true;
   }
 
-  get fastAggregatesCache(): FastAggregateSpec[] | undefined {
-    return this.#fastAggregatesCache;
-  }
-
   /**
    * Re-lays the code-slot table for a new window dictionary. Existing groups carry over by
    * value, so a group's state is shared across every window that mentions its value; the cost
@@ -6459,17 +6453,7 @@ function evaluateFinalExpression(
       };
     });
     if (orderBy.length > 0) {
-      members.sort((left, right) => {
-        for (const [index, order] of orderBy.entries()) {
-          const a = left.order[index];
-          const b = right.order[index];
-          const placed = nullOrder(a, b, order.nulls, order.direction);
-          if (placed !== undefined && placed !== 0) return placed;
-          const compared = compareValues(a, b);
-          if (compared !== 0) return order.direction === "desc" ? -compared : compared;
-        }
-        return 0;
-      });
+      members.sort((left, right) => compareAggregateOrder(orderBy, left.order, right.order));
     }
     return preservedJsonDomainValue(
       jsonConstructor(
@@ -6499,17 +6483,7 @@ function evaluateFinalExpression(
     });
     const orderBy = plan.aggregates[aggregateIndex]?.orderBy ?? [];
     if (orderBy.length > 0) {
-      decoded.sort((left, right) => {
-        for (const [index, order] of orderBy.entries()) {
-          const a = left.order[index];
-          const b = right.order[index];
-          const placed = nullOrder(a, b, order.nulls, order.direction);
-          if (placed !== undefined && placed !== 0) return placed;
-          const compared = compareValues(a, b);
-          if (compared !== 0) return order.direction === "desc" ? -compared : compared;
-        }
-        return 0;
-      });
+      decoded.sort((left, right) => compareAggregateOrder(orderBy, left.order, right.order));
     }
     return protectedSqlTextValue(
       decoded
@@ -6904,7 +6878,7 @@ function dictionaryNumericMatches(
   if (matches === undefined) {
     matches = new Uint8Array(dictionary.length);
     for (let code = 0; code < dictionary.length; code += 1) {
-      matches[code] = comparisonValue(
+      matches[code] = comparisonHolds(
         comparison.operator,
         comparison.expression.evaluate(dictionary[code] ?? ""),
         comparison.target,
@@ -7288,7 +7262,7 @@ function evaluateBatchPredicate(
       predicate.right.items.map((item) => evaluateBatchExpression(plan, item, batch, row)),
     );
   }
-  return comparisonValue(
+  return comparisonHolds(
     predicate.operator,
     evaluateBatchExpression(plan, predicate.left, batch, row),
     evaluateBatchExpression(plan, predicate.right, batch, row),
@@ -7562,92 +7536,6 @@ function binaryValue(
   return operator === "%" ? a % b : a / b;
 }
 
-function comparisonValue(
-  operator: PredicateOperator,
-  leftValue: unknown,
-  rightValue: unknown,
-): boolean {
-  if (operator === "IS NULL") return leftValue === null || leftValue === undefined;
-  if (operator === "IS NOT NULL") return leftValue !== null && leftValue !== undefined;
-  if (operator === "IN" || operator === "NOT IN") {
-    throw new TypeError("IN is only supported in WHERE predicates");
-  }
-  if (operator === "IS DISTINCT FROM") return distinctFromComparison(leftValue, rightValue);
-  if (operator === "IS NOT DISTINCT FROM") return !distinctFromComparison(leftValue, rightValue);
-  if (
-    operator === "LIKE" ||
-    operator === "NOT LIKE" ||
-    operator === "ILIKE" ||
-    operator === "NOT ILIKE" ||
-    operator === "SIMILAR TO" ||
-    operator === "NOT SIMILAR TO"
-  ) {
-    leftValue = externalSqlDomainValue(leftValue);
-    rightValue = externalSqlDomainValue(rightValue);
-    if (
-      leftValue === null ||
-      leftValue === undefined ||
-      rightValue === null ||
-      rightValue === undefined
-    ) {
-      return false;
-    }
-    if (typeof leftValue !== "string" || typeof rightValue !== "string") {
-      throw new TypeError("LIKE requires string operands");
-    }
-    const similar = operator === "SIMILAR TO" || operator === "NOT SIMILAR TO";
-    const matched = similar
-      ? compileSimilarPattern(rightValue).test(leftValue)
-      : likeMatches(rightValue, leftValue, operator === "ILIKE" || operator === "NOT ILIKE");
-    return operator === "LIKE" || operator === "ILIKE" || operator === "SIMILAR TO"
-      ? matched
-      : !matched;
-  }
-  if (
-    leftValue === null ||
-    leftValue === undefined ||
-    rightValue === null ||
-    rightValue === undefined
-  ) {
-    return false;
-  }
-  // NaN keeps the general path: SQL treats it as one value equal to itself.
-  if (
-    typeof leftValue === "number" &&
-    typeof rightValue === "number" &&
-    leftValue === leftValue &&
-    rightValue === rightValue
-  ) {
-    if (operator === "=") return leftValue === rightValue;
-    if (operator === "!=" || operator === "<>") return leftValue !== rightValue;
-    if (operator === ">") return leftValue > rightValue;
-    if (operator === ">=") return leftValue >= rightValue;
-    if (operator === "<") return leftValue < rightValue;
-    return leftValue <= rightValue;
-  }
-  // An untyped string beside a datetime, number, or boolean reads in that value's type, as
-  // PostgreSQL types an unknown-typed literal by its context; the row executor does the same.
-  [leftValue, rightValue] = coerceComparisonOperands(leftValue, rightValue);
-  const left = comparable(leftValue);
-  const right = comparable(rightValue);
-  if (operator === "=") return compareValues(left, right) === 0;
-  if (operator === "!=" || operator === "<>") return compareValues(left, right) !== 0;
-  const comparison = compareValues(left, right);
-  if (operator === ">") return comparison > 0;
-  if (operator === ">=") return comparison >= 0;
-  if (operator === "<") return comparison < 0;
-  return comparison <= 0;
-}
-
-function comparable(value: unknown): unknown {
-  if (value instanceof Date) return dateMilliseconds(value);
-  if (isDateDomainValue(value)) {
-    const external = externalSqlDomainValue(value);
-    return typeof external === "string" ? Date.parse(`${external}T00:00:00.000Z`) : value;
-  }
-  return value;
-}
-
 function groupKey(value: unknown): GroupIndexKey {
   const comparableValue = comparable(value);
   if (typeof comparableValue === "number" && !Number.isFinite(comparableValue)) return null;
@@ -7693,26 +7581,6 @@ function stableSortRows(rows: QueryRow[], orderBy: BoundPlan["orderBy"]): void {
 
 function compareValues(left: unknown, right: unknown): number {
   return compareSqlValues(left, right);
-}
-
-function numeric(value: unknown): number {
-  if (typeof value !== "number")
-    throw new TypeError("Arithmetic and numeric aggregates require numbers");
-  return value;
-}
-
-function asQueryValue(value: unknown): QueryValue {
-  if (
-    value === null ||
-    typeof value === "boolean" ||
-    typeof value === "number" ||
-    typeof value === "string" ||
-    value instanceof Date
-  ) {
-    return value;
-  }
-  if (value === undefined) return null;
-  throw new TypeError("Query produced an unsupported value");
 }
 
 function required<T>(value: T | undefined, message: string): T {
