@@ -71,7 +71,8 @@ const DATABASE_MARKER = "A database cannot queue more than";
 // quiet-table fold, schema 7 / layout 12): 1091.8 KiB raw / 326.0 KiB gzip.
 // Build-owner liveness and CREATE INDEX IF NOT EXISTS waits (owner-presence.ts): 1095.1 KiB raw /
 // 327.1 KiB gzip.
-const COMPLETE_ENTRY_RAW_BUDGET = 1096 * 1024;
+// Lapsed-lease retakes and write restarts: 1096.2 KiB raw.
+const COMPLETE_ENTRY_RAW_BUDGET = 1097 * 1024;
 const COMPLETE_ENTRY_GZIP_BUDGET = 328 * 1024;
 // Measured with the larger durable adapter: 1211.9 KiB raw / 337.5 KiB gzip. The durable
 // served-request ledger (OPFS layout 6) adds about 20 KiB raw: 1231.3 KiB raw. With the scope
@@ -94,7 +95,8 @@ const COMPLETE_ENTRY_GZIP_BUDGET = 328 * 1024;
 // UNIQUE builds under writes: 1458.3 KiB raw.
 // Single-row write paths and delta merges: 1481.7 KiB raw.
 // Build-owner liveness: 1485.0 KiB raw.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1486 * 1024;
+// Lapsed-lease retakes and write restarts: 1486.1 KiB raw.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1487 * 1024;
 // Explicit scheduler ownership and bounded diagnostic history add about 1 KiB gzip over the
 // correctness/upgrade batch (361.6 KiB measured). Concurrent compaction and posting ownership
 // repairs measure 362.1 KiB; allow the next whole KiB without changing runtime performance gates.
@@ -132,7 +134,8 @@ const ENGINE_WITH_OPFS_GZIP_BUDGET = 428 * 1024;
 // UNIQUE builds under writes: 1453.6 KiB raw / 417.2 KiB gzip.
 // Single-row write paths and delta merges: 1479.6 KiB raw / 424.1 KiB gzip.
 // Build-owner liveness: 1482.9 KiB raw / 425.2 KiB gzip.
-const INDEXEDDB_WORKER_RAW_BUDGET = 1483 * 1024;
+// Lapsed-lease retakes and write restarts: 1484.0 KiB raw.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1485 * 1024;
 const INDEXEDDB_WORKER_GZIP_BUDGET = 426 * 1024;
 
 const repoRoot = join(import.meta.dirname, "..", "..", "..");
