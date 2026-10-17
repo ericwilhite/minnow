@@ -747,8 +747,72 @@ for (const implementation of implementations()) {
       });
       store.close();
     });
+
+    // A thread frozen past the lease (a sleeping laptop, a suspended tab) resumes holding a
+    // transaction the store will no longer renew. Aborting it must still succeed: callers
+    // abort while unwinding from another error, and a throwing abort replaced that error.
+    it("aborts an owner whose lease lapsed while the thread was frozen", async () => {
+      let now = new Date("2026-01-01T00:00:00.000Z");
+      const store = await implementation.create();
+      const manager = new TransactionManager(store, { now: () => now, transactionTtlMs: 1_000 });
+      const transaction = await manager.begin();
+      await transaction.stageBlock("lapsed", Uint8Array.of(1));
+      now = new Date("2026-01-01T00:00:05.000Z");
+
+      await expect(transaction.abort()).resolves.toBeUndefined();
+      expect(transaction.status).toBe("aborted");
+      expect((await store.getTransaction(transaction.id))?.status).toBe("aborted");
+      store.close();
+    });
+
+    it("treats an abort of an owner another connection already reclaimed as done", async () => {
+      let now = new Date("2026-01-01T00:00:00.000Z");
+      const store = await implementation.create();
+      const manager = new TransactionManager(store, { now: () => now, transactionTtlMs: 1_000 });
+      const transaction = await manager.begin();
+      await transaction.stageBlock("reclaimed", Uint8Array.of(1));
+      now = new Date("2026-01-01T00:00:05.000Z");
+      const record = await store.getTransaction(transaction.id);
+      if (record === undefined) throw new Error("Expected a persisted transaction");
+      await store.abortTransactionIfExpired({
+        transactionId: record.id,
+        expectedOwnerId: record.ownerId,
+        expiresAtCutoff: now.toISOString(),
+        updatedAt: now.toISOString(),
+      });
+
+      await expect(transaction.commit()).rejects.toBeInstanceOf(TransactionClosedError);
+      await expect(transaction.abort()).resolves.toBeUndefined();
+      expect(transaction.status).toBe("aborted");
+      store.close();
+    });
   });
 }
+
+it("still refuses to abort a transaction whose record a live owner holds", async () => {
+  // Renewal refused while the record stays active and unexpired: not a lapse this abort can
+  // settle, so it reports the refusal and leaves the record alone.
+  class RefusingStore extends MemoryBlockStore {
+    refuse = false;
+    override async renewTransaction(
+      input: Parameters<MemoryBlockStore["renewTransaction"]>[0],
+    ): ReturnType<MemoryBlockStore["renewTransaction"]> {
+      return this.refuse ? false : super.renewTransaction(input);
+    }
+  }
+  let now = new Date("2026-01-01T00:00:00.000Z");
+  const store = new RefusingStore();
+  const manager = new TransactionManager(store, { now: () => now, transactionTtlMs: 1_000 });
+  const transaction = await manager.begin();
+  await transaction.stageBlock("held", Uint8Array.of(1));
+  // Due for renewal, not yet expired.
+  now = new Date("2026-01-01T00:00:00.800Z");
+  store.refuse = true;
+
+  await expect(transaction.abort()).rejects.toBeInstanceOf(TransactionClosedError);
+  expect((await store.getTransaction(transaction.id))?.status).toBe("active");
+  store.close();
+});
 
 it("chunks large staging calls and refuses an oversized journal before mutation", async () => {
   const store = new ArtifactBatchObservingStore();

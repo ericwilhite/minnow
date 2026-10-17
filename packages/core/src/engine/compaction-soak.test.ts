@@ -33,6 +33,7 @@
 import { describe, expect, it } from "vitest";
 import { MemoryBlockStore } from "../storage/index.js";
 import { MinnowDatabase } from "./database.js";
+import { instrumentStoreCalls } from "./storage-test-helpers.js";
 import { mulberry32, seedsFor } from "../testing/seeds.js";
 
 /** Keys are drawn from a small space so inserts, updates and deletes collide constantly. */
@@ -264,5 +265,98 @@ describe("compaction over a long mutation history", () => {
       ).toEqual([{ n: 200 }]);
     },
     60_000,
+  );
+
+  it.each(seedsFor("compaction-soak-lapses", [0x1a95e]))(
+    "keeps the table equal to a reference while owner leases lapse at random (seed %s)",
+    async (seed) => {
+      // A tab that sleeps mid-statement wakes holding a transaction whose 30-second lease the
+      // store will no longer renew. Here the clock jumps past every lease at a random store call
+      // inside a share of the operations -- a write in ten, a fold or collection in two -- so
+      // writes, folds, and collection all wake into one: each must start again rather than
+      // fail, and the table must still equal the reference. One jump per operation at most, as
+      // one sleep lands in one place. The jumps draw from a stream of their own and nothing runs
+      // in the background, so a seed replays the same lapses at the same calls.
+      const random = mulberry32(seed);
+      const lapse = mulberry32(seed ^ 0x5eed);
+      let now = Date.parse("2026-01-01T00:00:00Z");
+      const store = new MemoryBlockStore();
+      const probe = instrumentStoreCalls(store);
+      const database = new MinnowDatabase(store, {
+        rowsPerBlock: 16,
+        autoCompact: false,
+        autoCollect: false,
+        now: () => new Date(now),
+      });
+      await database.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, amount INTEGER)");
+      let lapses = 0;
+      let lapseAt: number | undefined;
+      probe.onCall = (call) => {
+        if (call !== lapseAt) return;
+        lapseAt = undefined;
+        lapses += 1;
+        now += 30_001;
+      };
+      /** Maybe schedules one lapse somewhere in the next `span` store calls. */
+      const mayLapse = (chance: number, span: number): void => {
+        lapseAt =
+          lapse() < chance ? probe.calls.length + 1 + Math.floor(lapse() * span) : undefined;
+      };
+      probe.armed = true;
+      const reference = new Map<number, number>();
+      const expectContents = async (context: string) => {
+        const rows = (
+          await database.query("SELECT id, amount FROM items ORDER BY id", { memoize: false })
+        ).rows;
+        expect(rows, `seed ${String(seed)}, ${context}`).toEqual(
+          [...reference]
+            .sort(([left], [right]) => left - right)
+            .map(([id, amount]) => ({ id, amount })),
+        );
+      };
+      for (let operation = 1; operation <= 900; operation += 1) {
+        const id = Math.floor(random() * 120) + 1;
+        const amount = Math.floor(random() * 1_000);
+        const roll = random();
+        mayLapse(0.1, 12);
+        if (!reference.has(id)) {
+          if (roll < 0.5) await database.insert("items", { id, amount });
+          else await database.execute("INSERT INTO items VALUES (?, ?)", [id, amount]);
+          reference.set(id, amount);
+        } else if (roll < 0.3) {
+          if (roll < 0.15) await database.delete("items", id);
+          else await database.execute("DELETE FROM items WHERE id = ?", [id]);
+          reference.delete(id);
+        } else {
+          if (roll < 0.65)
+            await database.updateBatch("items", { keys: [id], changes: { amount: [amount] } });
+          else await database.execute("UPDATE items SET amount = ? WHERE id = ?", [amount, id]);
+          reference.set(id, amount);
+        }
+        if (operation % 75 === 0) {
+          await expectContents(`before the fold after operation ${String(operation)}`);
+          mayLapse(0.5, 400);
+          await database.compactTable("items");
+          mayLapse(0.5, 100);
+          await database.collectGarbage();
+          lapseAt = undefined;
+          await expectContents(`after the fold after operation ${String(operation)}`);
+        }
+      }
+      for (let round = 0; round < 6; round += 1) {
+        mayLapse(0.5, 400);
+        await database.compactTable("items");
+      }
+      probe.armed = false;
+      await expectContents("after the final folds");
+      // Every owner the lapses stranded was taken over or aborted; none is left holding a pin.
+      const active = (await store.listTransactionPage(null, 1_000)).records.filter(
+        (record) => record.status === "active",
+      );
+      expect(active).toEqual([]);
+      expect(lapses).toBeGreaterThan(10);
+      await database.close();
+    },
+    120_000,
   );
 });

@@ -41,6 +41,15 @@ reproduced first and ships with a test that fails without it.
   and the table then accepted duplicates, even ones it already held. It now returns only once the
   index enforces; if writes land during the build, it builds again holding the write turn, so
   writers wait and readers do not.
+- **Work failed, or hung, after a tab slept past its transaction lease.** After a tab was suspended
+  or a laptop slept past the 30-second transaction lease, `compactTable()` rejected with
+  `TransactionClosedError`, batch writes could fail the same way, an abort replaced the original
+  error with that one, and a write that had lent its turn to a fold step could wait forever on
+  itself. A fold now takes its job over again, re-staging the output it already wrote;
+  single-statement writes (`insert`/`upsert`/`update`/`delete`, their batch forms, and SQL
+  autocommit statements) start again with a fresh lease, bounded by `maxCommitRetries`; aborting a
+  lapsed owner succeeds; and the lending writer keeps its turn. A `write()` scope or explicit
+  transaction that lapses still fails with `TransactionClosedError` and publishes nothing.
 - **`CREATE INDEX IF NOT EXISTS` could report an index that did not exist yet.** While another tab
   was still building it, the statement succeeded at once; for a UNIQUE index a duplicate written
   next was accepted, and the creating tab's statement then failed and removed the index. It now

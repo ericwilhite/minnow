@@ -996,6 +996,29 @@ class StaleTriggerDerivationsError extends Error {
 }
 
 /**
+ * Internal restart signal: a one-statement write's own transaction closed under it before it
+ * published — its lease lapsed while the thread was frozen (a sleeping laptop, a suspended
+ * tab), and the store would no longer renew it. The statement's abort just proved nothing was
+ * published, so it re-runs whole with a fresh transaction, as it does after a schema conflict.
+ */
+class LapsedWriteOwnershipError extends Error {
+  constructor(readonly closed: TransactionClosedError) {
+    super("A write's transaction lapsed before it published");
+  }
+}
+
+/**
+ * What a one-statement write rethrows once its abort has resolved. An abort settles only a
+ * transaction that never committed, so a close of that same transaction is a restart, not a
+ * failure the caller can act on.
+ */
+function afterWriteAbort(error: unknown, transaction: DatabaseTransaction): unknown {
+  return error instanceof TransactionClosedError && error.transactionId === transaction.id
+    ? new LapsedWriteOwnershipError(error)
+    : error;
+}
+
+/**
  * Below this ratio, gzip is not paying for itself: it costs the write a full compression pass
  * and every read a decompression pass, to save almost nothing. Measured on 129,000-row blocks,
  * the shapes worth compressing land far above it — the weakest, random UUID text, still reaches
@@ -3269,6 +3292,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             if (attempt >= this.#maxCommitRetries) throw error;
             continue;
           }
+          if (error instanceof LapsedWriteOwnershipError) {
+            if (attempt >= this.#maxCommitRetries) throw error.closed;
+            continue;
+          }
           if (!(error instanceof StaleTriggerDerivationsError)) throw error;
           if (attempt >= this.#maxCommitRetries) throw error.conflict;
         }
@@ -4138,7 +4165,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       throw new Error("Commit retry limit was exceeded");
     } catch (error) {
       await transaction.abort();
-      throw await this.#translateUniqueConflict(error);
+      throw await this.#translateUniqueConflict(afterWriteAbort(error, transaction));
     }
   }
 
@@ -4391,7 +4418,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       throw new Error("Commit retry limit was exceeded");
     } catch (error) {
       await transaction.abort();
-      throw await this.#translateUniqueConflict(error);
+      throw await this.#translateUniqueConflict(afterWriteAbort(error, transaction));
     }
   }
 
@@ -4823,7 +4850,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           throw new UniqueConstraintError(table.name, publicKeyName(table, keyColumn), value);
         }
       }
-      throw await this.#translateUniqueConflict(error);
+      throw await this.#translateUniqueConflict(afterWriteAbort(error, transaction));
     }
   }
 
@@ -15233,11 +15260,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         // against a fresh snapshot. Maintenance-only commits are handled inside #openWriteScope.
         return this.#coordinateWrite(async (statementAdmission) => {
           for (let attempt = 0; ; attempt += 1) {
+            let statementTransactionId: string | undefined;
             try {
               const completed = await this.#openWriteScope(
                 statementAdmission,
-                (_session, _transaction, writer) =>
-                  this.runStatement(statement, { ...options, writer }),
+                (_session, transaction, writer) => {
+                  statementTransactionId = transaction.id;
+                  return this.runStatement(statement, { ...options, writer });
+                },
                 // A standalone statement has no user-controlled idle gap. Its selection reads hold
                 // their own lease and a data conflict restarts the complete statement, so retain the
                 // atomic one-write fast path; public write() scopes keep the durable pin by default.
@@ -15255,9 +15285,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
                 ? result
                 : { ...result, version: completed.version };
             } catch (error) {
+              // The statement's own transaction closing under it means its lease lapsed while
+              // the thread was frozen: nothing published (a commit that lands does not throw),
+              // and the scope has aborted it, so the statement runs again like a conflict.
+              const lapsed =
+                error instanceof TransactionClosedError &&
+                error.transactionId === statementTransactionId;
               if (
                 (!(error instanceof WriteConflictError) &&
-                  !(error instanceof SchemaConflictError)) ||
+                  !(error instanceof SchemaConflictError) &&
+                  !lapsed) ||
                 attempt >= this.#maxCommitRetries
               ) {
                 throw error;
@@ -19171,9 +19208,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const expired = await (await this.#committedForwards())?.expired(KEY_FORWARD_TRIM_PAGE + 1);
       if (expired === undefined || expired.length === 0) return false;
       const page = expired.slice(0, KEY_FORWARD_TRIM_PAGE);
-      await this.#deleteBatchOnce(admission, KEY_FORWARDS_TABLE, {
-        keys: page.map((forward) => forwardRowKey(forward.tableId, storageKeyToken(forward.from))),
-      });
+      const keys = page.map((forward) =>
+        forwardRowKey(forward.tableId, storageKeyToken(forward.from)),
+      );
+      // A delete whose lease lapsed published nothing; run it again, as #runWrite would.
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          await this.#deleteBatchOnce(admission, KEY_FORWARDS_TABLE, { keys });
+          break;
+        } catch (error) {
+          if (!(error instanceof LapsedWriteOwnershipError)) throw error;
+          if (attempt >= this.#maxCommitRetries) throw error.closed;
+        }
+      }
       return expired.length > page.length;
     });
   }
@@ -22304,11 +22351,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     return total;
   }
 
+  /**
+   * One bounded step of a compaction job. `ownerRetakes` counts how many times this step has
+   * already found its own owner lapsed and begun again (see the end of the step).
+   */
   async #runCompactionJob(
     table: TableRecord,
     initialJob: CompactionJobRecord,
     maxBlocks: number,
     admission?: WriterAdmission,
+    ownerRetakes = 0,
   ): Promise<CompactionJobProgress> {
     let job = (await this.store.getCompactionJob(initialJob.id)) ?? initialJob;
     if (job.state === "cancelled") throw new CompactionJobCancelledError(job.id);
@@ -22389,7 +22441,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         if (linked.transaction === null) {
           // Pass the active record this step selected, not the newer one: the fresh read then
           // sees a job another coordinator abandoned meanwhile as a revision conflict.
-          return await this.#runCompactionJob(table, job, maxBlocks, admission);
+          return await this.#runCompactionJob(table, job, maxBlocks, admission, ownerRetakes);
         }
         ({ job, transaction } = linked);
       } else {
@@ -22410,16 +22462,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       // Another coordinator may publish the same transaction after our active-owner read but
       // before resume renews it. Reconcile only after the durable job or owner demonstrably moved.
       if (error instanceof TransactionClosedError && latestJob !== undefined) {
-        const latestOwner = await this.store.getTransaction(error.transactionId);
         if (
           latestJob.revision !== job.revision ||
-          latestOwner?.status !== "active" ||
-          Date.parse(latestOwner.expiresAt) <= dateMilliseconds(this.#now())
+          (await this.#compactionOwnerGone(error.transactionId))
         ) {
           // Pass the active record this step held, as above: the fresh read then sees a job
           // another coordinator abandoned (a schema change) as the revision race it is, not as
-          // this step's own failure.
-          return await this.#runCompactionJob(table, job, maxBlocks);
+          // this step's own failure. Pass the turn on too: a writer lending its turn runs this
+          // step inside it, and a step that asked for a turn of its own to publish would wait
+          // for the writer that is waiting for it.
+          return await this.#runCompactionJob(table, job, maxBlocks, admission, ownerRetakes);
         }
       }
       throw error;
@@ -22714,6 +22766,22 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const latest = await this.store.getCompactionJob(job.id);
       if (latest?.state === "cancelled" && isCompactionCoordinationRefusal(error)) {
         throw new CompactionJobCancelledError(job.id);
+      }
+      // The step's own owner lapsed under it: the thread was frozen past the lease (a sleeping
+      // laptop, a suspended tab), so the store refused to renew it when the step went on. A
+      // lapsed owner published nothing, and the job is durable, so take it over again exactly
+      // as a step finding a dead tab's owner does -- the fresh step aborts the lapsed owner,
+      // begins a new one, and re-stages the output already written -- rather than fail the
+      // caller over a lease nobody else holds.
+      if (
+        error instanceof TransactionClosedError &&
+        error.transactionId === transaction.id &&
+        latest !== undefined &&
+        isActiveCompactionState(latest.state) &&
+        ownerRetakes < this.#maxCommitRetries &&
+        (await this.#compactionOwnerGone(transaction.id))
+      ) {
+        return await this.#runCompactionJob(table, job, maxBlocks, admission, ownerRetakes + 1);
       }
       if (
         error instanceof CompactionWriteAmplificationError ||
@@ -23505,6 +23573,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         throw new Error(`Concurrent segment would reorder compaction output: ${segment.id}`);
       }
     }
+  }
+
+  /**
+   * Whether a fold's owner can no longer publish for it: committed, aborted, reclaimed, or past
+   * its lease. Every one of those is reconciled by stepping the job again -- the step adopts a
+   * commit, and replaces an aborted or expired owner. An owner the store still holds live is
+   * another coordinator's, and its refusal is not this step's to paper over.
+   */
+  async #compactionOwnerGone(transactionId: string): Promise<boolean> {
+    const owner = await this.store.getTransaction(transactionId);
+    return (
+      owner?.status !== "active" || Date.parse(owner.expiresAt) <= dateMilliseconds(this.#now())
+    );
   }
 
   async #beginCompactionTransaction(job: CompactionJobRecord): Promise<{

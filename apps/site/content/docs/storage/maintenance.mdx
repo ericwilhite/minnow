@@ -220,7 +220,10 @@ leave a table permanently above the fold threshold.
 Jobs are records in the store, so `listCompactionJobs()` finds one a previous session left behind
 and `resumeCompactionJob(jobId)` picks it up. A job whose owner lease has expired — a tab that
 closed mid-fold — is taken over by whoever resumes it, background maintenance included: the dead
-owner is aborted and the job continues under a fresh one. `cancelCompactionJob(jobId)` stops one cleanly —
+owner is aborted and the job continues under a fresh one. The same happens when a fold's own
+lease runs out while it is running, because the tab was suspended or the laptop slept: the fold
+takes its job over when the thread wakes, so `compactTable()` finishes instead of failing.
+`cancelCompactionJob(jobId)` stops one cleanly —
 compaction is visible-data-neutral by construction, so cancelling it can never lose data.
 The store atomically admits only one non-terminal compaction for a table, so two tabs racing the
 plan step converge on the same durable job instead of creating parallel roots.
