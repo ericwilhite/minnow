@@ -36,6 +36,17 @@ reproduced first and ships with a test that fails without it.
 - **Tables with a UNIQUE column could stop accepting writes.** Compaction never declared the
   table's unique indexes, so every fold of such a table was refused, and after 4,096 single-row
   commits every write to it was refused too.
+- **`CREATE UNIQUE INDEX` could report success without enforcing.** While another connection kept
+  writing, the statement could return with the index still building — or, on OPFS, invalidated —
+  and the table then accepted duplicates, even ones it already held. It now returns only once the
+  index enforces; if writes land during the build, it builds again holding the write turn, so
+  writers wait and readers do not.
+- **UNIQUE indexes fell out of use under steady writes.** Folding a UNIQUE index's recent changes
+  rebuilt its whole key set and lost to any commit that landed meanwhile; the index went invalid,
+  and on IndexedDB it could never be rebuilt once it held data, so every query reported a failed
+  rebuild. Folds now rebuild only the postings — every commit already maintains the key set — and
+  an index a commit invalidated is rebuilt by the next query. Enforcement of an index that already
+  enforced was never affected.
 - **`DELETE` could remove rows its `WHERE` did not match.** On a table with a secondary index and
   earlier updates, an index that named the matching rows exactly was combined with deltas the
   delete's key read did not apply. The same mismatch made `queryCursor`, spilling sorts and groups,

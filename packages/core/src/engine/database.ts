@@ -25,7 +25,7 @@ import {
 } from "./catalog-mutations.js";
 export type { ColumnDefinition } from "./catalog-mutations.js";
 export type { CreateTableInput } from "./catalog-mutations.js";
-import { CompactionController } from "./compaction-controller.js";
+import { CompactionController, QUIET_COMPACTION_FAILURE_LIMIT } from "./compaction-controller.js";
 import { BackgroundDiagnostics, isLivePostingBuildRefusal } from "./background-diagnostics.js";
 import { CollectionController } from "./collection-controller.js";
 import { databaseInternals } from "./internals.js";
@@ -239,6 +239,7 @@ import {
   TableInUseError,
   TableRecordConflictError,
   TransactionRecordConflictError,
+  UniqueKeyBuildConflictError,
   UniqueKeyConflictError,
   UniqueIndexCoverageError,
   WriteConflictError,
@@ -2687,6 +2688,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * store accepts as a replay.
    */
   readonly #postingBuildSessions = new Map<string, { createdAt: string; expiresAt: string }>();
+  /** Consecutive background UNIQUE builds of one index that commits outran, by table/index. */
+  readonly #uniqueKeySetOutruns = new Map<string, number>();
 
   readonly #compaction: CompactionController;
   readonly #accountedCompactionVersions = new Set<number>();
@@ -9289,6 +9292,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         if (error instanceof CompactionJobCancelledError) return folded;
         if (
           (error instanceof SchemaConflictError ||
+            error instanceof UniqueIndexCoverageError ||
             (error instanceof CompactionSourceChangedError && error.snapshotChanged)) &&
           planningConflicts < this.#maxCommitRetries
         ) {
@@ -21949,7 +21953,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           this.#afterCompactionCommit(manifest, table.id);
           return manifest;
         } catch (error) {
-          if (error instanceof SchemaConflictError) {
+          // A UNIQUE index that began enforcing after the fold read its table is the same
+          // change: the fold cannot name a namespace it never saw.
+          if (error instanceof SchemaConflictError || error instanceof UniqueIndexCoverageError) {
             // The schema moved under the fold -- an index build finishing, a column dropped.
             // The output was built against the old schema, so the job is abandoned rather than
             // resumed; the caller plans a fresh one (compactTable retries, auto backs off).
@@ -23302,7 +23308,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const marked = await this.#admissions.admit("catalog", async (): Promise<TableRecord> => {
         for (let attempt = 0; ; attempt += 1) {
           try {
-            return await this.store.updateTable(current.id, current.revision, {
+            const created = await this.store.updateTable(current.id, current.revision, {
               secondaryIndexes: {
                 ...current.secondaryIndexes,
                 [indexId]: {
@@ -23321,6 +23327,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
                 },
               },
             });
+            // Claim the build session in the turn that marks the index, so no other
+            // connection's build can take it over before this one starts streaming. A claim
+            // refused here is retried by the build's own begin, which reports a real failure.
+            await this.#beginPostingBuild(created.id, storageColumnId, buildId).catch(
+              () => undefined,
+            );
+            return created;
           } catch (error) {
             if (!(error instanceof TableRecordConflictError) || attempt >= this.#maxCommitRetries) {
               throw error;
@@ -23337,7 +23350,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
       });
       try {
-        await this.#buildSecondaryIndex(marked, indexId);
+        await this.#buildSecondaryIndex(marked, indexId).finally(() =>
+          // A no-op once the first attempt used or released the claim.
+          this.#releaseClaimedPostingBuild(marked.id, storageColumnId, buildId),
+        );
       } catch (error) {
         // A caller that sees CREATE INDEX fail must not inherit an unusable schema object. An
         // abandoned tab is different: it never runs this catch, so the durable `building` marker
@@ -23434,54 +23450,105 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     });
   }
 
+  /**
+   * Builds the index CREATE INDEX just marked, and returns only once it is ready -- a UNIQUE
+   * one enforced. Returning sooner would hand the caller a UNIQUE constraint nobody enforces:
+   * another connection's build may take the index over, or fail after this one stepped aside.
+   * Such an index is waited for, and built again here if that build fails.
+   *
+   * An attempt that loses its build -- another connection's commits cut the index's delta tail
+   * while it scanned, or took the index over -- is followed by one that holds the writer turn
+   * from its snapshot to its publication, which nothing can take over and no commit can outrun.
+   * Writers wait for that one as for any DDL; readers never do.
+   */
   async #buildSecondaryIndex(table: TableRecord, indexId: string): Promise<void> {
-    const index = table.secondaryIndexes?.[indexId];
-    if (index === undefined) return;
-    const key = `${table.id}/${index.storageColumnId}`;
-    const existing = this.#ftsBuildsInFlight.get(key);
-    if (existing !== undefined) return existing;
-    const build = (async () => {
-      let currentTable = table;
-      let currentIndex = index;
-      let ownedBuildId = index.buildId;
-      for (let attempt = 0; ; attempt += 1) {
-        try {
-          await this.#buildSecondaryIndexBase(currentTable, indexId, currentIndex, ownedBuildId);
-          return;
-        } catch (error) {
-          if (!(error instanceof WriteConflictError) || attempt >= this.#maxCommitRetries) {
-            throw error;
-          }
-          const fresh = await this.store.getTable(table.id);
-          const freshIndex = fresh?.secondaryIndexes?.[indexId];
-          if (fresh === undefined || freshIndex === undefined) return;
-          currentTable = fresh;
-          currentIndex = freshIndex;
-          ownedBuildId = freshIndex.buildId;
-        }
+    let ownedBuildId = table.secondaryIndexes?.[indexId]?.buildId;
+    let holdTurn = false;
+    let conflicts = 0;
+    for (let waits = 0; ;) {
+      if (this.#closed) throw new DatabaseClosedError();
+      const current = await this.store.getTable(table.id);
+      const held = current?.secondaryIndexes?.[indexId];
+      // Dropped meanwhile (DROP INDEX, DROP TABLE): nothing is left to build.
+      if (current === undefined || held === undefined) return;
+      if (secondaryIndexServes(held)) return;
+      const key = `${current.id}/${held.storageColumnId}`;
+      const inFlight = this.#ftsBuildsInFlight.get(key);
+      if (inFlight !== undefined) {
+        await inFlight;
+        continue;
       }
-    })();
-    this.#ftsBuildsInFlight.set(key, build);
-    try {
-      await build;
-    } finally {
-      if (this.#ftsBuildsInFlight.get(key) === build) this.#ftsBuildsInFlight.delete(key);
+      const build = holdTurn
+        ? this.#admissions.admit("catalog", () =>
+            this.#buildSecondaryIndexBase(current, indexId, held, {
+              heldTurn: true,
+              foreground: true,
+            }),
+          )
+        : this.#buildSecondaryIndexBase(current, indexId, held, {
+            ...(ownedBuildId === undefined ? {} : { ownedBuildId }),
+            foreground: true,
+          });
+      const settled = build.then(
+        () => undefined,
+        () => undefined,
+      );
+      this.#ftsBuildsInFlight.set(key, settled);
+      let outcome: "deferred" | undefined;
+      try {
+        outcome = await build;
+      } catch (error) {
+        // A build that loses to a commit publishes from inside the writer turn instead, so only
+        // a writer that took no turn can still move the manifest under it.
+        if (!(error instanceof WriteConflictError) || conflicts >= this.#maxCommitRetries) {
+          throw error;
+        }
+        conflicts += 1;
+      } finally {
+        if (this.#ftsBuildsInFlight.get(key) === settled) this.#ftsBuildsInFlight.delete(key);
+      }
+      ownedBuildId = undefined;
+      const after = (await this.store.getTable(table.id))?.secondaryIndexes?.[indexId];
+      if (outcome === "deferred" && after?.state === "building") {
+        // Another connection's live build holds the index: let it publish or fail first.
+        await new Promise((resolve) => setTimeout(resolve, Math.min(1_000, 10 * 2 ** waits)));
+        waits += 1;
+      } else {
+        // This attempt's build was cut (the index's delta tail outgrew it), taken over, or lost
+        // to commits: the next one holds the turn.
+        holdTurn = true;
+      }
     }
   }
 
+  /** Whether a UNIQUE build's staged key set is still owned by a live session. */
+  async #uniqueKeyBuildLive(buildId: string): Promise<boolean> {
+    const staged = await this.store.getUniqueKeyBuild(buildId);
+    return (
+      staged?.state === "active" && Date.parse(staged.expiresAt) > dateMilliseconds(this.#now())
+    );
+  }
+
+  /**
+   * One build attempt: marks the index with a fresh build (unless `ownedBuildId` already holds
+   * the mark), builds its base, and publishes it. "deferred" means another build holds or took
+   * the index, or commits outran a background UNIQUE build: a race lost, not a failure.
+   */
   async #buildSecondaryIndexBase(
     table: TableRecord,
     indexId: string,
     index: SecondaryIndexRecord,
-    ownedBuildId?: string,
+    attempt: SecondaryIndexBuildAttempt = {},
   ): Promise<"deferred" | undefined> {
+    const { ownedBuildId, heldTurn = false, foldOnly = false } = attempt;
     // Marking and publishing are catalog steps, each taken as one writer turn; the build in
     // between reads a leased snapshot outside any turn, so a large table never holds every
     // other writer for the whole scan.
-    const entered = await this.#admissions.admit(
-      "catalog",
+    // (background: the maintenance signal keeps these turns available during close)
+    const catalogTurn = <T>(step: () => Promise<T>): Promise<T> =>
+      heldTurn ? step() : this.#admissions.admit("catalog", step, this.#maintenanceSignal);
+    const entered = await catalogTurn(
       async (): Promise<{ marked: TableRecord; buildId: string } | "deferred" | undefined> => {
-        // (background: the maintenance signal below keeps this turn available during close)
         const current = await this.store.getTable(table.id);
         if (current === undefined) return undefined;
         const held = current.secondaryIndexes?.[indexId];
@@ -23489,6 +23556,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         const ownsMarkedBuild =
           ownedBuildId !== undefined && held.state === "building" && held.buildId === ownedBuildId;
         if (ownsMarkedBuild) return { marked: current, buildId: ownedBuildId };
+        // An invalid index keeps no delta tail, so a fold has nothing to fold: the next query
+        // over it rebuilds it, and a CREATE INDEX still running builds it itself.
+        if (foldOnly && held.state === "invalid") return "deferred";
         const buildId = this.#createId();
         // Claim the build session before taking the catalog mark. A claim refused because
         // another connection's build of this index is live means that connection is doing this
@@ -23500,6 +23570,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         // left to the build itself: it begins the session again after the mark, and a failure
         // there invalidates the index and is reported, as a failed build always is.
         if (held.state !== "invalid") {
+          // A UNIQUE index's first build finishes its postings session before it publishes its
+          // key set. Its staged key set, begun before its scan, shows it is live throughout.
+          if (
+            held.state === "building" &&
+            held.buildId !== undefined &&
+            held.unique === true &&
+            held.uniqueEnforced !== true &&
+            (await this.#uniqueKeyBuildLive(held.buildId))
+          ) {
+            return "deferred";
+          }
           try {
             await this.#beginPostingBuild(current.id, held.storageColumnId, buildId);
           } catch (error) {
@@ -23519,12 +23600,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           throw error;
         }
       },
-      this.#maintenanceSignal,
     );
     if (entered === undefined || entered === "deferred") return entered;
     const { marked, buildId } = entered;
     try {
-      return await this.#buildMarkedSecondaryIndexBase(table, indexId, index, marked, buildId);
+      return await this.#buildMarkedSecondaryIndexBase(
+        table,
+        indexId,
+        index,
+        marked,
+        buildId,
+        attempt,
+      );
     } finally {
       // A build that returned before streaming (its columns are gone) never used its claim.
       await this.#releaseClaimedPostingBuild(table.id, index.storageColumnId, buildId);
@@ -23549,21 +23636,41 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     index: SecondaryIndexRecord,
     marked: TableRecord,
     buildId: string,
+    { heldTurn = false, foreground = false }: SecondaryIndexBuildAttempt,
   ): Promise<"deferred" | undefined> {
+    const catalogTurn = <T>(step: () => Promise<T>): Promise<T> =>
+      heldTurn ? step() : this.#admissions.admit("catalog", step, this.#maintenanceSignal);
     // Set while a UNIQUE key set is staged and not yet published; written inside the snapshot.
     const uniqueBuild = { staged: false };
+    // Set once this attempt hands its publication to a build inside the turn, which cleans up
+    // after itself and whose outcome is this attempt's. Written inside the publication turn.
+    const handedOff = { inTurn: false };
+    // Only a UNIQUE index's first build stages a key set. Once enforced, its membership is the
+    // namespace every commit maintains atomically, whatever state the postings are in, so a
+    // rebuild is a postings rebuild like any other. Restaging it raced every commit (the key set
+    // publishes only over an unchanged manifest), and IndexedDB refused to replace a populated
+    // membership at all, so such an index lost its postings for good at its first fold.
+    const stagesKeys =
+      index.unique === true && marked.secondaryIndexes?.[indexId]?.uniqueEnforced !== true;
     try {
-      await this.#withLeasedSnapshot(undefined, async (snapshot) => {
+      const outcome = await this.#withLeasedSnapshot(undefined, async (snapshot) => {
         const columns = secondaryIndexColumnIds(index).map((columnId) =>
           marked.columns.find((candidate) => candidate.id === columnId),
         );
-        if (columns.some((column) => column === undefined)) return;
+        if (columns.some((column) => column === undefined)) return undefined;
         const indexedColumns = columns as TableColumnRecord[];
         const keyColumn = getUniqueKeyColumn(marked);
         const projected = keyColumn === undefined ? indexedColumns : [...indexedColumns, keyColumn];
         const coversVersion = snapshot.version ?? -1;
         const projectedColumns = [...new Map(projected.map((entry) => [entry.id, entry])).values()];
-        const uniqueTerms = index.unique === true ? new UniqueTermRuns() : undefined;
+        const uniqueTerms = stagesKeys ? new UniqueTermRuns() : undefined;
+        // Begun before the scan, so the staged build shows this one live for its whole course:
+        // its postings session ends before the key set publishes.
+        const uniqueBuildBegun =
+          uniqueTerms === undefined
+            ? undefined
+            : await this.#beginUniqueKeyBuild(marked.id, indexId, buildId);
+        if (uniqueBuildBegun !== undefined) uniqueBuild.staged = true;
         const streamed = await this.#writeStreamedSecondaryIndexBase(
           marked,
           indexedColumns,
@@ -23576,7 +23683,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           uniqueTerms,
         );
         if (!streamed) {
-          if (index.unique === true) {
+          if (uniqueTerms !== undefined) {
             await this.#writeMaterializedSecondaryIndexBase(
               marked,
               indexedColumns,
@@ -23586,7 +23693,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               snapshot,
               coversVersion,
               buildId,
-              uniqueTerms ?? new UniqueTermRuns(),
+              uniqueTerms,
             );
           } else {
             await this.#writeHistoricalSecondaryIndexBase(
@@ -23602,109 +23709,167 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
         // A UNIQUE index's key set is staged outside the catalog turn, a bounded chunk per store
         // call, so a large table's membership is never one database-sized step.
-        let uniqueChunks = 0;
-        if (uniqueTerms !== undefined) {
-          uniqueBuild.staged = true;
-          uniqueChunks = await this.#stageUniqueKeys(marked.id, indexId, buildId, uniqueTerms);
-        }
-        await this.#admissions.admit(
-          "catalog",
-          async () => {
-            const fresh = await this.store.getTable(marked.id);
-            const freshIndex = fresh?.secondaryIndexes?.[indexId];
-            if (freshIndex === undefined) {
-              // DROP INDEX / DROP TABLE can win while a whole-base build is writing.
-              // Its storage identity is never reused, so reclaiming it here cannot touch a new
-              // index.
-              await this.store.removeFtsColumn(marked.id, index.storageColumnId);
-              return;
-            }
-            if (
-              fresh === undefined ||
-              freshIndex.state !== "building" ||
-              freshIndex.buildId !== buildId
-            ) {
-              return;
-            }
-            if (uniqueTerms !== undefined) {
-              // One atomic step: membership, the ready flip, and the table+manifest check that
-              // nothing committed since the snapshot the keys were read from.
-              const now = dateIsoString(this.#now());
-              await this.store.finishUniqueKeyBuild({
-                buildId,
-                ownerId: this.#internalLeaseOwnerId,
-                expiresAtCutoff: now,
-                expectedTableRevision: fresh.revision,
-                expectedManifestVersion: coversVersion < 0 ? null : coversVersion,
-                chunkCount: uniqueChunks,
-                coversVersion,
-                completedAt: now,
-              });
+        const uniqueChunks =
+          uniqueTerms === undefined || uniqueBuildBegun === undefined
+            ? 0
+            : await this.#stageUniqueKeys(buildId, uniqueTerms, uniqueBuildBegun);
+        return await catalogTurn(async (): Promise<"deferred" | undefined> => {
+          const fresh = await this.store.getTable(marked.id);
+          const freshIndex = fresh?.secondaryIndexes?.[indexId];
+          if (freshIndex === undefined) {
+            // DROP INDEX / DROP TABLE can win while a whole-base build is writing.
+            // Its storage identity is never reused, so reclaiming it here cannot touch a new
+            // index.
+            await this.store.removeFtsColumn(marked.id, index.storageColumnId);
+            return undefined;
+          }
+          if (
+            fresh === undefined ||
+            freshIndex.state !== "building" ||
+            freshIndex.buildId !== buildId
+          ) {
+            return undefined;
+          }
+          if (uniqueTerms !== undefined) {
+            const current = await this.store.getCurrentManifestVersion();
+            if (!heldTurn && (current ?? -1) !== coversVersion) {
+              // Commits landed since the snapshot, so the staged key set may be stale -- and a
+              // writer that never pauses would refuse every attempt the same way.
+              if (!foreground) {
+                // Background work never holds writers for a whole build: this is a race lost,
+                // and a later trigger tries again (see #noteUniqueKeySetOutrun).
+                throw new UniqueKeySetOutrunError(
+                  coversVersion < 0 ? null : coversVersion,
+                  current,
+                );
+              }
+              // CREATE UNIQUE INDEX keeps this turn and builds again inside it: no commit can
+              // land between that snapshot and its publication. Writers wait for it as for any
+              // DDL; readers do not.
+              await this.#abortUniqueKeyBuild(table.id, index, buildId);
               uniqueBuild.staged = false;
-              return;
+              handedOff.inTurn = true;
+              return await this.#buildSecondaryIndexBase(fresh, indexId, freshIndex, {
+                heldTurn: true,
+                foreground: true,
+              });
             }
-            const { buildId: _completedBuild, ...readyIndex } = freshIndex;
-            void _completedBuild;
-            await this.store.updateTable(fresh.id, fresh.revision, {
-              secondaryIndexes: {
-                ...fresh.secondaryIndexes,
-                [indexId]: { ...readyIndex, state: "ready", buildFromVersion: coversVersion },
-              },
+            // One atomic step: membership, the ready flip, and the table+manifest check that
+            // nothing committed since the snapshot the keys were read from.
+            const now = dateIsoString(this.#now());
+            await this.store.finishUniqueKeyBuild({
+              buildId,
+              ownerId: this.#internalLeaseOwnerId,
+              expiresAtCutoff: now,
+              expectedTableRevision: fresh.revision,
+              expectedManifestVersion: coversVersion < 0 ? null : coversVersion,
+              chunkCount: uniqueChunks,
+              coversVersion,
+              completedAt: now,
             });
-          },
-          this.#maintenanceSignal,
-        );
+            uniqueBuild.staged = false;
+            this.#uniqueKeySetOutruns.delete(`${marked.id}/${indexId}`);
+            return undefined;
+          }
+          const { buildId: _completedBuild, ...readyIndex } = freshIndex;
+          void _completedBuild;
+          await this.store.updateTable(fresh.id, fresh.revision, {
+            secondaryIndexes: {
+              ...fresh.secondaryIndexes,
+              [indexId]: { ...readyIndex, state: "ready", buildFromVersion: coversVersion },
+            },
+          });
+          return undefined;
+        });
       });
       // Still staged after the publication turn: the index was dropped or rebuilt meanwhile.
       if (uniqueBuild.staged) await this.#abortUniqueKeyBuild(table.id, index, buildId);
-      return undefined;
+      return outcome;
     } catch (error) {
-      if (uniqueBuild.staged) await this.#abortUniqueKeyBuild(table.id, index, buildId);
+      // The build inside the turn already settled its own catalog state and reported nothing
+      // it should not have; its failure is this attempt's.
+      if (handedOff.inTurn) throw error;
       const superseded = Symbol("superseded");
       // Read the record inside the turn that rewrites it: read outside, any catalog step that
       // lands between the two (another index's build publishing) refuses the rewrite.
-      const invalidatedColumnId = await this.#admissions
-        .admit(
-          "catalog",
-          async () => {
-            const fresh = await this.store.getTable(table.id);
-            const freshIndex = fresh?.secondaryIndexes?.[indexId];
-            if (
-              fresh === undefined ||
-              freshIndex?.state !== "building" ||
-              freshIndex.buildId !== buildId
-            ) {
-              return superseded;
-            }
-            const { buildId: _failedBuild, ...invalidIndex } = freshIndex;
-            void _failedBuild;
-            await this.store.updateTable(fresh.id, fresh.revision, {
-              secondaryIndexes: {
-                ...fresh.secondaryIndexes,
-                [indexId]: { ...invalidIndex, state: "invalid" },
-              },
-            });
-            return freshIndex.storageColumnId;
+      const invalidatedColumnId = await catalogTurn(async () => {
+        const fresh = await this.store.getTable(table.id);
+        const freshIndex = fresh?.secondaryIndexes?.[indexId];
+        if (
+          fresh === undefined ||
+          freshIndex?.state !== "building" ||
+          freshIndex.buildId !== buildId
+        ) {
+          return superseded;
+        }
+        const { buildId: _failedBuild, ...invalidIndex } = freshIndex;
+        void _failedBuild;
+        await this.store.updateTable(fresh.id, fresh.revision, {
+          secondaryIndexes: {
+            ...fresh.secondaryIndexes,
+            [indexId]: { ...invalidIndex, state: "invalid" },
           },
-          this.#maintenanceSignal,
-        )
-        .catch(this.#postingCleanupFailure(table.id, index.storageColumnId));
+        });
+        return freshIndex.storageColumnId;
+      }).catch(this.#postingCleanupFailure(table.id, index.storageColumnId));
+      // Released only now: until the catalog stopped naming this build, its live staged key set
+      // kept other connections from taking the index over for a doomed build of their own.
+      if (uniqueBuild.staged) await this.#abortUniqueKeyBuild(table.id, index, buildId);
       // The catalog no longer names this build -- the index was dropped, its oversized tail cut,
       // or another connection's build took it over -- and that same change took the build's
       // session away. The build lost a race with whatever owns the index now; there is nothing
       // to clean up, and a query that finds the index not ready schedules the next build.
-      if (invalidatedColumnId === superseded && error instanceof PostingBuildConflictError) {
+      if (
+        invalidatedColumnId === superseded &&
+        (error instanceof PostingBuildConflictError || error instanceof UniqueKeyBuildConflictError)
+      ) {
         return "deferred";
       }
       // Catalog first: every intermediate reader scans. Once invalid, postings are neither
       // truth nor maintained; removing their base and deltas bounds a persistently failing
       // rebuild without touching a UNIQUE index's separate membership namespace.
       if (typeof invalidatedColumnId === "string") {
-        await this.store
-          .removeFtsColumn(table.id, invalidatedColumnId)
-          .catch(this.#postingCleanupFailure(table.id, index.storageColumnId));
+        await this.#removeInvalidatedPostings(table.id, invalidatedColumnId);
+      }
+      if (error instanceof UniqueKeySetOutrunError) {
+        this.#noteUniqueKeySetOutrun(marked, indexId, error);
+        return "deferred";
       }
       throw error;
+    }
+  }
+
+  /**
+   * Counts a background UNIQUE build that commits outran. The index is left invalid, so it
+   * scans, and the next query over it builds again; that one normally lands once writes pause. A run of `QUIET_COMPACTION_FAILURE_LIMIT` such losses with
+   * no publication between them is reported, so a build that never lands still surfaces.
+   */
+  #noteUniqueKeySetOutrun(table: TableRecord, indexId: string, error: Error): void {
+    const key = `${table.id}/${indexId}`;
+    const losses = (this.#uniqueKeySetOutruns.get(key) ?? 0) + 1;
+    if (losses < QUIET_COMPACTION_FAILURE_LIMIT) {
+      this.#uniqueKeySetOutruns.set(key, losses);
+      return;
+    }
+    this.#uniqueKeySetOutruns.delete(key);
+    this.#reportBackgroundError(
+      error,
+      `secondary index build for ${table.name}/${indexId} (${String(losses)} attempts in a row without progress)`,
+    );
+  }
+
+  /**
+   * Removes an invalidated accelerator's postings. Another build may mark the index again
+   * between the invalidation and this removal, and the store then refuses it: nothing is left
+   * to clean up, because that build's base replaces these postings when it publishes.
+   */
+  async #removeInvalidatedPostings(tableId: string, columnId: string): Promise<void> {
+    try {
+      await this.store.removeFtsColumn(tableId, columnId);
+    } catch (error) {
+      const table = await this.store.getTable(tableId).catch(() => undefined);
+      if (table !== undefined && activePostingStorageColumnIds(table).has(columnId)) return;
+      this.#postingCleanupFailure(tableId, columnId)(error);
     }
   }
 
@@ -23723,29 +23888,31 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   /**
-   * Stages a UNIQUE index's key set through the store's chunked build: globally ordered chunks
-   * of at most `MAX_UNIQUE_KEY_BUILD_TOKENS_PER_CHUNK` keys, one store call each, renewing the
-   * build's lease halfway through its lifetime. Returns the chunk count `finish` must match.
+   * Begins a UNIQUE index's staged key-set build, the one the catalog's `buildId` names, and
+   * returns when its lease started.
    */
-  async #stageUniqueKeys(
-    tableId: string,
-    indexId: string,
-    buildId: string,
-    terms: UniqueTermRuns,
-  ): Promise<number> {
-    const ownerId = this.#internalLeaseOwnerId;
-    const leaseUntil = (now: Date): string =>
-      dateIsoString(new Date(dateMilliseconds(now) + MAX_UNIQUE_KEY_BUILD_TTL_MS));
+  async #beginUniqueKeyBuild(tableId: string, indexId: string, buildId: string): Promise<Date> {
     const begun = this.#now();
     await this.store.beginUniqueKeyBuild({
       buildId,
       tableId,
       indexId,
       namespaceId: secondaryUniqueKeyNamespace(tableId, indexId),
-      ownerId,
+      ownerId: this.#internalLeaseOwnerId,
       createdAt: dateIsoString(begun),
-      expiresAt: leaseUntil(begun),
+      expiresAt: uniqueKeyBuildLeaseUntil(begun),
     });
+    return begun;
+  }
+
+  /**
+   * Stages a UNIQUE index's key set through the store's chunked build: globally ordered chunks
+   * of at most `MAX_UNIQUE_KEY_BUILD_TOKENS_PER_CHUNK` keys, one store call each, renewing the
+   * build's lease halfway through its lifetime. Returns the chunk count `finish` must match.
+   */
+  async #stageUniqueKeys(buildId: string, terms: UniqueTermRuns, begun: Date): Promise<number> {
+    const ownerId = this.#internalLeaseOwnerId;
+    const leaseUntil = uniqueKeyBuildLeaseUntil;
     let renewAt = dateMilliseconds(begun) + MAX_UNIQUE_KEY_BUILD_TTL_MS / 2;
     let ordinal = 0;
     for await (const keyTokens of terms.orderedChunks()) {
@@ -25032,10 +25199,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             return;
           }
           // "deferred": another connection's build is folding this tail already -- with several
-          // tabs writing, every commit past the bound lands here. Nothing failed, so nothing is
-          // reported; if that build fails, the next commit past the bound asks again.
+          // tabs writing, every commit past the bound lands here -- or the index went invalid
+          // meanwhile. Nothing failed, so nothing is reported; if that build fails, it leaves the
+          // index invalid, and the next query over it builds again.
           folded =
-            (await this.#buildSecondaryIndexBase(table, secondary[0], secondary[1])) !== "deferred";
+            (await this.#buildSecondaryIndexBase(table, secondary[0], secondary[1], {
+              foldOnly: true,
+            })) !== "deferred";
         }
         if (folded) {
           const version = (await this.store.getCurrentManifestVersion()) ?? -1;
@@ -28096,6 +28266,34 @@ function stageCompactionUniqueCoverage(transaction: DatabaseTransaction, table: 
   }
 }
 
+/** How one secondary-index build attempt runs. */
+interface SecondaryIndexBuildAttempt {
+  /** The build ID this caller already marked the index with. */
+  readonly ownedBuildId?: string;
+  /** The caller holds the writer turn for the whole attempt; its catalog steps run inside it. */
+  readonly heldTurn?: boolean;
+  /** CREATE INDEX is waiting on it, rather than background maintenance. */
+  readonly foreground?: boolean;
+  /** A commit's delta-tail fold: it rebuilds a live index but never revives an invalid one. */
+  readonly foldOnly?: boolean;
+}
+
+/**
+ * A background UNIQUE build whose key set could not be published because commits landed after
+ * its snapshot. A race with writers, retried quietly up to a point (#noteUniqueKeySetOutrun).
+ */
+class UniqueKeySetOutrunError extends WriteConflictError {}
+
+/** A secondary index is done building: ready, and a UNIQUE one enforcing its membership. */
+function secondaryIndexServes(index: SecondaryIndexRecord): boolean {
+  return index.state === "ready" && (index.unique !== true || index.uniqueEnforced === true);
+}
+
+/** When a UNIQUE key-set build's lease, taken or renewed at `now`, runs out. */
+function uniqueKeyBuildLeaseUntil(now: Date): string {
+  return dateIsoString(new Date(dateMilliseconds(now) + MAX_UNIQUE_KEY_BUILD_TTL_MS));
+}
+
 /**
  * Covers a fold's full-text indexes with empty commit deltas. A copy or a rechunk writes insert
  * segments that keep every row, its value, and its row ID, so the postings stay exact and the
@@ -30998,6 +31196,7 @@ function fillPhysicalColumn(
 function isTransientCompactionConflict(error: unknown): boolean {
   if (
     error instanceof SchemaConflictError ||
+    error instanceof UniqueIndexCoverageError ||
     error instanceof TransactionRecordConflictError ||
     error instanceof CompactionJobConflictError
   ) {

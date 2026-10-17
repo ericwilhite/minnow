@@ -186,6 +186,16 @@ together with the ready index. A build is published with one atomic pointer chan
 leave reclaimable staging bytes but cannot expose a partial index. Multi-tab writers that cannot prove they updated an index invalidate the
 accelerator, and the next relevant query rebuilds it while answering correctly from a scan.
 
+`CREATE INDEX` returns once the index is ready, and `CREATE UNIQUE INDEX` once it enforces. The
+build reads a snapshot and lets writes continue meanwhile. A `UNIQUE` index can publish its key
+set only if nothing was committed after that snapshot. When writes did land — in this tab or
+another — it builds again while holding the write turn. Any index does the same when other tabs'
+writes outgrow its delta tail before its build finishes. Writes wait for that second build, as
+they would for any schema change; reads never wait. A row committed before the index enforces is
+an existing row: if it repeats a key, `CREATE UNIQUE INDEX` fails and leaves no index. Once the
+index exists, folding its deltas rebuilds only its postings, never its key set, so a busy table
+keeps the index ready.
+
 ```sql
 DROP INDEX IF EXISTS orders_by_status;
 ```

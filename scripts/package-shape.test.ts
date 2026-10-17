@@ -185,8 +185,9 @@ describe("published core tarball", () => {
       // with the 0.16.0 audit (951,556 measured), then lowered to 954,000 when shared engine
       // helpers replaced duplicated copies (953,067 measured), and raised to 960,000 for PostgreSQL
       // datetime and interval text (959,373 measured), 961,000 with full-text fold coverage
-      // (960,174 measured); ratchets, not targets.
-      expect(report?.size, "packed bytes").toBeLessThanOrEqual(961_000);
+      // (960,174 measured), 962,000 with UNIQUE builds under writes (961,154 measured); ratchets,
+      // not targets.
+      expect(report?.size, "packed bytes").toBeLessThanOrEqual(962_000);
       expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_500_000);
       const emitted = await readFile(join(isolatedCore, "dist", "engine", "optimizer.js"), "utf8");
       expect(emitted).not.toContain("/**");

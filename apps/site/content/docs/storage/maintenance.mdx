@@ -316,17 +316,28 @@ store, and the retry resolves them on its own:
   stepping, so there is nothing for an application to reconcile. Collection still counts the
   failure in `consecutiveFailures` and `lastError`.
 - **A schema change mid-fold.** A fold that keeps losing to `CREATE INDEX` or `ALTER` is planned
-  again against the new schema.
+  again against the new schema. So is one that finds a `UNIQUE` index began enforcing after it
+  read its table (`UniqueIndexCoverageError`).
 - **A race another tab won.** With several tabs writing, their commits make the same table due
   for a fold and the same index tail due for a rebuild at the same moment. Every tab may step a
   table's one compaction job, so a step can find that another tab moved the job or its shared
   transaction first (`CompactionJobConflictError`, `TransactionRecordConflictError`). The job
   advanced, just not here; the fold retries after its backoff. An index build first claims the
   index's build session: while another tab's build of the same index is live, the claim is
-  refused and this tab leaves the work to it. The next commit past the tail bound, or the next
-  query that finds the index not ready, asks again, so a build that fails in the other tab is
-  retried here. A build whose index was dropped, invalidated, or taken over while it ran stops
-  quietly for the same reason.
+  refused and this tab leaves the work to it. The next query that finds the index not ready asks
+  again, so a build that fails in the other tab is retried here; the next commit past the tail
+  bound asks too, while the index still has a tail to fold (an invalid one keeps none). A build
+  whose index was dropped, invalidated, or taken over while it ran stops quietly for the same
+  reason.
+- **Commits during a `UNIQUE` index's first build.** Its key set can be published only over the
+  snapshot it was read from. `CREATE UNIQUE INDEX` that finds commits landed meanwhile does not
+  fail: it builds again inside the write turn, where none can land. Background work never holds
+  writers that long, so another tab finishing a `CREATE UNIQUE INDEX` whose tab closed mid-build
+  leaves the index scanning and tries again at the next query over it. Eight such losses in a
+  row with no publication between them are reported with the context
+  `secondary index build for <table>/<index> (8 attempts in a row without progress)`. Folding an
+  existing `UNIQUE` index's delta tail rebuilds only its postings; its key set is the separately
+  maintained membership and is never restaged, so busy writers never make that fold lose.
 
 Quiet does not mean hidden when nothing improves. A table whose automatic fold fails quietly
 eight times in a row, with no completed fold in between, reports the latest failure with the
