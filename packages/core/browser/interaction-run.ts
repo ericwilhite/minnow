@@ -148,6 +148,10 @@ const tab = {
       if (client === undefined) throw new Error("open() first");
       await client.compactTable(table);
       await client.collectGarbage();
+      const report = await client.checkIntegrity({ mode: "full" });
+      if (!report.ok) {
+        throw new Error(`integrity after maintenance: ${JSON.stringify(report.issues)}`);
+      }
     });
   },
   close(): Promise<TabFailure | undefined> {

@@ -536,7 +536,9 @@ equals `COUNT(*)`; a `UNION ALL` has the sum of its members' cardinalities; unco
 visible on their own connection and invisible to another; a read taken during a round of
 commuting writes shows every untouched key exactly and every touched key at its old or new
 value; a mutation interrupted by a fault lands entirely or not at all and a reported success is
-durable; and at every checkpoint every connection reads the same database as the model.
+durable; and at every checkpoint every connection reads the same database as the model. After
+each compaction and collection, the IndexedDB and OPFS stores must also pass a full
+`checkIntegrity()`.
 
 With `rekeying: true` (`--rekeying true` on the command line) a plan also changes primary keys:
 `UPDATE … SET id = …` to a constant, shifted by a step, negated, or swapped between two rows,
@@ -577,7 +579,8 @@ COLUMN`, `RENAME COLUMN`, and `CREATE`/`DROP INDEX`, including drops and renames
 - **`fullText`** (`--full-text true`) adds `MATCH … AGAINST` queries, with prefixes, several
   columns, and an extra predicate, over keyed tables and over append-only tables a full-text
   index can cover. The model tokenizes as the engine documents: NFKC, lowercased, runs of letters
-  and digits.
+  and digits. The append-only tables are folded and collected now and then too, so searches meet
+  an index that survived a fold.
 - **`burstCommits`** (`--burst-commits N`) adds bursts of up to `N` single-row commits to one
   table from every connection, each judged as it lands. Every plan with the option holds at least
   one. After a burst of 640 commits or more the table must hold at most 640 visible segments:

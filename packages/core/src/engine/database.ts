@@ -153,6 +153,7 @@ import {
 } from "./defaults.js";
 import { cachedQueryTerms, FTS_TOKENIZER_VERSION, type FtsStats } from "./fts.js";
 import {
+  activePostingStorageColumnIds,
   boundedMaintenanceBatchItems,
   floorWholeNumberProduct,
   type BlockStore,
@@ -182,6 +183,7 @@ import {
   type MergeCompactionPlannedColumn,
   type MergeCompactionRewritePlan,
   type ReplayedMergeCompactionRewritePlan,
+  type CompactionRewritePlan,
   isMergeCompactionPlan,
   type MergeCompactionSourceBlock,
   type MergeCompactionSourceColumn,
@@ -2673,6 +2675,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   readonly #ftsBuildsInFlight = new Map<string, Promise<void>>();
   /** Highest authoritative commit hint observed while a postings fold is in flight. */
   readonly #postingDeltaTailCounts = new Map<string, number>();
+  /**
+   * Invalidated indexes collection found holding no postings, by `table/column`, with the table
+   * revision it looked at. Postings cannot reappear without a rebuild, which moves the revision.
+   */
+  readonly #reclaimedPostingRevisions = new Map<string, number>();
   /**
    * Build sessions this engine claimed and has not yet finished or aborted, by build ID. A
    * secondary-index build claims its session before it marks the catalog; the writer that
@@ -18850,6 +18857,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       // Each page is one small delete; an explicit call finishes them all.
       let more = await this.#trimExpiredKeyForwards();
       while (more) more = await this.#trimExpiredKeyForwards(true);
+      await this.#reclaimInvalidatedPostings();
       const maxItems = boundedMaintenanceBatchItems(
         options.maxItemsPerStep ?? 64,
         "Garbage collection items per step",
@@ -18997,6 +19005,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
 
   async #runAutoCollection(): Promise<{ moreWork: boolean; reclaimed: boolean }> {
     const trimMoreWork = await this.#trimExpiredKeyForwards();
+    await this.#reclaimInvalidatedPostings();
     const reconciliationMoreWork = await this.#reconcileCompactionMaintenance();
     // A discovery cycle may span many bounded jobs. Finish its durable continuation, then
     // wait for a fresh trigger; restarting full discovery just because a job reclaimed records
@@ -19067,6 +19076,57 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       });
       return expired.length > page.length;
     });
+  }
+
+  /**
+   * Deletes the postings of invalidated indexes. A commit that cannot cover an index -- a keyed
+   * mutation, a writer prepared before the index existed, a keyed fold -- flips it to "invalid"
+   * and keeps the data commit, leaving the index's base and deltas stored. Reads never use them
+   * again; a rebuild retires them, but nothing else did, so an index that is never rebuilt held
+   * them until its table or column was dropped. Databases written before folds covered their
+   * indexes hold them for every folded append-only table. removeFtsColumn refuses an index a
+   * rebuild has made active again since the catalog was read here; that one is left alone.
+   */
+  async #reclaimInvalidatedPostings(): Promise<void> {
+    const tables = await this.store.listTables();
+    const seen = new Set<string>();
+    let version: number | undefined;
+    for (const table of tables) {
+      const active = activePostingStorageColumnIds(table);
+      const invalid = new Set(
+        [
+          ...Object.keys(table.ftsColumns ?? {}),
+          ...Object.values(table.secondaryIndexes ?? {}).map((index) => index.storageColumnId),
+        ].filter((columnId) => !active.has(columnId)),
+      );
+      for (const columnId of invalid) {
+        const key = `${table.id}/${columnId}`;
+        seen.add(key);
+        if (this.#closed) return;
+        // A build this engine is running replaces the postings itself.
+        if (this.#ftsBuildsInFlight.has(key)) continue;
+        if (this.#reclaimedPostingRevisions.get(key) === table.revision) continue;
+        try {
+          version ??= (await this.store.getCurrentManifestVersion()) ?? -1;
+          const stored = await this.store.readFtsCandidates(table.id, columnId, [], version);
+          if (stored.hasBase || stored.deltaChunkCount > 0) {
+            await this.store.removeFtsColumn(table.id, columnId);
+          }
+          this.#reclaimedPostingRevisions.set(key, table.revision);
+        } catch (error) {
+          // A rebuild another connection began since the listing is no failure. Anything else
+          // is reported and retried by the next pass; it must not hold up block collection.
+          const current = await this.store.getTable(table.id).catch(() => table);
+          if (current !== undefined && !activePostingStorageColumnIds(current).has(columnId)) {
+            this.#reportBackgroundError(error, `postings reclamation for ${key}`);
+          }
+        }
+        await this.#yieldMaintenance();
+      }
+    }
+    for (const key of this.#reclaimedPostingRevisions.keys()) {
+      if (!seen.has(key)) this.#reclaimedPostingRevisions.delete(key);
+    }
   }
 
   /**
@@ -21878,6 +21938,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       let publicationConflict: WriteConflictError | undefined;
       const publish = async (): Promise<ManifestSummary | undefined> => {
         try {
+          // From the record as it stands inside the turn: an index build stamped since this
+          // job read the table is covered too, rather than taken for a stale writer's victim.
+          stageCompactionPostingCoverage(
+            transaction,
+            (await this.store.getTable(table.id)) ?? table,
+            rewritePlan,
+          );
           const manifest = await transaction.commit();
           this.#afterCompactionCommit(manifest, table.id);
           return manifest;
@@ -28027,6 +28094,27 @@ function stageCompactionUniqueCoverage(transaction: DatabaseTransaction, table: 
     if (covered.has(namespaceId)) continue;
     transaction.setUniqueKeyChanges({ tableId: namespaceId, keyTokens: [], requireAbsent: false });
   }
+}
+
+/**
+ * Covers a fold's full-text indexes with empty commit deltas. A copy or a rechunk writes insert
+ * segments that keep every row, its value, and its row ID, so the postings stay exact and the
+ * pruner and rebuilds still read the table as append-only. Uncovered, the store's stale-writer
+ * rule took the fold for a writer that never saw the index and invalidated it: every fold of an
+ * append-only table threw its index away, searches scanned until a full rebuild, and the
+ * invalidated postings stayed stored. A merge writes base segments, which no full-text index can
+ * serve, so it stays uncovered and the index is invalidated as before.
+ */
+function stageCompactionPostingCoverage(
+  transaction: DatabaseTransaction,
+  table: TableRecord,
+  plan: CompactionRewritePlan,
+): void {
+  if (isMergeCompactionPlan(plan)) return;
+  const columns = Object.entries(table.ftsColumns ?? {}).flatMap(([columnId, index]) =>
+    index.state === "invalid" ? [] : [{ columnId, postings: [], totalTokens: 0 }],
+  );
+  if (columns.length > 0) transaction.setFtsChanges({ tableId: table.id, columns });
 }
 
 /**

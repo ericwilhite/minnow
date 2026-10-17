@@ -386,6 +386,15 @@ async function runIndexedDb(
   const foldedAcrossAddColumn = (
     await database.query("SELECT tag, COUNT(*) AS n FROM items GROUP BY tag ORDER BY tag")
   ).rows;
+  // A fold of the released writer's append-only table keeps its full-text index: the rows and
+  // row IDs the postings name are the ones the fold wrote back.
+  await database.compactTable("notes", { minimumLevel0Segments: 1 });
+  const foldedFullText = {
+    states: Object.values((await store.getTableByName("notes"))?.ftsColumns ?? {}).map(
+      (index) => index.state,
+    ),
+    matches: (await indexedAnswers(database)).matches,
+  };
   const integrity = (await store.checkIntegrity({ mode: "full" })).ok;
   await database.close();
   store.close();
@@ -417,6 +426,7 @@ async function runIndexedDb(
     rekeyed,
     keyForwards,
     foldedAcrossAddColumn,
+    foldedFullText,
     integrity,
     olderReadersRefused: refusals === Object.keys(releasedIndexedDb).length,
     finalSchema: await nativeVersion(name),

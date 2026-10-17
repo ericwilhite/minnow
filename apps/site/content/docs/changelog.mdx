@@ -52,6 +52,13 @@ reproduced first and ships with a test that fails without it.
 - **Live queries.** A live query over a self-join re-runs instead of patching rows joined to a
   changed or deleted row. A live query on a retired key updates when a row is written at the key it
   forwards to.
+- **Full-text indexes survived folds badly.** Every fold of an append-only table invalidated its
+  full-text index, so searches scanned until the next search rebuilt it, and the invalidated
+  postings stayed stored until the column or table was dropped. Folds of append-only tables now keep
+  the index, and garbage collection deletes the postings of any index a write invalidated â€”
+  including those earlier releases left behind, so existing databases are repaired by their next
+  collection. IndexedDB `checkIntegrity` no longer reports such postings, or a `UNIQUE` column
+  declared in `CREATE TABLE` before its index is built, as corruption.
 - **OPFS reopen.** A database where a UNIQUE index was dropped, or where a commit invalidated a
   UNIQUE index's postings, opens again instead of reporting corruption.
 - **Quiet multi-tab maintenance.** Background index builds and folds shared by several tabs no
@@ -167,7 +174,7 @@ Writes are still slower than SQLite's in-place B-tree, and bulk deletes about 8Ã
 
 ### Size
 
-The engine with the OPFS adapter is 419 KiB gzipped (392 KiB in 0.15.0). Helpers the engine had copied between modules are now shared, which offsets the JSON guard.
+The engine with the OPFS adapter is 420 KiB gzipped (392 KiB in 0.15.0). Helpers the engine had copied between modules are now shared, which offsets the JSON guard.
 
 ### API changes
 

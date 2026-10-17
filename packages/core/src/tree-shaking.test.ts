@@ -62,8 +62,10 @@ const DATABASE_MARKER = "A database cannot queue more than";
 // The V8 JSON key guard (block-format/json-parse.ts): 1069.6 KiB raw / 318.4 KiB gzip.
 // Shared engine helpers in place of duplicated copies: 1063.5 KiB raw / 317.3 KiB gzip.
 // PostgreSQL datetime and interval text (sql-datetime-text.ts): 1074.0 KiB raw / 320.6 KiB gzip.
-const COMPLETE_ENTRY_RAW_BUDGET = 1075 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 321 * 1024;
+// Full-text coverage for append-only folds and invalidated-postings collection: 1075.2 KiB raw /
+// 321.0 KiB gzip.
+const COMPLETE_ENTRY_RAW_BUDGET = 1076 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 322 * 1024;
 // Measured with the larger durable adapter: 1211.9 KiB raw / 337.5 KiB gzip. The durable
 // served-request ledger (OPFS layout 6) adds about 20 KiB raw: 1231.3 KiB raw. With the scope
 // write set: 346.0 KiB gzip. The unbounded journal (memoized RecordCore journal, bounded served
@@ -81,7 +83,8 @@ const COMPLETE_ENTRY_GZIP_BUDGET = 321 * 1024;
 // The 0.16.0 audit: 1449.0 KiB raw.
 // The V8 JSON key guard: 1451.2 KiB raw. Shared engine helpers: 1445.0 KiB raw.
 // PostgreSQL datetime and interval text: 1455.5 KiB raw.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1456 * 1024;
+// Full-text fold coverage and postings collection: 1456.6 KiB raw.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1457 * 1024;
 // Explicit scheduler ownership and bounded diagnostic history add about 1 KiB gzip over the
 // correctness/upgrade batch (361.6 KiB measured). Concurrent compaction and posting ownership
 // repairs measure 362.1 KiB; allow the next whole KiB without changing runtime performance gates.
@@ -112,7 +115,8 @@ const ENGINE_WITH_OPFS_GZIP_BUDGET = 420 * 1024;
 // The V8 JSON key guard: 1446.3 KiB raw / 413.8 KiB gzip. Shared engine helpers: 1440.1 KiB
 // raw / 412.7 KiB gzip.
 // PostgreSQL datetime and interval text: 1450.6 KiB raw / 416.2 KiB gzip.
-const INDEXEDDB_WORKER_RAW_BUDGET = 1451 * 1024;
+// Full-text fold coverage and postings collection: 1451.8 KiB raw.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1452 * 1024;
 const INDEXEDDB_WORKER_GZIP_BUDGET = 417 * 1024;
 
 const repoRoot = join(import.meta.dirname, "..", "..", "..");
