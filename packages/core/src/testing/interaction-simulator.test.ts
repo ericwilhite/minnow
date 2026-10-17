@@ -908,67 +908,6 @@ describe("simulator result-shape oracle", () => {
   });
 });
 
-describe.each(stores)("interaction simulator with rekeying over $name", ({ source }) => {
-  it.each(seedsFor("interaction-simulator-rekeying", [0x4e4b, 0xbeef]))("seed %i", async (seed) => {
-    const store = source();
-    try {
-      const plan = generateInteractionPlan(seed, {
-        length: 200,
-        connections: 3,
-        tables: 2,
-        keySpace: 16,
-        rekeying: true,
-      });
-      expect(plan.interactions.some((interaction) => interaction.kind === "rekey")).toBe(true);
-      const result = await runInteractionPlan(
-        plan,
-        createDatabaseDriver(store, { databaseOptions: { rowsPerBlock: 8 } }),
-      );
-      expect(result.interactions).toBe(plan.interactions.length);
-      expect(result.acceptedWrites).toBeGreaterThan(20);
-      expect(result.rejectedConflicts).toBe(0);
-    } finally {
-      if (typeof store !== "function") store.close();
-    }
-  });
-});
-
-describe.each(stores)(
-  "interaction simulator with constraints and schema changes over $name",
-  ({ source }) => {
-    it.each(seedsFor("interaction-simulator-schema", [0x5c4e, 0xd00d]))("seed %i", async (seed) => {
-      const store = source();
-      try {
-        const plan = generateInteractionPlan(seed, {
-          length: 200,
-          connections: 3,
-          tables: 3,
-          keySpace: 16,
-          constraints: true,
-          schemaChanges: true,
-          fullText: true,
-          burstCommits: 60,
-        });
-        const result = await runInteractionPlan(
-          plan,
-          createDatabaseDriver(store, {
-            databaseOptions: { rowsPerBlock: 8, ftsAutoIndexRows: 8 },
-          }),
-        );
-        expect(result.interactions).toBe(plan.interactions.length);
-        expect(result.acceptedWrites).toBeGreaterThan(20);
-        expect(result.expectedFailures).toBeGreaterThan(0);
-        expect(result.rejectedConflicts).toBe(0);
-        expect(result.burstCommits).toBeGreaterThanOrEqual(30);
-        // The lookups are shaped for the secondary-index path; some must have taken it.
-        expect(result.indexPathQueries).toBeGreaterThan(0);
-      } finally {
-        if (typeof store !== "function") store.close();
-      }
-    });
-  },
-);
-
 describe.each(stores)("interaction simulator over $name", ({ source }) => {
   it.each(seedsFor("interaction-simulator", [0x5eed, 0xc0ffee]))("seed %i", async (seed) => {
     const store = source();

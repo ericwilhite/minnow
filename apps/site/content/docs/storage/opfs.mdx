@@ -150,10 +150,13 @@ One directory per database under `minnowdb/` in the origin's private file system
 and index postings), `temp/` (query spill), and `snapshots-v1/` (checksummed, append-only ledgers
 for active or recently completed framed-snapshot sessions). Opening fails closed when the format
 marker is missing or malformed beside storage artifacts; a torn marker is repaired only in an
-otherwise empty database directory. The locked marker is canonical: extra fields, duplicate keys,
-or alternate JSON spellings are corruption, not extension points. Posting row locators use a
-compact delta-varint encoding rather than JSON, so a secondary index does not spend most of its
-space spelling out bigint values. Deleting the directory deletes the database —
+otherwise empty database directory. Connections that open a database at the same time take turns
+through a Web Lock whenever the marker does not read whole, as do the marker's writes, so a marker
+another tab is still creating or upgrading is waited for rather than refused as torn. The locked
+marker is canonical: extra fields, duplicate keys, or alternate JSON spellings are corruption, not
+extension points. Posting row locators use a compact delta-varint encoding rather than JSON, so a
+secondary index does not spend most of its space spelling out bigint values. Deleting the
+directory deletes the database —
 `deleteOpfsDatabase({ name })` does exactly that, but only when no participating connection is open.
 It requires Web Locks, holds an exclusive deletion lock, and refuses with
 `OpfsDatabaseInUseError` before removing files if a leader or follower holds a shared connection

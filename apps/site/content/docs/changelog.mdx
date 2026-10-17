@@ -90,6 +90,13 @@ reproduced first and ships with a test that fails without it.
   including those earlier releases left behind, so existing databases are repaired by their next
   collection. IndexedDB `checkIntegrity` no longer reports such postings, or a `UNIQUE` column
   declared in `CREATE TABLE` before its index is built, as corruption.
+- **Two tabs opening a new OPFS database at once could refuse it as corrupt.** One connection
+  could read `format.json` while another was still creating it, then find the WAL that connection
+  made next, and refuse a healthy database ("The OPFS format marker is torn, but the database
+  directory already contains storage artifacts"). It could also write the marker a second time
+  beside a live WAL, where a power loss would leave the database unopenable, and a leader upgrading
+  an older layout's marker raced readers the same way. Connections now judge any marker that does
+  not read whole under a per-database Web Lock that every marker write also holds.
 - **A stalled IndexedDB was reported as corruption.** When IndexedDB gave no answer while a
   database opened, Minnow raised `StorageCorruptionError` instead of `StorageUnresponsiveError`. In
   WebKit this happens after a worker is terminated with more than one IndexedDB transaction in
@@ -173,7 +180,8 @@ suites against both.
 - Kysely 0.6.0 accepts `renameColumn()`, `ifNotExists()` on `addColumn`, and array parameters for
   `fn.any`.
 - Devtools 0.3.7 confirms and reports `RENAME COLUMN` like the other catalog statements, and its
-  console no longer warns about the SQL forms this release supports.
+  console no longer warns about the SQL forms this release supports. It also carries the 0.3.6
+  changes listed below, which were never published on their own.
 
 ### Performance
 
@@ -272,9 +280,10 @@ gaps.
 
 ## Devtools 0.3.6 — October 16, 2026
 
-Published packages: `@minnowdb/devtools@0.3.6`.
+Not published: this release's run failed on unrelated real-browser tests, so `@minnowdb/devtools`
+went from 0.3.5 to 0.3.7. Everything below ships in 0.3.7 with core 0.16.0.
 
-A devtools-only release: `@minnowdb/core` stays at 0.15.0, stored formats are unchanged, and no
+A devtools-only change set: `@minnowdb/core` stayed at 0.15.0, stored formats are unchanged, and no
 migration is needed.
 
 ### Fixed

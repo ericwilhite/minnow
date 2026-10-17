@@ -394,7 +394,11 @@ and a layout-11 marker over the layout-10 fixture, to layout 12, folds a table a
 `DROP COLUMN` there, and merges a table's deltas there. `format-compatibility.test.ts` restores the
 forward the frozen format-2 fixture stored, checks it resolves until it expires, and rekeys data
 an older writer exported. The marker upgrade is cut at
-each of its eight I/O boundaries by tab death and by power loss, from every older layout. Unsupported pre-contract prototypes are refused without changing their bytes.
+each of its eight I/O boundaries by tab death and by power loss, from every older layout.
+`marker-race.test.ts` pauses one opener inside a marker write — while creating a database, and
+while upgrading one — lets a second opener read the marker in that window, and checks that the
+second waits instead of refusing the database or writing the marker again beside a live WAL.
+Unsupported pre-contract prototypes are refused without changing their bytes.
 The layout-7 tests also zero or truncate acknowledged WAL bytes and
 damage either acknowledgement slot; recovery must report corruption rather than roll back.
 

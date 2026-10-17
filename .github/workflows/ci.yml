@@ -24,9 +24,10 @@ jobs:
     name: Format, types, lint, build, unit tests
     runs-on: ubuntu-latest
     # The heaviest maintenance and conformance tests are each allowed 300 s under coverage; the
-    # sum has to fit here with room for the build and lint steps ahead of them. A typical run takes
-    # about 27 minutes, and a slow runner has needed more than 30.
-    timeout-minutes: 45
+    # sum has to fit here with room for the build and lint steps ahead of them. A typical run took
+    # about 27 minutes through 0.15.0; 0.16.0's upgrade tests (a released writer driven to the
+    # 4,096-segment ceiling), delta-merge and UNIQUE-under-writes suites brought it to 43.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -160,7 +161,9 @@ jobs:
   engines-floor:
     name: Unit tests on the oldest supported Node
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The whole unit suite without coverage. Node 22 runs the fake-indexeddb simulator seeds about
+    # twice as slowly as 24 (40-76 s each), and 0.16.0's suite passed 20 minutes there.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
