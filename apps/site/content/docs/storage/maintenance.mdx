@@ -342,8 +342,8 @@ store, and the retry resolves them on its own:
 Quiet does not mean hidden when nothing improves. A table whose automatic fold fails quietly
 eight times in a row, with no completed fold in between, reports the latest failure with the
 context `automatic compaction for <table> (8 attempts in a row without progress)`. A store that
-stops answering (`StorageUnresponsiveError`) is always reported, because only reloading the tab
-clears it, and so is every I/O, quota, or corruption error. `backgroundFailureCount` and
+stops answering (`StorageUnresponsiveError`) is always reported, because only closing the site's
+tabs clears it, and so is every I/O, quota, or corruption error. `backgroundFailureCount` and
 `backgroundErrors` count reported failures only.
 
 Foreground failures reject their owning call; a successful fallback still reports the unexpected

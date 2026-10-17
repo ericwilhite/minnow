@@ -2,14 +2,15 @@ import { IDBFactory } from "fake-indexeddb";
 import { describe, expect, it, vi } from "vitest";
 import { classifyError } from "../engine/errors.js";
 import { IndexedDbBlockStore, INDEXEDDB_UNRESPONSIVE_AFTER_MS } from "./indexeddb.js";
-import { StorageUnresponsiveError, UnknownOutcomeError } from "./types.js";
+import { StorageCorruptionError, StorageUnresponsiveError, UnknownOutcomeError } from "./types.js";
 
 /**
  * A connection that answers nothing.
  *
- * WebKit keeps a terminated worker's IndexedDB connection, and its unfinished transaction,
- * registered until the owning document goes away; while it is registered every connection to
- * that database blocks, new ones included, and no event ever arrives. Nothing in IndexedDB can
+ * WebKit can keep an unfinished transaction of a terminated worker registered after the worker
+ * is gone -- a reload of its tab does not always release it, closing the tab does -- and while
+ * it is registered every transaction that overlaps it blocks, in new connections and other tabs
+ * too, and no event ever arrives. Nothing in IndexedDB can
  * be cancelled or timed out, so the adapter's own deadline is the only thing between that and a
  * call that hangs forever. These transactions reproduce exactly that: they are attached to the
  * real connection (so the adapter's guard is found through `transaction.db`) and they deliver no
@@ -64,6 +65,54 @@ function wedge(db: IDBDatabase): void {
     value: () => shared.transaction,
     configurable: true,
   });
+}
+
+/**
+ * Real transactions whose events never reach the adapter: the schema is the stored one, so only
+ * the silence differs from a healthy open. This is the shape of a transaction queued behind one
+ * that never finishes — it has metadata at once and no event ever.
+ */
+function silence(db: IDBDatabase): void {
+  const original = db.transaction.bind(db);
+  Object.defineProperty(db, "transaction", {
+    value: (...args: Parameters<IDBDatabase["transaction"]>) => {
+      const transaction = original(...args);
+      return new Proxy(transaction, {
+        get(target, property) {
+          if (property === "addEventListener") return () => undefined;
+          const value: unknown = Reflect.get(target, property, target);
+          if (typeof value !== "function") return value;
+          return (...args: unknown[]): unknown => {
+            const result: unknown = Reflect.apply(value, target, args);
+            return result;
+          };
+        },
+      });
+    },
+    configurable: true,
+  });
+}
+
+/**
+ * A factory over an existing, valid database whose next connections are handed to `tamper` the
+ * moment they open -- before the adapter's own success listener, and so before its schema check.
+ */
+async function reopenedFactory(
+  name: string,
+  tamper: (db: IDBDatabase) => void,
+): Promise<IDBFactory> {
+  const base = new IDBFactory();
+  (await IndexedDbBlockStore.open({ name, indexedDB: base })).close();
+  return {
+    open: (openName: string, version?: number) => {
+      const request = base.open(openName, version);
+      request.addEventListener("success", () => tamper(request.result), { once: true });
+      return request;
+    },
+    deleteDatabase: (deleteName: string) => base.deleteDatabase(deleteName),
+    databases: () => base.databases(),
+    cmp: (first: IDBValidKey, second: IDBValidKey) => base.cmp(first, second),
+  };
 }
 
 function firstConnection(connections: IDBDatabase[]): IDBDatabase {
@@ -235,6 +284,41 @@ describe("an IndexedDB connection that stops answering", () => {
     await expect(
       IndexedDbBlockStore.open({ name: "wedged", indexedDB: never, unresponsiveAfterMs: 50 }),
     ).rejects.toBeInstanceOf(StorageUnresponsiveError);
+  });
+
+  it("reports an open whose first read never answers as unresponsive, not corrupt", async () => {
+    // The connection opens, then its schema check queues behind a transaction that never
+    // finishes -- what a WebKit tab meets after another tab's worker was terminated mid-commit.
+    // Silence is not evidence about the stored schema: the caller must learn that the browser
+    // holds the database, not that the data is damaged.
+    const indexedDB = await reopenedFactory("silent-schema", silence);
+    const failure = await IndexedDbBlockStore.open({
+      name: "silent-schema",
+      indexedDB,
+      unresponsiveAfterMs: 50,
+    }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(StorageUnresponsiveError);
+    expect(failure).not.toBeInstanceOf(StorageCorruptionError);
+    expect(classifyError(failure)).toMatchObject({
+      kind: "unknown-outcome",
+      connectionUsable: false,
+    });
+  });
+
+  it("reports a connection closed before its schema check as closed, not corrupt", async () => {
+    const indexedDB = await reopenedFactory("closed-schema", (db) => {
+      Object.defineProperty(db, "transaction", {
+        value: () => {
+          throw new DOMException("The database connection is closing.", "InvalidStateError");
+        },
+        configurable: true,
+      });
+    });
+    const failure = await IndexedDbBlockStore.open({ name: "closed-schema", indexedDB }).catch(
+      (error: unknown) => error,
+    );
+    expect(failure).not.toBeInstanceOf(StorageCorruptionError);
+    expect((failure as Error).name).toBe("InvalidStateError");
   });
 
   it("refuses a deadline that is not a positive whole number of milliseconds", async () => {

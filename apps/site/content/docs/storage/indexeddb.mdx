@@ -229,11 +229,15 @@ Progress advances the deadline without replacing a native timer for every reques
 checks the latest deadline when it wakes; a newly queued request does not count as progress.
 `unresponsiveAfterMs` on `IndexedDbBlockStore.open` changes the deadline.
 
-A wedge like that has one known cause: a worker killed with a write in flight. WebKit keeps the
-dead worker's connection, and its unfinished transaction, registered until the document that
-created the worker goes away, and until then every connection to that database blocks — new ones
-in other tabs included. No adapter can undo that, so it bounds the wait and names the remedy:
-reload the page. See [Errors](/docs/engine/errors) for what a caller should do with it.
+A wedge like that has one known cause: a worker killed with IndexedDB transactions in flight.
+WebKit can keep one of the dead worker's unfinished transactions registered after the worker is
+gone — we have seen it when the worker had more than one in flight — and until it is released,
+every transaction that overlaps it blocks, in every tab, new connections included. Reloading the
+tab that ran the worker does not always release it; closing that tab does. No adapter can undo
+that, so it bounds the wait and names the remedy: close the site's tabs, then open the site
+again. Opening the database reports the same error when the stuck transaction blocks its first
+read, the schema check — a silent database is not a damaged one. See
+[Errors](/docs/engine/errors) for what a caller should do with it.
 
 ## Schema compatibility and recovery
 

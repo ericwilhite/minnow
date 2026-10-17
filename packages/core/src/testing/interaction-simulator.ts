@@ -499,9 +499,11 @@ export interface InteractionRunResult {
   readonly peakBurstSegments: number;
   /**
    * The one transient that ends a run instead of being modelled: a store that stopped answering.
-   * A browser can wedge a whole database beyond any engine's reach (a worker terminated with a
-   * write in flight leaves WebKit's IndexedDB connection registered until its document goes away),
-   * and the engine then bounds the wait and reports `StorageUnresponsiveError` rather than hanging.
+   * A browser can wedge a whole database beyond any engine's reach (WebKit can keep an unfinished
+   * transaction of a worker terminated mid-operation registered until the tab that ran it closes;
+   * a reload does not always release it), and the engine then bounds the wait and reports
+   * `StorageUnresponsiveError` rather than hanging -- from the reopen itself when the stuck
+   * transaction blocks its first read.
    * Nothing further can be driven through that store, so the run stops at that interaction and
    * `interactions` counts only the steps it judged.
    */
