@@ -77,6 +77,10 @@ the tail exceeds 16 delta-bearing commits, the committing engine schedules a reb
 searches the column again. The persistent tail and the work of the next search therefore do not
 grow with an all-day write session.
 
+[Compaction](/docs/storage/maintenance#compaction) keeps the index. A fold of an append-only table
+rewrites its rows without changing any of them, so searches keep using the same index before,
+during, and after it.
+
 <Callout title="Append-only columns only">
   A full-text index can only cover a table that has not been updated or deleted from:
 
@@ -86,6 +90,11 @@ Full-text indexes support append-only tables; orders has keyed mutations
 
 `MATCH` still works on such a table — it just scans. The index is a pruning accelerator that the
 scan re-verifies, so a missing, stale, or invalidated index costs time, never correctness.
+
+An index stops at the first update, delete, or upsert of its table, and at the first fold of a
+table with a primary key. Searches then scan, and the next
+[garbage collection](/docs/storage/maintenance#garbage-collection) deletes the index's stored
+postings.
 
 </Callout>
 

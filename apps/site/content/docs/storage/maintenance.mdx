@@ -50,6 +50,11 @@ requestIdleCallback(async function step() {
 Each step processes at most `maxBlocks` output blocks and checkpoints; `progress.result` stays
 `null` until the job publishes.
 
+A fold keeps the table's indexes. It changes no row and no row's identity, so secondary indexes,
+and the full-text index of an append-only table, answer from the same postings afterwards. A fold
+of a table with a primary key writes merged segments a full-text index cannot read, so it stops
+that index; searches scan from then on.
+
 ### Deletes and updates before compaction
 
 Compaction is not what makes a mutated table readable at speed. A query applies the table's
@@ -251,7 +256,9 @@ candidate-count limit is not a wall-clock deadline. See [IndexedDB collection co
 
 The completed pass also removes expired reader leases, abandoned query-spill owners and pages,
 old manifest summaries below the earliest readable checkpoint, and finished maintenance-job
-records beyond the small diagnostic tail. Retired block intervals live in a separate paged
+records beyond the small diagnostic tail. It deletes the stored postings of any index a write has
+invalidated, such as a full-text index after an update: reads stopped using them at that write,
+and a rebuild writes new ones. Retired block intervals live in a separate paged
 provenance index until collection removes each payload and its provenance atomically. Summary
 pruning therefore cannot lose a large cleanup's durable discovery cursor. These are record bounds,
 not just block-byte bounds: normal

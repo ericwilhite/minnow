@@ -52,6 +52,11 @@ export interface IndexedDbUpgradeResult {
    * table was folded: the older rows take the column's default.
    */
   foldedAcrossAddColumn: unknown;
+  /**
+   * The released writer's full-text index on its append-only table after a fold: the index
+   * states, and the full-text matches it answers.
+   */
+  foldedFullText: { states: string[]; matches: unknown[] };
   integrity: boolean;
   olderReadersRefused: boolean;
   /** The schema after every released reader was refused: they must not change it. */

@@ -95,6 +95,10 @@ for (const writer of ["0.10.0", "0.12.1", "0.13.1", "0.14.1", "0.15.0"] as const
         { tag: "new", n: 1 },
         { tag: "old", n: 70_700 },
       ],
+      foldedFullText: {
+        states: ["ready"],
+        matches: [[{ n: 2_000 }], [{ n: 1 }], [{ n: 1 }], [{ n: 1 }]],
+      },
       integrity: true,
       olderReadersRefused: true,
       finalSchema: INDEXEDDB_SCHEMA,

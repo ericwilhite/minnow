@@ -41,7 +41,10 @@
  *   - index-lookup: selects shaped for the secondary-index path return the model's rows
  *   - schema-change (plans with `schemaChanges`): an accepted ALTER TABLE lands for every
  *     connection, and one the engine must refuse changes nothing
- *   - full-text (plans with `fullText`): MATCH returns exactly the rows holding every term
+ *   - full-text (plans with `fullText`): MATCH returns exactly the rows holding every term,
+ *     including after the append-only tables it reads are folded
+ *   - integrity: after each maintenance (fold and collection), a store that can check its own
+ *     integrity reports no issue
  *   - fold-progress (plans with `burstCommits`): a long run of single-row commits keeps the
  *     table's visible segments bounded, so automatic folds keep up
  *
@@ -427,7 +430,10 @@ export interface SimulatedConnection {
   query(sql: string, params?: readonly PlanValue[]): Promise<SimulatedQueryResult>;
   /** Closes and reopens this connection over the same database. */
   reopen(): Promise<void>;
-  /** Runs the store's maintenance (compaction and collection) for one table. */
+  /**
+   * Runs the store's maintenance (compaction and collection) for one table, then checks the
+   * store's integrity where it can.
+   */
   maintain?(table: string): Promise<void>;
   /** The engine's plan text for a SELECT; used to count the reads a secondary index served. */
   explain?(sql: string): Promise<string>;
@@ -597,6 +603,10 @@ export function generateInteractionPlan(
     options.schemaChanges === true ? createRandom((seed ^ 0x414c5452) >>> 0) : undefined;
   const textRandom =
     options.fullText === true ? createRandom((seed ^ 0x46545331) >>> 0) : undefined;
+  // Folds of the append-only tables MATCH reads draw from a stream of their own, so the full-text
+  // steps above stay what they were.
+  const logFoldRandom =
+    options.fullText === true ? createRandom((seed ^ 0x464f4c44) >>> 0) : undefined;
   const burstCommits = options.burstCommits;
   if (burstCommits !== undefined) checkRange("burstCommits", burstCommits, 1, 100_000);
   const burstRandom =
@@ -1265,6 +1275,13 @@ export function generateInteractionPlan(
       }
     }
     if (textRandom?.chance(0.08) === true) textStep(textRandom);
+    if (logFoldRandom !== undefined && logs.size > 0 && logFoldRandom.chance(0.02)) {
+      interactions.push({
+        kind: "maintenance",
+        connection: logFoldRandom.int(connections),
+        table: logFoldRandom.pick([...logs.values()]).name,
+      });
+    }
     if (burstRandom !== undefined && live.size > 0 && burstRandom.chance(0.004)) {
       burst(burstRandom, burstRandom.pick([...live.values()]));
     }
@@ -4900,6 +4917,12 @@ export function createDatabaseDriver(
         maintain: async (table) => {
           await database.compactTable(table);
           await database.collectGarbage();
+          // A fold and a collection must leave storage whole: every record owned, every live
+          // payload readable. The shared in-memory store has no checker.
+          const report = await store?.checkIntegrity?.({ mode: "full" });
+          if (report !== undefined && !report.ok) {
+            throw new Error(`integrity after maintenance: ${JSON.stringify(report.issues)}`);
+          }
         },
         explain: (sql) => database.explain(sql),
         visibleSegments: async (table) => {

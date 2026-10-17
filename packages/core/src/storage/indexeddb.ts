@@ -7274,23 +7274,27 @@ export class IndexedDbBlockStore implements BlockStore {
         }
       }
       for (const storageColumnId of activePostingStorageColumnIds(table)) {
-        const ready =
-          table.ftsColumns?.[storageColumnId]?.state === "ready" ||
-          Object.values(table.secondaryIndexes ?? {}).some(
-            (index) => index.storageColumnId === storageColumnId && index.state === "ready",
-          );
-        if (ready) {
+        const fullText = table.ftsColumns?.[storageColumnId]?.state === "ready";
+        const secondary = Object.values(table.secondaryIndexes ?? {}).find(
+          (index) => index.storageColumnId === storageColumnId && index.state === "ready",
+        );
+        if (fullText || secondary !== undefined) {
           const identity = `${table.id}/${storageColumnId}`;
           const toc = decodeFtsBaseToc(
             await requestResult<unknown>(catalog.get(`${FTS_BASE_INDEX_PREFIX}${identity}`)),
           );
-          if (toc === undefined) {
+          // A secondary index declared with its table (a UNIQUE column of CREATE TABLE) is ready
+          // before any build has written it a base: a read finds none, scans, and schedules that
+          // build. Every base is written with its delta index, and a full-text index is stamped
+          // ready only after its build wrote both.
+          const unbuilt = !fullText && toc === undefined;
+          if (toc === undefined && !unbuilt) {
             issue("missing-postings-toc", identity, "ready postings index has no base");
           }
           const delta = decodeFtsDeltaIndex(
             await requestResult<unknown>(catalog.get(`${FTS_CHUNK_PREFIX}index/${identity}`)),
           );
-          if (delta === undefined) {
+          if (delta === undefined && !unbuilt) {
             issue("missing-postings-delta-index", identity, "postings delta index is missing");
           }
         }
@@ -16415,6 +16419,12 @@ async function ftsBaseChunkHasProvenance(catalog: IDBObjectStore, key: string): 
   );
 }
 
+/**
+ * Whether a table declares the index that owns these postings, in any state. A commit that
+ * cannot cover an index flips it to "invalid" and keeps its postings until a rebuild replaces
+ * them or garbage collection reclaims them, so an invalidated owner still owns them; only
+ * postings no index declares are orphaned.
+ */
 function postingIdentityHasCatalogOwner(
   catalog: IDBObjectStore,
   identity: string,
@@ -16422,8 +16432,13 @@ function postingIdentityHasCatalogOwner(
   return visitObjectStoreSequentially(catalog, (value, key) => {
     if (typeof key !== "string" || !key.startsWith(TABLE_ID_PREFIX)) return false;
     const table = asTableRecord(value, key);
-    return [...activePostingStorageColumnIds(table)].some(
-      (columnId) => `${table.id}/${columnId}` === identity,
+    if (!identity.startsWith(`${table.id}/`)) return false;
+    const columnId = identity.slice(table.id.length + 1);
+    return (
+      Object.hasOwn(table.ftsColumns ?? {}, columnId) ||
+      Object.values(table.secondaryIndexes ?? {}).some(
+        (index) => index.storageColumnId === columnId,
+      )
     );
   });
 }
