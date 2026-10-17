@@ -183,9 +183,10 @@ describe("published core tarball", () => {
       // 4,300,000 with 0.10.1's coordination and recovery fixes, then to 920,000 and 4,500,000
       // when the interaction-plan simulator joined the published testing entry, then to 955,000
       // with the 0.16.0 audit (951,556 measured), then lowered to 954,000 when shared engine
-      // helpers replaced duplicated copies (953,067 measured), and raised to 960,000 for PostgreSQL
-      // datetime and interval text (959,373 measured); ratchets, not targets.
-      expect(report?.size, "packed bytes").toBeLessThanOrEqual(960_000);
+      // helpers replaced duplicated copies (953,067 measured), raised to 960,000 for PostgreSQL
+      // datetime and interval text (959,373 measured), and to 961,000 for UNIQUE builds under
+      // writes (960,358 measured); ratchets, not targets.
+      expect(report?.size, "packed bytes").toBeLessThanOrEqual(961_000);
       expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_500_000);
       const emitted = await readFile(join(isolatedCore, "dist", "engine", "optimizer.js"), "utf8");
       expect(emitted).not.toContain("/**");

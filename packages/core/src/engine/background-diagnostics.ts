@@ -4,6 +4,7 @@ import {
   PostingBuildConflictError,
   SchemaConflictError,
   TransactionRecordConflictError,
+  UniqueIndexCoverageError,
 } from "../storage/types.js";
 import { TransactionClosedError } from "../transactions/index.js";
 
@@ -40,14 +41,19 @@ export function isLivePostingBuildRefusal(error: unknown): boolean {
 
 /**
  * A maintenance mutation whose OPFS leader vanished before acknowledging it — another tab closed
- * or crashed mid-step — or a fold that kept losing to schema changes (`CREATE INDEX`, `ALTER`)
- * through its immediate retries. Each maintenance job is durable and revision-guarded, and its
+ * or crashed mid-step — or a fold that kept losing to schema changes (`CREATE INDEX`, `ALTER`,
+ * a `UNIQUE` index that began enforcing after the fold read its table) through its immediate
+ * retries. Each maintenance job is durable and revision-guarded, and its
  * next run re-reads it and plans against the current schema, so the scheduled retry reconciles
  * the outcome; reporting it would only tell the app that a tab went away or that DDL ran. A
  * wedged store (`StorageUnresponsiveError`) and every other failure are still reported.
  */
 export function isReconciledByMaintenanceRetry(error: unknown): boolean {
-  return error instanceof OpfsUncertainOutcomeError || error instanceof SchemaConflictError;
+  return (
+    error instanceof OpfsUncertainOutcomeError ||
+    error instanceof SchemaConflictError ||
+    error instanceof UniqueIndexCoverageError
+  );
 }
 
 /** One bounded owner of background evidence. Observers receive the original error; history
