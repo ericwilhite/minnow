@@ -130,8 +130,10 @@ when a large batch must not share the UI thread.
 
 Each RPC has a deadline: `requestTimeoutMs` on the client defaults to 60,000 ms and also covers
 startup. The deadline measures silence, not wall time: the worker reports every five seconds on
-each call it is still working on, so a large batch write or a slow query is bounded by progress
-rather than by size, up to ten times the deadline in all. The cap uses monotonic elapsed time,
+each call it is still working on, and on startup while it opens the store, so a large batch
+write, a slow query, or a slow open is bounded by progress rather than by size, up to ten times
+the deadline in all. A store that answers nothing fails startup with its own
+`StorageUnresponsiveError`, not a worker timeout. The cap uses monotonic elapsed time,
 so changing the system clock cannot extend it. Expiry closes the connection to
 further work and rejects pending calls with `DatabaseWorkerTimeoutError`, or
 `DatabaseWorkerOutcomeUnknownError` when an operation could have published before its reply was

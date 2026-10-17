@@ -2967,9 +2967,10 @@ export class ConnectionLostError extends Error {
  * site's tabs, then open the site again — not to retry: the connection cannot recover, and a
  * fresh one, in the same page or after reloading it, may be wedged by the same cause.
  *
- * The known cause is a worker terminated with IndexedDB transactions in flight. WebKit can keep
- * one of the dead worker's unfinished transactions registered after the worker is gone — seen
- * when it had more than one in flight — and while it is registered every transaction that
+ * The known cause is a worker terminated while one of its IndexedDB transactions was still
+ * queued inside IndexedDB, waiting on another transaction of the same worker — directly, or
+ * through another tab's write that itself waits on the worker. WebKit can keep that transaction
+ * registered after the worker is gone, and while it is registered every transaction that
  * overlaps it blocks, in every tab, including connections opened afterwards. Reloading the tab
  * that ran the worker does not always release it; closing that tab does. A store cannot unwedge
  * the browser, so it bounds the wait and says so instead of hanging. An open reports it too:

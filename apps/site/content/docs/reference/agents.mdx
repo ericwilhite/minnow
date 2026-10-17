@@ -307,12 +307,13 @@ machines: https://minnowdb.com/llms.txt
   store first on a healthy connection. After initialization or the transport already failed, the
   original `ready()` or operation reports that error; close removes local listeners and requests
   termination because the unusable channel cannot confirm store disposal. Without a terminable
-  transport, server-side release cannot be confirmed. A worker killed with IndexedDB transactions
-  in flight can leave WebKit holding one of them, even after its tab reloads, and every
-  transaction that overlaps it — in new connections and other tabs too — blocks meanwhile. The
-  engine bounds that wait and throws `StorageUnresponsiveError` after thirty seconds of total
-  storage silence, from `open` too; the remedy is to close the site's tabs and open it again, not
-  `reopen()`, which opens the same wedged database.
+  transport, server-side release cannot be confirmed. A worker terminated while one of its
+  IndexedDB transactions is still queued behind another can leave WebKit holding that
+  transaction, even after its tab reloads, and every transaction that overlaps it — in new
+  connections and other tabs too — blocks meanwhile. The engine bounds that wait and throws
+  `StorageUnresponsiveError` after thirty seconds of total storage silence, from `open` and
+  `ready()` too; the remedy is to close the site's tabs and open it again, not `reopen()`, which
+  opens the same wedged database.
 - OPFS deletion requires Web Locks and all connections closed. `OpfsDatabaseInUseError` refuses
   deletion while a current client is open; a client just closed is waited for, not refused. Close
   pre-0.9.0 clients too: they do not participate in the deletion lock protocol.

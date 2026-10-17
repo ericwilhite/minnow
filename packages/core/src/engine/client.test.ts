@@ -1922,6 +1922,34 @@ describe("MinnowDatabaseClient", () => {
     await expect(client.listTables()).rejects.toThrow(refusal);
   });
 
+  it("reports progress while the store opens, so a store that never answers names itself", async () => {
+    // IndexedDB answers nothing while another connection's stuck transaction blocks the open's
+    // first read; the store's own deadline then fails the open. The worker is alive meanwhile,
+    // so a client deadline no longer than the store's must not call it dead first.
+    vi.useFakeTimers();
+    try {
+      const { clientSide, workerSide } = createBoundary();
+      attachWorkerHost(workerSide, async () => {
+        await new Promise((resolve) => setTimeout(resolve, 31_000));
+        throw new storageTypes.StorageUnresponsiveError("indexeddb", "wedged", 30_000);
+      });
+      const client = new MinnowDatabaseClient(clientSide, {
+        store: { kind: "indexeddb", name: "wedged" },
+        requestTimeoutMs: 30_000,
+      });
+      const ready = client.ready().catch((error: unknown) => error);
+      // Pipelined behind init, as a caller that never awaits ready() issues it.
+      const pipelined = client.listTables().catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(31_000);
+      const failure = await ready;
+      expect(failure).toBeInstanceOf(storageTypes.StorageUnresponsiveError);
+      expect(failure).toMatchObject({ databaseName: "wedged", waitedMs: 30_000 });
+      expect(await pipelined).toBeInstanceOf(storageTypes.StorageUnresponsiveError);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("a per-store worker opens the store kind it bundles", async () => {
     const indexedDb = createBoundary();
     attachWorkerHost(indexedDb.workerSide, indexedDbWorkerStore, { indexedDB: new IDBFactory() });

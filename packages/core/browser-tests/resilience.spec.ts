@@ -109,7 +109,28 @@ for (const kind of ["indexeddb", "opfs"] as const) {
       const scenario = (await import(url)) as typeof import("../browser/resilience.js");
       return scenario.killDuringLoad();
     });
-    await open(first);
+    const reopenFailure = await open(first).then(
+      () => undefined,
+      (error: unknown) => (error instanceof Error ? error : new Error(String(error))),
+    );
+    if (reopenFailure !== undefined) {
+      // WebKit can keep a transaction the terminated worker still had queued registered — in
+      // this test, background reads queued behind the worker's own commit — and it then blocks
+      // this reopen's first read until the tab that ran the worker closes. The store reports
+      // that as StorageUnresponsiveError, the browser wedge the interaction spec's crash
+      // campaign also accepts. Accepted only here: WebKit, IndexedDB, the reopen right after the
+      // injected crash, and only that error. Anything else fails.
+      const wedged =
+        browserName === "webkit" &&
+        kind === "indexeddb" &&
+        reopenFailure.message.includes("StorageUnresponsiveError");
+      if (!wedged) throw reopenFailure;
+      test.info().annotations.push({
+        type: "accepted WebKit IndexedDB wedge",
+        description: reopenFailure.message,
+      });
+      return;
+    }
     const recovered = await counts();
     expect(Number(recovered.sales)).toBeGreaterThanOrEqual(acknowledged + 1);
     expect(Number(recovered.sales)).toBeLessThanOrEqual(acknowledged + 2);
@@ -139,6 +160,60 @@ for (const kind of ["indexeddb", "opfs"] as const) {
     );
   });
 }
+
+test("indexeddb: an open stalled behind a stuck transaction fails as unresponsive", async ({
+  storageContext,
+}) => {
+  // A transaction the browser never finishes — WebKit can leave one behind a terminated
+  // worker — blocks the open's first read. The worker is alive and keeps reporting, so the
+  // client waits for the store's own deadline and reports StorageUnresponsiveError, whose
+  // remedy is to close the site's tabs, rather than a generic worker timeout.
+  const holder = await storageContext.newPage();
+  const opener = await storageContext.newPage();
+  const name = `unresponsive-open-${crypto.randomUUID()}`;
+  await Promise.all([
+    holder.goto("/packages/core/browser/"),
+    opener.goto("/packages/core/browser/"),
+  ]);
+  await opener.evaluate(async (name) => {
+    const url = "/packages/core/browser/resilience.ts";
+    const scenario = (await import(url)) as typeof import("../browser/resilience.js");
+    await scenario.open(name, "indexeddb");
+    await scenario.initialize();
+    await scenario.close();
+  }, name);
+  await holder.evaluate(async (name) => {
+    const url = "/packages/core/browser/resilience.ts";
+    const scenario = (await import(url)) as typeof import("../browser/resilience.js");
+    await scenario.holdDatabase(name);
+  }, name);
+  try {
+    const outcome = await opener.evaluate(async (name) => {
+      const url = "/packages/core/browser/resilience.ts";
+      const scenario = (await import(url)) as typeof import("../browser/resilience.js");
+      return scenario.openWhileHeld(name);
+    }, name);
+    expect(outcome.name).toBe("StorageUnresponsiveError");
+    expect(outcome.message).toContain("close the site's tabs");
+  } finally {
+    await holder.evaluate(async () => {
+      const url = "/packages/core/browser/resilience.ts";
+      const scenario = (await import(url)) as typeof import("../browser/resilience.js");
+      await scenario.releaseDatabase();
+    });
+  }
+  // Released, the same database opens and reads normally.
+  expect(
+    await opener.evaluate(async (name) => {
+      const url = "/packages/core/browser/resilience.ts";
+      const scenario = (await import(url)) as typeof import("../browser/resilience.js");
+      await scenario.open(name, "indexeddb");
+      const stock = await scenario.readStock();
+      await scenario.close();
+      return stock;
+    }, name),
+  ).toEqual([{ qty: 1000 }]);
+});
 
 for (const kind of ["indexeddb", "opfs"] as const) {
   test(`strict ${kind}: reconciles a stable sale ID before and after a lost commit reply`, async ({

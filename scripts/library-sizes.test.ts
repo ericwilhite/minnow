@@ -42,10 +42,11 @@ describe("compressed download budgets", () => {
     // 521.1 KiB; with the V8 JSON key guard, 522.3 KiB; with shared engine helpers and droppable
     // storage-limit literals, 521.1 KiB; with PostgreSQL datetime and interval text, 524.3 KiB;
     // with UNIQUE builds under writes, 525.0 KiB; with the single-row write paths and delta
-    // merges, 532.3 KiB.
+    // merges, 532.3 KiB; with the OPFS marker lock and worker progress reports while the store
+    // opens, 534.0 KiB.
     expect(
       worker.totalGzipBytes + client.totalGzipBytes,
       "worker plus client gzip bytes",
-    ).toBeLessThanOrEqual(534 * 1024);
+    ).toBeLessThanOrEqual(535 * 1024);
   });
 });
