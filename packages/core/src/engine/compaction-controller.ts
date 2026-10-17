@@ -17,8 +17,9 @@ interface CompactionPorts {
   enabled: boolean;
   maximumLevelZeroSegments: number;
   dropping: (id: string) => boolean;
-  run: (table: TableRecord) => Promise<boolean>;
-  check: (id: string) => Promise<void>;
+  /** `idle`: the table went quiet, so deltas worth folding are folded (see the engine). */
+  run: (table: TableRecord, idle: boolean) => Promise<boolean>;
+  check: (id: string, idle: boolean) => Promise<void>;
   yield: () => Promise<void>;
   report: (error: unknown, context: string) => void;
 }
@@ -30,6 +31,12 @@ export class CompactionController {
   readonly #cancelledRuns = new WeakSet<Promise<void>>();
   readonly #continuations = new Set<Promise<void>>();
   readonly #requested = new Set<string>();
+  /**
+   * Tables that went quiet and have not yet had the run that check asked for: kept through a
+   * busy run, a backoff, or a failed attempt, so the retry folds what the quiet table holds
+   * rather than waiting for writes that may never come. A new commit clears it.
+   */
+  readonly #idlePending = new Set<string>();
   readonly #backoff = new Map<string, Backoff>();
   /** Quiet failures in a row per table, reset by any run that ends without one. */
   readonly #quietFailures = new Map<string, number>();
@@ -48,6 +55,7 @@ export class CompactionController {
     this.#quietFailures.clear();
     this.#idleTables.clear();
     this.#requested.clear();
+    this.#idlePending.clear();
     this.#commits.clear();
   }
   async drain(): Promise<void> {
@@ -62,6 +70,7 @@ export class CompactionController {
     this.#idleTables.delete(id);
     this.#commits.delete(id);
     this.#requested.delete(id);
+    this.#idlePending.delete(id);
   }
   retryPending(id: string): boolean {
     return this.#backoff.get(id)?.retryTimer !== undefined;
@@ -78,18 +87,21 @@ export class CompactionController {
       () => this.#continuations.delete(run),
     );
   }
-  #check(id: string): Promise<void> {
+  #check(id: string, idle = false): Promise<void> {
     if (this.#stopped) return Promise.resolve();
     return this.ports
-      .check(id)
+      .check(id, idle)
       .catch((error: unknown) => this.ports.report(error, `automatic compaction check for ${id}`));
   }
-  schedule(table: TableRecord, visible: number): void {
+  schedule(table: TableRecord, visible: number, idle = false): void {
     if (this.#stopped || !this.ports.enabled || this.ports.dropping(table.id)) return;
+    if (idle) this.#idlePending.add(table.id);
+    const quiet = this.#idlePending.has(table.id);
     const backoff = this.#backoff.get(table.id);
+    // A declined fold waits for the table to grow; a quiet table's fold is another question.
     if (
       backoff !== undefined &&
-      (backoff.retryTimer !== undefined || visible < backoff.minimumSegments)
+      (backoff.retryTimer !== undefined || (!quiet && visible < backoff.minimumSegments))
     )
       return;
     if (this.#runs.has(table.id)) {
@@ -97,9 +109,10 @@ export class CompactionController {
       return;
     }
     const run = this.ports
-      .run(table)
+      .run(table, quiet)
       .then((folded) => {
         if (this.#cancelledRuns.has(run)) return;
+        if (quiet) this.#idlePending.delete(table.id);
         this.#quietFailures.delete(table.id);
         if (folded) this.#clearBackoff(table.id);
         else this.backOff(table.id, visible);
@@ -130,7 +143,7 @@ export class CompactionController {
           this.#track(
             this.ports
               .yield()
-              .then(() => this.#check(table.id))
+              .then(() => this.#check(table.id, this.#idlePending.has(table.id)))
               .catch((error: unknown) =>
                 this.ports.report(error, `automatic compaction continuation for ${table.name}`),
               ),
@@ -155,7 +168,7 @@ export class CompactionController {
       () => {
         const entry = this.#backoff.get(id);
         if (entry?.retryTimer === timer) entry.retryTimer = undefined;
-        this.#track(this.#check(id));
+        this.#track(this.#check(id, this.#idlePending.has(id)));
       },
       Math.min(60_000, 250 * 2 ** Math.min(16, failures - 1)),
     );
@@ -172,6 +185,7 @@ export class CompactionController {
   committed(ids: readonly string[]): void {
     if (this.#stopped || !this.ports.enabled) return;
     for (const id of ids) {
+      this.#idlePending.delete(id);
       this.#idleTables.add(id);
       const commits = (this.#commits.get(id) ?? 0) + 1;
       if (commits < 8) this.#commits.set(id, commits);
@@ -188,7 +202,7 @@ export class CompactionController {
       this.#idleTables.clear();
       for (const id of ids) {
         this.#commits.delete(id);
-        this.#track(this.#check(id));
+        this.#track(this.#check(id, true));
       }
     }, 25);
     (this.#idleTimer as { unref?: () => void }).unref?.();

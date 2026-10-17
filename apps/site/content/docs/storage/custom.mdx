@@ -48,6 +48,13 @@ rejects has not. `commitTransaction` is the heart of the interface: it checks th
 the new version, finishes its segments, updates keys and full-text data, and marks the transaction
 complete in one saved step. A crash cannot leave half of that change visible.
 
+A data commit's level-zero segments take the order of the version that publishes them. A
+compaction commit's segments keep the order the job planned: a delta merge publishes level-zero
+segments under the order of the run of deltas they replace. The level-zero ceiling a commit
+enforces counts what the table holds once the commit lands, so the sources a delta merge retires
+— its plan's `sourceSegments` — are taken off before its outputs are added. `RecordCore` does
+both, and the conformance kit checks both.
+
 OPFS follower RPC has one explicit transport-loss exception. `OpfsUncertainOutcomeError` means a
 leader vanished after receiving the named mutation, its reply was lost, and the log the next
 leader recovered can neither answer the re-sent request nor prove it never ran: the request was

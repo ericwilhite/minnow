@@ -40,6 +40,12 @@ function loadFixtures(): Fixture[] {
 
 const fixtures = loadFixtures();
 const FIRST_STABLE_OPFS_LAYOUT_VERSION = FIRST_SUPPORTED_OPFS_LAYOUT;
+/**
+ * Layouts no published package ever wrote, so no released writer can freeze a fixture for them.
+ * Layout 11 existed only in development builds: 0.16.0 shipped layout 12. Its marker step is
+ * covered over a synthesized layout-11 marker in marker-upgrade.test.ts.
+ */
+const NEVER_RELEASED_OPFS_LAYOUTS: readonly number[] = [11];
 const currentPackageVersion = (
   JSON.parse(readFileSync(new URL("../../../package.json", import.meta.url), "utf8")) as {
     version: string;
@@ -93,10 +99,12 @@ describe("frozen native OPFS layout", () => {
     );
   });
   it("retains exactly one fixture for every locked layout", () => {
+    // Every released layout, and the one this build writes, must have a fixture.
+    expect(NEVER_RELEASED_OPFS_LAYOUTS).not.toContain(OPFS_LAYOUT_VERSION);
     const expectedVersions = Array.from(
       { length: OPFS_LAYOUT_VERSION - FIRST_STABLE_OPFS_LAYOUT_VERSION + 1 },
       (_, index) => FIRST_STABLE_OPFS_LAYOUT_VERSION + index,
-    );
+    ).filter((version) => !NEVER_RELEASED_OPFS_LAYOUTS.includes(version));
     expect(
       fixtures
         .map(({ fixture }) => fixture.layoutFormatVersion)

@@ -26,6 +26,12 @@ import {
 export type { ColumnDefinition } from "./catalog-mutations.js";
 export type { CreateTableInput } from "./catalog-mutations.js";
 import { CompactionController, QUIET_COMPACTION_FAILURE_LIMIT } from "./compaction-controller.js";
+import {
+  deltaMergeBlockRows,
+  encodeDeltaMergeOutputs,
+  resolveDeltaMerge,
+  type DeltaMergeSourceRows,
+} from "./delta-merge.js";
 import { BackgroundDiagnostics, isLivePostingBuildRefusal } from "./background-diagnostics.js";
 import { CollectionController } from "./collection-controller.js";
 import { databaseInternals } from "./internals.js";
@@ -172,12 +178,18 @@ import {
   CompactionBacklogError,
   compactionOutputSegmentIds,
   compactionPlanMatchesTableSchema,
+  deltaMergeOutputBlockIds,
+  deltaMergeOutputSegments,
+  MAX_DELTA_MERGE_SOURCE_ENCODED_BYTES,
+  MAX_DELTA_MERGE_SOURCE_ROWS,
+  type DeltaMergeCompactionRewritePlan,
   type CompactionJobRecord,
   type CompactionJobState,
   GarbageCollectionJobConflictError,
   type GarbageCollectionJobRecord,
   type GarbageCollectionJobState,
   type CatalogProbe,
+  type Manifest,
   type ManifestSummary,
   type MergeCompactionOutputColumn,
   type MergeCompactionPlannedColumn,
@@ -572,6 +584,21 @@ function visibleSegmentsMemoKey(tableId: string, version: number | null): string
   return `${tableId}\u0000${String(version ?? -1)}`;
 }
 
+/**
+ * Whether collection discovery must walk a transaction's journaled artifacts before deciding it:
+ * an aborted one, or an active one whose lease has lapsed and that discovery will abort.
+ */
+function transactionNeedsArtifactWalk(
+  transaction: TransactionRecord,
+  leaseCutoff: string,
+): boolean {
+  return (
+    transaction.status === "aborted" ||
+    (transaction.status === "active" &&
+      Date.parse(transaction.expiresAt) <= Date.parse(leaseCutoff))
+  );
+}
+
 /** A `COUNT(*)` answer over the rows a point or index read matched. */
 /** The order a plan's sources are joined in, as one comparable value. */
 function joinOrderKey(plan: CompiledQuery): string {
@@ -811,6 +838,34 @@ const AUTO_COMPACT_DELTA_SEGMENTS = 32;
  */
 const AUTO_COMPACT_DELTA_MIN_ROWS = 4_096;
 /**
+ * Level-zero segments an automatic delta merge needs before it is worth a step: below it the
+ * merge saves too little to beat folding the deltas outright.
+ */
+const DELTA_MERGE_MINIMUM_SOURCES = 8;
+/**
+ * Size tiers for delta merges, read from the run's newest end: an older commit holding more
+ * than `DELTA_MERGE_SMALL_ROWS` rows and more than this many times the rows already selected
+ * stays out, so a large merged delta is not rewritten to absorb a few small new ones. Each
+ * merged delta is at least this factor larger than the next, which keeps them few.
+ */
+const DELTA_MERGE_TIER_RATIO = 4;
+const DELTA_MERGE_SMALL_ROWS = 256;
+/**
+ * The share of the folded rows that deltas may hold, and the rows they may always hold, before
+ * an automatic step folds them into the partitions instead of merging them among themselves
+ * (`deltaMergeFoldRows`).
+ */
+const DELTA_MERGE_FOLD_FRACTION = 64;
+const DELTA_MERGE_FOLD_MIN_ROWS = 1_024;
+/**
+ * Delta rows at which a table that goes quiet folds them into its partitions
+ * (`idleFoldDueHint`): at least this many, and at least this share of the folded rows. Fewer
+ * stay until more writes come: a trickle of single-row writes is not worth a fold each, and a
+ * few patched rows in a thousand cost a scan little.
+ */
+const IDLE_FOLD_DELTA_ROWS = 256;
+const IDLE_FOLD_FRACTION = 512;
+/**
  * Manifest versions background collection leaves readable behind the current one, and how
  * old one may be before it is collected regardless. A version is kept only while both hold: the
  * count serves a reader that names a version it was just handed, the age keeps a burst of
@@ -830,6 +885,8 @@ const AUTO_COMPACTION_RECONCILE_RECORDS = 8;
 /** Finished job records of each kind a background run leaves for inspection. */
 const AUTO_COLLECT_RETAINED_JOB_RECORDS = 8;
 const MAINTENANCE_JOB_PAGE_SIZE = 64;
+/** Ordered manifest pages collection reads to decide a page of transactions before point reads. */
+const MANIFEST_LOOKUP_PAGES = 16;
 const CATALOG_SEGMENT_READ_CONCURRENCY = 8;
 /** Nested SQL savepoints and their total cloned transaction state are both hard bounded. */
 export const MAX_TRANSACTION_SAVEPOINTS = 64;
@@ -868,6 +925,19 @@ const AUTOMATIC_COMPACTION_STEP: CompactTableStepOptions = Object.freeze({
   maxLevel0Segments: AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS,
 });
 /**
+ * The options of an automatic step taken because a table went quiet with deltas worth folding
+ * (`idleFoldDueHint`): an automatic step in every other respect, it folds into the partitions
+ * rather than merging deltas among themselves, and folds a lone delta too.
+ */
+const AUTOMATIC_IDLE_FOLD_STEP: CompactTableStepOptions = Object.freeze({
+  maxBlocks: AUTO_COMPACT_STEP_BLOCKS,
+  maxLevel0Segments: AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS,
+});
+
+function isAutomaticCompactionStep(options: CompactTableOptions): boolean {
+  return options === AUTOMATIC_COMPACTION_STEP || options === AUTOMATIC_IDLE_FOLD_STEP;
+}
+/**
  * Step options of a `compactTable` call that named no memory budget: planning fits such a fold
  * to the default budget, as it fits an automatic one, instead of refusing it.
  */
@@ -888,6 +958,8 @@ const MAX_COMPACTION_PUBLICATION_CONFLICTS = 64;
 
 /** Modeled retained bytes for one cached block description (header metadata, no payload). */
 const ZONE_DESCRIPTION_CACHE_BYTES = 160;
+/** Rows up to which a block this engine writes is also kept decoded, for reads of it soon after. */
+const WRITTEN_BLOCK_DECODE_ROWS = 256;
 
 /** Overlay logical order for a write scope's staged segments: after all committed data. */
 const STAGED_OVERLAY_ORDER_BASE = 2 ** 52;
@@ -1149,6 +1221,8 @@ interface AutoCompactionHint {
   readonly deltaRows: number;
   /** Rows the base and insert segments carry: the data the deltas overlay. */
   readonly baseRows: number;
+  /** Rows of the partitions compaction published (level one and above). */
+  readonly foldedRows: number;
 }
 
 interface ZonePredicate {
@@ -2934,8 +3008,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       enabled: this.#autoCompact,
       maximumLevelZeroSegments: AUTO_COMPACT_MAX_LEVEL_ZERO_SEGMENTS,
       dropping: (id) => this.#catalogMutations.droppingTables.has(id),
-      run: (table) => this.#runAutoCompaction(table),
-      check: (id) => this.#checkAutoCompaction(id),
+      run: (table, idle) => this.#runAutoCompaction(table, idle),
+      check: (id, idle) => this.#checkAutoCompaction(id, idle),
       yield: () => this.#yieldMaintenance(),
       report: (error, context) => this.#reportBackgroundError(error, context),
     });
@@ -2944,6 +3018,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       cancelCrossContextWaits: (reason) => {
         this.#admissions.cancelCrossContextWaits(reason);
       },
+      automaticCompactionStep: (tableName) =>
+        this.#compactTableStep(tableName, AUTOMATIC_COMPACTION_STEP),
     });
   }
 
@@ -9113,11 +9189,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const windowSegments: SegmentRecord[] = [];
       const coveredVersions = new Set<number>();
       const windowVersions = new Map<string, number>();
+      const changed = context.changedVersions.get(tableId);
       for (const segment of segments) {
         const committed = transactions.get(segment.transactionId)?.committedVersion ?? null;
         if (committed === null || committed <= (context.after ?? -1) || committed > context.until) {
           continue;
         }
+        // A version that changed no row of the table is a compaction, whose segments hold the
+        // same data in another layout: a merged delta is no more a change than a folded base.
+        if (changed?.has(committed) !== true) continue;
         coveredVersions.add(committed);
         windowVersions.set(segment.id, committed);
         windowSegments.push(segment);
@@ -9177,12 +9257,21 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     this.#maybeScheduleAutoCompactionFromHint(table, autoCompactionHint(null, segments));
   }
 
-  #maybeScheduleAutoCompactionFromHint(table: TableRecord, hint: AutoCompactionHint): void {
+  #maybeScheduleAutoCompactionFromHint(
+    table: TableRecord,
+    hint: AutoCompactionHint,
+    idle = false,
+  ): void {
     if (this.#closed) return;
     if (!this.#autoCompact) return;
     if (this.#catalogMutations.droppingTables.has(table.id)) return;
-    if (!autoCompactionDueHint(hint, this.#queryExecutionMemoryBudgetBytes)) return;
-    this.#compaction.schedule(table, hint.visible);
+    if (
+      !autoCompactionDueHint(hint, this.#queryExecutionMemoryBudgetBytes) &&
+      !(idle && idleFoldDueHint(hint))
+    ) {
+      return;
+    }
+    this.#compaction.schedule(table, hint.visible, idle);
   }
 
   /**
@@ -9264,8 +9353,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * (an unsupported layout, keys living in published partitions) must not be re-planned on
    * every trigger, so the caller backs it off as it would a failure.
    */
-  async #runAutoCompaction(table: TableRecord): Promise<boolean> {
-    const options = AUTOMATIC_COMPACTION_STEP;
+  async #runAutoCompaction(table: TableRecord, idle = false): Promise<boolean> {
+    // A quiet table with nothing else due folds its deltas into the partitions; otherwise the
+    // step does what the due rule asked for, and the quiet fold follows if it is still due.
+    let options =
+      idle &&
+      !autoCompactionDue(
+        await this.#currentVisibleSegments(table),
+        this.#queryExecutionMemoryBudgetBytes,
+      )
+        ? AUTOMATIC_IDLE_FOLD_STEP
+        : AUTOMATIC_COMPACTION_STEP;
     let folded = false;
     let planningConflicts = 0;
     for (;;) {
@@ -9309,13 +9407,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       this.#collection.schedule();
       await this.#yieldMaintenance();
       const current = await this.store.getTable(table.id);
-      if (
-        current === undefined ||
-        !autoCompactionDue(
-          await this.#currentVisibleSegments(current),
-          this.#queryExecutionMemoryBudgetBytes,
-        )
-      ) {
+      if (current === undefined) return folded;
+      const segments = await this.#currentVisibleSegments(current);
+      if (autoCompactionDue(segments, this.#queryExecutionMemoryBudgetBytes)) {
+        options = AUTOMATIC_COMPACTION_STEP;
+      } else if (idle && idleFoldDueHint(autoCompactionHint(null, segments))) {
+        options = AUTOMATIC_IDLE_FOLD_STEP;
+      } else {
         return folded;
       }
     }
@@ -9544,6 +9642,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         deltas: hint.deltas + contribution.deltas,
         deltaRows: hint.deltaRows + contribution.deltaRows,
         baseRows: hint.baseRows + contribution.baseRows,
+        foldedRows: hint.foldedRows + contribution.foldedRows,
       });
     }
   }
@@ -9555,17 +9654,21 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * once. Background maintenance never surfaces through a write; a failed check waits for the
    * next one.
    */
-  async #checkAutoCompaction(tableId: string): Promise<void> {
+  async #checkAutoCompaction(tableId: string, idle = false): Promise<void> {
     try {
       const table = await this.store.getTable(tableId);
       if (table === undefined) return;
       const version = await this.store.getCurrentManifestVersion();
       const hint = this.#autoCompactionHints.get(tableId);
       if (hint?.version === version) {
-        this.#maybeScheduleAutoCompactionFromHint(table, hint);
+        this.#maybeScheduleAutoCompactionFromHint(table, hint, idle);
         return;
       }
-      this.#maybeScheduleAutoCompaction(table, await this.#currentVisibleSegments(table));
+      this.#maybeScheduleAutoCompactionFromHint(
+        table,
+        autoCompactionHint(null, await this.#currentVisibleSegments(table)),
+        idle,
+      );
     } catch (error) {
       this.#reportBackgroundError(error, `automatic compaction check for ${tableId}`);
     }
@@ -12399,7 +12502,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const columns = [keyColumn, ...changedColumns.map((name) => findColumn(table, name))];
     const segmentId = this.#createId();
     const columnBlockIds: Record<string, string[]> = {};
-    const blockStager = new BoundedWriteBlockStager(transaction, this.#rememberWrittenBlock);
+    const blockStager = new BoundedWriteBlockStager(transaction, this.#rememberWrittenDeltaBlock);
     const plannedColumns = columns.map((column) =>
       writeColumnValues(
         column.type,
@@ -12468,7 +12571,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   ): Promise<string> {
     const segmentId = this.#createId();
     const blockIds: string[] = [];
-    const blockStager = new BoundedWriteBlockStager(transaction, this.#rememberWrittenBlock);
+    const blockStager = new BoundedWriteBlockStager(transaction, this.#rememberWrittenDeltaBlock);
     const plannedColumn = writeColumnValues(keyColumn.type, values);
     const ranges = await writeBlockRangesSliced(
       [plannedColumn],
@@ -17401,8 +17504,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             throw new Error(`Column row count mismatch: ${state.column.name}`);
           }
           const replacements: QueryMemoryReservation[] = [];
+          // A window that lost no row keeps every row in place, so a column no patch of the
+          // window writes is exactly the inner rows: a view, not a copy. An update overlay
+          // touching a few rows of every window otherwise copied every projected column whole.
+          const unchanged = deadInWindow === 0 && resolvedPatches?.[position] === undefined;
+          if (runs !== undefined && !unchanged) overlayReplayTestHooks.compactedColumns += 1;
           const fields =
-            runs === undefined
+            runs === undefined || unchanged
               ? overlayWindowView(innerVector, offset, liveRows, memory, state.column, replacements)
               : overlayWindowCompacted(
                   innerVector,
@@ -19602,6 +19710,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             .filter((owner) => owner !== undefined)
             .map((owner) => [owner.id, owner]),
         );
+        // Which of the page's blocks the planning snapshot holds, asked once for the page: that
+        // manifest is immutable, so this is what one question per segment would answer, without
+        // a storage round trip per segment.
+        const pageBlockIds = [
+          ...new Set(
+            page.records.flatMap((segment) => Object.values(segment.columnBlockIds).flat()),
+          ),
+        ];
+        const presence = await this.#manifestBlockPresence(currentVersion, pageBlockIds);
+        const current = new Set(pageBlockIds.filter((_, index) => presence[index] === true));
         for (const segment of page.records) {
           const listedOwner = owners.get(segment.transactionId);
           if (
@@ -19615,10 +19733,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               updatedAt: job.leaseCutoff,
             });
           }
-          const segmentBlockIds = [...new Set(Object.values(segment.columnBlockIds).flat())];
-          const touchesCurrent = (
-            await this.#manifestBlockPresence(currentVersion, segmentBlockIds)
-          ).some(Boolean);
+          const touchesCurrent = Object.values(segment.columnBlockIds).some((ids) =>
+            ids.some((id) => current.has(id)),
+          );
           if (!touchesCurrent) addSegments([segment.id]);
           if (remaining <= 0) break;
         }
@@ -19641,12 +19758,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         let transaction: TransactionRecord | undefined;
         let blockIndex = 0;
         let segmentIndex = 0;
+        // Set when a page of transactions that need no artifact walk was visited in this step.
+        let paged = false;
         if (cursor?.family === "transaction") {
           transaction = await this.store.getTransaction(cursor.recordId);
           blockIndex = cursor.blockIndex;
           segmentIndex = cursor.segmentIndex;
         } else {
-          const page = await this.store.listTransactionPage(discovery.transactionCursor, 1);
+          const page = await this.store.listTransactionPage(
+            discovery.transactionCursor,
+            MAINTENANCE_JOB_PAGE_SIZE,
+          );
           transaction = page.records[0];
           if (transaction === undefined) {
             next = {
@@ -19656,9 +19778,58 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               artifactCursor: null,
               resumePhase: null,
             };
+          } else if (!transactionNeedsArtifactWalk(transaction, job.leaseCutoff)) {
+            // A committed or still-live transaction is decided by its manifest alone, so a run
+            // of them is one planning step: one durable update per page instead of one per
+            // record, which made every collection cycle a storage write per transaction the
+            // database retains. An aborted or expired one ends the run; the single-record path
+            // below walks its artifacts with a resumable cursor exactly as before.
+            paged = true;
+            let lastVisited = discovery.transactionCursor;
+            let visited = 0;
+            const run: TransactionRecord[] = [];
+            for (const record of page.records) {
+              if (transactionNeedsArtifactWalk(record, job.leaseCutoff)) break;
+              run.push(record);
+            }
+            const manifests = await this.#manifestsForVersions(
+              run.flatMap((record) =>
+                record.status === "committed" && record.committedVersion !== null
+                  ? [record.committedVersion]
+                  : [],
+              ),
+            );
+            for (const record of run) {
+              if (remaining <= 0) break;
+              visited += 1;
+              lastVisited = record.id;
+              if (record.status !== "committed" || record.committedVersion === null) continue;
+              const version = record.committedVersion;
+              const manifest = manifests.get(version);
+              if (
+                manifest === undefined ||
+                manifest.prunedAt !== undefined ||
+                job.candidateManifestVersions.includes(version) ||
+                appendManifestVersions.includes(version)
+              ) {
+                addTransactions([record.id]);
+              }
+            }
+            const filled = remaining <= 0;
+            next = {
+              ...next,
+              phase: filled ? "complete" : "transactions",
+              resumePhase: filled ? "transactions" : null,
+              transactionCursor: lastVisited,
+              artifactCursor: null,
+              visitedRecords: safeWholeNumberSum(
+                [discovery.visitedRecords, visited],
+                "Garbage collection discovery records",
+              ),
+            };
           }
         }
-        if (transaction !== undefined) {
+        if (!paged && transaction !== undefined) {
           if (
             transaction.status === "active" &&
             Date.parse(transaction.expiresAt) <= Date.parse(job.leaseCutoff)
@@ -19729,7 +19900,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               "Garbage collection discovery records",
             ),
           };
-        } else if (cursor?.family === "transaction") {
+        } else if (!paged && cursor?.family === "transaction") {
           next = {
             ...next,
             transactionCursor: cursor.recordId,
@@ -19865,6 +20036,45 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         job = latest;
       }
     }
+  }
+
+  /**
+   * The manifest records of some versions, absent where none exists. Read as a few ordered pages
+   * across the versions' range rather than one point read each: collection decides a page of
+   * transactions by their manifests, and the records it retains span only a little history.
+   * Versions past what a bounded number of pages reach fall back to point reads.
+   */
+  async #manifestsForVersions(versions: readonly number[]): Promise<Map<number, Manifest>> {
+    const found = new Map<number, Manifest>();
+    const wanted = [...new Set(versions)].sort((left, right) => left - right);
+    const first = wanted[0];
+    const last = wanted.at(-1);
+    if (first === undefined || last === undefined) return found;
+    // Every version at or below this one was decided by the listing: absent means no record.
+    let listedThrough = -1;
+    // Manifest records are dense in version, so the range bounds the pages a listing costs. List
+    // only when that is fewer reads than one per version.
+    const pages = Math.ceil((last - first + 1) / MAINTENANCE_JOB_PAGE_SIZE);
+    if (pages < wanted.length && pages <= MANIFEST_LOOKUP_PAGES) {
+      let after: number | null = first > 0 ? first - 1 : null;
+      for (let read = 0; read < MANIFEST_LOOKUP_PAGES; read += 1) {
+        const page = await this.store.listManifestPage(after, MAINTENANCE_JOB_PAGE_SIZE);
+        for (const manifest of page.records) found.set(manifest.version, manifest);
+        if (page.nextCursor === null) {
+          listedThrough = Number.POSITIVE_INFINITY;
+          break;
+        }
+        listedThrough = page.nextCursor;
+        if (listedThrough >= last) break;
+        after = page.nextCursor;
+      }
+    }
+    for (const version of wanted) {
+      if (version <= listedThrough) continue;
+      const manifest = await this.store.getManifest(version);
+      if (manifest !== undefined) found.set(version, manifest);
+    }
+    return found;
   }
 
   async #existingGarbageBlockCandidatesFrom(
@@ -20093,7 +20303,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       // would otherwise ever fold it, leaving every read to replay it.
       const lone = level0Segments[0];
       if (
-        options === AUTOMATIC_COMPACTION_STEP &&
+        isAutomaticCompactionStep(options) &&
         layout.partitions.length > 0 &&
         level0Segments.length === 1 &&
         lone !== undefined &&
@@ -20174,7 +20384,25 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       );
     }
     if (version === null) throw new Error("Visible compaction segments require a manifest");
-    const automatic = options === AUTOMATIC_COMPACTION_STEP;
+    const automatic = isAutomaticCompactionStep(options);
+    // Over folded partitions, an automatic step first tries to merge the deltas among
+    // themselves: that costs what they hold, where a fold rewrites every partition they touch.
+    if (
+      options === AUTOMATIC_COMPACTION_STEP &&
+      keyedLevelOne !== undefined &&
+      keyedLevelOne.partitions.length > 0
+    ) {
+      const merge = await this.#planDeltaMerge(
+        table,
+        version,
+        snapshot,
+        visibleSegments,
+        level0Segments,
+        maxLevel0Segments,
+        admission,
+      );
+      if (merge !== undefined) return merge;
+    }
     // Rewrite planning for one level-zero selection under one memory budget: the sources it
     // folds and the plan that folds them, or why the selection cannot be folded.
     const planRewrite = async (level0Selection: LevelZeroSelection, budgetBytes: number) => {
@@ -20510,8 +20738,24 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       updatedAt: timestamp,
     };
     await snapshot.renew(INTERNAL_READ_LEASE_TTL_MS);
-    // Planning stays outside the writer turn. Registration shares the short publication turn
-    // with DDL and other planners, so a dropped table or competing job is observed before create.
+    return this.#registerCompactionJob(table, job, version, admission, () => {
+      if (resolution !== undefined) this.#rememberMergeResolution(job.id, resolution);
+    });
+  }
+
+  /**
+   * Creates a planned job unless the table already has an active one, which is returned
+   * instead. Planning stays outside the writer turn. Registration shares the short publication
+   * turn with DDL and other planners, so a dropped table or competing job is observed before
+   * create, and a manifest that moved since planning must leave the plan's order intact.
+   */
+  async #registerCompactionJob(
+    table: TableRecord,
+    job: CompactionJobRecord,
+    version: number,
+    admission: WriterAdmission | undefined,
+    created?: () => void,
+  ): Promise<CompactionJobRecord> {
     const register = async (): Promise<CompactionJobRecord> => {
       if ((await this.store.getTable(table.id)) === undefined)
         throw new UnknownTableError(table.name);
@@ -20523,11 +20767,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
       try {
         await this.store.createCompactionJob(job);
-        if (resolution !== undefined) this.#rememberMergeResolution(job.id, resolution);
+        created?.();
         return job;
       } catch (error) {
         if (!(error instanceof CompactionJobConflictError)) throw error;
-        const raced = await this.store.getCompactionJob(id);
+        const raced = await this.store.getCompactionJob(job.id);
         if (raced !== undefined) return raced;
         const active = await this.#findActiveCompactionJob(table.id);
         if (active !== undefined) return active;
@@ -20535,6 +20779,420 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
     };
     return admission === undefined ? this.#admissions.publish(register) : register();
+  }
+
+  /**
+   * Plans a delta merge for an automatic step, or declines so the step folds instead.
+   *
+   * The sources are a run of whole commits holding only updates and deletes, contiguous in the
+   * table's visible order: the run with the most segments, cut from its newest end so a large
+   * older delta is not rewritten to absorb a few small new ones (size tiers, as a log-structured
+   * merge keeps them). The merge is declined — and the step folds — when the merged delta would
+   * hold enough rows that replaying it costs more than folding it would (`deltaMergeFoldRows`),
+   * when no run has `DELTA_MERGE_MINIMUM_SOURCES` segments, or when merging would not leave
+   * fewer segments than it read.
+   */
+  async #planDeltaMerge(
+    table: TableRecord,
+    version: number,
+    snapshot: LeasedSnapshot,
+    visibleSegments: readonly SegmentRecord[],
+    level0Segments: readonly SegmentRecord[],
+    maxSources: number,
+    admission: WriterAdmission | undefined,
+  ): Promise<CompactionJobRecord | undefined> {
+    const keyColumn = getUniqueKeyColumn(table);
+    if (keyColumn === undefined) return undefined;
+    const hint = autoCompactionHint(null, visibleSegments);
+    const columnIds = new Set(table.columns.map((column) => column.id));
+    const mergeable = (segment: SegmentRecord): boolean => {
+      if (segment.kind !== "update" && segment.kind !== "delete") return false;
+      if (segment.keyColumnId !== keyColumn.id || segment.rowCount === 0) return false;
+      const ids = Object.keys(segment.columnBlockIds);
+      if (!ids.includes(keyColumn.id) || ids.some((id) => !columnIds.has(id))) return false;
+      return segment.kind === "update" || ids.length === 1;
+    };
+    // Whole commits, in visible order, and the runs of consecutive mergeable ones.
+    const runs: SegmentRecord[][][] = [];
+    let current: SegmentRecord[][] = [];
+    for (let start = 0; start < level0Segments.length;) {
+      const order = level0Segments[start]?.logicalOrder;
+      let end = start + 1;
+      while (end < level0Segments.length && level0Segments[end]?.logicalOrder === order) end += 1;
+      const group = level0Segments.slice(start, end);
+      if (group.every(mergeable)) current.push(group);
+      else if (current.length > 0) {
+        runs.push(current);
+        current = [];
+      }
+      start = end;
+    }
+    if (current.length > 0) runs.push(current);
+    const segmentCount = (run: readonly SegmentRecord[][]): number =>
+      run.reduce((total, group) => total + group.length, 0);
+    let chosen: SegmentRecord[][] | undefined;
+    for (const run of runs) {
+      if (chosen === undefined || segmentCount(run) >= segmentCount(chosen)) chosen = run;
+    }
+    if (chosen === undefined || segmentCount(chosen) < DELTA_MERGE_MINIMUM_SOURCES) {
+      return undefined;
+    }
+    const groupRows = (group: readonly SegmentRecord[]): number =>
+      group.reduce((total, segment) => total + segment.rowCount, 0);
+    const selectedGroups: SegmentRecord[][] = [];
+    let selectedRows = 0;
+    let selectedSegments = 0;
+    for (let index = chosen.length - 1; index >= 0; index -= 1) {
+      const group = chosen[index];
+      if (group === undefined) break;
+      // As many sources as a fold takes at most: a merge's commit is bounded the same way.
+      if (selectedSegments + group.length > maxSources) break;
+      const rows = groupRows(group);
+      if (
+        selectedGroups.length > 0 &&
+        rows > DELTA_MERGE_SMALL_ROWS &&
+        rows > DELTA_MERGE_TIER_RATIO * selectedRows
+      ) {
+        break;
+      }
+      if (selectedRows + rows > MAX_DELTA_MERGE_SOURCE_ROWS) break;
+      selectedGroups.unshift(group);
+      selectedRows += rows;
+      selectedSegments += group.length;
+    }
+    // Describe the selection from its stored blocks, dropping its oldest commits until it
+    // holds no more than a merge may decode at once.
+    let selected = selectedGroups.flat();
+    if (selected.length < DELTA_MERGE_MINIMUM_SOURCES) return undefined;
+    const blockIds = selected.flatMap((segment) => Object.values(segment.columnBlockIds).flat());
+    const stored: Array<Uint8Array | undefined> = [];
+    for (let start = 0; start < blockIds.length; start += MAX_STORAGE_BULK_READ_ITEMS) {
+      await this.#renewInternalLeaseIfNeeded(snapshot);
+      stored.push(
+        ...(await this.#readBlockWindow(
+          blockIds.slice(start, start + MAX_STORAGE_BULK_READ_ITEMS),
+        )),
+      );
+    }
+    const bytesById = new Map<string, Uint8Array>();
+    let encodedBytes = 0;
+    const encodedByGroup: number[] = [];
+    for (const [index, blockId] of blockIds.entries()) {
+      const bytes = stored[index];
+      if (bytes === undefined) throw new Error(`Compaction source block is missing: ${blockId}`);
+      bytesById.set(blockId, bytes);
+    }
+    for (const group of selectedGroups) {
+      let groupBytes = 0;
+      for (const segment of group) {
+        for (const id of Object.values(segment.columnBlockIds).flat()) {
+          groupBytes += inspectBlock(bytesById.get(id) ?? new Uint8Array()).encodedLength;
+        }
+      }
+      encodedByGroup.push(groupBytes);
+      encodedBytes += groupBytes;
+    }
+    while (encodedBytes > MAX_DELTA_MERGE_SOURCE_ENCODED_BYTES && selectedGroups.length > 0) {
+      selectedGroups.shift();
+      encodedBytes -= encodedByGroup.shift() ?? 0;
+    }
+    selected = selectedGroups.flat();
+    if (selected.length < DELTA_MERGE_MINIMUM_SOURCES) return undefined;
+
+    const transactions = new Map(
+      (await this.#transactionRecordsForSegments(selected)).map((record) => [record.id, record]),
+    );
+    const describedSegments: MergeCompactionSourceSegment[] = [];
+    const sources: DeltaMergeSourceRows[] = [];
+    for (const segment of selected) {
+      const owner = transactions.get(segment.transactionId);
+      if (owner?.status !== "committed" || owner.committedVersion === null) {
+        throw await this.#compactionOwnerError(segment);
+      }
+      const columns: MergeCompactionSourceColumn[] = [];
+      const values = new Map<string, BatchValue[]>();
+      for (const column of table.columns) {
+        const ids = segment.columnBlockIds[column.id];
+        if (ids === undefined) continue;
+        const sourceBlocks: MergeCompactionSourceBlock[] = [];
+        const columnValues: BatchValue[] = [];
+        let rowStart = 0;
+        for (const blockId of ids) {
+          const bytes = bytesById.get(blockId);
+          if (bytes === undefined)
+            throw new Error(`Compaction source block is missing: ${blockId}`);
+          const decoded = await decodeBlock(bytes);
+          if (decoded.column.type !== column.type || decoded.description.rowCount === 0) {
+            throw new Error(`Compaction source block differs from table schema: ${blockId}`);
+          }
+          sourceBlocks.push({
+            blockId,
+            rowStart,
+            rowCount: decoded.description.rowCount,
+            storedBytes: bytes.byteLength,
+            encodedBytes: decoded.description.encodedLength,
+            checksum: decoded.description.checksum,
+          });
+          rowStart += decoded.description.rowCount;
+          for (const value of decoded.column.values) columnValues.push(value);
+        }
+        if (rowStart !== segment.rowCount) {
+          throw new Error(`Compaction source blocks do not cover segment ${segment.id}`);
+        }
+        columns.push({ columnId: column.id, type: column.type, sourceBlocks });
+        values.set(column.id, columnValues);
+      }
+      describedSegments.push({
+        segmentId: segment.id,
+        transactionId: segment.transactionId,
+        committedVersion: owner.committedVersion,
+        kind: segment.kind,
+        keyColumnId: keyColumn.id,
+        level: segment.level,
+        logicalOrder: segment.logicalOrder,
+        rowCount: segment.rowCount,
+        rowIdStart: segment.rowIdStart,
+        rowIdEndExclusive: segment.rowIdEndExclusive,
+        rowIdSpans: mergeSourceRowIdSpans(segment, segment.kind),
+        columns,
+      });
+      sources.push({
+        kind: segment.kind as "update" | "delete",
+        rowCount: segment.rowCount,
+        columns: values,
+      });
+    }
+    const plannedColumns: MergeCompactionPlannedColumn[] = table.columns.map((column) => ({
+      columnId: column.id,
+      type: column.type,
+    }));
+    const outputs = resolveDeltaMerge(plannedColumns, keyColumn.id, sources);
+    if (outputs.length >= selected.length) return undefined;
+    // The rows the deltas would hold once merged: a run rewriting the same keys over and over
+    // merges to a few rows, where one touching new keys every time does not. Large deltas the
+    // merge leaves alone count whole; small ones are left for the next merge to collapse, which
+    // a burst rewriting a few hot rows would otherwise overstate many times over.
+    const mergedRows = outputs.reduce((total, output) => total + output.rowCount, 0);
+    const selectedIds = new Set(selected.map((segment) => segment.id));
+    let projectedRows = mergedRows;
+    for (const segment of visibleSegments) {
+      if (selectedIds.has(segment.id) || segment.kind === "insert" || segment.kind === "base") {
+        continue;
+      }
+      if (segment.rowCount > DELTA_MERGE_SMALL_ROWS) projectedRows += segment.rowCount;
+    }
+    if (projectedRows >= deltaMergeFoldRows(hint.baseRows)) return undefined;
+    const blockRows = outputs.map((output) =>
+      deltaMergeBlockRows(output, this.#rowsPerBlock, this.#targetBlockBytes),
+    );
+    const { checksum } = encodeDeltaMergeOutputs(outputs, blockRows);
+    const last = describedSegments.at(-1);
+    if (last === undefined) return undefined;
+    const rewritePlan: DeltaMergeCompactionRewritePlan = {
+      kind: "delta-v1",
+      keyColumnId: keyColumn.id,
+      columns: plannedColumns,
+      logicalOrder: last.logicalOrder,
+      sourceSegments: describedSegments,
+      outputs: outputs.map((output, index) => ({
+        kind: output.kind,
+        columns: output.columns.map((column) => ({ columnId: column.columnId, type: column.type })),
+        rowCount: output.rowCount,
+        blockRows: blockRows[index] ?? [],
+      })),
+      resolution: { rows: mergedRows, checksum },
+    };
+    const sourceBlocks = describedSegments.flatMap((segment) =>
+      segment.columns.flatMap((column) => column.sourceBlocks),
+    );
+    const sourceStoredBytes = sourceBlocks.reduce((total, block) => total + block.storedBytes, 0);
+    const baseJobId = ["compaction", table.id, "manifest", String(version), "delta"].join("/");
+    let id = baseJobId;
+    const existing = await this.store.getCompactionJob(id);
+    if (existing !== undefined && existing.state !== "aborted" && existing.state !== "cancelled") {
+      return existing;
+    }
+    if (existing !== undefined) id = `${id}/retry/${this.#createId()}`;
+    const timestamp = dateIsoString(this.#now());
+    const job: CompactionJobRecord = {
+      id,
+      tableId: table.id,
+      sourceManifestVersion: version,
+      sourceSegmentIds: selected.map((segment) => segment.id),
+      sourceBlockIds: sourceBlocks.map((block) => block.blockId).sort(),
+      outputBlockIds: [],
+      cursor: { sourceSegmentIndex: 0, sourceBlockIndex: 0 },
+      processedRows: 0,
+      sourceStoredBytes,
+      level0SourceStoredBytes: sourceStoredBytes,
+      anchorSourceStoredBytes: 0,
+      outputStoredBytes: 0,
+      logicalBytes: sourceBlocks.reduce((total, block) => total + block.encodedBytes, 0),
+      rewritePlan,
+      outputCursor: null,
+      memoryBudgetBytes: 0,
+      minimumMemoryBytes: 0,
+      peakWorkingBytes: 0,
+      outputLogicalBytes: 0,
+      targetLevel: 0,
+      state: "planned",
+      transactionId: null,
+      outputSegmentId: outputs.length === 0 ? null : `${id}/output-segment`,
+      publishedVersion: null,
+      revision: 0,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    await snapshot.renew(INTERNAL_READ_LEASE_TTL_MS);
+    return this.#registerCompactionJob(table, job, version, admission);
+  }
+
+  /**
+   * Writes a delta merge's output blocks in one step: the merge is recomputed from its
+   * immutable sources and must reproduce the plan's outputs and checksum exactly, so a merge
+   * resumed on another connection writes the same blocks the planner described, and a block an
+   * earlier attempt left behind is kept only when it holds the same physical payload.
+   */
+  async #advanceDeltaMerge(
+    job: CompactionJobRecord,
+    transaction: DatabaseTransaction,
+    plan: DeltaMergeCompactionRewritePlan,
+  ): Promise<CompactionJobRecord> {
+    if (job.cursor.sourceSegmentIndex === job.sourceSegmentIds.length) return job;
+    const refs = plan.sourceSegments.flatMap((segment, segmentIndex) =>
+      segment.columns.flatMap((column) =>
+        column.sourceBlocks.map((source) => ({
+          blockId: source.blockId,
+          storedBytes: source.storedBytes,
+          encodedBytes: source.encodedBytes,
+          rowCount: source.rowCount,
+          segmentIndex,
+          column,
+          source,
+        })),
+      ),
+    );
+    const values = plan.sourceSegments.map(() => new Map<string, BatchValue[]>());
+    await this.#decodeCompactionBlocks(
+      refs,
+      { limitBytes: DEFAULT_COMPACTION_MEMORY_BUDGET_BYTES, retainsDecoded: true },
+      undefined,
+      async (bytes, { source, column }) => {
+        const description = inspectBlock(bytes);
+        if (
+          bytes.byteLength !== source.storedBytes ||
+          description.encodedLength !== source.encodedBytes ||
+          description.checksum !== source.checksum ||
+          description.rowCount !== source.rowCount ||
+          description.type !== column.type
+        ) {
+          throw new Error(`Compaction source block differs from its plan: ${source.blockId}`);
+        }
+        return (await decodeBlock(bytes)).column.values;
+      },
+      (decoded, { segmentIndex, column }) => {
+        const columns = values[segmentIndex];
+        if (columns === undefined) throw new Error("Delta merge source is missing");
+        let target = columns.get(column.columnId);
+        if (target === undefined) {
+          target = [];
+          columns.set(column.columnId, target);
+        }
+        for (const value of decoded) target.push(value);
+      },
+    );
+    const sources = plan.sourceSegments.map((segment, index) => ({
+      kind: segment.kind as "update" | "delete",
+      rowCount: segment.rowCount,
+      columns: values[index] ?? new Map<string, BatchValue[]>(),
+    }));
+    const outputs = resolveDeltaMerge(plan.columns, plan.keyColumnId, sources);
+    if (
+      outputs.length !== plan.outputs.length ||
+      outputs.some((output, index) => {
+        const planned = plan.outputs[index];
+        return (
+          planned?.kind !== output.kind ||
+          planned.rowCount !== output.rowCount ||
+          planned.columns.length !== output.columns.length ||
+          planned.columns.some((column, columnIndex) => {
+            const actual = output.columns[columnIndex];
+            return column.columnId !== actual?.columnId || column.type !== actual.type;
+          })
+        );
+      })
+    ) {
+      throw new CompactionReplayMismatchError(job.id);
+    }
+    const encoded = encodeDeltaMergeOutputs(
+      outputs,
+      plan.outputs.map((output) => output.blockRows),
+    );
+    if (encoded.checksum !== plan.resolution.checksum) {
+      throw new CompactionReplayMismatchError(job.id);
+    }
+    const blockIds = deltaMergeOutputBlockIds(job.id, plan);
+    if (blockIds.length !== encoded.blocks.length) throw new CompactionReplayMismatchError(job.id);
+    const existing: Array<Uint8Array | undefined> = [];
+    for (let start = 0; start < blockIds.length; start += MAX_STORAGE_BULK_READ_ITEMS) {
+      existing.push(
+        ...(await this.#readBlockWindow(
+          blockIds.slice(start, start + MAX_STORAGE_BULK_READ_ITEMS),
+        )),
+      );
+    }
+    const writes: BlockWrite[] = [];
+    const kept: string[] = [];
+    let outputStoredBytes = 0;
+    let outputLogicalBytes = 0;
+    for (const [index, block] of encoded.blocks.entries()) {
+      const blockId = blockIds[index] ?? "";
+      const output = plan.outputs[block.outputIndex];
+      const column = output?.columns[block.columnIndex];
+      if (output === undefined || column === undefined) {
+        throw new CompactionReplayMismatchError(job.id);
+      }
+      const previous = existing[index];
+      let bytes: Uint8Array;
+      if (previous === undefined) {
+        const payload = { type: block.type, rowCount: block.rowCount, bytes: block.bytes };
+        // Delete keys stay raw, as the write path stores them: a replay matches them undecoded.
+        bytes =
+          output.kind === "delete"
+            ? await encodePhysicalBlock(payload, "raw")
+            : await this.#encodePreferredBlock(
+                column.columnId,
+                this.#compression,
+                block.bytes.byteLength < GZIP_MINIMUM_INPUT_BYTES,
+                (compression) => encodePhysicalBlock(payload, compression),
+              );
+        writes.push({ id: blockId, bytes });
+      } else {
+        const decoded = await decodePhysicalBlock(previous);
+        if (
+          decoded.description.type !== block.type ||
+          decoded.description.rowCount !== block.rowCount ||
+          !sameBytes(decoded.column.bytes, block.bytes)
+        ) {
+          throw new Error(`A resumed compaction block differs: ${blockId}`);
+        }
+        bytes = previous;
+        kept.push(blockId);
+      }
+      outputStoredBytes += bytes.byteLength;
+      outputLogicalBytes += inspectBlock(bytes).encodedLength;
+    }
+    if (writes.length > 0) await transaction.stageBlocks(writes);
+    if (kept.length > 0) await transaction.stageExistingBlocks(kept);
+    return this.store.updateCompactionJob(job.id, job.revision, {
+      outputBlockIds: blockIds,
+      cursor: { sourceSegmentIndex: job.sourceSegmentIds.length, sourceBlockIndex: 0 },
+      processedRows: plan.sourceSegments.reduce((total, segment) => total + segment.rowCount, 0),
+      outputStoredBytes,
+      outputLogicalBytes,
+      updatedAt: dateIsoString(this.#now()),
+      error: null,
+    });
   }
 
   async #priorCompactionAttemptOutputStoredBytes(
@@ -21793,7 +22451,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           await transaction.stageExistingBlocks(unjournaledOutputIds);
         }
       }
-      if (rewritePlan.kind !== "copy-v1") {
+      if (rewritePlan.kind === "delta-v1") {
+        job = await this.#advanceDeltaMerge(job, transaction, rewritePlan);
+      } else if (rewritePlan.kind !== "copy-v1") {
         job = await this.#advancePhysicalCompaction(
           table,
           job,
@@ -21864,13 +22524,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
 
       const expectedOutputIds =
-        rewritePlan.kind !== "copy-v1"
-          ? physicalOutputBlockIds(job.id, rewritePlan)
-          : sourceSegments.flatMap((segment, segmentIndex) =>
-              compactionBlockEntries(table, segment, segmentIndex, job.id).map(
-                (entry) => entry.outputBlockId,
-              ),
-            );
+        rewritePlan.kind === "delta-v1"
+          ? deltaMergeOutputBlockIds(job.id, rewritePlan)
+          : rewritePlan.kind !== "copy-v1"
+            ? physicalOutputBlockIds(job.id, rewritePlan)
+            : sourceSegments.flatMap((segment, segmentIndex) =>
+                compactionBlockEntries(table, segment, segmentIndex, job.id).map(
+                  (entry) => entry.outputBlockId,
+                ),
+              );
       const pendingOutputIds = new Set(transaction.pendingBlockIds);
       const unjournaledOutputId = expectedOutputIds.find((id) => !pendingOutputIds.has(id));
       if (unjournaledOutputId !== undefined) {
@@ -21885,7 +22547,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const outputRowCount =
         rewritePlan.kind === "copy-v1"
           ? sourceSegments.reduce((total, segment) => total + segment.rowCount, 0)
-          : rewritePlan.totalRows;
+          : rewritePlan.kind === "delta-v1"
+            ? rewritePlan.resolution.rows
+            : rewritePlan.totalRows;
       if (outputRowCount === 0) {
         if (outputSegmentId !== null) {
           throw new Error("An empty compaction cannot have an output segment");
@@ -21918,7 +22582,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
                   createdAt,
                 },
               ]
-            : compactionOutputSegments(table, job, rewritePlan, transaction.id, createdAt);
+            : rewritePlan.kind === "delta-v1"
+              ? deltaMergeOutputSegments(job, rewritePlan, transaction.id).map((segment) => ({
+                  ...segment,
+                  createdAt,
+                }))
+              : compactionOutputSegments(table, job, rewritePlan, transaction.id, createdAt);
         for (const desiredOutputSegment of desiredOutputSegments) {
           await this.#stageCompactionOutputSegment(
             transaction,
@@ -22508,6 +23177,31 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       segmentCursor = page.nextCursor;
       if (segmentCursor !== null) await this.#yieldMaintenance();
     } while (segmentCursor !== null);
+    if (plan.kind === "delta-v1") {
+      // A delta merge's outputs take the run's place: every source is still visible as planned,
+      // and every other segment of the table sorts wholly before the run or wholly after it.
+      // New commits always land after; anything inside the run would be reordered by the merge.
+      const visibleById = new Map(visibleSegments.map((segment) => [segment.id, segment]));
+      for (const planned of plan.sourceSegments) {
+        const actual = visibleById.get(planned.segmentId);
+        if (actual === undefined) {
+          throw new CompactionSourceChangedError(
+            planned.segmentId,
+            snapshot.version !== job.sourceManifestVersion,
+          );
+        }
+        if (!sameMergeSourceSegment(actual, transactions.get(actual.transactionId), planned)) {
+          throw new Error(`Compaction source segment differs from its plan: ${planned.segmentId}`);
+        }
+      }
+      const firstOrder = plan.sourceSegments[0]?.logicalOrder ?? plan.logicalOrder;
+      for (const segment of visibleSegments) {
+        if (sourceIds.has(segment.id)) continue;
+        if (segment.logicalOrder < firstOrder || segment.logicalOrder > plan.logicalOrder) continue;
+        throw new Error(`Concurrent segment would reorder compaction output: ${segment.id}`);
+      }
+      return;
+    }
     if (
       job.outputPartitionOrdinal === undefined &&
       job.targetLevel === 1 &&
@@ -22969,7 +23663,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     version: number,
   ): CompactTableResult {
     const rewritePlan = job.rewritePlan;
-    const rowCount = rewritePlan.kind === "copy-v1" ? job.processedRows : rewritePlan.totalRows;
+    const rowCount =
+      rewritePlan.kind === "copy-v1"
+        ? job.processedRows
+        : rewritePlan.kind === "delta-v1"
+          ? rewritePlan.resolution.rows
+          : rewritePlan.totalRows;
     const outputLogicalBytes = job.outputLogicalBytes;
     const totalMs = Math.max(Date.parse(job.updatedAt) - Date.parse(job.createdAt), 0);
     return {
@@ -22999,7 +23698,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               (job.priorAttemptOutputStoredBytes ?? 0) + job.outputStoredBytes,
           }),
       outputLogicalBytes,
-      ...(rewritePlan.kind !== "copy-v1"
+      ...(rewritePlan.kind !== "copy-v1" && rewritePlan.kind !== "delta-v1"
         ? {
             targetBlockBytes: rewritePlan.targetBlockBytes,
             outputCompression: rewritePlan.outputCompression,
@@ -23251,7 +23950,49 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * ids are never reused, so a write that then fails leaves an entry nothing ever asks for.
    */
   readonly #rememberWrittenBlock = (block: BlockWrite): void => {
-    this.#cachePut(`zi ${block.id}`, inspectBlock(block.bytes), ZONE_DESCRIPTION_CACHE_BYTES);
+    // The zone-description family, where every reader looks: the flat `zi ` key this once used
+    // was left behind when per-block artifacts moved to their own key spaces, so each write read
+    // its own new blocks back again.
+    this.#blockCachePut(
+      ArtifactFamily.zoneDescription,
+      block.id,
+      inspectBlock(block.bytes),
+      ZONE_DESCRIPTION_CACHE_BYTES,
+    );
+  };
+
+  /**
+   * `#rememberWrittenBlock` for the blocks of an update or delete delta, which are also kept
+   * decoded when small. Every keyed read of a changed row replays its deltas — the row an
+   * application just changed and reads back, the next UPDATE of the same key — and on
+   * IndexedDB each block it would fetch is a storage transaction. Decoding one costs
+   * microseconds now. Decoded from a private copy, so neither the caller nor the store can
+   * change what the cache holds; a raw block decodes without yielding, so the entry is in place
+   * long before the write commits and anything can read it.
+   */
+  readonly #rememberWrittenDeltaBlock = (block: BlockWrite): void => {
+    const description = inspectBlock(block.bytes);
+    this.#blockCachePut(
+      ArtifactFamily.zoneDescription,
+      block.id,
+      description,
+      ZONE_DESCRIPTION_CACHE_BYTES,
+    );
+    if (description.compression === "raw" && description.rowCount <= WRITTEN_BLOCK_DECODE_ROWS) {
+      void decodePhysicalBlock(block.bytes.slice()).then(
+        (decoded) => {
+          if (this.#blockCacheGet(ArtifactFamily.decodedBlock, block.id) !== undefined) return;
+          this.#blockCachePut(
+            ArtifactFamily.decodedBlock,
+            block.id,
+            decoded,
+            decodedPhysicalBlockRetainedBytes(decoded),
+          );
+        },
+        // A block that does not decode is refused when a read asks for it; the cache only helps.
+        () => undefined,
+      );
+    }
   };
 
   /**
@@ -28301,14 +29042,15 @@ function uniqueKeyBuildLeaseUntil(now: Date): string {
  * rule took the fold for a writer that never saw the index and invalidated it: every fold of an
  * append-only table threw its index away, searches scanned until a full rebuild, and the
  * invalidated postings stayed stored. A merge writes base segments, which no full-text index can
- * serve, so it stays uncovered and the index is invalidated as before.
+ * serve, so it stays uncovered and the index is invalidated as before; so does a delta merge,
+ * whose updates and deletes the index could not serve either (their commits invalidated it).
  */
 function stageCompactionPostingCoverage(
   transaction: DatabaseTransaction,
   table: TableRecord,
   plan: CompactionRewritePlan,
 ): void {
-  if (isMergeCompactionPlan(plan)) return;
+  if (isMergeCompactionPlan(plan) || plan.kind === "delta-v1") return;
   const columns = Object.entries(table.ftsColumns ?? {}).flatMap(([columnId, index]) =>
     index.state === "invalid" ? [] : [{ columnId, postings: [], totalTokens: 0 }],
   );
@@ -29043,8 +29785,10 @@ function autoCompactionHint(
   let deltas = 0;
   let deltaRows = 0;
   let baseRows = 0;
+  let foldedRows = 0;
   for (const segment of segments) {
     if (segment.level === 0) levelZero += 1;
+    else foldedRows += segment.rowCount;
     const kind = segment.kind;
     if (kind !== "insert" && kind !== "base") {
       deltas += 1;
@@ -29060,6 +29804,7 @@ function autoCompactionHint(
     deltas,
     deltaRows,
     baseRows,
+    foldedRows,
   };
 }
 
@@ -29087,6 +29832,30 @@ function autoCompactionDueHint(hint: AutoCompactionHint, queryBudgetBytes: numbe
       hint.deltaRows >= AUTO_COMPACT_DELTA_MIN_ROWS &&
       (hint.deltaRows >= hint.baseRows ||
         hint.deltaRows * OVERLAY_PATCH_BYTES > overlayFairShare(queryBudgetBytes)))
+  );
+}
+
+/**
+ * Delta rows past which an automatic step folds deltas into the partitions rather than merging
+ * them among themselves: every scan replays them, so once they are a sixty-fourth of the
+ * table, or a thousand rows of a small one, folding them is the cheaper read.
+ */
+function deltaMergeFoldRows(baseRows: number): number {
+  return Math.max(DELTA_MERGE_FOLD_MIN_ROWS, Math.floor(baseRows / DELTA_MERGE_FOLD_FRACTION));
+}
+
+/**
+ * Whether a table that has gone quiet should fold its deltas into its partitions now. Delta
+ * merges keep a busy table's deltas few without rewriting a partition, but every scan still
+ * replays them; once writes stop, one fold returns the table to plain partitions, which every
+ * read afterwards scans at full speed.
+ */
+function idleFoldDueHint(hint: AutoCompactionHint): boolean {
+  return (
+    hint.foldedRows > 0 &&
+    hint.deltas > 0 &&
+    hint.deltaRows >=
+      Math.max(IDLE_FOLD_DELTA_ROWS, Math.floor(hint.foldedRows / IDLE_FOLD_FRACTION))
   );
 }
 

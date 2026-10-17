@@ -4,6 +4,7 @@
 import {
   MAX_AUTO_INCREMENT_EXCLUSIVE_END,
   type BeginTransactionInput,
+  type CompactionJobRecord,
   type TransactionRecord,
   type TransactionRecordUpdate,
   type SegmentRecord,
@@ -113,6 +114,19 @@ export function planLevelZeroAdmissions(
     plan.set(entry.tableId, { limit: entry.limit, added });
   }
   return plan;
+}
+
+/**
+ * Level-zero segments a compaction commit retires, by table. Only a delta merge publishes
+ * level-zero segments, and it publishes them in place of its sources, all level zero and all
+ * visible (the provenance check proved it): the ceiling counts what the table holds once the
+ * commit lands, so a merge never has to be refused at the ceiling it exists to relieve.
+ */
+export function levelZeroSegmentsRetiredBy(
+  job: Pick<CompactionJobRecord, "tableId" | "rewritePlan"> | undefined,
+): ReadonlyMap<string, number> {
+  if (job?.rewritePlan.kind !== "delta-v1") return new Map();
+  return new Map([[job.tableId, job.rewritePlan.sourceSegments.length]]);
 }
 
 /** A catalog alteration retains only accelerators whose entire column tuple survives. This

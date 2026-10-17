@@ -15,6 +15,8 @@ import {
   TransactionRecordConflictError,
   UniqueKeyConflictError,
   secondaryUniqueKeyNamespace,
+  deltaMergeOutputBlockIds,
+  deltaMergeOutputSegments,
   WriteConflictError,
   type BlockStore,
   type CompactionJobRecord,
@@ -2240,6 +2242,183 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
           ["compact-source-block"],
           "a provenance refusal must retain every source block",
         );
+        store.close();
+      },
+    },
+    {
+      name: "a delta merge publishes level zero under the run's order, counted net of its sources",
+      async run(target) {
+        let store = await target.create();
+        await store.addTable(table("delta", true));
+        // Two single-row updates, one commit each: level zero under orders 0 and 1.
+        const sources: SegmentRecord[] = [];
+        for (const name of ["a", "b"]) {
+          const version = await store.getCurrentManifestVersion();
+          const transactionId = `txn-delta-${name}`;
+          await store.createTransaction(transaction(transactionId, version));
+          const staged = await store.stageTransactionArtifacts({
+            transactionId,
+            expectedRevision: 0,
+            blocks: [
+              { id: `delta-${name}-key`, bytes: Uint8Array.of(1) },
+              { id: `delta-${name}-v`, bytes: Uint8Array.of(2, 3) },
+            ],
+            segments: [
+              {
+                ...segment(`delta-${name}`, "table-delta", transactionId, `delta-${name}-key`),
+                kind: "update",
+                keyColumnId: "col-id",
+                rowCount: 1,
+                rowIdStart: 0n,
+                rowIdEndExclusive: 0n,
+                columnBlockIds: { "col-id": [`delta-${name}-key`], "col-v": [`delta-${name}-v`] },
+              },
+            ],
+            updatedAt: T0,
+          });
+          const summary = await store.commitTransaction({
+            transactionId,
+            expectedTransactionRevision: staged.revision,
+            expectedManifestVersion: version,
+            levelZeroSegmentLimits: [{ tableId: "table-delta", limit: MAX_LEVEL_ZERO_SEGMENTS }],
+            committedAt: T0,
+          });
+          const committed = await store.getSegment(`delta-${name}`);
+          check(committed !== undefined, "a committed source segment is missing");
+          checkEqual(
+            committed.logicalOrder,
+            summary.version,
+            "a level-zero data segment takes the order of the version that publishes it",
+          );
+          sources.push(committed);
+        }
+        const [first, last] = sources;
+        check(first !== undefined && last !== undefined, "the merge sources are missing");
+        const sourceBlock = (blockId: string, storedBytes: number) => ({
+          blockId,
+          rowStart: 0,
+          rowCount: 1,
+          storedBytes,
+          encodedBytes: storedBytes,
+          checksum: 0,
+        });
+        const plan = {
+          kind: "delta-v1" as const,
+          keyColumnId: "col-id",
+          columns: [
+            { columnId: "col-id", type: "number" as const },
+            { columnId: "col-v", type: "string" as const },
+          ],
+          logicalOrder: last.logicalOrder,
+          sourceSegments: sources.map((source, index) => ({
+            segmentId: source.id,
+            transactionId: source.transactionId,
+            committedVersion: index,
+            kind: "update" as const,
+            keyColumnId: "col-id",
+            level: 0,
+            logicalOrder: source.logicalOrder,
+            rowCount: 1,
+            rowIdStart: 0n,
+            rowIdEndExclusive: 0n,
+            rowIdSpans: [],
+            columns: [
+              {
+                columnId: "col-id",
+                type: "number" as const,
+                sourceBlocks: [sourceBlock(`${source.id}-key`, 1)],
+              },
+              {
+                columnId: "col-v",
+                type: "string" as const,
+                sourceBlocks: [sourceBlock(`${source.id}-v`, 2)],
+              },
+            ],
+          })),
+          outputs: [
+            {
+              kind: "update" as const,
+              columns: [
+                { columnId: "col-id", type: "number" as const },
+                { columnId: "col-v", type: "string" as const },
+              ],
+              rowCount: 1,
+              blockRows: [1],
+            },
+          ],
+          resolution: { rows: 1, checksum: 0 },
+        };
+        const jobId = "delta-merge-job";
+        const outputBlockIds = deltaMergeOutputBlockIds(jobId, plan);
+        await store.createTransaction(transaction("txn-delta-merge", 1));
+        const job: CompactionJobRecord = {
+          id: jobId,
+          tableId: "table-delta",
+          sourceManifestVersion: 1,
+          sourceSegmentIds: sources.map(({ id }) => id),
+          sourceBlockIds: ["delta-a-key", "delta-a-v", "delta-b-key", "delta-b-v"],
+          outputBlockIds,
+          cursor: { sourceSegmentIndex: 2, sourceBlockIndex: 0 },
+          processedRows: 2,
+          sourceStoredBytes: 6,
+          outputStoredBytes: 2,
+          logicalBytes: 6,
+          rewritePlan: plan,
+          outputCursor: null,
+          memoryBudgetBytes: 0,
+          minimumMemoryBytes: 0,
+          level0SourceStoredBytes: 6,
+          anchorSourceStoredBytes: 0,
+          peakWorkingBytes: 0,
+          outputLogicalBytes: 2,
+          targetLevel: 0,
+          state: "ready",
+          transactionId: "txn-delta-merge",
+          outputSegmentId: `${jobId}/output-segment`,
+          publishedVersion: null,
+          revision: 0,
+          createdAt: T0,
+          updatedAt: LATER,
+        };
+        const outputs = deltaMergeOutputSegments(job, plan, "txn-delta-merge");
+        const staged = await store.stageTransactionArtifacts({
+          transactionId: "txn-delta-merge",
+          expectedRevision: 0,
+          blocks: outputBlockIds.map((id) => ({ id, bytes: Uint8Array.of(4) })),
+          segments: outputs.map((output) => ({ ...output, createdAt: LATER })),
+          updatedAt: LATER,
+        });
+        await store.createCompactionJob(job);
+        // The table holds two level-zero segments and the merge adds one: a ceiling of two
+        // admits it, because the merge retires both sources in the same commit.
+        const summary = await store.commitTransaction({
+          transactionId: staged.id,
+          expectedTransactionRevision: staged.revision,
+          expectedManifestVersion: 1,
+          compactionJobId: jobId,
+          removedBlockIds: job.sourceBlockIds,
+          levelZeroSegmentLimits: [{ tableId: "table-delta", limit: 2 }],
+          committedAt: LATER,
+        });
+        const verify = async (current: BlockStore) => {
+          const output = await current.getSegment(`${jobId}/output-segment`);
+          check(output !== undefined, "the merge output segment is missing");
+          checkEqual(
+            [output.level, output.kind, output.logicalOrder],
+            [0, "update", last.logicalOrder],
+            "a delta merge's output keeps the order of the last source, not its own version",
+          );
+          checkEqual(
+            (await manifestBlockIds(current, summary.version)).sort(),
+            [...outputBlockIds].sort(),
+            "a delta merge must replace its sources' blocks with its own",
+          );
+        };
+        await verify(store);
+        if (target.reopen !== undefined) {
+          store = await target.reopen(store);
+          await verify(store);
+        }
         store.close();
       },
     },

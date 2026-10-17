@@ -2571,6 +2571,7 @@ describe("IndexedDB corruption hardening", () => {
       const indexedDB = new IDBFactory();
       const name = crypto.randomUUID();
       const store = await openStore(indexedDB, name);
+      let committer: Awaited<ReturnType<typeof openStore>> | undefined;
       let restoreGet = (): void => undefined;
       try {
         await store.addTable({
@@ -2630,6 +2631,12 @@ describe("IndexedDB corruption hardening", () => {
           segments: [segment("zz-new-segment", "new-owner", "new-block")],
           updatedAt: NOW,
         });
+        // The mutations below change records without publishing a version, which no writer
+        // does. The connection that wrote the history remembers the count it last proved at
+        // version 129 and would rightly reuse it; the count read from storage — the path this
+        // pins — runs on a connection that has not proved one (level-zero-count.test.ts covers
+        // the remembered count). It opens first: opening validates what the mutations damage.
+        committer = await openStore(indexedDB, name);
         if (mode === "missing" || mode === "invalid") {
           const owner = await readRawValue(indexedDB, name, "transactions", "owner-128");
           await mutate(indexedDB, name, "transactions", (transaction) => {
@@ -2747,12 +2754,12 @@ describe("IndexedDB corruption hardening", () => {
           committedAt: NOW,
         };
         if (mode === "valid" || mode === "overflow partition")
-          await expect(store.commitTransaction(commit)).rejects.toMatchObject({
+          await expect(committer.commitTransaction(commit)).rejects.toMatchObject({
             name: "CompactionBacklogError",
             levelZeroSegments: 132,
           });
         else
-          await expect(store.commitTransaction(commit)).rejects.toBeInstanceOf(
+          await expect(committer.commitTransaction(commit)).rejects.toBeInstanceOf(
             StorageCorruptionError,
           );
         if (mode !== "partial" && mode !== "invalid provenance" && mode !== "index mismatch")
@@ -2773,7 +2780,7 @@ describe("IndexedDB corruption hardening", () => {
         ).toEqual(before);
         expect(await store.hasManifestBlocks(129, ["new-block"])).toEqual([false]);
         if (mode === "valid") {
-          await store.commitTransaction({
+          await committer.commitTransaction({
             ...commit,
             levelZeroSegmentLimits: [{ tableId: "events", limit: 132 }],
           });
@@ -2784,6 +2791,7 @@ describe("IndexedDB corruption hardening", () => {
         }
       } finally {
         restoreGet();
+        committer?.close();
         store.close();
       }
     },

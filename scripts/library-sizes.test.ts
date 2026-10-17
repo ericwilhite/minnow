@@ -41,10 +41,11 @@ describe("compressed download budgets", () => {
     // 0.16.0 audit as a whole (with prepared templates, PostgreSQL forms, schema-change folds):
     // 521.1 KiB; with the V8 JSON key guard, 522.3 KiB; with shared engine helpers and droppable
     // storage-limit literals, 521.1 KiB; with PostgreSQL datetime and interval text, 524.3 KiB;
-    // with UNIQUE builds under writes, 525.0 KiB.
+    // with UNIQUE builds under writes, 525.0 KiB; with the single-row write paths and delta
+    // merges, 532.3 KiB.
     expect(
       worker.totalGzipBytes + client.totalGzipBytes,
       "worker plus client gzip bytes",
-    ).toBeLessThanOrEqual(526 * 1024);
+    ).toBeLessThanOrEqual(533 * 1024);
   });
 });

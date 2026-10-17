@@ -379,13 +379,19 @@ ordinary API, reopens, and checks that the retired key still resolves and that e
 reader then refuses the database; `indexeddb-schema5.test.ts` does the same for schema 5 from
 every released IndexedDB writer, and `snapshot-format2.test.ts` checks that only a snapshot
 holding the key-forwards table is written as format 2. A fifth alias, of core 0.15.0, is the last
-IndexedDB schema-5 and OPFS layout-10 writer, and the last build that could not fold a table
-across `ALTER TABLE`: `schema-change-fold-upgrade.test.ts` lets it add and drop columns of a
-populated table until the level-zero ceiling refuses its writes, then upgrades the database to
-schema 6 or layout 11 through the ordinary open API, checks that the first write folds the table
-and succeeds, interrupts and retries the IndexedDB upgrade, races current and released openers,
-and checks that 0.15.0 then refuses the database. `marker-upgrade.test.ts` upgrades layouts 7 to
-10 to layout 11 and folds a table across `ADD` and `DROP COLUMN` there. `format-compatibility.test.ts` restores the
+IndexedDB schema-5 and OPFS layout-10 writer, the last build that could not fold a table across
+`ALTER TABLE`, and the last without delta merges: `schema-change-fold-upgrade.test.ts` lets it
+add and drop columns of a populated table until the level-zero ceiling refuses its writes, then
+upgrades the database to the current schema or layout through the ordinary open API, checks that
+the first write folds the table and succeeds, interrupts and retries the IndexedDB upgrade, races
+current and released openers, and checks that 0.15.0 then refuses the database.
+`delta-merge-upgrade.test.ts` leaves single-row updates and deletes over its folded partitions,
+upgrades the database to schema 7 or layout 12, merges those deltas, writes, reopens, interrupts
+and retries the IndexedDB upgrade, races current and released openers, refuses a damaged merge
+record as corruption, and checks that 0.15.0 then refuses the database. Schema 6 and layout 11
+were never released, so no alias writes them: `marker-upgrade.test.ts` upgrades layouts 7 to 10,
+and a layout-11 marker over the layout-10 fixture, to layout 12, folds a table across `ADD` and
+`DROP COLUMN` there, and merges a table's deltas there. `format-compatibility.test.ts` restores the
 forward the frozen format-2 fixture stored, checks it resolves until it expires, and rekeys data
 an older writer exported. The marker upgrade is cut at
 each of its eight I/O boundaries by tab death and by power loss, from every older layout. Unsupported pre-contract prototypes are refused without changing their bytes.
@@ -703,6 +709,15 @@ kilobytes long. A fold resumed by another engine recomputes its replay, and one 
 longer matches its plan is abandoned unwritten. A single delta as large as its table folds with
 no further write, including a lone one over already-folded partitions. Each case fails with its
 part of the fix removed.
+
+`delta-merge.test.ts` checks delta merges against a shadow model on memory, IndexedDB, and OPFS:
+the resolver against a row-by-row replay over two hundred random runs, the partitions left
+untouched and the merged deltas under the run's order, a fault injected at every storage call
+the merge step makes (each recovered by another connection), two connections stepping the same
+merge, a plan whose sources do not reproduce its checksum refused unwritten, a merge at the
+level-zero ceiling it relieves, a quiet table folded after a burst but not after a trickle, and a
+live query whose window spans a merge answered without a query. `compaction-controller.test.ts`
+carries a quiet table's fold through a busy run, a failure, and a decline.
 
 `large-delta-reads.test.ts` refreshes 400,000- and 1,000,000-row tables with one full-table
 upsert under default settings, on memory, OPFS, and IndexedDB stores, and checks exact results

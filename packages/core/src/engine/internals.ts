@@ -1,4 +1,4 @@
-import type { MinnowDatabase } from "./database.js";
+import type { CompactionJobProgress, MinnowDatabase } from "./database.js";
 
 /**
  * Engine operations the stock worker server needs that are not part of the public database
@@ -13,6 +13,11 @@ export interface DatabaseInternals {
    * waits for a tab that stopped inside its turn. One-shot: the engine is about to close.
    */
   cancelCrossContextWaits(reason: Error): void;
+  /**
+   * Takes one automatic compaction step on a table — the step background maintenance would
+   * take, delta merges included — so tests drive it deterministically.
+   */
+  automaticCompactionStep(tableName: string): Promise<CompactionJobProgress>;
 }
 
 export const databaseInternals = new WeakMap<MinnowDatabase, DatabaseInternals>();

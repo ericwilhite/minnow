@@ -1,6 +1,7 @@
 import {
   assertCommitSchema,
   assertCommitSnapshot,
+  levelZeroSegmentsRetiredBy,
   planLevelZeroAdmissions,
   planTableAccelerators,
   validateAutoIncrementReservation,
@@ -4733,9 +4734,12 @@ export class RecordCore {
       pendingSegments,
     );
     if (levelZeroAdmissions.size > 0) {
+      const retired = levelZeroSegmentsRetiredBy(compactionJob);
       for (const [tableId, entry] of levelZeroAdmissions) {
         const count =
-          this.#visibleLevelZeroCount(tableId, input.expectedManifestVersion) + entry.added;
+          this.#visibleLevelZeroCount(tableId, input.expectedManifestVersion) +
+          entry.added -
+          (retired.get(tableId) ?? 0);
         const table =
           this.#tables.get(tableId) ?? (pendingTable?.id === tableId ? pendingTable : undefined);
         if (table === undefined) {
@@ -4817,11 +4821,15 @@ export class RecordCore {
     this.#manifestUsageAfter([manifest]);
     // Level-zero records are staged before their publication version exists. Their durable
     // read order is the manifest that first makes them visible. Compaction output already
-    // carries its exact level/order and keeps it. Made once, here, so the apply publishes the
-    // very records this plan accounted for.
+    // carries its exact level/order and keeps it — a delta merge's level-zero output included,
+    // which takes the place of the run it replaces. Made once, here, so the apply publishes
+    // the very records this plan accounted for.
     const committedSegments = pendingSegments.map((segment) => ({
       ...segment,
-      logicalOrder: segment.level === 0 ? manifest.version : segment.logicalOrder,
+      logicalOrder:
+        segment.level === 0 && compactionJob === undefined
+          ? manifest.version
+          : segment.logicalOrder,
     }));
     this.#segmentUsageAfter(committedSegments);
     const committed = updateTransactionRecord(transaction, {

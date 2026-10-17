@@ -30,7 +30,8 @@ const store = await OpfsBlockStore.open({
   // Eight entries land the first follower request in the checkpoint; the follower's staging
   // call, its withheld answer, and the last table stay in the write-ahead log's tail.
   // Nine with layout 11's job first: the same eight later entries as before join it there.
-  checkpointEntries: 9,
+  // Ten with layout 12's job after it, for the same reason.
+  checkpointEntries: 10,
   // A row-id reservation's answer is kept; a staging call's answer (a transaction record) is
   // too large for this ceiling and is withheld, so the fixture holds both ledger shapes.
   servedLedgerResultBytes: 160,
@@ -125,6 +126,102 @@ await store.createCompactionJob({
   createdAt: "2026-08-24T11:59:59.000Z",
   updatedAt: "2026-08-24T11:59:59.000Z",
   error: "fixture: an aborted fold attempt",
+});
+// Layout 12's own shape, in the checkpoint too: a delta merge of two single-row updates of the
+// keyed table into one, under the order of the later. An older build refuses the plan kind; the
+// attempt is recorded as aborted, so it roots nothing either.
+const deltaKeyBlock = await encodeBlock({ type: "number", values: [1] }, "raw");
+const deltaNoteBlock = await encodeBlock({ type: "string", values: ["merged"] }, "raw");
+const deltaSourceBlock = (blockId: string, bytes: Uint8Array) => {
+  const description = inspectBlock(bytes);
+  return {
+    blockId,
+    rowStart: 0,
+    rowCount: 1,
+    storedBytes: bytes.byteLength,
+    encodedBytes: description.encodedLength,
+    checksum: description.checksum,
+  };
+};
+const deltaSources = ["a", "b"].map((name, index) => ({
+  segmentId: `fixture-delta-update-${name}`,
+  transactionId: `fixture-delta-transaction-${name}`,
+  committedVersion: 3 + index,
+  kind: "update" as const,
+  keyColumnId: "id",
+  level: 0,
+  logicalOrder: 1 + index,
+  rowCount: 1,
+  rowIdStart: 0n,
+  rowIdEndExclusive: 0n,
+  rowIdSpans: [],
+  columns: [
+    {
+      columnId: "id",
+      type: "number" as const,
+      sourceBlocks: [deltaSourceBlock(`fixture-delta-key-${name}`, deltaKeyBlock)],
+    },
+    {
+      columnId: "note",
+      type: "string" as const,
+      sourceBlocks: [deltaSourceBlock(`fixture-delta-note-${name}`, deltaNoteBlock)],
+    },
+  ],
+}));
+const deltaBlocks = deltaSources.flatMap(({ columns }) =>
+  columns.flatMap(({ sourceBlocks }) => sourceBlocks),
+);
+const deltaStoredBytes = deltaBlocks.reduce((total, block) => total + block.storedBytes, 0);
+await store.createCompactionJob({
+  id: "fixture-layout12-delta",
+  tableId: "fixture-keyed",
+  sourceManifestVersion: 4,
+  sourceSegmentIds: deltaSources.map(({ segmentId }) => segmentId),
+  sourceBlockIds: deltaBlocks.map(({ blockId }) => blockId).sort(),
+  outputBlockIds: [],
+  cursor: { sourceSegmentIndex: 0, sourceBlockIndex: 0 },
+  processedRows: 0,
+  sourceStoredBytes: deltaStoredBytes,
+  outputStoredBytes: 0,
+  logicalBytes: deltaBlocks.reduce((total, block) => total + block.encodedBytes, 0),
+  rewritePlan: {
+    kind: "delta-v1",
+    keyColumnId: "id",
+    columns: [
+      { columnId: "id", type: "number" },
+      { columnId: "note", type: "string" },
+    ],
+    logicalOrder: 2,
+    sourceSegments: deltaSources,
+    outputs: [
+      {
+        kind: "update",
+        columns: [
+          { columnId: "id", type: "number" },
+          { columnId: "note", type: "string" },
+        ],
+        rowCount: 1,
+        blockRows: [1],
+      },
+    ],
+    resolution: { rows: 1, checksum: 0 },
+  },
+  outputCursor: null,
+  memoryBudgetBytes: 0,
+  minimumMemoryBytes: 0,
+  level0SourceStoredBytes: deltaStoredBytes,
+  anchorSourceStoredBytes: 0,
+  peakWorkingBytes: 0,
+  outputLogicalBytes: 0,
+  targetLevel: 0,
+  state: "aborted",
+  transactionId: null,
+  outputSegmentId: "fixture-layout12-delta/output-segment",
+  publishedVersion: null,
+  revision: 0,
+  createdAt: "2026-08-24T11:59:59.500Z",
+  updatedAt: "2026-08-24T11:59:59.500Z",
+  error: "fixture: an aborted delta merge attempt",
 });
 await store.addTable(table("fixture-data", "data"));
 await store.addTable(table("fixture-checkpoint-b", "checkpoint-b"));

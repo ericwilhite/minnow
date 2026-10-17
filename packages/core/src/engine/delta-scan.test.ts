@@ -358,4 +358,52 @@ describe("scans over mutation histories", () => {
       ).rows,
     ).toEqual([{ id: 4 }]);
   });
+
+  it("views the columns no patch of a window writes instead of copying them", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore(), {
+      rowsPerBlock: 16,
+      autoCompact: false,
+    });
+    await database.createTable({
+      name: "items",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "region", type: "string", nullable: true },
+        { name: "amount", type: "number" },
+        { name: "label", type: "string" },
+      ],
+    });
+    const rows = Array.from({ length: 240 }, (_, index) => ({
+      id: index + 1,
+      region: index % 3 === 0 ? null : `r${String(index % 4)}`,
+      amount: index,
+      label: `l${String(index)}`,
+    }));
+    for (let start = 0; start < rows.length; start += 60) {
+      await database.insertBatch("items", rows.slice(start, start + 60));
+    }
+    // Five updates of one column, each in a different block.
+    for (const id of [5, 50, 100, 150, 200]) {
+      await database.execute("UPDATE items SET amount = -amount WHERE id = ?", [id]);
+      const row = rows[id - 1];
+      if (row !== undefined) row.amount = -row.amount;
+    }
+    const scan = async (): Promise<{ rows: unknown[]; compacted: number }> => {
+      const before = overlayReplayTestHooks.compactedColumns;
+      const result = await database.query(
+        "SELECT id, region, amount, label FROM items ORDER BY id",
+        { memoize: false, executionMemoryBudgetBytes: 64 * 1024 },
+      );
+      return { rows: result.rows, compacted: overlayReplayTestHooks.compactedColumns - before };
+    };
+    const updated = await scan();
+    expect(updated.rows).toEqual(rows);
+    // Each patched window copies the one column its patch writes; the other three are views.
+    expect(updated.compacted).toBeGreaterThan(0);
+    expect(updated.compacted).toBeLessThanOrEqual(5);
+    // A delete takes a row out of its window: still read right.
+    await database.execute("DELETE FROM items WHERE id = 77");
+    expect((await scan()).rows).toEqual(rows.filter((row) => row.id !== 77));
+  });
 });

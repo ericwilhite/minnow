@@ -269,3 +269,66 @@ it("retries folds that lose the shared job to another connection quietly, unless
   expect(controller.retryPending("t")).toBe(true);
   controller.stop();
 });
+
+it("carries a quiet table's fold through a busy run, a failure, and a decline", async () => {
+  vi.useFakeTimers();
+  const runs: boolean[] = [];
+  const outcomes: Array<boolean | Error> = [];
+  let release!: () => void;
+  let gate = Promise.resolve();
+  const controller: CompactionController = new CompactionController({
+    enabled: true,
+    maximumLevelZeroSegments: 256,
+    dropping: () => false,
+    run: async (_table, idle) => {
+      runs.push(idle);
+      await gate;
+      const outcome = outcomes.shift() ?? true;
+      if (outcome instanceof Error) throw outcome;
+      return outcome;
+    },
+    // As the engine does when nothing else is due: only a quiet check schedules a fold.
+    check: async (_id, idle) => {
+      if (idle) controller.schedule(table, 48, true);
+    },
+    yield: async () => undefined,
+    report: vi.fn(),
+  });
+
+  // The table goes quiet while a fold of its own is in flight: the continuation is quiet.
+  gate = new Promise((resolve) => (release = resolve));
+  controller.schedule(table, 48);
+  controller.committed(["t"]);
+  await vi.advanceTimersByTimeAsync(25);
+  gate = Promise.resolve();
+  release();
+  await controller.drain();
+  await vi.advanceTimersByTimeAsync(0);
+  await controller.drain();
+  expect(runs).toEqual([false, true]);
+
+  // A quiet fold that fails is retried as one, on time alone.
+  outcomes.push(new Error("transient read"));
+  controller.committed(["t"]);
+  await vi.advanceTimersByTimeAsync(25);
+  await controller.drain();
+  expect(runs).toEqual([false, true, true]);
+  await vi.advanceTimersByTimeAsync(250);
+  await controller.drain();
+  expect(runs).toEqual([false, true, true, true]);
+
+  // A declined fold holds the table until it grows, but not its next quiet fold.
+  outcomes.push(false);
+  controller.schedule(table, 48);
+  await controller.drain();
+  expect(runs).toHaveLength(5);
+  await vi.advanceTimersByTimeAsync(250);
+  await controller.drain();
+  controller.schedule(table, 48);
+  expect(runs).toHaveLength(5);
+  controller.committed(["t"]);
+  await vi.advanceTimersByTimeAsync(25);
+  await controller.drain();
+  expect(runs).toEqual([false, true, true, true, false, true]);
+  controller.stop();
+});

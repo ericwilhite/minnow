@@ -328,10 +328,13 @@ interface ReleasedWriter {
   close(): Promise<void>;
 }
 
+/** The store type the released writer takes; its records are a subset of the current ones. */
+type ReleasedBlockStore = ConstructorParameters<typeof ReleasedDatabase>[0];
+
 /** One database the released 0.15.0 writer opens first and the current build after it. */
 interface ReleasedSource {
   readonly name: string;
-  released(): Promise<BlockStore>;
+  released(): Promise<ReleasedBlockStore>;
   current(): Promise<BlockStore>;
   readonly indexedDB?: { factory: IDBFactory; name: string };
 }

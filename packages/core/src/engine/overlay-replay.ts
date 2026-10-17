@@ -61,6 +61,8 @@ export const overlayReplayTestHooks = {
   rangeReplays: 0,
   /** Replays of a pruned scan that followed the keys it reads rather than the deltas'. */
   scanKeyedBuilds: 0,
+  /** Projected columns a replayed window copied out rather than viewed in place. */
+  compactedColumns: 0,
   /** When set, replaces a query's fair share for kept patches: tests force range replay. */
   fairShareBytes: undefined as number | undefined,
   /** When set, replaces the scratch one replay pass may take: tests force partitions. */

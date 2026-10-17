@@ -1,17 +1,20 @@
 /* eslint-disable no-restricted-imports -- Released-writer and failure-injection tests run only in Node. */
 /**
- * Layouts 7 to 10 to 11: the store's bytes stay as they are and only the marker moves. Layout 8
+ * Layouts 7 to 11 to 12: the store's bytes stay as they are and only the marker moves. Layout 8
  * admits compaction jobs with replayed merge plans, which a layout-7 reader cannot parse;
  * layout 9 admits WAL frames whose payload spans continuation frames and checkpointed index
  * deltas of any size, which a layout-8 reader cannot; layout 10 admits the internal key-forwards
  * catalog record, which a layout-9 reader would read as an ordinary table while ignoring its
  * forwards; layout 11 admits compaction plans whose sources lack columns added after them or
- * keep only their key, which a layout-10 reader refuses as corruption. For each older layout
- * these tests use its frozen fixture and its last released writer — 0.12.1 for layout 7, 0.13.1
- * for layout 8, 0.14.1 for layout 9, 0.15.0 for layout 10 (schema-change-fold-upgrade.test.ts)
- * — upgrade through the ordinary open API, keep writing, reopen, and check that the released
- * reader is refused afterwards without a byte changing. Every I/O boundary of the marker
- * publication is cut, by tab death and by power loss, and retried.
+ * keep only their key, which a layout-10 reader refuses as corruption; layout 12 admits delta
+ * merges, which a layout-11 reader refuses as corruption. For each released layout these tests
+ * use its frozen fixture and its last released writer — 0.12.1 for layout 7, 0.13.1 for layout 8,
+ * 0.14.1 for layout 9, 0.15.0 for layout 10 (also schema-change-fold-upgrade.test.ts and
+ * delta-merge-upgrade.test.ts) — upgrade through the ordinary open API, keep writing, reopen, and
+ * check that the released reader is refused afterwards without a byte changing. Layout 11 was
+ * never released (0.16.0 writes layout 12), so its marker step runs over the layout-10 fixture
+ * under a layout-11 marker. Every I/O boundary of the marker publication is cut, by tab death
+ * and by power loss, and retried.
  */
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
@@ -23,6 +26,7 @@ import { OpfsBlockStore as Layout8OpfsStore } from "@minnowdb/core-layout8/stora
 import { MinnowDatabase as Layout9Database } from "@minnowdb/core-layout9";
 import { OpfsBlockStore as Layout9OpfsStore } from "@minnowdb/core-layout9/storage/opfs";
 import { MinnowDatabase } from "../../engine/database.js";
+import { internalsOf } from "../../engine/internals.js";
 import { keyForwardsTableRecord } from "../../engine/key-forwards.js";
 import { MemoryOpfs } from "../../testing/opfs-shim.js";
 import { StorageCorruptionError, StorageFormatVersionError, type TableRecord } from "../types.js";
@@ -37,19 +41,21 @@ const LAYOUT7 = '{"formatVersion":7}';
 const LAYOUT8 = '{"formatVersion":8}';
 const LAYOUT9 = '{"formatVersion":9}';
 const LAYOUT10 = '{"formatVersion":10}';
-const CURRENT_LAYOUT = 11;
-const CURRENT = '{"formatVersion":11}';
+const LAYOUT11 = '{"formatVersion":11}';
+const CURRENT_LAYOUT = 12;
+const CURRENT = '{"formatVersion":12}';
 /** The witness this build writes while it rewrites an older marker. */
-const WITNESS = "upgrade-10-11";
+const WITNESS = "upgrade-11-12";
 /**
- * Every marker-rewrite witness: a 0.13 build's, a 0.14 build's, a 0.15.0 build's, and this
- * build's.
+ * Every marker-rewrite witness: a 0.13 build's, a 0.14 build's, a 0.15.0 build's, an unreleased
+ * layout-11 build's, and this build's.
  */
 const WITNESSES = [
   ["upgrade-7-8", '{"from":7,"to":8}'],
   ["upgrade-8-9", '{"from":8,"to":9}'],
   ["upgrade-9-10", '{"from":9,"to":10}'],
-  [WITNESS, '{"from":10,"to":11}'],
+  ["upgrade-10-11", '{"from":10,"to":11}'],
+  [WITNESS, '{"from":11,"to":12}'],
 ] as const;
 const failure = new DOMException("injected upgrade I/O failure", "QuotaExceededError");
 
@@ -76,7 +82,20 @@ function readFixture(layout: number): Fixture {
   ) as Fixture;
 }
 
-const fixtures = new Map([7, 8, 9, 10].map((layout) => [layout, readFixture(layout)]));
+/**
+ * Layout 11 was never released, so no writer froze a fixture for it. A layout-11 database is
+ * the layout-10 fixture under a layout-11 marker: the bytes the marker step must carry across.
+ */
+function synthesizedLayout11(): Fixture {
+  const layout10 = readFixture(10);
+  const files = { ...layout10.files, "minnowdb/native-fixture/format.json": btoa(LAYOUT11) };
+  return { ...layout10, files };
+}
+
+const fixtures = new Map<number, Fixture>([
+  ...[7, 8, 9, 10].map((layout) => [layout, readFixture(layout)] as const),
+  [11, synthesizedLayout11()],
+]);
 function fixtureFor(layout: number): Fixture {
   const fixture = fixtures.get(layout);
   if (fixture === undefined) throw new Error(`No layout-${String(layout)} fixture`);
@@ -224,6 +243,7 @@ describe.each([
   { layout: 8, text: LAYOUT8 },
   { layout: 9, text: LAYOUT9 },
   { layout: 10, text: LAYOUT10 },
+  { layout: 11, text: LAYOUT11 },
 ])("OPFS frozen layout $layout to the current layout", ({ layout, text }) => {
   const source = fixtureFor(layout);
   // Layout 10 and later froze the key-forwards table into the fixture itself.
@@ -299,6 +319,40 @@ describe.each([
     const reopened = await verifyFixture(shim, source, ["notes"]);
     const reader = new MinnowDatabase(reopened, ENGINE_OPTIONS);
     expect((await reader.query("SELECT * FROM notes ORDER BY id")).rows).toEqual(expected);
+    await reader.close();
+    reopened._crashForTests();
+  });
+
+  it("merges deltas after the upgrade, and reopens", async () => {
+    const shim = hydrate(source);
+    const store = await verifyFixture(shim, source);
+    const database = new MinnowDatabase(store, ENGINE_OPTIONS);
+    await database.execute("CREATE TABLE tallies (id INTEGER PRIMARY KEY, n INTEGER, note TEXT)");
+    for (let start = 0; start < 600; start += 200) {
+      await database.insertBatch(
+        "tallies",
+        Array.from({ length: 200 }, (_, index) => ({ id: start + index, n: 0, note: "x" })),
+      );
+    }
+    await database.compactTable("tallies", { partitionRows: 200 });
+    for (let id = 0; id < 12; id += 1) {
+      await database.execute("UPDATE tallies SET n = n + 1 WHERE id = ?", [id * 41]);
+    }
+    await database.execute("DELETE FROM tallies WHERE id = 1");
+    // Layout 12's record: a delta merge, which takes the deltas' place under their order.
+    const progress = await internalsOf(database).automaticCompactionStep("tallies");
+    const job =
+      progress.result?.jobId === undefined
+        ? undefined
+        : await store.getCompactionJob(progress.result.jobId);
+    expect(job?.rewritePlan.kind).toBe("delta-v1");
+    const expected = (await database.query("SELECT * FROM tallies ORDER BY id")).rows;
+    expect(expected).toHaveLength(599);
+    await database.close();
+    store._crashForTests();
+    const reopened = await verifyFixture(shim, source, ["tallies"]);
+    const reader = new MinnowDatabase(reopened, ENGINE_OPTIONS);
+    expect((await reader.query("SELECT * FROM tallies ORDER BY id")).rows).toEqual(expected);
     await reader.close();
     reopened._crashForTests();
   });
@@ -390,8 +444,9 @@ describe.each([
 
   it("finishes a marker torn mid-rewrite when any build's witness survived", async () => {
     // A 0.13 build tearing the marker on its way to layout 8 left the first witness, a 0.14
-    // build on its way to 9 the second, a 0.15.0 build on its way to 10 the third, this build
-    // the fourth. Each finishes at the current layout.
+    // build on its way to 9 the second, a 0.15.0 build on its way to 10 the third, an unreleased
+    // layout-11 build on its way to 11 the fourth, this build the fifth. Each finishes at the
+    // current layout.
     for (const [name, bytes] of WITNESSES) {
       const shim = hydrate(source);
       shim.writeFileBytes(`${PREFIX}${name}`, new TextEncoder().encode(bytes));
@@ -423,8 +478,9 @@ describe.each([
       ["upgrade-7-8", new TextEncoder().encode('{"from":7,"to":9}')],
       ["upgrade-8-9", new TextEncoder().encode('{"from":8,"to":10}')],
       ["upgrade-9-10", new TextEncoder().encode('{"from":9,"to":11}')],
-      [WITNESS, new TextEncoder().encode('{"from":10,"to":12}')],
-      [WITNESS, new TextEncoder().encode('{"from":10,"to":1')],
+      ["upgrade-10-11", new TextEncoder().encode('{"from":10,"to":12}')],
+      [WITNESS, new TextEncoder().encode('{"from":11,"to":13}')],
+      [WITNESS, new TextEncoder().encode('{"from":11,"to":1')],
     ] as const) {
       const shim = hydrate(source);
       if (witness !== undefined) shim.writeFileBytes(`${PREFIX}${name}`, witness);
@@ -443,14 +499,14 @@ describe.each([
 
   it("refuses a layout newer than the current one without changing files", async () => {
     const shim = hydrate(source);
-    shim.writeFileBytes(`${PREFIX}format.json`, new TextEncoder().encode('{"formatVersion":12}'));
+    shim.writeFileBytes(`${PREFIX}format.json`, new TextEncoder().encode('{"formatVersion":13}'));
     const writes = recordWrites(shim);
     await expect(OpfsBlockStore.open({ name: NAME, root: shim.root })).rejects.toBeInstanceOf(
       StorageFormatVersionError,
     );
     stopRecording(shim);
     expect(writes).toEqual([]);
-    expect(marker(shim)).toBe('{"formatVersion":12}');
+    expect(marker(shim)).toBe('{"formatVersion":13}');
   });
 });
 
@@ -795,6 +851,27 @@ describe("OPFS current layout fixture", () => {
     ).toEqual([
       ["insert", ["id"]],
       ["update", ["id"]],
+    ]);
+    // Layout 12's record: a delta merge of two updates into one, under the later's order.
+    const delta = await store.getCompactionJob("fixture-layout12-delta");
+    expect(delta?.state).toBe("aborted");
+    const merge = delta?.rewritePlan;
+    if (merge?.kind !== "delta-v1") throw new Error("The layout-12 delta merge is missing");
+    expect(merge.logicalOrder).toBe(2);
+    expect(merge.sourceSegments.map(({ kind, logicalOrder }) => [kind, logicalOrder])).toEqual([
+      ["update", 1],
+      ["update", 2],
+    ]);
+    expect(merge.outputs).toEqual([
+      {
+        kind: "update",
+        columns: [
+          { columnId: "id", type: "number" },
+          { columnId: "note", type: "string" },
+        ],
+        rowCount: 1,
+        blockRows: [1],
+      },
     ]);
     store._crashForTests();
   });

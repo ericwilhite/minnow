@@ -15,9 +15,10 @@ import { IndexedDbBlockStore } from "./indexeddb.js";
 
 /**
  * The schema this build writes; schema 4 (multi-part postings deltas), schema 5 (the internal
- * key-forwards catalog record), and schema 6 (fills in compaction plans) followed schema 3.
+ * key-forwards catalog record), schema 6 (fills in compaction plans), and schema 7 (delta merges)
+ * followed schema 3.
  */
-const CURRENT_SCHEMA = 6;
+const CURRENT_SCHEMA = 7;
 
 function rows(version: number, count = 600) {
   return Array.from({ length: count }, (_, id) => ({

@@ -1,6 +1,7 @@
 import {
   assertCommitSchema,
   assertCommitSnapshot,
+  levelZeroSegmentsRetiredBy,
   planLevelZeroAdmissions,
   planTableAccelerators,
   validateAutoIncrementReservation,
@@ -237,7 +238,7 @@ import {
   type SnapshotFormatVersion,
 } from "./snapshot-format.js";
 
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 const FIRST_STABLE_SCHEMA_VERSION = 1;
 const CURRENT_MANIFEST_KEY = "manifest/current";
 const MANIFEST_PRUNE_CLEANUP_KEY = "manifest/prune-cleanup";
@@ -555,8 +556,17 @@ const indexedDbSchemaMigrations: readonly IndexedDbSchemaMigration[] = [
     // Schema 6 admits compaction job records whose sources lack columns added after them (their
     // rows fold to the column's backfill, or NULL) or keep only their key after DROP COLUMN. No
     // stored record changes: the version is the barrier that keeps a schema-5 reader, which
-    // refuses such a job as corruption, from opening a database that may hold one.
+    // refuses such a job as corruption, from opening a database that may hold one. Only
+    // development builds wrote schema 6; the first release with these folds writes schema 7.
     targetVersion: 6,
+    migrate: () => undefined,
+  },
+  {
+    // Schema 7 admits delta merges: compaction jobs with a `delta-v1` plan, and the level-zero
+    // update and delete segments they publish under the order of the run they replace. A
+    // schema-6 reader refuses such a job as corruption; nothing stored changes shape, and the
+    // version is the barrier that keeps that reader out.
+    targetVersion: 7,
     migrate: () => undefined,
   },
 ];
@@ -671,6 +681,17 @@ export class IndexedDbBlockStore implements BlockStore {
    * version) re-resolves from storage inside the committing transaction.
    */
   #manifestCache: { version: number; blockIds: Set<string> } | undefined;
+  /**
+   * Visible committed level-zero segment counts per table, exact at `version`. The commit-time
+   * fragmentation ceiling otherwise reads every segment record of each written table plus one
+   * membership get per level-zero block and one get per owning transaction, on every commit —
+   * hundreds of requests once a table carries a few dozen unfolded segments. The count at a
+   * version is a function of that version alone, so the entry is used only while the publishing
+   * transaction finds the manifest still at `version`; any commit from another instance or tab
+   * moves the version and the next commit counts again. It advances only after this instance's
+   * own commit proves durable, by exactly the level-zero segments that commit published.
+   */
+  #levelZeroCounts: { version: number; counts: Map<string, number> } | undefined;
   /**
    * The journal of the transaction this instance last staged into, so a stage call can hand
    * back the contract's complete id arrays without rereading every chunk. Valid only while the
@@ -2112,6 +2133,7 @@ export class IndexedDbBlockStore implements BlockStore {
       await bumpSchemaEpoch(catalog);
       await transactionDone(transaction);
       this.#manifestCache = undefined;
+      this.#levelZeroCounts = undefined;
       this.#journalCache = undefined;
       if (
         this.#uniqueKeyCache?.tableId === input.tableId ||
@@ -2286,6 +2308,7 @@ export class IndexedDbBlockStore implements BlockStore {
       await bumpSchemaEpoch(catalog);
       await transactionDone(transaction);
       this.#manifestCache = undefined;
+      this.#levelZeroCounts = undefined;
       this.#journalCache = undefined;
       this.#carryUniqueKeyCache(input.expectedManifestVersion, manifest.version);
       return manifest;
@@ -4532,26 +4555,39 @@ export class IndexedDbBlockStore implements BlockStore {
     const transaction = this.#transaction(storeNames, "readwrite");
     try {
       let base: TransactionRecord;
+      let segmentTableValues: ReadonlyMap<string, unknown> | undefined;
       if ("record" in input.transaction) {
         const id = input.transaction.record.id;
         validateNewTransactionLifetime({
           ...input.transaction.record,
           snapshotVersion: input.expectedManifestVersion,
         });
-        if (
-          (await requestResult(transaction.objectStore("transactions").getKey(id))) !== undefined
-        ) {
+        // These reads share one round trip, and the segments' table records ride along; the
+        // existence refusal still comes first, then the version check.
+        const segmentTableIds = [...new Set(normalizedSegments.map((segment) => segment.tableId))];
+        const [existing, currentValue, tableRecords] = await Promise.all([
+          requestResult(transaction.objectStore("transactions").getKey(id)),
+          requestResult<unknown>(transaction.objectStore("catalog").get(CURRENT_MANIFEST_KEY)),
+          Promise.all(
+            segmentTableIds.map(
+              async (tableId) =>
+                [
+                  tableId,
+                  await requestResult<unknown>(
+                    transaction.objectStore("catalog").get(`${TABLE_ID_PREFIX}${tableId}`),
+                  ),
+                ] as const,
+            ),
+          ),
+        ]);
+        segmentTableValues = new Map(tableRecords);
+        if (existing !== undefined) {
           throw new Error(`Transaction already exists: ${id}`);
         }
         // The fresh record pins the version the caller prepared against, so the commit below
         // is the same compare-and-swap a begun transaction would make; a moved manifest is a
         // WriteConflictError with nothing written, record included.
-        const current = asOptionalManifestVersion(
-          await requestResult<unknown>(
-            transaction.objectStore("catalog").get(CURRENT_MANIFEST_KEY),
-          ),
-          CURRENT_MANIFEST_KEY,
-        );
+        const current = asOptionalManifestVersion(currentValue, CURRENT_MANIFEST_KEY);
         const actualVersion = current ?? null;
         if (actualVersion !== input.expectedManifestVersion) {
           throw new WriteConflictError(input.expectedManifestVersion, actualVersion);
@@ -4575,6 +4611,7 @@ export class IndexedDbBlockStore implements BlockStore {
           transaction.objectStore("catalog"),
           segment,
           base.pendingTable,
+          segmentTableValues,
         );
       }
       normalizedSegments.forEach((segment, index) => {
@@ -4680,11 +4717,40 @@ export class IndexedDbBlockStore implements BlockStore {
     incrementSafeInteger(record.revision, "Transaction revision");
     const transactionStore = transaction.objectStore("transactions");
     const catalog = transaction.objectStore("catalog");
-    // Independent reads share one native request round trip; freshness checks keep their
-    // original precedence and still run inside this atomic publication transaction.
-    const [schemaValue, currentValue] = await Promise.all([
+    const statistics = transaction.objectStore("statistics");
+    const manifestStore = transaction.objectStore("manifests");
+    const blockStore = transaction.objectStore("blocks");
+    const segmentStore = transaction.objectStore("segments");
+    // Every record this commit reads before it writes that record, requested together. Inside
+    // a readwrite transaction nothing else can write between these reads and their use, and
+    // each request issued on its own is a round trip to the browser's storage process: a
+    // commit that awaited them one by one spent most of its time waiting. Each value is still
+    // parsed and checked where it was before, in the same order, so every refusal keeps its
+    // precedence; a record read here and not needed costs nothing but the read.
+    const [
+      schemaValue,
+      currentValue,
+      catalogEpochValue,
+      baseManifestValue,
+      recordLedgerValue,
+      resourceLedgerValue,
+      transactionLedgerValue,
+      storedBlockKeys,
+      pendingSegmentValues,
+    ] = await Promise.all([
       requestResult<unknown>(catalog.get(SCHEMA_EPOCH_KEY)),
       requestResult<unknown>(catalog.get(CURRENT_MANIFEST_KEY)),
+      requestResult<unknown>(catalog.get(CATALOG_EPOCH_KEY)),
+      input.expectedManifestVersion === null
+        ? Promise.resolve(undefined)
+        : requestResult<unknown>(manifestStore.get(input.expectedManifestVersion)),
+      requestResult<unknown>(statistics.get(RECORD_RESOURCE_LEDGER_KEY)),
+      requestResult<unknown>(statistics.get(RESOURCE_LEDGER_KEY)),
+      requestResult<unknown>(statistics.get(transactionResourceLedgerKey(record.id))),
+      Promise.all(record.pendingBlockIds.map((id) => requestResult(blockStore.getKey(id)))),
+      Promise.all(
+        record.pendingSegmentIds.map((id) => requestResult<unknown>(segmentStore.get(id))),
+      ),
     ]);
     assertCommitSchema(record, asSchemaEpoch(schemaValue));
     const current = asOptionalManifestVersion(currentValue, CURRENT_MANIFEST_KEY);
@@ -4692,7 +4758,7 @@ export class IndexedDbBlockStore implements BlockStore {
     assertCommitSnapshot(record, input.expectedManifestVersion, actualVersion);
     const pendingTable = record.pendingTable;
     if (pendingTable !== undefined) {
-      const epoch = asCatalogEpoch(await requestResult<unknown>(catalog.get(CATALOG_EPOCH_KEY)));
+      const epoch = asCatalogEpoch(catalogEpochValue);
       if (epoch !== record.catalogEpochGuard) {
         throw new TableRecordConflictError(
           pendingTable.id,
@@ -4714,18 +4780,10 @@ export class IndexedDbBlockStore implements BlockStore {
       }
     }
 
-    const manifestStore = transaction.objectStore("manifests");
     const baseRecord =
-      input.expectedManifestVersion === null
+      input.expectedManifestVersion === null || baseManifestValue === undefined
         ? undefined
-        : await (async () => {
-            const value: unknown = await requestResult(
-              manifestStore.get(input.expectedManifestVersion ?? -1),
-            );
-            return value === undefined
-              ? undefined
-              : asStoredManifestRecord(value, input.expectedManifestVersion ?? undefined);
-          })();
+        : asStoredManifestRecord(baseManifestValue, input.expectedManifestVersion);
     if (input.expectedManifestVersion !== null && baseRecord === undefined) {
       throw new Error(`Snapshot manifest is missing: ${String(input.expectedManifestVersion)}`);
     }
@@ -4759,14 +4817,6 @@ export class IndexedDbBlockStore implements BlockStore {
       await assertCompactionRetirementInTransaction(transaction, record, input, removedBlockIds);
     }
 
-    const blockStore = transaction.objectStore("blocks");
-    const segmentStore = transaction.objectStore("segments");
-    const [storedBlockKeys, pendingSegmentValues] = await Promise.all([
-      Promise.all(record.pendingBlockIds.map((id) => requestResult(blockStore.getKey(id)))),
-      Promise.all(
-        record.pendingSegmentIds.map((id) => requestResult<unknown>(segmentStore.get(id))),
-      ),
-    ]);
     const missingBlockIndex = storedBlockKeys.findIndex((key) => key === undefined);
     if (missingBlockIndex >= 0) {
       throw new Error(
@@ -4785,18 +4835,54 @@ export class IndexedDbBlockStore implements BlockStore {
     if (foreignSegment !== undefined) {
       throw new Error(`Segment ${foreignSegment.id} belongs to another transaction`);
     }
-    await assertCompactionOutputSegmentsInTransaction(
+    const compactionJob = await assertCompactionOutputSegmentsInTransaction(
       transaction,
       record,
       input.compactionJobId,
       pendingSegments,
     );
-    await assertLevelZeroSegmentLimits(
+    const changedTableIds = new Set([
+      ...(input.changedTableIds ?? []),
+      ...pendingSegments.map((segment) => segment.tableId),
+    ]);
+    const journalBlockIds = [...record.pendingBlockIds];
+    // The second set of reads the first one decided: the changed tables' records (read again by
+    // the ceiling, the UNIQUE coverage check, and the accelerator check below, none of which
+    // writes one), and each journaled block's manifest provenance and metadata.
+    const [changedTableValues, journalBlockRecords, journalMetadataValues] = await Promise.all([
+      Promise.all(
+        [...changedTableIds].map(
+          async (tableId) =>
+            [
+              tableId,
+              await requestResult<unknown>(catalog.get(`${TABLE_ID_PREFIX}${tableId}`)),
+            ] as const,
+        ),
+      ),
+      Promise.all(
+        journalBlockIds.map((id) => requestResult<unknown>(catalog.get(manifestBlockKey(id)))),
+      ),
+      Promise.all(
+        journalBlockIds.map((id) => requestResult<unknown>(catalog.get(blockMetadataKey(id)))),
+      ),
+    ]);
+    const tableValues = new Map(changedTableValues);
+    // assertCommitSnapshot proved the manifest is still at the expected version inside this
+    // transaction, so counts remembered at that version are exactly what a fresh count reads.
+    const knownLevelZeroCounts =
+      this.#levelZeroCounts !== undefined &&
+      this.#levelZeroCounts.version === input.expectedManifestVersion
+        ? this.#levelZeroCounts.counts
+        : undefined;
+    const countedLevelZero = await assertLevelZeroSegmentLimits(
       transaction,
       input.levelZeroSegmentLimits ?? [],
       pendingSegments,
       input.expectedManifestVersion,
       pendingTable,
+      knownLevelZeroCounts,
+      tableValues,
+      levelZeroSegmentsRetiredBy(compactionJob),
     );
 
     // The single-entry path below is the hot bulk-load path. Multi-entry commits (write scopes
@@ -4804,12 +4890,8 @@ export class IndexedDbBlockStore implements BlockStore {
     // retain one complete membership cache when its byte budget allows it.
     const uniqueKeyEntries = input.uniqueKeyChanges ?? [];
     const coveredUniqueNamespaces = new Set(uniqueKeyEntries.map((entry) => entry.tableId));
-    const changedTableIds = new Set([
-      ...(input.changedTableIds ?? []),
-      ...pendingSegments.map((segment) => segment.tableId),
-    ]);
     for (const tableId of changedTableIds) {
-      const value: unknown = await requestResult(catalog.get(`${TABLE_ID_PREFIX}${tableId}`));
+      const value = tableValues.get(tableId);
       const changedTable =
         value === undefined
           ? pendingTable?.id === tableId
@@ -4930,29 +5012,29 @@ export class IndexedDbBlockStore implements BlockStore {
       }
     }
 
-    const journalBlockIds = [...record.pendingBlockIds];
-    const journalMembership = await manifestBlockMembershipInTransaction(
-      catalog,
-      input.expectedManifestVersion,
-      journalBlockIds,
+    // manifestBlockMembershipInTransaction's answer, from the provenance records read above.
+    const journalMembership = journalBlockIds.map((id, index) => {
+      const value = journalBlockRecords[index];
+      if (input.expectedManifestVersion === null || value === undefined) return false;
+      return manifestBlockVisibleAt(
+        asManifestBlockRecord(value, id),
+        input.expectedManifestVersion,
+      );
+    });
+    const addedIndexes = journalBlockIds.flatMap((_, index) =>
+      journalMembership[index] === true ? [] : [index],
     );
-    const addedBlockIds = journalBlockIds.filter((_, index) => journalMembership[index] !== true);
-    const [addedMetadata, removedMetadata] = await Promise.all([
-      Promise.all(
-        addedBlockIds.map((id) =>
-          requestResult<unknown>(catalog.get(blockMetadataKey(id))).then((value) =>
-            asStoredBlockMetadata(value, id),
-          ),
+    const addedBlockIds = addedIndexes.map((index) => journalBlockIds[index] ?? "");
+    const addedMetadata = addedIndexes.map((index) =>
+      asStoredBlockMetadata(journalMetadataValues[index], journalBlockIds[index] ?? ""),
+    );
+    const removedMetadata = await Promise.all(
+      removedBlockIds.map((id) =>
+        requestResult<unknown>(catalog.get(blockMetadataKey(id))).then((value) =>
+          asStoredBlockMetadata(value, id),
         ),
       ),
-      Promise.all(
-        removedBlockIds.map((id) =>
-          requestResult<unknown>(catalog.get(blockMetadataKey(id))).then((value) =>
-            asStoredBlockMetadata(value, id),
-          ),
-        ),
-      ),
-    ]);
+    );
     const addedBytes = addedMetadata.reduce(
       (total, entry) => safeByteSum(total, entry.byteLength, "Manifest added bytes"),
       0,
@@ -4989,10 +5071,14 @@ export class IndexedDbBlockStore implements BlockStore {
     };
     const manifest = summary;
     const committedSegmentChanges = pendingSegments.map((segment) => {
+      // A delta merge's level-zero output keeps the order of the run it replaces.
       const next: SegmentRecord = {
         ...segment,
         level: segment.level,
-        logicalOrder: segment.level === 0 ? manifest.version : segment.logicalOrder,
+        logicalOrder:
+          segment.level === 0 && compactionJob === undefined
+            ? manifest.version
+            : segment.logicalOrder,
       };
       return { previous: segment, next };
     });
@@ -5003,40 +5089,56 @@ export class IndexedDbBlockStore implements BlockStore {
         pendingTable,
       );
     }
-    await updateRecordResourceLedger(transaction.objectStore("statistics"), {
-      manifests: [{ next: manifest }],
-      segments: committedSegmentChanges,
-    });
-    await assertPinnedHistoryAdmission(transaction, {
-      cutoff: input.committedAt,
-      currentVersion: manifest.version,
-      excludeTransactionId: record.id,
-      prospectiveRemovedBlockIds: new Set(removedBlockIds),
-    });
+    await updateRecordResourceLedger(
+      statistics,
+      { manifests: [{ next: manifest }], segments: committedSegmentChanges },
+      // Read in the first batch; nothing since has written the record ledger.
+      { value: recordLedgerValue },
+    );
+    // Both admission checks only read, so their reads share one round trip; a refusal from the
+    // pinned-history check still wins over one from the terminal-record check.
+    const [pinnedAdmission, terminalAdmission] = await Promise.allSettled([
+      assertPinnedHistoryAdmission(transaction, {
+        cutoff: input.committedAt,
+        currentVersion: manifest.version,
+        excludeTransactionId: record.id,
+        prospectiveRemovedBlockIds: new Set(removedBlockIds),
+      }),
+      assertTerminalTransactionAdmission(transactionStore),
+    ]);
+    if (pinnedAdmission.status === "rejected") throw pinnedAdmission.reason;
     const committed = updateTransactionRecord(record, {
       status: "committed",
       committedVersion: manifest.version,
       updatedAt: input.committedAt,
     });
-    await assertTerminalTransactionAdmission(transactionStore);
-    await updateRetiredHistoryLedger(transaction.objectStore("statistics"), removedBytes);
+    if (terminalAdmission.status === "rejected") throw terminalAdmission.reason;
+    await updateRetiredHistoryLedger(statistics, removedBytes, { value: resourceLedgerValue });
     await publishManifestBlockDeltaInTransaction(
       catalog,
       manifest.version,
       addedBlockIds,
       addedMetadata,
       removedBlockIds,
+      addedIndexes.map((index) => journalBlockRecords[index]),
     );
     manifestStore.add(manifest satisfies StoredManifestRecord, manifest.version);
     catalog.put(manifest.version, CURRENT_MANIFEST_KEY);
     catalog.delete(SNAPSHOT_FRAME_COMPLETED_KEY);
-    await deleteSnapshotFrameRecords(transaction.objectStore(SNAPSHOT_HEADER_STORE), "import");
+    // Issued now and joined before the commit returns: the cleanup only deletes frame records,
+    // which nothing below reads or writes, and a failure still aborts the whole transaction.
+    const frameCleanup = deleteSnapshotFrameRecords(
+      transaction.objectStore(SNAPSHOT_HEADER_STORE),
+      "import",
+    );
+    // Observed at once so an early refusal below leaves no unhandled rejection; joined below.
+    frameCleanup.catch(() => undefined);
     if (pendingTable !== undefined) {
       await installPendingTableCatalogRecords(catalog, pendingTable);
       catalog.put(record.pendingTableNextRowId ?? 1n, `${ROW_ID_PREFIX}${pendingTable.id}`);
       await bumpSchemaEpoch(catalog);
     }
-    await bumpCatalogEpoch(catalog);
+    await bumpCatalogEpoch(catalog, { value: catalogEpochValue });
     for (const { next: segment } of committedSegmentChanges) {
       segmentStore.put(segment, segment.id);
     }
@@ -5231,7 +5333,12 @@ export class IndexedDbBlockStore implements BlockStore {
     const changedFtsTableIds = new Set(pendingSegments.map((segment) => segment.tableId));
     const scalarChangedTableIds = new Set(manifest.changedTableIds);
     for (const tableId of changedFtsTableIds) {
-      const tableValue: unknown = await requestResult(catalog.get(`${TABLE_ID_PREFIX}${tableId}`));
+      // Each table is visited once, and only a pending table's record was written since the
+      // second batch read the others.
+      const tableValue: unknown =
+        tableId !== pendingTable?.id && tableValues.has(tableId)
+          ? tableValues.get(tableId)
+          : await requestResult(catalog.get(`${TABLE_ID_PREFIX}${tableId}`));
       if (tableValue === undefined) continue;
       const forTable = (input.ftsChanges ?? []).find((entry) => entry.tableId === tableId);
       const covered = new Set(forTable?.columns.map((column) => column.columnId) ?? []);
@@ -5362,7 +5469,9 @@ export class IndexedDbBlockStore implements BlockStore {
       }
     }
     if (ftsDeltaCounts.length > 0) manifest.ftsDeltaCounts = ftsDeltaCounts;
-    await clearTransactionResourceLedger(transaction.objectStore("statistics"), committed.id);
+    await clearTransactionResourceLedger(statistics, committed.id, {
+      value: transactionLedgerValue,
+    });
     // A journaled record's ids do not change at commit, so only its header is rewritten; a
     // single-shot write's ids have no chunks yet and are written here with the record.
     if (journal === "stored") {
@@ -5370,6 +5479,7 @@ export class IndexedDbBlockStore implements BlockStore {
     } else {
       putTransactionRecord(transaction, committed, journal.replacedChunkCount);
     }
+    await frameCleanup;
     const settle = (): void => {
       if (pendingTable !== undefined) {
         this.#tableIdsByName.set(pendingTable.name, pendingTable.id);
@@ -5457,6 +5567,13 @@ export class IndexedDbBlockStore implements BlockStore {
       }
       this.#manifestCache = undefined;
       this.#journalCache = undefined;
+      this.#levelZeroCounts = advancedLevelZeroCounts(
+        knownLevelZeroCounts,
+        countedLevelZero,
+        pendingSegments,
+        removedBlockIds.length > 0,
+        manifest.version,
+      );
     };
     return { manifest, settle };
   }
@@ -5467,9 +5584,11 @@ export class IndexedDbBlockStore implements BlockStore {
     if (normalized.kind === "backup") {
       throw new TypeError("Backup leases are created by beginSnapshotFrameExport");
     }
+    // Writes only reader leases: the new one and expired ones it clears.
     const transaction = this.#transaction(
       ["blocks", "catalog", "leases", "manifests", "transactions"],
       "readwrite",
+      { softState: true },
     );
     try {
       await assertSnapshotAvailableInTransaction(transaction, normalized.manifestVersion);
@@ -5604,12 +5723,26 @@ export class IndexedDbBlockStore implements BlockStore {
   async moveLease(input: MoveLeaseInput): Promise<LeaseRecord> {
     validateId(input.id, "Lease ID");
     const cutoff = validateBoundedLeaseExpiration(input.expiresAtCutoff, input.expiresAt, "Lease");
+    // Writes only the moved reader lease; a backup lease is refused before anything is written.
     const transaction = this.#transaction(
       ["leases", "manifests", "blocks", "catalog", "transactions"],
       "readwrite",
+      { softState: true },
     );
     const store = transaction.objectStore("leases");
-    const value: unknown = await requestResult(store.get(input.id));
+    // The lease, the target manifest, and the current version in one round trip; each is
+    // still checked in the order the move always checked them. A target that is not a valid
+    // manifest key is not read here, so the lease check still refuses first.
+    const targetVersion = input.manifestVersion;
+    const readTarget =
+      targetVersion !== null && Number.isSafeInteger(targetVersion) && targetVersion >= 0;
+    const [value, targetValue, currentValue] = await Promise.all([
+      requestResult<unknown>(store.get(input.id)),
+      readTarget
+        ? requestResult<unknown>(transaction.objectStore("manifests").get(targetVersion))
+        : Promise.resolve(undefined),
+      requestResult<unknown>(transaction.objectStore("catalog").get(CURRENT_MANIFEST_KEY)),
+    ]);
     const record = value === undefined ? undefined : asLeaseRecord(value, input.id);
     if (record?.revision !== input.expectedRevision) {
       transaction.abort();
@@ -5623,20 +5756,21 @@ export class IndexedDbBlockStore implements BlockStore {
       if (record.kind === "backup") {
         throw new Error("Snapshot export leases cannot move to another manifest");
       }
-      await assertSnapshotAvailableInTransaction(transaction, input.manifestVersion);
+      if (!readTarget) {
+        await assertSnapshotAvailableInTransaction(transaction, input.manifestVersion);
+      } else {
+        // assertSnapshotAvailableInTransaction's checks, on the target read above.
+        if (targetValue === undefined) throw new SnapshotManifestMissingError(targetVersion);
+        const target = asStoredManifestRecord(targetValue, targetVersion);
+        if (target.prunedAt !== undefined) throw new SnapshotManifestMissingError(targetVersion);
+      }
       const moved = {
         ...record,
         manifestVersion: input.manifestVersion,
         expiresAt: input.expiresAt,
         revision: incrementSafeInteger(record.revision, "Lease revision"),
       };
-      const currentVersion =
-        asOptionalManifestVersion(
-          await requestResult<unknown>(
-            transaction.objectStore("catalog").get(CURRENT_MANIFEST_KEY),
-          ),
-          CURRENT_MANIFEST_KEY,
-        ) ?? null;
+      const currentVersion = asOptionalManifestVersion(currentValue, CURRENT_MANIFEST_KEY) ?? null;
       await assertPinnedHistoryAdmission(transaction, {
         cutoff: input.expiresAtCutoff,
         currentVersion,
@@ -6650,6 +6784,7 @@ export class IndexedDbBlockStore implements BlockStore {
       this.#tableIdsByName.clear();
       this.#uniqueKeyCache = undefined;
       this.#manifestCache = undefined;
+      this.#levelZeroCounts = undefined;
       this.#journalCache = undefined;
       return {
         identity,
@@ -9024,6 +9159,7 @@ export class IndexedDbBlockStore implements BlockStore {
       this.#tableIdsByName.clear();
       this.#uniqueKeyCache = undefined;
       this.#manifestCache = undefined;
+      this.#levelZeroCounts = undefined;
       this.#journalCache = undefined;
     } catch (error) {
       abortIfActive(transaction);
@@ -9072,6 +9208,7 @@ export class IndexedDbBlockStore implements BlockStore {
       this.#tableIdsByName.clear();
       this.#uniqueKeyCache = undefined;
       this.#manifestCache = undefined;
+      this.#levelZeroCounts = undefined;
       this.#journalCache = undefined;
       return {
         identity: marker.identity,
@@ -9093,6 +9230,7 @@ export class IndexedDbBlockStore implements BlockStore {
     this.#tableIdsByName.clear();
     this.#uniqueKeyCache = undefined;
     this.#manifestCache = undefined;
+    this.#levelZeroCounts = undefined;
     this.#journalCache = undefined;
     this.#stallGuard.dispose();
     this.#db.close();
@@ -9458,7 +9596,16 @@ export class IndexedDbBlockStore implements BlockStore {
   #transaction(
     stores: string | string[],
     mode: IDBTransactionMode,
-    options: { allowSnapshotImport?: boolean } = {},
+    options: {
+      allowSnapshotImport?: boolean;
+      /**
+       * "relaxed" for a write of reader-lease soft state only. A reader lease protects a
+       * version from collection while its reader lives; a crash that loses an unflushed lease
+       * write also ended that reader, so the flush buys nothing, and IndexedDB keeps
+       * transaction order and visibility between connections either way.
+       */
+      softState?: boolean;
+    } = {},
   ): IDBTransaction {
     if (this.#unresponsive !== undefined) throw this.#unresponsive;
     if (this.#closed) throw new Error("This IndexedDB store connection is closed");
@@ -9471,7 +9618,9 @@ export class IndexedDbBlockStore implements BlockStore {
         : requested;
     const transaction =
       mode === "readwrite"
-        ? this.#db.transaction(storeList, mode, { durability: this.#durability })
+        ? this.#db.transaction(storeList, mode, {
+            durability: options.softState === true ? "relaxed" : this.#durability,
+          })
         : this.#db.transaction(storeList, mode);
     // Observe completion before any request can fail. Catch paths may run after native abort
     // dispatch (for example on quota exhaustion), when installing a new listener is too late.
@@ -10134,8 +10283,16 @@ function readExpiredTempOwnerPage(
  * `getCatalogProbe` is an atomic, monotonic proof of catalog identity: an unchanged epoch
  * means no table record, manifest publish, or commit has landed since the epoch was read.
  */
-async function bumpCatalogEpoch(catalog: IDBObjectStore): Promise<void> {
-  const value: unknown = await requestResult(catalog.get(CATALOG_EPOCH_KEY));
+/**
+ * `known` is the epoch record's value as this transaction already read it, when nothing has
+ * written it since; otherwise it is read here.
+ */
+async function bumpCatalogEpoch(
+  catalog: IDBObjectStore,
+  known?: { readonly value: unknown },
+): Promise<void> {
+  const value: unknown =
+    known === undefined ? await requestResult(catalog.get(CATALOG_EPOCH_KEY)) : known.value;
   let next: number;
   try {
     next = incrementSafeInteger(asCatalogEpoch(value), "Catalog epoch");
@@ -14351,18 +14508,19 @@ async function assertCompactionRetirementInTransaction(
   }
 }
 
+/** Proves a commit's output segments; returns the authorizing compaction job, if any. */
 async function assertCompactionOutputSegmentsInTransaction(
   transaction: IDBTransaction,
   committingTransaction: TransactionRecord,
   compactionJobId: string | undefined,
   pendingSegments: readonly SegmentRecord[],
-): Promise<void> {
+): Promise<CompactionJobRecord | undefined> {
   if (compactionJobId === undefined) {
     const nonLevelZero = pendingSegments.find((segment) => segment.level > 0);
     if (nonLevelZero !== undefined) {
       throw new Error("Non-level-zero segments require a ready compaction job");
     }
-    return;
+    return undefined;
   }
   const key = compactionJobKey(compactionJobId);
   const value: unknown = await requestResult(transaction.objectStore("gc").get(key));
@@ -14387,37 +14545,84 @@ async function assertCompactionOutputSegmentsInTransaction(
     sourceSegments,
     pendingSegments,
   );
+  return job;
 }
 
+/**
+ * Refuses a commit that would take a table past its level-zero ceiling. `known` holds counts
+ * already proven exact at `version` (the caller has checked the in-transaction manifest is still
+ * there); every other table is counted from storage. Returns each admitted table's count before
+ * this commit, so the caller can carry them forward once the commit is durable.
+ */
 async function assertLevelZeroSegmentLimits(
   transaction: IDBTransaction,
   limits: ReadonlyArray<{ tableId: string; limit: number }>,
   pendingSegments: readonly SegmentRecord[],
   version: number | null,
   pendingTable?: TableRecord,
-): Promise<void> {
+  known?: ReadonlyMap<string, number>,
+  /** Raw table records this transaction already read, by table ID, with no write since. */
+  tableValues?: ReadonlyMap<string, unknown>,
+  /** Level-zero segments the commit retires, by table (see levelZeroSegmentsRetiredBy). */
+  retired: ReadonlyMap<string, number> = new Map(),
+): Promise<Map<string, number>> {
   const admissions = planLevelZeroAdmissions(limits, pendingSegments);
   const catalog = transaction.objectStore("catalog");
   const segmentIndex = transaction.objectStore("segments").index(SEGMENT_TABLE_INDEX);
+  const counted = new Map<string, number>();
   for (const [tableId, entry] of admissions) {
-    const table =
-      (await readDeclaredTable(catalog, tableId)) ??
-      (pendingTable?.id === tableId ? pendingTable : undefined);
+    const declared =
+      tableValues?.has(tableId) === true
+        ? declaredTableFromValue(tableValues.get(tableId), tableId)
+        : await readDeclaredTable(catalog, tableId);
+    const table = declared ?? (pendingTable?.id === tableId ? pendingTable : undefined);
     if (table === undefined) {
       throw new Error(`Level-zero segment limit references missing table: ${tableId}`);
     }
-    const existing = await countVisibleLevelZeroSegments(
-      segmentIndex,
-      transaction.objectStore("transactions"),
-      catalog,
-      version,
-      tableId,
-    );
-    const count = existing + entry.added;
+    const existing =
+      known?.get(tableId) ??
+      (await countVisibleLevelZeroSegments(
+        segmentIndex,
+        transaction.objectStore("transactions"),
+        catalog,
+        version,
+        tableId,
+      ));
+    counted.set(tableId, existing);
+    const count = existing + entry.added - (retired.get(tableId) ?? 0);
     if (count > entry.limit) {
       throw new CompactionBacklogError(table.name, count, entry.limit);
     }
   }
+  return counted;
+}
+
+/**
+ * The level-zero counts that hold at `nextVersion` after a durable commit. An ordinary commit
+ * retires no block and commits no owner but its own, so every table's count moves by exactly the
+ * level-zero segments it published: remembered counts carry over, freshly counted tables join.
+ * A compaction retires level-zero sources, so nothing is carried and the next commit to each
+ * table counts again; that costs one count per fold rather than one per commit.
+ */
+function advancedLevelZeroCounts(
+  known: ReadonlyMap<string, number> | undefined,
+  counted: ReadonlyMap<string, number>,
+  pendingSegments: readonly SegmentRecord[],
+  retiredBlocks: boolean,
+  nextVersion: number,
+): { version: number; counts: Map<string, number> } | undefined {
+  if (retiredBlocks) return undefined;
+  const counts = new Map(known ?? []);
+  for (const [tableId, count] of counted) counts.set(tableId, count);
+  for (const segment of pendingSegments) {
+    if (segment.level !== 0) continue;
+    const count = counts.get(segment.tableId);
+    // planLevelZeroAdmissions requires a limit, and so a count, for every table that receives
+    // a level-zero segment; a table without one is forgotten rather than guessed.
+    if (count === undefined) counts.delete(segment.tableId);
+    else counts.set(segment.tableId, count + 1);
+  }
+  return { version: nextVersion, counts };
 }
 
 /**
@@ -14963,6 +15168,67 @@ function assertKnownCompactionJobNestedFields(
   ];
   const partitionFields = ["rowStart", "rowCount", "logicalOrder"];
   const outputFields = ["rowStart", "rowCount"];
+  const sourceSegmentFields = [
+    "segmentId",
+    "transactionId",
+    "committedVersion",
+    "kind",
+    "keyColumnId",
+    "level",
+    "logicalOrder",
+    "rowCount",
+    "rowIdStart",
+    "rowIdEndExclusive",
+    "rowIdSpans",
+    "columns",
+  ];
+  const sourceSegmentNested = (segment: Record<string, unknown>, segmentLocation: string) => {
+    assertKnownRecordArrayFields(
+      segment.rowIdSpans,
+      ["rowStart", "rowCount", "rowIdStart"],
+      `${segmentLocation}/rowIdSpans`,
+    );
+    assertKnownRecordArrayFields(
+      segment.columns,
+      ["columnId", "type", "sourceBlocks"],
+      `${segmentLocation}/columns`,
+      (column, columnLocation) =>
+        assertKnownRecordArrayFields(
+          column.sourceBlocks,
+          sourceBlockFields,
+          `${columnLocation}/sourceBlocks`,
+        ),
+    );
+  };
+  if (plan.kind === "delta-v1") {
+    assertKnownFields(
+      plan,
+      ["kind", "keyColumnId", "columns", "logicalOrder", "sourceSegments", "outputs", "resolution"],
+      planLocation,
+    );
+    assertKnownRecordArrayFields(plan.columns, ["columnId", "type"], `${planLocation}/columns`);
+    assertKnownRecordArrayFields(
+      plan.sourceSegments,
+      sourceSegmentFields,
+      `${planLocation}/sourceSegments`,
+      sourceSegmentNested,
+    );
+    assertKnownRecordArrayFields(
+      plan.outputs,
+      ["kind", "columns", "rowCount", "blockRows"],
+      `${planLocation}/outputs`,
+      (output, outputLocation) =>
+        assertKnownRecordArrayFields(
+          output.columns,
+          ["columnId", "type"],
+          `${outputLocation}/columns`,
+        ),
+    );
+    if (isRecord(plan.resolution)) {
+      assertKnownFields(plan.resolution, ["rows", "checksum"], `${planLocation}/resolution`);
+    }
+    return;
+  }
   if (plan.kind === "rechunk-v1") {
     assertKnownFields(
       plan,
@@ -16850,9 +17116,13 @@ async function updateRecordResourceLedger(
     }>;
     segments?: ReadonlyArray<{ previous?: SegmentRecord; next?: SegmentRecord }>;
   },
+  /** The ledger's value as this transaction already read it, with no write since. */
+  known?: { readonly value: unknown },
 ): Promise<void> {
   const current = asRecordResourceLedger(
-    await requestResult<unknown>(store.get(RECORD_RESOURCE_LEDGER_KEY)),
+    known === undefined
+      ? await requestResult<unknown>(store.get(RECORD_RESOURCE_LEDGER_KEY))
+      : known.value,
   );
   let manifestCount = current.manifestCount;
   let manifestBytes = current.manifestBytes;
@@ -17066,8 +17336,14 @@ async function assertTableForeignKeysInTransaction(
 async function updateRetiredHistoryLedger(
   store: IDBObjectStore,
   deltaBytes: number,
+  /** The ledger's value as this transaction already read it, with no write since. */
+  known?: { readonly value: unknown },
 ): Promise<void> {
-  const current = asResourceLedger(await requestResult<unknown>(store.get(RESOURCE_LEDGER_KEY)));
+  const current = asResourceLedger(
+    known === undefined
+      ? await requestResult<unknown>(store.get(RESOURCE_LEDGER_KEY))
+      : known.value,
+  );
   const retiredHistoryBytes = current.retiredHistoryBytes + deltaBytes;
   if (!Number.isSafeInteger(retiredHistoryBytes) || retiredHistoryBytes < 0) {
     throw corruption(`statistics/${RESOURCE_LEDGER_KEY}`, "retired history byte ledger overflowed");
@@ -17179,10 +17455,12 @@ async function updateTransactionResourceLedger(
 async function clearTransactionResourceLedger(
   store: IDBObjectStore,
   transactionId: string,
+  /** The transaction ledger's value as this transaction already read it, with no write since. */
+  known?: { readonly value: unknown },
 ): Promise<void> {
   const key = transactionResourceLedgerKey(transactionId);
   const current = asOptionalTransactionResourceLedger(
-    await requestResult<unknown>(store.get(key)),
+    known === undefined ? await requestResult<unknown>(store.get(key)) : known.value,
     transactionId,
   );
   if (current === undefined) return;
@@ -17277,16 +17555,18 @@ async function assertPinnedHistoryAdmission(
   const cutoff = Date.parse(input.cutoff);
   if (!Number.isFinite(cutoff)) throw new TypeError("Pinned-history cutoff must be valid");
   const pinnedVersions: number[] = [];
-  if (transaction.objectStoreNames.contains("leases")) {
-    await visitObjectStoreSequentially(transaction.objectStore("leases"), (value, key) => {
-      if (typeof key !== "string") throw corruption("leases", "record key is invalid");
-      if (key === input.excludeLeaseId) return;
-      const lease = asLeaseRecord(value, key);
-      if (lease.manifestVersion !== null && Date.parse(lease.expiresAt) > cutoff) {
-        pinnedVersions.push(lease.manifestVersion);
-      }
-    });
-  }
+  // Leases and active transactions are independent partitions: walk them side by side, one
+  // round trip per step for both. Only the set of pinned versions matters, never its order.
+  const leaseWalk = transaction.objectStoreNames.contains("leases")
+    ? visitObjectStoreSequentially(transaction.objectStore("leases"), (value, key) => {
+        if (typeof key !== "string") throw corruption("leases", "record key is invalid");
+        if (key === input.excludeLeaseId) return;
+        const lease = asLeaseRecord(value, key);
+        if (lease.manifestVersion !== null && Date.parse(lease.expiresAt) > cutoff) {
+          pinnedVersions.push(lease.manifestVersion);
+        }
+      })
+    : Promise.resolve();
   const replacement = input.replacementLease;
   if (
     replacement?.manifestVersion !== null &&
@@ -17303,27 +17583,29 @@ async function assertPinnedHistoryAdmission(
   ) {
     pinnedVersions.push(replacementTransaction.snapshotVersion);
   }
-  if (transaction.objectStoreNames.contains("transactions")) {
-    const transactions = transaction.objectStore("transactions");
-    // Terminal records accumulate up to the durable hard limit before collection. They cannot pin
-    // history, so walk only the bounded active partition instead of rescanning every historical
-    // transaction on each begin and commit.
-    await visitIndexPartitionSequentially(
-      transactions.index(TRANSACTION_STATUS_INDEX),
-      "active",
-      (value, key) => {
-        if (typeof key !== "string") throw corruption("transactions", "record key is invalid");
-        if (key === input.excludeTransactionId) return;
-        const record = asStoredTransactionRecord(value, key);
-        if (record.status !== "active") {
-          throw corruption(`transactions/${key}`, "status index does not match its record");
-        }
-        if (record.snapshotVersion !== null && Date.parse(record.expiresAt) > cutoff) {
-          pinnedVersions.push(record.snapshotVersion);
-        }
-      },
-    );
-  }
+  // Terminal records accumulate up to the durable hard limit before collection. They cannot pin
+  // history, so walk only the bounded active partition instead of rescanning every historical
+  // transaction on each begin and commit.
+  const transactionWalk = transaction.objectStoreNames.contains("transactions")
+    ? visitIndexPartitionSequentially(
+        transaction.objectStore("transactions").index(TRANSACTION_STATUS_INDEX),
+        "active",
+        (value, key) => {
+          if (typeof key !== "string") throw corruption("transactions", "record key is invalid");
+          if (key === input.excludeTransactionId) return;
+          const record = asStoredTransactionRecord(value, key);
+          if (record.status !== "active") {
+            throw corruption(`transactions/${key}`, "status index does not match its record");
+          }
+          if (record.snapshotVersion !== null && Date.parse(record.expiresAt) > cutoff) {
+            pinnedVersions.push(record.snapshotVersion);
+          }
+        },
+      )
+    : Promise.resolve();
+  const [leases, transactions] = await Promise.allSettled([leaseWalk, transactionWalk]);
+  if (leases.status === "rejected") throw leases.reason;
+  if (transactions.status === "rejected") throw transactions.reason;
   if (input.currentVersion !== null && pinnedVersions.length > 0) {
     const oldest = Math.min(...pinnedVersions);
     const lag = input.currentVersion - oldest;
@@ -17342,6 +17624,18 @@ async function assertPinnedHistoryAdmission(
     }
   }
   if (pinnedVersions.length === 0) return;
+  // Pinned retired history grows only when a block retires under a pin or a pin lands on a
+  // version it did not cover; every call that does either names it here and is checked below.
+  // A call that does neither — an ordinary commit retires nothing and only drops its own pin —
+  // leaves at most the usage the last such check admitted, so it skips the walk of every
+  // manifest-block record, which otherwise made each commit cost the size of the database.
+  if (
+    (input.prospectiveRemovedBlockIds?.size ?? 0) === 0 &&
+    input.replacementLease === undefined &&
+    input.replacementTransaction === undefined
+  ) {
+    return;
+  }
   let pinnedBlockCount = 0;
   let pinnedBytes = 0;
   await visitManifestBlockReadBatches(transaction.objectStore("catalog"), (record) => {
@@ -17463,8 +17757,16 @@ async function readDeclaredTable(
   tableId: string,
 ): Promise<TableRecord | undefined> {
   validateId(tableId, "Table ID");
+  return declaredTableFromValue(
+    await requestResult<unknown>(catalog.get(`${TABLE_ID_PREFIX}${tableId}`)),
+    tableId,
+  );
+}
+
+/** `readDeclaredTable`'s checks on a table record value read earlier in the same transaction. */
+function declaredTableFromValue(value: unknown, tableId: string): TableRecord | undefined {
+  validateId(tableId, "Table ID");
   const key = `${TABLE_ID_PREFIX}${tableId}`;
-  const value: unknown = await requestResult(catalog.get(key));
   if (value === undefined) return undefined;
   const table = asTableRecord(value, key);
   if (table.id !== tableId) throw corruption(key, "table ID does not match its catalog key");
@@ -17539,10 +17841,14 @@ async function assertSegmentTargetsCurrentTable(
   catalog: IDBObjectStore,
   segment: SegmentRecord,
   pendingTable?: TableRecord,
+  /** Raw table records this transaction already read, by table ID, with no write since. */
+  tableValues?: ReadonlyMap<string, unknown>,
 ): Promise<void> {
-  const table =
-    (await readDeclaredTable(catalog, segment.tableId)) ??
-    (pendingTable?.id === segment.tableId ? pendingTable : undefined);
+  const declared =
+    tableValues?.has(segment.tableId) === true
+      ? declaredTableFromValue(tableValues.get(segment.tableId), segment.tableId)
+      : await readDeclaredTable(catalog, segment.tableId);
+  const table = declared ?? (pendingTable?.id === segment.tableId ? pendingTable : undefined);
   if (table === undefined) throw new Error(`Segment ${segment.id} references missing table`);
   const columnIds = new Set(table.columns.map((column) => column.id));
   for (const columnId of Object.keys(segment.columnBlockIds)) {
@@ -18516,14 +18822,21 @@ async function publishManifestBlockDeltaInTransaction(
   addedBlockIds: readonly string[],
   addedMetadata: readonly StoredBlockMetadata[],
   removedBlockIds: readonly string[],
+  /** The added blocks' provenance records as this transaction already read them, if it has. */
+  knownAdds?: readonly unknown[],
 ): Promise<void> {
   if (addedBlockIds.length !== addedMetadata.length) {
     throw new TypeError("Manifest additions and block metadata disagree");
   }
+  if (knownAdds !== undefined && knownAdds.length !== addedBlockIds.length) {
+    throw new TypeError("Manifest additions and their provenance reads disagree");
+  }
   const previousVersion = version - 1;
-  const existingAdds = await Promise.all(
-    addedBlockIds.map((id) => requestResult<unknown>(catalog.get(manifestBlockKey(id)))),
-  );
+  const existingAdds =
+    knownAdds ??
+    (await Promise.all(
+      addedBlockIds.map((id) => requestResult<unknown>(catalog.get(manifestBlockKey(id)))),
+    ));
   const existingRemovals = await Promise.all(
     removedBlockIds.map((id) => requestResult<unknown>(catalog.get(manifestBlockKey(id)))),
   );

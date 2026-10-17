@@ -3204,7 +3204,7 @@
               "name": "CompactionRewritePlan",
               "kind": "type",
               "declarations": [
-                "export type CompactionRewritePlan = CopyCompactionRewritePlan | RechunkCompactionRewritePlan | MergeCompactionRewritePlan | ReplayedMergeCompactionRewritePlan;"
+                "export type CompactionRewritePlan = CopyCompactionRewritePlan | RechunkCompactionRewritePlan | MergeCompactionRewritePlan | ReplayedMergeCompactionRewritePlan | DeltaMergeCompactionRewritePlan;"
               ]
             },
             {
@@ -3275,6 +3275,48 @@
               "kind": "value",
               "declarations": [
                 "export declare function deleteOpfsDatabase(options: {\n    name: string;\n    root?: FileSystemDirectoryHandle;\n}): Promise<void>;"
+              ]
+            },
+            {
+              "name": "DeltaMergeCompactionRewritePlan",
+              "kind": "type",
+              "declarations": [
+                "export interface DeltaMergeCompactionRewritePlan {\n    readonly kind: \"delta-v1\";\n    readonly keyColumnId: string;\n    readonly columns: readonly MergeCompactionPlannedColumn[];\n    readonly logicalOrder: number;\n    readonly sourceSegments: readonly MergeCompactionSourceSegment[];\n    readonly outputs: readonly DeltaMergeOutputSegment[];\n    readonly resolution: DeltaMergeResolution;\n}"
+              ]
+            },
+            {
+              "name": "deltaMergeOutputBlockId",
+              "kind": "value",
+              "declarations": [
+                "export declare function deltaMergeOutputBlockId(jobId: string, outputIndex: number, columnIndex: number, part: number): string;"
+              ]
+            },
+            {
+              "name": "deltaMergeOutputBlockIds",
+              "kind": "value",
+              "declarations": [
+                "export declare function deltaMergeOutputBlockIds(jobId: string, plan: DeltaMergeCompactionRewritePlan): string[];"
+              ]
+            },
+            {
+              "name": "DeltaMergeOutputSegment",
+              "kind": "type",
+              "declarations": [
+                "export interface DeltaMergeOutputSegment {\n    readonly kind: \"delete\" | \"update\";\n    readonly columns: readonly MergeCompactionPlannedColumn[];\n    readonly rowCount: number;\n    readonly blockRows: readonly number[];\n}"
+              ]
+            },
+            {
+              "name": "deltaMergeOutputSegments",
+              "kind": "value",
+              "declarations": [
+                "export declare function deltaMergeOutputSegments(job: Pick<CompactionJobRecord, \"id\" | \"tableId\" | \"outputSegmentId\">, plan: DeltaMergeCompactionRewritePlan, transactionId: string): Array<Omit<SegmentRecord, \"createdAt\">>;"
+              ]
+            },
+            {
+              "name": "DeltaMergeResolution",
+              "kind": "type",
+              "declarations": [
+                "export interface DeltaMergeResolution {\n    readonly rows: number;\n    readonly checksum: number;\n}"
               ]
             },
             {
@@ -3800,6 +3842,20 @@
               "kind": "value",
               "declarations": [
                 "MAX_COMPLETED_GARBAGE_COLLECTION_JOB_RECORDS = 1024"
+              ]
+            },
+            {
+              "name": "MAX_DELTA_MERGE_SOURCE_ENCODED_BYTES",
+              "kind": "value",
+              "declarations": [
+                "MAX_DELTA_MERGE_SOURCE_ENCODED_BYTES: number"
+              ]
+            },
+            {
+              "name": "MAX_DELTA_MERGE_SOURCE_ROWS",
+              "kind": "value",
+              "declarations": [
+                "MAX_DELTA_MERGE_SOURCE_ROWS = 65536"
               ]
             },
             {
@@ -5717,7 +5773,7 @@
               "name": "CompactionRewritePlan",
               "kind": "type",
               "declarations": [
-                "export type CompactionRewritePlan = CopyCompactionRewritePlan | RechunkCompactionRewritePlan | MergeCompactionRewritePlan | ReplayedMergeCompactionRewritePlan;"
+                "export type CompactionRewritePlan = CopyCompactionRewritePlan | RechunkCompactionRewritePlan | MergeCompactionRewritePlan | ReplayedMergeCompactionRewritePlan | DeltaMergeCompactionRewritePlan;"
               ]
             },
             {
@@ -5760,6 +5816,48 @@
               "kind": "type",
               "declarations": [
                 "export interface CreateManifestInput {\n    changedTableIds: readonly string[];\n    expectedVersion: number | null;\n    liveBlockCount: number;\n    liveBlockBytes: number;\n    createdAt?: string;\n}"
+              ]
+            },
+            {
+              "name": "DeltaMergeCompactionRewritePlan",
+              "kind": "type",
+              "declarations": [
+                "export interface DeltaMergeCompactionRewritePlan {\n    readonly kind: \"delta-v1\";\n    readonly keyColumnId: string;\n    readonly columns: readonly MergeCompactionPlannedColumn[];\n    readonly logicalOrder: number;\n    readonly sourceSegments: readonly MergeCompactionSourceSegment[];\n    readonly outputs: readonly DeltaMergeOutputSegment[];\n    readonly resolution: DeltaMergeResolution;\n}"
+              ]
+            },
+            {
+              "name": "deltaMergeOutputBlockId",
+              "kind": "value",
+              "declarations": [
+                "export declare function deltaMergeOutputBlockId(jobId: string, outputIndex: number, columnIndex: number, part: number): string;"
+              ]
+            },
+            {
+              "name": "deltaMergeOutputBlockIds",
+              "kind": "value",
+              "declarations": [
+                "export declare function deltaMergeOutputBlockIds(jobId: string, plan: DeltaMergeCompactionRewritePlan): string[];"
+              ]
+            },
+            {
+              "name": "DeltaMergeOutputSegment",
+              "kind": "type",
+              "declarations": [
+                "export interface DeltaMergeOutputSegment {\n    readonly kind: \"delete\" | \"update\";\n    readonly columns: readonly MergeCompactionPlannedColumn[];\n    readonly rowCount: number;\n    readonly blockRows: readonly number[];\n}"
+              ]
+            },
+            {
+              "name": "deltaMergeOutputSegments",
+              "kind": "value",
+              "declarations": [
+                "export declare function deltaMergeOutputSegments(job: Pick<CompactionJobRecord, \"id\" | \"tableId\" | \"outputSegmentId\">, plan: DeltaMergeCompactionRewritePlan, transactionId: string): Array<Omit<SegmentRecord, \"createdAt\">>;"
+              ]
+            },
+            {
+              "name": "DeltaMergeResolution",
+              "kind": "type",
+              "declarations": [
+                "export interface DeltaMergeResolution {\n    readonly rows: number;\n    readonly checksum: number;\n}"
               ]
             },
             {
@@ -6229,6 +6327,20 @@
               "kind": "value",
               "declarations": [
                 "MAX_COMPLETED_GARBAGE_COLLECTION_JOB_RECORDS = 1024"
+              ]
+            },
+            {
+              "name": "MAX_DELTA_MERGE_SOURCE_ENCODED_BYTES",
+              "kind": "value",
+              "declarations": [
+                "MAX_DELTA_MERGE_SOURCE_ENCODED_BYTES: number"
+              ]
+            },
+            {
+              "name": "MAX_DELTA_MERGE_SOURCE_ROWS",
+              "kind": "value",
+              "declarations": [
+                "MAX_DELTA_MERGE_SOURCE_ROWS = 65536"
               ]
             },
             {

@@ -30,6 +30,11 @@ it only when every acknowledged write can be reconstructed, replayed, or recover
 durable source and that loss window is acceptable. Use `strict` whenever losing an acknowledged
 write is unacceptable.
 
+The setting governs every transaction that changes the database. Reader leases — the short-lived
+records that keep a version a query is reading from being collected — are always written
+`relaxed`: a crash that loses one also ended the reader it protected, so flushing them would only
+slow every query that follows a commit.
+
 ## Quota
 
 Browsers give an origin a share of free disk, not a fixed number, and evict from origins the user
@@ -241,7 +246,7 @@ read, the schema check — a silent database is not a damaged one. See
 
 ## Schema compatibility and recovery
 
-The current IndexedDB schema is 6. Schema 1 kept each transaction's journal ids on the record
+The current IndexedDB schema is 7. Schema 1 kept each transaction's journal ids on the record
 itself; opening a schema-1 database moves them into `transactionJournal` chunks and rewrites the
 records with their counts. Schema 3 changes no stored record: it admits compaction jobs whose
 merge plan is recomputed from its sources rather than stored cell by cell, which a schema-2 build
@@ -251,11 +256,14 @@ have no size limit and a lookup reads only the parts its terms fall in. A schema
 read those parts. Schema 5 rewrites nothing either: the catalog may hold the engine's internal
 key-forwards table, which records where each row whose primary key changed now lives. A schema-4
 build (core 0.14.1 and older) would read that table as an ordinary one and miss the forwards, so
-it must not open the database. Schema 6 rewrites nothing either: a compaction job may fold a table
-across `ALTER TABLE` — a source written before a column was added, whose rows the fold fills
-with the column's default, or an update left holding only its key after `DROP COLUMN`. A
-schema-5 build (core 0.15.0) refuses such a job as corruption. Opening a schema-2 to schema-5
-database only raises the version, and the older build then refuses it. There are no pre-contract schemas or compatibility
+it must not open the database. Schema 7 rewrites nothing either. It admits two kinds of
+compaction job that a schema-5 build (core 0.15.0) refuses as corruption: a fold across
+`ALTER TABLE` — a source written before a column was added, whose rows the fold fills with the
+column's default, or an update left holding only its key after `DROP COLUMN` — and a delta
+merge, which merges a run of level-zero updates and deletes into a few segments that take the
+run's place. Schema 6 was never released: core 0.16.0 moves a schema-5 database straight to
+schema 7. Opening a schema-2 to schema-6 database only raises the version, and the older build
+then refuses it. There are no pre-contract schemas or compatibility
 branches. Every schema change adds one ordered migration for every integer version between the database and the
 current build. All of those migrations run inside the browser's single `versionchange`
 transaction: either the complete chain and its data changes commit, or the old database remains

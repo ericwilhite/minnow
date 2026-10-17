@@ -5,10 +5,10 @@ import { expect } from "@playwright/test";
 import { requireWorkerOpfs, test } from "./fixtures.js";
 
 /**
- * The OPFS layout this build writes; layout 11 admits compaction plans whose sources lack a column
- * added after them.
+ * The OPFS layout this build writes; layout 12 admits compaction plans whose sources lack a column
+ * added after them, and delta merges. Layout 11 was never released.
  */
-const OPFS_LAYOUT = 11;
+const OPFS_LAYOUT = 12;
 
 const directory = new URL("../format-fixtures/", import.meta.url);
 for (const file of readdirSync(fileURLToPath(directory)).filter((name) =>
@@ -66,10 +66,10 @@ test("automatic upgrade: OPFS written by 0.14.1 keeps its rows, index, and seque
 });
 
 /**
- * The IndexedDB schema this build writes; schema 6 admits compaction plans whose sources lack a
- * column added after them.
+ * The IndexedDB schema this build writes; schema 7 admits compaction plans whose sources lack a
+ * column added after them, and delta merges. Schema 6 was never released.
  */
-const INDEXEDDB_SCHEMA = 6;
+const INDEXEDDB_SCHEMA = 7;
 
 for (const writer of ["0.10.0", "0.12.1", "0.13.1", "0.14.1", "0.15.0"] as const) {
   test(`automatic upgrade: IndexedDB written by ${writer} keeps its index deltas, writes past the old delta limit, and refuses the released reader`, async ({

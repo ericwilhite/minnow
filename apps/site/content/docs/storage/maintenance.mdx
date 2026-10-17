@@ -55,6 +55,33 @@ and the full-text index of an append-only table, answer from the same postings a
 of a table with a primary key writes merged segments a full-text index cannot read, so it stops
 that index; searches scan from then on.
 
+### Delta merges
+
+A fold rewrites every partition a delta touches. Single-row updates and deletes spread over a
+large table touch most of its partitions, so folding them every few dozen commits used to rewrite
+most of the table each time. Once a table has been folded, automatic compaction first merges its
+deltas among themselves instead. A run of update and delete commits becomes one delete segment
+and one update segment for each set of changed columns, with every key once, in key order. The
+merged segments take the run's place, so every read answers exactly as it did before, and a merge
+costs what the deltas hold rather than what the table holds. A small new merge stays apart from a
+much larger earlier one until it is a quarter of that size, so the larger one is not rewritten
+for a few new rows.
+
+Folds still happen, at the points where they pay:
+
+- When the merged deltas would hold more than a sixty-fourth of the table's rows (and at least
+  1,024 rows), the step folds them into the partitions instead.
+- When a table goes quiet — no commit for 25 milliseconds — with at least 256 delta rows and at
+  least one row in 512, one fold returns it to plain partitions, which every later read scans at
+  full speed. A trickle of a few rows waits for more writes.
+
+A merge is a compaction job like a fold: stepped, resumable, and published as a writer.
+`listCompactionJobs` reports it with `rewritePlan.kind` `"delta-v1"`. `compactTable` and
+`compactTableStep` always fold; merges are automatic only. Inserts and upserts are not merged;
+they fold as before. Merged segments are records 0.15.0 and older builds cannot read, so
+opening a database with this build upgrades it to IndexedDB schema 7 or OPFS layout 12, and an
+older build then refuses it (see [versioning](/docs/reference/versioning)).
+
 ### Deletes and updates before compaction
 
 Compaction is not what makes a mutated table readable at speed. A query applies the table's
@@ -91,7 +118,7 @@ level-zero segment until the 4,096-segment ceiling refused its writes. Opening s
 a later build fixes it without any call: the first write at the ceiling, or the first read of a
 heavily fragmented table, starts a fold, and automatic compaction keeps going until the table is
 back to a few segments. The data is unchanged. This build stores fold plans an older build
-cannot read, so opening the database upgrades it to IndexedDB schema 6 or OPFS layout 11, and
+cannot read, so opening the database upgrades it to IndexedDB schema 7 or OPFS layout 12, and
 0.15.0 then refuses it (see [versioning](/docs/reference/versioning)).
 
 ### Partitioned folds

@@ -31,8 +31,11 @@ import { StorageCorruptionError, type TableRecord } from "./types.js";
 
 vi.setConfig({ testTimeout: heavyTestTimeout(60_000) });
 
-/** The schema this build writes: schema 6 (fills in compaction plans) followed schema 5. */
-const CURRENT_SCHEMA = 6;
+/**
+ * The schema this build writes: schema 6 (fills in compaction plans) and schema 7 (delta merges)
+ * followed schema 5.
+ */
+const CURRENT_SCHEMA = 7;
 
 /** The engine's internal key-forwards table, as the engine creates it on its first rekey. */
 const KEY_FORWARDS: TableRecord = keyForwardsTableRecord(NOW);

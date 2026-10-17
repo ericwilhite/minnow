@@ -993,7 +993,12 @@ describe.each(stores.map(({ name, open }) => ({ name, create: open })))(
           );
           expect(dropped).toBe(true);
           const plan = planned?.rewritePlan;
-          expect(plan !== undefined && plan.kind !== "copy-v1" && plan.partitions).toBeTruthy();
+          expect(
+            plan !== undefined &&
+              plan.kind !== "copy-v1" &&
+              plan.kind !== "delta-v1" &&
+              plan.partitions,
+          ).toBeTruthy();
           expect(
             (await allTransactionRecords(store)).some((record) => record.status === "active"),
           ).toBe(false);

@@ -30,7 +30,7 @@ type UpgradeMessage =
   | { kind: "indexeddb"; writer: IndexedDbWriterVersion; name: string };
 
 /** The OPFS layout this build writes. */
-const OPFS_LAYOUT = 11;
+const OPFS_LAYOUT = 12;
 /** The engine's internal key-forwards table, created by the first rekey. */
 const KEY_FORWARDS_TABLE = "\u0000minnow_key_forwards";
 
@@ -237,7 +237,7 @@ async function runReleasedOpfs(name: string): Promise<ReleasedOpfsUpgradeResult>
 // ---------------------------------------------------------------------------------------------
 
 /** The IndexedDB schema this build writes. */
-const INDEXEDDB_SCHEMA = 6;
+const INDEXEDDB_SCHEMA = 7;
 
 interface IndexedHistoryDatabase {
   createTable(definition: unknown): Promise<unknown>;

@@ -11,8 +11,8 @@ npm install @minnowdb/core
 and benchmarks that run in your browser.
 
 > **Experimental API.** Minnow is in 0.x, so minor releases can include API and SQL breaking
-> changes. Stored data is stable: block format 2, snapshot formats 1 and 2, IndexedDB schema 6, and
-> OPFS layout 11 are versioned separately and locked — an incompatible future writer must use a new
+> changes. Stored data is stable: block format 2, snapshot formats 1 and 2, IndexedDB schema 7, and
+> OPFS layout 12 are versioned separately and locked — an incompatible future writer must use a new
 > format number.
 > Pin exact package versions. See
 > [Versioning](https://minnowdb.com/docs/reference/versioning/), the
@@ -38,7 +38,7 @@ and benchmarks that run in your browser.
   read anything, so concurrent writes land in a serial order without an application-side queue
   or retry loop. Callbacks run once; a tab that stops inside its turn is reported, never
   bypassed.
-- **Plain JavaScript.** The engine with its larger durable adapter is about 420 KiB gzipped, with
+- **Plain JavaScript.** The engine with its larger durable adapter is about 426 KiB gzipped, with
   no Wasm download, compile step, special headers, or server process.
 - **Direct SQL or Kysely.** Run PostgreSQL-style SQL through the engine API or use Kysely through
   `@minnowdb/kysely`. Kysely's `DB` type derives from the same schema used for migration, so

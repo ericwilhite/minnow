@@ -1,7 +1,8 @@
 /**
- * Durability on IndexedDB: the `durability` option reaches every readwrite transaction as its
- * IndexedDB durability hint (defaulting to "strict"), and no write is acknowledged before its
- * transaction has fired `complete` (or `abort`), never on the last request's `success`.
+ * Durability on IndexedDB: the `durability` option reaches every readwrite transaction that
+ * writes database state as its IndexedDB durability hint (defaulting to "strict"); reader-lease
+ * writes, soft state that dies with its reader, always commit "relaxed". No write is acknowledged
+ * before its transaction has fired `complete` (or `abort`), never on the last request's `success`.
  */
 import { IDBFactory } from "fake-indexeddb";
 import { describe, expect, it } from "vitest";
@@ -35,6 +36,49 @@ describe("IndexedDB durability hints", () => {
       );
       expect(readonly.map((entry) => entry.options)).toEqual(readonly.map(() => undefined));
       store.close();
+    }
+  });
+
+  it("writes reader leases relaxed whatever the configured hint, and only reader leases", async () => {
+    for (const durability of ["strict", "relaxed"] as const) {
+      const indexedDB = new IDBFactory();
+      const instrumented = instrumentFactory(indexedDB);
+      const store = await openStore(indexedDB, crypto.randomUUID(), durability);
+      const db = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+      try {
+        await db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, amount INTEGER NOT NULL)");
+        await db.execute("INSERT INTO t VALUES (1, 0)");
+        await db.query("SELECT amount FROM t WHERE id = 1", { memoize: false });
+        instrumented.reset();
+        // The write moves the version; the read re-pins its shared reader lease to it.
+        await db.execute("UPDATE t SET amount = amount + 1 WHERE id = 1");
+        await db.query("SELECT amount FROM t WHERE id = 1", { memoize: false });
+        const readwrite = instrumented.transactions.filter((entry) => entry.mode === "readwrite");
+        const leaseOnly = readwrite.filter((entry) =>
+          entry.stores.every((name) =>
+            [
+              "leases",
+              "manifests",
+              "blocks",
+              "catalog",
+              "transactions",
+              "transactionJournal",
+            ].includes(name),
+          ),
+        );
+        const publishing = readwrite.filter((entry) => !leaseOnly.includes(entry));
+        expect(leaseOnly.length).toBeGreaterThan(0);
+        expect(leaseOnly.map((entry) => entry.options?.durability)).toEqual(
+          leaseOnly.map(() => "relaxed"),
+        );
+        // The data commit keeps the configured hint.
+        expect(publishing.length).toBeGreaterThan(0);
+        expect(publishing.map((entry) => entry.options?.durability)).toEqual(
+          publishing.map(() => durability),
+        );
+      } finally {
+        await db.close();
+      }
     }
   });
 

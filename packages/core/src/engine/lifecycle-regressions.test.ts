@@ -418,14 +418,20 @@ it("uses at most six strict IndexedDB writes for a three-table checkout", async 
   const factory = new IDBFactory();
   const originalOpen = factory.open.bind(factory);
   let writes = 0;
+  let leaseWrites = 0;
   vi.spyOn(factory, "open").mockImplementation((name, version) => {
     const request = originalOpen(name, version);
     request.addEventListener("success", () => {
       const original = request.result.transaction.bind(request.result);
       vi.spyOn(request.result, "transaction").mockImplementation((names, mode, options) => {
         if (mode === "readwrite") {
-          writes += 1;
-          expect(options?.durability).toBe("strict");
+          // Reader leases are soft state and always commit relaxed; everything else that
+          // writes takes the configured strict flush.
+          if (options?.durability === "relaxed") leaseWrites += 1;
+          else {
+            writes += 1;
+            expect(options?.durability).toBe("strict");
+          }
         }
         return original(names, mode, options);
       });
@@ -440,12 +446,14 @@ it("uses at most six strict IndexedDB writes for a three-table checkout", async 
   await db.insertBatch("items", [{ id: 1, value: 100 }]);
   for (let id = 0; id < 3; id += 1) {
     writes = 0;
+    leaseWrites = 0;
     await db.write(async (tx) => {
       await tx.execute("UPDATE items SET value = value - 1 WHERE id = 1");
       await tx.insertBatch("sales", [{ id, total: 1000 }]);
       await tx.insertBatch("lines", [{ id, sale_id: id, qty: 1 }]);
     });
     expect(writes).toBeLessThanOrEqual(6);
+    expect(leaseWrites).toBeLessThanOrEqual(2);
   }
   expect((await db.query("SELECT value FROM items")).rows).toEqual([{ value: 97 }]);
   expect((await db.query("SELECT COUNT(*) AS n FROM sales")).rows).toEqual([{ n: 3 }]);

@@ -39,6 +39,7 @@
     "audit-run.ts",
     "semantic-run.ts",
     "upgrade-run.ts",
-    "upgrade-worker.ts"
+    "upgrade-worker.ts",
+    "oltp-latency-run.ts"
   ]
 }

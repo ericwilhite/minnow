@@ -171,23 +171,25 @@ Collection keeps every retained segment’s block references intact, including r
 Upgrading prevents the previous block-before-segment cleanup bug from recurring, but does not
 automatically repair a store already affected by missing referenced blocks.
 
-Layout 11 is the current native OPFS contract. Like layouts 8 to 10, it stores layout 7's bytes.
+Layout 12 is the current native OPFS contract. Like layouts 8 to 11, it stores layout 7's bytes.
 Layout 8 admits compaction jobs whose merge plan is recomputed from its sources rather than stored
 cell by cell, which a layout-7 build cannot read. Layout 9 admits a commit too large for one WAL
 frame: its frame is written as continuation frames, a few megabytes each, completed by an
 ordinary frame, and recovery joins them. A checkpoint may also hold one commit's index changes at
 any size. A layout-8 build cannot read either. Layout 10 admits the engine's internal key-forwards
 table, which records where each row whose primary key changed now lives. A layout-9 build (core
-0.14.1 and older) would read it as an ordinary table and miss the forwards. Layout 11 admits
-compaction jobs that fold a table across `ALTER TABLE`: a source written before a column was
-added (the fold fills its rows with the column's default, or NULL) and an update left holding
-only its key after `DROP COLUMN`. A layout-10 build (core 0.15.0) refuses such a job as
-corruption. **Layouts 7 to 10 upgrade automatically on open** by rewriting the format marker
-alone: a small `upgrade-10-11` witness is written and flushed first, so a crash that tears the
-marker is finished on the next open instead of refused, and the witness is removed once the new
-marker is durable. A witness an older build left behind (`upgrade-7-8`, `upgrade-8-9`, or
-`upgrade-9-10`) is finished the same way. An older build then refuses the database without
-changing it.
+0.14.1 and older) would read it as an ordinary table and miss the forwards. Layout 12 admits two
+kinds of compaction job that a layout-10 build (core 0.15.0) refuses as corruption: a fold
+across `ALTER TABLE` — a source written before a column was added (the fold fills its rows with
+the column's default, or NULL), or an update left holding only its key after `DROP COLUMN` — and
+a delta merge, which merges a run of level-zero updates and deletes into a few segments that
+take the run's place. Layout 11 was never released: core 0.16.0 moves a layout-10 database
+straight to layout 12. **Layouts 7 to 11 upgrade automatically on open** by rewriting the format
+marker alone: a small `upgrade-11-12` witness is written and flushed first, so a crash that
+tears the marker is finished on the next open instead of refused, and the witness is removed
+once the new marker is durable. A witness an older build left behind (`upgrade-7-8`,
+`upgrade-8-9`, or `upgrade-9-10`) is finished the same way. An older build then refuses the
+database without changing it.
 
 Layout 7 added a 48-byte acknowledgement file with two checksummed slots, alongside the
 structural `schemaEpoch` and served-request ledger. Recovery

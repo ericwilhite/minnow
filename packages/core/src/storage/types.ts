@@ -1507,17 +1507,99 @@ export interface ReplayedMergeCompactionRewritePlan extends MergeCompactionPlanL
   readonly resolution: MergeCompactionResolution;
 }
 
+/**
+ * One segment a delta merge publishes: the deleted keys, or the rows whose net change is an
+ * update of one set of columns. `columns` holds the key column first, then the changed columns
+ * in table order; a delete holds the key alone. `blockRows` is how many rows each block of every
+ * column holds, in order, so a resumed merge cuts its blocks where the first attempt did.
+ */
+export interface DeltaMergeOutputSegment {
+  readonly kind: "delete" | "update";
+  readonly columns: readonly MergeCompactionPlannedColumn[];
+  readonly rowCount: number;
+  readonly blockRows: readonly number[];
+}
+
+/**
+ * What a delta merge's sources resolve to: the rows it publishes and a CRC-32 over their kinds,
+ * columns, keys, and values. The engine recomputes the merge from the immutable sources and
+ * must arrive at exactly this before it writes a block.
+ */
+export interface DeltaMergeResolution {
+  readonly rows: number;
+  readonly checksum: number;
+}
+
+/**
+ * Level-zero updates and deletes merged among themselves, leaving every base partition as it
+ * is. The sources are a run of whole commits, contiguous in the table's visible order, holding
+ * only updates and deletes; the run is replaced by at most one delete segment and one update
+ * segment per changed-column set, each holding every key once in ascending key order, at level
+ * zero under the run's last logical order. Readers replay them exactly as they replayed the
+ * run: a key's net change over the run is a delete, or an update of the columns the run changed
+ * last. A merge costs what its deltas hold, where a fold rewrites every partition they touch.
+ */
+export interface DeltaMergeCompactionRewritePlan {
+  readonly kind: "delta-v1";
+  readonly keyColumnId: string;
+  /** The table's columns when the merge was planned; ALTER TABLE since makes it stale. */
+  readonly columns: readonly MergeCompactionPlannedColumn[];
+  /** The last source's logical order: the published segments take the run's place. */
+  readonly logicalOrder: number;
+  readonly sourceSegments: readonly MergeCompactionSourceSegment[];
+  readonly outputs: readonly DeltaMergeOutputSegment[];
+  readonly resolution: DeltaMergeResolution;
+}
+
+/** Source rows one delta merge may hold; past this a fold of the deltas into the base is due. */
+export const MAX_DELTA_MERGE_SOURCE_ROWS = 65_536;
+/** Encoded source bytes one delta merge may hold: the merge holds its sources decoded at once. */
+export const MAX_DELTA_MERGE_SOURCE_ENCODED_BYTES = 16 * 1024 * 1024;
+
 export type CompactionRewritePlan =
   | CopyCompactionRewritePlan
   | RechunkCompactionRewritePlan
   | MergeCompactionRewritePlan
-  | ReplayedMergeCompactionRewritePlan;
+  | ReplayedMergeCompactionRewritePlan
+  | DeltaMergeCompactionRewritePlan;
 
 /** Whether a plan merges keyed sources by replay, whichever way it records the replay. */
 export function isMergeCompactionPlan(
   plan: CompactionRewritePlan,
 ): plan is MergeCompactionRewritePlan | ReplayedMergeCompactionRewritePlan {
   return plan.kind === "merge-v1" || plan.kind === "merge-v2";
+}
+
+/** The canonical ID of a delta merge's output block: output, then column, then part. */
+export function deltaMergeOutputBlockId(
+  jobId: string,
+  outputIndex: number,
+  columnIndex: number,
+  part: number,
+): string {
+  return [
+    jobId,
+    "delta",
+    String(outputIndex).padStart(6, "0"),
+    "column",
+    String(columnIndex).padStart(6, "0"),
+    "part",
+    String(part).padStart(6, "0"),
+  ].join("/");
+}
+
+/** Every output block of a delta merge plan, in canonical order. */
+export function deltaMergeOutputBlockIds(
+  jobId: string,
+  plan: DeltaMergeCompactionRewritePlan,
+): string[] {
+  return plan.outputs.flatMap((output, outputIndex) =>
+    output.columns.flatMap((_column, columnIndex) =>
+      output.blockRows.map((_rows, part) =>
+        deltaMergeOutputBlockId(jobId, outputIndex, columnIndex, part),
+      ),
+    ),
+  );
 }
 
 /**
@@ -1604,10 +1686,13 @@ export function compactionOutputSegmentIds(
 ): string[] {
   const outputSegmentId = job.outputSegmentId;
   if (outputSegmentId === null) return [];
+  const plan = job.rewritePlan;
   const partitionCount =
-    job.rewritePlan.kind !== "copy-v1" && job.rewritePlan.partitions !== undefined
-      ? job.rewritePlan.partitions.length
-      : 1;
+    plan.kind === "delta-v1"
+      ? plan.outputs.length
+      : plan.kind !== "copy-v1" && plan.partitions !== undefined
+        ? plan.partitions.length
+        : 1;
   return Array.from({ length: partitionCount }, (_, index) =>
     index === 0 ? outputSegmentId : `${outputSegmentId}/${String(index)}`,
   );
@@ -1634,7 +1719,10 @@ export function compactionPlanMatchesTableSchema(
   ) {
     return false;
   }
-  return !isMergeCompactionPlan(plan) || plan.keyColumnId === table.uniqueKeyColumnId;
+  return (
+    (!isMergeCompactionPlan(plan) && plan.kind !== "delta-v1") ||
+    plan.keyColumnId === table.uniqueKeyColumnId
+  );
 }
 
 /**
@@ -1687,6 +1775,16 @@ export function assertCompactionOutputProvenance(
       expectedOutputBlockIds,
       `Compaction job ${job.id} output block plan`,
     );
+  } else if (plan.kind === "delta-v1") {
+    if (!compactionPlanMatchesTableSchema(plan, table)) {
+      throw new Error(`Compaction job ${job.id} table schema differs from its rewrite plan`);
+    }
+    assertDeltaMergeSourcesMatch(job.id, plan, sourceSegments);
+    assertExactOrderedIds(
+      job.outputBlockIds,
+      deltaMergeOutputBlockIds(job.id, plan),
+      `Compaction job ${job.id} output block plan`,
+    );
   } else {
     if (!compactionPlanMatchesTableSchema(plan, table)) {
       throw new Error(`Compaction job ${job.id} table schema differs from its rewrite plan`);
@@ -1718,7 +1816,85 @@ export function assertCompactionOutputProvenance(
   }
 }
 
+/**
+ * A delta merge's plan describes the stored sources it merges: same segments, kinds, order, and
+ * blocks. Its outputs take the place the plan claims for the run, so a plan that misdescribed
+ * its sources could move a change ahead of or behind another.
+ */
+function assertDeltaMergeSourcesMatch(
+  jobId: string,
+  plan: DeltaMergeCompactionRewritePlan,
+  sourceSegments: readonly SegmentRecord[],
+): void {
+  if (sourceSegments.length !== plan.sourceSegments.length) {
+    throw new Error(`Compaction job ${jobId} sources differ from its delta merge plan`);
+  }
+  for (const [index, stored] of sourceSegments.entries()) {
+    const planned = plan.sourceSegments[index];
+    if (
+      planned?.segmentId !== stored.id ||
+      planned.transactionId !== stored.transactionId ||
+      planned.kind !== stored.kind ||
+      planned.level !== stored.level ||
+      planned.logicalOrder !== stored.logicalOrder ||
+      planned.rowCount !== stored.rowCount ||
+      planned.keyColumnId !== (stored.keyColumnId ?? null)
+    ) {
+      throw new Error(`Compaction job ${jobId} source ${stored.id} differs from its plan`);
+    }
+    for (const column of planned.columns) {
+      const blockIds = stored.columnBlockIds[column.columnId];
+      if (
+        blockIds?.length !== column.sourceBlocks.length ||
+        blockIds.some((id, part) => column.sourceBlocks[part]?.blockId !== id)
+      ) {
+        throw new Error(`Compaction job ${jobId} source ${stored.id} blocks differ from its plan`);
+      }
+    }
+  }
+}
+
 type CompactionOutputShape = Omit<SegmentRecord, "createdAt">;
+
+/**
+ * The level-zero segments a delta merge publishes, in plan order: each under the run's last
+ * logical order, its blocks the plan's canonical output blocks.
+ */
+export function deltaMergeOutputSegments(
+  job: Pick<CompactionJobRecord, "id" | "tableId" | "outputSegmentId">,
+  plan: DeltaMergeCompactionRewritePlan,
+  transactionId: string,
+): Array<Omit<SegmentRecord, "createdAt">> {
+  const outputSegmentId = job.outputSegmentId;
+  if (outputSegmentId === null) return [];
+  let blockIndex = 0;
+  const blockIds = deltaMergeOutputBlockIds(job.id, plan);
+  return plan.outputs.map((output, index) => {
+    const columnBlockIds: Record<string, string[]> = {};
+    for (const column of output.columns) {
+      columnBlockIds[column.columnId] = blockIds.slice(
+        blockIndex,
+        blockIndex + output.blockRows.length,
+      );
+      blockIndex += output.blockRows.length;
+    }
+    return {
+      id: index === 0 ? outputSegmentId : `${outputSegmentId}/${String(index)}`,
+      tableId: job.tableId,
+      transactionId,
+      rowCount: output.rowCount,
+      rowIdStart: 0n,
+      rowIdEndExclusive: 0n,
+      columnBlockIds,
+      kind: output.kind,
+      keyColumnId: plan.keyColumnId,
+      level: 0,
+      logicalOrder: plan.logicalOrder,
+      commitOrdinal: index,
+      rowIdSpans: [],
+    };
+  });
+}
 
 function expectedCompactionOutputSegments(
   job: CompactionJobRecord,
@@ -1737,6 +1913,9 @@ function expectedCompactionOutputSegments(
       ? {}
       : { partitionOrdinal: job.outputPartitionOrdinal }),
   };
+  if (plan.kind === "delta-v1") {
+    return deltaMergeOutputSegments(job, plan, job.transactionId ?? "");
+  }
   if (plan.kind === "copy-v1") {
     const first = sourceSegments[0];
     const last = sourceSegments[sourceSegments.length - 1];
@@ -5505,7 +5684,7 @@ function normalizeCompactionJob(
       >
     | undefined;
   if (level2PolicyFieldCount !== 0) {
-    if (rewritePlan.kind === "copy-v1") {
+    if (rewritePlan.kind === "copy-v1" || rewritePlan.kind === "delta-v1") {
       throw new TypeError("L2 compaction requires a rechunk or merge plan");
     }
     if (record.targetLevel !== 2) {
@@ -5673,6 +5852,13 @@ export function updateCompactionJobRecord(
       }
     }
   }
+  if (current.rewritePlan.kind === "delta-v1") {
+    for (const field of ["sourceStoredBytes", "logicalBytes", "outputCursor"] as const) {
+      if (Reflect.has(update, field)) {
+        throw new TypeError(`Delta merge ${field} is immutable`);
+      }
+    }
+  }
   const mirrorCopyLogicalBytes =
     current.rewritePlan.kind === "copy-v1" &&
     update.logicalBytes !== undefined &&
@@ -5721,10 +5907,17 @@ function validateCompactionJobState(record: CompactionJobRecord): void {
       throw new TypeError("A non-empty merge compaction requires an output segment ID");
     }
   }
+  if (
+    plan.kind === "delta-v1" &&
+    (plan.outputs.length === 0) !== (record.outputSegmentId === null)
+  ) {
+    throw new TypeError("A delta merge has an output segment ID exactly when it publishes rows");
+  }
   if (record.state === "cancelled" && record.error !== undefined) {
     throw new TypeError("A cancelled compaction cannot contain an error");
   }
   if (record.state === "planned") {
+    // Copy jobs count source bytes as they go; every other plan fixes them when it is made.
     const isCopy = record.rewritePlan.kind === "copy-v1";
     const hasProgress =
       record.cursor.sourceSegmentIndex !== 0 ||
@@ -5746,7 +5939,9 @@ function validateCompactionJobState(record: CompactionJobRecord): void {
   if (record.state === "ready" || record.state === "published") {
     if (
       record.transactionId === null ||
-      (record.outputSegmentId === null && !(isMergeCompactionPlan(plan) && plan.totalRows === 0))
+      (record.outputSegmentId === null &&
+        !(isMergeCompactionPlan(plan) && plan.totalRows === 0) &&
+        !(plan.kind === "delta-v1" && plan.outputs.length === 0))
     ) {
       throw new TypeError(`${record.state} compaction requires its transaction and output segment`);
     }
@@ -5794,6 +5989,10 @@ function validateCompactionRewrite(record: CompactionJobRecord): void {
         "Compaction output cannot contain more blocks than its source selection",
       );
     }
+    return;
+  }
+  if (plan.kind === "delta-v1") {
+    validateDeltaMergeRewrite(record, plan);
     return;
   }
 
@@ -5888,6 +6087,84 @@ function validateCompactionRewrite(record: CompactionJobRecord): void {
   }
 }
 
+/**
+ * A delta merge writes its whole output in one step, so its record is either untouched or done:
+ * no output and the source cursor at the start, or every output block and the cursor past the
+ * last source. It holds no memory reservation, writes level zero, and its source accounting is
+ * fixed by the plan.
+ */
+function validateDeltaMergeRewrite(
+  record: CompactionJobRecord,
+  plan: DeltaMergeCompactionRewritePlan,
+): void {
+  if (record.outputCursor !== null) {
+    throw new TypeError("A delta merge cannot have an output cursor");
+  }
+  if (
+    record.memoryBudgetBytes !== 0 ||
+    record.minimumMemoryBytes !== 0 ||
+    record.peakWorkingBytes !== 0
+  ) {
+    throw new TypeError("A delta merge cannot have memory accounting");
+  }
+  if (record.targetLevel !== 0) throw new TypeError("A delta merge publishes level zero");
+  const plannedSegmentIds = plan.sourceSegments.map((segment) => segment.segmentId);
+  if (
+    plannedSegmentIds.length !== record.sourceSegmentIds.length ||
+    plannedSegmentIds.some((id, index) => id !== record.sourceSegmentIds[index])
+  ) {
+    throw new TypeError("Delta merge source layout must preserve every selected source in order");
+  }
+  const plannedBlocks = plan.sourceSegments.flatMap((segment) =>
+    segment.columns.flatMap((column) => column.sourceBlocks),
+  );
+  const plannedBlockIds = plannedBlocks.map((block) => block.blockId).sort();
+  if (
+    plannedBlockIds.length !== record.sourceBlockIds.length ||
+    plannedBlockIds.some((id, index) => id !== record.sourceBlockIds[index])
+  ) {
+    throw new TypeError("The delta merge source layout must describe every selected source block");
+  }
+  if (
+    record.sourceStoredBytes !==
+      safeSum(
+        plannedBlocks.map((block) => block.storedBytes),
+        "Delta merge source stored bytes",
+      ) ||
+    record.logicalBytes !==
+      safeSum(
+        plannedBlocks.map((block) => block.encodedBytes),
+        "Delta merge source encoded bytes",
+      )
+  ) {
+    throw new TypeError("Delta merge source bytes must match the immutable plan");
+  }
+  if (record.level0SourceStoredBytes !== record.sourceStoredBytes) {
+    throw new TypeError("Every delta merge source byte is a level-zero byte");
+  }
+  const sourceRows = safeSum(
+    plan.sourceSegments.map((segment) => segment.rowCount),
+    "Delta merge source rows",
+  );
+  const done = record.cursor.sourceSegmentIndex === record.sourceSegmentIds.length;
+  if (record.cursor.sourceBlockIndex !== 0 || (!done && record.cursor.sourceSegmentIndex !== 0)) {
+    throw new TypeError("A delta merge cursor is at its first source or past its last");
+  }
+  const expectedOutputs = deltaMergeOutputBlockIds(record.id, plan).length;
+  if (done) {
+    if (record.outputBlockIds.length !== expectedOutputs || record.processedRows !== sourceRows) {
+      throw new TypeError("A finished delta merge records every output block and source row");
+    }
+  } else if (
+    record.outputBlockIds.length !== 0 ||
+    record.processedRows !== 0 ||
+    record.outputStoredBytes !== 0 ||
+    record.outputLogicalBytes !== 0
+  ) {
+    throw new TypeError("An unfinished delta merge records no output");
+  }
+}
+
 function validateCompactionJobProgress(
   previous: CompactionJobRecord,
   next: CompactionJobRecord,
@@ -5907,6 +6184,18 @@ function validateCompactionJobProgress(
 
   if (next.outputBlockIds.length < previous.outputBlockIds.length) {
     throw new TypeError("Compaction output block IDs cannot be removed");
+  }
+  if (previous.rewritePlan.kind === "delta-v1") {
+    if (previous.outputBlockIds.some((id, index) => next.outputBlockIds[index] !== id)) {
+      throw new TypeError("Output block IDs are an append-only ordered checkpoint");
+    }
+    if (next.cursor.sourceSegmentIndex < previous.cursor.sourceSegmentIndex) {
+      throw new RangeError("Compaction source cursor cannot move backwards");
+    }
+    if (previous.outputSegmentId !== next.outputSegmentId) {
+      throw new TypeError("Delta merge output segment ID is immutable");
+    }
+    return;
   }
   if (isOutputDrivenCompactionPlan(previous.rewritePlan)) {
     if (previous.outputBlockIds.some((id, index) => next.outputBlockIds[index] !== id)) {
@@ -5940,7 +6229,7 @@ function validateCompactionJobProgress(
 
 function isInitialOutputCursor(record: CompactionJobRecord): boolean {
   const plan = record.rewritePlan;
-  if (plan.kind === "copy-v1") return record.outputCursor === null;
+  if (plan.kind === "copy-v1" || plan.kind === "delta-v1") return record.outputCursor === null;
   const cursor = record.outputCursor;
   const initialRowStart = plan.outputs[0]?.rowStart ?? plan.totalRows;
   return (
@@ -5950,7 +6239,7 @@ function isInitialOutputCursor(record: CompactionJobRecord): boolean {
 
 function hasCompletedCompactionCursor(record: CompactionJobRecord): boolean {
   const plan = record.rewritePlan;
-  if (plan.kind === "copy-v1") {
+  if (plan.kind === "copy-v1" || plan.kind === "delta-v1") {
     return record.cursor.sourceSegmentIndex === record.sourceSegmentIds.length;
   }
   const cursor = record.outputCursor;
@@ -5963,6 +6252,7 @@ function hasCompletedCompactionCursor(record: CompactionJobRecord): boolean {
 
 function expectedCompactionOutputCount(record: CompactionJobRecord): number {
   const plan = record.rewritePlan;
+  if (plan.kind === "delta-v1") return deltaMergeOutputBlockIds(record.id, plan).length;
   return plan.kind === "copy-v1"
     ? record.sourceBlockIds.length
     : safeProduct(plan.outputs.length, plan.columns.length, "Rechunk output block count");
@@ -5985,7 +6275,7 @@ function isOutputDrivenCompactionPlan(
   plan: CompactionRewritePlan,
 ): plan is
   RechunkCompactionRewritePlan | MergeCompactionRewritePlan | ReplayedMergeCompactionRewritePlan {
-  return plan.kind !== "copy-v1";
+  return plan.kind !== "copy-v1" && plan.kind !== "delta-v1";
 }
 
 function validateCompactionJobTransition(
@@ -6030,6 +6320,7 @@ function normalizeCompactionRewritePlan(value: unknown): CompactionRewritePlan {
   if (kind === "merge-v1" || kind === "merge-v2") {
     return normalizeMergeCompactionRewritePlan(value, kind);
   }
+  if (kind === "delta-v1") return normalizeDeltaMergeCompactionRewritePlan(value);
   if (kind !== "rechunk-v1") {
     throw new TypeError(`Invalid compaction rewrite plan: ${String(kind)}`);
   }
@@ -6311,6 +6602,180 @@ function normalizeMergeCompactionRewritePlan(
       totalRows,
       columns.length,
     ),
+  };
+}
+
+function normalizeDeltaMergeCompactionRewritePlan(value: object): DeltaMergeCompactionRewritePlan {
+  const keyColumnId = validateStorageId(Reflect.get(value, "keyColumnId"), "Delta key column ID");
+  const columnsValue: unknown = Reflect.get(value, "columns");
+  if (!Array.isArray(columnsValue) || columnsValue.length === 0) {
+    throw new TypeError("A delta merge plan requires the table's columns");
+  }
+  const columns = columnsValue.map((column, index) => normalizeMergePlannedColumn(column, index));
+  const columnOrder = new Map(columns.map((column, index) => [column.columnId, index] as const));
+  if (columnOrder.size !== columns.length) {
+    throw new TypeError("A delta merge plan cannot contain duplicate columns");
+  }
+  const keyColumn = columns.find((column) => column.columnId === keyColumnId);
+  if (keyColumn === undefined) throw new TypeError("A delta merge plan must name its key column");
+
+  const sourceSegmentsValue: unknown = Reflect.get(value, "sourceSegments");
+  if (!Array.isArray(sourceSegmentsValue) || sourceSegmentsValue.length === 0) {
+    throw new TypeError("A delta merge plan requires at least one source segment");
+  }
+  const sourceSegments = sourceSegmentsValue.map((segment, index) =>
+    normalizeMergeSourceSegment(segment, index),
+  );
+  if (new Set(sourceSegments.map((segment) => segment.segmentId)).size !== sourceSegments.length) {
+    throw new TypeError("A delta merge source segment can only appear once");
+  }
+  const sourceBlockIds = new Set<string>();
+  const changedColumnIds = new Set<string>();
+  let sourceRows = 0;
+  let sourceEncodedBytes = 0;
+  for (const [index, segment] of sourceSegments.entries()) {
+    const previous = sourceSegments[index - 1];
+    if (previous !== undefined && compareMergeSourceSegments(previous, segment) > 0) {
+      throw new TypeError("Delta merge source segments must use canonical logical order");
+    }
+    if (segment.kind !== "update" && segment.kind !== "delete") {
+      throw new TypeError("A delta merge only merges update and delete segments");
+    }
+    if (segment.level !== 0) throw new TypeError("A delta merge only merges level-zero segments");
+    if (segment.keyColumnId !== keyColumnId) {
+      throw new TypeError(`Delta merge source ${segment.segmentId} has the wrong key column`);
+    }
+    sourceRows = safeSum([sourceRows, segment.rowCount], "Delta merge source rows");
+    const sourceColumnIds = segment.columns.map((column) => column.columnId);
+    if (!sourceColumnIds.includes(keyColumnId)) {
+      throw new TypeError(`Delta merge source ${segment.segmentId} must contain its key column`);
+    }
+    if (segment.kind === "delete" && sourceColumnIds.length !== 1) {
+      throw new TypeError("A delta merge delete source must contain only its key column");
+    }
+    for (const column of segment.columns) {
+      const planned = columns[columnOrder.get(column.columnId) ?? -1];
+      if (planned?.type !== column.type) {
+        throw new TypeError(
+          `Delta merge source ${segment.segmentId} has an unknown column or type`,
+        );
+      }
+      if (column.columnId !== keyColumnId) changedColumnIds.add(column.columnId);
+      for (const block of column.sourceBlocks) {
+        if (sourceBlockIds.has(block.blockId)) {
+          throw new TypeError("A delta merge source block can only appear once");
+        }
+        sourceBlockIds.add(block.blockId);
+        sourceEncodedBytes = safeSum(
+          [sourceEncodedBytes, block.encodedBytes],
+          "Delta merge source encoded bytes",
+        );
+      }
+    }
+  }
+  if (
+    sourceRows > MAX_DELTA_MERGE_SOURCE_ROWS ||
+    sourceEncodedBytes > MAX_DELTA_MERGE_SOURCE_ENCODED_BYTES
+  ) {
+    throw new RangeError("A delta merge holds more source rows or bytes than its limit");
+  }
+  const logicalOrder = nonNegativeFiniteNumber(
+    Reflect.get(value, "logicalOrder"),
+    "Delta merge logical order",
+  );
+  if (logicalOrder !== sourceSegments.at(-1)?.logicalOrder) {
+    throw new TypeError("Delta merge logical order must match its last source segment");
+  }
+
+  const outputsValue: unknown = Reflect.get(value, "outputs");
+  if (!Array.isArray(outputsValue)) throw new TypeError("Delta merge outputs must be an array");
+  const outputColumnSets = new Set<string>();
+  let outputRows = 0;
+  const outputs = outputsValue.map((output, outputIndex): DeltaMergeOutputSegment => {
+    const label = `Delta merge output ${String(outputIndex)}`;
+    if (typeof output !== "object" || output === null) {
+      throw new TypeError(`${label} must be an object`);
+    }
+    for (const key of Object.keys(output as object)) {
+      if (key !== "kind" && key !== "columns" && key !== "rowCount" && key !== "blockRows") {
+        throw new TypeError(`${label} has an unknown field: ${key}`);
+      }
+    }
+    const kind: unknown = Reflect.get(output, "kind");
+    if (kind !== "delete" && kind !== "update") throw new TypeError(`${label} has an invalid kind`);
+    const outputColumnsValue: unknown = Reflect.get(output, "columns");
+    if (!Array.isArray(outputColumnsValue) || outputColumnsValue.length === 0) {
+      throw new TypeError(`${label} requires columns`);
+    }
+    const outputColumns = outputColumnsValue.map((column, index) =>
+      normalizeMergePlannedColumn(column, index),
+    );
+    if (outputColumns[0]?.columnId !== keyColumnId || outputColumns[0].type !== keyColumn.type) {
+      throw new TypeError(`${label} must start with its key column`);
+    }
+    if (kind === "delete" ? outputColumns.length !== 1 : outputColumns.length < 2) {
+      throw new TypeError(`${label} has the wrong number of columns for a ${kind}`);
+    }
+    for (let index = 1; index < outputColumns.length; index += 1) {
+      const column = outputColumns[index];
+      const position = columnOrder.get(column?.columnId ?? "");
+      if (
+        column === undefined ||
+        position === undefined ||
+        columns[position]?.type !== column.type ||
+        !changedColumnIds.has(column.columnId) ||
+        (index > 1 && position <= (columnOrder.get(outputColumns[index - 1]?.columnId ?? "") ?? -1))
+      ) {
+        throw new TypeError(`${label} columns must be changed columns in table order`);
+      }
+    }
+    const columnSet = `${kind}\u0000${outputColumns.map((column) => column.columnId).join("\u0000")}`;
+    if (outputColumnSets.has(columnSet) || (kind === "delete" && outputColumnSets.has("delete"))) {
+      throw new TypeError(`${label} repeats another output's kind and columns`);
+    }
+    outputColumnSets.add(columnSet);
+    if (kind === "delete") outputColumnSets.add("delete");
+    const rowCount = positiveWholeNumber(Reflect.get(output, "rowCount"), `${label} row count`);
+    const blockRowsValue: unknown = Reflect.get(output, "blockRows");
+    if (!Array.isArray(blockRowsValue) || blockRowsValue.length === 0) {
+      throw new TypeError(`${label} requires its block row counts`);
+    }
+    const blockRows = blockRowsValue.map((rows, part) =>
+      blockRowCount(rows, `${label} block ${String(part)} row count`),
+    );
+    if (safeSum(blockRows, `${label} block rows`) !== rowCount) {
+      throw new RangeError(`${label} blocks must hold exactly its rows`);
+    }
+    outputRows = safeSum([outputRows, rowCount], "Delta merge output rows");
+    return { kind, columns: outputColumns, rowCount, blockRows };
+  });
+  if (outputRows > sourceRows) {
+    throw new RangeError("A delta merge cannot publish more rows than its sources hold");
+  }
+  const resolutionValue: unknown = Reflect.get(value, "resolution");
+  if (typeof resolutionValue !== "object" || resolutionValue === null) {
+    throw new TypeError("A delta merge plan requires its resolution");
+  }
+  for (const key of Object.keys(resolutionValue)) {
+    if (key !== "rows" && key !== "checksum") {
+      throw new TypeError(`Delta merge resolution has an unknown field: ${key}`);
+    }
+  }
+  const resolution = {
+    rows: nonNegativeWholeNumber(Reflect.get(resolutionValue, "rows"), "Delta merge rows"),
+    checksum: uint32(Reflect.get(resolutionValue, "checksum"), "Delta merge checksum"),
+  };
+  if (resolution.rows !== outputRows) {
+    throw new RangeError("Delta merge resolution rows must match its outputs");
+  }
+  return {
+    kind: "delta-v1",
+    keyColumnId,
+    columns,
+    logicalOrder,
+    sourceSegments,
+    outputs,
+    resolution,
   };
 }
 
@@ -6716,9 +7181,9 @@ function normalizeCompactionOutputCursor(
   value: unknown,
   plan: CompactionRewritePlan,
 ): CompactionOutputCursor | null {
-  if (plan.kind === "copy-v1") {
+  if (plan.kind === "copy-v1" || plan.kind === "delta-v1") {
     if (value !== null) {
-      throw new TypeError("A copy compaction cannot have an output cursor");
+      throw new TypeError(`A ${plan.kind} compaction cannot have an output cursor`);
     }
     return null;
   }

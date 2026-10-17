@@ -6,7 +6,7 @@
  *
  * The fold now fills an absent column with what reads give it — the column's backfill, or NULL —
  * and retires inert updates. Its plans can describe such sources, which a 0.15.0 reader refuses
- * as corruption, so IndexedDB schema 6 and OPFS layout 11 bar that reader; the upgrade moves
+ * as corruption, so IndexedDB schema 7 and OPFS layout 12 bar that reader; the upgrade moves
  * only the version marker. These tests take the real 0.15.0 writer's damaged databases through
  * the ordinary open API: the table folds, writes resume — at the ceiling, on the first write —
  * the data reads the same, and the released reader is refused afterwards. They also cut the
@@ -34,6 +34,13 @@ vi.setConfig({ testTimeout: heavyTestTimeout(180_000) });
 
 const NAME = "schema-change-folds";
 const MAX_LEVEL_ZERO_SEGMENTS = 4_096;
+/**
+ * What this build writes. Schema 6 and layout 11 admitted these folds but were never released;
+ * schema 7 and layout 12 also admit delta merges.
+ */
+const CURRENT_SCHEMA = 7;
+const CURRENT_LAYOUT = 12;
+const CURRENT_MARKER = `{"formatVersion":${String(CURRENT_LAYOUT)}}`;
 
 interface Writer {
   execute(sql: string, params?: Array<number | string | boolean>): Promise<unknown>;
@@ -133,7 +140,7 @@ describe("OPFS: a table 0.15.0 left at the level-zero ceiling", () => {
 
     const errors: unknown[] = [];
     let store = await OpfsBlockStore.open({ name: NAME, root: shim.root });
-    expect(marker()).toBe('{"formatVersion":11}');
+    expect(marker()).toBe(CURRENT_MARKER);
     let database = new MinnowDatabase(store, { onBackgroundError: (error) => errors.push(error) });
     expect(await levelZeroCount(database, store)).toBeGreaterThanOrEqual(MAX_LEVEL_ZERO_SEGMENTS);
     // The write at the ceiling lends its turn to a fold, which now publishes.
@@ -155,11 +162,11 @@ describe("OPFS: a table 0.15.0 left at the level-zero ceiling", () => {
 
     await expect(ReleasedOpfsStore.open({ name: NAME, root: shim.root })).rejects.toMatchObject({
       name: "StorageFormatVersionError",
-      actualVersion: 11,
+      actualVersion: CURRENT_LAYOUT,
       supportedVersion: 10,
       relation: "newer",
     });
-    expect(marker()).toBe('{"formatVersion":11}');
+    expect(marker()).toBe(CURRENT_MARKER);
   });
 });
 
@@ -198,7 +205,7 @@ describe("IndexedDB: a table 0.15.0 could not fold", () => {
 
     const errors: unknown[] = [];
     let store = await IndexedDbBlockStore.open({ name, indexedDB });
-    expect(await nativeVersion(indexedDB, name)).toBe(6);
+    expect(await nativeVersion(indexedDB, name)).toBe(CURRENT_SCHEMA);
     let database = new MinnowDatabase(store, { onBackgroundError: (error) => errors.push(error) });
     expect(await readAll(database)).toEqual(expectedRows(nextId));
     expect(await settle(database, store)).toBeLessThan(48);
@@ -222,11 +229,11 @@ describe("IndexedDB: a table 0.15.0 could not fold", () => {
 
     await expect(ReleasedIndexedDbStore.open({ name, indexedDB })).rejects.toMatchObject({
       name: "StorageFormatVersionError",
-      actualVersion: 6,
+      actualVersion: CURRENT_SCHEMA,
       supportedVersion: 5,
       relation: "newer",
     });
-    expect(await nativeVersion(indexedDB, name)).toBe(6);
+    expect(await nativeVersion(indexedDB, name)).toBe(CURRENT_SCHEMA);
   });
 
   it("leaves schema 5 for the released writer when the upgrade is interrupted, then retries", async () => {
@@ -261,7 +268,7 @@ describe("IndexedDB: a table 0.15.0 could not fold", () => {
     releasedStore.close();
 
     const store = await IndexedDbBlockStore.open({ name, indexedDB });
-    expect(await nativeVersion(indexedDB, name)).toBe(6);
+    expect(await nativeVersion(indexedDB, name)).toBe(CURRENT_SCHEMA);
     const database = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
     const rows = [...expectedRows(nextId), { id: nextId, c: nextId, a: true, s: "late" }];
     expect(await readAll(database)).toEqual(rows);
@@ -285,7 +292,7 @@ describe("IndexedDB: a table 0.15.0 could not fold", () => {
     expect(second.status).toBe("fulfilled");
     expect(late).toMatchObject({
       status: "rejected",
-      reason: { name: "StorageFormatVersionError", actualVersion: 6 },
+      reason: { name: "StorageFormatVersionError", actualVersion: CURRENT_SCHEMA },
     });
     // The released connection that was open when the upgrade arrived closed itself.
     await expect(stale.getCurrentManifestVersion()).rejects.toThrow(/connection is closed/);

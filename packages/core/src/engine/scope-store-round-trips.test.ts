@@ -46,7 +46,9 @@ it("resolves the table once per scope and probes a keyed UPDATE's keys once", as
 
 it("reads a guarded upsert's pre-images by point read over a long committed history", async () => {
   const { store, calls, reset } = countingStore();
-  const db = new MinnowDatabase(store, { autoCompact: false });
+  // No background collection: its discovery reads segment owners too, and whether a pass lands
+  // inside the scope depends on timing, not on what the scope's statements cost.
+  const db = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
   await db.execute(
     "CREATE TABLE items (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL, note VARCHAR)",
   );
