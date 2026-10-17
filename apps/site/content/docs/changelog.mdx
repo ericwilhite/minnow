@@ -70,6 +70,12 @@ reproduced first and ships with a test that fails without it.
   including those earlier releases left behind, so existing databases are repaired by their next
   collection. IndexedDB `checkIntegrity` no longer reports such postings, or a `UNIQUE` column
   declared in `CREATE TABLE` before its index is built, as corruption.
+- **A stalled IndexedDB was reported as corruption.** When IndexedDB gave no answer while a
+  database opened, Minnow raised `StorageCorruptionError` instead of `StorageUnresponsiveError`. In
+  WebKit this happens after a worker is terminated with more than one IndexedDB transaction in
+  flight: WebKit can keep one of them registered, and every overlapping transaction then waits in
+  every tab until the tab that owned the worker is closed. The error now names the stall, and its
+  message says to close the site's tabs and open it again — reloading does not release it.
 - **OPFS reopen.** A database where a UNIQUE index was dropped, or where a commit invalidated a
   UNIQUE index's postings, opens again instead of reporting corruption.
 - **Quiet multi-tab maintenance.** Background index builds and folds shared by several tabs no
