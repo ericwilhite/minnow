@@ -104,9 +104,17 @@ export function isStoreUncoordinatedForTests(store: BlockStore): boolean {
   return uncoordinated.has(store);
 }
 
-/** The context's Web Locks, where it has them (every current browser, and Node from 24). */
+/**
+ * The context's Web Locks, where it has them (every current browser, and Node from 24). DOM
+ * emulations and some embedded contexts define `navigator.locks` as null or as a stub, which
+ * counts as having none.
+ */
 export function lockManager(): LockManager | undefined {
-  return typeof navigator === "undefined" ? undefined : navigator.locks;
+  if (typeof navigator === "undefined") return undefined;
+  const locks = (navigator as { locks?: LockManager | null }).locks;
+  return typeof locks?.request === "function" && typeof locks.query === "function"
+    ? locks
+    : undefined;
 }
 
 export function writeCoordinationScope(store: BlockStore): WriteCoordinationScope {

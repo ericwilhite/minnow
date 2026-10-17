@@ -2,6 +2,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { MemoryBlockStore } from "../storage/memory.js";
 import {
   admitWriter,
+  lockManager,
   markStoreUncoordinatedForTests,
   writeAdmissionState,
   writeCoordinationScope,
@@ -474,4 +475,30 @@ it("cancels only the wait on another context's lock, never the local queue", asy
   live.abort(new Error("disposed while waiting"));
   await expect(waiting).rejects.toThrow("disposed while waiting");
   letGo();
+});
+
+it("treats a null or stub navigator.locks as no Web Locks", async () => {
+  // happy-dom and some embedded contexts define `locks` as null: an engine must still open, with
+  // no unhandled rejection from its liveness claim.
+  const { MinnowDatabase } = await import("./database.js");
+  for (const locks of [null, {}, { request: 1, query: 1 }]) {
+    vi.stubGlobal("navigator", { locks });
+    expect(lockManager()).toBeUndefined();
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown): void => {
+      rejections.push(reason);
+    };
+    process.on("unhandledRejection", onRejection);
+    try {
+      const database = new MinnowDatabase(new MemoryBlockStore());
+      await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)");
+      await database.execute("INSERT INTO t VALUES (1)");
+      await database.close();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(rejections).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onRejection);
+      vi.unstubAllGlobals();
+    }
+  }
 });
