@@ -9569,10 +9569,15 @@ async function validateCurrentIndexedDbSchema(database: IDBDatabase): Promise<vo
       `object stores are ${actualStoreNames.join(", ")}; expected ${expectedStoreNames.join(", ")}`,
     );
   }
-  let transaction: IDBTransaction | undefined;
+  // Only the definitions below are evidence about the stored schema. Opening the transaction and
+  // waiting for it to finish are not: this is the first read of every open, so a database that
+  // answers nothing (another connection's transaction that never ends, which WebKit can leave
+  // behind a terminated worker) times out here, and a connection closed under the open fails
+  // here. Those keep their own errors -- above all `StorageUnresponsiveError`, whose remedy is to
+  // release the browser's hold, not to treat the data as damaged.
+  const transaction = database.transaction([...indexedDbStoreNames], "readonly");
+  void transactionDone(transaction).catch(() => undefined);
   try {
-    transaction = database.transaction([...indexedDbStoreNames], "readonly");
-    void transactionDone(transaction).catch(() => undefined);
     for (const storeName of indexedDbStoreNames) {
       const store = transaction.objectStore(storeName);
       if (store.keyPath !== null || store.autoIncrement) {
@@ -9599,12 +9604,12 @@ async function validateCurrentIndexedDbSchema(database: IDBDatabase): Promise<vo
         }
       }
     }
-    await transactionDone(transaction);
   } catch (error) {
-    if (transaction !== undefined) abortIfActive(transaction);
+    abortIfActive(transaction);
     if (error instanceof StorageCorruptionError) throw error;
     throw corruption("schema", integrityErrorMessage(error));
   }
+  await transactionDone(transaction);
 }
 
 function stringArraysEqual(left: readonly string[], right: readonly string[]): boolean {

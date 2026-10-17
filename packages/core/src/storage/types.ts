@@ -2784,15 +2784,17 @@ export class ConnectionLostError extends Error {
 
 /**
  * The store stopped answering: the whole connection went the adapter's unresponsive deadline
- * without a single storage event while it had work outstanding. The remedy is to reload the
- * page, not to retry — the connection cannot recover, and a fresh one in the same page may be
- * wedged by the same cause.
+ * without a single storage event while it had work outstanding. The remedy is to close the
+ * site's tabs, then open the site again — not to retry: the connection cannot recover, and a
+ * fresh one, in the same page or after reloading it, may be wedged by the same cause.
  *
- * The known cause is a worker terminated with a write in flight. WebKit keeps the dead worker's
- * IndexedDB connection, and its unfinished transaction, registered until the owning document
- * goes away, and while it is registered every connection to that database blocks — including
- * connections opened afterwards in other tabs. A store cannot unwedge the browser, so it bounds
- * the wait and says so instead of hanging.
+ * The known cause is a worker terminated with IndexedDB transactions in flight. WebKit can keep
+ * one of the dead worker's unfinished transactions registered after the worker is gone — seen
+ * when it had more than one in flight — and while it is registered every transaction that
+ * overlaps it blocks, in every tab, including connections opened afterwards. Reloading the tab
+ * that ran the worker does not always release it; closing that tab does. A store cannot unwedge
+ * the browser, so it bounds the wait and says so instead of hanging. An open reports it too:
+ * its first read is the schema check, and silence there is not evidence about the schema.
  *
  * It extends `UnknownOutcomeError` because a write that stalled may still be committed by the
  * browser once the wedge clears, and carries a `ConnectionLostError` cause so `classifyError`
@@ -2808,7 +2810,7 @@ export class StorageUnresponsiveError extends UnknownOutcomeError {
   ) {
     super(
       `The ${backend} database ${databaseName} answered nothing for ${String(waitedMs)}ms and is ` +
-        "treated as unresponsive; reload the page to open it again",
+        "treated as unresponsive; close the site's tabs, then open the site again",
       { cause: new ConnectionLostError(`The ${backend} connection stopped answering`) },
     );
   }

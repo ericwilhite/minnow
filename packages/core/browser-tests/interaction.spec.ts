@@ -159,12 +159,13 @@ async function openTab(
         ),
       ),
     /**
-     * A crash is recovered the way an application must recover one: by reloading the document.
-     * A new worker in the same document is enough on Chromium and Firefox, but WebKit keeps the
-     * terminated worker's IndexedDB connection -- and its unfinished transaction -- registered
-     * until the document goes away, and until then every connection to that database blocks,
-     * new ones in other tabs included. The engine bounds that wait and reports
-     * `StorageUnresponsiveError` rather than hanging; the remedy it names is this reload.
+     * A crash is recovered by reloading the document. A new worker in the same document is
+     * enough on Chromium and Firefox, but WebKit can keep an unfinished transaction of the
+     * terminated worker registered -- seen when the worker had more than one in flight -- and
+     * every transaction that overlaps it blocks, in every tab, new connections included. A
+     * reload does not always release it (closing the tab does), so the engine bounds the wait and
+     * reports `StorageUnresponsiveError`, from the reopen itself when the stuck transaction
+     * blocks the open's first read, and the plan runner stops there as an accepted transient.
      */
     reopen: async () => {
       if (!crashed) {
@@ -340,7 +341,19 @@ for (const store of ["indexeddb", "opfs"] as const satisfies readonly StoreKind[
       // Every diagnostic is retained in the attachment. Concurrent cold accelerators can lose
       // ownership without losing a user write; require typed identity/revision evidence for those
       // reported refusals. Unknown, I/O, corruption and replay errors still fail this campaign.
-      expect(tabErrors.filter((error) => !isMaintenanceContention(error))).toEqual([]);
+      // The one exception is the wedge accepted above: it stops every waiter on this database,
+      // so background maintenance that was waiting in another tab reports the same
+      // StorageUnresponsiveError. That report is the accepted transient, not a second defect.
+      const wedgeAccepted = result.transientsAccepted > 0;
+      const sameWedge = (error: TabError): boolean =>
+        wedgeAccepted &&
+        error.source === "worker" &&
+        error.kind === "maintenance" &&
+        error.error.name === "StorageUnresponsiveError" &&
+        error.error.props?.databaseName === name;
+      expect(
+        tabErrors.filter((error) => !isMaintenanceContention(error) && !sameWedge(error)),
+      ).toEqual([]);
     });
   }
 }

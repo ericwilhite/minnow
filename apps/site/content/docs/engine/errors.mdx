@@ -66,16 +66,18 @@ the engine had work outstanding. Nothing in IndexedDB can be cancelled or timed 
 deadline is what stands between a wedged browser and a call that never returns; any storage event
 resets it, so work queued behind a genuinely long transaction is never mistaken for a wedge.
 
-The known cause is a worker killed with a write in flight — `worker.terminate()` from your own
-code, or the browser killing it. Safari and other WebKit browsers keep the dead worker's
-IndexedDB connection, and its unfinished transaction, registered until the document that created
-the worker goes away. While it is registered, every connection to that database blocks, including
-connections opened afterwards in other tabs.
+The known cause is a worker killed with IndexedDB transactions in flight — `worker.terminate()`
+from your own code, or the browser killing it. Safari and other WebKit browsers can keep one of
+the dead worker's unfinished transactions registered after the worker is gone; we have seen it
+when the worker had more than one in flight. While it is registered, every transaction that
+overlaps it blocks, in every tab, including connections opened afterwards. Opening the database
+can report it too, since the open's first read waits behind the stuck transaction.
 
-**Reload the page.** `reopen()` is not enough: a new worker in the same document opens the same
-wedged database. Reloading, or closing the tab, releases the dead connection immediately. Let the
-engine terminate workers for you — `close({ terminateWorker: true })` disposes the store first —
-and treat a write that was in flight as an unknown outcome.
+**Close the site's tabs, then open the site again.** `reopen()` is not enough: a new worker opens
+the same wedged database. Reloading the tab that ran the dead worker does not always release the
+transaction either; closing that tab does. Let the engine terminate workers for you —
+`close({ terminateWorker: true })` disposes the store first — and treat a write that was in
+flight as an unknown outcome.
 
 Background failures that belong to no call — an uncaught exception in the worker, a failed
 checkpoint, an election that threw — are not errors on any promise. They arrive through
