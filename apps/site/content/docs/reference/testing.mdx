@@ -613,7 +613,9 @@ does not become acceptable just because a statement was meant to fail or a crash
 Custom drivers must preserve error names and causes across their transport, including
 `DatabaseWorkerOutcomeUnknownError` for a mutation interrupted by a worker crash.
 
-The runner is driver-agnostic. In Vitest (`interaction-simulator.test.ts`) each connection is a
+The runner is driver-agnostic. In Vitest (`interaction-simulator.test.ts`, with the rekeying and
+schema suites in `interaction-simulator-rekeying.test.ts` and `interaction-simulator-schema.test.ts`)
+each connection is a
 `MinnowDatabase` over one shared memory, IndexedDB, or OPFS store with the storage fault points
 armed. In Playwright (`interaction.spec.ts`) each connection is a real tab holding the published
 worker over a real IndexedDB or OPFS database, and the plan's faults terminate a worker with a

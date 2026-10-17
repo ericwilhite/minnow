@@ -41,11 +41,11 @@ const SUITES: Suite[] = [
   },
   {
     name: "interaction-simulator-rekeying",
-    file: "packages/core/src/testing/interaction-simulator.test.ts",
+    file: "packages/core/src/testing/interaction-simulator-rekeying.test.ts",
   },
   {
     name: "interaction-simulator-schema",
-    file: "packages/core/src/testing/interaction-simulator.test.ts",
+    file: "packages/core/src/testing/interaction-simulator-schema.test.ts",
   },
   { name: "compaction-soak", file: "packages/core/src/engine/compaction-soak.test.ts" },
   {
