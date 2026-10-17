@@ -65,8 +65,10 @@ const DATABASE_MARKER = "A database cannot queue more than";
 // Full-text coverage for append-only folds and invalidated-postings collection: 1075.2 KiB raw /
 // 321.0 KiB gzip.
 // UNIQUE builds under writes (postings-only folds, CREATE that finishes enforced): 1076.9 KiB
-// raw.
-const COMPLETE_ENTRY_RAW_BUDGET = 1077 * 1024;
+// raw / 321.7 KiB gzip.
+// Work that outlives its own lease (folds take their job over, one-statement writes start
+// again, aborts settle a lapsed owner): 1078.0 KiB raw / 321.9 KiB gzip.
+const COMPLETE_ENTRY_RAW_BUDGET = 1079 * 1024;
 const COMPLETE_ENTRY_GZIP_BUDGET = 322 * 1024;
 // Measured with the larger durable adapter: 1211.9 KiB raw / 337.5 KiB gzip. The durable
 // served-request ledger (OPFS layout 6) adds about 20 KiB raw: 1231.3 KiB raw. With the scope
@@ -87,7 +89,8 @@ const COMPLETE_ENTRY_GZIP_BUDGET = 322 * 1024;
 // PostgreSQL datetime and interval text: 1455.5 KiB raw.
 // Full-text fold coverage and postings collection: 1456.6 KiB raw.
 // UNIQUE builds under writes: 1458.3 KiB raw.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1459 * 1024;
+// Work that outlives its own lease: 1459.4 KiB raw.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1460 * 1024;
 // Explicit scheduler ownership and bounded diagnostic history add about 1 KiB gzip over the
 // correctness/upgrade batch (361.6 KiB measured). Concurrent compaction and posting ownership
 // repairs measure 362.1 KiB; allow the next whole KiB without changing runtime performance gates.
@@ -102,6 +105,7 @@ const ENGINE_WITH_OPFS_RAW_BUDGET = 1459 * 1024;
 // With the V8 JSON key guard: 417.2 KiB measured. Shared engine helpers: 416.2 KiB measured.
 // With PostgreSQL datetime and interval text: 419.4 KiB measured.
 // UNIQUE builds under writes: 420.4 KiB measured.
+// Work that outlives its own lease: 420.7 KiB measured.
 const ENGINE_WITH_OPFS_GZIP_BUDGET = 421 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
 // code splitting the way Vite's default iife worker format does. The generic entry inlined the
@@ -121,7 +125,8 @@ const ENGINE_WITH_OPFS_GZIP_BUDGET = 421 * 1024;
 // PostgreSQL datetime and interval text: 1450.6 KiB raw / 416.2 KiB gzip.
 // Full-text fold coverage and postings collection: 1451.8 KiB raw.
 // UNIQUE builds under writes: 1453.6 KiB raw / 417.2 KiB gzip.
-const INDEXEDDB_WORKER_RAW_BUDGET = 1454 * 1024;
+// Work that outlives its own lease: 1454.7 KiB raw / 417.5 KiB gzip.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1455 * 1024;
 const INDEXEDDB_WORKER_GZIP_BUDGET = 418 * 1024;
 
 const repoRoot = join(import.meta.dirname, "..", "..", "..");

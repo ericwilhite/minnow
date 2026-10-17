@@ -153,7 +153,8 @@ machines: https://minnowdb.com/llms.txt
   your transaction. `WriteConflictError` only comes from a writer that did not take a turn (an
   older build in another tab); a `COMMIT` that loses that way publishes nothing and leaves
   nothing to acknowledge: rerun the whole transaction. Keep transaction callbacks
-  short; readers use renewable leases, and a scope suspended past an expired lease fails explicitly.
+  short; readers use renewable leases, and a scope suspended past an expired lease fails explicitly
+  (a single-statement write or a fold starts again with a fresh lease instead).
 - For anything interactive, run the engine in a worker. Put
   `import "@minnowdb/core/worker"` in a local `db-worker.ts`, then pass
   `new Worker(new URL("./db-worker.ts", import.meta.url), { type: "module" })` to

@@ -1382,6 +1382,9 @@ export class DatabaseTransaction {
   }
 
   async abort(): Promise<void> {
+    // Already reclaimed: this owner's lease lapsed and the ownership check found the record
+    // aborted by whoever reclaimed it. Nothing can publish it now, so the abort is done.
+    if (this.#record.status === "aborted") return;
     this.#assertActive();
     if (!this.#persisted) {
       // Never written, so there is nothing to mark: the transaction simply ends here.
@@ -1394,13 +1397,53 @@ export class DatabaseTransaction {
       await this.#releaseSnapshotLease().catch(() => undefined);
       return;
     }
-    await this.#renewOwnership();
+    try {
+      await this.#renewOwnership();
+    } catch (error) {
+      if (!(error instanceof TransactionClosedError) || !(await this.#settleLapsedAbort())) {
+        throw error;
+      }
+      return;
+    }
     this.#record = await this.store.updateTransaction(this.id, this.#record.revision, {
       status: "aborted",
       updatedAt: dateIsoString(this.now()),
     });
     this.#stopHeartbeat();
     await this.#releaseSnapshotLease().catch(() => undefined);
+  }
+
+  /**
+   * An abort whose ownership lapsed first — the thread was frozen past the lease (a sleeping
+   * laptop, a suspended tab) or another connection reclaimed the record as expired. The abort
+   * only has to make sure the transaction never commits, and a lapsed owner never can: mark the
+   * record the way recovery marks any expired owner, and report success. Throwing instead would
+   * replace the error the caller is unwinding from with this one. `false` when the record
+   * committed or is still held by a live owner, which an abort cannot settle.
+   */
+  async #settleLapsedAbort(): Promise<boolean> {
+    let record: TransactionRecord | undefined = this.#record;
+    if (record.status === "active") {
+      const cutoff = dateIsoString(this.now());
+      record =
+        (await this.store.abortTransactionIfExpired({
+          transactionId: this.id,
+          expectedOwnerId: record.ownerId,
+          expiresAtCutoff: cutoff,
+          updatedAt: cutoff,
+        })) ?? (await this.store.getTransaction(this.id));
+    }
+    if (record?.status === "active" || record?.status === "committed") {
+      this.#record = record;
+      return false;
+    }
+    this.#record = record ?? {
+      ...this.#record,
+      status: "aborted",
+      updatedAt: dateIsoString(this.now()),
+    };
+    this.#stopHeartbeat();
+    return true;
   }
 
   #assertActive(): void {
