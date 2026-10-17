@@ -96,7 +96,8 @@ const COMPLETE_ENTRY_GZIP_BUDGET = 328 * 1024;
 // Single-row write paths and delta merges: 1481.7 KiB raw.
 // Build-owner liveness: 1485.0 KiB raw.
 // Lapsed-lease retakes and write restarts: 1486.1 KiB raw.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1487 * 1024;
+// OPFS marker judged under a Web Lock: 1487.1 KiB raw.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1488 * 1024;
 // Explicit scheduler ownership and bounded diagnostic history add about 1 KiB gzip over the
 // correctness/upgrade batch (361.6 KiB measured). Concurrent compaction and posting ownership
 // repairs measure 362.1 KiB; allow the next whole KiB without changing runtime performance gates.
@@ -113,7 +114,8 @@ const ENGINE_WITH_OPFS_RAW_BUDGET = 1487 * 1024;
 // UNIQUE builds under writes: 420.4 KiB measured.
 // Single-row write paths and delta merges: 426.5 KiB measured.
 // Build-owner liveness: 427.6 KiB measured.
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 428 * 1024;
+// OPFS marker under a Web Lock: 428.2 KiB measured.
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 429 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
 // code splitting the way Vite's default iife worker format does. The generic entry inlined the
 // same way measured 1546.4 KiB raw / 422.3 KiB gzip. Measured with typed coordination recovery: about 1239 KiB raw / 344.1 KiB gzip.
