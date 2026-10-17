@@ -196,6 +196,23 @@ an existing row: if it repeats a key, `CREATE UNIQUE INDEX` fails and leaves no 
 index exists, folding its deltas rebuilds only its postings, never its key set, so a busy table
 keeps the index ready.
 
+`CREATE INDEX IF NOT EXISTS` succeeds on the same terms: once an index of that name is ready, and
+a `UNIQUE` one enforces. So every tab can run the same statement at start-up. If another tab is
+still creating the index, the statement waits for that tab's `CREATE INDEX` to finish. If that
+build fails — say the table holds a duplicate — this statement creates the index itself and reports
+its own result, which for a duplicate is the same failure. It never succeeds while nothing
+enforces the index. As with PostgreSQL, the name alone decides: an existing index of that name on
+other columns counts as existing.
+
+A tab that closes or crashes in the middle of a build does not hold the index up. Each connection
+holds a Web Lock for as long as it is open, and the browser releases it when the tab goes away.
+Another tab's `CREATE INDEX IF NOT EXISTS`, or a query that needs the index, then takes the build
+over within moments, while a tab that is still building is never interrupted. When a
+`CREATE UNIQUE INDEX IF NOT EXISTS` takes over a build that then finds a duplicate, it fails and
+removes the index, as the closed tab's statement would have. Without Web Locks (older Node
+releases, or a browser too old to have them), a build abandoned by another context holds the
+index for up to an hour, until its lease runs out.
+
 ```sql
 DROP INDEX IF EXISTS orders_by_status;
 ```

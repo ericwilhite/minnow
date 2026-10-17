@@ -40,6 +40,8 @@
     "semantic-run.ts",
     "upgrade-run.ts",
     "upgrade-worker.ts",
-    "oltp-latency-run.ts"
+    "oltp-latency-run.ts",
+    "index-takeover-run.ts",
+    "index-takeover-worker.ts"
   ]
 }

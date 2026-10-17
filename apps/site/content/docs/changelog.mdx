@@ -41,6 +41,17 @@ reproduced first and ships with a test that fails without it.
   and the table then accepted duplicates, even ones it already held. It now returns only once the
   index enforces; if writes land during the build, it builds again holding the write turn, so
   writers wait and readers do not.
+- **`CREATE INDEX IF NOT EXISTS` could report an index that did not exist yet.** While another tab
+  was still building it, the statement succeeded at once; for a UNIQUE index a duplicate written
+  next was accepted, and the creating tab's statement then failed and removed the index. It now
+  succeeds only once the index is ready (UNIQUE: enforcing): it waits for the other tab's statement,
+  creates the index itself if that statement fails, and fails with it on a duplicate — safe to run
+  in every tab at start-up. Two connections creating the same index name at once can no longer both
+  succeed.
+- **A tab closed mid-build held an index for an hour.** Each connection now holds a Web Lock while
+  it is open, so a build whose tab is gone is taken over within moments by the next
+  `CREATE INDEX IF NOT EXISTS`, query, or full-text build; a live tab's build is never interrupted.
+  Where Web Locks are missing, the one-hour lease is still the fallback.
 - **UNIQUE indexes fell out of use under steady writes.** Folding a UNIQUE index's recent changes
   rebuilt its whole key set and lost to any commit that landed meanwhile; the index went invalid,
   and on IndexedDB it could never be rebuilt once it held data, so every query reported a failed
@@ -206,7 +217,7 @@ Single-row writes are still far slower than SQLite's in-place B-tree (a point up
 
 ### Size
 
-The engine with the OPFS adapter is 426 KiB gzipped (392 KiB in 0.15.0), still below SQLite Wasm's
+The engine with the OPFS adapter is 428 KiB gzipped (392 KiB in 0.15.0), still below SQLite Wasm's
 457 KiB. Helpers the engine had copied between modules are now shared.
 
 ### API changes

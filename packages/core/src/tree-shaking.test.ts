@@ -69,8 +69,10 @@ const DATABASE_MARKER = "A database cannot queue more than";
 // Single-row write paths (batched IndexedDB commit reads, the level-zero count cache, paged
 // collection planning) and delta merges (the delta-v1 planner, runner, and plan validation, the
 // quiet-table fold, schema 7 / layout 12): 1091.8 KiB raw / 326.0 KiB gzip.
-const COMPLETE_ENTRY_RAW_BUDGET = 1092 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 326 * 1024;
+// Build-owner liveness and CREATE INDEX IF NOT EXISTS waits (owner-presence.ts): 1095.1 KiB raw /
+// 327.1 KiB gzip.
+const COMPLETE_ENTRY_RAW_BUDGET = 1096 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 328 * 1024;
 // Measured with the larger durable adapter: 1211.9 KiB raw / 337.5 KiB gzip. The durable
 // served-request ledger (OPFS layout 6) adds about 20 KiB raw: 1231.3 KiB raw. With the scope
 // write set: 346.0 KiB gzip. The unbounded journal (memoized RecordCore journal, bounded served
@@ -91,7 +93,8 @@ const COMPLETE_ENTRY_GZIP_BUDGET = 326 * 1024;
 // Full-text fold coverage and postings collection: 1456.6 KiB raw.
 // UNIQUE builds under writes: 1458.3 KiB raw.
 // Single-row write paths and delta merges: 1481.7 KiB raw.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1482 * 1024;
+// Build-owner liveness: 1485.0 KiB raw.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1486 * 1024;
 // Explicit scheduler ownership and bounded diagnostic history add about 1 KiB gzip over the
 // correctness/upgrade batch (361.6 KiB measured). Concurrent compaction and posting ownership
 // repairs measure 362.1 KiB; allow the next whole KiB without changing runtime performance gates.
@@ -107,7 +110,8 @@ const ENGINE_WITH_OPFS_RAW_BUDGET = 1482 * 1024;
 // With PostgreSQL datetime and interval text: 419.4 KiB measured.
 // UNIQUE builds under writes: 420.4 KiB measured.
 // Single-row write paths and delta merges: 426.5 KiB measured.
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 427 * 1024;
+// Build-owner liveness: 427.6 KiB measured.
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 428 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
 // code splitting the way Vite's default iife worker format does. The generic entry inlined the
 // same way measured 1546.4 KiB raw / 422.3 KiB gzip. Measured with typed coordination recovery: about 1239 KiB raw / 344.1 KiB gzip.
@@ -127,8 +131,9 @@ const ENGINE_WITH_OPFS_GZIP_BUDGET = 427 * 1024;
 // Full-text fold coverage and postings collection: 1451.8 KiB raw.
 // UNIQUE builds under writes: 1453.6 KiB raw / 417.2 KiB gzip.
 // Single-row write paths and delta merges: 1479.6 KiB raw / 424.1 KiB gzip.
-const INDEXEDDB_WORKER_RAW_BUDGET = 1480 * 1024;
-const INDEXEDDB_WORKER_GZIP_BUDGET = 425 * 1024;
+// Build-owner liveness: 1482.9 KiB raw / 425.2 KiB gzip.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1483 * 1024;
+const INDEXEDDB_WORKER_GZIP_BUDGET = 426 * 1024;
 
 const repoRoot = join(import.meta.dirname, "..", "..", "..");
 

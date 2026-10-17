@@ -220,6 +220,9 @@ machines: https://minnowdb.com/llms.txt
   them. `CREATE UNIQUE INDEX`
   enforces additional candidate keys atomically; any NULL component does not conflict. It returns
   once the index enforces; if writes land during the build, it finishes holding the write turn.
+  `CREATE [UNIQUE] INDEX IF NOT EXISTS` is safe to run in every tab at start-up: it returns only
+  once that index is ready (UNIQUE: enforcing), waiting for another tab's build, and fails if
+  that build finds a duplicate.
   `DROP INDEX name` removes the catalog, postings, and unique membership. A matching non-null index
   can satisfy `ORDER BY` (and cover the query) on a keyless append-only table; other shapes sort.
   Logical domains such as exact NUMERIC and enum use indexes for equality, but scan/sort for ranges.

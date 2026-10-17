@@ -2301,9 +2301,11 @@ export class OpfsLeader {
             return undefined;
           }
           if (Date.parse(previous.expiresAt) > Date.parse(input.createdAt)) {
+            // Names the holder, as every store's refusal does: the engine asks whether it is
+            // alive.
             throw new PostingBuildConflictError(
-              input.buildId,
-              input.ownerId,
+              previous.buildId,
+              previous.ownerId,
               "another live build exists",
             );
           }

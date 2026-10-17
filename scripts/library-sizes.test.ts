@@ -46,6 +46,6 @@ describe("compressed download budgets", () => {
     expect(
       worker.totalGzipBytes + client.totalGzipBytes,
       "worker plus client gzip bytes",
-    ).toBeLessThanOrEqual(533 * 1024);
+    ).toBeLessThanOrEqual(534 * 1024);
   });
 });

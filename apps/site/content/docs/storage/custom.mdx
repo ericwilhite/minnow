@@ -130,7 +130,11 @@ instead of slipping through unenforced.
 
 Postings output is always chunked. `beginFtsBaseBuild`, `writeFtsBaseBuildChunk`,
 `finishFtsBaseBuild`, and `abortFtsBaseBuild` stage one small chunk at a time and publish the
-complete generation atomically. Starting a replacement reclaims an abandoned generation. Common
+complete generation atomically. Starting a replacement reclaims an abandoned generation. When
+`beginFtsBaseBuild` refuses because another live session holds the column, throw
+`PostingBuildConflictError` naming that session's `buildId` and `ownerId`, not the caller's: the
+engine checks whether that owner's connection is still open, and ends a dead one's session through
+`abortFtsBaseBuild` on its behalf instead of waiting for its lease to expire. Common
 append/update/delete histories are scanned through bounded row windows. An exact `UNIQUE` build
 over an uncompacted upsert history is the deliberate exception: it materializes the current
 projected key columns, never the historical rows, before writing the same bounded chunks. These

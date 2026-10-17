@@ -188,7 +188,7 @@ describe("published core tarball", () => {
       // (960,174 measured), 962,000 with UNIQUE builds under writes (961,154 measured), and
       // 973,000 with the single-row write paths and delta merges (972,128 measured); ratchets,
       // not targets.
-      expect(report?.size, "packed bytes").toBeLessThanOrEqual(973_000);
+      expect(report?.size, "packed bytes").toBeLessThanOrEqual(975_000);
       expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_500_000);
       const emitted = await readFile(join(isolatedCore, "dist", "engine", "optimizer.js"), "utf8");
       expect(emitted).not.toContain("/**");
