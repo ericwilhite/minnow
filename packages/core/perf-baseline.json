@@ -5,16 +5,16 @@
     "darwin-arm64-node24": {
       "thresholds": {
         "bulk-ingest": {
-          "sqlite": 3.38,
-          "pglite": 0.52
+          "sqlite": 3.3,
+          "pglite": 0.507
         },
         "count-star": {
           "sqlite": 0.206,
           "pglite": 0.00175
         },
         "filter-scan": {
-          "sqlite": 0.43,
-          "pglite": 0.176
+          "sqlite": 0.404,
+          "pglite": 0.168
         },
         "group-aggregate": {
           "sqlite": 0.0996,
@@ -61,7 +61,7 @@
           "pglite": 0.0256
         },
         "composite-key-lookup": {
-          "sqlite": 2.72,
+          "sqlite": 2.62,
           "pglite": 0.0182
         },
         "range-scan": {
@@ -74,11 +74,11 @@
         },
         "deep-page": {
           "sqlite": 0.706,
-          "pglite": 0.231
+          "pglite": 0.23
         },
         "catalog-point-lookup": {
-          "sqlite": 0.000837,
-          "pglite": 0.000354
+          "sqlite": 0.0008,
+          "pglite": 0.00032
         },
         "delta-point-lookup": {
           "sqlite": 0.00112,
@@ -89,28 +89,28 @@
           "pglite": 0.00224
         },
         "delta-filter-scan": {
-          "sqlite": 0.508,
-          "pglite": 0.213
+          "sqlite": 0.418,
+          "pglite": 0.19
         },
         "memo-hit-aggregate": {
           "sqlite": 0.0000558,
           "pglite": 0.000084
         },
         "point-update": {
-          "sqlite": 0.183,
-          "pglite": 0.0794
+          "sqlite": 0.118,
+          "pglite": 0.0462
         },
         "range-update": {
-          "sqlite": 0.242,
-          "pglite": 0.104
+          "sqlite": 0.192,
+          "pglite": 0.084
         },
         "filtered-update": {
-          "sqlite": 0.213,
-          "pglite": 0.136
+          "sqlite": 0.156,
+          "pglite": 0.103
         },
         "settle-after-updates": {
-          "sqlite": 1.15,
-          "pglite": 0.504
+          "sqlite": 0.98,
+          "pglite": 0.388
         },
         "settled-point-lookup": {
           "sqlite": 0.00147,
