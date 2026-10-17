@@ -170,7 +170,11 @@ import {
   type Placement,
 } from "../toolkit/extents.js";
 import { readFully, writeFully } from "../toolkit/sync-file.js";
-import { MAX_STORED_BLOCK_BYTE_LENGTH, verifyStoredBlock } from "../../block-format/index.js";
+import {
+  MAX_STORED_BLOCK_BYTE_LENGTH,
+  verifyStoredBlock,
+  parseJson,
+} from "../../block-format/index.js";
 import { crc32 } from "../../block-format/checksum.js";
 
 /** Checkpoint when the WAL passes either bound; both trade replay time against pause time. */
@@ -6936,7 +6940,7 @@ function postingStorageKey(tableId: string, columnId: string): string {
 function parsePostingStorageKey(value: string, label: string): readonly [string, string] {
   let decoded: unknown;
   try {
-    decoded = JSON.parse(value);
+    decoded = parseJson(value);
   } catch {
     throw new Error(`Invalid ${label} key`);
   }

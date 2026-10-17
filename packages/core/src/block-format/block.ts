@@ -1,4 +1,5 @@
 import { crc32 } from "./checksum.js";
+import { parseJson } from "./json-parse.js";
 import { decodeValidatedColumn, encodeColumn } from "./column.js";
 import { CompressionOutputLimitError, getCodec, getCompressionMemoryBound } from "./codecs.js";
 import {
@@ -347,7 +348,7 @@ function inspectV2Block(bytes: Uint8Array): BlockDescription {
     metadataJson = textDecoder.decode(
       bytes.subarray(HEADER_LENGTH, HEADER_LENGTH + metadataLength),
     );
-    parsedMetadata = JSON.parse(metadataJson) as unknown;
+    parsedMetadata = parseJson(metadataJson);
   } catch {
     throw new Error("Invalid block metadata");
   }
@@ -394,7 +395,7 @@ function encodeCanonicalMetadata(metadata: BlockMetadata): Uint8Array {
   if (typeof source !== "string") throw new TypeError("Block metadata must be canonical JSON");
   let canonical: BlockMetadata;
   try {
-    canonical = parseMetadata(JSON.parse(source) as unknown);
+    canonical = parseMetadata(parseJson(source));
   } catch {
     throw new TypeError("Block metadata must match the supported canonical shape");
   }

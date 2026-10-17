@@ -1,4 +1,5 @@
 import { castSqlValue, datetimeText } from "./sql-casts.js";
+import { parseJson } from "../block-format/json-parse.js";
 export { datetimeText } from "./sql-casts.js";
 import { encodeQueryIdentity } from "./query-identity.js";
 import { alreadyExternalResults, copyQueryResultExternalization } from "./result-state.js";
@@ -526,7 +527,7 @@ function scalarFunctionValueGeneric(
     const index = values[1];
     if (typeof source !== "string" || typeof index !== "number" || !Number.isSafeInteger(index))
       throw new TypeError("Array subscripts require an array and an integer position");
-    const array: unknown = JSON.parse(source);
+    const array: unknown = parseJson(source);
     if (!Array.isArray(array)) throw new TypeError("Array subscripts require an array");
     const selected: unknown = array[index - 1] ?? null;
     if (typeof selected === "string") return protectedSqlTextValue(selected);
@@ -2718,7 +2719,7 @@ function arrayParameterMembers(value: QueryParameter, index: number): readonly Q
     const text = arrayDomainText(
       normalizeSqlDomainValue({ kind: "array", element: "TEXT" }, value),
     );
-    members = JSON.parse(text ?? "[]") as unknown[];
+    members = parseJson(text ?? "[]") as unknown[];
   } else {
     throw new TypeError(`Parameter ${label} must be an array for ANY or ALL`);
   }
@@ -6737,7 +6738,7 @@ export function quantifiedMembers<E extends { readonly kind: string }>(
   const text = arrayDomainText(value);
   if (text === undefined) throw new TypeError("ANY/ALL take a subquery or an array");
   if (lastQuantifiedArray?.text === text) return lastQuantifiedArray.members;
-  const members = (JSON.parse(text) as unknown[]).map((member) => {
+  const members = (parseJson(text) as unknown[]).map((member) => {
     if (typeof member === "string") return protectedSqlTextValue(member);
     if (typeof member === "object" && member !== null) {
       throw new TypeError("ANY/ALL take a one-dimensional array of scalar values");

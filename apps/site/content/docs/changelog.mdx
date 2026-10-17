@@ -25,6 +25,14 @@ reproduced first and ships with a test that fails without it.
   Databases already in that state recover on open: the first write or read starts the folds. A
   fold planned before an `ALTER TABLE` is cancelled and planned again, and OPFS no longer refuses
   to reopen after an `ALTER TABLE` that follows a fold.
+- **Chrome and Node could misread JSON object keys.** V8 (Chrome 151–155 and Node 24 at least) can
+  return the wrong name for an object key written with an escape — `"\""`, `"\n"`, `"\u0000"`
+  — once it has parsed a similar object before: `{"a":1,"\"":2}` can come back as `{"a":1,"\\":2}`.
+  About one parse in a hundred of such objects was affected in a fuzz; WebKit is not. Minnow now
+  reads stored records, JSON column values, Kysely results, and devtools JSON through
+  `parseJson`, which keeps the native result when no key can be wrong and otherwise parses the
+  text again in JavaScript. `parseJson` is exported from `@minnowdb/core` and
+  `@minnowdb/core/json` for application code.
 - **Tables with a UNIQUE column could stop accepting writes.** Compaction never declared the
   table's unique indexes, so every fold of such a table was refused, and after 4,096 single-row
   commits every write to it was refused too.
@@ -139,11 +147,11 @@ Writes are still slower than SQLite's in-place B-tree, and bulk deletes about 8�
 
 ### Size
 
-The engine with the OPFS adapter is 416 KiB gzipped (392 KiB in 0.15.0).
+The engine with the OPFS adapter is 417 KiB gzipped (392 KiB in 0.15.0).
 
 ### API changes
 
-New `QueryParameter` type (`QueryValue | readonly QueryValue[]`) widens `params` across the
+New `parseJson` export (also the `@minnowdb/core/json` entry point). New `QueryParameter` type (`QueryValue | readonly QueryValue[]`) widens `params` across the
 database, client, worker, live queries, and Kysely. `ExecuteResult` gains a `rename-column`
 member, so an exhaustive `switch` over `ExecuteResult.kind` needs a new case. New
 `compactionPlanMatchesTableSchema` export for custom adapters. The plan model gains

@@ -835,6 +835,13 @@
               ]
             },
             {
+              "name": "parseJson",
+              "kind": "value",
+              "declarations": [
+                "export declare function parseJson(text: string): unknown;"
+              ]
+            },
+            {
               "name": "planMigration",
               "kind": "type-and-value",
               "declarations": [
@@ -1591,6 +1598,13 @@
               ]
             },
             {
+              "name": "parseJson",
+              "kind": "value",
+              "declarations": [
+                "export declare function parseJson(text: string): unknown;"
+              ]
+            },
+            {
               "name": "physicalBitmapByteLength",
               "kind": "value",
               "declarations": [
@@ -1762,6 +1776,26 @@
               "kind": "type",
               "declarations": [
                 "export interface MinnowDatabaseClientOptions<TSchema extends AnySchema = UntypedSchema> {\n    schema?: TSchema;\n    store?: StoreDescriptor;\n    databaseOptions?: WireDatabaseOptions;\n    requestTimeoutMs?: number;\n    onWorkerError?: (event: DatabaseWorkerErrorEvent) => void;\n    onConnectionLost?: (error: ConnectionLostError) => void;\n}"
+              ]
+            }
+          ]
+        },
+        {
+          "subpath": "./json",
+          "audience": "application",
+          "exports": [
+            {
+              "name": "parseJson",
+              "kind": "value",
+              "declarations": [
+                "export declare function parseJson(text: string): unknown;"
+              ]
+            },
+            {
+              "name": "parsePortableJson",
+              "kind": "value",
+              "declarations": [
+                "export declare function parsePortableJson(text: string): unknown;"
               ]
             }
           ]

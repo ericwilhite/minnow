@@ -1,4 +1,5 @@
 import { dateMilliseconds } from "../date-value.js";
+import { parseJson } from "../block-format/json-parse.js";
 import type { TableColumnRecord, TableRecord } from "../storage/types.js";
 import type { BatchValue } from "./batch.js";
 import { getUniqueKeyColumn, keyToken, secondaryTupleComponent } from "./index-terms.js";
@@ -149,7 +150,7 @@ export function encodeKeyValues(values: readonly BatchValue[]): string {
 }
 
 export function decodeKeyValues(text: string): BatchValue[] {
-  const parsed: unknown = JSON.parse(text);
+  const parsed: unknown = parseJson(text);
   if (!Array.isArray(parsed)) throw new TypeError("Key forward values are invalid");
   return parsed.map((value: unknown) => {
     if (value === null || typeof value === "string" || typeof value === "boolean") return value;

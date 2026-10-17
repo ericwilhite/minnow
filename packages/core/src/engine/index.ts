@@ -64,3 +64,5 @@ export {
   OpfsUncertainOutcomeError,
   StorageUnresponsiveError,
 } from "../storage/types.js";
+/** `JSON.parse`, guarded against V8 renaming escaped object keys; see json-parse.ts. */
+export { parseJson } from "../block-format/json-parse.js";

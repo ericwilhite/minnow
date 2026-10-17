@@ -176,6 +176,7 @@ import {
   crc32,
   crc32Continue,
   MAX_STORED_BLOCK_BYTE_LENGTH,
+  parseJson,
 } from "../../block-format/index.js";
 
 /**
@@ -8664,7 +8665,7 @@ function decodeExpiryPageCursor(
   if (cursor === null) return null;
   let value: unknown;
   try {
-    value = JSON.parse(cursor);
+    value = parseJson(cursor);
   } catch {
     throw new TypeError(`${label} cursor is invalid`);
   }

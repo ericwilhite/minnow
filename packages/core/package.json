@@ -124,6 +124,10 @@
       "types": "./dist/block-format/index.d.ts",
       "default": "./dist/block-format/index.js"
     },
+    "./json": {
+      "types": "./dist/block-format/json-parse.d.ts",
+      "default": "./dist/block-format/json-parse.js"
+    },
     "./transactions": {
       "types": "./dist/transactions/index.d.ts",
       "default": "./dist/transactions/index.js"

@@ -1,3 +1,4 @@
+import { parseJson } from "@minnowdb/core/json";
 import type { ExecuteResult, MinnowSqlDriver, QueryValue } from "@minnowdb/core";
 import {
   IdentifierNode,
@@ -72,7 +73,7 @@ export function decodedRows<R>(
       return (value: QueryValue | undefined): unknown => {
         if (value === null || value === undefined) return value;
         if (typeof value !== "string") return value;
-        return JSON.parse(value) as unknown;
+        return parseJson(value);
       };
     }
     return undefined;

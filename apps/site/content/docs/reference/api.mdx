@@ -34,6 +34,7 @@ rules behind this table.
 | `@minnowdb/core/storage/toolkit`                 | Extension   | Building blocks for writing storage adapters                    |
 | `@minnowdb/core/transactions`                    | Extension   | Snapshots, transactions, recovery (lower level)                 |
 | `@minnowdb/core/block-format`                    | Extension   | Binary block containers and codecs (lower level)                |
+| `@minnowdb/core/json`                            | Application | `parseJson`: `JSON.parse` guarded against a V8 key bug          |
 | `@minnowdb/core/worker-protocol`                 | Extension   | Versioned RPC frames (lower level)                              |
 | `@minnowdb/core/testing`                         | Testing     | Fault injection and the shared block-store test kit             |
 | `@minnowdb/core/sql-feature-matrix.json`         | Metadata    | Runnable SQL support and exclusion examples                     |
@@ -363,6 +364,16 @@ The versioned binary containers: block headers, column encodings, codec registry
 zone-map statistics, and physical-type mapping. Everything here is re-exported for tooling and
 inspection. Block-format 2 is the first locked byte contract: incompatible future writers must
 use a new format number and retain its reader.
+
+## `@minnowdb/core/json`
+
+`parseJson(text)` is `JSON.parse` that stays correct in Chrome and Node. Current V8 builds can
+return the wrong name for an object key written with an escape (`"\""`, `"\n"`, `"\u0000"`)
+once an earlier parse has seen a similar object: `{"a":1,"\"":2}` can come back with the key `\`.
+Minnow reads every stored record, JSON column value, and query result through it, and the Kysely
+adapter and devtools use it too. Use it in your own code for JSON whose keys you do not control.
+It costs nothing for text without escapes and falls back to a slower parser only when a key in
+the result contains a backslash. It is also exported from `@minnowdb/core`.
 
 ## `@minnowdb/core/worker-protocol`
 

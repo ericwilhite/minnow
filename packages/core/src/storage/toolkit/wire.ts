@@ -1,4 +1,4 @@
-import { crc32, crc32Continue } from "../../block-format/index.js";
+import { crc32, crc32Continue, parseJson } from "../../block-format/index.js";
 import { MAX_ROW_ID_EXCLUSIVE_END, StorageFormatVersionError } from "../types.js";
 
 /**
@@ -197,7 +197,7 @@ function jsonNodes(entry: unknown, limit: number): number {
 export function decodeRecordJson(bytes: Uint8Array): unknown {
   // A reviver runs once per parsed value and made a large checkpoint parse fifteen times slower
   // than the parse itself; tagged bigints are rare, so one pass after parsing finds them.
-  return reviveRecordBigints(JSON.parse(textDecoder.decode(bytes)) as unknown);
+  return reviveRecordBigints(parseJson(textDecoder.decode(bytes)));
 }
 
 /**
@@ -644,7 +644,7 @@ export async function parseRecordJsonSliced(
     await pause();
   };
   const parsePiece = async (text: string): Promise<unknown> => {
-    const value = reviveRecordBigints(JSON.parse(text) as unknown);
+    const value = reviveRecordBigints(parseJson(text));
     await pause();
     return value;
   };
@@ -765,7 +765,7 @@ export async function parseRecordJsonSliced(
     const flushRun = async (): Promise<void> => {
       if (runStart < 0) return;
       // Revived member by member: a run holding only a `$n` member is not a tagged bigint.
-      const run = JSON.parse(`{${textDecoder.decode(bytes.subarray(runStart, runEnd))}}`) as Record<
+      const run = parseJson(`{${textDecoder.decode(bytes.subarray(runStart, runEnd))}}`) as Record<
         string,
         unknown
       >;
@@ -790,7 +790,7 @@ export async function parseRecordJsonSliced(
       }
       const colon = skipSpace(keyEnd + 1, memberEnd);
       if (bytes[colon] !== COLON) throw malformed();
-      const key = JSON.parse(textDecoder.decode(bytes.subarray(keyStart, keyEnd + 1))) as string;
+      const key = parseJson(textDecoder.decode(bytes.subarray(keyStart, keyEnd + 1))) as string;
       assign(key, await parseRange(colon + 1, memberEnd));
     });
     await flushRun();

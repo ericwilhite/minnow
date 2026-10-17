@@ -3,6 +3,7 @@ import {
   crc32,
   crc32Continue,
   MAX_STORED_BLOCK_BYTE_LENGTH,
+  parseJson,
 } from "../block-format/index.js";
 import { dateIsoString, dateMilliseconds } from "../date-value.js";
 import {
@@ -859,7 +860,7 @@ export async function* decodeSnapshotFrameStream(
       throw new Error("Snapshot header checksum mismatch");
     let parsed: unknown;
     try {
-      parsed = JSON.parse(textDecoder.decode(headerBytes));
+      parsed = parseJson(textDecoder.decode(headerBytes));
     } catch {
       throw new TypeError("Snapshot header is not canonical JSON");
     }

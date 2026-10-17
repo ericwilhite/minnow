@@ -1,3 +1,4 @@
+import { parseJson } from "@minnowdb/core/json";
 import type { DevtoolsCorner } from "../options.js";
 
 export interface Size {
@@ -144,7 +145,7 @@ export function parseRect(raw: string | null): Rect | undefined {
   if (raw === null) return undefined;
   let value: unknown;
   try {
-    value = JSON.parse(raw);
+    value = parseJson(raw);
   } catch {
     return undefined;
   }

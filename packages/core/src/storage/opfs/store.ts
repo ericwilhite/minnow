@@ -12,6 +12,7 @@ import {
   type TempRunPage,
   type UniqueKeyChanges,
 } from "../types.js";
+import { parseJson } from "../../block-format/index.js";
 import { maybeYieldToEventLoop } from "../../work-slicer.js";
 import { commitDeltaUnits, LARGE_COMMIT_DELTA_UNITS } from "../commit-size.js";
 import { encodeRecordJsonBytesSliced, parseRecordJsonSliced } from "../toolkit/wire.js";
@@ -2101,7 +2102,7 @@ export class OpfsBlockStore {
 
   #validateFormatMarker(bytes: Uint8Array): void {
     const text = new TextDecoder().decode(bytes);
-    const parsed = JSON.parse(text) as unknown;
+    const parsed = parseJson(text);
     if (
       typeof parsed !== "object" ||
       parsed === null ||

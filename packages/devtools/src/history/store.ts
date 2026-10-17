@@ -1,3 +1,4 @@
+import { parseJson } from "@minnowdb/core/json";
 import type { QueryResult } from "@minnowdb/core";
 
 export interface HistoryEntry {
@@ -58,7 +59,7 @@ function parseEntries(raw: string | null): HistoryEntry[] {
   if (raw === null) return [];
   let value: unknown;
   try {
-    value = JSON.parse(raw);
+    value = parseJson(raw);
   } catch {
     return [];
   }

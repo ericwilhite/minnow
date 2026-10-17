@@ -221,7 +221,7 @@ import {
   type WriteTransactionInput,
   keyForwardsMarkerProblem,
 } from "./types.js";
-import { crc32, verifyStoredBlock } from "../block-format/index.js";
+import { crc32, verifyStoredBlock, parseJson } from "../block-format/index.js";
 import { dateIsoString } from "../date-value.js";
 import { WORK_SLICE_MS } from "../work-slicer.js";
 import {
@@ -9964,7 +9964,7 @@ function decodeExpiryPageCursor(
   if (cursor === null) return null;
   let value: unknown;
   try {
-    value = JSON.parse(cursor);
+    value = parseJson(cursor);
   } catch {
     throw new TypeError(`${label} cursor is invalid`);
   }

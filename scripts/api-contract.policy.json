@@ -21,6 +21,11 @@
           "description": "Main-thread client for a worker-hosted database."
         },
         {
+          "subpath": "./json",
+          "audience": "application",
+          "description": "JSON.parse guarded against V8 misreading escaped object keys."
+        },
+        {
           "subpath": "./live",
           "audience": "application",
           "description": "Typed, keyed, windowed, and low-level live-query APIs."

@@ -1,4 +1,5 @@
 import type { SqlDomain } from "../storage/types.js";
+import { parseJson } from "../block-format/json-parse.js";
 import { assertWellFormedString } from "../block-format/unicode.js";
 import { dateIsoString } from "../date-value.js";
 import { JsonNumber, parseJsonValue } from "./json-values.js";
@@ -665,7 +666,7 @@ export function intervalDomainValue(value: unknown): string | null {
     const source = value.slice(INTERVAL_VALUE.length);
     let decoded: unknown;
     try {
-      decoded = JSON.parse(source) as unknown;
+      decoded = parseJson(source);
     } catch {
       throw new TypeError("Invalid tagged INTERVAL value");
     }
@@ -728,7 +729,7 @@ export function intervalDomainValue(value: unknown): string | null {
 /** The [months, days, microseconds] fields of a tagged INTERVAL, or undefined for any other value. */
 export function intervalDomainParts(value: unknown): readonly [number, number, number] | undefined {
   if (typeof value !== "string" || !value.startsWith(INTERVAL_VALUE)) return undefined;
-  return JSON.parse(value.slice(INTERVAL_VALUE.length)) as [number, number, number];
+  return parseJson(value.slice(INTERVAL_VALUE.length)) as [number, number, number];
 }
 
 /** A tagged INTERVAL from its three fields, each a safe integer. */
@@ -774,7 +775,7 @@ function enumDomainValue(value: unknown, name: string, values: readonly string[]
     const encoded = value.slice(ENUM_VALUE.length);
     let decoded: unknown;
     try {
-      decoded = JSON.parse(encoded) as unknown;
+      decoded = parseJson(encoded);
     } catch {
       throw new TypeError(`Invalid tagged enum ${name} value`);
     }
@@ -808,8 +809,8 @@ export function enumDomainCompare(left: unknown, right: unknown): number | undef
   ) {
     return undefined;
   }
-  const a = JSON.parse(left.slice(ENUM_VALUE.length)) as [string, number, string];
-  const b = JSON.parse(right.slice(ENUM_VALUE.length)) as [string, number, string];
+  const a = parseJson(left.slice(ENUM_VALUE.length)) as [string, number, string];
+  const b = parseJson(right.slice(ENUM_VALUE.length)) as [string, number, string];
   if (a[0] !== b[0]) throw new TypeError("Cannot compare values of different enum types");
   return a[1] - b[1];
 }
@@ -896,7 +897,7 @@ function boundedTaggedDomainValue(prefix: string, value: string, label: string):
 export function collatedDomainCompare(left: unknown, right: unknown): number | undefined {
   const decode = (value: unknown): [string, string] | undefined =>
     typeof value === "string" && value.startsWith(COLLATION_VALUE)
-      ? (JSON.parse(value.slice(COLLATION_VALUE.length)) as [string, string])
+      ? (parseJson(value.slice(COLLATION_VALUE.length)) as [string, string])
       : undefined;
   const a = decode(left);
   const b = decode(right);
@@ -979,15 +980,15 @@ export function externalSqlDomainValue(value: unknown): unknown {
     if (value.startsWith(prefix)) return value.slice(prefix.length);
   }
   if (value.startsWith(INTERVAL_VALUE)) {
-    const decoded = JSON.parse(value.slice(INTERVAL_VALUE.length)) as [number, number, number];
+    const decoded = parseJson(value.slice(INTERVAL_VALUE.length)) as [number, number, number];
     return `${String(decoded[0])} mons ${String(decoded[1])} days ${String(decoded[2])} usecs`;
   }
   if (value.startsWith(ARRAY_VALUE)) return value.slice(ARRAY_VALUE.length);
   if (value.startsWith(COLLATION_VALUE)) {
-    return (JSON.parse(value.slice(COLLATION_VALUE.length)) as [string, string])[1];
+    return (parseJson(value.slice(COLLATION_VALUE.length)) as [string, string])[1];
   }
   if (value.startsWith(ENUM_VALUE)) {
-    return (JSON.parse(value.slice(ENUM_VALUE.length)) as [string, number, string])[2];
+    return (parseJson(value.slice(ENUM_VALUE.length)) as [string, number, string])[2];
   }
   return value;
 }
@@ -1062,7 +1063,7 @@ export function intervalDomainCompare(left: unknown, right: unknown): number | u
     return undefined;
   }
   const total = (value: string): number => {
-    const [months, days, microseconds] = JSON.parse(value.slice(INTERVAL_VALUE.length)) as [
+    const [months, days, microseconds] = parseJson(value.slice(INTERVAL_VALUE.length)) as [
       number,
       number,
       number,
@@ -1085,7 +1086,7 @@ export function temporalDomainPart(field: string, value: unknown): number | unde
   let usecs: number;
   const interval = value.startsWith(INTERVAL_VALUE);
   if (interval) {
-    [months, days, usecs] = JSON.parse(value.slice(INTERVAL_VALUE.length)) as [
+    [months, days, usecs] = parseJson(value.slice(INTERVAL_VALUE.length)) as [
       number,
       number,
       number,
@@ -1145,10 +1146,10 @@ export function structuredDomainCompare(left: unknown, right: unknown): number |
   if (left === right) return 0;
   const prefix = array ? ARRAY_VALUE : JSONB_VALUE;
   const a: unknown = array
-    ? JSON.parse(left.slice(prefix.length))
+    ? parseJson(left.slice(prefix.length))
     : parseJsonValue(left.slice(prefix.length));
   const b: unknown = array
-    ? JSON.parse(right.slice(prefix.length))
+    ? parseJson(right.slice(prefix.length))
     : parseJsonValue(right.slice(prefix.length));
   if (array && Array.isArray(a) && Array.isArray(b)) {
     for (let index = 0; index < Math.min(a.length, b.length); index += 1) {

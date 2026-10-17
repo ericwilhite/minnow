@@ -1,4 +1,5 @@
 import { dateMilliseconds } from "../date-value.js";
+import { parseJson } from "../block-format/json-parse.js";
 import { crossJoinPlan, isCrossJoinPlan } from "../plan/model.js";
 import {
   MAX_TEMP_RUN_BATCH_BYTES,
@@ -3402,7 +3403,7 @@ function* encodeSpillRowPages(
 
 function decodeSpillRows(columns: readonly string[], bytes: Uint8Array): QueryRow[] {
   spillRowsModeledBytes(bytes);
-  const value: unknown = JSON.parse(
+  const value: unknown = parseJson(
     new TextDecoder().decode(bytes.subarray(SPILL_PAGE_HEADER_BYTES)),
   );
   if (!Array.isArray(value)) throw new Error("Query spill page is invalid");
@@ -6161,7 +6162,7 @@ function updateAggregatesFromValues(
     const spec = required(plan.aggregates[index], "Aggregate specification is missing");
     const value = values[index];
     if (spec.name === "STRING_AGG" && typeof value === "string") {
-      const decoded: unknown = JSON.parse(value);
+      const decoded: unknown = parseJson(value);
       if (!Array.isArray(decoded) || decoded.length !== 3) {
         throw new Error("Spilled STRING_AGG input is invalid");
       }
@@ -6181,7 +6182,7 @@ function updateAggregatesFromValues(
       (spec.orderBy?.length ?? 0) > 0 &&
       typeof value === "string"
     ) {
-      const decoded: unknown = JSON.parse(value);
+      const decoded: unknown = parseJson(value);
       if (!Array.isArray(decoded) || decoded.length !== 2 || !Array.isArray(decoded[1])) {
         throw new Error("Spilled JSON_ARRAYAGG input is invalid");
       }
@@ -6448,7 +6449,7 @@ function evaluateFinalExpression(
     const members = retained.map((encoded) => {
       if (orderBy.length === 0) return { value: encoded, order: [] as QueryValue[] };
       if (typeof encoded !== "string") throw new Error("JSON_ARRAYAGG member is invalid");
-      const pair: unknown = JSON.parse(encoded);
+      const pair: unknown = parseJson(encoded);
       if (!Array.isArray(pair) || pair.length !== 2 || !Array.isArray(pair[1])) {
         throw new Error("JSON_ARRAYAGG member is invalid");
       }
@@ -6481,7 +6482,7 @@ function evaluateFinalExpression(
     const members = required(group.lists, "STRING_AGG list state is missing")[aggregateIndex] ?? [];
     const decoded = members.map((encoded) => {
       if (typeof encoded !== "string") throw new Error("STRING_AGG member is invalid");
-      const pair: unknown = JSON.parse(encoded);
+      const pair: unknown = parseJson(encoded);
       if (
         !Array.isArray(pair) ||
         typeof pair[0] !== "string" ||

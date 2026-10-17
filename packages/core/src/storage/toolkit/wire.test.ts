@@ -714,7 +714,9 @@ describe("sliced record JSON parsing", () => {
         }
         expect(await parseRecordJsonSliced(bytes, pause)).toEqual(expected);
       }),
-      { numRuns: 80 },
+      // Seeded, so a failure reproduces; MINNOW_SEED explores others. A failure shrinks a large
+      // tree slowly, so it ends on the first counterexample rather than hanging the suite.
+      { numRuns: 80, seed: Number(process.env.MINNOW_SEED ?? 0x5ead), endOnFailure: true },
     );
   });
 

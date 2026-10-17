@@ -14,7 +14,9 @@ import { describe, expect, it } from "vitest";
 
 const LIVE_RAW_BUDGET = 16 * 1024;
 const LIVE_GZIP_BUDGET = 6 * 1024;
-const COMPLETE_RAW_BUDGET = 184 * 1024;
+// The adapter parses JSON results through core's guarded `parseJson` (V8 can rename escaped
+// object keys): 185.1 KiB raw.
+const COMPLETE_RAW_BUDGET = 186 * 1024;
 const COMPLETE_GZIP_BUDGET = 40 * 1024;
 const repoRoot = join(import.meta.dirname, "..", "..", "..");
 

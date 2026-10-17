@@ -1,4 +1,5 @@
 import { assertWellFormedString } from "../block-format/unicode.js";
+import { parseJson } from "../block-format/json-parse.js";
 import {
   MAX_SQL_NUMERIC_DIGITS,
   MAX_SQL_SCALAR_RESULT_CHARACTERS,
@@ -78,7 +79,7 @@ export function parseJsonValue(source: string): unknown {
       const character = source[cursor++];
       if (character === "\\") cursor += 1;
       else if (character === '"') {
-        const value: unknown = JSON.parse(source.slice(start, cursor));
+        const value: unknown = parseJson(source.slice(start, cursor));
         if (typeof value !== "string") return fail();
         assertWellFormedString(value, "JSON string");
         return value;

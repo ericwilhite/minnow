@@ -1,3 +1,4 @@
+import { parseJson } from "@minnowdb/core/json";
 import type { QueryRow, QueryValue } from "@minnowdb/core";
 import { button, el, iconButton, icons } from "../dom.js";
 import { dateIsoString } from "../date-value.js";
@@ -25,7 +26,7 @@ export function detailText(value: QueryValue): string {
   if (value instanceof Date) return dateIsoString(value);
   if (typeof value === "string" && /^\s*[[{]/.test(value)) {
     try {
-      return JSON.stringify(JSON.parse(value), null, 2);
+      return JSON.stringify(parseJson(value), null, 2);
     } catch {
       return value;
     }
