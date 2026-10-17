@@ -2,7 +2,7 @@
  * Full-text indexes across folds and invalidations, on every store.
  *
  * A fold of an append-only table (a copy or a rechunk) keeps every row, its value, and its row
- * ID, so the table's postings stay exact. Through 0.16.0 the fold's commit carried no coverage
+ * ID, so the table's postings stay exact. Through 0.15.0 the fold's commit carried no coverage
  * for the index, and the store's stale-writer rule took it for a writer that never saw the
  * index: every fold flipped the index to "invalid" (searches scanned until a full rebuild) and
  * left the invalidated postings stored. IndexedDB's integrity check then reported them as

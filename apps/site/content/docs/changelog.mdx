@@ -176,6 +176,20 @@ Measured at 200,000 rows on the in-memory store against `node:sqlite` with match
   point update makes 3 store calls instead of 9 (one IndexedDB transaction each), a single-row
   `DELETE` 4 instead of 11, and an `INSERT` 6 instead of 8. A write no longer re-checks every
   visible block or recounts unmerged segments, so its cost no longer grows with unfolded history.
+- **Writes on IndexedDB.** A commit no longer recounts every unmerged segment against the
+  level-zero limit, reads its records in a few batched rounds instead of one request at a time,
+  and writes reader leases with relaxed durability; garbage collection pages its discovery. In
+  Chromium with 20,000 rows, a single-row update fell from 39 to 23 ms, an insert from 68 to 28 ms,
+  and a delete from 113 to 32 ms; in WebKit 56 → 39, 112 → 52, and 225 → 57 ms. OPFS writes are
+  25–40% faster.
+- **Delta merges.** Automatic compaction merges a folded table's updates and deletes among
+  themselves — a run of single-row commits becomes one delete segment and one update segment per
+  set of changed columns — instead of rewriting every partition they touch. Reads answer exactly as
+  before. A full fold still runs once the merged deltas pass a sixty-fourth of the table (at least
+  1,024 rows), and a table that goes quiet with at least 256 delta rows folds once back to plain
+  partitions. Settling after 1,000 single-row updates takes 3.1 s instead of 4.1 s, and a point
+  read after 1,000 updates is about 5× faster. A scan over updated rows views the columns no update
+  writes instead of copying them.
 - **Worker client.** `execute()`, `runStatement()`, and write-scope `execute()` results cross the
   worker as columnar frames, so Kysely and raw SQL selects through a worker are 1.4–1.5× faster at
   10,000–100,000 rows, and results under 32 rows travel as one plain array (point reads about 30%
@@ -186,19 +200,25 @@ Measured at 200,000 rows on the in-memory store against `node:sqlite` with match
 - `MIN`/`MAX`, `COUNT(DISTINCT)` of numbers, and arithmetic compared with a literal run in the
   batch code. `insertBatch(rows)` turns row objects into columns about 2× faster.
 
-Writes are still slower than SQLite's in-place B-tree, and bulk deletes about 8× slower; see the
-[storage guide](/docs/storage/maintenance) for how folds work.
+Single-row writes are still far slower than SQLite's in-place B-tree (a point update is about
+0.6 ms in memory), and bulk deletes about 8× slower; see the
+[storage guide](/docs/storage/maintenance) for how folds and delta merges work.
 
 ### Size
 
-The engine with the OPFS adapter is 420 KiB gzipped (392 KiB in 0.15.0). Helpers the engine had copied between modules are now shared, which offsets the JSON guard.
+The engine with the OPFS adapter is 426 KiB gzipped (392 KiB in 0.15.0), still below SQLite Wasm's
+457 KiB. Helpers the engine had copied between modules are now shared.
 
 ### API changes
 
 New `parseJson` export (also the `@minnowdb/core/json` entry point). New `QueryParameter` type (`QueryValue | readonly QueryValue[]`) widens `params` across the
 database, client, worker, live queries, and Kysely. `ExecuteResult` gains a `rename-column`
 member, so an exhaustive `switch` over `ExecuteResult.kind` needs a new case. New
-`compactionPlanMatchesTableSchema` export for custom adapters. The plan model gains
+`compactionPlanMatchesTableSchema` export for custom adapters, and the delta-merge storage
+types and helpers (`DeltaMergeCompactionRewritePlan`, `DeltaMergeOutputSegment`,
+`DeltaMergeResolution`, `deltaMergeOutputBlockId(s)`, `deltaMergeOutputSegments`,
+`MAX_DELTA_MERGE_SOURCE_ROWS`, `MAX_DELTA_MERGE_SOURCE_ENCODED_BYTES`; `CompactionRewritePlan` gains
+the `delta-v1` member). The plan model gains
 `JoinPlan.using`, `JoinPlan.inputHints`, the literal `timestamp` flag, `RecursiveCte.series`, and
 three `AggregateName` values. The testing simulator adds `constraints`, `schemaChanges`,
 `fullText`, `burstCommits`, and `rekeying` options. The worker protocol is version 9: deploy the
@@ -211,17 +231,24 @@ text they were stored with, and generated columns that divide `INTEGER` or `DATE
 old values, until the row is written again (`UPDATE t SET col = col` recomputes them). Full-text
 indexes are unaffected and need no rebuild.
 
-**Stored formats:** IndexedDB schema 6 and OPFS
-layout 11 let a compaction job read a source segment that lacks a column added after it was
-written, which 0.15.0 and older treat as corruption. Upgrades run automatically on open and
-rewrite no data: an IndexedDB database at schema 1 to 5 is raised to 6 in one `versionchange`
-transaction, and an OPFS database at layout 7 to 10 has only its format marker rewritten behind a
-flushed `upgrade-10-11` witness, so a crash or power loss at any step finishes on the next open;
-layout 6 is still converted first. After the upgrade, 0.15.0 and older refuse the database with
+**Stored formats:** IndexedDB schema 5 → 7 and OPFS layout 10 → 12 (schema 6 and layout 11 were
+never released). They admit two kinds of compaction job that 0.15.0 treats as corruption: a fold
+across `ALTER TABLE` (a source written before a column was added, or an update left holding only its
+key after `DROP COLUMN`), and a delta merge (a `delta-v1` plan whose level-zero segments take the
+order of the run they replace). Upgrades run automatically on open and rewrite nothing but the
+version marker: an IndexedDB database at schema 1 to 5 is raised to 7 in one `versionchange`
+transaction, and an OPFS database at layout 7 to 10 has only its marker rewritten behind a flushed
+`upgrade-11-12` witness, so a crash or power loss at any step finishes on the next open; layout 6 is
+still converted first. After the upgrade, 0.15.0 and older refuse the database with
 `StorageFormatVersionError` and change nothing, so pin 0.16.0 everywhere that opens the same
-database. Snapshot and block formats are unchanged. Custom storage adapters built on the storage
-toolkit's `RecordCore` accept the new compaction plans already; others must accept merge sources
-that hold only their key column and rechunk plans whose columns have gaps.
+database. Block format 2 and snapshot formats 1 and 2 are unchanged.
+
+**Storage contract:** a compaction commit's level-zero segments keep the logical order the job
+planned, and the level-zero limit counts what a table holds once a commit lands (a delta merge's
+sources come off before its outputs are added); the conformance kit checks both. Custom adapters
+built on the storage toolkit's `RecordCore` already comply and accept the new plans; others must
+also accept merge sources that hold only their key column and rechunk plans whose columns have
+gaps.
 
 ## Devtools 0.3.6 — October 16, 2026
 
