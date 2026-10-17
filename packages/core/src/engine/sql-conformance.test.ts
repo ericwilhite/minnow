@@ -1334,11 +1334,12 @@ function jsonSpellingCases(): Case[] {
 }
 
 /**
- * PostgreSQL date and timestamp arithmetic: date - date is whole days, date ± integer is a date,
- * and a timestamp difference is an interval a timestamp can be shifted by again. Intervals render
- * differently on each engine, so they are compared through EXTRACT and comparisons; DATE values
- * compare as YYYY-MM-DD text (the oracle's DATE parser keeps PostgreSQL's text). SQLite spells
- * all of these with julianday() and strftime(), so it sits these out.
+ * PostgreSQL date and timestamp arithmetic: date - date is whole days, an integer that divides
+ * as one, date ± integer is a date, and a timestamp difference is an interval a timestamp can be
+ * shifted by again. Intervals render as PostgreSQL's text, so they compare directly as well as
+ * through EXTRACT; DATE values compare as YYYY-MM-DD text (the oracle's DATE parser keeps
+ * PostgreSQL's text). SQLite spells all of these with julianday() and strftime(), so it sits
+ * these out.
  */
 function dateArithmeticCases(): Case[] {
   const pg = (sql: string, params?: CaseParameter[]): Case => ({
@@ -1381,6 +1382,20 @@ function dateArithmeticCases(): Case[] {
     ),
     pg(
       `SELECT id, NULL - CAST(joined AS DATE) AS gone, CAST(joined AS DATE) + CAST(NULL AS INTEGER) AS none FROM data WHERE id <= 5 ORDER BY id`,
+    ),
+    // date - date is an integer, so dividing it truncates toward zero.
+    pg(
+      `SELECT id, (CAST(joined AS DATE) - DATE '2025-11-01') / 7 AS weeks, (DATE '2026-04-01' - CAST(joined AS DATE)) / 30 AS months, (DATE '2025-11-02' - CAST(joined AS DATE)) / 7 AS back, (CAST(joined AS DATE) - DATE '2025-11-01') % 7 AS rest, (CAST(joined AS DATE) - DATE '2025-11-01') / 7.0 AS exact FROM data WHERE joined IS NOT NULL ORDER BY id`,
+    ),
+    pg(
+      `SELECT id, (DATE '2026-03-01' - DATE '2026-01-01') / 7 AS literal, (CAST('2026-03-01' AS DATE) - CAST(joined AS DATE)) / 7 AS cast_text, (CAST(joined AS DATE) - CAST(? AS DATE)) / 7 AS bound, (CURRENT_DATE - CURRENT_DATE) / 7 AS today FROM data WHERE joined IS NOT NULL ORDER BY id`,
+      ["2025-10-01"],
+    ),
+    pg(
+      `SELECT id, days / 7 AS weeks, days / 2 * 2 AS even FROM (SELECT id, CAST(joined AS DATE) - DATE '2025-11-01' AS days FROM data WHERE joined IS NOT NULL) s ORDER BY id`,
+    ),
+    pg(
+      `SELECT region, SUM(CAST(joined AS DATE) - DATE '2025-11-01') / COUNT(*) AS mean_days, MAX(CAST(joined AS DATE)) - MIN(CAST(joined AS DATE)) AS spread, (MAX(CAST(joined AS DATE)) - MIN(CAST(joined AS DATE))) / 7 AS spread_weeks FROM data WHERE joined IS NOT NULL GROUP BY region ORDER BY region NULLS LAST`,
     ),
   ];
 }
@@ -1569,8 +1584,113 @@ function orderedSetAggregateCases(): Case[] {
   ];
 }
 
+/**
+ * Every path that turns a datetime into SQL text, diffed against PostgreSQL's own output: CAST
+ * and `::text`, `||`, CONCAT, CONCAT_WS, FORMAT, QUOTE_LITERAL, string functions over the text,
+ * LIKE and equality on it, STRING_AGG, the JSON constructors and aggregates, and the text of
+ * DATE, TIME, and INTERVAL values. `joined` is TIMESTAMPTZ in PostgreSQL and every Minnow
+ * datetime is an instant, so it renders `2026-01-02 03:04:05+00`; a TIMESTAMP literal, a cast
+ * to TIMESTAMP, MAKE_TIMESTAMP, `date + interval`, and the derived, CTE, series, set-operation,
+ * subquery, and window outputs built from them render without the zone. SQLite stores the
+ * fixture's datetimes as ISO text, so its casts answer a different question and it sits out.
+ */
+function datetimeTextCases(): Case[] {
+  const pg = (sql: string, params?: CaseParameter[]): Case => ({
+    sql,
+    ordered: true,
+    skip: ["sqlite"],
+    ...(params === undefined ? {} : { params }),
+  });
+  return [
+    pg(
+      `SELECT id, CAST(joined AS TEXT) AS t, joined::text AS u, CAST(joined AS VARCHAR) AS v, CAST(joined AS VARCHAR(40)) AS w, CAST(joined + INTERVAL '0.05 seconds' AS TEXT) AS fraction, CAST(joined + INTERVAL '1.25 seconds' AS CHARACTER VARYING) AS quarter FROM data ORDER BY id`,
+    ),
+    pg(
+      `SELECT id, 'at ' || joined AS a, joined || '!' AS b, label || ' ' || joined AS c, joined::text || joined::text AS twice FROM data ORDER BY id`,
+    ),
+    pg(
+      `SELECT id, CONCAT(label, ' ', joined) AS c, CONCAT_WS('|', region, joined, amount) AS w, FORMAT('%s at %s', label, joined) AS f, FORMAT('%L', joined) AS l, QUOTE_LITERAL(joined) AS q FROM data ORDER BY id`,
+    ),
+    pg(
+      `SELECT id, LENGTH(CAST(joined AS TEXT)) AS n, UPPER(joined::text) AS u, SUBSTRING(joined::text FROM 12 FOR 8) AS clock, LEFT(joined::text, 10) AS day, RIGHT(joined::text, 3) AS zone, POSITION('+' IN joined::text) AS plus FROM data ORDER BY id`,
+    ),
+    pg(
+      `SELECT id FROM data WHERE CAST(joined AS TEXT) LIKE '2026-01-%' OR joined::text = '2025-12-30 00:00:00+00' ORDER BY id`,
+    ),
+    // PostgreSQL's output reads back: as an untyped constant beside a column, through a cast,
+    // and through the text a cast produced.
+    pg(
+      `SELECT id FROM data WHERE joined = '2026-01-02 03:04:05+00' OR joined >= '2026-03-15 23:59:59.5+00' ORDER BY id`,
+    ),
+    pg(
+      `SELECT id, CAST(CAST(joined AS TEXT) AS TIMESTAMPTZ) = joined AS same, CAST(CAST(joined + INTERVAL '0.5 seconds' AS TEXT) AS TIMESTAMP) - joined AS half FROM data WHERE joined IS NOT NULL ORDER BY id`,
+    ),
+    pg(
+      `SELECT id, CAST(CAST(joined - TIMESTAMP '2026-01-01' AS TEXT) AS INTERVAL) = joined - TIMESTAMP '2026-01-01' AS same FROM data WHERE joined IS NOT NULL ORDER BY id`,
+    ),
+    pg(
+      `SELECT region, STRING_AGG(CAST(joined AS TEXT), ', ' ORDER BY id) AS times, CAST(MAX(joined) AS TEXT) AS latest, MIN(joined)::text AS earliest FROM data GROUP BY region ORDER BY region NULLS LAST`,
+    ),
+    pg(
+      `SELECT id, TO_JSON(joined) AS j, JSON_BUILD_OBJECT('id', id, 'at', joined) AS o, JSON_BUILD_ARRAY(joined, label) AS a, JSON_OBJECT('at' VALUE joined) AS standard FROM data ORDER BY id`,
+    ),
+    pg(
+      `SELECT id, JSON_BUILD_OBJECT(joined, id) AS keyed FROM data WHERE joined IS NOT NULL ORDER BY id`,
+    ),
+    pg(
+      `SELECT region, JSON_AGG(joined ORDER BY id) AS times, JSON_AGG(CAST(joined AS TIMESTAMP) ORDER BY id) AS local_times FROM data GROUP BY region ORDER BY region NULLS LAST`,
+    ),
+    // Timestamps without time zone: no `+00`, and no offset in JSON.
+    pg(
+      `SELECT id, CAST(TIMESTAMP '2026-01-02 03:04:05.5' AS TEXT) AS literal, CAST(CAST(joined AS TIMESTAMP) AS TEXT) AS local, CAST(joined::timestamp + INTERVAL '1 hour' AS TEXT) AS later, CAST(DATE_TRUNC('month', joined::timestamp) AS TEXT) AS month, CAST(DATE_TRUNC('month', joined) AS TEXT) AS zoned_month FROM data WHERE joined IS NOT NULL ORDER BY id`,
+    ),
+    pg(
+      `SELECT id, 'x' || TIMESTAMP '2026-01-02 03:04:05' AS a, CONCAT(MAKE_TIMESTAMP(2026, 1, 2, 3, 4, 5.25)) AS b, TO_JSON(TIMESTAMP '2026-01-02 03:04:05.125') AS j, CAST(CAST(joined AS DATE) + INTERVAL '6 hours' AS TEXT) AS from_date, CAST(DATE_TRUNC('day', CAST(joined AS DATE)) AS TEXT) AS truncated_date FROM data WHERE id <= 8 ORDER BY id`,
+    ),
+    pg(
+      `SELECT id, CAST(COALESCE(CAST(joined AS TIMESTAMP), TIMESTAMP '2000-01-01') AS TEXT) AS local, CAST(COALESCE(joined, TIMESTAMP '2000-01-01') AS TEXT) AS zoned, CAST(CASE WHEN active THEN joined::timestamp ELSE TIMESTAMP '1999-12-31 23:59:59' END AS TEXT) AS chosen, CAST(GREATEST(joined::timestamp, TIMESTAMP '2026-01-01') AS TEXT) AS floor FROM data ORDER BY id`,
+    ),
+    pg(
+      `SELECT id, CAST(t AS TEXT) AS t, t || '' AS concatenated FROM (SELECT id, joined::timestamp AS t FROM data) s ORDER BY id`,
+    ),
+    pg(
+      `WITH s AS (SELECT id, joined::timestamp AS t, joined AS z FROM data) SELECT id, t::text AS t, z::text AS z, TO_JSON(t) AS j FROM s ORDER BY id`,
+    ),
+    pg(
+      `SELECT t::text AS t, TO_JSON(t) AS j FROM generate_series(TIMESTAMP '2026-01-30', TIMESTAMP '2026-05-02', INTERVAL '1 month') AS t ORDER BY t`,
+    ),
+    pg(
+      `SELECT t::text AS t FROM generate_series(CAST('2026-01-01' AS TIMESTAMPTZ), CAST('2026-01-03' AS TIMESTAMPTZ), INTERVAL '1 day') AS t ORDER BY t`,
+    ),
+    pg(
+      `SELECT CAST(t AS TEXT) AS t FROM (SELECT TIMESTAMP '2026-01-01' AS t UNION ALL SELECT TIMESTAMP '2026-01-02 12:00:00') u ORDER BY t`,
+    ),
+    pg(
+      `SELECT id, CAST((SELECT MAX(joined)::timestamp FROM data) AS TEXT) AS latest, CAST(FIRST_VALUE(joined::timestamp) OVER (ORDER BY id) AS TEXT) AS first FROM data WHERE id <= 6 ORDER BY id`,
+    ),
+    pg(
+      `SELECT id, CAST(LOCALTIMESTAMP AS TEXT) LIKE '%+00' AS local_zoned, CAST(CURRENT_TIMESTAMP AS TEXT) LIKE '%+00' AS now_zoned, CAST(NOW() AS TEXT) LIKE '% %:%' AS now_spaced FROM data WHERE id = 1 ORDER BY id`,
+    ),
+    pg(
+      `SELECT id, CAST(CAST(? AS TIMESTAMPTZ) AS TEXT) AS bound, CAST(CAST(? AS TIMESTAMP) AS TEXT) AS bound_local FROM data WHERE id = 1 ORDER BY id`,
+      [new Date("2026-02-03T04:05:06.007Z"), "2026-02-03 04:05:06.75"],
+    ),
+    // DATE, TIME, and INTERVAL text.
+    pg(
+      `SELECT id, CAST(CAST(joined AS DATE) AS TEXT) AS day, 'on ' || CAST(joined AS DATE) AS said, TO_JSON(CAST(joined AS DATE)) AS j, CAST(TIME '10:00:00.500' AS TEXT) AS t, 'at ' || TIME '23:59:59.120' AS said_time, TO_JSON(TIME '01:02:03') AS jt FROM data WHERE joined IS NOT NULL ORDER BY id`,
+    ),
+    pg(
+      `SELECT id, joined - TIMESTAMP '2026-01-01' AS since, AGE(TIMESTAMP '2026-06-15 12:00:00', joined) AS age, CAST(joined - TIMESTAMP '2025-12-31 12:00:00.5' AS TEXT) AS t, 'took ' || (TIMESTAMP '2026-04-01' - joined) AS s, TO_JSON(joined - TIMESTAMP '2026-01-01') AS j FROM data WHERE joined IS NOT NULL ORDER BY id`,
+    ),
+    pg(
+      `SELECT id, INTERVAL '1 year 2 months 3 days 04:05:06.5' AS a, INTERVAL '-1 second' AS b, INTERVAL '-3 days 4 hours' AS c, INTERVAL '25 hours' AS d, INTERVAL '0 seconds' AS e, CAST(INTERVAL '1 mon -1 day' AS TEXT) AS f, INTERVAL '-1 year -2 months' AS g, INTERVAL '1 day -00:00:01' AS h, INTERVAL '1.5 days' AS i, INTERVAL '100 hours 30 minutes' AS j FROM data WHERE id = 1 ORDER BY id`,
+    ),
+  ];
+}
+
 function postgresFormCases(): Case[] {
   return [
+    ...datetimeTextCases(),
     ...dateArithmeticCases(),
     ...arrayQuantifierCases(),
     ...generateSeriesCases(),
@@ -2631,12 +2751,12 @@ const matrixSkips = new Map<string, { oracles: readonly OracleName[]; reason: st
     },
   ],
   ["type.uuid", { oracles: ["sqlite"], reason: "SQLite has no UUID type" }],
+  ["type.interval", { oracles: ["sqlite"], reason: "SQLite has no INTERVAL type" }],
   [
-    "type.interval",
+    "type.timestamp-text",
     {
-      oracles: ["sqlite", "pglite"],
-      reason:
-        "Minnow exposes its structured interval as canonical text; PGlite formats intervals differently and SQLite has no interval type",
+      oracles: ["sqlite"],
+      reason: "SQLite stores the fixture's datetimes as ISO text, so its casts return that text",
     },
   ],
   ["from.lateral", { oracles: ["sqlite"], reason: "SQLite has no LATERAL source" }],
@@ -2764,14 +2884,7 @@ const matrixSkips = new Map<string, { oracles: readonly OracleName[]; reason: st
         "SQLite has no MAKE_DATE; PostgreSQL clients materialize DATE as a midnight Date while Minnow preserves zoneless YYYY-MM-DD text (the corpus diffs the value through comparisons)",
     },
   ],
-  [
-    "function.age",
-    {
-      oracles: ["sqlite", "pglite"],
-      reason:
-        "SQLite has no AGE; PostgreSQL renders intervals as '1 mon 14 days 12:00:00' while Minnow returns its canonical months/days/usecs text (the unit tests pin the calendar arithmetic against PostgreSQL's answers)",
-    },
-  ],
+  ["function.age", { oracles: ["sqlite"], reason: "SQLite has no AGE" }],
   ["function.date-part", { oracles: ["sqlite"], reason: "SQLite has no DATE_PART or EXTRACT" }],
   [
     "expression.date-minus-date",
@@ -3198,6 +3311,83 @@ describe("SQL conformance against SQLite and PGlite", () => {
     }
   });
 
+  it("types DATE and INTERVAL columns for date division and timestamp text as PostgreSQL does", async () => {
+    // What only the catalog knows: that a column is a DATE, so `until - day` is an integer and
+    // `day + span` a timestamp without time zone, and what a view's columns are. The corpus
+    // fixture has no DATE or INTERVAL column, so the table is built here and PGlite judges it.
+    const ddl = [
+      "CREATE TABLE spans (id INTEGER PRIMARY KEY, day DATE, until DATE, span INTERVAL, at TIMESTAMPTZ, weeks INTEGER GENERATED ALWAYS AS ((until - day) / 7) STORED)",
+      "CREATE VIEW stamped AS SELECT id, day + span AS local_end, at + span AS zoned_end, TIMESTAMP '2026-01-01 00:00:00.25' AS fixed FROM spans",
+    ];
+    const rows = [
+      "(1, '2026-01-01', '2026-01-11', '1 day 02:00:00', '2026-01-01 10:00:00.5+00')",
+      "(2, '2026-02-28', '2026-03-01', '-1 mon 3 days -00:00:01.25', '2026-03-01 00:00:00+00')",
+      "(3, '2025-12-31', '2025-12-01', '00:00:00', NULL)",
+      "(4, NULL, '2026-01-01', NULL, '2026-06-30 23:59:59+00')",
+    ];
+    const minnow = new MinnowDatabase(new MemoryBlockStore());
+    const { PGlite } = await import("@electric-sql/pglite");
+    const pg = await PGlite.create();
+    try {
+      await pg.exec(`SET TIME ZONE 'UTC'`);
+      for (const statement of ddl) {
+        await pg.exec(statement);
+        await minnow.execute(statement);
+      }
+      const insert = `INSERT INTO spans (id, day, until, span, at) VALUES ${rows.join(", ")}`;
+      await pg.exec(insert);
+      await minnow.execute(insert);
+      const cases = [
+        `SELECT id, until - day AS days, (until - day) / 7 AS weeks, (until - day) % 7 AS rest, weeks AS stored FROM spans ORDER BY id`,
+        `SELECT id, days / 7 AS weeks FROM (SELECT id, until - day AS days FROM spans) s ORDER BY id`,
+        `SELECT SUM(until - day) / COUNT(*) AS mean, (MAX(until) - MIN(day)) / 7 AS spread FROM spans`,
+        `SELECT id, CAST(day AS TEXT) AS d, span::text AS s, 'for ' || span AS f, CAST(day + INTERVAL '1 day' AS TEXT) AS next, CAST(day + span AS TEXT) AS local_end, CAST(at + span AS TEXT) AS zoned_end, CAST(at AS TEXT) AS at FROM spans ORDER BY id`,
+        `SELECT id, TO_JSON(span) AS s, TO_JSON(day + span) AS e, JSON_BUILD_OBJECT('day', day, 'span', span, 'at', at, 'end', day + span) AS o FROM spans ORDER BY id`,
+        `SELECT id, CONCAT(day, ' ', span, ' ', at) AS c, FORMAT('%s|%s', day - INTERVAL '6 hours', span) AS f FROM spans ORDER BY id`,
+        `SELECT id, CAST(local_end AS TEXT) AS local_end, CAST(zoned_end AS TEXT) AS zoned_end, fixed::text AS fixed, TO_JSON(local_end) AS j FROM stamped ORDER BY id`,
+        `SELECT id, CAST(CAST(span AS TEXT) AS INTERVAL) = span AS round_trip FROM spans ORDER BY id`,
+        // A catalog with DATE columns types text again at bind time, over a plan whose constants
+        // are already folded: a folded TIMESTAMPTZ constant must keep its zone.
+        `SELECT id, TO_JSON(s) AS doc FROM (SELECT id, CAST('2026-01-01 05:00' AS TIMESTAMPTZ) AS z, TIMESTAMP '2026-01-01 05:00:00.5' AS t, day FROM spans) s ORDER BY id`,
+        `SELECT id, CAST(CAST('2026-01-01' AS TIMESTAMPTZ) AS TEXT) AS z, CAST(TO_TIMESTAMP(0) AS TEXT) AS epoch, 'at ' || (TIMESTAMP '2026-01-01' + INTERVAL '1 hour') AS later FROM spans ORDER BY id`,
+      ];
+      const failures: string[] = [];
+      const decoded = (value: unknown): unknown => {
+        if (typeof value === "string" && /^[[{"]/.test(value)) {
+          try {
+            return JSON.parse(value) as unknown;
+          } catch {
+            return value;
+          }
+        }
+        return value;
+      };
+      for (const sql of cases) {
+        let minnowRows: string[];
+        try {
+          const result = await minnow.query(sql);
+          minnowRows = result.rows.map((row) =>
+            JSON.stringify(result.columns.map((column) => normalize(decoded(row[column])))),
+          );
+        } catch (error) {
+          failures.push(`${sql}\n  minnow threw: ${String(error)}`);
+          continue;
+        }
+        const pgResult = await pg.query<unknown[]>(sql, [], { rowMode: "array" });
+        const pgRows = pgResult.rows.map((row) =>
+          JSON.stringify(row.map((value) => normalize(decoded(value)))),
+        );
+        if (pgRows.join("\n") !== minnowRows.join("\n")) {
+          failures.push(`${sql}\n${diffSummary("minnow vs pglite", minnowRows, pgRows)}`);
+        }
+      }
+      expect(failures).toEqual([]);
+    } finally {
+      await minnow.close();
+      await pg.close();
+    }
+  });
+
   it("agrees with the oracles on every read-only feature the matrix claims", async () => {
     const covered = matrixFeatures.filter(
       (feature) =>
@@ -3281,7 +3471,6 @@ describe("SQL conformance against SQLite and PGlite", () => {
     const expectedIds = [
       "aggregate.any-value",
       "aggregate.json",
-      "function.age",
       "function.bm25",
       "function.make-date",
       "function.numeric-core",
@@ -3298,7 +3487,6 @@ describe("SQL conformance against SQLite and PGlite", () => {
       "type.array",
       "type.date",
       "type.exact-numeric",
-      "type.interval",
       "type.json-jsonb",
     ];
     const features = matrixFeatures.filter(
@@ -3391,13 +3579,6 @@ describe("SQL conformance against SQLite and PGlite", () => {
         expect(result.rows, feature.id).toEqual([{ amount: "1.25" }]);
       } else if (feature.id === "type.json-jsonb") {
         expect(JSON.parse(String(result.rows[0]?.document)), feature.id).toEqual({ a: 1 });
-      } else if (feature.id === "type.interval") {
-        expect(result.rows, feature.id).toEqual([
-          { next_day: new Date("2026-01-03T00:00:00.000Z") },
-          { next_day: new Date("2025-12-31T00:00:00.000Z") },
-          { next_day: new Date("2026-02-02T00:00:00.000Z") },
-          { next_day: null },
-        ]);
       } else if (feature.id === "type.array") {
         expect(JSON.parse(String(result.rows[0]?.pair)), feature.id).toEqual([1, 2]);
       } else if (feature.id === "select.repeated-output-name") {
@@ -3430,28 +3611,6 @@ describe("SQL conformance against SQLite and PGlite", () => {
             epoch: new Date("2026-01-02T03:00:00.000Z"),
           },
         ]);
-      } else if (feature.id === "function.age") {
-        // PostgreSQL's answers for these three fixture dates, rendered as Minnow's interval text:
-        // years and months first, days borrowed from the earlier date's month, then the time.
-        expect(
-          resultKeys(
-            result.rows.map(({ since }) => ({ since })),
-            false,
-          ),
-          feature.id,
-        ).toEqual(
-          resultKeys(
-            [
-              { since: "2 mons 13 days 43200000000 usecs" },
-              { since: "2 mons 16 days 43200000000 usecs" },
-              { since: "1 mons 14 days 43200000000 usecs" },
-            ],
-            false,
-          ),
-        );
-        for (const row of result.rows) {
-          expect(String(row.so_far), feature.id).toMatch(/^\d+ mons \d+ days \d+ usecs$/);
-        }
       } else if (feature.id === "function.numeric-core") {
         expect(result.rows, feature.id).toEqual([
           { n: 10, g: 10, l: 5, f: 10, c: 10, m: 2, p: 8, s: 4 },

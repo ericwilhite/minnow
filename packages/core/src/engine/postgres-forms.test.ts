@@ -78,7 +78,7 @@ describe("date and timestamp arithmetic", () => {
         id: 1,
         next_day: "2024-02-29",
         days: 58,
-        since: "0 mons 1 days 36000000000 usecs",
+        since: "1 day 10:00:00",
         later: new Date("2026-02-28T10:00:00.000Z"),
       },
       { id: 2, next_day: null, days: null, since: null, later: null },

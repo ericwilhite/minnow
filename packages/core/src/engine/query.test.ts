@@ -1767,9 +1767,9 @@ describe("scalar functions", () => {
         "SELECT AGE(TIMESTAMP '2026-03-15 12:00:00', TIMESTAMP '2025-01-31 08:30:00') AS a, AGE(DATE '2026-03-01', DATE '2026-01-31') AS b, AGE(TIMESTAMP '2025-01-01', TIMESTAMP '2026-03-15') AS c, EXTRACT(DOY FROM DATE '2026-03-04') AS d, EXTRACT(ISODOW FROM DATE '2026-03-08') AS e, DATE_PART('isoyear', DATE '2027-01-01') AS f",
       ),
     ).toEqual({
-      a: "13 mons 15 days 12600000000 usecs",
-      b: "1 mons 1 days 0 usecs",
-      c: "-14 mons -14 days 0 usecs",
+      a: "1 year 1 mon 15 days 03:30:00",
+      b: "1 mon 1 day",
+      c: "-1 years -2 mons -14 days",
       d: 63,
       e: 7,
       f: 2026,

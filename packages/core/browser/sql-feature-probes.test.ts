@@ -59,6 +59,7 @@ const expectedFeatureIds = [
   "aggregate.array-agg",
   "type.array",
   "type.date",
+  "type.timestamp-text",
   "function.to-date-timestamp",
   "function.make-date",
   "function.age",
@@ -90,7 +91,7 @@ describe("browser SQL feature behavior probes", () => {
   it("keeps the independently authored feature and step populations fixed", () => {
     expect(featureBehaviorProbes.map(({ featureId }) => featureId)).toEqual(expectedFeatureIds);
     expect(new Set(expectedFeatureIds).size).toBe(expectedFeatureIds.length);
-    expect(featureBehaviorProbes.reduce((total, probe) => total + probe.steps.length, 0)).toBe(159);
+    expect(featureBehaviorProbes.reduce((total, probe) => total + probe.steps.length, 0)).toBe(163);
     expect(
       featureBehaviorProbes
         .flatMap(({ steps }) => steps)

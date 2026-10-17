@@ -7,6 +7,7 @@
 import { copyDate } from "../date-value.js";
 import type { RowIdRange, TableColumnRecord, TableRecord } from "../storage/types.js";
 import type { BatchValue, ColumnarBatch } from "./batch.js";
+import { externalSqlDomainValue } from "./sql-domains.js";
 
 /** The deferred part of a fill: slots that need storage-reserved auto-increment values. */
 export interface AutoIncrementFill {
@@ -24,6 +25,20 @@ export interface FilledBatch {
   /** Present whenever the table has an auto-increment column, even if every value is explicit —
    * the counter still bumps past the explicit maximum in the same atomic step. */
   readonly autoIncrement?: AutoIncrementFill;
+}
+
+/**
+ * An expression default's value as its column stores it. The SQL evaluator returns explicit
+ * TEXT (`CAST(1 AS TEXT)`) and DATE, INTERVAL, and other logical values in their internal
+ * tagged forms; a plain TEXT column stores their text, as PostgreSQL's assignment cast does,
+ * never the tag. A domain column normalizes the tagged value itself.
+ */
+function storedExpressionDefault(column: TableColumnRecord, value: BatchValue): BatchValue {
+  if (column.type !== "string" || column.sqlDomain !== undefined || typeof value !== "string") {
+    return value;
+  }
+  const text = externalSqlDomainValue(value);
+  return typeof text === "string" ? text : value;
 }
 
 export async function fillColumnDefaults(
@@ -132,7 +147,10 @@ export async function fillColumnDefaults(
             defaultValue.value instanceof Date ? copyDate(defaultValue.value) : defaultValue.value;
           break;
         case "expression":
-          values[index] = await evaluateExpression(defaultValue.sql, index);
+          values[index] = storedExpressionDefault(
+            column,
+            await evaluateExpression(defaultValue.sql, index),
+          );
           break;
       }
     }

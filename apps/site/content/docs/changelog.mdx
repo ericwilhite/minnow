@@ -92,6 +92,26 @@ suites against both.
   rest.
 - `explain()` no longer throws on a placeholder compared with a `TEXT` column.
 
+### Changed: datetime and interval text follow PostgreSQL
+
+- **Datetime text.** `CAST(… AS TEXT)`, `::text`, `||`, `CONCAT`, `CONCAT_WS`, `FORMAT`, and
+  `QUOTE_LITERAL` render a stored datetime as `2024-01-02 10:00:00+00`, with a fraction only when
+  it is not zero (`10:00:00.5+00`), instead of `2024-01-02T10:00:00.000Z`. JSON constructors give
+  `"2024-01-02T10:00:00+00:00"`. Values with no zone — `TIMESTAMP` literals and casts,
+  `MAKE_TIMESTAMP`, `LOCALTIMESTAMP`, `date + interval`, timestamp series, and views, CTEs, and
+  derived tables over them — print without one. Results returned to JavaScript are still `Date`
+  objects. A column declared `TIMESTAMP` still prints `+00`: the catalog does not yet record which
+  of the two types a column was declared with.
+- **Interval text.** Intervals read and print as PostgreSQL does — `1 day 02:00:00`,
+  `1 mon 14 days 12:00:00`, `-00:00:01` — in SQL and at the JavaScript boundary, and `INTERVAL`
+  input accepts PostgreSQL's spellings (`mon`, `hh:mm:ss` fields, fractional units, `@ … ago`).
+  `TIME` text drops trailing fractional zeros.
+- **`date - date` is an integer**, so `(shipped - placed) / 7` truncates. Generated columns and
+  `CHECK` constraints now divide `INTEGER` and `DATE` columns as integers, as PostgreSQL does
+  (`GENERATED (qty / 2)` stored `2.5` for 5; it now stores `2`).
+- **Fixed on the way:** a `DEFAULT` producing text (`DEFAULT CAST(1 AS TEXT)`) stored an internal
+  tag; casting explicit text to `DATE`, `TIME`, `INTERVAL`, `JSON`, `UUID`, or `NUMERIC` failed.
+
 ### Added: SQL
 
 - `ON CONFLICT (columns)` may name a UNIQUE constraint or unique index, in any column order. A
@@ -147,7 +167,7 @@ Writes are still slower than SQLite's in-place B-tree, and bulk deletes about 8�
 
 ### Size
 
-The engine with the OPFS adapter is 416 KiB gzipped (392 KiB in 0.15.0). Helpers the engine had copied between modules are now shared, which offsets the JSON guard.
+The engine with the OPFS adapter is 419 KiB gzipped (392 KiB in 0.15.0). Helpers the engine had copied between modules are now shared, which offsets the JSON guard.
 
 ### API changes
 
@@ -160,7 +180,14 @@ three `AggregateName` values. The testing simulator adds `constraints`, `schemaC
 `fullText`, `burstCommits`, and `rekeying` options. The worker protocol is version 9: deploy the
 client and worker from the same build. Kysely 0.6.0 and devtools 0.3.7 need core 0.16.0.
 
-**Migration and stored formats:** no application migration is needed. IndexedDB schema 6 and OPFS
+**Migration:** code that parsed the ISO text SQL text conversions used to produce must accept
+PostgreSQL's form (Minnow's own input accepts both), and interval and `TIME` strings returned to
+JavaScript change format. Generated, text, and JSON values written before the upgrade keep the
+text they were stored with, and generated columns that divide `INTEGER` or `DATE` columns keep their
+old values, until the row is written again (`UPDATE t SET col = col` recomputes them). Full-text
+indexes are unaffected and need no rebuild.
+
+**Stored formats:** IndexedDB schema 6 and OPFS
 layout 11 let a compaction job read a source segment that lacks a column added after it was
 written, which 0.15.0 and older treat as corruption. Upgrades run automatically on open and
 rewrite no data: an IndexedDB database at schema 1 to 5 is raised to 6 in one `versionchange`

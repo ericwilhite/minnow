@@ -331,9 +331,14 @@ import {
   type QueryValue,
   type SqlColumnSchema,
   volatileScalarFunctionNames,
+  annotateIntegerDivision,
   annotatePlanIntegerDivision,
+  annotatePlanTimestampText,
+  annotateTimestampText,
   clonePlanTree,
+  type DatetimeTypeKind,
   planMayHaveIntegerDivision,
+  planMayHaveTimestampText,
   foldIdentifierCase,
   extendGroupByWithKeyDependents,
   expandRowReferences,
@@ -1796,6 +1801,11 @@ interface CatalogFacts {
   types: ReadonlyMap<string, ReadonlyMap<string, SimpleDataType>>;
   /** Physical table names to their SQL integer columns, for PostgreSQL integer division. */
   integers: ReadonlyMap<string, ReadonlySet<string>>;
+  /**
+   * Physical table names to their DATE and INTERVAL columns: `date - date` divides as an
+   * integer, and `date + interval` is a timestamp without time zone in text.
+   */
+  datetimes: ReadonlyMap<string, ReadonlyMap<string, DatetimeTypeKind>>;
   /** Physical table names to their primary-key columns, for GROUP BY functional dependency. */
   keys: ReadonlyMap<string, readonly string[]>;
   /** Every table record by name, so a write can resolve a foreign key's parent without a read. */
@@ -1960,7 +1970,7 @@ function projectReturningItems(
   alias: string,
   items: readonly ReturningItem[],
   rows: readonly QueryRow[],
-  facts: Pick<CatalogFacts, "domains" | "types" | "integers">,
+  facts: Pick<CatalogFacts, "domains" | "types" | "integers" | "datetimes">,
 ): Required<ReturningExecuteFields> {
   // The same catalog normalization a SELECT receives, and the same columnar executor: the
   // affected rows become a one-table input whose values carry the execution form a stored row
@@ -1982,7 +1992,12 @@ function projectReturningItems(
     facts.domains,
     facts.types,
   );
-  annotatePlanIntegerDivision(plan, (name) => facts.integers.get(name));
+  annotatePlanTimestampText(plan, (name) => facts.datetimes.get(name));
+  annotatePlanIntegerDivision(
+    plan,
+    (name) => facts.integers.get(name),
+    (name) => facts.datetimes.get(name),
+  );
   const visible = visibleTableColumns(table);
   const columns = new Map<string, ColumnarColumnInput>(
     visible.map((column) => [
@@ -6011,6 +6026,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       domains,
       types,
       integers,
+      datetimes,
       keys,
       columns: catalogColumns,
       tables,
@@ -6021,7 +6037,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     // them; a name that resolves exactly is never touched, so this is one probing walk.
     rewritten = foldIdentifierCase(rewritten, catalogColumns);
     rewritten = expandRowReferences(rewritten, (name) => catalogColumns.get(name));
-    if (views.size > 0 && planReadsViews(rewritten, (name) => views.has(name))) {
+    const readsViews = views.size > 0 && planReadsViews(rewritten, (name) => views.has(name));
+    if (readsViews) {
       const bodies = new Map<string, CompiledQuery>();
       rewritten = expandViewSources(rewritten, (name) => {
         const sql = views.get(name);
@@ -6051,12 +6068,22 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         rewritten = forwardPlanKeyLiterals(rewritten, tables, lookup);
       }
     }
-    // Integer division needs the catalog: `qty / 2` truncates only once `qty` is known to be
-    // an INTEGER column. The probe is one walk; a plan with a candidate is cloned so the shared
-    // compiled plan stays catalog-free.
-    if (integers.size > 0 && planMayHaveIntegerDivision(rewritten)) {
+    // A view's columns, and `date_column + INTERVAL '1 day'`, are timestamps without time zone
+    // only once the catalog says so; their text then carries no `+00`. Same probe-then-clone.
+    if ((readsViews || datetimes.size > 0) && planMayHaveTimestampText(rewritten)) {
       rewritten = clonePlanTree(rewritten);
-      annotatePlanIntegerDivision(rewritten, (name) => integers.get(name));
+      annotatePlanTimestampText(rewritten, (name) => datetimes.get(name));
+    }
+    // Integer division needs the catalog: `qty / 2` truncates only once `qty` is known to be
+    // an INTEGER column, and `(shipped - placed) / 7` once both are DATE columns. The probe is
+    // one walk; a plan with a candidate is cloned so the shared compiled plan stays catalog-free.
+    if ((integers.size > 0 || datetimes.size > 0) && planMayHaveIntegerDivision(rewritten)) {
+      rewritten = clonePlanTree(rewritten);
+      annotatePlanIntegerDivision(
+        rewritten,
+        (name) => integers.get(name),
+        (name) => datetimes.get(name),
+      );
     }
     if (keys.size > 0) {
       rewritten = extendGroupByWithKeyDependents(
@@ -6275,6 +6302,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const columns = new Map<string, readonly string[]>();
     const types = new Map<string, ReadonlyMap<string, SimpleDataType>>();
     const integers = new Map<string, ReadonlySet<string>>();
+    const datetimes = new Map<string, ReadonlyMap<string, DatetimeTypeKind>>();
     const keys = new Map<string, readonly string[]>();
     const tables = new Map<string, TableRecord>();
     let keyForwardsTableId: string | undefined;
@@ -6306,6 +6334,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         ),
       );
       if (tableDomains.size > 0) domains.set(table.name, tableDomains);
+      const tableDatetimes = tableDatetimeColumns(table);
+      if (tableDatetimes.size > 0) datetimes.set(table.name, tableDatetimes);
       if (table.view !== undefined) views.set(table.name, table.view.sql);
       for (const key of table.foreignKeys ?? []) {
         const existing = childKeys.get(key.parentTable);
@@ -6320,6 +6350,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       columns,
       types,
       integers,
+      datetimes,
       keys,
       tables,
       keyForwardsTableId,
@@ -27280,6 +27311,43 @@ function visibleSegmentManifestVersion(value: unknown, label: string): number | 
  */
 const compiledChecks = new Map<string, ReadonlyArray<{ name: string; expression: Expression }>>();
 const COMPILED_CHECK_CACHE_LIMIT = 64;
+
+/** A table's DATE and INTERVAL columns, as the typing passes read them from the catalog. */
+function tableDatetimeColumns(table: TableRecord): Map<string, DatetimeTypeKind> {
+  const columns = new Map<string, DatetimeTypeKind>();
+  for (const column of table.columns) {
+    const kind = column.sqlDomain?.kind;
+    if (column.hidden !== true && (kind === "date" || kind === "interval")) {
+      columns.set(column.name, kind);
+    }
+  }
+  return columns;
+}
+
+/**
+ * Types a CHECK or generated-column expression against its own table's columns, as a query is
+ * typed against the catalog: `/` over INTEGER columns or over `date - date` truncates, and
+ * `date_column + INTERVAL '1 day'` renders as a timestamp without time zone.
+ */
+function tableTypedExpression(table: TableRecord, expression: Expression): Expression {
+  const integers = new Set(
+    table.columns.filter((column) => column.integer === true).map((column) => column.name),
+  );
+  const datetimes = tableDatetimeColumns(table);
+  if (integers.size === 0 && datetimes.size === 0) return expression;
+  // A row expression names its own columns, bare or qualified by the table name.
+  const name = (reference: string): string => reference.slice(reference.lastIndexOf(".") + 1);
+  const columnDatetime = (reference: string): DatetimeTypeKind | undefined =>
+    datetimes.get(name(reference));
+  const typed = annotateTimestampText(expression, columnDatetime);
+  annotateIntegerDivision(
+    typed,
+    (reference) => integers.has(name(reference)),
+    undefined,
+    columnDatetime,
+  );
+  return typed;
+}
 const compiledGeneratedColumns = new Map<
   string,
   ReadonlyArray<{ column: TableColumnRecord; expression: Expression }>
@@ -27291,7 +27359,7 @@ function tableChecks(table: TableRecord): ReadonlyArray<{ name: string; expressi
   if (cached !== undefined) return cached;
   const compiled = (table.checks ?? []).map((check) => ({
     name: check.name,
-    expression: compileCheckExpression(check.sql, check.name),
+    expression: tableTypedExpression(table, compileCheckExpression(check.sql, check.name)),
   }));
   const cacheable =
     (table.checks ?? []).reduce(
@@ -27321,11 +27389,14 @@ function tableGeneratedExpressions(
       : [
           {
             column,
-            expression: compileGeneratedColumnExpression(
-              table.name,
-              column.name,
-              column.generatedValue.sql,
-              table.columns,
+            expression: tableTypedExpression(
+              table,
+              compileGeneratedColumnExpression(
+                table.name,
+                column.name,
+                column.generatedValue.sql,
+                table.columns,
+              ),
             ),
           },
         ],

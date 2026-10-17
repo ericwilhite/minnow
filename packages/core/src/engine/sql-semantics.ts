@@ -1,5 +1,5 @@
 import { SqlRegex } from "./sql-regex.js";
-import { dateMilliseconds } from "../date-value.js";
+import { dateMilliseconds, daysFromCivil } from "../date-value.js";
 import { assertWellFormedString } from "../block-format/unicode.js";
 import {
   MAX_SQL_NESTING_DEPTH,
@@ -27,21 +27,46 @@ import {
  */
 
 const SQL_TIMESTAMP_TEXT =
-  /^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?))?(?: ?([Zz]|[+-]\d{2}(?::?\d{2})?))?$/;
+  /^(\d{4,6})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,6}))?)?)?(?: ?([Zz]|[+-]\d{2}(?::?\d{2})?))?(?: ([Bb][Cc]))?$/;
+
+/** ECMAScript's Date range: 100,000,000 days either side of the epoch. */
+const MAX_DATE_MILLISECONDS = 8.64e15;
 
 /**
  * The standard's datetime text — `2026-01-02`, `2026-01-02 03:04:05`, `2026-01-02T03:04:05.250Z`,
  * an optional zone — read as an instant. A zone is `Z`, or an offset in any spelling PostgreSQL
- * accepts: `+05`, `+0530`, `+05:30`, `-08`, optionally after a space, up to ±15:59. A zoneless
- * spelling is UTC, the reading every datetime in a Minnow database has; `undefined` for text in
- * any other shape.
+ * accepts: `+05`, `+0530`, `+05:30`, `+00`, `-08`, optionally after a space, up to ±15:59. A
+ * zoneless spelling is UTC, the reading every datetime in a Minnow database has. Everything
+ * PostgreSQL's own timestamp output writes reads back: a year past 9999 in full, a `BC` suffix,
+ * and up to six fractional digits (kept to the millisecond a Date holds). `undefined` for text
+ * in any other shape.
  */
 export function parseSqlTimestampText(text: string): Date | undefined {
   const match = SQL_TIMESTAMP_TEXT.exec(text.trim());
   if (match === null) return undefined;
-  const [, day, time = "00:00:00", zone = "Z"] = match;
-  dateDomainValue(day);
-  const [hour, minute, second = "0"] = time.split(":");
+  const [
+    ,
+    yearText = "",
+    monthText = "",
+    dayText = "",
+    hour = "0",
+    minute = "0",
+    second = "0",
+    fraction = "",
+    zone = "Z",
+    era,
+  ] = match;
+  const bc = era !== undefined;
+  // The ordinary four-digit AD date keeps the DATE input's own validation and messages.
+  if (!bc && yearText.length === 4) dateDomainValue(`${yearText}-${monthText}-${dayText}`);
+  const written = Number(yearText);
+  // PostgreSQL has no year zero: 1 BC is astronomical year 0.
+  const year = bc ? 1 - written : written;
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const monthDays = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1] ?? 0;
+  if (written < 1 || day < 1 || day > monthDays) throw new TypeError(`Invalid TIMESTAMP: ${text}`);
   const offset = /^[Zz]$/.test(zone) ? "" : zone.replace(":", "");
   const offsetHours = offset === "" ? 0 : Number(offset.slice(1, 3));
   const offsetMinutes = offset === "" ? 0 : Number(offset.slice(3, 5) || "0");
@@ -54,12 +79,19 @@ export function parseSqlTimestampText(text: string): Date | undefined {
   ) {
     throw new TypeError(`Invalid TIMESTAMP fields: ${text}`);
   }
-  const seconds = time.length === 5 ? `${time}:00` : time;
-  const isoZone =
-    offset === "" ? "Z" : `${offset.slice(0, 3)}:${String(offsetMinutes).padStart(2, "0")}`;
-  const date = new Date(`${String(day)}T${seconds}${isoZone}`);
-  if (!Number.isFinite(dateMilliseconds(date))) throw new TypeError(`Invalid TIMESTAMP: ${text}`);
-  return date;
+  const offsetMilliseconds =
+    (offset.startsWith("-") ? -1 : 1) * (offsetHours * 60 + offsetMinutes) * 60_000;
+  const milliseconds =
+    daysFromCivil(year, month - 1, day) * 86_400_000 +
+    Number(hour) * 3_600_000 +
+    Number(minute) * 60_000 +
+    Number(second) * 1_000 +
+    Number(fraction.padEnd(3, "0").slice(0, 3)) -
+    offsetMilliseconds;
+  if (!(Math.abs(milliseconds) <= MAX_DATE_MILLISECONDS)) {
+    throw new TypeError(`Invalid TIMESTAMP: ${text}`);
+  }
+  return new Date(milliseconds);
 }
 
 /**

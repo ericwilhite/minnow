@@ -2089,7 +2089,8 @@ function tokenizeFtsDictionaryEntry(
   code: number,
 ): void {
   if (cache.tokenized[code] === 1) return;
-  const rendered = externalSqlDomainValue(cache.dictionary?.[code] ?? "");
+  // The document text every other full-text path reads, persisted postings included.
+  const rendered = renderDocumentValue(cache.dictionary?.[code] ?? "");
   const tokens = tokenize(typeof rendered === "string" ? rendered : "");
   cache.termMask[code] = termsMask(tokens, expression.terms);
   if (cache.tokenCount !== undefined) cache.tokenCount[code] = tokens.length;

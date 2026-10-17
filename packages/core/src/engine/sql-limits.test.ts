@@ -216,7 +216,7 @@ describe("SQL scalar allocation limits", () => {
     );
     const date = new Date("2026-08-24T00:00:00.000Z");
     date.toISOString = () => "caller-controlled";
-    expect(boundedJsonText(date, false)).toBe('"2026-08-24T00:00:00.000Z"');
+    expect(boundedJsonText(date, false)).toBe('"2026-08-24T00:00:00+00:00"');
   });
 
   it("does not retain every intermediate decimal power", () => {

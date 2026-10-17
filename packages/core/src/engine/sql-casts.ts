@@ -1,6 +1,7 @@
 /** Shared SQL cast kernel. Pure value operations run directly on row, vector and folding
  * paths; the module has no executor, catalog or storage dependency. */
-import { dateIsoString, dateMilliseconds } from "../date-value.js";
+import { dateMilliseconds } from "../date-value.js";
+import { postgresTimestampText } from "./sql-datetime-text.js";
 import { parseSqlTimestampText, readUntypedText } from "./sql-semantics.js";
 import {
   exactNumericValue,
@@ -10,6 +11,7 @@ import {
   timeDomainValue,
   intervalDomainValue,
   externalSqlDomainValue,
+  externalSqlTextValue,
   typedSqlTextValue,
   isExactNumeric,
   exactNumericRounded,
@@ -18,30 +20,36 @@ import {
 /**
  * CAST conversions between the four logical types, matching the strict common ground of
  * SQLite and PostgreSQL: numeric strings parse or fail (never silently 0), numeric integer casts round,
- * float integer casts use ties to even, booleans render as 'true'/'false', datetimes as ISO strings, and a
- * number cast to datetime reads as milliseconds since the epoch.
+ * float integer casts use ties to even, booleans render as 'true'/'false', datetimes as PostgreSQL's
+ * `timestamp with time zone` text in UTC (`2024-01-02 10:00:00+00`), and a number cast to
+ * datetime reads as milliseconds since the epoch.
  */
 export function castSqlValue(value: unknown, target: string): unknown {
+  // Explicit TEXT (what CAST(x AS TEXT) returns) is read by its text: a domain's input never
+  // sees the internal wrapper, so CAST(CAST(i AS TEXT) AS INTERVAL) is `i` again.
+  const source = externalSqlTextValue(value);
   if (target.startsWith("numeric")) {
     const [, precision, scale] = target.split(":");
     return exactNumericValue(
-      value,
+      source,
       precision === undefined || precision === "" ? undefined : Number(precision),
       scale === undefined || scale === "" ? undefined : Number(scale),
     );
   }
-  if (target === "json") return jsonDomainValue(value, false);
-  if (target === "jsonb") return jsonDomainValue(value, true);
-  if (target === "uuid") return uuidDomainValue(value);
-  if (target === "date") return dateDomainValue(value);
-  if (target === "time") return timeDomainValue(value);
-  if (target === "interval") return intervalDomainValue(value);
+  if (target === "json") return jsonDomainValue(source, false);
+  if (target === "jsonb") return jsonDomainValue(source, true);
+  if (target === "uuid") return uuidDomainValue(source);
+  if (target === "date") return dateDomainValue(source);
+  if (target === "time") return timeDomainValue(source);
+  if (target === "interval") return intervalDomainValue(source);
   if (target === "string") {
     const external = externalSqlDomainValue(value);
     if (typeof external === "string") return typedSqlTextValue(external);
     if (typeof value === "number") return typedSqlTextValue(String(value));
     if (typeof value === "boolean") return typedSqlTextValue(value ? "true" : "false");
-    if (value instanceof Date) return typedSqlTextValue(dateIsoString(value));
+    if (value instanceof Date) {
+      return typedSqlTextValue(postgresTimestampText(dateMilliseconds(value), true));
+    }
   }
   if (target === "number-integer" && isExactNumeric(value)) {
     const integer = Number(externalSqlDomainValue(exactNumericRounded(value, 0, "round")));

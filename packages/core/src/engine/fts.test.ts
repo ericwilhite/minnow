@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MAX_INDEXED_STRING_CHARACTERS } from "../storage/types.js";
+import { dateDomainValue, intervalDomainValue, timeDomainValue } from "./sql-domains.js";
 import {
   bm25DocumentScore,
   bm25Score,
@@ -99,6 +100,16 @@ describe("document matching", () => {
     );
     expect(renderDocumentValue(null)).toBeUndefined();
     expect(renderDocumentValue(true)).toBeUndefined();
+  });
+
+  it("keeps the document text persisted postings were built from", () => {
+    // SQL text follows PostgreSQL (`1 day 02:00:00`, `10:00:00.5`), but a full-text posting is
+    // a stored term: these documents must keep producing the terms already on disk.
+    expect(renderDocumentValue(intervalDomainValue("1 day 2 hours"))).toBe(
+      "0 mons 1 days 7200000000 usecs",
+    );
+    expect(renderDocumentValue(timeDomainValue("10:00:00.500"))).toBe("10:00:00.500");
+    expect(renderDocumentValue(dateDomainValue("2026-08-12"))).toBe("2026-08-12");
   });
 
   it("packs term masks with full coverage detection", () => {
