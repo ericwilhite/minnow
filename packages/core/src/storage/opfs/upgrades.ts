@@ -101,6 +101,13 @@ export interface UpgradeHandles {
   slotA: SyncFileHandle;
   slotB: SyncFileHandle;
 }
+/**
+ * Runs one marker publication so that no opener judges the marker part-way through it: the
+ * store passes its marker lock, which every opener holds while it judges a marker that does not
+ * read whole. Without one, the steps simply run.
+ */
+export type MarkerPublication = <T>(steps: () => Promise<T>) => Promise<T>;
+const unserializedPublication: MarkerPublication = (steps) => steps();
 interface ReadyRecord {
   from: 6;
   to: 7;
@@ -362,11 +369,15 @@ function readReady(bytes: Uint8Array): ReadyRecord {
  * Brings the database to the current layout under the held locks: layout 6 through the
  * validated conversion, layouts 7 to 11 through the marker. Returns whether stored bytes were
  * converted, which the caller follows with a full integrity check; an ordinary current-layout
- * open returns false without mutation.
+ * open returns false without mutation. Every marker write runs inside `publish`.
  */
-export async function upgradeOpfsLayout(tree: OpfsTree, handles: UpgradeHandles): Promise<boolean> {
-  const converted = await upgradeLayout6(tree, handles);
-  await upgradeMarker(tree);
+export async function upgradeOpfsLayout(
+  tree: OpfsTree,
+  handles: UpgradeHandles,
+  publish: MarkerPublication = unserializedPublication,
+): Promise<boolean> {
+  const converted = await upgradeLayout6(tree, handles, publish);
+  await upgradeMarker(tree, publish);
   return converted;
 }
 
@@ -403,15 +414,27 @@ async function markerRewriteWitness(tree: OpfsTree): Promise<boolean> {
  * whole older marker a half-written witness is simply written again. Witnesses are removed last,
  * once the layout-12 marker is durable — including one an older build left mid-rewrite to layout
  * 8, 9, 10, or 11 — and a witness that outlives its removal is cleaned up on the next open.
+ *
+ * The three steps publish as one: an opener judging the marker meanwhile could otherwise read it
+ * held or half-written, then find the witness already removed, and refuse the database.
  */
-async function upgradeMarker(tree: OpfsTree): Promise<void> {
+async function upgradeMarker(tree: OpfsTree, publish: MarkerPublication): Promise<void> {
   const text = new TextDecoder().decode(await tree.readFile(["format.json"], { maxBytes: 1024 }));
-  if (text !== MARKER_TEXT) {
-    const older = MARKER_ONLY_OLDER_TEXTS.includes(text);
-    if (!older && !(await markerRewriteWitness(tree))) return;
+  if (text === MARKER_TEXT) {
+    // Beside a whole current marker, a leftover witness changes no opener's judgement.
+    await removeMarkerWitnesses(tree);
+    return;
+  }
+  const older = MARKER_ONLY_OLDER_TEXTS.includes(text);
+  if (!older && !(await markerRewriteWitness(tree))) return;
+  await publish(async () => {
     await tree.writeFile([LAYOUT12_WITNESS], LAYOUT12_WITNESS_BYTES, { flush: true });
     await tree.writeFile(["format.json"], MARKER, { flush: true });
-  }
+    await removeMarkerWitnesses(tree);
+  });
+}
+
+async function removeMarkerWitnesses(tree: OpfsTree): Promise<void> {
   for (const { name } of MARKER_WITNESSES) {
     if ((await tree.readFile([name], { maxBytes: 4096 })) !== undefined) {
       await tree.deleteFile([name]);
@@ -420,7 +443,11 @@ async function upgradeMarker(tree: OpfsTree): Promise<void> {
 }
 
 /** The layout-6 conversion; returns false without mutation once it has nothing to do. */
-async function upgradeLayout6(tree: OpfsTree, handles: UpgradeHandles): Promise<boolean> {
+async function upgradeLayout6(
+  tree: OpfsTree,
+  handles: UpgradeHandles,
+  publish: MarkerPublication,
+): Promise<boolean> {
   const marker = await tree.readFile(["format.json"], { maxBytes: 1024 });
   const text = new TextDecoder().decode(marker);
   // A layout-7 to 11 marker is as published as the current one: an older build may have
@@ -555,7 +582,7 @@ async function upgradeLayout6(tree: OpfsTree, handles: UpgradeHandles): Promise<
       throw corrupt("Native WAL was reset without intact upgrade installation proof");
     // This is the version barrier: the old reader sees an unsupported marker before any
     // current-format native checkpoint or acknowledgement replaces its control files.
-    await tree.writeFile(["format.json"], MARKER, { flush: true });
+    await publish(() => tree.writeFile(["format.json"], MARKER, { flush: true }));
     for (const handle of [handles.slotA, handles.slotB]) {
       handle.truncate(0);
       writeFully(handle, checkpoint, 0, "publishing an automatic upgrade checkpoint");
