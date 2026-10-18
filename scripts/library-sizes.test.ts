@@ -43,10 +43,11 @@ describe("compressed download budgets", () => {
     // storage-limit literals, 521.1 KiB; with PostgreSQL datetime and interval text, 524.3 KiB;
     // with UNIQUE builds under writes, 525.0 KiB; with the single-row write paths and delta
     // merges, 532.3 KiB; with the OPFS marker lock and worker progress reports while the store
-    // opens, 534.0 KiB.
+    // opens, 534.0 KiB; with the storage commit-path costs (incremental level-zero count,
+    // batched IndexedDB presence and retired-provenance reads), 535.2 KiB.
     expect(
       worker.totalGzipBytes + client.totalGzipBytes,
       "worker plus client gzip bytes",
-    ).toBeLessThanOrEqual(535 * 1024);
+    ).toBeLessThanOrEqual(536 * 1024);
   });
 });

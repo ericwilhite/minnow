@@ -97,7 +97,9 @@ const COMPLETE_ENTRY_GZIP_BUDGET = 328 * 1024;
 // Build-owner liveness: 1485.0 KiB raw.
 // Lapsed-lease retakes and write restarts: 1486.1 KiB raw.
 // OPFS marker judged under a Web Lock: 1487.1 KiB raw.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1488 * 1024;
+// Storage commit-path costs (incremental level-zero count, batched IndexedDB presence and
+// retired-provenance reads): 1488.6 KiB raw.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1489 * 1024;
 // Explicit scheduler ownership and bounded diagnostic history add about 1 KiB gzip over the
 // correctness/upgrade batch (361.6 KiB measured). Concurrent compaction and posting ownership
 // repairs measure 362.1 KiB; allow the next whole KiB without changing runtime performance gates.
@@ -137,8 +139,10 @@ const ENGINE_WITH_OPFS_GZIP_BUDGET = 429 * 1024;
 // Single-row write paths and delta merges: 1479.6 KiB raw / 424.1 KiB gzip.
 // Build-owner liveness: 1482.9 KiB raw / 425.2 KiB gzip.
 // Lapsed-lease retakes and write restarts: 1484.0 KiB raw.
-const INDEXEDDB_WORKER_RAW_BUDGET = 1485 * 1024;
-const INDEXEDDB_WORKER_GZIP_BUDGET = 426 * 1024;
+// Storage commit-path costs (batched IndexedDB presence and retired-provenance reads):
+// 1486.3 KiB raw / 426.4 KiB gzip.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1487 * 1024;
+const INDEXEDDB_WORKER_GZIP_BUDGET = 427 * 1024;
 
 const repoRoot = join(import.meta.dirname, "..", "..", "..");
 
