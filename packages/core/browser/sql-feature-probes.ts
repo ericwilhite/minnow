@@ -873,60 +873,6 @@ export const featureBehaviorProbes: readonly FeatureBehaviorProbe[] = [
     ],
   },
   {
-    featureId: "type.timestamp-text",
-    steps: [
-      {
-        // A stored datetime is an instant: PostgreSQL's timestamp with time zone text in UTC,
-        // even in a column declared TIMESTAMP, as the browser fixture's `joined` is.
-        kind: "query",
-        sql: "SELECT CAST(joined AS TEXT) AS at, 'joined ' || joined AS said, TO_JSON(joined) AS doc FROM rows ORDER BY joined NULLS LAST",
-        expected: {
-          columns: ["at", "said", "doc"],
-          rows: [
-            [
-              "2025-12-30 00:00:00+00",
-              "joined 2025-12-30 00:00:00+00",
-              '"2025-12-30T00:00:00+00:00"',
-            ],
-            [
-              "2026-01-02 00:00:00+00",
-              "joined 2026-01-02 00:00:00+00",
-              '"2026-01-02T00:00:00+00:00"',
-            ],
-            [
-              "2026-02-01 00:00:00+00",
-              "joined 2026-02-01 00:00:00+00",
-              '"2026-02-01T00:00:00+00:00"',
-            ],
-            [null, null, null],
-          ],
-          ordered: true,
-        },
-      },
-      {
-        kind: "query",
-        sql: "SELECT CAST(TIMESTAMP '2026-01-02 03:04:05.5' AS TEXT) AS local_at, CAST(CAST('2026-01-02 03:04:05.5' AS TIMESTAMPTZ) AS TEXT) AS zoned_at, 'at ' || MAKE_TIMESTAMP(2026, 1, 2, 3, 4, 5.25) AS made, TO_JSON(TIMESTAMP '2026-01-02 03:04:05') AS local_doc, CAST(DATE '2026-01-02' + INTERVAL '6 hours' AS TEXT) AS from_date",
-        expected: {
-          columns: ["local_at", "zoned_at", "made", "local_doc", "from_date"],
-          rows: [
-            [
-              "2026-01-02 03:04:05.5",
-              "2026-01-02 03:04:05.5+00",
-              "at 2026-01-02 03:04:05.25",
-              '"2026-01-02T03:04:05"',
-              "2026-01-02 06:00:00",
-            ],
-          ],
-        },
-      },
-      {
-        kind: "query",
-        sql: "SELECT CAST(CAST(joined AS TEXT) AS TIMESTAMP) = joined AS round_trip FROM rows WHERE joined IS NOT NULL",
-        expected: { columns: ["round_trip"], rows: [[true], [true], [true]] },
-      },
-    ],
-  },
-  {
     featureId: "function.to-date-timestamp",
     steps: [
       {
@@ -1031,6 +977,15 @@ export const featureBehaviorProbes: readonly FeatureBehaviorProbe[] = [
               true,
             ],
           ],
+        },
+      },
+      {
+        // `timestamp with time zone` is an instant; `timestamp without time zone` has no zone.
+        kind: "query",
+        sql: "SELECT at::text AS at, seen::text AS seen, TO_JSON(seen) AS seen_doc FROM spelled",
+        expected: {
+          columns: ["at", "seen", "seen_doc"],
+          rows: [["2026-01-02 03:04:05+00", "2026-01-03 04:05:06", '"2026-01-03T04:05:06"']],
         },
       },
     ],

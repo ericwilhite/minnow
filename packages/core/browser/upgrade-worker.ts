@@ -5,6 +5,9 @@ import { OpfsBlockStore } from "@minnowdb/core/storage/opfs";
 import { MinnowDatabase as Layout10Database } from "@minnowdb/core-layout10";
 import { IndexedDbBlockStore as Layout10IndexedDb } from "@minnowdb/core-layout10/storage/indexeddb";
 import { OpfsBlockStore as Layout10Store } from "@minnowdb/core-layout10/storage/opfs";
+import { MinnowDatabase as Layout12Database } from "@minnowdb/core-layout12";
+import { IndexedDbBlockStore as Layout12IndexedDb } from "@minnowdb/core-layout12/storage/indexeddb";
+import { OpfsBlockStore as Layout12Store } from "@minnowdb/core-layout12/storage/opfs";
 import { MinnowDatabase as Layout6Database } from "@minnowdb/core-layout6";
 import { IndexedDbBlockStore as Layout6IndexedDb } from "@minnowdb/core-layout6/storage/indexeddb";
 import { OpfsBlockStore as Layout6Store } from "@minnowdb/core-layout6/storage/opfs";
@@ -30,7 +33,7 @@ type UpgradeMessage =
   | { kind: "indexeddb"; writer: IndexedDbWriterVersion; name: string };
 
 /** The OPFS layout this build writes. */
-const OPFS_LAYOUT = 12;
+const OPFS_LAYOUT = 13;
 /** The engine's internal key-forwards table, created by the first rekey. */
 const KEY_FORWARDS_TABLE = "\u0000minnow_key_forwards";
 
@@ -92,12 +95,14 @@ async function run({
     await database.execute("INSERT INTO after_upgrade VALUES (1, 'retained')");
     // A rekey: the engine records a forward in its internal key-forwards table, layout 10's record.
     await database.execute("UPDATE after_upgrade SET id = 2 WHERE id = 1");
+    await writeTimestampColumns(database);
     await database.close();
     store._crashForTests();
     store = await OpfsBlockStore.open({ name });
     database = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
     const rows = (await database.query("SELECT id, value FROM after_upgrade")).rows;
     const keyForwards = (await store.getTableByName(KEY_FORWARDS_TABLE))?.keyForwards === true;
+    const timestampText = await readTimestampColumns(database);
     const olderReaderRefused = await olderOpfsReadersRefused(name);
     return {
       tables,
@@ -105,6 +110,7 @@ async function run({
       walOnlyPreserved,
       rows,
       keyForwards,
+      timestampText,
       format: await opfsFormat(name),
       integrity: (await store.checkIntegrity({ mode: "full" })).ok,
       olderReaderRefused,
@@ -113,6 +119,29 @@ async function run({
     await database.close();
     store.close();
   }
+}
+
+/** Layout 13's and schema 8's record: a column declared TIMESTAMP without time zone. */
+async function writeTimestampColumns(database: {
+  execute(sql: string): Promise<unknown>;
+}): Promise<void> {
+  await database.execute(
+    "CREATE TABLE stamps (id INTEGER PRIMARY KEY, local_at TIMESTAMP, zoned_at TIMESTAMPTZ)",
+  );
+  await database.execute(
+    "INSERT INTO stamps VALUES (1, '2026-01-02 03:04:05.5', '2026-01-02 03:04:05.5')",
+  );
+}
+
+/** The TIMESTAMP column's text has no zone, the TIMESTAMPTZ column's does, after a reopen. */
+async function readTimestampColumns(database: {
+  query(sql: string): Promise<{ rows: unknown[] }>;
+}): Promise<unknown> {
+  return (
+    await database.query(
+      "SELECT local_at::text AS local_at, zoned_at::text AS zoned_at, TO_JSON(local_at) AS doc FROM stamps",
+    )
+  ).rows;
 }
 
 async function opfsFormat(name: string): Promise<number> {
@@ -132,6 +161,7 @@ async function olderOpfsReadersRefused(name: string): Promise<boolean> {
     { open: (options: { name: string }) => Layout8Store.open(options), supported: 8 },
     { open: (options: { name: string }) => Layout9Store.open(options), supported: 9 },
     { open: (options: { name: string }) => Layout10Store.open(options), supported: 10 },
+    { open: (options: { name: string }) => Layout12Store.open(options), supported: 12 },
   ];
   let refusals = 0;
   for (const reader of olderReaders) {
@@ -237,7 +267,7 @@ async function runReleasedOpfs(name: string): Promise<ReleasedOpfsUpgradeResult>
 // ---------------------------------------------------------------------------------------------
 
 /** The IndexedDB schema this build writes. */
-const INDEXEDDB_SCHEMA = 7;
+const INDEXEDDB_SCHEMA = 8;
 
 interface IndexedHistoryDatabase {
   createTable(definition: unknown): Promise<unknown>;
@@ -281,6 +311,11 @@ const releasedIndexedDb: Record<
     schema: 5,
     open: (name) => Layout10IndexedDb.open({ name }),
     database: (store: Layout10IndexedDb) => new Layout10Database(store, databaseOptions),
+  },
+  "0.16.0": {
+    schema: 7,
+    open: (name) => Layout12IndexedDb.open({ name }),
+    database: (store: Layout12IndexedDb) => new Layout12Database(store, databaseOptions),
   },
 };
 
@@ -395,6 +430,13 @@ async function runIndexedDb(
     ),
     matches: (await indexedAnswers(database)).matches,
   };
+  await writeTimestampColumns(database);
+  await database.close();
+  store.close();
+
+  store = await IndexedDbBlockStore.open({ name });
+  database = new MinnowDatabase(store, databaseOptions);
+  const timestampText = await readTimestampColumns(database);
   const integrity = (await store.checkIntegrity({ mode: "full" })).ok;
   await database.close();
   store.close();
@@ -427,6 +469,7 @@ async function runIndexedDb(
     keyForwards,
     foldedAcrossAddColumn,
     foldedFullText,
+    timestampText,
     integrity,
     olderReadersRefused: refusals === Object.keys(releasedIndexedDb).length,
     finalSchema: await nativeVersion(name),

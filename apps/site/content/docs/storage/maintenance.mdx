@@ -79,8 +79,8 @@ A merge is a compaction job like a fold: stepped, resumable, and published as a 
 `listCompactionJobs` reports it with `rewritePlan.kind` `"delta-v1"`. `compactTable` and
 `compactTableStep` always fold; merges are automatic only. Inserts and upserts are not merged;
 they fold as before. Merged segments are records 0.15.0 and older builds cannot read, so
-opening a database with this build upgrades it to IndexedDB schema 7 or OPFS layout 12, and an
-older build then refuses it (see [versioning](/docs/reference/versioning)).
+opening a database with this build upgrades it to at least IndexedDB schema 7 or OPFS layout 12,
+and an older build then refuses it (see [versioning](/docs/reference/versioning)).
 
 ### Deletes and updates before compaction
 
@@ -118,8 +118,8 @@ level-zero segment until the 4,096-segment ceiling refused its writes. Opening s
 a later build fixes it without any call: the first write at the ceiling, or the first read of a
 heavily fragmented table, starts a fold, and automatic compaction keeps going until the table is
 back to a few segments. The data is unchanged. This build stores fold plans an older build
-cannot read, so opening the database upgrades it to IndexedDB schema 7 or OPFS layout 12, and
-0.15.0 then refuses it (see [versioning](/docs/reference/versioning)).
+cannot read, so opening the database upgrades it to at least IndexedDB schema 7 or OPFS layout
+12, and 0.15.0 then refuses it (see [versioning](/docs/reference/versioning)).
 
 ### Partitioned folds
 

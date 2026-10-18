@@ -33,12 +33,14 @@ import { MinnowDatabase, type DatabaseRow } from "./database.js";
 import { preparedPlanTestHooks } from "./prepared-plan.js";
 import {
   annotatePlanIntegerDivision,
+  annotatePlanTimestampText,
   bindPlanParameters,
   compileQuery,
   extendGroupByWithKeyDependents,
   foldIdentifierCase,
   executeRowQuery,
   transparentProjectionSource,
+  type DatetimeTypeKind,
   type QueryParameter,
   type QueryResult,
   type QueryValue,
@@ -65,8 +67,27 @@ interface FixtureRow {
   region: string | null;
   amount: number;
   active: boolean;
+  /** TIMESTAMPTZ on every engine: an instant, whose text ends in `+00`. */
   joined: Date | null;
   label: string;
+  /** TIMESTAMP (without time zone) on Minnow and PostgreSQL: its text carries no zone. */
+  noted: Date | null;
+}
+
+const NOTED_START = Date.UTC(2026, 0, 1);
+
+/**
+ * `noted` for one row, derived from its id so the random draws that build every other column
+ * (and the seeds that replay them) stay as they were: one hour, one second, and a quarter-second
+ * step per id, so the text carries fractions, and NULL every fifth row.
+ */
+function notedFor(id: number): Date | null {
+  return id % 5 === 0 ? null : new Date(NOTED_START + id * 3_601_250);
+}
+
+/** PostgreSQL's input text for a TIMESTAMP holding the same UTC wall clock as `value`. */
+function wallClockText(value: Date | null): string | null {
+  return value === null ? null : value.toISOString().slice(0, 23).replace("T", " ");
 }
 
 function buildFixture(seed: number): FixtureRow[] {
@@ -84,6 +105,7 @@ function buildFixture(seed: number): FixtureRow[] {
       active: rng() < 0.5,
       joined: joined === null ? null : new Date(joined),
       label: LABELS[Math.floor(rng() * LABELS.length)] ?? "alpha",
+      noted: notedFor(id),
     });
   }
   return rows;
@@ -109,6 +131,8 @@ async function minnowFixture(fixture: readonly FixtureRow[]): Promise<MinnowData
       { name: "active", type: "boolean" },
       { name: "joined", type: "datetime", nullable: true },
       { name: "label", type: "string" },
+      // TIMESTAMP, as PostgreSQL declares it below: the same instants, text without a zone.
+      { name: "noted", type: "datetime", withoutTimeZone: true, nullable: true },
     ],
   });
   await database.insertBatch("data", fixture as unknown as DatabaseRow[]);
@@ -126,11 +150,13 @@ async function minnowFixture(fixture: readonly FixtureRow[]): Promise<MinnowData
 
 /**
  * The row executor has no catalog, so it receives what catalog binding would have added: the
+ * timestamp-text marks that `data.noted` (a TIMESTAMP without time zone) implies, and the
  * integer-division marks that `data.id` (an INTEGER on every engine) implies.
  */
 function catalogBoundPlan(sql: string, params: CaseParameter[] | undefined, optimize = true) {
   let plan = compileQuery(sql, optimize ? {} : { optimize: false });
   plan = foldIdentifierCase(plan, catalogColumnNames);
+  annotatePlanTimestampText(plan, (table) => (table === "data" ? catalogDatetimes : undefined));
   annotatePlanIntegerDivision(plan, (table) => (table === "data" ? new Set(["id"]) : undefined));
   plan = extendGroupByWithKeyDependents(
     plan,
@@ -141,9 +167,10 @@ function catalogBoundPlan(sql: string, params: CaseParameter[] | undefined, opti
 }
 
 const catalogColumnNames = new Map<string, readonly string[]>([
-  ["data", ["id", "region", "amount", "active", "joined", "label"]],
+  ["data", ["id", "region", "amount", "active", "joined", "label", "noted"]],
   ["dims", ["region", "label", "rank"]],
 ]);
+const catalogDatetimes = new Map<string, DatetimeTypeKind>([["noted", "local"]]);
 
 function rowTablesFor(fixture: readonly FixtureRow[]): Map<string, DatabaseRow[]> {
   return new Map<string, DatabaseRow[]>([
@@ -156,10 +183,10 @@ function sqliteFixture(fixture: readonly FixtureRow[]): DatabaseSync {
   const database = new DatabaseSync(":memory:");
   database.exec("PRAGMA case_sensitive_like = ON");
   database.exec(
-    `CREATE TABLE data ("id" INTEGER PRIMARY KEY, "region" TEXT, "amount" REAL, "active" INTEGER, "joined" TEXT, "label" TEXT)`,
+    `CREATE TABLE data ("id" INTEGER PRIMARY KEY, "region" TEXT, "amount" REAL, "active" INTEGER, "joined" TEXT, "label" TEXT, "noted" TEXT)`,
   );
   database.exec(`CREATE TABLE dims ("region" TEXT, "label" TEXT, "rank" REAL)`);
-  const insert = database.prepare(`INSERT INTO data VALUES (?, ?, ?, ?, ?, ?)`);
+  const insert = database.prepare(`INSERT INTO data VALUES (?, ?, ?, ?, ?, ?, ?)`);
   for (const row of fixture) {
     insert.run(
       row.id,
@@ -168,6 +195,7 @@ function sqliteFixture(fixture: readonly FixtureRow[]): DatabaseSync {
       row.active ? 1 : 0,
       row.joined === null ? null : row.joined.toISOString(),
       row.label,
+      row.noted === null ? null : row.noted.toISOString(),
     );
   }
   const insertDim = database.prepare(`INSERT INTO dims VALUES (?, ?, ?)`);
@@ -1084,11 +1112,11 @@ function wildcardShapeCases(): Case[] {
       ordered: true,
     },
     {
-      sql: `WITH copied(ident, place, total, enabled, joined_at, title) AS (SELECT * FROM data) SELECT ident, title FROM copied ORDER BY ident LIMIT 19`,
+      sql: `WITH copied(ident, place, total, enabled, joined_at, title, noted_at) AS (SELECT * FROM data) SELECT ident, title FROM copied ORDER BY ident LIMIT 19`,
       ordered: true,
     },
     {
-      sql: `SELECT copied.ident, copied.title FROM (SELECT * FROM data) AS copied(ident, place, total, enabled, joined_at, title) ORDER BY copied.ident LIMIT 19`,
+      sql: `SELECT copied.ident, copied.title FROM (SELECT * FROM data) AS copied(ident, place, total, enabled, joined_at, title, noted_at) ORDER BY copied.ident LIMIT 19`,
       ordered: true,
       skip: ["sqlite"],
     },
@@ -1588,11 +1616,12 @@ function orderedSetAggregateCases(): Case[] {
  * Every path that turns a datetime into SQL text, diffed against PostgreSQL's own output: CAST
  * and `::text`, `||`, CONCAT, CONCAT_WS, FORMAT, QUOTE_LITERAL, string functions over the text,
  * LIKE and equality on it, STRING_AGG, the JSON constructors and aggregates, and the text of
- * DATE, TIME, and INTERVAL values. `joined` is TIMESTAMPTZ in PostgreSQL and every Minnow
- * datetime is an instant, so it renders `2026-01-02 03:04:05+00`; a TIMESTAMP literal, a cast
- * to TIMESTAMP, MAKE_TIMESTAMP, `date + interval`, and the derived, CTE, series, set-operation,
- * subquery, and window outputs built from them render without the zone. SQLite stores the
- * fixture's datetimes as ISO text, so its casts answer a different question and it sits out.
+ * DATE, TIME, and INTERVAL values. `joined` is declared TIMESTAMPTZ on both engines, an
+ * instant, so it renders `2026-01-02 03:04:05+00`; `noted` is declared TIMESTAMP, and it, a
+ * TIMESTAMP literal, a cast to TIMESTAMP, MAKE_TIMESTAMP, `date + interval`, and the derived,
+ * CTE, series, set-operation, subquery, aggregate, and window outputs built from them render
+ * without the zone. SQLite stores the fixture's datetimes as ISO text, so its casts answer a
+ * different question and it sits out.
  */
 function datetimeTextCases(): Case[] {
   const pg = (sql: string, params?: CaseParameter[]): Case => ({
@@ -1670,6 +1699,56 @@ function datetimeTextCases(): Case[] {
     ),
     pg(
       `SELECT id, CAST(LOCALTIMESTAMP AS TEXT) LIKE '%+00' AS local_zoned, CAST(CURRENT_TIMESTAMP AS TEXT) LIKE '%+00' AS now_zoned, CAST(NOW() AS TEXT) LIKE '% %:%' AS now_spaced FROM data WHERE id = 1 ORDER BY id`,
+    ),
+    // A column declared TIMESTAMP: every rendering drops the zone, beside the TIMESTAMPTZ one.
+    pg(
+      `SELECT id, CAST(noted AS TEXT) AS t, noted::text AS u, CAST(noted AS VARCHAR(40)) AS v, CAST(noted AS CHARACTER VARYING) AS w, joined::text AS z FROM data ORDER BY id`,
+    ),
+    pg(
+      `SELECT id, 'at ' || noted AS a, noted || '!' AS b, label || ' ' || noted || ' ' || joined AS c, CONCAT(label, ' ', noted) AS d, CONCAT_WS('|', region, noted, joined, amount) AS e, FORMAT('%s / %s', noted, joined) AS f, FORMAT('%L', noted) AS g, QUOTE_LITERAL(noted) AS q FROM data ORDER BY id`,
+    ),
+    pg(
+      `SELECT id, LENGTH(noted::text) AS n, SUBSTRING(noted::text FROM 12 FOR 8) AS clock, RIGHT(noted::text, 3) AS tail, POSITION('+' IN noted::text) AS plus FROM data ORDER BY id`,
+    ),
+    pg(
+      `SELECT id, TO_JSON(noted) AS j, JSON_BUILD_OBJECT('n', noted, 'j', joined) AS o, JSON_BUILD_ARRAY(noted, joined) AS a, JSON_OBJECT('n' VALUE noted) AS s FROM data ORDER BY id`,
+    ),
+    pg(
+      `SELECT id, JSON_BUILD_OBJECT(noted, id) AS keyed FROM data WHERE noted IS NOT NULL ORDER BY id`,
+    ),
+    pg(
+      `SELECT region, JSON_AGG(noted ORDER BY id) AS notes, STRING_AGG(noted::text, ', ' ORDER BY id) AS texts, MAX(noted)::text AS latest, 'first ' || MIN(noted) AS earliest FROM data GROUP BY region ORDER BY region NULLS LAST`,
+    ),
+    pg(
+      `SELECT id FROM data WHERE CAST(noted AS TEXT) LIKE '2026-01-0%' OR noted::text = '2026-01-05 12:05:00' ORDER BY id`,
+    ),
+    pg(
+      `WITH s AS (SELECT id, noted, joined FROM data) SELECT id, noted::text AS n, joined::text AS j, TO_JSON(noted) AS doc FROM s ORDER BY id`,
+    ),
+    pg(
+      `SELECT id, CAST(n AS TEXT) AS n, n || '' AS concatenated FROM (SELECT id, noted AS n FROM data) d ORDER BY id`,
+    ),
+    pg(
+      `SELECT CAST(u AS TEXT) AS u FROM (SELECT noted AS u FROM data WHERE id <= 6 UNION ALL SELECT noted FROM data WHERE id >= 146) s ORDER BY u NULLS LAST`,
+    ),
+    pg(
+      `SELECT id, CAST((SELECT MAX(noted) FROM data) AS TEXT) AS latest, CAST(LAG(noted) OVER (ORDER BY id) AS TEXT) AS prev, 'first ' || FIRST_VALUE(noted) OVER (ORDER BY id) AS first, TO_JSON(MAX(noted) OVER ()) AS top FROM data WHERE id <= 8 ORDER BY id`,
+    ),
+    // PostgreSQL's common type of timestamp and timestamptz is timestamptz; timestamp arithmetic
+    // and truncation stay timestamps.
+    pg(
+      `SELECT id, CAST(COALESCE(noted, joined) AS TEXT) AS c, CAST(CASE WHEN active THEN noted ELSE TIMESTAMP '2000-01-01' END AS TEXT) AS k, CAST(CASE WHEN active THEN noted ELSE joined END AS TEXT) AS mixed, CAST(noted + INTERVAL '90 minutes' AS TEXT) AS later, CAST(DATE_TRUNC('hour', noted) AS TEXT) AS hour, CAST(GREATEST(noted, TIMESTAMP '2026-01-03') AS TEXT) AS g FROM data ORDER BY id`,
+    ),
+    // TO_CHAR writes no zone for a timestamp without one.
+    pg(
+      `SELECT id, TO_CHAR(noted, 'YYYY-MM-DD HH24:MI:SS TZ') AS n, TO_CHAR(joined, 'YYYY-MM-DD HH24:MI:SS TZ') AS j, TO_CHAR(TIMESTAMP '2026-01-02 03:04:05', 'HH24 TZ') AS l FROM data ORDER BY id`,
+    ),
+    // Comparisons and arithmetic read the same instants as before: UTC on both engines.
+    pg(
+      `SELECT id, noted = joined AS same, noted - TIMESTAMP '2026-01-01' AS since, noted - joined AS gap, EXTRACT(EPOCH FROM noted) AS epoch FROM data WHERE noted IS NOT NULL ORDER BY id`,
+    ),
+    pg(
+      `SELECT id FROM data WHERE noted >= TIMESTAMP '2026-01-03' AND noted < CAST('2026-01-04 00:00:00+00' AS TIMESTAMPTZ) ORDER BY id`,
     ),
     pg(
       `SELECT id, CAST(CAST(? AS TIMESTAMPTZ) AS TEXT) AS bound, CAST(CAST(? AS TIMESTAMP) AS TEXT) AS bound_local FROM data WHERE id = 1 ORDER BY id`,
@@ -2370,17 +2449,18 @@ async function pgliteOracle(fixture: readonly FixtureRow[]): Promise<Oracle> {
   // two disagree by the offset — a difference in the question, not in the answer.
   await database.exec(`SET TIME ZONE 'UTC'`);
   await database.exec(
-    `CREATE TABLE data ("id" INTEGER PRIMARY KEY, "region" TEXT, "amount" DOUBLE PRECISION, "active" BOOLEAN, "joined" TIMESTAMPTZ, "label" TEXT)`,
+    `CREATE TABLE data ("id" INTEGER PRIMARY KEY, "region" TEXT, "amount" DOUBLE PRECISION, "active" BOOLEAN, "joined" TIMESTAMPTZ, "label" TEXT, "noted" TIMESTAMP)`,
   );
   await database.exec(`CREATE TABLE dims ("region" TEXT, "label" TEXT, "rank" DOUBLE PRECISION)`);
   for (const row of fixture) {
-    await database.query(`INSERT INTO data VALUES ($1, $2, $3, $4, $5, $6)`, [
+    await database.query(`INSERT INTO data VALUES ($1, $2, $3, $4, $5, $6, $7)`, [
       row.id,
       row.region,
       row.amount,
       row.active,
       row.joined,
       row.label,
+      wallClockText(row.noted),
     ]);
   }
   for (const dim of dims) {
@@ -3187,16 +3267,17 @@ describe("SQL conformance against SQLite and PGlite", () => {
     try {
       await pg.exec(`SET TIME ZONE 'UTC'`);
       await pg.exec(
-        `CREATE TABLE data ("id" INTEGER PRIMARY KEY, "region" TEXT, "amount" DOUBLE PRECISION, "active" BOOLEAN, "joined" TIMESTAMPTZ, "label" TEXT)`,
+        `CREATE TABLE data ("id" INTEGER PRIMARY KEY, "region" TEXT, "amount" DOUBLE PRECISION, "active" BOOLEAN, "joined" TIMESTAMPTZ, "label" TEXT, "noted" TIMESTAMP)`,
       );
       for (const row of fixture) {
-        await pg.query(`INSERT INTO data VALUES ($1, $2, $3, $4, $5, $6)`, [
+        await pg.query(`INSERT INTO data VALUES ($1, $2, $3, $4, $5, $6, $7)`, [
           row.id,
           row.region,
           row.amount,
           row.active,
           row.joined,
           row.label,
+          wallClockText(row.noted),
         ]);
       }
       const positional = (result: QueryResult): string[] =>
@@ -3230,7 +3311,11 @@ describe("SQL conformance against SQLite and PGlite", () => {
         if (sqliteRows.join("\n") !== minnowRows.join("\n")) {
           failures.push(`${sql}\n${diffSummary("minnow vs sqlite", minnowRows, sqliteRows)}`);
         }
-        const pgResult = await pg.query<unknown[]>(sql, [], { rowMode: "array" });
+        // A TIMESTAMP without time zone reads as UTC, not in the zone of the machine running this.
+        const pgResult = await pg.query<unknown[]>(sql, [], {
+          rowMode: "array",
+          parsers: { 1114: (value: string) => new Date(`${value.replace(" ", "T")}Z`) },
+        });
         const pgRows = pgResult.rows.map((row) => JSON.stringify(row.map(normalize)));
         if (pgRows.join("\n") !== minnowRows.join("\n")) {
           failures.push(`${sql}\n${diffSummary("minnow vs pglite", minnowRows, pgRows)}`);
@@ -3381,6 +3466,71 @@ describe("SQL conformance against SQLite and PGlite", () => {
           failures.push(`${sql}\n${diffSummary("minnow vs pglite", minnowRows, pgRows)}`);
         }
       }
+      expect(failures).toEqual([]);
+    } finally {
+      await minnow.close();
+      await pg.close();
+    }
+  });
+
+  it("renders TIMESTAMP and TIMESTAMPTZ columns from every DDL path as PostgreSQL does", async () => {
+    // Only the catalog says a column is TIMESTAMP without time zone, so the columns CREATE
+    // TABLE, ALTER TABLE ADD COLUMN, and CREATE TABLE AS declare, and a view over them, are
+    // built here from the same DDL on both engines and PGlite judges their text.
+    const statements = [
+      "CREATE TABLE stamps (id INTEGER PRIMARY KEY, local_at TIMESTAMP, zoned_at TIMESTAMPTZ, precise TIMESTAMP(3), spelled TIMESTAMP WITHOUT TIME ZONE, zoned_spelled TIMESTAMP(3) WITH TIME ZONE)",
+      "INSERT INTO stamps VALUES (1, '2026-01-02 03:04:05.5', '2026-01-02 03:04:05.5', '2026-01-02 03:04:05.125', '1999-12-31 23:59:59', '2026-07-04 12:00:00'), (2, NULL, '2025-06-01 00:00:00', NULL, '0099-01-01 00:00:00', NULL)",
+      "ALTER TABLE stamps ADD COLUMN added TIMESTAMP",
+      "UPDATE stamps SET added = local_at + INTERVAL '1 day' WHERE id = 1",
+      "CREATE TABLE copied AS SELECT id, local_at, zoned_at, CAST(zoned_at AS TIMESTAMP) AS cast_local, COALESCE(local_at, zoned_at) AS common FROM stamps",
+      "CREATE VIEW recent AS SELECT id, local_at, zoned_at, added FROM stamps",
+    ];
+    const minnow = new MinnowDatabase(new MemoryBlockStore());
+    const { PGlite } = await import("@electric-sql/pglite");
+    const pg = await PGlite.create();
+    try {
+      await pg.exec(`SET TIME ZONE 'UTC'`);
+      for (const statement of statements) {
+        await pg.exec(statement);
+        await minnow.execute(statement);
+      }
+      const cases = [
+        `SELECT id, local_at::text AS l, zoned_at::text AS z, precise::text AS p, spelled::text AS s, zoned_spelled::text AS zs, added::text AS a FROM stamps ORDER BY id`,
+        `SELECT id, TO_JSON(local_at) AS l, TO_JSON(zoned_at) AS z, JSON_BUILD_OBJECT('a', added, 's', spelled) AS o, 'at ' || precise AS p FROM stamps ORDER BY id`,
+        `SELECT id, local_at::text AS l, zoned_at::text AS z, cast_local::text AS c, common::text AS m FROM copied ORDER BY id`,
+        `SELECT id, local_at::text AS l, 'z ' || zoned_at AS z, CONCAT(added, '') AS a FROM recent ORDER BY id`,
+        `SELECT s.id, r.local_at::text AS l, c.cast_local::text AS c FROM stamps s JOIN recent r ON r.id = s.id JOIN copied c ON c.id = s.id ORDER BY s.id`,
+      ];
+      const decoded = (value: unknown): unknown => {
+        if (typeof value === "string" && /^[[{"]/.test(value)) {
+          try {
+            return JSON.parse(value) as unknown;
+          } catch {
+            return value;
+          }
+        }
+        return value;
+      };
+      const failures: string[] = [];
+      for (const sql of cases) {
+        const result = await minnow.query(sql);
+        const minnowRows = result.rows.map((row) =>
+          JSON.stringify(result.columns.map((column) => normalize(decoded(row[column])))),
+        );
+        const pgResult = await pg.query<unknown[]>(sql, [], { rowMode: "array" });
+        const pgRows = pgResult.rows.map((row) =>
+          JSON.stringify(row.map((value) => normalize(decoded(value)))),
+        );
+        if (pgRows.join("\n") !== minnowRows.join("\n")) {
+          failures.push(`${sql}\n${diffSummary("minnow vs pglite", minnowRows, pgRows)}`);
+        }
+      }
+      // RETURNING renders the written row the same way.
+      const returning =
+        "UPDATE stamps SET added = added + INTERVAL '1 hour' WHERE id = 1 RETURNING added::text AS a, 'z ' || zoned_at AS z";
+      const minnowReturned = await minnow.execute(returning);
+      const pgReturned = await pg.query(returning);
+      expect(minnowReturned).toMatchObject({ returnedRows: pgReturned.rows });
       expect(failures).toEqual([]);
     } finally {
       await minnow.close();

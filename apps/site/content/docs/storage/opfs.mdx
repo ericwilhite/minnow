@@ -174,7 +174,7 @@ Collection keeps every retained segment’s block references intact, including r
 Upgrading prevents the previous block-before-segment cleanup bug from recurring, but does not
 automatically repair a store already affected by missing referenced blocks.
 
-Layout 12 is the current native OPFS contract. Like layouts 8 to 11, it stores layout 7's bytes.
+Layout 13 is the current native OPFS contract. Like layouts 8 to 12, it stores layout 7's bytes.
 Layout 8 admits compaction jobs whose merge plan is recomputed from its sources rather than stored
 cell by cell, which a layout-7 build cannot read. Layout 9 admits a commit too large for one WAL
 frame: its frame is written as continuation frames, a few megabytes each, completed by an
@@ -187,12 +187,14 @@ across `ALTER TABLE` — a source written before a column was added (the fold fi
 the column's default, or NULL), or an update left holding only its key after `DROP COLUMN` — and
 a delta merge, which merges a run of level-zero updates and deletes into a few segments that
 take the run's place. Layout 11 was never released: core 0.16.0 moves a layout-10 database
-straight to layout 12. **Layouts 7 to 11 upgrade automatically on open** by rewriting the format
-marker alone: a small `upgrade-11-12` witness is written and flushed first, so a crash that
-tears the marker is finished on the next open instead of refused, and the witness is removed
-once the new marker is durable. A witness an older build left behind (`upgrade-7-8`,
-`upgrade-8-9`, or `upgrade-9-10`) is finished the same way. An older build then refuses the
-database without changing it.
+straight to layout 12. Layout 13 admits a column declared `TIMESTAMP` (without time zone), whose
+SQL text has no zone; a layout-12 build (core 0.16.0) would render it as `TIMESTAMPTZ`. Columns
+an older build wrote stay `TIMESTAMPTZ`, whatever their DDL said. **Layouts 7 to 12 upgrade
+automatically on open** by rewriting the format marker alone: a small `upgrade-12-13` witness is
+written and flushed first, so a crash that tears the marker is finished on the next open instead
+of refused, and the witness is removed once the new marker is durable. A witness an older build
+left behind (`upgrade-7-8`, `upgrade-8-9`, `upgrade-9-10`, `upgrade-10-11`, or `upgrade-11-12`)
+is finished the same way. An older build then refuses the database without changing it.
 
 Layout 7 added a 48-byte acknowledgement file with two checksummed slots, alongside the
 structural `schemaEpoch` and served-request ledger. Recovery

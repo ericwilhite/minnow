@@ -145,6 +145,16 @@ export async function buildFixtureDatabase(database: MinnowDatabase): Promise<vo
     "name-renamed",
     "name-0009",
   ]);
+
+  // A column declared TIMESTAMP without time zone beside a TIMESTAMPTZ one: snapshot format 3
+  // carries the declared kind. Its questions are asked in format-compatibility.test.ts rather
+  // than in FIXTURE_QUERIES, which every older fixture must still answer.
+  await database.execute(
+    "CREATE TABLE stamped (id INTEGER PRIMARY KEY, local_at TIMESTAMP, zoned_at TIMESTAMPTZ)",
+  );
+  await database.execute(
+    "INSERT INTO stamped VALUES (1, '2026-01-02 03:04:05.5', '2026-01-02 03:04:05.5'), (2, NULL, '2025-06-01 00:00:00')",
+  );
 }
 
 /**

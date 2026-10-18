@@ -38,9 +38,10 @@ vi.setConfig({ testTimeout: heavyTestTimeout(60_000) });
 
 /**
  * The schema this build writes: schema 5 (the key-forwards record), schema 6 (fills in
- * compaction plans), and schema 7 (delta merges) followed schema 4.
+ * compaction plans), schema 7 (delta merges), and schema 8 (TIMESTAMP without time zone columns)
+ * followed schema 4.
  */
-const CURRENT_SCHEMA = 7;
+const CURRENT_SCHEMA = 8;
 const PART = "fts-delta-part";
 /** The per-part ceilings the store writes; a test that needs several parts exceeds them. */
 const PART_POSTINGS = 8_192;

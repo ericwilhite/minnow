@@ -33,7 +33,10 @@ const rows = await peopleRows.rows();
 ```
 
 The four physical storage builders are `column.boolean()`, `column.number()`, `column.string()`,
-and `column.datetime()`. The DSL also retains the SQL domain layered over that storage:
+and `column.datetime()`. `column.datetime()` is SQL `TIMESTAMPTZ`, an instant whose text ends in
+`+00`; `column.timestamp()` is the same `Date` declared `TIMESTAMP` (without time zone), whose
+text has no zone (see [column types](/docs/sql/ddl#column-types)). A migration cannot switch an
+existing column between the two. The DSL also retains the SQL domain layered over that storage:
 
 | Builder                                   | Selected type                                   | Insert / update type          |
 | ----------------------------------------- | ----------------------------------------------- | ----------------------------- |

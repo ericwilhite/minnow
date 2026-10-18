@@ -6,9 +6,19 @@ import { requireWorkerOpfs, test } from "./fixtures.js";
 
 /**
  * The OPFS layout this build writes; layout 12 admits compaction plans whose sources lack a column
- * added after them, and delta merges. Layout 11 was never released.
+ * added after them, and delta merges, and layout 13 columns declared TIMESTAMP without time zone.
+ * Layout 11 was never released.
  */
-const OPFS_LAYOUT = 12;
+const OPFS_LAYOUT = 13;
+
+/** A TIMESTAMP and a TIMESTAMPTZ column declared after the upgrade, read back after a reopen. */
+const TIMESTAMP_TEXT = [
+  {
+    local_at: "2026-01-02 03:04:05.5",
+    zoned_at: "2026-01-02 03:04:05.5+00",
+    doc: '"2026-01-02T03:04:05.5"',
+  },
+];
 
 const directory = new URL("../format-fixtures/", import.meta.url);
 for (const file of readdirSync(fileURLToPath(directory)).filter((name) =>
@@ -34,6 +44,7 @@ for (const file of readdirSync(fileURLToPath(directory)).filter((name) =>
       walOnlyPreserved: true,
       rows: [{ id: 2, value: "retained" }],
       keyForwards: true,
+      timestampText: TIMESTAMP_TEXT,
       format: OPFS_LAYOUT,
       integrity: true,
       olderReaderRefused: true,
@@ -67,11 +78,12 @@ test("automatic upgrade: OPFS written by 0.14.1 keeps its rows, index, and seque
 
 /**
  * The IndexedDB schema this build writes; schema 7 admits compaction plans whose sources lack a
- * column added after them, and delta merges. Schema 6 was never released.
+ * column added after them, and delta merges, and schema 8 columns declared TIMESTAMP without time
+ * zone. Schema 6 was never released.
  */
-const INDEXEDDB_SCHEMA = 7;
+const INDEXEDDB_SCHEMA = 8;
 
-for (const writer of ["0.10.0", "0.12.1", "0.13.1", "0.14.1", "0.15.0"] as const) {
+for (const writer of ["0.10.0", "0.12.1", "0.13.1", "0.14.1", "0.15.0", "0.16.0"] as const) {
   test(`automatic upgrade: IndexedDB written by ${writer} keeps its index deltas, writes past the old delta limit, and refuses the released reader`, async ({
     page,
   }) => {
@@ -83,7 +95,14 @@ for (const writer of ["0.10.0", "0.12.1", "0.13.1", "0.14.1", "0.15.0"] as const
       return module.runIndexedDbUpgrade(version);
     }, writer);
     expect(result).toEqual({
-      releasedSchema: { "0.10.0": 2, "0.12.1": 2, "0.13.1": 3, "0.14.1": 4, "0.15.0": 5 }[writer],
+      releasedSchema: {
+        "0.10.0": 2,
+        "0.12.1": 2,
+        "0.13.1": 3,
+        "0.14.1": 4,
+        "0.15.0": 5,
+        "0.16.0": 7,
+      }[writer],
       schema: INDEXEDDB_SCHEMA,
       answersPreserved: true,
       newRow: [{ id: 70_000 }],
@@ -99,6 +118,7 @@ for (const writer of ["0.10.0", "0.12.1", "0.13.1", "0.14.1", "0.15.0"] as const
         states: ["ready"],
         matches: [[{ n: 2_000 }], [{ n: 1 }], [{ n: 1 }], [{ n: 1 }]],
       },
+      timestampText: TIMESTAMP_TEXT,
       integrity: true,
       olderReadersRefused: true,
       finalSchema: INDEXEDDB_SCHEMA,

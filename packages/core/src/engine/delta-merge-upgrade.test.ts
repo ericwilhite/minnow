@@ -4,7 +4,8 @@
  * and the level-zero segments it publishes under the order of the run they replace are records
  * an older reader refuses as corruption, so IndexedDB schema 7 and OPFS layout 12 bar it; the
  * upgrade moves only the version marker. (Schema 6 and layout 11 were never released: 0.16.0
- * writes 7 and 12.) These tests take the real 0.15.0 writer's databases through the ordinary
+ * writes 7 and 12. This build writes 8 and 13, which add TIMESTAMP without time zone columns;
+ * see timestamp-kind-upgrade.test.ts.) These tests take the real 0.15.0 writer's databases through the ordinary
  * open API: the history reads the same, the deltas it left merge, writes resume, the database
  * reopens, and the released reader is refused afterwards without a change. They also cut the
  * IndexedDB upgrade mid-way and retry, race current and released openers, and refuse a damaged
@@ -32,9 +33,9 @@ import { heavyTestTimeout } from "./storage-test-helpers.js";
 vi.setConfig({ testTimeout: heavyTestTimeout(120_000) });
 
 /** What this build writes, and what the 0.15.0 writer wrote. */
-const CURRENT_SCHEMA = 7;
+const CURRENT_SCHEMA = 8;
 const RELEASED_SCHEMA = 5;
-const CURRENT_LAYOUT = 12;
+const CURRENT_LAYOUT = 13;
 const RELEASED_LAYOUT = 10;
 const NAME = "delta-merge-upgrade";
 const OPTIONS = { autoCompact: false, autoCollect: false } as const;
@@ -142,7 +143,7 @@ async function releasedIndexedDb(indexedDB: IDBFactory, name: string): Promise<u
   return rows;
 }
 
-describe("IndexedDB: the 0.15.0 writer's deltas after the schema 7 upgrade", () => {
+describe("IndexedDB: the 0.15.0 writer's deltas after the schema upgrade", () => {
   it("merges them, writes on, reopens, and refuses the released reader", async () => {
     const indexedDB = new IDBFactory();
     const name = crypto.randomUUID();
@@ -235,7 +236,7 @@ describe("IndexedDB: the 0.15.0 writer's deltas after the schema 7 upgrade", () 
     ]);
     expect(first.status).toBe("fulfilled");
     expect(second.status).toBe("fulfilled");
-    // A released opener that arrives behind the upgrade is refused, never served schema 7.
+    // A released opener that arrives behind the upgrade is refused, never served the new schema.
     expect(late).toMatchObject({
       status: "rejected",
       reason: { name: "StorageFormatVersionError", actualVersion: CURRENT_SCHEMA },
@@ -306,7 +307,7 @@ async function rawPut(
   }
 }
 
-describe("OPFS: the 0.15.0 writer's deltas after the layout 12 upgrade", () => {
+describe("OPFS: the 0.15.0 writer's deltas after the layout upgrade", () => {
   const marker = (shim: MemoryOpfs) =>
     new TextDecoder().decode(shim.readFileBytes(`minnowdb/${NAME}/format.json`));
 

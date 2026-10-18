@@ -33,7 +33,7 @@ await db.execute(`CREATE TABLE customers (
   customer_id INTEGER PRIMARY KEY,
   name VARCHAR(80) NOT NULL,
   city VARCHAR(80),
-  signed_up_on TIMESTAMP NOT NULL
+  signed_up_on TIMESTAMPTZ NOT NULL
 )`);
 
 await db.execute(`CREATE TABLE orders (
@@ -41,7 +41,7 @@ await db.execute(`CREATE TABLE orders (
   customer_id INTEGER NOT NULL,
   status VARCHAR(20) NOT NULL,
   total DOUBLE PRECISION NOT NULL,
-  placed_at TIMESTAMP NOT NULL
+  placed_at TIMESTAMPTZ NOT NULL
 )`);
 ```
 
@@ -93,7 +93,7 @@ const { rows, columns, columnDomains } = await db.query(
 );
 ```
 
-`rows` are plain objects — numbers are numbers, `TIMESTAMP` columns come back as `Date`. `columns`
+`rows` are plain objects — numbers are numbers, `TIMESTAMPTZ` and `TIMESTAMP` columns come back as `Date`. `columns`
 carries the result names; positionally aligned `columnDomains` carries logical types such as
 JSON/JSONB, UUID, exact numeric, and DATE. A grid can render headers without inspecting values,
 and a generic consumer can parse JSON text without knowing the query in advance.

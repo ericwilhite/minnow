@@ -244,6 +244,14 @@ export interface TableColumnRecord {
   integer?: true;
   /** SQL-level semantics for a value physically encoded in this column's primitive type. */
   sqlDomain?: SqlDomain;
+  /**
+   * Datetime columns only: declared `TIMESTAMP` (without time zone), so SQL text renders the
+   * value without the `+00` a `timestamp with time zone` carries. Absent means `TIMESTAMPTZ`,
+   * which is what every datetime column written before IndexedDB schema 8 and OPFS layout 13
+   * is. The stored value is the same UTC instant either way; comparisons and arithmetic do not
+   * change.
+   */
+  withoutTimeZone?: true;
   nullable: boolean;
   /** Fills omitted or SQL `DEFAULT` slots at insert time; explicit NULL is never replaced. */
   defaultValue?: ColumnDefault;
@@ -334,6 +342,10 @@ export function validateTableColumns(columns: readonly TableColumnRecord[]): voi
     const integer: unknown = column.integer;
     if (integer !== undefined && (integer !== true || column.type !== "number")) {
       throw new TypeError(`Integer domain requires a number column: ${column.name}`);
+    }
+    const withoutTimeZone: unknown = column.withoutTimeZone;
+    if (withoutTimeZone !== undefined && (withoutTimeZone !== true || column.type !== "datetime")) {
+      throw new TypeError(`TIMESTAMP without time zone requires a datetime column: ${column.name}`);
     }
     if (column.sqlDomain !== undefined && column.type !== "string") {
       throw new TypeError(`SQL domain columns must use string storage: ${column.name}`);
@@ -2768,8 +2780,11 @@ export function assertSnapshotImportAcceleratorUsage(bytes: number, entries: num
  * below contain counts and byte totals only, never record descriptors, keys, or postings.
  */
 export interface SnapshotFrameStreamHeader {
-  /** 2 when the snapshot holds the internal key-forwards catalog record; otherwise 1. */
-  readonly formatVersion: 1 | 2;
+  /**
+   * 3 when a table has a column declared TIMESTAMP without time zone, 2 when the snapshot holds
+   * the internal key-forwards catalog record, and 1 otherwise.
+   */
+  readonly formatVersion: 1 | 2 | 3;
   readonly databaseVersion: number;
   readonly createdAt: string;
   readonly kinds: Readonly<Record<SnapshotFrameKind, SnapshotKindSummary>>;

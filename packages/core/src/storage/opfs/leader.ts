@@ -125,10 +125,7 @@ import {
   snapshotFrameEnvelopeParts,
   snapshotFrameStreamHeaderIdentity,
 } from "../snapshot-stream.js";
-import {
-  snapshotMetadataItemFormatVersion,
-  type SnapshotFormatVersion,
-} from "../snapshot-format.js";
+import { withSnapshotMetadataItem, type SnapshotFormatVersion } from "../snapshot-format.js";
 import {
   RecordCore,
   type RecordCoreState,
@@ -4859,7 +4856,7 @@ export class OpfsLeader {
       let formatVersion: SnapshotFormatVersion = 1;
       try {
         for (const item of this.#core.snapshotFrameMetadataItems()) {
-          if (snapshotMetadataItemFormatVersion(item) === 2) formatVersion = 2;
+          formatVersion = withSnapshotMetadataItem(formatVersion, item);
           sequence = appendSnapshotMetadataItems(
             ledger,
             snapshotMetadataFrameKind(item),

@@ -1498,6 +1498,8 @@ export type CompiledStatement =
         type: SqlColumnType;
         integer?: true;
         sqlDomain?: SqlDomain;
+        /** A datetime declared TIMESTAMP (without time zone); absent for TIMESTAMPTZ. */
+        withoutTimeZone?: true;
         nullable?: boolean;
         defaultValue?: ColumnDefault;
         generatedValue?: ColumnGenerated;
@@ -1599,6 +1601,8 @@ export type CompiledStatement =
         type: SqlColumnType;
         integer?: true;
         sqlDomain?: SqlDomain;
+        /** A datetime declared TIMESTAMP (without time zone); absent for TIMESTAMPTZ. */
+        withoutTimeZone?: true;
         nullable?: boolean;
         defaultValue?: ColumnDefault;
         generatedValue?: ColumnGenerated;
@@ -2934,6 +2938,11 @@ export interface SqlColumnSchema {
   integer?: true;
   /** Logical SQL domain when the stable physical representation alone is not semantic. */
   sqlDomain?: SqlDomain;
+  /**
+   * A datetime that is PostgreSQL's `timestamp` without time zone — a TIMESTAMP column, literal,
+   * or cast — rather than an instant (`timestamptz`). Only its text differs.
+   */
+  withoutTimeZone?: true;
 }
 
 /**
@@ -2960,6 +2969,7 @@ export function inferBlockSchema(
         ...(column.unknown === true ? { unknown: true as const } : {}),
         ...(column.integer === true ? { integer: true } : {}),
         ...(column.sqlDomain === undefined ? {} : { sqlDomain: column.sqlDomain }),
+        ...(column.withoutTimeZone === true ? { withoutTimeZone: true as const } : {}),
       }));
   if (
     plan.select[0]?.expression.kind === "wildcard" &&
@@ -2983,36 +2993,30 @@ export function inferBlockSchema(
     if (matches.length !== 1) throw new TypeError(`Ambiguous or missing column: ${reference}`);
     return matches[0] ?? "string";
   };
-  const resolveColumnInteger = (reference: string): boolean => {
-    const parts = reference.split(".");
-    if (parts.length === 2) {
-      const source = sources.find(({ alias }) => alias === parts[0]);
-      return (
-        source !== undefined &&
-        (schemas.get(source.table) ?? []).find(({ name }) => name === parts[1])?.integer === true
-      );
-    }
-    const matches = sources.flatMap((source) =>
-      (schemas.get(source.table) ?? []).filter(({ name }) => name === parts[0]),
-    );
-    return matches.length === 1 && matches[0]?.integer === true;
-  };
-  const resolveColumnDomain = (reference: string): SqlDomain | undefined => {
+  /** The one source column a reference names, qualified or not; undefined when not exactly one. */
+  const resolveColumnSchema = (reference: string): SqlColumnSchema | undefined => {
     const parts = reference.split(".");
     if (parts.length === 2) {
       const source = sources.find(({ alias }) => alias === parts[0]);
       return source === undefined
         ? undefined
-        : (schemas.get(source.table) ?? []).find(({ name }) => name === parts[1])?.sqlDomain;
+        : (schemas.get(source.table) ?? []).find(({ name }) => name === parts[1]);
     }
     const matches = sources.flatMap((source) =>
       (schemas.get(source.table) ?? []).filter(({ name }) => name === parts[0]),
     );
-    return matches.length === 1 ? matches[0]?.sqlDomain : undefined;
+    return matches.length === 1 ? matches[0] : undefined;
   };
-  // `date - date` is an integer; a DATE column itself is not.
+  const resolveColumnInteger = (reference: string): boolean =>
+    resolveColumnSchema(reference)?.integer === true;
+  const resolveColumnDomain = (reference: string): SqlDomain | undefined =>
+    resolveColumnSchema(reference)?.sqlDomain;
+  // `date - date` is an integer; a DATE column itself is not. A TIMESTAMP column is a timestamp
+  // without time zone, whose text carries no `+00`.
   const resolveColumnDatetime = (reference: string): DatetimeTypeKind | undefined => {
-    const domain = resolveColumnDomain(reference)?.kind;
+    const column = resolveColumnSchema(reference);
+    if (column?.withoutTimeZone === true) return "local";
+    const domain = column?.sqlDomain?.kind;
     return domain === "date" || domain === "interval" ? domain : undefined;
   };
   const castDomain = (target: string): SqlDomain | undefined => {
@@ -3106,6 +3110,9 @@ export function inferBlockSchema(
             ? expression.arguments[0].arguments[0]
             : undefined;
       if (argument?.kind === "call" && argument.name === "MINNOW_ARRAY_ELEMENT")
+        argument = argument.arguments[0];
+      // A timestamp without time zone is still a TIMESTAMP element; only its text is marked.
+      if (argument?.kind === "call" && argument.name === "MINNOW_TIMESTAMP_TEXT")
         argument = argument.arguments[0];
       const type = argument === undefined ? "string" : infer(argument);
       return {
@@ -3486,12 +3493,15 @@ export function inferBlockSchema(
       undefined,
       resolveColumnDatetime,
     );
+    const withoutTimeZone =
+      type === "datetime" && datetimeTypeKind(item.expression, resolveColumnDatetime) === "local";
     return [
       {
         name: item.alias,
         type,
         ...(integer ? { integer: true } : {}),
         ...(sqlDomain === undefined ? {} : { sqlDomain }),
+        ...(withoutTimeZone ? { withoutTimeZone: true as const } : {}),
       },
     ];
   });
@@ -4697,6 +4707,8 @@ export interface DatetimeColumns {
 const NO_DATETIME_COLUMNS: DatetimeColumns = { get: () => undefined };
 /** The bind-time probe's assumption: any column might be a DATE. */
 const EVERY_COLUMN_DATE: DatetimeColumns = { get: () => "date" };
+/** The bind-time probe's other assumption: any column might be a TIMESTAMP column. */
+const EVERY_COLUMN_LOCAL: DatetimeColumns = { get: () => "local" };
 
 /** The value functions whose result has their argument's type. */
 const datetimeValueFunctions: ReadonlySet<string> = new Set([
@@ -5029,9 +5041,12 @@ function timestampTextStyle(
       return index > 0 ? "text" : undefined;
     case "QUOTE_LITERAL":
       return index === 0 ? "text" : undefined;
+    // MINNOW_ARRAY_ELEMENT is ARRAY_AGG's element, held in the array's JSON text as ARRAY's
+    // members are.
     case "TO_JSON":
     case "JSON_ARRAY":
     case "ARRAY":
+    case "MINNOW_ARRAY_ELEMENT":
       return "json";
     case "JSON_ARRAYAGG":
       return index === 0 ? "json" : undefined;
@@ -5076,6 +5091,10 @@ function timestampTextSite(
     };
   }
   if (node.kind !== "call") return node;
+  // TO_CHAR writes a timestamp without time zone's TZ field as nothing.
+  if (node.name === "TO_CHAR" && node.arguments[0] !== undefined && local(node.arguments[0])) {
+    return { ...node, name: "MINNOW_TO_CHAR_LOCAL" };
+  }
   let wrapped: Expression[] | undefined;
   node.arguments.forEach((argument, index) => {
     const style = timestampTextStyle(node, index);
@@ -5138,13 +5157,15 @@ export function annotatePlanTimestampText(
 /**
  * Whether catalog binding could still mark timestamp text in this plan: an unmarked rendering
  * whose operand would be a timestamp without time zone if its columns were DATEs (`day +
- * INTERVAL '1 day'`) or were a view's timestamp-without-time-zone outputs. Plans without one —
- * nearly all — need no clone at bind time.
+ * INTERVAL '1 day'`), or were TIMESTAMP columns or a view's timestamp-without-time-zone outputs
+ * — in this block or inside a scalar subquery it renders (`(SELECT MAX(at) FROM t)::text`).
+ * Plans without one need no clone at bind time.
  */
 export function planMayHaveTimestampText(plan: CompiledQuery): boolean {
   const optimisticDate = (): DatetimeTypeKind => "date";
   const everyColumnDate = (): DatetimeColumns => EVERY_COLUMN_DATE;
   const optimisticLocal = (): DatetimeTypeKind => "local";
+  const everyColumnLocal = (): DatetimeColumns => EVERY_COLUMN_LOCAL;
   const state = { found: false };
   const probe = (expression: Expression): void => {
     if (state.found) return;
@@ -5154,7 +5175,8 @@ export function planMayHaveTimestampText(plan: CompiledQuery): boolean {
     }
     if (
       timestampTextSite(expression, optimisticDate, everyColumnDate) !== expression ||
-      timestampTextSite(expression, optimisticLocal, everyColumnDate) !== expression
+      timestampTextSite(expression, optimisticLocal, everyColumnDate) !== expression ||
+      timestampTextSite(expression, optimisticLocal, everyColumnLocal) !== expression
     ) {
       state.found = true;
       return;
@@ -8809,7 +8831,7 @@ class Parser {
       .slice(start, this.#index)
       .map((token) => token.text.toUpperCase())
       .join(" ");
-    const local = !words.startsWith("TIMESTAMPTZ") && !words.startsWith("TIMESTAMP WITH");
+    const local = !words.startsWith("TIMESTAMPTZ") && !words.endsWith(" WITH TIME ZONE");
     return local ? { kind: "literal", value, timestamp: true } : { kind: "literal", value };
   }
 
@@ -8838,20 +8860,37 @@ class Parser {
     }
     const mapped = createTableTypeNames.get(word);
     if (mapped === undefined) throw new TypeError(`Unsupported CAST target: ${word}`);
-    this.#multiWordTypeTail(word);
+    const multiWord = this.#multiWordTypeTail(word);
     if (this.#punctuation("(")) {
       this.#typeWidth();
       if (this.#punctuation(",")) this.#typeWidth();
       this.#expectPunctuation(")");
+      // PostgreSQL writes a timestamp's precision before its zone: `TIMESTAMP(3) WITH TIME ZONE`.
+      if (!multiWord && word === "TIMESTAMP") this.#multiWordTypeTail(word);
     }
     return integerTypeNames.has(word) ? "number-integer" : mapped;
   }
 
   /**
+   * `TIMESTAMP`'s `WITH TIME ZONE` or `WITHOUT TIME ZONE` tail: which one was written, consumed,
+   * or undefined when the next words are not one.
+   */
+  #timestampZoneTail(word: string): "with" | "without" | undefined {
+    if (word !== "TIMESTAMP" || !(this.#isKeyword("WITH") || this.#isKeyword("WITHOUT"))) {
+      return undefined;
+    }
+    const zone = this.#isKeyword("WITH") ? "with" : "without";
+    this.#keyword(zone === "with" ? "WITH" : "WITHOUT");
+    this.#keyword("TIME");
+    this.#keyword("ZONE");
+    return zone;
+  }
+
+  /**
    * The words PostgreSQL's multi-word type names carry after their first word: `CHARACTER
    * VARYING`, `TIMESTAMP WITH TIME ZONE`, `TIMESTAMP WITHOUT TIME ZONE`, `TIME WITH TIME ZONE`.
-   * Each maps onto the same storage as its one-word spelling, so the tail is consumed and
-   * nothing else changes. Returns whether a tail was present.
+   * Each maps onto the same storage as its one-word spelling, so the tail is consumed; a CAST
+   * reads a timestamp's zone from the words it spans. Returns whether a tail was present.
    */
   #multiWordTypeTail(word: string): boolean {
     if (word === "CHARACTER" && this.#isKeyword("VARYING")) {
@@ -8870,7 +8909,13 @@ class Parser {
     return false;
   }
 
-  #columnType(): { type: SqlColumnType; integer?: true; sqlDomain?: SqlDomain; serial?: true } {
+  #columnType(): {
+    type: SqlColumnType;
+    integer?: true;
+    sqlDomain?: SqlDomain;
+    withoutTimeZone?: true;
+    serial?: true;
+  } {
     const declared = this.#identifier();
     const word = declared.toUpperCase();
     if (word === "SERIAL" || word === "BIGSERIAL" || word === "SMALLSERIAL") {
@@ -8908,18 +8953,32 @@ class Parser {
       return { type: "string", sqlDomain: { kind: "enum", name: declared, values: [] } };
     }
     // `TIME WITH TIME ZONE` stays the TIME domain: the zone tail is parsed with the type name.
-    const multiWord = this.#multiWordTypeTail(word);
-    // Character widths document intent and do not truncate values.
+    let zone = this.#timestampZoneTail(word);
+    let multiWord = zone !== undefined || this.#multiWordTypeTail(word);
+    // Character widths document intent and do not truncate values; neither does a timestamp's
+    // precision, since every datetime keeps its milliseconds.
     if (this.#punctuation("(")) {
       this.#typeWidth();
       if (this.#punctuation(",")) {
         throw new TypeError(`${word} takes one width`);
       }
       this.#expectPunctuation(")");
+      // PostgreSQL writes a timestamp's precision before its zone: `TIMESTAMP(3) WITH TIME ZONE`.
+      if (!multiWord) {
+        zone = this.#timestampZoneTail(word);
+        multiWord = zone !== undefined;
+      }
     }
     if (!multiWord && this.#punctuation("[")) {
       this.#expectPunctuation("]");
       return { type: "string", sqlDomain: { kind: "array", element: word } };
+    }
+    if (mapped === "datetime") {
+      // TIMESTAMP and TIMESTAMP WITHOUT TIME ZONE are PostgreSQL's `timestamp`, whose text has no
+      // zone; DATETIME reads the same way, as it does in a CAST. TIMESTAMPTZ and TIMESTAMP WITH
+      // TIME ZONE are instants. Both kinds store the same UTC instant.
+      const zoned = word === "TIMESTAMPTZ" || zone === "with";
+      return zoned ? { type: mapped } : { type: mapped, withoutTimeZone: true };
     }
     return { type: mapped, ...(integerTypeNames.has(word) ? { integer: true } : {}) };
   }
@@ -11731,7 +11790,8 @@ class Parser {
         name === "MINNOW_JSON_GET" ||
         name === "MINNOW_JSON_GET_TEXT" ||
         name === "MINNOW_REGEX_MATCH" ||
-        name === "MINNOW_TIMESTAMP_TEXT"
+        name === "MINNOW_TIMESTAMP_TEXT" ||
+        name === "MINNOW_TO_CHAR_LOCAL"
       ) {
         throw new TypeError(`Unsupported function: ${identifier}`);
       }
@@ -14279,6 +14339,15 @@ function desugarWindows(
     }
     if (!containsWindow(expression)) {
       return { kind: "column", reference: hide(expression) };
+    }
+    if (expression.kind === "call" && expression.name === "CAST") {
+      // The target type stays a literal beside the window: catalog binding recognizes a text
+      // rendering by it, which is how `CAST(LAG(at) OVER (…) AS TEXT)` learns that `at` is a
+      // TIMESTAMP column and drops the `+00`.
+      const [operand, target] = expression.arguments;
+      if (operand !== undefined && target?.kind === "literal") {
+        return { ...expression, arguments: [split(operand), target] };
+      }
     }
     return mapChildExpressions(expression, split);
   };

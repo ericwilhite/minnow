@@ -28,7 +28,7 @@ const { rows, columns } = await db.query(`
 ```
 
 `rows` is an array of plain objects in result order. Values arrive as their JavaScript
-equivalents: numbers as `number`, `TIMESTAMP` as `Date`, `BOOLEAN` as `boolean`, and SQL `NULL`
+equivalents: numbers as `number`, `TIMESTAMPTZ` and `TIMESTAMP` as `Date`, `BOOLEAN` as `boolean`, and SQL `NULL`
 as `null`. Exact decimals, JSON/JSONB, UUIDs, arrays, `DATE`, `TIME`, intervals, and enums arrive
 as strings so no precision or domain value is lost. `columns` lists the result names, and the
 positionally aligned `columnDomains` identifies logical domains such as JSON, UUID, and DATE —

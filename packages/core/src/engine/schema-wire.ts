@@ -26,6 +26,8 @@ export interface WireColumn {
   readonly isUnique: boolean;
   readonly integer?: true;
   readonly sqlDomain?: SqlDomain;
+  /** `column.timestamp()`; absent, as in a frame written before it, for `column.datetime()`. */
+  readonly withoutTimeZone?: true;
   readonly defaultSpec?: ColumnDefault;
   readonly generatedSpec?: ColumnGenerated;
   readonly renamedFromName?: string;
@@ -111,6 +113,7 @@ function serializeColumn(
     ...(definition.sqlDomain === undefined
       ? {}
       : { sqlDomain: structuredClone(definition.sqlDomain) }),
+    ...(definition.withoutTimeZone === true ? { withoutTimeZone: true } : {}),
     ...(definition.defaultSpec === undefined ? {} : { defaultSpec: { ...definition.defaultSpec } }),
     ...(definition.generatedSpec === undefined
       ? {}
@@ -210,6 +213,7 @@ function deserializeColumn(wire: WireColumn): AnyColumn {
     isUnique: wire.isUnique,
     integer: wire.integer === true,
     ...(wire.sqlDomain === undefined ? {} : { sqlDomain: structuredClone(wire.sqlDomain) }),
+    ...(wire.withoutTimeZone === true ? { withoutTimeZone: true } : {}),
     ...(wire.defaultSpec === undefined ? {} : { defaultSpec: wire.defaultSpec }),
     ...(wire.generatedSpec === undefined ? {} : { generatedSpec: wire.generatedSpec }),
     ...(wire.renamedFromName === undefined ? {} : { renamedFromName: wire.renamedFromName }),

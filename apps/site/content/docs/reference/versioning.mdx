@@ -81,8 +81,15 @@ Snapshot format 2 uses format 1's file framing and frames unchanged. It is writt
 database holds the engine's internal key-forwards table, which records where each row whose
 primary key changed now lives. A snapshot without that table is still format 1, byte for byte, so
 older builds can import it. Core 0.14.1 and older refuse a format-2 snapshot, because they would
-restore the forwards table as an ordinary one and lose the forwards. The current build imports
-both formats, and refuses a format-1 snapshot that holds a key-forwards table.
+restore the forwards table as an ordinary one and lose the forwards.
+
+Snapshot format 3 also uses format 1's framing unchanged. It is written only when a table has a
+column declared `TIMESTAMP` (without time zone). Core 0.16.0 and older refuse a format-3
+snapshot, because they would refuse that column as corrupt or restore it as `TIMESTAMPTZ`. A
+snapshot without such a column is still format 1 or 2. The current build imports all three
+formats, and refuses a snapshot whose format is too old for a record it holds: a format-1
+snapshot with a key-forwards table, or a format-1 or format-2 snapshot with a `TIMESTAMP`
+column.
 
 IndexedDB schema 1 was its first locked native layout; schema 2 (core 0.10.0) moved each
 transaction's artifact journal into chunked records and migrates a schema-1 database in place on
@@ -98,15 +105,18 @@ was added, whose rows the fold fills with the column's default, or an update lef
 its key after `DROP COLUMN` — and delta merges, compaction jobs that merge a run of level-zero
 updates and deletes into a few segments that take the run's place. A schema-5 build (core
 0.15.0) refuses either job as corruption, so that build refuses the database. Schema 6 was
-never released: core 0.16.0 moves a schema-5 database straight to schema 7. No pre-contract
+never released: core 0.16.0 moves a schema-5 database straight to schema 7. Schema 8 rewrites
+nothing either: a column's catalog record may say it was declared `TIMESTAMP` (without time
+zone), which a schema-7 build (core 0.16.0) refuses as corruption, so that build refuses the
+database. Columns written before schema 8 stay `TIMESTAMPTZ`. No pre-contract
 schema readers or recreation policy ship. Every future integer schema
 version must add one ordered migration to the explicit registry and a frozen fixture for the
 version it supersedes. The browser runs the complete chain
 inside one `versionchange` transaction, so either every schema and data step commits or the old
 database remains intact. An older application build refuses a newer database without mutation.
 
-OPFS native layout 12 (core 0.16.0) is the current contract. Like layouts 8 (core 0.13.0),
-9 (core 0.14.0), and 10 (core 0.15.0), it keeps layout 7's bytes — the checkpoint, WAL, and
+OPFS native layout 13 is the current contract. Like layouts 8 (core 0.13.0), 9 (core 0.14.0),
+10 (core 0.15.0), and 12 (core 0.16.0), it keeps layout 7's bytes — the checkpoint, WAL, and
 extents still carry encoding version 7. Layout 8 admits compaction jobs with replayed merge plans, which a layout-7
 build cannot read. Layout 9 admits a WAL entry whose payload spans several frames, for a commit
 too large for one, and checkpointed index changes of any size, which a layout-8 build cannot
@@ -114,16 +124,19 @@ read. Layout 10 admits the engine's internal key-forwards table, which a layout-
 0.14.1 and older) would read as an ordinary table. Layout 12 admits compaction jobs that fold a
 table across `ALTER TABLE ADD` or `DROP COLUMN`, and delta merges; a layout-10 build refuses
 either as corruption. Layout 11 was never released: core 0.16.0 moves a layout-10 database
-straight to layout 12. The format marker is the barrier, and upgrading a layout-7 to 11 database rewrites only that marker. Layout 7's fixture freezes the format
+straight to layout 12. Layout 13 admits a column declared `TIMESTAMP` (without time zone), which
+a layout-12 build (core 0.16.0) would render as `TIMESTAMPTZ`. The format marker is the barrier,
+and upgrading a layout-7 to 12 database rewrites only that marker. Layout 7's fixture freezes the format
 marker, checkpoint, WAL tail, extent payloads, and a separate checksummed acknowledgement file. That file records
 which WAL boundary completed a strict flush, so recovery can distinguish an unwritten suffix
 from damage to an acknowledged write. Missing or corrupt acknowledgement bytes stop recovery.
 
 **Supported upgrades are automatic, including during 0.x.** Opening a layout-6 database with
 the current build validates its native data and converts it under exclusive ownership; a layout-7
-to 11 database only has its marker rewritten. All of them end at layout 12. An IndexedDB database
-at schema 1 to 6 is also upgraded to schema 7 when it is opened; only the step from schema 1
-rewrites records. No export/import or separate migration call is needed. Block
+to 12 database only has its marker rewritten. All of them end at layout 13. An IndexedDB database
+at schema 1 to 7 is also upgraded to schema 8 when it is opened; only the step from schema 1
+rewrites records. Every datetime column an older build wrote stays `TIMESTAMPTZ` after the
+upgrade, whatever its DDL said. No export/import or separate migration call is needed. Block
 format 2 is unchanged. Frozen older
 immutable posting envelopes remain readable. Older application builds refuse the upgraded
 database.

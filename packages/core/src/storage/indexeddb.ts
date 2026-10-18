@@ -233,12 +233,9 @@ import {
   snapshotFrameEnvelopeParts,
   snapshotFrameStreamHeaderIdentity,
 } from "./snapshot-stream.js";
-import {
-  snapshotMetadataItemFormatVersion,
-  type SnapshotFormatVersion,
-} from "./snapshot-format.js";
+import { withSnapshotMetadataItem, type SnapshotFormatVersion } from "./snapshot-format.js";
 
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 const FIRST_STABLE_SCHEMA_VERSION = 1;
 const CURRENT_MANIFEST_KEY = "manifest/current";
 const MANIFEST_PRUNE_CLEANUP_KEY = "manifest/prune-cleanup";
@@ -567,6 +564,14 @@ const indexedDbSchemaMigrations: readonly IndexedDbSchemaMigration[] = [
     // schema-6 reader refuses such a job as corruption; nothing stored changes shape, and the
     // version is the barrier that keeps that reader out.
     targetVersion: 7,
+    migrate: () => undefined,
+  },
+  {
+    // Schema 8 admits a column declared TIMESTAMP without time zone (`withoutTimeZone: true`).
+    // A schema-7 reader refuses that field as corruption, and a reader that ignored it would
+    // render the column's text as `timestamp with time zone`; nothing stored changes shape, and
+    // the version is the barrier that keeps that reader out.
+    targetVersion: 8,
     migrate: () => undefined,
   },
 ];
@@ -12760,7 +12765,7 @@ async function writeSnapshotMetadataFramesInTransaction(input: {
     { frameCount: number; itemCount: number; storedBytes: number }
   >;
   frameCount: number;
-  /** 2 when a key-forwards catalog record was written; otherwise 1. */
+  /** The lowest format the written catalog records need; see `SnapshotFormatVersion`. */
   formatVersion: SnapshotFormatVersion;
 }> {
   const catalog = input.transaction.objectStore("catalog");
@@ -12819,7 +12824,7 @@ async function writeSnapshotMetadataFramesInTransaction(input: {
         left.columnId.localeCompare(right.columnId),
       ),
     } satisfies SnapshotCatalogItem;
-    if (snapshotMetadataItemFormatVersion(item) === 2) formatVersion = 2;
+    formatVersion = withSnapshotMetadataItem(formatVersion, item);
     writeItem("catalog-page", item);
   });
   await visitObjectStoreSequentially(input.transaction.objectStore("segments"), async (value) => {
@@ -13772,6 +13777,7 @@ function asTableRecord(value: unknown, location = "catalog/table"): TableRecord 
           "type",
           "integer",
           "sqlDomain",
+          "withoutTimeZone",
           "nullable",
           "defaultValue",
           "backfill",
@@ -13824,6 +13830,7 @@ function asTableRecord(value: unknown, location = "catalog/table"): TableRecord 
       !["boolean", "number", "string", "datetime"].includes(String(column.type)) ||
       typeof column.nullable !== "boolean" ||
       (column.integer !== undefined && column.integer !== true) ||
+      (column.withoutTimeZone !== undefined && column.withoutTimeZone !== true) ||
       (column.hidden !== undefined && column.hidden !== true) ||
       (column.enumValues !== undefined && !isStringArray(column.enumValues))
     ) {
