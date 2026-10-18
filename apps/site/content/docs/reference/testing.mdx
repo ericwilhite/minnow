@@ -65,7 +65,8 @@ artifacts. A test that passes only on retry still fails the gate.
 `.github/workflows/sql-conformance.yml` runs the full SQL profile and long simulator
 nightly and on demand. Both it and the release workflow also run
 `test:browser:conformance`: the entire core browser suite, including the full pinned SQL corpus
-and longer multi-tab plans over native IndexedDB and OPFS. WebKit runs on macOS so worker OPFS is available; a missing worker OPFS API
+and longer multi-tab plans over native IndexedDB and OPFS, split into Playwright shards (two each for
+Chromium and Firefox, three for WebKit) that must all pass. WebKit runs on macOS so worker OPFS is available; a missing worker OPFS API
 fails this profile instead of skipping its tests. Publishing requires the exact commit's successful
 CI, SQL, simulator, and browser conformance gates. Retry a failed release through GitHub's rerun
 control; there is no manual trigger that can bypass CI. `.github/workflows/performance.yml` runs the performance gate

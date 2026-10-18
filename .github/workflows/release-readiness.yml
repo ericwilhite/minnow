@@ -28,20 +28,42 @@ jobs:
       - run: npm run test:simulator:full
 
   browser-conformance:
-    name: Full browser conformance (${{ matrix.browser }})
+    name: Full browser conformance (${{ matrix.browser }} ${{ matrix.shard }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
+        # Playwright shards split each engine's conformance suite by test; every shard must pass
+        # (a flaky test still fails its shard). WebKit, on macOS's single worker, ran 32-36 min
+        # whole.
         include:
           - browser: chromium
+            shard: 1/2
+            os: ubuntu-latest
+            cache_path: ~/.cache/ms-playwright
+          - browser: chromium
+            shard: 2/2
             os: ubuntu-latest
             cache_path: ~/.cache/ms-playwright
           - browser: firefox
+            shard: 1/2
+            os: ubuntu-latest
+            cache_path: ~/.cache/ms-playwright
+          - browser: firefox
+            shard: 2/2
             os: ubuntu-latest
             cache_path: ~/.cache/ms-playwright
           - browser: webkit
+            shard: 1/3
+            os: macos-latest
+            cache_path: ~/Library/Caches/ms-playwright
+          - browser: webkit
+            shard: 2/3
+            os: macos-latest
+            cache_path: ~/Library/Caches/ms-playwright
+          - browser: webkit
+            shard: 3/3
             os: macos-latest
             cache_path: ~/Library/Caches/ms-playwright
     steps:
@@ -65,12 +87,12 @@ jobs:
       - name: Install browser system dependencies
         run: npx playwright install-deps ${{ matrix.browser }}
         if: runner.os == 'Linux'
-      - run: npm run test:browser:conformance -- --project ${{ matrix.browser }}
+      - run: npm run test:browser:conformance -- --project ${{ matrix.browser }} --shard ${{ matrix.shard }}
       - name: Upload browser reports, traces, and plans
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: readiness-browser-conformance-${{ matrix.browser }}
+          name: readiness-browser-conformance-${{ matrix.browser }}-${{ strategy.job-index }}
           path: |
             playwright-report/
             test-results/

@@ -45,21 +45,43 @@ jobs:
       - run: npm run test:simulator:full
 
   browser-conformance:
-    name: Release browser conformance (${{ matrix.browser }})
+    name: Release browser conformance (${{ matrix.browser }} ${{ matrix.shard }})
     if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ${{ matrix.os }}
     timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
+        # Playwright shards split each engine's conformance suite by test; every shard must pass
+        # (a flaky test still fails its shard). WebKit, on macOS's single worker, ran 32-36 min
+        # whole.
         include:
           - browser: chromium
+            shard: 1/2
+            os: ubuntu-latest
+            cache_path: ~/.cache/ms-playwright
+          - browser: chromium
+            shard: 2/2
             os: ubuntu-latest
             cache_path: ~/.cache/ms-playwright
           - browser: firefox
+            shard: 1/2
+            os: ubuntu-latest
+            cache_path: ~/.cache/ms-playwright
+          - browser: firefox
+            shard: 2/2
             os: ubuntu-latest
             cache_path: ~/.cache/ms-playwright
           - browser: webkit
+            shard: 1/3
+            os: macos-latest
+            cache_path: ~/Library/Caches/ms-playwright
+          - browser: webkit
+            shard: 2/3
+            os: macos-latest
+            cache_path: ~/Library/Caches/ms-playwright
+          - browser: webkit
+            shard: 3/3
             os: macos-latest
             cache_path: ~/Library/Caches/ms-playwright
     steps:
@@ -85,12 +107,12 @@ jobs:
       - name: Install browser system dependencies
         run: npx playwright install-deps ${{ matrix.browser }}
         if: runner.os == 'Linux'
-      - run: npm run test:browser:conformance -- --project ${{ matrix.browser }}
+      - run: npm run test:browser:conformance -- --project ${{ matrix.browser }} --shard ${{ matrix.shard }}
       - name: Upload browser reports, traces, and plans
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: release-browser-conformance-${{ matrix.browser }}
+          name: release-browser-conformance-${{ matrix.browser }}-${{ strategy.job-index }}
           path: |
             playwright-report/
             test-results/
