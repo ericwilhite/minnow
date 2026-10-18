@@ -119,8 +119,10 @@ falls back to the ordinary executor, which stays the authority on answers and er
 reports eligibility as `key-covering equality answers as a point read when the visible history
 allows`. A lone `COUNT(*)` over the same equalities is answered the same way. One equality may be
 a membership — `id IN (…)` or `id = ANY($1)` with up to 4,096 members — and each member is then
-one lookup: a hundred keys cost about a hundred point reads rather than a scan. Duplicate members
-are read once and rows come back in ascending key order; a NULL member matches nothing.
+one lookup: a hundred keys cost about a hundred point reads rather than a scan. Over pending
+deltas the members share one replay, which reads each delta block once for every member it may
+hold. Duplicate members are read once and rows come back in ascending key order; a NULL member
+matches nothing.
 
 **Prepared plans.** A statement's catalog rewrites run once per structural catalog epoch, on its
 second execution, with its placeholders still open; every later run binds its values into that
