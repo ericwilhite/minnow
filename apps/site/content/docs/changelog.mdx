@@ -41,6 +41,12 @@ replaces this heading with its version and date. Package: `@minnowdb/core`.
 
 ### Fixed
 
+- **Fewer stuck databases after a worker crash in WebKit.** The automatic compaction check that runs
+  after commits, and when a table goes quiet, now starts its catalog reads only between the
+  connection's writes. They used to wait inside IndexedDB behind the connection's own commit, and
+  WebKit can keep such a waiting read alive after its worker is terminated: the database then fails
+  with `StorageUnresponsiveError` in every tab until the tab that ran the worker closes. In the
+  resilience crash test this went from 8 stalls in 80 runs to none.
 - **Dropping a column a CHECK named with its table's qualifier was allowed.** `dropColumn()` and
   `ALTER TABLE … DROP COLUMN` accepted dropping `qty` from a table with `CHECK (items.qty > 0)`,
   and the check then silently passed every row. It is now refused like an unqualified reference.
