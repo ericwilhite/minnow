@@ -38,7 +38,7 @@ after generated declarations or asynchronous signatures change.
 | `npm run test:browser:site`        | Public-site examples in Chromium, Firefox, and WebKit                                                                                                          | Docs, examples, and site changes            |
 | `npm run test:browser`             | Both browser runners, in sequence                                                                                                                              | Cross-browser regression checks             |
 | `npm run test:consumer`            | Packed libraries installed, typed, bundled, and run outside the workspace                                                                                      | Package and public-entry changes            |
-| `npm run benchmark:gate`           | Seeded Node performance ratios against the checked-in baseline                                                                                                 | Query-executor performance changes          |
+| `npm run benchmark:gate`           | Seeded Node performance ratios against the checked-in baseline                                                                                                 | Query-executor and write-path changes       |
 | `npm run benchmark:sizes`          | Download size of Minnow, SQLite Wasm, and PGlite, from the installed packages                                                                                  | Dependency or public-entry changes          |
 | `npm run api:check`                | The public API surface against the committed contract snapshot                                                                                                 | Public-entry or declaration changes         |
 | `npm run check`                    | Format, types, lint, build, API contract, coverage, and fast SQLLogicTest                                                                                      | The local merge gate                        |
@@ -912,6 +912,19 @@ sample ends only after ten consecutive 50ms observations see no job and the same
 The report separates the time to the first confirmed-stable observation from the following
 confirmation delay. Observation resolution is 50ms. The gate and comparison row keep the full
 elapsed time, including confirmation; SQLite and PGlite time their updates without this window.
+
+## Wide-table writes
+
+The `wide-*` shapes write the way an app syncing server data does: a 101-column table of text,
+numbers, booleans, and timestamps, keyed by a number, with a `_synced` flag. `wide-guarded-upsert`
+lands 2,000-row sync batches, half new rows, through `upsertBatch` with
+`conflictWhere: _synced = true`, and some rows it meets are local edits the guard must leave
+alone. `wide-insert-row`, `wide-upsert-row`, `wide-update-row` (a keyed SQL `UPDATE` of three
+columns), and `wide-delete-row` are the app's own single-row edits. Unlike the historical shapes,
+SQLite and PGlite hold this table with a real primary key, and SQLite runs prepared statements
+over arguments built before timing, so these ratios compare like with like. The table lives in a
+database of its own, so its writes do not change what the other shapes read. Every engine runs the
+same sequence, and a summary of the table is compared with SQLite's after each shape.
 
 ## Update the performance-gate baseline
 

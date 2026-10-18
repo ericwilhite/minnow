@@ -5,8 +5,8 @@
     "darwin-arm64-node24": {
       "thresholds": {
         "bulk-ingest": {
-          "sqlite": 3.3,
-          "pglite": 0.507
+          "sqlite": 3.11,
+          "pglite": 0.439
         },
         "count-star": {
           "sqlite": 0.206,
@@ -108,8 +108,28 @@
           "sqlite": 0.156,
           "pglite": 0.103
         },
+        "wide-guarded-upsert": {
+          "sqlite": 5.02,
+          "pglite": 0.067
+        },
+        "wide-insert-row": {
+          "sqlite": 476,
+          "pglite": 12.7
+        },
+        "wide-upsert-row": {
+          "sqlite": 637,
+          "pglite": 11.8
+        },
+        "wide-update-row": {
+          "sqlite": 153,
+          "pglite": 5.13
+        },
+        "wide-delete-row": {
+          "sqlite": 216,
+          "pglite": 2.8
+        },
         "settle-after-updates": {
-          "sqlite": 0.98,
+          "sqlite": 0.874,
           "pglite": 0.388
         },
         "settled-point-lookup": {
@@ -235,6 +255,26 @@
         "filtered-update": {
           "sqlite": 0.729,
           "pglite": 0.391
+        },
+        "wide-guarded-upsert": {
+          "sqlite": 12,
+          "pglite": 0.107
+        },
+        "wide-insert-row": {
+          "sqlite": 2860,
+          "pglite": 76.2
+        },
+        "wide-upsert-row": {
+          "sqlite": 3820,
+          "pglite": 70.8
+        },
+        "wide-update-row": {
+          "sqlite": 918,
+          "pglite": 30.8
+        },
+        "wide-delete-row": {
+          "sqlite": 1300,
+          "pglite": 16.8
         },
         "settle-after-updates": {
           "sqlite": 6.18,
