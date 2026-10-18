@@ -215,7 +215,10 @@ compaction declines because the table's layout or keys put it out of reach also 
 table to reach twice its segment count, capped at the largest level-zero prefix one fold
 consumes. A threshold crossed while another fold is running is queued. Writes are sampled
 during a burst and its final tail is checked after a short quiet period, so the last writes cannot
-leave a table permanently above the fold threshold.
+leave a table permanently above the fold threshold. A check starts reading the store only between
+the connection's writes, never while one of its commits is open: on IndexedDB a read issued then
+waits behind the commit, and WebKit can leave such a waiting read stuck when its worker is
+terminated (see [IndexedDB](/docs/storage/indexeddb#a-connection-that-stops-answering)).
 
 Jobs are records in the store, so `listCompactionJobs()` finds one a previous session left behind
 and `resumeCompactionJob(jobId)` picks it up. A job whose owner lease has expired — a tab that
