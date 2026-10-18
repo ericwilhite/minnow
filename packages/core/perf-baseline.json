@@ -109,24 +109,24 @@
           "pglite": 0.103
         },
         "wide-guarded-upsert": {
-          "sqlite": 5.02,
-          "pglite": 0.067
+          "sqlite": 6.22,
+          "pglite": 0.0801
         },
         "wide-insert-row": {
-          "sqlite": 476,
-          "pglite": 12.7
+          "sqlite": 261,
+          "pglite": 6.52
         },
         "wide-upsert-row": {
-          "sqlite": 637,
-          "pglite": 11.8
+          "sqlite": 223,
+          "pglite": 4.13
         },
         "wide-update-row": {
-          "sqlite": 153,
-          "pglite": 5.13
+          "sqlite": 165,
+          "pglite": 5.25
         },
         "wide-delete-row": {
-          "sqlite": 216,
-          "pglite": 2.8
+          "sqlite": 318,
+          "pglite": 3.71
         },
         "settle-after-updates": {
           "sqlite": 0.874,
