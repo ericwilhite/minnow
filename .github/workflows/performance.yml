@@ -39,6 +39,9 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
+      # The gate imports the Kysely dialect from source, and the dialect imports `parseJson` from
+      # `@minnowdb/core/json`, which resolves through the package's built `dist`.
+      - run: npx tsc -b packages/core
       - name: Run the gate
         # An explicit Bash shell enables pipefail, so tee cannot turn a failed benchmark into a
         # green job. Capture stderr too: the regression summary belongs in the uploaded artifact.

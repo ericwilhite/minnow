@@ -621,7 +621,8 @@ Custom drivers must preserve error names and causes across their transport, incl
 `DatabaseWorkerOutcomeUnknownError` for a mutation interrupted by a worker crash.
 
 The runner is driver-agnostic. In Vitest (`interaction-simulator.test.ts`, with the rekeying and
-schema suites in `interaction-simulator-rekeying.test.ts` and `interaction-simulator-schema.test.ts`)
+schema suites in `interaction-simulator-rekeying.test.ts` and `interaction-simulator-schema.test.ts`,
+whose IndexedDB seeds alternate with `interaction-simulator-schema-indexeddb.test.ts`)
 each connection is a
 `MinnowDatabase` over one shared memory, IndexedDB, or OPFS store with the storage fault points
 armed. In Playwright (`interaction.spec.ts`) each connection is a real tab holding the published
