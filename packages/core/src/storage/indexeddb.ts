@@ -18879,7 +18879,61 @@ function readManifestBlockPageFromCatalog(
   });
 }
 
-function readRetiredManifestBlockPageFromCatalog(
+/** Provenance records one batched read of the retired-block listing returns. */
+const RETIRED_PROVENANCE_READ_PAGE = 256;
+
+/**
+ * Retired provenance records in block-id order. Live records far outnumber retired ones, and
+ * the listing has no index of its own, so it reads the provenance a page at a time — one round
+ * trip per page rather than one cursor step per record, which made each collection pass cost a
+ * storage round trip per live block.
+ */
+async function readRetiredManifestBlockPageFromCatalog(
+  catalog: IDBObjectStore,
+  removedThroughVersion: number,
+  afterBlockId: string | null,
+  limit: number,
+): Promise<ManifestBlockRecord[]> {
+  // Injected factories need not install the browser's key-range constructor globally.
+  if (typeof IDBKeyRange === "undefined") {
+    return readRetiredManifestBlockPageWithCursor(
+      catalog,
+      removedThroughVersion,
+      afterBlockId,
+      limit,
+    );
+  }
+  const records: ManifestBlockRecord[] = [];
+  const upper: IDBValidKey = [MANIFEST_BLOCK + "\u0000"];
+  let lower: IDBValidKey =
+    afterBlockId === null ? [MANIFEST_BLOCK] : [MANIFEST_BLOCK, afterBlockId];
+  let exclusive = afterBlockId !== null;
+  for (;;) {
+    const range = IDBKeyRange.bound(lower, upper, exclusive, true);
+    const [keys, values]: [IDBValidKey[], unknown[]] = await Promise.all([
+      requestResult<IDBValidKey[]>(catalog.getAllKeys(range, RETIRED_PROVENANCE_READ_PAGE)),
+      requestResult<unknown[]>(catalog.getAll(range, RETIRED_PROVENANCE_READ_PAGE)),
+    ]);
+    if (keys.length !== values.length)
+      throw corruption("catalog", "batch keys do not match values");
+    for (const [index, key] of keys.entries()) {
+      if (!Array.isArray(key) || key.length !== 2 || typeof key[1] !== "string") {
+        throw corruption(MANIFEST_BLOCK, "record key is invalid");
+      }
+      const record = asManifestBlockRecord(values[index], key[1]);
+      if (record.removedVersion !== null && record.removedVersion <= removedThroughVersion) {
+        records.push(record);
+        if (records.length === limit) return records;
+      }
+    }
+    const last = keys.at(-1);
+    if (keys.length < RETIRED_PROVENANCE_READ_PAGE || last === undefined) return records;
+    lower = last;
+    exclusive = true;
+  }
+}
+
+function readRetiredManifestBlockPageWithCursor(
   catalog: IDBObjectStore,
   removedThroughVersion: number,
   afterBlockId: string | null,

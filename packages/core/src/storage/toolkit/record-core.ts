@@ -220,6 +220,8 @@ function cloneRecordValue(value: unknown): unknown {
 export const recordCoreTestHooks = {
   /** Segment records walked by level-zero recounts; a carried count walks none. */
   levelZeroSegmentsCounted: 0,
+  /** Provenance records the retired-block listing examined. */
+  retiredProvenanceVisited: 0,
 };
 
 const postingTextEncoder = new TextEncoder();
@@ -1008,6 +1010,12 @@ export class RecordCore {
   readonly #retiredManifestVersions = new OrderedKeyIndex<number>(compareOrderedKeys);
   readonly #retiredManifestBlocksByVersion = new Map<number, OrderedKeyIndex<RetiredManifestKey>>();
   /**
+   * Retired provenance records' block ids, in id order. Collection planning pages through the
+   * retired records after every few dozen commits; finding them by walking every provenance
+   * record, live ones included, cost the whole database's block count per pass.
+   */
+  readonly #retiredManifestBlockIds = new OrderedKeyIndex<string>(compareOrderedKeys);
+  /**
    * Visible committed level-zero segments per table, as the level-zero ceiling counts them, for
    * the current manifest version. Every commit that adds level-zero work checks the ceiling, and
    * counting walked every segment of the table and every block of each. A count stays exact
@@ -1249,6 +1257,8 @@ export class RecordCore {
   #changeRetiredManifestBlock(record: ManifestBlockRecord, delta: 1 | -1): void {
     const removedVersion = record.removedVersion;
     if (removedVersion === null) return;
+    if (delta === 1) this.#retiredManifestBlockIds.add(record.blockId);
+    else this.#retiredManifestBlockIds.delete(record.blockId);
     let index = this.#retiredManifestBlocksByVersion.get(removedVersion);
     if (delta === 1) {
       if (index === undefined) {
@@ -3606,8 +3616,15 @@ export class RecordCore {
     if (input.afterBlockId !== null) validateId(input.afterBlockId);
     validatePageLimit(input.limit);
     const records: Array<Pick<ManifestBlockRecord, "blockId" | "byteLength" | "checksum">> = [];
-    for (const record of this.#manifestBlocks.orderedValues(input.afterBlockId)) {
-      if (record.removedVersion === null || record.removedVersion > input.removedThroughVersion) {
+    for (const blockId of this.#retiredManifestBlockIds.after(input.afterBlockId)) {
+      recordCoreTestHooks.retiredProvenanceVisited += 1;
+      const record = this.#manifestBlocks.get(blockId);
+      const removedVersion = record?.removedVersion ?? null;
+      if (
+        record === undefined ||
+        removedVersion === null ||
+        removedVersion > input.removedThroughVersion
+      ) {
         continue;
       }
       records.push({
