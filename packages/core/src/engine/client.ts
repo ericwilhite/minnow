@@ -62,13 +62,12 @@ import {
   type InsertBatchInputLike,
 } from "./batch.js";
 import type { Catalog } from "./catalog.js";
+import type { BufferedFlushResult, BufferedWriterOptions } from "./buffered-writer.js";
 import type {
   BatchValue,
   BufferPoolStats,
   StagedWriteResult,
   StagedUpsertResult,
-  BufferedFlushResult,
-  BufferedWriterOptions,
   CancelCompactionJobResult,
   CollectGarbageOptions,
   CollectGarbageStepOptions,

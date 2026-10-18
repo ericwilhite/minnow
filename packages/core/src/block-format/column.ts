@@ -6,7 +6,11 @@ import type {
   ValidatedPhysicalColumn,
 } from "./types.js";
 import { dateMilliseconds } from "../date-value.js";
-import { physicalColumnByteLength, validatePhysicalColumn } from "./physical.js";
+import {
+  MAX_PHYSICAL_COLUMN_BYTE_LENGTH,
+  physicalColumnByteLength,
+  validatePhysicalColumn,
+} from "./physical.js";
 import { wellFormedUtf8ByteLength } from "./unicode.js";
 
 const textEncoder = new TextEncoder();
@@ -41,26 +45,7 @@ export function encodeColumn(input: ColumnInput): {
   // encode each accessor value in one pass. Reading them twice would both waste a full scan and
   // introduce a needless time-of-check/time-of-use boundary for accessor-backed inputs.
   physicalColumnByteLength(input.type, rowCount);
-  let stringContentByteLength = 0;
-  if (input.type === "string") {
-    // Variable-width output still needs an exact sizing pass before allocation. The encode pass
-    // below revalidates the local value it writes, so a changing accessor cannot smuggle invalid
-    // UTF-16 or make offsets disagree with the content buffer.
-    for (let index = 0; index < rowCount; index += 1) {
-      const value = input.values[index];
-      if (value === undefined) throw new TypeError("Column values cannot be undefined");
-      if (value !== null) {
-        if (typeof value !== "string") {
-          throw new TypeError("String columns accept only strings or null");
-        }
-        stringContentByteLength += wellFormedUtf8ByteLength(value);
-        if (!Number.isSafeInteger(stringContentByteLength)) {
-          throw new RangeError("Invalid string content byte length");
-        }
-      }
-    }
-  }
-  physicalColumnByteLength(input.type, rowCount, stringContentByteLength);
+  if (input.type === "string") return encodeStringColumn(input.values, rowCount);
   const validity = new Uint8Array(bitmapLength(rowCount));
 
   switch (input.type) {
@@ -135,43 +120,106 @@ export function encodeColumn(input: ColumnInput): {
       const metadata = min === Number.POSITIVE_INFINITY ? {} : { zoneMap: { min, max } };
       return { bytes: join(validity, new Uint8Array(values.buffer)), metadata, nullCount };
     }
-    case "string": {
-      // Measure exactly without allocating, both to reject lossy unpaired surrogates and to avoid
-      // the former 3x worst-case scratch for ASCII-heavy data. The complete 64 MiB format bound is
-      // checked before the content or offset arrays are allocated.
-      const offsets = new Uint32Array(rowCount + 1);
-      // Some native encodeInto implementations stop at an internal chunk boundary when the
-      // destination has exactly two or three bytes left, even though the final code point fits.
-      // Three bytes of non-persisted tail room keeps the native fast path reliable; the returned
-      // physical payload still contains exactly `contentByteLength` content bytes.
-      const content = new Uint8Array(stringContentByteLength + 3);
-      let offset = 0;
-      let nullCount = 0;
-      for (let index = 0; index < rowCount; index += 1) {
-        const value = input.values[index];
-        if (value === undefined) throw new TypeError("Column values cannot be undefined");
-        if (value === null) nullCount += 1;
-        else {
-          if (typeof value !== "string") {
-            throw new TypeError("String columns accept only strings or null");
-          }
-          const localByteLength = wellFormedUtf8ByteLength(value);
-          setBit(validity, index);
-          const result = textEncoder.encodeInto(value, content.subarray(offset));
-          if (result.read !== value.length) throw new Error("UTF-8 output sizing mismatch");
-          if (result.written !== localByteLength) throw new Error("UTF-8 output sizing mismatch");
-          offset += result.written;
+  }
+}
+
+/**
+ * A string column's payload: validity, offsets, then each value's UTF-8 bytes. Every value is
+ * checked from one read of it, kept in a local snapshot, so the bytes written are the strings
+ * that were checked even for accessor-backed input; an earlier pass only sizes the buffer.
+ * ASCII — nearly every value in practice — is copied a code unit to a byte while it is checked,
+ * into a buffer the UTF-16 length already sizes exactly, with no native call per value. The
+ * first value that is not ASCII sends the column to the exact encoding: measured first, both to
+ * reject unpaired surrogates (UTF-8 cannot represent them, and TextEncoder would silently
+ * replace them) and to check the 64 MiB format bound before the content buffer is allocated.
+ * Errors arrive in row order either way, exactly as one checking pass would raise them.
+ */
+function encodeStringColumn(
+  values: ReadonlyArray<string | null>,
+  rowCount: number,
+): { bytes: Uint8Array; metadata: BlockMetadata; nullCount: number } {
+  // A capacity guess, not a check: every code unit is at least one UTF-8 byte and an ASCII one
+  // is exactly one, so for an all-ASCII column this is the payload. A guess past the format bound
+  // allocates nothing and lets the exact path refuse the column.
+  let units = 0;
+  for (let index = 0; index < rowCount; index += 1) {
+    const value: unknown = values[index];
+    if (typeof value === "string") units += value.length;
+  }
+  const validity = new Uint8Array(bitmapLength(rowCount));
+  const offsets = new Uint32Array(rowCount + 1);
+  const snapshot = new Array<string | null>(rowCount);
+  const ascii = new Uint8Array(units <= MAX_PHYSICAL_COLUMN_BYTE_LENGTH ? units : 0);
+  let offset = 0;
+  let copying = true;
+  let byteLength = 0;
+  let nullCount = 0;
+  for (let index = 0; index < rowCount; index += 1) {
+    const value = values[index];
+    if (value === undefined) throw new TypeError("Column values cannot be undefined");
+    if (value === null) {
+      nullCount += 1;
+      snapshot[index] = null;
+      offsets[index + 1] = offset;
+      continue;
+    }
+    if (typeof value !== "string") {
+      throw new TypeError("String columns accept only strings or null");
+    }
+    snapshot[index] = value;
+    setBit(validity, index);
+    const length = value.length;
+    if (copying) {
+      let unit = 0;
+      if (offset + length <= ascii.length) {
+        for (; unit < length; unit += 1) {
+          const code = value.charCodeAt(unit);
+          if (code > 0x7f) break;
+          ascii[offset + unit] = code;
         }
-        offsets[index + 1] = offset;
       }
-      if (offset !== stringContentByteLength) throw new Error("UTF-8 output sizing mismatch");
-      return {
-        bytes: join(validity, new Uint8Array(offsets.buffer), content.subarray(0, offset)),
-        metadata: {},
-        nullCount,
-      };
+      if (unit === length && offset + length <= ascii.length) {
+        offset += length;
+        byteLength += length;
+        offsets[index + 1] = offset;
+        continue;
+      }
+      copying = false;
+    }
+    byteLength += wellFormedUtf8ByteLength(value);
+    if (!Number.isSafeInteger(byteLength)) {
+      throw new RangeError("Invalid string content byte length");
     }
   }
+  physicalColumnByteLength("string", rowCount, byteLength);
+  if (copying) {
+    return {
+      bytes: join(validity, new Uint8Array(offsets.buffer), ascii.subarray(0, offset)),
+      metadata: {},
+      nullCount,
+    };
+  }
+  // Some native encodeInto implementations stop at an internal chunk boundary when the
+  // destination has exactly two or three bytes left, even though the final code point fits.
+  // Three bytes of non-persisted tail room keeps the native fast path reliable; the returned
+  // physical payload still contains exactly `byteLength` content bytes.
+  const content = new Uint8Array(byteLength + 3);
+  offset = 0;
+  for (let index = 0; index < rowCount; index += 1) {
+    const value = snapshot[index];
+    if (value !== null && value !== undefined) {
+      const result = textEncoder.encodeInto(value, content.subarray(offset));
+      if (result.read !== value.length) throw new Error("UTF-8 output sizing mismatch");
+      offset += result.written;
+    }
+    offsets[index + 1] = offset;
+  }
+  if (offset !== byteLength) throw new Error("UTF-8 output sizing mismatch");
+  return {
+    bytes: join(validity, new Uint8Array(offsets.buffer), content.subarray(0, offset)),
+    metadata: {},
+    nullCount,
+  };
 }
 
 export function decodeColumn<T extends LogicalType>(

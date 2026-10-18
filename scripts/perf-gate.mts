@@ -526,6 +526,108 @@ const MUTATION_CHECK: PerfQuery = {
   sql: "SELECT COUNT(*) AS n, SUM(amount) AS amount, SUM(CASE WHEN label = 'alpha' THEN 1 ELSE 0 END) AS alpha FROM data_mut",
 };
 
+/**
+ * Wide-table writes, shaped like an app that syncs server rows into a local table: about a
+ * hundred mixed columns, a numeric key, and a `_synced` flag marking the rows the server still
+ * owns. The sync lands as guarded upsert batches that leave a row the user has edited locally
+ * (`_synced = false`) alone; the app's own edits are single-row inserts, upserts, keyed SQL
+ * updates, and deletes. Every engine holds this table with a real primary key, as an upsert needs
+ * one, and SQLite runs prepared statements. The narrow `data_mut` shapes cannot see a cost that
+ * grows with the column count, which is where a wide write spends its time.
+ */
+const WIDE_ROWS = 20_000;
+/** Rows per guarded sync batch: half replace existing rows, half are new. */
+const WIDE_BATCH_ROWS = 2_000;
+type WideKind = "text" | "number" | "boolean" | "datetime";
+const WIDE_COLUMNS: ReadonlyArray<{ readonly name: string; readonly kind: WideKind }> = [
+  ...Array.from({ length: 40 }, (_, index) => ({
+    name: `t${String(index)}`,
+    kind: "text" as const,
+  })),
+  ...Array.from({ length: 35 }, (_, index) => ({
+    name: `n${String(index)}`,
+    kind: "number" as const,
+  })),
+  ...Array.from({ length: 12 }, (_, index) => ({
+    name: `b${String(index)}`,
+    kind: "boolean" as const,
+  })),
+  ...Array.from({ length: 12 }, (_, index) => ({
+    name: `d${String(index)}`,
+    kind: "datetime" as const,
+  })),
+];
+type WideValue = string | number | boolean | Date | null;
+type WideRow = Record<string, WideValue>;
+/** Every column in table order, the order each engine's row values are listed in. */
+const WIDE_NAMES = ["id", "_synced", ...WIDE_COLUMNS.map(({ name }) => name)];
+
+function wideValue(kind: WideKind, id: number, column: number, version: number): WideValue {
+  switch (kind) {
+    case "text":
+      return (id + column) % 7 === 0
+        ? null
+        : `v${String((id * 31 + column + version) % 5_000)}-text`;
+    case "number":
+      return (id * 13 + column * 7 + version) % 100_000;
+    case "boolean":
+      return (id + column + version) % 3 === 0;
+    case "datetime":
+      return new Date(
+        Date.UTC(2025, 0, 1) + ((id * 1_000 + column + version) % 86_400_000) * 1_000,
+      );
+  }
+}
+
+function wideRow(id: number, version: number, synced = true): WideRow {
+  const row: WideRow = { id, _synced: synced };
+  WIDE_COLUMNS.forEach((column, index) => {
+    row[column.name] = wideValue(column.kind, id, index, version);
+  });
+  return row;
+}
+
+/** Guarded sync batch `n`: the same rows for every engine. */
+function wideBatch(n: number): WideRow[] {
+  const rows: WideRow[] = [];
+  for (let index = 0; index < WIDE_BATCH_ROWS / 2; index += 1) {
+    rows.push(wideRow(((n * 997 + index * 13) % WIDE_ROWS) + 1, n + 1));
+  }
+  for (let index = 0; index < WIDE_BATCH_ROWS / 2; index += 1) {
+    rows.push(wideRow(1_000_000 + n * WIDE_BATCH_ROWS + index, n + 1));
+  }
+  return rows;
+}
+
+function wideSqliteArgs(row: WideRow): Array<number | string | null> {
+  return WIDE_NAMES.map((name) => {
+    const value = row[name] ?? null;
+    if (value instanceof Date) return value.toISOString();
+    if (typeof value === "boolean") return value ? 1 : 0;
+    return value;
+  });
+}
+
+function widePgliteArgs(row: WideRow): WideValue[] {
+  return WIDE_NAMES.map((name) => row[name] ?? null);
+}
+
+const WIDE_GUARD = { conflictWhere: { column: "_synced", operator: "=", value: true } } as const;
+const WIDE_PLACEHOLDERS = WIDE_NAMES.map(() => "?").join(", ");
+const WIDE_ASSIGNMENTS = WIDE_NAMES.slice(1)
+  .map((name) => `"${name}" = excluded."${name}"`)
+  .join(", ");
+const WIDE_INSERT_SQL = `INSERT INTO wide VALUES (${WIDE_PLACEHOLDERS})`;
+const WIDE_UPSERT_SQL = `${WIDE_INSERT_SQL} ON CONFLICT ("id") DO UPDATE SET ${WIDE_ASSIGNMENTS}`;
+const WIDE_UPDATE_SQL = `UPDATE wide SET "t3" = ?, "n4" = ?, "_synced" = ? WHERE "id" = ?`;
+const WIDE_DELETE_SQL = `DELETE FROM wide WHERE "id" = ?`;
+const WIDE_CHECK_SQL = `SELECT COUNT(*) AS n, SUM("n0") AS total, COUNT("t3") AS texts, SUM(CASE WHEN "_synced" THEN 1 ELSE 0 END) AS synced FROM wide`;
+/** The same summary in SQLite, whose booleans are 0 and 1. */
+const WIDE_CHECK_SQLITE_SQL = WIDE_CHECK_SQL.replace(
+  `WHEN "_synced" THEN`,
+  `WHEN "_synced" = 1 THEN`,
+);
+
 interface BenchmarkDatabase {
   data: {
     id: number;
@@ -688,6 +790,39 @@ for (let start = 0; start < rows.length; start += 50_000) {
   );
 }
 await minnow.deleteBatch("data_mut", { keys: [7] });
+
+const WIDE_MINNOW_TYPES = {
+  text: "string",
+  number: "number",
+  boolean: "boolean",
+  datetime: "datetime",
+} as const;
+/**
+ * The wide table lives in its own database, so its writes neither crowd the buffer pool the
+ * `data_mut` shapes measured after them read through nor lengthen their table's catalog work.
+ * Compaction stays off for the same reason as above.
+ */
+const wideDb = new MinnowDatabase(new MemoryBlockStore(), { autoCompact: false });
+await wideDb.createTable({
+  name: "wide",
+  uniqueKey: "id",
+  columns: [
+    { name: "id", type: "number" },
+    { name: "_synced", type: "boolean" },
+    ...WIDE_COLUMNS.map(({ name, kind }) => ({
+      name,
+      type: WIDE_MINNOW_TYPES[kind],
+      nullable: true,
+    })),
+  ],
+});
+// One base row in 37 is a local edit the server has not seen.
+const wideBaseRows = Array.from({ length: WIDE_ROWS }, (_, index) =>
+  wideRow(index + 1, 0, (index + 1) % 37 !== 0),
+);
+for (let start = 0; start < WIDE_ROWS; start += 5_000) {
+  await wideDb.insertBatch("wide", wideBaseRows.slice(start, start + 5_000));
+}
 
 /**
  * A settled history: the same rows with a thousand point updates applied and the background
@@ -857,6 +992,16 @@ sqlite.exec(
   const settledStarted = performance.now();
   for (let index = 0; index < SETTLED_UPDATES; index += 1) settledUpdate.run(settledKey(index));
   settleMs.sqlite = performance.now() - settledStarted;
+  const sqliteWideTypes = { text: "TEXT", number: "REAL", boolean: "INTEGER", datetime: "TEXT" };
+  sqlite.exec(
+    `CREATE TABLE wide ("id" INTEGER PRIMARY KEY, "_synced" INTEGER, ${WIDE_COLUMNS.map(
+      ({ name, kind }) => `"${name}" ${sqliteWideTypes[kind]}`,
+    ).join(", ")})`,
+  );
+  const wideInsert = sqlite.prepare(WIDE_INSERT_SQL);
+  sqlite.exec("BEGIN");
+  for (const row of wideBaseRows) wideInsert.run(...wideSqliteArgs(row));
+  sqlite.exec("COMMIT");
 }
 
 function sqlLiteral(value: unknown): string {
@@ -972,6 +1117,28 @@ for (let start = 0; start < rows.length; start += 2000) {
   }
   settleMs.pglite = performance.now() - started;
 }
+{
+  const pgliteWideTypes = {
+    text: "TEXT",
+    number: "DOUBLE PRECISION",
+    boolean: "BOOLEAN",
+    datetime: "TIMESTAMPTZ",
+  };
+  await pglite.exec(
+    `CREATE TABLE wide ("id" INTEGER PRIMARY KEY, "_synced" BOOLEAN, ${WIDE_COLUMNS.map(
+      ({ name, kind }) => `"${name}" ${pgliteWideTypes[kind]}`,
+    ).join(", ")})`,
+  );
+  const literal = (value: WideValue): string =>
+    value instanceof Date ? sqlLiteral(value.toISOString()) : sqlLiteral(value);
+  for (let start = 0; start < WIDE_ROWS; start += 500) {
+    const batch = wideBaseRows
+      .slice(start, start + 500)
+      .map((row) => `(${widePgliteArgs(row).map(literal).join(", ")})`)
+      .join(", ");
+    await pglite.exec(`INSERT INTO wide VALUES ${batch}`);
+  }
+}
 
 function pgliteRunner(query: PerfQuery): () => Promise<unknown> {
   const sql = positionalToNumbered(query.sql);
@@ -982,10 +1149,150 @@ function pgliteRunner(query: PerfQuery): () => Promise<unknown> {
 type EngineName = PerformanceEngine;
 const ENGINES: readonly EngineName[] = PERFORMANCE_ENGINES;
 
+/**
+ * The wide-table writes, in the order they run: the sync batches first, over the short history a
+ * compacted table keeps, then the app's single-row edits. Some base rows are already edited
+ * locally (`_synced = false`), so every batch meets rows its guard has to leave alone.
+ */
+interface WideShape {
+  readonly name: string;
+  /** Repeats per timed sample, the same for every engine. */
+  readonly iterations: number;
+  /**
+   * Each engine's runner over `calls` inputs built before it is timed: building a hundred-column
+   * row would otherwise land inside a sample, a fixed cost that pulls every ratio toward one and
+   * is most of a single-row SQLite write.
+   */
+  readonly minnow: (calls: number) => () => Promise<unknown>;
+  readonly sqlite: (calls: number) => () => unknown;
+  readonly pglite: (calls: number) => () => Promise<unknown>;
+}
+const wideInsertSqlite = sqlite.prepare(WIDE_INSERT_SQL);
+const wideUpsertSqlite = sqlite.prepare(WIDE_UPSERT_SQL);
+const wideGuardedSqlite = sqlite.prepare(`${WIDE_UPSERT_SQL} WHERE wide."_synced" = 1`);
+const wideUpdateSqlite = sqlite.prepare(WIDE_UPDATE_SQL);
+const wideDeleteSqlite = sqlite.prepare(WIDE_DELETE_SQL);
+const widePgliteInsert = positionalToNumbered(WIDE_INSERT_SQL);
+const widePgliteUpsert = positionalToNumbered(WIDE_UPSERT_SQL);
+const widePgliteGuarded = positionalToNumbered(`${WIDE_UPSERT_SQL} WHERE wide."_synced"`);
+const widePgliteUpdate = positionalToNumbered(WIDE_UPDATE_SQL);
+const widePgliteDelete = positionalToNumbered(WIDE_DELETE_SQL);
+/** A runner over inputs `0..calls-1`, built up front and consumed in order. */
+function cycling<T, R>(calls: number, input: (n: number) => T, run: (value: T) => R): () => R {
+  const inputs = Array.from({ length: calls }, (_, n) => input(n));
+  let next = 0;
+  return () => {
+    const value = inputs[next];
+    if (value === undefined) throw new Error("A wide-table shape ran more often than planned");
+    next += 1;
+    return run(value);
+  };
+}
+/** Keys the single-row shapes cycle through: each iteration writes a different row. */
+const wideInsertRow = (n: number): WideRow => wideRow(2_000_000 + n, 0);
+const wideUpsertRow = (n: number): WideRow => wideRow(((n * 7919) % WIDE_ROWS) + 1, 10_000 + n);
+const wideUpdateKey = (n: number): number => ((n * 4561) % WIDE_ROWS) + 1;
+const wideDeleteKey = (n: number): number => ((n * 6007) % WIDE_ROWS) + 1;
+const WIDE_SHAPES: readonly WideShape[] = [
+  {
+    name: "wide-guarded-upsert",
+    // A batch takes tens of milliseconds on every engine: one per sample is already above the
+    // timer's resolution, and each one writes a fresh segment of history.
+    iterations: 1,
+    minnow: (calls) =>
+      cycling(calls, wideBatch, (rows) => wideDb.upsertBatch("wide", rows, WIDE_GUARD)),
+    sqlite: (calls) =>
+      cycling(
+        calls,
+        (n) => wideBatch(n).map(wideSqliteArgs),
+        (batch) => {
+          sqlite.exec("BEGIN");
+          for (const args of batch) wideGuardedSqlite.run(...args);
+          sqlite.exec("COMMIT");
+        },
+      ),
+    pglite: (calls) =>
+      cycling(
+        calls,
+        (n) => wideBatch(n).map(widePgliteArgs),
+        (batch) =>
+          pglite.transaction(async (transaction) => {
+            for (const args of batch) await transaction.query(widePgliteGuarded, args);
+          }),
+      ),
+  },
+  {
+    name: "wide-insert-row",
+    iterations: MUTATION_ITERATIONS,
+    minnow: (calls) => cycling(calls, wideInsertRow, (row) => wideDb.insertBatch("wide", [row])),
+    sqlite: (calls) =>
+      cycling(
+        calls,
+        (n) => wideSqliteArgs(wideInsertRow(n)),
+        (args) => wideInsertSqlite.run(...args),
+      ),
+    pglite: (calls) =>
+      cycling(
+        calls,
+        (n) => widePgliteArgs(wideInsertRow(n)),
+        (args) => pglite.query(widePgliteInsert, args),
+      ),
+  },
+  {
+    name: "wide-upsert-row",
+    iterations: MUTATION_ITERATIONS,
+    minnow: (calls) => cycling(calls, wideUpsertRow, (row) => wideDb.upsertBatch("wide", [row])),
+    sqlite: (calls) =>
+      cycling(
+        calls,
+        (n) => wideSqliteArgs(wideUpsertRow(n)),
+        (args) => wideUpsertSqlite.run(...args),
+      ),
+    pglite: (calls) =>
+      cycling(
+        calls,
+        (n) => widePgliteArgs(wideUpsertRow(n)),
+        (args) => pglite.query(widePgliteUpsert, args),
+      ),
+  },
+  {
+    name: "wide-update-row",
+    iterations: MUTATION_ITERATIONS,
+    minnow: (calls) =>
+      cycling(
+        calls,
+        (n) => [`edit-${String(n)}`, n, false, wideUpdateKey(n)],
+        (params) => wideDb.execute(WIDE_UPDATE_SQL, params),
+      ),
+    sqlite: (calls) =>
+      cycling(
+        calls,
+        (n) => [`edit-${String(n)}`, n, 0, wideUpdateKey(n)] as const,
+        (params) => wideUpdateSqlite.run(...params),
+      ),
+    pglite: (calls) =>
+      cycling(
+        calls,
+        (n) => [`edit-${String(n)}`, n, false, wideUpdateKey(n)],
+        (params) => pglite.query(widePgliteUpdate, params),
+      ),
+  },
+  {
+    name: "wide-delete-row",
+    iterations: MUTATION_ITERATIONS,
+    minnow: (calls) =>
+      cycling(calls, wideDeleteKey, (key) => wideDb.deleteBatch("wide", { keys: [key] })),
+    sqlite: (calls) => cycling(calls, wideDeleteKey, (key) => wideDeleteSqlite.run(key)),
+    pglite: (calls) =>
+      cycling(calls, wideDeleteKey, (key) => pglite.query(widePgliteDelete, [key])),
+  },
+];
+
 const workloadNames = [
   "bulk-ingest",
   ...QUERIES.map(({ name }) => name),
   ...MUTATIONS.map(({ name }) => name),
+  ...WIDE_SHAPES.map(({ name }) => name),
   "settle-after-updates",
   ...SETTLED_QUERIES.map(({ name }) => name),
   "bulk-delete",
@@ -1068,6 +1375,34 @@ for (const mutation of MUTATIONS) {
 }
 
 /**
+ * The wide-table writes. Each engine runs a shape's whole sequence before the next engine starts,
+ * over the same inputs in the same order, so all three hold the same rows afterwards — which the
+ * summary check below proves before any number is reported.
+ */
+for (const shape of WIDE_SHAPES) {
+  const calls = WARMUP + 1 + RUNS * shape.iterations;
+  const minnowRun = shape.minnow(calls);
+  await warmUp(minnowRun);
+  const minnowTiming = await timeRepeated(minnowRun, shape.iterations);
+  const sqliteRun = shape.sqlite(calls);
+  await warmUp(sqliteRun);
+  const sqliteTiming = await timeRepeated(sqliteRun, shape.iterations);
+  const pgliteRun = shape.pglite(calls);
+  await warmUp(pgliteRun);
+  const pgliteTiming = await timeRepeated(pgliteRun, shape.iterations);
+  results.push({
+    name: shape.name,
+    minnow: minnowTiming,
+    engine: { sqlite: sqliteTiming, pglite: pgliteTiming },
+  });
+  assertQueryEquivalent(
+    { name: `${shape.name} state`, sql: WIDE_CHECK_SQL },
+    await wideDb.query(WIDE_CHECK_SQL, { memoize: false }),
+    sqlite.prepare(WIDE_CHECK_SQLITE_SQL).all(),
+  );
+}
+
+/**
  * The settled shapes: the same read shapes over the history that was written to a thousand
  * times and then maintained, plus the settle itself, once.
  */
@@ -1138,6 +1473,7 @@ for (const query of SETTLED_QUERIES) {
 sqlite.close();
 await pglite.close();
 await kysely.destroy();
+await wideDb.close();
 
 console.log(`\nSQL performance gate — ${String(ROWS)} rows, median of ${String(RUNS)} runs`);
 console.log("query                minnow(ms)      sqlite(ms)            pglite(ms)");

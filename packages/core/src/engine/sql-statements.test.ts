@@ -326,6 +326,34 @@ describe("INSERT defaults", () => {
     expect(updatedAt).toBeInstanceOf(Date);
   });
 
+  it("re-runs a cached statement unchanged and resolves CURRENT_* afresh on every execution", async () => {
+    // A statement that names no CURRENT_* call is executed as compiled, the cached object itself;
+    // one that does gets the clock of each execution, never the first one's.
+    let clock = Date.UTC(2026, 0, 1);
+    const database = new MinnowDatabase(new MemoryBlockStore(), { now: () => new Date(clock) });
+    await database.execute(
+      "CREATE TABLE counters (id INTEGER PRIMARY KEY, n INTEGER NOT NULL, at TIMESTAMP)",
+    );
+    await database.execute("INSERT INTO counters (id, n) VALUES (1, 0), (2, 0)");
+    for (let run = 0; run < 3; run += 1) {
+      await database.execute("UPDATE counters SET n = n + 1 WHERE id = 1");
+    }
+    await database.execute("DELETE FROM counters WHERE id = 2");
+    await database.execute("DELETE FROM counters WHERE id = 2");
+    const stamps: number[] = [];
+    for (let run = 0; run < 2; run += 1) {
+      clock += 60_000;
+      await database.execute("UPDATE counters SET at = CURRENT_TIMESTAMP WHERE id = 1");
+      const row = (await database.query("SELECT n, at FROM counters WHERE id = 1")).rows[0] as
+        { n: number; at: Date } | undefined;
+      expect(row?.n).toBe(3);
+      stamps.push(row?.at.getTime() ?? 0);
+    }
+    expect(stamps).toEqual([Date.UTC(2026, 0, 1, 0, 1), Date.UTC(2026, 0, 1, 0, 2)]);
+    expect((await database.query("SELECT COUNT(*) AS n FROM counters")).rows).toEqual([{ n: 1 }]);
+    await database.close();
+  });
+
   it("evaluates SQL defaults per omitted row and preserves explicit NULL", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore());
     await database.execute(

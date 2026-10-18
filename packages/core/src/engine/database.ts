@@ -74,31 +74,17 @@ import {
 } from "./scope-write-set.js";
 import { throwIfAborted } from "./cancellation.js";
 import { BufferedTableWriter, type BufferedWriterOptions } from "./buffered-writer.js";
-export {
-  attachLifecycleFlush,
-  BufferedTableWriter,
-  MAX_BUFFERED_WRITER_PENDING_ADDS,
-  type BufferedFlushResult,
-  type BufferedWriterOptions,
-  type LifecycleDocumentTarget,
-  type LifecycleFlushOptions,
-  type LifecycleFlushRequester,
-  type LifecyclePageTarget,
-} from "./buffered-writer.js";
 import {
   CompactionJobCancelledError,
   CompactionMemoryBudgetError,
   CompactionWriteAmplificationError,
   DatabaseReadBacklogError,
   TransactionExpiredError,
-  MaintenanceBacklogError,
   MissingKeyError,
-  SqlCompileError,
   UnknownTableError,
   UniqueConstraintError,
   VisibleSegmentCursorStaleError,
 } from "./errors.js";
-export { DatabaseReadBacklogError } from "./errors.js";
 import {
   BLOCK_HEADER_LENGTH,
   buildPhysicalColumnFromRanges,
@@ -129,7 +115,12 @@ import {
 } from "../block-format/index.js";
 import { dateIsoString, dateMilliseconds } from "../date-value.js";
 import { crc32Continue } from "../block-format/checksum.js";
-import { maybeYieldToEventLoop, runStepsSliced, yieldToEventLoop } from "../work-slicer.js";
+import {
+  maybeYieldToEventLoop,
+  runStepsSliced,
+  sliceExpired,
+  yieldToEventLoop,
+} from "../work-slicer.js";
 import {
   NUMBER_INDEX_CELL_BYTES,
   OVERLAY_PATCH_BYTES,
@@ -249,7 +240,6 @@ import {
   PostingBuildConflictError,
   SnapshotManifestMissingError,
   SchemaConflictError,
-  TableInUseError,
   TableRecordConflictError,
   TransactionRecordConflictError,
   UniqueKeyBuildConflictError,
@@ -410,8 +400,12 @@ import {
 } from "./sql-domains.js";
 import { toCatalog, type Catalog } from "./catalog.js";
 import {
-  applyColumnSteps,
   compileGeneratedColumnExpression,
+  storedExpressionColumns,
+  validateSchemaExpressions,
+} from "./schema-expressions.js";
+import {
+  applyColumnSteps,
   declaredForeignKeys,
   isDestructiveStep,
   planMigration,
@@ -515,6 +509,7 @@ import {
   type OrderedRange,
 } from "./ordered-selection.js";
 import {
+  ascendingMembers,
   cachedPointReadTemplate,
   equalRunRange,
   pointReadSignature,
@@ -604,6 +599,43 @@ function transactionNeedsArtifactWalk(
 /** The order a plan's sources are joined in, as one comparable value. */
 function joinOrderKey(plan: CompiledQuery): string {
   return JSON.stringify([plan.base.alias, ...plan.joins.map((join) => join.alias)]);
+}
+
+/** Whether a point read's literal is exactly its column's storage type; coercion is the executor's. */
+function storageTypeMatches(type: SimpleDataType | undefined, value: unknown): boolean {
+  return (
+    (type === "number" && typeof value === "number") ||
+    (type === "string" && typeof value === "string") ||
+    (type === "boolean" && typeof value === "boolean") ||
+    (type === "datetime" && value instanceof Date)
+  );
+}
+
+/** Whether a stored value equals a point read's literal; Dates compare by instant. */
+function pointValueEquals(stored: QueryValue | undefined, wanted: unknown): boolean {
+  return wanted instanceof Date
+    ? stored instanceof Date && dateMilliseconds(stored) === dateMilliseconds(wanted)
+    : stored === wanted;
+}
+
+/**
+ * Sets one projected value on a point read's output row. A domain column's stored scalar
+ * carries its internal tag, which the shared externalization boundary strips; anything else in
+ * the NUL namespace — plain text crossing the ordinary executor's wrapping rules, or an untagged
+ * value where a tag is required — is not provably reproduced, so false sends the whole statement
+ * back to the ordinary executor.
+ */
+function setPointReadValue(
+  row: QueryRow,
+  item: { readonly column: TableColumnRecord; readonly alias: string },
+  value: QueryValue,
+): boolean {
+  if (typeof value === "string" && value.charCodeAt(0) === 0) {
+    if (item.column.sqlDomain === undefined || !isSqlDomainValue(value)) return false;
+  }
+  if (item.alias === "__proto__") defineSqlResultProperty(row, item.alias, value);
+  else row[item.alias] = value;
+  return true;
 }
 
 function countResult(alias: string, count: number): QueryResult {
@@ -738,6 +770,8 @@ interface ResolvedPointReadCommon {
   /** Storage type of each equality's column, in equality order. */
   readonly equalityTypes: ReadonlyArray<TableColumnRecord["type"]>;
   readonly projected: ReadonlyArray<{ column: TableColumnRecord; alias: string }>;
+  /** Equality and projected columns, each once: what a candidate row is read for. */
+  readonly neededColumns: readonly TableColumnRecord[];
   /** Set for `SELECT COUNT(*)`: the answer is the matched rows' count under this alias. */
   readonly count?: string;
   readonly columns: readonly string[];
@@ -773,8 +807,6 @@ type ResolvedPointRead =
       readonly prefixEqualities: readonly number[];
       /** Whether the pinned columns leave trailing index columns open (a prefix term). */
       readonly partial: boolean;
-      /** Equality and projected columns, read per candidate block. */
-      readonly neededColumns: readonly TableColumnRecord[];
       readonly equalityVectors: readonly number[];
       readonly projectedVectors: readonly number[];
       readonly segments: readonly ResolvedIndexReadSegment[];
@@ -1068,8 +1100,23 @@ class BoundedWriteBlockStager {
     return this.#earlyStageMs;
   }
 
-  async prepare(maximumNextBytes: number): Promise<void> {
-    await this.prepareBatch(1, maximumNextBytes);
+  /**
+   * Whether `prepareBatch` would stage nothing for a group arriving after `aheadCount` blocks
+   * of at most `aheadMaximumBytes` that are still being encoded: proven from the bounds alone,
+   * so the next group can start before the ones ahead of it are accepted.
+   */
+  acceptsWithoutFlush(
+    aheadCount: number,
+    aheadMaximumBytes: number,
+    nextBlockCount: number,
+    maximumNextBytes: number,
+  ): boolean {
+    const count = this.#pending.length + aheadCount;
+    return (
+      count === 0 ||
+      (count + nextBlockCount <= MAX_TRANSACTION_STAGE_BLOCKS &&
+        this.#pendingBytes + aheadMaximumBytes + maximumNextBytes <= MAX_TRANSACTION_STAGE_BYTES)
+    );
   }
 
   async prepareBatch(nextBlockCount: number, maximumNextBytes: number): Promise<void> {
@@ -1733,20 +1780,6 @@ export interface TableDefinition {
 
 export type DatabaseRow = Record<string, Exclude<BatchValue, null> | null>;
 
-export {
-  CompactionBacklogError,
-  CompactionJobCancelledError,
-  CompactionMemoryBudgetError,
-  CompactionWriteAmplificationError,
-  MaintenanceBacklogError,
-  MissingKeyError,
-  SqlCompileError,
-  UnknownTableError,
-  TableInUseError,
-  UniqueConstraintError,
-  VisibleSegmentCursorStaleError,
-};
-
 export interface MinnowDatabaseOptions<TSchema extends AnySchema = UntypedSchema> {
   /**
    * The schema this database is declared against. It types every batch method by table name —
@@ -2210,11 +2243,47 @@ function insertStatementBatch(
   };
 }
 
+/** The calls `resolveStatementDatetimes` replaces with the statement's clock. */
+const STATEMENT_DATETIME_CALLS: ReadonlySet<string> = new Set([
+  "CURRENT_DATE",
+  "CURRENT_TIMESTAMP",
+  "LOCALTIME",
+]);
+
+const statementDatetimeCalls = new WeakMap<CompiledStatement, boolean>();
+
+/**
+ * Whether any expression anywhere in a compiled statement is one of those calls: a walk over the
+ * whole tree, which finds every call the structured resolution below would rewrite. Memoized per
+ * statement object, so a cached statement executed again pays nothing.
+ */
+function namesStatementDatetime(statement: CompiledStatement): boolean {
+  const cached = statementDatetimeCalls.get(statement);
+  if (cached !== undefined) return cached;
+  const seen = new Set<object>();
+  const visit = (value: unknown): boolean => {
+    if (typeof value !== "object" || value === null || seen.has(value)) return false;
+    seen.add(value);
+    if (Array.isArray(value)) return value.some(visit);
+    const node = value as { readonly kind?: unknown; readonly name?: unknown };
+    if (node.kind === "call" && typeof node.name === "string") {
+      if (STATEMENT_DATETIME_CALLS.has(node.name)) return true;
+    }
+    return Object.values(value).some(visit);
+  };
+  const names = visit(statement);
+  statementDatetimeCalls.set(statement, names);
+  return names;
+}
+
 /** Resolves CURRENT_* in every retained DML expression with one statement-start clock. */
 function resolveMutationStatementDatetimes(
   statement: CompiledStatement,
   now: Date,
 ): CompiledStatement {
+  // Nothing to resolve: the statement itself, not a copy of every expression in it, which also
+  // keeps its identity for whatever is cached against it downstream.
+  if (!namesStatementDatetime(statement)) return statement;
   const plan = (block: CompiledQuery): CompiledQuery =>
     resolveStatementDatetimes({ ...block, usesStatementDatetime: true }, now);
   const expression = (value: Expression): Expression => {
@@ -3993,9 +4062,6 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       await transaction.setFtsChangesSliced({ tableId: table.id, columns: secondaryCoverage });
     }
     let deletedRowCount: number;
-    let storedBytes = 0;
-    let blockCount = 0;
-    let encodeMs = 0;
     let stageMs = 0;
     let commitMs = 0;
     let retries = 0;
@@ -4016,7 +4082,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           metrics: createWriteMetrics({
             logicalBytes,
             storedBytes: 0,
-            encodeMs,
+            encodeMs: 0,
             stageMs,
             commitMs,
             totalMs: performance.now() - started,
@@ -4026,43 +4092,25 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         };
       }
 
-      const blockIds: string[] = [];
       const values = [...keys.values()];
       if (keyStringByteLengths !== undefined) {
         validatedStringByteLengths.set(values, keyStringByteLengths);
       }
-      const plannedColumn = writeColumnValues(keyColumn.type, values);
-      const ranges = await writeBlockRangesSliced(
-        [plannedColumn],
+      const columnBlockIds: Record<string, string[]> = {};
+      const {
+        waitedMs: encodeMs,
+        storedBytes,
+        blockCount,
+      } = await this.#encodeSegmentBlocks(
+        blockStager,
+        `table/${table.id}/segment/${segmentId}/delete-key`,
+        [keyColumn],
+        [values],
         values.length,
-        this.#rowsPerBlock,
-        this.#targetBlockBytes,
+        columnBlockIds,
+        true,
+        "raw",
       );
-      for (const [part, { start, end }] of ranges.entries()) {
-        await blockStager.prepare(maximumWriteBlockStoredBytes(plannedColumn, start, end, "raw"));
-        const slice = values.slice(start, end);
-        const encodeStarted = performance.now();
-        const bytes = await this.#encodeColumnBlock(
-          keyColumn.id,
-          asColumnInput(keyColumn.type, slice),
-          "raw",
-        );
-        encodeMs += performance.now() - encodeStarted;
-        const blockId = [
-          "table",
-          table.id,
-          "segment",
-          segmentId,
-          "delete-key",
-          keyColumn.id,
-          "part",
-          String(part).padStart(6, "0"),
-        ].join("/");
-        blockStager.add({ id: blockId, bytes });
-        blockIds.push(blockId);
-        storedBytes += bytes.byteLength;
-        blockCount += 1;
-      }
       // Triggers fire once per row that actually exists: a requested key with no row deletes
       // nothing and must not fire a phantom all-null OLD image.
       const deletePreImages = (
@@ -4096,7 +4144,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         rowCount: keys.size,
         rowIdStart: 0n,
         rowIdEndExclusive: 0n,
-        columnBlockIds: { [keyColumn.id]: blockIds },
+        columnBlockIds,
         kind: "delete",
         keyColumnId: keyColumn.id,
         level: 0,
@@ -4196,9 +4244,6 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const blockStager = new BoundedWriteBlockStager(transaction, this.#rememberWrittenBlock);
     const segmentId = this.#createId();
     const columnBlockIds: Record<string, string[]> = {};
-    let storedBytes = 0;
-    let blockCount = 0;
-    let encodeMs = 0;
     let stageMs = 0;
     let commitMs = 0;
     let retries = 0;
@@ -4239,51 +4284,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           0,
         );
       const changedColumns = Object.keys(input.changes).sort();
-      const columns = [keyColumn, ...changedColumns.map((name) => findColumn(table, name))];
-      const plannedColumns = columns.map((column) =>
-        writeColumnValues(
-          column.type,
-          column.id === keyColumn.id ? input.keys : (input.changes[column.name] ?? []),
-        ),
-      );
-      const ranges = await writeBlockRangesSliced(
-        plannedColumns,
+      const {
+        waitedMs: encodeMs,
+        storedBytes,
+        blockCount,
+      } = await this.#encodeSegmentBlocks(
+        blockStager,
+        `table/${table.id}/segment/${segmentId}/update-column`,
+        [keyColumn, ...changedColumns.map((name) => findColumn(table, name))],
+        [input.keys, ...changedColumns.map((name) => input.changes[name] ?? [])],
         input.keys.length,
-        this.#rowsPerBlock,
-        this.#targetBlockBytes,
+        columnBlockIds,
+        true,
       );
-      for (const [columnIndex, column] of columns.entries()) {
-        const values = column.id === keyColumn.id ? input.keys : (input.changes[column.name] ?? []);
-        const plannedColumn = plannedColumns[columnIndex];
-        if (plannedColumn === undefined) {
-          throw new Error(`Write column disappeared: ${column.name}`);
-        }
-        const blockIds: string[] = [];
-        for (const [part, { start, end }] of ranges.entries()) {
-          await blockStager.prepare(
-            maximumWriteBlockStoredBytes(plannedColumn, start, end, this.#compression),
-          );
-          const slice = values.slice(start, end);
-          const encodeStarted = performance.now();
-          const bytes = await this.#encodeColumnBlock(column.id, asColumnInput(column.type, slice));
-          encodeMs += performance.now() - encodeStarted;
-          const blockId = [
-            "table",
-            table.id,
-            "segment",
-            segmentId,
-            "update-column",
-            column.id,
-            "part",
-            String(part).padStart(6, "0"),
-          ].join("/");
-          blockStager.add({ id: blockId, bytes });
-          blockIds.push(blockId);
-          storedBytes += bytes.byteLength;
-          blockCount += 1;
-        }
-        columnBlockIds[column.id] = blockIds;
-      }
       stageSecondaryUniqueMutationChanges(transaction, table, input, preImages);
       const secondaryDeltas = await buildSecondaryUpdateDeltas(table, input, preImages);
       if (secondaryDeltas.length > 0) {
@@ -4473,15 +4486,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     transaction.limitLevelZeroSegments(table.id, MAX_LEVEL_ZERO_SEGMENTS);
     const blockStager = new BoundedWriteBlockStager(transaction, this.#rememberWrittenBlock);
     let resolvedKeys = keys;
-    let segmentId: string | null = null;
     const columnBlockIds: Record<string, string[]> = {};
-    let storedBytes = 0;
-    let blockCount = 0;
     let counts: { inserted: number; updated: number } | undefined;
     let skippedRowCount = 0;
     let acceptedRowIndexes = await rowIndexesSliced(requestedRowCount);
     let upsertFirings: UpsertFirings | undefined;
-    let encodeMs = 0;
     let stageMs = 0;
     let commitMs = 0;
     let retries = 0;
@@ -4518,7 +4527,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           upsertKeyColumn,
           input,
           rowCount,
-          (sql, params) => this.#sessionQuery(transaction, sql, { params }),
+          (sql, params) => this.#unstagedWriteQuery(transaction, sql, params),
           normalizedConflictWhere,
         );
       }
@@ -4530,11 +4539,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         const filtered = applyUpsertConflictFilter(input, rowCount, upsertFirings);
         acceptedRowIndexes = filtered.acceptedRowIndexes;
         skippedRowCount = filtered.skippedRowCount;
-        input = filtered.batch;
+        // A guard that refused nothing hands the same batch back: its size and keys stand.
+        if (filtered.batch !== input) {
+          input = filtered.batch;
+          logicalBytes = await estimateBatchBytesSliced(input);
+          resolvedKeys = await batchKeys(table, input);
+        }
         rowCount = filtered.rowCount;
         upsertFirings = filtered.firings;
-        logicalBytes = await estimateBatchBytesSliced(input);
-        resolvedKeys = await batchKeys(table, input);
         if (rowCount === 0) {
           await transaction.abort();
           const version = transaction.snapshotVersion;
@@ -4597,7 +4609,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         start: reserved.start,
         endExclusive: reserved.start + BigInt(rowCount),
       };
-      segmentId = this.#createId();
+      const segmentId = this.#createId();
       // Insert batches maintain any active full-text index by tokenizing their own rows into a
       // commit delta. Other mutation kinds emit nothing on purpose: the store's stale-writer
       // rule then flips the index to "invalid" (keyed histories are unindexable) and the scan
@@ -4619,108 +4631,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         );
       }
       await maybeYieldToEventLoop();
-      const plannedColumns = table.columns.map((column) =>
-        writeColumnValues(column.type, input.columns[column.name] ?? []),
-      );
-      await maybeYieldToEventLoop();
-      const ranges = await writeBlockRangesSliced(
-        plannedColumns,
+      const {
+        waitedMs: encodeMs,
+        storedBytes,
+        blockCount,
+      } = await this.#encodeSegmentBlocks(
+        blockStager,
+        `table/${table.id}/segment/${segmentId}/column`,
+        table.columns,
+        table.columns.map((column) => input.columns[column.name] ?? []),
         rowCount,
-        this.#rowsPerBlock,
-        this.#targetBlockBytes,
+        columnBlockIds,
+        false,
       );
-      const plannedBlocks: Array<{
-        column: TableColumnRecord;
-        values: readonly BatchValue[];
-        plannedColumn: WriteColumnValues;
-        start: number;
-        end: number;
-        part: number;
-        maximumStoredBytes: number;
-      }> = [];
-      for (const [columnIndex, column] of table.columns.entries()) {
-        const values = input.columns[column.name] ?? [];
-        const plannedColumn = plannedColumns[columnIndex];
-        if (plannedColumn === undefined)
-          throw new Error(`Write column disappeared: ${column.name}`);
-        columnBlockIds[column.id] = [];
-        for (const [part, { start, end }] of ranges.entries()) {
-          // Measuring a string block's bytes reads each of its values.
-          await maybeYieldToEventLoop();
-          plannedBlocks.push({
-            column,
-            values,
-            plannedColumn,
-            start,
-            end,
-            part,
-            maximumStoredBytes: maximumWriteBlockStoredBytes(
-              plannedColumn,
-              start,
-              end,
-              this.#compression,
-            ),
-          });
-        }
-      }
-      for (let next = 0; next < plannedBlocks.length;) {
-        const group: typeof plannedBlocks = [];
-        let maximumGroupBytes = 0;
-        while (next < plannedBlocks.length && group.length < WRITE_ENCODE_CONCURRENCY) {
-          const candidate = plannedBlocks[next];
-          if (candidate === undefined) break;
-          if (
-            group.length > 0 &&
-            maximumGroupBytes + candidate.maximumStoredBytes > MAX_TRANSACTION_STAGE_BYTES
-          ) {
-            break;
-          }
-          group.push(candidate);
-          maximumGroupBytes += candidate.maximumStoredBytes;
-          next += 1;
-        }
-        await blockStager.prepareBatch(group.length, maximumGroupBytes);
-        const encodeStarted = performance.now();
-        // Each encode runs its synchronous part before its first await. Starting them one at a
-        // time, with a turn offered before each, keeps those parts apart while their
-        // compression still runs concurrently.
-        const pending: Array<Promise<{ columnId: string; blockId: string; bytes: Uint8Array }>> =
-          [];
-        for (const { column, values, start, end, part } of group) {
-          await maybeYieldToEventLoop();
-          const encoding = (async () => {
-            const bytes = await this.#encodeColumnBlock(
-              column.id,
-              asColumnInput(column.type, values.slice(start, end)),
-            );
-            const blockId = [
-              "table",
-              table.id,
-              "segment",
-              segmentId,
-              "column",
-              column.id,
-              "part",
-              String(part).padStart(6, "0"),
-            ].join("/");
-            return { columnId: column.id, blockId, bytes };
-          })();
-          // Observed now: one that fails while a later one is still being started must not
-          // surface as unhandled. Promise.all below still receives the failure.
-          encoding.catch(() => undefined);
-          pending.push(encoding);
-        }
-        const encoded = await Promise.all(pending);
-        encodeMs += performance.now() - encodeStarted;
-        // Promise.all preserves column/range order even when native compressors finish out of
-        // order. The group bound means their completed buffers plus the accumulator stay finite.
-        for (const block of encoded) {
-          blockStager.add({ id: block.blockId, bytes: block.bytes });
-          columnBlockIds[block.columnId]?.push(block.blockId);
-          storedBytes += block.bytes.byteLength;
-          blockCount += 1;
-        }
-      }
 
       const segment: SegmentRecord = {
         id: segmentId,
@@ -7271,9 +7194,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   async #pointReadResult(
     shape: PointReadShape,
     options: QueryOptions,
+    /** Serve only from exactly this manifest version; any other declines the read. */
+    expectedVersion?: number | null,
   ): Promise<QueryResult | undefined> {
     pointReadTestHooks.attempted += 1;
     const probe = await this.store.getCatalogProbe();
+    if (expectedVersion !== undefined && probe.manifestVersion !== expectedVersion) {
+      return undefined;
+    }
     // A database that has never rekeyed proves the absence of forwards once per catalog epoch.
     const forwards =
       !this.#keyForwardsTableSeen && this.#keyForwardsTableAbsentAt === probe.catalogEpoch
@@ -7284,15 +7212,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const result = await this.#withSharedCatalogSnapshot(
       [shape.table],
       (snapshot, realTables, visibility) =>
-        this.#pointReadAtSnapshot(
-          shape,
-          snapshot,
-          realTables,
-          visibility,
-          options,
-          forwards,
-          forwardedTables,
-        ),
+        expectedVersion !== undefined && snapshot.version !== expectedVersion
+          ? Promise.resolve(undefined)
+          : this.#pointReadAtSnapshot(
+              shape,
+              snapshot,
+              realTables,
+              visibility,
+              options,
+              forwards,
+              forwardedTables,
+            ),
       probe,
     );
     if (result !== undefined) {
@@ -7300,6 +7230,44 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       options.onStats?.({ peakMemoryBytes: 0 });
     }
     return result;
+  }
+
+  /**
+   * A read for a write whose transaction has staged nothing yet. Its view is then exactly the
+   * committed snapshot it pinned, so a keyed read takes the ordinary point-read path at that
+   * version — whose visible history is carried from one commit to the next — rather than the
+   * transaction overlay's, which lists the table's segments and proves their history again on
+   * each statement. Anything that path declines, or a manifest that has moved past the pinned
+   * version, reads through the transaction.
+   */
+  async #unstagedWriteQuery(
+    transaction: DatabaseTransaction,
+    sql: string,
+    params: readonly QueryValue[],
+  ): Promise<QueryResult> {
+    if (
+      !pointReadTestHooks.disabled &&
+      transaction.stagedSegments.length === 0 &&
+      transaction.snapshotVersion !== null
+    ) {
+      const compiled = this.#queries.compile(sql);
+      const template =
+        (compiled.parameterCount ?? 0) === params.length ? cachedPointReadTemplate(compiled) : null;
+      const shape = template === null ? undefined : resolvePointReadShape(template, params);
+      if (shape !== undefined) {
+        try {
+          const point = await this.#pointReadResult(
+            shape,
+            this.#effectiveQueryOptions({ params: [...params] }),
+            transaction.snapshotVersion,
+          );
+          if (point !== undefined) return point;
+        } catch (error) {
+          if (!(error instanceof UnknownTableError)) throw error;
+        }
+      }
+    }
+    return this.#sessionQuery(transaction, sql, { params: [...params] });
   }
 
   /**
@@ -7371,12 +7339,47 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       };
       const plan = await this.#pointReadPlan(single, table, snapshot, visibility);
       if (plan.kind === "ineligible") return undefined;
+      if (
+        plan.kind === "delta" &&
+        members.column === plan.keyColumn.name &&
+        !shape.equalities.some((equality) => equality.column === plan.keyColumn.name)
+      ) {
+        // Over a mutation history, one pass per segment serves every member: a lookup per
+        // member re-searched each unsorted delta block once for each of them.
+        const keyType = plan.equalityTypes[shape.equalities.length];
+        if (
+          !shape.equalities.every((equality, index) =>
+            storageTypeMatches(plan.equalityTypes[index], equality.value),
+          ) ||
+          !members.values.every((value) => storageTypeMatches(keyType, value))
+        ) {
+          return undefined;
+        }
+        const replayed = await this.#pointReadThroughDeltas(
+          plan,
+          members.values,
+          shape.equalities,
+          snapshot,
+          visibility,
+          options,
+        );
+        if (replayed === undefined) return undefined;
+        if (plan.count !== undefined) return countResult(plan.count, replayed.length);
+        return {
+          columns: [...plan.columns],
+          columnDomains: [...plan.columnDomains],
+          rows: replayed,
+        };
+      }
       const rows: QueryRow[] = [];
       let columns: readonly string[] = plan.columns;
       let columnDomains: ReadonlyArray<SqlDomain | null> = plan.columnDomains;
       const last = equalities.length - 1;
       for (const value of members.values) {
         throwIfAborted(options.signal);
+        // A cached point read settles without a macrotask; thousands in a row would hold the
+        // thread through the whole statement.
+        if (sliceExpired()) await yieldToEventLoop();
         equalities[last] = { column: members.column, value };
         const member = await this.#servePointRead(plan, single, snapshot, visibility, options);
         if (member === undefined) return undefined;
@@ -7455,14 +7458,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     // case belongs to the ordinary executor.
     const equalities = shape.equalities;
     for (let index = 0; index < equalities.length; index += 1) {
-      const type = plan.equalityTypes[index];
-      const value = equalities[index]?.value;
-      if (!(
-        (type === "number" && typeof value === "number") ||
-        (type === "string" && typeof value === "string") ||
-        (type === "boolean" && typeof value === "boolean") ||
-        (type === "datetime" && value instanceof Date)
-      )) {
+      if (!storageTypeMatches(plan.equalityTypes[index], equalities[index]?.value)) {
         return undefined;
       }
     }
@@ -7475,21 +7471,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       // Update and delete deltas are replayed for the one key instead of the whole table: a
       // scalar key identifies its row in every segment, so the row's history is a handful of
       // small blocks. A composite (hidden) key keeps the ordinary replay.
-      // Outside a scope, a history too long to replay cheaply is one compaction should have
-      // folded, and the scan is the honest answer. Inside one, the staged segments cannot fold
-      // before the commit and the scan would walk the same segments in full: replay them all.
-      return this.#pointReadThroughDeltas(
-        shape,
-        plan.keyColumn,
-        plan.segments,
-        plan.equalityColumns,
-        plan.projected,
+      const key = equalities.find((equality) => equality.column === plan.keyColumn.name);
+      if (key === undefined) return undefined;
+      const rows = await this.#pointReadThroughDeltas(
+        plan,
+        [key.value],
+        equalities,
         snapshot,
+        visibility,
         options,
-        visibility.overlayTransactionId === undefined
-          ? MAX_POINT_READ_DELTA_BLOCKS
-          : Number.POSITIVE_INFINITY,
       );
+      return rows === undefined
+        ? undefined
+        : { columns: [...plan.columns], columnDomains: [...plan.columnDomains], rows };
     }
     const searchValue = equalities[plan.searchEquality]?.value;
     if (searchValue === undefined) return undefined;
@@ -7570,13 +7564,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           for (let index = 0; index < equalities.length; index += 1) {
             const columnVector = vectors[plan.equalityVectors[index] ?? 0];
             if (columnVector === undefined) return undefined;
-            const stored = vectorValue(columnVector, slot);
-            const wanted = equalities[index]?.value;
-            const equal =
-              wanted instanceof Date
-                ? stored instanceof Date && dateMilliseconds(stored) === dateMilliseconds(wanted)
-                : stored === wanted;
-            if (!equal) {
+            if (!pointValueEquals(vectorValue(columnVector, slot), equalities[index]?.value)) {
               matches = false;
               break;
             }
@@ -7587,19 +7575,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             const item = plan.projected[index];
             const columnVector = vectors[plan.projectedVectors[index] ?? 0];
             if (item === undefined || columnVector === undefined) return undefined;
-            const value = vectorValue(columnVector, slot);
-            if (typeof value === "string" && value.charCodeAt(0) === 0) {
-              // A domain column's stored scalar is expected here: it carries the internal
-              // tag and is stripped by the shared externalization boundary. Anything else in
-              // the NUL namespace — plain text crossing through the ordinary executor's
-              // wrapping rules, or an untagged value where a tag is required — is not
-              // provably reproduced, so the whole statement falls back.
-              if (item.column.sqlDomain === undefined || !isSqlDomainValue(value)) {
-                return undefined;
-              }
-            }
-            if (item.alias === "__proto__") defineSqlResultProperty(row, item.alias, value);
-            else row[item.alias] = value;
+            if (!setPointReadValue(row, item, vectorValue(columnVector, slot))) return undefined;
           }
           rows.push(row);
         }
@@ -7695,6 +7671,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       equalityColumns,
       equalityTypes,
       projected,
+      neededColumns: [
+        ...new Set([...equalityColumns.values(), ...projected.map((item) => item.column)]),
+      ],
       ...(!Array.isArray(select) && select !== "*" ? { count: select.count } : {}),
       columns: projected.map((item) => item.alias),
       columnDomains: projected.map((item) => item.column.sqlDomain ?? null),
@@ -7730,9 +7709,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       (equality) => equality.column === searchColumn.name,
     );
     if (searchEquality < 0) return ineligible;
-    const otherColumns = [
-      ...new Set([...equalityColumns.values(), ...projected.map((item) => item.column)]),
-    ].filter((column) => column.id !== searchColumn.id);
+    const otherColumns = common.neededColumns.filter((column) => column.id !== searchColumn.id);
     const vectorIndex = (column: TableColumnRecord): number =>
       column.id === searchColumn.id
         ? 0
@@ -7860,12 +7837,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       shape.equalities.findIndex((equality) => equality.column === column.name),
     );
     if (prefixEqualities.some((position) => position < 0)) return ineligible;
-    const neededColumns = [
-      ...new Set([
-        ...common.equalityColumns.values(),
-        ...common.projected.map((item) => item.column),
-      ]),
-    ];
+    const neededColumns = common.neededColumns;
     const vectorIndex = (column: TableColumnRecord): number =>
       neededColumns.findIndex((candidate) => candidate.id === column.id);
     const resolved: ResolvedIndexReadSegment[] = [];
@@ -7890,7 +7862,6 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       prefixColumns: best.columns,
       prefixEqualities,
       partial: best.columns.length < indexColumnCount,
-      neededColumns,
       equalityVectors: shape.equalities.map((equality) =>
         vectorIndex(common.equalityColumns.get(equality.column) ?? common.keyColumn),
       ),
@@ -7985,13 +7956,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         for (let index = 0; index < equalities.length; index += 1) {
           const columnVector = vectors[plan.equalityVectors[index] ?? -1];
           if (columnVector === undefined) return undefined;
-          const stored = vectorValue(columnVector, slot);
-          const wanted = equalities[index]?.value;
-          const equal =
-            wanted instanceof Date
-              ? stored instanceof Date && dateMilliseconds(stored) === dateMilliseconds(wanted)
-              : stored === wanted;
-          if (!equal) {
+          if (!pointValueEquals(vectorValue(columnVector, slot), equalities[index]?.value)) {
             matches = false;
             break;
           }
@@ -8002,13 +7967,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           const item = plan.projected[index];
           const columnVector = vectors[plan.projectedVectors[index] ?? -1];
           if (item === undefined || columnVector === undefined) return undefined;
-          const value = vectorValue(columnVector, slot);
-          if (typeof value === "string" && value.charCodeAt(0) === 0) {
-            // As for a key read: only a domain column's tagged scalar is provably reproduced.
-            if (item.column.sqlDomain === undefined || !isSqlDomainValue(value)) return undefined;
-          }
-          if (item.alias === "__proto__") defineSqlResultProperty(output, item.alias, value);
-          else output[item.alias] = value;
+          if (!setPointReadValue(output, item, vectorValue(columnVector, slot))) return undefined;
         }
         rows.push(output);
       }
@@ -8058,36 +8017,48 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   /**
-   * A keyed point read over a mutation history: the segments are walked in visible order,
-   * an insert lands the row, a delete unmaps it, and an update patches the columns it carries
-   * — the same last-writer-wins replay the streamed mutation table performs, applied to one
-   * key. The remaining equalities are checked on the row as it stands at the end, since an
-   * update may have changed a filtered column. Falls back when the history is wide enough
-   * that decoding it would not beat the ordinary path.
+   * A keyed point read over a mutation history: the segments are walked in visible order, an
+   * insert lands a row, a delete unmaps it, and an update patches the columns it carries — the
+   * same last-writer-wins replay the streamed mutation table performs, applied only to `keys`
+   * (distinct and ascending: one lookup, or a whole `key IN (…)`). Each segment's key blocks are
+   * read once for every key their zones admit, and a block several keys share is searched in one
+   * pass. `equalities` are checked on each row as it stands at the end, since an update may have
+   * changed a filtered column; rows come back in key order. Falls back when the history is wide
+   * enough that replaying it would not beat the ordinary path: some key would decode more than
+   * `maxDecodedBlocks` blocks, or its row is ambiguous.
    */
   async #pointReadThroughDeltas(
-    shape: PointReadShape,
-    keyColumn: TableColumnRecord,
-    segments: readonly SegmentRecord[],
-    equalityColumns: ReadonlyMap<string, TableColumnRecord>,
-    projected: ReadonlyArray<{ column: TableColumnRecord; alias: string }>,
+    plan: Extract<ResolvedPointRead, { kind: "delta" }>,
+    keys: ReadonlyArray<PointReadEquality["value"]>,
+    equalities: readonly PointReadEquality[],
     snapshot: LeasedSnapshot,
+    visibility: SegmentVisibilityCatalog,
     options: QueryOptions,
-    maxDecodedBlocks = MAX_POINT_READ_DELTA_BLOCKS,
-  ): Promise<QueryResult | undefined> {
-    const keyEquality = shape.equalities.find((equality) => equality.column === keyColumn.name);
-    if (keyEquality === undefined) return undefined;
-    const target =
-      keyEquality.value instanceof Date ? dateMilliseconds(keyEquality.value) : keyEquality.value;
-    const neededColumns = [
-      ...new Set([...equalityColumns.values(), ...projected.map((item) => item.column)]),
-    ];
-    let current: Map<string, QueryValue> | undefined;
-    let decodedBlocks = 0;
+  ): Promise<QueryRow[] | undefined> {
+    // Outside a scope, a history too long to replay cheaply is one compaction should have
+    // folded, and the scan is the honest answer. Inside one, the staged segments cannot fold
+    // before the commit and the scan would walk the same segments in full: replay them all.
+    const maxDecodedBlocks =
+      visibility.overlayTransactionId === undefined
+        ? MAX_POINT_READ_DELTA_BLOCKS
+        : Number.POSITIVE_INFINITY;
+    const keyColumn = plan.keyColumn;
+    const keyCount = keys.length;
+    const targets = keys.map((key) => (key instanceof Date ? dateMilliseconds(key) : key));
+    const numeric = typeof targets[0] === "number";
+    const segments = plan.segments;
+    // Plain arrays: a lookup of one key would pay more to allocate typed ones than to use them.
+    const current = new Array<Map<string, QueryValue> | undefined>(keyCount);
+    const decoded = new Array<number>(keyCount).fill(0);
+    /** Counts `blocks` more decoded for `key`: true once that is more than its replay allows. */
+    const exhausts = (key: number, blocks: number): boolean =>
+      (decoded[key] = (decoded[key] ?? 0) + blocks) > maxDecodedBlocks;
+    // The slot holding each key in the block at hand, -1 for none.
+    const hits = new Array<number>(keyCount).fill(-1);
     // Read bounded batches of headers once, including single-block deltas. Unrelated keys
-    // cannot affect this row and must not exhaust its unchanged decoded-block replay cap.
+    // cannot affect these rows and must not exhaust their decoded-block replay cap.
     let zones: Float64Array[] | undefined;
-    if (typeof target === "number") {
+    if (numeric) {
       let headerBlocks = 0;
       for (const segment of segments) {
         headerBlocks += segment.columnBlockIds[keyColumn.id]?.length ?? 0;
@@ -8095,111 +8066,154 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
       zones = await this.#segmentKeyZones(segments, keyColumn.id, snapshot);
     }
-    for (const [segmentIndex, segment] of segments.entries()) {
+    // Keys are ascending, so a zone admits one run of them: the first index at or past `bound`.
+    const firstAtLeast = (bound: number, inclusive: boolean): number => {
+      let low = 0;
+      let high = keyCount;
+      while (low < high) {
+        const middle = (low + high) >>> 1;
+        const value = targets[middle] as number;
+        if (inclusive ? value < bound : value <= bound) low = middle + 1;
+        else high = middle;
+      }
+      return low;
+    };
+    let keyByTarget: Map<number | string | boolean, number> | undefined;
+    for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex += 1) {
+      // A long history replayed for many keys is many slices of work; the clock is read every
+      // few segments, so a short history replayed for one key pays nothing for it.
+      if ((segmentIndex & 15) === 15 && sliceExpired()) await yieldToEventLoop();
       throwIfAborted(options.signal);
-      if (segment.rowCount === 0) continue;
+      const segment = segments[segmentIndex];
+      if (segment === undefined || segment.rowCount === 0) continue;
       const keyBlockIds = segment.columnBlockIds[keyColumn.id] ?? [];
       if (keyBlockIds.length === 0) return undefined;
-      let blockIndexes: number[];
       const segmentZones = zones?.[segmentIndex];
-      if (typeof target === "number" && segmentZones !== undefined) {
-        // Most deltas in a long history hold other keys: rule them out before allocating.
-        blockIndexes = [];
-        for (let blockIndex = 0; blockIndex < keyBlockIds.length; blockIndex += 1) {
-          const min = segmentZones[blockIndex * 2] ?? Number.NEGATIVE_INFINITY;
-          const max = segmentZones[blockIndex * 2 + 1] ?? Number.POSITIVE_INFINITY;
-          if (min <= target && target <= max) blockIndexes.push(blockIndex);
+      // Each candidate block as (block, begin, end): the [begin, end) run of keys its zone
+      // admits. Most deltas in a long history hold other keys: rule them out before allocating.
+      let candidates: number[] | undefined;
+      for (let blockIndex = 0; blockIndex < keyBlockIds.length; blockIndex += 1) {
+        let begin = 0;
+        let end = keyCount;
+        if (segmentZones !== undefined) {
+          begin = firstAtLeast(segmentZones[blockIndex * 2] ?? Number.NEGATIVE_INFINITY, true);
+          end = firstAtLeast(segmentZones[blockIndex * 2 + 1] ?? Number.POSITIVE_INFINITY, false);
         }
-      } else {
-        blockIndexes = keyBlockIds.map((_, index) => index);
+        if (begin >= end) continue;
+        (candidates ??= []).push(blockIndex, begin, end);
+        for (let key = begin; key < end; key += 1) if (exhausts(key, 1)) return undefined;
       }
-      if (blockIndexes.length === 0) continue;
-      decodedBlocks += blockIndexes.length;
-      if (decodedBlocks > maxDecodedBlocks) return undefined;
-      const keyBlocks = await this.#pointReadVectors(
-        blockIndexes.map((blockIndex) => keyBlockIds[blockIndex] ?? ""),
-        snapshot,
-      );
-      for (const [position, blockIndex] of blockIndexes.entries()) {
-        const keyVector = keyBlocks[position];
-        if (keyVector === undefined) return undefined;
-        const blockId = keyBlockIds[blockIndex] ?? "";
-        if (keyVector.kind !== keyColumn.type) return undefined;
-        const slots = this.#keySlotsInBlock(blockId, keyVector, target);
-        if (slots === undefined) return undefined;
-        if (slots.length === 0) continue;
-        if (slots.length > 1) return undefined;
-        const slot = slots[0] ?? 0;
-        if (segment.kind === "delete") {
-          current = undefined;
-          continue;
+      if (candidates === undefined) continue;
+      const candidateIds: string[] = [];
+      for (let at = 0; at < candidates.length; at += 3) {
+        candidateIds.push(keyBlockIds[candidates[at] ?? 0] ?? "");
+      }
+      const keyBlocks = await this.#pointReadVectors(candidateIds, snapshot);
+      // An upsert carries the whole row and replaces whatever the key held before; an insert
+      // must find the key absent; an update carries the columns it changed.
+      let carried: TableColumnRecord[] | undefined;
+      for (let at = 0; at < candidates.length; at += 3) {
+        const keyVector = keyBlocks[at / 3];
+        if (keyVector?.kind !== keyColumn.type) return undefined;
+        const blockIndex = candidates[at] ?? 0;
+        const blockId = candidateIds[at / 3] ?? "";
+        const begin = candidates[at + 1] ?? 0;
+        const end = candidates[at + 2] ?? 0;
+        hits.fill(-1, begin, end);
+        const scanned =
+          end - begin > 1 &&
+          ((keyVector.kind === "string" && typeof targets[begin] === "string") ||
+            ((keyVector.kind === "number" || keyVector.kind === "datetime") &&
+              typeof targets[begin] === "number" &&
+              (keyVector.nullCount !== 0 || !valuesAreAscending(keyVector.values))));
+        if (scanned) {
+          // Several keys and a block only a scan can search: one pass finds all of them.
+          let codes: Map<number, number> | undefined;
+          if (keyVector.kind === "string") {
+            codes = new Map();
+            for (let key = begin; key < end; key += 1) {
+              const code = this.#dictionaryCode(blockId, keyVector, targets[key] as string);
+              if (code !== undefined) codes.set(code, key);
+            }
+          } else {
+            keyByTarget ??= new Map(targets.map((target, key) => [target, key]));
+          }
+          for (let slot = 0; slot < keyVector.length; slot += 1) {
+            const key =
+              keyVector.kind === "string"
+                ? codes?.get(keyVector.codes[slot] ?? NULL_STRING_VECTOR_CODE)
+                : keyByTarget?.get(keyVector.values[slot] ?? Number.NaN);
+            if (key === undefined || key < begin || key >= end) continue;
+            if (vectorValue(keyVector, slot) === null) continue;
+            if ((hits[key] ?? -1) >= 0) return undefined;
+            hits[key] = slot;
+          }
+        } else {
+          for (let key = begin; key < end; key += 1) {
+            const slots = this.#keySlotsInBlock(blockId, keyVector, targets[key] ?? Number.NaN);
+            if (slots === undefined || slots.length > 1) return undefined;
+            if (slots.length === 1) hits[key] = slots[0] ?? 0;
+          }
         }
-        if (segment.kind === "update" && current === undefined) continue;
-        // An upsert carries the whole row and replaces whatever the key held before; an
-        // insert must find the key absent. Both read every needed column of this row.
-        const carried =
-          segment.kind === "update"
-            ? neededColumns.filter(
-                (column) =>
-                  column.id !== keyColumn.id && segment.columnBlockIds[column.id] !== undefined,
-              )
-            : neededColumns.filter((column) => column.id !== keyColumn.id);
-        const blockIds = carried.map((column) => segment.columnBlockIds[column.id]?.[blockIndex]);
-        if (blockIds.some((id) => id === undefined)) return undefined;
-        decodedBlocks += blockIds.length;
-        if (decodedBlocks > maxDecodedBlocks) return undefined;
-        const blocks = await this.#pointReadVectors(blockIds as string[], snapshot);
-        const values =
-          segment.kind === "update" && current !== undefined
-            ? current
-            : new Map<string, QueryValue>();
-        if (segment.kind !== "update") {
-          if (current !== undefined && segment.kind !== "upsert") return undefined;
-          values.set(keyColumn.name, vectorValue(keyVector, slot));
+        let blocks: ColumnVector[] | undefined;
+        for (let key = begin; key < end; key += 1) {
+          const slot = hits[key] ?? -1;
+          if (slot < 0) continue;
+          if (segment.kind === "delete") {
+            current[key] = undefined;
+            continue;
+          }
+          const previous = current[key];
+          if (segment.kind === "update" && previous === undefined) continue;
+          carried ??= plan.neededColumns.filter(
+            (column) =>
+              column.id !== keyColumn.id &&
+              (segment.kind !== "update" || segment.columnBlockIds[column.id] !== undefined),
+          );
+          if (exhausts(key, carried.length)) return undefined;
+          if (blocks === undefined) {
+            const blockIds = carried.map(
+              (column) => segment.columnBlockIds[column.id]?.[blockIndex],
+            );
+            if (blockIds.some((id) => id === undefined)) return undefined;
+            blocks = await this.#pointReadVectors(blockIds as string[], snapshot);
+          }
+          const values =
+            segment.kind === "update" && previous !== undefined
+              ? previous
+              : new Map<string, QueryValue>();
+          if (segment.kind !== "update") {
+            if (previous !== undefined && segment.kind !== "upsert") return undefined;
+            values.set(keyColumn.name, vectorValue(keyVector, slot));
+          }
+          for (let index = 0; index < carried.length; index += 1) {
+            const vector = blocks[index];
+            const column = carried[index];
+            if (vector?.length !== keyVector.length || vector.kind !== column?.type)
+              return undefined;
+            values.set(column.name, vectorValue(vector, slot));
+          }
+          current[key] = values;
         }
-        for (const [index, column] of carried.entries()) {
-          const vector = blocks[index];
-          if (vector?.length !== keyVector.length) return undefined;
-          if (vector.kind !== column.type) return undefined;
-          values.set(column.name, vectorValue(vector, slot));
-        }
-        current = values;
       }
     }
     const rows: QueryRow[] = [];
-    if (current !== undefined) {
-      let matches = true;
-      for (const equality of shape.equalities) {
-        const stored = current.get(equality.column);
-        const wanted = equality.value;
-        const equal =
-          wanted instanceof Date
-            ? stored instanceof Date && dateMilliseconds(stored) === dateMilliseconds(wanted)
-            : stored === wanted;
-        if (!equal) {
-          matches = false;
-          break;
-        }
+    rows: for (let key = 0; key < keyCount; key += 1) {
+      const values = current[key];
+      if (values === undefined || !pointValueEquals(values.get(keyColumn.name), keys[key])) {
+        continue;
       }
-      if (matches) {
-        const row: QueryRow = {};
-        for (const item of projected) {
-          const value = current.get(item.column.name);
-          if (value === undefined) return undefined;
-          if (typeof value === "string" && value.charCodeAt(0) === 0) {
-            if (item.column.sqlDomain === undefined || !isSqlDomainValue(value)) return undefined;
-          }
-          if (item.alias === "__proto__") defineSqlResultProperty(row, item.alias, value);
-          else row[item.alias] = value;
-        }
-        rows.push(row);
+      for (const equality of equalities) {
+        if (!pointValueEquals(values.get(equality.column), equality.value)) continue rows;
       }
+      const row: QueryRow = {};
+      for (const item of plan.projected) {
+        const value = values.get(item.column.name);
+        if (value === undefined || !setPointReadValue(row, item, value)) return undefined;
+      }
+      rows.push(row);
     }
-    return {
-      columns: projected.map((item) => item.alias),
-      columnDomains: projected.map((item) => item.column.sqlDomain ?? null),
-      rows,
-    };
+    return rows;
   }
 
   /** The dictionary code for a value in one block's string vector, reverse-mapped and cached. */
@@ -9899,8 +9913,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const quote = quoteSqlIdentifier;
     const keyValues = batch.columns[keyColumn.name] ?? [];
     const distinct = new Map<string, Exclude<BatchValue, null>>();
-    for (const value of keyValues) {
-      if (value !== null) distinct.set(keyToken(keyColumn.type, value), value);
+    const tokens = new Array<string>(rowCount);
+    for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
+      const value = keyValues[rowIndex] ?? null;
+      if (value === null) {
+        tokens[rowIndex] = "";
+        continue;
+      }
+      const token = keyToken(keyColumn.type, value);
+      tokens[rowIndex] = token;
+      distinct.set(token, value);
     }
     const params = [...distinct.values()];
     const rows: QueryRow[] = [];
@@ -9942,9 +9964,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const skipped: number[] = [];
     const oldImages: Array<Record<string, BatchValue> | undefined> = [];
     const currentByToken = new Map(byToken);
+    // A row's own image is what a later row of the batch with the same key replaces. Only a
+    // repeated key can be that later row, and it reads only what the stored image would have
+    // carried: every column for a trigger's OLD, otherwise just the projected columns. Building a
+    // whole-row image for every row of a wide batch cost more than the rest of the classification.
+    const repeatsKeys = distinct.size < rowCount;
+    const imageColumns = fires
+      ? table.columns
+      : table.columns.filter((column) => projectedColumns.has(column.name));
     for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
-      const key = keyValues[rowIndex] ?? null;
-      const token = key === null ? "" : keyToken(keyColumn.type, key);
+      const token = tokens[rowIndex] ?? "";
       const old = currentByToken.get(token);
       if (old === undefined) {
         inserts.push(rowIndex);
@@ -9966,10 +9995,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
         updates.push(rowIndex);
       }
+      if (!repeatsKeys) continue;
       currentByToken.set(
         token,
         Object.fromEntries(
-          table.columns.map((column) => [
+          imageColumns.map((column) => [
             column.name,
             batch.columns[column.name]?.[rowIndex] ?? null,
           ]),
@@ -10342,41 +10372,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const segmentId = this.#createId();
     const columnBlockIds: Record<string, string[]> = {};
     const blockStager = new BoundedWriteBlockStager(transaction, this.#rememberWrittenBlock);
-    const plannedColumns = table.columns.map((column) =>
-      writeColumnValues(column.type, batch.columns[column.name] ?? []),
-    );
-    const ranges = await writeBlockRangesSliced(
-      plannedColumns,
+    await this.#encodeSegmentBlocks(
+      blockStager,
+      `table/${table.id}/segment/${segmentId}/column`,
+      table.columns,
+      table.columns.map((column) => batch.columns[column.name] ?? []),
       rowCount,
-      this.#rowsPerBlock,
-      this.#targetBlockBytes,
+      columnBlockIds,
+      true,
     );
-    for (const [columnIndex, column] of table.columns.entries()) {
-      const values = batch.columns[column.name] ?? [];
-      const plannedColumn = plannedColumns[columnIndex];
-      if (plannedColumn === undefined) throw new Error(`Write column disappeared: ${column.name}`);
-      const blockIds: string[] = [];
-      for (const [part, { start, end }] of ranges.entries()) {
-        await blockStager.prepare(
-          maximumWriteBlockStoredBytes(plannedColumn, start, end, this.#compression),
-        );
-        const slice = values.slice(start, end);
-        const bytes = await this.#encodeColumnBlock(column.id, asColumnInput(column.type, slice));
-        const blockId = [
-          "table",
-          table.id,
-          "segment",
-          segmentId,
-          "column",
-          column.id,
-          "part",
-          String(part).padStart(6, "0"),
-        ].join("/");
-        blockStager.add({ id: blockId, bytes });
-        blockIds.push(blockId);
-      }
-      columnBlockIds[column.id] = blockIds;
-    }
     const segment: SegmentRecord = {
       id: segmentId,
       tableId: table.id,
@@ -11681,12 +11685,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   /**
-   * Committed rows for keys the write set cannot vouch for, read the way a keyed SELECT is
-   * read: one point read per key over the scope's pinned snapshot and its once-listed
-   * committed segments, replaying only that key's history. The general path this replaces
-   * leased, listed every segment and owner, and scanned the table's whole delta history per
-   * call, so a guarded upsert over a long history cost milliseconds. Undefined when a key's
-   * value or the table's layout keeps the point read from answering; the caller scans then.
+   * Committed rows for keys the write set cannot vouch for, in ascending key order, read the way
+   * `key IN (…)` is read: one point read for all of them over the scope's pinned snapshot and
+   * its once-listed committed segments, replaying only those keys' history and searching each
+   * delta segment once for all of them. The general path this replaces leased, listed every
+   * segment and owner, and scanned the table's whole delta history per call, so a guarded upsert
+   * over a long history cost milliseconds. Undefined when a key's value or the table's layout
+   * keeps the point read from answering; the caller scans then.
    */
   async #scopeCommittedRowsByKey(
     transaction: DatabaseTransaction,
@@ -11708,6 +11713,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
       values.push(key);
     }
+    const members = ascendingMembers(values);
+    if (members === undefined) return values.length === 0 ? [] : undefined;
     const { segments, records } = await this.#scopeCommittedSegments(transaction, table);
     const visibility: SegmentVisibilityCatalog = {
       transactions: new Map(records.map((record) => [record.id, record] as const)),
@@ -11716,22 +11723,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const realTables = new Map([[table.name, table]]);
     const select = names.map((name) => ({ column: name, alias: name }));
     return this.#withLeasedSnapshot(transaction.snapshotVersion, async (snapshot) => {
-      const rows: QueryRow[] = [];
-      for (const value of values) {
-        // A cached point read settles without a macrotask; thousands in a row would hold the
-        // thread through the whole statement.
-        await maybeYieldToEventLoop();
-        const result = await this.#pointReadAtSnapshot(
-          { table: table.name, equalities: [{ column: keyColumn.name, value }], select },
-          snapshot,
-          realTables,
-          visibility,
-          {},
-        );
-        if (result === undefined) return undefined;
-        rows.push(...result.rows);
-      }
-      return rows;
+      const result = await this.#pointReadAtSnapshot(
+        {
+          table: table.name,
+          equalities: [],
+          members: { column: keyColumn.name, values: members },
+          select,
+        },
+        snapshot,
+        realTables,
+        visibility,
+        {},
+      );
+      return result?.rows;
     });
   }
 
@@ -12542,48 +12546,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     input: UpdateBatchInput,
   ): Promise<string> {
     const changedColumns = Object.keys(input.changes).sort();
-    const columns = [keyColumn, ...changedColumns.map((name) => findColumn(table, name))];
     const segmentId = this.#createId();
     const columnBlockIds: Record<string, string[]> = {};
     const blockStager = new BoundedWriteBlockStager(transaction, this.#rememberWrittenDeltaBlock);
-    const plannedColumns = columns.map((column) =>
-      writeColumnValues(
-        column.type,
-        column.id === keyColumn.id ? input.keys : (input.changes[column.name] ?? []),
-      ),
-    );
-    const ranges = await writeBlockRangesSliced(
-      plannedColumns,
+    await this.#encodeSegmentBlocks(
+      blockStager,
+      `table/${table.id}/segment/${segmentId}/update-column`,
+      [keyColumn, ...changedColumns.map((name) => findColumn(table, name))],
+      [input.keys, ...changedColumns.map((name) => input.changes[name] ?? [])],
       input.keys.length,
-      this.#rowsPerBlock,
-      this.#targetBlockBytes,
+      columnBlockIds,
+      true,
     );
-    for (const [columnIndex, column] of columns.entries()) {
-      const values = column.id === keyColumn.id ? input.keys : (input.changes[column.name] ?? []);
-      const plannedColumn = plannedColumns[columnIndex];
-      if (plannedColumn === undefined) throw new Error(`Write column disappeared: ${column.name}`);
-      const blockIds: string[] = [];
-      for (const [part, { start, end }] of ranges.entries()) {
-        await blockStager.prepare(
-          maximumWriteBlockStoredBytes(plannedColumn, start, end, this.#compression),
-        );
-        const slice = values.slice(start, end);
-        const bytes = await this.#encodeColumnBlock(column.id, asColumnInput(column.type, slice));
-        const blockId = [
-          "table",
-          table.id,
-          "segment",
-          segmentId,
-          "update-column",
-          column.id,
-          "part",
-          String(part).padStart(6, "0"),
-        ].join("/");
-        blockStager.add({ id: blockId, bytes });
-        blockIds.push(blockId);
-      }
-      columnBlockIds[column.id] = blockIds;
-    }
     await blockStager.stageWithSegments([
       {
         id: segmentId,
@@ -12613,36 +12587,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     values: ReadonlyArray<Exclude<BatchValue, null>>,
   ): Promise<string> {
     const segmentId = this.#createId();
-    const blockIds: string[] = [];
     const blockStager = new BoundedWriteBlockStager(transaction, this.#rememberWrittenDeltaBlock);
-    const plannedColumn = writeColumnValues(keyColumn.type, values);
-    const ranges = await writeBlockRangesSliced(
-      [plannedColumn],
+    const columnBlockIds: Record<string, string[]> = {};
+    await this.#encodeSegmentBlocks(
+      blockStager,
+      `table/${table.id}/segment/${segmentId}/delete-key`,
+      [keyColumn],
+      [values],
       values.length,
-      this.#rowsPerBlock,
-      this.#targetBlockBytes,
+      columnBlockIds,
+      true,
+      "raw",
     );
-    for (const [part, { start, end }] of ranges.entries()) {
-      await blockStager.prepare(maximumWriteBlockStoredBytes(plannedColumn, start, end, "raw"));
-      const slice = values.slice(start, end);
-      const bytes = await this.#encodeColumnBlock(
-        keyColumn.id,
-        asColumnInput(keyColumn.type, slice),
-        "raw",
-      );
-      const blockId = [
-        "table",
-        table.id,
-        "segment",
-        segmentId,
-        "delete-key",
-        keyColumn.id,
-        "part",
-        String(part).padStart(6, "0"),
-      ].join("/");
-      blockStager.add({ id: blockId, bytes });
-      blockIds.push(blockId);
-    }
     await blockStager.stageWithSegments([
       {
         id: segmentId,
@@ -12651,7 +12607,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         rowCount: values.length,
         rowIdStart: 0n,
         rowIdEndExclusive: 0n,
-        columnBlockIds: { [keyColumn.id]: blockIds },
+        columnBlockIds,
         kind: "delete",
         keyColumnId: keyColumn.id,
         level: 0,
@@ -12716,6 +12672,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           "migrate() needs a schema: pass a definition, or construct the database with { schema }",
         );
       }
+      // The schema DSL does not parse SQL, so this is where a declaration's CHECK, DEFAULT, and
+      // generated expressions are first compiled — every table's, before any step applies, so an
+      // invalid expression anywhere leaves the catalog untouched.
+      validateSchemaExpressions(definition);
       // Table revisions also move under background full-text index activity (build stamps,
       // stale-writer invalidation), so a lost compare-and-swap no longer implies a concurrent
       // migrator. Migration is idempotent by construction — re-plan from fresh records and retry;
@@ -19754,16 +19714,40 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             .filter((owner) => owner !== undefined)
             .map((owner) => [owner.id, owner]),
         );
-        // Which of the page's blocks the planning snapshot holds, asked once for the page: that
-        // manifest is immutable, so this is what one question per segment would answer, without
-        // a storage round trip per segment.
-        const pageBlockIds = [
+        // Which of the page's blocks the planning snapshot holds, asked for the page at once:
+        // that manifest is immutable, so this is what one question per segment would answer,
+        // without a storage round trip per segment. A segment touches the snapshot when any one
+        // of its blocks is in it, so each segment's first block is asked first and the rest only
+        // for segments whose first block is absent: a live segment of a hundred-column table
+        // is answered by one block rather than a hundred.
+        const touches = (segment: SegmentRecord, held: ReadonlySet<string>): boolean =>
+          Object.values(segment.columnBlockIds).some((ids) => ids.some((id) => held.has(id)));
+        const firstBlockIds = [
           ...new Set(
-            page.records.flatMap((segment) => Object.values(segment.columnBlockIds).flat()),
+            page.records.flatMap((segment) => {
+              const first = Object.values(segment.columnBlockIds).find((ids) => ids.length > 0);
+              return first === undefined ? [] : [first[0] ?? ""];
+            }),
           ),
         ];
-        const presence = await this.#manifestBlockPresence(currentVersion, pageBlockIds);
-        const current = new Set(pageBlockIds.filter((_, index) => presence[index] === true));
+        const current = new Set<string>();
+        const ask = async (ids: readonly string[]): Promise<void> => {
+          if (ids.length === 0) return;
+          const presence = await this.#manifestBlockPresence(currentVersion, ids);
+          ids.forEach((id, index) => {
+            if (presence[index] === true) current.add(id);
+          });
+        };
+        await ask(firstBlockIds);
+        const asked = new Set(firstBlockIds);
+        await ask([
+          ...new Set(
+            page.records
+              .filter((segment) => !touches(segment, current))
+              .flatMap((segment) => Object.values(segment.columnBlockIds).flat())
+              .filter((id) => !asked.has(id)),
+          ),
+        ]);
         for (const segment of page.records) {
           const listedOwner = owners.get(segment.transactionId);
           if (
@@ -19777,10 +19761,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               updatedAt: job.leaseCutoff,
             });
           }
-          const touchesCurrent = Object.values(segment.columnBlockIds).some((ids) =>
-            ids.some((id) => current.has(id)),
-          );
-          if (!touchesCurrent) addSegments([segment.id]);
+          if (!touches(segment, current)) addSegments([segment.id]);
           if (remaining <= 0) break;
         }
         // The page fits the remaining candidate budget, so every listed segment was visited.
@@ -28165,6 +28146,168 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   }
 
   /**
+   * Encodes one segment's columns, `values` holding each column's vector, into `stager` and lists
+   * the blocks in `columnBlockIds` — each column's list starts empty, in column order — as
+   * `${prefix}/<column id>/part/<part>`. Returns the time spent waiting on the encodes and the
+   * blocks' stored bytes and count.
+   *
+   * Blocks run column-major, one per (column, row range), and form the groups they always have —
+   * at most WRITE_ENCODE_CONCURRENCY, cut where their stored-size bound would cross a stage batch
+   * — and every group opens with the same stage decision, but a block starts as soon as one of the
+   * window's slots frees rather than once its whole group finished, so the native compressors
+   * stay busy while the next blocks encode. A start still waits for anything that could tell the
+   * difference: a block of its column from an earlier group (a column's codec verdict comes from
+   * its own previous block), verdicts the blocks in flight could record that might evict the one
+   * it reads, and — at a group boundary — whether accepting the blocks ahead might flush a batch.
+   *
+   * `columnsInOrder` is for the paths that used to encode one block at a time: a block then waits
+   * for every earlier block of its column, not only those of earlier groups, so each one reads
+   * the verdict its predecessor left exactly as it did when nothing overlapped.
+   */
+  async #encodeSegmentBlocks(
+    stager: BoundedWriteBlockStager,
+    prefix: string,
+    columns: readonly TableColumnRecord[],
+    values: ReadonlyArray<readonly BatchValue[]>,
+    rowCount: number,
+    columnBlockIds: Record<string, string[]>,
+    columnsInOrder: boolean,
+    compression = this.#compression,
+  ): Promise<{ waitedMs: number; storedBytes: number; blockCount: number }> {
+    // Validation measured the batch's own string vectors already; any other — a scope's write
+    // set rebuilds its vectors — is measured here once, for the range planner and the
+    // stored-size bound alike, which would otherwise each measure every one of its strings.
+    const planned: WriteColumnValues[] = [];
+    for (const [index, column] of columns.entries()) {
+      const vector = values[index] ?? [];
+      let lengths = column.type === "string" ? validatedStringByteLengths.get(vector) : undefined;
+      if (column.type === "string" && lengths?.length !== vector.length) {
+        const measured = new Array<number>(vector.length);
+        for (let at = 0; at < vector.length; at += 1) {
+          if ((at & 4095) === 4095 && sliceExpired()) await yieldToEventLoop();
+          const value = vector[at];
+          // Anything else is the planner's to refuse, exactly as it did before.
+          measured[at] = typeof value === "string" ? wellFormedUtf8ByteLength(value) : 0;
+        }
+        lengths = measured;
+      }
+      planned.push(
+        lengths === undefined
+          ? { type: column.type, values: vector }
+          : { type: column.type, values: vector, stringByteLengths: lengths },
+      );
+    }
+    const ranges = await writeBlockRangesSliced(
+      planned,
+      rowCount,
+      this.#rowsPerBlock,
+      this.#targetBlockBytes,
+    );
+    const groups: Array<{ blocks: PlannedWriteBlock[]; maximumBytes: number }> = [];
+    let group = { blocks: [] as PlannedWriteBlock[], maximumBytes: 0 };
+    for (const [index, column] of columns.entries()) {
+      const plannedColumn = planned[index];
+      if (plannedColumn === undefined) throw new Error(`Write column disappeared: ${column.name}`);
+      columnBlockIds[column.id] = [];
+      for (const [part, { start, end }] of ranges.entries()) {
+        // Measuring a string block's bytes reads each of its values.
+        if (sliceExpired()) await yieldToEventLoop();
+        const maximumStoredBytes = maximumWriteBlockStoredBytes(
+          plannedColumn,
+          start,
+          end,
+          compression,
+        );
+        if (
+          group.blocks.length === WRITE_ENCODE_CONCURRENCY ||
+          (group.blocks.length > 0 &&
+            group.maximumBytes + maximumStoredBytes > MAX_TRANSACTION_STAGE_BYTES)
+        ) {
+          groups.push(group);
+          group = { blocks: [], maximumBytes: 0 };
+        }
+        group.blocks.push({
+          column,
+          values: plannedColumn.values as readonly BatchValue[],
+          start,
+          end,
+          part,
+          maximumStoredBytes,
+        });
+        group.maximumBytes += maximumStoredBytes;
+      }
+    }
+    if (group.blocks.length > 0) groups.push(group);
+    const inFlight: Array<{ block: PlannedWriteBlock; group: number; bytes: Promise<Uint8Array> }> =
+      [];
+    let inFlightMaximumBytes = 0;
+    const result = { waitedMs: 0, storedBytes: 0, blockCount: 0 };
+    const acceptOldest = async (): Promise<void> => {
+      const oldest = inFlight[0];
+      if (oldest === undefined) return;
+      const started = performance.now();
+      const bytes = await oldest.bytes;
+      result.waitedMs += performance.now() - started;
+      inFlight.shift();
+      const { column, part, maximumStoredBytes } = oldest.block;
+      inFlightMaximumBytes -= maximumStoredBytes;
+      const id = `${prefix}/${column.id}/part/${String(part).padStart(6, "0")}`;
+      stager.add({ id, bytes });
+      columnBlockIds[column.id]?.push(id);
+      result.storedBytes += bytes.byteLength;
+      result.blockCount += 1;
+    };
+    for (const [groupIndex, { blocks, maximumBytes }] of groups.entries()) {
+      if (
+        inFlight.length > 0 &&
+        !stager.acceptsWithoutFlush(
+          inFlight.length,
+          inFlightMaximumBytes,
+          blocks.length,
+          maximumBytes,
+        )
+      ) {
+        while (inFlight.length > 0) await acceptOldest();
+      }
+      if (inFlight.length === 0) await stager.prepareBatch(blocks.length, maximumBytes);
+      for (const block of blocks) {
+        while (
+          inFlight.length >= WRITE_ENCODE_CONCURRENCY ||
+          (inFlight.length > 0 &&
+            this.#gzipVerdicts.size + inFlight.length >= GZIP_VERDICT_CACHE_LIMIT) ||
+          inFlight.some(
+            (other) =>
+              (columnsInOrder || other.group < groupIndex) &&
+              other.block.column.id === block.column.id,
+          )
+        ) {
+          await acceptOldest();
+        }
+        // Each encode runs its synchronous part before its first await. Starting them one at a
+        // time, with a turn offered before each, keeps those parts apart while their
+        // compression still runs concurrently.
+        if (sliceExpired()) await yieldToEventLoop();
+        const { column, values: vector, start, end } = block;
+        const bytes = this.#encodeColumnBlock(
+          column.id,
+          asColumnInput(
+            column.type,
+            start === 0 && end === vector.length ? vector : vector.slice(start, end),
+          ),
+          compression,
+        );
+        // Observed now: one that fails while a later one is still being started must not
+        // surface as unhandled. Accepting it in order still receives the failure.
+        bytes.catch(() => undefined);
+        inFlight.push({ block, group: groupIndex, bytes });
+        inFlightMaximumBytes += block.maximumStoredBytes;
+      }
+    }
+    while (inFlight.length > 0) await acceptOldest();
+    return result;
+  }
+
+  /**
    * Applies the same adaptive gzip rule to ordinary writes and compaction output. `gzip` is a
    * preference, not a promise: tiny inputs and probes that save less than 20% stay raw. Only a
    * failed verdict is cached, so successful columns do not leave one map entry behind forever.
@@ -28837,20 +28980,18 @@ async function validateBatch(
     // The pending auto-increment column keeps its null slots until the write path reserves a
     // range from storage, so nulls pass here; every explicit value still type-checks.
     const allowNull = column.name === pendingColumn;
-    // An index loop rather than forEach: forEach skips holes in sparse arrays, which would let an
-    // undefined value reach the block encoder and persist a corrupt block that only fails at read
-    // time. Every slot is validated, holes included.
     const stringByteLengths =
       column.type === "string" ? new Array<number>(values.length) : undefined;
-    for (let index = 0; index < values.length; index += 1) {
-      if ((index & 4095) === 4095) await maybeYieldToEventLoop();
-      const value = values[index] as BatchValue;
-      if (allowNull && value === null) {
-        if (stringByteLengths !== undefined) stringByteLengths[index] = 0;
-        continue;
-      }
-      const byteLength = validateValue(column, value, index);
-      if (stringByteLengths !== undefined) stringByteLengths[index] = byteLength ?? 0;
+    for (let start = 0; start < values.length; start += VALIDATE_SLICE_VALUES) {
+      if (start > 0 && sliceExpired()) await yieldToEventLoop();
+      validateColumnRange(
+        column,
+        values,
+        start,
+        Math.min(values.length, start + VALIDATE_SLICE_VALUES),
+        allowNull,
+        stringByteLengths,
+      );
     }
     if (stringByteLengths !== undefined) validatedStringByteLengths.set(values, stringByteLengths);
   }
@@ -28964,6 +29105,72 @@ function resolvePublicReadColumns(
     if (column === undefined) throw new TypeError(`Unknown column: ${name}`);
     return column;
   });
+}
+
+/** Values `validateBatch` checks in one column between offered turns. */
+const VALIDATE_SLICE_VALUES = 4_096;
+
+/**
+ * `validateValue` over `values[start, end)` of one column, specialized by the column's type so a
+ * valid value costs one type test; anything else goes through `validateValue` itself, for its
+ * exact error. A string column's UTF-8 byte lengths land in `stringByteLengths`. An index loop
+ * rather than forEach: forEach skips holes in sparse arrays, which would let an undefined value
+ * reach the block encoder and persist a corrupt block that only fails at read time. Every slot
+ * is validated, holes included.
+ */
+function validateColumnRange(
+  column: TableColumnRecord,
+  values: readonly BatchValue[],
+  start: number,
+  end: number,
+  /** The pending auto-increment column: its null slots are filled from storage later. */
+  allowNull: boolean,
+  stringByteLengths: number[] | undefined,
+): void {
+  const acceptsNull = allowNull || column.nullable;
+  if (column.type === "string") {
+    const lengths = stringByteLengths ?? [];
+    const plain = column.enumValues === undefined;
+    for (let index = start; index < end; index += 1) {
+      const value = values[index] as BatchValue;
+      if (plain && typeof value === "string") {
+        let length: number | undefined;
+        try {
+          // No position in the message until one is needed: building it for every value
+          // cost as much as measuring the value.
+          length = wellFormedUtf8ByteLength(value);
+        } catch {
+          // Measured again with its position, so the refusal names the column and row.
+          length = validateValue(column, value, index);
+        }
+        lengths[index] = length ?? 0;
+      } else if (value === null && acceptsNull) {
+        lengths[index] = 0;
+      } else {
+        lengths[index] = validateValue(column, value, index) ?? 0;
+      }
+    }
+    return;
+  }
+  const type = column.type;
+  const integer = column.integer === true;
+  for (let index = start; index < end; index += 1) {
+    const value = values[index] as BatchValue;
+    if (
+      value === null
+        ? acceptsNull
+        : type === "number"
+          ? typeof value === "number" &&
+            Number.isFinite(value) &&
+            (!integer || Number.isSafeInteger(value))
+          : type === "boolean"
+            ? typeof value === "boolean"
+            : value instanceof Date && Number.isFinite(dateMilliseconds(value))
+    ) {
+      continue;
+    }
+    validateValue(column, value, index);
+  }
 }
 
 function validateValue(
@@ -29355,16 +29562,9 @@ function assertColumnRenameSafe(
   column: TableColumnRecord,
 ): void {
   const where = `${table.name}.${column.name}`;
-  const names = (sql: string, label: string): readonly string[] => {
-    try {
-      return expressionColumnNames(compileCheckExpression(sql, label)).map(
-        (name) => name.split(".").at(-1) ?? name,
-      );
-    } catch {
-      // An expression that can no longer be read cannot prove it does not use the column.
-      return [column.name];
-    }
-  };
+  // An expression that can no longer be read cannot prove it does not use the column.
+  const names = (sql: string, label: string): readonly string[] =>
+    storedExpressionColumns(table.name, sql, label) ?? [column.name];
   for (const check of table.checks ?? []) {
     if (names(check.sql, check.name).includes(column.name)) {
       throw new TypeError(`Cannot rename ${where}: CHECK ${check.name} uses it`);
@@ -29505,9 +29705,10 @@ function normalizeDomainBatch(table: TableRecord, input: ColumnarBatch): void {
     if (values === undefined) continue;
     if (
       column.sqlDomain !== undefined ||
-      column.type === "datetime" ||
-      // A number column rewrites only when a tagged exact-NUMERIC constant actually reached it
-      // (a SQL literal like 0.1/3 evaluated exactly), so plain bulk loads never copy here.
+      // A datetime column rewrites only when a SQL DATE value reached it, and a number column
+      // only when a tagged exact-NUMERIC constant did (a SQL literal like 0.1/3 evaluated
+      // exactly): every other value normalizes to itself, so plain bulk loads never copy here.
+      (column.type === "datetime" && values.some((value) => typeof value === "string")) ||
       (column.type === "number" &&
         values.some((value) => typeof value === "string" && isExactNumeric(value)))
     ) {
@@ -34369,13 +34570,15 @@ function compactTableSkipped(
   };
 }
 
-function writeColumnValues(type: LogicalType, values: readonly BatchValue[]): WriteColumnValues {
-  const cached = type === "string" ? validatedStringByteLengths.get(values) : undefined;
-  return {
-    type,
-    values,
-    ...(cached?.length === values.length ? { stringByteLengths: cached } : {}),
-  };
+/** One column block a segment encodes: a row range of one column's values. */
+interface PlannedWriteBlock {
+  readonly column: TableColumnRecord;
+  readonly values: readonly BatchValue[];
+  readonly start: number;
+  readonly end: number;
+  readonly part: number;
+  /** Conservative complete stored size, for the stage batch bound. */
+  readonly maximumStoredBytes: number;
 }
 
 /** Conservative complete stored-byte bound used to flush an accumulator before encoding. */

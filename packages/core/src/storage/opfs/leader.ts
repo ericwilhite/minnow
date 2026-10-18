@@ -2954,14 +2954,19 @@ export class OpfsLeader {
     this.#releasePlacements(placements);
   }
 
+  /**
+   * The reverse index's in-memory key for a payload reference: unique per reference, with the
+   * kind as its first character. A block's is a plain prefix, since every commit indexes one
+   * block per column; the rest keep their JSON tuples.
+   */
   #payloadRefKey(ref: ExtentPayloadRef): string {
     switch (ref.kind) {
       case "block":
-        return JSON.stringify(["b", ref.id]);
+        return `b${ref.id}`;
       case "fts":
-        return JSON.stringify(["f", ref.key, ref.ordinal]);
+        return `f${JSON.stringify([ref.key, ref.ordinal])}`;
       case "fts-build":
-        return JSON.stringify(["s", ref.key, ref.buildId, ref.ordinal]);
+        return `s${JSON.stringify([ref.key, ref.buildId, ref.ordinal])}`;
     }
   }
 

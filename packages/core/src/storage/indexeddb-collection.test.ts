@@ -68,6 +68,53 @@ it("batches retained history checks and excludes block history from table listin
   }
 });
 
+it("proves retained payloads exist with range reads, not a request per block", async () => {
+  vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+  const store = await IndexedDbBlockStore.open({
+    indexedDB: new IDBFactory(),
+    name: crypto.randomUUID(),
+  });
+  const db = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+  try {
+    await db.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value INTEGER)");
+    // Two blocks a commit: several hundred live blocks for every step to account for.
+    for (let id = 0; id < 300; id += 1) await db.insertBatch("items", [{ id, value: id }]);
+    const job = await store.createGarbageCollectionJob({
+      id: "presence",
+      candidateManifestVersions: [0],
+      candidateSegmentIds: [],
+      candidateBlockIds: [],
+      candidateTransactionIds: [],
+      leaseCutoff: new Date().toISOString(),
+      createdAt: new Date().toISOString(),
+    });
+    let blockRequests = 0;
+    for (const method of ["get", "getKey", "getAll", "getAllKeys", "openCursor"] as const) {
+      // eslint-disable-next-line @typescript-eslint/unbound-method -- Called with its native receiver below.
+      const original = IDBObjectStore.prototype[method] as (...args: unknown[]) => IDBRequest;
+      vi.spyOn(IDBObjectStore.prototype, method).mockImplementation(function (
+        this: IDBObjectStore,
+        ...args: unknown[]
+      ) {
+        if (this.name === "blocks") blockRequests += 1;
+        return original.apply(this, args);
+      } as never);
+    }
+    const result = await store.runGarbageCollectionStep({
+      jobId: job.id,
+      expectedRevision: job.revision,
+      maxItems: 1,
+      updatedAt: new Date().toISOString(),
+    });
+    expect(result.prunedManifestVersions).toEqual([0]);
+    // Probing each payload issued one request per live block (600 here).
+    expect(blockRequests).toBeLessThan(20);
+  } finally {
+    await db.close();
+    store.close();
+  }
+});
+
 function requestValue<T>(request: IDBRequest<T>): Promise<T> {
   return new Promise((resolve, reject) => {
     request.onsuccess = () => resolve(request.result);

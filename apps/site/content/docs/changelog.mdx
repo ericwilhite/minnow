@@ -8,6 +8,107 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## Unreleased
+
+Not yet published. This entry collects changes merged after 0.16.0; the release that ships them
+replaces this heading with its version and date. Package: `@minnowdb/core`.
+
+### Changed: the schema DSL no longer parses SQL
+
+- **Declaring tables no longer downloads the SQL compiler.** `table()` used to compile every CHECK,
+  `.defaultSql()`, and `.generatedSql()` expression, which pulled the parser, optimizer, and SQL
+  function tables into any page that declared a schema — even one whose engine runs in a worker.
+  Importing an error class such as `UniqueConstraintError` from `@minnowdb/core` also pulled part
+  of the engine, because it was re-exported through the engine module. A page that runs the engine
+  in a worker and imports the client, the schema DSL, error classes, the Kysely dialect and live
+  queries, and the React hooks now ships 101 KiB minified (30 KiB gzipped) on its main thread,
+  down from 356 KiB (102 KiB gzipped); the schema DSL with the error classes is 32 KiB (10 KiB
+  gzipped), down from 286 KiB (82 KiB gzipped). The engine bundles stay within 0.4 KiB of their
+  0.16.0 size.
+- **Invalid expression SQL is reported by `migrate()`, not `table()`.** The engine now compiles a
+  declaration's CHECK conditions and DEFAULT and generated expressions when `migrate()` runs, for
+  every table in the schema before any step applies, with the same messages and error types
+  `table()` threw. A schema with an invalid expression anywhere leaves the catalog untouched; with
+  the worker client the error comes back from the worker. `table()` and the column builders still
+  check everything else at declaration: names, keys, relations, and literal defaults and backfills.
+  See [When expression SQL is checked](/docs/schema#when-expression-sql-is-checked).
+- **The published catalog lists the columns stored expressions read.** `CatalogCheck.columns` and
+  `CatalogColumn.generatedValue.columns` (the new `CatalogGenerated` type) name the table's columns
+  each CHECK and generated expression reads, unqualified. `planMigration` decides whether a column
+  can be dropped or renamed from these lists instead of parsing SQL, so it no longer needs the
+  compiler either; when a catalog leaves a list out (a hand-built catalog, or one saved by an
+  earlier release), it refuses to drop or rename any column of that table rather than guess.
+
+### Fixed
+
+- **Dropping a column a CHECK named with its table's qualifier was allowed.** `dropColumn()` and
+  `ALTER TABLE … DROP COLUMN` accepted dropping `qty` from a table with `CHECK (items.qty > 0)`,
+  and the check then silently passed every row. It is now refused like an unqualified reference.
+
+### Performance: the storage side of small writes
+
+Measured on a 101-column table with 20,000 rows unless noted. A table that wide writes one block
+per column, so every per-block cost of a commit is paid a hundred times.
+
+- **Wide tables recounted unmerged segments on every commit.** 0.16.0 stopped recounting them for
+  the level-zero limit, but a table with more than 64 columns stages part of each write before
+  committing it, and that stage discarded the remembered count, so each commit walked every
+  segment and block of the table again. Single-row inserts and upserts cost more the longer a run
+  of them went. In memory a single-row insert now takes about 1.0 ms (1.7–1.8 ms before) and a
+  single-row upsert 1.0 ms (2.6–2.7 ms); on OPFS 1.5–1.7 ms (2.4–2.5 ms) and 1.4–1.6 ms
+  (2.9–3.3 ms).
+- **Commits do less per block.** Storage ids are checked for well-formed text with one native
+  scan, a single-shot write no longer re-validates its whole journal, a published segment's
+  retained size is derived instead of re-serialized, and segment block references keep one index
+  entry per block instead of three.
+- **IndexedDB.** A single-row write no longer reads back the blocks and segments it has just
+  written in the same transaction: a single-row insert on 101 columns makes 208 reads instead
+  of 392. Collection proves retained blocks present with range reads of block keys and lists
+  retired blocks 256 records per request: a collection cycle after 400 single-row commits to a
+  21-column table made 8,872 requests instead of 125,155.
+- **Collection planning** finds retired blocks without walking every live one, and proves a live
+  segment current by one block instead of one per column.
+- **Reads after batch writes.** `insertBatch` and `upsertBatch` now keep the cached catalog state
+  current across their own commits, as SQL statements and write scopes already did, so the next
+  read no longer reloads the table and re-proves every block of every segment. Each batch write
+  reads the catalog probe beside its begin, which on IndexedDB is one more read-only transaction.
+
+### Performance: the engine side of batch writes
+
+Measured in memory on the same 101-column table, with the storage changes above on both sides.
+
+- **Wide-table batch writes take about half the time.** A guarded `upsertBatch` of 2,000 rows,
+  half of them new, takes 43 ms instead of 83; an unguarded one 40 ms instead of 53; a
+  10,000-row `insertBatch` 201 ms instead of 285; and a `write()` scope that flips 500 rows and
+  then upserts them 44 ms instead of 106. `node:sqlite` takes 27, 30, 142, and 9 ms for the same
+  row objects through prepared statements. A guarded upsert reads only the guard's and unique
+  indexes' columns of the rows it replaces, string columns are encoded without a native call per
+  value, a block compresses while the next ones encode, and validation runs once per column type.
+  Single-row inserts, upserts, updates, and deletes are within 2% of before.
+- **A guarded single-row upsert after a long history** reads the row it replaces on the
+  point-read path at its pinned version, which now keeps its visible history across batch
+  commits: after 200 single-row commits it takes 1.7 ms instead of 12.4 ms (19 ms in 0.16.0).
+- **`key IN (…)` over updated or upserted rows** searches each delta segment once for all of its
+  keys instead of once per key: 50 keys over a short history are read 2.5× faster. A write
+  scope's reads of committed rows take the same path.
+- **SQL writes without `CURRENT_*` calls** run their compiled statement as is instead of copying
+  every expression on each execution: a keyed `UPDATE` of three columns is about 5% faster.
+
+Stored blocks are byte-for-byte what they were. The engine with the OPFS adapter grows by 1.6 KiB
+raw and 0.9 KiB gzipped, to 430 KiB.
+
+### API changes
+
+New `CatalogGenerated` type; `CatalogCheck` gains optional `columns`. `compileGeneratedColumnExpression`
+is no longer exported from `@minnowdb/core/schema`: it was an engine internal that returned the
+compiler's expression tree.
+
+**Migration:** code that relied on `table()` throwing for invalid expression SQL — a unit test, or
+a build-time schema check — should call `migrate()` instead, for example on a database over
+`MemoryBlockStore`.
+
+**Stored formats:** unchanged.
+
 ## 0.16.0 — October 16, 2026
 
 Release packages: `@minnowdb/core@0.16.0`, `@minnowdb/kysely@0.6.0`, `@minnowdb/devtools@0.3.7`.

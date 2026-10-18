@@ -194,14 +194,14 @@
               "name": "CatalogCheck",
               "kind": "type",
               "declarations": [
-                "export interface CatalogCheck {\n    readonly name: string;\n    readonly sql: string;\n}"
+                "export interface CatalogCheck {\n    readonly name: string;\n    readonly sql: string;\n    readonly columns?: readonly string[];\n}"
               ]
             },
             {
               "name": "CatalogColumn",
               "kind": "type",
               "declarations": [
-                "export interface CatalogColumn {\n    readonly id: string;\n    readonly name: string;\n    readonly type: SimpleDataType;\n    readonly integer?: true;\n    readonly sqlDomain?: SqlDomain;\n    readonly nullable: boolean;\n    readonly defaultValue?: ColumnDefault;\n    readonly generatedValue?: ColumnGenerated;\n    readonly enumValues?: readonly string[];\n    readonly isAutoIncrementing: boolean;\n    readonly backfill?: boolean | number | string | Date;\n}"
+                "export interface CatalogColumn {\n    readonly id: string;\n    readonly name: string;\n    readonly type: SimpleDataType;\n    readonly integer?: true;\n    readonly sqlDomain?: SqlDomain;\n    readonly nullable: boolean;\n    readonly defaultValue?: ColumnDefault;\n    readonly generatedValue?: CatalogGenerated;\n    readonly enumValues?: readonly string[];\n    readonly isAutoIncrementing: boolean;\n    readonly backfill?: boolean | number | string | Date;\n}"
               ]
             },
             {
@@ -209,6 +209,13 @@
               "kind": "type",
               "declarations": [
                 "export interface CatalogForeignKey {\n    readonly name: string;\n    readonly columns: readonly string[];\n    readonly parentTable: string;\n    readonly parentColumns: readonly string[];\n    readonly onDelete: \"restrict\" | \"cascade\" | \"set null\";\n    readonly enforced: boolean;\n}"
+              ]
+            },
+            {
+              "name": "CatalogGenerated",
+              "kind": "type",
+              "declarations": [
+                "export interface CatalogGenerated extends ColumnGenerated {\n    readonly columns?: readonly string[];\n}"
               ]
             },
             {
@@ -311,7 +318,7 @@
             },
             {
               "name": "CompactionBacklogError",
-              "kind": "type",
+              "kind": "type-and-value",
               "declarations": [
                 "export declare class CompactionBacklogError extends Error {\n    readonly tableName: string;\n    readonly levelZeroSegments: number;\n    readonly limit: number;\n    readonly name = \"CompactionBacklogError\";\n    constructor(tableName: string, levelZeroSegments: number, limit: number);\n}"
               ]
@@ -384,13 +391,6 @@
               "kind": "type",
               "declarations": [
                 "export type CompiledStatement = {\n    kind: \"select\";\n    sql: string;\n    parameterCount?: number;\n} | {\n    kind: \"insert\";\n    table: string;\n    alias?: string;\n    columns: string[];\n    rows: InsertValue[][];\n    defaultValues?: true;\n    query?: CompiledQuery;\n    onConflict?: {\n        column: string;\n        columns?: string[];\n        anyTarget?: true;\n        action: \"nothing\" | \"replace\" | \"update\";\n        assignments?: Array<{\n            column: string;\n            expression: Expression;\n        }>;\n        where?: Expression;\n    };\n    returning?: string[] | \"*\";\n    returningItems?: ReturningItem[];\n    parameterCount?: number;\n} | {\n    kind: \"update\";\n    table: string;\n    alias?: string;\n    assignments: Array<{\n        column: string;\n        expression: Expression;\n    }>;\n    predicates: Array<{\n        left: Expression;\n        operator: PredicateOperator;\n        right: Expression;\n    }>;\n    from?: MutationSources;\n    returning?: string[] | \"*\";\n    returningItems?: ReturningItem[];\n    parameterCount?: number;\n} | {\n    kind: \"delete\";\n    table: string;\n    alias?: string;\n    predicates: Array<{\n        left: Expression;\n        operator: PredicateOperator;\n        right: Expression;\n    }>;\n    from?: MutationSources;\n    returning?: string[] | \"*\";\n    returningItems?: ReturningItem[];\n    parameterCount?: number;\n} | {\n    kind: \"create-table\";\n    table: string;\n    columns: Array<{\n        name: string;\n        type: SqlColumnType;\n        integer?: true;\n        sqlDomain?: SqlDomain;\n        nullable?: boolean;\n        defaultValue?: ColumnDefault;\n        generatedValue?: ColumnGenerated;\n        enumValues?: readonly string[];\n        backfill?: Exclude<QueryValue, null>;\n    }>;\n    checks?: Array<{\n        name: string;\n        sql: string;\n    }>;\n    foreignKeys?: ForeignKeyDefinition[];\n    uniqueKey?: string;\n    compositePrimaryKey?: string[];\n    uniqueConstraints?: UniqueConstraintDefinition[];\n    ifNotExists?: boolean;\n    managed?: boolean;\n    parameterCount?: number;\n} | {\n    kind: \"create-enum\";\n    name: string;\n    values: string[];\n    parameterCount?: number;\n} | {\n    kind: \"create-sequence\";\n    name: string;\n    parameterCount?: number;\n} | {\n    kind: \"create-index\";\n    index: string;\n    table: string;\n    columns: Array<{\n        name: string;\n        direction: \"asc\" | \"desc\";\n    }>;\n    unique?: true;\n    ifNotExists?: boolean;\n    parameterCount?: number;\n} | {\n    kind: \"drop-index\";\n    index: string;\n    ifExists?: boolean;\n    parameterCount?: number;\n} | {\n    kind: \"create-trigger\";\n    table: string;\n    trigger: {\n        name: string;\n        event: \"insert\" | \"update\" | \"delete\";\n        timing: \"before\" | \"after\";\n        statements: Array<{\n            sql: string;\n            bindings: Array<{\n                source: \"new\" | \"old\";\n                column: string;\n            }>;\n        }>;\n    };\n    parameterCount?: number;\n} | {\n    kind: \"drop-trigger\";\n    name: string;\n    parameterCount?: number;\n} | {\n    kind: \"create-table-as\";\n    table: string;\n    query: CompiledQuery;\n    ifNotExists?: boolean;\n    parameterCount?: number;\n} | {\n    kind: \"drop-table\";\n    table: string;\n    ifExists?: boolean;\n    parameterCount?: number;\n} | {\n    kind: \"create-view\";\n    view: string;\n    sql: string;\n    orReplace?: boolean;\n    managed?: boolean;\n    parameterCount?: number;\n} | {\n    kind: \"drop-view\";\n    view: string;\n    ifExists?: boolean;\n    parameterCount?: number;\n} | {\n    kind: \"set\";\n    action: \"set\" | \"reset\";\n    name: string;\n    parameterCount?: number;\n} | {\n    kind: \"show\";\n    name: string;\n    parameterCount?: number;\n} | {\n    kind: \"transaction\";\n    action: \"begin\" | \"commit\" | \"rollback\" | \"savepoint\" | \"rollback-to\" | \"release\";\n    name?: string;\n    parameterCount?: number;\n} | {\n    kind: \"merge\";\n    table: string;\n    alias: string;\n    source: {\n        alias: string;\n        table?: string;\n        sql?: string;\n    };\n    on: Expression;\n    branches: MergeBranch[];\n    parameterCount?: number;\n} | {\n    kind: \"add-column\";\n    table: string;\n    column: {\n        name: string;\n        type: SqlColumnType;\n        integer?: true;\n        sqlDomain?: SqlDomain;\n        nullable?: boolean;\n        defaultValue?: ColumnDefault;\n        generatedValue?: ColumnGenerated;\n        enumValues?: readonly string[];\n        backfill?: Exclude<QueryValue, null>;\n    };\n    allowNonNullableWithBackfill?: boolean;\n    ifNotExists?: true;\n    parameterCount?: number;\n} | {\n    kind: \"rename-column\";\n    table: string;\n    from: string;\n    to: string;\n    parameterCount?: number;\n} | {\n    kind: \"drop-column\";\n    table: string;\n    column: string;\n    ifExists?: true;\n    parameterCount?: number;\n};"
-              ]
-            },
-            {
-              "name": "compileGeneratedColumnExpression",
-              "kind": "type",
-              "declarations": [
-                "export declare function compileGeneratedColumnExpression(tableName: string, columnName: string, sql: string, columns: ReadonlyArray<{\n    readonly name: string;\n    readonly generatedValue?: {\n        readonly kind: \"stored\";\n        readonly sql: string;\n    };\n}>): Expression;"
               ]
             },
             {
@@ -1110,7 +1110,7 @@
             },
             {
               "name": "TableInUseError",
-              "kind": "type",
+              "kind": "type-and-value",
               "declarations": [
                 "export declare class TableInUseError extends Error {\n    readonly tableId: string;\n    readonly ownerKind: \"transaction\" | \"compaction job\" | \"foreign key\" | \"pending foreign key\" | \"accelerator build\";\n    readonly ownerId: string;\n    readonly name = \"TableInUseError\";\n    constructor(tableId: string, ownerKind: \"transaction\" | \"compaction job\" | \"foreign key\" | \"pending foreign key\" | \"accelerator build\", ownerId: string);\n}"
               ]
@@ -2548,13 +2548,6 @@
               "kind": "type",
               "declarations": [
                 "export interface ColumnReferenceSpec {\n    readonly table: string;\n    readonly column: string;\n    readonly onDelete: ReferentialAction;\n    readonly enforced: boolean;\n}"
-              ]
-            },
-            {
-              "name": "compileGeneratedColumnExpression",
-              "kind": "value",
-              "declarations": [
-                "export declare function compileGeneratedColumnExpression(tableName: string, columnName: string, sql: string, columns: ReadonlyArray<{\n    readonly name: string;\n    readonly generatedValue?: {\n        readonly kind: \"stored\";\n        readonly sql: string;\n    };\n}>): Expression;"
               ]
             },
             {

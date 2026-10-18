@@ -4678,19 +4678,25 @@ export class IndexedDbBlockStore implements BlockStore {
       }
       // Only previously journaled artifacts need existence probes; the ones added below commit
       // or fail atomically with everything else.
-      await assertPendingArtifactsAvailableInTransaction(transaction, base);
+      const journaledSegments = await assertPendingArtifactsAvailableInTransaction(
+        transaction,
+        base,
+      );
       await updateRecordResourceLedger(transaction.objectStore("statistics"), {
         segments: normalizedSegments.map((segment) => ({ next: segment })),
       });
       const blockStore = transaction.objectStore("blocks");
       const catalog = transaction.objectStore("catalog");
+      const addedMetadata = new Map<string, StoredBlockMetadata>();
       for (const block of input.blocks) {
         const bytes = compactStructuredCloneBytes(block.bytes, "Block bytes");
+        const metadata: StoredBlockMetadata = {
+          byteLength: bytes.byteLength,
+          checksum: crc32(bytes),
+        };
         blockStore.add(bytes, block.id);
-        catalog.add(
-          { byteLength: bytes.byteLength, checksum: crc32(bytes) } satisfies StoredBlockMetadata,
-          blockMetadataKey(block.id),
-        );
+        catalog.add(metadata, blockMetadataKey(block.id));
+        addedMetadata.set(block.id, metadata);
       }
       const segmentStore = transaction.objectStore("segments");
       for (const segment of normalizedSegments) {
@@ -4701,6 +4707,13 @@ export class IndexedDbBlockStore implements BlockStore {
         staged,
         { replacedChunkCount: journalChunkCountOf(base) },
         input,
+        {
+          probedBlockIds: new Set(base.pendingBlockIds),
+          addedMetadata,
+          segments: new Map(
+            [...journaledSegments, ...normalizedSegments].map((segment) => [segment.id, segment]),
+          ),
+        },
       );
       await transactionDone(transaction);
       outcome.settle();
@@ -4720,12 +4733,24 @@ export class IndexedDbBlockStore implements BlockStore {
    * must do with the journal chunks: nothing for a journaled record, whose ids are already
    * stored, or a rewrite replacing that many chunks for a single-shot write whose freshly
    * staged ids have no chunks yet.
+   *
+   * `known` is what a single-shot write already holds about the journal in this same storage
+   * transaction, so the commit does not read it back: blocks whose existence it probed, the
+   * metadata of blocks it added (which also cannot have provenance: published ids name stored
+   * payloads, so adding one would have failed), and the pending segment records it read or
+   * added. Nothing else writes inside a readwrite transaction, so each answer is the one a read
+   * would give. A wide table's single-row write otherwise read back a few hundred records.
    */
   async #commitInTransaction(
     transaction: IDBTransaction,
     record: TransactionRecord,
     journal: "stored" | { replacedChunkCount: number },
     input: Omit<CommitTransactionInput, "transactionId" | "expectedTransactionRevision">,
+    known?: {
+      probedBlockIds: ReadonlySet<string>;
+      addedMetadata: ReadonlyMap<string, StoredBlockMetadata>;
+      segments: ReadonlyMap<string, SegmentRecord>;
+    },
   ): Promise<{ manifest: ManifestSummary; settle: () => void }> {
     incrementSafeInteger(record.revision, "Transaction revision");
     const transactionStore = transaction.objectStore("transactions");
@@ -4760,9 +4785,20 @@ export class IndexedDbBlockStore implements BlockStore {
       requestResult<unknown>(statistics.get(RECORD_RESOURCE_LEDGER_KEY)),
       requestResult<unknown>(statistics.get(RESOURCE_LEDGER_KEY)),
       requestResult<unknown>(statistics.get(transactionResourceLedgerKey(record.id))),
-      Promise.all(record.pendingBlockIds.map((id) => requestResult(blockStore.getKey(id)))),
       Promise.all(
-        record.pendingSegmentIds.map((id) => requestResult<unknown>(segmentStore.get(id))),
+        record.pendingBlockIds.map((id) =>
+          known?.probedBlockIds.has(id) === true || known?.addedMetadata.has(id) === true
+            ? Promise.resolve<IDBValidKey | undefined>(id)
+            : requestResult(blockStore.getKey(id)),
+        ),
+      ),
+      Promise.all(
+        record.pendingSegmentIds.map((id) => {
+          const segment = known?.segments.get(id);
+          return segment === undefined
+            ? requestResult<unknown>(segmentStore.get(id))
+            : Promise.resolve<unknown>(segment);
+        }),
       ),
     ]);
     assertCommitSchema(record, asSchemaEpoch(schemaValue));
@@ -4873,10 +4909,19 @@ export class IndexedDbBlockStore implements BlockStore {
         ),
       ),
       Promise.all(
-        journalBlockIds.map((id) => requestResult<unknown>(catalog.get(manifestBlockKey(id)))),
+        journalBlockIds.map((id) =>
+          known?.addedMetadata.has(id) === true
+            ? Promise.resolve<unknown>(undefined)
+            : requestResult<unknown>(catalog.get(manifestBlockKey(id))),
+        ),
       ),
       Promise.all(
-        journalBlockIds.map((id) => requestResult<unknown>(catalog.get(blockMetadataKey(id)))),
+        journalBlockIds.map((id) => {
+          const metadata = known?.addedMetadata.get(id);
+          return metadata === undefined
+            ? requestResult<unknown>(catalog.get(blockMetadataKey(id)))
+            : Promise.resolve<unknown>(metadata);
+        }),
       ),
     ]);
     const tableValues = new Map(changedTableValues);
@@ -14835,13 +14880,14 @@ async function garbageCollectionPinsInTransaction(
   return versions;
 }
 
+/** Returns the pending segments it read and validated; none when `validateSegments` is false. */
 async function assertPendingArtifactsAvailableInTransaction(
   transaction: IDBTransaction,
   record: TransactionRecord,
   validateBlocks = true,
   validateSegments = true,
   validateCurrentTable = false,
-): Promise<void> {
+): Promise<SegmentRecord[]> {
   const [blockKeys, segmentValues] = await Promise.all([
     validateBlocks
       ? Promise.all(
@@ -14921,7 +14967,9 @@ async function assertPendingArtifactsAvailableInTransaction(
         throw corruption(`transactions/${record.id}`, "pending row counter disagrees with journal");
       }
     }
+    return segments;
   }
+  return [];
 }
 
 /** Validate all retained blocks once, in bounded parallel read batches. */
@@ -14937,25 +14985,79 @@ async function assertRemainingManifestRecordsAvailable(
       readableVersions.push(record.version);
     }
   });
+  // Every block a readable manifest names must exist. Probing each one was a request per live
+  // block on every collection step, so the payload keys are read a page at a time over the
+  // range the page of provenance records spans; provenance is visited in block-id order, so the
+  // ranges never overlap and the whole check reads each payload key at most once.
+  const blocks = transaction.objectStore("blocks");
+  let page: Array<{ blockId: string; version: number }> = [];
+  let probes: Promise<void> = Promise.resolve();
+  const probe = (): Promise<void> => {
+    const probed = page;
+    page = [];
+    probes = probes.then(async () => {
+      const missing = await firstMissingBlock(blocks, probed);
+      if (missing !== undefined) throw new SnapshotManifestMissingError(missing.version);
+    });
+    return probes;
+  };
   await visitObjectStoreReadBatches(
     transaction.objectStore("catalog"),
-    async (value, key) => {
+    (value, key) => {
       if (!Array.isArray(key) || key.length !== 2 || typeof key[1] !== "string") {
         throw corruption(MANIFEST_BLOCK, "record key is invalid");
       }
       const record = asManifestBlockRecord(value, key[1]);
       const version = firstOverlappingManifestVersion(record, readableVersions);
-      if (
-        version !== undefined &&
-        (await requestResult(transaction.objectStore("blocks").getKey(record.blockId))) ===
-          undefined
-      ) {
-        throw new SnapshotManifestMissingError(version);
-      }
+      if (version === undefined) return;
+      page.push({ blockId: record.blockId, version });
+      if (page.length >= BLOCK_PRESENCE_PAGE) return probe();
     },
     { kind: MANIFEST_BLOCK },
   );
+  await probe();
   return readableVersions;
+}
+
+/** Provenance records whose payloads one presence read covers. */
+const BLOCK_PRESENCE_PAGE = 128;
+/** Payload keys one range read returns before it continues past the last. */
+const BLOCK_KEY_RANGE_PAGE = 1_024;
+
+/** The first of `wanted` whose payload is absent from `blocks`, if any. */
+async function firstMissingBlock<T extends { blockId: string }>(
+  blocks: IDBObjectStore,
+  wanted: readonly T[],
+): Promise<T | undefined> {
+  if (wanted.length === 0) return undefined;
+  // Injected factories need not install the browser's key-range constructor globally.
+  if (typeof IDBKeyRange === "undefined") {
+    const keys = await Promise.all(
+      wanted.map(({ blockId }) => requestResult(blocks.getKey(blockId))),
+    );
+    return wanted.find((_, index) => keys[index] === undefined);
+  }
+  let lowest = wanted[0]?.blockId ?? "";
+  let highest = lowest;
+  for (const { blockId } of wanted) {
+    if (blockId < lowest) lowest = blockId;
+    if (blockId > highest) highest = blockId;
+  }
+  const present = new Set<IDBValidKey>();
+  let lower: IDBValidKey = lowest;
+  let exclusive = false;
+  for (;;) {
+    const range = IDBKeyRange.bound(lower, highest, exclusive, false);
+    const keys: IDBValidKey[] = await requestResult<IDBValidKey[]>(
+      blocks.getAllKeys(range, BLOCK_KEY_RANGE_PAGE),
+    );
+    for (const key of keys) present.add(key);
+    const last: IDBValidKey | undefined = keys.at(-1);
+    if (keys.length < BLOCK_KEY_RANGE_PAGE || last === undefined) break;
+    lower = last;
+    exclusive = true;
+  }
+  return wanted.find(({ blockId }) => !present.has(blockId));
 }
 
 function compactionJobKey(id: string): string {
@@ -18777,7 +18879,61 @@ function readManifestBlockPageFromCatalog(
   });
 }
 
-function readRetiredManifestBlockPageFromCatalog(
+/** Provenance records one batched read of the retired-block listing returns. */
+const RETIRED_PROVENANCE_READ_PAGE = 256;
+
+/**
+ * Retired provenance records in block-id order. Live records far outnumber retired ones, and
+ * the listing has no index of its own, so it reads the provenance a page at a time — one round
+ * trip per page rather than one cursor step per record, which made each collection pass cost a
+ * storage round trip per live block.
+ */
+async function readRetiredManifestBlockPageFromCatalog(
+  catalog: IDBObjectStore,
+  removedThroughVersion: number,
+  afterBlockId: string | null,
+  limit: number,
+): Promise<ManifestBlockRecord[]> {
+  // Injected factories need not install the browser's key-range constructor globally.
+  if (typeof IDBKeyRange === "undefined") {
+    return readRetiredManifestBlockPageWithCursor(
+      catalog,
+      removedThroughVersion,
+      afterBlockId,
+      limit,
+    );
+  }
+  const records: ManifestBlockRecord[] = [];
+  const upper: IDBValidKey = [MANIFEST_BLOCK + "\u0000"];
+  let lower: IDBValidKey =
+    afterBlockId === null ? [MANIFEST_BLOCK] : [MANIFEST_BLOCK, afterBlockId];
+  let exclusive = afterBlockId !== null;
+  for (;;) {
+    const range = IDBKeyRange.bound(lower, upper, exclusive, true);
+    const [keys, values]: [IDBValidKey[], unknown[]] = await Promise.all([
+      requestResult<IDBValidKey[]>(catalog.getAllKeys(range, RETIRED_PROVENANCE_READ_PAGE)),
+      requestResult<unknown[]>(catalog.getAll(range, RETIRED_PROVENANCE_READ_PAGE)),
+    ]);
+    if (keys.length !== values.length)
+      throw corruption("catalog", "batch keys do not match values");
+    for (const [index, key] of keys.entries()) {
+      if (!Array.isArray(key) || key.length !== 2 || typeof key[1] !== "string") {
+        throw corruption(MANIFEST_BLOCK, "record key is invalid");
+      }
+      const record = asManifestBlockRecord(values[index], key[1]);
+      if (record.removedVersion !== null && record.removedVersion <= removedThroughVersion) {
+        records.push(record);
+        if (records.length === limit) return records;
+      }
+    }
+    const last = keys.at(-1);
+    if (keys.length < RETIRED_PROVENANCE_READ_PAGE || last === undefined) return records;
+    lower = last;
+    exclusive = true;
+  }
+}
+
+function readRetiredManifestBlockPageWithCursor(
   catalog: IDBObjectStore,
   removedThroughVersion: number,
   afterBlockId: string | null,

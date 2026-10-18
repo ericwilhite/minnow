@@ -1,4 +1,4 @@
-import { maybeYieldToEventLoop } from "../work-slicer.js";
+import { sliceExpired, yieldToEventLoop } from "../work-slicer.js";
 import type { ColumnarBatch } from "./batch.js";
 
 /**
@@ -8,9 +8,15 @@ import type { ColumnarBatch } from "./batch.js";
  * thresholds, not the physical format. Keeping a single implementation keeps those
  * accountings from drifting apart.
  */
-export function estimateValuesBytes(values: readonly unknown[]): number {
+export function estimateValuesBytes(
+  values: readonly unknown[],
+  /** A range, `values[start, end)`, is measured without copying it out first. */
+  start = 0,
+  end = values.length,
+): number {
   let bytes = 0;
-  for (const value of values) {
+  for (let index = start; index < end; index += 1) {
+    const value = values[index];
     if (typeof value === "string") bytes += 4 + value.length;
     else if (typeof value === "number" || value instanceof Date) bytes += 8;
     else bytes += 1;
@@ -37,8 +43,12 @@ export async function estimateBatchBytesSliced(input: ColumnarBatch): Promise<nu
   let total = 0;
   for (const values of Object.values(input.columns)) {
     for (let start = 0; start < values.length; start += ESTIMATE_SLICE_VALUES) {
-      await maybeYieldToEventLoop();
-      total += estimateValuesBytes(values.slice(start, start + ESTIMATE_SLICE_VALUES));
+      if (sliceExpired()) await yieldToEventLoop();
+      total += estimateValuesBytes(
+        values,
+        start,
+        Math.min(values.length, start + ESTIMATE_SLICE_VALUES),
+      );
     }
   }
   return total;

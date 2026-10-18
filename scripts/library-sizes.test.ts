@@ -29,24 +29,11 @@ describe("compressed download budgets", () => {
 
     // The client and worker run in separate realms. Count both downloads without sharing code;
     // disabling splitting also counts all dynamically imported adapters in the worker bundle.
-    // The correctness audit adds exact JSON and bounded regex. Measured 459.5 KiB combined:
-    // retain a tight absolute budget rather than claiming this two-download setup is below SQLite.
-    // Compaction that never stalls (0.13.0) adds 3.0 KiB: 467.6 KiB measured. Sliced OPFS
-    // checkpoints and windowed index builds: 468.6 KiB measured. Staged UNIQUE builds, index
-    // capacity, and sliced OPFS recovery: 470.1 KiB measured. Sliced commits and checkpoint
-    // parsing (0.13.1): 472.2 KiB measured. Bounded delta replay, staged commit deltas, WAL
-    // continuation frames, the lease lane, follower pieces, and schema-4 parts (0.14.0):
-    // 486.0 KiB measured. Rekeying (0.15.0): 493.5 KiB measured; with its audit, 496.4 KiB.
-    // The read-path work (point-read plans, index reads, ordered selection): 504.3 KiB. The
-    // 0.16.0 audit as a whole (with prepared templates, PostgreSQL forms, schema-change folds):
-    // 521.1 KiB; with the V8 JSON key guard, 522.3 KiB; with shared engine helpers and droppable
-    // storage-limit literals, 521.1 KiB; with PostgreSQL datetime and interval text, 524.3 KiB;
-    // with UNIQUE builds under writes, 525.0 KiB; with the single-row write paths and delta
-    // merges, 532.3 KiB; with the OPFS marker lock and worker progress reports while the store
-    // opens, 534.0 KiB.
+    // A tight absolute budget, not a claim that this two-download setup is below SQLite: the
+    // current measurement plus a little headroom (536.2 KiB measured; the history is in git).
     expect(
       worker.totalGzipBytes + client.totalGzipBytes,
       "worker plus client gzip bytes",
-    ).toBeLessThanOrEqual(535 * 1024);
+    ).toBeLessThanOrEqual(537 * 1024);
   });
 });

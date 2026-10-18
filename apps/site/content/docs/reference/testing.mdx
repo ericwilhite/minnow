@@ -38,7 +38,7 @@ after generated declarations or asynchronous signatures change.
 | `npm run test:browser:site`        | Public-site examples in Chromium, Firefox, and WebKit                                                                                                          | Docs, examples, and site changes            |
 | `npm run test:browser`             | Both browser runners, in sequence                                                                                                                              | Cross-browser regression checks             |
 | `npm run test:consumer`            | Packed libraries installed, typed, bundled, and run outside the workspace                                                                                      | Package and public-entry changes            |
-| `npm run benchmark:gate`           | Seeded Node performance ratios against the checked-in baseline                                                                                                 | Query-executor performance changes          |
+| `npm run benchmark:gate`           | Seeded Node performance ratios against the checked-in baseline                                                                                                 | Query-executor and write-path changes       |
 | `npm run benchmark:sizes`          | Download size of Minnow, SQLite Wasm, and PGlite, from the installed packages                                                                                  | Dependency or public-entry changes          |
 | `npm run api:check`                | The public API surface against the committed contract snapshot                                                                                                 | Public-entry or declaration changes         |
 | `npm run check`                    | Format, types, lint, build, API contract, coverage, and fast SQLLogicTest                                                                                      | The local merge gate                        |
@@ -913,6 +913,19 @@ The report separates the time to the first confirmed-stable observation from the
 confirmation delay. Observation resolution is 50ms. The gate and comparison row keep the full
 elapsed time, including confirmation; SQLite and PGlite time their updates without this window.
 
+## Wide-table writes
+
+The `wide-*` shapes write the way an app syncing server data does: a 101-column table of text,
+numbers, booleans, and timestamps, keyed by a number, with a `_synced` flag. `wide-guarded-upsert`
+lands 2,000-row sync batches, half new rows, through `upsertBatch` with
+`conflictWhere: _synced = true`, and some rows it meets are local edits the guard must leave
+alone. `wide-insert-row`, `wide-upsert-row`, `wide-update-row` (a keyed SQL `UPDATE` of three
+columns), and `wide-delete-row` are the app's own single-row edits. Unlike the historical shapes,
+SQLite and PGlite hold this table with a real primary key, and SQLite runs prepared statements
+over arguments built before timing, so these ratios compare like with like. The table lives in a
+database of its own, so its writes do not change what the other shapes read. Every engine runs the
+same sequence, and a summary of the table is compared with SQLite's after each shape.
+
 ## Update the performance-gate baseline
 
 After an intentional executor change, inspect the performance-gate output before updating its
@@ -944,12 +957,16 @@ The figure each measured engine shows on the page is the `download` field in
 
 The unit suite also compares fresh bundles against the installed SQLite Wasm loader plus its
 Wasm file. The engine with OPFS must stay smaller after gzip. The generic worker with all
-stores plus its separately bundled client has a tight 465 KiB combined budget; those two
-downloads repeat some code and currently slightly exceed SQLite's single loader-plus-Wasm
-measurement. The report and test share the same measurement code. Per-entry budgets separately
-bound the main engine and IndexedDB worker. Exact JSON parsing and bounded regex matching add
-code, and those intentional additions are recorded alongside the budgets. This guards compressed download size; it does not claim a smaller uncompressed bundle or
-prove that every possible behavior is regression-free.
+stores plus its separately bundled client has a tight 537 KiB combined budget; those two
+downloads repeat some code and exceed SQLite's single loader-plus-Wasm measurement. The report
+and test share the same measurement code. Per-entry budgets in
+`packages/core/src/tree-shaking.test.ts` separately bound the main engine, the IndexedDB worker,
+the schema DSL, and what a page that runs the engine in a worker ships on its main thread (the
+client, the DSL and error classes, the Kysely dialect, and the React hooks); probes there also
+check that the last two carry none of the SQL parser, optimizer, or executor. Each budget is its
+current measurement plus a little headroom, so growth is a deliberate edit beside the number.
+This guards compressed download size; it does not claim a smaller uncompressed bundle or prove
+that every possible behavior is regression-free.
 
 OPFS browser cases check for the storage API inside a dedicated worker before running. Some
 Linux WebKit builds expose it only in the page; those cases are skipped for that missing

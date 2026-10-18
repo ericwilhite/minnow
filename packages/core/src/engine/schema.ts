@@ -11,18 +11,9 @@ import {
 } from "../storage/types.js";
 import type { ComparisonOperator } from "../plan/model.js";
 import type { BatchRow, BatchValue, InsertBatchInput } from "./batch.js";
-import { type Catalog, type CatalogColumn, type CatalogTable } from "./catalog.js";
+import type { Catalog, CatalogColumn, CatalogTable } from "./catalog.js";
 import type { DatabaseRow, DeleteBatchInput, UpdateBatchInput, UpsertOptions } from "./database.js";
-import {
-  childExpressions,
-  compileCheckExpression,
-  expressionColumns,
-  hasAggregate,
-  validateDefaultExpression,
-  type Expression,
-  type QueryParameter,
-  type QueryValue,
-} from "./query.js";
+import type { QueryParameter, QueryValue } from "./query.js";
 import { externalSqlDomainValue, normalizeSqlDomainValue } from "./sql-domains.js";
 
 /**
@@ -31,78 +22,14 @@ import { externalSqlDomainValue, normalizeSqlDomainValue } from "./sql-domains.j
  * steps and rejects everything it cannot prove safe. Physical rewrites never happen here: adding
  * a nullable column, renaming a column through its stable ID, and widening nullability are
  * catalog-only, and older segments read the new column as NULL.
+ *
+ * Nothing here parses SQL, so declaring tables on the main thread does not ship the compiler. The
+ * engine checks the CHECK, DEFAULT, and generated expressions a declaration carries when
+ * `migrate()` runs (see `schema-expressions.ts`), and the catalog it publishes lists the columns
+ * each stored expression reads, which is what planning consults.
  */
 
 export type SchemaColumnType = "boolean" | "number" | "string" | "datetime";
-
-const volatileGeneratedFunctions = new Set([
-  "CURRENT_DATE",
-  "CURRENT_TIMESTAMP",
-  "LOCALTIME",
-  "RANDOM",
-  "GEN_RANDOM_UUID",
-  "NEXTVAL",
-  "CURRVAL",
-]);
-
-/** Compiles and validates one immutable, row-local generated-column expression. */
-export function compileGeneratedColumnExpression(
-  tableName: string,
-  columnName: string,
-  sql: string,
-  columns: ReadonlyArray<{
-    readonly name: string;
-    readonly generatedValue?: { readonly kind: "stored"; readonly sql: string };
-  }>,
-): Expression {
-  if (sql.length === 0 || sql.trim() !== sql) {
-    throw new TypeError(
-      `Generated SQL must be a trimmed non-empty expression: ${tableName}.${columnName}`,
-    );
-  }
-  const expression = compileCheckExpression(sql, `generated ${tableName}.${columnName}`);
-  if (hasAggregate(expression)) {
-    throw new TypeError(
-      `Generated column ${tableName}.${columnName} must be an immutable expression over sibling columns`,
-    );
-  }
-  const inspect = (node: Expression): void => {
-    if (node.kind === "subquery" || node.kind === "exists") {
-      throw new TypeError(
-        `Generated column ${tableName}.${columnName} must be an immutable expression over sibling columns`,
-      );
-    }
-    if (node.kind === "call" && volatileGeneratedFunctions.has(node.name)) {
-      throw new TypeError(
-        `Generated column ${tableName}.${columnName} cannot call volatile function ${node.name}`,
-      );
-    }
-    childExpressions(node).forEach(inspect);
-  };
-  inspect(expression);
-  for (const reference of expressionColumns(expression)) {
-    const pieces = reference.split(".");
-    const referencedName = pieces.at(-1) ?? reference;
-    const qualifier = pieces.length > 1 ? pieces.slice(0, -1).join(".") : undefined;
-    if (qualifier !== undefined && qualifier !== tableName) {
-      throw new TypeError(
-        `Generated column ${tableName}.${columnName} references another table: ${reference}`,
-      );
-    }
-    const referenced = columns.find(({ name }) => name === referencedName);
-    if (referenced === undefined) {
-      throw new TypeError(
-        `Generated column ${tableName}.${columnName} names an unknown column: ${referencedName}`,
-      );
-    }
-    if (referencedName === columnName || referenced.generatedValue !== undefined) {
-      throw new TypeError(
-        `Generated column ${tableName}.${columnName} cannot reference a generated column: ${referencedName}`,
-      );
-    }
-  }
-  return expression;
-}
 
 /** What a FOREIGN KEY does to child rows when the parent row is deleted (E141-04). */
 export type ReferentialAction = "restrict" | "cascade" | "set null";
@@ -243,12 +170,15 @@ export interface ColumnBuilder<
   /**
    * Declares a variable-free SQL default expression, such as `CURRENT_TIMESTAMP`,
    * `gen_random_uuid()`, or `nextval('orders_id_seq')`. The engine parses and type-checks it
-   * before migration and evaluates it once per omitted row.
+   * when `migrate()` runs, before the catalog changes, and evaluates it once per omitted row.
    */
   defaultSql(
     sql: string,
   ): ColumnBuilder<TValue, TNullable, TUnique, true, TInput, TDomain, TGenerated>;
-  /** Declares a stored expression over sibling columns. Callers never insert or update it. */
+  /**
+   * Declares a stored expression over sibling columns. Callers never insert or update it. The
+   * engine checks the expression when `migrate()` runs, before the catalog changes.
+   */
   generatedSql(
     sql: string,
   ): ColumnBuilder<TValue, TNullable, TUnique, false, TInput, TDomain, true>;
@@ -721,10 +651,6 @@ export function table(
   if (uniqueEntry?.[1].isNullable === true) {
     throw new TypeError(`Table ${name} unique column must not be nullable: ${uniqueEntry[0]}`);
   }
-  const generatedColumns = entries.map(([columnName, definition]) => ({
-    name: columnName,
-    ...(definition.generatedSpec === undefined ? {} : { generatedValue: definition.generatedSpec }),
-  }));
   for (const [columnName, definition] of entries) {
     validateSchemaName(columnName, "Column");
     if (definition.integer && definition.type !== "number") {
@@ -761,12 +687,6 @@ export function table(
           `A generated column cannot also have a default or backfill: ${name}.${columnName}`,
         );
       }
-      compileGeneratedColumnExpression(
-        name,
-        columnName,
-        definition.generatedSpec.sql,
-        generatedColumns,
-      );
       if (definition.isUnique || primaryKey.includes(columnName)) {
         throw new TypeError(
           `Generated columns cannot be row-addressing keys: ${name}.${columnName}`,
@@ -791,13 +711,6 @@ export function table(
       },
       spec,
     );
-    if (spec.kind === "expression") {
-      validateDefaultExpression(spec.sql, {
-        name: `${name}.${columnName}`,
-        type: definition.type,
-        ...(definition.sqlDomain === undefined ? {} : { sqlDomain: definition.sqlDomain }),
-      });
-    }
     if (spec.kind === "literal" && definition.sqlDomain !== undefined) {
       normalizeSqlDomainValue(definition.sqlDomain, spec.value);
     }
@@ -862,17 +775,6 @@ export function table(
     constraintNames.add(check.name);
     if (check.sql.trim().length === 0) {
       throw new TypeError(`CHECK ${check.name} in table ${name} has no expression`);
-    }
-    for (const reference of expressionColumns(compileCheckExpression(check.sql, check.name))) {
-      const pieces = reference.split(".");
-      const columnName = pieces.at(-1) ?? reference;
-      const qualifier = pieces.length > 1 ? pieces.slice(0, -1).join(".") : undefined;
-      if (qualifier !== undefined && qualifier !== name) {
-        throw new TypeError(`CHECK ${check.name} references another table: ${reference}`);
-      }
-      if (columns[columnName] === undefined) {
-        throw new TypeError(`CHECK ${check.name} names an unknown column: ${columnName}`);
-      }
     }
   }
   return {
@@ -1518,33 +1420,23 @@ export function assertColumnDroppable(record: CatalogTable, column: CatalogColum
     }
   }
   for (const check of record.checks) {
-    let referenced: readonly string[];
-    try {
-      referenced = expressionColumns(compileCheckExpression(check.sql, check.name));
-    } catch {
-      // A check the engine can no longer compile is not a licence to drop what it names.
+    // A check whose columns the catalog cannot list is not a licence to drop what it names.
+    if (check.columns === undefined) {
       throw new TypeError(`CHECK ${check.name} cannot be re-read, so ${where} is not droppable`);
     }
-    if (referenced.includes(column.name)) {
+    if (check.columns.includes(column.name)) {
       throw new TypeError(`CHECK ${check.name} still uses this column: ${where}`);
     }
   }
   for (const dependent of record.columns) {
-    if (dependent.generatedValue === undefined) continue;
-    let referenced: readonly string[];
-    try {
-      referenced = expressionColumns(
-        compileCheckExpression(
-          dependent.generatedValue.sql,
-          `generated ${record.name}.${dependent.name}`,
-        ),
-      );
-    } catch {
+    const generated = dependent.generatedValue;
+    if (generated === undefined) continue;
+    if (generated.columns === undefined) {
       throw new TypeError(
         `Generated column ${dependent.name} cannot be re-read, so ${where} is not droppable`,
       );
     }
-    if (referenced.includes(column.name)) {
+    if (generated.columns.includes(column.name)) {
       throw new TypeError(`Generated column ${dependent.name} still uses this column: ${where}`);
     }
   }
@@ -1566,20 +1458,22 @@ function assertColumnRenamable(
     }
   }
   for (const check of record.checks) {
-    const referenced = expressionColumns(compileCheckExpression(check.sql, check.name));
-    if (referenced.includes(column.name)) {
+    if (check.columns === undefined) {
+      throw new TypeError(`CHECK ${check.name} cannot be re-read, so ${where} cannot be renamed`);
+    }
+    if (check.columns.includes(column.name)) {
       throw new TypeError(`CHECK ${check.name} prevents renaming ${where}`);
     }
   }
   for (const dependent of record.columns) {
-    if (dependent.generatedValue === undefined) continue;
-    const referenced = expressionColumns(
-      compileCheckExpression(
-        dependent.generatedValue.sql,
-        `generated ${record.name}.${dependent.name}`,
-      ),
-    );
-    if (referenced.includes(column.name)) {
+    const generated = dependent.generatedValue;
+    if (generated === undefined) continue;
+    if (generated.columns === undefined) {
+      throw new TypeError(
+        `Generated column ${dependent.name} cannot be re-read, so ${where} cannot be renamed`,
+      );
+    }
+    if (generated.columns.includes(column.name)) {
       throw new TypeError(`Generated column ${dependent.name} prevents renaming ${where}`);
     }
   }
@@ -1910,9 +1804,14 @@ export function planMigration(
           });
         }
       }
+      // The catalog entry also lists the columns its expression reads; a declaration is the
+      // kind and text alone.
       const existingGenerated = existing.generatedValue;
       const definedGenerated = columnDefinition.generatedSpec;
-      if (JSON.stringify(existingGenerated ?? null) !== JSON.stringify(definedGenerated ?? null)) {
+      if (
+        existingGenerated?.kind !== definedGenerated?.kind ||
+        existingGenerated?.sql !== definedGenerated?.sql
+      ) {
         steps.push({
           kind: "alter-generated",
           tableName: tableDefinition.name,

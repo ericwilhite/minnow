@@ -111,6 +111,44 @@ it("carries a table's visible segments across its own commits instead of re-prov
   await db.close();
 });
 
+it("carries a table's visible segments across batch-write commits too", async () => {
+  const { store, calls, reset } = countingStore();
+  const db = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+  await db.execute(
+    "CREATE TABLE items (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL, note VARCHAR)",
+  );
+  for (let batch = 0; batch < 4; batch += 1) {
+    await db.insertBatch(
+      "items",
+      Array.from({ length: 50 }, (_, index) => ({ id: batch * 50 + index, revision: 0, note: "" })),
+    );
+  }
+  for (let index = 0; index < 30; index += 1) {
+    await db.upsertBatch("items", [{ id: index, revision: 1, note: "seed" }]);
+  }
+  // Warm the catalog state the reads below use.
+  await db.query("SELECT note FROM items WHERE id = 0");
+  reset();
+  // Batch writes began without the catalog probe the carry needs, so the read after each one
+  // reloaded the table's catalog state and re-proved every block of every segment.
+  for (let index = 0; index < 20; index += 1) {
+    await db.upsertBatch("items", [{ id: index, revision: 2, note: "updated" }]);
+    expect(
+      (await db.query("SELECT note FROM items WHERE id = ?", { params: [index] })).rows,
+    ).toEqual([{ note: "updated" }]);
+    await db.insertBatch("items", [{ id: 1_000 + index, revision: 0, note: "new" }]);
+    expect(
+      (await db.query("SELECT note FROM items WHERE id = ?", { params: [1_000 + index] })).rows,
+    ).toEqual([{ note: "new" }]);
+  }
+  expect(calls.get("hasManifestBlocks") ?? 0).toBe(0);
+  expect(calls.get("listTables") ?? 0).toBe(0);
+  expect(
+    (await db.query("SELECT COUNT(*) AS n FROM items WHERE revision = 2 OR id >= 1000")).rows,
+  ).toEqual([{ n: 40 }]);
+  await db.close();
+});
+
 it("probes a keyed INSERT's keys and resolves its table once per statement", async () => {
   const { store, calls, reset } = countingStore();
   const db = new MinnowDatabase(store, { autoCompact: false });

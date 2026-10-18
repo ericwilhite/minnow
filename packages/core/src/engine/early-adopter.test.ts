@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import { IndexedDbBlockStore, MemoryBlockStore } from "../storage/index.js";
 import { MinnowDatabase } from "./database.js";
-import { UnknownTableError } from "./errors.js";
+import { UniqueConstraintError, UnknownTableError } from "./errors.js";
 import { column, schema, table } from "./schema.js";
 
 describe("early-adopter engine contracts", () => {
@@ -210,6 +210,98 @@ describe("early-adopter engine contracts", () => {
       { id: 1, _synced: false },
       { id: 2, _synced: true },
     ]);
+    await database.close();
+  });
+
+  it("judges a repeated key in a guarded scope batch against the batch's own earlier row", async () => {
+    // Inside a scope the guard runs before the batch's keys are checked for repeats. The second
+    // row for key 5 replaces the first, so it is the first row's `_synced` the guard reads, not
+    // storage's: it refuses, the first row stands alone, and the batch commits. An autocommit
+    // batch refuses any repeated key outright.
+    const database = new MinnowDatabase(new MemoryBlockStore(), { compression: "raw" });
+    await database.createTable({
+      name: "items",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "value", type: "string" },
+        { name: "_synced", type: "boolean" },
+      ],
+    });
+    await database.insertBatch("items", [{ id: 1, value: "stored", _synced: true }]);
+    const guard = { conflictWhere: { column: "_synced", operator: "=", value: true } } as const;
+    const rows = [
+      { id: 5, value: "local-first", _synced: false },
+      { id: 1, value: "remote", _synced: true },
+      { id: 5, value: "must-not-win", _synced: true },
+    ];
+    await expect(database.upsertBatch("items", rows, guard)).rejects.toThrow(UniqueConstraintError);
+    const { result } = await database.write((session) => session.upsertBatch("items", rows, guard));
+    expect(result).toMatchObject({ rowCount: 2, skippedRowCount: 1 });
+    expect(
+      [...(await database.readTable("items"))].sort(
+        (left, right) => Number(left.id) - Number(right.id),
+      ),
+    ).toEqual([
+      { id: 1, value: "remote", _synced: true },
+      { id: 5, value: "local-first", _synced: false },
+    ]);
+    await database.close();
+  });
+
+  it("classifies a guarded batch over a long history of single-row writes", async () => {
+    // Hundreds of single-row writes with no compaction: the guard's old-image read replays each
+    // key's history in one pass over the segments and must read every row as it now stands.
+    const database = new MinnowDatabase(new MemoryBlockStore(), {
+      compression: "raw",
+      autoCompact: false,
+    });
+    await database.createTable({
+      name: "items",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "value", type: "string" },
+        { name: "_synced", type: "boolean" },
+      ],
+    });
+    const model = new Map<number, { value: string; _synced: boolean }>();
+    await database.insertBatch(
+      "items",
+      Array.from({ length: 40 }, (_, index) => ({
+        id: index + 1,
+        value: "base",
+        _synced: true,
+      })),
+    );
+    for (let id = 1; id <= 40; id += 1) model.set(id, { value: "base", _synced: true });
+    for (let step = 0; step < 300; step += 1) {
+      const id = (step % 40) + 1;
+      const row = { value: `edit-${String(step)}`, _synced: step % 3 !== 0 };
+      await database.upsert("items", { id, ...row });
+      model.set(id, row);
+    }
+    const guard = { conflictWhere: { column: "_synced", operator: "=", value: true } } as const;
+    const batch = Array.from({ length: 50 }, (_, index) => ({
+      id: index + 1,
+      value: "sync",
+      _synced: true,
+    }));
+    const expectedSkipped = batch.filter((row) => model.get(row.id)?._synced === false).length;
+    const result = await database.upsertBatch("items", batch, guard);
+    expect(result.skippedRowCount).toBe(expectedSkipped);
+    expect(result.insertedRowCount).toBe(10);
+    for (const row of batch) {
+      const current = model.get(row.id);
+      if (current === undefined || current._synced)
+        model.set(row.id, { value: "sync", _synced: true });
+    }
+    const stored = await database.readTable("items");
+    expect([...stored].sort((left, right) => Number(left.id) - Number(right.id))).toEqual(
+      [...model.entries()]
+        .sort(([left], [right]) => left - right)
+        .map(([id, row]) => ({ id, ...row })),
+    );
     await database.close();
   });
 

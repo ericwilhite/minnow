@@ -871,6 +871,165 @@ describe("point-read fast path", () => {
     await database.close();
   });
 
+  it("serves key IN lists over a mutation history in one pass, matching a model and the executor", async () => {
+    // Every member of a membership is replayed through each segment at once. Its answer must be
+    // the rows a lookup per member would give, in member order: checked against a model of the
+    // table, and as a set against the ordinary executor, through upserts that replace rows,
+    // deletes, re-inserts, patched columns, extra equalities, and multi-block segments.
+    const database = new MinnowDatabase(new MemoryBlockStore(), {
+      autoCompact: false,
+      rowsPerBlock: 8,
+    });
+    await database.createTable({
+      name: "items",
+      uniqueKey: "id",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "label", type: "string" },
+        { name: "qty", type: "number" },
+        { name: "seen", type: "datetime", nullable: true },
+      ],
+    });
+    interface Item {
+      label: string;
+      qty: number;
+      seen: Date | null;
+    }
+    const model = new Map<number, Item>();
+    let seed = 0x1a2b3c;
+    const random = (limit: number): number => {
+      seed ^= seed << 13;
+      seed ^= seed >>> 17;
+      seed ^= seed << 5;
+      return (seed >>> 0) % limit;
+    };
+    const item = (id: number, version: number): Item => ({
+      label: `item-${String(id)}-${String(version)}`,
+      qty: (id * 7 + version) % 13,
+      seen:
+        (id + version) % 4 === 0 ? null : new Date(Date.UTC(2026, 0, 1 + ((id + version) % 28))),
+    });
+    const initial = Array.from({ length: 60 }, (_, index) => ({
+      id: index + 1,
+      ...item(index + 1, 0),
+    }));
+    await database.insertBatch("items", initial);
+    for (const { id, ...rest } of initial) model.set(id, rest);
+    const unordered = (rows: ReadonlyArray<Record<string, QueryValue>>): string[] =>
+      rows.map((row) => JSON.stringify(row)).sort();
+    const check = async (): Promise<void> => {
+      const members = [...new Set(Array.from({ length: 1 + random(12) }, () => 1 + random(90)))];
+      const placeholders = members.map(() => "?").join(", ");
+      const sql = `SELECT id, label, qty, seen FROM items WHERE id IN (${placeholders})`;
+      pointReadTestHooks.disabled = false;
+      const servedBefore = pointReadTestHooks.served;
+      const fast = await database.query(sql, { params: members, memoize: false });
+      expect(pointReadTestHooks.served).toBeGreaterThan(servedBefore);
+      const expected = [...members]
+        .sort((left, right) => left - right)
+        .flatMap((id) => {
+          const row = model.get(id);
+          return row === undefined ? [] : [{ id, ...row }];
+        });
+      expect(fast.rows).toEqual(expected);
+      pointReadTestHooks.disabled = true;
+      const ordinary = await database.query(sql, { params: members, memoize: false });
+      pointReadTestHooks.disabled = false;
+      expect(unordered(fast.rows)).toEqual(unordered(ordinary.rows));
+      // An extra equality is checked against each row as it stands after its history.
+      const qty = random(13);
+      const filtered = await database.query(
+        `SELECT id, qty FROM items WHERE id IN (${placeholders}) AND qty = ?`,
+        { params: [...members, qty], memoize: false },
+      );
+      expect(filtered.rows).toEqual(
+        expected.filter((row) => row.qty === qty).map(({ id }) => ({ id, qty })),
+      );
+      const counted = await database.query(
+        `SELECT COUNT(*) AS n FROM items WHERE id IN (${placeholders})`,
+        { params: members, memoize: false },
+      );
+      expect(counted.rows).toEqual([{ n: expected.length }]);
+    };
+    for (let step = 1; step <= 40; step += 1) {
+      const action = random(5);
+      if (action === 0) {
+        const ids = [...new Set(Array.from({ length: 1 + random(10) }, () => 1 + random(90)))];
+        await database.upsertBatch(
+          "items",
+          ids.map((id) => ({ id, ...item(id, step) })),
+        );
+        for (const id of ids) model.set(id, item(id, step));
+      } else if (action === 1) {
+        const ids = [...new Set(Array.from({ length: 1 + random(5) }, () => 1 + random(90)))];
+        await database.deleteBatch("items", { keys: ids });
+        for (const id of ids) model.delete(id);
+      } else if (action === 2) {
+        const ids = [...new Set(Array.from({ length: 1 + random(6) }, () => 1 + random(90)))];
+        await database.execute(
+          `UPDATE items SET qty = qty + 1 WHERE id IN (${ids.map(String).join(", ")})`,
+        );
+        for (const id of ids) {
+          const row = model.get(id);
+          if (row !== undefined) model.set(id, { ...row, qty: row.qty + 1 });
+        }
+      } else if (action === 3) {
+        const id = 1 + random(90);
+        await database.execute("UPDATE items SET label = ?, seen = NULL WHERE id = ?", [
+          `patched-${String(step)}`,
+          id,
+        ]);
+        const row = model.get(id);
+        if (row !== undefined)
+          model.set(id, { ...row, label: `patched-${String(step)}`, seen: null });
+      } else {
+        const ids = Array.from({ length: 1 + random(4) }, (_, index) => 1_000 + step * 10 + index);
+        await database.insertBatch(
+          "items",
+          ids.map((id) => ({ id, ...item(id, step) })),
+        );
+        for (const id of ids) model.set(id, item(id, step));
+      }
+      await check();
+    }
+    await database.close();
+  });
+
+  it("serves string-key IN lists over a mutation history through the dictionary path", async () => {
+    const users = await scalarDatabase();
+    await users.execute("UPDATE users SET score = 500 WHERE email = ?", ["user-3@example.com"]);
+    await users.execute("DELETE FROM users WHERE email = ?", ["user-4@example.com"]);
+    await users.upsertBatch("users", [
+      { email: "user-5@example.com", score: 55, joined: null },
+      { email: "fresh@example.com", score: 1, joined: null },
+    ]);
+    const emails = [
+      "user-3@example.com",
+      "user-4@example.com",
+      "user-5@example.com",
+      "user-6@example.com",
+      "fresh@example.com",
+      "missing@example.com",
+    ];
+    const sql = `SELECT email, score FROM users WHERE email IN (${emails.map(() => "?").join(", ")})`;
+    const servedBefore = pointReadTestHooks.served;
+    const fast = await users.query(sql, { params: emails, memoize: false });
+    expect(pointReadTestHooks.served).toBeGreaterThan(servedBefore);
+    expect(fast.rows).toEqual([
+      { email: "fresh@example.com", score: 1 },
+      { email: "user-3@example.com", score: 500 },
+      { email: "user-5@example.com", score: 55 },
+      { email: "user-6@example.com", score: (6 * 37) % 100 },
+    ]);
+    pointReadTestHooks.disabled = true;
+    const ordinary = await users.query(sql, { params: emails, memoize: false });
+    pointReadTestHooks.disabled = false;
+    expect([...fast.rows].sort((a, b) => String(a.email).localeCompare(String(b.email)))).toEqual(
+      [...ordinary.rows].sort((a, b) => String(a.email).localeCompare(String(b.email))),
+    );
+    await users.close();
+  });
+
   it("stays exact under randomized lookups against a randomized table", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore(), { rowsPerBlock: 128 });
     await database.execute(

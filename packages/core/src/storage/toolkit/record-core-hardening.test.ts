@@ -36,6 +36,8 @@ import {
   OrderedStringSet,
   RecordCore,
   SegmentRecordMap,
+  reorderedSegmentRecord,
+  segmentRetainedBytes,
   validateAutoIncrementReservation,
   validateBeginTransactionInput,
   validateBlockWriteBytes,
@@ -445,6 +447,37 @@ describe("RecordCore hardening", () => {
       createdAt: "2026-08-24T00:00:00.000Z",
     };
     expect(segmentRecordRetainedBytes(record)).toBe(encodeRecordJson(record).byteLength);
+  });
+
+  it("derives a republished segment's bytes exactly as a fresh measurement reads them", () => {
+    // A commit stamps each staged level-zero segment with its manifest version and charges the
+    // copy from the staged record's size; across digit counts and fractions it must not drift.
+    const orders = [0, 9, 10, 99, 100, 123_456, 2 ** 31, Number.MAX_SAFE_INTEGER, 0.5, 1e-7, 1e21];
+    for (const from of orders) {
+      const staged: SegmentRecord = {
+        id: "segment-€",
+        tableId: "table",
+        transactionId: "transaction",
+        rowCount: 1,
+        rowIdStart: 9_007_199_254_740_993n,
+        rowIdEndExclusive: 9_007_199_254_740_994n,
+        columnBlockIds: { "column-€": ["block-€"], other: ["block-2"] },
+        kind: "insert",
+        level: 0,
+        logicalOrder: from,
+        commitOrdinal: 0,
+        rowIdSpans: [],
+        createdAt: "2026-08-24T00:00:00.000Z",
+      };
+      for (const to of orders) {
+        const reordered = reorderedSegmentRecord(staged, to);
+        expect(reordered).toEqual({ ...staged, logicalOrder: to });
+        expect(segmentRetainedBytes(reordered)).toBe(encodeRecordJson(reordered).byteLength);
+        // Chained, as a record republished twice would be.
+        const twice = reorderedSegmentRecord(reordered, from);
+        expect(segmentRetainedBytes(twice)).toBe(segmentRecordRetainedBytes(staged));
+      }
+    }
   });
 
   it("refuses retained manifest and segment cardinality overflow before replacing live state", () => {
@@ -1975,8 +2008,34 @@ describe("RecordCore hardening", () => {
     segments.delete(record.id);
     expect(segments.blockReferenceCount("reverse-block")).toBe(0);
     segments.set(record.id, record);
+    // An aliased block: named by segments of two tables, then by one again.
+    const alias: SegmentRecord = {
+      ...record,
+      id: "alias-segment",
+      tableId: "alias-table",
+      columnBlockIds: { value: ["reverse-block"], other: ["alias-block"] },
+    };
+    const third: SegmentRecord = { ...record, id: "third-segment" };
+    segments.set(alias.id, alias);
+    segments.set(third.id, third);
+    expect(segments.blockReferenceCount("reverse-block")).toBe(3);
+    expect(segments.tableBlockReferenceCount(record.tableId, "reverse-block")).toBe(2);
+    expect(segments.tableBlockReferenceCount(alias.tableId, "reverse-block")).toBe(1);
+    expect(new Set(segments.segmentIdsForBlock("reverse-block"))).toEqual(
+      new Set([record.id, alias.id, third.id]),
+    );
+    segments.delete(third.id);
+    segments.delete(record.id);
+    expect(segments.blockReferenceCount("reverse-block")).toBe(1);
+    expect(segments.tableBlockReferenceCount(record.tableId, "reverse-block")).toBe(0);
+    expect([...segments.segmentIdsForBlock("reverse-block")]).toEqual([alias.id]);
+    // Moving a segment to blocks it did not name drops the old references.
+    segments.set(alias.id, { ...alias, columnBlockIds: { other: ["alias-block"] } });
+    expect(segments.blockReferenceCount("reverse-block")).toBe(0);
+    expect(segments.blockReferenceCount("alias-block")).toBe(1);
     segments.clear();
     expect(segments.size).toBe(0);
+    expect(segments.blockReferenceCount("alias-block")).toBe(0);
   });
 
   it("rebuilds bulk unique-key order lazily and stays exact across later mutations", () => {

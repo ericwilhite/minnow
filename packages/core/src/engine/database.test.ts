@@ -33,23 +33,24 @@ import { MAX_CACHEABLE_TEXT_CHARACTERS } from "./cache-limits.js";
 import { compileQuery, type QueryRow } from "./query.js";
 import { column, schema, table } from "./schema.js";
 import { allVisibleSegments } from "./storage-test-helpers.js";
+import { attachLifecycleFlush, MAX_BUFFERED_WRITER_PENDING_ADDS } from "./buffered-writer.js";
 import {
-  attachLifecycleFlush,
-  DatabaseReadBacklogError,
   MAX_DATABASE_ACTIVE_READS,
   MAX_DATABASE_PENDING_WRITES,
-  MAX_BUFFERED_WRITER_PENDING_ADDS,
   MAX_GARBAGE_COLLECTION_RETAIN_RECENT_VERSIONS,
   MAX_VISIBLE_SEGMENT_PAGE_ITEMS,
   MinnowDatabase,
-  CompactionJobCancelledError,
-  CompactionMemoryBudgetError,
   type DatabaseRow,
   type VisibleSegmentPageCursor,
+} from "./database.js";
+import {
+  CompactionJobCancelledError,
+  CompactionMemoryBudgetError,
+  DatabaseReadBacklogError,
   MissingKeyError,
   UniqueConstraintError,
   VisibleSegmentCursorStaleError,
-} from "./database.js";
+} from "./errors.js";
 import { markStoreUncoordinatedForTests } from "./write-coordinator.js";
 
 async function manifestBlockIdsAt(store: BlockStore, version: number): Promise<string[]> {
@@ -9953,11 +9954,12 @@ describe("prepared-input cache and shared read lease", () => {
     // statements read the same table set, so no further catalog read happens at all until
     // something actually changes.
     expect(store.queryCatalogStateCalls).toBe(catalogReadsAfterFirst);
-    // A local commit moves the epoch, so the next query reloads once and later repeats reuse it.
+    // A local commit moves the epoch, and this instance carries its cached state across it with
+    // the segments the commit published: the next query answers from it without a catalog read.
     await database.insertBatch("orders", { columns: { region: ["south"], amount: [11] } });
     const afterLocal = await database.query("SELECT COUNT(*) AS orders FROM orders");
     expect(afterLocal.rows).toEqual([{ orders: 7 }]);
-    expect(store.queryCatalogStateCalls).toBeGreaterThan(catalogReadsAfterFirst);
+    expect(store.queryCatalogStateCalls).toBe(catalogReadsAfterFirst);
     const catalogReadsAfterLocal = store.queryCatalogStateCalls;
     await database.query("SELECT COUNT(*) AS orders FROM orders");
     expect(store.queryCatalogStateCalls).toBe(catalogReadsAfterLocal);
@@ -10044,7 +10046,8 @@ describe("prepared-input cache and shared read lease", () => {
       { right_value: "right-two", left_value: "left-two" },
       { right_value: "right-three", left_value: "left-three" },
     ]);
-    expect(store.queryCatalogStateCalls).toBe(2);
+    // This instance's own batch commits carry the shared state forward with their segments.
+    expect(store.queryCatalogStateCalls).toBe(1);
     await database.close();
     store.close();
   });

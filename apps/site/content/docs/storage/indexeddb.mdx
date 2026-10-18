@@ -187,10 +187,12 @@ corruption.
 ## Collection cost
 
 Collection retains corruption and snapshot-pin checks inside the same atomic transaction as
-reclamation. On browsers, metadata validation reads at most 128 records per batch and pipelines
-block-presence checks. A step builds its pinned-version set once and keeps at most 4,096 cached
-ownership roots; overflow falls back to exact probes. That cache lasts only for the current
-IndexedDB transaction, so another tab cannot make a cached root decision stale.
+reclamation. On browsers, metadata validation reads at most 128 records per batch, and proves the
+blocks of each batch present with one range read of block keys rather than one request per block.
+Listing retired blocks for collection reads 256 records per request. A step builds its
+pinned-version set once and keeps at most 4,096 cached ownership roots; overflow falls back to
+exact probes. That cache lasts only for the current IndexedDB transaction, so another tab cannot
+make a cached root decision stale.
 
 The candidate item limit bounds reclamation, not every validation read. Validation still depends
 on retained history, and readers and writes can wait behind a collection transaction. Measure

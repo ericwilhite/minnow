@@ -1,7 +1,8 @@
 /**
- * Pins the package download budget and the promise that an application ships only the store it
- * uses. Both can regress silently through a barrel export, a stray side effect, or a static worker
- * adapter import.
+ * Pins the package download budget and the promise that an application ships only what it uses:
+ * the store it opens, and on a page that hosts the engine in a worker, none of the engine. Each can
+ * regress silently through a barrel export, a re-export routed through a heavy module, a stray
+ * side effect, or a static adapter import.
  *
  * Bundles the built package the way an application's bundler would — so like the playground
  * declaration suite, it reads `dist/` and expects it to be current (`tsc -b`, which every
@@ -9,7 +10,7 @@
  *
  * The probes are string literals that survive bundling: the OPFS store's BroadcastChannel
  * prefix and the IndexedDB store's key-partition prefix, each found nowhere else in the
- * package.
+ * package, and the SQL tokenizer's own refusal for an unterminated dollar-quoted string.
  */
 import { join } from "node:path";
 import { constants, gzipSync } from "node:zlib";
@@ -22,123 +23,59 @@ const CLIENT_MARKER = "Database client is closed";
 const KEYED_LIVE_MARKER = "Live query window maxRows must be a positive whole number";
 const TYPED_TABLE_MARKER = "Upsert requires a unique key:";
 const DATABASE_MARKER = "A database cannot queue more than";
-// Result-domain metadata, DATE, guarded upserts, typed catalog errors, bounded cancellation,
-// exact-NUMERIC dictionary predicates, maintenance hints, set-at-a-time correlated SQL, nested
-// JSON provenance, stored generated columns, the keyed point-read fast path, declared-scale
-// NUMERIC rendering, the -> and ->> JSON operators, exact numeric constants (PostgreSQL's
-// NUMERIC typing of decimal and big-integer literals, with compile-time exact folding), and
-// PostgreSQL quotient-scale selection, schema-bound wildcard lowering, execution-time DML
-// scalar materialization, PostgreSQL GROUP BY / set-operation tail resolution, untyped-literal
-// coercion, the table-driven PostgreSQL scalar function surface (TO_CHAR templates, regular
-// expressions, MD5, FORMAT, AGE), mutation aliases with subquery assignments, and SERIAL /
-// IDENTITY DDL, correlation probes that carry the outer predicates and mirror key ranges,
-// uncorrelated IN subqueries planned as joins, dictionary-decided CASE aggregate branches, and
-// exact NUMERIC ROUND/TRUNC/ABS/FLOOR/CEIL/MOD/SIGN with PostgreSQL display-scale inference
-// intentionally expand the complete engine surface.
-// Lifecycle queues, RPC deadlines, snapshot renewal, and write admission add about 3 KiB gzip.
-// Measured after the resilience audit: 878.3 KiB raw / 254.1 KiB gzip; under 1% headroom. The
-// scope write set (per-key memtable, mirror lookups, keyed SQL path) adds about 7 KiB raw:
-// 898.9 KiB raw / 260.5 KiB gzip. The 0.10.1 audit fixes (scope pre-checks, point-read key
-// lookups, admission bypass) add about 6 KiB raw: 904.7 KiB raw. Writer turns (0.11.0: the
-// admission queue with stall reporting and cross-context cancellation, catalog and import
-// turns, lent fold publications) add about 7 KiB raw: 911.3 KiB raw / 265.3 KiB gzip.
-// Exact JSON parsing, bounded regex, strict TEXT typing, and acknowledgement validation add
-// about 15 KiB raw / 5 KiB gzip; these measured correctness features intentionally expand the surface.
-// Compaction that never stalls (0.13.0: replayed merge plans recomputed from their sources,
-// memory fitted to the budget, time-sliced folds, scans, writes, and live patches, and the
-// schema-3 / layout-8 barriers) adds 6.3 KiB raw / 2.4 KiB gzip: 941.1 KiB raw / 275.3 KiB gzip.
-// Staged UNIQUE builds, index capacity, and sliced OPFS recovery: 944.2 KiB raw / 276.3 KiB gzip.
-// Sliced commits and checkpoint parsing (0.13.1): 945.4 KiB raw / 276.8 KiB gzip. Bounded
-// replay of large unmerged deltas, staged commit deltas, and masked key publication (0.14.0):
-// 965.5 KiB raw / 284.1 KiB gzip. Rekeying (0.15.0: primary-key updates, references that
-// follow, key forwards and their SQL rewrite, batched live delivery): 987.6 KiB raw / 291.1 KiB
-// gzip. The 0.15.0 rekeying audit (layered key forwards replayed from commit windows, live delivery
-// recovery, grouped postings reads, marker validation):
-// 994.6 KiB raw / 293.6 KiB gzip. The read-path work (resolved point-read plans, index reads,
-// ordered row selection, index-served OR and LIKE prefixes, LEFT join input hints, unboxed
-// arithmetic and DISTINCT kernels): 1017.2 KiB raw / 301.4 KiB gzip.
-// The 0.16.0 audit (prepared read templates, ordered selection, index reads, columnar statement
-// results, PostgreSQL forms, schema-change folds): 1067.0 KiB raw / 317.3 KiB gzip.
-// The V8 JSON key guard (block-format/json-parse.ts): 1069.6 KiB raw / 318.4 KiB gzip.
-// Shared engine helpers in place of duplicated copies: 1063.5 KiB raw / 317.3 KiB gzip.
-// PostgreSQL datetime and interval text (sql-datetime-text.ts): 1074.0 KiB raw / 320.6 KiB gzip.
-// Full-text coverage for append-only folds and invalidated-postings collection: 1075.2 KiB raw /
-// 321.0 KiB gzip.
-// UNIQUE builds under writes (postings-only folds, CREATE that finishes enforced): 1076.9 KiB
-// raw.
-// Single-row write paths (batched IndexedDB commit reads, the level-zero count cache, paged
-// collection planning) and delta merges (the delta-v1 planner, runner, and plan validation, the
-// quiet-table fold, schema 7 / layout 12): 1091.8 KiB raw / 326.0 KiB gzip.
-// Build-owner liveness and CREATE INDEX IF NOT EXISTS waits (owner-presence.ts): 1095.1 KiB raw /
-// 327.1 KiB gzip.
-// Lapsed-lease retakes and write restarts: 1096.2 KiB raw.
-const COMPLETE_ENTRY_RAW_BUDGET = 1097 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 328 * 1024;
-// Measured with the larger durable adapter: 1211.9 KiB raw / 337.5 KiB gzip. The durable
-// served-request ledger (OPFS layout 6) adds about 20 KiB raw: 1231.3 KiB raw. With the scope
-// write set: 346.0 KiB gzip. The unbounded journal (memoized RecordCore journal, bounded served
-// ledger) adds about 10 KiB raw: 1241.7 KiB raw. Writer turns: 1254.8 KiB raw / 351.6 KiB gzip.
-// Bounded delta-header preparation and the released cross-tab collection fix measure
-// 1285.3 KiB raw. The catalog, writer-admission and query controllers plus the storage
-// fast paths add about 4 KiB. Allow 1290 KiB raw while retaining the compressed download budget.
-// Compaction that never stalls (0.13.0) adds 8.3 KiB raw: 1297.3 KiB raw. Sliced OPFS
-// checkpoints and windowed index builds add 2.6 KiB: 1299.9 KiB raw. Staged UNIQUE builds,
-// index capacity, and sliced OPFS recovery: 1304.6 KiB raw. Sliced commits and checkpoint
-// parsing (0.13.1): 1309.4 KiB raw. Bounded delta replay, staged commit deltas, WAL
-// continuation frames, the lease lane, and follower pieces (0.14.0): 1345.0 KiB raw.
-// Rekeying (0.15.0): 1367.4 KiB raw. With its audit: 1374.8 KiB raw. The read-path work:
-// 1397.8 KiB raw.
-// The 0.16.0 audit: 1449.0 KiB raw.
-// The V8 JSON key guard: 1451.2 KiB raw. Shared engine helpers: 1445.0 KiB raw.
-// PostgreSQL datetime and interval text: 1455.5 KiB raw.
-// Full-text fold coverage and postings collection: 1456.6 KiB raw.
-// UNIQUE builds under writes: 1458.3 KiB raw.
-// Single-row write paths and delta merges: 1481.7 KiB raw.
-// Build-owner liveness: 1485.0 KiB raw.
-// Lapsed-lease retakes and write restarts: 1486.1 KiB raw.
-// OPFS marker judged under a Web Lock: 1487.1 KiB raw.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1488 * 1024;
-// Explicit scheduler ownership and bounded diagnostic history add about 1 KiB gzip over the
-// correctness/upgrade batch (361.6 KiB measured). Concurrent compaction and posting ownership
-// repairs measure 362.1 KiB; allow the next whole KiB without changing runtime performance gates.
-// Compaction that never stalls (0.13.0) adds 2.8 KiB gzip: 365.6 KiB measured. Sliced OPFS
-// checkpoints and windowed index builds: 366.5 KiB measured. Staged UNIQUE builds, index
-// capacity, and sliced OPFS recovery: 368.0 KiB measured. Sliced commits and checkpoint
-// parsing (0.13.1): 369.8 KiB measured. Bounded delta replay, staged commit deltas, WAL
-// continuation frames, the lease lane, and follower pieces (0.14.0): 382.2 KiB measured.
-// Rekeying (0.15.0): 389.4 KiB measured. With its audit: 392.0 KiB measured. The read-path
-// work: 399.9 KiB measured.
-// The 0.16.0 audit: 416.2 KiB measured.
-// With the V8 JSON key guard: 417.2 KiB measured. Shared engine helpers: 416.2 KiB measured.
-// With PostgreSQL datetime and interval text: 419.4 KiB measured.
-// UNIQUE builds under writes: 420.4 KiB measured.
-// Single-row write paths and delta merges: 426.5 KiB measured.
-// Build-owner liveness: 427.6 KiB measured.
-// OPFS marker under a Web Lock: 428.2 KiB measured.
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 429 * 1024;
+const SQL_COMPILER_MARKER = "Unterminated dollar-quoted string";
+/** The parser, planner, optimizer, function tables, executors, and engine. */
+const SQL_ENGINE_MODULES =
+  /\/engine\/(query|optimizer|sql-functions|sql-semantics|sql-regex|vector|database|schema-expressions)\.js$/u;
+
+// Each budget is the current measurement plus a little headroom; a change that moves one updates
+// the measurement beside it, and the history lives in git.
+
+// Everything the main entry exports, bundled: the in-thread engine. 1098.6 KiB raw / 328.4 KiB gzip.
+const COMPLETE_ENTRY_RAW_BUDGET = 1099 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 329 * 1024;
+// The engine with the larger durable adapter, OPFS. 1491.2 KiB raw / 429.8 KiB gzip.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1492 * 1024;
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 430 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
-// code splitting the way Vite's default iife worker format does. The generic entry inlined the
-// same way measured 1546.4 KiB raw / 422.3 KiB gzip. Measured with typed coordination recovery: about 1239 KiB raw / 344.1 KiB gzip.
-// With the scope write set: 1257.8 KiB raw. The chunked transaction journal (schema 2) adds
-// about 6 KiB gzip: 351.7 KiB gzip. Writer turns: 357.4 KiB gzip. Compaction that never stalls
-// (0.13.0): 1310.5 KiB raw / 368.2 KiB gzip; with staged UNIQUE builds, index capacity, and
-// sliced OPFS recovery, 1313.8 KiB raw / 369.3 KiB gzip; with sliced commits (0.13.1),
-// 1315.0 KiB raw / 369.7 KiB gzip; with bounded delta replay, staged commit deltas, and
-// schema-4 delta parts (0.14.0), 1339.8 KiB raw / 378.9 KiB gzip; with rekeying (0.15.0),
-// 1362.8 KiB raw / 386.3 KiB gzip; with the rekeying audit, 1370.4 KiB raw / 388.9 KiB gzip;
-// with chained forwards and lapsed-lease re-pinning, 389.05 KiB gzip; with the read-path work
-// (point-read plans, index reads, ordered selection), 1393.0 KiB raw / 396.7 KiB gzip.
-// The 0.16.0 audit: 1444.1 KiB raw / 412.7 KiB gzip.
-// The V8 JSON key guard: 1446.3 KiB raw / 413.8 KiB gzip. Shared engine helpers: 1440.1 KiB
-// raw / 412.7 KiB gzip.
-// PostgreSQL datetime and interval text: 1450.6 KiB raw / 416.2 KiB gzip.
-// Full-text fold coverage and postings collection: 1451.8 KiB raw.
-// UNIQUE builds under writes: 1453.6 KiB raw / 417.2 KiB gzip.
-// Single-row write paths and delta merges: 1479.6 KiB raw / 424.1 KiB gzip.
-// Build-owner liveness: 1482.9 KiB raw / 425.2 KiB gzip.
-// Lapsed-lease retakes and write restarts: 1484.0 KiB raw.
-const INDEXEDDB_WORKER_RAW_BUDGET = 1485 * 1024;
-const INDEXEDDB_WORKER_GZIP_BUDGET = 426 * 1024;
+// code splitting the way Vite's default iife worker format does. 1488.4 KiB raw / 427.5 KiB gzip.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1489 * 1024;
+const INDEXEDDB_WORKER_GZIP_BUDGET = 428 * 1024;
+// What a page that hosts the engine in a worker ships on the main thread: the client, the schema
+// DSL and error classes, the Kysely dialect and live queries, and the React hooks, with `kysely`
+// and `react` left to the application. 101.1 KiB raw / 30.1 KiB gzip.
+const MAIN_THREAD_RAW_BUDGET = 103 * 1024;
+const MAIN_THREAD_GZIP_BUDGET = 31 * 1024;
+// The schema DSL and the error classes, taken from the main entry. 32.2 KiB raw / 10.2 KiB gzip.
+const SCHEMA_DSL_RAW_BUDGET = 33 * 1024;
+const SCHEMA_DSL_GZIP_BUDGET = 11 * 1024;
+// The standalone live entry. 8.7 KiB gzip.
+const LIVE_ENTRY_GZIP_BUDGET = 9 * 1024;
+
+/** A worker-hosted application's main-thread imports: declare, catch, and query. */
+const MAIN_THREAD_APPLICATION = `
+  import { MinnowDatabaseClient } from "@minnowdb/core/client";
+  import {
+    column, schema, table, DatabaseReadBacklogError, LiveQueryLimitError,
+    MaintenanceBacklogError, SqlCompileError, UniqueConstraintError, UnknownTableError,
+  } from "@minnowdb/core";
+  import {
+    MinnowDialect, createKyselyLiveQueries, jsonArrayFrom, jsonBuildObject, jsonObjectFrom,
+  } from "@minnowdb/kysely";
+  import { useLiveQuery, useSuspenseLiveQuery } from "@minnowdb/react";
+  console.log(
+    MinnowDatabaseClient, column, schema, table, DatabaseReadBacklogError, LiveQueryLimitError,
+    MaintenanceBacklogError, SqlCompileError, UniqueConstraintError, UnknownTableError,
+    MinnowDialect, createKyselyLiveQueries, jsonArrayFrom, jsonBuildObject, jsonObjectFrom,
+    useLiveQuery, useSuspenseLiveQuery,
+  );
+`;
+const SCHEMA_DSL_AND_ERRORS = `
+  export {
+    column, schema, table, view, DatabaseReadBacklogError, LiveQueryLimitError,
+    MaintenanceBacklogError, SqlCompileError, UniqueConstraintError, UnknownTableError,
+  } from "@minnowdb/core";
+`;
 
 const repoRoot = join(import.meta.dirname, "..", "..", "..");
 
@@ -157,11 +94,15 @@ async function bundle(contents: string): Promise<string> {
   return output.text;
 }
 
-/** A production build the way an application ships it: minified, without code splitting. */
+/**
+ * A production build the way an application ships it: minified, without code splitting. Peer
+ * dependencies named in `external` stay the application's own.
+ */
 async function measure(
   label: string,
   source: { entryPoint: string } | { contents: string },
-): Promise<{ rawBytes: number; gzipBytes: number }> {
+  external: readonly string[] = [],
+): Promise<{ rawBytes: number; gzipBytes: number; text: string; inputs: readonly string[] }> {
   const result = await build({
     ...("entryPoint" in source
       ? { entryPoints: [source.entryPoint], absWorkingDir: repoRoot }
@@ -173,13 +114,21 @@ async function measure(
     platform: "browser",
     target: "es2022",
     define: { "process.env.NODE_ENV": '"production"' },
+    external: [...external],
+    metafile: true,
     logLevel: "silent",
   });
   const output = result.outputFiles[0];
   if (output === undefined) throw new Error(`esbuild produced no ${label} output`);
+  // Inputs that contribute bytes; a module whose every statement was shaken away is not shipped.
+  const inputs = Object.values(result.metafile.outputs).flatMap((meta) =>
+    Object.entries(meta.inputs).flatMap(([path, input]) => (input.bytesInOutput > 0 ? [path] : [])),
+  );
   return {
     rawBytes: output.contents.byteLength,
     gzipBytes: gzipSync(output.contents, { level: constants.Z_BEST_COMPRESSION }).byteLength,
+    text: output.text,
+    inputs,
   };
 }
 
@@ -221,6 +170,40 @@ describe("core packaging", () => {
     );
   });
 
+  it("keeps a worker-hosted application's main thread free of the SQL engine", async () => {
+    const { rawBytes, gzipBytes, text, inputs } = await measure(
+      "main thread",
+      { contents: MAIN_THREAD_APPLICATION },
+      ["kysely", "react"],
+    );
+
+    expect(inputs.filter((path) => SQL_ENGINE_MODULES.test(path))).toEqual([]);
+    expect(text).not.toContain(SQL_COMPILER_MARKER);
+    expect(text).not.toContain(DATABASE_MARKER);
+    expect(rawBytes, "main-thread raw bytes").toBeLessThanOrEqual(MAIN_THREAD_RAW_BUDGET);
+    expect(gzipBytes, "main-thread gzip bytes").toBeLessThanOrEqual(MAIN_THREAD_GZIP_BUDGET);
+  });
+
+  it("the schema DSL and error classes carry no SQL compiler, from either entry", async () => {
+    const main = await measure("schema DSL", { contents: SCHEMA_DSL_AND_ERRORS });
+    expect(main.inputs.filter((path) => SQL_ENGINE_MODULES.test(path))).toEqual([]);
+    expect(main.text).not.toContain(SQL_COMPILER_MARKER);
+    expect(main.rawBytes, "schema DSL raw bytes").toBeLessThanOrEqual(SCHEMA_DSL_RAW_BUDGET);
+    expect(main.gzipBytes, "schema DSL gzip bytes").toBeLessThanOrEqual(SCHEMA_DSL_GZIP_BUDGET);
+
+    const subpath = await measure("schema subpath", {
+      contents: 'export { column, schema, table, view } from "@minnowdb/core/schema";',
+    });
+    expect(subpath.inputs.filter((path) => SQL_ENGINE_MODULES.test(path))).toEqual([]);
+    expect(subpath.text).not.toContain(SQL_COMPILER_MARKER);
+
+    // The probe itself: the engine does carry the tokenizer's refusal.
+    const engine = await bundle(
+      `import { MinnowDatabase } from "@minnowdb/core"; console.log(MinnowDatabase);`,
+    );
+    expect(engine).toContain(SQL_COMPILER_MARKER);
+  });
+
   it("the engine alone carries no adapter", async () => {
     const output = await bundle(
       `import { MinnowDatabase } from "@minnowdb/core"; console.log(MinnowDatabase);`,
@@ -259,12 +242,9 @@ describe("core packaging", () => {
     const output = result.outputFiles[0];
     expect(output).toBeDefined();
     if (output === undefined) throw new Error("Missing live bundle");
-    // Measured 8.1 KiB gzip with typed coordination errors and bounded live recovery; 8.75 KiB
-    // with batched sweep delivery, key changes, and rekey diffs (0.15.0); 8.72 KiB once unused
-    // storage limits became droppable literals.
     expect(
       gzipSync(output.contents, { level: constants.Z_BEST_COMPRESSION }).byteLength,
-    ).toBeLessThanOrEqual(9 * 1024);
+    ).toBeLessThanOrEqual(LIVE_ENTRY_GZIP_BUDGET);
   });
 
   it("keeps the optional typed-table renderer on the schema entry", async () => {

@@ -212,6 +212,18 @@ function cloneRecordValue(value: unknown): unknown {
   return copy;
 }
 
+/**
+ * Test-only counters. Not exported from any public entry point (the toolkit re-exports named
+ * symbols only): in-repo suites import this module directly to assert how much work a commit
+ * does, which timing cannot pin down.
+ */
+export const recordCoreTestHooks = {
+  /** Segment records walked by level-zero recounts; a carried count walks none. */
+  levelZeroSegmentsCounted: 0,
+  /** Provenance records the retired-block listing examined. */
+  retiredProvenanceVisited: 0,
+};
+
 const postingTextEncoder = new TextEncoder();
 const RESOURCE_EXPIRY_SWEEP_ITEMS = 64;
 /** Leaves ample canonical-wire overhead below the 4 MiB metadata frame ceiling. */
@@ -525,13 +537,27 @@ class ExpiringRecordMap<Value extends { expiresAt: string }> extends OrderedReco
 /** @internal Exported only so the storage hardening suite can exercise table-local traversal. */
 export class SegmentRecordMap extends OrderedRecordMap<string, SegmentRecord> {
   readonly #byTable = new Map<string, OrderedKeyIndex<string>>();
-  readonly #byBlock = new Map<string, Set<string>>();
+  /**
+   * The segments naming each block: the id itself while there is one — nearly every block
+   * belongs to exactly one segment — and a set once there are more. Reference counts are this
+   * index's sizes, so a commit touches one map entry per block rather than three and a set.
+   */
+  readonly #byBlock = new Map<string, string | Set<string>>();
   readonly #byOwner = new Map<string, Set<string>>();
-  readonly #blockReferences = new Map<string, number>();
-  readonly #tableBlockReferences = new Map<string, Map<string, number>>();
 
   override set(id: string, record: SegmentRecord): this {
     const previous = this.get(id);
+    // Records are replaced, never changed in place, so a replacement sharing its predecessor's
+    // block map, owner, and table references exactly what it did — a level-zero segment taking
+    // its publication order at commit. Dropping and re-adding a reference per block for it was
+    // a fixed cost per column on every commit.
+    if (
+      previous?.columnBlockIds === record.columnBlockIds &&
+      previous.transactionId === record.transactionId &&
+      previous.tableId === record.tableId
+    ) {
+      return super.set(id, record);
+    }
     if (previous !== undefined) this.#removeReferences(previous);
     if (previous?.tableId !== record.tableId) {
       if (previous !== undefined) this.#removeFromTable(previous.tableId, id);
@@ -561,8 +587,6 @@ export class SegmentRecordMap extends OrderedRecordMap<string, SegmentRecord> {
     this.#byTable.clear();
     this.#byBlock.clear();
     this.#byOwner.clear();
-    this.#blockReferences.clear();
-    this.#tableBlockReferences.clear();
   }
 
   *tableValues(tableId: string): IterableIterator<SegmentRecord> {
@@ -573,15 +597,22 @@ export class SegmentRecordMap extends OrderedRecordMap<string, SegmentRecord> {
   }
 
   blockReferenceCount(blockId: string): number {
-    return this.#blockReferences.get(blockId) ?? 0;
+    const segments = this.#byBlock.get(blockId);
+    return segments === undefined ? 0 : typeof segments === "string" ? 1 : segments.size;
   }
 
   tableBlockReferenceCount(tableId: string, blockId: string): number {
-    return this.#tableBlockReferences.get(tableId)?.get(blockId) ?? 0;
+    let count = 0;
+    for (const id of this.segmentIdsForBlock(blockId)) {
+      if (this.get(id)?.tableId === tableId) count += 1;
+    }
+    return count;
   }
 
   segmentIdsForBlock(blockId: string): ReadonlySet<string> {
-    return this.#byBlock.get(blockId) ?? EMPTY_STRING_SET;
+    const segments = this.#byBlock.get(blockId);
+    if (segments === undefined) return EMPTY_STRING_SET;
+    return typeof segments === "string" ? new Set([segments]) : segments;
   }
 
   ownerReferenceCount(transactionId: string): number {
@@ -596,27 +627,35 @@ export class SegmentRecordMap extends OrderedRecordMap<string, SegmentRecord> {
 
   #addReferences(record: SegmentRecord): void {
     addSetReference(this.#byOwner, record.transactionId, record.id);
-    let table = this.#tableBlockReferences.get(record.tableId);
-    if (table === undefined) {
-      table = new Map();
-      this.#tableBlockReferences.set(record.tableId, table);
-    }
-    for (const blockId of segmentBlockIds(record)) {
-      updateReferenceCount(this.#blockReferences, blockId, 1);
-      updateReferenceCount(table, blockId, 1);
-      addSetReference(this.#byBlock, blockId, record.id);
+    // A block a segment names twice is still one reference: adding an id already present is a
+    // no-op, so the block map needs no de-duplicating copy.
+    for (const blockIds of Object.values(record.columnBlockIds)) {
+      for (const blockId of blockIds) {
+        const segments = this.#byBlock.get(blockId);
+        if (segments === undefined) this.#byBlock.set(blockId, record.id);
+        else if (typeof segments !== "string") segments.add(record.id);
+        else if (segments !== record.id) this.#byBlock.set(blockId, new Set([segments, record.id]));
+      }
     }
   }
 
   #removeReferences(record: SegmentRecord): void {
     deleteSetReference(this.#byOwner, record.transactionId, record.id);
-    const table = this.#tableBlockReferences.get(record.tableId);
-    for (const blockId of segmentBlockIds(record)) {
-      updateReferenceCount(this.#blockReferences, blockId, -1);
-      if (table !== undefined) updateReferenceCount(table, blockId, -1);
-      deleteSetReference(this.#byBlock, blockId, record.id);
+    for (const blockIds of Object.values(record.columnBlockIds)) {
+      for (const blockId of blockIds) {
+        const segments = this.#byBlock.get(blockId);
+        if (segments === record.id) {
+          this.#byBlock.delete(blockId);
+        } else if (typeof segments === "object") {
+          segments.delete(record.id);
+          if (segments.size === 1) {
+            for (const remaining of segments) this.#byBlock.set(blockId, remaining);
+          } else if (segments.size === 0) {
+            this.#byBlock.delete(blockId);
+          }
+        }
+      }
     }
-    if (table?.size === 0) this.#tableBlockReferences.delete(record.tableId);
   }
 }
 
@@ -987,13 +1026,27 @@ export class RecordCore {
   readonly #retiredManifestVersions = new OrderedKeyIndex<number>(compareOrderedKeys);
   readonly #retiredManifestBlocksByVersion = new Map<number, OrderedKeyIndex<RetiredManifestKey>>();
   /**
+   * Retired provenance records' block ids, in id order. Collection planning pages through the
+   * retired records after every few dozen commits; finding them by walking every provenance
+   * record, live ones included, cost the whole database's block count per pass.
+   */
+  readonly #retiredManifestBlockIds = new OrderedKeyIndex<string>(compareOrderedKeys);
+  /**
    * Visible committed level-zero segments per table, as the level-zero ceiling counts them, for
    * the current manifest version. Every commit that adds level-zero work checks the ceiling, and
    * counting walked every segment of the table and every block of each. A count stays exact
-   * while its version is current and `#levelZeroGeneration` — bumped by any change to segment
-   * records, manifest block records, or committed transaction records — has not moved; an
-   * ordinary commit that retires no block carries it forward by the level-zero segments it
-   * publishes (see `#applyCommit`).
+   * while its version is current and `#levelZeroGeneration` has not moved; an ordinary commit
+   * that retires no block carries it forward by the level-zero segments it publishes (see
+   * `#applyCommit`).
+   *
+   * The generation moves on exactly the changes that can alter a count at the current version:
+   * a level-zero segment record whose owner is committed, a manifest block record some segment
+   * names, or a transaction that owns segments entering or leaving the committed state. Staging
+   * (segments of an uncommitted owner), collecting records nothing references, and updating a
+   * transaction without changing whether it is committed leave every count as it was. Moving
+   * them all was what made a wide table recount on every commit: a write with more blocks than
+   * one staging call accepts stages part of its journal first, and that stage alone discarded
+   * the count the previous commit had carried forward.
    */
   readonly #levelZeroCounts = new Map<
     string,
@@ -1001,7 +1054,10 @@ export class RecordCore {
   >();
   #levelZeroGeneration = 0;
   readonly #manifestBlocks = new OrderedRecordMap<string, ManifestBlockRecord>((previous, next) => {
-    this.#levelZeroGeneration += 1;
+    const blockId = (previous ?? next)?.blockId;
+    if (blockId !== undefined && this.#segments.blockReferenceCount(blockId) > 0) {
+      this.#levelZeroGeneration += 1;
+    }
     if (previous !== undefined && previous.removedVersion !== null) {
       this.#retiredHistoryBytes -= previous.byteLength;
       this.#changeRetiredManifestBlock(previous, -1);
@@ -1036,7 +1092,12 @@ export class RecordCore {
   readonly #activeTransactionExpiries = new OrderedKeyIndex<ExpiryKey>(compareExpiryKeys);
   readonly #activeTransactionExpiryKeys = new Map<string, ExpiryKey>();
   readonly #transactions = new OrderedRecordMap<string, TransactionRecord>((previous, next) => {
-    if (previous?.status === "committed" || next?.status === "committed") {
+    const id = (previous ?? next)?.id;
+    if (
+      id !== undefined &&
+      (previous?.status === "committed") !== (next?.status === "committed") &&
+      this.#segments.ownerReferenceCount(id) > 0
+    ) {
       this.#levelZeroGeneration += 1;
     }
     this.#changeTransactionReferences(previous, next);
@@ -1212,6 +1273,8 @@ export class RecordCore {
   #changeRetiredManifestBlock(record: ManifestBlockRecord, delta: 1 | -1): void {
     const removedVersion = record.removedVersion;
     if (removedVersion === null) return;
+    if (delta === 1) this.#retiredManifestBlockIds.add(record.blockId);
+    else this.#retiredManifestBlockIds.delete(record.blockId);
     let index = this.#retiredManifestBlocksByVersion.get(removedVersion);
     if (delta === 1) {
       if (index === undefined) {
@@ -1541,11 +1604,11 @@ export class RecordCore {
       const previous = this.#segments.get(id);
       if (previous !== undefined) {
         count -= 1;
-        retainedBytes -= segmentRecordRetainedBytes(previous);
+        retainedBytes -= segmentRetainedBytes(previous);
       }
       if (record !== undefined) {
         count += 1;
-        retainedBytes = safeStorageSum(retainedBytes, segmentRecordRetainedBytes(record));
+        retainedBytes = safeStorageSum(retainedBytes, segmentRetainedBytes(record));
       }
     }
     if (count > MAX_SEGMENT_RECORDS) {
@@ -1564,7 +1627,12 @@ export class RecordCore {
 
   #replaceSegments(records: readonly SegmentRecord[], removeIds: readonly string[] = []): void {
     const { retainedBytes, changes } = this.#segmentUsageAfter(records, removeIds);
-    this.#levelZeroGeneration += 1;
+    for (const [id, record] of changes) {
+      if (this.#mayCountAtLevelZero(this.#segments.get(id)) || this.#mayCountAtLevelZero(record)) {
+        this.#levelZeroGeneration += 1;
+        break;
+      }
+    }
     for (const [id, record] of changes) {
       if (record === undefined) this.#segments.delete(id);
       else this.#segments.set(id, record);
@@ -1574,6 +1642,13 @@ export class RecordCore {
 
   #setSegment(record: SegmentRecord): void {
     this.#replaceSegments([record]);
+  }
+
+  /** Whether the level-zero count could include this segment record (see `#levelZeroCounts`). */
+  #mayCountAtLevelZero(segment: SegmentRecord | undefined): boolean {
+    return (
+      segment?.level === 0 && this.#transactions.get(segment.transactionId)?.status === "committed"
+    );
   }
 
   #assertTransactionResourceTransition(
@@ -3447,14 +3522,11 @@ export class RecordCore {
     }
     let count = 0;
     for (const segment of this.#segments.tableValues(tableId)) {
+      recordCoreTestHooks.levelZeroSegmentsCounted += 1;
       if (segment.level !== 0) continue;
       const owner = this.#transactions.get(segment.transactionId);
       if (owner?.status !== "committed") continue;
-      const blocks = segmentBlockIds(segment);
-      if (blocks.length > 0 && blocks.some((id) => !this.#isManifestBlockVisible(version, id))) {
-        continue;
-      }
-      count += 1;
+      if (this.#segmentBlocksVisible(segment, version)) count += 1;
     }
     if (memoizable) {
       this.#levelZeroCounts.set(tableId, {
@@ -3464,6 +3536,14 @@ export class RecordCore {
       });
     }
     return count;
+  }
+
+  /** Every block the segment names is visible at `version` — vacuously, when it names none. */
+  #segmentBlocksVisible(segment: SegmentRecord, version: number | null): boolean {
+    for (const ids of Object.values(segment.columnBlockIds)) {
+      for (const id of ids) if (!this.#isManifestBlockVisible(version, id)) return false;
+    }
+    return true;
   }
 
   #isManifestBlockVisible(version: number | null, id: string): boolean {
@@ -3552,8 +3632,15 @@ export class RecordCore {
     if (input.afterBlockId !== null) validateId(input.afterBlockId);
     validatePageLimit(input.limit);
     const records: Array<Pick<ManifestBlockRecord, "blockId" | "byteLength" | "checksum">> = [];
-    for (const record of this.#manifestBlocks.orderedValues(input.afterBlockId)) {
-      if (record.removedVersion === null || record.removedVersion > input.removedThroughVersion) {
+    for (const blockId of this.#retiredManifestBlockIds.after(input.afterBlockId)) {
+      recordCoreTestHooks.retiredProvenanceVisited += 1;
+      const record = this.#manifestBlocks.get(blockId);
+      const removedVersion = record?.removedVersion ?? null;
+      if (
+        record === undefined ||
+        removedVersion === null ||
+        removedVersion > input.removedThroughVersion
+      ) {
         continue;
       }
       records.push({
@@ -4132,7 +4219,7 @@ export class RecordCore {
   #validateStagedSegment(
     segment: SegmentRecord,
     transactionId: string,
-    journalBlockIds: ReadonlySet<string>,
+    journalBlockIds: { has(id: string): boolean },
   ): void {
     if (segment.transactionId !== transactionId) {
       throw new Error(`Segment ${segment.id} belongs to another transaction`);
@@ -4462,8 +4549,13 @@ export class RecordCore {
       }
       base = current;
     }
-    const pendingBlockIds = [...base.pendingBlockIds, ...blocks.keys()];
-    const pendingSegmentIds = [...base.pendingSegmentIds, ...segments.keys()];
+    // A block already in the journal is a duplicate too. The journal itself was proved distinct
+    // when it was staged, so only this call's additions are checked against it; re-validating
+    // every id the journal holds cost the whole journal on each write.
+    const journalBlocks = this.#journalBlockSet(base);
+    for (const id of blocks.keys()) {
+      if (journalBlocks.has(id)) throw new Error(`Block already exists: ${id}`);
+    }
     let segmentIndex = 0;
     for (const segment of segments.values()) {
       const expectedCommitOrdinal = base.pendingSegmentIds.length + segmentIndex;
@@ -4474,11 +4566,7 @@ export class RecordCore {
       }
       segmentIndex += 1;
     }
-    const update: TransactionRecordUpdate = {
-      pendingBlockIds,
-      pendingSegmentIds,
-      updatedAt: input.committedAt,
-    };
+    let pendingTableNextRowId: bigint | undefined;
     if (base.pendingTable !== undefined) {
       let nextRowId = base.pendingTableNextRowId;
       if (nextRowId === undefined) throw new Error("Pending table row-ID state is missing");
@@ -4495,11 +4583,17 @@ export class RecordCore {
         }
         nextRowId = segment.rowIdEndExclusive;
       }
-      update.pendingTableNextRowId = nextRowId;
+      pendingTableNextRowId = nextRowId;
     }
-    assertGenericTransactionUpdateAllowed(base, update);
-    const staged = updateTransactionRecord(base, update);
-    const stagedBlockIds = new Set(staged.pendingBlockIds);
+    const staged = appendTransactionJournal(base, {
+      blockIds: [...blocks.keys()],
+      segmentIds: [...segments.keys()],
+      updatedAt: input.committedAt,
+      ...(pendingTableNextRowId === undefined ? {} : { pendingTableNextRowId }),
+    });
+    const stagedBlockIds = {
+      has: (id: string): boolean => blocks.has(id) || journalBlocks.has(id),
+    };
     for (const segment of segments.values()) {
       this.#validateStagedSegment(segment, staged.id, stagedBlockIds);
     }
@@ -4657,18 +4751,25 @@ export class RecordCore {
         removedVersion: null,
       });
     }
+    // Built once for the commit, not once per segment: a journal of many segments made this
+    // quadratic in the journal's size. Local, so a committed record keeps no set alive.
+    const journalBlocks = new Set(transaction.pendingBlockIds);
+    const columnsByTable = new Map<string, ReadonlySet<string>>();
     const pendingSegments = transaction.pendingSegmentIds.map((id) => {
       const segment = getSegment(id);
       if (segment === undefined) throw new Error(`Transaction references missing segment: ${id}`);
       if (segment.transactionId !== transaction.id) {
         throw new Error(`Segment ${id} belongs to another transaction`);
       }
-      const table =
-        this.#tables.get(segment.tableId) ??
-        (pendingTable?.id === segment.tableId ? pendingTable : undefined);
-      if (table === undefined) throw new Error(`Segment ${id} references missing table`);
-      const columns = new Set(table.columns.map((column) => column.id));
-      const journalBlocks = new Set(transaction.pendingBlockIds);
+      let columns = columnsByTable.get(segment.tableId);
+      if (columns === undefined) {
+        const table =
+          this.#tables.get(segment.tableId) ??
+          (pendingTable?.id === segment.tableId ? pendingTable : undefined);
+        if (table === undefined) throw new Error(`Segment ${id} references missing table`);
+        columns = new Set(table.columns.map((column) => column.id));
+        columnsByTable.set(segment.tableId, columns);
+      }
       for (const [columnId, blockIds] of Object.entries(segment.columnBlockIds)) {
         if (!columns.has(columnId))
           throw new Error(`Segment ${id} references unknown column: ${columnId}`);
@@ -4824,13 +4925,14 @@ export class RecordCore {
     // carries its exact level/order and keeps it — a delta merge's level-zero output included,
     // which takes the place of the run it replaces. Made once, here, so the apply publishes
     // the very records this plan accounted for.
-    const committedSegments = pendingSegments.map((segment) => ({
-      ...segment,
-      logicalOrder:
+    const committedSegments = pendingSegments.map((segment) =>
+      reorderedSegmentRecord(
+        segment,
         segment.level === 0 && compactionJob === undefined
           ? manifest.version
           : segment.logicalOrder,
-    }));
+      ),
+    );
     this.#segmentUsageAfter(committedSegments);
     const committed = updateTransactionRecord(transaction, {
       status: "committed",
@@ -6404,6 +6506,10 @@ export class RecordCore {
     // Every membership is replaced, so nothing prepared against the old ones may be reused.
     this.#unpublished = undefined;
     this.#membershipEpoch += 1;
+    // The same goes for remembered level-zero counts: a loaded state may sit at the very version
+    // a count was taken at and still hold different segments.
+    this.#levelZeroCounts.clear();
+    this.#levelZeroGeneration += 1;
     // A recovery candidate may intentionally discard an unpublished WAL suffix whose physical
     // blocks were already reclaimed. Clearing the old candidate state must therefore not need
     // those obsolete bytes merely to decrement counters; the counters are reset immediately.
@@ -6883,15 +6989,18 @@ function validateTimestampRuntime(value: unknown, label: string): asserts value 
   validateCanonicalTimestamp(value, label);
 }
 
-function validateUniqueIdsRuntime(value: unknown, label: string): string[] {
-  if (!Array.isArray(value)) throw new TypeError(`${label} must be an array`);
+function validateUniqueIdsRuntime(value: unknown, label: string | (() => string)): string[] {
+  const name = (): string => (typeof label === "string" ? label : label());
+  if (!Array.isArray(value)) throw new TypeError(`${name()} must be an array`);
   const result: string[] = [];
   for (const candidate of value as unknown[]) {
-    if (typeof candidate !== "string") throw new TypeError(`${label} must contain strings`);
+    if (typeof candidate !== "string") throw new TypeError(`${name()} must contain strings`);
     validateId(candidate);
     result.push(candidate);
   }
-  if (new Set(result).size !== result.length) throw new TypeError(`${label} contains duplicates`);
+  if (result.length > 1 && new Set(result).size !== result.length) {
+    throw new TypeError(`${name()} contains duplicates`);
+  }
   return result;
 }
 
@@ -6986,9 +7095,10 @@ export function validateSegmentRuntimeRecord(value: unknown, label: string): Seg
   }
   for (const [columnId, blockIds] of Object.entries(rawColumnBlockIds)) {
     validateId(columnId);
+    // The label is built only for a refusal: a wide table's segment names a hundred columns.
     const normalizedBlockIds = validateUniqueIdsRuntime(
       blockIds,
-      `${label} column ${columnId} blocks`,
+      () => `${label} column ${columnId} blocks`,
     );
     if (normalizedBlockIds.length === 0)
       throw new TypeError(`${label} column ${columnId} has no blocks`);
@@ -8623,6 +8733,33 @@ function collectIndexedPhysicalRoots(
     }
   }
   return { blockIds: rootedBlockIds, segmentIds: rootedSegmentIds };
+}
+
+/**
+ * Retained bytes of segment records made from a measured record by changing nothing but its
+ * logical order: a commit republishes every level-zero segment it stages with its manifest
+ * version as that order. Their canonical JSON differs only in that number's digits — JSON
+ * writes a finite number exactly as `String` does — so the size follows from the staged
+ * record's without serializing a hundred-column block map again.
+ */
+const reorderedSegmentRetainedBytes = new WeakMap<SegmentRecord, number>();
+
+export function segmentRetainedBytes(record: SegmentRecord): number {
+  return reorderedSegmentRetainedBytes.get(record) ?? segmentRecordRetainedBytes(record);
+}
+
+export function reorderedSegmentRecord(
+  segment: SegmentRecord,
+  logicalOrder: number,
+): SegmentRecord {
+  const reordered = { ...segment, logicalOrder };
+  reorderedSegmentRetainedBytes.set(
+    reordered,
+    segmentRetainedBytes(segment) -
+      String(segment.logicalOrder).length +
+      String(logicalOrder).length,
+  );
+  return reordered;
 }
 
 function segmentBlockIds(segment: SegmentRecord): string[] {

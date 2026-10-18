@@ -9,7 +9,8 @@
 import { IDBFactory } from "fake-indexeddb";
 import { describe, expect, it, vi } from "vitest";
 import { IndexedDbBlockStore } from "./indexeddb.js";
-import { MinnowDatabase, UniqueConstraintError } from "../engine/database.js";
+import { MinnowDatabase } from "../engine/database.js";
+import { UniqueConstraintError } from "../engine/errors.js";
 import { secondaryUniqueKeyNamespace, type TableRecord } from "./types.js";
 import { heavyTestTimeout } from "../engine/storage-test-helpers.js";
 

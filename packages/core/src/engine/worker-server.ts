@@ -19,9 +19,7 @@ import {
   type SnapshotSession,
   MinnowDatabase,
   type MinnowDatabaseOptions,
-  type BufferedTableWriter,
   type BatchValue,
-  type BufferedWriterOptions,
   type ExecuteOptions,
   type QueryCursorOptions,
   type QueryExecutionStats,
@@ -29,6 +27,7 @@ import {
   type ReadTableOptions,
   type UpsertOptions,
 } from "./database.js";
+import type { BufferedTableWriter, BufferedWriterOptions } from "./buffered-writer.js";
 import { internalsOf } from "./internals.js";
 import { LiveQuerySet, type LiveQueryInput, type LiveQuerySubscription } from "./live.js";
 import type { CompiledQuery, QueryParameter, QueryRow } from "./query.js";

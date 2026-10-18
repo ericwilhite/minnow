@@ -405,6 +405,92 @@ it("sizes string columns exactly and rejects impossible row counts before alloca
   );
 });
 
+/**
+ * The string payload as the format defines it, built the slow obvious way: validity bits, then
+ * little-endian offsets, then every value's UTF-8 bytes from TextEncoder.
+ */
+function referenceStringPayload(values: ReadonlyArray<string | null>): Uint8Array {
+  const encoder = new TextEncoder();
+  const validity = new Uint8Array(Math.ceil(values.length / 8));
+  const contents = values.map((value, index) => {
+    if (value === null) return new Uint8Array(0);
+    validity[index >>> 3] = (validity[index >>> 3] ?? 0) | (1 << (index & 7));
+    return encoder.encode(value);
+  });
+  const offsets = new Uint8Array((values.length + 1) * 4);
+  const view = new DataView(offsets.buffer);
+  let offset = 0;
+  contents.forEach((content, index) => {
+    offset += content.byteLength;
+    view.setUint32((index + 1) * 4, offset, true);
+  });
+  const payload = new Uint8Array(validity.byteLength + offsets.byteLength + offset);
+  payload.set(validity);
+  payload.set(offsets, validity.byteLength);
+  let at = validity.byteLength + offsets.byteLength;
+  for (const content of contents) {
+    payload.set(content, at);
+    at += content.byteLength;
+  }
+  return payload;
+}
+
+it("writes every string column byte for byte as the reference UTF-8 layout", () => {
+  // The encoder copies ASCII a code unit at a time and sends anything else through TextEncoder,
+  // so the columns that matter mix the two: all-ASCII, non-ASCII first, last, and throughout,
+  // surrogate pairs, empty strings, nulls, and the 0x7F/0x80 boundary itself.
+  const alphabet = ["a", "Z", "0", " ", "\u007f", "\u0080", "é", "漢", "🌍", "\u0000", "-"];
+  let state = 0x5eed;
+  const next = (limit: number): number => {
+    state = (Math.imul(state, 1_103_515_245) + 12_345) >>> 0;
+    return state % limit;
+  };
+  const randomString = (): string => {
+    let value = "";
+    const length = next(12);
+    for (let index = 0; index < length; index += 1) value += alphabet[next(alphabet.length)] ?? "";
+    return value;
+  };
+  const cases: Array<ReadonlyArray<string | null>> = [
+    ["ascii", "", null, "only-ascii"],
+    ["é", "plain", "text"],
+    ["plain", "text", "🌍"],
+    ["\u007f", "\u0080"],
+    [null, null],
+    [""],
+    Array.from({ length: 300 }, (_, index) => (index % 11 === 0 ? null : `v${String(index)}-x`)),
+  ];
+  for (let index = 0; index < 200; index += 1) {
+    cases.push(Array.from({ length: 1 + next(40) }, () => (next(6) === 0 ? null : randomString())));
+  }
+  for (const values of cases) {
+    const encoded = encodeColumn({ type: "string", values });
+    expect(encoded.bytes).toEqual(referenceStringPayload(values));
+    expect(encoded.nullCount).toBe(values.filter((value) => value === null).length);
+    expect(decodeColumn("string", encoded.bytes, values.length).values).toEqual(values);
+  }
+});
+
+it("refuses a string column in row order, whichever value breaks it", () => {
+  // An unpaired surrogate after valid ASCII, after valid non-ASCII, and before a wrong type: the
+  // first offending row decides the error, exactly as one checking pass reports it.
+  expect(() => encodeColumn({ type: "string", values: ["ok", "x\uD800", 1] } as never)).toThrow(
+    "String value contains an unpaired surrogate at UTF-16 index 1",
+  );
+  expect(() => encodeColumn({ type: "string", values: ["é", "\uDC00"] })).toThrow(
+    "unpaired surrogate at UTF-16 index 0",
+  );
+  expect(() => encodeColumn({ type: "string", values: ["ok", 1, "\uD800"] } as never)).toThrow(
+    "strings or null",
+  );
+  const sparse = new Array<string | null>(3);
+  sparse[0] = "ok";
+  sparse[2] = "\uD800";
+  expect(() => encodeColumn({ type: "string", values: sparse })).toThrow(
+    "Column values cannot be undefined",
+  );
+});
+
 it("fills the exact UTF-8 payload across native encodeInto chunk boundaries", () => {
   // Node 26's encoder stops two bytes short with an exactly-sized destination for this shape.
   // The block encoder's three-byte private tail prevents that native chunk-boundary truncation.

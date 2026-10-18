@@ -15,7 +15,8 @@ npm install @minnowdb/core
 - Atomic writes across tabs through IndexedDB or OPFS, one writer at a time through Web Locks
   with no application-side queue or retry loop, strict durability by default, and explicit
   origin-eviction persistence policy.
-- A ready-made worker client with the same everyday database API.
+- A ready-made worker client with the same everyday database API. The client and the schema
+  declarations carry no SQL engine, so the page that hosts the worker stays light.
 - TypeScript schema declarations and metadata-only migrations, including SQL domains,
   composite primary/foreign keys, and informational relationships.
 - Batch and upsert write APIs, typed catalog errors, and per-column result type metadata.

@@ -2728,6 +2728,39 @@ describe("MinnowDatabaseClient", () => {
     expect(await handle.rows()).toEqual([{ id: 1, name: "Ada", nickname: null }]);
   });
 
+  it("has the worker check a declaration's SQL expressions and reports the engine's error", async () => {
+    const client = connect();
+    // The main thread never parses these; the worker's engine does, before changing anything.
+    const invalid = [
+      [
+        table(
+          "checked",
+          { id: column.number().unique() },
+          { checks: [{ name: "c", sql: "x > 0" }] },
+        ),
+        "CHECK c names an unknown column: x",
+      ],
+      [
+        table("generated", {
+          id: column.number().unique(),
+          g: column.string().generatedSql("CAST(RANDOM() AS TEXT)"),
+        }),
+        "Generated column generated.g cannot call volatile function RANDOM",
+      ],
+      [
+        table("defaulted", { id: column.number().unique(), d: column.string().defaultSql("1") }),
+        "DEFAULT defaulted.d produces number, but the column is string",
+      ],
+    ] as const;
+    for (const [definition, message] of invalid) {
+      const migration = client.migrate(schema([definition]));
+      await expect(migration).rejects.toBeInstanceOf(TypeError);
+      await expect(migration).rejects.toThrow(message);
+    }
+    expect((await client.introspect()).tables).toEqual([]);
+    await client.close();
+  });
+
   it("returns generated columns across the worker boundary", async () => {
     const client = connect();
     // Defaults declared through the schema DSL must survive serialization to the worker, and

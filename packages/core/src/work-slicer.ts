@@ -31,6 +31,16 @@ export async function maybeYieldToEventLoop(): Promise<void> {
   await yieldToEventLoop();
 }
 
+/**
+ * Whether the current slice has run out, so `maybeYieldToEventLoop` would hand the event loop a
+ * turn. A loop of many small steps tests this instead of awaiting that call each time: awaiting
+ * even an already-settled promise costs a microtask hop, which a per-column loop over a
+ * single-row write paid a hundred times over.
+ */
+export function sliceExpired(): boolean {
+  return performance.now() - sliceStart >= WORK_SLICE_MS;
+}
+
 function macrotask(): Promise<void> {
   // A timer is clamped to roughly 1–4 ms in the runtimes Minnow targets. Maintenance can yield
   // once per bounded page, so using timers turns a healthy thousand-page cleanup into seconds of
