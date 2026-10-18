@@ -14985,25 +14985,79 @@ async function assertRemainingManifestRecordsAvailable(
       readableVersions.push(record.version);
     }
   });
+  // Every block a readable manifest names must exist. Probing each one was a request per live
+  // block on every collection step, so the payload keys are read a page at a time over the
+  // range the page of provenance records spans; provenance is visited in block-id order, so the
+  // ranges never overlap and the whole check reads each payload key at most once.
+  const blocks = transaction.objectStore("blocks");
+  let page: Array<{ blockId: string; version: number }> = [];
+  let probes: Promise<void> = Promise.resolve();
+  const probe = (): Promise<void> => {
+    const probed = page;
+    page = [];
+    probes = probes.then(async () => {
+      const missing = await firstMissingBlock(blocks, probed);
+      if (missing !== undefined) throw new SnapshotManifestMissingError(missing.version);
+    });
+    return probes;
+  };
   await visitObjectStoreReadBatches(
     transaction.objectStore("catalog"),
-    async (value, key) => {
+    (value, key) => {
       if (!Array.isArray(key) || key.length !== 2 || typeof key[1] !== "string") {
         throw corruption(MANIFEST_BLOCK, "record key is invalid");
       }
       const record = asManifestBlockRecord(value, key[1]);
       const version = firstOverlappingManifestVersion(record, readableVersions);
-      if (
-        version !== undefined &&
-        (await requestResult(transaction.objectStore("blocks").getKey(record.blockId))) ===
-          undefined
-      ) {
-        throw new SnapshotManifestMissingError(version);
-      }
+      if (version === undefined) return;
+      page.push({ blockId: record.blockId, version });
+      if (page.length >= BLOCK_PRESENCE_PAGE) return probe();
     },
     { kind: MANIFEST_BLOCK },
   );
+  await probe();
   return readableVersions;
+}
+
+/** Provenance records whose payloads one presence read covers. */
+const BLOCK_PRESENCE_PAGE = 128;
+/** Payload keys one range read returns before it continues past the last. */
+const BLOCK_KEY_RANGE_PAGE = 1_024;
+
+/** The first of `wanted` whose payload is absent from `blocks`, if any. */
+async function firstMissingBlock<T extends { blockId: string }>(
+  blocks: IDBObjectStore,
+  wanted: readonly T[],
+): Promise<T | undefined> {
+  if (wanted.length === 0) return undefined;
+  // Injected factories need not install the browser's key-range constructor globally.
+  if (typeof IDBKeyRange === "undefined") {
+    const keys = await Promise.all(
+      wanted.map(({ blockId }) => requestResult(blocks.getKey(blockId))),
+    );
+    return wanted.find((_, index) => keys[index] === undefined);
+  }
+  let lowest = wanted[0]?.blockId ?? "";
+  let highest = lowest;
+  for (const { blockId } of wanted) {
+    if (blockId < lowest) lowest = blockId;
+    if (blockId > highest) highest = blockId;
+  }
+  const present = new Set<IDBValidKey>();
+  let lower: IDBValidKey = lowest;
+  let exclusive = false;
+  for (;;) {
+    const range = IDBKeyRange.bound(lower, highest, exclusive, false);
+    const keys: IDBValidKey[] = await requestResult<IDBValidKey[]>(
+      blocks.getAllKeys(range, BLOCK_KEY_RANGE_PAGE),
+    );
+    for (const key of keys) present.add(key);
+    const last: IDBValidKey | undefined = keys.at(-1);
+    if (keys.length < BLOCK_KEY_RANGE_PAGE || last === undefined) break;
+    lower = last;
+    exclusive = true;
+  }
+  return wanted.find(({ blockId }) => !present.has(blockId));
 }
 
 function compactionJobKey(id: string): string {
