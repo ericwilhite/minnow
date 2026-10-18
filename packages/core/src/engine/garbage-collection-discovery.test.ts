@@ -75,6 +75,35 @@ it("one collection cycle asks which segment blocks are current once per page of 
   }
 });
 
+it("a live segment is proved current by one block, not one per column", async () => {
+  const memory = new MemoryBlockStore();
+  let askedIds = 0;
+  const store = new Proxy(memory, {
+    get(target, property, receiver) {
+      const value: unknown = Reflect.get(target, property, receiver);
+      if (typeof value !== "function") return value;
+      return (...args: unknown[]) => {
+        if (property === "hasManifestBlocks") askedIds += (args[1] as readonly string[]).length;
+        return (value as (...args: unknown[]) => unknown).apply(target, args);
+      };
+    },
+  });
+  const db = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+  try {
+    const columns = Array.from({ length: 30 }, (_, index) => `c${String(index)} INTEGER`);
+    await db.execute(`CREATE TABLE t (id INTEGER PRIMARY KEY, ${columns.join(", ")})`);
+    for (let id = 0; id < 100; id += 1) await db.insertBatch("t", [{ id }]);
+    askedIds = 0;
+    await db.collectGarbage({ retainRecentVersions: 400 });
+    // A hundred live segments of 31 blocks: asking every block was 3,100 ids.
+    expect(askedIds).toBeGreaterThan(0);
+    expect(askedIds).toBeLessThanOrEqual(200);
+    expect((await db.query("SELECT COUNT(*) AS n FROM t")).rows).toEqual([{ n: 100 }]);
+  } finally {
+    await db.close();
+  }
+});
+
 const FIXED_POINT = { manifests: 3, transactions: 202, segments: 202, obsoleteBlocks: 128 };
 
 it("paged discovery reclaims exactly what single-record discovery did", async () => {

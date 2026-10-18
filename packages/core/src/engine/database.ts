@@ -19745,16 +19745,40 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             .filter((owner) => owner !== undefined)
             .map((owner) => [owner.id, owner]),
         );
-        // Which of the page's blocks the planning snapshot holds, asked once for the page: that
-        // manifest is immutable, so this is what one question per segment would answer, without
-        // a storage round trip per segment.
-        const pageBlockIds = [
+        // Which of the page's blocks the planning snapshot holds, asked for the page at once:
+        // that manifest is immutable, so this is what one question per segment would answer,
+        // without a storage round trip per segment. A segment touches the snapshot when any one
+        // of its blocks is in it, so each segment's first block is asked first and the rest only
+        // for segments whose first block is absent: a live segment of a hundred-column table
+        // is answered by one block rather than a hundred.
+        const touches = (segment: SegmentRecord, held: ReadonlySet<string>): boolean =>
+          Object.values(segment.columnBlockIds).some((ids) => ids.some((id) => held.has(id)));
+        const firstBlockIds = [
           ...new Set(
-            page.records.flatMap((segment) => Object.values(segment.columnBlockIds).flat()),
+            page.records.flatMap((segment) => {
+              const first = Object.values(segment.columnBlockIds).find((ids) => ids.length > 0);
+              return first === undefined ? [] : [first[0] ?? ""];
+            }),
           ),
         ];
-        const presence = await this.#manifestBlockPresence(currentVersion, pageBlockIds);
-        const current = new Set(pageBlockIds.filter((_, index) => presence[index] === true));
+        const current = new Set<string>();
+        const ask = async (ids: readonly string[]): Promise<void> => {
+          if (ids.length === 0) return;
+          const presence = await this.#manifestBlockPresence(currentVersion, ids);
+          ids.forEach((id, index) => {
+            if (presence[index] === true) current.add(id);
+          });
+        };
+        await ask(firstBlockIds);
+        const asked = new Set(firstBlockIds);
+        await ask([
+          ...new Set(
+            page.records
+              .filter((segment) => !touches(segment, current))
+              .flatMap((segment) => Object.values(segment.columnBlockIds).flat())
+              .filter((id) => !asked.has(id)),
+          ),
+        ]);
         for (const segment of page.records) {
           const listedOwner = owners.get(segment.transactionId);
           if (
@@ -19768,10 +19792,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               updatedAt: job.leaseCutoff,
             });
           }
-          const touchesCurrent = Object.values(segment.columnBlockIds).some((ids) =>
-            ids.some((id) => current.has(id)),
-          );
-          if (!touchesCurrent) addSegments([segment.id]);
+          if (!touches(segment, current)) addSegments([segment.id]);
           if (remaining <= 0) break;
         }
         // The page fits the remaining candidate budget, so every listed segment was visited.
