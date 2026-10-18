@@ -224,11 +224,13 @@ export async function openWhileHeld(name: string): Promise<{ name: string; messa
     type: "module",
   });
   stalledWorkers.push(stalled);
-  // A client deadline shorter than the store's: only the worker's progress reports keep the
-  // client from calling a live worker dead before the store names the stall.
+  // A client deadline shorter than the store's (12 s, unresponsive-worker.ts): only the worker's
+  // progress reports keep the client from calling a live worker dead before the store names the
+  // stall. Four seconds leaves a slow runner room to load the worker module before its first
+  // report, which a one-second deadline did not.
   const stalledClient = new MinnowDatabaseClient(stalled, {
     store: { kind: "indexeddb", name },
-    requestTimeoutMs: 1_000,
+    requestTimeoutMs: 4_000,
   });
   try {
     await stalledClient.ready();
