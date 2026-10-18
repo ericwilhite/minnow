@@ -38,15 +38,17 @@ and benchmarks that run in your browser.
   read anything, so concurrent writes land in a serial order without an application-side queue
   or retry loop. Callbacks run once; a tab that stops inside its turn is reported, never
   bypassed.
-- **Plain JavaScript.** The engine with its larger durable adapter is about 428 KiB gzipped, with
+- **Plain JavaScript.** The engine with its larger durable adapter is about 429 KiB gzipped, with
   no Wasm download, compile step, special headers, or server process.
 - **Direct SQL or Kysely.** Run PostgreSQL-style SQL through the engine API or use Kysely through
   `@minnowdb/kysely`. Kysely's `DB` type derives from the same schema used for migration, so
   tables are declared once, aggregate and built-in results are inferred without output generics,
   and typed JSON helpers build nested projections. Both paths use the same SQL engine.
 - **Built for responsive applications.** A ready-made worker client keeps query work off the UI
-  thread. Pull-driven cursors transfer one columnar page at a time; batch execution and spillable
-  sorts and aggregates keep large working sets under a configurable budget.
+  thread, and the page itself carries no SQL engine: the client, schema declarations, Kysely
+  dialect, and React hooks come to about 30 KiB gzipped, not counting Kysely and React.
+  Pull-driven cursors transfer one columnar page at a time; batch execution and spillable sorts
+  and aggregates keep large working sets under a configurable budget.
 - **Search and reactive views.** Full-text search uses `MATCH` and BM25 without index DDL. Live
   queries refresh after relevant commits, including commits from other tabs, with typed Kysely,
   keyed-change, bounded-window, and Suspense/SWR-friendly React adapters. A commit updates every

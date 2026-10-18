@@ -9,7 +9,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { MemoryBlockStore } from "../storage/index.js";
 import type { CompactionJobRecord, SegmentRecord } from "../storage/types.js";
-import { CompactionMemoryBudgetError, MinnowDatabase } from "./database.js";
+import { MinnowDatabase } from "./database.js";
+import { CompactionMemoryBudgetError } from "./errors.js";
 import { allVisibleSegments, heavyTestTimeout } from "./storage-test-helpers.js";
 
 vi.setConfig({ testTimeout: heavyTestTimeout(240_000) });

@@ -47,7 +47,9 @@ const { rows } = await client.query("SELECT name, score FROM people ORDER BY sco
 - The channel is ordered, so you can issue calls immediately. `await client.ready()` exists to
   surface store-open failures eagerly.
 - Storage access, decoding, planning, and execution all run in the worker; the main thread holds
-  only the proxy.
+  only the proxy and your schema declaration. The schema DSL never parses SQL, so neither carries
+  the SQL compiler: the worker checks the declaration's CHECK, DEFAULT, and generated expressions
+  when `migrate()` runs, and its errors come back with the same message and type.
 - The raw layer is there too: `client.query(sql)`, `client.insertBatch(...)`,
   `client.createTable(...)`, `client.createView(...)`, `client.createIndex(...)`, and
   `client.buildFtsIndex(...)` — the everyday database API, including the direct catalog and index

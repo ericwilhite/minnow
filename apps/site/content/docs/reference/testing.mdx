@@ -944,12 +944,16 @@ The figure each measured engine shows on the page is the `download` field in
 
 The unit suite also compares fresh bundles against the installed SQLite Wasm loader plus its
 Wasm file. The engine with OPFS must stay smaller after gzip. The generic worker with all
-stores plus its separately bundled client has a tight 465 KiB combined budget; those two
-downloads repeat some code and currently slightly exceed SQLite's single loader-plus-Wasm
-measurement. The report and test share the same measurement code. Per-entry budgets separately
-bound the main engine and IndexedDB worker. Exact JSON parsing and bounded regex matching add
-code, and those intentional additions are recorded alongside the budgets. This guards compressed download size; it does not claim a smaller uncompressed bundle or
-prove that every possible behavior is regression-free.
+stores plus its separately bundled client has a tight 535 KiB combined budget; those two
+downloads repeat some code and exceed SQLite's single loader-plus-Wasm measurement. The report
+and test share the same measurement code. Per-entry budgets in
+`packages/core/src/tree-shaking.test.ts` separately bound the main engine, the IndexedDB worker,
+the schema DSL, and what a page that runs the engine in a worker ships on its main thread (the
+client, the DSL and error classes, the Kysely dialect, and the React hooks); probes there also
+check that the last two carry none of the SQL parser, optimizer, or executor. Each budget is its
+current measurement plus a little headroom, so growth is a deliberate edit beside the number.
+This guards compressed download size; it does not claim a smaller uncompressed bundle or prove
+that every possible behavior is regression-free.
 
 OPFS browser cases check for the storage API inside a dedicated worker before running. Some
 Linux WebKit builds expose it only in the page; those cases are skipped for that missing

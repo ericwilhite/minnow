@@ -18,7 +18,6 @@ import {
 } from "../storage/types.js";
 import {
   DUAL_TABLE,
-  compileCheckExpression,
   compileQuery,
   compileStatement,
   expressionColumnNames,
@@ -33,7 +32,8 @@ import {
 } from "./query.js";
 import { normalizeSqlDomainValue } from "./sql-domains.js";
 import { dateIsoString, dateMilliseconds } from "../date-value.js";
-import { assertColumnDroppable, compileGeneratedColumnExpression } from "./schema.js";
+import { assertColumnDroppable } from "./schema.js";
+import { compileGeneratedColumnExpression, validateCheckColumns } from "./schema-expressions.js";
 import { UnknownTableError } from "./errors.js";
 import { toCatalog } from "./catalog.js";
 import type { BlockStore, ManifestSummary } from "../storage/types.js";
@@ -635,20 +635,9 @@ export class CatalogMutations {
       const checks = (input.checks ?? []).map((check, checkIndex) => {
         // Compiling here means a constraint the engine could never evaluate is refused at
         // definition rather than on the first write.
-        const referencedColumns = expressionColumnNames(
-          compileCheckExpression(check.sql, check.name),
+        validateCheckColumns(name, check, (columnName) =>
+          columns.some((column) => column.name === columnName && !column.hidden),
         );
-        for (const reference of referencedColumns) {
-          const pieces = reference.split(".");
-          const columnName = pieces.at(-1) ?? reference;
-          const qualifier = pieces.length > 1 ? pieces.slice(0, -1).join(".") : undefined;
-          if (qualifier !== undefined && qualifier !== name) {
-            throw new TypeError(`CHECK ${check.name} references another table: ${reference}`);
-          }
-          if (!columns.some((column) => column.name === columnName && !column.hidden)) {
-            throw new TypeError(`CHECK ${check.name} names an unknown column: ${columnName}`);
-          }
-        }
         return { name: checkNames[checkIndex] ?? check.name, sql: check.sql };
       });
       const tableId = this.#createId();
@@ -949,7 +938,9 @@ export class CatalogMutations {
     if (table.columns.length === 1) {
       throw new TypeError(`The last column cannot be dropped: ${table.name}.${column.name}`);
     }
-    const catalogTable = toCatalog(records).tables.find(
+    // Projected alone: the catalog entry compiles the table's stored expressions to list the
+    // columns they read, and no other table bears on this one's droppability.
+    const catalogTable = toCatalog([table]).tables.find(
       (candidate) => candidate.name === table.name,
     );
     const catalogColumn = catalogTable?.columns.find((candidate) => candidate.id === column.id);

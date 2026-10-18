@@ -90,9 +90,9 @@ for (const table of catalog.tables) {
   table.name;
   table.uniqueKeyColumnId; // scalar identity, when present
   table.primaryKeyColumnIds; // ordered scalar or composite primary identity
-  table.columns; // { id, name, type, integer?, sqlDomain?, nullable, defaultValue?, enumValues?, isAutoIncrementing }
+  table.columns; // { id, name, type, integer?, sqlDomain?, nullable, defaultValue?, generatedValue?, enumValues?, isAutoIncrementing, backfill? }
   table.foreignKeys; // { name, columns, parentTable, parentColumns, onDelete, enforced }
-  table.checks; // { name, sql }
+  table.checks; // { name, sql, columns? }
   table.triggers; // { id, name, event, timing }; id is immutable until that trigger is dropped
 }
 
@@ -111,15 +111,19 @@ Two things make it plannable rather than merely descriptive:
 - **Trigger IDs identify exact objects.** A trigger keeps its ID for its lifetime. A later trigger
   may reuse a dropped name but receives a different ID, so tools can detect drop/recreate races.
 - **Derived facts are resolved for you.** `isAutoIncrementing` is reported directly rather than
-  leaving a planner to decode a default spec.
+  leaving a planner to decode a default spec. Each CHECK and each generated column
+  (`generatedValue: { kind, sql, columns? }`) lists the `columns` of its table that the expression
+  reads, so a planner can tell which columns are safe to drop or rename without a SQL parser. The
+  list is absent only when the engine cannot read the stored expression again, or in a catalog
+  saved by an earlier release.
 
 Tables and views are sorted by name, so a diff over two catalogs is stable.
 
 ## Planning a migration
 
 `planMigration` diffs a `Catalog` against a schema declaration. It takes the published catalog and
-nothing else — no database, no store, no engine — so a tool can plan against a catalog it fetched,
-cached, or built by hand:
+nothing else — no database, no store, no engine, no SQL compiler — so a tool can plan against a
+catalog it fetched, cached, or built by hand:
 
 ```ts
 import { planMigration, schema, table, column } from "@minnowdb/core";
@@ -137,7 +141,11 @@ for (const step of plan.steps) {
 
 Planning is a pure function, so it is also how you preview: run it, show the steps, and decide
 whether to apply. Anything it cannot prove safe throws with a message naming the fix rather than
-appearing as a step — see [the rejected list](/docs/schema#what-migrate-does).
+appearing as a step — see [the rejected list](/docs/schema#what-migrate-does). Dropping or renaming
+a column that a CHECK or generated column reads is one of those; it is decided from the catalog's
+`columns` lists, so a hand-built catalog that leaves a list out has every drop and rename in that
+table refused rather than guessed. Planning does not compile the SQL the declaration carries:
+`migrate()` checks every CHECK, DEFAULT, and generated expression before it applies a step.
 
 **Applying still goes through the engine.** `database.migrate(schema)` plans and applies in one
 call. Some steps have no SQL spelling — widening an enum, adopting a generated expression — so

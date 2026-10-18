@@ -1,10 +1,27 @@
 /**
  * The everyday in-thread API. Larger optional surfaces have their own entry points so exporting
  * one helper cannot make an application download the worker client or typed live-query layer.
+ *
+ * Each name is exported from the module that defines it, never re-exported through
+ * `database.js`: a bundler resolves an import through the module that re-exports it and keeps
+ * that module's top-level statements, so an error class taken through the engine module would
+ * carry part of the engine (and the SQL function tables it reads) onto a page that only declares
+ * a schema and catches errors.
  */
 export * from "./catalog.js";
 export * from "./database.js";
 export * from "./errors.js";
+export {
+  attachLifecycleFlush,
+  BufferedTableWriter,
+  MAX_BUFFERED_WRITER_PENDING_ADDS,
+  type BufferedFlushResult,
+  type BufferedWriterOptions,
+  type LifecycleDocumentTarget,
+  type LifecycleFlushOptions,
+  type LifecycleFlushRequester,
+  type LifecyclePageTarget,
+} from "./buffered-writer.js";
 export type {
   WriteAdmissionStall,
   WriteCoordinationScope,
@@ -59,10 +76,12 @@ export type {
 export type { MinnowSqlDriver, MinnowSqlExecutor } from "./sql-driver.js";
 
 export {
+  CompactionBacklogError,
   OpfsCoordinationError,
   OpfsDatabaseInUseError,
   OpfsUncertainOutcomeError,
   StorageUnresponsiveError,
+  TableInUseError,
 } from "../storage/types.js";
 /** `JSON.parse`, guarded against V8 renaming escaped object keys; see json-parse.ts. */
 export { parseJson } from "../block-format/json-parse.js";

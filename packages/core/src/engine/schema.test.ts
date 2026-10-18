@@ -18,6 +18,7 @@ import {
   table,
   typedTable,
   view,
+  type AnyTable,
   type InferInsertRow,
   type InferRow,
   type InferUpdateChanges,
@@ -500,21 +501,87 @@ describe("column defaults", () => {
     ).toThrow("Auto-increment requires a number column");
     expect(() => column.datetime().default("later" as unknown as Date)).toThrow("valid Date");
     expect(() => column.number().default(Number.NaN)).toThrow("finite number");
-    expect(() =>
-      table("row_expression", {
-        source: column.string(),
-        copy: column.string().defaultSql("source"),
-      }),
-    ).toThrow("variable-free scalar SQL expression");
-    expect(() =>
-      table("parameter_expression", { value: column.string().defaultSql("$1") }),
-    ).toThrow("variable-free scalar SQL expression");
-    expect(() =>
-      table("aggregate_expression", { value: column.number().defaultSql("COUNT(*)") }),
-    ).toThrow("variable-free scalar SQL expression");
-    expect(() =>
-      table("wrong_expression_type", { value: column.string().defaultSql("1 + 2") }),
-    ).toThrow("produces number, but the column is string");
+    expect(() => column.string().defaultSql(" now()")).toThrow(
+      "Default SQL must be a trimmed non-empty expression",
+    );
+  });
+
+  it("checks default expressions when migrate() runs, before the catalog changes", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    // The DSL does not parse SQL: each of these declares without complaint …
+    const invalid: Array<[AnyTable, string]> = [
+      [
+        table("row_expression", {
+          source: column.string(),
+          copy: column.string().defaultSql("source"),
+        }),
+        "DEFAULT row_expression.copy takes a variable-free scalar SQL expression",
+      ],
+      [
+        table("parameter_expression", { value: column.string().defaultSql("$1") }),
+        "DEFAULT parameter_expression.value takes a variable-free scalar SQL expression",
+      ],
+      [
+        table("aggregate_expression", { value: column.number().defaultSql("COUNT(*)") }),
+        "DEFAULT aggregate_expression.value takes a variable-free scalar SQL expression",
+      ],
+      [
+        table("subquery_expression", {
+          value: column.number().defaultSql("(SELECT 1)"),
+        }),
+        "DEFAULT subquery_expression.value takes a variable-free scalar SQL expression",
+      ],
+      [
+        table("wrong_expression_type", { value: column.string().defaultSql("1 + 2") }),
+        "DEFAULT wrong_expression_type.value produces number, but the column is string",
+      ],
+    ];
+    // … and the engine refuses it whole: the valid table beside it is not created either.
+    const valid = table("valid", { id: column.integer().unique() });
+    for (const [definition, message] of invalid) {
+      await expect(database.migrate(schema([valid, definition]))).rejects.toThrow(message);
+    }
+    await expect(
+      database.migrate(
+        schema([valid, table("unknown", { v: column.string().defaultSql("nope()") })]),
+      ),
+    ).rejects.toThrow("Unsupported function: nope");
+    expect((await database.introspect()).tables).toEqual([]);
+  });
+
+  it("checks default expressions on added columns and altered defaults too", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.migrate(schema([table("posts", { id: column.integer().unique() })]));
+    await expect(
+      database.migrate(
+        schema([
+          table("posts", {
+            id: column.integer().unique(),
+            title: column.string().nullable().defaultSql("1 + 2"),
+          }),
+        ]),
+      ),
+    ).rejects.toThrow("DEFAULT posts.title produces number, but the column is string");
+    await database.migrate(
+      schema([
+        table("posts", { id: column.integer().unique(), title: column.string().nullable() }),
+      ]),
+    );
+    await expect(
+      database.migrate(
+        schema([
+          table("posts", {
+            id: column.integer().unique(),
+            title: column.string().nullable().defaultSql("title"),
+          }),
+        ]),
+      ),
+    ).rejects.toThrow("DEFAULT posts.title takes a variable-free scalar SQL expression");
+    const [posts] = (await database.introspect()).tables;
+    expect(posts?.columns.map(({ name, defaultValue }) => [name, defaultValue ?? null])).toEqual([
+      ["id", null],
+      ["title", null],
+    ]);
   });
 
   it("makes default-bearing columns optional in insert rows", () => {
@@ -824,6 +891,48 @@ describe("stored generated columns", () => {
     await expect(database.migrate(schema([generated]))).rejects.toThrow(
       "Generated columns cannot be added to an existing table without rewriting its rows",
     );
+  });
+
+  it("checks generated expressions when migrate() runs, before the catalog changes", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    const rows = (sql: string, extra: AnyTable["columns"] = {}) =>
+      table("rows", {
+        id: column.integer().unique(),
+        a: column.string(),
+        ...extra,
+        g: column.string().generatedSql(sql),
+      });
+    const refused: Array<[AnyTable, string]> = [
+      [rows("UPPER(missing)"), "Generated column rows.g names an unknown column: missing"],
+      [rows("other.a"), "Generated column rows.g references another table: other.a"],
+      [rows("g || a"), "Generated column rows.g cannot reference a generated column: g"],
+      [
+        rows("h || a", { h: column.string().generatedSql("UPPER(a)") }),
+        "Generated column rows.g cannot reference a generated column: h",
+      ],
+      [
+        rows("MAX(a)"),
+        "CHECK generated rows.g takes a row condition over this table's own columns",
+      ],
+      [
+        rows("(SELECT a FROM rows)"),
+        "Generated column rows.g must be an immutable expression over sibling columns",
+      ],
+      [
+        rows("CAST(CURRENT_TIMESTAMP AS TEXT)"),
+        "Generated column rows.g cannot call volatile function CURRENT_TIMESTAMP",
+      ],
+      [
+        rows("CAST(RANDOM() AS TEXT)"),
+        "Generated column rows.g cannot call volatile function RANDOM",
+      ],
+      [rows("nope(a)"), "Unsupported function: nope"],
+    ];
+    const valid = table("valid", { id: column.integer().unique() });
+    for (const [definition, message] of refused) {
+      await expect(database.migrate(schema([valid, definition]))).rejects.toThrow(message);
+    }
+    expect((await database.introspect()).tables).toEqual([]);
   });
 });
 
@@ -1551,16 +1660,6 @@ describe("constraint migration safety", () => {
       ),
     ).toThrow("Duplicate CHECK in table t: a");
     expect(() =>
-      table("t", { id: column.number().unique() }, { checks: [{ name: "bad", sql: "nope(" }] }),
-    ).toThrow();
-    expect(() =>
-      table(
-        "t",
-        { id: column.number().unique(), parent_id: column.number() },
-        { checks: [{ name: "known", sql: "missing > 0" }] },
-      ),
-    ).toThrow("CHECK known names an unknown column: missing");
-    expect(() =>
       table(
         "t",
         { id: column.number().unique(), parent_id: column.number() },
@@ -1576,6 +1675,41 @@ describe("constraint migration safety", () => {
         },
       ),
     ).toThrow("Duplicate constraint in table t: same_name");
+  });
+
+  it("compiles checks when migrate() runs, before the catalog changes", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    const withCheck = (sql: string) =>
+      table(
+        "t",
+        { id: column.number().unique(), parent_id: column.number() },
+        { checks: [{ name: "c", sql }] },
+      );
+    // Declaring never parses the condition …
+    expect(withCheck("nope(").checks).toEqual([{ name: "c", sql: "nope(" }]);
+    // … migrating does, for every table, before applying any step.
+    const valid = table("valid", { id: column.integer().unique() });
+    await expect(database.migrate(schema([valid, withCheck("nope(")]))).rejects.toThrow(
+      "Unsupported function: nope",
+    );
+    await expect(database.migrate(schema([valid, withCheck("missing > 0")]))).rejects.toThrow(
+      "CHECK c names an unknown column: missing",
+    );
+    await expect(database.migrate(schema([valid, withCheck("other.id > 0")]))).rejects.toThrow(
+      "CHECK c references another table: other.id",
+    );
+    await expect(database.migrate(schema([valid, withCheck("COUNT(*) > 0")]))).rejects.toThrow(
+      "CHECK c takes a row condition over this table's own columns",
+    );
+    await expect(database.migrate(schema([valid, withCheck("id > $1")]))).rejects.toThrow(
+      "CHECK c takes a row condition over this table's own columns",
+    );
+    expect((await database.introspect()).tables).toEqual([]);
+    // A reference qualified by the table's own name is the same column.
+    await database.migrate(schema([withCheck("t.parent_id >= 0")]));
+    expect((await database.introspect()).tables[0]?.checks).toEqual([
+      { name: "c", sql: "t.parent_id >= 0", columns: ["parent_id"] },
+    ]);
   });
 });
 
@@ -1854,7 +1988,7 @@ describe("catalog introspection", () => {
         enforced: true,
       },
     ]);
-    expect(children.checks).toEqual([{ name: "positive_id", sql: "id > 0" }]);
+    expect(children.checks).toEqual([{ name: "positive_id", sql: "id > 0", columns: ["id"] }]);
     expect(children.triggers).toHaveLength(1);
     expect(children.triggers[0]).toMatchObject({
       name: "audit",
@@ -2057,6 +2191,179 @@ describe("planning a migration without engine access", () => {
         ]),
       ),
     ).toThrow("Column types cannot change");
+  });
+
+  it("reads the columns a stored expression uses from the catalog, not by parsing it", () => {
+    const guarded = (columns: readonly string[] | undefined, generated?: readonly string[]) => {
+      const [notes] = handBuilt.tables;
+      if (notes === undefined) expect.unreachable("notes missing");
+      return {
+        ...handBuilt,
+        tables: [
+          {
+            ...notes,
+            columns: [
+              ...notes.columns,
+              {
+                id: "col-title",
+                name: "title",
+                type: "string",
+                nullable: false,
+                isAutoIncrementing: false,
+              },
+              {
+                id: "col-slug",
+                name: "slug",
+                type: "string",
+                nullable: false,
+                isAutoIncrementing: false,
+                // Text the planner never parses: only the listed columns count.
+                generatedValue: {
+                  kind: "stored",
+                  sql: "not parsed",
+                  ...(generated === undefined ? {} : { columns: generated }),
+                },
+              },
+            ],
+            checks: [
+              {
+                name: "has_body",
+                sql: "not parsed",
+                ...(columns === undefined ? {} : { columns }),
+              },
+            ],
+          },
+        ],
+      } satisfies Catalog;
+    };
+    const declared = (columns: Record<string, ReturnType<typeof column.string>>) =>
+      schema([
+        table(
+          "notes",
+          {
+            id: column.number().unique().autoIncrement(),
+            ...columns,
+            slug: column.string().generatedSql("not parsed"),
+          },
+          { checks: [{ name: "has_body", sql: "not parsed" }] },
+        ),
+      ]);
+    const listed = guarded(["body"], ["body"]);
+
+    // A column no stored expression reads is free to go or be renamed …
+    expect(planMigration(listed, declared({ body: column.string() })).steps).toEqual([
+      { kind: "drop-column", tableName: "notes", columnName: "title" },
+    ]);
+    expect(
+      planMigration(
+        listed,
+        declared({ body: column.string(), headline: column.string().renamedFrom("title") }),
+      ).steps,
+    ).toEqual([{ kind: "rename-column", tableName: "notes", from: "title", to: "headline" }]);
+    // … one a listed expression reads is not.
+    expect(() => planMigration(listed, declared({ title: column.string() }))).toThrow(
+      "CHECK has_body still uses this column: notes.body",
+    );
+    expect(() =>
+      planMigration(
+        listed,
+        declared({ title: column.string(), content: column.string().renamedFrom("body") }),
+      ),
+    ).toThrow("CHECK has_body prevents renaming notes.body");
+    expect(() =>
+      planMigration(guarded([], ["body"]), declared({ title: column.string() })),
+    ).toThrow("Generated column slug still uses this column: notes.body");
+    expect(() =>
+      planMigration(
+        guarded([], ["body"]),
+        declared({ title: column.string(), content: column.string().renamedFrom("body") }),
+      ),
+    ).toThrow("Generated column slug prevents renaming notes.body");
+
+    // A catalog that does not list an expression's columns cannot prove any column is unused.
+    expect(() =>
+      planMigration(guarded(undefined, ["body"]), declared({ body: column.string() })),
+    ).toThrow("CHECK has_body cannot be re-read, so notes.title is not droppable");
+    expect(() =>
+      planMigration(
+        guarded(["body"], undefined),
+        declared({ body: column.string(), headline: column.string().renamedFrom("title") }),
+      ),
+    ).toThrow("Generated column slug cannot be re-read, so notes.title cannot be renamed");
+  });
+});
+
+describe("the columns a stored expression reads", () => {
+  it("are published in the catalog, unqualified, and guard drops and renames", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    const items = (
+      columns: Record<string, ReturnType<typeof column.integer>>,
+      total = "price * qty + price",
+    ) =>
+      table(
+        "items",
+        { id: column.integer().unique(), ...columns, total: column.integer().generatedSql(total) },
+        { checks: [{ name: "positive_qty", sql: "items.qty > 0" }] },
+      );
+    const without = (name: "qty" | "price" | "note") =>
+      Object.fromEntries(
+        (["qty", "price", "note"] as const)
+          .filter((candidate) => candidate !== name)
+          .map((candidate) => [candidate, column.integer()]),
+      );
+    await database.migrate(
+      schema([items({ qty: column.integer(), price: column.integer(), note: column.integer() })]),
+    );
+    const [catalogItems] = (await database.introspect()).tables;
+    expect(catalogItems?.checks).toEqual([
+      { name: "positive_qty", sql: "items.qty > 0", columns: ["qty"] },
+    ]);
+    expect(catalogItems?.columns.find(({ name }) => name === "total")?.generatedValue).toEqual({
+      kind: "stored",
+      sql: "price * qty + price",
+      columns: ["price", "qty"],
+    });
+
+    // A reference qualified by the table's own name still holds its column in place.
+    await expect(database.dropColumn("items", "qty")).rejects.toThrow(
+      "CHECK positive_qty still uses this column: items.qty",
+    );
+    // A declaration that drops a column its own CHECK reads is refused before planning, as
+    // CREATE TABLE would refuse it.
+    const withoutQty = without("qty");
+    await expect(
+      database.migrate(schema([items(withoutQty, "price * 2")]), { allowDestructive: true }),
+    ).rejects.toThrow("CHECK positive_qty names an unknown column: qty");
+    // The catalog still lists what the stored generated expression reads, so neither dropping
+    // the column alongside it nor renaming it under a rewritten expression slips through.
+    const withoutPrice = without("price");
+    await expect(
+      database.migrate(
+        schema([
+          table(
+            "items",
+            { id: column.integer().unique(), ...withoutPrice },
+            { checks: [{ name: "positive_qty", sql: "items.qty > 0" }] },
+          ),
+        ]),
+        { allowDestructive: true },
+      ),
+    ).rejects.toThrow("Generated column total still uses this column: items.price");
+    await expect(
+      database.migrate(
+        schema([
+          items({ ...withoutPrice, cost: column.integer().renamedFrom("price") }, "cost * qty"),
+        ]),
+      ),
+    ).rejects.toThrow("Generated column total prevents renaming items.price");
+    // The column no expression reads still goes.
+    const withoutNote = without("note");
+    const dropped = await database.migrate(schema([items(withoutNote)]), {
+      allowDestructive: true,
+    });
+    expect(dropped.steps).toEqual([
+      { kind: "drop-column", tableName: "items", columnName: "note" },
+    ]);
   });
 });
 

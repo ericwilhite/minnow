@@ -117,6 +117,9 @@ machines: https://minnowdb.com/llms.txt
   value derived from sibling columns. Omit it from inserts and updates; Minnow recomputes it.
   Adding a new generated column to an existing table is refused, while adopting generation on an
   existing column scans and verifies its values.
+- The schema DSL never parses SQL. An invalid `checks` condition, `.defaultSql()`, or
+  `.generatedSql()` expression throws from `migrate()`, before it changes anything, not from
+  `table()`; a test that migrates the schema into a `MemoryBlockStore` database catches one.
 - Load many rows with `db.insertBatch(table, rows)`, not one `INSERT` per row.
 - Construct the engine or client with the declaration — `new MinnowDatabase(store, { schema })`,
   `new MinnowDatabaseClient(worker, { store, schema })` — then call `migrate()` with no
