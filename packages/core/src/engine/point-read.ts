@@ -299,6 +299,14 @@ function resolveMembers(
     if (value === undefined) return undefined;
     values.push(value);
   }
+  return ascendingMembers(values);
+}
+
+/**
+ * Keys as a membership: distinct and ascending, the order a key scan meets them. Undefined when
+ * they are not all one storage kind, or there are none. Sorts `values` in place.
+ */
+export function ascendingMembers(values: PointReadValue[]): PointReadValue[] | undefined {
   if (values.length === 0) return undefined;
   const kind = typeof values[0];
   const date = values[0] instanceof Date;

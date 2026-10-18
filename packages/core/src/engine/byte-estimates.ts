@@ -8,12 +8,12 @@ import type { ColumnarBatch } from "./batch.js";
  * thresholds, not the physical format. Keeping a single implementation keeps those
  * accountings from drifting apart.
  */
-export function estimateValuesBytes(values: readonly unknown[]): number {
-  return estimateRangeBytes(values, 0, values.length);
-}
-
-/** `estimateValuesBytes` over `values[start, end)`, without copying the range out first. */
-function estimateRangeBytes(values: readonly unknown[], start: number, end: number): number {
+export function estimateValuesBytes(
+  values: readonly unknown[],
+  /** A range, `values[start, end)`, is measured without copying it out first. */
+  start = 0,
+  end = values.length,
+): number {
   let bytes = 0;
   for (let index = start; index < end; index += 1) {
     const value = values[index];
@@ -44,7 +44,7 @@ export async function estimateBatchBytesSliced(input: ColumnarBatch): Promise<nu
   for (const values of Object.values(input.columns)) {
     for (let start = 0; start < values.length; start += ESTIMATE_SLICE_VALUES) {
       if (sliceExpired()) await yieldToEventLoop();
-      total += estimateRangeBytes(
+      total += estimateValuesBytes(
         values,
         start,
         Math.min(values.length, start + ESTIMATE_SLICE_VALUES),

@@ -25,14 +25,8 @@ export function assertWellFormedString(value: string, context = "String value"):
 
 function measureWellFormedUtf8(value: string, context: string): number {
   if (typeof value !== "string") throw new TypeError(`${context} must be a string`);
-  // ASCII, nearly every stored string, is one byte a code unit and cannot hold a surrogate: a
-  // tight scan settles it, and only the rest of a string past its first other unit is measured.
-  const length = value.length;
-  let ascii = 0;
-  while (ascii < length && value.charCodeAt(ascii) <= 0x7f) ascii += 1;
-  if (ascii === length) return length;
-  let byteLength = ascii;
-  for (let index = ascii; index < length; index += 1) {
+  let byteLength = 0;
+  for (let index = 0; index < value.length; index += 1) {
     const code = value.charCodeAt(index);
     if (code <= 0x7f) {
       byteLength += 1;
