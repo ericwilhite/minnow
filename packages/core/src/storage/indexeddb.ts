@@ -4678,19 +4678,25 @@ export class IndexedDbBlockStore implements BlockStore {
       }
       // Only previously journaled artifacts need existence probes; the ones added below commit
       // or fail atomically with everything else.
-      await assertPendingArtifactsAvailableInTransaction(transaction, base);
+      const journaledSegments = await assertPendingArtifactsAvailableInTransaction(
+        transaction,
+        base,
+      );
       await updateRecordResourceLedger(transaction.objectStore("statistics"), {
         segments: normalizedSegments.map((segment) => ({ next: segment })),
       });
       const blockStore = transaction.objectStore("blocks");
       const catalog = transaction.objectStore("catalog");
+      const addedMetadata = new Map<string, StoredBlockMetadata>();
       for (const block of input.blocks) {
         const bytes = compactStructuredCloneBytes(block.bytes, "Block bytes");
+        const metadata: StoredBlockMetadata = {
+          byteLength: bytes.byteLength,
+          checksum: crc32(bytes),
+        };
         blockStore.add(bytes, block.id);
-        catalog.add(
-          { byteLength: bytes.byteLength, checksum: crc32(bytes) } satisfies StoredBlockMetadata,
-          blockMetadataKey(block.id),
-        );
+        catalog.add(metadata, blockMetadataKey(block.id));
+        addedMetadata.set(block.id, metadata);
       }
       const segmentStore = transaction.objectStore("segments");
       for (const segment of normalizedSegments) {
@@ -4701,6 +4707,13 @@ export class IndexedDbBlockStore implements BlockStore {
         staged,
         { replacedChunkCount: journalChunkCountOf(base) },
         input,
+        {
+          probedBlockIds: new Set(base.pendingBlockIds),
+          addedMetadata,
+          segments: new Map(
+            [...journaledSegments, ...normalizedSegments].map((segment) => [segment.id, segment]),
+          ),
+        },
       );
       await transactionDone(transaction);
       outcome.settle();
@@ -4720,12 +4733,24 @@ export class IndexedDbBlockStore implements BlockStore {
    * must do with the journal chunks: nothing for a journaled record, whose ids are already
    * stored, or a rewrite replacing that many chunks for a single-shot write whose freshly
    * staged ids have no chunks yet.
+   *
+   * `known` is what a single-shot write already holds about the journal in this same storage
+   * transaction, so the commit does not read it back: blocks whose existence it probed, the
+   * metadata of blocks it added (which also cannot have provenance: published ids name stored
+   * payloads, so adding one would have failed), and the pending segment records it read or
+   * added. Nothing else writes inside a readwrite transaction, so each answer is the one a read
+   * would give. A wide table's single-row write otherwise read back a few hundred records.
    */
   async #commitInTransaction(
     transaction: IDBTransaction,
     record: TransactionRecord,
     journal: "stored" | { replacedChunkCount: number },
     input: Omit<CommitTransactionInput, "transactionId" | "expectedTransactionRevision">,
+    known?: {
+      probedBlockIds: ReadonlySet<string>;
+      addedMetadata: ReadonlyMap<string, StoredBlockMetadata>;
+      segments: ReadonlyMap<string, SegmentRecord>;
+    },
   ): Promise<{ manifest: ManifestSummary; settle: () => void }> {
     incrementSafeInteger(record.revision, "Transaction revision");
     const transactionStore = transaction.objectStore("transactions");
@@ -4760,9 +4785,20 @@ export class IndexedDbBlockStore implements BlockStore {
       requestResult<unknown>(statistics.get(RECORD_RESOURCE_LEDGER_KEY)),
       requestResult<unknown>(statistics.get(RESOURCE_LEDGER_KEY)),
       requestResult<unknown>(statistics.get(transactionResourceLedgerKey(record.id))),
-      Promise.all(record.pendingBlockIds.map((id) => requestResult(blockStore.getKey(id)))),
       Promise.all(
-        record.pendingSegmentIds.map((id) => requestResult<unknown>(segmentStore.get(id))),
+        record.pendingBlockIds.map((id) =>
+          known?.probedBlockIds.has(id) === true || known?.addedMetadata.has(id) === true
+            ? Promise.resolve<IDBValidKey | undefined>(id)
+            : requestResult(blockStore.getKey(id)),
+        ),
+      ),
+      Promise.all(
+        record.pendingSegmentIds.map((id) => {
+          const segment = known?.segments.get(id);
+          return segment === undefined
+            ? requestResult<unknown>(segmentStore.get(id))
+            : Promise.resolve<unknown>(segment);
+        }),
       ),
     ]);
     assertCommitSchema(record, asSchemaEpoch(schemaValue));
@@ -4873,10 +4909,19 @@ export class IndexedDbBlockStore implements BlockStore {
         ),
       ),
       Promise.all(
-        journalBlockIds.map((id) => requestResult<unknown>(catalog.get(manifestBlockKey(id)))),
+        journalBlockIds.map((id) =>
+          known?.addedMetadata.has(id) === true
+            ? Promise.resolve<unknown>(undefined)
+            : requestResult<unknown>(catalog.get(manifestBlockKey(id))),
+        ),
       ),
       Promise.all(
-        journalBlockIds.map((id) => requestResult<unknown>(catalog.get(blockMetadataKey(id)))),
+        journalBlockIds.map((id) => {
+          const metadata = known?.addedMetadata.get(id);
+          return metadata === undefined
+            ? requestResult<unknown>(catalog.get(blockMetadataKey(id)))
+            : Promise.resolve<unknown>(metadata);
+        }),
       ),
     ]);
     const tableValues = new Map(changedTableValues);
@@ -14835,13 +14880,14 @@ async function garbageCollectionPinsInTransaction(
   return versions;
 }
 
+/** Returns the pending segments it read and validated; none when `validateSegments` is false. */
 async function assertPendingArtifactsAvailableInTransaction(
   transaction: IDBTransaction,
   record: TransactionRecord,
   validateBlocks = true,
   validateSegments = true,
   validateCurrentTable = false,
-): Promise<void> {
+): Promise<SegmentRecord[]> {
   const [blockKeys, segmentValues] = await Promise.all([
     validateBlocks
       ? Promise.all(
@@ -14921,7 +14967,9 @@ async function assertPendingArtifactsAvailableInTransaction(
         throw corruption(`transactions/${record.id}`, "pending row counter disagrees with journal");
       }
     }
+    return segments;
   }
+  return [];
 }
 
 /** Validate all retained blocks once, in bounded parallel read batches. */

@@ -9,6 +9,7 @@ import { IDBCursor, IDBFactory, IDBIndex, IDBObjectStore } from "fake-indexeddb"
 import { afterEach, expect, it, vi } from "vitest";
 import { MinnowDatabase } from "../engine/database.js";
 import { IndexedDbBlockStore } from "./indexeddb.js";
+import { MAX_TRANSACTION_STAGE_BLOCKS } from "./types.js";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -95,4 +96,43 @@ it("an ordinary commit reads the same however many blocks the database holds", a
   // Neither the pinned-history admission nor the level-zero ceiling reads every record of a
   // kind: the large database's commit issues exactly the small one's requests and steps.
   expect(Object.fromEntries(large)).toEqual(Object.fromEntries(small));
+});
+
+async function singleRowInsertRequests(columns: number): Promise<Map<string, number>> {
+  const store = await IndexedDbBlockStore.open({
+    name: crypto.randomUUID(),
+    indexedDB: new IDBFactory(),
+  });
+  const db = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+  try {
+    const names = Array.from({ length: columns }, (_, index) => `c${String(index)}`);
+    const declarations = names.map((name) => `${name} INTEGER`).join(", ");
+    await db.execute(`CREATE TABLE t (id INTEGER PRIMARY KEY, ${declarations})`);
+    const row = (id: number): Record<string, number> => {
+      const values: Record<string, number> = { id };
+      for (const name of names) values[name] = id;
+      return values;
+    };
+    await db.insertBatch("t", [row(1)]);
+    const counts = countReadwriteRequests();
+    await db.insertBatch("t", [row(2)]);
+    vi.restoreAllMocks();
+    return counts;
+  } finally {
+    await db.close();
+  }
+}
+
+it("a single-shot write reads back none of the blocks or segments it writes", async () => {
+  // One block per column: a write's own blocks and segment are known to it, so the commit
+  // inside the same storage transaction reads only what came before.
+  const narrow = await singleRowInsertRequests(3);
+  const wide = await singleRowInsertRequests(40);
+  expect(wide.get("blocks.getKey") ?? 0).toBe(0);
+  expect(wide.get("segments.get") ?? 0).toBe(0);
+  expect(wide.get("catalog.get")).toBe(narrow.get("catalog.get"));
+  // Wider than one staging call: only the blocks staged ahead of the write are probed, once.
+  const staged = await singleRowInsertRequests(MAX_TRANSACTION_STAGE_BLOCKS + 6);
+  expect(staged.get("blocks.getKey")).toBeGreaterThan(0);
+  expect(staged.get("blocks.getKey")).toBeLessThanOrEqual(MAX_TRANSACTION_STAGE_BLOCKS);
 });
