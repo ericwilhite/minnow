@@ -5,6 +5,7 @@ import {
   assertTransactionArtifactBatchLimits,
   type BlockStore,
   type BlockWrite,
+  type CatalogProbe,
   GarbageCollectionJobConflictError,
   LeaseConflictError,
   LeaseExpiredError,
@@ -1901,7 +1902,15 @@ export class TransactionManager {
     const ownerId = `${id}/owner`;
     const timestamp = dateIsoString(this.#now());
     let begun: Awaited<ReturnType<BlockStore["beginTransaction"]>>;
+    let probe: CatalogProbe;
     for (;;) {
+      // The catalog state the transaction starts from, as `beginDeferred` records it: the
+      // engine carries its catalog cache past this transaction's commit only when the commit
+      // lands on exactly that state, and without it every read after a batch write reloaded
+      // the table and re-proved every block of every segment. Asked beside the begin, so it
+      // costs no extra round trip of waiting.
+      const probing = this.store.getCatalogProbe();
+      probing.catch(() => undefined);
       try {
         begun = await this.store.beginTransaction({
           record: {
@@ -1919,12 +1928,13 @@ export class TransactionManager {
           ...(reserveRowIds === undefined ? {} : { reserveRowIds }),
           ...(reserveAutoIncrement === undefined ? {} : { reserveAutoIncrement }),
         });
-        break;
       } catch (error) {
         // The store's atomic begin aborted in full, including any counter reservation.
         if (error instanceof SnapshotManifestMissingError) continue;
         throw error;
       }
+      probe = await probing;
+      break;
     }
     return {
       transaction: new DatabaseTransaction(
@@ -1933,6 +1943,11 @@ export class TransactionManager {
         this.#now,
         this.#transactionTtlMs,
         this.#createWeakRef,
+        // A probe from another version than the one begun describes some other state; the
+        // carry is then simply not offered, as when the commit itself lands elsewhere.
+        probe.manifestVersion === begun.record.snapshotVersion
+          ? { initialCatalogProbe: probe }
+          : {},
       ),
       ...(begun.rowIds === undefined ? {} : { rowIds: begun.rowIds }),
       ...(begun.autoIncrementValues === undefined
