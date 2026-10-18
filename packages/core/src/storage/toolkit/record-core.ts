@@ -212,6 +212,16 @@ function cloneRecordValue(value: unknown): unknown {
   return copy;
 }
 
+/**
+ * Test-only counters. Not exported from any public entry point (the toolkit re-exports named
+ * symbols only): in-repo suites import this module directly to assert how much work a commit
+ * does, which timing cannot pin down.
+ */
+export const recordCoreTestHooks = {
+  /** Segment records walked by level-zero recounts; a carried count walks none. */
+  levelZeroSegmentsCounted: 0,
+};
+
 const postingTextEncoder = new TextEncoder();
 const RESOURCE_EXPIRY_SWEEP_ITEMS = 64;
 /** Leaves ample canonical-wire overhead below the 4 MiB metadata frame ceiling. */
@@ -990,10 +1000,18 @@ export class RecordCore {
    * Visible committed level-zero segments per table, as the level-zero ceiling counts them, for
    * the current manifest version. Every commit that adds level-zero work checks the ceiling, and
    * counting walked every segment of the table and every block of each. A count stays exact
-   * while its version is current and `#levelZeroGeneration` — bumped by any change to segment
-   * records, manifest block records, or committed transaction records — has not moved; an
-   * ordinary commit that retires no block carries it forward by the level-zero segments it
-   * publishes (see `#applyCommit`).
+   * while its version is current and `#levelZeroGeneration` has not moved; an ordinary commit
+   * that retires no block carries it forward by the level-zero segments it publishes (see
+   * `#applyCommit`).
+   *
+   * The generation moves on exactly the changes that can alter a count at the current version:
+   * a level-zero segment record whose owner is committed, a manifest block record some segment
+   * names, or a transaction that owns segments entering or leaving the committed state. Staging
+   * (segments of an uncommitted owner), collecting records nothing references, and updating a
+   * transaction without changing whether it is committed leave every count as it was. Moving
+   * them all was what made a wide table recount on every commit: a write with more blocks than
+   * one staging call accepts stages part of its journal first, and that stage alone discarded
+   * the count the previous commit had carried forward.
    */
   readonly #levelZeroCounts = new Map<
     string,
@@ -1001,7 +1019,10 @@ export class RecordCore {
   >();
   #levelZeroGeneration = 0;
   readonly #manifestBlocks = new OrderedRecordMap<string, ManifestBlockRecord>((previous, next) => {
-    this.#levelZeroGeneration += 1;
+    const blockId = (previous ?? next)?.blockId;
+    if (blockId !== undefined && this.#segments.blockReferenceCount(blockId) > 0) {
+      this.#levelZeroGeneration += 1;
+    }
     if (previous !== undefined && previous.removedVersion !== null) {
       this.#retiredHistoryBytes -= previous.byteLength;
       this.#changeRetiredManifestBlock(previous, -1);
@@ -1036,7 +1057,12 @@ export class RecordCore {
   readonly #activeTransactionExpiries = new OrderedKeyIndex<ExpiryKey>(compareExpiryKeys);
   readonly #activeTransactionExpiryKeys = new Map<string, ExpiryKey>();
   readonly #transactions = new OrderedRecordMap<string, TransactionRecord>((previous, next) => {
-    if (previous?.status === "committed" || next?.status === "committed") {
+    const id = (previous ?? next)?.id;
+    if (
+      id !== undefined &&
+      (previous?.status === "committed") !== (next?.status === "committed") &&
+      this.#segments.ownerReferenceCount(id) > 0
+    ) {
       this.#levelZeroGeneration += 1;
     }
     this.#changeTransactionReferences(previous, next);
@@ -1564,7 +1590,12 @@ export class RecordCore {
 
   #replaceSegments(records: readonly SegmentRecord[], removeIds: readonly string[] = []): void {
     const { retainedBytes, changes } = this.#segmentUsageAfter(records, removeIds);
-    this.#levelZeroGeneration += 1;
+    for (const [id, record] of changes) {
+      if (this.#mayCountAtLevelZero(this.#segments.get(id)) || this.#mayCountAtLevelZero(record)) {
+        this.#levelZeroGeneration += 1;
+        break;
+      }
+    }
     for (const [id, record] of changes) {
       if (record === undefined) this.#segments.delete(id);
       else this.#segments.set(id, record);
@@ -1574,6 +1605,13 @@ export class RecordCore {
 
   #setSegment(record: SegmentRecord): void {
     this.#replaceSegments([record]);
+  }
+
+  /** Whether the level-zero count could include this segment record (see `#levelZeroCounts`). */
+  #mayCountAtLevelZero(segment: SegmentRecord | undefined): boolean {
+    return (
+      segment?.level === 0 && this.#transactions.get(segment.transactionId)?.status === "committed"
+    );
   }
 
   #assertTransactionResourceTransition(
@@ -3447,14 +3485,11 @@ export class RecordCore {
     }
     let count = 0;
     for (const segment of this.#segments.tableValues(tableId)) {
+      recordCoreTestHooks.levelZeroSegmentsCounted += 1;
       if (segment.level !== 0) continue;
       const owner = this.#transactions.get(segment.transactionId);
       if (owner?.status !== "committed") continue;
-      const blocks = segmentBlockIds(segment);
-      if (blocks.length > 0 && blocks.some((id) => !this.#isManifestBlockVisible(version, id))) {
-        continue;
-      }
-      count += 1;
+      if (this.#segmentBlocksVisible(segment, version)) count += 1;
     }
     if (memoizable) {
       this.#levelZeroCounts.set(tableId, {
@@ -3464,6 +3499,14 @@ export class RecordCore {
       });
     }
     return count;
+  }
+
+  /** Every block the segment names is visible at `version` — vacuously, when it names none. */
+  #segmentBlocksVisible(segment: SegmentRecord, version: number | null): boolean {
+    for (const ids of Object.values(segment.columnBlockIds)) {
+      for (const id of ids) if (!this.#isManifestBlockVisible(version, id)) return false;
+    }
+    return true;
   }
 
   #isManifestBlockVisible(version: number | null, id: string): boolean {
@@ -6404,6 +6447,10 @@ export class RecordCore {
     // Every membership is replaced, so nothing prepared against the old ones may be reused.
     this.#unpublished = undefined;
     this.#membershipEpoch += 1;
+    // The same goes for remembered level-zero counts: a loaded state may sit at the very version
+    // a count was taken at and still hold different segments.
+    this.#levelZeroCounts.clear();
+    this.#levelZeroGeneration += 1;
     // A recovery candidate may intentionally discard an unpublished WAL suffix whose physical
     // blocks were already reclaimed. Clearing the old candidate state must therefore not need
     // those obsolete bytes merely to decrement counters; the counters are reset immediately.

@@ -10,8 +10,10 @@ import { expect, it, vi } from "vitest";
 import { MinnowDatabase } from "../engine/database.js";
 import { MemoryOpfs } from "../testing/opfs-shim.js";
 import { IndexedDbBlockStore } from "./indexeddb.js";
+import { recordCoreTestHooks } from "./toolkit/record-core.js";
 import {
   CompactionBacklogError,
+  MAX_TRANSACTION_STAGE_BLOCKS,
   MemoryBlockStore,
   OpfsBlockStore,
   type BlockStore,
@@ -106,47 +108,53 @@ const adapters: Array<{ name: string; open: () => Promise<BlockStore> }> = [
 ];
 
 for (const adapter of adapters) {
-  it(`${adapter.name}: the enforced level-zero count follows commits, folds, and collection`, async () => {
-    const store = await adapter.open();
-    const db = new MinnowDatabase(store, { autoCompact: false });
-    try {
-      await db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, amount INTEGER NOT NULL)");
-      const table = await store.getTableByName("t");
-      const keyColumnId = table?.uniqueKeyColumnId;
-      if (table === undefined || keyColumnId === undefined) throw new Error("table is missing");
-      const check = async (): Promise<number> => {
-        const enforced = await enforcedLevelZeroCount(store, table.id, keyColumnId);
-        expect(enforced).toBe(await visibleLevelZero(db, store));
-        return enforced;
-      };
-      for (let batch = 0; batch < 3; batch += 1) {
-        await db.insertBatch(
-          "t",
-          Array.from({ length: 10 }, (_, index) => ({ id: batch * 10 + index, amount: 0 })),
+  // A table wider than one staging call stages part of each write before committing it.
+  for (const extra of [0, MAX_TRANSACTION_STAGE_BLOCKS]) {
+    it(`${adapter.name}: the enforced level-zero count follows commits, folds, and collection (${String(extra + 2)} columns)`, async () => {
+      const store = await adapter.open();
+      const db = new MinnowDatabase(store, { autoCompact: false });
+      try {
+        const wide = Array.from({ length: extra }, (_, index) => `, c${String(index)} INTEGER`);
+        await db.execute(
+          `CREATE TABLE t (id INTEGER PRIMARY KEY, amount INTEGER NOT NULL${wide.join("")})`,
         );
+        const table = await store.getTableByName("t");
+        const keyColumnId = table?.uniqueKeyColumnId;
+        if (table === undefined || keyColumnId === undefined) throw new Error("table is missing");
+        const check = async (): Promise<number> => {
+          const enforced = await enforcedLevelZeroCount(store, table.id, keyColumnId);
+          expect(enforced).toBe(await visibleLevelZero(db, store));
+          return enforced;
+        };
+        for (let batch = 0; batch < 3; batch += 1) {
+          await db.insertBatch(
+            "t",
+            Array.from({ length: 10 }, (_, index) => ({ id: batch * 10 + index, amount: 0 })),
+          );
+        }
+        expect(await check()).toBe(3);
+        // Ordinary commits carry the count forward, one segment each.
+        for (let index = 0; index < 5; index += 1) {
+          await db.execute("UPDATE t SET amount = amount + 1 WHERE id = ?", [index]);
+        }
+        expect(await check()).toBe(8);
+        // A fold retires the level-zero segments' blocks: the count must not carry through it.
+        await db.compactTable("t");
+        const folded = await check();
+        expect(folded).toBeLessThan(8);
+        await db.execute("UPDATE t SET amount = amount + 1 WHERE id = 1");
+        await db.execute("DELETE FROM t WHERE id = 2");
+        expect(await check()).toBe(folded + 2);
+        // Collection reclaims records without publishing a version.
+        await db.collectGarbage();
+        expect(await check()).toBe(folded + 2);
+        await db.execute("UPDATE t SET amount = amount + 1 WHERE id = 3");
+        expect(await check()).toBe(folded + 3);
+      } finally {
+        await db.close();
       }
-      expect(await check()).toBe(3);
-      // Ordinary commits carry the count forward, one segment each.
-      for (let index = 0; index < 5; index += 1) {
-        await db.execute("UPDATE t SET amount = amount + 1 WHERE id = ?", [index]);
-      }
-      expect(await check()).toBe(8);
-      // A fold retires the level-zero segments' blocks: the count must not carry through it.
-      await db.compactTable("t");
-      const folded = await check();
-      expect(folded).toBeLessThan(8);
-      await db.execute("UPDATE t SET amount = amount + 1 WHERE id = 1");
-      await db.execute("DELETE FROM t WHERE id = 2");
-      expect(await check()).toBe(folded + 2);
-      // Collection reclaims records without publishing a version.
-      await db.collectGarbage();
-      expect(await check()).toBe(folded + 2);
-      await db.execute("UPDATE t SET amount = amount + 1 WHERE id = 3");
-      expect(await check()).toBe(folded + 3);
-    } finally {
-      await db.close();
-    }
-  });
+    });
+  }
 }
 
 it("indexeddb: a commit from another connection is counted, not carried", async () => {
@@ -233,3 +241,56 @@ it("indexeddb: a steady-state commit reads the same however much history is unfo
     await db.close();
   }
 });
+
+/**
+ * A write to a table wider than one staging call's block limit stages part of its journal before
+ * it commits. That stage changes no count, yet it used to discard the count the previous commit
+ * carried forward, so every commit to a wide table walked every segment of the table again:
+ * a run of single-row writes cost quadratically in its own length.
+ */
+for (const adapter of adapters.filter(({ name }) => name !== "indexeddb")) {
+  it(`${adapter.name}: a wide-table commit walks no segments however much history is unfolded`, async () => {
+    const width = MAX_TRANSACTION_STAGE_BLOCKS + 6;
+    const store = await adapter.open();
+    const db = new MinnowDatabase(store, { autoCompact: false });
+    try {
+      const columns = Array.from({ length: width }, (_, index) => `c${String(index)} INTEGER`);
+      await db.execute(`CREATE TABLE t (id INTEGER PRIMARY KEY, ${columns.join(", ")})`);
+      const table = await store.getTableByName("t");
+      const keyColumnId = table?.uniqueKeyColumnId;
+      if (table === undefined || keyColumnId === undefined) throw new Error("table is missing");
+      const row = (id: number): Record<string, number> => {
+        const values: Record<string, number> = { id };
+        for (let index = 0; index < width; index += 1) values[`c${String(index)}`] = id + index;
+        return values;
+      };
+      let next = 0;
+      const walkedBy = async (write: () => Promise<unknown>): Promise<number> => {
+        const before = recordCoreTestHooks.levelZeroSegmentsCounted;
+        await write();
+        return recordCoreTestHooks.levelZeroSegmentsCounted - before;
+      };
+      const writes = [
+        () => db.insertBatch("t", [row((next += 1))]),
+        () => db.upsertBatch("t", [row(1)]),
+        () => db.execute("UPDATE t SET c3 = c3 + 1 WHERE id = ?", [2]),
+        () => db.deleteBatch("t", { keys: [next] }),
+      ];
+      // The first commits seed the count; after that each one carries it forward.
+      for (let index = 0; index < 4; index += 1) await db.insertBatch("t", [row((next += 1))]);
+      const shallow = [];
+      for (const write of writes) shallow.push(await walkedBy(write));
+      for (let index = 0; index < 40; index += 1) await db.insertBatch("t", [row((next += 1))]);
+      const deep = [];
+      for (const write of writes) deep.push(await walkedBy(write));
+      expect(shallow).toEqual([0, 0, 0, 0]);
+      expect(deep).toEqual([0, 0, 0, 0]);
+      // Carried through all of that, the count is still the one a fresh walk reads.
+      const enforced = await enforcedLevelZeroCount(store, table.id, keyColumnId);
+      expect(enforced).toBe(await visibleLevelZero(db, store));
+      expect(enforced).toBe(4 + writes.length * 2 + 40);
+    } finally {
+      await db.close();
+    }
+  });
+}
