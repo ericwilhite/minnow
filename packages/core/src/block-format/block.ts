@@ -110,22 +110,29 @@ export function maximumPhysicalBlockByteLength(
   return total;
 }
 
-export async function encodeBlock(
+export function encodeBlock(
   input: ColumnInput,
   compression: Compression = "raw",
 ): Promise<Uint8Array> {
-  assertBlockRowCount(input.values.length);
-  const encoded = encodeColumn(input);
-  return encodeValidatedPhysicalBlock(
-    {
-      type: input.type,
-      rowCount: input.values.length,
-      nullCount: encoded.nullCount,
-      bytes: encoded.bytes,
-      metadata: encoded.metadata,
-    },
-    compression,
-  );
+  // Not an async function: a raw block, nearly every block of a small write, is finished
+  // synchronously and handed back already settled rather than through extra promise layers.
+  // Failures still arrive as rejections, as they always have.
+  try {
+    assertBlockRowCount(input.values.length);
+    const encoded = encodeColumn(input);
+    return encodeValidatedPhysicalBlock(
+      {
+        type: input.type,
+        rowCount: input.values.length,
+        nullCount: encoded.nullCount,
+        bytes: encoded.bytes,
+        metadata: encoded.metadata,
+      },
+      compression,
+    );
+  } catch (error) {
+    return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+  }
 }
 
 /** Encodes physical column bytes after validating their complete canonical v2 layout. */
@@ -136,33 +143,59 @@ export async function encodePhysicalBlock(
   return encodeValidatedPhysicalBlock(validatePhysicalColumn(input), compression);
 }
 
-async function encodeValidatedPhysicalBlock(
+function encodeValidatedPhysicalBlock(
   input: ValidatedPhysicalColumn,
   compression: Compression,
 ): Promise<Uint8Array> {
-  // validatePhysicalColumn constructs this exact closed metadata shape. Avoid serializing,
-  // parsing, and serializing it again on every write; the public sizing helper validates its
-  // independently supplied metadata because it has no such provenance.
-  const metadata = textEncoder.encode(JSON.stringify(input.metadata));
-  // Checksum before the first possible async yield. The gzip codec also takes its input copy
-  // synchronously when called, so caller mutation after encodePhysicalBlock returns cannot make
-  // the checksum and compressed bytes observe different physical payloads.
-  const logicalChecksum = crc32(input.bytes);
-  // Avoid an async yield on raw blocks: validation and the copy into the immutable envelope
-  // complete before a caller can mutate a physical input buffer. The gzip codec takes its own
-  // input copy before yielding to the native stream.
+  try {
+    // validatePhysicalColumn constructs this exact closed metadata shape. Avoid serializing,
+    // parsing, and serializing it again on every write; the public sizing helper validates its
+    // independently supplied metadata because it has no such provenance.
+    const metadata = textEncoder.encode(JSON.stringify(input.metadata));
+    // Checksum before the first possible async yield. The gzip codec also takes its input copy
+    // synchronously when called, so caller mutation after encodePhysicalBlock returns cannot
+    // make the checksum and compressed bytes observe different physical payloads.
+    const logicalChecksum = crc32(input.bytes);
+    // Avoid an async yield on raw blocks: validation and the copy into the immutable envelope
+    // complete before a caller can mutate a physical input buffer. The gzip codec takes its own
+    // input copy before yielding to the native stream.
+    if (compression === "raw") {
+      return Promise.resolve(
+        assembleBlock(input, compression, metadata, logicalChecksum, input.bytes),
+      );
+    }
+    return compressAndAssembleBlock(input, compression, metadata, logicalChecksum);
+  } catch (error) {
+    return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+  }
+}
+
+async function compressAndAssembleBlock(
+  input: ValidatedPhysicalColumn,
+  compression: Compression,
+  metadata: Uint8Array,
+  logicalChecksum: number,
+): Promise<Uint8Array> {
   let stored: Uint8Array;
   try {
-    stored =
-      compression === "raw"
-        ? input.bytes
-        : await getCodec(compression).compress(input.bytes, MAX_BLOCK_LENGTH);
+    stored = await getCodec(compression).compress(input.bytes, MAX_BLOCK_LENGTH);
   } catch (error) {
     if (error instanceof CompressionOutputLimitError) {
       throw new StoredBlockPayloadTooLargeError(error.byteLength);
     }
     throw error;
   }
+  return assembleBlock(input, compression, metadata, logicalChecksum, stored);
+}
+
+/** The v2 envelope around a physical payload as stored with `compression`. */
+function assembleBlock(
+  input: ValidatedPhysicalColumn,
+  compression: Compression,
+  metadata: Uint8Array,
+  logicalChecksum: number,
+  stored: Uint8Array,
+): Uint8Array {
   assertMetadataLength(metadata.byteLength);
   assertLength(input.bytes.byteLength, "encoded payload");
   assertStoredBlockPayloadByteLength(stored.byteLength);
