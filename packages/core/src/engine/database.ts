@@ -9687,12 +9687,21 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * no reads in between piles deltas up unfolded, and the next query pays for all of them at
    * once. Background maintenance never surfaces through a write; a failed check waits for the
    * next one.
+   *
+   * The check starts its reads only between this database's writer turns (see
+   * `WriterAdmissions.outsideTurns`), and starts them together: its timers fire at any moment,
+   * and a read created while a turn's commit or lease write is open waits inside the store
+   * behind it — where WebKit can leak it if the worker is terminated.
    */
   async #checkAutoCompaction(tableId: string, idle = false): Promise<void> {
     try {
-      const table = await this.store.getTable(tableId);
+      await this.#admissions.outsideTurns();
+      if (this.#closed) return;
+      const [table, version] = await Promise.all([
+        this.store.getTable(tableId),
+        this.store.getCurrentManifestVersion(),
+      ]);
       if (table === undefined) return;
-      const version = await this.store.getCurrentManifestVersion();
       const hint = this.#autoCompactionHints.get(tableId);
       if (hint?.version === version) {
         this.#maybeScheduleAutoCompactionFromHint(table, hint, idle);

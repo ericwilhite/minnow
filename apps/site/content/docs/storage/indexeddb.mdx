@@ -246,6 +246,11 @@ database is not a damaged one — and a worker opening it keeps reporting progre
 `ready()` fails with this error rather than a worker timeout. See [Errors](/docs/engine/errors)
 for what a caller should do with it.
 
+The automatic compaction check stays out of that queue. It can start at any moment, so it waits
+until the connection has no write in progress before it reads the catalog, instead of queueing
+inside IndexedDB behind the connection's own commit. Work that overlaps by itself — queries issued
+alongside writes, or another tab's writes — can still queue, so the bound above stays.
+
 ## Schema compatibility and recovery
 
 The current IndexedDB schema is 7. Schema 1 kept each transaction's journal ids on the record

@@ -17,6 +17,9 @@ export class WriterAdmissions {
   readonly #maintenanceQueue = new AbortController();
   readonly #pendingCompactionPublications = new Set<() => Promise<void>>();
   #pendingPublicationSignal: { promise: Promise<void>; resolve: () => void } | undefined;
+  /** Turns of this database running now; a turn still waiting for admission is not counted. */
+  #running = 0;
+  #turnsEnded: { promise: Promise<void>; resolve: () => void } | undefined;
   #grace: ReturnType<typeof setTimeout> | undefined;
   readonly #closedError: WriterAdmissionOptions["closedError"];
   readonly #shutdown: WriterAdmissionOptions["shutdown"];
@@ -27,6 +30,46 @@ export class WriterAdmissions {
     this.#shutdown = options.shutdown;
     this.#store = options.store;
     this.#report = options.report;
+    this.#shutdown.addEventListener("abort", () => this.#wakeTurnWaiters(), { once: true });
+  }
+
+  /**
+   * Settles once no turn of this database is running, or once it closes. Background reads wait
+   * for it before they start: a turn's commits and lease writes are readwrite transactions, and
+   * a read issued while one of them is open waits inside the store behind it. On WebKit's
+   * IndexedDB, a transaction still waiting there when its worker is terminated can be leaked,
+   * and then blocks the database in every tab until the tab that ran the worker closes.
+   * Started between turns, the read runs at once and is done in well under a commit's time.
+   */
+  outsideTurns(): Promise<void> {
+    if (this.#running === 0 || this.#shutdown.aborted) return Promise.resolve();
+    if (this.#turnsEnded === undefined) {
+      let resolve = (): void => undefined;
+      const promise = new Promise<void>((settle) => {
+        resolve = settle;
+      });
+      this.#turnsEnded = { promise, resolve };
+    }
+    return this.#turnsEnded.promise;
+  }
+
+  #wakeTurnWaiters(): void {
+    const waiting = this.#turnsEnded;
+    this.#turnsEnded = undefined;
+    waiting?.resolve();
+  }
+
+  async #runTurn<T>(
+    run: (admission: WriterAdmission) => Promise<T>,
+    admission: WriterAdmission,
+  ): Promise<T> {
+    this.#running += 1;
+    try {
+      return await run(admission);
+    } finally {
+      this.#running -= 1;
+      if (this.#running === 0) this.#wakeTurnWaiters();
+    }
   }
   get maintenanceSignal(): AbortSignal {
     return this.#maintenanceQueue.signal;
@@ -80,7 +123,7 @@ export class WriterAdmissions {
             );
           },
         },
-        run,
+        (admission) => this.#runTurn(run, admission),
       );
     const task =
       cancelWait !== undefined
