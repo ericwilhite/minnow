@@ -2008,8 +2008,34 @@ describe("RecordCore hardening", () => {
     segments.delete(record.id);
     expect(segments.blockReferenceCount("reverse-block")).toBe(0);
     segments.set(record.id, record);
+    // An aliased block: named by segments of two tables, then by one again.
+    const alias: SegmentRecord = {
+      ...record,
+      id: "alias-segment",
+      tableId: "alias-table",
+      columnBlockIds: { value: ["reverse-block"], other: ["alias-block"] },
+    };
+    const third: SegmentRecord = { ...record, id: "third-segment" };
+    segments.set(alias.id, alias);
+    segments.set(third.id, third);
+    expect(segments.blockReferenceCount("reverse-block")).toBe(3);
+    expect(segments.tableBlockReferenceCount(record.tableId, "reverse-block")).toBe(2);
+    expect(segments.tableBlockReferenceCount(alias.tableId, "reverse-block")).toBe(1);
+    expect(new Set(segments.segmentIdsForBlock("reverse-block"))).toEqual(
+      new Set([record.id, alias.id, third.id]),
+    );
+    segments.delete(third.id);
+    segments.delete(record.id);
+    expect(segments.blockReferenceCount("reverse-block")).toBe(1);
+    expect(segments.tableBlockReferenceCount(record.tableId, "reverse-block")).toBe(0);
+    expect([...segments.segmentIdsForBlock("reverse-block")]).toEqual([alias.id]);
+    // Moving a segment to blocks it did not name drops the old references.
+    segments.set(alias.id, { ...alias, columnBlockIds: { other: ["alias-block"] } });
+    expect(segments.blockReferenceCount("reverse-block")).toBe(0);
+    expect(segments.blockReferenceCount("alias-block")).toBe(1);
     segments.clear();
     expect(segments.size).toBe(0);
+    expect(segments.blockReferenceCount("alias-block")).toBe(0);
   });
 
   it("rebuilds bulk unique-key order lazily and stays exact across later mutations", () => {

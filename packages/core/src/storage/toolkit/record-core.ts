@@ -537,10 +537,13 @@ class ExpiringRecordMap<Value extends { expiresAt: string }> extends OrderedReco
 /** @internal Exported only so the storage hardening suite can exercise table-local traversal. */
 export class SegmentRecordMap extends OrderedRecordMap<string, SegmentRecord> {
   readonly #byTable = new Map<string, OrderedKeyIndex<string>>();
-  readonly #byBlock = new Map<string, Set<string>>();
+  /**
+   * The segments naming each block: the id itself while there is one — nearly every block
+   * belongs to exactly one segment — and a set once there are more. Reference counts are this
+   * index's sizes, so a commit touches one map entry per block rather than three and a set.
+   */
+  readonly #byBlock = new Map<string, string | Set<string>>();
   readonly #byOwner = new Map<string, Set<string>>();
-  readonly #blockReferences = new Map<string, number>();
-  readonly #tableBlockReferences = new Map<string, Map<string, number>>();
 
   override set(id: string, record: SegmentRecord): this {
     const previous = this.get(id);
@@ -584,8 +587,6 @@ export class SegmentRecordMap extends OrderedRecordMap<string, SegmentRecord> {
     this.#byTable.clear();
     this.#byBlock.clear();
     this.#byOwner.clear();
-    this.#blockReferences.clear();
-    this.#tableBlockReferences.clear();
   }
 
   *tableValues(tableId: string): IterableIterator<SegmentRecord> {
@@ -596,15 +597,22 @@ export class SegmentRecordMap extends OrderedRecordMap<string, SegmentRecord> {
   }
 
   blockReferenceCount(blockId: string): number {
-    return this.#blockReferences.get(blockId) ?? 0;
+    const segments = this.#byBlock.get(blockId);
+    return segments === undefined ? 0 : typeof segments === "string" ? 1 : segments.size;
   }
 
   tableBlockReferenceCount(tableId: string, blockId: string): number {
-    return this.#tableBlockReferences.get(tableId)?.get(blockId) ?? 0;
+    let count = 0;
+    for (const id of this.segmentIdsForBlock(blockId)) {
+      if (this.get(id)?.tableId === tableId) count += 1;
+    }
+    return count;
   }
 
   segmentIdsForBlock(blockId: string): ReadonlySet<string> {
-    return this.#byBlock.get(blockId) ?? EMPTY_STRING_SET;
+    const segments = this.#byBlock.get(blockId);
+    if (segments === undefined) return EMPTY_STRING_SET;
+    return typeof segments === "string" ? new Set([segments]) : segments;
   }
 
   ownerReferenceCount(transactionId: string): number {
@@ -619,27 +627,35 @@ export class SegmentRecordMap extends OrderedRecordMap<string, SegmentRecord> {
 
   #addReferences(record: SegmentRecord): void {
     addSetReference(this.#byOwner, record.transactionId, record.id);
-    let table = this.#tableBlockReferences.get(record.tableId);
-    if (table === undefined) {
-      table = new Map();
-      this.#tableBlockReferences.set(record.tableId, table);
-    }
-    for (const blockId of segmentBlockIds(record)) {
-      updateReferenceCount(this.#blockReferences, blockId, 1);
-      updateReferenceCount(table, blockId, 1);
-      addSetReference(this.#byBlock, blockId, record.id);
+    // A block a segment names twice is still one reference: adding an id already present is a
+    // no-op, so the block map needs no de-duplicating copy.
+    for (const blockIds of Object.values(record.columnBlockIds)) {
+      for (const blockId of blockIds) {
+        const segments = this.#byBlock.get(blockId);
+        if (segments === undefined) this.#byBlock.set(blockId, record.id);
+        else if (typeof segments !== "string") segments.add(record.id);
+        else if (segments !== record.id) this.#byBlock.set(blockId, new Set([segments, record.id]));
+      }
     }
   }
 
   #removeReferences(record: SegmentRecord): void {
     deleteSetReference(this.#byOwner, record.transactionId, record.id);
-    const table = this.#tableBlockReferences.get(record.tableId);
-    for (const blockId of segmentBlockIds(record)) {
-      updateReferenceCount(this.#blockReferences, blockId, -1);
-      if (table !== undefined) updateReferenceCount(table, blockId, -1);
-      deleteSetReference(this.#byBlock, blockId, record.id);
+    for (const blockIds of Object.values(record.columnBlockIds)) {
+      for (const blockId of blockIds) {
+        const segments = this.#byBlock.get(blockId);
+        if (segments === record.id) {
+          this.#byBlock.delete(blockId);
+        } else if (typeof segments === "object") {
+          segments.delete(record.id);
+          if (segments.size === 1) {
+            for (const remaining of segments) this.#byBlock.set(blockId, remaining);
+          } else if (segments.size === 0) {
+            this.#byBlock.delete(blockId);
+          }
+        }
+      }
     }
-    if (table?.size === 0) this.#tableBlockReferences.delete(record.tableId);
   }
 }
 
