@@ -10,8 +10,16 @@ export function wellFormedUtf8ByteLength(value: string, context = "String value"
   return measureWellFormedUtf8(value, context);
 }
 
-/** Rejects strings that cannot round-trip exactly through UTF-8 persistence. */
+/** Any UTF-16 surrogate, paired or not; no `g` flag, so `test` keeps no state. */
+const SURROGATE_CODE_UNIT = /[\uD800-\uDFFF]/;
+
+/**
+ * Rejects strings that cannot round-trip exactly through UTF-8 persistence. A string with no
+ * surrogate code unit at all is well-formed, and the native scan that says so costs a tenth of
+ * the measuring loop: storage checks every id of every block and segment on each commit.
+ */
 export function assertWellFormedString(value: string, context = "String value"): void {
+  if (typeof value === "string" && !SURROGATE_CODE_UNIT.test(value)) return;
   wellFormedUtf8ByteLength(value, context);
 }
 

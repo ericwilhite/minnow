@@ -542,6 +542,17 @@ export class SegmentRecordMap extends OrderedRecordMap<string, SegmentRecord> {
 
   override set(id: string, record: SegmentRecord): this {
     const previous = this.get(id);
+    // Records are replaced, never changed in place, so a replacement sharing its predecessor's
+    // block map, owner, and table references exactly what it did — a level-zero segment taking
+    // its publication order at commit. Dropping and re-adding a reference per block for it was
+    // a fixed cost per column on every commit.
+    if (
+      previous?.columnBlockIds === record.columnBlockIds &&
+      previous.transactionId === record.transactionId &&
+      previous.tableId === record.tableId
+    ) {
+      return super.set(id, record);
+    }
     if (previous !== undefined) this.#removeReferences(previous);
     if (previous?.tableId !== record.tableId) {
       if (previous !== undefined) this.#removeFromTable(previous.tableId, id);
@@ -1567,11 +1578,11 @@ export class RecordCore {
       const previous = this.#segments.get(id);
       if (previous !== undefined) {
         count -= 1;
-        retainedBytes -= segmentRecordRetainedBytes(previous);
+        retainedBytes -= segmentRetainedBytes(previous);
       }
       if (record !== undefined) {
         count += 1;
-        retainedBytes = safeStorageSum(retainedBytes, segmentRecordRetainedBytes(record));
+        retainedBytes = safeStorageSum(retainedBytes, segmentRetainedBytes(record));
       }
     }
     if (count > MAX_SEGMENT_RECORDS) {
@@ -4175,7 +4186,7 @@ export class RecordCore {
   #validateStagedSegment(
     segment: SegmentRecord,
     transactionId: string,
-    journalBlockIds: ReadonlySet<string>,
+    journalBlockIds: { has(id: string): boolean },
   ): void {
     if (segment.transactionId !== transactionId) {
       throw new Error(`Segment ${segment.id} belongs to another transaction`);
@@ -4505,8 +4516,13 @@ export class RecordCore {
       }
       base = current;
     }
-    const pendingBlockIds = [...base.pendingBlockIds, ...blocks.keys()];
-    const pendingSegmentIds = [...base.pendingSegmentIds, ...segments.keys()];
+    // A block already in the journal is a duplicate too. The journal itself was proved distinct
+    // when it was staged, so only this call's additions are checked against it; re-validating
+    // every id the journal holds cost the whole journal on each write.
+    const journalBlocks = this.#journalBlockSet(base);
+    for (const id of blocks.keys()) {
+      if (journalBlocks.has(id)) throw new Error(`Block already exists: ${id}`);
+    }
     let segmentIndex = 0;
     for (const segment of segments.values()) {
       const expectedCommitOrdinal = base.pendingSegmentIds.length + segmentIndex;
@@ -4517,11 +4533,7 @@ export class RecordCore {
       }
       segmentIndex += 1;
     }
-    const update: TransactionRecordUpdate = {
-      pendingBlockIds,
-      pendingSegmentIds,
-      updatedAt: input.committedAt,
-    };
+    let pendingTableNextRowId: bigint | undefined;
     if (base.pendingTable !== undefined) {
       let nextRowId = base.pendingTableNextRowId;
       if (nextRowId === undefined) throw new Error("Pending table row-ID state is missing");
@@ -4538,11 +4550,17 @@ export class RecordCore {
         }
         nextRowId = segment.rowIdEndExclusive;
       }
-      update.pendingTableNextRowId = nextRowId;
+      pendingTableNextRowId = nextRowId;
     }
-    assertGenericTransactionUpdateAllowed(base, update);
-    const staged = updateTransactionRecord(base, update);
-    const stagedBlockIds = new Set(staged.pendingBlockIds);
+    const staged = appendTransactionJournal(base, {
+      blockIds: [...blocks.keys()],
+      segmentIds: [...segments.keys()],
+      updatedAt: input.committedAt,
+      ...(pendingTableNextRowId === undefined ? {} : { pendingTableNextRowId }),
+    });
+    const stagedBlockIds = {
+      has: (id: string): boolean => blocks.has(id) || journalBlocks.has(id),
+    };
     for (const segment of segments.values()) {
       this.#validateStagedSegment(segment, staged.id, stagedBlockIds);
     }
@@ -4700,18 +4718,25 @@ export class RecordCore {
         removedVersion: null,
       });
     }
+    // Built once for the commit, not once per segment: a journal of many segments made this
+    // quadratic in the journal's size. Local, so a committed record keeps no set alive.
+    const journalBlocks = new Set(transaction.pendingBlockIds);
+    const columnsByTable = new Map<string, ReadonlySet<string>>();
     const pendingSegments = transaction.pendingSegmentIds.map((id) => {
       const segment = getSegment(id);
       if (segment === undefined) throw new Error(`Transaction references missing segment: ${id}`);
       if (segment.transactionId !== transaction.id) {
         throw new Error(`Segment ${id} belongs to another transaction`);
       }
-      const table =
-        this.#tables.get(segment.tableId) ??
-        (pendingTable?.id === segment.tableId ? pendingTable : undefined);
-      if (table === undefined) throw new Error(`Segment ${id} references missing table`);
-      const columns = new Set(table.columns.map((column) => column.id));
-      const journalBlocks = new Set(transaction.pendingBlockIds);
+      let columns = columnsByTable.get(segment.tableId);
+      if (columns === undefined) {
+        const table =
+          this.#tables.get(segment.tableId) ??
+          (pendingTable?.id === segment.tableId ? pendingTable : undefined);
+        if (table === undefined) throw new Error(`Segment ${id} references missing table`);
+        columns = new Set(table.columns.map((column) => column.id));
+        columnsByTable.set(segment.tableId, columns);
+      }
       for (const [columnId, blockIds] of Object.entries(segment.columnBlockIds)) {
         if (!columns.has(columnId))
           throw new Error(`Segment ${id} references unknown column: ${columnId}`);
@@ -4867,13 +4892,14 @@ export class RecordCore {
     // carries its exact level/order and keeps it — a delta merge's level-zero output included,
     // which takes the place of the run it replaces. Made once, here, so the apply publishes
     // the very records this plan accounted for.
-    const committedSegments = pendingSegments.map((segment) => ({
-      ...segment,
-      logicalOrder:
+    const committedSegments = pendingSegments.map((segment) =>
+      reorderedSegmentRecord(
+        segment,
         segment.level === 0 && compactionJob === undefined
           ? manifest.version
           : segment.logicalOrder,
-    }));
+      ),
+    );
     this.#segmentUsageAfter(committedSegments);
     const committed = updateTransactionRecord(transaction, {
       status: "committed",
@@ -6930,15 +6956,18 @@ function validateTimestampRuntime(value: unknown, label: string): asserts value 
   validateCanonicalTimestamp(value, label);
 }
 
-function validateUniqueIdsRuntime(value: unknown, label: string): string[] {
-  if (!Array.isArray(value)) throw new TypeError(`${label} must be an array`);
+function validateUniqueIdsRuntime(value: unknown, label: string | (() => string)): string[] {
+  const name = (): string => (typeof label === "string" ? label : label());
+  if (!Array.isArray(value)) throw new TypeError(`${name()} must be an array`);
   const result: string[] = [];
   for (const candidate of value as unknown[]) {
-    if (typeof candidate !== "string") throw new TypeError(`${label} must contain strings`);
+    if (typeof candidate !== "string") throw new TypeError(`${name()} must contain strings`);
     validateId(candidate);
     result.push(candidate);
   }
-  if (new Set(result).size !== result.length) throw new TypeError(`${label} contains duplicates`);
+  if (result.length > 1 && new Set(result).size !== result.length) {
+    throw new TypeError(`${name()} contains duplicates`);
+  }
   return result;
 }
 
@@ -7033,9 +7062,10 @@ export function validateSegmentRuntimeRecord(value: unknown, label: string): Seg
   }
   for (const [columnId, blockIds] of Object.entries(rawColumnBlockIds)) {
     validateId(columnId);
+    // The label is built only for a refusal: a wide table's segment names a hundred columns.
     const normalizedBlockIds = validateUniqueIdsRuntime(
       blockIds,
-      `${label} column ${columnId} blocks`,
+      () => `${label} column ${columnId} blocks`,
     );
     if (normalizedBlockIds.length === 0)
       throw new TypeError(`${label} column ${columnId} has no blocks`);
@@ -8670,6 +8700,33 @@ function collectIndexedPhysicalRoots(
     }
   }
   return { blockIds: rootedBlockIds, segmentIds: rootedSegmentIds };
+}
+
+/**
+ * Retained bytes of segment records made from a measured record by changing nothing but its
+ * logical order: a commit republishes every level-zero segment it stages with its manifest
+ * version as that order. Their canonical JSON differs only in that number's digits — JSON
+ * writes a finite number exactly as `String` does — so the size follows from the staged
+ * record's without serializing a hundred-column block map again.
+ */
+const reorderedSegmentRetainedBytes = new WeakMap<SegmentRecord, number>();
+
+export function segmentRetainedBytes(record: SegmentRecord): number {
+  return reorderedSegmentRetainedBytes.get(record) ?? segmentRecordRetainedBytes(record);
+}
+
+export function reorderedSegmentRecord(
+  segment: SegmentRecord,
+  logicalOrder: number,
+): SegmentRecord {
+  const reordered = { ...segment, logicalOrder };
+  reorderedSegmentRetainedBytes.set(
+    reordered,
+    segmentRetainedBytes(segment) -
+      String(segment.logicalOrder).length +
+      String(logicalOrder).length,
+  );
+  return reordered;
 }
 
 function segmentBlockIds(segment: SegmentRecord): string[] {
