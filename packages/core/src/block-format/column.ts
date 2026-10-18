@@ -125,14 +125,14 @@ export function encodeColumn(input: ColumnInput): {
 
 /**
  * A string column's payload: validity, offsets, then each value's UTF-8 bytes. Every value is
- * read exactly once, into a local snapshot, so the bytes written are the strings that were
- * checked even for accessor-backed input. ASCII — nearly every value in practice — is copied a
- * code unit to a byte while it is checked, into a buffer the UTF-16 length already sizes exactly,
- * with no native call per value. The first value that is not ASCII sends the column to the exact
- * encoding: measured first, both to reject unpaired surrogates (UTF-8 cannot represent them, and
- * TextEncoder would silently replace them) and to check the 64 MiB format bound before the
- * content buffer is allocated. Errors arrive in row order either way, exactly as one checking
- * pass would raise them.
+ * checked from one read of it, kept in a local snapshot, so the bytes written are the strings
+ * that were checked even for accessor-backed input; an earlier pass only sizes the buffer.
+ * ASCII — nearly every value in practice — is copied a code unit to a byte while it is checked,
+ * into a buffer the UTF-16 length already sizes exactly, with no native call per value. The
+ * first value that is not ASCII sends the column to the exact encoding: measured first, both to
+ * reject unpaired surrogates (UTF-8 cannot represent them, and TextEncoder would silently
+ * replace them) and to check the 64 MiB format bound before the content buffer is allocated.
+ * Errors arrive in row order either way, exactly as one checking pass would raise them.
  */
 function encodeStringColumn(
   values: ReadonlyArray<string | null>,

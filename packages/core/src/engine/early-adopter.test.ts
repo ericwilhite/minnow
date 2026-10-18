@@ -249,9 +249,9 @@ describe("early-adopter engine contracts", () => {
     await database.close();
   });
 
-  it("classifies a guarded batch over a history longer than a point read replays", async () => {
-    // Hundreds of single-row writes with no compaction: the guard's old-image read must replay
-    // the whole history for every key, not give up on it, and still read each row as it stands.
+  it("classifies a guarded batch over a long history of single-row writes", async () => {
+    // Hundreds of single-row writes with no compaction: the guard's old-image read replays each
+    // key's history in one pass over the segments and must read every row as it now stands.
     const database = new MinnowDatabase(new MemoryBlockStore(), {
       compression: "raw",
       autoCompact: false,
