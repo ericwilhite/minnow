@@ -124,8 +124,31 @@ Measured in memory on the same 101-column table, with the storage changes above 
 - **SQL writes without `CURRENT_*` calls** run their compiled statement as is instead of copying
   every expression on each execution: a keyed `UPDATE` of three columns is about 5% faster.
 
-Stored blocks are byte-for-byte what they were. The engine with the OPFS adapter grows by 1.6 KiB
-raw and 0.9 KiB gzipped, to 430 KiB.
+These changes leave stored blocks byte-for-byte as they were. The engine with the OPFS adapter
+grows by 1.6 KiB raw and 0.9 KiB gzipped, to 430 KiB.
+
+### Performance: a small write stores one block
+
+Measured on the same 101-column table.
+
+- **A small write to a wide table stores its columns as one block.** A commit whose columns each
+  fit one block, below the size where compression pays, and 64 KiB in all, now stores them as one
+  _packed block_: the same format-2 blocks it wrote before, back to back behind a short directory.
+  A single-row insert in memory takes 0.79 ms (1.14 ms before) and an upsert 0.72 ms (1.09 ms); on
+  OPFS 0.95 ms (1.59 ms) and 0.91 ms (1.40 ms). On IndexedDB a single-row insert makes 59 requests
+  instead of 359 and an upsert 51 instead of 352.
+- **Reads cut the columns they need out of the packed block**, and every cache above sees the same
+  blocks as before. On IndexedDB a point read of a row a single-row insert wrote takes 1.3 ms
+  instead of 5.5 ms, and reading every such row 310 ms instead of 699 ms; in memory point reads
+  are at parity. Three new gate shapes time these reads. Compaction writes ordinary
+  blocks, so folding a table leaves no packed block behind.
+- **One staging call takes up to 1,024 blocks** (`MAX_TRANSACTION_STAGE_BLOCKS`, 64 before), one per
+  column of the widest table, so a segment of a single row range stages in one call. The 64 MiB
+  limit on its bytes is unchanged.
+- **Write results count stored blocks.** `blockCount` and `storedBytes` describe what storage
+  keeps, so a packed write reports one block.
+
+The engine with the OPFS adapter grows by 15.2 KiB raw and 4.4 KiB gzipped, to 435.1 KiB.
 
 ### API changes
 
@@ -133,11 +156,25 @@ New `CatalogGenerated` type; `CatalogCheck` gains optional `columns`. `compileGe
 is no longer exported from `@minnowdb/core/schema`: it was an engine internal that returned the
 compiler's expression tree.
 
+`SegmentRecord` and `VisibleSegment` gain an optional `packedBlockId`. New storage exports:
+`PACKED_SEGMENTS`, `acceptsPackedSegments`, `segmentStoredBlockIds`, `packedSegmentMemberId`, and
+`packedSegmentShapeProblem`; the toolkit adds `packedSnapshotFrames`, `unpackedSnapshotSegment`,
+`packedSnapshotMembers`, and `packedSnapshotBlockSummary`; `@minnowdb/core/block-format` adds the
+packed block v1 functions. `MAX_TRANSACTION_STAGE_BLOCKS` is 1,024.
+
 **Migration:** code that relied on `table()` throwing for invalid expression SQL — a unit test, or
 a build-time schema check — should call `migrate()` instead, for example on a database over
-`MemoryBlockStore`.
+`MemoryBlockStore`. A custom `BlockStore` needs no change: the engine writes packed segments only to
+a store that declares `PACKED_SEGMENTS`, as the built-in stores do (see
+[custom stores](/docs/storage/custom#the-rules) to opt in). An adapter that assumed at most 64
+blocks per staging call must accept 1,024.
 
-**Stored formats:** unchanged.
+**Stored formats:** IndexedDB schema 8 and OPFS layout 13 also admit packed segments, so a 0.16.0
+database still upgrades once, by its version marker alone, automatically on open (see the
+`TIMESTAMP` entry above); 0.16.0 and older then refuse it. Packing never changes a snapshot's
+format: an export writes a packed segment's columns as ordinary blocks, so 0.16.0 imports every
+snapshot it imported before. Block format 2 is unchanged; packed block v1 is a new container of
+format-2 blocks.
 
 ## 0.16.0 — October 16, 2026
 

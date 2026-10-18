@@ -571,7 +571,12 @@ function prepareCatalogItem(value: unknown): SnapshotCatalogItem {
 function prepareSegmentItem(value: unknown): SnapshotSegmentItem {
   const item = exactRecord(value, ["kind", "record"], "Snapshot segment item");
   if (item.kind !== "segment") throw new TypeError("Snapshot segment item kind is invalid");
-  return { kind: "segment", record: normalizeSegmentRecord(item.record as never) };
+  const record = normalizeSegmentRecord(item.record as never);
+  // A snapshot carries packed segments unpacked: each member travels as an ordinary block.
+  if (record.packedBlockId !== undefined) {
+    throw new TypeError("A snapshot segment cannot name a packed block");
+  }
+  return { kind: "segment", record };
 }
 
 function prepareTransactionItem(value: unknown): SnapshotTransactionItem {

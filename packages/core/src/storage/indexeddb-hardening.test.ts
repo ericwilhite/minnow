@@ -1210,7 +1210,7 @@ describe("IndexedDB corruption hardening", () => {
         segments: [],
         updatedAt: NOW,
       }),
-    ).rejects.toThrow(/exceeds 64 blocks/);
+    ).rejects.toThrow(`exceeds ${String(MAX_TRANSACTION_STAGE_BLOCKS)} blocks`);
     const tooManySegments = Array.from({ length: MAX_TRANSACTION_STAGE_SEGMENTS + 1 }, (_, index) =>
       segment(`too-many-segment-${String(index)}`, "bounded-stage", "missing"),
     );
@@ -1239,7 +1239,7 @@ describe("IndexedDB corruption hardening", () => {
         expectedManifestVersion: null,
         committedAt: NOW,
       }),
-    ).rejects.toThrow(/exceeds 64 blocks/);
+    ).rejects.toThrow(`exceeds ${String(MAX_TRANSACTION_STAGE_BLOCKS)} blocks`);
     const { snapshotVersion: _secondSnapshot, ...freshSegments } = activeTransaction(
       "bounded-write-segments",
       null,
@@ -1281,8 +1281,10 @@ describe("IndexedDB corruption hardening", () => {
     const blockIds: string[] = [];
     const segmentIds: string[] = [];
     for (let batch = 0; batch < batchCount; batch += 1) {
-      const blocks = Array.from({ length: MAX_TRANSACTION_STAGE_BLOCKS }, (_, offset) => ({
-        id: `long-block-${String(batch * MAX_TRANSACTION_STAGE_BLOCKS + offset)}`,
+      // 64 blocks a call, as the staging limit was when this was written: the subject is the
+      // journal's length, not one call's.
+      const blocks = Array.from({ length: 64 }, (_, offset) => ({
+        id: `long-block-${String(batch * 64 + offset)}`,
         bytes: Uint8Array.of(offset & 0xff),
       }));
       const segments = blocks.slice(0, 2).map((block, offset) => ({

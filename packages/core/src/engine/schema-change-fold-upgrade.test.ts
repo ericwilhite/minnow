@@ -38,7 +38,7 @@ const MAX_LEVEL_ZERO_SEGMENTS = 4_096;
 /**
  * What this build writes. Schema 6 and layout 11 admitted these folds but were never released;
  * schema 7 and layout 12 also admit delta merges, and schema 8 and layout 13 TIMESTAMP without
- * time zone columns.
+ * time zone columns and packed segments.
  */
 const CURRENT_SCHEMA = 8;
 const CURRENT_LAYOUT = 13;

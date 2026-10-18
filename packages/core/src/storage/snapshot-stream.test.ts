@@ -8,6 +8,7 @@ import {
 } from "./types.js";
 import {
   decodeSnapshotFrameStream,
+  decodeSnapshotMetadataItems,
   decodeSnapshotMetadataPage,
   encodeSnapshotFrameStreamFooter,
   encodeSnapshotFrameStreamHeader,
@@ -88,6 +89,38 @@ async function decode(parts: readonly Uint8Array[]) {
 }
 
 describe("framed snapshot v1", () => {
+  it("refuses a segment naming a packed block: snapshots carry packed segments unpacked", () => {
+    const record = {
+      id: "segment-1",
+      tableId: "table-1",
+      transactionId: "transaction-1",
+      kind: "insert",
+      level: 0,
+      logicalOrder: 0,
+      commitOrdinal: 0,
+      rowCount: 1,
+      rowIdStart: 1n,
+      rowIdEndExclusive: 2n,
+      rowIdSpans: [],
+      columnBlockIds: { value: ["segment-1\u0000value"] },
+      createdAt: "2026-10-18T12:00:00.000Z",
+    };
+    expect(
+      decodeSnapshotMetadataItems(
+        "segment-page",
+        encodeSnapshotMetadataPage([{ kind: "segment", record }]),
+      ),
+    ).toMatchObject([{ kind: "segment", record: { id: "segment-1" } }]);
+    expect(() =>
+      decodeSnapshotMetadataItems(
+        "segment-page",
+        encodeSnapshotMetadataPage([
+          { kind: "segment", record: { ...record, packedBlockId: "segment-1" } },
+        ]),
+      ),
+    ).toThrow(/cannot name a packed block/);
+  });
+
   it("round-trips deterministic metadata and raw block frames", async () => {
     const metadata = encodeSnapshotMetadataPage([
       {

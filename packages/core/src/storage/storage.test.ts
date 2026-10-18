@@ -139,7 +139,8 @@ const frozenIndexedDbSchemas: ReadonlyArray<{
   // Schema 7 is schema 6's stores too; the version bars schema-6 readers from delta merges.
   { version: 7, writerPackageVersion: "0.16.0", install: installFrozenIndexedDbV2 },
   // Schema 8 is schema 7's stores too; the version bars schema-7 readers from a column declared
-  // TIMESTAMP without time zone. Its first writer is the release that ships it, this package.
+  // TIMESTAMP without time zone and from packed segments. Its first writer is the release that
+  // ships it, this package.
   { version: 8, writerPackageVersion: currentPackageVersion, install: installFrozenIndexedDbV2 },
 ];
 

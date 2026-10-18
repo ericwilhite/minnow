@@ -1,5 +1,27 @@
-import type { BlockStore, SegmentRecord, TransactionRecord } from "../storage/index.js";
+import { inspectPackedBlock, packedMemberBytes, packedMemberTag } from "../block-format/index.js";
+import {
+  PACKED_SEGMENTS,
+  segmentStoredBlockIds,
+  type BlockStore,
+  type SegmentRecord,
+  type TransactionRecord,
+} from "../storage/index.js";
 import type { MinnowDatabase, VisibleSegment, VisibleSegmentPageCursor } from "./database.js";
+
+/**
+ * The store as an adapter written before packed segments sees it: every method and field, but not
+ * the capability, so an engine over it writes one block per column. For tests whose subject is
+ * how ordinary blocks stage, read, or count.
+ */
+export function withoutPackedSegments<T extends BlockStore>(store: T): T {
+  return new Proxy(store, {
+    get(target, property) {
+      if (property === PACKED_SEGMENTS) return undefined;
+      const value: unknown = Reflect.get(target, property, target);
+      return typeof value === "function" ? (value.bind(target) as unknown) : value;
+    },
+  });
+}
 
 /**
  * The test timeout for a file too heavy for vitest.config.ts's 20-second local default, applied
@@ -12,6 +34,36 @@ import type { MinnowDatabase, VisibleSegment, VisibleSegmentPageCursor } from ".
  */
 export function heavyTestTimeout(localMs: number): number {
   return process.env.CI === undefined ? localMs : Math.max(localMs, 300_000);
+}
+
+/**
+ * The v2 bytes of every block a segment's columns name, keyed by id: a packed segment's members
+ * cut out of its packed block, any other segment's blocks as stored.
+ */
+export async function segmentColumnBlocks(
+  store: BlockStore,
+  segment: SegmentRecord,
+): Promise<Map<string, Uint8Array>> {
+  const blocks = new Map<string, Uint8Array>();
+  if (segment.packedBlockId !== undefined) {
+    const packed = await store.getBlock(segment.packedBlockId);
+    if (packed === undefined) throw new Error(`Expected packed block ${segment.packedBlockId}`);
+    const directory = inspectPackedBlock(packed);
+    for (const [columnId, [memberId]] of Object.entries(segment.columnBlockIds)) {
+      if (memberId === undefined) continue;
+      blocks.set(
+        memberId,
+        packedMemberBytes(packed, directory, packedMemberTag(memberId, columnId), memberId),
+      );
+    }
+    return blocks;
+  }
+  for (const id of segmentStoredBlockIds(segment)) {
+    const bytes = await store.getBlock(id);
+    if (bytes === undefined) throw new Error(`Expected block ${id}`);
+    blocks.set(id, bytes);
+  }
+  return blocks;
 }
 
 /** Exhausts the bounded public segment cursor for finite test fixtures. */

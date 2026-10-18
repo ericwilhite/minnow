@@ -1189,7 +1189,17 @@ export interface SegmentRecord {
   rowCount: number;
   rowIdStart: bigint;
   rowIdEndExclusive: bigint;
+  /**
+   * Each column's blocks, in row order. In a packed segment (`packedBlockId` set) each column
+   * names exactly one *member*: an id the engine reads out of the packed block. Members are not
+   * stored blocks — never staged, published, or collected; see `segmentStoredBlockIds`.
+   */
   columnBlockIds: Record<string, string[]>;
+  /**
+   * The one stored block holding every column of a small level-zero data segment. Written only
+   * to stores that declare `PACKED_SEGMENTS`; absent everywhere else.
+   */
+  packedBlockId?: string;
   kind: SegmentKind;
   keyColumnId?: string;
   level: number;
@@ -1204,6 +1214,74 @@ export interface SegmentRecord {
   /** Monotone policy ordinal for an immutable append-row-range level-two partition. */
   readonly partitionOrdinal?: number;
   createdAt: string;
+}
+
+/**
+ * The stored blocks a segment references: its packed block, or every block its columns name.
+ * Everything that counts, retires, roots, or checks a segment's blocks goes through this rather
+ * than `columnBlockIds`, whose members in a packed segment are not stored blocks.
+ */
+export function segmentStoredBlockIds(
+  segment: Pick<SegmentRecord, "columnBlockIds" | "packedBlockId">,
+): string[] {
+  if (segment.packedBlockId !== undefined) return [segment.packedBlockId];
+  return [...new Set(Object.values(segment.columnBlockIds).flat())];
+}
+
+/**
+ * A packed segment's member id for a column: the segment id, a NUL, then the column id. A
+ * packed block's id is its segment's id, so its members sort directly after it — which lets a
+ * snapshot export write the members in the packed block's place and stay in id order. Members
+ * are looked up, never split apart: an unpacked block's id may contain anything.
+ */
+export function packedSegmentMemberId(segmentId: string, columnId: string): string {
+  return `${segmentId}\u0000${columnId}`;
+}
+
+/**
+ * Why a segment record is not a valid packed segment, or undefined when it is one (or is not
+ * packed at all). A packed segment is a level-zero data segment whose packed block shares its
+ * id and which names, for each column, the one member `packedSegmentMemberId` gives. Columns
+ * may be absent — a dropped column takes its member with it — but the packed block stays until
+ * the segment goes.
+ */
+export function packedSegmentShapeProblem(
+  segment: Pick<
+    SegmentRecord,
+    "id" | "columnBlockIds" | "packedBlockId" | "kind" | "level" | "partitionOrdinal"
+  >,
+): string | undefined {
+  const packed: unknown = segment.packedBlockId;
+  if (packed === undefined) return undefined;
+  if (packed !== segment.id) return "a packed block must share its segment's ID";
+  if (segment.level !== 0 || segment.partitionOrdinal !== undefined) {
+    return "a packed segment must be level zero";
+  }
+  if (segment.kind === "base") return "a packed segment cannot be a base";
+  for (const [columnId, ids] of Object.entries(segment.columnBlockIds)) {
+    if (ids.length !== 1 || ids[0] !== packedSegmentMemberId(segment.id, columnId)) {
+      return "a packed segment names its one canonical member per column";
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The capability a store declares to receive packed segments: `store[PACKED_SEGMENTS] === true`.
+ * A store that declares it treats `packedBlockId` as a packed segment's only stored block
+ * everywhere it counts, retires, collects, or verifies blocks — see `segmentStoredBlockIds` —
+ * and exports packed segments unpacked in snapshots. The engine writes packed segments only to a
+ * store that declares it, so an adapter written before packed segments existed, which would
+ * count references from `columnBlockIds` and collect a live packed block, never sees one.
+ * Wrappers forward it from the store they wrap.
+ */
+export const PACKED_SEGMENTS: unique symbol = /* @__PURE__ */ Symbol.for(
+  "@minnowdb/core/packed-segments",
+);
+
+/** Whether a store declares `PACKED_SEGMENTS`. */
+export function acceptsPackedSegments(store: object): boolean {
+  return (store as { readonly [PACKED_SEGMENTS]?: unknown })[PACKED_SEGMENTS] === true;
 }
 
 export interface RowIdRange {
@@ -1361,6 +1439,11 @@ export interface CopyCompactionRewritePlan {
 
 export interface RechunkCompactionSourceBlock {
   readonly blockId: string;
+  /**
+   * The packed block `blockId` is a member of, when the source segment is packed. The job's
+   * `sourceBlockIds` hold stored blocks, so they name this instead of the member.
+   */
+  readonly packedBlockId?: string;
   readonly rowStart: number;
   readonly rowCount: number;
   /** Full persisted block byteLength, including the envelope and stored payload. */
@@ -1401,6 +1484,8 @@ export interface RechunkCompactionRewritePlan {
 
 export interface MergeCompactionSourceBlock {
   readonly blockId: string;
+  /** The packed block `blockId` is a member of; see `RechunkCompactionSourceBlock`. */
+  readonly packedBlockId?: string;
   /** Row offset within the source segment column. */
   readonly rowStart: number;
   readonly rowCount: number;
@@ -1629,6 +1714,7 @@ export interface CompactionJobRecord {
   tableId: string;
   sourceManifestVersion: number;
   sourceSegmentIds: string[];
+  /** The stored blocks the sources reference (`segmentStoredBlockIds`), which publication retires. */
   sourceBlockIds: string[];
   outputBlockIds: string[];
   cursor: CompactionJobCursor;
@@ -1775,6 +1861,10 @@ export function assertCompactionOutputProvenance(
 
   const plan = job.rewritePlan;
   if (plan.kind === "copy-v1") {
+    // Copy jobs predate packed segments and are only resumed, never planned.
+    if (sourceSegments.some((segment) => segment.packedBlockId !== undefined)) {
+      throw new Error(`Compaction job ${job.id} copies a packed segment`);
+    }
     const expectedOutputBlockIds = sourceSegments.flatMap((segment, segmentIndex) =>
       table.columns.flatMap((column, columnIndex) =>
         (segment.columnBlockIds[column.id] ?? []).map((_blockId, part) =>
@@ -1858,7 +1948,11 @@ function assertDeltaMergeSourcesMatch(
       const blockIds = stored.columnBlockIds[column.columnId];
       if (
         blockIds?.length !== column.sourceBlocks.length ||
-        blockIds.some((id, part) => column.sourceBlocks[part]?.blockId !== id)
+        blockIds.some(
+          (id, part) =>
+            column.sourceBlocks[part]?.blockId !== id ||
+            column.sourceBlocks[part].packedBlockId !== stored.packedBlockId,
+        )
       ) {
         throw new Error(`Compaction job ${jobId} source ${stored.id} blocks differ from its plan`);
       }
@@ -2018,6 +2112,8 @@ function assertCompactionSegmentFields(
     "logicalOrder",
     "commitOrdinal",
     "partitionOrdinal",
+    // Compaction output is never packed: the expected shape never carries one.
+    "packedBlockId",
   ] as const) {
     if (actual[field] !== expected[field]) {
       throw new Error(`Compaction job ${jobId} output ${actual.id} has invalid ${field}`);
@@ -2503,8 +2599,11 @@ export interface StageTransactionArtifactsInput {
   updatedAt: string;
 }
 
-/** Maximum immutable payloads accepted by one atomic staging/WAL operation. */
-export const MAX_TRANSACTION_STAGE_BLOCKS = 64;
+/**
+ * Maximum immutable payloads accepted by one atomic staging/WAL operation: one per column of the
+ * widest table, so any single-range segment stages in one call. (64 through core 0.16.)
+ */
+export const MAX_TRANSACTION_STAGE_BLOCKS = 1_024;
 /** Maximum segment records accepted by one atomic staging/WAL operation. */
 export const MAX_TRANSACTION_STAGE_SEGMENTS = 64;
 /**
@@ -4672,6 +4771,8 @@ export interface BlockStore
     MaintenanceStore,
     FtsIndexStore,
     TempSpillStore {
+  /** Present and `true` only on a store that accepts packed segments; see `PACKED_SEGMENTS`. */
+  readonly [PACKED_SEGMENTS]?: true;
   /**
    * Bounded builder for a postings base. Chunks stage under `buildId`; finish swaps the complete
    * generation into view atomically and prunes covered deltas. Beginning another build for the
@@ -6043,7 +6144,7 @@ function validateCompactionRewrite(record: CompactionJobRecord): void {
   if (new Set(plannedBlockIds).size !== plannedBlockIds.length) {
     throw new TypeError("A planned source block can only appear once in its source layout");
   }
-  const sortedPlannedIds = [...plannedBlockIds].sort();
+  const sortedPlannedIds = plannedSourceStoredBlockIds(plannedBlocks);
   if (
     sortedPlannedIds.length !== record.sourceBlockIds.length ||
     sortedPlannedIds.some((id, index) => id !== record.sourceBlockIds[index])
@@ -6111,6 +6212,24 @@ function validateCompactionRewrite(record: CompactionJobRecord): void {
 }
 
 /**
+ * The sorted stored blocks a plan's source blocks live in: a packed member's packed block, any
+ * other block itself. A packed block appears once however many of its members the plan reads,
+ * and no member may also be a stored source block.
+ */
+function plannedSourceStoredBlockIds(
+  blocks: ReadonlyArray<{ readonly blockId: string; readonly packedBlockId?: string }>,
+): string[] {
+  const stored = new Set<string>();
+  for (const block of blocks) stored.add(block.packedBlockId ?? block.blockId);
+  for (const block of blocks) {
+    if (block.packedBlockId !== undefined && stored.has(block.blockId)) {
+      throw new TypeError("A packed source member cannot also be a stored source block");
+    }
+  }
+  return [...stored].sort();
+}
+
+/**
  * A delta merge writes its whole output in one step, so its record is either untouched or done:
  * no output and the source cursor at the start, or every output block and the cursor past the
  * last source. It holds no memory reservation, writes level zero, and its source accounting is
@@ -6141,7 +6260,7 @@ function validateDeltaMergeRewrite(
   const plannedBlocks = plan.sourceSegments.flatMap((segment) =>
     segment.columns.flatMap((column) => column.sourceBlocks),
   );
-  const plannedBlockIds = plannedBlocks.map((block) => block.blockId).sort();
+  const plannedBlockIds = plannedSourceStoredBlockIds(plannedBlocks);
   if (
     plannedBlockIds.length !== record.sourceBlockIds.length ||
     plannedBlockIds.some((id, index) => id !== record.sourceBlockIds[index])
@@ -6431,7 +6550,7 @@ function normalizeRechunkSourceColumn(
   if (!Array.isArray(sourceBlocksValue)) {
     throw new TypeError(`Rechunk source column ${String(columnIndex)} blocks must be an array`);
   }
-  const sourceBlocks = sourceBlocksValue.map((block, blockIndex) => {
+  const sourceBlocks = sourceBlocksValue.map((block: unknown, blockIndex) => {
     if (typeof block !== "object" || block === null) {
       throw new TypeError(
         `Rechunk source block ${String(columnIndex)}:${String(blockIndex)} must be an object`,
@@ -6441,6 +6560,10 @@ function normalizeRechunkSourceColumn(
       blockId: validateStorageId(
         Reflect.get(block, "blockId"),
         `Rechunk source block ${String(columnIndex)}:${String(blockIndex)} ID`,
+      ),
+      ...packedSourceBlockField(
+        block,
+        `Rechunk source block ${String(columnIndex)}:${String(blockIndex)}`,
       ),
       rowStart: nonNegativeWholeNumber(
         Reflect.get(block, "rowStart"),
@@ -6978,6 +7101,14 @@ function normalizeMergeSourceSegment(
   };
 }
 
+/** A planned source block's optional `packedBlockId`, present only when the block is a member. */
+function packedSourceBlockField(block: object, label: string): { packedBlockId?: string } {
+  const packedBlockId: unknown = Reflect.get(block, "packedBlockId");
+  return packedBlockId === undefined
+    ? {}
+    : { packedBlockId: validateStorageId(packedBlockId, `${label} packed block ID`) };
+}
+
 function normalizeMergeSourceColumn(
   value: unknown,
   segmentRowCount: number,
@@ -6992,12 +7123,13 @@ function normalizeMergeSourceColumn(
   if (!Array.isArray(sourceBlocksValue) || sourceBlocksValue.length === 0) {
     throw new TypeError(`${label} requires source blocks`);
   }
-  const sourceBlocks = sourceBlocksValue.map((block, blockIndex) => {
+  const sourceBlocks = sourceBlocksValue.map((block: unknown, blockIndex) => {
     if (typeof block !== "object" || block === null) {
       throw new TypeError(`${label} block ${String(blockIndex)} must be an object`);
     }
     return {
       blockId: validateStorageId(Reflect.get(block, "blockId"), `${label} block ID`),
+      ...packedSourceBlockField(block, `${label} block`),
       rowStart: nonNegativeWholeNumber(Reflect.get(block, "rowStart"), `${label} block row start`),
       rowCount: blockRowCount(Reflect.get(block, "rowCount"), `${label} block row count`),
       storedBytes: positiveWholeNumber(

@@ -108,11 +108,17 @@ const adapters: Array<{ name: string; open: () => Promise<BlockStore> }> = [
 ];
 
 for (const adapter of adapters) {
-  // A table wider than one staging call stages part of each write before committing it.
-  for (const extra of [0, MAX_TRANSACTION_STAGE_BLOCKS]) {
+  // A write of more blocks than one staging call takes stages part of itself before committing:
+  // here, ten rows of a 130-column table at one row per block. On IndexedDB that is thousands of
+  // fake-indexeddb records per fold; indexeddb-commit-cost.test.ts stages its part there.
+  for (const extra of adapter.name === "indexeddb" ? [0] : [0, 128]) {
     it(`${adapter.name}: the enforced level-zero count follows commits, folds, and collection (${String(extra + 2)} columns)`, async () => {
       const store = await adapter.open();
-      const db = new MinnowDatabase(store, { autoCompact: false });
+      const db = new MinnowDatabase(store, {
+        autoCompact: false,
+        ...(extra === 0 ? {} : { rowsPerBlock: 1 }),
+      });
+      if (extra !== 0) expect(10 * (extra + 2)).toBeGreaterThan(MAX_TRANSACTION_STAGE_BLOCKS);
       try {
         const wide = Array.from({ length: extra }, (_, index) => `, c${String(index)} INTEGER`);
         await db.execute(
@@ -243,16 +249,18 @@ it("indexeddb: a steady-state commit reads the same however much history is unfo
 });
 
 /**
- * A write to a table wider than one staging call's block limit stages part of its journal before
- * it commits. That stage changes no count, yet it used to discard the count the previous commit
- * carried forward, so every commit to a wide table walked every segment of the table again:
- * a run of single-row writes cost quadratically in its own length.
+ * A write of more blocks than one staging call's limit stages part of its journal before it
+ * commits. That stage changes no count, yet it used to discard the count the previous commit
+ * carried forward, so every such commit walked every segment of the table again: a run of them
+ * cost quadratically in its own length. (Through 0.16 a single row of a table wider than 64
+ * columns was such a write; here eight rows at one row per block are.)
  */
 for (const adapter of adapters.filter(({ name }) => name !== "indexeddb")) {
-  it(`${adapter.name}: a wide-table commit walks no segments however much history is unfolded`, async () => {
-    const width = MAX_TRANSACTION_STAGE_BLOCKS + 6;
+  it(`${adapter.name}: a commit that stages part of itself first walks no segments however much history is unfolded`, async () => {
+    const width = 130;
     const store = await adapter.open();
-    const db = new MinnowDatabase(store, { autoCompact: false });
+    const db = new MinnowDatabase(store, { autoCompact: false, rowsPerBlock: 1 });
+    expect(8 * (width + 1)).toBeGreaterThan(MAX_TRANSACTION_STAGE_BLOCKS);
     try {
       const columns = Array.from({ length: width }, (_, index) => `c${String(index)} INTEGER`);
       await db.execute(`CREATE TABLE t (id INTEGER PRIMARY KEY, ${columns.join(", ")})`);
@@ -270,9 +278,15 @@ for (const adapter of adapters.filter(({ name }) => name !== "indexeddb")) {
         await write();
         return recordCoreTestHooks.levelZeroSegmentsCounted - before;
       };
+      const rows = (): Array<Record<string, number>> =>
+        Array.from({ length: 8 }, () => row((next += 1)));
       const writes = [
-        () => db.insertBatch("t", [row((next += 1))]),
-        () => db.upsertBatch("t", [row(1)]),
+        () => db.insertBatch("t", rows()),
+        () =>
+          db.upsertBatch(
+            "t",
+            [1, 2, 3, 4, 5, 6, 7, 8].map((id) => row(id)),
+          ),
         () => db.execute("UPDATE t SET c3 = c3 + 1 WHERE id = ?", [2]),
         () => db.deleteBatch("t", { keys: [next] }),
       ];

@@ -89,6 +89,7 @@ import {
   assertStorageBulkReadItems,
   validateStorageId,
   assertTempRunPageBatchLimits,
+  PACKED_SEGMENTS,
   type FtsChanges,
   type UniqueKeyChanges,
 } from "./types.js";
@@ -115,6 +116,12 @@ import {
   validateTempRunPage,
   validateTempRunPageIdentity,
 } from "./toolkit/record-core.js";
+import {
+  packedSnapshotBlockSummary,
+  packedSnapshotFrames,
+  unpackedSnapshotSegment,
+  type PackedSnapshotFrame,
+} from "./toolkit/packed-snapshot.js";
 
 interface MemorySnapshotFrameExportState {
   session: SnapshotFrameExportSession;
@@ -123,6 +130,10 @@ interface MemorySnapshotFrameExportState {
   nextSequence: number;
   lastBlockId: string | null;
   lastFrame?: SnapshotFrame;
+  /** Each exported packed block's member frames, which the export writes in its place. */
+  packedFrames: Map<string, readonly PackedSnapshotFrame[]>;
+  /** The packed block whose members are being written, and the next one to write. */
+  expanding: { readonly frames: readonly PackedSnapshotFrame[]; next: number } | undefined;
 }
 
 interface SnapshotObservedSummary {
@@ -192,6 +203,8 @@ const commitTurn: () => Promise<void> = (() => {
  * (`commitTurn`), so a write loop yields to background work as it would on disk.
  */
 export class MemoryBlockStore implements BlockStore {
+  /** Packed segments are understood everywhere this store counts its blocks: RecordCore. */
+  readonly [PACKED_SEGMENTS] = true as const;
   readonly #blocks = new Map<string, Uint8Array>();
   readonly #blockChecksums = new Map<string, number>();
   #physicalBlockBytes = 0;
@@ -1144,16 +1157,30 @@ export class MemoryBlockStore implements BlockStore {
         summary.storedBytes = safeSnapshotByteSum(summary.storedBytes, payload.byteLength);
       };
       let formatVersion: SnapshotFormatVersion = 1;
+      const packedFrames = new Map<string, readonly PackedSnapshotFrame[]>();
+      const packedBlocks: Array<{ packedBytes: number; frames: readonly PackedSnapshotFrame[] }> =
+        [];
       for (const item of this.#core.snapshotFrameMetadataItems()) {
         formatVersion = withSnapshotMetadataItem(formatVersion, item);
+        const packedBlockId = item.kind === "segment" ? item.record.packedBlockId : undefined;
+        if (item.kind === "segment" && packedBlockId !== undefined) {
+          const packed = this.#blocks.get(packedBlockId);
+          if (packed === undefined) {
+            throw new StorageCorruptionError("memory", packedBlockId, "packed block is missing");
+          }
+          const frames = packedSnapshotFrames("memory", item.record, packed);
+          packedFrames.set(packedBlockId, frames);
+          packedBlocks.push({ packedBytes: packed.byteLength, frames });
+          append({ kind: "segment", record: unpackedSnapshotSegment(item.record) });
+          continue;
+        }
         append(item);
       }
       for (const item of this.#core.snapshotFramePostingItems()) append(item);
-      summaries.block = {
-        frameCount: manifest.liveBlockCount,
-        itemCount: manifest.liveBlockCount,
-        storedBytes: manifest.liveBlockBytes,
-      };
+      summaries.block = packedSnapshotBlockSummary(
+        { frameCount: manifest.liveBlockCount, storedBytes: manifest.liveBlockBytes },
+        packedBlocks,
+      );
       const header = prepareSnapshotFrameStreamHeader({
         formatVersion,
         databaseVersion: manifest.version,
@@ -1177,6 +1204,8 @@ export class MemoryBlockStore implements BlockStore {
         metadataFrames,
         nextSequence: 0,
         lastBlockId: null,
+        packedFrames,
+        expanding: undefined,
       };
       return structuredClone(session);
     });
@@ -1220,30 +1249,43 @@ export class MemoryBlockStore implements BlockStore {
       if (metadata !== undefined) {
         frame = metadata;
       } else {
-        const blockPage = this.#core.listManifestBlockPage({
-          version: state.manifestVersion,
-          afterBlockId: state.lastBlockId,
-          limit: 1,
-        });
-        const record = blockPage.records[0];
-        if (record === undefined) return undefined;
-        const bytes = this.#blocks.get(record.blockId);
-        if (bytes?.byteLength !== record.byteLength || crc32(bytes) !== record.checksum) {
-          throw new StorageCorruptionError(
-            "memory",
-            record.blockId,
-            "snapshot block disagrees with its manifest provenance",
-          );
+        // A packed block's members are written where the packed block would have gone.
+        let member = state.expanding?.frames[state.expanding.next];
+        while (member === undefined) {
+          state.expanding = undefined;
+          const blockPage = this.#core.listManifestBlockPage({
+            version: state.manifestVersion,
+            afterBlockId: state.lastBlockId,
+            limit: 1,
+          });
+          const record = blockPage.records[0];
+          if (record === undefined) return undefined;
+          const bytes = this.#blocks.get(record.blockId);
+          if (bytes?.byteLength !== record.byteLength || crc32(bytes) !== record.checksum) {
+            throw new StorageCorruptionError(
+              "memory",
+              record.blockId,
+              "snapshot block disagrees with its manifest provenance",
+            );
+          }
+          state.lastBlockId = record.blockId;
+          const frames = state.packedFrames.get(record.blockId);
+          if (frames === undefined) {
+            member = { key: record.blockId, payload: bytes, checksum: record.checksum };
+            break;
+          }
+          state.expanding = { frames, next: 0 };
+          member = frames[0];
         }
+        if (state.expanding !== undefined) state.expanding.next += 1;
         frame = {
           sequence: input.sequence,
           kind: "block",
           itemCount: 1,
-          key: record.blockId,
-          payload: bytes.slice(),
-          checksum: record.checksum,
+          key: member.key,
+          payload: member.payload.slice(),
+          checksum: member.checksum,
         };
-        state.lastBlockId = record.blockId;
       }
       state.lastFrame = copySnapshotFrame(frame);
       state.nextSequence += 1;

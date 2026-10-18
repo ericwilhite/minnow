@@ -90,7 +90,7 @@ trigger sees each statement's rows.
 
 The bounds that remain are far away. Small successive stages share one bounded local batch and
 publish in one atomic storage call; exceeding it moves artifacts into the recovery journal. One
-adapter call carries at most 64 blocks, 64 segment records, and 64 MiB of payload, and the
+adapter call carries at most 1,024 blocks, 64 segment records, and 64 MiB of payload, and the
 engine splits larger stages into as many calls as it takes. A transaction's journal itself has
 no length limit: staging costs what it stages, not what the journal already holds, in every
 adapter. What bounds an unpublished transaction is the store's aggregate quota — 512 MiB of

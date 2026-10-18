@@ -31,16 +31,16 @@ const SQL_ENGINE_MODULES =
 // Each budget is the current measurement plus a little headroom; a change that moves one updates
 // the measurement beside it, and the history lives in git.
 
-// Everything the main entry exports, bundled: the in-thread engine. 1101.3 KiB raw / 329.3 KiB gzip.
-const COMPLETE_ENTRY_RAW_BUDGET = 1102 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 330 * 1024;
-// The engine with the larger durable adapter, OPFS. 1493.9 KiB raw / 430.7 KiB gzip.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1495 * 1024;
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 431 * 1024;
+// Everything the main entry exports, bundled: the in-thread engine. 1111.5 KiB raw / 332.3 KiB gzip.
+const COMPLETE_ENTRY_RAW_BUDGET = 1112 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 333 * 1024;
+// The engine with the larger durable adapter, OPFS. 1509.1 KiB raw / 435.1 KiB gzip.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1510 * 1024;
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 436 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
-// code splitting the way Vite's default iife worker format does. 1491.4 KiB raw / 428.3 KiB gzip.
-const INDEXEDDB_WORKER_RAW_BUDGET = 1492 * 1024;
-const INDEXEDDB_WORKER_GZIP_BUDGET = 429 * 1024;
+// code splitting the way Vite's default iife worker format does. 1505.9 KiB raw / 432.6 KiB gzip.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1506 * 1024;
+const INDEXEDDB_WORKER_GZIP_BUDGET = 433 * 1024;
 // What a page that hosts the engine in a worker ships on the main thread: the client, the schema
 // DSL and error classes, the Kysely dialect and live queries, and the React hooks, with `kysely`
 // and `react` left to the application. 101.1 KiB raw / 30.1 KiB gzip.

@@ -121,7 +121,10 @@ type, and the native database fixture locks the block and snapshot containers to
 
 Writes append small **delta segments**: an update stores just the key and the changed columns, a
 delete stores a key marker. Background compaction folds deltas into larger read-friendly segments
-later. Nothing is ever edited in place.
+later. Nothing is ever edited in place. A small segment of two or more columns, below the
+compression threshold, is stored as one **packed block** — its column blocks back to back
+behind a short directory — so a single-row write to a wide table costs one stored block, not one
+per column. Reads cut the columns they need out of it; compaction writes ordinary blocks.
 
 A query reads a table with deltas by scanning the appended data and applying the deltas over it:
 deleted keys mask rows out, updated keys patch the cells they changed, and the row groups a

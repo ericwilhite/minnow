@@ -80,7 +80,9 @@ The full set:
 | `insert` / `upsert` / `update` / `delete` | Single-row convenience wrappers over the same paths. |
 
 Each returns what it did — `rowCount`, `blockCount`, `storedBytes`, and the published `version` —
-which is enough to drive a progress bar over a large load without a second query.
+which is enough to drive a progress bar over a large load without a second query. `blockCount` and
+`storedBytes` count the blocks storage keeps. A small write to a table of two or more columns
+stores all its columns as one packed block, so it reports one block, not one per column.
 
 `upsertBatch` and `upsert` accept the same target-row guard as SQL's
 `ON CONFLICT ... DO UPDATE ... WHERE`:

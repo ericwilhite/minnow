@@ -35,6 +35,9 @@ export default defineConfig({
             "apps/site/{lib,bench,components}/**/*.test.ts",
           ],
           exclude: [...configDefaults.exclude, maintenanceWorkload],
+          // `npm run test:packed`: every segment the engine can pack is packed.
+          setupFiles:
+            process.env.MINNOW_FORCE_PACKING === "1" ? ["scripts/forced-packing.setup.ts"] : [],
           // Nonzero groups also preserve this order with Vitest's single-worker shortcut.
           sequence: { groupOrder: 1 },
         },

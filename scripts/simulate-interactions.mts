@@ -8,6 +8,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { IDBFactory } from "fake-indexeddb";
+import "./lib/forced-packing.mts";
 import {
   IndexedDbBlockStore,
   MemoryBlockStore,

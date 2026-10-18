@@ -16,6 +16,9 @@ for (let slice = 1; slice < 8; slice += 1) {
   }
 }
 
+/** The byte-at-a-time CRC-32 table, for callers that hash a few bytes they never materialize. */
+export const CRC32_BYTE_TABLE: Uint32Array = TABLES.subarray(0, 256);
+
 /**
  * CRC-32 (IEEE) via slicing-by-8. Every decoded block is checksummed end to end, so this is a
  * per-query hot path: eight table folds per 8-byte word beat the byte-at-a-time loop several

@@ -31,6 +31,7 @@ import {
   VisibleSegmentCursorStaleError,
 } from "./errors.js";
 import { QueryMemoryBudgetError } from "./memory.js";
+import { withoutPackedSegments } from "./storage-test-helpers.js";
 import { TYPED_COLUMN_MIN_ROWS } from "./result-wire.js";
 import { compileQuery, compileStatement, type QueryResult } from "./query.js";
 import { column, schema, table, typedTable } from "./schema.js";
@@ -712,9 +713,11 @@ async function createWorkerWriteTable(database: MinnowDatabase): Promise<void> {
     columns: [
       { name: "id", type: "number" },
       { name: "value", type: "string" },
-      // Two stages exceed the 64-block local batch and exercise durable staging/abort. The
-      // trigger below keeps every stage per statement: without one, a scope holds its
-      // statements in a write set until something reads, checkpoints, or commits it.
+      // Two stages of ordinary blocks exceed the 64-block local batch and exercise durable
+      // staging/abort, so the tests that need that open the database without packed segments
+      // (one packed block per stage would stay local). The trigger below keeps every stage per
+      // statement: without one, a scope holds its statements in a write set until something
+      // reads, checkpoints, or commits it.
       ...Array.from({ length: 31 }, (_, index) => ({
         name: `padding_${String(index)}`,
         type: "number" as const,
@@ -1153,7 +1156,10 @@ describe("MinnowDatabaseClient", () => {
     vi.useFakeTimers();
     try {
       const store = new MemoryBlockStore();
-      const database = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
+      const database = new MinnowDatabase(withoutPackedSegments(store), {
+        autoCollect: false,
+        autoCompact: false,
+      });
       await createWorkerWriteTable(database);
       const raw = exposeRaw(database, { writeHandleIdleTimeoutMs: 10 });
       const opened = await raw.call(null, "writeOpen");
@@ -1241,7 +1247,10 @@ describe("MinnowDatabaseClient", () => {
     vi.useFakeTimers();
     try {
       const store = new PausedWorkerStageStore();
-      const database = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
+      const database = new MinnowDatabase(withoutPackedSegments(store), {
+        autoCollect: false,
+        autoCompact: false,
+      });
       await createWorkerWriteTable(database);
       const raw = exposeRaw(database, { writeHandleIdleTimeoutMs: 10 });
       const opened = await raw.call(null, "writeOpen");
@@ -1308,7 +1317,10 @@ describe("MinnowDatabaseClient", () => {
     try {
       for (const outcome of ["abort", "dispose"] as const) {
         const store = new MemoryBlockStore();
-        const database = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
+        const database = new MinnowDatabase(withoutPackedSegments(store), {
+          autoCollect: false,
+          autoCompact: false,
+        });
         await createWorkerWriteTable(database);
         const raw = exposeRaw(database, { writeHandleIdleTimeoutMs: 10 });
         const opened = await raw.call(null, "writeOpen");
@@ -1386,7 +1398,10 @@ describe("MinnowDatabaseClient", () => {
 
   it("joins an already-decided abort before worker disposal closes resources", async () => {
     const store = new PausedWorkerAbortStore();
-    const database = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
+    const database = new MinnowDatabase(withoutPackedSegments(store), {
+      autoCollect: false,
+      autoCompact: false,
+    });
     await createWorkerWriteTable(database);
     const raw = exposeRaw(database);
     const opened = await raw.call(null, "writeOpen");
@@ -1423,7 +1438,10 @@ describe("MinnowDatabaseClient", () => {
     vi.useFakeTimers();
     try {
       const store = new PausedWorkerAbortStore();
-      const database = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
+      const database = new MinnowDatabase(withoutPackedSegments(store), {
+        autoCollect: false,
+        autoCompact: false,
+      });
       await createWorkerWriteTable(database);
       const raw = exposeRaw(database, { writeHandleIdleTimeoutMs: 10 });
       const opened = await raw.call(null, "writeOpen");
@@ -1456,7 +1474,10 @@ describe("MinnowDatabaseClient", () => {
 
   it("waits for an active stage, then aborts it before worker disposal", async () => {
     const store = new PausedWorkerStageStore();
-    const database = new MinnowDatabase(store, { autoCollect: false, autoCompact: false });
+    const database = new MinnowDatabase(withoutPackedSegments(store), {
+      autoCollect: false,
+      autoCompact: false,
+    });
     await createWorkerWriteTable(database);
     const raw = exposeRaw(database);
     const opened = await raw.call(null, "writeOpen");

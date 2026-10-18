@@ -95,6 +95,7 @@ import {
   encodePhysicalBlock,
   getCompressionMemoryBound,
   inspectBlock,
+  isPackedBlock,
   maximumPhysicalBlockByteLength,
   MAX_BLOCK_METADATA_BYTE_LENGTH,
   MAX_BLOCK_ROW_COUNT,
@@ -103,8 +104,12 @@ import {
   measurePhysicalColumnRanges,
   physicalColumnByteLength,
   StoredBlockPayloadTooLargeError,
+  encodePackedBlock,
+  PACKED_BLOCK_ENTRY_LENGTH,
+  PACKED_BLOCK_HEADER_LENGTH,
   validatePhysicalColumn,
   wellFormedUtf8ByteLength,
+  type BlockDescription,
   type ColumnInput,
   type Compression,
   type DecodedColumn,
@@ -144,6 +149,18 @@ import {
 } from "./write-block-planner.js";
 import { MAX_CACHEABLE_TEXT_CHARACTERS, MAX_SQL_PARAMETERS } from "./cache-limits.js";
 import {
+  PACKED_SEGMENT_MAX_BYTES,
+  PackedMemberIndex,
+  packedMemberCandidates,
+  memberBlockBytes,
+  packedSegmentTestHooks,
+  resolvePackedBlock,
+  resolvedPackedBlockBytes,
+  unindexedMemberBytes,
+  type PackedMemberRef,
+  type ResolvedPackedBlock,
+} from "./packed-members.js";
+import {
   fillColumnDefaults,
   patchAutoIncrementValues,
   type AutoIncrementFill,
@@ -151,6 +168,9 @@ import {
 } from "./defaults.js";
 import { cachedQueryTerms, FTS_TOKENIZER_VERSION, type FtsStats } from "./fts.js";
 import {
+  acceptsPackedSegments,
+  packedSegmentMemberId,
+  segmentStoredBlockIds,
   activePostingStorageColumnIds,
   boundedMaintenanceBatchItems,
   floorWholeNumberProduct,
@@ -1092,8 +1112,11 @@ class BoundedWriteBlockStager {
 
   constructor(
     private readonly transaction: DatabaseTransaction,
-    /** Sees each block as it is accepted, so the writer can remember what it just encoded. */
-    private readonly accepted?: (block: BlockWrite) => void,
+    /**
+     * Sees each block as it is accepted, so the writer can remember what it just encoded: every
+     * member of a packed block, with the header its encoder already knows.
+     */
+    private readonly accepted?: (block: BlockWrite, description?: BlockDescription) => void,
   ) {}
 
   get earlyStageMs(): number {
@@ -1143,6 +1166,28 @@ class BoundedWriteBlockStager {
 
   pendingBlocks(): readonly BlockWrite[] {
     return this.#pending;
+  }
+
+  /** Accepts a packed block, which the caller prepared room for, and reports its members. */
+  addPacked(
+    block: BlockWrite,
+    members: ReadonlyArray<{
+      readonly id: string;
+      readonly bytes: Uint8Array;
+      readonly description: BlockDescription;
+    }>,
+  ): void {
+    if (
+      this.#pending.length >= MAX_TRANSACTION_STAGE_BLOCKS ||
+      this.#pendingBytes + block.bytes.byteLength > MAX_TRANSACTION_STAGE_BYTES
+    ) {
+      throw new Error("Write block accumulator crossed its prepared storage bound");
+    }
+    this.#pending.push(block);
+    this.#pendingBytes += block.bytes.byteLength;
+    for (const member of members) {
+      this.accepted?.({ id: member.id, bytes: member.bytes }, member.description);
+    }
   }
 
   async stageWithSegments(segments: readonly SegmentRecord[]): Promise<void> {
@@ -2477,7 +2522,10 @@ interface OpenStatementTransaction {
 export interface VisibleSegment {
   id: string;
   rowCount: number;
+  /** Each column's block ids; in a packed segment, its members (not stored blocks). */
   columnBlockIds: Readonly<Record<string, readonly string[]>>;
+  /** The one stored block of a packed segment, which holds every member. */
+  packedBlockId?: string;
 }
 
 export interface VisibleSegmentPageRecord extends VisibleSegment {
@@ -2587,11 +2635,13 @@ function queryCursorError(value: unknown, fallback = "Query cursor failed"): Err
 async function listTableSegmentsPaged(
   store: BlockStore,
   tableId: string,
+  packedMembers: PackedMemberIndex,
 ): Promise<SegmentRecord[]> {
   const records: SegmentRecord[] = [];
   let afterId: string | null = null;
   for (;;) {
     const page = await store.listTableSegmentPage(tableId, afterId, MAX_MAINTENANCE_BATCH_ITEMS);
+    packedMembers.registerAll(page.records);
     records.push(...page.records);
     if (page.nextCursor === null) return records;
     afterId = page.nextCursor;
@@ -2823,6 +2873,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   readonly #spillOwnerLeaseMs: number;
   readonly #transactionOwnerLeaseMs: number;
   readonly #createId: () => string;
+  /**
+   * Member id to packed block for every packed segment this engine has read or written, so the
+   * block-read boundary can cut members out of their packed blocks; see packed-members.ts.
+   */
+  readonly #packedMembers = new PackedMemberIndex();
+  /** Whether the store declared it accepts packed segments; nothing else is ever written one. */
+  readonly #writesPackedSegments: boolean;
   readonly #diagnostics: BackgroundDiagnostics;
   readonly #internalLeaseOwnerId: string;
   /** Shows other connections this engine is alive, so its index builds are never taken over. */
@@ -2980,6 +3037,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
     this.#now = options.now ?? (() => new Date());
     this.#createId = options.createId ?? (() => crypto.randomUUID());
+    this.#writesPackedSegments = acceptsPackedSegments(store);
     this.#diagnostics = new BackgroundDiagnostics(
       () => dateMilliseconds(this.#now()),
       options.onBackgroundError,
@@ -4103,6 +4161,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         waitedMs: encodeMs,
         storedBytes,
         blockCount,
+        packedBlockId,
       } = await this.#encodeSegmentBlocks(
         blockStager,
         `table/${table.id}/segment/${segmentId}/delete-key`,
@@ -4111,7 +4170,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         values.length,
         columnBlockIds,
         true,
-        "raw",
+        { compression: "raw", packedSegmentId: segmentId },
       );
       // Triggers fire once per row that actually exists: a requested key with no row deletes
       // nothing and must not fire a phantom all-null OLD image.
@@ -4147,6 +4206,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         rowIdStart: 0n,
         rowIdEndExclusive: 0n,
         columnBlockIds,
+        ...(packedBlockId === undefined ? {} : { packedBlockId }),
         kind: "delete",
         keyColumnId: keyColumn.id,
         level: 0,
@@ -4290,6 +4350,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         waitedMs: encodeMs,
         storedBytes,
         blockCount,
+        packedBlockId,
       } = await this.#encodeSegmentBlocks(
         blockStager,
         `table/${table.id}/segment/${segmentId}/update-column`,
@@ -4298,6 +4359,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         input.keys.length,
         columnBlockIds,
         true,
+        { packedSegmentId: segmentId },
       );
       stageSecondaryUniqueMutationChanges(transaction, table, input, preImages);
       const secondaryDeltas = await buildSecondaryUpdateDeltas(table, input, preImages);
@@ -4354,6 +4416,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         rowIdStart: 0n,
         rowIdEndExclusive: 0n,
         columnBlockIds,
+        ...(packedBlockId === undefined ? {} : { packedBlockId }),
         kind: "update",
         keyColumnId: keyColumn.id,
         level: 0,
@@ -4637,6 +4700,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         waitedMs: encodeMs,
         storedBytes,
         blockCount,
+        packedBlockId,
       } = await this.#encodeSegmentBlocks(
         blockStager,
         `table/${table.id}/segment/${segmentId}/column`,
@@ -4645,6 +4709,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         rowCount,
         columnBlockIds,
         false,
+        { packedSegmentId: segmentId },
       );
 
       const segment: SegmentRecord = {
@@ -4655,6 +4720,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         rowIdStart: rowIds.start,
         rowIdEndExclusive: rowIds.endExclusive,
         columnBlockIds,
+        ...(packedBlockId === undefined ? {} : { packedBlockId }),
         kind,
         ...(table.uniqueKeyColumnId === undefined ? {} : { keyColumnId: table.uniqueKeyColumnId }),
         level: 0,
@@ -5027,7 +5093,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   /** One coherent catalog read assembled from bounded pages under a stable epoch probe. */
   async #queryCatalogState(names: readonly string[]): Promise<QueryCatalogState> {
     const atomic = this.store.getQueryCatalogState?.bind(this.store);
-    if (atomic !== undefined) return atomic(names);
+    if (atomic !== undefined) {
+      const state = await atomic(names);
+      this.#packedMembers.registerAll(state.segments);
+      return state;
+    }
     for (;;) {
       const before = await this.store.getCatalogProbe();
       // The version is read first so the segment listing is a superset of that version's
@@ -5228,7 +5298,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     for (let offset = 0; offset < uniqueIds.length; offset += CATALOG_SEGMENT_READ_CONCURRENCY) {
       const page = uniqueIds.slice(offset, offset + CATALOG_SEGMENT_READ_CONCURRENCY);
       const listed = await Promise.all(
-        page.map((tableId) => listTableSegmentsPaged(this.store, tableId)),
+        page.map((tableId) => listTableSegmentsPaged(this.store, tableId, this.#packedMembers)),
       );
       for (const tableSegments of listed) segments.push(...tableSegments);
     }
@@ -9089,6 +9159,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           ),
         ];
         if (uncachedIds.length > 0) {
+          // A block gone since the window was read answers "it might".
           const fetched = await this.#getBlocksWindowed(uncachedIds);
           for (const [index, blockId] of uncachedIds.entries()) {
             const bytes = fetched[index];
@@ -9230,7 +9301,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const entry = (async (): Promise<LiveProofTable | undefined> => {
       const table = await this.store.getTable(tableId);
       if (table === undefined) return undefined;
-      const segments = await listTableSegmentsPaged(this.store, tableId);
+      const segments = await listTableSegmentsPaged(this.store, tableId, this.#packedMembers);
       const transactions = new Map(
         (await this.#transactionRecordsForSegments(segments)).map(
           (record) => [record.id, record] as const,
@@ -10374,7 +10445,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const segmentId = this.#createId();
     const columnBlockIds: Record<string, string[]> = {};
     const blockStager = new BoundedWriteBlockStager(transaction, this.#rememberWrittenBlock);
-    await this.#encodeSegmentBlocks(
+    const { packedBlockId } = await this.#encodeSegmentBlocks(
       blockStager,
       `table/${table.id}/segment/${segmentId}/column`,
       table.columns,
@@ -10382,6 +10453,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       rowCount,
       columnBlockIds,
       true,
+      { packedSegmentId: segmentId },
     );
     const segment: SegmentRecord = {
       id: segmentId,
@@ -10391,6 +10463,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       rowIdStart: rowIds.start,
       rowIdEndExclusive: rowIds.endExclusive,
       columnBlockIds,
+      ...(packedBlockId === undefined ? {} : { packedBlockId }),
       kind,
       ...(table.uniqueKeyColumnId === undefined ? {} : { keyColumnId: table.uniqueKeyColumnId }),
       level: 0,
@@ -10948,9 +11021,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
     const cached = byTable.get(table.id);
     if (cached !== undefined) return cached;
-    const segments = (await listTableSegmentsPaged(this.store, table.id)).filter(
-      (segment) => segment.transactionId !== transaction.id,
-    );
+    const segments = (
+      await listTableSegmentsPaged(this.store, table.id, this.#packedMembers)
+    ).filter((segment) => segment.transactionId !== transaction.id);
     const records = await this.#transactionRecordsForSegments(segments, transaction.id);
     const entry = { segments, records };
     byTable.set(table.id, entry);
@@ -12551,7 +12624,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const segmentId = this.#createId();
     const columnBlockIds: Record<string, string[]> = {};
     const blockStager = new BoundedWriteBlockStager(transaction, this.#rememberWrittenDeltaBlock);
-    await this.#encodeSegmentBlocks(
+    const { packedBlockId } = await this.#encodeSegmentBlocks(
       blockStager,
       `table/${table.id}/segment/${segmentId}/update-column`,
       [keyColumn, ...changedColumns.map((name) => findColumn(table, name))],
@@ -12559,6 +12632,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       input.keys.length,
       columnBlockIds,
       true,
+      { packedSegmentId: segmentId },
     );
     await blockStager.stageWithSegments([
       {
@@ -12569,6 +12643,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         rowIdStart: 0n,
         rowIdEndExclusive: 0n,
         columnBlockIds,
+        ...(packedBlockId === undefined ? {} : { packedBlockId }),
         kind: "update",
         keyColumnId: keyColumn.id,
         level: 0,
@@ -12591,7 +12666,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const segmentId = this.#createId();
     const blockStager = new BoundedWriteBlockStager(transaction, this.#rememberWrittenDeltaBlock);
     const columnBlockIds: Record<string, string[]> = {};
-    await this.#encodeSegmentBlocks(
+    const { packedBlockId } = await this.#encodeSegmentBlocks(
       blockStager,
       `table/${table.id}/segment/${segmentId}/delete-key`,
       [keyColumn],
@@ -12599,7 +12674,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       values.length,
       columnBlockIds,
       true,
-      "raw",
+      { compression: "raw", packedSegmentId: segmentId },
     );
     await blockStager.stageWithSegments([
       {
@@ -12610,6 +12685,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         rowIdStart: 0n,
         rowIdEndExclusive: 0n,
         columnBlockIds,
+        ...(packedBlockId === undefined ? {} : { packedBlockId }),
         kind: "delete",
         keyColumnId: keyColumn.id,
         level: 0,
@@ -18361,6 +18437,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       return this.#withLeasedSnapshot(version, async (snapshot) => {
         await this.#assertVisibleSegmentCursorTable(normalizedTableName, tableId);
         const page = await this.store.listTableSegmentPage(tableId, afterId, limit);
+        this.#packedMembers.registerAll(page.records);
         // A drop can interleave with the async physical read and remove the old table's segment
         // metadata. Check again so that race fails closed instead of returning a truncated page.
         await this.#assertVisibleSegmentCursorTable(normalizedTableName, tableId);
@@ -18385,6 +18462,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             id: segment.id,
             rowCount: segment.rowCount,
             columnBlockIds: structuredClone(segment.columnBlockIds),
+            ...(segment.packedBlockId === undefined
+              ? {}
+              : { packedBlockId: segment.packedBlockId }),
             logicalOrder: segment.logicalOrder,
             committedVersion: transactions.get(segment.transactionId)?.committedVersion ?? -1,
             commitOrdinal: segment.commitOrdinal,
@@ -19729,10 +19809,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         // for segments whose first block is absent: a live segment of a hundred-column table
         // is answered by one block rather than a hundred.
         const touches = (segment: SegmentRecord, held: ReadonlySet<string>): boolean =>
-          Object.values(segment.columnBlockIds).some((ids) => ids.some((id) => held.has(id)));
+          segment.packedBlockId === undefined
+            ? Object.values(segment.columnBlockIds).some((ids) => ids.some((id) => held.has(id)))
+            : held.has(segment.packedBlockId);
         const firstBlockIds = [
           ...new Set(
             page.records.flatMap((segment) => {
+              if (segment.packedBlockId !== undefined) return [segment.packedBlockId];
               const first = Object.values(segment.columnBlockIds).find((ids) => ids.length > 0);
               return first === undefined ? [] : [first[0] ?? ""];
             }),
@@ -19752,7 +19835,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           ...new Set(
             page.records
               .filter((segment) => !touches(segment, current))
-              .flatMap((segment) => Object.values(segment.columnBlockIds).flat())
+              .flatMap((segment) => segmentStoredBlockIds(segment))
               .filter((id) => !asked.has(id)),
           ),
         ]);
@@ -20197,6 +20280,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           maxItems,
           updatedAt: dateIsoString(this.#now()),
         });
+        // A collected packed segment's members can never be read again.
+        this.#packedMembers.forget(step.reclaimedSegmentIds);
         if (step.job.state === "completed") {
           await this.store.removePrunedManifestRecords(MAINTENANCE_JOB_PAGE_SIZE);
         }
@@ -20960,6 +21045,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           }
           sourceBlocks.push({
             blockId,
+            ...packedSourceField(segment),
             rowStart,
             rowCount: decoded.description.rowCount,
             storedBytes: bytes.byteLength,
@@ -21052,7 +21138,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       tableId: table.id,
       sourceManifestVersion: version,
       sourceSegmentIds: selected.map((segment) => segment.id),
-      sourceBlockIds: sourceBlocks.map((block) => block.blockId).sort(),
+      sourceBlockIds: [
+        ...new Set(sourceBlocks.map((block) => block.packedBlockId ?? block.blockId)),
+      ].sort(),
       outputBlockIds: [],
       cursor: { sourceSegmentIndex: 0, sourceBlockIndex: 0 },
       processedRows: 0,
@@ -21278,7 +21366,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         measuredBlockIds.add(blockId);
         blockIds.push(blockId);
         await this.#renewInternalLeaseIfNeeded(snapshot);
-        const bytes = await this.store.getBlock(blockId);
+        const bytes = await this.#readBlock(blockId);
         if (bytes === undefined) throw new Error(`Compaction source block is missing: ${blockId}`);
         total = safeWholeNumberSum([total, bytes.byteLength], "Compaction selected stored bytes");
       }
@@ -21426,7 +21514,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           continue;
         }
         await this.#renewInternalLeaseIfNeeded(snapshot);
-        const bytes = await this.store.getBlock(blockId);
+        const bytes = await this.#readBlock(blockId);
         if (bytes === undefined) throw new Error(`Compaction source block is missing: ${blockId}`);
         const decoded = await decodeBlock(bytes);
         if (decoded.column.type !== keyColumn.type) {
@@ -21453,7 +21541,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     let rowIndex = 0;
     for (const blockId of segment.columnBlockIds[keyColumn.id] ?? []) {
       await this.#renewInternalLeaseIfNeeded(snapshot);
-      const bytes = await this.store.getBlock(blockId);
+      const bytes = await this.#readBlock(blockId);
       if (bytes === undefined) throw new Error(`Compaction source block is missing: ${blockId}`);
       const decoded = await decodeBlock(bytes);
       if (decoded.column.type !== keyColumn.type) {
@@ -21514,7 +21602,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
         for (const blockId of blockIds) {
           await this.#renewInternalLeaseIfNeeded(snapshot);
-          const bytes = await this.store.getBlock(blockId);
+          const bytes = await this.#readBlock(blockId);
           if (bytes === undefined)
             throw new Error(`Compaction source block is missing: ${blockId}`);
           const description = inspectBlock(bytes);
@@ -21526,6 +21614,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           }
           sourceBlocks.push({
             blockId,
+            ...packedSourceField(segment),
             rowStart,
             rowCount: description.rowCount,
             storedBytes: bytes.byteLength,
@@ -21670,7 +21759,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         let rowStart = 0;
         for (const blockId of blockIds) {
           await this.#renewInternalLeaseIfNeeded(snapshot);
-          const bytes = await this.store.getBlock(blockId);
+          const bytes = await this.#readBlock(blockId);
           if (bytes === undefined) {
             throw new Error(`Compaction source block is missing: ${blockId}`);
           }
@@ -21684,6 +21773,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           sourceBlockIds.add(blockId);
           sourceBlocks.push({
             blockId,
+            ...packedSourceField(segment),
             rowStart,
             rowCount: description.rowCount,
             storedBytes: bytes.byteLength,
@@ -22362,6 +22452,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   ): Promise<CompactionJobProgress> {
     let job = (await this.store.getCompactionJob(initialJob.id)) ?? initialJob;
     if (job.state === "cancelled") throw new CompactionJobCancelledError(job.id);
+    // A job another connection planned names its packed sources' members only in its plan.
+    this.#registerPlannedMembers(job.rewritePlan);
     if (job.state === "aborted") {
       // An active selection can be abandoned by another coordinator before this fresh read.
       // Preserve revision evidence for that refusal; explicitly resuming an already aborted
@@ -22522,7 +22614,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             continue;
           }
 
-          const source = await this.store.getBlock(entry.sourceBlockId);
+          const source = await this.#readBlock(entry.sourceBlockId);
           if (source === undefined) {
             throw new Error(`A compaction source block is missing: ${entry.sourceBlockId}`);
           }
@@ -23171,7 +23263,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
         for (const blockId of blockIds) {
           const planned = column.sourceBlocks[blockIndex];
-          if (planned?.blockId !== blockId || planned.rowStart !== rowStart) {
+          if (
+            planned?.blockId !== blockId ||
+            planned.packedBlockId !== segment.packedBlockId ||
+            planned.rowStart !== rowStart
+          ) {
             throw new CompactionReplayMismatchError(job.id, "source layout");
           }
           rowStart += planned.rowCount;
@@ -23187,6 +23283,23 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
   }
 
+  /** Indexes the packed members a durable compaction plan reads. */
+  #registerPlannedMembers(plan: CompactionRewritePlan): void {
+    const columns =
+      plan.kind === "copy-v1"
+        ? []
+        : plan.kind === "rechunk-v1"
+          ? plan.columns
+          : plan.sourceSegments.flatMap((segment) => segment.columns);
+    for (const column of columns) {
+      for (const block of column.sourceBlocks) {
+        if (block.packedBlockId !== undefined) {
+          this.#packedMembers.registerMember(block.blockId, column.columnId, block.packedBlockId);
+        }
+      }
+    }
+  }
+
   async #loadCompactionSources(job: CompactionJobRecord): Promise<SegmentRecord[]> {
     const segments = await Promise.all(job.sourceSegmentIds.map((id) => this.store.getSegment(id)));
     const missingIndex = segments.findIndex((segment) => segment === undefined);
@@ -23195,6 +23308,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         `Compaction source segment is missing: ${job.sourceSegmentIds[missingIndex] ?? ""}`,
       );
     }
+    this.#packedMembers.registerAll(segments as SegmentRecord[]);
     return segments as SegmentRecord[];
   }
 
@@ -23204,7 +23318,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   ): Promise<void> {
     const plan = job.rewritePlan;
     const sourceIds = new Set(job.sourceSegmentIds);
-    const tableSegments = await listTableSegmentsPaged(this.store, job.tableId);
+    const tableSegments = await listTableSegmentsPaged(
+      this.store,
+      job.tableId,
+      this.#packedMembers,
+    );
     const visibleSegments = await filterSnapshotSegments(snapshot, tableSegments);
     const plannedSourceSegments = (
       await Promise.all(job.sourceSegmentIds.map((id) => this.store.getSegment(id)))
@@ -23220,11 +23338,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const page = await this.store.listSegmentPage(segmentCursor, MAINTENANCE_JOB_PAGE_SIZE);
       for (const segment of page.records) {
         if (sourceIds.has(segment.id)) continue;
-        if (
-          Object.values(segment.columnBlockIds)
-            .flat()
-            .some((blockId) => sourceBlockIds.has(blockId))
-        ) {
+        if (segmentStoredBlockIds(segment).some((blockId) => sourceBlockIds.has(blockId))) {
           throw new Error(`Concurrent segment shares a compaction source block: ${segment.id}`);
         }
       }
@@ -24016,14 +24130,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * only to read their headers cost every write a block read — an IndexedDB transaction. Block
    * ids are never reused, so a write that then fails leaves an entry nothing ever asks for.
    */
-  readonly #rememberWrittenBlock = (block: BlockWrite): void => {
+  readonly #rememberWrittenBlock = (block: BlockWrite, description?: BlockDescription): void => {
     // The zone-description family, where every reader looks: the flat `zi ` key this once used
     // was left behind when per-block artifacts moved to their own key spaces, so each write read
     // its own new blocks back again.
     this.#blockCachePut(
       ArtifactFamily.zoneDescription,
       block.id,
-      inspectBlock(block.bytes),
+      description ?? inspectBlock(block.bytes),
       ZONE_DESCRIPTION_CACHE_BYTES,
     );
   };
@@ -24037,8 +24151,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * change what the cache holds; a raw block decodes without yielding, so the entry is in place
    * long before the write commits and anything can read it.
    */
-  readonly #rememberWrittenDeltaBlock = (block: BlockWrite): void => {
-    const description = inspectBlock(block.bytes);
+  readonly #rememberWrittenDeltaBlock = (block: BlockWrite, known?: BlockDescription): void => {
+    const description = known ?? inspectBlock(block.bytes);
     this.#blockCachePut(
       ArtifactFamily.zoneDescription,
       block.id,
@@ -27847,12 +27961,151 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     return decoded;
   }
 
+  /** Block bytes by id, packed members included, 64 a round trip. */
   async #getBlocksWindowed(ids: readonly string[]): Promise<Array<Uint8Array | undefined>> {
+    return this.#readBlocks(ids, (stored) => this.#readStoredWindows(stored));
+  }
+
+  async #readStoredWindows(ids: readonly string[]): Promise<Array<Uint8Array | undefined>> {
     const blocks: Array<Uint8Array | undefined> = [];
     for (let start = 0; start < ids.length; start += 64) {
-      blocks.push(...(await this.#readBlockWindow(ids.slice(start, start + 64))));
+      blocks.push(...(await this.#readStoredBlockWindow(ids.slice(start, start + 64))));
     }
     return blocks;
+  }
+
+  /**
+   * The block-read boundary: block ids in, v2 block bytes out, where an id may be a packed
+   * segment's member. Members become reads of their packed block — one per packed block however
+   * many of its members the call names — and come back as standalone copies, so every cache and
+   * decoder above sees exactly what an unpacked segment would give it. With no packed member
+   * indexed, the call is today's read.
+   */
+  async #readBlocks(
+    ids: readonly string[],
+    readStored: (storedIds: readonly string[]) => Promise<Array<Uint8Array | undefined>>,
+  ): Promise<Array<Uint8Array | undefined>> {
+    const blocks = await this.#readBlocksOnce(ids, readStored);
+    if (!blocks.includes(undefined)) return blocks;
+    const filled = [...blocks];
+    await this.#readUnindexedMembers(ids, filled, readStored);
+    return filled;
+  }
+
+  /**
+   * Fills in the members of packed segments the index does not hold — written by another
+   * connection and not yet listed here, or dropped past the index's bound — from their ids
+   * alone: each candidate packed block is read once, and only a member its directory holds
+   * under the tag of that id and column is served. What it finds is indexed for the next read.
+   */
+  async #readUnindexedMembers(
+    ids: readonly string[],
+    blocks: Array<Uint8Array | undefined>,
+    readStored: (storedIds: readonly string[]) => Promise<Array<Uint8Array | undefined>>,
+  ): Promise<void> {
+    const wanted: Array<{ index: number; packedBlockId: string; columnId: string }> = [];
+    for (const [index, id] of ids.entries()) {
+      if (blocks[index] !== undefined || this.#packedMembers.lookup(id) !== undefined) continue;
+      for (const candidate of packedMemberCandidates(id)) wanted.push({ index, ...candidate });
+    }
+    if (wanted.length === 0) return;
+    const resolved = new Map<string, ResolvedPackedBlock | undefined>();
+    const uncached: string[] = [];
+    for (const { packedBlockId } of wanted) {
+      if (resolved.has(packedBlockId)) continue;
+      const cached = this.#blockCacheGet(ArtifactFamily.packedBlock, packedBlockId) as
+        ResolvedPackedBlock | undefined;
+      resolved.set(packedBlockId, cached);
+      if (cached === undefined) uncached.push(packedBlockId);
+    }
+    const fetched = uncached.length === 0 ? [] : await readStored(uncached);
+    for (const [at, packedBlockId] of uncached.entries()) {
+      const bytes = fetched[at];
+      if (bytes === undefined || !isPackedBlock(bytes)) continue;
+      const block = resolvePackedBlock(bytes);
+      resolved.set(packedBlockId, block);
+      this.#blockCachePut(
+        ArtifactFamily.packedBlock,
+        packedBlockId,
+        block,
+        resolvedPackedBlockBytes(block),
+      );
+    }
+    for (const { index, packedBlockId, columnId } of wanted) {
+      const block = resolved.get(packedBlockId);
+      const memberId = ids[index] ?? "";
+      if (blocks[index] !== undefined || block === undefined) continue;
+      const bytes = unindexedMemberBytes(block, memberId, columnId);
+      if (bytes === undefined) continue;
+      if (packedSegmentTestHooks.missIsFatal) {
+        throw new Error(`Packed member was read before its segment was indexed: ${memberId}`);
+      }
+      packedSegmentTestHooks.unindexedReads += 1;
+      blocks[index] = bytes;
+      this.#packedMembers.registerMember(memberId, columnId, packedBlockId);
+    }
+  }
+
+  async #readBlocksOnce(
+    ids: readonly string[],
+    readStored: (storedIds: readonly string[]) => Promise<Array<Uint8Array | undefined>>,
+  ): Promise<Array<Uint8Array | undefined>> {
+    if (this.#packedMembers.size === 0) return readStored(ids);
+    let refs: Array<PackedMemberRef | undefined> | undefined;
+    for (const [index, id] of ids.entries()) {
+      const ref = this.#packedMembers.lookup(id);
+      if (ref === undefined) continue;
+      refs ??= new Array<PackedMemberRef | undefined>(ids.length);
+      refs[index] = ref;
+    }
+    if (refs === undefined) return readStored(ids);
+    const stored: string[] = [];
+    const storedAt = new Map<string, number>();
+    const packed = new Map<string, ResolvedPackedBlock | undefined>();
+    const want = (id: string): void => {
+      if (storedAt.has(id)) return;
+      storedAt.set(id, stored.length);
+      stored.push(id);
+    };
+    for (const [index, id] of ids.entries()) {
+      const ref = refs[index];
+      if (ref === undefined) {
+        want(id);
+      } else if (!packed.has(ref.packedBlockId)) {
+        const cached = this.#blockCacheGet(ArtifactFamily.packedBlock, ref.packedBlockId) as
+          ResolvedPackedBlock | undefined;
+        packed.set(ref.packedBlockId, cached);
+        if (cached === undefined) want(ref.packedBlockId);
+      }
+    }
+    const fetched = stored.length === 0 ? [] : await readStored(stored);
+    for (const [packedBlockId, block] of packed) {
+      if (block !== undefined) continue;
+      const bytes = fetched[storedAt.get(packedBlockId) ?? -1];
+      if (bytes === undefined) continue;
+      const resolved = resolvePackedBlock(bytes);
+      packed.set(packedBlockId, resolved);
+      this.#blockCachePut(
+        ArtifactFamily.packedBlock,
+        packedBlockId,
+        resolved,
+        resolvedPackedBlockBytes(resolved),
+      );
+    }
+    return ids.map((id, index) => {
+      const ref = refs[index];
+      if (ref === undefined) return fetched[storedAt.get(id) ?? -1];
+      const block = packed.get(ref.packedBlockId);
+      return block === undefined ? undefined : memberBlockBytes(block, ref, id);
+    });
+  }
+
+  /** One block's bytes, member or stored, for the paths that read blocks one at a time. */
+  async #readBlock(id: string): Promise<Uint8Array | undefined> {
+    const [bytes] = await this.#readBlocks([id], async (storedIds) =>
+      Promise.all(storedIds.map((storedId) => this.store.getBlock(storedId))),
+    );
+    return bytes;
   }
 
   /**
@@ -27872,11 +28125,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
     ).getBlocks;
     if (overlayRead === undefined) return this.#getBlocksWindowed(ids);
-    const blocks: Array<Uint8Array | undefined> = [];
-    for (let start = 0; start < ids.length; start += 64) {
-      blocks.push(...(await overlayRead.call(snapshot, ids.slice(start, start + 64))));
-    }
-    return blocks;
+    return this.#readBlocks(ids, async (stored) => {
+      const blocks: Array<Uint8Array | undefined> = [];
+      for (let start = 0; start < stored.length; start += 64) {
+        blocks.push(...(await overlayRead.call(snapshot, stored.slice(start, start + 64))));
+      }
+      return blocks;
+    });
   }
 
   async #manifestBlockPresence(version: number | null, ids: readonly string[]): Promise<boolean[]> {
@@ -27892,14 +28147,19 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     return present;
   }
 
+  /** One bounded read of block ids, members included; see `#getBlocksWindowed`. */
   async #readBlockWindow(ids: readonly string[]): Promise<Array<Uint8Array | undefined>> {
+    return this.#readBlocks(ids, (stored) => this.#readStoredBlockWindow(stored));
+  }
+
+  async #readStoredBlockWindow(ids: readonly string[]): Promise<Array<Uint8Array | undefined>> {
     try {
       return await this.store.getBlocks(ids);
     } catch (error) {
       if (!(error instanceof BlockReadBatchTooLargeError) || ids.length <= 1) throw error;
       const middle = ids.length >>> 1;
-      const left = await this.#readBlockWindow(ids.slice(0, middle));
-      const right = await this.#readBlockWindow(ids.slice(middle));
+      const left = await this.#readStoredBlockWindow(ids.slice(0, middle));
+      const right = await this.#readStoredBlockWindow(ids.slice(middle));
       return [...left, ...right];
     }
   }
@@ -28006,7 +28266,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   ): Promise<SegmentRecord[]> {
     const segments =
       catalog === undefined
-        ? await listTableSegmentsPaged(this.store, table.id)
+        ? await listTableSegmentsPaged(this.store, table.id, this.#packedMembers)
         : (catalog.segmentsByTable.get(table.id) ?? []);
     const transactions =
       catalog?.transactions ??
@@ -28180,8 +28440,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     rowCount: number,
     columnBlockIds: Record<string, string[]>,
     columnsInOrder: boolean,
-    compression = this.#compression,
-  ): Promise<{ waitedMs: number; storedBytes: number; blockCount: number }> {
+    options: {
+      readonly compression?: Compression;
+      /** The segment's id, when its blocks may be packed into one; see `#encodePackedSegment`. */
+      readonly packedSegmentId?: string;
+    } = {},
+  ): Promise<{
+    waitedMs: number;
+    storedBytes: number;
+    blockCount: number;
+    packedBlockId?: string;
+  }> {
+    const compression = options.compression ?? this.#compression;
     // Validation measured the batch's own string vectors already; any other — a scope's write
     // set rebuilds its vectors — is measured here once, for the range planner and the
     // stored-size bound alike, which would otherwise each measure every one of its strings.
@@ -28211,6 +28481,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       this.#rowsPerBlock,
       this.#targetBlockBytes,
     );
+    if (options.packedSegmentId !== undefined && ranges.length === 1) {
+      const packed = await this.#encodePackedSegment(
+        stager,
+        options.packedSegmentId,
+        columns,
+        planned,
+        rowCount,
+        columnBlockIds,
+        compression,
+      );
+      if (packed !== undefined) return packed;
+    }
     const groups: Array<{ blocks: PlannedWriteBlock[]; maximumBytes: number }> = [];
     let group = { blocks: [] as PlannedWriteBlock[], maximumBytes: 0 };
     for (const [index, column] of columns.entries()) {
@@ -28313,6 +28595,71 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
     while (inFlight.length > 0) await acceptOldest();
     return result;
+  }
+
+  /**
+   * Writes a small segment's columns as one packed block (see packed-members.ts), or returns
+   * undefined for `#encodeSegmentBlocks` to write ordinary blocks. A segment packs when the store
+   * declared it accepts packed segments, it has two or more columns in one row range, every
+   * column would be written raw anyway (below the gzip threshold), and the packed block stays
+   * within PACKED_SEGMENT_MAX_BYTES. Members are encoded straight into the packed block, and
+   * their headers go to the written-block callbacks without being read back.
+   */
+  async #encodePackedSegment(
+    stager: BoundedWriteBlockStager,
+    segmentId: string,
+    columns: readonly TableColumnRecord[],
+    planned: readonly WriteColumnValues[],
+    rowCount: number,
+    columnBlockIds: Record<string, string[]>,
+    compression: Compression,
+  ): Promise<
+    { waitedMs: number; storedBytes: number; blockCount: number; packedBlockId: string } | undefined
+  > {
+    if (!this.#writesPackedSegments) return undefined;
+    const forced = packedSegmentTestHooks.forcePacking;
+    if (columns.length === 0 || (columns.length < 2 && !forced)) return undefined;
+    const inputs: Array<{ memberId: string; columnId: string; column: ColumnInput }> = [];
+    const limit = forced ? MAX_TRANSACTION_STAGE_BYTES : PACKED_SEGMENT_MAX_BYTES;
+    // Headers and payloads only: a lower bound, so a segment clearly too large is refused before
+    // it is encoded. Its metadata is counted exactly once encoded, below.
+    let bound = PACKED_BLOCK_HEADER_LENGTH + PACKED_BLOCK_ENTRY_LENGTH * columns.length;
+    for (const [index, column] of columns.entries()) {
+      const plannedColumn = planned[index];
+      if (plannedColumn === undefined) throw new Error(`Write column disappeared: ${column.name}`);
+      const input = asColumnInput(column.type, plannedColumn.values as readonly BatchValue[]);
+      if (compression === "gzip" && !columnInputBytesBelow(input, GZIP_MINIMUM_INPUT_BYTES)) {
+        return undefined;
+      }
+      bound += BLOCK_HEADER_LENGTH + writeBlockPhysicalBytes(plannedColumn, 0, rowCount);
+      if (bound > limit) return undefined;
+      inputs.push({
+        memberId: packedSegmentMemberId(segmentId, column.id),
+        columnId: column.id,
+        column: input,
+      });
+    }
+    const started = performance.now();
+    const encoded = encodePackedBlock(inputs);
+    if (encoded === undefined || encoded.bytes.byteLength > limit) return undefined;
+    const waitedMs = performance.now() - started;
+    await stager.prepareBatch(1, encoded.bytes.byteLength);
+    stager.addPacked(
+      { id: segmentId, bytes: encoded.bytes },
+      encoded.members.map((member) => ({
+        id: member.memberId,
+        bytes: encoded.bytes.subarray(member.offset, member.offset + member.length),
+        description: member.description,
+      })),
+    );
+    for (const { memberId, columnId } of inputs) columnBlockIds[columnId] = [memberId];
+    this.#packedMembers.registerPacked(segmentId, columnBlockIds);
+    return {
+      waitedMs,
+      storedBytes: encoded.bytes.byteLength,
+      blockCount: 1,
+      packedBlockId: segmentId,
+    };
   }
 
   /**
@@ -33970,10 +34317,14 @@ function isActiveCompactionState(state: CompactionJobState): boolean {
   return state === "planned" || state === "running" || state === "ready";
 }
 
+/** The stored blocks of a set of segments, sorted: what a compaction of them retires. */
 function uniqueSegmentBlockIds(segments: readonly SegmentRecord[]): string[] {
-  return [
-    ...new Set(segments.flatMap((segment) => Object.values(segment.columnBlockIds).flat())),
-  ].sort();
+  return [...new Set(segments.flatMap((segment) => segmentStoredBlockIds(segment)))].sort();
+}
+
+/** A planned source block's `packedBlockId`, when its segment is packed. */
+function packedSourceField(segment: SegmentRecord): { packedBlockId?: string } {
+  return segment.packedBlockId === undefined ? {} : { packedBlockId: segment.packedBlockId };
 }
 
 function compactionBlockEntries(
@@ -34593,12 +34944,8 @@ interface PlannedWriteBlock {
 }
 
 /** Conservative complete stored-byte bound used to flush an accumulator before encoding. */
-function maximumWriteBlockStoredBytes(
-  column: WriteColumnValues,
-  start: number,
-  end: number,
-  compression: Compression,
-): number {
+/** The physical (uncompressed) payload bytes of one write block's rows. */
+function writeBlockPhysicalBytes(column: WriteColumnValues, start: number, end: number): number {
   let stringBytes = 0;
   if (column.type === "string") {
     for (let index = start; index < end; index += 1) {
@@ -34608,7 +34955,16 @@ function maximumWriteBlockStoredBytes(
       stringBytes += column.stringByteLengths?.[index] ?? wellFormedUtf8ByteLength(value);
     }
   }
-  const physicalBytes = physicalColumnByteLength(column.type, end - start, stringBytes);
+  return physicalColumnByteLength(column.type, end - start, stringBytes);
+}
+
+function maximumWriteBlockStoredBytes(
+  column: WriteColumnValues,
+  start: number,
+  end: number,
+  compression: Compression,
+): number {
+  const physicalBytes = writeBlockPhysicalBytes(column, start, end);
   const storedPayloadBytes =
     compression === "gzip"
       ? Math.max(physicalBytes, getCompressionMemoryBound("gzip", physicalBytes).maximumOutputBytes)
@@ -34640,15 +34996,11 @@ async function filterSnapshotSegments(
   snapshot: Snapshot,
   segments: readonly SegmentRecord[],
 ): Promise<SegmentRecord[]> {
-  const blockIds = [
-    ...new Set(segments.flatMap((segment) => Object.values(segment.columnBlockIds).flat())),
-  ];
+  const blockIds = [...new Set(segments.flatMap((segment) => segmentStoredBlockIds(segment)))];
   const membership = await snapshot.hasBlocks(blockIds);
   const visibleBlockIds = new Set(blockIds.filter((_blockId, index) => membership[index] === true));
   return segments.filter((segment) =>
-    Object.values(segment.columnBlockIds)
-      .flat()
-      .every((blockId) => visibleBlockIds.has(blockId)),
+    segmentStoredBlockIds(segment).every((blockId) => visibleBlockIds.has(blockId)),
   );
 }
 

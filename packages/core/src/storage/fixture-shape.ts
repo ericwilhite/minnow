@@ -26,6 +26,7 @@
  */
 import { MinnowDatabase } from "../engine/database.js";
 import { MemoryBlockStore } from "./memory.js";
+import { PACKED_SEGMENTS, type BlockStore } from "./types.js";
 import { mulberry32 } from "../testing/seeds.js";
 
 /** Stable clock and ID source shared by the fixture writer and its writer-shape regression. */
@@ -203,12 +204,31 @@ export const FIXTURE_QUERIES: readonly string[] = [
   "SELECT r.region, COUNT(*) AS n FROM records r JOIN keyless k ON r.region = k.label GROUP BY r.region ORDER BY r.region",
 ];
 
-/** Builds the deterministic logical writer artifact frozen by the current-version fixture. */
-export async function createFormatFixtureArtifact(): Promise<{
+/**
+ * Builds the deterministic logical writer artifact frozen by the current-version fixture.
+ *
+ * `packed: false` (the frozen artifact) builds the database over a store that does not accept
+ * packed segments, so every commit writes one block per column, as the build that froze the
+ * fixture did. A snapshot never carries a packed block — an export writes a packed segment's
+ * members as ordinary blocks under their member ids — so the format is the same either way;
+ * `packed: true` builds the one a current store writes, which the compatibility test imports
+ * and checks for exactly that.
+ */
+export async function createFormatFixtureArtifact(options: { packed?: boolean } = {}): Promise<{
   bytes: Uint8Array;
   expectations: Array<{ sql: string; rows: unknown }>;
 }> {
-  const store = new MemoryBlockStore();
+  const memory = new MemoryBlockStore();
+  const store: BlockStore =
+    options.packed === true
+      ? memory
+      : new Proxy(memory, {
+          get(target, property) {
+            if (property === PACKED_SEGMENTS) return undefined;
+            const value: unknown = Reflect.get(target, property, target);
+            return typeof value === "function" ? (value.bind(target) as unknown) : value;
+          },
+        });
   const database = new MinnowDatabase(store, {
     rowsPerBlock: 64,
     autoCompact: false,

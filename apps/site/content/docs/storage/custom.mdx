@@ -78,7 +78,9 @@ uncollectable orphan or a journal pointing at missing data.
 
 Keep each staging call within the exported `MAX_TRANSACTION_STAGE_BLOCKS`,
 `MAX_TRANSACTION_STAGE_SEGMENTS`, and `MAX_TRANSACTION_STAGE_BYTES` limits, checked before opening
-a write transaction. The engine splits larger writes into resumable batches; the per-call ceiling
+a write transaction. `MAX_TRANSACTION_STAGE_BLOCKS` is 1,024, one per column of the widest table,
+so a single-range segment stages in one call; it was 64 through core 0.16, and an adapter that
+sized a buffer or a request batch for 64 must accept the larger call. The engine splits larger writes into resumable batches; the per-call ceiling
 prevents one caller from creating an unbounded storage transaction. A transaction's journal itself
 has no fixed length: only the aggregate staged-artifact quotas bound it, so an adapter must not
 rewrite or re-verify the whole journal on every staging call — append to it, and validate what
@@ -233,6 +235,30 @@ Each snapshot direction is one complete capability: begin/read/close frame expor
 begin/renew/append/finish/cancel frame import. Do not expose a partial family. Export must pin one
 version and page all six frame kinds; import must compare same-sequence replay bytes and publish
 only after the footer totals and rolling checksum match. See [Snapshots](/docs/storage/snapshots).
+
+**Packed segments are opt-in.** A small commit to a table of two or more columns can store all
+its columns as one _packed block_: the segment record names it with `packedBlockId` (equal to the
+segment's own ID), and each column's `columnBlockIds` entry names one member of it, the segment ID,
+a NUL, then the column ID. Members are not stored blocks; `getBlock` of a member ID returns
+`undefined`, and the engine cuts members out of the packed block itself. The engine writes packed
+segments only to a store that declares `store[PACKED_SEGMENTS] === true` — test with
+`acceptsPackedSegments(store)` — so an adapter written before them, which would count references
+from `columnBlockIds` and collect a live packed block, never receives one. To declare it:
+
+- Count, retire, collect, and verify a segment's blocks through `segmentStoredBlockIds(segment)`,
+  everywhere: it returns `[packedBlockId]` for a packed segment and the `columnBlockIds` blocks
+  otherwise. A packed segment keeps its packed block for as long as the segment lives, whatever
+  columns `DROP COLUMN` removes.
+- Store and return `packedBlockId` like any other field, and refuse a record that
+  `packedSegmentShapeProblem(segment)` rejects.
+- Export packed segments unpacked, so packing never changes a snapshot's format: write each member as an
+  ordinary block frame under its member ID in the packed block's place (member IDs sort directly
+  after it), and the segment record without `packedBlockId`. The toolkit's `packedSnapshotFrames`,
+  `unpackedSnapshotSegment`, and `packedSnapshotBlockSummary` do exactly this. Import never sees
+  `packedBlockId`; the shared snapshot decoder refuses one.
+
+A wrapper forwards the symbol from the store it wraps, as `FaultInjectingBlockStore` does. The
+conformance kit's packed-segment case runs only against a store that declares it.
 
 **Tabs are plural and mortal.** Several connections may open one database; readers keep a stable
 version while writers publish new versions. Physical I/O may queue. A connection can die between

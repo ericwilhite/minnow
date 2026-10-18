@@ -9,6 +9,7 @@ import { createReadStream, existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 
 import { MinnowDatabase } from "../packages/core/src/engine/index.js";
+import "./lib/forced-packing.mts";
 import { MemoryBlockStore } from "../packages/core/src/storage/index.js";
 import {
   SqlLogicFailure,

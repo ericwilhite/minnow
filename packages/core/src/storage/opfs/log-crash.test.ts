@@ -1129,7 +1129,7 @@ describe("OPFS write-ahead log crash shapes", () => {
         segments: [],
         updatedAt: "2026-08-24T00:00:01.000Z",
       }),
-    ).rejects.toThrow(/exceeds 64 blocks/);
+    ).rejects.toThrow(`exceeds ${String(MAX_TRANSACTION_STAGE_BLOCKS)} blocks`);
     expect(await store.getTransaction(transactionId)).toEqual(transactionBefore);
     expect(shim.readFileBytes(`minnowdb/${name}/wal`)).toEqual(walBefore);
     expect(shim.readFileBytes(`minnowdb/${name}/extents/000000`)).toEqual(extentBefore);
@@ -1155,7 +1155,7 @@ describe("OPFS write-ahead log crash shapes", () => {
         segments: [],
         committedAt: "2026-08-24T00:00:01.000Z",
       }),
-    ).rejects.toThrow(/exceeds 64 blocks/);
+    ).rejects.toThrow(`exceeds ${String(MAX_TRANSACTION_STAGE_BLOCKS)} blocks`);
     expect(await store.getTransaction("oversized-single-shot")).toBeUndefined();
     expect(shim.readFileBytes(`minnowdb/${name}/wal`)).toEqual(walBefore);
     expect(shim.readFileBytes(`minnowdb/${name}/extents/000000`)).toEqual(extentBefore);

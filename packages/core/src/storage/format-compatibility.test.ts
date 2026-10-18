@@ -249,11 +249,22 @@ describe("v1 format compatibility", () => {
   });
 
   it("keeps the current v1 writer canonical across native gzip encoders", async () => {
-    const frozen = fixtures.find(
-      ({ manifest }) =>
-        manifest.blockFormatVersion === BLOCK_FORMAT_VERSION &&
-        manifest.snapshotFormatVersion === SNAPSHOT_FORMAT_VERSION,
-    );
+    // The newest writer's artifact at this build's format versions: a writer change that leaves
+    // the formats alone freezes its own fixture beside the older ones (`--writer`).
+    const frozen = fixtures
+      .filter(
+        ({ manifest }) =>
+          manifest.blockFormatVersion === BLOCK_FORMAT_VERSION &&
+          manifest.snapshotFormatVersion === SNAPSHOT_FORMAT_VERSION,
+      )
+      .sort(
+        (left, right) =>
+          comparePackageVersions(
+            left.manifest.writerPackageVersion,
+            right.manifest.writerPackageVersion,
+          ) || left.stem.localeCompare(right.stem),
+      )
+      .at(-1);
     if (frozen === undefined) throw new Error("Current format fixture is missing");
     const generated = await createFormatFixtureArtifact();
     expect(await canonicalWriterArtifact(generated.bytes)).toEqual(
@@ -385,6 +396,28 @@ describe("v1 format compatibility", () => {
       );
       expect(() => inspectBlock(tampered)).toThrow(/Unsupported block version/);
     }
+  });
+});
+
+describe("packed segments in snapshots", () => {
+  it("export unpacked: ordinary blocks under member ids, at the same format version", async () => {
+    // The fixture database as a current store writes it: its small commits are packed.
+    const packed = await createFormatFixtureArtifact({ packed: true });
+    const frozen = fixtures.find(
+      ({ manifest }) => manifest.snapshotFormatVersion === SNAPSHOT_FORMAT_VERSION,
+    );
+    if (frozen === undefined) throw new Error("Current format fixture is missing");
+    expect((await readSnapshotSummary(packed.bytes)).formatVersion).toBe(SNAPSHOT_FORMAT_VERSION);
+    const payloads = await fixtureBlockPayloads(packed.bytes);
+    // Every block frame is a v2 block: no packed block ever leaves its store.
+    for (const payload of payloads) expect(inspectBlock(payload).formatVersion).toBe(2);
+    expect(normalize(packed.expectations)).toEqual(normalize(frozen.manifest.expectations));
+    const restored = await restoreFixture(packed.bytes);
+    for (const { sql, rows } of frozen.manifest.expectations) {
+      const result = await restored.query(sql, { memoize: false });
+      expect(normalize(result.rows), sql).toEqual(normalize(rows));
+    }
+    await restored.close();
   });
 });
 

@@ -13,6 +13,7 @@ import {
   MAX_ACTIVE_LEASES,
   MAX_MAINTENANCE_BATCH_ITEMS,
   MAX_INDEXED_STRING_CHARACTERS,
+  MAX_TRANSACTION_STAGE_BLOCKS,
   MAX_TRANSACTION_STAGE_BYTES,
   MemoryBlockStore,
   StorageResourceLimitError,
@@ -25,6 +26,7 @@ import {
   type RowIdSpan,
   type SegmentRecord,
   type TableRecord,
+  segmentStoredBlockIds,
 } from "../storage/index.js";
 import { FaultInjectingBlockStore } from "../testing/index.js";
 import { TransactionManager } from "../transactions/index.js";
@@ -32,7 +34,11 @@ import { QueryMemoryBudgetError } from "./memory.js";
 import { MAX_CACHEABLE_TEXT_CHARACTERS } from "./cache-limits.js";
 import { compileQuery, type QueryRow } from "./query.js";
 import { column, schema, table } from "./schema.js";
-import { allVisibleSegments } from "./storage-test-helpers.js";
+import {
+  allVisibleSegments,
+  segmentColumnBlocks,
+  withoutPackedSegments,
+} from "./storage-test-helpers.js";
 import { attachLifecycleFlush, MAX_BUFFERED_WRITER_PENDING_ADDS } from "./buffered-writer.js";
 import {
   MAX_DATABASE_ACTIVE_READS,
@@ -1931,7 +1937,7 @@ async function createMutationCompactionFixture(
     visibleSourceIds.map((segmentId) => requiredSegment(store, segmentId)),
   );
   const sourceBlockIds = [
-    ...new Set(sourceSegments.flatMap((segment) => Object.values(segment.columnBlockIds).flat())),
+    ...new Set(sourceSegments.flatMap((segment) => segmentStoredBlockIds(segment))),
   ].sort();
   const expectedRows: DatabaseRow[] = [
     { email: "b@example.com", score: 21, active: false, note: null },
@@ -1970,15 +1976,14 @@ async function compactionSourceStats(
     segmentIds.map((segmentId) => requiredSegment(store, segmentId)),
   );
   const blockIds = [
-    ...new Set(segments.flatMap((segment) => Object.values(segment.columnBlockIds).flat())),
+    ...new Set(segments.flatMap((segment) => segmentStoredBlockIds(segment))),
   ].sort();
-  const blocks = await store.getBlocks(blockIds);
+  // A plan counts each block it reads: a packed segment's members, not its packed block.
   let storedBytes = 0;
-  for (const [index, bytes] of blocks.entries()) {
-    if (bytes === undefined) {
-      throw new Error(`Expected compaction source block ${blockIds[index] ?? ""}`);
+  for (const segment of segments) {
+    for (const bytes of (await segmentColumnBlocks(store, segment)).values()) {
+      storedBytes += bytes.byteLength;
     }
-    storedBytes += bytes.byteLength;
   }
   return { blockIds, storedBytes };
 }
@@ -3687,7 +3692,8 @@ for (const implementation of implementations()) {
         requestedRowCount: 2,
         updatedRowCount: 2,
         changedColumns: ["score"],
-        blockCount: 2,
+        // The key and the changed column, packed into one stored block.
+        blockCount: 1,
         version: 1,
       });
       expect(updated.metrics.logicalBytes).toBeGreaterThan(0);
@@ -4288,10 +4294,11 @@ it("compacts append-only segments without changing current or older snapshots", 
   expect(result).toMatchObject({
     compacted: true,
     sourceSegmentCount: 2,
-    sourceBlockCount: 4,
+    // Each small source is one packed block.
+    sourceBlockCount: 2,
     outputBlockCount: 2,
     rowCount: 4,
-    supersededBlockCount: 4,
+    supersededBlockCount: 2,
     physicallyReclaimedBytes: 0,
     version: 2,
   });
@@ -4450,7 +4457,8 @@ it("physically rechunks every simple type on shared bitmap-aligned row windows",
   expect(result).toMatchObject({
     compacted: true,
     sourceSegmentCount: 3,
-    sourceBlockCount: 12,
+    // Each small source is one packed block.
+    sourceBlockCount: 3,
     outputBlockCount: 8,
     rowCount: 17,
     targetBlockBytes: 75,
@@ -4713,7 +4721,8 @@ it("refines skewed strings to exact target-sized windows before persisting the p
 
 for (const outputCompression of ["raw", "gzip"] as const) {
   it(`rewrites mixed source codecs with ${outputCompression} preferred after reopen`, async () => {
-    const store = new MemoryBlockStore();
+    // Packed blocks are raw: the subject is a mix of codecs, so the sources are ordinary blocks.
+    const store = withoutPackedSegments(new MemoryBlockStore());
     const raw = new MinnowDatabase(store, { compression: "raw", rowsPerBlock: 64 });
     await raw.createTable({
       name: "events",
@@ -6373,7 +6382,8 @@ it("canonicalizes a hostile equal logical order before rebasing a mutation merge
 });
 
 it("aborts a mutation merge before supersession when a concurrent segment aliases a source block", async () => {
-  const store = new MemoryBlockStore();
+  // A packed member is not a stored block a segment could alias: the sources are ordinary.
+  const store = withoutPackedSegments(new MemoryBlockStore());
   const fixture = await createMutationRebaseGuardFixture(store, "shared_block_merge_guard");
   const plan = fixture.job.rewritePlan;
   if (plan.kind !== "merge-v2") throw new Error("Expected a shared-block merge plan");
@@ -6421,7 +6431,8 @@ it("aborts a mutation merge before supersession when a concurrent segment aliase
 });
 
 it("aborts a mutation merge when a segment from another table aliases a global source block", async () => {
-  const store = new MemoryBlockStore();
+  // A packed member is not a stored block a segment could alias: the sources are ordinary.
+  const store = withoutPackedSegments(new MemoryBlockStore());
   const setup = new MinnowDatabase(store);
   await setup.createTable({
     name: "source_alias_owner",
@@ -8085,19 +8096,23 @@ it("stages encoded blocks early in bounded batches and aborts them after a late 
 
   await expect(
     database.insertBatch("bounded_source", {
-      columns: { value: Array.from({ length: 130 }, (_, value) => value) },
+      columns: {
+        value: Array.from({ length: 2 * MAX_TRANSACTION_STAGE_BLOCKS + 2 }, (_, value) => value),
+      },
     }),
   ).rejects.toThrow();
 
   expect(store.stagedBlockBatchSizes.length).toBeGreaterThanOrEqual(3);
-  expect(Math.max(...store.stagedBlockBatchSizes)).toBeLessThanOrEqual(64);
+  expect(Math.max(...store.stagedBlockBatchSizes)).toBeLessThanOrEqual(
+    MAX_TRANSACTION_STAGE_BLOCKS,
+  );
   expect(Math.max(...store.stagedBlockBatchBytes)).toBeLessThanOrEqual(MAX_TRANSACTION_STAGE_BYTES);
   expect(await database.readTable("bounded_source")).toEqual([]);
   expect(await database.readTable("bounded_audit")).toEqual([]);
   const aborted = await transactionRecords(store);
   expect(aborted).toHaveLength(1);
   expect(aborted[0]?.status).toBe("aborted");
-  expect(aborted[0]?.pendingBlockIds).toHaveLength(130);
+  expect(aborted[0]?.pendingBlockIds).toHaveLength(2 * MAX_TRANSACTION_STAGE_BLOCKS + 2);
   await database.close();
 });
 
@@ -9370,7 +9385,7 @@ for (const implementation of implementations()) {
     if (table === undefined || version === null) throw new Error("Expected a source snapshot");
     const source = (await tableSegmentRecords(store, table.id))[0];
     if (source === undefined) throw new Error("Expected a source segment");
-    const sourceBlockIds = Object.values(source.columnBlockIds).flat();
+    const sourceBlockIds = segmentStoredBlockIds(source);
     const sourceStoredBytes = (
       await Promise.all(sourceBlockIds.map((id) => store.getBlock(id)))
     ).reduce((total, bytes) => total + (bytes?.byteLength ?? 0), 0);

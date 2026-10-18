@@ -170,29 +170,117 @@ async function encodeValidatedPhysicalBlock(
   const storedChecksum = compression === "raw" ? logicalChecksum : crc32(stored);
 
   const output = new Uint8Array(HEADER_LENGTH + metadata.byteLength + stored.byteLength);
-  output.set(MAGIC);
-  const view = new DataView(output.buffer);
+  writeBlockEnvelope(output, 0, {
+    type: input.type,
+    compression,
+    rowCount: input.rowCount,
+    nullCount: input.nullCount,
+    metadata,
+    encodedLength: input.bytes.byteLength,
+    stored,
+    logicalChecksum,
+    storedChecksum,
+  });
+  return output;
+}
+
+/** The persisted length of a raw block with this metadata and payload. */
+export function encodedRawBlockLength(metadataLength: number, payloadLength: number): number {
+  assertMetadataLength(metadataLength);
+  assertStoredBlockPayloadByteLength(payloadLength);
+  return HEADER_LENGTH + metadataLength + payloadLength;
+}
+
+/**
+ * Writes one raw v2 block into `target` at `at` — the same bytes `encodeBlock(input, "raw")`
+ * returns — and returns the header `inspectBlock` reads back from them. Packed blocks use this
+ * to lay their members out in one buffer. The caller supplies an `encodeColumn` result and its
+ * exact `JSON.stringify` metadata bytes.
+ */
+export function writeRawBlock(
+  target: Uint8Array,
+  at: number,
+  input: {
+    readonly type: LogicalType;
+    readonly rowCount: number;
+    readonly nullCount: number;
+    readonly payload: Uint8Array;
+    readonly metadataBytes: Uint8Array;
+    readonly metadata: BlockMetadata;
+  },
+): BlockDescription {
+  const length = encodedRawBlockLength(input.metadataBytes.byteLength, input.payload.byteLength);
+  if (at < 0 || at + length > target.byteLength) throw new RangeError("Block does not fit");
+  const checksum = crc32(input.payload);
+  writeBlockEnvelope(target, at, {
+    type: input.type,
+    compression: "raw",
+    rowCount: input.rowCount,
+    nullCount: input.nullCount,
+    metadata: input.metadataBytes,
+    encodedLength: input.payload.byteLength,
+    stored: input.payload,
+    logicalChecksum: checksum,
+    storedChecksum: checksum,
+  });
+  return {
+    formatVersion: VERSION,
+    headerLength: HEADER_LENGTH,
+    metadataLength: input.metadataBytes.byteLength,
+    type: input.type,
+    compression: "raw",
+    rowCount: input.rowCount,
+    nullCount: input.nullCount,
+    encodedLength: input.payload.byteLength,
+    storedLength: input.payload.byteLength,
+    checksum,
+    storedChecksum: checksum,
+    metadata: input.metadata,
+  };
+}
+
+function writeBlockEnvelope(
+  output: Uint8Array,
+  at: number,
+  fields: {
+    readonly type: LogicalType;
+    readonly compression: Compression;
+    readonly rowCount: number;
+    readonly nullCount: number;
+    readonly metadata: Uint8Array;
+    readonly encodedLength: number;
+    readonly stored: Uint8Array;
+    readonly logicalChecksum: number;
+    readonly storedChecksum: number;
+  },
+): void {
+  output.set(MAGIC, at);
+  const view = new DataView(output.buffer, output.byteOffset + at);
   view.setUint16(8, VERSION, true);
   view.setUint16(10, HEADER_LENGTH, true);
-  view.setUint8(12, typeIds[input.type]);
-  view.setUint8(13, typeIds[input.type]); // the physical encoding mirrors the logical type
-  view.setUint8(14, codecIds[compression]);
+  view.setUint8(12, typeIds[fields.type]);
+  view.setUint8(13, typeIds[fields.type]); // the physical encoding mirrors the logical type
+  view.setUint8(14, codecIds[fields.compression]);
   view.setUint8(15, 0);
-  view.setUint32(16, input.rowCount, true);
-  view.setUint32(20, input.nullCount, true);
-  view.setUint32(24, metadata.byteLength, true);
-  view.setUint32(28, input.bytes.byteLength, true);
-  view.setUint32(32, stored.byteLength, true);
-  view.setUint32(36, logicalChecksum, true);
-  view.setUint32(40, storedChecksum, true);
-  output.set(metadata, HEADER_LENGTH);
-  output.set(stored, HEADER_LENGTH + metadata.byteLength);
+  view.setUint32(16, fields.rowCount, true);
+  view.setUint32(20, fields.nullCount, true);
+  view.setUint32(24, fields.metadata.byteLength, true);
+  view.setUint32(28, fields.encodedLength, true);
+  view.setUint32(32, fields.stored.byteLength, true);
+  view.setUint32(36, fields.logicalChecksum, true);
+  view.setUint32(40, fields.storedChecksum, true);
+  output.set(fields.metadata, at + HEADER_LENGTH);
+  output.set(fields.stored, at + HEADER_LENGTH + fields.metadata.byteLength);
   view.setUint32(
     4,
-    crc32(output.subarray(ENVELOPE_CHECKSUM_START, HEADER_LENGTH + metadata.byteLength)),
+    crc32(
+      output.subarray(
+        at + ENVELOPE_CHECKSUM_START,
+        at + HEADER_LENGTH + fields.metadata.byteLength,
+      ),
+    ),
     true,
   );
-  return output;
 }
 
 export async function decodeBlock(bytes: Uint8Array): Promise<DecodedBlock> {

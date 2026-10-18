@@ -170,6 +170,8 @@ import {
   SchemaConflictError,
   WriteConflictError,
   keyForwardsMarkerProblem,
+  packedSegmentShapeProblem,
+  segmentStoredBlockIds,
 } from "../types.js";
 import { dateIsoString } from "../../date-value.js";
 import {
@@ -553,6 +555,7 @@ export class SegmentRecordMap extends OrderedRecordMap<string, SegmentRecord> {
     // a fixed cost per column on every commit.
     if (
       previous?.columnBlockIds === record.columnBlockIds &&
+      previous.packedBlockId === record.packedBlockId &&
       previous.transactionId === record.transactionId &&
       previous.tableId === record.tableId
     ) {
@@ -628,8 +631,9 @@ export class SegmentRecordMap extends OrderedRecordMap<string, SegmentRecord> {
   #addReferences(record: SegmentRecord): void {
     addSetReference(this.#byOwner, record.transactionId, record.id);
     // A block a segment names twice is still one reference: adding an id already present is a
-    // no-op, so the block map needs no de-duplicating copy.
-    for (const blockIds of Object.values(record.columnBlockIds)) {
+    // no-op, so the block map needs no de-duplicating copy. A packed segment references its
+    // packed block alone; its members are not stored blocks.
+    for (const blockIds of storedBlockLists(record)) {
       for (const blockId of blockIds) {
         const segments = this.#byBlock.get(blockId);
         if (segments === undefined) this.#byBlock.set(blockId, record.id);
@@ -641,7 +645,7 @@ export class SegmentRecordMap extends OrderedRecordMap<string, SegmentRecord> {
 
   #removeReferences(record: SegmentRecord): void {
     deleteSetReference(this.#byOwner, record.transactionId, record.id);
-    for (const blockIds of Object.values(record.columnBlockIds)) {
+    for (const blockIds of storedBlockLists(record)) {
       for (const blockId of blockIds) {
         const segments = this.#byBlock.get(blockId);
         if (segments === record.id) {
@@ -2224,7 +2228,7 @@ export class RecordCore {
 
     const tableBlockIds = new Set(
       [...this.#segments.tableValues(input.tableId)].flatMap((segment) =>
-        Object.values(segment.columnBlockIds).flat(),
+        segmentStoredBlockIds(segment),
       ),
     );
     // Aliased payloads remain live when another table still references them.
@@ -2301,12 +2305,14 @@ export class RecordCore {
     const remainingBlockIds = new Set<string>();
     const updatedSegments = new Map<string, SegmentRecord>();
     for (const segment of this.#segments.tableValues(input.tableId)) {
-      for (const id of segment.columnBlockIds[input.columnId] ?? []) candidateBlockIds.add(id);
       const columnBlockIds = Object.fromEntries(
         Object.entries(segment.columnBlockIds).filter(([columnId]) => columnId !== input.columnId),
       );
-      for (const ids of Object.values(columnBlockIds)) {
-        for (const id of ids) remainingBlockIds.add(id);
+      // What the segment stores before and after the drop: a packed segment keeps its packed
+      // block whatever columns remain, so only an unpacked column's own blocks retire.
+      for (const id of segmentStoredBlockIds(segment)) candidateBlockIds.add(id);
+      for (const id of segmentStoredBlockIds({ ...segment, columnBlockIds })) {
+        remainingBlockIds.add(id);
       }
       if (segment.columnBlockIds[input.columnId] === undefined) continue;
       // An empty physical column map still carries the segment's row envelope. For example,
@@ -2956,7 +2962,7 @@ export class RecordCore {
     if (!owner.pendingSegmentIds.includes(id)) {
       throw new Error(`Segment ${id} is not journaled by its aborted transaction`);
     }
-    const blockIds = new Set(Object.values(segment.columnBlockIds).flat());
+    const blockIds = segmentStoredBlockIds(segment);
     for (const blockId of blockIds) {
       const provenance = this.#manifestBlocks.get(blockId);
       if (provenance !== undefined && this.#manifestBlockHasReadableVersion(provenance)) {
@@ -3047,18 +3053,18 @@ export class RecordCore {
       throw new Error(`Replacement segment differs from stored segment: ${desired.id}`);
     }
     const journalBlocks = new Set(replacement.pendingBlockIds);
-    for (const id of segmentBlockIds(desired)) {
+    for (const id of segmentStoredBlockIds(desired)) {
       if (this.#isManifestBlockVisible(replacement.snapshotVersion, id)) journalBlocks.add(id);
     }
     this.#validateStagedSegment(desired, replacement.id, journalBlocks);
-    for (const id of segmentBlockIds(desired)) {
+    for (const id of segmentStoredBlockIds(desired)) {
       if (!this.#physical.hasBlock(id))
         throw new Error(`Replacement segment block is missing: ${id}`);
     }
     if (replacement.pendingSegmentIds.includes(desired.id)) {
       throw new Error(`Replacement transaction already journals segment: ${desired.id}`);
     }
-    for (const id of segmentBlockIds(stored)) {
+    for (const id of segmentStoredBlockIds(stored)) {
       const provenance = this.#manifestBlocks.get(id);
       if (provenance !== undefined && this.#manifestBlockHasReadableVersion(provenance)) {
         throw new Error(`Segment ${stored.id} is already published`);
@@ -3540,7 +3546,7 @@ export class RecordCore {
 
   /** Every block the segment names is visible at `version` — vacuously, when it names none. */
   #segmentBlocksVisible(segment: SegmentRecord, version: number | null): boolean {
-    for (const ids of Object.values(segment.columnBlockIds)) {
+    for (const ids of storedBlockLists(segment)) {
       for (const id of ids) if (!this.#isManifestBlockVisible(version, id)) return false;
     }
     return true;
@@ -4057,7 +4063,7 @@ export class RecordCore {
       }
       // Only this segment's own blocks matter, so the check costs the segment, not the journal.
       const availableBlockIds = new Set<string>();
-      for (const id of segmentBlockIds(normalized)) {
+      for (const id of segmentStoredBlockIds(normalized)) {
         if (
           inputBlockIds.has(id) ||
           journalBlocks.has(id) ||
@@ -4151,7 +4157,7 @@ export class RecordCore {
     }
     for (const segment of this.#segments.values()) {
       if (removedSegments.has(segment.id)) continue;
-      for (const id of Object.values(segment.columnBlockIds).flat()) {
+      for (const id of segmentStoredBlockIds(segment)) {
         if (removedBlocks.has(id)) {
           throw new Error(`Transaction block is still reachable from segment ${segment.id}: ${id}`);
         }
@@ -4224,7 +4230,7 @@ export class RecordCore {
     if (segment.transactionId !== transactionId) {
       throw new Error(`Segment ${segment.id} belongs to another transaction`);
     }
-    if (segmentBlockIds(segment).length === 0) {
+    if (segmentStoredBlockIds(segment).length === 0) {
       throw new TypeError(`Segment ${segment.id} must reference at least one block`);
     }
     const owner = this.#transactions.get(transactionId);
@@ -4235,14 +4241,14 @@ export class RecordCore {
         : undefined);
     if (table === undefined) throw new Error(`Segment ${segment.id} references missing table`);
     const columns = new Set(table.columns.map((column) => column.id));
-    for (const [columnId, blockIds] of Object.entries(segment.columnBlockIds)) {
+    for (const columnId of Object.keys(segment.columnBlockIds)) {
       if (!columns.has(columnId)) {
         throw new Error(`Segment ${segment.id} references unknown column: ${columnId}`);
       }
-      for (const id of blockIds) {
-        if (!journalBlockIds.has(id)) {
-          throw new Error(`Segment ${segment.id} references block outside its transaction: ${id}`);
-        }
+    }
+    for (const id of segmentStoredBlockIds(segment)) {
+      if (!journalBlockIds.has(id)) {
+        throw new Error(`Segment ${segment.id} references block outside its transaction: ${id}`);
       }
     }
   }
@@ -4702,7 +4708,7 @@ export class RecordCore {
         if (segment.tableId !== job.tableId) {
           throw new Error(`Compaction source segment belongs to another table: ${segmentId}`);
         }
-        for (const blockId of segmentBlockIds(segment)) {
+        for (const blockId of segmentStoredBlockIds(segment)) {
           segmentSourceBlockIds.add(blockId);
           sourceReferenceCounts.set(blockId, (sourceReferenceCounts.get(blockId) ?? 0) + 1);
         }
@@ -4770,17 +4776,17 @@ export class RecordCore {
         columns = new Set(table.columns.map((column) => column.id));
         columnsByTable.set(segment.tableId, columns);
       }
-      for (const [columnId, blockIds] of Object.entries(segment.columnBlockIds)) {
+      for (const columnId of Object.keys(segment.columnBlockIds)) {
         if (!columns.has(columnId))
           throw new Error(`Segment ${id} references unknown column: ${columnId}`);
-        for (const blockId of blockIds) {
-          if (
-            (!journalBlocks.has(blockId) &&
-              !this.#isManifestBlockVisible(input.expectedManifestVersion, blockId)) ||
-            !hasBlock(blockId)
-          ) {
-            throw new Error(`Segment ${id} references unpublished block: ${blockId}`);
-          }
+      }
+      for (const blockId of segmentStoredBlockIds(segment)) {
+        if (
+          (!journalBlocks.has(blockId) &&
+            !this.#isManifestBlockVisible(input.expectedManifestVersion, blockId)) ||
+          !hasBlock(blockId)
+        ) {
+          throw new Error(`Segment ${id} references unpublished block: ${blockId}`);
         }
       }
       return segment;
@@ -5380,7 +5386,7 @@ export class RecordCore {
     const outputIds = compactionOutputSegmentIds(job);
     const referencedSegmentIds = [...job.sourceSegmentIds, ...outputIds];
     const segmentIsRooted = (segment: SegmentRecord): boolean => {
-      const ids = segmentBlockIds(segment);
+      const ids = segmentStoredBlockIds(segment);
       return (
         this.#roots.transactionSegmentCount(segment.id) > 0 ||
         this.#roots.activeOwner(segment.transactionId) ||
@@ -5756,7 +5762,7 @@ export class RecordCore {
       ) {
         continue;
       }
-      if (segmentBlockIds(record).some((id) => !this.#isManifestBlockVisible(version, id))) {
+      if (segmentStoredBlockIds(record).some((id) => !this.#isManifestBlockVisible(version, id))) {
         continue;
       }
       const table = this.#tables.get(record.tableId);
@@ -7058,6 +7064,7 @@ const SEGMENT_RECORD_FIELDS = new Set([
   "commitOrdinal",
   "rowIdSpans",
   "partitionOrdinal",
+  "packedBlockId",
   "createdAt",
 ]);
 
@@ -7137,6 +7144,11 @@ export function validateSegmentRuntimeRecord(value: unknown, label: string): Seg
   }
   if (!Number.isFinite(record.logicalOrder) || record.logicalOrder < 0) {
     throw new TypeError(`${label} logical order is invalid`);
+  }
+  if (record.packedBlockId !== undefined) {
+    validateId(record.packedBlockId);
+    const problem = packedSegmentShapeProblem(record);
+    if (problem !== undefined) throw new TypeError(`${label}: ${problem}`);
   }
   const zeroKeyedEnvelope =
     record.rowIdStart === 0n &&
@@ -7917,7 +7929,7 @@ function validateRecordCoreState(state: RecordCoreState, physical: PhysicalBlock
     }
     // Historical segment column identities are intentionally not checked against the current
     // table: metadata-only DROP COLUMN leaves immutable old bytes until compaction.
-    for (const id of Object.values(normalized.columnBlockIds).flat()) {
+    for (const id of segmentStoredBlockIds(normalized)) {
       if (!physical.hasBlock(id))
         throw new Error(`Segment ${segment.id} references missing block: ${id}`);
       const owners = segmentBlockOwners.get(id) ?? new Set<string>();
@@ -7938,7 +7950,7 @@ function validateRecordCoreState(state: RecordCoreState, physical: PhysicalBlock
     if (segment.level !== 0) continue;
     const owner = transactionsById.get(segment.transactionId);
     if (owner?.status !== "committed") continue;
-    const blockIds = segmentBlockIds(segment);
+    const blockIds = segmentStoredBlockIds(segment);
     if (blockIds.length > 0 && blockIds.some((id) => !currentBlockIds.has(id))) continue;
     const count = (visibleLevelZeroCounts.get(segment.tableId) ?? 0) + 1;
     if (count > MAX_LEVEL_ZERO_SEGMENTS) {
@@ -8699,7 +8711,7 @@ function collectIndexedPhysicalRoots(
     );
   };
   const isSegmentRoot = (segment: SegmentRecord): boolean => {
-    const ids = segmentBlockIds(segment);
+    const ids = segmentStoredBlockIds(segment);
     return (
       roots.activeTransactionSegmentCount(segment.id) > 0 ||
       roots.liveJobSegmentCount(segment.id) > 0 ||
@@ -8762,8 +8774,11 @@ export function reorderedSegmentRecord(
   return reordered;
 }
 
-function segmentBlockIds(segment: SegmentRecord): string[] {
-  return [...new Set(Object.values(segment.columnBlockIds).flat())];
+/** A segment's stored blocks as lists, for the loops that walk `columnBlockIds` shapes. */
+function storedBlockLists(segment: SegmentRecord): Iterable<readonly string[]> {
+  return segment.packedBlockId === undefined
+    ? Object.values(segment.columnBlockIds)
+    : [[segment.packedBlockId]];
 }
 
 function validateGarbageCollectionStepInput(input: RunGarbageCollectionStepInput): void {

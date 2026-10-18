@@ -2,6 +2,7 @@ import {
   isStoreUncoordinatedForTests,
   markStoreUncoordinatedForTests,
 } from "../engine/write-coordinator.js";
+import { PACKED_SEGMENTS, acceptsPackedSegments } from "../storage/types.js";
 import type {
   BlockStore,
   AdoptAbortedSegmentInput,
@@ -56,9 +57,14 @@ export class FaultInjectingBlockStore implements BlockStore {
         enumerable: true,
       });
     }
+    // The wrapped store's layout capability: the wrapper forwards every record unchanged.
+    if (acceptsPackedSegments(inner)) {
+      Object.defineProperty(this, PACKED_SEGMENTS, { value: true, enumerable: true });
+    }
   }
 
   declare readonly liveQueryChannelName?: string;
+  declare readonly [PACKED_SEGMENTS]?: true;
 
   getCatalogProbe(): Promise<CatalogProbe> {
     return this.inner.getCatalogProbe();

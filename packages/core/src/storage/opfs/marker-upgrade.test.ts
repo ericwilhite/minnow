@@ -9,11 +9,13 @@
  * keep only their key, which a layout-10 reader refuses as corruption; layout 12 admits delta
  * merges, which a layout-11 reader refuses as corruption; layout 13 admits a column declared
  * TIMESTAMP without time zone, which a layout-12 reader would render as `timestamp with time
- * zone`. For each released layout these tests use its frozen fixture and its last released
+ * zone`, and packed segments in staging frames of up to 1,024 blocks, which it would count
+ * wrongly. For each released layout these tests use its frozen fixture and its last released
  * writer — 0.12.1 for layout 7, 0.13.1 for layout 8, 0.14.1 for layout 9, 0.15.0 for layout 10
  * (also schema-change-fold-upgrade.test.ts and delta-merge-upgrade.test.ts), 0.16.0 for layout
- * 12 (timestamp-kind-upgrade.test.ts) — upgrade through the ordinary open API, keep writing,
- * reopen, and check that the released reader is refused afterwards without a byte changing.
+ * 12 (timestamp-kind-upgrade.test.ts, packed-segment-upgrade.test.ts) — upgrade through the
+ * ordinary open API, keep writing, reopen, and check that the released reader is refused
+ * afterwards without a byte changing.
  * Layout 11 was never released (0.16.0 writes layout 12), so its marker step runs over the
  * layout-10 fixture under a layout-11 marker. Every I/O boundary of the marker publication is
  * cut, by tab death and by power loss, and retried.
@@ -393,6 +395,33 @@ describe.each([
     ]);
     const reader = new MinnowDatabase(reopened, ENGINE_OPTIONS);
     expect((await reader.query(text)).rows).toEqual(expected);
+    await reader.close();
+    reopened._crashForTests();
+  });
+
+  it("writes packed segments after the upgrade, and reopens", async () => {
+    const shim = hydrate(source);
+    const store = await verifyFixture(shim, source);
+    const database = new MinnowDatabase(store, ENGINE_OPTIONS);
+    await database.execute("CREATE TABLE small (id INTEGER PRIMARY KEY, note TEXT, n INTEGER)");
+    await database.execute("INSERT INTO small VALUES (1, 'one', 10)");
+    await database.execute("INSERT INTO small VALUES (2, 'two', 20)");
+    await database.execute("UPDATE small SET n = 21 WHERE id = 2");
+    // Layout 13's record: each small commit's columns in one packed block.
+    const created = await store.getTableByName("small");
+    const segments = (await store.listTableSegmentPage(created?.id ?? "", null, 16)).records;
+    expect(segments).toHaveLength(3);
+    expect(segments.every(({ packedBlockId, id }) => packedBlockId === id)).toBe(true);
+    const expected = [
+      { id: 1, note: "one", n: 10 },
+      { id: 2, note: "two", n: 21 },
+    ];
+    expect((await database.query("SELECT * FROM small ORDER BY id")).rows).toEqual(expected);
+    await database.close();
+    store._crashForTests();
+    const reopened = await verifyFixture(shim, source, ["small"]);
+    const reader = new MinnowDatabase(reopened, ENGINE_OPTIONS);
+    expect((await reader.query("SELECT * FROM small ORDER BY id")).rows).toEqual(expected);
     await reader.close();
     reopened._crashForTests();
   });
@@ -928,6 +957,14 @@ describe("OPFS current layout fixture", () => {
         ["zoned_at", "datetime", undefined],
       ]);
     }
+    // Layout 13's record: a packed segment, its one stored block holding its column as a member.
+    const segments = (await store.listTableSegmentPage("fixture-data", null, 16)).records;
+    const packed = segments.find(({ id }) => id === "fixture-packed-segment");
+    expect(packed?.packedBlockId).toBe("fixture-packed-segment");
+    const member = packed?.columnBlockIds.value?.[0] ?? "";
+    expect(member).toBe("fixture-packed-segment\u0000value");
+    expect(await store.getBlock("fixture-packed-segment")).toBeDefined();
+    expect(await store.getBlock(member)).toBeUndefined();
     store._crashForTests();
   });
 });

@@ -104,7 +104,9 @@ it("a live segment is proved current by one block, not one per column", async ()
   }
 });
 
-const FIXED_POINT = { manifests: 3, transactions: 202, segments: 202, obsoleteBlocks: 128 };
+// Each update's key and amount are one packed block (two ordinary blocks through 0.16, which
+// left 128 obsolete blocks at the same 64 segments).
+const FIXED_POINT = { manifests: 3, transactions: 202, segments: 202, obsoleteBlocks: 64 };
 
 it("paged discovery reclaims exactly what single-record discovery did", async () => {
   const store = new MemoryBlockStore();

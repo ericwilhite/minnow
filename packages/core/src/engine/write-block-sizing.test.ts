@@ -2,7 +2,7 @@ import { inspectBlock, MAX_BLOCK_ROW_COUNT } from "../block-format/index.js";
 import { describe, expect, it } from "vitest";
 import { MemoryBlockStore, type SegmentRecord } from "../storage/index.js";
 import { MinnowDatabase } from "./database.js";
-import { allSegmentRecords } from "./storage-test-helpers.js";
+import { allSegmentRecords, segmentColumnBlocks } from "./storage-test-helpers.js";
 import {
   estimateCompactionRowsPerOutput,
   planAlignedWriteBlockRanges,
@@ -12,22 +12,16 @@ async function blockRowCounts(
   store: MemoryBlockStore,
   segment: SegmentRecord,
 ): Promise<Record<string, number[]>> {
+  const blocks = await segmentColumnBlocks(store, segment);
   return Object.fromEntries(
-    await Promise.all(
-      Object.entries(segment.columnBlockIds).map(
-        async ([columnId, ids]) =>
-          [
-            columnId,
-            await Promise.all(
-              ids.map(async (id) => {
-                const bytes = await store.getBlock(id);
-                if (bytes === undefined) throw new Error(`Missing test block: ${id}`);
-                return inspectBlock(bytes).rowCount;
-              }),
-            ),
-          ] as const,
-      ),
-    ),
+    Object.entries(segment.columnBlockIds).map(([columnId, ids]) => [
+      columnId,
+      ids.map((id) => {
+        const bytes = blocks.get(id);
+        if (bytes === undefined) throw new Error(`Missing test block: ${id}`);
+        return inspectBlock(bytes).rowCount;
+      }),
+    ]),
   );
 }
 

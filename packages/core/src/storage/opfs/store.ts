@@ -4,6 +4,7 @@ import {
   OpfsCoordinationError,
   OpfsDatabaseInUseError,
   OpfsUncertainOutcomeError,
+  PACKED_SEGMENTS,
   StorageCorruptionError,
   StorageFormatVersionError,
   validateStorageDatabaseName,
@@ -376,6 +377,8 @@ export interface OpfsBlockStore extends Required<BlockStore> {}
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
 export class OpfsBlockStore {
   readonly liveQueryChannelName: string;
+  /** The leader keeps every record in RecordCore, which understands packed segments. */
+  readonly [PACKED_SEGMENTS] = true as const;
   readonly #tree: OpfsTree;
   readonly #durability: "relaxed" | "strict";
   readonly #checkpointEntries: number | undefined;

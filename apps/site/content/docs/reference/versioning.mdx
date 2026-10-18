@@ -71,6 +71,13 @@ the stored payload. Permanent raw vectors freeze every Minnow-owned byte for all
 types. A future writer uses a new format number and retains the format-2 reader rather than
 changing those bytes in place.
 
+A packed block holds a small segment's column blocks in one stored payload. It is a container,
+not a new block format: a 24-byte header and a directory of 12-byte entries, then complete
+format-2 blocks, one per column. The container has its own version, 1, and a frozen vector of its
+bytes. Snapshots never carry it: an export writes each member as an ordinary format-2 block
+frame, so packing never changes a snapshot's format, and an older build imports it whenever it
+could before.
+
 Snapshot format 1 is locked with block format 2 embedded inside it. Its fixture freezes the file
 framing, canonical header, payload order, and logical block bytes. Native `CompressionStream`
 implementations may produce different valid gzip streams, so compressed payload sizes and their
@@ -107,7 +114,8 @@ updates and deletes into a few segments that take the run's place. A schema-5 bu
 0.15.0) refuses either job as corruption, so that build refuses the database. Schema 6 was
 never released: core 0.16.0 moves a schema-5 database straight to schema 7. Schema 8 rewrites
 nothing either: a column's catalog record may say it was declared `TIMESTAMP` (without time
-zone), which a schema-7 build (core 0.16.0) refuses as corruption, so that build refuses the
+zone), which a schema-7 build (core 0.16.0) refuses as corruption, and it admits packed segments
+and staging calls of up to 1,024 blocks, which that build would count wrongly, so it refuses the
 database. Columns written before schema 8 stay `TIMESTAMPTZ`. No pre-contract
 schema readers or recreation policy ship. Every future integer schema
 version must add one ordered migration to the explicit registry and a frozen fixture for the
@@ -125,7 +133,8 @@ read. Layout 10 admits the engine's internal key-forwards table, which a layout-
 table across `ALTER TABLE ADD` or `DROP COLUMN`, and delta merges; a layout-10 build refuses
 either as corruption. Layout 11 was never released: core 0.16.0 moves a layout-10 database
 straight to layout 12. Layout 13 admits a column declared `TIMESTAMP` (without time zone), which
-a layout-12 build (core 0.16.0) would render as `TIMESTAMPTZ`. The format marker is the barrier,
+a layout-12 build (core 0.16.0) would render as `TIMESTAMPTZ`, and packed segments in staging
+frames of up to 1,024 blocks, which it would count wrongly. The format marker is the barrier,
 and upgrading a layout-7 to 12 database rewrites only that marker. Layout 7's fixture freezes the format
 marker, checkpoint, WAL tail, extent payloads, and a separate checksummed acknowledgement file. That file records
 which WAL boundary completed a strict flush, so recovery can distinguish an unwritten suffix

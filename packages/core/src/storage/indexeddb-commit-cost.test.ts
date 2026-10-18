@@ -98,12 +98,20 @@ it("an ordinary commit reads the same however many blocks the database holds", a
   expect(Object.fromEntries(large)).toEqual(Object.fromEntries(small));
 });
 
-async function singleRowInsertRequests(columns: number): Promise<Map<string, number>> {
+async function insertRequests(
+  columns: number,
+  rows = 1,
+  rowsPerBlock?: number,
+): Promise<Map<string, number>> {
   const store = await IndexedDbBlockStore.open({
     name: crypto.randomUUID(),
     indexedDB: new IDBFactory(),
   });
-  const db = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+  const db = new MinnowDatabase(store, {
+    autoCompact: false,
+    autoCollect: false,
+    ...(rowsPerBlock === undefined ? {} : { rowsPerBlock }),
+  });
   try {
     const names = Array.from({ length: columns }, (_, index) => `c${String(index)}`);
     const declarations = names.map((name) => `${name} INTEGER`).join(", ");
@@ -115,7 +123,10 @@ async function singleRowInsertRequests(columns: number): Promise<Map<string, num
     };
     await db.insertBatch("t", [row(1)]);
     const counts = countReadwriteRequests();
-    await db.insertBatch("t", [row(2)]);
+    await db.insertBatch(
+      "t",
+      Array.from({ length: rows }, (_, index) => row(2 + index)),
+    );
     vi.restoreAllMocks();
     return counts;
   } finally {
@@ -126,13 +137,15 @@ async function singleRowInsertRequests(columns: number): Promise<Map<string, num
 it("a single-shot write reads back none of the blocks or segments it writes", async () => {
   // One block per column: a write's own blocks and segment are known to it, so the commit
   // inside the same storage transaction reads only what came before.
-  const narrow = await singleRowInsertRequests(3);
-  const wide = await singleRowInsertRequests(40);
+  const narrow = await insertRequests(3);
+  const wide = await insertRequests(40);
   expect(wide.get("blocks.getKey") ?? 0).toBe(0);
   expect(wide.get("segments.get") ?? 0).toBe(0);
   expect(wide.get("catalog.get")).toBe(narrow.get("catalog.get"));
-  // Wider than one staging call: only the blocks staged ahead of the write are probed, once.
-  const staged = await singleRowInsertRequests(MAX_TRANSACTION_STAGE_BLOCKS + 6);
+  // More blocks than one staging call takes — nine rows at one row per block — stages part of
+  // the write ahead of it: only those blocks are probed, once.
+  expect(9 * 130).toBeGreaterThan(MAX_TRANSACTION_STAGE_BLOCKS);
+  const staged = await insertRequests(129, 9, 1);
   expect(staged.get("blocks.getKey")).toBeGreaterThan(0);
   expect(staged.get("blocks.getKey")).toBeLessThanOrEqual(MAX_TRANSACTION_STAGE_BLOCKS);
 });

@@ -1,13 +1,17 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
-import { encodeBlock, inspectBlock } from "../packages/core/src/block-format/index.ts";
+import {
+  encodeBlock,
+  encodePackedBlock,
+  inspectBlock,
+} from "../packages/core/src/block-format/index.ts";
 import { MemoryOpfs } from "../packages/core/src/testing/opfs-shim.ts";
 import { keyForwardsTableRecord } from "../packages/core/src/engine/key-forwards.ts";
 import { OpfsBlockStore } from "../packages/core/src/storage/opfs/index.ts";
 import { walStagingTestHooks } from "../packages/core/src/storage/opfs/leader.ts";
 import { OPFS_LAYOUT_VERSION } from "../packages/core/src/storage/opfs/upgrades.ts";
-import type { TableRecord } from "../packages/core/src/storage/types.ts";
+import { packedSegmentMemberId, type TableRecord } from "../packages/core/src/storage/types.ts";
 
 const databaseName = "native-fixture";
 const prefix = `minnowdb/${databaseName}`;
@@ -375,6 +379,53 @@ await store.writeTransaction({
     },
   ],
   committedAt: "2026-08-24T12:00:07.000Z",
+});
+// Layout 13's own shape, in the log's tail: a packed segment, one stored block holding a
+// single-row commit's columns, which the segment names as members. One entry — a single-shot
+// write that begins its own transaction — so the tail stays short of a second checkpoint.
+const packedMember = packedSegmentMemberId("fixture-packed-segment", "value");
+const packed = encodePackedBlock([
+  { memberId: packedMember, columnId: "value", column: { type: "string", values: ["packed"] } },
+]);
+if (packed === undefined) throw new Error("The fixture's packed block did not encode");
+await store.writeTransaction({
+  transaction: {
+    record: {
+      id: "fixture-packed-transaction",
+      ownerId: "fixture-owner",
+      expiresAt: "2026-08-24T13:00:00.000Z",
+      pendingBlockIds: [],
+      pendingSegmentIds: [],
+      status: "active",
+      revision: 0,
+      startedAt: "2026-08-24T12:00:08.000Z",
+      updatedAt: "2026-08-24T12:00:08.000Z",
+      committedVersion: null,
+      schemaEpochGuard: (await store.getCatalogProbe()).schemaEpoch,
+    },
+  },
+  blocks: [{ id: "fixture-packed-segment", bytes: packed.bytes }],
+  segments: [
+    {
+      id: "fixture-packed-segment",
+      tableId: "fixture-data",
+      transactionId: "fixture-packed-transaction",
+      kind: "insert",
+      level: 0,
+      logicalOrder: 0,
+      commitOrdinal: 0,
+      rowCount: 1,
+      rowIdStart: 6n,
+      rowIdEndExclusive: 7n,
+      rowIdSpans: [],
+      columnBlockIds: { value: [packedMember] },
+      packedBlockId: "fixture-packed-segment",
+      createdAt: "2026-08-24T12:00:09.000Z",
+    },
+  ],
+  expectedManifestVersion: (await store.getCurrentManifestVersion()) ?? null,
+  levelZeroSegmentLimits: [{ tableId: "fixture-data", limit: 4096 }],
+  committedAt: "2026-08-24T12:00:10.000Z",
 });
 await store.addTable(stampedTable("fixture-wal-tail", "wal-tail"));
 follower.close();

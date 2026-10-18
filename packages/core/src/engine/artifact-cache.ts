@@ -27,11 +27,13 @@ export const ArtifactFamily = {
   reverseDictionary: 4,
   /** A segment's key locator table, keyed by segment id. */
   segmentKeyLocators: 5,
+  /** A packed block's bytes and directory, keyed by its stored block id. */
+  packedBlock: 6,
 } as const;
 
 export type ArtifactFamily = (typeof ArtifactFamily)[keyof typeof ArtifactFamily];
 
-const FAMILY_COUNT = 6;
+const FAMILY_COUNT = 7;
 
 /**
  * What a family key is charged beyond its id: the short prefix the flat key space used to

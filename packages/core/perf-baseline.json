@@ -128,6 +128,18 @@
           "sqlite": 318,
           "pglite": 3.71
         },
+        "wide-level-zero-point-lookup": {
+          "sqlite": 7.5,
+          "pglite": 0.283
+        },
+        "wide-level-zero-select": {
+          "sqlite": 4150,
+          "pglite": 254
+        },
+        "wide-level-zero-scan": {
+          "sqlite": 4.17,
+          "pglite": 1.72
+        },
         "settle-after-updates": {
           "sqlite": 0.874,
           "pglite": 0.388
@@ -275,6 +287,18 @@
         "wide-delete-row": {
           "sqlite": 1300,
           "pglite": 16.8
+        },
+        "wide-level-zero-point-lookup": {
+          "sqlite": 45,
+          "pglite": 1.7
+        },
+        "wide-level-zero-select": {
+          "sqlite": 9960,
+          "pglite": 406
+        },
+        "wide-level-zero-scan": {
+          "sqlite": 10,
+          "pglite": 2.75
         },
         "settle-after-updates": {
           "sqlite": 6.18,

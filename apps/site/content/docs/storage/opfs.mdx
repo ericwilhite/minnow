@@ -189,12 +189,15 @@ a delta merge, which merges a run of level-zero updates and deletes into a few s
 take the run's place. Layout 11 was never released: core 0.16.0 moves a layout-10 database
 straight to layout 12. Layout 13 admits a column declared `TIMESTAMP` (without time zone), whose
 SQL text has no zone; a layout-12 build (core 0.16.0) would render it as `TIMESTAMPTZ`. Columns
-an older build wrote stay `TIMESTAMPTZ`, whatever their DDL said. **Layouts 7 to 12 upgrade
-automatically on open** by rewriting the format marker alone: a small `upgrade-12-13` witness is
-written and flushed first, so a crash that tears the marker is finished on the next open instead
-of refused, and the witness is removed once the new marker is durable. A witness an older build
-left behind (`upgrade-7-8`, `upgrade-8-9`, `upgrade-9-10`, `upgrade-10-11`, or `upgrade-11-12`)
-is finished the same way. An older build then refuses the database without changing it.
+an older build wrote stay `TIMESTAMPTZ`, whatever their DDL said. Layout 13 also admits packed
+segments, a small commit's columns stored as one block that the segment record names with
+`packedBlockId`, in staging frames of up to 1,024 blocks, which a layout-12 build would count
+wrongly. **Layouts 7 to 12 upgrade automatically on open** by rewriting the format marker alone:
+a small `upgrade-12-13` witness is written and flushed first, so a crash that tears the marker is
+finished on the next open instead of refused, and the witness is removed once the new marker is
+durable. A witness an older build left behind (`upgrade-7-8`, `upgrade-8-9`, `upgrade-9-10`,
+`upgrade-10-11`, or `upgrade-11-12`) is finished the same way. An older build then refuses the
+database without changing it.
 
 Layout 7 added a 48-byte acknowledgement file with two checksummed slots, alongside the
 structural `schemaEpoch` and served-request ledger. Recovery

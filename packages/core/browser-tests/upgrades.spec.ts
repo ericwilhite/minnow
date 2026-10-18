@@ -6,8 +6,8 @@ import { requireWorkerOpfs, test } from "./fixtures.js";
 
 /**
  * The OPFS layout this build writes; layout 12 admits compaction plans whose sources lack a column
- * added after them, and delta merges, and layout 13 columns declared TIMESTAMP without time zone.
- * Layout 11 was never released.
+ * added after them, and delta merges, and layout 13 columns declared TIMESTAMP without time zone
+ * and packed segments. Layout 11 was never released.
  */
 const OPFS_LAYOUT = 13;
 
@@ -79,7 +79,7 @@ test("automatic upgrade: OPFS written by 0.14.1 keeps its rows, index, and seque
 /**
  * The IndexedDB schema this build writes; schema 7 admits compaction plans whose sources lack a
  * column added after them, and delta merges, and schema 8 columns declared TIMESTAMP without time
- * zone. Schema 6 was never released.
+ * zone and packed segments. Schema 6 was never released.
  */
 const INDEXEDDB_SCHEMA = 8;
 

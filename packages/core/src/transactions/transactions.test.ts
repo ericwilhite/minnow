@@ -2,6 +2,7 @@ import { IDBFactory } from "fake-indexeddb";
 import { describe, expect, it, vi } from "vitest";
 import {
   IndexedDbBlockStore,
+  MAX_TRANSACTION_STAGE_BLOCKS,
   MemoryBlockStore,
   OpfsBlockStore,
   SnapshotManifestMissingError,
@@ -817,13 +818,17 @@ it("still refuses to abort a transaction whose record a live owner holds", async
 it("chunks large staging calls and refuses an oversized journal before mutation", async () => {
   const store = new ArtifactBatchObservingStore();
   const transaction = await new TransactionManager(store).begin();
-  const blocks = Array.from({ length: 129 }, (_, index) => ({
+  const blocks = Array.from({ length: 2 * MAX_TRANSACTION_STAGE_BLOCKS + 1 }, (_, index) => ({
     id: `chunk-${String(index)}`,
     bytes: Uint8Array.of(index & 0xff),
   }));
   await transaction.stageBlocks(blocks);
-  expect(store.artifactBatchBlockCounts).toEqual([64, 64, 1]);
-  expect((await store.getTransaction(transaction.id))?.pendingBlockIds).toHaveLength(129);
+  expect(store.artifactBatchBlockCounts).toEqual([
+    MAX_TRANSACTION_STAGE_BLOCKS,
+    MAX_TRANSACTION_STAGE_BLOCKS,
+    1,
+  ]);
+  expect((await store.getTransaction(transaction.id))?.pendingBlockIds).toHaveLength(blocks.length);
 
   // The journal has no ceiling of its own: a batch well past the old 4,096 limit lands in
   // bounded storage calls, and the record reads back every id in order.
@@ -832,11 +837,13 @@ it("chunks large staging calls and refuses an oversized journal before mutation"
     bytes: Uint8Array.of(1),
   }));
   await transaction.stageBlocks(many);
-  expect(store.artifactBatchBlockCounts.slice(3).every((count) => count <= 64)).toBe(true);
+  expect(
+    store.artifactBatchBlockCounts.slice(3).every((count) => count <= MAX_TRANSACTION_STAGE_BLOCKS),
+  ).toBe(true);
   const journaled = (await store.getTransaction(transaction.id))?.pendingBlockIds ?? [];
-  expect(journaled).toHaveLength(129 + 4_500);
-  expect(journaled.slice(129)).toEqual(many.map((block) => block.id));
-  expect(transaction.pendingBlockCount).toBe(129 + 4_500);
+  expect(journaled).toHaveLength(blocks.length + 4_500);
+  expect(journaled.slice(blocks.length)).toEqual(many.map((block) => block.id));
+  expect(transaction.pendingBlockCount).toBe(blocks.length + 4_500);
   store.close();
 });
 

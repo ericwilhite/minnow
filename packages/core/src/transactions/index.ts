@@ -34,6 +34,13 @@ import {
 
 /** Keys `setUniqueKeyChangesSliced` deduplicates between turns. */
 const UNIQUE_KEY_CHANGE_SLICE = 16_384;
+/**
+ * Blocks a deferred transaction keeps in memory before it persists its journal: the per-call
+ * staging limit through core 0.16, kept when that limit rose to 1,024 so a write scope holds no
+ * more process-local state than it did. A single-shot commit is bounded by the staging limit
+ * instead (`stageArtifactsAndCommit`), which is what lets a wide write commit in one call.
+ */
+const LOCAL_ARTIFACT_BATCH_BLOCKS = 64;
 
 /**
  * One indexed column's postings from the operations of one transaction. Each operation adds a
@@ -763,7 +770,7 @@ export class DatabaseTransaction {
       !this.#persisted &&
       (this.#coalesceArtifacts ||
         (this.#deferredBlocks.length === 0 && this.#deferredSegments.length === 0)) &&
-      this.#deferredBlocks.length + blocks.length <= MAX_TRANSACTION_STAGE_BLOCKS &&
+      this.#deferredBlocks.length + blocks.length <= LOCAL_ARTIFACT_BATCH_BLOCKS &&
       this.#deferredSegments.length + ordered.length <= MAX_TRANSACTION_STAGE_SEGMENTS &&
       [...this.#deferredBlocks, ...blocks].reduce(
         (bytes, block) => bytes + block.bytes.byteLength,
@@ -2437,6 +2444,7 @@ function sameSegmentArtifacts(left: SegmentRecord, right: SegmentRecord): boolea
     left.logicalOrder === right.logicalOrder &&
     left.commitOrdinal === right.commitOrdinal &&
     left.partitionOrdinal === right.partitionOrdinal &&
+    left.packedBlockId === right.packedBlockId &&
     left.createdAt === right.createdAt &&
     leftColumns.length === rightColumns.length &&
     leftColumns.every((columnId, index) => {

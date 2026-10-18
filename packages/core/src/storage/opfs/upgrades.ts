@@ -26,8 +26,10 @@ export const FIRST_SUPPORTED_OPFS_LAYOUT = 6;
  * (`delta-v1` jobs) and the level-zero segments they publish under the order of the run they
  * replace, which an older build refuses as corruption; layout 13, a column declared TIMESTAMP
  * without time zone (`withoutTimeZone: true`), which an older build would render as `timestamp
- * with time zone`. The marker is the barrier: an older reader refuses the database before it
- * reads a record.
+ * with time zone`, and packed segments (one packed block holding a small commit's columns, named
+ * by `packedBlockId`) in staging frames of up to 1,024 blocks, which an older build would count
+ * wrongly. The marker is the barrier: an older reader refuses the database before it reads a
+ * record.
  */
 export const OPFS_LAYOUT_VERSION = 13;
 export const OPFS_UPGRADES = [

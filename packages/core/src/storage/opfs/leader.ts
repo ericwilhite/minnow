@@ -168,8 +168,15 @@ import {
 } from "../toolkit/extents.js";
 import { readFully, writeFully } from "../toolkit/sync-file.js";
 import {
+  packedSnapshotBlockSummary,
+  packedSnapshotFrames,
+  unpackedSnapshotSegment,
+  type PackedSnapshotFrame,
+} from "../toolkit/packed-snapshot.js";
+import {
   MAX_STORED_BLOCK_BYTE_LENGTH,
   verifyStoredBlock,
+  verifyStoredPayload,
   parseJson,
 } from "../../block-format/index.js";
 import { crc32 } from "../../block-format/checksum.js";
@@ -278,7 +285,29 @@ interface SnapshotFrameExportState {
   lastSequence: number | null;
   lastMetadataOffset: number | null;
   lastBlockId: string | null;
+  /**
+   * Each exported packed block, with the ledger offset of its segment's metadata frame. The
+   * export writes the members that segment names in the packed block's place. Empty in an
+   * export a layout-12 build began.
+   */
+  packedSegments: Array<[packedBlockId: string, metadataOffset: number]>;
+  /** The packed block whose member the last block frame was, or null. */
+  packedBlockId: string | null;
 }
+
+/** One exported block frame, and the packed block it is a member of, if any. */
+type ExportBlockFrame = PackedSnapshotFrame & { readonly packedBlockId: string | null };
+
+type SnapshotFrameExportCursor = Pick<
+  SnapshotFrameExportState,
+  | "nextSequence"
+  | "metadataOffset"
+  | "blockCursor"
+  | "lastSequence"
+  | "lastMetadataOffset"
+  | "lastBlockId"
+  | "packedBlockId"
+>;
 
 interface SnapshotFrameObservedState {
   frameCount: number;
@@ -462,15 +491,7 @@ type WalEntryBody =
       op: "advanceSnapshotFrameExport";
       input: ReadSnapshotExportFrameInput;
       expectedLeaseRevision: number;
-      next: Pick<
-        SnapshotFrameExportState,
-        | "nextSequence"
-        | "metadataOffset"
-        | "blockCursor"
-        | "lastSequence"
-        | "lastMetadataOffset"
-        | "lastBlockId"
-      >;
+      next: SnapshotFrameExportCursor;
     }
   | { op: "closeSnapshotFrameExport"; input: CloseSnapshotExportInput }
   | { op: "beginSnapshotFrameImport"; state: SnapshotFrameImportState }
@@ -779,6 +800,11 @@ export class OpfsLeader {
   #ftsChunkCacheBytes = 0;
   #snapshotFrameExport: SnapshotFrameExportState | undefined;
   #snapshotFrameExportLedger: SnapshotFrameLedger | undefined;
+  /** The member frames of the packed block an export is writing, so each member reads it once. */
+  #packedSnapshotExportCache:
+    | { sessionId: string; packedBlockId: string; frames: readonly PackedSnapshotFrame[] }
+    | undefined;
+  #packedSnapshotExportOffsets: { sessionId: string; offsets: Map<string, number> } | undefined;
   #preparedSnapshotFrameExportLedger: SnapshotFrameLedger | undefined;
   #snapshotFrameImport: SnapshotFrameImportState | undefined;
   #snapshotFrameImportLedger: SnapshotFrameLedger | undefined;
@@ -2434,6 +2460,7 @@ export class OpfsLeader {
       }
       case "advanceSnapshotFrameExport": {
         const session = this.#requireSnapshotFrameExport(body.input.sessionId, body.input.ownerId);
+        withPackedExportDefaults(body.next);
         validateSnapshotFrameExportAdvance(session, body.input.sequence, body.next);
         const lease = this.#core.renewLease({
           id: snapshotFrameExportLeaseId(session.sessionId),
@@ -3842,7 +3869,7 @@ export class OpfsLeader {
       try {
         for (const source of blockSources) {
           const bytes = await this.#pool.readVerified(source.from);
-          verifyStoredBlock(bytes);
+          verifyStoredPayload(bytes);
           const placement = await this.#pool.append(bytes, false);
           blocks.push({ ...source, placement });
         }
@@ -4854,13 +4881,27 @@ export class OpfsLeader {
       const summaries = emptySnapshotFrameSummaries();
       let sequence = 0;
       let formatVersion: SnapshotFormatVersion = 1;
+      const packedSegments: Array<[string, number]> = [];
+      const packedBlocks: Array<{ packedBytes: number; frames: readonly PackedSnapshotFrame[] }> =
+        [];
       try {
         for (const item of this.#core.snapshotFrameMetadataItems()) {
           formatVersion = withSnapshotMetadataItem(formatVersion, item);
+          let exported: SnapshotMetadataItem = item;
+          if (item.kind === "segment" && item.record.packedBlockId !== undefined) {
+            const packedBlockId = item.record.packedBlockId;
+            const packed = await this.#readPackedBlock(packedBlockId);
+            packedBlocks.push({
+              packedBytes: packed.byteLength,
+              frames: packedSnapshotFrames("opfs", item.record, packed),
+            });
+            packedSegments.push([packedBlockId, ledger.byteLength]);
+            exported = { kind: "segment", record: unpackedSnapshotSegment(item.record) };
+          }
           sequence = appendSnapshotMetadataItems(
             ledger,
             snapshotMetadataFrameKind(item),
-            [item],
+            [exported],
             sequence,
             summaries,
           );
@@ -4874,11 +4915,10 @@ export class OpfsLeader {
             summaries,
           );
         }
-        summaries.block = {
-          frameCount: manifest.liveBlockCount,
-          itemCount: manifest.liveBlockCount,
-          storedBytes: manifest.liveBlockBytes,
-        };
+        summaries.block = packedSnapshotBlockSummary(
+          { frameCount: manifest.liveBlockCount, storedBytes: manifest.liveBlockBytes },
+          packedBlocks,
+        );
         const header = prepareSnapshotFrameStreamHeader({
           formatVersion,
           databaseVersion: manifest.version,
@@ -4903,6 +4943,8 @@ export class OpfsLeader {
           lastSequence: null,
           lastMetadataOffset: null,
           lastBlockId: null,
+          packedSegments,
+          packedBlockId: null,
         };
         const previousLedgerId = existing?.ledgerId;
         const result = this.#logged({
@@ -4942,15 +4984,7 @@ export class OpfsLeader {
       }
       const replay = input.sequence === session.lastSequence;
       let frame: SnapshotFrame;
-      let next: Pick<
-        SnapshotFrameExportState,
-        | "nextSequence"
-        | "metadataOffset"
-        | "blockCursor"
-        | "lastSequence"
-        | "lastMetadataOffset"
-        | "lastBlockId"
-      >;
+      let next: SnapshotFrameExportCursor;
       if (input.sequence < session.metadataFrameCount) {
         const offset = replay ? session.lastMetadataOffset : session.metadataOffset;
         if (offset === null) throw new Error("Snapshot metadata replay cursor is missing");
@@ -4972,32 +5006,19 @@ export class OpfsLeader {
               lastSequence: input.sequence,
               lastMetadataOffset: offset,
               lastBlockId: null,
+              packedBlockId: null,
             };
       } else {
-        const blockId = replay ? session.lastBlockId : this.#nextSnapshotExportBlockId(session);
-        if (blockId === null) {
-          throw new StorageCorruptionError(
-            "opfs",
-            `snapshot-export/${session.sessionId}`,
-            "manifest block count exceeds its provenance page",
-          );
-        }
-        const placement = this.#blockIndex.get(blockId);
-        if (placement === undefined) {
-          throw new StorageCorruptionError(
-            "opfs",
-            `block/${blockId}`,
-            "snapshot manifest member has no physical placement",
-          );
-        }
-        const bytes = await this.#pool.readVerified(placement);
+        const block = replay
+          ? await this.#snapshotExportFrameAt(session, session.lastBlockId, session.packedBlockId)
+          : await this.#nextSnapshotExportFrame(session);
         frame = {
           sequence: input.sequence,
           kind: "block",
           itemCount: 1,
-          key: blockId,
-          payload: bytes,
-          checksum: placement.checksum,
+          key: block.key,
+          payload: block.payload,
+          checksum: block.checksum,
         };
         snapshotFrameEnvelopeParts(frame);
         next = replay
@@ -5005,10 +5026,11 @@ export class OpfsLeader {
           : {
               nextSequence: safeSuccessor(session.nextSequence, "Snapshot export sequence"),
               metadataOffset: session.metadataOffset,
-              blockCursor: blockId,
+              blockCursor: block.key,
               lastSequence: input.sequence,
               lastMetadataOffset: null,
-              lastBlockId: blockId,
+              lastBlockId: block.key,
+              packedBlockId: block.packedBlockId,
             };
       }
       this.#logged({
@@ -5389,13 +5411,134 @@ export class OpfsLeader {
     return ledger;
   }
 
-  #nextSnapshotExportBlockId(session: SnapshotFrameExportState): string | null {
+  #nextSnapshotExportBlockId(session: SnapshotFrameExportState, after: string | null): string {
     const page = this.#core.listManifestBlockPage({
       version: session.manifestVersion,
-      afterBlockId: session.blockCursor,
+      afterBlockId: after,
       limit: 1,
     });
-    return page.records[0]?.blockId ?? null;
+    const blockId = page.records[0]?.blockId;
+    if (blockId === undefined) {
+      throw new StorageCorruptionError(
+        "opfs",
+        `snapshot-export/${session.sessionId}`,
+        "manifest block count exceeds its provenance page",
+      );
+    }
+    return blockId;
+  }
+
+  /**
+   * The block frame after the export's cursor: the next member of the packed block it is
+   * writing, or the next manifest block, whose members take its place when it is a packed
+   * block. A member id sorts directly after its packed block, so the order stays canonical.
+   */
+  async #nextSnapshotExportFrame(session: SnapshotFrameExportState): Promise<ExportBlockFrame> {
+    const cursor = session.blockCursor;
+    if (session.packedBlockId !== null && cursor !== null) {
+      const frames = await this.#packedSnapshotExportFrames(session, session.packedBlockId);
+      const next = frames.find((frame) => frame.key > cursor);
+      if (next !== undefined) return { ...next, packedBlockId: session.packedBlockId };
+    }
+    let after = cursor;
+    for (;;) {
+      const blockId = this.#nextSnapshotExportBlockId(session, after);
+      if (!this.#packedSnapshotSegmentOffsets(session).has(blockId)) {
+        return this.#snapshotExportFrameAt(session, blockId, null);
+      }
+      const first = (await this.#packedSnapshotExportFrames(session, blockId))[0];
+      // A packed segment whose every column was dropped names no member; nothing replaces it.
+      if (first !== undefined) return { ...first, packedBlockId: blockId };
+      after = blockId;
+    }
+  }
+
+  /** The block frame with this key: a stored block, or a member of `packedBlockId`. */
+  async #snapshotExportFrameAt(
+    session: SnapshotFrameExportState,
+    key: string | null,
+    packedBlockId: string | null,
+  ): Promise<ExportBlockFrame> {
+    if (key === null) throw new Error("Snapshot export block replay cursor is missing");
+    if (packedBlockId !== null) {
+      const frames = await this.#packedSnapshotExportFrames(session, packedBlockId);
+      const member = frames.find((frame) => frame.key === key);
+      if (member === undefined) {
+        throw new StorageCorruptionError(
+          "opfs",
+          `snapshot-export/${session.sessionId}`,
+          "replayed packed member is not in its packed block",
+        );
+      }
+      return { ...member, packedBlockId };
+    }
+    const placement = this.#blockIndex.get(key);
+    if (placement === undefined) {
+      throw new StorageCorruptionError(
+        "opfs",
+        `block/${key}`,
+        "snapshot manifest member has no physical placement",
+      );
+    }
+    const payload = await this.#pool.readVerified(placement);
+    return { key, payload, checksum: placement.checksum, packedBlockId: null };
+  }
+
+  /** A packed block's member frames, from the segment frame its export wrote at begin. */
+  async #packedSnapshotExportFrames(
+    session: SnapshotFrameExportState,
+    packedBlockId: string,
+  ): Promise<readonly PackedSnapshotFrame[]> {
+    const cached = this.#packedSnapshotExportCache;
+    if (cached?.sessionId === session.sessionId && cached.packedBlockId === packedBlockId) {
+      return cached.frames;
+    }
+    const offset = this.#packedSnapshotSegmentOffsets(session).get(packedBlockId);
+    if (offset === undefined) {
+      throw new StorageCorruptionError(
+        "opfs",
+        `snapshot-export/${session.sessionId}`,
+        "packed block has no exported segment",
+      );
+    }
+    const read = this.#requireSnapshotFrameExportLedger().read(offset, session.ledgerLength);
+    const metadata = frameFromSnapshotLedger(read, undefined);
+    const [item] = decodeSnapshotMetadataItems("segment-page", metadata.payload);
+    if (item?.kind !== "segment") {
+      throw new StorageCorruptionError(
+        "opfs",
+        `snapshot-export/${session.sessionId}`,
+        "packed block's segment frame is not a segment",
+      );
+    }
+    const frames = packedSnapshotFrames(
+      "opfs",
+      { ...item.record, packedBlockId },
+      await this.#readPackedBlock(packedBlockId),
+    );
+    this.#packedSnapshotExportCache = { sessionId: session.sessionId, packedBlockId, frames };
+    return frames;
+  }
+
+  /** The export's packed blocks by id, built once per session. */
+  #packedSnapshotSegmentOffsets(session: SnapshotFrameExportState): ReadonlyMap<string, number> {
+    const cached = this.#packedSnapshotExportOffsets;
+    if (cached?.sessionId === session.sessionId) return cached.offsets;
+    const offsets = new Map(session.packedSegments);
+    this.#packedSnapshotExportOffsets = { sessionId: session.sessionId, offsets };
+    return offsets;
+  }
+
+  async #readPackedBlock(packedBlockId: string): Promise<Uint8Array> {
+    const placement = this.#blockIndex.get(packedBlockId);
+    if (placement === undefined) {
+      throw new StorageCorruptionError(
+        "opfs",
+        `block/${packedBlockId}`,
+        "packed block has no physical placement",
+      );
+    }
+    return this.#pool.readVerified(placement);
   }
 
   #requireSnapshotFrameImport(
@@ -5708,7 +5851,7 @@ export class OpfsLeader {
           try {
             if (mode === "full") {
               const bytes = await this.#pool.readVerified(payload.placement);
-              if (payload.kind === "block") verifyStoredBlock(bytes);
+              if (payload.kind === "block") verifyStoredPayload(bytes);
               else {
                 verifyFtsChunkBytes(bytes, payload.bounds, payload.location);
               }
@@ -6972,6 +7115,10 @@ function validateSnapshotFrameExportState(
   value: unknown,
 ): asserts value is SnapshotFrameExportState {
   requireRecord(value, "snapshot frame export state");
+  if (!("packedSegments" in value)) {
+    withPackedExportDefaults(value);
+    Object.assign(value, { packedSegments: [] });
+  }
   assertExactRecordKeys(
     value,
     [
@@ -6991,9 +7138,24 @@ function validateSnapshotFrameExportState(
       "lastSequence",
       "lastMetadataOffset",
       "lastBlockId",
+      "packedSegments",
+      "packedBlockId",
     ],
     "snapshot frame export state",
   );
+  if (!Array.isArray(value.packedSegments)) {
+    throw new Error("Snapshot frame export packed segments are invalid");
+  }
+  for (const entry of value.packedSegments as unknown[]) {
+    if (!Array.isArray(entry) || entry.length !== 2) {
+      throw new Error("Snapshot frame export packed segment is invalid");
+    }
+    requireStorageId(entry[0], "snapshot frame export packed block id");
+    requireNonNegativeInteger(entry[1], "snapshot frame export packed segment offset");
+  }
+  if (value.packedBlockId !== null) {
+    requireStorageId(value.packedBlockId, "snapshot frame export packed block id");
+  }
   requireStorageId(value.sessionId, "snapshot frame export session id");
   requireStorageId(value.ownerId, "snapshot frame export owner id");
   requireStorageId(value.ledgerId, "snapshot frame export ledger id");
@@ -7290,17 +7452,7 @@ function frameFromSnapshotLedger(
   return frame;
 }
 
-function snapshotFrameExportCursor(
-  state: SnapshotFrameExportState,
-): Pick<
-  SnapshotFrameExportState,
-  | "nextSequence"
-  | "metadataOffset"
-  | "blockCursor"
-  | "lastSequence"
-  | "lastMetadataOffset"
-  | "lastBlockId"
-> {
+function snapshotFrameExportCursor(state: SnapshotFrameExportState): SnapshotFrameExportCursor {
   return {
     nextSequence: state.nextSequence,
     metadataOffset: state.metadataOffset,
@@ -7308,21 +7460,22 @@ function snapshotFrameExportCursor(
     lastSequence: state.lastSequence,
     lastMetadataOffset: state.lastMetadataOffset,
     lastBlockId: state.lastBlockId,
+    packedBlockId: state.packedBlockId,
   };
+}
+
+/**
+ * A layout-12 build logged export states and cursors without the packed-segment fields: its
+ * export began before packed segments existed, so it holds none.
+ */
+function withPackedExportDefaults(value: object): void {
+  if (!("packedBlockId" in value)) Object.assign(value, { packedBlockId: null });
 }
 
 function validateSnapshotFrameExportAdvance(
   current: SnapshotFrameExportState,
   requestedSequence: number,
-  next: Pick<
-    SnapshotFrameExportState,
-    | "nextSequence"
-    | "metadataOffset"
-    | "blockCursor"
-    | "lastSequence"
-    | "lastMetadataOffset"
-    | "lastBlockId"
-  >,
+  next: SnapshotFrameExportCursor,
 ): void {
   const replay = requestedSequence === current.lastSequence;
   if (replay) {

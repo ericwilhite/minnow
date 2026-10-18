@@ -1288,11 +1288,52 @@ const WIDE_SHAPES: readonly WideShape[] = [
   },
 ];
 
+/**
+ * Reads over the level-zero history the single-row shapes leave on the wide table, which is
+ * never folded here: a point lookup of rows a single-row insert wrote, a select of all of them,
+ * and a scan of a few columns across the whole history. A small commit to a wide table stores its
+ * columns as one packed block, so these are the reads that cut members out of packed blocks.
+ */
+interface WideRead {
+  readonly name: string;
+  readonly sql: string;
+  /** Parameters of call `n`, so a repeated sample reads a different row rather than the same. */
+  readonly params?: (n: number) => number[];
+  readonly ordered?: boolean;
+}
+/** The key and every text and number column: what all three engines return alike. */
+const WIDE_READ_COLUMNS = [
+  "id",
+  ...WIDE_COLUMNS.filter(({ kind }) => kind === "text" || kind === "number").map(
+    ({ name }) => name,
+  ),
+]
+  .map((name) => `"${name}"`)
+  .join(", ");
+const WIDE_READS: readonly WideRead[] = [
+  {
+    name: "wide-level-zero-point-lookup",
+    sql: `SELECT ${WIDE_READ_COLUMNS} FROM wide WHERE "id" = ?`,
+    // The first hundred of the rows wide-insert-row wrote, each its own level-zero commit.
+    params: (n) => [wideInsertRow(n % 100).id as number],
+  },
+  {
+    name: "wide-level-zero-select",
+    sql: `SELECT ${WIDE_READ_COLUMNS} FROM wide WHERE "id" >= 2000000 ORDER BY "id"`,
+    ordered: true,
+  },
+  {
+    name: "wide-level-zero-scan",
+    sql: `SELECT COUNT(*) AS n, SUM("n4") AS total, COUNT("t3") AS texts, MAX("t20") AS last FROM wide`,
+  },
+];
+
 const workloadNames = [
   "bulk-ingest",
   ...QUERIES.map(({ name }) => name),
   ...MUTATIONS.map(({ name }) => name),
   ...WIDE_SHAPES.map(({ name }) => name),
+  ...WIDE_READS.map(({ name }) => name),
   "settle-after-updates",
   ...SETTLED_QUERIES.map(({ name }) => name),
   "bulk-delete",
@@ -1400,6 +1441,38 @@ for (const shape of WIDE_SHAPES) {
     await wideDb.query(WIDE_CHECK_SQL, { memoize: false }),
     sqlite.prepare(WIDE_CHECK_SQLITE_SQL).all(),
   );
+}
+
+for (const read of WIDE_READS) {
+  const statement = sqlite.prepare(read.sql);
+  const pgliteSql = positionalToNumbered(read.sql);
+  const params = (n: number): number[] => read.params?.(n) ?? [];
+  const counters = { minnow: 0, sqlite: 0, pglite: 0 };
+  const runners = {
+    minnow: () =>
+      wideDb.query(read.sql, { memoize: false, params: params(counters.minnow++) as never }),
+    sqlite: () => statement.all(...params(counters.sqlite++)),
+    pglite: () => pglite.query(pgliteSql, params(counters.pglite++)),
+  };
+  assertQueryEquivalent(
+    { name: read.name, sql: read.sql, ...(read.ordered === true ? { ordered: true } : {}) },
+    await wideDb.query(read.sql, { memoize: false, params: params(0) as never }),
+    statement.all(...params(0)),
+  );
+  const singleRuns = [
+    await warmUp(runners.minnow),
+    await warmUp(runners.sqlite),
+    await warmUp(runners.pglite),
+  ];
+  const iterations = singleRuns.map((singleRun) => iterationsFor(singleRun));
+  results.push({
+    name: read.name,
+    minnow: await timeRepeated(runners.minnow, iterations[0] ?? 1),
+    engine: {
+      sqlite: await timeRepeated(runners.sqlite, iterations[1] ?? 1),
+      pglite: await timeRepeated(runners.pglite, iterations[2] ?? 1),
+    },
+  });
 }
 
 /**

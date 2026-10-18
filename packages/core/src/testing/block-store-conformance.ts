@@ -24,7 +24,10 @@ import {
   type TableRecord,
   type TransactionRecord,
   KEY_FORWARDS_RECORD_ID,
+  acceptsPackedSegments,
+  packedSegmentMemberId,
 } from "../storage/types.js";
+import { encodePackedBlock } from "../block-format/index.js";
 
 /**
  * The storage-contract conformance kit: the executable half of the `BlockStore` documentation,
@@ -2744,6 +2747,112 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
           next.start >= reserved.endExclusive,
           "counters must continue past the reserved high-water mark after a reopen",
         );
+        store.close();
+      },
+    },
+    {
+      name: "a store that declares packed segments stores and keeps their one packed block",
+      async run(target) {
+        let store = await target.create();
+        // Only a store that declares the capability is ever handed a packed segment.
+        if (!acceptsPackedSegments(store)) {
+          store.close();
+          return;
+        }
+        await store.addTable(table("t"));
+        const segmentId = "segment-packed";
+        const members = {
+          "col-id": packedSegmentMemberId(segmentId, "col-id"),
+          "col-v": packedSegmentMemberId(segmentId, "col-v"),
+        };
+        const packed = encodePackedBlock([
+          {
+            memberId: members["col-id"],
+            columnId: "col-id",
+            column: { type: "number", values: [1, 2] },
+          },
+          {
+            memberId: members["col-v"],
+            columnId: "col-v",
+            column: { type: "string", values: ["a", null] },
+          },
+        ]);
+        check(packed !== undefined, "the fixture's packed block did not encode");
+        const record: SegmentRecord = {
+          ...segment(segmentId, "table-t", "txn-packed", segmentId),
+          columnBlockIds: { "col-id": [members["col-id"]], "col-v": [members["col-v"]] },
+          packedBlockId: segmentId,
+        };
+        await store.createTransaction(transaction("txn-packed", null));
+        // A packed segment whose block was not staged, or whose members are not canonical,
+        // is refused before anything changes.
+        for (const [label, refused] of [
+          ["missing packed block", record],
+          [
+            "non-canonical member",
+            { ...record, columnBlockIds: { ...record.columnBlockIds, "col-v": ["other-block"] } },
+          ],
+        ] as Array<[string, SegmentRecord]>) {
+          let threw = false;
+          try {
+            await store.stageTransactionArtifacts({
+              transactionId: "txn-packed",
+              expectedRevision: 0,
+              blocks:
+                label === "missing packed block" ? [] : [{ id: segmentId, bytes: packed.bytes }],
+              segments: [refused],
+              updatedAt: T0,
+            });
+          } catch {
+            threw = true;
+          }
+          check(threw, `staging a packed segment with a ${label} must be refused`);
+          checkEqual(
+            (await store.getTransaction("txn-packed"))?.revision,
+            0,
+            `a refused packed segment (${label}) must not stage anything`,
+          );
+        }
+        await store.stageTransactionArtifacts({
+          transactionId: "txn-packed",
+          expectedRevision: 0,
+          blocks: [{ id: segmentId, bytes: packed.bytes }],
+          segments: [record],
+          updatedAt: T0,
+        });
+        const summary = await store.commitTransaction({
+          transactionId: "txn-packed",
+          expectedTransactionRevision: 1,
+          expectedManifestVersion: null,
+          levelZeroSegmentLimits: [{ tableId: "table-t", limit: MAX_LEVEL_ZERO_SEGMENTS }],
+          committedAt: LATER,
+        });
+        const verify = async (when: string) => {
+          checkEqual(
+            await manifestBlockIds(store, summary.version),
+            [segmentId],
+            `the packed block is the segment's one stored block ${when}`,
+          );
+          checkEqual(
+            await store.getBlock(segmentId),
+            packed.bytes,
+            `the packed block's bytes are kept exactly ${when}`,
+          );
+          check(
+            (await store.getBlock(members["col-id"])) === undefined,
+            `a member id is not a stored block ${when}`,
+          );
+          checkEqual(
+            await store.getSegment(segmentId),
+            record,
+            `the segment record keeps packedBlockId and its members ${when}`,
+          );
+        };
+        await verify("after commit");
+        if (target.reopen !== undefined) {
+          store = await target.reopen(store);
+          await verify("after a reopen");
+        }
         store.close();
       },
     },

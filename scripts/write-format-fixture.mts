@@ -34,7 +34,17 @@ mkdirSync(fileURLToPath(directory), { recursive: true });
 // the framed bytes. The compatibility test calls this same function and compares every
 // Minnow-owned byte after normalizing native gzip streams and their derived checksums.
 const { bytes, expectations } = await createFormatFixtureArtifact();
-const stem = `block${String(BLOCK_FORMAT_VERSION)}-snapshot${String(SNAPSHOT_FORMAT_VERSION)}`;
+// `--writer <name>` freezes a new writer artifact at unchanged format versions — a writer whose
+// records differ, as when staging limits change what a transaction's revision ends at — beside
+// the fixtures earlier writers left, instead of replacing one.
+const writerFlag = process.argv.indexOf("--writer");
+const writer = writerFlag < 0 ? undefined : process.argv[writerFlag + 1];
+if (writerFlag >= 0 && (writer === undefined || !/^[a-z0-9-]+$/.test(writer))) {
+  throw new Error("--writer takes a lowercase name");
+}
+const stem = `block${String(BLOCK_FORMAT_VERSION)}-snapshot${String(SNAPSHOT_FORMAT_VERSION)}${
+  writer === undefined ? "" : `-${writer}`
+}`;
 const { version: writerPackageVersion } = JSON.parse(
   readFileSync(new URL("../packages/core/package.json", import.meta.url), "utf8"),
 ) as { version: string };

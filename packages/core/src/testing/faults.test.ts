@@ -112,7 +112,7 @@ it("forwards the complete maintenance and recovery surface without changing argu
   const store = new FaultInjectingBlockStore(inner, (point) => {
     faults.push(point);
   });
-  const cases: Array<{ method: keyof BlockStore; args: unknown[] }> = [
+  const cases: Array<{ method: Extract<keyof BlockStore, string>; args: unknown[] }> = [
     { method: "readManifestBlock", args: [1, "block"] },
     { method: "removeTable", args: ["table", 2, { expectedCatalogEpoch: 3 }] },
     { method: "dropTable", args: [{ tableId: "table" }] },

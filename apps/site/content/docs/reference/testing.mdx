@@ -32,6 +32,7 @@ after generated declarations or asynchronous signatures change.
 | `npm run simulate`                 | One replayable deterministic concurrency, fault, and storage simulation                                                                                        | Storage and transaction changes             |
 | `npm run test:simulator:full`      | 4,000 concurrent mutations plus deterministic fault and maintenance checkpoints, then three long interaction plans over the memory, IndexedDB, and OPFS stores | Before a release                            |
 | `npm run simulate:interactions`    | One replayable interaction plan: DDL, DML, transactions, concurrent rounds, faults, reopens, and maintenance against a shadow model                            | Engine, index, and transaction changes      |
+| `npm run test:packed`              | Differential, conformance, and SQLLogicTest suites with every segment packed that can be; `:full` adds the simulators                                          | Packed-segment and block-read changes       |
 | `npm run fixture:format`           | Freezes a database this build wrote, as a compatibility fixture                                                                                                | Before changing a format version            |
 | `npm run test:browser:library`     | Core IndexedDB, OPFS, transaction, SQLLogicTest, and multi-tab interaction-plan tests in Chromium, Firefox, and WebKit                                         | Storage, engine, or browser-runtime changes |
 | `npm run test:browser:conformance` | Full core browser suite, full SQLLogicTest, and 800-step interactions over native IndexedDB and OPFS in all three browsers                                     | Release and nightly storage correctness     |
@@ -41,8 +42,8 @@ after generated declarations or asynchronous signatures change.
 | `npm run benchmark:gate`           | Seeded Node performance ratios against the checked-in baseline                                                                                                 | Query-executor and write-path changes       |
 | `npm run benchmark:sizes`          | Download size of Minnow, SQLite Wasm, and PGlite, from the installed packages                                                                                  | Dependency or public-entry changes          |
 | `npm run api:check`                | The public API surface against the committed contract snapshot                                                                                                 | Public-entry or declaration changes         |
-| `npm run check`                    | Format, types, lint, build, API contract, coverage, and fast SQLLogicTest                                                                                      | The local merge gate                        |
-| `npm run check:release`            | The local gate, full SQL/simulator, performance, and browser runners                                                                                           | Release candidates                          |
+| `npm run check`                    | Format, types, lint, build, API contract, coverage, fast SQLLogicTest, and `test:packed`                                                                       | The local merge gate                        |
+| `npm run check:release`            | The local gate, full SQL/simulator (also forced-packed), performance, and browser runners                                                                      | Release candidates                          |
 
 Install the browser binaries once before using a browser runner:
 
@@ -399,20 +400,27 @@ interrupts and retries the IndexedDB upgrade, races current and released openers
 damaged merge record as corruption, and checks that 0.15.0 then refuses the database. Schema 6
 and layout 11 were never released, so no alias writes them: `marker-upgrade.test.ts` upgrades
 layouts 7 to 10, and a layout-11 marker over the layout-10 fixture, to the current layout, folds a
-table across `ADD` and `DROP COLUMN` there, and merges a table's deltas there. A sixth alias, of
-core 0.16.0, is the last IndexedDB schema-7 and OPFS layout-12 writer, the last that stored every
-datetime column as `TIMESTAMPTZ`: `timestamp-kind-upgrade.test.ts` has it declare `TIMESTAMP` and
-`TIMESTAMPTZ` columns, upgrades the database to schema 8 or layout 13 through the ordinary open
-API, checks that those columns stay `TIMESTAMPTZ`, declares new `TIMESTAMP` columns that render
-without a zone, reopens, interrupts and retries the IndexedDB upgrade, races current and released
-openers, refuses a damaged time-zone mark as corruption, and checks that 0.16.0 then refuses the
+table across `ADD` and `DROP COLUMN` there, merges a table's deltas there, and writes packed
+segments there. A sixth alias, of core 0.16.0, is the last IndexedDB schema-7 and OPFS layout-12
+writer, the last that stored every datetime column as `TIMESTAMPTZ` and the last without packed
+segments: `timestamp-kind-upgrade.test.ts` has it declare `TIMESTAMP` and `TIMESTAMPTZ` columns,
+upgrades the database to schema 8 or layout 13 through the ordinary open API, checks that those
+columns stay `TIMESTAMPTZ`, declares new `TIMESTAMP` columns that render without a zone,
+reopens, interrupts and retries the IndexedDB upgrade, races current and released openers,
+refuses a damaged time-zone mark as corruption, and checks that 0.16.0 then refuses the
 database; `marker-upgrade.test.ts` takes the frozen layout-12 fixture to layout 13 the same way,
 and `snapshot-format3.test.ts` checks that only a snapshot with a `TIMESTAMP` column is written as
 format 3, that 0.16.0 refuses it into every store, and that 0.16.0's own snapshots import with
-their columns as instants. `format-compatibility.test.ts` restores the forward the frozen format-2
-fixture stored, checks it resolves until it expires, rekeys data an older writer exported, and
-restores the column kinds the frozen format-3 fixture stored. The marker upgrade is cut at each
-of its eight I/O boundaries by tab death and by power loss, from every older layout.
+their columns as instants. `packed-segment-upgrade.test.ts` writes a wide table's history with
+the same alias, upgrades the database, reads the history, writes single-row commits that pack,
+folds them with the released segments, reopens, interrupts and retries the IndexedDB upgrade,
+races current and released openers, refuses a damaged packed block and a record naming a member
+its block lacks, and checks that 0.16.0 then refuses the database; `packed-segments.test.ts`
+exports a database holding packed segments and imports the snapshot into this build and into
+0.16.0. `format-compatibility.test.ts` restores the forward the frozen format-2 fixture stored,
+checks it resolves until it expires, rekeys data an older writer exported, and restores the
+column kinds the frozen format-3 fixture stored. The marker upgrade is cut at each of its eight
+I/O boundaries by tab death and by power loss, from every older layout.
 `marker-race.test.ts` pauses one opener inside a marker write — while creating a database, and
 while upgrading one — lets a second opener read the marker in that window, and checks that the
 second waits instead of refusing the database or writing the marker again beside a live WAL.

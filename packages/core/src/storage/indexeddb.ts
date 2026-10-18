@@ -9,6 +9,12 @@ import {
   assertGenericTransactionUpdateAllowed,
 } from "./toolkit/transaction-rules.js";
 import {
+  packedSnapshotBlockSummary,
+  packedSnapshotFrames,
+  unpackedSnapshotSegment,
+  type PackedSnapshotFrame,
+} from "./toolkit/packed-snapshot.js";
+import {
   type AbortTransactionIfExpiredInput,
   type AdoptAbortedSegmentInput,
   type BeginTransactionInput,
@@ -221,8 +227,17 @@ import {
   WriteConflictError,
   type WriteTransactionInput,
   keyForwardsMarkerProblem,
+  packedSegmentShapeProblem,
+  segmentStoredBlockIds,
+  PACKED_SEGMENTS,
 } from "./types.js";
-import { crc32, verifyStoredBlock, parseJson } from "../block-format/index.js";
+import {
+  crc32,
+  isPackedBlock,
+  verifyStoredBlock,
+  verifyStoredPayload,
+  parseJson,
+} from "../block-format/index.js";
 import { dateIsoString } from "../date-value.js";
 import { WORK_SLICE_MS } from "../work-slicer.js";
 import {
@@ -399,8 +414,17 @@ interface SnapshotFrameExportMarker {
   header: SnapshotFrameStreamHeader;
   metadataFrameCount: number;
   nextBlockIndex: number;
+  /** The key of the last block frame: a stored block, or a member of `packedBlockId`. */
   lastBlockId: string | null;
+  /**
+   * The packed block whose member the last block frame was, or null. Absent in a marker a
+   * schema-7 build wrote, whose export holds no packed segment.
+   */
+  packedBlockId: string | null;
 }
+
+/** One exported block frame, and the packed block it is a member of, if any. */
+type SnapshotExportBlockFrame = PackedSnapshotFrame & { readonly packedBlockId: string | null };
 
 interface SnapshotFrameImportMarker {
   kind: "snapshot-frame-import";
@@ -567,10 +591,12 @@ const indexedDbSchemaMigrations: readonly IndexedDbSchemaMigration[] = [
     migrate: () => undefined,
   },
   {
-    // Schema 8 admits a column declared TIMESTAMP without time zone (`withoutTimeZone: true`).
-    // A schema-7 reader refuses that field as corruption, and a reader that ignored it would
-    // render the column's text as `timestamp with time zone`; nothing stored changes shape, and
-    // the version is the barrier that keeps that reader out.
+    // Schema 8 admits a column declared TIMESTAMP without time zone (`withoutTimeZone: true`),
+    // which a schema-7 reader refuses as corruption or would render as `timestamp with time
+    // zone`, and packed segments: a segment naming `packedBlockId`, whose one stored block holds
+    // every column, staged in calls of up to 1,024 blocks, whose blocks a schema-7 reader would
+    // count from its members. Nothing stored changes shape; the version is the barrier that keeps
+    // that reader out.
     targetVersion: 8,
     migrate: () => undefined,
   },
@@ -658,6 +684,7 @@ const TABLE_NAME_CACHE_LIMIT = 256;
 
 export class IndexedDbBlockStore implements BlockStore {
   readonly liveQueryChannelName: string;
+  readonly [PACKED_SEGMENTS] = true as const;
   readonly #db: IDBDatabase;
   readonly #durability: IDBTransactionDurability;
   readonly #uniqueKeyCacheBytes: number;
@@ -2087,7 +2114,7 @@ export class IndexedDbBlockStore implements BlockStore {
           throw new SnapshotManifestMissingError(actualVersion);
         }
       }
-      const tableBlockIds = new Set(removal.segments.flatMap(segmentBlockIds));
+      const tableBlockIds = new Set(removal.segments.flatMap(segmentStoredBlockIds));
       const otherTableBlockIds = new Set<string>();
       await visitObjectStoreSequentially(transaction.objectStore("segments"), (value, key) => {
         if (typeof key !== "string") throw corruption("segments", "record key is invalid");
@@ -2096,7 +2123,7 @@ export class IndexedDbBlockStore implements BlockStore {
           throw corruption(`segments/${key}`, `record declares id ${segment.id}`);
         }
         if (segment.tableId !== input.tableId) {
-          for (const blockId of segmentBlockIds(segment)) otherTableBlockIds.add(blockId);
+          for (const blockId of segmentStoredBlockIds(segment)) otherTableBlockIds.add(blockId);
         }
       });
       const retiredCandidates = [...tableBlockIds].filter((id) => !otherTableBlockIds.has(id));
@@ -2233,9 +2260,20 @@ export class IndexedDbBlockStore implements BlockStore {
           throw new SnapshotManifestMissingError(actualVersion);
         }
       }
+      // What each segment stores before and after the drop: a packed segment keeps its packed
+      // block whatever columns remain, so only an unpacked column's own blocks retire.
+      const withoutColumn = (segment: SegmentRecord): SegmentRecord => ({
+        ...segment,
+        columnBlockIds: Object.fromEntries(
+          Object.entries(segment.columnBlockIds).filter(
+            ([columnId]) => columnId !== input.columnId,
+          ),
+        ),
+      });
       const candidateBlockIds = new Set<string>();
       for (const segment of tableState.segments) {
-        for (const id of segment.columnBlockIds[input.columnId] ?? []) candidateBlockIds.add(id);
+        if (segment.columnBlockIds[input.columnId] === undefined) continue;
+        for (const id of segmentStoredBlockIds(segment)) candidateBlockIds.add(id);
       }
       const remainingBlockIds = new Set<string>();
       const segmentStore = transaction.objectStore("segments");
@@ -2245,10 +2283,8 @@ export class IndexedDbBlockStore implements BlockStore {
         if (segment.id !== key) {
           throw corruption(`segments/${key}`, `record declares id ${segment.id}`);
         }
-        for (const [columnId, blockIds] of Object.entries(segment.columnBlockIds)) {
-          if (segment.tableId === input.tableId && columnId === input.columnId) continue;
-          for (const id of blockIds) remainingBlockIds.add(id);
-        }
+        const kept = segment.tableId === input.tableId ? withoutColumn(segment) : segment;
+        for (const id of segmentStoredBlockIds(kept)) remainingBlockIds.add(id);
       });
       const retiredCandidates = [...candidateBlockIds].filter((id) => !remainingBlockIds.has(id));
       const newVersion =
@@ -2287,15 +2323,7 @@ export class IndexedDbBlockStore implements BlockStore {
       await updateCatalogResourceLedger(transaction.objectStore("statistics"), table, updatedTable);
       const segmentChanges = tableState.segments.flatMap((segment) => {
         if (segment.columnBlockIds[input.columnId] === undefined) return [];
-        const next = asSegmentRecord({
-          ...segment,
-          columnBlockIds: Object.fromEntries(
-            Object.entries(segment.columnBlockIds).filter(
-              ([columnId]) => columnId !== input.columnId,
-            ),
-          ),
-        });
-        return [{ previous: segment, next }];
+        return [{ previous: segment, next: asSegmentRecord(withoutColumn(segment)) }];
       });
       await updateRecordResourceLedger(transaction.objectStore("statistics"), {
         manifests: [{ next: manifest }],
@@ -3150,7 +3178,10 @@ export class IndexedDbBlockStore implements BlockStore {
           `owned segment ${segmentId} is absent from its journal`,
         );
       }
-      const published = await findReadableManifestBlock(transaction, segmentBlockIds(segment));
+      const published = await findReadableManifestBlock(
+        transaction,
+        segmentStoredBlockIds(segment),
+      );
       if (published !== undefined) {
         throw new Error(
           `Segment ${segmentId} is published by manifest ${String(published.version)}`,
@@ -3313,7 +3344,9 @@ export class IndexedDbBlockStore implements BlockStore {
         );
         for (const id of snapshotBlocks) availableBlocks.add(id);
       }
-      const unavailableBlock = segmentBlockIds(desired).find((id) => !availableBlocks.has(id));
+      const unavailableBlock = segmentStoredBlockIds(desired).find(
+        (id) => !availableBlocks.has(id),
+      );
       if (unavailableBlock !== undefined) {
         throw new Error(
           `Replacement segment ${desired.id} references unavailable block ${unavailableBlock}`,
@@ -3321,19 +3354,21 @@ export class IndexedDbBlockStore implements BlockStore {
       }
       const missingBlock = (
         await Promise.all(
-          segmentBlockIds(desired).map((id) =>
+          segmentStoredBlockIds(desired).map((id) =>
             requestResult(transaction.objectStore("blocks").getKey(id)),
           ),
         )
       ).findIndex((key) => key === undefined);
       if (missingBlock >= 0) {
         throw new Error(
-          `Replacement segment references missing block: ${segmentBlockIds(desired)[missingBlock] ?? ""}`,
+          `Replacement segment references missing block: ${segmentStoredBlockIds(desired)[missingBlock] ?? ""}`,
         );
       }
       await assertSegmentTargetsCurrentTable(transaction.objectStore("catalog"), desired);
 
-      if ((await findReadableManifestBlock(transaction, segmentBlockIds(stored))) !== undefined) {
+      if (
+        (await findReadableManifestBlock(transaction, segmentStoredBlockIds(stored))) !== undefined
+      ) {
         throw new Error(`Segment ${desired.id} is still reachable from a readable manifest`);
       }
       await visitTransactionRecords(transaction, (candidate) => {
@@ -4188,7 +4223,7 @@ export class IndexedDbBlockStore implements BlockStore {
       // A segment may only name blocks this call carries or the journal already holds. The
       // common case resolves from this call alone; the rest consult the journal membership.
       for (const segment of normalizedSegments) {
-        const unjournaledBlock = segmentBlockIds(segment).find(
+        const unjournaledBlock = segmentStoredBlockIds(segment).find(
           (id) => !ids.has(id) && !journal.blockIdSet.has(id),
         );
         if (unjournaledBlock !== undefined) {
@@ -4384,9 +4419,7 @@ export class IndexedDbBlockStore implements BlockStore {
           removedSegmentRecords.push(segment);
           return;
         }
-        const referenced = Object.values(segment.columnBlockIds)
-          .flat()
-          .find((id) => removedBlocks.has(id));
+        const referenced = segmentStoredBlockIds(segment).find((id) => removedBlocks.has(id));
         if (referenced !== undefined) {
           throw corruption(
             `transactions/${input.transactionId}`,
@@ -4674,7 +4707,9 @@ export class IndexedDbBlockStore implements BlockStore {
       // written commits, and every read of it answers from the rows it was meant to replace.
       const stagedBlockIds = new Set(staged.pendingBlockIds);
       for (const segment of normalizedSegments) {
-        const unjournaledBlock = segmentBlockIds(segment).find((id) => !stagedBlockIds.has(id));
+        const unjournaledBlock = segmentStoredBlockIds(segment).find(
+          (id) => !stagedBlockIds.has(id),
+        );
         if (unjournaledBlock !== undefined) {
           throw new Error(
             `Segment ${segment.id} references block absent from the transaction journal: ${unjournaledBlock}`,
@@ -7690,7 +7725,7 @@ export class IndexedDbBlockStore implements BlockStore {
             throw corruption(`segments/${key}`, "pending table segment has an unknown column");
           }
         }
-        for (const blockId of Object.values(segment.columnBlockIds).flat()) {
+        for (const blockId of segmentStoredBlockIds(segment)) {
           if ((await requestResult(blockStore.getKey(blockId))) === undefined) {
             throw corruption(`segments/${key}`, `referenced block ${blockId} is missing`);
           }
@@ -7776,7 +7811,8 @@ export class IndexedDbBlockStore implements BlockStore {
                   throw corruption(`segments/${segmentKey}`, "record id differs from key");
                 }
                 return (
-                  segment.transactionId !== record.id && segmentBlockIds(segment).includes(blockId)
+                  segment.transactionId !== record.id &&
+                  segmentStoredBlockIds(segment).includes(blockId)
                 );
               },
             );
@@ -8449,7 +8485,7 @@ export class IndexedDbBlockStore implements BlockStore {
         if (mode === "full") {
           checkedBlocks += 1;
           checkedBytes = safeByteSum(checkedBytes, bytes.byteLength, "Integrity checked bytes");
-          verifyStoredBlock(bytes);
+          verifyStoredPayload(bytes);
         }
       } catch (error) {
         issue("invalid-block", `blocks/${key}`, error);
@@ -8468,6 +8504,148 @@ export class IndexedDbBlockStore implements BlockStore {
   }
 
   /** Captures one immutable, framed view and its durable GC pin without reading payload bytes. */
+  /** Packed member frames an export is writing, so each member reads its packed block once. */
+  #packedSnapshotExportCache:
+    | { sessionId: string; packedBlockId: string; frames: readonly PackedSnapshotFrame[] }
+    | undefined;
+
+  /**
+   * Reads an export's block frames: manifest blocks in id order, with a packed block's members
+   * written in its place. A member id sorts directly after its packed block, so the frames stay
+   * in canonical order.
+   */
+  #snapshotExportBlockReader(
+    transaction: IDBTransaction,
+    marker: SnapshotFrameExportMarker,
+  ): {
+    next(): Promise<SnapshotExportBlockFrame>;
+    at(key: string, packedBlockId: string | null): Promise<SnapshotExportBlockFrame>;
+  } {
+    const catalog = transaction.objectStore("catalog");
+    const blocks = transaction.objectStore("blocks");
+    const frames = transaction.objectStore(SNAPSHOT_HEADER_STORE);
+    const storedBlock = async (blockRecord: ManifestBlockRecord): Promise<Uint8Array> => {
+      const value: unknown = await requestResult(blocks.get(blockRecord.blockId));
+      if (value === undefined) {
+        throw corruption(`blocks/${blockRecord.blockId}`, "pinned block is missing");
+      }
+      const payload = asBytes(value, `blocks/${blockRecord.blockId}`);
+      const metadata = asStoredBlockMetadata(
+        await requestResult<unknown>(catalog.get(blockMetadataKey(blockRecord.blockId))),
+        blockRecord.blockId,
+      );
+      if (
+        payload.byteLength !== blockRecord.byteLength ||
+        payload.byteLength !== metadata.byteLength ||
+        crc32(payload) !== blockRecord.checksum ||
+        metadata.checksum !== blockRecord.checksum
+      ) {
+        throw corruption(`blocks/${blockRecord.blockId}`, "pinned block metadata is inconsistent");
+      }
+      return payload;
+    };
+    const visibleRecord = async (blockId: string): Promise<ManifestBlockRecord> => {
+      const record = asManifestBlockRecord(
+        await requestResult<unknown>(catalog.get(manifestBlockKey(blockId))),
+        blockId,
+      );
+      if (!manifestBlockVisibleAt(record, marker.manifestVersion)) {
+        throw corruption(SNAPSHOT_EXPORT_KEY, "replayed block is outside the pinned manifest");
+      }
+      return record;
+    };
+    const membersOf = async (
+      packedBlockId: string,
+      packed?: Uint8Array,
+    ): Promise<readonly PackedSnapshotFrame[]> => {
+      const cached = this.#packedSnapshotExportCache;
+      if (cached?.sessionId === marker.sessionId && cached.packedBlockId === packedBlockId) {
+        return cached.frames;
+      }
+      const sequence: unknown = await requestResult(
+        frames.get(snapshotPackedSegmentKey(marker.sessionId, packedBlockId)),
+      );
+      if (!Number.isSafeInteger(sequence)) {
+        throw corruption(`blocks/${packedBlockId}`, "packed block has no exported segment");
+      }
+      const metadata = asSnapshotFrame(
+        await requestResult<unknown>(
+          frames.get(snapshotFrameKey("export", marker.sessionId, sequence as number)),
+        ),
+        sequence as number,
+      );
+      const [item] = decodeSnapshotMetadataItems("segment-page", metadata.payload);
+      if (item?.kind !== "segment") {
+        throw corruption(`blocks/${packedBlockId}`, "packed block's segment frame is invalid");
+      }
+      const members = packedSnapshotFrames(
+        "indexeddb",
+        { ...item.record, packedBlockId },
+        packed ?? (await storedBlock(await visibleRecord(packedBlockId))),
+      );
+      this.#packedSnapshotExportCache = {
+        sessionId: marker.sessionId,
+        packedBlockId,
+        frames: members,
+      };
+      return members;
+    };
+    return {
+      next: async () => {
+        const cursor = marker.lastBlockId;
+        if (marker.packedBlockId !== null && cursor !== null) {
+          const member = (await membersOf(marker.packedBlockId)).find(
+            (frame) => frame.key > cursor,
+          );
+          if (member !== undefined) return { ...member, packedBlockId: marker.packedBlockId };
+        }
+        let after = cursor;
+        for (;;) {
+          const blockRecord = await nextManifestBlockRecord(
+            catalog.index(MANIFEST_BLOCK_ID_INDEX),
+            marker.manifestVersion,
+            after,
+          );
+          if (blockRecord === undefined) {
+            throw corruption(SNAPSHOT_EXPORT_KEY, "manifest block count exceeds provenance");
+          }
+          const payload = await storedBlock(blockRecord);
+          if (!isPackedBlock(payload)) {
+            return {
+              key: blockRecord.blockId,
+              payload,
+              checksum: blockRecord.checksum,
+              packedBlockId: null,
+            };
+          }
+          // A packed segment whose every column was dropped names no member; nothing replaces it.
+          const first = (await membersOf(blockRecord.blockId, payload))[0];
+          if (first !== undefined) return { ...first, packedBlockId: blockRecord.blockId };
+          after = blockRecord.blockId;
+        }
+      },
+      at: async (key, packedBlockId) => {
+        if (packedBlockId === null) {
+          const blockRecord = await visibleRecord(key);
+          return {
+            key,
+            payload: await storedBlock(blockRecord),
+            checksum: blockRecord.checksum,
+            packedBlockId: null,
+          };
+        }
+        const member = (await membersOf(packedBlockId)).find((frame) => frame.key === key);
+        if (member === undefined) {
+          throw corruption(
+            SNAPSHOT_EXPORT_KEY,
+            "replayed packed member is not in its packed block",
+          );
+        }
+        return { ...member, packedBlockId };
+      },
+    };
+  }
+
   async beginSnapshotFrameExport(
     input: BeginSnapshotFrameExportInput,
   ): Promise<SnapshotFrameExportSession> {
@@ -8480,7 +8658,15 @@ export class IndexedDbBlockStore implements BlockStore {
     );
     const sessionId = `snapshot-export/${crypto.randomUUID()}`;
     const transaction = this.#transaction(
-      ["catalog", "leases", "manifests", "segments", "transactions", SNAPSHOT_HEADER_STORE],
+      [
+        "blocks",
+        "catalog",
+        "leases",
+        "manifests",
+        "segments",
+        "transactions",
+        SNAPSHOT_HEADER_STORE,
+      ],
       "readwrite",
     );
     try {
@@ -8521,6 +8707,7 @@ export class IndexedDbBlockStore implements BlockStore {
         summaries,
         frameCount: metadataFrameCount,
         formatVersion,
+        packedBlocks,
       } = await writeSnapshotMetadataFramesInTransaction({
         transaction,
         manifest,
@@ -8534,11 +8721,10 @@ export class IndexedDbBlockStore implements BlockStore {
           this.#snapshotPeakRetainedBytes = Math.max(this.#snapshotPeakRetainedBytes, bytes);
         },
       });
-      summaries.block = {
-        frameCount: manifest.liveBlockCount,
-        itemCount: manifest.liveBlockCount,
-        storedBytes: manifest.liveBlockBytes,
-      };
+      summaries.block = packedSnapshotBlockSummary(
+        { frameCount: manifest.liveBlockCount, storedBytes: manifest.liveBlockBytes },
+        packedBlocks,
+      );
       const header = prepareSnapshotFrameStreamHeader({
         formatVersion,
         databaseVersion: version,
@@ -8571,6 +8757,7 @@ export class IndexedDbBlockStore implements BlockStore {
         metadataFrameCount,
         nextBlockIndex: 0,
         lastBlockId: null,
+        packedBlockId: null,
       };
       leases.add(lease, sessionId);
       catalog.add(marker, SNAPSHOT_EXPORT_KEY);
@@ -8636,62 +8823,28 @@ export class IndexedDbBlockStore implements BlockStore {
         );
       } else if (input.sequence < totalFrames) {
         const blockIndex = input.sequence - marker.metadataFrameCount;
-        let blockRecord: ManifestBlockRecord;
+        const reader = this.#snapshotExportBlockReader(transaction, marker);
+        let block: SnapshotExportBlockFrame;
         if (blockIndex === marker.nextBlockIndex) {
-          const next = await nextManifestBlockRecord(
-            catalog.index(MANIFEST_BLOCK_ID_INDEX),
-            marker.manifestVersion,
-            marker.lastBlockId,
-          );
-          if (next === undefined) {
-            throw corruption(SNAPSHOT_EXPORT_KEY, "manifest block count exceeds provenance");
-          }
-          blockRecord = next;
+          block = await reader.next();
           updatedMarker = {
             ...marker,
             nextBlockIndex: incrementSafeInteger(blockIndex, "Snapshot block cursor"),
-            lastBlockId: blockRecord.blockId,
+            lastBlockId: block.key,
+            packedBlockId: block.packedBlockId,
           };
         } else if (blockIndex + 1 === marker.nextBlockIndex && marker.lastBlockId !== null) {
-          blockRecord = asManifestBlockRecord(
-            await requestResult<unknown>(catalog.get(manifestBlockKey(marker.lastBlockId))),
-            marker.lastBlockId,
-          );
-          if (!manifestBlockVisibleAt(blockRecord, marker.manifestVersion)) {
-            throw corruption(SNAPSHOT_EXPORT_KEY, "replayed block is outside the pinned manifest");
-          }
+          block = await reader.at(marker.lastBlockId, marker.packedBlockId);
         } else {
           throw new RangeError("Snapshot block frames must be read contiguously");
-        }
-        const value: unknown = await requestResult(
-          transaction.objectStore("blocks").get(blockRecord.blockId),
-        );
-        if (value === undefined) {
-          throw corruption(`blocks/${blockRecord.blockId}`, "pinned block is missing");
-        }
-        const payload = asBytes(value, `blocks/${blockRecord.blockId}`);
-        const metadata = asStoredBlockMetadata(
-          await requestResult<unknown>(catalog.get(blockMetadataKey(blockRecord.blockId))),
-          blockRecord.blockId,
-        );
-        if (
-          payload.byteLength !== blockRecord.byteLength ||
-          payload.byteLength !== metadata.byteLength ||
-          crc32(payload) !== blockRecord.checksum ||
-          metadata.checksum !== blockRecord.checksum
-        ) {
-          throw corruption(
-            `blocks/${blockRecord.blockId}`,
-            "pinned block metadata is inconsistent",
-          );
         }
         frame = {
           sequence: input.sequence,
           kind: "block",
           itemCount: 1,
-          key: blockRecord.blockId,
-          payload,
-          checksum: blockRecord.checksum,
+          key: block.key,
+          payload: block.payload,
+          checksum: block.checksum,
         };
       }
       const revision = incrementSafeInteger(lease.revision, "Snapshot export revision");
@@ -11416,6 +11569,14 @@ function snapshotFrameKey(
   return [direction, identity, sequence];
 }
 
+/**
+ * The export's record of where a packed block's segment frame is. Its key extends the export's
+ * frame keys, so clearing the export's frames clears these too.
+ */
+function snapshotPackedSegmentKey(identity: string, packedBlockId: string): IDBValidKey {
+  return ["export", identity, "packed", packedBlockId];
+}
+
 function deleteSnapshotFrameRecords(
   store: IDBObjectStore,
   direction: "export" | "import",
@@ -11699,9 +11860,11 @@ function asSnapshotFrameExportMarker(value: unknown): SnapshotFrameExportMarker 
       "metadataFrameCount",
       "nextBlockIndex",
       "lastBlockId",
+      "packedBlockId",
     ],
     SNAPSHOT_EXPORT_KEY,
   );
+  const packedBlockId = value.packedBlockId ?? null;
   if (
     value.kind !== "snapshot-frame-export" ||
     !isStorageId(value.sessionId) ||
@@ -11714,7 +11877,8 @@ function asSnapshotFrameExportMarker(value: unknown): SnapshotFrameExportMarker 
     (value.metadataFrameCount as number) < 0 ||
     !Number.isSafeInteger(value.nextBlockIndex) ||
     (value.nextBlockIndex as number) < 0 ||
-    (value.lastBlockId !== null && !isStorageId(value.lastBlockId))
+    (value.lastBlockId !== null && !isStorageId(value.lastBlockId)) ||
+    (packedBlockId !== null && (!isStorageId(packedBlockId) || value.lastBlockId === null))
   ) {
     throw corruption(SNAPSHOT_EXPORT_KEY, "active export marker is invalid");
   }
@@ -11753,6 +11917,7 @@ function asSnapshotFrameExportMarker(value: unknown): SnapshotFrameExportMarker 
     metadataFrameCount,
     nextBlockIndex: value.nextBlockIndex as number,
     lastBlockId: value.lastBlockId,
+    packedBlockId,
   };
 }
 
@@ -12402,7 +12567,7 @@ async function validateAndPromoteStagedSnapshot(
     if ((await readTransactionRecord(transaction, segment.transactionId)) === undefined) {
       throw corruption(`segments/${key}`, "snapshot segment owner is missing");
     }
-    for (const blockId of segmentBlockIds(segment)) {
+    for (const blockId of segmentStoredBlockIds(segment)) {
       const provenance = asManifestBlockRecord(
         await requestResult<unknown>(catalog.get(manifestBlockKey(blockId))),
         blockId,
@@ -12767,8 +12932,11 @@ async function writeSnapshotMetadataFramesInTransaction(input: {
   frameCount: number;
   /** The lowest format the written catalog records need; see `SnapshotFormatVersion`. */
   formatVersion: SnapshotFormatVersion;
+  /** On export, each packed block with the member frames it exports in its place. */
+  packedBlocks: Array<{ packedBytes: number; frames: readonly PackedSnapshotFrame[] }>;
 }> {
   const catalog = input.transaction.objectStore("catalog");
+  const packedBlocks: Array<{ packedBytes: number; frames: readonly PackedSnapshotFrame[] }> = [];
   const frameStore = input.transaction.objectStore(SNAPSHOT_HEADER_STORE);
   const summaries = emptySnapshotKindSummaries();
   let sequence = 0;
@@ -12838,7 +13006,7 @@ async function writeSnapshotMetadataFramesInTransaction(input: {
     ) {
       return;
     }
-    for (const blockId of segmentBlockIds(record)) {
+    for (const blockId of segmentStoredBlockIds(record)) {
       const provenanceValue: unknown = await requestResult(catalog.get(manifestBlockKey(blockId)));
       if (
         provenanceValue === undefined ||
@@ -12848,7 +13016,24 @@ async function writeSnapshotMetadataFramesInTransaction(input: {
       }
     }
     input.observeRetainedItems(1);
-    writeItem("segment-page", { kind: "segment", record } satisfies SnapshotSegmentItem);
+    if (record.packedBlockId !== undefined && input.direction === "export") {
+      const value: unknown = await requestResult(
+        input.transaction.objectStore("blocks").get(record.packedBlockId),
+      );
+      if (value === undefined) {
+        throw corruption(`blocks/${record.packedBlockId}`, "packed block is missing");
+      }
+      const packed = asBytes(value, `blocks/${record.packedBlockId}`);
+      packedBlocks.push({
+        packedBytes: packed.byteLength,
+        frames: packedSnapshotFrames("indexeddb", record, packed),
+      });
+      frameStore.add(sequence, snapshotPackedSegmentKey(input.identity, record.packedBlockId));
+    }
+    writeItem("segment-page", {
+      kind: "segment",
+      record: unpackedSnapshotSegment(record),
+    } satisfies SnapshotSegmentItem);
   });
   await visitObjectStoreSequentially(
     input.transaction.objectStore("transactions"),
@@ -12972,7 +13157,7 @@ async function writeSnapshotMetadataFramesInTransaction(input: {
     }
   });
   void input.manifest;
-  return { summaries, frameCount: sequence, formatVersion };
+  return { summaries, frameCount: sequence, formatVersion, packedBlocks };
 }
 
 function blockMetadataKey(id: string): string {
@@ -14184,6 +14369,7 @@ function asSegmentRecord(value: unknown): SegmentRecord {
       "commitOrdinal",
       "rowIdSpans",
       "partitionOrdinal",
+      "packedBlockId",
       "createdAt",
     ],
     "segments",
@@ -14249,6 +14435,11 @@ function asSegmentRecord(value: unknown): SegmentRecord {
     value.logicalOrder < 0
   ) {
     throw corruption(location, "logical order is invalid");
+  }
+  if (value.packedBlockId !== undefined) {
+    nonEmptyStoredString(value.packedBlockId, `${location}/packedBlockId`);
+    const problem = packedSegmentShapeProblem(value as unknown as SegmentRecord);
+    if (problem !== undefined) throw corruption(location, problem);
   }
   validStoredTimestamp(value.createdAt, `${location}/createdAt`);
   const zeroKeyedEnvelope =
@@ -14424,7 +14615,7 @@ async function assertCompactionJobReferences(
         `Compaction job ${job.id} source segment belongs to another table: ${segmentId}`,
       );
     }
-    for (const blockId of segmentBlockIds(segment)) {
+    for (const blockId of segmentStoredBlockIds(segment)) {
       if (!declaredSourceBlocks.has(blockId)) {
         throw new Error(
           `Compaction job ${job.id} source segment block is absent from its source list: ${blockId}`,
@@ -14517,7 +14708,7 @@ async function assertCompactionRetirementInTransaction(
         `Compaction job ${jobId} source segment belongs to another table: ${segmentId}`,
       );
     }
-    for (const blockId of segmentBlockIds(segment)) {
+    for (const blockId of segmentStoredBlockIds(segment)) {
       if (!declaredSourceBlocks.has(blockId)) {
         throw new Error(
           `Compaction job ${jobId} source segment references undeclared block: ${blockId}`,
@@ -14548,7 +14739,7 @@ async function assertCompactionRetirementInTransaction(
       throw corruption(`segments/${segmentKey}`, `record declares id ${segment.id}`);
     }
     if (declaredSourceSegments.has(segment.id)) return;
-    const alias = segmentBlockIds(segment).find((blockId) => retired.has(blockId));
+    const alias = segmentStoredBlockIds(segment).find((blockId) => retired.has(blockId));
     if (alias !== undefined) {
       throw new Error(
         `Compaction job ${jobId} cannot retire block ${alias}; segment ${segment.id} also references it`,
@@ -14739,7 +14930,7 @@ async function countVisibleLevelZeroSegments(
   }
   const memberships = await Promise.all(
     candidates.map((segment) =>
-      manifestBlockMembershipInTransaction(catalog, version, segmentBlockIds(segment)),
+      manifestBlockMembershipInTransaction(catalog, version, segmentStoredBlockIds(segment)),
     ),
   );
   const owners = new Map<string, { segmentId: string; count: number }>();
@@ -14798,7 +14989,7 @@ async function compactionJobRemovalPreservesProvenance(
     if (typeof key !== "string") throw corruption("segments", "record key is invalid");
     const segment = asSegmentRecord(value);
     if (segment.id !== key) throw corruption(`segments/${key}`, `record declares id ${segment.id}`);
-    for (const blockId of segmentBlockIds(segment)) rootedBlocks.add(blockId);
+    for (const blockId of segmentStoredBlockIds(segment)) rootedBlocks.add(blockId);
   });
   await visitTransactionRecords(transaction, (record) => {
     for (const blockId of record.pendingBlockIds) rootedBlocks.add(blockId);
@@ -14942,7 +15133,7 @@ async function assertPendingArtifactsAvailableInTransaction(
         );
       }
       segments.push(segment);
-      const unjournaledBlock = segmentBlockIds(segment).find((id) => !pendingBlocks.has(id));
+      const unjournaledBlock = segmentStoredBlockIds(segment).find((id) => !pendingBlocks.has(id));
       if (unjournaledBlock !== undefined) {
         throw corruption(
           `transactions/${record.id}`,
@@ -15282,6 +15473,7 @@ function assertKnownCompactionJobNestedFields(
   }
   const sourceBlockFields = [
     "blockId",
+    "packedBlockId",
     "rowStart",
     "rowCount",
     "storedBytes",
@@ -15816,7 +16008,7 @@ async function collectBoundedPhysicalRootsInTransaction(
     const value: unknown = await requestResult(segmentStore.get(id));
     if (value === undefined) continue;
     const segment = asSegmentRecord(value);
-    const ids = segmentBlockIds(segment);
+    const ids = segmentStoredBlockIds(segment);
     const owner = await readStoredTransactionRecord(transaction, segment.transactionId);
     let allBlocksRooted = ids.length > 0;
     for (const blockId of ids) {
@@ -15838,16 +16030,12 @@ async function collectBoundedPhysicalRootsInTransaction(
     await visitObjectStoreReadBatches(segmentStore, (value) => {
       const segment = asSegmentRecord(value);
       if (candidateSegments.has(segment.id) && !rootedSegmentIds.has(segment.id)) return;
-      for (const id of segmentBlockIds(segment)) {
+      for (const id of segmentStoredBlockIds(segment)) {
         if (candidateBlocks.has(id)) rootedBlockIds.add(id);
       }
     });
   }
   return { blockIds: rootedBlockIds, segmentIds: rootedSegmentIds };
-}
-
-function segmentBlockIds(segment: SegmentRecord): string[] {
-  return [...new Set(Object.values(segment.columnBlockIds).flat())];
 }
 
 function validateGarbageCollectionStepInput(input: RunGarbageCollectionStepInput): void {

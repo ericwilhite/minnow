@@ -17,6 +17,8 @@
  * - `ExtentPool` — packed append-only files for bulk bytes, addressed by `Placement`.
  * - `encodeRecordJson` and the envelope codecs — JSON with bigint support, checksummed and
  *   versioned, for frames, checkpoints, and immutable chunks.
+ * - `packedSnapshotFrames` and its siblings — how a store that accepts packed segments exports
+ *   them unpacked, so packing never changes a snapshot's format.
  *
  * `SyncFileHandle` is the only substrate assumption the file-shaped pieces make; the browser's
  * `FileSystemSyncAccessHandle` satisfies it as-is, and so does anything with positioned
@@ -60,3 +62,10 @@ export {
   EncodedRecordTooLargeError,
   type PostingChunkEntry,
 } from "./wire.js";
+export {
+  packedSnapshotBlockSummary,
+  packedSnapshotFrames,
+  packedSnapshotMembers,
+  unpackedSnapshotSegment,
+  type PackedSnapshotFrame,
+} from "./packed-snapshot.js";

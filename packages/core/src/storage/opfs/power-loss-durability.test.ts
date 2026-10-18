@@ -19,7 +19,7 @@ import {
   snapshotFrameEnvelopeParts,
   snapshotFrameStreamHeaderIdentity,
 } from "../snapshot-stream.js";
-import type { SnapshotFrame, TableRecord } from "../types.js";
+import { MAX_TRANSACTION_STAGE_BLOCKS, type SnapshotFrame, type TableRecord } from "../types.js";
 import { PowerLossModel, bytesEqual } from "./power-loss-model.js";
 
 function table(name: string, id = `table-${name}`): TableRecord {
@@ -56,6 +56,44 @@ async function beginTransaction(store: OpfsBlockStore, label: string): Promise<s
 
 async function bigBlock(id: string, bytes: number): Promise<{ id: string; bytes: Uint8Array }> {
   return { id, bytes: await encodeBlock({ type: "string", values: ["x".repeat(bytes)] }, "raw") };
+}
+
+/** One staging call at the block limit: a block per row of one column, each its own payload. */
+async function fullStage(
+  store: OpfsBlockStore,
+  label: string,
+): Promise<{ transactionId: string; blocks: Array<{ id: string; bytes: Uint8Array }> }> {
+  const transactionId = await beginTransaction(store, label);
+  const blocks = await Promise.all(
+    Array.from({ length: MAX_TRANSACTION_STAGE_BLOCKS }, async (_, index) => ({
+      id: `${label}-${String(index).padStart(4, "0")}`,
+      bytes: await encodeBlock({ type: "string", values: [`row-${String(index)}`] }, "raw"),
+    })),
+  );
+  await store.stageTransactionArtifacts({
+    transactionId,
+    expectedRevision: 0,
+    blocks,
+    segments: [
+      {
+        id: `${label}-segment`,
+        tableId: "table-wide",
+        transactionId,
+        rowCount: blocks.length,
+        rowIdStart: 1n,
+        rowIdEndExclusive: BigInt(blocks.length + 1),
+        columnBlockIds: { c1: blocks.map((block) => block.id) },
+        kind: "insert",
+        level: 0,
+        logicalOrder: 0,
+        commitOrdinal: 0,
+        rowIdSpans: [],
+        createdAt: "2026-08-24T00:00:01.000Z",
+      },
+    ],
+    updatedAt: "2026-08-24T00:00:01.000Z",
+  });
+  return { transactionId, blocks };
 }
 
 interface Snapshot {
@@ -202,6 +240,40 @@ describe("power loss: strict durability", () => {
     store = await OpfsBlockStore.open({ name, root: shim.root, checkpointEntries: 1_000 });
     expect(await store.getCurrentManifestVersion()).toBe(committed.version);
     expect((await store.checkIntegrity({ mode: "full" })).ok).toBe(true);
+    store.close();
+  });
+
+  it("a stage of the full 1,024 blocks, one WAL frame, survives power loss and commits", async () => {
+    const shim = new MemoryOpfs();
+    const model = new PowerLossModel(shim);
+    const name = "pl-strict-full-stage";
+    let store = await OpfsBlockStore.open({ name, root: shim.root, checkpointEntries: 1_000 });
+    await store.addTable(table("wide"));
+    const { transactionId, blocks } = await fullStage(store, "full");
+    store._crashForTests();
+    model.powerLoss();
+    store = await OpfsBlockStore.open({ name, root: shim.root, checkpointEntries: 1_000 });
+    const record = await store.getTransaction(transactionId);
+    expect(record?.pendingBlockIds).toHaveLength(MAX_TRANSACTION_STAGE_BLOCKS);
+    const read = await store.getBlocks(blocks.map(({ id }) => id).slice(0, 64));
+    expect(
+      read.every(
+        (bytes, index) =>
+          bytes !== undefined && bytesEqual(bytes, blocks[index]?.bytes ?? new Uint8Array()),
+      ),
+    ).toBe(true);
+    const committed = await store.commitTransaction({
+      transactionId,
+      expectedTransactionRevision: record?.revision ?? -1,
+      expectedManifestVersion: null,
+      levelZeroSegmentLimits: [{ tableId: "table-wide", limit: 4096 }],
+      committedAt: "2026-08-24T00:00:03.000Z",
+    });
+    store._crashForTests();
+    model.powerLoss();
+    store = await OpfsBlockStore.open({ name, root: shim.root, checkpointEntries: 1_000 });
+    expect(await store.getCurrentManifestVersion()).toBe(committed.version);
+    expect((await store.checkIntegrity({ mode: "full" })).issues).toEqual([]);
     store.close();
   });
 
@@ -538,6 +610,48 @@ describe("power loss: relaxed durability", () => {
 
   it("recovery accepts a consecutive verified prefix (torn suffix survives partially)", async () => {
     expect(await sqlLoop("relaxed", true, 4)).toEqual([]);
+  });
+
+  it("a 1,024-block stage torn anywhere recovers whole or not at all", async () => {
+    const rng = mulberry32(1_024);
+    const outcomes = new Set<number>();
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      const shim = new MemoryOpfs();
+      const model = new PowerLossModel(shim);
+      const name = `pl-relaxed-full-stage-${String(attempt)}`;
+      const open = () =>
+        OpfsBlockStore.open({
+          name,
+          root: shim.root,
+          durability: "relaxed",
+          checkpointEntries: 1_000,
+        });
+      let store = await open();
+      await store.addTable(table("wide"));
+      const { transactionId, blocks } = await fullStage(store, "torn");
+      store._crashForTests();
+      // Each file keeps all it had not flushed, or a random prefix of it: the frame, or the
+      // payloads it names, may be cut anywhere.
+      model.powerLoss((unflushed) =>
+        rng() < 0.5 ? unflushed : Math.floor(rng() * (unflushed + 1)),
+      );
+      store = await open();
+      const record = await store.getTransaction(transactionId);
+      const journaled = record?.pendingBlockIds.length ?? 0;
+      expect([0, MAX_TRANSACTION_STAGE_BLOCKS]).toContain(journaled);
+      const present = (await store.getBlocks(blocks.slice(0, 64).map(({ id }) => id))).filter(
+        (bytes) => bytes !== undefined,
+      ).length;
+      expect(present).toBe(journaled === 0 ? 0 : 64);
+      outcomes.add(journaled);
+      expect((await store.checkIntegrity({ mode: "full" })).issues).toEqual([]);
+      store.close();
+    }
+    // Some cuts kept the whole stage and some lost it.
+    expect([...outcomes].sort((left, right) => left - right)).toEqual([
+      0,
+      MAX_TRANSACTION_STAGE_BLOCKS,
+    ]);
   });
 
   it("a durable WAL frame whose extent payload was lost is rolled back, never half-applied", async () => {
