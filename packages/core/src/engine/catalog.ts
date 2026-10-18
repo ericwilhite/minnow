@@ -9,6 +9,7 @@ import {
   type TableRecord,
 } from "../storage/types.js";
 import { externalSqlDomainValue } from "./sql-domains.js";
+import { storedExpressionColumns } from "./schema-expressions.js";
 
 /**
  * The published shape of the catalog: everything a schema tool needs to diff a live database
@@ -18,7 +19,8 @@ import { externalSqlDomainValue } from "./sql-domains.js";
  * and of what type", which is enough to render a table and not enough to plan a migration: a
  * rename is only expressible because a column keeps a stable ID across it, and a constraint can
  * only be diffed if it is visible in the first place. This carries both, plus the derived facts
- * (auto-increment, view bodies) that a planner would otherwise have to reverse-engineer.
+ * (auto-increment, view bodies, the columns each CHECK and generated expression reads) that a
+ * planner would otherwise have to reverse-engineer — the last one with a SQL compiler.
  */
 
 export interface CatalogColumn {
@@ -33,13 +35,24 @@ export interface CatalogColumn {
   /** Filled for omitted or SQL DEFAULT insert slots; never applied at read time. */
   readonly defaultValue?: ColumnDefault;
   /** Stored expression maintained by the engine; callers cannot assign this column. */
-  readonly generatedValue?: ColumnGenerated;
+  readonly generatedValue?: CatalogGenerated;
   /** String columns only: the closed set of values writes may draw from. */
   readonly enumValues?: readonly string[];
   /** Derived from the default spec, because a planner should not have to decode one. */
   readonly isAutoIncrementing: boolean;
   /** What rows written before this column existed read as, instead of NULL. */
   readonly backfill?: boolean | number | string | Date;
+}
+
+/** A stored generated expression, with the sibling columns it reads. */
+export interface CatalogGenerated extends ColumnGenerated {
+  /**
+   * The table's columns the expression reads, unqualified, as the engine resolved them. Absent
+   * when the engine cannot re-read the stored text, and in catalogs from versions before these
+   * lists were published; `planMigration` then refuses to drop or rename any column of the
+   * table rather than guess.
+   */
+  readonly columns?: readonly string[];
 }
 
 export interface CatalogForeignKey {
@@ -56,6 +69,8 @@ export interface CatalogCheck {
   readonly name: string;
   /** The boolean expression's text, as declared. */
   readonly sql: string;
+  /** The table's columns the condition reads; absent exactly as `CatalogGenerated.columns` is. */
+  readonly columns?: readonly string[];
 }
 
 export interface CatalogTrigger {
@@ -121,7 +136,12 @@ export interface Catalog {
   readonly views: readonly CatalogView[];
 }
 
-function toCatalogColumn(column: TableRecord["columns"][number]): CatalogColumn {
+function toCatalogColumn(tableName: string, column: TableRecord["columns"][number]): CatalogColumn {
+  const generated = column.generatedValue;
+  const generatedColumns =
+    generated === undefined
+      ? undefined
+      : storedExpressionColumns(tableName, generated.sql, `generated ${tableName}.${column.name}`);
   return {
     id: column.id,
     name: column.name,
@@ -130,7 +150,14 @@ function toCatalogColumn(column: TableRecord["columns"][number]): CatalogColumn 
     ...(column.sqlDomain === undefined ? {} : { sqlDomain: structuredClone(column.sqlDomain) }),
     nullable: column.nullable,
     ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
-    ...(column.generatedValue === undefined ? {} : { generatedValue: column.generatedValue }),
+    ...(generated === undefined
+      ? {}
+      : {
+          generatedValue: {
+            ...generated,
+            ...(generatedColumns === undefined ? {} : { columns: generatedColumns }),
+          },
+        }),
     ...(column.enumValues === undefined ? {} : { enumValues: [...column.enumValues] }),
     ...(column.backfill === undefined
       ? {}
@@ -152,7 +179,9 @@ export function toCatalog(records: readonly TableRecord[]): Catalog {
     ) {
       continue;
     }
-    const columns = record.columns.filter((column) => !column.hidden).map(toCatalogColumn);
+    const columns = record.columns
+      .filter((column) => !column.hidden)
+      .map((column) => toCatalogColumn(record.name, column));
     if (record.view !== undefined) {
       views.push({
         name: record.name,
@@ -177,7 +206,10 @@ export function toCatalog(records: readonly TableRecord[]): Catalog {
         ...key,
         enforced: key.enforced !== false,
       })),
-      checks: (record.checks ?? []).map((check) => ({ ...check })),
+      checks: (record.checks ?? []).map((check) => {
+        const read = storedExpressionColumns(record.name, check.sql, check.name);
+        return { ...check, ...(read === undefined ? {} : { columns: read }) };
+      }),
       ...(record.secondaryIndexes === undefined
         ? {}
         : {

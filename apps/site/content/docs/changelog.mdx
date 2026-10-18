@@ -8,6 +8,55 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## Unreleased
+
+Not yet published. This entry collects changes merged after 0.16.0; the release that ships them
+replaces this heading with its version and date. Package: `@minnowdb/core`.
+
+### Changed: the schema DSL no longer parses SQL
+
+- **Declaring tables no longer downloads the SQL compiler.** `table()` used to compile every CHECK,
+  `.defaultSql()`, and `.generatedSql()` expression, which pulled the parser, optimizer, and SQL
+  function tables into any page that declared a schema — even one whose engine runs in a worker.
+  Importing an error class such as `UniqueConstraintError` from `@minnowdb/core` also pulled part
+  of the engine, because it was re-exported through the engine module. A page that runs the engine
+  in a worker and imports the client, the schema DSL, error classes, the Kysely dialect and live
+  queries, and the React hooks now ships 101 KiB minified (30 KiB gzipped) on its main thread,
+  down from 356 KiB (102 KiB gzipped); the schema DSL with the error classes is 32 KiB (10 KiB
+  gzipped), down from 286 KiB (82 KiB gzipped). The engine bundles stay within 0.4 KiB of their
+  0.16.0 size.
+- **Invalid expression SQL is reported by `migrate()`, not `table()`.** The engine now compiles a
+  declaration's CHECK conditions and DEFAULT and generated expressions when `migrate()` runs, for
+  every table in the schema before any step applies, with the same messages and error types
+  `table()` threw. A schema with an invalid expression anywhere leaves the catalog untouched; with
+  the worker client the error comes back from the worker. `table()` and the column builders still
+  check everything else at declaration: names, keys, relations, and literal defaults and backfills.
+  See [When expression SQL is checked](/docs/schema#when-expression-sql-is-checked).
+- **The published catalog lists the columns stored expressions read.** `CatalogCheck.columns` and
+  `CatalogColumn.generatedValue.columns` (the new `CatalogGenerated` type) name the table's columns
+  each CHECK and generated expression reads, unqualified. `planMigration` decides whether a column
+  can be dropped or renamed from these lists instead of parsing SQL, so it no longer needs the
+  compiler either; when a catalog leaves a list out (a hand-built catalog, or one saved by an
+  earlier release), it refuses to drop or rename any column of that table rather than guess.
+
+### Fixed
+
+- **Dropping a column a CHECK named with its table's qualifier was allowed.** `dropColumn()` and
+  `ALTER TABLE … DROP COLUMN` accepted dropping `qty` from a table with `CHECK (items.qty > 0)`,
+  and the check then silently passed every row. It is now refused like an unqualified reference.
+
+### API changes
+
+New `CatalogGenerated` type; `CatalogCheck` gains optional `columns`. `compileGeneratedColumnExpression`
+is no longer exported from `@minnowdb/core/schema`: it was an engine internal that returned the
+compiler's expression tree.
+
+**Migration:** code that relied on `table()` throwing for invalid expression SQL — a unit test, or
+a build-time schema check — should call `migrate()` instead, for example on a database over
+`MemoryBlockStore`.
+
+**Stored formats:** unchanged.
+
 ## 0.16.0 — October 16, 2026
 
 Release packages: `@minnowdb/core@0.16.0`, `@minnowdb/kysely@0.6.0`, `@minnowdb/devtools@0.3.7`.

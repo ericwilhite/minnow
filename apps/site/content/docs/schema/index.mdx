@@ -68,11 +68,13 @@ The column modifiers are:
   nullable column may therefore also have a default. `defaultSql` accepts the SQL functions and
   operators Minnow implements, including `CURRENT_TIMESTAMP`, `random()`, `gen_random_uuid()`,
   and `nextval(...)`. It rejects column references, parameters, aggregates, windows, subqueries,
-  and a result type that does not match the column. `RETURNING` echoes the generated values.
+  and a result type that does not match the column — when `migrate()` runs, before anything
+  changes. `RETURNING` echoes the generated values.
 - **`.generatedSql(expression)`** — stores an immutable expression over ordinary sibling columns
   and recomputes it on every insert, upsert, and update. Generated columns are omitted from
   inferred insert/update inputs and cannot be row-addressing keys. The expression cannot use
-  parameters, aggregates, windows, subqueries, volatile functions, or another generated column.
+  parameters, aggregates, windows, subqueries, volatile functions, or another generated column;
+  `migrate()` checks it before anything changes.
 - **`.renamedFrom()`** — renames through the column's stable ID, so a rename is a metadata step
   rather than a drop-and-add.
 - **`.backfill(value)`** — what rows written before this column existed read as, instead of NULL.
@@ -203,10 +205,35 @@ CREATE TABLE children (
 );
 ```
 
-Each check is a boolean SQL expression over the table's own columns, compiled when the table is
-declared — so invalid SQL, an unknown column, or a reference to another relation fails before
-`migrate()` can change the catalog. CHECK and FOREIGN KEY names share the table's constraint
-namespace; a duplicate name across kinds is rejected at declaration time.
+Each check is a boolean SQL expression over the table's own columns. CHECK and FOREIGN KEY names
+share the table's constraint namespace; a duplicate name across kinds is rejected at declaration
+time.
+
+### When expression SQL is checked
+
+The schema DSL never parses SQL, so declaring tables does not download the SQL compiler — which
+matters on a page that runs the engine in a [worker](/docs/engine/workers) and keeps only the
+client and the declaration on the main thread. `table()` and the column builders check the shape
+of a declaration as soon as you write it: names, keys, relations, literal defaults and backfills.
+The SQL inside `checks`, `.defaultSql()`, and `.generatedSql()` is compiled by the engine when
+`migrate()` runs, for every table in the schema before any step applies. Invalid SQL, an unknown
+column, a reference to another relation, or a default of the wrong type therefore fails
+`migrate()` and leaves the catalog untouched; with the worker client the error comes back from the
+worker with the same message and type.
+
+```ts
+const orders = table(
+  "orders",
+  { id: column.integer().unique(), qty: column.integer() },
+  { checks: [{ name: "positive", sql: "quantity > 0" }] },
+); // no error yet: the DSL does not read the SQL
+
+await database.migrate(schema([orders]));
+// throws: CHECK positive names an unknown column: quantity
+```
+
+To catch such a mistake in a test, migrate the schema into a database over a
+[`MemoryBlockStore`](/docs/storage/memory).
 
 ### Informational relationships
 
@@ -504,7 +531,8 @@ library that speaks that interface can validate rows at runtime with your defini
 
 `planMigration(catalog, schema)` is the same diff `migrate()` runs, exposed as a pure function over
 the [published catalog](/docs/reference/extending#introspecting-the-catalog) — useful for previewing
-what a migration would do, or for building schema tooling of your own.
+what a migration would do, or for building schema tooling of your own. Like the rest of the DSL it
+does not compile the expression SQL a declaration carries; `migrate()` does that first.
 
 > Raw `createTable` (see [Writes](/docs/sql/dml)) remains available when compile-time types aren't
 > needed.

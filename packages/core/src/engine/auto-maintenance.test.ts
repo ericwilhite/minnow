@@ -12,7 +12,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryBlockStore, type Manifest, type TransactionRecord } from "../storage/index.js";
 import { SnapshotManifestMissingError } from "../storage/types.js";
-import { MaintenanceBacklogError, MinnowDatabase } from "./database.js";
+import { MinnowDatabase } from "./database.js";
+import { MaintenanceBacklogError } from "./errors.js";
 import { allVisibleSegments, heavyTestTimeout } from "./storage-test-helpers.js";
 
 vi.setConfig({ testTimeout: heavyTestTimeout(180_000) });

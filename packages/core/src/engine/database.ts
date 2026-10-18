@@ -74,31 +74,17 @@ import {
 } from "./scope-write-set.js";
 import { throwIfAborted } from "./cancellation.js";
 import { BufferedTableWriter, type BufferedWriterOptions } from "./buffered-writer.js";
-export {
-  attachLifecycleFlush,
-  BufferedTableWriter,
-  MAX_BUFFERED_WRITER_PENDING_ADDS,
-  type BufferedFlushResult,
-  type BufferedWriterOptions,
-  type LifecycleDocumentTarget,
-  type LifecycleFlushOptions,
-  type LifecycleFlushRequester,
-  type LifecyclePageTarget,
-} from "./buffered-writer.js";
 import {
   CompactionJobCancelledError,
   CompactionMemoryBudgetError,
   CompactionWriteAmplificationError,
   DatabaseReadBacklogError,
   TransactionExpiredError,
-  MaintenanceBacklogError,
   MissingKeyError,
-  SqlCompileError,
   UnknownTableError,
   UniqueConstraintError,
   VisibleSegmentCursorStaleError,
 } from "./errors.js";
-export { DatabaseReadBacklogError } from "./errors.js";
 import {
   BLOCK_HEADER_LENGTH,
   buildPhysicalColumnFromRanges,
@@ -249,7 +235,6 @@ import {
   PostingBuildConflictError,
   SnapshotManifestMissingError,
   SchemaConflictError,
-  TableInUseError,
   TableRecordConflictError,
   TransactionRecordConflictError,
   UniqueKeyBuildConflictError,
@@ -410,8 +395,12 @@ import {
 } from "./sql-domains.js";
 import { toCatalog, type Catalog } from "./catalog.js";
 import {
-  applyColumnSteps,
   compileGeneratedColumnExpression,
+  storedExpressionColumns,
+  validateSchemaExpressions,
+} from "./schema-expressions.js";
+import {
+  applyColumnSteps,
   declaredForeignKeys,
   isDestructiveStep,
   planMigration,
@@ -1732,20 +1721,6 @@ export interface TableDefinition {
 }
 
 export type DatabaseRow = Record<string, Exclude<BatchValue, null> | null>;
-
-export {
-  CompactionBacklogError,
-  CompactionJobCancelledError,
-  CompactionMemoryBudgetError,
-  CompactionWriteAmplificationError,
-  MaintenanceBacklogError,
-  MissingKeyError,
-  SqlCompileError,
-  UnknownTableError,
-  TableInUseError,
-  UniqueConstraintError,
-  VisibleSegmentCursorStaleError,
-};
 
 export interface MinnowDatabaseOptions<TSchema extends AnySchema = UntypedSchema> {
   /**
@@ -12707,6 +12682,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           "migrate() needs a schema: pass a definition, or construct the database with { schema }",
         );
       }
+      // The schema DSL does not parse SQL, so this is where a declaration's CHECK, DEFAULT, and
+      // generated expressions are first compiled — every table's, before any step applies, so an
+      // invalid expression anywhere leaves the catalog untouched.
+      validateSchemaExpressions(definition);
       // Table revisions also move under background full-text index activity (build stamps,
       // stale-writer invalidation), so a lost compare-and-swap no longer implies a concurrent
       // migrator. Migration is idempotent by construction — re-plan from fresh records and retry;
@@ -29346,16 +29325,9 @@ function assertColumnRenameSafe(
   column: TableColumnRecord,
 ): void {
   const where = `${table.name}.${column.name}`;
-  const names = (sql: string, label: string): readonly string[] => {
-    try {
-      return expressionColumnNames(compileCheckExpression(sql, label)).map(
-        (name) => name.split(".").at(-1) ?? name,
-      );
-    } catch {
-      // An expression that can no longer be read cannot prove it does not use the column.
-      return [column.name];
-    }
-  };
+  // An expression that can no longer be read cannot prove it does not use the column.
+  const names = (sql: string, label: string): readonly string[] =>
+    storedExpressionColumns(table.name, sql, label) ?? [column.name];
   for (const check of table.checks ?? []) {
     if (names(check.sql, check.name).includes(column.name)) {
       throw new TypeError(`Cannot rename ${where}: CHECK ${check.name} uses it`);
