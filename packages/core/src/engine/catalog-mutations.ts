@@ -50,6 +50,12 @@ export interface ColumnDefinition {
   integer?: true;
   /** PostgreSQL logical domain over the primitive storage type. */
   sqlDomain?: SqlDomain;
+  /**
+   * Datetime columns only: `TIMESTAMP` (without time zone). SQL text renders the value with no
+   * zone, `2026-01-02 03:04:05`. Absent is `TIMESTAMPTZ`, whose text ends in `+00`. Values are
+   * the same UTC instants either way, and JavaScript receives a `Date` for both.
+   */
+  withoutTimeZone?: true;
   nullable?: boolean;
   /** Fills omitted or SQL DEFAULT slots at insert time; never applied at read time. */
   defaultValue?: ColumnDefault;
@@ -117,23 +123,29 @@ function viewReadsTable(sql: string, table: string): boolean {
 
 type QueryColumnShape = SqlColumnSchema;
 
-/** One stored column as the compiler types a reference to it: name, type, and SQL domain. */
+/**
+ * One stored column as the compiler types a reference to it: name, type, SQL domain, and whether
+ * a datetime is a timestamp without time zone.
+ */
 export function querySchemaColumn({
   name,
   type,
   integer,
   sqlDomain,
+  withoutTimeZone,
 }: {
   readonly name: string;
   readonly type: QueryColumnShape["type"];
   readonly integer?: true | undefined;
   readonly sqlDomain?: SqlDomain | undefined;
+  readonly withoutTimeZone?: true | undefined;
 }): QueryColumnShape {
   return {
     name,
     type,
     ...(integer === true ? { integer: true as const } : {}),
     ...(sqlDomain === undefined ? {} : { sqlDomain }),
+    ...(withoutTimeZone === true && type === "datetime" ? { withoutTimeZone: true as const } : {}),
   };
 }
 
@@ -143,7 +155,12 @@ export function catalogQuerySchemas(
   return new Map(records.map((record) => [record.name, record.columns.map(querySchemaColumn)]));
 }
 
-function querySchemasEqual(
+/**
+ * Whether two output schemas agree on what a dependent view's readers can rely on: names, types,
+ * integer and SQL domains. A datetime's time-zone kind is left out: it changes only how the
+ * value renders as text, and a view stored before the kind was recorded must stay valid.
+ */
+export function querySchemasEqual(
   left: readonly QueryColumnShape[],
   right: readonly QueryColumnShape[],
 ): boolean {
@@ -410,12 +427,18 @@ export class CatalogMutations {
           throw new TypeError(`Enum values require a string column: ${columnName}`);
         }
         const sqlDomain = enumDomains.get(column.name) ?? column.sqlDomain;
+        if (column.withoutTimeZone !== undefined && column.type !== "datetime") {
+          throw new TypeError(
+            `TIMESTAMP without time zone requires a datetime column: ${columnName}`,
+          );
+        }
         return {
           id: this.#createId(),
           name: columnName,
           type: column.type,
           ...(column.integer === true ? { integer: true } : {}),
           ...(sqlDomain === undefined ? {} : { sqlDomain: structuredClone(sqlDomain) }),
+          ...(column.withoutTimeZone === true ? { withoutTimeZone: true as const } : {}),
           nullable: column.nullable ?? false,
           ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
           ...(column.generatedValue === undefined
@@ -738,6 +761,7 @@ export class CatalogMutations {
             type: column.type,
             ...(column.integer === true ? { integer: true as const } : {}),
             ...(column.sqlDomain === undefined ? {} : { sqlDomain: column.sqlDomain }),
+            ...(column.withoutTimeZone === true ? { withoutTimeZone: true as const } : {}),
             nullable: true,
           };
         });
@@ -971,7 +995,7 @@ export class CatalogMutations {
         try {
           const inferred = inferBlockSchema(compileQuery(owner.view.sql), schemas);
           const stored = owner.columns.map(querySchemaColumn);
-          if (JSON.stringify(inferred) !== JSON.stringify(stored)) {
+          if (!querySchemasEqual(inferred, stored)) {
             throw new TypeError("view output would change");
           }
         } catch {

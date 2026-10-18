@@ -35,7 +35,11 @@ import {
   validateTableRecordBounds,
   validateStorageId,
 } from "./types.js";
-import { snapshotFormatVersion, snapshotMetadataItemFormatVersion } from "./snapshot-format.js";
+import {
+  snapshotFormatVersion,
+  snapshotMetadataItemFormatFeature,
+  snapshotMetadataItemFormatVersion,
+} from "./snapshot-format.js";
 
 const MAGIC = Uint8Array.of(0x4d, 0x49, 0x4e, 0x53, 0x4e, 0x41, 0x50, 0x31); // MINSNAP1
 const HEADER_PREFIX_BYTES = 20;
@@ -849,7 +853,9 @@ export async function* decodeSnapshotFrameStream(
       throw new Error("Not a Minnow snapshot");
     const prefixView = new DataView(prefix.buffer);
     const containerVersion = prefixView.getUint32(8, true);
-    if (containerVersion !== 1 && containerVersion !== 2) {
+    try {
+      snapshotFormatVersion(containerVersion);
+    } catch {
       throw new Error("Unsupported snapshot format version");
     }
     const headerLength = prefixView.getUint32(12, true);
@@ -948,11 +954,15 @@ export async function* decodeSnapshotFrameStream(
         if (items.length !== frameItems) {
           throw new Error("Snapshot metadata frame item count is invalid");
         }
-        // A format-1 snapshot cannot hold a key-forwards record: no writer of that format made
-        // one, and restoring it under format 1's rules would be a guess.
-        if (items.some((item) => snapshotMetadataItemFormatVersion(item) > header.formatVersion)) {
+        // A snapshot cannot hold a record newer than its format: no writer of that format made
+        // one (a key-forwards record before format 2, a TIMESTAMP without time zone column
+        // before format 3), and restoring it under the older format's rules would be a guess.
+        const newer = items.find(
+          (item) => snapshotMetadataItemFormatVersion(item) > header.formatVersion,
+        );
+        if (newer !== undefined) {
           throw new TypeError(
-            `Snapshot format ${String(header.formatVersion)} cannot hold a key-forwards record`,
+            `Snapshot format ${String(header.formatVersion)} cannot hold ${snapshotMetadataItemFormatFeature(newer)}`,
           );
         }
       }

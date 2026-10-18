@@ -24,6 +24,22 @@ function table(id: string, name: string): TableRecord {
   };
 }
 
+/**
+ * Layout 13's own shape: a table with a column declared TIMESTAMP without time zone, beside an
+ * ordinary datetime column, which an older build would render as `timestamp with time zone`.
+ */
+function stampedTable(id: string, name: string): TableRecord {
+  const record = table(id, name);
+  return {
+    ...record,
+    columns: [
+      ...record.columns,
+      { id: "local_at", name: "local_at", type: "datetime", nullable: true, withoutTimeZone: true },
+      { id: "zoned_at", name: "zoned_at", type: "datetime", nullable: true },
+    ],
+  };
+}
+
 const store = await OpfsBlockStore.open({
   name: databaseName,
   root: shim.root,
@@ -224,7 +240,8 @@ await store.createCompactionJob({
   error: "fixture: an aborted delta merge attempt",
 });
 await store.addTable(table("fixture-data", "data"));
-await store.addTable(table("fixture-checkpoint-b", "checkpoint-b"));
+// Layout 13's shape in the checkpoint, and again in the log's tail below.
+await store.addTable(stampedTable("fixture-checkpoint-b", "checkpoint-b"));
 // A follower on the same tree: its mutations reach the log through the leader with their
 // request identity, and the served-request ledger records what they answered.
 const follower = await OpfsBlockStore.open({ name: databaseName, root: shim.root });
@@ -359,7 +376,7 @@ await store.writeTransaction({
   ],
   committedAt: "2026-08-24T12:00:07.000Z",
 });
-await store.addTable(table("fixture-wal-tail", "wal-tail"));
+await store.addTable(stampedTable("fixture-wal-tail", "wal-tail"));
 follower.close();
 store._crashForTests();
 

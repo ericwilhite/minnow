@@ -772,7 +772,7 @@
       "id": "ddl.type-spellings",
       "status": "supported",
       "example": "CREATE TABLE spelled (id int4 PRIMARY KEY, name character varying(10), note character varying, at timestamp with time zone, seen timestamp without time zone, big int8, small int2, f float8, r float4, flag bool)",
-      "notes": "PostgreSQL's internal type names (int2, int4, int8, float4, float8, bool) and its multi-word spellings (character varying, timestamp with time zone, timestamp without time zone, time with time zone) map onto the same storage as INTEGER, BIGINT, DOUBLE PRECISION, BOOLEAN, VARCHAR, and TIMESTAMPTZ. pg_dump and migration tools emit these spellings."
+      "notes": "PostgreSQL's internal type names (int2, int4, int8, float4, float8, bool) and its multi-word spellings (character varying, timestamp with time zone, timestamp without time zone, time with time zone) map onto the same storage as INTEGER, BIGINT, DOUBLE PRECISION, BOOLEAN, VARCHAR, TIMESTAMPTZ, and TIMESTAMP. pg_dump and migration tools emit these spellings."
     },
     {
       "id": "ddl.temporary-table",
@@ -1283,7 +1283,7 @@
       "id": "json.row-reference",
       "status": "supported",
       "example": "SELECT r.region, JSON_AGG(r ORDER BY r.amount) AS rows_doc, JSON_AGG(ROW_TO_JSON(r) ORDER BY r.amount) AS row_docs FROM (SELECT region, amount FROM rows) r GROUP BY r.region",
-      "notes": "A table alias used as a value is the row as a JSON object with the source's columns in order, as PostgreSQL treats it \u2014 the shape json_agg(agg) and to_json(obj) take in Kysely's jsonArrayFrom and jsonObjectFrom. Datetime members render as to_json renders a timestamp with time zone: ISO 8601 with a +00:00 offset."
+      "notes": "A table alias used as a value is the row as a JSON object with the source's columns in order, as PostgreSQL treats it \u2014 the shape json_agg(agg) and to_json(obj) take in Kysely's jsonArrayFrom and jsonObjectFrom. Datetime members render as to_json renders them: ISO 8601, with a +00:00 offset for a TIMESTAMPTZ column and none for a TIMESTAMP column."
     },
     {
       "id": "json.value",
@@ -1662,7 +1662,7 @@
       "id": "type.timestamp-text",
       "status": "supported",
       "example": "SELECT CAST(joined AS TEXT) AS at, 'joined ' || joined AS said, CAST(TIMESTAMP '2026-01-02 03:04:05.5' AS TEXT) AS local_at, TO_JSON(joined) AS doc FROM rows",
-      "notes": "A datetime becomes text the way PostgreSQL writes it in a UTC session, through CAST and ::text, ||, CONCAT, FORMAT, string functions over the cast, and the JSON constructors. A stored datetime is an instant, PostgreSQL's timestamp with time zone: 2026-01-02 03:04:05+00, fractional seconds only when nonzero (03:04:05.5+00), and 2026-01-02T03:04:05+00:00 in JSON. A TIMESTAMP literal, a cast to TIMESTAMP, MAKE_TIMESTAMP, LOCALTIMESTAMP, and a date plus an interval are timestamps without time zone and carry no zone: 2026-01-02 03:04:05.5. That text reads back as the same instant. Values returned to JavaScript stay Date objects."
+      "notes": "A datetime becomes text the way PostgreSQL writes it in a UTC session, through CAST and ::text, ||, CONCAT, FORMAT, string functions over the cast, TO_CHAR, and the JSON constructors. A column declared TIMESTAMPTZ (or TIMESTAMP WITH TIME ZONE) is an instant: 2026-01-02 03:04:05+00, fractional seconds only when nonzero (03:04:05.5+00), and 2026-01-02T03:04:05+00:00 in JSON. A column declared TIMESTAMP (or TIMESTAMP WITHOUT TIME ZONE), a TIMESTAMP literal, a cast to TIMESTAMP, MAKE_TIMESTAMP, LOCALTIMESTAMP, and a date plus an interval are timestamps without time zone and carry no zone: 2026-01-02 03:04:05.5, and 2026-01-02T03:04:05.5 in JSON. Views, CTEs, derived tables, and CREATE TABLE AS keep each column's kind. Both kinds hold the same UTC instant, compare and do arithmetic alike, and come back to JavaScript as Date objects; that text reads back as the same instant. Text with an offset written into a TIMESTAMP column is read as that instant, where PostgreSQL drops the offset. A column written by 0.16.0 or earlier is TIMESTAMPTZ, whatever its DDL said."
     },
     {
       "id": "type.date",
@@ -1830,7 +1830,7 @@
       "id": "function.to-char-datetime",
       "status": "supported",
       "example": "SELECT TO_CHAR(joined, 'YYYY-MM-DD HH24:MI:SS') AS iso, TO_CHAR(joined, 'FMDay, DD FMMonth YYYY') AS spoken, TO_CHAR(joined, 'HH12:MI AM') AS clock, TO_CHAR(joined, 'IW DDD Q') AS calendar FROM rows WHERE joined IS NOT NULL",
-      "notes": "The datetime template fields YYYY, YY, MM, DD, DDD, D, Q, IW, J, HH24, HH12, HH, MI, SS, MS, US, AM/PM, Month/Mon/Day/Dy in every case, TZ (always UTC), FM to drop padding, and double-quoted literal text. Every datetime is an instant in UTC."
+      "notes": "The datetime template fields YYYY, YY, MM, DD, DDD, D, Q, IW, J, HH24, HH12, HH, MI, SS, MS, US, AM/PM, Month/Mon/Day/Dy in every case, TZ (UTC, and nothing for a timestamp without time zone, as PostgreSQL writes it), FM to drop padding, and double-quoted literal text. Every datetime is read in UTC."
     },
     {
       "id": "function.to-char-numeric",

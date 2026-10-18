@@ -238,7 +238,11 @@ function dayOfYear(date: Date): number {
   );
 }
 
-function formatDatetime(date: Date, template: string): string {
+/**
+ * `zoned` is false for a timestamp without time zone, whose TZ field PostgreSQL writes as
+ * nothing; every other datetime is an instant in the UTC session, `UTC`.
+ */
+function formatDatetime(date: Date, template: string, zoned = true): string {
   const parts: string[] = [];
   const hours = dateUtcHours(date);
   for (const item of dateTemplate(template)) {
@@ -296,7 +300,7 @@ function formatDatetime(date: Date, template: string): string {
         parts.push(String(date.getUTCMilliseconds() * 1000).padStart(6, "0"));
         break;
       case "TZ":
-        parts.push("UTC");
+        if (zoned) parts.push("UTC");
         break;
       case "AM":
       case "PM":
@@ -1417,6 +1421,21 @@ export const simpleScalarFunctions: ReadonlyMap<string, SimpleScalarFunction> = 
         }
         return bounded(formatDatetime(datetime("TO_CHAR", values[0]), template), "TO_CHAR");
       },
+    },
+  ],
+  [
+    // The compiler's TO_CHAR over a `timestamp without time zone` (see annotatePlanTimestampText):
+    // the same template, with no zone to write for TZ.
+    "MINNOW_TO_CHAR_LOCAL",
+    {
+      minArgs: 2,
+      maxArgs: 2,
+      returns: "string",
+      evaluate: (values) =>
+        bounded(
+          formatDatetime(datetime("TO_CHAR", values[0]), text("TO_CHAR", values[1]), false),
+          "TO_CHAR",
+        ),
     },
   ],
   [

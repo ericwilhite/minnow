@@ -106,10 +106,7 @@ import {
   snapshotFrameEnvelopeParts,
   snapshotFrameStreamHeaderIdentity,
 } from "./snapshot-stream.js";
-import {
-  snapshotMetadataItemFormatVersion,
-  type SnapshotFormatVersion,
-} from "./snapshot-format.js";
+import { withSnapshotMetadataItem, type SnapshotFormatVersion } from "./snapshot-format.js";
 import {
   blockBytesChecksum,
   RecordCore,
@@ -1148,7 +1145,7 @@ export class MemoryBlockStore implements BlockStore {
       };
       let formatVersion: SnapshotFormatVersion = 1;
       for (const item of this.#core.snapshotFrameMetadataItems()) {
-        if (snapshotMetadataItemFormatVersion(item) === 2) formatVersion = 2;
+        formatVersion = withSnapshotMetadataItem(formatVersion, item);
         append(item);
       }
       for (const item of this.#core.snapshotFramePostingItems()) append(item);

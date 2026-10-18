@@ -2612,6 +2612,58 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
       },
     },
     {
+      name: "a column declared TIMESTAMP without time zone keeps its mark, across a reopen",
+      async run(target) {
+        // `withoutTimeZone` is how a datetime column renders as SQL text; an adapter that drops
+        // it would silently turn a TIMESTAMP column into a TIMESTAMPTZ one.
+        const base = table("stamped");
+        const stamped: TableRecord = {
+          ...base,
+          columns: [
+            ...base.columns,
+            {
+              id: "col-local",
+              name: "local_at",
+              type: "datetime",
+              nullable: true,
+              withoutTimeZone: true,
+            },
+            { id: "col-zoned", name: "zoned_at", type: "datetime", nullable: true },
+          ],
+        };
+        let store = await target.create();
+        await store.addTable(stamped);
+        const kinds = async (): Promise<unknown> =>
+          (await store.getTableByName("stamped"))?.columns.map(({ name, withoutTimeZone }) => [
+            name,
+            withoutTimeZone === true,
+          ]);
+        const expected = [
+          ["id", false],
+          ["v", false],
+          ["local_at", true],
+          ["zoned_at", false],
+        ];
+        checkEqual(await kinds(), expected, "a TIMESTAMP column must keep withoutTimeZone");
+        await checkThrows(
+          () =>
+            store.addTable({
+              ...table("misdeclared"),
+              columns: [
+                { id: "col-x", name: "x", type: "string", nullable: true, withoutTimeZone: true },
+              ],
+            }),
+          TypeError,
+          "withoutTimeZone on a non-datetime column",
+        );
+        if (target.reopen !== undefined) {
+          store = await target.reopen(store);
+          checkEqual(await kinds(), expected, "withoutTimeZone must survive a reopen");
+        }
+        store.close();
+      },
+    },
+    {
       name: "everything committed survives a reopen",
       async run(target) {
         if (target.reopen === undefined) return;

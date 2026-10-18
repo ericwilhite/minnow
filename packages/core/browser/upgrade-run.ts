@@ -6,6 +6,8 @@ export interface NativeUpgradeResult {
   rows: Array<Record<string, unknown>>;
   /** Whether the internal key-forwards table the rekey created is marked as such. */
   keyForwards: boolean;
+  /** A TIMESTAMP and a TIMESTAMPTZ column declared after the upgrade, as text after a reopen. */
+  timestampText: unknown;
   format: number;
   integrity: boolean;
   olderReaderRefused: boolean;
@@ -31,7 +33,8 @@ export interface ReleasedOpfsUpgradeResult {
 }
 
 /** Every released build that writes an IndexedDB schema this build upgrades. */
-export type IndexedDbWriterVersion = "0.10.0" | "0.12.1" | "0.13.1" | "0.14.1" | "0.15.0";
+export type IndexedDbWriterVersion =
+  "0.10.0" | "0.12.1" | "0.13.1" | "0.14.1" | "0.15.0" | "0.16.0";
 
 export interface IndexedDbUpgradeResult {
   /** The schema the released writer left. */
@@ -57,6 +60,8 @@ export interface IndexedDbUpgradeResult {
    * states, and the full-text matches it answers.
    */
   foldedFullText: { states: string[]; matches: unknown[] };
+  /** A TIMESTAMP and a TIMESTAMPTZ column declared after the upgrade, as text after a reopen. */
+  timestampText: unknown;
   integrity: boolean;
   olderReadersRefused: boolean;
   /** The schema after every released reader was refused: they must not change it. */

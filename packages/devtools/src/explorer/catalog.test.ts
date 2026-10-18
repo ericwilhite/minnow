@@ -83,6 +83,9 @@ describe("toCatalog", () => {
     expect(table?.columns[2]?.enumValues).toEqual(["a", "b"]);
     expect(table?.columns[4]?.generated).toBe("weight_kg * 1000");
     expect(typeLabelOf({ name: "n", type: "number" })).toBeUndefined();
+    // A datetime is an instant unless it was declared TIMESTAMP (without time zone).
+    expect(typeLabelOf({ name: "at", type: "datetime" })).toBeUndefined();
+    expect(typeLabelOf({ name: "at", type: "datetime", withoutTimeZone: true })).toBe("TIMESTAMP");
   });
 
   it("marks views from the introspection, and appends a view the table list omits", () => {

@@ -6,7 +6,8 @@
  *
  * The fold now fills an absent column with what reads give it — the column's backfill, or NULL —
  * and retires inert updates. Its plans can describe such sources, which a 0.15.0 reader refuses
- * as corruption, so IndexedDB schema 7 and OPFS layout 12 bar that reader; the upgrade moves
+ * as corruption, so IndexedDB schema 7 and OPFS layout 12 bar that reader (this build writes
+ * schema 8 and layout 13, which also admit TIMESTAMP without time zone columns); the upgrade moves
  * only the version marker. These tests take the real 0.15.0 writer's damaged databases through
  * the ordinary open API: the table folds, writes resume — at the ceiling, on the first write —
  * the data reads the same, and the released reader is refused afterwards. They also cut the
@@ -36,10 +37,11 @@ const NAME = "schema-change-folds";
 const MAX_LEVEL_ZERO_SEGMENTS = 4_096;
 /**
  * What this build writes. Schema 6 and layout 11 admitted these folds but were never released;
- * schema 7 and layout 12 also admit delta merges.
+ * schema 7 and layout 12 also admit delta merges, and schema 8 and layout 13 TIMESTAMP without
+ * time zone columns.
  */
-const CURRENT_SCHEMA = 7;
-const CURRENT_LAYOUT = 12;
+const CURRENT_SCHEMA = 8;
+const CURRENT_LAYOUT = 13;
 const CURRENT_MARKER = `{"formatVersion":${String(CURRENT_LAYOUT)}}`;
 
 interface Writer {

@@ -386,15 +386,25 @@ upgrades the database to the current schema or layout through the ordinary open 
 the first write folds the table and succeeds, interrupts and retries the IndexedDB upgrade, races
 current and released openers, and checks that 0.15.0 then refuses the database.
 `delta-merge-upgrade.test.ts` leaves single-row updates and deletes over its folded partitions,
-upgrades the database to schema 7 or layout 12, merges those deltas, writes, reopens, interrupts
-and retries the IndexedDB upgrade, races current and released openers, refuses a damaged merge
-record as corruption, and checks that 0.15.0 then refuses the database. Schema 6 and layout 11
-were never released, so no alias writes them: `marker-upgrade.test.ts` upgrades layouts 7 to 10,
-and a layout-11 marker over the layout-10 fixture, to layout 12, folds a table across `ADD` and
-`DROP COLUMN` there, and merges a table's deltas there. `format-compatibility.test.ts` restores the
-forward the frozen format-2 fixture stored, checks it resolves until it expires, and rekeys data
-an older writer exported. The marker upgrade is cut at
-each of its eight I/O boundaries by tab death and by power loss, from every older layout.
+upgrades the database to the current schema or layout, merges those deltas, writes, reopens,
+interrupts and retries the IndexedDB upgrade, races current and released openers, refuses a
+damaged merge record as corruption, and checks that 0.15.0 then refuses the database. Schema 6
+and layout 11 were never released, so no alias writes them: `marker-upgrade.test.ts` upgrades
+layouts 7 to 10, and a layout-11 marker over the layout-10 fixture, to the current layout, folds a
+table across `ADD` and `DROP COLUMN` there, and merges a table's deltas there. A sixth alias, of
+core 0.16.0, is the last IndexedDB schema-7 and OPFS layout-12 writer, the last that stored every
+datetime column as `TIMESTAMPTZ`: `timestamp-kind-upgrade.test.ts` has it declare `TIMESTAMP` and
+`TIMESTAMPTZ` columns, upgrades the database to schema 8 or layout 13 through the ordinary open
+API, checks that those columns stay `TIMESTAMPTZ`, declares new `TIMESTAMP` columns that render
+without a zone, reopens, interrupts and retries the IndexedDB upgrade, races current and released
+openers, refuses a damaged time-zone mark as corruption, and checks that 0.16.0 then refuses the
+database; `marker-upgrade.test.ts` takes the frozen layout-12 fixture to layout 13 the same way,
+and `snapshot-format3.test.ts` checks that only a snapshot with a `TIMESTAMP` column is written as
+format 3, that 0.16.0 refuses it into every store, and that 0.16.0's own snapshots import with
+their columns as instants. `format-compatibility.test.ts` restores the forward the frozen format-2
+fixture stored, checks it resolves until it expires, rekeys data an older writer exported, and
+restores the column kinds the frozen format-3 fixture stored. The marker upgrade is cut at each
+of its eight I/O boundaries by tab death and by power loss, from every older layout.
 `marker-race.test.ts` pauses one opener inside a marker write — while creating a database, and
 while upgrading one — lets a second opener read the marker in that window, and checks that the
 second waits instead of refusing the database or writing the marker again beside a live WAL.

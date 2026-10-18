@@ -1189,6 +1189,18 @@ describe("MinnowDialect", () => {
     ]);
   });
 
+  it("reports a TIMESTAMP column as timestamp and every other datetime as timestamptz", async () => {
+    await database.execute(
+      "CREATE TABLE stamped (local_at TIMESTAMP, zoned_at TIMESTAMPTZ, spelled TIMESTAMP WITH TIME ZONE)",
+    );
+    const table = (await db.introspection.getTables()).find(({ name }) => name === "stamped");
+    expect(table?.columns.map(({ name, dataType }) => ({ name, dataType }))).toEqual([
+      { name: "local_at", dataType: "timestamp" },
+      { name: "zoned_at", dataType: "timestamptz" },
+      { name: "spelled", dataType: "timestamptz" },
+    ]);
+  });
+
   it("compiles Kysely's JSON references to the -> and ->> operators and executes them", async () => {
     interface JsonDatabase {
       profiles: {

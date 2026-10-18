@@ -171,7 +171,7 @@ describe("snapshot format 2 refusals", () => {
 
   it("refuses a container version that disagrees with its header, and unknown versions", async () => {
     const bytes = await exportWith(openMemory, true);
-    for (const version of [1, 3, 0]) {
+    for (const version of [1, 4, 0]) {
       const patched = bytes.slice();
       new DataView(patched.buffer).setUint32(8, version, true);
       await expect(readSnapshotSummary(patched), `container ${String(version)}`).rejects.toThrow(
@@ -181,7 +181,7 @@ describe("snapshot format 2 refusals", () => {
     expect(() =>
       encodeSnapshotFrameStreamHeader({
         ...({} as SnapshotFrameStreamHeader),
-        formatVersion: 3 as 2,
+        formatVersion: 4 as 2,
       }),
     ).toThrow(/Unsupported snapshot format version/);
   });

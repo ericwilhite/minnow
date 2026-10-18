@@ -34,7 +34,8 @@ function dataType(column: CatalogColumn): string {
     case "string":
       return "text";
     case "datetime":
-      return "timestamp";
+      // A datetime is an instant, PostgreSQL's timestamptz, unless it was declared TIMESTAMP.
+      return column.withoutTimeZone === true ? "timestamp" : "timestamptz";
   }
 }
 

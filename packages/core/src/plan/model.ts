@@ -99,6 +99,11 @@ export type ScalarFunctionName =
    * second argument is the literal style, "text" or "json"; any other value passes through.
    */
   | "MINNOW_TIMESTAMP_TEXT"
+  /**
+   * Compiler-produced TO_CHAR over a `timestamp without time zone`: the same template, with the
+   * TZ field written as nothing, as PostgreSQL writes it for a value with no zone.
+   */
+  | "MINNOW_TO_CHAR_LOCAL"
   | "NEXTVAL"
   | "CURRVAL"
   | "RANDOM"

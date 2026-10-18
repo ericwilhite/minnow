@@ -452,7 +452,8 @@ applied.
   `generatedAlwaysAsIdentity()` declare the same key.
 - `db.introspection`: tables, views, columns, nullability, defaults, auto-increment, and logical
   types. Exact `NUMERIC(p, s)`, JSON/JSONB, UUID, DATE, TIME, INTERVAL, arrays, and enum names are
-  reported instead of being flattened to `text`.
+  reported instead of being flattened to `text`, and a datetime column as `timestamptz`, or
+  `timestamp` when it was declared without time zone.
 
 Minnow has one logical connection, handed out through a first-in-first-out mutex: each statement
 waits for the previous holder to release, and a transaction or stream holds the connection until

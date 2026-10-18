@@ -255,7 +255,7 @@ alongside writes, or another tab's writes — can still queue, so the bound abov
 
 ## Schema compatibility and recovery
 
-The current IndexedDB schema is 7. Schema 1 kept each transaction's journal ids on the record
+The current IndexedDB schema is 8. Schema 1 kept each transaction's journal ids on the record
 itself; opening a schema-1 database moves them into `transactionJournal` chunks and rewrites the
 records with their counts. Schema 3 changes no stored record: it admits compaction jobs whose
 merge plan is recomputed from its sources rather than stored cell by cell, which a schema-2 build
@@ -271,8 +271,11 @@ compaction job that a schema-5 build (core 0.15.0) refuses as corruption: a fold
 column's default, or an update left holding only its key after `DROP COLUMN` — and a delta
 merge, which merges a run of level-zero updates and deletes into a few segments that take the
 run's place. Schema 6 was never released: core 0.16.0 moves a schema-5 database straight to
-schema 7. Opening a schema-2 to schema-6 database only raises the version, and the older build
-then refuses it. There are no pre-contract schemas or compatibility
+schema 7. Schema 8 rewrites nothing either: a column's catalog record may say it was declared
+`TIMESTAMP` (without time zone), so its SQL text has no zone. A schema-7 build (core 0.16.0)
+refuses that record as corruption. Columns an older build wrote stay `TIMESTAMPTZ`, whatever
+their DDL said. Opening a schema-2 to schema-7 database only raises the version, and the older
+build then refuses it. There are no pre-contract schemas or compatibility
 branches. Every schema change adds one ordered migration for every integer version between the database and the
 current build. All of those migrations run inside the browser's single `versionchange`
 transaction: either the complete chain and its data changes commit, or the old database remains

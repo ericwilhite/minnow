@@ -136,9 +136,11 @@ const frozenIndexedDbSchemas: ReadonlyArray<{
   // whose sources lack columns added after them or keep only their key. It was never released:
   // only development builds of 0.16.0 wrote it, and the release writes schema 7.
   { version: 6, writerPackageVersion: "0.16.0", install: installFrozenIndexedDbV2 },
-  // Schema 7 is schema 6's stores too; the version bars schema-6 readers from delta merges. Its
-  // first writer is the release that ships it, this package.
-  { version: 7, writerPackageVersion: currentPackageVersion, install: installFrozenIndexedDbV2 },
+  // Schema 7 is schema 6's stores too; the version bars schema-6 readers from delta merges.
+  { version: 7, writerPackageVersion: "0.16.0", install: installFrozenIndexedDbV2 },
+  // Schema 8 is schema 7's stores too; the version bars schema-7 readers from a column declared
+  // TIMESTAMP without time zone. Its first writer is the release that ships it, this package.
+  { version: 8, writerPackageVersion: currentPackageVersion, install: installFrozenIndexedDbV2 },
 ];
 
 /** Schema 2 adds the chunked transaction journal store; everything else is schema 1. */
@@ -5492,7 +5494,7 @@ it("retains, migrates, and writes every stable IndexedDB schema fixture", async 
 it("rejects a newer IndexedDB schema without mutating it", async () => {
   const indexedDB = new IDBFactory();
   const name = crypto.randomUUID();
-  const newer = await openNativeIndexedDb(indexedDB, name, 8, (request) => {
+  const newer = await openNativeIndexedDb(indexedDB, name, 9, (request) => {
     request.result.createObjectStore("future");
   });
   await new Promise<void>((resolve, reject) => {
@@ -5511,11 +5513,11 @@ it("rejects a newer IndexedDB schema without mutating it", async () => {
     name: "StorageFormatVersionError",
     backend: "indexeddb",
     location: name,
-    actualVersion: 8,
-    supportedVersion: 7,
+    actualVersion: 9,
+    supportedVersion: 8,
     relation: "newer",
   });
-  const unchanged = await openNativeIndexedDb(indexedDB, name, 8);
+  const unchanged = await openNativeIndexedDb(indexedDB, name, 9);
   expect(unchanged.objectStoreNames.contains("future")).toBe(true);
   unchanged.close();
 });
@@ -5544,7 +5546,7 @@ it("closes an IndexedDB connection when a newer schema version arrives", async (
   const name = crypto.randomUUID();
   const store = await IndexedDbBlockStore.open({ name, indexedDB });
   const upgraded = await new Promise<IDBDatabase>((resolve, reject) => {
-    const request = indexedDB.open(name, 8);
+    const request = indexedDB.open(name, 9);
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error("upgrade failed"));
   });

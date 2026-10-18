@@ -260,9 +260,11 @@ machines: https://minnowdb.com/llms.txt
   only under ANY/ALL. Numeric RANGE offsets need one numeric ordering expression.
   FULL JOIN supports grouping, DISTINCT, wildcards, and compound ON in its sole-join form.
 - A datetime cast or concatenated to text is PostgreSQL's text in UTC: `2026-01-02 03:04:05+00`
-  for a stored value, no `+00` for a `TIMESTAMP` literal or cast, and
-  `"2026-01-02T03:04:05+00:00"` in JSON. INTERVAL values read and render as `1 day 02:00:00`.
-  Query results return datetimes as `Date` objects; use those rather than parsing SQL text.
+  for a `TIMESTAMPTZ` column (`column.datetime()`, and every datetime column core 0.16.0 or
+  earlier wrote), and no `+00` for a `TIMESTAMP` column (`column.timestamp()`), literal, or cast;
+  `"2026-01-02T03:04:05+00:00"` against `"2026-01-02T03:04:05"` in JSON. Both kinds hold the same
+  UTC instant and compare alike. INTERVAL values read and render as `1 day 02:00:00`. Query
+  results return datetimes as `Date` objects; use those rather than parsing SQL text.
 - Unsupported: keyless `UPDATE`/`DELETE`, `GRANT`, `SERIALIZABLE` isolation, `LOCK TABLE`, DDL
   inside `BEGIN … COMMIT`, several statements in one call, range-correlated LATERAL
   grouping/order/limit, correlated JSON_TABLE documents, array slices and multidimensional access,
@@ -288,7 +290,7 @@ machines: https://minnowdb.com/llms.txt
   with its exact error; check each supported entry's note before assuming every PostgreSQL
   variant.
 - Supported stored-format upgrades run automatically through ordinary open/load, including
-  IndexedDB schemas 1–6 to 7 and OPFS layouts 6–11 to 12. Do not add a required export/import
+  IndexedDB schemas 1–7 to 8 and OPFS layouts 6–12 to 13. Do not add a required export/import
   step. Every format change needs frozen
   older-writer fixtures and data-preservation, continued-write/reopen, interruption/power-loss,
   corruption-refusal, concurrent-open and older-writer-barrier tests. Close older connections

@@ -13,7 +13,7 @@ CREATE TABLE orders (
   status VARCHAR(20) NOT NULL,
   total DOUBLE PRECISION NOT NULL,
   refunded BOOLEAN NOT NULL,
-  placed_at TIMESTAMP NOT NULL
+  placed_at TIMESTAMPTZ NOT NULL
 )
 ```
 
@@ -237,7 +237,8 @@ add validation and semantics without widening hot scan vectors:
 | string             | `VARCHAR(n)`, `CHARACTER VARYING(n)`, `TEXT`, `CHAR(n)` | `string`                                   |
 | boolean            | `BOOLEAN`, `BOOL`                                       | `boolean`                                  |
 | calendar date      | `DATE`                                                  | canonical `YYYY-MM-DD` `string`            |
-| datetime           | `TIMESTAMP`, `TIMESTAMPTZ`, `TIMESTAMP WITH TIME ZONE`  | `Date`                                     |
+| instant            | `TIMESTAMPTZ`, `TIMESTAMP WITH TIME ZONE`               | `Date`                                     |
+| timestamp          | `TIMESTAMP`, `TIMESTAMP WITHOUT TIME ZONE`, `DATETIME`  | `Date`                                     |
 | time of day        | `TIME`                                                  | `HH:MM:SS[.ffffff]` `string`               |
 | JSON               | `JSON`, `JSONB`                                         | JSON `string`                              |
 | UUID               | `UUID`                                                  | lowercase `string`                         |
@@ -245,16 +246,24 @@ add validation and semantics without widening hot scan vectors:
 | array              | `INTEGER[]`, `TEXT[]`, and other core arrays            | JSON `string`                              |
 | enum               | a name declared by `CREATE TYPE … AS ENUM`              | member `string`                            |
 
-A datetime becomes text the way PostgreSQL writes it in a UTC session — through `CAST(x AS TEXT)`
-or `x::text`, `||`, `CONCAT`, `FORMAT`, and the JSON constructors. A stored datetime is an
-instant, PostgreSQL's `timestamp with time zone`, so `CAST(placed_at AS TEXT)` is
+Both datetime kinds store the same UTC instant, compare and sort alike, do the same arithmetic,
+and come back to JavaScript as a `Date`. They differ only in text, which follows PostgreSQL in a
+UTC session — through `CAST(x AS TEXT)` or `x::text`, `||`, `CONCAT`, `FORMAT`, `TO_CHAR`, and the
+JSON constructors. A `TIMESTAMPTZ` column is an instant, so `CAST(placed_at AS TEXT)` is
 `2025-03-14 09:30:00+00`, with fractional seconds only when they are nonzero
 (`2025-03-14 09:30:00.25+00`), and `TO_JSON(placed_at)` is `"2025-03-14T09:30:00+00:00"`. A
-`TIMESTAMP '…'` literal, a cast to `TIMESTAMP`, `MAKE_TIMESTAMP`, `LOCALTIMESTAMP`, and a date plus
-an interval are timestamps without time zone, and their text carries no zone:
-`2025-03-14 09:30:00`. `TIMESTAMP` and `TIMESTAMPTZ` columns store the same instant, so a column
-declared `TIMESTAMP` also renders with `+00`, where PostgreSQL would write no zone. Every text
-form reads back as the same instant. An interval renders as `1 year 2 mons 3 days 04:05:06.5`,
+`TIMESTAMP` column, a `TIMESTAMP '…'` literal, a cast to `TIMESTAMP`, `MAKE_TIMESTAMP`,
+`LOCALTIMESTAMP`, and a date plus an interval are timestamps without time zone, and their text
+carries no zone: `2025-03-14 09:30:00`, and `"2025-03-14T09:30:00"` in JSON. Views, CTEs, derived
+tables, and `CREATE TABLE … AS` keep each column's kind; mixing the two in `CASE`, `COALESCE`, or a
+`UNION` gives `TIMESTAMPTZ`, as PostgreSQL does. A precision such as `TIMESTAMP(3)` is accepted and
+ignored: values keep their milliseconds. Every text form reads back as the same instant. Text
+written into either kind is read as an instant, so a `TIMESTAMP` column stores
+`'2025-03-14 09:30:00+02'` as `07:30` UTC, where PostgreSQL would drop the offset and keep
+`09:30`. A datetime column written by core 0.16.0 or earlier is `TIMESTAMPTZ`, whatever its DDL
+said, and stays so after the [automatic upgrade](/docs/reference/versioning); `listTables()` and
+`introspect()` report a `TIMESTAMP` column with `withoutTimeZone: true`, which the low-level
+`createTable` API accepts on a `datetime` column too. An interval renders as `1 year 2 mons 3 days 04:05:06.5`,
 `-00:00:01`, or `-3 days +04:00:00`, and a time of day as `09:30:00.5`. A datetime returned to
 JavaScript is still a `Date`, not text.
 

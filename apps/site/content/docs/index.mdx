@@ -17,7 +17,7 @@ await db.execute(`CREATE TABLE orders (
   order_id INTEGER PRIMARY KEY,
   customer_id INTEGER NOT NULL,
   total NUMERIC(12, 2) NOT NULL,
-  placed_at TIMESTAMP NOT NULL
+  placed_at TIMESTAMPTZ NOT NULL
 )`);
 
 const { rows } = await db.query(`
@@ -30,11 +30,11 @@ const { rows } = await db.query(`
 
 <Callout type="warn" title="Experimental">
   Minnow is in 0.x, so minor releases can include API and SQL breaking changes. Stored data is
-  stable: block format 2, snapshot formats 1 and 2, IndexedDB schema 7, and OPFS layout 12 are
+  stable: block format 2, snapshot formats 1 to 3, IndexedDB schema 8, and OPFS layout 13 are
   versioned separately and locked — an incompatible future writer must use a new format number. Pin
   exact package versions. The [versioning guide](/docs/reference/versioning) explains the policy,
   and the [changelog](/docs/changelog) lists breaking changes and migrations. Supported storage
-  upgrades, including IndexedDB schemas 1–5 to 6 and OPFS layouts 6–10 to 11, run automatically on
+  upgrades, including IndexedDB schemas 1–7 to 8 and OPFS layouts 6–12 to 13, run automatically on
   open; see the [OPFS guide](/docs/storage/opfs#what-it-creates).
 </Callout>
 

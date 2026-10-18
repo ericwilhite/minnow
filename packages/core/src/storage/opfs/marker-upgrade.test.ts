@@ -1,24 +1,27 @@
 /* eslint-disable no-restricted-imports -- Released-writer and failure-injection tests run only in Node. */
 /**
- * Layouts 7 to 11 to 12: the store's bytes stay as they are and only the marker moves. Layout 8
+ * Layouts 7 to 12 to 13: the store's bytes stay as they are and only the marker moves. Layout 8
  * admits compaction jobs with replayed merge plans, which a layout-7 reader cannot parse;
  * layout 9 admits WAL frames whose payload spans continuation frames and checkpointed index
  * deltas of any size, which a layout-8 reader cannot; layout 10 admits the internal key-forwards
  * catalog record, which a layout-9 reader would read as an ordinary table while ignoring its
  * forwards; layout 11 admits compaction plans whose sources lack columns added after them or
  * keep only their key, which a layout-10 reader refuses as corruption; layout 12 admits delta
- * merges, which a layout-11 reader refuses as corruption. For each released layout these tests
- * use its frozen fixture and its last released writer — 0.12.1 for layout 7, 0.13.1 for layout 8,
- * 0.14.1 for layout 9, 0.15.0 for layout 10 (also schema-change-fold-upgrade.test.ts and
- * delta-merge-upgrade.test.ts) — upgrade through the ordinary open API, keep writing, reopen, and
- * check that the released reader is refused afterwards without a byte changing. Layout 11 was
- * never released (0.16.0 writes layout 12), so its marker step runs over the layout-10 fixture
- * under a layout-11 marker. Every I/O boundary of the marker publication is cut, by tab death
- * and by power loss, and retried.
+ * merges, which a layout-11 reader refuses as corruption; layout 13 admits a column declared
+ * TIMESTAMP without time zone, which a layout-12 reader would render as `timestamp with time
+ * zone`. For each released layout these tests use its frozen fixture and its last released
+ * writer — 0.12.1 for layout 7, 0.13.1 for layout 8, 0.14.1 for layout 9, 0.15.0 for layout 10
+ * (also schema-change-fold-upgrade.test.ts and delta-merge-upgrade.test.ts), 0.16.0 for layout
+ * 12 (timestamp-kind-upgrade.test.ts) — upgrade through the ordinary open API, keep writing,
+ * reopen, and check that the released reader is refused afterwards without a byte changing.
+ * Layout 11 was never released (0.16.0 writes layout 12), so its marker step runs over the
+ * layout-10 fixture under a layout-11 marker. Every I/O boundary of the marker publication is
+ * cut, by tab death and by power loss, and retried.
  */
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { OpfsBlockStore as Layout10OpfsStore } from "@minnowdb/core-layout10/storage/opfs";
+import { OpfsBlockStore as Layout12OpfsStore } from "@minnowdb/core-layout12/storage/opfs";
 import { MinnowDatabase as ReleasedDatabase } from "@minnowdb/core-layout7";
 import { OpfsBlockStore as ReleasedOpfsStore } from "@minnowdb/core-layout7/storage/opfs";
 import { MinnowDatabase as Layout8Database } from "@minnowdb/core-layout8";
@@ -42,20 +45,22 @@ const LAYOUT8 = '{"formatVersion":8}';
 const LAYOUT9 = '{"formatVersion":9}';
 const LAYOUT10 = '{"formatVersion":10}';
 const LAYOUT11 = '{"formatVersion":11}';
-const CURRENT_LAYOUT = 12;
-const CURRENT = '{"formatVersion":12}';
+const LAYOUT12 = '{"formatVersion":12}';
+const CURRENT_LAYOUT = 13;
+const CURRENT = '{"formatVersion":13}';
 /** The witness this build writes while it rewrites an older marker. */
-const WITNESS = "upgrade-11-12";
+const WITNESS = "upgrade-12-13";
 /**
  * Every marker-rewrite witness: a 0.13 build's, a 0.14 build's, a 0.15.0 build's, an unreleased
- * layout-11 build's, and this build's.
+ * layout-11 build's, a 0.16 build's, and this build's.
  */
 const WITNESSES = [
   ["upgrade-7-8", '{"from":7,"to":8}'],
   ["upgrade-8-9", '{"from":8,"to":9}'],
   ["upgrade-9-10", '{"from":9,"to":10}'],
   ["upgrade-10-11", '{"from":10,"to":11}'],
-  [WITNESS, '{"from":11,"to":12}'],
+  ["upgrade-11-12", '{"from":11,"to":12}'],
+  [WITNESS, '{"from":12,"to":13}'],
 ] as const;
 const failure = new DOMException("injected upgrade I/O failure", "QuotaExceededError");
 
@@ -93,7 +98,7 @@ function synthesizedLayout11(): Fixture {
 }
 
 const fixtures = new Map<number, Fixture>([
-  ...[7, 8, 9, 10].map((layout) => [layout, readFixture(layout)] as const),
+  ...[7, 8, 9, 10, 12].map((layout) => [layout, readFixture(layout)] as const),
   [11, synthesizedLayout11()],
 ]);
 function fixtureFor(layout: number): Fixture {
@@ -244,6 +249,7 @@ describe.each([
   { layout: 9, text: LAYOUT9 },
   { layout: 10, text: LAYOUT10 },
   { layout: 11, text: LAYOUT11 },
+  { layout: 12, text: LAYOUT12 },
 ])("OPFS frozen layout $layout to the current layout", ({ layout, text }) => {
   const source = fixtureFor(layout);
   // Layout 10 and later froze the key-forwards table into the fixture itself.
@@ -357,6 +363,40 @@ describe.each([
     reopened._crashForTests();
   });
 
+  it("declares TIMESTAMP columns after the upgrade, renders them without a zone, and reopens", async () => {
+    const shim = hydrate(source);
+    const store = await verifyFixture(shim, source);
+    const database = new MinnowDatabase(store, ENGINE_OPTIONS);
+    // Layout 13's record: a column declared TIMESTAMP without time zone.
+    await database.execute(
+      "CREATE TABLE stamps (id INTEGER PRIMARY KEY, local_at TIMESTAMP, zoned_at TIMESTAMPTZ)",
+    );
+    await database.execute(
+      "INSERT INTO stamps VALUES (1, '2026-01-02 03:04:05.5', '2026-01-02 03:04:05.5')",
+    );
+    await database.execute("ALTER TABLE stamps ADD COLUMN later TIMESTAMP");
+    await database.execute("UPDATE stamps SET later = local_at + INTERVAL '1 day'");
+    const text = "SELECT local_at::text AS l, zoned_at::text AS z, later::text AS a FROM stamps";
+    const expected = [
+      { l: "2026-01-02 03:04:05.5", z: "2026-01-02 03:04:05.5+00", a: "2026-01-03 03:04:05.5" },
+    ];
+    expect((await database.query(text)).rows).toEqual(expected);
+    await database.close();
+    store._crashForTests();
+    const reopened = await verifyFixture(shim, source, ["stamps"]);
+    const columns = (await reopened.getTableByName("stamps"))?.columns ?? [];
+    expect(columns.map(({ name, withoutTimeZone }) => [name, withoutTimeZone])).toEqual([
+      ["id", undefined],
+      ["local_at", true],
+      ["zoned_at", undefined],
+      ["later", true],
+    ]);
+    const reader = new MinnowDatabase(reopened, ENGINE_OPTIONS);
+    expect((await reader.query(text)).rows).toEqual(expected);
+    await reader.close();
+    reopened._crashForTests();
+  });
+
   it("serializes concurrent openers through the marker upgrade", async () => {
     const shim = hydrate(source);
     const stores = await Promise.all(
@@ -445,8 +485,8 @@ describe.each([
   it("finishes a marker torn mid-rewrite when any build's witness survived", async () => {
     // A 0.13 build tearing the marker on its way to layout 8 left the first witness, a 0.14
     // build on its way to 9 the second, a 0.15.0 build on its way to 10 the third, an unreleased
-    // layout-11 build on its way to 11 the fourth, this build the fifth. Each finishes at the
-    // current layout.
+    // layout-11 build on its way to 11 the fourth, a 0.16 build on its way to 12 the fifth, this
+    // build the sixth. Each finishes at the current layout.
     for (const [name, bytes] of WITNESSES) {
       const shim = hydrate(source);
       shim.writeFileBytes(`${PREFIX}${name}`, new TextEncoder().encode(bytes));
@@ -479,8 +519,9 @@ describe.each([
       ["upgrade-8-9", new TextEncoder().encode('{"from":8,"to":10}')],
       ["upgrade-9-10", new TextEncoder().encode('{"from":9,"to":11}')],
       ["upgrade-10-11", new TextEncoder().encode('{"from":10,"to":12}')],
-      [WITNESS, new TextEncoder().encode('{"from":11,"to":13}')],
-      [WITNESS, new TextEncoder().encode('{"from":11,"to":1')],
+      ["upgrade-11-12", new TextEncoder().encode('{"from":11,"to":13}')],
+      [WITNESS, new TextEncoder().encode('{"from":12,"to":14}')],
+      [WITNESS, new TextEncoder().encode('{"from":12,"to":1')],
     ] as const) {
       const shim = hydrate(source);
       if (witness !== undefined) shim.writeFileBytes(`${PREFIX}${name}`, witness);
@@ -499,14 +540,14 @@ describe.each([
 
   it("refuses a layout newer than the current one without changing files", async () => {
     const shim = hydrate(source);
-    shim.writeFileBytes(`${PREFIX}format.json`, new TextEncoder().encode('{"formatVersion":13}'));
+    shim.writeFileBytes(`${PREFIX}format.json`, new TextEncoder().encode('{"formatVersion":14}'));
     const writes = recordWrites(shim);
     await expect(OpfsBlockStore.open({ name: NAME, root: shim.root })).rejects.toBeInstanceOf(
       StorageFormatVersionError,
     );
     stopRecording(shim);
     expect(writes).toEqual([]);
-    expect(marker(shim)).toBe('{"formatVersion":13}');
+    expect(marker(shim)).toBe('{"formatVersion":14}');
   });
 });
 
@@ -827,6 +868,7 @@ describe("OPFS current layout fixture", () => {
       [(root: FileSystemDirectoryHandle) => Layout8OpfsStore.open({ name: NAME, root }), 8],
       [(root: FileSystemDirectoryHandle) => Layout9OpfsStore.open({ name: NAME, root }), 9],
       [(root: FileSystemDirectoryHandle) => Layout10OpfsStore.open({ name: NAME, root }), 10],
+      [(root: FileSystemDirectoryHandle) => Layout12OpfsStore.open({ name: NAME, root }), 12],
     ] as const) {
       await expect(open(shim.root)).rejects.toMatchObject({
         name: "StorageFormatVersionError",
@@ -873,6 +915,19 @@ describe("OPFS current layout fixture", () => {
         blockRows: [1],
       },
     ]);
+    // Layout 13's record: a column declared TIMESTAMP without time zone beside a TIMESTAMPTZ
+    // one, in a table the checkpoint holds and in one the log's tail holds.
+    for (const name of ["checkpoint-b", "wal-tail"]) {
+      const columns = (await store.getTableByName(name))?.columns ?? [];
+      expect(
+        columns.map(({ name: column, type, withoutTimeZone }) => [column, type, withoutTimeZone]),
+        name,
+      ).toEqual([
+        ["value", "string", undefined],
+        ["local_at", "datetime", true],
+        ["zoned_at", "datetime", undefined],
+      ]);
+    }
     store._crashForTests();
   });
 });

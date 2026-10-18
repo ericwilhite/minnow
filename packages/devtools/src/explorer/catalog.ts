@@ -66,11 +66,15 @@ export interface IndexInfo {
   state: "building" | "ready" | "invalid";
 }
 
-/** `NUMERIC(10,2)`, `INTEGER`, `JSONB`: the declared type, when it is more than the physical one. */
+/**
+ * `NUMERIC(10,2)`, `INTEGER`, `JSONB`, `TIMESTAMP`: the declared type, when it is more than the
+ * physical one. A datetime is an instant (`TIMESTAMPTZ`) unless it was declared `TIMESTAMP`.
+ */
 export function typeLabelOf(column: ColumnDefinition): string | undefined {
   const domain = column.sqlDomain;
-  if (domain === undefined) return column.integer === true ? "INTEGER" : undefined;
-  return domainLabel(domain);
+  if (domain !== undefined) return domainLabel(domain);
+  if (column.integer === true) return "INTEGER";
+  return column.withoutTimeZone === true ? "TIMESTAMP" : undefined;
 }
 
 /** A column's declared SQL domain, as the catalog and query results both carry it. */

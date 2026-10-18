@@ -86,8 +86,8 @@ Assigning `options` an object with the same values as before does nothing.
 ## The schema rail
 
 Your tables sit down the left of every tab, views in their own group below them. Each expands to
-its columns with their declared SQL types — `INTEGER`, `NUMERIC(10,2)`, `JSONB`, an enum type's
-name — nullability, and which one is the unique key. Columns are badged when they are enum values,
+its columns with their declared SQL types — `INTEGER`, `NUMERIC(10,2)`, `JSONB`, `TIMESTAMP` for a
+datetime without time zone, an enum type's name — nullability, and which one is the unique key. Columns are badged when they are enum values,
 generated from an expression, or filled by the engine when omitted. Below the columns come the
 indexes with their ordered keys and build health, the foreign keys with what they point at and how
 they delete, the check constraints, and the triggers. A view shows the query it stands for.

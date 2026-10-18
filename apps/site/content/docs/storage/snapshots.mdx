@@ -135,8 +135,11 @@ A snapshot is a bounded frame stream, not one database-sized metadata object. Fo
 1 with one addition: it may carry the engine's internal key-forwards table, which records where
 each [rekeyed](/docs/engine/rekeying) row now lives. The engine creates that table on the first
 rekey — even one that fails — and keeps it, so from then on every snapshot of that database is
-format 2. A snapshot without the table is written as format 1, byte for byte, so older builds still
-import it; core 0.14.1 and older refuse format 2.
+format 2. Format 3 is format 1 with a column declared `TIMESTAMP` (without time zone): it carries
+that kind, so the restored column renders its text without a zone. A snapshot is written at the
+lowest format its tables need, so one without either record is format 1, byte for byte, and older
+builds still import it. Core 0.14.1 and older refuse format 2, and core 0.16.0 and older refuse
+format 3.
 All integers in envelopes are little-endian.
 
 The file starts with a 20-byte prefix:

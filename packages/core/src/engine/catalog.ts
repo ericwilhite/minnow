@@ -31,6 +31,11 @@ export interface CatalogColumn {
   /** True for SQL INTEGER/SMALLINT/BIGINT columns, whose values must stay exactly representable. */
   readonly integer?: true;
   readonly sqlDomain?: SqlDomain;
+  /**
+   * True for a datetime column declared `TIMESTAMP` (without time zone), whose SQL text has no
+   * zone. Absent for `TIMESTAMPTZ`, the default.
+   */
+  readonly withoutTimeZone?: true;
   readonly nullable: boolean;
   /** Filled for omitted or SQL DEFAULT insert slots; never applied at read time. */
   readonly defaultValue?: ColumnDefault;
@@ -148,6 +153,7 @@ function toCatalogColumn(tableName: string, column: TableRecord["columns"][numbe
     type: column.type,
     ...(column.integer === true ? { integer: true } : {}),
     ...(column.sqlDomain === undefined ? {} : { sqlDomain: structuredClone(column.sqlDomain) }),
+    ...(column.withoutTimeZone === true ? { withoutTimeZone: true } : {}),
     nullable: column.nullable,
     ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
     ...(generated === undefined

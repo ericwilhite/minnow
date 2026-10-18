@@ -187,9 +187,10 @@ describe("published core tarball", () => {
       // datetime and interval text (959,373 measured), 961,000 with full-text fold coverage
       // (960,174 measured), 962,000 with UNIQUE builds under writes (961,154 measured), 973,000
       // with the single-row write paths and delta merges (972,128 measured), 978,000 with the
-      // storage commit-path costs (977,096 measured), and 980,000 with the engine's batch-write
-      // paths (979,032 measured); ratchets, not targets.
-      expect(report?.size, "packed bytes").toBeLessThanOrEqual(980_000);
+      // storage commit-path costs (977,096 measured), 980,000 with the engine's batch-write
+      // paths (979,032 measured), and 982,000 with TIMESTAMP columns without time zone (981,457
+      // measured); ratchets, not targets.
+      expect(report?.size, "packed bytes").toBeLessThanOrEqual(982_000);
       expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_500_000);
       const emitted = await readFile(join(isolatedCore, "dist", "engine", "optimizer.js"), "utf8");
       expect(emitted).not.toContain("/**");

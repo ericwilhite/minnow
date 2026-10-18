@@ -111,6 +111,8 @@ export interface ColumnBuilder<
   readonly integer: boolean;
   /** Logical SQL semantics layered over the stable string storage encoding. */
   readonly sqlDomain?: SqlDomain;
+  /** Present on `column.timestamp()`: a datetime whose SQL text carries no time zone. */
+  readonly withoutTimeZone?: true;
   readonly defaultSpec?: ColumnDefault;
   readonly generatedSpec?: { readonly kind: "stored"; readonly sql: string };
   /** Present on `column.enum()` builders: the closed set of values writes must draw from. */
@@ -210,6 +212,7 @@ interface AnyColumn {
   readonly isGenerated: boolean;
   readonly integer: boolean;
   readonly sqlDomain?: SqlDomain;
+  readonly withoutTimeZone?: true;
   readonly defaultSpec?: ColumnDefault;
   readonly generatedSpec?: { readonly kind: "stored"; readonly sql: string };
   readonly enumValues?: readonly string[];
@@ -263,6 +266,7 @@ function createColumn<
     isUnique?: boolean;
     integer?: boolean;
     sqlDomain?: SqlDomain;
+    withoutTimeZone?: true;
     renamedFromName?: string;
     reference?: ColumnReferenceSpec;
     defaultSpec?: ColumnDefault | undefined;
@@ -280,6 +284,7 @@ function createColumn<
     isGenerated: (state.generatedSpec !== undefined) as TGenerated,
     integer: state.integer ?? false,
     ...(state.sqlDomain === undefined ? {} : { sqlDomain: state.sqlDomain }),
+    ...(state.withoutTimeZone === true ? { withoutTimeZone: true as const } : {}),
     ...(state.defaultSpec === undefined ? {} : { defaultSpec: state.defaultSpec }),
     ...(state.generatedSpec === undefined ? {} : { generatedSpec: state.generatedSpec }),
     ...(state.renamedFromName === undefined ? {} : { renamedFromName: state.renamedFromName }),
@@ -413,6 +418,7 @@ export function columnFromState(
         AnyColumn,
         | "integer"
         | "sqlDomain"
+        | "withoutTimeZone"
         | "renamedFromName"
         | "reference"
         | "defaultSpec"
@@ -427,6 +433,7 @@ export function columnFromState(
     isUnique: state.isUnique,
     integer: state.integer ?? false,
     ...(state.sqlDomain === undefined ? {} : { sqlDomain: state.sqlDomain }),
+    ...(state.withoutTimeZone === true ? { withoutTimeZone: true } : {}),
     ...(state.renamedFromName === undefined ? {} : { renamedFromName: state.renamedFromName }),
     ...(state.reference === undefined ? {} : { reference: state.reference }),
     ...(state.defaultSpec === undefined ? {} : { defaultSpec: state.defaultSpec }),
@@ -442,7 +449,17 @@ export const column = {
   /** Exact safe-integer semantics, matching SQL INTEGER/SMALLINT/BIGINT. */
   integer: () => createColumn("number", { integer: true }),
   string: () => createColumn("string"),
+  /**
+   * An instant: SQL `TIMESTAMPTZ`. Selects return a `Date`, and SQL text renders it in UTC with
+   * its zone, `2026-01-02 03:04:05+00`.
+   */
   datetime: () => createColumn("datetime"),
+  /**
+   * SQL `TIMESTAMP`, without time zone. Selects return a `Date` and comparisons read the same
+   * UTC instant as `column.datetime()`; only SQL text differs, which has no zone:
+   * `2026-01-02 03:04:05`.
+   */
+  timestamp: () => createColumn("datetime", { withoutTimeZone: true }),
   /** Exact decimal SQL NUMERIC. Selects return strings; writes accept strings or numbers. */
   numeric: (options: { precision?: number; scale?: number } = {}) => {
     const sqlDomain = validateSqlDomain({ kind: "numeric", ...options }, "numeric column");
@@ -655,6 +672,11 @@ export function table(
     validateSchemaName(columnName, "Column");
     if (definition.integer && definition.type !== "number") {
       throw new TypeError(`Integer domain requires a number column: ${name}.${columnName}`);
+    }
+    if (definition.withoutTimeZone !== undefined && definition.type !== "datetime") {
+      throw new TypeError(
+        `TIMESTAMP without time zone requires a datetime column: ${name}.${columnName}`,
+      );
     }
     if (definition.sqlDomain !== undefined) {
       if (definition.type !== "string") {
@@ -1713,6 +1735,15 @@ export function planMigration(
       ) {
         throw new TypeError(`Column domains cannot change: ${tableDefinition.name}.${columnName}`);
       }
+      if ((existing.withoutTimeZone === true) !== (columnDefinition.withoutTimeZone === true)) {
+        const kind = (withoutTimeZone: boolean): string =>
+          withoutTimeZone ? "column.timestamp()" : "column.datetime()";
+        throw new TypeError(
+          `Column time zones cannot change: ${tableDefinition.name}.${columnName} is ` +
+            `${kind(existing.withoutTimeZone === true)}, schema says ` +
+            kind(columnDefinition.withoutTimeZone === true),
+        );
+      }
       if (existing.backfill === undefined && columnDefinition.backfillValue !== undefined) {
         throw new TypeError(
           `Backfills cannot be added after a column exists: ${tableDefinition.name}.${columnName}`,
@@ -2110,6 +2141,7 @@ export function applyColumnSteps(
           ...(step.definition.sqlDomain === undefined
             ? {}
             : { sqlDomain: structuredClone(step.definition.sqlDomain) }),
+          ...(step.definition.withoutTimeZone === true ? { withoutTimeZone: true } : {}),
           // A backfill is what lets the column be non-nullable: every row has a value, either
           // written or substituted at read time.
           nullable: step.backfill === undefined ? true : step.definition.isNullable,

@@ -155,11 +155,6 @@
       "reason": "Minnow returns canonical JSON text at the JavaScript boundary while PostgreSQL clients commonly decode JSONB to a native object."
     },
     {
-      "id": "type.timestamp-text",
-      "classification": "different",
-      "reason": "Datetime text matches PostgreSQL's for every timestamp with time zone and for TIMESTAMP literals, casts, and expressions. A column declared TIMESTAMP (without time zone) stores an instant like every Minnow datetime, so its text carries +00 where PostgreSQL writes no zone."
-    },
-    {
       "id": "type.array",
       "classification": "different",
       "reason": "Minnow returns arrays as canonical JSON text at the JavaScript boundary while PostgreSQL clients commonly return native arrays."

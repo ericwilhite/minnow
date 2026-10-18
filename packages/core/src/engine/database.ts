@@ -1936,8 +1936,9 @@ interface CatalogFacts {
   /** Physical table names to their SQL integer columns, for PostgreSQL integer division. */
   integers: ReadonlyMap<string, ReadonlySet<string>>;
   /**
-   * Physical table names to their DATE and INTERVAL columns: `date - date` divides as an
-   * integer, and `date + interval` is a timestamp without time zone in text.
+   * Physical table names to their DATE, INTERVAL, and TIMESTAMP (without time zone) columns:
+   * `date - date` divides as an integer, and a TIMESTAMP column or `date + interval` is a
+   * timestamp without time zone in text.
    */
   datetimes: ReadonlyMap<string, ReadonlyMap<string, DatetimeTypeKind>>;
   /** Physical table names to their primary-key columns, for GROUP BY functional dependency. */
@@ -3304,6 +3305,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
               ...(column.sqlDomain === undefined
                 ? {}
                 : { sqlDomain: structuredClone(column.sqlDomain) }),
+              ...(column.withoutTimeZone === true ? { withoutTimeZone: true } : {}),
               nullable: column.nullable,
               ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
               ...(column.generatedValue === undefined
@@ -12717,6 +12719,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       type: definition.type,
       ...(definition.integer ? { integer: true as const } : {}),
       ...(definition.sqlDomain === undefined ? {} : { sqlDomain: definition.sqlDomain }),
+      ...(definition.withoutTimeZone ? { withoutTimeZone: true as const } : {}),
     }));
     const inferred = record.columns.map(querySchemaColumn);
     const render = (
@@ -12725,12 +12728,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         type: string;
         integer?: true;
         sqlDomain?: SqlDomain;
+        withoutTimeZone?: true;
       }>,
     ): string =>
       columns
         .map(
-          ({ name, type, integer, sqlDomain }) =>
-            `${name} ${type}${integer === true ? " integer" : ""}${sqlDomain === undefined ? "" : ` ${JSON.stringify(sqlDomain)}`}`,
+          ({ name, type, integer, sqlDomain, withoutTimeZone }) =>
+            `${name} ${type}${integer === true ? " integer" : ""}${withoutTimeZone === true ? " without time zone" : ""}${sqlDomain === undefined ? "" : ` ${JSON.stringify(sqlDomain)}`}`,
         )
         .join(", ");
     if (render(declared) !== render(inferred)) {
@@ -12908,6 +12912,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
             ...(columnDefinition.sqlDomain === undefined
               ? {}
               : { sqlDomain: structuredClone(columnDefinition.sqlDomain) }),
+            ...(columnDefinition.withoutTimeZone ? { withoutTimeZone: true as const } : {}),
             ...(columnDefinition.isNullable ? { nullable: true } : {}),
             ...(columnDefinition.defaultSpec === undefined
               ? {}
@@ -14831,12 +14836,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           const schemas = catalogQuerySchemas(records);
           const plan = await this.#applyCatalogRewrites(statement.query, before);
           const tableColumns: TableColumnRecord[] = inferBlockSchema(plan, schemas).map(
-            ({ name, type, integer, sqlDomain }) => ({
+            ({ name, type, integer, sqlDomain, withoutTimeZone }) => ({
               id: this.#createId(),
               name: validateName(name, "Column"),
               type,
               ...(integer === true ? { integer: true as const } : {}),
               ...(sqlDomain === undefined ? {} : { sqlDomain: structuredClone(sqlDomain) }),
+              // A TIMESTAMP column, literal, or cast keeps its kind, as PostgreSQL's does.
+              ...(withoutTimeZone === true ? { withoutTimeZone: true as const } : {}),
               nullable: true,
             }),
           );
@@ -15087,6 +15094,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
                 ...(added.sqlDomain === undefined
                   ? {}
                   : { sqlDomain: structuredClone(added.sqlDomain) }),
+                ...(added.withoutTimeZone === true ? { withoutTimeZone: true as const } : {}),
                 nullable: added.nullable ?? false,
                 ...(added.defaultValue === undefined ? {} : { defaultValue: added.defaultValue }),
                 ...(added.enumValues === undefined ? {} : { enumValues: [...added.enumValues] }),
@@ -28719,14 +28727,17 @@ function visibleSegmentManifestVersion(value: unknown, label: string): number | 
 const compiledChecks = new Map<string, ReadonlyArray<{ name: string; expression: Expression }>>();
 const COMPILED_CHECK_CACHE_LIMIT = 64;
 
-/** A table's DATE and INTERVAL columns, as the typing passes read them from the catalog. */
+/**
+ * A table's DATE, INTERVAL, and TIMESTAMP (without time zone) columns, as the typing passes read
+ * them from the catalog. A TIMESTAMPTZ column is an instant, the default, and is not listed.
+ */
 function tableDatetimeColumns(table: TableRecord): Map<string, DatetimeTypeKind> {
   const columns = new Map<string, DatetimeTypeKind>();
   for (const column of table.columns) {
+    if (column.hidden === true) continue;
     const kind = column.sqlDomain?.kind;
-    if (column.hidden !== true && (kind === "date" || kind === "interval")) {
-      columns.set(column.name, kind);
-    }
+    if (kind === "date" || kind === "interval") columns.set(column.name, kind);
+    else if (column.withoutTimeZone === true) columns.set(column.name, "local");
   }
   return columns;
 }

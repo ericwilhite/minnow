@@ -430,3 +430,48 @@ describe("key forwards in the stored formats", () => {
     await target.close();
   });
 });
+
+describe("TIMESTAMP without time zone in the stored formats", () => {
+  const text = "SELECT id, local_at::text AS l, zoned_at::text AS z FROM stamped ORDER BY id";
+
+  it("restores the column kinds a format-3 fixture stored, and renders them", async () => {
+    const frozen = fixtures.find(({ manifest }) => manifest.snapshotFormatVersion === 3);
+    if (frozen === undefined) throw new Error("No format-3 fixture is on file");
+    const database = await restoreFixture(frozen.bytes);
+    expect((await database.query(text, { memoize: false })).rows).toEqual([
+      { id: 1, l: "2026-01-02 03:04:05.5", z: "2026-01-02 03:04:05.5+00" },
+      { id: 2, l: null, z: "2025-06-01 00:00:00+00" },
+    ]);
+    const columns = (await database.introspect()).tables.find(({ name }) => name === "stamped");
+    expect(columns?.columns.map(({ name, withoutTimeZone }) => [name, withoutTimeZone])).toEqual([
+      ["id", undefined],
+      ["local_at", true],
+      ["zoned_at", undefined],
+    ]);
+    await database.close();
+  });
+
+  it("adds a TIMESTAMP column to data an older writer exported, then round-trips it as format 3", async () => {
+    const older = fixtures.find(({ manifest }) => manifest.snapshotFormatVersion === 2);
+    if (older === undefined) throw new Error("No format-2 fixture is on file");
+    const source = await restoreFixture(older.bytes);
+    // The older writer's datetime columns are instants, and stay so.
+    expect(
+      (await source.query("SELECT seen_at::text AS t FROM records WHERE id = 1")).rows,
+    ).toEqual([{ t: "2026-01-01 00:00:00+00" }]);
+    await source.execute("ALTER TABLE records ADD COLUMN seen_local TIMESTAMP");
+    await source.execute("UPDATE records SET seen_local = seen_at WHERE id = 1");
+    const bytes = await source.exportSnapshot();
+    await source.close();
+    expect((await readSnapshotSummary(bytes)).formatVersion).toBe(3);
+    const target = await restoreFixture(bytes);
+    expect(
+      (
+        await target.query(
+          "SELECT seen_at::text AS zoned, seen_local::text AS local FROM records WHERE id = 1",
+        )
+      ).rows,
+    ).toEqual([{ zoned: "2026-01-01 00:00:00+00", local: "2026-01-01 00:00:00" }]);
+    await target.close();
+  });
+});

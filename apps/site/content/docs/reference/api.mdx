@@ -57,6 +57,7 @@ Core declarations come from `@minnowdb/core` or the smaller `@minnowdb/core/sche
 | ------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `table(name, columns, options)`                                                                                     | Defines a table. Options include `primaryKey`, composite `foreignKeys`, and `checks`. The result carries inferred row types and a Standard Schema `~standard` validator. The DSL never parses SQL: `migrate()` compiles `checks` and the columns' SQL expressions. |
 | `column.boolean() / number() / string() / datetime()`                                                               | Column builders for the four physical storage types.                                                                                                                                                                                                               |
+| `column.timestamp()`                                                                                                | A datetime declared SQL `TIMESTAMP` (without time zone): a `Date` like `column.datetime()` (`TIMESTAMPTZ`), whose SQL text has no zone.                                                                                                                            |
 | `column.integer() / numeric() / json() / jsonb() / uuid() / date() / time() / interval() / array()`                 | Builders retaining the SQL engine's domain metadata and exact boundary types. `json`/`jsonb` accept an optional declared document shape — `column.jsonb<Shape>()` — that types the Kysely adapter's `->`/`->>` traversal.                                          |
 | `column.enum([...])`                                                                                                | A string column restricted to a closed value set, typed as the literal union and validated on every write. Migrations may add values, never remove.                                                                                                                |
 | `column.sqlEnum(name, values)`                                                                                      | Per-column named enum metadata, typed as the values' literal union. It does not create a reusable `CREATE TYPE` object.                                                                                                                                            |
@@ -321,8 +322,8 @@ adapter isolation explicit even to conservative bundlers.
 
 Record and job types beyond these (compaction plans, GC cursors, temp-run pages) are exported for
 tooling but are storage internals. Their TypeScript API may still change during 0.x; the bytes
-written by the locked block-format 2, snapshot-format 1 and 2, IndexedDB-schema 7, and
-OPFS-layout 12 writers are separate format contracts and cannot be reinterpreted in place.
+written by the locked block-format 2, snapshot-format 1 to 3, IndexedDB-schema 8, and
+OPFS-layout 13 writers are separate format contracts and cannot be reinterpreted in place.
 
 ## `@minnowdb/core/storage/toolkit`
 

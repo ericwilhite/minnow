@@ -115,6 +115,12 @@ and a record is at most one of a view, an enum type, a sequence, or the key-forw
 Refuse anything else: a second marked table would hide the real one from the engine. An adapter built on the storage toolkit's `RecordCore` gets
 this rule automatically. The conformance kit checks it.
 
+A column record may carry `withoutTimeZone: true`: a `datetime` column declared `TIMESTAMP`
+(without time zone), whose SQL text has no zone. Store and return it like any other column field.
+An adapter that drops it silently turns the column into a `TIMESTAMPTZ` one. It is either absent
+or exactly `true`, and only on a `datetime` column; `validateTableColumns` refuses anything else,
+and the conformance kit checks that the mark survives a reopen.
+
 Catalog cleanup follows the same rule. When `updateTable` removes a column or secondary index,
 that operation also deletes all of its postings base chunks, staged generations, and commit
 deltas. A dropped `UNIQUE` index also removes its membership namespace. `removeFtsColumn` provides

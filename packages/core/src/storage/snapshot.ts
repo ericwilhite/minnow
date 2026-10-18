@@ -5,10 +5,11 @@ import { SNAPSHOT_FRAME_KINDS, type SnapshotFrameStreamHeader } from "./types.js
 import { decodeSnapshotFrameStream } from "./snapshot-stream.js";
 
 /**
- * The newest snapshot format this build writes. A snapshot is format 2 only when it carries the
- * internal key-forwards table; one without it is still written as format 1.
+ * The newest snapshot format this build writes. A snapshot is format 3 only when a table has a
+ * column declared TIMESTAMP without time zone, format 2 only when it carries the internal
+ * key-forwards table, and format 1 otherwise.
  */
-export const SNAPSHOT_FORMAT_VERSION = 2;
+export const SNAPSHOT_FORMAT_VERSION = 3;
 
 /** Export and worker-transport chunk ceiling; direct imports accept any non-empty source chunk. */
 export const MAX_SNAPSHOT_STREAM_CHUNK_BYTES = 1024 * 1024;
