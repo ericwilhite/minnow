@@ -11,7 +11,8 @@ compatibility policy and release process.
 ## Unreleased
 
 Not yet published. This entry collects changes merged after 0.16.0; the release that ships them
-replaces this heading with its version and date. Package: `@minnowdb/core`.
+replaces this heading with its version and date. Packages: `@minnowdb/core`, `@minnowdb/kysely`,
+`@minnowdb/devtools`.
 
 ### Changed: the schema DSL no longer parses SQL
 
@@ -38,6 +39,29 @@ replaces this heading with its version and date. Package: `@minnowdb/core`.
   can be dropped or renamed from these lists instead of parsing SQL, so it no longer needs the
   compiler either; when a catalog leaves a list out (a hand-built catalog, or one saved by an
   earlier release), it refuses to drop or rename any column of that table rather than guess.
+
+### Changed: TIMESTAMP columns render without a time zone
+
+- A column declared `TIMESTAMP`, `TIMESTAMP WITHOUT TIME ZONE`, or `DATETIME` now renders its SQL
+  text as PostgreSQL does — `2024-01-02 10:00:00`, and `"2024-01-02T10:00:00"` in JSON — through
+  `CAST`/`::text`, `||`, `CONCAT`/`CONCAT_WS`/`FORMAT`/`QUOTE_LITERAL`, `TO_CHAR`'s `TZ` field,
+  `ARRAY_AGG`, and the JSON constructors, including through views, CTEs, derived tables,
+  `CREATE TABLE AS`, and windows. `TIMESTAMPTZ` columns keep `+00`. Values, comparisons, and
+  arithmetic are unchanged, and both kinds still return `Date`.
+- New `column.timestamp()` builder; `column.datetime()` remains `TIMESTAMPTZ`. `listTables()` and
+  `introspect()` report `withoutTimeZone: true`, and `createTable()` accepts it. The Kysely
+  introspector reports `timestamp` or `timestamptz` (it reported `timestamp` for both), and
+  devtools labels TIMESTAMP columns. `TIMESTAMP(3) WITH TIME ZONE` now parses.
+- **Migration:** columns created by 0.16.0 or earlier stay `TIMESTAMPTZ` whatever their DDL said, so
+  their text does not change; for zoneless text add a new `TIMESTAMP` column (a migration cannot
+  switch an existing column's kind). Code that parsed `+00` out of a new `TIMESTAMP` column's text
+  must handle its absence. A DSL schema declaring `column.datetime()` for a table created with SQL
+  `TIMESTAMP` is refused: declare `column.timestamp()`. Text with an offset written into a
+  `TIMESTAMP` column is read as that instant, where PostgreSQL drops the offset.
+- **Stored formats:** IndexedDB schema 8 and OPFS layout 13, marker-only and automatic on open from
+  schemas 1–7 and layouts 6–12; afterwards 0.16.0 and older refuse the database with
+  `StorageFormatVersionError`. Snapshot format 3 is written only when a table has a `TIMESTAMP`
+  column; 0.16.0 and older refuse it, and every other snapshot is still format 1 or 2.
 
 ### Fixed
 
