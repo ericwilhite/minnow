@@ -1,9 +1,9 @@
 #!/bin/sh
 # The merge gate, run before anything leaves the machine.
 #
-# This is the same suite CI's first job runs, in the same order, so a red build is something you
-# see here in a couple of minutes rather than on GitHub after the push. `git push --no-verify`
-# skips it when you need to.
+# This is the same suite CI's `Format, types, lint, build, unit tests` gate runs — CI spreads it
+# across parallel jobs, this runs it in order — so a red build is something you see here rather
+# than on GitHub after the push. `git push --no-verify` skips it when you need to.
 #
 # It checks the working tree, not the commits being pushed, which is deliberate: this repository
 # is often worked on by more than one session at a time, and a file left unformatted or broken by

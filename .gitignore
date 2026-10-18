@@ -3,6 +3,8 @@ node_modules/
 .tasks/
 dist/
 coverage/
+# Vitest blob reports, one per CI unit-test part, merged by `vitest run --merge-reports`.
+.vitest-reports/
 playwright-report/
 test-results/
 *.tsbuildinfo
