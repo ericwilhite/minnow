@@ -51,10 +51,17 @@ npx playwright install chromium firefox webkit
 ```
 
 The merge gate and fast SQLLogicTest profile run in `.github/workflows/ci.yml` on every push and pull
-request. Browser jobs run independently: Chromium and Firefox on Linux, and WebKit on macOS.
-Each runs the library and site suites; Chromium also runs the packed consumer. The `Real browsers`
-check requires every engine to pass. Splitting the jobs preserves their 45-minute deadlines and
-leaves time to save failure artifacts. A test that passes only on retry still fails the gate.
+request, spread across parallel jobs. One job runs the format, type, lint, build, API contract, and
+SQLLogicTest checks. The unit suite runs under coverage in four Vitest shards, with the maintenance
+workload alone in a fifth job; a final job merges their results and coverage and enforces the
+coverage floors on the whole suite, exactly as `npm run test:coverage` does. The
+`Format, types, lint, build, unit tests` check requires all of them, and the
+`Unit tests on the oldest supported Node` check requires both of that suite's shards on Node 22.
+Browser jobs run independently: Chromium and Firefox on Linux, and WebKit on macOS. Each engine
+runs the library and site suites, Firefox and WebKit with the library suite split across two
+runners; Chromium also runs the packed consumer. The `Real browsers` check requires every engine
+to pass. Splitting the jobs preserves their 45-minute deadlines and leaves time to save failure
+artifacts. A test that passes only on retry still fails the gate.
 `.github/workflows/sql-conformance.yml` runs the full SQL profile and long simulator
 nightly and on demand. Both it and the release workflow also run
 `test:browser:conformance`: the entire core browser suite, including the full pinned SQL corpus
@@ -624,7 +631,8 @@ Custom drivers must preserve error names and causes across their transport, incl
 `DatabaseWorkerOutcomeUnknownError` for a mutation interrupted by a worker crash.
 
 The runner is driver-agnostic. In Vitest (`interaction-simulator.test.ts`, with the rekeying and
-schema suites in `interaction-simulator-rekeying.test.ts` and `interaction-simulator-schema.test.ts`)
+schema suites in `interaction-simulator-rekeying.test.ts` and `interaction-simulator-schema.test.ts`,
+whose IndexedDB seeds alternate with `interaction-simulator-schema-indexeddb.test.ts`)
 each connection is a
 `MinnowDatabase` over one shared memory, IndexedDB, or OPFS store with the storage fault points
 armed. In Playwright (`interaction.spec.ts`) each connection is a real tab holding the published

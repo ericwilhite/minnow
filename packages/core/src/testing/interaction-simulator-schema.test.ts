@@ -44,10 +44,20 @@ const stores: ReadonlyArray<{ name: string; source: () => DriverStoreSource }> =
   },
 ];
 
+/**
+ * fake-indexeddb runs these plans several times slower than the other stores, and Vitest runs one
+ * file's tests in sequence, so IndexedDB's seeds alternate with
+ * interaction-simulator-schema-indexeddb.test.ts: this file runs the even-indexed ones. A seed
+ * chosen with MINNOW_SEED is index 0, so it runs here on every store.
+ */
+const schemaSeeds = seedsFor("interaction-simulator-schema", [0x5c4e, 0xd00d]);
+const seedsOver = (name: string): number[] =>
+  name === "indexeddb" ? schemaSeeds.filter((_, index) => index % 2 === 0) : schemaSeeds;
+
 describe.each(stores)(
   "interaction simulator with constraints and schema changes over $name",
-  ({ source }) => {
-    it.each(seedsFor("interaction-simulator-schema", [0x5c4e, 0xd00d]))("seed %i", async (seed) => {
+  ({ name, source }) => {
+    it.each(seedsOver(name))("seed %i", async (seed) => {
       const store = source();
       try {
         const plan = generateInteractionPlan(seed, {

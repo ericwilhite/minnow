@@ -4,6 +4,15 @@ import { configDefaults, defineConfig } from "vitest/config";
 
 const maintenanceWorkload = "packages/core/src/engine/maintenance-under-load.test.ts";
 
+/**
+ * Set by CI on each part of the unit suite it spreads across runners (`.github/workflows/ci.yml`).
+ * A part's coverage is partial by construction, so the part neither prints it nor judges it: it
+ * travels in the part's blob report, and `vitest run --merge-reports --coverage` reports the
+ * combined coverage of every part and enforces the floors below on it, exactly as one whole run
+ * does. A whole run must never set this.
+ */
+const coveragePart = process.env.MINNOW_COVERAGE_PART === "1";
+
 export default defineConfig({
   // The site's own modules import each other through the `@/` alias its tsconfig declares, so a
   // test of one of them resolves the same way the browser build does.
@@ -56,7 +65,7 @@ export default defineConfig({
     testTimeout: process.env.CI ? 300_000 : 20_000,
     hookTimeout: process.env.CI ? 90_000 : 20_000,
     coverage: {
-      reporter: ["text", "html", "json-summary"],
+      reporter: coveragePart ? [] : ["text", "html", "json-summary"],
       // A failed run is exactly when the report is worth reading, and CI uploads it either way.
       reportOnFailure: true,
       // Only the shipped library. The site is covered by its own browser runner, and measuring
@@ -74,17 +83,19 @@ export default defineConfig({
        * The devtools' DOM modules run under happy-dom (each test file opts in with a
        * `@vitest-environment` comment); the site browser runner covers what a real browser adds.
        */
-      thresholds: {
-        statements: 82,
-        branches: 75,
-        functions: 84,
-        lines: 84,
-        "packages/core/src/**": { statements: 87, branches: 78, functions: 91, lines: 89 },
-        "packages/devtools/src/**": { statements: 50, branches: 48, functions: 47, lines: 51 },
-        "packages/export/src/**": { statements: 91, branches: 81, functions: 99, lines: 97 },
-        "packages/kysely/src/**": { statements: 93, branches: 84, functions: 99, lines: 95 },
-        "packages/react/src/**": { statements: 70, branches: 49, functions: 59, lines: 79 },
-      },
+      thresholds: coveragePart
+        ? {}
+        : {
+            statements: 82,
+            branches: 75,
+            functions: 84,
+            lines: 84,
+            "packages/core/src/**": { statements: 87, branches: 78, functions: 91, lines: 89 },
+            "packages/devtools/src/**": { statements: 50, branches: 48, functions: 47, lines: 51 },
+            "packages/export/src/**": { statements: 91, branches: 81, functions: 99, lines: 97 },
+            "packages/kysely/src/**": { statements: 93, branches: 84, functions: 99, lines: 95 },
+            "packages/react/src/**": { statements: 70, branches: 49, functions: 59, lines: 79 },
+          },
     },
   },
 });

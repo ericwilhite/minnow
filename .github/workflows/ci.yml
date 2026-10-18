@@ -1,9 +1,15 @@
 # The merge gate. Everything here must pass before a change lands on main.
 #
-# Split by failure domain: `check` catches most mistakes, the browser matrix proves storage and
-# site behavior a Node substitute cannot, and `engines-floor` proves the oldest Node the package
-# claims to support still runs the suite. The performance gate deliberately lives in its own
-# scheduled workflow — it measures a machine as much as the code, so it must never block a merge.
+# Split by failure domain: the static checks catch most mistakes, the unit suite proves behavior
+# and holds the coverage floors, the browser matrix proves storage and site behavior a Node
+# substitute cannot, and the oldest-Node suite proves the oldest Node the package claims to support
+# still runs it. The performance gate deliberately lives in its own scheduled workflow — it
+# measures a machine as much as the code, so it must never block a merge.
+#
+# The long suites are spread across parallel runners. Each split gate ends in an aggregate job
+# with a stable name — `Format, types, lint, build, unit tests`, `Unit tests on the oldest
+# supported Node`, and `Real browsers` — that fails unless every part of it passed, so a required
+# check names the gate rather than however it happens to be split.
 name: CI
 
 on:
@@ -20,14 +26,10 @@ permissions:
   contents: read
 
 jobs:
-  check:
-    name: Format, types, lint, build, unit tests
+  static:
+    name: Format, types, lint, build, API contract, SQLLogicTest
     runs-on: ubuntu-latest
-    # The heaviest maintenance and conformance tests are each allowed 300 s under coverage; the
-    # sum has to fit here with room for the build and lint steps ahead of them. A typical run took
-    # about 27 minutes through 0.15.0; 0.16.0's upgrade tests (a released writer driven to the
-    # 4,096-segment ceiling), delta-merge and UNIQUE-under-writes suites brought it to 43.
-    timeout-minutes: 60
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -39,18 +41,102 @@ jobs:
       # broken build, and nothing later in this job would notice.
       - run: npm run version:check
       - run: npm run format
+      # On this fresh checkout, its `tsc -b --force` is the clean package build: there is no
+      # earlier output to reuse. The site, scripts, and browser harnesses are checked against it.
       - run: npm run typecheck
       - run: npm run lint
-      - run: npm run build
+      # `npm run build` is `clean`, that same forced package build, then the site. The packages
+      # were just built from scratch by the step above, so only the site is left to build.
+      - name: Build the site
+        run: npm run site:build
       # The public API surface is a contract: an unclassified subpath, a declaration change, or a
-      # type-only export turning runtime fails here, matching the pre-push hook's gate.
-      - run: npm run api:check
-      # Coverage rather than a bare run: the thresholds in vitest.config.ts are a ratchet, and a
-      # ratchet nothing turns is just a number in a file.
-      - run: npm run test:coverage
+      # type-only export turning runtime fails here, matching the pre-push hook's gate. Checked
+      # against the declarations built above rather than a third forced build of the same source.
+      - run: npm run api:check:built
       # The committed portable SQLLogicTest profile adds 6,345 result-checked queries without
       # network access. It is intentionally standard local/PR coverage, not a nightly-only net.
       - run: npm run test:sql:standard
+
+  # The unit suite under coverage, in parts. Vitest assigns each file to exactly one of the four
+  # shards by a hash of its path. The maintenance workload is a fifth part: it has a deadline, and
+  # vitest.config.ts runs it alone rather than beside unrelated database simulators. The shards
+  # exclude it by name (`!maintenance`) rather than naming `unit`, so a project added later still
+  # runs in them.
+  unit:
+    name: Unit tests with coverage (${{ matrix.part }})
+    runs-on: ubuntu-latest
+    # Vitest runs one file's tests serially, so the heaviest file bounds its shard however the rest
+    # are spread. That is the schema interaction simulator, whose fake-IndexedDB seeds take about a
+    # quarter of an hour under coverage on a hosted runner; the rest of a shard runs beside it.
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - part: 1/4
+            filter: --project='!maintenance' --shard=1/4
+          - part: 2/4
+            filter: --project='!maintenance' --shard=2/4
+          - part: 3/4
+            filter: --project='!maintenance' --shard=3/4
+          - part: 4/4
+            filter: --project='!maintenance' --shard=4/4
+          - part: maintenance
+            filter: --project=maintenance
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # The suite imports the packages through their built entry points, and the console snippet
+      # tests check against the declaration bundle generated from them. The site itself is built
+      # and checked by the static job.
+      - run: npm run test:prepare
+      # The blob report carries this part's results and coverage to the merge below, which is where
+      # the coverage floors are judged.
+      - name: Test ${{ matrix.part }}
+        run: npm run test:coverage -- ${{ matrix.filter }} --reporter=default --reporter=blob
+        env:
+          MINNOW_COVERAGE_PART: "1"
+      - name: Upload this part's report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: unit-blob-${{ strategy.job-index }}
+          path: .vitest-reports/
+          include-hidden-files: true
+          if-no-files-found: error
+          # A rerun of a failed part replaces its earlier report; the merge reads the latest of each.
+          overwrite: true
+          retention-days: 7
+
+  # Coverage rather than a bare run: the thresholds in vitest.config.ts are a ratchet, and a
+  # ratchet nothing turns is just a number in a file. Merged here, they are judged on every part's
+  # coverage combined, exactly as one `npm run test:coverage` judges a whole run. It runs after a
+  # failed part too, because a failed run is exactly when the report is worth reading.
+  coverage:
+    name: Unit test results and coverage floors
+    needs: unit
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: unit-blob-*
+          path: .vitest-reports
+          merge-multiple: true
+      # Replays every part's results, fails on any failed test, and enforces the coverage floors.
+      - name: Merge the parts and enforce the coverage floors
+        run: npm run test:coverage -- --merge-reports
       - name: Upload coverage
         if: always()
         uses: actions/upload-artifact@v7
@@ -58,6 +144,26 @@ jobs:
           name: coverage
           path: coverage/
           retention-days: 14
+
+  # Preserve the stable required-check name for what used to be one job: it passes only when the
+  # static checks, every unit-test part, and the merged coverage gate all passed.
+  check:
+    name: Format, types, lint, build, unit tests
+    if: always()
+    needs: [static, unit, coverage]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require the static checks, every unit-test part, and the coverage floors
+        env:
+          STATIC_RESULT: ${{ needs.static.result }}
+          UNIT_RESULT: ${{ needs.unit.result }}
+          COVERAGE_RESULT: ${{ needs.coverage.result }}
+        run: |
+          echo "static: $STATIC_RESULT, unit parts: $UNIT_RESULT, coverage: $COVERAGE_RESULT"
+          test "$STATIC_RESULT" = "success"
+          test "$UNIT_RESULT" = "success"
+          test "$COVERAGE_RESULT" = "success"
 
   memory:
     name: Heap plateau
@@ -75,22 +181,51 @@ jobs:
       - run: npm run soak:memory
 
   browser-matrix:
-    name: Real browser (${{ matrix.browser }})
+    name: Real browser (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
+        # Firefox and WebKit split their library suites in two: WebKit's macOS runners leave room
+        # for one Playwright worker, and Firefox spends up to ten minutes in the SQLLogicTest file
+        # alone. Playwright shards whole spec files, so each engine's site suite (two files) runs
+        # once, on its first shard.
         include:
-          - browser: chromium
+          - name: chromium
+            browser: chromium
             os: ubuntu-latest
             cache_path: ~/.cache/ms-playwright
-          - browser: firefox
+            artifact: chromium
+            site: true
+          - name: firefox 1/2
+            browser: firefox
             os: ubuntu-latest
             cache_path: ~/.cache/ms-playwright
-          - browser: webkit
+            shard: 1/2
+            artifact: firefox-1
+            site: true
+          - name: firefox 2/2
+            browser: firefox
+            os: ubuntu-latest
+            cache_path: ~/.cache/ms-playwright
+            shard: 2/2
+            artifact: firefox-2
+            site: false
+          - name: webkit 1/2
+            browser: webkit
             os: macos-latest
             cache_path: ~/Library/Caches/ms-playwright
+            shard: 1/2
+            artifact: webkit-1
+            site: true
+          - name: webkit 2/2
+            browser: webkit
+            os: macos-latest
+            cache_path: ~/Library/Caches/ms-playwright
+            shard: 2/2
+            artifact: webkit-2
+            site: false
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -113,26 +248,27 @@ jobs:
       - name: Install browser system dependencies
         run: npx playwright install-deps ${{ matrix.browser }}
         if: runner.os == 'Linux'
-      - name: Test library in ${{ matrix.browser }}
+      - name: Test library in ${{ matrix.name }}
         id: library
-        run: npm run test:browser:library -- --project ${{ matrix.browser }}
+        run: npm run test:browser:library -- --project ${{ matrix.browser }} ${{ matrix.shard && format('--shard={0}', matrix.shard) || '' }}
       - name: Upload library reports, traces, and plans
         if: always() && (steps.library.outcome == 'success' || steps.library.outcome == 'failure')
         uses: actions/upload-artifact@v7
         with:
-          name: playwright-library-${{ matrix.browser }}
+          name: playwright-library-${{ matrix.artifact }}
           path: |
             playwright-report/
             test-results/
           retention-days: 14
       - name: Test site in ${{ matrix.browser }}
         id: site
+        if: matrix.site
         run: npm run test:browser:site -- --project ${{ matrix.browser }}
       - name: Upload site reports, traces, and plans
         if: always() && (steps.site.outcome == 'success' || steps.site.outcome == 'failure')
         uses: actions/upload-artifact@v7
         with:
-          name: playwright-site-${{ matrix.browser }}
+          name: playwright-site-${{ matrix.artifact }}
           path: |
             playwright-report/
             test-results/
@@ -158,12 +294,17 @@ jobs:
           BROWSER_MATRIX_RESULT: ${{ needs.browser-matrix.result }}
         run: test "$BROWSER_MATRIX_RESULT" = "success"
 
-  engines-floor:
-    name: Unit tests on the oldest supported Node
+  engines-floor-part:
+    name: Unit tests on the oldest supported Node (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    # The whole unit suite without coverage. Node 22 runs the fake-indexeddb simulator seeds about
-    # twice as slowly as 24 (40-76 s each), and 0.16.0's suite passed 20 minutes there.
-    timeout-minutes: 40
+    # The whole unit suite without coverage, in two shards. Node 22 runs the fake-indexeddb
+    # simulator seeds about twice as slowly as 24 (40-76 s each); 0.16.0's whole suite passed in
+    # 20 minutes there on one runner.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1/2, 2/2]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -174,4 +315,19 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
-      - run: npm run test:unit
+      # Both projects, so the maintenance workload runs in whichever shard holds it, alone and
+      # after that shard's other files, as in a whole run.
+      - run: npm run test:unit -- --shard=${{ matrix.shard }}
+
+  # Preserve the stable check name for the oldest-Node gate: it passes only when both shards did.
+  engines-floor:
+    name: Unit tests on the oldest supported Node
+    if: always()
+    needs: engines-floor-part
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every shard
+        env:
+          ENGINES_FLOOR_RESULT: ${{ needs.engines-floor-part.result }}
+        run: test "$ENGINES_FLOOR_RESULT" = "success"
