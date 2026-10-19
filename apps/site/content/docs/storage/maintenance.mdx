@@ -324,7 +324,11 @@ A continuation keeps its destination while paging retained manifests, so a long 
 restart completed segment discovery and starve later cleanup phases. Background passes keep
 the 64 most recent versions readable for up to a minute, so `query({ version })` on a version you
 were just handed still finds it. An explicit `collectGarbage()` reclaims everything no lease or
-job pins; pass `retainRecentVersions` to keep a window. It first reconciles compaction jobs the
+job pins; pass `retainRecentVersions` to keep a window. The connection's own reader lease does
+not count: the engine keeps one shared lease across queries so the next query at the same
+version reuses it, and every pass, explicit or background, first lets go of that lease when no
+query holds it, so a table dropped a moment ago is reclaimed by the pass that follows the drop
+even when nothing has read since. It first reconciles compaction jobs the
 way a background pass does — an owner past its lease is aborted and its job resumed or cancelled —
 so an explicit call also repairs a fold a dead owner left behind.
 

@@ -165,6 +165,7 @@ import {
   type StorageStats,
   StorageCorruptionError,
   StorageFormatVersionError,
+  StorageConnectionClosedError,
   StorageUnresponsiveError,
   IndexedDbSchemaUpgradeBlockedError,
   StorageResourceLimitError,
@@ -236,6 +237,7 @@ import {
   isPackedBlock,
   verifyStoredBlock,
   missingPackedMember,
+  packedSegmentStagingProblem,
   verifyStoredPayload,
   parseJson,
 } from "../block-format/index.js";
@@ -736,6 +738,8 @@ export class IndexedDbBlockStore implements BlockStore {
   #snapshotPeakRetainedItems = 0;
   #snapshotPeakRetainedBytes = 0;
   #closed = false;
+  /** Why the connection closed: the application's `close()`, or a newer build's upgrade. */
+  #closeReason: "closed" | "superseded" = "closed";
   /** Set once the connection's deadline ran out; every later call fails with it. */
   #unresponsive: StorageUnresponsiveError | undefined;
   readonly #stallGuard: ConnectionStallGuard;
@@ -759,8 +763,9 @@ export class IndexedDbBlockStore implements BlockStore {
     stallGuards.set(db, this.#stallGuard);
     db.addEventListener("versionchange", () => {
       // Never leave a newer deployment blocked behind a forgotten connection in another tab.
-      // Closing also makes every later method fail deterministically through #transaction.
-      this.close();
+      // Closing also makes every later method fail deterministically through #transaction,
+      // with a StorageConnectionClosedError that names the cause: this tab was superseded.
+      this.#close("superseded");
     });
   }
 
@@ -4233,6 +4238,22 @@ export class IndexedDbBlockStore implements BlockStore {
           );
         }
       }
+      // A packed segment staged beside its packed block must name only members the block's
+      // directory holds, under their columns: reads refuse the same mismatch, so the record
+      // would otherwise journal a column that can never be read. Directory-only.
+      const packedSegments = normalizedSegments.filter(
+        (segment) => segment.packedBlockId !== undefined,
+      );
+      if (packedSegments.length > 0) {
+        const bytesById = new Map(input.blocks.map((block) => [block.id, block.bytes]));
+        for (const segment of packedSegments) {
+          const problem = packedSegmentStagingProblem(
+            segment.columnBlockIds,
+            bytesById.get(segment.packedBlockId ?? ""),
+          );
+          if (problem !== undefined) throw new TypeError(`Segment ${segment.id}: ${problem}`);
+        }
+      }
       await updateTransactionResourceLedger(
         transaction.objectStore("statistics"),
         input.transactionId,
@@ -4715,6 +4736,21 @@ export class IndexedDbBlockStore implements BlockStore {
           throw new Error(
             `Segment ${segment.id} references block absent from the transaction journal: ${unjournaledBlock}`,
           );
+        }
+      }
+      // As the two-step stage checks: a packed segment written beside its packed block names
+      // only members the block's directory holds, under their columns. Directory-only.
+      const packedSegments = normalizedSegments.filter(
+        (segment) => segment.packedBlockId !== undefined,
+      );
+      if (packedSegments.length > 0) {
+        const bytesById = new Map(input.blocks.map((block) => [block.id, block.bytes]));
+        for (const segment of packedSegments) {
+          const problem = packedSegmentStagingProblem(
+            segment.columnBlockIds,
+            bytesById.get(segment.packedBlockId ?? ""),
+          );
+          if (problem !== undefined) throw new TypeError(`Segment ${segment.id}: ${problem}`);
         }
       }
       // Only previously journaled artifacts need existence probes; the ones added below commit
@@ -7636,6 +7672,19 @@ export class IndexedDbBlockStore implements BlockStore {
             throw corruption(CURRENT_MANIFEST_KEY, "current manifest is pruned");
           }
           currentManifestRecord = record;
+        } else if (
+          currentVersion !== undefined &&
+          record.version > currentVersion &&
+          record.prunedAt === undefined
+        ) {
+          // Every publication writes its summary and moves the pointer in one transaction, so a
+          // readable summary past the pointer means the pointer went backwards: readers answer
+          // from an older version than the one that committed last.
+          issue(
+            "orphan-manifest",
+            `manifests/${String(key)}`,
+            `readable manifest ${String(key)} is newer than the current pointer ${String(currentVersion)}`,
+          );
         }
       } catch (error) {
         issue("invalid-manifest", storageKeyLocation(key), error);
@@ -9456,8 +9505,13 @@ export class IndexedDbBlockStore implements BlockStore {
   }
 
   close(): void {
+    this.#close("closed");
+  }
+
+  #close(reason: "closed" | "superseded"): void {
     if (this.#closed) return;
     this.#closed = true;
+    this.#closeReason = reason;
     // close() is a memory boundary too: callers often retain their service graph after tearing
     // down a database, so do not leave table names, a manifest, or unique-key membership hanging
     // from the closed adapter.
@@ -9466,7 +9520,13 @@ export class IndexedDbBlockStore implements BlockStore {
     this.#manifestCache = undefined;
     this.#levelZeroCounts = undefined;
     this.#journalCache = undefined;
-    this.#stallGuard.dispose();
+    // The stall guard keeps timing the calls already waiting. IndexedDB finishes the transactions
+    // this connection started before it closes, so those calls settle on their own events; one
+    // that never answers — a wedge the moment a newer build's `versionchange` closed this
+    // connection — still fails at the deadline instead of hanging. Dropping the waiters here
+    // did exactly that, and rejecting them at once would be wrong the other way: a transaction
+    // IndexedDB already accepted still commits after close(), and its caller would be told a
+    // write failed that landed. The guard's timer disarms itself once the waiters drain.
     this.#db.close();
   }
 
@@ -9842,7 +9902,9 @@ export class IndexedDbBlockStore implements BlockStore {
     } = {},
   ): IDBTransaction {
     if (this.#unresponsive !== undefined) throw this.#unresponsive;
-    if (this.#closed) throw new Error("This IndexedDB store connection is closed");
+    if (this.#closed) {
+      throw new StorageConnectionClosedError("indexeddb", this.#db.name, this.#closeReason);
+    }
     // A transaction record is only meaningful with its journal chunks, so the journal store
     // travels with the transactions store in every scope rather than at every call site.
     const requested = typeof stores === "string" ? [stores] : stores;
@@ -10054,7 +10116,6 @@ class ConnectionStallGuard {
   #timer: ReturnType<typeof setTimeout> | undefined;
   #tripped: StorageUnresponsiveError | undefined;
   #deadline = 0;
-  #disposed = false;
 
   constructor(
     databaseName: string,
@@ -10076,7 +10137,6 @@ class ConnectionStallGuard {
       queueMicrotask(() => reject(tripped));
       return () => undefined;
     }
-    if (this.#disposed) return () => undefined;
     if (this.#waiting.size === 0) this.#deadline = performance.now() + this.#afterMs;
     this.#waiting.add(reject);
     this.#arm();
@@ -10087,12 +10147,6 @@ class ConnectionStallGuard {
       this.#waiting.delete(reject);
       this.#progress();
     };
-  }
-
-  dispose(): void {
-    this.#disposed = true;
-    this.#waiting.clear();
-    this.#disarm();
   }
 
   #arm(): void {

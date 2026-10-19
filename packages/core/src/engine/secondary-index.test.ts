@@ -489,7 +489,7 @@ describe("secondary-index SQL", () => {
         await database.execute("INSERT INTO duplicate_values VALUES (1, 'x'), (2, 'x')");
         await expect(
           database.execute("CREATE UNIQUE INDEX duplicate_code ON duplicate_values(code)"),
-        ).rejects.toThrow("duplicate key");
+        ).rejects.toThrow(UniqueConstraintError);
         expect((await store.getTableByName("duplicate_values"))?.secondaryIndexes).toBeUndefined();
         await expect(
           database.query("SELECT id FROM duplicate_values WHERE code = 'x' ORDER BY id"),

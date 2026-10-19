@@ -4082,8 +4082,8 @@ it("maintains the full-text index across two IndexedDB connections", async () =>
 it("burns the reserved auto-increment range when a write aborts", async () => {
   const store = new MemoryBlockStore();
   let failNextBlockWrite = false;
-  // The fault-injecting proxy deliberately lacks beginTransaction, so this also exercises the
-  // fallback reservation path.
+  // The range is reserved by the store's atomic `beginTransaction` (the proxy forwards it) and
+  // the write fails after that reservation, so the test shows the burned range is never reused.
   const faultStore = new FaultInjectingBlockStore(store, (point) => {
     if (point === "afterBlockWrite" && failNextBlockWrite) {
       failNextBlockWrite = false;

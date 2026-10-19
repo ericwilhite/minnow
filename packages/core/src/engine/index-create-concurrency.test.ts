@@ -287,9 +287,9 @@ describe.each(stores)("CREATE INDEX IF NOT EXISTS beside another build ($name)",
       await writer.execute("INSERT INTO people VALUES (1000, 'e7')");
       expect(waiting.settled()).toBe(false);
       park.release();
-      expect(await creating.outcome).toMatch(/UNIQUE index people_email has a duplicate key/);
+      expect(await creating.outcome).toMatch(/Duplicate value for people\.email/);
       // Its own attempt, after the creator's failed: the same duplicate, the same failure.
-      expect(await waiting.outcome).toMatch(/UNIQUE index people_email has a duplicate key/);
+      expect(await waiting.outcome).toMatch(/Duplicate value for people\.email/);
       expect(await indexNamed(database.inspect, "people_email")).toBeUndefined();
       expect(reports).toEqual([]);
     } finally {
@@ -363,7 +363,7 @@ describe.each(stores)("CREATE INDEX IF NOT EXISTS beside another build ($name)",
         if (duplicate) {
           // Every start-up reports the duplicate; none reports an index, and none is left.
           for (const outcome of outcomes) {
-            expect(outcome).toMatch(/UNIQUE index people_email has a duplicate key/);
+            expect(outcome).toMatch(/Duplicate value for people\.email/);
           }
           expect(index).toBeUndefined();
         } else {
@@ -479,7 +479,7 @@ describe.each(stores)("index builds whose connection is gone ($name)", ({ name, 
           await track(
             other.execute("CREATE UNIQUE INDEX IF NOT EXISTS people_email ON people (email)"),
           ).outcome,
-        ).toMatch(/UNIQUE index people_email has a duplicate key/);
+        ).toMatch(/Duplicate value for people\.email/);
         // Nobody else is left to clean up: a failed first build leaves no index.
         expect(await indexNamed(database.inspect, "people_email")).toBeUndefined();
         park.release();

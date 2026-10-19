@@ -16,7 +16,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { MinnowDatabase as ReleasedDatabase } from "@minnowdb/core-layout12";
 import { IndexedDbBlockStore as ReleasedIndexedDbStore } from "@minnowdb/core-layout12/storage/indexeddb";
 import { OpfsBlockStore as ReleasedOpfsStore } from "@minnowdb/core-layout12/storage/opfs";
-import { crc32 } from "../block-format/index.js";
+import {
+  crc32,
+  inspectPackedBlock,
+  PACKED_BLOCK_ENTRY_LENGTH,
+  PACKED_BLOCK_HEADER_LENGTH,
+} from "../block-format/index.js";
 import {
   IndexedDbBlockStore,
   OpfsBlockStore,
@@ -410,6 +415,18 @@ describe("IndexedDB: the 0.16.0 writer's database after the schema 8 upgrade", (
     await expect(
       reader.query("SELECT c3 FROM items WHERE id = 5", { memoize: false }),
     ).rejects.toThrow(/has no member/);
+    // The block and its storage checksum are intact, so only the full check's member
+    // cross-check can name the problem; the metadata check reads no block and passes.
+    expect((await reopened.checkIntegrity()).ok).toBe(true);
+    const full = await reopened.checkIntegrity({ mode: "full" });
+    expect(full.ok).toBe(false);
+    expect(full.issues).toEqual([
+      expect.objectContaining({
+        code: "invalid-segment",
+        location: `segments/${update.id}`,
+        message: expect.stringMatching(/packed block lacks member/) as string,
+      }),
+    ]);
     await reader.close();
     reopened.close();
   });
@@ -505,4 +522,132 @@ describe("OPFS: the 0.16.0 writer's database after the layout 13 upgrade", () =>
       reopened._crashForTests();
     }
   });
+
+  it("reports a stored packed block that lost a member its segment names, under an intact storage checksum", async () => {
+    const shim = new MemoryOpfs();
+    await releasedOpfs(shim);
+    let store = await OpfsBlockStore.open({ name: NAME, root: shim.root });
+    let database = new MinnowDatabase(store, OPTIONS);
+    await database.insertBatch("items", [item(900)] as never);
+    const [insert] = await packedSegments(store);
+    if (insert?.packedBlockId === undefined) throw new Error("Expected a packed insert");
+    const original = await store.getBlock(insert.packedBlockId);
+    if (original === undefined) throw new Error("The packed block is missing");
+    await database.close();
+    store._crashForTests();
+
+    // The fault a bit flip in the first directory entry's tag would leave if the extent's
+    // whole-payload checksum happened to survive it: the container is still valid (its envelope
+    // checksum rewritten, its members untouched), so only the member cross-check sees that the
+    // segment's first column now names a member the directory does not hold.
+    const forged = retagFirstMemberKeepingChecksum(original);
+    expect(crc32(forged)).toBe(crc32(original));
+    expect(inspectPackedBlock(forged).memberCount).toBe(inspectPackedBlock(original).memberCount);
+    // Blocks live in extent files under the database directory; patch the one holding it.
+    const database_ = await (
+      await shim.root.getDirectoryHandle("minnowdb")
+    ).getDirectoryHandle(NAME);
+    let patched = 0;
+    const walk = async (directory: FileSystemDirectoryHandle, prefix: string): Promise<void> => {
+      for await (const [entryName, handle] of directory.entries()) {
+        if (handle.kind === "directory") {
+          await walk(handle as FileSystemDirectoryHandle, `${prefix}${entryName}/`);
+          continue;
+        }
+        const path = `${prefix}${entryName}`;
+        const bytes = shim.readFileBytes(path);
+        if (bytes === undefined) continue;
+        const at = indexOfBytes(bytes, original);
+        if (at < 0) continue;
+        bytes.set(forged, at);
+        shim.writeFileBytes(path, bytes);
+        patched += 1;
+      }
+    };
+    await walk(database_, `minnowdb/${NAME}/`);
+    expect(patched).toBe(1);
+
+    store = await OpfsBlockStore.open({ name: NAME, root: shim.root });
+    database = new MinnowDatabase(store, OPTIONS);
+    try {
+      expect((await store.checkIntegrity()).ok).toBe(true);
+      const full = await store.checkIntegrity({ mode: "full" });
+      expect(full.ok).toBe(false);
+      expect(full.issues).toEqual([
+        expect.objectContaining({
+          code: "invalid-segment",
+          location: `segments/${insert.id}`,
+          message: expect.stringMatching(/packed block lacks member/) as string,
+        }),
+      ]);
+      await expect(database.query(ALL, { memoize: false })).rejects.toThrow(/has no member/);
+    } finally {
+      await database.close();
+      store._crashForTests();
+    }
+  });
 });
+
+function indexOfBytes(haystack: Uint8Array, needle: Uint8Array): number {
+  const first = needle[0];
+  for (let at = 0; at + needle.byteLength <= haystack.byteLength; at += 1) {
+    if (haystack[at] !== first) continue;
+    let matched = true;
+    for (let offset = 1; offset < needle.byteLength; offset += 1) {
+      if (haystack[at + offset] !== needle[offset]) {
+        matched = false;
+        break;
+      }
+    }
+    if (matched) return at;
+  }
+  return -1;
+}
+
+/**
+ * The packed block with its first directory entry's tag changed and its envelope checksum
+ * rewritten, chosen so that the whole payload's CRC-32 is unchanged: the entry's second tag
+ * word is solved for over GF(2), since CRC-32 is affine in the bytes it covers.
+ */
+function retagFirstMemberKeepingChecksum(original: Uint8Array): Uint8Array {
+  const target = crc32(original);
+  const directoryEnd =
+    PACKED_BLOCK_HEADER_LENGTH +
+    PACKED_BLOCK_ENTRY_LENGTH * inspectPackedBlock(original).memberCount;
+  const entry = PACKED_BLOCK_HEADER_LENGTH;
+  const candidate = (fnv: number): Uint8Array => {
+    const bytes = original.slice();
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    view.setUint32(entry + 4, view.getUint32(entry + 4, true) ^ 1, true);
+    view.setUint32(entry + 8, fnv >>> 0, true);
+    view.setUint32(4, crc32(bytes.subarray(8, directoryEnd)), true);
+    return bytes;
+  };
+  const base = crc32(candidate(0));
+  const columns = Array.from({ length: 32 }, (_, bit) => crc32(candidate(1 << bit)) ^ base);
+  // Solve sum(columns[bit] for set bits) = target ^ base by Gaussian elimination.
+  let wanted = (target ^ base) >>> 0;
+  const rows = columns.map((column, bit) => ({ column: column >>> 0, bits: 1 << bit }));
+  let solution = 0;
+  for (let pivot = 31; pivot >= 0; pivot -= 1) {
+    const mask = 1 << pivot;
+    const index = rows.findIndex((row) => (row.column & mask) !== 0);
+    if (index < 0) continue;
+    const [row] = rows.splice(index, 1);
+    if (row === undefined) continue;
+    for (const other of rows) {
+      if ((other.column & mask) !== 0) {
+        other.column = (other.column ^ row.column) >>> 0;
+        other.bits ^= row.bits;
+      }
+    }
+    if ((wanted & mask) !== 0) {
+      wanted = (wanted ^ row.column) >>> 0;
+      solution ^= row.bits;
+    }
+  }
+  if (wanted !== 0) throw new Error("No tag keeps the storage checksum");
+  const forged = candidate(solution);
+  if (crc32(forged) !== target) throw new Error("The forged tag changed the storage checksum");
+  return forged;
+}

@@ -10,6 +10,7 @@
 import { dateMilliseconds } from "../date-value.js";
 import { maybeYieldToEventLoop } from "../work-slicer.js";
 import type { BatchValue, ColumnarBatch } from "./batch.js";
+import { UniqueConstraintError } from "./errors.js";
 import { renderDocumentValue, tokenize as ftsTokenize } from "./fts.js";
 import { protectedSqlTextValue } from "./sql-domains.js";
 import {
@@ -414,6 +415,8 @@ export function addSecondaryPosting(
   values: readonly BatchValue[],
   locator: bigint,
   uniqueTerms?: Set<string>,
+  /** The indexed table, named by the error a UNIQUE build raises over a duplicate. */
+  tableName?: string,
 ): void {
   const first = columns[0];
   if (first === undefined) return;
@@ -423,7 +426,15 @@ export function addSecondaryPosting(
   // posting so a prefix lookup can find them, but they never join the uniqueness set.
   if (!values.some((value) => value === null)) {
     if (uniqueTerms?.has(term) === true) {
-      throw new TypeError(`UNIQUE index ${index.name} has a duplicate key`);
+      // The same error every other UNIQUE collision raises, so a caller that catches
+      // `UniqueConstraintError` around a write also catches a `CREATE UNIQUE INDEX` that found
+      // one: the table, the index's column list, and the repeated value.
+      const only = values[0];
+      throw new UniqueConstraintError(
+        tableName ?? index.name,
+        columns.length === 1 ? first.name : `(${columns.map((column) => column.name).join(", ")})`,
+        values.length === 1 && only !== null && only !== undefined ? only : JSON.stringify(values),
+      );
     }
     uniqueTerms?.add(term);
   }

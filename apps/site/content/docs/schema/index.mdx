@@ -352,7 +352,9 @@ const appSchema = schema([customers, orders], { views: [activeCustomers] });
 
 The engine infers the query's real output schema when it creates the view and compares it to what
 you declared, so a body that drifts from its declaration fails the migration instead of surprising
-a reader later.
+a reader later. Every view is checked against the schema the migration produces before any step
+applies, so a view may read a table or column the same `migrate()` call adds, and a view that
+cannot be created fails the migration with nothing changed.
 
 **Views are readable, not writable.** Query them like tables; an insert is rejected because the
 catalog records the object as a view:

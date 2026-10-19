@@ -60,6 +60,10 @@ const SUITES: Suite[] = [
     name: "concurrency-simulation",
     file: "packages/core/src/engine/concurrency-simulation.test.ts",
   },
+  { name: "index-oracle", file: "packages/core/src/engine/index-oracle.test.ts" },
+  { name: "live-oracle", file: "packages/core/src/engine/live-oracle.test.ts" },
+  { name: "compaction-interleave", file: "packages/core/src/engine/compaction-interleave.test.ts" },
+  { name: "fts-oracle", file: "packages/core/src/engine/fts-oracle.test.ts" },
 ];
 
 function argument(flag: string): string | undefined {

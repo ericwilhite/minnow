@@ -8,6 +8,165 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## Unreleased
+
+Not yet published. This entry collects changes merged after 0.17.0; the release that ships them
+replaces this heading with its version and date. Packages: `@minnowdb/core`, `@minnowdb/devtools`. No stored format
+changes: IndexedDB schema 8 and OPFS layout 13 are unchanged, and 0.17.0 opens every database
+this build writes.
+
+The engine with the OPFS adapter is now 438.0 KiB gzipped, about 3 KiB above the previous
+435 KiB measurement. The generic worker plus its separate client measures 546.3 KiB gzipped
+(previously 543.1 KiB); the size budgets and comparison figures follow those measurements.
+The core tarball measures 1,000,105 bytes, up 5.8 KiB from 994,119 bytes.
+
+This batch comes from a correctness and stability audit ahead of production deployments: five
+reviewers injected faults at every storage write of the IndexedDB, OPFS, transaction, and
+packed-segment paths and compared the engine against shadow models. No path lost or corrupted
+committed data. What they found, fixed below, were ways a database could refuse to open after a
+crash, a lost reply that was reported as safe to retry, typed errors that did not survive a
+minified bundle, and reclaimed space that was never returned.
+
+### Fixed: a database that would not open again
+
+- **OPFS: a large commit whose acknowledgement flush failed left the database unopenable.** A
+  commit big enough to be logged in continuation frames (more than 4 MiB of frame, which a bulk
+  load with tens of thousands of `UNIQUE` keys or postings reaches), followed by one transient
+  flush failure on the acknowledgement file, made the leader truncate the completed frame out of
+  the log although the acknowledgement slot may already have named it. Every later open then
+  refused the database with `WAL is truncated before its acknowledged boundary`, with everything
+  before the commit intact on disk and unreachable. The frame now stays, as it always did for a
+  single-frame commit; the leader reloads from its handles and recovery finds the commit. The
+  caller still receives `OpfsUncertainOutcomeError`, which the engine reconciles as before. A
+  crash sweep at each of the 19 flushes of a staged strict commit, by tab death and by power
+  loss, now opens all-or-nothing every time. A database already damaged this way by 0.17.0 or
+  earlier is still refused: on disk it cannot be told from storage that lost flushed bytes.
+- **OPFS, relaxed durability: power loss during a checkpoint's second slot write refused the
+  database.** Relaxed frames were flushed only by the log reset, so a power loss while the
+  mirror slot was being written could leave the first slot complete, the second at the previous
+  generation, and the log empty; recovery refused it with `OPFS checkpoint copies disagree
+without a WAL bridge`. The log is now flushed once per checkpoint, before the first slot is
+  written, so it bridges the generations, and a relaxed opener accepts two complete slots at
+  adjacent generations without a log by taking the newer one; a frame a strict writer
+  acknowledged after it is still protected by the acknowledgement boundary. Strict stores are
+  unchanged.
+- **OPFS, relaxed durability: a zeroed frame inside the unflushed tail made recovery fail
+  closed.** A power loss that zeroed one unflushed frame while a later frame's page survived was
+  reported as `WAL frame marker mismatch`. A relaxed store now ends the log at that frame and
+  recovers the consecutive prefix before it, as the relaxed contract describes. A strict store
+  still fails closed, and a zero-filled frame inside the acknowledged prefix is still refused in
+  both modes.
+- **OPFS: a leader whose handles stopped working held them forever.** When a held handle began
+  failing (the shape a stale handle takes in WebKit), every reload from it failed, every write in
+  every tab failed with it, and nothing released the handles until that tab closed. The leader
+  now releases them the first time a reload fails; the operation that needed it is sent to
+  whoever leads next, this tab with fresh handles or another, and followers' pending requests
+  are declined and re-sent.
+
+### Fixed: writes report their outcome honestly
+
+- **A committed write whose acknowledgement was lost could be reported as safe to retry.** When
+  the reply to a commit was lost and the one read that recovers its record then failed too, the
+  write rejected with that read's error — `OpfsCoordinationError`, `TransactionRecordConflictError`
+  or `TransactionClosedError` depending on the path — which `classifyError` called `transient` or
+  `conflict` with `retry: "safe"`. The row was durable, so a retry duplicated it in a keyless table
+  or failed the application's own write with `UniqueConstraintError` in a keyed one. The record is
+  now read back up to four times with a short backoff; if every read fails, the write still rejects
+  with the original `UnknownOutcomeError`, the read failure as its `cause`. Aborting a transaction
+  whose record turns out to be committed now adopts the commit instead of throwing. Covered on the
+  single-shot, write-scope, SQL `COMMIT`, and trigger two-step paths.
+- **A lost acknowledgement of a step that cannot publish is a definite failure.** A row-id or
+  auto-increment reservation, a lease renewal, or a journal write before the commit whose reply
+  was lost used to surface as `OpfsUncertainOutcomeError`, as if the write might have landed; a
+  lost `beginTransaction` reply also left an active orphan record pinning the manifest until its
+  lease expired. These now reject with the new `WriteNotPublishedError` (`classifyError` kind
+  `transient`, `retry: "safe"`, the uncertain error as `cause`); a lost `beginTransaction` reply
+  is retried under a fresh id and its orphan record closed, burning the reserved range.
+
+### Fixed: typed errors in production bundles
+
+- **Error identity no longer depends on class names surviving minification.** The worker client
+  and the OPFS follower hop rebuilt a typed error by looking up its constructor's name, which
+  every production bundler mangles by default. In such a bundle an `OpfsUncertainOutcomeError`,
+  `StorageUnresponsiveError`, or `UniqueConstraintError` thrown in the worker arrived on the main
+  thread as a plain `Error`: `instanceof` was false and `classifyError` reported an uncertain
+  commit as `other`, `mayHavePublished: false`. Both registries now key on the literal `name` each
+  class carries, and `classifyError` also recognises known errors by name when their prototype is
+  foreign. A test bundles the client with esbuild, minified, and round-trips every exported error
+  class through it. See [Error identity across the worker](/docs/engine/errors#error-identity-across-the-worker).
+- **Damage inside a stored block is `StorageCorruptionError`.** A block whose envelope, payload,
+  or packed-directory checksum fails when the engine decodes it now rejects the read with
+  `StorageCorruptionError` naming `blocks/<id>` (the decoder's error is its `cause`), on every
+  store, and `classifyError` reports it as `corruption`. It was the decoder's bare `Error`,
+  classified `other`.
+
+### Changed: a closed connection says why
+
+- **`StorageConnectionClosedError`.** Calls on a store connection closed by `close()` reject with
+  this `ConnectionLostError` (`reason: "closed"`). A connection that a newer deployment in another
+  tab upgraded underneath — an IndexedDB connection that closed itself on `versionchange` so the
+  upgrade could proceed, or an OPFS connection that heard a leader announce a newer layout —
+  rejects with `reason: "superseded"`: reload the page, which loads the newer build. Both were
+  plain `Error`s before, classified `other`. A call the connection had already handed to storage
+  when it closed is never reported as closed: on IndexedDB it settles on its own transaction, or
+  fails with `StorageUnresponsiveError` at the deadline if that transaction never answers (it used
+  to hang forever once `close()` had run); on OPFS a mutation already posted to the leader rejects
+  with `OpfsUncertainOutcomeError`.
+- **OPFS connections exchange their layout version.** Every leader announcement and request now
+  carries the sender's layout; a connection that hears a newer leader closes itself as superseded,
+  and a leader declines a request from an older layout the same way. A connection that elected
+  itself over a newer marker used to report corruption (`Missing upgrade witness for a torn
+marker`); it is now refused with `StorageFormatVersionError`. Wire-compatible with 0.17.0, whose
+  messages carry no layout and are read as layout 13.
+
+### Fixed: migrations and constraints
+
+- **`migrate()` half-applied a schema that added a column and a view over it.** Views were
+  inferred against the catalog as it stood before the migration's alterations, so a schema that
+  added `a.y` and a view reading it created its new tables, failed on the view with
+  `Ambiguous or missing column: y`, and failed the same way on every rerun, leaving the database
+  between versions for good. `migrate()` now checks every declared view against the schema the
+  migration produces before any step applies: a view may read a table or column the same call
+  adds, and a view that cannot be created fails the migration with nothing changed and an error
+  naming the view. See [Views](/docs/schema#views).
+- **`CREATE UNIQUE INDEX` over existing duplicates** fails with `UniqueConstraintError`, naming
+  the table, the index's columns, and the repeated value, instead of a `TypeError` that only the
+  index name identified. Code that catches `UniqueConstraintError` around writes now catches this
+  too; code matching the old text `UNIQUE index <name> has a duplicate key` must switch to the
+  class or to `Duplicate value for <table>.<columns>`.
+- **`UPDATE … SET generated_column = DEFAULT`** with no other assignment updates every matched row
+  as PostgreSQL does — the generated value is recomputed, update triggers fire, `RETURNING` works,
+  and the row count reports the matches — instead of failing with "An update batch needs at
+  least one change".
+- **`ON CONFLICT … DO UPDATE` cannot reassign the conflict target's own columns**, where
+  PostgreSQL would move the row. This was already refused; the [DML guide](/docs/sql/dml) now
+  says so and the feature matrix lists `mutation.upsert-rekey-target` as unsupported with the
+  exact error; devtools shows that explanation for the refusal. Use `UPDATE` to change a key.
+
+### Fixed: space and maintenance
+
+- **Packed segments are checked against their block when staged.** A staging or single-shot
+  write call that carries a packed segment together with its packed block is refused when the
+  block's directory lacks a member the record names under its column, or when the block is not a
+  packed block (`Segment <id>: packed block lacks member …`). Reads already refused the same
+  mismatch; a record that slipped through would have held a column no one could read until a
+  full integrity check named it. The check reads only the directory, about 0.4 µs per column.
+  `@minnowdb/core/block-format` adds `packedSegmentStagingProblem`, and the storage conformance
+  kit's packed-segment case now requires the refusal, so a custom adapter built on `RecordCore`
+  inherits it. Full-mode `checkIntegrity` on IndexedDB and OPFS is now tested against a stored
+  packed block whose directory lost a member under an intact storage checksum.
+- **`checkIntegrity` reports a manifest pointer that went backwards.** A readable manifest
+  summary newer than `manifest/current` — the mark of a storage layer that rolled the pointer
+  back — is reported as `orphan-manifest`; readers answered from the older version with no sign.
+- **`collectGarbage()` right after `DROP TABLE` reclaimed almost nothing.** The engine keeps one
+  shared reader lease across queries so the next query at the same version reuses it. Left idle
+  at a pre-drop version, that lease rooted every block of the dropped table, and an explicit
+  `collectGarbage()` — with no read in between — retained all of them, pass after pass, until an
+  unrelated query moved the lease; a background pass released it without waiting for the release
+  to land, so its first pass could retain them too. Every pass now lets go of the connection's own
+  idle lease and waits for that before it plans. In the regression test a dropped 306-row table's
+  blocks are all reclaimed by the pass that follows the drop on every store.
+
 ## 0.17.0 — October 18, 2026
 
 Release packages: `@minnowdb/core@0.17.0`, `@minnowdb/kysely@0.6.1`, `@minnowdb/devtools@0.3.8`.

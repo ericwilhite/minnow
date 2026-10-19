@@ -112,6 +112,77 @@ function encodedMemberTag(memberId: string, columnId: string): PackedMemberTag {
 }
 
 /**
+ * Both tag hashes after a member id's prefix — the text up to and including the NUL before its
+ * column id. A segment's canonical members (`<segment id>\0<column id>`) all share one, so a
+ * check over a whole segment hashes the segment id once instead of once per column.
+ */
+interface PrefixTagState {
+  readonly text: string;
+  /** The CRC register, not yet inverted. */
+  readonly crc: number;
+  readonly fnv: number;
+}
+
+/** The prefix state of a canonical ASCII member id, or undefined for any other id. */
+function prefixTagState(memberId: string, columnId: string): PrefixTagState | undefined {
+  const prefixLength = memberId.length - columnId.length;
+  if (
+    prefixLength < 2 ||
+    memberId.charCodeAt(prefixLength - 1) !== 0 ||
+    !memberId.endsWith(columnId)
+  ) {
+    return undefined;
+  }
+  const table = CRC32_BYTE_TABLE;
+  let crc = -1;
+  let fnv = 0x811c9dc5;
+  for (let at = 0; at < prefixLength; at += 1) {
+    const code = memberId.charCodeAt(at);
+    if (code > 0x7f) return undefined;
+    crc = (table[(crc ^ code) & 0xff] ?? 0) ^ (crc >>> 8);
+    fnv = Math.imul(fnv ^ code, 0x01000193);
+  }
+  return { text: memberId.slice(0, prefixLength), crc, fnv };
+}
+
+/**
+ * `packedMemberTag(memberId, columnId)` for a member id made of the prefix's text and the
+ * column id, continued from the prefix's state: it hashes `<column id>\0<column id>` only.
+ * Undefined when the id has another shape or the column id is not ASCII.
+ */
+function sharedPrefixTag(
+  prefix: PrefixTagState | undefined,
+  memberId: string,
+  columnId: string,
+): PackedMemberTag | undefined {
+  if (
+    prefix === undefined ||
+    memberId.length !== prefix.text.length + columnId.length ||
+    !memberId.startsWith(prefix.text) ||
+    !memberId.endsWith(columnId)
+  ) {
+    return undefined;
+  }
+  const table = CRC32_BYTE_TABLE;
+  let crc = prefix.crc;
+  let fnv = prefix.fnv;
+  for (let pass = 0; pass < 2; pass += 1) {
+    for (let at = 0; at < columnId.length; at += 1) {
+      const code = columnId.charCodeAt(at);
+      if (code > 0x7f) return undefined;
+      crc = (table[(crc ^ code) & 0xff] ?? 0) ^ (crc >>> 8);
+      fnv = Math.imul(fnv ^ code, 0x01000193);
+    }
+    if (pass === 0) {
+      // The NUL between the member id and its column id.
+      crc = (table[crc & 0xff] ?? 0) ^ (crc >>> 8);
+      fnv = Math.imul(fnv, 0x01000193);
+    }
+  }
+  return { crc: ~crc >>> 0, fnv: fnv >>> 0 };
+}
+
+/**
  * Encodes small raw columns as one packed block, or returns undefined when two members' tags
  * collide and the caller should write ordinary blocks instead. Every member is raw: packing is
  * for blocks too small for compression to pay.
@@ -267,12 +338,54 @@ export function missingPackedMember(
   columnBlockIds: Readonly<Record<string, readonly string[]>>,
 ): string | undefined {
   const directory = inspectPackedBlock(bytes);
+  // A segment written with its block names the members in directory order, so each one is
+  // tried at the next position first; only a miss builds the lookup. A wide table names up to
+  // 1,024 members, and a linear `findPackedMember` scan for each would make this quadratic.
+  // Canonical member ids share their segment-id prefix, hashed once (see `sharedPrefixTag`).
+  let position = 0;
+  let tags: Set<string> | undefined;
+  let prefix: PrefixTagState | undefined;
   for (const [columnId, memberIds] of Object.entries(columnBlockIds)) {
     for (const memberId of memberIds) {
-      if (findPackedMember(directory, packedMemberTag(memberId, columnId)) < 0) return memberId;
+      prefix ??= prefixTagState(memberId, columnId);
+      const tag =
+        sharedPrefixTag(prefix, memberId, columnId) ?? packedMemberTag(memberId, columnId);
+      if (directory.tagCrc[position] === tag.crc && directory.tagFnv[position] === tag.fnv) {
+        position += 1;
+        continue;
+      }
+      if (tags === undefined) {
+        tags = new Set<string>();
+        for (let index = 0; index < directory.memberCount; index += 1) {
+          tags.add(`${String(directory.tagCrc[index])}:${String(directory.tagFnv[index])}`);
+        }
+      }
+      if (!tags.has(`${String(tag.crc)}:${String(tag.fnv)}`)) return memberId;
     }
   }
   return undefined;
+}
+
+/**
+ * Why a packed segment cannot be staged with the block bytes the same call carries, or
+ * undefined when it can — or when the call does not carry its packed block, which the journal
+ * rules judge instead. Reads refuse the same mismatches, so refusing them here keeps a record
+ * whose column could never be read out of the store. Directory-only: the members' bytes are not
+ * read, so the check costs a few microseconds however large the block.
+ */
+export function packedSegmentStagingProblem(
+  columnBlockIds: Readonly<Record<string, readonly string[]>>,
+  bytes: Uint8Array | undefined,
+): string | undefined {
+  if (bytes === undefined) return undefined;
+  if (!isPackedBlock(bytes)) return "packed block is not a packed block";
+  let missing: string | undefined;
+  try {
+    missing = missingPackedMember(bytes, columnBlockIds);
+  } catch (error) {
+    return `packed block is invalid: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  return missing === undefined ? undefined : `packed block lacks member ${missing}`;
 }
 
 /**

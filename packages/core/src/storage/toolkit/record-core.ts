@@ -179,6 +179,7 @@ import {
   crc32,
   crc32Continue,
   MAX_STORED_BLOCK_BYTE_LENGTH,
+  packedSegmentStagingProblem,
   parseJson,
 } from "../../block-format/index.js";
 
@@ -4044,6 +4045,12 @@ export class RecordCore {
       inputBlockIds.add(block.id);
       addedBytes += options.blockByteLengths?.get(block.id) ?? block.bytes.byteLength;
     }
+    // Prevalidated bodies carry placements, not payload bytes: their packed segments were
+    // checked against real bytes at preflight, before the adapter stored them.
+    const stagedBlockBytes =
+      options.blocksPrevalidated === true
+        ? undefined
+        : new Map(input.blocks.map((block) => [block.id, block.bytes]));
     const segmentIds = new Set<string>();
     const normalizedSegments: SegmentRecord[] = [];
     for (const segment of input.segments) {
@@ -4072,7 +4079,12 @@ export class RecordCore {
           availableBlockIds.add(id);
         }
       }
-      this.#validateStagedSegment(normalized, input.transactionId, availableBlockIds);
+      this.#validateStagedSegment(
+        normalized,
+        input.transactionId,
+        availableBlockIds,
+        stagedBlockBytes === undefined ? undefined : (id) => stagedBlockBytes.get(id),
+      );
       normalizedSegments.push(normalized);
     }
     let pendingTableNextRowId: bigint | undefined;
@@ -4226,9 +4238,23 @@ export class RecordCore {
     segment: SegmentRecord,
     transactionId: string,
     journalBlockIds: { has(id: string): boolean },
+    /**
+     * The bytes of a block the same stage or write call carries, when the call carries real
+     * payload bytes. A packed segment staged beside its packed block is checked against the
+     * block's directory here, so a record naming a member the block lacks never reaches the
+     * journal; adapters that apply placement-only bodies pass nothing and checked at preflight.
+     */
+    stagedBlockBytes?: (id: string) => Uint8Array | undefined,
   ): void {
     if (segment.transactionId !== transactionId) {
       throw new Error(`Segment ${segment.id} belongs to another transaction`);
+    }
+    if (segment.packedBlockId !== undefined && stagedBlockBytes !== undefined) {
+      const problem = packedSegmentStagingProblem(
+        segment.columnBlockIds,
+        stagedBlockBytes(segment.packedBlockId),
+      );
+      if (problem !== undefined) throw new TypeError(`Segment ${segment.id}: ${problem}`);
     }
     if (segmentStoredBlockIds(segment).length === 0) {
       throw new TypeError(`Segment ${segment.id} must reference at least one block`);
@@ -4600,8 +4626,11 @@ export class RecordCore {
     const stagedBlockIds = {
       has: (id: string): boolean => blocks.has(id) || journalBlocks.has(id),
     };
+    // Placement-only bodies (OPFS apply and replay) were checked against real bytes at preflight.
+    const stagedBlockBytes =
+      options.blocksPrevalidated === true ? undefined : (id: string) => blocks.get(id)?.bytes;
     for (const segment of segments.values()) {
-      this.#validateStagedSegment(segment, staged.id, stagedBlockIds);
+      this.#validateStagedSegment(segment, staged.id, stagedBlockIds, stagedBlockBytes);
     }
     // Previously journaled artifacts must exist; the ones staged here land with the commit.
     this.#assertPendingArtifactsAvailable(base, true, true);

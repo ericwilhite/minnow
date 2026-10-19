@@ -55,7 +55,7 @@ enforces counts what the table holds once the commit lands, so the sources a del
 — its plan's `sourceSegments` — are taken off before its outputs are added. `RecordCore` does
 both, and the conformance kit checks both.
 
-OPFS follower RPC has one explicit transport-loss exception. `OpfsUncertainOutcomeError` means a
+OPFS has an explicit uncertain-outcome exception. `OpfsUncertainOutcomeError` can mean a
 leader vanished after receiving the named mutation, its reply was lost, and the log the next
 leader recovered can neither answer the re-sent request nor prove it never ran: the request was
 first sent before the recovered ledger's coverage begins, the leader died in the instant
@@ -63,7 +63,8 @@ between the mutation's frame and the frame that records its return value, or the
 was too large for the ledger to keep (a staging call's answer is the whole transaction record). Every other loss is
 resolved from the log — a re-send is answered with the value the mutation already returned, or
 run once because the log proves it never ran — and a graceful handover never raises the error
-at all. Preserve the class and its `method` field across any wrapper or worker boundary;
+at all. An acknowledgement flush failure, or closing a connection with a mutation already
+posted to a leader, also reports an uncertain outcome. Preserve the class and its `method` field across any wrapper or worker boundary;
 inspect or reopen the database instead of blindly retrying. An ordinary `Error` still means no
 effect and must never be used to hide an uncertain outcome.
 
@@ -251,6 +252,12 @@ from `columnBlockIds` and collect a live packed block, never receives one. To de
   columns `DROP COLUMN` removes.
 - Store and return `packedBlockId` like any other field, and refuse a record that
   `packedSegmentShapeProblem(segment)` rejects.
+- When a staging or single-shot write call carries a packed segment together with its packed
+  block, refuse the call if the block's directory lacks a member the record names under its
+  column, or if the block is not a packed block at all — `packedSegmentStagingProblem(segment.columnBlockIds, bytes)`
+  from `@minnowdb/core/block-format` returns the reason, reading only the directory. Reads refuse
+  the same mismatch, so a record that passed would hold a column no one can read until a full
+  integrity check named it. `RecordCore` does this for the stores built on it.
 - Export packed segments unpacked, so packing never changes a snapshot's format: write each member as an
   ordinary block frame under its member ID in the packed block's place (member IDs sort directly
   after it), and the segment record without `packedBlockId`. The toolkit's `packedSnapshotFrames`,

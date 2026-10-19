@@ -3,6 +3,8 @@
  * fake-indexeddb: fixture records, raw object-store access that bypasses the adapter, and a
  * factory wrapper that observes or sabotages individual requests. Test-only: nothing here ships.
  */
+import { IDBFactory } from "fake-indexeddb";
+import { MinnowDatabase } from "../engine/database.js";
 import { IndexedDbBlockStore } from "./indexeddb.js";
 import type { SegmentRecord, TableRecord, TransactionRecord } from "./types.js";
 
@@ -358,4 +360,109 @@ export async function stageSegments(
     });
   }
   return current;
+}
+
+/** Every record of one object store, in key order, read outside the adapter. */
+export async function readRawStore(
+  indexedDB: IDBFactory,
+  name: string,
+  storeName: string,
+): Promise<Array<{ key: IDBValidKey; value: unknown }>> {
+  const database = await rawOpen(indexedDB, name);
+  try {
+    const transaction = database.transaction(storeName, "readonly");
+    const store = transaction.objectStore(storeName);
+    const [keys, values] = await Promise.all([
+      new Promise<IDBValidKey[]>((resolve, reject) => {
+        const request = store.getAllKeys();
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error ?? new Error("raw IndexedDB read failed"));
+      }),
+      new Promise<unknown[]>((resolve, reject) => {
+        const request = store.getAll();
+        request.onsuccess = () => resolve(request.result as unknown[]);
+        request.onerror = () => reject(request.error ?? new Error("raw IndexedDB read failed"));
+      }),
+    ]);
+    await new Promise<void>((resolve, reject) => {
+      transaction.oncomplete = () => resolve();
+      transaction.onabort = () => reject(transaction.error ?? new Error("raw read aborted"));
+    });
+    return keys.map((key, index) => ({ key, value: values[index] }));
+  } finally {
+    database.close();
+  }
+}
+
+/** Overwrites one raw record behind the adapter's back, as damaged storage would. */
+export async function writeRawValue(
+  indexedDB: IDBFactory,
+  name: string,
+  storeName: string,
+  key: IDBValidKey,
+  value: unknown,
+): Promise<void> {
+  const database = await rawOpen(indexedDB, name);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(storeName, "readwrite");
+      transaction.objectStore(storeName).put(value, key);
+      transaction.oncomplete = () => resolve();
+      transaction.onabort = () => reject(transaction.error ?? new Error("raw write aborted"));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+/** Deletes one raw record behind the adapter's back. */
+export async function deleteRawValue(
+  indexedDB: IDBFactory,
+  name: string,
+  storeName: string,
+  key: IDBValidKey,
+): Promise<void> {
+  const database = await rawOpen(indexedDB, name);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(storeName, "readwrite");
+      transaction.objectStore(storeName).delete(key);
+      transaction.oncomplete = () => resolve();
+      transaction.onabort = () => reject(transaction.error ?? new Error("raw write aborted"));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+/** An engine over a fresh, instrumented fake-indexeddb store, for the engine-level suites. */
+export interface OpenedEngine {
+  indexedDB: IDBFactory;
+  name: string;
+  instrumented: InstrumentedFactory;
+  store: IndexedDbBlockStore;
+  db: MinnowDatabase;
+}
+
+export const ENGINE_OPTIONS = { autoCompact: false, autoCollect: false, rowsPerBlock: 8 } as const;
+
+export async function openEngine(name: string = crypto.randomUUID()): Promise<OpenedEngine> {
+  const indexedDB = new IDBFactory();
+  const instrumented = instrumentFactory(indexedDB);
+  const store = await IndexedDbBlockStore.open({ name, indexedDB });
+  const db = new MinnowDatabase(store, ENGINE_OPTIONS);
+  return { indexedDB, name, instrumented, store, db };
+}
+
+/** Closes the engine and store (a half-failed statement may refuse to close; the store is what matters) and opens them again cold. */
+export async function reopenEngine(opened: OpenedEngine): Promise<OpenedEngine> {
+  try {
+    await opened.db.close();
+  } catch {
+    // see above
+  }
+  opened.store.close();
+  const store = await IndexedDbBlockStore.open({ name: opened.name, indexedDB: opened.indexedDB });
+  const db = new MinnowDatabase(store, ENGINE_OPTIONS);
+  return { ...opened, store, db };
 }

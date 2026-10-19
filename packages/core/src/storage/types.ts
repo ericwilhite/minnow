@@ -3053,8 +3053,9 @@ export class StorageCorruptionError extends Error {
     readonly backend: string,
     readonly location: string,
     message: string,
+    options?: { cause?: unknown },
   ) {
-    super(`${backend} storage corruption at ${location}: ${message}`);
+    super(`${backend} storage corruption at ${location}: ${message}`, options);
   }
 }
 
@@ -3073,6 +3074,31 @@ export class UnknownOutcomeError extends Error {
  */
 export class ConnectionLostError extends Error {
   override readonly name: string = "ConnectionLostError";
+}
+
+/**
+ * The store connection was closed before this call ran, so the call did nothing. `reason` says
+ * why: `"closed"` is the application's own `close()`; `"superseded"` is a newer deployment in
+ * another tab upgrading the stored format underneath this connection, which closed itself so
+ * the upgrade could proceed — the remedy is to reload the page, which loads the newer build.
+ * A call the connection had already handed to storage when it closed is reported as an
+ * `UnknownOutcomeError`, never as this.
+ */
+export class StorageConnectionClosedError extends ConnectionLostError {
+  override readonly name = "StorageConnectionClosedError";
+
+  constructor(
+    readonly backend: string,
+    readonly databaseName: string,
+    readonly reason: "closed" | "superseded",
+  ) {
+    super(
+      reason === "superseded"
+        ? `The ${backend} database ${databaseName} was upgraded by a newer build in another tab ` +
+            "and this connection closed; reload the page to open it with that build"
+        : `This ${backend} store connection is closed`,
+    );
+  }
 }
 
 /**

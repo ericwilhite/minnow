@@ -110,7 +110,7 @@ really is gone, the request goes to whoever leads next, with the same identity a
 was first sent, and the log decides. Every frame a follower's mutation appended carries that
 request's identity, and each checkpoint carries a ledger of recently served requests with the
 values they returned, so a recovering leader answers a re-sent request from the log, or runs it
-fresh when the log proves it never ran. Three things are left to report as
+fresh when the log proves it never ran. Three unresolved reply cases report
 `OpfsUncertainOutcomeError`: a request first sent before the recovered ledger's coverage
 begins (its entries are kept for ten minutes, 65,536 requests, or 8 MiB of returned values), a
 request whose frame was durable but whose leader died in the instant before it recorded the
@@ -197,7 +197,15 @@ a small `upgrade-12-13` witness is written and flushed first, so a crash that te
 finished on the next open instead of refused, and the witness is removed once the new marker is
 durable. A witness an older build left behind (`upgrade-7-8`, `upgrade-8-9`, `upgrade-9-10`,
 `upgrade-10-11`, or `upgrade-11-12`) is finished the same way. An older build then refuses the
-database without changing it.
+database without changing it — including a connection from an older build that was already open
+when the marker moved and later elects itself: it judges the marker again before it leads and
+is refused with `StorageFormatVersionError`. Tabs also tell each other their layout: every
+leader announcement and every request carries the sender's native layout, a connection that
+hears a leader on a newer layout than its own closes itself with `StorageConnectionClosedError`
+(`reason: "superseded"`; reload the page to open the database with the newer build), reporting
+any mutation it had already posted as `OpfsUncertainOutcomeError`, and a leader declines a
+request from an older layout the same way. Builds up to 0.17.0 send no layout and are read as
+layout 13, so a rolling deployment that mixes them with this build behaves as described.
 
 Layout 7 added a 48-byte acknowledgement file with two checksummed slots, alongside the
 structural `schemaEpoch` and served-request ledger. Recovery
@@ -257,7 +265,16 @@ slot and the un-reset log still holding everything. A power loss that persists a
 ahead of its bytes leaves a zero-filled tail where the unacknowledged frame was to go, or a slot
 whose magic landed ahead of its header. A zero-filled WAL suffix is accepted as unwritten only
 when it is beyond the independently recorded acknowledged boundary; missing acknowledged bytes
-stop recovery. An incomplete checkpoint can fall back to its intact mirror and WAL. Opening the database is the recovery; there is no separate repair step. Recovery runs in steps too: it decodes
+stop recovery. A relaxed log, whose frames are flushed only when a checkpoint is taken, can also
+lose a frame in the middle of its unflushed tail with a later frame's page intact behind it;
+recovery of a relaxed store ends the log at that zero-filled frame and keeps the prefix before
+it, where a strict store fails closed. An incomplete checkpoint can fall back to its intact
+mirror and WAL: a relaxed writer flushes the log before it writes a checkpoint's first slot, so
+the log bridges two slots a power loss left at adjacent generations, and a relaxed opener that
+finds two complete slots at adjacent generations with no log at all (a database a relaxed writer
+checkpointed before that flush existed) takes the newer one — every frame a strict writer
+acknowledged after it has an acknowledgement boundary past that slot, which recovery still
+enforces. Opening the database is the recovery; there is no separate repair step. Recovery runs in steps too: it decodes
 one slot and reuses that work when the mirror holds the same bytes, parses the checkpoint a
 bounded piece at a time, builds each table's key membership a slice at a time, and replays the
 log with turns in between, so opening a database of a million keyed rows holds the thread for
@@ -266,8 +283,9 @@ from the fully validated current layout. A recognized but unsupported envelope o
 version stops before redundant-slot fallback and before any truncation or deletion.
 
 A shutdown checkpoint can advance its generation without adding a WAL entry. If shutdown ends
-between mirror writes, recovery accepts adjacent generations only when their WAL sequences agree.
-It still rejects a sequence gap without the log that bridges it. Staged index builds can renew
+between mirror writes, strict recovery accepts adjacent generations only when their WAL sequences agree
+or the log bridges the sequence gap. Relaxed recovery also accepts the newer complete slot as
+described above. Staged index builds can renew
 their leases across checkpoints; recovery validates the current lease interval, not the total
 age of the build. Low-level renewal and chunk-append calls must place the expiration after both
 `expiresAtCutoff` and `updatedAt`, within the one-hour lease limit of each. Invalid intervals are
@@ -291,12 +309,22 @@ An acknowledgement flush failure is reported through `onDiagnostic` (or `console
 returns `OpfsUncertainOutcomeError` to low-level callers. The WAL may already contain the mutation;
 the engine reconciles its transaction before deciding whether it can return success. Never retry
 an uncertain mutation blindly. A throwing diagnostic hook is contained and its error is logged.
+The frame itself stays in the log — a large commit's continuation frames included — and the leader
+reloads from its handles before its next operation; the boundary the acknowledgement slot may
+already name is never truncated away. A leader whose reload fails too (a handle gone stale)
+releases its handles, so the next election recovers from the files; the operations it refused
+never ran and are sent to whoever leads next. Closing a connection reports the calls it still
+holds: a mutation already posted to a leader with `OpfsUncertainOutcomeError`, everything else
+with `StorageConnectionClosedError`.
 
 `relaxed` completes the payload and WAL writes before acknowledging, but lets the operating
 system schedule their final flush. A tab, worker, or browser-process failure normally recovers
 the acknowledged writes already held by the operating system; a machine or device power loss can
 lose an acknowledged suffix. Recovery still accepts only a consecutive WAL prefix whose extent
-ranges and checksums verify. The extra strict-mode flushes cost write throughput, so select
+ranges and checksums verify: it ends at the first frame the power loss left zero-filled, even
+when later frames survived behind it, and a checkpoint interrupted between its two slots recovers
+from the newer complete slot. The log is flushed once per checkpoint, before the first slot is
+written. The extra strict-mode flushes cost write throughput, so select
 `relaxed` only when every acknowledged write can be reconstructed, replayed, or recovered from
 another durable source, and that loss window is an accepted performance trade-off. A later
 checkpoint makes the writes it includes durable, but relaxed mode provides no per-write promise

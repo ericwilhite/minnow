@@ -104,11 +104,11 @@ it("a live segment is proved current by one block, not one per column", async ()
   }
 });
 
-// Each update's key and amount are one packed block (two ordinary blocks through 0.16, which
-// left 128 obsolete blocks at the same 64 segments).
-const FIXED_POINT = { manifests: 3, transactions: 202, segments: 202, obsoleteBlocks: 64 };
+// Releasing the idle reader lease lets the compacted source's 64 packed blocks go too. The
+// old lease retained three manifests and 202 transactions/segments, with 64 obsolete blocks.
+const FIXED_POINT = { manifests: 1, transactions: 138, segments: 138, obsoleteBlocks: 0 };
 
-it("paged discovery reclaims exactly what single-record discovery did", async () => {
+it("paged discovery reaches the fixed point after releasing the idle reader lease", async () => {
   const store = new MemoryBlockStore();
   const db = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
   try {
@@ -131,7 +131,7 @@ it("paged discovery reclaims exactly what single-record discovery did", async ()
       previous = footprint;
     }
     const stats = await store.getStorageStats();
-    // The fixed point single-record discovery reached on this workload.
+    // Only current data remains; the connection's old idle lease cannot root the folded source.
     expect({
       manifests: stats.manifestCount,
       transactions: stats.transactionCount,

@@ -15,6 +15,7 @@ import {
   SchemaConflictError,
   SnapshotImportConflictError,
   SnapshotManifestMissingError,
+  StorageConnectionClosedError,
   StorageCorruptionError,
   StorageUnresponsiveError,
   StorageFormatVersionError,
@@ -65,6 +66,12 @@ export type StoreRpcMessage =
       /** When the requester first sent it; a re-send keeps it, so the ledger can vouch. */
       sentAt: number;
       /**
+       * The requester's native layout (`OPFS_LAYOUT_VERSION`). A leader declines an older one,
+       * which would read records it cannot interpret. Absent from builds up to 0.17.0, which are
+       * layout 13: a missing field reads as 13.
+       */
+      layout?: number;
+      /**
        * Set when a commit's deltas were too large for one message: its key and index changes,
        * fields of `args[0]`, arrived just before as `pieces` `opPiece` messages holding `bytes`
        * of record JSON, and the receiver merges them back into `args[0]`.
@@ -95,8 +102,12 @@ export type StoreRpcMessage =
    * before the ledger's coverage begins, so an earlier leader may have executed it.
    */
   | { kind: "uncertain"; requestId: string }
-  /** The leader exists (sent on takeover and in answer to pings). */
-  | { kind: "leader"; leaderId: string }
+  /**
+   * The leader exists (sent on takeover and in answer to pings), with its native layout. A
+   * follower that hears a layout newer than its own closes itself: a newer build upgraded the
+   * database. Absent from builds up to 0.17.0, which are layout 13.
+   */
+  | { kind: "leader"; leaderId: string; layout?: number }
   /**
    * The sender holds the database's handles but cannot serve yet: it is recovering the log
    * after winning them, or checkpointing on its way out. Nobody else can lead until it is
@@ -137,6 +148,11 @@ const MAX_OPFS_RPC_NODES = 1_100_000;
 function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
   const actual = Object.keys(value);
   return actual.length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+
+/** A native layout version on the wire: absent (a build before the field) or a positive integer. */
+function validLayout(value: unknown): boolean {
+  return value === undefined || (Number.isSafeInteger(value) && (value as number) >= 1);
 }
 
 function boundedRpcString(value: unknown): value is string {
@@ -262,19 +278,21 @@ export function parseStoreRpcMessage(
     const record = value as Record<string, unknown>;
     estimateRpcValueBytes(record);
     switch (record.kind) {
-      case "op":
+      case "op": {
+        const opKeys = [
+          "kind",
+          "requestId",
+          "from",
+          "method",
+          "args",
+          "sentAt",
+          ...(record.layout === undefined ? [] : ["layout"]),
+        ];
         if (
+          !validLayout(record.layout) ||
           !(
-            exactKeys(record, ["kind", "requestId", "from", "method", "args", "sentAt"]) ||
-            (exactKeys(record, [
-              "kind",
-              "requestId",
-              "from",
-              "method",
-              "args",
-              "sentAt",
-              "encoded",
-            ]) &&
+            exactKeys(record, opKeys) ||
+            (exactKeys(record, [...opKeys, "encoded"]) &&
               validEncodedArguments(record.encoded) &&
               Array.isArray(record.args) &&
               record.args.length === 1)
@@ -290,6 +308,7 @@ export function parseStoreRpcMessage(
         )
           return undefined;
         return record as StoreRpcMessage;
+      }
       case "opPiece":
         return exactKeys(record, ["kind", "requestId", "from", "index", "bytes"]) &&
           boundedRpcString(record.requestId) &&
@@ -343,6 +362,11 @@ export function parseStoreRpcMessage(
           ? (record as StoreRpcMessage)
           : undefined;
       case "leader":
+        return (exactKeys(record, ["kind", "leaderId"]) ||
+          (exactKeys(record, ["kind", "leaderId", "layout"]) && validLayout(record.layout))) &&
+          boundedRpcString(record.leaderId)
+          ? (record as StoreRpcMessage)
+          : undefined;
       case "wait":
       case "released":
         return exactKeys(record, ["kind", "leaderId"]) && boundedRpcString(record.leaderId)
@@ -422,39 +446,42 @@ export async function fingerprintStoreRequest(
   return { signature: `${String(retainedBytes)}:${hex(digest)}`, retainedBytes };
 }
 
-const errorRegistry = new Map<string, new (...args: never[]) => Error>(
-  [
-    BlockReadBatchTooLargeError,
-    CompactionBacklogError,
-    WriteConflictError,
-    SchemaConflictError,
-    UniqueKeyConflictError,
-    UniqueIndexCoverageError,
-    TableRecordConflictError,
-    TransactionRecordConflictError,
-    LeaseConflictError,
-    LeaseExpiredError,
-    LeaseOwnerConflictError,
-    CompactionJobConflictError,
-    GarbageCollectionJobConflictError,
-    IndexedDbSchemaUpgradeBlockedError,
-    TempOwnerConflictError,
-    StorageResourceLimitError,
-    TableInUseError,
-    SnapshotManifestMissingError,
-    SnapshotImportConflictError,
-    UniqueKeyBuildConflictError,
-    PostingBuildConflictError,
-    StorageCorruptionError,
-    StorageFormatVersionError,
-    StorageUnresponsiveError,
-    OpfsCoordinationError,
-    OpfsDatabaseInUseError,
-    OpfsUncertainOutcomeError,
-    UnknownOutcomeError,
-    ConnectionLostError,
-  ].map((constructor) => [constructor.name, constructor]),
-);
+/**
+ * Keyed by the literal `name` each class stamps on its instances, never by `constructor.name`:
+ * a bundler minifies the latter while the serialized `name` stays the literal.
+ */
+const errorRegistry = new Map<string, new (...args: never[]) => Error>([
+  ["BlockReadBatchTooLargeError", BlockReadBatchTooLargeError],
+  ["CompactionBacklogError", CompactionBacklogError],
+  ["WriteConflictError", WriteConflictError],
+  ["SchemaConflictError", SchemaConflictError],
+  ["UniqueKeyConflictError", UniqueKeyConflictError],
+  ["UniqueIndexCoverageError", UniqueIndexCoverageError],
+  ["TableRecordConflictError", TableRecordConflictError],
+  ["TransactionRecordConflictError", TransactionRecordConflictError],
+  ["LeaseConflictError", LeaseConflictError],
+  ["LeaseExpiredError", LeaseExpiredError],
+  ["LeaseOwnerConflictError", LeaseOwnerConflictError],
+  ["CompactionJobConflictError", CompactionJobConflictError],
+  ["GarbageCollectionJobConflictError", GarbageCollectionJobConflictError],
+  ["IndexedDbSchemaUpgradeBlockedError", IndexedDbSchemaUpgradeBlockedError],
+  ["TempOwnerConflictError", TempOwnerConflictError],
+  ["StorageResourceLimitError", StorageResourceLimitError],
+  ["TableInUseError", TableInUseError],
+  ["SnapshotManifestMissingError", SnapshotManifestMissingError],
+  ["SnapshotImportConflictError", SnapshotImportConflictError],
+  ["UniqueKeyBuildConflictError", UniqueKeyBuildConflictError],
+  ["PostingBuildConflictError", PostingBuildConflictError],
+  ["StorageCorruptionError", StorageCorruptionError],
+  ["StorageFormatVersionError", StorageFormatVersionError],
+  ["StorageUnresponsiveError", StorageUnresponsiveError],
+  ["StorageConnectionClosedError", StorageConnectionClosedError],
+  ["OpfsCoordinationError", OpfsCoordinationError],
+  ["OpfsDatabaseInUseError", OpfsDatabaseInUseError],
+  ["OpfsUncertainOutcomeError", OpfsUncertainOutcomeError],
+  ["UnknownOutcomeError", UnknownOutcomeError],
+  ["ConnectionLostError", ConnectionLostError],
+]);
 
 export function serializeStoreError(error: unknown): SerializedStoreError {
   return serializeError(error);

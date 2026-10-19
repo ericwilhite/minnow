@@ -192,8 +192,8 @@ set only if nothing was committed after that snapshot. When writes did land — 
 another — it builds again while holding the write turn. Any index does the same when other tabs'
 writes outgrow its delta tail before its build finishes. Writes wait for that second build, as
 they would for any schema change; reads never wait. A row committed before the index enforces is
-an existing row: if it repeats a key, `CREATE UNIQUE INDEX` fails and leaves no index. Once the
-index exists, folding its deltas rebuilds only its postings, never its key set, so a busy table
+an existing row: if it repeats a key, `CREATE UNIQUE INDEX` fails with `UniqueConstraintError` —
+the same error a write that repeats a key gets — and leaves no index. Once the index exists, folding its deltas rebuilds only its postings, never its key set, so a busy table
 keeps the index ready.
 
 `CREATE INDEX IF NOT EXISTS` succeeds on the same terms: once an index of that name is ready, and

@@ -1391,7 +1391,7 @@ describe.each([
       ]);
       // The name is free again, and a rebuild judges the rows as they stand.
       await expect(reopened.execute("CREATE UNIQUE INDEX t_c ON t (c)")).rejects.toThrow(
-        /UNIQUE index t_c has a duplicate key/u,
+        /Duplicate value for t\.c/u,
       );
       await reopened.execute("CREATE UNIQUE INDEX t_c ON t (c, id)");
     } finally {

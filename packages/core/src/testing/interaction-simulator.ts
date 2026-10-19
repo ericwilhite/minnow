@@ -3619,8 +3619,8 @@ class PlanRunner {
         !errorChainSome(
           outcome.error,
           (name, message) =>
-            name === "TypeError" &&
-            message === `UNIQUE index ${interaction.name} has a duplicate key`,
+            name === "UniqueConstraintError" &&
+            message?.startsWith(`Duplicate value for ${interaction.table}.`) === true,
         )
       ) {
         this.#fail(

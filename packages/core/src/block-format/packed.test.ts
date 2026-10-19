@@ -12,6 +12,7 @@ import {
   missingPackedMember,
   packedMemberBytes,
   packedMemberTag,
+  packedSegmentStagingProblem,
   verifyPackedBlock,
   verifyStoredPayload,
 } from "./packed.js";
@@ -175,6 +176,42 @@ describe("packed blocks", () => {
     // A member under another column, and a member the block never held.
     expect(missingPackedMember(encoded.bytes, { a: ["seg/b"] })).toBe("seg/b");
     expect(missingPackedMember(encoded.bytes, { a: ["seg/a"], c: ["seg/c"] })).toBe("seg/c");
+  });
+
+  it("checks canonical members through their shared prefix, in any order, ASCII or not", () => {
+    const column = { type: "number", values: [1] } as const;
+    const member = (segment: string, columnId: string): string => `${segment}\u0000${columnId}`;
+    const columns = ["id", "a\u0000b", "ü", "c"];
+    const encoded = encodePackedBlock(
+      columns.map((columnId) => ({ memberId: member("seg", columnId), columnId, column })),
+    );
+    if (encoded === undefined) throw new Error("expected a packed block");
+    const named = Object.fromEntries(
+      columns.map((columnId) => [columnId, [member("seg", columnId)]]),
+    );
+    expect(missingPackedMember(encoded.bytes, named)).toBeUndefined();
+    // Reversed order leaves the directory-order fast path on the first member.
+    expect(
+      missingPackedMember(encoded.bytes, Object.fromEntries(Object.entries(named).reverse())),
+    ).toBeUndefined();
+    // Another segment's canonical member of the same column, and a column the block lacks.
+    expect(missingPackedMember(encoded.bytes, { id: [member("other", "id")] })).toBe(
+      member("other", "id"),
+    );
+    expect(missingPackedMember(encoded.bytes, { ...named, d: [member("seg", "d")] })).toBe(
+      member("seg", "d"),
+    );
+    // The staging rule: nothing to say without the block, a message for every mismatch.
+    expect(packedSegmentStagingProblem(named, undefined)).toBeUndefined();
+    expect(packedSegmentStagingProblem(named, encoded.bytes)).toBeUndefined();
+    expect(packedSegmentStagingProblem({ d: [member("seg", "d")] }, encoded.bytes)).toBe(
+      `packed block lacks member ${member("seg", "d")}`,
+    );
+    expect(packedSegmentStagingProblem(named, Uint8Array.of(1, 2, 3, 4, 5))).toBe(
+      "packed block is not a packed block",
+    );
+    const torn = encoded.bytes.slice(0, encoded.bytes.byteLength - 1);
+    expect(packedSegmentStagingProblem(named, torn)).toMatch(/^packed block is invalid: /);
   });
 
   it("declines to pack two members whose tags collide", () => {

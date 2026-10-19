@@ -140,7 +140,18 @@ workers (one on a two-CPU runner); each concurrency scenario still creates its f
   (plpgsql trigger functions for PGlite) with identical bodies, and `MERGE` — which SQLite lacks
   — runs verbatim on PGlite and as an equivalent statement pair on SQLite. `npm test` picks up
   `apps/site/bench` alongside `packages/**`, so the dataset generator, the oracles, and the
-  suite definitions are checked on every unit run.
+  suite definitions are checked on every unit run. Four seeded oracle suites then check the
+  paths where stored state can diverge from what a query returns: random mutations, rekeys,
+  compaction, reopens, and column and index DDL, with every indexed query shape compared against
+  the same query forced to scan and against a JavaScript model (`index-oracle`), every live
+  query's last delivered result compared with a fresh run of its SQL after every commit
+  (`live-oracle`), stepped folds interleaved with writes and DDL from a second connection
+  (`compaction-interleave`), and `MATCH` queries through updates, folds, and reopens
+  (`fts-oracle`); `npm run soak` explores all four under new seeds. A PostgreSQL-diffed
+  constraint suite pins CHECK, NOT NULL, DEFAULT, generated, FK, and UNIQUE semantics and tags
+  each documented divergence, and a fault sweep injects an abort or quota refusal at every
+  IndexedDB write of every write shape and expects the logical state unchanged, integrity clean,
+  and the retried write to succeed.
 - **Library browser tests** exercise IndexedDB, OPFS, and transaction behavior that a Node substitute
   cannot prove, and drive a database through a real module worker: the package entry booting,
   transferred buffers arriving intact, and a second worker reopening what the first one wrote.
@@ -984,7 +995,7 @@ The figure each measured engine shows on the page is the `download` field in
 
 The unit suite also compares fresh bundles against the installed SQLite Wasm loader plus its
 Wasm file. The engine with OPFS must stay smaller after gzip. The generic worker with all
-stores plus its separately bundled client has a tight 544 KiB combined budget; those two
+stores plus its separately bundled client has a tight 547 KiB combined budget; those two
 downloads repeat some code and exceed SQLite's single loader-plus-Wasm measurement. The report
 and test share the same measurement code. Per-entry budgets in
 `packages/core/src/tree-shaking.test.ts` separately bound the main engine, the IndexedDB worker,

@@ -183,7 +183,10 @@ RETURNING account_id, logins
 `INSERT INTO accounts AS a` names the target row for the assignments, the conflict predicate,
 and `RETURNING`; as in PostgreSQL, the `AS` is required there. A collision on a constraint other
 than the target is still an error. `ON CONFLICT ON CONSTRAINT name` is not supported; name the
-constraint's columns instead.
+constraint's columns instead. The assignments cannot change the conflict target's own columns:
+`ON CONFLICT (customer_id) DO UPDATE SET customer_id = …` is refused at compile time, where
+PostgreSQL would move the row. To change a row's key, use `UPDATE` (see
+[rekeying](/docs/engine/rekeying)).
 
 `DO NOTHING` is also available, with or without a conflict target — a bare `ON CONFLICT DO
 NOTHING` skips rows that collide on any unique constraint, the key or a `UNIQUE` column — and a

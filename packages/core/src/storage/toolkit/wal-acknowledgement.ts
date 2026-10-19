@@ -62,8 +62,11 @@ export class WalAcknowledgements {
     const acknowledgement = { sequence, endOffset };
     const bytes = this.#encode(acknowledgement);
     writeFully(this.#handle, bytes, (sequence % 2) * SLOT_BYTES, "publishing WAL acknowledgement");
-    this.#handle.flush();
+    // Once the slot is written the boundary may become durable whether or not the flush below
+    // succeeds, so `latest` names it from here: a writer whose flush was refused must treat the
+    // log up to this offset as acknowledged (never truncate it), then reload to learn the truth.
     this.#latest = acknowledgement;
+    this.#handle.flush();
   }
 
   #encode({ sequence, endOffset }: WalAcknowledgement): Uint8Array {

@@ -5,6 +5,7 @@ import {
   OpfsDatabaseInUseError,
   OpfsUncertainOutcomeError,
   PACKED_SEGMENTS,
+  StorageConnectionClosedError,
   StorageCorruptionError,
   StorageFormatVersionError,
   validateStorageDatabaseName,
@@ -392,7 +393,13 @@ export class OpfsBlockStore {
   readonly #dispatchBudgetMs: number;
   readonly #onDiagnostic: ((error: unknown, context: string) => void) | undefined;
   readonly #instanceId = crypto.randomUUID();
+  readonly #databaseName: string;
   readonly #channelName: string;
+  /**
+   * Set when a leader announced a layout newer than this build's: a newer build upgraded the
+   * database in another tab. This connection closed itself; every call reports why.
+   */
+  #superseded: StorageConnectionClosedError | undefined;
   /** Held by every judgement and every write of this database's format marker. */
   readonly #markerLockName: string;
   /** The database-wide channel: leadership traffic every connection listens to. */
@@ -461,6 +468,7 @@ export class OpfsBlockStore {
     this.#handoverGraceMs = options.handoverGraceMs ?? HANDOVER_GRACE_MS;
     this.#dispatchBudgetMs = options.dispatchBudgetMs ?? DISPATCH_BUDGET_MS;
     this.#onDiagnostic = options.onDiagnostic;
+    this.#databaseName = options.name;
     this.#channelName = `minnowdb-store:${options.name}`;
     this.#markerLockName = markerLockName(options.name);
     this.liveQueryChannelName = `minnowdb-live:opfs:${options.name}`;
@@ -591,6 +599,21 @@ export class OpfsBlockStore {
       // them in sequence; the brief retry covers the gap.
       slotA = await this.#openWithRetry(["checkpoint-a"]);
       slotB = await this.#openWithRetry(["checkpoint-b"]);
+      // Judge the marker again with the handles held: a newer build may have advanced it since
+      // this connection opened (a rolling deployment), which is a version refusal — never the
+      // torn marker the upgrade step would otherwise take it for. A marker that does not read
+      // whole is left to that step, which finishes a rewrite from its witness.
+      const marker = await this.#tree.readFile(["format.json"], {
+        lockedMeansAbsent: true,
+        maxBytes: 1024,
+      });
+      if (marker !== undefined) {
+        try {
+          this.#validateFormatMarker(marker);
+        } catch (error) {
+          if (!(error instanceof SyntaxError)) throw error;
+        }
+      }
       const upgraded = await upgradeOpfsLayout(this.#tree, { wal, slotA, slotB }, (publish) =>
         this.#withMarkerLock(publish),
       );
@@ -640,10 +663,14 @@ export class OpfsBlockStore {
       return false;
     }
     this.#knownLeader = this.#instanceId;
-    this.#leader.onBeforeCheckpoint = (expectedMs) => {
+    const leader = this.#leader;
+    leader.onBeforeCheckpoint = (expectedMs) => {
       this.#holdServed(expectedMs);
     };
-    this.#post({ kind: "leader", leaderId: this.#instanceId });
+    leader.onRecoveryFailed = () => {
+      this.#onLeaderRecoveryFailed(leader);
+    };
+    this.#post({ kind: "leader", leaderId: this.#instanceId, layout: OPFS_LAYOUT_VERSION });
     this.#post({ kind: "state", leaderId: this.#instanceId, foreground: this.#foreground });
     if (!this.#foreground) this.#armHiddenIdleTimer();
     return true;
@@ -882,6 +909,20 @@ export class OpfsBlockStore {
           this.#decline(message);
           return;
         }
+        if ((message.layout ?? OPFS_LAYOUT_VERSION) < OPFS_LAYOUT_VERSION) {
+          // A tab from before this database's layout was upgraded: it would read records it
+          // cannot interpret. It is told why, and closes itself when it hears this leader.
+          this.#incomingPieces.delete(servedRequestKey(message.from, message.requestId));
+          this.#answer(message.from, {
+            kind: "result",
+            requestId: message.requestId,
+            ok: false,
+            error: serializeStoreError(
+              new StorageConnectionClosedError("opfs", this.#databaseName, "superseded"),
+            ),
+          });
+          return;
+        }
         let encoded: Uint8Array<ArrayBuffer> | undefined;
         if (message.encoded !== undefined) {
           const assembled = this.#takeAssembledPieces(message);
@@ -986,6 +1027,13 @@ export class OpfsBlockStore {
         return;
       }
       case "leader": {
+        if ((message.layout ?? OPFS_LAYOUT_VERSION) > OPFS_LAYOUT_VERSION) {
+          // A newer build upgraded the database and leads it. Records it writes are beyond
+          // this build; stop here rather than read them wrongly. A leader from a build without
+          // the field is from before any later layout existed, hence this one's.
+          this.#supersede();
+          return;
+        }
         this.#knownLeader = message.leaderId;
         this.#gracefulLeaders.delete(message.leaderId);
         if (this.#reacquireTimer !== undefined) {
@@ -1035,7 +1083,7 @@ export class OpfsBlockStore {
       }
       case "ping": {
         if (this.#leader !== undefined) {
-          this.#post({ kind: "leader", leaderId: this.#instanceId });
+          this.#post({ kind: "leader", leaderId: this.#instanceId, layout: OPFS_LAYOUT_VERSION });
         } else if (this.#recovering || this.#yielding !== undefined) {
           this.#post({ kind: "wait", leaderId: this.#instanceId });
         }
@@ -1670,7 +1718,42 @@ export class OpfsBlockStore {
   // ---------------------------------------------------------------------------------------
 
   #assertOpen(): void {
-    if (this.#closed) throw new Error("This OPFS store connection is closed");
+    if (this.#closed) throw this.#closedError();
+  }
+
+  /** Why a call on this connection cannot run: it closed, or a newer build superseded it. */
+  #closedError(): StorageConnectionClosedError {
+    return (
+      this.#superseded ?? new StorageConnectionClosedError("opfs", this.#databaseName, "closed")
+    );
+  }
+
+  /**
+   * A newer build upgraded this database and leads it. This connection cannot read what that
+   * build writes, so it closes: calls already handed to a leader report an unknown outcome,
+   * everything else reports the supersession, and the remedy is to reload the page.
+   */
+  #supersede(): void {
+    if (this.#closed) return;
+    this.#superseded = new StorageConnectionClosedError("opfs", this.#databaseName, "superseded");
+    this.#diagnostic(this.#superseded, "opfs layout superseded");
+    this.close();
+  }
+
+  /**
+   * The leader could not reload its own log after a refused write and crash-closed itself,
+   * releasing the handles. Whoever next needs the database — this connection included, with
+   * fresh handles — recovers it from the files; the operations it refused never ran and are
+   * re-dispatched.
+   */
+  #onLeaderRecoveryFailed(leader: OpfsLeader): void {
+    if (this.#leader !== leader) return;
+    this.#leader = undefined;
+    this.#knownLeader = undefined;
+    this.#clearHiddenIdleTimer();
+    this.#clearDeferredBid();
+    this.#closeAnswerChannels();
+    this.#post({ kind: "released", leaderId: this.#instanceId });
   }
 
   async #dispatch(method: string, args: unknown[]): Promise<unknown> {
@@ -1806,6 +1889,7 @@ export class OpfsBlockStore {
         method,
         args: encoded?.args ?? args,
         sentAt,
+        layout: OPFS_LAYOUT_VERSION,
         ...(encoded === undefined
           ? {}
           : { encoded: { pieces: encoded.pieces.length, bytes: encoded.bytes } }),
@@ -1880,7 +1964,14 @@ export class OpfsBlockStore {
     this.#clearCoordinationTimers();
     for (const pending of this.#pending.values()) {
       clearTimeout(pending.timer);
-      pending.reject(new Error("This OPFS store connection is closed"));
+      // A mutation already posted to a leader may have run there; its answer is now lost with
+      // this connection, so its outcome is unknown. One never posted, and any read, simply did
+      // not happen.
+      pending.reject(
+        pending.sentTo !== undefined && !READ_METHODS.has(pending.message.method)
+          ? new OpfsUncertainOutcomeError(pending.message.method)
+          : this.#closedError(),
+      );
     }
     this.#pending.clear();
     this.#inFlightMutations.clear();

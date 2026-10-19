@@ -393,6 +393,13 @@
       "notes": "Assigning a subset of target columns changes only those columns; unassigned columns keep their stored values. Assignment targets need not appear in the INSERT column list. Mixed update/insert batches publish atomically or roll back together."
     },
     {
+      "id": "mutation.upsert-rekey-target",
+      "status": "unsupported",
+      "example": "INSERT INTO keyed (name, score) VALUES ('x', 9) ON CONFLICT (name) DO UPDATE SET name = 'z'",
+      "error": "ON CONFLICT DO UPDATE cannot reassign the conflict key",
+      "notes": "The DO UPDATE assignments cannot change the conflict target's own columns, which PostgreSQL permits as a key change of the stored row. Change a row's key with UPDATE instead; the engine records the rekey and forwards the old key."
+    },
+    {
       "id": "where.or",
       "status": "supported",
       "example": "SELECT region FROM rows WHERE amount > 5 OR region = 'west'"

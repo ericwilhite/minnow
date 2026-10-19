@@ -12,7 +12,48 @@
  */
 import { expect, it } from "vitest";
 import { MemoryOpfs } from "../../testing/opfs-shim.js";
+import { StorageConnectionClosedError } from "../types.js";
 import { opener, outcomeMessage, table, waitFor } from "./coordination-helpers.js";
+
+it("a follower that closes reports a posted mutation as uncertain and later calls as closed", async () => {
+  const shim = new MemoryOpfs();
+  const open = opener(shim, "follower-close");
+  const leader = await open();
+  const follower = await open();
+  try {
+    await leader.addTable(table("seed"));
+    await follower.getCurrentManifestVersion();
+    const release = leader._holdServedMutationsForTests();
+    const posted = outcomeMessage(follower.addTable(table("posted")));
+    await waitFor(
+      () => leader._residentStateForTests().inFlightMutations === 1,
+      "the follower's write to reach the leader",
+    );
+    // The leader holds the write; it may run. The follower's own connection goes away.
+    follower.close();
+    expect(await posted).toBe(
+      "OpfsUncertainOutcomeError: The OPFS operation addTable could not be acknowledged; the mutation may have committed",
+    );
+    let error: unknown;
+    try {
+      await follower.listTables();
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(StorageConnectionClosedError);
+    expect(error).toMatchObject({
+      reason: "closed",
+      backend: "opfs",
+      databaseName: "follower-close",
+    });
+    release();
+    // It did run: the leader's log holds it.
+    await waitFor(async () => (await leader.listTables()).length === 2, "the posted write to land");
+  } finally {
+    leader.close();
+    follower.close();
+  }
+});
 
 it("answers a served mutation that was mid-flight when the leader closed gracefully", async () => {
   const shim = new MemoryOpfs();

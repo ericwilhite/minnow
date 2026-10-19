@@ -2,6 +2,7 @@
  * a temporary tree; a checksummed ready record makes publication retryable after tab/power loss.
  * The original payloads remain in place. No operation is admitted until publication completes. */
 import { crc32, crc32Continue } from "../../block-format/checksum.js";
+import { parseJson } from "../../block-format/index.js";
 import { readFully, writeFully, type SyncFileHandle } from "../toolkit/sync-file.js";
 import { iterateWalFrames } from "../toolkit/wal.js";
 import {
@@ -422,6 +423,25 @@ async function markerRewriteWitness(tree: OpfsTree): Promise<boolean> {
 }
 
 /**
+ * The layout a whole, canonical marker names, or undefined for anything else — a torn or
+ * foreign marker, which the witness logic judges.
+ */
+function wholeMarkerVersion(text: string): number | undefined {
+  let parsed: unknown;
+  try {
+    parsed = parseJson(text);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+  const version = (parsed as { formatVersion?: unknown }).formatVersion;
+  if (!Number.isSafeInteger(version) || typeof version !== "number" || version < 0) {
+    return undefined;
+  }
+  return text === JSON.stringify({ formatVersion: version }) ? version : undefined;
+}
+
+/**
  * Layouts 7 to 12 store layout 13's bytes, so the upgrade is the marker. The witness goes first
  * and is flushed before the marker is touched: a crash that tears the marker while it is
  * rewritten leaves a durable witness behind, and the next open finishes the rewrite instead of
@@ -474,6 +494,18 @@ async function upgradeLayout6(
   if (!current && !legacy && readyBytes === undefined) {
     // A marker torn while it was rewritten as layout 8 to 13 is the marker step's to finish.
     if (await markerRewriteWitness(tree)) return false;
+    // A whole marker naming a layout this build does not write is a version refusal — a newer
+    // build upgraded the database since this connection opened — never a torn one.
+    const version = wholeMarkerVersion(text);
+    if (version !== undefined) {
+      throw new StorageFormatVersionError(
+        "opfs",
+        "format.json",
+        version,
+        OPFS_LAYOUT_VERSION,
+        version < OPFS_LAYOUT_VERSION ? "older" : "newer",
+      );
+    }
     throw corrupt("Missing upgrade witness for a torn marker");
   }
   let ready: ReadyRecord;

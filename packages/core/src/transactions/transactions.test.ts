@@ -5,6 +5,8 @@ import {
   MAX_TRANSACTION_STAGE_BLOCKS,
   MemoryBlockStore,
   OpfsBlockStore,
+  OpfsCoordinationError,
+  OpfsUncertainOutcomeError,
   SnapshotManifestMissingError,
   WriteConflictError,
   type BeginTransactionInput,
@@ -20,6 +22,7 @@ import {
 import { FaultInjectingBlockStore } from "../testing/index.js";
 import { MemoryOpfs } from "../testing/opfs-shim.js";
 import { TransactionClosedError, TransactionManager } from "./index.js";
+import { MinnowDatabase } from "../engine/database.js";
 
 function implementations(): Array<{ name: string; create: () => Promise<BlockStore> }> {
   return [
@@ -1562,4 +1565,136 @@ it("lets an unacknowledged terminal lease cleanup expire without changing the ou
   await manager.removeExpiredLeases(now);
   expect(await store.listLeases()).toEqual([]);
   store.close();
+});
+
+describe("a commit whose acknowledgement was lost and whose recovery read fails", () => {
+  /** Commits durably, loses the acknowledgement, then fails `getTransaction` `reads` times. */
+  async function lostCommit(reads: number, options: { lapse?: boolean } = {}) {
+    let now = new Date("2026-01-01T00:00:00.000Z");
+    const store = new MemoryBlockStore();
+    const manager = new TransactionManager(store, { now: () => now, transactionTtlMs: 3_000 });
+    const { transaction } = await manager.beginWithReservation();
+    const original = store.writeTransaction.bind(store);
+    vi.spyOn(store, "writeTransaction").mockImplementation(async (input) => {
+      await original(input);
+      // A slow commit: the lease is past a third of its life when the engine aborts.
+      if (options.lapse === true) now = new Date(now.getTime() + 2_500);
+      throw new OpfsUncertainOutcomeError("writeTransaction");
+    });
+    let remaining = reads;
+    const read = store.getTransaction.bind(store);
+    const reading = vi.spyOn(store, "getTransaction").mockImplementation(async (id) => {
+      if (remaining > 0) {
+        remaining -= 1;
+        throw new OpfsCoordinationError("leader-unavailable", "getTransaction");
+      }
+      return read(id);
+    });
+    return { store, transaction, reading };
+  }
+
+  it("retries the read and adopts the commit when a later read answers", async () => {
+    const { store, transaction, reading } = await lostCommit(2);
+    const manifest = await transaction.stageArtifactsAndCommit(
+      [{ id: "b", bytes: new Uint8Array([1]) }],
+      [],
+    );
+    expect(manifest.version).toBe(0);
+    expect(transaction.status).toBe("committed");
+    expect(reading).toHaveBeenCalledTimes(3);
+    store.close();
+  });
+
+  it("rethrows the original uncertain error, with the read failure as cause, when every read fails", async () => {
+    const { store, transaction, reading } = await lostCommit(100);
+    const error = await transaction
+      .stageArtifactsAndCommit([{ id: "b", bytes: new Uint8Array([1]) }], [])
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(OpfsUncertainOutcomeError);
+    expect((error as Error).cause).toBeInstanceOf(OpfsCoordinationError);
+    expect(reading).toHaveBeenCalledTimes(4);
+    // The commit did land; the record says so once the store answers again.
+    reading.mockRestore();
+    expect((await store.getTransaction(transaction.id))?.status).toBe("committed");
+    store.close();
+  });
+
+  it("abort after a failed recovery adopts the committed record instead of throwing", async () => {
+    const { store, transaction } = await lostCommit(4);
+    await expect(
+      transaction.stageArtifactsAndCommit([{ id: "b", bytes: new Uint8Array([1]) }], []),
+    ).rejects.toBeInstanceOf(OpfsUncertainOutcomeError);
+    // The revision moved under the abort's compare-and-swap: a lost-ack commit, not a conflict.
+    await expect(transaction.abort()).resolves.toBeUndefined();
+    expect(transaction.status).toBe("committed");
+    expect((await store.getTransaction(transaction.id))?.status).toBe("committed");
+    store.close();
+  });
+
+  it("abort whose renewal finds the record committed adopts it instead of throwing", async () => {
+    const { store, transaction } = await lostCommit(4, { lapse: true });
+    await expect(
+      transaction.stageArtifactsAndCommit([{ id: "b", bytes: new Uint8Array([1]) }], []),
+    ).rejects.toBeInstanceOf(OpfsUncertainOutcomeError);
+    await expect(transaction.abort()).resolves.toBeUndefined();
+    expect(transaction.status).toBe("committed");
+    store.close();
+  });
+
+  it("reports whether a publishing call was issued", async () => {
+    const store = new MemoryBlockStore();
+    const manager = new TransactionManager(store);
+    const transaction = await manager.beginDeferred();
+    expect(transaction.commitAttempted).toBe(false);
+    await transaction.stageArtifacts([{ id: "b", bytes: new Uint8Array([1]) }], []);
+    expect(transaction.commitAttempted).toBe(false);
+    await transaction.commit();
+    expect(transaction.commitAttempted).toBe(true);
+    store.close();
+  });
+});
+
+describe("a begin whose acknowledgement was lost", () => {
+  it("closes the orphan record and begins again; the reserved range is a gap, not a reuse", async () => {
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store, { autoCompact: false, autoCollect: false });
+    await database.createTable({ name: "t", columns: [{ name: "c", type: "number" }] });
+    const tableId = (await store.getTableByName("t"))?.id ?? "";
+    const manager = new TransactionManager(store);
+    const begin = store.beginTransaction.bind(store);
+    let lost = 2;
+    const begun = vi.spyOn(store, "beginTransaction").mockImplementation(async (input) => {
+      const result = await begin(input);
+      if (lost > 0) {
+        lost -= 1;
+        throw new OpfsUncertainOutcomeError("beginTransaction");
+      }
+      return result;
+    });
+    const first = await manager.beginWithReservation({ tableId, count: 3 });
+    expect(begun).toHaveBeenCalledTimes(3);
+    // The two lost begins each reserved three ids; this transaction's range starts after them.
+    expect(first.rowIds).toEqual({ start: 7n, endExclusive: 10n });
+    const records = (await store.listTransactionPage(null, 100)).records;
+    expect(records.map((record) => record.status).sort()).toEqual(["aborted", "aborted", "active"]);
+    expect(records.find((record) => record.status === "active")?.id).toBe(first.transaction.id);
+    await first.transaction.abort();
+    store.close();
+  });
+
+  it("gives up after a bounded number of lost begins with the uncertain error", async () => {
+    const store = new MemoryBlockStore();
+    const manager = new TransactionManager(store);
+    const begin = store.beginTransaction.bind(store);
+    const begun = vi.spyOn(store, "beginTransaction").mockImplementation(async (input) => {
+      await begin(input);
+      throw new OpfsUncertainOutcomeError("beginTransaction");
+    });
+    await expect(manager.beginWithReservation()).rejects.toBeInstanceOf(OpfsUncertainOutcomeError);
+    expect(begun).toHaveBeenCalledTimes(4);
+    const records = (await store.listTransactionPage(null, 100)).records;
+    // Every record this connection knows it created is closed, not left pinning its version.
+    expect(records.filter((record) => record.status === "active")).toHaveLength(1);
+    store.close();
+  });
 });

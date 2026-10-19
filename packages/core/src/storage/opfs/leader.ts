@@ -689,8 +689,8 @@ function shrinksLoggedState(body: WalEntryBody): boolean {
  */
 export class OpfsLeaderClosedError extends Error {
   override readonly name = "OpfsLeaderClosedError";
-  constructor() {
-    super("This OPFS store connection is closed");
+  constructor(options?: ErrorOptions) {
+    super("This OPFS store connection is closed", options);
   }
 }
 
@@ -894,6 +894,11 @@ export class OpfsLeader {
    * followers how long the leader will be silent; nothing else may run in between.
    */
   onBeforeCheckpoint: ((expectedMs: number) => void) | undefined;
+  /**
+   * Runs when a poisoned leader could not reload from its handles and crash-closed itself
+   * (`#reloadFromDisk`). The store drops it and lets the next election recover from the files.
+   */
+  onRecoveryFailed: ((error: unknown) => void) | undefined;
   /** How long the previous checkpoint took, the estimate the next hold is based on. */
   #lastCheckpointMs = 0;
 
@@ -1064,11 +1069,19 @@ export class OpfsLeader {
         throw new Error("OPFS checkpoint copies disagree within the same generation");
       }
       // A no-op checkpoint interrupted between mirrors advances only the generation.
-      // Equal sequences preserve acknowledged state; a missing WAL sequence does not.
+      // Equal sequences preserve acknowledged state; a missing WAL sequence does not — under
+      // strict durability, where every frame between the two captures was flushed before it was
+      // acknowledged, so an empty log beside two sequences means the log was lost. A relaxed
+      // log is flushed before a checkpoint's first slot is written (`#checkpointState`), but a
+      // database a relaxed writer checkpointed before that flush existed can still show the
+      // newer slot complete, the older one intact, and no log: a power loss during the mirror
+      // write. The newer slot is a flushed capture of acknowledged state, and any frame a strict
+      // writer acknowledged after it has an acknowledgement boundary past the slot's sequence,
+      // which the boundary check below still refuses; so a relaxed opener accepts it.
       if (
         walSize === 0 &&
         (firstCopy.generation - secondCopy.generation > 1 ||
-          firstCopy.lastSeq !== secondCopy.lastSeq)
+          (firstCopy.lastSeq !== secondCopy.lastSeq && this.#strict))
       ) {
         throw new Error(
           "OPFS checkpoint copies disagree without a WAL bridge; refusing a silent rollback",
@@ -1195,6 +1208,9 @@ export class OpfsLeader {
       this.#walHandle,
       acknowledgedEnd,
       maybeYieldToEventLoop,
+      // A relaxed log's frames were not flushed one by one, so a power loss can leave a
+      // zero-filled frame with later frames behind it; the prefix before it is the state.
+      { zeroedFrameEndsLog: !this.#strict },
     )) {
       await maybeYieldToEventLoop();
       const entry = validateWalEntry(payload);
@@ -1402,11 +1418,31 @@ export class OpfsLeader {
   #run<T>(work: () => Promise<T> | T): Promise<T> {
     const result = this.#chain.then(async () => {
       if (this.#closed) throw new OpfsLeaderClosedError();
-      if (this.#poisoned) await this.#loadFromDisk();
+      if (this.#poisoned) await this.#reloadFromDisk();
       return work();
     });
     this.#chain = result.catch(() => undefined);
     return result;
+  }
+
+  /**
+   * Reloads a poisoned leader from its own handles. A reload that fails leaves nothing to serve
+   * from — and nothing to gain from trying again on the same handles, which is what a stale
+   * handle looks like in a browser. The leader crash-closes, releasing the handles so another
+   * connection (or this one, with fresh handles) can recover from the files, tells the store
+   * through `onRecoveryFailed`, and refuses the operation as closed: it never ran, so the store
+   * sends it to whoever leads next.
+   */
+  async #reloadFromDisk(): Promise<void> {
+    try {
+      await this.#loadFromDisk();
+    } catch (error) {
+      if (this.#closed) throw error;
+      this.crash();
+      this.#diagnostic(error, "opfs leader recovery");
+      this.onRecoveryFailed?.(error);
+      throw new OpfsLeaderClosedError({ cause: error });
+    }
   }
 
   /**
@@ -1581,7 +1617,7 @@ export class OpfsLeader {
    */
   async #reloadIfPoisonedByLeaseLane(): Promise<boolean> {
     if (!this.#poisoned) return false;
-    await this.#loadFromDisk();
+    await this.#reloadFromDisk();
     return true;
   }
 
@@ -1859,12 +1895,23 @@ export class OpfsLeader {
     encoded.staged = { offset, prefixBytes };
   }
 
-  /** Takes back a staged frame's pieces when its completing frame never went in. */
+  /**
+   * Takes back a staged frame's pieces when its completing frame never went in. A frame whose
+   * completing piece was written is consumed by `#appendFrame` (its `staged` cleared), so this
+   * never rewinds a frame the log holds whole — not even when the acknowledgement that followed
+   * it failed: that frame is durable, and the poisoned reload replays it.
+   */
   #unstageEncodedFrame(encoded: EncodedWalFrame): void {
     const staged = encoded.staged;
     if (staged === undefined || this.#wal.byteLength < staged.offset) return;
     // The completing frame went in when the sequence advanced past the frame's own.
     if (this.#seq >= encoded.seq) return;
+    // Never truncate below a boundary the acknowledgement file may already name: a log shorter
+    // than its acknowledged boundary is refused by every later open. Reload instead.
+    if (staged.offset < (this.#acknowledgements?.latest.endOffset ?? 0)) {
+      this.#poisoned = true;
+      return;
+    }
     try {
       this.#wal.rewind(staged.offset);
     } catch (error) {
@@ -1888,6 +1935,9 @@ export class OpfsLeader {
           throw new Error("A staged OPFS log frame lost its place in the log");
         }
         this.#wal.appendEncoded(encoded.bytes.subarray(encoded.staged.prefixBytes), flush);
+        // The log holds the whole frame now. Whatever fails from here — the acknowledgement
+        // most plausibly — must not take it back (`#unstageEncodedFrame`).
+        delete encoded.staged;
       } else if (
         encoded !== undefined &&
         encoded.request === request &&
@@ -3386,7 +3436,13 @@ export class OpfsLeader {
     // In relaxed mode, appends deliberately avoid per-operation flushes. Make every extent
     // referenced by this checkpoint durable before publishing and flushing the checkpoint;
     // only then is it safe to reset the WAL.
-    if (!this.#strict) this.#pool.flush();
+    if (!this.#strict) {
+      this.#pool.flush();
+      // The log too: the frames this checkpoint covers are the bridge recovery needs when a
+      // power loss lands between the first slot's flush and the mirror's, leaving the slots at
+      // adjacent generations. One flush per checkpoint, not per write.
+      this.#wal.flush();
+    }
     this.#snapshotFrameExportLedger?.flush();
     this.#snapshotFrameImportLedger?.flush();
     return {
@@ -4370,7 +4426,7 @@ export class OpfsLeader {
       // Drop the blocks, reload if poisoned, and run again with the lane closed, making the
       // room before the next batch.
       await this.#pool.rollbackBatch(mark);
-      if (this.#poisoned) await this.#loadFromDisk();
+      if (this.#poisoned) await this.#reloadFromDisk();
     }
   }
 
@@ -6088,7 +6144,10 @@ export class OpfsLeader {
     this.#extents?.close();
   }
 
-  /** Test-only: what tab death does — locks release, nothing is flushed or checkpointed. */
+  /**
+   * What tab death does — locks release, nothing is flushed or checkpointed. Tests use it as
+   * such; the leader uses it on itself when it can no longer recover from its handles.
+   */
   crash(): void {
     this.#cancelCoveredLogReset();
     this.#closed = true;

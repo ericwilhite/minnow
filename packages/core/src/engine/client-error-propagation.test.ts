@@ -8,6 +8,7 @@ import { MinnowDatabase } from "./database.js";
 import { MinnowDatabaseClient } from "./client.js";
 import { exposeDatabase, attachWorkerHost } from "./worker-server.js";
 import { classifyError, DatabaseStoreUnavailableError, UnknownTableError } from "./errors.js";
+import { StorageConnectionClosedError } from "../storage/types.js";
 import {
   OpfsCoordinationError,
   OpfsUncertainOutcomeError,
@@ -77,6 +78,11 @@ describe("direct calls", () => {
       () => chained(new WriteConflictError(1, 2)),
       { expectedVersion: 1, actualVersion: 2 },
     ],
+    [
+      "StorageConnectionClosedError",
+      () => chained(new StorageConnectionClosedError("OPFS", "shop", "superseded")),
+      { backend: "OPFS", databaseName: "shop", reason: "superseded" },
+    ],
   ];
   for (const [name, make, fields] of cases) {
     it(`${name} arrives typed with fields and cause from an autocommit insert`, async () => {
@@ -114,6 +120,27 @@ describe("direct calls", () => {
     expect(error).toBeInstanceOf(DOMException);
     expect((error as DOMException).name).toBe("QuotaExceededError");
     expect(classifyError(error).kind).toBe("resource");
+    await client.close().catch(() => undefined);
+  });
+
+  it("StorageConnectionClosedError classifies as connection-lost on both sides", async () => {
+    let armed = false;
+    const { client } = connect(async (method, _args, run) => {
+      if (armed && method === "writeTransaction") {
+        throw new StorageConnectionClosedError("OPFS", "shop", "closed");
+      }
+      return run();
+    });
+    await seed(client);
+    armed = true;
+    const error = await client.insert("t", { id: 1, v: "x" }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(StorageConnectionClosedError);
+    expect(classifyError(error)).toEqual({
+      kind: "connection-lost",
+      mayHavePublished: false,
+      retry: "never",
+      connectionUsable: false,
+    });
     await client.close().catch(() => undefined);
   });
 

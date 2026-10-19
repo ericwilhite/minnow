@@ -41,6 +41,16 @@ const UNIQUE_KEY_CHANGE_SLICE = 16_384;
  * instead (`stageArtifactsAndCommit`), which is what lets a wide write commit in one call.
  */
 const LOCAL_ARTIFACT_BATCH_BLOCKS = 64;
+/**
+ * How many times a commit whose acknowledgement was lost reads its record back before giving
+ * up, and the pause between reads. The read goes to the same store that just lost the
+ * acknowledgement — an OPFS follower re-electing a leader, say — so one failure is expected
+ * and a bounded retry is what turns "unknown" into "committed" most of the time.
+ */
+const COMMIT_RECOVERY_READS = 4;
+const COMMIT_RECOVERY_BACKOFF_MS = 25;
+/** How many times a begin whose acknowledgement was lost is repeated with a fresh id. */
+const BEGIN_RETRIES = 3;
 
 /**
  * One indexed column's postings from the operations of one transaction. Each operation adds a
@@ -313,6 +323,12 @@ export class DatabaseTransaction {
    * touches nothing.
    */
   #persisted: boolean;
+  /**
+   * Whether a publishing call (`commitTransaction` / `writeTransaction`) has been issued. Until
+   * it has, nothing of this transaction can be visible, so an error from an earlier storage
+   * step — a reservation, a renewal — is a definite failure however the store reported it.
+   */
+  #commitAttempted = false;
   readonly #coalesceArtifacts: boolean;
   /** Durable pin for a deferred transaction that has no transaction record yet. */
   #snapshotLease: LeasedSnapshot | undefined;
@@ -507,6 +523,14 @@ export class DatabaseTransaction {
 
   get compactionSourceBlockIds(): string[] {
     return [...this.#compactionSourceBlockIds].sort();
+  }
+
+  /**
+   * Whether a publishing storage call has been issued. False means nothing of this transaction
+   * can have become visible, whatever error a storage step reported.
+   */
+  get commitAttempted(): boolean {
+    return this.#commitAttempted;
   }
 
   /** Extends durable ownership; scope owners call this while user code is legitimately waiting. */
@@ -879,6 +903,7 @@ export class DatabaseTransaction {
     for (const segment of ordered) this.#knownSegments.set(segment.id, structuredClone(segment));
     this.#stagedSegmentsView = undefined;
     for (const segment of ordered) this.#changedTableIds.add(segment.tableId);
+    this.#commitAttempted = true;
     try {
       const manifest = await single({
         transaction: this.#persisted
@@ -1324,6 +1349,7 @@ export class DatabaseTransaction {
     const committedRevision = advanceRevision(this.#record.revision, 1);
     const compactionJobId = this.#compactionJobId;
     const ftsChanges = await this.#materializedFtsChangesSliced();
+    this.#commitAttempted = true;
     try {
       const manifest = await this.store.commitTransaction({
         transactionId: this.id,
@@ -1393,6 +1419,15 @@ export class DatabaseTransaction {
     // Already reclaimed: this owner's lease lapsed and the ownership check found the record
     // aborted by whoever reclaimed it. Nothing can publish it now, so the abort is done.
     if (this.#record.status === "aborted") return;
+    // Already committed: a lost acknowledgement whose recovery read adopted the commit, or one
+    // whose recovery failed and whose ownership check then found the record committed. There
+    // is nothing to abort, and throwing here would replace the error the caller is unwinding
+    // from — the uncertain outcome it must report — with a misleading one.
+    if (this.#record.status === "committed") {
+      this.#stopHeartbeat();
+      await this.#releaseSnapshotLease().catch(() => undefined);
+      return;
+    }
     this.#assertActive();
     if (!this.#persisted) {
       // Never written, so there is nothing to mark: the transaction simply ends here.
@@ -1408,15 +1443,32 @@ export class DatabaseTransaction {
     try {
       await this.#renewOwnership();
     } catch (error) {
-      if (!(error instanceof TransactionClosedError) || !(await this.#settleLapsedAbort())) {
-        throw error;
+      if (!(error instanceof TransactionClosedError)) throw error;
+      if (await this.#settleLapsedAbort()) return;
+      // The ownership check read the record back and found it committed: the commit whose
+      // acknowledgement was lost did land. Adopt that, as #recoverCommitted would have.
+      const settled: TransactionRecord = this.#record;
+      if (settled.status === "committed") {
+        this.#stopHeartbeat();
+        await this.#releaseSnapshotLease().catch(() => undefined);
+        return;
       }
-      return;
+      throw error;
     }
-    this.#record = await this.store.updateTransaction(this.id, this.#record.revision, {
-      status: "aborted",
-      updatedAt: dateIsoString(this.now()),
-    });
+    try {
+      this.#record = await this.store.updateTransaction(this.id, this.#record.revision, {
+        status: "aborted",
+        updatedAt: dateIsoString(this.now()),
+      });
+    } catch (error) {
+      // The revision moved under a fresh lease: the record committed (a lost acknowledgement)
+      // or was reclaimed. Read it back rather than report the mismatch; only a record that is
+      // still active with a revision this owner never produced is a real conflict.
+      if (!(error instanceof TransactionRecordConflictError)) throw error;
+      const persisted = await this.store.getTransaction(this.id);
+      if (persisted === undefined || persisted.status === "active") throw error;
+      this.#record = persisted;
+    }
     this.#stopHeartbeat();
     await this.#releaseSnapshotLease().catch(() => undefined);
   }
@@ -1518,10 +1570,40 @@ export class DatabaseTransaction {
     this.#deferredSegments.length = 0;
   }
 
-  /** A commit whose acknowledgement was lost still committed: answer from the persisted record. */
+  /**
+   * A commit whose acknowledgement was lost still committed: answer from the persisted record.
+   * The record is read back a bounded number of times, because the read goes to the store that
+   * just lost the acknowledgement. When every read fails, the error the caller gets is the
+   * commit's own — an `UnknownOutcomeError` stays uncertain, with the last read failure as its
+   * cause — never the read's: a transient read failure reported in its place would tell the
+   * application that nothing published and that a retry is safe, when the commit may well
+   * have landed.
+   */
   async #recoverCommitted(error: unknown): Promise<ManifestSummary> {
-    const manifest = await this.#adoptPersistedCommit();
-    if (manifest !== undefined) return manifest;
+    let readFailure: unknown;
+    for (let attempt = 0; attempt < COMMIT_RECOVERY_READS; attempt += 1) {
+      if (attempt > 0) {
+        await new Promise((resolve) => setTimeout(resolve, COMMIT_RECOVERY_BACKOFF_MS * attempt));
+      }
+      let manifest: ManifestSummary | undefined;
+      try {
+        manifest = await this.#adoptPersistedCommit();
+      } catch (caught) {
+        readFailure = caught;
+        continue;
+      }
+      if (manifest !== undefined) return manifest;
+      // The record is there and not committed, or is gone: the commit did not land.
+      throw error;
+    }
+    if (error instanceof Error && error.cause === undefined) {
+      Object.defineProperty(error, "cause", {
+        value: readFailure,
+        writable: true,
+        configurable: true,
+        enumerable: false,
+      });
+    }
     throw error;
   }
 
@@ -1793,11 +1875,11 @@ export class TransactionManager {
     record: TableRecord,
     expectedCatalogEpoch: number,
   ): Promise<DatabaseTransaction> {
-    const id = this.#createId();
-    const ownerId = `${id}/owner`;
-    const timestamp = dateIsoString(this.#now());
     let begun: Awaited<ReturnType<BlockStore["beginTransaction"]>>;
-    for (;;) {
+    for (let lostBegins = 0; ;) {
+      const id = this.#createId();
+      const ownerId = `${id}/owner`;
+      const timestamp = dateIsoString(this.#now());
       try {
         begun = await this.store.beginTransaction({
           record: {
@@ -1818,6 +1900,11 @@ export class TransactionManager {
       } catch (error) {
         // Atomic begin writes nothing when its current-manifest pin loses a pruning race.
         if (error instanceof SnapshotManifestMissingError) continue;
+        if (error instanceof UnknownOutcomeError && lostBegins < BEGIN_RETRIES) {
+          lostBegins += 1;
+          await this.#settleLostBegin(id, ownerId);
+          continue;
+        }
         throw error;
       }
     }
@@ -1905,12 +1992,12 @@ export class TransactionManager {
     rowIds?: RowIdRange;
     autoIncrementValues?: RowIdRange;
   }> {
-    const id = this.#createId();
-    const ownerId = `${id}/owner`;
-    const timestamp = dateIsoString(this.#now());
     let begun: Awaited<ReturnType<BlockStore["beginTransaction"]>>;
     let probe: CatalogProbe;
-    for (;;) {
+    for (let lostBegins = 0; ;) {
+      const id = this.#createId();
+      const ownerId = `${id}/owner`;
+      const timestamp = dateIsoString(this.#now());
       // The catalog state the transaction starts from, as `beginDeferred` records it: the
       // engine carries its catalog cache past this transaction's commit only when the commit
       // lands on exactly that state, and without it every read after a batch write reloaded
@@ -1938,6 +2025,14 @@ export class TransactionManager {
       } catch (error) {
         // The store's atomic begin aborted in full, including any counter reservation.
         if (error instanceof SnapshotManifestMissingError) continue;
+        // A begin publishes nothing, so a lost acknowledgement is not an uncertain write: the
+        // reply that carried the reserved ranges is gone, the record (if it landed) is closed,
+        // and the begin is simply repeated under a fresh id.
+        if (error instanceof UnknownOutcomeError && lostBegins < BEGIN_RETRIES) {
+          lostBegins += 1;
+          await this.#settleLostBegin(id, ownerId);
+          continue;
+        }
         throw error;
       }
       probe = await probing;
@@ -1984,6 +2079,24 @@ export class TransactionManager {
 
   #transactionExpiry(): string {
     return expiryAfter(this.#now(), this.#transactionTtlMs);
+  }
+
+  /**
+   * A begin whose acknowledgement was lost may have created its record and reserved its
+   * counters, but nobody can drive a record whose reserved ranges never arrived. Close it when
+   * it exists — left active it would pin its version until its lease expired — so the caller
+   * can begin again. A counter range the lost begin reserved is a gap, never a reuse. Best
+   * effort: a record this cannot reach is reclaimed by recovery like any expired writer.
+   */
+  async #settleLostBegin(id: string, ownerId: string): Promise<void> {
+    const persisted = await this.store.getTransaction(id).catch(() => undefined);
+    if (persisted?.status !== "active" || persisted.ownerId !== ownerId) return;
+    await this.store
+      .updateTransaction(id, persisted.revision, {
+        status: "aborted",
+        updatedAt: dateIsoString(this.#now()),
+      })
+      .catch(() => undefined);
   }
 
   async openSnapshot(version?: number | null): Promise<Snapshot> {

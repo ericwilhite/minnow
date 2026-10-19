@@ -112,6 +112,25 @@ export class LiveQueryLimitError extends Error {
   }
 }
 
+/**
+ * A storage step before the commit — a row-id or auto-increment reservation, a lease renewal, a
+ * journal write — lost its acknowledgement. Nothing of the write can have published, because no
+ * publishing call was issued, so unlike the `UnknownOutcomeError` it carries as `cause` this is a
+ * definite failure: repeating the write is safe. The cause still says whether the connection
+ * survived (`classifyError(error).connectionUsable`).
+ */
+export class WriteNotPublishedError extends Error {
+  override readonly name = "WriteNotPublishedError";
+
+  constructor(cause: unknown) {
+    super(
+      "A storage step before the commit lost its acknowledgement; nothing of the write was " +
+        "published, and repeating it is safe",
+      { cause },
+    );
+  }
+}
+
 export class UniqueConstraintError extends Error {
   override readonly name = "UniqueConstraintError";
 
@@ -298,76 +317,119 @@ export interface ErrorClassification {
 
 type ErrorClass = abstract new (...args: never[]) => Error;
 
-const CONFLICT_ERRORS: readonly ErrorClass[] = [
-  WriteConflictError,
-  SchemaConflictError,
-  TableRecordConflictError,
-  TransactionRecordConflictError,
-  LeaseConflictError,
-  LeaseOwnerConflictError,
-  CompactionJobConflictError,
-  GarbageCollectionJobConflictError,
-  TempOwnerConflictError,
-  UniqueKeyBuildConflictError,
-  PostingBuildConflictError,
-  SnapshotImportConflictError,
-  SnapshotManifestMissingError,
-  TableInUseError,
-  OpfsDatabaseInUseError,
+/**
+ * A class and the literal `name` its instances carry. Classification matches either: `instanceof`
+ * is the normal path, and the name is the fallback for an error whose prototype is not this
+ * module's class — a second copy of the module in a bundle, or an error rehydrated by an older
+ * client — so the answer never silently degrades to `"other"` for an error the engine knows.
+ */
+type ErrorEntry = readonly [name: string, constructor: ErrorClass];
+
+const UNKNOWN_OUTCOME_ERRORS: readonly ErrorEntry[] = [
+  ["UnknownOutcomeError", UnknownOutcomeError],
+  ["OpfsUncertainOutcomeError", UnknownOutcomeError],
+  ["StorageUnresponsiveError", UnknownOutcomeError],
+  ["DatabaseWorkerOutcomeUnknownError", DatabaseWorkerOutcomeUnknownError],
 ];
 
-const TRANSIENT_ERRORS: readonly ErrorClass[] = [
-  OpfsCoordinationError,
-  DatabaseReadBacklogError,
-  MaintenanceBacklogError,
-  CompactionBacklogError,
-  LiveQueryLimitError,
-  LeaseExpiredError,
-  TransactionExpiredError,
-  IndexedDbSchemaUpgradeBlockedError,
-  VisibleSegmentCursorStaleError,
+const CONNECTION_LOST_ERRORS: readonly ErrorEntry[] = [
+  ["ConnectionLostError", ConnectionLostError],
+  ["DatabaseWorkerTimeoutError", DatabaseWorkerTimeoutError],
+  ["DatabaseWorkerFailedError", DatabaseWorkerFailedError],
+  ["StorageConnectionClosedError", ConnectionLostError],
 ];
 
-const RESOURCE_ERRORS: readonly ErrorClass[] = [
-  StorageResourceLimitError,
-  BlockReadBatchTooLargeError,
-  CompactionMemoryBudgetError,
-  CompactionWriteAmplificationError,
+const CORRUPTION_ERRORS: readonly ErrorEntry[] = [
+  ["StorageCorruptionError", StorageCorruptionError],
+  ["StorageFormatVersionError", StorageFormatVersionError],
 ];
 
-const REJECTED_ERRORS: readonly ErrorClass[] = [
-  UniqueConstraintError,
-  UniqueKeyConflictError,
-  UniqueIndexCoverageError,
-  MissingKeyError,
-  UnknownTableError,
-  SqlCompileError,
-  CompactionJobCancelledError,
+const CONFLICT_ERRORS: readonly ErrorEntry[] = [
+  ["WriteConflictError", WriteConflictError],
+  ["SchemaConflictError", SchemaConflictError],
+  ["TableRecordConflictError", TableRecordConflictError],
+  ["TransactionRecordConflictError", TransactionRecordConflictError],
+  ["LeaseConflictError", LeaseConflictError],
+  ["LeaseOwnerConflictError", LeaseOwnerConflictError],
+  ["CompactionJobConflictError", CompactionJobConflictError],
+  ["GarbageCollectionJobConflictError", GarbageCollectionJobConflictError],
+  ["TempOwnerConflictError", TempOwnerConflictError],
+  ["UniqueKeyBuildConflictError", UniqueKeyBuildConflictError],
+  ["PostingBuildConflictError", PostingBuildConflictError],
+  ["SnapshotImportConflictError", SnapshotImportConflictError],
+  ["SnapshotManifestMissingError", SnapshotManifestMissingError],
+  ["TableInUseError", TableInUseError],
+  ["OpfsDatabaseInUseError", OpfsDatabaseInUseError],
 ];
 
-function isAnyOf(error: unknown, classes: readonly ErrorClass[]): boolean {
-  return classes.some((constructor) => error instanceof constructor);
-}
+const TRANSIENT_ERRORS: readonly ErrorEntry[] = [
+  ["OpfsCoordinationError", OpfsCoordinationError],
+  ["DatabaseReadBacklogError", DatabaseReadBacklogError],
+  ["MaintenanceBacklogError", MaintenanceBacklogError],
+  ["CompactionBacklogError", CompactionBacklogError],
+  ["LiveQueryLimitError", LiveQueryLimitError],
+  ["LeaseExpiredError", LeaseExpiredError],
+  ["TransactionExpiredError", TransactionExpiredError],
+  ["IndexedDbSchemaUpgradeBlockedError", IndexedDbSchemaUpgradeBlockedError],
+  ["VisibleSegmentCursorStaleError", VisibleSegmentCursorStaleError],
+];
+
+const RESOURCE_ERRORS: readonly ErrorEntry[] = [
+  ["StorageResourceLimitError", StorageResourceLimitError],
+  ["BlockReadBatchTooLargeError", BlockReadBatchTooLargeError],
+  ["CompactionMemoryBudgetError", CompactionMemoryBudgetError],
+  ["CompactionWriteAmplificationError", CompactionWriteAmplificationError],
+];
+
+const REJECTED_ERRORS: readonly ErrorEntry[] = [
+  ["UniqueConstraintError", UniqueConstraintError],
+  ["UniqueKeyConflictError", UniqueKeyConflictError],
+  ["UniqueIndexCoverageError", UniqueIndexCoverageError],
+  ["MissingKeyError", MissingKeyError],
+  ["UnknownTableError", UnknownTableError],
+  ["SqlCompileError", SqlCompileError],
+  ["CompactionJobCancelledError", CompactionJobCancelledError],
+];
 
 function hasErrorName(error: unknown, name: string): boolean {
   return typeof error === "object" && error !== null && (error as { name?: unknown }).name === name;
 }
 
+function isAnyOf(error: unknown, entries: readonly ErrorEntry[]): boolean {
+  return entries.some(
+    ([name, constructor]) => error instanceof constructor || hasErrorName(error, name),
+  );
+}
+
+/** Whether the error, or anything in its `cause` chain, says the connection is finished. */
+function causedByConnectionLoss(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  for (let current = error; typeof current === "object" && current !== null;) {
+    if (seen.has(current)) return false;
+    seen.add(current);
+    if (isAnyOf(current, CONNECTION_LOST_ERRORS)) return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
 /**
  * Classifies any error into what it means for the caller: may the operation have published, is
  * a retry sound, and is the connection still usable. Works on errors rehydrated from the worker
- * or a follower hop, and on the platform's own `QuotaExceededError` and `AbortError`.
+ * or a follower hop, and on the platform's own `QuotaExceededError` and `AbortError`. An error
+ * is recognised by its class or, failing that, by its `name`, so identity does not depend on
+ * one copy of this module or on class names surviving a bundler.
  */
 export function classifyError(error: unknown): ErrorClassification {
-  if (error instanceof UnknownOutcomeError) {
+  if (isAnyOf(error, UNKNOWN_OUTCOME_ERRORS)) {
     return {
       kind: "unknown-outcome",
       mayHavePublished: true,
       retry: "after-reconcile",
-      connectionUsable: !(error.cause instanceof ConnectionLostError),
+      connectionUsable: !causedByConnectionLoss((error as { cause?: unknown }).cause),
     };
   }
-  if (error instanceof ConnectionLostError) {
+  if (isAnyOf(error, CONNECTION_LOST_ERRORS)) {
     return {
       kind: "connection-lost",
       mayHavePublished: false,
@@ -375,11 +437,20 @@ export function classifyError(error: unknown): ErrorClassification {
       connectionUsable: false,
     };
   }
-  if (error instanceof StorageCorruptionError || error instanceof StorageFormatVersionError) {
+  if (isAnyOf(error, CORRUPTION_ERRORS)) {
     return { kind: "corruption", mayHavePublished: false, retry: "never", connectionUsable: true };
   }
   if (isAnyOf(error, CONFLICT_ERRORS)) {
     return { kind: "conflict", mayHavePublished: false, retry: "safe", connectionUsable: true };
+  }
+  if (error instanceof WriteNotPublishedError || hasErrorName(error, "WriteNotPublishedError")) {
+    // Nothing published, but the cause may still have ended the connection.
+    return {
+      kind: "transient",
+      mayHavePublished: false,
+      retry: "safe",
+      connectionUsable: !causedByConnectionLoss((error as { cause?: unknown }).cause),
+    };
   }
   if (isAnyOf(error, TRANSIENT_ERRORS)) {
     return { kind: "transient", mayHavePublished: false, retry: "safe", connectionUsable: true };

@@ -24,23 +24,44 @@ try {
 
 ## The matrix
 
-| Kind              | Errors                                                                                                                                                                                                                                                  | May have published | Retry                                            | Connection usable |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ | ------------------------------------------------ | ----------------- |
-| `unknown-outcome` | `DatabaseWorkerOutcomeUnknownError`, `OpfsUncertainOutcomeError`, `StorageUnresponsiveError` — all extend `UnknownOutcomeError`                                                                                                                         | **yes**            | after reconciling                                | see below         |
-| `connection-lost` | `DatabaseWorkerTimeoutError`, `DatabaseWorkerFailedError` — both extend `ConnectionLostError`                                                                                                                                                           | no                 | never on this client                             | **no**            |
-| `conflict`        | `WriteConflictError`, `SchemaConflictError`, `TableRecordConflictError`, `TransactionRecordConflictError`, lease, compaction, collection, temp-owner, index-build, and snapshot-import conflicts, `TableInUseError`, `OpfsDatabaseInUseError`           | no                 | as is                                            | yes               |
-| `rejected`        | `UniqueConstraintError`, `UniqueKeyConflictError`, `UniqueIndexCoverageError`, `MissingKeyError`, `UnknownTableError`, `SqlCompileError`, `CompactionJobCancelledError`, any `TypeError`, `RangeError`, `SyntaxError`                                   | no                 | never as written                                 | yes               |
-| `transient`       | `OpfsCoordinationError`, `DatabaseReadBacklogError`, `MaintenanceBacklogError`, `CompactionBacklogError`, `LiveQueryLimitError`, `LeaseExpiredError`, `TransactionExpiredError`, `IndexedDbSchemaUpgradeBlockedError`, `VisibleSegmentCursorStaleError` | no                 | with backoff                                     | yes               |
-| `resource`        | `QuotaExceededError`, `StorageResourceLimitError`, `BlockReadBatchTooLargeError`, `CompactionMemoryBudgetError`, `CompactionWriteAmplificationError`                                                                                                    | no                 | after freeing space (`retry: "after-reconcile"`) | yes               |
-| `corruption`      | `StorageCorruptionError`, `StorageFormatVersionError`                                                                                                                                                                                                   | no                 | never                                            | yes               |
-| `cancelled`       | An `AbortError` from the caller's own signal                                                                                                                                                                                                            | no                 | as is                                            | yes               |
-| `other`           | Anything else — a plain `Error`, a `QueryMemoryBudgetError`, a platform error the engine does not classify                                                                                                                                              | no                 | never as written                                 | yes               |
+| Kind              | Errors                                                                                                                                                                                                                                                                            | May have published | Retry                                            | Connection usable |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ | ------------------------------------------------ | ----------------- |
+| `unknown-outcome` | `DatabaseWorkerOutcomeUnknownError`, `OpfsUncertainOutcomeError`, `StorageUnresponsiveError` — all extend `UnknownOutcomeError`                                                                                                                                                   | **yes**            | after reconciling                                | see below         |
+| `connection-lost` | `DatabaseWorkerTimeoutError`, `DatabaseWorkerFailedError`, `StorageConnectionClosedError` — all extend `ConnectionLostError`                                                                                                                                                      | no                 | never on this client                             | **no**            |
+| `conflict`        | `WriteConflictError`, `SchemaConflictError`, `TableRecordConflictError`, `TransactionRecordConflictError`, lease, compaction, collection, temp-owner, index-build, and snapshot-import conflicts, `TableInUseError`, `OpfsDatabaseInUseError`                                     | no                 | as is                                            | yes               |
+| `rejected`        | `UniqueConstraintError`, `UniqueKeyConflictError`, `UniqueIndexCoverageError`, `MissingKeyError`, `UnknownTableError`, `SqlCompileError`, `CompactionJobCancelledError`, any `TypeError`, `RangeError`, `SyntaxError`                                                             | no                 | never as written                                 | yes               |
+| `transient`       | `WriteNotPublishedError`, `OpfsCoordinationError`, `DatabaseReadBacklogError`, `MaintenanceBacklogError`, `CompactionBacklogError`, `LiveQueryLimitError`, `LeaseExpiredError`, `TransactionExpiredError`, `IndexedDbSchemaUpgradeBlockedError`, `VisibleSegmentCursorStaleError` | no                 | with backoff                                     | yes (see below)   |
+| `resource`        | `QuotaExceededError`, `StorageResourceLimitError`, `BlockReadBatchTooLargeError`, `CompactionMemoryBudgetError`, `CompactionWriteAmplificationError`                                                                                                                              | no                 | after freeing space (`retry: "after-reconcile"`) | yes               |
+| `corruption`      | `StorageCorruptionError`, `StorageFormatVersionError`                                                                                                                                                                                                                             | no                 | never                                            | yes               |
+| `cancelled`       | An `AbortError` from the caller's own signal                                                                                                                                                                                                                                      | no                 | as is                                            | yes               |
+| `other`           | Anything else — a plain `Error`, a `QueryMemoryBudgetError`, a platform error the engine does not classify                                                                                                                                                                        | no                 | never as written                                 | yes               |
 
 An unknown-outcome error is the one case where "the call threw" does not mean "nothing
 happened". The engine never replays a mutation on its own; reconcile a stable identity (a sale
 id, a revision) before deciding whether to send it again. Its `cause` tells you whether the
 connection survived: a mutation cancelled by its own signal leaves the connection usable, one
 rejected because the worker fell silent does not.
+
+The engine keeps that uncertainty honest in both directions. A commit whose acknowledgement was
+lost reads its own record back, several times if the store is still recovering, and reports the
+commit as success when the record says it landed; when every read fails, the error you get is
+still the `UnknownOutcomeError` (with the read failure as its `cause`), never a conflict or
+transient error that would call a retry safe. And a storage step that cannot publish — a row-id
+or auto-increment reservation, a lease renewal, a journal write before the commit — that loses its
+acknowledgement is reported as `WriteNotPublishedError`: nothing of the write is visible, so
+repeating it is safe. Its `cause` is the underlying uncertain error, and
+`classifyError(error).connectionUsable` reads that cause, so an unresponsive store still reports
+the connection as finished.
+
+## Error identity across the worker
+
+`classifyError` and `instanceof` work on an error that crossed the worker boundary (or the OPFS
+follower hop) because the client rebuilds it from the literal `name` the engine stamps on every
+error instance, not from the class's own identifier. A bundler that minifies class names — the
+default for every production build — therefore does not affect error identity: no `keepNames` or
+`keep_classnames` setting is needed. `classifyError` also falls back to that `name` when the
+prototype is not its own class, which covers an application bundle that ended up with two
+copies of `@minnowdb/core`.
 
 ## Losing and reopening a connection
 

@@ -123,6 +123,10 @@ export class WalWriter {
     }
     this.#handle.truncate(offset);
     this.#offset = offset;
+    // The pieces were flushed when they went in; a power loss that forgot an unflushed
+    // truncation would bring them back as a torn tail. Harmless, but make what the writer
+    // sees and what the disk holds agree.
+    this.#handle.flush();
   }
 
   #appendFrame(magic: number, bytes: Uint8Array, flush: boolean): void {
@@ -210,11 +214,24 @@ export function replayWalFrames(handle: SyncFileHandle): {
 export function* iterateWalFrames(
   handle: SyncFileHandle,
   acknowledgedEndOffset = 0,
+  options: WalReplayOptions = {},
 ): Generator<ReplayedWalFrame> {
-  for (const payload of walPayloads(handle, acknowledgedEndOffset)) {
+  for (const payload of walPayloads(handle, acknowledgedEndOffset, options)) {
     if (payload !== null)
       yield { payload: decodeRecordJson(payload.bytes), frameEnd: payload.frameEnd };
   }
+}
+
+export interface WalReplayOptions {
+  /**
+   * Ends the log at the first zero-filled frame at or after the acknowledged boundary even when
+   * non-zero bytes follow it. For a log whose frames were not flushed one by one (relaxed
+   * durability), a power loss can persist a later frame's page and not an earlier one's; the
+   * frames after the hole were not acknowledged as durable either, so the consecutive prefix
+   * before it is the recovered state. A strictly flushed log leaves this off: there a hole
+   * followed by a frame cannot happen, and fails closed.
+   */
+  zeroedFrameEndsLog?: boolean;
 }
 
 /**
@@ -225,8 +242,9 @@ export async function* iterateWalFramesSliced(
   handle: SyncFileHandle,
   acknowledgedEndOffset: number,
   pause: () => Promise<void>,
+  options: WalReplayOptions = {},
 ): AsyncGenerator<ReplayedWalFrame> {
-  for (const piece of walPayloads(handle, acknowledgedEndOffset)) {
+  for (const piece of walPayloads(handle, acknowledgedEndOffset, options)) {
     await pause();
     if (piece === null) continue;
     const { bytes, frameEnd } = piece;
@@ -245,7 +263,9 @@ export async function* iterateWalFramesSliced(
 function* walPayloads(
   handle: SyncFileHandle,
   acknowledgedEndOffset: number,
+  options: WalReplayOptions = {},
 ): Generator<{ bytes: Uint8Array; frameEnd: number } | null> {
+  const zeroedFrameEndsLog = options.zeroedFrameEndsLog === true;
   const size = handle.getSize();
   if (!Number.isSafeInteger(size) || size < 0) {
     throw new Error(`Invalid WAL byte length: ${String(size)}`);
@@ -270,7 +290,12 @@ function* walPayloads(
       // zero-filled tail where the in-flight frame was to go. That frame was never
       // acknowledged, so an all-zero remainder is the end of the log, exactly like a short
       // tail; anything else in its place is foreign bytes, and fails closed.
-      if (offset >= acknowledgedEndOffset && isZeroFilled(handle, offset, size)) break;
+      if (
+        offset >= acknowledgedEndOffset &&
+        ((zeroedFrameEndsLog && header.every((byte) => byte === 0)) ||
+          isZeroFilled(handle, offset, size))
+      )
+        break;
       throw new Error(`WAL frame marker mismatch at offset ${String(offset)}`);
     }
     const length = headerView.getUint32(4, true);
@@ -299,7 +324,7 @@ function* walPayloads(
       if (
         offset >= acknowledgedEndOffset &&
         payloadBytes.every((byte) => byte === 0) &&
-        isZeroFilled(handle, end, size)
+        (zeroedFrameEndsLog || isZeroFilled(handle, end, size))
       )
         break;
       throw new Error(`WAL frame checksum mismatch at offset ${String(offset)}`);

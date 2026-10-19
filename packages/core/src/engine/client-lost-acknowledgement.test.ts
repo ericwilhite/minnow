@@ -9,10 +9,13 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { MinnowDatabase } from "./database.js";
 import { scopeWriteSetTestHooks } from "./scope-write-set.js";
 import {
+  OpfsCoordinationError,
   OpfsUncertainOutcomeError,
+  StorageUnresponsiveError,
   type StageTransactionArtifactsInput,
   type TransactionRecord,
 } from "../storage/types.js";
+import { classifyError, WriteNotPublishedError } from "./errors.js";
 import { faultyStore } from "./client-audit-harness.js";
 
 function lostAckStore(target: string, hide: string[] = [], times = 1) {
@@ -156,5 +159,206 @@ describe("lost staging acknowledgement", () => {
     // The engine learned the record exists, so the rollback marked it instead of leaving it
     // active — pin held — until it expired.
     expect((await store.getTransaction(txId))?.status).toBe("aborted");
+  });
+});
+
+/**
+ * The double fault: the store commits and loses the acknowledgement, and the record read that
+ * would prove the commit fails too (an OPFS follower whose leader just died re-electing one).
+ * The write is durable, so the application must hear "unknown outcome" — never a conflict or
+ * transient error whose classification calls a retry safe, which would duplicate the write.
+ */
+describe("lost commit acknowledgement whose recovery read fails", () => {
+  function doubleFaultStore(options: { lapse?: boolean } = {}) {
+    const base = Date.parse("2026-01-01T00:00:00Z");
+    let offset = 0;
+    let armed = false;
+    let commitLost = false;
+    let failedReads = 0;
+    const { store } = faultyStore(async (method, _args, run) => {
+      if (!armed) return run();
+      if (!commitLost && (method === "writeTransaction" || method === "commitTransaction")) {
+        commitLost = true;
+        await run();
+        // A slow commit: the record's lease is past a third of its life at the abort.
+        if (options.lapse === true) offset += 2_500;
+        throw new OpfsUncertainOutcomeError(method);
+      }
+      // The record reads after the lost commit fail — the bounded recovery reads inside the
+      // write and the one its abort makes — and the store answers again afterwards.
+      if (commitLost && method === "getTransaction" && failedReads < 8) {
+        failedReads += 1;
+        throw new OpfsCoordinationError("leader-unavailable", method);
+      }
+      return run();
+    });
+    const database = new MinnowDatabase(store, {
+      autoCompact: false,
+      autoCollect: false,
+      now: () => new Date(base + offset),
+      transactionOwnerLeaseMs: 3_000,
+    });
+    return {
+      database,
+      store,
+      arm: () => {
+        armed = true;
+      },
+    };
+  }
+
+  async function keyless(database: MinnowDatabase): Promise<void> {
+    await database.createTable({
+      name: "k",
+      columns: [
+        { name: "id", type: "number" },
+        { name: "v", type: "string" },
+      ],
+    });
+  }
+
+  function expectUncertain(error: unknown): void {
+    expect(error).toBeInstanceOf(OpfsUncertainOutcomeError);
+    expect((error as Error).cause).toBeInstanceOf(OpfsCoordinationError);
+    expect(classifyError(error)).toMatchObject({
+      kind: "unknown-outcome",
+      mayHavePublished: true,
+      connectionUsable: true,
+    });
+  }
+
+  for (const lapse of [false, true]) {
+    const label = lapse ? "lease past a third of its life" : "fresh lease";
+
+    it(`insertBatch (single-shot) surfaces the uncertain outcome, ${label}`, async () => {
+      const { database, arm } = doubleFaultStore({ lapse });
+      await keyless(database);
+      arm();
+      const error = await database.insertBatch("k", [{ id: 1, v: "a" }]).catch((e: unknown) => e);
+      expectUncertain(error);
+      expect((await database.readTable("k")).length).toBe(1);
+    });
+
+    it(`write() scope surfaces the uncertain outcome, ${label}`, async () => {
+      const { database, arm } = doubleFaultStore({ lapse });
+      await keyless(database);
+      arm();
+      const error = await database
+        .write(async (s) => {
+          await s.insertBatch("k", [{ id: 1, v: "a" }]);
+        })
+        .catch((e: unknown) => e);
+      expectUncertain(error);
+      expect((await database.readTable("k")).length).toBe(1);
+    });
+
+    it(`SQL COMMIT surfaces the uncertain outcome, ${label}`, async () => {
+      const { database, arm } = doubleFaultStore({ lapse });
+      await keyless(database);
+      await database.execute("BEGIN");
+      await database.execute("INSERT INTO k (id, v) VALUES (1, 'a')");
+      arm();
+      const error = await database.execute("COMMIT").catch((e: unknown) => e);
+      expectUncertain(error);
+      expect((await database.readTable("k")).length).toBe(1);
+    });
+
+    it(`insert with an AFTER trigger (two-step commit) surfaces the uncertain outcome, ${label}`, async () => {
+      const { database, arm } = doubleFaultStore({ lapse });
+      await keyless(database);
+      await database.createTable({ name: "log", columns: [{ name: "note", type: "string" }] });
+      await database.execute(
+        "CREATE TRIGGER k_after AFTER INSERT ON k FOR EACH ROW BEGIN INSERT INTO log (note) VALUES (NEW.v); END",
+      );
+      arm();
+      const error = await database.insertBatch("k", [{ id: 1, v: "a" }]).catch((e: unknown) => e);
+      expectUncertain(error);
+      expect((await database.readTable("k")).length).toBe(1);
+      expect((await database.readTable("log")).length).toBe(1);
+    });
+  }
+});
+
+/**
+ * A storage step that cannot publish — a reservation, a renewal — loses its acknowledgement.
+ * Nothing of the write is visible, so the application hears a definite, retry-safe failure.
+ */
+describe("lost acknowledgement of a step that cannot publish", () => {
+  it("a lost beginTransaction acknowledgement is repeated: the write lands once", async () => {
+    const { database, calls, store, arm } = lostAckStore("beginTransaction");
+    await seed(database);
+    arm();
+    const result = await database.insertBatch("t", [{ id: 1, v: "x" }]);
+    expect(result.rowCount).toBe(1);
+    expect((await database.readTable("t")).length).toBe(1);
+    expect(calls.filter((c) => c.method === "beginTransaction").length).toBe(2);
+    // The orphan record of the lost begin was closed, not left active until its lease expired.
+    const records = (await store.listTransactionPage(null, 100)).records;
+    expect(records.filter((record) => record.status === "active")).toEqual([]);
+  });
+
+  it("a lost reserveRowIds acknowledgement inside a scope is a definite failure", async () => {
+    scopeWriteSetTestHooks.budgetBytes = 1;
+    try {
+      const { database, arm } = lostAckStore("reserveRowIds");
+      await seed(database);
+      arm();
+      const error = await database
+        .write(async (s) => {
+          await s.insertBatch("t", [{ id: 1, v: "a" }]);
+          await s.insertBatch("t", [{ id: 2, v: "b" }]);
+          // The read encodes the write set, which reserves the row ids.
+          await s.query("SELECT COUNT(*) AS n FROM t");
+          await s.insertBatch("t", [{ id: 3, v: "c" }]);
+        })
+        .catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(WriteNotPublishedError);
+      expect((error as Error).cause).toBeInstanceOf(OpfsUncertainOutcomeError);
+      expect(classifyError(error)).toEqual({
+        kind: "transient",
+        mayHavePublished: false,
+        retry: "safe",
+        connectionUsable: true,
+      });
+      expect((await database.readTable("t")).length).toBe(0);
+      // The retry the classification allows works.
+      await database.write(async (s) => {
+        await s.insertBatch("t", [{ id: 1, v: "a" }]);
+      });
+      expect((await database.readTable("t")).length).toBe(1);
+    } finally {
+      scopeWriteSetTestHooks.budgetBytes = scopeWriteSetTestHooks.defaultBudgetBytes;
+    }
+  });
+
+  it("an unresponsive store before the commit is definite but leaves the connection unusable", async () => {
+    scopeWriteSetTestHooks.budgetBytes = 1;
+    try {
+      let armed = false;
+      const { store } = faultyStore(async (method, _args, run) => {
+        if (armed && method === "reserveRowIds") {
+          throw new StorageUnresponsiveError("IndexedDB", "db", 1_000);
+        }
+        return run();
+      });
+      const database = new MinnowDatabase(store);
+      await seed(database);
+      armed = true;
+      const error = await database
+        .write(async (s) => {
+          await s.insertBatch("t", [{ id: 1, v: "a" }]);
+          await s.query("SELECT COUNT(*) AS n FROM t");
+        })
+        .catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(WriteNotPublishedError);
+      expect(classifyError(error)).toEqual({
+        kind: "transient",
+        mayHavePublished: false,
+        retry: "safe",
+        connectionUsable: false,
+      });
+    } finally {
+      scopeWriteSetTestHooks.budgetBytes = scopeWriteSetTestHooks.defaultBudgetBytes;
+    }
   });
 });

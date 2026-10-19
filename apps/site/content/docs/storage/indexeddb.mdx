@@ -68,7 +68,10 @@ One IndexedDB database with eleven object stores: `blocks`, `manifests`, `segmen
 `snapshotHeaders`. Block payloads are stored as `Uint8Array` values keyed by block id. Manifest
 membership is interval provenance beside each block, so snapshot export can cursor the captured
 version without constructing a descriptor array; integrity checks cross-check that provenance
-against the payload store.
+against the payload store. They also report, as `orphan-manifest`, a readable manifest summary
+newer than the `manifest/current` pointer: every publication writes its summary and moves the
+pointer in one transaction, so such a record means the pointer went backwards and readers are
+answering from an older version than the one that committed last.
 
 A transaction record in `transactions` holds the record's fields plus three counts: journaled
 blocks, journaled segments, and journal chunks. The block and segment ids themselves live in
@@ -216,9 +219,15 @@ the wait is reported after ten seconds and never bypassed, and closing a waiting
 client cancels its wait at once.
 
 When a newer build requests an IndexedDB schema version, every Minnow connection closes itself on
-the browser's `versionchange` event so it cannot strand the open. If a non-cooperating connection
-blocks the open, `open()` rejects with `IndexedDbSchemaUpgradeBlockedError` instead of waiting
-forever. The error carries the database name and old/requested versions; close the older tab and
+the browser's `versionchange` event so it cannot strand the open. From then on that connection
+fails every call with `StorageConnectionClosedError` whose `reason` is `"superseded"` (a
+connection the application closed itself reports `"closed"`). It extends `ConnectionLostError`:
+the connection cannot be reused, and the remedy is to reload the page, which loads the newer
+build. A call the connection had already handed to IndexedDB is not affected — IndexedDB
+finishes the transactions it accepted before the connection closes, so that call still settles
+on its own result, or on the unresponsive deadline below if its transaction never answers. If a
+non-cooperating connection blocks the open, `open()` rejects with
+`IndexedDbSchemaUpgradeBlockedError` instead of waiting forever. The error carries the database name and old/requested versions; close the older tab and
 retry. A request that already reported this error is marked abandoned, so it cannot wake later and
 silently upgrade or rebuild the database after its caller has moved on.
 
@@ -234,7 +243,10 @@ work rather than queueing behind something that never moves. Any event resets th
 transaction waiting behind a genuinely long one is never mistaken for a wedge.
 Progress advances the deadline without replacing a native timer for every request. The timer
 checks the latest deadline when it wakes; a newly queued request does not count as progress.
-`unresponsiveAfterMs` on `IndexedDbBlockStore.open` changes the deadline.
+`unresponsiveAfterMs` on `IndexedDbBlockStore.open` changes the deadline. The deadline outlives
+`close()`: a call still waiting on a transaction when the connection closes — because this tab
+closed it, or a newer build's upgrade did — fails with `StorageUnresponsiveError` if that
+transaction never answers, rather than hanging; one that does answer settles normally.
 
 A wedge like that has one known cause: a worker terminated while one of its transactions was
 still queued inside IndexedDB, waiting on another transaction of the same worker — directly, or
@@ -287,7 +299,11 @@ step.
 
 A build older than the database throws `StorageFormatVersionError` and leaves every store, index,
 and record untouched; it never downgrades or recreates the database. Malformed current-schema
-metadata is `StorageCorruptionError`, also without automatic deletion. Use snapshots or remote
+metadata is `StorageCorruptionError`, also without automatic deletion. So is damage inside a
+stored block: a payload or envelope checksum that fails when the engine decodes the block —
+packed or unpacked, on every store — rejects the read with `StorageCorruptionError` naming
+`blocks/<id>`, with the decoder's error as its `cause`, and the integrity check reports the same
+block as `invalid-block`. Use snapshots or remote
 synchronization for recovery from genuine corruption or browser storage loss; no local adapter can
 reconstruct the only copy of bytes that are gone.
 

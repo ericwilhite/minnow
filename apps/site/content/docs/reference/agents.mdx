@@ -300,9 +300,11 @@ machines: https://minnowdb.com/llms.txt
   never delete a database merely because migration rejected. Established live queries retain
   their last good result and retry coordination errors automatically. An
   `OpfsUncertainOutcomeError` needs reconciliation because its mutation may have committed; it
-  is raised only when a leader vanished mid-flight and the recovered log can neither answer the
-  re-sent request nor prove it never ran — never during a handover, a slow write, or an ordinary
-  failover, which the log resolves.
+  can mean a lost leader reply the recovered log cannot resolve, an acknowledgement flush that
+  failed, or a connection closed with a mutation already posted. A graceful handover, a slow
+  write, or an ordinary failover is resolved from the log. A pre-commit storage step that cannot
+  publish reports `WriteNotPublishedError` instead; repeating the write is safe. A closed store
+  reports `StorageConnectionClosedError`; `reason: "superseded"` means reload the newer build.
 - Pass `onWorkerError` to `MinnowDatabaseClient` to hear worker failures that belong to no call
   (uncaught errors, unhandled rejections, failed maintenance, coordination errors); without it
   they go to `console.error`. They are not fatal. `DatabaseWorkerFailedError` is: it means the

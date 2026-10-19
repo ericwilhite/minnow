@@ -37,6 +37,10 @@
     ],
     "interaction-simulator-rekeying": [800002, 800011, 800017, 800024, 800027, 800037, 800040],
     "interaction-simulator-schema": [4, 2, 9, 109, 116, 144, 145, 159, 500, 503, 3, 5, 6],
-    "block-format-properties": []
+    "block-format-properties": [],
+    "index-oracle": [],
+    "live-oracle": [],
+    "compaction-interleave": [],
+    "fts-oracle": []
   }
 }

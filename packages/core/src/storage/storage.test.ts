@@ -5551,7 +5551,13 @@ it("closes an IndexedDB connection when a newer schema version arrives", async (
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error("upgrade failed"));
   });
-  await expect(store.getCurrentManifestVersion()).rejects.toThrow(/connection is closed/);
+  // The superseded connection names the cause and the remedy (reload for the newer build).
+  await expect(store.getCurrentManifestVersion()).rejects.toMatchObject({
+    name: "StorageConnectionClosedError",
+    backend: "indexeddb",
+    databaseName: name,
+    reason: "superseded",
+  });
   upgraded.close();
 });
 

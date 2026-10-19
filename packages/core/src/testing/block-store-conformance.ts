@@ -27,7 +27,7 @@ import {
   acceptsPackedSegments,
   packedSegmentMemberId,
 } from "../storage/types.js";
-import { encodePackedBlock } from "../block-format/index.js";
+import { encodeBlock, encodePackedBlock } from "../block-format/index.js";
 
 /**
  * The storage-contract conformance kit: the executable half of the `BlockStore` documentation,
@@ -2784,14 +2784,25 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
           packedBlockId: segmentId,
         };
         await store.createTransaction(transaction("txn-packed", null));
-        // A packed segment whose block was not staged, or whose members are not canonical,
-        // is refused before anything changes.
+        // A packed segment whose block was not staged, whose members are not canonical, or
+        // whose block lacks a member it names, is refused before anything changes.
+        const lacking = encodePackedBlock([
+          {
+            memberId: members["col-id"],
+            columnId: "col-id",
+            column: { type: "number", values: [1, 2] },
+          },
+        ]);
+        check(lacking !== undefined, "the fixture's one-member packed block did not encode");
+        const unpacked = await encodeBlock({ type: "number", values: [1, 2] });
         for (const [label, refused] of [
           ["missing packed block", record],
           [
             "non-canonical member",
             { ...record, columnBlockIds: { ...record.columnBlockIds, "col-v": ["other-block"] } },
           ],
+          ["member its packed block lacks", record],
+          ["packed block that is not a packed block", record],
         ] as Array<[string, SegmentRecord]>) {
           let threw = false;
           try {
@@ -2799,7 +2810,13 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
               transactionId: "txn-packed",
               expectedRevision: 0,
               blocks:
-                label === "missing packed block" ? [] : [{ id: segmentId, bytes: packed.bytes }],
+                label === "missing packed block"
+                  ? []
+                  : label === "member its packed block lacks"
+                    ? [{ id: segmentId, bytes: lacking.bytes }]
+                    : label === "packed block that is not a packed block"
+                      ? [{ id: segmentId, bytes: unpacked }]
+                      : [{ id: segmentId, bytes: packed.bytes }],
               segments: [refused],
               updatedAt: T0,
             });

@@ -84,17 +84,18 @@ import {
   UnknownTableError,
   UniqueConstraintError,
   VisibleSegmentCursorStaleError,
+  WriteNotPublishedError,
 } from "./errors.js";
 import {
   BLOCK_HEADER_LENGTH,
   buildPhysicalColumnFromRanges,
-  decodeBlock,
-  decodePhysicalBlock,
+  decodeBlock as decodeBlockBytes,
+  decodePhysicalBlock as decodePhysicalBlockBytes,
   encodeBlock,
   encodeColumn,
   encodePhysicalBlock,
   getCompressionMemoryBound,
-  inspectBlock,
+  inspectBlock as inspectBlockBytes,
   isPackedBlock,
   maximumPhysicalBlockByteLength,
   MAX_BLOCK_METADATA_BYTE_LENGTH,
@@ -260,11 +261,13 @@ import {
   PostingBuildConflictError,
   SnapshotManifestMissingError,
   SchemaConflictError,
+  StorageCorruptionError,
   TableRecordConflictError,
   TransactionRecordConflictError,
   UniqueKeyBuildConflictError,
   UniqueKeyConflictError,
   UniqueIndexCoverageError,
+  UnknownOutcomeError,
   WriteConflictError,
 } from "../storage/types.js";
 import type { SnapshotExportProgress, SnapshotLoadProgress } from "../storage/snapshot.js";
@@ -572,6 +575,68 @@ import {
   forwardPlanKeyLiterals,
   planHasKeyLiterals,
 } from "./key-forward-plan.js";
+
+/**
+ * Damage inside a stored block — a failed envelope, payload, or packed-directory checksum, a
+ * truncated or malformed frame — is storage corruption, whatever store served the bytes: the
+ * block-format decoders report it as a bare `Error`, so every decode in this file goes through
+ * these and surfaces `StorageCorruptionError` (which `classifyError` reports as `corruption`,
+ * never retried) with the decoder's error as `cause`. The read paths that know the block name
+ * it (`blocks/<id>`); the rest say `blocks`. The store's own CRC over the payload is not
+ * repeated here: the block envelope's checksums already detect the damage.
+ */
+function blockCorruption(error: unknown, where?: BlockWhere): StorageCorruptionError {
+  if (error instanceof StorageCorruptionError) return error;
+  const message = error instanceof Error ? error.message : String(error);
+  return new StorageCorruptionError(
+    where?.backend ?? "block",
+    where?.blockId === undefined ? "blocks" : `blocks/${where.blockId}`,
+    message,
+    { cause: error },
+  );
+}
+
+interface BlockWhere {
+  readonly backend: string;
+  readonly blockId: string;
+}
+
+async function decodeBlock(
+  bytes: Uint8Array,
+  where?: BlockWhere,
+): Promise<Awaited<ReturnType<typeof decodeBlockBytes>>> {
+  try {
+    return await decodeBlockBytes(bytes);
+  } catch (error) {
+    throw blockCorruption(error, where);
+  }
+}
+
+async function decodePhysicalBlock(
+  bytes: Uint8Array,
+  where?: BlockWhere,
+): Promise<Awaited<ReturnType<typeof decodePhysicalBlockBytes>>> {
+  try {
+    return await decodePhysicalBlockBytes(bytes);
+  } catch (error) {
+    throw blockCorruption(error, where);
+  }
+}
+
+function inspectBlock(bytes: Uint8Array, where?: BlockWhere): ReturnType<typeof inspectBlockBytes> {
+  try {
+    return inspectBlockBytes(bytes);
+  } catch (error) {
+    throw blockCorruption(error, where);
+  }
+}
+
+/** The store kind behind a `liveQueryChannelName` (`minnowdb-live:<kind>:<database>`), for errors. */
+function storageBackendOf(store: BlockStore): string {
+  const name = store.liveQueryChannelName;
+  const match = typeof name === "string" ? /^minnowdb-live:([^:]+):/.exec(name) : null;
+  return match?.[1] ?? "store";
+}
 
 // The on-disk format is little-endian; the bulk Float64 copy reads platform order.
 const PLATFORM_LITTLE_ENDIAN = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
@@ -2878,6 +2943,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * block-read boundary can cut members out of their packed blocks; see packed-members.ts.
    */
   readonly #packedMembers = new PackedMemberIndex();
+  /** The store kind named in block-corruption errors; see `blockCorruption`. */
+  readonly #storageBackend: string;
   /** Whether the store declared it accepts packed segments; nothing else is ever written one. */
   readonly #writesPackedSegments: boolean;
   readonly #diagnostics: BackgroundDiagnostics;
@@ -3037,6 +3104,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
     this.#now = options.now ?? (() => new Date());
     this.#createId = options.createId ?? (() => crypto.randomUUID());
+    this.#storageBackend = storageBackendOf(store);
     this.#writesPackedSegments = acceptsPackedSegments(store);
     this.#diagnostics = new BackgroundDiagnostics(
       () => dateMilliseconds(this.#now()),
@@ -4273,8 +4341,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
       }
       throw new Error("Commit retry limit was exceeded");
-    } catch (error) {
-      await transaction.abort();
+    } catch (caught) {
+      // Before any publishing call, an uncertain storage error is a definite failure: nothing
+      // of the write can be visible. After one, the uncertainty stands, and a failing abort
+      // must not replace it with an error that says the write did not land.
+      const error =
+        caught instanceof UnknownOutcomeError && !transaction.commitAttempted
+          ? new WriteNotPublishedError(caught)
+          : caught;
+      await transaction.abort().catch((abortError: unknown) => {
+        if (!(error instanceof UnknownOutcomeError)) throw abortError;
+      });
       throw await this.#translateUniqueConflict(afterWriteAbort(error, transaction));
     }
   }
@@ -4494,8 +4571,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
       }
       throw new Error("Commit retry limit was exceeded");
-    } catch (error) {
-      await transaction.abort();
+    } catch (caught) {
+      // Before any publishing call, an uncertain storage error is a definite failure: nothing
+      // of the write can be visible. After one, the uncertainty stands, and a failing abort
+      // must not replace it with an error that says the write did not land.
+      const error =
+        caught instanceof UnknownOutcomeError && !transaction.commitAttempted
+          ? new WriteNotPublishedError(caught)
+          : caught;
+      await transaction.abort().catch((abortError: unknown) => {
+        if (!(error instanceof UnknownOutcomeError)) throw abortError;
+      });
       throw await this.#translateUniqueConflict(afterWriteAbort(error, transaction));
     }
   }
@@ -4832,8 +4918,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
       }
       throw new Error("Commit retry limit was exceeded");
-    } catch (error) {
-      await transaction.abort();
+    } catch (caught) {
+      // Before any publishing call, an uncertain storage error is a definite failure: nothing
+      // of the write can be visible. After one, the uncertainty stands, and a failing abort
+      // must not replace it with an error that says the write did not land.
+      const error =
+        caught instanceof UnknownOutcomeError && !transaction.commitAttempted
+          ? new WriteNotPublishedError(caught)
+          : caught;
+      await transaction.abort().catch((abortError: unknown) => {
+        if (!(error instanceof UnknownOutcomeError)) throw abortError;
+      });
       if (error instanceof UniqueKeyConflictError && resolvedKeys !== undefined) {
         const keyColumn = getUniqueKeyColumn(table);
         const value = resolvedKeys.get(error.keyToken);
@@ -5224,12 +5319,20 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * reuses it — but after a burst of writes and a fold, an idle database's last lease sits at a
    * pre-fold version and roots every block that version referenced, which is exactly what a
    * collection pass is trying to reclaim. The next query simply takes a fresh lease.
+   *
+   * Resolves once the lease record is gone from storage, so a pass planned right after it sees
+   * the version unpinned. Every pass does this, explicit or background: an application that
+   * dropped a table and called `collectGarbage()` without a read in between otherwise kept
+   * every block of that table, pass after pass, rooted by this connection's own idle lease.
    */
-  #releaseIdleSharedLease(): void {
+  async #releaseIdleSharedLease(): Promise<void> {
     const current = this.#sharedLease;
     if (current?.refCount !== 0) return;
     this.#sharedLease = undefined;
-    this.#trackSharedLeaseRelease(current.lease.release());
+    const release = current.lease.release();
+    this.#trackSharedLeaseRelease(release);
+    // A failed release is a lease that expires on its own; the pass still runs.
+    await release.catch(() => undefined);
   }
 
   #releaseSharedLease(entry: SharedLeaseEntry): void {
@@ -10898,11 +11001,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
       }
       throw new Error("Commit retry limit was exceeded");
-    } catch (error) {
+    } catch (caught) {
       accepting = false;
       closed = true;
       await tail;
       await transaction.abort().catch(() => undefined);
+      // Before any publishing call, an uncertain storage error is a definite failure: nothing
+      // of the scope can be visible. After one, the uncertainty stands.
+      const error =
+        caught instanceof UnknownOutcomeError && !transaction.commitAttempted
+          ? new WriteNotPublishedError(caught)
+          : caught;
       throw await this.#translateUniqueConflict(error);
     }
   }
@@ -12951,12 +13060,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         );
       }
     }
+    // Every declared view is checked against the schema this migration produces before any step
+    // commits, so a view that cannot be inferred fails the whole migration with nothing applied.
+    // A view that reads only what the catalog already holds is created in plan order; one that
+    // needs a column or table a later step adds waits until the alterations have landed.
+    const deferredViews = this.#planMigrationViews(records, plan.steps);
     const createdTables: string[] = [];
     const replacedViews: string[] = [];
     const droppedViews: string[] = [];
     const droppedTables: string[] = [];
     let catalogChangedBeforeAlterations = false;
     const alterationsByTable = new Map<string, MigrationStep[]>();
+    const deferredViewSteps: Array<Extract<MigrationStep, { kind: "replace-view" }>> = [];
     for (const step of plan.steps) {
       if (step.kind === "create-table") {
         const entries = Object.entries(step.table.columns);
@@ -13019,35 +13134,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       // Views carry no data, so they are applied directly rather than batched into a table's
       // atomic column rewrite. `orReplace` makes create and redefine one path.
       if (step.kind === "replace-view") {
-        const proof = await this.#catalogMutations.readProof();
-        const inferred = inferBlockSchema(
-          compileQuery(step.view.sql),
-          catalogQuerySchemas(proof.records),
-        );
-        this.#assertViewMatchesDeclaration(
-          {
-            id: "prospective-view",
-            name: step.view.name,
-            columns: inferred.map((column, index) => ({
-              id: `prospective-column-${String(index)}`,
-              ...column,
-              nullable: true,
-            })),
-            managed: false,
-            revision: 0,
-            view: { sql: step.view.sql, managed: true },
-            createdAt: dateIsoString(this.#now()),
-          },
-          step,
-        );
-        await this.#runStatementAdmitted(admission, {
-          kind: "create-view",
-          view: step.view.name,
-          sql: step.view.sql,
-          orReplace: true,
-          managed: true,
-        });
-        this.#assertViewMatchesDeclaration(await this.store.getTableByName(step.view.name), step);
+        if (deferredViews.has(step.view.name)) {
+          deferredViewSteps.push(step);
+          continue;
+        }
+        await this.#applyMigrationView(admission, step);
         replacedViews.push(step.view.name);
         catalogChangedBeforeAlterations = true;
         continue;
@@ -13211,6 +13302,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       proof.catalogEpoch += 1;
       alteredTables.push(tableName);
     }
+    // The views that read what the alterations above added. Their shape was proven against the
+    // planned schema before the first step; this re-proves it against the catalog as it now is.
+    for (const step of deferredViewSteps) {
+      await this.#applyMigrationView(admission, step);
+      replacedViews.push(step.view.name);
+    }
     return {
       createdTables,
       alteredTables,
@@ -13219,6 +13316,137 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       droppedViews,
       steps: plan.steps,
     };
+  }
+
+  /** Creates or redefines one declared view and proves it produces the columns it declares. */
+  async #applyMigrationView(
+    admission: WriterAdmission,
+    step: Extract<MigrationStep, { kind: "replace-view" }>,
+  ): Promise<void> {
+    const proof = await this.#catalogMutations.readProof();
+    this.#assertViewMatchesDeclaration(
+      this.#prospectiveView(step, catalogQuerySchemas(proof.records)),
+      step,
+    );
+    await this.#runStatementAdmitted(admission, {
+      kind: "create-view",
+      view: step.view.name,
+      sql: step.view.sql,
+      orReplace: true,
+      managed: true,
+    });
+    this.#assertViewMatchesDeclaration(await this.store.getTableByName(step.view.name), step);
+  }
+
+  /** The record a declared view would have over the given schemas, or the error naming it. */
+  #prospectiveView(
+    step: Extract<MigrationStep, { kind: "replace-view" }>,
+    schemas: ReadonlyMap<string, SqlColumnSchema[]>,
+  ): TableRecord {
+    let inferred: SqlColumnSchema[];
+    try {
+      inferred = inferBlockSchema(compileQuery(step.view.sql), schemas);
+    } catch (error) {
+      throw new TypeError(
+        `View ${step.view.name} cannot be created: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
+    }
+    return {
+      id: "prospective-view",
+      name: step.view.name,
+      columns: inferred.map((column, index) => ({
+        id: `prospective-column-${String(index)}`,
+        ...column,
+        nullable: true,
+      })),
+      managed: false,
+      revision: 0,
+      view: { sql: step.view.sql, managed: true },
+      createdAt: dateIsoString(this.#now()),
+    };
+  }
+
+  /**
+   * Proves every declared view against the schema the plan produces — tables the plan creates,
+   * columns it adds, renames, and drops, views it defines earlier — before any step commits, and
+   * returns the names of the views that cannot be created from the catalog as it stands: those
+   * are applied after the table alterations instead of before them. A view that fails against
+   * the planned schema fails the migration here, with nothing applied.
+   */
+  #planMigrationViews(
+    records: readonly TableRecord[],
+    steps: readonly MigrationStep[],
+  ): Set<string> {
+    const current = catalogQuerySchemas(records);
+    const planned = new Map<string, TableColumnRecord[]>(
+      records.map((record) => [record.name, [...record.columns]]),
+    );
+    const declaredColumn = (
+      name: string,
+      definition: Extract<MigrationStep, { kind: "add-column" }>["definition"],
+    ): TableColumnRecord => ({
+      id: `planned-column-${name}`,
+      name,
+      type: definition.type,
+      nullable: true,
+      ...(definition.integer ? { integer: true as const } : {}),
+      ...(definition.sqlDomain === undefined ? {} : { sqlDomain: definition.sqlDomain }),
+      ...(definition.withoutTimeZone ? { withoutTimeZone: true as const } : {}),
+    });
+    for (const step of steps) {
+      switch (step.kind) {
+        case "create-table":
+          planned.set(
+            step.table.name,
+            Object.entries(step.table.columns).map(([name, definition]) =>
+              declaredColumn(name, definition),
+            ),
+          );
+          break;
+        case "drop-table":
+        case "drop-view":
+          planned.delete(step.kind === "drop-table" ? step.tableName : step.viewName);
+          break;
+        case "add-column":
+          planned.get(step.tableName)?.push(declaredColumn(step.columnName, step.definition));
+          break;
+        case "rename-column":
+          planned.set(
+            step.tableName,
+            (planned.get(step.tableName) ?? []).map((column) =>
+              column.name === step.from ? { ...column, name: step.to } : column,
+            ),
+          );
+          break;
+        case "drop-column":
+          planned.set(
+            step.tableName,
+            (planned.get(step.tableName) ?? []).filter((column) => column.name !== step.columnName),
+          );
+          break;
+        default:
+          break;
+      }
+    }
+    const candidate = new Map(
+      [...planned].map(([name, columns]) => [name, columns.map(querySchemaColumn)]),
+    );
+    const deferred = new Set<string>();
+    for (const step of steps) {
+      if (step.kind !== "replace-view") continue;
+      const prospective = this.#prospectiveView(step, candidate);
+      this.#assertViewMatchesDeclaration(prospective, step);
+      candidate.set(step.view.name, prospective.columns.map(querySchemaColumn));
+      try {
+        const now = this.#prospectiveView(step, current);
+        this.#assertViewMatchesDeclaration(now, step);
+        current.set(step.view.name, now.columns.map(querySchemaColumn));
+      } catch {
+        deferred.add(step.view.name);
+      }
+    }
+    return deferred;
   }
 
   /**
@@ -19132,6 +19360,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     );
     return this.#collection.step(async () => {
       const active = await this.#findActiveGarbageCollectionJob();
+      // A new plan must not root history with this connection's own idle reader lease.
+      if (active === undefined) await this.#releaseIdleSharedLease();
       const job =
         active ??
         (await this.#planGarbageCollection(
@@ -19208,7 +19438,6 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     let reclaimed = false;
     for (let pass = 0; pass < AUTO_COLLECT_MAX_PASSES; pass += 1) {
       if (this.#closed) break;
-      this.#releaseIdleSharedLease();
       let progress: GarbageCollectionProgress | undefined = await this.#collectGarbageStep(
         {
           maxItems: AUTO_COLLECT_STEP_ITEMS,
@@ -25210,7 +25439,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           keyColumn.type,
           storedSqlValueFromExecution(keyColumn, vectorValue(keyVector, row)),
         );
-        addSecondaryPosting(postings.byTerm, index, columns, values, locator, uniqueTerms);
+        addSecondaryPosting(
+          postings.byTerm,
+          index,
+          columns,
+          values,
+          locator,
+          uniqueTerms,
+          table.name,
+        );
         if (postings.rowAdded()) await postings.service();
       }
       await postings.flush();
@@ -25284,7 +25521,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
                     ? null
                     : storedSqlValueFromExecution(keyColumn, vectorValue(keyVector, row)),
                 );
-          addSecondaryPosting(postings.byTerm, index, columns, values, locator, uniqueTerms);
+          addSecondaryPosting(
+            postings.byTerm,
+            index,
+            columns,
+            values,
+            locator,
+            uniqueTerms,
+            table.name,
+          );
           if (postings.rowAdded()) await postings.service();
         }
         start = end;
@@ -27284,7 +27529,10 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const id = ids[index] ?? "";
       const bytes = fetchedBytes.get(id) ?? storedBlocks?.get(id);
       if (bytes === undefined) throw new Error(`Visible block is missing: ${id}`);
-      const decoded = await decodePhysicalBlock(bytes);
+      const decoded = await decodePhysicalBlock(bytes, {
+        backend: this.#storageBackend,
+        blockId: id,
+      });
       this.#blockCachePut(
         ArtifactFamily.decodedBlock,
         id,
@@ -27953,7 +28201,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         blocks.map(async (bytes, index) => {
           const blockId = ids[index] ?? "";
           if (bytes === undefined) throw new Error(`Visible block is missing: ${blockId}`);
-          return [blockId, (await decodeBlock(bytes)).column] as const;
+          const where = { backend: this.#storageBackend, blockId };
+          return [blockId, (await decodeBlock(bytes, where)).column] as const;
         }),
       );
       for (const [blockId, column] of columns) decoded.set(blockId, column);
@@ -28022,7 +28271,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     for (const [at, packedBlockId] of uncached.entries()) {
       const bytes = fetched[at];
       if (bytes === undefined || !isPackedBlock(bytes)) continue;
-      const block = resolvePackedBlock(bytes);
+      const block = this.#resolvePackedBlock(packedBlockId, bytes);
       resolved.set(packedBlockId, block);
       this.#blockCachePut(
         ArtifactFamily.packedBlock,
@@ -28035,7 +28284,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const block = resolved.get(packedBlockId);
       const memberId = ids[index] ?? "";
       if (blocks[index] !== undefined || block === undefined) continue;
-      const bytes = unindexedMemberBytes(block, memberId, columnId);
+      let bytes: Uint8Array | undefined;
+      try {
+        bytes = unindexedMemberBytes(block, memberId, columnId);
+      } catch (error) {
+        throw blockCorruption(error, { backend: this.#storageBackend, blockId: packedBlockId });
+      }
       if (bytes === undefined) continue;
       if (packedSegmentTestHooks.missIsFatal) {
         throw new Error(`Packed member was read before its segment was indexed: ${memberId}`);
@@ -28083,7 +28337,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       if (block !== undefined) continue;
       const bytes = fetched[storedAt.get(packedBlockId) ?? -1];
       if (bytes === undefined) continue;
-      const resolved = resolvePackedBlock(bytes);
+      const resolved = this.#resolvePackedBlock(packedBlockId, bytes);
       packed.set(packedBlockId, resolved);
       this.#blockCachePut(
         ArtifactFamily.packedBlock,
@@ -28096,8 +28350,22 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const ref = refs[index];
       if (ref === undefined) return fetched[storedAt.get(id) ?? -1];
       const block = packed.get(ref.packedBlockId);
-      return block === undefined ? undefined : memberBlockBytes(block, ref, id);
+      if (block === undefined) return undefined;
+      try {
+        return memberBlockBytes(block, ref, id);
+      } catch (error) {
+        throw blockCorruption(error, { backend: this.#storageBackend, blockId: ref.packedBlockId });
+      }
     });
+  }
+
+  /** A packed block's directory, checked once; a failed check is corruption of that block. */
+  #resolvePackedBlock(packedBlockId: string, bytes: Uint8Array): ResolvedPackedBlock {
+    try {
+      return resolvePackedBlock(bytes);
+    } catch (error) {
+      throw blockCorruption(error, { backend: this.#storageBackend, blockId: packedBlockId });
+    }
   }
 
   /** One block's bytes, member or stored, for the paths that read blocks one at a time. */
@@ -30008,8 +30276,34 @@ function foldInsertColumns<T extends { columns: readonly string[] }>(
  * Replaces each `SET column = DEFAULT` with what an omitted INSERT slot would receive: the
  * column's literal or expression default, or NULL when it has none. A stored generated column
  * recomputes on every update anyway, so assigning it DEFAULT is dropped, as PostgreSQL allows.
+ * A SET list made only of such assignments — `UPDATE g SET gen = DEFAULT` — still updates every
+ * matched row in PostgreSQL, so it becomes one stored column assigned to itself: the rows are
+ * rewritten, generated values recomputed, triggers fire, and the count reports the matches.
  */
 function resolveUpdateDefaults(
+  table: TableRecord,
+  assignments: ReadonlyArray<{ column: string; expression: Expression }>,
+): Array<{ column: string; expression: Expression }> {
+  const resolved = resolveUpdateDefaultAssignments(table, assignments);
+  if (resolved.length > 0 || assignments.length === 0) return resolved;
+  const keyIds = new Set([
+    ...(table.uniqueKeyColumnId === undefined ? [] : [table.uniqueKeyColumnId]),
+    ...(table.primaryKeyColumnIds ?? []),
+  ]);
+  // Prefer a plain column; a table of only its key and generated columns touches the key, which
+  // the rekey path treats as the no-op it is.
+  const touched =
+    table.columns.find(
+      (column) =>
+        column.generatedValue === undefined && column.hidden !== true && !keyIds.has(column.id),
+    ) ?? table.columns.find((column) => column.generatedValue === undefined && !column.hidden);
+  if (touched === undefined) {
+    throw new TypeError(`${table.name} has no stored column an UPDATE could write`);
+  }
+  return [{ column: touched.name, expression: { kind: "column", reference: touched.name } }];
+}
+
+function resolveUpdateDefaultAssignments(
   table: TableRecord,
   assignments: ReadonlyArray<{ column: string; expression: Expression }>,
 ): Array<{ column: string; expression: Expression }> {

@@ -266,6 +266,12 @@ export const unsupportedFeatures: readonly UnsupportedFeatureRecord[] = [
       "Naming the arbiter by constraint name, and a partial-index predicate after the target, are not supported; name the constraint's columns instead, as in ON CONFLICT (score).",
   },
   {
+    id: "mutation.upsert-rekey-target",
+    error: "ON CONFLICT DO UPDATE cannot reassign the conflict key",
+    notes:
+      "The DO UPDATE assignments cannot change the conflict target's own columns, which PostgreSQL permits as a key change of the stored row. Change a row's key with UPDATE instead; the engine records the rekey and forwards the old key.",
+  },
+  {
     id: "predicate.regex-backreferences",
     error: "pattern backreferences are unsupported",
     notes:

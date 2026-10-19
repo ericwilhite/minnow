@@ -2801,10 +2801,11 @@ describe("OPFS write-ahead log crash shapes", () => {
         const errors = outcomes.filter((value) => value instanceof Error);
         expect(errors).toHaveLength(ending === "close" ? 128 : ending === "failure" ? 1 : 0);
         for (const error of errors)
-          expect(error).toMatchObject({
-            message:
-              ending === "close" ? "This OPFS store connection is closed" : "injected read failure",
-          });
+          expect(error).toMatchObject(
+            ending === "close"
+              ? { name: "StorageConnectionClosedError", reason: "closed" }
+              : { message: "injected read failure" },
+          );
         if (ending === "close") expect(leader._residentStateForTests().retainedRpcBytes).toBe(0);
         expect(maximum).toBe(3);
         expect(follower._residentStateForTests().pendingRequests).toBe(0);

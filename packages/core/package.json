@@ -158,6 +158,7 @@
     "!dist/engine/client-audit-harness.*",
     "!dist/storage/indexeddb-audit-helpers.*",
     "!dist/storage/opfs/power-loss-model.*",
+    "!dist/storage/opfs/leader-test-helpers.*",
     "!dist/*.tsbuildinfo",
     "sql-feature-matrix.json",
     "postgres-feature-profile.json",

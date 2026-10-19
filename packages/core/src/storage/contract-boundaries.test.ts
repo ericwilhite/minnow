@@ -11,7 +11,7 @@
  *    any adapter — an adapter uses the toolkit, never the reverse.
  * 3. **The engine sees only the contract surface.** Engine, plan, and transaction sources
  *    import storage only through its public barrels (`storage/index.js`, `storage/types.js`,
- *    `storage/snapshot.js`) — never an adapter's internals and never the toolkit. The one
+ *    `storage/snapshot.js`, `storage/persistence.js`) — never an adapter's internals and never the toolkit. The one
  *    exception is the worker host's descriptor switch — the composition root — which
  *    dynamically imports exactly the three adapter entry modules, so a bundler can split them
  *    into their own chunks and an application ships only the store it opens.
@@ -96,7 +96,12 @@ describe("storage contract boundaries", () => {
       for (const specifier of importsOf(file)) {
         if (!specifier.includes("/storage/")) continue;
         const surface = specifier.replace(/^(\.\.\/)+/, "");
-        const allowed = ["storage/index.js", "storage/types.js", "storage/snapshot.js"];
+        const allowed = [
+          "storage/index.js",
+          "storage/types.js",
+          "storage/snapshot.js",
+          "storage/persistence.js",
+        ];
         allowed.push(...(compositionRoots.get(file) ?? []));
         expect(allowed, `${file} imports ${specifier}`).toContain(surface);
       }
