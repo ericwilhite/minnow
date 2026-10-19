@@ -235,6 +235,7 @@ import {
   crc32,
   isPackedBlock,
   verifyStoredBlock,
+  missingPackedMember,
   verifyStoredPayload,
   parseJson,
 } from "../block-format/index.js";
@@ -7006,6 +7007,8 @@ export class IndexedDbBlockStore implements BlockStore {
     let issueCount = 0;
     let checkedRecords = 0;
     let checkedBlocks = 0;
+    /** Full mode: the packed segments naming each packed block, checked when its bytes are read. */
+    const packedSegmentsByBlock = new Map<string, SegmentRecord[]>();
     let checkedBytes = 0;
     const issue = (code: string, location: string, error: unknown): void => {
       issueCount += 1;
@@ -7729,6 +7732,11 @@ export class IndexedDbBlockStore implements BlockStore {
           if ((await requestResult(blockStore.getKey(blockId))) === undefined) {
             throw corruption(`segments/${key}`, `referenced block ${blockId} is missing`);
           }
+        }
+        if (mode === "full" && segment.packedBlockId !== undefined) {
+          const segments = packedSegmentsByBlock.get(segment.packedBlockId) ?? [];
+          segments.push(segment);
+          packedSegmentsByBlock.set(segment.packedBlockId, segments);
         }
       } catch (error) {
         issue("invalid-segment", storageKeyLocation(key), error);
@@ -8486,6 +8494,16 @@ export class IndexedDbBlockStore implements BlockStore {
           checkedBlocks += 1;
           checkedBytes = safeByteSum(checkedBytes, bytes.byteLength, "Integrity checked bytes");
           verifyStoredPayload(bytes);
+          for (const segment of packedSegmentsByBlock.get(key) ?? []) {
+            const missing = missingPackedMember(bytes, segment.columnBlockIds);
+            if (missing !== undefined) {
+              issue(
+                "invalid-segment",
+                `segments/${segment.id}`,
+                corruption(`segments/${segment.id}`, `packed block lacks member ${missing}`),
+              );
+            }
+          }
         }
       } catch (error) {
         issue("invalid-block", `blocks/${key}`, error);

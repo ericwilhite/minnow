@@ -258,6 +258,24 @@ export function findPackedMember(directory: PackedBlockDirectory, tag: PackedMem
 }
 
 /**
+ * The first of a packed segment's members that its packed block does not hold for the member's
+ * column, or undefined when every one is there. Full integrity checks call this; reads refuse the
+ * same mismatch when they cut a member out.
+ */
+export function missingPackedMember(
+  bytes: Uint8Array,
+  columnBlockIds: Readonly<Record<string, readonly string[]>>,
+): string | undefined {
+  const directory = inspectPackedBlock(bytes);
+  for (const [columnId, memberIds] of Object.entries(columnBlockIds)) {
+    for (const memberId of memberIds) {
+      if (findPackedMember(directory, packedMemberTag(memberId, columnId)) < 0) return memberId;
+    }
+  }
+  return undefined;
+}
+
+/**
  * A copy of one member's v2 block. A copy, not a view: caches keep what they are handed, and a
  * view would keep the whole container alive behind every member.
  */

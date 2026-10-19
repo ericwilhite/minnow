@@ -128,6 +128,9 @@ describe.each(["memory", "indexeddb", "opfs"] as const)("packed segments on %s",
       const packed = await packedSegments(store);
       // Ten single-row inserts, one two-row upsert, one update; the delete names one column.
       expect(packed.length).toBe(12);
+      // A full integrity check reads every packed block and finds each segment's members in it.
+      const integrity = await store.checkIntegrity?.({ mode: "full" });
+      if (kind !== "memory") expect(integrity?.ok).toBe(true);
       for (const segment of packed) expect(segment.packedBlockId).toBe(segment.id);
 
       const expected = new Map<number, Record<string, unknown>>();

@@ -176,6 +176,7 @@ import {
 import {
   MAX_STORED_BLOCK_BYTE_LENGTH,
   verifyStoredBlock,
+  missingPackedMember,
   verifyStoredPayload,
   parseJson,
 } from "../../block-format/index.js";
@@ -5793,7 +5794,7 @@ export class OpfsLeader {
       }
 
       type IntegrityPayload =
-        | { location: string; placement: Placement; kind: "block" }
+        | { location: string; placement: Placement; kind: "block"; id?: string }
         | {
             location: string;
             placement: Placement;
@@ -5802,7 +5803,7 @@ export class OpfsLeader {
           };
       const payloads = (function* (leader: OpfsLeader): IterableIterator<IntegrityPayload> {
         for (const [id, placement] of leader.#blockIndex) {
-          yield { location: `blocks/${id}`, placement, kind: "block" };
+          yield { location: `blocks/${id}`, placement, kind: "block", id };
         }
         for (const [key, pointer] of leader.#ftsBases) {
           for (const [ordinal, placement] of pointer.chunks.entries()) {
@@ -5841,6 +5842,21 @@ export class OpfsLeader {
           }
         }
       })(this);
+      // Full mode: the packed segments naming each packed block, checked when its bytes are read.
+      const packedSegmentsByBlock = new Map<string, SegmentRecord[]>();
+      if (mode === "full") {
+        let after: string | null = null;
+        do {
+          const page = this.#core.listSegmentPage(after, 1_024);
+          for (const segment of page.records) {
+            if (segment.packedBlockId === undefined) continue;
+            const named = packedSegmentsByBlock.get(segment.packedBlockId) ?? [];
+            named.push(segment);
+            packedSegmentsByBlock.set(segment.packedBlockId, named);
+          }
+          after = page.nextCursor;
+        } while (after !== null);
+      }
       const workers = Array.from({ length: 8 }, async () => {
         for (;;) {
           const next = payloads.next();
@@ -5851,8 +5867,21 @@ export class OpfsLeader {
           try {
             if (mode === "full") {
               const bytes = await this.#pool.readVerified(payload.placement);
-              if (payload.kind === "block") verifyStoredPayload(bytes);
-              else {
+              if (payload.kind === "block") {
+                verifyStoredPayload(bytes);
+                const named =
+                  payload.id === undefined ? undefined : packedSegmentsByBlock.get(payload.id);
+                for (const segment of named ?? []) {
+                  const missing = missingPackedMember(bytes, segment.columnBlockIds);
+                  if (missing !== undefined) {
+                    issue(
+                      "invalid-segment",
+                      `segments/${segment.id}`,
+                      `packed block lacks member ${missing}`,
+                    );
+                  }
+                }
+              } else {
                 verifyFtsChunkBytes(bytes, payload.bounds, payload.location);
               }
             } else if (!(await this.#pool.contains(payload.placement))) {

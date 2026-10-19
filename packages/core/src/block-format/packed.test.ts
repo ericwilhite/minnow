@@ -9,6 +9,7 @@ import {
   findPackedMember,
   inspectPackedBlock,
   isPackedBlock,
+  missingPackedMember,
   packedMemberBytes,
   packedMemberTag,
   verifyPackedBlock,
@@ -161,6 +162,19 @@ describe("packed blocks", () => {
     );
     expect(member.buffer).not.toBe(bytes.buffer);
     expect(member.byteOffset).toBe(0);
+  });
+
+  it("names the first segment member its packed block does not hold", () => {
+    const column = { type: "number", values: [1] } as const;
+    const encoded = encodePackedBlock([
+      { memberId: "seg/a", columnId: "a", column },
+      { memberId: "seg/b", columnId: "b", column },
+    ]);
+    if (encoded === undefined) throw new Error("expected a packed block");
+    expect(missingPackedMember(encoded.bytes, { a: ["seg/a"], b: ["seg/b"] })).toBeUndefined();
+    // A member under another column, and a member the block never held.
+    expect(missingPackedMember(encoded.bytes, { a: ["seg/b"] })).toBe("seg/b");
+    expect(missingPackedMember(encoded.bytes, { a: ["seg/a"], c: ["seg/c"] })).toBe("seg/c");
   });
 
   it("declines to pack two members whose tags collide", () => {
