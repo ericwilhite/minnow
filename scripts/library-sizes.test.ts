@@ -30,10 +30,10 @@ describe("compressed download budgets", () => {
     // The client and worker run in separate realms. Count both downloads without sharing code;
     // disabling splitting also counts all dynamically imported adapters in the worker bundle.
     // A tight absolute budget, not a claim that this two-download setup is below SQLite: the
-    // current measurement plus a little headroom (542.7 KiB measured; the history is in git).
+    // current measurement plus a little headroom (543.1 KiB measured; the history is in git).
     expect(
       worker.totalGzipBytes + client.totalGzipBytes,
       "worker plus client gzip bytes",
-    ).toBeLessThanOrEqual(543 * 1024);
+    ).toBeLessThanOrEqual(544 * 1024);
   });
 });

@@ -984,7 +984,7 @@ The figure each measured engine shows on the page is the `download` field in
 
 The unit suite also compares fresh bundles against the installed SQLite Wasm loader plus its
 Wasm file. The engine with OPFS must stay smaller after gzip. The generic worker with all
-stores plus its separately bundled client has a tight 537 KiB combined budget; those two
+stores plus its separately bundled client has a tight 544 KiB combined budget; those two
 downloads repeat some code and exceed SQLite's single loader-plus-Wasm measurement. The report
 and test share the same measurement code. Per-entry budgets in
 `packages/core/src/tree-shaking.test.ts` separately bound the main engine, the IndexedDB worker,
