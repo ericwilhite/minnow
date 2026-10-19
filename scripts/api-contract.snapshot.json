@@ -1647,6 +1647,13 @@
               ]
             },
             {
+              "name": "missingPackedMember",
+              "kind": "value",
+              "declarations": [
+                "export declare function missingPackedMember(bytes: Uint8Array, columnBlockIds: Readonly<Record<string, readonly string[]>>): string | undefined;"
+              ]
+            },
+            {
               "name": "PACKED_BLOCK_ENTRY_LENGTH",
               "kind": "value",
               "declarations": [
