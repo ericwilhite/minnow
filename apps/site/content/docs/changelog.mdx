@@ -8,12 +8,12 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
-## Unreleased
+## 0.17.1 — October 19, 2026
 
-Not yet published. This entry collects changes merged after 0.17.0; the release that ships them
-replaces this heading with its version and date. Packages: `@minnowdb/core`, `@minnowdb/devtools`. No stored format
-changes: IndexedDB schema 8 and OPFS layout 13 are unchanged, and 0.17.0 opens every database
-this build writes.
+Release packages: `@minnowdb/core@0.17.1`, `@minnowdb/devtools@0.3.9`.
+
+No stored format changes: IndexedDB schema 8 and OPFS layout 13 are unchanged, and 0.17.0 opens
+every database this release writes. No data migration or export/import step is needed.
 
 The engine with the OPFS adapter is now 438.0 KiB gzipped, about 3 KiB above the previous
 435 KiB measurement. The generic worker plus its separate client measures 546.3 KiB gzipped
@@ -166,6 +166,11 @@ marker`); it is now refused with `StorageFormatVersionError`. Wire-compatible wi
   to land, so its first pass could retain them too. Every pass now lets go of the connection's own
   idle lease and waits for that before it plans. In the regression test a dropped 306-row table's
   blocks are all reclaimed by the pass that follows the drop on every store.
+
+### Maintenance
+
+The private docs site uses Next.js 16.3.8, and the shared build toolchain uses
+`source-map-js` 1.2.2. The locked dependency tree reports no known vulnerabilities in `npm audit`.
 
 ## 0.17.0 — October 18, 2026
 

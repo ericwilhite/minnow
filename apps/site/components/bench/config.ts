@@ -37,7 +37,7 @@ export const ENGINES: readonly EngineChoice[] = [
     engine: "minnow",
     label: "Minnow",
     note: "This engine. Columnar blocks on IndexedDB, plain JavaScript.",
-    download: "435 KiB",
+    download: "438 KiB",
   },
   {
     id: "minnow-cached",
