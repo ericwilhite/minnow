@@ -36,7 +36,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
+      - run: bash scripts/ci-install.sh
       # First, because a version that only moved on one package is a broken install rather than a
       # broken build, and nothing later in this job would notice.
       - run: npm run version:check
@@ -89,7 +89,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
+      - run: bash scripts/ci-install.sh
       # The suite imports the packages through their built entry points, and the console snippet
       # tests check against the declaration bundle generated from them. The site itself is built
       # and checked by the static job.
@@ -128,7 +128,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
+      - run: bash scripts/ci-install.sh
       - uses: actions/download-artifact@v8
         with:
           pattern: unit-blob-*
@@ -175,7 +175,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
+      - run: bash scripts/ci-install.sh
       # Forced-GC samples across repeated queries, writes, live subscriptions, and database
       # lifecycles. Caches may warm once; a continuing post-warmup climb fails the merge gate.
       - run: npm run soak:memory
@@ -232,7 +232,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
+      - run: bash scripts/ci-install.sh
       # Cache each browser against the Playwright version that asks for it.
       - name: Resolve Playwright version
         id: playwright
@@ -313,7 +313,7 @@ jobs:
           # aspirational — node:sqlite in particular moved between 22 and 24.
           node-version: 22
           cache: npm
-      - run: npm ci
+      - run: bash scripts/ci-install.sh
       - run: npm run build
       # Both projects, so the maintenance workload runs in whichever shard holds it, alone and
       # after that shard's other files, as in a whole run.

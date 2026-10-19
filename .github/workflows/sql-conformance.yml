@@ -22,7 +22,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
+      - run: bash scripts/ci-install.sh
       - run: npm run test:sql:full
 
   simulator:
@@ -35,7 +35,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
+      - run: bash scripts/ci-install.sh
       - run: npm run test:simulator:full
 
   browser-conformance:
@@ -61,7 +61,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
+      - run: bash scripts/ci-install.sh
       - name: Resolve Playwright version
         id: playwright
         run: echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
@@ -102,7 +102,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
+      - run: bash scripts/ci-install.sh
       # Merge tests replay every recorded regression seed. This scheduled frontier deliberately
       # tries seeds that are not in that corpus yet across SQL semantics, mutation semantics,
       # differential execution, cross-client simulation, and both compaction state machines.

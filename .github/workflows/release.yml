@@ -40,7 +40,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
+      - run: bash scripts/ci-install.sh
       - run: npm run test:sql:full
       - run: npm run test:simulator:full
 
@@ -92,7 +92,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
+      - run: bash scripts/ci-install.sh
       - name: Resolve Playwright version
         id: playwright
         run: echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
@@ -137,7 +137,7 @@ jobs:
       # Trusted publishing needs npm 11.5.1 or newer, which is newer than some Node 24 images
       # ship. Pinning the major keeps that from being a surprise on a runner-image update.
       - run: npm install --global npm@^11
-      - run: npm ci
+      - run: bash scripts/ci-install.sh
       # The tarballs are built from source here rather than trusted from CI's artifacts.
       - run: npm run build
       - name: Publish

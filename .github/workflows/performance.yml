@@ -38,7 +38,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
+      - run: bash scripts/ci-install.sh
       # The gate imports the Kysely dialect from source, and the dialect imports `parseJson` from
       # `@minnowdb/core/json`, which resolves through the package's built `dist`.
       - run: npx tsc -b packages/core

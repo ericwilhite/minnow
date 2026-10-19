@@ -62,7 +62,9 @@ Browser jobs run independently: Chromium and Firefox on Linux, and WebKit on mac
 runs the library and site suites, Firefox and WebKit with the library suite split across two
 runners; Chromium also runs the packed consumer. The `Real browsers` check requires every engine
 to pass. Splitting the jobs preserves their 45-minute deadlines and leaves time to save failure
-artifacts. A test that passes only on retry still fails the gate.
+artifacts. A test that passes only on retry still fails the gate. Workflow dependency installation
+retries network failures up to three times, with short delays; other installation failures stop
+immediately. These retries do not rerun tests or bypass release gates.
 `.github/workflows/sql-conformance.yml` runs the full SQL profile and long simulator
 nightly and on demand. Both it and the release workflow also run
 `test:browser:conformance`: the entire core browser suite, including the full pinned SQL corpus
