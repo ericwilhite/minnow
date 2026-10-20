@@ -1,3 +1,4 @@
+import type { KeyChange } from "./key-change.js";
 import {
   createLiveQueryPatch,
   type LiveQueryPatch,
@@ -278,6 +279,7 @@ export interface ClientMigrationResult {
 }
 
 interface EventRoute {
+  onKeyChanges?: (changes: readonly KeyChange[]) => void;
   onChange?: (result: QueryResult, delivery: LiveQueryDelivery) => void;
   onPatch?: (patch: LiveQueryPatch, delivery: LiveQueryDelivery) => void;
   onInvalidate?: (invalidation: LiveQueryInvalidation) => void;
@@ -655,6 +657,25 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
   ): Promise<Exclude<BatchValue, null> | BatchValue[]> {
     return (await this.#call("resolveKey", [tableName, key])) as
       Exclude<BatchValue, null> | BatchValue[];
+  }
+
+  /** Resolve an ordered batch in one worker request; see MinnowDatabase.resolveKeys(). */
+  async resolveKeys(
+    tableName: string,
+    keys: ReadonlyArray<Exclude<BatchValue, null> | readonly BatchValue[]>,
+  ): Promise<Array<Exclude<BatchValue, null> | BatchValue[]>> {
+    return (await this.#call("resolveKeys", [tableName, keys])) as Array<
+      Exclude<BatchValue, null> | BatchValue[]
+    >;
+  }
+
+  /** Coalesce a source into an existing target; see MinnowDatabase.mergeKey(). */
+  async mergeKey(
+    tableName: string,
+    from: Exclude<BatchValue, null> | readonly BatchValue[],
+    to: Exclude<BatchValue, null> | readonly BatchValue[],
+  ): Promise<void> {
+    await this.#call("mergeKey", [tableName, from, to]);
   }
 
   /** The published catalog; see `MinnowDatabase.introspect()`. */
@@ -1050,6 +1071,10 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
         stage("upsertBatch", tableName, input, options) as Promise<StagedUpsertResult>,
       updateBatch: (tableName, input) => stage("updateBatch", tableName, input),
       deleteBatch: (tableName, input) => stage("deleteBatch", tableName, input),
+      mergeKey: (tableName, from, to) =>
+        enqueue(async () => {
+          await this._invoke(opened.handleId, "mergeKey", [tableName, from, to]);
+        }),
     };
     try {
       // The scope stages by runtime table name; the declaration only types the caller's view.
@@ -1216,6 +1241,28 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
     return (await this.#call("abortInterruptedImport", [
       identity,
     ])) as InterruptedSnapshotImportAbortResult;
+  }
+
+  /** Observe future rekeys across every table. Await registration before writing. Re-register after reopen(). */
+  async onKeyChanges(
+    listener: (changes: readonly KeyChange[]) => void,
+    options: { onError?: (error: unknown) => void; onComplete?: () => void } = {},
+  ): Promise<() => Promise<void>> {
+    const handleId = crypto.randomUUID();
+    this.#events.set(handleId, { onKeyChanges: listener, ...options });
+    try {
+      await this.#call("onKeyChanges", [handleId]);
+    } catch (error) {
+      this.#events.delete(handleId);
+      throw error;
+    }
+    let closed = false;
+    return async () => {
+      if (closed) return;
+      closed = true;
+      this.#events.delete(handleId);
+      if (!this.#closed && this.#fatal === undefined) await this.#call("offKeyChanges", [handleId]);
+    };
   }
 
   liveQueries(options: ClientLiveQueryOptions = {}): ClientLiveQuerySet {
@@ -1529,7 +1576,9 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
       }
       const route = this.#events.get(response.handleId);
       if (route === undefined) return;
-      if (response.event === "change") {
+      if (response.event === "keyChanges") {
+        route.onKeyChanges?.(response.payload as readonly KeyChange[]);
+      } else if (response.event === "change") {
         const { result, delivery } = response.payload as {
           result: unknown;
           delivery: LiveQueryDelivery;
@@ -1670,7 +1719,7 @@ function clientDeadline(value: number): number {
 function rpcMayPublish(method: string, args: unknown[]): boolean {
   if (method === "execute" && typeof args[0] === "string" && /^\s*SELECT\b/iu.test(args[0]))
     return false;
-  return /^(?:insert|upsert|update|delete|create|drop|migrate|commit|flush|execute|runStatement|import|finish|add|close|dispose)/u.test(
+  return /^(?:mergeKey|insert|upsert|update|delete|create|drop|migrate|commit|flush|execute|runStatement|import|finish|add|close|dispose)/u.test(
     method,
   );
 }
@@ -1681,6 +1730,11 @@ function rpcMayPublish(method: string, args: unknown[]): boolean {
  */
 /** The scope handed to the client `write()`; mirrors the in-worker WriteSession. */
 export interface ClientWriteSession<TSchema extends AnySchema = UntypedSchema> {
+  mergeKey(
+    tableName: string,
+    from: Exclude<BatchValue, null> | readonly BatchValue[],
+    to: Exclude<BatchValue, null> | readonly BatchValue[],
+  ): Promise<void>;
   /** Read-your-writes: observes the pre-scope snapshot plus everything staged so far. */
   query(sql: string, options?: QueryOptions): Promise<QueryResult>;
   execute(sql: string, params?: readonly QueryParameter[]): Promise<ExecuteResult>;

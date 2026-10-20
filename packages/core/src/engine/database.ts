@@ -1,3 +1,5 @@
+import { identifyKeyChange } from "./key-change.js";
+import { normalizeForeignKeys, type ReferenceTable } from "./foreign-key-schema.js";
 import {
   QueryExecution,
   type SegmentVisibilityCatalog,
@@ -1641,6 +1643,12 @@ export interface StagedUpsertResult extends StagedWriteResult {
  * leaves the scope usable.
  */
 export interface WriteSession<TSchema extends AnySchema = UntypedSchema> {
+  /** Coalesce two identities, preserving the target row. */
+  mergeKey(
+    tableName: string,
+    from: Exclude<BatchValue, null> | readonly BatchValue[],
+    to: Exclude<BatchValue, null> | readonly BatchValue[],
+  ): Promise<void>;
   /**
    * Read-your-writes: the query observes the pre-scope snapshot PLUS everything this scope
    * has staged so far, ordered after all committed data — without publishing anything.
@@ -3372,41 +3380,66 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     tableName: string,
     key: Exclude<BatchValue, null> | readonly BatchValue[],
   ): Promise<Exclude<BatchValue, null> | BatchValue[]> {
+    const [resolved] = await this.resolveKeys(tableName, [key]);
+    if (resolved === undefined) throw new Error("Key resolution returned no result");
+    return resolved;
+  }
+
+  /** Resolve an ordered batch against one captured forward generation; duplicates are preserved. */
+  async resolveKeys(
+    tableName: string,
+    keys: ReadonlyArray<Exclude<BatchValue, null> | readonly BatchValue[]>,
+  ): Promise<Array<Exclude<BatchValue, null> | BatchValue[]>> {
+    const captured = structuredClone(keys);
     return this.#foreground(async () => {
       const table = await this.#findTable(tableName);
       const address = tableAddress(table);
       if (address === undefined) throw new TypeError(`Table has no primary key: ${table.name}`);
-      const composite = Array.isArray(key);
-      const tuple: readonly BatchValue[] = composite
-        ? (key as readonly BatchValue[])
-        : [key as Exclude<BatchValue, null>];
-      if (tuple.length !== address.columns.length) {
-        throw new TypeError(
-          `${table.name} has ${String(address.columns.length)} primary-key column(s); the key has ${String(tuple.length)} value(s)`,
-        );
-      }
-      const stored = tuple.map((value, index) => {
-        const column = address.columns[index];
-        return column === undefined || value === null
-          ? value
-          : normalizeColumnLogicalValue(column, value);
-      });
-      const lookup = await this.#committedForwards();
-      const forward =
-        lookup === undefined ? undefined : lookupAddressForward(lookup, table.id, address, stored);
-      if (forward === undefined) {
-        return composite ? [...tuple] : (key as Exclude<BatchValue, null>);
-      }
-      const current = forward.toValues.map(
-        (value, index) =>
-          (address.columns[index]?.sqlDomain === undefined
+      const committed = await this.#committedForwards();
+      const lookup = committed?.atTime(dateMilliseconds(this.#now()));
+      return captured.map((key) => {
+        const composite = Array.isArray(key);
+        const tuple: readonly BatchValue[] = composite
+          ? (key as readonly BatchValue[])
+          : [key as Exclude<BatchValue, null>];
+        if (tuple.length !== address.columns.length) {
+          throw new TypeError(
+            `${table.name} has ${String(address.columns.length)} primary-key column(s); the key has ${String(tuple.length)} value(s)`,
+          );
+        }
+        const stored = tuple.map((value, index) => {
+          const column = address.columns[index];
+          return column === undefined || value === null
             ? value
-            : externalSqlDomainValue(value)) as BatchValue,
-      );
-      const only = current[0];
-      if (composite || only === undefined || only === null) return current;
-      return only;
+            : normalizeColumnLogicalValue(column, value);
+        });
+        const forward =
+          lookup === undefined
+            ? undefined
+            : lookupAddressForward(lookup, table.id, address, stored);
+        if (forward === undefined) {
+          return composite ? [...tuple] : (key as Exclude<BatchValue, null>);
+        }
+        const current = forward.toValues.map(
+          (value, index) =>
+            (address.columns[index]?.sqlDomain === undefined
+              ? value
+              : externalSqlDomainValue(value)) as BatchValue,
+        );
+        const only = current[0];
+        if (composite || only === undefined || only === null) return current;
+        return only;
+      });
     });
+  }
+
+  /** Merge a source into an existing target, preserving target values. Ordinary UPDATE still refuses occupied keys. */
+  async mergeKey(
+    tableName: string,
+    from: Exclude<BatchValue, null> | readonly BatchValue[],
+    to: Exclude<BatchValue, null> | readonly BatchValue[],
+  ): Promise<void> {
+    await this.write((session) => session.mergeKey(tableName, from, to));
   }
 
   async listTables(): Promise<TableDefinition[]> {
@@ -7201,6 +7234,92 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     };
   }
 
+  async #sessionMergeKey(
+    transaction: DatabaseTransaction,
+    tableName: string,
+    from: Exclude<BatchValue, null> | readonly BatchValue[],
+    to: Exclude<BatchValue, null> | readonly BatchValue[],
+  ): Promise<void> {
+    const table = await this.#findTable(tableName, transaction);
+    const address = tableAddress(table);
+    if (address === undefined) throw new TypeError(`Table has no primary key: ${table.name}`);
+    const lookup = (await this.#writeForwards(transaction))?.lookup;
+    const current = (key: Exclude<BatchValue, null> | readonly BatchValue[]) => {
+      const tuple: readonly BatchValue[] = Array.isArray(key)
+        ? (key as readonly BatchValue[])
+        : [key as Exclude<BatchValue, null>];
+      if (tuple.length !== address.columns.length)
+        throw new TypeError(
+          `${table.name} has ${String(address.columns.length)} primary-key column(s); the key has ${String(tuple.length)} value(s)`,
+        );
+      const values = tuple.map((value, index) => {
+        const column = address.columns[index];
+        if (column === undefined) throw new TypeError("Primary key column is missing");
+        if (value === null) throw new TypeError(`Primary key cannot be null: ${column.name}`);
+        const stored = normalizeColumnLogicalValue(column, value);
+        validateValue(column, stored, index);
+        return stored;
+      });
+      return lookup === undefined
+        ? values
+        : (lookupAddressForward(lookup, table.id, address, values)?.toValues ?? values);
+    };
+    const fromValues = [...current(from)],
+      toValues = [...current(to)];
+    const source = addressStorageKey(address, fromValues),
+      target = addressStorageKey(address, toValues);
+    const firstColumn = address.columns[0];
+    if (firstColumn === undefined) throw new TypeError("Primary key column is missing");
+    const exists = async (values: BatchValue[]) =>
+      (
+        await this.#sessionQuery(
+          transaction,
+          `SELECT ${quoteSqlIdentifier(firstColumn.name)} FROM ${quoteSqlIdentifier(table.name)} WHERE ${address.columns.map((column) => `${quoteSqlIdentifier(column.name)} = ?`).join(" AND ")}`,
+          { params: values },
+        )
+      ).rows.length > 0;
+    if (!(await exists(toValues)))
+      throw new MissingKeyError(table.name, address.keyColumn.name, target);
+    // An acknowledged retry reaches the existing target through the source's forward.
+    if (storageKeyToken(source) === storageKeyToken(target)) return;
+    if (!(await exists(fromValues)))
+      throw new MissingKeyError(table.name, address.keyColumn.name, source);
+    const renamed = new Map([[keyToken(address.keyColumn.type, source), { fromValues, toValues }]]);
+    await this.#moveReferences(
+      transaction,
+      table,
+      address,
+      renamed,
+      1,
+      REFERENTIAL_CASCADES,
+      new Set([keyToken(address.keyColumn.type, source)]),
+    );
+    const after = (await this.#writeForwards(transaction))?.lookup;
+    if (
+      after !== undefined &&
+      (lookupForward(after, table.id, source) !== undefined ||
+        lookupForward(after, table.id, target) !== undefined)
+    ) {
+      throw new TypeError("Merge references would change the source or target primary key");
+    }
+    if (!(await exists(toValues)))
+      throw new MissingKeyError(table.name, address.keyColumn.name, target);
+    if (!(await exists(fromValues)))
+      throw new MissingKeyError(table.name, address.keyColumn.name, source);
+    // Coalescing identity is not a SQL DELETE: delete triggers and ON DELETE actions do not run.
+    await this.#sessionDelete(
+      transaction,
+      table.name,
+      { keys: [source] },
+      1,
+      REFERENTIAL_CASCADES,
+      true,
+    );
+    await this.#stageKeyForwards(transaction, table, [
+      { from: source, to: target, fromValues, toValues },
+    ]);
+  }
+
   /**
    * Points every declared reference to a rekeyed row at its new key — enforced or not, since a
    * reference that kept the old key would silently stop joining. A reference column that is
@@ -8650,11 +8769,20 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         );
         return shown.length === 1 ? (shown[0] ?? null) : shown;
       };
-      changes.push({
-        table: table.name,
-        from: external(forward.fromValues),
-        to: external(forward.toValues),
-      });
+      changes.push(
+        identifyKeyChange(
+          {
+            table: table.name,
+            from: external(forward.fromValues),
+            to: external(forward.toValues),
+          },
+          {
+            id: `${forwardRowKey(forward.tableId, token)}:${String(forward.expiresAt)}:${storageKeyToken(forward.to)}`,
+            expiresAt: forward.expiresAt,
+            observedAt: dateMilliseconds(this.#now()),
+          },
+        ),
+      );
     }
     this.#keyChangeDiff = { prior, next: committed, changes };
     return { changes, state: committed };
@@ -10752,6 +10880,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
     };
     const operations: WriteSession = {
+      mergeKey: async (tableName, from, to) => {
+        open();
+        staged += 1;
+        return guarded(() => this.#sessionMergeKey(transaction, tableName, from, to));
+      },
       // Results cross the application boundary here, as db.query's do: the internal tagged
       // forms (NUMERIC domains, above all) are for the engine's own readers — trigger bodies
       // and keyed lookups share #sessionQuery — never for the callback's code.
@@ -10945,6 +11078,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         enqueue(() => operations.upsertBatch(name, input, upsertOptions)),
       updateBatch: (name, input) => enqueue(() => operations.updateBatch(name, input)),
       deleteBatch: (name, input) => enqueue(() => operations.deleteBatch(name, input)),
+      mergeKey: (name, from, to) => enqueue(() => operations.mergeKey(name, from, to)),
     };
     const queuedWriter: TransactionStatementWriter = {
       ...writer,
@@ -13065,6 +13199,50 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     // A view that reads only what the catalog already holds is created in plan order; one that
     // needs a column or table a later step adds waits until the alterations have landed.
     const deferredViews = this.#planMigrationViews(records, plan.steps);
+    const referenceTables = new Map<string, ReferenceTable>(
+      records.map((record) => [record.name, record]),
+    );
+    for (const declared of definition.tables) {
+      const columns: TableColumnRecord[] = Object.entries(declared.columns).map(
+        ([name, column]) => ({
+          id: name,
+          name,
+          type: column.type,
+          nullable: column.isNullable,
+          ...(column.integer ? { integer: true as const } : {}),
+          ...(column.sqlDomain === undefined ? {} : { sqlDomain: column.sqlDomain }),
+        }),
+      );
+      const primary =
+        declared.primaryKey.length > 0
+          ? declared.primaryKey
+          : Object.entries(declared.columns)
+              .filter(([, column]) => column.isUnique)
+              .map(([name]) => name);
+      referenceTables.set(declared.name, {
+        name: declared.name,
+        columns,
+        primaryKeyColumnIds: [...primary],
+      });
+    }
+    for (const step of plan.steps) {
+      if (step.kind === "drop-table") referenceTables.delete(step.tableName);
+    }
+    for (const declared of definition.tables) {
+      const owner = referenceTables.get(declared.name);
+      if (owner === undefined)
+        throw new Error(`Migration reference owner missing: ${declared.name}`);
+      await normalizeForeignKeys(
+        owner,
+        declaredForeignKeys(declared).map((key) => ({
+          ...key,
+          column: key.columns[0] ?? "",
+          parentColumn: key.parentColumns[0] ?? "",
+        })),
+        async (name) => referenceTables.get(name),
+      );
+    }
+
     const createdTables: string[] = [];
     const replacedViews: string[] = [];
     const droppedViews: string[] = [];
@@ -13089,9 +13267,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           }
           return { ...key, column, parentColumn };
         });
-        await this.#runStatementAdmitted(admission, {
-          kind: "create-table",
-          table: step.table.name,
+        await this.#catalogMutations.createTable(admission, {
+          name: step.table.name,
           ...(uniqueEntry === undefined && primaryKey.length !== 1
             ? {}
             : { uniqueKey: uniqueEntry?.[0] ?? primaryKey[0] }),
@@ -13123,10 +13300,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
                       : columnDefinition.backfillValue,
                 }),
           })),
-          ...(statementForeignKeys.length === 0 ? {} : { foreignKeys: statementForeignKeys }),
+
           ...(step.table.checks.length === 0 ? {} : { checks: [...step.table.checks] }),
           managed: true,
         });
+        if (statementForeignKeys.length > 0) {
+          alterationsByTable.set(step.table.name, [
+            { kind: "alter-foreign-keys", tableName: step.table.name, foreignKeys },
+          ]);
+        }
         createdTables.push(step.table.name);
         catalogChangedBeforeAlterations = true;
         continue;
@@ -13187,7 +13369,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
       const steps = plannedSteps.filter((step) => step.kind !== "drop-column");
       if (steps.length === 0) {
-        if (changed) alteredTables.push(tableName);
+        if (changed && !createdTables.includes(tableName)) alteredTables.push(tableName);
         continue;
       }
       const proof = alterationProof;
@@ -13276,14 +13458,49 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       const foreignKeyStep = steps.find((step) => step.kind === "alter-foreign-keys");
       const foreignKeys =
         foreignKeyStep?.kind === "alter-foreign-keys"
-          ? foreignKeyStep.foreignKeys.map((key) => ({ ...key }))
+          ? foreignKeyStep.foreignKeys.map(({ enforced, ...key }) => ({
+              ...key,
+              ...(!enforced ? { enforced: false } : {}),
+            }))
           : record.foreignKeys;
       if (
         JSON.stringify(columns) === JSON.stringify(record.columns) &&
         JSON.stringify(foreignKeys ?? []) === JSON.stringify(record.foreignKeys ?? [])
       ) {
-        if (changed) alteredTables.push(tableName);
+        if (changed && !createdTables.includes(tableName)) alteredTables.push(tableName);
         continue;
+      }
+      const addedEnforced = (foreignKeys ?? []).filter(
+        (key) =>
+          key.enforced !== false &&
+          !(record.foreignKeys ?? []).some((existing) => existing.name === key.name),
+      );
+      if (addedEnforced.length > 0) {
+        const candidate = { ...record, columns, foreignKeys: addedEnforced };
+        const renamedFrom = new Map(
+          steps.flatMap((step) =>
+            step.kind === "rename-column" ? [[step.to, step.from] as const] : [],
+          ),
+        );
+        const arity = Math.max(...addedEnforced.map((key) => key.columns.length));
+        for await (const batch of this.queryCursor(
+          `SELECT * FROM ${quoteSqlIdentifier(record.name)}`,
+          { memoize: false, batchRows: Math.max(1, Math.floor(512 / arity)) },
+        )) {
+          await this.#assertForeignKeysPresent(
+            candidate,
+            (name) =>
+              batch.rows.map((row) => {
+                const column = findColumn(candidate, name);
+                const previousName = renamedFrom.get(name) ?? name;
+                const value = Object.hasOwn(row, previousName)
+                  ? (row[previousName] ?? null)
+                  : (column.backfill ?? null);
+                return storedSqlValueFromExecution(column, value);
+              }),
+            (sql, params) => this.query(sql, { params }),
+          );
+        }
       }
       assertTriggerBodiesAcceptTableSchema(proof.records, record, columns);
       const candidateSchemas = catalogQuerySchemas(proof.records);
@@ -13300,7 +13517,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         candidate.id === updated.id ? updated : candidate,
       );
       proof.catalogEpoch += 1;
-      alteredTables.push(tableName);
+      if (!createdTables.includes(tableName)) alteredTables.push(tableName);
     }
     // The views that read what the alterations above added. Their shape was proven against the
     // planned schema before the first step; this re-proves it against the catalog as it now is.

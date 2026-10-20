@@ -501,6 +501,11 @@ export class LiveQuerySet {
   readonly #onSweepDelivered: ((sweep: LiveQuerySweep) => void) | undefined;
   /** The host's key-forward state as of the last sweep; undefined until the first subscription. */
   #keyState: { value: unknown } | undefined;
+  #keyObserverState: { value: unknown } | undefined;
+  readonly #keyObservers = new Set<{
+    listener: (changes: readonly KeyChange[]) => void;
+    enabled: () => boolean;
+  }>();
 
   constructor(host: LiveQueryHost, options: LiveQuerySetOptions = {}) {
     if (
@@ -598,6 +603,37 @@ export class LiveQuerySet {
       throw new LiveQueryLimitError("subscription", this.#maxSubscriptions);
     }
     this.#subscriptionCount += 1;
+  }
+
+  /** Observe future rekeys even with no queries or unchanged query results. */
+  async subscribeKeyChanges(
+    listener: (changes: readonly KeyChange[]) => void,
+    options: { enabled?: () => boolean } = {},
+  ): Promise<LiveQuerySubscription> {
+    this.#throwIfClosed();
+    const probe = await this.#freshProbe();
+    if (this.#keyObserverState === undefined) {
+      if (this.#host.keyChanges === undefined)
+        throw new TypeError("Live host does not support key changes");
+      const baseline = await this.#host.keyChanges(undefined, probe);
+      this.#keyObserverState ??= { value: baseline.state };
+    }
+    this.#throwIfClosed();
+    this.#lastProbe ??= probe;
+    const observer = { listener, enabled: options.enabled ?? (() => true) };
+    this.#keyObservers.add(observer);
+    return {
+      dependencyTableIds: [],
+      close: () => {
+        this.#keyObservers.delete(observer);
+        if (this.#keyObservers.size === 0) this.#keyObserverState = undefined;
+      },
+    };
+  }
+
+  #hasKeyObservers(): boolean {
+    for (const observer of this.#keyObservers) if (observer.enabled()) return true;
+    return false;
   }
 
   /** Registers a query, delivers its current result, and shares work with equal statements. */
@@ -737,7 +773,7 @@ export class LiveQuerySet {
     this.#unindexGroup(group, group.dependencies);
     // With no queries the set stops sweeping, so its key baseline would go stale; the next
     // subscription takes a fresh one.
-    if (this.#groups.size === 0) this.#keyState = undefined;
+    if (this.#groups.size === 0 && this.#keyObservers.size === 0) this.#keyState = undefined;
   }
 
   async #getOrOpenGroup(query: LiveQueryInput): Promise<{ group: QueryGroup; fresh: boolean }> {
@@ -1078,6 +1114,9 @@ export class LiveQuerySet {
     if (this.#retryTimer !== undefined) clearTimeout(this.#retryTimer);
     const groups = [...this.#groups.values()];
     this.#groups.clear();
+    this.#keyObservers.clear();
+    this.#keyState = undefined;
+    this.#keyObserverState = undefined;
     this.#retainedBytes = 0;
     this.#groupsByTable.clear();
     this.#lagging.clear();
@@ -1121,7 +1160,12 @@ export class LiveQuerySet {
 
   /** One timer per set; poll and commit hints cannot bypass coordination backpressure. */
   #retrySweep(): void {
-    if (this.#closed || this.#groups.size === 0 || this.#retryTimer !== undefined) return;
+    if (
+      this.#closed ||
+      (this.#groups.size === 0 && !this.#hasKeyObservers()) ||
+      this.#retryTimer !== undefined
+    )
+      return;
     this.#retryTimer = setTimeout(() => {
       this.#retryTimer = undefined;
       this.#hint();
@@ -1158,7 +1202,7 @@ export class LiveQuerySet {
   }
 
   async #sweep(): Promise<void> {
-    if (this.#closed || this.#groups.size === 0) return;
+    if (this.#closed || (this.#groups.size === 0 && !this.#hasKeyObservers())) return;
     this.#stats.versionChecks += 1;
     const current = await this.#freshProbe();
     if (!this.#stillOpen()) return;
@@ -1181,42 +1225,65 @@ export class LiveQuerySet {
 
     const candidates = await this.#sweepCandidates(last, current, changedSince);
     if (candidates === undefined) return;
-    // One group at a time. Interleaving groups was measured and rejected: their patches share
-    // the engine's catalog snapshot and block cache, and running them together tripled the
-    // latency on IndexedDB rather than overlapping anything.
+    // Read notices before settling any group. A failed forward read must not advance a
+    // group's result without delivering it. Cursor copies publish only with their notices.
+    const previousKeys = this.#keyState;
+    const previousObserver = this.#keyObserverState;
+    const nextKeys = previousKeys === undefined ? undefined : { value: previousKeys.value };
+    const nextObserver =
+      previousObserver === undefined ? undefined : { value: previousObserver.value };
+    const observerChanges = this.#hasKeyObservers()
+      ? await this.#sweepKeyChanges(last, current, changedSince, true, nextObserver)
+      : [];
+    const keyChanges = await this.#sweepKeyChanges(
+      last,
+      current,
+      changedSince,
+      candidates.length > 0,
+      nextKeys,
+    );
+    if (!this.#stillOpen()) return;
     const deliveries: SweepDelivery[] = [];
+    const deliverSweep = (): void => {
+      if (this.#keyState === previousKeys && previousKeys !== undefined && nextKeys !== undefined)
+        previousKeys.value = nextKeys.value;
+      if (
+        this.#keyObserverState === previousObserver &&
+        previousObserver !== undefined &&
+        nextObserver !== undefined
+      )
+        previousObserver.value = nextObserver.value;
+      if (observerChanges.length > 0) {
+        for (const observer of this.#keyObservers) {
+          if (observer.enabled()) callLiveCallback(() => observer.listener(observerChanges));
+        }
+      }
+      for (const deliver of deliveries) deliver(keyChanges);
+      if (deliveries.length > 0 || keyChanges.length > 0 || observerChanges.length > 0) {
+        const sweep: LiveQuerySweep = {
+          manifestVersion: current.manifestVersion,
+          catalogEpoch: current.catalogEpoch,
+          keyChanges: keyChanges.length > 0 ? keyChanges : observerChanges,
+        };
+        callLiveCallback(() => this.#onSweepDelivered?.(sweep));
+      }
+    };
+    // One group at a time: interleaving shared cache and catalog work was slower on IndexedDB.
     try {
       for (const group of candidates) {
         if (!this.#stillOpen()) return;
         await this.#sweepGroup(group, last, current, changedSince, deliveries);
       }
     } catch (error) {
-      // Groups swept before the failure are settled at this probe and will not be visited again;
-      // their results go out now, and the rest retry with the failed group.
-      for (const deliver of deliveries) deliver([]);
+      // Flush the settled portion, including its notices, before retrying failed groups.
+      if (this.#stillOpen()) deliverSweep();
       throw error;
     }
-    const keyChanges = await this.#sweepKeyChanges(
-      last,
-      current,
-      changedSince,
-      deliveries.length > 0,
-    );
     if (!this.#stillOpen()) return;
     this.#lastProbe = current;
     this.#stats.rerunsAvoided += this.#groups.size - (this.#stats.reruns - rerunsBefore);
     this.#stats.lastSweepMs = performance.now() - started;
-    // Every delivery the sweep made, handed out together in one synchronous turn: a commit that
-    // changes several queries reaches a renderer as one update, not one per query.
-    for (const deliver of deliveries) deliver(keyChanges);
-    if (deliveries.length > 0 || keyChanges.length > 0) {
-      const sweep: LiveQuerySweep = {
-        manifestVersion: current.manifestVersion,
-        catalogEpoch: current.catalogEpoch,
-        keyChanges,
-      };
-      callLiveCallback(() => this.#onSweepDelivered?.(sweep));
-    }
+    deliverSweep();
   }
 
   /** Reads the forwards every later sweep reports key changes against; never rejects. */
@@ -1236,8 +1303,8 @@ export class LiveQuerySet {
     current: CatalogProbe,
     changedSince: (after: number | null) => Promise<Set<string> | "all">,
     report: boolean,
+    state = this.#keyState,
   ): Promise<readonly KeyChange[]> {
-    const state = this.#keyState;
     if (state === undefined || this.#host.keyChanges === undefined) return [];
     if (!catalogChangedBetween(last, current)) {
       const changed = await changedSince(last.manifestVersion);
@@ -1248,7 +1315,8 @@ export class LiveQuerySet {
       const next = await this.#host.keyChanges(state, current, report);
       state.value = next.state;
       return next.changes;
-    } catch {
+    } catch (error) {
+      if (this.#hasKeyObservers()) throw error;
       // A notice is a convenience over results that are already correct; never fail a sweep.
       return [];
     }

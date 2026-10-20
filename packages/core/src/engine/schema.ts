@@ -1537,11 +1537,10 @@ function backfillsEqual(left: unknown, right: unknown): boolean {
 }
 
 /**
- * Enforced constraints on an existing table cannot change through a metadata-only step. Attaching
- * a FOREIGN KEY or CHECK to a table that already holds rows would claim something about those rows
- * that nobody has verified, and no validation scan exists; dropping one is refused for the mirror
- * reason, so that a constraint never disappears because a schema file drifted. Informational
- * foreign keys are catalog metadata only, so adding, dropping, or remapping one is safe.
+ * Enforced foreign keys may be added after the engine validates existing rows. Changing or
+ * dropping enforced constraints is refused, so a constraint never disappears because a schema
+ * file drifted. CHECK additions still require table replacement. Informational foreign keys
+ * are catalog metadata only, so adding, dropping, or remapping one needs no row scan.
  */
 function planConstraintChanges(
   record: CatalogTable,
@@ -1560,18 +1559,12 @@ function planConstraintChanges(
   const declaredList = declaredForeignKeys(definition);
   const existingKeys = new Map(record.foreignKeys.map((key) => [key.name, key]));
   const declaredKeys = new Map(declaredList.map((key) => [key.name, key]));
-  let informationalChanged = false;
+  let referencesChanged = false;
   for (const [name, declared] of declaredKeys) {
     const existing = existingKeys.get(name);
     if (existing === undefined) {
-      if (!declared.enforced) {
-        informationalChanged = true;
-        continue;
-      }
-      throw new TypeError(
-        `FOREIGN KEY cannot be added after creation: ${definition.name}.${declared.columns.join(",")}. ` +
-          `Existing rows are not known to satisfy it; recreate the table to add a relation.`,
-      );
+      referencesChanged = true;
+      continue;
     }
     if (existing.enforced !== declared.enforced) {
       throw new TypeError(
@@ -1580,7 +1573,7 @@ function planConstraintChanges(
     }
     if (describeKey(existing) !== describeKey(declared)) {
       if (!declared.enforced) {
-        informationalChanged = true;
+        referencesChanged = true;
         continue;
       }
       throw new TypeError(
@@ -1592,7 +1585,7 @@ function planConstraintChanges(
   for (const name of existingKeys.keys()) {
     if (!declaredKeys.has(name)) {
       if (existingKeys.get(name)?.enforced === false) {
-        informationalChanged = true;
+        referencesChanged = true;
         continue;
       }
       throw new TypeError(
@@ -1601,7 +1594,7 @@ function planConstraintChanges(
       );
     }
   }
-  if (informationalChanged) {
+  if (referencesChanged) {
     steps.push({
       kind: "alter-foreign-keys",
       tableName: definition.name,

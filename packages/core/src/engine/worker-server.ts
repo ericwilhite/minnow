@@ -1,3 +1,5 @@
+import { keyChangeIdentity } from "./key-change.js";
+import type { LiveQuerySweep } from "./live.js";
 import type { BlockStore } from "../storage/types.js";
 import { MAX_SNAPSHOT_STREAM_CHUNK_BYTES } from "../storage/snapshot.js";
 import {
@@ -145,6 +147,8 @@ const directRootMethods = [
   "introspect",
   "listTables",
   "resolveKey",
+  "resolveKeys",
+  "mergeKey",
   "insertBatch",
   "insert",
   "upsertBatch",
@@ -424,6 +428,7 @@ export type WorkerStoreFactory = (
 ) => BlockStore | OpenedStore | Promise<BlockStore | OpenedStore>;
 
 type Handle =
+  | { type: "key-changes" }
   | { type: "snapshot"; session: SnapshotSession; release: () => void; done: Promise<void> }
   | {
       type: "snapshot-export";
@@ -475,6 +480,14 @@ const passiveRpcSignal = new AbortController().signal;
 
 class DatabaseRpcServer {
   readonly #handles = new Map<string, Handle>();
+  #keyMonitor: LiveQuerySet | undefined;
+  #keyReady: Promise<void> | undefined;
+  #seenKeyChangeExpiry = Infinity;
+  readonly #pendingKeyChanges = new Map<LiveQuerySet, LiveQuerySweep["keyChanges"]>();
+  readonly #keyWatchers = new Map<LiveQuerySet, Promise<LiveQuerySubscription>>();
+  #keyPollTimer: ReturnType<typeof setInterval> | undefined;
+  readonly #seenKeyChanges = new Map<string, number>();
+
   readonly #reservedHandleIds = new Set<string>();
   readonly #openingHandlePromises = new Set<Promise<unknown>>();
   readonly #settlingWritePromises = new Set<Promise<unknown>>();
@@ -509,6 +522,99 @@ class DatabaseRpcServer {
         `Worker write-handle idle timeout must be a positive whole number no greater than ${String(MAX_TIMER_DELAY_MS)}`,
       );
     }
+  }
+
+  #hasLiveSets(): boolean {
+    return [...this.#handles.values()].some((handle) => handle.type === "live-set");
+  }
+  #hasKeyListeners(): boolean {
+    return [...this.#handles.values()].some((handle) => handle.type === "key-changes");
+  }
+
+  #keyChangeEvents(set: LiveQuerySet): LiveSweepEvents["events"] {
+    if (!this.#hasKeyListeners()) return [];
+    const pending = this.#pendingKeyChanges.get(set) ?? [];
+    this.#pendingKeyChanges.delete(set);
+    const now = pending[0] === undefined ? undefined : keyChangeIdentity(pending[0])?.observedAt;
+    if (now !== undefined && this.#seenKeyChangeExpiry <= now) {
+      this.#seenKeyChangeExpiry = Infinity;
+      for (const [id, expiresAt] of this.#seenKeyChanges) {
+        if (expiresAt <= now) this.#seenKeyChanges.delete(id);
+        else this.#seenKeyChangeExpiry = Math.min(this.#seenKeyChangeExpiry, expiresAt);
+      }
+    }
+    const changes = pending.filter((change) => {
+      const identity = keyChangeIdentity(change);
+      if (identity === undefined) return true;
+      if (this.#seenKeyChanges.has(identity.id)) return false;
+      this.#seenKeyChanges.set(identity.id, identity.expiresAt);
+      this.#seenKeyChangeExpiry = Math.min(this.#seenKeyChangeExpiry, identity.expiresAt);
+      return true;
+    });
+    if (changes.length === 0) return [];
+    return [...this.#handles]
+      .filter(([, handle]) => handle.type === "key-changes")
+      .map(([handleId]) => ({ handleId, event: "keyChanges", payload: changes, transfer: [] }));
+  }
+
+  #watchKeys(set: LiveQuerySet): Promise<LiveQuerySubscription> {
+    let pending = this.#keyWatchers.get(set);
+    if (pending === undefined) {
+      pending = set.subscribeKeyChanges((changes) => this.#pendingKeyChanges.set(set, changes));
+      this.#keyWatchers.set(set, pending);
+    }
+    return pending;
+  }
+
+  async #startKeyChanges(): Promise<void> {
+    if (this.#keyMonitor !== undefined) return this.#keyReady;
+    const monitor = this.database.liveQueries({
+      onSweepDelivered: () => {
+        const events = this.#keyChangeEvents(monitor);
+        if (events.length > 0) this.scope.postMessage(rpcEvent("key-changes", "batch", { events }));
+      },
+    });
+    this.#keyMonitor = monitor;
+    this.#keyReady = (async () => {
+      try {
+        await monitor.subscribeKeyChanges(
+          (changes) => this.#pendingKeyChanges.set(monitor, changes),
+          { enabled: () => !this.#hasLiveSets() },
+        );
+        for (const handle of this.#handles.values()) {
+          if (handle.type === "live-set") await this.#watchKeys(handle.set);
+        }
+        if (this.#disposed || this.#keyMonitor !== monitor)
+          throw new Error("Key-change subscription was closed");
+        this.#keyPollTimer = setInterval(() => {
+          const sets = [...this.#handles.values()].flatMap((handle) =>
+            handle.type === "live-set" ? [handle.set] : [],
+          );
+          for (const set of sets.length > 0 ? sets : [monitor]) void set.refresh();
+        }, 1000);
+      } catch (error) {
+        this.#stopKeyChanges();
+        throw error;
+      }
+    })();
+    return this.#keyReady;
+  }
+
+  #stopKeyChanges(): void {
+    this.#keyMonitor?.close();
+    this.#keyMonitor = undefined;
+    for (const watcher of this.#keyWatchers.values())
+      void watcher.then(
+        (value) => value.close(),
+        () => undefined,
+      );
+    if (this.#keyPollTimer !== undefined) clearInterval(this.#keyPollTimer);
+    this.#keyPollTimer = undefined;
+    this.#keyWatchers.clear();
+    this.#seenKeyChanges.clear();
+    this.#pendingKeyChanges.clear();
+    this.#keyReady = undefined;
+    this.#seenKeyChangeExpiry = Infinity;
   }
 
   async handle(request: RpcRequest): Promise<void> {
@@ -617,6 +723,23 @@ class DatabaseRpcServer {
       return operation.apply(this.database, args);
     }
     switch (method) {
+      case "onKeyChanges": {
+        const handleId = this.#claimHandleId(args[0]);
+        this.#publishHandle(handleId, { type: "key-changes" });
+        try {
+          await this.#startKeyChanges();
+        } catch (error) {
+          this.#handles.delete(handleId);
+          throw error;
+        }
+        return { handleId };
+      }
+      case "offKeyChanges": {
+        const handleId = args[0] as string;
+        if (this.#handles.get(handleId)?.type === "key-changes") this.#handles.delete(handleId);
+        if (!this.#hasKeyListeners()) this.#stopKeyChanges();
+        return undefined;
+      }
       case "query": {
         const [sql, options, reportStats = false] = args as [
           string,
@@ -807,6 +930,7 @@ class DatabaseRpcServer {
             ...(pollIntervalMs === undefined ? {} : { pollIntervalMs }),
             sharedResults: true,
             onSweepDelivered: () => {
+              if (set !== undefined) pending.events.unshift(...this.#keyChangeEvents(set));
               if (pending.events.length === 0) return;
               const events = pending.events.splice(0);
               try {
@@ -843,6 +967,7 @@ class DatabaseRpcServer {
               }
             },
           });
+          if (this.#hasKeyListeners()) await this.#watchKeys(set);
           this.#publishHandle(handleId, {
             type: "live-set",
             set,
@@ -850,6 +975,14 @@ class DatabaseRpcServer {
             pending,
           });
         } catch (error) {
+          if (set !== undefined) {
+            void this.#keyWatchers.get(set)?.then(
+              (watcher) => watcher.close(),
+              () => undefined,
+            );
+            this.#keyWatchers.delete(set);
+            this.#pendingKeyChanges.delete(set);
+          }
           set?.close();
           this.#releaseHandleId(handleId);
           throw error;
@@ -1080,6 +1213,13 @@ class DatabaseRpcServer {
     args: unknown[],
     context: RpcCallContext,
   ): Promise<unknown> {
+    if (method === "mergeKey") {
+      return handle.session.mergeKey(
+        args[0] as string,
+        args[1] as Exclude<BatchValue, null> | readonly BatchValue[],
+        args[2] as Exclude<BatchValue, null> | readonly BatchValue[],
+      );
+    }
     if (method === "query") return this.#querySession(handle.session, args, context);
     if (method === "execute") {
       const [sql, params] = args as [string, readonly QueryParameter[] | undefined];
@@ -1467,6 +1607,12 @@ class DatabaseRpcServer {
   }
 
   #closeLiveSet(handleId: string, handle: Extract<Handle, { type: "live-set" }>): void {
+    void this.#keyWatchers.get(handle.set)?.then(
+      (value) => value.close(),
+      () => undefined,
+    );
+    this.#keyWatchers.delete(handle.set);
+    this.#pendingKeyChanges.delete(handle.set);
     handle.set.close();
     for (const subscriptionId of handle.subscriptionIds) this.#handles.delete(subscriptionId);
     this.#handles.delete(handleId);
@@ -1474,6 +1620,7 @@ class DatabaseRpcServer {
 
   async #dispose(): Promise<void> {
     this.#disposed = true;
+    this.#stopKeyChanges();
     this.#connectionAbort.abort(new Error("Database connection was disposed"));
     // A root call — a batch write, a statement, a migration — queued behind this engine's own
     // writers is still answered before the database closes; one that would have to wait for

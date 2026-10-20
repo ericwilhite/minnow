@@ -171,6 +171,14 @@ as two steps. Typed snapshots carry the same
 list, gathered across every delivery the snapshot stands for. It is read from the stored key
 forwards, so a tab that missed every cross-tab notification still reports it on its next sweep.
 
+Query deliveries alone are not a complete key-change feed: a rekey can leave a query's result
+unchanged. Use `await client.onKeyChanges(listener, { onError })` for future rekeys across all
+tables, even without queries. It deduplicates overlapping live sets. The first observing set includes its notices before its
+results in one worker batch; other sets sweep independently. Re-register after reopening the client. Engine-side
+sets offer `await live.subscribeKeyChanges(listener)`; close its returned subscription when done.
+See [keys held in application state](/docs/engine/rekeying#following-keys-held-in-application-state)
+for startup, retention, polling, and synchronous-cache limits.
+
 A typed query asks the engine to compare before anything reaches it. On a relevant commit the
 engine brings the statement's result up to date where the data is, compares it with the rows it
 delivered last, and delivers only when they differ. An adapter that can decode the engine's result

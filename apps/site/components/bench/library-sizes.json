@@ -1,24 +1,24 @@
 {
   "schemaVersion": 1,
   "kind": "library-sizes",
-  "measuredAt": "2026-10-19T18:58:37.211Z",
+  "measuredAt": "2026-10-20T15:31:35.362Z",
   "method": "Each engine's browser entry bundled with esbuild (ESM, minified, production), plus the Wasm and data files it fetches at run time. Gzip is level 9.",
   "engines": [
     {
       "id": "minnow",
       "name": "Minnow",
       "package": "@minnowdb/core",
-      "version": "0.17.1",
+      "version": "0.18.0",
       "note": "The main engine plus its larger durable adapter (OPFS). Plain JavaScript; nothing else to fetch.",
       "assets": [
         {
           "name": "JavaScript (bundled, minified)",
-          "bytes": 1554612,
-          "gzipBytes": 448465
+          "bytes": 1559330,
+          "gzipBytes": 450025
         }
       ],
-      "totalBytes": 1554612,
-      "totalGzipBytes": 448465
+      "totalBytes": 1559330,
+      "totalGzipBytes": 450025
     },
     {
       "id": "sqlite",

@@ -1404,6 +1404,7 @@ export class IndexedDbBlockStore implements BlockStore {
         secondaryIndexes: previousSecondary,
         triggers: previousTriggers,
         view: previousView,
+        foreignKeys: previousForeignKeys,
         ...base
       } = record;
       void _previousFts;
@@ -1449,6 +1450,7 @@ export class IndexedDbBlockStore implements BlockStore {
         }
       }
       const nextView = update.view === undefined ? previousView : update.view;
+      const nextForeignKeys = update.foreignKeys ?? previousForeignKeys;
       const updated: TableRecord = {
         ...base,
         columns: update.columns === undefined ? record.columns : structuredClone(update.columns),
@@ -1462,9 +1464,11 @@ export class IndexedDbBlockStore implements BlockStore {
           ? {}
           : { triggers: structuredClone(nextTriggers) }),
         ...(nextView === null || nextView === undefined ? {} : { view: structuredClone(nextView) }),
+        ...(nextForeignKeys === undefined ? {} : { foreignKeys: structuredClone(nextForeignKeys) }),
         revision: nextRevision,
       };
       asIncomingTableRecord(updated, idKey);
+      await assertTableForeignKeysInTransaction(store, updated);
       await updateCatalogResourceLedger(transaction.objectStore("statistics"), record, updated);
       for (const [indexId, index] of Object.entries(nextSecondary ?? {})) {
         store.put({ tableId: id, indexId }, `${SECONDARY_INDEX_NAME_PREFIX}${index.name}`);

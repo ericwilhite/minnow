@@ -31,26 +31,26 @@ const SQL_ENGINE_MODULES =
 // Each budget is the current measurement plus a little headroom; a change that moves one updates
 // the measurement beside it, and the history lives in git.
 
-// Everything the main entry exports, bundled: the in-thread engine. 1117.4 KiB raw / 334.2 KiB gzip.
-const COMPLETE_ENTRY_RAW_BUDGET = 1118 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 335 * 1024;
-// The engine with the larger durable adapter, OPFS. 1518.2 KiB raw / 438.0 KiB gzip.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1519 * 1024;
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 439 * 1024;
+// Everything the main entry exports, bundled: the in-thread engine. 1122.0 KiB raw / 335.7 KiB gzip.
+const COMPLETE_ENTRY_RAW_BUDGET = 1123 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 336 * 1024;
+// The engine with the larger durable adapter, OPFS. 1522.8 KiB raw / 439.5 KiB gzip.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1524 * 1024;
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 440 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
-// code splitting the way Vite's default iife worker format does. 1512.7 KiB raw / 434.8 KiB gzip.
-const INDEXEDDB_WORKER_RAW_BUDGET = 1513 * 1024;
-const INDEXEDDB_WORKER_GZIP_BUDGET = 435 * 1024;
+// code splitting the way Vite's default iife worker format does. 1519.7 KiB raw / 437.2 KiB gzip.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1520 * 1024;
+const INDEXEDDB_WORKER_GZIP_BUDGET = 438 * 1024;
 // What a page that hosts the engine in a worker ships on the main thread: the client, the schema
 // DSL and error classes, the Kysely dialect and live queries, and the React hooks, with `kysely`
-// and `react` left to the application. 103.5 KiB raw / 30.8 KiB gzip.
-const MAIN_THREAD_RAW_BUDGET = 104 * 1024;
+// and `react` left to the application. 104.1 KiB raw / 30.9 KiB gzip.
+const MAIN_THREAD_RAW_BUDGET = 105 * 1024;
 const MAIN_THREAD_GZIP_BUDGET = 31 * 1024;
 // The schema DSL and the error classes, taken from the main entry. 32.5 KiB raw / 10.3 KiB gzip.
 const SCHEMA_DSL_RAW_BUDGET = 33 * 1024;
 const SCHEMA_DSL_GZIP_BUDGET = 11 * 1024;
-// The standalone live entry. 8.7 KiB gzip.
-const LIVE_ENTRY_GZIP_BUDGET = 9 * 1024;
+// The standalone live entry. 9.0 KiB gzip.
+const LIVE_ENTRY_GZIP_BUDGET = 10 * 1024;
 
 /** A worker-hosted application's main-thread imports: declare, catch, and query. */
 const MAIN_THREAD_APPLICATION = `

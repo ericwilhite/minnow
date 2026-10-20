@@ -8,6 +8,37 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.18.0 — October 20, 2026
+
+Release packages: `@minnowdb/core@0.18.0`.
+
+- `migrate()` creates cyclic references in one call, including enforced cycles. It validates the
+  final reference schema before creating tables, then attaches references after all tables exist.
+  Interrupted migrations resume through the ordinary API. Adding an enforced foreign key now
+  validates existing rows; changing or dropping an existing enforced constraint remains refused.
+  IndexedDB now persists and validates foreign-key updates, matching memory and OPFS stores.
+- `MinnowDatabaseClient.onKeyChanges()` observes future rekeys across every table, independently
+  of query-result delivery, with deduplication across live sets and a polling fallback. Notices
+  precede results in the first observing live set's worker batch; other sets sweep independently. Low-level live sets expose
+  `subscribeKeyChanges()`. Subscriptions end on close or connection loss and must be rebuilt after
+  reopening; earlier rekeys are resolved through the lookup APIs rather than replayed.
+- `mergeKey(table, from, to)` coalesces two known identities atomically, preserving target values,
+  moving references, removing the source, and recording its forward. Root and write-session
+  APIs support it in the engine and worker client. Collisions refuse the whole operation.
+  Ordinary `UPDATE` still refuses an occupied target. A retry through an active source forward
+  to the same existing target is a no-op.
+- `resolveKeys(table, keys)` resolves an ordered batch against one forward generation and uses
+  one worker request. Duplicates and composite-key shapes are preserved.
+
+The engine with OPFS measures 439.5 KiB gzipped (previously 438.0 KiB). The generic worker plus
+its client measures 548.9 KiB gzipped (previously 546.3 KiB); download budgets and comparison
+figures follow these measurements. The core tarball is about 1,004,000 bytes, up from 1,000,105.
+
+No stored format changes: IndexedDB schema 8 and OPFS layout 13 are unchanged. Existing databases
+open normally, and these operations use the existing foreign-key and key-forward records. No
+export/import or data migration is required. Existing APIs keep their signatures; the new
+`mergeKey` member is also required on structural implementations of the write-session interfaces.
+
 ## 0.17.1 — October 19, 2026
 
 Release packages: `@minnowdb/core@0.17.1`, `@minnowdb/devtools@0.3.9`.

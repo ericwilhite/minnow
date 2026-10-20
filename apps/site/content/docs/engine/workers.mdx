@@ -70,6 +70,11 @@ code also makes the worker's lifecycle yours (you decide when it starts and stop
 - **`snapshot()` pins its version in the worker** for the callback's lifetime — session queries
   cross the channel pinned to that version, so a scope observes one consistent state even while
   other tabs commit.
+- **Key notifications cover the whole client.** `await client.onKeyChanges(listener, { onError })`
+  returns an async unsubscribe function. It reports future rekeys without requiring query-result
+  deliveries; re-register after `reopen()`. Use `resolveKeys(table, keys)` for an ordered batch of
+  held keys in one request. `mergeKey(table, from, to)` is available on the client and its write
+  sessions, with the same atomic behavior as the engine. See [rekeying](/docs/engine/rekeying).
 - **`migrate()` takes the same schema DSL** — it's serialized over the wire automatically.
 - **Typed errors survive the trip.** `instanceof UniqueConstraintError` and
   `instanceof UnknownTableError` work on the client, with their fields; stack traces point into

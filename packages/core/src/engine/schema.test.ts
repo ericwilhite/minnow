@@ -1548,7 +1548,7 @@ describe("constraint migration safety", () => {
     store.close();
   });
 
-  it("refuses to add a relation to an existing table", async () => {
+  it("validates and adds a relation to an existing table", async () => {
     const { database, store } = await migrated();
     await expect(
       database.migrate(
@@ -1565,7 +1565,7 @@ describe("constraint migration safety", () => {
           ),
         ]),
       ),
-    ).rejects.toThrow("FOREIGN KEY cannot be added after creation: children.qty");
+    ).resolves.toMatchObject({ alteredTables: ["children"] });
     store.close();
   });
 

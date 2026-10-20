@@ -11,7 +11,8 @@ forms, list selections, queued requests, other tabs — has to keep finding the 
 Minnow handles this with one rule: **a row has one key, its primary key, and you can change it
 with an ordinary `UPDATE`.** The engine moves the row, moves every reference to it in the same
 commit, and remembers the old key so it keeps working for a while. There is no second id column to
-join on and no key map to keep.
+join on. Application state can follow key-change notifications; keys persisted outside Minnow
+resolve through the engine before use.
 
 ## A record made offline
 
@@ -198,6 +199,97 @@ showing the order after the rekey, and the row's `order_id` column tells you the
 await db.resolveKey("orders", -1); // 900001
 await db.resolveKey("receipts", [1, -1]); // a composite key, in primary-key order
 ```
+
+## When the server row already exists
+
+A sync page may bring in the server row before the acknowledgement of an offline insert arrives.
+Once the application knows the two keys name the same record, merge the temporary row into the
+existing server row:
+
+```ts
+await db.mergeKey("orders", -1, 900001);
+// Also available through MinnowDatabaseClient and a write() session.
+```
+
+Both rows must exist, after following any current forwards. The target row keeps its values,
+including columns the application did not read. Every declared reference to the source moves to
+the target, enforced or not. The source disappears and its key forwards to the target for the
+usual retention period. These changes publish in one transaction. References within the target
+row follow too, so a target column referencing the source changes to the target key.
+
+`mergeKey` requires an explicit identity match from the application; it does not infer one from
+row values. A normal `UPDATE` onto an occupied key still throws `UniqueConstraintError`.
+Composite keys use arrays in primary-key order. A missing source or target throws `MissingKeyError`;
+a source that already forwards to the existing target is a no-op, so an acknowledged merge can
+be retried while its forward remains valid. Merging an existing key into itself is also a no-op.
+
+A child whose reference is part of its own primary key rekeys in turn. A child-key collision,
+failed constraint, trigger failure, or cascade that would change the source or target key aborts
+the whole merge. Source and target rows do not fire DELETE or UPDATE triggers for the merge;
+referencing rows use the normal update and rekey paths, including their UPDATE triggers.
+ON DELETE actions do not run. A keyed live result containing both rows reports the source's
+deletion and retains the target, rather than reporting a rekey onto an existing result key.
+
+## Resolving queued keys together
+
+`resolveKeys(table, keys)` returns an array in input order, preserving duplicate inputs. It uses
+one captured forward generation for the whole batch and, through the worker client, one request:
+
+```ts
+await client.resolveKeys("orders", [-1, -2, -1]);
+await client.resolveKeys("receipts", [
+  [1, -1],
+  [1, -2],
+]);
+```
+
+Each result has the same shape and meaning as `resolveKey`: scalar keys remain scalar, composite
+keys remain arrays, and a key without an active forward comes back unchanged. This does not prove
+that a row exists. After retention expires an old key can no longer identify the original row.
+An external outbox must resolve or durably update its held keys within that window, or retain an
+application reconciliation strategy. Keeping outbox references inside Minnow lets rekeying move
+them in the same transaction as the record.
+
+## Following keys held in application state
+
+Subscribe once on the worker client to learn future rekeys across every table:
+
+```ts
+const unsubscribe = await client.onKeyChanges(
+  (changes) => {
+    for (const change of changes) {
+      renameHeldKey(change.table, change.from, change.to);
+    }
+  },
+  { onError: reportError },
+);
+
+// When the screen or owning service closes:
+await unsubscribe();
+```
+
+Await registration before making writes whose notifications you need. Notifications arrive once
+per observed rekey, in order within a sweep, even when no query reads that table, a query's rows
+stay unchanged, or no live queries exist. Several commits can coalesce into one sweep. Overlapping
+live sets are deduplicated. The first live set to observe a rekey sends its notice before any
+query results in that worker message. Other live sets sweep independently and do not repeat the
+notice; use one set for queries that must update together. A listener's exception reaches its
+`onError` without preventing other listeners or query deliveries.
+
+The subscription observes retained durable forwards, with a one-second polling fallback for
+missed hints. It starts with a baseline and does not replay earlier rekeys. Rekeys whose forwards
+expired before observation cannot be recovered from notifications. Swaps and rotations that leave
+keys in use create no forwards and produce no notice; follow query results for those operations.
+Listener handles end on client
+close or connection loss; register them again after `reopen()`. Unsubscribing is idempotent.
+
+A synchronous UI lookup may keep a session map from these notices. That map describes observed
+changes; clear it when its database or table is replaced. It cannot establish the current key for
+an unseen or expired forward. Resolve persisted
+keys asynchronously on startup, and use `resolveKey` or `resolveKeys` when an authoritative lookup
+is needed. Low-level engine users can observe the same future changes with
+`await live.subscribeKeyChanges(listener)` and close the returned subscription, independently of
+query-result delivery.
 
 ## Declaring references
 

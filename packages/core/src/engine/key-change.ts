@@ -20,3 +20,16 @@ export interface KeyChange {
 
 /** One key column's value. */
 export type KeyChangeValue = boolean | number | string | Date | null;
+
+// Worker sets can observe overlapping windows. Keep durable identity off the public payload.
+const identities = new WeakMap<KeyChange, { id: string; expiresAt: number; observedAt: number }>();
+export function identifyKeyChange(
+  change: KeyChange,
+  identity: { id: string; expiresAt: number; observedAt: number },
+): KeyChange {
+  identities.set(change, identity);
+  return change;
+}
+export function keyChangeIdentity(change: KeyChange) {
+  return identities.get(change);
+}

@@ -593,6 +593,20 @@ export class CommittedKeyForwards implements KeyForwardLookup {
     return this.#raw(tableId, token);
   }
 
+  /** A batch reads one immutable generation and evaluates retention at one instant. */
+  atTime(now: number): KeyForwardLookup {
+    const hop = (tableId: string, token: string) => {
+      const forward = this.#raw(tableId, token);
+      return forward !== undefined && forward.expiresAt > now ? forward : undefined;
+    };
+    return {
+      isEmpty: () => this.isEmpty(),
+      hasTable: (tableId) => this.hasTable(tableId),
+      hop,
+      get: (tableId, token) => followForwards(hop, tableId, token),
+    };
+  }
+
   /** How many stored forwards have expired by now; it only grows until the table next changes. */
   expiredCount(): number {
     const now = this.now();

@@ -191,8 +191,9 @@ describe("published core tarball", () => {
       // storage commit-path costs (977,096 measured), 980,000 with the engine's batch-write
       // paths (979,032 measured), 982,000 with TIMESTAMP columns without time zone (981,457
       // measured), 995,000 with packed segments (994,119 measured), and 1,001,000 with the
-      // correctness audit (1,000,105 measured); ratchets, not targets.
-      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_001_000);
+      // correctness audit (1,000,105 measured), then 1,005,000 for offline identity APIs
+      // (about 1,004,000 measured); ratchets, not targets.
+      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_005_000);
       expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_500_000);
       const emitted = await readFile(join(isolatedCore, "dist", "engine", "optimizer.js"), "utf8");
       expect(emitted).not.toContain("/**");

@@ -20,7 +20,9 @@ const { result, version } = await db.write(async (tx) => {
 });
 ```
 
-The callback can mix batch calls with parameterized SQL through `tx.execute(...)`. Kysely maps its
+The callback can mix batch calls with parameterized SQL through `tx.execute(...)` and coalesce
+known duplicate identities with `tx.mergeKey(table, from, to)`. A failed merge that has staged
+changes makes the scope roll back even if the callback catches its error. Kysely maps its
 transaction callback to Minnow's SQL transaction statements; see the
 [Kysely adapter](/docs/adapters/kysely).
 

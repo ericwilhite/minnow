@@ -380,7 +380,7 @@ deterministic steps:
 
 | Step                         | What it does                                                               |
 | ---------------------------- | -------------------------------------------------------------------------- |
-| create table                 | Including its constraints, and after any table it references.              |
+| create table                 | Create missing tables, then attach their references, including cycles.     |
 | add column                   | Nullable, or non-nullable [with a backfill](#backfilling-an-added-column). |
 | rename column                | Through the column's stable ID, so it is not a drop plus an add.           |
 | widen nullability            | NOT NULL to NULL.                                                          |
@@ -391,20 +391,29 @@ deterministic steps:
 | replace a view               | Nothing is stored under a view, so a body change needs no proof.           |
 | drop a column or table       | Only [with your say-so](#dropping-things).                                 |
 
+References are checked against the final declared schema before table creation, so declaration
+order and mutual references work in one call, including enforced cycles. Tables are created
+before references are attached. A migration interrupted between those steps can leave tables
+without some references; rerun the same migration before exposing the database to application
+writes. On retry, attaching an enforced reference validates any rows already present. Invalid
+rows refuse the attachment without changing the data. Each attachment checks the catalog and
+data versions it validated before publishing.
+
 - **Each step is all or nothing**, and running the same migration again is safe. If a migration is
   interrupted, the next run completes what remains.
 - **Concurrent migrators can't interleave** — the loser fails with a typed conflict.
-- **DDL shares the statement executor.** Creating, replacing, and dropping schema objects uses
-  the same engine statements as SQL DDL. A table's metadata-only column edits stay grouped into
+- **DDL shares catalog validation.** Migration and SQL DDL use the same table and reference
+  validation. Creating all tables before attaching references also allows cycles. A table's metadata-only column edits stay grouped into
   one catalog compare-and-swap, preserving one write per changed table instead of parsing and
   committing a separate `ALTER TABLE` for every column.
 - **Nothing is rewritten.** Not one stored byte changes: a column added later is answered at read
   time, and folding it into the blocks is
   [compaction](/docs/storage/maintenance#compaction)'s job, on its own schedule.
 
-Column storage types, SQL domains, primary-key membership/order, enforced foreign keys, checks,
+Column storage types, SQL domains, primary-key membership/order, existing enforced foreign keys, checks,
 and frozen backfills cannot be changed in place. `migrate()` rejects those changes because a
-catalog-only edit cannot prove or preserve their meaning. Informational foreign keys are metadata
+catalog-only edit cannot preserve their meaning. New enforced foreign keys may be added after
+validating existing rows; a missing parent refuses the attachment. Informational foreign keys are metadata
 and may change; enum restrictions are the other exception, with sets that may widen but never
 narrow. A matching ordinary column may also adopt or drop a stored generated expression under the
 proof below. Secondary indexes, triggers, named enum-type objects, and sequences remain SQL/Kysely
@@ -477,12 +486,13 @@ Rejected outright, rather than attempted:
 - unique-key changes
 - non-nullable column additions **without a backfill**
 - removing enum values, or tightening a string column into an enum
-- adding, changing, or dropping an enforced FOREIGN KEY or CHECK on an existing table
+- changing or dropping an enforced FOREIGN KEY on an existing table
+- adding, changing, or dropping a CHECK on an existing table
 
-Type and identity changes need a deliberate table replacement. A new or changed constraint also
-needs proof about existing rows, and there is no validation scan. Declare constraints when you
-create the table, or create a new table and copy deliberately. Views are the exception — they hold
-no rows, so replacing one needs no proof.
+Type and identity changes need a deliberate table replacement. A new enforced foreign key is
+validated against existing rows before attachment; CHECK additions and changes to existing
+enforced constraints still require a deliberate replacement. Views hold no rows, so replacing
+one needs no data validation.
 
 If you need one of those, that's a new table plus a deliberate application-level copy.
 
