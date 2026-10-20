@@ -30,6 +30,32 @@ function controller(
 }
 afterEach(() => vi.useRealTimers());
 
+it("collects every 64 commits and collects a shorter tail after the idle minute", async () => {
+  vi.useFakeTimers();
+  const { collection, run } = controller();
+  collection.start();
+  try {
+    for (let commit = 0; commit < 64; commit++) collection.committed();
+    await collection.drain();
+    expect(run).toHaveBeenCalledTimes(1);
+
+    // Becoming idle does not itself start another pass. Up to 63 later commits can remain
+    // above the last pass's retained history until the commit interval or idle timer fires.
+    for (let commit = 0; commit < 63; commit++) collection.committed();
+    await collection.drain();
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(collection.status().pendingCommitDebt).toBe(63);
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(run).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await collection.drain();
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(collection.status().pendingCommitDebt).toBe(0);
+  } finally {
+    collection.stop();
+  }
+});
+
 it("coalesces triggers during a run and drains the continuation before disposal", async () => {
   const first = deferred<{ moreWork: boolean; reclaimed: boolean }>();
   const yielding = deferred<undefined>();

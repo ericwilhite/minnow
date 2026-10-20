@@ -668,43 +668,61 @@ describe("delta merge", () => {
     await database.close();
   });
 
-  it("folds a quiet table's deltas into its partitions, but not a trickle", async () => {
-    const store = new MemoryBlockStore();
-    const database = new MinnowDatabase(store, { rowsPerBlock: 256 });
-    const shadow = await seed(database);
-    const levelZero = async (): Promise<number> =>
-      (await visibleRecords(database, store)).filter((segment) => segment.level === 0).length;
-    const quiet = async (): Promise<void> => {
-      for (let attempt = 0; attempt < 200; attempt += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 25));
-        const active = (await database.listCompactionJobs()).some(
-          (job) => job.state === "planned" || job.state === "running" || job.state === "ready",
-        );
-        if (!active && attempt > 8) return;
+  it.each([0, 30])(
+    "folds a quiet table's deltas into its partitions, but not a trickle (pause %i ms)",
+    async (pauseMs) => {
+      const store = new MemoryBlockStore();
+      const database = new MinnowDatabase(store, { rowsPerBlock: 256 });
+      const shadow = await seed(database);
+      const levelZero = async (): Promise<number> =>
+        (await visibleRecords(database, store)).filter((segment) => segment.level === 0).length;
+      const quiet = async (expectedLevelZero: number): Promise<void> => {
+        let settled = 0;
+        for (let attempt = 0; attempt < 200; attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          const active = (await database.listCompactionJobs()).some(
+            (job) => job.state === "planned" || job.state === "running" || job.state === "ready",
+          );
+          // Planning precedes the durable job record. Absence of a job alone can look idle
+          // while a loaded runner is still planning the fold; require its resulting layout too.
+          settled = !active && (await levelZero()) === expectedLevelZero ? settled + 1 : 0;
+          if (settled >= 10) return;
+        }
+        throw new Error("Maintenance did not go quiet");
+      };
+      // Keep this first burst below the 256-row idle-fold threshold even if a busy runner pauses
+      // between commits. It must merge before the final atomic write makes the idle fold due.
+      for (let id = 1; id <= 32; id += 1) {
+        if (pauseMs > 0) await new Promise((resolve) => setTimeout(resolve, pauseMs));
+        await database.execute("UPDATE items SET amount = amount + 1 WHERE id = ?", [id]);
+        const row = shadow.get(id);
+        if (row !== undefined) row.amount += 1;
       }
-      throw new Error("Maintenance did not go quiet");
-    };
-    // A burst of three hundred rows: merged while it runs, folded once it stops.
-    for (let id = 1; id <= 300; id += 1) {
-      await database.execute("UPDATE items SET amount = amount + 1 WHERE id = ?", [id]);
-      const row = shadow.get(id);
-      if (row !== undefined) row.amount += 1;
-    }
-    await quiet();
-    expect(await levelZero()).toBe(0);
-    expect((await deltaJobs(database)).length).toBeGreaterThan(0);
-    await expectShadow(database, shadow);
-    // A few rows are not worth a fold: they wait for more writes.
-    for (let id = 1; id <= 5; id += 1) {
-      await database.execute("UPDATE items SET label = 'trickle' WHERE id = ?", [id]);
-      const row = shadow.get(id);
-      if (row !== undefined) row.label = "trickle";
-    }
-    await quiet();
-    expect(await levelZero()).toBe(5);
-    await expectShadow(database, shadow);
-    await database.close();
-  });
+      await quiet(1);
+      expect((await deltaJobs(database)).length).toBeGreaterThan(0);
+      // Single-row commits after an early idle fold would leave a valid sub-threshold trickle.
+      // Publish the remaining rows together so this test can require a completely folded tail.
+      await database.execute("UPDATE items SET amount = amount + 1 WHERE id BETWEEN 33 AND 300");
+      for (let id = 33; id <= 300; id += 1) {
+        const row = shadow.get(id);
+        if (row !== undefined) row.amount += 1;
+      }
+      await quiet(0);
+      expect(await levelZero()).toBe(0);
+      expect((await deltaJobs(database)).length).toBeGreaterThan(0);
+      await expectShadow(database, shadow);
+      // A few rows are not worth a fold: they wait for more writes.
+      for (let id = 1; id <= 5; id += 1) {
+        await database.execute("UPDATE items SET label = 'trickle' WHERE id = ?", [id]);
+        const row = shadow.get(id);
+        if (row !== undefined) row.label = "trickle";
+      }
+      await quiet(5);
+      expect(await levelZero()).toBe(5);
+      await expectShadow(database, shadow);
+      await database.close();
+    },
+  );
 
   it("is not a change to a live query whose window spans it", async () => {
     const store = new MemoryBlockStore();

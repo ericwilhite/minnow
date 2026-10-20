@@ -605,9 +605,10 @@ describe("background maintenance", () => {
     // not one segment per write.
     expect(folded.visibleSegments).toBeLessThanOrEqual(33);
     expect(folded.liveBlocks).toBeLessThanOrEqual(fresh.liveBlocks);
-    // Right after the burst the last sixty-four versions are still readable, and they are
-    // pre-fold versions that root the burst's blocks: bounded, but not yet small.
-    expect(folded.unprunedManifests).toBeLessThanOrEqual(64 + 2);
+    // A pass retains sixty-four versions. Collection runs every sixty-four commits, so a
+    // sub-threshold tail after its snapshot can remain too, until the next pass or idle minute.
+    // Whether the last fold finishes before that tail depends on foreground/background timing.
+    expect(folded.unprunedManifests).toBeLessThanOrEqual(64 + 63 + 2);
 
     await quietMinute(database, reference, clock);
     await settle(store, database);
