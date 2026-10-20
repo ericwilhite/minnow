@@ -271,25 +271,48 @@ it("does not let the previous initialization failure poison a reopened transport
 it("reports a lost mutation reply as unknown and never replays its committed write", async () => {
   const boundary = createBoundary();
   let drop = false;
+  let replyProduced!: () => void;
+  const lostReply = new Promise<void>((resolve) => {
+    replyProduced = resolve;
+  });
   const original = boundary.workerSide.postMessage.bind(boundary.workerSide);
   boundary.workerSide.postMessage = (message, options) => {
     if (!drop) original(message, options);
+    else if (parseRpcResponse(message)?.kind === "rpc-result") replyProduced();
+  };
+  let insertCalls = 0;
+  const post = boundary.clientSide.postMessage.bind(boundary.clientSide);
+  boundary.clientSide.postMessage = (message, options) => {
+    if ((message as { method?: string }).method === "insertBatch") insertCalls++;
+    post(message, options);
   };
   const database = new MinnowDatabase(new MemoryBlockStore(), {
     autoCollect: false,
     autoCompact: false,
   });
   exposeDatabase(database, boundary.workerSide);
+  vi.useFakeTimers();
   const client = new MinnowDatabaseClient(boundary.clientSide, { requestTimeoutMs: 100 });
-  await client.ready();
-  await client.execute("CREATE TABLE sales(id INTEGER PRIMARY KEY)");
-  drop = true;
-  await expect(client.insertBatch("sales", [{ id: 7 }])).rejects.toBeInstanceOf(
-    DatabaseWorkerOutcomeUnknownError,
-  );
-  expect((await database.query("SELECT * FROM sales")).rows).toEqual([{ id: 7 }]);
-  await expect(client.close()).resolves.toBeUndefined();
-  await database.close();
+  try {
+    await client.ready();
+    await client.execute("CREATE TABLE sales(id INTEGER PRIMARY KEY)");
+    drop = true;
+    const unknown = expect(client.insertBatch("sales", [{ id: 7 }])).rejects.toBeInstanceOf(
+      DatabaseWorkerOutcomeUnknownError,
+    );
+    // The worker must commit and produce its reply before we lose it. A real 100 ms deadline
+    // could expire before commit on a busy runner, which tests a different unknown outcome.
+    await lostReply;
+    expect((await database.query("SELECT * FROM sales")).rows).toEqual([{ id: 7 }]);
+    await vi.advanceTimersByTimeAsync(100);
+    await unknown;
+    expect(insertCalls).toBe(1);
+    expect((await database.query("SELECT * FROM sales")).rows).toEqual([{ id: 7 }]);
+  } finally {
+    vi.useRealTimers();
+    await client.close();
+    await database.close();
+  }
 });
 
 it("orders parallel worker scope calls and keeps an empty worker snapshot stable", async () => {
