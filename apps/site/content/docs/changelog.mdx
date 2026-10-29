@@ -8,6 +8,44 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.18.1 — October 29, 2026
+
+Release packages: `@minnowdb/core@0.18.1`.
+
+- Grouped live queries now patch only the groups a commit touched. Every group's output row stays
+  in `ORDER BY` order, and a commit evaluates `HAVING` and the select list for its touched groups
+  and moves those rows. Before, every commit evaluated and sorted all groups, so a maintained
+  `GROUP BY` cost about as much as running it again. Measured on the memory store with a one-row
+  insert into a 200,000-row table:
+
+  | Statement over 100,000 groups                   | 0.18.0   | 0.18.1  |
+  | ----------------------------------------------- | -------- | ------- |
+  | `GROUP BY g ORDER BY g LIMIT 20`                | 100.7 ms | 1.0 ms  |
+  | `… HAVING … ORDER BY SUM(…) DESC, g LIMIT 10`   | 135.7 ms | 1.1 ms  |
+  | `GROUP BY g` with no `LIMIT` (delivers 100,000) | 111.3 ms | 18.9 ms |
+
+  Results are unchanged, including the order of tied rows. A commit that touches more than an
+  eighth of the groups sorts them all again, as do `WITH TIES`, statement datetimes, and a
+  parameter-bound `LIMIT` or `OFFSET`. Aggregate maintenance also retains one output row per
+  group, which `stats.retainedBytes` counts.
+
+- `@minnowdb/core/testing`: `InteractionRunResult.reached` lists the states a plan entered, such
+  as an `UPDATE` that matched rows or a fault after which the write landed.
+  `INTERACTION_REACH_STATES` and `InteractionReachState` name them. Both are additions; nothing
+  existing changed.
+- Testing: every fast-check property now takes a recorded seed and is explored by `npm run soak`.
+  The live-query oracles now check every delivery's `retained` map and rebuild each subscription
+  from its patches. Generated campaigns fail when their seeds stop reaching the states their
+  checks depend on, and a work-bound suite holds maintained live queries to the same work at 1,000
+  and 50,000 rows. See [Testing](/docs/reference/testing).
+
+The engine with OPFS measures 440.7 KiB gzipped (previously 439.5 KiB). The generic worker plus
+its client measures 550.1 KiB gzipped (previously 548.9 KiB); download budgets and comparison
+figures follow these measurements. The core tarball is 1,006,355 bytes, up from about 1,004,000.
+
+No stored format changes: IndexedDB schema 8 and OPFS layout 13 are unchanged, and 0.18.0 opens
+every database this release writes. No data migration or export/import step is needed.
+
 ## 0.18.0 — October 20, 2026
 
 Release packages: `@minnowdb/core@0.18.0`.
