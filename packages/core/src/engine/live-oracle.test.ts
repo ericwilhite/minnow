@@ -9,10 +9,19 @@
  * predicate updates and deletes, upserts, rekeys of both tables, FK cascades, write scopes,
  * compaction, and ADD/DROP COLUMN on the watched table.
  *
+ * Every delivery also passes through a publication ledger, which holds its `retained` map to the
+ * rows it claims to keep, and a second subscriber per shape rebuilds its rows from
+ * `subscribePatches` alone; both must agree with the fresh execution after every commit. A
+ * declared reach fails the campaign when its seeds stop producing patched, moved, shrunk, or
+ * rekeyed deliveries.
+ *
  * `MINNOW_SEED=<n>` replays one seed; `MINNOW_ORACLE_STEPS` widens a run.
  */
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { MemoryBlockStore } from "../storage/index.js";
+import { LivePatchReplica, LivePublicationLedger } from "../testing/live-publication.js";
+import type { LivePublicationState } from "../testing/live-publication.js";
+import { createReach, type Reach } from "../testing/reach.js";
 import { mulberry32, seedsFor } from "../testing/seeds.js";
 import { MinnowDatabase } from "./database.js";
 import type { LiveQueryInput, LiveQuerySubscription } from "./live.js";
@@ -115,12 +124,31 @@ interface Tracked {
   sql: string;
   params: readonly unknown[];
   latest?: QueryResult;
+  ledger: LivePublicationLedger;
+  replica: LivePatchReplica;
   deliveries: number;
   errors: unknown[];
   sub?: LiveQuerySubscription;
 }
 
-async function runStream(seed: number, steps: number, incremental: boolean): Promise<string[]> {
+/** Re-running never patches, so with maintenance off only a fresh run and key changes are owed. */
+const DECLARED = {
+  on: ["patched", "moved", "replaced", "shrunk", "rerun", "keyChanges"],
+  off: ["rerun", "keyChanges"],
+} as const satisfies Record<string, readonly LivePublicationState[]>;
+const reach = {
+  on: createReach<LivePublicationState>("live-oracle incremental", DECLARED.on),
+  off: createReach<LivePublicationState>("live-oracle re-run", DECLARED.off),
+};
+
+async function runStream(
+  seed: number,
+  steps: number,
+  incremental: boolean,
+  declared: Reach<LivePublicationState>,
+  owed: readonly LivePublicationState[],
+): Promise<string[]> {
+  declared.beginHistory();
   const r = mulberry32(seed);
   const store = new MemoryBlockStore();
   const db = new MinnowDatabase(store, { rowsPerBlock: 8 });
@@ -159,9 +187,14 @@ async function runStream(seed: number, steps: number, incremental: boolean): Pro
     const retiredC = new Set<number>();
     let hasFlag = false;
 
+    const observe = (state: LivePublicationState): void => {
+      if (owed.includes(state)) declared.reach(state);
+    };
     const tracked: Tracked[] = SHAPES.map((s) => ({
       name: s.name,
       input: s.input,
+      ledger: new LivePublicationLedger(s.name, observe),
+      replica: new LivePatchReplica(s.name),
       deliveries: 0,
       errors: [],
       sql: typeof s.input === "string" ? s.input : s.input.kind === "sql-query" ? s.input.sql : "",
@@ -169,10 +202,15 @@ async function runStream(seed: number, steps: number, incremental: boolean): Pro
     }));
     for (const t of tracked) {
       t.sub = await live.subscribe(t.input, {
-        onChange: (result) => {
+        onChange: (result, delivery) => {
           t.latest = result;
           t.deliveries += 1;
+          t.ledger.change(result, delivery);
         },
+        onError: (error) => t.errors.push(error),
+      });
+      await live.subscribePatches(t.input, {
+        onPatch: t.replica.apply,
         onError: (error) => t.errors.push(error),
       });
     }
@@ -321,12 +359,22 @@ async function runStream(seed: number, steps: number, incremental: boolean): Pro
           );
           t.errors.length = 0;
         }
+        const at = `seed ${String(seed)} incremental=${String(incremental)} step ${String(step)} (${label}) ${t.name} [${t.sql}]`;
         if (canon(t.latest) !== now) {
           problems.push(
-            `seed ${String(seed)} incremental=${String(incremental)} step ${String(step)} (${label}) ${t.name} [${t.sql}]:\n` +
-              `   live =${canon(t.latest)}\n   fresh=${now}\n   prev =${was ?? ""}`,
+            `${at}:\n   live =${canon(t.latest)}\n   fresh=${now}\n   prev =${was ?? ""}`,
           );
         }
+        const rebuilt = JSON.stringify(t.replica.rows() ?? null);
+        const freshRows = JSON.stringify((JSON.parse(now) as { rows: unknown }).rows);
+        if (rebuilt !== freshRows) {
+          problems.push(`${at}: rebuilt from patches\n   patch=${rebuilt}\n   fresh=${freshRows}`);
+        }
+        for (const violation of [...t.ledger.violations, ...t.replica.violations]) {
+          problems.push(`${at}: ${violation}`);
+        }
+        t.ledger.violations.length = 0;
+        t.replica.violations.length = 0;
       }
     }
     for (const t of tracked) t.sub?.close();
@@ -341,11 +389,15 @@ async function runStream(seed: number, steps: number, incremental: boolean): Pro
 const STEPS = Number(process.env.MINNOW_ORACLE_STEPS ?? 50);
 
 describe("live results equal re-execution after every commit", () => {
+  afterAll(() => {
+    reach.on.assertReached();
+    reach.off.assertReached();
+  });
   it.each(seedsFor("live-oracle", [0x11fe, 0x2a9d]))(
     "with incremental maintenance on and off (seed %s)",
     async (seed) => {
-      expect(await runStream(seed, STEPS, true)).toEqual([]);
-      expect(await runStream(seed, STEPS, false)).toEqual([]);
+      expect(await runStream(seed, STEPS, true, reach.on, DECLARED.on)).toEqual([]);
+      expect(await runStream(seed, STEPS, false, reach.off, DECLARED.off)).toEqual([]);
     },
   );
 });

@@ -7,13 +7,33 @@
  * must land exactly where running the statement again would. This property runs every kind of
  * write the engine has -- keyed and predicate writes, upserts, rekeys, transactions that commit
  * or roll back, writes from a second connection, compaction, collection, and index builds --
- * and after each one compares every subscription's latest delivery with a fresh query.
+ * and after each one compares every subscription with a fresh query.
+ *
+ * Each statement has two subscribers. One records every `onChange` in a publication ledger,
+ * which holds each delivery's `retained` map to the rows it claims to keep. The other rebuilds
+ * its rows from `subscribePatches` alone, the way a worker-hosted consumer must. After each write
+ * the ledger's latest rows, the rebuilt rows, and the fresh query must agree. The same property
+ * runs in process, with incremental maintenance on and off, and across a worker boundary, where
+ * the patches are the frames the worker posts. A declared reach fails the campaign when its
+ * histories stop producing patched, moved, shrunk, or rekeyed deliveries, so the comparison
+ * cannot quietly degrade into checking full re-runs only.
+ *
+ * `MINNOW_SEED=<n>` replays one seed; `MINNOW_LIVE_RUNS` widens each seed's run.
  */
 import fc from "fast-check";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { MemoryBlockStore } from "../storage/memory.js";
+import { LivePatchReplica, LivePublicationLedger } from "../testing/live-publication.js";
+import type { LivePublicationState } from "../testing/live-publication.js";
+import { createReach } from "../testing/reach.js";
+import { seedsFor } from "../testing/seeds.js";
+import { createBoundary } from "./client-audit-harness.js";
+import { MinnowDatabaseClient } from "./client.js";
 import { MinnowDatabase } from "./database.js";
+import type { LiveQueryDelivery } from "./live.js";
+import type { LiveQueryPatch } from "./live-patch.js";
 import { heavyTestTimeout } from "./storage-test-helpers.js";
+import { exposeDatabase } from "./worker-server.js";
 import type { QueryResult } from "./query.js";
 
 vi.setConfig({ testTimeout: heavyTestTimeout(120_000) });
@@ -164,8 +184,28 @@ function sqlOf(entry: Write): string[] {
 }
 
 /** Runs one write; refusals the engine documents (duplicates, retired keys) are expected. */
+/** What a write needs from the connection it runs on, in process or across the worker boundary. */
+interface Writer {
+  execute(sql: string): Promise<unknown>;
+  compactTable(table: string): Promise<unknown>;
+}
+
+/** The live query set either connection kind hands out. */
+interface LiveSet {
+  subscribe(
+    sql: string,
+    options: { onChange(result: QueryResult, delivery: LiveQueryDelivery): void },
+  ): Promise<unknown>;
+  subscribePatches(
+    sql: string,
+    options: { onPatch(patch: LiveQueryPatch): void },
+  ): Promise<unknown>;
+  refresh(): Promise<unknown>;
+  close(): unknown;
+}
+
 async function apply(
-  database: MinnowDatabase,
+  database: Writer,
   other: MinnowDatabase,
   entry: Write,
   indexed: { done: boolean },
@@ -216,12 +256,56 @@ async function apply(
   }
 }
 
-async function check(writes: readonly Write[], incremental: boolean): Promise<void> {
+type Mode = "incremental" | "re-run" | "worker";
+
+/**
+ * The states each mode's laws depend on. Re-running never patches, so it declares only that a
+ * later delivery ran again; the worker path always maintains incrementally and posts patches.
+ */
+const DECLARED: Record<Mode, readonly LivePublicationState[]> = {
+  incremental: ["patched", "moved", "replaced", "shrunk", "rerun", "keyChanges"],
+  "re-run": ["rerun", "keyChanges"],
+  worker: ["patched", "moved", "replaced", "shrunk", "rerun", "keyChanges"],
+};
+
+interface Opened {
+  writer: Writer;
+  live: LiveSet;
+  close(): Promise<void>;
+}
+
+/** The connection the subscriptions live on: the database itself, or a client across a boundary. */
+async function open(database: MinnowDatabase, mode: Mode): Promise<Opened> {
+  if (mode !== "worker") {
+    const live = database.liveQueries({ incremental: mode === "incremental" });
+    return { writer: database, live, close: () => Promise.resolve(live.close()) };
+  }
+  const boundary = createBoundary();
+  exposeDatabase(database, boundary.workerSide);
+  const client = new MinnowDatabaseClient(boundary.clientSide);
+  await client.ready();
+  const live = client.liveQueries();
+  return {
+    writer: client,
+    live,
+    close: async () => {
+      await live.close();
+      await client.close();
+    },
+  };
+}
+
+async function check(
+  writes: readonly Write[],
+  mode: Mode,
+  reach: ReturnType<typeof createReach<LivePublicationState>>,
+): Promise<void> {
+  reach.beginHistory();
   const store = new MemoryBlockStore();
   const options = { autoCompact: false, autoCollect: false, rowsPerBlock: 4 } as const;
   const database = new MinnowDatabase(store, options);
   const other = new MinnowDatabase(store, options);
-  const live = database.liveQueries({ incremental });
+  let opened: Opened | undefined;
   try {
     await database.execute(
       "CREATE TABLE a (id INTEGER PRIMARY KEY, g TEXT, x INTEGER, p INTEGER REFERENCES a (id) NOT ENFORCED)",
@@ -233,39 +317,56 @@ async function check(writes: readonly Write[], incremental: boolean): Promise<vo
       "INSERT INTO a VALUES (1, 'k', 5, NULL), (2, 'm', 12, 1), (3, 'k', -3, 2), (4, 'q', 20, 3)",
     );
     await database.execute("INSERT INTO b VALUES (1, 1, 1), (2, 3, -1), (3, 3, 4)");
-    const latest = new Map<string, QueryResult>();
-    for (const sql of STATEMENTS) {
-      await live.subscribe(sql, { onChange: (result) => latest.set(sql, result) });
+    opened = await open(database, mode);
+    const subscribers = STATEMENTS.map((sql) => ({
+      sql,
+      ledger: new LivePublicationLedger(`${mode} ${sql}`, (state) => {
+        if (DECLARED[mode].includes(state)) reach.reach(state);
+      }),
+      replica: new LivePatchReplica(`${mode} ${sql}`),
+    }));
+    for (const { sql, ledger, replica } of subscribers) {
+      await opened.live.subscribe(sql, { onChange: ledger.change });
+      await opened.live.subscribePatches(sql, { onPatch: replica.apply });
     }
     const indexed = { done: false };
     for (const [step, entry] of writes.entries()) {
-      await apply(database, other, entry, indexed);
-      await live.refresh();
-      for (const sql of STATEMENTS) {
+      await apply(opened.writer, other, entry, indexed);
+      await opened.live.refresh();
+      for (const { sql, ledger, replica } of subscribers) {
+        const at = `${mode}: ${sql} after step ${String(step)}: ${JSON.stringify(entry)}`;
         const fresh = await database.query(sql, { memoize: false });
-        expect(
-          latest.get(sql)?.rows,
-          `${sql} after step ${String(step)}: ${JSON.stringify(entry)}`,
-        ).toEqual(fresh.rows);
+        expect(ledger.violations, at).toEqual([]);
+        expect(replica.violations, at).toEqual([]);
+        expect(ledger.latest()?.rows, at).toEqual(fresh.rows);
+        expect(replica.rows(), `${at} (rebuilt from patches)`).toEqual(fresh.rows);
       }
     }
   } finally {
-    live.close();
+    await opened?.close();
     await database.close();
     await other.close();
     store.close();
   }
 }
 
+const RUNS = Number(process.env.MINNOW_LIVE_RUNS ?? 12);
+
 describe("live results against fresh execution", () => {
-  it.each([true, false])("agree after every write (incremental=%s)", async (incremental) => {
-    await fc.assert(
-      fc.asyncProperty(fc.array(write, { minLength: 10, maxLength: 30 }), (writes) =>
-        check(writes, incremental),
-      ),
-      {
-        seed: Number(process.env.MINNOW_SEED ?? 0x11fe),
-        numRuns: Number(process.env.MINNOW_LIVE_RUNS ?? 12),
+  describe.each(["incremental", "re-run", "worker"] as const)("%s", (mode) => {
+    const reach = createReach(`live-differential ${mode}`, DECLARED[mode]);
+    afterAll(() => {
+      reach.assertReached();
+    });
+    it.each(seedsFor("live-differential", [0x11fe]))(
+      "every delivery, patch, and final result agree (seed %i)",
+      async (seed) => {
+        await fc.assert(
+          fc.asyncProperty(fc.array(write, { minLength: 10, maxLength: 30 }), (writes) =>
+            check(writes, mode, reach),
+          ),
+          { seed, numRuns: RUNS },
+        );
       },
     );
   });

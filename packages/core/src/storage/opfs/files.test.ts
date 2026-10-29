@@ -9,6 +9,10 @@ import {
   MAX_OPFS_PATH_SEGMENTS,
   OpfsTree,
 } from "./files.js";
+import { seedsFor } from "../../testing/seeds.js";
+
+/** Seeds for this file's generated properties; `npm run soak` explores others. */
+const SEEDS = seedsFor("opfs-segment-names", [0x5e9]);
 
 async function collect<T>(items: AsyncIterable<T>): Promise<T[]> {
   const values: T[] = [];
@@ -27,7 +31,7 @@ describe("segment encoding", () => {
     expect(encodeSegment("100%")).toBe("100%25");
   });
 
-  it("round-trips arbitrary segments, including the odd ones", () => {
+  it.each(SEEDS)("round-trips arbitrary segments, including the odd ones (seed %i)", (seed) => {
     fc.assert(
       fc.property(fc.string({ unit: "grapheme" }), (segment) => {
         const encoded = encodeSegment(segment);
@@ -37,6 +41,7 @@ describe("segment encoding", () => {
         expect(encoded.includes("/")).toBe(false);
         expect(encoded === "." || encoded === "..").toBe(false);
       }),
+      { seed },
     );
   });
 

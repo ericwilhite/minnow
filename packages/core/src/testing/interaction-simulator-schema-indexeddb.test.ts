@@ -5,7 +5,7 @@
  * same there. Replay a seed with MINNOW_SEED (it then runs in the main schema file).
  */
 import { IDBFactory } from "fake-indexeddb";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { IndexedDbBlockStore } from "../storage/index.js";
 import { heavyTestTimeout } from "../engine/storage-test-helpers.js";
 import {
@@ -13,10 +13,31 @@ import {
   generateInteractionPlan,
   runInteractionPlan,
   type DriverStoreSource,
+  type InteractionReachState,
 } from "./interaction-simulator.js";
+import { createReach } from "./reach.js";
 import { seedsFor } from "./seeds.js";
 
 vi.setConfig({ testTimeout: heavyTestTimeout(120_000) });
+
+/**
+ * The states this campaign's seeds must reach on every store: the base campaign's, refused unique
+ * values, schema changes on populated tables, and lookups the secondary index answered.
+ */
+const DECLARED_REACH = [
+  "update-matched",
+  "delete-matched",
+  "write-refused",
+  "limit-truncated",
+  "rollback-discarded",
+  "concurrent-read",
+  "fault-landed",
+  "fault-discarded",
+  "reopen-with-rows",
+  "unique-refused",
+  "alter-populated",
+  "index-lookup-rows",
+] as const satisfies readonly InteractionReachState[];
 
 /** A separate adapter instance per connection over one database, as separate tabs do. */
 function indexedDbSource(): DriverStoreSource {
@@ -34,6 +55,13 @@ describe("interaction simulator with constraints and schema changes over 'indexe
     it.skip("has no odd-indexed seed when MINNOW_SEED picks one", () => undefined);
     return;
   }
+  const reach = createReach(
+    "interaction-simulator-schema over indexeddb (odd seeds)",
+    DECLARED_REACH,
+  );
+  afterAll(() => {
+    reach.assertReached();
+  });
   it.each(oddSeeds)("seed %i", async (seed) => {
     const store = indexedDbSource();
     try {
@@ -60,6 +88,7 @@ describe("interaction simulator with constraints and schema changes over 'indexe
       expect(result.burstCommits).toBeGreaterThanOrEqual(30);
       // The lookups are shaped for the secondary-index path; some must have taken it.
       expect(result.indexPathQueries).toBeGreaterThan(0);
+      reach.recordHistory(result.reached);
     } finally {
       if (typeof store !== "function") store.close();
     }

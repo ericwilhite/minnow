@@ -531,6 +531,7 @@ export {
 } from "./simulator.js";
 
 export {
+  INTERACTION_REACH_STATES,
   InteractionFailure,
   createDatabaseDriver,
   evaluate as evaluatePlanPredicate,
@@ -548,6 +549,7 @@ export {
   type Interaction,
   type InteractionPlan,
   type InteractionPlanOptions,
+  type InteractionReachState,
   type InteractionRunOptions,
   type InteractionRunResult,
   type KeyAssignment,

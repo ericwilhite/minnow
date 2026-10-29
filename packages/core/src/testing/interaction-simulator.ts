@@ -466,6 +466,48 @@ export interface InteractionRunOptions {
   readonly traceLength?: number;
 }
 
+/**
+ * States the properties depend on. Operation counts show that a family ran; these show it ran
+ * where its law bites: an UPDATE that matched rows, a fault on a write that changed something, a
+ * LIMIT that cut rows off. A run reports the ones it entered, and a campaign declares the ones
+ * its seeds must reach (testing/reach.ts), so a generator change that stops producing them fails
+ * instead of leaving the property green and idle.
+ */
+export const INTERACTION_REACH_STATES = [
+  /** An accepted UPDATE the model matched at least one row for. */
+  "update-matched",
+  /** An accepted DELETE the model matched at least one row for. */
+  "delete-matched",
+  /** An INSERT, UPDATE, or DELETE the model refused, judged for atomicity. */
+  "write-refused",
+  /** A SELECT whose LIMIT returned fewer rows than matched. */
+  "limit-truncated",
+  /** A ROLLBACK that discarded rows the transaction had changed. */
+  "rollback-discarded",
+  /** A concurrent round whose reads overlapped its writes. */
+  "concurrent-read",
+  /** An injected fault on a write that changed rows, after which the write had landed. */
+  "fault-landed",
+  /** An injected fault on a write that changed rows, after which the write had not landed. */
+  "fault-discarded",
+  /** A reopen of a database holding rows. */
+  "reopen-with-rows",
+  /** A rekey that moved at least one row. */
+  "rekey-moved",
+  /** A rekey refused onto a taken, repeated, or retired key. */
+  "rekey-refused",
+  /** A retired key read back on another connection. */
+  "retired-key-read",
+  /** An upsert refused on a unique value its conflict target does not cover. */
+  "unique-refused",
+  /** An accepted ADD or DROP COLUMN on a table holding rows. */
+  "alter-populated",
+  /** An index-shaped lookup, planned through a secondary index, that returned rows. */
+  "index-lookup-rows",
+] as const;
+
+export type InteractionReachState = (typeof INTERACTION_REACH_STATES)[number];
+
 export interface InteractionRunResult {
   readonly seed: number;
   /** Interactions judged. Short of the plan's length only when `transientsAccepted` is not zero. */
@@ -495,6 +537,8 @@ export interface InteractionRunResult {
   readonly indexPathQueries: number;
   /** Single-row commits that write bursts attempted. */
   readonly burstCommits: number;
+  /** The reach states this run entered, in declaration order. */
+  readonly reached: readonly InteractionReachState[];
   /** The most visible segments any table held at the end of a burst. */
   readonly peakBurstSegments: number;
   /**
@@ -3144,6 +3188,7 @@ class PlanRunner {
   #indexPathQueries = 0;
   #burstCommits = 0;
   #peakBurstSegments = 0;
+  readonly #reached = new Set<InteractionReachState>();
 
   constructor(plan: InteractionPlan, driver: SimulationDriver, traceLength: number) {
     this.#plan = plan;
@@ -3189,10 +3234,15 @@ class PlanRunner {
       rowsAtEnd: rows,
       indexPathQueries: this.#indexPathQueries,
       burstCommits: this.#burstCommits,
+      reached: INTERACTION_REACH_STATES.filter((state) => this.#reached.has(state)),
       peakBurstSegments: this.#peakBurstSegments,
       transientsAccepted: stoppedBy === undefined ? 0 : 1,
       stoppedBy,
     };
+  }
+
+  #reach(state: InteractionReachState): void {
+    this.#reached.add(state);
   }
 
   #connection(index: number): SimulatedConnection {
@@ -3367,6 +3417,7 @@ class PlanRunner {
     const refusal = this.#model.insert(interaction.table, interaction.rows);
     const outcome = await this.#attempt(interaction.connection, rendered.sql, rendered.params);
     if (refusal !== undefined) {
+      this.#reach("write-refused");
       this.#expectRefusal(
         refusal,
         outcome,
@@ -3413,6 +3464,7 @@ class PlanRunner {
     );
     const sql = `UPDATE ${quote(interaction.table)} SET ${renderAssignments(interaction.assignments)} WHERE ${renderPredicate(interaction.predicate)}`;
     if (refusal !== undefined) {
+      this.#reach("write-refused");
       this.#expectRefusal(
         refusal,
         await this.#attempt(interaction.connection, sql),
@@ -3435,6 +3487,7 @@ class PlanRunner {
         `update-count: UPDATE reported ${String(result.rowCount)} rows, model matched ${String(expected)}\n  model rows before: ${canonicalRows(before, this.#model.columns(interaction.table))}`,
       );
     }
+    if (expected > 0) this.#reach("update-matched");
     this.#acceptedWrites++;
     await this.#expectRows(
       interaction.connection,
@@ -3453,6 +3506,7 @@ class PlanRunner {
     const where = renderPredicate(interaction.predicate);
     const sql = `DELETE FROM ${quote(interaction.table)} WHERE ${where}`;
     if (refusal !== undefined) {
+      this.#reach("write-refused");
       this.#expectRefusal(
         refusal,
         await this.#attempt(interaction.connection, sql),
@@ -3475,6 +3529,7 @@ class PlanRunner {
         `delete-count: DELETE reported ${String(result.rowCount)} rows, model matched ${String(expected)}\n  model rows before: ${canonicalRows(before, this.#model.columns(interaction.table))}`,
       );
     }
+    if (expected > 0) this.#reach("delete-matched");
     this.#acceptedWrites++;
     const survivors = await this.#count(interaction.connection, interaction.table, where);
     if (survivors !== 0)
@@ -3498,6 +3553,7 @@ class PlanRunner {
     const sql = renderRekey(interaction.table, interaction);
     const result = await this.#attempt(interaction.connection, sql);
     if (!outcome.accepted) {
+      this.#reach("rekey-refused");
       this.#model = before;
       this.#expectRefusal(
         outcome.refusal ?? ["unique"],
@@ -3514,6 +3570,7 @@ class PlanRunner {
           `update-count: a rekey reported ${String(result.result?.rowCount)} rows, model matched ${String(outcome.matched)}\n  model rows before: ${canonicalRows(before.sorted(interaction.table), before.columns(interaction.table))}`,
         );
       }
+      if (outcome.matched > 0) this.#reach("rekey-moved");
       this.#acceptedWrites++;
     }
     await this.#expectRows(
@@ -3524,6 +3581,7 @@ class PlanRunner {
     );
     const reader = (interaction.connection + 1) % this.#plan.connections;
     for (const [from] of outcome.retired.slice(0, 3)) {
+      this.#reach("retired-key-read");
       const target = this.#model.resolve(interaction.table, from);
       const row = this.#model.table(interaction.table).rows.get(target);
       await this.#expectRows(
@@ -3540,6 +3598,7 @@ class PlanRunner {
     const matching = this.#model.matching(interaction.table, interaction.predicate);
     if (interaction.descending) matching.reverse();
     const expected = interaction.limit === null ? matching : matching.slice(0, interaction.limit);
+    if (expected.length < matching.length) this.#reach("limit-truncated");
     const order = `ORDER BY id${interaction.descending ? " DESC" : ""}`;
     const limit = interaction.limit === null ? "" : ` LIMIT ${String(interaction.limit)}`;
     const sql = `SELECT * FROM ${quote(interaction.table)} WHERE ${renderPredicate(interaction.predicate)} ${order}${limit}`;
@@ -3940,8 +3999,15 @@ class PlanRunner {
     await this.#execute(interaction.connection, end).catch((error: unknown) =>
       this.#refuseTransaction(end, error),
     );
-    if (end === "ROLLBACK") this.#model = committed;
-    else this.#acceptedWrites++;
+    if (end === "ROLLBACK") {
+      if (
+        canonicalRows(this.#model.sorted(interaction.table), columns) !==
+        canonicalRows(committed.sorted(interaction.table), columns)
+      ) {
+        this.#reach("rollback-discarded");
+      }
+      this.#model = committed;
+    } else this.#acceptedWrites++;
     await this.#expectRows(
       interaction.connection,
       interaction.table,
@@ -3993,6 +4059,7 @@ class PlanRunner {
     const [writeOutcomes, readOutcomes] = serial
       ? [await writes, await Promise.all(interaction.readers.map(read))]
       : await Promise.all([writes, Promise.all(interaction.readers.map(read))]);
+    if (!serial && interaction.readers.length > 0) this.#reach("concurrent-read");
     const touched = new Set<number>(targets);
     if (contended) this.#explainContendedRound(interaction.table, before, writeOutcomes);
     for (const [index, { operation, outcome }] of contended ? [] : writeOutcomes.entries()) {
@@ -4227,6 +4294,8 @@ class PlanRunner {
     const beforeRows = canonicalRows(before.sorted(interaction.table), columns);
     const afterRows = canonicalRows(after.sorted(interaction.table), columns);
     const observed = canonicalRows(actual, columns);
+    if (beforeRows !== afterRows)
+      this.#reach(observed === afterRows ? "fault-landed" : "fault-discarded");
     if (observed === afterRows) this.#model = after;
     else if (observed === beforeRows) {
       if (outcome.error === undefined)
@@ -4280,6 +4349,11 @@ class PlanRunner {
         `ALTER TABLE ${change.kind} failed: ${describeError(outcome.error)}`,
         outcome.error,
       );
+    } else if (
+      change.kind !== "renameColumn" &&
+      this.#model.table(interaction.table).rows.size > 0
+    ) {
+      this.#reach("alter-populated");
     }
     const context = refused ? "after a refused ALTER TABLE" : "after ALTER TABLE";
     await this.#expectRows(
@@ -4331,6 +4405,7 @@ class PlanRunner {
     const outcome = await this.#attempt(interaction.connection, sql);
     const rowsBefore = `\n  model rows before: ${canonicalRows(before, columns)}`;
     if (refusal !== undefined) {
+      this.#reach("unique-refused");
       this.#expectRefusal(refusal, outcome, "upsert-arbiter: a refused upsert", rowsBefore);
     } else {
       if (outcome.error !== undefined) {
@@ -4386,7 +4461,10 @@ class PlanRunner {
       const plan = await connection
         .explain(sql)
         .catch((error: unknown) => this.#fail(`EXPLAIN failed: ${describeError(error)}`, error));
-      if (plan.includes("secondary index")) this.#indexPathQueries++;
+      if (plan.includes("secondary index")) {
+        this.#indexPathQueries++;
+        if (expected.length > 0) this.#reach("index-lookup-rows");
+      }
     }
   }
 
@@ -4475,6 +4553,9 @@ class PlanRunner {
   }
 
   async #reopen(index: number): Promise<void> {
+    if ([...this.#model.tables.values()].some((table) => table.rows.size > 0)) {
+      this.#reach("reopen-with-rows");
+    }
     await this.#reopenConnection(index);
     for (const table of this.#model.tables.keys()) {
       await this.#expectRows(index, table, this.#model.sorted(table), "after reopen");

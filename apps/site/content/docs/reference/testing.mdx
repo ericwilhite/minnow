@@ -150,8 +150,8 @@ workers (one on a two-CPU runner); each concurrency scenario still creates its f
   paths where stored state can diverge from what a query returns: random mutations, rekeys,
   compaction, reopens, and column and index DDL, with every indexed query shape compared against
   the same query forced to scan and against a JavaScript model (`index-oracle`), every live
-  query's last delivered result compared with a fresh run of its SQL after every commit
-  (`live-oracle`), stepped folds interleaved with writes and DDL from a second connection
+  query's deliveries and the rows a second subscriber rebuilds from its patches compared with a
+  fresh run of its SQL after every commit (`live-oracle`), stepped folds interleaved with writes and DDL from a second connection
   (`compaction-interleave`), and `MATCH` queries through updates, folds, and reopens
   (`fts-oracle`); `npm run soak` explores all four under new seeds. A PostgreSQL-diffed
   constraint suite pins CHECK, NOT NULL, DEFAULT, generated, FK, and UNIQUE semantics and tags
@@ -361,6 +361,29 @@ MINNOW_SEED=1476318588 npx vitest run packages/core/src/engine/sql-conformance.t
 Then add it to `regression-seeds.json` under the suite that failed, where every future run picks
 it up. Never remove one: a seed in that file is a bug that used to exist, and the entry is what
 stops it coming back. The explored space only grows, and it grows by exactly what the soak found.
+
+Every fast-check property follows the same rule. It takes its seed from a `seedsFor` case rather
+than letting fast-check draw a fresh one, so a CI failure replays and the soak runner explores
+the property. `seeds.test.ts` fails on any `fc.assert` without a seed, on a registry key that no
+suite runs, and on a seeded suite the soak runner does not list.
+
+### Declared reach
+
+A passing seed shows that no law was broken, not that any law was tested. A plan can update rows
+that do not exist, inject every fault into a write that changes nothing, or deliver every live
+result by re-running the query. Seed 1349451771 in the registry is the case where all of its
+faults hit missing rows, so no storage write hook fired.
+
+So each generated campaign declares the states its laws depend on, and fails when too few of its
+histories reached one. `testing/reach.ts` counts each history once per state, after the
+campaign; the counting is TanStack DB's `createOracleReach`. The interaction campaigns report the
+states each plan entered in `InteractionRunResult.reached`: an `UPDATE` or `DELETE` that matched
+rows, a refused write, a `LIMIT` that cut rows off, a rollback that discarded changes, reads
+during a concurrent round, a fault after which the write had or had not landed, a reopen of a
+database with rows, and, in their own campaigns, rekeys, retired-key reads, refused unique
+values, `ALTER TABLE` on populated tables, and index lookups that returned rows. The live oracles
+declare patched, moved, replaced, shrunk, re-run, and rekeyed deliveries. A `MINNOW_SEED` replay
+checks one history, so reach stands aside then.
 
 ## Format compatibility
 
@@ -740,11 +763,27 @@ ready.
 
 `live-differential.test.ts` holds live queries to a fresh execution. A fast-check property runs
 keyed and predicate writes, upserts, rekeys, transactions that commit or roll back, writes from a
-second connection, compaction, collection, and an index build. After each one it compares every
-subscription's latest delivery, maintained incrementally or re-run, with the statement executed
-again. Set `MINNOW_SEED` and `MINNOW_LIVE_RUNS` to explore further. It found a self-join patched
-as if only its base rows changed, and a live query on a retired key that missed a row written at
-the key it forwards to.
+second connection, compaction, collection, and an index build. It runs in process with
+incremental maintenance on and off, and across a worker boundary. Set `MINNOW_SEED` and
+`MINNOW_LIVE_RUNS` to explore further. It found a self-join patched as if only its base rows
+changed, and a live query on a retired key that missed a row written at the key it forwards to.
+
+Comparing only the latest result misses a delivery that is wrong and then repaired by the next
+one, and it never sees the patch stream a worker-hosted subscriber rebuilds its rows from. So
+each statement has two subscribers, checked by `testing/live-publication.ts`. One records every
+`onChange` in a ledger. The ledger holds each delivery to the `LiveQueryDelivery` contract: only
+the first is `initial`, the manifest version never goes back, and every `retained` entry is `-1`
+or points at a distinct row of the previous delivery with the same values. The other subscriber rebuilds
+its rows from `subscribePatches` alone. It refuses a patch before any reset, and changed rows
+that do not fill exactly the `-1` positions. After each write, the ledger's rows, the rebuilt
+rows, and the fresh query must agree. `live-oracle.test.ts` applies the same two checks to its
+wider shapes. Before these checks existed, a `retained` map that kept a changed row passed both
+oracles, and so did a worker that dropped the changed row at position 0. Both are now caught.
+`live-publication.test.ts` gives each law a wrong delivery it must reject.
+
+These checks have limits. The fresh query is Minnow's own engine. The SQLite and PGlite diffs are
+what hold that engine to an outside answer. The React and Kysely bindings consume deliveries
+above this layer and are not driven by these generated histories.
 
 ## Background maintenance, size, and memory
 

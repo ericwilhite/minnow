@@ -41,6 +41,14 @@
     "index-oracle": [],
     "live-oracle": [],
     "compaction-interleave": [],
-    "fts-oracle": []
+    "fts-oracle": [],
+    "live-differential": [],
+    "live-correctness": [],
+    "key-forwards": [],
+    "json-values": [],
+    "indexeddb-schema4-lookups": [],
+    "opfs-segment-names": [],
+    "unicode-properties": [],
+    "record-json-properties": []
   }
 }

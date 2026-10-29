@@ -3,18 +3,25 @@ import fc from "fast-check";
 import { JsonNumber, parseJsonValue } from "./json-values.js";
 import { boundedJsonText } from "./sql-domains.js";
 import { MAX_SQL_STRUCTURED_VALUE_DEPTH, MAX_SQL_STRUCTURED_VALUE_ITEMS } from "./cache-limits.js";
+import { seedsFor } from "../testing/seeds.js";
 
-it("agrees with native JSON for generated documents whose numbers are exact integers", () => {
-  fc.assert(
-    fc.property(fc.jsonValue({ maxDepth: 5 }), (value) => {
-      const source = JSON.stringify(value);
-      const parsed = parseJsonValue(source);
-      // Native parsing is the oracle only for structure. Numeric text is independently preserved.
-      expect(JSON.parse(boundedJsonText(parsed, false))).toEqual(JSON.parse(source));
-    }),
-    { seed: 29092026, numRuns: 300 },
-  );
-});
+/** Seeds for this file's generated properties; `npm run soak` explores others. */
+const SEEDS = seedsFor("json-values", [29092026]);
+
+it.each(SEEDS)(
+  "agrees with native JSON for generated documents whose numbers are exact integers (seed %i)",
+  (seed) => {
+    fc.assert(
+      fc.property(fc.jsonValue({ maxDepth: 5 }), (value) => {
+        const source = JSON.stringify(value);
+        const parsed = parseJsonValue(source);
+        // Native parsing is the oracle only for structure. Numeric text is independently preserved.
+        expect(JSON.parse(boundedJsonText(parsed, false))).toEqual(JSON.parse(source));
+      }),
+      { seed, numRuns: 300 },
+    );
+  },
+);
 
 it.each(["-", "01", "1.", "1e", "[1,]", '{"a":1,}', "true false", "[1]x", '"\\uD800"'])(
   "rejects malformed or ill-formed JSON %s",

@@ -3,6 +3,10 @@ import fc from "fast-check";
 import { MinnowDatabase } from "./database.js";
 import { MemoryBlockStore } from "../storage/memory.js";
 import { compileQuery, type QueryResult } from "./query.js";
+import { seedsFor } from "../testing/seeds.js";
+
+/** Seeds for this file's generated properties; `npm run soak` explores others. */
+const SEEDS = seedsFor("live-correctness", [42017]);
 
 describe("live maintenance correctness", () => {
   it("keeps a concurrently joining subscription alive when the previous owner closes", async () => {
@@ -171,53 +175,56 @@ describe("live maintenance correctness", () => {
     },
   );
 
-  it("keeps numeric ordering exact through randomized inserts, updates, deletes and window refills", async () => {
-    await fc.assert(
-      fc.asyncProperty(
-        fc.array(
-          fc.tuple(
-            fc.integer({ min: 1, max: 12 }),
-            fc.integer({ min: -20, max: 120 }),
-            fc.boolean(),
+  it.each(SEEDS)(
+    "keeps numeric ordering exact through randomized inserts, updates, deletes and window refills (seed %i)",
+    async (seed) => {
+      await fc.assert(
+        fc.asyncProperty(
+          fc.array(
+            fc.tuple(
+              fc.integer({ min: 1, max: 12 }),
+              fc.integer({ min: -20, max: 120 }),
+              fc.boolean(),
+            ),
+            { minLength: 25, maxLength: 40 },
           ),
-          { minLength: 25, maxLength: 40 },
-        ),
-        async (writes) => {
-          const db = new MinnowDatabase(new MemoryBlockStore(), { autoCompact: false });
-          const live = db.liveQueries();
-          try {
-            await db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x NUMERIC(12,2))");
-            await db.execute("INSERT INTO t VALUES (1,2),(2,10),(3,NULL),(4,-10),(5,100)");
-            const statements = [
-              "SELECT id,x FROM t ORDER BY x,id LIMIT 2",
-              "SELECT id,x FROM t ORDER BY x DESC NULLS LAST,id LIMIT 3 OFFSET 1",
-              "SELECT id FROM t ORDER BY x,id",
-              "SELECT id,x*2 AS y FROM t ORDER BY y,id LIMIT 4",
-              "SELECT id,x FROM t ORDER BY 2 DESC,1 LIMIT 2",
-            ];
-            const latest = new Map<string, QueryResult>();
-            for (const sql of statements)
-              await live.subscribe(sql, { onChange: (result) => latest.set(sql, result) });
-            for (const [id, value, remove] of writes) {
-              await db.execute(
-                remove
-                  ? `DELETE FROM t WHERE id=${String(id)}`
-                  : `INSERT INTO t VALUES (${String(id)},${String(value)}) ON CONFLICT (id) DO UPDATE SET x=EXCLUDED.x`,
-              );
-              await live.refresh();
+          async (writes) => {
+            const db = new MinnowDatabase(new MemoryBlockStore(), { autoCompact: false });
+            const live = db.liveQueries();
+            try {
+              await db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x NUMERIC(12,2))");
+              await db.execute("INSERT INTO t VALUES (1,2),(2,10),(3,NULL),(4,-10),(5,100)");
+              const statements = [
+                "SELECT id,x FROM t ORDER BY x,id LIMIT 2",
+                "SELECT id,x FROM t ORDER BY x DESC NULLS LAST,id LIMIT 3 OFFSET 1",
+                "SELECT id FROM t ORDER BY x,id",
+                "SELECT id,x*2 AS y FROM t ORDER BY y,id LIMIT 4",
+                "SELECT id,x FROM t ORDER BY 2 DESC,1 LIMIT 2",
+              ];
+              const latest = new Map<string, QueryResult>();
               for (const sql of statements)
-                expect(latest.get(sql), sql).toEqual(await db.query(sql, { memoize: false }));
+                await live.subscribe(sql, { onChange: (result) => latest.set(sql, result) });
+              for (const [id, value, remove] of writes) {
+                await db.execute(
+                  remove
+                    ? `DELETE FROM t WHERE id=${String(id)}`
+                    : `INSERT INTO t VALUES (${String(id)},${String(value)}) ON CONFLICT (id) DO UPDATE SET x=EXCLUDED.x`,
+                );
+                await live.refresh();
+                for (const sql of statements)
+                  expect(latest.get(sql), sql).toEqual(await db.query(sql, { memoize: false }));
+              }
+              expect(live.stats.maintained).toBeGreaterThan(0);
+            } finally {
+              live.close();
+              await db.close();
             }
-            expect(live.stats.maintained).toBeGreaterThan(0);
-          } finally {
-            live.close();
-            await db.close();
-          }
-        },
-      ),
-      { seed: 42017, numRuns: 5 },
-    );
-  });
+          },
+        ),
+        { seed, numRuns: 5 },
+      );
+    },
+  );
 
   it.each([true, false])(
     "captures parameter ownership before asynchronous registration (incremental=%s)",

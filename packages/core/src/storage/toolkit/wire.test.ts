@@ -22,6 +22,10 @@ import {
   MAX_ROW_ID_EXCLUSIVE_END,
   StorageFormatVersionError,
 } from "../types.js";
+import { seedsFor } from "../../testing/seeds.js";
+
+/** Seeds for this file's generated properties; `npm run soak` explores others. */
+const SEEDS = seedsFor("record-json-properties", [0x5ead]);
 
 function postingEnvelope(payload: Uint8Array): Uint8Array {
   const bytes = new Uint8Array(20 + payload.byteLength);
@@ -479,7 +483,7 @@ describe("synchronous checkpoint slots", () => {
 });
 
 describe("record JSON decoding", () => {
-  it("round-trips arbitrary JSON-shaped records holding bigints", () => {
+  it.each(SEEDS)("round-trips arbitrary JSON-shaped records holding bigints (seed %i)", (seed) => {
     const leaf = fc.oneof(
       fc.string({ maxLength: 8 }),
       fc.integer(),
@@ -499,7 +503,7 @@ describe("record JSON decoding", () => {
       fc.property(tree, (value) => {
         expect(decodeRecordJson(encodeRecordJson(value))).toEqual(value);
       }),
-      { numRuns: 300 },
+      { seed, numRuns: 300 },
     );
   });
 
@@ -592,34 +596,37 @@ describe("sliced checkpoint encoding", () => {
     expect(pauses).toBeGreaterThan(1);
   });
 
-  it("matches the synchronous encoding for arbitrary JSON-shaped states", async () => {
-    const leaf = fc.oneof(
-      fc.string({ unit: "grapheme", maxLength: 12 }),
-      fc.double(),
-      fc.integer(),
-      fc.boolean(),
-      fc.constant(null),
-      fc.constant(undefined),
-      fc.bigInt({ min: 0n, max: MAX_ROW_ID_EXCLUSIVE_END }),
-    );
-    const { tree } = fc.letrec((node) => ({
-      tree: fc.oneof(
-        { depthSize: "small", withCrossShrink: true },
-        leaf,
-        fc.array(node("tree"), { maxLength: 6 }),
-        fc.dictionary(fc.string({ maxLength: 6 }), node("tree"), { maxKeys: 6 }),
-        // Wide enough to cross the slice boundary, so walked and native pieces interleave.
-        fc.array(leaf, { minLength: 4_000, maxLength: 9_000 }),
-      ),
-    }));
-    await fc.assert(
-      fc.asyncProperty(tree, async (state) => {
-        if (state === undefined) return;
-        await expectSameBytes(state);
-      }),
-      { numRuns: 60 },
-    );
-  });
+  it.each(SEEDS)(
+    "matches the synchronous encoding for arbitrary JSON-shaped states (seed %i)",
+    async (seed) => {
+      const leaf = fc.oneof(
+        fc.string({ unit: "grapheme", maxLength: 12 }),
+        fc.double(),
+        fc.integer(),
+        fc.boolean(),
+        fc.constant(null),
+        fc.constant(undefined),
+        fc.bigInt({ min: 0n, max: MAX_ROW_ID_EXCLUSIVE_END }),
+      );
+      const { tree } = fc.letrec((node) => ({
+        tree: fc.oneof(
+          { depthSize: "small", withCrossShrink: true },
+          leaf,
+          fc.array(node("tree"), { maxLength: 6 }),
+          fc.dictionary(fc.string({ maxLength: 6 }), node("tree"), { maxKeys: 6 }),
+          // Wide enough to cross the slice boundary, so walked and native pieces interleave.
+          fc.array(leaf, { minLength: 4_000, maxLength: 9_000 }),
+        ),
+      }));
+      await fc.assert(
+        fc.asyncProperty(tree, async (state) => {
+          if (state === undefined) return;
+          await expectSameBytes(state);
+        }),
+        { seed, numRuns: 60 },
+      );
+    },
+  );
 
   it("refuses what the synchronous encoding refuses", async () => {
     await expect(encodeSyncCheckpointSliced(undefined, pause)).rejects.toThrow(
@@ -677,48 +684,51 @@ describe("sliced record JSON parsing", () => {
     fc.constantFrom('"', "\\", '\\"', "[{,:}]", "$n", "__proto__", "é😀\u2028", "\n\t"),
   );
 
-  it("parses what decodeRecordJson parses, across slices of nested large containers", async () => {
-    const leaf = fc.oneof(
-      tricky,
-      fc.integer(),
-      fc.double({ noNaN: true, noDefaultInfinity: true }),
-      fc.boolean(),
-      fc.constant(null),
-      fc.bigInt({ min: 0n, max: MAX_ROW_ID_EXCLUSIVE_END }),
-    );
-    const { tree } = fc.letrec((node) => ({
-      tree: fc.oneof(
-        { depthSize: "small", withCrossShrink: true },
-        leaf,
-        fc.array(node("tree"), { maxLength: 5 }),
-        fc.dictionary(tricky, node("tree"), { maxKeys: 5 }),
-        // Wide enough to pass one parse slice, so runs, recursion, and native pieces mix.
-        fc.array(leaf, { minLength: 3_000, maxLength: 6_000 }),
-        fc.dictionary(tricky, leaf, { minKeys: 2_000, maxKeys: 4_000 }),
-      ),
-    }));
-    await fc.assert(
-      fc.asyncProperty(tree, async (value) => {
-        const bytes = encodeRecordJson(value);
-        // A generated record can hold an object whose sole key is `$n` with a value that is no
-        // decimal, which no stored record contains and both decoders refuse. Compare outcomes,
-        // so such a case checks refusal parity instead of failing and shrinking a huge tree.
-        let expected: unknown;
-        try {
-          expected = decodeRecordJson(bytes);
-        } catch (error) {
-          await expect(parseRecordJsonSliced(bytes, pause)).rejects.toThrow(
-            (error as Error).message,
-          );
-          return;
-        }
-        expect(await parseRecordJsonSliced(bytes, pause)).toEqual(expected);
-      }),
-      // Seeded, so a failure reproduces; MINNOW_SEED explores others. A failure shrinks a large
-      // tree slowly, so it ends on the first counterexample rather than hanging the suite.
-      { numRuns: 80, seed: Number(process.env.MINNOW_SEED ?? 0x5ead), endOnFailure: true },
-    );
-  });
+  it.each(SEEDS)(
+    "parses what decodeRecordJson parses, across slices of nested large containers (seed %i)",
+    async (seed) => {
+      const leaf = fc.oneof(
+        tricky,
+        fc.integer(),
+        fc.double({ noNaN: true, noDefaultInfinity: true }),
+        fc.boolean(),
+        fc.constant(null),
+        fc.bigInt({ min: 0n, max: MAX_ROW_ID_EXCLUSIVE_END }),
+      );
+      const { tree } = fc.letrec((node) => ({
+        tree: fc.oneof(
+          { depthSize: "small", withCrossShrink: true },
+          leaf,
+          fc.array(node("tree"), { maxLength: 5 }),
+          fc.dictionary(tricky, node("tree"), { maxKeys: 5 }),
+          // Wide enough to pass one parse slice, so runs, recursion, and native pieces mix.
+          fc.array(leaf, { minLength: 3_000, maxLength: 6_000 }),
+          fc.dictionary(tricky, leaf, { minKeys: 2_000, maxKeys: 4_000 }),
+        ),
+      }));
+      await fc.assert(
+        fc.asyncProperty(tree, async (value) => {
+          const bytes = encodeRecordJson(value);
+          // A generated record can hold an object whose sole key is `$n` with a value that is no
+          // decimal, which no stored record contains and both decoders refuse. Compare outcomes,
+          // so such a case checks refusal parity instead of failing and shrinking a huge tree.
+          let expected: unknown;
+          try {
+            expected = decodeRecordJson(bytes);
+          } catch (error) {
+            await expect(parseRecordJsonSliced(bytes, pause)).rejects.toThrow(
+              (error as Error).message,
+            );
+            return;
+          }
+          expect(await parseRecordJsonSliced(bytes, pause)).toEqual(expected);
+        }),
+        // A failure shrinks a large tree slowly, so it ends on the first counterexample rather
+        // than hanging the suite.
+        { seed, numRuns: 80, endOnFailure: true },
+      );
+    },
+  );
 
   it("parses pretty-printed JSON and keeps __proto__ keys own properties", async () => {
     const large = {

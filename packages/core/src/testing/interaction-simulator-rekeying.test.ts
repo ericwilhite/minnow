@@ -4,7 +4,7 @@
  * with the other suites; replay a seed with MINNOW_SEED.
  */
 import { IDBFactory } from "fake-indexeddb";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { IndexedDbBlockStore, MemoryBlockStore, OpfsBlockStore } from "../storage/index.js";
 import { heavyTestTimeout } from "../engine/storage-test-helpers.js";
 import {
@@ -12,11 +12,29 @@ import {
   generateInteractionPlan,
   runInteractionPlan,
   type DriverStoreSource,
+  type InteractionReachState,
 } from "./interaction-simulator.js";
 import { MemoryOpfs } from "./opfs-shim.js";
+import { createReach } from "./reach.js";
 import { seedsFor } from "./seeds.js";
 
 vi.setConfig({ testTimeout: heavyTestTimeout(120_000) });
+
+/** The states this campaign's seeds must reach on every store: the base campaign's and rekeys'. */
+const DECLARED_REACH = [
+  "update-matched",
+  "delete-matched",
+  "write-refused",
+  "limit-truncated",
+  "rollback-discarded",
+  "concurrent-read",
+  "fault-landed",
+  "fault-discarded",
+  "reopen-with-rows",
+  "rekey-moved",
+  "rekey-refused",
+  "retired-key-read",
+] as const satisfies readonly InteractionReachState[];
 
 /**
  * Memory has no durable identity to share, so its connections share one instance. IndexedDB and
@@ -43,7 +61,11 @@ const stores: ReadonlyArray<{ name: string; source: () => DriverStoreSource }> =
   },
 ];
 
-describe.each(stores)("interaction simulator with rekeying over $name", ({ source }) => {
+describe.each(stores)("interaction simulator with rekeying over $name", ({ name, source }) => {
+  const reach = createReach(`interaction-simulator-rekeying over ${name}`, DECLARED_REACH);
+  afterAll(() => {
+    reach.assertReached();
+  });
   it.each(seedsFor("interaction-simulator-rekeying", [0x4e4b, 0xbeef]))("seed %i", async (seed) => {
     const store = source();
     try {
@@ -62,6 +84,7 @@ describe.each(stores)("interaction simulator with rekeying over $name", ({ sourc
       expect(result.interactions).toBe(plan.interactions.length);
       expect(result.acceptedWrites).toBeGreaterThan(20);
       expect(result.rejectedConflicts).toBe(0);
+      reach.recordHistory(result.reached);
     } finally {
       if (typeof store !== "function") store.close();
     }

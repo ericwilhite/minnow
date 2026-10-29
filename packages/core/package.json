@@ -153,6 +153,8 @@
     "!dist/engine/storage-test-helpers.*",
     "!dist/testing/seeds.*",
     "!dist/testing/oracle.*",
+    "!dist/testing/reach.*",
+    "!dist/testing/live-publication.*",
     "!dist/testing/semantic-corpus.*",
     "!dist/testing/maintenance-diagnostics.*",
     "!dist/engine/client-audit-harness.*",

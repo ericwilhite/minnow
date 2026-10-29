@@ -23,6 +23,27 @@ function testFiles(): Array<{ path: string; text: string }> {
   );
 }
 
+/** The text of each `fc.assert(...)` call, matched by parentheses. */
+function assertCalls(text: string): string[] {
+  const calls: string[] = [];
+  for (
+    let start = text.indexOf("fc.assert(");
+    start >= 0;
+    start = text.indexOf("fc.assert(", start + 1)
+  ) {
+    let depth = 0;
+    for (let index = start + "fc.assert".length; index < text.length; index += 1) {
+      const character = text[index];
+      if (character === "(") depth += 1;
+      else if (character === ")" && --depth === 0) {
+        calls.push(text.slice(start, index + 1));
+        break;
+      }
+    }
+  }
+  return calls;
+}
+
 describe("regression seeds", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
@@ -59,6 +80,19 @@ describe("regression seeds", () => {
       const text = consumers[0]?.text ?? "";
       const line = text.slice(text.indexOf(call)).split("\n")[0] ?? "";
       expect(line, `suite ${suite} takes a single seed`).not.toMatch(/\)\[0\]|\.at\(0\)/);
+    }
+  });
+
+  it("seeds every generated property from the registry", () => {
+    // fast-check without a seed draws a fresh one on every run, so a CI failure is a flake
+    // nobody can replay and the soak runner never explores the property. Every property takes
+    // the seed of a `seedsFor` case instead.
+    for (const { path, text } of testFiles()) {
+      if (!text.includes("fc.assert(")) continue;
+      expect(text, `${path} draws its seeds from seedsFor`).toMatch(/seedsFor\("/);
+      for (const call of assertCalls(text)) {
+        expect(call, `${path}: fc.assert without a seed`).toMatch(/[{,]\s*seed\b/);
+      }
     }
   });
 

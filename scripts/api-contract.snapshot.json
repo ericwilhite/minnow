@@ -8676,6 +8676,13 @@
               ]
             },
             {
+              "name": "INTERACTION_REACH_STATES",
+              "kind": "value",
+              "declarations": [
+                "INTERACTION_REACH_STATES: readonly [\n    \"update-matched\",\n    \"delete-matched\",\n    \"write-refused\",\n    \"limit-truncated\",\n    \"rollback-discarded\",\n    \"concurrent-read\",\n    \"fault-landed\",\n    \"fault-discarded\",\n    \"reopen-with-rows\",\n    \"rekey-moved\",\n    \"rekey-refused\",\n    \"retired-key-read\",\n    \"unique-refused\",\n    \"alter-populated\",\n    \"index-lookup-rows\"\n]"
+              ]
+            },
+            {
               "name": "InteractionFailure",
               "kind": "type-and-value",
               "declarations": [
@@ -8697,6 +8704,13 @@
               ]
             },
             {
+              "name": "InteractionReachState",
+              "kind": "type",
+              "declarations": [
+                "export type InteractionReachState = (typeof INTERACTION_REACH_STATES)[number];"
+              ]
+            },
+            {
               "name": "InteractionRunOptions",
               "kind": "type",
               "declarations": [
@@ -8707,7 +8721,7 @@
               "name": "InteractionRunResult",
               "kind": "type",
               "declarations": [
-                "export interface InteractionRunResult {\n    readonly seed: number;\n    readonly interactions: number;\n    readonly statements: number;\n    readonly queries: number;\n    readonly acceptedWrites: number;\n    readonly rejectedConflicts: number;\n    readonly expectedFailures: number;\n    readonly faultsInjected: number;\n    readonly faultsSkipped: number;\n    readonly reopens: number;\n    readonly checkpoints: number;\n    readonly tablesAtEnd: number;\n    readonly rowsAtEnd: number;\n    readonly indexPathQueries: number;\n    readonly burstCommits: number;\n    readonly peakBurstSegments: number;\n    readonly transientsAccepted: number;\n    readonly stoppedBy: string | undefined;\n}"
+                "export interface InteractionRunResult {\n    readonly seed: number;\n    readonly interactions: number;\n    readonly statements: number;\n    readonly queries: number;\n    readonly acceptedWrites: number;\n    readonly rejectedConflicts: number;\n    readonly expectedFailures: number;\n    readonly faultsInjected: number;\n    readonly faultsSkipped: number;\n    readonly reopens: number;\n    readonly checkpoints: number;\n    readonly tablesAtEnd: number;\n    readonly rowsAtEnd: number;\n    readonly indexPathQueries: number;\n    readonly burstCommits: number;\n    readonly reached: readonly InteractionReachState[];\n    readonly peakBurstSegments: number;\n    readonly transientsAccepted: number;\n    readonly stoppedBy: string | undefined;\n}"
               ]
             },
             {

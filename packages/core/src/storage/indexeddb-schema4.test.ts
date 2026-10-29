@@ -33,6 +33,10 @@ import {
 } from "./indexeddb-audit-helpers.js";
 import { IndexedDbBlockStore } from "./indexeddb.js";
 import type { FtsPosting, FtsPostingQuery, ManifestSummary, TableRecord } from "./types.js";
+import { seedsFor } from "../testing/seeds.js";
+
+/** Seeds for this file's generated properties; `npm run soak` explores others. */
+const SEEDS = seedsFor("indexeddb-schema4-lookups", [0x1db4]);
 
 vi.setConfig({ testTimeout: heavyTestTimeout(60_000) });
 
@@ -310,113 +314,116 @@ describe("IndexedDB schema 4 delta parts", () => {
     store.close();
   });
 
-  it("answers lookups exactly like a reference model across random multi-part commits", async () => {
-    await fc.assert(
-      fc.asyncProperty(
-        fc.array(
-          fc.record({
-            terms: fc.integer({ min: 0, max: 20_000 }),
-            wideRows: fc.oneof(fc.constant(0), fc.integer({ min: 1, max: 150_000 })),
-            seed: fc.integer({ min: 1, max: 2 ** 30 }),
-          }),
-          { minLength: 1, maxLength: 3 },
-        ),
-        async (commits) => {
-          const indexedDB = new IDBFactory();
-          const name = crypto.randomUUID();
-          const store = await articleStore(indexedDB, name);
-          const reference = new Map<string, Map<bigint, number>>();
-          let version: number | null = null;
-          let tokens = 0;
-          const versions: number[] = [];
-          for (const commit of commits) {
-            let state = commit.seed;
-            const next = () => {
-              state = (state * 1_103_515_245 + 12_345) % 2 ** 31;
-              return state;
-            };
-            const postings: FtsPosting[] = [];
-            // Terms come from a small shared space so commits overlap on terms and rows.
-            const chosen = new Set<number>();
-            for (let index = 0; index < commit.terms; index += 1) chosen.add(next() % 30_000);
-            const sorted = [...chosen]
-              .sort((left, right) => left - right)
-              .map((value) => term("t", value));
-            const wideAt = commit.wideRows > 0 ? next() % (sorted.length + 1) : -1;
-            if (wideAt === 0) postings.push(wide("s-w", commit.wideRows, 1 + (next() % 1_000)));
-            sorted.forEach((value, position) => {
-              const rows = [
-                ...new Set(Array.from({ length: 1 + (next() % 3) }, () => 1 + (next() % 50_000))),
-              ]
+  it.each(SEEDS)(
+    "answers lookups exactly like a reference model across random multi-part commits (seed %i)",
+    async (seed) => {
+      await fc.assert(
+        fc.asyncProperty(
+          fc.array(
+            fc.record({
+              terms: fc.integer({ min: 0, max: 20_000 }),
+              wideRows: fc.oneof(fc.constant(0), fc.integer({ min: 1, max: 150_000 })),
+              seed: fc.integer({ min: 1, max: 2 ** 30 }),
+            }),
+            { minLength: 1, maxLength: 3 },
+          ),
+          async (commits) => {
+            const indexedDB = new IDBFactory();
+            const name = crypto.randomUUID();
+            const store = await articleStore(indexedDB, name);
+            const reference = new Map<string, Map<bigint, number>>();
+            let version: number | null = null;
+            let tokens = 0;
+            const versions: number[] = [];
+            for (const commit of commits) {
+              let state = commit.seed;
+              const next = () => {
+                state = (state * 1_103_515_245 + 12_345) % 2 ** 31;
+                return state;
+              };
+              const postings: FtsPosting[] = [];
+              // Terms come from a small shared space so commits overlap on terms and rows.
+              const chosen = new Set<number>();
+              for (let index = 0; index < commit.terms; index += 1) chosen.add(next() % 30_000);
+              const sorted = [...chosen]
                 .sort((left, right) => left - right)
-                .map(BigInt);
-              postings.push({ term: value, rowIds: rows, tf: rows.map(() => 1 + (next() % 4)) });
-              // "t0001234-w" sorts after "t0001234" and before the next padded term.
-              if (position + 1 === wideAt) {
-                postings.push(wide(`${value}-w`, commit.wideRows, 1 + (next() % 1_000)));
-              }
-            });
-            const manifest: ManifestSummary = await commitPostings(store, version, postings);
-            version = manifest.version;
-            if (postings.length > 0) versions.push(version);
-            tokens += tokenTotal(postings);
-            for (const posting of postings) {
-              const rows = reference.get(posting.term) ?? new Map<bigint, number>();
-              posting.rowIds.forEach((rowId, index) => {
-                rows.set(rowId, Math.max(rows.get(rowId) ?? 0, posting.tf[index] ?? 0));
+                .map((value) => term("t", value));
+              const wideAt = commit.wideRows > 0 ? next() % (sorted.length + 1) : -1;
+              if (wideAt === 0) postings.push(wide("s-w", commit.wideRows, 1 + (next() % 1_000)));
+              sorted.forEach((value, position) => {
+                const rows = [
+                  ...new Set(Array.from({ length: 1 + (next() % 3) }, () => 1 + (next() % 50_000))),
+                ]
+                  .sort((left, right) => left - right)
+                  .map(BigInt);
+                postings.push({ term: value, rowIds: rows, tf: rows.map(() => 1 + (next() % 4)) });
+                // "t0001234-w" sorts after "t0001234" and before the next padded term.
+                if (position + 1 === wideAt) {
+                  postings.push(wide(`${value}-w`, commit.wideRows, 1 + (next() % 1_000)));
+                }
               });
-              reference.set(posting.term, rows);
+              const manifest: ManifestSummary = await commitPostings(store, version, postings);
+              version = manifest.version;
+              if (postings.length > 0) versions.push(version);
+              tokens += tokenTotal(postings);
+              for (const posting of postings) {
+                const rows = reference.get(posting.term) ?? new Map<bigint, number>();
+                posting.rowIds.forEach((rowId, index) => {
+                  rows.set(rowId, Math.max(rows.get(rowId) ?? 0, posting.tf[index] ?? 0));
+                });
+                reference.set(posting.term, rows);
+              }
+              if (postings.length > 0) {
+                // The stored parts are exactly the commit's postings, split and nothing else.
+                expect(rejoin(await readRawParts(indexedDB, name, IDENTITY, version))).toEqual(
+                  postings,
+                );
+              }
             }
-            if (postings.length > 0) {
-              // The stored parts are exactly the commit's postings, split and nothing else.
-              expect(rejoin(await readRawParts(indexedDB, name, IDENTITY, version))).toEqual(
-                postings,
+            const terms = [...reference.keys()].sort();
+            const queries: FtsPostingQuery[] = [
+              { term: terms[0] ?? "t", prefix: false },
+              { term: terms.at(-1) ?? "t", prefix: false },
+              { term: terms[Math.floor(terms.length / 2)] ?? "t", prefix: false },
+              { term: "t000001", prefix: true },
+              { lower: "t0001", upper: "t00012", upperInclusive: false },
+              { term: "absent", prefix: false },
+            ];
+            for (const query of queries) {
+              const matched = terms.filter((candidate) =>
+                "term" in query
+                  ? query.prefix
+                    ? candidate.startsWith(query.term)
+                    : candidate === query.term
+                  : (query.lower === undefined || candidate >= query.lower) &&
+                    (query.upper === undefined ||
+                      candidate < query.upper ||
+                      (candidate === query.upper && query.upperInclusive !== false)),
               );
+              const expected = [
+                ...new Set(
+                  matched.flatMap((candidate) => [...(reference.get(candidate)?.keys() ?? [])]),
+                ),
+              ].sort((left, right) => (left < right ? -1 : 1));
+              const result = await candidates(store, [query], version ?? -1);
+              const overflow = expected.length > 65_536;
+              expect(result.overflow).toBe(overflow);
+              expect(result.hasBase).toBe(!overflow);
+              if (!overflow) {
+                expect(result.rowIdsByTerm).toEqual([expected]);
+                // Exact totals and a version count, whichever parts the lookup skipped.
+                expect(result.deltaChunkCount).toBe(versions.length);
+                expect(result.totalTokens).toBe(tokens);
+              }
             }
-          }
-          const terms = [...reference.keys()].sort();
-          const queries: FtsPostingQuery[] = [
-            { term: terms[0] ?? "t", prefix: false },
-            { term: terms.at(-1) ?? "t", prefix: false },
-            { term: terms[Math.floor(terms.length / 2)] ?? "t", prefix: false },
-            { term: "t000001", prefix: true },
-            { lower: "t0001", upper: "t00012", upperInclusive: false },
-            { term: "absent", prefix: false },
-          ];
-          for (const query of queries) {
-            const matched = terms.filter((candidate) =>
-              "term" in query
-                ? query.prefix
-                  ? candidate.startsWith(query.term)
-                  : candidate === query.term
-                : (query.lower === undefined || candidate >= query.lower) &&
-                  (query.upper === undefined ||
-                    candidate < query.upper ||
-                    (candidate === query.upper && query.upperInclusive !== false)),
-            );
-            const expected = [
-              ...new Set(
-                matched.flatMap((candidate) => [...(reference.get(candidate)?.keys() ?? [])]),
-              ),
-            ].sort((left, right) => (left < right ? -1 : 1));
-            const result = await candidates(store, [query], version ?? -1);
-            const overflow = expected.length > 65_536;
-            expect(result.overflow).toBe(overflow);
-            expect(result.hasBase).toBe(!overflow);
-            if (!overflow) {
-              expect(result.rowIdsByTerm).toEqual([expected]);
-              // Exact totals and a version count, whichever parts the lookup skipped.
-              expect(result.deltaChunkCount).toBe(versions.length);
-              expect(result.totalTokens).toBe(tokens);
-            }
-          }
-          expect((await store.checkIntegrity({ mode: "full" })).issues).toEqual([]);
-          store.close();
-        },
-      ),
-      { numRuns: 8 },
-    );
-  });
+            expect((await store.checkIntegrity({ mode: "full" })).issues).toEqual([]);
+            store.close();
+          },
+        ),
+        { seed, numRuns: 8 },
+      );
+    },
+  );
 
   it("refuses a malformed delta of any size before any part becomes visible", async () => {
     const indexedDB = new IDBFactory();

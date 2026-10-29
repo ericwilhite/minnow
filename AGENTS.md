@@ -26,6 +26,24 @@
   refusal, concurrent openers, and older-writer refusal after upgrade. Manual export/import
   is not an acceptable upgrade path for a supported version. A format bump without this
   regression coverage is unfinished, including during 0.x.
+- A fix in an area a generated suite owns (the interaction simulator, the live, index, FTS and
+  compaction oracles, the SQLite/PGlite diffs, the fast-check properties) carries this evidence
+  in its commit message:
+  - **Law:** the rule and its authority — a docs page, PostgreSQL's behaviour, or the contract
+    comment on the type. Engine output is evidence, never authority.
+  - **RED:** the suite, extended if it could not see the defect, failing on the parent commit.
+    A pinned example alone is not enough when the law needs a generator dimension.
+  - **GREEN:** the same command passing after the fix.
+  - **Mutant:** the defect, or a plausible wrong design, put back and rejected by the check for
+    the intended reason, not by a timeout or setup error.
+  - **Reach:** for a new generator dimension or state, a declared reach (`testing/reach.ts`) the
+    committed seeds meet.
+  - **Limits:** what the evidence does not cover.
+
+  These do not count as a fix: changing the shadow model or an expectation to match new engine
+  output without an authority, relaxing a comparison or skipping a case without saying so in the
+  commit, and lowering a run count, step count, or seed list. Every fast-check property takes its
+  seed from `seedsFor` (`seeds.test.ts` enforces it), so a failure replays with `MINNOW_SEED`.
 
 ## Traps
 

@@ -64,6 +64,17 @@ const SUITES: Suite[] = [
   { name: "live-oracle", file: "packages/core/src/engine/live-oracle.test.ts" },
   { name: "compaction-interleave", file: "packages/core/src/engine/compaction-interleave.test.ts" },
   { name: "fts-oracle", file: "packages/core/src/engine/fts-oracle.test.ts" },
+  { name: "live-differential", file: "packages/core/src/engine/live-differential.test.ts" },
+  { name: "live-correctness", file: "packages/core/src/engine/live-correctness.test.ts" },
+  { name: "key-forwards", file: "packages/core/src/engine/key-forwards.test.ts" },
+  { name: "json-values", file: "packages/core/src/engine/json-values.test.ts" },
+  {
+    name: "indexeddb-schema4-lookups",
+    file: "packages/core/src/storage/indexeddb-schema4.test.ts",
+  },
+  { name: "opfs-segment-names", file: "packages/core/src/storage/opfs/files.test.ts" },
+  { name: "unicode-properties", file: "packages/core/src/block-format/unicode.test.ts" },
+  { name: "record-json-properties", file: "packages/core/src/storage/toolkit/wire.test.ts" },
 ];
 
 function argument(flag: string): string | undefined {

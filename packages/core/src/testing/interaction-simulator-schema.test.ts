@@ -5,7 +5,7 @@
  * with MINNOW_SEED.
  */
 import { IDBFactory } from "fake-indexeddb";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { IndexedDbBlockStore, MemoryBlockStore, OpfsBlockStore } from "../storage/index.js";
 import { heavyTestTimeout } from "../engine/storage-test-helpers.js";
 import {
@@ -13,11 +13,32 @@ import {
   generateInteractionPlan,
   runInteractionPlan,
   type DriverStoreSource,
+  type InteractionReachState,
 } from "./interaction-simulator.js";
 import { MemoryOpfs } from "./opfs-shim.js";
+import { createReach } from "./reach.js";
 import { seedsFor } from "./seeds.js";
 
 vi.setConfig({ testTimeout: heavyTestTimeout(120_000) });
+
+/**
+ * The states this campaign's seeds must reach on every store: the base campaign's, refused unique
+ * values, schema changes on populated tables, and lookups the secondary index answered.
+ */
+const DECLARED_REACH = [
+  "update-matched",
+  "delete-matched",
+  "write-refused",
+  "limit-truncated",
+  "rollback-discarded",
+  "concurrent-read",
+  "fault-landed",
+  "fault-discarded",
+  "reopen-with-rows",
+  "unique-refused",
+  "alter-populated",
+  "index-lookup-rows",
+] as const satisfies readonly InteractionReachState[];
 
 /**
  * Memory has no durable identity to share, so its connections share one instance. IndexedDB and
@@ -57,6 +78,10 @@ const seedsOver = (name: string): number[] =>
 describe.each(stores)(
   "interaction simulator with constraints and schema changes over $name",
   ({ name, source }) => {
+    const reach = createReach(`interaction-simulator-schema over ${name}`, DECLARED_REACH);
+    afterAll(() => {
+      reach.assertReached();
+    });
     it.each(seedsOver(name))("seed %i", async (seed) => {
       const store = source();
       try {
@@ -83,6 +108,7 @@ describe.each(stores)(
         expect(result.burstCommits).toBeGreaterThanOrEqual(30);
         // The lookups are shaped for the secondary-index path; some must have taken it.
         expect(result.indexPathQueries).toBeGreaterThan(0);
+        reach.recordHistory(result.reached);
       } finally {
         if (typeof store !== "function") store.close();
       }

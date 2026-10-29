@@ -6,7 +6,7 @@
  * and the seed to replay with MINNOW_SEED.
  */
 import { IDBFactory } from "fake-indexeddb";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { IndexedDbBlockStore, MemoryBlockStore, OpfsBlockStore } from "../storage/index.js";
 import { markStoreUncoordinatedForTests } from "../engine/write-coordinator.js";
 import { heavyTestTimeout } from "../engine/storage-test-helpers.js";
@@ -21,12 +21,30 @@ import {
   type DriverStoreSource,
   type Interaction,
   type InteractionPlan,
+  type InteractionReachState,
   type SimulatedConnection,
 } from "./interaction-simulator.js";
 import { MemoryOpfs } from "./opfs-shim.js";
+import { createReach } from "./reach.js";
 import { seedsFor } from "./seeds.js";
 
 vi.setConfig({ testTimeout: heavyTestTimeout(120_000) });
+
+/**
+ * The states this campaign's seeds must reach on every store, or its properties pass without
+ * having been tested where they matter.
+ */
+const DECLARED_REACH = [
+  "update-matched",
+  "delete-matched",
+  "write-refused",
+  "limit-truncated",
+  "rollback-discarded",
+  "concurrent-read",
+  "fault-landed",
+  "fault-discarded",
+  "reopen-with-rows",
+] as const satisfies readonly InteractionReachState[];
 
 /**
  * Memory has no durable identity to share, so its connections share one instance. IndexedDB and
@@ -908,7 +926,11 @@ describe("simulator result-shape oracle", () => {
   });
 });
 
-describe.each(stores)("interaction simulator over $name", ({ source }) => {
+describe.each(stores)("interaction simulator over $name", ({ name, source }) => {
+  const reach = createReach(`interaction-simulator over ${name}`, DECLARED_REACH);
+  afterAll(() => {
+    reach.assertReached();
+  });
   it.each(seedsFor("interaction-simulator", [0x5eed, 0xc0ffee]))("seed %i", async (seed) => {
     const store = source();
     try {
@@ -932,6 +954,7 @@ describe.each(stores)("interaction simulator over $name", ({ source }) => {
       // The default plan ends with an effective insert for each of the four storage fault points;
       // the in-process driver intentionally skips only the separate browser crash point.
       expect(result.faultsInjected).toBeGreaterThanOrEqual(4);
+      reach.recordHistory(result.reached);
     } finally {
       if (typeof store !== "function") store.close();
     }
