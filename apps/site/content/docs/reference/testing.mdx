@@ -781,6 +781,15 @@ wider shapes. Before these checks existed, a `retained` map that kept a changed 
 oracles, and so did a worker that dropped the changed row at position 0. Both are now caught.
 `live-publication.test.ts` gives each law a wrong delivery it must reject.
 
+Correct rows do not prove the work was incremental. `live-work-bounds.test.ts` runs the same
+five commits against each maintained shape at 1,000 and at 50,000 rows. Each run must report the
+same work: delta queries, aggregate groups evaluated, groups put back in order, and patched
+deliveries. Wall time is never measured. Before this check existed, every commit to a grouped
+query evaluated and sorted all of its groups. So a maintained `GROUP BY` over 100,000 groups cost
+as much as running the statement again, about 100 ms, while every row stayed correct.
+`live-differential` also includes grouped shapes with one group per key, so its commits reach the
+path that moves a few groups' rows. It declares reach for both moving and rebuilding.
+
 These checks have limits. The fresh query is Minnow's own engine. The SQLite and PGlite diffs are
 what hold that engine to an outside answer. The React and Kysely bindings consume deliveries
 above this layer and are not driven by these generated histories.

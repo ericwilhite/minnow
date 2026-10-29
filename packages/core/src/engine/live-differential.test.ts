@@ -28,6 +28,7 @@ import type { LivePublicationState } from "../testing/live-publication.js";
 import { createReach } from "../testing/reach.js";
 import { seedsFor } from "../testing/seeds.js";
 import { createBoundary } from "./client-audit-harness.js";
+import { liveAggregateTestHooks } from "./live-aggregate.js";
 import { MinnowDatabaseClient } from "./client.js";
 import { MinnowDatabase } from "./database.js";
 import type { LiveQueryDelivery } from "./live.js";
@@ -52,6 +53,11 @@ const STATEMENTS = [
   "SELECT id, x FROM a WHERE id = 3",
   "SELECT id, x FROM a WHERE id = -3 OR id = 4 ORDER BY id",
   "SELECT DISTINCT g FROM a ORDER BY g",
+  // One group per key: a commit touches a few of many groups, so their output rows move within
+  // the retained order instead of every group being evaluated and sorted again.
+  "SELECT id, COUNT(*) AS n, SUM(x) AS s FROM a GROUP BY id ORDER BY s DESC NULLS LAST, id LIMIT 4",
+  "SELECT x, COUNT(*) AS n FROM a GROUP BY x HAVING COUNT(*) >= 1 ORDER BY n DESC, x NULLS FIRST LIMIT 3 OFFSET 1",
+  "SELECT g, id % 4 AS r, COUNT(*) AS n, SUM(x) AS s FROM a GROUP BY g, id % 4 ORDER BY g, r",
   "SELECT id, x FROM a WHERE x IS NULL ORDER BY id",
 ];
 
@@ -268,6 +274,9 @@ const DECLARED: Record<Mode, readonly LivePublicationState[]> = {
   worker: ["patched", "moved", "replaced", "shrunk", "rerun", "keyChanges"],
 };
 
+/** Maintained aggregates either move their touched groups' rows or rebuild; both must be judged. */
+const AGGREGATE_REACH = ["aggregate-moved", "aggregate-rebuilt"] as const;
+
 interface Opened {
   writer: Writer;
   live: LiveSet;
@@ -299,8 +308,11 @@ async function check(
   writes: readonly Write[],
   mode: Mode,
   reach: ReturnType<typeof createReach<LivePublicationState>>,
+  aggregates: ReturnType<typeof createReach<(typeof AGGREGATE_REACH)[number]>>,
 ): Promise<void> {
   reach.beginHistory();
+  aggregates.beginHistory();
+  const before = { ...liveAggregateTestHooks };
   const store = new MemoryBlockStore();
   const options = { autoCompact: false, autoCollect: false, rowsPerBlock: 4 } as const;
   const database = new MinnowDatabase(store, options);
@@ -342,6 +354,8 @@ async function check(
         expect(replica.rows(), `${at} (rebuilt from patches)`).toEqual(fresh.rows);
       }
     }
+    if (liveAggregateTestHooks.moves > before.moves) aggregates.reach("aggregate-moved");
+    if (liveAggregateTestHooks.rebuilds > before.rebuilds) aggregates.reach("aggregate-rebuilt");
   } finally {
     await opened?.close();
     await database.close();
@@ -355,15 +369,21 @@ const RUNS = Number(process.env.MINNOW_LIVE_RUNS ?? 12);
 describe("live results against fresh execution", () => {
   describe.each(["incremental", "re-run", "worker"] as const)("%s", (mode) => {
     const reach = createReach(`live-differential ${mode}`, DECLARED[mode]);
+    // Re-running never maintains an aggregate, so it owes neither state.
+    const aggregates = createReach(
+      `live-differential ${mode} aggregates`,
+      mode === "re-run" ? [] : AGGREGATE_REACH,
+    );
     afterAll(() => {
       reach.assertReached();
+      aggregates.assertReached();
     });
     it.each(seedsFor("live-differential", [0x11fe]))(
       "every delivery, patch, and final result agree (seed %i)",
       async (seed) => {
         await fc.assert(
           fc.asyncProperty(fc.array(write, { minLength: 10, maxLength: 30 }), (writes) =>
-            check(writes, mode, reach),
+            check(writes, mode, reach, aggregates),
           ),
           { seed, numRuns: RUNS },
         );

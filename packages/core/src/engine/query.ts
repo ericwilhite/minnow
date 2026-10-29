@@ -6215,21 +6215,7 @@ export function executeRowQueryInternal(
             return columns.length === 0 ? [] : [{ alias: source.alias, columns }];
           })
         : [];
-    const sortColumns = plan.orderBy.map(({ expression, direction, nulls }) => ({
-      outputName: orderOutputName(expression, plan.select, orderSources),
-      direction,
-      multiplier: direction === "desc" ? -1 : 1,
-      nulls,
-    }));
-    rows.sort((left, right) => {
-      for (const { outputName, direction, multiplier, nulls } of sortColumns) {
-        const placed = nullOrder(left[outputName], right[outputName], nulls, direction);
-        if (placed !== undefined && placed !== 0) return placed;
-        const comparison = compareValues(left[outputName], right[outputName]);
-        if (comparison !== 0) return comparison * multiplier;
-      }
-      return 0;
-    });
+    rows.sort(outputRowComparator(plan, orderSources));
   }
   if (plan.limit !== undefined || plan.offset !== undefined) {
     const start = plan.offset ?? 0;
@@ -6294,6 +6280,32 @@ interface OrderSourceShape {
  * order with no sign of the problem, which paging built on ORDER BY turns into skipped and
  * repeated rows.
  */
+/**
+ * The ORDER BY comparison the row executor sorts its output rows with: each term by its output
+ * column, NULLs placed as the term says, values by SQL comparison. Equal rows compare 0, so a
+ * stable sort keeps their input order.
+ */
+export function outputRowComparator(
+  plan: CompiledQuery,
+  sources: readonly OrderSourceShape[] = [],
+): (left: QueryRow, right: QueryRow) => number {
+  const sortColumns = plan.orderBy.map(({ expression, direction, nulls }) => ({
+    outputName: orderOutputName(expression, plan.select, sources),
+    direction,
+    multiplier: direction === "desc" ? -1 : 1,
+    nulls,
+  }));
+  return (left, right) => {
+    for (const { outputName, direction, multiplier, nulls } of sortColumns) {
+      const placed = nullOrder(left[outputName], right[outputName], nulls, direction);
+      if (placed !== undefined && placed !== 0) return placed;
+      const comparison = compareValues(left[outputName], right[outputName]);
+      if (comparison !== 0) return comparison * multiplier;
+    }
+    return 0;
+  };
+}
+
 export function orderOutputName(
   expression: Expression,
   select: readonly SelectItem[],

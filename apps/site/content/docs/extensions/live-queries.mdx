@@ -231,9 +231,15 @@ aggregate functions re-execute.
 
 Aggregate patches stage only changed contributions and publish them after result evaluation and
 memory admission succeed. A failed patch or an over-limit result leaves the previous contributions
-intact for retry. Contribution updates and their byte accounting do not scan every input row;
-grouped queries still rebuild their output groups. Ordered maintenance keeps SQL-domain values
-until comparison is complete, including exact NUMERIC ordering.
+intact for retry. Contribution updates and their byte accounting do not scan every input row.
+A grouped query keeps every group's output row in `ORDER BY` order. A commit evaluates `HAVING`
+and the select list only for the groups it touched, and moves those rows to their new places. So
+`GROUP BY customer ORDER BY total DESC LIMIT 10` over a hundred thousand customers answers a
+one-row commit in about a millisecond. A grouped result without `LIMIT` still delivers every
+group, so its cost grows with the number of groups. If a commit touches more than an eighth of
+the groups, the engine sorts them all again. So does a statement with `FETCH … WITH TIES`, a
+statement datetime, or a `LIMIT` or `OFFSET` bound to a parameter. Ordered maintenance keeps
+SQL-domain values until comparison is complete, including exact NUMERIC ordering.
 
 One inner or left join to a unique lookup key can patch base-table changes. A lookup-table change
 runs the statement again. More general joins also re-execute. The zone-map proofs above still
@@ -243,7 +249,8 @@ spare these queries inserts that cannot match.
 
 The engine retains one result per distinct statement, a key-position index, ordering values,
 and at most 64 margin rows for a bounded window. Aggregate maintenance also retains per-key
-contributions, so a small aggregate result can retain state proportional to its input.
+contributions and one output row per group, so a small aggregate result can retain state
+proportional to its input and to its number of groups.
 
 `liveQueries({ maxRetainedBytes })` bounds modeled resident results and maintenance state per
 set; the default is 64 MiB. `stats.retainedBytes` reports that accounting. An over-limit opening
