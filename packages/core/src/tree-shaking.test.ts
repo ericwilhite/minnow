@@ -34,7 +34,7 @@ const SQL_ENGINE_MODULES =
 // Everything the main entry exports, bundled: the in-thread engine. 1125.6 KiB raw / 336.8 KiB gzip.
 const COMPLETE_ENTRY_RAW_BUDGET = 1127 * 1024;
 const COMPLETE_ENTRY_GZIP_BUDGET = 337.5 * 1024;
-// The engine with the larger durable adapter, OPFS. 1526.8 KiB raw / 440.9 KiB gzip.
+// The engine with the larger durable adapter, OPFS. 1527.1 KiB raw / 441.0 KiB gzip.
 const ENGINE_WITH_OPFS_RAW_BUDGET = 1528 * 1024;
 const ENGINE_WITH_OPFS_GZIP_BUDGET = 441.5 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without

@@ -303,6 +303,16 @@ function quotientScale(a: DecimalParts, b: DecimalParts, minimumScale: number): 
   return Math.min(scale, 1000);
 }
 
+/**
+ * A remainder, integer quotient, or sign without JavaScript's negative zero: `-4 % 4` is `-0` in
+ * JavaScript and `0` in PostgreSQL, which has `%`, `MOD`, and `DIV` only for integers and NUMERIC,
+ * neither of which has a negative zero, and whose float8 `SIGN(-0)` is `0`. Every other value,
+ * NaN included, is returned unchanged.
+ */
+export function computedNumber(value: number): number {
+  return value + 0;
+}
+
 export function exactNumericBinary(
   operator: "+" | "-" | "*" | "/" | "%",
   left: unknown,

@@ -77,6 +77,7 @@ import {
   readUntypedText,
 } from "./sql-semantics.js";
 import {
+  computedNumber,
   concatenatedSqlValue,
   exactNumericBinary,
   externalSqlDomainValue,
@@ -6760,7 +6761,7 @@ function compileNumericArithmetic(
   if (operator === "%") {
     return (rows, row) => {
       const divisor = right(rows, row);
-      return divisor === 0 ? NaN : left(rows, row) % divisor;
+      return divisor === 0 ? NaN : computedNumber(left(rows, row) % divisor);
     };
   }
   return undefined;
@@ -7535,7 +7536,7 @@ function binaryValue(
     if (operator === "*") return left * right;
     if (operator === "/")
       return integer ? integerQuotient(left, right) : right === 0 ? null : left / right;
-    if (operator === "%") return right === 0 ? null : left % right;
+    if (operator === "%") return right === 0 ? null : computedNumber(left % right);
   }
   if (operator === "||") return concatenatedSqlValue(left, right);
   // An untyped string constant beside a number is a number, as PostgreSQL types `'5' + 1`. Text
@@ -7560,7 +7561,7 @@ function binaryValue(
   if (operator === "*") return a * b;
   // Division and remainder by zero are NULL, matching SQLite, not Infinity/NaN.
   if (b === 0) return null;
-  return operator === "%" ? a % b : a / b;
+  return operator === "%" ? computedNumber(a % b) : a / b;
 }
 
 function groupKey(value: unknown): GroupIndexKey {

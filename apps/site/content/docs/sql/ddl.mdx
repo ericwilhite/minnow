@@ -293,6 +293,13 @@ columns of a recursive CTE whose first member selects integers. Write `7 / 2.0`,
 quotient is wanted. A bound parameter takes the type of its integer partner, so `qty / $1`
 truncates when `$1` is bound to an integer.
 
+A remainder is never JavaScript's negative zero: `-4 % 4` and `MOD(-4, 4)` are `0`, as in
+PostgreSQL, whose `%`, `MOD`, and `DIV` work on integers and `NUMERIC`, which have no negative
+zero. `DIV` and `SIGN` never return it either. An integer column stores a written `-0` as `0`.
+`DOUBLE PRECISION` keeps `-0` as PostgreSQL's float8 does: `-amount` for a zero `amount` is `-0`.
+Integer multiplication and negation can still return `-0` (`-qty` for a zero `qty`), where
+PostgreSQL returns `0`; SQL compares the two as equal.
+
 Exact decimals never pass through Float64. Precision and scale are enforced on writes, and exact
 comparison, arithmetic, aggregates, windows, grouping, and sorting retain decimal semantics.
 Division picks its result scale the way PostgreSQL does — roughly sixteen significant digits,

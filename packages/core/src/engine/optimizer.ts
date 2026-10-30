@@ -36,6 +36,7 @@ import {
   integerQuotient,
 } from "./query.js";
 import {
+  computedNumber,
   concatenatedSqlValue,
   intervalDomainParts,
   isDateDomainValue,
@@ -3479,7 +3480,7 @@ function foldBinary(
         : operator === "*"
           ? left * right
           : operator === "%"
-            ? left % right
+            ? computedNumber(left % right)
             : left / right;
   return Number.isFinite(result) ? result : undefined;
 }

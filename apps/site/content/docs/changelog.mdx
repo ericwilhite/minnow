@@ -8,6 +8,31 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.18.3 — October 30, 2026
+
+Release packages: `@minnowdb/core@0.18.3`.
+
+- A remainder no longer returns JavaScript's negative zero. `-4 % 4`, `MOD(-4, 4)`, `DIV(-1, 4)`
+  and `SIGN(-0.0)` returned `-0`, where PostgreSQL returns `0`. They now return `0`, and an
+  integer column now stores a written `-0` as `0`. SQL compares `-0` and `0` as equal, but
+  JavaScript's `Object.is` and structural comparisons do not. A grouped live query keyed by
+  `id % 4` delivered `0` after an incremental patch and `-0` when run fresh. `DOUBLE PRECISION`
+  keeps `-0` as before, as PostgreSQL's float8 does. Integer multiplication and negation can
+  still return `-0` (`-qty` for a zero `qty`), where PostgreSQL returns `0`.
+- Garbage collection no longer deletes a compaction or collection job record that finishes
+  while it runs. Collection keeps the eight newest finished records of each kind. It chose them
+  in one pass and deleted the rest in a second, so a record published between the two passes
+  was deleted even though it was the newest: for example, a merge that background collection
+  overlapped. `listCompactionJobs()` then had no record of a compaction that had published. Now
+  collection deletes only records older than the oldest one it chose to keep.
+
+The engine with OPFS measures 441.0 KiB gzipped (previously 440.9 KiB). The generic worker plus
+its client measures 550.4 KiB gzipped (previously 550.3 KiB).
+
+No stored format changes: IndexedDB schema 8 and OPFS layout 13 are unchanged, and 0.18.2 opens
+every database this release writes. Rows already stored with an integer `-0` read back as `-0`
+until they are rewritten. No data migration or export/import step is needed.
+
 ## 0.18.2 — October 29, 2026
 
 Release packages: `@minnowdb/core@0.18.2`.

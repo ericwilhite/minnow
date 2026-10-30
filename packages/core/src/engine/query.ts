@@ -133,6 +133,7 @@ import {
   concatenatedSqlValue,
   dateDomainValue,
   exactNumericAsNumber,
+  computedNumber,
   exactNumericBinary,
   exactNumericLiteral,
   decimalScaleOfNumber,
@@ -576,7 +577,7 @@ function scalarFunctionValueGeneric(
       const exact = exactNumericBinary("%", first, values[1]);
       if (exact !== undefined) return exact;
       const divisor = numeric(values[1]);
-      return divisor === 0 ? null : numeric(first) % divisor;
+      return divisor === 0 ? null : computedNumber(numeric(first) % divisor);
     }
     case "POWER": {
       if (values[1] === null || values[1] === undefined) return null;
@@ -6532,7 +6533,7 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
       if (expression.operator === "*") return a * b;
       // Division and remainder by zero are NULL, matching SQLite, not Infinity/NaN.
       if (b === 0) return null;
-      return expression.operator === "%" ? a % b : a / b;
+      return expression.operator === "%" ? computedNumber(a % b) : a / b;
     }
     case "call": {
       if (aggregateNames.has(expression.name as AggregateName)) {

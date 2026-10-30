@@ -19895,6 +19895,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       if (cursor !== null) await this.#yieldMaintenance();
     } while (cursor !== null);
     const retainedCompactionIds = new Set(newestCompactions.map((job) => job.id));
+    // Records keep finishing while this runs: on this connection's background work, and on
+    // others. One finished after the pass above sorts ahead of the tail it chose and is not in
+    // it, so the pass below drops only records that sort behind the tail's oldest entry.
+    const oldestRetained =
+      newestCompactions.length === AUTO_COLLECT_RETAINED_JOB_RECORDS
+        ? newestCompactions[newestCompactions.length - 1]
+        : undefined;
+    const prunable = (job: CompactionJobRecord): boolean =>
+      !retainedCompactionIds.has(job.id) &&
+      oldestRetained !== undefined &&
+      newestFirst(job, oldestRetained) > 0;
 
     // Retry IDs sort next to their base ID. Keep at most one newest failed attempt for each
     // still-readable source snapshot; it carries the cumulative lifetime write budget. The
@@ -19912,7 +19923,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           continue;
         }
         if (job.state === "published") {
-          if (!retainedCompactionIds.has(job.id)) await this.store.removeCompactionJob(job.id);
+          if (prunable(job)) await this.store.removeCompactionJob(job.id);
           continue;
         }
 
@@ -19928,7 +19939,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           readableManifestVersion = job.sourceManifestVersion;
         }
         if (!readableManifest) {
-          if (!retainedCompactionIds.has(job.id)) await this.store.removeCompactionJob(job.id);
+          if (prunable(job)) await this.store.removeCompactionJob(job.id);
           continue;
         }
 
@@ -19937,11 +19948,11 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           continue;
         }
         if (newestFirst(job, newestReadableFailure) < 0) {
-          if (!retainedCompactionIds.has(newestReadableFailure.id)) {
+          if (prunable(newestReadableFailure)) {
             await this.store.removeCompactionJob(newestReadableFailure.id);
           }
           newestReadableFailure = job;
-        } else if (!retainedCompactionIds.has(job.id)) {
+        } else if (prunable(job)) {
           await this.store.removeCompactionJob(job.id);
         }
       }
@@ -19960,11 +19971,21 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       if (cursor !== null) await this.#yieldMaintenance();
     } while (cursor !== null);
     const retainedCollectionIds = new Set(newestCollections.map((job) => job.id));
+    // As for compactions: a collection that completed after the pass above is kept.
+    const oldestCollection =
+      newestCollections.length === AUTO_COLLECT_RETAINED_JOB_RECORDS
+        ? newestCollections[newestCollections.length - 1]
+        : undefined;
     cursor = null;
     do {
       const page = await this.store.listGarbageCollectionJobPage(cursor, MAINTENANCE_JOB_PAGE_SIZE);
       for (const job of page.records) {
-        if (job.state === "completed" && !retainedCollectionIds.has(job.id)) {
+        if (
+          job.state === "completed" &&
+          !retainedCollectionIds.has(job.id) &&
+          oldestCollection !== undefined &&
+          newestFirst(job, oldestCollection) > 0
+        ) {
           await this.store.removeGarbageCollectionJob(job.id);
         }
       }
@@ -30574,12 +30595,14 @@ function normalizeDomainBatch(table: TableRecord, input: ColumnarBatch): void {
     if (values === undefined) continue;
     if (
       column.sqlDomain !== undefined ||
-      // A datetime column rewrites only when a SQL DATE value reached it, and a number column
-      // only when a tagged exact-NUMERIC constant did (a SQL literal like 0.1/3 evaluated
-      // exactly): every other value normalizes to itself, so plain bulk loads never copy here.
+      // A datetime column rewrites only when a SQL DATE value reached it, a number column only
+      // when a tagged exact-NUMERIC constant did (a SQL literal like 0.1/3 evaluated exactly),
+      // and an integer column only when it got a -0: every other value normalizes to itself, so
+      // plain bulk loads never copy here.
       (column.type === "datetime" && values.some((value) => typeof value === "string")) ||
       (column.type === "number" &&
-        values.some((value) => typeof value === "string" && isExactNumeric(value)))
+        values.some((value) => typeof value === "string" && isExactNumeric(value))) ||
+      integerNegativeZero(column, values)
     ) {
       (input.columns as Record<string, readonly BatchValue[]>)[column.name] = values.map((value) =>
         normalizeColumnLogicalValue(column, value),
@@ -30588,8 +30611,14 @@ function normalizeDomainBatch(table: TableRecord, input: ColumnarBatch): void {
   }
 }
 
+/** An integer column never stores JavaScript's negative zero; PostgreSQL's integers have none. */
+function integerNegativeZero(column: TableColumnRecord, values: readonly BatchValue[]): boolean {
+  return column.integer === true && values.some((value) => Object.is(value, -0));
+}
+
 function normalizeColumnLogicalValue(column: TableColumnRecord, value: BatchValue): BatchValue {
   if (column.sqlDomain !== undefined) return normalizeSqlDomainValue(column.sqlDomain, value);
+  if (column.integer === true && Object.is(value, -0)) return 0;
   if (column.type === "datetime" && isDateDomainValue(value)) {
     const external = externalSqlDomainValue(value);
     if (typeof external !== "string") throw new TypeError("Invalid DATE value");
@@ -30728,8 +30757,9 @@ function normalizeUpsertConflictWhere(
 
 function normalizeDomainUpdate(table: TableRecord, input: UpdateBatchInput): UpdateBatchInput {
   const numberColumnNeedsCast = (column: TableColumnRecord, values: readonly BatchValue[]) =>
-    column.type === "number" &&
-    values.some((value) => typeof value === "string" && isExactNumeric(value));
+    (column.type === "number" &&
+      values.some((value) => typeof value === "string" && isExactNumeric(value))) ||
+    integerNegativeZero(column, values);
   if (
     !table.columns.some((column) => column.sqlDomain !== undefined || column.type === "datetime") &&
     !Object.entries(input.changes).some(([name, values]) => {

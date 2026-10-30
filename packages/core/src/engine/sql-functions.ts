@@ -18,6 +18,7 @@ import {
 } from "../date-value.js";
 import { MAX_SQL_SCALAR_RESULT_CHARACTERS } from "./cache-limits.js";
 import {
+  computedNumber,
   dateDomainValue,
   exactNumericRounded,
   exactNumericIntegerDivision,
@@ -1230,7 +1231,7 @@ export const simpleScalarFunctions: ReadonlyMap<string, SimpleScalarFunction> = 
       evaluate: (values) =>
         isExactNumeric(values[0])
           ? exactNumericUnary("SIGN", values[0])
-          : Math.sign(number("SIGN", values[0])),
+          : computedNumber(Math.sign(number("SIGN", values[0]))),
     },
   ],
   [
@@ -1289,7 +1290,7 @@ export const simpleScalarFunctions: ReadonlyMap<string, SimpleScalarFunction> = 
         if (exact !== undefined) return exact;
         const divisor = number("DIV", values[1]);
         if (divisor === 0) throw new TypeError("DIV by zero");
-        return Math.trunc(number("DIV", values[0]) / divisor);
+        return computedNumber(Math.trunc(number("DIV", values[0]) / divisor));
       },
     },
   ],
