@@ -78,8 +78,11 @@ describe("large commits from a follower", () => {
   it("runs a re-sent large commit once, under the identity of its first delivery", async () => {
     const name = "follower-resend";
     const { leader, follower } = await pair(name);
-    const createdAt = new Date().toISOString();
-    const later = new Date(Date.now() + 60 * 60_000).toISOString();
+    // One clock read: the expiry is exactly the one-hour maximum after the start, and a second
+    // read a millisecond later would put it past that maximum.
+    const now = Date.now();
+    const createdAt = new Date(now).toISOString();
+    const later = new Date(now + 60 * 60_000).toISOString();
     await follower.addTable({
       id: "keyed",
       name: "keyed",
