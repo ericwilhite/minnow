@@ -250,6 +250,14 @@ emit it as a separate worker chunk. Vite's default worker format is `iife`, whic
 that chunk further, so a Vite worker built from the generic entry carries all three stores — use a
 [per-store entry](#per-store-worker-entries) or set `worker: { format: "es" }`.
 
+**Restart the Vite dev server after upgrading any `@minnowdb` package.** A running dev server
+keeps serving the files it resolved when it started, even after the install replaces them. That
+holds for its pre-bundled dependencies and, when `@minnowdb/core` is listed in
+`optimizeDeps.exclude`, for core itself. Until the restart, the page and its worker run the old
+release. Fetching a file from the new version's folder doesn't prove the page loads it: check the
+import paths in the modules the page actually loaded. If a restart still serves the old files,
+start it with `vite --force`.
+
 **esbuild** (and Parcel 2 by default) doesn't rewrite `new URL` worker expressions. Bundle the
 worker entry separately and point at the output:
 

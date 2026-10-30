@@ -44,7 +44,11 @@ function createBoundary(): { clientSide: ClientTransport; workerSide: RpcScope }
     },
     workerSide: {
       postMessage: (message) => deliver(clientListeners, message),
-      addEventListener: (_type, listener) => workerListeners.push(listener),
+      // The host also listens for "error", "unhandledrejection" and "messageerror"; those are
+      // the scope's own events, never frames from the client.
+      addEventListener: (type: string, listener) => {
+        if (type === "message") workerListeners.push(listener);
+      },
     },
   };
 }

@@ -13,8 +13,9 @@
  *     subscriber exists, then the component commits and subscribes.
  *   - `suspense-strict`: the same under StrictMode, which subscribes, unsubscribes, and
  *     subscribes again on mount. Simulated in one turn, this can understate what real React does
- *     (it also lets the first subscription open); `packages/react/src/suspense.test.ts` counts
- *     engine subscriptions under real Suspense and StrictMode.
+ *     (it also lets the first subscription open). `packages/react/src/suspense.test.ts` counts
+ *     engine subscriptions under real Suspense and StrictMode, and `suspense-stack.test.ts` does
+ *     it through a worker client and a Kysely live query.
  *
  *   npm run benchmark:live-wide -- [--rounds 3] [--rows 15933] [--top]
  *
