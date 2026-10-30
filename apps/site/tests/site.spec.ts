@@ -134,10 +134,19 @@ test("the playground never erases a newer IndexedDB schema during a downgrade", 
     newer,
   );
 
+  // A database a newer build left behind: the page reloads once to fetch that build (here the
+  // same one), then reports that it cannot open the database rather than reloading again.
+  let loads = 0;
+  page.on("load", () => {
+    loads += 1;
+  });
   await page.goto("/");
+  await expect.poll(() => loads, { timeout: 60_000 }).toBe(2);
   await expect(page.getByText(/The playground could not start:/)).toBeVisible({
     timeout: 60_000,
   });
+  await page.waitForTimeout(1_000);
+  expect(loads).toBe(2);
 
   const untouched = await page.evaluate(
     () =>
