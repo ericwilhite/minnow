@@ -106,6 +106,15 @@ function reconcileRows<TRow>(
 }
 
 /**
+ * How long the engine subscription a cold `refresh()` opened waits for its first subscriber.
+ * React Suspense loads a query with `refresh()` and subscribes only when the component commits,
+ * which can wait on every other query in the same boundary. Closing the subscription in between
+ * would make the engine run the query and deliver its whole result a second time for that
+ * subscriber. A render that never commits releases the subscription when this runs out.
+ */
+const REFRESH_HANDOFF_MS = 30_000;
+
+/**
  * One typed live SELECT. It is also a framework-neutral external store: getSnapshot is stable
  * until state changes and subscribe returns synchronous cleanup. Slow consumers coalesce to the
  * newest invalidation; errors retain the last good rows.
@@ -134,6 +143,7 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
   #invalidationSequence = 0;
   #closed = false;
   #refreshLeases = 0;
+  #releaseTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(backend: LiveQueryBackend, source: LiveQuerySource<TRow>, onClose?: () => void) {
     this.#backend = backend;
@@ -148,13 +158,16 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
     // A subscription is a lease, even when a framework reuses the same callback function.
     const registered = (): void => listener();
     this.#listeners.add(registered);
+    this.#cancelRelease();
     if (this.#listeners.size === 1) this.#startObservation();
     let subscribed = true;
     return () => {
       if (!subscribed) return;
       subscribed = false;
       this.#listeners.delete(registered);
-      if (this.#listeners.size === 0 && this.#refreshLeases === 0) this.#stopObservation();
+      // Released on the next task rather than now: React StrictMode, and a component remounted
+      // in the same commit, unsubscribe and subscribe again synchronously.
+      if (this.#listeners.size === 0 && this.#refreshLeases === 0) this.#releaseAfter(0);
     };
   };
 
@@ -163,6 +176,7 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
     // A one-shot refresh must also load direct-delivery sources before any framework
     // subscription commits (including React Suspense). Concurrent refreshes share the lease.
     this.#refreshLeases += 1;
+    this.#cancelRelease();
     try {
       const sequence = this.#invalidationSequence;
       if (this.#listeners.size > 0 || this.#decodes()) {
@@ -187,7 +201,9 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
       await this.#waitForIdle();
     } finally {
       this.#refreshLeases -= 1;
-      if (this.#refreshLeases === 0 && this.#listeners.size === 0) this.#stopObservation();
+      if (this.#refreshLeases === 0 && this.#listeners.size === 0) {
+        this.#releaseAfter(REFRESH_HANDOFF_MS);
+      }
     }
   }
 
@@ -204,6 +220,7 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    this.#cancelRelease();
     this.#observationGeneration += 1;
     this.#executionAbort?.abort(new Error("Live query is closed"));
     const subscription = this.#subscription;
@@ -270,6 +287,29 @@ export class LiveQuery<out TRow> implements AsyncIterable<LiveSnapshot<TRow>> {
       this.#subscription = undefined;
       this.#setError(error, this.#currentVersion());
     });
+  }
+
+  /** Stops observing after `graceMs` unless a subscriber or refresh holds the query by then. */
+  #releaseAfter(graceMs: number): void {
+    this.#cancelRelease();
+    // Nothing open to hand over: stop now, which also cancels an execution in flight.
+    if (this.#subscription === undefined) {
+      this.#stopObservation();
+      return;
+    }
+    const timer = setTimeout(() => {
+      this.#releaseTimer = undefined;
+      if (this.#listeners.size === 0 && this.#refreshLeases === 0) this.#stopObservation();
+    }, graceMs);
+    // A pending release must not keep a Node process alive.
+    (timer as { unref?: () => void }).unref?.();
+    this.#releaseTimer = timer;
+  }
+
+  #cancelRelease(): void {
+    if (this.#releaseTimer === undefined) return;
+    clearTimeout(this.#releaseTimer);
+    this.#releaseTimer = undefined;
   }
 
   #stopObservation(): void {

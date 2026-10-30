@@ -1,12 +1,19 @@
 import { stringArgument } from "./sql-semantics.js";
 import {
   boundedJsonText,
+  builtJsonDomainValue,
   externalSqlDomainValue,
   isExactNumeric,
   jsonDomainDocument,
+  preservedJsonDomainValue,
 } from "./sql-domains.js";
+import { assertWellFormedString } from "../block-format/unicode.js";
 import { JsonNumber, parseJsonValue } from "./json-values.js";
-import { MAX_CACHEABLE_TEXT_CHARACTERS, MAX_SQL_SCALAR_RESULT_CHARACTERS } from "./cache-limits.js";
+import {
+  MAX_CACHEABLE_TEXT_CHARACTERS,
+  MAX_SQL_SCALAR_RESULT_CHARACTERS,
+  MAX_SQL_STRUCTURED_VALUE_ITEMS,
+} from "./cache-limits.js";
 
 /**
  * SQL/JSON scalar support (T801 family). Documents may be ordinary JSON text or native JSON/JSONB
@@ -186,19 +193,32 @@ function jsonValueOf(value: unknown): unknown {
 }
 
 /**
- * JSON_ARRAY(v, ...) and JSON_OBJECT(k, v, ...) (T811/T812). The omitted null-handling clause is
- * `NULL ON NULL`: SQL NULL becomes a JSON null. `ABSENT ON NULL` is a separate spelling rather
- * than the default. Constructors return JSON text at the JavaScript boundary.
+ * JSON_ARRAY(v, ...) and JSON_OBJECT(k, v, ...) (T811/T812) as a JSON-domain value. The omitted
+ * null-handling clause is `NULL ON NULL`: SQL NULL becomes a JSON null. `ABSENT ON NULL` is a
+ * separate spelling rather than the default. Constructors return JSON text at the JavaScript
+ * boundary.
  */
 export function jsonConstructor(
   name: "JSON_ARRAY" | "JSON_OBJECT",
   values: readonly unknown[],
 ): string {
+  // Scalar members are encoded and bounded one by one, so a document built only from them is
+  // valid one level deep by construction. A member that is itself a JSON document is embedded as
+  // its text, and only then can the whole exceed the nesting and item limits; that document, or
+  // one with more members than the item limit, is checked by the validating parse.
+  const validate = values.length >= MAX_SQL_STRUCTURED_VALUE_ITEMS || values.some(isJsonDocument);
+  // The document's pieces, joined once at the end: the members are not concatenated one by one.
+  const pieces: string[] = [];
   if (name === "JSON_ARRAY") {
-    const members = values.map((value) => boundedJsonValue(value ?? null, "JSON_ARRAY value"));
-    return joinBoundedJson("[", members, "]", "JSON_ARRAY result");
+    pieces.push("[");
+    for (const value of values) {
+      if (pieces.length > 1) pieces.push(",");
+      pieces.push(boundedJsonValue(value ?? null, "JSON_ARRAY value"));
+    }
+    pieces.push("]");
+    return constructedJsonValue(pieces, "JSON_ARRAY result", validate);
   }
-  const members: string[] = [];
+  pieces.push("{");
   for (let index = 0; index + 1 < values.length; index += 2) {
     const rawKey = externalSqlDomainValue(values[index]);
     if (rawKey === null || rawKey === undefined) {
@@ -216,17 +236,36 @@ export function jsonConstructor(
     // special names such as "__proto__".
     // Keys are always JSON strings. In particular, a JSON-domain expression used as a key is
     // its document text, not a raw object member token as JSON-domain values are below.
-    const encodedKey = boundedJsonString(key, "JSON_OBJECT key");
-    const encodedValue = boundedJsonValue(member ?? null, "JSON_OBJECT value");
-    members.push(`${encodedKey}:${encodedValue}`);
+    if (pieces.length > 1) pieces.push(",");
+    pieces.push(
+      boundedJsonString(key, "JSON_OBJECT key"),
+      ":",
+      boundedJsonValue(member ?? null, "JSON_OBJECT value"),
+    );
   }
-  return joinBoundedJson("{", members, "}", "JSON_OBJECT result");
+  pieces.push("}");
+  return constructedJsonValue(pieces, "JSON_OBJECT result", validate);
+}
+
+function isJsonDocument(value: unknown): boolean {
+  return jsonDomainDocument(value) !== undefined;
+}
+
+/** A constructed document, given as its pieces, as one bounded JSON-domain value. */
+function constructedJsonValue(pieces: string[], label: string, validate: boolean): string {
+  let length = 0;
+  for (const piece of pieces) length += piece.length;
+  if (length > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
+    throw new RangeError(`${label} exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`);
+  }
+  return validate ? preservedJsonDomainValue(pieces.join("")) : builtJsonDomainValue(pieces);
 }
 
 function boundedJsonString(value: string, label: string): string {
   if (value.length > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
     throw new RangeError(`${label} exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`);
   }
+  assertWellFormedString(value, label);
   const encoded = JSON.stringify(value);
   if (encoded.length > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
     throw new RangeError(`${label} exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`);
@@ -271,28 +310,6 @@ function boundedJsonValue(value: unknown, label: string): string {
     throw new RangeError(`${label} exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`);
   }
   return encoded;
-}
-
-function joinBoundedJson(
-  prefix: string,
-  members: readonly string[],
-  suffix: string,
-  label: string,
-): string {
-  let length = prefix.length + suffix.length;
-  for (const member of members) {
-    length += member.length;
-    if (!Number.isSafeInteger(length) || length > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
-      throw new RangeError(
-        `${label} exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`,
-      );
-    }
-  }
-  if (members.length > 1) length += members.length - 1;
-  if (!Number.isSafeInteger(length) || length > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
-    throw new RangeError(`${label} exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`);
-  }
-  return `${prefix}${members.join(",")}${suffix}`;
 }
 import { dateMilliseconds } from "../date-value.js";
 import { postgresTimestampJsonText } from "./sql-datetime-text.js";

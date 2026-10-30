@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MemoryBlockStore } from "../storage/index.js";
 import { MinnowDatabase } from "./database.js";
 import { LiveQuerySet, type LiveQueryHost, type LiveQuerySubscribeOptions } from "./live.js";
@@ -136,17 +136,25 @@ describe("audited live delivery boundaries", () => {
   });
 
   it("loads concurrent cold refreshes once and releases the temporary subscription", async () => {
-    const fixture = deliveringBackend();
-    const query = new LiveQuery(fixture.backend, {
-      query: "SELECT id FROM t",
-      execute: async () => [],
-      decode: (result) => result.rows,
-    });
-    await Promise.all([query.refresh(), query.refresh()]);
-    await settle();
-    expect(query.getSnapshot()).toMatchObject({ status: "ready", rows: [{ id: 1 }, { id: 2 }] });
-    expect(fixture.counts()).toEqual({ opens: 1, closes: 1 });
-    query.close();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const fixture = deliveringBackend();
+      const query = new LiveQuery(fixture.backend, {
+        query: "SELECT id FROM t",
+        execute: async () => [],
+        decode: (result) => result.rows,
+      });
+      await Promise.all([query.refresh(), query.refresh()]);
+      await settle();
+      expect(query.getSnapshot()).toMatchObject({ status: "ready", rows: [{ id: 1 }, { id: 2 }] });
+      // Kept for a subscriber to take over, then released when none does.
+      expect(fixture.counts()).toEqual({ opens: 1, closes: 0 });
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(fixture.counts()).toEqual({ opens: 1, closes: 1 });
+      query.close();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it.each([false, true])(

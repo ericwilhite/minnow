@@ -81,7 +81,6 @@ import {
   exactNumericBinary,
   externalSqlDomainValue,
   isExactNumeric,
-  preservedJsonDomainValue,
   protectedSqlTextValue,
   isSqlDomainValue,
 } from "./sql-domains.js";
@@ -6456,11 +6455,9 @@ function evaluateFinalExpression(
     if (orderBy.length > 0) {
       members.sort((left, right) => compareAggregateOrder(orderBy, left.order, right.order));
     }
-    return preservedJsonDomainValue(
-      jsonConstructor(
-        "JSON_ARRAY",
-        members.map(({ value }) => value),
-      ),
+    return jsonConstructor(
+      "JSON_ARRAY",
+      members.map(({ value }) => value),
     );
   }
   if (expression.name === "STRING_AGG") {
@@ -6509,12 +6506,52 @@ function evaluateFinalExpression(
 }
 
 /**
- * Builds one result row by direct property assignment in stable select order: every projected
- * row shares one hidden class and the per-row tuple/array churn of an entries-based build never
- * exists. This runs once per surviving row, so it is the hottest allocation site of a query.
+ * A plan's result-row shape, built once per plan: every output column in select order with a
+ * null value, and for `SELECT *` the vector behind each column.
+ */
+interface ProjectionLayout {
+  readonly template: QueryRow;
+  readonly wildcard: ReadonlyArray<{
+    readonly name: string;
+    readonly source: number;
+    readonly vector: ColumnVector;
+  }>;
+}
+
+const projectionLayouts = new WeakMap<BoundPlan, ProjectionLayout>();
+
+function projectionLayout(plan: BoundPlan): ProjectionLayout {
+  let layout = projectionLayouts.get(plan);
+  if (layout !== undefined) return layout;
+  const wildcard: Array<ProjectionLayout["wildcard"][number]> = [];
+  if (plan.wildcard) {
+    // The output names, in the order the loop below visits the same columns.
+    const outputNames = wildcardColumnNames(plan);
+    for (let source = 0; source < plan.sourceTables.length; source += 1) {
+      const table = required(plan.sourceTables[source], "Wildcard source table is missing");
+      for (const [name, vector] of table.columns) {
+        if (name.startsWith("\0")) continue;
+        wildcard.push({ name: outputNames[wildcard.length] ?? name, source, vector });
+      }
+    }
+  }
+  const names = plan.wildcard
+    ? wildcard.map(({ name }) => name)
+    : plan.select.map(({ alias }) => alias);
+  layout = { template: Object.fromEntries(names.map((name) => [name, null])), wildcard };
+  projectionLayouts.set(plan, layout);
+  return layout;
+}
+
+/**
+ * Builds one result row in stable select order. This runs once per surviving row, so it is the
+ * hottest allocation site of a query. The row is cloned from the plan's template, so it is born
+ * with every column: a wide row built by assigning computed names one at a time is moved by V8 to
+ * slow dictionary properties, which costs several times the row's own size in garbage as it grows.
  */
 function projectBatchRow(plan: BoundPlan, batch: BatchRows, row: number): QueryRow {
-  const result: QueryRow = {};
+  const layout = projectionLayout(plan);
+  const result: QueryRow = { ...layout.template };
   if (!plan.wildcard) {
     if (plan.directProjection) {
       for (const item of plan.select) {
@@ -6537,21 +6574,10 @@ function projectBatchRow(plan: BoundPlan, batch: BatchRows, row: number): QueryR
     }
     return result;
   }
-  const multiple =
-    plan.sourceTables.filter((table) =>
-      [...table.columns.keys()].some((name) => !name.startsWith("\0")),
-    ).length > 1;
-  for (let source = 0; source < plan.sourceTables.length; source += 1) {
-    const table = required(plan.sourceTables[source], "Wildcard source table is missing");
-    const rowIndex = batch.rowsBySource[source]?.[row] ?? -1;
-    const prefix = multiple ? `${plan.sourceAliases[source] ?? ""}.` : "";
-    for (const [name, vector] of table.columns) {
-      if (name.startsWith("\0")) continue;
-      const outputName = multiple ? prefix + name : name;
-      const value = vectorValue(vector, rowIndex);
-      if (outputName === "__proto__") defineSqlResultProperty(result, outputName, value);
-      else result[outputName] = value;
-    }
+  for (const { name, source, vector } of layout.wildcard) {
+    const value = vectorValue(vector, batch.rowsBySource[source]?.[row] ?? -1);
+    if (name === "__proto__") defineSqlResultProperty(result, name, value);
+    else result[name] = value;
   }
   return result;
 }

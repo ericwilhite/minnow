@@ -302,7 +302,12 @@ reports invalidations without delivering rows; with `suppressUnchanged: true` th
 statement itself and invalidates only when the rows changed, which is what typed adapters use.
 
 A decoded typed query can load through `refresh()` before any listener subscribes, including
-React Suspense's first render. It uses a temporary subscription and releases it after loading.
+React Suspense's first render. The engine subscription that loaded it stays open for the first
+subscriber, so the component that commits afterwards takes over the delivered result instead of
+the engine running the query and sending the whole result again. If nobody subscribes within 30
+seconds (a render that was abandoned, for example), the subscription is released. When the last
+subscriber leaves, the subscription is released on the next task, so an immediate unsubscribe
+and subscribe — React StrictMode does this on mount — also keeps it.
 Decoder output is checked before reusing retained rows, so reordering and cross-row transforms
 cannot attach a newer version to stale values. Consumer error and completion callbacks are
 isolated so one throwing callback cannot stop other subscriptions or later sweeps.

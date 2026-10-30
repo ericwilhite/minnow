@@ -21,29 +21,30 @@ after generated declarations or asynchronous signatures change.
 
 ## Choose the smallest runner that proves the change
 
-| Command                            | What it runs                                                                                                                                                   | Use it for                                  |
-| ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
-| `npm test`                         | Vitest plus the committed fast SQLLogicTest profile                                                                                                            | Normal implementation work                  |
-| `npm run test:unit`                | Vitest unit, generated, simulator, comparison, and harness tests                                                                                               | A focused inner loop                        |
-| `npm run test:sql:standard`        | 6,345 result-checked upstream queries; committed, offline, about fifteen seconds                                                                               | Every SQL or optimizer change               |
-| `npm run test:sql:full`            | The full supported profile, including exhaustive multi-way join permutations                                                                                   | Before a release                            |
-| `npm run test:coverage`            | Vitest with the coverage floors enforced                                                                                                                       | Before pushing                              |
-| `npm run soak`                     | The generative suites on fresh random seeds, to find new failures                                                                                              | Hunting bugs rather than pinning            |
-| `npm run simulate`                 | One replayable deterministic concurrency, fault, and storage simulation                                                                                        | Storage and transaction changes             |
-| `npm run test:simulator:full`      | 4,000 concurrent mutations plus deterministic fault and maintenance checkpoints, then three long interaction plans over the memory, IndexedDB, and OPFS stores | Before a release                            |
-| `npm run simulate:interactions`    | One replayable interaction plan: DDL, DML, transactions, concurrent rounds, faults, reopens, and maintenance against a shadow model                            | Engine, index, and transaction changes      |
-| `npm run test:packed`              | Differential, conformance, and SQLLogicTest suites with every segment packed that can be; `:full` adds the simulators                                          | Packed-segment and block-read changes       |
-| `npm run fixture:format`           | Freezes a database this build wrote, as a compatibility fixture                                                                                                | Before changing a format version            |
-| `npm run test:browser:library`     | Core IndexedDB, OPFS, transaction, SQLLogicTest, and multi-tab interaction-plan tests in Chromium, Firefox, and WebKit                                         | Storage, engine, or browser-runtime changes |
-| `npm run test:browser:conformance` | Full core browser suite, full SQLLogicTest, and 800-step interactions over native IndexedDB and OPFS in all three browsers                                     | Release and nightly storage correctness     |
-| `npm run test:browser:site`        | Public-site examples in Chromium, Firefox, and WebKit                                                                                                          | Docs, examples, and site changes            |
-| `npm run test:browser`             | Both browser runners, in sequence                                                                                                                              | Cross-browser regression checks             |
-| `npm run test:consumer`            | Packed libraries installed, typed, bundled, and run outside the workspace                                                                                      | Package and public-entry changes            |
-| `npm run benchmark:gate`           | Seeded Node performance ratios against the checked-in baseline                                                                                                 | Query-executor and write-path changes       |
-| `npm run benchmark:sizes`          | Download size of Minnow, SQLite Wasm, and PGlite, from the installed packages                                                                                  | Dependency or public-entry changes          |
-| `npm run api:check`                | The public API surface against the committed contract snapshot                                                                                                 | Public-entry or declaration changes         |
-| `npm run check`                    | Format, types, lint, build, API contract, coverage, fast SQLLogicTest, and `test:packed`                                                                       | The local merge gate                        |
-| `npm run check:release`            | The local gate, full SQL/simulator (also forced-packed), performance, and browser runners                                                                      | Release candidates                          |
+| Command                            | What it runs                                                                                                                                                   | Use it for                                      |
+| ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------- |
+| `npm test`                         | Vitest plus the committed fast SQLLogicTest profile                                                                                                            | Normal implementation work                      |
+| `npm run test:unit`                | Vitest unit, generated, simulator, comparison, and harness tests                                                                                               | A focused inner loop                            |
+| `npm run test:sql:standard`        | 6,345 result-checked upstream queries; committed, offline, about fifteen seconds                                                                               | Every SQL or optimizer change                   |
+| `npm run test:sql:full`            | The full supported profile, including exhaustive multi-way join permutations                                                                                   | Before a release                                |
+| `npm run test:coverage`            | Vitest with the coverage floors enforced                                                                                                                       | Before pushing                                  |
+| `npm run soak`                     | The generative suites on fresh random seeds, to find new failures                                                                                              | Hunting bugs rather than pinning                |
+| `npm run simulate`                 | One replayable deterministic concurrency, fault, and storage simulation                                                                                        | Storage and transaction changes                 |
+| `npm run test:simulator:full`      | 4,000 concurrent mutations plus deterministic fault and maintenance checkpoints, then three long interaction plans over the memory, IndexedDB, and OPFS stores | Before a release                                |
+| `npm run simulate:interactions`    | One replayable interaction plan: DDL, DML, transactions, concurrent rounds, faults, reopens, and maintenance against a shadow model                            | Engine, index, and transaction changes          |
+| `npm run test:packed`              | Differential, conformance, and SQLLogicTest suites with every segment packed that can be; `:full` adds the simulators                                          | Packed-segment and block-read changes           |
+| `npm run fixture:format`           | Freezes a database this build wrote, as a compatibility fixture                                                                                                | Before changing a format version                |
+| `npm run test:browser:library`     | Core IndexedDB, OPFS, transaction, SQLLogicTest, and multi-tab interaction-plan tests in Chromium, Firefox, and WebKit                                         | Storage, engine, or browser-runtime changes     |
+| `npm run test:browser:conformance` | Full core browser suite, full SQLLogicTest, and 800-step interactions over native IndexedDB and OPFS in all three browsers                                     | Release and nightly storage correctness         |
+| `npm run test:browser:site`        | Public-site examples in Chromium, Firefox, and WebKit                                                                                                          | Docs, examples, and site changes                |
+| `npm run test:browser`             | Both browser runners, in sequence                                                                                                                              | Cross-browser regression checks                 |
+| `npm run test:consumer`            | Packed libraries installed, typed, bundled, and run outside the workspace                                                                                      | Package and public-entry changes                |
+| `npm run benchmark:gate`           | Seeded Node performance ratios against the checked-in baseline                                                                                                 | Query-executor and write-path changes           |
+| `npm run benchmark:sizes`          | Download size of Minnow, SQLite Wasm, and PGlite, from the installed packages                                                                                  | Dependency or public-entry changes              |
+| `npm run benchmark:live-wide`      | Allocation per thread, deliveries, and time to rows for one wide live query from subscribe and from a Suspense load                                            | Live-query, projection, and result-wire changes |
+| `npm run api:check`                | The public API surface against the committed contract snapshot                                                                                                 | Public-entry or declaration changes             |
+| `npm run check`                    | Format, types, lint, build, API contract, coverage, fast SQLLogicTest, and `test:packed`                                                                       | The local merge gate                            |
+| `npm run check:release`            | The local gate, full SQL/simulator (also forced-packed), performance, and browser runners                                                                      | Release candidates                              |
 
 Install the browser binaries once before using a browser runner:
 
@@ -886,6 +887,15 @@ databases opened and closed over one store — runs in rounds with a forced coll
 reading after each. The assertion is a plateau: the last rounds may not sit more than a bounded
 margin above the early ones. The database runs with a small buffer pool so the pool fills during
 the warm-up rounds, which are excluded; a climb that continues past a full pool is a leak.
+
+A leak is memory kept; a burst is memory allocated and dropped, which a page still pays for in
+heap growth and collection time. `npm run benchmark:live-wide` measures the burst of one large
+live query: 15,933 rows over 13 joins, 63 columns, 12 of them `JSON_OBJECT` columns, decoded
+through Kysely with `json: "parse"`. The database runs in a worker thread on the stock worker
+host, and each thread samples its own allocations, collected objects included. It reports bytes
+allocated per thread, how many times the result was delivered, and the time until rows are ready,
+for a plain subscribe and for a Suspense load (`refresh()`, then a subscriber). The React suite
+counts the same deliveries under real Suspense and StrictMode.
 
 ## Concurrent writes
 

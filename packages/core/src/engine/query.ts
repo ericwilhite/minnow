@@ -508,7 +508,7 @@ function scalarFunctionValueGeneric(
   }
   if (name === "JSON_ARRAY" || name === "JSON_OBJECT") {
     // These build from every argument, so a NULL first one is data, not an early exit.
-    return preservedJsonDomainValue(jsonConstructor(name, values));
+    return jsonConstructor(name, values);
   }
   if (name === "ARRAY") return arrayDomainValue(values);
   if (name === "MINNOW_ARRAY_ELEMENT") {
@@ -6616,11 +6616,9 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
           }
           return members.length === 0
             ? null
-            : preservedJsonDomainValue(
-                jsonConstructor(
-                  "JSON_ARRAY",
-                  members.map(({ value }) => value),
-                ),
+            : jsonConstructor(
+                "JSON_ARRAY",
+                members.map(({ value }) => value),
               );
         }
         if (

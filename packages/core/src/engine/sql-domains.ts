@@ -408,6 +408,17 @@ export function boundedJsonText(
   label = "JSON value",
   exactNumbers = false,
 ): string {
+  // A scalar is one piece: no traversal state to build. JSON_OBJECT and JSON_ARRAY encode every
+  // member this way, so this is most calls.
+  const scalar = scalarJsonText(value, label, exactNumbers);
+  if (scalar !== undefined) {
+    if (scalar.length > MAX_SQL_SCALAR_RESULT_CHARACTERS) {
+      throw new RangeError(
+        `${label} exceeds ${String(MAX_SQL_SCALAR_RESULT_CHARACTERS)} characters`,
+      );
+    }
+    return scalar;
+  }
   const state: JsonEncodingState = {
     active: new Set(),
     pieces: [],
@@ -435,39 +446,14 @@ function encodeBoundedJson(
   if (depth > MAX_SQL_STRUCTURED_VALUE_DEPTH) {
     throw new RangeError(`${label} cannot exceed ${String(MAX_SQL_STRUCTURED_VALUE_DEPTH)} levels`);
   }
-  if (value === null) {
-    appendJsonPiece(state, "null", label);
+  const scalar = scalarJsonText(value, label, state.exactNumbers);
+  if (scalar !== undefined) {
+    appendJsonPiece(state, scalar, label);
     return;
   }
-  if (value instanceof JsonNumber) {
-    appendJsonPiece(state, value.text, label);
-    return;
+  if (typeof value !== "object" || value === null) {
+    throw new TypeError(`${label} cannot be represented as JSON`);
   }
-  if (typeof value === "boolean") {
-    appendJsonPiece(state, value ? "true" : "false", label);
-    return;
-  }
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) throw new TypeError("JSON numbers must be finite");
-    appendJsonPiece(
-      state,
-      state.exactNumbers ? new JsonNumber(String(value)).text : JSON.stringify(value),
-      label,
-    );
-    return;
-  }
-  if (typeof value === "string") {
-    assertBoundedDomainString(value, label);
-    appendJsonPiece(state, JSON.stringify(value), label);
-    return;
-  }
-  if (value instanceof Date) {
-    // to_json's ISO 8601 rendering of a timestamp with time zone in a UTC session.
-    const timestamp = postgresTimestampJsonText(dateMilliseconds(value), true);
-    appendJsonPiece(state, JSON.stringify(timestamp), label);
-    return;
-  }
-  if (typeof value !== "object") throw new TypeError(`${label} cannot be represented as JSON`);
   const object = value;
   if (state.active.has(object)) throw new TypeError(`${label} cannot contain a cycle`);
   state.active.add(object);
@@ -518,6 +504,26 @@ function encodeBoundedJson(
   } finally {
     state.active.delete(object);
   }
+}
+
+/** A JSON scalar's text, or undefined for an array, an object, or a value JSON cannot hold. */
+function scalarJsonText(value: unknown, label: string, exactNumbers: boolean): string | undefined {
+  if (value === null) return "null";
+  if (value instanceof JsonNumber) return value.text;
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new TypeError("JSON numbers must be finite");
+    return exactNumbers ? new JsonNumber(String(value)).text : JSON.stringify(value);
+  }
+  if (typeof value === "string") {
+    assertBoundedDomainString(value, label);
+    return JSON.stringify(value);
+  }
+  if (value instanceof Date) {
+    // to_json's ISO 8601 rendering of a timestamp with time zone in a UTC session.
+    return JSON.stringify(postgresTimestampJsonText(dateMilliseconds(value), true));
+  }
+  return undefined;
 }
 
 function appendJsonPiece(state: JsonEncodingState, piece: string, label: string): void {
@@ -588,6 +594,18 @@ export function preservedJsonDomainValue(document: string, binary = false): stri
     document,
     binary ? "JSONB value" : "JSON value",
   );
+}
+
+/**
+ * Joins JSON text the engine wrote itself from encoded scalar members — what `jsonConstructor`
+ * builds when no member is a document — into a JSON-domain value, which a validating parse could
+ * only confirm. The tag is joined with the text, so the value is one flat string rather than a
+ * tag and a document to be copied together on first use. The caller has bounded the length and
+ * hands over `pieces`. Anything else goes through `preservedJsonDomainValue`.
+ */
+export function builtJsonDomainValue(pieces: string[]): string {
+  pieces.unshift(JSON_VALUE);
+  return pieces.join("");
 }
 
 export function uuidDomainValue(value: unknown): string | null {
@@ -1079,10 +1097,14 @@ export function externalSqlDomainColumnValue(
   return externalSqlDomainValue(value);
 }
 
+/** Domains whose external value is their tagged text with the tag removed. */
+const TAG_ONLY_DOMAINS = [NUMERIC, JSON_VALUE, JSONB_VALUE, UUID_VALUE, DATE_VALUE];
+
 export function externalSqlDomainValue(value: unknown): unknown {
-  if (typeof value !== "string") return value;
+  // Every tag starts with PREFIX, so an ordinary string — nearly every value — stops here.
+  if (typeof value !== "string" || !value.startsWith(PREFIX)) return value;
   if (value.startsWith(TEXT_VALUE)) return value.slice(TEXT_VALUE.length);
-  for (const prefix of [NUMERIC, JSON_VALUE, JSONB_VALUE, UUID_VALUE, DATE_VALUE]) {
+  for (const prefix of TAG_ONLY_DOMAINS) {
     if (value.startsWith(prefix)) return value.slice(prefix.length);
   }
   // TIME and INTERVAL render as PostgreSQL writes them: `10:00:00.5`, `1 mon 14 days 12:00:00`.

@@ -42,7 +42,8 @@ function OpenOrders() {
 ```
 
 The hook uses React's concurrent-safe external-store primitive and the same stable snapshot for
-server rendering. Observation starts with the first subscriber and stops after the last cleanup;
+server rendering. Observation starts with the first subscriber and stops one task after the last
+cleanup, so StrictMode's unsubscribe and resubscribe on mount reuse the same engine subscription;
 duplicate subscriptions are independent leases. Keep the live manager and query stable across
 renders so a render does not create a new database subscription.
 
@@ -70,7 +71,9 @@ function Page() {
 ```
 
 It calls the store's `refresh()` once per cold load and throws that shared promise until the query
-settles. Its return type excludes the `loading` snapshot. The equivalent lower-level call is
+settles. The engine subscription that loaded the query is kept for the component when it commits,
+so the query runs and its result crosses from the worker once, not again on commit. A render that
+never commits releases that subscription after 30 seconds. Its return type excludes the `loading` snapshot. The equivalent lower-level call is
 `useLiveQuery(query, { suspense: true })`; a query used this way must implement `refresh()`.
 
 When switching between stable query objects, keep the last settled snapshot on screen while the

@@ -61,6 +61,7 @@
     "devtools:matrix": "vite-node scripts/devtools-unsupported-features.mts",
     "benchmark:sizes": "vite-node scripts/measure-library-sizes.mts",
     "benchmark:stalls": "vite-node scripts/stall-survey.mts",
+    "benchmark:live-wide": "tsc -b packages/core packages/kysely && node scripts/live-wide-bench.mts",
     "test:browser:conformance": "tsc -b packages/core --force && MINNOW_BROWSER_CONFORMANCE=1 playwright test --config playwright.library.config.ts",
     "benchmark:compare": "vite-node scripts/perf-gate.mts --compare"
   },

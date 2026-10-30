@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { LiveQueryInput, LiveQueryObserveOptions, LiveQuerySubscribeOptions } from "./live.js";
 import {
   LiveQuery,
@@ -19,6 +19,11 @@ async function until(assertion: () => void): Promise<void> {
     }
   }
   throw failure;
+}
+
+/** A query releases its engine subscription a task after its last subscriber leaves. */
+function nextTask(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 class TestBackend implements LiveQueryBackend {
@@ -148,7 +153,9 @@ describe("typed live query", () => {
     await until(() => expect(live.getSnapshot().rows).toEqual(rows));
     expect(notifications).toBe(3);
     unsubscribe();
-    await until(() => expect(backend.closes).toBe(1));
+    expect(backend.closes).toBe(0);
+    await nextTask();
+    expect(backend.closes).toBe(1);
   });
 
   it("asks the backend to compare before invalidating", async () => {
@@ -450,8 +457,76 @@ describe("typed live query", () => {
     await until(() => expect(live.getSnapshot().status).toBe("ready"));
     expect(backend.opens).toBe(1);
     first();
+    await nextTask();
     expect(backend.closes).toBe(0);
     second();
+    await nextTask();
+    expect(backend.closes).toBe(1);
+  });
+
+  it("hands the subscription a cold refresh opened to its first subscriber", async () => {
+    const backend = new TestBackend();
+    const query = new LiveQuery(backend, {
+      query: "SELECT id FROM rows",
+      execute: () => Promise.reject(new Error("decode should use delivered rows")),
+      decode: (result) => result.rows,
+    });
+    // React Suspense: the thrown refresh() loads the query, and the component subscribes once it
+    // commits — under StrictMode as subscribe, unsubscribe, subscribe within one commit.
+    await query.refresh();
+    await nextTask();
+    query.subscribe(() => undefined)();
+    const unsubscribe = query.subscribe(() => undefined);
+    await nextTask();
+    expect(query.getSnapshot()).toMatchObject({ status: "ready", rows: [{ id: 1 }] });
+    expect({ subscribed: backend.subscribed, closes: backend.closes }).toEqual({
+      subscribed: 1,
+      closes: 0,
+    });
+    unsubscribe();
+    await nextTask();
+    expect(backend.closes).toBe(1);
+    query.close();
+  });
+
+  it("releases a refreshed subscription that no subscriber joins", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const backend = new TestBackend();
+      const query = new LiveQuery(backend, {
+        query: "SELECT id FROM rows",
+        execute: () => Promise.reject(new Error("decode should use delivered rows")),
+        decode: (result) => result.rows,
+      });
+      // A suspended render that never commits: nothing subscribes after the load.
+      await query.refresh();
+      await vi.advanceTimersByTimeAsync(29_999);
+      expect(backend.closes).toBe(0);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(backend.closes).toBe(1);
+      // A later subscriber opens a subscription of its own.
+      const unsubscribe = query.subscribe(() => undefined);
+      expect(backend.subscribed).toBe(2);
+      unsubscribe();
+      query.close();
+      await until(() => expect(backend.closes).toBe(2));
+      // Closing cancelled the release, so no timer outlives the query.
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("closes a refreshed subscription at once when the query is closed", async () => {
+    const backend = new TestBackend();
+    const query = new LiveQuery(backend, {
+      query: "SELECT id FROM rows",
+      execute: () => Promise.reject(new Error("decode should use delivered rows")),
+      decode: (result) => result.rows,
+    });
+    await query.refresh();
+    expect(backend.closes).toBe(0);
+    query.close();
     await until(() => expect(backend.closes).toBe(1));
   });
 });

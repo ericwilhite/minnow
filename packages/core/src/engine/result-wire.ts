@@ -191,8 +191,9 @@ export function decodeQueryResult(payload: unknown): QueryResult {
   // Validate lengths before allocating rows: a missing vector must never fabricate SQL values.
   for (const column of payload.values) validateColumn(column, payload.rowCount);
   const columnDomains = copyDomains(payload.columnDomains);
+  const template = rowTemplate(columns);
   const rows: QueryRow[] = [];
-  for (let index = 0; index < payload.rowCount; index += 1) rows.push({});
+  for (let index = 0; index < payload.rowCount; index += 1) rows.push({ ...template });
   // Column by column: each fill loop stores one property name into every row, which the engine
   // runs noticeably faster than visiting every column of each row in turn.
   for (const [position, name] of columns.entries()) {
@@ -214,10 +215,11 @@ function rowsFromCells(columns: readonly string[], cells: unknown, rowCount: num
   }
   const values = cells as readonly QueryValue[];
   const protoColumn = columns.includes("__proto__");
+  const template = rowTemplate(columns);
   const rows = new Array<QueryRow>(rowCount);
   let cell = 0;
   for (let index = 0; index < rowCount; index += 1) {
-    const row: QueryRow = {};
+    const row: QueryRow = { ...template };
     for (const name of columns) {
       const value = values[cell] ?? null;
       cell += 1;
@@ -234,6 +236,15 @@ function rowsFromCells(columns: readonly string[], cells: unknown, rowCount: num
     rows[index] = row;
   }
   return rows;
+}
+
+/**
+ * A row holding every column, null, in result order, for each row to be cloned from. A clone is
+ * born with all its properties; a row given 60 computed names one at a time is moved by V8 to
+ * slow dictionary properties, which costs several times the row's own size in garbage as it grows.
+ */
+function rowTemplate(columns: readonly string[]): QueryRow {
+  return Object.fromEntries(columns.map((name) => [name, null]));
 }
 
 function isQueryValue(value: unknown): value is QueryValue {
@@ -280,7 +291,7 @@ function validateColumn(input: unknown, rowCount: number): void {
   };
   if ("nulls" in column && column.nulls !== undefined) {
     if (!(column.nulls instanceof Uint8Array) || column.nulls.length !== rowCount) return fail();
-    for (const value of column.nulls) if (value !== 0 && value !== 1) return fail();
+    if (!isBitMask(column.nulls)) return fail();
   }
   switch (column.kind) {
     case "null":
@@ -305,7 +316,7 @@ function validateColumn(input: unknown, rowCount: number): void {
     case "boolean":
       if (!(column.values instanceof Uint8Array) || column.values.length !== rowCount)
         return fail();
-      for (const value of column.values) if (value !== 0 && value !== 1) return fail();
+      if (!isBitMask(column.values)) return fail();
       return;
     case "string": {
       if (
@@ -316,10 +327,10 @@ function validateColumn(input: unknown, rowCount: number): void {
         column.offsets[rowCount] !== column.text.length
       )
         return fail();
-      let previous = 0;
-      for (const offset of column.offsets) {
-        if (offset < previous || offset > column.text.length) return fail();
-        previous = offset;
+      const { offsets, text } = column;
+      for (let index = 1; index < offsets.length; index += 1) {
+        const offset = offsets[index] ?? 0;
+        if (offset < (offsets[index - 1] ?? 0) || offset > text.length) return fail();
       }
       return;
     }
@@ -332,6 +343,11 @@ function validateColumn(input: unknown, rowCount: number): void {
     default:
       return fail();
   }
+}
+
+/** Whether every byte is 0 or 1. Not `for…of`, which allocates per element of a typed array. */
+function isBitMask(bytes: Uint8Array): boolean {
+  return bytes.every((byte) => byte === 0 || byte === 1);
 }
 
 export function isWireQueryResult(value: unknown): value is WireQueryResult {
@@ -457,7 +473,8 @@ function encodeColumn(name: string, rows: readonly QueryRow[]): WireResultColumn
   if (typeof first === "string") {
     const offsets = new Uint32Array(rowCount + 1);
     let nulls = start === 0 ? undefined : nullMask(rowCount, start);
-    const parts: string[] = [];
+    // One slot per row, so the array never regrows; a null row's hole joins as nothing.
+    const parts = new Array<string>(rowCount);
     let length = 0;
     for (let index = start; index < rowCount; index += 1) {
       const value = rows[index]?.[name] ?? null;
@@ -465,7 +482,7 @@ function encodeColumn(name: string, rows: readonly QueryRow[]): WireResultColumn
         nulls ??= new Uint8Array(rowCount);
         nulls[index] = 1;
       } else if (typeof value === "string") {
-        parts.push(value);
+        parts[index] = value;
         length += value.length;
       } else {
         return encodeMixed(name, rows);
@@ -509,58 +526,53 @@ function fillColumn(rows: QueryRow[], name: string, column: WireResultColumn): v
     }
     return;
   }
-  let index = 0;
+  // forEach, not `for…of`: the iterator allocates a result object per row until the loop is
+  // optimized, and a wide result runs one of these loops per column.
   switch (column.kind) {
     case "number": {
       const { values, nulls } = column;
       if (nulls === undefined) {
-        for (const row of rows) {
+        rows.forEach((row, index) => {
           row[name] = values[index] ?? 0;
-          index += 1;
-        }
+        });
       } else {
-        for (const row of rows) {
+        rows.forEach((row, index) => {
           row[name] = nulls[index] === 1 ? null : (values[index] ?? 0);
-          index += 1;
-        }
+        });
       }
       return;
     }
     case "boolean": {
       const { values, nulls } = column;
-      for (const row of rows) {
+      rows.forEach((row, index) => {
         row[name] = nulls?.[index] === 1 ? null : values[index] === 1;
-        index += 1;
-      }
+      });
       return;
     }
     case "datetime": {
       const { values, nulls } = column;
-      for (const row of rows) {
+      rows.forEach((row, index) => {
         row[name] = nulls?.[index] === 1 ? null : new Date(values[index] ?? 0);
-        index += 1;
-      }
+      });
       return;
     }
     case "string": {
       const { text, offsets, nulls } = column;
-      for (const row of rows) {
+      rows.forEach((row, index) => {
         row[name] =
           nulls?.[index] === 1 ? null : text.slice(offsets[index] ?? 0, offsets[index + 1] ?? 0);
-        index += 1;
-      }
+      });
       return;
     }
     case "mixed": {
       const { values } = column;
-      for (const row of rows) {
+      rows.forEach((row, index) => {
         row[name] = values[index] ?? null;
-        index += 1;
-      }
+      });
       return;
     }
     case "null":
-      for (const row of rows) row[name] = null;
+    // Rows are cloned from a template that already holds null in every column.
   }
 }
 
