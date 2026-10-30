@@ -8,6 +8,44 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.18.2 — October 29, 2026
+
+Release packages: `@minnowdb/core@0.18.2`.
+
+- A typed live query loaded by `refresh()` keeps its engine subscription for its first subscriber.
+  React Suspense loads a query with `refresh()` and subscribes when the component commits; before,
+  the subscription closed in between, so the engine ran the query and sent the whole result a
+  second time on commit, and a third time under StrictMode. Now the result is delivered once. If
+  nobody subscribes within 30 seconds (a render that never commits), the subscription is released.
+  When the last subscriber leaves, the subscription is released on the next task instead of at
+  once, so an unsubscribe followed by a subscribe in the same turn keeps it. `close()` still
+  releases it at once. `@minnowdb/react` needs no update to get this.
+- Large results allocate far less. Result rows are now created with all their columns at once:
+  a wide row built one column at a time is stored by V8 in a slow mode that allocated several
+  times the row's size. This applies to rows the engine projects and rows the client decodes from
+  the worker. `JSON_OBJECT` and `JSON_ARRAY` with scalar members no longer parse the text they
+  just built to validate it; a member that is itself a JSON document is still checked. Measured
+  with `npm run benchmark:live-wide`: one live query of 15,933 rows, 13 joins and 63 columns, 12
+  of them `JSON_OBJECT`, decoded through Kysely with `json: "parse"`, in a Node worker thread:
+
+  | Per query load (median of 3)     | 0.18.1   | 0.18.2 |
+  | -------------------------------- | -------- | ------ |
+  | Worker allocation, one delivery  | 932 MB   | 229 MB |
+  | Main-thread allocation           | 341 MB   | 99 MB  |
+  | Time until rows are ready        | 2,344 ms | 839 ms |
+  | Suspense load: deliveries        | 2        | 1      |
+  | Suspense load: worker allocation | 1,784 MB | 228 MB |
+
+  Results are unchanged. JSON stays JSON text at the core boundary; Kysely's `json: "parse"`
+  still parses it on the main thread.
+
+The engine with OPFS measures 440.9 KiB gzipped (previously 440.7 KiB). The generic worker plus
+its client measures 550.3 KiB gzipped (previously 550.1 KiB). A worker-hosted page's main thread
+grows by 156 bytes gzipped to 31.1 KiB.
+
+No stored format changes: IndexedDB schema 8 and OPFS layout 13 are unchanged, and 0.18.1 opens
+every database this release writes. No data migration or export/import step is needed.
+
 ## 0.18.1 — October 29, 2026
 
 Release packages: `@minnowdb/core@0.18.1`.

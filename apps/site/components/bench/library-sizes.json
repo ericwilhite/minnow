@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "kind": "library-sizes",
-  "measuredAt": "2026-10-29T21:12:47.338Z",
+  "measuredAt": "2026-10-30T02:30:50.148Z",
   "method": "Each engine's browser entry bundled with esbuild (ESM, minified, production), plus the Wasm and data files it fetches at run time. Gzip is level 9.",
   "engines": [
     {
@@ -13,12 +13,12 @@
       "assets": [
         {
           "name": "JavaScript (bundled, minified)",
-          "bytes": 1563054,
-          "gzipBytes": 451313
+          "bytes": 1563459,
+          "gzipBytes": 451457
         }
       ],
-      "totalBytes": 1563054,
-      "totalGzipBytes": 451313
+      "totalBytes": 1563459,
+      "totalGzipBytes": 451457
     },
     {
       "id": "sqlite",
