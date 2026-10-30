@@ -680,7 +680,32 @@ export interface IndexedDbBlockStoreOptions {
    * Defaults to `INDEXEDDB_UNRESPONSIVE_AFTER_MS`.
    */
   unresponsiveAfterMs?: number;
+  /**
+   * Called when a newer build opens the database at a higher schema version, before this
+   * connection closes. The connection keeps serving until the returned promise settles —
+   * bounded by `INDEXEDDB_SUPERSEDE_DRAIN_MS` — so work it already accepted can finish: the
+   * worker host flushes its buffered writers here.
+   */
+  onSuperseding?: () => Promise<void> | void;
+  /**
+   * Called once this connection has closed because a newer build upgraded the database. Every
+   * later call fails with `StorageConnectionClosedError` (`reason: "superseded"`); the remedy is
+   * to reload the page.
+   */
+  onSuperseded?: () => void;
+  /**
+   * @internal Test seam: how long an upgrade this connection needs waits for older connections
+   * to close before failing with `IndexedDbSchemaUpgradeBlockedError` (default 10000ms).
+   */
+  upgradeWaitMs?: number;
 }
+
+/**
+ * How long a connection a newer build superseded keeps serving while work it already accepted
+ * finishes, well inside the newer opener's `upgradeWaitMs`.
+ */
+export const INDEXEDDB_SUPERSEDE_DRAIN_MS = 3_000;
+const INDEXEDDB_UPGRADE_WAIT_MS = 10_000;
 
 const DEFAULT_UNIQUE_KEY_CACHE_BYTES = 8 * 1024 * 1024;
 const TABLE_NAME_CACHE_LIMIT = 256;
@@ -738,6 +763,10 @@ export class IndexedDbBlockStore implements BlockStore {
   #snapshotPeakRetainedItems = 0;
   #snapshotPeakRetainedBytes = 0;
   #closed = false;
+  /** Set once a newer build's upgrade asked this connection to close. */
+  #superseding = false;
+  readonly #onSuperseding: (() => Promise<void> | void) | undefined;
+  readonly #onSuperseded: (() => void) | undefined;
   /** Why the connection closed: the application's `close()`, or a newer build's upgrade. */
   #closeReason: "closed" | "superseded" = "closed";
   /** Set once the connection's deadline ran out; every later call fails with it. */
@@ -749,8 +778,11 @@ export class IndexedDbBlockStore implements BlockStore {
     durability: IDBTransactionDurability,
     uniqueKeyCacheBytes: number,
     unresponsiveAfterMs: number,
+    hooks: Pick<IndexedDbBlockStoreOptions, "onSuperseding" | "onSuperseded"> = {},
   ) {
     this.#db = db;
+    this.#onSuperseding = hooks.onSuperseding;
+    this.#onSuperseded = hooks.onSuperseded;
     this.liveQueryChannelName = `minnowdb-live:indexeddb:${db.name}`;
     this.#durability = durability;
     this.#uniqueKeyCacheBytes = uniqueKeyCacheBytes;
@@ -762,11 +794,41 @@ export class IndexedDbBlockStore implements BlockStore {
     });
     stallGuards.set(db, this.#stallGuard);
     db.addEventListener("versionchange", () => {
-      // Never leave a newer deployment blocked behind a forgotten connection in another tab.
-      // Closing also makes every later method fail deterministically through #transaction,
-      // with a StorageConnectionClosedError that names the cause: this tab was superseded.
-      this.#close("superseded");
+      this.#supersede();
     });
+  }
+
+  /**
+   * A newer build is upgrading the database. Never leave it blocked behind this connection: let
+   * the owner finish work already accepted, bounded by `INDEXEDDB_SUPERSEDE_DRAIN_MS`, then
+   * close. Closing makes every later method fail deterministically through #transaction, with a
+   * StorageConnectionClosedError that names the cause: this tab was superseded.
+   */
+  #supersede(): void {
+    if (this.#closed || this.#superseding) return;
+    this.#superseding = true;
+    void (async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          Promise.resolve(this.#onSuperseding?.()),
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, INDEXEDDB_SUPERSEDE_DRAIN_MS);
+          }),
+        ]);
+      } catch {
+        // The drain is best effort; the upgrade must not wait on its failure.
+      } finally {
+        clearTimeout(timer);
+      }
+      if (this.#closed) return;
+      this.#close("superseded");
+      try {
+        this.#onSuperseded?.();
+      } catch {
+        // An observer that throws cannot undo the close.
+      }
+    })();
   }
 
   static async open(options: IndexedDbBlockStoreOptions): Promise<IndexedDbBlockStore> {
@@ -819,6 +881,7 @@ export class IndexedDbBlockStore implements BlockStore {
         },
         options.name,
         unresponsiveAfterMs,
+        options.upgradeWaitMs ?? INDEXEDDB_UPGRADE_WAIT_MS,
       );
     } catch (error) {
       if (upgradeError !== undefined) throw upgradeError;
@@ -839,6 +902,7 @@ export class IndexedDbBlockStore implements BlockStore {
       options.durability ?? "strict",
       uniqueKeyCacheBytes,
       unresponsiveAfterMs,
+      options,
     );
     try {
       await validateCurrentIndexedDbSchema(db);
@@ -10206,6 +10270,7 @@ function openDatabaseRequest(
   blockedError: (event: IDBVersionChangeEvent) => Error,
   databaseName: string,
   unresponsiveAfterMs: number,
+  upgradeWaitMs = 0,
 ): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -10245,8 +10310,16 @@ function openDatabaseRequest(
     request.addEventListener(
       "blocked",
       (event) => {
-        if (!settle()) return;
-        reject(blockedError(event));
+        // Older connections were asked to close (`versionchange`) and do so once they finish
+        // what they accepted. Wait for them: success follows as soon as the last one closes. A
+        // connection still open when the wait runs out is frozen, hung, or not Minnow's.
+        const blocked = setTimeout(() => {
+          if (!settle()) return;
+          reject(blockedError(event));
+        }, upgradeWaitMs);
+        (blocked as { unref?: () => void }).unref?.();
+        request.addEventListener("success", () => clearTimeout(blocked), { once: true });
+        request.addEventListener("error", () => clearTimeout(blocked), { once: true });
       },
       { once: true },
     );

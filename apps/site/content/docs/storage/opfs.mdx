@@ -200,12 +200,28 @@ durable. A witness an older build left behind (`upgrade-7-8`, `upgrade-8-9`, `up
 database without changing it — including a connection from an older build that was already open
 when the marker moved and later elects itself: it judges the marker again before it leads and
 is refused with `StorageFormatVersionError`. Tabs also tell each other their layout: every
-leader announcement and every request carries the sender's native layout, a connection that
-hears a leader on a newer layout than its own closes itself with `StorageConnectionClosedError`
-(`reason: "superseded"`; reload the page to open the database with the newer build), reporting
-any mutation it had already posted as `OpfsUncertainOutcomeError`, and a leader declines a
-request from an older layout the same way. Builds up to 0.17.0 send no layout and are read as
-layout 13, so a rolling deployment that mixes them with this build behaves as described.
+leader announcement and every request carries the sender's native layout, and a leader declines
+a request from an older layout.
+
+A newer build does not wait for older tabs to close. While its open waits to upgrade, it
+broadcasts an upgrade request carrying its layout. Every connection on an older layout steps
+aside:
+
+1. It never leads again.
+2. It finishes what it already accepted: the worker host writes its buffered writers' rows, and
+   calls already made are answered. A leader also keeps serving until its followers have gone
+   quiet. All of this is bounded by three seconds.
+3. It closes with `StorageConnectionClosedError` (`reason: "superseded"`). A leader's close
+   releases the handles.
+
+The newer build then upgrades and opens, typically in under half a second. A connection that
+hears a leader on a newer layout steps aside the same way. A worker client reloads the page by
+default; see
+[when a newer build opens the database](/docs/engine/workers#when-a-newer-build-opens-the-database).
+Only a connection that answers nothing blocks the upgrade: a frozen tab, or a build from before
+0.19.0. The open then fails after its ten-second budget with `StorageUpgradeBlockedError`, which
+carries the database name and the old and new layouts. Builds up to 0.17.0 send no layout and are
+read as layout 13.
 
 Layout 7 added a 48-byte acknowledgement file with two checksummed slots, alongside the
 structural `schemaEpoch` and served-request ledger. Recovery

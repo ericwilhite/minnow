@@ -149,9 +149,16 @@ describe("automatic OPFS upgrades", () => {
     const root = await (await shim.root.getDirectoryHandle("minnowdb")).getDirectoryHandle(NAME);
     const wal = await (await root.getFileHandle("wal")).createSyncAccessHandle();
     try {
+      // Nothing answers the request to step aside: a raw handle stands for a frozen or older tab.
       await expect(
         OpfsBlockStore.open({ name: NAME, root: shim.root, dispatchBudgetMs: 50 }),
-      ).rejects.toThrow("close older connections");
+      ).rejects.toMatchObject({
+        name: "StorageUpgradeBlockedError",
+        backend: "opfs",
+        databaseName: NAME,
+        oldVersion: 6,
+        requestedVersion: OPFS_LAYOUT_VERSION,
+      });
       expect(new TextDecoder().decode(shim.readFileBytes(`${PREFIX}format.json`))).toBe(
         '{"formatVersion":6}',
       );

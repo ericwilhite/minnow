@@ -1905,6 +1905,13 @@
               ]
             },
             {
+              "name": "DatabaseSupersededEvent",
+              "kind": "type",
+              "declarations": [
+                "export interface DatabaseSupersededEvent {\n    reloading: boolean;\n}"
+              ]
+            },
+            {
               "name": "DatabaseWorkerErrorEvent",
               "kind": "type",
               "declarations": [
@@ -1915,14 +1922,14 @@
               "name": "MinnowDatabaseClient",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {\n    #private;\n    constructor(transport: ClientTransport | (() => ClientTransport), options?: MinnowDatabaseClientOptions<TSchema>);\n    reopen(transport?: ClientTransport): Promise<void>;\n    ready(): Promise<void>;\n    storeKind(): Promise<OpenedStoreKind | undefined>;\n    createTable(input: CreateTableInput): Promise<void>;\n    createView(name: string, sql: string, options?: {\n        orReplace?: boolean;\n        managed?: boolean;\n    }): Promise<void>;\n    dropView(name: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    dropColumn(tableName: string, columnName: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    dropTable(tableName: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    createIndex(indexName: string, tableName: string, requestedColumns: string | ReadonlyArray<{\n        name: string;\n        direction: \"asc\" | \"desc\";\n    }>, options?: {\n        unique?: boolean;\n    }): Promise<void>;\n    dropIndex(indexName: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    buildFtsIndex(tableName: string, columnName: string): Promise<void>;\n    resolveKey(tableName: string, key: Exclude<BatchValue, null> | readonly BatchValue[]): Promise<Exclude<BatchValue, null> | BatchValue[]>;\n    resolveKeys(tableName: string, keys: ReadonlyArray<Exclude<BatchValue, null> | readonly BatchValue[]>): Promise<Array<Exclude<BatchValue, null> | BatchValue[]>>;\n    mergeKey(tableName: string, from: Exclude<BatchValue, null> | readonly BatchValue[], to: Exclude<BatchValue, null> | readonly BatchValue[]): Promise<void>;\n    introspect(): Promise<Catalog>;\n    listTables(): Promise<TableDefinition[]>;\n    migrate(definition?: SchemaDefinition<readonly AnyTable[]> | undefined, options?: MigrateOptions): Promise<ClientMigrationResult>;\n    insertBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchInsertInput<TSchema, TName>): Promise<InsertBatchResult>;\n    insert<TName extends TableName<TSchema>>(tableName: TName, row: BatchInsertRow<TSchema, TName>): Promise<InsertBatchResult>;\n    upsertBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchInsertInput<TSchema, TName>, options?: BatchUpsertOptions<TSchema, TName>): Promise<UpsertBatchResult>;\n    upsert<TName extends TableName<TSchema>>(tableName: TName, row: BatchInsertRow<TSchema, TName>, options?: BatchUpsertOptions<TSchema, TName>): Promise<UpsertBatchResult>;\n    updateBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchUpdateInput<TSchema, TName>): Promise<UpdateBatchResult>;\n    update<TName extends TableName<TSchema>>(tableName: TName, key: BatchKeyValue<TSchema, TName>, changes: BatchUpdateChanges<TSchema, TName>): Promise<UpdateBatchResult>;\n    deleteBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchDeleteInput<TSchema, TName>): Promise<DeleteBatchResult>;\n    delete<TName extends TableName<TSchema>>(tableName: TName, key: BatchKeyValue<TSchema, TName>): Promise<DeleteBatchResult>;\n    bufferedWriter<TName extends TableName<TSchema>>(tableName: TName, options?: BufferedWriterOptions): ClientBufferedWriter<BatchInsertRow<TSchema, TName>>;\n    readTable<TName extends TableName<TSchema>, const TColumns extends ReadonlyArray<BatchColumnName<TSchema, TName>>>(tableName: TName, options: BatchReadOptions<TSchema, TName, TColumns> & {\n        readonly columns: TColumns;\n    }): Promise<Array<Pick<BatchReadRow<TSchema, TName>, TColumns[number]>>>;\n    readTable<TName extends TableName<TSchema>>(tableName: TName, versionOrOptions?: number | BatchReadOptions<TSchema, TName>): Promise<Array<BatchReadRow<TSchema, TName>>>;\n    query(sql: string, options?: QueryOptions): Promise<QueryResult>;\n    queryCursor(sql: string, options?: QueryCursorOptions): AsyncIterableIterator<QueryResult, undefined>;\n    run<TRow>(query: {\n        kind: \"typed-query\";\n        plan: CompiledQuery;\n        __row?: TRow;\n    }): Promise<TRow[]>;\n    explain(sql: string): Promise<string>;\n    execute(sql: string, params?: readonly QueryParameter[], options?: ExecuteOptions): Promise<ExecuteResult>;\n    runStatement(statement: CompiledStatement, options?: RunStatementOptions): Promise<ExecuteResult>;\n    snapshot<T>(action: (session: ClientSnapshotSession) => Promise<T>): Promise<T>;\n    write<T>(action: (session: ClientWriteSession<TSchema>) => Promise<T>, options?: WriteOptions): Promise<{\n        result: T;\n        version: number | null;\n    }>;\n    exportSnapshot(options?: SnapshotExportOptions): Promise<Uint8Array>;\n    exportSnapshotStream(options?: SnapshotExportOptions): AsyncGenerator<Uint8Array, void, void>;\n    importSnapshot(bytes: Uint8Array, options?: SnapshotImportOptions): Promise<void>;\n    importSnapshotStream(source: AsyncIterable<Uint8Array>, options?: SnapshotImportOptions): Promise<void>;\n    bufferPoolStats(): Promise<BufferPoolStats>;\n    maintenanceStatus(): Promise<MaintenanceStatus>;\n    writeCoordination(): Promise<WriteCoordinationScope>;\n    checkIntegrity(options?: {\n        mode?: StorageIntegrityMode;\n        maxIssues?: number;\n    }): Promise<StorageIntegrityReport>;\n    storageStats(): Promise<StorageStats>;\n    inspectInterruptedImport(): Promise<InterruptedSnapshotImport | null>;\n    abortInterruptedImport(identity: string): Promise<InterruptedSnapshotImportAbortResult>;\n    onKeyChanges(listener: (changes: readonly KeyChange[]) => void, options?: {\n        onError?: (error: unknown) => void;\n        onComplete?: () => void;\n    }): Promise<() => Promise<void>>;\n    liveQueries(options?: ClientLiveQueryOptions): ClientLiveQuerySet;\n    listVisibleSegmentPage(tableName: string, options?: VisibleSegmentPageOptions): Promise<VisibleSegmentPage>;\n    cleanupQuerySpill(options?: QuerySpillCleanupOptions): Promise<QuerySpillCleanupResult>;\n    compactTable(tableName: string, options?: CompactTableOptions): Promise<CompactTableResult>;\n    compactTableStep(tableName: string, options?: CompactTableStepOptions): Promise<CompactionJobProgress>;\n    resumeCompactionJob(jobId: string, options?: {\n        maxBlocks?: number;\n    }): Promise<CompactionJobProgress>;\n    listCompactionJobs(tableName?: string): Promise<CompactionJobRecord[]>;\n    cancelCompactionJob(jobId: string): Promise<CancelCompactionJobResult>;\n    collectGarbage(options?: CollectGarbageOptions): Promise<GarbageCollectionResult>;\n    collectGarbageStep(options?: CollectGarbageStepOptions): Promise<GarbageCollectionProgress>;\n    resumeGarbageCollectionJob(jobId: string, options?: {\n        maxItems?: number;\n    }): Promise<GarbageCollectionProgress>;\n    listGarbageCollectionJobs(): Promise<GarbageCollectionJobRecord[]>;\n    close(options?: CloseClientOptions): Promise<void>;\n    _invoke(handleId: string, method: string, args: unknown[]): Promise<unknown>;\n    _invokeControlled(handleId: string, method: string, args: unknown[], controls: RpcCallControls): Promise<unknown>;\n    _routeEvents(handleId: string, route: EventRoute): void;\n    _unrouteEvents(handleId: string): void;\n}"
+                "export declare class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {\n    #private;\n    constructor(transport: ClientTransport | (() => ClientTransport), options?: MinnowDatabaseClientOptions<TSchema>);\n    reopen(transport?: ClientTransport): Promise<void>;\n    ready(): Promise<void>;\n    get superseded(): boolean;\n    storeKind(): Promise<OpenedStoreKind | undefined>;\n    createTable(input: CreateTableInput): Promise<void>;\n    createView(name: string, sql: string, options?: {\n        orReplace?: boolean;\n        managed?: boolean;\n    }): Promise<void>;\n    dropView(name: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    dropColumn(tableName: string, columnName: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    dropTable(tableName: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    createIndex(indexName: string, tableName: string, requestedColumns: string | ReadonlyArray<{\n        name: string;\n        direction: \"asc\" | \"desc\";\n    }>, options?: {\n        unique?: boolean;\n    }): Promise<void>;\n    dropIndex(indexName: string, options?: {\n        ifExists?: boolean;\n    }): Promise<boolean>;\n    buildFtsIndex(tableName: string, columnName: string): Promise<void>;\n    resolveKey(tableName: string, key: Exclude<BatchValue, null> | readonly BatchValue[]): Promise<Exclude<BatchValue, null> | BatchValue[]>;\n    resolveKeys(tableName: string, keys: ReadonlyArray<Exclude<BatchValue, null> | readonly BatchValue[]>): Promise<Array<Exclude<BatchValue, null> | BatchValue[]>>;\n    mergeKey(tableName: string, from: Exclude<BatchValue, null> | readonly BatchValue[], to: Exclude<BatchValue, null> | readonly BatchValue[]): Promise<void>;\n    introspect(): Promise<Catalog>;\n    listTables(): Promise<TableDefinition[]>;\n    migrate(definition?: SchemaDefinition<readonly AnyTable[]> | undefined, options?: MigrateOptions): Promise<ClientMigrationResult>;\n    insertBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchInsertInput<TSchema, TName>): Promise<InsertBatchResult>;\n    insert<TName extends TableName<TSchema>>(tableName: TName, row: BatchInsertRow<TSchema, TName>): Promise<InsertBatchResult>;\n    upsertBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchInsertInput<TSchema, TName>, options?: BatchUpsertOptions<TSchema, TName>): Promise<UpsertBatchResult>;\n    upsert<TName extends TableName<TSchema>>(tableName: TName, row: BatchInsertRow<TSchema, TName>, options?: BatchUpsertOptions<TSchema, TName>): Promise<UpsertBatchResult>;\n    updateBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchUpdateInput<TSchema, TName>): Promise<UpdateBatchResult>;\n    update<TName extends TableName<TSchema>>(tableName: TName, key: BatchKeyValue<TSchema, TName>, changes: BatchUpdateChanges<TSchema, TName>): Promise<UpdateBatchResult>;\n    deleteBatch<TName extends TableName<TSchema>>(tableName: TName, input: BatchDeleteInput<TSchema, TName>): Promise<DeleteBatchResult>;\n    delete<TName extends TableName<TSchema>>(tableName: TName, key: BatchKeyValue<TSchema, TName>): Promise<DeleteBatchResult>;\n    bufferedWriter<TName extends TableName<TSchema>>(tableName: TName, options?: BufferedWriterOptions): ClientBufferedWriter<BatchInsertRow<TSchema, TName>>;\n    readTable<TName extends TableName<TSchema>, const TColumns extends ReadonlyArray<BatchColumnName<TSchema, TName>>>(tableName: TName, options: BatchReadOptions<TSchema, TName, TColumns> & {\n        readonly columns: TColumns;\n    }): Promise<Array<Pick<BatchReadRow<TSchema, TName>, TColumns[number]>>>;\n    readTable<TName extends TableName<TSchema>>(tableName: TName, versionOrOptions?: number | BatchReadOptions<TSchema, TName>): Promise<Array<BatchReadRow<TSchema, TName>>>;\n    query(sql: string, options?: QueryOptions): Promise<QueryResult>;\n    queryCursor(sql: string, options?: QueryCursorOptions): AsyncIterableIterator<QueryResult, undefined>;\n    run<TRow>(query: {\n        kind: \"typed-query\";\n        plan: CompiledQuery;\n        __row?: TRow;\n    }): Promise<TRow[]>;\n    explain(sql: string): Promise<string>;\n    execute(sql: string, params?: readonly QueryParameter[], options?: ExecuteOptions): Promise<ExecuteResult>;\n    runStatement(statement: CompiledStatement, options?: RunStatementOptions): Promise<ExecuteResult>;\n    snapshot<T>(action: (session: ClientSnapshotSession) => Promise<T>): Promise<T>;\n    write<T>(action: (session: ClientWriteSession<TSchema>) => Promise<T>, options?: WriteOptions): Promise<{\n        result: T;\n        version: number | null;\n    }>;\n    exportSnapshot(options?: SnapshotExportOptions): Promise<Uint8Array>;\n    exportSnapshotStream(options?: SnapshotExportOptions): AsyncGenerator<Uint8Array, void, void>;\n    importSnapshot(bytes: Uint8Array, options?: SnapshotImportOptions): Promise<void>;\n    importSnapshotStream(source: AsyncIterable<Uint8Array>, options?: SnapshotImportOptions): Promise<void>;\n    bufferPoolStats(): Promise<BufferPoolStats>;\n    maintenanceStatus(): Promise<MaintenanceStatus>;\n    writeCoordination(): Promise<WriteCoordinationScope>;\n    checkIntegrity(options?: {\n        mode?: StorageIntegrityMode;\n        maxIssues?: number;\n    }): Promise<StorageIntegrityReport>;\n    storageStats(): Promise<StorageStats>;\n    inspectInterruptedImport(): Promise<InterruptedSnapshotImport | null>;\n    abortInterruptedImport(identity: string): Promise<InterruptedSnapshotImportAbortResult>;\n    onKeyChanges(listener: (changes: readonly KeyChange[]) => void, options?: {\n        onError?: (error: unknown) => void;\n        onComplete?: () => void;\n    }): Promise<() => Promise<void>>;\n    liveQueries(options?: ClientLiveQueryOptions): ClientLiveQuerySet;\n    listVisibleSegmentPage(tableName: string, options?: VisibleSegmentPageOptions): Promise<VisibleSegmentPage>;\n    cleanupQuerySpill(options?: QuerySpillCleanupOptions): Promise<QuerySpillCleanupResult>;\n    compactTable(tableName: string, options?: CompactTableOptions): Promise<CompactTableResult>;\n    compactTableStep(tableName: string, options?: CompactTableStepOptions): Promise<CompactionJobProgress>;\n    resumeCompactionJob(jobId: string, options?: {\n        maxBlocks?: number;\n    }): Promise<CompactionJobProgress>;\n    listCompactionJobs(tableName?: string): Promise<CompactionJobRecord[]>;\n    cancelCompactionJob(jobId: string): Promise<CancelCompactionJobResult>;\n    collectGarbage(options?: CollectGarbageOptions): Promise<GarbageCollectionResult>;\n    collectGarbageStep(options?: CollectGarbageStepOptions): Promise<GarbageCollectionProgress>;\n    resumeGarbageCollectionJob(jobId: string, options?: {\n        maxItems?: number;\n    }): Promise<GarbageCollectionProgress>;\n    listGarbageCollectionJobs(): Promise<GarbageCollectionJobRecord[]>;\n    close(options?: CloseClientOptions): Promise<void>;\n    _invoke(handleId: string, method: string, args: unknown[]): Promise<unknown>;\n    _invokeControlled(handleId: string, method: string, args: unknown[], controls: RpcCallControls): Promise<unknown>;\n    _routeEvents(handleId: string, route: EventRoute): void;\n    _unrouteEvents(handleId: string): void;\n}"
               ]
             },
             {
               "name": "MinnowDatabaseClientOptions",
               "kind": "type",
               "declarations": [
-                "export interface MinnowDatabaseClientOptions<TSchema extends AnySchema = UntypedSchema> {\n    schema?: TSchema;\n    store?: StoreDescriptor;\n    databaseOptions?: WireDatabaseOptions;\n    requestTimeoutMs?: number;\n    onWorkerError?: (event: DatabaseWorkerErrorEvent) => void;\n    onConnectionLost?: (error: ConnectionLostError) => void;\n}"
+                "export interface MinnowDatabaseClientOptions<TSchema extends AnySchema = UntypedSchema> {\n    schema?: TSchema;\n    store?: StoreDescriptor;\n    databaseOptions?: WireDatabaseOptions;\n    requestTimeoutMs?: number;\n    onWorkerError?: (event: DatabaseWorkerErrorEvent) => void;\n    onConnectionLost?: (error: ConnectionLostError) => void;\n    whenSuperseded?: \"reload\" | \"prompt\";\n    onSuperseded?: (event: DatabaseSupersededEvent) => void;\n}"
               ]
             }
           ]
@@ -3691,6 +3698,13 @@
               ]
             },
             {
+              "name": "INDEXEDDB_SUPERSEDE_DRAIN_MS",
+              "kind": "value",
+              "declarations": [
+                "INDEXEDDB_SUPERSEDE_DRAIN_MS = 3000"
+              ]
+            },
+            {
               "name": "INDEXEDDB_UNRESPONSIVE_AFTER_MS",
               "kind": "value",
               "declarations": [
@@ -3708,14 +3722,14 @@
               "name": "IndexedDbBlockStoreOptions",
               "kind": "type",
               "declarations": [
-                "export interface IndexedDbBlockStoreOptions {\n    name: string;\n    durability?: IDBTransactionDurability;\n    indexedDB?: IDBFactory;\n    uniqueKeyCacheBytes?: number;\n    unresponsiveAfterMs?: number;\n}"
+                "export interface IndexedDbBlockStoreOptions {\n    name: string;\n    durability?: IDBTransactionDurability;\n    indexedDB?: IDBFactory;\n    uniqueKeyCacheBytes?: number;\n    unresponsiveAfterMs?: number;\n    onSuperseding?: () => Promise<void> | void;\n    onSuperseded?: () => void;\n    upgradeWaitMs?: number;\n}"
               ]
             },
             {
               "name": "IndexedDbSchemaUpgradeBlockedError",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class IndexedDbSchemaUpgradeBlockedError extends Error {\n    readonly databaseName: string;\n    readonly oldVersion: number;\n    readonly requestedVersion: number;\n    readonly name = \"IndexedDbSchemaUpgradeBlockedError\";\n    constructor(databaseName: string, oldVersion: number, requestedVersion: number);\n}"
+                "export declare class IndexedDbSchemaUpgradeBlockedError extends StorageUpgradeBlockedError {\n    readonly name = \"IndexedDbSchemaUpgradeBlockedError\";\n    constructor(databaseName: string, oldVersion: number, requestedVersion: number);\n}"
               ]
             },
             {
@@ -4605,7 +4619,7 @@
               "name": "OpfsBlockStoreOptions",
               "kind": "type",
               "declarations": [
-                "export interface OpfsBlockStoreOptions {\n    name: string;\n    durability?: \"relaxed\" | \"strict\";\n    root?: FileSystemDirectoryHandle;\n    checkpointEntries?: number;\n    cleanupLimitBytes?: number;\n    servedLedgerAgeMs?: number;\n    servedLedgerResultBytes?: number;\n    rpcTimeoutMs?: number;\n    yieldCooldownMs?: number;\n    hiddenIdleReleaseMs?: number;\n    handoverGraceMs?: number;\n    dispatchBudgetMs?: number;\n    onDiagnostic?: (error: unknown, context: string) => void;\n}"
+                "export interface OpfsBlockStoreOptions {\n    name: string;\n    durability?: \"relaxed\" | \"strict\";\n    root?: FileSystemDirectoryHandle;\n    checkpointEntries?: number;\n    cleanupLimitBytes?: number;\n    servedLedgerAgeMs?: number;\n    servedLedgerResultBytes?: number;\n    rpcTimeoutMs?: number;\n    yieldCooldownMs?: number;\n    hiddenIdleReleaseMs?: number;\n    handoverGraceMs?: number;\n    dispatchBudgetMs?: number;\n    layoutVersion?: number;\n    onSuperseding?: () => Promise<void> | void;\n    onSuperseded?: () => void;\n    onDiagnostic?: (error: unknown, context: string) => void;\n}"
               ]
             },
             {
@@ -5229,6 +5243,13 @@
               "kind": "type-and-value",
               "declarations": [
                 "export declare class StorageUnresponsiveError extends UnknownOutcomeError {\n    readonly backend: string;\n    readonly databaseName: string;\n    readonly waitedMs: number;\n    readonly name = \"StorageUnresponsiveError\";\n    constructor(backend: string, databaseName: string, waitedMs: number);\n}"
+              ]
+            },
+            {
+              "name": "StorageUpgradeBlockedError",
+              "kind": "type-and-value",
+              "declarations": [
+                "export declare class StorageUpgradeBlockedError extends Error {\n    readonly backend: string;\n    readonly databaseName: string;\n    readonly oldVersion: number;\n    readonly requestedVersion: number;\n    readonly name: string;\n    constructor(backend: string, databaseName: string, oldVersion: number, requestedVersion: number, message?: string);\n}"
               ]
             },
             {
@@ -6242,7 +6263,7 @@
               "name": "IndexedDbSchemaUpgradeBlockedError",
               "kind": "type-and-value",
               "declarations": [
-                "export declare class IndexedDbSchemaUpgradeBlockedError extends Error {\n    readonly databaseName: string;\n    readonly oldVersion: number;\n    readonly requestedVersion: number;\n    readonly name = \"IndexedDbSchemaUpgradeBlockedError\";\n    constructor(databaseName: string, oldVersion: number, requestedVersion: number);\n}"
+                "export declare class IndexedDbSchemaUpgradeBlockedError extends StorageUpgradeBlockedError {\n    readonly name = \"IndexedDbSchemaUpgradeBlockedError\";\n    constructor(databaseName: string, oldVersion: number, requestedVersion: number);\n}"
               ]
             },
             {
@@ -7618,6 +7639,13 @@
               ]
             },
             {
+              "name": "StorageUpgradeBlockedError",
+              "kind": "type-and-value",
+              "declarations": [
+                "export declare class StorageUpgradeBlockedError extends Error {\n    readonly backend: string;\n    readonly databaseName: string;\n    readonly oldVersion: number;\n    readonly requestedVersion: number;\n    readonly name: string;\n    constructor(backend: string, databaseName: string, oldVersion: number, requestedVersion: number, message?: string);\n}"
+              ]
+            },
+            {
               "name": "StoredManifestRecord",
               "kind": "type",
               "declarations": [
@@ -7960,6 +7988,13 @@
           "audience": "application",
           "exports": [
             {
+              "name": "INDEXEDDB_SUPERSEDE_DRAIN_MS",
+              "kind": "value",
+              "declarations": [
+                "INDEXEDDB_SUPERSEDE_DRAIN_MS = 3000"
+              ]
+            },
+            {
               "name": "INDEXEDDB_UNRESPONSIVE_AFTER_MS",
               "kind": "value",
               "declarations": [
@@ -7977,7 +8012,7 @@
               "name": "IndexedDbBlockStoreOptions",
               "kind": "type",
               "declarations": [
-                "export interface IndexedDbBlockStoreOptions {\n    name: string;\n    durability?: IDBTransactionDurability;\n    indexedDB?: IDBFactory;\n    uniqueKeyCacheBytes?: number;\n    unresponsiveAfterMs?: number;\n}"
+                "export interface IndexedDbBlockStoreOptions {\n    name: string;\n    durability?: IDBTransactionDurability;\n    indexedDB?: IDBFactory;\n    uniqueKeyCacheBytes?: number;\n    unresponsiveAfterMs?: number;\n    onSuperseding?: () => Promise<void> | void;\n    onSuperseded?: () => void;\n    upgradeWaitMs?: number;\n}"
               ]
             }
           ]
@@ -8018,7 +8053,7 @@
               "name": "OpfsBlockStoreOptions",
               "kind": "type",
               "declarations": [
-                "export interface OpfsBlockStoreOptions {\n    name: string;\n    durability?: \"relaxed\" | \"strict\";\n    root?: FileSystemDirectoryHandle;\n    checkpointEntries?: number;\n    cleanupLimitBytes?: number;\n    servedLedgerAgeMs?: number;\n    servedLedgerResultBytes?: number;\n    rpcTimeoutMs?: number;\n    yieldCooldownMs?: number;\n    hiddenIdleReleaseMs?: number;\n    handoverGraceMs?: number;\n    dispatchBudgetMs?: number;\n    onDiagnostic?: (error: unknown, context: string) => void;\n}"
+                "export interface OpfsBlockStoreOptions {\n    name: string;\n    durability?: \"relaxed\" | \"strict\";\n    root?: FileSystemDirectoryHandle;\n    checkpointEntries?: number;\n    cleanupLimitBytes?: number;\n    servedLedgerAgeMs?: number;\n    servedLedgerResultBytes?: number;\n    rpcTimeoutMs?: number;\n    yieldCooldownMs?: number;\n    hiddenIdleReleaseMs?: number;\n    handoverGraceMs?: number;\n    dispatchBudgetMs?: number;\n    layoutVersion?: number;\n    onSuperseding?: () => Promise<void> | void;\n    onSuperseded?: () => void;\n    onDiagnostic?: (error: unknown, context: string) => void;\n}"
               ]
             },
             {
@@ -9323,10 +9358,17 @@
               ]
             },
             {
+              "name": "workerStoreHooks",
+              "kind": "value",
+              "declarations": [
+                "export declare function workerStoreHooks(options: WorkerStoreOptions): {\n    onSuperseding?: () => Promise<void> | void;\n    onSuperseded?: () => void;\n};"
+              ]
+            },
+            {
               "name": "WorkerStoreOptions",
               "kind": "type",
               "declarations": [
-                "export interface WorkerStoreOptions {\n    indexedDB?: IDBFactory;\n    onDiagnostic?: (error: unknown, context: string) => void;\n}"
+                "export interface WorkerStoreOptions {\n    indexedDB?: IDBFactory;\n    onDiagnostic?: (error: unknown, context: string) => void;\n    onSuperseding?: () => Promise<void> | void;\n    onSuperseded?: () => void;\n}"
               ]
             }
           ]
@@ -9487,6 +9529,13 @@
               "kind": "value",
               "declarations": [
                 "export declare function workerKeepaliveEvent(requestId: string): RpcResponse;"
+              ]
+            },
+            {
+              "name": "workerSupersededEvent",
+              "kind": "value",
+              "declarations": [
+                "export declare function workerSupersededEvent(): RpcResponse;"
               ]
             }
           ]

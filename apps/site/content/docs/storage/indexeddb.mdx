@@ -218,18 +218,24 @@ that stops inside its turn holds the others until it finishes or the browser rel
 the wait is reported after ten seconds and never bypassed, and closing a waiting engine or
 client cancels its wait at once.
 
-When a newer build requests an IndexedDB schema version, every Minnow connection closes itself on
-the browser's `versionchange` event so it cannot strand the open. From then on that connection
-fails every call with `StorageConnectionClosedError` whose `reason` is `"superseded"` (a
-connection the application closed itself reports `"closed"`). It extends `ConnectionLostError`:
-the connection cannot be reused, and the remedy is to reload the page, which loads the newer
-build. A call the connection had already handed to IndexedDB is not affected — IndexedDB
-finishes the transactions it accepted before the connection closes, so that call still settles
-on its own result, or on the unresponsive deadline below if its transaction never answers. If a
-non-cooperating connection blocks the open, `open()` rejects with
-`IndexedDbSchemaUpgradeBlockedError` instead of waiting forever. The error carries the database name and old/requested versions; close the older tab and
-retry. A request that already reported this error is marked abandoned, so it cannot wake later and
-silently upgrade or rebuild the database after its caller has moved on.
+When a newer build requests an IndexedDB schema version, every Minnow connection steps aside on
+the browser's `versionchange` event, so it cannot strand the open. It first finishes what it
+already accepted: the worker host writes its buffered writers' rows, for up to three seconds.
+Then it closes. From then on that connection fails every call with `StorageConnectionClosedError`
+whose `reason` is `"superseded"` (a connection the application closed itself reports `"closed"`).
+It extends `ConnectionLostError`: the connection cannot be reused. A worker client reloads the
+page by default, which loads the newer build; see
+[when a newer build opens the database](/docs/engine/workers#when-a-newer-build-opens-the-database).
+A call the connection had already handed to IndexedDB is not affected. IndexedDB finishes the
+transactions it accepted before the connection closes, so that call still settles on its own
+result, or on the unresponsive deadline below if its transaction never answers.
+
+The newer build's open waits while older connections finish, up to ten seconds. If a connection
+still blocks it then (a frozen tab, or one that is not Minnow's), `open()` rejects with
+`IndexedDbSchemaUpgradeBlockedError`, a `StorageUpgradeBlockedError`. The error carries the
+database name and old/requested versions; close or reload the older tab and retry. A request that
+already reported this error is marked abandoned, so it cannot wake later and silently upgrade or
+rebuild the database after its caller has moved on.
 
 Transaction completion is observed before requests are submitted. An abort remains observable
 even if quota or request-failure processing resumes after the abort event.

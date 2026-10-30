@@ -8,6 +8,7 @@
 import type { BlockStore } from "../storage/types.js";
 import {
   attachWorkerHost,
+  workerStoreHooks,
   type RpcScope,
   type StoreDescriptor,
   type WorkerStoreFactory,
@@ -24,6 +25,7 @@ export {
 export {
   exposeDatabase,
   singleStoreFactory,
+  workerStoreHooks,
   MAX_WORKER_HANDLES_PER_CONNECTION,
   type DatabaseInitPayload,
   type ExposeDatabaseOptions,
@@ -103,11 +105,13 @@ async function createStore(
       name: descriptor.name,
       ...(descriptor.durability === undefined ? {} : { durability: descriptor.durability }),
       ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic }),
+      ...workerStoreHooks(options),
     });
   }
   const { IndexedDbBlockStore } = await import("../storage/indexeddb.js");
   return IndexedDbBlockStore.open({
     name: descriptor.name,
+    ...workerStoreHooks(options),
     ...(descriptor.durability === undefined ? {} : { durability: descriptor.durability }),
     ...(descriptor.uniqueKeyCacheBytes === undefined
       ? {}

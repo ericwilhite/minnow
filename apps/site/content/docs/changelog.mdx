@@ -8,6 +8,58 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.19.0 — October 30, 2026
+
+Release packages: `@minnowdb/core@0.19.0`.
+
+- **Deploying a new stored format no longer strands users.** The tab with the new release
+  used to wait up to ten seconds for older tabs to let go of the database. Then it failed with a
+  plain `Error`, and the app looked stuck loading. Now:
+  1. The new tab asks every older tab to let go.
+  2. Each older tab finishes what it already accepted: rows a buffered writer took, and calls
+     already made. Then it releases the database.
+  3. The new tab upgrades and opens, typically in under half a second.
+  4. The worker client in each older tab reloads its page once, which loads the new release.
+
+  It works the same on OPFS (a new request on the store's channel) and IndexedDB, where the
+  database now finishes accepted work before it closes on `versionchange`. A newer tab's open also
+  waits up to ten seconds for older connections instead of failing as soon as the browser reports
+  `blocked`. See
+  [when a newer build opens the database](/docs/engine/workers#when-a-newer-build-opens-the-database).
+
+- **New client options.**
+  - `whenSuperseded` is `"reload"` by default. `"prompt"` reloads nothing: `client.superseded`
+    turns `true`, calls fail with `StorageConnectionClosedError` (`reason: "superseded"`), and the
+    app shows its own reload message.
+  - `onSuperseded` reports the switch in both modes, with `{ reloading }`.
+  - A page that can't open the database because a newer release already upgraded it also reloads
+    once, in `"reload"` mode.
+  - A page reloads at most once a minute for this, so a stale cache can't cause a reload loop.
+- **New error: `StorageUpgradeBlockedError`.** It means an older tab did not answer at all: a
+  frozen tab, or a release before 0.19.0. It carries `backend`, the database name, and the old
+  and new format versions. `IndexedDbSchemaUpgradeBlockedError` now extends it. It is classified
+  transient: show "close or reload your other tabs" and retry. It replaces the untyped "Automatic
+  OPFS upgrade is waiting for exclusive access" `Error`.
+- **For custom worker entries.** `workerStoreHooks(options)` from `@minnowdb/core/worker-host`
+  passes the host's handling to a store your factory opens. `OpfsBlockStoreOptions` and
+  `IndexedDbBlockStoreOptions` gain `onSuperseding` and `onSuperseded` for direct use.
+
+**Migration.**
+
+- Apps using the stock worker client get the reload behaviour with no code change.
+- If your app guards unsaved input, keep (or add) a `beforeunload` handler, or pass
+  `whenSuperseded: "prompt"`.
+- Code that matched the old error message should catch `StorageUpgradeBlockedError`.
+- Releases before 0.19.0 don't answer the new request. While tabs on them are still open, a new
+  release's tab fails with `StorageUpgradeBlockedError` after ten seconds, as before but typed.
+
+The engine with OPFS measures 441.4 KiB gzipped (previously 441.0 KiB). The generic worker plus
+its client measures 551.6 KiB gzipped (previously 550.4 KiB). A worker-hosted page's main thread
+grows by 480 bytes gzipped to 31.6 KiB, for the client's reload handling.
+
+No stored format changes: IndexedDB schema 8 and OPFS layout 13 are unchanged, and 0.18.3 opens
+every database this release writes. No data migration or export/import step is needed.
+
 ## 0.18.3 — October 30, 2026
 
 Release packages: `@minnowdb/core@0.18.3`.

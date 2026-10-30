@@ -213,6 +213,14 @@ export function workerErrorEvent(report: WorkerErrorReport): RpcResponse {
 }
 
 /**
+ * The store this worker opened closed because a newer build in another tab needs the database:
+ * it upgraded the stored format, or is waiting to. Every later call fails; the page must reload.
+ */
+export function workerSupersededEvent(): RpcResponse {
+  return rpcEvent(WORKER_DIAGNOSTIC_HANDLE_ID, "superseded", null);
+}
+
+/**
  * How often the worker tells the client that a call is still being worked on. The client's
  * request deadline counts silence, not wall time, so a large batch write is not cut off — and
  * its client left permanently failed — merely for being large.

@@ -5,6 +5,7 @@ import {
   ConnectionLostError,
   GarbageCollectionJobConflictError,
   IndexedDbSchemaUpgradeBlockedError,
+  StorageUpgradeBlockedError,
   LeaseConflictError,
   LeaseExpiredError,
   LeaseOwnerConflictError,
@@ -102,6 +103,11 @@ export type StoreRpcMessage =
    * before the ledger's coverage begins, so an earlier leader may have executed it.
    */
   | { kind: "uncertain"; requestId: string }
+  /**
+   * An opener on a newer layout is waiting to upgrade the database. Every connection on an older
+   * layout finishes the work it accepted, stops leading for good, and closes as superseded.
+   */
+  | { kind: "upgrade"; layout: number }
   /**
    * The leader exists (sent on takeover and in answer to pings), with its native layout. A
    * follower that hears a layout newer than its own closes itself: a newer build upgraded the
@@ -374,6 +380,12 @@ export function parseStoreRpcMessage(
           : undefined;
       case "ping":
         return exactKeys(record, ["kind"]) ? (record as StoreRpcMessage) : undefined;
+      case "upgrade":
+        return exactKeys(record, ["kind", "layout"]) &&
+          record.layout !== undefined &&
+          validLayout(record.layout)
+          ? (record as StoreRpcMessage)
+          : undefined;
       case "bid":
         return exactKeys(record, ["kind", "bidderId", "foreground"]) &&
           boundedRpcString(record.bidderId) &&
@@ -465,6 +477,7 @@ const errorRegistry = new Map<string, new (...args: never[]) => Error>([
   ["CompactionJobConflictError", CompactionJobConflictError],
   ["GarbageCollectionJobConflictError", GarbageCollectionJobConflictError],
   ["IndexedDbSchemaUpgradeBlockedError", IndexedDbSchemaUpgradeBlockedError],
+  ["StorageUpgradeBlockedError", StorageUpgradeBlockedError],
   ["TempOwnerConflictError", TempOwnerConflictError],
   ["StorageResourceLimitError", StorageResourceLimitError],
   ["TableInUseError", TableInUseError],

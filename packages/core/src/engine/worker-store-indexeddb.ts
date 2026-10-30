@@ -3,13 +3,14 @@
  * entry so a test can attach it to an in-process scope without the entry's `self` side effect.
  */
 import { IndexedDbBlockStore } from "../storage/indexeddb.js";
-import { singleStoreFactory, type WorkerStoreFactory } from "./worker-server.js";
+import { singleStoreFactory, workerStoreHooks, type WorkerStoreFactory } from "./worker-server.js";
 
 export const indexedDbWorkerStore: WorkerStoreFactory = singleStoreFactory(
   "indexeddb",
   (descriptor, options) =>
     IndexedDbBlockStore.open({
       name: descriptor.name,
+      ...workerStoreHooks(options),
       ...(descriptor.durability === undefined ? {} : { durability: descriptor.durability }),
       ...(descriptor.uniqueKeyCacheBytes === undefined
         ? {}

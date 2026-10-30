@@ -3,7 +3,7 @@
  * a test can attach it to an in-process scope without the entry's `self` side effect.
  */
 import { OpfsBlockStore } from "../storage/opfs/index.js";
-import { singleStoreFactory, type WorkerStoreFactory } from "./worker-server.js";
+import { singleStoreFactory, workerStoreHooks, type WorkerStoreFactory } from "./worker-server.js";
 
 export const opfsWorkerStore: WorkerStoreFactory = singleStoreFactory(
   "opfs",
@@ -12,5 +12,6 @@ export const opfsWorkerStore: WorkerStoreFactory = singleStoreFactory(
       name: descriptor.name,
       ...(descriptor.durability === undefined ? {} : { durability: descriptor.durability }),
       ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic }),
+      ...workerStoreHooks(options),
     }),
 );

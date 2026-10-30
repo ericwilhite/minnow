@@ -258,6 +258,7 @@ import {
   ConnectionLostError,
   GarbageCollectionJobConflictError,
   IndexedDbSchemaUpgradeBlockedError,
+  StorageUpgradeBlockedError,
   LeaseConflictError,
   LeaseExpiredError,
   LeaseOwnerConflictError,
@@ -371,6 +372,7 @@ const TRANSIENT_ERRORS: readonly ErrorEntry[] = [
   ["LeaseExpiredError", LeaseExpiredError],
   ["TransactionExpiredError", TransactionExpiredError],
   ["IndexedDbSchemaUpgradeBlockedError", IndexedDbSchemaUpgradeBlockedError],
+  ["StorageUpgradeBlockedError", StorageUpgradeBlockedError],
   ["VisibleSegmentCursorStaleError", VisibleSegmentCursorStaleError],
 ];
 

@@ -43,6 +43,7 @@ const factories: Record<string, ErrorFactory> = {
     new storage.GarbageCollectionJobConflictError("job", 1, 2),
   IndexedDbSchemaUpgradeBlockedError: () =>
     new storage.IndexedDbSchemaUpgradeBlockedError("db", 1, 2),
+  StorageUpgradeBlockedError: () => new storage.StorageUpgradeBlockedError("opfs", "db", 12, 13),
   LeaseConflictError: () => new storage.LeaseConflictError("lease", 1, 2),
   LeaseExpiredError: () =>
     new storage.LeaseExpiredError("lease", "2026-01-01T00:00:00Z", "2026-01-01T00:00:01Z"),

@@ -8,6 +8,7 @@ import {
   StorageConnectionClosedError,
   StorageCorruptionError,
   StorageFormatVersionError,
+  StorageUpgradeBlockedError,
   validateStorageDatabaseName,
   type BlockStore,
   type FtsChanges,
@@ -61,6 +62,16 @@ const DISCOVERY_WAIT_MS = 150;
  * database is waited out while a leader that is frozen with the handles is not.
  */
 const DISPATCH_BUDGET_MS = 10_000;
+/**
+ * How long a connection a newer build superseded keeps serving while work it already accepted
+ * finishes. Well inside the newer opener's dispatch budget, which it spends waiting.
+ */
+const SUPERSEDE_DRAIN_MS = 3_000;
+/**
+ * How long a superseded leader must go without serving anything before it lets go. Longer than a
+ * follower's discovery wait (`DISCOVERY_WAIT_MS`), so one still finding the leader finds it.
+ */
+const SUPERSEDE_QUIET_MS = 250;
 /** A leader yields to a foreground bidder at most this often; a bid inside it is deferred. */
 const YIELD_COOLDOWN_MS = 3_000;
 /** After yielding, the ex-leader stays out of elections this long so the bidder can win. */
@@ -128,6 +139,24 @@ export interface OpfsBlockStoreOptions {
   handoverGraceMs?: number;
   /** @internal Test seam: how long an operation looks for a leader (default 10000ms). */
   dispatchBudgetMs?: number;
+  /**
+   * @internal Test seam: the layout this connection runs, as an older build's would (default
+   * `OPFS_LAYOUT_VERSION`). Lets one build play both sides of an upgrade.
+   */
+  layoutVersion?: number;
+  /**
+   * Called when a newer build needs this database, before this connection lets go of it. The
+   * connection keeps serving until the returned promise settles — bounded by
+   * `SUPERSEDE_DRAIN_MS` — so work it already accepted can finish: the worker host flushes its
+   * buffered writers here.
+   */
+  onSuperseding?: () => Promise<void> | void;
+  /**
+   * Called once this connection has closed because a newer build took over the database. Every
+   * later call fails with `StorageConnectionClosedError` (`reason: "superseded"`); the remedy is
+   * to reload the page.
+   */
+  onSuperseded?: () => void;
   /**
    * Hears failures no operation reports: a background checkpoint or cleanup that failed, an
    * election or handover that threw, a served request that could not be answered. The worker
@@ -400,6 +429,17 @@ export class OpfsBlockStore {
    * database in another tab. This connection closed itself; every call reports why.
    */
   #superseded: StorageConnectionClosedError | undefined;
+  /**
+   * Set once a newer build asked for the database: this connection finishes what it accepted,
+   * never leads again, then closes as superseded.
+   */
+  #superseding = false;
+  readonly #onSuperseding: (() => Promise<void> | void) | undefined;
+  readonly #onSuperseded: (() => void) | undefined;
+  /** The layout this connection runs: this build's, unless a test plays an older build. */
+  readonly #layout: number;
+  /** The layout the marker named when this connection opened. */
+  #markerVersion: number | undefined;
   /** Held by every judgement and every write of this database's format marker. */
   readonly #markerLockName: string;
   /** The database-wide channel: leadership traffic every connection listens to. */
@@ -467,6 +507,9 @@ export class OpfsBlockStore {
     this.#hiddenIdleReleaseMs = options.hiddenIdleReleaseMs ?? HIDDEN_IDLE_RELEASE_MS;
     this.#handoverGraceMs = options.handoverGraceMs ?? HANDOVER_GRACE_MS;
     this.#dispatchBudgetMs = options.dispatchBudgetMs ?? DISPATCH_BUDGET_MS;
+    this.#layout = options.layoutVersion ?? OPFS_LAYOUT_VERSION;
+    this.#onSuperseding = options.onSuperseding;
+    this.#onSuperseded = options.onSuperseded;
     this.#onDiagnostic = options.onDiagnostic;
     this.#databaseName = options.name;
     this.#channelName = `minnowdb-store:${options.name}`;
@@ -511,6 +554,9 @@ export class OpfsBlockStore {
         // Recovery answers pings with a wait announcement. Refresh that evidence while a
         // large conversion is alive, including when this opener missed its first broadcast.
         store.#post({ kind: "ping" });
+        // Connections on an older layout hold the database: ask them to finish what they
+        // accepted and let go. Repeated, so one that elected itself since hears it too.
+        store.#post({ kind: "upgrade", layout: store.#layout });
         await sleep(20);
         await store.#ensureFormatMarker();
         await store.#tryBecomeLeader();
@@ -518,8 +564,13 @@ export class OpfsBlockStore {
         // outlast the budget while the conversion it belongs to is finishing.
         if (!store.#upgradeStillPending()) break;
         if (Date.now() - Math.max(upgradeStarted, store.#waitHeardAt) > store.#dispatchBudgetMs) {
-          throw new Error(
-            "Automatic OPFS upgrade is waiting for exclusive access; close older connections and reopen",
+          // Older connections step aside when asked; one that did not is frozen, hung, or from
+          // a build before the request existed.
+          throw new StorageUpgradeBlockedError(
+            "opfs",
+            store.#databaseName,
+            store.#markerVersion ?? 0,
+            store.#layout,
           );
         }
       }
@@ -565,7 +616,7 @@ export class OpfsBlockStore {
    * this soon after yielding them.
    */
   async #tryBecomeLeader(force = false): Promise<boolean> {
-    if (this.#closed) return false;
+    if (this.#closed || this.#superseding) return false;
     if (this.#leader !== undefined) return true;
     if (this.#yielding !== undefined) return false;
     if (!force && Date.now() - this.#lastYieldAt < this.#handoverGraceMs) return false;
@@ -614,9 +665,12 @@ export class OpfsBlockStore {
           if (!(error instanceof SyntaxError)) throw error;
         }
       }
-      const upgraded = await upgradeOpfsLayout(this.#tree, { wal, slotA, slotB }, (publish) =>
-        this.#withMarkerLock(publish),
-      );
+      // A connection playing an older build (`layoutVersion`) never upgrades past its layout.
+      const upgraded =
+        this.#layout === OPFS_LAYOUT_VERSION &&
+        (await upgradeOpfsLayout(this.#tree, { wal, slotA, slotB }, (publish) =>
+          this.#withMarkerLock(publish),
+        ));
       this.#upgradePending = false;
       acknowledgements = await this.#openWithRetry(["wal-acknowledgements"]);
       this.#leader = await OpfsLeader.recover(
@@ -670,7 +724,7 @@ export class OpfsBlockStore {
     leader.onRecoveryFailed = () => {
       this.#onLeaderRecoveryFailed(leader);
     };
-    this.#post({ kind: "leader", leaderId: this.#instanceId, layout: OPFS_LAYOUT_VERSION });
+    this.#post({ kind: "leader", leaderId: this.#instanceId, layout: this.#layout });
     this.#post({ kind: "state", leaderId: this.#instanceId, foreground: this.#foreground });
     if (!this.#foreground) this.#armHiddenIdleTimer();
     return true;
@@ -723,7 +777,9 @@ export class OpfsBlockStore {
    */
   #armHiddenIdleTimer(): void {
     this.#clearHiddenIdleTimer();
-    if (this.#foreground || this.#leader === undefined || this.#closed) return;
+    if (this.#foreground || this.#leader === undefined || this.#closed || this.#superseding) {
+      return;
+    }
     const elapsed = Date.now() - this.#lastActivityAt;
     const timer = setTimeout(
       () => {
@@ -815,7 +871,14 @@ export class OpfsBlockStore {
 
   /** Yields now when the cooldown allows it, otherwise when the cooldown ends. */
   #considerBid(bidderId: string): void {
-    if (this.#leader === undefined || this.#foreground || this.#yielding !== undefined) return;
+    if (
+      this.#leader === undefined ||
+      this.#foreground ||
+      this.#yielding !== undefined ||
+      this.#superseding
+    ) {
+      return;
+    }
     const remaining = this.#yieldCooldownMs - (Date.now() - this.#lastYieldAt);
     if (remaining <= 0) {
       this.#clearDeferredBid();
@@ -909,7 +972,7 @@ export class OpfsBlockStore {
           this.#decline(message);
           return;
         }
-        if ((message.layout ?? OPFS_LAYOUT_VERSION) < OPFS_LAYOUT_VERSION) {
+        if ((message.layout ?? OPFS_LAYOUT_VERSION) < this.#layout) {
           // A tab from before this database's layout was upgraded: it would read records it
           // cannot interpret. It is told why, and closes itself when it hears this leader.
           this.#incomingPieces.delete(servedRequestKey(message.from, message.requestId));
@@ -1027,7 +1090,7 @@ export class OpfsBlockStore {
         return;
       }
       case "leader": {
-        if ((message.layout ?? OPFS_LAYOUT_VERSION) > OPFS_LAYOUT_VERSION) {
+        if ((message.layout ?? OPFS_LAYOUT_VERSION) > this.#layout) {
           // A newer build upgraded the database and leads it. Records it writes are beyond
           // this build; stop here rather than read them wrongly. A leader from a build without
           // the field is from before any later layout existed, hence this one's.
@@ -1081,9 +1144,14 @@ export class OpfsBlockStore {
         }
         return;
       }
+      case "upgrade": {
+        // A newer build is waiting to upgrade the database this connection holds or follows.
+        if (message.layout > this.#layout) this.#supersede();
+        return;
+      }
       case "ping": {
         if (this.#leader !== undefined) {
-          this.#post({ kind: "leader", leaderId: this.#instanceId, layout: OPFS_LAYOUT_VERSION });
+          this.#post({ kind: "leader", leaderId: this.#instanceId, layout: this.#layout });
         } else if (this.#recovering || this.#yielding !== undefined) {
           this.#post({ kind: "wait", leaderId: this.#instanceId });
         }
@@ -1729,15 +1797,47 @@ export class OpfsBlockStore {
   }
 
   /**
-   * A newer build upgraded this database and leads it. This connection cannot read what that
-   * build writes, so it closes: calls already handed to a leader report an unknown outcome,
-   * everything else reports the supersession, and the remedy is to reload the page.
+   * A newer build needs this database: it is waiting to upgrade it, or already did and leads
+   * it. This connection cannot read what that build writes, so it steps aside. It never leads
+   * again; it lets the owner finish work it already accepted (`onSuperseding`) and waits for its
+   * own calls in flight to be answered, both bounded by `SUPERSEDE_DRAIN_MS`, then closes. A
+   * leader's close finishes and answers every request it admitted before it lets go. Every
+   * later call reports the supersession; the remedy is to reload the page.
    */
   #supersede(): void {
-    if (this.#closed) return;
-    this.#superseded = new StorageConnectionClosedError("opfs", this.#databaseName, "superseded");
-    this.#diagnostic(this.#superseded, "opfs layout superseded");
-    this.close();
+    if (this.#closed || this.#superseding) return;
+    this.#superseding = true;
+    this.#clearCoordinationTimers();
+    void (async () => {
+      const deadline = Date.now() + SUPERSEDE_DRAIN_MS;
+      try {
+        await settleWithin(Promise.resolve(this.#onSuperseding?.()), SUPERSEDE_DRAIN_MS);
+      } catch (error) {
+        this.#diagnostic(error, "opfs superseded drain");
+      }
+      while (this.#callsInFlight > 0 && Date.now() < deadline && !this.#closed) await sleep(10);
+      // A leader also serves the followers that heard the same request and are finishing their
+      // own work through it: it lets go once it has served nothing for a moment.
+      while (
+        this.#leader !== undefined &&
+        Date.now() < deadline &&
+        !this.#closed &&
+        (this.#served.size > 0 || Date.now() - this.#lastActivityAt < SUPERSEDE_QUIET_MS)
+      ) {
+        await sleep(10);
+      }
+      if (this.#closed) return;
+      this.#superseded = new StorageConnectionClosedError("opfs", this.#databaseName, "superseded");
+      if (this.#onSuperseded === undefined) {
+        this.#diagnostic(this.#superseded, "opfs layout superseded");
+      }
+      this.close();
+      try {
+        this.#onSuperseded?.();
+      } catch (error) {
+        this.#diagnostic(error, "opfs superseded callback");
+      }
+    })();
   }
 
   /**
@@ -1756,8 +1856,20 @@ export class OpfsBlockStore {
     this.#post({ kind: "released", leaderId: this.#instanceId });
   }
 
+  /** Calls made on this connection and not yet answered, posted to a leader or not. */
+  #callsInFlight = 0;
+
   async #dispatch(method: string, args: unknown[]): Promise<unknown> {
     this.#assertOpen();
+    this.#callsInFlight += 1;
+    try {
+      return await this.#dispatchCall(method, args);
+    } finally {
+      this.#callsInFlight -= 1;
+    }
+  }
+
+  async #dispatchCall(method: string, args: unknown[]): Promise<unknown> {
     const requestId = crypto.randomUUID();
     const sentAt = Date.now();
     const isRead = READ_METHODS.has(method);
@@ -1889,7 +2001,7 @@ export class OpfsBlockStore {
         method,
         args: encoded?.args ?? args,
         sentAt,
-        layout: OPFS_LAYOUT_VERSION,
+        layout: this.#layout,
         ...(encoded === undefined
           ? {}
           : { encoded: { pieces: encoded.pieces.length, bytes: encoded.bytes } }),
@@ -2249,7 +2361,7 @@ export class OpfsBlockStore {
           `Refusing to guess their layout version.`,
       );
     }
-    const bytes = new TextEncoder().encode(JSON.stringify({ formatVersion: OPFS_LAYOUT_VERSION }));
+    const bytes = new TextEncoder().encode(JSON.stringify({ formatVersion: this.#layout }));
     try {
       await this.#tree.writeFile(["format.json"], bytes, { flush: true });
     } catch (error) {
@@ -2289,13 +2401,16 @@ export class OpfsBlockStore {
       );
     }
     const formatVersion = (parsed as { formatVersion: number }).formatVersion;
-    if (formatVersion !== OPFS_LAYOUT_VERSION && !canUpgradeOpfsLayout(formatVersion)) {
+    if (
+      formatVersion !== this.#layout &&
+      !(formatVersion < this.#layout && canUpgradeOpfsLayout(formatVersion))
+    ) {
       throw new StorageFormatVersionError(
         "opfs",
         "format.json",
         formatVersion,
-        OPFS_LAYOUT_VERSION,
-        formatVersion < OPFS_LAYOUT_VERSION ? "older" : "newer",
+        this.#layout,
+        formatVersion < this.#layout ? "older" : "newer",
       );
     }
     if (
@@ -2309,7 +2424,8 @@ export class OpfsBlockStore {
         "The OPFS format marker is not the canonical layout marker",
       );
     }
-    this.#upgradePending = canUpgradeOpfsLayout(formatVersion);
+    this.#markerVersion = formatVersion;
+    this.#upgradePending = formatVersion < this.#layout && canUpgradeOpfsLayout(formatVersion);
   }
 }
 
@@ -2457,6 +2573,21 @@ export async function opfsDatabaseExists(options: {
 
 function isLockContention(error: unknown): boolean {
   return isDomError(error, "NoModificationAllowedError") || isDomError(error, "InvalidStateError");
+}
+
+/** Waits for `work`, or `ms`, whichever is first; a rejection still surfaces if it comes first. */
+async function settleWithin(work: Promise<unknown>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      work,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function sleep(ms: number): Promise<void> {

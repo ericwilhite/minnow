@@ -13,6 +13,7 @@ import {
   GarbageCollectionJobConflictError,
   type GarbageCollectionJobRecord,
   IndexedDbSchemaUpgradeBlockedError,
+  StorageUpgradeBlockedError,
   type InterruptedSnapshotImport,
   type InterruptedSnapshotImportAbortResult,
   LeaseConflictError,
@@ -241,6 +242,31 @@ export interface MinnowDatabaseClientOptions<TSchema extends AnySchema = Untyped
    * fails the same way until `reopen()`; use this hook to reopen and rebuild handles.
    */
   onConnectionLost?: (error: ConnectionLostError) => void;
+  /**
+   * What this page does when a newer build of the app, open in another tab, takes the database
+   * over: it upgraded the stored format, or is waiting to, so this tab can no longer read it.
+   *
+   * - `"reload"` (the default): the page reloads once, which loads the newer build. Calls this tab
+   *   already sent finish first, including the rows a buffered writer accepted. An app that
+   *   guards unsaved input with a `beforeunload` handler still gets to ask the user.
+   * - `"prompt"`: nothing reloads. `superseded` turns true, `onSuperseded` fires, and every call
+   *   fails with `StorageConnectionClosedError` (`reason: "superseded"`); the page asks the user
+   *   to reload, as an installable app's update prompt does.
+   *
+   * The same applies when the database cannot open because a newer build already upgraded it.
+   * A page reloads at most once per minute for this, so a stale cache that serves the old build
+   * again ends in `"prompt"` behaviour instead of a reload loop. Outside a page — a worker, Node,
+   * an in-memory store — nothing reloads.
+   */
+  whenSuperseded?: "reload" | "prompt";
+  /** Hears that a newer build took the database over, in both modes and before any reload. */
+  onSuperseded?: (event: DatabaseSupersededEvent) => void;
+}
+
+/** Delivered to `onSuperseded` when a newer build in another tab takes the database over. */
+export interface DatabaseSupersededEvent {
+  /** Whether the client is reloading the page; false in `"prompt"` mode or when it cannot. */
+  reloading: boolean;
 }
 
 /** A worker failure that belongs to no call, delivered to `onWorkerError`. */
@@ -296,6 +322,47 @@ interface EventRoute {
  * to be felt as a dropped frame.
  */
 const SNAPSHOT_CHUNK_BYTES = MAX_SNAPSHOT_STREAM_CHUNK_BYTES;
+
+/** How long a superseded page waits for its calls in flight before it reloads. */
+const SUPERSEDED_SETTLE_MS = 5_000;
+/** A page that reloaded for a supersession and is superseded again within this reloads no more. */
+const SUPERSEDED_RELOAD_GUARD_MS = 60_000;
+
+function supersededReloadKey(store: StoreDescriptor): string | undefined {
+  return store.kind === "memory" ? undefined : `minnowdb:superseded-reload:${store.name}`;
+}
+
+/**
+ * Whether this page may reload for a supersession now, recording that it did. False outside a
+ * page, for an in-memory store (nothing else can take it over), without session storage (no
+ * guard, so no reload), and within a minute of the last such reload: a cache that serves the
+ * old build again must not reload the page forever.
+ */
+function claimSupersededReload(store: StoreDescriptor): boolean {
+  const key = supersededReloadKey(store);
+  if (key === undefined || typeof location === "undefined" || typeof document === "undefined") {
+    return false;
+  }
+  try {
+    const last = Number(sessionStorage.getItem(key));
+    if (Number.isFinite(last) && Date.now() - last < SUPERSEDED_RELOAD_GUARD_MS) return false;
+    sessionStorage.setItem(key, String(Date.now()));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The database opened: a later supersession of this page may reload it again. */
+function forgetSupersededReload(store: StoreDescriptor): void {
+  const key = supersededReloadKey(store);
+  if (key === undefined) return;
+  try {
+    if (typeof sessionStorage !== "undefined") sessionStorage.removeItem(key);
+  } catch {
+    // Without session storage there was nothing recorded.
+  }
+}
 const MAX_SNAPSHOT_BYTE_ARRAY_LENGTH = 0xffffffff;
 
 async function* clientSnapshotChunks(bytes: Uint8Array): AsyncGenerator<Uint8Array> {
@@ -371,6 +438,7 @@ const errorRegistry = new Map<string, new (...args: never[]) => Error>([
   ["CompactionJobConflictError", CompactionJobConflictError],
   ["GarbageCollectionJobConflictError", GarbageCollectionJobConflictError],
   ["IndexedDbSchemaUpgradeBlockedError", IndexedDbSchemaUpgradeBlockedError],
+  ["StorageUpgradeBlockedError", StorageUpgradeBlockedError],
   ["SnapshotManifestMissingError", SnapshotManifestMissingError],
   ["SnapshotImportConflictError", SnapshotImportConflictError],
   ["TableInUseError", TableInUseError],
@@ -436,6 +504,9 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
   #storeKind: OpenedStoreKind | undefined;
   #fatal: Error | undefined;
   #closed = false;
+  #superseded = false;
+  readonly #whenSuperseded: "reload" | "prompt";
+  readonly #onSuperseded: ((event: DatabaseSupersededEvent) => void) | undefined;
   #onVisibilityChange: (() => void) | undefined;
   readonly #onMessage = (event: MessageEvent<unknown>): void => {
     this.#receive(event.data);
@@ -468,6 +539,36 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
     this.#fail(error);
   };
 
+  /**
+   * A newer build took the database over. Tell the application, then — in `"reload"` mode, in a
+   * page, and at most once a minute — let this tab's calls in flight settle and reload.
+   */
+  #supersede(): void {
+    if (this.#superseded) return;
+    this.#superseded = true;
+    const reloading =
+      this.#whenSuperseded === "reload" && claimSupersededReload(this.#initPayload.store);
+    if (this.#onSuperseded !== undefined) {
+      try {
+        this.#onSuperseded({ reloading });
+      } catch (error) {
+        console.error("[minnowdb] onSuperseded callback failed:", error);
+      }
+    }
+    if (!reloading) return;
+    void this.#pendingSettled(SUPERSEDED_SETTLE_MS).then(() => {
+      location.reload();
+    });
+  }
+
+  /** Resolves once no call is in flight, or after `ms`. */
+  async #pendingSettled(ms: number): Promise<void> {
+    const deadline = Date.now() + ms;
+    while (this.#pending.size > 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+
   #reportWorkerError(event: DatabaseWorkerErrorEvent): void {
     if (this.#onWorkerError !== undefined) {
       try {
@@ -490,6 +591,8 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
     this.#schema = options.schema;
     this.#onWorkerError = options.onWorkerError;
     this.#onConnectionLost = options.onConnectionLost;
+    this.#whenSuperseded = options.whenSuperseded ?? "reload";
+    this.#onSuperseded = options.onSuperseded;
     this.#transportFactory = typeof transport === "function" ? transport : undefined;
     this.#transport = typeof transport === "function" ? transport() : transport;
     this.#initPayload = {
@@ -529,9 +632,18 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
         const kind = (result as { store?: unknown } | undefined)?.store;
         this.#storeKind =
           kind === "indexeddb" || kind === "opfs" || kind === "memory" ? kind : undefined;
+        // This build opened the database: a later supersession may reload the page again.
+        forgetSupersededReload(this.#initPayload.store);
       },
       (error: unknown) => {
-        if (this.#transport === transport) this.#readyFailed = true;
+        if (this.#transport === transport) {
+          this.#readyFailed = true;
+          // A newer build already upgraded the database: this page is an old build, perhaps
+          // restored from a cache, and the newer one is what reloading fetches.
+          if (error instanceof StorageFormatVersionError && error.relation === "newer") {
+            this.#supersede();
+          }
+        }
         throw error;
       },
     );
@@ -576,6 +688,7 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
     }
     this.#fatal = undefined;
     this.#closed = false;
+    this.#superseded = false;
     this.#closePromise = undefined;
     this.#events.clear();
     this.#transport = next;
@@ -592,6 +705,14 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
   /** Resolves once the worker has opened the store and constructed the database. */
   async ready(): Promise<void> {
     return this.#ready;
+  }
+
+  /**
+   * True once a newer build in another tab took the database over. Every call fails from then
+   * on; the page has to reload to open the database with that build. See `whenSuperseded`.
+   */
+  get superseded(): boolean {
+    return this.#superseded;
   }
 
   /**
@@ -1537,6 +1658,10 @@ export class MinnowDatabaseClient<TSchema extends AnySchema = UntypedSchema> {
       if (response.handleId === WORKER_DIAGNOSTIC_HANDLE_ID) {
         if (response.event === "keepalive" && typeof response.requestId === "string") {
           this.#pending.get(response.requestId)?.keepalive?.();
+          return;
+        }
+        if (response.event === "superseded") {
+          this.#supersede();
           return;
         }
         if (response.event === "error" && isWorkerErrorReport(response.payload)) {

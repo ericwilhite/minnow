@@ -2,7 +2,11 @@ import { IndexedDbBlockStore } from "../storage/indexeddb.js";
 import { OpfsBlockStore, opfsDatabaseExists } from "../storage/opfs/index.js";
 import { openAutoStore } from "./auto-store.js";
 import type { BlockStore } from "../storage/types.js";
-import { unsupportedStoreKindError, type WorkerStoreFactory } from "./worker-server.js";
+import {
+  unsupportedStoreKindError,
+  workerStoreHooks,
+  type WorkerStoreFactory,
+} from "./worker-server.js";
 
 /**
  * The store factory behind `@minnowdb/core/worker/auto`: both durable adapters, statically, so a
@@ -10,18 +14,22 @@ import { unsupportedStoreKindError, type WorkerStoreFactory } from "./worker-ser
  * to. Explicit `opfs` and `indexeddb` descriptors open as they would on their own entries.
  */
 export const autoWorkerStore: WorkerStoreFactory = async (descriptor, options) => {
-  const diagnostic =
-    options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic };
+  const hooks = workerStoreHooks(options);
+  const opfsHooks = {
+    ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic }),
+    ...hooks,
+  };
   switch (descriptor.kind) {
     case "opfs":
       return OpfsBlockStore.open({
         name: descriptor.name,
         ...(descriptor.durability === undefined ? {} : { durability: descriptor.durability }),
-        ...diagnostic,
+        ...opfsHooks,
       });
     case "indexeddb":
       return IndexedDbBlockStore.open({
         name: descriptor.name,
+        ...hooks,
         ...(descriptor.durability === undefined ? {} : { durability: descriptor.durability }),
         ...(descriptor.uniqueKeyCacheBytes === undefined
           ? {}
@@ -37,10 +45,11 @@ export const autoWorkerStore: WorkerStoreFactory = async (descriptor, options) =
                 ...(descriptor.opfs?.durability === undefined
                   ? {}
                   : { durability: descriptor.opfs.durability }),
-                ...diagnostic,
+                ...opfsHooks,
               })
             : IndexedDbBlockStore.open({
                 name: descriptor.name,
+                ...hooks,
                 ...(descriptor.indexeddb?.durability === undefined
                   ? {}
                   : { durability: descriptor.indexeddb.durability }),

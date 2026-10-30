@@ -215,6 +215,47 @@ Client adapters can wrap the same worker client because it implements `MinnowSql
 [Kysely adapter](/docs/adapters/kysely) therefore uses the same API on either side of the worker
 boundary.
 
+## When a newer build opens the database
+
+When you deploy a release that changes the stored format, tabs still running the previous release
+cannot read what the new one writes. Minnow handles the switch without asking the user anything:
+
+1. The tab running the new release opens the database and finds the older format. It asks every
+   older tab to let go.
+2. Each older tab finishes what it already accepted, including rows a buffered writer took and
+   has not written yet. Then it releases the database.
+3. The new tab upgrades the format and opens. This takes well under a second, not a timeout.
+4. Each older tab reloads itself once, which loads the new release.
+
+That's the default, `whenSuperseded: "reload"`. If a page can hold unsaved input, a
+`beforeunload` handler still gets to ask the user before the reload. To show your own message
+instead, use `"prompt"`, as an installable app does for updates:
+
+```ts
+const client = new MinnowDatabaseClient(worker, {
+  store: { kind: "auto", name: "app" },
+  whenSuperseded: "prompt",
+  onSuperseded: () => showBanner("A new version is ready. Reload to continue."),
+});
+```
+
+In `"prompt"` mode the older tab still lets go of the database at once, so the new tab never
+waits on someone in another tab. The page stays on screen, `client.superseded` turns `true`, and
+every call fails with `StorageConnectionClosedError` (`reason: "superseded"`) until the user
+reloads. `onSuperseded` fires in both modes, before any reload, with `{ reloading }`.
+
+The same applies to a page that opens after the upgrade still running the old release — from a
+stale cache, for example. It can't open the database (`StorageFormatVersionError`, `relation:
+"newer"`), so in `"reload"` mode it reloads once to fetch the new release. A page reloads at most
+once a minute for this, so a cache that keeps serving the old release ends in an error the app can
+show, never a reload loop. Nothing reloads outside a page (in a worker or Node) or for an
+in-memory store.
+
+The new tab is only blocked if an older tab doesn't answer at all: a frozen background tab, or a
+release from before 0.19.0. It waits about ten seconds, then fails with
+`StorageUpgradeBlockedError`, which names the database and the old and new format versions. Show
+"close or reload your other tabs" and retry.
+
 ## Buffered writers and low-level live queries
 
 Stateful handles proxy transparently — the writer's age timer runs on the worker's clock, and
@@ -369,17 +410,29 @@ factory. This installs the init listener before asynchronous storage work begins
 ```ts
 // my-worker.ts
 import { IndexedDbBlockStore } from "@minnowdb/core/storage/indexeddb";
-import { attachDatabaseWorker, singleStoreFactory } from "@minnowdb/core/worker-host";
+import {
+  attachDatabaseWorker,
+  singleStoreFactory,
+  workerStoreHooks,
+} from "@minnowdb/core/worker-host";
 
 attachDatabaseWorker(self, {
-  createStore: singleStoreFactory("indexeddb", async () =>
-    IndexedDbBlockStore.open({ name: "app-db", durability: "strict" }),
+  createStore: singleStoreFactory("indexeddb", async (_descriptor, options) =>
+    IndexedDbBlockStore.open({
+      name: "app-db",
+      durability: "strict",
+      ...workerStoreHooks(options),
+    }),
   ),
 });
 ```
 
 The client still sends its database options in the init frame. `singleStoreFactory()` refuses
 other store kinds, as the per-store entries do. Disposal closes the engine and then the store.
+`workerStoreHooks(options)` passes the store the host's
+[newer-build handling](#when-a-newer-build-opens-the-database): the store flushes buffered
+writers before it lets go, and the page hears it. Without it the store still steps aside for a
+newer build, but buffered rows are not written first and the page is not told.
 
 For function-valued engine options such as deterministic `now`/`createId`, construct a
 `MinnowDatabase` yourself and pass it to `exposeDatabase(database, self, options)`. If opening

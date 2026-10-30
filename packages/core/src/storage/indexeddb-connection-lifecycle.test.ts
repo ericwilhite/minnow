@@ -6,15 +6,18 @@
  * completion arrives after the deadline is an unknown outcome, not a failure.
  */
 import { IDBFactory } from "fake-indexeddb";
+import { IndexedDbBlockStore as ReleasedIndexedDbStore } from "@minnowdb/core-layout12/storage/indexeddb";
 import { describe, expect, it, vi } from "vitest";
 import { classifyError } from "../engine/errors.js";
 import { EVENTS_TABLE } from "./indexeddb-audit-helpers.js";
 import { IndexedDbBlockStore } from "./indexeddb.js";
 import {
   ConnectionLostError,
+  IndexedDbSchemaUpgradeBlockedError,
   StorageConnectionClosedError,
   StorageFormatVersionError,
   StorageUnresponsiveError,
+  StorageUpgradeBlockedError,
   UnknownOutcomeError,
 } from "./types.js";
 
@@ -227,5 +230,105 @@ describe("an IndexedDB connection that ends under its callers", () => {
     } finally {
       reopened.close();
     }
+  });
+
+  it("finishes what an older connection accepted before a newer build's upgrade proceeds", async () => {
+    const indexedDB = new IDBFactory();
+    const name = "drains";
+    const events: string[] = [];
+    const opened: { store?: IndexedDbBlockStore } = {};
+    // The worker host flushes buffered writers here: rows the tab accepted still get written.
+    const store = await IndexedDbBlockStore.open({
+      name,
+      indexedDB,
+      onSuperseding: async () => {
+        await opened.store?.addTable({
+          id: "table-drained",
+          name: "drained",
+          columns: [{ id: "c1", name: "id", type: "number", nullable: false }],
+          managed: false,
+          revision: 0,
+          createdAt: "2026-10-30T00:00:00.000Z",
+        });
+        events.push("drained");
+      },
+      onSuperseded: () => events.push("superseded"),
+    });
+    opened.store = store;
+    const current = await nativeVersion(indexedDB, name);
+    await new Promise<void>((resolve, reject) => {
+      const request = indexedDB.open(name, current + 1);
+      request.onupgradeneeded = () => events.push("upgraded");
+      request.onsuccess = () => {
+        request.result.close();
+        resolve();
+      };
+      request.onerror = () => reject(request.error ?? new Error("upgrade failed"));
+    });
+    expect(events).toEqual(["drained", "superseded", "upgraded"]);
+    const failure = await store.listTables().catch((error: unknown) => error);
+    expect(failure).toMatchObject({ name: "StorageConnectionClosedError", reason: "superseded" });
+  });
+
+  describe("a newer build opening a database an older tab holds open", () => {
+    /** A database at the released 0.16.0 build's schema, and that schema's version. */
+    async function olderDatabase(indexedDB: IDBFactory, name: string): Promise<number> {
+      const released = await ReleasedIndexedDbStore.open({ name, indexedDB });
+      released.close();
+      return nativeVersion(indexedDB, name);
+    }
+
+    /** An older tab's raw connection, closing `closeAfterMs` after it is asked to (never: -1). */
+    function olderTab(indexedDB: IDBFactory, name: string, closeAfterMs: number) {
+      return new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open(name);
+        request.onsuccess = () => {
+          const db = request.result;
+          db.onversionchange = () => {
+            if (closeAfterMs >= 0) setTimeout(() => db.close(), closeAfterMs);
+          };
+          resolve(db);
+        };
+        request.onerror = () => reject(request.error ?? new Error("older open failed"));
+      });
+    }
+
+    it("waits for the older tab to finish and close, then upgrades", async () => {
+      const indexedDB = new IDBFactory();
+      const name = "waits";
+      const older = await olderDatabase(indexedDB, name);
+      await olderTab(indexedDB, name, 300);
+      const store = await IndexedDbBlockStore.open({ name, indexedDB, upgradeWaitMs: 5_000 });
+      try {
+        expect(await nativeVersion(indexedDB, name)).toBeGreaterThan(older);
+        expect(await store.listTables()).toEqual([]);
+      } finally {
+        store.close();
+      }
+    });
+
+    it("fails with StorageUpgradeBlockedError when the older tab never closes", async () => {
+      const indexedDB = new IDBFactory();
+      const name = "never-closes";
+      const older = await olderDatabase(indexedDB, name);
+      const stuck = await olderTab(indexedDB, name, -1);
+      const failure = await IndexedDbBlockStore.open({ name, indexedDB, upgradeWaitMs: 200 }).catch(
+        (error: unknown) => error,
+      );
+      expect(failure).toBeInstanceOf(IndexedDbSchemaUpgradeBlockedError);
+      expect(failure).toBeInstanceOf(StorageUpgradeBlockedError);
+      expect(failure).toMatchObject({
+        backend: "indexeddb",
+        databaseName: name,
+        oldVersion: older,
+      });
+      expect(classifyError(failure)).toMatchObject({ kind: "transient" });
+      // The abandoned upgrade request is still queued behind the stuck tab. Once that closes,
+      // the request is aborted rather than applied, and the next open upgrades normally.
+      stuck.close();
+      expect(await nativeVersion(indexedDB, name)).toBe(older);
+      const store = await IndexedDbBlockStore.open({ name, indexedDB });
+      store.close();
+    });
   });
 });

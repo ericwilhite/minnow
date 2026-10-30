@@ -3029,16 +3029,39 @@ export class StorageFormatVersionError extends Error {
   }
 }
 
-/** A native IndexedDB schema upgrade is waiting for another connection to close. */
-export class IndexedDbSchemaUpgradeBlockedError extends Error {
-  override readonly name = "IndexedDbSchemaUpgradeBlockedError";
+/**
+ * A newer build needs to upgrade the stored format, and a connection on the older format did not
+ * let go in time: a tab running an older build that is frozen, unresponsive, or not Minnow. The
+ * older tabs normally step aside on their own — the remedy is to close or reload them.
+ */
+export class StorageUpgradeBlockedError extends Error {
+  override readonly name: string = "StorageUpgradeBlockedError";
 
   constructor(
+    readonly backend: string,
     readonly databaseName: string,
+    /** The format version on disk. */
     readonly oldVersion: number,
+    /** The format version this build upgrades it to. */
     readonly requestedVersion: number,
+    message = `The ${backend} database ${databaseName} needs an upgrade from format ` +
+      `${String(oldVersion)} to ${String(requestedVersion)}, and a tab running an older build ` +
+      "did not let go of it; close or reload the older tabs and retry",
   ) {
+    super(message);
+  }
+}
+
+/** The IndexedDB form of `StorageUpgradeBlockedError`: a native schema upgrade is blocked. */
+export class IndexedDbSchemaUpgradeBlockedError extends StorageUpgradeBlockedError {
+  override readonly name = "IndexedDbSchemaUpgradeBlockedError";
+
+  constructor(databaseName: string, oldVersion: number, requestedVersion: number) {
     super(
+      "indexeddb",
+      databaseName,
+      oldVersion,
+      requestedVersion,
       `IndexedDB schema upgrade for ${databaseName} from version ${String(oldVersion)} to ` +
         `${String(requestedVersion)} is blocked by another open connection; close older tabs and retry`,
     );

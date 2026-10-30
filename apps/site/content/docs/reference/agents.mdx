@@ -323,7 +323,12 @@ machines: https://minnowdb.com/llms.txt
   failed, or a connection closed with a mutation already posted. A graceful handover, a slow
   write, or an ordinary failover is resolved from the log. A pre-commit storage step that cannot
   publish reports `WriteNotPublishedError` instead; repeating the write is safe. A closed store
-  reports `StorageConnectionClosedError`; `reason: "superseded"` means reload the newer build.
+  reports `StorageConnectionClosedError`; `reason: "superseded"` means a newer build took the
+  database over. By default the worker client then reloads the page once (after finishing calls
+  and buffered rows it accepted). Pass `whenSuperseded: "prompt"` and `onSuperseded` to show
+  your own reload prompt instead. Do not add app-level "close your other tabs" logic for
+  upgrades. Only `StorageUpgradeBlockedError` (a frozen or pre-0.19 tab did not answer) needs a
+  message: close or reload the other tabs, then retry.
 - Pass `onWorkerError` to `MinnowDatabaseClient` to hear worker failures that belong to no call
   (uncaught errors, unhandled rejections, failed maintenance, coordination errors); without it
   they go to `console.error`. They are not fatal. `DatabaseWorkerFailedError` is: it means the

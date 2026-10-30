@@ -15,6 +15,7 @@ import {
   WORKER_KEEPALIVE_INTERVAL_MS,
   workerErrorEvent,
   workerKeepaliveEvent,
+  workerSupersededEvent,
 } from "../worker-protocol/index.js";
 import {
   type WriteSession,
@@ -415,6 +416,28 @@ export interface WorkerStoreOptions {
    * to a store that accepts one (`OpfsBlockStoreOptions.onDiagnostic`).
    */
   onDiagnostic?: (error: unknown, context: string) => void;
+  /**
+   * Called when a newer build in another tab needs the database, before the store lets go of
+   * it; the store keeps serving, for a bounded time, until the promise settles. The stock host
+   * flushes its buffered writers here. A factory passes it to the durable adapters.
+   */
+  onSuperseding?: () => Promise<void> | void;
+  /** Called once the store closed because a newer build took the database over. */
+  onSuperseded?: () => void;
+}
+
+/**
+ * The hooks of `WorkerStoreOptions` that the durable adapters take, ready to spread into an
+ * `OpfsBlockStore` or `IndexedDbBlockStore` option object.
+ */
+export function workerStoreHooks(options: WorkerStoreOptions): {
+  onSuperseding?: () => Promise<void> | void;
+  onSuperseded?: () => void;
+} {
+  return {
+    ...(options.onSuperseding === undefined ? {} : { onSuperseding: options.onSuperseding }),
+    ...(options.onSuperseded === undefined ? {} : { onSuperseded: options.onSuperseded }),
+  };
 }
 
 /**
@@ -493,6 +516,17 @@ class DatabaseRpcServer {
   readonly #settlingWritePromises = new Set<Promise<unknown>>();
   readonly #requestAborts = new Map<string, AbortController>();
   #disposed = false;
+
+  /**
+   * Writes every buffered writer's accepted rows, so a store that a newer build supersedes
+   * loses none of them. A flush that fails is reported through the writer's own `onError`.
+   */
+  async flushWriters(): Promise<void> {
+    const writers = [...this.#handles.values()].flatMap((handle) =>
+      handle.type === "writer" ? [handle.writer] : [],
+    );
+    await Promise.allSettled(writers.map((writer) => writer.flush()));
+  }
   /** Aborted by disposal, so scopes still waiting for their writer turn stop waiting. */
   readonly #connectionAbort = new AbortController();
   #inFlightRpcCount = 0;
@@ -1832,7 +1866,25 @@ async function createServer(
   options: WorkerStoreOptions,
   report: WorkerErrorReporter,
 ): Promise<DatabaseRpcServer> {
-  const opened = await createStore(payload.store, options);
+  // The store opens before the server exists; its hooks reach the server once it does.
+  const served: { server?: DatabaseRpcServer } = {};
+  const opened = await createStore(payload.store, {
+    ...options,
+    // Rows a buffered writer already accepted are written before the store lets go; anything
+    // later fails as superseded.
+    onSuperseding: async () => {
+      await served.server?.flushWriters();
+      await options.onSuperseding?.();
+    },
+    onSuperseded: () => {
+      try {
+        scope.postMessage(workerSupersededEvent());
+      } catch (error) {
+        report("uncaught", error, "superseded event");
+      }
+      options.onSuperseded?.();
+    },
+  });
   const { store, kind } = isOpenedStore(opened)
     ? opened
     : { store: opened, kind: payload.store.kind === "auto" ? undefined : payload.store.kind };
@@ -1851,7 +1903,7 @@ async function createServer(
     }
     throw error;
   }
-  return new DatabaseRpcServer(database, scope, {
+  const server = new DatabaseRpcServer(database, scope, {
     ...(payload.options?.transactionIdleTimeoutMs === undefined
       ? {}
       : { writeHandleIdleTimeoutMs: payload.options.transactionIdleTimeoutMs }),
@@ -1864,6 +1916,8 @@ async function createServer(
       ? {}
       : { keepaliveIntervalMs: payload.keepaliveIntervalMs }),
   });
+  served.server = server;
+  return server;
 }
 
 /** Posts keepalive events for `requestId` every `intervalMs` until `pending` settles. */
