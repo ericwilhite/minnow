@@ -884,13 +884,17 @@ export class ViewIndex implements IndexReader {
    * columns of this index's key (a foreign key's supporting index may cover more columns).
    */
   async exists(key: Uint8Array, prefix: boolean): Promise<boolean> {
-    if (!prefix) {
-      const rows: number[] = [];
-      const result = this.resolve(key, rows);
-      if (result instanceof Promise) await result;
-      return rows.length > 0;
-    }
+    if (!prefix) return (await this.countRange(key, 0, key.length)) > 0;
     return (await this.collect(prefixRange(key))).length > 0;
+  }
+
+  /** Live row ids holding `key`, exactly or (with `prefix`) as the key's leading columns. */
+  async holders(key: Uint8Array, prefix: boolean): Promise<number[]> {
+    if (prefix) return (await this.collect(prefixRange(key))).map((entry) => entry.rowId);
+    const rows: number[] = [];
+    const result = this.resolve(key, rows);
+    if (result instanceof Promise) await result;
+    return rows;
   }
 
   range(range: KeyRange, direction: "asc" | "desc"): IndexCursor {

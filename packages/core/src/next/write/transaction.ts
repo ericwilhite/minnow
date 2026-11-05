@@ -486,7 +486,13 @@ interface FkCheck {
 interface ParentCheck {
   readonly parentTableId: number;
   readonly indexId: number;
+  /** The key that left the parent (deleted, or changed by an UPDATE). */
   readonly key: Uint8Array;
+  /**
+   * For a rekey (an UPDATE that changed the key): the new row, whose key columns the children's
+   * references follow. Null for a delete.
+   */
+  readonly next: { readonly vectors: readonly Vector[]; readonly row: number } | null;
 }
 
 export class StatementImpl implements Statement {
@@ -689,7 +695,12 @@ export class StatementImpl implements Statement {
       finish();
       return RESOLVED;
     }
-    return Promise.resolve(this.guard(() => this.#verify())).then(finish);
+    return Promise.resolve(
+      this.guard(async () => {
+        await this.#actions();
+        await this.#verify();
+      }),
+    ).then(finish);
   }
 
   #releaseViews(): void {
@@ -700,12 +711,7 @@ export class StatementImpl implements Statement {
   }
 
   async #verify(): Promise<void> {
-    if (
-      this.suspects.length === 0 &&
-      this.childChecks.length === 0 &&
-      this.parentChecks.length === 0
-    )
-      return;
+    if (this.suspects.length === 0 && this.childChecks.length === 0) return;
     const current = this.current();
     try {
       const lookup = async (tableId: number, indexId: number, key: Uint8Array): Promise<number> => {
@@ -725,26 +731,69 @@ export class StatementImpl implements Statement {
             "missingParent",
             check.key,
           );
-      for (const check of this.parentChecks) {
-        if ((await lookup(check.parentTableId, check.indexId, check.key)) > 0) continue;
-        for (const child of this.tx.catalog.tables)
-          for (const fk of child.foreignKeys) {
-            if (!fk.enforced || fk.parentIndexId !== check.indexId || fk.supportIndexId === null)
-              continue;
-            const support = need(child.indexes.find((index) => index.id === fk.supportIndexId));
-            const reader = new ViewIndex(nonUnique(support), current.internalTable(child.id));
-            // A covering supporting index has the reference as a key prefix (ruling 4).
-            if (await reader.exists(check.key, support.columnIds.length > fk.columnIds.length))
-              throw new ForeignKeyViolationError(
-                check.parentTableId,
-                fk.id,
-                "referenced",
-                check.key,
-              );
-          }
-      }
     } finally {
       // `current` belongs to the statement (released with it).
+    }
+  }
+
+  /**
+   * Foreign-key actions, run to a fixpoint before the checks (PostgreSQL runs them as the
+   * statement's AFTER triggers): for each key that left a referenced parent and is not live there
+   * again, the children holding it are deleted (ON DELETE CASCADE), have their reference set to
+   * NULL (SET NULL), make the statement fail (RESTRICT), or, when an UPDATE changed the key, have
+   * their reference rewritten to the new key (rekey follow: always, as today's engine does). Rows
+   * these actions write go through the same writers, so their own constraints and actions apply.
+   */
+  async #actions(): Promise<void> {
+    while (this.parentChecks.length > 0) {
+      const check = need(this.parentChecks.shift());
+      const current = this.current();
+      const parent = current.internalTable(check.parentTableId);
+      const key = parent.def.indexes.find((index) => index.id === check.indexId);
+      // The key is live in the parent again (re-inserted, or another row took it): nothing to do.
+      if (
+        key !== undefined &&
+        (await new ViewIndex(nonUnique(key), parent).countRange(check.key, 0, check.key.length)) > 0
+      )
+        continue;
+      for (const child of this.tx.catalog.tables)
+        for (const fk of child.foreignKeys) {
+          if (!fk.enforced || fk.parentIndexId !== check.indexId || fk.supportIndexId === null)
+            continue;
+          const support = need(child.indexes.find((index) => index.id === fk.supportIndexId));
+          // A covering supporting index holds the reference as a key prefix (ruling 4).
+          const children = await new ViewIndex(
+            nonUnique(support),
+            current.internalTable(child.id),
+          ).holders(check.key, support.columnIds.length > fk.columnIds.length);
+          if (children.length === 0) continue;
+          const writer = new TableWriterImpl(this, child, { onRepeat: "first" });
+          if (check.next !== null) {
+            const parent = need(this.tx.catalog.table(check.parentTableId));
+            const index = need(parent.indexes.find((candidate) => candidate.id === check.indexId));
+            const sources = index.columnIds.map((columnId) => ({
+              vector: need(
+                check.next?.vectors[parent.columns.findIndex((column) => column.id === columnId)],
+              ),
+              row: check.next?.row ?? 0,
+            }));
+            await writer.applyUpdate(children, fk.columnIds, sources, true);
+          } else if (fk.onDelete === "cascade") await writer.applyDelete(children);
+          else if (fk.onDelete === "setNull")
+            await writer.applyUpdate(
+              children,
+              fk.columnIds,
+              fk.columnIds.map((columnId) => ({
+                vector: nullVector(
+                  need(child.columns.find((column) => column.id === columnId)).type,
+                ),
+                row: 0,
+              })),
+              true,
+            );
+          else
+            throw new ForeignKeyViolationError(check.parentTableId, fk.id, "referenced", check.key);
+        }
     }
   }
 
@@ -1097,40 +1146,84 @@ export class TableWriterImpl implements TableWriter {
     return this.statement.guard(() => {
       this.#checkShape(batch.columns, 1, this.#assigned);
       const { rows, rowIds } = this.#targets(batch);
-      if (rowIds.length === 0) {
-        if (written !== null) written.count = 0;
-        return 0;
+      if (written !== null) {
+        written.rows.set(rows);
+        written.count = rows.length;
       }
-      const current = this.statement.current();
-      const table = current.internalTable(this.tableId);
-      const work = settle(readRows(table, rowIds), (old) => {
-        // New rows: assigned columns from the batch, the rest from the old rows.
-        const assigned = new Map(
-          this.#assigned.map((columnId, k) => [this.#columnIndex(columnId), k + 1]),
-        );
-        const one = new Uint16Array(1);
-        const columns: FlatVector[] = this.def.columns.map((column, c) => {
-          const source = assigned.get(c);
-          if (source === undefined) return need(old[c]);
-          const chunk = new ColumnChunk(column.type);
-          for (const row of rows) {
-            one[0] = row;
-            chunk.append(need(batch.columns[source]), one, 0, 1);
-          }
-          return chunk.view();
-        });
-        const all = Uint16Array.from({ length: rowIds.length }, (_, k) => k);
-        this.#validate(columns, all, rowIds.length, this.#assigned);
-        const removed = this.#deleteRows(table, rowIds, old);
-        const added = this.insertRows(columns, all);
-        this.#parentChecksForChange(old, columns, rowIds.length);
-        if (written !== null) {
-          written.rows.set(rows);
-          written.count = rows.length;
-        }
-        return settle(all_(removed, added), () => rowIds.length);
+      if (rowIds.length === 0) return 0;
+      const sources = this.#assigned.map((_, k) => ({ vector: need(batch.columns[k + 1]), rows }));
+      return settle(this.#update(rowIds, this.#assigned, sources, false), () => rowIds.length);
+    });
+  }
+
+  /**
+   * An update a foreign-key action writes: every row gets the same value per assigned column
+   * (`row` of `vector`), and stored generated columns are recomputed (`TableRules.generate`).
+   * Row ids are this table's current rows; more than a chunk is done chunk by chunk.
+   */
+  async applyUpdate(
+    rowIds: readonly number[],
+    columnIds: readonly number[],
+    values: ReadonlyArray<{ readonly vector: Vector; readonly row: number }>,
+    generate: boolean,
+  ): Promise<void> {
+    for (let from = 0; from < rowIds.length; from += MEMORY_CHUNK_ROWS) {
+      const ids = rowIds.slice(from, from + MEMORY_CHUNK_ROWS);
+      const rows = new Uint16Array(ids.length);
+      const sources = values.map((value) => {
+        rows.fill(value.row);
+        return { vector: value.vector, rows: rows.slice() };
       });
-      return work;
+      const done = this.#update(ids, columnIds, sources, generate);
+      if (done instanceof Promise) await done;
+    }
+  }
+
+  /** A delete a foreign-key action writes (ON DELETE CASCADE). */
+  async applyDelete(rowIds: readonly number[]): Promise<void> {
+    for (let from = 0; from < rowIds.length; from += MEMORY_CHUNK_ROWS) {
+      const ids = rowIds.slice(from, from + MEMORY_CHUNK_ROWS);
+      const done = this.#delete(ids);
+      if (done instanceof Promise) await done;
+    }
+  }
+
+  /**
+   * Rewrites rows `rowIds`: column `columnIds[c]` takes `sources[c].vector` at physical rows
+   * `sources[c].rows[k]` for row k; the others keep their old values.
+   */
+  #update(
+    rowIds: readonly number[],
+    columnIds: readonly number[],
+    sources: ReadonlyArray<{ readonly vector: Vector; readonly rows: Uint16Array }>,
+    generate: boolean,
+  ): MaybePromise<void> {
+    const current = this.statement.current();
+    const table = current.internalTable(this.tableId);
+    return settle(readRows(table, rowIds), (old) => {
+      const assigned = new Map(columnIds.map((columnId, k) => [this.#columnIndex(columnId), k]));
+      const one = new Uint16Array(1);
+      const columns: FlatVector[] = this.def.columns.map((column, c) => {
+        const k = assigned.get(c);
+        if (k === undefined) return need(old[c]);
+        const source = need(sources[k]);
+        const chunk = new ColumnChunk(column.type);
+        for (const row of source.rows) {
+          one[0] = row;
+          chunk.append(source.vector, one, 0, 1);
+        }
+        return chunk.view();
+      });
+      const all = Uint16Array.from({ length: rowIds.length }, (_, k) => k);
+      if (generate)
+        this.statement
+          .rules(this.tableId)
+          .generate({ length: rowIds.length, columns, selection: null }, columnIds);
+      this.#validate(columns, all, rowIds.length, columnIds);
+      const removed = this.#deleteRows(table, rowIds, old);
+      const added = this.insertRows(columns, all);
+      this.#parentChecksForChange(old, columns, rowIds.length);
+      return all_(removed, added);
     });
   }
 
@@ -1139,32 +1232,34 @@ export class TableWriterImpl implements TableWriter {
       if (batch.columns.length !== 1)
         throw new TypeError("A delete batch holds the locator column only");
       const { rows, rowIds } = this.#targets(batch);
-      if (rowIds.length === 0) {
-        if (written !== null) written.count = 0;
-        return 0;
+      if (written !== null) {
+        written.rows.set(rows);
+        written.count = rows.length;
       }
-      const current = this.statement.current();
-      const table = current.internalTable(this.tableId);
-      const work = settle(readRows(table, rowIds), (old) => {
-        const removed = this.#deleteRows(table, rowIds, old);
-        for (const index of this.def.indexes)
-          if (this.#referenced.has(index.id)) {
-            const keys = this.#encode(index, old, null, rowIds.length);
-            for (let k = 0; k < rowIds.length; k++)
-              if (!this.#hasNullKey(index, old, k))
-                this.statement.parentChecks.push({
-                  parentTableId: this.tableId,
-                  indexId: index.id,
-                  key: keys.key(k).slice(),
-                });
-          }
-        if (written !== null) {
-          written.rows.set(rows);
-          written.count = rows.length;
+      if (rowIds.length === 0) return 0;
+      return settle(this.#delete(rowIds), () => rowIds.length);
+    });
+  }
+
+  /** Deletes current rows `rowIds` (≤ a chunk) and queues the keys they free for FK actions. */
+  #delete(rowIds: readonly number[]): MaybePromise<void> {
+    const current = this.statement.current();
+    const table = current.internalTable(this.tableId);
+    return settle(readRows(table, rowIds), (old) => {
+      const removed = this.#deleteRows(table, rowIds, old);
+      for (const index of this.def.indexes)
+        if (this.#referenced.has(index.id)) {
+          const keys = this.#encode(index, old, null, rowIds.length);
+          for (let k = 0; k < rowIds.length; k++)
+            if (!this.#hasNullKey(index, old, k))
+              this.statement.parentChecks.push({
+                parentTableId: this.tableId,
+                indexId: index.id,
+                key: keys.key(k).slice(),
+                next: null,
+              });
         }
-        return settle(removed, () => rowIds.length);
-      });
-      return work;
+      return removed;
     });
   }
 
@@ -1181,7 +1276,12 @@ export class TableWriterImpl implements TableWriter {
         const now = after.key(k);
         const same = key.length === now.length && key.every((byte, b) => byte === now[b]);
         if (!same)
-          this.statement.parentChecks.push({ parentTableId: this.tableId, indexId: index.id, key });
+          this.statement.parentChecks.push({
+            parentTableId: this.tableId,
+            indexId: index.id,
+            key,
+            next: { vectors: next, row: k },
+          });
       }
     }
   }
@@ -1322,6 +1422,23 @@ export class TableWriterImpl implements TableWriter {
       return decide(0);
     });
   }
+}
+
+/** A one-row vector of `type` whose only value is NULL. */
+function nullVector(type: import("../types.js").PhysicalType): Vector {
+  const chunk = new ColumnChunk(type);
+  chunk.append(
+    {
+      form: "constant",
+      type,
+      length: 1,
+      value: { ...chunk.view(0), length: 1, validity: new Uint32Array(1) },
+    },
+    null,
+    0,
+    1,
+  );
+  return chunk.view();
 }
 
 function all_(a: MaybePromise<void>, b: MaybePromise<void>): MaybePromise<void> {

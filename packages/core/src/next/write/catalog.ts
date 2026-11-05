@@ -451,10 +451,6 @@ export class Catalog implements CatalogView {
             `Foreign key ${input_.name} column types differ from the key`,
           );
       });
-      if (input_.onDelete !== "restrict")
-        throw new CatalogChangeError(
-          `ON DELETE ${input_.onDelete === "cascade" ? "CASCADE" : "SET NULL"} is not supported by the write path yet`,
-        );
       let supportIndexId: number | null = null;
       if (input_.enforced) {
         const covering = indexes.find(
