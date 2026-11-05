@@ -24,8 +24,13 @@ Release packages: `@minnowdb/core@0.19.3`.
   - Constant arithmetic beyond the safe range still returns an exact decimal string.
   - `DOUBLE PRECISION` arithmetic and aggregates stay approximate floating point, including when
     the values happen to be whole numbers.
+- The exported query-plan type `Expression` gains an optional `integerArgument` flag on aggregate
+  calls, set when the argument is integer-typed. It is additive; nothing needs to change.
 
-SIZES_PLACEHOLDER
+The checks cost about 1% CPU on integer aggregates in a local microbenchmark. The main entry
+measures 338.3 KiB gzipped (previously 336.8 KiB). The engine with OPFS measures 442.9 KiB
+(previously 441.7 KiB). The generic worker plus its client measures 553.1 KiB (previously
+551.9 KiB).
 
 No stored format changes: IndexedDB schema 8 and OPFS layout 13 are unchanged, and 0.19.2 opens
 every database this release writes. No data migration or export/import step is needed. Values
