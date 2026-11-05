@@ -182,12 +182,16 @@ export class KeyScratch {
   readonly encoded: KeyBatch | null;
   /** Rows with a null in a key compared with `=` (they never match). */
   unmatchable = 0;
+  /** When `extractKeys` stopped early: the bytes the encoder was refused (else 0). */
+  requiredBytes = 0;
   count = 0;
 
   constructor(
     readonly layout: KeyLayout,
     capacity: number,
     charge: ByteCharge,
+    /** What the `enc` encoder's growth is charged to (default `charge`). */
+    encodedCharge: ByteCharge = charge,
   ) {
     this.capacity = capacity;
     const bytes = capacity * (4 * Math.max(1, layout.width) + 12);
@@ -196,7 +200,7 @@ export class KeyScratch {
     this.nulls = new Int32Array(capacity);
     this.hashes = new Uint32Array(capacity);
     this.slots = new Int32Array(capacity);
-    this.encoded = layout.family === "enc" ? new KeyBatch(charge, 1 << 30) : null;
+    this.encoded = layout.family === "enc" ? new KeyBatch(encodedCharge, 1 << 30) : null;
   }
 
   static bytes(layout: KeyLayout, capacity: number): number {
@@ -303,6 +307,7 @@ export function extractKeys(
   const hashes = out.hashes;
   if (count > out.capacity) throw new RangeError("More key rows than the scratch holds");
   out.count = count;
+  out.requiredBytes = 0;
   let unmatchable = 0;
   // Null masks first (every family needs them).
   nulls.fill(0, 0, count);
@@ -403,6 +408,7 @@ export function extractKeys(
     encoded,
   );
   const done = result.encoded;
+  out.requiredBytes = result.done ? 0 : result.requiredBytes;
   for (let k = 0; k < done; k++)
     hashes[k] = xxHash32(
       encoded.writer.bytes,

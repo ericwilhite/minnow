@@ -14,6 +14,13 @@ import { defined } from "./join-fixtures.js";
 import { PageWriter, SpillFiles, SpilledRun, decodePage, pageHeader } from "./spill-pages.js";
 
 const FREE = { allocate: () => true, free: () => undefined };
+/** Decodes with an unlimited charge (the charged paths have their own tests). */
+function decodeOrThrow(page: Uint8Array, types: readonly PhysicalType[]) {
+  const decoded = decodePage(page, types, FREE);
+  if ("needed" in decoded) throw new Error("refused");
+  return decoded;
+}
+
 const SEEDS = seedsFor("next-spill-pages", [0x5b11, 7]);
 
 function validity(n: number, random: () => number): Uint32Array | null {
@@ -223,7 +230,7 @@ describe("spill pages", () => {
           sequence: 11,
           rows: n,
         });
-        const decoded = decodePage(
+        const decoded = decodeOrThrow(
           bytes,
           columns.map((c) => c.type),
         );
@@ -256,16 +263,16 @@ describe("spill pages", () => {
     file.corrupt(ref, 200);
     await expect(file.read(ref)).rejects.toBeInstanceOf(SpillCorruptionError);
     const copy = page.slice();
-    expect(() => decodePage(copy, types.slice(1))).toThrow(SpillCorruptionError);
-    expect(() => decodePage(copy, [{ kind: "text" }, ...types.slice(1)])).toThrow(
+    expect(() => decodeOrThrow(copy, types.slice(1))).toThrow(SpillCorruptionError);
+    expect(() => decodeOrThrow(copy, [{ kind: "text" }, ...types.slice(1)])).toThrow(
       SpillCorruptionError,
     );
-    expect(() => decodePage(copy.subarray(0, copy.length - 40), types)).toThrow(
+    expect(() => decodeOrThrow(copy.subarray(0, copy.length - 40), types)).toThrow(
       SpillCorruptionError,
     );
     const badMagic = copy.slice();
     badMagic[0] = 0;
-    expect(() => decodePage(badMagic, types)).toThrow(SpillCorruptionError);
+    expect(() => decodeOrThrow(badMagic, types)).toThrow(SpillCorruptionError);
     // A varlen offset that runs backwards is corruption, not a short string.
     const textColumns = [defined(columns[10])];
     const textPage = new PageWriter(FREE).encode(
@@ -278,7 +285,72 @@ describe("spill pages", () => {
     const offsetsAt = 32 + 16 + (textColumns[0]?.validity === null ? 0 : 8 + 8) + 8;
     broken[offsetsAt + 4 * 10] = 0xff;
     broken[offsetsAt + 4 * 10 + 1] = 0xff;
-    expect(() => decodePage(broken, [{ kind: "text" }])).toThrow(SpillCorruptionError);
+    expect(() => decodeOrThrow(broken, [{ kind: "text" }])).toThrow(SpillCorruptionError);
+  });
+
+  it("decodes into views of the page, charging only what must be copied (review B7-p2a #4)", () => {
+    let charged = 0;
+    let limit = Infinity;
+    const charge = {
+      allocate: (bytes: number) => {
+        if (charged + bytes > limit) return false;
+        charged += bytes;
+        return true;
+      },
+      free: (bytes: number) => {
+        charged -= bytes;
+      },
+    };
+    const n = 2048;
+    const uuid: FlatVector = {
+      form: "flat",
+      type: { kind: "uuid" },
+      length: n,
+      validity: null,
+      data: { layout: "fixed16", bytes: Uint8Array.from({ length: n * 16 }, (_, i) => i & 255) },
+    };
+    const page = defined(
+      new PageWriter(FREE).encode({ queryId: 1, run: 0, partition: 0, sequence: 0 }, [uuid], n),
+    );
+    const views = decodePage(page, [uuid.type], charge);
+    if ("needed" in views) throw new Error("refused");
+    expect(views.charged).toBe(0);
+    expect(charged).toBe(0);
+    const decoded = views.columns[0]?.data;
+    expect(decoded?.layout === "fixed16" && decoded.bytes.buffer === page.buffer).toBe(true);
+    // A page that is not 8-byte aligned is copied once, charged before the copy.
+    const shifted = new Uint8Array(page.length + 4);
+    shifted.set(page, 4);
+    const unaligned = shifted.subarray(4);
+    limit = page.length - 1;
+    expect(decodePage(unaligned, [uuid.type], charge)).toEqual({ needed: page.length });
+    expect(charged).toBe(0);
+    limit = Infinity;
+    const copied = decodePage(unaligned, [uuid.type], charge);
+    if ("needed" in copied) throw new Error("refused");
+    expect(copied.charged).toBe(page.length);
+    expect(charged).toBe(page.length);
+    charge.free(copied.charged);
+    // Wide decimals allocate BigInts: charged first, refused without leaving anything charged.
+    const wide = variants(300, mulberry32(9)).find(
+      (v) => v.data.layout === "decimal" && v.data.coefficients.repr === "wide",
+    );
+    const widePage = defined(
+      new PageWriter(FREE).encode(
+        { queryId: 1, run: 0, partition: 0, sequence: 0 },
+        [defined(wide)],
+        300,
+      ),
+    );
+    limit = 100;
+    const refused = decodePage(widePage, [defined(wide).type], charge);
+    expect("needed" in refused && refused.needed > 100).toBe(true);
+    expect(charged).toBe(0);
+    limit = Infinity;
+    const ok = decodePage(widePage, [defined(wide).type], charge);
+    if ("needed" in ok) throw new Error("refused");
+    expect(ok.charged).toBeGreaterThan(300 * 16);
+    expect(charged).toBe(ok.charged);
   });
 
   it("charges a growing page buffer and refuses when the charge does", () => {

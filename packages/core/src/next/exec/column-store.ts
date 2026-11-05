@@ -37,6 +37,11 @@ import type { ByteCharge } from "../vector/varlen.js";
 import type { FlatVector, Validity, Vector, VectorData } from "../vector/vector.js";
 
 const TWO_32 = 4_294_967_296;
+/**
+ * Values up to this many bytes are copied with a loop, not `set(subarray(…))`, which allocates
+ * a view per value; past it the view's cost is negligible next to the copy.
+ */
+const LOOP_COPY_BYTES = 4096;
 const MAX_SAFE = Number.MAX_SAFE_INTEGER;
 
 type Varlen = Extract<VectorData, { layout: "varlen" }>;
@@ -559,8 +564,7 @@ export class ColumnStore {
       if (chunk === undefined) return 0;
       const data = chunk.data as Varlen;
       if (used + need <= data.bytes.length) continue;
-      let size = data.bytes.length * 2;
-      while (size < used + need) size *= 2;
+      const size = this.#growTo(data.bytes.length, used + need);
       if (!this.#allocate(size)) {
         if (n === 1) return 0;
         return Math.max(1, n >> 1);
@@ -577,6 +581,26 @@ export class ColumnStore {
       };
     }
     return n;
+  }
+
+  /**
+   * The arena size growth picks: doubling, but in single-chunk mode exactly the need once it
+   * passes the target (one oversized value is charged at its size, not twice it).
+   */
+  #growTo(length: number, need: number): number {
+    if (this.targetBytes !== Infinity && need > this.targetBytes) return need;
+    let size = Math.max(1, length) * 2;
+    while (size < need) size *= 2;
+    return size;
+  }
+
+  /** Bytes a varlen arena of chunk k must grow by to take `length` more (0 if it fits). */
+  #arenaGrowth(column: Column, k: number, newChunk: boolean, length: number): number {
+    const used = newChunk ? 0 : (column.used[k] ?? 0);
+    const current = newChunk
+      ? this.#varlenInitial
+      : ((column.chunks[k]?.data as Varlen | undefined)?.bytes.length ?? 0);
+    return used + length <= current ? 0 : this.#growTo(current, used + length);
   }
 
   #varlenNeedVector(source: Source | undefined, rows: Rows): number {
@@ -690,6 +714,47 @@ export class ColumnStore {
     this.#wideBytes += bytes;
   }
 
+  /**
+   * An upper bound of the bytes appending row `row` of `vectors` would allocate (a new chunk, and
+   * varlen arenas growing by doubling): the size of a progress loan for one row.
+   */
+  appendNeed(vectors: readonly Vector[], row: number): number {
+    const sources = vectors.map(resolve);
+    let bytes = 0;
+    const newChunk = this.rows === this.chunkCount * this.chunkRows;
+    const k = this.chunkCount - 1;
+    for (let c = 0; c < this.#columns.length; c++) {
+      const column = this.#columns[c];
+      if (column === undefined) continue;
+      if (newChunk) bytes += this.#chunkBytes(column);
+      const source = sources[c];
+      if (column.layout !== "varlen" || source === undefined) continue;
+      const length = this.#varlenNeedVector(source, { ids: [row], from: 0, count: 1 });
+      bytes += this.#arenaGrowth(column, k, newChunk, length);
+    }
+    return bytes;
+  }
+
+  /** `appendNeed` for one row `id` of another store. */
+  appendFromNeed(source: ColumnStore, columns: readonly number[], id: number): number {
+    let bytes = 0;
+    const newChunk = this.rows === this.chunkCount * this.chunkRows;
+    const k = this.chunkCount - 1;
+    for (let c = 0; c < this.#columns.length; c++) {
+      const column = this.#columns[c];
+      if (column === undefined) continue;
+      if (newChunk) bytes += this.#chunkBytes(column);
+      if (column.layout !== "varlen") continue;
+      const length = this.#varlenNeedStore(source, columns[c] ?? 0, {
+        ids: [id],
+        from: 0,
+        count: 1,
+      });
+      bytes += this.#arenaGrowth(column, k, newChunk, length);
+    }
+    return bytes;
+  }
+
   /** Drops rows past `rows`, freeing whole chunks beyond it. */
   truncate(rows: number): void {
     if (rows < 0 || rows > this.rows) throw new RangeError("Truncate outside the store");
@@ -722,8 +787,11 @@ export class ColumnStore {
     }
   }
 
-  /** Single-chunk mode: empties the chunk, keeping (and shrinking oversized) buffers. */
-  reset(): void {
+  /**
+   * Single-chunk mode: empties the chunk, keeping buffers but shrinking an arena past the target
+   * (with `shrink`, every arena past its initial size: give a progress loan back).
+   */
+  reset(shrink = false): void {
     this.rows = 0;
     for (const column of this.#columns) {
       const bitmap = column.bitmaps[0];
@@ -736,10 +804,9 @@ export class ColumnStore {
       column.hasNulls = false;
       if (column.layout === "varlen") {
         const data = chunk.data as Varlen;
-        const limit = Math.max(
-          this.#varlenInitial,
-          this.targetBytes === Infinity ? 0 : this.targetBytes,
-        );
+        const limit = shrink
+          ? this.#varlenInitial
+          : Math.max(this.#varlenInitial, this.targetBytes === Infinity ? 0 : this.targetBytes);
         if (data.bytes.length > limit) {
           this.#free(data.bytes.length - this.#varlenInitial);
           column.chunks[0] = {
@@ -896,9 +963,11 @@ function writeSlot(
     case "int64":
       writeInt64(out.values, at, (data as typeof out).values, slot);
       return used;
-    case "fixed16":
-      out.bytes.set((data as typeof out).bytes.subarray(slot * 16, slot * 16 + 16), at * 16);
+    case "fixed16": {
+      const from = (data as typeof out).bytes;
+      for (let b = 0; b < 16; b++) out.bytes[at * 16 + b] = from[slot * 16 + b] ?? 0;
       return used;
+    }
     case "interval": {
       const source = data as typeof out;
       out.months[at] = source.months[slot] ?? 0;
@@ -914,7 +983,7 @@ function writeSlot(
       const start = source.offsets[slot] ?? 0;
       const end = source.offsets[slot + 1] ?? 0;
       const length = end - start;
-      if (length <= 64) {
+      if (length <= LOOP_COPY_BYTES) {
         const from = source.bytes;
         const to = out.bytes;
         for (let b = 0; b < length; b++) to[used + b] = from[start + b] ?? 0;
@@ -1004,7 +1073,9 @@ function writeFromSource(column: Column, k: number, at: number, source: Source, 
         const row = ids[rows.from + i] ?? 0;
         const start = offsets[row] ?? 0;
         const length = (offsets[row + 1] ?? 0) - start;
-        if (length <= 64) for (let b = 0; b < length; b++) to[used + b] = bytes[start + b] ?? 0;
+        // A byte loop: a subarray per row would allocate a view per value.
+        if (length <= LOOP_COPY_BYTES)
+          for (let b = 0; b < length; b++) to[used + b] = bytes[start + b] ?? 0;
         else to.set(bytes.subarray(start, start + length), used);
         used += length;
         toOffsets[at + i + 1] = used;

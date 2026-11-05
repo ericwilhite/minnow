@@ -27,6 +27,7 @@ import type { PhysicalKind, PhysicalType } from "../types.js";
 import { layoutOf } from "../types.js";
 import type { ByteCharge } from "../vector/varlen.js";
 import type { FlatVector, VectorData } from "../vector/vector.js";
+import { bigintBytes } from "../memory/governor.js";
 import { TIER_INT128, TIER_INT64, TIER_SAFE, TIER_WIDE } from "./column-store.js";
 
 const HEADER_BYTES = 32;
@@ -193,10 +194,12 @@ export class PageWriter {
   #bytes: Uint8Array;
   #view: DataView;
   readonly #charge: ByteCharge;
+  readonly #initial: number;
 
   constructor(charge: ByteCharge, initialBytes = 64 * 1024) {
     if (!charge.allocate(initialBytes)) throw new RangeError("A page buffer must be admitted");
     this.#charge = charge;
+    this.#initial = initialBytes;
     this.#bytes = new Uint8Array(initialBytes);
     this.#view = new DataView(this.#bytes.buffer);
   }
@@ -226,8 +229,8 @@ export class PageWriter {
       for (const buffer of part.buffers) total += 8 + pad8(buffer.length);
     }
     if (total > this.#bytes.length) {
-      let size = this.#bytes.length * 2;
-      while (size < total) size *= 2;
+      // Grow to the page (rounded to 4 KiB): the new buffer is charged before the old is freed.
+      const size = Math.max(this.#initial, (total + 4095) & ~4095);
       if (!this.#charge.allocate(size)) return null;
       this.#charge.free(this.#bytes.length);
       this.#bytes = new Uint8Array(size);
@@ -265,6 +268,20 @@ export class PageWriter {
     return bytes.subarray(0, total);
   }
 
+  /** Bytes growing the buffer for this page would charge (0 when it fits). */
+  growthFor(columns: readonly FlatVector[], rows: number): number {
+    const total = PageWriter.encodedBytes(columns, rows);
+    return total > this.#bytes.length ? Math.max(this.#initial, (total + 4095) & ~4095) : 0;
+  }
+
+  /** Back to the initial buffer (when a progress step must give its bytes back). */
+  shrinkIf(shrink: boolean): void {
+    if (!shrink || this.#bytes.length <= this.#initial) return;
+    this.#charge.free(this.#bytes.length - this.#initial);
+    this.#bytes = new Uint8Array(this.#initial);
+    this.#view = new DataView(this.#bytes.buffer);
+  }
+
   close(): void {
     this.#charge.free(this.#bytes.byteLength);
     this.#bytes = new Uint8Array(0);
@@ -290,13 +307,60 @@ export function pageHeader(page: Uint8Array): PageHeader & { rows: number; colum
   };
 }
 
+export interface DecodedPage {
+  readonly rows: number;
+  /** Views of the page's bytes: valid while the caller holds the page. */
+  readonly columns: FlatVector[];
+  /** Bytes charged for copies (a misaligned page, wide decimals); the caller frees them. */
+  readonly charged: number;
+}
+
 /**
- * Decodes a page into flat vectors of `types` (length = rows). Fixed-width buffers are views of
- * `page` when aligned (so the vectors live as long as the page bytes), else copies.
+ * Decodes a page into flat vectors of `types` (length = rows). Every buffer is a view of `page`
+ * (they live as long as the page bytes, which the caller holds and has charged). Only what cannot
+ * be a view is allocated, charged to `charge` first: a copy of a page that is not 8-byte aligned,
+ * and the BigInts of wide decimals. If the charge refuses, nothing stays allocated and the result
+ * is `{ needed }`, the bytes to make room for (then decode again).
  */
 export function decodePage(
   page: Uint8Array,
   types: readonly PhysicalType[],
+  charge: ByteCharge,
+): DecodedPage | { readonly needed: number } {
+  let copied = 0;
+  if (page.byteOffset % 8 !== 0) {
+    if (!charge.allocate(page.length)) return { needed: page.length };
+    copied = page.length;
+    page = page.slice();
+  }
+  const wide = wideBytes(page, types);
+  if (wide > 0 && !charge.allocate(wide)) {
+    if (copied > 0) charge.free(copied);
+    return { needed: copied + wide };
+  }
+  try {
+    return { ...decodeViews(page, types), charged: copied + wide };
+  } catch (error) {
+    charge.free(copied + wide);
+    throw error;
+  }
+}
+
+/** Bytes the BigInts of a page's wide decimal columns occupy (0 without any). */
+function wideBytes(page: Uint8Array, types: readonly PhysicalType[]): number {
+  if (!types.some((type) => type.kind === "decimal")) return 0;
+  let total = 0;
+  decodeViews(page, types, (length) => {
+    total += bigintBytes(1n << BigInt(Math.max(0, length * 8 - 1)));
+  });
+  return total;
+}
+
+/** The structural decode, every buffer a view; `onWide` sees each wide value's byte length. */
+function decodeViews(
+  page: Uint8Array,
+  types: readonly PhysicalType[],
+  onWide?: (length: number) => void,
 ): { rows: number; columns: FlatVector[] } {
   const header = pageHeader(page);
   const rows = header.rows;
@@ -313,16 +377,14 @@ export function decodePage(
     at += pad8(length);
     return bytes;
   };
-  const aligned = (bytes: Uint8Array, width: number): ArrayBuffer | Uint8Array =>
-    bytes.byteOffset % width === 0 ? bytes : bytes.slice();
+  // Buffers are 8-byte aligned within an 8-byte-aligned page: every typed view is legal.
   const typed = <T>(
     make: (buffer: ArrayBufferLike, offset: number, length: number) => T,
     bytes: Uint8Array,
     width: number,
   ): T => {
-    const source = aligned(bytes, width);
-    const u8 = source instanceof Uint8Array ? source : new Uint8Array(source);
-    return make(u8.buffer, u8.byteOffset, u8.byteLength / width);
+    if (bytes.byteOffset % width !== 0) corrupt("misaligned buffer");
+    return make(bytes.buffer, bytes.byteOffset, bytes.byteLength / width);
   };
   const columns: FlatVector[] = [];
   for (const type of types) {
@@ -336,11 +398,7 @@ export function decodePage(
     if (layout !== layoutOf(type) || kind !== type.kind) corrupt("column type");
     let validity: Uint32Array | null = null;
     if ((flags & 1) !== 0)
-      validity = typed(
-        (b, o, l) => new Uint32Array(b, o, l),
-        take(((rows + 31) >>> 5) * 4),
-        4,
-      ).slice();
+      validity = typed((b, o, l) => new Uint32Array(b, o, l), take(((rows + 31) >>> 5) * 4), 4);
     let data: VectorData;
     const int64 = (bytes: Uint8Array) =>
       tier === TIER_SAFE
@@ -354,7 +412,7 @@ export function decodePage(
           } as const);
     switch (layout) {
       case "bool":
-        data = { layout, values: take(rows).slice() };
+        data = { layout, values: take(rows) };
         break;
       case "i32":
         data = { layout, values: typed((b, o, l) => new Int32Array(b, o, l), take(rows * 4), 4) };
@@ -370,7 +428,7 @@ export function decodePage(
         data = { layout, values: int64(take(rows * 8)) };
         break;
       case "fixed16":
-        data = { layout, bytes: take(rows * 16).slice() };
+        data = { layout, bytes: take(rows * 16) };
         break;
       case "interval": {
         if (tier > TIER_INT64) corrupt("interval tier");
@@ -406,11 +464,16 @@ export function decodePage(
           const offsets = typed((b, o, l) => new Int32Array(b, o, l), take((rows + 1) * 4), 4);
           const bytes = take(null);
           const values: bigint[] = [];
-          for (let i = 0; i < rows; i++)
-            values.push(bytesToBigint(bytes, offsets[i] ?? 0, offsets[i + 1] ?? 0));
+          for (let i = 0; i < rows; i++) {
+            const start = offsets[i] ?? 0;
+            const end = offsets[i + 1] ?? 0;
+            if (end < start || end > bytes.length) corrupt("wide decimal offsets");
+            if (onWide !== undefined) onWide(end - start);
+            else values.push(bytesToBigint(bytes, start, end));
+          }
           coefficients = { repr: "wide", values };
         } else corrupt("decimal tier");
-        const specials = (flags & 4) !== 0 ? take(rows).slice() : null;
+        const specials = (flags & 4) !== 0 ? take(rows) : null;
         data = {
           layout,
           scale: scales === null ? scale : null,
@@ -437,14 +500,30 @@ export class SpilledRun {
   file: SpillFile | null = null;
 }
 
+/** The operator closed its spill files: a create or append that resolves later is refused. */
+export class SpillClosedError extends Error {
+  readonly code = "MINNOW_SPILL_CLOSED";
+  constructor() {
+    super("The operator's spill files are closed");
+    this.name = "SpillClosedError";
+  }
+}
+
 /**
  * Lazily created spill files for a partitioned operator: one file per run, closed together.
+ *
+ * Closing races nothing: `closeAll` marks the set closed first, waits for creations in flight,
+ * closes every file (including one whose creation resolved after the close began) and settles
+ * once every close has; its Promise rejects with the first close failure, so cleanup failures are
+ * observed, never dropped. `closed` is that Promise for whoever owns the operator.
  */
 export class SpillFiles {
   readonly #service: SpillService;
   readonly #queryId: number;
   readonly #budget: ByteCharge;
   readonly #open = new Set<SpillFile>();
+  readonly #creating = new Set<Promise<unknown>>();
+  #closing: Promise<void> | null = null;
   /** Bytes written, for the profile. */
   written = 0;
 
@@ -454,12 +533,36 @@ export class SpillFiles {
     this.#budget = budget;
   }
 
+  get isClosed(): boolean {
+    return this.#closing !== null;
+  }
+
+  /** Settles when `closeAll` finished (rejects with its first failure); null before. */
+  get closed(): Promise<void> | null {
+    return this.#closing;
+  }
+
   async append(run: SpilledRun, page: Uint8Array, rows: number): Promise<void> {
+    if (this.#closing !== null) throw new SpillClosedError();
     if (run.file === null) {
-      run.file = await this.#service.create(this.#queryId, this.#budget);
-      this.#open.add(run.file);
+      const creating = this.#service.create(this.#queryId, this.#budget);
+      this.#creating.add(creating);
+      let file: SpillFile;
+      try {
+        file = await creating;
+      } finally {
+        this.#creating.delete(creating);
+      }
+      if (this.isClosed) {
+        // Created after the close began: close it here, the closer may have missed it.
+        await file.close();
+        throw new SpillClosedError();
+      }
+      run.file = file;
+      this.#open.add(file);
     }
     const ref = await run.file.append(page);
+    if (this.isClosed) throw new SpillClosedError();
     run.pages.push(ref);
     run.rows += rows;
     run.bytes += page.length;
@@ -477,9 +580,18 @@ export class SpillFiles {
     }
   }
 
-  async closeAll(): Promise<void> {
-    const files = [...this.#open];
-    this.#open.clear();
-    await Promise.all(files.map((file) => file.close()));
+  /** Closes every file, now and created later; idempotent (returns the same Promise). */
+  closeAll(): Promise<void> {
+    this.#closing ??= (async () => {
+      await Promise.allSettled([...this.#creating]);
+      const files = [...this.#open];
+      this.#open.clear();
+      const results = await Promise.allSettled(files.map((file) => file.close()));
+      const failure = results.find(
+        (result): result is PromiseRejectedResult => result.status === "rejected",
+      );
+      if (failure !== undefined) throw failure.reason;
+    })();
+    return this.#closing;
   }
 }

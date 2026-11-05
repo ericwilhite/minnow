@@ -24,12 +24,12 @@ import {
   type Value,
   defined,
 } from "./join-fixtures.js";
-import { Governor } from "../memory/governor.js";
+import { Governor, ValueTooLargeError } from "../memory/governor.js";
 import { SpillCorruptionError, type SpillService } from "../spill/contract.js";
 import { MemorySpillFile, MemorySpillService } from "../spill/memory-spill.js";
 import type { Batch } from "../vector/vector.js";
 import { HASH_SEED, fmix32, levelHash } from "./join-keys.js";
-import { HashJoin, hashJoinMinimumBytes } from "./join.js";
+import { Charge, HashJoin, Pool, hashJoinMinimumBytes } from "./join.js";
 import { drive, type Operator } from "./pipeline.js";
 import type { HashJoinKind, HashJoinSpec } from "./join.js";
 
@@ -186,6 +186,13 @@ describe("hash join: examples", () => {
     ).toThrow("Only a mark join has a filter");
   });
 
+  it("1 NOT IN (SELECT 1 WHERE NULL::int > 0) is TRUE: the WHERE excludes the row (review #5)", async () => {
+    const s = spec("mark", [INT], [INT, INT], 1, { correlated: 0 });
+    const where = (_p: Row, b: Row) => (b[1] === null ? null : (b[1] as number) > 0);
+    const result = await runJoin({ ...s, filter: residualOf(1, where) }, [[1, null]], [[1]]);
+    expect(canonical(result.rows)).toEqual(canonical([[1, false]]));
+  });
+
   it("IN over an empty set is FALSE even for a NULL", async () => {
     const s = spec("mark", [INT], [INT], 1, { correlated: 0 });
     const result = await check(s, [], [[1], [null]]);
@@ -332,12 +339,14 @@ describe("hash join: spill", () => {
 
   it("a heavy hitter key is processed in chunks", async () => {
     const types = [INT, TEXT];
-    const build: Row[] = Array.from({ length: 6000 }, (_, i): Row => [
+    // One key, several chunks of build rows (more than the pool and grant hold at once); two
+    // probe rows hit it, so semi/anti/outer state must carry across the chunks.
+    const build: Row[] = Array.from({ length: 30_000 }, (_, i): Row => [
       7,
-      `b${String(i)}-${"y".repeat(60)}`,
+      `b${String(i)}-${"y".repeat(100)}`,
     ]);
     const probe: Row[] = Array.from({ length: 40 }, (_, i): Row => [
-      i % 3 === 0 ? 7 : i,
+      i === 0 || i === 21 ? 7 : i + 100,
       `p${String(i)}`,
     ]);
     for (const kind of ["inner", "left", "full", "semi", "anti"] as const) {
@@ -348,6 +357,26 @@ describe("hash join: spill", () => {
       expect(result.join.profile.chunkPasses).toBeGreaterThan(1);
     }
   });
+
+  it("values larger than the pool progress with one loan per row-sized step (review #1)", async () => {
+    // 450 KiB values: each spill step (stage a row, read its page, load it, emit it) needs room
+    // the minimum grant does not have, and each takes a loan of about one row, never a page × 4.
+    const types = [INT, TEXT];
+    const big = (k: number, i: number): Row => [k, `${String(i)}-${"v".repeat(450 * 1024)}`];
+    const build: Row[] = Array.from({ length: 10 }, (_, i) => big(i % 3, i));
+    const probe: Row[] = [big(0, 100), big(1, 101), [9, "miss"]];
+    for (const kind of ["inner", "left", "full", "anti"] as const) {
+      const result = await check(spec(kind, types, types, 1), build, probe, {
+        cap: "tight",
+        slack: 0,
+      });
+      expect(result.join.profile.spilledBytes).toBeGreaterThan(0);
+      expect(result.join.profile.loans).toBeGreaterThan(0);
+      expect(result.join.profile.largestLoan).toBeLessThan(result.governor.reserveBytes);
+      // One-row pages go down a level whole: one copy of a wide row, not three.
+      expect(result.join.profile.forwardedPages).toBeGreaterThan(0);
+    }
+  }, 120_000);
 
   it("recursion splits a partition that is still too large", async () => {
     // 90 % of the build lands in level-0 partition 0 (chosen by hash), so that partition cannot
@@ -446,6 +475,104 @@ describe("hash join: lifecycle", () => {
     expect(spill.bytesInUse).toBe(0);
   });
 
+  it("a cancel while a spill file is being created leaks no spill space (review B7-p2a #3)", async () => {
+    const service = new MemorySpillService();
+    let resume: (() => void) | null = null;
+    let entered: (() => void) | null = null;
+    const gate = new Promise<void>((resolve) => (resume = resolve));
+    const started = new Promise<void>((resolve) => (entered = resolve));
+    const slow: SpillService = {
+      get bytesInUse() {
+        return service.bytesInUse;
+      },
+      sweep: () => service.sweep(),
+      create: async (queryId) => {
+        entered?.();
+        await gate;
+        return service.create(queryId);
+      },
+    };
+    const { governor, join } = await setup(
+      spec("inner", types, types, 1),
+      "tight",
+      slow as MemorySpillService,
+    );
+    const running = Promise.resolve(
+      drive(new ArraySource(batchesOf(types, rows(12_000))), join.build),
+    ).then(
+      () => "finished",
+      (error: unknown) => String(error),
+    );
+    await started;
+    join.abort(new Error("cancel"));
+    (resume as (() => void) | null)?.();
+    expect(await running).toMatch(/cancel|closed/);
+    await join.closed;
+    expect(governor.usedBytes).toBe(0);
+    expect(service.bytesInUse).toBe(0);
+  });
+
+  it("a spill file that fails to close fails the query, and the failure is kept", async () => {
+    const service = new MemorySpillService();
+    const failing: SpillService = {
+      get bytesInUse() {
+        return service.bytesInUse;
+      },
+      sweep: () => service.sweep(),
+      create: async (queryId) => {
+        const file = await service.create(queryId);
+        const close = file.close.bind(file);
+        file.close = async () => {
+          await close();
+          throw new Error("close failed");
+        };
+        return file;
+      },
+    };
+    const { join } = await setup(
+      spec("inner", types, types, 1),
+      "tight",
+      failing as MemorySpillService,
+    );
+    const run = async () => {
+      await drive(new ArraySource(batchesOf(types, rows(20_000))), join.build);
+      await drive(new ArraySource(batchesOf(types, rows(2000))), join.probe(new CollectSink()));
+    };
+    await expect(run()).rejects.toThrow("close failed");
+    await expect(join.closed).rejects.toThrow("close failed");
+    expect(String(join.cleanupError)).toMatch("close failed");
+  });
+
+  it("a close failure after an abort is kept, not dropped", async () => {
+    const service = new MemorySpillService();
+    const failing: SpillService = {
+      get bytesInUse() {
+        return service.bytesInUse;
+      },
+      sweep: () => service.sweep(),
+      create: async (queryId) => {
+        const file = await service.create(queryId);
+        const close = file.close.bind(file);
+        file.close = async () => {
+          await close();
+          throw new Error("close failed");
+        };
+        return file;
+      },
+    };
+    const { join } = await setup(
+      spec("inner", types, types, 1),
+      "tight",
+      failing as MemorySpillService,
+    );
+    await drive(new ArraySource(batchesOf(types, rows(20_000))), join.build);
+    expect(join.profile.spilledBytes).toBeGreaterThan(0);
+    join.abort(new Error("cancel"));
+    await expect(join.closed).rejects.toThrow("close failed");
+    await Promise.resolve();
+    expect(String(join.cleanupError)).toMatch("close failed");
+  });
+
   it("a corrupt spill page fails the query and releases everything", async () => {
     const service = new MemorySpillService();
     const files: MemorySpillFile[] = [];
@@ -480,5 +607,43 @@ describe("hash join: lifecycle", () => {
     await new Promise((resolve) => setTimeout(resolve, 10));
     expect(governor.usedBytes).toBe(0);
     expect(service.bytesInUse).toBe(0);
+  });
+});
+
+describe("hash join: the spill pool's progress loans", () => {
+  async function pool(minimum: number) {
+    // cap − reserve = the minimum: the grant cannot grow, so past the pool's size is a loan.
+    const governor = new Governor(minimum + (1 << 20));
+    const grant = await governor.admit({ label: "pool", minimumBytes: minimum, spillable: true });
+    const charge = new Charge(grant);
+    return { governor, grant, pool: new Pool(charge, minimum) };
+  }
+
+  it("lends exactly a step's shortfall, holds it for the step, repays when its usage leaves", async () => {
+    const { governor, grant, pool: p } = await pool(256 * 1024);
+    expect(p.allocate(200 * 1024)).toBe(true);
+    await p.need(100 * 1024, grant);
+    expect(p.loans).toBe(1);
+    expect(p.largestLoan).toBe(44 * 1024);
+    // Before the step allocates, a reset (free + settle) must not give the room back.
+    p.free(10 * 1024);
+    p.settle();
+    expect(grant.loaned).toBe(44 * 1024);
+    expect(p.allocate(100 * 1024)).toBe(true);
+    // Within the step the room may grow once more from the grant only: a second loan is refused.
+    await expect(p.need(200 * 1024, grant)).rejects.toThrow("second progress loan");
+    p.free(100 * 1024);
+    expect(grant.loaned).toBe(0);
+    p.free(190 * 1024);
+    p.close();
+    grant.close();
+    expect(governor.usedBytes).toBe(0);
+  });
+
+  it("refuses a step larger than the reserve: the governor's one size error", async () => {
+    const { grant, pool: p } = await pool(64 * 1024);
+    await expect(p.need(4 << 20, grant)).rejects.toBeInstanceOf(ValueTooLargeError);
+    p.close();
+    grant.close();
   });
 });

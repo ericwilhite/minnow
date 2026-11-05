@@ -109,9 +109,9 @@ describe("runtime join filters", () => {
       Array.from({ length: 500 }, (_, i) => i),
     );
     expect([...kept]).toEqual([10, 12, 14, 40]);
-    expect(filter?.excludes(41, 900)).toBe(true);
-    expect(filter?.excludes(0, 9)).toBe(true);
-    expect(filter?.excludes(0, 10)).toBe(false);
+    expect(filter?.excludes(41, 900, 0, 0)).toBe(true);
+    expect(filter?.excludes(0, 9, 0, 0)).toBe(true);
+    expect(filter?.excludes(0, 10, 0, 0)).toBe(false);
   });
 
   it("keeps a probe NULL only under IS NOT DISTINCT FROM with a NULL on the build side", () => {
@@ -123,10 +123,30 @@ describe("runtime join filters", () => {
     expect([...apply(defined(safeNoNull), INT, [null, 1])]).toEqual([1]);
   });
 
+  it("never prunes a page by bounds when a NULL or NaN on it could match (review B7-p2a #2)", () => {
+    // IS NOT DISTINCT FROM, build [1, NULL]; probe page [2, NULL] has bounds [2, 2].
+    const safe = defined(JoinRuntimeFilter.build(1, storeOf(INT, [1, null]), 0, true, FREE, 2048));
+    expect(safe.excludes(2, 2, null, 0)).toBe(false);
+    expect(safe.excludes(2, 2, 1, 0)).toBe(false);
+    expect(safe.excludes(2, 2, 0, 0)).toBe(true);
+    // A NaN in the build matches a NaN probe (NaN = NaN): bounds cannot exclude a page with NaN.
+    const nan = defined(
+      JoinRuntimeFilter.build(1, storeOf(DBL, [1.5, Number.NaN]), 0, false, FREE, 2048),
+    );
+    expect(nan.excludes(2, 3, 0, null)).toBe(false);
+    expect(nan.excludes(2, 3, 0, 2)).toBe(false);
+    expect(nan.excludes(2, 3, 0, 0)).toBe(true);
+    // With `=`, a NULL never matches: nulls on the page do not keep it.
+    const strict = defined(
+      JoinRuntimeFilter.build(1, storeOf(INT, [1, null]), 0, false, FREE, 2048),
+    );
+    expect(strict.excludes(2, 2, null, null)).toBe(true);
+  });
+
   it("an empty build excludes everything", () => {
     const filter = defined(JoinRuntimeFilter.build(1, storeOf(INT, []), 0, false, FREE, 2048));
     expect(apply(filter, INT, [1, 2, null]).size).toBe(0);
-    expect(filter.excludes(-1e9, 1e9)).toBe(true);
+    expect(filter.excludes(-1e9, 1e9, 0, 0)).toBe(true);
   });
 
   it("stops testing once it keeps more than 90 % of probes", () => {

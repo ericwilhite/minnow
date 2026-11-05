@@ -269,9 +269,17 @@ export class JoinRuntimeFilter {
     return out;
   }
 
-  /** Whether no value in [lo, hi] (page or segment bounds) can match: the page is skipped. */
-  excludes(lo: number, hi: number): boolean {
-    if (this.shape === "bounds" && !this.hasNull) return true;
+  /**
+   * Whether no row of a page (or segment) with bounds [lo, hi] can match, so it is skipped.
+   * `nulls` and `nans` are the page's null and NaN counts (null: unknown). A page that may hold a
+   * NULL is never excluded when NULL can match (IS NOT DISTINCT FROM with a NULL in the build),
+   * nor one that may hold NaN when NaN can (a NaN in the build: NaN = NaN) — bounds say nothing
+   * about either.
+   */
+  excludes(lo: number, hi: number, nulls: number | null, nans: number | null): boolean {
+    if (this.hasNull && nulls !== 0) return false;
+    if (this.hasNaN && nans !== 0) return false;
+    if (this.shape === "bounds") return true;
     if (this.min === null || this.max === null) return false;
     return hi < this.min || lo > this.max;
   }
