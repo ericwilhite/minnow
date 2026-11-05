@@ -6,6 +6,7 @@
 import { Governor } from "../memory/governor.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
 import type { PhysicalType } from "../types.js";
+import { encodeArrayValue, type ArrayValue } from "../vector/array-value.js";
 import { setInt128 } from "../vector/int128.js";
 import { decodeUtf8 } from "../vector/varlen.js";
 import {
@@ -118,8 +119,15 @@ export function vectorOf(
     }
     case "text":
     case "bytes":
+    case "json":
+    case "array":
     case "enum": {
-      const parts = values.map((v) => encoder.encode(typeof v === "string" ? v : ""));
+      // Arrays take their values as PostgreSQL-style JSON lists of int32 ("[1,null,3]").
+      const parts = values.map((v) =>
+        type.kind === "array" && typeof v === "string"
+          ? encodeArrayValue(type.element, arrayFromJson(v))
+          : encoder.encode(typeof v === "string" ? v : ""),
+      );
       if (options.dictionary === true) {
         const distinct = [...new Set(values.filter((v): v is string => typeof v === "string"))];
         const dict = vectorOf(type, distinct) as FlatVector;
@@ -149,6 +157,14 @@ export function vectorOf(
       throw new TypeError(`No fixture for ${type.kind}`);
   }
   return { form: "flat", type, length: n, validity: nulls ? validity : null, data };
+}
+
+/** A one-dimensional int array from JSON text ("[1,null,3]"). */
+function arrayFromJson(text: string): ArrayValue {
+  const elements = JSON.parse(text) as Array<number | null>;
+  return elements.length === 0
+    ? { dimensions: [], lowerBounds: [], elements: [] }
+    : { dimensions: [elements.length], lowerBounds: [1], elements };
 }
 
 /** Batches of `rows` (row-major) over `types`. */

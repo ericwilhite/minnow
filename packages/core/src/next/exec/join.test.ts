@@ -29,7 +29,8 @@ import { SpillCorruptionError, type SpillService } from "../spill/contract.js";
 import { MemorySpillFile, MemorySpillService } from "../spill/memory-spill.js";
 import type { Batch } from "../vector/vector.js";
 import { HASH_SEED, fmix32, levelHash } from "./join-keys.js";
-import { Charge, HashJoin, Pool, hashJoinMinimumBytes } from "./join.js";
+import { HashJoin, hashJoinMinimumBytes } from "./join.js";
+import { Charge, Pool } from "./spill-pool.js";
 import { drive, type Operator } from "./pipeline.js";
 import type { HashJoinKind, HashJoinSpec } from "./join.js";
 

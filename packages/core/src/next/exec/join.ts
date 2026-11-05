@@ -82,7 +82,7 @@
  * - Chunk mode keeps 2 bits per probe row of the partition in memory (charged).
  */
 import type { JoinKind } from "../ir/ir.js";
-import type { Grant, Loan } from "../memory/governor.js";
+import type { Grant } from "../memory/governor.js";
 import type { SpillService } from "../spill/contract.js";
 import type { PhysicalType } from "../types.js";
 import type { ByteCharge } from "../vector/varlen.js";
@@ -97,8 +97,9 @@ import {
 import { isPromise, type Operator, type PushResult, type Transfer } from "./pipeline.js";
 import { JoinRuntimeFilter, kindPublishes } from "./join-filter.js";
 import { KeyLayout, KeyScratch, bytesEqual, extractKeys, levelHash } from "./join-keys.js";
-import { PageWriter, SpillFiles, SpilledRun, decodePage, type DecodedPage } from "./spill-pages.js";
+import { PageWriter, SpillFiles, SpilledRun, type DecodedPage } from "./spill-pages.js";
 import { ColumnStore, nullConstant } from "./column-store.js";
+import { Charge, Pool, SpillIo } from "./spill-pool.js";
 import { JoinTable, chunkKeys } from "./join-table.js";
 
 type MaybePromise<T> = T | Promise<T>;
@@ -271,152 +272,6 @@ export function hashJoinMinimumBytes(spec: HashJoinSpec): number {
   return KeyScratch.bytes(layout, BATCH_ROWS) + SCRATCH_BYTES + poolBytes(spec);
 }
 
-/** The join's charge on its grant, tracking the peak. */
-export class Charge implements ByteCharge {
-  peak = 0;
-  constructor(readonly grant: Grant) {}
-  allocate(bytes: number): boolean {
-    if (!this.grant.allocate(bytes)) return false;
-    if (this.grant.held > this.peak) this.peak = this.grant.held;
-    return true;
-  }
-  free(bytes: number): void {
-    this.grant.free(bytes);
-  }
-}
-
-/**
- * The pool: a sub-budget for transient buffers, allocated from the grant inside the admitted
- * minimum. Past it, allocations try the grant. When the grant refuses, `need` makes room for one
- * bounded step (one row, one bounded page) with a progress loan (memory/governor.ts rule 5) that
- * the pool itself allocates, so no other buffer can take those bytes; the pool repays it as soon
- * as its usage falls back below its own size. One step at a time, so one loan at a time.
- */
-export class Pool implements ByteCharge {
-  #used = 0;
-  #overflow = 0;
-  #size: number;
-  readonly #base: number;
-  #loan: Loan | null = null;
-  /** Bytes added to the pool for the current step (from the grant or the loan). */
-  #extra = 0;
-  /** Usage when the current step made room; its extra goes back once usage is back to it. */
-  #stepBase = 0;
-  /** The step allocated since it made room (until then, its room is held, not given back). */
-  #consumed = false;
-  loans = 0;
-  largestLoan = 0;
-  constructor(
-    readonly charge: Charge,
-    size: number,
-  ) {
-    if (!charge.allocate(size)) throw new RangeError("A join's spill pool must be admitted");
-    this.#size = size;
-    this.#base = size;
-  }
-
-  /** The pool holds a step's extra bytes: shrink buffers when they are reset. */
-  get owes(): boolean {
-    return this.#extra > 0;
-  }
-
-  get loaned(): boolean {
-    return this.#loan !== null;
-  }
-
-  /** Bytes of the pool's own room not in use. */
-  get room(): number {
-    return this.#size - this.#used;
-  }
-
-  /**
-   * Takes `bytes` from the pool's room, keeping `keep` bytes of it for other steps; past that
-   * from the grant.
-   */
-  allocate(bytes: number, keep = 0): boolean {
-    if (this.#used + bytes <= this.#size - keep) {
-      this.#used += bytes;
-      if (this.#extra > 0) this.#consumed = true;
-      return true;
-    }
-    if (this.#extra === 0 && this.charge.allocate(bytes)) {
-      this.#overflow += bytes;
-      return true;
-    }
-    return false;
-  }
-
-  free(bytes: number): void {
-    const fromOverflow = Math.min(bytes, this.#overflow);
-    if (fromOverflow > 0) {
-      this.charge.free(fromOverflow);
-      this.#overflow -= fromOverflow;
-    }
-    this.#used -= bytes - fromOverflow;
-    this.settle();
-  }
-
-  /**
-   * Room for `bytes` more in the pool for the next step: from the grant if it has them, else a
-   * progress loan of exactly the shortfall (rule 5's one bounded step).
-   */
-  async need(bytes: number, grant: Grant, signal?: AbortSignal): Promise<void> {
-    if (this.#used + bytes <= this.#size) return;
-    this.settle();
-    const shortfall = this.#used + bytes - this.#size;
-    if (shortfall <= 0) return;
-    // Within one step the room may grow again (a row, then its page): from the grant, or one
-    // loan; everything goes back together when the step's usage has left.
-    if (this.charge.allocate(shortfall)) {
-      this.#size += shortfall;
-      this.#beginStep(shortfall);
-      return;
-    }
-    if (this.#loan !== null)
-      throw new RangeError("A join step needed a second progress loan before repaying its first");
-    const loan = await grant.borrow(shortfall, signal);
-    this.loans++;
-    this.largestLoan = Math.max(this.largestLoan, shortfall);
-    if (!this.charge.allocate(shortfall)) {
-      loan.repay();
-      throw new RangeError("A progress loan could not be held");
-    }
-    this.#loan = loan;
-    this.#size += shortfall;
-    this.#beginStep(shortfall);
-  }
-
-  #beginStep(extra: number): void {
-    if (this.#extra === 0) this.#stepBase = this.#used;
-    this.#extra += extra;
-    this.#consumed = false;
-  }
-
-  /**
-   * Gives a step's extra bytes back (repaying the loan) once the step has allocated and its
-   * usage has left again (usage back to what it was when the step made room).
-   */
-  settle(): void {
-    if (this.#extra === 0 || !this.#consumed || this.#used > this.#stepBase) return;
-    this.charge.free(this.#extra);
-    this.#size -= this.#extra;
-    this.#extra = 0;
-    const loan = this.#loan;
-    this.#loan = null;
-    loan?.repay();
-  }
-
-  close(): void {
-    if (this.#overflow > 0) this.charge.free(this.#overflow);
-    this.#overflow = 0;
-    this.charge.free(this.#size);
-    this.#size = this.#base;
-    this.#extra = 0;
-    this.#consumed = false;
-    this.#loan = null;
-  }
-}
-
 /** State shared by every level of one join: spec, scratch, outputs, spill, downstream. */
 class Shared {
   readonly kind: HashJoinKind;
@@ -426,6 +281,7 @@ class Shared {
   readonly pool: Pool;
   readonly files: SpillFiles;
   readonly pages: PageWriter;
+  readonly io: SpillIo;
   readonly scratch: KeyScratch;
   readonly heads = new Int32Array(BATCH_ROWS);
   readonly aligned = new Int32Array(BATCH_ROWS);
@@ -514,6 +370,9 @@ class Shared {
     this.pool = new Pool(this.charge, poolBytes(spec));
     this.files = new SpillFiles(context.spill, context.queryId, this.charge);
     this.pages = new PageWriter(this.pool, 16 * 1024);
+    this.io = new SpillIo(this.pool, this.files, this.pages, context, () => {
+      this.checkAborted();
+    });
     this.scratch = new KeyScratch(this.layout, BATCH_ROWS, this.charge, this.pool);
     this.probeOut = new ColumnStore(spec.probeTypes, this.pool, {
       targetBytes: BATCH_TARGET_BYTES,
@@ -581,78 +440,37 @@ class Shared {
 
   /** Room in the pool for one bounded step of `bytes` (see `Pool`). */
   need(bytes: number): Promise<void> {
-    return this.pool.need(bytes, this.context.grant, this.context.signal);
+    return this.io.need(bytes);
   }
 
-  /** Resets an output or staging store, shrinking its arenas while the pool holds a step. */
   reset(store: ColumnStore): void {
-    store.reset(this.pool.owes);
-    this.pool.settle();
+    this.io.reset(store);
   }
 
-  /** Reads and verifies a page (a bounded step), charged to the pool while the caller holds it. */
-  async readPage(run: SpilledRun, index: number): Promise<{ bytes: Uint8Array; charged: number }> {
-    const ref = run.pages[index];
-    const file = run.file;
-    if (ref === undefined || file === null) throw new RangeError("No such spill page");
-    if (!this.pool.allocate(ref.length)) {
-      await this.need(ref.length);
-      if (!this.pool.allocate(ref.length)) throw new RangeError("A spill page could not be read");
-    }
-    try {
-      return { bytes: await file.read(ref), charged: ref.length };
-    } catch (error) {
-      this.pool.free(ref.length);
-      throw error;
-    }
+  readPage(run: SpilledRun, index: number): Promise<{ bytes: Uint8Array; charged: number }> {
+    return this.io.readPage(run, index);
   }
 
   releasePage(page: { charged: number }): void {
-    this.pool.free(page.charged);
+    this.io.releasePage(page);
   }
 
-  /** Decodes a held page into views of its bytes (copies charged to the pool). */
-  async decode(
+  decode(
     page: { bytes: Uint8Array; charged: number },
     types: readonly PhysicalType[],
   ): Promise<DecodedPage> {
-    let decoded = decodePage(page.bytes, types, this.pool);
-    if ("needed" in decoded) {
-      await this.need(decoded.needed);
-      decoded = decodePage(page.bytes, types, this.pool);
-      if ("needed" in decoded) throw new RangeError("A spill page could not be decoded");
-    }
-    page.charged += decoded.charged;
-    return decoded;
+    return this.io.decode(page, types);
   }
 
-  /** Encodes and appends one staging chunk as a page of `run`. */
   async flush(
     staging: ColumnStore,
     run: SpilledRun,
     header: { run: number; partition: number },
   ): Promise<void> {
-    if (staging.rows === 0) return;
-    const columns = staging.vectors();
-    const pageHeader = {
-      queryId: this.context.queryId,
-      run: header.run,
-      partition: header.partition,
-      sequence: run.pages.length,
-    };
-    let page = this.pages.encode(pageHeader, columns, staging.rows);
-    if (page === null) {
-      await this.need(this.pages.growthFor(columns, staging.rows));
-      page = this.pages.encode(pageHeader, columns, staging.rows);
-      if (page === null) throw new RangeError("A spill page could not be encoded");
-    }
-    await this.files.append(run, page, staging.rows);
+    await this.io.flush(staging, run, header);
     this.profile.spilledBytes = this.files.written;
-    this.pages.shrinkIf(this.pool.owes);
-    this.reset(staging);
   }
 
-  /** Appends rows to a staging store, flushing it as it fills; one oversized row at a time. */
   async stage(
     staging: ColumnStore,
     run: SpilledRun,
@@ -662,26 +480,8 @@ class Shared {
     from: number,
     count: number,
   ): Promise<void> {
-    let done = 0;
-    while (done < count) {
-      this.checkAborted();
-      done += staging.append(vectors, ids, from + done, count - done);
-      if (done >= count) break;
-      if (staging.rows > 0) {
-        await this.flush(staging, run, header);
-        continue;
-      }
-      // Not even one row fits an empty staging chunk: room for exactly that row, which then
-      // goes out as a page of its own before the next step.
-      // The step is the row and the page it becomes: room for both at once.
-      const row = ids === null ? from + done : (ids[from + done] ?? 0);
-      const rowBytes = staging.appendNeed(vectors, row);
-      await this.need(2 * rowBytes + 64 * 1024);
-      const one = staging.append(vectors, ids, from + done, 1);
-      if (one === 0) throw new RangeError("A spill staging row could not be allocated");
-      done += one;
-      await this.flush(staging, run, header);
-    }
+    await this.io.stage(staging, run, header, vectors, ids, from, count);
+    this.profile.spilledBytes = this.files.written;
   }
 }
 

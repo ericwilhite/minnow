@@ -467,15 +467,24 @@ export class ColumnStore {
     ids: ArrayLike<number> | null,
     from: number,
     count: number,
+    dense?: { readonly vectors: readonly Vector[]; readonly from: number },
   ): number {
     const sources = vectors.map(resolve);
+    // Optional dense tail: the store's last columns, row k of this call at `dense.from + k`.
+    const tail = dense?.vectors.length ?? 0;
+    if (tail > 0 && dense !== undefined) sources.push(...dense.vectors.map(resolve));
+    const split = sources.length - tail;
+    const denseFrom = dense?.from ?? 0;
+    const rowsOf = (c: number, n: number, done: number): Rows =>
+      c >= split
+        ? { ids: null, from: denseFrom + done, count: n }
+        : { ids, from: from + done, count: n };
     return this.#appendWith(
       count,
-      (n, done) => {
-        const rows: Rows = { ids, from: from + done, count: n };
-        return this.#prepareVectors(sources, rows) && (this.#writeVectors(sources, rows), true);
-      },
-      (c, n, done) => this.#varlenNeedVector(sources[c], { ids, from: from + done, count: n }),
+      (n, done) =>
+        this.#prepareVectors(sources, rowsOf, n, done) &&
+        (this.#writeVectors(sources, rowsOf, n, done), true),
+      (c, n, done) => this.#varlenNeedVector(sources[c], rowsOf(c, n, done)),
     );
   }
 
@@ -634,12 +643,17 @@ export class ColumnStore {
   }
 
   /** Raises column tiers so the incoming vector rows fit; false if the charge refused. */
-  #prepareVectors(sources: readonly Source[], rows: Rows): boolean {
+  #prepareVectors(
+    sources: readonly Source[],
+    rowsOf: (c: number, n: number, done: number) => Rows,
+    n: number,
+    done: number,
+  ): boolean {
     for (let c = 0; c < this.#columns.length; c++) {
       const column = this.#columns[c];
       const source = sources[c];
       if (column === undefined || source === undefined) continue;
-      const need = this.#tierNeedVector(column, source, rows);
+      const need = this.#tierNeedVector(column, source, rowsOf(c, n, done));
       if (need > column.tier && !this.#upgrade(column, need)) return false;
     }
     return true;
@@ -679,14 +693,19 @@ export class ColumnStore {
     return true;
   }
 
-  #writeVectors(sources: readonly Source[], rows: Rows): void {
+  #writeVectors(
+    sources: readonly Source[],
+    rowsOf: (c: number, n: number, done: number) => Rows,
+    n: number,
+    done: number,
+  ): void {
     const k = this.chunkCount - 1;
     const at = this.rows - k * this.chunkRows;
     for (let c = 0; c < this.#columns.length; c++) {
       const column = this.#columns[c];
       const source = sources[c];
       if (column === undefined || source === undefined) continue;
-      writeFromSource(column, k, at, source, rows);
+      writeFromSource(column, k, at, source, rowsOf(c, n, done));
     }
   }
 
@@ -1219,6 +1238,38 @@ function writeFromStore(
   }
   let used = column.used[k] ?? 0;
   if (out.layout === "varlen" && at === 0) out.offsets[0] = 0;
+  if (out.layout === "varlen" && !source.hasNulls) {
+    // Bytes of non-null rows: one loop, no per-value dispatch or view.
+    const to = out.bytes;
+    const toOffsets = out.offsets;
+    let nulls = false;
+    for (let i = 0; i < n; i++) {
+      const id = ids[rows.from + i] ?? -1;
+      if (id < 0) {
+        nulls = true;
+        toOffsets[at + i + 1] = used;
+        continue;
+      }
+      const data = chunks[id >>> shift]?.data as Varlen | undefined;
+      if (data === undefined) continue;
+      const slot = id & mask;
+      const start = data.offsets[slot] ?? 0;
+      const length = (data.offsets[slot + 1] ?? 0) - start;
+      const from = data.bytes;
+      if (length <= LOOP_COPY_BYTES)
+        for (let b = 0; b < length; b++) to[used + b] = from[start + b] ?? 0;
+      else to.set(from.subarray(start, start + length), used);
+      used += length;
+      toOffsets[at + i + 1] = used;
+    }
+    column.used[k] = used;
+    if (nulls || target.validity !== null)
+      for (let i = 0; i < n; i++) {
+        if ((ids[rows.from + i] ?? -1) < 0) setNull(column, k, at + i);
+        else if (target.validity !== null) setValidSlot(column, k, at + i);
+      }
+    return;
+  }
   for (let i = 0; i < n; i++) {
     const id = ids[rows.from + i] ?? -1;
     const chunk = id < 0 ? undefined : chunks[id >>> shift];
