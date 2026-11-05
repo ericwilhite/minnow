@@ -27,11 +27,11 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | `spill/`           | executor (OPFS service: storage) | Spill contract (one long-lived scratch file, batching charged to the operator's budget); in-memory double                                                                                                                                                                                                                                                                                                              |
 | `memory/`          | executor                         | Memory governor: admission, progress loans, held vs allocated bytes (reference implementation)                                                                                                                                                                                                                                                                                                                         |
 | `exec/`            | executor                         | Entry point (`executor.ts`), result frames (`result.ts`), scans (`scan.ts`, `memory-scan.ts`), table rules (`rules.ts`), push driver (`pipeline.ts`), fetcher (`fetch.ts`), comparators, decimal SUM                                                                                                                                                                                                                   |
-| `ir/`              | lowering, executor               | Operator IR (`ir.ts`); the front-end boundary (`lowering.ts`)                                                                                                                                                                                                                                                                                                                                                          |
+| `ir/`              | lowering, executor               | Operator IR (`ir.ts`); scalar function and operator table (`functions.ts`); table rules in IR form (`rules.ts`); executor costs the planner reads (`costs.ts`)                                                                                                                                                                                                                                                         |
 | `access/`          | write path + key index           | Storage access contracts the write path implements: snapshots and segments, catalog, key-index probes and ranges, `modify` (rows, conflicts, RETURNING), transactions, group commit, sequences, delivery                                                                                                                                                                                                               |
 | `testing/`         | all                              | Differential-harness adapter for a partial new core                                                                                                                                                                                                                                                                                                                                                                    |
 | `write/` (to come) | write path + key index           | Group commit, memtables, key index runs, maintenance (implements `access/`)                                                                                                                                                                                                                                                                                                                                            |
-| `lower/` (to come) | planner lowering                 | `Lowerer`, cost model, statistics                                                                                                                                                                                                                                                                                                                                                                                      |
+| `lower/`           | planner lowering                 | `Lowerer` (`lowerer.ts` contract, `create.ts`): front-end passes over the catalog, typing (`coerce.ts`, `expressions.ts`), queries, DML, DDL, table rules, result descriptors; an in-memory catalog; front-end inventory (`INVENTORY.md`)                                                                                                                                                                              |
 | `owner/`           | ownership                        | Owner/client protocol (`protocol.ts`), wire payloads (re-exported from exec) and stream dictionaries (`frame.ts`), ledger outcomes per request (`outcomes.ts`), wire errors (`errors.ts`), client sequencing (`sequence.ts`), election, liveness and step-down (`election.ts`), public client API (`api.ts`), engine boundary and idle-transaction timer (`engine.ts`); composition root to come                       |
 
 ## Cross-track interfaces (owned by the implementing track)
@@ -119,9 +119,9 @@ is access's `Snapshot`.
   - IndexedDB: a durable epoch record that every transaction checks.
 - Every mutation is async and checks ownership in the same step that applies its effect. A fenced
   owner changes nothing.
-- The store is four long-lived files: log, data space, and two root slots. OPFS adds a fifth, the
-  spill scratch file, opened under the same fence. Extents are reused in place inside the data
-  space.
+- The store is four long-lived files: log, data space, and two root slots. OPFS adds the spill
+  scratch file and the epoch counter (two checksummed slots, flushed before a lease exists), all six
+  opened under the same fence. Extents are reused in place inside the data space.
 - `publish` is atomic and durable: it flushes data, then writes the inactive root slot.
 - The log has a flush barrier and two header slots.
 - **The extent space** (`extents.ts`) is the only caller of the data-space calls and of `publish`.
@@ -150,6 +150,15 @@ is access's `Snapshot`.
     `space-crash.test.ts` crashes it at every physical step of a workload and reopens.
 - **The in-memory backend** (`memory-store.ts`) is the file store over growable in-memory files:
   the store of an in-memory database and of the end-to-end suites. It has no scratch space.
+- **The OPFS backend** (`opfs.ts`: `createOpfsBackend`, `webLocks`) is the file store over real
+  sync access handles: the Web Lock, then every handle with bounded retry; a lost lock closes them
+  at once; quota signals become `StoreQuotaError` by name. It passes the storage kit over
+  simulated handles (`opfs.test.ts`), and `browser-tests/next-storage.spec.ts` runs conformance,
+  a worker killed during publish, a closed owner tab, the cross-worker fence and spill in real
+  Chromium, Firefox and WebKit.
+- A writer that interleaves many builders (the page format's group writer) passes a `budget` to
+  `beginWrite`: each builder stages up to 256 KiB of its own. Without it, alternating page-by-page
+  appends cost one platform write per page (measured 2–9× a flush on Chromium and Firefox).
 - The simulated disk crashes at any physical step. Every write after the last flush may land
   whole, torn or not at all, and may land out of order. It models honest and lying flush.
 - A backend is accepted by the **storage kit** (`kit.ts`): the conformance cases together with a
@@ -379,6 +388,9 @@ and the owner import it directly.
 - No per-query caps.
 - Write batching is charged to the operator's budget, and is skipped when the budget refuses, so
   spilling never needs memory beyond the page in hand.
+- `scratch-spill.ts` is the service over a backend's `ScratchSpace` (the OPFS `spill` file now,
+  IndexedDB's `spill` store later): one free map, 256 KiB batches written as extents that extend
+  the file's last one, checksummed reads, `sweep` at startup.
 
 ### Memory (`memory/governor.ts`)
 
@@ -478,7 +490,38 @@ and the owner import it directly.
   contract (`exec/fetch.ts`): an explicit, enforced output capacity, charged and bounded staging,
   and partial completion that may reread pages.
 - `apply` memoizes only when evaluation multiplicity is unobservable.
-- `lowering.ts` lists the front-end passes that are kept and the code that lowering replaces.
+- `rules.ts` is a table's CHECK, generated and default expressions in IR form: lowering builds
+  them, the executor compiles them (`compileTableRules`).
+
+### Lowering (`lower/`)
+
+- `Lowerer.lower(text, context)` runs the whole front end (parse, catalog passes over access/'s
+  `CatalogView`, shape passes), types every expression, and returns a `LoweredStatement`: a plan
+  with result descriptors, read and write sets and its statistics basis; a catalog change; or a
+  transaction or utility command. `lowerer.ts` lists the front-end passes that are kept and the
+  code that lowering replaces.
+- Pure and synchronous; the owner caches by (text, catalog version) and re-lowers when
+  `statisticsDrifted` says the data moved.
+- Declared numeric widths and VARCHAR(n) / CHAR(n) widths come from the parser only under
+  `compileWithDeclaredTypes` (engine/query.ts), so the current engine compiles exactly what it
+  did (C5, R17.4).
+- Types follow PostgreSQL: integer constants are int4 → int8 → numeric by magnitude, string
+  constants and placeholders take the type of their context, overloads resolve against
+  `ir/functions.ts` with implicit casts, and values written to a column get assignment casts.
+- A unique key fixed by `=` constants (or one `IN` list) becomes `keyLookup`: a point read. A
+  constant that cannot be a key of the column's type keeps the scan.
+- int8 renders `bigint` only when an operand does (R17.1); SUM(int8) is `decimal(null, 0)`
+  rendered `bigint` (R17.2).
+- Milestone M1 surface. Joins, subqueries, windows, set operations and recursion are refused
+  with `UnsupportedPlanError` (stage "lower", a construct key) until milestone M3.
+- `testing/lowering-differential.test.ts` runs DDL, seed rows, 41 queries, writes, RETURNING
+  and failing writes through the current engine and through lowering + the IR reference
+  interpreter (`testing/ir-reference.ts`), and requires identical results;
+  `testing/lowering-pglite.test.ts` does the same against PostgreSQL (PGlite), the authority;
+  `testing/ir-check.ts` type-checks every plan they run.
+- Under `compileWithDeclaredTypes` the front end keeps constants typed (no folding with the
+  current engine's numbers), keeps INSERT values as expressions, marks TRUNCATE and leaves bare
+  ON CONFLICT names unqualified; lowering folds integer constants after overload resolution.
 
 ### Differential adapter (`testing/differential-adapter.ts`)
 

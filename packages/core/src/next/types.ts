@@ -69,9 +69,17 @@ export interface TimestampType {
 export interface IntervalType {
   readonly kind: "interval";
 }
-/** TEXT / VARCHAR / CHAR: UTF-8 bytes. Equality and hashing are byte equality. */
+/**
+ * TEXT / VARCHAR / CHAR: UTF-8 bytes. Equality and hashing are byte equality.
+ * `maxLength` (VARCHAR(n), CHAR(n); additive, ruling R17.4) is the most characters (code points)
+ * a stored value may have: an assignment cast of a longer value is SQLSTATE 22001, an explicit
+ * cast truncates. `fixed` is CHAR(n): the same storage and rules, printed `character(n)`; values
+ * are not blank-padded (a documented divergence from PostgreSQL). Absent: unbounded.
+ */
 export interface TextType {
   readonly kind: "text";
+  readonly maxLength?: number;
+  readonly fixed?: true;
 }
 /** Arbitrary bytes. Reserved: the current front end has no BYTEA. */
 export interface BytesType {
@@ -206,6 +214,8 @@ export interface SqlTypeDescriptor {
   readonly withoutTimeZone?: true;
   readonly enumValues?: readonly string[];
   readonly declaredTypeName?: string;
+  /** VARCHAR(n) / CHAR(n) (additive, R17.4): the declared width; CHAR without one is CHAR(1). */
+  readonly declaredLength?: { readonly length: number; readonly fixed: boolean };
 }
 
 const INT16_NAMES = new Set(["SMALLINT", "INT2"]);
@@ -280,10 +290,15 @@ export function physicalTypeOf(descriptor: SqlTypeDescriptor): PhysicalType {
       return { kind: "bool" };
     case "datetime":
       return { kind: "timestamp", zoned: descriptor.withoutTimeZone !== true };
-    case "string":
-      return descriptor.enumValues === undefined
-        ? { kind: "text" }
-        : { kind: "enum", name: "", labels: [...descriptor.enumValues] };
+    case "string": {
+      if (descriptor.enumValues !== undefined)
+        return { kind: "enum", name: "", labels: [...descriptor.enumValues] };
+      const width = descriptor.declaredLength;
+      if (width === undefined) return { kind: "text" };
+      return width.fixed
+        ? { kind: "text", maxLength: width.length, fixed: true }
+        : { kind: "text", maxLength: width.length };
+    }
     case "number": {
       const name = descriptor.declaredTypeName?.toUpperCase();
       if (descriptor.integer !== true)
@@ -310,15 +325,21 @@ const ELEMENT_TYPES: ReadonlyMap<string, PhysicalType> = new Map<string, Physica
   ["REAL", { kind: "float32" }],
   ["FLOAT4", { kind: "float32" }],
   ["FLOAT8", { kind: "float64" }],
+  ["FLOAT", { kind: "float64" }],
   ["DOUBLE PRECISION", { kind: "float64" }],
   ["NUMERIC", { kind: "decimal", precision: null, scale: null }],
   ["DECIMAL", { kind: "decimal", precision: null, scale: null }],
   ["TEXT", { kind: "text" }],
   ["VARCHAR", { kind: "text" }],
+  ["CHAR", { kind: "text" }],
+  ["CHARACTER", { kind: "text" }],
+  ["STRING", { kind: "text" }],
   ["DATE", { kind: "date" }],
   ["TIME", { kind: "time" }],
   ["TIMESTAMP", { kind: "timestamp", zoned: false }],
   ["TIMESTAMPTZ", { kind: "timestamp", zoned: true }],
+  // The current engine's DATETIME reads as TIMESTAMP (without time zone).
+  ["DATETIME", { kind: "timestamp", zoned: false }],
   ["INTERVAL", { kind: "interval" }],
   ["UUID", { kind: "uuid" }],
   ["JSON", { kind: "json", binary: false }],
@@ -364,6 +385,10 @@ export function samePhysicalType(left: PhysicalType, right: PhysicalType): boole
     }
     case "timestamp":
       return left.zoned === (right as TimestampType).zoned;
+    case "text": {
+      const other = right as TextType;
+      return left.maxLength === other.maxLength && left.fixed === other.fixed;
+    }
     case "json":
       return left.binary === (right as JsonType).binary;
     case "enum": {

@@ -6,6 +6,7 @@ import {
   blockHasSubqueries,
   childExpressions,
   clonePlanTree,
+  declaredTypesActive,
   DUAL_TABLE,
   expressionAliases,
   forEachBlockExpression,
@@ -238,7 +239,8 @@ function optimizeBlock(block: CompiledQuery, nextCorrelationAlias: NextAlias): v
     for (const child of childExpressions(expression)) optimizeExpressionBlock(child);
   };
   forEachBlockExpression(block, optimizeExpressionBlock);
-  foldBlockConstants(block);
+  // Lowering's compilation keeps constants typed; it folds after overload resolution.
+  if (!declaredTypesActive()) foldBlockConstants(block);
   extractJoinKeys(block);
   normalizeBooleanPredicates(block);
   coalesceOrEqualityLists(block);

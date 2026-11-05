@@ -116,6 +116,7 @@
 import type { Snapshot } from "../access/snapshot.js";
 import type { Statement } from "../access/modify.js";
 import type { SequenceAccess } from "../access/write-path.js";
+import type { ExecutorCosts } from "../ir/costs.js";
 import type { OutputColumn, PhysicalPlan } from "../ir/ir.js";
 import type { MemoryGovernor } from "../memory/governor.js";
 import type { SpillService } from "../spill/contract.js";
@@ -288,21 +289,10 @@ export interface ExecutionProfile {
 
 /**
  * Per-row CPU cost of each operator class in nanoseconds (single thread, warm), measured by the
- * executor's benches and versioned with the kernels. The cost model computes
- * `Σ rows × cost + spillBytes / spillBytesPerSecond` (design-joins-agg-spill.md "Statistics and
- * ordering"); I/O costs come from the storage track.
+ * executor's benches and versioned with the kernels. Defined once in ir/costs.ts, where lowering's
+ * cost model reads it (lower/ may not import exec/).
  */
-export interface ExecutorCosts {
-  readonly decodePerValue: number;
-  readonly filterPerRow: number;
-  readonly hashBuildPerRow: number;
-  readonly hashProbePerRow: number;
-  readonly aggregatePerRow: number;
-  readonly sortPerRowLog: number;
-  readonly emitPerValue: number;
-  /** Bytes per second of the spill path, write plus read back. */
-  readonly spillBytesPerSecond: number;
-}
+export type { ExecutorCosts } from "../ir/costs.js";
 
 /** Placeholder values until the Phase 2 benches measure them. */
 export const EXECUTOR_COSTS: ExecutorCosts = {

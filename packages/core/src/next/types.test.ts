@@ -101,3 +101,29 @@ describe("SQL → physical type mapping", () => {
     ).toBe(false);
   });
 });
+
+describe("text widths (ruling R17.4)", () => {
+  it("keeps VARCHAR(n) and CHAR(n) widths and compares them", () => {
+    const varchar = physicalTypeOf({
+      type: "string",
+      declaredLength: { length: 20, fixed: false },
+    });
+    expect(varchar).toEqual({ kind: "text", maxLength: 20 });
+    expect(physicalTypeOf({ type: "string", declaredLength: { length: 3, fixed: true } })).toEqual({
+      kind: "text",
+      maxLength: 3,
+      fixed: true,
+    });
+    expect(physicalTypeOf({ type: "string" })).toEqual({ kind: "text" });
+    expect(samePhysicalType(varchar, { kind: "text", maxLength: 20 })).toBe(true);
+    expect(samePhysicalType(varchar, { kind: "text" })).toBe(false);
+    expect(samePhysicalType(varchar, { kind: "text", maxLength: 20, fixed: true })).toBe(false);
+  });
+
+  it("names every array element spelling the parser accepts", () => {
+    expect(physicalTypeOfName("FLOAT")).toEqual({ kind: "float64" });
+    expect(physicalTypeOfName("char")).toEqual({ kind: "text" });
+    expect(physicalTypeOfName("STRING")).toEqual({ kind: "text" });
+    expect(physicalTypeOfName("DATETIME")).toEqual({ kind: "timestamp", zoned: false });
+  });
+});
