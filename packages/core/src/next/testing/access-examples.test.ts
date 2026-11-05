@@ -25,7 +25,6 @@ import {
   type DeletionVector,
   type MemorySegment,
   type Snapshot,
-  type TableReadOptions,
   type TableSnapshot,
 } from "../access/snapshot.js";
 import type {
@@ -165,7 +164,7 @@ const deletions: DeletionVector = {
   },
 };
 
-function memoryTable(options: TableReadOptions): TableSnapshot {
+function memoryTable(): TableSnapshot {
   const segment: MemorySegment = {
     kind: "memory",
     index: 0,
@@ -184,8 +183,8 @@ function memoryTable(options: TableReadOptions): TableSnapshot {
       },
     ],
     chunk(columnId) {
-      if (!options.columns.includes(columnId)) throw new RangeError("Column not declared");
-      return ints(SEGMENT.get(columnId) ?? []); // resident: borrowed, `out` unused
+      // Resident: a borrowed vector (valid until another chunk index is read), `out` unused.
+      return ints(SEGMENT.get(columnId) ?? []);
     },
   };
   return {
@@ -212,7 +211,7 @@ function readSnapshot(): Snapshot {
       read: () => Promise.reject(new Error("The stand-in has no groups")),
       peek: () => null,
     },
-    table: (_tableId, options) => memoryTable(options),
+    table: () => memoryTable(),
     index: (_table, indexId) => {
       const reader = indexes.get(indexId);
       if (reader === undefined) throw new Error("unknown index");
@@ -302,7 +301,7 @@ async function joinProbe(view: Snapshot, probeCustomers: readonly number[]): Pro
 // (not shown: the stand-in has none); memory chunks are borrowed, zero-copy vectors.
 
 async function sumIds(view: Snapshot, budget: Grant): Promise<number> {
-  const table = await settle(view.table(TABLE, { columns: [0], budget }));
+  const table = await settle(view.table(TABLE, { budget }));
   const out = { flat: allocateFlat(INT), codes: new Int32Array(MEMORY_CHUNK_ROWS), varlen: null };
   const live = allocateSelection(MEMORY_CHUNK_ROWS);
   let sum = 0;

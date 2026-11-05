@@ -199,15 +199,17 @@ and the owner import it directly.
   observed, and every sequence block it drew from, is durable (`durable(lsn)`).
 - **Sequences are not transactional.** Blocks (1 → 1,024 values, adaptive) are reserved by
   standalone sequence frames, so a value waits for one group flush, never for COMMIT. A crash skips
-  the rest of a block.
+  the rest of a block. A standalone `SELECT nextval(…)` is at-least-once: a retry draws new values.
 - **Scans are built on segments.** A snapshot lists each table's segments in locator order (groups,
   then memory), with sound page bounds (exact or null), deletion vectors for live rows, and
   dictionary codes kept. Groups are read through B1's verified cache with the format chunk readers.
-- **Retention is bounded.** Memtables kept only by pins are charged to the write path up to a cap
-  (two memtables). Past it, a slow reader's segments are copied into its own grant, or re-pointed
-  to the published group. Writers never wait on readers.
+- **Retention is bounded.** A reader borrows at most one chunk per memory segment. A frozen memtable
+  stays resident (capped, writers wait past the cap) only until its flush publishes; then its
+  readers are re-pointed to the published group under a pin taken during that publication, and
+  the memtable is freed. Writers never wait on readers.
 - **Large transactions commit through a staged root.** Rows past the memtable bounds are written as
-  staged groups, published under the transaction's id, and committed by a `publishedRows` frame.
+  staged groups with staged index runs, published under the transaction's id, and committed by a
+  `publishedRows` frame.
 - **Indexes resolve by tombstones.** Entries are `(key, rowId, put | tombstone)` in layers, newest
   first. A delete tombstones every index, so a lookup never reads a deletion bitmap
   (`resolveVersions`).
@@ -218,6 +220,8 @@ and the owner import it directly.
   and foreign keys are checked at `Statement.end()`; ON CONFLICT probes immediately.
 - **Statements are atomic.** After any error the only call is `rollback()`, which undoes the
   statement.
+- **`openWritePath` does the single log scan.** It scans, truncates and replays the log itself,
+  after the extent space opens and before the spill sweep.
 - **Storage goes through the extent space only.** No free map of its own; the log is reset only
   after the publish that covers it resolves; on an idle database with
   `waitingBytes > max(16 MiB, 5% of the data space)` it publishes one no-change root (ruling R10).

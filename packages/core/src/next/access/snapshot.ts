@@ -60,27 +60,36 @@
  * - **Live rows.** `Segment.deletions()` gives the view's deletion vector; `liveRows` turns a
  *   position range into a selection. Deletion bitmaps of groups are blobs read through the cache.
  *
- * ## Retention and copy-on-pressure (ruling R5)
- * A memtable a pin still reads after its rows were flushed and published is **retained** for that
- * pin. Retained memtables are charged to the write path (non-spillable) up to
- * `RETAINED_MEMTABLE_CAP_BYTES`. Past it, the write path releases the oldest retained memtable at
- * once, never waiting for its readers. First, each table snapshot reading it either:
- * 1. copies its declared columns (`TableReadOptions.columns`) of that segment into buffers
- *    allocated from its own `TableReadOptions.budget` (the query's spillable grant), synchronously;
- *    the segment stays a synchronous memory segment; or, if the budget refuses,
- * 2. re-points the segment to the published group holding the same rows at the same positions
- *    (the snapshot takes an extent-space pin of that generation, held until its release), so
- *    `chunk` decodes into the caller's `out` buffers through the page cache and may return a
- *    Promise.
- * Vectors handed out before the switch stay valid (memory is never reused, only uncharged): at
- * most one batch per column per reader. So slow readers never block writers and never pin
- * unbounded memory. Unflushed frozen memtables are flush debt, bounded by backpressure on writers.
+ * ## Memory segments: borrowing, retention, re-pointing (ruling R16.3)
+ * - **Borrow.** A table snapshot borrows at most one chunk index per memory segment: the vectors
+ *   `chunk()` returned for that chunk index (every column) stay valid until `chunk()` is called on
+ *   the same segment with another chunk index, or the snapshot is released. The write path keeps
+ *   their bytes and charges them to itself meanwhile (`WritePathStats.borrowedChunkBytes`).
+ * - **Retention until publication.** A frozen memtable stays resident, charged to the write path,
+ *   until its flush publishes; that is flush debt, bounded by `FROZEN_MEMTABLE_CAP_BYTES` with
+ *   backpressure on writers, never by readers.
+ * - **Re-point at publication.** When the flush's publish resolves, the write path, in the same
+ *   synchronous step and before anything else can publish or retire, takes one extent-space pin
+ *   on the publishing generation for the readers it re-points, and re-points every table snapshot
+ *   still reading that memtable to the published group holding the same rows at the same
+ *   positions. Then the memtable is freed (except each reader's one borrowed chunk, until its
+ *   borrow ends). A re-pointed segment keeps its index, `rowCount`, deletions and summaries;
+ *   its `chunk()` decodes into the caller's `out` through the page cache, leases charged to
+ *   `TableReadOptions.budget`, and may return a Promise. That pin is released when the last
+ *   re-pointed reader of that publication is released.
+ * So a slow reader never blocks a writer and never pins more than one chunk per memory segment.
  *
  * ## Pin lifetime and ownership
  * - The owner pins one snapshot per query (or read transaction / snapshot scope), passes it to
  *   the executor, and releases it after the execution settles, or when the client's Web Lock is
  *   released. `release` is idempotent and synchronous. A statement view belongs to its statement
  *   and is released by `Statement.end()` / `rollback()`, never by the executor.
+ * - **Release** (on close, on cancellation, on error alike: a cancelled execution settles, then
+ *   the owner releases) ends every borrow of every table snapshot taken from it, drops its
+ *   references to memtables, releases its extent-space pin and its share of any re-point pin, and
+ *   frees nothing a newer snapshot still uses. A `chunk()` or index call in flight at release
+ *   rejects with `SnapshotReleasedError` and releases its lease; vectors borrowed from it must not
+ *   be used after release (the executor's aborted pipeline never touches them again).
  * - After release every method throws `SnapshotReleasedError` (defined here; exec/fetch.ts uses
  *   it). Locators die with the pin.
  * - Memory: a pin costs O(1) owner heap; what it retains is the write path's, reported as debt
@@ -144,7 +153,7 @@ export interface Snapshot {
   /**
    * One table as this view sees it. Synchronous when its group directory is cached (always for a
    * warm point read); otherwise reads it once. Throws `UnknownTableError` for a table the catalog
-   * lacks. Each call returns a new table snapshot with its own declared columns and budget.
+   * lacks. Each call returns a new table snapshot (its own borrows and budget).
    */
   table(tableId: number, options: TableReadOptions): MaybePromise<TableSnapshot>;
   /** An index of `tableId` (the primary key, a unique or a secondary index), read in this view. */
@@ -154,9 +163,7 @@ export interface Snapshot {
 }
 
 export interface TableReadOptions {
-  /** Every catalog column id the query may read from this table (scans and fetches). */
-  readonly columns: readonly number[];
-  /** The query's spillable grant: pays for copy-on-pressure (see "Retention"). */
+  /** The query's grant: charged for the page leases of re-pointed memory segments' reads. */
   readonly budget: ByteBudget;
 }
 
@@ -194,7 +201,7 @@ interface SegmentBase {
    */
   deletions(): MaybePromise<DeletionVector | null>;
   /**
-   * Sound bounds of a declared column over the whole segment ("Scanning"), or null when unknown.
+   * Sound bounds of a column over the whole segment ("Scanning"), or null when unknown.
    * Groups: from the group root (`root()` must have resolved).
    */
   statistics(columnId: number): ColumnStatistics | null;
@@ -226,12 +233,11 @@ export interface GroupSegment extends SegmentBase {
 export interface MemorySegment extends SegmentBase {
   readonly kind: "memory";
   /**
-   * Chunk `chunk` (rows `chunk × MEMORY_CHUNK_ROWS …`, at most `rowCount`) of a declared column, in
-   * its exact physical type. While resident (the normal case, and after a copy-on-pressure copy)
-   * it returns a borrowed, immutable flat or dictionary vector synchronously and ignores `out`.
-   * After a re-point ("Retention") it decodes into `out` and may return a Promise; a varlen
-   * builder answering `full` or `denied` gives `{ partial: k }` (slots before k complete). A column
-   * not declared in `TableReadOptions.columns` is a `RangeError`.
+   * Chunk `chunk` (rows `chunk × MEMORY_CHUNK_ROWS …`, at most `rowCount`) of `columnId`, in its
+   * exact physical type. While resident it returns a borrowed, immutable flat or dictionary vector
+   * synchronously and ignores `out` (see "Borrow" for how long it stays valid). After a re-point
+   * it decodes into `out` and may return a Promise; a varlen builder answering `full` or `denied`
+   * gives `{ partial: k }` (slots before k complete).
    */
   chunk(columnId: number, chunk: number, out: ChunkOutput): MaybePromise<ChunkResult>;
 }
@@ -248,8 +254,8 @@ export type ChunkResult = Vector | { readonly partial: number };
 /** Memory segments store rows in chunks of this many rows (= `BATCH_ROWS`). */
 export const MEMORY_CHUNK_ROWS = 2048;
 
-/** Retained memtable bytes the write path carries for pins before copy-on-pressure (two memtables). */
-export const RETAINED_MEMTABLE_CAP_BYTES = 2 * 8 * 1024 * 1024;
+/** Frozen memtable bytes awaiting their flush's publication before writers wait (two memtables). */
+export const FROZEN_MEMTABLE_CAP_BYTES = 2 * 8 * 1024 * 1024;
 
 /** The deleted positions of one segment, as one view sees them. Immutable; synchronous. */
 export interface DeletionVector {

@@ -19,9 +19,10 @@
  *    version, the request) as log frames of at most `MAX_FRAME_BYTES` (1 MiB) each, multipart
  *    when bigger (format/log-frame.ts);
  * 2. a **large transaction** (pending rows past the memtable bounds, already written as staged
- *    groups: snapshot.ts "Segments") first publishes a root that stages those groups under the
- *    transaction's id, and its frame carries a `publishedRows` effect naming that root instead of
- *    the rows (format/replay.ts "Large transactions"); the frame is still the commit point;
+ *    groups with their index runs: snapshot.ts "Segments") first publishes a root that stages
+ *    those groups and runs under the transaction's id (`TableRoot.staged`), and its frame carries
+ *    a `publishedRows` effect naming that root and the indexes it built runs for, instead of the
+ *    rows (format/replay.ts "Large transactions"); the frame is still the commit point;
  * 3. appends the frames, makes the transaction's changes committed in memory (restamping its
  *    pending seqs to its LSN), and releases the writer slot. `commit` resolves here;
  * 4. the frames become durable with the next log flush: if none is running one starts at once;
@@ -33,8 +34,9 @@
  * outcome (format/ledger.ts `settle`); a retry runs again, which is correct for a no-op.
  *
  * ## Ledger (ruling R9)
- * The owner admits every request (`ledger.admit`), records failures, and settles no-effect
- * requests. The write path records **committed** outcomes (`ledger.record`, with the frame's LSN
+ * The owner admits every request (`ledger.admit`), records failures and the session-scoped
+ * `statement` outcomes of statements inside an open transaction, and settles requests that changed
+ * nothing. Standalone queries, `SELECT nextval(…)` included, are at-least-once (ruling R16.2). The write path records **committed** outcomes (`ledger.record`, with the frame's LSN
  * and counts): under strict durability when `receipt.durable` resolves, under relaxed when
  * `commit` resolves. Replay re-records the outcomes of frames past the root's `globalLsn`.
  *
@@ -87,28 +89,33 @@
  * becomes reusable. The space never publishes on its own. Then it is quiet again: no timers until
  * the next commit (zero wakeups when idle).
  *
- * ## Memory (ruling R5)
+ * ## Memory (rulings R5, R16.3)
  * - Memtables, index deltas, the resident fences and Bloom filters of index runs, and scratch are
  *   one write-path grant (memory/governor.ts). It is spillable in the governor's sense: its
  *   reclaim callback flushes memtables.
- * - Memtables retained only by pins are charged to the write path, non-spillable, up to
- *   `RETAINED_MEMTABLE_CAP_BYTES`; past it, copy-on-pressure moves the cost to the slow readers'
- *   own grants (snapshot.ts "Retention"). No pin holds unbounded memory and none blocks a writer.
+ * - Frozen memtables awaiting their flush's publication are charged to the write path,
+ *   non-spillable, up to `FROZEN_MEMTABLE_CAP_BYTES` (writers wait past it). Once the flush
+ *   publishes, readers still on that memtable are re-pointed to the published group and the
+ *   memtable is freed; each reader keeps at most one borrowed chunk per memory segment, charged to
+ *   the write path until the borrow ends (snapshot.ts, ruling R16.3). No pin holds unbounded memory
+ *   and none blocks a writer.
  * - Durable bytes are read through B1's verified cache only (`Space`), with leases bounded per
  *   call. Target: ≤ 4 B of resident heap per keyed row (fences + Bloom ≈ 1.4 B/row; the rest is
  *   bounded by the memtable thresholds, ~64k rows or ~8 MB per table).
  *
- * ## Startup order (ruling R7; storage/contract.ts "Startup order")
- * 1. acquire the fence (storage/fence.ts); 2. open the store session; 3. recover the log: the
- * owner scans it (format/log-frame.ts `scanLogIncremental` under its admitted
- * `RECOVERY_SCAN_BYTES`, validating against the durable root) and truncates it to `validEnd`;
- * 4. open B1's extent space (it walks the two roots it keeps, current and previous, and builds
- * the free map: the write path keeps no free-space map of its own); 5. `openWritePath`
- * replays the log into memtables, catalog, sequences and the ledger (format/replay.ts rules, one
- * frame plus the memtables it rebuilds in memory, flushing through the space when they fill), drops
- * staging no frame claimed (retired at its first publish), and admits its grant; 6. ready.
+ * ## Startup order (rulings R13, R16.6; storage/contract.ts and format/manifest.ts)
+ * 1. acquire the fence (storage/fence.ts); 2. open the store session; 3. open B1's extent space
+ * (it walks the two roots it keeps, current and previous, and builds the free map: the write path
+ * keeps no free-space map of its own); 4. `openWritePath` performs the **single** log scan
+ * (format/log-frame.ts `scanLogIncremental`, under its admitted `RECOVERY_SCAN_BYTES`, validated
+ * against the durable root), truncates the log to `validEnd`, and replays the same scan into
+ * memtables, catalog, sequences and the ledger (format/replay.ts rules, `publishedRows` staging
+ * included: one frame plus the memtables it rebuilds in memory, flushing through the space when
+ * they fill); it drops staging no frame claimed (rows and index runs together, retired at its first
+ * publish) and admits its grant; 5. the owner sweeps the spill space (`SpillService.sweep`);
+ * 6. ready.
  */
-import type { CommitFrameBody, LogScanSummary } from "../format/log-frame.js";
+import type { CommitFrameBody } from "../format/log-frame.js";
 import type { RequestLedger } from "../format/ledger.js";
 import type { MemoryGovernor } from "../memory/governor.js";
 import type { StoreSession } from "../storage/contract.js";
@@ -214,6 +221,10 @@ export interface CommitReceipt {
  * doubles the next, up to 1,024; a sequence idle for a second shrinks back. A crash skips the unused
  * rest of the newest block. currval / lastval are the owner's session state, passed to the
  * executor per session.
+ *
+ * A standalone `SELECT nextval(…)` is **at-least-once** (ruling R16.2): no outcome is recorded, so
+ * a retry after a lost reply runs again and draws new values; the lost ones are a gap, which
+ * PostgreSQL allows. Only commits are exactly-once.
  */
 export interface SequenceAccess {
   /**
@@ -235,11 +246,13 @@ export interface WritePathStats {
   readonly logBytes: number;
   readonly memtableBytes: number;
   readonly frozenMemtables: number;
-  /** Bytes of memtables kept only by pins (≤ `RETAINED_MEMTABLE_CAP_BYTES`). */
-  readonly retainedMemtableBytes: number;
-  /** Copy-on-pressure events: copies into readers' grants, and re-points to published groups. */
-  readonly pressureCopies: number;
-  readonly pressureRepoints: number;
+  /** Bytes of frozen memtables awaiting publication (≤ `FROZEN_MEMTABLE_CAP_BYTES`). */
+  readonly frozenMemtableBytes: number;
+  /** Bytes of chunks readers still borrow from freed memtables (one per memory segment each). */
+  readonly borrowedChunkBytes: number;
+  /** Readers currently re-pointed to published groups, and the re-point pins held for them. */
+  readonly repointedReaders: number;
+  readonly repointPins: number;
   readonly levelZeroRuns: number;
   readonly garbageBytes: number;
   readonly pins: number;
@@ -256,20 +269,19 @@ export interface WritePathOptions {
 }
 
 export interface OpenWritePathInput {
-  /** The session the owner opened under its fence (step 2). */
+  /** The session the owner opened under its fence (step 2): the log is read and cut through it. */
   readonly session: StoreSession;
-  /** B1's extent space over that session (step 4): every data-space read, write and publish. */
+  /** B1's extent space over that session (step 3): every data-space read, write and publish. */
   readonly space: Space;
   readonly governor: MemoryGovernor;
-  /** Step 3's result: the log is valid and truncated to `validEnd`. */
-  readonly log: LogScanSummary;
   readonly options: WritePathOptions;
 }
 
 /**
- * Step 5 of "Startup order". Throws `LogCorruptionError` / `StoreCorruptionError` rather than open
- * a damaged database (replay rule violations included), and a typed refusal for a pre-reset
- * layout. Recovery memory is admitted from `governor` before anything is read.
+ * Step 4 of "Startup order": scan, truncate and replay the log, then serve. Throws
+ * `LogCorruptionError` / `StoreCorruptionError` rather than open a damaged database (replay rule
+ * violations included), and a typed refusal for a pre-reset layout. Recovery memory is admitted
+ * from `governor` before anything is read.
  */
 export type OpenWritePath = (input: OpenWritePathInput) => Promise<WritePath>;
 

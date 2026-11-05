@@ -58,12 +58,13 @@
  * ## Memory and async
  * The statement's writes live in the table's memtable as pending rows (snapshot.ts), charged to
  * the write path's grant. When a transaction's pending rows pass the memtable bounds, the write
- * path writes them as **staged groups** through the extent space (readable by the transaction's
- * later statements as group segments with `staged: true`; committed through `publishedRows`,
- * write-path.ts "Commit"), so a bulk load is never resident whole. Calls return a Promise only
- * when they must wait: reading index blocks for checks, writing staged groups, or backpressure.
- * One call at a time per statement; callers check their cancellation signal between calls and
- * `rollback()` on abort (which also aborts the statement's staged writers).
+ * path writes them as **staged groups**, with staged runs for every index, through the extent
+ * space (readable by the transaction's later statements as group segments with `staged: true`;
+ * committed through `publishedRows`, write-path.ts "Commit"), so a bulk load is never resident
+ * whole. Calls return a Promise only when they must wait: reading index blocks for checks,
+ * writing staged groups, or backpressure. One call at a time per statement; callers check their
+ * cancellation signal between calls and `rollback()` on abort (which also aborts the statement's
+ * staged writers).
  */
 import type { Batch, Selection } from "../vector/vector.js";
 import type { CatalogChange, CatalogView } from "./catalog.js";
