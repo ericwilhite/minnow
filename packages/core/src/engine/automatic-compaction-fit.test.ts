@@ -83,20 +83,29 @@ function isActive(job: CompactionJobRecord): boolean {
  * Waits for automatic compaction to go quiet on a table: no fold in flight and the visible
  * layout unchanged for a second. Fails after two minutes with the layout it last saw.
  */
+/**
+ * Waits until compaction is idle and the visible layout has not changed for 20 polls (1 s).
+ * `foldedTo` is for a test whose law is that automatic compaction *eventually* folds the table
+ * to that many segments: a quiet second alone cannot tell "finished" from "between passes" on a
+ * slow, instrumented runner (CI saw 21 segments after one quiet second), so quiet polls count
+ * only once the layout is that small. A compaction that never gets there still fails, at the
+ * same 2,400-poll bound.
+ */
 async function settled(
   database: MinnowDatabase,
   store: MemoryBlockStore,
   table = "t",
+  foldedTo?: number,
 ): Promise<SegmentRecord[]> {
   let previous = "";
   let quiet = 0;
   for (let attempt = 0; attempt < 2_400 && quiet < 20; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 50));
     const active = (await database.listCompactionJobs(table)).some(isActive);
-    const layout = JSON.stringify(
-      (await allVisibleSegments(database, table)).map((segment) => segment.id),
-    );
-    quiet = !active && layout === previous ? quiet + 1 : 0;
+    const visible = await allVisibleSegments(database, table);
+    const layout = JSON.stringify(visible.map((segment) => segment.id));
+    const folded = foldedTo === undefined || visible.length <= foldedTo;
+    quiet = !active && folded && layout === previous ? quiet + 1 : 0;
     previous = layout;
   }
   expect(quiet, `Compaction did not settle: ${previous}`).toBe(20);
@@ -123,7 +132,7 @@ describe("automatic compaction fits its folds to memory", () => {
     for (let refresh = 1; refresh <= 36; refresh += 1) {
       await database.upsertBatch("t", wideRows(7_000, refresh));
     }
-    const segments = await settled(database, store);
+    const segments = await settled(database, store, "t", 2);
     expect(errors).toEqual([]);
     expect(segments.length).toBeLessThanOrEqual(2);
     expect(segments.reduce((total, segment) => total + segment.rowCount, 0)).toBeLessThanOrEqual(
