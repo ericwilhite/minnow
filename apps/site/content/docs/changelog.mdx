@@ -8,9 +8,9 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
-## 0.19.2 — Unreleased
+## 0.19.2 — November 5, 2026
 
-Release packages: `@minnowdb/core@0.19.2` (not yet published).
+Release packages: `@minnowdb/core@0.19.2`.
 
 - **An OPFS database no longer becomes unopenable after a session of stopped spilling
   queries.** Opening it failed with `StorageCorruptionError` ("Temp page has no owner"), even
@@ -36,7 +36,8 @@ Release packages: `@minnowdb/core@0.19.2` (not yet published).
 
 IndexedDB was not affected: its store does not remove expired spill records when a query starts.
 `checkIntegrity()` on OPFS now also reports a spill page that has no record
-(`temp-page-ownerless`). The engine with OPFS measures 441.7 KiB gzipped (0.19.1: 441.4 KiB).
+(`temp-page-ownerless`). The engine with OPFS measures 441.7 KiB gzipped (previously 441.4 KiB).
+The generic worker plus its client measures 551.9 KiB gzipped (previously 551.7 KiB).
 
 No stored format changes: IndexedDB schema 8 and OPFS layout 13 are unchanged. 0.19.1 opens
 every database this release writes, including one this release has already repaired. No data
