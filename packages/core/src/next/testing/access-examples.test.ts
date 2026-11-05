@@ -147,9 +147,12 @@ const catalog: CatalogView = {
   tables: [],
   sequences: [],
   views: [],
+  types: [],
   table: () => undefined,
   tableByName: () => undefined,
   sequence: () => undefined,
+  type: () => undefined,
+  typeByName: () => undefined,
 };
 
 /** Deleted positions of the stand-in segment: row 1 (id 2) was deleted. */

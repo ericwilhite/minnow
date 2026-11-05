@@ -1,0 +1,862 @@
+/**
+ * Snapshots and their readers (access/snapshot.ts, access/key-index.ts) over a captured
+ * `WriteState`: segments in locator order, deletion vectors, memory chunks (zero copy, or decoded
+ * from the published group after a re-point), and index probes and ranges that resolve put and
+ * tombstone entries across memtable deltas and durable runs under the view's bound.
+ */
+import type { CatalogView, ColumnDef, IndexDef, TableDef } from "../access/catalog.js";
+import {
+  inKeyRange,
+  type IndexCursor,
+  type IndexReader,
+  type KeyRange,
+  type MaybePromise,
+  type ProbeOutput,
+  type ProbeResult,
+  type ProbeResume,
+} from "../access/key-index.js";
+import {
+  SnapshotReleasedError,
+  UnknownTableError,
+  type ChunkOutput,
+  type ChunkResult,
+  type DeletionVector,
+  type GroupSegment,
+  type MemorySegment,
+  type PageSummary,
+  type Segment,
+  type Snapshot,
+  type TableReadOptions,
+  type TableSnapshot,
+} from "../access/snapshot.js";
+import type { ByteBudget, SpacePin } from "../access/space.js";
+import type {
+  ColumnChunk as StoredChunk,
+  GroupRef,
+  GroupRoot,
+  RunRef,
+} from "../format/manifest.js";
+import type { KeyBatch } from "../keys/key-encoding.js";
+import { ChunkReader } from "../page/reader.js";
+import type { ColumnStatistics } from "../types.js";
+import { packLocator } from "../vector/locator.js";
+import { allocateData } from "../vector/vector.js";
+import type { FlatVector, Selection } from "../vector/vector.js";
+import { compareBytes } from "../vector/varlen.js";
+import { MEMORY_CHUNK_ROWS } from "./columns.js";
+import type { Memtable } from "./memtable.js";
+import type { RunEntry } from "./runs.js";
+import { groupDeletions, type Shared, type TableView, type WriteState } from "./state.js";
+import { need } from "./bytes.js";
+
+const settle = <T, R>(
+  value: MaybePromise<T>,
+  then: (value: T) => MaybePromise<R>,
+): MaybePromise<R> => (value instanceof Promise ? value.then(then) : then(value));
+
+// ── Deletion vectors ───────────────────────────────────────────────────────────────────────────
+
+export class BitDeletions implements DeletionVector {
+  readonly deletedCount: number;
+  constructor(
+    readonly bits: Uint32Array,
+    count: number,
+  ) {
+    this.deletedCount = count;
+  }
+
+  isDeleted(position: number): boolean {
+    return ((this.bits[position >>> 5] ?? 0) & (1 << (position & 31))) !== 0;
+  }
+
+  liveRows(from: number, length: number, input: Selection | null, out: Selection): void {
+    let count = 0;
+    const total = input === null ? length : input.count;
+    for (let k = 0; k < total; k++) {
+      const row = input === null ? k : (input.rows[k] ?? 0);
+      if (!this.isDeleted(from + row)) out.rows[count++] = row;
+    }
+    out.count = count;
+  }
+}
+
+function deletionVector(
+  rows: number,
+  base: Uint32Array | null,
+  positions: readonly number[],
+): BitDeletions | null {
+  if (base === null && positions.length === 0) return null;
+  const bits = new Uint32Array(Math.ceil(rows / 32));
+  if (base !== null) bits.set(base.subarray(0, bits.length));
+  for (const position of positions)
+    if (position < rows)
+      bits[position >>> 5] = (bits[position >>> 5] ?? 0) | (1 << (position & 31));
+  let count = 0;
+  for (let position = 0; position < rows; position++)
+    if (((bits[position >>> 5] ?? 0) & (1 << (position & 31))) !== 0) count += 1;
+  return count === 0 ? null : new BitDeletions(bits, count);
+}
+
+// ── Segments ───────────────────────────────────────────────────────────────────────────────────
+
+function missingStatistics(column: ColumnDef | undefined, rows: number): ColumnStatistics {
+  void column;
+  return { nullCount: rows, min: null, max: null, dictionarySize: null };
+}
+
+class GroupSegmentImpl implements GroupSegment {
+  readonly kind = "group" as const;
+  readonly staged = false;
+  readonly rowCount: number;
+  #root: GroupRoot | null = null;
+  #deleted: number | null = null;
+
+  constructor(
+    readonly index: number,
+    readonly group: GroupRef,
+    readonly view: TableSnapshotImpl,
+  ) {
+    this.rowCount = group.rowCount;
+  }
+
+  get liveRowCount(): number {
+    if (this.#deleted === null) {
+      const delta = groupDeletions(
+        this.view.tableView,
+        this.group.groupId,
+        this.view.snapshot.bound,
+      );
+      // The durable bitmap is in `group.liveRowCount`; delta positions are not in it.
+      this.#deleted = this.group.rowCount - this.group.liveRowCount + delta.length;
+    }
+    return this.group.rowCount - this.#deleted;
+  }
+
+  deletions(): MaybePromise<DeletionVector | null> {
+    this.view.snapshot.check();
+    const delta = groupDeletions(this.view.tableView, this.group.groupId, this.view.snapshot.bound);
+    const ref = this.group.deletions;
+    if (ref === null) return deletionVector(this.rowCount, null, delta);
+    return settle(this.view.snapshot.shared.bitmap(ref), (bits) =>
+      deletionVector(this.rowCount, bits, delta),
+    );
+  }
+
+  root(): MaybePromise<GroupRoot> {
+    this.view.snapshot.check();
+    if (this.#root !== null) return this.#root;
+    return settle(this.view.snapshot.shared.groupRoot(this.group.root), (root) => {
+      this.#root = root;
+      return root;
+    });
+  }
+
+  #requireRoot(): GroupRoot {
+    if (this.#root === null) throw new TypeError("Call root() before reading a group's chunks");
+    return this.#root;
+  }
+
+  chunk(columnId: number): StoredChunk | null {
+    return this.#requireRoot().columns.find((chunk) => chunk.columnId === columnId) ?? null;
+  }
+
+  statistics(columnId: number): ColumnStatistics | null {
+    const chunk = this.chunk(columnId);
+    if (chunk === null) return missingStatistics(this.view.column(columnId), this.rowCount);
+    return chunk.statistics;
+  }
+
+  pages(columnId: number): MaybePromise<readonly PageSummary[]> {
+    return settle(this.root(), () => {
+      const chunk = this.chunk(columnId);
+      if (chunk === null)
+        return [
+          { firstRow: 0, rowCount: this.rowCount, ...missingStatistics(undefined, this.rowCount) },
+        ];
+      return settle(
+        ChunkReader.open(this.view.snapshot.shared.space, chunk, { budget: this.view.budget }),
+        (reader) => {
+          const pages = reader.directory.pages.map((entry) => ({
+            firstRow: entry.firstRow,
+            rowCount: entry.rowCount,
+            nullCount: entry.nullCount,
+            min: entry.min,
+            max: entry.max,
+            dictionarySize: null,
+          }));
+          reader.close();
+          return pages;
+        },
+      );
+    });
+  }
+}
+
+class MemorySegmentImpl implements MemorySegment {
+  readonly kind = "memory" as const;
+  readonly rowCount: number;
+  /** The chunk index the reader currently borrows (−1: none). */
+  borrowed = -1;
+
+  constructor(
+    readonly index: number,
+    readonly memtable: Memtable,
+    readonly view: TableSnapshotImpl,
+  ) {
+    this.rowCount = memtable.visibleRows(view.snapshot.bound);
+  }
+
+  get liveRowCount(): number {
+    return (
+      this.rowCount - this.memtable.deletedUnder(this.view.snapshot.bound, this.rowCount).length
+    );
+  }
+
+  deletions(): DeletionVector | null {
+    this.view.snapshot.check();
+    return deletionVector(
+      this.rowCount,
+      null,
+      this.memtable.deletedUnder(this.view.snapshot.bound, this.rowCount),
+    );
+  }
+
+  statistics(): ColumnStatistics | null {
+    return null;
+  }
+
+  pages(columnId: number): readonly PageSummary[] {
+    const c = this.view.columnIndex(columnId);
+    const out: PageSummary[] = [];
+    for (let first = 0; first < this.rowCount; first += MEMORY_CHUNK_ROWS) {
+      const rows = Math.min(MEMORY_CHUNK_ROWS, this.rowCount - first);
+      const published = this.memtable.published;
+      let nullCount = 0;
+      if (published === null) {
+        const chunk = this.memtable.chunks[c]?.[first / MEMORY_CHUNK_ROWS];
+        const validity = chunk?.validity ?? null;
+        if (validity !== null)
+          for (let slot = 0; slot < rows; slot++)
+            if (((validity[slot >>> 5] ?? 0) & (1 << (slot & 31))) === 0) nullCount += 1;
+      } else nullCount = -1;
+      out.push({
+        firstRow: first,
+        rowCount: rows,
+        // After a re-point the per-chunk null count is unknown here: report the whole range as
+        // possibly null (sound: it never prunes a chunk that has values).
+        nullCount: nullCount < 0 ? 0 : nullCount,
+        min: null,
+        max: null,
+        dictionarySize: null,
+      });
+    }
+    return out;
+  }
+
+  chunk(
+    columnId: number,
+    chunk: number,
+    out: ChunkOutput,
+    startRow = 0,
+  ): MaybePromise<ChunkResult> {
+    this.view.snapshot.check();
+    const first = chunk * MEMORY_CHUNK_ROWS;
+    const length = Math.min(MEMORY_CHUNK_ROWS, this.rowCount - first);
+    if (!(length > 0)) throw new RangeError(`Chunk ${String(chunk)} is outside the segment`);
+    if (!(Number.isInteger(startRow) && startRow >= 0 && startRow < length))
+      throw new RangeError("startRow is outside the chunk");
+    this.borrowed = chunk;
+    const published = this.memtable.published;
+    if (published === null) {
+      const c = this.view.columnIndex(columnId);
+      const stored = this.memtable.chunks[c]?.[chunk];
+      if (stored === undefined) throw new RangeError("A memtable chunk is missing");
+      return {
+        vector: stored.view(length),
+        firstRow: 0,
+        rowCount: length,
+        complete: true,
+        reason: null,
+      };
+    }
+    return this.#decodePublished(published.groupRoot, columnId, first, startRow, length, out);
+  }
+
+  #decodePublished(
+    root: GroupRoot,
+    columnId: number,
+    first: number,
+    startRow: number,
+    length: number,
+    out: ChunkOutput,
+  ): MaybePromise<ChunkResult> {
+    const stored = root.columns.find((candidate) => candidate.columnId === columnId);
+    if (stored === undefined)
+      throw new RangeError(`The published group lacks column ${String(columnId)}`);
+    const shared = this.view.snapshot.shared;
+    const from = first + startRow;
+    const to = first + length;
+    return settle(
+      ChunkReader.open(shared.space, stored, { budget: this.view.budget }),
+      (reader) => {
+        const [firstPage, endPage] = reader.pagesInRange(from, to);
+        const pages = Array.from({ length: endPage - firstPage }, (_, k) => firstPage + k);
+        return settle(reader.load(pages), () => {
+          try {
+            return decodeInto(reader, stored, from, to, startRow, out);
+          } finally {
+            reader.close();
+          }
+        });
+      },
+    );
+  }
+}
+
+/** Decodes rows `[from, to)` of a published chunk into `out`, honouring varlen batch limits. */
+function decodeInto(
+  reader: ChunkReader,
+  stored: StoredChunk,
+  from: number,
+  to: number,
+  startRow: number,
+  out: ChunkOutput,
+): ChunkResult {
+  const count = to - from;
+  const varlenBytes =
+    stored.type.kind === "text" ||
+    stored.type.kind === "bytes" ||
+    stored.type.kind === "json" ||
+    stored.type.kind === "enum" ||
+    stored.type.kind === "array"
+      ? reader.varlenBytes(from, to)
+      : 0;
+  const temp: FlatVector = {
+    form: "flat",
+    type: stored.type,
+    length: 0,
+    validity: stored.statistics.nullCount === 0 ? null : new Uint32Array(Math.ceil(count / 32)),
+    data: allocateData(stored.type, count, varlenBytes),
+  };
+  reader.decodeRange(from, to, temp, 0);
+  temp.length = count;
+  const target = out.flat;
+  if (temp.data.layout !== "varlen" || out.varlen === null) {
+    copyFlat(temp, target, count);
+    return { vector: target, firstRow: startRow, rowCount: count, complete: true, reason: null };
+  }
+  const builder = out.varlen;
+  const data = temp.data;
+  let filled = 0;
+  let reason: "full" | "denied" | null = null;
+  for (; filled < count; filled++) {
+    const valid =
+      temp.validity === null || ((temp.validity[filled >>> 5] ?? 0) & (1 << (filled & 31))) !== 0;
+    const result = valid
+      ? builder.appendBytes(data.bytes, data.offsets[filled] ?? 0, data.offsets[filled + 1] ?? 0)
+      : builder.appendEmpty();
+    if (result !== "ok") {
+      reason = result;
+      break;
+    }
+  }
+  const validity =
+    temp.validity === null ? null : temp.validity.slice(0, Math.ceil(filled / 32) + 1);
+  const vector: FlatVector = {
+    form: "flat",
+    type: stored.type,
+    length: filled,
+    validity,
+    data: builder.data(),
+  };
+  return { vector, firstRow: startRow, rowCount: filled, complete: reason === null, reason };
+}
+
+function copyFlat(source: FlatVector, target: FlatVector, count: number): void {
+  const s = source.data;
+  const t = target.data;
+  if (s.layout !== t.layout) throw new TypeError("Output layout differs from the column's");
+  switch (s.layout) {
+    case "bool":
+    case "i32":
+    case "f64":
+    case "f32":
+      (t as typeof s).values.set(s.values.subarray(0, count));
+      break;
+    case "int64": {
+      const tv = (t as typeof s).values;
+      if (tv.repr !== s.values.repr) throw new TypeError("Output int64 representation differs");
+      (tv.values as Float64Array).set(s.values.values.subarray(0, count) as Float64Array);
+      break;
+    }
+    default:
+      // Decimal, fixed16, interval and varlen without a builder: hand back the decoded vector.
+      Object.assign(target, { data: s, validity: source.validity, length: count });
+      return;
+  }
+  target.validity = source.validity;
+  target.length = count;
+}
+
+// ── Table snapshots ────────────────────────────────────────────────────────────────────────────
+
+/** First row id of every segment of a table view (groups, then memtables), computed once. */
+const firstRowIdsOf = new WeakMap<TableView, Float64Array>();
+
+function firstRowIds(view: TableView): Float64Array {
+  let firsts = firstRowIdsOf.get(view);
+  if (firsts === undefined) {
+    firsts = new Float64Array(view.groups.length + view.memtables.length);
+    view.groups.forEach((group, k) => {
+      need(firsts)[k] = group.firstRowId;
+    });
+    view.memtables.forEach((memtable, k) => {
+      need(firsts)[view.groups.length + k] = memtable.firstRowId;
+    });
+    firstRowIdsOf.set(view, firsts);
+  }
+  return firsts;
+}
+
+export class TableSnapshotImpl implements TableSnapshot {
+  readonly tableId: number;
+  readonly schemaVersion: number;
+  readonly columns: readonly ColumnDef[];
+  #segments: readonly Segment[] | null = null;
+  readonly #columnIndex: ReadonlyMap<number, number>;
+  readonly firstRowIds: Float64Array;
+
+  constructor(
+    readonly snapshot: SnapshotImpl,
+    readonly def: TableDef,
+    readonly tableView: TableView,
+    readonly budget: ByteBudget,
+  ) {
+    this.tableId = def.id;
+    this.schemaVersion = def.schemaVersion;
+    this.columns = def.columns;
+    this.#columnIndex = new Map(def.columns.map((column, c) => [column.id, c]));
+    this.firstRowIds = firstRowIds(tableView);
+  }
+
+  /** Built on first use (point reads and inserts never need them). */
+  get segments(): readonly Segment[] {
+    if (this.#segments === null) {
+      const segments: Segment[] = [];
+      for (const group of this.tableView.groups)
+        segments.push(new GroupSegmentImpl(segments.length, group, this));
+      for (const memtable of this.tableView.memtables)
+        segments.push(new MemorySegmentImpl(segments.length, memtable, this));
+      this.#segments = segments;
+    }
+    return this.#segments;
+  }
+
+  get liveRowCount(): number {
+    let total = 0;
+    for (const segment of this.segments) total += segment.liveRowCount;
+    return total;
+  }
+
+  column(columnId: number): ColumnDef | undefined {
+    const index = this.#columnIndex.get(columnId);
+    return index === undefined ? undefined : this.columns[index];
+  }
+
+  columnIndex(columnId: number): number {
+    const index = this.#columnIndex.get(columnId);
+    if (index === undefined)
+      throw new RangeError(`Table ${String(this.tableId)} has no column ${String(columnId)}`);
+    return index;
+  }
+
+  /** The locator of `rowId` in this view. */
+  locator(rowId: number): number {
+    const firsts = this.firstRowIds;
+    let lo = 0;
+    let hi = firsts.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if ((firsts[mid] ?? 0) <= rowId) lo = mid + 1;
+      else hi = mid;
+    }
+    const segment = lo - 1;
+    if (segment < 0) throw new RangeError(`Row ${String(rowId)} is not in this view`);
+    return packLocator(segment, rowId - (firsts[segment] ?? 0));
+  }
+
+  /** The row id a locator names. */
+  rowId(locator: number): number {
+    const segment = Math.floor(locator / 65_536);
+    const first = this.firstRowIds[segment];
+    if (first === undefined) throw new RangeError("A locator names no segment of this view");
+    return first + (locator % 65_536);
+  }
+}
+
+// ── Snapshots ──────────────────────────────────────────────────────────────────────────────────
+
+export interface SnapshotParts {
+  readonly state: WriteState;
+  readonly bound: number;
+  readonly observedLsn: number;
+  readonly catalog: CatalogView & { table(tableId: number): TableDef | undefined };
+  readonly shared: Shared;
+  readonly label: string;
+  /** Statement views are released by their statement only. */
+  readonly statementView: boolean;
+}
+
+export class SnapshotImpl implements Snapshot {
+  readonly rootSequence: number;
+  readonly bound: number;
+  readonly observedLsn: number;
+  readonly catalog: CatalogView;
+  readonly shared: Shared;
+  readonly state: WriteState;
+  readonly pages: Shared["space"];
+  readonly #pin: SpacePin;
+  readonly #reader: number;
+  readonly #statementView: boolean;
+  #released = false;
+  readonly #indexes = new Map<string, ViewIndex>();
+  readonly #tables = new Map<number, TableSnapshotImpl>();
+
+  constructor(parts: SnapshotParts) {
+    this.state = parts.state;
+    this.rootSequence = parts.state.root.sequence;
+    this.bound = parts.bound;
+    this.observedLsn = parts.observedLsn;
+    this.catalog = parts.catalog;
+    this.shared = parts.shared;
+    this.pages = parts.shared.space;
+    this.#pin = parts.shared.pinState(parts.state, parts.label);
+    this.#reader = parts.shared.readers.open();
+    this.#statementView = parts.statementView;
+  }
+
+  get released(): boolean {
+    return this.#released;
+  }
+
+  check(): void {
+    if (this.#released) throw new SnapshotReleasedError();
+  }
+
+  #def(tableId: number): { def: TableDef; view: TableView } {
+    this.check();
+    const def = this.catalog.table(tableId);
+    const view = this.state.tables.get(tableId);
+    if (def === undefined || view === undefined) throw new UnknownTableError(tableId);
+    return { def, view };
+  }
+
+  table(tableId: number, options: TableReadOptions): TableSnapshotImpl {
+    const { def, view } = this.#def(tableId);
+    return new TableSnapshotImpl(this, def, view, options.budget);
+  }
+
+  /** The write path's own table view (constraint checks, index probes): one per table. */
+  internalTable(tableId: number): TableSnapshotImpl {
+    let table = this.#tables.get(tableId);
+    if (table === undefined) {
+      const { def, view } = this.#def(tableId);
+      table = new TableSnapshotImpl(this, def, view, this.shared.budget);
+      this.#tables.set(tableId, table);
+    }
+    return table;
+  }
+
+  index(tableId: number, indexId: number): ViewIndex {
+    const key = `${String(tableId)}:${String(indexId)}`;
+    let reader = this.#indexes.get(key);
+    if (reader === undefined) {
+      const table = this.internalTable(tableId);
+      const def = table.def.indexes.find((index) => index.id === indexId);
+      if (def === undefined)
+        throw new RangeError(`Table ${String(tableId)} has no index ${String(indexId)}`);
+      reader = new ViewIndex(def, table);
+      this.#indexes.set(key, reader);
+    }
+    return reader;
+  }
+
+  release(): void {
+    if (this.#statementView) throw new TypeError("A statement view is released by its statement");
+    this.releaseInternal();
+  }
+
+  releaseInternal(): void {
+    if (this.#released) return;
+    this.#released = true;
+    this.#pin.release();
+    this.shared.readers.close(this.#reader);
+  }
+}
+
+// ── Index reading ──────────────────────────────────────────────────────────────────────────────
+
+interface Resume extends ProbeResume {
+  /** Matches of `key` already written. */
+  readonly skip: number;
+}
+
+/** Resolution of one key across the view's layers. */
+export class ViewIndex implements IndexReader {
+  readonly #dead = new Set<number>();
+  readonly #layer: RunEntry[] = [];
+
+  constructor(
+    readonly def: IndexDef,
+    readonly table: TableSnapshotImpl,
+  ) {}
+
+  /**
+   * Live row ids of `key` under the view's bound, ascending (unique: at most one). Layers are
+   * visited newest first: memtable deltas (or, once a memtable is published, its runs), then the
+   * table's durable runs. Synchronous when every run block it needs is cached; otherwise the
+   * Promise continues from the layer that had to read.
+   */
+  resolve(key: Uint8Array, out: number[]): MaybePromise<void> {
+    out.length = 0;
+    this.#dead.clear();
+    return this.#resolveFrom(key, out, 0);
+  }
+
+  /**
+   * Runs `resolve` may skip for keys within `[low, high]` (byte order): runs whose key range does
+   * not overlap it. A batch of new keys checks every run's range once instead of once per key.
+   */
+  skipRunsOutside(low: Uint8Array | null, high: Uint8Array | null): void {
+    this.#skip = null;
+    if (low === null || high === null) return;
+    const skip = new Set<RunRef>();
+    const outside = (run: RunRef) =>
+      compareBytes(run.maxKey, 0, run.maxKey.length, low, 0, low.length) < 0 ||
+      compareBytes(run.minKey, 0, run.minKey.length, high, 0, high.length) > 0;
+    for (const run of this.table.tableView.runs.get(this.def.id) ?? [])
+      if (outside(run)) skip.add(run);
+    for (const memtable of this.table.tableView.memtables) {
+      const run = memtable.published?.runs.get(this.def.id);
+      if (run !== undefined && outside(run)) skip.add(run);
+    }
+    this.#skip = skip;
+  }
+
+  #skip: Set<RunRef> | null = null;
+
+  #resolveFrom(key: Uint8Array, out: number[], from: number): MaybePromise<void> {
+    const bound = this.table.snapshot.bound;
+    const unique = this.def.unique;
+    const memtables = this.table.tableView.memtables;
+    const runs = this.table.tableView.runs.get(this.def.id) ?? [];
+    const layers = memtables.length + runs.length;
+    for (let layer = from; layer < layers; layer++) {
+      let run: RunRef | undefined;
+      if (layer < memtables.length) {
+        const memtable = need(memtables[memtables.length - 1 - layer]);
+        const published = memtable.published;
+        if (published === null) {
+          if (this.#deltaLayer(memtable, key, out, bound) && unique) return;
+          continue;
+        }
+        run = published.runs.get(this.def.id);
+        if (run === undefined) continue;
+      } else run = runs[layer - memtables.length];
+      if (run === undefined || this.#skip?.has(run) === true) continue;
+      const pending = this.#runLayer(run, key, out, layer);
+      if (pending !== null) return pending;
+      if (unique && out.length > 0) return;
+    }
+    if (!unique) out.sort((a, b) => a - b);
+  }
+
+  /** One delta layer; true when it added a live row. */
+  #deltaLayer(memtable: Memtable, key: Uint8Array, out: number[], bound: number): boolean {
+    const delta = memtable.deltas.get(this.def.id);
+    if (delta === undefined) return false;
+    const keySlot = delta.find(key);
+    if (keySlot < 0) return false;
+    for (let entry = delta.head(keySlot); entry >= 0; entry = delta.nextEntry(entry))
+      if (delta.isTombstone(entry) && delta.seq(entry) <= bound) this.#dead.add(delta.rowId(entry));
+    let added = false;
+    for (let entry = delta.head(keySlot); entry >= 0; entry = delta.nextEntry(entry)) {
+      if (delta.isTombstone(entry) || delta.seq(entry) > bound) continue;
+      const rowId = delta.rowId(entry);
+      if (this.#dead.has(rowId)) continue;
+      out.push(rowId);
+      added = true;
+      if (this.def.unique) return true;
+    }
+    return added;
+  }
+
+  /** One run layer; a Promise that finishes the resolution when it had to read, else null. */
+  #runLayer(run: RunRef, key: Uint8Array, out: number[], layer: number): Promise<void> | null {
+    const shared = this.table.snapshot.shared;
+    const reader = shared.runReader(run);
+    if (reader instanceof Promise)
+      return reader.then(async () => {
+        await this.#resolveFrom(key, out, layer);
+      });
+    const entries = this.#layer;
+    entries.length = 0;
+    const read = reader.lookup(shared.space, key, entries, shared.budget);
+    if (read instanceof Promise)
+      return read.then(async () => {
+        this.#applyLayer(entries, out);
+        if (this.def.unique && out.length > 0) return;
+        await this.#resolveFrom(key, out, layer + 1);
+      });
+    this.#applyLayer(entries, out);
+    return null;
+  }
+
+  #applyLayer(layer: readonly RunEntry[], out: number[]): void {
+    for (const entry of layer) if (entry.tombstone) this.#dead.add(entry.rowId);
+    for (const entry of layer) {
+      if (entry.tombstone || this.#dead.has(entry.rowId)) continue;
+      out.push(entry.rowId);
+      if (this.def.unique) return;
+    }
+  }
+
+  probe(keys: KeyBatch, out: ProbeOutput, resume?: ProbeResume): MaybePromise<ProbeResult> {
+    this.table.snapshot.check();
+    out.count = 0;
+    const start = resume as Resume | undefined;
+    return this.#probeFrom(keys, out, start?.key ?? 0, start?.skip ?? 0);
+  }
+
+  #probeFrom(
+    keys: KeyBatch,
+    out: ProbeOutput,
+    from: number,
+    skip: number,
+  ): MaybePromise<ProbeResult> {
+    const capacity = Math.min(out.probes.length, out.locators.length);
+    const rows: number[] = [];
+    for (let k = from; k < keys.count; k++) {
+      const result = this.resolve(keys.key(k), rows);
+      if (result instanceof Promise)
+        return result.then(() => {
+          // Blocks are cached now: this key resolves synchronously (or reads again).
+          return this.#probeFrom(keys, out, k, k === from ? skip : 0);
+        });
+      const first = k === from ? skip : 0;
+      for (let m = first; m < rows.length; m++) {
+        if (out.count >= capacity) {
+          const next: Resume = { key: k, skip: m };
+          return { done: false, resume: next };
+        }
+        out.probes[out.count] = k;
+        out.locators[out.count] = this.table.locator(rows[m] ?? 0);
+        out.count += 1;
+      }
+    }
+    return { done: true };
+  }
+
+  range(range: KeyRange, direction: "asc" | "desc"): IndexCursor {
+    if (this.def.kind !== "ordered") throw new TypeError("An equality index serves lookups only");
+    return new RangeCursor(this, range, direction);
+  }
+
+  /** Every live (key, rowId) in `range`, resolved, sorted by key then row id. */
+  async collect(range: KeyRange): Promise<Array<{ key: Uint8Array; rowId: number }>> {
+    const snapshot = this.table.snapshot;
+    const shared = snapshot.shared;
+    const bound = snapshot.bound;
+    const accept = (key: Uint8Array): -1 | 0 | 1 => {
+      if (range.lower !== null) {
+        const order = compareBytes(key, 0, key.length, range.lower.key, 0, range.lower.key.length);
+        if (order < 0) return -1;
+      }
+      if (inKeyRange(range, key)) return 0;
+      if (range.upper !== null) {
+        const order = compareBytes(key, 0, key.length, range.upper.key, 0, range.upper.key.length);
+        if (order > 0 && !startsWith(key, range.upper.key)) return 1;
+      }
+      return -1;
+    };
+    // Candidate keys from every layer, then resolve each key once.
+    const keys = new Map<string, Uint8Array>();
+    const add = (key: Uint8Array) => {
+      if (inKeyRange(range, key)) keys.set(String.fromCharCode(...key), key.slice());
+    };
+    for (const memtable of this.table.tableView.memtables) {
+      const published = memtable.published;
+      if (published !== null) {
+        const run = published.runs.get(this.def.id);
+        if (run !== undefined) {
+          const reader = await shared.runReader(run);
+          await reader.scan(shared.space, shared.budget, accept, (key) => add(key));
+        }
+        continue;
+      }
+      const delta = memtable.deltas.get(this.def.id);
+      if (delta === undefined) continue;
+      for (let slot = 0; slot < delta.keyCount; slot++) {
+        let visible = false;
+        for (let entry = delta.head(slot); entry >= 0; entry = delta.nextEntry(entry))
+          if (delta.seq(entry) <= bound) visible = true;
+        if (visible) add(delta.keyBytes(slot));
+      }
+    }
+    for (const run of this.table.tableView.runs.get(this.def.id) ?? []) {
+      const reader = await shared.runReader(run);
+      await reader.scan(shared.space, shared.budget, accept, (key) => add(key));
+    }
+    const sorted = [...keys.values()].sort((a, b) => compareBytes(a, 0, a.length, b, 0, b.length));
+    const out: Array<{ key: Uint8Array; rowId: number }> = [];
+    const rows: number[] = [];
+    for (const key of sorted) {
+      const result = this.resolve(key, rows);
+      if (result instanceof Promise) await result;
+      for (const rowId of [...rows].sort((a, b) => a - b)) out.push({ key, rowId });
+    }
+    return out;
+  }
+}
+
+function startsWith(key: Uint8Array, prefix: Uint8Array): boolean {
+  if (key.length < prefix.length) return false;
+  for (let k = 0; k < prefix.length; k++) if (key[k] !== prefix[k]) return false;
+  return true;
+}
+
+class RangeCursor implements IndexCursor {
+  #rows: number[] | null = null;
+  #at = 0;
+  #closed = false;
+
+  constructor(
+    readonly index: ViewIndex,
+    readonly range: KeyRange,
+    readonly direction: "asc" | "desc",
+  ) {}
+
+  next(out: Float64Array): MaybePromise<number> {
+    this.index.table.snapshot.check();
+    if (this.#closed) return 0;
+    if (this.#rows === null)
+      return this.index.collect(this.range).then((entries) => {
+        const rows = entries.map((entry) => this.index.table.locator(entry.rowId));
+        this.#rows = this.direction === "asc" ? rows : rows.reverse();
+        return this.#fill(out);
+      });
+    return this.#fill(out);
+  }
+
+  #fill(out: Float64Array): number {
+    const rows = this.#rows ?? [];
+    let filled = 0;
+    while (filled < out.length && this.#at < rows.length) out[filled++] = rows[this.#at++] ?? 0;
+    return filled;
+  }
+
+  close(): void {
+    this.#closed = true;
+    this.#rows = null;
+  }
+}

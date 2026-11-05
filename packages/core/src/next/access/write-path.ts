@@ -119,6 +119,7 @@ import type { CommitFrameBody } from "../format/log-frame.js";
 import type { RequestLedger } from "../format/ledger.js";
 import type { MemoryGovernor } from "../memory/governor.js";
 import type { StoreSession } from "../storage/contract.js";
+import type { StatValue } from "../types.js";
 import type { Int64Values } from "../vector/vector.js";
 import type { CatalogView } from "./catalog.js";
 import type { Statement, StatementOptions } from "./modify.js";
@@ -168,6 +169,12 @@ export interface WritePath {
    */
   flush(): Promise<void>;
   stats(): WritePathStats;
+  /**
+   * The planning summary of a committed table (ruling R17.7), synchronously, or null for a table
+   * the committed catalog lacks. Maintained at flush (from the chunks' exact statistics) plus the
+   * memtables' row counts; lowering's `PlanningStatistics` reads it (lower/statistics.ts).
+   */
+  statistics(tableId: number): TableSummary | null;
   /**
    * Flushes, writes the final header, releases pins and memtables. Rejects open transactions
    * (rolled back) and pending begins with `WritePathClosedError`. Idempotent.
@@ -238,6 +245,24 @@ export interface SequenceAccess {
   next(sequenceId: number, count: number, out: Int64Values, offset: number): number;
   /** setval(): a standalone frame too; returns its LSN. */
   set(sequenceId: number, value: bigint, isCalled: boolean): number;
+}
+
+/** A table's planning summary (shape of lower/statistics.ts `TablePlanningStatistics`). */
+export interface TableSummary {
+  /** Live rows, approximately (published groups plus memtables, minus deletions). */
+  readonly rowCount: number;
+  column(columnId: number): ColumnSummary | null;
+}
+
+export interface ColumnSummary {
+  readonly nullCount: number;
+  /** Estimated distinct non-null values, or null when unknown. */
+  readonly distinct: number | null;
+  /** Sound bounds over the published groups (types.ts `StatValue`), or null when unknown. */
+  readonly min: StatValue | null;
+  readonly max: StatValue | null;
+  /** Average stored bytes per non-null value. */
+  readonly averageWidth: number;
 }
 
 export interface WritePathStats {
