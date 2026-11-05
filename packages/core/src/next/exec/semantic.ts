@@ -10,7 +10,9 @@
  * keys, values, elements; a top-level scalar is a one-element "raw scalar" array) and compared
  * token by token:
  * - Same token, same type: scalars compare as values: null = null, strings (and keys) by bytes
- *   (C collation), numbers numerically and exactly (`1` = `1.0`, `2` < `10`), false < true;
+ *   (C collation), numbers numerically and exactly (`1` = `1.0`, `2` < `10`; every zero is the
+ *   same value; `compareDecimals` never aligns scales, so `0e1073741823` costs what `0` does),
+ *   false < true;
  *   arrays: a raw scalar sorts below a real array, but a different element count decides first;
  *   objects: more pairs sort higher.
  * - Otherwise: by type, Null < String < Number < Boolean < Array < Object.
@@ -70,11 +72,30 @@ function compareKeys(a: string, b: string): number {
   return difference !== 0 ? Math.sign(difference) : compareCodePoints(a, b);
 }
 
-function compareDecimals(a: DecimalKey, b: DecimalKey): number {
-  const scale = Math.max(a.scale, b.scale);
-  const x = a.coefficient * 10n ** BigInt(scale - a.scale);
-  const y = b.coefficient * 10n ** BigInt(scale - b.scale);
-  return x === y ? 0 : x < y ? -1 : 1;
+/**
+ * NUMERIC order without aligning scales (review A1-5 finding 1): every zero is the same value
+ * whatever its scale; otherwise sign, then the adjusted exponent (digits − scale: where the
+ * decimal point falls), then the digits with trailing zeros dropped. Nothing is multiplied, so
+ * `0e1073741823 = 0` costs what `0 = 0` does.
+ */
+export function compareDecimals(a: DecimalKey, b: DecimalKey): number {
+  const signA = a.coefficient === 0n ? 0 : a.coefficient < 0n ? -1 : 1;
+  const signB = b.coefficient === 0n ? 0 : b.coefficient < 0n ? -1 : 1;
+  if (signA !== signB) return signA < signB ? -1 : 1;
+  if (signA === 0) return 0;
+  const digitsA = (signA < 0 ? -a.coefficient : a.coefficient).toString();
+  const digitsB = (signB < 0 ? -b.coefficient : b.coefficient).toString();
+  const exponentA = digitsA.length - a.scale;
+  const exponentB = digitsB.length - b.scale;
+  let order: number;
+  if (exponentA !== exponentB) order = exponentA < exponentB ? -1 : 1;
+  else {
+    // Same point position: compare significant digits; a prefix (after trimming) is smaller.
+    const x = digitsA.replace(/0+$/u, "");
+    const y = digitsB.replace(/0+$/u, "");
+    order = x === y ? 0 : x < y ? -1 : 1;
+  }
+  return signA < 0 && order !== 0 ? -order : order;
 }
 
 /** PostgreSQL's jbvType order. */
@@ -341,6 +362,9 @@ export function parseJsonb(text: string): JsonbValue {
     if (significant > 0 && significant - scale > NUMERIC_MAX_INTEGER_DIGITS)
       fail("numeric value out of range");
     const digits = BigInt(whole + fraction);
+    // Any zero is the canonical zero (sign and exponent dropped); it keeps PostgreSQL's display
+    // scale, which is never negative.
+    if (digits === 0n) return { number: { coefficient: 0n, scale: Math.max(0, scale) } };
     return {
       number: { coefficient: match[0].startsWith("-") ? -digits : digits, scale },
     };

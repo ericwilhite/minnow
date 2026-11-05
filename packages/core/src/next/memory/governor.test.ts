@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { createReach } from "../../testing/reach.js";
 import { VarlenBuilder } from "../vector/varlen.js";
 import {
   Governor,
@@ -404,8 +405,36 @@ describe("loan races (review A1-3 finding 3)", () => {
     await reserveIntact(governor);
   });
 
-  it("keeps the reserve under random interleavings of every operation, loans outstanding", async () => {
+  it("keeps exact accounting and the reserve under random interleavings, loans outstanding (declared reach)", async () => {
+    const states = [
+      "stepWithLoan",
+      "evictWithLoan",
+      "reclaimWithLoan",
+      "abortWithLoan",
+      "loanServed",
+      "loanAborted",
+      "loanOnClosedGrant",
+      "borrowWhilePending",
+      "admissionQueued",
+      "tryAdmitRefused",
+      "growRefused",
+      "allocateRefused",
+      "releaseRefused",
+      "repaid",
+      "repayRefused",
+      "chargeRefused",
+    ] as const;
+    // Each state must be entered in at least 6 of the 60 histories (observed: 7–60).
+    const reach = createReach("governor interleavings", states, { minimum: 6 });
+    const cancelled = new Error("cancelled");
+    const done = new Error("done");
+    // A macrotask: every resolved admission and loan has been delivered to its .then.
+    const quiesce = () =>
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, 0);
+      });
     for (let seed = 1; seed <= 60; seed++) {
+      reach.beginHistory();
       let state = seed;
       const random = () => {
         state = (Math.imul(state ^ (state >>> 15), 0x2c1b3c6d) + 0x9e3779b9) >>> 0;
@@ -419,6 +448,7 @@ describe("loan races (review A1-3 finding 3)", () => {
           return cached;
         },
         evict(bytes) {
+          if (governor.loanedBytes > 0) reach.reach("evictWithLoan");
           const freed = Math.min(bytes, cached);
           cached -= freed;
           cache.release(freed);
@@ -428,19 +458,37 @@ describe("loan races (review A1-3 finding 3)", () => {
       interface Live {
         grant: Awaited<ReturnType<Governor["admit"]>>;
         loan: Loan | null;
+        borrowing: boolean;
+        closed: boolean;
+        /** Aborts the pending borrow, if any. */
+        abort: AbortController | null;
       }
+      /** Every delivered, open grant: after `quiesce`, every grant the governor holds. */
       const grants: Live[] = [];
+      let queuedAdmissions = 0;
       const aborts: AbortController[] = [];
       const pending: Array<Promise<unknown>> = [];
       const releasable = (live: Live) => live.grant.held - live.grant.allocated - live.grant.loaned;
       const check = (step: string) => {
+        // Exact accounting: every charged byte is a delivered grant's or the cache's.
+        const held = grants.reduce((sum, live) => sum + live.grant.held, 0);
+        expect(governor.usedBytes, `${step}: used = Σ held + cached`).toBe(held + cached);
+        const loaned = grants.reduce((sum, live) => sum + live.grant.loaned, 0);
+        expect(governor.loanedBytes, `${step}: loaned = Σ grant loans`).toBe(loaned);
+        for (const live of grants) {
+          expect(live.grant.loaned, `${step}: a served loan is delivered`).toBe(
+            live.loan?.bytes ?? 0,
+          );
+          expect(live.grant.allocated, step).toBeLessThanOrEqual(live.grant.held);
+          expect(live.grant.loaned, step).toBeLessThanOrEqual(live.grant.held);
+        }
         expect(governor.usedBytes, step).toBeLessThanOrEqual(governor.capBytes);
         // The reserve invariant: everything but loans fits under cap − reserve.
         expect(governor.usedBytes - governor.loanedBytes, step).toBeLessThanOrEqual(
           governor.capBytes - governor.reserveBytes,
         );
       };
-      for (let step = 0; step < 80; step++) {
+      const operate = (step: number) => {
         const live = pick(grants);
         const roll = random();
         const amount = Math.floor(random() * 4) * (MiB / 2);
@@ -450,40 +498,90 @@ describe("loan races (review A1-3 finding 3)", () => {
             minimumBytes: amount,
             spillable: false,
           });
-          if (fast !== null) grants.push({ grant: fast, loan: null });
+          if (fast === null) reach.reach("tryAdmitRefused");
+          else
+            grants.push({ grant: fast, loan: null, borrowing: false, closed: false, abort: null });
         } else if (roll < 0.15 || live === undefined) {
           const spillable = random() < 0.7;
+          queuedAdmissions += 1;
           pending.push(
             governor
-              .admit({ label: `g${String(step)}`, minimumBytes: amount, spillable })
+              .admit({ label: `g${String(step)}`, minimumBytes: 2 * amount, spillable })
               .then((grant) => {
-                const entry: Live = { grant, loan: null };
+                queuedAdmissions -= 1;
+                const entry: Live = {
+                  grant,
+                  loan: null,
+                  borrowing: false,
+                  closed: false,
+                  abort: null,
+                };
                 grants.push(entry);
                 // Reclaim callbacks release synchronously, within what may be released.
                 if (spillable)
                   grant.onReclaimRequest((bytes) => {
+                    if (governor.loanedBytes > 0) reach.reach("reclaimWithLoan");
                     const give = Math.min(bytes, releasable(entry));
                     if (give > 0) grant.release(give);
                   });
               }),
           );
-        } else if (roll < 0.25) live.grant.tryGrow(amount);
-        else if (roll < 0.35 && live.loan === null) {
+        } else if (roll < 0.25) {
+          const held = live.grant.held;
+          if (!live.grant.tryGrow(amount)) {
+            reach.reach("growRefused");
+            expect(live.grant.held).toBe(held);
+          }
+        } else if (roll < 0.35 && live.loan === null) {
+          const again = random() < 0.3 ? grants.find((entry) => entry.borrowing) : undefined;
+          if (again !== undefined || live.borrowing) {
+            const target = again ?? live;
+            // A second borrow while one is pending is refused at once, for that reason.
+            reach.reach("borrowWhilePending");
+            pending.push(
+              expect(target.grant.borrow(MiB / 2)).rejects.toThrow(/must repay its loan/u),
+            );
+            return;
+          }
           const controller = new AbortController();
           aborts.push(controller);
+          live.abort = controller;
+          live.borrowing = true;
           pending.push(
-            live.grant.borrow(Math.max(MiB / 2, amount / 2), controller.signal).then(
+            live.grant.borrow(Math.max(MiB / 2, amount), controller.signal).then(
               (loan) => {
+                live.borrowing = false;
+                reach.reach("loanServed");
                 live.loan = loan;
               },
-              () => undefined,
+              (error: unknown) => {
+                live.borrowing = false;
+                // Only two reasons: our abort, or the grant closed first.
+                if (live.closed && error instanceof GrantClosedError)
+                  reach.reach("loanOnClosedGrant");
+                else {
+                  expect([cancelled, done]).toContain(error);
+                  reach.reach("loanAborted");
+                }
+              },
             ),
           );
-        } else if (roll < 0.4) pick(aborts)?.abort(new Error("cancelled"));
-        else if (roll < 0.5 && live.loan !== null) {
+        } else if (roll < 0.4) {
+          if (governor.loanedBytes > 0) reach.reach("abortWithLoan");
+          // Prefer a borrow still waiting: aborting a settled one changes nothing.
+          const waiting = grants.filter((entry) => entry.borrowing);
+          (random() < 0.7 ? pick(waiting)?.abort : pick(aborts))?.abort(cancelled);
+        } else if (roll < 0.5 && live.loan !== null) {
           if (live.grant.held - live.grant.allocated >= live.loan.bytes) {
             live.loan.repay();
             live.loan = null;
+            reach.reach("repaid");
+          } else {
+            const loan = live.loan;
+            expect(() => {
+              loan.repay();
+            }).toThrow(/free its loaned bytes/u);
+            reach.reach("repayRefused");
           }
         } else if (roll < 0.62) {
           const before = { held: live.grant.held, used: governor.usedBytes };
@@ -493,32 +591,59 @@ describe("loan races (review A1-3 finding 3)", () => {
             }).toThrow(LoanBackedReleaseError);
             expect(live.grant.held).toBe(before.held);
             expect(governor.usedBytes).toBe(before.used);
+            reach.reach("releaseRefused");
           } else live.grant.release(amount);
-        } else if (roll < 0.72) live.grant.allocate(amount);
-        else if (roll < 0.8) live.grant.free(Math.min(amount, live.grant.allocated));
+        } else if (roll < 0.72) {
+          const allocated = live.grant.allocated;
+          if (!live.grant.allocate(amount)) {
+            reach.reach("allocateRefused");
+            expect(live.grant.allocated).toBe(allocated);
+          }
+        } else if (roll < 0.8) live.grant.free(Math.min(amount, live.grant.allocated));
         else if (roll < 0.88) {
           if (cache.charge(amount)) cached += amount;
+          else reach.reach("chargeRefused");
         } else if (roll < 0.94) {
-          live.grant.close();
-          grants.splice(grants.indexOf(live), 1);
+          // Prefer a grant whose borrow is still waiting: the loan must go back with it.
+          const waiting = grants.filter((entry) => entry.borrowing);
+          const target = (random() < 0.5 ? pick(waiting) : undefined) ?? live;
+          target.closed = true;
+          target.loan = null;
+          target.grant.close();
+          grants.splice(grants.indexOf(target), 1);
         }
-        await ticks(Math.floor(random() * 4));
+      };
+      for (let step = 0; step < 80; step++) {
+        // One to three operations, with 0–3 microtasks between them: resolutions may still be
+        // undelivered when the next operation runs.
+        const operations = 1 + Math.floor(random() * 3);
+        for (let index = 0; index < operations; index++) {
+          operate(step);
+          await ticks(Math.floor(random() * 4));
+        }
+        await quiesce();
+        if (queuedAdmissions > 0) reach.reach("admissionQueued");
+        if (governor.loanedBytes > 0) reach.reach("stepWithLoan");
         check(`seed ${String(seed)} step ${String(step)}`);
       }
       // Quiesce: close everything (including grants admitted late) and empty the cache.
-      for (const controller of aborts) controller.abort(new Error("done"));
-      for (let round = 0; round < 20; round++) {
-        await ticks(5);
-        for (const live of grants.splice(0)) live.grant.close();
+      for (const controller of aborts) controller.abort(done);
+      for (let round = 0; round < 20 && (grants.length > 0 || queuedAdmissions > 0); round++) {
+        for (const live of grants.splice(0)) {
+          live.closed = true;
+          live.grant.close();
+        }
         if (cached > 0) {
           cache.release(cached);
           cached = 0;
         }
+        await quiesce();
       }
+      expect(queuedAdmissions, `seed ${String(seed)}: every admission served`).toBe(0);
       await Promise.all(pending);
-      for (const live of grants.splice(0)) live.grant.close();
       check(`seed ${String(seed)} end`);
       await reserveIntact(governor);
     }
-  });
+    reach.assertReached();
+  }, 60_000);
 });

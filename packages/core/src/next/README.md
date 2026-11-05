@@ -16,7 +16,7 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | Module             | Owner track                      | What it is                                                                                                                                                                                   |
 | ------------------ | -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `types.ts`         | contracts                        | Physical types; the one SQL → physical mapping; declared widths are mandatory; column statistics types shared by format and exec                                                             |
-| `errors.ts`        | contracts                        | Errors shared across tracks: `OwnerUnresponsiveError`, `RequestExpiredError`                                                                                                                 |
+| `errors.ts`        | contracts                        | Errors shared across tracks: `OwnerUnresponsiveError`, `RequestExpiredError`, `SessionLostError`                                                                                             |
 | `temporal.ts`      | contracts                        | DATE/TIMESTAMP on PostgreSQL's 2000 epoch; infinities; ISO text                                                                                                                              |
 | `hash/`            | contracts                        | xxHash32, the only checksum                                                                                                                                                                  |
 | `vector/`          | contracts → executor             | Batches (byte-bounded), vectors, validity, exact int64, int128 decimals, UTF-8 builder under a grant, locators                                                                               |
@@ -90,6 +90,8 @@ Merge note: `SnapshotReleasedError` and the snapshot type move to `next/access/`
 - A batch holds at most 2,048 rows and about 1 MiB in total, so wide rows get fewer rows. One huge
   value is a batch of one.
 - Arrays are stored as reversible values (`array-value.ts`) and decoded before any operation.
+  Values are validated on write and on read: int32 bounds, element ranges, NUMERIC limits, and
+  an empty array only as zero dimensions.
 - int64 is exact. It uses `Float64Array` only when every slot is proven to lie within ±(2^53 − 1),
   and `BigInt64Array` otherwise.
 - Decimals have three tiers: int64, then 128-bit limbs, then `bigint[]`. Kernels widen before
@@ -146,12 +148,16 @@ Merge note: `SnapshotReleasedError` and the snapshot type move to `next/access/`
   drops staging no commit claimed.
 - The log must reach every checkpoint the root claims.
 - A rolled-back root is detected through the log header's `rootSequence`.
-- Requests are exactly-once through a bounded per-client ledger of outcomes, with expiry enforced
+- Commits are exactly-once through a bounded per-client ledger of outcomes, with expiry enforced
   by the receiver (`RequestExpiredError`). A statement inside an open transaction records a
-  session-scoped, non-durable outcome that answers its duplicates until the session ends; only a
-  request that changed nothing (a read) is settled without an outcome, so its retry runs again.
-- Errors shared across tracks (`OwnerUnresponsiveError`, `RequestExpiredError`) are defined once,
-  in `errors.ts`.
+  non-durable outcome keyed by its client, engine session and session generation, which answers
+  its duplicates. Ending a generation (`endSession`) drops that session's statement outcomes and
+  pending statements only: a late completion is ignored, a retry is refused with
+  `SessionLostError`, a pending commit still records, and other sessions keep their protection.
+  Standalone queries (reads, `SELECT nextval(...)`) are at-least-once: settled without an outcome,
+  so a retry runs again.
+- Errors shared across tracks (`OwnerUnresponsiveError`, `RequestExpiredError`,
+  `SessionLostError`) are defined once, in `errors.ts`.
 
 ### Key encoding (`keys/key-encoding.ts`)
 
@@ -169,8 +175,11 @@ Merge note: `SnapshotReleasedError` and the snapshot type move to `next/access/`
 ### Manifest (`format/manifest.ts`)
 
 - The root is O(tables + ledger). Nothing is O(rows).
-- Each column chunk names its data extent.
-- Every reference carries the checksum of what it names.
+- Every reference names the extent it lives in (`BlobRef = {extent, offset, length, checksum}`,
+  the storage track's shape), so reachability walks list extents without inferring them. Small
+  blobs share 4 KiB-aligned extents; an extent is reclaimed as a unit. Page offsets are relative
+  to their chunk's data blob.
+- Every reference carries the checksum of what it names (a chunk's pages carry theirs).
 - Space is reusable only when neither the current durable root, nor the previous one (the other
   root slot), nor any pinned root reaches it (two generations), and startup walks both roots.
 - Startup order: acquire the fence → open the store session → open the extent space (walk the

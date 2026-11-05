@@ -18,7 +18,7 @@
  *       u32 byte length, coefficient as two's complement bytes ·
  *     interval: i32 months, i32 days, i64 µs · text/bytes/enum: u32 length + bytes · uuid: 16 bytes
  * Element types: every scalar type except JSON (and never arrays of arrays: use dimensions).
- * Zero dimensions is the empty array.
+ * Zero dimensions is the empty array, and the only one (`validateArrayValue`). Decoding validates.
  */
 import type { PhysicalType } from "../types.js";
 
@@ -127,23 +127,33 @@ class Writer {
   }
 }
 
+/**
+ * Minimal little-endian two's complement bytes. Linear time through hex text: a byte-at-a-time
+ * BigInt shift is quadratic, seconds for a legal 131,072-digit NUMERIC.
+ */
 function twosComplement(value: bigint): Uint8Array {
-  const out: number[] = [];
-  let rest = value;
-  for (;;) {
-    out.push(Number(BigInt.asUintN(8, rest)));
-    rest >>= 8n;
-    const sign = (out.at(-1) ?? 0) & 0x80;
-    if ((rest === 0n && sign === 0) || (rest === -1n && sign !== 0)) break;
+  const negative = value < 0n;
+  // For a negative value the bytes are the complement of −value − 1's.
+  let hex = (negative ? -value - 1n : value).toString(16);
+  if (hex.length % 2 === 1) hex = `0${hex}`;
+  const count = hex.length / 2;
+  const signByte = Number.parseInt(hex.slice(0, 2), 16) >= 0x80 ? 1 : 0;
+  const out = new Uint8Array(count + signByte);
+  for (let index = 0; index < count; index++) {
+    const at = hex.length - 2 * (index + 1);
+    const byte = Number.parseInt(hex.slice(at, at + 2), 16);
+    out[index] = negative ? ~byte & 0xff : byte;
   }
-  return Uint8Array.from(out);
+  if (signByte === 1) out[count] = negative ? 0xff : 0;
+  return out;
 }
 
 function fromTwosComplement(bytes: Uint8Array): bigint {
-  let value = 0n;
+  if (bytes.length === 0) return 0n;
+  const digits: string[] = [];
   for (let index = bytes.length - 1; index >= 0; index--)
-    value = (value << 8n) | BigInt(bytes[index] ?? 0);
-  return BigInt.asIntN(bytes.length * 8, value);
+    digits.push((bytes[index] ?? 0).toString(16).padStart(2, "0"));
+  return BigInt.asIntN(bytes.length * 8, BigInt(`0x${digits.join("")}`));
 }
 
 /** PostgreSQL's MaxArraySize: the most elements an array may hold. */
@@ -157,6 +167,26 @@ const isInt32 = (value: unknown): value is number =>
   typeof value === "number" && Number.isInteger(value) && value >= INT32_MIN && value <= INT32_MAX;
 const isInt64 = (value: unknown): value is bigint =>
   typeof value === "bigint" && value >= INT64_MIN && value <= INT64_MAX;
+
+/** PostgreSQL NUMERIC: display scale ≤ 16,383 and ≤ 131,072 digits before the point. */
+const NUMERIC_MAX_SCALE = 16_383;
+const NUMERIC_MAX_INTEGER_DIGITS = 131_072;
+const LOG10_2 = Math.log10(2);
+
+/**
+ * Whether coefficient × 10^−scale has at most 131,072 digits before the point. Decides from the
+ * hex length (linear time) unless the value is within a digit of the limit, so a huge coefficient
+ * is refused without a quadratic decimal conversion.
+ */
+function numericFits(coefficient: bigint, scale: number): boolean {
+  const magnitude = coefficient < 0n ? -coefficient : coefficient;
+  if (magnitude === 0n) return true;
+  const limit = NUMERIC_MAX_INTEGER_DIGITS + scale;
+  const bits = (magnitude.toString(16).length - 1) * 4; // magnitude ≥ 2^bits
+  if (Math.floor(bits * LOG10_2) + 1 > limit + 1) return false;
+  if (Math.ceil((bits + 4) * LOG10_2) + 1 < limit) return true;
+  return magnitude.toString().length <= limit;
+}
 
 function checkElement(element: PhysicalType, tag: number, item: ArrayElement): void {
   const bad = (what: string): never => {
@@ -191,9 +221,10 @@ function checkElement(element: PhysicalType, tag: number, item: ArrayElement): v
     case 7: {
       if (typeof item !== "object" || !("coefficient" in item)) return bad("not a NUMERIC");
       if (item.special !== undefined) return;
-      if (typeof item.coefficient !== "bigint") bad("NUMERIC coefficient");
-      if (!Number.isInteger(item.scale) || item.scale < 0 || item.scale > 16_383)
+      if (typeof item.coefficient !== "bigint") return bad("NUMERIC coefficient");
+      if (!Number.isInteger(item.scale) || item.scale < 0 || item.scale > NUMERIC_MAX_SCALE)
         bad("NUMERIC scale");
+      if (!numericFits(item.coefficient, item.scale)) bad("NUMERIC value overflows");
       return;
     }
     case 12: {
@@ -218,9 +249,12 @@ function checkElement(element: PhysicalType, tag: number, item: ArrayElement): v
 }
 
 /**
- * Checks a value before anything is written: dimensions and lower bounds are int32, every upper
- * bound (lower + length − 1) is int32, at most `MAX_ARRAY_ELEMENTS` elements, and every element
- * is in its type's range. A value that fails is never narrowed or truncated.
+ * Checks a value before anything is written and after it is read: dimensions and lower bounds are
+ * int32, every upper bound (lower + length − 1) is int32, at most `MAX_ARRAY_ELEMENTS` elements,
+ * and every element is in its type's range (NUMERIC: scale ≤ 16,383 and ≤ 131,072 digits before
+ * the point). An empty array has zero dimensions, as PostgreSQL stores it (`'{{}}'` and
+ * `array_fill(1, '{0}')` are both `{}` with no dimensions): a dimension of length 0 is refused,
+ * never normalized here. A value that fails is never narrowed or truncated.
  */
 export function validateArrayValue(element: PhysicalType, value: ArrayValue): void {
   const tag = arrayElementTag(element);
@@ -231,6 +265,8 @@ export function validateArrayValue(element: PhysicalType, value: ArrayValue): vo
   dimensions.forEach((length, index) => {
     const lower = lowerBounds[index];
     if (!isInt32(length) || length < 0) throw new MalformedArrayError("Bad array dimension length");
+    if (length === 0)
+      throw new MalformedArrayError("An empty array has no dimensions (a dimension of length 0)");
     if (!isInt32(lower)) throw new MalformedArrayError("Array lower bound out of range");
     if (lower + length - 1 > INT32_MAX)
       throw new MalformedArrayError("Array upper bound out of range");
@@ -418,5 +454,8 @@ export function decodeArrayValue(element: PhysicalType, bytes: Uint8Array): Arra
     }
   }
   if (at !== bytes.length) throw new MalformedArrayError("Trailing bytes after the array value");
-  return { dimensions, lowerBounds, elements };
+  const value = { dimensions, lowerBounds, elements };
+  // Stored bytes are checked like written values: a decoded value is always a valid one.
+  validateArrayValue(element, value);
+  return value;
 }

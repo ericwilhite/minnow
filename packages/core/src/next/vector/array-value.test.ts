@@ -55,7 +55,7 @@ const ELEMENTS: ReadonlyArray<[PhysicalType, fc.Arbitrary<ArrayElement>]> = [
 const shapes = fc.oneof(
   fc.constant({ dimensions: [] as number[], lowerBounds: [] as number[] }),
   fc
-    .tuple(fc.integer({ min: 0, max: 4 }), fc.integer({ min: -3, max: 3 }))
+    .tuple(fc.integer({ min: 1, max: 4 }), fc.integer({ min: -3, max: 3 }))
     .map(([n, lb]) => ({ dimensions: [n], lowerBounds: [lb] })),
   fc
     .tuple(fc.integer({ min: 1, max: 3 }), fc.integer({ min: 1, max: 3 }))
@@ -190,5 +190,92 @@ describe("array validation before writing (review A1-4 follow-up)", () => {
       [{ kind: "text" }, 5, "text"],
     ];
     for (const [element, item, label] of cases) refuse(element, one(item), label);
+  });
+
+  it("refuses NUMERIC elements PostgreSQL cannot hold (review A1-5 probe: 10^131072)", () => {
+    const decimal: PhysicalType = { kind: "decimal", precision: null, scale: null };
+    const accept = (item: ArrayElement) =>
+      expect(decodeArrayValue(decimal, encodeArrayValue(decimal, one(item))).elements).toEqual([
+        item,
+      ]);
+    // PostgreSQL (PGlite): '1' followed by 131,071 zeros is accepted; one more zero overflows.
+    accept({ coefficient: 10n ** 131_071n, scale: 0 });
+    accept({ coefficient: -(10n ** 131_071n), scale: 0 });
+    accept({ coefficient: 10n ** 131_073n, scale: 2 });
+    accept({ coefficient: 10n ** 16_383n, scale: 16_383 });
+    refuse(decimal, one({ coefficient: 10n ** 131_072n, scale: 0 }), "131,073 integer digits");
+    refuse(decimal, one({ coefficient: 10n ** 131_074n, scale: 2 }), "with a scale");
+    const started = performance.now();
+    refuse(decimal, one({ coefficient: 10n ** 2_000_000n, scale: 0 }), "huge");
+    expect(performance.now() - started).toBeLessThan(500);
+  });
+
+  it.each(SEEDS)("bounds NUMERIC integer digits exactly at the limit (seed %i)", (seed) => {
+    const decimal: PhysicalType = { kind: "decimal", precision: null, scale: null };
+    let accepted = 0;
+    let refused = 0;
+    fc.assert(
+      fc.property(
+        fc.integer({ min: 0, max: 64 }),
+        fc.integer({ min: -3, max: 3 }),
+        fc.oneof(fc.integer({ min: 1, max: 9 }), fc.constant(0)),
+        fc.boolean(),
+        (scale, delta, lead, negative) => {
+          // `digits` digits: a leading digit then zeros, or (lead 0) all nines; integer digits
+          // = digits − scale sits within 3 of the limit, where the size estimate is tightest.
+          const digits = 131_072 + scale + delta;
+          const magnitude =
+            lead === 0 ? 10n ** BigInt(digits) - 1n : BigInt(lead) * 10n ** BigInt(digits - 1);
+          const value = one({ coefficient: negative ? -magnitude : magnitude, scale });
+          if (delta <= 0) {
+            accepted += 1;
+            expect(decodeArrayValue(decimal, encodeArrayValue(decimal, value))).toEqual(value);
+          } else {
+            refused += 1;
+            refuse(decimal, value, `${String(digits)} digits at scale ${String(scale)}`);
+          }
+        },
+      ),
+      { seed, numRuns: 300 },
+    );
+    // Declared reach: both sides of the limit.
+    expect(accepted).toBeGreaterThan(50);
+    expect(refused).toBeGreaterThan(50);
+  });
+
+  it("stores an empty array only with zero dimensions (review A1-5 probe)", () => {
+    const smallint: PhysicalType = { kind: "int32", bits: 16 };
+    refuse(smallint, { dimensions: [0], lowerBounds: [-2_147_483_648], elements: [] }, "INT32_MIN");
+    refuse(int, { dimensions: [0], lowerBounds: [1], elements: [] }, "one empty dimension");
+    refuse(int, { dimensions: [2, 0], lowerBounds: [1, 1], elements: [] }, "an empty inner one");
+    const empty = { dimensions: [], lowerBounds: [], elements: [] };
+    expect(decodeArrayValue(int, encodeArrayValue(int, empty))).toEqual(empty);
+  });
+
+  it("validates what it decodes (review A1-5 probe: SMALLINT 40000, upper bound past int32)", () => {
+    const smallint: PhysicalType = { kind: "int32", bits: 16 };
+    // The reviewer's bytes: one SMALLINT at lower bound 2147483647, rewritten to two elements
+    // 40000 and 40001.
+    const bytes = encodeArrayValue(smallint, {
+      dimensions: [1],
+      lowerBounds: [2_147_483_647],
+      elements: [1],
+    });
+    const forged = new Uint8Array(20);
+    forged.set(bytes);
+    const view = new DataView(forged.buffer);
+    view.setInt32(4, 2, true);
+    view.setInt32(12, 40_000, true);
+    view.setInt32(16, 40_001, true);
+    expect(() => decodeArrayValue(smallint, forged)).toThrow(/upper bound/u);
+    view.setInt32(8, 1, true); // a valid lower bound: now the elements are what is wrong
+    expect(() => decodeArrayValue(smallint, forged)).toThrow(/not a SMALLINT/u);
+    view.setInt32(12, 7, true);
+    view.setInt32(16, -7, true);
+    expect(decodeArrayValue(smallint, forged).elements).toEqual([7, -7]);
+    // A stored empty dimension is refused on read too.
+    const zero = encodeArrayValue(int, { dimensions: [1], lowerBounds: [1], elements: [5] });
+    const emptyDimension = Uint8Array.from([1, zero[1] ?? 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0]);
+    expect(() => decodeArrayValue(int, emptyDimension)).toThrow(/no dimensions/u);
   });
 });

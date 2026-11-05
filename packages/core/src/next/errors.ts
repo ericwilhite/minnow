@@ -29,3 +29,18 @@ export class RequestExpiredError extends Error {
     this.name = "RequestExpiredError";
   }
 }
+
+/**
+ * A statement of an explicit transaction arrived after its session's generation ended (a
+ * reconnect, format/ledger.ts `sessionLost`). It was not executed: the transaction rolled back
+ * with the old generation. The client starts the transaction again.
+ */
+export class SessionLostError extends Error {
+  readonly code = "MINNOW_SESSION_LOST";
+  constructor(sequence: number) {
+    super(
+      `Request ${String(sequence)} belongs to a session that ended; its transaction was rolled back`,
+    );
+    this.name = "SessionLostError";
+  }
+}

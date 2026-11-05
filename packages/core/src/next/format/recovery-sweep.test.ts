@@ -213,7 +213,7 @@ class Toy {
   #record(body: Body, lsn: number): void {
     if (body.request === null) return;
     const { clientId, sequence, rowCount } = body.request;
-    this.ledger.admit({ clientId, sequence, sentAtMs: NOW, resolvedThrough: 0 }, NOW);
+    // A replayed commit is recorded without admission: committed outcomes need no session.
     this.ledger.record(clientId, sequence, {
       kind: "committed",
       lsn,

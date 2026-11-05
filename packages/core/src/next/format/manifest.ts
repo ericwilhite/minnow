@@ -8,16 +8,27 @@
  *                 └─ tables[] ─ TableRoot ─┬─ groups (BlobRef → GroupRef[])
  *                                          │     └─ GroupRef.root (BlobRef → GroupRoot)
  *                                          │           └─ columns[] ─ ColumnChunk
- *                                          │                 ├─ data (ExtentRef: the chunk's pages)
+ *                                          │                 ├─ data (ChunkData: the chunk's pages)
  *                                          │                 └─ directory (BlobRef → PageEntry[])
  *                                          ├─ deletion bitmaps (per GroupRef)
  *                                          └─ keyIndex / secondary (IndexRoot → RunRef[])
  *
  * ## Invariants
- * - **Addresses.** Everything lives in the store's data space (storage/contract.ts). A `BlobRef`
- *   names a checksummed byte range there. A column chunk's pages are one contiguous extent
- *   (`ColumnChunk.data`); each `PageEntry.offset` is relative to it. A chunk never spans extents
- *   (a writer that cannot place it contiguously writes a smaller group).
+ * - **Addresses.** Everything lives in the store's data space (storage/contract.ts), allocated in
+ *   **extents** (`ExtentRef`: a `DATA_ALIGN`-aligned offset and the bytes written), the unit of
+ *   allocation and reclaim. Every reference names the extent it lives in: a `BlobRef` is
+ *   `{extent, offset, length, checksum}` with `offset` relative to `extent.offset` (ruling R15.1,
+ *   storage's shape). So a reachability walk yields each reference's `extent` as it meets it and
+ *   never infers an extent from an address.
+ * - **Packing.** Small blobs (metadata blobs, page directories, sketches, the data of small column
+ *   chunks) may share one 4 KiB-aligned extent; a large chunk's data has an extent of its own. An
+ *   extent is reclaimed as a unit: it is free only when no blob in it is reachable from the current
+ *   root, the previous root or a pin. Every reference into one extent carries the same `ExtentRef`.
+ * - **Chunks.** A column chunk's pages lie contiguously in its data blob (`ColumnChunk.data`,
+ *   inside one extent); each `PageEntry.offset` is relative to the start of that blob, so a page's
+ *   data-space address is `blobAddress(data) + page.offset`. A chunk never spans extents (a writer
+ *   that cannot place it contiguously writes a smaller group). Metadata blobs and pages are at most
+ *   1 MiB (storage `MAX_BLOB_BYTES`); a chunk's data blob and an extent have no cap.
  * - **Size.** The root is O(tables + ledger). A table root is O(1) plus its index runs; its group
  *   directory is O(groups); a group root is O(columns); a page directory is O(pages of one
  *   chunk). Nothing is O(rows). Planning and pruning read directories, never pages.
@@ -56,20 +67,45 @@ export type { ColumnStatistics, StatValue };
 
 export const MANIFEST_FORMAT_VERSION = 1;
 
-/** A byte range of the data space whose bytes carry their own checksums (pages). */
+/**
+ * Data-space addresses are the storage track's (storage/extents.ts on rebuild/storage 948ae4f,
+ * ruling R15.1): these two interfaces and `blobAddress` are identical to its definitions, and at
+ * the merge this module re-exports them from there instead.
+ */
+/** A contiguous byte range of the data space: the unit of allocation and reclaim. */
 export interface ExtentRef {
   /** A multiple of `DATA_ALIGN`. */
   readonly offset: number;
+  /** Bytes written (the reservation is this rounded up to `DATA_ALIGN`). */
   readonly length: number;
 }
 
-/** A checksummed byte range of the data space. */
+/**
+ * A checksummed byte range inside one extent: what readers ask for. Its data-space address is
+ * `extent.offset + offset`; `offset + length ≤ extent.length` (a ref read from storage that breaks
+ * this is `StoreCorruptionError`).
+ */
 export interface BlobRef {
+  /** The extent the blob lives in: its unit of reclaim (ruling R15.1). */
+  readonly extent: ExtentRef;
+  /** Byte offset within `extent`. */
   readonly offset: number;
   readonly length: number;
   /** xxHash32 (seed 0) of the referenced bytes. */
   readonly checksum: number;
 }
+
+/** The data-space address of a blob's first byte. */
+export function blobAddress(ref: BlobRef): number {
+  return ref.extent.offset + ref.offset;
+}
+
+/**
+ * A column chunk's data blob ("Chunks"): where its pages lie, contiguously, inside one extent. A
+ * `BlobRef` without a checksum of its own: each page carries its checksum in its `PageEntry`, a
+ * reader reads pages (never the whole range), and the range may exceed the 1 MiB blob cap.
+ */
+export type ChunkData = Omit<BlobRef, "checksum">;
 
 export interface ManifestRoot {
   readonly formatVersion: number;
@@ -161,8 +197,8 @@ export interface GroupRoot {
 export interface ColumnChunk {
   readonly columnId: number;
   readonly type: PhysicalType;
-  /** The extent holding this chunk's pages, contiguously. */
-  readonly data: ExtentRef;
+  /** The chunk's pages, contiguously, inside one extent (possibly shared: "Packing"). */
+  readonly data: ChunkData;
   /** → PageEntry[] for this column of this group. */
   readonly directory: BlobRef;
   readonly statistics: ColumnStatistics;
@@ -182,7 +218,7 @@ export const PageEncoding = {
 } as const;
 
 export interface PageEntry {
-  /** Byte offset (relative to `ColumnChunk.data.offset`) and length of the page. */
+  /** Byte offset (relative to the start of the `ColumnChunk.data` blob) and length of the page. */
   readonly offset: number;
   readonly length: number;
   /** Row positions this page covers within the group. */

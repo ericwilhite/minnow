@@ -9,6 +9,9 @@ import {
 const T0 = 1_000_000;
 const request = (sequence: number, extra: Partial<RequestIdentity> = {}): RequestIdentity => ({
   clientId: "c1",
+  sessionId: "s1",
+  generation: 1,
+  scope: "standalone",
   sequence,
   sentAtMs: T0,
   resolvedThrough: 0,
@@ -123,15 +126,17 @@ describe("settling requests with no durable effect (Phase B ruling)", () => {
 describe("statements inside an open transaction (review A1-4 finding 3)", () => {
   const statement = (rowCount: number) =>
     ({ kind: "statement", status: "ok", counts: { rowCount }, recordedAtMs: T0 }) as const;
+  const inTransaction = (sequence: number, extra: Partial<RequestIdentity> = {}) =>
+    request(sequence, { scope: "transaction", ...extra });
 
   it("answers a retried in-transaction statement from its session outcome, never twice (review probe)", () => {
     const ledger = new RequestLedger();
     let executed = 0;
     for (let attempt = 0; attempt < 2; attempt++) {
-      const admission = ledger.admit(request(1), T0 + attempt);
+      const admission = ledger.admit(inTransaction(1), T0 + attempt);
       if (admission.kind === "execute") {
         executed += 1;
-        ledger.record("c1", 1, statement(4));
+        expect(ledger.record("c1", 1, statement(4))).toBe(true);
       } else expect(admission).toEqual({ kind: "duplicate", outcome: statement(4) });
     }
     expect(executed).toBe(1);
@@ -139,15 +144,104 @@ describe("statements inside an open transaction (review A1-4 finding 3)", () => 
 
   it("keeps session outcomes out of the durable checkpoint and drops them when the session ends", () => {
     const ledger = new RequestLedger();
-    ledger.admit(request(1), T0);
+    ledger.admit(inTransaction(1), T0);
     ledger.record("c1", 1, statement(2));
     ledger.admit(request(2), T0);
     ledger.record("c1", 2, committed(10, 2));
     expect(ledger.checkpoint()[0]?.outcomes.map((o) => o.sequence)).toEqual([2]);
-    ledger.endSession("c1");
+    ledger.endSession("c1", "s1", 1, T0);
     expect(ledger.admit(request(2), T0).kind).toBe("duplicate");
-    // After the session ended a retry of the statement cannot be answered: it was a new session's
-    // job to never send it (its transaction died with the session).
-    expect(ledger.admit(request(1), T0).kind).toBe("execute");
+    // Its transaction rolled back with the generation: the retry is refused, never run.
+    expect(ledger.admit(inTransaction(1), T0).kind).toBe("sessionLost");
+  });
+});
+
+describe("session generations (review A1-5 finding 2, rulings R16.1 and R16.2)", () => {
+  const statement = {
+    kind: "statement",
+    status: "ok",
+    counts: { rows: 1 },
+    recordedAtMs: T0 + 1,
+  } as const;
+  const inTransaction = (sequence: number, extra: Partial<RequestIdentity> = {}) =>
+    request(sequence, { scope: "transaction", ...extra });
+
+  it("drops an ended generation's pending statements, so pruning forgets the client (review probe)", () => {
+    const ledger = new RequestLedger();
+    expect(ledger.admit(inTransaction(1), T0).kind).toBe("execute");
+    ledger.endSession("c1", "s1", 1, T0);
+    expect(ledger.inFlight).toBe(0);
+    ledger.prune(T0 + 2 * CLIENT_RETRY_WINDOW_MS);
+    expect(ledger.checkpoint()).toEqual([]);
+    // The probe's reconnect: the old statement, retried, is refused while the window allows it.
+    const ledger2 = new RequestLedger();
+    ledger2.admit(inTransaction(1), T0);
+    ledger2.endSession("c1", "s1", 1, T0 + 5);
+    expect(ledger2.admit(inTransaction(1), T0 + 10).kind).toBe("sessionLost");
+    // The reconnected generation runs its own requests.
+    expect(ledger2.admit(inTransaction(2, { generation: 2 }), T0 + 10).kind).toBe("execute");
+  });
+
+  it("ignores a completion that arrives after its generation ended (review probe)", () => {
+    const ledger = new RequestLedger();
+    ledger.admit(inTransaction(1), T0);
+    ledger.endSession("c1", "s1", 1, T0);
+    expect(ledger.record("c1", 1, statement)).toBe(false);
+    expect(ledger.record("c1", 1, { kind: "failed", code: "X", recordedAtMs: T0 })).toBe(false);
+    expect(ledger.size).toBe(0);
+    // Not "duplicate": nothing was recorded for the dead transaction.
+    expect(ledger.admit(inTransaction(1), T0 + 2).kind).toBe("sessionLost");
+  });
+
+  it("lets a commit pending at the end complete and record its durable outcome", () => {
+    const ledger = new RequestLedger();
+    ledger.admit(request(1), T0); // COMMIT (standalone), in progress
+    ledger.endSession("c1", "s1", 1, T0);
+    expect(ledger.inFlight).toBe(1);
+    expect(ledger.record("c1", 1, committed(10, 3))).toBe(true);
+    expect(ledger.admit(request(1), T0)).toEqual({ kind: "duplicate", outcome: committed(10, 3) });
+    expect(ledger.checkpoint()[0]?.outcomes.map((o) => o.sequence)).toEqual([1]);
+  });
+
+  it("ends one session of a client without touching another's retry protection (R16.1)", () => {
+    const ledger = new RequestLedger();
+    const s2 = (sequence: number) => inTransaction(sequence, { sessionId: "s2" });
+    ledger.admit(inTransaction(1), T0);
+    ledger.record("c1", 1, statement);
+    ledger.admit(s2(2), T0);
+    ledger.record("c1", 2, statement);
+    ledger.admit(s2(3), T0); // still executing in s2
+    ledger.admit(inTransaction(4), T0); // still executing in s1
+    ledger.endSession("c1", "s1", 1, T0);
+    expect(ledger.admit(inTransaction(1), T0).kind).toBe("sessionLost");
+    expect(ledger.admit(inTransaction(4), T0).kind).toBe("sessionLost");
+    expect(ledger.admit(s2(2), T0)).toEqual({ kind: "duplicate", outcome: statement });
+    expect(ledger.admit(s2(3), T0).kind).toBe("inFlight");
+    expect(ledger.record("c1", 3, statement)).toBe(true);
+    expect(ledger.admit(s2(3), T0).kind).toBe("duplicate");
+    // Ending an older generation of s2 than the one in use changes nothing for it.
+    ledger.endSession("c1", "s2", 0, T0);
+    expect(ledger.admit(s2(2), T0).kind).toBe("duplicate");
+  });
+
+  it("runs standalone queries at least once: a settled nextval is re-executed (R16.2)", () => {
+    const ledger = new RequestLedger();
+    expect(ledger.admit(request(1), T0).kind).toBe("execute"); // SELECT nextval('s')
+    ledger.settle("c1", 1);
+    expect(ledger.admit(request(1), T0 + 1).kind).toBe("execute");
+    ledger.settle("c1", 1);
+    expect(ledger.size).toBe(0);
+  });
+
+  it("expires an ended generation's retries before the ledger forgets the generation", () => {
+    const ledger = new RequestLedger();
+    ledger.admit(inTransaction(1), T0);
+    ledger.endSession("c1", "s1", 1, T0);
+    ledger.admit(request(2), T0 + 2 * CLIENT_RETRY_WINDOW_MS); // the client stays active
+    ledger.settle("c1", 2);
+    ledger.prune(T0 + 2 * CLIENT_RETRY_WINDOW_MS + 1);
+    expect(ledger.admit(inTransaction(1), T0 + 2 * CLIENT_RETRY_WINDOW_MS + 1).kind).toBe(
+      "expired",
+    );
   });
 });

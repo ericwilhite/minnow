@@ -4,10 +4,18 @@
  * ## Identity
  * - A client has a `clientId` of 16 random bytes for its whole page lifetime. It keeps it across
  *   reconnects and owner changes; a reload is a new client.
- * - Each request carries `(clientId, sequence, sentAtMs, resolvedThrough)`. Sequences increase as
+ * - A client runs one or more engine **sessions** (`sessionId`, unique within the client: each has
+ *   its own transaction state). A session's connection to the owner is a **generation**: it
+ *   starts at 1 and a reconnect is the next one. A transaction lives in one generation.
+ * - Each request carries `(clientId, sessionId, generation, sequence, sentAtMs, resolvedThrough)`
+ *   and its `scope` (below); a retry resends them unchanged. Sequences are per client, increase as
  *   the client issues them, may arrive out of order (up to `MAX_OUTSTANDING_REQUESTS` in flight,
  *   the worker protocol's limit), and may have gaps. `resolvedThrough` is the highest S such that
  *   the client holds the outcome of every request ≤ S.
+ * - `scope` is `transaction` for a statement the client sent inside an explicit transaction it
+ *   opened (after BEGIN, before COMMIT or ROLLBACK), and `standalone` for everything else: an
+ *   autocommit statement, BEGIN, COMMIT, ROLLBACK, a read. The client knows it; the owner cannot
+ *   tell after a reconnect, when the transaction is gone.
  *
  * ## Admission (`RequestLedger.admit`), checked by the receiver before executing anything
  * - `expired`: `now − sentAtMs > CLIENT_RETRY_WINDOW_MS`. Never executed; the receiver answers
@@ -19,19 +27,39 @@
  * - `duplicate`: the outcome is recorded: a committed write answers "already committed" with its
  *   original affected-row counts (RETURNING rows are not replayed: the duplicate gets counts
  *   only); a failure answers with the same error code.
+ * - `sessionLost`: a `transaction`-scope request of a generation that has ended (and no outcome
+ *   is held for it). Never executed: its transaction rolled back with the generation; the receiver
+ *   answers `SessionLostError` (next/errors.ts).
  * - `execute`: first sight; run it.
  *
  * ## Outcomes by kind of request
- * - **Commit** (a statement in autocommit, or COMMIT): a durable `committed` outcome (below).
- * - **Statement inside an open transaction**: it changed the transaction's state, so running it
- *   twice would apply it twice. It records a `statement` outcome (status and counts): in memory
- *   only, scoped to the client's session, and dropped by `endSession` (when the client's session
- *   ends: its Web Lock is released or it disconnects), by acknowledgement, or by the window. A
+ * - **Commit** (an autocommit write, or COMMIT): exactly once. A durable `committed` outcome
+ *   (below), recorded once the commit is durable.
+ * - **Statement inside an open transaction** (`transaction` scope): it changed the transaction's
+ *   state, so running it twice would apply it twice. It records a `statement` (or `failed`)
+ *   outcome, in memory only, keyed by its `(clientId, sessionId, generation)` (ruling R16.1). A
  *   duplicate gets it back instead of running again.
- * - **A request that changed nothing** (a read, read-only transaction work, a ROLLBACK of a
- *   transaction already gone) is `settle`d: it leaves `inFlight` and records nothing, so a retry
- *   simply runs again.
+ * - **Standalone queries** (reads, including `SELECT nextval(...)`, and anything else that is not
+ *   a commit) are **at-least-once** (ruling R16.2): they are `settle`d, which records nothing, so a
+ *   retry runs them again. A `nextval` whose answer was lost is a sequence gap, which PostgreSQL
+ *   allows. Only commits are exactly-once.
  * - **Failure**: a `failed` outcome, in memory only.
+ *
+ * ## Sessions (`endSession`, review A1-5 finding 2)
+ * `endSession(clientId, sessionId, generation, nowMs)` closes that generation of that session (and any
+ * earlier one): when the connection drops, the client's Web Lock is released, or the session is
+ * closed. Its open transaction rolls back. Then:
+ * - its `transaction`-scope requests leave `inFlight` and their outcomes are dropped; a late
+ *   completion for them (`record` after the close) is ignored and never recorded, and a retry is
+ *   `sessionLost`;
+ * - its pending `standalone` requests are untouched: a commit in progress completes and records
+ *   its durable outcome, so its retry gets `duplicate`;
+ * - every other session of the client, and every other client, is untouched: their retry
+ *   protection stays.
+ * The owner ends every admitted request with `record` or `settle`, so nothing stays in flight.
+ * The ledger remembers an ended generation for two windows: any request of it was sent before the
+ * client saw that connection end (within the owner liveness timeout of `endSession`, far below a
+ * window), so by then its retries are `expired`. A client's ended sessions go with the client.
  *
  * ## Durability and bounds
  * - Committed outcomes are durable: the commit's log frame carries the request (log-frame.ts
@@ -51,12 +79,21 @@
 export const CLIENT_RETRY_WINDOW_MS = 10 * 60 * 1000;
 export const MAX_OUTSTANDING_REQUESTS = 256;
 
-export interface RequestIdentity {
+/** One generation of one engine session of a client. */
+export interface SessionRef {
+  readonly sessionId: string;
+  /** 1 for the first connection; a reconnect is the next. */
+  readonly generation: number;
+}
+
+export interface RequestIdentity extends SessionRef {
   /** Hex of the 16-byte client id. */
   readonly clientId: string;
   readonly sequence: number;
   readonly sentAtMs: number;
   readonly resolvedThrough: number;
+  /** "Identity": `transaction` inside an explicit transaction the client opened. */
+  readonly scope: "transaction" | "standalone";
 }
 
 export type Outcome =
@@ -80,7 +117,7 @@ export type Admission =
   | { readonly kind: "execute" }
   | { readonly kind: "inFlight" }
   | { readonly kind: "duplicate"; readonly outcome: Outcome }
-  | { readonly kind: "expired" | "stale" | "window" };
+  | { readonly kind: "expired" | "stale" | "window" | "sessionLost" };
 
 /** The durable form, in the manifest root (committed outcomes only). */
 export interface ClientLedgerEntry {
@@ -94,11 +131,26 @@ export interface ClientLedgerEntry {
   }>;
 }
 
+/** What a request or outcome belongs to: its session generation for `transaction` scope. */
+interface Owner {
+  readonly sessionId: string;
+  readonly generation: number;
+  readonly scope: "transaction" | "standalone";
+}
+
+interface Held {
+  readonly outcome: Outcome;
+  /** Null for outcomes restored from a checkpoint or replayed (committed, session-free). */
+  readonly owner: Owner | null;
+}
+
 interface ClientState {
   resolvedThrough: number;
   lastSeenMs: number;
-  readonly outcomes: Map<number, Outcome>;
-  readonly inFlight: Set<number>;
+  readonly outcomes: Map<number, Held>;
+  readonly inFlight: Map<number, Owner>;
+  /** Per session: generations ≤ `generation` have ended, at `atMs`. */
+  readonly ended: Map<string, { generation: number; atMs: number }>;
 }
 
 export class RequestLedger {
@@ -107,7 +159,13 @@ export class RequestLedger {
   #client(id: string, nowMs: number): ClientState {
     let client = this.#clients.get(id);
     if (client === undefined) {
-      client = { resolvedThrough: 0, lastSeenMs: nowMs, outcomes: new Map(), inFlight: new Set() };
+      client = {
+        resolvedThrough: 0,
+        lastSeenMs: nowMs,
+        outcomes: new Map(),
+        inFlight: new Map(),
+        ended: new Map(),
+      };
       this.#clients.set(id, client);
     }
     return client;
@@ -121,35 +179,65 @@ export class RequestLedger {
     if (request.sequence <= client.resolvedThrough) return { kind: "stale" };
     if (request.sequence > client.resolvedThrough + MAX_OUTSTANDING_REQUESTS)
       return { kind: "window" };
-    const outcome = client.outcomes.get(request.sequence);
-    if (outcome !== undefined) return { kind: "duplicate", outcome };
+    const held = client.outcomes.get(request.sequence);
+    if (held !== undefined) return { kind: "duplicate", outcome: held.outcome };
     if (client.inFlight.has(request.sequence)) return { kind: "inFlight" };
-    client.inFlight.add(request.sequence);
+    if (
+      request.scope === "transaction" &&
+      request.generation <= (client.ended.get(request.sessionId)?.generation ?? 0)
+    )
+      return { kind: "sessionLost" };
+    client.inFlight.set(request.sequence, {
+      sessionId: request.sessionId,
+      generation: request.generation,
+      scope: request.scope,
+    });
     return { kind: "execute" };
   }
 
   /**
-   * Ends an admitted request that changed nothing (a read, read-only work) without recording an
-   * outcome: a retry runs it again. Never for a statement inside an open transaction: record a
-   * `statement` outcome instead.
+   * Ends an admitted request that records nothing (a standalone query: at-least-once, R16.2), so
+   * a retry runs it again. Never for a statement inside an open transaction or a commit.
    */
   settle(clientId: string, sequence: number): void {
     this.#clients.get(clientId)?.inFlight.delete(sequence);
   }
 
-  /** Ends a client's session: its `statement` outcomes go (durable and failed outcomes stay). */
-  endSession(clientId: string): void {
+  /**
+   * Ends generations ≤ `generation` of one session of a client ("Sessions"): drops that session's
+   * `transaction`-scope requests and outcomes; its standalone requests (commits in progress) and
+   * every other session keep theirs.
+   */
+  endSession(clientId: string, sessionId: string, generation: number, nowMs: number): void {
     const client = this.#clients.get(clientId);
     if (client === undefined) return;
-    for (const [sequence, outcome] of client.outcomes)
-      if (outcome.kind === "statement") client.outcomes.delete(sequence);
+    if (generation > (client.ended.get(sessionId)?.generation ?? 0))
+      client.ended.set(sessionId, { generation, atMs: nowMs });
+    const ended = (owner: Owner | null) =>
+      owner !== null &&
+      owner.scope === "transaction" &&
+      owner.sessionId === sessionId &&
+      owner.generation <= generation;
+    for (const [sequence, owner] of client.inFlight)
+      if (ended(owner)) client.inFlight.delete(sequence);
+    for (const [sequence, held] of client.outcomes)
+      if (ended(held.owner)) client.outcomes.delete(sequence);
   }
 
-  /** Records the terminal outcome of an admitted request (a commit only once it is durable). */
-  record(clientId: string, sequence: number, outcome: Outcome): void {
+  /**
+   * Records the terminal outcome of an admitted request (a commit only once it is durable), and
+   * returns whether it was kept. A completion that is no longer in flight is kept only if it is
+   * a durable commit (replay records those too); otherwise it belongs to an ended generation (or
+   * was never admitted) and is ignored ("Sessions").
+   */
+  record(clientId: string, sequence: number, outcome: Outcome): boolean {
     const client = this.#client(clientId, outcome.recordedAtMs);
+    const owner = client.inFlight.get(sequence) ?? null;
+    if (owner === null && outcome.kind !== "committed") return false;
     client.inFlight.delete(sequence);
-    if (sequence > client.resolvedThrough) client.outcomes.set(sequence, outcome);
+    if (sequence <= client.resolvedThrough) return false;
+    client.outcomes.set(sequence, { outcome, owner });
+    return true;
   }
 
   #acknowledge(client: ClientState, resolvedThrough: number): void {
@@ -162,8 +250,11 @@ export class RequestLedger {
   /** Drops outcomes older than the window and clients idle for it. */
   prune(nowMs: number): void {
     for (const [id, client] of this.#clients) {
-      for (const [sequence, outcome] of client.outcomes)
-        if (nowMs - outcome.recordedAtMs > CLIENT_RETRY_WINDOW_MS) client.outcomes.delete(sequence);
+      for (const [sequence, held] of client.outcomes)
+        if (nowMs - held.outcome.recordedAtMs > CLIENT_RETRY_WINDOW_MS)
+          client.outcomes.delete(sequence);
+      for (const [sessionId, ended] of client.ended)
+        if (nowMs - ended.atMs > 2 * CLIENT_RETRY_WINDOW_MS) client.ended.delete(sessionId);
       if (
         client.outcomes.size === 0 &&
         client.inFlight.size === 0 &&
@@ -180,22 +271,30 @@ export class RequestLedger {
     return size;
   }
 
+  /** Requests admitted and not yet recorded or settled (an owner leak shows here). */
+  get inFlight(): number {
+    let count = 0;
+    for (const client of this.#clients.values()) count += client.inFlight.size;
+    return count;
+  }
+
   /** The durable checkpoint: committed outcomes only. */
   checkpoint(): ClientLedgerEntry[] {
     return [...this.#clients].map(([clientId, client]) => ({
       clientId,
       resolvedThrough: client.resolvedThrough,
-      outcomes: [...client.outcomes]
-        .filter(
-          (entry): entry is [number, Extract<Outcome, { kind: "committed" }>] =>
-            entry[1].kind === "committed",
-        )
-        .map(([sequence, outcome]) => ({
-          sequence,
-          lsn: outcome.lsn,
-          counts: outcome.counts,
-          recordedAtMs: outcome.recordedAtMs,
-        })),
+      outcomes: [...client.outcomes].flatMap(([sequence, { outcome }]) =>
+        outcome.kind === "committed"
+          ? [
+              {
+                sequence,
+                lsn: outcome.lsn,
+                counts: outcome.counts,
+                recordedAtMs: outcome.recordedAtMs,
+              },
+            ]
+          : [],
+      ),
     }));
   }
 
@@ -207,10 +306,13 @@ export class RequestLedger {
       client.resolvedThrough = entry.resolvedThrough;
       for (const outcome of entry.outcomes)
         client.outcomes.set(outcome.sequence, {
-          kind: "committed",
-          lsn: outcome.lsn,
-          counts: outcome.counts,
-          recordedAtMs: outcome.recordedAtMs,
+          outcome: {
+            kind: "committed",
+            lsn: outcome.lsn,
+            counts: outcome.counts,
+            recordedAtMs: outcome.recordedAtMs,
+          },
+          owner: null,
         });
     }
     return ledger;

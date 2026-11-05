@@ -31,9 +31,11 @@
  *   staged rows and their staged index runs visible together, and consumes the staging. The frame
  *   names the indexes it built runs for; if they differ from the staged runs, replay refuses.
  * After replay, staging no frame claimed belongs to a transaction that never committed: recovery
- * drops it (`Replayer.unclaimedStaging`), and its extents become free at the next publish. A root
- * that folds staged rows into the table's groups sets `flushedThroughLsn ≥ L` and removes the
- * staging entry in the same publish.
+ * drops it (`Replayer.unclaimedStaging`) with a publish whose root no longer lists it. That publish
+ * retires the staging's extents; they are reused only once neither durable root (current and
+ * previous slot) nor any pin reaches them (manifest.ts "Reclaim (two generations)"). A root that
+ * folds staged rows into the table's groups sets `flushedThroughLsn ≥ L` and removes the staging
+ * entry in the same publish.
  *
  * ## Writer obligations
  * 1. **A checkpoint covers the rows before the schema it records.** A root whose `globalLsn` covers

@@ -60,6 +60,44 @@ async function workload(session: StoreSession, acknowledged: Acknowledged): Prom
   }
 }
 
+/** Checks that `root` (a workload root) names an intact extent. */
+async function checkExtent(session: StoreSession, root: string, what: string): Promise<void> {
+  const ref = JSON.parse(root) as { offset: number; length: number; checksum: number };
+  if (ref.offset + ref.length > (await session.dataLength())) fail(`${what}'s extent is missing`);
+  const [bytes] = await session.readData([ref]);
+  if (bytes === undefined || xxHash32(bytes) !== ref.checksum)
+    fail(`${what}'s extent does not match its checksum`);
+}
+
+const decode = (bytes: Uint8Array | null) =>
+  bytes === null ? null : new TextDecoder().decode(bytes);
+
+/**
+ * Guarantee 1 plus the previous root (two-generation reclaim walks both): the current root is the
+ * last published or the in-flight one; the previous root is exactly the one published before the
+ * current, or absent only when the current is the first, or when an interrupted publish may have
+ * overwritten its slot; and the extents both roots name are intact.
+ */
+async function checkRoots(session: StoreSession, acknowledged: Acknowledged, label: string) {
+  const root = decode(await session.readRoot());
+  const previous = decode(await session.readPreviousRoot());
+  const published = acknowledged.published;
+  const last = published.at(-1) ?? null;
+  if (root !== last && root !== acknowledged.inFlight)
+    fail(`${label}: root ${String(root)} is not the last published or in-flight one`);
+  let expected: string | null;
+  let mayBeLost: boolean;
+  if (root === null) [expected, mayBeLost] = [null, false];
+  else if (root === acknowledged.inFlight && root !== last) [expected, mayBeLost] = [last, false];
+  else [expected, mayBeLost] = [published.at(-2) ?? null, acknowledged.inFlight !== null];
+  if (previous !== expected && !(mayBeLost && previous === null))
+    fail(
+      `${label}: previous root ${String(previous)} is not the one before the current (${String(expected)})`,
+    );
+  if (root !== null) await checkExtent(session, root, `${label}: the published root`);
+  if (previous !== null) await checkExtent(session, previous, `${label}: the previous root`);
+}
+
 async function open(backend: StorageBackend): Promise<StoreSession> {
   return backend.open(await backend.acquire({ timeoutMs: 2_000 }));
 }
@@ -73,12 +111,17 @@ export async function runStorageKit(
     await testCase.run(async () => createOverDisk(new SimDisk()));
 
   const clean = new SimDisk();
-  await workload(await open(createOverDisk(clean)), {
-    published: [],
-    inFlight: null,
-    logBytes: new Uint8Array(0),
-  });
+  const cleanRun: Acknowledged = { published: [], inFlight: null, logBytes: new Uint8Array(0) };
+  const firstBackend = createOverDisk(clean);
+  const firstLease = await firstBackend.acquire({ timeoutMs: 2_000 });
+  const first = await firstBackend.open(firstLease);
+  await workload(first, cleanRun);
   const steps = clean.steps;
+  await checkRoots(first, cleanRun, "clean run");
+  await first.close();
+  await firstLease.release();
+  // Reopened as a new process would: both roots and their extents survive.
+  await checkRoots(await open(createOverDisk(clean)), cleanRun, "clean reopen");
   const seeds = options.seeds ?? 8;
   for (let step = 0; step <= steps; step++)
     for (let seed = 1; seed <= seeds; seed++) {
@@ -96,20 +139,7 @@ export async function runStorageKit(
       }
       const label = `crash at step ${String(step)}, seed ${String(seed)}`;
       const session = await open(createOverDisk(disk));
-      // Guarantee 1: the last published root or the one in flight, and its extent intact.
-      const rootBytes = await session.readRoot();
-      const root = rootBytes === null ? null : new TextDecoder().decode(rootBytes);
-      const allowed = [acknowledged.published.at(-1) ?? null, acknowledged.inFlight];
-      if (!allowed.includes(root))
-        fail(`${label}: root ${String(root)} is not the last published or in-flight one`);
-      if (root !== null) {
-        const ref = JSON.parse(root) as { offset: number; length: number; checksum: number };
-        if (ref.offset + ref.length > (await session.dataLength()))
-          fail(`${label}: a published extent is missing`);
-        const [bytes] = await session.readData([ref]);
-        if (bytes === undefined || xxHash32(bytes) !== ref.checksum)
-          fail(`${label}: a published extent does not match its checksum`);
-      }
+      await checkRoots(session, acknowledged, label);
       // Guarantee 3: every log byte acknowledged by a flush is there.
       const flushed = acknowledged.logBytes;
       if (session.logLength() < flushed.length)
