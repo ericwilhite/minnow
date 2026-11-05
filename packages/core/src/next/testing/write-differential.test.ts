@@ -64,8 +64,28 @@ import {
 } from "./divergences.js";
 import { DEFAULT_KEY_FORWARD_RETENTION_MS } from "../../engine/key-forwards.js";
 
-const SEEDS = seedsFor("next-write-differential", [0xd1ff, 7, 4242, 90210]);
+const SEEDS = seedsFor("next-write-differential", [0xd1ff, 7, 4242, 90210, 31337, 2718]);
 const STEPS = 160;
+/**
+ * A step that takes longer than this is a hang (a correctness bug), reported with its label. It
+ * catches a stall on a promise; a loop that never yields to the event loop (as the minSeq one did)
+ * starves the timer too, and shows as the suite's timeout instead.
+ */
+const STEP_LIMIT_MS = 30_000;
+
+async function within<T>(label: string, work: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const limit = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${label} did not finish within ${String(STEP_LIMIT_MS)} ms`));
+    }, STEP_LIMIT_MS);
+  });
+  try {
+    return await Promise.race([work, limit]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 const FREE = { allocate: () => true, free: () => undefined };
 
 type Outcome = "ok" | "unique" | "foreignKey";
@@ -687,10 +707,13 @@ describe("write path vs PostgreSQL and the current engine (generated)", () => {
           }
           const expected = await runOn(pg, sqls, rollback);
           const log: StepLog = { moved: [] };
-          const actual = await transaction(
-            path,
-            rollback,
-            ...ops.map((op) => (statement: Statement) => op.run(statement, ids, log)),
+          const actual = await within(
+            `the write path at ${label}`,
+            transaction(
+              path,
+              rollback,
+              ...ops.map((op) => (statement: Statement) => op.run(statement, ids, log)),
+            ),
           );
           expect(actual, `${label} (PostgreSQL: ${String(expected.message)})`).toBe(
             expected.outcome,
