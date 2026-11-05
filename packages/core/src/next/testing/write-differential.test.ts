@@ -1,12 +1,16 @@
 /**
- * The generated differential (review B3-p2a-1): seeded random workloads of the statements the
- * write path supports today, run against the write path, PostgreSQL (PGlite: the law) and the
- * current engine (`MinnowDatabase`) side by side. After every step the write path must agree with
- * PostgreSQL on each table's rows, on which statements failed and why (unique / foreign key), and
- * on what the indexes return; and with the current engine on all of it until the current engine
- * first disagrees with PostgreSQL. That divergence is recorded, must be a known current-engine
- * defect (`KNOWN_ORACLE_DEFECTS`), and ends the comparison with the current engine for the seed
- * (its state differs from then on).
+ * The generated differential for the write path (review B3-p2a-1): seeded random workloads of the
+ * statements the write path supports today, run on the write path, PostgreSQL (PGlite: the law) and
+ * the current engine (`MinnowDatabase`) side by side. After every step the write path must agree
+ * with PostgreSQL on each table's rows, on which statements failed and why (unique / foreign key),
+ * and on what the indexes return; and the current engine must agree with PostgreSQL too, unless the
+ * difference is a registered intended divergence (ruling R21, `divergences.ts`).
+ *
+ * The current engine runs each step inside a transaction and commits only when its outcome and
+ * rows match PostgreSQL's. Otherwise it rolls back, the difference must match a registered
+ * divergence, and the harness moves the engine's clock past the key-forwarding window (the only
+ * entry so far) and runs the step again, which must then match exactly. So the comparison with the
+ * current engine continues through every step of every seed.
  *
  * Statements: multi-row INSERT (duplicate keys, in the batch and against stored rows; NULLs in a
  * UNIQUE column), UPDATE by primary key (of a UNIQUE and an indexed column, and of the key itself
@@ -32,7 +36,7 @@ import {
 } from "../access/modify.js";
 import type { Snapshot } from "../access/snapshot.js";
 import { encodeKeyBatch, KeyBatch } from "../keys/key-encoding.js";
-import type { WritePathImpl } from "./engine.js";
+import type { WritePathImpl } from "../write/engine.js";
 import {
   batch,
   column,
@@ -46,7 +50,9 @@ import {
   TEXT,
   texts,
   type Value,
-} from "./test-support.js";
+} from "../write/test-support.js";
+import { intendedDivergence, type Divergence } from "./divergences.js";
+import { DEFAULT_KEY_FORWARD_RETENTION_MS } from "../../engine/key-forwards.js";
 
 const SEEDS = seedsFor("next-write-differential", [0xd1ff, 7, 4242, 90210]);
 const STEPS = 160;
@@ -88,11 +94,13 @@ async function postgres(): Promise<Oracle> {
   };
 }
 
-function currentEngine(): Oracle {
+/** The current engine, on a clock the harness moves (`now`). */
+function currentEngine(clock: { ms: number }): Oracle {
   const db = new MinnowDatabase(new MemoryBlockStore(), {
     compression: "raw",
     autoCompact: false,
     autoCollect: false,
+    now: () => new Date(clock.ms),
   });
   return {
     name: "current engine",
@@ -108,24 +116,6 @@ function currentEngine(): Oracle {
     },
     close: () => db.close(),
   };
-}
-
-/**
- * Current-engine results PostgreSQL contradicts, found by this suite. The write path follows
- * PostgreSQL; the comparison with the current engine ends at the first one.
- */
-const KNOWN_ORACLE_DEFECTS: ReadonlyArray<(message: string, history: History) => boolean> = [
-  // After `UPDATE t SET id = 15 WHERE id = 51`, the current engine still refuses a new row with
-  // id 51 ("Duplicate value for t.id: 51"); PostgreSQL inserts it.
-  (message, history) => {
-    const match = /^Duplicate value for t\.id: (\d+)$/u.exec(message);
-    return match !== null && history.rekeyedAway.has(Number(match[1]));
-  },
-];
-
-/** What PostgreSQL has accepted so far, for recognising a known current-engine defect. */
-interface History {
-  readonly rekeyedAway: Set<number>;
 }
 
 /** Runs one generated step on an oracle: its statements in a transaction when there are several. */
@@ -153,10 +143,18 @@ async function runOn(
 const sql = (value: number | string | null) =>
   value === null ? "NULL" : typeof value === "number" ? String(value) : `'${value}'`;
 
-/** One generated operation: its SQL for the oracle and its write-path form. */
+/** One generated operation: its SQL for the oracles and its write-path form. */
 interface Op {
   readonly sql: string;
-  readonly run: (statement: Statement, ids: Ids) => Promise<unknown>;
+  /** Values of t's primary key the operation names (written, matched or referenced). */
+  readonly keys: readonly number[];
+  readonly run: (statement: Statement, ids: Ids, step: StepLog) => Promise<unknown>;
+}
+
+/** What a step's write-path run did that the divergence facts need. */
+interface StepLog {
+  /** Keys of t a rekey moved a row away from. */
+  readonly moved: number[];
 }
 
 interface Ids {
@@ -255,6 +253,7 @@ class Workload {
         s: this.text(),
       }));
       return {
+        keys: rows.map((row) => row.id),
         sql: `INSERT INTO t VALUES ${rows.map((row) => `(${sql(row.id)}, ${sql(row.u)}, ${sql(row.v)}, ${sql(row.s)})`).join(", ")}`,
         run: (statement, ids) =>
           Promise.resolve(
@@ -277,6 +276,7 @@ class Workload {
       const u = this.maybe(120, 0.3);
       const v = this.maybe(10);
       return {
+        keys: [id],
         sql: `UPDATE t SET u = ${sql(u)}, v = ${sql(v)} WHERE id = ${String(id)}`,
         run: async (statement, ids) => {
           const at = await locate(statement.view, ids.t, primaryOf(statement, ids.t), id);
@@ -295,20 +295,23 @@ class Workload {
       if ((children.get(next) ?? 0) > 0 || (children.get(id) ?? 0) > 0)
         return this.op(parents, children);
       return {
+        keys: [id, next],
         sql: `UPDATE t SET id = ${String(next)} WHERE id = ${String(id)}`,
-        run: async (statement, ids) => {
+        run: async (statement, ids, step) => {
           const def = statement.catalog.table(ids.t);
           const at = await locate(statement.view, ids.t, primaryOf(statement, ids.t), id);
           if (at === null) return;
           await statement
             .table(ids.t, { assigned: [def?.columns[0]?.id ?? 0] })
             .update(batch(locators([at], ids.t), ints([next])), null);
+          if (next !== id) step.moved.push(id);
         },
       };
     }
     if (kind < 77) {
       const id = pick();
       return {
+        keys: [id],
         sql: `DELETE FROM t WHERE id = ${String(id)}`,
         run: async (statement, ids) => {
           const at = await locate(statement.view, ids.t, primaryOf(statement, ids.t), id);
@@ -321,6 +324,7 @@ class Workload {
       const id = this.int(60);
       const pid = this.chance(0.15) ? null : pick();
       return {
+        keys: pid === null ? [] : [pid],
         sql: `INSERT INTO c VALUES (${String(id)}, ${sql(pid)})`,
         run: (statement, ids) =>
           Promise.resolve(statement.table(ids.c).insert(batch(ints([id]), ints([pid])), null)),
@@ -328,6 +332,7 @@ class Workload {
     }
     const id = this.int(60);
     return {
+      keys: [],
       sql: `DELETE FROM c WHERE id = ${String(id)}`,
       run: async (statement, ids) => {
         const at = await locate(statement.view, ids.c, primaryOf(statement, ids.c), id);
@@ -484,33 +489,68 @@ async function childCounts(path: WritePathImpl, ids: Ids): Promise<Map<number, n
   return counts;
 }
 
-interface Divergence {
+interface Observed {
   readonly step: string;
+  readonly divergence: Divergence;
   readonly current: string | null;
-  readonly postgres: string | null;
+}
+
+/**
+ * Runs a step on the current engine inside a transaction; commits only when its outcome, and (for
+ * a committed step) its rows, are PostgreSQL's. Returns whether it matched, and its error.
+ */
+async function stepOnCurrent(
+  current: Oracle,
+  sqls: readonly string[],
+  rollback: boolean,
+  expected: { readonly outcome: Outcome },
+  rows: { readonly t: Value[][]; readonly c: Value[][] },
+): Promise<{ readonly same: boolean; readonly error: string | null }> {
+  await current.execute("BEGIN");
+  let outcome: Outcome = "ok";
+  let error: string | null = null;
+  for (const text of sqls)
+    try {
+      await current.execute(text);
+    } catch (caught) {
+      outcome = current.classify(caught);
+      error = caught instanceof Error ? caught.message : String(caught);
+      break;
+    }
+  let same = outcome === expected.outcome;
+  if (same && outcome === "ok" && !rollback) {
+    const t = await oracleRows(current, "t", "id, u, v, s");
+    const c = await oracleRows(current, "c", "id, pid");
+    same =
+      JSON.stringify(t) === JSON.stringify(rows.t) && JSON.stringify(c) === JSON.stringify(rows.c);
+  }
+  await current.execute(same && outcome === "ok" && !rollback ? "COMMIT" : "ROLLBACK");
+  return { same, error };
 }
 
 describe("write path vs PostgreSQL and the current engine (generated)", () => {
-  const divergences: Divergence[] = [];
-  let lockstep = 0;
+  const observed: Observed[] = [];
+  let compared = 0;
   for (const seed of SEEDS)
     it(`seed ${String(seed)}`, async () => {
       const workload = new Workload(seed);
       const harness = new Harness("strict", "sim", 16);
       let path = await harness.open();
       const pg = await postgres();
-      let current: Oracle | null = currentEngine();
+      const clock = { ms: Date.UTC(2026, 0, 1) };
+      const current = currentEngine(clock);
       for (const text of SCHEMA) {
         await pg.execute(text);
         await current.execute(text);
       }
       const ids = await setUp(path);
       let parents: number[] = [];
-      const history: History = { rekeyedAway: new Set() };
+      /** Keys of t a committed rekey moved away from → when (the current engine's clock). */
+      const rekeyedAway = new Map<number, number>();
       const outcomes = new Map<Outcome, number>();
       try {
         for (let step = 0; step < STEPS; step++) {
-          const oracles = current === null ? [pg] : [pg, current];
+          const oracles = [pg, current];
           const roll = workload.int(100);
           if (roll < 4) {
             path = workload.chance(0.5) ? await harness.reopen() : await harness.crash();
@@ -524,54 +564,57 @@ describe("write path vs PostgreSQL and the current engine (generated)", () => {
           const sqls = ops.map((op) => op.sql);
           const label = `step ${String(step)}: ${sqls.join("; ")}${rollback ? " (rolled back)" : ""}`;
           const expected = await runOn(pg, sqls, rollback);
-          if (expected.outcome === "ok" && !rollback)
-            for (const text of sqls) {
-              const rekey = /^UPDATE t SET id = \d+ WHERE id = (\d+)$/u.exec(text);
-              if (rekey !== null) history.rekeyedAway.add(Number(rekey[1]));
-            }
-          if (current !== null) {
-            const other = await runOn(current, sqls, rollback);
-            if (other.outcome !== expected.outcome) {
-              // The current engine contradicts PostgreSQL: a known defect, or a new finding.
-              divergences.push({
-                step: `seed ${String(seed)} ${label}`,
-                current: other.message,
-                postgres: expected.message,
-              });
-              expect(
-                KNOWN_ORACLE_DEFECTS.some((defect) => defect(other.message ?? "", history)),
-                `the current engine diverges from PostgreSQL at ${label}: ${String(other.message)} vs ${String(expected.message)}`,
-              ).toBe(true);
-              await current.close();
-              current = null;
-            } else lockstep += 1;
-          }
+          const log: StepLog = { moved: [] };
           const actual = await transaction(
             path,
             rollback,
-            ...ops.map((op) => (statement: Statement) => op.run(statement, ids)),
+            ...ops.map((op) => (statement: Statement) => op.run(statement, ids, log)),
           );
           expect(actual, `${label} (PostgreSQL: ${String(expected.message)})`).toBe(
             expected.outcome,
           );
           outcomes.set(actual, (outcomes.get(actual) ?? 0) + 1);
-          parents = await compare(
-            path,
-            current === null ? [pg] : [pg, current],
-            ids,
-            workload,
-            label,
-          );
+          const rows = {
+            t: await oracleRows(pg, "t", "id, u, v, s"),
+            c: await oracleRows(pg, "c", "id, pid"),
+          };
+          // The current engine: equal to PostgreSQL, or an intended divergence (R21).
+          let result = await stepOnCurrent(current, sqls, rollback, expected, rows);
+          if (!result.same) {
+            const divergence = intendedDivergence({
+              statements: sqls,
+              keys: new Map([["t", ops.flatMap((op) => op.keys)]]),
+              oracleError: result.error,
+              authorityError: expected.message,
+              facts: { nowMs: clock.ms, rekeyedAway: new Map([["t", rekeyedAway]]) },
+            });
+            expect(
+              divergence?.id,
+              `the current engine differs from PostgreSQL at ${label}: ${String(result.error)} vs ${String(expected.message)} (unregistered)`,
+            ).toBeDefined();
+            if (divergence !== null)
+              observed.push({
+                step: `seed ${String(seed)} ${label}`,
+                divergence,
+                current: result.error,
+              });
+            // Past the forward window the current engine must match PostgreSQL exactly.
+            clock.ms += DEFAULT_KEY_FORWARD_RETENTION_MS + 1;
+            rekeyedAway.clear();
+            result = await stepOnCurrent(current, sqls, rollback, expected, rows);
+            expect(
+              result.same,
+              `${label}: still differs once forwards expired (${String(result.error)})`,
+            ).toBe(true);
+          }
+          compared += 1;
+          if (expected.outcome === "ok" && !rollback)
+            for (const key of log.moved) rekeyedAway.set(key, clock.ms);
+          parents = await compare(path, oracles, ids, workload, label);
         }
         await path.quiesce();
         path = await harness.reopen();
-        await compare(
-          path,
-          current === null ? [pg] : [pg, current],
-          ids,
-          workload,
-          "the final reopen",
-        );
+        await compare(path, [pg, current], ids, workload, "the final reopen");
         await harness.space.audit();
         // The workload reached every outcome, so the comparison is not vacuous.
         expect(outcomes.get("ok") ?? 0).toBeGreaterThan(STEPS / 4);
@@ -580,19 +623,16 @@ describe("write path vs PostgreSQL and the current engine (generated)", () => {
       } finally {
         await harness.close();
         await pg.close();
-        await current?.close();
+        await current.close();
       }
-    }, 120_000);
+    }, 180_000);
 
-  it("compared most steps with the current engine too", () => {
+  it("compared every step with the current engine, and met the registered divergence", () => {
     if (process.env.MINNOW_SEED !== undefined) return;
-    if (divergences.length > 0)
-      console.info(
-        `current-engine divergences from PostgreSQL:\n${divergences.map((d) => `  ${d.step}: ${String(d.current)}`).join("\n")}`,
-      );
     console.info(
-      `lockstep steps with the current engine: ${String(lockstep)} of ${String(SEEDS.length * STEPS)}`,
+      `intended divergences (R21):\n${observed.map((o) => `  ${o.divergence.id} at ${o.step}: ${String(o.current)}`).join("\n")}\ncompared with the current engine: ${String(compared)} steps`,
     );
-    expect(lockstep).toBeGreaterThan((SEEDS.length * STEPS) / 4);
+    expect(observed.length).toBeGreaterThan(0);
+    expect(new Set(observed.map((o) => o.divergence.id))).toEqual(new Set(["key-forwarding"]));
   });
 });
