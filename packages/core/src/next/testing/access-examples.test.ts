@@ -19,10 +19,19 @@ import {
   type TableRules,
   type TableWriter,
 } from "../access/modify.js";
-import { readBound, type Snapshot } from "../access/snapshot.js";
+import {
+  MEMORY_CHUNK_ROWS,
+  readBound,
+  type DeletionVector,
+  type MemorySegment,
+  type Snapshot,
+  type TableReadOptions,
+  type TableSnapshot,
+} from "../access/snapshot.js";
 import type {
   CommitReceipt,
   CommitRequest,
+  SequenceAccess,
   WritePath,
   WriteTransaction,
 } from "../access/write-path.js";
@@ -32,7 +41,7 @@ import { Governor, type Grant } from "../memory/governor.js";
 import type { PhysicalType } from "../types.js";
 import { packLocator } from "../vector/locator.js";
 import { allocateSelection } from "../vector/validity.js";
-import type { Batch, FlatVector, Selection } from "../vector/vector.js";
+import { allocateFlat, type Batch, type FlatVector, type Selection } from "../vector/vector.js";
 
 const INT: PhysicalType = { kind: "int32", bits: 32 };
 const TABLE = 1;
@@ -58,6 +67,9 @@ function locators(values: Float64Array, length: number): FlatVector {
     data: { layout: "f64", values },
   };
 }
+
+/** Key buffers in these examples are tiny; a real operator charges its grant. */
+const keyCharge = { allocate: () => true, free: () => undefined };
 
 const settle = async <T>(value: MaybePromise<T>): Promise<T> => value;
 
@@ -91,7 +103,7 @@ function indexDef(id: number, column: number, unique: boolean): IndexDef {
 function memoryIndex(def: IndexDef): IndexReader {
   const hex = (bytes: Uint8Array) => Buffer.from(bytes).toString("hex");
   const byKey = new Map<string, number[]>();
-  const probeKeys = new KeyBatch();
+  const probeKeys = new KeyBatch(keyCharge);
   const column = SEGMENT.get(def.columnIds[0] ?? 0) ?? [];
   encodeKeyBatch(
     "equality",
@@ -137,6 +149,54 @@ const catalog: CatalogView = {
   sequence: () => undefined,
 };
 
+/** Deleted positions of the stand-in segment: row 1 (id 2) was deleted. */
+const DELETED = new Set([1]);
+const deletions: DeletionVector = {
+  deletedCount: DELETED.size,
+  isDeleted: (position) => DELETED.has(position),
+  liveRows(from, length, input, out) {
+    let count = 0;
+    const total = input === null ? length : input.count;
+    for (let k = 0; k < total; k++) {
+      const row = input === null ? k : (input.rows[k] ?? 0);
+      if (!DELETED.has(from + row)) out.rows[count++] = row;
+    }
+    out.count = count;
+  },
+};
+
+function memoryTable(options: TableReadOptions): TableSnapshot {
+  const segment: MemorySegment = {
+    kind: "memory",
+    index: 0,
+    rowCount: ROWS.length,
+    liveRowCount: ROWS.length - DELETED.size,
+    deletions: () => deletions,
+    statistics: () => null,
+    pages: () => [
+      {
+        firstRow: 0,
+        rowCount: ROWS.length,
+        nullCount: 0,
+        min: null,
+        max: null,
+        dictionarySize: null,
+      },
+    ],
+    chunk(columnId) {
+      if (!options.columns.includes(columnId)) throw new RangeError("Column not declared");
+      return ints(SEGMENT.get(columnId) ?? []); // resident: borrowed, `out` unused
+    },
+  };
+  return {
+    tableId: TABLE,
+    schemaVersion: 1,
+    columns: [],
+    liveRowCount: segment.liveRowCount,
+    segments: [segment],
+  };
+}
+
 function readSnapshot(): Snapshot {
   const indexes = new Map([
     [PRIMARY, memoryIndex(indexDef(PRIMARY, 0, true))],
@@ -148,9 +208,11 @@ function readSnapshot(): Snapshot {
     bound: readBound(5),
     observedLsn: 5,
     catalog,
-    table() {
-      throw new Error("not used by these examples");
+    pages: {
+      read: () => Promise.reject(new Error("The stand-in has no groups")),
+      peek: () => null,
     },
+    table: (_tableId, options) => memoryTable(options),
     index: (_table, indexId) => {
       const reader = indexes.get(indexId);
       if (reader === undefined) throw new Error("unknown index");
@@ -179,7 +241,7 @@ async function pointRead(
   grant: Grant,
   id: number,
 ): Promise<number | null> {
-  const keys = new KeyBatch(); // reused across executions of the prepared plan
+  const keys = new KeyBatch(keyCharge); // reused across executions of the prepared plan
   encodeKeyBatch(
     "equality",
     [{ vector: ints([id]), direction: "asc", nulls: "last" }],
@@ -194,12 +256,13 @@ async function pointRead(
   if (out.count === 0) return null;
   const customer = ints([0]);
   await fetcher.fetch({
-    snapshot: view, // a Snapshot is a SnapshotPin
+    snapshot: view, // the access snapshot the locators came from
     tableId: TABLE,
     locators: locators(out.locators, out.count),
     length: out.count,
     selection: null,
     from: 0,
+    capacity: 1,
     columns: [1],
     output: [customer],
     varlen: [null],
@@ -212,7 +275,7 @@ async function pointRead(
 // non-unique index with a deliberately small output, resuming until done.
 
 async function joinProbe(view: Snapshot, probeCustomers: readonly number[]): Promise<number[][]> {
-  const keys = new KeyBatch();
+  const keys = new KeyBatch(keyCharge);
   encodeKeyBatch(
     "equality",
     [{ vector: ints(probeCustomers), direction: "asc", nulls: "last" }],
@@ -234,6 +297,34 @@ async function joinProbe(view: Snapshot, probeCustomers: readonly number[]): Pro
   }
 }
 
+// Executor: `SELECT sum(id) FROM t`: a scan over the segments in locator order, filtering
+// deleted rows. Group segments go through the format track's chunk reader over `view.pages`
+// (not shown: the stand-in has none); memory chunks are borrowed, zero-copy vectors.
+
+async function sumIds(view: Snapshot, budget: Grant): Promise<number> {
+  const table = await settle(view.table(TABLE, { columns: [0], budget }));
+  const out = { flat: allocateFlat(INT), codes: new Int32Array(MEMORY_CHUNK_ROWS), varlen: null };
+  const live = allocateSelection(MEMORY_CHUNK_ROWS);
+  let sum = 0;
+  for (const segment of table.segments) {
+    if (segment.kind === "group") throw new Error("read through the format chunk reader");
+    const deleted = await settle(segment.deletions());
+    for (let chunk = 0; chunk * MEMORY_CHUNK_ROWS < segment.rowCount; chunk++) {
+      const from = chunk * MEMORY_CHUNK_ROWS;
+      const length = Math.min(MEMORY_CHUNK_ROWS, segment.rowCount - from);
+      const vector = await settle(segment.chunk(0, chunk, out));
+      if ("partial" in vector || vector.form !== "flat" || vector.data.layout !== "i32")
+        throw new Error("an int32 column reads as a flat int32 vector here");
+      if (deleted === null) live.count = 0;
+      else deleted.liveRows(from, length, null, live);
+      const count = deleted === null ? length : live.count;
+      for (let k = 0; k < count; k++)
+        sum += vector.data.values[deleted === null ? k : (live.rows[k] ?? 0)] ?? 0;
+    }
+  }
+  return sum;
+}
+
 describe("executor reads through the access contracts", () => {
   it("point read: probe the primary key, fetch through the same pin", async () => {
     const view = readSnapshot();
@@ -241,6 +332,10 @@ describe("executor reads through the access contracts", () => {
     const grant = await smallGrant();
     expect(await pointRead(view, fetcher, grant, 3)).toBe(8);
     expect(await pointRead(view, fetcher, grant, 99)).toBeNull();
+  });
+
+  it("scan: segments in locator order, deleted rows filtered", async () => {
+    expect(await sumIds(readSnapshot(), await smallGrant())).toBe(1 + 3 + 4);
   });
 
   it("join probe: matches in probe order, resumed when the output fills", async () => {
@@ -399,6 +494,7 @@ async function autocommitInsert(
       throw error;
     }
     const receipt = await transaction.commit({ ...request, counts: { inserted } });
+    // `receipt.wrote` false: nothing committed; the owner settles the request (ledger.settle).
     if (writePath.durability === "strict") await receipt.durable; // relaxed: acknowledge now
     return inserted;
   } finally {
@@ -421,11 +517,21 @@ async function readQuery<T>(
   }
 }
 
+// Executor and owner: `INSERT … RETURNING id` with id from nextval inside an explicit
+// transaction. The block's frame is standalone, so its durability never waits for COMMIT.
+
+function drawIds(sequences: SequenceAccess, count: number): { ids: number[]; waitLsn: number } {
+  const out = { repr: "safe" as const, values: new Float64Array(count) };
+  const waitLsn = sequences.next(42, count, out, 0);
+  return { ids: Array.from(out.values), waitLsn };
+}
+
 describe("owner composition", () => {
   it("autocommit: begin, statement, end, commit, then wait for durability under strict", async () => {
     const { statement, calls } = recordingStatement(new Map());
     let durable = false;
     const receipt: CommitReceipt = {
+      wrote: true,
       lsn: 6,
       durable: Promise.resolve().then(() => {
         durable = true;
@@ -457,6 +563,26 @@ describe("owner composition", () => {
     expect(inserted).toBe(2);
     expect(durable).toBe(true);
     expect(calls).toEqual(["insert ", "end", 'commit {"inserted":2}']);
+  });
+
+  it("sequences: deliver after the block frame's flush, not after COMMIT", async () => {
+    let next = 1;
+    const sequences: SequenceAccess = {
+      next: (_id, count, out) => {
+        if (out.repr === "safe") for (let k = 0; k < count; k++) out.values[k] = next++;
+        return 9; // the standalone block frame
+      },
+      set: () => 0,
+    };
+    const flushed: number[] = [];
+    const durable = (lsn: number) => {
+      flushed.push(lsn);
+      return Promise.resolve();
+    };
+    const { ids, waitLsn } = drawIds(sequences, 3);
+    await durable(Math.max(5, waitLsn)); // view.observedLsn 5; no COMMIT involved
+    expect(ids).toEqual([1, 2, 3]);
+    expect(flushed).toEqual([9]);
   });
 
   it("read: pin, run, deliver after durability, release", async () => {

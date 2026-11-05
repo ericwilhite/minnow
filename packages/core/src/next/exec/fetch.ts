@@ -4,8 +4,9 @@
  * pages through the page cache, `MemoryRowFetcher` is the reference and test double.
  *
  * ## Contract
- * - **Snapshot.** Every request names the snapshot pin its locators came from. A released pin is
- *   refused (`SnapshotReleasedError`): locators are meaningless outside their pin.
+ * - **Snapshot.** Every request names the snapshot its locators came from (access/snapshot.ts:
+ *   the storage-facing fetcher reads its segments). A released snapshot is refused
+ *   (`SnapshotReleasedError`): locators are meaningless outside their pin.
  * - **Rows.** The request's active rows are `selection` (or 0 … length), starting at active index
  *   `from`. Output slot k receives the row of the (from + k)-th active locator: outputs are dense,
  *   in active-row order, with no selection. Repeated locators fill each slot with the same value;
@@ -29,20 +30,15 @@
  * - **Cancellation.** If `signal` aborts, the call rejects with its reason between page reads; the
  *   outputs are unspecified and nothing is retained.
  */
+import { SnapshotReleasedError, type Snapshot } from "../access/snapshot.js";
 import type { Grant } from "../memory/governor.js";
 import { locatorPosition, locatorSegment } from "../vector/locator.js";
 import { isValid, setValid } from "../vector/validity.js";
 import type { VarlenBuilder } from "../vector/varlen.js";
 import type { FlatVector, Selection } from "../vector/vector.js";
 
-export interface SnapshotPin {
-  readonly rootSequence: number;
-  readonly released: boolean;
-  release(): void;
-}
-
 export interface FetchRequest {
-  readonly snapshot: SnapshotPin;
+  readonly snapshot: Snapshot;
   readonly tableId: number;
   /** A locator vector (type `locator`), `length` physical rows. */
   readonly locators: FlatVector;
@@ -92,19 +88,6 @@ function slots(vector: FlatVector): number {
       return data.values.values.length;
     default:
       return data.values.length;
-  }
-}
-
-/**
- * Merge note (Phase B ruling): this error and the snapshot type move to `next/access/` (created on
- * rebuild/write), and `FetchRequest.snapshot` becomes access's `Snapshot`. `access/` does not exist
- * on this branch, so both stay here until the merge.
- */
-export class SnapshotReleasedError extends Error {
-  readonly code = "MINNOW_SNAPSHOT_RELEASED";
-  constructor() {
-    super("The snapshot these locators belong to has been released");
-    this.name = "SnapshotReleasedError";
   }
 }
 

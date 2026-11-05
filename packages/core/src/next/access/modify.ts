@@ -45,19 +45,25 @@
  * which undoes all of its writes (statement-level atomicity). Whether the transaction continues
  * is the session's policy, not the write path's.
  *
- * ## RETURNING
+ * ## RETURNING (ruling R2)
  * The write path never materializes RETURNING. The executor evaluates it over the rows it
  * supplied (insert, update: the assigned values plus old values it fetched through the view) or
- * fetched (delete: the old row), restricted to `written`. It holds them (spilling if needed) and
- * delivers them only after `Statement.end()` succeeds, and for an autocommit statement after the
- * commit is acknowledged (write-path.ts "Delivery"). A duplicate request answered from the ledger
- * gets counts only (format/ledger.ts).
+ * fetched (delete: the old row), restricted to `written`, into a charged, spillable result spool.
+ * A statement has three completions: **executed** (`Statement.end()` resolved: every deferred
+ * check passed), **committed** (the owner acknowledged the commit per durability mode, after
+ * `WriteTransaction.commit`), **delivered**. The spool offers nothing before the owner calls the
+ * executor's `acknowledgeCommit()`; on abort or rollback it is discarded. A duplicate request
+ * answered from the ledger gets counts only (format/ledger.ts).
  *
  * ## Memory and async
- * The statement's writes live in the table's memtable as pending rows (snapshot.ts); the write
- * path charges them to its own grant. Calls return a Promise only when they must wait: reading
- * index blocks for checks, or flushing a full memtable (backpressure). One call at a time per
- * statement; callers check their cancellation signal between calls and `rollback()` on abort.
+ * The statement's writes live in the table's memtable as pending rows (snapshot.ts), charged to
+ * the write path's grant. When a transaction's pending rows pass the memtable bounds, the write
+ * path writes them as **staged groups** through the extent space (readable by the transaction's
+ * later statements as group segments with `staged: true`; committed through `publishedRows`,
+ * write-path.ts "Commit"), so a bulk load is never resident whole. Calls return a Promise only
+ * when they must wait: reading index blocks for checks, writing staged groups, or backpressure.
+ * One call at a time per statement; callers check their cancellation signal between calls and
+ * `rollback()` on abort (which also aborts the statement's staged writers).
  */
 import type { Batch, Selection } from "../vector/vector.js";
 import type { CatalogChange, CatalogView } from "./catalog.js";
@@ -66,8 +72,9 @@ import type { Snapshot } from "./snapshot.js";
 
 export interface StatementOptions {
   /**
-   * The executor's row rules per table, compiled against the statement's catalog: called for
-   * every row the statement writes, including rows written by foreign-key actions.
+   * The executor's row rules per table, compiled against the statement's catalog (the executor's
+   * `compileTableRules(table, catalogVersion)`, cached per version): called for every row the
+   * statement writes, including rows written by foreign-key actions.
    */
   readonly rules: (tableId: number) => TableRules;
   /** Cancels waits inside the statement (backpressure, index reads). */
@@ -157,7 +164,8 @@ export interface ConflictOutput {
 }
 
 /**
- * The executor's compiled rules for one table (one instance per table and catalog version). All
+ * The executor's compiled rules for one table (one instance per table and catalog version; the
+ * executor provides them through `compileTableRules`, ruling R1). All
  * methods are synchronous kernels over a batch of complete new rows (every column, catalog
  * order); they must not retain the batch.
  */
