@@ -630,7 +630,10 @@ and the owner import it directly.
   sums are exact at any size: an f64 part within ±2^52, a 128-bit carry, and past that an exact
   BigInt offset per group that changes only when the carry overflows (or for inputs already
   wider than 128 bits), never per row. A scalar NUMERIC SUM over a declared precision ≤ 12 is
-  fused: four accumulators, no per-row check. Float SUM and AVG follow PostgreSQL's float8pl and
+  fused: four accumulators, no per-row check. Without GROUP BY, the batches of several such
+  columns that qualify (no NULL, every row) are summed in one loop over up to four columns
+  (`fusedSums`), and a SUM and an AVG of one exact column share one state. Accumulator loops
+  start from −0 (a double), so V8 keeps them unboxed. Float SUM and AVG follow PostgreSQL's float8pl and
   float8_accum, including their 22003 rules. MIN/MAX ties take the newer value, as PostgreSQL
   does (MIN(1.5, 1.50) is 1.50); int8 and NUMERIC comparisons use words and limbs.
 - `values.ts`: per-group values for MIN/MAX and NUMERIC keys: int8 and interval microseconds as

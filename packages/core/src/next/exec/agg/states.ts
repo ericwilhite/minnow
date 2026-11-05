@@ -84,6 +84,20 @@ export interface Accumulator {
    */
   prepare?(from: number, count: number, expired: () => boolean): number;
   close(): void;
+  /**
+   * One state serving a SUM and an AVG of the same argument (aggregate.ts shares it): the sum
+   * (`average` false) or the average, as a vector of `type`. Exact sums only (NUMERIC, integers);
+   * float SUM and AVG differ in their identity (−0 / 0) and overflow rules, so they never share.
+   */
+  emitAs?(average: boolean, type: PhysicalType, from: number, count: number): FlatVector;
+  /**
+   * The fused scalar pass (aggregate.ts): this batch's values as one Float64Array when it can be
+   * summed exactly in one loop with other columns (dense rows, no NULL, the state's one scale,
+   * |value| < 2^53 / 2,048), else null. A non-null result commits the batch to `addFused`.
+   */
+  fusedValues?(vector: Vector, rows: Uint16Array, count: number): Float64Array | null;
+  /** Adds `count` values whose exact total is `total` (after `fusedValues`). */
+  addFused?(total: number, count: number): void;
 }
 
 /** The f64 part of an exact sum stays within ±LIMIT so every addition of a value ≤ LIMIT is exact. */
@@ -444,8 +458,8 @@ function addIntegers(
   );
   if (scalar && data.layout === "i32") {
     // int32: a batch sums below 2^42, exactly, with no per-row check.
-    let s0 = 0;
-    let s1 = 0;
+    let s0 = -0; // −0: a double from the start (see exactSumIdentity)
+    let s1 = -0;
     let n = 0;
     if (validity === null) {
       let k = 0;
@@ -550,9 +564,13 @@ class IntegerSumAccumulator implements Accumulator {
     return validityBytes(count) + count * 24 + this.#sums.wideOutputBytes(from, count);
   }
   emit(from: number, count: number): FlatVector {
+    return this.emitAs(this.average, this.type, from, count);
+  }
+  emitAs(average: boolean, type: PhysicalType, from: number, count: number): FlatVector {
     const sums = this.#sums;
     const validity = validityFrom(sums.has, from, count);
-    if (this.#counts !== null) {
+    if (average) {
+      if (this.#counts === null) throw new TypeError("AVG from a SUM-only state");
       const out = new Float64Array(count);
       for (let k = 0; k < count; k++) {
         const g = from + k;
@@ -562,20 +580,20 @@ class IntegerSumAccumulator implements Accumulator {
       }
       return {
         form: "flat",
-        type: this.type,
+        type: type,
         length: count,
         validity,
         data: { layout: "f64", values: out },
       };
     }
     // SUM(int2/int4) is int64; SUM(int8) is NUMERIC(·, 0) (exact past 2^63).
-    const decimal = this.type.kind === "decimal";
+    const decimal = type.kind === "decimal";
     if (sums.carried === 0 && sums.wide === null) {
       const values = sums.sums.slice(from, from + count);
       return decimal
         ? {
             form: "flat",
-            type: this.type,
+            type: type,
             length: count,
             validity,
             data: {
@@ -588,7 +606,7 @@ class IntegerSumAccumulator implements Accumulator {
           }
         : {
             form: "flat",
-            type: this.type,
+            type: type,
             length: count,
             validity,
             data: { layout: "int64", values: { repr: "safe", values } },
@@ -605,7 +623,7 @@ class IntegerSumAccumulator implements Accumulator {
     if (wide)
       return {
         form: "flat",
-        type: this.type,
+        type,
         length: count,
         validity,
         data: {
@@ -629,7 +647,7 @@ class IntegerSumAccumulator implements Accumulator {
       return decimal
         ? {
             form: "flat",
-            type: this.type,
+            type: type,
             length: count,
             validity,
             data: {
@@ -642,7 +660,7 @@ class IntegerSumAccumulator implements Accumulator {
           }
         : {
             form: "flat",
-            type: this.type,
+            type: type,
             length: count,
             validity,
             data: { layout: "int64", values },
@@ -650,7 +668,7 @@ class IntegerSumAccumulator implements Accumulator {
     }
     return {
       form: "flat",
-      type: this.type,
+      type: type,
       length: count,
       validity,
       data: {
@@ -670,6 +688,153 @@ class IntegerSumAccumulator implements Accumulator {
 
 // ---------------------------------------------------------------------------------------------
 // Float sums and averages
+
+/**
+ * Σ values[0 … count) with four independent accumulators. Exact when the caller bounds the result
+ * below 2^53 (the fused NUMERIC SUM: |c| < 10^12 and count ≤ 2,048). Standalone functions so each
+ * loop compiles on its own (inside a large method V8 compiles it several times slower).
+ */
+function exactSumIdentity(values: Float64Array, count: number): number {
+  // −0, not 0: a double from the start, so V8 keeps the accumulators unboxed (a small-integer
+  // start costs ~3× here); −0 is also the additive identity, so no sum changes.
+  let s0 = -0;
+  let s1 = -0;
+  let s2 = -0;
+  let s3 = -0;
+  let k = 0;
+  for (; k + 3 < count; k += 4) {
+    s0 += values[k] ?? 0;
+    s1 += values[k + 1] ?? 0;
+    s2 += values[k + 2] ?? 0;
+    s3 += values[k + 3] ?? 0;
+  }
+  for (; k < count; k++) s0 += values[k] ?? 0;
+  return s0 + s1 + (s2 + s3);
+}
+
+/** Σ values[rows[0 … count)], as `exactSumIdentity`. */
+function exactSumRows(values: Float64Array, rows: Uint16Array, count: number): number {
+  // −0, not 0: a double from the start, so V8 keeps the accumulators unboxed (a small-integer
+  // start costs ~3× here); −0 is also the additive identity, so no sum changes.
+  let s0 = -0;
+  let s1 = -0;
+  let s2 = -0;
+  let s3 = -0;
+  let k = 0;
+  for (; k + 3 < count; k += 4) {
+    s0 += values[rows[k] ?? 0] ?? 0;
+    s1 += values[rows[k + 1] ?? 0] ?? 0;
+    s2 += values[rows[k + 2] ?? 0] ?? 0;
+    s3 += values[rows[k + 3] ?? 0] ?? 0;
+  }
+  for (; k < count; k++) s0 += values[rows[k] ?? 0] ?? 0;
+  return s0 + s1 + (s2 + s3);
+}
+
+/** Σ of rows 0 … count − 1 of two to four columns in one loop, into out[at …]. */
+function fused2(
+  a: Float64Array,
+  b: Float64Array,
+  count: number,
+  out: Float64Array,
+  at: number,
+): void {
+  let sa = -0;
+  let sb = -0;
+  for (let k = 0; k < count; k++) {
+    sa += a[k] ?? 0;
+    sb += b[k] ?? 0;
+  }
+  out[at] = sa;
+  out[at + 1] = sb;
+}
+function fused3(
+  a: Float64Array,
+  b: Float64Array,
+  c: Float64Array,
+  count: number,
+  out: Float64Array,
+  at: number,
+): void {
+  let sa = -0;
+  let sb = -0;
+  let sc = -0;
+  for (let k = 0; k < count; k++) {
+    sa += a[k] ?? 0;
+    sb += b[k] ?? 0;
+    sc += c[k] ?? 0;
+  }
+  out[at] = sa;
+  out[at + 1] = sb;
+  out[at + 2] = sc;
+}
+function fused4(
+  a: Float64Array,
+  b: Float64Array,
+  c: Float64Array,
+  d: Float64Array,
+  count: number,
+  out: Float64Array,
+  at: number,
+): void {
+  let sa = -0;
+  let sb = -0;
+  let sc = -0;
+  let sd = -0;
+  for (let k = 0; k < count; k++) {
+    sa += a[k] ?? 0;
+    sb += b[k] ?? 0;
+    sc += c[k] ?? 0;
+    sd += d[k] ?? 0;
+  }
+  out[at] = sa;
+  out[at + 1] = sb;
+  out[at + 2] = sc;
+  out[at + 3] = sd;
+}
+
+const EMPTY_F64 = new Float64Array(0);
+
+/**
+ * The fused scalar pass: out[j] = Σ columns[j][0 … count) for j < n, reading up to four columns
+ * per loop (one loop over several columns runs ~1.7× faster than one loop per column: their
+ * additions are independent). Exact under `fusedValues`'s bound (each sum below 2^51).
+ */
+export function fusedSums(
+  columns: readonly Float64Array[],
+  n: number,
+  count: number,
+  out: Float64Array,
+): void {
+  let j = 0;
+  const at = (c: number): Float64Array => columns[c] ?? EMPTY_F64;
+  for (; j + 3 < n; j += 4) fused4(at(j), at(j + 1), at(j + 2), at(j + 3), count, out, j);
+  if (n - j === 3) fused3(at(j), at(j + 1), at(j + 2), count, out, j);
+  else if (n - j === 2) fused2(at(j), at(j + 1), count, out, j);
+  else if (n - j === 1) out[j] = exactSumIdentity(at(j), count);
+}
+
+/** The valid rows counted by the last `exactSumValid`. */
+let validCount = 0;
+
+/** Σ of the valid values[rows[0 … count)], branch-free; their number goes to `validCount`. */
+function exactSumValid(
+  values: Float64Array,
+  rows: Uint16Array,
+  count: number,
+  validity: Validity,
+): number {
+  let s0 = -0;
+  let n = 0;
+  for (let k = 0; k < count; k++) {
+    const i = rows[k] ?? 0;
+    const bit = ((validity[i >>> 5] ?? 0) >>> (i & 31)) & 1;
+    s0 += (values[i] ?? 0) * bit;
+    n += bit;
+  }
+  validCount = n;
+  return s0;
+}
 
 /** Float sums of grouped rows without NULLs until the first non-finite sum; returns that row. */
 function sumDense(
@@ -995,44 +1160,20 @@ class DecimalSumAccumulator implements Accumulator {
         precision <= 12
       ) {
         // The fused SUM: |c| < 10^12, so a batch of ≤ 2,048 sums below 2^51 exactly.
-        let s0 = 0;
-        let s1 = 0;
-        let s2 = 0;
-        let s3 = 0;
         let n = count;
-        if (validity === null && rows === IDENTITY) {
-          // Dense: every row, no indirection.
-          let k = 0;
-          for (; k + 3 < count; k += 4) {
-            s0 += values[k] ?? 0;
-            s1 += values[k + 1] ?? 0;
-            s2 += values[k + 2] ?? 0;
-            s3 += values[k + 3] ?? 0;
-          }
-          for (; k < count; k++) s0 += values[k] ?? 0;
-        } else if (validity === null) {
-          let k = 0;
-          for (; k + 3 < count; k += 4) {
-            s0 += values[rows[k] ?? 0] ?? 0;
-            s1 += values[rows[k + 1] ?? 0] ?? 0;
-            s2 += values[rows[k + 2] ?? 0] ?? 0;
-            s3 += values[rows[k + 3] ?? 0] ?? 0;
-          }
-          for (; k < count; k++) s0 += values[rows[k] ?? 0] ?? 0;
-        } else {
-          n = 0;
-          for (let k = 0; k < count; k++) {
-            const i = rows[k] ?? 0;
-            const bit = ((validity[i >>> 5] ?? 0) >>> (i & 31)) & 1;
-            s0 += (values[i] ?? 0) * bit;
-            n += bit;
-          }
+        let total: number;
+        if (validity === null)
+          total =
+            rows === IDENTITY ? exactSumIdentity(values, count) : exactSumRows(values, rows, count);
+        else {
+          total = exactSumValid(values, rows, count, validity);
+          n = validCount;
         }
         if (n > 0) {
           flags[0] = (flags[0] ?? 0) | HAS;
           sums.has[0] = 1;
           counts[0] = (counts[0] ?? 0) + n;
-          sums.add(0, s0 + s1 + (s2 + s3));
+          sums.add(0, total);
         }
         return true;
       }
@@ -1153,7 +1294,28 @@ class DecimalSumAccumulator implements Accumulator {
       bytes += Math.max(this.#sums.offsetBytes(from + k), 48) + 24 + 8;
     return bytes;
   }
+  fusedValues(vector: Vector, rows: Uint16Array, count: number): Float64Array | null {
+    if (vector.form !== "flat" || vector.validity !== null || rows !== IDENTITY) return null;
+    const data = vector.data as DecimalData;
+    const precision = this.#precision;
+    if (precision === null || precision > 12 || data.specials !== null) return null;
+    const scale = data.scale;
+    if (scale === null || (this.#scale !== SCALE_NONE && this.#scale !== scale)) return null;
+    if (data.coefficients.repr !== "safe" || count > BATCH_ROWS) return null;
+    this.#scale = scale;
+    return data.coefficients.values;
+  }
+  addFused(total: number, count: number): void {
+    if (count === 0) return;
+    this.#flags[0] = (this.#flags[0] ?? 0) | HAS;
+    this.#sums.has[0] = 1;
+    this.#counts[0] = (this.#counts[0] ?? 0) + count;
+    this.#sums.add(0, total);
+  }
   emit(from: number, count: number): FlatVector {
+    return this.emitAs(this.average, this.type, from, count);
+  }
+  emitAs(average: boolean, type: PhysicalType, from: number, count: number): FlatVector {
     const sums = this.#sums;
     const flags = this.#flags;
     const present = new Uint8Array(count);
@@ -1169,7 +1331,7 @@ class DecimalSumAccumulator implements Accumulator {
     const validity = validityFrom(present, 0, count);
     const uniform = this.#scale >= 0 ? this.#scale : null;
     const scales = uniform === null ? this.#scales.slice(from, from + count) : null;
-    if (this.average) return this.#average(from, count, validity, specials);
+    if (average) return this.#average(type, from, count, validity, specials);
     let coefficients: DecimalData["coefficients"];
     if (sums.carried === 0 && sums.wide === null)
       coefficients = { repr: "safe", values: sums.sums.slice(from, from + count) };
@@ -1197,7 +1359,7 @@ class DecimalSumAccumulator implements Accumulator {
     }
     return {
       form: "flat",
-      type: this.type,
+      type: type,
       length: count,
       validity,
       data: {
@@ -1274,6 +1436,7 @@ class DecimalSumAccumulator implements Accumulator {
   }
 
   #average(
+    type: PhysicalType,
     from: number,
     count: number,
     validity: Validity | null,
@@ -1304,7 +1467,7 @@ class DecimalSumAccumulator implements Accumulator {
     for (let k = 0; k < count; k++) if (specials[k] !== 0) anySpecial = true;
     return {
       form: "flat",
-      type: this.type,
+      type: type,
       length: count,
       validity,
       data: {

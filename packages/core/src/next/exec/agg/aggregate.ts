@@ -41,7 +41,7 @@ import { countIn, rowsIn, type Compiled } from "../kernels/vectors.js";
 import { YIELD_INTERVAL_MS, yieldTask, type Operator, type PushResult } from "../pipeline.js";
 import { DistinctSet } from "./distinct.js";
 import { GroupTable } from "./groups.js";
-import { accumulatorFor, type Accumulator } from "./states.js";
+import { accumulatorFor, fusedSums, type Accumulator } from "./states.js";
 
 type AggregateRel = Extract<Rel, { op: "aggregate" }>;
 
@@ -60,6 +60,28 @@ interface CompiledAggregate {
   readonly filter: Predicate | null;
   readonly distinct: DistinctSet | null;
   readonly selection: Selection;
+  /** The output's type and, for a shared state, which of its results it reads. */
+  readonly type: PhysicalType;
+  readonly reads: "own" | "sum" | "average";
+  /** False for the second reader of a shared state (it neither updates nor closes it). */
+  readonly updates: boolean;
+  /** In the fused scalar pass (no GROUP BY, no FILTER or DISTINCT, an exact sum). */
+  readonly fusable: boolean;
+}
+
+/**
+ * Plain SUM / AVG over one input column of an exact type (integers, NUMERIC): candidates for a
+ * shared state. Floats never share: SUM starts from −0 and AVG from 0, and their overflow rules
+ * differ (float8pl, float8_accum).
+ */
+function shareKey(call: AggregateCall, input: readonly PhysicalType[]): string | null {
+  const [arg] = call.args;
+  if ((call.fn !== "sum" && call.fn !== "avg") || call.distinct || call.filter !== null)
+    return null;
+  if (call.args.length !== 1 || arg?.op !== "column") return null;
+  const kind = input[arg.index]?.kind;
+  if (kind !== "int32" && kind !== "int64" && kind !== "decimal") return null;
+  return String(arg.index);
 }
 
 /** Output pacing (tests inject a clock). */
@@ -100,6 +122,11 @@ export class AggregateOperator implements Operator {
   readonly #keys: readonly number[];
   readonly #groups: GroupTable | null = null;
   readonly #aggregates: CompiledAggregate[] = [];
+  /** The fused scalar pass's members, and per-batch scratch. */
+  #fused: readonly CompiledAggregate[] = [];
+  readonly #fusedColumns: Float64Array[] = [];
+  readonly #fusedMembers: CompiledAggregate[] = [];
+  #fusedTotals = new Float64Array(0);
   readonly #gids: Int32Array = new Int32Array(0);
   readonly #keyVectors: Vector[];
   readonly #charge: ByteCharge;
@@ -146,11 +173,43 @@ export class AggregateOperator implements Operator {
     try {
       this.#takeArena(context, 4 * capacity);
       this.#gids = new Int32Array(capacity);
-      for (const call of rel.aggregates)
-        this.#aggregates.push(this.#compile(call, context, capacity));
+      // A SUM and an AVG of the same column share one exact-sum state (one pass over it).
+      const keys = rel.aggregates.map((call) => shareKey(call, context.input));
+      const both = new Set(
+        keys.filter(
+          (key, k) =>
+            key !== null &&
+            rel.aggregates.some(
+              (other, o) => keys[o] === key && other.fn !== rel.aggregates[k]?.fn,
+            ),
+        ),
+      );
+      const shared = new Map<string, CompiledAggregate>();
+      rel.aggregates.forEach((call, k) => {
+        const key = keys[k] ?? null;
+        const sharing = key !== null && both.has(key);
+        const owner = sharing ? shared.get(key) : undefined;
+        if (owner?.accumulator.emitAs !== undefined) {
+          this.#aggregates.push({
+            ...owner,
+            type: call.type,
+            reads: call.fn === "avg" ? "average" : "sum",
+            updates: false,
+            fusable: false,
+          });
+          return;
+        }
+        const compiled = this.#compile(call, context, capacity, sharing);
+        this.#aggregates.push(compiled);
+        if (sharing) shared.set(key, compiled);
+      });
       this.#groups = keyTypes.length === 0 ? null : new GroupTable(keyTypes, charge);
-      if (this.#groups === null)
-        for (const aggregate of this.#aggregates) aggregate.accumulator.grow(1);
+      if (this.#groups === null) {
+        for (const aggregate of this.#aggregates)
+          if (aggregate.updates) aggregate.accumulator.grow(1);
+        this.#fused = this.#aggregates.filter((a) => a.fusable);
+        this.#fusedTotals = new Float64Array(this.#fused.length);
+      }
     } catch (error) {
       this.#close();
       context.arena.give(this.#arenaBytes);
@@ -163,11 +222,22 @@ export class AggregateOperator implements Operator {
     this.#arenaBytes += bytes;
   }
 
-  #compile(call: AggregateCall, context: CompileContext, capacity: number): CompiledAggregate {
+  #compile(
+    call: AggregateCall,
+    context: CompileContext,
+    capacity: number,
+    sharedState: boolean,
+  ): CompiledAggregate {
     const [arg] = call.args;
     const argument =
       call.fn === "count_star" || arg === undefined ? null : compileExpr(arg, context);
-    const accumulator = accumulatorFor(call.fn, call.type, argument?.type ?? null, this.#charge);
+    // A shared state is built as AVG's (it also counts) and read as either.
+    const accumulator = accumulatorFor(
+      sharedState ? "avg" : call.fn,
+      call.type,
+      argument?.type ?? null,
+      this.#charge,
+    );
     let distinct: DistinctSet | null = null;
     let filter: Predicate | null;
     let selection: Selection;
@@ -191,6 +261,19 @@ export class AggregateOperator implements Operator {
       filter,
       distinct,
       selection,
+      type: call.type,
+      reads:
+        sharedState && accumulator.emitAs !== undefined
+          ? call.fn === "avg"
+            ? "average"
+            : "sum"
+          : "own",
+      updates: true,
+      fusable:
+        call.filter === null &&
+        !call.distinct &&
+        argument !== null &&
+        accumulator.fusedValues !== undefined,
     };
   }
 
@@ -208,7 +291,9 @@ export class AggregateOperator implements Operator {
       groups.assign(this.#keyVectors, length, batch.selection, gids);
       for (const aggregate of this.#aggregates) aggregate.accumulator.grow(groups.groupCount);
     }
+    if (scalar && this.#fused.length > 0) this.#pushFused(batch, length);
     for (const aggregate of this.#aggregates) {
+      if (!aggregate.updates || (scalar && aggregate.fusable)) continue;
       let rows: Selection | null = batch.selection;
       if (aggregate.filter !== null) {
         rows = aggregate.filter.select(batch);
@@ -220,6 +305,34 @@ export class AggregateOperator implements Operator {
       aggregate.accumulator.update(value, gids, rowsIn(rows), countIn(rows, length), scalar);
     }
     return "ready";
+  }
+
+  /**
+   * The fused scalar pass: members whose batch qualifies (`Accumulator.fusedValues`) are summed in
+   * one loop over their columns; the others update one by one as usual.
+   */
+  #pushFused(batch: Batch, length: number): void {
+    const rows = rowsIn(batch.selection);
+    const count = countIn(batch.selection, length);
+    const columns = this.#fusedColumns;
+    const members = this.#fusedMembers;
+    let n = 0;
+    for (const aggregate of this.#fused) {
+      if (aggregate.argument === null) continue;
+      const value = aggregate.argument.evaluate(batch, batch.selection);
+      const values = aggregate.accumulator.fusedValues?.(value, rows, count) ?? null;
+      if (values === null) {
+        aggregate.accumulator.update(value, this.#gids, rows, count, true);
+        continue;
+      }
+      columns[n] = values;
+      members[n] = aggregate;
+      n += 1;
+    }
+    if (n === 0) return;
+    const totals = this.#fusedTotals;
+    fusedSums(columns, n, count, totals);
+    for (let j = 0; j < n; j++) members[j]?.accumulator.addFused?.(totals[j] ?? 0, count);
   }
 
   ready(): Promise<void> {
@@ -285,7 +398,16 @@ export class AggregateOperator implements Operator {
           for (let c = 0; c < this.#keys.length; c++)
             columns.push(groups.emitKey(c, this.#emitted, count));
         for (const aggregate of this.#aggregates)
-          columns.push(aggregate.accumulator.emit(this.#emitted, count));
+          columns.push(
+            aggregate.reads === "own" || aggregate.accumulator.emitAs === undefined
+              ? aggregate.accumulator.emit(this.#emitted, count)
+              : aggregate.accumulator.emitAs(
+                  aggregate.reads === "average",
+                  aggregate.type,
+                  this.#emitted,
+                  count,
+                ),
+          );
       } catch (error) {
         this.#releaseOutput();
         throw error;
@@ -326,6 +448,7 @@ export class AggregateOperator implements Operator {
     this.#releaseOutput();
     this.#groups?.close();
     for (const aggregate of this.#aggregates) {
+      if (!aggregate.updates) continue;
       aggregate.accumulator.close();
       aggregate.distinct?.close();
     }

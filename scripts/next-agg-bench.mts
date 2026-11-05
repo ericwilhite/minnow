@@ -171,13 +171,30 @@ const M = 1_048_576;
   await bench("SUM(numeric(12,2)) × 1", M, "target ≤ 5 ms (PROPOSAL)", () =>
     run(data, input, [], [call("sum", D, 0, N12)]),
   );
+  const gateB = [0, 1, 2, 3].map((k) => call("sum", D, k, N12)).concat([call("avg", D, 4, N12)]);
   await bench("SUM × 4 + AVG, numeric(12,2)", M, "DuckDB 11 ms; Gate B ≤ 5 ms", () =>
+    run(data, input, [], gateB),
+  );
+  // The pipeline model: a scan decodes each chunk into a reused batch, so the aggregate reads
+  // cache-resident vectors. The same 512 pushes cycle over 4 batches (320 KiB); the streaming
+  // rows above read 40 MB of prebuilt coefficients from RAM instead.
+  const resident = Array.from({ length: data.length }, (_, b) => data[b % 4] as Batch);
+  await bench("SUM(numeric(12,2)) × 1, cache-resident", M, "target ≤ 5 ms (PROPOSAL)", () =>
+    run(resident, input, [], [call("sum", D, 0, N12)]),
+  );
+  await bench("SUM × 4 + AVG, numeric(12,2), cache-resident", M, "Gate B ≤ 5 ms", () =>
+    run(resident, input, [], gateB),
+  );
+  await bench("SUM × 5, numeric(12,2), cache-resident (no AVG)", M, "comparison", () =>
     run(
-      data,
+      resident,
       input,
       [],
-      [0, 1, 2, 3].map((k) => call("sum", D, k, N12)).concat([call("avg", D, 4, N12)]),
+      [0, 1, 2, 3, 4].map((k) => call("sum", D, k, N12)),
     ),
+  );
+  await bench("AVG × 1, numeric(12,2), cache-resident", M, "comparison", () =>
+    run(resident, input, [], [call("avg", D, 4, N12)]),
   );
 }
 
