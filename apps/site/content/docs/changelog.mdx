@@ -8,6 +8,34 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.19.1 — November 4, 2026
+
+Release packages: `@minnowdb/core@0.19.1`.
+
+- **An OPFS database no longer becomes unopenable after a long query or a long-held
+  snapshot.** Opening it failed with `StorageCorruptionError` even though no data was damaged.
+  Two records that are renewed while they are in use were checked on open as if they had just
+  been created:
+  - A query that spills to disk renews its spill record while it runs. If the query was
+    stopped before it finished (a closed tab, a killed worker, a timeout, or a spill limit), the
+    record stayed behind, and the next open refused it ("Temp owner record must be created at
+    revision zero").
+  - A reader that holds a snapshot for more than an hour keeps renewing its lease. The next
+    open refused that lease too ("expiration exceeds the maximum TTL").
+
+  Opening now accepts any state that renewal produces. Spill cleanup still reclaims an
+  abandoned spill record and its pages after it expires.
+
+- **Recovering a database that is already affected.** Open it with 0.19.1. Nothing else is
+  needed, and no data is lost: the records were valid, only the check on open was wrong.
+
+IndexedDB was not affected. The engine with OPFS measures 441.4 KiB gzipped (unchanged). The
+generic worker plus its client measures 551.7 KiB gzipped (previously 551.6 KiB).
+
+No stored format changes: IndexedDB schema 8 and OPFS layout 13 are unchanged, and 0.19.0 opens
+every database this release writes, unless 0.19.0 itself would refuse it as above. No data
+migration or export/import step is needed.
+
 ## 0.19.0 — October 30, 2026
 
 Release packages: `@minnowdb/core@0.19.0`.

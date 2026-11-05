@@ -8298,7 +8298,7 @@ function validateRecordCoreState(state: RecordCoreState, physical: PhysicalBlock
       MAX_ACTIVE_TEMP_OWNERS,
     );
   }
-  for (const owner of state.tempOwners) validateTempOwnerRecord(owner);
+  for (const owner of state.tempOwners) validateStoredTempOwnerRecord(owner);
 
   const validateCounters = (
     entries: ReadonlyArray<readonly [string, bigint]>,
@@ -8912,6 +8912,26 @@ function validateTempOwnerRecord(record: TempOwnerRecord): void {
   }
 }
 
+/**
+ * A temp owner as a checkpoint holds it. `renewTempOwner` advances the revision and bounds each
+ * new expiration by the renewal's own cutoff, so a live owner may be past revision zero and
+ * expire more than one TTL after it was created. Only the creation rules above are stricter.
+ */
+function validateStoredTempOwnerRecord(record: TempOwnerRecord): void {
+  validateId(record.ownerId);
+  validateStoredExpiration(record.createdAt, record.expiresAt, "Temp owner");
+  if (!Number.isSafeInteger(record.revision) || record.revision < 0) {
+    throw new RangeError("Temp owner revision is invalid");
+  }
+}
+
+/** Expiration as stored after any number of renewals: canonical, and after creation. */
+function validateStoredExpiration(createdAt: string, expiresAt: string, label: string): void {
+  const created = validateCanonicalTimestamp(createdAt, `${label} creation time`);
+  const expiry = validateCanonicalTimestamp(expiresAt, `${label} expiration`);
+  if (expiry <= created) throw new RangeError(`${label} expiration must be after its creation`);
+}
+
 function isCanonicalTimestamp(value: string): boolean {
   const timestamp = Date.parse(value);
   return Number.isFinite(timestamp) && dateIsoString(new Date(timestamp)) === value;
@@ -8956,7 +8976,13 @@ function validateLeaseRuntimeRecord(
   ) {
     throw new TypeError(`${label} manifest version is invalid`);
   }
-  validateBoundedExpiration(record.createdAt, record.expiresAt, label, MAX_LEASE_TTL_MS);
+  // A renewal bounds the new expiration by its own cutoff (`renewLease`, `moveLease`), so only
+  // a lease being created is bounded by one TTL from its creation time.
+  if (requireInitialRevision) {
+    validateBoundedExpiration(record.createdAt, record.expiresAt, label, MAX_LEASE_TTL_MS);
+  } else {
+    validateStoredExpiration(record.createdAt, record.expiresAt, label);
+  }
   if (
     !Number.isSafeInteger(record.revision) ||
     record.revision < 0 ||

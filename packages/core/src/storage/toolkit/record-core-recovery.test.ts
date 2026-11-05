@@ -425,7 +425,16 @@ describe("RecordCore checkpoint recovery refusal", () => {
         state.tempOwners.push(structuredClone(first(state.tempOwners)));
       }),
       mutated(base, (state) => {
-        first(state.tempOwners).revision = 1;
+        first(state.tempOwners).revision = -1;
+      }),
+      mutated(base, (state) => {
+        first(state.tempOwners).revision = 0.5;
+      }),
+      mutated(base, (state) => {
+        first(state.tempOwners).expiresAt = timestamp;
+      }),
+      mutated(base, (state) => {
+        first(state.tempOwners).createdAt = "not a timestamp";
       }),
       mutated(base, (state) => {
         state.nextRowIds = [["missing-table", 1n]];
@@ -444,6 +453,53 @@ describe("RecordCore checkpoint recovery refusal", () => {
       }),
     ];
     expectAtomicRefusal(candidates);
+  });
+
+  it("loads temp owners and leases in any state renewal reaches", () => {
+    const core = new RecordCore({ hasBlock: () => false, blockByteLength: () => undefined });
+    const at = (minutes: number): string =>
+      new Date(Date.parse(timestamp) + minutes * 60_000).toISOString();
+    core.createLease({
+      id: "lease",
+      ownerId: "lease-owner",
+      kind: "reader",
+      manifestVersion: null,
+      createdAt: timestamp,
+      expiresAt: at(60),
+      revision: 0,
+    });
+    core.createTempOwner({ ownerId: "temp", createdAt: timestamp, expiresAt: at(60), revision: 0 });
+    // Renewed past revision zero, and past one TTL from creation: a spill or a reader that
+    // has run for two hours.
+    for (const [revision, minutes] of [
+      [0, 30],
+      [1, 60],
+      [2, 90],
+      [3, 120],
+    ] as const) {
+      core.renewLease({
+        id: "lease",
+        expectedRevision: revision,
+        expiresAtCutoff: at(minutes),
+        expiresAt: at(minutes + 60),
+      });
+      core.renewTempOwner({
+        ownerId: "temp",
+        expectedRevision: revision,
+        expiresAtCutoff: at(minutes),
+        expiresAt: at(minutes + 60),
+      });
+    }
+    const state = core.dump();
+    const loaded = new RecordCore({ hasBlock: () => false, blockByteLength: () => undefined });
+    loaded.load(state);
+    expect(loaded.dump()).toEqual(state);
+    expect(loaded.getTempOwner("temp")).toEqual({
+      ownerId: "temp",
+      createdAt: timestamp,
+      expiresAt: at(180),
+      revision: 4,
+    });
   });
 
   it("rejects orphaned or inconsistent full-text durable generations", () => {

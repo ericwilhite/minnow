@@ -1356,6 +1356,100 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
       },
     },
     {
+      // A long spill renews its temp owner, and a long reader renews its lease, for as long as
+      // the work runs. Every renewal advances the revision and may carry the expiration past
+      // the creation time plus one TTL. That state is ordinary, so a reopen must restore it
+      // exactly, and the holder must still be able to renew with the revision it holds.
+      name: "renewed temp owners and leases survive a reopen and stay renewable",
+      async run(target) {
+        let store = await target.create();
+        await store.addTable(table("t"));
+        const { version } = await commitOne(store, "one");
+        const hour = 3_600_000;
+        const at = (ms: number): string => new Date(Date.parse(T0) + ms).toISOString();
+        await store.createTempOwner({
+          ownerId: "spill-owner",
+          createdAt: T0,
+          expiresAt: at(hour),
+          revision: 0,
+        });
+        await store.createLease({
+          id: "long-reader",
+          kind: "reader",
+          manifestVersion: version,
+          ownerId: "reader-owner",
+          createdAt: T0,
+          expiresAt: at(hour),
+          revision: 0,
+        });
+        // A spill shorter than an hour: renewed once, still inside its first TTL.
+        await store.createTempOwner({
+          ownerId: "short-spill",
+          createdAt: T0,
+          expiresAt: at(hour / 2),
+          revision: 0,
+        });
+        await store.renewTempOwner({
+          ownerId: "short-spill",
+          expectedRevision: 0,
+          expiresAtCutoff: at(hour / 4),
+          expiresAt: at(hour),
+        });
+        // Renew at 30, 60 and 90 minutes; each extends to one hour past its renewal.
+        for (const minutes of [30, 60, 90]) {
+          const now = minutes * 60_000;
+          await store.renewTempOwner({
+            ownerId: "spill-owner",
+            expectedRevision: minutes / 30 - 1,
+            expiresAtCutoff: at(now),
+            expiresAt: at(now + hour),
+          });
+          await store.renewLease({
+            id: "long-reader",
+            expectedRevision: minutes / 30 - 1,
+            expiresAtCutoff: at(now),
+            expiresAt: at(now + hour),
+          });
+        }
+        if (target.reopen !== undefined) store = await target.reopen(store);
+        checkEqual(
+          await store.getTempOwner("spill-owner"),
+          { ownerId: "spill-owner", createdAt: T0, expiresAt: at(150 * 60_000), revision: 3 },
+          "a reopen must restore a renewed temp owner exactly",
+        );
+        checkEqual(
+          await store.getTempOwner("short-spill"),
+          { ownerId: "short-spill", createdAt: T0, expiresAt: at(hour), revision: 1 },
+          "a reopen must restore a temp owner renewed within its first TTL",
+        );
+        check(
+          (await store.getLease("long-reader"))?.revision === 3,
+          "a reopen must restore a renewed lease",
+        );
+        const owner = await store.renewTempOwner({
+          ownerId: "spill-owner",
+          expectedRevision: 3,
+          expiresAtCutoff: at(120 * 60_000),
+          expiresAt: at(180 * 60_000),
+        });
+        check(owner.revision === 4, "a restored temp owner must renew from its revision");
+        const lease = await store.renewLease({
+          id: "long-reader",
+          expectedRevision: 3,
+          expiresAtCutoff: at(120 * 60_000),
+          expiresAt: at(180 * 60_000),
+        });
+        check(lease.revision === 4, "a restored lease must renew from its revision");
+        if (target.reopen !== undefined) store = await target.reopen(store);
+        check(
+          (await store.getTempOwner("spill-owner"))?.revision === 4 &&
+            (await store.getLease("long-reader"))?.revision === 4,
+          "a second reopen must restore the latest renewals",
+        );
+        store.close();
+      },
+    },
+    {
       name: "compaction job records update by CAS with the exact conflict class",
       async run(target) {
         const store = await target.create();
