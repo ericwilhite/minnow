@@ -36,7 +36,7 @@
  * - The owner may answer requests out of order. Requests on one session run in arrival order.
  *
  * ## Result frames and the window (ruling R3)
- * - The owner pulls frames from the executor's result stream (owner/engine.ts `FrameStream`) and
+ * - The owner pulls frames from the executor's result stream (exec/result.ts `ResultStream`) and
  *   posts each one as soon as it has it; frames already queued go out together in one message.
  *   The last frames ride in the terminal `done`, so a small result is one message.
  * - A frame stays charged to the owner until the client sends `release { target, through }` for
@@ -46,8 +46,11 @@
  * - RETURNING rows (ruling R2) are delivered only once the write is committed: for an autocommit
  *   write, after its commit is acknowledged per durability mode (strict: durable; relaxed:
  *   applied). Until then the executor keeps them in a charged, spillable spool and offers no
- *   frames; if the commit fails they are discarded and the client gets only the error. A plain
- *   SELECT streams at once.
+ *   frames; if the commit fails they are discarded and the client gets only the error. Inside an
+ *   explicit transaction they flow when the statement has executed, before COMMIT, as in
+ *   PostgreSQL (ruling R11). A plain SELECT streams at once.
+ * - Under strict durability a frame is posted only once `writePath.durable(frame.requiresLsn)`
+ *   holds (no wait in the common case: a read snapshot sees only durable commits).
  * - A stream whose request is not `live` (below) and whose frames stay unreleased for
  *   `ABANDONED_STREAM_MS` is treated as abandoned: cancelled, frames released, `SessionLostError`.
  *
@@ -67,10 +70,25 @@
  * - The owner admits every request through `RequestLedger.admit` before running it; `sentAtMs`
  *   and `resolvedThrough` feed it, and the receiver enforces the retry window. The client keeps
  *   `seq − resolvedThrough ≤ MAX_OUTSTANDING_REQUESTS` (sequence.ts).
- * - Outcomes (ruling R9): the **write path** records a committed outcome once its commit is
- *   durable (strict) or applied (relaxed); the **owner** records failures, and `settle`s requests
- *   with no durable effect (reads, statements inside an open transaction, rollbacks), so a retry of
- *   those runs again.
+ * - What a retry gets depends on the request (outcomes.ts `ledgerAction` decides; rulings R9,
+ *   R12, R16.1, R16.2):
+ *   - **Commits are exactly-once** (an autocommit write or DDL, `COMMIT`): the write path records
+ *     the committed outcome once durable (strict) or applied (relaxed); a retry gets it.
+ *   - **Statements inside an open transaction** that change it (DML, DDL, savepoints, `BEGIN`,
+ *     and any statement that fails, since failing aborts the transaction) get a session-scoped,
+ *     in-memory `statement` outcome, keyed by (client, engine session, generation); a duplicate
+ *     gets it back instead of running again. The session's end (`endSession`) clears that
+ *     session's outcomes only.
+ *   - **Everything else is at-least-once**: reads, standalone queries including
+ *     `SELECT nextval(…)` (a lost value is a sequence gap, which PostgreSQL allows), queries
+ *     inside a transaction (re-running reads the same transaction state), `ROLLBACK`, prepares and
+ *     subscriptions are `settle`d: no outcome, and a retry runs again.
+ *   - **Failures** of requests that would have committed are recorded by the owner (in memory);
+ *     a retry gets the same error.
+ * - A connection is one **generation** of its sessions: the owner numbers each client's
+ *   connections, and when one ends it ends each of its sessions in the ledger. In-transaction
+ *   statements of an ended generation are dropped with its rolled-back transaction, and their
+ *   late completions are not recorded; a commit already past the boundary still records.
  * - After a reconnect, the client resends every request it has no terminal reply for, unchanged
  *   (same seq, same `sentAtMs`, same cloned input), except those it already saw frames of (it
  *   fails those itself).
@@ -82,6 +100,17 @@
  *   standalone is refused with `SessionLostError` and never executed. So a transaction's
  *   statements never run outside it, and a COMMIT whose fate is unknown resolves from the ledger:
  *   committed, or definitely not.
+ *
+ * ## Idle transactions (ruling R16.7)
+ * - The owner rolls back a transaction left idle for `transactionIdleTimeoutMs` (default 30 s, as
+ *   in 0.19): no request of its session running and none arriving. The timer starts when the
+ *   session's last running request ends, and is cleared by any request on that session or any
+ *   `release` of one of its streams.
+ * - On expiry the owner rolls the transaction back, which releases the writer slot (or the
+ *   read-only pin), and sends `sessionAborted`. Until the client ends the transaction, every
+ *   request on that session except `ROLLBACK` fails with `TransactionIdleTimeoutError` (SQLSTATE
+ *   25P03); `COMMIT` fails the same way and ends it; `ROLLBACK` succeeds and ends it. So statements
+ *   meant for the transaction never run in autocommit.
  *
  * ## Liveness (election.ts)
  * - `live: true` promises that the sender held its liveness lock when it sent the request and
@@ -129,7 +158,13 @@
  */
 import type { PhysicalType } from "../types.js";
 import type { WireError } from "./errors.js";
-import type { ResultFrame, WireInputColumn } from "./frame.js";
+import type { FramePayload, WireInputColumn } from "./frame.js";
+
+/** A session's transaction state as the owner reports it. */
+export type TransactionState = "idle" | "open" | "failed" | "timedOut";
+
+/** Default `transactionIdleTimeoutMs` (0.19's default). */
+export const DEFAULT_TRANSACTION_IDLE_TIMEOUT_MS = 30_000;
 
 /** Bumped by every change to a message in this file or in frame.ts. */
 export const PROTOCOL_VERSION = 1;
@@ -415,7 +450,11 @@ export interface StatementSummary {
   /** A cursor or subscription ended by `cancel { close: true }`. */
   readonly closedEarly: boolean;
   /** The session's transaction state after the request, like PostgreSQL's ReadyForQuery. */
-  readonly transaction: "idle" | "open" | "failed";
+  /**
+   * The session's transaction state after the request, like PostgreSQL's ReadyForQuery: `failed`
+   * after an error inside it (25P02 until it ends), `timedOut` after the idle timeout.
+   */
+  readonly transaction: TransactionState;
   readonly catalogVersion: number;
 }
 
@@ -425,7 +464,7 @@ export interface Rows {
   readonly seq: number;
   /** Present on the first message of a result unless the client already has them. */
   readonly columns: readonly WireColumnMeta[] | null;
-  readonly frames: readonly ResultFrame[];
+  readonly frames: readonly FramePayload[];
 }
 
 export interface Done {
@@ -433,7 +472,7 @@ export interface Done {
   readonly seq: number;
   readonly columns: readonly WireColumnMeta[] | null;
   /** The last frames, inline (often the only one: a small result is this one message). */
-  readonly frames: readonly ResultFrame[];
+  readonly frames: readonly FramePayload[];
   readonly summary: StatementSummary;
 }
 
@@ -470,7 +509,7 @@ export interface Live {
   readonly seq: number;
   readonly version: number;
   readonly columns: readonly WireColumnMeta[] | null;
-  readonly frames: readonly ResultFrame[];
+  readonly frames: readonly FramePayload[];
 }
 
 export interface LiveEnded {
@@ -485,6 +524,17 @@ export interface Alive {
 }
 
 /** The owner is leaving. Requests without a terminal reply will be resent to the next owner. */
+/**
+ * The owner rolled back session `session`'s transaction on its own: idle past
+ * `transactionIdleTimeoutMs`. Requests on it fail with `TransactionIdleTimeoutError` until the
+ * client ends it.
+ */
+export interface SessionAborted {
+  readonly t: "sessionAborted";
+  readonly session: SessionId;
+  readonly reason: "idleTimeout";
+}
+
 export interface StepDown {
   readonly t: "stepDown";
   readonly reason: "freeze" | "pagehide" | "hidden" | "superseded" | "closing" | "lockLost";
@@ -501,7 +551,7 @@ export interface Diagnostic {
 export type Reply = Rows | Done | Prepared | Value | Failure;
 
 export type OwnerMessage =
-  Welcome | Refused | Reply | Live | LiveEnded | Alive | StepDown | Diagnostic;
+  Welcome | Refused | Reply | Live | LiveEnded | Alive | SessionAborted | StepDown | Diagnostic;
 
 /** Whether `message` is the last message about its seq. */
 export function isTerminal(message: OwnerMessage): boolean {

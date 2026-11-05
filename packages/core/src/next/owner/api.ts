@@ -295,6 +295,11 @@ export interface ClientOptions {
   readonly broker?: Broker;
   /** Owner settings, applied when this page hosts. */
   readonly durability?: "strict" | "relaxed";
+  /**
+   * Owner setting, applied when this context hosts: a transaction idle this long is rolled back
+   * and its next call fails with `TransactionIdleTimeoutError`. Defaults to 30 s.
+   */
+  readonly transactionIdleTimeoutMs?: number;
   /** The one optional memory cap of the owner, in bytes. */
   readonly memoryLimitBytes?: number;
   /** Silence before calls fail with `OwnerUnresponsiveError`. */

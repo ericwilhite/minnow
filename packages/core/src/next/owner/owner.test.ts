@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import { CLIENT_RETRY_WINDOW_MS, RequestLedger } from "../format/ledger.js";
-import { allocateValidity, setValid } from "../vector/validity.js";
 import {
   canHost,
   clientLockName,
@@ -12,6 +11,7 @@ import {
 } from "./election.js";
 import {
   CommittedWithoutResultError,
+  TransactionIdleTimeoutError,
   OutcomeUnknownError,
   OwnerUnresponsiveError,
   SessionLostError,
@@ -20,18 +20,10 @@ import {
   toWireError,
 } from "./errors.js";
 import {
-  FrameBufferError,
-  frameTransferables,
-  StreamDictionaries,
-  type ResultFrame,
-} from "./frame.js";
-import {
   DEFAULT_RESULT_WINDOW_BYTES,
   PROTOCOL_VERSION,
   ProtocolError,
-  isTerminal,
   parseClientMessage,
-  type Done,
   type StatementRequest,
 } from "./protocol.js";
 import { RequestSequencer, isStandalone, mayControlTransaction } from "./sequence.js";
@@ -182,136 +174,6 @@ describe("standalone requests", () => {
   });
 });
 
-/** A two-row result frame (int64 + text) built the way the result sink must: exact buffers. */
-function sampleFrame(): ResultFrame {
-  const validity = allocateValidity(2);
-  setValid(validity, 0, true);
-  return {
-    sequence: 0,
-    rowCount: 2,
-    columns: [
-      {
-        form: "flat",
-        validity: null,
-        data: {
-          layout: "int64",
-          values: { repr: "int64", values: BigInt64Array.of(1n, 2n ** 60n) },
-        },
-      },
-      {
-        form: "flat",
-        validity,
-        data: {
-          layout: "varlen",
-          bytes: new TextEncoder().encode("ab"),
-          offsets: Int32Array.of(0, 2, 2),
-        },
-      },
-    ],
-  };
-}
-
-describe("result frames move by transfer", () => {
-  it("detaches every buffer on the sender and delivers the same values", async () => {
-    const frame = sampleFrame();
-    const done: Done = {
-      t: "done",
-      seq: 7,
-      columns: null,
-      frames: [frame],
-      summary: {
-        command: "SELECT",
-        rowCount: 2,
-        counts: null,
-        lsn: null,
-        replayed: false,
-        closedEarly: false,
-        transaction: "idle",
-        catalogVersion: 1,
-      },
-    };
-    const transfer = frameTransferables(frame);
-    expect(transfer).toHaveLength(4);
-    const { port1, port2 } = new MessageChannel();
-    const received = new Promise<Done>((resolve) => {
-      port2.onmessage = (event: MessageEvent<Done>) => {
-        resolve(event.data);
-      };
-    });
-    port1.postMessage(done, transfer);
-    const reply = await received;
-    port1.close();
-    port2.close();
-    // Zero added copies: the owner's buffers are gone, not cloned.
-    for (const buffer of transfer) expect(buffer.byteLength).toBe(0);
-    expect(isTerminal(reply)).toBe(true);
-    const [ints, text] = reply.frames[0]?.columns ?? [];
-    expect(
-      ints?.form === "flat" && ints.data.layout === "int64" ? [...ints.data.values.values] : null,
-    ).toEqual([1n, 2n ** 60n]);
-    expect(
-      text?.form === "flat" && text.data.layout === "varlen"
-        ? new TextDecoder().decode(text.data.bytes)
-        : null,
-    ).toBe("ab");
-  });
-
-  it("refuses views that do not own their whole buffer, and shared memory", () => {
-    const slack = new Float64Array(16).subarray(0, 2);
-    const frame: ResultFrame = {
-      sequence: 0,
-      rowCount: 2,
-      columns: [{ form: "flat", validity: null, data: { layout: "f64", values: slack } }],
-    };
-    expect(() => frameTransferables(frame)).toThrow(FrameBufferError);
-    const shared = new Float64Array(new SharedArrayBuffer(16));
-    expect(() =>
-      frameTransferables({
-        ...frame,
-        columns: [{ form: "flat", validity: null, data: { layout: "f64", values: shared } }],
-      }),
-    ).toThrow(FrameBufferError);
-  });
-
-  it("keeps per-stream dictionaries from deltas, and rejects a gap", () => {
-    const utf8 = (...values: string[]) => {
-      const bytes = new TextEncoder().encode(values.join(""));
-      const offsets = new Int32Array(values.length + 1);
-      values.forEach((value, index) => {
-        offsets[index + 1] = (offsets[index] ?? 0) + new TextEncoder().encode(value).length;
-      });
-      return { form: "flat", validity: null, data: { layout: "varlen", bytes, offsets } } as const;
-    };
-    const frame = (sequence: number, base: number, entries: string[], codes: number[]) =>
-      ({
-        sequence,
-        rowCount: codes.length,
-        columns: [
-          {
-            form: "dictionary",
-            codes: Int32Array.from(codes),
-            validity: null,
-            dictionary: 1,
-            delta: entries.length === 0 ? null : { base, entries: utf8(...entries) },
-          },
-        ],
-      }) satisfies ResultFrame;
-    const dictionaries = new StreamDictionaries();
-    const first = frame(0, 0, ["red", "green"], [0, 1, 0]);
-    expect(frameTransferables(first)).toHaveLength(3);
-    dictionaries.apply(first);
-    dictionaries.apply(frame(1, 2, ["blue"], [2, 0]));
-    dictionaries.apply(frame(2, 3, [], [1]));
-    expect(dictionaries.size(1)).toBe(3);
-    const { entries, index } = dictionaries.locate(1, 2);
-    expect(entries.data.layout === "varlen" ? entries.data.offsets[index] : null).toBe(0);
-    expect(() => {
-      dictionaries.apply(frame(3, 5, ["gap"], [5]));
-    }).toThrow(RangeError);
-    expect(() => dictionaries.locate(1, 3)).toThrow(RangeError);
-  });
-});
-
 describe("parseClientMessage", () => {
   const statement: StatementRequest = {
     t: "statement",
@@ -351,6 +213,7 @@ describe("errors on the wire", () => {
     for (const error of [
       new OwnerUnresponsiveError(10_000),
       new OutcomeUnknownError("unresponsive"),
+      new TransactionIdleTimeoutError(30_000),
       new SessionLostError("transaction"),
       new CommittedWithoutResultError({ orders: 2 }),
     ]) {

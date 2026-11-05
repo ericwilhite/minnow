@@ -131,6 +131,25 @@ export class ClientClosedError extends Error {
   }
 }
 
+/**
+ * The session's transaction sat idle past `transactionIdleTimeoutMs` and was rolled back (ruling
+ * R16.7; SQLSTATE 25P03, PostgreSQL's idle-in-transaction timeout). Every request on the session
+ * fails with this until the client ends the transaction with ROLLBACK (or COMMIT, which commits
+ * nothing). Nothing of the transaction took effect.
+ */
+export class TransactionIdleTimeoutError extends Error {
+  readonly code = "MINNOW_TRANSACTION_IDLE_TIMEOUT";
+  override readonly name = "TransactionIdleTimeoutError";
+  readonly sqlState = "25P03";
+  readonly timeoutMs: number;
+  constructor(timeoutMs: number) {
+    super(
+      `The transaction was idle for more than ${String(timeoutMs)} ms and was rolled back; nothing of it took effect`,
+    );
+    this.timeoutMs = timeoutMs;
+  }
+}
+
 /** The classes above, keyed by name, for `fromWireError`. */
 export const ownerErrorRegistry: ErrorRegistry = new Map<string, new (...args: never[]) => Error>([
   ["OwnerUnresponsiveError", OwnerUnresponsiveError],
@@ -142,4 +161,5 @@ export const ownerErrorRegistry: ErrorRegistry = new Map<string, new (...args: n
   ["SupersededError", SupersededError],
   ["OwnerUnreachableError", OwnerUnreachableError],
   ["ClientClosedError", ClientClosedError],
+  ["TransactionIdleTimeoutError", TransactionIdleTimeoutError],
 ]);

@@ -7,8 +7,8 @@
  * - Sequences start at 1 and increase by one per request, in send order, for the client's whole
  *   page lifetime: across reconnects and owner changes.
  * - A seq is **resolved** when the client holds its terminal reply, or has failed it locally
- *   without ever sending it. A request failed early with `OwnerUnresponsiveError { outcome:
- *   "unknown" }` is **not** resolved: its reply is still collected (or it expires, below).
+ *   without ever sending it. A write failed early with `OutcomeUnknownError { reason:
+ *   "unresponsive" }` is **not** resolved: its reply is still collected (or it expires, below).
  * - `resolvedThrough` is the highest S with every seq ≤ S resolved. The owner uses it to drop
  *   outcomes the client holds (ledger `#acknowledge`).
  * - Window: a new seq is issued only while `seq ≤ resolvedThrough + maxOutstanding`, the bound the
@@ -27,9 +27,12 @@
  * session 0 inside (or possibly inside) a transaction; `begin`, `commit`, `rollback`. On a new
  * connection, a non-standalone request is answered from the ledger if it committed, and is
  * otherwise refused with `SessionLostError`, untouched.
+ *
+ * Standalone is about meaning, not about exactly-once: a standalone query is still
+ * at-least-once (outcomes.ts). Only commits are exactly-once.
  */
 import { MAX_OUTSTANDING_REQUESTS } from "../format/ledger.js";
-import type { Request } from "./protocol.js";
+import type { Request, TransactionState } from "./protocol.js";
 
 export class RequestSequencer {
   readonly #maxOutstanding: number;
@@ -77,7 +80,7 @@ export class RequestSequencer {
 /** What the client knows about session 0 when it sends a request. */
 export interface DefaultSessionView {
   /** Session 0's transaction state from the latest `done.summary.transaction`. */
-  readonly transaction: "idle" | "open" | "failed";
+  readonly transaction: TransactionState;
   /** Session-0 requests sent, unresolved, for which `mayControlTransaction` was true. */
   readonly unresolvedControl: number;
 }
