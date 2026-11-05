@@ -162,7 +162,9 @@ describe("ResultChannel", () => {
     // 1,000-row frames of 4 KB; a 10 KB window holds at most 3 unreleased frames.
     const channel = new ResultChannel(COLUMNS, { windowBytes: 10_000 });
     const sink = new ToySink(channel, grant, 1000);
-    const run = drive(new CountingSource(40, 250), sink);
+    // A frozen clock: the driver's 4 ms time slice must not end the first run early on a loaded
+    // machine (the window, not the clock, is what this test pauses on).
+    const run = drive(new CountingSource(40, 250), sink, undefined, { now: () => 0 });
     await tick();
     expect(channel.outstandingBytes).toBe(12_000);
     let peak = 0;

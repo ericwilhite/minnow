@@ -12,11 +12,12 @@
  *   overflow`, a zero product or quotient from non-zero inputs is `…: underflow`, and division by
  *   zero is 22012 (PostgreSQL's float8 operators). REAL computes in f64 and rounds with
  *   `Math.fround`; range checks apply to the rounded value.
- * - Decimal (`add`, `sub`, `mul`; `div`/`mod` are not compiled yet): result display scale is
+ * - Decimal `add`, `sub`, `mul`: result display scale is
  *   max(scales) for add/sub and the sum of scales for mul, per slot. Coefficients are never
  *   rescaled to a shared maximum across rows. The fast path keeps `safe` coefficients while every
  *   aligned value stays exact in f64; otherwise the batch is recomputed in BigInt into the `wide`
  *   tier. NaN and ±Infinity follow PostgreSQL (NaN absorbs; ∞ − ∞ and ∞ × 0 are NaN).
+ * - Decimal `div`, `mod`: exact BigInt per row with PostgreSQL's display scales (decimal-div.ts).
  */
 import type { PhysicalType } from "../../types.js";
 import { INT32_MAX, INT32_MIN, INT16_MAX, INT16_MIN, INT64_MAX, INT64_MIN } from "../../types.js";
@@ -34,8 +35,11 @@ import {
   SCRATCH,
   addTo,
   copy,
+  divideTo,
   fitsInt64,
   int64Words,
+  isZero,
+  leadingDigitOf,
   multiplyTo,
   scaleUp,
   setInt64,
@@ -43,6 +47,12 @@ import {
   sign,
   storeInt64,
 } from "./limbs.js";
+import {
+  NUMERIC_MAX_DISPLAY_SCALE,
+  NUMERIC_MIN_SIG_DIGITS,
+  numericDivide,
+  numericModulo,
+} from "./decimal-div.js";
 import { ADD, DIV, MUL, SUB, floatLoop, int32Loop, zeroSeen } from "./loops.js";
 import {
   POW10,
@@ -1082,6 +1092,218 @@ function special(op: number, xs: number, ys: number, fx: number, fy: number): nu
   return ey > 0 ? POS : NEG;
 }
 
+/**
+ * NUMERIC `/` and `%` with PostgreSQL's display scales (decimal-div.ts has the rules). Each row is
+ * computed in 128-bit limbs (limbs.ts `divideTo`: a double estimate corrected exactly), output in
+ * the int64 tier when every value fits, else int128. A row whose scaled operands pass 128 bits, or
+ * whose quotient reaches 2^50, sends the batch to the exact BigInt path.
+ */
+class DecimalDivNode extends BinaryNode {
+  readonly #modulo: boolean;
+  readonly #scales: Uint16Array;
+  readonly #limbs: Uint32Array;
+  readonly #int64: BigInt64Array;
+  readonly #int64Words: Uint32Array;
+  readonly #wide: bigint[];
+  readonly #specials: Uint8Array;
+  readonly #validity: Validity;
+  /** int64 / int128 / wide outputs, without and with specials. */
+  readonly #tiers: readonly FlatVector[];
+  readonly #lead = new Int32Array(2);
+  #wordsCache: { source: BigInt64Array | null; words: Uint32Array } = {
+    source: null,
+    words: new Uint32Array(0),
+  };
+  #wordsCacheB: { source: BigInt64Array | null; words: Uint32Array } = {
+    source: null,
+    words: new Uint32Array(0),
+  };
+  constructor(
+    op: "div" | "mod",
+    type: PhysicalType,
+    left: Compiled,
+    right: Compiled,
+    arena: OutputArena,
+  ) {
+    super(type, left, right);
+    this.#modulo = op === "mod";
+    const capacity = arena.capacity;
+    arena.take(2 * capacity + 16 * capacity + 8 * capacity + capacity + 32 * capacity);
+    this.#scales = new Uint16Array(capacity);
+    this.#limbs = new Uint32Array(4 * capacity);
+    this.#int64 = new BigInt64Array(capacity);
+    this.#int64Words = int64Words(this.#int64);
+    this.#specials = new Uint8Array(capacity);
+    this.#wide = new Array<bigint>(capacity).fill(0n);
+    this.#validity = arena.validity();
+    const tiers: FlatVector[] = [];
+    for (const coefficients of [
+      { repr: "int64", values: this.#int64 } as const,
+      { repr: "int128", limbs: this.#limbs } as const,
+      { repr: "wide", values: this.#wide } as const,
+    ]) {
+      tiers.push(decimalVector(type, null, this.#scales, coefficients, null));
+      tiers.push(decimalVector(type, null, this.#scales, coefficients, this.#specials));
+    }
+    this.#tiers = tiers;
+  }
+  #words(data: DecimalData, second: boolean): Uint32Array {
+    const coefficients = data.coefficients;
+    if (coefficients.repr !== "int64") return EMPTY_WORDS;
+    const cache = second ? this.#wordsCacheB : this.#wordsCache;
+    if (cache.source !== coefficients.values) {
+      cache.source = coefficients.values;
+      cache.words = int64Words(coefficients.values);
+    }
+    return cache.words;
+  }
+  compute(length: number, l: Vector, r: Vector, rows: Uint16Array, count: number): Vector {
+    const validity = combineValidity(
+      operandValidity(l),
+      operandValidity(r),
+      this.#validity,
+      length,
+    );
+    const out =
+      this.#limbed(l, r, rows, count, validity) ?? this.#exact(l, r, rows, count, validity);
+    out.length = length;
+    out.validity = validity;
+    return out;
+  }
+  /** The limb path; null sends the batch to `#exact`. Raises 22012 like PostgreSQL. */
+  #limbed(
+    l: Vector,
+    r: Vector,
+    rows: Uint16Array,
+    count: number,
+    validity: Validity | null,
+  ): FlatVector | null {
+    const ld = flatOf(l).data as DecimalData;
+    const rd = flatOf(r).data as DecimalData;
+    if (ld.coefficients.repr === "wide" || rd.coefficients.repr === "wide") return null;
+    const lw = this.#words(ld, false);
+    const rw = this.#words(rd, true);
+    const loadLeft = loaderFor(ld);
+    const loadRight = loaderFor(rd);
+    const out = this.#limbs;
+    const scales = this.#scales;
+    const specials = this.#specials;
+    const lead = this.#lead;
+    let fits = true;
+    let anySpecial = false;
+    for (let k = 0; k < count; k++) {
+      const i = rows[k] ?? 0;
+      specials[i] = 0;
+      scales[i] = 0;
+      if (!validAt(validity, i)) continue;
+      const li = slotIndex(l, i);
+      const ri = slotIndex(r, i);
+      const xs = specialAt(ld, li);
+      const ys = specialAt(rd, ri);
+      loadLeft(SCRATCH, 0, ld, li, lw);
+      loadRight(SCRATCH, 1, rd, ri, rw);
+      const s1 = scaleAt(ld, li);
+      const s2 = scaleAt(rd, ri);
+      if (xs !== 0 || ys !== 0) {
+        const outcome = (this.#modulo ? numericModulo : numericDivide)(
+          xs,
+          xs === 0 ? BigInt(sign(SCRATCH, 0)) : 0n,
+          s1,
+          ys,
+          ys === 0 ? BigInt(sign(SCRATCH, 1)) : 0n,
+          s2,
+        );
+        specials[i] = outcome.special;
+        if (outcome.special === 0) {
+          // Finite results with a special operand: x % ±∞ = x, finite / ±∞ = 0.
+          if (this.#modulo) copy(out, i, SCRATCH, 0);
+          else setNumber(out, i, 0);
+          scales[i] = this.#modulo ? s1 : 0;
+        } else {
+          anySpecial = true;
+          setNumber(out, i, 0);
+        }
+        if (fits && !fitsInt64(out, i)) fits = false;
+        continue;
+      }
+      if (isZero(SCRATCH, 1)) throw new DivisionByZeroError();
+      let scale: number;
+      if (this.#modulo) {
+        // x − trunc(x / y)·y at scale max(s1, s2).
+        scale = Math.max(s1, s2);
+        if (!scaleUp(SCRATCH, 0, scale - s1) || !scaleUp(SCRATCH, 1, scale - s2)) return null;
+        if (!divideTo(SCRATCH, 2, SCRATCH, 0, SCRATCH, 1, false)) return null;
+        if (!multiplyTo(SCRATCH, 2, SCRATCH, 2, SCRATCH, 1)) return null;
+        if (!addTo(out, i, SCRATCH, 0, SCRATCH, 2, true)) return null;
+      } else {
+        leadingDigitOf(SCRATCH, 0, s1, lead);
+        const w1 = lead[0] ?? 0;
+        const d1 = lead[1] ?? 0;
+        leadingDigitOf(SCRATCH, 1, s2, lead);
+        const w2 = lead[0] ?? 0;
+        const d2 = lead[1] ?? 0;
+        let qweight = w1 - w2;
+        if (d1 <= d2) qweight -= 1;
+        scale = Math.min(
+          Math.max(NUMERIC_MIN_SIG_DIGITS - qweight * 4, s1, s2, 0),
+          NUMERIC_MAX_DISPLAY_SCALE,
+        );
+        const e = scale - s1 + s2;
+        if (!scaleUp(SCRATCH, e >= 0 ? 0 : 1, Math.abs(e))) return null;
+        if (!divideTo(out, i, SCRATCH, 0, SCRATCH, 1, true)) return null;
+      }
+      scales[i] = scale;
+      if (fits && !fitsInt64(out, i)) fits = false;
+    }
+    if (fits) {
+      const words = this.#int64Words;
+      for (let k = 0; k < count; k++) {
+        const i = rows[k] ?? 0;
+        storeInt64(out, i, words, i);
+      }
+      return this.#tiers[anySpecial ? 1 : 0] ?? null;
+    }
+    return this.#tiers[anySpecial ? 3 : 2] ?? null;
+  }
+  /** Exact BigInt per row (operands or quotients past the limb range). */
+  #exact(
+    l: Vector,
+    r: Vector,
+    rows: Uint16Array,
+    count: number,
+    validity: Validity | null,
+  ): FlatVector {
+    const wide = this.#wide;
+    const scales = this.#scales;
+    const specials = this.#specials;
+    const ld = flatOf(l).data as DecimalData;
+    const rd = flatOf(r).data as DecimalData;
+    const divide = this.#modulo ? numericModulo : numericDivide;
+    let anySpecial = false;
+    for (let k = 0; k < count; k++) {
+      const i = rows[k] ?? 0;
+      specials[i] = 0;
+      if (!validAt(validity, i)) continue;
+      const li = slotIndex(l, i);
+      const ri = slotIndex(r, i);
+      const xs = specialAt(ld, li);
+      const ys = specialAt(rd, ri);
+      const x = xs === 0 ? coefficientAt(ld, li) : 0n;
+      const y = ys === 0 ? coefficientAt(rd, ri) : 0n;
+      const outcome = divide(xs, x, scaleAt(ld, li), ys, y, scaleAt(rd, ri));
+      specials[i] = outcome.special;
+      if (outcome.special !== 0) anySpecial = true;
+      wide[i] = outcome.coefficient;
+      scales[i] = outcome.scale;
+    }
+    return (
+      this.#tiers[anySpecial ? 5 : 4] ??
+      this.#tiers[4] ??
+      decimalVector(this.type, null, scales, { repr: "wide", values: wide }, null)
+    );
+  }
+}
+
 // ------------------------------------------------------------------------------------------------
 
 /**
@@ -1238,9 +1460,9 @@ export function compileArithmetic(
     case "float32":
       return new FloatNode(op, type, left, right, arena);
     case "decimal":
-      if (op === "div" || op === "mod")
-        throw new UnsupportedPlanError("numeric division and modulo");
-      return new DecimalNode(op, type, left, right, arena);
+      return op === "div" || op === "mod"
+        ? new DecimalDivNode(op, type, left, right, arena)
+        : new DecimalNode(op, type, left, right, arena);
     default:
       throw new UnsupportedPlanError(`${op} over ${type.kind}`);
   }
