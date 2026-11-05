@@ -1134,7 +1134,8 @@ when a generator, schema or load path changes. Delete the lane directory to recl
 space; the default scales take several gigabytes, the large ones tens.
 
 **The baseline.** `packages/core/browser-perf-baseline.json` holds, per runtime profile (OS,
-architecture, Chromium major), what each cell does today: `completes` with its ratio and a
+architecture, Chromium major, and a `-ci` suffix on a CI runner, so a shared runner and a
+developer machine never judge each other), what each cell does today: `completes` with its ratio and a
 regression threshold, or `fails` with its failure class. Many analytics cells fail at default
 options today, and the baseline says so. The lane fails when:
 
@@ -1151,8 +1152,9 @@ file carries the design targets for the 1.0 reset (Gates A–D and the point tar
 prints each cell's progress toward its target and never fails on one. `--update` rewrites the
 current profile's cells it ran and keeps every other profile and the targets. A profile marked
 `provisional` was calibrated on a noisy or unrepresentative host; recalibrate it on the machine
-that runs the lane, with the nightly workflow's `update` input, and treat that update as a code
-change.
+that runs the lane, and treat that update as a code change. The CI profile starts empty, so the
+nightly run fails as uncalibrated until the workflow is run once with its `update` input and the
+uploaded baseline file is committed.
 
 ## Refresh the download-size comparison
 

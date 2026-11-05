@@ -128,16 +128,21 @@ export function parseBrowserPerfBaseline(value: unknown): BrowserPerfBaseline {
   return { schemaVersion: 1, targets, profiles };
 }
 
-/** `linux-x64-chromium148`: ratios are specific to the OS, CPU architecture and browser major. */
+/**
+ * `linux-x64-chromium148`: ratios are specific to the OS, CPU architecture and browser major.
+ * A CI runner (`CI` set) gets its own `-ci` profile: a shared 4-vCPU runner and a developer
+ * machine with the same OS and Chromium measure different ratios, so neither judges the other.
+ */
 export function browserPerfProfile(
   browserVersion: string,
   platform = process.platform,
   architecture = process.arch,
+  ci = process.env.CI !== undefined && process.env.CI !== "" && process.env.CI !== "false",
 ): string {
   const major = browserVersion.split(".")[0] ?? "";
   if (!/^\d+$/.test(major))
     throw new Error(`Cannot identify the Chromium major version from ${browserVersion}`);
-  return `${platform}-${architecture}-chromium${major}`;
+  return `${platform}-${architecture}-chromium${major}${ci ? "-ci" : ""}`;
 }
 
 /** What one engine did in one cell, reduced to what the baseline judges. */

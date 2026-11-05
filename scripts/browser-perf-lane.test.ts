@@ -202,7 +202,10 @@ describe("browser lane baseline", () => {
   });
 
   it("keys profiles by OS, architecture and Chromium major", () => {
-    expect(browserPerfProfile("151.0.7000.1", "linux", "x64")).toBe("linux-x64-chromium151");
+    expect(browserPerfProfile("151.0.7000.1", "linux", "x64", false)).toBe("linux-x64-chromium151");
+    expect(browserPerfProfile("151.0.7000.1", "linux", "x64", true)).toBe(
+      "linux-x64-chromium151-ci",
+    );
     expect(() => browserPerfProfile("nightly")).toThrow();
   });
 
