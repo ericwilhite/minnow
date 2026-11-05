@@ -24,7 +24,8 @@
  *    position (or `context.parameterTypes`), operator and function overloads resolved against
  *    the executor's kernel signatures, implicit casts made explicit (`cast` nodes).
  * 5. **IR construction** (INVENTORY.md maps each front-end construct to its operator), join
- *    ordering by the cost model (lower/statistics.ts), parameter slots, init plans, `apply`.
+ *    ordering by the cost model (lower/from.ts over lower/statistics.ts), access paths
+ *    (lower/access-path.ts), parameter slots, init plans, mark joins, `apply`.
  * 6. **Descriptors**: result columns (lower/result.ts), read and write sets, statistics basis.
  *
  * The front end's semantics are kept, not re-derived: where it rewrote SQL (decorrelation, view

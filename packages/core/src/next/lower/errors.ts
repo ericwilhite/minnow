@@ -10,7 +10,7 @@ import { UnsupportedPlanError } from "../errors.js";
  * first" table in INVENTORY.md, so the differential harness can count refusals per construct.
  */
 export type UnsupportedConstruct =
-  /** MERGE (needs the IR `merge` modify kind, INVENTORY.md "IR requests" 2). */
+  /** A MERGE form lowering cannot express (a generated column reading a later volatile value). */
   | "merge"
   /** CREATE TRIGGER / DROP TRIGGER and firing (the new catalog has no triggers). */
   | "trigger"
@@ -28,16 +28,10 @@ export type UnsupportedConstruct =
   | "columnType"
   /** An ALTER TABLE form beyond ADD / RENAME / DROP COLUMN. */
   | "alterTable"
-  /** Joins, UPDATE … FROM, DELETE … USING (milestone M3). */
-  | "join"
-  /** Scalar, IN and EXISTS subqueries (milestone M3). */
+  /** A subquery where no FROM clause can attach it. */
   | "subquery"
-  /** Window functions (milestone M3). */
+  /** A window function lowering does not translate (explicit frames are carried as written). */
   | "window"
-  /** UNION / INTERSECT / EXCEPT (milestone M3). */
-  | "setOperation"
-  /** WITH RECURSIVE and GENERATE_SERIES (milestone M3). */
-  | "recursive"
   /** Ordered-set aggregates (percentile_cont/disc, mode) and JSON aggregates. */
   | "aggregate"
   /** SERIAL / IDENTITY columns (needs the write path's owned sequences, R17.7). */

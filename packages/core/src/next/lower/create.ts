@@ -6,10 +6,9 @@ import type { CreateTableInput } from "../../engine/catalog-mutations.js";
 import type { CompiledStatement } from "../../engine/query.js";
 import type { OutputColumn, PhysicalPlan, Rel } from "../ir/ir.js";
 import type { TableRuleExpressions } from "../ir/rules.js";
-import type { PhysicalType } from "../types.js";
 import { ParameterTypes } from "./coerce.js";
 import { descriptorOf, lowerDdl, tableInput } from "./ddl.js";
-import { PlanningError, unsupported } from "./errors.js";
+import { PlanningError } from "./errors.js";
 import type { ExpressionState } from "./expressions.js";
 import type { CompiledQuery } from "../../plan/model.js";
 import { parseAny, parseQuery, prepareQuery } from "./frontend.js";
@@ -26,9 +25,16 @@ import {
   lowerBatchWrite,
   lowerDelete,
   lowerInsert,
+  lowerMerge,
   lowerUpdate,
 } from "./modify.js";
-import { lowerBlock, outputColumns, PlanBuilder, type RelColumn } from "./query.js";
+import {
+  installSubqueries,
+  lowerBlock,
+  outputColumns,
+  PlanBuilder,
+  type RelColumn,
+} from "./query.js";
 import { resultColumn } from "./result.js";
 import { lowerTableRules } from "./rules.js";
 import { classifyStatement } from "./statement.js";
@@ -53,8 +59,6 @@ const SETTINGS: Readonly<Record<string, string>> = {
   max_identifier_length: "63",
 };
 
-const TIMESTAMPTZ: PhysicalType = { kind: "timestamp", zoned: true };
-
 /**
  * The query of `CREATE TABLE [IF NOT EXISTS] name AS query`, as written: the compiled statement
  * keeps no text of it, and its follow-up INSERT must lower it again at the new catalog version.
@@ -71,28 +75,25 @@ function ctasQueryText(text: string): string {
 
 interface Planning {
   readonly builder: PlanBuilder;
-  readonly state: ExpressionState & { clockUsed: boolean };
+  readonly state: ExpressionState;
   readonly placeholders: number;
 }
 
 function planning(placeholders: number, context: LoweringContext): Planning {
   const parameters = new ParameterTypes(placeholders, context.parameterTypes ?? []);
-  const state = {
+  let builder: PlanBuilder | null = null;
+  const state: ExpressionState = {
     parameters,
     catalog: context.catalog,
-    clockUsed: false,
-    clock(): number {
-      state.clockUsed = true;
-      return placeholders;
+    clock: () => {
+      if (builder === null) throw new PlanningError("clock before planning", "XX000");
+      return builder.clock();
     },
     volatile: false,
     sequences: false,
   };
-  const builder = new PlanBuilder(
-    context.catalog,
-    state,
-    (tableId) => context.statistics.table(tableId)?.rowCount ?? 0,
-  );
+  builder = new PlanBuilder(context.catalog, state, context.statistics, context.costs);
+  installSubqueries(builder);
   return { builder, state, placeholders };
 }
 
@@ -102,15 +103,13 @@ function physicalPlan(
   plan: Planning,
   catalog: CatalogView,
 ): PhysicalPlan {
-  const parameters = plan.state.parameters.settled();
-  const clockSlot = plan.state.clockUsed ? plan.placeholders : null;
   return {
     root,
     columns,
-    parameters: clockSlot === null ? parameters : [...parameters, TIMESTAMPTZ],
+    parameters: [...plan.state.parameters.settled(), ...plan.builder.slots],
     placeholderCount: plan.placeholders,
-    clockSlot,
-    initPlans: [],
+    clockSlot: plan.builder.clockSlot,
+    initPlans: [...plan.builder.initPlans],
     catalogVersion: catalog.version,
     volatile: plan.state.volatile,
   };
@@ -146,7 +145,7 @@ function lowerSelect(text: string, parsed: CompiledQuery, context: LoweringConte
 
 function lowerModify(
   text: string,
-  statement: Extract<CompiledStatement, { kind: "insert" | "update" | "delete" }>,
+  statement: Extract<CompiledStatement, { kind: "insert" | "update" | "delete" | "merge" }>,
   context: LoweringContext,
 ): LoweredModify {
   const plan = planning(placeholderCount(statement), context);
@@ -155,7 +154,9 @@ function lowerModify(
       ? lowerInsert(statement, plan.builder)
       : statement.kind === "update"
         ? lowerUpdate(statement, plan.builder)
-        : lowerDelete(statement, plan.builder);
+        : statement.kind === "merge"
+          ? lowerMerge(statement, plan.builder)
+          : lowerDelete(statement, plan.builder);
   return {
     kind: "modify",
     text,
@@ -202,7 +203,7 @@ export function createLowerer(): Lowerer {
         case "delete":
           return lowerModify(text, statement, context);
         case "merge":
-          throw unsupported("merge", "MERGE (milestone M3)");
+          return lowerModify(text, statement, context);
         case "transaction":
           return {
             ...base,

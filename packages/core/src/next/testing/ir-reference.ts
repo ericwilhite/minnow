@@ -270,6 +270,8 @@ export interface Environment {
   readonly params: readonly Value[];
   readonly rules: (table: TableDef) => TableRuleExpressions;
   sequences: Map<number, bigint>;
+  /** Recursive work tables in scope, by id. */
+  readonly workTables?: ReadonlyMap<number, readonly Row[]>;
 }
 
 export function evaluate(expr: ScalarExpr, row: readonly Value[], env: Environment): Value {
@@ -488,6 +490,13 @@ function aggregate(fn: string, values: readonly Value[], type: PhysicalType): Va
     case "avg":
       if (present.length === 0) return null;
       return present.reduce<number>((sum, value) => sum + Number(value), 0) / present.length;
+    case "single_value":
+      if (values.length > 1)
+        throw new ReferenceSqlError(
+          "more than one row returned by a subquery used as an expression",
+          "21000",
+        );
+      return values[0] ?? null;
     case "min":
     case "max":
       if (present.length === 0) return null;
@@ -589,6 +598,20 @@ export function run(rel: Rel, env: Environment): Row[] {
     }
     case "modify":
       return modifyRows(rel, env);
+    case "join":
+      return joinRows(rel, env);
+    case "apply":
+      return applyRows(rel, env);
+    case "window":
+      return windowRows(rel, env);
+    case "setOp":
+      return setOpRows(rel, env);
+    case "recursive":
+      return recursiveRows(rel, env);
+    case "workTableScan":
+      return (env.workTables?.get(rel.workTable) ?? []).map((row) => [...row]);
+    case "indexRange":
+      return indexRangeRows(rel, env);
     case "input":
       return (env.input ?? []).map((row) => [...row]);
     default:
@@ -637,10 +660,58 @@ function modifyRows(rel: Extract<Rel, { op: "modify" }>, env: Environment): Row[
     }
     return -1;
   };
-  const returning = (row: Row): void => {
+  const returning = (row: Row, extra: readonly Value[] = []): void => {
     if (rel.returning !== null)
-      returned.push(rel.returning.map((expr) => evaluate(expr, row, env)));
+      returned.push(rel.returning.map((expr) => evaluate(expr, [...row, ...extra], env)));
   };
+  const passthrough = rel.passthrough ?? 0;
+  if (rel.kind === "merge" && rel.merge !== undefined) {
+    const spec = rel.merge;
+    for (const row of input) {
+      const locatorValue = row[spec.sourceColumns] ?? null;
+      const matched = locatorValue !== null;
+      for (const action of spec.actions) {
+        if (action.when !== (matched ? "matched" : "notMatched")) continue;
+        if (action.condition !== null && evaluate(action.condition, row, env) !== true) continue;
+        if (action.action.kind === "nothing") break;
+        if (action.when === "matched") {
+          const locator = Number(locatorValue);
+          if (touched.has(locator))
+            throw new ReferenceSqlError("MERGE affects a row a second time", "21000");
+          touched.add(locator);
+          if (action.action.kind === "delete") {
+            stored[locator] = [];
+            break;
+          }
+          const next = [...(stored[locator] ?? [])];
+          const reads = [...row];
+          for (const [j, id] of action.action.assigned.entries()) {
+            const value = evaluate(at(action.action.values, j), reads, env);
+            reads.push(value);
+            next[table.columns.findIndex((column) => column.id === id)] = value;
+          }
+          validate(next);
+          stored[locator] = [];
+          if (conflict(next, []) !== -1) throw new ReferenceSqlError("duplicate key", "23505");
+          stored[locator] = next;
+          break;
+        }
+        const reads = [...row];
+        const next: Row = [];
+        for (const value of action.action.values) {
+          const computed = evaluate(value, reads, env);
+          reads.push(computed);
+          next.push(computed);
+        }
+        validate(next);
+        if (conflict(next, []) !== -1) throw new ReferenceSqlError("duplicate key", "23505");
+        stored.push(next);
+        touched.add(stored.length - 1);
+        break;
+      }
+    }
+    return [];
+  }
   for (const row of input) {
     if (rel.kind === "insert" || rel.kind === "upsert") {
       validate(row);
@@ -674,9 +745,16 @@ function modifyRows(rel: Extract<Rel, { op: "modify" }>, env: Environment): Row[
     } else {
       const locator = Number(row[0]);
       const existing = stored[locator];
+      const extra = passthrough === 0 ? [] : row.slice(row.length - passthrough);
+      if (touched.has(locator)) {
+        // A row affected twice: the first wins (UPDATE … FROM), else 21000.
+        if (rel.onRepeat === "first") continue;
+        throw new ReferenceSqlError("command affects a row a second time", "21000");
+      }
       if (existing === undefined || existing.length === 0) continue;
+      touched.add(locator);
       if (rel.kind === "delete") {
-        returning(existing);
+        returning(existing, extra);
         stored[locator] = [];
         continue;
       }
@@ -687,8 +765,339 @@ function modifyRows(rel: Extract<Rel, { op: "modify" }>, env: Environment): Row[
       stored[locator] = [];
       if (conflict(next, []) !== -1) throw new ReferenceSqlError("duplicate key", "23505");
       stored[locator] = next;
-      returning(next);
+      returning(next, extra);
     }
   }
   return returned;
+}
+
+const rowKey = (row: readonly Value[]): string =>
+  JSON.stringify(row, (_key, value: unknown) =>
+    typeof value === "bigint" ? `${value.toString()}n` : value,
+  );
+
+function keysMatch(
+  rel: Extract<Rel, { op: "join" }>,
+  left: Row,
+  right: Row,
+  from: number,
+  to: number,
+  env: Environment,
+): boolean | null {
+  let result: boolean | null = true;
+  for (let index = from; index < to; index += 1) {
+    const l = evaluate(at(rel.leftKeys, index), left, env);
+    const r = evaluate(at(rel.rightKeys, index), right, env);
+    let equal: boolean | null;
+    if (rel.nullSafe[index] === true)
+      equal = l === null || r === null ? l === r : compareValues(l, r) === 0;
+    else equal = l === null || r === null ? null : compareValues(l, r) === 0;
+    if (equal === false) return false;
+    if (equal === null) result = null;
+  }
+  return result;
+}
+
+function joinRows(rel: Extract<Rel, { op: "join" }>, env: Environment): Row[] {
+  const left = run(rel.left, env);
+  const right = run(rel.right, env);
+  const keys = rel.leftKeys.length;
+  const nullsLeft = (): Row => rel.left.output.map(() => null);
+  const nullsRight = (): Row => rel.right.output.map(() => null);
+  if (rel.kind === "mark") {
+    // R20.5: participation by correlation keys and `filter`; the mark from the tested keys and
+    // `residual`, three-valued.
+    const correlated = rel.correlated ?? 0;
+    return left.map((l) => {
+      let sawTrue = false;
+      let sawUnknown = false;
+      for (const r of right) {
+        if (keysMatch(rel, l, r, 0, correlated, env) !== true) continue;
+        const both = [...l, ...r];
+        if (
+          rel.filter !== undefined &&
+          rel.filter !== null &&
+          evaluate(rel.filter, both, env) !== true
+        )
+          continue;
+        let compared = keysMatch(rel, l, r, correlated, keys, env);
+        if (compared !== false && rel.residual !== null) {
+          const residual = evaluate(rel.residual, both, env);
+          compared = residual === false ? false : residual === null ? null : compared;
+        }
+        if (compared === true) {
+          sawTrue = true;
+          break;
+        }
+        if (compared === null) sawUnknown = true;
+      }
+      return [...l, sawTrue ? true : sawUnknown ? null : false];
+    });
+  }
+  const matches = (l: Row, r: Row): boolean =>
+    keysMatch(rel, l, r, 0, keys, env) === true &&
+    (rel.residual === null || evaluate(rel.residual, [...l, ...r], env) === true);
+  const out: Row[] = [];
+  const matchedRight = new Set<number>();
+  for (const l of left) {
+    let any = false;
+    for (const [index, r] of right.entries()) {
+      if (!matches(l, r)) continue;
+      any = true;
+      matchedRight.add(index);
+      if (rel.kind === "semi" || rel.kind === "anti") break;
+      out.push([...l, ...r]);
+    }
+    if (rel.kind === "semi" && any) out.push([...l]);
+    if (rel.kind === "anti" && !any) out.push([...l]);
+    if ((rel.kind === "left" || rel.kind === "full") && !any) out.push([...l, ...nullsRight()]);
+  }
+  if (rel.kind === "full" || rel.kind === "right")
+    for (const [index, r] of right.entries())
+      if (!matchedRight.has(index)) out.push([...nullsLeft(), ...r]);
+  return out;
+}
+
+function quantify(
+  test: Value,
+  values: readonly Value[],
+  cmp: "=" | "<>" | "<" | "<=" | ">" | ">=",
+  quantifier: "any" | "all",
+): boolean | null {
+  let unknown = false;
+  for (const value of values) {
+    let result: boolean | null;
+    if (test === null || value === null) result = null;
+    else {
+      const order = compareValues(test, value);
+      result =
+        cmp === "="
+          ? order === 0
+          : cmp === "<>"
+            ? order !== 0
+            : cmp === "<"
+              ? order < 0
+              : cmp === "<="
+                ? order <= 0
+                : cmp === ">"
+                  ? order > 0
+                  : order >= 0;
+    }
+    if (quantifier === "any" && result === true) return true;
+    if (quantifier === "all" && result === false) return false;
+    if (result === null) unknown = true;
+  }
+  if (unknown) return null;
+  return quantifier === "all";
+}
+
+function applyRows(rel: Extract<Rel, { op: "apply" }>, env: Environment): Row[] {
+  return run(rel.outer, env).map((row) => {
+    const params = [...env.params];
+    for (const binding of rel.bindings) params[binding.slot] = evaluate(binding.expr, row, env);
+    const rows = run(rel.inner, { ...env, params });
+    if (rel.mode === "scalar") {
+      if (rows.length > 1)
+        throw new ReferenceSqlError(
+          "more than one row returned by a subquery used as an expression",
+          "21000",
+        );
+      return [...row, rows[0]?.[0] ?? null];
+    }
+    if (rel.mode === "exists") return [...row, rows.length > 0];
+    const quantified = rel.quantified;
+    if (quantified === null)
+      throw new ReferenceUnsupportedError("a quantified apply without its test");
+    const test = evaluate(quantified.test, row, env);
+    return [
+      ...row,
+      quantify(
+        test,
+        rows.map((inner) => inner[0] ?? null),
+        quantified.cmp,
+        quantified.quantifier,
+      ),
+    ];
+  });
+}
+
+function windowRows(rel: Extract<Rel, { op: "window" }>, env: Environment): Row[] {
+  const rows = run(rel.input, env);
+  const partitions = new Map<string, Row[]>();
+  for (const row of rows) {
+    const key = rowKey(rel.partitionBy.map((index) => row[index] ?? null));
+    partitions.set(key, [...(partitions.get(key) ?? []), row]);
+  }
+  const out: Row[] = [];
+  for (const partition of partitions.values()) {
+    const sorted = sortRows(partition, rel.orderBy, env);
+    const orderKey = (row: Row) => rowKey(rel.orderBy.map((key) => evaluate(key.expr, row, env)));
+    const peersEnd = sorted.map((row, index) => {
+      let end = index;
+      while (end + 1 < sorted.length && orderKey(at(sorted, end + 1)) === orderKey(row)) end += 1;
+      return end;
+    });
+    const peersStart = sorted.map((row, index) => {
+      let start = index;
+      while (start > 0 && orderKey(at(sorted, start - 1)) === orderKey(row)) start -= 1;
+      return start;
+    });
+    const n = sorted.length;
+    for (const [index, row] of sorted.entries()) {
+      const values = rel.functions.map((call) => {
+        const frameEnd = rel.orderBy.length === 0 ? n - 1 : (peersEnd[index] ?? index);
+        if (call.frame !== null) throw new ReferenceUnsupportedError("explicit window frames");
+        const frame = sorted.slice(0, frameEnd + 1);
+        const arg = (target: Row) =>
+          call.args[0] === undefined ? true : evaluate(call.args[0], target, env);
+        switch (call.fn) {
+          case "row_number":
+            return BigInt(index + 1);
+          case "rank":
+            return BigInt((peersStart[index] ?? index) + 1);
+          case "dense_rank": {
+            const groups = new Set(sorted.slice(0, index + 1).map(orderKey));
+            return BigInt(groups.size);
+          }
+          case "lag":
+          case "lead": {
+            const offset = Number(
+              call.args[1] === undefined ? 1n : evaluate(call.args[1], row, env),
+            );
+            const target = sorted[call.fn === "lag" ? index - offset : index + offset];
+            if (target !== undefined) return arg(target);
+            return call.args[2] === undefined ? null : evaluate(call.args[2], row, env);
+          }
+          case "first_value":
+            return frame[0] === undefined ? null : arg(frame[0]);
+          case "last_value": {
+            const last = frame.at(-1);
+            return last === undefined ? null : arg(last);
+          }
+          default:
+            return aggregate(call.fn, frame.map(arg), call.type);
+        }
+      });
+      out.push([...row, ...values]);
+    }
+  }
+  return out;
+}
+
+function setOpRows(rel: Extract<Rel, { op: "setOp" }>, env: Environment): Row[] {
+  const [first = [], ...others] = rel.inputs.map((input) => run(input, env));
+  const distinct = (rows: readonly Row[]): Row[] => {
+    const seen = new Set<string>();
+    return rows.filter((row) => {
+      const key = rowKey(row);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  };
+  let acc = first;
+  for (const other of others) {
+    if (rel.kind === "union") acc = [...acc, ...other];
+    else {
+      // Multiset counts of the right side: INTERSECT keeps, EXCEPT removes, one per occurrence
+      // with ALL; any occurrence without.
+      const counts = new Map<string, number>();
+      for (const row of other) counts.set(rowKey(row), (counts.get(rowKey(row)) ?? 0) + 1);
+      acc = acc.filter((row) => {
+        const key = rowKey(row);
+        const count = counts.get(key) ?? 0;
+        if (rel.all && count > 0) counts.set(key, count - 1);
+        return rel.kind === "intersect" ? count > 0 : count === 0;
+      });
+    }
+    if (!rel.all) acc = distinct(acc);
+  }
+  return acc;
+}
+
+function recursiveRows(rel: Extract<Rel, { op: "recursive" }>, env: Environment): Row[] {
+  const seen = new Set<string>();
+  const fresh = (rows: readonly Row[]): Row[] =>
+    rel.all
+      ? [...rows]
+      : rows.filter((row) => {
+          const key = rowKey(row);
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+  let work = fresh(run(rel.base, env));
+  const result = [...work];
+  for (let iteration = 0; work.length > 0; iteration += 1) {
+    if (iteration > 10_000) throw new ReferenceUnsupportedError("recursion past 10,000 steps");
+    const workTables = new Map(env.workTables ?? []);
+    workTables.set(rel.workTable, work);
+    work = fresh(run(rel.step, { ...env, workTables }));
+    result.push(...work);
+  }
+  return result;
+}
+
+function indexRangeRows(rel: Extract<Rel, { op: "indexRange" }>, env: Environment): Row[] {
+  const table = env.catalog.table(rel.tableId);
+  const index = table?.indexes.find((candidate) => candidate.id === rel.indexId);
+  if (table === undefined || index === undefined)
+    throw new ReferenceUnsupportedError("a missing index");
+  const keyPositions = index.columnIds.map((id) =>
+    table.columns.findIndex((column) => column.id === id),
+  );
+  const positions = rel.columns.map((id) => table.columns.findIndex((column) => column.id === id));
+  const bound = (side: typeof rel.lower) =>
+    side === null
+      ? null
+      : { keys: side.keys.map((key) => evaluate(key, [], env)), inclusive: side.inclusive };
+  const lower = bound(rel.lower);
+  const upper = bound(rel.upper);
+  if ([...(lower?.keys ?? []), ...(upper?.keys ?? [])].some((value) => value === null)) return [];
+  const compareTo = (row: Row, keys: readonly Value[]): number => {
+    for (const [k, key] of keys.entries()) {
+      const value = row[keyPositions[k] ?? -1] ?? null;
+      if (value === null || key === null) return Number.NaN;
+      const order = compareValues(value, key);
+      if (order !== 0) return order;
+    }
+    return 0;
+  };
+  const stored = env.tables.get(rel.tableId) ?? [];
+  const selected = stored
+    .map((row, locator) => ({ row, locator }))
+    .filter(({ row }) => {
+      if (row.length === 0) return false;
+      if (lower !== null) {
+        const order = compareTo(row, lower.keys);
+        if (Number.isNaN(order) || order < 0 || (order === 0 && !lower.inclusive)) return false;
+      }
+      if (upper !== null) {
+        const order = compareTo(row, upper.keys);
+        if (Number.isNaN(order) || order > 0 || (order === 0 && !upper.inclusive)) return false;
+      }
+      return true;
+    })
+    .sort((a, b) => {
+      for (const position of keyPositions) {
+        const x = a.row[position] ?? null;
+        const y = b.row[position] ?? null;
+        if (x === null || y === null) continue;
+        const order = compareValues(x, y);
+        if (order !== 0) return rel.descending ? -order : order;
+      }
+      return a.locator - b.locator;
+    });
+  return selected.map(({ row, locator }) => {
+    const out = positions.map((position) => row[position] ?? null);
+    if (rel.emitLocator) out.push(BigInt(locator));
+    return out;
+  });
+}
+
+/** `items[index]`, which the plan's shape guarantees exists. */
+function at<T>(items: ArrayLike<T>, index: number): T {
+  const item = items[index];
+  if (item === undefined) throw new Error(`item ${String(index)} is missing`);
+  return item;
 }

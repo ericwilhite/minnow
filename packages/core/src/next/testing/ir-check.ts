@@ -207,9 +207,140 @@ function checkRel(rel: Rel, catalog: CatalogView): void {
         }
         if (rel.onConflict.where !== null) checkExpr(rel.onConflict.where, [...row, ...row], where);
       }
-      for (const expr of rel.returning ?? []) checkExpr(expr, row, where);
+      const extra =
+        (rel.passthrough ?? 0) === 0 ? [] : input.slice(input.length - (rel.passthrough ?? 0));
+      for (const expr of rel.returning ?? []) checkExpr(expr, [...row, ...extra], where);
+      if (rel.kind === "merge") {
+        const merge = rel.merge;
+        if (merge === undefined) fail(where, "merge without its spec");
+        if (input[merge.sourceColumns]?.type.kind !== "locator")
+          fail(where, "merge input lacks the target locator");
+        for (const [index, column] of row.entries())
+          if (
+            !samePhysicalType(
+              input[merge.sourceColumns + 1 + index]?.type ?? { kind: "text" },
+              column.type,
+            )
+          )
+            fail(where, `merge target column ${column.name} has another type`);
+        for (const action of merge.actions) {
+          if (action.condition !== null) checkExpr(action.condition, input, where);
+          const reads = [...input];
+          if (action.action.kind === "update") {
+            for (const [index, value] of action.action.values.entries()) {
+              checkExpr(value, reads, where);
+              const column = table.columns.find(
+                (candidate) =>
+                  candidate.id ===
+                  (action.action as { assigned: readonly number[] }).assigned[index],
+              );
+              if (column === undefined || !samePhysicalType(value.type, column.type))
+                fail(where, "merge update value of another type");
+              reads.push({ name: column.name, type: column.type, nullable: true });
+            }
+          }
+          if (action.action.kind === "insert") {
+            if (action.action.values.length !== row.length)
+              fail(where, "merge insert is not the table row");
+            for (const [index, value] of action.action.values.entries()) {
+              checkExpr(value, reads, where);
+              const column = row[index] as OutputColumn;
+              if (!samePhysicalType(value.type, column.type))
+                fail(where, `merge insert column ${column.name} of another type`);
+              reads.push(column);
+            }
+          }
+        }
+      }
       return;
     }
+    case "keyLookup":
+    case "indexRange": {
+      const keys =
+        rel.op === "keyLookup"
+          ? rel.keys.flat()
+          : [...(rel.lower?.keys ?? []), ...(rel.upper?.keys ?? [])];
+      for (const key of keys) checkExpr(key, [], where);
+      const table = catalog.table(rel.tableId);
+      const index = table?.indexes.find((candidate) => candidate.id === rel.indexId);
+      if (table === undefined || index === undefined) fail(where, "unknown table or index");
+      const tuples =
+        rel.op === "keyLookup" ? rel.keys : [rel.lower?.keys ?? [], rel.upper?.keys ?? []];
+      for (const tuple of tuples)
+        for (const [position, key] of tuple.entries()) {
+          const column = table.columns.find(
+            (candidate) => candidate.id === index.columnIds[position],
+          );
+          if (column === undefined || !sameBase(key.type, column.type))
+            fail(where, `key ${String(position)} of another type`);
+        }
+      return;
+    }
+    case "join": {
+      checkRel(rel.left, catalog);
+      checkRel(rel.right, catalog);
+      if (rel.leftKeys.length !== rel.rightKeys.length) fail(where, "key counts differ");
+      for (const [index, key] of rel.leftKeys.entries()) {
+        checkExpr(key, rel.left.output, where);
+        const other = at(rel.rightKeys, index);
+        checkExpr(other, rel.right.output, where);
+        if (!sameBase(key.type, other.type)) fail(where, `key ${String(index)} compares two types`);
+      }
+      const both = [...rel.left.output, ...rel.right.output];
+      if (rel.residual !== null) checkExpr(rel.residual, both, where);
+      if (rel.filter !== undefined && rel.filter !== null) {
+        if (rel.kind !== "mark") fail(where, "filter on a non-mark join");
+        checkExpr(rel.filter, both, where);
+      }
+      const width =
+        rel.kind === "semi" || rel.kind === "anti"
+          ? rel.left.output.length
+          : rel.kind === "mark"
+            ? rel.left.output.length + 1
+            : both.length;
+      if (rel.output.length !== width)
+        fail(where, `output width ${String(rel.output.length)}, expected ${String(width)}`);
+      return;
+    }
+    case "apply":
+      checkRel(rel.outer, catalog);
+      checkRel(rel.inner, catalog);
+      for (const binding of rel.bindings) checkExpr(binding.expr, rel.outer.output, where);
+      if (rel.quantified !== null) {
+        checkExpr(rel.quantified.test, rel.outer.output, where);
+        const inner = rel.inner.output[0];
+        if (inner === undefined || !sameBase(inner.type, rel.quantified.test.type))
+          fail(where, "quantified test of another type");
+      }
+      if (rel.output.length !== rel.outer.output.length + 1) fail(where, "apply output width");
+      return;
+    case "window":
+      checkRel(rel.input, catalog);
+      for (const index of rel.partitionBy)
+        if (index >= rel.input.output.length) fail(where, "partition key out of range");
+      for (const key of rel.orderBy) checkExpr(key.expr, rel.input.output, where);
+      for (const call of rel.functions)
+        for (const arg of call.args) checkExpr(arg, rel.input.output, where);
+      if (rel.output.length !== rel.input.output.length + rel.functions.length)
+        fail(where, "window output width");
+      return;
+    case "setOp":
+      for (const input of rel.inputs) {
+        checkRel(input, catalog);
+        if (input.output.length !== rel.output.length) fail(where, "set operation widths differ");
+        for (const [index, column] of input.output.entries())
+          if (!sameBase(column.type, at(rel.output, index).type))
+            fail(where, `set operation column ${String(index)} of another type`);
+      }
+      return;
+    case "recursive":
+      checkRel(rel.base, catalog);
+      checkRel(rel.step, catalog);
+      for (const side of [rel.base, rel.step])
+        for (const [index, column] of side.output.entries())
+          if (!sameBase(column.type, rel.output[index]?.type ?? column.type))
+            fail(where, `recursive column ${String(index)} of another type`);
+      return;
     default:
       return;
   }
@@ -223,4 +354,11 @@ export function checkPlan(plan: PhysicalPlan, catalog: CatalogView): void {
     plan.root.output,
     "plan columns",
   );
+}
+
+/** `items[index]`, which the plan's shape guarantees exists. */
+function at<T>(items: ArrayLike<T>, index: number): T {
+  const item = items[index];
+  if (item === undefined) throw new Error(`item ${String(index)} is missing`);
+  return item;
 }

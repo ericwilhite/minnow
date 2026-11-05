@@ -6,7 +6,7 @@ import type { CatalogView } from "../access/catalog.js";
 import { NON_STRICT_FUNCTIONS, VOLATILE_FUNCTIONS, sqlTypeOf } from "../ir/functions.js";
 import type { Collation, ScalarExpr } from "../ir/ir.js";
 import type { PhysicalType } from "../types.js";
-import type { Expression, PredicateOperator } from "../../plan/model.js";
+import type { CompiledQuery, Expression, PredicateOperator } from "../../plan/model.js";
 import { isAggregateCall } from "../../engine/query.js";
 import { externalSqlDomainValue } from "../../engine/sql-domains.js";
 import { timestampFromDate } from "../temporal.js";
@@ -30,6 +30,18 @@ import {
   timestampLiteral,
 } from "./literals.js";
 
+/** A subquery an expression needs (scalar, EXISTS, or `test cmp ANY|ALL (subquery)`). */
+export type SubqueryRequest =
+  | { readonly kind: "scalar"; readonly block: CompiledQuery }
+  | { readonly kind: "exists"; readonly block: CompiledQuery }
+  | {
+      readonly kind: "quantified";
+      readonly block: CompiledQuery;
+      readonly test: Collated;
+      readonly cmp: "=" | "<>" | "<" | "<=" | ">" | ">=";
+      readonly quantifier: "any" | "all";
+    };
+
 /** How names (and, in a grouped block, whole expressions) resolve. */
 export interface Scope {
   /** A column reference as the front end writes it (`a`, `t.a`), or undefined if unknown. */
@@ -39,6 +51,11 @@ export interface Scope {
    * block. Tried before the expression is lowered structurally.
    */
   match?(expression: Expression): Typed | undefined;
+  /**
+   * A subquery over this scope's rows: a FROM clause attaches it as `apply` (lower/from.ts) and
+   * returns the attached column. Absent: the plan builder's `ExpressionState.subquery` decides.
+   */
+  subquery?(request: SubqueryRequest, scope: Scope): Typed;
 }
 
 /** State shared by every expression of one statement. */
@@ -49,7 +66,39 @@ export interface ExpressionState {
   clock(): number;
   volatile: boolean;
   sequences: boolean;
+  /**
+   * Subqueries in scopes that cannot attach one (HAVING, grouped select lists, DML
+   * expressions): uncorrelated ones become init plans; anything else is refused.
+   */
+  subquery?(request: SubqueryRequest, scope: Scope): Typed;
 }
+
+function requestSubquery(request: SubqueryRequest, scope: Scope, state: ExpressionState): Typed {
+  if (scope.subquery !== undefined) return scope.subquery(request, scope);
+  if (state.subquery !== undefined) return state.subquery(request, scope);
+  throw unsupported("subquery", "a subquery here");
+}
+
+const QUANTIFIED: Readonly<
+  Record<string, { cmp: "=" | "<>" | "<" | "<=" | ">" | ">="; quantifier: "any" | "all" }>
+> = {
+  IN: { cmp: "=", quantifier: "any" },
+  "NOT IN": { cmp: "<>", quantifier: "all" },
+  "= ANY": { cmp: "=", quantifier: "any" },
+  "!= ANY": { cmp: "<>", quantifier: "any" },
+  "<> ANY": { cmp: "<>", quantifier: "any" },
+  "< ANY": { cmp: "<", quantifier: "any" },
+  "<= ANY": { cmp: "<=", quantifier: "any" },
+  "> ANY": { cmp: ">", quantifier: "any" },
+  ">= ANY": { cmp: ">=", quantifier: "any" },
+  "= ALL": { cmp: "=", quantifier: "all" },
+  "!= ALL": { cmp: "<>", quantifier: "all" },
+  "<> ALL": { cmp: "<>", quantifier: "all" },
+  "< ALL": { cmp: "<", quantifier: "all" },
+  "<= ALL": { cmp: "<=", quantifier: "all" },
+  "> ALL": { cmp: ">", quantifier: "all" },
+  ">= ALL": { cmp: ">=", quantifier: "all" },
+};
 
 /** A typed value with the explicit collation a `COLLATE` gave it (C8). */
 export type Collated = Typed & { readonly collation?: string };
@@ -375,6 +424,15 @@ export function lowerCondition(
   scope: Scope,
   state: ExpressionState,
 ): Typed {
+  const quantified = QUANTIFIED[operator];
+  if (quantified !== undefined && right.kind === "subquery") {
+    const test = lowerExpression(left, scope, state);
+    return requestSubquery(
+      { kind: "quantified", block: right.block, test, ...quantified },
+      scope,
+      state,
+    );
+  }
   const cmp = COMPARISONS[operator];
   if (cmp !== undefined) {
     const l = lowerExpression(left, scope, state);
@@ -732,10 +790,16 @@ export function lowerExpression(
     case "list":
       throw new PlanningError("A value list is allowed only after IN", "42601");
     case "subquery":
-    case "exists":
-      throw unsupported("subquery", "subqueries (milestone M3)");
+      return requestSubquery({ kind: "scalar", block: expression.block }, scope, state);
+    case "exists": {
+      const exists = requestSubquery({ kind: "exists", block: expression.block }, scope, state);
+      if (!expression.negated) return exists;
+      return { expr: { op: "not", arg: exists.expr, type: BOOL }, nullable: false, big: false };
+    }
     case "window":
-      throw unsupported("window", "window functions (milestone M3)");
+      // The front end moves every allowed window into a windowed source; one left here sits where
+      // PostgreSQL forbids it (WHERE, GROUP BY, an aggregate's argument).
+      throw new PlanningError("window functions are not allowed here", "42P20");
     case "fts":
       throw unsupported("fullTextSearch", "full-text search");
   }

@@ -282,7 +282,7 @@ describe("SELECT", () => {
     expect(chain(lowered.plan.root)).toEqual(["project", "values"]);
   });
 
-  it("refuses the milestone M3 surface with a construct key", () => {
+  it("lowers the milestone M3 surface and refuses what is left with a construct key", () => {
     const { run } = database(...RETAIL);
     const construct = (sql: string): string | null => {
       try {
@@ -293,17 +293,20 @@ describe("SELECT", () => {
       }
       return null;
     };
-    expect(construct("SELECT * FROM customers c JOIN orders o ON o.customer_id = c.id")).toBe(
-      "join",
+    for (const sql of [
+      "SELECT * FROM customers c JOIN orders o ON o.customer_id = c.id",
+      "SELECT (SELECT max(id) FROM orders) FROM customers",
+      "SELECT row_number() OVER (ORDER BY id) FROM customers",
+      "SELECT id FROM customers UNION SELECT id FROM orders",
+      "MERGE INTO customers c USING orders o ON c.id = o.customer_id WHEN MATCHED THEN DELETE",
+      "UPDATE orders o SET qty = 1 FROM customers c WHERE c.id = o.customer_id",
+    ])
+      expect(construct(sql), sql).toBeNull();
+    expect(construct("SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY qty) FROM orders")).toBe(
+      "aggregate",
     );
-    expect(construct("SELECT (SELECT max(id) FROM orders) FROM customers")).toBe("subquery");
-    expect(construct("SELECT row_number() OVER (ORDER BY id) FROM customers")).toBe("window");
-    expect(construct("SELECT id FROM customers UNION SELECT id FROM orders")).toBe("setOperation");
-    expect(
-      construct(
-        "MERGE INTO customers c USING orders o ON c.id = o.customer_id WHEN MATCHED THEN DELETE",
-      ),
-    ).toBe("merge");
+    // An uncorrelated LATERAL is a plain derived table after the front end's rewrite.
+    expect(construct("SELECT * FROM customers c, LATERAL (SELECT 1 AS one) l")).toBeNull();
   });
 });
 

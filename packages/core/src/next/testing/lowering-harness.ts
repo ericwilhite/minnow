@@ -95,12 +95,16 @@ export class LoweredDatabase {
     params: readonly unknown[],
     input: readonly Row[],
   ): ResultRow[] {
+    const plan = lowered.plan;
+    // Every slot: placeholders, then the clock (a fixed instant) and init plans (run first).
+    const slots: Value[] = plan.parameters.map((type, index) =>
+      index < plan.placeholderCount ? bindValue(params[index], type) : null,
+    );
+    if (plan.clockSlot !== null) slots[plan.clockSlot] = 820_454_400_000_000n;
     const env: Environment = {
       tables: this.tables,
       catalog: this.catalog.view,
-      params: lowered.plan.parameters
-        .slice(0, lowered.plan.placeholderCount)
-        .map((type, index) => bindValue(params[index], type)),
+      params: slots,
       rules: (table) => this.lowerer.lowerTableRules(table, this.catalog.view),
       sequences: this.sequences,
       input,
@@ -110,7 +114,8 @@ export class LoweredDatabase {
     // Statement atomicity: a failing statement leaves the tables as they were.
     const saved = new Map([...this.tables].map(([id, rows]) => [id, rows.map((row) => [...row])]));
     try {
-      const rows = run(lowered.plan.root, env);
+      for (const init of plan.initPlans) slots[init.slot] = run(init.plan, env)[0]?.[0] ?? null;
+      const rows = run(plan.root, env);
       return rows.map((row) =>
         Object.fromEntries(
           lowered.columns.map((column, index) => [column.name, comparable(row[index] ?? null)]),
