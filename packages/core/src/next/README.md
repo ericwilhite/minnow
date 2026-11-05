@@ -16,7 +16,7 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | Module             | Owner track                      | What it is                                                                                                                                                                                                                                                                                                             |
 | ------------------ | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `types.ts`         | contracts                        | Physical types; the one SQL → physical mapping; declared widths are mandatory; column statistics types shared by format and exec                                                                                                                                                                                       |
-| `errors.ts`        | contracts                        | Errors shared across tracks: `OwnerUnresponsiveError`, `RequestExpiredError`, `SessionLostError`                                                                                                                                                                                                                                        |
+| `errors.ts`        | contracts                        | Errors shared across tracks: `OwnerUnresponsiveError`, `RequestExpiredError`, `SessionLostError`                                                                                                                                                                                                                       |
 | `temporal.ts`      | contracts                        | DATE/TIMESTAMP on PostgreSQL's 2000 epoch; infinities; ISO text                                                                                                                                                                                                                                                        |
 | `hash/`            | contracts                        | xxHash32, the only checksum                                                                                                                                                                                                                                                                                            |
 | `vector/`          | contracts → executor             | Batches (byte-bounded), vectors, validity, exact int64, int128 decimals, UTF-8 builder under a grant, locators                                                                                                                                                                                                         |
@@ -25,11 +25,11 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | `format/`          | format, write path               | Log frames and multipart transactions, header slots, in-memory and incremental recovery scans, replay rules, request ledger, manifest types                                                                                                                                                                            |
 | `spill/`           | executor (OPFS service: storage) | Spill contract (one long-lived scratch file, batching charged to the operator's budget); in-memory double                                                                                                                                                                                                              |
 | `memory/`          | executor                         | Memory governor: admission, progress loans, held vs allocated bytes (reference implementation)                                                                                                                                                                                                                         |
-| `exec/`            | executor                         | Push protocol and driver (`pipeline.ts`), row fetcher (`fetch.ts`), array/JSONB comparators (`semantic.ts`), scale-partitioned decimal SUM (`decimal-sum.ts`); kernels and operators to come                                                                                                                           |
+| `exec/`            | executor                         | Entry point (`executor.ts`), result frames (`result.ts`), scans (`scan.ts`, `memory-scan.ts`), table rules (`rules.ts`), push driver (`pipeline.ts`), fetcher (`fetch.ts`), comparators, decimal SUM                                                                                                                   |
 | `ir/`              | lowering, executor               | Operator IR (`ir.ts`); the front-end boundary (`lowering.ts`)                                                                                                                                                                                                                                                          |
-| `access/`          | write path + key index           | Storage access contracts the write path implements: snapshots and segments, catalog, key-index probes and ranges, `modify` (rows, conflicts, RETURNING), transactions, group commit, sequences, delivery |
+| `access/`          | write path + key index           | Storage access contracts the write path implements: snapshots and segments, catalog, key-index probes and ranges, `modify` (rows, conflicts, RETURNING), transactions, group commit, sequences, delivery                                                                                                               |
 | `testing/`         | all                              | Differential-harness adapter for a partial new core                                                                                                                                                                                                                                                                    |
-| `write/` (to come) | write path + key index           | Group commit, memtables, key index runs, maintenance (implements `access/`)                                                                                                                              |
+| `write/` (to come) | write path + key index           | Group commit, memtables, key index runs, maintenance (implements `access/`)                                                                                                                                                                                                                                            |
 | `lower/` (to come) | planner lowering                 | `Lowerer`, cost model, statistics                                                                                                                                                                                                                                                                                      |
 | `owner/` (to come) | ownership                        | Web Lock election, client protocol, step-down, composition root                                                                                                                                                                                                                                                        |
 
@@ -294,12 +294,41 @@ and the owner import it directly.
 - Kernels are synchronous.
 - `push` returns `ready` or `blocked`, and a blocked batch stays borrowed until `ready()`.
   Operators resume partly consumed batches themselves.
-- `finish` is async.
+- `next()` and `finish()` return a value when nothing waits and a Promise only when they must
+  wait; the driver awaits only real Promises, and `drive` returns no Promise when the whole
+  pipeline finished synchronously.
+- After `YIELD_INTERVAL_MS` (4 ms) of synchronous work the driver yields a task (`setImmediate`
+  or a `MessageChannel` message, never a resolved Promise) at the next batch boundary.
 - `abort` releases grants, spill files and transferred batches.
 - The driver adds no cancellation machinery without a signal, and with one each wait removes its
   listener, so a long stream retains nothing per batch.
 - Each edge holds at most one in-flight batch, plus whatever credits the producer has handed out
   as transfers.
+
+### Executor entry point (`exec/executor.ts`, `result.ts`, `scan.ts`, `memory-scan.ts`, `rules.ts`)
+
+- `executor.prepare(plan)` compiles a plan once; `bind(values)` fills its placeholders;
+  `execute(request)` runs it over the access contracts: a read snapshot for a query, or an open
+  `Statement` for DML, which the executor ends or rolls back. It never commits.
+- The executor admits its own pipelines with plan-bounded minimums. State that outlives a
+  pipeline is in spillable grants. Nothing is refused for size.
+- A plan from another catalog version fails with `PlanStaleError` before anything runs.
+- Three completions: `executed` (the plan ran; for DML the statement ended), committed
+  (`acknowledgeCommit()`: autocommit RETURNING waits in a charged, spillable spool until then),
+  and `delivered` (every frame released; the result grant closes).
+- Results are wire-ready frames: a plain-data payload plus a transfer list, about 1 MiB each,
+  with per-stream dictionary deltas up to 1 MiB per stream. A frame stays charged until the
+  client's credit returns, so a slow client pauses the pipeline. There is no row-count cap.
+- The pipeline driver progresses synchronously whenever sources and sinks are ready and awaits
+  only real Promises, so a point read whose index blocks and pages are cached runs inside
+  `execute` and its frame is taken with `results.poll()`. Long work yields a task (not a
+  microtask) every 4 ms, so owner messages are serviced even during a cached scan.
+- The frame payload in `result.ts` is the one wire definition (the owner re-exports it); its
+  dictionary deltas are per frame, over per-stream dictionaries.
+- Scans read access/ segments and the page track's chunk readers (`scan.ts`); a memory-segment
+  scan (`memory-scan.ts`) borrows one chunk at a time, passes on async re-pointed chunks, and
+  resumes a partial one (a full or denied varlen builder) at `resumeRow`. CHECK and
+  generated columns are compiled by `compileTableRules` into the write path's `TableRules`.
 
 ### IR (`ir/`)
 
