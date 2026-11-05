@@ -421,25 +421,36 @@ benchmarkTest(
     await expect(scaleButtons).toHaveText(["1×", "2×", "5×", "10×"]);
     await expect(page.getByRole("button", { name: "5×" })).toHaveAttribute("aria-pressed", "true");
 
-    // Some WebKit builds (notably Playwright's Linux port) expose no OPFS inside dedicated
-    // workers, persistent context or not; this run asserts the OPFS column's success, so probe
-    // from a real worker and skip honestly where the API does not exist.
+    // Playwright's Linux WebKit (build 2336, Playwright 1.62) has no OPFS at all, and this run
+    // asserts the OPFS column's success, so probe from a real worker. A local run skips where
+    // the API does not exist; CI claims OPFS in every engine (WebKit runs on macOS), so there
+    // a missing API fails. A worker that errors or never answers is a failure, not a skip.
     const opfsInWorkers = await page.evaluate(
       () =>
-        new Promise<boolean>((resolve) => {
+        new Promise<boolean>((resolve, reject) => {
           const code = "self.postMessage(typeof navigator?.storage?.getDirectory === 'function');";
           const worker = new Worker(
             URL.createObjectURL(new Blob([code], { type: "text/javascript" })),
           );
-          worker.addEventListener("message", (event) => {
-            resolve(event.data === true);
+          const timer = setTimeout(() => {
             worker.terminate();
-          });
-          setTimeout(() => {
-            resolve(false);
+            reject(new Error("OPFS capability worker did not answer"));
           }, 5_000);
+          worker.addEventListener("message", (event) => {
+            clearTimeout(timer);
+            worker.terminate();
+            resolve(event.data === true);
+          });
+          worker.addEventListener("error", (event) => {
+            clearTimeout(timer);
+            worker.terminate();
+            reject(new Error(event.message));
+          });
         }),
     );
+    if (!opfsInWorkers && process.env.CI) {
+      throw new Error("CI claims OPFS coverage, but this browser build exposes no OPFS in workers");
+    }
     benchmarkTest.skip(!opfsInWorkers, "this WebKit build exposes no OPFS in workers");
 
     // Both Minnow stores at the smallest scale: enough to prove the whole chain — including the

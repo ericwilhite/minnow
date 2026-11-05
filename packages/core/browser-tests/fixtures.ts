@@ -83,7 +83,19 @@ export const test = base.extend<{ storageContext: BrowserContext }>({
   storageContext: async ({ context }, use) => use(context),
 });
 
-/** Probe the worker realm: Linux WebKit may expose OPFS in a page but not in its workers. */
+/**
+ * Runs that claim OPFS coverage: the CI merge gate (WebKit on macOS, Chromium and Firefox on
+ * Linux, all with worker OPFS) and the conformance profile. There a missing OPFS fails the test.
+ */
+function opfsCoverageRequired(): boolean {
+  return Boolean(process.env.CI) || process.env.MINNOW_BROWSER_CONFORMANCE === "1";
+}
+
+/**
+ * Probe the worker realm for OPFS. Playwright's Linux WebKit (build 2336, Playwright 1.62) has
+ * no `navigator.storage` at all. A local run skips the case for that missing capability; a run
+ * that claims OPFS coverage fails instead, so the gate can never pass on skipped OPFS cases.
+ */
 export async function requireWorkerOpfs(page: Page): Promise<void> {
   const supported = await page.evaluate(
     () =>
@@ -121,8 +133,10 @@ export async function requireWorkerOpfs(page: Page): Promise<void> {
         );
       }),
   );
-  if (!supported && process.env.MINNOW_BROWSER_CONFORMANCE === "1") {
-    throw new Error("Browser conformance requires OPFS inside dedicated workers");
+  if (!supported && opfsCoverageRequired()) {
+    throw new Error(
+      "This run claims OPFS coverage (CI or browser conformance), but this browser build exposes no OPFS inside dedicated workers",
+    );
   }
   test.skip(!supported, "This browser build exposes no OPFS in dedicated workers");
 }
