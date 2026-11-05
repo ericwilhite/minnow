@@ -6,8 +6,9 @@
  * - Columns return the input batch's own vector (no copy). Literals and parameters are constants;
  *   parameter slots are read at evaluation time from `context.params`, so a plan compiled once
  *   serves every execution that binds new values into the same slots.
- * - Function names and overloads follow ir/functions.ts. Anything outside it is
- *   `UnsupportedPlanError` here, never a wrong answer later.
+ * - Function names and overloads are ir/functions.ts's (R19); bindings.ts maps each overload to
+ *   a kernel or a refusal. Anything else is `UnsupportedPlanError` here, never a wrong answer
+ *   later.
  */
 import type { ScalarExpr } from "../../ir/ir.js";
 import type { PhysicalType } from "../../types.js";
@@ -21,6 +22,7 @@ import {
 } from "../../vector/vector.js";
 import { UnsupportedPlanError } from "../errors.js";
 import { compileArithmetic, compileNegate, type ArithOp } from "./arith.js";
+import { bindCall } from "./bindings.js";
 import { compileCase, compileCoalesce } from "./case.js";
 import { compileCast } from "./cast.js";
 import { compileCompare, compileDistinctFrom } from "./compare.js";
@@ -84,16 +86,6 @@ class ParamNode implements Compiled {
   }
 }
 
-const ARITH = new Set(["add", "sub", "mul", "div", "mod"]);
-
-const TESTS: Record<string, readonly [boolean, boolean, boolean]> = {
-  // [holds if true, holds if false, holds if null]
-  is_true: [true, false, false],
-  is_not_true: [false, true, true],
-  is_false: [false, true, false],
-  is_not_false: [true, false, true],
-};
-
 export function compileExpr(expr: ScalarExpr, context: CompileContext): Compiled {
   const { arena } = context;
   const sub = (child: ScalarExpr) => compileExpr(child, context);
@@ -156,19 +148,17 @@ export function compileExpr(expr: ScalarExpr, context: CompileContext): Compiled
 function compileCall(expr: Extract<ScalarExpr, { op: "call" }>, context: CompileContext): Compiled {
   const { arena } = context;
   const args = expr.args.map((arg) => compileExpr(arg, context));
-  if (ARITH.has(expr.fn)) {
-    const [left, right] = args;
-    if (args.length !== 2 || left === undefined || right === undefined)
-      throw new TypeError(`${expr.fn} takes two arguments`);
-    return compileArithmetic(expr.fn as ArithOp, expr.type, left, right, arena);
-  }
-  const holds = TESTS[expr.fn];
-  if (holds !== undefined) {
-    const [arg] = args;
-    if (arg === undefined) throw new TypeError(`${expr.fn} takes one argument`);
-    return compileTest(arg, holds, arena);
-  }
-  switch (expr.fn) {
+  const binding = bindCall(
+    expr.fn,
+    args.map((arg) => arg.type),
+  );
+  switch (binding.kernel) {
+    case "arith": {
+      const [left, right] = args;
+      if (args.length !== 2 || left === undefined || right === undefined)
+        throw new TypeError(`${expr.fn} takes two arguments`);
+      return compileArithmetic(expr.fn as ArithOp, expr.type, left, right, arena);
+    }
     case "neg": {
       const [arg] = args;
       if (arg === undefined) throw new TypeError("neg takes one argument");
@@ -194,8 +184,6 @@ function compileCall(expr: Extract<ScalarExpr, { op: "call" }>, context: Compile
         arena,
       );
     }
-    default:
-      throw new UnsupportedPlanError(`the function ${expr.fn}`);
   }
 }
 

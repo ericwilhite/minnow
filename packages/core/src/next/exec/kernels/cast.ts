@@ -22,7 +22,9 @@ import {
   INT64_MAX,
   INT64_MIN,
   MICROS_PER_DAY,
+  samePhysicalType,
 } from "../../types.js";
+import { sqlTypeOf } from "../../ir/functions.js";
 import {
   DATE_NEG_INFINITY,
   DATE_POS_INFINITY,
@@ -32,6 +34,7 @@ import {
 import { MAX_SAFE } from "../../vector/int64.js";
 import type { Batch, FlatVector, Int64Values, Selection, Vector } from "../../vector/vector.js";
 import { CannotConvertError, NumericOutOfRangeError, UnsupportedPlanError } from "../errors.js";
+import { castRefusal } from "./bindings.js";
 import { coefficientAt, scaleAt, specialAt, type DecimalData } from "./numeric.js";
 import {
   nullConstant,
@@ -565,25 +568,35 @@ class Retype implements Compiled {
 
 const NUMERIC = new Set(["int32", "int64", "float64", "float32", "decimal"]);
 
+/**
+ * The kernel for `CAST(input AS type)`: the pairs ir/functions.ts allows minus bindings.ts
+ * `CAST_REFUSALS` (bindings.test.ts checks every pair). Assignment casts (`cast.assignment`) use
+ * the same kernels: numeric range and precision errors are the same, and the one difference,
+ * 22001 for an over-long text, is refused with the bounded text casts until the text kernels.
+ */
 export function compileCast(type: PhysicalType, input: Compiled, arena: OutputArena): Compiled {
   const from = input.type;
-  if (
-    from.kind === type.kind &&
-    type.kind !== "int32" &&
-    type.kind !== "decimal" &&
-    type.kind !== "timestamp"
-  )
-    return input;
+  const source = sqlTypeOf(from);
+  const target = sqlTypeOf(type);
+  const refuse = (reason: string) =>
+    new UnsupportedPlanError(
+      `a cast from ${source ?? from.kind} to ${target ?? type.kind}: ${reason}`,
+      { construct: "cast" },
+    );
+  if (source !== null && target !== null) {
+    const refusal = castRefusal(source, target);
+    if (refusal !== null) throw refuse(refusal);
+  }
   if (NUMERIC.has(from.kind) && NUMERIC.has(type.kind)) {
     switch (type.kind) {
       case "int32":
         if (from.kind === "int32" && (from.bits === type.bits || type.bits === 32)) return input;
         return new ToInt32(type, input, arena);
       case "int64":
-        return new ToInt64(type, input, arena);
+        return from.kind === "int64" ? input : new ToInt64(type, input, arena);
       case "float64":
       case "float32":
-        return new ToFloat(type, input, arena);
+        return from.kind === type.kind ? input : new ToFloat(type, input, arena);
       case "decimal":
         return new ToDecimal(type, input, arena);
     }
@@ -592,6 +605,23 @@ export function compileCast(type: PhysicalType, input: Compiled, arena: OutputAr
     return new DateToTimestamp(type, input, arena);
   if (from.kind === "timestamp" && type.kind === "date")
     return new TimestampToDate(type, input, arena);
+  // Same stored value: the session time zone is UTC (types.ts), so zoned ↔ unzoned relabels.
   if (from.kind === "timestamp" && type.kind === "timestamp") return new Retype(type, input);
-  throw new UnsupportedPlanError(`a cast from ${from.kind} to ${type.kind}`);
+  if (type.kind === "text" && from.kind === "text") {
+    if (type.maxLength !== undefined)
+      throw refuse("bounded text (truncation and 22001 come with the text kernels)");
+    return new Retype(type, input);
+  }
+  if (
+    from.kind === type.kind &&
+    (from.kind === "bool" ||
+      from.kind === "date" ||
+      from.kind === "time" ||
+      from.kind === "interval" ||
+      from.kind === "uuid" ||
+      from.kind === "bytes" ||
+      samePhysicalType(from, type))
+  )
+    return input;
+  throw refuse("no kernel");
 }

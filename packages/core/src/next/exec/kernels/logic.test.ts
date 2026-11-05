@@ -268,8 +268,17 @@ describe("three-valued logic", () => {
     expect(
       evaluate({ op: "isNull", negated: false, arg: col(0, BOOL), type: BOOL }, batch),
     ).toEqual([false, false, true]);
-    expect(evaluate(call("is_true", BOOL, col(0, BOOL)), batch)).toEqual([true, false, false]);
-    expect(evaluate(call("is_not_false", BOOL, col(0, BOOL)), batch)).toEqual([true, false, true]);
+    // Lowering's IS TRUE / IS NOT FALSE: x IS NOT DISTINCT FROM true / x IS DISTINCT FROM false.
+    const truth = (value: number): ScalarExpr => lit(numbers(BOOL, [value]));
+    const is = (negated: boolean, value: number): ScalarExpr => ({
+      op: "distinctFrom",
+      negated,
+      left: col(0, BOOL),
+      right: truth(value),
+      type: BOOL,
+    });
+    expect(evaluate(is(true, 1), batch)).toEqual([true, false, false]);
+    expect(evaluate(is(false, 0), batch)).toEqual([true, false, true]);
   });
 
   it("IN and NOT IN are three-valued; dictionaries are decided per entry", () => {

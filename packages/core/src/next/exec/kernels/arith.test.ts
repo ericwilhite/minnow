@@ -263,8 +263,8 @@ describe("float arithmetic (PostgreSQL float8 / float4)", () => {
     );
     expect(() => f("mul", F32, 3e38, 10)).toThrow("value out of range: overflow");
   });
-  it("refuses float modulo at compile time", () => {
-    expect(() => f("mod", F64, 1, 2)).toThrow(TypeError);
+  it("refuses float modulo at compile time (no such overload in ir/functions.ts)", () => {
+    expect(() => f("mod", F64, 1, 2)).toThrow(UnsupportedPlanError);
   });
 });
 
