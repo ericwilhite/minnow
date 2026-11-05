@@ -108,6 +108,18 @@ is access's `Snapshot`.
 - Text stays UTF-8 until output.
 - A consumer borrows a batch until it signals readiness, or owns it under an explicit transfer.
 
+### Checksum (`hash/xxhash32.ts`)
+
+- xxHash32 is the one checksum of the new core (log frames, header and root slots, blobs and
+  pages, spill pages). It equals the reference XXH32 for any range, alignment and byte order,
+  frozen by the published `xxhsum` sanity and string vectors plus vectors derived with the
+  reference CLI on both sides of the read threshold.
+- Inputs of at least `WORD_READ_BYTES` (256) read 32-bit little-endian words through one
+  `DataView` per call (R15.8); shorter ones read bytes, which is faster there. Words are about
+  2.5–3.5× faster from 4 KiB (about 2 GB/s against 0.6 GB/s); cold page loads, which verify
+  every page, rose about 1.4× on text columns. Nothing is cached between calls, so no buffer
+  outlives its holder. `scripts/xxhash-bench.mts` measures it by length and alignment.
+
 ### Storage (`storage/`)
 
 - Ownership comes first. Acquisition takes the Web Lock, then opens the backend's fence, which may

@@ -1,5 +1,8 @@
-import { describe, expect, it } from "vitest";
-import { xxHash32 } from "./xxhash32.js";
+import fc from "fast-check";
+import { afterAll, describe, expect, it } from "vitest";
+import { createReach } from "../../testing/reach.js";
+import { seedsFor } from "../../testing/seeds.js";
+import { WORD_READ_BYTES, xxHash32 } from "./xxhash32.js";
 
 const PRIME32 = 2_654_435_761;
 const ascii = (text: string): Uint8Array => new TextEncoder().encode(text);
@@ -69,4 +72,159 @@ describe("xxHash32", () => {
     expect(() => xxHash32(new Uint8Array(4), 0, 2, 5)).toThrow(RangeError);
     expect(() => xxHash32(new Uint8Array(4), 0, 3, 2)).toThrow(RangeError);
   });
+});
+
+/**
+ * A plain byte-at-a-time XXH32 written from the spec (the implementation this file had before
+ * the word reads, ruling R15.8): the reference the word path is compared with.
+ */
+function referenceXxHash32(bytes: Uint8Array, seed: number): number {
+  const P1 = 0x9e3779b1;
+  const P2 = 0x85ebca77;
+  const P3 = 0xc2b2ae3d;
+  const P4 = 0x27d4eb2f;
+  const P5 = 0x165667b1;
+  const lane = (at: number): number =>
+    (bytes[at] ?? 0) |
+    ((bytes[at + 1] ?? 0) << 8) |
+    ((bytes[at + 2] ?? 0) << 16) |
+    ((bytes[at + 3] ?? 0) << 24);
+  const round = (acc: number, input: number): number => {
+    const sum = (acc + Math.imul(input, P2)) | 0;
+    return Math.imul((sum << 13) | (sum >>> 19), P1);
+  };
+  const rotl = (value: number, bits: number): number => (value << bits) | (value >>> (32 - bits));
+  let at = 0;
+  let hash: number;
+  if (bytes.length >= 16) {
+    const v = [(seed + P1 + P2) | 0, (seed + P2) | 0, seed | 0, (seed - P1) | 0];
+    for (; at + 16 <= bytes.length; at += 16)
+      for (let k = 0; k < 4; k++) v[k] = round(v[k] ?? 0, lane(at + 4 * k));
+    hash =
+      (rotl(v[0] ?? 0, 1) + rotl(v[1] ?? 0, 7) + rotl(v[2] ?? 0, 12) + rotl(v[3] ?? 0, 18)) | 0;
+  } else hash = (seed + P5) | 0;
+  hash = (hash + bytes.length) | 0;
+  for (; at + 4 <= bytes.length; at += 4)
+    hash = Math.imul(rotl((hash + Math.imul(lane(at), P3)) | 0, 17), P4);
+  for (; at < bytes.length; at++)
+    hash = Math.imul(rotl((hash + Math.imul(bytes[at] ?? 0, P5)) | 0, 11), P1);
+  hash = Math.imul(hash ^ (hash >>> 15), P2);
+  hash = Math.imul(hash ^ (hash >>> 13), P3);
+  return (hash ^ (hash >>> 16)) >>> 0;
+}
+
+describe("xxHash32 word reads (ruling R15.8)", () => {
+  // Derived with the reference CLI (`xxhsum -H0`, xxHash 0.8.4, seed 0) from the sanity buffer:
+  // lengths either side of WORD_READ_BYTES, a stripe boundary, and a 1 MiB + 5 blob.
+  it.each([
+    [255, 0xe048e445],
+    [256, 0x520cb910],
+    [257, 0x9566588e],
+    [271, 0xbb29abc8],
+    [272, 0x42ab99e9],
+    [4099, 0x64e581b2],
+    [1_048_581, 0x5db1695a],
+  ])("matches the reference CLI: length %i", (length, expected) => {
+    expect(WORD_READ_BYTES).toBe(256);
+    expect(xxHash32(sanityBuffer(length), 0)).toBe(expected);
+    // The same bytes at an odd offset in a larger buffer, and at the end of it.
+    const shifted = new Uint8Array(length + 7);
+    shifted.set(sanityBuffer(length), 3);
+    expect(xxHash32(shifted, 0, 3, 3 + length)).toBe(expected);
+    expect(xxHash32(new Uint8Array(shifted.buffer, 3, length), 0)).toBe(expected);
+  });
+
+  it("matches the byte-wise reference for every short and boundary length at every alignment", () => {
+    const source = sanityBuffer(2 * WORD_READ_BYTES + 64);
+    const lengths = [
+      ...Array.from({ length: 48 }, (_, k) => k), // every short input
+      WORD_READ_BYTES - 17,
+      WORD_READ_BYTES - 16,
+      WORD_READ_BYTES - 1,
+      WORD_READ_BYTES,
+      WORD_READ_BYTES + 1,
+      WORD_READ_BYTES + 15,
+      WORD_READ_BYTES + 16,
+      2 * WORD_READ_BYTES + 3,
+    ];
+    for (const length of lengths)
+      for (let offset = 0; offset < 8; offset++)
+        for (const seed of [0, 1, PRIME32, 0xffff_ffff]) {
+          const copy = source.slice(offset, offset + length);
+          const expected = referenceXxHash32(copy, seed);
+          expect(xxHash32(source, seed, offset, offset + length)).toBe(expected);
+          // The input ending exactly at its buffer's end (no readable byte after it).
+          const tight = new Uint8Array(new ArrayBuffer(offset + length), offset, length);
+          tight.set(copy);
+          expect(xxHash32(tight, seed)).toBe(expected);
+        }
+  });
+
+  it("reads a SharedArrayBuffer view like any other", () => {
+    const length = 3 * WORD_READ_BYTES + 5;
+    const shared = new Uint8Array(new SharedArrayBuffer(length + 9), 9, length);
+    shared.set(sanityBuffer(length));
+    expect(xxHash32(shared, 7)).toBe(referenceXxHash32(sanityBuffer(length), 7));
+  });
+
+  const reach = createReach("next-xxhash32", [
+    "byte reads",
+    "word reads",
+    "word reads at an odd byte offset",
+    "a range ending at its buffer's end",
+  ]);
+  afterAll(() => {
+    reach.assertReached();
+  });
+
+  it.each(seedsFor("next-xxhash32", [0x5eed, 0x91]))(
+    "equals the byte-wise reference on generated inputs and ranges (seed %i)",
+    (seed) => {
+      const input = fc
+        .record({
+          bytes: fc.oneof(
+            fc.uint8Array({ maxLength: 64 }),
+            fc.uint8Array({ minLength: WORD_READ_BYTES, maxLength: 6000 }),
+          ),
+          lead: fc.nat({ max: 15 }),
+          trail: fc.nat({ max: 15 }),
+          seed: fc.nat({ max: 0xffff_ffff }),
+        })
+        .chain((each) =>
+          fc
+            .tuple(
+              fc.nat({ max: each.bytes.length }),
+              fc.nat({ max: each.bytes.length }),
+              fc.boolean(),
+            )
+            .map(([a, b, whole]) =>
+              whole
+                ? { ...each, start: 0, end: each.bytes.length }
+                : { ...each, start: Math.min(a, b), end: Math.max(a, b) },
+            ),
+        );
+      fc.assert(
+        fc.property(input, ({ bytes, lead, trail, seed: hashSeed, start, end }) => {
+          // The bytes at `lead` inside a buffer with `trail` bytes after them.
+          const view = new Uint8Array(
+            new ArrayBuffer(lead + bytes.length + trail),
+            lead,
+            bytes.length,
+          );
+          view.set(bytes);
+          const length = end - start;
+          reach.beginHistory();
+          reach.reach(length >= WORD_READ_BYTES ? "word reads" : "byte reads");
+          if (length >= WORD_READ_BYTES && (lead + start) % 4 !== 0)
+            reach.reach("word reads at an odd byte offset");
+          if (trail === 0 && end === bytes.length)
+            reach.reach("a range ending at its buffer's end");
+          expect(xxHash32(view, hashSeed, start, end)).toBe(
+            referenceXxHash32(bytes.slice(start, end), hashSeed),
+          );
+        }),
+        { seed, numRuns: 300 },
+      );
+    },
+  );
 });

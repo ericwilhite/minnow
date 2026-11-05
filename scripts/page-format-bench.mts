@@ -2,7 +2,7 @@
  * Benchmarks the rebuild core's page format (packages/core/src/next/page) against today's block
  * format on realistic columns of the wide analytics table (scripts/browser-perf/page/wide-data.ts).
  *
- *   npx vite-node scripts/page-format-bench.mts [--rows 1048576] [--repeats 7]
+ *   npx vite-node scripts/page-format-bench.mts [--rows 1048576] [--repeats 7] [--only text]
  *
  * For each column it writes `rows` values as 64k-row groups into an in-memory data space, then:
  * - encode: the group writer, from vectors (values/s, MB/s of vector bytes);
@@ -36,6 +36,8 @@ const option = (name: string, fallback: number): number => {
 };
 const ROWS = option("rows", 1_048_576);
 const REPEATS = option("repeats", 7);
+/** Runs only the columns whose label contains this text. */
+const ONLY = args.includes("--only") ? (args[args.indexOf("--only") + 1] ?? "") : "";
 const GROUP = 65_536;
 const BATCH = 2048;
 const encoder = new TextEncoder();
@@ -405,7 +407,7 @@ function widthOf(vector: FlatVector): number {
 }
 
 const mb = (bytes: number, ms: number): string => (bytes / 1e6 / (ms / 1000)).toFixed(0);
-const mvals = (count: number, ms: number): string => (count / 1e6 / (ms / 1000)).toFixed(0);
+const mvals = (count: number, ms: number): string => (count / 1e6 / (ms / 1000)).toFixed(2);
 
 console.log(
   `rows ${String(ROWS)} per column, groups of ${String(GROUP)}, batches of ${String(BATCH)}, median of ${String(REPEATS)}`,
@@ -428,7 +430,7 @@ console.log(
     "decode ×old",
   ].join(" | "),
 );
-for (const bench of BENCHES) {
+for (const bench of BENCHES.filter((each) => each.label.includes(ONLY))) {
   const r = await run(bench);
   console.log(
     [

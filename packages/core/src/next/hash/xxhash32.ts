@@ -5,8 +5,14 @@
  * spill pages all use it. It is not a cryptographic hash and is never used as one.
  *
  * Contract: `xxHash32(bytes, seed, start, end)` equals the reference XXH32 of
- * `bytes.subarray(start, end)` with `seed`, as an unsigned 32-bit integer. It allocates nothing
- * and reads input little-endian byte by byte, so any alignment and any byteOffset work.
+ * `bytes.subarray(start, end)` with `seed`, as an unsigned 32-bit integer, at any alignment and
+ * any byteOffset, on any platform byte order.
+ *
+ * Reading (ruling R15.8): inputs of at least `WORD_READ_BYTES` read their 16-byte stripes a
+ * 32-bit word at a time through one `DataView` (explicitly little-endian, unaligned reads are
+ * fine); shorter ones read bytes, because creating the view costs more than it saves there
+ * (measured: the two meet near 256 bytes; words are ~2.5× faster from 4 KiB). The tail (< 16
+ * bytes) always reads bytes. No state is kept between calls, so no buffer outlives its holder.
  */
 
 const PRIME1 = 0x9e3779b1;
@@ -23,6 +29,9 @@ function read32(bytes: Uint8Array, index: number): number {
     ((bytes[index + 3] ?? 0) << 24)
   );
 }
+
+/** Inputs this long read words (scripts/xxhash-bench.mts picks it; see the contract above). */
+export const WORD_READ_BYTES = 256;
 
 function round(accumulator: number, lane: number): number {
   const sum = (accumulator + Math.imul(lane, PRIME2)) | 0;
@@ -41,13 +50,25 @@ export function xxHash32(bytes: Uint8Array, seed = 0, start = 0, end = bytes.len
     let v3 = seed | 0;
     let v4 = (seed - PRIME1) | 0;
     const limit = end - 16;
-    while (index <= limit) {
-      v1 = round(v1, read32(bytes, index));
-      v2 = round(v2, read32(bytes, index + 4));
-      v3 = round(v3, read32(bytes, index + 8));
-      v4 = round(v4, read32(bytes, index + 12));
-      index += 16;
-    }
+    if (length >= WORD_READ_BYTES) {
+      const view = new DataView(bytes.buffer, bytes.byteOffset + start, length);
+      const stripes = length - 16;
+      let at = 0;
+      for (; at <= stripes; at += 16) {
+        v1 = round(v1, view.getInt32(at, true));
+        v2 = round(v2, view.getInt32(at + 4, true));
+        v3 = round(v3, view.getInt32(at + 8, true));
+        v4 = round(v4, view.getInt32(at + 12, true));
+      }
+      index = start + at;
+    } else
+      while (index <= limit) {
+        v1 = round(v1, read32(bytes, index));
+        v2 = round(v2, read32(bytes, index + 4));
+        v3 = round(v3, read32(bytes, index + 8));
+        v4 = round(v4, read32(bytes, index + 12));
+        index += 16;
+      }
     hash =
       (((v1 << 1) | (v1 >>> 31)) +
         ((v2 << 7) | (v2 >>> 25)) +
