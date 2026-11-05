@@ -12,8 +12,36 @@
  */
 import { xxHash32 } from "../hash/xxhash32.js";
 import { compareBytes } from "../vector/varlen.js";
+import { charged, copyRange, UNCHARGED, type Charge } from "./bytes.js";
+
+/** Bytes of a fresh delta's arrays (slots 64×4, 4 key arrays 16×4, arena 256, entries 16×(8+8+1+4+4)). */
+const INITIAL_BYTES = 64 * 4 + 4 * 16 * 4 + 256 + 16 * 25;
+const ENTRY_BYTES = 25;
 
 export class KeyDelta {
+  readonly #charge: Charge;
+  /** Bytes charged for the delta's arrays. */
+  chargedBytes = INITIAL_BYTES;
+
+  /** `charge` pays for every array before it is allocated (the memtable's counter). */
+  constructor(charge: Charge = UNCHARGED) {
+    this.#charge = charge;
+    charged(charge, INITIAL_BYTES);
+  }
+
+  #grow(bytes: number, freed: number): void {
+    charged(this.#charge, bytes);
+    this.chargedBytes += bytes - freed;
+    // The old arrays are released after the copy (the caller replaces them right after).
+    this.#charge.free(freed);
+  }
+
+  /** Returns every charged byte (the delta is dropped). */
+  releaseCharge(): void {
+    this.#charge.free(this.chargedBytes);
+    this.chargedBytes = 0;
+  }
+
   #slots: Int32Array = new Int32Array(64);
   #mask = 63;
   #hashes = new Int32Array(16);
@@ -30,16 +58,9 @@ export class KeyDelta {
   #keyOf = new Int32Array(16);
   entryCount = 0;
 
-  /** Bytes held (for memtable accounting). */
+  /** Bytes held (charged). */
   get bytes(): number {
-    return (
-      this.#slots.byteLength +
-      this.#hashes.byteLength * 4 +
-      this.#arena.byteLength +
-      this.#rowIds.byteLength * 2 +
-      this.#tombstones.byteLength +
-      this.#next.byteLength * 2
-    );
+    return this.chargedBytes;
   }
 
   /** Key slot of `key[start … end)`, or −1. */
@@ -85,6 +106,22 @@ export class KeyDelta {
     return this.#tombstones[entry] === 1;
   }
 
+  /**
+   * The arena holding every key slot's bytes at `keyStart … keyEnd` (a later growth copies them
+   * to a new arena; bytes already written never change).
+   */
+  keyArena(): Uint8Array {
+    return this.#arena;
+  }
+
+  keyStart(keySlot: number): number {
+    return this.#keyStart[keySlot] ?? 0;
+  }
+
+  keyEnd(keySlot: number): number {
+    return this.#keyEnd[keySlot] ?? 0;
+  }
+
   keyBytes(keySlot: number): Uint8Array {
     return this.#arena.subarray(this.#keyStart[keySlot] ?? 0, this.#keyEnd[keySlot] ?? 0);
   }
@@ -125,6 +162,16 @@ export class KeyDelta {
     this.#seqs[entry] = seq;
   }
 
+  /** Restamps entries `from … to − 1`. */
+  restampRange(from: number, to: number, seq: number): void {
+    this.#seqs.fill(seq, from, to);
+  }
+
+  /** The key slot an entry belongs to. */
+  keyOf(entry: number): number {
+    return this.#keyOf[entry] ?? 0;
+  }
+
   #insertKey(key: Uint8Array, start: number, end: number): number {
     const index = this.keyCount;
     if (index >= this.#hashes.length) this.#growKeys();
@@ -133,11 +180,12 @@ export class KeyDelta {
     if (this.#arenaUsed + length > this.#arena.length) {
       let size = this.#arena.length * 2;
       while (size < this.#arenaUsed + length) size *= 2;
+      this.#grow(size, this.#arena.byteLength);
       const grown = new Uint8Array(size);
       grown.set(this.#arena.subarray(0, this.#arenaUsed));
       this.#arena = grown;
     }
-    this.#arena.set(key.subarray(start, end), this.#arenaUsed);
+    copyRange(this.#arena, this.#arenaUsed, key, start, end);
     const hash = xxHash32(key, 0, start, end) | 0;
     this.#hashes[index] = hash;
     this.#keyStart[index] = this.#arenaUsed;
@@ -156,6 +204,7 @@ export class KeyDelta {
   }
 
   #rehash(size: number): void {
+    this.#grow(size * 4, this.#slots.byteLength);
     this.#slots = new Int32Array(size);
     this.#mask = size - 1;
     for (let index = 0; index < this.keyCount; index++)
@@ -164,6 +213,7 @@ export class KeyDelta {
 
   #growKeys(): void {
     const size = this.#hashes.length * 2;
+    this.#grow(4 * size * 4, 4 * this.#hashes.byteLength);
     const grow = (array: Int32Array) => {
       const grown = new Int32Array(size);
       grown.set(array);
@@ -177,6 +227,7 @@ export class KeyDelta {
 
   #growEntries(): void {
     const size = this.#rowIds.length * 2;
+    this.#grow(size * ENTRY_BYTES, this.#rowIds.length * ENTRY_BYTES);
     const rowIds = new Float64Array(size);
     rowIds.set(this.#rowIds);
     this.#rowIds = rowIds;
@@ -223,7 +274,8 @@ export class KeyDelta {
           entries.push({ rowId: this.rowId(entry), tombstone: this.isTombstone(entry) });
       if (entries.length === 0) continue;
       entries.sort((a, b) => a.rowId - b.rowId || Number(a.tombstone) - Number(b.tombstone));
-      out.push({ key: this.keyBytes(keySlot).slice(), entries });
+      // A view: a frozen delta's arena no longer changes (the run is encoded before release).
+      out.push({ key: this.keyBytes(keySlot), entries });
     }
     return out;
   }

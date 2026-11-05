@@ -7,6 +7,7 @@
 import type { CatalogView, ColumnDef, IndexDef, TableDef } from "../access/catalog.js";
 import {
   inKeyRange,
+  prefixRange,
   type IndexCursor,
   type IndexReader,
   type KeyRange,
@@ -265,9 +266,11 @@ class MemorySegmentImpl implements MemorySegment {
     if (!(length > 0)) throw new RangeError(`Chunk ${String(chunk)} is outside the segment`);
     if (!(Number.isInteger(startRow) && startRow >= 0 && startRow < length))
       throw new RangeError("startRow is outside the chunk");
-    this.borrowed = chunk;
     const published = this.memtable.published;
     if (published === null) {
+      // One borrowed chunk per segment, charged to the write path until the borrow ends.
+      this.memtable.borrow(chunk, this.borrowed);
+      this.borrowed = chunk;
       const c = this.view.columnIndex(columnId);
       const stored = this.memtable.chunks[c]?.[chunk];
       if (stored === undefined) throw new RangeError("A memtable chunk is missing");
@@ -400,6 +403,18 @@ function copyFlat(source: FlatVector, target: FlatVector, count: number): void {
 
 // ── Table snapshots ────────────────────────────────────────────────────────────────────────────
 
+/** Column id → position, per table definition (definitions are immutable), computed once. */
+const columnIndexOf = new WeakMap<TableDef, ReadonlyMap<number, number>>();
+
+function columnIndex(def: TableDef): ReadonlyMap<number, number> {
+  let index = columnIndexOf.get(def);
+  if (index === undefined) {
+    index = new Map(def.columns.map((column, c) => [column.id, c]));
+    columnIndexOf.set(def, index);
+  }
+  return index;
+}
+
 /** First row id of every segment of a table view (groups, then memtables), computed once. */
 const firstRowIdsOf = new WeakMap<TableView, Float64Array>();
 
@@ -435,7 +450,7 @@ export class TableSnapshotImpl implements TableSnapshot {
     this.tableId = def.id;
     this.schemaVersion = def.schemaVersion;
     this.columns = def.columns;
-    this.#columnIndex = new Map(def.columns.map((column, c) => [column.id, c]));
+    this.#columnIndex = columnIndex(def);
     this.firstRowIds = firstRowIds(tableView);
   }
 
@@ -456,6 +471,16 @@ export class TableSnapshotImpl implements TableSnapshot {
     let total = 0;
     for (const segment of this.segments) total += segment.liveRowCount;
     return total;
+  }
+
+  /** Ends every memory segment's borrow (the snapshot is released). */
+  endBorrows(): void {
+    if (this.#segments === null) return;
+    for (const segment of this.#segments)
+      if (segment instanceof MemorySegmentImpl && segment.borrowed >= 0) {
+        segment.memtable.unborrow(segment.borrowed);
+        segment.borrowed = -1;
+      }
   }
 
   column(columnId: number): ColumnDef | undefined {
@@ -519,8 +544,10 @@ export class SnapshotImpl implements Snapshot {
   readonly #reader: number;
   readonly #statementView: boolean;
   #released = false;
-  readonly #indexes = new Map<string, ViewIndex>();
-  readonly #tables = new Map<number, TableSnapshotImpl>();
+  // Made on first use: most write-path views read one table through one index, or nothing.
+  #indexes: Map<string, ViewIndex> | null = null;
+  #tables: Map<number, TableSnapshotImpl> | null = null;
+  #first: TableSnapshotImpl | null = null;
 
   constructor(parts: SnapshotParts) {
     this.state = parts.state;
@@ -553,22 +580,28 @@ export class SnapshotImpl implements Snapshot {
 
   table(tableId: number, options: TableReadOptions): TableSnapshotImpl {
     const { def, view } = this.#def(tableId);
-    return new TableSnapshotImpl(this, def, view, options.budget);
+    const table = new TableSnapshotImpl(this, def, view, options.budget);
+    (this.#handed ??= []).push(table);
+    return table;
   }
 
   /** The write path's own table view (constraint checks, index probes): one per table. */
   internalTable(tableId: number): TableSnapshotImpl {
-    let table = this.#tables.get(tableId);
+    // One table needs no map (the usual case for write-path views).
+    if (this.#first?.tableId === tableId) return this.#first;
+    let table = this.#tables?.get(tableId);
     if (table === undefined) {
       const { def, view } = this.#def(tableId);
       table = new TableSnapshotImpl(this, def, view, this.shared.budget);
-      this.#tables.set(tableId, table);
+      if (this.#first === null) this.#first = table;
+      else (this.#tables ??= new Map()).set(tableId, table);
     }
     return table;
   }
 
   index(tableId: number, indexId: number): ViewIndex {
     const key = `${String(tableId)}:${String(indexId)}`;
+    this.#indexes ??= new Map();
     let reader = this.#indexes.get(key);
     if (reader === undefined) {
       const table = this.internalTable(tableId);
@@ -586,9 +619,13 @@ export class SnapshotImpl implements Snapshot {
     this.releaseInternal();
   }
 
+  /** Table snapshots handed out (their memory segments' borrows end with the snapshot). */
+  #handed: TableSnapshotImpl[] | null = null;
+
   releaseInternal(): void {
     if (this.#released) return;
     this.#released = true;
+    if (this.#handed !== null) for (const table of this.#handed) table.endBorrows();
     this.#pin.release();
     this.shared.readers.close(this.#reader);
   }
@@ -602,9 +639,16 @@ interface Resume extends ProbeResume {
 }
 
 /** Resolution of one key across the view's layers. */
+const NO_RUNS: readonly RunRef[] = [];
+
 export class ViewIndex implements IndexReader {
-  readonly #dead = new Set<number>();
+  /** Row ids a newer layer tombstoned (made on the first tombstone). */
+  #deadRows: Set<number> | null = null;
   readonly #layer: RunEntry[] = [];
+
+  get #dead(): Set<number> {
+    return (this.#deadRows ??= new Set());
+  }
 
   constructor(
     readonly def: IndexDef,
@@ -618,9 +662,45 @@ export class ViewIndex implements IndexReader {
    * Promise continues from the layer that had to read.
    */
   resolve(key: Uint8Array, out: number[]): MaybePromise<void> {
+    return this.resolveRange(key, 0, key.length, out);
+  }
+
+  /** `resolve` of the key `bytes[start … end)` (a view is made only if a run is searched). */
+  resolveRange(bytes: Uint8Array, start: number, end: number, out: number[]): MaybePromise<void> {
+    const done = this.#begin(bytes, start, end);
+    return done === undefined ? this.#deliver(out) : done.then(() => this.#deliver(out));
+  }
+
+  /** How many live rows hold the key `bytes[start … end)` (`resolve` without the row ids). */
+  countRange(bytes: Uint8Array, start: number, end: number): MaybePromise<number> {
+    const done = this.#begin(bytes, start, end);
+    return done === undefined ? this.#hitCount : done.then(() => this.#hitCount);
+  }
+
+  /**
+   * Row ids found by the current resolution, in `#hits[0 … #hitCount)`: written by index and never
+   * truncated, so repeated resolutions reuse the array's storage.
+   */
+  readonly #hits: number[] = [];
+  #hitCount = 0;
+
+  #hit(rowId: number): void {
+    if (this.#hitCount < this.#hits.length) this.#hits[this.#hitCount] = rowId;
+    else this.#hits.push(rowId);
+    this.#hitCount += 1;
+  }
+
+  #begin(bytes: Uint8Array, start: number, end: number): Promise<void> | undefined {
+    this.#hitCount = 0;
+    this.#deadRows?.clear();
+    const done = this.#resolveFrom(bytes, start, end, 0);
+    return done instanceof Promise ? done : undefined;
+  }
+
+  #deliver(out: number[]): void {
     out.length = 0;
-    this.#dead.clear();
-    return this.#resolveFrom(key, out, 0);
+    for (let k = 0; k < this.#hitCount; k++) out.push(this.#hits[k] ?? 0);
+    if (!this.def.unique && out.length > 1) out.sort((a, b) => a - b);
   }
 
   /**
@@ -630,52 +710,59 @@ export class ViewIndex implements IndexReader {
   skipRunsOutside(low: Uint8Array | null, high: Uint8Array | null): void {
     this.#skip = null;
     if (low === null || high === null) return;
-    const skip = new Set<RunRef>();
+    let skip: Set<RunRef> | null = null;
     const outside = (run: RunRef) =>
       compareBytes(run.maxKey, 0, run.maxKey.length, low, 0, low.length) < 0 ||
       compareBytes(run.minKey, 0, run.minKey.length, high, 0, high.length) > 0;
-    for (const run of this.table.tableView.runs.get(this.def.id) ?? [])
-      if (outside(run)) skip.add(run);
+    for (const run of this.table.tableView.runs.get(this.def.id) ?? NO_RUNS)
+      if (outside(run)) (skip ??= new Set()).add(run);
     for (const memtable of this.table.tableView.memtables) {
       const run = memtable.published?.runs.get(this.def.id);
-      if (run !== undefined && outside(run)) skip.add(run);
+      if (run !== undefined && outside(run)) (skip ??= new Set()).add(run);
     }
     this.#skip = skip;
   }
 
   #skip: Set<RunRef> | null = null;
 
-  #resolveFrom(key: Uint8Array, out: number[], from: number): MaybePromise<void> {
+  #resolveFrom(bytes: Uint8Array, start: number, end: number, from: number): MaybePromise<void> {
     const bound = this.table.snapshot.bound;
     const unique = this.def.unique;
     const memtables = this.table.tableView.memtables;
-    const runs = this.table.tableView.runs.get(this.def.id) ?? [];
+    const runs = this.table.tableView.runs.get(this.def.id) ?? NO_RUNS;
     const layers = memtables.length + runs.length;
     for (let layer = from; layer < layers; layer++) {
       let run: RunRef | undefined;
       if (layer < memtables.length) {
         const memtable = need(memtables[memtables.length - 1 - layer]);
         const published = memtable.published;
-        if (published === null) {
-          if (this.#deltaLayer(memtable, key, out, bound) && unique) return;
+        // Retained deltas answer for readers older than the publication (ruling 2).
+        if (published === null || !memtable.deltasDropped) {
+          if (this.#deltaLayer(memtable, bytes, start, end, bound) && unique) return;
           continue;
         }
         run = published.runs.get(this.def.id);
         if (run === undefined) continue;
       } else run = runs[layer - memtables.length];
       if (run === undefined || this.#skip?.has(run) === true) continue;
-      const pending = this.#runLayer(run, key, out, layer);
+      const key = start === 0 && end === bytes.length ? bytes : bytes.subarray(start, end);
+      const pending = this.#runLayer(run, key, layer);
       if (pending !== null) return pending;
-      if (unique && out.length > 0) return;
+      if (unique && this.#hitCount > 0) return;
     }
-    if (!unique) out.sort((a, b) => a - b);
   }
 
   /** One delta layer; true when it added a live row. */
-  #deltaLayer(memtable: Memtable, key: Uint8Array, out: number[], bound: number): boolean {
+  #deltaLayer(
+    memtable: Memtable,
+    bytes: Uint8Array,
+    start: number,
+    end: number,
+    bound: number,
+  ): boolean {
     const delta = memtable.deltas.get(this.def.id);
     if (delta === undefined) return false;
-    const keySlot = delta.find(key);
+    const keySlot = delta.find(bytes, start, end);
     if (keySlot < 0) return false;
     for (let entry = delta.head(keySlot); entry >= 0; entry = delta.nextEntry(entry))
       if (delta.isTombstone(entry) && delta.seq(entry) <= bound) this.#dead.add(delta.rowId(entry));
@@ -683,8 +770,8 @@ export class ViewIndex implements IndexReader {
     for (let entry = delta.head(keySlot); entry >= 0; entry = delta.nextEntry(entry)) {
       if (delta.isTombstone(entry) || delta.seq(entry) > bound) continue;
       const rowId = delta.rowId(entry);
-      if (this.#dead.has(rowId)) continue;
-      out.push(rowId);
+      if (this.#deadRows?.has(rowId) === true) continue;
+      this.#hit(rowId);
       added = true;
       if (this.def.unique) return true;
     }
@@ -692,31 +779,31 @@ export class ViewIndex implements IndexReader {
   }
 
   /** One run layer; a Promise that finishes the resolution when it had to read, else null. */
-  #runLayer(run: RunRef, key: Uint8Array, out: number[], layer: number): Promise<void> | null {
+  #runLayer(run: RunRef, key: Uint8Array, layer: number): Promise<void> | null {
     const shared = this.table.snapshot.shared;
     const reader = shared.runReader(run);
     if (reader instanceof Promise)
       return reader.then(async () => {
-        await this.#resolveFrom(key, out, layer);
+        await this.#resolveFrom(key, 0, key.length, layer);
       });
     const entries = this.#layer;
     entries.length = 0;
     const read = reader.lookup(shared.space, key, entries, shared.budget);
     if (read instanceof Promise)
       return read.then(async () => {
-        this.#applyLayer(entries, out);
-        if (this.def.unique && out.length > 0) return;
-        await this.#resolveFrom(key, out, layer + 1);
+        this.#applyLayer(entries);
+        if (this.def.unique && this.#hitCount > 0) return;
+        await this.#resolveFrom(key, 0, key.length, layer + 1);
       });
-    this.#applyLayer(entries, out);
+    this.#applyLayer(entries);
     return null;
   }
 
-  #applyLayer(layer: readonly RunEntry[], out: number[]): void {
+  #applyLayer(layer: readonly RunEntry[]): void {
     for (const entry of layer) if (entry.tombstone) this.#dead.add(entry.rowId);
     for (const entry of layer) {
-      if (entry.tombstone || this.#dead.has(entry.rowId)) continue;
-      out.push(entry.rowId);
+      if (entry.tombstone || this.#deadRows?.has(entry.rowId) === true) continue;
+      this.#hit(entry.rowId);
       if (this.def.unique) return;
     }
   }
@@ -757,6 +844,20 @@ export class ViewIndex implements IndexReader {
     return { done: true };
   }
 
+  /**
+   * Whether a live row holds `key`: exactly (all key columns), or, with `prefix`, as the leading
+   * columns of this index's key (a foreign key's supporting index may cover more columns).
+   */
+  async exists(key: Uint8Array, prefix: boolean): Promise<boolean> {
+    if (!prefix) {
+      const rows: number[] = [];
+      const result = this.resolve(key, rows);
+      if (result instanceof Promise) await result;
+      return rows.length > 0;
+    }
+    return (await this.collect(prefixRange(key))).length > 0;
+  }
+
   range(range: KeyRange, direction: "asc" | "desc"): IndexCursor {
     if (this.def.kind !== "ordered") throw new TypeError("An equality index serves lookups only");
     return new RangeCursor(this, range, direction);
@@ -786,7 +887,7 @@ export class ViewIndex implements IndexReader {
     };
     for (const memtable of this.table.tableView.memtables) {
       const published = memtable.published;
-      if (published !== null) {
+      if (published !== null && memtable.deltasDropped) {
         const run = published.runs.get(this.def.id);
         if (run !== undefined) {
           const reader = await shared.runReader(run);

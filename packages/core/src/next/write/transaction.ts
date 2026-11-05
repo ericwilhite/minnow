@@ -86,6 +86,8 @@ export interface EngineHooks {
   createTableState(def: TableDef | null, tableId: number): void;
   /** Adds an index's delta to the table's live memtable (createIndex). */
   addIndexDelta(tableId: number, indexId: number): Memtable;
+  /** Ensures memtable memory for about `bytes` more before an insert (backpressure). */
+  admit(bytes: number): MaybePromise<void>;
   commit(tx: TransactionImpl, request: CommitRequest | null): Promise<CommitReceipt>;
   release(tx: TransactionImpl): void;
   label(): string;
@@ -98,12 +100,15 @@ export type Undo =
       readonly tableId: number;
       readonly memtable: Memtable;
       readonly before: number;
+      readonly count: number;
     }
   | {
+      /** Entries `entry … entry + count − 1` of one delta, added in order. */
       readonly kind: "delta";
       readonly statement: number;
       readonly delta: KeyDelta;
       readonly entry: number;
+      readonly count: number;
     }
   | {
       readonly kind: "memDelete";
@@ -174,7 +179,11 @@ export class TransactionImpl implements WriteTransaction {
   readonly undo: Undo[] = [];
   #ordinal = 0;
   #open: StatementImpl | null = null;
-  readonly #savepoints = new Map<number, number>();
+  #savepointMap: Map<number, number> | null = null;
+
+  get #savepoints(): Map<number, number> {
+    return (this.#savepointMap ??= new Map());
+  }
   /** Requested on the transaction by the engine at commit. */
   readonly hooks: EngineHooks;
 
@@ -262,95 +271,123 @@ export class TransactionImpl implements WriteTransaction {
    */
   effects(scratch: ByteWriter): BodyEffect[] {
     scratch.reset();
-    const ranges_: Array<{ readonly effect: number; readonly spans: Array<[number, number]> }> = [];
     const effects: BodyEffect[] = [];
-    for (const entry of this.undo)
-      if (entry.kind === "catalog")
-        for (const change of entry.logged) effects.push(catalogEffect(change));
-    const dropped = new Set<number>();
-    for (const change of effects) if (change.kind === "dropTable") dropped.add(change.tableId);
-    // Inserted ranges per memtable, in order; then deletes per table.
-    const ranges = new Map<Memtable, number>();
-    const deletes = new Map<number, Array<{ rowId: number; keys: readonly Uint8Array[] }>>();
-    for (const entry of this.undo) {
-      if (entry.kind === "rows" && !ranges.has(entry.memtable))
-        ranges.set(entry.memtable, entry.before);
-      if (entry.kind === "memDelete" || entry.kind === "groupDelete") {
-        let list = deletes.get(entry.tableId);
-        if (list === undefined) {
-          list = [];
-          deletes.set(entry.tableId, list);
+    // Column byte ranges in `scratch` as (effect's column list, start, end) triples: views are
+    // made once every column is encoded (the scratch buffer may grow and move until then).
+    const columnLists: Uint8Array[][] = [];
+    const spans: number[] = [];
+    // Row changes accumulate between catalog changes and are emitted before each one, so the body
+    // lists effects in the order the transaction made them (format/replay.ts "ordered effects").
+    // Usually one memtable: a short list beats a map.
+    const inserts: Array<{ memtable: Memtable; from: number; to: number }> = [];
+    let deletes: Map<number, Array<{ rowId: number; keys: readonly Uint8Array[] }>> | null = null;
+    const emitRows = () => {
+      for (const range of inserts) {
+        const memtable = range.memtable;
+        for (let from = range.from; from < range.to;) {
+          const chunk = Math.floor(from / MEMORY_CHUNK_ROWS);
+          const slot = from % MEMORY_CHUNK_ROWS;
+          const end = Math.min(range.to, (chunk + 1) * MEMORY_CHUNK_ROWS);
+          const count = end - from;
+          const columns: Uint8Array[] = [];
+          const list = columnLists.length;
+          columnLists.push(columns);
+          for (const stored of memtable.chunks) {
+            const chunkData = stored[chunk];
+            if (chunkData === undefined)
+              throw new RangeError("A pending memtable chunk is missing");
+            const start = scratch.length;
+            encodeColumn(chunkData.view(), slot, count, scratch);
+            spans.push(list, start, scratch.length);
+          }
+          effects.push({
+            kind: "rows",
+            tableId: memtable.tableId,
+            schemaVersion: memtable.schemaVersion,
+            inserts: { firstRowId: memtable.firstRowId + from, rowCount: count, columns },
+            deletes: null,
+          });
+          from = end;
         }
-        list.push({ rowId: entry.rowId, keys: entry.keys });
+      }
+      if (deletes !== null)
+        for (const [tableId, list] of deletes) {
+          let schemaVersion: number | undefined;
+          for (const range of inserts)
+            if (range.memtable.tableId === tableId) schemaVersion = range.memtable.schemaVersion;
+          schemaVersion ??= need(this.#tableVersion(tableId));
+          list.sort((x, y) => x.rowId - y.rowId);
+          effects.push({
+            kind: "rows",
+            tableId,
+            schemaVersion,
+            inserts: null,
+            deletes: {
+              rowIds: Float64Array.from(list, (item) => item.rowId),
+              keys: list.map((item) => item.keys),
+            },
+          });
+        }
+      inserts.length = 0;
+      deletes?.clear();
+    };
+    for (const entry of this.undo) {
+      switch (entry.kind) {
+        case "rows": {
+          const range = inserts.find((candidate) => candidate.memtable === entry.memtable);
+          if (range === undefined)
+            inserts.push({
+              memtable: entry.memtable,
+              from: entry.before,
+              to: entry.before + entry.count,
+            });
+          else range.to = entry.before + entry.count;
+          break;
+        }
+        case "memDelete":
+        case "groupDelete": {
+          deletes ??= new Map();
+          let list = deletes.get(entry.tableId);
+          if (list === undefined) {
+            list = [];
+            deletes.set(entry.tableId, list);
+          }
+          list.push({ rowId: entry.rowId, keys: entry.keys });
+          break;
+        }
+        case "catalog":
+          emitRows();
+          for (const change of entry.logged) effects.push(catalogEffect(change));
+          break;
+        default:
+          break;
       }
     }
-    for (const [memtable, first] of ranges) {
-      if (dropped.has(memtable.tableId) || memtable.rowCount <= first) continue;
-      for (let from = first; from < memtable.rowCount;) {
-        const chunk = Math.floor(from / MEMORY_CHUNK_ROWS);
-        const slot = from % MEMORY_CHUNK_ROWS;
-        const end = Math.min(memtable.rowCount, (chunk + 1) * MEMORY_CHUNK_ROWS);
-        const count = end - from;
-        const spans: Array<[number, number]> = memtable.chunks.map((list) => {
-          const stored = list[chunk];
-          if (stored === undefined) throw new RangeError("A pending memtable chunk is missing");
-          const start = scratch.length;
-          encodeColumn(stored.view(), slot, count, scratch);
-          return [start, scratch.length];
-        });
-        ranges_.push({ effect: effects.length, spans });
-        effects.push({
-          kind: "rows",
-          tableId: memtable.tableId,
-          schemaVersion: memtable.schemaVersion,
-          inserts: { firstRowId: memtable.firstRowId + from, rowCount: count, columns: [] },
-          deletes: null,
-        });
-        from = end;
-      }
-    }
-    for (const [tableId, list] of deletes) {
-      if (dropped.has(tableId)) continue;
-      const def = this.catalog.table(tableId);
-      if (def === undefined) continue;
-      list.sort((a, b) => a.rowId - b.rowId);
-      effects.push({
-        kind: "rows",
-        tableId,
-        schemaVersion: def.schemaVersion,
-        inserts: null,
-        deletes: {
-          rowIds: Float64Array.from(list, (item) => item.rowId),
-          keys: list.map((item) => item.keys),
-        },
-      });
-    }
+    emitRows();
     // Column bytes are final now: point the effects at views of the scratch buffer.
-    for (const { effect, spans } of ranges_) {
-      const rows = effects[effect] as Extract<BodyEffect, { kind: "rows" }>;
-      const inserts = rows.inserts;
-      if (inserts === null) continue;
-      effects[effect] = {
-        ...rows,
-        inserts: {
-          ...inserts,
-          columns: spans.map(([start, end]) => scratch.bytes.subarray(start, end)),
-        },
-      };
-    }
+    for (let k = 0; k < spans.length; k += 3)
+      need(columnLists[spans[k] ?? 0]).push(scratch.bytes.subarray(spans[k + 1], spans[k + 2]));
     return effects;
+  }
+
+  /** A table's schema version in the transaction's catalog, or the committed one (dropped later). */
+  #tableVersion(tableId: number): number | undefined {
+    return (this.catalog.table(tableId) ?? this.hooks.committedCatalog().table(tableId))
+      ?.schemaVersion;
   }
 
   /** Restamps every pending change with `lsn` (after the frame is appended). */
   restamp(lsn: number): void {
-    const memtables = new Set<Memtable>();
+    // Restamping a memtable is idempotent: consecutive entries of one memtable restamp it once.
+    let last: Memtable | null = null;
     for (const entry of this.undo) {
       switch (entry.kind) {
         case "rows":
-          memtables.add(entry.memtable);
+          if (entry.memtable !== last) entry.memtable.restamp(PENDING_BASE, lsn);
+          last = entry.memtable;
           break;
         case "delta":
-          entry.delta.restamp(entry.entry, lsn);
+          entry.delta.restampRange(entry.entry, entry.entry + entry.count, lsn);
           break;
         case "memDelete":
           entry.memtable.deletions.set(entry.position, lsn);
@@ -362,7 +399,6 @@ export class TransactionImpl implements WriteTransaction {
           break;
       }
     }
-    for (const memtable of memtables) memtable.restamp(PENDING_BASE, lsn);
   }
 }
 
@@ -379,7 +415,8 @@ function undoEntry(tx: TransactionImpl, entry: Undo): void {
       entry.memtable.truncate(entry.before, pendingSeq(entry.statement));
       break;
     case "delta":
-      entry.delta.pop(entry.entry);
+      for (let added = entry.entry + entry.count - 1; added >= entry.entry; added--)
+        entry.delta.pop(added);
       break;
     case "memDelete":
       entry.memtable.deletions.delete(entry.position);
@@ -396,9 +433,44 @@ function undoEntry(tx: TransactionImpl, entry: Undo): void {
       tx.catalog = entry.before;
       break;
     case "indexDelta":
-      entry.memtable.deltas.delete(entry.indexId);
+      entry.memtable.removeDelta(entry.indexId);
       break;
   }
+}
+
+const RESOLVED: Promise<void> = Promise.resolve();
+
+const NONE: ReadonlySet<number> = new Set();
+/** Per catalog (immutable): table id → its indexes other tables' enforced foreign keys name. */
+const referencedOf = new WeakMap<Catalog, Map<number, ReadonlySet<number>>>();
+
+function referencedIndexes(catalog: Catalog, tableId: number): ReadonlySet<number> {
+  let tables = referencedOf.get(catalog);
+  if (tables === undefined) {
+    const built = new Map<number, Set<number>>();
+    for (const table of catalog.tables)
+      for (const fk of table.foreignKeys) {
+        if (!fk.enforced) continue;
+        let indexes = built.get(fk.parentTableId);
+        if (indexes === undefined) built.set(fk.parentTableId, (indexes = new Set()));
+        indexes.add(fk.parentIndexId);
+      }
+    tables = built;
+    referencedOf.set(catalog, tables);
+  }
+  return tables.get(tableId) ?? NONE;
+}
+
+/** An index definition read as non-unique (constraint checks count every live row). */
+const nonUniqueOf = new WeakMap<IndexDef, IndexDef>();
+
+function nonUnique(def: IndexDef): IndexDef {
+  let read = nonUniqueOf.get(def);
+  if (read === undefined) {
+    read = { ...def, unique: false };
+    nonUniqueOf.set(def, read);
+  }
+  return read;
 }
 
 // ── Statements ─────────────────────────────────────────────────────────────────────────────────
@@ -419,17 +491,30 @@ interface ParentCheck {
 
 export class StatementImpl implements Statement {
   readonly ordinal: number;
-  readonly view: SnapshotImpl;
   readonly seq: number;
   readonly tx: TransactionImpl;
   readonly #rules: (tableId: number) => TableRules;
   readonly #start: number;
   #state: "open" | "failed" | "ended" = "open";
-  readonly #writers = new Map<string, TableWriterImpl>();
+  #writers: Map<string, TableWriterImpl> | null = null;
+  #plain: TableWriterImpl | null = null;
   /** Row ids this statement updated or deleted, per table (row-affected-twice). */
-  readonly touched = new Map<number, Set<number>>();
-  /** Row ids this statement inserted, per table (ON CONFLICT `statement`). */
-  readonly inserted = new Map<number, Set<number>>();
+  #touchedMap: Map<number, Set<number>> | null = null;
+
+  get touched(): Map<number, Set<number>> {
+    return (this.#touchedMap ??= new Map());
+  }
+  /** Whether this statement inserted row `rowId` of `tableId` (ON CONFLICT `statement`). */
+  inserted(tableId: number, rowId: number): boolean {
+    const undo = this.tx.undo;
+    for (let k = this.#start; k < undo.length; k++) {
+      const entry = undo[k];
+      if (entry?.kind !== "rows" || entry.tableId !== tableId) continue;
+      const first = entry.memtable.firstRowId + entry.before;
+      if (rowId >= first && rowId < first + entry.count) return true;
+    }
+    return false;
+  }
   readonly suspects: Array<{ tableId: number; indexId: number; key: Uint8Array }> = [];
   readonly childChecks: FkCheck[] = [];
   readonly parentChecks: ParentCheck[] = [];
@@ -440,15 +525,29 @@ export class StatementImpl implements Statement {
     this.seq = pendingSeq(ordinal);
     this.#rules = options.rules;
     this.#start = tx.undo.length;
-    this.view = new SnapshotImpl({
-      state: tx.hooks.state(),
-      bound: statementBound(ordinal),
-      observedLsn: tx.baseLsn,
-      catalog: tx.catalog,
-      shared: tx.hooks.shared,
-      label: `${tx.hooks.label()}/statement#${String(ordinal)}`,
+    this.#startCatalog = tx.catalog;
+  }
+
+  #view: SnapshotImpl | null = null;
+  /** The catalog when the statement began (what its view shows). */
+  readonly #startCatalog: Catalog;
+
+  /**
+   * The statement view, made on first use (an INSERT of values never reads one). Rows are
+   * visible by seq (`statementBound`), so a view made later shows what one made at the start
+   * would; the catalog is the one the statement began with.
+   */
+  get view(): SnapshotImpl {
+    this.#view ??= new SnapshotImpl({
+      state: this.tx.hooks.state(),
+      bound: statementBound(this.ordinal),
+      observedLsn: this.tx.baseLsn,
+      catalog: this.#startCatalog,
+      shared: this.tx.hooks.shared,
+      label: `${this.tx.hooks.label()}/statement#${String(this.ordinal)}`,
       statementView: true,
     });
+    return this.#view;
   }
 
   get catalog(): Catalog {
@@ -505,6 +604,21 @@ export class StatementImpl implements Statement {
 
   table(tableId: number, options: TableWriteOptions = {}): TableWriterImpl {
     if (this.#state !== "open") throw new TransactionStateError(`The statement is ${this.#state}`);
+    // The common case (no options, the same table again) skips the keyed lookup.
+    const plain = options.assigned === undefined && options.onRepeat === undefined;
+    if (plain && this.#plain?.tableId === tableId) return this.#plain;
+    if (plain && this.#plain === null && this.#writers === null) {
+      // The first writer of a statement needs no map.
+      const def = this.tx.catalog.table(tableId);
+      if (def === undefined) throw new RangeError(`Table ${String(tableId)} does not exist`);
+      this.#plain = new TableWriterImpl(this, def, options);
+      return this.#plain;
+    }
+    if (this.#writers === null) {
+      this.#writers = new Map();
+      if (this.#plain !== null)
+        this.#writers.set(`${String(this.#plain.tableId)}::error`, this.#plain);
+    }
     const key = `${String(tableId)}:${(options.assigned ?? []).join(",")}:${options.onRepeat ?? "error"}`;
     let writer = this.#writers.get(key);
     if (writer === undefined) {
@@ -513,6 +627,7 @@ export class StatementImpl implements Statement {
       writer = new TableWriterImpl(this, def, options);
       this.#writers.set(key, writer);
     }
+    if (plain) this.#plain = writer;
     return writer;
   }
 
@@ -558,15 +673,28 @@ export class StatementImpl implements Statement {
   }
 
   end(): Promise<void> {
-    return Promise.resolve(this.guard(() => this.#verify())).then(() => {
+    const finish = () => {
       this.#state = "ended";
       this.#releaseViews();
       this.tx.ended(this);
-    });
+    };
+    if (
+      this.suspects.length === 0 &&
+      this.childChecks.length === 0 &&
+      this.parentChecks.length === 0
+    ) {
+      // Nothing to re-verify: end now (no check view, no promise chain).
+      if (this.#state !== "open")
+        throw new TransactionStateError(`The statement is ${this.#state}`);
+      finish();
+      return RESOLVED;
+    }
+    return Promise.resolve(this.guard(() => this.#verify())).then(finish);
   }
 
   #releaseViews(): void {
-    this.view.releaseInternal();
+    this.#view?.releaseInternal();
+    this.#view = null;
     this.#current?.releaseInternal();
     this.#current = null;
   }
@@ -580,15 +708,11 @@ export class StatementImpl implements Statement {
       return;
     const current = this.current();
     try {
-      const rows: number[] = [];
       const lookup = async (tableId: number, indexId: number, key: Uint8Array): Promise<number> => {
         const table = current.internalTable(tableId);
         const def = table.def.indexes.find((index) => index.id === indexId);
         if (def === undefined) return 0;
-        const reader = new ViewIndex({ ...def, unique: false }, table);
-        const result = reader.resolve(key, rows);
-        if (result instanceof Promise) await result;
-        return rows.length;
+        return new ViewIndex(nonUnique(def), table).countRange(key, 0, key.length);
       };
       for (const suspect of this.suspects)
         if ((await lookup(suspect.tableId, suspect.indexId, suspect.key)) > 1)
@@ -607,7 +731,10 @@ export class StatementImpl implements Statement {
           for (const fk of child.foreignKeys) {
             if (!fk.enforced || fk.parentIndexId !== check.indexId || fk.supportIndexId === null)
               continue;
-            if ((await lookup(child.id, fk.supportIndexId, check.key)) > 0)
+            const support = need(child.indexes.find((index) => index.id === fk.supportIndexId));
+            const reader = new ViewIndex(nonUnique(support), current.internalTable(child.id));
+            // A covering supporting index has the reference as a key prefix (ruling 4).
+            if (await reader.exists(check.key, support.columnIds.length > fk.columnIds.length))
               throw new ForeignKeyViolationError(
                 check.parentTableId,
                 fk.id,
@@ -651,11 +778,7 @@ export class TableWriterImpl implements TableWriter {
     this.#keys = statement.tx.hooks.keys;
     this.#assigned = options.assigned ?? [];
     this.#onRepeat = options.onRepeat ?? "error";
-    const referenced = new Set<number>();
-    for (const table of statement.catalog.tables)
-      for (const fk of table.foreignKeys)
-        if (fk.enforced && fk.parentTableId === def.id) referenced.add(fk.parentIndexId);
-    this.#referenced = referenced;
+    this.#referenced = referencedIndexes(statement.catalog, def.id);
   }
 
   #columnIndex(columnId: number): number {
@@ -725,10 +848,28 @@ export class TableWriterImpl implements TableWriter {
 
   /** Appends `rows` of `columns` (complete, validated) and their index entries. */
   insertRows(columns: readonly Vector[], rows: Uint16Array): MaybePromise<void> {
+    // Memtable memory is admitted before anything is appended (ruling 6).
+    return settle(this.statement.tx.hooks.admit(this.#estimate(columns, rows)), () =>
+      this.#insertRows(columns, rows),
+    );
+  }
+
+  /** An upper estimate of the memtable bytes `rows` of `columns` take (rows and index entries). */
+  #estimate(columns: readonly Vector[], rows: Uint16Array): number {
+    let bytes =
+      4096 * columns.length + rows.length * (16 * columns.length + 96 * this.def.indexes.length);
+    for (const vector of columns)
+      if (vector.form === "flat" && vector.data.layout === "varlen") {
+        const offsets = vector.data.offsets;
+        for (const row of rows) bytes += 2 * ((offsets[row + 1] ?? 0) - (offsets[row] ?? 0));
+      }
+    return bytes;
+  }
+
+  #insertRows(columns: readonly Vector[], rows: Uint16Array): MaybePromise<void> {
     const tx = this.statement.tx;
     const seq = this.statement.seq;
-    const rowIds: number[] = new Array<number>(rows.length);
-    const puts: Array<MaybePromise<void>> = [];
+    let puts: Array<Promise<void>> | null = null;
     let done = 0;
     while (done < rows.length) {
       const { memtable, created, frozen } = tx.hooks.liveMemtable(this.tableId, rows.length - done);
@@ -750,28 +891,17 @@ export class TableWriterImpl implements TableWriter {
         tableId: this.tableId,
         memtable,
         before,
+        count: take,
       });
-      for (let k = 0; k < take; k++) rowIds[done + k] = memtable.firstRowId + before + k;
+      const firstRowId = memtable.firstRowId + before;
       // Index entries go to the memtable that took the rows (its layer covers them).
-      puts.push(
-        this.putKeys(
-          this.def.indexes,
-          columns,
-          rows.subarray(done, done + take),
-          rowIds.slice(done, done + take),
-          memtable,
-        ),
-      );
+      const piece = take === rows.length ? rows : rows.subarray(done, done + take);
+      const put = this.putKeys(this.def.indexes, columns, piece, firstRowId, memtable);
+      if (put instanceof Promise) (puts ??= []).push(put);
       done += take;
     }
-    let inserted = this.statement.inserted.get(this.tableId);
-    if (inserted === undefined) {
-      inserted = new Set();
-      this.statement.inserted.set(this.tableId, inserted);
-    }
-    for (const rowId of rowIds) inserted.add(rowId);
-    this.#childChecks(columns, rows);
-    return all(puts);
+    if (this.def.foreignKeys.length > 0) this.#childChecks(columns, rows);
+    return puts === null ? undefined : Promise.all(puts).then(() => undefined);
   }
 
   #keyColumns(index: IndexDef, columns: readonly Vector[]): KeyColumn[] {
@@ -808,67 +938,100 @@ export class TableWriterImpl implements TableWriter {
   }
 
   /**
-   * Puts index entries for new rows (`rows` of `columns`; row ids `rowIds`) into `memtable`'s
-   * deltas, and records unique suspects.
+   * Puts index entries for new rows (`rows` of `columns`) into `memtable`'s deltas, and records
+   * unique suspects. `rowIds` lists the rows' ids, or is the first of consecutive ids.
    */
   putKeys(
     indexes: readonly IndexDef[],
     columns: readonly Vector[],
     rows: Uint16Array | null,
-    rowIds: readonly number[],
+    rowIds: readonly number[] | number,
     memtable: Memtable,
   ): MaybePromise<void> {
     const tx = this.statement.tx;
     const seq = this.statement.seq;
-    const count = rows === null ? rowIds.length : rows.length;
-    const checks: Array<MaybePromise<void>> = [];
+    const count = rows === null ? (typeof rowIds === "number" ? 0 : rowIds.length) : rows.length;
+    let checks: Array<Promise<void>> | null = null;
     for (const index of indexes) {
       const delta = memtable.deltas.get(index.id);
       if (delta === undefined) continue;
       const keys = this.#encode(index, columns, rows, columns[0]?.length ?? count);
-      const unique: Uint8Array[] = [];
+      const first = delta.entryCount;
       for (let k = 0; k < count; k++) {
         const row = rows === null ? k : (rows[k] ?? 0);
         if (this.#hasNullKey(index, columns, row)) continue;
-        const start = keys.offsets[k] ?? 0;
-        const end = keys.offsets[k + 1] ?? 0;
-        const entry = delta.add(keys.writer.bytes, start, end, rowIds[k] ?? 0, seq, false);
-        tx.undo.push({ kind: "delta", statement: this.statement.ordinal, delta, entry });
-        if (index.unique) unique.push(keys.writer.bytes.slice(start, end));
+        const rowId = typeof rowIds === "number" ? rowIds + k : (rowIds[k] ?? 0);
+        delta.add(
+          keys.writer.bytes,
+          keys.offsets[k] ?? 0,
+          keys.offsets[k + 1] ?? 0,
+          rowId,
+          seq,
+          false,
+        );
       }
-      if (unique.length > 0) checks.push(this.#suspect(index, unique));
+      const added = delta.entryCount - first;
+      if (added === 0) continue;
+      tx.undo.push({
+        kind: "delta",
+        statement: this.statement.ordinal,
+        delta,
+        entry: first,
+        count: added,
+      });
+      if (!index.unique) continue;
+      const check = this.#suspect(index, delta, first, delta.entryCount);
+      if (check !== undefined) (checks ??= []).push(check);
     }
-    return all(checks);
+    return checks === null ? undefined : Promise.all(checks).then(() => undefined);
   }
 
-  /** Records every key of `keys` that more than one live row holds now (re-verified at end). */
-  #suspect(index: IndexDef, keys: readonly Uint8Array[]): MaybePromise<void> {
+  /**
+   * Records every key of delta entries `from … to − 1` that more than one live row holds now
+   * (re-verified at the end of the statement). The keys are read from the delta's arena, which
+   * keeps them (no copies).
+   */
+  #suspect(index: IndexDef, delta: KeyDelta, from: number, to: number): Promise<void> | undefined {
     const current = this.statement.current();
-    const reader = new ViewIndex({ ...index, unique: false }, current.internalTable(this.tableId));
-    let low: Uint8Array | null = null;
-    let high: Uint8Array | null = null;
-    for (const key of keys) {
-      if (low === null || compareBytes(key, 0, key.length, low, 0, low.length) < 0) low = key;
-      if (high === null || compareBytes(key, 0, key.length, high, 0, high.length) > 0) high = key;
+    const reader = new ViewIndex(nonUnique(index), current.internalTable(this.tableId));
+    // The batch's key range, compared in the arena (views only for the two bounds).
+    const bytes = delta.keyArena();
+    let low = delta.keyOf(from);
+    let high = low;
+    for (let entry = from + 1; entry < to; entry++) {
+      const slot = delta.keyOf(entry);
+      const start = delta.keyStart(slot);
+      const end = delta.keyEnd(slot);
+      if (compareBytes(bytes, start, end, bytes, delta.keyStart(low), delta.keyEnd(low)) < 0)
+        low = slot;
+      if (compareBytes(bytes, start, end, bytes, delta.keyStart(high), delta.keyEnd(high)) > 0)
+        high = slot;
     }
-    reader.skipRunsOutside(low, high);
-    const rows: number[] = [];
-    const run = (from: number): MaybePromise<void> => {
-      for (let k = from; k < keys.length; k++) {
-        const key = need(keys[k]);
-        const result = reader.resolve(key, rows);
-        if (result instanceof Promise)
-          return result.then(() => {
-            if (rows.length > 1)
-              this.statement.suspects.push({ tableId: this.tableId, indexId: index.id, key });
-            return run(k + 1);
+    reader.skipRunsOutside(delta.keyBytes(low), delta.keyBytes(high));
+    const run = (first: number): Promise<void> | undefined => {
+      for (let entry = first; entry < to; entry++) {
+        const slot = delta.keyOf(entry);
+        const found = reader.countRange(delta.keyArena(), delta.keyStart(slot), delta.keyEnd(slot));
+        if (found instanceof Promise)
+          return found.then((count) => {
+            if (count > 1)
+              this.statement.suspects.push({
+                tableId: this.tableId,
+                indexId: index.id,
+                key: delta.keyBytes(slot).slice(),
+              });
+            return run(entry + 1);
           });
-        if (rows.length > 1)
-          this.statement.suspects.push({ tableId: this.tableId, indexId: index.id, key });
+        if (found > 1)
+          this.statement.suspects.push({
+            tableId: this.tableId,
+            indexId: index.id,
+            key: delta.keyBytes(slot).slice(),
+          });
       }
       return undefined;
     };
-    return run(0);
+    return run(from);
   }
 
   #childChecks(columns: readonly Vector[], rows: Uint16Array | null): void {
@@ -1037,6 +1200,7 @@ export class TableWriterImpl implements TableWriter {
     for (const index of this.def.indexes) {
       const delta = live.deltas.get(index.id);
       const keys = this.#encode(index, old, null, rowIds.length);
+      const first = delta?.entryCount ?? 0;
       for (let k = 0; k < rowIds.length; k++) {
         if (this.#hasNullKey(index, old, k)) {
           keysPerRow[k]?.push(NULL_KEY);
@@ -1045,10 +1209,16 @@ export class TableWriterImpl implements TableWriter {
         const start = keys.offsets[k] ?? 0;
         const end = keys.offsets[k + 1] ?? 0;
         keysPerRow[k]?.push(keys.writer.bytes.slice(start, end));
-        if (delta === undefined) continue;
-        const entry = delta.add(keys.writer.bytes, start, end, rowIds[k] ?? 0, seq, true);
-        tx.undo.push({ kind: "delta", statement: this.statement.ordinal, delta, entry });
+        delta?.add(keys.writer.bytes, start, end, rowIds[k] ?? 0, seq, true);
       }
+      if (delta !== undefined && delta.entryCount > first)
+        tx.undo.push({
+          kind: "delta",
+          statement: this.statement.ordinal,
+          delta,
+          entry: first,
+          count: delta.entryCount - first,
+        });
     }
     rowIds.forEach((rowId, k) => {
       const locator = table.locator(rowId);
@@ -1105,7 +1275,6 @@ export class TableWriterImpl implements TableWriter {
       const current = this.statement.current();
       const table = current.internalTable(this.tableId);
       const view = this.statement.view.internalTable(this.tableId);
-      const inserted = this.statement.inserted.get(this.tableId) ?? new Set<number>();
       const seen = indexes.map(() => new Map<string, number>());
       const found: number[] = [];
       const keyed = indexes.map((index) => {
@@ -1124,7 +1293,9 @@ export class TableWriterImpl implements TableWriter {
             if (result instanceof Promise) return result.then(() => decide(k));
             if (found.length > 0) {
               const rowId = need(found[0]);
-              out.kinds[row] = inserted.has(rowId) ? ConflictKind.statement : ConflictKind.existing;
+              out.kinds[row] = this.statement.inserted(this.tableId, rowId)
+                ? ConflictKind.statement
+                : ConflictKind.existing;
               out.locators[row] = view.locator(rowId);
               out.indexIds[row] = index.id;
               break;

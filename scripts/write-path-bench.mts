@@ -18,9 +18,13 @@
  * - resident bytes per keyed row: the write path's own memory (memtables, the resident fences,
  *   block refs and Bloom filters of the runs it opened), per row (target ≤ 4 B; pages and run
  *   blocks live in the extent space's governed cache and are not counted).
+ * - allocation: heap bytes allocated per keyed-load row and per relaxed INSERT, and the share of
+ *   the time spent in GC, from V8's GC profiler (allocated = the heap growth between collections).
  * Medians of several runs; the machine is shared, so compare against the targets with margin.
+ * `--only keyed|uuid|insert` runs one section.
  */
 import { performance } from "node:perf_hooks";
+import { GCProfiler, getHeapStatistics } from "node:v8";
 import { encodeKeyBatch, KeyBatch } from "../packages/core/src/next/keys/key-encoding.ts";
 import { ChunkReader } from "../packages/core/src/next/page/reader.ts";
 import type { ColumnChunk } from "../packages/core/src/next/format/manifest.ts";
@@ -49,6 +53,35 @@ const ROWS = option("rows", 1_000_000);
 const PROBES = option("probes", 20_000);
 const FREE = { allocate: () => true, free: () => undefined };
 const UUID: PhysicalType = { kind: "uuid" };
+const ONLY = (() => {
+  const index = args.indexOf("--only");
+  return index >= 0 ? (args[index + 1] ?? null) : null;
+})();
+const runs = (section: string) => ONLY === null || ONLY === section;
+
+/** Heap bytes allocated while `work` runs, and the milliseconds V8 spent collecting. */
+async function measureAllocation(
+  work: () => Promise<void>,
+): Promise<{ bytes: number; gcMs: number; ms: number }> {
+  const profiler = new GCProfiler();
+  const before = getHeapStatistics().used_heap_size;
+  const start = performance.now();
+  profiler.start();
+  await work();
+  const result = profiler.stop();
+  const ms = performance.now() - start;
+  const after = getHeapStatistics().used_heap_size;
+  let bytes = 0;
+  let previous = before;
+  let gcMs = 0;
+  for (const entry of result?.statistics ?? []) {
+    bytes += Math.max(0, entry.beforeGC.heapStatistics.usedHeapSize - previous);
+    previous = entry.afterGC.heapStatistics.usedHeapSize;
+    gcMs += entry.cost / 1000;
+  }
+  bytes += Math.max(0, after - previous);
+  return { bytes, gcMs, ms };
+}
 
 function median(values: number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
@@ -227,89 +260,111 @@ async function main(): Promise<void> {
   const report = (label: string, value: string, target: string) => {
     lines.push(`${label.padEnd(44)} ${value.padStart(14)}   target ${target}`);
   };
-  // Keyed load, strict.
-  const harness = new Harness("strict", "memory");
-  const path = await harness.open();
-  const t = await createKeyed(path, "keyed", INT);
-  let start = performance.now();
-  await load(path, t, INT, 0, ROWS);
-  await path.quiesce();
-  const loadMs = performance.now() - start;
-  report(
-    `keyed load, ${String(ROWS)} rows (strict, memory disk)`,
-    `${loadMs.toFixed(0)} ms`,
-    "≤ 1,500 ms at 1M (durable)",
-  );
-  report("  publications", String(path.publications), "");
-  // Resident bytes per keyed row: memtables plus resident run parts, after the probes below
-  // have opened every run (reported after them).
-  // Warm PK probe and read.
-  const keys = randomKeys(PROBES, ROWS);
-  const probeUs = await probeLatency(path, t, INT, keys, false);
-  report("warm PK probe (INT key, owner)", `${probeUs.toFixed(2)} µs`, "part of ≤ 10 µs");
-  const readUs = await probeLatency(path, t, INT, keys, true);
-  report("warm PK read: probe + 2 columns (INT key)", `${readUs.toFixed(2)} µs`, "≤ 10 µs");
-  report(
-    "resident write-path bytes per keyed row",
-    `${(path.residentBytes() / ROWS).toFixed(2)} B`,
-    "≤ 4 B",
-  );
-  report(
-    "  stored bytes per row (pages, runs, metadata)",
-    `${(harness.space.stats.dataBytes / ROWS).toFixed(1)} B`,
-    "",
-  );
-  // After 2k uncompacted writes.
-  await load(path, t, INT, ROWS, 2048);
-  const afterUs = await probeLatency(path, t, INT, keys, false);
-  report(
-    "probe after 2k uncompacted writes",
-    `${(afterUs / probeUs).toFixed(2)}×`,
-    "≤ 1.2× compacted",
-  );
-  await harness.close();
-  // UUID keys.
-  const uuidHarness = new Harness("strict", "memory");
-  const uuidPath = await uuidHarness.open();
-  const u = await createKeyed(uuidPath, "uuid_keyed", UUID);
-  const uuidRows = Math.min(ROWS, 1_000_000);
-  start = performance.now();
-  await load(uuidPath, u, UUID, 0, uuidRows);
-  await uuidPath.quiesce();
-  report(
-    `UUID keyed load, ${String(uuidRows)} rows`,
-    `${(performance.now() - start).toFixed(0)} ms`,
-    "",
-  );
-  const uuidUs = await probeLatency(uuidPath, u, UUID, randomKeys(PROBES, uuidRows), true);
-  report("warm PK read: probe + 2 columns (UUID key)", `${uuidUs.toFixed(2)} µs`, "≤ 15 µs");
-  await uuidHarness.close();
-  // Relaxed single-row INSERT.
-  const relaxed = new Harness("relaxed", "memory");
-  const relaxedPath = await relaxed.open();
-  const r = await createKeyed(relaxedPath, "inserts", INT);
-  const one = { id: ints([0]), v: texts(["x"]), n: ints([1]) };
-  const insertOne = async (id: number) => {
-    if (one.id.data.layout === "i32") one.id.data.values[0] = id;
-    const tx = await relaxedPath.begin();
-    const statement = tx.statement({ rules });
-    const inserted = statement.table(r).insert(batch(one.id, one.v, one.n), null);
-    if (inserted instanceof Promise) await inserted;
-    await statement.end();
-    await tx.commit(null);
-  };
-  for (let id = 0; id < 5000; id++) await insertOne(id);
-  const rounds: number[] = [];
-  let next = 5000;
-  for (let round = 0; round < 5; round++) {
-    const cpu = process.cpuUsage();
-    const count = 10_000;
-    for (let k = 0; k < count; k++) await insertOne(next++);
-    const used = process.cpuUsage(cpu);
-    rounds.push((used.user + used.system) / count);
+  let start: number;
+  if (runs("keyed")) {
+    // Keyed load, strict.
+    const harness = new Harness("strict", "memory");
+    const path = await harness.open();
+    const t = await createKeyed(path, "keyed", INT);
+    const loaded = await measureAllocation(async () => {
+      await load(path, t, INT, 0, ROWS);
+      await path.quiesce();
+    });
+    report(
+      `keyed load, ${String(ROWS)} rows (strict, memory disk)`,
+      `${loaded.ms.toFixed(0)} ms`,
+      "≤ 1,500 ms at 1M (durable)",
+    );
+    report("  publications", String(path.publications), "");
+    report(
+      "  heap allocated per row (incl. building input)",
+      `${(loaded.bytes / ROWS).toFixed(0)} B`,
+      "",
+    );
+    report("  GC share of load time", `${((100 * loaded.gcMs) / loaded.ms).toFixed(1)} %`, "");
+    // Resident bytes per keyed row: memtables plus resident run parts, after the probes below
+    // have opened every run (reported after them).
+    // Warm PK probe and read.
+    const keys = randomKeys(PROBES, ROWS);
+    const probeUs = await probeLatency(path, t, INT, keys, false);
+    report("warm PK probe (INT key, owner)", `${probeUs.toFixed(2)} µs`, "part of ≤ 10 µs");
+    const readUs = await probeLatency(path, t, INT, keys, true);
+    report("warm PK read: probe + 2 columns (INT key)", `${readUs.toFixed(2)} µs`, "≤ 10 µs");
+    report(
+      "resident write-path bytes per keyed row",
+      `${(path.residentBytes() / ROWS).toFixed(2)} B`,
+      "≤ 4 B",
+    );
+    report(
+      "  stored bytes per row (pages, runs, metadata)",
+      `${(harness.space.stats.dataBytes / ROWS).toFixed(1)} B`,
+      "",
+    );
+    // After 2k uncompacted writes.
+    await load(path, t, INT, ROWS, 2048);
+    const afterUs = await probeLatency(path, t, INT, keys, false);
+    report(
+      "probe after 2k uncompacted writes",
+      `${(afterUs / probeUs).toFixed(2)}×`,
+      "≤ 1.2× compacted",
+    );
+    await harness.close();
   }
-  report("relaxed single-row INSERT (owner CPU)", `${median(rounds).toFixed(2)} µs`, "≤ 20 µs");
-  await relaxed.close();
+  if (runs("uuid")) {
+    // UUID keys.
+    const uuidHarness = new Harness("strict", "memory");
+    const uuidPath = await uuidHarness.open();
+    const u = await createKeyed(uuidPath, "uuid_keyed", UUID);
+    const uuidRows = Math.min(ROWS, 1_000_000);
+    start = performance.now();
+    await load(uuidPath, u, UUID, 0, uuidRows);
+    await uuidPath.quiesce();
+    report(
+      `UUID keyed load, ${String(uuidRows)} rows`,
+      `${(performance.now() - start).toFixed(0)} ms`,
+      "",
+    );
+    const uuidUs = await probeLatency(uuidPath, u, UUID, randomKeys(PROBES, uuidRows), true);
+    report("warm PK read: probe + 2 columns (UUID key)", `${uuidUs.toFixed(2)} µs`, "≤ 15 µs");
+    await uuidHarness.close();
+  }
+  if (runs("insert")) {
+    // Relaxed single-row INSERT.
+    const relaxed = new Harness("relaxed", "memory");
+    const relaxedPath = await relaxed.open();
+    const r = await createKeyed(relaxedPath, "inserts", INT);
+    const one = { id: ints([0]), v: texts(["x"]), n: ints([1]) };
+    const insertOne = async (id: number) => {
+      if (one.id.data.layout === "i32") one.id.data.values[0] = id;
+      const tx = await relaxedPath.begin();
+      const statement = tx.statement({ rules });
+      const inserted = statement.table(r).insert(batch(one.id, one.v, one.n), null);
+      if (inserted instanceof Promise) await inserted;
+      await statement.end();
+      await tx.commit(null);
+    };
+    for (let id = 0; id < 5000; id++) await insertOne(id);
+    const rounds: number[] = [];
+    const allocated: number[] = [];
+    const gcShare: number[] = [];
+    let next = 5000;
+    for (let round = 0; round < 5; round++) {
+      const count = 10_000;
+      let used = { user: 0, system: 0 };
+      const measured = await measureAllocation(async () => {
+        const cpu = process.cpuUsage();
+        for (let k = 0; k < count; k++) await insertOne(next++);
+        used = process.cpuUsage(cpu);
+      });
+      rounds.push((used.user + used.system) / count);
+      allocated.push(measured.bytes / count);
+      gcShare.push((100 * measured.gcMs) / measured.ms);
+    }
+    report("relaxed single-row INSERT (owner CPU)", `${median(rounds).toFixed(2)} µs`, "≤ 20 µs");
+    report("  heap allocated per INSERT", `${median(allocated).toFixed(0)} B`, "");
+    report("  GC share of INSERT time", `${median(gcShare).toFixed(1)} %`, "");
+    await relaxed.close();
+  }
   process.stdout.write(`${lines.join("\n")}\n`);
 }
 

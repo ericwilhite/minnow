@@ -13,8 +13,46 @@ export function need<T>(value: T | null | undefined): T {
   return value;
 }
 
+/** Memory a structure charges before it allocates (a governor grant, or a memtable's counter). */
+export interface Charge {
+  allocate(bytes: number): boolean;
+  free(bytes: number): void;
+}
+
+/** For scratch structures nobody accounts (tests, a statement's transient row copies). */
+export const UNCHARGED: Charge = { allocate: () => true, free: () => undefined };
+
+/** The write path's grant refused memory a memtable needs (after backpressure). */
+export class MemtableMemoryError extends Error {
+  readonly code = "MINNOW_MEMTABLE_MEMORY";
+  constructor(readonly bytes: number) {
+    super(`The write path could not charge ${String(bytes)} bytes of memtable memory`);
+    this.name = "MemtableMemoryError";
+  }
+}
+
+/** Charges `bytes` to `charge` before an allocation, or throws `MemtableMemoryError`. */
+export function charged(charge: Charge, bytes: number): void {
+  if (!charge.allocate(bytes)) throw new MemtableMemoryError(bytes);
+}
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
+
+/** Copies `source[start … end)` to `target` at `at`; short ranges byte by byte (no view). */
+export function copyRange(
+  target: Uint8Array,
+  at: number,
+  source: Uint8Array,
+  start: number,
+  end: number,
+): void {
+  if (end - start > 32) {
+    target.set(source.subarray(start, end), at);
+    return;
+  }
+  for (let k = start; k < end; k++) target[at + k - start] = source[k] ?? 0;
+}
 
 export class ByteWriter {
   bytes: Uint8Array;
@@ -85,6 +123,13 @@ export class ByteWriter {
     this.string(value.toString());
   }
 
+  /** Bytes `start … end − 1` of `source` (short ranges copied without a view). */
+  rawRange(source: Uint8Array, start: number, end: number): void {
+    this.ensure(end - start);
+    copyRange(this.bytes, this.length, source, start, end);
+    this.length += end - start;
+  }
+
   raw(source: Uint8Array): void {
     this.ensure(source.length);
     this.bytes.set(source, this.length);
@@ -104,6 +149,38 @@ export class ByteWriter {
   /** Raw bytes of a typed array (its own byte range). */
   typed(array: ArrayBufferView): void {
     this.raw(new Uint8Array(array.buffer, array.byteOffset, array.byteLength));
+  }
+
+  /**
+   * Elements `from … from + count − 1` of a typed array, in platform byte order (as `typed`).
+   * Short ranges are copied element by element, so nothing is allocated for them.
+   */
+  range(
+    array: Int32Array | Uint32Array | Float64Array | Float32Array | Uint8Array,
+    from: number,
+    count: number,
+  ): void {
+    const width = array.BYTES_PER_ELEMENT;
+    const length = count * width;
+    this.ensure(length);
+    if (count > 8 || width === 1) {
+      this.bytes.set(
+        new Uint8Array(array.buffer, array.byteOffset + from * width, length),
+        this.length,
+      );
+      this.length += length;
+      return;
+    }
+    const view = this.view;
+    let at = this.length;
+    if (array instanceof Float64Array)
+      for (let k = 0; k < count; k++, at += 8) view.setFloat64(at, array[from + k] ?? 0, true);
+    else if (array instanceof Float32Array)
+      for (let k = 0; k < count; k++, at += 4) view.setFloat32(at, array[from + k] ?? 0, true);
+    else if (array instanceof Int32Array)
+      for (let k = 0; k < count; k++, at += 4) view.setInt32(at, array[from + k] ?? 0, true);
+    else for (let k = 0; k < count; k++, at += 4) view.setUint32(at, array[from + k] ?? 0, true);
+    this.length = at;
   }
 
   /** The bytes written (a copy, safe to keep). */

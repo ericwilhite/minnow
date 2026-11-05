@@ -297,6 +297,26 @@ describe("modify", () => {
     tx.rollback();
     await harness.close();
   });
+
+  it("a statement view, made on first use, shows the catalog the statement began with", async () => {
+    const harness = new Harness();
+    const path = await harness.open();
+    const tx = await path.begin();
+    const s = tx.statement({ rules });
+    await s.changeCatalog({
+      kind: "createTable",
+      table: tableInput("late", [column("id", INT, false)]),
+    });
+    // The view is first read after the statement's own DDL: it still predates it.
+    expect(s.view.catalog.tableByName("late")).toBeUndefined();
+    expect(tx.catalog.tableByName("late")).toBeDefined();
+    await s.end();
+    const next = tx.statement({ rules });
+    expect(next.view.catalog.tableByName("late")).toBeDefined();
+    await next.end();
+    tx.rollback();
+    await harness.close();
+  });
 });
 
 describe("transactions", () => {

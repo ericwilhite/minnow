@@ -20,13 +20,27 @@ import type { GroupRef, GroupRoot, RunRef } from "../format/manifest.js";
 import type { Vector } from "../vector/vector.js";
 import { ColumnChunk, MEMORY_CHUNK_ROWS } from "./columns.js";
 import { KeyDelta } from "./key-hash.js";
+import { UNCHARGED, type Charge } from "./bytes.js";
 import { need } from "./bytes.js";
 
 export const MEMTABLE_ROWS = 65_536;
 /** Memtable bytes that freeze it early (wide rows). */
 export const MEMTABLE_BYTES = 8 * 1024 * 1024;
-/** Rows between byte measurements of a live memtable. */
-const BYTES_STEP = 256;
+
+/** A memtable's memory: charged to the write path's grant before allocation, counted here. */
+class Counter implements Charge {
+  bytes = 0;
+  constructor(readonly grant: Charge) {}
+  allocate(bytes: number): boolean {
+    if (!this.grant.allocate(bytes)) return false;
+    this.bytes += bytes;
+    return true;
+  }
+  free(bytes: number): void {
+    this.grant.free(bytes);
+    this.bytes -= bytes;
+  }
+}
 
 export interface Published {
   readonly group: GroupRef;
@@ -49,48 +63,87 @@ export class Memtable {
   #markSeqs: number[] = [];
   state: "live" | "frozen" | "published" = "live";
   published: Published | null = null;
+  readonly #counter: Counter;
+  /** Readers borrowing each chunk index (memory segments: one chunk at a time each). */
+  readonly #borrows = new Map<number, number>();
+  /** Chunks released while borrowed: charged until their last borrow ends. */
+  readonly #lent = new Map<number, ColumnChunk[]>();
 
+  /** `charge` is the write path's grant: every array is charged before it is allocated. */
   constructor(
     readonly tableId: number,
     readonly firstRowId: number,
     readonly schemaVersion: number,
     columns: readonly ColumnDef[],
     indexIds: readonly number[],
+    charge: Charge = UNCHARGED,
+    /** Rows before the memtable is full (tests shrink it: `EngineInput.tuning`). */
+    readonly limit = MEMTABLE_ROWS,
   ) {
     this.columns = columns;
     this.chunks = columns.map(() => []);
-    this.deltas = new Map(indexIds.map((id) => [id, new KeyDelta()]));
+    this.#counter = new Counter(charge);
+    this.deltas = new Map(indexIds.map((id) => [id, new KeyDelta(this.#counter)]));
   }
 
-  get capacity(): number {
-    return MEMTABLE_ROWS - this.rowCount;
+  /** A new key delta for an index created while this memtable is live. */
+  addDelta(indexId: number): KeyDelta {
+    const delta = new KeyDelta(this.#counter);
+    this.deltas.set(indexId, delta);
+    return delta;
   }
 
-  #bytes = 0;
-  #bytesAt = -1;
-
-  /**
-   * Bytes held by rows and deltas: measured at most every `BYTES_STEP` appended rows (and on
-   * demand once frozen), so the per-insert cost is O(1).
-   */
-  get bytes(): number {
-    if (this.#bytesAt < 0 || (this.state === "live" && this.rowCount - this.#bytesAt >= BYTES_STEP))
-      this.measure();
-    return this.#bytes;
+  /** Removes an index's delta (a rolled back CREATE INDEX), returning its memory. */
+  removeDelta(indexId: number): void {
+    this.deltas.get(indexId)?.releaseCharge();
+    this.deltas.delete(indexId);
   }
 
-  /** Measures the bytes now (freeze, rollback). */
-  measure(): number {
+  /** A reader borrows chunk `chunk` (and gives back `previous`, −1 for none). */
+  borrow(chunk: number, previous: number): void {
+    if (chunk === previous) return;
+    if (previous >= 0) this.unborrow(previous);
+    this.#borrows.set(chunk, (this.#borrows.get(chunk) ?? 0) + 1);
+  }
+
+  unborrow(chunk: number): void {
+    const left = (this.#borrows.get(chunk) ?? 0) - 1;
+    if (left > 0) {
+      this.#borrows.set(chunk, left);
+      return;
+    }
+    this.#borrows.delete(chunk);
+    const lent = this.#lent.get(chunk);
+    if (lent !== undefined) {
+      for (const stored of lent) stored.releaseCharge();
+      this.#lent.delete(chunk);
+    }
+  }
+
+  /** Bytes of released chunks still borrowed by readers. */
+  get borrowedBytes(): number {
     let total = 0;
-    for (const column of this.chunks) for (const chunk of column) total += chunk.bytes;
-    for (const delta of this.deltas.values()) total += delta.bytes;
-    this.#bytes = total;
-    this.#bytesAt = this.rowCount;
+    for (const chunks of this.#lent.values())
+      for (const stored of chunks) total += stored.chargedBytes;
     return total;
   }
 
+  get capacity(): number {
+    return this.limit - this.rowCount;
+  }
+
+  /** Bytes charged for rows, deltas and borrowed released chunks (exact, O(1)). */
+  get bytes(): number {
+    return this.#counter.bytes;
+  }
+
+  /** Kept for callers that measured before freezing; the count is always exact now. */
+  measure(): number {
+    return this.#counter.bytes;
+  }
+
   get full(): boolean {
-    return this.rowCount >= MEMTABLE_ROWS || this.bytes >= MEMTABLE_BYTES;
+    return this.rowCount >= this.limit || this.bytes >= MEMTABLE_BYTES;
   }
 
   /**
@@ -107,7 +160,7 @@ export class Memtable {
         const list = need(this.chunks[c]);
         let chunk = list[chunkIndex];
         if (chunk === undefined) {
-          chunk = new ColumnChunk(column.type);
+          chunk = new ColumnChunk(column.type, this.#counter);
           list.push(chunk);
         }
         const vector = columns[c];
@@ -175,7 +228,6 @@ export class Memtable {
       if (last !== undefined) last.truncate(rowCount - (keepChunks - 1) * MEMORY_CHUNK_ROWS);
     }
     this.rowCount = rowCount;
-    this.#bytesAt = -1;
   }
 
   /** Deleted positions under `bound` within `[0, rows)`. */
@@ -186,9 +238,38 @@ export class Memtable {
     return out;
   }
 
-  /** Frees rows and deltas once published (re-pointed readers read the group and runs). */
+  /**
+   * Frees the rows once published: re-pointed readers read them from the group. The key deltas
+   * stay (sequence-qualified, cancelled pairs intact) for readers older than the publication,
+   * until `dropDeltas` (ruling 2).
+   */
   release(): void {
+    const chunkCount = this.chunks[0]?.length ?? 0;
+    for (let chunk = 0; chunk < chunkCount; chunk++) {
+      const stored = this.chunks.map((list) => need(list[chunk]));
+      if (this.#borrows.has(chunk)) this.#lent.set(chunk, stored);
+      else for (const column of stored) column.releaseCharge();
+    }
     this.chunks = this.columns.map(() => []);
-    for (const id of this.deltas.keys()) this.deltas.set(id, new KeyDelta());
   }
+
+  /** Frees the key deltas once no reader older than the publication remains. */
+  dropDeltas(): void {
+    for (const delta of this.deltas.values()) delta.releaseCharge();
+    this.deltas.clear();
+    this.deltasDropped = true;
+  }
+
+  /** Returns every charged byte (the memtable is gone: dropped table, closed write path). */
+  releaseAll(): void {
+    for (const list of this.chunks) for (const stored of list) stored.releaseCharge();
+    for (const chunks of this.#lent.values()) for (const stored of chunks) stored.releaseCharge();
+    this.#lent.clear();
+    for (const delta of this.deltas.values()) delta.releaseCharge();
+    this.chunks = this.columns.map(() => []);
+    this.deltas.clear();
+    this.deltasDropped = true;
+  }
+
+  deltasDropped = false;
 }

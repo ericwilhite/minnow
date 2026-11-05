@@ -91,8 +91,8 @@ export interface WriteState {
 export class ReaderRegistry {
   #next = 1;
   readonly #live = new Set<number>();
-  /** Re-point pins, each waiting for every reader older than `before`. */
-  readonly #pins: Array<{ readonly before: number; readonly pin: SpacePin }> = [];
+  /** Re-point holds (a pin and retained deltas), each waiting for every reader older than `before`. */
+  readonly #pins: Array<{ readonly before: number; readonly release: () => void }> = [];
 
   open(): number {
     const id = this.#next++;
@@ -109,9 +109,9 @@ export class ReaderRegistry {
     return this.#live.size;
   }
 
-  /** Holds `pin` until every reader opened before now is closed (at once if there is none). */
-  holdUntilOlderClose(pin: SpacePin): void {
-    this.#pins.push({ before: this.#next, pin });
+  /** Runs `release` once every reader opened before now is closed (at once if there is none). */
+  holdUntilOlderClose(release: () => void): void {
+    this.#pins.push({ before: this.#next, release });
     this.#drain();
   }
 
@@ -129,7 +129,7 @@ export class ReaderRegistry {
       const first = this.#pins[0];
       if (first === undefined || first.before > oldest) break;
       this.#pins.shift();
-      first.pin.release();
+      first.release();
     }
   }
 }

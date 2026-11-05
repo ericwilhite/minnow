@@ -31,7 +31,12 @@ const KIND = {
   publishedRows: 7,
 } as const;
 
-export function encodeBody(body: CommitFrameBody, writer = new ByteWriter()): Uint8Array {
+/**
+ * Encodes a commit body. Into a given `into` writer the result is a view of its bytes, valid until
+ * the writer is used again (the log appender copies it into frames at once); else a fresh copy.
+ */
+export function encodeBody(body: CommitFrameBody, into?: ByteWriter): Uint8Array {
+  const writer = into ?? new ByteWriter();
   writer.reset();
   writer.u8(VERSION);
   const request = body.request;
@@ -102,7 +107,7 @@ export function encodeBody(body: CommitFrameBody, writer = new ByteWriter()): Ui
         break;
     }
   }
-  return writer.finish();
+  return into === undefined ? writer.finish() : writer.bytes.subarray(0, writer.length);
 }
 
 /** Decodes a commit body; copies every byte it keeps. `LogCorruptionError` if malformed. */

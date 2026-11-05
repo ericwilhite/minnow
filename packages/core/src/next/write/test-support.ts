@@ -72,7 +72,7 @@ export function tableInput(
  * (`openExtentSpace`) with format's reachability walk over the write path's manifest codecs.
  */
 export class Harness {
-  readonly disk = new SimDisk();
+  readonly disk: SimDisk = new SimDisk();
   readonly backend: StorageBackend;
   readonly governor = new Governor(256 * 1024 * 1024);
   #release: (() => Promise<void>) | null = null;
@@ -82,7 +82,10 @@ export class Harness {
   constructor(
     readonly durability: Durability = "strict",
     readonly store: "sim" | "memory" = "sim",
+    readonly memtableRows?: number,
+    disk?: SimDisk,
   ) {
+    if (disk !== undefined) this.disk = disk;
     this.backend = store === "sim" ? new SimBackend(this.disk) : new MemoryBackend();
   }
 
@@ -104,6 +107,7 @@ export class Harness {
       space: this.space,
       governor: this.governor,
       options: { durability: this.durability },
+      ...(this.memtableRows === undefined ? {} : { tuning: { memtableRows: this.memtableRows } }),
     });
     this.#release = async () => {
       await this.space.close();

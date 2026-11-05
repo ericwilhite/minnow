@@ -22,8 +22,15 @@ import { int128At, setInt128 } from "../vector/int128.js";
 import { MAX_SAFE } from "../vector/int64.js";
 import type { FlatVector, Int64Values, Validity, Vector, VectorData } from "../vector/vector.js";
 import { DecimalSpecial } from "../vector/vector.js";
-import { ByteReader, ByteWriter } from "./bytes.js";
-import { need } from "./bytes.js";
+import {
+  ByteReader,
+  ByteWriter,
+  charged,
+  copyRange,
+  need,
+  UNCHARGED,
+  type Charge,
+} from "./bytes.js";
 
 export const MEMORY_CHUNK_ROWS = 2048;
 
@@ -87,11 +94,17 @@ export class ColumnChunk {
   months: Int32Array | null = null;
   days: Int32Array | null = null;
   readonly #slot: SourceSlot;
+  readonly #charge: Charge;
+  /** Bytes charged for this chunk's arrays. */
+  chargedBytes = 0;
 
-  constructor(type: PhysicalType) {
+  /** `charge` pays for every array before it is allocated (memtables pass their counter). */
+  constructor(type: PhysicalType, charge: Charge = UNCHARGED) {
     this.type = type;
     this.layout = layoutOf(type);
+    this.#charge = charge;
     const n = MEMORY_CHUNK_ROWS;
+    this.#take(initialBytes(this.layout, type));
     switch (this.layout) {
       case "bool":
         this.bools = new Uint8Array(n);
@@ -133,6 +146,21 @@ export class ColumnChunk {
     return this.length >= MEMORY_CHUNK_ROWS;
   }
 
+  #take(bytes: number): void {
+    charged(this.#charge, bytes);
+    this.chargedBytes += bytes;
+  }
+
+  #give(bytes: number): void {
+    this.#charge.free(bytes);
+    this.chargedBytes -= bytes;
+  }
+
+  /** Returns every charged byte (the chunk's arrays are no longer the memtable's). */
+  releaseCharge(): void {
+    this.#give(this.chargedBytes);
+  }
+
   /** Bytes the chunk's arrays hold (for memtable accounting). */
   get bytes(): number {
     let total = this.validity?.byteLength ?? 0;
@@ -158,6 +186,7 @@ export class ColumnChunk {
 
   #setNull(slot: number): void {
     if (this.validity === null) {
+      this.#take(MEMORY_CHUNK_ROWS / 8);
       const words = new Uint32Array(MEMORY_CHUNK_ROWS / 32);
       words.fill(0xffff_ffff);
       this.validity = words;
@@ -260,14 +289,18 @@ export class ColumnChunk {
   #widenToInt64(): void {
     if (this.big !== null) return;
     const safe = need(this.safe);
+    this.#take(MEMORY_CHUNK_ROWS * 8);
     const big = new BigInt64Array(MEMORY_CHUNK_ROWS);
     for (let slot = 0; slot < this.length; slot++) big[slot] = BigInt(safe[slot] ?? 0);
     this.big = big;
     this.safe = null;
+    this.#give(MEMORY_CHUNK_ROWS * 8);
   }
 
   #widenToInt128(): void {
     if (this.limbs !== null) return;
+    this.#take(MEMORY_CHUNK_ROWS * 16);
+    const freed = (this.safe?.byteLength ?? 0) + (this.big?.byteLength ?? 0);
     const limbs = new Uint32Array(MEMORY_CHUNK_ROWS * 4);
     for (let slot = 0; slot < this.length; slot++)
       setInt128(
@@ -278,12 +311,16 @@ export class ColumnChunk {
     this.limbs = limbs;
     this.safe = null;
     this.big = null;
+    this.#give(freed);
   }
 
   #putDecimal(at: number, data: DecimalData, index: number): void {
     const special = data.specials?.[index] ?? DecimalSpecial.finite;
     if (special !== DecimalSpecial.finite) {
-      this.specials ??= new Uint8Array(MEMORY_CHUNK_ROWS);
+      if (this.specials === null) {
+        this.#take(MEMORY_CHUNK_ROWS);
+        this.specials = new Uint8Array(MEMORY_CHUNK_ROWS);
+      }
       this.specials[at] = special;
     } else if (this.specials !== null) this.specials[at] = DecimalSpecial.finite;
     const scale = data.scale ?? data.scales?.[index] ?? 0;
@@ -330,12 +367,14 @@ export class ColumnChunk {
     if (total > arena.length) {
       let size = arena.length * 2;
       while (size < total) size *= 2;
+      this.#take(size);
       const grown = new Uint8Array(size);
       grown.set(arena.subarray(0, used));
+      this.#give(arena.byteLength);
       arena = grown;
       this.arena = grown;
     }
-    arena.set(source.subarray(start, end), used);
+    copyRange(arena, used, source, start, end);
     offsets[at + 1] = total;
   }
 
@@ -408,6 +447,29 @@ export class ColumnChunk {
   }
 }
 
+/** Bytes a fresh chunk of `layout` allocates (charged before its arrays exist). */
+function initialBytes(layout: ReturnType<typeof layoutOf>, type: PhysicalType): number {
+  const n = MEMORY_CHUNK_ROWS;
+  switch (layout) {
+    case "bool":
+      return n;
+    case "i32":
+    case "f32":
+      return n * 4;
+    case "f64":
+    case "int64":
+      return n * 8;
+    case "decimal":
+      return n * 8 + (type.kind === "decimal" && type.scale === null ? n * 2 : 0);
+    case "varlen":
+      return 256 + (n + 1) * 4;
+    case "fixed16":
+      return n * 16;
+    case "interval":
+      return n * 16;
+  }
+}
+
 // ── Frame column codec ─────────────────────────────────────────────────────────────────────────
 
 const LAYOUT_TAG = {
@@ -452,16 +514,14 @@ export function encodeColumn(
   if (vector.validity === null) writer.u8(0);
   else {
     writer.u8(1);
-    const bits = new Uint32Array(Math.ceil(count / 32));
-    copyBits(vector.validity, from, bits, 0, count);
-    writer.typed(bits);
+    writeBits(writer, vector.validity, from, count);
   }
   switch (data.layout) {
     case "bool":
     case "i32":
     case "f64":
     case "f32":
-      writer.typed(data.values.subarray(from, from + count));
+      writer.range(data.values, from, count);
       break;
     case "int64":
       writeInt64(writer, data.values, from, count);
@@ -484,10 +544,9 @@ export function encodeColumn(
     case "varlen": {
       const base = data.offsets[from] ?? 0;
       const end = data.offsets[from + count] ?? base;
-      const relative = new Int32Array(count + 1);
-      for (let k = 0; k <= count; k++) relative[k] = (data.offsets[from + k] ?? base) - base;
-      writer.typed(relative);
-      writer.raw(data.bytes.subarray(base, end));
+      writer.ensure(4 * (count + 1) + (end - base));
+      for (let k = 0; k <= count; k++) writer.u32((data.offsets[from + k] ?? base) - base);
+      writer.rawRange(data.bytes, base, end);
       break;
     }
     case "fixed16":
@@ -499,7 +558,42 @@ export function encodeColumn(
       writeInt64(writer, data.micros, from, count);
       break;
   }
-  return into === undefined ? writer.finish() : writer.bytes.subarray(0, 0);
+  return into === undefined ? writer.finish() : EMPTY;
+}
+
+const EMPTY = new Uint8Array(0);
+
+/** Validity bits `from … from + count − 1` as `ceil(count / 32)` little-endian words. */
+function writeBits(writer: ByteWriter, validity: Uint32Array, from: number, count: number): void {
+  const words = Math.ceil(count / 32);
+  if ((from & 31) === 0) {
+    writer.range(validity, from >>> 5, words);
+    // Bits past `count` in the last word are not part of the column.
+    const tail = count & 31;
+    if (tail !== 0) {
+      const at = writer.length - 4;
+      writer.view.setUint32(at, writer.view.getUint32(at, true) & ((1 << tail) - 1), true);
+    }
+    return;
+  }
+  if (count <= 64) {
+    // A few rows (single-row commits): gather the bits without a scratch array.
+    writer.ensure(words * 4);
+    for (let word = 0; word < words; word++) {
+      let value = 0;
+      const first = word * 32;
+      const last = Math.min(count, first + 32);
+      for (let k = first; k < last; k++) {
+        const bit = from + k;
+        if ((((validity[bit >>> 5] ?? 0) >>> (bit & 31)) & 1) !== 0) value |= 1 << (k - first);
+      }
+      writer.u32(value);
+    }
+    return;
+  }
+  const bits = new Uint32Array(words);
+  copyBits(validity, from, bits, 0, count);
+  writer.typed(bits);
 }
 
 /** Decodes an encoded column into a fresh flat vector of `type`. */

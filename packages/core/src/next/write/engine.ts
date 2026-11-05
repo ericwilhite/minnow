@@ -11,7 +11,15 @@
  *   space, and its readers are re-pointed (ruling R16.3).
  * - **Recovery** (`openWritePath`): the single log scan, truncation and replay of startup step 4.
  */
-import { Memtable } from "./memtable.js";
+import { Memtable, MEMTABLE_ROWS } from "./memtable.js";
+
+/**
+ * `openWritePath`'s input plus internal tuning for tests (never a public dial): smaller memtables
+ * make crash sweeps cross many flushes and publishes in a short scenario.
+ */
+export type EngineInput = OpenWritePathInput & {
+  readonly tuning?: { readonly memtableRows?: number };
+};
 import { CatalogChangeError, type TableDef } from "../access/catalog.js";
 import { FROZEN_MEMTABLE_CAP_BYTES, MAX_LSN } from "../access/snapshot.js";
 import type { Space, SpacePin } from "../access/space.js";
@@ -61,10 +69,11 @@ import { layoutOf } from "../types.js";
 import type { Vector } from "../vector/vector.js";
 import { compareBytes } from "../vector/varlen.js";
 import { decodeBody, encodeBody } from "./body.js";
+import { MemtableMemoryError } from "./bytes.js";
+import type { MaybePromise } from "../access/key-index.js";
 import { ByteWriter } from "./bytes.js";
 import { Catalog, decodeLogged, type LoggedChange } from "./catalog.js";
 import { decodeColumn, isNullAt, MEMORY_CHUNK_ROWS } from "./columns.js";
-import { KeyDelta } from "./key-hash.js";
 import { LogAppender, type LogPosition } from "./log.js";
 import {
   decodeGroupRoot,
@@ -129,6 +138,52 @@ function maxSeq(memtable: Memtable, rows: number): number {
   for (const delta of memtable.deltas.values())
     for (let entry = 0; entry < delta.entryCount; entry++) max = Math.max(max, delta.seq(entry));
   return max;
+}
+
+const RESOLVED: Promise<void> = Promise.resolve();
+
+/** A commit's receipt: its durability promise is made when first read (most callers never do). */
+class Receipt implements CommitReceipt {
+  readonly wrote = true;
+  #durable: Promise<void> | null = null;
+
+  constructor(
+    readonly lsn: number,
+    readonly appender: LogAppender,
+  ) {}
+
+  get durable(): Promise<void> {
+    return (this.#durable ??= this.appender.durable(this.lsn) ?? RESOLVED);
+  }
+}
+
+/** One holder's share of a state's space pin; the last release drops the pin. */
+class StatePin implements SpacePin {
+  #released = false;
+
+  constructor(
+    readonly entry: { readonly pin: SpacePin; count: number },
+    readonly label: string,
+    readonly pins: Map<WriteState, unknown>,
+    readonly state: WriteState,
+  ) {}
+
+  get generation(): number {
+    return this.entry.pin.generation;
+  }
+
+  get released(): boolean {
+    return this.#released;
+  }
+
+  release(): void {
+    if (this.#released) return;
+    this.#released = true;
+    this.entry.count -= 1;
+    if (this.entry.count > 0) return;
+    this.entry.pin.release();
+    this.pins.delete(this.state);
+  }
 }
 
 /** The lowest seq of anything in a memtable (its first rows or delta entries), or Infinity. */
@@ -206,21 +261,22 @@ export class WritePathImpl implements WritePath, EngineHooks {
   readonly #groupRootCache = new Map<string, GroupRoot | Promise<GroupRoot>>();
   readonly #summaries = new Map<number, Map<number, ColumnTotals>>();
   #labels = 0;
+  /** Published memtables older readers may still hold (deltas, borrowed chunks). */
+  readonly #published = new Set<Memtable>();
+  readonly #governorCap: number;
+  readonly #memtableRows: number;
   /** True while open replays the log (no flush runs before the appender exists). */
   #recovering = true;
   /** Publications (flushes that reached a durable root). */
   publications = 0;
 
-  private constructor(
-    input: OpenWritePathInput,
-    grant: Grant,
-    root: ManifestRoot,
-    catalog: Catalog,
-  ) {
+  private constructor(input: EngineInput, grant: Grant, root: ManifestRoot, catalog: Catalog) {
     this.durability = input.options.durability;
+    this.#memtableRows = input.tuning?.memtableRows ?? MEMTABLE_ROWS;
     this.#session = input.session;
     this.#space = input.space;
     this.#grant = grant;
+    this.#governorCap = input.governor.capBytes;
     this.#now = input.options.now ?? Date.now;
     this.#root = root;
     this.#catalog = catalog;
@@ -255,7 +311,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
 
   // ── Open and recovery ────────────────────────────────────────────────────────────────────
 
-  static async open(input: OpenWritePathInput): Promise<WritePathImpl> {
+  static async open(input: EngineInput): Promise<WritePathImpl> {
     const grant = await input.governor.admit({
       label: "write path",
       minimumBytes: MINIMUM_BYTES,
@@ -449,8 +505,15 @@ export class WritePathImpl implements WritePath, EngineHooks {
     }
     if (change.op === "dropTable") this.#dropTableState(change.tableId);
     if (change.op === "dropSequence") this.sequences.drop(change.sequenceId);
-    if (change.op === "createIndex")
-      await this.#backfill(change.index.tableId, change.index.id, lsn);
+    if (change.op === "createIndex") {
+      const state = this.#tables.get(change.index.tableId);
+      // A root whose table checkpoint covers the build has its entries in the runs already.
+      if (state !== undefined && state.flushedThroughLsn < lsn) {
+        await this.#backfill(change.index.tableId, change.index.id, lsn);
+        this.#pendingIndexes.set(change.index.id, { tableId: change.index.tableId, lsn });
+      }
+    }
+    if (change.op === "dropIndex") this.#pendingIndexes.delete(change.indexId);
   }
 
   /** Replay of createIndex: entries for every live row, with the creating commit's seq. */
@@ -497,7 +560,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         const next = memtable.firstRowId + memtable.rowCount;
         if (next !== inserts.firstRowId + done)
           throw new LogCorruptionError(
-            `Logged rows of table ${String(effect.tableId)} start at an unexpected row id`,
+            `Logged rows of table ${String(effect.tableId)} start at row ${String(inserts.firstRowId + done)}, not ${String(next)}`,
           );
         const take = Math.min(memtable.capacity, inserts.rowCount - done);
         const before = memtable.rowCount;
@@ -508,7 +571,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
         this.#putEntries(def, def.indexes, memtable, columns, rows, rowIds, lsn);
         done += take;
       }
-      state.nextRowId = Math.max(state.nextRowId, inserts.firstRowId + inserts.rowCount);
     }
     const deletes = effect.deletes;
     if (deletes !== null) {
@@ -665,6 +727,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
       def.schemaVersion,
       def.columns,
       def.indexes.map((index) => index.id),
+      this.#grant,
+      this.#memtableRows,
     );
     this.#setView(state, { ...state.view, memtables: [...memtables, memtable] });
     if (frozen !== null && !this.#recovering) this.#scheduleFlush();
@@ -712,16 +776,86 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#publishState();
   }
 
+  /**
+   * CREATE INDEX builds whose entries are still only in a memtable delta (ruling 1): a root's
+   * global checkpoint stays below their LSN until their table's checkpoint covers them, so a
+   * reopen replays the build.
+   */
+  readonly #pendingIndexes = new Map<number, { readonly tableId: number; readonly lsn: number }>();
+
   #dropTableState(tableId: number): void {
+    for (const [indexId, pending] of this.#pendingIndexes)
+      if (pending.tableId === tableId) this.#pendingIndexes.delete(indexId);
+    const state = this.#tables.get(tableId);
     this.#tables.delete(tableId);
     this.#summaries.delete(tableId);
     this.#publishState();
+    // Older readers may still read its memtables (ruling 5): their memory goes when they close.
+    if (state !== undefined)
+      this.shared.readers.holdUntilOlderClose(() => {
+        for (const memtable of state.view.memtables) memtable.releaseAll();
+      });
   }
 
   addIndexDelta(tableId: number, indexId: number): Memtable {
     const { memtable } = this.liveMemtable(tableId);
-    if (!memtable.deltas.has(indexId)) memtable.deltas.set(indexId, new KeyDelta());
+    if (!memtable.deltas.has(indexId)) memtable.addDelta(indexId);
     return memtable;
+  }
+
+  /** Total bytes of every table's memtables (live, frozen, retained). */
+  #memtableBytes(): number {
+    let total = 0;
+    for (const state of this.#tables.values())
+      for (const memtable of state.view.memtables) total += memtable.bytes;
+    return total;
+  }
+
+  /** The cap on memtable bytes across tables: a quarter of the memory cap, at least 16 MiB. */
+  get #memtableCap(): number {
+    return Math.max(16 * 1024 * 1024, Math.floor(this.#governorCap / 4));
+  }
+
+  /**
+   * Ensures the write path's grant can take `bytes` more memtable memory before an insert
+   * (ruling 6): grows the grant, and when the governor refuses, freezes the largest live
+   * memtables that hold no pending rows and waits for their flushes. Throws
+   * `MemtableMemoryError` when nothing more can be freed.
+   */
+  admit(bytes: number): MaybePromise<void> {
+    if (this.#headroom(bytes)) return;
+    return this.#relieve(bytes);
+  }
+
+  #headroom(bytes: number): boolean {
+    const free = this.#grant.held - this.#grant.allocated;
+    return free >= bytes || this.#grant.tryGrow(bytes - free);
+  }
+
+  async #relieve(bytes: number): Promise<void> {
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const live = [...this.#tables.values()]
+        .map((state) => state.view.memtables[state.view.memtables.length - 1])
+        .filter(
+          (memtable): memtable is Memtable =>
+            memtable?.state === "live" &&
+            memtable.rowCount > 0 &&
+            memtable.visibleRows(MAX_LSN) === memtable.rowCount,
+        )
+        .sort((a, b) => b.bytes - a.bytes);
+      for (const memtable of live.slice(0, 2)) {
+        memtable.state = "frozen";
+        this.#setView(need(this.#tables.get(memtable.tableId)), {
+          ...need(this.#tables.get(memtable.tableId)).view,
+        });
+      }
+      this.#scheduleFlush();
+      await this.#appender.flush();
+      await this.#flushes;
+      this.#check();
+      if (this.#headroom(bytes)) return;
+    }
+    throw new MemtableMemoryError(bytes);
   }
 
   // ── Public API ───────────────────────────────────────────────────────────────────────────
@@ -813,12 +947,14 @@ export class WritePathImpl implements WritePath, EngineHooks {
         );
       });
     this.#check();
-    // Backpressure: frozen memtables awaiting publication past the cap make writers wait.
+    // Backpressure: frozen memtables awaiting publication past their cap, or memtables across
+    // every table past theirs, make writers wait (ruling 6).
     while (this.#frozenBytes() > FROZEN_MEMTABLE_CAP_BYTES) {
       this.#scheduleFlush();
       await this.#flushes;
       this.#check();
     }
+    if (this.#memtableBytes() > this.#memtableCap) await this.#relieve(0);
     const tx = new TransactionImpl(this, this.appliedLsn);
     this.#holder = tx;
     return tx;
@@ -833,7 +969,14 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#holder = null;
       next.resolve();
     }
-    this.#scheduleFlush();
+    // A frozen memtable may have waited for this writer's pending rows.
+    if (this.#hasFrozen()) this.#scheduleFlush();
+  }
+
+  #hasFrozen(): boolean {
+    for (const state of this.#tables.values())
+      for (const memtable of state.view.memtables) if (memtable.state === "frozen") return true;
+    return false;
   }
 
   commit(tx: TransactionImpl, request: CommitRequest | null): Promise<CommitReceipt> {
@@ -857,14 +1000,29 @@ export class WritePathImpl implements WritePath, EngineHooks {
               state.flushedThroughLsn = lsn - 1;
             }
           }
-          if (effect.kind === "dropTable") this.#dropTableState(effect.tableId);
+          if (effect.kind === "dropTable") {
+            // Strict readers pin the durable LSN: keep the state until the drop is durable.
+            const tableId = effect.tableId;
+            const wait = this.durability === "strict" ? this.#appender.durable(lsn) : null;
+            if (wait === null) this.#dropTableState(tableId);
+            else
+              void wait.then(
+                () => {
+                  if (this.#catalog.table(tableId) === undefined) this.#dropTableState(tableId);
+                },
+                () => undefined,
+              );
+          }
           if (effect.kind === "catalog") {
             const change = decodeLogged(effect.definition);
             if (change.op === "dropSequence") this.sequences.drop(change.sequenceId);
+            if (change.op === "createIndex")
+              this.#pendingIndexes.set(change.index.id, { tableId: change.index.tableId, lsn });
+            if (change.op === "dropIndex") this.#pendingIndexes.delete(change.indexId);
           }
         }
       }
-      const durable = this.#appender.durable(lsn) ?? Promise.resolve();
+      const receipt = new Receipt(lsn, this.#appender);
       if (request !== null) {
         const record = () => {
           this.ledger.record(hexId(request.clientId), request.sequence, {
@@ -874,11 +1032,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
             recordedAtMs: this.#now(),
           });
         };
-        if (this.durability === "strict") void durable.then(record, () => undefined);
+        if (this.durability === "strict") void receipt.durable.then(record, () => undefined);
         else record();
       }
       this.release(tx);
-      return Promise.resolve({ wrote: true, lsn, durable });
+      return Promise.resolve(receipt);
     } catch (error) {
       tx.undoTo(0);
       this.release(tx);
@@ -905,6 +1063,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   /** Whether a flush could run now, ignoring durability waits. */
   #nextFlushReady(): true | null {
     for (const state of this.#tables.values()) {
+      if (this.#catalog.table(state.tableId) === undefined) continue;
       const memtables = state.view.memtables;
       let through = 0;
       for (let k = 0; k < memtables.length; k++) {
@@ -1000,7 +1159,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
       memtableBytes,
       frozenMemtables: frozen,
       frozenMemtableBytes: this.#frozenBytes(),
-      borrowedChunkBytes: 0,
+      borrowedChunkBytes: [...this.#published].reduce(
+        (sum, memtable) => sum + memtable.borrowedBytes,
+        0,
+      ),
       repointedReaders: this.shared.readers.heldPins > 0 ? this.shared.readers.count : 0,
       repointPins: this.shared.readers.heldPins,
       levelZeroRuns: runs,
@@ -1041,6 +1203,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
     await this.#flushes;
     if (this.#appender.failure === null) await this.#appender.close();
     this.keys.close();
+    for (const state of this.#tables.values())
+      for (const memtable of state.view.memtables) memtable.releaseAll();
+    for (const memtable of this.#published) memtable.releaseAll();
     this.#currentPin?.release();
     this.#currentPin = null;
     this.#grant.close();
@@ -1057,23 +1222,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#statePins.set(state, held);
     }
     held.count += 1;
-    const entry = held;
-    let released = false;
-    return {
-      generation: entry.pin.generation,
-      label,
-      get released() {
-        return released;
-      },
-      release: () => {
-        if (released) return;
-        released = true;
-        entry.count -= 1;
-        if (entry.count > 0) return;
-        entry.pin.release();
-        this.#statePins.delete(state);
-      },
-    };
+    return new StatePin(held, label, this.#statePins, state);
   }
 
   #runReader(ref: RunRef): RunReader | Promise<RunReader> {
@@ -1150,6 +1299,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   /** The next table flush that can run now (null when none), or a wait for durability. */
   #nextFlush(): Promise<void> | null {
     for (const state of this.#tables.values()) {
+      if (this.#catalog.table(state.tableId) === undefined) continue;
       const memtables = state.view.memtables;
       const set: Memtable[] = [];
       let through = 0;
@@ -1262,7 +1412,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
       await this.#space.publish(encodeRoot(root), { writers: [writer], retired });
       // Re-point readers in the same step the publish resolves (ruling R16.3).
       const pin: SpacePin = this.#space.pin(`re-point t${String(state.tableId)}`);
-      this.shared.readers.holdUntilOlderClose(pin);
+      const flushed = [...set];
+      // Older readers keep the published group (pin) and the memtables' key deltas (ruling 2).
+      for (const memtable of flushed) this.#published.add(memtable);
+      this.shared.readers.holdUntilOlderClose(() => {
+        pin.release();
+        for (const memtable of flushed) {
+          memtable.releaseAll();
+          this.#published.delete(memtable);
+        }
+      });
       for (const memtable of set) {
         const entry = published.get(memtable);
         if (entry !== undefined)
@@ -1278,6 +1437,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#pruneCatalogs(root.globalLsn);
       state.root = tableRoot;
       state.flushedThroughLsn = through;
+      for (const [indexId, pending] of this.#pendingIndexes)
+        if (pending.tableId === state.tableId && pending.lsn <= through)
+          this.#pendingIndexes.delete(indexId);
       state.nextGroupId = nextGroupId;
       state.nextRowId = nextRowId;
       // Rebuilt from the view as it is now: memtables, deletions and sources added during the
@@ -1340,7 +1502,15 @@ export class WritePathImpl implements WritePath, EngineHooks {
     retired: ExtentRef[],
     changed: ReadonlyMap<number, TableRoot>,
   ): Promise<ManifestRoot> {
-    const globalLsn = Math.max(this.#root.globalLsn, this.durableLsn);
+    let globalLsn = Math.max(this.#root.globalLsn, this.durableLsn);
+    for (const pending of this.#pendingIndexes.values()) {
+      const covered =
+        changed.get(pending.tableId)?.flushedThroughLsn ??
+        this.#tables.get(pending.tableId)?.flushedThroughLsn ??
+        0;
+      if (covered < pending.lsn) globalLsn = Math.min(globalLsn, pending.lsn - 1);
+    }
+    globalLsn = Math.max(globalLsn, this.#root.globalLsn);
     const catalog = this.#catalogAt(globalLsn);
     let catalogRef = this.#root.catalog;
     if (catalog.version !== this.#root.catalogVersion) {

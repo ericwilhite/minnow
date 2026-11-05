@@ -22,6 +22,7 @@ import {
   MAX_FRAME_PARTS,
 } from "../format/log-frame.js";
 import type { StoreSession } from "../storage/contract.js";
+import { need } from "./bytes.js";
 
 export const IDLE_FLUSH_MS = 100;
 export const RELAXED_DELAY_MS = 5;
@@ -61,7 +62,9 @@ export class LogAppender {
   /** The newest durable group's boundary. */
   #durable: Boundary;
   #rootSequence: number;
-  #tail: Promise<void> = Promise.resolve();
+  /** Frames appended and not yet written to the log file (written by the next flush). */
+  #queued: Uint8Array[] = [];
+  #queuedBytes = 0;
   #flushing: Promise<void> | null = null;
   #scheduled = false;
   #idle: ReturnType<typeof setTimeout> | null = null;
@@ -120,7 +123,10 @@ export class LogAppender {
     if (parts > MAX_FRAME_PARTS) throw new RangeError("A transaction is too large for the log");
     const first = this.#lastLsn + 1;
     for (let part = 0; part < parts; part++) {
-      const slice = body.subarray(part * MAX_FRAME_BODY_BYTES, (part + 1) * MAX_FRAME_BODY_BYTES);
+      const slice =
+        parts === 1
+          ? body
+          : body.subarray(part * MAX_FRAME_BODY_BYTES, (part + 1) * MAX_FRAME_BODY_BYTES);
       const frame = encodeFrame(
         { salt: this.#salt, lsn: first + part, partIndex: part, partCount: parts },
         slice,
@@ -129,10 +135,8 @@ export class LogAppender {
       this.#chain = frame.chain;
       this.#end += frame.bytes.length;
       this.bytes += frame.bytes.length;
-      const bytes = frame.bytes;
-      this.#tail = this.#tail.then(async () => {
-        await this.#session.appendLog(bytes);
-      });
+      this.#queued.push(frame.bytes);
+      this.#queuedBytes += frame.bytes.length;
     }
     this.#lastLsn = first + parts - 1;
     this.#schedule();
@@ -181,7 +185,7 @@ export class LogAppender {
     if (group.lsn <= this.#durable.lsn) return Promise.resolve();
     const run = (async () => {
       try {
-        await this.#tail;
+        await this.#writeQueued();
         await this.#writeHeader(this.#durable);
         await this.#session.flushLog();
         this.flushes += 1;
@@ -198,6 +202,24 @@ export class LogAppender {
     })();
     this.#flushing = run;
     return run;
+  }
+
+  /** Writes the queued frames, in order, as one log append. */
+  async #writeQueued(): Promise<void> {
+    if (this.#queued.length === 0) return;
+    const frames = this.#queued;
+    let bytes = need(frames[0]);
+    if (frames.length > 1) {
+      bytes = new Uint8Array(this.#queuedBytes);
+      let at = 0;
+      for (const frame of frames) {
+        bytes.set(frame, at);
+        at += frame.length;
+      }
+    }
+    this.#queued = [];
+    this.#queuedBytes = 0;
+    await this.#session.appendLog(bytes);
   }
 
   async #writeHeader(ack: Boundary): Promise<void> {
