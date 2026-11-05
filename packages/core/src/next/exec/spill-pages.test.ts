@@ -3,7 +3,7 @@
  * spill contract's page layout, and a corrupt, truncated or mistyped page is refused, never read
  * as rows. Law: spill/contract.ts "Files and pages".
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import { SpillCorruptionError } from "../spill/contract.js";
 import { MemorySpillFile, MemorySpillService } from "../spill/memory-spill.js";
@@ -11,7 +11,14 @@ import type { PhysicalType } from "../types.js";
 import { setInt128 } from "../vector/int128.js";
 import type { FlatVector, VectorData } from "../vector/vector.js";
 import { defined } from "./join-fixtures.js";
-import { PageWriter, SpillFiles, SpilledRun, decodePage, pageHeader } from "./spill-pages.js";
+import {
+  PageWriter,
+  SpillClosedError,
+  SpillFiles,
+  SpilledRun,
+  decodePage,
+  pageHeader,
+} from "./spill-pages.js";
 
 const FREE = { allocate: () => true, free: () => undefined };
 /** Decodes with an unlimited charge (the charged paths have their own tests). */
@@ -382,5 +389,169 @@ describe("spill pages", () => {
     ).toBeNull();
     writer.close();
     expect(held).toBe(0);
+  });
+});
+
+/** A promise and its resolver (deferred). */
+function gate(): { promise: Promise<void>; resolve: () => void } {
+  let resolve: () => void = () => undefined;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+describe("spill file lifecycle (review B7-p2a-2 #1)", () => {
+  it("closeAll waits for a late-created file's close", async () => {
+    const service = new MemorySpillService();
+    const create = gate();
+    const closeGate = gate();
+    const started = gate();
+    let closed = false;
+    const files = new SpillFiles(
+      {
+        bytesInUse: 0,
+        sweep: () => service.sweep(),
+        create: async (queryId: number) => {
+          await create.promise;
+          const file = await service.create(queryId);
+          const close = file.close.bind(file);
+          file.close = async () => {
+            started.resolve();
+            await closeGate.promise;
+            await close();
+            closed = true;
+          };
+          return file;
+        },
+      },
+      1,
+      FREE,
+    );
+    const append = files.append(new SpilledRun(), new Uint8Array(8), 1).catch((e: unknown) => e);
+    const closing = files.closeAll();
+    let settled = false;
+    void closing.then(
+      () => (settled = true),
+      () => (settled = true),
+    );
+    create.resolve();
+    await started.promise;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(settled).toBe(false);
+    closeGate.resolve();
+    await closing;
+    expect(closed).toBe(true);
+    expect(await append).toBeInstanceOf(SpillClosedError);
+  });
+
+  it("closeAll reports a late-created file's close failure", async () => {
+    const service = new MemorySpillService();
+    const create = gate();
+    const files = new SpillFiles(
+      {
+        bytesInUse: 0,
+        sweep: () => service.sweep(),
+        create: async (queryId: number) => {
+          await create.promise;
+          const file = await service.create(queryId);
+          file.close = async () => {
+            throw new Error("late close failed");
+          };
+          return file;
+        },
+      },
+      1,
+      FREE,
+    );
+    const append = files.append(new SpilledRun(), new Uint8Array(8), 1).catch((e: unknown) => e);
+    const closing = files.closeAll();
+    create.resolve();
+    await append;
+    await expect(closing).rejects.toThrow("late close failed");
+  });
+
+  it("closeAll observes a release whose close is still in flight", async () => {
+    const service = new MemorySpillService();
+    const hold = gate();
+    const files = new SpillFiles(service, 1, FREE);
+    const run = new SpilledRun();
+    await files.append(run, new Uint8Array(8), 1);
+    defined(run.file).close = async () => {
+      await hold.promise;
+      throw new Error("release failed");
+    };
+    const release = files.release(run).catch((e: unknown) => e);
+    const closing = files.closeAll();
+    hold.resolve();
+    await release;
+    await expect(closing).rejects.toThrow("release failed");
+  });
+});
+
+describe("spill decoding charges (review B7-p2a-2 #2, #3)", () => {
+  const wide = (value: bigint): FlatVector => ({
+    form: "flat",
+    type: { kind: "decimal", precision: null, scale: 0 },
+    length: 1,
+    validity: null,
+    data: {
+      layout: "decimal",
+      scale: 0,
+      scales: null,
+      coefficients: { repr: "wide", values: [value] },
+      specials: null,
+    },
+  });
+
+  it("a malformed misaligned decimal page refunds its copy charge", () => {
+    const valid = defined(
+      new PageWriter(FREE).encode(
+        { queryId: 1, run: 0, partition: 0, sequence: 0 },
+        [wide(123n)],
+        1,
+      ),
+    );
+    const backing = new Uint8Array(valid.length + 1);
+    backing.set(valid, 1);
+    const page = backing.subarray(1);
+    page[0] = 0;
+    let used = 0;
+    const charge = {
+      allocate: (n: number) => {
+        used += n;
+        return true;
+      },
+      free: (n: number) => {
+        used -= n;
+      },
+    };
+    expect(() => decodePage(page, [wide(0n).type], charge)).toThrow(SpillCorruptionError);
+    expect(used).toBe(0);
+  });
+
+  it("sizes wide decimals from their byte length: no BigInt or string before the charge", () => {
+    const page = defined(
+      new PageWriter(FREE).encode(
+        { queryId: 1, run: 0, partition: 0, sequence: 0 },
+        [wide(1n << 8000n)],
+        1,
+      ),
+    );
+    const spy = vi.spyOn(BigInt.prototype, "toString");
+    let atCharge = -1;
+    try {
+      const result = decodePage(page, [wide(0n).type], {
+        allocate: () => {
+          atCharge = spy.mock.calls.length;
+          return false;
+        },
+        free: () => undefined,
+      });
+      expect("needed" in result && result.needed >= 1000).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(atCharge).toBe(0);
   });
 });

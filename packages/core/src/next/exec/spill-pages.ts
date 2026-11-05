@@ -27,7 +27,6 @@ import type { PhysicalKind, PhysicalType } from "../types.js";
 import { layoutOf } from "../types.js";
 import type { ByteCharge } from "../vector/varlen.js";
 import type { FlatVector, VectorData } from "../vector/vector.js";
-import { bigintBytes } from "../memory/governor.js";
 import { TIER_INT128, TIER_INT64, TIER_SAFE, TIER_WIDE } from "./column-store.js";
 
 const HEADER_BYTES = 32;
@@ -333,10 +332,17 @@ export function decodePage(
     copied = page.length;
     page = page.slice();
   }
-  const wide = wideBytes(page, types);
-  if (wide > 0 && !charge.allocate(wide)) {
+  // Sizing and decoding share one refund scope: whatever throws, the copy's charge goes back.
+  let wide: number;
+  try {
+    wide = wideBytes(page, types);
+    if (wide > 0 && !charge.allocate(wide)) {
+      if (copied > 0) charge.free(copied);
+      return { needed: copied + wide };
+    }
+  } catch (error) {
     if (copied > 0) charge.free(copied);
-    return { needed: copied + wide };
+    throw error;
   }
   try {
     return { ...decodeViews(page, types), charged: copied + wide };
@@ -350,8 +356,10 @@ export function decodePage(
 function wideBytes(page: Uint8Array, types: readonly PhysicalType[]): number {
   if (!types.some((type) => type.kind === "decimal")) return 0;
   let total = 0;
+  // A BigInt of N magnitude bytes: a header plus 64-bit digits (memory/governor.ts
+  // `bigintBytes`), computed from N alone, so nothing value-sized exists before admission.
   decodeViews(page, types, (length) => {
-    total += bigintBytes(1n << BigInt(Math.max(0, length * 8 - 1)));
+    total += 16 + 8 * Math.max(1, Math.ceil(length / 8));
   });
   return total;
 }
@@ -512,18 +520,20 @@ export class SpillClosedError extends Error {
 /**
  * Lazily created spill files for a partitioned operator: one file per run, closed together.
  *
- * Closing races nothing: `closeAll` marks the set closed first, waits for creations in flight,
- * closes every file (including one whose creation resolved after the close began) and settles
- * once every close has; its Promise rejects with the first close failure, so cleanup failures are
- * observed, never dropped. `closed` is that Promise for whoever owns the operator.
+ * Every operation that can still close a file (a creation that resolves after the close began,
+ * a `release`, `closeAll` itself) is tracked in one set; `closed` settles only when all of them
+ * have, and rejects with their failures (one error, or an `AggregateError`). So cleanup is never
+ * reported complete while a close is in flight, and no close failure is dropped.
  */
 export class SpillFiles {
   readonly #service: SpillService;
   readonly #queryId: number;
   readonly #budget: ByteCharge;
   readonly #open = new Set<SpillFile>();
-  readonly #creating = new Set<Promise<unknown>>();
-  #closing: Promise<void> | null = null;
+  readonly #inFlight = new Set<Promise<void>>();
+  readonly #failures: unknown[] = [];
+  #closing = false;
+  #closed: Promise<void> | null = null;
   /** Bytes written, for the profile. */
   written = 0;
 
@@ -534,28 +544,40 @@ export class SpillFiles {
   }
 
   get isClosed(): boolean {
-    return this.#closing !== null;
-  }
-
-  /** Settles when `closeAll` finished (rejects with its first failure); null before. */
-  get closed(): Promise<void> | null {
     return this.#closing;
   }
 
+  /** Settles when `closeAll` finished every tracked close (rejects with their failures); null before. */
+  get closed(): Promise<void> | null {
+    return this.#closed;
+  }
+
+  /** Tracks an operation that may close a file; its failure is kept for `closed`. */
+  #track(operation: Promise<unknown>): void {
+    const tracked: Promise<void> = operation.then(
+      () => undefined,
+      (error: unknown) => {
+        this.#failures.push(error);
+      },
+    );
+    this.#inFlight.add(tracked);
+    void tracked.then(() => this.#inFlight.delete(tracked));
+  }
+
   async append(run: SpilledRun, page: Uint8Array, rows: number): Promise<void> {
-    if (this.#closing !== null) throw new SpillClosedError();
+    if (this.#closing) throw new SpillClosedError();
     if (run.file === null) {
-      const creating = this.#service.create(this.#queryId, this.#budget);
-      this.#creating.add(creating);
-      let file: SpillFile;
-      try {
-        file = await creating;
-      } finally {
-        this.#creating.delete(creating);
-      }
-      if (this.isClosed) {
-        // Created after the close began: close it here, the closer may have missed it.
+      // The creation and, if the close began meanwhile, the late file's close are one tracked
+      // operation, so `closed` waits for that close and sees its failure.
+      const created = this.#service.create(this.#queryId, this.#budget).then(async (file) => {
+        if (!this.#closing) return file;
         await file.close();
+        return null;
+      });
+      this.#track(created);
+      const file = await created;
+      if (file === null || this.isClosed) {
+        if (file !== null) this.#track(file.close());
         throw new SpillClosedError();
       }
       run.file = file;
@@ -569,29 +591,38 @@ export class SpillFiles {
     this.written += page.length;
   }
 
-  /** Closes a run's file (its pages are gone). */
+  /** Closes a run's file (its pages are gone); the close is tracked until it settles. */
   async release(run: SpilledRun): Promise<void> {
     const file = run.file;
     run.file = null;
     run.pages.length = 0;
-    if (file !== null) {
-      this.#open.delete(file);
-      await file.close();
-    }
+    if (file === null) return;
+    this.#open.delete(file);
+    const closing = file.close();
+    this.#track(closing);
+    await closing;
   }
 
   /** Closes every file, now and created later; idempotent (returns the same Promise). */
   closeAll(): Promise<void> {
-    this.#closing ??= (async () => {
-      await Promise.allSettled([...this.#creating]);
-      const files = [...this.#open];
-      this.#open.clear();
-      const results = await Promise.allSettled(files.map((file) => file.close()));
-      const failure = results.find(
-        (result): result is PromiseRejectedResult => result.status === "rejected",
-      );
-      if (failure !== undefined) throw failure.reason;
+    this.#closing = true;
+    this.#closed ??= (async () => {
+      // Drain until nothing is in flight: a late creation may add its own close meanwhile.
+      for (;;) {
+        for (const file of [...this.#open]) {
+          this.#open.delete(file);
+          this.#track(file.close());
+        }
+        if (this.#inFlight.size === 0) break;
+        await Promise.all([...this.#inFlight]);
+      }
+      if (this.#failures.length === 1) throw this.#failures[0];
+      if (this.#failures.length > 1)
+        throw new AggregateError(
+          this.#failures,
+          `Spill files failed to close: ${String((this.#failures[0] as Error | undefined)?.message ?? this.#failures[0])} (and ${String(this.#failures.length - 1)} more)`,
+        );
     })();
-    return this.#closing;
+    return this.#closed;
   }
 }
