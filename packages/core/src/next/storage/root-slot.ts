@@ -47,15 +47,29 @@ export function decodeRootSlot(bytes: Uint8Array | null): RootSlot | null {
   };
 }
 
-/** The current root of two slots, and which slot the next publish must overwrite. */
+/**
+ * The current root of two slots, the previous one (the other slot, when valid and older), and which
+ * slot the next publish must overwrite (the previous root's).
+ */
 export function chooseRoot(
   first: Uint8Array | null,
   second: Uint8Array | null,
-): { readonly current: RootSlot | null; readonly nextSlot: 0 | 1; readonly nextSequence: number } {
+): {
+  readonly current: RootSlot | null;
+  readonly previous: RootSlot | null;
+  readonly nextSlot: 0 | 1;
+  readonly nextSequence: number;
+} {
   const a = decodeRootSlot(first);
   const b = decodeRootSlot(second);
   if (a !== null && (b === null || a.sequence > b.sequence))
-    return { current: a, nextSlot: 1, nextSequence: a.sequence + 1 };
-  if (b !== null) return { current: b, nextSlot: 0, nextSequence: b.sequence + 1 };
-  return { current: null, nextSlot: 0, nextSequence: 1 };
+    return { current: a, previous: b, nextSlot: 1, nextSequence: a.sequence + 1 };
+  if (b !== null)
+    return {
+      current: b,
+      previous: a !== null && a.sequence < b.sequence ? a : null,
+      nextSlot: 0,
+      nextSequence: b.sequence + 1,
+    };
+  return { current: null, previous: null, nextSlot: 0, nextSequence: 1 };
 }

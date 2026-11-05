@@ -29,7 +29,7 @@
  *   old chunk extents unchanged; several roots and groups may reference one extent.
  * - **Reclaim (two generations).** An extent is reusable only when neither the current durable root,
  *   nor the previous durable root (the other root slot), nor any pinned snapshot's root reaches
- *   it. Keeping the previous generation means a lost flush that rolls back to the previous root
+ *   it (storage/extents.ts, storage/reclaim.ts). Keeping the previous generation means a lost flush that rolls back to the previous root
  *   slot finds its extents intact instead of overwritten. At startup the owner walks both roots
  *   (crash orphans are simply unreachable: no job records) and maintains free space in memory
  *   after. Freed space is reused in place; only a free tail is ever released to the platform.

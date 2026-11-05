@@ -7,7 +7,7 @@
  * ```text
  *   writer = space.beginWrite("flush t7")      ─ one per intended publication
  *   b = writer.open(capacity)                  ─ reserve a contiguous extent
- *   refs = await b.append([page, page, …])     ─ blobs, back to back, checksummed by the space
+ *   refs = await b.append([page, page, …])     ─ blobs (≤ 1 MiB each), checksummed by the space
  *   chunk = await b.seal()                     ─ trim the unused tail; readable from now on
  *   …more extents, metadata blobs (writer.write(parts) = open + append + seal)…
  *   gen = await space.publish(rootBytes, { writers: [writer], retired: [...] })
@@ -15,13 +15,31 @@
  *   or: await writer.abort()                   ─ everything it reserved is free again at once
  * ```
  *
+ * ## The write path's storage dependency (lead ruling R7)
+ * The write path (access/, track B3) reaches the data space only through this interface; it gets
+ * no `readData` adapter and keeps no free map of its own:
+ * - **Reads:** `read` (leased, verified, cached, budget-charged) and `peek` (synchronous cache hit,
+ *   for the end-to-end synchronous point-read path of ruling R6). The root: `root`.
+ * - **Writes:** writers for memtable flushes, index runs, merges, catalog and ledger blobs.
+ * - **Publish:** `publish(root, { writers, retired })`, the only way a root changes. The log stays
+ *   on the session (`appendLog`, `flushLog`, `resetLog`…): the write path resets the log only after
+ *   the publish that covers it has resolved.
+ * - **Snapshots:** `pin(label)` under each access/ snapshot; `stats` for backpressure (garbage
+ *   debt, oldest pin).
+ * - **Startup** (storage/contract.ts "Startup order"): fence → session → log recovery → extent
+ *   space (walks the current and previous roots) → write path (memtable replay) → ready.
+ *
  * ## Units
  * - An **extent** (`ExtentRef`) is the unit of allocation and reclaim: a contiguous range at a
- *   `DATA_ALIGN` offset, written once, never modified while any root or pin reaches it. A column
- *   chunk is one extent (format/manifest.ts). Several blobs may share an extent (a chunk's pages,
- *   or a chunk and its page directory); they are reclaimed together.
+ *   `DATA_ALIGN` offset, written once, never modified while any kept root or pin reaches it. A
+ *   column chunk is one extent (format/manifest.ts). Several blobs may share an extent (a chunk's
+ *   pages, or a chunk and its page directory); they are reclaimed together. Extents have no size
+ *   cap.
  * - A **blob** (`BlobRef`) is a checksummed byte range inside one extent: what a reader asks for
  *   (a page, a group root, a directory). The space computes every checksum it hands out.
+ * - **Blobs are at most `MAX_BLOB_BYTES` (1 MiB, ruling R8).** A larger structure (a catalog, a
+ *   long group list, an index run's entries) is split across several blobs by its format. So every
+ *   blob fits one read slab, and no single read pins an unbounded buffer.
  *
  * ## Writer lifecycle (`ExtentWriter`)
  * - `open` → `publishing` → `published`, or `open` → `aborted`. A writer publishes once, with
@@ -37,17 +55,24 @@
  * - `retired` lists the extents the previous root reaches and the new root does not, each exactly
  *   once, as `ExtentRef`s the space handed out (any length that rounds to the same aligned size is
  *   accepted). Retiring space that is free, reserved or already retired is a `RangeError` before
- *   anything is written. Retired space is reused only when no pin of an older generation remains
- *   (`reclaim.ts`), and never before this publish is durable.
+ *   anything is written.
+ * - **Two-generation reclaim (ruling R8, reclaim.ts).** Space retired by the publish of generation
+ *   g is reused only when the *next* publish (g+1) is durable **and** no pin below g remains.
+ *   Until g+1 overwrites the other root slot, that slot holds g−1, the root a reopen falls back to
+ *   if g's slot is lost; so the current and previous roots always read intact. The cost is that
+ *   garbage waits one publish (`stats.waitingBytes`); the write path's idle maintenance publishes
+ *   when that debt matters.
  * - **A rejected publish is indeterminate**: the root may or may not be durable. The space keeps
  *   the writers' extents and the retired extents allocated, sets `failed`, and refuses further
  *   writers and publishes with `SpaceFailedError`. Reads continue. The owner reopens: a new space
- *   walks whichever root is durable and frees the rest.
+ *   walks whichever roots are durable and frees the rest.
  *
  * ## Free space
- * - Rebuilt on open from the durable root: `[0, dataLength)` minus every extent `reachable(root)`
- *   lists. Crash orphans, aborted writers and unpublished extents are simply unreachable. Two
- *   different reachable extents that overlap, or one past the data length, fail the open with
+ * - Rebuilt on open from **both kept roots**: `[0, dataLength)` minus every extent
+ *   `reachable(current)` or `reachable(previous)` lists (`StoreSession.readPreviousRoot`). Extents
+ *   only the previous root reaches are retired at generation 0 and reused after the first publish.
+ *   Crash orphans, aborted writers and unpublished extents are simply unreachable. Two different
+ *   reachable extents that overlap, or one past the data length, fail the open with
  *   `StoreCorruptionError`.
  * - Kept in memory after that (free-space.ts): lowest-address first fit, freed runs coalesced.
  *   Allocation never fails for fragmentation; it grows the data space at its end. Quota surfaces as
@@ -62,23 +87,32 @@
  * ## Reads and the cache (`ExtentReader`)
  * - One cache of **encoded, verified blobs**, keyed by exact `(offset, length, checksum)`, charged
  *   to the memory governor through its cache handle (`memory/governor.ts` `registerCache`). The
- *   governor evicts it before any grant grows or any operator spills; it has no size dial.
+ *   governor evicts it before any grant grows or any operator spills; it has no size dial. Nothing
+ *   decoded is cached here: decoded dictionaries and pages belong to the query that decoded them
+ *   (ruling R5).
  * - **Verify once.** A blob's xxHash32 is checked when its bytes come from storage; a mismatch is
  *   `StoreCorruptionError` naming the offset. Cached bytes are trusted.
- * - **Coalesced misses.** One `read` call plans its misses into slabs (slabs.ts: gaps ≤ 64 KiB,
- *   slabs ≤ 1 MiB), reads each slab with one platform call into one reused 1 MiB buffer
- *   (`readDataInto`), verifies, and copies each blob into its own exact-size buffer. A blob is never
- *   a view of a shared slab, so evicting it frees exactly its bytes.
+ * - **Bounded per call (ruling R8).** One `read` asks for at most `MAX_READ_BYTES` (4 MiB) of
+ *   blobs in total; more is a `RangeError` before any I/O (callers batch).
+ * - **Coalesced misses.** A call plans its misses into slabs (slabs.ts: gaps ≤ 64 KiB, slabs ≤
+ *   1 MiB, and a slab never exceeds 1 MiB because no blob does), reads each slab with one platform
+ *   call into one reused 1 MiB buffer (`readDataInto`), verifies, and copies each blob into its own
+ *   exact-size buffer. A blob is never a view of a shared slab, so evicting it frees exactly its
+ *   bytes.
  * - **Policy.** Segmented LRU: a blob read once enters a probation segment; a second read
  *   promotes it. A one-pass scan over a table larger than the cache churns only probation, so
  *   directories, roots, fences and hot pages stay. No hints, no dials.
- * - **Pins.** A lease pins its blobs until `release`; pinned blobs are not evictable. A blob the
- *   cache cannot admit (the governor has no room) is charged to the caller's `budget` for the
- *   lease's life. If the budget refuses too, `read` rejects with `ReadDeniedError(bytes)` and
- *   holds nothing: the caller borrows a progress loan of that size and retries.
- * - `peek` serves a cached blob synchronously, with no lease, for the warm point-read path
- *   (≤ 10 µs PK reads): the bytes are valid until the caller next yields. Cache buffers are never
- *   pooled or reused, so a peeked or leased array is never overwritten, only uncharged.
+ * - **Leases are charged to the reader (ruling R5).** Every byte a lease holds, cached or not, is
+ *   charged to the caller's `budget` (its grant) until `release`; while any lease pins a blob, the
+ *   cache does not charge it, and it is not evictable. So a slow reader's pins count against its
+ *   own grant (spillable or not), never against the cache, and are bounded by `MAX_READ_BYTES` per
+ *   call. If the budget refuses, `read` rejects with `ReadDeniedError(bytes)` and holds nothing:
+ *   the caller borrows a progress loan of that size and retries. On release, the cache charges the
+ *   blob again or drops it if the governor has no room.
+ * - `peek` serves a cached blob synchronously, with no lease and no charge, for the warm
+ *   point-read path (owner-side ≤ 10 µs, ruling R6): the bytes are valid until the caller next
+ *   yields. Cache buffers are never pooled or reused, so a peeked or leased array is never
+ *   overwritten, only uncharged.
  * - Writes go around the cache. Freeing an extent drops its cached blobs in the same step, before
  *   the space can reallocate it.
  *
@@ -97,18 +131,26 @@
  *   nothing. Writer work is cancelled by `abort`.
  * - `OwnershipLostError`, `StoreQuotaError` and `StoreCorruptionError` pass through from the
  *   session. After `OwnershipLostError` the space is `failed`.
- * - Misuse (appending past capacity, publishing an open builder, a foreign writer, using an
- *   aborted writer) is a `TypeError` or `RangeError`, thrown before any effect.
+ * - Misuse (a blob over `MAX_BLOB_BYTES`, appending past capacity, a read over `MAX_READ_BYTES`,
+ *   publishing an open builder, a foreign writer, using an aborted writer) is a `TypeError` or
+ *   `RangeError`, thrown before any effect.
  *
  * ## Both backends fit
  * Everything above goes through `StoreSession` (`writeData`, `readDataInto`, `releaseData`,
- * `publish`): OPFS runs it as synchronous handle calls; IndexedDB as staged records, one
- * transaction per call, the epoch check inside each. The space never assumes a file.
+ * `publish`, `readRoot`, `readPreviousRoot`): OPFS runs it as synchronous handle calls; IndexedDB
+ * as staged records, one transaction per call, the epoch check inside each. The space never
+ * assumes a file.
  */
 import type { StoreSession } from "./contract.js";
 import type { RootPin } from "./reclaim.js";
+import { MAX_SLAB } from "./slabs.js";
 
 export type { RootPin } from "./reclaim.js";
+
+/** The largest blob a writer accepts (one read slab). Larger structures span several blobs. */
+export const MAX_BLOB_BYTES = MAX_SLAB;
+/** The most blob bytes one `read` call may ask for (and so one lease may pin). */
+export const MAX_READ_BYTES = 4 * MAX_SLAB;
 
 /** A contiguous byte range of the data space: the unit of allocation and reclaim. */
 export interface ExtentRef {
@@ -156,26 +198,33 @@ export interface EvictableCacheLike {
 // ── Open ───────────────────────────────────────────────────────────────────────────────────────
 
 /**
- * Every extent `root` reaches, supplied by the format track. It reads metadata through `reader`
- * (verified and cached). Duplicates are fine (shared extents). It must list every extent of every
- * structure the root reaches: catalog, group directories, group roots, chunks, deletion bitmaps,
- * statistics, index runs and their fences and Bloom filters.
+ * Every extent `root` reaches, supplied by the format track. The space calls it for the current
+ * root and then the previous one (most of whose metadata the first walk already cached). It reads
+ * metadata through `reader` (verified, cached), charging its leases to `budget` (the open's
+ * `OpenSpaceOptions.budget`). Duplicates are fine (shared extents). It must list every extent of every structure the
+ * root reaches: catalog, group directories, group roots, chunks, deletion bitmaps, statistics,
+ * index runs and their fences and Bloom filters.
  */
 export type ReachableExtents = (
   root: Uint8Array,
   reader: ExtentReader,
+  budget: ByteBudget,
 ) => AsyncIterable<ExtentRef> | Iterable<ExtentRef>;
 
 export interface OpenSpaceOptions {
   readonly reachable: ReachableExtents;
+  /** Charged for the walk's leases (the owner's startup grant); `audit` uses it too. */
+  readonly budget: ByteBudget;
   /** Registers the cache with the governor and returns its handle (`governor.registerCache`). */
   readonly registerCache: (cache: EvictableCacheLike) => CacheMemory;
   readonly signal?: AbortSignal;
 }
 
 /**
- * Opens the space over a session the owner holds: reads the durable root, walks it, builds the
- * free map, returns the free tail. The walk reads O(groups + index runs) metadata, coalesced.
+ * Opens the space over a session the owner holds, after log recovery (storage/contract.ts
+ * "Startup order"): reads the current and previous roots, walks both, builds the free map, retires
+ * what only the previous root reaches (`ReclaimLedger.retireAtOpen`), returns the free tail. The
+ * walks read O(groups + index runs) metadata, coalesced. Nothing is written but the tail release.
  * Implemented in phase 2 as `openExtentSpace`.
  */
 export type OpenExtentSpace = (
@@ -186,7 +235,7 @@ export type OpenExtentSpace = (
 // ── Reading ────────────────────────────────────────────────────────────────────────────────────
 
 export interface ReadOptions {
-  /** Charged for leased bytes the cache cannot hold, until `release`. */
+  /** Charged for every byte the lease holds, cached or not, until `release` (ruling R5). */
   readonly budget: ByteBudget;
   readonly signal?: AbortSignal;
 }
@@ -201,7 +250,9 @@ export interface ReadLease {
 export interface ExtentReader {
   /**
    * Verified bytes for `refs` (any order; duplicates share one array): cache hits, then the
-   * misses in coalesced slabs. Readable: blobs of sealed extents, published or not.
+   * misses in coalesced slabs. At most `MAX_READ_BYTES` in total (`RangeError` otherwise).
+   * Readable: blobs of sealed extents, published or not, and of extents any kept root or pin
+   * reaches. `ReadDeniedError` when `budget` cannot hold the lease.
    */
   read(refs: readonly BlobRef[], options: ReadOptions): Promise<ReadLease>;
   /** A cached blob, synchronously, or null. Valid until the caller yields; never pinned. */
@@ -224,7 +275,10 @@ export interface ExtentWriter {
    * allocates. Fails only on misuse (writer not open).
    */
   open(capacity: number): ExtentBuilder;
-  /** `open(total)`, `append(parts)`, `seal()` in one call. `parts` must not be empty. */
+  /**
+   * `open(total)`, `append(parts)`, `seal()` in one call. `parts` must not be empty; each is at
+   * most `MAX_BLOB_BYTES`.
+   */
   write(parts: readonly Uint8Array[]): Promise<WrittenExtent>;
   /** Frees one of this writer's sealed extents before publication (an intermediate it dropped). */
   discard(extent: ExtentRef): Promise<void>;
@@ -244,8 +298,8 @@ export interface ExtentBuilder {
   /**
    * Places `parts` back to back after the bytes already appended and returns one checksummed ref
    * per part (absolute offsets). The caller may reuse `parts`' buffers once it resolves. A
-   * `RangeError` if they do not fit the remaining capacity (nothing is written). Refs become
-   * readable at `seal`.
+   * `RangeError` if a part exceeds `MAX_BLOB_BYTES` or they do not fit the remaining capacity
+   * (nothing is written). Refs become readable at `seal`.
    */
   append(parts: readonly Uint8Array[]): Promise<BlobRef[]>;
   /**
@@ -271,8 +325,11 @@ export interface SpaceStats {
   readonly freeBytes: number;
   /** Reserved or sealed by writers not yet published or aborted. */
   readonly writerBytes: number;
-  /** Retired but still reachable from a pinned older generation (garbage debt). */
+  /** Retired, waiting for the next publish or an older pin (garbage debt). */
   readonly waitingBytes: number;
+  readonly pinCount: number;
+  /** The longest-held pin, for backpressure diagnostics. */
+  readonly oldestPin: { readonly label: string; readonly ageMs: number } | null;
   /** Freed and being released to the platform. */
   readonly releasingBytes: number;
   readonly cache: {
@@ -289,6 +346,8 @@ export interface SpaceStats {
 export interface ExtentSpace extends ExtentReader {
   /** The durable root, or null for a new store. Replaced when a publish resolves. */
   readonly root: Uint8Array | null;
+  /** The root before it (kept intact until the next publish), or null. */
+  readonly previousRoot: Uint8Array | null;
   /** The current generation (0 at open). */
   readonly generation: number;
   /** Set when a publish was rejected or ownership was lost; writes and publishes then refuse. */
@@ -299,12 +358,15 @@ export interface ExtentSpace extends ExtentReader {
   beginWrite(label: string): ExtentWriter;
   /** Atomically and durably makes `root` current; returns its generation. See "Publish". */
   publish(root: Uint8Array, change: PublishChange): Promise<number>;
-  /** Holds the current root's extents (and so its blobs) until released. Synchronous. */
-  pin(): RootPin;
   /**
-   * Walks the current root with `reachable` and checks the free map against it: every reachable
-   * extent allocated and not waiting; every allocated extent reachable, held by a writer, waiting
-   * on a pin, or being released. Throws `Error("Extent audit: …")` naming the first difference. Tests only.
+   * Holds the current root's extents (and so its blobs) until released. Synchronous; `label`
+   * names the holder in `stats.oldestPin`.
+   */
+  pin(label?: string): RootPin;
+  /**
+   * Walks the current and previous roots with `reachable` and checks the free map against them:
+   * every extent either root reaches is allocated (the previous root's only as waiting); every
+   * allocated extent is reachable, held by a writer, waiting, or being released. Throws `Error("Extent audit: …")` naming the first difference. Tests only.
    */
   audit(): Promise<void>;
   /** Drops the cache and returns its memory. Does not close the session. Idempotent. */
@@ -320,7 +382,7 @@ export class SpaceFailedError extends Error {
   }
 }
 
-/** Neither the cache nor the caller's budget could hold a read's bytes. Borrow, then retry. */
+/** The caller's budget could not hold a read's lease. Borrow a loan of `bytes`, then retry. */
 export class ReadDeniedError extends Error {
   readonly code = "MINNOW_READ_DENIED";
   constructor(readonly bytes: number) {

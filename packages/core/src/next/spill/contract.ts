@@ -5,13 +5,16 @@
  * ## Never in the recovery path
  * - Spill state is in memory only: no root, catalog, log or checkpoint names spill space, and no
  *   spill write is flushed for durability.
- * - The space is one long-lived file per database (OPFS: `spill`, its sync handle opened at
- *   acquisition with the store's files), never deleted or created per query: browsers do not
- *   return quota on truncate (Chromium, WebKit), so space is reused inside the file. At startup,
- *   after the write path has recovered (format/manifest.ts "Startup order"), the whole file is
- *   free (`SpillService.sweep`), whatever it holds;
- *   only its free tail may be truncated. A crash, kill, cancellation or timeout mid-spill can cost
- *   disk space until the next open, never correctness or the ability to open.
+ * - The space is the backend's long-lived scratch space (`StorageBackend.scratch`, a
+ *   `ScratchSpace`): OPFS's `spill` file, its sync handle opened at acquisition with the store's
+ *   files; IndexedDB's dedicated `spill` object store (lead ruling R8), epoch-checked in every
+ *   transaction. Nothing is created or deleted per query: browsers do not return quota on truncate
+ *   (Chromium, WebKit), so space is reused inside it. At startup, after the write path has
+ *   recovered (format/manifest.ts "Startup order"), the whole space is free
+ *   (`SpillService.sweep`), whatever it holds. A crash, kill,
+ *   cancellation or timeout mid-spill can cost disk space until the next open, never correctness
+ *   or the ability to open. A fenced owner's late spill call is refused by the scratch space, so
+ *   it never lands in its successor's space.
  * - There are no per-query caps on files, pages or runs. The limits are the platform quota
  *   (`SpillQuotaError`) and the memory governor.
  *
@@ -35,14 +38,14 @@
  *   buffer; `read` returns a new array the caller must account for.
  *
  * ## Implementations
- * - `MemorySpillService` (memory-spill.ts): the test double, and the service on backends with no
- *   scratch file (IndexedDB, memory).
- * - The file service (storage track, phase 2: `spill/file-spill.ts`): one `FreeSpaceMap`
- *   (storage/free-space.ts) over the backend's scratch file (`StorageBackend.scratch`, OPFS
- *   `spill`), opened under the owner's fence. Each `SpillFile` is a list of extents; it extends
- *   its last extent in place when the space after it is free (`allocateAt`), so a run is written
- *   and read back sequentially. Writes are never flushed. `sweep` empties the map and truncates
- *   the file to zero.
+ * - The scratch service (storage track, phase 2: `spill/scratch-spill.ts`), for OPFS and
+ *   IndexedDB alike: one `FreeSpaceMap` (storage/free-space.ts) over the backend's
+ *   `ScratchSpace`. Each `SpillFile` is a list of extents; it extends its last extent in place when
+ *   the space after it is free (`allocateAt`), so a run is written and read back sequentially
+ *   (on IndexedDB, one record per batched write). Writes are never flushed. Closed files' extents
+ *   go to `ScratchSpace.release` before reuse. `sweep` empties the map and calls `truncate(0)`.
+ * - `MemorySpillService` (memory-spill.ts): the test double, and the service for the in-memory
+ *   backend only (`scratch` is null there: the whole database is already in memory).
  *
  * ## Lifetime
  * - A file belongs to one query (`queryId`). `close` frees its extents. Cancellation and errors

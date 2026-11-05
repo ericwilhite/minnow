@@ -23,11 +23,24 @@
  * - **Data space.** One long-lived byte space (OPFS: one file; IndexedDB: chunk records) in which
  *   the engine allocates extents (`DATA_ALIGN`-aligned). Space is reused in place: the engine
  *   frees an extent only when neither the current nor the previous durable root reaches it and no
- *   pin does (format/manifest.ts "Reclaim": two generations) and writes new extents there. Files are never created or deleted per object: browsers do not
+ *   pin does (format/manifest.ts "Reclaim": two generations; extents.ts) and writes new extents there. Files are never created or deleted per object: browsers do not
  *   return quota on truncate (Chromium, WebKit), and WebKit does not let IndexedDB reuse space
  *   freed by deleting OPFS files.
  * - **Log.** An append-only byte sequence with two fixed header slots. The write path appends
  *   commit frames and flushes once per commit group.
+ * - **Scratch** (`ScratchSpace`). The spill service's byte space: never flushed, never named by a
+ *   root, emptied on open. OPFS: the `spill` file. IndexedDB: a dedicated `spill` object store.
+ *
+ * ## Startup order (lead ruling R7; the ownership track drives it)
+ * 1. `acquire` the fence (Web Lock, then handles or epoch).
+ * 2. `open` the session.
+ * 3. Recover the log (format/replay.ts): scan, validate the acknowledged boundary, truncate an
+ *    invalid tail. Needs the session only.
+ * 4. Open the extent space (`extents.ts` `OpenExtentSpace`): read the current and previous roots,
+ *    walk both, build the free map, start the cache.
+ * 5. Open the write path over the extent space and the session (memtable replay, ledger).
+ * 6. Sweep the scratch space (`SpillService.sweep`), then serve requests.
+ * Every later step depends on the earlier ones; nothing writes the data space before step 4.
  *
  * ## Calls
  * Every mutating call is async and checks ownership in the same synchronous step that applies
@@ -105,6 +118,26 @@ export interface SyncFile {
   close(): void;
 }
 
+/**
+ * The spill service's byte space. Nothing in it is durable or recovered: writes are never flushed,
+ * and a crash leaves garbage that the next owner's sweep (`truncate(0)`) discards. Every call
+ * checks ownership like a store mutation (`OwnershipLostError`), so a fenced owner's late spill
+ * write can never land in its successor's scratch space. Quota is `StoreQuotaError`.
+ * - OPFS: synchronous calls on the open `spill` sync handle.
+ * - IndexedDB: records in the `spill` object store keyed by extent offset (ArrayBuffers), one
+ *   transaction per call with the epoch check inside it.
+ */
+export interface ScratchSpace {
+  /** Writes `bytes` at `offset` (a multiple of `DATA_ALIGN`). */
+  write(offset: number, bytes: Uint8Array): Promise<void>;
+  /** Reads exactly `target.length` bytes written at `offset`; `StoreCorruptionError` past the end. */
+  readInto(offset: number, target: Uint8Array): Promise<void>;
+  /** Space the spill service freed (IndexedDB deletes the records; OPFS returns a free tail). */
+  release(ranges: readonly DataRange[]): Promise<void>;
+  /** Drops everything at or past `size`. The sweep on open is `truncate(0)`. */
+  truncate(size: number): Promise<void>;
+}
+
 export interface DataRange {
   readonly offset: number;
   readonly length: number;
@@ -132,11 +165,11 @@ export interface StorageBackend {
   /** A session over the store, valid while `lease` is held. */
   open(lease: OwnerLease): Promise<StoreSession>;
   /**
-   * The engine's scratch file for the spill service (OPFS: `spill`, opened under the same fence at
-   * acquisition and closed with the lease), or null when the backend has none (IndexedDB, memory:
-   * the owner uses the in-memory spill service). Its contents mean nothing across leases.
+   * The spill service's scratch space under this lease (OPFS: the `spill` file, opened under the
+   * same fence at acquisition; IndexedDB: the `spill` object store, epoch-checked in every
+   * transaction), or null for the in-memory backend. Its contents mean nothing across leases.
    */
-  scratch(lease: OwnerLease): SyncFile | null;
+  scratch(lease: OwnerLease): ScratchSpace | null;
 }
 
 export interface StoreSession {
@@ -145,8 +178,11 @@ export interface StoreSession {
   /** The durable root, or null for a new store. */
   readRoot(): Promise<Uint8Array | null>;
   /**
-   * The previous durable root (the one the current replaced), or null if none survives. Startup
-   * walks both: extents either reaches are not free (format/manifest.ts "Reclaim").
+   * The previous durable root (the one the current replaced): the other root slot's root when that
+   * slot is valid and older, else null (a new store, one publish only, or a slot torn by an
+   * interrupted publish). A reopen falls back to it if the current root's slot is lost, so startup
+   * walks both and the extent space keeps the extents either reaches until the next publish is
+   * durable (format/manifest.ts "Reclaim": two generations).
    */
   readPreviousRoot(): Promise<Uint8Array | null>;
   /** Guarantee 1. */

@@ -312,16 +312,24 @@ describe("two-slot root publication", () => {
   });
 
   it("chooses the newest valid slot and overwrites the other", () => {
-    expect(chooseRoot(null, null)).toEqual({ current: null, nextSlot: 0, nextSequence: 1 });
+    expect(chooseRoot(null, null)).toEqual({
+      current: null,
+      previous: null,
+      nextSlot: 0,
+      nextSequence: 1,
+    });
     const one = encodeRootSlot(1, root("one"));
     const two = encodeRootSlot(2, root("two"));
     expect(chooseRoot(one, null)).toMatchObject({ nextSlot: 1, nextSequence: 2 });
     expect(chooseRoot(one, two).current?.root).toEqual(root("two"));
     expect(chooseRoot(one, two).nextSlot).toBe(0);
+    expect(chooseRoot(one, two).previous?.root).toEqual(root("one"));
+    expect(chooseRoot(two, one).previous?.root).toEqual(root("one"));
     // A torn write of the next root leaves the previous one current.
     const torn = encodeRootSlot(3, root("three")).slice(0, 10);
     expect(chooseRoot(torn, two).current?.sequence).toBe(2);
     expect(chooseRoot(torn, two).nextSlot).toBe(0);
+    expect(chooseRoot(torn, two).previous).toBeNull();
   });
 });
 

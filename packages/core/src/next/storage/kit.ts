@@ -64,6 +64,16 @@ async function open(backend: StorageBackend): Promise<StoreSession> {
   return backend.open(await backend.acquire({ timeoutMs: 2_000 }));
 }
 
+/** A workload root names one extent; it must be present and match its checksum. */
+async function verifyRoot(session: StoreSession, root: string, label: string): Promise<void> {
+  const ref = JSON.parse(root) as { offset: number; length: number; checksum: number };
+  if (ref.offset + ref.length > (await session.dataLength()))
+    fail(`${label}: a published extent is missing`);
+  const [bytes] = await session.readData([ref]);
+  if (bytes === undefined || xxHash32(bytes) !== ref.checksum)
+    fail(`${label}: a published extent does not match its checksum`);
+}
+
 /** Runs conformance and the durability sweep; throws on the first failure. */
 export async function runStorageKit(
   createOverDisk: (disk: SimDisk) => StorageBackend,
@@ -102,14 +112,16 @@ export async function runStorageKit(
       const allowed = [acknowledged.published.at(-1) ?? null, acknowledged.inFlight];
       if (!allowed.includes(root))
         fail(`${label}: root ${String(root)} is not the last published or in-flight one`);
-      if (root !== null) {
-        const ref = JSON.parse(root) as { offset: number; length: number; checksum: number };
-        if (ref.offset + ref.length > (await session.dataLength()))
-          fail(`${label}: a published extent is missing`);
-        const [bytes] = await session.readData([ref]);
-        if (bytes === undefined || xxHash32(bytes) !== ref.checksum)
-          fail(`${label}: a published extent does not match its checksum`);
-      }
+      if (root !== null) await verifyRoot(session, root, label);
+      // The previous root (two-generation reclaim): the root before the current one, or none; the
+      // workload rotates three extent offsets, so its extent is never overwritten while it is kept.
+      const previousBytes = await session.readPreviousRoot();
+      const previous = previousBytes === null ? null : new TextDecoder().decode(previousBytes);
+      const history = [...acknowledged.published, acknowledged.inFlight];
+      const before = root === null ? null : (history[history.indexOf(root) - 1] ?? null);
+      if (previous !== null && previous !== before)
+        fail(`${label}: previous root ${previous} is not the one before ${String(root)}`);
+      if (previous !== null) await verifyRoot(session, previous, `${label} (previous root)`);
       // Guarantee 3: every log byte acknowledged by a flush is there.
       const flushed = acknowledged.logBytes;
       if (session.logLength() < flushed.length)

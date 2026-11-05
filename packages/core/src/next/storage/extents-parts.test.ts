@@ -1,6 +1,6 @@
 /**
- * The behaviour under the extent space's interface (extents.ts): the free map, deferred reclaim
- * under pins, and read coalescing. The space itself arrives in phase 2.
+ * The behaviour under the extent space's interface (extents.ts): the free map, two-generation
+ * reclaim under pins, and read coalescing. The space itself arrives in phase 2.
  */
 import { describe, expect, it } from "vitest";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
@@ -117,43 +117,69 @@ describe("free space map", () => {
   );
 });
 
-describe("reclaim ledger", () => {
-  it("frees retired space at once when nothing older is pinned", () => {
+describe("reclaim ledger (two-generation reclaim, ruling R8)", () => {
+  it("keeps retired space until the next publish is durable, even with no pins", () => {
     const freed: string[][] = [];
     const ledger = new ReclaimLedger<string>((items) => freed.push([...items]));
-    const current = ledger.pin();
     expect(ledger.advance(["a"])).toBe(1);
-    // The pin of generation 0 still reaches "a".
+    // Generation 0's root is still in the other slot: a reopen may fall back to it.
     expect(freed).toEqual([]);
     expect(ledger.waiting).toBe(1);
-    current.release();
-    current.release();
+    expect(ledger.advance([])).toBe(2);
     expect(freed).toEqual([["a"]]);
-    const newest = ledger.pin();
-    expect(newest.generation).toBe(1);
-    ledger.advance(["b"]);
-    newest.release();
-    expect(freed).toEqual([["a"], ["b"]]);
   });
 
-  it("holds each retirement until every pin older than its generation is gone", () => {
+  it("also waits for every pin older than the retiring generation", () => {
     const freed: string[] = [];
     const ledger = new ReclaimLedger<string>((items) => freed.push(...items));
-    const zero = ledger.pin();
+    const zero = ledger.pin("query 1");
     ledger.advance(["x"]);
-    const one = ledger.pin();
+    const one = ledger.pin("query 2");
     ledger.advance(["y"]);
-    const two = ledger.pin();
+    const two = ledger.pin("merge");
     ledger.advance(["z"]);
+    ledger.advance([]);
     expect(ledger.oldestPinned).toBe(0);
+    one.release();
     one.release();
     expect(freed).toEqual([]);
     zero.release();
-    // x (retired by 1) and y (retired by 2) are free; z waits for the pin of generation 2.
+    // x (retired by 1) and y (retired by 2) are free; z (retired by 3) waits for the pin of 2.
     expect(freed).toEqual(["x", "y"]);
     two.release();
     expect(freed).toEqual(["x", "y", "z"]);
     expect(ledger.pinCount).toBe(0);
+    expect(ledger.waiting).toBe(0);
+  });
+
+  it("holds what only the previous root reaches at open until the first publish", () => {
+    const freed: string[] = [];
+    const ledger = new ReclaimLedger<string>((items) => freed.push(...items));
+    ledger.retireAtOpen(["previous only"]);
+    const pin = ledger.pin();
+    expect(freed).toEqual([]);
+    ledger.advance([]);
+    // A pin of the current root never reaches the previous root's extents.
+    expect(freed).toEqual(["previous only"]);
+    pin.release();
+    expect(() => ledger.retireAtOpen(["late"])).toThrow(TypeError);
+  });
+
+  it("reports the oldest live pin for backpressure", () => {
+    let now = 1_000;
+    const ledger = new ReclaimLedger<string>(
+      () => undefined,
+      () => now,
+    );
+    expect(ledger.oldestPin).toBeNull();
+    const first = ledger.pin("slow reader");
+    now = 1_500;
+    ledger.advance([]);
+    ledger.pin("fresh");
+    now = 2_000;
+    expect(ledger.oldestPin).toEqual({ label: "slow reader", ageMs: 1_000 });
+    first.release();
+    expect(ledger.oldestPin).toEqual({ label: "fresh", ageMs: 500 });
   });
 });
 
@@ -170,6 +196,32 @@ describe("read coalescing", () => {
       { offset: 300_000, length: 10, members: [0] },
     ]);
   });
+
+  it.each(seedsFor("next-slabs", [0x51ab, 3]))(
+    "covers every range with exactly one slab of at most MAX_SLAB when no range is longer (seed %i)",
+    (seed) => {
+      const random = mulberry32(seed);
+      for (let round = 0; round < 200; round++) {
+        const ranges = Array.from({ length: 1 + Math.floor(random() * 40) }, () => ({
+          offset: Math.floor(random() * 8 * MAX_SLAB),
+          length: Math.floor(random() * (random() < 0.1 ? MAX_SLAB + 1 : 64 * 1024)),
+        }));
+        const slabs = planSlabs(ranges);
+        const covered = new Array<number>(ranges.length).fill(0);
+        for (const slab of slabs) {
+          expect(slab.length).toBeLessThanOrEqual(MAX_SLAB);
+          for (const member of slab.members) {
+            const range = ranges[member];
+            if (range === undefined) throw new Error("bad member");
+            expect(range.offset).toBeGreaterThanOrEqual(slab.offset);
+            expect(range.offset + range.length).toBeLessThanOrEqual(slab.offset + slab.length);
+            covered[member] = (covered[member] ?? 0) + 1;
+          }
+        }
+        expect(covered.every((count) => count === 1)).toBe(true);
+      }
+    },
+  );
 
   it("bounds a slab at MAX_SLAB, and reads a longer range alone", () => {
     const pages = Array.from({ length: 80 }, (_, index) => ({

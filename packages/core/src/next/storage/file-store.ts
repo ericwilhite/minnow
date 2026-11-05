@@ -11,13 +11,14 @@
  * Publication order (guarantee 1): flush the data file; write the inactive root slot; flush it.
  * A torn slot fails its checksum and the other slot, the previous root, stays current.
  */
-import { chooseRoot, decodeRootSlot, encodeRootSlot } from "./root-slot.js";
+import { chooseRoot, encodeRootSlot } from "./root-slot.js";
 import {
   DATA_ALIGN,
   LOG_HEADER_SLOT_BYTES,
   StoreClosedError,
   StoreCorruptionError,
   type DataRange,
+  type ScratchSpace,
   type StoreSession,
   type SyncFile,
 } from "./contract.js";
@@ -87,13 +88,7 @@ export class FileStoreSession implements StoreSession {
   }
 
   async readPreviousRoot(): Promise<Uint8Array | null> {
-    const [first, second] = this.#live().roots.map((file) => readExact(file, 0, file.getSize()));
-    const current = this.#chooseRoot().current;
-    for (const bytes of [first ?? null, second ?? null]) {
-      const slot = decodeRootSlot(bytes);
-      if (slot !== null && current !== null && slot.sequence < current.sequence) return slot.root;
-    }
-    return null;
+    return this.#chooseRoot().previous?.root ?? null;
   }
 
   #chooseRoot() {
@@ -217,5 +212,47 @@ export class FileStoreSession implements StoreSession {
 
   async close(): Promise<void> {
     this.#closed = true;
+  }
+}
+
+/**
+ * The scratch space over one sync handle (OPFS `spill`, or a simulated file). `guard` is the
+ * lease's ownership check, run before every call touches the handle, so a fenced owner gets
+ * `OwnershipLostError` rather than the closed handle's `InvalidStateError`.
+ */
+export class FileScratch implements ScratchSpace {
+  readonly #file: SyncFile;
+  readonly #guard: () => void;
+
+  constructor(file: SyncFile, guard: () => void) {
+    this.#file = file;
+    this.#guard = guard;
+  }
+
+  async write(offset: number, bytes: Uint8Array): Promise<void> {
+    if (offset % DATA_ALIGN !== 0 || offset < 0) throw new RangeError("Unaligned scratch extent");
+    this.#guard();
+    writeAll(this.#file, bytes, offset);
+  }
+
+  async readInto(offset: number, target: Uint8Array): Promise<void> {
+    this.#guard();
+    if (offset < 0 || offset + target.length > this.#file.getSize())
+      throw new StoreCorruptionError("Read outside the scratch space");
+    readFully(this.#file, offset, target);
+  }
+
+  async release(ranges: readonly DataRange[]): Promise<void> {
+    this.#guard();
+    // Only a free tail can be returned; interior space is reused by the spill service's map.
+    let size = this.#file.getSize();
+    for (const range of [...ranges].sort((a, b) => b.offset - a.offset))
+      if (range.offset + range.length >= size && range.offset < size) size = range.offset;
+    if (size < this.#file.getSize()) this.#file.truncate(size);
+  }
+
+  async truncate(size: number): Promise<void> {
+    this.#guard();
+    if (size < this.#file.getSize()) this.#file.truncate(size);
   }
 }

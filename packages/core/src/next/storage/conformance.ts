@@ -152,7 +152,7 @@ export const storeConformanceCases: readonly ConformanceCase[] = [
     },
   },
   {
-    name: "the scratch file, when there is one, is fenced with the store",
+    name: "the scratch space reads back its writes and is fenced with the store",
     async run(createBackend) {
       const backend = await createBackend();
       const first = await owner(backend);
@@ -161,16 +161,51 @@ export const storeConformanceCases: readonly ConformanceCase[] = [
         await first.lease.release();
         return;
       }
-      scratch.write(bytes(7), { at: 0 });
-      const second = await backend.acquire({ steal: true, timeoutMs: 2_000 });
+      await scratch.write(DATA_ALIGN, bytes(7, 8, 9));
+      const back = new Uint8Array(2);
+      await scratch.readInto(DATA_ALIGN + 1, back);
+      assert(equal(back, bytes(8, 9)), "scratch bytes read back");
       await rejects(
-        () => scratch.write(bytes(8), { at: 0 }),
-        Error,
-        "the lost owner's scratch handle is closed",
+        () => scratch.readInto(DATA_ALIGN + 2, new Uint8Array(2)),
+        StoreCorruptionError,
+        "a scratch read past the end",
       );
-      assert(backend.scratch(second) !== null, "the new owner has the scratch file");
+      await rejects(() => scratch.write(3, bytes(1)), RangeError, "an unaligned scratch write");
+      const second = await backend.acquire({ steal: true, timeoutMs: 2_000 });
+      const successor = backend.scratch(second);
+      assert(successor !== null, "the new owner has the scratch space");
+      await successor.truncate(0);
+      for (const [name, action] of [
+        ["write", () => scratch.write(0, bytes(1))],
+        ["readInto", () => scratch.readInto(0, new Uint8Array(1))],
+        ["release", () => scratch.release([{ offset: 0, length: DATA_ALIGN }])],
+        ["truncate", () => scratch.truncate(0)],
+      ] as const)
+        await rejects(action, OwnershipLostError, `fenced scratch ${name}`);
+      await successor.write(0, bytes(5));
+      const mine = new Uint8Array(1);
+      await successor.readInto(0, mine);
+      assert(equal(mine, bytes(5)), "the successor's scratch is its own");
       await second.release();
       await first.lease.release();
+    },
+  },
+  {
+    name: "the previous root is the one before the current, and survives reacquiring",
+    async run(createBackend) {
+      const backend = await createBackend();
+      const first = await owner(backend);
+      assert((await first.session.readPreviousRoot()) === null, "a new store has none");
+      await first.session.publish(bytes(1));
+      assert((await first.session.readPreviousRoot()) === null, "one publish has none");
+      await first.session.publish(bytes(2));
+      await first.session.publish(bytes(3));
+      assert(equal(await first.session.readPreviousRoot(), bytes(2)), "the root before");
+      await first.lease.release();
+      const second = await owner(backend);
+      assert(equal(await second.session.readRoot(), bytes(3)), "current survives");
+      assert(equal(await second.session.readPreviousRoot(), bytes(2)), "previous survives");
+      await second.lease.release();
     },
   },
   {

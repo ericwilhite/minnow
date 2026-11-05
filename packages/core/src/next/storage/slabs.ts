@@ -5,9 +5,13 @@
  * A platform read costs a fixed ~15–80 µs warm and ~240–320 µs cold (storage probe, 16–32 KiB),
  * against ~1.5 µs per KiB of sequential bandwidth. So ranges are sorted and merged into one slab
  * while the gap between them is at most `MAX_SLAB_GAP` (64 KiB: about the cost of one extra call)
- * and the slab stays within `MAX_SLAB` (1 MiB). A range longer than `MAX_SLAB` is a slab of its
- * own. A 3-of-200-column scan therefore reads its columns' extents and never the 197 others
- * between them, which are far more than 64 KiB away.
+ * and the slab stays within `MAX_SLAB` (1 MiB). A 3-of-200-column scan therefore reads its
+ * columns' extents and never the 197 others between them, which are far more than 64 KiB away.
+ *
+ * **Every slab is at most `MAX_SLAB` when every range is.** The extent space's ranges always are
+ * (blobs are capped at `MAX_BLOB_BYTES` = `MAX_SLAB`, extents.ts), so its misses always fit its one
+ * reused 1 MiB slab buffer. Only the session's raw `readData` may pass a longer range (the storage
+ * kit reads a whole extent); such a range is read alone, as its own slab.
  */
 import type { DataRange } from "./contract.js";
 

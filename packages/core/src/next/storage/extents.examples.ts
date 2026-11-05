@@ -14,24 +14,36 @@ import {
   type ReachableExtents,
 } from "./extents.js";
 
-/** Ownership track: open the space once the lease and session are held. */
-export async function openSpace(
+/**
+ * Ownership track: the startup order (storage/contract.ts "Startup order", ruling R7). The
+ * callbacks stand in for the other tracks' entry points.
+ */
+export async function startOwner(
+  acquireAndOpen: () => Promise<StoreSession>,
+  recoverLog: (session: StoreSession) => Promise<void>,
   openExtentSpace: OpenExtentSpace,
-  session: StoreSession,
   governor: { registerCache: Parameters<OpenExtentSpace>[1]["registerCache"] },
+  startupGrant: ByteBudget,
   reachable: ReachableExtents,
+  openWritePath: (space: ExtentSpace, session: StoreSession) => Promise<void>,
+  sweepSpill: () => Promise<void>,
 ): Promise<ExtentSpace> {
-  // The walk frees every crash orphan; nothing else is swept.
-  return openExtentSpace(session, {
+  const session = await acquireAndOpen(); // 1–2: fence, then session
+  await recoverLog(session); // 3: scan and truncate the log; no data-space writes yet
+  // 4: walk the current and previous roots; every crash orphan is free, nothing else is swept.
+  const space = await openExtentSpace(session, {
     reachable,
+    budget: startupGrant,
     registerCache: (cache) => governor.registerCache(cache),
   });
+  await openWritePath(space, session); // 5: memtable replay over the space
+  await sweepSpill(); // 6: then serve requests
+  return space;
 }
 
 /** Format track: `reachable` walks the root through the space's verified, cached reader. */
-export const reachableExample: ReachableExtents = async function* (root, reader) {
+export const reachableExample: ReachableExtents = async function* (root, reader, budget) {
   const groupDirectories: BlobRef[] = decodeRootGroupDirectories(root);
-  const budget: ByteBudget = { allocate: () => true, free: () => undefined };
   for (const directory of groupDirectories) {
     yield extentOf(directory);
     const lease = await reader.read([directory], { budget });
@@ -46,7 +58,8 @@ export const reachableExample: ReachableExtents = async function* (root, reader)
 /**
  * Write path + format: a memtable flush writes one group (a chunk extent per column holding its
  * pages and then its page directory), a group root, and a new groups list, then publishes a root
- * that names them and retires the old groups list.
+ * that names them and retires the old groups list. Every part is ≤ MAX_BLOB_BYTES (1 MiB): a
+ * longer groups list would be split across several blobs.
  */
 export async function flushGroup(
   space: ExtentSpace,
@@ -89,7 +102,7 @@ export async function mergeGroups(
   budget: ByteBudget,
   signal: AbortSignal,
 ): Promise<void> {
-  const pin = space.pin();
+  const pin = space.pin("merge table 7");
   const writer = space.beginWrite("merge table 7");
   try {
     const lease = await space.read(inputPages, { budget, signal });
@@ -106,14 +119,16 @@ export async function mergeGroups(
     if (writer.state === "open") await writer.abort();
     throw error;
   } finally {
-    // The inputs become reusable once this (the last older pin) is released.
+    // The inputs become reusable once this (the last older pin) is released and the next publish
+    // after this one is durable (two-generation reclaim).
     pin.release();
   }
 }
 
 /**
- * Executor: decode pages under the operator's grant; on `ReadDeniedError` borrow a progress loan
- * of the missing size and retry once.
+ * Executor (through access/ snapshots): decode pages under the operator's grant, which is charged
+ * for every leased byte until release; on `ReadDeniedError` borrow a progress loan of that size and
+ * retry once. A batch's pages stay under MAX_READ_BYTES per call.
  */
 export async function decodePages(
   space: ExtentSpace,
@@ -142,7 +157,7 @@ export async function decodePages(
   }
 }
 
-/** Key index: a warm point read stays synchronous; a miss falls back to `read`. */
+/** Key index: a warm point read stays synchronous end to end (ruling R6); a miss falls back to `read`. */
 export async function lookupFence(
   space: ExtentSpace,
   fences: BlobRef,

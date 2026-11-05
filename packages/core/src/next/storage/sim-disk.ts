@@ -22,12 +22,13 @@
  * IndexedDB transaction semantics. These states are a subset of what the contract allows; the
  * contract's guarantee 4 is wider (any byte may revert independently).
  */
-import { FileStoreSession, FILE_NAMES, type FileSet } from "./file-store.js";
+import { FileScratch, FileStoreSession, FILE_NAMES, type FileSet } from "./file-store.js";
 import { acquireFenced, type HeldLock, type LockManagerLike } from "./fence.js";
 import {
   OwnershipLostError,
   type AcquireOptions,
   type OwnerLease,
+  type ScratchSpace,
   type StorageBackend,
   type StoreSession,
   type SyncFile,
@@ -464,11 +465,13 @@ export class SimBackend implements StorageBackend {
     });
   }
 
-  scratch(lease: OwnerLease): SyncFile | null {
+  /** The `spill` file under the lease's guard: the handle fence, or the epoch check (IndexedDB). */
+  scratch(lease: OwnerLease): ScratchSpace | null {
     if (!(lease instanceof SimLease) || !this.#leases.has(lease))
       throw new TypeError("The lease was not acquired from this backend");
-    // Only an exclusive handle fences a scratch file; the epoch model (IndexedDB) has none.
-    return this.fence === "handle" ? lease.scratch : null;
+    return new FileScratch(lease.scratch, () => {
+      lease.guard();
+    });
   }
 
   /** Process restart after `disk.powerLoss()`: every lock holder is gone. */
