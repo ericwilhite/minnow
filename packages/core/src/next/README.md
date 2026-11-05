@@ -27,8 +27,9 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | `memory/`          | executor                         | Memory governor: admission, progress loans, held vs allocated bytes (reference implementation)                                                                                               |
 | `exec/`            | executor                         | Push protocol and driver (`pipeline.ts`), row fetcher (`fetch.ts`), array/JSONB comparators (`semantic.ts`), scale-partitioned decimal SUM (`decimal-sum.ts`); kernels and operators to come |
 | `ir/`              | lowering, executor               | Operator IR (`ir.ts`); the front-end boundary (`lowering.ts`)                                                                                                                                |
+| `access/` | write path + key index | Storage access contracts the write path implements: snapshots and segments, catalog, key-index probes and ranges, `modify` (rows, conflicts, RETURNING), transactions, group commit, sequences, delivery |
 | `testing/`         | all                              | Differential-harness adapter for a partial new core                                                                                                                                          |
-| `write/` (to come) | write path + key index           | Group commit, memtables, key index runs, maintenance                                                                                                                                         |
+| `write/` (to come) | write path + key index | Group commit, memtables, key index runs, maintenance (implements `access/`) |
 | `lower/` (to come) | planner lowering                 | `Lowerer`, cost model, statistics                                                                                                                                                            |
 | `owner/` (to come) | ownership                        | Web Lock election, client protocol, step-down, composition root                                                                                                                              |
 
@@ -59,6 +60,7 @@ Merge note: `SnapshotReleasedError` and the snapshot type move to `next/access/`
   types/temporal ← vector ← memory ← exec
   types, hash, vector ← keys ← exec, write
   hash ← storage ← format ← write
+  vector, keys, storage, format, memory ← access ← exec, write, lower
   hash ← spill ← exec;  vector ← ir ← lower
   owner ← everything;  testing ← everything
   ```
@@ -177,6 +179,31 @@ Merge note: `SnapshotReleasedError` and the snapshot type move to `next/access/`
   current and previous roots) → open the write path (a single log scan and replay, `publishedRows`
   staging included) → spill sweep → ready.
 - Snapshot pins live in memory and are dropped when their client's lock is released.
+
+### Storage access (`access/`)
+
+The write path implements these; the executor, lowering and the owner consume them.
+
+- **One writer at a time.** `begin()` hands out the writer slot in FIFO order, so transactions never
+  conflict. Readers never take it.
+- **Visibility is one comparison.** Every in-memory change has a `seq`: its commit LSN, or
+  `PENDING_BASE + statement` while its transaction is open. A view sees `seq ≤ bound`. A read
+  snapshot's bound is an LSN; a statement view sees earlier statements of its transaction, never
+  its own.
+- **Strict reads see only durable commits.** Nothing reaches a client before every commit its view
+  observed is durable (`durable(observedLsn)`).
+- **Pins are O(1) and in memory.** A snapshot pins a root plus memtables. Its segments (groups, then
+  memtables) define locators. What a pin retains is write-path memory, reported as debt.
+- **Indexes resolve by tombstones.** Entries are `(key, rowId, put | tombstone)` in layers, newest
+  first. A delete tombstones every index, so a lookup never reads a deletion bitmap
+  (`resolveVersions`).
+- **The executor evaluates, the write path enforces.** Expressions, casts, defaults, generated
+  columns, CHECK (through `TableRules`) and RETURNING belong to the executor. NOT NULL, unique,
+  foreign keys and their actions, and "row affected twice" belong to the write path. Unique and
+  foreign keys are checked at `Statement.end()`; ON CONFLICT probes immediately.
+- **Statements are atomic.** After any error the only call is `rollback()`, which undoes the
+  statement.
+- **A failed flush fails the write path.** Close and reopen; the ledger answers retries.
 
 ### Spill (`spill/`)
 
