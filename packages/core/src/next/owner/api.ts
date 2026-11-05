@@ -25,7 +25,8 @@
  * - Open transactions and cursors cannot move: they fail with `SessionLostError` (nothing took
  *   effect). A retried write whose RETURNING rows were lost fails with
  *   `CommittedWithoutResultError` (it did commit).
- * - A frozen owner fails calls with `OwnerUnresponsiveError` after `unresponsiveAfterMs`.
+ * - A frozen owner fails reads with `OwnerUnresponsiveError` after `unresponsiveAfterMs`, and
+ *   writes in flight with `OutcomeUnknownError { reason: "unresponsive" }`: they may still commit.
  */
 import type { PhysicalType } from "../types.js";
 import type { Int128Values, Int64Values, WideCoefficients } from "../vector/vector.js";
@@ -115,6 +116,10 @@ export type ColumnView =
       readonly kind: "text" | "json" | "enum" | "bytes" | "array";
       readonly encoding: "dictionary";
       readonly codes: Int32Array;
+      /**
+       * The stream's dictionary as of this chunk (frame.ts `StreamDictionaries`): a later chunk of
+       * the same result may see more entries, never different ones.
+       */
       readonly dictionary: { readonly bytes: Uint8Array; readonly offsets: Int32Array };
       readonly validity: ValidityBytes | null;
     }
@@ -159,13 +164,17 @@ export interface CallOptions {
 export interface CursorOptions extends CallOptions {
   /** At most this many rows per yielded result; defaults to the byte-bounded batch. */
   readonly frameRows?: number;
-  /** Frames buffered ahead of the consumer (credits). Defaults to `DEFAULT_CURSOR_CREDITS`. */
-  readonly prefetch?: number;
+  /**
+   * Result bytes the owner may send ahead of the consumer (the stream's window). Defaults to
+   * `DEFAULT_RESULT_WINDOW_BYTES` (two ~1 MiB frames). A frame is released to the owner when the
+   * iterator hands it out, so this bounds both the owner's charge and this client's backlog.
+   */
+  readonly prefetchBytes?: number;
 }
 
 /**
  * Rows streamed one frame at a time, with backpressure: the owner sends a frame only when the
- * consumer has credit for it. Holds a snapshot pin until it ends; `return()` (a `break` in
+ * consumer's window has room for it. Holds a snapshot pin until it ends; `return()` (a `break` in
  * `for await`) or `close()` releases it.
  */
 export interface Cursor<TRow = Row> extends AsyncIterableIterator<Result<TRow>> {
@@ -209,8 +218,10 @@ export interface PreparedStatement {
 export type WriteInput = ReadonlyArray<Readonly<Record<string, Param>>> | ColumnarInput;
 
 /**
- * Columns by name. Typed arrays are sent without encoding: transferred (and detached here) when
- * `transfer` is true, cloned otherwise. Plain arrays are encoded by the client.
+ * Columns by name. Typed arrays are sent without encoding, plain arrays are encoded by the
+ * client. Input is structured-cloned, never transferred: the caller's arrays stay usable, and the
+ * client keeps the clone source until the reply so it can resend the write after a reconnect
+ * (ruling R9). Do not mutate them until the call settles.
  */
 export interface ColumnarInput {
   readonly columns: Readonly<
@@ -226,7 +237,6 @@ export interface ColumnarInput {
         }
     >
   >;
-  readonly transfer?: boolean;
 }
 
 export interface WriteOptions extends CallOptions {
@@ -270,10 +280,17 @@ export interface ClientOptions {
   /** The database name: one owner per name per origin. */
   readonly database: string;
   /**
-   * Starts this page's owner worker when it wins the election (`@minnowdb/core/owner-worker`).
-   * Omitted in contexts that never host (workers): they always reach a host in another page.
+   * In a page: starts this page's owner worker when it wins the election
+   * (`@minnowdb/core/owner-worker`). Without it the page never hosts.
    */
   readonly ownerWorker?: () => Worker;
+  /**
+   * In a dedicated worker: run the owner in this worker when it wins the election (ruling R9).
+   * The page that created the worker should relay its lifecycle (`relayLifecycle(worker)`, which
+   * posts election.ts `LifecycleRelay` messages); without it this worker keeps the store until it
+   * ends, even while its page sits in bfcache.
+   */
+  readonly hostInPlace?: boolean;
   /** Defaults to the SharedWorker broker shipped with the package. */
   readonly broker?: Broker;
   /** Owner settings, applied when this page hosts. */
@@ -306,6 +323,12 @@ export interface MinnowClient extends SqlExecutor {
   /** Waits for in-flight calls, then says `bye`; steps this page down if it hosts. */
   close(): Promise<void>;
 }
+
+/**
+ * Relays the page's lifecycle events to a dedicated worker created with `hostInPlace`
+ * (election.ts `LifecycleRelay`). Returns a function that stops relaying. Implemented in Phase 2.
+ */
+export type RelayLifecycle = (worker: Worker) => () => void;
 
 /** Column metadata as the client keeps it (protocol.ts `WireColumnMeta` → `ResultColumn`). */
 export const resultColumn = (meta: WireColumnMeta): ResultColumn => ({

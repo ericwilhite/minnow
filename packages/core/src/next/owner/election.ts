@@ -7,9 +7,12 @@
  * | Name                         | Held by                                     | While                        |
  * | ---------------------------- | ------------------------------------------- | ---------------------------- |
  * | `minnow:<db>`                | the owner worker (`storage/fence.ts`)       | it holds the store's handles |
- * | `minnow:<db>:host`           | the context that started the owner worker   | that worker runs             |
+ * | `minnow:<db>:host`           | the host: the context running the owner     | the owner runs               |
  * | `minnow:<db>:client:<id>`    | a client                                    | it has pins or `live` requests |
  *
+ * - Hosts (`canHost`): a page, which starts a dedicated owner worker (the package's owner entry),
+ *   or a dedicated worker, which runs the owner **in place** (sync access handles exist only in
+ *   dedicated workers). SharedWorkers never host; they only broker.
  * - The fence lock is taken inside the owner worker so it frees when the worker dies. The handle,
  *   not the lock, is the fence: the lock frees 2 ms–2 s before the handle, so the successor opens
  *   with bounded retry (`acquireFenced`), and a frozen owner blocks takeover until it thaws or is
@@ -43,15 +46,24 @@
  *   round trip, probe table 3).
  *
  * ## Step-down (`lifecycleAction`)
- * - `freeze` and `pagehide`: the host terminates its owner worker at once. Terminating frees the
- *   handle in 5–40 ms; a page in bfcache would otherwise keep it (Firefox, verified) or lose only
- *   the lock (Safari). Strict commits are durable before they are acknowledged; relaxed commits
- *   acknowledged within the idle-flush window may be lost, as on power loss. Clients resend
- *   unanswered requests to the next owner (exactly-once through the ledger).
+ * Workers get no lifecycle events (probe table 4). A page host sees them itself; a worker hosting
+ * in place gets them relayed by the page that created it (`LifecycleRelay`, a message the client
+ * package sends for the app). Without a relay an in-place host never steps down early: it holds
+ * the store until its worker ends, documented as the cost of hosting without a relay.
+ * - `hidden` on desktop: `flush`: the owner calls `engine.flushPending()` (one flush, ~4 ms), so a
+ *   later freeze or pagehide loses at most relaxed commits acknowledged after the page was hidden
+ *   (ruling R9). Strict commits are durable before they are acknowledged and lose nothing. No
+ *   handover: it costs a close, an open (Firefox ~12 ms each), up to 70 ms of lock-to-handle lag
+ *   and a rebuild of in-memory state, so it is not paid per tab switch.
  * - `hidden` on mobile (where hidden pages are suspended): graceful step-down: stop admitting,
- *   finish or cancel running statements, flush, send `stepDown`, close the handles, terminate.
- * - Nothing on `hidden` elsewhere: a handover costs a close, an open (Firefox ~12 ms each), up to
- *   70 ms of lock-to-handle lag and a rebuild of in-memory state, so it is not paid per tab switch.
+ *   finish or cancel running statements up to the commit boundary, flush, send `stepDown`, close
+ *   the handles, release the locks, terminate.
+ * - `freeze` and `pagehide`: `terminate` at once, inside the event handler. A page host calls
+ *   `worker.terminate()`, which frees the handle in 5–40 ms; a page in bfcache would otherwise
+ *   keep it (Firefox, verified) or lose only the lock (Safari). An in-place host, on the relayed
+ *   event, closes its sync handles synchronously and releases its locks without flushing. Relaxed
+ *   commits acknowledged since the last flush may be lost, as on power loss. Clients resend
+ *   unanswered requests to the next owner (exactly-once through the ledger).
  * - A host returning (`pageshow`, `resume`, `visible`) does nothing: it is a client again and
  *   elects lazily on its next request.
  *
@@ -169,8 +181,15 @@ export function compareProtocol(
 
 // --- Lifecycle ---------------------------------------------------------------------------------
 
-/** Page lifecycle events. Workers get none (probe table 4); the host page relays them. */
+/** Page lifecycle events. Workers get none (probe table 4); the page relays them. */
 export type LifecycleEvent = "freeze" | "resume" | "pagehide" | "pageshow" | "hidden" | "visible";
+
+/** The message a page posts to a dedicated worker hosting in place, for each lifecycle event. */
+export interface LifecycleRelay {
+  readonly t: "minnow:lifecycle";
+  readonly event: LifecycleEvent;
+  readonly platform: Platform;
+}
 
 export interface Platform {
   /** Hidden pages get suspended (iOS, Android). */
@@ -178,21 +197,22 @@ export interface Platform {
 }
 
 /**
- * What the host does with its owner worker on `event`:
- * - `terminate`: `worker.terminate()` now, inside the event handler, then release the host lock.
- * - `stepDown`: graceful step-down (see the module comment), then terminate.
+ * What the host does on `event` (module comment, "Step-down"):
+ * - `terminate`: stop owning now, synchronously, inside the event handler.
+ * - `stepDown`: graceful step-down, then terminate.
+ * - `flush`: `engine.flushPending()`; keep owning.
  * - `none`.
  */
 export function lifecycleAction(
   event: LifecycleEvent,
   platform: Platform,
-): "terminate" | "stepDown" | "none" {
+): "terminate" | "stepDown" | "flush" | "none" {
   switch (event) {
     case "freeze":
     case "pagehide":
       return "terminate";
     case "hidden":
-      return platform.mobile ? "stepDown" : "none";
+      return platform.mobile ? "stepDown" : "flush";
     case "resume":
     case "pageshow":
     case "visible":
@@ -201,8 +221,12 @@ export function lifecycleAction(
 }
 
 export interface HostContext {
-  /** A page can start and terminate an owner worker and sees lifecycle events; a worker cannot. */
-  readonly kind: "page" | "worker";
+  /**
+   * `page`: starts an owner worker. `dedicatedWorker`: hosts in place. `sharedWorker` and
+   * `serviceWorker`: never host (no sync access handles).
+   */
+  readonly kind: "page" | "dedicatedWorker" | "sharedWorker" | "serviceWorker";
+  /** The page's visibility (for a dedicated worker: as last relayed; true if never relayed). */
   readonly visible: boolean;
   readonly platform: Platform;
   /** This page was superseded by a newer build; it never hosts again. */
@@ -210,10 +234,11 @@ export interface HostContext {
 }
 
 /**
- * Whether a context may request the host lock. Workers do not host (no lifecycle events, and
- * nested workers need Safari 16.4); a hidden mobile page would be suspended while hosting.
+ * Whether a context may request the host lock: pages and dedicated workers (ruling R9), unless
+ * superseded, and not while hidden on mobile, where the host would be suspended.
  */
 export function canHost(context: HostContext): boolean {
-  if (context.superseded || context.kind !== "page") return false;
+  if (context.superseded) return false;
+  if (context.kind !== "page" && context.kind !== "dedicatedWorker") return false;
   return context.visible || !context.platform.mobile;
 }

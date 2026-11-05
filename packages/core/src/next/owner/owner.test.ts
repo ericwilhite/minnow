@@ -12,6 +12,7 @@ import {
 } from "./election.js";
 import {
   CommittedWithoutResultError,
+  OutcomeUnknownError,
   OwnerUnresponsiveError,
   SessionLostError,
   fromWireError,
@@ -21,10 +22,11 @@ import {
 import {
   FrameBufferError,
   frameTransferables,
-  inputTransferables,
+  StreamDictionaries,
   type ResultFrame,
 } from "./frame.js";
 import {
+  DEFAULT_RESULT_WINDOW_BYTES,
   PROTOCOL_VERSION,
   ProtocolError,
   isTerminal,
@@ -112,6 +114,17 @@ describe("RequestSequencer", () => {
     expect(ledger.size).toBeLessThanOrEqual(256);
   });
 
+  it("re-runs a settled no-effect request on retry, and answers a recorded failure", () => {
+    const ledger = new RequestLedger();
+    const read = { clientId: "c", sequence: 1, sentAtMs: 0, resolvedThrough: 0 };
+    expect(ledger.admit(read, 1).kind).toBe("execute");
+    ledger.settle("c", 1);
+    expect(ledger.admit(read, 2).kind).toBe("execute");
+    ledger.record("c", 1, { kind: "failed", code: "23505", recordedAtMs: 3 });
+    const retry = ledger.admit(read, 4);
+    expect(retry.kind === "duplicate" ? retry.outcome.kind : retry.kind).toBe("failed");
+  });
+
   it("is refused as expired past the retry window, so the client resolves it locally", () => {
     const ledger = new RequestLedger();
     const admission = ledger.admit(
@@ -174,12 +187,11 @@ function sampleFrame(): ResultFrame {
   const validity = allocateValidity(2);
   setValid(validity, 0, true);
   return {
+    sequence: 0,
     rowCount: 2,
-    dictionaries: [],
     columns: [
       {
         form: "flat",
-        length: 2,
         validity: null,
         data: {
           layout: "int64",
@@ -188,7 +200,6 @@ function sampleFrame(): ResultFrame {
       },
       {
         form: "flat",
-        length: 2,
         validity,
         data: {
           layout: "varlen",
@@ -207,7 +218,7 @@ describe("result frames move by transfer", () => {
       t: "done",
       seq: 7,
       columns: null,
-      frame,
+      frames: [frame],
       summary: {
         command: "SELECT",
         rowCount: 2,
@@ -219,7 +230,7 @@ describe("result frames move by transfer", () => {
         catalogVersion: 1,
       },
     };
-    const transfer = frameTransferables([frame]);
+    const transfer = frameTransferables(frame);
     expect(transfer).toHaveLength(4);
     const { port1, port2 } = new MessageChannel();
     const received = new Promise<Done>((resolve) => {
@@ -234,7 +245,7 @@ describe("result frames move by transfer", () => {
     // Zero added copies: the owner's buffers are gone, not cloned.
     for (const buffer of transfer) expect(buffer.byteLength).toBe(0);
     expect(isTerminal(reply)).toBe(true);
-    const [ints, text] = reply.frame?.columns ?? [];
+    const [ints, text] = reply.frames[0]?.columns ?? [];
     expect(
       ints?.form === "flat" && ints.data.layout === "int64" ? [...ints.data.values.values] : null,
     ).toEqual([1n, 2n ** 60n]);
@@ -248,34 +259,56 @@ describe("result frames move by transfer", () => {
   it("refuses views that do not own their whole buffer, and shared memory", () => {
     const slack = new Float64Array(16).subarray(0, 2);
     const frame: ResultFrame = {
+      sequence: 0,
       rowCount: 2,
-      dictionaries: [],
-      columns: [
-        { form: "flat", length: 2, validity: null, data: { layout: "f64", values: slack } },
-      ],
+      columns: [{ form: "flat", validity: null, data: { layout: "f64", values: slack } }],
     };
-    expect(() => frameTransferables([frame])).toThrow(FrameBufferError);
+    expect(() => frameTransferables(frame)).toThrow(FrameBufferError);
     const shared = new Float64Array(new SharedArrayBuffer(16));
     expect(() =>
-      frameTransferables([
-        {
-          ...frame,
-          columns: [
-            { form: "flat", length: 2, validity: null, data: { layout: "f64", values: shared } },
-          ],
-        },
-      ]),
+      frameTransferables({
+        ...frame,
+        columns: [{ form: "flat", validity: null, data: { layout: "f64", values: shared } }],
+      }),
     ).toThrow(FrameBufferError);
   });
 
-  it("transfers encoded input columns but clones value columns", () => {
-    const bytes = new TextEncoder().encode("xy");
-    const offsets = Int32Array.of(0, 1, 2);
-    const transfer = inputTransferables([
-      { kind: "utf8", bytes, offsets, validity: null },
-      { kind: "values", values: ["1.50", null] },
-    ]);
-    expect(transfer).toEqual([bytes.buffer, offsets.buffer]);
+  it("keeps per-stream dictionaries from deltas, and rejects a gap", () => {
+    const utf8 = (...values: string[]) => {
+      const bytes = new TextEncoder().encode(values.join(""));
+      const offsets = new Int32Array(values.length + 1);
+      values.forEach((value, index) => {
+        offsets[index + 1] = (offsets[index] ?? 0) + new TextEncoder().encode(value).length;
+      });
+      return { form: "flat", validity: null, data: { layout: "varlen", bytes, offsets } } as const;
+    };
+    const frame = (sequence: number, base: number, entries: string[], codes: number[]) =>
+      ({
+        sequence,
+        rowCount: codes.length,
+        columns: [
+          {
+            form: "dictionary",
+            codes: Int32Array.from(codes),
+            validity: null,
+            dictionary: 1,
+            delta: entries.length === 0 ? null : { base, entries: utf8(...entries) },
+          },
+        ],
+      }) satisfies ResultFrame;
+    const dictionaries = new StreamDictionaries();
+    const first = frame(0, 0, ["red", "green"], [0, 1, 0]);
+    expect(frameTransferables(first)).toHaveLength(3);
+    dictionaries.apply(first);
+    dictionaries.apply(frame(1, 2, ["blue"], [2, 0]));
+    dictionaries.apply(frame(2, 3, [], [1]));
+    expect(dictionaries.size(1)).toBe(3);
+    const { entries, index } = dictionaries.locate(1, 2);
+    expect(entries.data.layout === "varlen" ? entries.data.offsets[index] : null).toBe(0);
+    expect(() => {
+      dictionaries.apply(frame(3, 5, ["gap"], [5]));
+    }).toThrow(RangeError);
+    expect(() => dictionaries.locate(1, 3)).toThrow(RangeError);
   });
 });
 
@@ -293,12 +326,14 @@ describe("parseClientMessage", () => {
     prepared: null,
     knownColumnsVersion: -1,
     params: [],
-    result: { credits: -1, frameRows: null, wantRows: true },
+    result: { windowBytes: DEFAULT_RESULT_WINDOW_BYTES, frameRows: null, wantRows: true },
   };
 
   it("accepts a well-formed request and signal", () => {
     expect(parseClientMessage(structuredClone(statement))).toEqual(statement);
     expect(parseClientMessage({ t: "cancel", target: 3, close: false }).t).toBe("cancel");
+    expect(parseClientMessage({ t: "release", target: 3, through: 0 }).t).toBe("release");
+    expect(parseClientMessage({ t: "liveness" }).t).toBe("liveness");
     expect(parseClientMessage({ t: "hello", protocol: PROTOCOL_VERSION }).t).toBe("hello");
   });
 
@@ -314,7 +349,8 @@ describe("parseClientMessage", () => {
 describe("errors on the wire", () => {
   it("keep their class, code and fields through a structured clone", () => {
     for (const error of [
-      new OwnerUnresponsiveError(10_000, "unknown"),
+      new OwnerUnresponsiveError(10_000),
+      new OutcomeUnknownError("unresponsive"),
       new SessionLostError("transaction"),
       new CommittedWithoutResultError({ orders: 2 }),
     ]) {
@@ -340,7 +376,7 @@ describe("election and lifecycle", () => {
     expect(new Set(names).size).toBe(names.length);
   });
 
-  it("steps down on freeze and pagehide everywhere, and on hidden only on mobile", () => {
+  it("terminates on freeze and pagehide, flushes on hidden, and steps down on hidden only on mobile", () => {
     const table = (mobile: boolean) =>
       Object.fromEntries(
         (["freeze", "resume", "pagehide", "pageshow", "hidden", "visible"] as LifecycleEvent[]).map(
@@ -352,7 +388,7 @@ describe("election and lifecycle", () => {
       resume: "none",
       pagehide: "terminate",
       pageshow: "none",
-      hidden: "none",
+      hidden: "flush",
       visible: "none",
     });
     expect(table(true)).toMatchObject({
@@ -362,7 +398,7 @@ describe("election and lifecycle", () => {
     });
   });
 
-  it("lets only visible-or-desktop pages that were not superseded host", () => {
+  it("lets pages and dedicated workers host, unless superseded or hidden on mobile", () => {
     const page = {
       kind: "page",
       visible: true,
@@ -372,7 +408,9 @@ describe("election and lifecycle", () => {
     expect(canHost(page)).toBe(true);
     expect(canHost({ ...page, visible: false })).toBe(false);
     expect(canHost({ ...page, visible: false, platform: { mobile: false } })).toBe(true);
-    expect(canHost({ ...page, kind: "worker" })).toBe(false);
+    expect(canHost({ ...page, kind: "dedicatedWorker" })).toBe(true);
+    expect(canHost({ ...page, kind: "sharedWorker" })).toBe(false);
+    expect(canHost({ ...page, kind: "serviceWorker" })).toBe(false);
     expect(canHost({ ...page, superseded: true })).toBe(false);
   });
 

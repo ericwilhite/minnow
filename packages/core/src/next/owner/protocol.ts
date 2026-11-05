@@ -4,59 +4,92 @@
  *
  * ## Topology
  * - One owner worker per database holds the storage fence (election.ts). Every other context is a
- *   client. The owner tab's own client uses the same protocol over a MessageChannel to its worker.
+ *   client. The owner tab's own client uses the same protocol over a MessageChannel to its worker;
+ *   a dedicated worker hosting in place talks to itself without a port.
  * - A client in another tab reaches the owner through a port handed out by the broker
- *   (election.ts `Broker`). The port carries nothing but these messages.
- * - There is no SharedArrayBuffer. Result and input buffers are **transferred** (frame.ts), never
- *   cloned: a 64 KiB clone costs 0.6–0.9 ms and 1 MiB 4–7 ms (storage probe, table 3).
+ *   (election.ts `Broker`). After the handout the broker is off the path: the port connects the
+ *   client straight to the owner worker.
+ * - There is no SharedArrayBuffer. Result frames are **transferred** (frame.ts); batch-write input
+ *   is cloned so the client can resend it (ruling R9).
  *
  * ## Connection
  * 1. The client sends `hello`. The owner answers `welcome` or `refused`. Nothing else is sent
- *    before `welcome`; requests sent early are queued by the client, not by the owner.
+ *    before `welcome`; requests made earlier wait in the client, not in the owner.
  * 2. A connection is one port. Sessions, cursors, prepared statements and subscriptions belong to
  *    the connection and die with it. A new port is a new connection, even to the same owner.
  * 3. There is no close event on a MessagePort (removed from the spec, 2026-10). A connection ends
- *    by `bye` (client), `stepDown` (owner), or the client's silence deadline (`OwnerUnresponsive`).
+ *    by `bye` (client), `stepDown` (owner), the owner seeing the client's liveness lock released,
+ *    or the client's silence deadline (`OwnerUnresponsiveError`).
+ * 4. When a connection ends, the owner cancels its running statements (except past the commit
+ *    boundary, below), rolls back its sessions, drops its pins and releases every result frame it
+ *    still has outstanding.
  *
  * ## Requests and replies
  * - Every request carries a `RequestHeader` with a per-client sequence `seq`. It is the ledger
  *   sequence (format/ledger.ts) and the request's id on the wire: replies, frames, cancellation
- *   and credits name it.
+ *   and releases name it.
  * - Every request gets **exactly one terminal reply** (`done`, `error`, `prepared`, `value`),
- *   possibly preceded by `rows` frames. After its terminal reply a seq is never mentioned again.
- * - Signals (`cancel`, `credit`, `liveAck`, `unprepare`, `bye`) have no seq and no reply.
+ *   possibly preceded by `rows` messages. After its terminal reply a seq is never mentioned again
+ *   by the owner.
+ * - Signals (`cancel`, `release`, `liveness`, `liveAck`, `unprepare`, `bye`) have no seq and no
+ *   reply.
  * - The owner may answer requests out of order. Requests on one session run in arrival order.
+ *
+ * ## Result frames and the window (ruling R3)
+ * - The owner pulls frames from the executor's result stream (owner/engine.ts `FrameStream`) and
+ *   posts each one as soon as it has it; frames already queued go out together in one message.
+ *   The last frames ride in the terminal `done`, so a small result is one message.
+ * - A frame stays charged to the owner until the client sends `release { target, through }` for
+ *   it. The client releases a cursor frame when the caller takes it from the iterator, and a
+ *   buffered result's frames as they arrive. Unreleased bytes reach the request's `windowBytes`
+ *   and the executor pauses: a slow consumer costs one window, never a growing buffer.
+ * - RETURNING rows (ruling R2) are delivered only once the write is committed: for an autocommit
+ *   write, after its commit is acknowledged per durability mode (strict: durable; relaxed:
+ *   applied). Until then the executor keeps them in a charged, spillable spool and offers no
+ *   frames; if the commit fails they are discarded and the client gets only the error. A plain
+ *   SELECT streams at once.
+ * - A stream whose request is not `live` (below) and whose frames stay unreleased for
+ *   `ABANDONED_STREAM_MS` is treated as abandoned: cancelled, frames released, `SessionLostError`.
  *
  * ## Cancellation and its acknowledgement
  * - `cancel { target }` asks the owner to stop request `target`. Its acknowledgement is the
  *   target's terminal reply, which always follows:
  *   - `error` with code `MINNOW_CANCELLED`: stopped, with no effect.
- *   - its normal reply: it finished first. A write's reply then means it committed.
+ *   - its normal reply: it finished first.
+ * - **The commit boundary** (ruling R9) is the owner's call to the write path's `commit()`.
+ *   Cancelling before it aborts the transaction; from that call on the request completes and its
+ *   reply reports the commit. Explicit `COMMIT` and autocommit writes are the same here.
  * - `cancel { target, close: true }` ends a cursor or subscription early. Its terminal reply is
  *   `done` with `summary.closedEarly`, never an error.
- * - A commit that has reached the group-commit flush cannot be stopped; cancel then waits for it.
  * - A cancel for a seq the owner has already answered, or never saw, is ignored.
  *
  * ## Exactly-once (format/ledger.ts)
- * - `sentAtMs` and `resolvedThrough` feed `RequestLedger.admit`; the receiver enforces the retry
- *   window. The client keeps `seq − resolvedThrough ≤ MAX_OUTSTANDING_REQUESTS` (sequence.ts).
+ * - The owner admits every request through `RequestLedger.admit` before running it; `sentAtMs`
+ *   and `resolvedThrough` feed it, and the receiver enforces the retry window. The client keeps
+ *   `seq − resolvedThrough ≤ MAX_OUTSTANDING_REQUESTS` (sequence.ts).
+ * - Outcomes (ruling R9): the **write path** records a committed outcome once its commit is
+ *   durable (strict) or applied (relaxed); the **owner** records failures, and `settle`s requests
+ *   with no durable effect (reads, statements inside an open transaction, rollbacks), so a retry of
+ *   those runs again.
  * - After a reconnect, the client resends every request it has no terminal reply for, unchanged
- *   (same seq, same `sentAtMs`), except those it already saw frames of (it fails those itself).
+ *   (same seq, same `sentAtMs`, same cloned input), except those it already saw frames of (it
+ *   fails those itself).
  * - The owner answers a recorded duplicate from the ledger: a committed write gets `done` with
  *   `summary.replayed: true` and the original counts. RETURNING rows are not replayed: the client
  *   rejects with `CommittedWithoutResultError` if the caller asked for them.
  * - `standalone` says whether a request means the same thing on a fresh connection (sequence.ts
  *   rules). A resent request (`retry`) that the ledger admits as first sight and that is not
- *   standalone is refused with `SessionLostError` and never executed. So a
- *   transaction's statements never run outside it, and a COMMIT whose fate is unknown resolves
- *   from the ledger: committed, or definitely not.
+ *   standalone is refused with `SessionLostError` and never executed. So a transaction's
+ *   statements never run outside it, and a COMMIT whose fate is unknown resolves from the ledger:
+ *   committed, or definitely not.
  *
  * ## Liveness (election.ts)
  * - `live: true` promises that the sender held its liveness lock when it sent the request and
- *   keeps holding it until the terminal reply. Only then does the owner watch that lock and drop
- *   the request's work (and the client's pins) when it is released.
+ *   keeps holding it until the terminal reply. The owner watches that lock only while it has
+ *   such requests or pins of the client; a grant ends the connection (above).
  * - Requests are never delayed to take the lock: the client sends `live: false` until the lock is
- *   granted. Opening a cursor or a transaction (which pin a snapshot) waits for the lock.
+ *   granted, then sends `liveness` once, which makes all its outstanding requests live. Opening a
+ *   cursor or a transaction (they pin a snapshot) waits for the lock.
  * - While a client has requests in flight the owner sends `alive` at least every
  *   `ALIVE_INTERVAL_MS`. The client's deadline counts silence, not wall time.
  *
@@ -66,13 +99,33 @@
  * - A newer client asks the owner to step aside (election.ts `SkewSignal`); an older client is
  *   superseded and reloads (0.19's `whenSuperseded` behaviour, engine/client.ts).
  *
- * ## Performance contract (cross-tab PK read ≤ 0.25 ms)
- * - A small result is one message each way: the request, then a `done` carrying the column
- *   metadata and the only frame inline.
- * - Prepared statements send an id, not text. A reply omits `columns` when the client already has
- *   them for that statement at that catalog version.
- * - Messages are plain objects of numbers, strings and typed arrays: no JSON, no class instances,
- *   nothing whose clone cost grows with the result.
+ * ## Latency (ruling R6)
+ * Targets for a warm primary-key read from another tab, measured at the client from `query()` to
+ * its resolution, in the browser perf lane:
+ *
+ * | Engine   | Uncontended p50 | Under a concurrent analytic query, p95 | Owner-side work |
+ * | -------- | --------------- | -------------------------------------- | --------------- |
+ * | Chromium | ≤ 0.25 ms       | ≤ 5 ms                                 | ≤ 10 µs         |
+ * | Firefox  | ≤ 0.4 ms        | ≤ 5 ms                                 | ≤ 10 µs         |
+ * | WebKit   | ≤ 0.6 ms        | ≤ 5 ms                                 | ≤ 10 µs         |
+ *
+ * The bare round trip is ~55–65 µs, ~140 µs and ~280 µs (probe), so the path adds nothing it can
+ * avoid:
+ * - **Client:** `query()` issues the seq and posts synchronously: no await before `postMessage`,
+ *   no lock wait (`live: false` is fine), no SQL parsing (prepared statements send an id), no
+ *   per-request timer (one shared silence timer).
+ * - **Owner:** the port's message handler runs the whole read synchronously: envelope check,
+ *   `admit`, the plan-cache hit, a snapshot pin, the executor's synchronous point-read path when
+ *   the key index and page cache hit (`EngineSession.runNow`), `settle`, unpin, and one
+ *   `postMessage` of `done` with the frame inline. No promise, microtask or timer on the hit path;
+ *   a miss falls back to the async run. Strict durability adds no wait: a read snapshot sees only
+ *   durable commits.
+ * - **Reply:** one message; `columns` omitted when the client already has them for that prepared
+ *   statement and catalog version.
+ * - **Under load:** the executor yields at most every `YIELD_INTERVAL_MS` (4 ms, B4), and the
+ *   owner handles each message as its own task, so a point read waits at most one slice.
+ * - On WebKit a busy main thread in the owner's page delays messages to its worker (probe 7):
+ *   outside these targets, documented.
  */
 import type { PhysicalType } from "../types.js";
 import type { WireError } from "./errors.js";
@@ -85,10 +138,10 @@ export const PROTOCOL_VERSION = 1;
 export const ALIVE_INTERVAL_MS = 1_000;
 /** Default silence after which a client reports `OwnerUnresponsiveError`. */
 export const DEFAULT_UNRESPONSIVE_AFTER_MS = 10_000;
-/** Frames a cursor may have in flight before the client grants more, by default. */
-export const DEFAULT_CURSOR_CREDITS = 2;
-/** `credits` value meaning "send every frame": buffered results. */
-export const UNLIMITED_CREDITS = -1;
+/** Default result window: two frames of ~1 MiB, equal to the executor's `RESULT_WINDOW_BYTES`. */
+export const DEFAULT_RESULT_WINDOW_BYTES = 2 * 1024 * 1024;
+/** A non-live stream with frames unreleased this long is abandoned. */
+export const ABANDONED_STREAM_MS = 30_000;
 
 // --- Values ------------------------------------------------------------------------------------
 
@@ -143,10 +196,10 @@ export type SessionId = number;
 /** How the rows of a statement come back. */
 export interface ResultRequest {
   /**
-   * Frames the owner may send before the client grants more (`credit`): ≥ 1, since a `done`
-   * carrying a frame consumes a credit too; or `UNLIMITED_CREDITS` for a buffered result.
+   * Unreleased frame bytes the stream may hold before the executor pauses (the executor's
+   * `resultWindowBytes`). `DEFAULT_RESULT_WINDOW_BYTES` unless the caller asked for more prefetch.
    */
-  readonly credits: number;
+  readonly windowBytes: number;
   /** Upper bound on rows per frame, if the caller wants smaller frames than the byte target. */
   readonly frameRows: number | null;
   /** Statement returns rows the caller wants (SELECT, or RETURNING). False drops them unsent. */
@@ -173,7 +226,11 @@ export interface PrepareRequest extends RequestHeader {
   readonly text: string;
 }
 
-/** Opens session `session` (client-chosen, ≥ 1) and its transaction. */
+/**
+ * Opens session `session` (client-chosen, ≥ 1) and its transaction. A read-write transaction
+ * waits for the write path's single writer slot (B3, FIFO) and holds it until commit or
+ * rollback; `readOnly` only pins a snapshot.
+ */
 export interface BeginRequest extends RequestHeader {
   readonly t: "begin";
   readonly session: SessionId;
@@ -186,8 +243,9 @@ export interface EndRequest extends RequestHeader {
 }
 
 /**
- * A batch write without SQL: rows as transferred columns (frame.ts). One transaction unless it
- * runs inside an open session transaction. Counts come back in `done.summary.counts`.
+ * A batch write without SQL: rows as cloned columns (frame.ts; the client keeps them to resend).
+ * One transaction unless it runs inside an open session transaction. Counts come back in
+ * `done.summary.counts`.
  */
 export interface WriteRequest extends RequestHeader {
   readonly t: "write";
@@ -254,14 +312,25 @@ export interface Cancel {
   readonly close: boolean;
 }
 
-/** Lets the owner send `frames` more frames of request `target`. */
-export interface Credit {
-  readonly t: "credit";
+/**
+ * The client has taken every frame of request `target` with `sequence ≤ through`: the owner calls
+ * their `release()`, which returns their bytes to the window. Cumulative and idempotent.
+ */
+export interface Release {
+  readonly t: "release";
   readonly target: number;
-  readonly frames: number;
+  readonly through: number;
 }
 
-/** The client has applied live update `version` of subscription `target`: one more may follow. */
+/** The client now holds its liveness lock: every request it has outstanding is `live`. */
+export interface Liveness {
+  readonly t: "liveness";
+}
+
+/**
+ * The client has taken live update `version` of subscription `target`: its frames are released
+ * and one more update may follow.
+ */
 export interface LiveAck {
   readonly t: "liveAck";
   readonly target: number;
@@ -278,7 +347,7 @@ export interface Bye {
   readonly t: "bye";
 }
 
-export type Signal = Cancel | Credit | LiveAck | Unprepare | Bye;
+export type Signal = Cancel | Release | Liveness | LiveAck | Unprepare | Bye;
 
 export type ClientMessage = Hello | Request | Signal;
 
@@ -350,21 +419,21 @@ export interface StatementSummary {
   readonly catalogVersion: number;
 }
 
-/** A non-terminal frame of request `seq`'s rows. Consumes one credit. */
+/** Frames of request `seq`'s rows, in sequence order (all those the stream had queued). */
 export interface Rows {
   readonly t: "rows";
   readonly seq: number;
   /** Present on the first message of a result unless the client already has them. */
   readonly columns: readonly WireColumnMeta[] | null;
-  readonly frame: ResultFrame;
+  readonly frames: readonly ResultFrame[];
 }
 
 export interface Done {
   readonly t: "done";
   readonly seq: number;
   readonly columns: readonly WireColumnMeta[] | null;
-  /** The last (or only) frame, inline: a small result is this one message. */
-  readonly frame: ResultFrame | null;
+  /** The last frames, inline (often the only one: a small result is this one message). */
+  readonly frames: readonly ResultFrame[];
   readonly summary: StatementSummary;
 }
 
@@ -393,7 +462,7 @@ export interface Failure {
 
 /**
  * A new result for subscription `seq`, sent only after the previous version was acknowledged
- * (`liveAck`); changes in between coalesce. Unacknowledged subscriptions are dropped after
+ * (`liveAck`, which also releases its frames); changes in between coalesce. Unacknowledged subscriptions are dropped after
  * `LIVE_UNACKED_DROP_MS` (election.ts) with `liveEnded`; a client that wakes later resubscribes.
  */
 export interface Live {
@@ -466,7 +535,8 @@ const CLIENT_KINDS = new Set<string>([
   "subscribe",
   "admin",
   "cancel",
-  "credit",
+  "release",
+  "liveness",
   "liveAck",
   "unprepare",
   "bye",

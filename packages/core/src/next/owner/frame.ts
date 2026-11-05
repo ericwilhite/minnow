@@ -1,74 +1,81 @@
 /**
- * Columnar frames on the wire: result frames (owner → client) and input columns (client →
- * owner). Both move by **transfer**: the sender gives up its ArrayBuffers and the port adds no
- * copy. SharedArrayBuffer is never used.
+ * Columnar data on the wire: result frames (owner → client) and batch-write input (client →
+ * owner).
  *
- * ## Result frames
- * - A frame is one result batch (vector/vector.ts): at most `BATCH_ROWS` rows and about
- *   `OwnerLimits.frameBytes` bytes; a single larger row is a frame of one.
- * - Vectors keep their executor form: `VectorData` is sent as is, so the client sees the exact
- *   physical values (int64 as proven-safe Float64Array or BigInt64Array, decimal tiers, UTF-8
- *   bytes, dictionary codes). Conversion to JS values happens on the client, on request (api.ts).
- * - **Ownership.** The result sink (owner/engine.ts `FrameSink`) builds each frame into buffers it
- *   allocates for that frame alone, exactly sized, and transfers them. This compaction (applying
- *   the selection, cutting capacity slack) is the one copy a result row takes after the operator
- *   that produced it; the port adds none. A batch handed to the sink by `transfer`, with no
- *   selection and exact buffers, is sent as is and its `release` tells the producer the buffers
- *   are gone (not returned to its pool).
- * - **Dictionaries** are immutable for the life of a query (vector/vector.ts rule 2) and still
- *   referenced by the owner, so they are copied, once per result, into a buffer the frame owns.
- *   Each gets a wire id unique within the result and travels in the first frame that uses it;
- *   later frames refer to it by id. The client keeps them until the result is released.
- * - **Accounting.** A frame's bytes are charged to the statement's grant until the postMessage
- *   that transfers them returns, then freed: frames in flight live in the client's heap, bounded
- *   by its credits.
+ * ## Result frames (lead ruling R3)
+ * - The executor (B4) produces each frame **wire-ready**: a `ResultFrame` payload of plain data
+ *   (numbers, typed arrays, `bigint[]` for wide decimals) plus its transfer list. The release
+ *   handle lives beside the payload (owner/engine.ts `StreamedFrame`), never inside it, so the
+ *   payload is postMessage-safe. The owner posts it as is: no second compaction, no copy. The
+ *   port adds no copy either: every typed-array buffer is transferred (`frameTransferables`
+ *   checks a payload owns exactly what it transfers). Wide coefficients are cloned.
+ * - Vectors keep their executor form (`VectorData`), so the client sees exact physical values:
+ *   int64 as proven-safe `Float64Array` or `BigInt64Array`, the decimal tiers, UTF-8 bytes,
+ *   dictionary codes. JS values are built on the client, on request (api.ts).
+ * - **Accounting.** A frame stays charged to its result grant from the moment the executor
+ *   offers it until the client's `release` signal for it reaches the owner (protocol.ts
+ *   `Release`), not until `postMessage` returns: the client's backlog is bounded by the stream's
+ *   window too. On disconnect (`bye`, step-down, a liveness grant, an abandoned non-live stream)
+ *   the owner releases every outstanding frame of the connection and cancels its streams.
+ * - **Dictionaries are per stream** (rulings 3 and R3). A dictionary column names a stream
+ *   dictionary id and may carry a `delta`: entries appended to that dictionary, starting at code
+ *   `delta.base`, which must equal the dictionary's current size. Codes index the cumulative
+ *   dictionary. The executor stops adding entries once a stream's dictionaries reach
+ *   `STREAM_DICTIONARY_LIMIT_BYTES` and sends that column as plain varlen from then on. The
+ *   client keeps the dictionaries for the life of the result (`StreamDictionaries`).
+ * - `sequence` numbers a stream's frames 0, 1, 2…; the client's `release` names them, and a gap
+ *   is a protocol error.
  *
- * ## Input columns
- * - The client encodes a batch write's rows into typed buffers it allocates, so it transfers
- *   them. Caller-provided typed arrays (api.ts `ColumnarInput`) are transferred only when the
- *   caller passes `transfer: true`; otherwise they are cloned, never silently detached.
- * - `values` is the fallback for columns of mixed or non-primitive JS values: cloned, converted
- *   on the owner like parameters.
+ * At integration this payload type moves to exec/result.ts (exec/ cannot import owner/), and
+ * this module re-exports it. The shape here is the one both sides build against.
+ *
+ * ## Batch-write input (ruling R9)
+ * Input columns are **structured-cloned, not transferred**: the client keeps them until the
+ * request's terminal reply so it can resend them after a reconnect. One clone costs ~4–7 ms per
+ * MiB (probe), paid once per write.
  */
 import type { VectorData } from "../vector/vector.js";
 import type { WireValue } from "./protocol.js";
 
-/** A flat vector without its type (the type travels once, in `WireColumnMeta`). */
+/** Bytes of dictionary entries a stream may accumulate before columns go plain. */
+export const STREAM_DICTIONARY_LIMIT_BYTES = 1024 * 1024;
+
+/** A flat column without its type (the type travels once, in `WireColumnMeta`). */
 export interface WireFlat {
   readonly form: "flat";
-  readonly length: number;
   /** vector/vector.ts `Validity` (bit set = valid), or null when all are valid. */
   readonly validity: Uint32Array | null;
   readonly data: VectorData;
 }
 
+/** One value for every row of the frame: `value` has one slot. */
 export interface WireConstant {
   readonly form: "constant";
-  readonly length: number;
-  /** Length 1. */
   readonly value: WireFlat;
 }
 
-export interface WireDictionaryVector {
+export interface WireDictionaryColumn {
   readonly form: "dictionary";
-  readonly length: number;
   readonly codes: Int32Array;
   readonly validity: Uint32Array | null;
-  /** Wire id of a dictionary sent in this frame or an earlier frame of the same result. */
+  /** Stream dictionary id: unique within the result, stable across its frames. */
   readonly dictionary: number;
+  /** New entries, appended at code `base` (the dictionary's size before this frame). */
+  readonly delta: { readonly base: number; readonly entries: WireFlat } | null;
 }
 
-export type WireVector = WireFlat | WireConstant | WireDictionaryVector;
+export type WireColumn = WireFlat | WireConstant | WireDictionaryColumn;
 
+/** One frame of a result: plain data, postMessage-safe. */
 export interface ResultFrame {
+  /** 0, 1, 2… within the stream. */
+  readonly sequence: number;
   readonly rowCount: number;
-  /** One per output column, in output order; each has `length === rowCount`. */
-  readonly columns: readonly WireVector[];
-  /** Dictionaries first used by this frame. */
-  readonly dictionaries: ReadonlyArray<{ readonly id: number; readonly values: WireFlat }>;
+  /** One per output column, in output order, each with `rowCount` rows. */
+  readonly columns: readonly WireColumn[];
 }
 
-/** Client-encoded input for a batch write: one per input column, `rowCount` slots each. */
+/** Client-encoded input for a batch write: one per input column, `rowCount` slots each. Cloned. */
 export type WireInputColumn =
   | { readonly kind: "bool"; readonly values: Uint8Array; readonly validity: Uint32Array | null }
   | { readonly kind: "i32"; readonly values: Int32Array; readonly validity: Uint32Array | null }
@@ -87,10 +94,7 @@ export type WireInputColumn =
     }
   | { readonly kind: "values"; readonly values: readonly WireValue[] };
 
-/** A typed array whose buffer can be transferred. */
-type View = ArrayBufferView & { readonly buffer: ArrayBufferLike };
-
-/** Thrown when a frame would transfer bytes it does not use, or a shared buffer. */
+/** A frame payload that would transfer bytes it does not own, or shared memory. */
 export class FrameBufferError extends Error {
   readonly code = "MINNOW_FRAME_BUFFER";
   constructor(message: string) {
@@ -98,6 +102,8 @@ export class FrameBufferError extends Error {
     this.name = "FrameBufferError";
   }
 }
+
+type View = ArrayBufferView & { readonly buffer: ArrayBufferLike };
 
 function addView(view: View | null, into: Set<ArrayBuffer>): void {
   if (view === null) return;
@@ -150,36 +156,85 @@ function addFlat(flat: WireFlat, into: Set<ArrayBuffer>): void {
 }
 
 /**
- * The transfer list of a result frame: every ArrayBuffer it references, once. Throws
- * `FrameBufferError` if a view does not cover its whole buffer (the sink must allocate exactly)
- * or a buffer is shared, so a frame can never move bytes it does not own.
+ * Every ArrayBuffer a frame references, once: what its transfer list must be. Throws
+ * `FrameBufferError` if a view does not cover its whole buffer or a buffer is shared. The
+ * executor's transfer list is checked against this in tests (and in debug builds).
  */
-export function frameTransferables(frames: readonly ResultFrame[]): ArrayBuffer[] {
+export function frameTransferables(frame: ResultFrame): ArrayBuffer[] {
   const buffers = new Set<ArrayBuffer>();
-  for (const frame of frames) {
-    for (const dictionary of frame.dictionaries) addFlat(dictionary.values, buffers);
-    for (const column of frame.columns) {
-      if (column.form === "flat") addFlat(column, buffers);
-      else if (column.form === "constant") addFlat(column.value, buffers);
-      else {
-        addView(column.codes, buffers);
-        addView(column.validity, buffers);
-      }
+  for (const column of frame.columns) {
+    if (column.form === "flat") addFlat(column, buffers);
+    else if (column.form === "constant") addFlat(column.value, buffers);
+    else {
+      addView(column.codes, buffers);
+      addView(column.validity, buffers);
+      if (column.delta !== null) addFlat(column.delta.entries, buffers);
     }
   }
   return [...buffers];
 }
 
-/** The transfer list of encoded input columns (`values` columns are cloned). */
-export function inputTransferables(columns: readonly WireInputColumn[]): ArrayBuffer[] {
-  const buffers = new Set<ArrayBuffer>();
-  for (const column of columns) {
-    if (column.kind === "values") continue;
-    if (column.kind === "utf8") {
-      addView(column.bytes, buffers);
-      addView(column.offsets, buffers);
-    } else addView(column.values, buffers);
-    addView(column.validity, buffers);
+/** Rows of a flat column's data (the length of its first dimension). */
+function entryCount(flat: WireFlat): number {
+  const data = flat.data;
+  switch (data.layout) {
+    case "varlen":
+      return data.offsets.length - 1;
+    case "fixed16":
+      return data.bytes.length / 16;
+    case "int64":
+      return data.values.values.length;
+    case "interval":
+      return data.months.length;
+    case "decimal":
+      return data.coefficients.repr === "int128"
+        ? data.coefficients.limbs.length / 4
+        : data.coefficients.values.length;
+    default:
+      return data.values.length;
   }
-  return [...buffers];
+}
+
+/**
+ * The client's per-stream dictionaries: deltas appended in frame order, entries kept as the
+ * chunks that arrived (no copy). A delta whose `base` is not the dictionary's current size is a
+ * protocol error (a lost or reordered frame).
+ */
+export class StreamDictionaries {
+  readonly #chunks = new Map<number, { size: number; readonly parts: WireFlat[] }>();
+
+  /** Applies the deltas of `frame`, in column order. */
+  apply(frame: ResultFrame): void {
+    for (const column of frame.columns) {
+      if (column.form !== "dictionary" || column.delta === null) continue;
+      let dictionary = this.#chunks.get(column.dictionary);
+      if (dictionary === undefined) {
+        dictionary = { size: 0, parts: [] };
+        this.#chunks.set(column.dictionary, dictionary);
+      }
+      if (column.delta.base !== dictionary.size)
+        throw new RangeError(
+          `Dictionary ${String(column.dictionary)} delta starts at ${String(column.delta.base)}, expected ${String(dictionary.size)}`,
+        );
+      dictionary.parts.push(column.delta.entries);
+      dictionary.size += entryCount(column.delta.entries);
+    }
+  }
+
+  /** Entries of dictionary `id` so far. */
+  size(id: number): number {
+    return this.#chunks.get(id)?.size ?? 0;
+  }
+
+  /** The chunk holding `code`, and the code's index inside it. */
+  locate(id: number, code: number): { readonly entries: WireFlat; readonly index: number } {
+    const dictionary = this.#chunks.get(id);
+    let index = code;
+    for (const entries of dictionary?.parts ?? []) {
+      const count = entryCount(entries);
+      if (index < count) return { entries, index };
+      index -= count;
+    }
+    throw new RangeError(`Code ${String(code)} is outside dictionary ${String(id)}`);
+  }
 }

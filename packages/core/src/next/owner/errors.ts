@@ -7,9 +7,12 @@
  *   the stack is the owner's.
  * - Every class here has a stable `code` (`MINNOW_…`) and a literal `name`; match on either. The
  *   class identity holds only inside one realm; across the port it is the registry's.
+ * - A silent owner fails reads with `OwnerUnresponsiveError` (next/errors.ts) and in-flight
+ *   writes with `OutcomeUnknownError { reason: "unresponsive" }` carrying it as `cause`.
  * - Errors from the SQL front end, the executor and storage cross the same way; the client's
  *   registry includes their classes (composition, Phase 2).
  */
+import { OwnerUnresponsiveError, RequestExpiredError } from "../errors.js";
 import {
   rehydrateError,
   serializeError,
@@ -17,36 +20,14 @@ import {
   type SerializedError,
 } from "../../worker-protocol/index.js";
 
+/** Defined once for every track (next/errors.ts); re-exported for the client API. */
+export { OwnerUnresponsiveError, RequestExpiredError };
+
 export type WireError = SerializedError;
 
 export const toWireError = (error: unknown): WireError => serializeError(error);
 export const fromWireError = (error: WireError, registry: ErrorRegistry): Error =>
   rehydrateError(error, registry);
-
-/**
- * The owner has said nothing for `silentMs` while this request was in flight: it is frozen (a
- * hidden mobile tab, Energy Saver), busy behind its page's main thread (WebKit), or gone with no
- * successor able to open the store (its handle still held).
- *
- * - `outcome: "none"`: the request was never sent, or is a read: retrying is safe.
- * - `outcome: "unknown"`: a write that may yet commit when the owner thaws. The client keeps its
- *   seq unresolved and still collects the terminal reply in the background, so the ledger stays
- *   exact; the caller decides whether to check and retry.
- */
-export class OwnerUnresponsiveError extends Error {
-  readonly code = "MINNOW_OWNER_UNRESPONSIVE";
-  override readonly name = "OwnerUnresponsiveError";
-  readonly silentMs: number;
-  readonly outcome: "none" | "unknown";
-  constructor(silentMs: number, outcome: "none" | "unknown") {
-    super(
-      `The database owner did not answer for ${String(silentMs)} ms` +
-        (outcome === "unknown" ? "; the write may still commit" : ""),
-    );
-    this.silentMs = silentMs;
-    this.outcome = outcome;
-  }
-}
 
 /**
  * Connection state this request depended on is gone: the owner changed, stepped down, or dropped
@@ -56,8 +37,8 @@ export class OwnerUnresponsiveError extends Error {
 export class SessionLostError extends Error {
   readonly code = "MINNOW_SESSION_LOST";
   override readonly name = "SessionLostError";
-  readonly lost: "transaction" | "cursor" | "subscription";
-  constructor(lost: "transaction" | "cursor" | "subscription") {
+  readonly lost: "transaction" | "cursor" | "subscription" | "result";
+  constructor(lost: "transaction" | "cursor" | "subscription" | "result") {
     super(
       `The ${lost} was lost when the connection to the database owner changed; nothing took effect`,
     );
@@ -81,25 +62,26 @@ export class CommittedWithoutResultError extends Error {
 }
 
 /**
- * No owner answered a write within the retry window (format/ledger.ts `CLIENT_RETRY_WINDOW_MS`),
- * so whether it committed can no longer be learned from the ledger.
+ * Whether a write committed cannot be learned now.
+ * - `unresponsive`: the owner went silent (`cause` is the `OwnerUnresponsiveError`) while the write
+ *   was in flight. It may still commit when the owner thaws; the client keeps its seq unresolved
+ *   and collects the terminal reply in the background, so the ledger stays exact.
+ * - `expired`: no owner answered within the retry window (format/ledger.ts
+ *   `CLIENT_RETRY_WINDOW_MS`), so the ledger can no longer say.
+ * Reads never get this error: a silent owner fails them with `OwnerUnresponsiveError` itself.
  */
 export class OutcomeUnknownError extends Error {
   readonly code = "MINNOW_OUTCOME_UNKNOWN";
   override readonly name = "OutcomeUnknownError";
-  constructor() {
+  readonly reason: "unresponsive" | "expired";
+  constructor(reason: "unresponsive" | "expired", options?: ErrorOptions) {
     super(
-      "No database owner answered within the retry window; the write may or may not have committed",
+      reason === "unresponsive"
+        ? "The database owner stopped answering; the write may still commit"
+        : "No database owner answered within the retry window; the write may or may not have committed",
+      options,
     );
-  }
-}
-
-/** The owner refused a request sent more than the retry window ago (ledger `expired`). */
-export class RequestExpiredError extends Error {
-  readonly code = "MINNOW_REQUEST_EXPIRED";
-  override readonly name = "RequestExpiredError";
-  constructor() {
-    super("The request is older than the retry window and was not executed");
+    this.reason = reason;
   }
 }
 
