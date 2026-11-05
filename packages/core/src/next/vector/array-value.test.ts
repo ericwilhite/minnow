@@ -210,38 +210,44 @@ describe("array validation before writing (review A1-4 follow-up)", () => {
     expect(performance.now() - started).toBeLessThan(500);
   });
 
-  it.each(SEEDS)("bounds NUMERIC integer digits exactly at the limit (seed %i)", (seed) => {
-    const decimal: PhysicalType = { kind: "decimal", precision: null, scale: null };
-    let accepted = 0;
-    let refused = 0;
-    fc.assert(
-      fc.property(
-        fc.integer({ min: 0, max: 64 }),
-        fc.integer({ min: -3, max: 3 }),
-        fc.oneof(fc.integer({ min: 1, max: 9 }), fc.constant(0)),
-        fc.boolean(),
-        (scale, delta, lead, negative) => {
-          // `digits` digits: a leading digit then zeros, or (lead 0) all nines; integer digits
-          // = digits − scale sits within 3 of the limit, where the size estimate is tightest.
-          const digits = 131_072 + scale + delta;
-          const magnitude =
-            lead === 0 ? 10n ** BigInt(digits) - 1n : BigInt(lead) * 10n ** BigInt(digits - 1);
-          const value = one({ coefficient: negative ? -magnitude : magnitude, scale });
-          if (delta <= 0) {
-            accepted += 1;
-            expect(decodeArrayValue(decimal, encodeArrayValue(decimal, value))).toEqual(value);
-          } else {
-            refused += 1;
-            refuse(decimal, value, `${String(digits)} digits at scale ${String(scale)}`);
-          }
-        },
-      ),
-      { seed, numRuns: 300 },
-    );
-    // Declared reach: both sides of the limit.
-    expect(accepted).toBeGreaterThan(50);
-    expect(refused).toBeGreaterThan(50);
-  });
+  it.each(SEEDS)(
+    "bounds NUMERIC integer digits exactly at the limit (seed %i)",
+    (seed) => {
+      const decimal: PhysicalType = { kind: "decimal", precision: null, scale: null };
+      let accepted = 0;
+      let refused = 0;
+      fc.assert(
+        fc.property(
+          fc.integer({ min: 0, max: 64 }),
+          fc.integer({ min: -3, max: 3 }),
+          fc.oneof(fc.integer({ min: 1, max: 9 }), fc.constant(0)),
+          fc.boolean(),
+          (scale, delta, lead, negative) => {
+            // `digits` digits: a leading digit then zeros, or (lead 0) all nines; integer digits
+            // = digits − scale sits within 3 of the limit, where the size estimate is tightest.
+            const digits = 131_072 + scale + delta;
+            const magnitude =
+              lead === 0 ? 10n ** BigInt(digits) - 1n : BigInt(lead) * 10n ** BigInt(digits - 1);
+            const value = one({ coefficient: negative ? -magnitude : magnitude, scale });
+            if (delta <= 0) {
+              accepted += 1;
+              expect(decodeArrayValue(decimal, encodeArrayValue(decimal, value))).toEqual(value);
+            } else {
+              refused += 1;
+              refuse(decimal, value, `${String(digits)} digits at scale ${String(scale)}`);
+            }
+          },
+        ),
+        { seed, numRuns: 300 },
+      );
+      // Declared reach: both sides of the limit.
+      expect(accepted).toBeGreaterThan(50);
+      expect(refused).toBeGreaterThan(50);
+      // 300 round trips of ~131k-digit coefficients: ~4 s alone, but well past the default 20 s
+      // timeout when the machine is saturated. A load timeout is not a failure of the law.
+    },
+    120_000,
+  );
 
   it("stores an empty array only with zero dimensions (review A1-5 probe)", () => {
     const smallint: PhysicalType = { kind: "int32", bits: 16 };
