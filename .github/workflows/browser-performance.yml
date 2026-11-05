@@ -1,0 +1,69 @@
+# The browser performance lane, nightly and off the merge path.
+#
+# Minnow against SQLite-Wasm (point suite) and single-thread DuckDB-Wasm (analytics suite) in real
+# Chromium, with the browser profile -- and so OPFS -- on the runner's disk. Like the Node gate it
+# judges ratios against a competitor measured in the same run, confirms a flagged cell in a fresh
+# browser before failing, and never blocks a merge: a shared runner measures itself as much as the
+# code. Unlike the Node gate it also fails at once when a Minnow store will not reopen after a
+# failed cell, or when Minnow's answer differs from the competitor's.
+name: Browser performance
+
+on:
+  schedule:
+    # 08:00 UTC daily, after the Node performance gate.
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: "Analytics datasets: default (W1M, W500, S1), large (W5M, S5), or all"
+        default: default
+        type: choice
+        options: [default, large, all]
+      update:
+        description: "Recalibrate this runner's baseline profile and upload the file (no judging)"
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  lane:
+    name: Browser performance lane
+    runs-on: ubuntu-latest
+    # Measured locally (8 threads, busy): a whole default run -- the point suite, then W1M, W500 and
+    # S1 including their first loads and one W1M reload after a corrupted store -- took 62 minutes;
+    # with the datasets cached, about 45. A 4-vCPU runner is slower and loads every night, so the
+    # default run gets 240 minutes. The large scales take hours and are opt-in.
+    timeout-minutes: ${{ (inputs.scale || 'default') == 'default' && 240 || 355 }}
+    env:
+      # On the runner's disk, never tmpfs; the lane refuses a memory filesystem.
+      MINNOW_BROWSER_PERF_DIR: ${{ runner.temp }}/minnow-browser-perf
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: bash scripts/ci-install.sh
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Run the lane
+        # An explicit Bash shell enables pipefail, so tee cannot turn a failed lane into a green job.
+        shell: bash
+        run: >-
+          npm run benchmark:browser --
+          --scale=${{ inputs.scale || 'default' }}
+          --out=browser-perf-results
+          ${{ inputs.update && '--update' || '' }}
+          2>&1 | tee browser-perf.txt
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: browser-perf
+          path: |
+            browser-perf.txt
+            browser-perf-results/
+            packages/core/browser-perf-baseline.json
+          retention-days: 90

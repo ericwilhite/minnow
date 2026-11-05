@@ -86,10 +86,13 @@ The checked performance envelope includes:
 - browser OLAP scans, joins, windows, aggregates, and 10,000–100,000 row writes;
 - IndexedDB, OPFS, direct-engine, worker-client, and live-query paths; and
 - memory soaks covering queries, writes with maintenance, live-query churn, and repeated
-  snapshot import/export.
+  snapshot import/export; and
+- a nightly browser lane on a real disk: point reads and writes against SQLite-Wasm, and wide and
+  star-schema analytics against DuckDB-Wasm, including whether each shape completes and whether
+  the store reopens after a failure.
 
-The Node gate is a regression alarm against a reviewed baseline, not a published comparison with
-other engines. The [benchmarks page](/benchmarks) runs verified workloads on the visitor's own
+The Node gate and the browser lane are regression alarms against reviewed baselines, not published
+comparisons with other engines. The [benchmarks page](/benchmarks) runs verified workloads on the visitor's own
 browser and keeps each operation visible instead of reducing them to a marketing score.
 
 ## 1.0 release-candidate checklist

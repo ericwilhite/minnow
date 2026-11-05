@@ -98,6 +98,7 @@ npm run test:browser:conformance # full SQL corpus and long interaction plans in
 npm run test:browser:pos # isolated sustained POS correctness and latency checks
 npm run test:consumer  # install packed libraries in a clean Vite app and run it
 npm run site:dev       # docs, live console, and browser benchmarks
+npm run benchmark:browser # performance lane: Minnow against SQLite-Wasm and DuckDB-Wasm in Chromium, on disk
 ```
 
 See [Testing and benchmarks](https://minnowdb.com/docs/reference/testing/) for the complete test

@@ -40,6 +40,7 @@ after generated declarations or asynchronous signatures change.
 | `npm run test:browser`             | Both browser runners, in sequence                                                                                                                              | Cross-browser regression checks                 |
 | `npm run test:consumer`            | Packed libraries installed, typed, bundled, and run outside the workspace                                                                                      | Package and public-entry changes                |
 | `npm run benchmark:gate`           | Seeded Node performance ratios against the checked-in baseline                                                                                                 | Query-executor and write-path changes           |
+| `npm run benchmark:browser`        | Minnow against SQLite-Wasm and DuckDB-Wasm in real Chromium on a real disk, judged against the checked-in browser baseline                                     | Storage, executor, and worker changes           |
 | `npm run benchmark:sizes`          | Download size of Minnow, SQLite Wasm, and PGlite, from the installed packages                                                                                  | Dependency or public-entry changes              |
 | `npm run benchmark:live-wide`      | Allocation per thread, deliveries, and time to rows for one wide live query from subscribe and from a Suspense load                                            | Live-query, projection, and result-wire changes |
 | `npm run api:check`                | The public API surface against the committed contract snapshot                                                                                                 | Public-entry or declaration changes             |
@@ -79,6 +80,8 @@ much as it measures the code, and a merge gate that fails on a noisy runner is o
 re-run rather than read. When a completed run crosses a ratio threshold, the gate starts a fresh
 process and fails only if that same workload and comparison engine cross it again. Setup errors,
 missing profiles, and incomplete runs still fail immediately.
+`.github/workflows/browser-performance.yml` runs the [browser performance lane](#browser-performance-lane)
+nightly, also off the merge path, and uploads its JSON lines and summary as an artifact.
 
 Each browser runner owns its test directory, server, port, and build prerequisites. Shared browser
 defaults live in `playwright.shared.mjs`; runner-specific configuration stays in its named
@@ -1046,6 +1049,110 @@ npm run benchmark:gate -- --update
 ```
 
 Treat that update as a code change: explain it in review and run the gate again without `--update`.
+
+## Browser performance lane
+
+`npm run benchmark:browser` measures Minnow in real Chromium against the engines an application
+would otherwise ship: SQLite-Wasm for point reads and writes, and single-thread DuckDB-Wasm for
+wide and large analytics. Like the Node gate, it judges ratios against a competitor measured in the
+same run, never wall-clock budgets. These numbers are not published anywhere; the
+[benchmarks page](/benchmarks) is the only place results are shown, and it runs in the visitor's
+browser.
+
+```bash
+npx playwright install chromium   # once
+npm run benchmark:browser                                   # point suite, then W1M, W500 and S1
+npm run benchmark:browser -- --suite=point
+npm run benchmark:browser -- --suite=analytics --scale=W1M --only=scan_proj3_agg,agg_numeric_sum
+npm run benchmark:browser -- --suite=analytics --scale=large         # W5M and S5, hours
+```
+
+| Option                          | Effect                                                                                        |
+| ------------------------------- | --------------------------------------------------------------------------------------------- |
+| `--suite=point\|analytics\|all` | Which suite to run; default `all`                                                             |
+| `--scale=default\|large\|<ids>` | Analytics datasets: `default` is W1M, W500 and S1; `large` is W5M and S5                      |
+| `--only=<cells>`                | Comma-separated cell ids (`W1M/scan_proj3_agg`), query ids (`scan_proj3_agg`), or point cells |
+| `--with-sqlite`                 | Adds SQLite-Wasm to the analytics suite, on W1M and S1 only                                   |
+| `--warm=<n>`                    | Warm runs per cell; at least 5 for a baseline update                                          |
+| `--timeout-ms=<ms>`             | Per-run deadline in the page; the engine's worker is terminated when it passes                |
+| `--reload`                      | Loads every dataset again instead of reusing the cached copy                                  |
+| `--update`                      | Recalibrates this runtime profile in `packages/core/browser-perf-baseline.json`               |
+| `--out=<dir>`                   | Where `cells.jsonl`, `summary.txt` and `lane.log` go                                          |
+| `--no-confirm`                  | Skips the confirmation re-run of flagged cells                                                |
+
+**The suites.**
+
+- **Point**, against SQLite-Wasm on the OPFS SAH-pool VFS: a 1M-row keyed load; strict single
+  inserts; strict concurrent inserts from 8, 32 and 64 callers (Minnow spreads them over up to
+  eight worker connections in one page, so they meet one leader; SQLite's pool allows one worker,
+  which runs them in turn); relaxed parameterized inserts; warm primary-key reads on an INTEGER
+  key (bound and literal) and a UUID text key; the first read after a reopen at 1M rows; a read
+  from a second tab; and reads on a compacted table before and after 2,000 uncompacted updates.
+  Reads are timed in batches of 200, because a page without cross-origin isolation has a coarse
+  clock.
+- **Analytics**, against DuckDB-Wasm 1.32.0: the wide table (200 columns at 1M rows, 500 columns
+  at 250k rows) and the commerce star schema from `apps/site/bench`, at the query families of
+  scans, wide aggregation, joins, windows and sorts, plus three spill shapes under a 64 MiB and a
+  256 MiB cap. W5M and S5 (5M rows) are opt-in.
+
+**What each cell records** (one JSON line per engine per cell): the warm median and p95 over at
+least five runs; the cold first run in a fresh worker after reopening the database; renderer RSS
+after open; peak renderer RSS (`/proc/<pid>/status` VmHWM, reset with `clear_refs` before the
+cell); renderer CPU time across all threads (`/proc/<pid>/stat`); the result hash; and, when the
+cell fails, its failure class and message. Memory and CPU need Linux and are marked unavailable
+elsewhere.
+
+**Rules the lane enforces.** Each of these was once a wrong measurement:
+
+- The browser profile is a persistent one (`launchPersistentContext`); an ephemeral context keeps
+  OPFS in memory. The lane refuses a profile on tmpfs or ramfs, and proves OPFS is on disk by
+  writing a probe file and watching the profile grow. The profile lives in
+  `~/.cache/minnow-browser-perf`; set `MINNOW_BROWSER_PERF_DIR` to move it.
+- One fixed origin, `http://127.0.0.1:8791` (`MINNOW_BROWSER_PERF_PORT`), so a database loaded in
+  one run is the one later runs read. A port in use is an error.
+- Every write cell names its durability. SQLite's pragmas are read back after they are set and
+  recorded as they were: WAL only takes effect on the SAH pool with `locking_mode=EXCLUSIVE`, so
+  the strict set is EXCLUSIVE + WAL + `synchronous=FULL` and the relaxed set uses
+  `synchronous=NORMAL`.
+- DuckDB-Wasm is pinned to exactly 1.32.0, the EH single-thread bundle, on an `opfs://`
+  database. The 1.33 development builds keep `opfs://` databases in memory without an error, and
+  the threaded build cannot open OPFS at all, so neither is used.
+- Every result is canonicalized and hashed, order-sensitively when the ORDER BY is total, and
+  Minnow's hash is compared with the reference engine's. Results of up to 2,000 rows are kept, so a
+  hash difference is rechecked with a 1e-9 relative tolerance and reported as `tolerance` or
+  `ties` (only near-equal float keys changed places) rather than as a wrong answer.
+- A failure is recorded, never fatal to the run. After any failed Minnow cell the lane reopens the
+  store in a fresh page and counts the table; a store that will not reopen fails the run at once.
+
+A whole default run takes about an hour on an 8-thread laptop, most of it the first loads.
+
+**Cached datasets.** Loading W1M takes minutes per engine, so loaded databases stay in the
+profile between runs. `datasets.json` in the lane directory keys each copy by the generator
+version (`GENERATOR_VERSION` in `scripts/browser-perf/catalogue.ts`) and the engine's package
+version, and every reuse first reopens the copy and checks its row count. Bump the generator version
+when a generator, schema or load path changes. Delete the lane directory to reclaim the disk
+space; the default scales take several gigabytes, the large ones tens.
+
+**The baseline.** `packages/core/browser-perf-baseline.json` holds, per runtime profile (OS,
+architecture, Chromium major), what each cell does today: `completes` with its ratio and a
+regression threshold, or `fails` with its failure class. Many analytics cells fail at default
+options today, and the baseline says so. The lane fails when:
+
+- a Minnow store does not reopen after a failed cell;
+- Minnow's result differs from the reference engine's;
+- a cell that used to complete now fails, and fails again in a fresh browser;
+- a ratio's whole sampled range (Minnow's fastest run against the reference's slowest) is past
+  its threshold, and is again in a fresh browser;
+- a cell has no baseline entry on this profile.
+
+A cell that starts completing, or fails differently, is reported as a note. Thresholds pin the
+current ratio with 1.5× to 3× headroom, sized from the spread of both engines' samples. The same
+file carries the design targets for the 1.0 reset (Gates A–D and the point targets); the summary
+prints each cell's progress toward its target and never fails on one. `--update` rewrites the
+current profile's cells it ran and keeps every other profile and the targets. A profile marked
+`provisional` was calibrated on a noisy or unrepresentative host; recalibrate it on the machine
+that runs the lane, with the nightly workflow's `update` input, and treat that update as a code
+change.
 
 ## Refresh the download-size comparison
 

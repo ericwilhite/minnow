@@ -66,9 +66,11 @@
     "benchmark:compare": "vite-node scripts/perf-gate.mts --compare",
     "test:differential": "vitest run packages/core/src/testing/differential-harness.test.ts",
     "test:differential:nightly": "MINNOW_DIFFERENTIAL_PROFILE=nightly vitest run packages/core/src/testing/differential-harness.test.ts",
-    "fixture:differential": "vite-node scripts/differential-corpus.mts"
+    "fixture:differential": "vite-node scripts/differential-corpus.mts",
+    "benchmark:browser": "tsc -b packages/core && vite-node scripts/browser-perf.mts"
   },
   "devDependencies": {
+    "@duckdb/duckdb-wasm": "1.32.0",
     "@electric-sql/pglite": "^0.5.5",
     "@eslint/js": "^10.0.1",
     "@minnowdb/core-layout10": "npm:@minnowdb/core@0.15.0",
@@ -78,8 +80,10 @@
     "@minnowdb/core-layout8": "npm:@minnowdb/core@0.13.1",
     "@minnowdb/core-layout9": "npm:@minnowdb/core@0.14.1",
     "@playwright/test": "^1.62.1",
+    "@sqlite.org/sqlite-wasm": "^3.53.0-build1",
     "@types/node": "^26.2.0",
     "@vitest/coverage-v8": "^4.1.11",
+    "apache-arrow": "^17.0.0",
     "esbuild": "^0.28.1",
     "eslint": "^10.8.1",
     "fake-indexeddb": "^6.2.5",

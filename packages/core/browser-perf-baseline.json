@@ -1,0 +1,1267 @@
+{
+  "schemaVersion": 1,
+  "targets": {
+    "point/load_keyed_1m_strict": {
+      "gate": "point",
+      "ms": 1500
+    },
+    "point/insert_single_strict": {
+      "gate": "point",
+      "ratio": 1.1,
+      "note": "SQLite EXCLUSIVE+WAL+FULL; flush-bound, so parity is the ceiling"
+    },
+    "point/insert_concurrent_strict_8": {
+      "gate": "point",
+      "ratio": 0.667,
+      "note": "\u22651.5\u00d7 SQLite throughput; p95 \u22641.1\u00d7"
+    },
+    "point/insert_concurrent_strict_32": {
+      "gate": "point",
+      "ratio": 0.667,
+      "note": "\u22651.5\u00d7 SQLite throughput; p95 \u22641.1\u00d7"
+    },
+    "point/insert_concurrent_strict_64": {
+      "gate": "point",
+      "ratio": 0.667,
+      "note": "\u22651.5\u00d7 SQLite throughput; p95 \u22641.1\u00d7"
+    },
+    "point/insert_prepared_relaxed": {
+      "gate": "point",
+      "ratio": 0.8,
+      "note": "\u22651.25\u00d7 SQLite relaxed throughput; \u226420 \u00b5s owner CPU per insert"
+    },
+    "point/pk_read_warm_int": {
+      "gate": "point",
+      "ms": 0.01,
+      "note": "owner-side target; this cell includes the worker round trip"
+    },
+    "point/pk_read_warm_int_literal": {
+      "gate": "point",
+      "ms": 0.01,
+      "note": "owner-side target; this cell includes the worker round trip"
+    },
+    "point/pk_read_warm_uuid": {
+      "gate": "point",
+      "ms": 0.015,
+      "note": "owner-side target; this cell includes the worker round trip"
+    },
+    "point/pk_read_cold_1m": {
+      "gate": "point",
+      "ms": 3
+    },
+    "point/pk_read_cross_tab": {
+      "gate": "point",
+      "ms": 0.25
+    },
+    "point/pk_read_after_2k_writes": {
+      "gate": "point",
+      "ratio": 1.2,
+      "versus": "point/pk_read_compacted"
+    },
+    "W1M/scan_first_page": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/scan_first_page_ordered": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/scan_proj3_agg": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/scan_selective_30col": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/scan_export_all": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true,
+      "note": "streams \u2265190k rows/s with RSS \u2264 baseline + 256 MB"
+    },
+    "W1M/agg_3dims_20aggs": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/agg_highcard_text": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/agg_highcard_int": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/agg_count_distinct": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/agg_count_distinct_grouped": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/agg_numeric_sum": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/agg_numeric_grouped": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/join_star_3dims": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/join_fact_fact_int": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/join_fact_fact_text": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/join_semi_exists": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/join_anti_not_exists": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/win_topk_row_number": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/win_rank": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/win_running_sum": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/win_lag_lead": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/win_moving_avg": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/win_median_pct": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/sort_full_numeric": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/sort_full_text": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/sort_deep_offset": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/sort_deep_offset_pk": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true,
+      "note": "\u226420 ms cold"
+    },
+    "W1M/sort_topn": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/sort_topn_wide": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W1M/spill_group_1m@64MiB": {
+      "gate": "A",
+      "completes": true,
+      "note": "completes under the cap in \u22643\u00d7 its unbounded time; DuckDB-Wasm cannot spill"
+    },
+    "W1M/spill_group_1m@256MiB": {
+      "gate": "A",
+      "completes": true,
+      "note": "completes under the cap"
+    },
+    "W1M/spill_sort_wide_text@64MiB": {
+      "gate": "A",
+      "completes": true,
+      "note": "completes under the cap in \u22643\u00d7 its unbounded time; DuckDB-Wasm cannot spill"
+    },
+    "W1M/spill_sort_wide_text@256MiB": {
+      "gate": "A",
+      "completes": true,
+      "note": "completes under the cap"
+    },
+    "W1M/spill_hash_join_text@64MiB": {
+      "gate": "A",
+      "completes": true,
+      "note": "completes under the cap in \u22643\u00d7 its unbounded time; DuckDB-Wasm cannot spill"
+    },
+    "W1M/spill_hash_join_text@256MiB": {
+      "gate": "A",
+      "completes": true,
+      "note": "completes under the cap"
+    },
+    "W500/scan_first_page": {
+      "gate": "C",
+      "ratio": 1,
+      "ms": 32,
+      "completes": true
+    },
+    "W500/scan_first_page_ordered": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/scan_proj3_agg": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/scan_selective_30col": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/scan_export_all": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/agg_3dims_20aggs": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/agg_highcard_text": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/agg_highcard_int": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/agg_count_distinct": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/agg_count_distinct_grouped": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/agg_numeric_sum": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/agg_numeric_grouped": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/join_star_3dims": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/join_fact_fact_int": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/join_fact_fact_text": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/join_semi_exists": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/join_anti_not_exists": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/win_topk_row_number": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/win_rank": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/win_running_sum": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/win_lag_lead": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/win_moving_avg": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/win_median_pct": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/sort_full_numeric": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/sort_full_text": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/sort_deep_offset": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/sort_deep_offset_pk": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/sort_topn": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W500/sort_topn_wide": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "S1/S_q2": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "S1/S_q3": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "S1/S_q4": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "S1/S_q5": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "S1/S_q6": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "S1/S_q7": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "S1/S_q8": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "S1/S_q9": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "S1/S_q10": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "S1/S_q11": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "S1/S_q14": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "S1/S_q15": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "S1/S_fact_fact": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "S1/S_semi": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "S1/S_anti": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "S1/S_m2m": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/scan_first_page": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/scan_first_page_ordered": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/scan_proj3_agg": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/scan_selective_30col": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/scan_export_all": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/agg_3dims_20aggs": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/agg_highcard_text": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/agg_highcard_int": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/agg_count_distinct": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/agg_count_distinct_grouped": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/agg_numeric_sum": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/agg_numeric_grouped": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/join_star_3dims": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/join_fact_fact_int": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/join_fact_fact_text": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/join_semi_exists": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/join_anti_not_exists": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/win_topk_row_number": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/win_rank": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/win_running_sum": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/win_lag_lead": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/win_moving_avg": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/win_median_pct": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/sort_full_numeric": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/sort_full_text": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/sort_deep_offset": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/sort_deep_offset_pk": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/sort_topn": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/sort_topn_wide": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "W5M/spill_group_1m@64MiB": {
+      "gate": "A",
+      "completes": true,
+      "note": "completes under the cap in \u22643\u00d7 its unbounded time; DuckDB-Wasm cannot spill"
+    },
+    "W5M/spill_group_1m@256MiB": {
+      "gate": "A",
+      "completes": true,
+      "note": "completes under the cap"
+    },
+    "W5M/spill_sort_wide_text@64MiB": {
+      "gate": "A",
+      "completes": true,
+      "note": "completes under the cap in \u22643\u00d7 its unbounded time; DuckDB-Wasm cannot spill"
+    },
+    "W5M/spill_sort_wide_text@256MiB": {
+      "gate": "A",
+      "completes": true,
+      "note": "completes under the cap"
+    },
+    "W5M/spill_hash_join_text@64MiB": {
+      "gate": "A",
+      "completes": true,
+      "note": "completes under the cap in \u22643\u00d7 its unbounded time; DuckDB-Wasm cannot spill"
+    },
+    "W5M/spill_hash_join_text@256MiB": {
+      "gate": "A",
+      "completes": true,
+      "note": "completes under the cap"
+    },
+    "S5/S_q2": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "S5/S_q3": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "S5/S_q4": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "S5/S_q5": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "S5/S_q6": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "S5/S_q7": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "S5/S_q8": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "S5/S_q9": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "S5/S_q10": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "S5/S_q11": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "S5/S_q14": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "S5/S_q15": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "S5/S_fact_fact": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "S5/S_semi": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "S5/S_anti": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    },
+    "S5/S_m2m": {
+      "gate": "C",
+      "ratio": 1,
+      "completes": true
+    }
+  },
+  "profiles": {
+    "linux-x64-chromium151": {
+      "provisional": true,
+      "recorded": "2026-11-05 on 8 threads, 15 GiB",
+      "note": "First calibration on a shared 8-thread / 15 GiB laptop (btrfs on NVMe) while other agents ran test suites; timings are noisy. Recalibrate on the nightly runner with the workflow's update input before tightening anything.",
+      "cells": {
+        "S1/S_anti": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 8.34,
+          "threshold": 13.9
+        },
+        "S1/S_fact_fact": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 3.22,
+          "threshold": 4.83
+        },
+        "S1/S_m2m": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 4.61,
+          "threshold": 6.92
+        },
+        "S1/S_q10": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 5.41,
+          "threshold": 8.99
+        },
+        "S1/S_q11": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 2.19,
+          "threshold": 3.62
+        },
+        "S1/S_q14": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 3.11,
+          "threshold": 4.66
+        },
+        "S1/S_q15": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 12.7,
+          "threshold": 19.1
+        },
+        "S1/S_q2": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 7.21,
+          "threshold": 12.5
+        },
+        "S1/S_q3": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 2.13,
+          "threshold": 6.39
+        },
+        "S1/S_q4": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 9.71,
+          "threshold": 24.4
+        },
+        "S1/S_q5": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 4.17,
+          "threshold": 6.26
+        },
+        "S1/S_q6": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 7.11,
+          "threshold": 14.2
+        },
+        "S1/S_q7": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 5.32,
+          "threshold": 7.97
+        },
+        "S1/S_q8": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 10.1,
+          "threshold": 18.4
+        },
+        "S1/S_q9": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 8.38,
+          "threshold": 12.6
+        },
+        "S1/S_semi": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 8.51,
+          "threshold": 18.5
+        },
+        "W1M/agg_3dims_20aggs": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 21.8,
+          "threshold": 42.5
+        },
+        "W1M/agg_count_distinct": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 8.18,
+          "threshold": 17.7
+        },
+        "W1M/agg_count_distinct_grouped": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 6.91,
+          "threshold": 11.7
+        },
+        "W1M/agg_highcard_int": {
+          "reference": "duckdb",
+          "status": "fails",
+          "failure": "spill-limit"
+        },
+        "W1M/agg_highcard_text": {
+          "reference": "duckdb",
+          "status": "fails",
+          "failure": "spill-limit"
+        },
+        "W1M/agg_numeric_grouped": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 692,
+          "threshold": 1040
+        },
+        "W1M/agg_numeric_sum": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 1370,
+          "threshold": 2270
+        },
+        "W1M/join_anti_not_exists": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 2.68,
+          "threshold": 8.03
+        },
+        "W1M/join_fact_fact_int": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 0.954,
+          "threshold": 2.52
+        },
+        "W1M/join_fact_fact_text": {
+          "reference": "duckdb",
+          "status": "fails",
+          "failure": "budget"
+        },
+        "W1M/join_semi_exists": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 2.87,
+          "threshold": 5.22
+        },
+        "W1M/join_star_3dims": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 1.66,
+          "threshold": 2.75
+        },
+        "W1M/scan_export_all": {
+          "reference": "duckdb",
+          "status": "fails",
+          "failure": "budget"
+        },
+        "W1M/scan_first_page": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 107,
+          "threshold": 222
+        },
+        "W1M/scan_first_page_ordered": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 16.4,
+          "threshold": 27.7
+        },
+        "W1M/scan_proj3_agg": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 2.32,
+          "threshold": 6.95
+        },
+        "W1M/scan_selective_30col": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 110,
+          "threshold": 172
+        },
+        "W1M/sort_deep_offset": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 0.57,
+          "threshold": 1.07
+        },
+        "W1M/sort_deep_offset_pk": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 0.00187,
+          "threshold": 0.00562
+        },
+        "W1M/sort_full_numeric": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 3.49,
+          "threshold": 5.43
+        },
+        "W1M/sort_full_text": {
+          "reference": "duckdb",
+          "status": "fails",
+          "failure": "timeout"
+        },
+        "W1M/sort_topn": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 7.13,
+          "threshold": 10.7
+        },
+        "W1M/sort_topn_wide": {
+          "reference": "duckdb",
+          "status": "fails",
+          "failure": "budget"
+        },
+        "W1M/spill_group_1m@256MiB": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 16.8,
+          "threshold": 50.4
+        },
+        "W1M/spill_group_1m@64MiB": {
+          "reference": "duckdb",
+          "status": "fails",
+          "failure": "spill-limit"
+        },
+        "W1M/spill_hash_join_text@256MiB": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 8.32,
+          "threshold": 15.6
+        },
+        "W1M/spill_hash_join_text@64MiB": {
+          "reference": "duckdb",
+          "status": "fails",
+          "failure": "budget"
+        },
+        "W1M/spill_sort_wide_text@256MiB": {
+          "reference": "duckdb",
+          "status": "completes"
+        },
+        "W1M/spill_sort_wide_text@64MiB": {
+          "reference": "duckdb",
+          "status": "fails",
+          "failure": "timeout"
+        },
+        "W1M/win_lag_lead": {
+          "reference": "duckdb",
+          "status": "fails",
+          "failure": "budget"
+        },
+        "W1M/win_median_pct": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 10.1,
+          "threshold": 17.7
+        },
+        "W1M/win_moving_avg": {
+          "reference": "duckdb",
+          "status": "fails",
+          "failure": "budget"
+        },
+        "W1M/win_rank": {
+          "reference": "duckdb",
+          "status": "fails",
+          "failure": "budget"
+        },
+        "W1M/win_running_sum": {
+          "reference": "duckdb",
+          "status": "fails",
+          "failure": "budget"
+        },
+        "W1M/win_topk_row_number": {
+          "reference": "duckdb",
+          "status": "fails",
+          "failure": "budget"
+        },
+        "W500/agg_3dims_20aggs": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 27,
+          "threshold": 46.8
+        },
+        "W500/agg_count_distinct": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 2.32,
+          "threshold": 4.12
+        },
+        "W500/agg_count_distinct_grouped": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 3.16,
+          "threshold": 6.27
+        },
+        "W500/agg_highcard_int": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 25.2,
+          "threshold": 75.5
+        },
+        "W500/agg_highcard_text": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 21.4,
+          "threshold": 44.9
+        },
+        "W500/agg_numeric_grouped": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 581,
+          "threshold": 871
+        },
+        "W500/agg_numeric_sum": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 1260,
+          "threshold": 1890
+        },
+        "W500/join_anti_not_exists": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 5.35,
+          "threshold": 11.2
+        },
+        "W500/join_fact_fact_int": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 1.48,
+          "threshold": 4.45
+        },
+        "W500/join_fact_fact_text": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 3.28,
+          "threshold": 5.1
+        },
+        "W500/join_semi_exists": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 3.72,
+          "threshold": 7.98
+        },
+        "W500/join_star_3dims": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 3.86,
+          "threshold": 11.1
+        },
+        "W500/scan_export_all": {
+          "reference": "duckdb",
+          "status": "fails",
+          "failure": "budget"
+        },
+        "W500/scan_first_page": {
+          "reference": "duckdb",
+          "status": "fails",
+          "failure": "budget"
+        },
+        "W500/scan_first_page_ordered": {
+          "reference": "duckdb",
+          "status": "fails",
+          "failure": "budget"
+        },
+        "W500/scan_proj3_agg": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 1.69,
+          "threshold": 5.06
+        },
+        "W500/scan_selective_30col": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 143,
+          "threshold": 215
+        },
+        "W500/sort_deep_offset": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 0.755,
+          "threshold": 1.2
+        },
+        "W500/sort_deep_offset_pk": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 0.0156,
+          "threshold": 0.0468
+        },
+        "W500/sort_full_numeric": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 5.81,
+          "threshold": 11
+        },
+        "W500/sort_full_text": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 7.45,
+          "threshold": 14.6
+        },
+        "W500/sort_topn": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 0.146,
+          "threshold": 0.438
+        },
+        "W500/sort_topn_wide": {
+          "reference": "duckdb",
+          "status": "fails",
+          "failure": "budget"
+        },
+        "W500/win_lag_lead": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 10.2,
+          "threshold": 19.1
+        },
+        "W500/win_median_pct": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 12.4,
+          "threshold": 22.8
+        },
+        "W500/win_moving_avg": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 5.96,
+          "threshold": 9.76
+        },
+        "W500/win_rank": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 9.46,
+          "threshold": 16.9
+        },
+        "W500/win_running_sum": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 3.98,
+          "threshold": 11.7
+        },
+        "W500/win_topk_row_number": {
+          "reference": "duckdb",
+          "status": "completes",
+          "ratio": 5.83,
+          "threshold": 8.74
+        },
+        "point/insert_concurrent_strict_32": {
+          "reference": "sqlite",
+          "status": "completes",
+          "ratio": 31.9,
+          "threshold": 70.4
+        },
+        "point/insert_concurrent_strict_64": {
+          "reference": "sqlite",
+          "status": "completes",
+          "ratio": 31,
+          "threshold": 59.3
+        },
+        "point/insert_concurrent_strict_8": {
+          "reference": "sqlite",
+          "status": "completes",
+          "ratio": 26,
+          "threshold": 78
+        },
+        "point/insert_prepared_relaxed": {
+          "reference": "sqlite",
+          "status": "completes",
+          "ratio": 14.4,
+          "threshold": 40.4
+        },
+        "point/insert_single_strict": {
+          "reference": "sqlite",
+          "status": "completes",
+          "ratio": 5,
+          "threshold": 13.4
+        },
+        "point/load_keyed_1m_strict": {
+          "reference": "sqlite",
+          "status": "completes",
+          "ratio": 0.554,
+          "threshold": 1.66
+        },
+        "point/pk_read_after_2k_writes": {
+          "reference": "sqlite",
+          "status": "completes",
+          "ratio": 214,
+          "threshold": 405
+        },
+        "point/pk_read_cold_1m": {
+          "reference": "sqlite",
+          "status": "completes",
+          "ratio": 166,
+          "threshold": 497
+        },
+        "point/pk_read_compacted": {
+          "reference": "sqlite",
+          "status": "completes",
+          "ratio": 143,
+          "threshold": 428
+        },
+        "point/pk_read_cross_tab": {
+          "reference": "sqlite",
+          "status": "completes",
+          "ratio": 499,
+          "threshold": 1500
+        },
+        "point/pk_read_warm_int": {
+          "reference": "sqlite",
+          "status": "completes",
+          "ratio": 312,
+          "threshold": 936
+        },
+        "point/pk_read_warm_int_literal": {
+          "reference": "sqlite",
+          "status": "completes",
+          "ratio": 173,
+          "threshold": 520
+        },
+        "point/pk_read_warm_uuid": {
+          "reference": "sqlite",
+          "status": "completes",
+          "ratio": 4.07,
+          "threshold": 12.2
+        }
+      }
+    }
+  }
+}
