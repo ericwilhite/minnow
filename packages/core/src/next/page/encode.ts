@@ -51,7 +51,8 @@ export interface EncodedPage {
 
 /** Grows by doubling; every page starts at byte 0 of an 8-aligned ArrayBuffer. */
 export class PageScratch {
-  #buffer = new ArrayBuffer(64 * 1024);
+  /** Empty until the first page: the owner charges (via `onGrow`) before anything is allocated. */
+  #buffer = new ArrayBuffer(0);
 
   /** `onGrow(newBytes, oldBytes)` runs before a larger buffer replaces the current one. */
   constructor(private readonly onGrow: ((grown: number, old: number) => void) | null = null) {}
@@ -63,7 +64,7 @@ export class PageScratch {
   /** A zeroed buffer of at least `bytes`, valid until the next call. */
   take(bytes: number): ArrayBuffer {
     if (bytes > this.#buffer.byteLength) {
-      let size = this.#buffer.byteLength * 2;
+      let size = Math.max(64 * 1024, this.#buffer.byteLength * 2);
       while (size < bytes) size *= 2;
       this.onGrow?.(size, this.#buffer.byteLength);
       this.#buffer = new ArrayBuffer(size);

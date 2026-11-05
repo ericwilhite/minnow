@@ -210,7 +210,7 @@ is access's `Snapshot`.
   group-scoped dictionary.
 - NUMERIC: a declared scale makes a fixed-scale chunk; an unconstrained NUMERIC keeps each
   value's scale (a per-row section, or one scale per page), and its min/max are normalized sort
-  keys (value order, scale ignored, R15.10). Coefficients are stored by the int64 rules when they
+  keys (value order, scale ignored, R15.10), chosen by comparing the exact key bytes. Coefficients are stored by the int64 rules when they
   fit, else as 128-bit limbs. Past 128 bits, and a single value too large for one page, is
   `UnsupportedPageLayoutError` (large values: Phase 2, R15.4).
 - Floats: min/max follow PostgreSQL's order (NaN above +Infinity): max is NaN when any NaN is
@@ -233,7 +233,8 @@ is access's `Snapshot`.
   the parsed directory) is charged to the reader's budget until `release` or `close`.
 - Decoders write into caller-owned vector buffers, with no JS strings and no per-value
   allocation: by range, by selection (late materialization), or as dictionary codes. A page
-  flagged `safe` is rechecked when decoded into f64 unless its header bounds every value.
+  flagged `safe` is rechecked when decoded into f64 unless its int64 or decimal header bounds every
+  value (interval pages are always rechecked).
 - `memory-extents.ts` is an in-memory extent space (writer, builder with `extend`, verified and
   cached reads) for tests and benchmarks; `scripts/page-format-bench.mts` measures the codecs
   against today's block format.

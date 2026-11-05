@@ -304,7 +304,12 @@ export function parsePage(
   }
   check(bytes.length === length, "Page length differs from its contents");
   const baseNumber = baseHigh * 4_294_967_296 + (baseLow >>> 0);
-  const boundSafe = safe && headerBoundsSafe(kind, width, baseNumber, checkpoints, rows);
+  // Only an int64 or decimal-coefficient payload supplies the base the proof reads; an interval's
+  // base is not decoded here, so its pages are always rechecked value by value (B2-2 #2).
+  const boundSafe =
+    safe &&
+    (tag === ValueTag.i64 || tag === ValueTag.dec64) &&
+    headerBoundsSafe(kind, width, baseNumber, checkpoints, rows);
   return {
     bytes,
     kind,

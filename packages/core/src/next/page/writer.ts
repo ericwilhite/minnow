@@ -811,57 +811,23 @@ class DecimalWriter extends ColumnWriter {
     return { ...page, min, max };
   }
 
-  /** The value's order class (PostgreSQL: −Infinity < finite < +Infinity < NaN). */
-  #orderClass(row: number): number {
-    const special = this.specials[row] ?? 0;
-    return special === 3 ? 0 : special === 0 ? 1 : special === 2 ? 2 : 3;
-  }
-
-  /** A double close to the value (exact enough to order values that are not near-equal). */
-  #approximate(row: number, scales: Uint16Array): number {
-    const slot = row * 4;
-    const high = (this.limbs[slot + 1] ?? 0) | 0;
-    const sign = (high >> 31) >>> 0;
-    const coefficient =
-      (this.limbs[slot + 2] ?? 0) === sign && (this.limbs[slot + 3] ?? 0) === sign
-        ? high * TWO32 + (this.limbs[slot] ?? 0)
-        : Number(int128At(this.limbs, row));
-    return coefficient / 10 ** (scales[row] ?? 0);
-  }
-
-  /** Value order of two finite or special rows, scale ignored (1.5 = 1.50). */
-  #compare(a: number, b: number, scales: Uint16Array): number {
-    const classA = this.#orderClass(a);
-    const classB = this.#orderClass(b);
-    if (classA !== classB) return classA - classB;
-    if (classA !== 1) return 0;
-    const x = this.#approximate(a, scales);
-    const y = this.#approximate(b, scales);
-    if (x !== y && Math.abs(x - y) > 1e-9 * Math.max(Math.abs(x), Math.abs(y)))
-      return x < y ? -1 : 1;
-    // Near-equal: compare exactly at the larger scale.
-    const scaleA = scales[a] ?? 0;
-    const scaleB = scales[b] ?? 0;
-    const top = Math.max(scaleA, scaleB);
-    const left = int128At(this.limbs, a) * 10n ** BigInt(top - scaleA);
-    const right = int128At(this.limbs, b) * 10n ** BigInt(top - scaleB);
-    return left < right ? -1 : left > right ? 1 : 0;
-  }
-
   /**
-   * Normalized bounds of a mixed-scale page (ruling R15.10): the sort keys (keys/key-encoding.ts,
-   * value order, scale ignored, specials in PostgreSQL's order) of its least and greatest values.
+   * Normalized bounds of a mixed-scale page (ruling R15.10): the sort keys (keys/key-encoding.ts:
+   * value order, scale ignored, specials in PostgreSQL's order) of its least and greatest values,
+   * chosen by comparing those exact key bytes, never an approximation (B2-2 #1).
    */
   #mixedBounds(scales: Uint16Array): [Uint8Array, Uint8Array] {
     const validity = this.pageValidity;
-    let minRow = -1;
-    let maxRow = -1;
+    let min: Uint8Array | null = null;
+    let max: Uint8Array | null = null;
     for (let row = 0; row < this.rows; row++) {
       if (validity !== null && (((validity[row >>> 5] ?? 0) >>> (row & 31)) & 1) === 0) continue;
-      if (minRow < 0 || this.#compare(row, minRow, scales) < 0) minRow = row;
-      if (maxRow < 0 || this.#compare(row, maxRow, scales) > 0) maxRow = row;
+      const key = this.#sortKey(row, scales);
+      if (min === null || compareBytes(key, 0, key.length, min, 0, min.length) < 0) min = key;
+      if (max === null || compareBytes(key, 0, key.length, max, 0, max.length) > 0) max = key;
     }
-    return [this.#sortKey(minRow, scales), this.#sortKey(maxRow, scales)];
+    if (min === null || max === null) throw new Error("bounds of a page without valid rows");
+    return [min, max];
   }
 
   #sortKey(row: number, scales: Uint16Array): Uint8Array {
@@ -1219,7 +1185,6 @@ export class GroupWriter {
       this.memory.free(old);
     });
     try {
-      this.memory.grow(this.scratch.byteLength);
       this.#columns = options.columns.map((column) => columnWriter(this, column));
     } catch (error) {
       this.memory.free(this.memory.bytes);

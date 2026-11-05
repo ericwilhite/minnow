@@ -91,6 +91,20 @@ export function directoryCharge(directory: ChunkDirectory): number {
   return 256 + (directory.pages.length + (directory.dictionary === null ? 0 : 1)) * 192;
 }
 
+/** The smallest stored page entry (directory.ts): bounds a corrupt header's page count. */
+const MIN_ENTRY_BYTES = 26;
+
+/**
+ * `directoryCharge` read from the blob's header, before parsing: the page count (bounded by what
+ * the blob could hold) and the dictionary flag. Equal to `directoryCharge` of a valid directory.
+ */
+export function directoryChargeOf(bytes: Uint8Array): number {
+  if (bytes.length < 24) return 256;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const pages = Math.min(view.getUint32(12, true), Math.floor(bytes.length / MIN_ENTRY_BYTES));
+  return 256 + (pages + ((view.getUint8(6) & 1) !== 0 ? 1 : 0)) * 192;
+}
+
 /** `value`, or a `RangeError` (an index the caller just validated). */
 function at<T>(values: readonly T[], index: number): T {
   const value = values[index];
@@ -181,14 +195,20 @@ export class ChunkReader {
   ): MaybePromise<ChunkReader> {
     const ref = chunk.directory;
     const build = (bytes: Uint8Array): ChunkReader => {
-      const directory = parseDirectory(sized(bytes, ref.length), chunk.data.length);
-      check(
-        directory.tag === chunkTagOf(chunk.type),
-        "Page directory tag differs from the column type",
-      );
-      const charge = directoryCharge(directory);
+      // Charged from the header's page count before the parse builds anything (B2-2 #4).
+      const charge = directoryChargeOf(sized(bytes, ref.length));
       if (!options.budget.allocate(charge)) throw new PageBudgetError(charge);
-      return new ChunkReader(space, chunk, directory, options, charge);
+      try {
+        const directory = parseDirectory(bytes, chunk.data.length);
+        check(
+          directory.tag === chunkTagOf(chunk.type),
+          "Page directory tag differs from the column type",
+        );
+        return new ChunkReader(space, chunk, directory, options, charge);
+      } catch (error) {
+        options.budget.free(charge);
+        throw error;
+      }
     };
     const cached = space.peek(ref);
     if (cached !== null) return build(cached);
@@ -324,7 +344,8 @@ export class ChunkReader {
         installed++;
       }
     } catch (error) {
-      for (let k = installed; k < found.length; k++) {
+      // `#install` gave back the hold that failed (one owner per hold, B2-2 #3); the rest are ours.
+      for (let k = installed + 1; k < found.length; k++) {
         const { bytes, pinned } = at(found, k);
         this.#options.budget.free(bytes.length);
         if (pinned !== null) inflated?.unpin(pinned);
