@@ -93,6 +93,14 @@ describe("published package shape", () => {
     expect(manifest.files).toContain("!dist/storage/opfs/leader-test-helpers.*");
   });
 
+  it("keeps the unreleased rebuild core (src/next) out of the tarball until cut-over", async () => {
+    const manifest = JSON.parse(
+      await readFile(join(repoRoot, "packages", "core", "package.json"), "utf8"),
+    ) as { files?: string[]; exports?: Record<string, unknown> };
+    expect(manifest.files).toContain("!dist/next/**");
+    expect(Object.keys(manifest.exports ?? {}).filter((path) => path.includes("next"))).toEqual([]);
+  });
+
   it("boots browser tests through published package subpaths", async () => {
     const workerEntry = await readFile(
       join(repoRoot, "packages", "core", "browser", "published-worker.ts"),
@@ -180,6 +188,7 @@ describe("published core tarball", () => {
         "dist/testing/maintenance-diagnostics.js",
       );
       expect(report?.files.map(({ path }) => path)).toContain("dist/engine/query.d.ts");
+      expect(report?.files.filter(({ path }) => path.startsWith("dist/next/"))).toEqual([]);
       // Existing publication budgets also cover declaration pruning. Raised from 870,000 and
       // 4,300,000 with 0.10.1's coordination and recovery fixes, then to 920,000 and 4,500,000
       // when the interaction-plan simulator joined the published testing entry, then to 955,000

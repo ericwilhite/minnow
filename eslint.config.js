@@ -94,6 +94,10 @@ export default tseslint.config(
       // Reads the package's own sources off disk to assert the layering rules between the
       // storage contract, the adapter toolkit, and the engine.
       "packages/core/src/storage/contract-boundaries.test.ts",
+      // The same, for the rebuild core's module layers (next/README.md).
+      "packages/core/src/next/dependency-rules.test.ts",
+      // Exposes the collector through node:v8/node:vm to measure the driver's live heap.
+      "packages/core/src/next/exec/pipeline.test.ts",
       // Bundles the built package with esbuild to prove the storage adapters tree-shake.
       "packages/core/src/tree-shaking.test.ts",
       // Bundles and imports a temporary minified client to check error identity across RPC.
