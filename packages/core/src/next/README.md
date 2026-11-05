@@ -540,6 +540,14 @@ and the owner import it directly.
   `nextval` included, is at-least-once.
 - A transaction idle for `transactionIdleTimeoutMs` (30 s) is rolled back; the session then fails
   with `TransactionIdleTimeoutError` until the client ends it.
+- Sessions follow PostgreSQL: any error inside a transaction aborts it (25P02 until it ends);
+  savepoints are an ordered stack (a newer one shadows an older one of the same name; read-only
+  transactions may use them; ROLLBACK TO restores the transaction's counts). Statements plan
+  against the session's catalog, a transaction's own DDL included; plans of uncommitted schema
+  stay private to the session.
+- A hello whose generation is not newer than one already seen from the client is refused
+  (`staleGeneration`). A retried write whose RETURNING rows are lost fails with
+  `CommittedWithoutResultError`, never an empty result.
 - Result frames are the executor's payloads, pulled and transferred without a copy, and charged
   until the client releases them. Dictionaries are per stream, sent as frame-level deltas.
 - A warm cross-tab key read has a synchronous owner path and one message each way: targets

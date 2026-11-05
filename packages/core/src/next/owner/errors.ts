@@ -133,6 +133,26 @@ export class TransactionIdleTimeoutError extends Error {
   }
 }
 
+/** SAVEPOINT, RELEASE or ROLLBACK TO outside a transaction (PostgreSQL 25P01). */
+export class NoActiveTransactionError extends Error {
+  readonly code = "MINNOW_NO_ACTIVE_TRANSACTION";
+  override readonly name = "NoActiveTransactionError";
+  readonly sqlState = "25P01";
+  constructor(command: string) {
+    super(`${command} can only be used in transaction blocks`);
+  }
+}
+
+/** RELEASE or ROLLBACK TO a savepoint that does not exist (PostgreSQL 3B001). */
+export class SavepointNotFoundError extends Error {
+  readonly code = "MINNOW_SAVEPOINT_NOT_FOUND";
+  override readonly name = "SavepointNotFoundError";
+  readonly sqlState = "3B001";
+  constructor(name: string) {
+    super(`savepoint "${name}" does not exist`);
+  }
+}
+
 /** A statement inside a failed transaction (PostgreSQL 25P02): only ROLLBACK ends it. */
 export class InFailedTransactionError extends Error {
   readonly code = "MINNOW_IN_FAILED_TRANSACTION";
@@ -195,6 +215,8 @@ export const ownerErrorRegistry: ErrorRegistry = new Map<string, new (...args: n
   ["ClientClosedError", ClientClosedError],
   ["TransactionIdleTimeoutError", TransactionIdleTimeoutError],
   ["InFailedTransactionError", InFailedTransactionError],
+  ["NoActiveTransactionError", NoActiveTransactionError],
+  ["SavepointNotFoundError", SavepointNotFoundError],
   ["ReadOnlyTransactionError", ReadOnlyTransactionError],
   ["SequenceStateError", SequenceStateError],
   ["RecordedFailureError", RecordedFailureError],

@@ -62,6 +62,8 @@ import type {
 } from "./engine.js";
 import {
   InFailedTransactionError,
+  NoActiveTransactionError,
+  SavepointNotFoundError,
   ReadOnlyTransactionError,
   SequenceStateError,
   TransactionIdleTimeoutError,
@@ -263,6 +265,11 @@ class ComposedEngine implements OwnerEngine {
     return ++this.#sessionId;
   }
 
+  /** Lowers without caching: plans against uncommitted schema state (session-private). */
+  lower(text: string, catalog: CatalogView): PlannedStatement {
+    return toPlanned(this.#options.planner.lower(text, { catalog }));
+  }
+
   plan(text: string, catalog: CatalogView = this.#options.writePath.catalog): PlannedStatement {
     const key = `${String(catalog.version)}\u0000${text}`;
     const cached = this.#plans.get(key);
@@ -387,7 +394,21 @@ class ComposedSession implements EngineSession {
   #readPin: Snapshot | null = null;
   #startedAtMs: number | null = null;
   #lastCommitLsn: number | null = null;
-  readonly #savepoints = new Map<string, Savepoint>();
+  /**
+   * Savepoints, oldest first. Names may repeat: the newest shadows older ones, and RELEASE or
+   * ROLLBACK TO name the newest (PostgreSQL). A read-only transaction's entries carry no write
+   * path savepoint. Each keeps the transaction's counts at that point.
+   */
+  #savepoints: Array<{
+    readonly name: string;
+    readonly savepoint: Savepoint | null;
+    readonly counts: Readonly<Record<string, number>>;
+  }> = [];
+  /**
+   * Plans against this transaction's own schema changes (uncommitted DDL): private to the
+   * session, dropped when the transaction ends or rolls back to a savepoint.
+   */
+  readonly #privatePlans = new Map<string, PlannedStatement>();
   /** Affected rows per table of the open transaction, for its COMMIT's frame and outcome. */
   #txCounts: Record<string, number> = {};
 
@@ -406,6 +427,28 @@ class ComposedSession implements EngineSession {
 
   get lastCommitLsn(): number | null {
     return this.#lastCommitLsn;
+  }
+
+  /** The catalog this session's statements see. */
+  #catalog(): CatalogView {
+    return this.#tx?.catalog ?? this.#readPin?.catalog ?? this.#writePath().catalog;
+  }
+
+  get catalogVersion(): number {
+    return this.#catalog().version;
+  }
+
+  plan(text: string): PlannedStatement {
+    const catalog = this.#catalog();
+    // A transaction whose DDL moved its catalog past the committed one plans privately: another
+    // transaction could reach the same version number with different contents.
+    if (this.#tx === null || catalog.version === this.#writePath().catalog.version)
+      return this.#engine.plan(text, catalog);
+    const cached = this.#privatePlans.get(text);
+    if (cached?.catalogVersion === catalog.version) return cached;
+    const planned = this.#engine.lower(text, catalog);
+    this.#privatePlans.set(text, planned);
+    return planned;
   }
 
   // ---- helpers ----
@@ -467,7 +510,8 @@ class ComposedSession implements EngineSession {
     this.#readPin = null;
     this.#readOnly = false;
     this.#startedAtMs = null;
-    this.#savepoints.clear();
+    this.#savepoints = [];
+    this.#privatePlans.clear();
     this.#txCounts = {};
   }
 
@@ -552,12 +596,25 @@ class ComposedSession implements EngineSession {
   }
 
   run(statement: PlannedStatement, params: readonly WireValue[], context: RunContext): Run {
+    const run = this.#run(statement, params, context);
+    // PostgreSQL: any error inside an open transaction aborts it (25P02 until it ends), whatever
+    // raised it: a refusal, a missing savepoint, the statement itself.
+    const done = this.#abortOnFailure(run.done);
+    done.catch(() => undefined);
+    return {
+      results: run.results,
+      done,
+      commits: run.commits,
+      // Read live: the composition sets it as the run crosses the commit boundary.
+      get reachedCommit() {
+        return run.reachedCommit;
+      },
+    };
+  }
+
+  #run(statement: PlannedStatement, params: readonly WireValue[], context: RunContext): Run {
     const refused = this.#guard(statement);
-    if (refused !== null) {
-      // A statement refused by the transaction state ends a timed-out transaction only via
-      // ROLLBACK/COMMIT; anything else just fails.
-      return failedRun(refused);
-    }
+    if (refused !== null) return failedRun(refused);
     const lowered = statement.lowered;
     switch (lowered.kind) {
       case "query":
@@ -793,10 +850,10 @@ class ComposedSession implements EngineSession {
           lsn: receipt.wrote ? receipt.lsn : null,
         };
       } catch (error) {
-        if (!run.reachedCommit) {
-          started?.abort(error);
-          tx.rollback();
-        }
+        // The run's stream ends with the error either way: a spool behind a failed commit (or a
+        // failed durability wait past the boundary) is discarded, never delivered.
+        started?.abort(error);
+        if (!run.reachedCommit) tx.rollback();
         stream.fail(error);
         throw error;
       }
@@ -819,7 +876,7 @@ class ComposedSession implements EngineSession {
         throw error;
       }
       if (lowered.followUp !== null) {
-        const followUp = this.#engine.plan(lowered.followUp, tx.catalog).lowered;
+        const followUp = this.plan(lowered.followUp).lowered;
         if (followUp.kind !== "modify") throw new TypeError("A DDL follow-up must be a write");
         const next = tx.statement({
           rules: this.#rules(() => next.catalog),
@@ -879,21 +936,32 @@ class ComposedSession implements EngineSession {
         this.rollback();
         return done("ROLLBACK");
       case "savepoint": {
-        if (this.#tx === null)
-          return failedRun(new TypeError("SAVEPOINT can only be used in transaction blocks"));
-        this.#savepoints.set(lowered.savepoint ?? "", this.#tx.savepoint());
+        if (this.#state === "idle") return failedRun(new NoActiveTransactionError(lowered.command));
+        this.#savepoints.push({
+          name: lowered.savepoint ?? "",
+          savepoint: this.#tx?.savepoint() ?? null,
+          counts: { ...this.#txCounts },
+        });
         return done(lowered.command);
       }
       case "rollbackTo":
       case "release": {
-        const savepoint = this.#savepoints.get(lowered.savepoint ?? "");
-        if (this.#tx === null || savepoint === undefined)
-          return failedRun(new TypeError(`Savepoint ${lowered.savepoint ?? ""} does not exist`));
+        if (this.#state === "idle") return failedRun(new NoActiveTransactionError(lowered.command));
+        const name = lowered.savepoint ?? "";
+        let index = this.#savepoints.length - 1;
+        while (index >= 0 && this.#savepoints[index]?.name !== name) index--;
+        const entry = this.#savepoints[index];
+        if (entry === undefined) return failedRun(new SavepointNotFoundError(name));
         if (lowered.action === "release") {
-          this.#tx.release(savepoint);
-          this.#savepoints.delete(lowered.savepoint ?? "");
+          // Releases it and every savepoint after it.
+          if (entry.savepoint !== null) this.#tx?.release(entry.savepoint);
+          this.#savepoints.length = index;
         } else {
-          this.#tx.rollbackTo(savepoint);
+          // Undoes everything after it; it stays, later ones go; counts as they were then.
+          if (entry.savepoint !== null) this.#tx?.rollbackTo(entry.savepoint);
+          this.#savepoints.length = index + 1;
+          this.#txCounts = { ...entry.counts };
+          this.#privatePlans.clear();
           if (this.#state === "failed") this.#state = "open";
         }
         return done(lowered.command);

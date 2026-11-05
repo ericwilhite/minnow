@@ -49,7 +49,12 @@ import type {
   SyncRun,
 } from "./engine.js";
 import { IdleTransactionTimer } from "./engine.js";
-import { CancelledError, RecordedFailureError, toWireError } from "./errors.js";
+import {
+  CancelledError,
+  CommittedWithoutResultError,
+  RecordedFailureError,
+  toWireError,
+} from "./errors.js";
 import type { FramePayload } from "./frame.js";
 import { ledgerAction, ledgerIdentity, ledgerScope, type AnsweredRequest } from "./outcomes.js";
 import {
@@ -215,6 +220,23 @@ export class OwnerServer {
     };
   }
 
+  /** Newest generation seen per client, kept a retry window after its last hello. */
+  readonly #generations = new Map<string, { generation: number; atMs: number }>();
+
+  /**
+   * Records `generation` of `clientId`; false when it is not newer than one already seen (a stale
+   * hello: its requests belong to an ended generation).
+   */
+  claimGeneration(clientId: string, generation: number): boolean {
+    const now = this.#now();
+    for (const [id, seen] of this.#generations)
+      if (now - seen.atMs > CLIENT_RETRY_WINDOW_MS) this.#generations.delete(id);
+    const seen = this.#generations.get(clientId);
+    if (seen !== undefined && generation <= seen.generation) return false;
+    this.#generations.set(clientId, { generation, atMs: now });
+    return true;
+  }
+
   /** A newer generation of `clientId` connected: older connections of it end. */
   supersede(clientId: string, generation: number, except: Connection): void {
     for (const connection of this.#connections)
@@ -251,6 +273,8 @@ class Connection {
   readonly #sessions = new Map<number, SessionSlot>();
   readonly #prepared = new Map<number, { readonly text: string; planned: PlannedStatement }>();
   readonly #running = new Map<number, Running>();
+  /** Requests waiting behind their session, by seq: a cancel marks them. */
+  readonly #queued = new Map<number, { cancelled: boolean; close: boolean }>();
   readonly #streams = new Map<number, Stream>();
   #aliveTimer: ReturnType<typeof setInterval> | null = null;
   #sweepTimer: ReturnType<typeof setInterval> | null = null;
@@ -360,6 +384,16 @@ class Connection {
     }
     if (!Number.isSafeInteger(hello.generation) || hello.generation < 1) {
       this.#protocolFailure(hello, new ProtocolError("generation must be a positive integer"));
+      return;
+    }
+    if (!server.claimGeneration(hello.clientId, hello.generation)) {
+      // A newer connection of this client exists (or existed): this one is stale.
+      this.post({
+        t: "refused",
+        reason: "staleGeneration",
+        ownerProtocol: PROTOCOL_VERSION,
+        ownerBuild: server.options.build,
+      });
       return;
     }
     this.clientId = hello.clientId;
@@ -484,7 +518,40 @@ class Connection {
       void this.#serveOne(request, null);
       return;
     }
-    this.#enqueue(slot, () => this.#serveOne(request, slot));
+    const queued = { cancelled: false, close: false };
+    this.#queued.set(request.seq, queued);
+    this.#enqueue(slot, () => {
+      this.#queued.delete(request.seq);
+      // Cancelled while it waited behind its session: never admitted, never run.
+      if (queued.cancelled) {
+        this.#answerCancelledBeforeStart(request, slot, queued.close);
+        return;
+      }
+      return this.#serveOne(request, slot);
+    });
+  }
+
+  #answerCancelledBeforeStart(request: Request, slot: SessionSlot, close: boolean): void {
+    if (!close) {
+      this.post({ t: "error", seq: request.seq, error: toWireError(new CancelledError()) });
+      return;
+    }
+    this.post({
+      t: "done",
+      seq: request.seq,
+      columns: null,
+      frames: [],
+      summary: {
+        command: "",
+        rowCount: null,
+        counts: null,
+        lsn: null,
+        replayed: false,
+        closedEarly: true,
+        transaction: slot.engine?.transaction ?? "idle",
+        catalogVersion: slot.engine?.catalogVersion ?? this.#server.engine.catalogVersion,
+      },
+    });
   }
 
   /** Admits and serves one request; returns a promise only if it continues asynchronously. */
@@ -492,16 +559,16 @@ class Connection {
     const server = this.#server;
     const engine = server.engine;
     // Plan first (synchronous, cached): the scope depends on what the statement is.
+    const session = slot === null ? null : this.#engineSession(slot);
     let planned: PlannedStatement | null = null;
     let planError: unknown = null;
-    if (request.t === "statement") {
+    if (request.t === "statement" && session !== null) {
       try {
-        planned = this.#planStatement(request.text, request.prepared);
+        planned = this.#planStatement(session, request.text, request.prepared);
       } catch (error) {
         planError = error;
       }
     }
-    const session = slot === null ? null : this.#engineSession(slot);
     const before = session?.transaction ?? "idle";
     const scope = ledgerScope({
       kind: request.t,
@@ -534,18 +601,24 @@ class Connection {
     return this.#execute(request, planned, slot, session, before);
   }
 
-  #planStatement(text: string | null, prepared: number | null): PlannedStatement {
-    const engine = this.#server.engine;
+  /** Plans against the session's catalog (a transaction's own DDL included). */
+  #planStatement(
+    session: EngineSession,
+    text: string | null,
+    prepared: number | null,
+  ): PlannedStatement {
     if (prepared !== null) {
       const entry = this.#prepared.get(prepared);
       if (entry === undefined)
         throw new ProtocolError(`Prepared statement ${String(prepared)} does not exist`);
-      if (entry.planned.catalogVersion !== engine.catalogVersion)
-        entry.planned = engine.plan(entry.text);
-      return entry.planned;
+      // Re-planned against the session's catalog when it differs (the planned entry stays the
+      // shared one, so a transaction's private plan never outlives it).
+      return entry.planned.catalogVersion === session.catalogVersion
+        ? entry.planned
+        : session.plan(entry.text);
     }
     if (text === null) throw new ProtocolError("A statement needs text or a prepared id");
-    return engine.plan(text);
+    return session.plan(text);
   }
 
   #answerAdmission(
@@ -617,6 +690,22 @@ class Connection {
       return;
     }
     const counts = outcome.counts;
+    // Rows the caller asked for are not kept by the ledger: say so, never answer with none.
+    const wantedRows =
+      (request.t === "statement" &&
+        request.result.wantRows &&
+        planned !== null &&
+        planned.kind === "modify" &&
+        planned.columns.length > 0) ||
+      (request.t === "write" && request.returning !== null && request.result.wantRows);
+    if (wantedRows) {
+      this.post({
+        t: "error",
+        seq: request.seq,
+        error: toWireError(new CommittedWithoutResultError(counts)),
+      });
+      return;
+    }
     let rows = 0;
     for (const value of Object.values(counts)) rows += value;
     this.post({
@@ -633,7 +722,7 @@ class Connection {
         replayed: true,
         closedEarly: false,
         transaction: slot?.engine?.transaction ?? "idle",
-        catalogVersion: this.#server.engine.catalogVersion,
+        catalogVersion: slot?.engine?.catalogVersion ?? this.#server.engine.catalogVersion,
       },
     });
   }
@@ -856,7 +945,7 @@ class Connection {
       replayed: false,
       closedEarly,
       transaction: session?.transaction ?? "idle",
-      catalogVersion: this.#server.engine.catalogVersion,
+      catalogVersion: session?.catalogVersion ?? this.#server.engine.catalogVersion,
     };
   }
 
@@ -925,6 +1014,12 @@ class Connection {
     let pending: ResultFrame[] = [];
     const flush = () => {
       if (pending.length === 0) return;
+      if (this.#state === "closed") {
+        // Nobody will release them: free them now.
+        for (const frame of pending) frame.release();
+        pending = [];
+        return;
+      }
       const transfer: Transferable[] = [];
       for (const frame of pending) for (const buffer of frame.transfer) transfer.push(buffer);
       const columns = columnsSent
@@ -959,7 +1054,10 @@ class Connection {
         const wait = engine.durable(frame.requiresLsn);
         if (wait !== null) {
           flush();
+          // Held in `pending` while it waits, so a failed wait releases it with the rest.
+          pending.push(frame);
           await wait;
+          continue;
         }
         pending.push(frame);
       }
@@ -1005,12 +1103,17 @@ class Connection {
         );
         return;
       }
-      await run.done.catch(() => undefined);
-      this.#finishLedger(request, planned, before, session, null, true, error, run);
+      // The stream fails as a consequence when the run itself failed (a failed commit discards
+      // the RETURNING spool): report the run's error, not the stream's.
+      let failure: unknown = error;
+      await run.done.catch((runError: unknown) => {
+        failure = runError;
+      });
+      this.#finishLedger(request, planned, before, session, null, true, failure, run);
       this.post({
         t: "error",
         seq: request.seq,
-        error: toWireError(this.#mapError(error, running)),
+        error: toWireError(this.#mapError(failure, running)),
       });
       if (stream.posted.length === 0) this.#streams.delete(request.seq);
     }
@@ -1027,10 +1130,18 @@ class Connection {
     closedEarly: boolean,
     stream: Stream,
   ): void {
+    if (this.#state === "closed") {
+      for (const frame of frames) frame.release();
+      this.#streams.delete(request.seq);
+      return;
+    }
     const transfer: Transferable[] = [];
     for (const frame of frames) for (const buffer of frame.transfer) transfer.push(buffer);
     stream.posted.push(...frames);
     if (stream.posted.length === 0) this.#streams.delete(request.seq);
+    // A finished stream with frames outstanding stays watched (live) or swept (not live).
+    this.#sweepIfNeeded();
+    this.#watchIfNeeded();
     this.post(
       {
         t: "done",
@@ -1110,9 +1221,25 @@ class Connection {
   // ---- signals ----
 
   #cancel(target: number, close: boolean): void {
+    const queued = this.#queued.get(target);
+    if (queued !== undefined) {
+      queued.cancelled = true;
+      queued.close ||= close;
+      return;
+    }
     const running = this.#running.get(target);
-    // Unknown, finished, or past the commit boundary: the target's own reply answers the cancel.
-    if (running === undefined || running.run?.reachedCommit === true) return;
+    if (running === undefined) {
+      // Finished: closing it frees the frames the client will never take.
+      const stream = this.#streams.get(target);
+      if (stream?.finished === true) {
+        for (const frame of stream.posted.splice(0)) frame.release();
+        this.#streams.delete(target);
+        this.#watchIfNeeded();
+      }
+      return;
+    }
+    // Past the commit boundary the target's own reply answers the cancel.
+    if (running.run?.reachedCommit === true) return;
     running.cancelled = true;
     if (close) {
       running.closeEarly = true;
@@ -1130,7 +1257,10 @@ class Connection {
     while (stream.posted.length > 0 && (stream.posted[0]?.payload.sequence ?? Infinity) <= through)
       stream.posted.shift()?.release();
     if (stream.session !== null) this.#sessions.get(stream.session)?.timer.touch();
-    if (stream.finished && stream.posted.length === 0) this.#streams.delete(target);
+    if (stream.finished && stream.posted.length === 0) {
+      this.#streams.delete(target);
+      this.#watchIfNeeded();
+    }
   }
 
   // ---- liveness, heartbeats, abandoned streams ----
@@ -1140,6 +1270,9 @@ class Connection {
     if (watch === undefined || this.#state !== "open" || this.#livenessLock === "") return;
     let needs = false;
     for (const running of this.#running.values()) if (running.live) needs = true;
+    // Frames posted to a live client hold the executor's charge: keep watching until released.
+    for (const stream of this.#streams.values())
+      if (stream.live && stream.posted.length > 0) needs = true;
     for (const slot of this.#sessions.values()) {
       const state = slot.engine?.transaction ?? "idle";
       if (state !== "idle") needs = true;

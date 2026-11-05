@@ -430,8 +430,10 @@ export interface Refused {
    * - `version`: protocol mismatch; `ownerProtocol` says which side is newer.
    * - `steppingDown`: this owner is leaving; reconnect through the broker.
    * - `superseded`: a newer build owns (or is taking) the database; this client must reload.
+   * - `staleGeneration`: this client already connected with this generation or a newer one; the
+   *   hello belongs to an ended connection.
    */
-  readonly reason: "version" | "steppingDown" | "superseded";
+  readonly reason: "version" | "steppingDown" | "superseded" | "staleGeneration";
   readonly ownerProtocol: number;
   readonly ownerBuild: string;
 }

@@ -107,6 +107,8 @@ function stubEngine(): OwnerEngine {
     transaction: "idle",
     readOnly: false,
     lastCommitLsn: null,
+    catalogVersion: 1,
+    plan: () => planned,
     runNow: () => answer,
     close: () => undefined,
   } as unknown as EngineSession;

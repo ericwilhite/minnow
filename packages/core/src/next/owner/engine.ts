@@ -135,6 +135,17 @@ export interface EngineSession {
    * executor's `sequenceSession`. Survives rollback, as in PostgreSQL.
    */
   readonly sequences: SequenceSession;
+  /**
+   * The catalog version statements of this session see: the open transaction's (with its own
+   * DDL), a read-only transaction's pinned one, or the committed one.
+   */
+  readonly catalogVersion: number;
+  /**
+   * Plans `text` against that catalog. Plans of committed catalogs are shared across sessions;
+   * plans against a transaction's uncommitted schema stay private to the session and are dropped
+   * when the transaction ends or rolls back to a savepoint.
+   */
+  plan(text: string): PlannedStatement;
   /** This session's last commit LSN: relaxed read-your-writes pins at least this (B3 `atLeastLsn`). */
   readonly lastCommitLsn: number | null;
   /**

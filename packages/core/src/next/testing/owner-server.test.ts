@@ -2,186 +2,17 @@
  * The owner server end to end in process: protocol client ⇄ MessageChannel ⇄ server ⇄ composed
  * engine ⇄ stand-ins for the write path, executor and planner (testing/owner-standins.ts).
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { SessionLostError } from "../errors.js";
-import type { ChunkReads } from "../exec/scan.js";
-import { Governor } from "../memory/governor.js";
-import { MemorySpillService } from "../spill/memory-spill.js";
-import {
-  StandinExecutor,
-  StandinPlanner,
-  StandinWritePath,
-  standinRules,
-} from "./owner-standins.js";
-import { ProtocolClient } from "../owner/client.js";
-import { composeEngine } from "../owner/compose.js";
 import {
   CancelledError,
   InFailedTransactionError,
   RecordedFailureError,
   TransactionIdleTimeoutError,
 } from "../owner/errors.js";
-import { PROTOCOL_VERSION, type OwnerMessage, type WireValue } from "../owner/protocol.js";
-import { OwnerServer, type ServerPort } from "../owner/server.js";
-
-const cleanups: Array<() => void> = [];
-afterEach(() => {
-  for (const cleanup of cleanups.splice(0)) cleanup();
-});
-
-interface HarnessOptions {
-  readonly durability?: "strict" | "relaxed";
-  readonly autoFlush?: boolean;
-  readonly idleMs?: number;
-  readonly abandonedStreamMs?: number;
-  readonly liveness?: Map<string, AbortController>;
-}
-
-function harness(options: HarnessOptions = {}) {
-  const writePath = new StandinWritePath({
-    durability: options.durability ?? "strict",
-    autoFlush: options.autoFlush ?? true,
-  });
-  const executor = new StandinExecutor();
-  const planner = new StandinPlanner();
-  const engine = composeEngine({
-    planner,
-    executor,
-    writePath,
-    governor: new Governor(64 * 1024 * 1024),
-    spill: new MemorySpillService(),
-    reads: {} as ChunkReads,
-    rules: standinRules,
-    ...(options.idleMs === undefined ? {} : { transactionIdleTimeoutMs: options.idleMs }),
-  });
-  const liveness = options.liveness;
-  const server = new OwnerServer(engine, {
-    ownerId: "owner-1",
-    epoch: 1,
-    build: "test",
-    ...(options.idleMs === undefined ? {} : { transactionIdleTimeoutMs: options.idleMs }),
-    ...(options.abandonedStreamMs === undefined
-      ? {}
-      : { abandonedStreamMs: options.abandonedStreamMs }),
-    ...(liveness === undefined
-      ? {}
-      : {
-          watchLiveness: (lock: string) => {
-            const controller = new AbortController();
-            liveness.set(lock, controller);
-            return { gone: controller.signal, stop: () => liveness.delete(lock) };
-          },
-        }),
-  });
-  const connect = async (client = new ProtocolClient()): Promise<ProtocolClient> => {
-    const { port1, port2 } = new MessageChannel();
-    server.accept(port1);
-    cleanups.push(() => {
-      port1.close();
-      port2.close();
-    });
-    await client.connect(port2);
-    cleanups.push(() => {
-      client.close();
-    });
-    return client;
-  };
-  const reconnect = async (client: ProtocolClient): Promise<void> => {
-    const { port1, port2 } = new MessageChannel();
-    server.accept(port1);
-    cleanups.push(() => {
-      port1.close();
-      port2.close();
-    });
-    await client.reconnect(port2);
-  };
-  return { writePath, executor, planner, engine, server, connect, reconnect };
-}
-
-/** A hand-driven connection: messages delivered synchronously, replies recorded in order. */
-function raw(server: OwnerServer, clientId = "0".repeat(31) + "1", generation = 1) {
-  const replies: OwnerMessage[] = [];
-  const waiters: Array<() => void> = [];
-  const port: ServerPort & { posted: number } = {
-    posted: 0,
-    onmessage: null,
-    postMessage(message: unknown) {
-      this.posted++;
-      replies.push(message as OwnerMessage);
-      for (const wake of waiters.splice(0)) wake();
-    },
-  };
-  server.accept(port);
-  const deliver = (message: unknown) => {
-    port.onmessage?.({ data: structuredClone(message) } as MessageEvent);
-  };
-  deliver({
-    t: "hello",
-    protocol: PROTOCOL_VERSION,
-    build: "test",
-    clientId,
-    livenessLock: `client:${clientId}`,
-    previousOwnerId: null,
-    generation,
-  });
-  let resolvedThrough = 0;
-  const statement = (
-    seq: number,
-    text: string,
-    params: WireValue[] = [],
-    extra: Record<string, unknown> = {},
-  ) => ({
-    t: "statement",
-    seq,
-    sentAtMs: Date.now(),
-    resolvedThrough,
-    live: false,
-    resendable: true,
-    retry: false,
-    generation,
-    session: 0,
-    text,
-    prepared: null,
-    knownColumnsVersion: -1,
-    params,
-    result: { windowBytes: 1 << 20, frameRows: null, wantRows: true },
-    ...extra,
-  });
-  const reply = async (seq: number): Promise<OwnerMessage> => {
-    for (;;) {
-      const found = replies.find(
-        (message) =>
-          "seq" in message &&
-          message.seq === seq &&
-          (message.t === "done" ||
-            message.t === "error" ||
-            message.t === "prepared" ||
-            message.t === "value"),
-      );
-      if (found !== undefined) return found;
-      await new Promise<void>((resolve) => waiters.push(resolve));
-    }
-  };
-  return {
-    port,
-    replies,
-    deliver,
-    statement,
-    reply,
-    acknowledge(through: number) {
-      resolvedThrough = through;
-    },
-  };
-}
-
-const flushTasks = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
-const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
-
-async function seed(client: ProtocolClient, rows = 3): Promise<void> {
-  await client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
-  for (let id = 1; id <= rows; id++)
-    await client.query("INSERT INTO t VALUES ($1, $2, $3)", [id, 0, `row ${String(id)}`]);
-}
+import { PROTOCOL_VERSION, type OwnerMessage } from "../owner/protocol.js";
+import type { ServerPort } from "../owner/server.js";
+import { flushTasks, harness, raw, seed, sleep } from "./owner-harness.js";
 
 describe("handshake", () => {
   it("welcomes the current protocol and refuses another", async () => {
@@ -535,6 +366,31 @@ describe("result windows and releases (R3)", () => {
     expect(server.stats.outstandingFrames).toBe(0);
   });
 
+  it("sends the next frame only when the client releases one (a 1-byte window)", async () => {
+    const { connect, server } = harness();
+    await seed(await connect(), 100);
+    const port = raw(server);
+    port.deliver(
+      port.statement(1, "SELECT * FROM t STREAM BY 10", [], {
+        result: { windowBytes: 1, frameRows: null, wantRows: true },
+      }),
+    );
+    const received = () =>
+      port.replies.flatMap((message) =>
+        (message.t === "rows" || message.t === "done") && message.seq === 1 ? message.frames : [],
+      );
+    await sleep(20);
+    expect(received()).toHaveLength(1);
+    for (let through = 0; through < 9; through++) {
+      port.deliver({ t: "release", target: 1, through });
+      await sleep(3);
+      expect(received()).toHaveLength(through + 2);
+    }
+    await port.reply(1);
+    port.deliver({ t: "release", target: 1, through: 9 });
+    expect(server.stats.outstandingFrames).toBe(0);
+  });
+
   it("releases every outstanding frame when the connection ends", async () => {
     const { connect, server, executor } = harness();
     const client = await connect();
@@ -600,7 +456,7 @@ describe("cancellation and the commit boundary (R9)", () => {
     expect(writePath.rows("t")[0]).toEqual([1, 0, "row 1"]);
   });
 
-  it("completes a write cancelled after its commit() call", async () => {
+  it("completes a write cancelled after its commit() call, RETURNING rows included", async () => {
     const { connect, writePath } = harness({ autoFlush: false });
     const client = await connect();
     const created = client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
@@ -610,7 +466,7 @@ describe("cancellation and the commit boundary (R9)", () => {
     const insert = client.send({
       t: "statement",
       session: 0,
-      text: "INSERT INTO t VALUES ($1, $2, $3)",
+      text: "INSERT INTO t VALUES ($1, $2, $3) RETURNING *",
       prepared: null,
       knownColumnsVersion: -1,
       params: [1, 0, "a"],
@@ -621,7 +477,9 @@ describe("cancellation and the commit boundary (R9)", () => {
     client.cancel(insert.seq);
     await sleep(5);
     await writePath.flush();
-    expect((await insert.promise).summary).toMatchObject({ command: "INSERT", counts: { t: 1 } });
+    const result = await insert.promise;
+    expect(result.summary).toMatchObject({ command: "INSERT", counts: { t: 1 } });
+    expect(result.rows()).toEqual([[1, 0, "a"]]);
     expect(writePath.rows("t")).toHaveLength(1);
   });
 });

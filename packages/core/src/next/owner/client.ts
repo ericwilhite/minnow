@@ -69,7 +69,8 @@ interface Pending {
   readonly session: number | null;
   columns: readonly WireColumnMeta[] | null;
   readonly frames: FramePayload[];
-  readonly dictionaries: StreamDictionaries;
+  /** Reset when the request is resent: a resent stream starts again at frame 0. */
+  dictionaries: StreamDictionaries;
   /** Frames already handed to a cursor consumer: the request cannot be resent. */
   handedOut: boolean;
   readonly cursor: CursorQueue | null;
@@ -155,6 +156,8 @@ export class ProtocolClient {
   #ownerId: string | null = null;
   #welcome: { resolve: (welcome: Welcome) => void; reject: (error: Error) => void } | null = null;
   #prepared = 0;
+  /** Prepared id → whether it may control a transaction (protocol.ts `Prepared`). */
+  readonly #preparedControl = new Map<number, boolean>();
   #closed = false;
   onSessionAborted: ((session: number) => void) | null = null;
   onStepDown: ((reason: StepDown["reason"]) => void) | null = null;
@@ -190,6 +193,7 @@ export class ProtocolClient {
         continue;
       }
       pending.frames.length = 0;
+      pending.dictionaries = new StreamDictionaries();
       pending.columns = null;
       this.#send(pending, true);
     }
@@ -279,7 +283,9 @@ export class ProtocolClient {
         params,
         result: { windowBytes: DEFAULT_RESULT_WINDOW_BYTES, frameRows: null, wantRows: true },
       },
-      false,
+      // A prepared statement may be BEGIN or COMMIT: the owner said so at prepare time; unknown
+      // is treated as control (it only costs resendability).
+      this.#preparedControl.get(id) ?? true,
     ).promise;
   }
 
@@ -447,7 +453,20 @@ export class ProtocolClient {
         const pending = this.#pending.get(message.seq);
         if (pending === undefined) return;
         if (message.columns !== null) pending.columns = message.columns;
-        for (const frame of message.frames) pending.dictionaries.apply(frame);
+        try {
+          for (const frame of message.frames) pending.dictionaries.apply(frame);
+        } catch (error) {
+          // A frame out of order or a broken delta: fail this request, never the handler.
+          this.cancel(message.seq);
+          this.#settle(message.seq);
+          const failure = error instanceof Error ? error : new Error(String(error));
+          if (pending.cursor !== null) {
+            pending.cursor.error = failure;
+            pending.cursor.wake?.();
+          }
+          pending.reject(failure);
+          return;
+        }
         const last = message.frames.at(-1);
         if (pending.cursor !== null) {
           pending.cursor.frames.push(...message.frames);
@@ -476,6 +495,7 @@ export class ProtocolClient {
       case "prepared": {
         const pending = this.#pending.get(message.seq);
         if (pending === undefined) return;
+        this.#preparedControl.set(message.id, message.controlsTransaction);
         this.#settle(message.seq);
         pending.resolve(
           makeResult(

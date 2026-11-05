@@ -41,8 +41,14 @@ import type {
   ParameterValue,
   PreparedPlan,
 } from "../exec/executor.js";
-import { ResultChannel, type UnnumberedPayload, type WireFlat } from "../exec/result.js";
+import {
+  ResultChannel,
+  frameByteLength,
+  type UnnumberedPayload,
+  type WireFlat,
+} from "../exec/result.js";
 import { RequestLedger } from "../format/ledger.js";
+import type { Grant } from "../memory/governor.js";
 import type { OutputColumn, PhysicalPlan } from "../ir/ir.js";
 import type {
   LoweredModify,
@@ -545,16 +551,36 @@ const profile = (synchronous: boolean): ExecutionSummary["profile"] => ({
   synchronous,
 });
 
+/**
+ * One execution, following B4's contract (exec/executor.ts, exec/result.ts) where the owner can
+ * observe it:
+ * - frames carry the run's `requiresLsn` (the view's observed LSN and every sequence block it drew
+ *   from), so the owner's delivery rule waits for them under strict durability;
+ * - a spillable result grant (`governor.tryAdmit`) is charged for every frame from offer to
+ *   release, and for the RETURNING spool while it waits for `acknowledgeCommit()`; it closes when
+ *   the stream is delivered or cancelled;
+ * - `executed` settles when the last frame has been offered (DML: after `statement.end()`),
+ *   `delivered` when the stream has ended and every frame was released; a cancel or failure
+ *   rejects both;
+ * - the spool replays into frames under the window (`ready()`), one frame per `rowsPerFrame`.
+ */
 class StandinExecution implements Execution {
   readonly results: ResultChannel;
   state: ExecutionState = "running";
   summary: ExecutionSummary | null = null;
   readonly executed: Promise<ExecutionSummary>;
   readonly delivered: Promise<void>;
-  #spool: Row[] | null = null;
+  readonly #grant: Grant;
+  #spool: { readonly rows: Row[]; readonly bytes: number } | null = null;
   #cancelled = false;
+  #ended = false;
+  #offered = 0;
+  #freed = 0;
+  #requiresLsn = 0;
   #resolveExecuted: (summary: ExecutionSummary) => void = () => undefined;
   #rejectExecuted: (error: unknown) => void = () => undefined;
+  #resolveDelivered: () => void = () => undefined;
+  #rejectDelivered: (error: unknown) => void = () => undefined;
 
   constructor(
     private readonly program: Program,
@@ -570,13 +596,31 @@ class StandinExecution implements Execution {
         this.cancel(reason);
       },
     });
+    const grant = request.governor.tryAdmit({
+      label: `query#${String(request.queryId)}/result`,
+      minimumBytes: 0,
+      spillable: true,
+    });
+    if (grant === null) throw new TypeError("The stand-in executor needs an uncontended governor");
+    this.#grant = grant;
     this.executed = new Promise<ExecutionSummary>((resolve, reject) => {
       this.#resolveExecuted = resolve;
       this.#rejectExecuted = reject;
     });
     this.executed.catch(() => undefined);
-    this.delivered = this.executed.then(() => undefined);
+    this.delivered = new Promise<void>((resolve, reject) => {
+      this.#resolveDelivered = resolve;
+      this.#rejectDelivered = reject;
+    });
     this.delivered.catch(() => undefined);
+    void this.delivered.then(
+      () => {
+        this.#grant.close();
+      },
+      () => {
+        this.#grant.close();
+      },
+    );
     const signal = request.signal;
     if (signal !== undefined) {
       const onAbort = () => {
@@ -584,16 +628,17 @@ class StandinExecution implements Execution {
       };
       signal.addEventListener("abort", onAbort, { once: true });
       // The listener lives only as long as the run (B4 removes its listeners the same way).
-      void this.executed
-        .then(
-          () => this.delivered,
-          () => undefined,
-        )
+      void this.delivered
+        .catch(() => undefined)
         .finally(() => {
           signal.removeEventListener("abort", onAbort);
         });
     }
     this.#start(params);
+  }
+
+  #charge(bytes: number): void {
+    if (!this.#grant.allocate(bytes) && this.#grant.tryGrow(bytes)) this.#grant.allocate(bytes);
   }
 
   #start(params: readonly ParameterValue[]): void {
@@ -614,96 +659,118 @@ class StandinExecution implements Execution {
       this.#fail(error);
       return;
     }
+    this.#requiresLsn = Math.max(result.requiresLsn, view.observedLsn);
     const summary: ExecutionSummary = {
       rowCount: this.program.kind === "modify" ? result.affected : result.rows.length,
       counts: { inserted: 0, updated: 0, deleted: 0 },
-      requiresLsn: Math.max(result.requiresLsn, view.observedLsn),
+      requiresLsn: this.#requiresLsn,
       profile: profile(this.program.streamBy === null),
     };
     if (this.program.kind === "modify" && statement !== null) {
       statement.wrote += result.affected;
+      const spool = this.request.returning === "atCommit" && this.program.columns.length > 0;
+      if (spool) {
+        const bytes = frameByteLength(payloadOf(this.program.columns, result.rows));
+        this.#charge(bytes);
+        this.#spool = { rows: result.rows, bytes };
+      }
       // B4 ends the statement before `executed` (deferred checks): asynchronous.
       void statement.end().then(() => {
-        this.#executed(summary, result.rows, this.request.returning === "atCommit");
+        if (this.#cancelled) return;
+        if (!spool) void this.#emit(result.rows, null);
+        this.#executedWith(summary);
       });
       return;
     }
     if (this.program.streamBy !== null) {
-      this.state = "running";
-      void this.#stream(result.rows, this.program.streamBy, summary);
+      void this.#emit(result.rows, this.program.streamBy).then(() => {
+        this.#executedWith(summary);
+      });
       return;
     }
-    this.#executed(summary, result.rows, false);
+    void this.#emit(result.rows, null);
+    this.#executedWith(summary);
   }
 
-  #executed(summary: ExecutionSummary, rows: Row[], spool: boolean): void {
-    if (this.#cancelled) return;
-    if (spool) this.#spool = rows;
-    else this.#offer(rows);
+  #executedWith(summary: ExecutionSummary): void {
+    if (this.#cancelled || this.state !== "running") return;
     this.state = "executed";
     this.summary = summary;
     this.#resolveExecuted(summary);
   }
 
-  #offer(rows: readonly Row[]): void {
-    if (rows.length > 0)
-      this.results.offer({
-        payload: payloadOf(this.program.columns, rows),
-        requiresLsn: 0,
-        free: () => undefined,
-      });
-    this.results.end();
+  /** Offers `rows` as frames of `by` rows (all at once when null) under the window, then ends. */
+  async #emit(all: readonly Row[], by: number | null): Promise<void> {
+    // A plan without output columns (DML without RETURNING) produces no frames.
+    const rows = this.program.columns.length === 0 ? [] : all;
+    const size = by ?? Math.max(1, rows.length);
+    try {
+      for (let start = 0; start < rows.length; start += size) {
+        if (this.#cancelled) return;
+        const payload = payloadOf(this.program.columns, rows.slice(start, start + size));
+        const bytes = frameByteLength(payload);
+        this.#charge(bytes);
+        this.#offered++;
+        const pushed = this.results.offer({
+          payload,
+          requiresLsn: this.#requiresLsn,
+          free: () => {
+            this.#grant.free(bytes);
+            this.#freed++;
+            this.#checkDelivered();
+          },
+        });
+        if (pushed === "blocked" && start + size < rows.length) await this.results.ready();
+      }
+      if (this.#cancelled) return;
+      this.results.end();
+      this.#ended = true;
+      this.#checkDelivered();
+    } catch (error) {
+      if (!this.#cancelled) this.#fail(error);
+    }
   }
 
-  async #stream(rows: Row[], by: number, summary: ExecutionSummary): Promise<void> {
-    try {
-      for (let start = 0; start < rows.length; start += by) {
-        if (this.#cancelled) return;
-        if (
-          this.results.offer({
-            payload: payloadOf(this.program.columns, rows.slice(start, start + by)),
-            requiresLsn: 0,
-            free: () => undefined,
-          }) === "blocked"
-        )
-          await this.results.ready();
-      }
-      this.results.end();
-      this.state = "executed";
-      this.summary = summary;
-      this.#resolveExecuted(summary);
-    } catch (error) {
-      this.#fail(error);
-    }
+  #checkDelivered(): void {
+    if (this.#ended && this.#freed === this.#offered && !this.#cancelled) this.#resolveDelivered();
   }
 
   #fail(error: unknown): void {
     (this.request.statement as unknown as StandinStatement | null)?.rollback();
     this.state = this.#cancelled ? "cancelled" : "failed";
+    this.#dropSpool();
     this.results.fail(error);
     this.#rejectExecuted(error);
+    this.#rejectDelivered(error);
+  }
+
+  #dropSpool(): void {
+    if (this.#spool === null) return;
+    this.#grant.free(this.#spool.bytes);
+    this.#spool = null;
   }
 
   acknowledgeCommit(): void {
     this.acknowledged();
     const spool = this.#spool;
+    if (spool === null) return;
     this.#spool = null;
-    if (spool !== null) this.#offer(spool);
+    // The spool moves into frames: its charge becomes theirs.
+    this.#grant.free(spool.bytes);
+    void this.#emit(spool.rows, null);
   }
 
   cancel(reason?: unknown): void {
-    if (this.#cancelled || (this.state === "executed" && this.#spool === null)) {
-      if (this.state === "executed") this.results.cancel(reason);
-      return;
-    }
+    if (this.#cancelled) return;
     this.#cancelled = true;
-    this.#spool = null;
+    this.#dropSpool();
     const error = new QueryCancelledError(reason);
     if (this.state === "running") {
       (this.request.statement as unknown as StandinStatement | null)?.rollback();
       this.state = "cancelled";
       this.#rejectExecuted(error);
     }
+    this.#rejectDelivered(error);
     this.results.cancel(reason);
   }
 }
