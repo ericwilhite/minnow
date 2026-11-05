@@ -394,8 +394,10 @@ describe("DML", () => {
     const orders = catalog.view.tableByName("orders");
     const id = (name: string) => orders?.columns.find((column) => column.name === name)?.id;
     expect(root.kind).toBe("update");
-    expect(root.assigned).toEqual([id("qty"), id("total"), id("note")]);
-    expect(chain(root)).toEqual(["modify", "project", "keyLookup"]);
+    // Assigned columns in statement order, then the generated total that reads qty, computed in
+    // a second projection from the materialized qty (review finding 3).
+    expect(root.assigned).toEqual([id("qty"), id("note"), id("total")]);
+    expect(chain(root)).toEqual(["modify", "project", "project", "keyLookup"]);
     const lookup = find(root, "keyLookup");
     expect(lookup.emitLocator).toBe(true);
     expect(lookup.output.at(-1)?.type).toEqual({ kind: "locator", tableId: orders?.id });
@@ -408,11 +410,13 @@ describe("DML", () => {
     const root = modify(run("DELETE FROM customers WHERE region = 'east'")).plan.root;
     expect(chain(root)).toEqual(["modify", "project", "scan"]);
     expect(find(root, "scan").emitLocator).toBe(true);
-    expect(chain(modify(run("TRUNCATE customers")).plan.root)).toEqual([
-      "modify",
-      "project",
-      "scan",
-    ]);
+    const truncate = modify(run("TRUNCATE orders"));
+    expect([
+      truncate.command,
+      truncate.plan.root.op === "modify" && truncate.plan.root.kind,
+    ]).toEqual(["TRUNCATE", "truncate"]);
+    // orders references customers: PostgreSQL refuses TRUNCATE without CASCADE.
+    expect(() => run("TRUNCATE customers")).toThrow(/referenced in a foreign key/u);
   });
 });
 

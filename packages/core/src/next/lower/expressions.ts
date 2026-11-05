@@ -3,7 +3,7 @@
  * expressions. Names resolve through a `Scope`; types follow PostgreSQL (lower/coerce.ts).
  */
 import type { CatalogView } from "../access/catalog.js";
-import { NON_STRICT_FUNCTIONS, VOLATILE_FUNCTIONS } from "../ir/functions.js";
+import { NON_STRICT_FUNCTIONS, VOLATILE_FUNCTIONS, sqlTypeOf } from "../ir/functions.js";
 import type { Collation, ScalarExpr } from "../ir/ir.js";
 import type { PhysicalType } from "../types.js";
 import type { Expression, PredicateOperator } from "../../plan/model.js";
@@ -11,6 +11,7 @@ import { isAggregateCall } from "../../engine/query.js";
 import { externalSqlDomainValue } from "../../engine/sql-domains.js";
 import { timestampFromDate } from "../temporal.js";
 import {
+  baseType,
   coerce,
   commonType,
   resolveFunction,
@@ -23,6 +24,7 @@ import {
   boolLiteral,
   decimalLiteral,
   integerLiteral,
+  integerLiteralValue,
   parseDecimalText,
   textLiteral,
   timestampLiteral,
@@ -235,19 +237,90 @@ export function callFunction(
   state: ExpressionState,
   nullable?: boolean,
 ): Typed {
+  if (fn === "nullif") return nullIf(args, state);
   const resolved = resolveFunction(fn, args, state.parameters);
   const coerced = args.map((arg, index) =>
     coerce(arg, resolved.args[index] ?? resolved.result, "implicit", state.parameters),
   );
   if (VOLATILE_FUNCTIONS.has(fn)) state.volatile = true;
   const anyNullable = NON_STRICT_FUNCTIONS.has(fn)
-    ? fn === "nullif" || coerced.every((arg) => arg.nullable)
+    ? coerced.every((arg) => arg.nullable)
     : strictNullable(coerced);
+  const expr: ScalarExpr = {
+    op: "call",
+    fn,
+    args: coerced.map((arg) => arg.expr),
+    type: resolved.result,
+  };
   return {
-    expr: { op: "call", fn, args: coerced.map((arg) => arg.expr), type: resolved.result },
+    expr: foldConstant(expr) ?? expr,
     nullable: nullable ?? anyNullable,
     big: resolved.result.kind === "int64" && coerced.some((arg) => arg.big),
   };
+}
+
+const INTEGER_FAMILY = new Set(["int2", "int4", "int8"]);
+const FLOAT_FAMILY = new Set(["float4", "float8"]);
+
+/**
+ * NULLIF(a, b) as PostgreSQL types it (ir/functions.ts `NON_STRICT_FUNCTIONS`): compared in the
+ * arguments' common type; the result is the first argument's type when both are integers or both
+ * floats (PostgreSQL has cross-type `=` there), else the common type (review finding 9).
+ */
+function nullIf(args: readonly Typed[], state: ExpressionState): Typed {
+  const [first, second] = args;
+  if (first === undefined || second === undefined || args.length !== 2)
+    throw new PlanningError("nullif takes two arguments", "42883");
+  const common = commonType(args, state.parameters, "NULLIF");
+  const a = settle(first, state.parameters);
+  const b = settle(second, state.parameters);
+  const left = a.pending === undefined ? sqlTypeOf(a.expr.type) : null;
+  const right = b.pending === undefined ? sqlTypeOf(b.expr.type) : null;
+  const sameFamily =
+    left !== null &&
+    right !== null &&
+    left !== right &&
+    ((INTEGER_FAMILY.has(left) && INTEGER_FAMILY.has(right)) ||
+      (FLOAT_FAMILY.has(left) && FLOAT_FAMILY.has(right)));
+  const call: Typed = {
+    expr: {
+      op: "call",
+      fn: "nullif",
+      args: [
+        coerce(first, common, "implicit", state.parameters).expr,
+        coerce(second, common, "implicit", state.parameters).expr,
+      ],
+      type: common,
+    },
+    nullable: true,
+    big: common.kind === "int64" && first.big,
+  };
+  // Widening an integer (or a float4) and back is exact, so the value is the first argument's.
+  return sameFamily ? coerce(call, a.expr.type, "explicit", state.parameters) : call;
+}
+
+/**
+ * Folds integer `add`, `sub`, `mul`, `neg` over integer literals of the call's type when the
+ * result fits it (constant folding after overload resolution, review finding 2). Anything that
+ * would overflow, divide, or is not an integer literal stays a call, so the executor raises the
+ * error PostgreSQL raises (22003).
+ */
+function foldConstant(expr: Extract<ScalarExpr, { op: "call" }>): ScalarExpr | null {
+  if (expr.type.kind !== "int32" && expr.type.kind !== "int64") return null;
+  const values = expr.args.map(integerLiteralValue);
+  if (values.some((value) => value === null)) return null;
+  const [a = 0n, b = 0n] = values as bigint[];
+  const result =
+    expr.fn === "add"
+      ? a + b
+      : expr.fn === "sub"
+        ? a - b
+        : expr.fn === "mul"
+          ? a * b
+          : expr.fn === "neg"
+            ? -a
+            : null;
+  return result === null ? null : integerLiteral(result, expr.type);
 }
 
 export function asBool(typed: Typed, state: ExpressionState): Typed {
@@ -260,8 +333,18 @@ function collationOf(...values: readonly Collated[]): Collation {
   return null;
 }
 
-function unify(values: readonly Typed[], state: ExpressionState, what: string): Typed[] {
-  const type = commonType(values, state.parameters, what);
+/**
+ * Coerces `values` to their common type. Comparison operands (`compared`) use its base type, so a
+ * constant compared with a VARCHAR(n) column stays text and is never truncated to n (finding 1).
+ */
+function unify(
+  values: readonly Typed[],
+  state: ExpressionState,
+  what: string,
+  compared = false,
+): Typed[] {
+  const common = commonType(values, state.parameters, what);
+  const type = compared ? baseType(common) : common;
   return values.map((value) => coerce(value, type, "implicit", state.parameters));
 }
 
@@ -288,7 +371,7 @@ export function lowerCondition(
   if (cmp !== undefined) {
     const l = lowerExpression(left, scope, state);
     const r = lowerExpression(right, scope, state);
-    const [a, b] = unify([l, r], state, "comparison") as [Typed, Typed];
+    const [a, b] = unify([l, r], state, "comparison", true) as [Typed, Typed];
     return {
       expr: {
         op: "compare",
@@ -318,6 +401,7 @@ export function lowerCondition(
         [lowerExpression(left, scope, state), lowerExpression(right, scope, state)],
         state,
         "IS DISTINCT FROM",
+        true,
       ) as [Typed, Typed];
       return {
         expr: {
@@ -354,7 +438,7 @@ export function lowerCondition(
         );
       const arg = lowerExpression(left, scope, state);
       const items = right.items.map((item) => lowerExpression(item, scope, state));
-      const [first, ...rest] = unify([arg, ...items], state, "IN");
+      const [first, ...rest] = unify([arg, ...items], state, "IN", true);
       if (first === undefined) throw new PlanningError("IN needs a value", "42601");
       return {
         expr: {

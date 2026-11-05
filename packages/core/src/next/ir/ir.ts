@@ -183,10 +183,20 @@ export interface RuntimeFilter {
 }
 
 /**
- * `mark` (a decorrelated nullable IN / ANY): the output is the left (probe) columns plus one
- * `bool` column, last: TRUE when some right row matches the keys and the residual, else NULL when
- * a comparison was unknown (a null left key with a non-empty right side, or a null right key),
- * else FALSE; an empty right side gives FALSE. One output row per left row (additive, R17.5).
+ * `mark` (a decorrelated [NOT] IN / ANY / ALL with SQL's three-valued result; rulings R20.1 and
+ * R20.5): the output is the probe (left) columns plus one `bool` column, last, one row per probe
+ * row. Two kinds of condition decide it:
+ * - **Participation.** A build row takes part when its correlation keys (`join.correlated`
+ *   leading keys, `=`: a NULL key matches none) equal the probe row's and `join.filter` (the
+ *   subquery's own WHERE, including correlated conditions such as `b.z > p.w`) is TRUE: with
+ *   WHERE semantics, FALSE and NULL both exclude the row.
+ * - **The comparison.** Over the participating rows, the tested keys (the keys after the
+ *   correlation keys) and `join.residual` (only the quantified comparison itself and any extra
+ *   comparison columns) give the mark: TRUE if the comparison is TRUE for any row; else UNKNOWN
+ *   (NULL) if it is UNKNOWN for any; else FALSE. No participating row gives FALSE. A composite
+ *   tested key compares per column, so `(1, 2) IN (SELECT 3, NULL)` is FALSE.
+ * PostgreSQL (verified in PGlite): p(x = 1, w = 0), b(y = 1, z = NULL):
+ * `x NOT IN (SELECT y FROM b WHERE b.z > p.w)` is TRUE, since b's row does not participate.
  */
 export type JoinKind = "inner" | "left" | "right" | "full" | "semi" | "anti" | "mark" | "cross";
 
@@ -286,7 +296,22 @@ export type Rel =
       readonly rightKeys: readonly ScalarExpr[];
       /** Per key: `IS NOT DISTINCT FROM` instead of `=`. */
       readonly nullSafe: readonly boolean[];
-      /** Remaining ON conditions, over left output ++ right output, after the key match. */
+      /**
+       * Mark joins: how many leading keys are correlation keys (R20.1); absent is 0. Never set on
+       * other kinds.
+       */
+      readonly correlated?: number;
+      /**
+       * Mark joins: the participation condition over left output ++ right output, with WHERE
+       * semantics (R20.5, additive; see `JoinKind`). Absent or null: every build row with matching
+       * correlation keys participates. Never set on other kinds, whose `residual` is the whole
+       * remaining ON condition.
+       */
+      readonly filter?: ScalarExpr | null;
+      /**
+       * Remaining ON conditions, over left output ++ right output, after the key match. On a mark
+       * join, only the quantified comparison, evaluated three-valued (R20.5).
+       */
       readonly residual: ScalarExpr | null;
       /** Filters this join's build side publishes into scans under `left`. */
       readonly publishes: readonly RuntimeFilter[];
@@ -372,13 +397,22 @@ export type Rel =
    * the table in catalog order (access/catalog.ts `TableDef.columns`), complete.
    * - `onConflict.assignments` and `onConflict.where`: the existing (conflicting) table row, then
    *   the proposed row (PostgreSQL's EXCLUDED), so column `i` is existing and `n + i` proposed.
+   *   Assignments are evaluated in list order, each once per row, and assignment `j` may also
+   *   read column `2n + i` for `i < j`: the value assignment `i` produced. Lowering recomputes a
+   *   stored generated column from those values, so a volatile assigned expression is evaluated
+   *   once (review B6-p2a finding 3).
    * - `returning`: the affected table row (new values for insert, update and upsert; old values
    *   for delete), then the input's passthrough columns (`passthrough`, below).
    * - `merge` actions: see `MergeAction`.
    */
   | (RelBase & {
       readonly op: "modify";
-      readonly kind: "insert" | "update" | "delete" | "upsert" | "merge";
+      /**
+       * `truncate` (TRUNCATE): removes every row of the table, statement-atomic; the input is an
+       * empty `values` the executor never reads, and there is no RETURNING. Lowering refuses a
+       * table another table's foreign key references (PostgreSQL's 0A000 without CASCADE).
+       */
+      readonly kind: "insert" | "update" | "delete" | "upsert" | "merge" | "truncate";
       readonly tableId: number;
       /**
        * Rows to write (insert/upsert): every table column in catalog order, defaults and

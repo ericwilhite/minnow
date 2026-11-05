@@ -389,11 +389,14 @@ and the owner import it directly.
   rendered `bigint` (R17.2).
 - Milestone M1 surface. Joins, subqueries, windows, set operations and recursion are refused
   with `UnsupportedPlanError` (stage "lower", a construct key) until milestone M3.
-- `testing/lowering-differential.test.ts` runs DDL, seed rows, 40 queries, writes, RETURNING
+- `testing/lowering-differential.test.ts` runs DDL, seed rows, 41 queries, writes, RETURNING
   and failing writes through the current engine and through lowering + the IR reference
-  interpreter (`testing/ir-reference.ts`), and requires identical results.
-- `INVENTORY.md` maps every front-end construct to its IR operator, lists what is refused at
-  first (`UnsupportedPlanError` with a construct key) and the contract changes lowering needs.
+  interpreter (`testing/ir-reference.ts`), and requires identical results;
+  `testing/lowering-pglite.test.ts` does the same against PostgreSQL (PGlite), the authority;
+  `testing/ir-check.ts` type-checks every plan they run.
+- Under `compileWithDeclaredTypes` the front end keeps constants typed (no folding with the
+  current engine's numbers), keeps INSERT values as expressions, marks TRUNCATE and leaves bare
+  ON CONFLICT names unqualified; lowering folds integer constants after overload resolution.
 
 ### Differential adapter (`testing/differential-adapter.ts`)
 

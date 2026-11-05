@@ -95,6 +95,17 @@ function checkRange(value: bigint, type: PhysicalType): bigint {
   return value;
 }
 
+function roundHalfEven(value: number): number {
+  const floor = Math.floor(value);
+  const fraction = value - floor;
+  if (fraction !== 0.5) return Math.round(value);
+  return floor % 2 === 0 ? floor : floor + 1;
+}
+
+function roundHalfAway(value: number): number {
+  return Math.sign(value) * Math.round(Math.abs(value));
+}
+
 const isInteger = (type: PhysicalType) => type.kind === "int32" || type.kind === "int64";
 const isFloat = (type: PhysicalType) => type.kind === "float32" || type.kind === "float64";
 
@@ -103,7 +114,8 @@ function castValue(value: Value, from: PhysicalType, to: PhysicalType): Value {
   if (isInteger(to)) {
     if (typeof value === "bigint") return checkRange(value, to);
     if (typeof value === "number")
-      return checkRange(BigInt(Math.sign(value) * Math.round(Math.abs(value))), to);
+      // PostgreSQL: float → int is rint (ties to even); numeric → int rounds half away from zero.
+      return checkRange(BigInt(isFloat(from) ? roundHalfEven(value) : roundHalfAway(value)), to);
     if (typeof value === "string") {
       if (!/^\s*[+-]?\d+\s*$/u.test(value))
         throw new ReferenceSqlError(`invalid input syntax: "${value}"`, "22P02");
@@ -136,6 +148,7 @@ function castValue(value: Value, from: PhysicalType, to: PhysicalType): Value {
       : text;
   }
   if (to.kind === "bool" && typeof value === "boolean") return value;
+  if (to.kind === "bool" && typeof value === "bigint" && from.kind === "int32") return value !== 0n;
   if (to.kind === "bool" && typeof value === "string") {
     const word = value.trim().toLowerCase();
     if (["t", "true", "yes", "y", "on", "1"].includes(word)) return true;
@@ -222,7 +235,7 @@ function arithmetic(fn: string, args: readonly Value[], type: PhysicalType): Val
       case "abs":
         return round(Math.abs(x));
       case "round":
-        return Math.sign(x) * Math.round(Math.abs(x));
+        return roundHalfEven(x);
     }
   }
   throw new ReferenceUnsupportedError(`${fn} over ${type.kind}`);
@@ -230,6 +243,8 @@ function arithmetic(fn: string, args: readonly Value[], type: PhysicalType): Val
 
 export interface Environment {
   readonly tables: Map<number, Row[]>;
+  /** The rows of the plan's `input` relation (batch writes). */
+  readonly input?: readonly Row[];
   readonly catalog: CatalogView;
   readonly params: readonly Value[];
   readonly rules: (table: TableDef) => TableRuleExpressions;
@@ -342,6 +357,8 @@ export function evaluate(expr: ScalarExpr, row: readonly Value[], env: Environme
         }
         return null;
       }
+      if (expr.fn === "random") return Math.random();
+      if (expr.fn === "gen_random_uuid") return crypto.randomUUID();
       if (expr.fn === "nextval") {
         const id = Number(evaluate(expr.args[0] ?? expr, row, env));
         const next = (env.sequences.get(id) ?? 0n) + 1n;
@@ -551,6 +568,8 @@ export function run(rel: Rel, env: Environment): Row[] {
     }
     case "modify":
       return modifyRows(rel, env);
+    case "input":
+      return (env.input ?? []).map((row) => [...row]);
     default:
       throw new ReferenceUnsupportedError((rel as Rel).op);
   }
@@ -562,6 +581,10 @@ function modifyRows(rel: Extract<Rel, { op: "modify" }>, env: Environment): Row[
   const stored = env.tables.get(table.id) ?? [];
   env.tables.set(table.id, stored);
   const rules = env.rules(table);
+  if (rel.kind === "truncate") {
+    stored.length = 0;
+    return [];
+  }
   const input = run(rel.input, env);
   const returned: Row[] = [];
   const touched = new Set<number>();
@@ -611,12 +634,12 @@ function modifyRows(rel: Extract<Rel, { op: "modify" }>, env: Environment): Row[
           if (rel.onConflict.where !== null && evaluate(rel.onConflict.where, both, env) !== true)
             continue;
           const next = [...existing];
-          for (const assignment of rel.onConflict.assignments)
-            next[table.columns.findIndex((column) => column.id === assignment.column)] = evaluate(
-              assignment.expr,
-              both,
-              env,
-            );
+          // In list order; assignment j reads earlier values as columns 2n + i (ir.ts).
+          for (const assignment of rel.onConflict.assignments) {
+            const value = evaluate(assignment.expr, both, env);
+            both.push(value);
+            next[table.columns.findIndex((column) => column.id === assignment.column)] = value;
+          }
           validate(next);
           stored[found] = next;
           touched.add(found);

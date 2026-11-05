@@ -1117,6 +1117,15 @@ export function compileWithDeclaredTypes<T>(compile: () => T): T {
   }
 }
 
+/**
+ * Whether the current compilation runs under `compileWithDeclaredTypes`. There the parser and
+ * optimizer keep typed expressions instead of folding them with the current engine's number
+ * semantics (lowering folds after overload resolution; review B6-p2a finding 2).
+ */
+export function declaredTypesActive(): boolean {
+  return recordDeclaredTypes;
+}
+
 function declaredType(
   word: string,
   width?: number,
@@ -1537,6 +1546,8 @@ export type CompiledStatement =
       predicates: Array<{ left: Expression; operator: PredicateOperator; right: Expression }>;
       /** `DELETE FROM t USING sources WHERE …`: the extra sources the predicates may read. */
       from?: MutationSources;
+      /** TRUNCATE, marked only under `compileWithDeclaredTypes` (it is a DELETE elsewhere). */
+      truncate?: true;
       returning?: string[] | "*";
       /** RETURNING items that are not plain columns, evaluated over the affected rows. */
       returningItems?: ReturningItem[];
@@ -1818,7 +1829,9 @@ function parseTruncateStatement(tokens: Token[]): CompiledStatement {
   if (index !== words.length) {
     throw new TypeError(`Unexpected input after TRUNCATE: ${words[index]?.text ?? ""}`);
   }
-  return { kind: "delete", table: table.text, predicates: [] };
+  return recordDeclaredTypes
+    ? { kind: "delete", table: table.text, predicates: [], truncate: true }
+    : { kind: "delete", table: table.text, predicates: [] };
 }
 
 function parseTransactionStatement(keyword: string, tokens: Token[]): CompiledStatement {
@@ -8095,7 +8108,9 @@ function rewriteUpsertExpression(
   const rewrite = (node: Expression): Expression => {
     if (node.kind === "column") {
       const parts = node.reference.split(".");
-      if (parts.length === 1) return { ...node, reference: `${table}.${node.reference}` };
+      // Lowering resolves bare names itself (PostgreSQL: ambiguous with EXCLUDED, 42702).
+      if (parts.length === 1)
+        return recordDeclaredTypes ? node : { ...node, reference: `${table}.${node.reference}` };
       if (parts.length === 2 && parts[0]?.toUpperCase() === "EXCLUDED") {
         return { ...node, reference: `EXCLUDED.${parts[1] ?? ""}` };
       }
@@ -9790,6 +9805,13 @@ class Parser {
     // A bare placeholder stays a slot; the batch write binds it later. Placeholders nested in
     // arithmetic would need expression retention through the batch path, so they stay rejected.
     if (expression.kind === "parameter") return { parameter: expression.index };
+    // Lowering types every value itself: nothing is evaluated with the current engine's numbers.
+    if (
+      recordDeclaredTypes &&
+      expressionColumns(expression).length === 0 &&
+      !hasAggregate(expression)
+    )
+      return { expression: resolveStatementExpression(expression) };
     if (containsParameter(expression)) {
       throw new TypeError(`${label} take a bare ? placeholder or a constant expression`);
     }

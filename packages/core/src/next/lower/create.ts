@@ -59,6 +59,9 @@ const TIMESTAMPTZ: PhysicalType = { kind: "timestamp", zoned: true };
  * The query of `CREATE TABLE [IF NOT EXISTS] name AS query`, as written: the compiled statement
  * keeps no text of it, and its follow-up INSERT must lower it again at the new catalog version.
  */
+/** A trailing `WITH DATA` / `WITH NO DATA` of CREATE TABLE AS (group 1 is `NO`). */
+const CTAS_DATA = /(?<=^\s*CREATE\s+TABLE\b[\s\S]*\bAS\b[\s\S]*)\s+WITH\s+(NO\s+)?DATA\s*;?\s*$/iu;
+
 function ctasQueryText(text: string): string {
   const match =
     /^\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:"(?:[^"]|"")+"|[^\s(]+)\s+AS\s+/iu.exec(text);
@@ -176,7 +179,12 @@ const TRANSACTION_ACTIONS = {
 export function createLowerer(): Lowerer {
   return {
     lower(text: string, context: LoweringContext): LoweredStatement {
-      const parsed = parseAny(text);
+      // CREATE TABLE … AS … WITH [NO] DATA: the front end does not parse the clause (and keeps
+      // refusing it); lowering strips it and decides whether the follow-up INSERT runs.
+      const ctasData = CTAS_DATA.exec(text);
+      const source = ctasData === null ? text : text.slice(0, ctasData.index);
+      const noData = ctasData?.[1] !== undefined;
+      const parsed = parseAny(source);
       if ("query" in parsed) return lowerSelect(text, parsed.query, context);
       const statement = parsed.statement;
       const statementClass = classifyStatement(statement);
@@ -263,11 +271,13 @@ export function createLowerer(): Lowerer {
             kind: "ddl",
             parameters: [],
             change,
-            followUp: insertSelectText(
-              statement.table,
-              columns.map((column) => column.name),
-              ctasQueryText(text),
-            ),
+            followUp: noData
+              ? null
+              : insertSelectText(
+                  statement.table,
+                  columns.map((column) => column.name),
+                  ctasQueryText(source),
+                ),
           };
         }
         default: {

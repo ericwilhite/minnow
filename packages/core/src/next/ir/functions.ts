@@ -1,11 +1,12 @@
 /**
  * The scalar functions and operators of the IR: every `call.fn` lowering may emit, with its
  * overloads (additive, ruling R17.5). Lowering resolves a SQL call against this table
- * (PostgreSQL's function resolution: exact match, else the candidate reachable by the fewest
- * implicit casts, ties broken by the preferred type of each category) and emits the chosen
+ * (PostgreSQL's func_select_candidate: lower/coerce.ts `resolveFunction`) and emits the chosen
  * overload's argument types exactly, inserting `cast` nodes. The executor implements a kernel per
  * overload and refuses any other (`UnsupportedPlanError`, stage "execute"). The table is data so
- * both sides read one list; growing it is additive.
+ * both sides read one list; growing it is additive. Ruling R19: this file is the one authority for
+ * names, overloads, casts (implicit and explicit), strictness, volatility and preferred types;
+ * the executor binds kernels to its entries.
  *
  * ## Semantics shared by every entry
  * - **Strict** unless listed in `NON_STRICT_FUNCTIONS`: any NULL argument gives NULL, without
@@ -19,19 +20,23 @@
  *   result (any type, including enums and arrays); lowering picks it as PostgreSQL picks a common
  *   type (UNION / CASE resolution) and casts each argument to it.
  * - Comparison, boolean logic, NULL tests, CASE, IN lists and LIKE are IR nodes, not calls.
- *   `compare` and `inList` take operands of exactly one type (lowering casts to the common
- *   type), so no comparison overloads are listed here.
+ *   `compare` and `inList` take operands of one base type (lowering casts to the common type);
+ *   type modifiers may differ and are ignored: a VARCHAR(2) column compares with a `text`
+ *   constant by value, never by truncating the constant (review B6-p2a finding 1), and
+ *   NUMERIC(10, 2) with unconstrained NUMERIC by value. A `keyLookup` or `indexRange` key may
+ *   likewise differ from its column only in modifiers. So no comparison overloads are listed.
  *
  * ## Casts (`cast` nodes)
- * The executor implements a cast between every pair below, with PostgreSQL's semantics (rounding
- * float → int to nearest, ties away from zero; numeric rounding half away from zero; range errors
- * 22003; text parsing as the type's input function, error 22P02):
- * - among int2, int4, int8, float4, float8, numeric (and numeric(p, s) to its declared scale);
- * - every type → text, and text → every type except arrays of arrays;
- * - date ↔ timestamp ↔ timestamptz (session time zone UTC), time ↔ interval, timestamp(tz) →
- *   date and → time;
- * - json ↔ jsonb, text → enum, enum → text, bool ↔ int4.
- * Implicit casts (applied without a CAST in the SQL) are `IMPLICIT_CASTS`.
+ * Exactly the pairs `explicitCastAllowed` accepts; any other explicit CAST is 42846 at lowering
+ * (`CAST(true AS date)`, `CAST(1 AS date)`, `CAST(1::int8 AS bool)`, as PostgreSQL). Semantics
+ * are PostgreSQL's (review finding 9):
+ * - float4/float8 → integer rounds to nearest, **ties to even** (`rint`: 2.5 → 2, 3.5 → 4,
+ *   −2.5 → −2); numeric → integer and numeric → numeric(p, s) round half away from zero
+ *   (2.5 → 3); out of range is 22003; text is parsed by the type's input function (22P02);
+ * - `CAST` to VARCHAR(n) / CHAR(n) truncates; `cast.assignment` raises 22001 instead (ir.ts).
+ * Implicit casts (applied without a CAST in the SQL) are `IMPLICIT_CASTS`; assignment casts
+ * (values written to a column) additionally narrow among numeric types and accept any type into
+ * text.
  */
 import type { PhysicalType } from "../types.js";
 
@@ -184,7 +189,10 @@ export const FUNCTIONS: Readonly<Record<string, readonly Overload[]>> = {
 /**
  * Functions that see NULL arguments: `coalesce` (first non-null), `greatest` / `least` (ignore
  * nulls; NULL only when every argument is), `nullif` (NULL first argument gives NULL; NULL
- * second gives the first).
+ * second gives the first). `nullif`'s result type is PostgreSQL's: the left operand type of the
+ * resolved `=`, which is the first argument's type when both are integers or both floats (cross-
+ * type `=` exists) and their common type otherwise; lowering casts back to the first argument's
+ * type in the integer and float cases, so the call itself is always `nullif(T, T)`.
  */
 export const NON_STRICT_FUNCTIONS: ReadonlySet<string> = new Set([
   "coalesce",
@@ -216,6 +224,38 @@ export const IMPLICIT_CASTS: Readonly<Partial<Record<SqlType, readonly SqlType[]
   time: ["interval"],
   json: ["jsonb"],
 };
+
+const NUMERIC_TYPES: readonly SqlType[] = ["int2", "int4", "int8", "float4", "float8", "numeric"];
+
+/** Explicit casts beyond numeric ↔ numeric and anything ↔ text (`pg_cast` among these types). */
+export const EXPLICIT_CASTS: Readonly<Partial<Record<SqlType, readonly SqlType[]>>> = {
+  bool: ["int4"],
+  int4: ["bool"],
+  date: ["timestamp", "timestamptz"],
+  timestamp: ["date", "time", "timestamptz"],
+  timestamptz: ["date", "time", "timestamp"],
+  time: ["interval"],
+  interval: ["time"],
+  json: ["jsonb"],
+  jsonb: ["json"],
+};
+
+/**
+ * Whether `CAST(from AS to)` exists: the same base type, numeric ↔ numeric, to or from text
+ * (PostgreSQL's I/O conversion casts), the pairs in `EXPLICIT_CASTS`, enums ↔ text, and arrays
+ * whose elements cast. Anything else is 42846.
+ */
+export function explicitCastAllowed(from: PhysicalType, to: PhysicalType): boolean {
+  if (from.kind === to.kind && from.kind !== "array") return true;
+  if (from.kind === "text" || to.kind === "text") return true;
+  if (from.kind === "array" && to.kind === "array")
+    return explicitCastAllowed(from.element, to.element);
+  const source = sqlTypeOf(from);
+  const target = sqlTypeOf(to);
+  if (source === null || target === null) return false;
+  if (NUMERIC_TYPES.includes(source) && NUMERIC_TYPES.includes(target)) return true;
+  return (EXPLICIT_CASTS[source] ?? []).includes(target);
+}
 
 /**
  * The preferred type of each category (`pg_type.typispreferred`), which wins ties in overload

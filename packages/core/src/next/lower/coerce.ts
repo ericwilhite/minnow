@@ -4,6 +4,7 @@
  * common types (CASE, COALESCE, comparison operands) and overload choice.
  */
 import {
+  explicitCastAllowed,
   FUNCTIONS,
   IMPLICIT_CASTS,
   PREFERRED_TYPES,
@@ -104,13 +105,17 @@ function typeName(type: PhysicalType): string {
   return sqlTypeOf(type) ?? type.kind;
 }
 
-/** A pending constant as a constant of `type`: folded when lowering knows the value exactly. */
-function constantOf(text: string, type: PhysicalType): ScalarExpr {
+/**
+ * A pending constant as a constant of `type`: folded when lowering knows the value exactly, else
+ * cast by the executor in `context` (an assignment never truncates: 22001, review finding 4).
+ */
+function constantOf(text: string, type: PhysicalType, context: CoercionContext): ScalarExpr {
+  const assignment = context === "assignment";
   switch (type.kind) {
     case "text":
       return type.maxLength === undefined
         ? textLiteral(text, type)
-        : castTo(textLiteral(text), type);
+        : castTo(textLiteral(text), type, assignment);
     case "bool": {
       const word = text.trim().toLowerCase();
       if (["t", "true", "y", "yes", "on", "1"].includes(word)) return boolLiteral(true);
@@ -135,11 +140,12 @@ function constantOf(text: string, type: PhysicalType): ScalarExpr {
     case "decimal": {
       const parsed = parseDecimalText(text);
       // NaN / Infinity and declared scales go through the executor's cast.
-      if (parsed === null || type.scale !== null) return castTo(textLiteral(text), type);
+      if (parsed === null || type.scale !== null)
+        return castTo(textLiteral(text), type, assignment);
       return decimalLiteral(parsed.coefficient, parsed.scale, type);
     }
     default:
-      return castTo(textLiteral(text), type);
+      return castTo(textLiteral(text), type, assignment);
   }
 }
 
@@ -168,7 +174,7 @@ export function coerce(
   if (pending?.kind === "null") return { expr: nullLiteral(type), nullable: true, big: false };
   if (pending?.kind === "text")
     return {
-      expr: constantOf(pending.text, type),
+      expr: constantOf(pending.text, type, context),
       nullable: false,
       big: int64 && context === "explicit",
     };
@@ -182,10 +188,20 @@ export function coerce(
     return samePhysicalType(fixed, type) ? param : coerce(param, type, context, parameters);
   }
   const from = typed.expr.type;
-  if (samePhysicalType(from, type)) return typed;
+  if (samePhysicalType(from, type))
+    // R17.1: CAST AS BIGINT renders bigint even over an int8 (`count(*)::bigint`, finding 8).
+    return int64 && context === "explicit" && !typed.big ? { ...typed, big: true } : typed;
+  // Dropping a modifier for a comparison is no cast: a VARCHAR(40) value is a text value.
+  if (context === "implicit" && sameBase(from, type) && samePhysicalType(type, baseType(type)))
+    return typed;
   const allowed =
-    context === "explicit" ||
-    (context === "assignment" ? canAssign(from, type) : canImplicitlyCast(from, type));
+    context === "explicit"
+      ? explicitCastAllowed(from, type)
+      : context === "assignment"
+        ? canAssign(from, type)
+        : canImplicitlyCast(from, type);
+  if (!allowed && context === "explicit")
+    throw new PlanningError(`cannot cast type ${typeName(from)} to ${typeName(type)}`, "42846");
   if (!allowed)
     throw new PlanningError(
       `${context === "assignment" ? "column is of type" : "cannot use"} ${typeName(type)} but expression is of type ${typeName(from)}`,
@@ -291,11 +307,46 @@ function expand(overload: Overload, arity: number): ReadonlyArray<SqlType | "T">
   return overload.args.length === arity ? overload.args : null;
 }
 
+/** PostgreSQL's type categories (`pg_type.typcategory`) of the table's types. */
+function categoryOf(type: SqlType): string {
+  switch (type) {
+    case "int2":
+    case "int4":
+    case "int8":
+    case "float4":
+    case "float8":
+    case "numeric":
+      return "N";
+    case "text":
+      return "S";
+    case "date":
+    case "time":
+    case "timestamp":
+    case "timestamptz":
+      return "D";
+    case "interval":
+      return "T";
+    case "bool":
+      return "B";
+    default:
+      return type;
+  }
+}
+
+interface Candidate {
+  readonly overload: Overload;
+  readonly params: readonly SqlType[];
+}
+
 /**
- * Chooses the overload of `fn` for `args` (PostgreSQL's func_select_candidate, simplified to the
- * table's types): an exact match; else, when every typed argument has one type and an overload
- * takes only that type, that one; else the candidate needing implicit casts only with the most
- * exact matches, then the most preferred types. Throws 42883 when none fits, 42725 on a tie.
+ * Chooses the overload of `fn` for `args` by PostgreSQL's func_select_candidate over the table's
+ * types (typeconv-func.html): an exact match; for a binary call with one unknown argument, the
+ * overload taking the known type twice; else among the candidates reachable by implicit casts,
+ * the most exact matches, then the most preferred types where a cast is needed, then for each
+ * unknown argument the string category if a candidate accepts it, else the one category every
+ * candidate accepts; finally, when every known argument has one type, the candidate taking that
+ * type at the unknown positions. Throws 42883 when nothing fits and 42725 when more than one
+ * candidate is left (`'1' + '2'`, as PostgreSQL).
  */
 export function resolveFunction(
   fn: string,
@@ -305,63 +356,88 @@ export function resolveFunction(
   const overloads = FUNCTIONS[fn];
   if (overloads === undefined) throw new PlanningError(`function ${fn} does not exist`, "42883");
   const kinds = args.map((arg) => argSql(arg, parameters));
-  const candidates = overloads.flatMap((overload) => {
+  const expanded = overloads.flatMap((overload) => {
     const params = expand(overload, args.length);
     return params === null ? [] : [{ overload, params }];
   });
-  const generic = candidates.find(({ params }) => params.every((param) => param === "T"));
+  // A type-variable overload (coalesce, greatest…) takes the arguments' common type. A
+  // zero-argument overload is an ordinary exact match (review finding 5).
+  const generic = expanded.find(
+    ({ params }) => params.length > 0 && params.every((param) => param === "T"),
+  );
   if (generic !== undefined) {
     const type = commonType(args, parameters, fn);
     return { fn, args: args.map(() => type), result: type };
   }
-  const known = kinds.filter((kind): kind is SqlType => kind !== "unknown" && kind !== null);
   if (kinds.includes(null))
     throw new PlanningError(`function ${fn} does not accept these argument types`, "42883");
-  const score = (params: ReadonlyArray<SqlType | "T">) => {
-    let exact = 0;
-    let preferred = 0;
-    for (const [index, param] of params.entries()) {
-      const kind = kinds[index];
-      if (param === "T" || kind === undefined || kind === null) return null;
-      if (kind === "unknown") {
-        if (PREFERRED_TYPES.has(param)) preferred += 1;
-        continue;
-      }
-      if (kind === param) exact += 1;
-      else if (!(IMPLICIT_CASTS[kind] ?? []).includes(param)) return null;
-      else if (PREFERRED_TYPES.has(param)) preferred += 1;
-    }
-    return { exact, preferred };
-  };
-  const viable = candidates.flatMap(({ overload, params }) => {
-    const value = score(params);
-    return value === null ? [] : [{ overload, params: params as readonly SqlType[], ...value }];
-  });
-  if (viable.length === 0)
-    throw new PlanningError(`function ${fn}(${kinds.join(", ")}) does not exist`, "42883");
-  const exact = viable.find((candidate) => candidate.exact === args.length);
-  const sameKnown = known.length > 0 && known.every((kind) => kind === known[0]);
-  const chosen =
-    exact ??
-    (sameKnown
-      ? viable.find((candidate) => candidate.params.every((param) => param === known[0]))
-      : undefined) ??
-    pickBest(viable, fn);
-  return {
+  const candidates: Candidate[] = expanded.flatMap(({ overload, params }) =>
+    params.includes("T") ? [] : [{ overload, params: params as readonly SqlType[] }],
+  );
+  const resolved = (chosen: Candidate): Resolved => ({
     fn,
     args: chosen.params.map((param) => physicalTypeOfSql(param)),
     result: physicalTypeOfSql(chosen.overload.result as SqlType),
+  });
+  const exact = candidates.find((candidate) =>
+    candidate.params.every((param, index) => kinds[index] === param),
+  );
+  if (exact !== undefined) return resolved(exact);
+  const known = kinds.filter((kind): kind is SqlType => kind !== "unknown" && kind !== null);
+  if (args.length === 2 && known.length === 1) {
+    const twice = candidates.find((candidate) =>
+      candidate.params.every((param) => param === known[0]),
+    );
+    if (twice !== undefined) return resolved(twice);
+  }
+  let viable = candidates.filter((candidate) =>
+    candidate.params.every((param, index) => {
+      const kind = kinds[index];
+      return (
+        kind === "unknown" ||
+        kind === param ||
+        (kind !== null && kind !== undefined && (IMPLICIT_CASTS[kind] ?? []).includes(param))
+      );
+    }),
+  );
+  if (viable.length === 0)
+    throw new PlanningError(`function ${fn}(${kinds.join(", ")}) does not exist`, "42883");
+  const keepMost = (score: (candidate: Candidate) => number): void => {
+    const best = Math.max(...viable.map(score));
+    viable = viable.filter((candidate) => score(candidate) === best);
   };
-}
-
-function pickBest<T extends { exact: number; preferred: number }>(
-  viable: readonly T[],
-  fn: string,
-): T {
-  const best = [...viable].sort((a, b) => b.exact - a.exact || b.preferred - a.preferred);
-  const [first, second] = best;
-  if (first === undefined) throw new PlanningError(`function ${fn} does not exist`, "42883");
-  if (second?.exact === first.exact && second.preferred === first.preferred)
-    throw new PlanningError(`function ${fn} is not unique`, "42725");
-  return first;
+  keepMost((candidate) => candidate.params.filter((param, index) => kinds[index] === param).length);
+  keepMost(
+    (candidate) =>
+      candidate.params.filter(
+        (param, index) => kinds[index] !== param && PREFERRED_TYPES.has(param),
+      ).length,
+  );
+  for (const [index, kind] of kinds.entries()) {
+    if (kind !== "unknown" || viable.length <= 1) continue;
+    const categories = new Set(
+      viable.map((candidate) => categoryOf(candidate.params[index] ?? "text")),
+    );
+    const chosen = categories.has("S")
+      ? "S"
+      : categories.size === 1
+        ? [...categories][0]
+        : undefined;
+    if (chosen === undefined) break;
+    viable = viable.filter((candidate) => categoryOf(candidate.params[index] ?? "text") === chosen);
+    const preferred = viable.filter((candidate) =>
+      PREFERRED_TYPES.has(candidate.params[index] ?? "text"),
+    );
+    if (preferred.length > 0) viable = preferred;
+  }
+  if (viable.length > 1 && known.length > 0 && known.every((kind) => kind === known[0])) {
+    const same = viable.filter((candidate) =>
+      candidate.params.every((param, index) => kinds[index] !== "unknown" || param === known[0]),
+    );
+    if (same.length === 1) viable = same;
+  }
+  const [only] = viable;
+  if (only === undefined || viable.length > 1)
+    throw new PlanningError(`function ${fn}(${kinds.join(", ")}) is not unique`, "42725");
+  return resolved(only);
 }

@@ -20,7 +20,7 @@ import type { PhysicalType } from "../types.js";
 import { DUAL_TABLE, isAggregateCall } from "../../engine/query.js";
 import { encodeQueryIdentity } from "../../engine/query-identity.js";
 import type { CompiledQuery, Expression, Predicate, TableSource } from "../../plan/model.js";
-import { coerce, settle, type ParameterTypes, type Typed } from "./coerce.js";
+import { baseType, coerce, settle, type ParameterTypes, type Typed } from "./coerce.js";
 import { PlanningError, unsupported } from "./errors.js";
 import {
   asBool,
@@ -180,11 +180,19 @@ function keyValue(
 ): ScalarExpr | null {
   const typed = lowerExpression(expression, scope, builder.state);
   try {
-    const keyed = coerce(typed, def.type, "implicit", builder.parameters);
+    // Only lossless coercions select key access (review finding 1): the key is the constant at
+    // the column's base type, so `varchar2_col = 'abc'` probes 'abc' (no match), never 'ab'.
+    const keyed = coerce(typed, baseType(def.type), "implicit", builder.parameters);
     const expr = keyed.expr;
     if (expr.op === "literal" || expr.op === "param") return expr;
-    // A constant cast the executor folds once (`DATE '…'`, a text constant as uuid).
-    if (expr.op === "cast" && (expr.input.op === "literal" || expr.input.op === "param"))
+    // A constant parsed from text (`DATE '…'`, a uuid string), evaluated once by the executor.
+    if (
+      expr.op === "cast" &&
+      expr.assignment !== true &&
+      expr.input.op === "literal" &&
+      expr.input.type.kind === "text" &&
+      expr.type.kind !== "text"
+    )
       return expr;
     return null;
   } catch {

@@ -9,23 +9,8 @@
 import { describe, expect, it } from "vitest";
 import { MinnowDatabase } from "../../engine/database.js";
 import { MemoryBlockStore } from "../../storage/index.js";
-import type { ExecutorCosts } from "../ir/costs.js";
-import { createLowerer } from "../lower/create.js";
-import type { LoweredStatement, LoweringContext } from "../lower/lowerer.js";
-import { MemoryCatalog } from "../lower/memory-catalog.js";
-import type { PhysicalType } from "../types.js";
-import { run, ReferenceSqlError, type Environment, type Row, type Value } from "./ir-reference.js";
-
-const COSTS: ExecutorCosts = {
-  decodePerValue: 1,
-  filterPerRow: 1,
-  hashBuildPerRow: 20,
-  hashProbePerRow: 15,
-  aggregatePerRow: 5,
-  sortPerRowLog: 3,
-  emitPerValue: 2,
-  spillBytesPerSecond: 600e6,
-};
+import { ReferenceSqlError } from "./ir-reference.js";
+import { LoweredDatabase } from "./lowering-harness.js";
 
 /** A statement and its placeholder values. */
 type Case = readonly [string, (readonly unknown[])?];
@@ -136,74 +121,9 @@ function oracleValue(value: unknown): unknown {
   return value;
 }
 
-function nextValue(value: Value): unknown {
-  if (typeof value === "bigint") return Number(value);
-  if (typeof value === "number" && !Number.isInteger(value)) return Number(value.toPrecision(12));
-  return value;
-}
-
-function bind(value: unknown, type: PhysicalType): Value {
-  if (value === null || value === undefined) return null;
-  if (type.kind === "int32" || type.kind === "int64") return BigInt(value as number);
-  if (type.kind === "float64" || type.kind === "float32") return Number(value);
-  if (type.kind === "bool") return Boolean(value);
-  return typeof value === "string" ? value : JSON.stringify(value);
-}
-
-class Next {
-  readonly catalog = new MemoryCatalog();
-  readonly tables = new Map<number, Row[]>();
-  readonly sequences = new Map<number, bigint>();
-  readonly lowerer = createLowerer();
-
-  context(): LoweringContext {
-    return { catalog: this.catalog.view, statistics: { table: () => null }, costs: COSTS };
-  }
-
-  lower(sql: string): LoweredStatement {
-    return this.lowerer.lower(sql, this.context());
-  }
-
-  execute(sql: string, params: readonly unknown[] = []): Array<Record<string, unknown>> {
-    const lowered = this.lower(sql);
-    if (lowered.kind === "ddl") {
-      if (lowered.change !== null) {
-        const created = this.catalog.apply(lowered.change);
-        if (lowered.change.kind === "createTable" && created.id !== null)
-          this.tables.set(created.id, []);
-      }
-      return [];
-    }
-    if (lowered.kind !== "query" && lowered.kind !== "modify")
-      throw new Error(`Cannot run ${lowered.kind}`);
-    const env: Environment = {
-      tables: this.tables,
-      catalog: this.catalog.view,
-      params: lowered.plan.parameters
-        .slice(0, lowered.plan.placeholderCount)
-        .map((type, index) => bind(params[index], type)),
-      rules: (table) => this.lowerer.lowerTableRules(table, this.catalog.view),
-      sequences: this.sequences,
-    };
-    // Statement atomicity: a failing statement leaves the tables as they were.
-    const saved = new Map([...this.tables].map(([id, rows]) => [id, rows.map((row) => [...row])]));
-    try {
-      const rows = run(lowered.plan.root, env);
-      return rows.map((row) =>
-        Object.fromEntries(
-          lowered.columns.map((column, index) => [column.name, nextValue(row[index] ?? null)]),
-        ),
-      );
-    } catch (error) {
-      for (const [id, rows] of saved) this.tables.set(id, rows);
-      throw error;
-    }
-  }
-}
-
-async function both(): Promise<{ oracle: MinnowDatabase; next: Next }> {
+async function both(): Promise<{ oracle: MinnowDatabase; next: LoweredDatabase }> {
   const oracle = new MinnowDatabase(new MemoryBlockStore());
-  const next = new Next();
+  const next = new LoweredDatabase();
   for (const sql of [...SCHEMA, ...SEED]) {
     await oracle.execute(sql);
     next.execute(sql);
@@ -278,7 +198,7 @@ describe("lowering agrees with the current engine (milestone M1 surface)", () =>
 describe("lowered table rules (R14.3)", () => {
   it("are accepted by the executor's compileTableRules", async () => {
     const { compileTableRules } = await import("../exec/rules.js");
-    const next = new Next();
+    const next = new LoweredDatabase();
     for (const sql of SCHEMA) next.execute(sql);
     next.execute(
       "CREATE TABLE ruled (a INTEGER NOT NULL, b TEXT DEFAULT 'x', c BIGINT GENERATED ALWAYS AS (a * 2) STORED, d VARCHAR(5), CHECK (a > 0), CHECK (d <> 'bad'))",

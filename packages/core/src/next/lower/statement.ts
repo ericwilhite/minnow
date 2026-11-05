@@ -47,8 +47,9 @@ const TRANSACTION_COMMANDS = {
 } as const;
 
 /**
- * Classifies one compiled statement. TRUNCATE compiles to an unfiltered DELETE and reports
- * `DELETE` (PostgreSQL: `TRUNCATE TABLE`); the front end keeps no trace of the spelling.
+ * Classifies one compiled statement. TRUNCATE is `TRUNCATE` when compiled under
+ * `compileWithDeclaredTypes` (lowering always is); compiled without it, the front end makes it an
+ * unfiltered DELETE and keeps no trace of the spelling, so it reports `DELETE`.
  */
 export function classifyStatement(statement: CompiledStatement): StatementClass {
   switch (statement.kind) {
@@ -59,7 +60,11 @@ export function classifyStatement(statement: CompiledStatement): StatementClass 
     case "update":
       return { kind: "modify", command: "UPDATE", controlsTransaction: false };
     case "delete":
-      return { kind: "modify", command: "DELETE", controlsTransaction: false };
+      return {
+        kind: "modify",
+        command: statement.truncate === true ? "TRUNCATE" : "DELETE",
+        controlsTransaction: false,
+      };
     case "merge":
       return { kind: "modify", command: "MERGE", controlsTransaction: false };
     case "transaction":

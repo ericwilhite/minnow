@@ -25,7 +25,7 @@ import { coerce, ParameterTypes } from "./coerce.js";
 import { declaredColumnType, type FrontEndColumn } from "./columns.js";
 import { PlanningError, unsupported } from "./errors.js";
 import { lowerExpression, type ExpressionState } from "./expressions.js";
-import { lowerTableRules } from "./rules.js";
+import { generatedValue, lowerTableRules, tableRowScope } from "./rules.js";
 
 type CreateTable = Extract<CompiledStatement, { kind: "create-table" }>;
 
@@ -243,6 +243,29 @@ function validateRules(input: TableInput, catalog: CatalogView): void {
         "42601",
       );
   lowerTableRules(provisional, catalog);
+  // PostgreSQL: a generation expression must be immutable (42P17; review finding 6): no volatile
+  // function, sequence or statement clock.
+  const scope = tableRowScope(provisional);
+  for (const column of provisional.columns) {
+    if (column.generatedSql === null) continue;
+    const reads = { clock: false };
+    const state: ExpressionState = {
+      parameters: new ParameterTypes(0),
+      catalog,
+      clock: () => {
+        reads.clock = true;
+        return 0;
+      },
+      volatile: false,
+      sequences: false,
+    };
+    generatedValue(column, scope, state);
+    if (state.volatile || state.sequences || reads.clock)
+      throw new PlanningError(
+        `generation expression for column "${column.name}" is not immutable`,
+        "42P17",
+      );
+  }
 }
 
 /** The table's current definition as a `TableInput` (every entry keeps its id). */

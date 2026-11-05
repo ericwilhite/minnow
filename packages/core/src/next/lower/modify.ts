@@ -33,6 +33,7 @@ import {
   type RelColumn,
 } from "./query.js";
 import { defaultValue, generatedValue, rowScope, ruleColumns, tableRowScope } from "./rules.js";
+import { nullLiteral } from "./literals.js";
 
 type Insert = Extract<CompiledStatement, { kind: "insert" }>;
 type Update = Extract<CompiledStatement, { kind: "update" }>;
@@ -145,8 +146,9 @@ function completeRows(
   builder: PlanBuilder,
 ): Rel {
   const base = table.columns.map((def): Typed => {
+    // A placeholder of the column's own type; the next projection computes it (finding 6).
     if (def.generatedSql !== null)
-      return { expr: { op: "column", index: 0, type: def.type }, nullable: true, big: false };
+      return { expr: nullLiteral(def.type), nullable: true, big: false };
     return supplied(def) ?? defaultValue(def, builder.state);
   });
   const output: OutputColumn[] = table.columns.map((def) => ({
@@ -181,29 +183,68 @@ function arbitersFor(table: TableDef, columns: readonly string[]): IndexDef[] {
   );
 }
 
-/** Values assigned to columns by name, with generated columns that read them recomputed. */
-function assignmentsWithGenerated(
+/**
+ * The stored generated columns that read an assigned column, computed over the new row: an
+ * assigned column reads `assignedValue(def)`, the value already materialized once (an input
+ * column of the next projection, or an earlier ON CONFLICT assignment), never its expression
+ * again, so `SET x = nextval('s')` advances the sequence once (review finding 3); any other
+ * column reads `current`. In catalog order.
+ */
+function dependentGenerated(
   table: TableDef,
-  assigned: ReadonlyMap<number, Typed>,
+  assigned: ReadonlySet<number>,
+  assignedValue: (def: ColumnDef) => Typed,
   current: (position: number, def: ColumnDef) => Typed,
   qualifiers: readonly string[],
   builder: PlanBuilder,
-): Map<number, Typed> {
-  const result = new Map(assigned);
+): Array<{ readonly def: ColumnDef; readonly value: Typed }> {
   const assignedNames = new Set(
     table.columns.filter((def) => assigned.has(def.id)).map((def) => def.name),
   );
-  const newRow = rowScope(
-    table,
-    qualifiers,
-    (position, def) => assigned.get(def.id) ?? current(position, def),
+  const newRow = rowScope(table, qualifiers, (position, def) =>
+    assigned.has(def.id) ? assignedValue(def) : current(position, def),
   );
-  for (const def of table.columns) {
-    if (def.generatedSql === null) continue;
-    if (!ruleColumns(def.generatedSql).some((name) => assignedNames.has(name))) continue;
-    result.set(def.id, generatedValue(def, newRow, builder.state));
-  }
-  return result;
+  return table.columns.flatMap((def) =>
+    def.generatedSql !== null &&
+    ruleColumns(def.generatedSql).some((name) => assignedNames.has(name))
+      ? [{ def, value: generatedValue(def, newRow, builder.state) }]
+      : [],
+  );
+}
+
+/**
+ * ON CONFLICT assignments in IR order: the assigned values, then the generated columns that read
+ * them, each reading an earlier assignment `j` as column `2n + j` (ir.ts "What modify's
+ * expressions read").
+ */
+function conflictAssignments(
+  table: TableDef,
+  assigned: ReadonlyArray<{ readonly def: ColumnDef; readonly value: Typed }>,
+  qualifiers: readonly string[],
+  builder: PlanBuilder,
+): Array<{ readonly column: number; readonly expr: ScalarExpr }> {
+  const width = table.columns.length;
+  const order = new Map(assigned.map((entry, index) => [entry.def.id, index]));
+  const dependents = dependentGenerated(
+    table,
+    new Set(order.keys()),
+    (def) => ({
+      expr: column(2 * width + (order.get(def.id) ?? 0), def),
+      nullable: true,
+      big: def.type.kind === "int64",
+    }),
+    (position, def) => ({
+      expr: column(position, def),
+      nullable: def.nullable,
+      big: def.type.kind === "int64",
+    }),
+    qualifiers,
+    builder,
+  );
+  return [...assigned, ...dependents].map(({ def, value }) => ({
+    column: def.id,
+    expr: value.expr,
+  }));
 }
 
 function generatedAssignmentError(def: ColumnDef): PlanningError {
@@ -353,10 +394,15 @@ function conflictClause(
     nullable: def.nullable,
     big: def.type.kind === "int64",
   }));
+  // An unqualified name is both the target's and EXCLUDED's column: PostgreSQL's 42702 (finding 7).
   const scope: Scope = {
-    column: (reference) => excluded.column(reference) ?? own.column(reference),
+    column: (reference) => {
+      if (!reference.includes(".") && own.column(reference) !== undefined)
+        throw new PlanningError(`column reference "${reference}" is ambiguous`, "42702");
+      return excluded.column(reference) ?? own.column(reference);
+    },
   };
-  const assigned = new Map<number, Typed>();
+  const assigned: Array<{ def: ColumnDef; value: Typed }> = [];
   const pairs =
     clause.action === "replace"
       ? targets.map((def) => ({
@@ -375,9 +421,10 @@ function conflictClause(
           "assignment",
           builder.parameters,
         );
-    assigned.set(def.id, value);
+    if (assigned.some((entry) => entry.def.id === def.id))
+      throw new PlanningError(`multiple assignments to same column "${def.name}"`, "42601");
+    assigned.push({ def, value });
   }
-  const all = assignmentsWithGenerated(table, assigned, existing, qualifiers, builder);
   const where =
     clause.where === undefined
       ? null
@@ -386,10 +433,7 @@ function conflictClause(
     arbiters,
     indexId,
     action: "update",
-    assignments: table.columns.flatMap((def) => {
-      const value = all.get(def.id);
-      return value === undefined ? [] : [{ column: def.id, expr: value.expr }];
-    }),
+    assignments: conflictAssignments(table, assigned, qualifiers, builder),
     where,
   };
 }
@@ -468,11 +512,15 @@ export function lowerUpdate(statement: Update, builder: PlanBuilder): LoweredWri
   if (statement.from !== undefined) throw unsupported("join", "UPDATE … FROM (milestone M3)");
   const table = targetTable(statement.table, builder);
   const qualifiers = [table.name, ...(statement.alias === undefined ? [] : [statement.alias])];
-  const assigned = new Map<number, Typed>();
+  const assigned: Array<{ def: ColumnDef; value: Typed }> = [];
+  let dependents: Array<{ readonly def: ColumnDef; readonly value: Typed }> = [];
+  // Generated columns read the assigned values as columns of a first projection
+  // [locator, assigned…, every target column]: positions 1 + j and 1 + k + scan position.
+  const passthrough = (scanPosition: number) => 1 + assigned.length + scanPosition;
   const target = targetRows(table, statement.alias, statement.predicates, builder, (scope) => {
     for (const assignment of statement.assignments) {
       const def = columnNamed(table, assignment.column);
-      if (assigned.has(def.id))
+      if (assigned.some((entry) => entry.def.id === def.id))
         throw new PlanningError(`multiple assignments to same column "${def.name}"`, "42601");
       if (def.generatedSql !== null && !isUpdateDefaultAssignment(assignment.expression))
         throw generatedAssignmentError(def);
@@ -485,35 +533,64 @@ export function lowerUpdate(statement: Update, builder: PlanBuilder): LoweredWri
             "assignment",
             builder.parameters,
           );
-      assigned.set(def.id, value);
+      assigned.push({ def, value });
     }
-    const current = (_position: number, def: ColumnDef): Typed => {
-      const resolved = scope.column(def.name);
-      if (resolved === undefined) throw new PlanningError(`column ${def.name} vanished`, "XX000");
-      return resolved;
-    };
-    const all = assignmentsWithGenerated(table, assigned, current, qualifiers, builder);
-    for (const [id, value] of all) assigned.set(id, value);
+    const order = new Map(assigned.map((entry, index) => [entry.def.id, index]));
+    dependents = dependentGenerated(
+      table,
+      new Set(order.keys()),
+      (def) => ({ expr: column(1 + (order.get(def.id) ?? 0), def), nullable: true, big: false }),
+      (_position, def) => {
+        const resolved = scope.column(def.name);
+        if (resolved?.expr.op !== "column")
+          throw new PlanningError(`column ${def.name} vanished`, "XX000");
+        return { ...resolved, expr: column(passthrough(resolved.expr.index), def) };
+      },
+      qualifiers,
+      builder,
+    );
   });
-  const ids = table.columns.filter((def) => assigned.has(def.id)).map((def) => def.id);
   const locatorType = { kind: "locator" as const, tableId: table.id };
-  const exprs: ScalarExpr[] = [
-    { op: "column", index: target.locator, type: locatorType },
-    ...ids.map((id) => {
-      const value = assigned.get(id);
-      if (value === undefined) throw new PlanningError("assignment vanished", "XX000");
-      return value.expr;
-    }),
-  ];
-  const output: OutputColumn[] = [
-    { name: "(locator)", type: locatorType, nullable: false },
-    ...ids.map((id) => {
-      const def = table.columns.find((candidate) => candidate.id === id);
-      if (def === undefined) throw new PlanningError("column vanished", "XX000");
-      return { name: def.name, type: def.type, nullable: true };
-    }),
-  ];
-  const input: Rel = { op: "project", id: builder.id(), input: target.rel, exprs, output };
+  const locator: OutputColumn = { name: "(locator)", type: locatorType, nullable: false };
+  const assignedOutput = (def: ColumnDef): OutputColumn => ({
+    name: def.name,
+    type: def.type,
+    nullable: true,
+  });
+  const scanned = target.rel.output.slice(0, target.read.columns.length);
+  let input: Rel = {
+    op: "project",
+    id: builder.id(),
+    input: target.rel,
+    exprs: [
+      { op: "column", index: target.locator, type: locatorType },
+      ...assigned.map((entry) => entry.value.expr),
+      ...(dependents.length === 0
+        ? []
+        : scanned.map((output, position): ScalarExpr => ({
+            op: "column",
+            index: position,
+            type: output.type,
+          }))),
+    ],
+    output: [
+      locator,
+      ...assigned.map((entry) => assignedOutput(entry.def)),
+      ...(dependents.length === 0 ? [] : scanned),
+    ],
+  };
+  if (dependents.length > 0)
+    input = {
+      op: "project",
+      id: builder.id(),
+      input,
+      exprs: [
+        { op: "column", index: 0, type: locatorType },
+        ...assigned.map((entry, index) => column(1 + index, entry.def)),
+        ...dependents.map((entry) => entry.value.expr),
+      ],
+      output: [locator, ...[...assigned, ...dependents].map((entry) => assignedOutput(entry.def))],
+    };
   const returning = returningList(statement, table, statement.alias, builder);
   return {
     rel: {
@@ -522,7 +599,7 @@ export function lowerUpdate(statement: Update, builder: PlanBuilder): LoweredWri
       kind: "update",
       tableId: table.id,
       input,
-      assigned: ids,
+      assigned: [...assigned, ...dependents].map((entry) => entry.def.id),
       onRepeat: "error",
       onConflict: null,
       returning: returning?.exprs ?? null,
@@ -536,6 +613,7 @@ export function lowerUpdate(statement: Update, builder: PlanBuilder): LoweredWri
 export function lowerDelete(statement: Delete, builder: PlanBuilder): LoweredWrite {
   if (statement.from !== undefined) throw unsupported("join", "DELETE … USING (milestone M3)");
   const table = targetTable(statement.table, builder);
+  if (statement.truncate === true) return lowerTruncate(table, builder);
   const target = targetRows(table, statement.alias, statement.predicates, builder, () => undefined);
   const locatorType = { kind: "locator" as const, tableId: table.id };
   const input: Rel = {
@@ -560,6 +638,39 @@ export function lowerDelete(statement: Delete, builder: PlanBuilder): LoweredWri
       output: outputColumns(returning?.columns ?? []),
     },
     columns: returning?.columns ?? [],
+    tableId: table.id,
+  };
+}
+
+/**
+ * TRUNCATE: the `truncate` modify kind (ir.ts), which removes every row. A table another table's
+ * foreign key references is refused as PostgreSQL refuses it without CASCADE (0A000).
+ */
+function lowerTruncate(table: TableDef, builder: PlanBuilder): LoweredWrite {
+  const referenced = builder.catalog.tables.find(
+    (other) =>
+      other.id !== table.id && other.foreignKeys.some((key) => key.parentTableId === table.id),
+  );
+  if (referenced !== undefined)
+    throw new PlanningError(
+      `cannot truncate a table referenced in a foreign key constraint: "${referenced.name}" references "${table.name}"`,
+      "0A000",
+    );
+  builder.read(table);
+  return {
+    rel: {
+      op: "modify",
+      id: builder.id(),
+      kind: "truncate",
+      tableId: table.id,
+      input: { op: "values", id: builder.id(), rows: [], output: [] },
+      assigned: [],
+      onRepeat: "error",
+      onConflict: null,
+      returning: null,
+      output: [],
+    },
+    columns: [],
     tableId: table.id,
   };
 }
@@ -609,15 +720,17 @@ export function lowerBatchWrite(
     if (primary === undefined)
       throw new PlanningError(`table "${table.name}" has no primary key to upsert on`, "42P10");
     const width = table.columns.length;
+    const supplied = table.columns.flatMap((def, position) =>
+      targets.includes(def) && !primary.columnIds.includes(def.id)
+        ? [{ def, value: { expr: column(width + position, def), nullable: true, big: false } }]
+        : [],
+    );
     onConflict = {
       arbiters: [primary.id],
       indexId: primary.id,
       action: "update",
-      assignments: table.columns.flatMap((def, position) =>
-        targets.includes(def) && !primary.columnIds.includes(def.id)
-          ? [{ column: def.id, expr: column(width + position, def) }]
-          : [],
-      ),
+      // The supplied columns, then the generated columns that read them (finding 6).
+      assignments: conflictAssignments(table, supplied, [table.name], builder),
       where: null,
     };
   }
