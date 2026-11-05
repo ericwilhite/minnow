@@ -227,16 +227,26 @@ is access's `Snapshot`.
   is plain, and the chunk's dictionary carries on for the other pages. Bounds use the value's
   first 33 bytes and the sketch hashes the whole value. The parts are inside the chunk's data
   range, so the reachability walk reaches them through the chunk and they are reclaimed with it.
-  A value over 64 MiB (`MAX_VALUE_BYTES`) is `UnsupportedPageLayoutError`.
+  Each page's directory entry records its large-value region (`PageEntry.largeRegion`): it lies
+  after the previous page and before this one (pages are in order and never overlap), and the
+  page's pointers must tile it exactly, in row order (checked when the page is parsed, one
+  comparison per value), so a value can alias neither another value nor a page. A value over
+  64 MiB (`MAX_VALUE_BYTES`) is `UnsupportedPageLayoutError`. A group ends before a varlen chunk
+  passes `maxChunkBytes` (1 GiB, far below what the directory's u32 offsets address); it always
+  takes at least one row.
 - Reading large values: `load` reads pages only. `loadValues(from, to)` / `loadValuesOf(rows)`
   load the out-of-line values a decode will reach, charged to the budget before they are read
   (the space's lease), in reads of at most 4 MiB, and kept leased (a decode copies the parts
   straight into the target; no reassembly copy) until `releaseValues`, `release` of their page
   or `close`. Synchronous when every part is resident. A decode that reaches an unloaded one
   throws `ValueNotLoadedError`; `varlenBytes` and `gatherBytes` count full value lengths, so a
-  caller can size batches first. A consumer that can stream uses `valueParts(row)`: one verified
-  part (≤ 1 MiB) held at a time, whatever the value's size. Every pointer is checked against
-  the chunk's data range before anything is read. `scripts/large-value-bench.mts` measures it.
+  caller can size batches first. Values read together share one lease, charged until the last
+  of them is released; a release while a load is in flight wins (the load gives its holds back,
+  and a later load reads afresh). A consumer that can stream uses `valueParts(row)`: one
+  verified part (≤ 1 MiB) held at a time, whatever the value's size. `close` ends every stream
+  and releases what it holds. A stream may yield verified parts before a later part fails: a
+  failed stream is wholly invalid, and its consumer must discard what it got; `loadValues` (and
+  so every decode) verifies every part first. `scripts/large-value-bench.mts` measures it.
 - Floats: min/max follow PostgreSQL's order (NaN above +Infinity): max is NaN when any NaN is
   present, both are NaN only when no other value is.
 - gzip is a second stage only maintenance compaction applies (writer option `gzip`; never a

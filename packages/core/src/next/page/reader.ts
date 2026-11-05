@@ -30,9 +30,12 @@
  *   `loadValuesOf` for a selection; `ValueNotLoadedError` otherwise). Loading charges the parts
  *   to the budget before it reads them (the space's lease), in reads of at most `MAX_READ_BYTES`,
  *   and keeps them leased (no reassembly copy) until `releaseValues`, `release` of their page or
- *   `close`; a decode copies the parts straight into the target. A consumer that can stream
- *   (`valueParts`) holds one verified part at a time. Every pointer is checked against the
- *   chunk's data range before anything is read.
+ *   `close`; values read together share one lease, charged until the last of them is released.
+ *   A release while a load is in flight wins: the load gives what it read back. A decode copies
+ *   the parts straight into the target. A consumer that can stream (`valueParts`) holds one
+ *   verified part at a time; `close` ends every stream, and a stream that fails is wholly
+ *   invalid. Pointers tile their page's large-value region (directory.ts, checked when the page
+ *   is parsed), so a value can alias neither another value nor a page.
  *
  * Decoding is synchronous over loaded pages; every target buffer is the caller's.
  */
@@ -197,11 +200,18 @@ interface LoadedValue {
   readonly charged: number;
 }
 
-/** A value to load: its chunk row and its parts as blobs. */
+/** A value to load: its chunk row, its parts as blobs, and the row's release generation. */
 interface ValueJob {
   readonly row: number;
   readonly refs: readonly BlobRef[];
   readonly bytes: number;
+  readonly generation: number;
+}
+
+/** A `valueParts` stream in progress: the part it holds, until it moves on or the reader closes. */
+interface Stream {
+  live: boolean;
+  lease: ReadLease | null;
 }
 
 export class ChunkReader {
@@ -222,6 +232,13 @@ export class ChunkReader {
   /** Loaded out-of-line values by chunk row. */
   readonly #values = new Map<number, LoadedValue>();
   readonly #valuesPending = new Map<number, Promise<void>>();
+  /**
+   * Bumped when a row's pending load is released (review B2-p2b #3): a load that completes for
+   * an older generation gives its holds back instead of installing.
+   */
+  readonly #generations = new Map<number, number>();
+  /** `valueParts` streams not finished: `close` releases what they hold (review B2-p2b #2). */
+  readonly #streams = new Set<Stream>();
   #closed = false;
 
   private constructor(
@@ -595,12 +612,15 @@ export class ChunkReader {
       this.#drop(this.#held[index]);
       this.#held[index] = undefined;
       const entry = this.directory.pages[index];
-      if (entry !== undefined && this.#values.size > 0)
-        for (const [row, value] of this.#values)
-          if (row >= entry.firstRow && row < entry.firstRow + entry.rowCount) {
-            this.#values.delete(row);
-            this.#dropValue(value);
-          }
+      if (entry === undefined) continue;
+      const inPage = (row: number): boolean =>
+        row >= entry.firstRow && row < entry.firstRow + entry.rowCount;
+      for (const [row, value] of this.#values)
+        if (inPage(row)) {
+          this.#values.delete(row);
+          this.#dropValue(value);
+        }
+      for (const row of [...this.#valuesPending.keys()]) if (inPage(row)) this.#invalidate(row);
     }
   }
 
@@ -611,6 +631,13 @@ export class ChunkReader {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    for (const stream of this.#streams) {
+      stream.live = false;
+      const lease = stream.lease;
+      stream.lease = null;
+      lease?.release();
+    }
+    this.#streams.clear();
     this.release();
     this.#drop(this.#dictionaryHeld);
     this.#dictionaryHeld = null;
@@ -681,14 +708,29 @@ export class ChunkReader {
     return this.#loadValues(this.largeRowsOf(rows, start, end));
   }
 
-  /** Drops loaded out-of-line values: all, or those of the named chunk rows. */
+  /**
+   * Drops out-of-line values: all, or those of the named chunk rows, loaded or still loading (a
+   * load in flight then gives what it reads back; a later `loadValues` reads again).
+   */
   releaseValues(rows?: readonly number[]): void {
-    for (const row of rows ?? [...this.#values.keys()]) {
+    const named = rows ?? [...new Set([...this.#values.keys(), ...this.#valuesPending.keys()])];
+    for (const row of named) {
+      if (this.#valuesPending.has(row)) this.#invalidate(row);
       const value = this.#values.get(row);
       if (value === undefined) continue;
       this.#values.delete(row);
       this.#dropValue(value);
     }
+  }
+
+  /** A pending load of `row` no longer installs; the next load starts afresh. */
+  #invalidate(row: number): void {
+    this.#generations.set(row, this.#generation(row) + 1);
+    this.#valuesPending.delete(row);
+  }
+
+  #generation(row: number): number {
+    return this.#generations.get(row) ?? 0;
   }
 
   /** Whether row `row`'s out-of-line value is loaded. */
@@ -701,9 +743,34 @@ export class ChunkReader {
    * array, an out-of-line one part by part (≤ 1 MiB each, verified, charged while it is held).
    * Each yielded array is valid until the next step; nothing is yielded for null. Memory: one
    * part, whatever the value's size.
+   *
+   * **A failed stream is wholly invalid** (review B2-p2b #4). Every part is verified before it
+   * is yielded, but a later part may still fail (`StoreCorruptionError`, a refused budget, an
+   * abort, `ReaderClosedError`): the consumer must then discard everything the stream gave it,
+   * not keep a prefix. `loadValues` (and so `decodeRange` / `gather`) reads and verifies every
+   * part before anything is decoded.
+   *
+   * `close` ends every stream: what a suspended stream holds is released at once, and its next
+   * step throws `ReaderClosedError`.
    */
   async *valueParts(row: number): AsyncGenerator<Uint8Array> {
-    if (this.#closed) throw new ReaderClosedError();
+    const stream: Stream = { live: true, lease: null };
+    this.#live();
+    this.#streams.add(stream);
+    try {
+      yield* this.#streamParts(row, stream);
+    } finally {
+      const lease = stream.lease;
+      stream.lease = null;
+      lease?.release();
+      this.#streams.delete(stream);
+    }
+  }
+
+  async *#streamParts(row: number, stream: Stream): AsyncGenerator<Uint8Array> {
+    const live = (): void => {
+      if (!stream.live || this.#closed) throw new ReaderClosedError();
+    };
     const page = pageIndexOf(this.directory.pages, row);
     const entry = at(this.directory.pages, page);
     const view = this.#view(page);
@@ -725,19 +792,26 @@ export class ChunkReader {
       yield data.subarray(offsets[local] ?? 0, offsets[local + 1] ?? 0);
       return;
     }
-    const loaded = this.#values.get(row);
-    if (loaded !== undefined) {
-      yield* loaded.parts;
-      return;
-    }
-    for (const ref of this.#valueRefs(view, local)) {
-      // The reader may be closed while the consumer holds a part or a read is in flight.
-      this.#live();
+    const refs = this.#valueRefs(view, local);
+    for (const [index, ref] of refs.entries()) {
+      live();
+      // A loaded value's parts are held by it (and released by `releaseValues` or `close`).
+      const loaded = this.#values.get(row);
+      if (loaded !== undefined) {
+        yield at(loaded.parts, index);
+        continue;
+      }
       const lease = await this.#space.read([ref], this.#options);
-      try {
-        this.#live();
-        yield sized(lease.bytes[0], ref.length);
-      } finally {
+      if (!stream.live || this.#closed) {
+        lease.release();
+        throw new ReaderClosedError();
+      }
+      stream.lease = lease;
+      const bytes = sized(lease.bytes[0], ref.length);
+      yield bytes;
+      // Resumed: give the part back unless `close` already did.
+      if (stream.lease === lease) {
+        stream.lease = null;
         lease.release();
       }
     }
@@ -780,7 +854,12 @@ export class ChunkReader {
       const page = pageIndexOf(this.directory.pages, row);
       const entry = at(this.directory.pages, page);
       const refs = this.#valueRefs(this.#view(page), row - entry.firstRow);
-      jobs.push({ row, refs, bytes: refs.reduce((sum, ref) => sum + ref.length, 0) });
+      jobs.push({
+        row,
+        refs,
+        bytes: refs.reduce((sum, ref) => sum + ref.length, 0),
+        generation: this.#generation(row),
+      });
     }
     if (jobs.length === 0) return waits.size === 0 ? undefined : Promise.all(waits).then(noop);
     if (waits.size === 0 && this.#valuesCached(jobs)) return;
@@ -853,7 +932,7 @@ export class ChunkReader {
         const parts = job.refs.map((ref) => sized(lease.bytes[next++], ref.length));
         // `#installValue` owns this hold from here, on success or failure.
         installed++;
-        this.#installValue(job.row, { parts, leases: [shared], charged: 0 });
+        this.#installValue(job, { parts, leases: [shared], charged: 0 });
       }
     } finally {
       for (let rest = installed; rest < group.length; rest++) shared.drop();
@@ -873,6 +952,8 @@ export class ChunkReader {
           bytes += at(job.refs, end++).length;
         if (end === start) end++;
         if (this.#closed) throw new ReaderClosedError();
+        // Released while it loads: stop reading (what was read goes back below).
+        if (this.#generation(job.row) !== job.generation) break;
         const refs = job.refs.slice(start, end);
         const lease = await this.#space.read(refs, this.#options);
         leases.push(new SharedLease(lease, 1));
@@ -883,17 +964,22 @@ export class ChunkReader {
       for (const lease of leases) lease.drop();
       throw error;
     }
-    this.#installValue(job.row, { parts, leases, charged: 0 });
+    this.#installValue(job, { parts, leases, charged: 0 });
   }
 
-  /** Installs a loaded value; a closed reader gives it back and refuses (one owner per hold). */
-  #installValue(row: number, value: LoadedValue): void {
-    if (this.#closed || this.#values.has(row)) {
+  /**
+   * Installs a loaded value; gives it back instead (one owner per hold) when the reader closed
+   * (and refuses), when the row was released since the load began (review B2-p2b #3), or when
+   * another load installed it first.
+   */
+  #installValue(job: ValueJob, value: LoadedValue): void {
+    const stale = this.#generation(job.row) !== job.generation;
+    if (this.#closed || stale || this.#values.has(job.row)) {
       this.#dropValue(value);
       if (this.#closed) throw new ReaderClosedError();
       return;
     }
-    this.#values.set(row, value);
+    this.#values.set(job.row, value);
   }
 
   #dropValue(value: LoadedValue): void {

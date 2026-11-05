@@ -212,6 +212,13 @@ export interface PageEntry {
   readonly min: StatValue | null;
   readonly max: StatValue | null;
   readonly checksum: number;
+  /**
+   * The out-of-line values of a plain varlen page (page/large-value.ts): the range, relative to
+   * `ColumnChunk.data`, that the parts of its pointers tile exactly, in row order. It lies after
+   * the previous page and before this one, so no value can alias another or overlap a page.
+   * Absent when the page holds none.
+   */
+  readonly largeRegion?: { readonly offset: number; readonly length: number };
 }
 
 /** A key index or secondary index: leveled sorted runs of (key, rowId, seq). */

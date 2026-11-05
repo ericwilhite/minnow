@@ -148,6 +148,10 @@ export function parsePage(
   const hasScales = (flags & PageFlag.scales) !== 0;
   const hasLarge = (flags & PageFlag.large) !== 0;
   check(
+    hasLarge === (entry.largeRegion !== undefined),
+    "Page and directory disagree on large values",
+  );
+  check(
     !hasLarge || (tag === ValueTag.varlen && kind === PageEncoding.plain),
     "Large values outside a plain varlen page",
   );
@@ -257,9 +261,20 @@ export function parsePage(
           check((offsets[row] ?? 0) <= (offsets[row + 1] ?? 0), "Varlen offsets decrease");
         unsigned = offsets;
         data = bytes.subarray(start + offsetBytes, length);
-        if (large !== null)
+        if (large !== null) {
+          // The pointers tile the entry's region exactly, in row order (review B2-p2b #1): no
+          // value can alias another or overlap a page, at one comparison per value.
+          const region = entry.largeRegion;
+          check(region !== undefined, "Large values without a region in the directory");
+          let cursor = region.offset;
           for (let row = 0; row < rows; row++)
-            if (isBit(large, row)) decodePointer(data, offsets[row] ?? 0, offsets[row + 1] ?? 0);
+            if (isBit(large, row)) {
+              const pointer = decodePointer(data, offsets[row] ?? 0, offsets[row + 1] ?? 0);
+              check(pointer.offset === cursor, "Large values do not tile their region");
+              cursor += pointer.length;
+            }
+          check(cursor === region.offset + region.length, "Large values do not tile their region");
+        }
         break;
       }
       check(width === plainWidth(tag) && width > 0, "Bad plain width");

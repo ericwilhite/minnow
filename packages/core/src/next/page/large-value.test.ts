@@ -24,8 +24,8 @@ import {
   type ReadOptions,
 } from "../storage/extents.js";
 import type { PhysicalType } from "../types.js";
+import { decodeArrayValue, encodeArrayValue, type ArrayValue } from "../vector/array-value.js";
 import { parsePage, ValueNotLoadedError } from "./decode.js";
-import { encodeDirectory } from "./directory.js";
 import { PageCorruptionError, UnsupportedPageLayoutError, ValueTag } from "./format.js";
 import {
   decodePointer,
@@ -499,7 +499,7 @@ describe("out-of-line values", () => {
     reader.close();
   });
 
-  it("refuses a damaged part, and a pointer outside the chunk's data", async () => {
+  it("refuses a damaged part", async () => {
     const values = [value(200 * KiB, 1)];
     const { space, group } = await writeGroup([{ type: { kind: "bytes" }, values }]);
     const chunk = defined(group.columns[0]);
@@ -517,35 +517,7 @@ describe("out-of-line values", () => {
     expect(budget.held).toBe(pages);
     reader.close();
 
-    // A page whose (well-formed) pointer reaches past its chunk: written as a chunk of its own.
-    const entry = defined((await openChunk(space, chunk)).directory.pages[0]);
-    const bytes = await pageBytes(space, chunk, entry);
-    const view = parsePage(bytes, entry, ValueTag.varlen);
-    const slot =
-      defined(view.data ?? undefined).byteOffset - bytes.byteOffset + (view.unsigned?.[0] ?? 0);
-    new DataView(bytes.buffer).setUint32(slot + 8, 1 << 30, true); // offset low
-    const other = new MemoryExtentSpace();
-    const writer = other.beginWrite("crafted");
-    const page = defined((await writer.write([bytes])).blobs[0]);
-    const directory = encodeDirectory({
-      tag: ValueTag.varlen,
-      rowCount: entry.rowCount,
-      scale: 0,
-      hasSpecials: false,
-      pages: [{ ...entry, offset: 0, checksum: page.checksum, encoding: PageEncoding.plain }],
-      dictionary: null,
-      sketch: null,
-    });
-    const crafted: ColumnChunk = {
-      ...chunk,
-      data: { extent: page.extent, offset: page.offset, length: page.length },
-      directory: defined((await writer.write([directory])).blobs[0]),
-    };
-    const outside = await ChunkReader.open(other, crafted, { budget: UNLIMITED });
-    await outside.load([0]);
-    expect(() => outside.loadValues(0, 1)).toThrow(PageCorruptionError);
-    await expect(outside.valueParts(0).next()).rejects.toThrow(PageCorruptionError);
-    outside.close();
+    // Pointers that alias or overlap: page/review-p2b.test.ts (generated forgeries).
   });
 
   it("refuses malformed pointers and a large-value bit on a null row", async () => {
@@ -653,6 +625,67 @@ describe("out-of-line values", () => {
     await abortGroup.abort();
     expect(aborted.allocator.reserved).toBe(0);
     expect(abortWriter.extents).toEqual([]);
+  });
+
+  it("stores array values out of line like any varlen value, and decodes them back", async () => {
+    const element: PhysicalType = { kind: "int64" };
+    const type: PhysicalType = { kind: "array", element };
+    const arrayOf = (count: number, seed: number): ArrayValue => ({
+      dimensions: [count],
+      lowerBounds: [1],
+      elements: Array.from({ length: count }, (_, k) =>
+        k % 97 === 0 ? null : BigInt(k * 1_000_003 + seed),
+      ),
+    });
+    const arrays: Array<ArrayValue | null> = [
+      arrayOf(3, 1), // inline
+      arrayOf(20_000, 2), // one part
+      null,
+      arrayOf(300_000, 3), // three parts
+      arrayOf(5, 4),
+    ];
+    const values = arrays.map((each) => (each === null ? null : encodeArrayValue(element, each)));
+    expect((values[3]?.length ?? 0) > 2 * MiB).toBe(true);
+    const { space, group } = await writeGroup([{ type, values }]);
+    const chunk = defined(group.columns[0]);
+    expect((await pointersOf(space, chunk)).map(({ row }) => row)).toEqual([1, 3]);
+    const reader = await openChunk(space, chunk);
+    const read = await readAll(reader);
+    expectSame(read, values);
+    read.forEach((bytes, row) => {
+      expect(bytes === null ? null : decodeArrayValue(element, bytes as Uint8Array)).toEqual(
+        arrays[row],
+      );
+    });
+    expectSame(await gatherAll(reader, Uint32Array.of(1, 4)), [
+      values[1] ?? null,
+      values[4] ?? null,
+    ]);
+    reader.close();
+  });
+
+  it("ends a group before a varlen chunk passes maxChunkBytes, but always takes one row", async () => {
+    const space = new MemoryExtentSpace();
+    const group = new GroupWriter({
+      columns: [{ columnId: 1, type: { kind: "bytes" } }],
+      writer: space.beginWrite("capped"),
+      maxChunkBytes: 1 * MiB,
+    });
+    const values = Array.from({ length: 6 }, (_, k) => value(300 * KiB, k));
+    // 300 KiB + 4 per row: three fit in 1 MiB, the fourth would pass it.
+    expect(await group.append([vectorOf({ kind: "bytes" }, values)], values.length)).toBe(3);
+    expect(await group.append([vectorOf({ kind: "bytes" }, values)], 1, 3)).toBe(0);
+    const written = await group.finish();
+    expect(written.rowCount).toBe(3);
+    const alone = new GroupWriter({
+      columns: [{ columnId: 1, type: { kind: "bytes" } }],
+      writer: space.beginWrite("one row"),
+      maxChunkBytes: 100 * KiB,
+    });
+    expect(await alone.append([vectorOf({ kind: "bytes" }, [value(200 * KiB, 1)])], 1)).toBe(1);
+    expectSame(await readAll(await openChunk(space, defined((await alone.finish()).columns[0]))), [
+      value(200 * KiB, 1),
+    ]);
   });
 
   it("writes values straight from the caller's vector: the writer's memory does not grow with them", async () => {
