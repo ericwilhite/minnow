@@ -92,7 +92,8 @@
  * - The log calls belong to the write path (group commit, recovery).
  *
  * ## Implementations
- * - `file-store.ts`: the store over four long-lived files (log, data, two root slots) through a
+ * - `file-store.ts`: the store over four long-lived files (log, data, two root slots; OPFS adds
+ *   `spill` and `epoch`) through a
  *   `SyncFile` interface with the shape of `FileSystemSyncAccessHandle`. OPFS supplies real
  *   handles (`opfs.ts`); `sim-disk.ts` supplies simulated ones with a physical crash model.
  * - IndexedDB (storage track, after OPFS; needed for Safari and Firefox private browsing): the
