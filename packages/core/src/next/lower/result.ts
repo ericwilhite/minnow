@@ -7,12 +7,13 @@ import type { OutputColumn } from "../ir/ir.js";
 import type { PhysicalType } from "../types.js";
 
 /**
- * How row access renders a column's values in JavaScript, for the types where it is a choice:
- * - `"bigint"`: every BIGINT value, and SUM over BIGINT (exact past 2^63: its physical type is
- *   `decimal(null, 0)`, PostgreSQL's NUMERIC result, rendered as a JS bigint, as D2 decides).
- * - `"number"`: COUNT and SUM over SMALLINT/INTEGER (D2), and ROW_NUMBER, RANK and DENSE_RANK
- *   (bounded by the rows, like COUNT): exact, or a `RangeError` past 2^53 that names
- *   `::bigint`.
+ * How row access renders a column's values in JavaScript, for the types where it is a choice
+ * (DECISIONS.md D2, ruling R17.1–2):
+ * - `"bigint"`: an int8 expression with a bigint-rendered operand (a BIGINT column, SUM over
+ *   BIGINT, CAST AS BIGINT, a bigint parameter); and SUM over BIGINT itself, whose physical type
+ *   is `decimal(null, 0)` (exact past 2^63, PostgreSQL's NUMERIC) rendered as a JS bigint.
+ * - `"number"`: every other int8 expression (COUNT, SUM over SMALLINT/INTEGER, `COUNT(*) + 1`):
+ *   exact, or a `RangeError` past 2^53 that names `::bigint`.
  * - `null`: the type's one rendering (numbers, NUMERIC text, DATE/TIMESTAMP text…).
  */
 export type IntegerRender = "bigint" | "number";
@@ -24,27 +25,12 @@ export interface ResultColumn extends OutputColumn {
 }
 
 /**
- * Where an output column's value comes from, as far as rendering cares. Lowering decides it
- * from the expression after peeling column references through derived tables, CTEs and set
- * operations (a set operation is `count` only when every branch is).
+ * The rendering rule. `big` is whether the expression renders bigint by R17.1 (lowering tracks
+ * it through every expression: lower/coerce.ts `Typed.big`).
  */
-export type ValueOrigin =
-  /** COUNT(*), COUNT(x), as an aggregate or a window aggregate. */
-  | "count"
-  /** SUM over int2/int4 (int64 result, D2). */
-  | "sumNarrow"
-  /** SUM over int8 (decimal(null, 0) result, D2). */
-  | "sumBigint"
-  /** ROW_NUMBER(), RANK(), DENSE_RANK(). */
-  | "rank"
-  /** Anything else, including arithmetic over the above (`COUNT(*) + 1` is a BIGINT). */
-  | "value";
-
-/** The rendering rule (see `IntegerRender`). */
-export function renderOf(type: PhysicalType, origin: ValueOrigin): IntegerRender | null {
-  if (type.kind === "int64")
-    return origin === "count" || origin === "sumNarrow" || origin === "rank" ? "number" : "bigint";
-  if (type.kind === "decimal" && origin === "sumBigint") return "bigint";
+export function renderOf(type: PhysicalType, big: boolean): IntegerRender | null {
+  if (type.kind === "int64") return big ? "bigint" : "number";
+  if (type.kind === "decimal" && big) return "bigint";
   return null;
 }
 
@@ -94,13 +80,13 @@ export function sqlTypeName(type: PhysicalType): string {
   }
 }
 
-/** A result column from an IR output column and its origin. */
-export function resultColumn(column: OutputColumn, origin: ValueOrigin): ResultColumn {
+/** A result column from an IR output column and whether it renders bigint. */
+export function resultColumn(column: OutputColumn, big: boolean): ResultColumn {
   return {
     name: column.name,
     type: column.type,
     nullable: column.nullable,
     sqlType: sqlTypeName(column.type),
-    render: renderOf(column.type, origin),
+    render: renderOf(column.type, big),
   };
 }

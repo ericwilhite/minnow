@@ -8,16 +8,17 @@
  * synchronous, all over `context.catalog` (access/catalog.ts, the only catalog contract, R1):
  * 1. **Parse** under `compileWithDeclaredTypes` (engine/query.ts): `compileStatement`. The
  *    parser then records each numeric column's and CAST target's declared width (C5).
- * 2. **Catalog passes**, as `MinnowDatabase.#applyCatalogRewrites` runs them today, with each
- *    catalog fact read from `CatalogView` instead of the old store: sequence-name resolution,
- *    `foldIdentifierCase`, `expandRowReferences`, `expandViewSources` (view bodies compiled
- *    under the same scope), domain-literal normalization, `annotatePlanTimestampText`,
- *    `annotatePlanIntegerDivision`, `extendGroupByWithKeyDependents`, `bindPendingSelectShapes`,
- *    `mergeJoinColumns`, `expandSourceColumnAliases`, `expandNaturalJoins`, then `optimizePlan`
- *    (with the decorrelator) over `qualifyCorrelatedReferences`. Key forwarding is gone.
- * 3. **Shape passes**, as `createPreparedColumnarQuery` runs them: `expandQualifiedWildcards`,
- *    `expandDistinctWildcard`, `unifyPlanGroupedReferences`, `validateGrouping`,
- *    `expandFtsColumns`.
+ * 2. **Catalog passes** (lower/frontend.ts), in `MinnowDatabase.#applyCatalogRewrites`' order,
+ *    each catalog fact read from `CatalogView`: `foldIdentifierCase`, `expandRowReferences`,
+ *    `expandViewSources` (view bodies parsed under the same scope),
+ *    `extendGroupByWithKeyDependents`, `bindPendingSelectShapes`, `mergeJoinColumns`,
+ *    `expandSourceColumnAliases`, `expandNaturalJoins`, then `optimizePlan` (with the
+ *    decorrelator) over `qualifyCorrelatedReferences`. Not run: key forwarding (gone),
+ *    domain-literal normalization and the timestamp-text / integer-division annotations (types
+ *    decide them), sequence-name resolution (lowering reads `CatalogView.sequences`).
+ * 3. **Shape passes**: `prepareColumnarShape` (engine/query.ts), the passes
+ *    `createPreparedColumnarQuery` runs: wildcards, column aliases, grouped references,
+ *    `validateGrouping`.
  * 4. **Typing.** Every expression gets its `PhysicalType` by PostgreSQL's rules: columns from the
  *    catalog, integer literals int4 → int8 → numeric by magnitude, placeholders from their
  *    position (or `context.parameterTypes`), operator and function overloads resolved against
@@ -48,6 +49,7 @@
  * - **Cancellation.** None: lowering is bounded and synchronous.
  */
 import type { CatalogChange, CatalogView, TableDef } from "../access/catalog.js";
+import type { CreateTableInput } from "../../engine/catalog-mutations.js";
 import type { ExecutorCosts } from "../ir/costs.js";
 import type { PhysicalPlan } from "../ir/ir.js";
 import type { TableRuleExpressions } from "../ir/rules.js";
@@ -179,4 +181,10 @@ export interface Lowerer {
    * types against the table (a catalog bug: DDL validated it).
    */
   lowerTableRules(table: TableDef, catalog: CatalogView): TableRuleExpressions;
+  /**
+   * A table declared through the schema DSL (`CreateTableInput`, engine/catalog-mutations.ts),
+   * as the `createTable` change SQL's CREATE TABLE would give (additive, Phase 2). The DSL names
+   * no SQL types: `column.integer()` is INTEGER and `column.number()` DOUBLE PRECISION (R17.3).
+   */
+  lowerSchemaTable(input: CreateTableInput, catalog: CatalogView): CatalogChange;
 }

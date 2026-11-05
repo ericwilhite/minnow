@@ -232,7 +232,9 @@ export type Rel =
       readonly indexId: number;
       /**
        * One tuple of key expressions (constants or params) per probe, each already of the key
-       * column's exact type (lowering casts or drops a constant that does not fit).
+       * column's exact type (lowering casts or drops a constant that does not fit). A constant
+       * may also be a `cast` of a literal or param (`DATE '…'`), evaluated once. A tuple with a
+       * NULL key matches nothing (`=` never matches NULL); duplicate tuples return a row once.
        */
       readonly keys: ReadonlyArray<readonly ScalarExpr[]>;
       readonly columns: readonly number[];

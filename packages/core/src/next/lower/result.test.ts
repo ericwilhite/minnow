@@ -41,27 +41,25 @@ describe("sqlTypeName", () => {
   });
 });
 
-describe("renderOf (DECISIONS.md D2, ruling R16)", () => {
-  it("renders BIGINT values and SUM(bigint) as bigint", () => {
-    expect(renderOf(int64, "value")).toBe("bigint");
-    expect(renderOf(exactSum, "sumBigint")).toBe("bigint");
+describe("renderOf (DECISIONS.md D2, ruling R17.1)", () => {
+  it("renders bigint-rendered int8 expressions and SUM(bigint) as bigint", () => {
+    expect(renderOf(int64, true)).toBe("bigint");
+    expect(renderOf(exactSum, true)).toBe("bigint");
   });
 
-  it("renders COUNT, SUM(int2/int4) and row numbering as number", () => {
-    expect(renderOf(int64, "count")).toBe("number");
-    expect(renderOf(int64, "sumNarrow")).toBe("number");
-    expect(renderOf(int64, "rank")).toBe("number");
+  it("renders every other int8 expression as number", () => {
+    expect(renderOf(int64, false)).toBe("number");
   });
 
   it("has no choice to make for other types", () => {
-    expect(renderOf({ kind: "int32", bits: 32 }, "value")).toBeNull();
-    expect(renderOf({ kind: "decimal", precision: 10, scale: 2 }, "value")).toBeNull();
-    expect(renderOf({ kind: "timestamp", zoned: true }, "value")).toBeNull();
-    expect(renderOf({ kind: "float64" }, "count")).toBeNull();
+    expect(renderOf({ kind: "int32", bits: 32 }, false)).toBeNull();
+    expect(renderOf({ kind: "decimal", precision: 10, scale: 2 }, false)).toBeNull();
+    expect(renderOf({ kind: "timestamp", zoned: true }, true)).toBeNull();
+    expect(renderOf({ kind: "float64" }, true)).toBeNull();
   });
 
   it("builds the owner's column metadata", () => {
-    expect(resultColumn({ name: "n", type: int64, nullable: false }, "count")).toEqual({
+    expect(resultColumn({ name: "n", type: int64, nullable: false }, false)).toEqual({
       name: "n",
       type: int64,
       nullable: false,

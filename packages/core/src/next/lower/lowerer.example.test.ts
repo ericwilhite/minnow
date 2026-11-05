@@ -102,13 +102,16 @@ class StubLowerer implements Lowerer {
       kind: "query",
       command: "SELECT",
       plan,
-      columns: plan.columns.map((column) => resultColumn(column, "count")),
+      columns: plan.columns.map((column) => resultColumn(column, false)),
       reads: [7],
       basis: [{ tableId: 7, rowCount: rows }],
       pointRead: false,
     };
   }
   lowerWrite(): never {
+    throw new Error("not used here");
+  }
+  lowerSchemaTable(): never {
     throw new Error("not used here");
   }
   readonly rulesLowered: string[] = [];

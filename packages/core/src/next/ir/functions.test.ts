@@ -57,7 +57,7 @@ describe("the IR function table (ruling R17.5)", () => {
 
   it("lists implicit casts as a ladder that never narrows", () => {
     for (const [from, targets] of Object.entries(IMPLICIT_CASTS))
-      for (const to of targets ?? []) {
+      for (const to of targets) {
         expect(from).not.toBe(to);
         expect(samePhysicalType(physicalTypeOfSql(from as SqlType), physicalTypeOfSql(to))).toBe(
           false,

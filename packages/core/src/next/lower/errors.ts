@@ -27,7 +27,27 @@ export type UnsupportedConstruct =
   /** A column type the new core's catalog cannot declare yet (an array of an unknown element). */
   | "columnType"
   /** An ALTER TABLE form beyond ADD / RENAME / DROP COLUMN. */
-  | "alterTable";
+  | "alterTable"
+  /** Joins, UPDATE … FROM, DELETE … USING (milestone M3). */
+  | "join"
+  /** Scalar, IN and EXISTS subqueries (milestone M3). */
+  | "subquery"
+  /** Window functions (milestone M3). */
+  | "window"
+  /** UNION / INTERSECT / EXCEPT (milestone M3). */
+  | "setOperation"
+  /** WITH RECURSIVE and GENERATE_SERIES (milestone M3). */
+  | "recursive"
+  /** Ordered-set aggregates (percentile_cont/disc, mode) and JSON aggregates. */
+  | "aggregate"
+  /** SERIAL / IDENTITY columns (needs the write path's owned sequences, R17.7). */
+  | "identityColumn"
+  /** A foreign key to its own table (needs the write path's "self" parent, R17.7). */
+  | "selfReference"
+  /** CREATE OR REPLACE VIEW over an existing view (two catalog changes). */
+  | "replaceView"
+  /** A batch write that finds rows by key (update / delete batches need a lookup join, M3). */
+  | "batchWrite";
 
 /** Lowering refuses `detail`: the shared `UnsupportedPlanError` (next/errors.ts, R17.6). */
 export function unsupported(construct: UnsupportedConstruct, detail: string): UnsupportedPlanError {

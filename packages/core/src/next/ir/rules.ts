@@ -8,8 +8,10 @@
  * - Every expression is positional over the table's columns in catalog order
  *   (access/catalog.ts `TableDef.columns`): `{ op: "column", index: i }` is column i, the layout of
  *   every batch the rules see.
- * - No parameter slots. A rule reads its row and nothing else, except `nextval` in a default,
- *   which is a `call` with `fn: "nextval"` and the sequence id as an int64 literal argument.
+ * - No parameter slots in checks and generated columns: they read their row and nothing else.
+ *   A default reads no column; it may call `nextval` (`fn: "nextval"`, the sequence id as an
+ *   int64 literal) and read the statement clock as `param` slot 0 (`now()`, CURRENT_TIMESTAMP),
+ *   which the executor binds to the statement time when it evaluates a default itself.
  * - Types are exact: a check is `bool`; a generated column or default has exactly its column's
  *   physical type (lowering inserts the cast PostgreSQL's assignment cast would).
  * - Lists are complete and ordered: one entry per `TableDef.checks` entry (catalog order), per

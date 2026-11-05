@@ -3879,6 +3879,26 @@ export function createPreparedQuery(
   }
 }
 
+/**
+ * The shape passes `createPreparedColumnarQuery` runs before binding, in the same order, for the
+ * new core's lowering, which binds against its own catalog: pending wildcard shapes, source
+ * column aliases, NATURAL joins, qualified and DISTINCT wildcards, grouped references, then the
+ * grouping check. WITH TIES and the statement clock stay in the plan (the IR has both).
+ */
+export function prepareColumnarShape(
+  plan: CompiledQuery,
+  columnsOf: (tableName: string) => readonly string[] | undefined,
+): CompiledQuery {
+  plan = bindPendingSelectShapes(plan, columnsOf);
+  plan = expandSourceColumnAliases(plan, columnsOf);
+  plan = expandNaturalJoins(plan, columnsOf);
+  plan = expandQualifiedWildcards(plan, columnsOf);
+  plan = expandDistinctWildcard(plan, columnsOf);
+  plan = unifyPlanGroupedReferences(plan, columnsOf);
+  validateGrouping(plan);
+  return plan;
+}
+
 /** Internal columnar entry point used after MinnowDatabase materializes a stable snapshot. */
 export function createPreparedColumnarQuery(
   plan: CompiledQuery,

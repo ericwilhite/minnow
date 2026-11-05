@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { UnsupportedPlanError } from "./errors.js";
-import { UnsupportedPlanError as ExecUnsupportedPlanError } from "./exec/errors.js";
-import { unsupported } from "./lower/errors.js";
+import { UnsupportedPlanError } from "../errors.js";
+import { UnsupportedPlanError as ExecUnsupportedPlanError } from "../exec/errors.js";
+import { unsupported } from "../lower/errors.js";
 
 describe("UnsupportedPlanError (ruling R17.6)", () => {
   it("is one class for lowering and the executor", () => {
