@@ -1,33 +1,32 @@
 /**
- * The conformance cases every `DurableStore` implementation must pass (memory here; OPFS and
- * IndexedDB in the storage track, in Node and in real browsers). Plain assertions, no test
- * framework, so browser suites can run them too. Crash behaviour is not tested here: it needs a
- * platform-level fault model (fault-store.ts for the engine's side; each store's own tests for
- * how it meets guarantees 1–6).
+ * The conformance cases every `StorageBackend` must pass (simulated here with both fences; OPFS
+ * and IndexedDB in the storage track, in Node and in real browsers). Plain assertions, no test
+ * framework, so browser suites can run them. Crash behaviour needs a physical model and lives
+ * with each backend (sim-disk.ts for the simulated one).
  */
 import {
-  StaleEpochError,
+  DATA_ALIGN,
+  OwnerUnresponsiveError,
+  OwnershipLostError,
   StoreClosedError,
   StoreCorruptionError,
-  type DurableStore,
+  type StorageBackend,
   type StoreSession,
 } from "./contract.js";
 
 export interface ConformanceCase {
   readonly name: string;
-  run(createStore: () => Promise<DurableStore>): Promise<void>;
+  run(createBackend: () => Promise<StorageBackend>): Promise<void>;
 }
 
 function assert(condition: boolean, message: string): asserts condition {
   if (!condition) throw new Error(`Store conformance: ${message}`);
 }
 
-function bytes(...values: number[]): Uint8Array {
-  return new Uint8Array(values);
-}
+const bytes = (...values: number[]) => new Uint8Array(values);
 
-function equal(left: Uint8Array | null, right: Uint8Array | null): boolean {
-  if (left === null || right === null) return left === right;
+function equal(left: Uint8Array | null | undefined, right: Uint8Array | null): boolean {
+  if (left === null || left === undefined || right === null) return (left ?? null) === right;
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
@@ -45,144 +44,162 @@ async function rejects(
   throw new Error(`Store conformance: ${message}: did not throw`);
 }
 
-async function writePack(session: StoreSession, id: number, ...chunks: Uint8Array[]) {
-  const writer = session.createPack(id);
-  for (const chunk of chunks) await writer.append(chunk);
-  return writer.seal();
+async function owner(backend: StorageBackend, timeoutMs = 2_000) {
+  const lease = await backend.acquire({ timeoutMs });
+  return { lease, session: await backend.open(lease) };
+}
+
+/** Everything a session can observe, to prove a fenced owner changed nothing. */
+async function view(session: StoreSession) {
+  const data = await session.dataLength();
+  const [content] = await session.readData([{ offset: 0, length: data }]);
+  return {
+    root: await session.readRoot(),
+    data: content ?? new Uint8Array(0),
+    log: await session.readLog(0, session.logLength()),
+    headers: await session.readLogHeaders(),
+  };
+}
+
+function sameView(a: Awaited<ReturnType<typeof view>>, b: Awaited<ReturnType<typeof view>>) {
+  return (
+    equal(a.root, b.root) &&
+    equal(a.data, b.data) &&
+    equal(a.log, b.log) &&
+    equal(a.headers[0], b.headers[0]) &&
+    equal(a.headers[1], b.headers[1])
+  );
+}
+
+/** Every mutating call, for fencing checks. */
+function mutations(session: StoreSession): Array<[string, () => Promise<unknown>]> {
+  return [
+    ["publish", () => session.publish(bytes(66))],
+    ["writeData", () => session.writeData(0, bytes(66))],
+    ["releaseData", () => session.releaseData([{ offset: 0, length: DATA_ALIGN }])],
+    ["appendLog", () => session.appendLog(bytes(66))],
+    ["writeLogHeader", () => session.writeLogHeader(0, bytes(66))],
+    ["flushLog", () => session.flushLog()],
+    ["truncateLog", () => session.truncateLog(0)],
+    ["resetLog", () => session.resetLog()],
+  ];
 }
 
 export const storeConformanceCases: readonly ConformanceCase[] = [
   {
     name: "a new store is empty",
-    async run(createStore) {
-      const session = await (await createStore()).open();
-      assert(session.epoch >= 1, "epoch starts at 1");
+    async run(createBackend) {
+      const { lease, session } = await owner(await createBackend());
+      assert(lease.epoch >= 1 && session.epoch === lease.epoch, "epoch");
       assert((await session.readRoot()) === null, "no root");
-      assert((await session.listPacks()).length === 0, "no packs");
+      assert((await session.dataLength()) === 0, "no data");
       assert(session.logLength() === 0, "empty log");
-      const [first, second] = await session.readLogHeaders();
-      assert(first === null && second === null, "no headers");
-      session.close();
+      await lease.release();
     },
   },
   {
-    name: "packs are written, published, read by range and survive reopening",
-    async run(createStore) {
-      const store = await createStore();
-      const session = await store.open();
-      const writer = session.createPack(7);
-      assert((await writer.append(bytes(1, 2, 3))) === 0, "first append at 0");
-      assert((await writer.append(bytes(4, 5))) === 3, "second append after the first");
-      assert(writer.length === 5, "writer length");
-      const sealed = await writer.seal();
-      assert(sealed.id === 7 && sealed.length === 5, "sealed pack");
-      await session.publish(bytes(9, 9), [sealed]);
-      const [whole, middle, empty] = await session.read([
-        { pack: 7, offset: 0, length: 5 },
-        { pack: 7, offset: 2, length: 2 },
-        { pack: 7, offset: 5, length: 0 },
+    name: "data extents are written, read by coalesced ranges, published and survive reacquiring",
+    async run(createBackend) {
+      const backend = await createBackend();
+      const first = await owner(backend);
+      await first.session.writeData(0, bytes(1, 2, 3));
+      await first.session.writeData(DATA_ALIGN, bytes(4, 5));
+      await rejects(() => first.session.writeData(7, bytes(1)), RangeError, "an unaligned extent");
+      await first.session.publish(bytes(9, 9));
+      const [a, b, c, empty] = await first.session.readData([
+        { offset: DATA_ALIGN, length: 2 },
+        { offset: 1, length: 2 },
+        { offset: 0, length: 3 },
+        { offset: DATA_ALIGN + 2, length: 0 },
       ]);
-      assert(equal(whole ?? null, bytes(1, 2, 3, 4, 5)), "whole range");
-      assert(equal(middle ?? null, bytes(3, 4)), "inner range across appends");
+      assert(equal(a, bytes(4, 5)) && equal(b, bytes(2, 3)) && equal(c, bytes(1, 2, 3)), "ranges");
       assert(empty?.length === 0, "empty range at the end");
       await rejects(
-        () => session.read([{ pack: 7, offset: 4, length: 2 }]),
+        () => first.session.readData([{ offset: DATA_ALIGN, length: 3 }]),
         StoreCorruptionError,
-        "a read past a pack's end",
+        "a read past the data length",
       );
-      await rejects(
-        () => session.read([{ pack: 8, offset: 0, length: 1 }]),
-        StoreCorruptionError,
-        "a read of a missing pack",
-      );
-      await rejects(() => session.createPack(7), Error, "reusing a pack id");
-      session.close();
-      const reopened = await store.open();
-      assert(equal(await reopened.readRoot(), bytes(9, 9)), "root survives reopening");
-      const [again] = await reopened.read([{ pack: 7, offset: 1, length: 3 }]);
-      assert(equal(again ?? null, bytes(2, 3, 4)), "pack survives reopening");
-      reopened.close();
-    },
-  },
-  {
-    name: "publish replaces the root; reclaim is idempotent; listing is ordered",
-    async run(createStore) {
-      const session = await (await createStore()).open();
-      const a = await writePack(session, 3, bytes(1));
-      await session.publish(bytes(1), [a]);
-      const b = await writePack(session, 1, bytes(2));
-      const c = await writePack(session, 2, bytes(3));
-      await session.publish(bytes(2), [b, c]);
-      assert(equal(await session.readRoot(), bytes(2)), "newest root");
-      assert((await session.listPacks()).join() === "1,2,3", "ascending ids");
-      await session.reclaim([3, 3, 99]);
-      await session.reclaim([3]);
-      assert((await session.listPacks()).join() === "1,2", "reclaimed");
-      session.close();
+      await first.lease.release();
+      const second = await owner(backend);
+      assert(second.lease.epoch > first.lease.epoch, "epochs increase");
+      assert(equal(await second.session.readRoot(), bytes(9, 9)), "root survives");
+      const [again] = await second.session.readData([{ offset: 1, length: 2 }]);
+      assert(equal(again, bytes(2, 3)), "data survives");
+      await second.session.releaseData([{ offset: DATA_ALIGN, length: DATA_ALIGN }]);
+      assert((await second.session.dataLength()) <= DATA_ALIGN + 2, "a free tail may be returned");
+      await second.session.publish(bytes(7));
+      await second.session.publish(bytes(8));
+      assert(equal(await second.session.readRoot(), bytes(8)), "newest root");
+      await second.lease.release();
     },
   },
   {
     name: "the log appends, flushes, keeps header slots, truncates and resets",
-    async run(createStore) {
-      const store = await createStore();
-      const session = await store.open();
-      assert(session.appendLog(bytes(1, 2, 3)) === 0, "first append at 0");
-      assert(session.appendLog(bytes(4)) === 3, "appends are contiguous");
-      session.writeLogHeader(1, bytes(7, 7));
+    async run(createBackend) {
+      const backend = await createBackend();
+      const first = await owner(backend);
+      const { session } = first;
+      assert((await session.appendLog(bytes(1, 2, 3))) === 0, "first append at 0");
+      assert((await session.appendLog(bytes(4))) === 3, "appends are contiguous");
+      await session.writeLogHeader(1, bytes(7, 7));
       await session.flushLog();
-      assert(session.logLength() === 4, "length");
       assert(equal(await session.readLog(1, 3), bytes(2, 3, 4)), "read across appends");
       await rejects(() => session.readLog(2, 3), StoreCorruptionError, "a read past the log end");
-      session.close();
-      const reopened = await store.open();
-      assert(reopened.logLength() === 4, "flushed log survives reopening");
-      const [first, second] = await reopened.readLogHeaders();
-      assert(first === null && equal(second, bytes(7, 7)), "header slot survives reopening");
-      await reopened.truncateLog(2);
-      assert(reopened.logLength() === 2, "truncated");
-      assert(reopened.appendLog(bytes(9)) === 2, "appends follow a truncation");
-      await reopened.flushLog();
-      assert(equal(await reopened.readLog(0, 3), bytes(1, 2, 9)), "rewritten tail");
-      await reopened.resetLog();
-      assert(reopened.logLength() === 0, "reset body");
-      const headers = await reopened.readLogHeaders();
-      assert(headers[0] === null && headers[1] === null, "reset headers");
-      reopened.close();
+      await first.lease.release();
+      const second = await owner(backend);
+      const again = second.session;
+      assert(again.logLength() === 4, "flushed log survives");
+      const headers = await again.readLogHeaders();
+      assert(equal(headers[1]?.subarray(0, 2), bytes(7, 7)), "header slot survives");
+      await again.truncateLog(2);
+      assert((await again.appendLog(bytes(9))) === 2, "appends follow a truncation");
+      await again.flushLog();
+      assert(equal(await again.readLog(0, 3), bytes(1, 2, 9)), "rewritten tail");
+      await again.resetLog();
+      assert(again.logLength() === 0, "reset body");
+      const reset = await again.readLogHeaders();
+      assert(
+        reset.every((slot) => slot === null || slot.every((byte) => byte === 0)),
+        "reset slots",
+      );
+      await second.lease.release();
     },
   },
   {
-    name: "a newer session fences every mutation of an older one",
-    async run(createStore) {
-      const store = await createStore();
-      const old = await store.open();
-      const writer = old.createPack(1);
-      const current = await store.open();
-      assert(current.epoch > old.epoch, "epochs increase");
-      const fenced: Array<[string, () => unknown]> = [
-        ["publish", () => old.publish(bytes(1), [])],
-        ["createPack", () => old.createPack(2)],
-        ["pack append", () => writer.append(bytes(1))],
-        ["reclaim", () => old.reclaim([1])],
-        ["appendLog", () => old.appendLog(bytes(1))],
-        ["writeLogHeader", () => old.writeLogHeader(0, bytes(1))],
-        ["flushLog", () => old.flushLog()],
-        ["truncateLog", () => old.truncateLog(0)],
-        ["resetLog", () => old.resetLog()],
-      ];
-      for (const [name, action] of fenced) await rejects(action, StaleEpochError, `fenced ${name}`);
-      assert(current.appendLog(bytes(5)) === 0, "the fenced session changed nothing");
-      await current.flushLog();
-      current.close();
-      old.close();
+    name: "a second owner waits while the first holds, and a fenced first owner changes nothing",
+    async run(createBackend) {
+      const backend = await createBackend();
+      const first = await owner(backend);
+      await first.session.writeData(0, bytes(1));
+      await first.session.publish(bytes(1));
+      await first.session.appendLog(bytes(5, 5));
+      await first.session.flushLog();
+      // Opened while the first still holds its session: it must wait, then give up.
+      await rejects(() => backend.acquire({ timeoutMs: 40 }), OwnerUnresponsiveError, "waiting");
+      await first.session.appendLog(bytes(6));
+      assert(first.session.logLength() === 3, "the first owner still works");
+      // Stale-owner resumption: a second owner takes over; the first resumes and tries everything.
+      const second = await backend.acquire({ steal: true, timeoutMs: 2_000 });
+      const session = await backend.open(second);
+      assert(second.epoch > first.lease.epoch, "the new owner has a newer epoch");
+      assert(first.lease.signal.aborted, "the old lease knows it was lost");
+      const before = await view(session);
+      for (const [name, action] of mutations(first.session))
+        await rejects(action, OwnershipLostError, `fenced ${name}`);
+      assert(sameView(before, await view(session)), "a fenced owner's calls had no effect");
+      assert(session.logLength() >= 2, "the flushed log is the new owner's to recover");
+      await second.release();
+      await first.lease.release();
     },
   },
   {
-    name: "a closed session refuses every call",
-    async run(createStore) {
-      const session = await (await createStore()).open();
-      session.close();
+    name: "a closed session refuses calls",
+    async run(createBackend) {
+      const { lease, session } = await owner(await createBackend());
+      await session.close();
       await rejects(() => session.readRoot(), StoreClosedError, "readRoot after close");
       await rejects(() => session.appendLog(bytes(1)), StoreClosedError, "appendLog after close");
+      await lease.release();
     },
   },
 ];

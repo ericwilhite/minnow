@@ -3,6 +3,7 @@ import {
   layoutOf,
   physicalTypeOf,
   physicalTypeOfName,
+  requireDeclaredWidths,
   samePhysicalType,
   type SqlTypeDescriptor,
 } from "./types.js";
@@ -22,7 +23,14 @@ describe("SQL → physical type mapping", () => {
     ],
     ["BIGINT", { type: "number", integer: true, declaredTypeName: "BIGINT" }, { kind: "int64" }],
     ["integer without a declared name", { type: "number", integer: true }, { kind: "int64" }],
-    ["DOUBLE / REAL / number", { type: "number" }, { kind: "float64" }],
+    ["DOUBLE / number", { type: "number" }, { kind: "float64" }],
+    ["REAL", { type: "number", declaredTypeName: "real" }, { kind: "float32" }],
+    ["FLOAT4", { type: "number", declaredTypeName: "FLOAT4" }, { kind: "float32" }],
+    [
+      "DOUBLE PRECISION",
+      { type: "number", declaredTypeName: "DOUBLE PRECISION" },
+      { kind: "float64" },
+    ],
     [
       "NUMERIC(12,2)",
       { type: "string", sqlDomain: { kind: "numeric", precision: 12, scale: 2 } },
@@ -59,6 +67,16 @@ describe("SQL → physical type mapping", () => {
     ],
   ])("maps %s", (_name, descriptor, expected) => {
     expect(physicalTypeOf(descriptor)).toEqual(expected);
+  });
+
+  it("requires declared widths before lowering (C5)", () => {
+    expect(() => requireDeclaredWidths({ type: "number", integer: true }, "t.a")).toThrow(
+      TypeError,
+    );
+    expect(() => requireDeclaredWidths({ type: "number" }, "t.b")).toThrow(TypeError);
+    requireDeclaredWidths({ type: "number", integer: true, declaredTypeName: "BIGINT" }, "t.c");
+    requireDeclaredWidths({ type: "string", sqlDomain: { kind: "numeric" } }, "t.d");
+    expect(physicalTypeOfName("real")).toEqual({ kind: "float32" });
   });
 
   it("refuses an unknown array element type", () => {

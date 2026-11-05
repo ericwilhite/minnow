@@ -22,7 +22,12 @@
 import type { PhysicalType } from "../types.js";
 import type { FlatVector } from "../vector/vector.js";
 
-/** A collation name as written (`"C"`, `"default"`, an ICU locale); null is the default. */
+/**
+ * A collation name as written (`"C"`, `"default"`, an ICU locale); null is the default, which is
+ * byte (code point) order, PostgreSQL's C collation (DECISIONS.md C8). An ICU collation orders by
+ * query-wide ranks from `Intl.Collator` when the distinct values fit the grant, else by an
+ * external comparison sort; ties are broken by bytes, so peers and equality stay byte equality.
+ */
 export type Collation = string | null;
 
 export type ScalarExpr =
@@ -181,6 +186,23 @@ export type Rel =
       /** Conjuncts over this scan's output, evaluated first (late materialization, pruning). */
       readonly filter: ScalarExpr | null;
       readonly runtimeFilters: readonly RuntimeFilter[];
+      /**
+       * Late materialization: also output a row-locator column (type `locator`, last), so a
+       * later `fetch` can read the columns this scan deferred.
+       */
+      readonly emitLocator: boolean;
+    })
+  /**
+   * Late materialization (vector/locator.ts): appends `columns` of `tableId`, read through the
+   * locator column `locator` of the input, to the input's columns. A null locator (an outer
+   * join's null-extended row) yields nulls. Batched: one fetch reads each needed page once.
+   */
+  | (RelBase & {
+      readonly op: "fetch";
+      readonly input: Rel;
+      readonly tableId: number;
+      readonly locator: number;
+      readonly columns: readonly number[];
     })
   | (RelBase & {
       readonly op: "keyLookup";
@@ -262,15 +284,34 @@ export type Rel =
     })
   | (RelBase & { readonly op: "workTableScan"; readonly workTable: number })
   /**
-   * A correlated subquery the decorrelator left in place: runs `inner` per distinct binding of
-   * `bindings` (outer expressions written into parameter slots), memoized by binding.
+   * A correlated subquery the decorrelator left in place. For each outer row, `bindings` write
+   * outer expressions into parameter slots and `inner` runs. Output: the outer columns plus one:
+   * - `scalar`: inner's single column; null when inner is empty; more than one row is the
+   *   cardinality error (PostgreSQL's "more than one row returned by a subquery").
+   * - `exists`: true iff inner has a row (never null). NOT EXISTS is `not` over it.
+   * - `quantified`: `test cmp ANY|ALL (inner)` with SQL's three-valued result. ANY: true if some
+   *   comparison is true; else null if some comparison is null (a null test value with a non-empty
+   *   inner, or a null inner value); else false; an empty inner gives false. ALL: false if some
+   *   comparison is false; else null if some is null; else true; an empty inner gives true.
+   *   `x IN (q)` is `= ANY`; `x NOT IN (q)` is `<> ALL`. Comparison uses `collation`.
+   * - `memoize`: lowering sets it only when the inner subplan has no volatile function, sequence
+   *   call or other observable side effect; then inner runs once per distinct binding tuple
+   *   (bindings compared by equality keys, null-safe). Otherwise inner runs once per outer row, in
+   *   outer order: how many times a volatile expression is evaluated is observable.
    */
   | (RelBase & {
       readonly op: "apply";
-      readonly mode: "scalar" | "exists" | "notExists" | "in" | "notIn";
+      readonly mode: "scalar" | "exists" | "quantified";
       readonly outer: Rel;
       readonly inner: Rel;
       readonly bindings: ReadonlyArray<{ readonly slot: number; readonly expr: ScalarExpr }>;
+      readonly quantified: {
+        readonly test: ScalarExpr;
+        readonly cmp: "=" | "<>" | "<" | "<=" | ">" | ">=";
+        readonly quantifier: "any" | "all";
+        readonly collation: Collation;
+      } | null;
+      readonly memoize: boolean;
     })
   | (RelBase & {
       readonly op: "modify";
@@ -301,6 +342,9 @@ export interface PhysicalPlan {
   readonly initPlans: ReadonlyArray<{ readonly slot: number; readonly plan: Rel }>;
   /** Catalog version the plan was lowered against; a mismatch means re-lower. */
   readonly catalogVersion: number;
-  /** Volatile functions or sequence calls: never cached by result, never reordered. */
+  /**
+   * Volatile functions or sequence calls anywhere in the plan: never cached by result, never
+   * reordered, and every `apply` over a volatile inner has `memoize: false`.
+   */
   readonly volatile: boolean;
 }

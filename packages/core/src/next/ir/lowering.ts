@@ -35,7 +35,7 @@
  * ## Who
  * - The **planner-lowering track** owns `Lowerer` and the cost model; it may import the front-end
  *   modules above. The front end must also start carrying each column's declared SQL type name
- *   (types.ts `SqlTypeDescriptor.declaredTypeName`): today INTEGER/SMALLINT/BIGINT and
+ *   (types.ts `SqlTypeDescriptor.declaredTypeName`, checked by `requireDeclaredWidths`): today INTEGER/SMALLINT/BIGINT and
  *   REAL/DOUBLE collapse before lowering could see them.
  * - The **executor track** consumes `PhysicalPlan` and nothing from the front end.
  * - The **ownership track** calls the front end and `Lowerer` inside the engine owner, caches

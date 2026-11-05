@@ -28,9 +28,16 @@ export interface Int32Type {
 export interface Int64Type {
   readonly kind: "int64";
 }
-/** DOUBLE PRECISION, and REAL (stored as float64; see DECISIONS.md). */
+/** DOUBLE PRECISION. */
 export interface Float64Type {
   readonly kind: "float64";
+}
+/**
+ * REAL (C6): stored as Float32Array; kernels compute in f64 and round with `Math.fround` at every
+ * point a value takes the REAL type (storage, casts, REAL-typed results).
+ */
+export interface Float32Type {
+  readonly kind: "float32";
 }
 /**
  * NUMERIC. Values are a coefficient scaled by 10^scale plus a per-value display scale.
@@ -41,7 +48,7 @@ export interface DecimalType {
   readonly precision: number | null;
   readonly scale: number | null;
 }
-/** DATE: int32 days since 1970-01-01 (proleptic Gregorian). */
+/** DATE: int32 days since 2000-01-01, PostgreSQL's epoch; ±infinity are INT32 min/max (temporal.ts). */
 export interface DateType {
   readonly kind: "date";
 }
@@ -50,8 +57,9 @@ export interface TimeType {
   readonly kind: "time";
 }
 /**
- * TIMESTAMP / TIMESTAMPTZ: int64 microseconds since 1970-01-01T00:00:00Z. The stored instant is
- * the same for both; `zoned` changes rendering and casts only (there is no session time zone).
+ * TIMESTAMP / TIMESTAMPTZ: int64 µs since 2000-01-01T00:00:00Z (PostgreSQL's epoch, so its whole
+ * range is exact); ±infinity are INT64 min/max (temporal.ts). The stored value is the same for
+ * both; `zoned` changes rendering and casts only (the session time zone is always UTC).
  */
 export interface TimestampType {
   readonly kind: "timestamp";
@@ -92,12 +100,21 @@ export interface ArrayType {
   readonly kind: "array";
   readonly element: PhysicalType;
 }
+/**
+ * Internal, never a SQL type: a snapshot-qualified row locator for late materialization
+ * (vector/locator.ts). Valid only inside the query whose snapshot pin produced it.
+ */
+export interface LocatorType {
+  readonly kind: "locator";
+  readonly tableId: number;
+}
 
 export type PhysicalType =
   | BoolType
   | Int32Type
   | Int64Type
   | Float64Type
+  | Float32Type
   | DecimalType
   | DateType
   | TimeType
@@ -108,7 +125,8 @@ export type PhysicalType =
   | JsonType
   | UuidType
   | EnumType
-  | ArrayType;
+  | ArrayType
+  | LocatorType;
 
 export type PhysicalKind = PhysicalType["kind"];
 
@@ -117,14 +135,15 @@ export type PhysicalKind = PhysicalType["kind"];
  * - `bool`: Uint8Array, 0 or 1.
  * - `i32`: Int32Array.
  * - `int64`: exact 64-bit integers, either proven-safe Float64Array or BigInt64Array.
- * - `f64`: Float64Array of IEEE doubles.
+ * - `f64`: Float64Array of IEEE doubles (also row locators).
+ * - `f32`: Float32Array (REAL).
  * - `decimal`: int64-family coefficients (or wide bigints) at one vector scale.
  * - `varlen`: UTF-8 / raw bytes plus Int32Array offsets.
  * - `fixed16`: 16 bytes per value.
  * - `interval`: months, days (Int32Array) and microseconds (int64-family).
  */
 export type Layout =
-  "bool" | "i32" | "int64" | "f64" | "decimal" | "varlen" | "fixed16" | "interval";
+  "bool" | "i32" | "int64" | "f64" | "f32" | "decimal" | "varlen" | "fixed16" | "interval";
 
 export function layoutOf(type: PhysicalType): Layout {
   switch (type.kind) {
@@ -138,7 +157,10 @@ export function layoutOf(type: PhysicalType): Layout {
     case "timestamp":
       return "int64";
     case "float64":
+    case "locator":
       return "f64";
+    case "float32":
+      return "f32";
     case "decimal":
       return "decimal";
     case "text":
@@ -171,7 +193,8 @@ export const NUMERIC_MAX_SCALE = 16_383;
  *
  * `declaredTypeName` is required for exactness: today INTEGER, SMALLINT and BIGINT all compile to
  * `{ type: "number", integer: true }`, and REAL and DOUBLE to `{ type: "number" }`. Without the
- * name an integer column maps to int64 (it never narrows a value the old engine accepted).
+ * name an integer column maps to int64 (it never narrows a value the old engine accepted), and a
+ * floating column to float64. Lowering requires the name (C5): `requireDeclaredWidths`.
  */
 export interface SqlTypeDescriptor {
   readonly type: SimpleDataType;
@@ -184,6 +207,21 @@ export interface SqlTypeDescriptor {
 
 const INT16_NAMES = new Set(["SMALLINT", "INT2"]);
 const INT32_NAMES = new Set(["INTEGER", "INT", "INT4"]);
+const FLOAT32_NAMES = new Set(["REAL", "FLOAT4"]);
+
+/**
+ * C5: integer and floating widths must be declared before lowering. Throws for a numeric
+ * descriptor without `declaredTypeName`, so a collapsed front-end type can never silently
+ * become int64 or float64 in the new core.
+ */
+export function requireDeclaredWidths(descriptor: SqlTypeDescriptor, context: string): void {
+  if (
+    descriptor.type === "number" &&
+    descriptor.sqlDomain === undefined &&
+    descriptor.declaredTypeName === undefined
+  )
+    throw new TypeError(`Column ${context} has no declared SQL type name`);
+}
 
 /**
  * The single SQL → physical type mapping.
@@ -193,7 +231,8 @@ const INT32_NAMES = new Set(["INTEGER", "INT", "INT4"]);
  * | BOOLEAN                          | bool                             |
  * | SMALLINT / INTEGER               | int32 (bits 16 / 32)             |
  * | BIGINT, integer without a name   | int64                            |
- * | DOUBLE PRECISION, REAL, number   | float64                          |
+ * | DOUBLE PRECISION, number         | float64                          |
+ * | REAL, FLOAT4                     | float32                          |
  * | NUMERIC(p, s)                    | decimal(p, s)                    |
  * | DATE                             | date                             |
  * | TIME                             | time                             |
@@ -243,8 +282,11 @@ export function physicalTypeOf(descriptor: SqlTypeDescriptor): PhysicalType {
         ? { kind: "text" }
         : { kind: "enum", name: "", labels: [...descriptor.enumValues] };
     case "number": {
-      if (descriptor.integer !== true) return { kind: "float64" };
       const name = descriptor.declaredTypeName?.toUpperCase();
+      if (descriptor.integer !== true)
+        return name !== undefined && FLOAT32_NAMES.has(name)
+          ? { kind: "float32" }
+          : { kind: "float64" };
       if (name !== undefined && INT16_NAMES.has(name)) return { kind: "int32", bits: 16 };
       if (name !== undefined && INT32_NAMES.has(name)) return { kind: "int32", bits: 32 };
       return { kind: "int64" };
@@ -262,8 +304,8 @@ const ELEMENT_TYPES: ReadonlyMap<string, PhysicalType> = new Map<string, Physica
   ["INT4", { kind: "int32", bits: 32 }],
   ["BIGINT", { kind: "int64" }],
   ["INT8", { kind: "int64" }],
-  ["REAL", { kind: "float64" }],
-  ["FLOAT4", { kind: "float64" }],
+  ["REAL", { kind: "float32" }],
+  ["FLOAT4", { kind: "float32" }],
   ["FLOAT8", { kind: "float64" }],
   ["DOUBLE PRECISION", { kind: "float64" }],
   ["NUMERIC", { kind: "decimal", precision: null, scale: null }],
@@ -311,6 +353,8 @@ export function samePhysicalType(left: PhysicalType, right: PhysicalType): boole
     }
     case "array":
       return samePhysicalType(left.element, (right as ArrayType).element);
+    case "locator":
+      return left.tableId === (right as LocatorType).tableId;
     default:
       return true;
   }

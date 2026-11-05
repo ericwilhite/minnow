@@ -23,7 +23,7 @@ const ALLOWED: Readonly<Record<string, readonly string[]>> = {
   storage: ["hash"],
   format: [".", "hash", "storage"],
   spill: ["hash"],
-  memory: [],
+  memory: ["vector"],
   ir: [".", "vector"],
   // Tracks (not written yet) — their layer, fixed now:
   exec: [".", "hash", "vector", "ir", "memory", "spill"],

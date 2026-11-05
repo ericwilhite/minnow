@@ -1,167 +1,153 @@
-# Decisions to make before the format freezes
+# Public-contract and format decisions
 
-Status: **proposed** (2026-11-05). Each item needs an owner's decision. The public API may change
-in the reset; stored formats may not change after the freeze without upgrade coverage.
+Status: **decided** on 2026-11-05, by the lead's rulings on review A1-1 and on the browser storage
+probe. Each item names the code that freezes it.
 
-Evidence probes below ran against the current engine (0.19.3, `MinnowDatabase` on the memory
-store).
+The public API changes at the reset. Stored formats may not change after the freeze without
+upgrade coverage (AGENTS.md).
 
-## D1. The JS value of TIMESTAMP / TIMESTAMPTZ
+## D1. TIMESTAMP and TIMESTAMPTZ values: ISO 8601 text
 
-Facts:
+**Storage** (`temporal.ts`):
 
-- The new format stores int64 microseconds since 1970-01-01 UTC (decided 2026-11-04).
-- Today both types return `Date`. A value written as `'2024-01-02 03:04:05.123456'` reads back
-  as `2024-01-02T03:04:05.123Z`: the microseconds are already dropped silently.
-- DATE returns `'YYYY-MM-DD'` and NUMERIC returns exact decimal text. TIME and INTERVAL return
-  PostgreSQL text.
-- The f64-safe range of epoch microseconds is about 1684–2255. Inside it, a column of
-  timestamps is an exact `Float64Array`.
+- int64 µs since 2000-01-01T00:00:00Z, PostgreSQL's epoch, so PostgreSQL's whole range is exact:
+  4714-11-24 BC to 294276-12-31.
+- `-infinity` and `infinity` are INT64 min and max.
+- Values with either sentinel never use the f64 fast path. That path covers about 1715–2285.
 
-| Option                                                                                                                              | Exact                                                                     | Cost per value | JSON / `postMessage`                                     | Ergonomics                                               | Consistent with DATE/NUMERIC |
-| ----------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- | -------------- | -------------------------------------------------------- | -------------------------------------------------------- | ---------------------------- |
-| A. `Date` (today)                                                                                                                   | No: ms only; a returned value no longer equals its row in `WHERE ts = $1` | 1 object       | Yes / yes                                                | Familiar                                                 | No                           |
-| B. ISO 8601 text, 6 fixed fraction digits: `2024-01-02T03:04:05.123456Z` (TIMESTAMPTZ) and `2024-01-02T03:04:05.123456` (TIMESTAMP) | Yes, full PostgreSQL range (expanded years outside 0000–9999)             | 1 string       | Yes / yes                                                | Must parse to compute; sorts as text for years 0000–9999 | Yes                          |
-| C. `bigint` µs                                                                                                                      | Yes                                                                       | 1 bigint       | `JSON.stringify` throws                                  | Mixing with numbers throws; no zone                      | No                           |
-| D. `number` µs                                                                                                                      | Only 1684–2255                                                            | none           | Yes                                                      | Looks like any number; needs the domain to read          | No                           |
-| E. `Temporal.Instant` / `PlainDateTime`                                                                                             | Yes (ns)                                                                  | 1 object       | Not structured-cloneable: rebuilt at the worker boundary | The right types                                          | No                           |
-| F. Custom `Timestamp` class                                                                                                         | Yes                                                                       | 1 object       | Prototype lost across `postMessage`                      | New API to learn                                         | No                           |
+**Row value:**
 
-Notes:
+| Type        | Example                       |
+| ----------- | ----------------------------- |
+| TIMESTAMPTZ | `2024-01-02T03:04:05.123456Z` |
+| TIMESTAMP   | `2024-01-02T03:04:05.123456`  |
 
-- B's zone suffix carries the type: no `Z` means wall-clock time without a zone. `new Date(text)`
-  reads text without `Z` as local time, which is correct for TIMESTAMP but differs from today,
-  where TIMESTAMP comes back as a UTC instant. More than three fraction digits is outside
-  ECMAScript's strict date-time format. Engines accept it today, but docs should point to
-  `Temporal.*.from(text)` or a small exported `timestampToDate(text)` helper.
-- E is the right model but cannot be required yet: it is not in every target browser, a
-  polyfill would cost much of the 300 KiB gzip budget, and it would need rehydration at the
-  worker boundary.
-- Performance is the same for A, B, E and F (one allocation per value, only at row output). The
-  columnar accessor makes this matter less: it exposes the µs column directly.
+- Always exactly six fraction digits.
+- Years are astronomical (`0000` is 1 BC). Years outside 0000–9999 use ISO's expanded form:
+  `+012345-…`, `-004713-…`.
+- Infinities are the text `infinity` and `-infinity`.
+- TIMESTAMPTZ is an instant shown in UTC; the session time zone is always UTC. TIMESTAMP is a
+  wall-clock time with no zone. A cast between them keeps the stored µs.
+- Text in years 0000–9999 sorts as the values do.
 
-**Recommendation: B for row objects. The columnar accessor returns epoch µs as a
-`Float64Array` (BigInt64Array outside 1684–2255).** Parameters accept text (ISO or PostgreSQL) and
-`Date` (exact to the millisecond). B is exact, JSON- and clone-safe, matches DATE and NUMERIC,
-maps one-to-one to Temporal later, and adds no dial.
+**Inputs:**
 
-Cost: a breaking change. It touches the changelog, `InferRow` (timestamp → `string`), the
-Kysely/React typings, the docs and the agent rules. The differential harness's `["datetime", …]`
-encoding must follow at cut-over; the adapter maps to the oracle's `Date` until then.
+- ISO text or PostgreSQL text (`2024-01-02 03:04:05.5+00`).
+- JS `Date`, exact to the millisecond.
 
-## D2. The JS value of BIGINT values beyond 2^53
+**Helpers:** `parseTimestamp`, `formatTimestamp`, `timestampFromDate` and
+`unixMillisFromTimestamp`. The docs point to `Temporal.Instant.from` and
+`Temporal.PlainDateTime.from` for the text.
 
-Facts:
+**Columnar accessor:** a discriminated descriptor, never a bare typed-array union:
 
-- Since 0.19.3, integers are exact or an error. BIGINT holds only safe integers, and
-  `SUM(bigint)` past 2^53 throws `RangeError: Integer out of range`. PostgreSQL returns NUMERIC
-  `9007199254740993`.
-- The new format stores the full int64 range. A stored value the API cannot return is not an
-  option.
+```ts
+type ColumnView =
+  | { kind: "timestamp"; zoned: boolean; unit: "microseconds"; epoch: "2000-01-01T00:00:00Z";
+      repr: "safe"; values: Float64Array; validity: Uint8Array | null }
+  | { kind: "timestamp"; zoned: boolean; unit: "microseconds"; epoch: "2000-01-01T00:00:00Z";
+      repr: "int64"; values: BigInt64Array; validity: Uint8Array | null }
+  | { kind: "date"; unit: "days"; epoch: "2000-01-01"; values: Int32Array; validity: Uint8Array | null }
+  | { kind: "int64"; repr: "safe" | "int64"; values: Float64Array | BigInt64Array; … }
+  | …;
+```
 
-| Option                                               | Exact | Common case                                                                   | Failure mode                                                  | PostgreSQL fidelity |
-| ---------------------------------------------------- | ----- | ----------------------------------------------------------------------------- | ------------------------------------------------------------- | ------------------- |
-| A. Always `bigint` for int64                         | Yes   | Every count and id becomes bigint: `n + 1`, `JSON.stringify` and charts break | Loud, everywhere                                              | Type-faithful       |
-| B. `number` within ±(2^53−1), `bigint` beyond        | Yes   | Unchanged                                                                     | Loud, only at large values (TypeError on mixing; JSON throws) | Value-faithful      |
-| C. `number`, error beyond (today)                    | Yes   | Unchanged                                                                     | A stored value cannot be read; sums overflow into errors      | No                  |
-| D. Text beyond 2^53, or always (node-postgres style) | Yes   | A: breaks / B: unchanged                                                      | **Silent**: `"9007199254740993" + 1` concatenates             | Value-faithful      |
-| E. Per-connection option                             | —     | —                                                                             | —                                                             | Adds a dial         |
+When a timestamp column holds an infinity, its view is `repr: "int64"`.
 
-**Recommendation: B.**
+**Changes from today:** TIMESTAMP was a `Date`, and `.123456` was silently cut to `.123`. That loss
+is gone. It touches the changelog, `InferRow`, the Kysely and React typings, the docs, the agent
+rules, and the harness `["datetime"]` encoding at cut-over.
 
-- Only BIGINT columns and int64 results are typed `number | bigint`. SMALLINT and INTEGER stay
-  `number`, so `InferRow` changes only for BIGINT. The schema DSL gains `column.bigint()`;
-  `column.integer()` stays int32.
-- The columnar accessor returns `Float64Array` when the batch is proven safe, otherwise
-  `BigInt64Array`.
-- Parameters accept a safe-integer `number` or a `bigint`. An unsafe `number` is refused,
-  because it was already rounded before it reached the engine.
-- Failures are loud, and only at the values that need them. Text (D) is exact but fails silently.
+## D2. BIGINT values: always `bigint`
 
-## Other decisions needed before the freeze
+- BIGINT/INT8 columns and int64 results are always `bigint`, with no `number | bigint` union.
+  - `column.bigint()` infers `bigint`.
+  - Parameters for int8 positions accept `bigint`, or a safe-integer `number`. An unsafe `number`
+    is refused: it was already rounded.
+- **SUM(bigint)** returns `bigint`, exactly (JS bigint has arbitrary precision; PostgreSQL returns
+  NUMERIC).
+- **COUNT** returns `number`. This is documented: counts are bounded by the rows the engine holds,
+  far below 2^53.
+- **SUM(int2/int4)** returns `number`, exact or `RangeError`.
+  - PostgreSQL returns int8 here.
+  - This can actually happen: about 4.2M INT4 values near the maximum pass 2^53. The error message
+    suggests `SUM(x::bigint)`.
+- **The columnar accessor** is the `int64` descriptor above: `repr: "safe"` gives a
+  `Float64Array`, proven exact; otherwise a `BigInt64Array`.
+- **The differential adapter** keeps the oracle's `number` until cut-over.
 
-- **C1. DATE value.** Keep `'YYYY-MM-DD'` (with `' BC'` for year ≤ 0, as PostgreSQL writes it).
-  The accessor returns `Int32Array` days. _Recommend: keep._
-- **C2. NUMERIC value and specials.** Keep exact text. PostgreSQL 14+ also has NaN and ±Infinity.
-  The vector layout has a `specials` side array, and the page format should reserve it now even
-  if SQL support comes later. _Recommend: reserve in the format; enable later._
-- **C3. TIME and INTERVAL values.** Keep PostgreSQL text. _Recommend: keep._
-- **C4. Infinite DATE and TIMESTAMP.** PostgreSQL stores `'infinity'` as int min/max. Those
-  sentinels must be reserved in the format. In the safe f64 layout they become ±Infinity.
-  _Recommend: reserve._
-- **C5. Integer widths.** SMALLINT and INTEGER get PostgreSQL ranges (int16/int32). Today INTEGER
-  accepts any safe integer, so this changes behaviour. It needs the front end to keep the
-  declared type name, which it drops today (`createTableTypeNames` maps all of them to
-  `"number"`). _Recommend: PostgreSQL ranges._
-- **C6. REAL.** Today it is float64. PostgreSQL's float4 would need `Math.fround` on every write
-  and operation. _Recommend: keep float64 and document the deviation._
-- **C7. Key encoding.** Key-index runs, fences, Bloom filters and normalized sort keys share one
-  memcomparable byte encoding, and runs persist it, so it freezes with the format. Its rules:
-  - ints: sign-flipped big-endian;
-  - float64: order-preserving bits, with −0 → 0, one canonical NaN, NaN above +Infinity
-    (PostgreSQL);
-  - NUMERIC: normalized, so `1.0` and `1.00` encode equal (PostgreSQL equality ignores scale);
-  - text: bytes with 0x00 escaped and a terminator, so composite keys are prefix-free;
-  - a null-order byte per component.
-    _Recommend: freeze these rules with the page format._
-- **C8. Text order.**
-  - **Default order.** It is JS `<` on UTF-16 code units today (`compareSqlStrings`). PostgreSQL's
-    C collation orders by bytes, which is code-point order. The two differ only between
-    supplementary characters and U+E000–U+FFFF: `'￿' < '😀'` is false today and true in
-    PostgreSQL. _Recommend: byte order._ It is PostgreSQL's order, it matches the stored UTF-8
-    and the page statistics, and it needs no decoding. Record it as a known divergence from the
-    oracle.
-  - **Explicit `COLLATE`.** This uses `Intl.Collator`, which has only `compare` and no sort-key
-    API. The proposal's "normalized sort-key bytes per collation" cannot be built without
-    shipping collation tables. _Recommend:_ rank the distinct values once with the collator (the
-    size of a dictionary), sort by integer rank, and keep equality on bytes. This is an executor
-    contract change, not a format one.
-- **C9. Arrays.** The choice is one canonical binary value per row (element tag, dimensions, null
-  bitmap, elements) or list vectors (offsets plus a child vector). Arrays are rare in analytics.
-  _Recommend: the binary value at 1.0._
-- **C10. JSON vs JSONB storage.** Today both keep the same document text. PostgreSQL normalizes
-  JSONB: keys sorted, duplicate keys last-wins, whitespace dropped. Which one we pick changes the
-  stored bytes and the results. _Recommend: normalize JSONB (PostgreSQL fidelity)._
-- **C11. Aggregate result types.**
-  - PostgreSQL types `SUM(int4)` as int8, `SUM(int8)` and `AVG(int)` as NUMERIC, and `COUNT` as
-    int8.
-  - Today `AVG(integer)` returns the number `1.5`, where PostgreSQL returns NUMERIC
-    `1.5000000000000000`, and `SUM(bigint)` overflows into an error.
-  - Following PostgreSQL turns `AVG(int)` into decimal text. _Recommend:_ follow PostgreSQL for
-    SUM (exact) but keep `AVG` of int and float inputs as float64. Document the AVG deviation.
-    This needs an owner's decision: it is the most visible result-type change.
-- **C12. Time travel.** Today `options.version` reads an older version. The reset does not
-  mention it. Keeping it means reclaim must respect pinned roots, at the cost of disk space.
-  _Recommend:_ drop arbitrary-version reads. Keep consistent snapshot reads while a read
-  transaction is open, and keep snapshot copies.
-- **C13. Exactly-once retry window.** `CLIENT_RETRY_WINDOW_MS` is 10 minutes. The client protocol
-  must stop retrying before it ends (format/manifest.ts). _Recommend: 10 minutes._
+## Other decisions
 
-## Where these contracts deviate from or refine PROPOSAL.md
+| #   | Decision                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | Frozen by                                                        |
+| --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| C1  | DATE is PostgreSQL text: `2024-02-29`, `0044-03-15 BC`, `10000-01-01` (5+ digit years as PostgreSQL prints them), `infinity` / `-infinity`. Stored as int32 days since 2000-01-01, finite range 4714-11-24 BC to 5874897-12-31; the columnar view is `Int32Array` days.                                                                                                                                                                                                                                                                                                                                                                   | `temporal.ts`                                                    |
+| C2  | NUMERIC is exact text, including `NaN`, `Infinity` and `-Infinity` (PostgreSQL 14+), which are stored in the `specials` side array. Coefficients are int64-family, then int128 limbs, then `bigint[]`, at one vector scale ≥ 0. Each value has a display scale ≤ that scale. A declared negative scale rounds on write. Mixed scales use the maximum and widen the tier on overflow.                                                                                                                                                                                                                                                      | `vector/vector.ts`, `vector/int128.ts`, `format/key-encoding.ts` |
+| C3  | TIME and INTERVAL are PostgreSQL text. INTERVAL equality and order use the normalized span (`1 mon` = `30 days`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | `format/key-encoding.ts`                                         |
+| C4  | DATE and TIMESTAMP infinities are the int min/max sentinels, reserved now and excluded from the f64 proof.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | `temporal.ts`                                                    |
+| C5  | SMALLINT and INTEGER have PostgreSQL ranges. Declared widths are mandatory before lowering (`requireDeclaredWidths`); the front end must keep the declared type name, which it drops today.                                                                                                                                                                                                                                                                                                                                                                                                                                               | `types.ts`                                                       |
+| C6  | REAL is float32: `Float32Array` storage, computed in f64, with `Math.fround` at REAL type boundaries.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | `types.ts`, `vector/vector.ts`                                   |
+| C7  | The key encoding is byte-level and frozen, with golden vectors and generated order/equality/hash tests. Equality keys (persisted in index runs) and sort keys (query time) are separate: ENUM sorts by rank but is stored by label, so adding a label never rewrites an index.                                                                                                                                                                                                                                                                                                                                                            | `format/key-encoding.ts`                                         |
+| C8  | The default text order is byte order (code point order, PostgreSQL's C collation). Today it is JS UTF-16 order: `'￿' < '😀'` is false today and true from now on. An explicit ICU `COLLATE` sorts by query-wide ranks from `Intl.Collator` when the distinct values fit the grant, and otherwise by an external comparison sort. That rare path may decode to JS strings (the one documented exception, charged via `stringBytes`). Ties break by bytes, so peers and equality are byte equality (PostgreSQL's deterministic collations).                                                                                                 | `vector/varlen.ts`, `ir/ir.ts`                                   |
+| C9  | An array is one canonical binary value per row: element type tag, number of dimensions, each dimension's length and lower bound, a null bitmap, then elements in their equality-key payload form. That makes its bytes its equality key, ordered element-wise like PostgreSQL.                                                                                                                                                                                                                                                                                                                                                            | `types.ts`; codec: format track                                  |
+| C10 | **Correction:** today's JSONB already canonicalizes. `encodeBoundedJson` with `canonical` sorts object keys with JS `sort()` (UTF-16 order) and re-serializes without whitespace; the parser keeps the last duplicate (`engine/sql-domains.ts` around lines 497 and 957). Today `'{"b":1,"aa":2,"a":3,"b":4}'::jsonb` gives `{"a":3,"aa":2,"b":4}`; PostgreSQL gives `{"a": 3, "b": 4, "aa": 2}` (keys by length, then bytes; `": "` and `", "` separators). The new core stores JSONB in PostgreSQL's canonical key order and renders PostgreSQL's text, so JSONB output changes in key order and spacing. JSON keeps its text verbatim. | format track                                                     |
+| C11 | AVG of integer and float inputs returns float64, a documented deviation from PostgreSQL's NUMERIC; `AVG(x::numeric)` is exact. AVG of NUMERIC stays NUMERIC.                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | lowering                                                         |
+| C12 | Arbitrary-version reads (`options.version`) are dropped. A read pins one root plus that moment's memtable views for one query or read transaction. Pins live in memory, and a client's pins drop when its Web Lock is released. Space is reclaimable when no durable or pinned root reaches it.                                                                                                                                                                                                                                                                                                                                           | `format/manifest.ts`                                             |
+| C13 | Replaced by the request ledger (review finding 5).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | `format/ledger.ts`                                               |
 
-1. **IndexedDB is needed, so the store contract is async.** Safari private browsing has no OPFS,
-   so the IndexedDB gate fails. IndexedDB implements the same `DurableStore`, and its fence is
-   the epoch check inside each transaction plus the Web Lock: there is no exclusive handle.
-   OPFS pays one resolved promise per batched call.
-2. **Batched `read(ranges)` instead of `readPage`.** The store knows the physical layout, so
-   coalescing into 256 KiB–1 MiB slabs belongs there. One call serves a whole scan step.
-3. **Packs instead of loose pages.** `publish(root, packs)` publishes immutable packs written by a
-   streaming `PackWriter`. A 64k-row × 200-column group is ~100 MB and is never held in memory
-   to publish. Reclaim works per pack: the maintenance track rewrites packs that are mostly
-   dead.
-4. **Frames carry delete keys, not a full key-index delta.** Insert keys are derived from the
-   inserted key columns. Repeating them would add 8–16 B per inserted row to the log for nothing.
-5. **The log is recycled only when every table's memtable is flushed past its end.** The proposal
-   recycles the log on each flush. With several tables sharing one log, that is unsafe unless
-   all of them flush, or the remaining rows are copied forward into the new log. The rule is
-   stated in `format/manifest.ts`; the write path may add copy-forward.
-6. **Exactly-once needs a ledger in the root.** Frames are the record only until the log is
-   recycled. After that, `clients` in the root keeps the last sequence per client for the
-   retry window.
-7. **Checksums are chained across frames** (frame n's xxHash32 is seeded with frame n−1's), and
-   recovery truncates to the valid end before appending. Without chaining, a stale but intact
-   frame behind a rewritten one validates. `log-frame.test.ts` shows the case.
-8. **The front end must carry declared types** (C5), and it executes nested blocks eagerly today
-   (`subqueryResolutionSteps`). Lowering turns them into subtrees, `initPlans` and `apply`
-   (`ir/lowering.ts`).
-9. **Sort keys for ICU collations are ranks, not bytes** (C8).
+## Ownership protocol facts (for the ownership track)
+
+These rulings follow the storage probe of 2026-11-05.
+
+- **Acquisition.** The owner takes the Web Lock `minnow:<db>`, then opens its sync handles with
+  bounded backoff, treating `NoModificationAllowedError` and `InvalidStateError` as busy
+  (`storage/fence.ts` `acquireFenced`).
+  - If the lock is stolen (`AbortError`), the owner closes its handles at once.
+  - A frozen owner blocks takeover until it thaws or is discarded. A successor reports
+    `OwnerUnresponsiveError`.
+- **IndexedDB.** It is a second implementation of the same contract, built after OPFS. It is
+  needed for Safari and Firefox private browsing, which have no OPFS.
+  - Its fence is the Web Lock plus an epoch record checked inside every transaction.
+  - It stores ArrayBuffers, never Blobs.
+- **Client liveness.** A client holds its Web Lock only while it has snapshot pins or requests in
+  flight. A permanent lock costs bfcache on Firefox, and Safari drops locks on bfcache.
+  - Releasing the lock drops the client's pins.
+  - A client returning from bfcache expects "snapshot gone" and registers again.
+- **Step-down.** The owner steps down on `freeze` and `pagehide`, and on `hidden` only on mobile.
+  - In `pagehide`, the owner's page flushes and terminates its owner worker, which matters for
+    Safari bfcache.
+  - The owner does not step down on every visibility change.
+- **Files.**
+  - A few long-lived files (log, data, two root slots, spill), opened at acquisition and kept open.
+  - Space is reused inside them; only a free tail is truncated.
+  - Never create or delete files per object: quota is not returned on truncate (Chromium, WebKit),
+    and WebKit's IndexedDB cannot reuse space freed by deleting OPFS files.
+- **WebKit.** A busy tab delays its worker's async OPFS calls and incoming messages; reads and
+  writes on an open sync handle are not delayed. The owner keeps its hot path on open handles.
+- **Targets.**
+  - Cross-tab round trip: ~55–65 µs Chromium, ~140 µs Firefox, ~280 µs WebKit (p95 520 µs).
+  - `flush()`: one real disk flush, 3.4–4.7 ms on every engine. Group commit stays essential.
+
+## Where these contracts differ from PROPOSAL.md
+
+1. **IndexedDB is required.** The gate fails because Safari and Firefox private browsing have no
+   OPFS. So the store contract is async and its fence is pluggable.
+2. **Extents in one data space, not per-object pages or files.** Space is reused in place
+   (probe). Reads are batched ranges that the store coalesces.
+3. **Commit frames carry delete keys for every index.** Insert keys are derived from the inserted
+   columns.
+4. **The log is recycled only when it is covered.** The root that switches salt must checkpoint
+   global state and every table through the old log's end. Recycling on every memtable flush is
+   unsafe with several tables sharing one log.
+5. **DDL and sequences are logged.** They are applied in LSN order with a global checkpoint, and
+   a table is flushed before a schema change (`format/replay.ts`). The proposal publishes
+   metadata only through roots.
+6. **Exactly-once uses a bounded ledger of outcomes.** A last-sequence watermark is not enough
+   (`format/ledger.ts`).
+7. **Lying flush.** The proposal says every acknowledged group but the newest is protected. That
+   holds only for a cleanly truncated log body; such loss is detected through the acknowledged
+   boundary and the root's coverage.
+   - A write-back cache lost in order can silently drop a suffix of groups. No format can detect
+     that without a durable witness outside the device.
+   - The log never reorders or invents a group, and a rolled-back root is detected.
+   - `format/recovery-sweep.test.ts` ("lying flush") demonstrates this.
+8. **ICU collations use ranks, not sort-key bytes.** JavaScript has no sort-key API (C8).

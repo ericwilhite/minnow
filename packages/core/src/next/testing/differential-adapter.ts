@@ -25,6 +25,13 @@ import type {
 } from "../../testing/differential-harness.js";
 import type { OutputColumn } from "../ir/ir.js";
 import type { PhysicalType } from "../types.js";
+import {
+  PG_EPOCH_UNIX_MICROS,
+  TIMESTAMP_NEG_INFINITY,
+  TIMESTAMP_POS_INFINITY,
+  formatDate,
+} from "../temporal.js";
+import { int128At } from "../vector/int128.js";
 import { int64At } from "../vector/int64.js";
 import { isValid } from "../vector/validity.js";
 import { decodeUtf8 } from "../vector/varlen.js";
@@ -95,29 +102,6 @@ export function oracleDomain(type: PhysicalType): SqlDomain | null {
   }
 }
 
-/** Days since 1970-01-01 → proleptic Gregorian (y, m, d) (H. Hinnant's civil_from_days). */
-export function civilFromDays(days: number): readonly [number, number, number] {
-  const z = days + 719_468;
-  const era = Math.floor(z / 146_097);
-  const doe = z - era * 146_097;
-  const yoe = Math.floor(
-    (doe - Math.floor(doe / 1460) + Math.floor(doe / 36_524) - Math.floor(doe / 146_096)) / 365,
-  );
-  const doy = doe - (365 * yoe + Math.floor(yoe / 4) - Math.floor(yoe / 100));
-  const mp = Math.floor((5 * doy + 2) / 153);
-  const day = doy - Math.floor((153 * mp + 2) / 5) + 1;
-  const month = mp < 10 ? mp + 3 : mp - 9;
-  return [yoe + era * 400 + (month <= 2 ? 1 : 0), month, day];
-}
-
-function dateText(days: number): string {
-  const [year, month, day] = civilFromDays(days);
-  const pad = (value: number, width: number) => String(value).padStart(width, "0");
-  // PostgreSQL writes year 0 and before as the positive BC year.
-  const shown = year <= 0 ? 1 - year : year;
-  return `${pad(shown, 4)}-${pad(month, 2)}-${pad(day, 2)}${year <= 0 ? " BC" : ""}`;
-}
-
 function decimalText(coefficient: bigint, scale: number, displayScale: number): string {
   const negative = coefficient < 0n;
   let magnitude = negative ? -coefficient : coefficient;
@@ -135,16 +119,25 @@ function flatValue(vector: FlatVector, row: number): unknown {
     case "bool":
       return data.values[row] === 1;
     case "i32":
-      return vector.type.kind === "date" ? dateText(data.values[row] ?? 0) : data.values[row];
+      return vector.type.kind === "date" ? formatDate(data.values[row] ?? 0) : data.values[row];
     case "f64":
+      if (vector.type.kind === "locator") throw new UnsupportedOracleValueError(vector.type);
+      return data.values[row];
+    case "f32":
       return data.values[row];
     case "int64": {
       if (vector.type.kind === "timestamp") {
+        // The oracle returns Date (ms); D1's ISO text replaces it at cut-over.
         const micros = int64At(data.values, row);
-        if (micros % 1000n !== 0n) return { subMillisecondTimestamp: micros.toString() };
-        return new Date(Number(micros / 1000n));
+        if (micros === TIMESTAMP_POS_INFINITY || micros === TIMESTAMP_NEG_INFINITY)
+          return { infiniteTimestamp: String(micros > 0n) };
+        const unix = micros + PG_EPOCH_UNIX_MICROS;
+        if (unix % 1000n !== 0n) return { subMillisecondTimestamp: unix.toString() };
+        return new Date(Number(unix / 1000n));
       }
       if (vector.type.kind !== "int64") throw new UnsupportedOracleValueError(vector.type);
+      // The oracle returns safe numbers (D2's public bigint arrives at cut-over); a value past
+      // 2^53 stays a bigint here, so it fails against the oracle loudly.
       const value = int64At(data.values, row);
       return value >= -BigInt(Number.MAX_SAFE_INTEGER) && value <= BigInt(Number.MAX_SAFE_INTEGER)
         ? Number(value)
@@ -153,10 +146,13 @@ function flatValue(vector: FlatVector, row: number): unknown {
     case "decimal": {
       const special = data.specials?.[row] ?? 0;
       if (special !== 0) return special === 1 ? "NaN" : special === 2 ? "Infinity" : "-Infinity";
+      const coefficients = data.coefficients;
       const coefficient =
-        data.coefficients.repr === "wide"
-          ? (data.coefficients.values[row] ?? 0n)
-          : int64At(data.coefficients, row);
+        coefficients.repr === "wide"
+          ? (coefficients.values[row] ?? 0n)
+          : coefficients.repr === "int128"
+            ? int128At(coefficients.limbs, row)
+            : int64At(coefficients, row);
       return decimalText(coefficient, data.scale, data.displayScales?.[row] ?? data.scale);
     }
     case "varlen":

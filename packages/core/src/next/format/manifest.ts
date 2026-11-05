@@ -3,44 +3,61 @@
  * format track; these shapes and invariants are fixed.
  *
  * ## Shape
- *   ManifestRoot ─┬─ catalog (BlobRef)
- *                 ├─ tables[] ─ TableRoot ─┬─ groups (BlobRef → GroupRef[])
- *                 │                       │     └─ GroupRef.root (BlobRef → GroupRoot)
- *                 │                       │           └─ columns[].directory (BlobRef → PageEntry[])
- *                 │                       ├─ deletion vectors (per GroupRef)
- *                 │                       └─ keyIndex / secondary (IndexRoot → RunRef[])
- *                 └─ clients (exactly-once ledger)
+ *   ManifestRoot ─┬─ catalog (BlobRef), sequences, request ledger   ← global state at `globalLsn`
+ *                 ├─ log incarnation (salt, firstLsn, rootSequence)
+ *                 └─ tables[] ─ TableRoot ─┬─ groups (BlobRef → GroupRef[])
+ *                                          │     └─ GroupRef.root (BlobRef → GroupRoot)
+ *                                          │           └─ columns[] ─ ColumnChunk
+ *                                          │                 ├─ data (ExtentRef: the chunk's pages)
+ *                                          │                 └─ directory (BlobRef → PageEntry[])
+ *                                          ├─ deletion bitmaps (per GroupRef)
+ *                                          └─ keyIndex / secondary (IndexRoot → RunRef[])
  *
  * ## Invariants
- * - **Size.** The root is O(tables). A table root is O(1) plus its index runs; its group directory
- *   is O(groups); a group root is O(columns); a page directory is O(pages of one column chunk).
- *   Nothing is O(rows). Planning and pruning read directories, never pages.
- * - **Verify once.** Every reference carries the xxHash32 of the bytes it names. A reader checks
- *   it when the bytes come from storage; cached bytes are trusted. Pages carry no checksum of
- *   their own (their PageEntry does).
- * - **Immutability.** Everything a root reaches is immutable. A change writes new packs and
- *   publishes a new root (copy on write up the tree).
- * - **Reachability.** Every pack a root reaches has id < `nextPackId`. On open, packs that the
- *   root does not reach are orphans of a crash and are reclaimed (no job records).
+ * - **Addresses.** Everything lives in the store's data space (storage/contract.ts). A `BlobRef`
+ *   names a checksummed byte range there. A column chunk's pages are one contiguous extent
+ *   (`ColumnChunk.data`); each `PageEntry.offset` is relative to it. A chunk never spans extents
+ *   (a writer that cannot place it contiguously writes a smaller group).
+ * - **Size.** The root is O(tables + ledger). A table root is O(1) plus its index runs; its group
+ *   directory is O(groups); a group root is O(columns); a page directory is O(pages of one
+ *   chunk). Nothing is O(rows). Planning and pruning read directories, never pages.
+ * - **Verify once.** Every reference carries the xxHash32 of the bytes it names (pages: their
+ *   PageEntry). A reader checks it when the bytes come from storage; cached bytes are trusted.
+ * - **Immutability and sharing.** Everything a root reaches is immutable. A change writes new
+ *   extents and publishes a new root (copy on write up the tree). A metadata-only rewrite (new
+ *   statistics, a deletion bitmap, a renamed column) writes a new group root that references the
+ *   old chunk extents unchanged; several roots and groups may reference one extent.
+ * - **Reclaim.** An extent is free when neither the durable root nor any pinned snapshot's root
+ *   reaches it. The owner computes free space on open by walking the root (crash orphans are
+ *   simply unreachable: no job records) and maintains it in memory after. Freed space is reused
+ *   in place; only a free tail is ever released to the platform.
+ * - **Snapshots (C12).** A reader pins a root (and the memtable views of that moment) for the
+ *   length of one query or read transaction; pins are in memory, never durable. A client's pins
+ *   are dropped when its Web Lock is released (it vanished) or when it ends the read. There is no
+ *   reading of arbitrary older versions: a root no pin holds is gone once a newer one is durable.
  * - **Groups.** A table's groups cover disjoint row-id ranges, in insertion (row-id) order. Row ids
  *   are never reused and never rewritten by maintenance; a merge keeps each row's id.
- * - **Log rule.** Recovery replays a frame of table T iff its salt is `log.salt` and its LSN is
- *   greater than `T.flushedThroughLsn`. A root may switch to a new salt (and the log be reset after
- *   it is durable) only when every table's `flushedThroughLsn` covers the old log's last LSN.
- * - **Exactly once.** A request (client id, sequence) is committed iff its frame is replayed or
- *   `clients` records a sequence ≥ it. Ledger entries outlive the log for `CLIENT_RETRY_WINDOW_MS`;
- *   clients stop retrying before that (the protocol enforces it).
+ * - **Checkpoints and replay** (replay.ts): global state (catalog, sequences, ledger) is as of
+ *   `globalLsn`; each table's rows are as of its `flushedThroughLsn`. A root may switch to a new
+ *   log salt only when `globalLsn` and every table's `flushedThroughLsn` reach the old log's last
+ *   LSN; the new incarnation records the switching root's sequence (`log.rootSequence`).
+ * - **Exactly once** (ledger.ts): `clients` holds the committed outcomes as of `globalLsn`.
  */
+import type { ClientLedgerEntry } from "./ledger.js";
+import type { LogIncarnation } from "./log-frame.js";
 import type { PhysicalType } from "../types.js";
-import type { PackId } from "../storage/contract.js";
 
 export const MANIFEST_FORMAT_VERSION = 1;
-/** How long a committed request stays deduplicated after its frame leaves the log. */
-export const CLIENT_RETRY_WINDOW_MS = 10 * 60 * 1000;
 
-/** A checksummed byte range of a pack. */
+/** A byte range of the data space whose bytes carry their own checksums (pages). */
+export interface ExtentRef {
+  /** A multiple of `DATA_ALIGN`. */
+  readonly offset: number;
+  readonly length: number;
+}
+
+/** A checksummed byte range of the data space. */
 export interface BlobRef {
-  readonly pack: PackId;
   readonly offset: number;
   readonly length: number;
   /** xxHash32 (seed 0) of the referenced bytes. */
@@ -51,20 +68,30 @@ export interface ManifestRoot {
   readonly formatVersion: number;
   /** Strictly increasing per publish. */
   readonly sequence: number;
-  /** Store epoch of the owner that published it (diagnostic; fencing is the store's). */
+  /** Epoch of the owner that published it (diagnostic; fencing is the store's). */
   readonly epoch: number;
-  readonly nextPackId: PackId;
   /** The log incarnation recovery replays. */
-  readonly log: { readonly salt: number; readonly firstLsn: number };
+  readonly log: LogIncarnation;
+  /** Global state below includes every transaction with LSN ≤ this. */
+  readonly globalLsn: number;
   readonly catalogVersion: number;
-  /** The catalog: tables, columns (with PhysicalType), constraints, views, sequences. */
+  /** The catalog: tables (columns with PhysicalType, schema versions), constraints, views. */
   readonly catalog: BlobRef;
+  /** Table ids below this that the catalog lacks were dropped; ids are never reused. */
+  readonly nextTableId: number;
+  /** Sequence state: each sequence's reserved-through value (values are handed out below it). */
+  readonly sequences: ReadonlyArray<{
+    readonly sequenceId: number;
+    readonly reservedThrough: bigint;
+  }>;
   readonly tables: readonly TableRoot[];
   readonly clients: readonly ClientLedgerEntry[];
 }
 
 export interface TableRoot {
   readonly tableId: number;
+  /** The schema version its groups were written under (replay checks frames against it). */
+  readonly schemaVersion: number;
   /** The next row id this table allocates (row ids start at 1). */
   readonly nextRowId: number;
   /** Every frame of this table with LSN ≤ this is in `groups`. */
@@ -106,6 +133,8 @@ export interface GroupRoot {
 export interface ColumnChunk {
   readonly columnId: number;
   readonly type: PhysicalType;
+  /** The extent holding this chunk's pages, contiguously. */
+  readonly data: ExtentRef;
   /** → PageEntry[] for this column of this group. */
   readonly directory: BlobRef;
   readonly statistics: ColumnStatistics;
@@ -140,7 +169,7 @@ export const PageEncoding = {
 } as const;
 
 export interface PageEntry {
-  /** Byte offset and length within the column chunk's pack. */
+  /** Byte offset (relative to `ColumnChunk.data.offset`) and length of the page. */
   readonly offset: number;
   readonly length: number;
   /** Row positions this page covers within the group. */
@@ -172,10 +201,4 @@ export interface RunRef {
   readonly bloom: BlobRef;
   readonly minKey: Uint8Array;
   readonly maxKey: Uint8Array;
-}
-
-export interface ClientLedgerEntry {
-  readonly clientId: Uint8Array;
-  readonly lastSequence: number;
-  readonly committedAtMs: number;
 }

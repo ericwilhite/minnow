@@ -1,10 +1,12 @@
 /**
  * The in-memory columnar representation every operator, kernel, spill page and result frame
- * uses.
+ * uses. The push protocol that moves batches between operators is exec/pipeline.ts.
  *
  * ## Shapes
- * - A `Batch` is up to `BATCH_ROWS` rows: one `Vector` per column plus an optional `Selection`
- *   naming the active rows. Rows outside the selection are present but must be ignored.
+ * - A `Batch` is up to `BATCH_ROWS` rows and about `BATCH_TARGET_BYTES` bytes (`batchRowsFor`):
+ *   one `Vector` per column plus an optional `Selection` naming the active rows. Rows outside the
+ *   selection are present but must be ignored. Wide rows mean fewer rows, never bigger batches;
+ *   a single row larger than the target is a batch of one (memory/governor.ts admits it).
  * - A `Vector` is `flat` (one slot per row), `constant` (one value for every row), or
  *   `dictionary` (an Int32Array of codes into an immutable flat dictionary).
  * - `VectorData` is the typed storage of a flat vector, one variant per `Layout`.
@@ -14,36 +16,61 @@
  *   The data under an invalid slot is unspecified: kernels must not branch, throw or allocate on
  *   it (`1 / 0` in an invalid slot is not an error). Errors are raised only for active, valid rows.
  * - int64-family data (`Int64Values`) is exact. `repr: "safe"` holds integers in ±(2^53 − 1) in a
- *   Float64Array; `repr: "int64"` holds BigInt64Array. A producer may use `safe` only when every
- *   valid slot is proven in range (page statistics, or a checked kernel). A kernel whose result can
- *   leave the range must check and fall back to `int64`, or raise PostgreSQL's out-of-range error.
+ *   Float64Array, never −0 and never a temporal infinity; `repr: "int64"` holds BigInt64Array. A
+ *   producer may use `safe` only when every valid slot is proven in range (page statistics, or a
+ *   checked kernel). A kernel whose result can leave the range must check and fall back to `int64`,
+ *   or raise PostgreSQL's out-of-range error.
+ * - Decimal coefficients have three tiers: int64-family, 128-bit limbs (`Int128Values`, no
+ *   allocation per value), and `bigint[]` (`WideCoefficients`, past 128 bits). Kernels widen before
+ *   overflow and never narrow implicitly; spill pages keep the tier (exact round trip).
+ * - Decimal scale (DECISIONS.md C2): coefficient × 10^−scale, `scale` ≥ 0 and uniform per vector;
+ *   each value's display scale is ≤ `scale` (PostgreSQL display scales are never negative). A
+ *   declared negative scale (NUMERIC(p, −s)) only rounds on write; stored scale is 0. Values of
+ *   different display scales share the vector's maximum; rescaling that overflows a tier widens
+ *   the tier ("mixed-scale fallback").
+ * - REAL (`f32`) is stored as Float32Array and computed in f64 with `Math.fround` at REAL type
+ *   boundaries. Locators (`f64`) are vector/locator.ts.
  * - `varlen` strings are UTF-8 bytes. JS strings are made only when a value leaves the engine
- *   (`varlen.ts` `decodeUtf8`), never inside operators.
+ *   (`varlen.ts` `decodeUtf8`), with one documented exception: ordering under an ICU collation
+ *   when its distinct values do not fit memory (DECISIONS.md C8).
  * - A dictionary's entries are distinct and non-null (null lives in the codes' validity). Two
  *   dictionaries with different `dictionaryId`s are unrelated: their codes are never compared.
  *
- * ## Ownership and lifetime (who may mutate, when buffers are recycled)
- * 1. The producer of a batch owns every buffer in it. A consumer borrows the batch for the
- *    duration of the call that hands it over (`BatchSink.push`). Anything kept past that call is
- *    copied into the consumer's own buffers (a hash table copies keys into its slabs).
- * 2. Exception: a dictionary vector's `dictionary`, and a constant vector's `value`, are immutable
- *    for the life of the query and may be referenced past the call.
+ * ## Ownership and lifetime
+ * 1. The producer of a batch owns every buffer in it. A consumer borrows the batch until it
+ *    signals readiness (exec/pipeline.ts: `push` returns `ready`, or `ready()` resolves after
+ *    `blocked`). Anything kept past that is copied into the consumer's own buffers, unless the
+ *    batch was handed over with `transfer` (then the consumer owns it and calls `release`).
+ * 2. A dictionary vector's `dictionary` and a constant vector's `value` are immutable for the life
+ *    of the query and may be referenced past the borrow.
  * 3. Nobody writes to a buffer they did not allocate. Kernels write only into output vectors their
  *    caller passes in.
- * 4. Operators allocate their output vectors once at `BATCH_ROWS` capacity and reuse them for
- *    every batch: the producer recycles a batch's buffers when the next `push` begins. Kernels
- *    never allocate per value and, in steady state, never per batch.
+ * 4. Operators allocate their output vectors once, charged to their grant, and reuse them: the
+ *    producer recycles a batch's buffers only after the borrow ends. Kernels never allocate per
+ *    value and, in steady state, never per batch.
  * 5. A `Selection`'s rows are ascending and unique, each < the batch length.
  * 6. Buffers handed to a helper worker are transferred, not shared: the sender gives up the
  *    ArrayBuffer (SharedArrayBuffer is never required).
  */
 import { layoutOf, type Layout, type PhysicalType } from "../types.js";
 
-/**
- * Rows per batch. One constant, not a dial: 2,048 rows keep a column's working set in L1/L2
- * (16 KiB of f64) and let selections use Uint16Array.
- */
+/** Most rows in a batch: keeps selections in Uint16Array and a narrow column in L1/L2. */
 export const BATCH_ROWS = 2048;
+/** Target bytes of one batch across all its columns; wide rows get fewer rows. */
+export const BATCH_TARGET_BYTES = 1024 * 1024;
+
+/**
+ * Rows per batch for rows of about `rowBytes` bytes (all columns, including varlen estimates):
+ * at most `BATCH_ROWS`, at most `BATCH_TARGET_BYTES` in total, a multiple of 64 when ≥ 64, and
+ * at least 1.
+ */
+export function batchRowsFor(rowBytes: number): number {
+  if (!(rowBytes > 0)) return BATCH_ROWS;
+  const rows = Math.floor(BATCH_TARGET_BYTES / rowBytes);
+  if (rows >= BATCH_ROWS) return BATCH_ROWS;
+  if (rows >= 64) return rows - (rows % 64);
+  return Math.max(1, rows);
+}
 
 /** A validity bitmap: bit `i % 32` of word `i >>> 5`, set = valid. */
 export type Validity = Uint32Array;
@@ -58,7 +85,13 @@ export type Int64Values =
   | { readonly repr: "safe"; readonly values: Float64Array }
   | { readonly repr: "int64"; readonly values: BigInt64Array };
 
-/** Decimal coefficients past int64 (rare): one bigint per slot. */
+/** 128-bit two's-complement integers: four little-endian Uint32 limbs per slot (int128.ts). */
+export interface Int128Values {
+  readonly repr: "int128";
+  readonly limbs: Uint32Array;
+}
+
+/** Decimal coefficients past 128 bits (rare): one bigint per slot, accounted by size. */
 export interface WideCoefficients {
   readonly repr: "wide";
   readonly values: bigint[];
@@ -75,15 +108,16 @@ export type VectorData =
   | { readonly layout: "bool"; readonly values: Uint8Array }
   | { readonly layout: "i32"; readonly values: Int32Array }
   | { readonly layout: "f64"; readonly values: Float64Array }
+  | { readonly layout: "f32"; readonly values: Float32Array }
   | { readonly layout: "int64"; readonly values: Int64Values }
   | {
       readonly layout: "decimal";
-      /** Every coefficient is scaled by 10^scale. */
+      /** Every coefficient is scaled by 10^scale; scale ≥ 0. */
       readonly scale: number;
-      readonly coefficients: Int64Values | WideCoefficients;
+      readonly coefficients: Int64Values | Int128Values | WideCoefficients;
       /**
-       * PostgreSQL's per-value display scale (≤ `scale`), or null when every value displays at
-       * `scale` (always the case for a column declared NUMERIC(p, s)).
+       * PostgreSQL's per-value display scale (0 ≤ d ≤ `scale`), or null when every value displays
+       * at `scale` (always the case for a column declared NUMERIC(p, s) with s ≥ 0).
        */
       readonly displayScales: Uint16Array | null;
       /** `DecimalSpecial` per slot, or null when every value is finite. */
@@ -142,19 +176,6 @@ export interface Batch {
   readonly selection: Selection | null;
 }
 
-/**
- * The push protocol between pipeline operators. A source pushes batches; each operator either
- * transforms and pushes on (filter, project, probe) or absorbs them (a pipeline breaker: build,
- * aggregate, sort) and becomes the source of the next pipeline when `finish` is called.
- *
- * Kernels and `push` are synchronous. Only sources await I/O (page reads, spill reads), between
- * batches, which is also where cancellation is checked.
- */
-export interface BatchSink {
-  push(batch: Batch): void;
-  finish(): void;
-}
-
 let nextDictionaryId = 1;
 /** A fresh identity for a newly built dictionary. */
 export function newDictionaryId(): number {
@@ -167,8 +188,8 @@ function int64Values(capacity: number): Int64Values {
 
 /**
  * Allocates the data buffers of a flat vector for `type` at `capacity` slots. Variable-width
- * data starts with `varlenBytes` bytes; builders (varlen.ts) grow it. Allocation happens once
- * per operator, never per batch.
+ * data starts with `varlenBytes` bytes; builders (varlen.ts) grow it under a grant. The caller
+ * charges `dataBytes` to its grant first.
  */
 export function allocateData(type: PhysicalType, capacity: number, varlenBytes = 0): VectorData {
   const layout: Layout = layoutOf(type);
@@ -179,12 +200,14 @@ export function allocateData(type: PhysicalType, capacity: number, varlenBytes =
       return { layout, values: new Int32Array(capacity) };
     case "f64":
       return { layout, values: new Float64Array(capacity) };
+    case "f32":
+      return { layout, values: new Float32Array(capacity) };
     case "int64":
       return { layout, values: int64Values(capacity) };
     case "decimal":
       return {
         layout,
-        scale: type.kind === "decimal" ? (type.scale ?? 0) : 0,
+        scale: type.kind === "decimal" ? Math.max(0, type.scale ?? 0) : 0,
         coefficients: int64Values(capacity),
         displayScales: null,
         specials: null,
@@ -200,6 +223,26 @@ export function allocateData(type: PhysicalType, capacity: number, varlenBytes =
         days: new Int32Array(capacity),
         micros: int64Values(capacity),
       };
+  }
+}
+
+/** Bytes `allocateData(type, capacity, varlenBytes)` allocates, charged to a grant first. */
+export function dataBytes(type: PhysicalType, capacity: number, varlenBytes = 0): number {
+  switch (layoutOf(type)) {
+    case "bool":
+      return capacity;
+    case "i32":
+    case "f32":
+      return capacity * 4;
+    case "f64":
+    case "int64":
+    case "decimal":
+      return capacity * 8;
+    case "varlen":
+      return varlenBytes + (capacity + 1) * 4;
+    case "fixed16":
+    case "interval":
+      return capacity * 16;
   }
 }
 

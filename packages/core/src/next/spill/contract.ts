@@ -1,34 +1,38 @@
 /**
- * The spill service: engine-owned temporary files for sort runs, join partitions, aggregate
+ * The spill service: engine-owned temporary space for sort runs, join partitions, aggregate
  * partitions and DISTINCT streams. One service serves every operator.
  *
  * ## Never in the recovery path
- * - Spill state is in memory only: no root, catalog, log or checkpoint entry ever names a spill
- *   file, and no spill write is flushed for durability.
- * - Spill files live in one engine temp directory per owner epoch. On open, after the owner holds
- *   its fence, it deletes the whole temp directory (`SpillService.sweep`) before anything else.
- *   A crash, kill, cancellation or timeout mid-spill can cost disk space until the next open,
- *   never correctness or the ability to open.
+ * - Spill state is in memory only: no root, catalog, log or checkpoint names spill space, and no
+ *   spill write is flushed for durability.
+ * - The space is one long-lived file per database (OPFS: `spill`, its sync handle opened at
+ *   acquisition with the store's files), never deleted or created per query: browsers do not
+ *   return quota on truncate (Chromium, WebKit), so space is reused inside the file. On open, after
+ *   the owner holds its fence, the whole file is free (`SpillService.sweep`), whatever it holds;
+ *   only its free tail may be truncated. A crash, kill, cancellation or timeout mid-spill can cost
+ *   disk space until the next open, never correctness or the ability to open.
  * - There are no per-query caps on files, pages or runs. The limits are the platform quota
  *   (`SpillQuotaError`) and the memory governor.
  *
  * ## Files and pages
- * - A `SpillFile` is append-only. Each `append` writes one typed spill page and returns its
+ * - A `SpillFile` is one query's append-only logical stream inside the shared space (a list of
+ *   extents the service allocates). `append` writes one typed spill page and returns its
  *   `SpillPageRef`; `read` returns the page's bytes after checking its checksum.
  * - A spill page is a batch in vector layout (vector.ts), not JSON:
  *     header: magic u32 "MNSP" | query id u32 | run u32 | partition u32 | sequence u32 |
  *             row count u32 | column count u32 | flags u32
- *     per column: layout u8, physical-type tag, then validity words, data buffers, varlen
- *             offsets and bytes, each 8-byte aligned
+ *     per column: layout u8, physical-type tag, decimal tier and scale, then validity words,
+ *             data buffers (int128 limbs, wide decimals as length-prefixed two's complement),
+ *             varlen offsets and bytes, display scales and specials, each 8-byte aligned
  *   Pages are uncompressed (spill is bandwidth-bound and short-lived). The codec belongs to the
- *   executor track and must round-trip every `VectorData` variant exactly.
+ *   executor track and must round-trip every `VectorData` variant exactly, locators included.
  * - Implementations batch small appends into large sequential writes (≥256 KiB) and may read
- *   several refs with one platform call.
+ *   several refs with one platform call. Buffers are charged to the writing operator's grant.
  *
  * ## Lifetime
- * - A file belongs to one query (`queryId`). `close` deletes it. Cancellation and errors close
- *   every file the query opened; a query is restarted, never resumed.
- * - Only the engine owner touches spill files. Helpers receive page bytes by transfer.
+ * - A file belongs to one query (`queryId`). `close` frees its extents. Cancellation and errors
+ *   close every file the query opened; a query is restarted, never resumed.
+ * - Only the engine owner touches spill space. Helpers receive page bytes by transfer.
  */
 export interface SpillPageRef {
   readonly offset: number;
@@ -44,13 +48,13 @@ export interface SpillFile {
   append(page: Uint8Array): Promise<SpillPageRef>;
   /** The page's bytes, verified; throws `SpillCorruptionError` on a checksum mismatch. */
   read(ref: SpillPageRef): Promise<Uint8Array>;
-  /** Deletes the file. Idempotent. */
+  /** Frees the file's extents for reuse. Idempotent. */
   close(): Promise<void>;
 }
 
 export interface SpillService {
   create(queryId: number): Promise<SpillFile>;
-  /** Deletes every spill file of every epoch. Called once on open, after the owner's fence. */
+  /** Marks the whole spill space free. Called once on open, after the owner's fence. */
   sweep(): Promise<void>;
   /** Spill bytes currently held (diagnostics). */
   readonly bytesInUse: number;

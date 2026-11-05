@@ -5,13 +5,7 @@ import type { OutputColumn } from "../ir/ir.js";
 import { setAllValid, allocateValidity, setValid } from "../vector/validity.js";
 import { VarlenBuilder } from "../vector/varlen.js";
 import { allocateFlat, newDictionaryId, type Batch, type FlatVector } from "../vector/vector.js";
-import {
-  civilFromDays,
-  nextEngine,
-  oracleRows,
-  type NextCore,
-  type NextRows,
-} from "./differential-adapter.js";
+import { nextEngine, oracleRows, type NextCore, type NextRows } from "./differential-adapter.js";
 
 function int32Vector(values: number[]): FlatVector {
   const vector = allocateFlat({ kind: "int32", bits: 32 }, values.length);
@@ -21,7 +15,10 @@ function int32Vector(values: number[]): FlatVector {
 }
 
 function textVector(values: string[]): FlatVector {
-  const builder = new VarlenBuilder(values.length);
+  const builder = new VarlenBuilder(values.length, {
+    tryGrow: () => true,
+    release: () => undefined,
+  });
   for (const value of values) builder.appendString(value);
   return {
     form: "flat",
@@ -43,7 +40,7 @@ function literalRow(): NextRows {
     { name: "z", type: { kind: "float64" }, nullable: true },
   ];
   const date = allocateFlat({ kind: "date" }, 1);
-  if (date.data.layout === "i32") date.data.values[0] = 19_782; // 2024-02-29
+  if (date.data.layout === "i32") date.data.values[0] = 8_825; // 2024-02-29: days since 2000-01-01
   date.length = 1;
   const decimal = allocateFlat({ kind: "decimal", precision: 5, scale: 2 }, 1);
   if (decimal.data.layout === "decimal" && decimal.data.coefficients.repr === "safe")
@@ -129,12 +126,5 @@ describe("next-core differential adapter", () => {
       { c: "green", k: 7 },
       { c: null, k: 7 },
     ]);
-  });
-
-  it("converts days to civil dates across eras", () => {
-    expect(civilFromDays(0)).toEqual([1970, 1, 1]);
-    expect(civilFromDays(19_782)).toEqual([2024, 2, 29]);
-    expect(civilFromDays(-719_528)).toEqual([0, 1, 1]);
-    expect(civilFromDays(-1)).toEqual([1969, 12, 31]);
   });
 });

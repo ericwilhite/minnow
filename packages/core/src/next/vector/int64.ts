@@ -8,7 +8,8 @@
  * (`sumStaysSafe`), and otherwise switches to BigInt64Array. A safe slot never holds −0.
  */
 import { INT64_MAX, INT64_MIN } from "../types.js";
-import type { Int64Values } from "./vector.js";
+import { isValid } from "./validity.js";
+import type { Int64Values, Validity } from "./vector.js";
 
 export const MAX_SAFE = Number.MAX_SAFE_INTEGER;
 const MAX_SAFE_BIG = BigInt(MAX_SAFE);
@@ -48,17 +49,35 @@ export function int64At(values: Int64Values, index: number): bigint {
   return values.repr === "safe" ? BigInt(values.values[index] ?? 0) : (values.values[index] ?? 0n);
 }
 
-/** Widens slots 0 … length into `target` (BigInt64Array). */
-export function widenToInt64(source: Float64Array, length: number, target: BigInt64Array): void {
-  for (let index = 0; index < length; index++) target[index] = BigInt(source[index] ?? 0);
+/**
+ * Widens slots 0 … length into `target` (BigInt64Array). Invalid slots (garbage under a null,
+ * NaN included) become 0n and never throw.
+ */
+export function widenToInt64(
+  source: Float64Array,
+  length: number,
+  validity: Validity | null,
+  target: BigInt64Array,
+): void {
+  for (let index = 0; index < length; index++)
+    target[index] = isValid(validity, index) ? BigInt(source[index] ?? 0) : 0n;
 }
 
 /**
- * Narrows slots 0 … length into `target` if every slot is safe; returns false (with `target`
- * partially written) otherwise. Data under invalid slots must already be zeroed or safe.
+ * Narrows slots 0 … length into `target` if every valid slot is safe; returns false (with
+ * `target` partially written) otherwise. Invalid slots become 0.
  */
-export function narrowToSafe(source: BigInt64Array, length: number, target: Float64Array): boolean {
+export function narrowToSafe(
+  source: BigInt64Array,
+  length: number,
+  validity: Validity | null,
+  target: Float64Array,
+): boolean {
   for (let index = 0; index < length; index++) {
+    if (!isValid(validity, index)) {
+      target[index] = 0;
+      continue;
+    }
     const value = source[index] ?? 0n;
     if (value < -MAX_SAFE_BIG || value > MAX_SAFE_BIG) return false;
     target[index] = Number(value);
