@@ -81,6 +81,8 @@
 /** The broker message format version, independent of `PROTOCOL_VERSION`. */
 export const BROKER_PROTOCOL = 1;
 
+/** How long a client waits for `welcome` before abandoning the connection and starting over. */
+export const HANDSHAKE_TIMEOUT_MS = 5_000;
 /** Idle time after which a client releases its liveness lock. */
 export const LIVENESS_IDLE_RELEASE_MS = 1_000;
 /** A live subscription whose update is unacknowledged this long is dropped (`liveEnded`). */

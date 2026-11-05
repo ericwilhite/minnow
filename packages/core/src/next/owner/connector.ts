@@ -15,6 +15,11 @@
  * 4. Refused for `version`: a newer client asks the older owner to step aside (`supersede`) and
  *    retries; an older client is superseded (`onSuperseded`) and stops.
  *
+ * ## The handshake
+ * Bounded and watched: it is abandoned when the host lock is granted to a watch (the owner died
+ * before it answered) or after `HANDSHAKE_TIMEOUT_MS`, and the connector starts again from step 1.
+ * A welcomed connection re-announces the liveness lock before its resends (client.ts).
+ *
  * ## Losing the owner
  * - While requests are in flight it watches the host lock, which the owner itself holds: a grant
  *   means the owner died (a closed tab, a terminated or crashed worker, this page's own worker
@@ -29,11 +34,17 @@
  * ## Lifecycle
  * The host's page relays its lifecycle events here (`lifecycle`): `freeze`/`pagehide` terminate
  * the owner at once and release the host lock; `hidden` flushes (desktop) or steps down (mobile).
+ *
+ * ## Closing
+ * `close()` ends everything this context started, wherever it is: a queued host-lock request is
+ * withdrawn, an owner still starting is terminated and its host lock released, a liveness grant
+ * that arrives later is released at once.
  */
 import type { HeldLock } from "../storage/fence.js";
 import type { ProtocolClient } from "./client.js";
 import {
   BROKER_PROTOCOL,
+  HANDSHAKE_TIMEOUT_MS,
   LIVENESS_IDLE_RELEASE_MS,
   canHost,
   clientLockName,
@@ -81,9 +92,18 @@ export interface ConnectorOptions {
   readonly onSuperseded?: () => void;
   /** How long to wait for a `registered` announcement before trying again. */
   readonly retryMs?: number;
+  /** Bound on the handshake (default `HANDSHAKE_TIMEOUT_MS`). */
+  readonly handshakeTimeoutMs?: number;
 }
 
 export type ConnectorStatus = "connecting" | "connected" | "superseded" | "closed";
+
+/** An owner this context is starting: the host-lock wait, then the lock and the handle. */
+interface Starting {
+  readonly waiting: AbortController;
+  handle: OwnerHandle | null;
+  lock: HeldLock | null;
+}
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -96,6 +116,8 @@ export class OwnerConnector {
   readonly #brokerReplies = new Map<number, (message: BrokerMessage) => void>();
   #registered: Array<() => void> = [];
   #hosting: { readonly handle: OwnerHandle; readonly lock: HeldLock } | null = null;
+  /** An owner this context is starting (not yet ready), or the host-lock wait before it. */
+  #starting: Starting | null = null;
   #ownerProtocol: number | null = null;
   #connecting: Promise<void> | null = null;
   #everConnected = false;
@@ -145,7 +167,13 @@ export class OwnerConnector {
   lifecycle(event: LifecycleEvent): void {
     const hosting = this.#hosting;
     if (hosting === null) return;
-    const action = lifecycleAction(event, this.#options.context().platform);
+    // `freeze` and `pagehide` terminate on every platform. Decide without calling out first:
+    // Firefox can abandon a closing page's handler midway (observed inside `context()`), and the
+    // `hidden` that follows must then find nothing to flush, not a live owner.
+    const action =
+      event === "freeze" || event === "pagehide"
+        ? "terminate"
+        : lifecycleAction(event, this.#options.context().platform);
     if (action === "terminate") {
       this.#hosting = null;
       hosting.handle.terminate();
@@ -158,6 +186,13 @@ export class OwnerConnector {
   close(): void {
     if (this.#status === "closed") return;
     this.#status = "closed";
+    const starting = this.#starting;
+    this.#starting = null;
+    if (starting !== null) {
+      starting.waiting.abort();
+      starting.handle?.terminate();
+      starting.lock?.release();
+    }
     this.#watch?.stop();
     if (this.#watchIdle !== null) clearTimeout(this.#watchIdle);
     this.#releaseLiveness();
@@ -202,16 +237,35 @@ export class OwnerConnector {
 
   /** Connects the client on `port`; false when it must try again (skew handled). */
   async #attach(port: MessagePort): Promise<boolean> {
+    // The owner holds the host lock: a grant to this watch means it died mid-handshake.
+    const abandon = new AbortController();
+    const watch = watchLock(this.#options.locks, hostLockName(this.#options.database));
+    const onGone = () => {
+      abandon.abort();
+    };
+    watch.gone.addEventListener("abort", onGone, { once: true });
+    const timer = setTimeout(onGone, this.#options.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS);
+    const done = () => {
+      clearTimeout(timer);
+      watch.gone.removeEventListener("abort", onGone);
+      watch.stop();
+    };
     try {
       const welcome = this.#everConnected
-        ? await this.#client.reconnect(port)
-        : await this.#client.connect(port);
+        ? await this.#client.reconnect(port, abandon.signal)
+        : await this.#client.connect(port, abandon.signal);
+      done();
+      if (this.#status === "closed") return true;
       this.#everConnected = true;
       this.#ownerProtocol = welcome.protocol;
       this.#status = "connected";
       this.#activity();
       return true;
     } catch (error) {
+      done();
+      if (this.#status === "closed") return true;
+      // The owner died or never answered: start again (a successor is elected).
+      if (error instanceof OwnerUnreachableError) return false;
       if (!(error instanceof ConnectionRefusedError)) throw error;
       if (error.reason === "version") {
         if (compareProtocol(this.#client.protocol, error.ownerProtocol) === "clientNewer") {
@@ -235,7 +289,14 @@ export class OwnerConnector {
   /** Queues for the host lock; on the grant starts an owner and connects. False: someone else won. */
   async #host(): Promise<boolean> {
     const database = this.#options.database;
+    if (this.#status === "closed") return false;
     const waiting = new AbortController();
+    const starting: Starting = {
+      waiting,
+      handle: null,
+      lock: null,
+    };
+    this.#starting = starting;
     const onRegistered = () => {
       waiting.abort();
     };
@@ -246,15 +307,17 @@ export class OwnerConnector {
         signal: waiting.signal,
       });
     } catch {
-      return false; // another context registered while we queued
+      if (this.#starting === starting) this.#starting = null;
+      return false; // another context registered while we queued, or closed
     } finally {
       this.#registered = this.#registered.filter((wake) => wake !== onRegistered);
     }
     const start = this.#options.startOwner;
-    if (start === null || this.#status === "closed") {
+    if (start === null || this.#starting !== starting) {
       lock.release();
       return false;
     }
+    starting.lock = lock;
     const channel = new MessageChannel();
     const handle = start({
       database,
@@ -263,14 +326,19 @@ export class OwnerConnector {
       brokerPort: this.#options.openBroker?.() ?? null,
       settings: { ...this.#options.settings, protocol: this.#client.protocol },
     });
+    starting.handle = handle;
     try {
       await handle.ready;
     } catch {
       handle.terminate();
       lock.release();
+      if (this.#starting === starting) this.#starting = null;
       await sleep(50);
       return false;
     }
+    // Closed while it started: `close()` already terminated it and released the lock.
+    if (this.#starting !== starting) return false;
+    this.#starting = null;
     this.#hosting = { handle, lock };
     void handle.stopped.then((reason) => {
       if (this.#hosting?.handle !== handle) return;
@@ -455,6 +523,8 @@ export class OwnerConnector {
             }
             state.lock = lock;
             this.#client.liveness(true);
+            // Granted late, after the client went idle: start the idle release now.
+            this.#updateLiveness();
           })
           .catch(() => {
             state.acquiring = false;
@@ -546,11 +616,12 @@ export function relayPageLifecycle(
   const visibility = () => {
     connector.lifecycle(target.document.visibilityState === "hidden" ? "hidden" : "visible");
   };
-  target.addEventListener("freeze", freeze);
+  // Page Lifecycle: `freeze` fires on the document, `pagehide` on the window.
+  target.document.addEventListener("freeze", freeze);
   target.addEventListener("pagehide", pagehide);
   target.document.addEventListener("visibilitychange", visibility);
   return () => {
-    target.removeEventListener("freeze", freeze);
+    target.document.removeEventListener("freeze", freeze);
     target.removeEventListener("pagehide", pagehide);
     target.document.removeEventListener("visibilitychange", visibility);
   };

@@ -9,8 +9,11 @@
  *   dropped, never used (`noOwner`, or `unreachable` while a successor that has not registered yet
  *   holds the lock). A held host lock with no live registration here is `unreachable`: the owner
  *   registered with another broker (another build's script) or is still starting.
- * - Every registration is announced to every connected context (`registered`), so waiting clients
- *   reconnect at once.
+ * - A registration is announced (`registered`) to the contexts that asked about that database
+ *   since its last registration, so waiting clients reconnect at once. The broker keeps no other
+ *   reference to a client's port: a port is held only until the next registration of the database
+ *   it asked about (or its `close` event, where the platform fires one), so closed tabs are not
+ *   kept or broadcast to.
  * - It takes no locks itself.
  */
 import { BROKER_PROTOCOL, hostLockName, type BrokerMessage } from "./election.js";
@@ -32,7 +35,8 @@ interface Registration {
 export class Broker {
   readonly #locks: LockQuery;
   readonly #owners = new Map<string, Registration>();
-  readonly #ports = new Set<MessagePort>();
+  /** Per database, the ports that asked since its last registration (told of the next one). */
+  readonly #waiters = new Map<string, Set<MessagePort>>();
 
   constructor(locks: LockQuery) {
     this.#locks = locks;
@@ -40,10 +44,28 @@ export class Broker {
 
   /** Serves a newly connected context's port. */
   accept(port: MessagePort): void {
-    this.#ports.add(port);
     port.onmessage = (event: MessageEvent) => {
       void this.#receive(port, event.data as BrokerMessage);
     };
+    // Where the platform reports an entangled port's closing (a closed tab), forget it at once.
+    if (typeof port.addEventListener === "function")
+      port.addEventListener("close", () => {
+        this.#forget(port);
+      });
+  }
+
+  /** Ports held for announcements, over all databases (tests). */
+  get heldPorts(): number {
+    let count = 0;
+    for (const ports of this.#waiters.values()) count += ports.size;
+    return count;
+  }
+
+  #forget(port: MessagePort): void {
+    for (const [db, ports] of this.#waiters) {
+      ports.delete(port);
+      if (ports.size === 0) this.#waiters.delete(db);
+    }
   }
 
   /** Who holds the host lock: `null` when nobody does, `""` when the platform hides the id. */
@@ -67,19 +89,31 @@ export class Broker {
           port,
           lockHolder: message.lockHolder,
         });
-        for (const other of this.#ports)
-          other.postMessage({
-            t: "registered",
-            db: message.db,
-            ownerId: message.ownerId,
-          } satisfies BrokerMessage);
+        {
+          const waiting = this.#waiters.get(message.db);
+          this.#waiters.delete(message.db);
+          for (const other of waiting ?? [])
+            other.postMessage({
+              t: "registered",
+              db: message.db,
+              ownerId: message.ownerId,
+            } satisfies BrokerMessage);
+        }
         return;
       case "unregister":
         if (this.#owners.get(message.db)?.ownerId === message.ownerId)
           this.#owners.delete(message.db);
-        this.#ports.delete(port);
+        this.#forget(port);
         return;
       case "connect": {
+        // Whatever the answer, the asker may wait for the next owner (none yet, a successor
+        // starting, a version refusal to settle): it is told once, then forgotten.
+        let waiting = this.#waiters.get(message.db);
+        if (waiting === undefined) {
+          waiting = new Set();
+          this.#waiters.set(message.db, waiting);
+        }
+        waiting.add(port);
         const owner = this.#owners.get(message.db);
         const holder = await this.#hostHolder(message.db);
         const held = holder !== null;

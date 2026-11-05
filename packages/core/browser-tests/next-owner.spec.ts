@@ -216,3 +216,48 @@ test("a closed tab's open transaction is rolled back and the writer slot freed",
   });
   expect(await n(a)).toBe(1);
 });
+
+// ---- the review of increment 2 (B5-p2b-review-1) ----
+
+test("freeze, which fires on the document, terminates the owner", async ({ page }) => {
+  await tab(page);
+  expect(await call(page, "open", dbName("freeze-document"))).toEqual({ hosting: true });
+  await page.evaluate(() => document.dispatchEvent(new Event("freeze")));
+  await page.waitForTimeout(100);
+  expect(await call(page, "status")).toMatchObject({ hosting: false });
+});
+
+test("an older client is superseded by a newer owner", async ({ page, context }) => {
+  await tab(page);
+  const name = dbName("older");
+  await call(page, "open", name, { protocol: PROTOCOL_VERSION + 1 });
+  const b = await tab(await context.newPage());
+  await call(b, "open", name);
+  expect(await call(b, "status")).toMatchObject({ superseded: true, hosting: false });
+});
+
+test("a transaction lost with its owner stays lost until ROLLBACK, never autocommit", async ({
+  page,
+  context,
+}) => {
+  const name = dbName("lost-session");
+  const a = await tab(page);
+  await call(a, "open", name);
+  await seed(a);
+  const b = await tab(await context.newPage());
+  await call(b, "open", name);
+  await call(b, "begin", 1);
+  await call(b, "query", "UPDATE t SET n = n + 1 WHERE id = $1", [1], 1);
+  await a.close();
+  // Session 0 reconnects b, which takes over.
+  expect(await n(b)).toBe(0);
+  const update = () => call(b, "query", "UPDATE t SET n = n + 1 WHERE id = $1", [1], 1);
+  expect(await update()).toMatchObject({ error: "SessionLostError" });
+  expect(await call(b, "query", "COMMIT", [], 1)).toMatchObject({ error: "SessionLostError" });
+  expect(await n(b)).toBe(0);
+  expect(await call(b, "query", "ROLLBACK", [], 1)).toMatchObject({
+    summary: { transaction: "idle" },
+  });
+  expect(await update()).toMatchObject({ summary: { transaction: "idle" } });
+  expect(await n(b)).toBe(1);
+});

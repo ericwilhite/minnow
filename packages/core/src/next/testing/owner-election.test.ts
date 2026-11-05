@@ -12,7 +12,7 @@ import { Broker } from "../owner/broker.js";
 import { ProtocolClient } from "../owner/client.js";
 import { composeEngine } from "../owner/compose.js";
 import { OwnerConnector, type OwnerHandle, type StartOwner } from "../owner/connector.js";
-import { hostLockName, type HostContext } from "../owner/election.js";
+import { LIVENESS_IDLE_RELEASE_MS, hostLockName, type HostContext } from "../owner/election.js";
 import { startOwnerHost, type OwnerEngineFactory, type OwnerHost } from "../owner/host.js";
 import { PROTOCOL_VERSION, type StepDown } from "../owner/protocol.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
@@ -432,5 +432,552 @@ describe("step-down and version skew", () => {
     await late.connector.start();
     expect(lateSuperseded).toBe(1);
     expect(late.connector.status).toBe("superseded");
+  });
+});
+
+describe("review of increment 2 (B5-p2b-review-1)", () => {
+  const seedTable = async (client: ProtocolClient) => {
+    await client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
+    await client.query("INSERT INTO t VALUES ($1, $2, $3)", [1, 0, "x"]);
+  };
+
+  it("1: a transaction lost with its owner never falls through to autocommit", async () => {
+    const w = world();
+    const a = tab(w);
+    await a.connector.start();
+    await seedTable(a.client);
+    const b = tab(w);
+    await b.connector.start();
+    await b.client.begin(1);
+    await b.client.query("UPDATE t SET n = n + 1 WHERE id = $1", [1], { session: 1 });
+    killTab(w, a, 0);
+    // Session 0 reconnects b (electing it).
+    await b.client.query("SELECT * FROM t");
+    const update = () =>
+      b.client.query("UPDATE t SET n = n + 1 WHERE id = $1", [1], { session: 1 }).then(
+        (result) => result.summary.transaction,
+        (error: unknown) => (error as Error).name,
+      );
+    expect(await update()).toBe("SessionLostError");
+    // Every statement, COMMIT included, until the session is ended explicitly.
+    expect(await update()).toBe("SessionLostError");
+    expect(
+      await b.client.query("COMMIT", [], { session: 1 }).then(
+        () => "committed",
+        (error: unknown) => (error as Error).name,
+      ),
+    ).toBe("SessionLostError");
+    expect(await value(b.client)).toBe(0);
+    await b.client.rollback(1);
+    expect(await update()).toBe("idle");
+    expect(await value(b.client)).toBe(1);
+  });
+
+  it("1: the same holds for session 0 after BEGIN, and for a statement in flight at the loss", async () => {
+    const w = world();
+    const a = tab(w);
+    await a.connector.start();
+    await seedTable(a.client);
+    const b = tab(w);
+    await b.connector.start();
+    await b.client.query("BEGIN");
+    await b.client.query("UPDATE t SET n = n + 1 WHERE id = $1", [1]);
+    const host = w.owners[0]?.host;
+    if (host === undefined || host === null) throw new Error("no owner");
+    // Swallowed by the dying owner: in flight at the loss.
+    host.server.accept = () => undefined;
+    killTab(w, a, 0);
+    const inFlight = b.client.query("UPDATE t SET n = n + 1 WHERE id = $1", [1]).then(
+      () => "ran",
+      (error: unknown) => (error as Error).name,
+    );
+    expect(await inFlight).toBe("SessionLostError");
+    expect(
+      await b.client.query("SELECT * FROM t").then(
+        () => "ran",
+        (error: unknown) => (error as Error).name,
+      ),
+    ).toBe("SessionLostError");
+    expect(b.client.lostSessions.has(0)).toBe(true);
+    expect((await b.client.query("ROLLBACK")).summary.transaction).toBe("idle");
+    expect(await value(b.client)).toBe(0);
+  });
+
+  it("2: a fence stolen while the engine opens fails startup and tears everything down", async () => {
+    const w = world();
+    const base = factory(w);
+    let unblock: (() => void) | undefined;
+    const channel = new MessageChannel();
+    let closes = 0;
+    const posted: string[] = [];
+    const locks = w.registry.context();
+    const calls: string[] = [];
+    const request = locks.request.bind(locks);
+    locks.request = ((name: string, options: object, callback: () => Promise<void>) => {
+      calls.push(name);
+      return request(name, options, callback);
+    }) as typeof locks.request;
+    const starting = startOwnerHost(
+      {
+        t: "minnow:host",
+        database: "steal",
+        build: "",
+        clientPort: channel.port2,
+        brokerPort: null,
+        settings: {},
+      },
+      {
+        ...base,
+        closeFence(fence) {
+          closes++;
+          base.closeFence(fence);
+        },
+        async open(fence, settings) {
+          await new Promise<void>((resolve) => {
+            unblock = resolve;
+          });
+          return base.open(fence, settings);
+        },
+      },
+      {
+        locks,
+        post: (status) => {
+          posted.push(status.t);
+        },
+      },
+    );
+    await until(() => unblock !== undefined);
+    const thief = w.registry.context();
+    void thief.request("minnow:steal", { steal: true }, () => new Promise<void>(() => undefined));
+    await sleep(5);
+    unblock?.();
+    await expect(starting).rejects.toMatchObject({ name: "OwnershipLostError" });
+    // Checked right after the open: the host lock was never even requested.
+    expect(calls).toEqual(["minnow:steal"]);
+    expect(closes).toBe(1);
+    expect(posted).toEqual(["minnow:failed"]);
+    // Never took the host lock, never served the page's client.
+    expect(w.registry.held(hostLockName("steal"))).toBe(false);
+    thief.kill();
+    channel.port1.close();
+  });
+
+  it("2: a fence stolen during the host-lock steal fails startup and releases the host lock", async () => {
+    const w = world();
+    const channel = new MessageChannel();
+    const locks = w.registry.context();
+    const posted: string[] = [];
+    const original = locks.request.bind(locks);
+    const thief = w.registry.context();
+    let queries = 0;
+    const query = locks.query.bind(locks);
+    locks.query = () => {
+      queries++;
+      return query();
+    };
+    // The host-lock request completes only after the fence was stolen.
+    locks.request = ((name: string, options: object, callback: () => Promise<void>) => {
+      if (name === hostLockName("steal2"))
+        void thief.request(
+          "minnow:steal2",
+          { steal: true },
+          () => new Promise<void>(() => undefined),
+        );
+      return original(name, options, callback);
+    }) as typeof locks.request;
+    await expect(
+      startOwnerHost(
+        {
+          t: "minnow:host",
+          database: "steal2",
+          build: "",
+          clientPort: channel.port2,
+          brokerPort: null,
+          settings: {},
+        },
+        factory(w),
+        { locks, post: (status) => posted.push(status.t) },
+      ),
+    ).rejects.toMatchObject({ name: "OwnershipLostError" });
+    // Checked right after the steal: startup went no further.
+    expect(queries).toBe(0);
+    expect(posted).toEqual(["minnow:failed"]);
+    expect(w.registry.held(hostLockName("steal2"))).toBe(false);
+    thief.kill();
+    channel.port1.close();
+  });
+
+  it("3: an owner dying during the handshake does not hang the connector", async () => {
+    const w = world();
+    const a = tab(w);
+    await a.connector.start();
+    const host = w.owners[0]?.host;
+    if (host === undefined || host === null) throw new Error("no owner");
+    host.server.accept = (port) => {
+      (port as MessagePort).close();
+      w.owners[0]?.kill();
+    };
+    const b = tab(w);
+    const result = await Promise.race([
+      b.connector.start().then(() => "connected"),
+      sleep(1_000).then(() => "hung"),
+    ]);
+    expect(result).toBe("connected");
+    // A successor was elected (a's page or b) and serves b.
+    expect(a.connector.hosting || b.connector.hosting).toBe(true);
+    expect(await b.client.query("SHOW timezone").then(() => "served")).toBe("served");
+  });
+
+  it("3: an owner that never answers the handshake is abandoned after the bound", async () => {
+    const locks = new FakeLockRegistry();
+    const context = locks.context();
+    // Someone holds the host lock but never answers.
+    void locks
+      .context()
+      .request(hostLockName("silent"), {}, () => new Promise<void>(() => undefined));
+    const client = new ProtocolClient();
+    let asks = 0;
+    const connector = new OwnerConnector({
+      database: "silent",
+      client,
+      locks: context,
+      openBroker: () => {
+        const { port1, port2 } = new MessageChannel();
+        port1.onmessage = (event: MessageEvent) => {
+          const message = event.data as { t: string; nonce: number };
+          if (message.t !== "connect") return;
+          asks++;
+          const silent = new MessageChannel();
+          cleanups.push(() => {
+            silent.port1.close();
+          });
+          port1.postMessage({ t: "port", nonce: message.nonce, ownerId: "x", port: silent.port2 }, [
+            silent.port2,
+          ]);
+        };
+        cleanups.push(() => {
+          port1.close();
+        });
+        return port2;
+      },
+      startOwner: null,
+      context: () => ({
+        kind: "page",
+        visible: true,
+        platform: { mobile: false },
+        superseded: false,
+      }),
+      handshakeTimeoutMs: 30,
+      retryMs: 10,
+    });
+    void connector.start().catch(() => undefined);
+    await until(() => asks >= 3, 1_000);
+    connector.close();
+  });
+
+  it("4: liveness is re-announced to a replacement owner, which then watches it", async () => {
+    const w = world();
+    const a = tab(w);
+    await a.connector.start();
+    await seedTable(a.client);
+    const b = tab(w);
+    await b.connector.start();
+    await b.client.query("BEGIN");
+    await b.client.query("UPDATE t SET n = n + 1 WHERE id = $1", [1]);
+    await sleep(20);
+    killTab(w, a, 0);
+    await b.client.query("SELECT * FROM t").catch(() => undefined);
+    // The lost session must be ended before it is used again (finding 1's ruling).
+    await b.client.query("ROLLBACK");
+    await b.client.query("BEGIN");
+    await b.client.query("UPDATE t SET n = n + 1 WHERE id = $1", [1]);
+    const c = tab(w);
+    await c.connector.start();
+    // b's page dies without a word; the owner (b's own worker survives in this world) must see
+    // b's liveness lock go and roll its transaction back.
+    b.locks.kill();
+    const update = c.client.query("UPDATE t SET n = n + 1 WHERE id = $1", [1]);
+    const outcome = await Promise.race([update.then(() => "done"), sleep(500).then(() => "hung")]);
+    expect(outcome).toBe("done");
+  });
+
+  it("5: closing while the owner starts terminates it and releases the host lock", async () => {
+    const w = world();
+    const client = new ProtocolClient();
+    let ready: ((id: string) => void) | undefined;
+    let terminated = 0;
+    const connector = new OwnerConnector({
+      database: "late",
+      client,
+      locks: w.registry.context(),
+      openBroker: null,
+      context: () => ({
+        kind: "page",
+        visible: true,
+        platform: { mobile: false },
+        superseded: false,
+      }),
+      startOwner: () => ({
+        ready: new Promise((resolve) => {
+          ready = resolve;
+        }),
+        stopped: new Promise(() => undefined),
+        lifecycle() {
+          return undefined;
+        },
+        terminate() {
+          terminated++;
+        },
+      }),
+    });
+    const starting = connector.start();
+    await until(() => ready !== undefined);
+    connector.close();
+    // Terminated at close, not when (if ever) it would have become ready.
+    expect(terminated).toBe(1);
+    await sleep(1);
+    expect(w.registry.held(hostLockName("late"))).toBe(false);
+    ready?.("late-owner");
+    await starting;
+    await sleep(10);
+    expect({ terminated, hosting: connector.hosting }).toEqual({ terminated: 1, hosting: false });
+  });
+
+  it("5: closing while queued for the host lock withdraws the request", async () => {
+    const w = world();
+    const holder = w.registry.context();
+    let release: (() => void) | undefined;
+    void holder.request(
+      hostLockName("queued"),
+      {},
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    let started = 0;
+    const connector = new OwnerConnector({
+      database: "queued",
+      client: new ProtocolClient(),
+      locks: w.registry.context(),
+      openBroker: null,
+      context: () => ({
+        kind: "page",
+        visible: true,
+        platform: { mobile: false },
+        superseded: false,
+      }),
+      startOwner: () => {
+        started++;
+        return {
+          ready: new Promise(() => undefined),
+          stopped: new Promise(() => undefined),
+          lifecycle: () => undefined,
+          terminate: () => undefined,
+        };
+      },
+    });
+    const starting = connector.start();
+    await sleep(10);
+    const queued = () =>
+      w.registry.query().pending.filter((lock) => lock.name === hostLockName("queued"));
+    expect(queued()).toHaveLength(1);
+    connector.close();
+    await sleep(1);
+    // Withdrawn at once, not left to be granted (and released) later.
+    expect(queued()).toHaveLength(0);
+    release?.();
+    await starting;
+    await sleep(10);
+    expect(started).toBe(0);
+    expect(w.registry.held(hostLockName("queued"))).toBe(false);
+  });
+
+  it("7: a liveness grant that arrives after the client went idle is released after the hysteresis", async () => {
+    const w = world();
+    const a = tab(w);
+    await a.connector.start();
+    await a.client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
+    const b = tab(w);
+    await b.connector.start();
+    const blocker = w.registry.context();
+    let release: (() => void) | undefined;
+    const name = `minnow:db:client:${b.client.clientId}`;
+    void blocker.request(
+      name,
+      {},
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    await b.client.query("SELECT * FROM t");
+    release?.();
+    await sleep(LIVENESS_IDLE_RELEASE_MS + 200);
+    expect(w.registry.held(name)).toBe(false);
+    blocker.kill();
+  });
+
+  it("8: the broker keeps no port of a context that never asked, and forgets askers on registration", async () => {
+    const broker = new Broker({ query: () => Promise.resolve({ held: [] }) });
+    let broadcasts = 0;
+    for (let i = 0; i < 100; i++) {
+      const port = {
+        onmessage: null,
+        postMessage: () => {
+          broadcasts++;
+        },
+        close() {
+          return undefined;
+        },
+      } as unknown as MessagePort;
+      broker.accept(port);
+      port.close();
+    }
+    const asker = {
+      onmessage: null as ((event: MessageEvent) => void) | null,
+      postMessage: () => {
+        broadcasts++;
+      },
+    };
+    broker.accept(asker as unknown as MessagePort);
+    asker.onmessage?.({
+      data: { t: "connect", v: 1, db: "db", clientId: "c", nonce: 1 },
+    } as MessageEvent);
+    await sleep(1);
+    expect(broker.heldPorts).toBe(1);
+    broadcasts = 0;
+    const owner = {
+      onmessage: null as ((event: MessageEvent) => void) | null,
+      postMessage: () => undefined,
+    };
+    broker.accept(owner as unknown as MessagePort);
+    const register = {
+      t: "register",
+      v: 1,
+      db: "db",
+      ownerId: "o",
+      protocol: 1,
+      build: "",
+      lockHolder: null,
+    };
+    owner.onmessage?.({ data: register } as MessageEvent);
+    await sleep(1);
+    // Only the asker heard, once; then it is forgotten.
+    expect(broadcasts).toBe(1);
+    expect(broker.heldPorts).toBe(0);
+    owner.onmessage?.({ data: { ...register, ownerId: "o2" } } as MessageEvent);
+    await sleep(1);
+    expect(broadcasts).toBe(1);
+  });
+
+  it("8: the broker forgets a port when the platform reports it closed", async () => {
+    const broker = new Broker({ query: () => Promise.resolve({ held: [] }) });
+    const { port1, port2 } = new MessageChannel();
+    broker.accept(port1);
+    port2.postMessage({ t: "connect", v: 1, db: "db", clientId: "c", nonce: 1 });
+    await until(() => broker.heldPorts === 1);
+    port2.close();
+    await until(() => broker.heldPorts === 0);
+  });
+
+  it("1: the client never resends a lost session's in-flight statement (only its COMMIT)", async () => {
+    const sent: Array<Record<string, unknown>> = [];
+    const fake = () => {
+      const port = {
+        onmessage: null as ((event: { data: unknown }) => void) | null,
+        close: () => undefined,
+        postMessage(message: Record<string, unknown>) {
+          sent.push(message);
+          if (message.t === "hello")
+            queueMicrotask(() =>
+              port.onmessage?.({
+                data: { t: "welcome", ownerId: "o", protocol: PROTOCOL_VERSION },
+              }),
+            );
+        },
+      };
+      return port;
+    };
+    const client = new ProtocolClient();
+    const first = fake();
+    await client.connect(first as unknown as MessagePort);
+    const begin = client.begin(1);
+    const beginSeq = sent.at(-1)?.seq as number;
+    first.onmessage?.({
+      data: {
+        t: "done",
+        seq: beginSeq,
+        columns: [],
+        frames: [],
+        summary: {
+          command: "BEGIN",
+          rowCount: null,
+          counts: null,
+          lsn: null,
+          replayed: false,
+          closedEarly: false,
+          transaction: "inTransaction",
+          catalogVersion: 1,
+        },
+      },
+    });
+    await begin;
+    const update = client.query("UPDATE t SET n = 1", [], { session: 1 });
+    const updateSeq = sent.at(-1)?.seq as number;
+    const commit = client.commit(1);
+    const commitSeq = sent.at(-1)?.seq as number;
+    sent.length = 0;
+    await client.reconnect(fake() as unknown as MessagePort);
+    const resent = sent.filter((message) => message.retry === true).map((message) => message.seq);
+    expect(resent).not.toContain(updateSeq);
+    expect(resent).toEqual([commitSeq]);
+    expect(
+      await Promise.race([
+        update.then(
+          () => "ran",
+          (error: unknown) => (error as { lost?: string }).lost,
+        ),
+        sleep(50).then(() => "pending"),
+      ]),
+    ).toBe("transaction");
+    client.close();
+    await commit.catch(() => undefined);
+  });
+
+  it("6: freeze and pagehide terminate without calling back into the closing page", async () => {
+    const w = world();
+    let closing = false;
+    let terminated = 0;
+    const start = inProcessOwner(w);
+    const connector = new OwnerConnector({
+      database: "db",
+      client: new ProtocolClient(),
+      locks: w.registry.context(),
+      openBroker: null,
+      startOwner: (init) => {
+        const handle = start(init);
+        return {
+          ...handle,
+          terminate: () => {
+            terminated++;
+            handle.terminate();
+          },
+        };
+      },
+      context: () => {
+        // Firefox can abandon a closing page's handler inside a call like this one.
+        if (closing) throw new Error("abandoned");
+        return { kind: "page", visible: true, platform: { mobile: false }, superseded: false };
+      },
+    });
+    cleanups.push(() => {
+      connector.close();
+    });
+    await connector.start();
+    expect(connector.hosting).toBe(true);
+    closing = true;
+    connector.lifecycle("pagehide");
+    expect({ terminated, hosting: connector.hosting }).toEqual({ terminated: 1, hosting: false });
   });
 });

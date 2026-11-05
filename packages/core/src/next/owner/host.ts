@@ -8,10 +8,15 @@
  *    retry (the lock frees before a dead owner's handles).
  * 2. `factory.open(fence)`: store session → extent space → write path (one log scan and replay)
  *    → spill sweep. With stand-ins it loads their durable file.
- * 3. The protocol server; the host page's own client connects on `clientPort`.
- * 4. The host lock, stolen from the page that won the election: from now on the owner holds it.
+ * 3. The host lock, stolen from the page that won the election: from now on the owner holds it.
+ * 4. The protocol server; the host page's own client connects on `clientPort`.
  * 5. Registration with the broker; answers on the skew channel.
  * 6. `minnow:ready` to the page.
+ *
+ * A newer owner may steal the fence lock while startup awaits (steps 2 and 3, and the lock query
+ * that names the holder for the broker). After every await the host checks; a lost fence tears
+ * everything down (handles, locks, engine) and startup fails with `OwnershipLostError` before
+ * anything is served. Steps 4 to 6 run with no await between them.
  *
  * ## Stepping down
  * - `terminate` (`freeze`, `pagehide`, a stolen lock): synchronous — the server ends every
@@ -24,7 +29,8 @@
  * - A stolen fence lock closes the handles at once (storage probe: the steal alone does not stop a
  *   hung owner; only closing the handle does).
  */
-import { acquireFenced } from "../storage/fence.js";
+import { OwnershipLostError } from "../storage/contract.js";
+import { acquireFenced, type HeldLock } from "../storage/fence.js";
 import {
   BROKER_PROTOCOL,
   hostLockName,
@@ -124,29 +130,51 @@ export async function startOwnerHost<F>(
     throw error;
   }
   const { lock, fence } = acquired;
+  // Startup awaits three times (engine open, host-lock steal, lock query). A newer owner may steal
+  // the fence lock during any of them: after each, check, and if it was lost tear everything
+  // down before serving anything (the handles first: only closing them stops this owner).
+  let engineOpened: OwnerEngine | null = null;
+  let hostLock: HeldLock | null = null;
+  const abandon = (error: unknown): never => {
+    factory.closeFence(fence);
+    lock.release();
+    hostLock?.release();
+    if (engineOpened !== null) void engineOpened.close().catch(() => undefined);
+    deps.post({ t: "minnow:failed", error: toWireError(error) });
+    throw error;
+  };
+  const checkFence = () => {
+    if (lock.lost.aborted) abandon(new OwnershipLostError(0));
+  };
   try {
     engine = await factory.open(fence, init.settings);
   } catch (error) {
-    factory.closeFence(fence);
-    lock.release();
-    deps.post({ t: "minnow:failed", error: toWireError(error) });
-    throw error;
+    return abandon(error);
   }
+  engineOpened = engine;
+  checkFence();
 
   // The host lock moves to the owner itself: the page held it only to serialize the election.
   // Held here, any death of the owner (terminate, crash, closed tab) frees it at once, so waiting
   // clients elect a successor (election.ts "Locks").
-  let hostLock: Awaited<ReturnType<ReturnType<typeof webLocks>["request"]>>;
   try {
     hostLock = await webLocks(deps.locks).request(hostLockName(database), { steal: true });
   } catch (error) {
-    await engine.close().catch(() => undefined);
-    factory.closeFence(fence);
-    lock.release();
-    deps.post({ t: "minnow:failed", error: toWireError(error) });
-    throw error;
+    return abandon(error);
   }
+  checkFence();
 
+  // The context id the platform gives this owner's host lock, for the broker's liveness check.
+  const lockHolder =
+    (await deps.locks.query?.().then(
+      (state) =>
+        (state.held ?? []).find((held) => held.name === hostLockName(database))?.clientId ?? null,
+      () => null,
+    )) ?? null;
+  checkFence();
+  const heldHostLock = hostLock;
+
+  // No await from here to `minnow:ready`: the lock checks above cover the whole startup.
   const ownerId = randomId();
   const idle = init.settings.transactionIdleTimeoutMs;
   const server = new OwnerServer(engine, {
@@ -158,14 +186,6 @@ export async function startOwnerHost<F>(
     watchLiveness: (name) => watchLock(deps.locks, name),
   });
   server.accept(init.clientPort);
-
-  // The context id the platform gives this owner's host lock, for the broker's liveness check.
-  const lockHolder =
-    (await deps.locks.query?.().then(
-      (state) =>
-        (state.held ?? []).find((held) => held.name === hostLockName(database))?.clientId ?? null,
-      () => null,
-    )) ?? null;
 
   const broker = init.brokerPort;
   if (broker !== null) {
@@ -193,7 +213,7 @@ export async function startOwnerHost<F>(
   const release = (reason: StepDown["reason"]) => {
     factory.closeFence(fence);
     lock.release();
-    hostLock.release();
+    heldHostLock.release();
     skew?.close();
     if (broker !== null) {
       broker.postMessage({

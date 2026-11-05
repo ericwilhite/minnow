@@ -106,6 +106,12 @@
  *   resendable is refused with `SessionLostError` and never executed. So a transaction's
  *   statements never run outside it, and a COMMIT whose fate is unknown resolves from the ledger:
  *   committed, or definitely not.
+ * - A session with an open transaction belongs to its connection generation (B5-p2b review,
+ *   finding 1). After a reconnect, every request on it fails with
+ *   `SessionLostError("transaction")` in the client, unsent, until the client ends the session
+ *   explicitly (`rollback`, ROLLBACK, ABORT): nothing meant for the lost transaction reaches the
+ *   new owner, where it would run in autocommit. A COMMIT in flight at the loss is the one
+ *   exception: it is resent, and the ledger answers it (committed: the session ends).
  *
  * ## Idle transactions (ruling R16.7)
  * - The owner rolls back a transaction left idle for `transactionIdleTimeoutMs` (default 30 s, as
@@ -126,6 +132,8 @@
  *   granted, then sends `liveness { held: true }`, which makes its outstanding requests and pins
  *   watched; before releasing the lock it sends `liveness { held: false }`. Opening a
  *   cursor or a transaction (they pin a snapshot) waits for the lock.
+ * - A held lock is declared again on every new connection, right after `welcome` and before any
+ *   resend: an owner watches only what its own connection was told.
  * - While a client has requests in flight the owner sends `alive` at least every
  *   `ALIVE_INTERVAL_MS`. The client's deadline counts silence, not wall time.
  *

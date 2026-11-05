@@ -15,12 +15,26 @@
  * terminal reply, except streams whose frames it already handed out (those fail with
  * `SessionLostError`). The ledger answers duplicates; a non-resendable request the new owner has
  * not seen fails with `SessionLostError` and never runs.
+ *
+ * ## Sessions bound to their generation
+ * A session with an open transaction (any state but `idle`, or a BEGIN unanswered) belongs to the
+ * connection generation it ran on. A reconnect loses it: every request on it then fails with
+ * `SessionLostError("transaction")` without being sent, so nothing can fall through to
+ * autocommit on the new owner, until the client ends the session explicitly (`rollback`, or a
+ * ROLLBACK / ABORT statement). Requests that were in flight on it fail the same way, except a
+ * COMMIT: it is resent, and the ledger answers it if it committed (ending the session).
+ *
+ * ## Handshake
+ * `connect` and `reconnect` take an optional `AbortSignal`: the connector aborts a handshake whose
+ * owner died or did not answer within `HANDSHAKE_TIMEOUT_MS`. A welcomed connection re-announces
+ * the liveness lock (`liveness { held: true }`) before anything else is sent on it.
  */
 import { SessionLostError } from "../errors.js";
 import { decodeUtf8 } from "../vector/varlen.js";
 import {
   ClientClosedError,
   ConnectionRefusedError,
+  OwnerUnreachableError,
   fromWireError,
   ownerErrorRegistry,
 } from "./errors.js";
@@ -164,6 +178,10 @@ export class ProtocolClient {
   readonly #sequencer = new RequestSequencer();
   /** Each session's transaction state, from replies: a non-idle session pins a snapshot. */
   readonly #sessions = new Map<number, TransactionState>();
+  /** Sessions whose transaction a reconnect lost: refused until ended explicitly. */
+  readonly #lostSessions = new Set<number>();
+  /** Whether the connector holds the liveness lock (re-announced on every new connection). */
+  #livenessHeld = false;
   #cursors = 0;
   readonly #pending = new Map<number, Pending>();
   readonly #session0 = { transaction: "idle" as TransactionState, unresolvedControl: 0 };
@@ -214,18 +232,46 @@ export class ProtocolClient {
   }
 
   /** Opens the first connection. */
-  connect(port: MessagePort): Promise<Welcome> {
-    return this.#open(port);
+  connect(port: MessagePort, signal?: AbortSignal): Promise<Welcome> {
+    return this.#open(port, signal);
+  }
+
+  /** Sessions a reconnect lost, refused until ended (see "Sessions bound to their generation"). */
+  get lostSessions(): ReadonlySet<number> {
+    return this.#lostSessions;
   }
 
   /** Opens the next generation on `port` and resends unanswered requests. */
-  async reconnect(port: MessagePort): Promise<Welcome> {
-    const welcome = await this.#open(port);
+  async reconnect(port: MessagePort, signal?: AbortSignal): Promise<Welcome> {
+    const welcome = await this.#open(port, signal);
+    // Every session with a transaction open on the old generation is lost with it.
+    for (const [session, state] of this.#sessions)
+      if (state !== "idle") this.#lostSessions.add(session);
+    if (this.#session0.transaction !== "idle") this.#lostSessions.add(0);
+    for (const pending of this.#pending.values())
+      if (pending.session !== null && pending.body.t === "begin")
+        this.#lostSessions.add(pending.session);
+    for (const session of this.#lostSessions) this.#sessions.set(session, "idle");
     this.#session0.transaction = "idle";
     for (const pending of [...this.#pending.values()].sort((a, b) => a.seq - b.seq)) {
       if (pending.handedOut) {
         this.#settle(pending.seq);
         pending.reject(new SessionLostError("cursor", pending.seq));
+        continue;
+      }
+      if (
+        pending.session !== null &&
+        this.#lostSessions.has(pending.session) &&
+        sessionEffect(pending.body) !== "commit"
+      ) {
+        if (sessionEffect(pending.body) === "end") {
+          // The ROLLBACK the client already asked for: the transaction is gone either way.
+          this.#lostSessions.delete(pending.session);
+          this.#send(pending, true);
+          continue;
+        }
+        this.#settle(pending.seq);
+        pending.reject(new SessionLostError("transaction", pending.seq));
         continue;
       }
       pending.frames.length = 0;
@@ -236,7 +282,7 @@ export class ProtocolClient {
     return welcome;
   }
 
-  #open(port: MessagePort): Promise<Welcome> {
+  #open(port: MessagePort, signal?: AbortSignal): Promise<Welcome> {
     this.#port?.close();
     this.#port = port;
     this.#generation++;
@@ -244,7 +290,28 @@ export class ProtocolClient {
       this.#receive(event.data as OwnerMessage);
     };
     return new Promise<Welcome>((resolve, reject) => {
-      this.#welcome = { resolve, reject };
+      const onAbort = () => {
+        if (this.#port !== port || this.#welcome === null) return;
+        this.#welcome = null;
+        this.#port = null;
+        port.close();
+        reject(new OwnerUnreachableError("the owner did not answer the handshake"));
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      this.#welcome = {
+        resolve: (welcome) => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve(welcome);
+        },
+        reject: (error) => {
+          signal?.removeEventListener("abort", onAbort);
+          reject(error);
+        },
+      };
+      if (signal?.aborted === true) {
+        onAbort();
+        return;
+      }
       port.postMessage({
         t: "hello",
         protocol: this.protocol,
@@ -403,9 +470,13 @@ export class ProtocolClient {
     this.#port?.postMessage({ t: "cancel", target: seq, close });
   }
 
-  /** Declares the liveness lock held, or about to be released (protocol.ts `liveness`). */
+  /**
+   * Declares the liveness lock held, or about to be released (protocol.ts `liveness`). Remembered:
+   * a held lock is announced again on every new connection, before its resends.
+   */
   liveness(held: boolean): void {
-    this.#port?.postMessage({ t: "liveness", held });
+    this.#livenessHeld = held;
+    if (this.connected) this.#port?.postMessage({ t: "liveness", held });
   }
 
   #request(
@@ -414,13 +485,19 @@ export class ProtocolClient {
     cursor: CursorQueue | null = null,
   ): { readonly seq: number; readonly promise: Promise<ClientResult> } {
     if (this.#closed) return { seq: -1, promise: Promise.reject(new ClientClosedError()) };
+    const session = "session" in body ? body.session : null;
+    if (session !== null && this.#lostSessions.has(session)) {
+      // Never sent: on the new owner it would run outside the lost transaction (autocommit).
+      if (sessionEffect(body) !== "end")
+        return { seq: -1, promise: Promise.reject(new SessionLostError("transaction")) };
+      this.#lostSessions.delete(session);
+    }
     const seq = this.#sequencer.issue();
     if (seq === null)
       return {
         seq: -1,
         promise: Promise.reject(new RangeError("Outstanding request window is full")),
       };
-    const session = "session" in body ? body.session : null;
     const resendable = isResendable(body, this.#session0);
     let resolve: (result: ClientResult) => void = () => undefined;
     let reject: (error: Error) => void = () => undefined;
@@ -485,11 +562,15 @@ export class ProtocolClient {
 
   #receive(message: OwnerMessage): void {
     switch (message.t) {
-      case "welcome":
+      case "welcome": {
         this.#ownerId = message.ownerId;
-        this.#welcome?.resolve(message);
+        const welcome = this.#welcome;
         this.#welcome = null;
+        // Before any resend or new request: the owner watches the lock only once announced.
+        if (this.#livenessHeld) this.#port?.postMessage({ t: "liveness", held: true });
+        welcome?.resolve(message);
         return;
+      }
       case "refused":
         this.#welcome?.reject(new ConnectionRefusedError(message.reason, message.ownerProtocol));
         this.#welcome = null;
@@ -524,6 +605,9 @@ export class ProtocolClient {
             this.#port?.postMessage({ t: "release", target: message.seq, through: last.sequence });
         }
         if (message.t === "done") {
+          // A COMMIT resent after a reconnect, answered (from the ledger): the session ended.
+          if (pending.session !== null && sessionEffect(pending.body) === "commit")
+            this.#lostSessions.delete(pending.session);
           if (pending.session === 0) this.#session0.transaction = message.summary.transaction;
           if (pending.session !== null)
             this.#sessions.set(pending.session, message.summary.transaction);
@@ -591,6 +675,20 @@ export class ProtocolClient {
         return;
     }
   }
+}
+
+/** What a request does to its session's transaction, as far as reconnect handling needs. */
+function sessionEffect(body: Body): "commit" | "end" | null {
+  if (body.t === "commit") return "commit";
+  if (body.t === "rollback") return "end";
+  if (body.t !== "statement" || body.text === null) return null;
+  const match = /^\s*(\w+)(?:\s+(\w+))?\s*;?\s*$/u.exec(body.text);
+  const word = match?.[1]?.toLowerCase();
+  const next = match?.[2]?.toLowerCase();
+  if (word === "commit" || word === "end") return "commit";
+  // ROLLBACK and ABORT end the transaction; ROLLBACK TO a savepoint does not.
+  if ((word === "rollback" || word === "abort") && next !== "to") return "end";
+  return null;
 }
 
 function emptySummary(): StatementSummary {
