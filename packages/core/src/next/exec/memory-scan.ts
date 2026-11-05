@@ -48,7 +48,7 @@ export class MemorySegmentScan implements BatchSource {
   readonly #columnIds: readonly number[];
   readonly #out: readonly ChunkOutput[];
   readonly #vectors: Vector[];
-  readonly #results: (ChunkResult | undefined)[];
+  readonly #results: Array<ChunkResult | undefined>;
   readonly #selection: Selection = allocateSelection(MEMORY_CHUNK_ROWS);
   #segment = 0;
   /** The chunk index the next read continues, or starts when `#start` is 0. */
