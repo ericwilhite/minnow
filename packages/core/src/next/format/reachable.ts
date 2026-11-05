@@ -1,38 +1,30 @@
 /**
- * The reachability walk (manifest.ts "Reclaim"): every data-space range a manifest root
- * references, so the owner can rebuild its free-space map on open and free what no durable or
- * pinned root reaches. Crash orphans need no records: they are simply absent from every walk.
+ * The reachability walk (manifest.ts "Reclaim"): everything a manifest root references, so the
+ * extent space can rebuild its free map at open and audit it (storage/extents.ts
+ * `ReachableExtents`). Crash orphans need no records: they are simply absent from every walk.
  *
  * What a root reaches:
  * - the catalog; each table's statistics blob;
- * - each table's group directory (`groups`) and the group directories of staged large
- *   transactions (`staged[].groups`);
+ * - each table's group directory (`groups`) and, for every staged large transaction, its group
+ *   directory (`staged[].groups`) and the index runs built for it (`staged[].indexRuns`);
  * - through each `GroupRef`: its group root and its deletion bitmap;
  * - through each `GroupRoot`: its row-id column (merged groups) and every column chunk's data
- *   extent, page directory and distinct sketch (both usually inside the data extent:
- *   page/writer.ts);
- * - every index run of the key index and the secondary indexes: entries, fences, Bloom filter.
+ *   extent, page directory and distinct sketch;
+ * - every index run (key index, secondary indexes, staged runs): entries, fences, Bloom filter.
  *
- * The walk reads only metadata (group directories and group roots), through a `ManifestReader`
- * that decodes those blobs and checks their checksums (verify once). Pages are never read.
- * Several chunks, groups and roots may share one extent (manifest.ts "Immutability and
- * sharing"): `occupied` merges the list into disjoint `DATA_ALIGN`-rounded ranges.
+ * Units (ruling R15.1): a `BlobRef` carries the extent it lives in, so the walk yields blobs and
+ * chunk extents as they are; the space takes `BlobRef.extent` and never maps an address back to
+ * an extent. Duplicates are allowed (packed and shared extents); `reachableExtents` drops only a
+ * repeat of the extent it yielded last, so its memory stays bounded.
  *
- * Cost: one read per table group directory and one per group root, issued in parallel batches
- * of `concurrency`; O(groups × columns) memory for the result, never O(rows).
+ * The walk streams: it reads one group directory, then its group roots in batches of
+ * `concurrency`, yielding as it goes. It holds one directory's `GroupRef[]` and one batch of
+ * group roots at a time, and every metadata lease only while decoding. Pages are never read.
  */
-import type { DataRange } from "../storage/contract.js";
-import { DATA_ALIGN } from "../storage/contract.js";
-import type {
-  BlobRef,
-  ExtentRef,
-  GroupRef,
-  GroupRoot,
-  IndexRoot,
-  ManifestRoot,
-} from "./manifest.js";
+import type { BlobRef, ByteBudget, ExtentReader, ExtentRef } from "../storage/extents.js";
+import type { GroupRef, GroupRoot, IndexRoot, ManifestRoot, RunRef } from "./manifest.js";
 
-/** Decodes (and verifies) the metadata blobs the walk descends through. */
+/** Decodes the metadata blobs the walk descends through. */
 export interface ManifestReader {
   /** The `GroupRef[]` a group directory blob holds. */
   groups(ref: BlobRef): Promise<readonly GroupRef[]>;
@@ -55,12 +47,12 @@ export type ReachableKind =
   | "index-fences"
   | "index-bloom";
 
-export interface ReachableRange extends DataRange {
+export interface Reached {
+  /** A blob (with its extent) or a chunk's data extent. */
+  readonly ref: BlobRef | ExtentRef;
   readonly kind: ReachableKind;
   /** The table it belongs to (null for the catalog). */
   readonly tableId: number | null;
-  /** Page directories and sketches: the chunk extent they lie in (page/writer.ts puts them there). */
-  readonly within?: ExtentRef;
 }
 
 export interface ReachableOptions {
@@ -68,144 +60,102 @@ export interface ReachableOptions {
   readonly concurrency?: number;
 }
 
+function* runsOf(
+  index: IndexRoot | { readonly runs: readonly RunRef[] } | null,
+  tableId: number,
+): Generator<Reached> {
+  if (index === null) return;
+  for (const run of index.runs) {
+    yield { ref: run.entries, kind: "index-entries", tableId };
+    yield { ref: run.fences, kind: "index-fences", tableId };
+    yield { ref: run.bloom, kind: "index-bloom", tableId };
+  }
+}
+
 /**
- * Every range `root` references, in walk order, with duplicates (a shared extent appears once per
- * reference). Rejects with whatever the reader throws (a checksum failure is corruption: the
- * caller must not compute free space from a partial walk).
+ * Every reference `root` reaches, streamed in walk order. Rejects with whatever the reader throws
+ * (a checksum failure is corruption: a caller must not compute free space from a partial walk).
  */
-export async function reachable(
+export async function* walkReachable(
   root: ManifestRoot,
   reader: ManifestReader,
   options: ReachableOptions = {},
-): Promise<ReachableRange[]> {
+): AsyncGenerator<Reached> {
   const concurrency = Math.max(1, options.concurrency ?? 32);
-  const out: ReachableRange[] = [];
-  const add = (
-    ref: BlobRef | ExtentRef | null,
-    kind: ReachableKind,
-    tableId: number | null,
-    within?: ExtentRef,
-  ): void => {
-    if (ref === null || ref.length <= 0) return;
-    const range = { offset: ref.offset, length: ref.length, kind, tableId };
-    out.push(within === undefined ? range : { ...range, within });
-  };
-  add(root.catalog, "catalog", null);
+  yield { ref: root.catalog, kind: "catalog", tableId: null };
   for (const table of root.tables) {
     const tableId = table.tableId;
-    add(table.statistics, "table-statistics", tableId);
-    for (const index of [table.keyIndex, ...table.secondaryIndexes]) addIndex(index, tableId, add);
+    if (table.statistics !== null)
+      yield { ref: table.statistics, kind: "table-statistics", tableId };
+    for (const index of [table.keyIndex, ...table.secondaryIndexes]) yield* runsOf(index, tableId);
     const directories: Array<{ ref: BlobRef; kind: ReachableKind }> = [
       { ref: table.groups, kind: "group-directory" },
-      ...table.staged.map((staged) => ({
-        ref: staged.groups,
-        kind: "staged-group-directory" as const,
-      })),
     ];
+    for (const staged of table.staged) {
+      directories.push({ ref: staged.groups, kind: "staged-group-directory" });
+      for (const index of staged.indexRuns) yield* runsOf(index, tableId);
+    }
     for (const { ref, kind } of directories) {
       if (ref.length === 0) continue;
-      add(ref, kind, tableId);
+      yield { ref, kind, tableId };
       const groups = await reader.groups(ref);
       for (let start = 0; start < groups.length; start += concurrency) {
         const batch = groups.slice(start, start + concurrency);
         const roots = await Promise.all(batch.map((group) => reader.groupRoot(group.root)));
-        batch.forEach((group, index) => {
-          add(group.root, "group-root", tableId);
-          add(group.deletions, "deletions", tableId);
+        for (const [index, group] of batch.entries()) {
+          yield { ref: group.root, kind: "group-root", tableId };
+          if (group.deletions !== null) yield { ref: group.deletions, kind: "deletions", tableId };
           const groupRoot = roots[index];
-          if (groupRoot === undefined) return;
-          if (groupRoot.rowIds.kind === "column") add(groupRoot.rowIds.ref, "row-ids", tableId);
+          if (groupRoot === undefined) continue;
+          if (groupRoot.rowIds.kind === "column")
+            yield { ref: groupRoot.rowIds.ref, kind: "row-ids", tableId };
           for (const chunk of groupRoot.columns) {
-            add(chunk.data, "chunk-data", tableId);
-            add(chunk.directory, "page-directory", tableId, chunk.data);
-            add(chunk.distinctSketch, "distinct-sketch", tableId, chunk.data);
+            yield { ref: chunk.data, kind: "chunk-data", tableId };
+            yield { ref: chunk.directory, kind: "page-directory", tableId };
+            if (chunk.distinctSketch !== null)
+              yield { ref: chunk.distinctSketch, kind: "distinct-sketch", tableId };
           }
-        });
+        }
       }
     }
   }
+}
+
+/** The whole walk as a list (tests and audits; the open uses the stream). */
+export async function reachable(
+  root: ManifestRoot,
+  reader: ManifestReader,
+  options: ReachableOptions = {},
+): Promise<Reached[]> {
+  const out: Reached[] = [];
+  for await (const reached of walkReachable(root, reader, options)) out.push(reached);
   return out;
 }
 
-function addIndex(
-  index: IndexRoot | null,
-  tableId: number,
-  add: (ref: BlobRef, kind: ReachableKind, tableId: number) => void,
-): void {
-  if (index === null) return;
-  for (const run of index.runs) {
-    add(run.entries, "index-entries", tableId);
-    add(run.fences, "index-fences", tableId);
-    add(run.bloom, "index-bloom", tableId);
-  }
-}
-
-/**
- * The disjoint, ascending ranges the given references occupy, each widened to `DATA_ALIGN`
- * boundaries (the allocator's unit), with overlapping and touching ranges merged. Everything
- * else below the data length is free.
- */
-export function occupied(ranges: readonly DataRange[]): DataRange[] {
-  const aligned = ranges
-    .filter((range) => range.length > 0)
-    .map((range) => {
-      const start = Math.floor(range.offset / DATA_ALIGN) * DATA_ALIGN;
-      const end = Math.ceil((range.offset + range.length) / DATA_ALIGN) * DATA_ALIGN;
-      return { offset: start, end };
-    })
-    .sort((a, b) => a.offset - b.offset);
-  const out: DataRange[] = [];
-  let current: { offset: number; end: number } | null = null;
-  for (const range of aligned) {
-    if (current !== null && range.offset <= current.end)
-      current.end = Math.max(current.end, range.end);
-    else {
-      if (current !== null)
-        out.push({ offset: current.offset, length: current.end - current.offset });
-      current = { ...range };
-    }
-  }
-  if (current !== null) out.push({ offset: current.offset, length: current.end - current.offset });
-  return out;
-}
-
-// ── The storage track's open walk (storage/extents.ts `ReachableExtents`) ─────────────────────
-
-/** A grant's suballocator (storage/extents.ts `ByteBudget`). */
-export interface WalkBudget {
-  allocate(bytes: number): boolean;
-  free(bytes: number): void;
-}
-
-/** The extent space's reader (storage/extents.ts `ExtentReader`), stated structurally. */
-export interface WalkReader {
-  read(
-    refs: readonly BlobRef[],
-    options: { readonly budget: WalkBudget },
-  ): Promise<{ readonly bytes: readonly Uint8Array[]; release(): void }>;
-}
-
-/** The byte codecs of the metadata the walk descends through (format track, to come). */
+/** The byte codecs of the metadata the walk descends through (format track, Phase 2: R15.3). */
 export interface ManifestCodecs {
   decodeRoot(bytes: Uint8Array): ManifestRoot;
   decodeGroups(bytes: Uint8Array): readonly GroupRef[];
   decodeGroupRoot(bytes: Uint8Array): GroupRoot;
 }
 
+const extentOf = (ref: BlobRef | ExtentRef): ExtentRef => ("extent" in ref ? ref.extent : ref);
+
 /**
- * `reachable` in the shape the extent space opens with: root bytes in, extents out. Metadata
- * blobs are read through the space (verified, cached), each lease charged to `budget` only while
- * it is decoded.
- *
- * Extents, not blobs: a chunk's data extent covers its page directory and sketch, so those are
- * listed only when they lie outside it. Every other blob the manifest names (catalog, group
- * directories, group roots, deletion bitmaps, row-id columns, statistics, index entries, fences,
- * Bloom filters) is taken to be **its own extent**, as `ExtentWriter.write([blob])` produces it:
- * the manifest stores `BlobRef`s only, so the write path must write each such blob alone.
+ * `walkReachable` in the shape the extent space opens with (storage/extents.ts
+ * `ReachableExtents`): root bytes in, blobs and extents out, streamed. Metadata blobs are read
+ * through the space (verified, cached), each lease charged to `budget` only while it is decoded.
+ * A reference in the same extent as the one yielded just before it (a chunk's directory and
+ * sketch, the next chunk of a pack) is not repeated.
  */
 export function reachableExtents(
   codecs: ManifestCodecs,
-): (root: Uint8Array, reader: WalkReader, budget: WalkBudget) => AsyncIterable<ExtentRef> {
+  options: ReachableOptions = {},
+): (
+  root: Uint8Array,
+  reader: ExtentReader,
+  budget: ByteBudget,
+) => AsyncIterable<BlobRef | ExtentRef> {
   return async function* walk(root, reader, budget) {
     const decode = async <T>(ref: BlobRef, decoder: (bytes: Uint8Array) => T): Promise<T> => {
       const lease = await reader.read([ref], { budget });
@@ -215,21 +165,20 @@ export function reachableExtents(
         lease.release();
       }
     };
-    const ranges = await reachable(codecs.decodeRoot(root), {
-      groups: (ref) => decode(ref, (bytes) => codecs.decodeGroups(bytes)),
-      groupRoot: (ref) => decode(ref, (bytes) => codecs.decodeGroupRoot(bytes)),
-    });
-    const seen = new Set<string>();
-    for (const range of ranges) {
-      const inside =
-        range.within !== undefined &&
-        range.offset >= range.within.offset &&
-        range.offset + range.length <= range.within.offset + range.within.length;
-      if (inside) continue;
-      const key = `${String(range.offset)}:${String(range.length)}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      yield { offset: range.offset, length: range.length };
+    const manifest = codecs.decodeRoot(root);
+    let last: ExtentRef | null = null;
+    for await (const { ref } of walkReachable(
+      manifest,
+      {
+        groups: (blob) => decode(blob, (bytes) => codecs.decodeGroups(bytes)),
+        groupRoot: (blob) => decode(blob, (bytes) => codecs.decodeGroupRoot(bytes)),
+      },
+      options,
+    )) {
+      const extent = extentOf(ref);
+      if (last !== null && last.offset === extent.offset && last.length === extent.length) continue;
+      last = extent;
+      yield ref;
     }
   };
 }

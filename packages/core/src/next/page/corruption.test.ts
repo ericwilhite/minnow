@@ -11,6 +11,7 @@ import type { PhysicalType } from "../types.js";
 import { decodeRange, parsePage } from "./decode.js";
 import { PageCorruptionError } from "./format.js";
 import { StoreCorruptionError } from "../storage/contract.js";
+import { blobAddress } from "../storage/extents.js";
 import { targetFor, writeGroup, type TestValue, type Written } from "./test-support.js";
 import { openChunk } from "./test-support.js";
 import { defined } from "./test-support.js";
@@ -126,17 +127,9 @@ beforeAll(async () => {
         ),
       },
     ],
-    { dictionaryEntries: 1, pageBytes: 64 * 1024, gzip: true },
+    { dictionaryEntries: 1, pageBytes: 64 * 1024, gzip: true, space: written.space },
   );
-  const zipChunk = defined(zipped.group.columns[0]);
-  // Copy the gzip chunk into the main space so every page lives in one data space.
-  const offset = Math.ceil(written.space.length / 4096) * 4096 + 4096;
-  await written.space.writeData(offset, zipped.space.bytes.subarray(0, zipped.space.length));
-  const moved: ColumnChunk = {
-    ...zipChunk,
-    data: { offset: zipChunk.data.offset + offset, length: zipChunk.data.length },
-    directory: { ...zipChunk.directory, offset: zipChunk.directory.offset + offset },
-  };
+  const moved = defined(zipped.group.columns[0]);
   pages = [];
   for (const chunk of [...written.group.columns, moved]) {
     const reader = await openChunk(written.space, chunk);
@@ -201,7 +194,8 @@ describe("corruption is refused, never decoded", () => {
     const bytes = written.space.bytes;
     const missed: number[] = [];
     for (const chunk of written.group.columns) {
-      const { offset, length } = chunk.directory;
+      const offset = blobAddress(chunk.directory);
+      const { length } = chunk.directory;
       for (let at = offset; at < offset + length; at++) {
         const original = bytes[at] ?? 0;
         bytes[at] = original ^ 0x01;

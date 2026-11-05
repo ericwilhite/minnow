@@ -470,7 +470,9 @@ export function encodeInt64Page(
     const buffer = scratch.take(start + plainSize);
     header(buffer, PageEncoding.plain, tag, flags, 8, rows, aux);
     writeSections(buffer);
-    new Int32Array(buffer, start, rows * 2).set(words.subarray(0, rows * 2));
+    const out = new Int32Array(buffer, start, rows * 2);
+    out.set(words.subarray(0, rows * 2));
+    zeroInvalidPairs(out, validity, rows);
     return finish(buffer, start + plainSize, PageEncoding.plain, rows, nulls, min, max);
   }
   if (forSize <= deltaSize) {
@@ -506,6 +508,19 @@ export function encodeInt64Page(
     narrowInto(buffer, start + 8 + blocks * 8, dWidth, deltas, rows);
   }
   return finish(buffer, start + deltaSize, PageEncoding.frameOfReference, rows, nulls, min, max);
+}
+
+/**
+ * Null slots of a plain int64 page hold 0, not the input's garbage: a page flagged `safe` then
+ * holds only safe values, which the decoder rechecks (decode.ts `checkSafe`).
+ */
+function zeroInvalidPairs(words: Int32Array, validity: Uint32Array | null, rows: number): void {
+  if (validity === null) return;
+  for (let row = 0; row < rows; row++)
+    if (!isValidAt(validity, row)) {
+      words[row * 2] = 0;
+      words[row * 2 + 1] = 0;
+    }
 }
 
 function hasNonZero(bytes: Uint8Array, rows: number): boolean {
@@ -601,9 +616,18 @@ export function hashInt128(limbs: Uint32Array, row: number): number {
 // ---------------------------------------------------------------------------------------------
 // floats
 
-function floatStats(min: number, max: number, sawNaN: boolean): [number, number] {
-  if (sawNaN) return [min === Infinity ? Number.NaN : min, Number.NaN];
-  return [min, max];
+/**
+ * Bounds in PostgreSQL's float order (NaN above +Infinity): min and max over the non-NaN values;
+ * max is NaN when any NaN is present; both are NaN only when no non-NaN value is.
+ */
+function floatStats(
+  min: number,
+  max: number,
+  sawNaN: boolean,
+  sawNumber: boolean,
+): [number, number] {
+  if (!sawNumber) return [Number.NaN, Number.NaN];
+  return [min, sawNaN ? Number.NaN : max];
 }
 
 /** float64 (`width` 8) or float32 (`width` 4): plain, or constant when every value is equal. */
@@ -621,6 +645,7 @@ export function encodeFloatPage(
   let min = Infinity;
   let max = -Infinity;
   let sawNaN = false;
+  let sawNumber = false;
   let constant = true;
   let first: number | null = null;
   for (let row = 0; row < rows; row++) {
@@ -633,13 +658,14 @@ export function encodeFloatPage(
     else if (constant && !Object.is(first, value)) constant = false;
     if (value !== value) sawNaN = true;
     else {
+      sawNumber = true;
       if (value < min) min = value;
       if (value > max) max = value;
     }
     sketch.add(hashFloat(value));
   }
   if (nulls === rows || first === null) return allNullPage(scratch, tag, rows);
-  const [low, high] = floatStats(min, max, sawNaN);
+  const [low, high] = floatStats(min, max, sawNaN, sawNumber);
   const flags = validityFlags(rows, nulls);
   const start = sectionStart(rows, nulls);
   if (constant) {
@@ -760,7 +786,9 @@ export function encodeIntervalPage(
   writeValidity(buffer, PAGE_HEADER_BYTES, validity, rows, nulls);
   new Int32Array(buffer, start, rows).set(months.subarray(0, rows));
   new Int32Array(buffer, start + lane, rows).set(days.subarray(0, rows));
-  new Int32Array(buffer, start + lane * 2, rows * 2).set(micros.subarray(0, rows * 2));
+  const microsOut = new Int32Array(buffer, start + lane * 2, rows * 2);
+  microsOut.set(micros.subarray(0, rows * 2));
+  zeroInvalidPairs(microsOut, validity, rows);
   return finish(buffer, start + lane * 2 + rows * 8, PageEncoding.plain, rows, nulls, null, null);
 }
 

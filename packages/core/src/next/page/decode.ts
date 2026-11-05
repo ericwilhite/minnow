@@ -24,6 +24,7 @@ import {
   align8,
   check,
   DELTA_BLOCK,
+  PageCorruptionError,
   LITTLE_ENDIAN,
   PAGE_HEADER_BYTES,
   PageFlag,
@@ -50,6 +51,8 @@ export interface PageView {
   readonly validity: Uint32Array | null;
   readonly allNull: boolean;
   readonly safe: boolean;
+  /** `safe` is proven by the header alone (a bound on every value), so decoding skips the recheck. */
+  readonly boundSafe: boolean;
   readonly specials: Uint8Array | null;
   /** Decimals: the scale of every row (fixed chunk, or a mixed chunk's uniform page). */
   readonly scale: number;
@@ -301,6 +304,7 @@ export function parsePage(
   }
   check(bytes.length === length, "Page length differs from its contents");
   const baseNumber = baseHigh * 4_294_967_296 + (baseLow >>> 0);
+  const boundSafe = safe && headerBoundsSafe(kind, width, baseNumber, checkpoints, rows);
   return {
     bytes,
     kind,
@@ -313,6 +317,7 @@ export function parsePage(
     validity,
     allNull,
     safe,
+    boundSafe,
     specials,
     scale: uniformScale ? aux : (chunkScale ?? 0),
     scales,
@@ -325,6 +330,32 @@ export function parsePage(
     plain,
     data,
   };
+}
+
+/**
+ * Whether the header alone bounds every value of an int64-family page within ±(2^53 − 1):
+ * constant (the value), FOR (base … base + 2^(8w) − 1), delta (each checkpoint ± 127 steps of at
+ * most |base| + 2^(8w) − 1). Plain pages are rechecked value by value instead.
+ */
+function headerBoundsSafe(
+  kind: number,
+  width: number,
+  base: number,
+  checkpoints: Int32Array | null,
+  rows: number,
+): boolean {
+  const span = width === 0 ? 0 : 2 ** (8 * width) - 1;
+  if (kind === PageEncoding.constant) return Math.abs(base) <= Number.MAX_SAFE_INTEGER;
+  if (kind !== PageEncoding.frameOfReference) return false;
+  if (checkpoints === null)
+    return base >= -Number.MAX_SAFE_INTEGER && base + span <= Number.MAX_SAFE_INTEGER;
+  let largest = 0;
+  for (let block = 0; block * DELTA_BLOCK < rows; block++) {
+    const value =
+      (checkpoints[block * 2 + 1] ?? 0) * 4_294_967_296 + ((checkpoints[block * 2] ?? 0) >>> 0);
+    largest = Math.max(largest, Math.abs(value));
+  }
+  return largest + (DELTA_BLOCK - 1) * (Math.abs(base) + span) <= Number.MAX_SAFE_INTEGER;
 }
 
 function unsignedView(
@@ -1063,6 +1094,7 @@ function decodeValues(
       expectTag(tag, ValueTag.i64);
       if (rows === null) decodeInt64(view, from, to, data.values, at);
       else gatherInt64(view, rows, 0, count, base0, data.values, at);
+      checkSafe(view, data.values, at, count);
       return;
     case "f64":
     case "f32": {
@@ -1118,6 +1150,7 @@ function decodeValues(
         throw new RangeError("A 128-bit coefficient page needs an int128 target");
       if (rows === null) decodeInt64(view, from, to, coefficients, at);
       else gatherInt64(view, rows, 0, count, base0, coefficients, at);
+      checkSafe(view, coefficients, at, count);
       return;
     }
   }
@@ -1148,6 +1181,31 @@ function decodeScales(
   if (source === null) scales.fill(view.allNull ? 0 : view.scale, at, at + count);
   else if (rows === null) scales.set(source.subarray(from, to), at);
   else for (let k = 0; k < count; k++) scales[at + k] = source[(rows[k] ?? 0) - base0] ?? 0;
+}
+
+const MAX_SAFE = Number.MAX_SAFE_INTEGER;
+
+/**
+ * A page flagged `safe` decoded into the f64 representation is rechecked: every slot must lie in
+ * ±(2^53 − 1) (null slots hold 0, encode.ts). A wrong flag is corruption, never a silent rounding:
+ * a value past 2^53 rounds to a double of magnitude ≥ 2^53, which this rejects.
+ */
+function checkSafe(view: PageView, values: Int64Values, at: number, count: number): void {
+  if (values.repr !== "safe" || view.allNull || view.boundSafe) return;
+  if (!allSafe(values.values, at, at + count))
+    throw new PageCorruptionError("A page flagged safe holds a value beyond ±(2^53 − 1)");
+}
+
+/** One monomorphic pass: min and max, compared once at the end. */
+function allSafe(out: Float64Array, start: number, end: number): boolean {
+  let low = 0;
+  let high = 0;
+  for (let k = start; k < end; k++) {
+    const value = out[k] ?? 0;
+    low = value < low ? value : low;
+    high = value > high ? value : high;
+  }
+  return high <= MAX_SAFE && low >= -MAX_SAFE;
 }
 
 function expectTag(actual: number, expected: number): void {
@@ -1192,6 +1250,7 @@ function decodeInterval(
       microWords[(at + k) * 2 + 1] = high;
     } else (micros.values as Float64Array)[at + k] = high * TWO32 + (low >>> 0);
   }
+  checkSafe(view, micros, at, count);
 }
 
 /**

@@ -65,20 +65,46 @@ export async function gzipPage(page: Uint8Array): Promise<Uint8Array | null> {
   return out;
 }
 
-/** Inflates a stored gzip page into a fresh (8-aligned) buffer of exactly its raw length. */
-export async function inflatePage(stored: Uint8Array): Promise<Uint8Array> {
+/** The raw (inflated) length a stored gzip page records; checked, so it can be charged first. */
+export function inflatedLength(stored: Uint8Array): number {
   if (stored.length < 4) throw new PageCorruptionError("gzip page is shorter than its header");
   const length = new DataView(stored.buffer, stored.byteOffset, 4).getUint32(0, true);
-  if (length > GZIP_MAX_PAGE_BYTES)
+  if (length > GZIP_MAX_PAGE_BYTES || length < 16)
     throw new PageCorruptionError("gzip page records an impossible length");
-  let raw: Uint8Array;
+  return length;
+}
+
+/**
+ * Inflates a stored gzip page into `target` (exactly `inflatedLength(stored)` bytes, allocated
+ * and charged by the caller), copying each decompressed chunk straight in: nothing else is
+ * retained. A stream that ends short or runs long is `PageCorruptionError`.
+ */
+export async function inflateInto(stored: Uint8Array, target: Uint8Array): Promise<void> {
+  if (target.length !== inflatedLength(stored))
+    throw new RangeError("Inflate target has the wrong length");
+  const reader = pipe(stored.subarray(4), new DecompressionStream("gzip")).getReader();
+  let at = 0;
   try {
-    raw = await drain(pipe(stored.subarray(4), new DecompressionStream("gzip")), length);
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (at + value.length > target.length) {
+        await reader.cancel();
+        throw new PageCorruptionError("gzip page inflates past its recorded length");
+      }
+      target.set(value, at);
+      at += value.length;
+    }
   } catch (error) {
     if (error instanceof PageCorruptionError) throw error;
     throw new PageCorruptionError(`gzip page does not inflate: ${String(error)}`);
   }
-  if (raw.length !== length)
-    throw new PageCorruptionError("gzip page inflates to the wrong length");
-  return raw;
+  if (at !== target.length) throw new PageCorruptionError("gzip page inflates to the wrong length");
+}
+
+/** Inflates into a fresh buffer (tests and tools; readers use `inflateInto` with a charge). */
+export async function inflatePage(stored: Uint8Array): Promise<Uint8Array> {
+  const target = new Uint8Array(inflatedLength(stored));
+  await inflateInto(stored, target);
+  return target;
 }

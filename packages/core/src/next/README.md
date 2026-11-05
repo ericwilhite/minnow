@@ -200,33 +200,43 @@ is access's `Snapshot`.
 
 ### Pages (`page/`)
 
-- A column chunk is `[pages][dictionary page][directory]` in one extent. The directory (a
-  `BlobRef` inside the extent) lists every page's rows, encoding, null count, min/max and
-  xxHash32, plus the chunk's distinct sketch, so pruning and planning never read pages.
+- A column chunk is `[pages][dictionary page][directory]` in one extent; each is one blob of at
+  most 1 MiB, and its `BlobRef` carries the extent (R15.1). The directory lists every page's
+  rows, encoding, null count, min/max and checksum, plus the chunk's distinct sketch (a range of
+  the directory blob), so pruning and planning never read pages.
 - Encodings (`encode.ts` has the selection rules): constant (and all-null), plain, bool bitmap,
   frame of reference at u8/u16/u32 over an int64 base, delta (FOR over successive differences,
   a checkpoint every 128 rows), and dictionary codes (u8/u16/u32, or one code) into a
-  group-scoped dictionary. gzip is an opt-in second stage for varlen and uuid pages ≥ 16 KiB,
-  kept only at ≥ 2×; off by default, because the space caches encoded blobs and a gzip page
-  inflates on every load.
-- Every page, dictionary page and directory is one blob of at most 1 MiB. A single value too
-  large for a page is `UnsupportedPageLayoutError` (a large-value layout is still to come).
+  group-scoped dictionary.
 - NUMERIC: a declared scale makes a fixed-scale chunk; an unconstrained NUMERIC keeps each
-  value's scale (a per-row section, or one scale per page). Coefficients are stored in the int64
-  rules when they fit, else as 128-bit limbs. Past 128 bits: `UnsupportedPageLayoutError`.
-- `ChunkReader` is the executor's `ChunkPages`: it opens over the extent space's reader (`read`
-  with a lease, `peek` for cache hits). The space verifies each blob's checksum once, on its way
-  in from storage; the reader parses (structural checks) when it loads a page, and a loaded page
-  decodes with no checks. `open`, `load` and `loadDictionary` are synchronous when everything
-  they need is cached. Every byte a loaded page holds is charged to the reader's budget until
-  `release` or `close`. Reads go out in calls of at most 4 MiB.
+  value's scale (a per-row section, or one scale per page), and its min/max are normalized sort
+  keys (value order, scale ignored, R15.10). Coefficients are stored by the int64 rules when they
+  fit, else as 128-bit limbs. Past 128 bits, and a single value too large for one page, is
+  `UnsupportedPageLayoutError` (large values: Phase 2, R15.4).
+- Floats: min/max follow PostgreSQL's order (NaN above +Infinity): max is NaN when any NaN is
+  present, both are NaN only when no other value is.
+- gzip is a second stage only maintenance compaction applies (writer option `gzip`; never a
+  memtable flush), to varlen and uuid pages ≥ 16 KiB that halve. Readers keep gzip pages inflated
+  in the `InflatedPageCache` (charged at inflated size, evictable when unpinned), so a page
+  inflates once per cache residency and a cached one loads synchronously (R15.5).
+- `GroupWriter` writes through the caller's `ExtentWriter` (R15.2): small chunks are packed into
+  one shared extent at `finish`; a larger chunk opens an `ExtentBuilder` sized from its bytes per
+  row, appends each page as it is encoded and calls `extend` when it runs short. Memory per
+  column is about one raw page (32 KiB) plus its sketch and small-chunk pages; dictionaries are
+  bounded and charged apart. Everything is charged before it is allocated (a 200-column text
+  group peaks at about 10.6 MB without dictionaries).
+- `ChunkReader` is the executor's `ChunkPages` over the space's `ExtentReader`. The space
+  verifies each blob's checksum once; the reader parses (structural checks) when it loads a page.
+  `open`, `load` and `loadDictionary` are synchronous when everything is cached. Concurrent loads
+  of a page share one read; `close` is final, and loads still in flight reject with
+  `ReaderClosedError` after giving back what they read. Every byte held (pages, inflated pages,
+  the parsed directory) is charged to the reader's budget until `release` or `close`.
 - Decoders write into caller-owned vector buffers, with no JS strings and no per-value
-  allocation: by range, by selection (late materialization), or as dictionary codes.
-- The writer streams pages into extents from an `ExtentAllocator` (the write path's free-space
-  map): small chunks share one packed extent, large ones get their own and are relocated if they
-  outgrow it. Every buffer it holds is charged to its grant.
-- `memory-extents.ts` is the in-memory data space and allocator for tests and benchmarks;
-  `scripts/page-format-bench.mts` measures the codecs against today's block format.
+  allocation: by range, by selection (late materialization), or as dictionary codes. A page
+  flagged `safe` is rechecked when decoded into f64 unless its header bounds every value.
+- `memory-extents.ts` is an in-memory extent space (writer, builder with `extend`, verified and
+  cached reads) for tests and benchmarks; `scripts/page-format-bench.mts` measures the codecs
+  against today's block format.
 
 ### Manifest (`format/manifest.ts`)
 
@@ -242,10 +252,11 @@ is access's `Snapshot`.
   current and previous roots) → open the write path (a single log scan and replay, `publishedRows`
   staging included) → spill sweep → ready.
 - Snapshot pins live in memory and are dropped when their client's lock is released.
-- `reachable(root, reader)` lists every range a root references (catalog, table statistics,
-  group directories including staged ones, group roots, deletion bitmaps, row-id columns, chunk
-  extents, page directories, sketches, index entries, fences and Bloom filters); `occupied`
-  merges them into aligned free-space units. A failed metadata read rejects the walk.
+- `walkReachable(root, reader)` streams every reference a root reaches (catalog, table
+  statistics, group directories, staged transactions' group directories and index runs, group
+  roots, deletion bitmaps, row-id columns, chunk extents, page directories, sketches, index
+  entries, fences and Bloom filters); `reachableExtents(codecs)` is the extent space's
+  `ReachableExtents` over it. A failed metadata read rejects the walk.
 
 ### Storage access (`access/`)
 

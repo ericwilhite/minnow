@@ -17,7 +17,8 @@
  * | sketch (flag 2): length, bytes | u32 + bytes |
  *
  * Statistic values: bool u8; int32 i32; int64 i64; decimal i128 (coefficient at the chunk's
- * scale; mixed-scale chunks have none); float64 and float32 f64; text, bytes and uuid u16 length + bytes (byte order, possibly
+ * scale; a mixed-scale chunk stores u16 length + its sort key, keys/key-encoding.ts, so bounds
+ * compare by value whatever the scales, ruling R15.10); float64 and float32 f64; text, bytes and uuid u16 length + bytes (byte order, possibly
  * truncated, `ByteBounds` in encode.ts). Interval has none.
  *
  * The directory is a `BlobRef` with its own checksum; `parseDirectory` additionally checks that
@@ -167,6 +168,11 @@ class Reader {
 }
 
 function writeStat(writer: Writer, tag: number, value: StatValue): void {
+  if (value instanceof Uint8Array) {
+    writer.u16(value.length);
+    writer.raw(value);
+    return;
+  }
   switch (tag) {
     case ValueTag.bool:
       writer.u8(value === true ? 1 : 0);
@@ -184,15 +190,14 @@ function writeStat(writer: Writer, tag: number, value: StatValue): void {
     case ValueTag.f32:
       writer.f64(value as number);
       return;
-    default: {
-      const bytes = value as Uint8Array;
-      writer.u16(bytes.length);
-      writer.raw(bytes);
-    }
+    default:
+      throw new RangeError("A byte statistic must be a Uint8Array");
   }
 }
 
-function readStat(reader: Reader, tag: number): StatValue {
+/** `bytes`: the chunk keeps byte bounds (varlen, uuid, mixed-scale decimal sort keys). */
+function readStat(reader: Reader, tag: number, bytes: boolean): StatValue {
+  if (bytes) return reader.raw(reader.u16());
   switch (tag) {
     case ValueTag.bool: {
       const value = reader.u8();
@@ -292,6 +297,10 @@ export function parseDirectory(bytes: Uint8Array, extentLength: number): ChunkDi
   check(stored === 0 || tag === ValueTag.dec64, "Scale outside a decimal chunk");
   check(stored === MIXED_SCALE || stored <= NUMERIC_MAX_SCALE, "Decimal scale out of range");
   const scale = stored === MIXED_SCALE ? null : stored;
+  const byteStats =
+    tag === ValueTag.varlen ||
+    tag === ValueTag.fixed16 ||
+    (tag === ValueTag.dec64 && scale === null);
   const inExtent = (offset: number, length: number): void =>
     check(length > 0 && offset + length <= extentLength, "Page outside its chunk's extent");
   let dictionary: PageEntry | null = null;
@@ -341,8 +350,8 @@ export function parseDirectory(bytes: Uint8Array, extentLength: number): ChunkDi
     )
       check(dictionary !== null, "Dictionary page without a dictionary");
     inExtent(offset, length);
-    const min = (statFlags & 1) !== 0 ? readStat(reader, tag) : null;
-    const max = (statFlags & 2) !== 0 ? readStat(reader, tag) : null;
+    const min = (statFlags & 1) !== 0 ? readStat(reader, tag, byteStats) : null;
+    const max = (statFlags & 2) !== 0 ? readStat(reader, tag, byteStats) : null;
     pages.push({
       offset,
       length,

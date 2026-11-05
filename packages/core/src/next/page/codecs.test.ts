@@ -10,7 +10,8 @@ import {
   TIMESTAMP_POS_INFINITY,
 } from "../temporal.js";
 import { INT32_MAX, INT32_MIN, INT64_MAX, INT64_MIN, type PhysicalType } from "../types.js";
-import { ChunkReader, MAX_BLOB_BYTES, MAX_READ_BYTES, PageBudgetError } from "./reader.js";
+import { ChunkReader, directoryCharge, MAX_BLOB_BYTES, MAX_READ_BYTES } from "./reader.js";
+import { ReadDeniedError } from "../storage/extents.js";
 import { DistinctSketch, mix32 } from "./sketch.js";
 import {
   readChunk,
@@ -25,7 +26,7 @@ import { openChunk, UNLIMITED } from "./test-support.js";
 import { defined } from "./test-support.js";
 import { DELTA_BLOCK, UnsupportedPageLayoutError } from "./format.js";
 import { GroupWriter } from "./writer.js";
-import { MemoryDataSpace, MemoryExtentAllocator, MemorySpace } from "./memory-extents.js";
+import { MemoryExtentSpace } from "./memory-extents.js";
 import { vectorOf } from "./test-support.js";
 
 const SEEDS = seedsFor("next-page-codecs", [0x9a6e, 0x51]);
@@ -49,7 +50,7 @@ const TAGS = [
 ];
 const KINDS = ["", "plain", "constant", "bitmap", "for", "dictionary"];
 function recordReach(
-  space: MemoryDataSpace,
+  space: MemoryExtentSpace,
   offset: number,
   pages: ReadonlyArray<{ offset: number; encoding: number }>,
 ): void {
@@ -687,8 +688,7 @@ describe("page writer contract", () => {
     const open = (column: PhysicalType): GroupWriter =>
       new GroupWriter({
         columns: [{ columnId: 1, type: column }],
-        store: new MemoryDataSpace(),
-        allocator: new MemoryExtentAllocator(),
+        writer: new MemoryExtentSpace().beginWrite("test"),
       });
     const vector = vectorOf(type, [{ coefficient: 15n, special: 0 }], { scale: 2 });
     const huge = {
@@ -707,11 +707,10 @@ describe("page writer contract", () => {
 
   it("stores a uniform-scale batch of an unconstrained NUMERIC as one page scale", async () => {
     const type: PhysicalType = { kind: "decimal", precision: null, scale: null };
-    const space = new MemoryDataSpace();
+    const space = new MemoryExtentSpace();
     const writer = new GroupWriter({
       columns: [{ columnId: 1, type }],
-      store: space,
-      allocator: new MemoryExtentAllocator(),
+      writer: space.beginWrite("test"),
     });
     const values = Array.from({ length: 100 }, (_, row) => ({
       coefficient: BigInt(row) * 7n,
@@ -721,17 +720,14 @@ describe("page writer contract", () => {
     const group = await writer.finish();
     const read = await readChunk(space, defined(group.columns[0]));
     expect(read).toEqual(values.map((value) => ({ ...value, scale: 4 })));
-    expect(defined(group.columns[0]).statistics.min).toBeNull();
   });
 
   it("splits groups at maxRows and frees every extent on abort", async () => {
-    const space = new MemoryDataSpace();
-    const allocator = new MemoryExtentAllocator();
+    const space = new MemoryExtentSpace();
     const type: PhysicalType = { kind: "int64" };
     const writer = new GroupWriter({
       columns: [{ columnId: 1, type }],
-      store: space,
-      allocator,
+      writer: space.beginWrite("test"),
       maxRows: 1000,
       inlineBytes: 0,
     });
@@ -739,22 +735,20 @@ describe("page writer contract", () => {
     expect(await writer.append([vectorOf(type, values)], 1500)).toBe(1000);
     expect(await writer.append([vectorOf(type, values)], 1500)).toBe(0);
     await writer.abort();
-    expect(allocator.reserved).toBe(0);
+    expect(space.allocator.reserved).toBe(0);
   });
 
   it("relocates a chunk that outgrows its reservation and trims every extent", async () => {
-    const space = new MemoryDataSpace();
-    const allocator = new MemoryExtentAllocator();
+    const space = new MemoryExtentSpace();
     const type: PhysicalType = { kind: "text" };
     const writer = new GroupWriter({
       columns: [
         { columnId: 1, type },
         { columnId: 2, type },
       ],
-      store: space,
-      allocator,
+      writer: space.beginWrite("test"),
       inlineBytes: 0,
-      slabBytes: 4096,
+      maxRows: 3000,
       dictionaryEntries: 1,
     });
     const values: TestValue[] = [];
@@ -773,7 +767,8 @@ describe("page writer contract", () => {
       (sum, extent) => sum + Math.ceil(extent.length / 4096) * 4096,
       0,
     );
-    expect(allocator.reserved).toBe(used);
+    expect(space.allocator.reserved).toBe(used);
+    expect(space.relocations).toBeGreaterThan(0);
     for (const chunk of group.columns) {
       const read = await readChunk(space, chunk);
       expect(read.every((value, row) => sameValue(value, values[row] ?? null))).toBe(true);
@@ -784,11 +779,10 @@ describe("page writer contract", () => {
     const type: PhysicalType = { kind: "text" };
     const dictionary = vectorOf(type, [encoder.encode("a"), encoder.encode("bb")]);
     const codes = Int32Array.of(1, 0, 1, 1);
-    const space = new MemoryDataSpace();
+    const space = new MemoryExtentSpace();
     const writer = new GroupWriter({
       columns: [{ columnId: 1, type }],
-      store: space,
-      allocator: new MemoryExtentAllocator(),
+      writer: space.beginWrite("test"),
     });
     await writer.append(
       [{ form: "dictionary", type, length: 4, codes, validity: null, dictionary, dictionaryId: 1 }],
@@ -901,8 +895,9 @@ describe("page and chunk statistics", () => {
     ] as const) {
       const ref = defined(chunk).distinctSketch;
       if (ref === null) throw new Error("no sketch");
-      const [bytes] = await space.readData([ref]);
-      const estimate = DistinctSketch.parse(defined(bytes)).estimate();
+      const lease = await space.read([ref], { budget: UNLIMITED });
+      const estimate = DistinctSketch.parse(defined(lease.bytes[0])).estimate();
+      lease.release();
       expect(Math.abs(estimate - distinct) / distinct).toBeLessThan(0.1);
     }
   });
@@ -965,7 +960,7 @@ describe("chunk reader over the extent space", () => {
       pageBytes: 1024,
     });
     const chunk = defined(group.columns[0]);
-    const space = new MemorySpace(data);
+    const space = data.view({});
     const cold = tracked();
     const opening = ChunkReader.open(space, chunk, { budget: cold });
     expect(opening).toBeInstanceOf(Promise);
@@ -985,7 +980,8 @@ describe("chunk reader over the extent space", () => {
     expect(second.load(all)).toBeUndefined();
     expect(second.loadDictionary()).toBe(second.dictionary);
     const stored = second.directory.pages.reduce((sum, page) => sum + page.length, 0);
-    expect(warm.held).toBe(stored + (second.directory.dictionary?.length ?? 0));
+    const directory = directoryCharge(second.directory);
+    expect(warm.held).toBe(directory + stored + (second.directory.dictionary?.length ?? 0));
     const codes = new Int32Array(values.length);
     second.decodeCodes(0, values.length, codes, null, 0);
     const dictionary = defined(second.dictionary ?? undefined);
@@ -994,7 +990,8 @@ describe("chunk reader over the extent space", () => {
     ).toBe(true);
     second.release([0]);
     expect(warm.held).toBe(
-      stored +
+      directory +
+        stored +
         (second.directory.dictionary?.length ?? 0) -
         defined(second.directory.pages[0]).length,
     );
@@ -1015,7 +1012,7 @@ describe("chunk reader over the extent space", () => {
       gzip: false,
     });
     const chunk = defined(group.columns[0]);
-    const space = new MemorySpace(data, { cache: false });
+    const space = data.view({ cache: false });
     const reader = await ChunkReader.open(space, chunk, { budget: UNLIMITED });
     const all = Array.from({ length: reader.directory.pages.length }, (_, page) => page);
     const total = reader.directory.pages.reduce((sum, page) => sum + page.length, 0);
@@ -1028,11 +1025,11 @@ describe("chunk reader over the extent space", () => {
     reader.close();
     expect(space.leased).toBe(0);
 
-    // A budget that admits the directory read, then refuses.
-    let admitted = 1;
+    // A budget that admits the directory read and its parsed charge, then refuses.
+    let admitted = 2;
     const refusing = { allocate: (): boolean => admitted-- > 0, free: (): void => undefined };
     const strict = await ChunkReader.open(space, chunk, { budget: refusing });
-    await expect(strict.load([0])).rejects.toBeInstanceOf(PageBudgetError);
+    await expect(strict.load([0])).rejects.toBeInstanceOf(ReadDeniedError);
     expect(strict.isLoaded(0)).toBe(false);
     expect(space.leased).toBe(0);
   });

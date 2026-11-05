@@ -1,31 +1,41 @@
 /**
  * Reads one column chunk: its directory, then only the pages a row range or a selection needs.
  * This is the executor's `ChunkPages` (exec/scan.ts, ruling R14.4), opened over the extent
- * space's reader (`PageSpace`: `read` with a lease, `peek` for cache hits).
+ * space's reader (storage/extents.ts `ExtentReader`: `read` with a lease, `peek` for hits).
  *
  * - **Verify once.** The space checks every blob's xxHash32 when its bytes come from storage and
  *   caches verified encoded blobs; the reader does not hash again. It parses each page (the
  *   structural checks of decode.ts) when it loads it; a loaded page decodes with no checks.
- * - **Synchronous when cached (ruling R6).** `open`, `load` and `loadDictionary` return a value,
- *   not a Promise, when every blob they need is resident (`peek`) and needs no inflating; they
- *   go through `read` otherwise.
- * - **Memory.** Every byte a loaded page holds is charged to the `budget` given to `open`: leased
- *   bytes by the space itself, peeked and inflated bytes by the reader, until `release` (or
- *   `close`, which also drops the dictionary). A refused charge on the read path is the space's
- *   `ReadDeniedError` (borrow a loan, retry); on the reader's own charges it is `PageBudgetError`.
- *   Directories are parsed to O(pages) objects, not held as bytes.
- * - **Only what is needed.** `pagesInRange` and `pagesForRows` name the pages; `load` reads just
- *   those, ascending (the space coalesces neighbours), in calls of at most `MAX_READ_BYTES`, plus
- *   the dictionary page when one of them is dictionary-encoded.
+ * - **Synchronous when cached (rulings R6, R14.4).** `open`, `load` and `loadDictionary` return
+ *   a value, not a Promise, when every blob they need is resident: `peek` for stored pages, the
+ *   inflated-page cache (`options.inflated`, R15.5) for gzip pages.
+ * - **One load per page.** Concurrent `load`s of the same page (or of the dictionary) share one
+ *   read: a page is in flight at most once, so no lease or charge is taken twice.
+ * - **Memory.** Every byte the reader holds is charged to `options.budget`: leased bytes by the
+ *   space, peeked and inflated bytes by the reader (inflated pages before they are allocated),
+ *   and the parsed directory at `open`. All of it is returned by `release` (pages) and `close`.
+ *   A refused charge of the reader's own is `PageBudgetError(bytes)`; the space's is
+ *   `ReadDeniedError`. Either way nothing is held.
+ * - **close.** `close` releases everything at once. A load still in flight then completes by
+ *   releasing what it read and rejecting with `ReaderClosedError`; it installs nothing.
+ * - **Only what is needed.** `load` reads just the named pages, ascending, in calls of at most
+ *   `MAX_READ_BYTES`, plus the dictionary page when one of them is dictionary-encoded.
  * - **Late materialization.** `gather` decodes only the selected rows: plain and dictionary pages
  *   index directly, FOR pages too, delta pages walk at most one 128-row block per run of
  *   selected rows. `gatherCodes` does the same for dictionary codes.
  *
  * Decoding is synchronous over loaded pages; every target buffer is the caller's.
  */
-import type { BlobRef, ColumnChunk, PageEntry } from "../format/manifest.js";
+import type { ColumnChunk, PageEntry } from "../format/manifest.js";
 import { PageEncoding } from "../format/manifest.js";
-import type { ByteCharge } from "../vector/varlen.js";
+import {
+  MAX_BLOB_BYTES,
+  MAX_READ_BYTES,
+  type BlobRef,
+  type ByteBudget,
+  type ExtentReader,
+  type ReadLease,
+} from "../storage/extents.js";
 import type { FlatVector, Validity } from "../vector/vector.js";
 import { provenSafe } from "../vector/int64.js";
 import {
@@ -42,50 +52,43 @@ import {
 } from "./decode.js";
 import { pageIndexOf, parseDirectory, type ChunkDirectory } from "./directory.js";
 import { check, chunkTagOf, PageCorruptionError, ValueTag } from "./format.js";
-import { inflatePage } from "./gzip.js";
+import { inflatedLength, inflateInto } from "./gzip.js";
+import type { InflatedPageCache } from "./inflated-cache.js";
+
+export { MAX_BLOB_BYTES, MAX_READ_BYTES };
 
 type Rows = Uint16Array | Uint32Array | Int32Array;
 export type MaybePromise<T> = T | Promise<T>;
 
-/** Every blob is at most this (storage ruling R8); pages and directories are blobs. */
-export const MAX_BLOB_BYTES = 1024 * 1024;
-/** The most bytes one `PageSpace.read` call may ask for (storage ruling R8). */
-export const MAX_READ_BYTES = 4 * MAX_BLOB_BYTES;
-
-/** A grant's suballocator (memory/governor.ts `Grant`; the space's `ByteBudget`). */
-export type PageBudget = ByteCharge;
-
-/** A lease on verified blobs (storage/extents.ts `ReadLease`). */
-export interface PageLease {
-  readonly bytes: readonly Uint8Array[];
-  release(): void;
-}
-
-/**
- * The extent space's reader (storage/extents.ts `ExtentReader`, access/space.ts `SpaceReader`),
- * stated structurally: those modules are not on the contracts branch yet.
- */
-export interface PageSpace {
-  read(
-    refs: readonly BlobRef[],
-    options: { readonly budget: PageBudget; readonly signal?: AbortSignal },
-  ): Promise<PageLease>;
-  peek(ref: BlobRef): Uint8Array | null;
-}
-
 export interface ChunkReadOptions {
   /** Charged for every byte the reader holds (ruling R5). */
-  readonly budget: PageBudget;
+  readonly budget: ByteBudget;
   readonly signal?: AbortSignal;
+  /** Where gzip pages stay inflated across loads and readers (R15.5); without it they inflate per load. */
+  readonly inflated?: InflatedPageCache;
 }
 
-/** The reader could not charge bytes it must hold (a peeked or inflated page). */
+/** The reader could not charge bytes it must hold (a peeked, inflated or parsed structure). */
 export class PageBudgetError extends Error {
   readonly code = "MINNOW_PAGE_BUDGET";
   constructor(readonly bytes: number) {
-    super(`Loading pages needs ${String(bytes)} bytes the budget does not have`);
+    super(`The chunk reader needs ${String(bytes)} bytes the budget does not have`);
     this.name = "PageBudgetError";
   }
+}
+
+/** A load that was still in flight when its reader was closed. */
+export class ReaderClosedError extends Error {
+  readonly code = "MINNOW_READER_CLOSED";
+  constructor() {
+    super("The chunk reader was closed");
+    this.name = "ReaderClosedError";
+  }
+}
+
+/** Bytes charged for a parsed directory: one entry object (with its statistics) per page. */
+export function directoryCharge(directory: ChunkDirectory): number {
+  return 256 + (directory.pages.length + (directory.dictionary === null ? 0 : 1)) * 192;
 }
 
 /** `value`, or a `RangeError` (an index the caller just validated). */
@@ -99,18 +102,20 @@ const isDictionary = (entry: PageEntry): boolean =>
   (entry.encoding & 0x7f) === PageEncoding.dictionary;
 const isGzip = (entry: PageEntry): boolean => (entry.encoding & PageEncoding.gzip) !== 0;
 
-/** One loaded page or dictionary: its parsed view and what keeps its bytes alive. */
+/** What keeps one loaded page's (or the dictionary's) bytes alive, and what to give back. */
 interface Held {
-  /** Bytes the reader itself charged (peeked or inflated). */
+  /** Bytes the reader charged to its budget (peeked or inflated). */
   readonly charged: number;
   /** The lease its stored bytes came in, shared with the other pages of that read. */
   readonly lease: SharedLease | null;
+  /** The inflated-page cache entry it pins. */
+  readonly inflated: BlobRef | null;
 }
 
 class SharedLease {
   #holders: number;
   constructor(
-    readonly lease: PageLease,
+    readonly lease: ReadLease,
     holders: number,
   ) {
     this.#holders = holders;
@@ -122,7 +127,8 @@ class SharedLease {
 
 function blobOf(chunk: ColumnChunk, entry: PageEntry): BlobRef {
   return {
-    offset: chunk.data.offset + entry.offset,
+    extent: chunk.data,
+    offset: entry.offset,
     length: entry.length,
     checksum: entry.checksum,
   };
@@ -134,34 +140,42 @@ function sized(bytes: Uint8Array | undefined, length: number): Uint8Array {
   return bytes;
 }
 
+const noop = (): void => undefined;
+
 export class ChunkReader {
   readonly chunk: ColumnChunk;
   readonly directory: ChunkDirectory;
-  readonly #space: PageSpace;
+  readonly #space: ExtentReader;
   readonly #options: ChunkReadOptions;
   readonly #pages: Array<PageView | undefined>;
   readonly #held: Array<Held | undefined>;
+  readonly #pending = new Map<number, Promise<void>>();
+  readonly #directoryCharge: number;
+  #dictionaryPending: Promise<void> | null = null;
   #dictionary: PageDictionary | null = null;
   #dictionaryHeld: Held | null = null;
   #dictionaryVector: FlatVector | null = null;
+  #closed = false;
 
   private constructor(
-    space: PageSpace,
+    space: ExtentReader,
     chunk: ColumnChunk,
     directory: ChunkDirectory,
     options: ChunkReadOptions,
+    directoryBytes: number,
   ) {
     this.#space = space;
     this.#options = options;
     this.chunk = chunk;
     this.directory = directory;
+    this.#directoryCharge = directoryBytes;
     this.#pages = new Array<PageView | undefined>(directory.pages.length);
     this.#held = new Array<Held | undefined>(directory.pages.length);
   }
 
   /** Reads the chunk's directory (no pages): synchronously when it is cached. */
   static open(
-    space: PageSpace,
+    space: ExtentReader,
     chunk: ColumnChunk,
     options: ChunkReadOptions,
   ): MaybePromise<ChunkReader> {
@@ -172,7 +186,9 @@ export class ChunkReader {
         directory.tag === chunkTagOf(chunk.type),
         "Page directory tag differs from the column type",
       );
-      return new ChunkReader(space, chunk, directory, options);
+      const charge = directoryCharge(directory);
+      if (!options.budget.allocate(charge)) throw new PageBudgetError(charge);
+      return new ChunkReader(space, chunk, directory, options, charge);
     };
     const cached = space.peek(ref);
     if (cached !== null) return build(cached);
@@ -219,67 +235,51 @@ export class ChunkReader {
 
   /**
    * Loads (parses) the named pages that are not loaded yet, plus the dictionary when one of them
-   * needs it. Synchronous when all are cached and none is gzipped.
+   * needs it. Synchronous when all are cached; a page already in flight is awaited, not re-read.
    */
   load(pageIndices: readonly number[]): MaybePromise<void> {
+    if (this.#closed) throw new ReaderClosedError();
     const pages = this.directory.pages;
-    const missing = [...new Set(pageIndices)]
-      .filter((index) => {
-        if (pages[index] === undefined) throw new RangeError("Page index outside the chunk");
-        return this.#pages[index] === undefined;
-      })
-      .sort((a, b) => a - b);
-    const wantsDictionary =
-      this.#dictionary === null && missing.some((index) => isDictionary(at(pages, index)));
-    if (missing.length === 0 && !wantsDictionary) return;
-    if (this.#loadCached(missing, wantsDictionary)) return;
-    return this.#loadRead(missing, wantsDictionary);
+    const waits = new Set<Promise<void>>();
+    const missing: number[] = [];
+    let needsDictionary = false;
+    for (const index of [...new Set(pageIndices)].sort((a, b) => a - b)) {
+      const entry = pages[index];
+      if (entry === undefined) throw new RangeError("Page index outside the chunk");
+      if (isDictionary(entry)) needsDictionary = true;
+      if (this.#pages[index] !== undefined) continue;
+      const pending = this.#pending.get(index);
+      if (pending !== undefined) waits.add(pending);
+      else missing.push(index);
+    }
+    let wantsDictionary = false;
+    if (needsDictionary && this.#dictionary === null) {
+      if (this.#dictionaryPending !== null) waits.add(this.#dictionaryPending);
+      else wantsDictionary = true;
+    }
+    if (missing.length === 0 && !wantsDictionary)
+      return waits.size === 0 ? undefined : Promise.all(waits).then(noop);
+    if (waits.size === 0 && this.#loadCached(missing, wantsDictionary)) return;
+    waits.add(this.#start(missing, wantsDictionary));
+    return waits.size === 1 ? [...waits][0] : Promise.all(waits).then(noop);
   }
 
-  /** The sync path: every blob resident and plain. All or nothing. */
+  /** Starts one read for `missing` (and the dictionary) and registers it as their pending load. */
+  #start(missing: readonly number[], wantsDictionary: boolean): Promise<void> {
+    const run = this.#loadRead(missing, wantsDictionary);
+    for (const index of missing) this.#pending.set(index, run);
+    if (wantsDictionary) this.#dictionaryPending = run;
+    const settle = (): void => {
+      for (const index of missing)
+        if (this.#pending.get(index) === run) this.#pending.delete(index);
+      if (this.#dictionaryPending === run) this.#dictionaryPending = null;
+    };
+    run.then(settle, settle);
+    return run;
+  }
+
+  /** The sync path: every blob resident (peek, or the inflated cache). All or nothing. */
   #loadCached(missing: readonly number[], wantsDictionary: boolean): boolean {
-    const pages = this.directory.pages;
-    const entries = missing.map((index) => at(pages, index));
-    const dictionaryEntry = wantsDictionary ? this.directory.dictionary : null;
-    if (dictionaryEntry !== null) entries.push(dictionaryEntry);
-    if (entries.some(isGzip)) return false;
-    const found: Uint8Array[] = [];
-    for (const entry of entries) {
-      const bytes = this.#space.peek(blobOf(this.chunk, entry));
-      if (bytes === null) return false;
-      found.push(bytes);
-    }
-    const total = entries.reduce((sum, entry) => sum + entry.length, 0);
-    // Peeked bytes are uncharged by the space: the reader charges them while it holds them.
-    if (!this.#options.budget.allocate(total)) return false;
-    let charged = total;
-    try {
-      missing.forEach((index, k) => {
-        const entry = at(entries, k);
-        this.#pages[index] = parsePage(
-          sized(found[k], entry.length),
-          entry,
-          this.directory.tag,
-          this.directory.scale,
-        );
-        this.#held[index] = { charged: entry.length, lease: null };
-        charged -= entry.length;
-      });
-      if (dictionaryEntry !== null) {
-        const bytes = sized(found[missing.length], dictionaryEntry.length);
-        this.#setDictionary(parseDictionary(bytes, dictionaryEntry, this.directory.tag), {
-          charged: dictionaryEntry.length,
-          lease: null,
-        });
-        charged -= dictionaryEntry.length;
-      }
-    } finally {
-      if (charged > 0) this.#options.budget.free(charged);
-    }
-    return true;
-  }
-
-  async #loadRead(missing: readonly number[], wantsDictionary: boolean): Promise<void> {
     const pages = this.directory.pages;
     const jobs: Array<{ entry: PageEntry; page: number | null }> = missing.map((page) => ({
       entry: at(pages, page),
@@ -287,25 +287,100 @@ export class ChunkReader {
     }));
     const dictionaryEntry = wantsDictionary ? this.directory.dictionary : null;
     if (dictionaryEntry !== null) jobs.push({ entry: dictionaryEntry, page: null });
-    // Batches of at most MAX_READ_BYTES (every blob is ≤ MAX_BLOB_BYTES, so each fits).
+    const inflated = this.#options.inflated;
+    const found: Array<{ bytes: Uint8Array; pinned: BlobRef | null }> = [];
+    const unpin = (): void => {
+      for (const { pinned } of found) if (pinned !== null) inflated?.unpin(pinned);
+    };
+    for (const { entry } of jobs) {
+      const ref = blobOf(this.chunk, entry);
+      if (isGzip(entry)) {
+        const bytes = inflated?.pin(ref) ?? null;
+        if (bytes === null) {
+          unpin();
+          return false;
+        }
+        found.push({ bytes, pinned: ref });
+      } else {
+        const bytes = this.#space.peek(ref);
+        if (bytes === null) {
+          unpin();
+          return false;
+        }
+        found.push({ bytes: sized(bytes, entry.length), pinned: null });
+      }
+    }
+    const total = found.reduce((sum, { bytes }) => sum + bytes.length, 0);
+    // Peeked and cached-inflated bytes are uncharged by their caches: the reader charges them.
+    if (!this.#options.budget.allocate(total)) {
+      unpin();
+      return false;
+    }
+    let installed = 0;
+    try {
+      for (const [k, { entry, page }] of jobs.entries()) {
+        const { bytes, pinned } = at(found, k);
+        this.#install(entry, page, bytes, { charged: bytes.length, lease: null, inflated: pinned });
+        installed++;
+      }
+    } catch (error) {
+      for (let k = installed; k < found.length; k++) {
+        const { bytes, pinned } = at(found, k);
+        this.#options.budget.free(bytes.length);
+        if (pinned !== null) inflated?.unpin(pinned);
+      }
+      throw error;
+    }
+    return true;
+  }
+
+  async #loadRead(missing: readonly number[], wantsDictionary: boolean): Promise<void> {
+    const pages = this.directory.pages;
+    const jobs: Array<{ entry: PageEntry; page: number | null }> = [];
+    const all: Array<{ entry: PageEntry; page: number | null }> = missing.map((page) => ({
+      entry: at(pages, page),
+      page,
+    }));
+    const dictionaryEntry = wantsDictionary ? this.directory.dictionary : null;
+    if (dictionaryEntry !== null) all.push({ entry: dictionaryEntry, page: null });
+    const inflated = this.#options.inflated;
+    // gzip pages already inflated in the cache need no read.
+    for (const job of all) {
+      const ref = blobOf(this.chunk, job.entry);
+      const bytes = isGzip(job.entry) ? (inflated?.pin(ref) ?? null) : null;
+      if (bytes === null) {
+        jobs.push(job);
+        continue;
+      }
+      if (!this.#options.budget.allocate(bytes.length)) {
+        inflated?.unpin(ref);
+        throw new PageBudgetError(bytes.length);
+      }
+      this.#install(job.entry, job.page, bytes, {
+        charged: bytes.length,
+        lease: null,
+        inflated: ref,
+      });
+    }
     let start = 0;
     while (start < jobs.length) {
       let end = start;
       let bytes = 0;
-      while (end < jobs.length && bytes + (jobs[end]?.entry.length ?? 0) <= MAX_READ_BYTES)
-        bytes += jobs[end++]?.entry.length ?? 0;
+      while (end < jobs.length && bytes + at(jobs, end).entry.length <= MAX_READ_BYTES)
+        bytes += at(jobs, end++).entry.length;
       if (end === start) end++;
       const batch = jobs.slice(start, end);
+      if (this.#closed) throw new ReaderClosedError();
       const lease = await this.#space.read(
         batch.map(({ entry }) => blobOf(this.chunk, entry)),
         this.#options,
       );
       const shared = new SharedLease(lease, batch.length);
-      // `#install` takes over one hold on the lease per job, success or failure.
+      // `#settle` takes over one hold on the lease per job, success or failure.
       for (let k = 0; k < batch.length; k++) {
         const { entry, page } = at(batch, k);
         try {
-          await this.#install(entry, page, lease.bytes[k], shared);
+          await this.#settle(entry, page, lease.bytes[k], shared);
         } catch (error) {
           for (let rest = k + 1; rest < batch.length; rest++) shared.drop();
           throw error;
@@ -315,34 +390,67 @@ export class ChunkReader {
     }
   }
 
-  async #install(
+  /** Installs one page read through a lease (inflating a gzip page into charged memory first). */
+  async #settle(
     entry: PageEntry,
     page: number | null,
     stored: Uint8Array | undefined,
     lease: SharedLease,
   ): Promise<void> {
-    let bytes: Uint8Array;
-    let charged = 0;
-    let holder: SharedLease | null = lease;
-    try {
-      bytes = sized(stored, entry.length);
-      if (isGzip(entry)) {
-        // The inflated page is the reader's: charge it; the stored bytes go back with the lease.
-        bytes = await inflatePage(bytes);
-        if (!this.#options.budget.allocate(bytes.length)) throw new PageBudgetError(bytes.length);
-        charged = bytes.length;
-        holder = null;
+    // A reader closed meanwhile is refused by `#install`, which gives the lease and charge back.
+    if (!isGzip(entry)) {
+      let bytes: Uint8Array;
+      try {
+        bytes = sized(stored, entry.length);
+      } catch (error) {
         lease.drop();
+        throw error;
       }
+      this.#install(entry, page, bytes, { charged: 0, lease, inflated: null });
+      return;
+    }
+    // gzip: charge the inflated size before allocating it, inflate, let the stored bytes go.
+    let length: number;
+    try {
+      length = inflatedLength(sized(stored, entry.length));
     } catch (error) {
-      if (holder !== null) lease.drop();
+      lease.drop();
       throw error;
     }
-    const held: Held = { charged, lease: holder };
+    if (!this.#options.budget.allocate(length)) {
+      lease.drop();
+      throw new PageBudgetError(length);
+    }
+    let raw: Uint8Array = new Uint8Array(length);
     try {
-      if (page === null)
-        this.#setDictionary(parseDictionary(bytes, entry, this.directory.tag), held);
-      else {
+      await inflateInto(sized(stored, entry.length), raw);
+    } catch (error) {
+      this.#options.budget.free(length);
+      throw error;
+    } finally {
+      lease.drop();
+    }
+    // If the reader was closed while this page inflated, `#install` gives the charge back.
+    const cache = this.#options.inflated;
+    const ref = blobOf(this.chunk, entry);
+    if (cache !== undefined) raw = cache.admit(ref, raw);
+    this.#install(entry, page, raw, {
+      charged: length,
+      lease: null,
+      inflated: cache === undefined ? null : ref,
+    });
+  }
+
+  /** Parses and installs one page or the dictionary; on failure, gives `held` back. */
+  #install(entry: PageEntry, page: number | null, bytes: Uint8Array, held: Held): void {
+    try {
+      if (this.#closed) throw new ReaderClosedError();
+      if (page === null) {
+        const dictionary = parseDictionary(bytes, entry, this.directory.tag);
+        this.#dictionary = dictionary;
+        this.#dictionaryHeld = held;
+        this.#dictionaryVector = dictionaryVector(dictionary, this.chunk.type);
+      } else {
         this.#pages[page] = parsePage(bytes, entry, this.directory.tag, this.directory.scale);
         this.#held[page] = held;
       }
@@ -352,24 +460,22 @@ export class ChunkReader {
     }
   }
 
-  #setDictionary(dictionary: PageDictionary, held: Held): void {
-    this.#dictionary = dictionary;
-    this.#dictionaryHeld = held;
-    this.#dictionaryVector = dictionaryVector(dictionary, this.chunk.type);
-  }
-
   #drop(held: Held | undefined | null): void {
     if (held === undefined || held === null) return;
     if (held.charged > 0) this.#options.budget.free(held.charged);
     held.lease?.drop();
+    if (held.inflated !== null) this.#options.inflated?.unpin(held.inflated);
   }
 
   /** Loads the dictionary page on its own (for a dictionary vector before any page). */
   loadDictionary(): MaybePromise<FlatVector | null> {
+    if (this.#closed) throw new ReaderClosedError();
     if (this.directory.dictionary === null) return null;
     if (this.#dictionaryVector !== null) return this.#dictionaryVector;
+    const pending = this.#dictionaryPending;
+    if (pending !== null) return pending.then(() => this.#dictionaryVector);
     if (this.#loadCached([], true)) return this.#dictionaryVector;
-    return this.#loadRead([], true).then(() => this.#dictionaryVector);
+    return this.#start([], true).then(() => this.#dictionaryVector);
   }
 
   /** The chunk's dictionary as an immutable flat vector, once loaded. */
@@ -388,13 +494,19 @@ export class ChunkReader {
     }
   }
 
-  /** Releases every page and the dictionary. The reader can load again afterwards. */
+  /**
+   * Releases every page, the dictionary and the directory's charge. Final: later calls throw
+   * `ReaderClosedError`, and loads in flight reject with it after giving back what they read.
+   */
   close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
     this.release();
     this.#drop(this.#dictionaryHeld);
     this.#dictionaryHeld = null;
     this.#dictionary = null;
     this.#dictionaryVector = null;
+    this.#options.budget.free(this.#directoryCharge);
   }
 
   #view(index: number): PageView {

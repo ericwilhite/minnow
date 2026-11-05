@@ -1,71 +1,81 @@
 import { describe, expect, it } from "vitest";
+import type { BlobRef, ExtentRef } from "../storage/extents.js";
 import type {
-  BlobRef,
   ColumnChunk,
   GroupRef,
   GroupRoot,
   IndexRoot,
   ManifestRoot,
+  RunRef,
   TableRoot,
 } from "./manifest.js";
 import {
-  occupied,
   reachable,
   reachableExtents,
+  walkReachable,
   type ManifestReader,
   type ReachableKind,
 } from "./reachable.js";
 
 let next = 0;
-/** A fresh ref at the next 4 KiB slot (offsets are distinct, so each reference is traceable). */
-function blob(length = 100, shift = 0): BlobRef {
-  next += 4096;
-  return { offset: next + shift, length, checksum: next };
+/** A fresh extent at the next 8 KiB slot, so each reference is traceable. */
+function extent(length = 4096): ExtentRef {
+  next += 1 << 16;
+  return { offset: next, length };
+}
+/** A blob alone in its own extent (metadata), or at `offset` inside `within`. */
+function blob(within: ExtentRef = extent(100), offset = 0, length = within.length): BlobRef {
+  return { extent: within, offset, length, checksum: within.offset + offset };
 }
 
-function chunk(columnId: number, data = blob(20_000)): ColumnChunk {
+function chunk(columnId: number, data: ExtentRef = extent(20_000), at = 0): ColumnChunk {
   return {
     columnId,
     type: { kind: "int32", bits: 32 },
-    data: { offset: data.offset, length: data.length },
-    directory: { offset: data.offset + 16_000, length: 300, checksum: 1 },
+    data,
+    directory: blob(data, at + 16_000, 300),
     statistics: { nullCount: 0, min: null, max: null, dictionarySize: null },
-    distinctSketch: { offset: data.offset + 16_200, length: 90, checksum: 2 },
+    distinctSketch: blob(data, at + 16_300, 90),
+  };
+}
+
+function run(level: number): RunRef {
+  return {
+    level,
+    entryCount: 10,
+    entries: blob(),
+    fences: blob(),
+    bloom: blob(),
+    minKey: new Uint8Array(1),
+    maxKey: new Uint8Array(1),
   };
 }
 
 function index(indexId: number): IndexRoot {
-  return {
-    indexId,
-    columnIds: [1],
-    unique: false,
-    runs: [0, 1].map((level) => ({
-      level,
-      entryCount: 10,
-      entries: blob(),
-      fences: blob(),
-      bloom: blob(),
-      minKey: new Uint8Array(1),
-      maxKey: new Uint8Array(1),
-    })),
-  };
+  return { indexId, columnIds: [1], unique: false, runs: [run(0), run(1)] };
 }
 
 interface Fixture {
   readonly root: ManifestRoot;
   readonly reader: ManifestReader;
   /** Every reference the root reaches, with its kind. */
-  readonly expected: Array<{ offset: number; length: number; kind: ReachableKind }>;
+  readonly expected: Array<{ ref: BlobRef | ExtentRef; kind: ReachableKind }>;
 }
 
 function fixture(): Fixture {
   const expected: Fixture["expected"] = [];
-  const want = (ref: { offset: number; length: number }, kind: ReachableKind): void => {
-    expected.push({ offset: ref.offset, length: ref.length, kind });
+  const want = (ref: BlobRef | ExtentRef, kind: ReachableKind): void => {
+    expected.push({ ref, kind });
   };
-  const directories = new Map<number, GroupRef[]>();
-  const roots = new Map<number, GroupRoot>();
-  const shared = blob(8_000); // a packed extent shared by two chunks of one group
+  const directories = new Map<BlobRef, GroupRef[]>();
+  const roots = new Map<BlobRef, GroupRoot>();
+  const wantRuns = (runs: readonly RunRef[]): void => {
+    for (const each of runs) {
+      want(each.entries, "index-entries");
+      want(each.fences, "index-fences");
+      want(each.bloom, "index-bloom");
+    }
+  };
   const makeGroups = (count: number, kind: ReachableKind): BlobRef => {
     const directory = blob();
     want(directory, kind);
@@ -73,11 +83,12 @@ function fixture(): Fixture {
     for (let k = 0; k < count; k++) {
       const rootRef = blob();
       const deletions = k % 2 === 0 ? blob() : null;
-      const merged = k === 1;
-      const rowIds = merged ? blob() : null;
+      const rowIds = k === 1 ? blob() : null;
+      // Group 0 packs two small chunks into one shared extent.
+      const pack = extent(40_000);
       const columns =
-        k === 0 ? [chunk(1, shared), chunk(2, shared), chunk(3)] : [chunk(1), chunk(2)];
-      roots.set(rootRef.offset, {
+        k === 0 ? [chunk(1, pack, 0), chunk(2, pack, 20_000), chunk(3)] : [chunk(1), chunk(2)];
+      roots.set(rootRef, {
         rowCount: 100,
         rowIds: rowIds === null ? { kind: "dense" } : { kind: "column", ref: rowIds },
         columns,
@@ -100,19 +111,35 @@ function fixture(): Fixture {
         if (column.distinctSketch !== null) want(column.distinctSketch, "distinct-sketch");
       }
     }
-    directories.set(directory.offset, groups);
+    directories.set(directory, groups);
     return directory;
   };
   const tables: TableRoot[] = [1, 2].map((tableId) => {
     const keyIndex = index(1);
     const secondary = [index(2)];
     const statistics = tableId === 1 ? blob() : null;
-    for (const run of [...keyIndex.runs, ...(secondary[0]?.runs ?? [])]) {
-      want(run.entries, "index-entries");
-      want(run.fences, "index-fences");
-      want(run.bloom, "index-bloom");
-    }
+    wantRuns([...keyIndex.runs, ...(secondary[0]?.runs ?? [])]);
     if (statistics !== null) want(statistics, "table-statistics");
+    const stagedRuns =
+      tableId === 2
+        ? [
+            { indexId: 1, runs: [run(0)] },
+            { indexId: 2, runs: [run(0), run(1)] },
+          ]
+        : [];
+    for (const staged of stagedRuns) wantRuns(staged.runs);
+    const staged =
+      tableId === 2
+        ? [
+            {
+              transaction: 9,
+              firstRowId: 2000,
+              rowCount: 200,
+              groups: makeGroups(2, "staged-group-directory"),
+              indexRuns: stagedRuns,
+            },
+          ]
+        : [];
     return {
       tableId,
       schemaVersion: 1,
@@ -121,17 +148,7 @@ function fixture(): Fixture {
       liveRowCount: 900,
       groups: makeGroups(tableId === 1 ? 70 : 3, "group-directory"),
       groupCount: tableId === 1 ? 70 : 3,
-      staged:
-        tableId === 2
-          ? [
-              {
-                transaction: 9,
-                firstRowId: 2000,
-                rowCount: 200,
-                groups: makeGroups(2, "staged-group-directory"),
-              },
-            ]
-          : [],
+      staged,
       keyIndex,
       secondaryIndexes: secondary,
       statistics,
@@ -139,7 +156,8 @@ function fixture(): Fixture {
   });
   const catalog = blob();
   want(catalog, "catalog");
-  const root: ManifestRoot = {
+  // Only the fields the walk reads are meaningful here.
+  const root = {
     formatVersion: 1,
     sequence: 3,
     epoch: 1,
@@ -151,11 +169,11 @@ function fixture(): Fixture {
     sequences: [],
     tables,
     clients: [],
-  };
+  } as unknown as ManifestRoot;
   const reader: ManifestReader = {
-    groups: async (ref) => directories.get(ref.offset) ?? [],
+    groups: async (ref) => directories.get(ref) ?? [],
     groupRoot: async (ref) => {
-      const found = roots.get(ref.offset);
+      const found = roots.get(ref);
       if (found === undefined) throw new Error("unknown group root");
       return found;
     },
@@ -163,48 +181,45 @@ function fixture(): Fixture {
   return { root, reader, expected };
 }
 
-const key = (range: { offset: number; length: number; kind: string }): string =>
-  `${range.kind}@${String(range.offset)}+${String(range.length)}`;
+const key = (ref: BlobRef | ExtentRef, kind: string): string =>
+  "extent" in ref
+    ? `${kind}@${String(ref.extent.offset)}+${String(ref.offset)}:${String(ref.length)}`
+    : `${kind}@${String(ref.offset)}:${String(ref.length)}`;
+
+const extentKey = (ref: BlobRef | ExtentRef): string => {
+  const owner = "extent" in ref ? ref.extent : ref;
+  return `${String(owner.offset)}:${String(owner.length)}`;
+};
 
 describe("reachability walk", () => {
-  it("lists every range a root references, each with its kind", async () => {
+  it("lists every reference a root reaches, staged index runs included", async () => {
     const { root, reader, expected } = fixture();
     const found = await reachable(root, reader, { concurrency: 8 });
-    expect(found.map(key).sort()).toEqual(expected.map(key).sort());
-    // Table ownership is recorded.
-    expect(found.filter((range) => range.kind === "catalog").map((range) => range.tableId)).toEqual(
-      [null],
+    expect(found.map(({ ref, kind }) => key(ref, kind)).sort()).toEqual(
+      expected.map(({ ref, kind }) => key(ref, kind)).sort(),
     );
-    expect(
-      new Set(
-        found
-          .filter((range) => range.kind === "staged-group-directory")
-          .map((range) => range.tableId),
-      ),
-    ).toEqual(new Set([2]));
+    // The review's probe (B2-1 #1): a staged transaction's index runs are reached.
+    const staged = root.tables[1]?.staged[0]?.indexRuns.flatMap((each) => each.runs) ?? [];
+    expect(staged.length).toBe(3);
+    for (const each of staged)
+      for (const ref of [each.entries, each.fences, each.bloom])
+        expect(found.some((reached) => reached.ref === ref)).toBe(true);
+    expect(found.filter((r) => r.kind === "catalog").map((r) => r.tableId)).toEqual([null]);
   });
 
-  it("merges shared and nested references into disjoint aligned ranges", async () => {
+  it("streams: it yields before it has read every group root", async () => {
     const { root, reader } = fixture();
-    const ranges = occupied(await reachable(root, reader));
-    for (let k = 1; k < ranges.length; k++) {
-      const previous = ranges[k - 1];
-      const current = ranges[k];
-      if (previous === undefined || current === undefined) continue;
-      expect(current.offset).toBeGreaterThan(previous.offset + previous.length);
-    }
-    for (const range of ranges) {
-      expect(range.offset % 4096).toBe(0);
-      expect(range.length % 4096).toBe(0);
-    }
-    expect(
-      occupied([
-        { offset: 100, length: 10 },
-        { offset: 4000, length: 200 },
-        { offset: 8192, length: 1 },
-        { offset: 0, length: 0 },
-      ]),
-    ).toEqual([{ offset: 0, length: 12_288 }]);
+    let rootsRead = 0;
+    const counting: ManifestReader = {
+      groups: (ref) => reader.groups(ref),
+      groupRoot: async (ref) => {
+        rootsRead++;
+        return reader.groupRoot(ref);
+      },
+    };
+    for await (const reached of walkReachable(root, counting, { concurrency: 4 }))
+      if (reached.kind === "chunk-data") break;
+    expect(rootsRead).toBe(4); // one batch of the 75 group roots
   });
 
   it("refuses to produce a partial walk when a metadata read fails", async () => {
@@ -218,26 +233,18 @@ describe("reachability walk", () => {
     await expect(reachable(root, failing)).rejects.toThrow("checksum");
   });
 
-  it("yields the extents the space opens with, through leased and released reads", async () => {
+  it("yields every extent for the space, leasing metadata blobs only to decode them", async () => {
     const { root, reader, expected } = fixture();
-    // Fake codecs: a blob's first 8 bytes name the offset it was read from.
-    const groupsAt = new Map<number, readonly GroupRef[]>();
-    const rootsAt = new Map<number, GroupRoot>();
-    const read = async (offset: number): Promise<void> => {
-      const groups = await reader.groups({ offset, length: 1, checksum: 0 });
-      if (groups.length > 0) groupsAt.set(offset, groups);
+    // Fake codecs: a blob's bytes hold its checksum, which names the ref.
+    const byChecksum = new Map<number, BlobRef>();
+    for (const { ref } of expected) if ("extent" in ref) byChecksum.set(ref.checksum, ref);
+    const refOf = (bytes: Uint8Array): BlobRef => {
+      const ref = byChecksum.get(new DataView(bytes.buffer, bytes.byteOffset).getFloat64(0, true));
+      if (ref === undefined) throw new Error("unknown blob");
+      return ref;
     };
-    for (const table of root.tables) {
-      await read(table.groups.offset);
-      for (const staged of table.staged) await read(staged.groups.offset);
-    }
-    for (const groups of groupsAt.values())
-      for (const group of groups)
-        rootsAt.set(group.root.offset, await reader.groupRoot(group.root));
-    const offsetOf = (bytes: Uint8Array): number =>
-      new DataView(bytes.buffer, bytes.byteOffset).getFloat64(0, true);
     let leased = 0;
-    let budgetHeld = 0;
+    let held = 0;
     const space = {
       read: async (
         refs: readonly BlobRef[],
@@ -249,7 +256,7 @@ describe("reachability walk", () => {
         return {
           bytes: refs.map((ref) => {
             const bytes = new Uint8Array(8);
-            new DataView(bytes.buffer).setFloat64(0, ref.offset, true);
+            new DataView(bytes.buffer).setFloat64(0, ref.checksum, true);
             return bytes;
           }),
           release: () => {
@@ -258,43 +265,37 @@ describe("reachability walk", () => {
           },
         };
       },
+      peek: () => null,
     };
     const budget = {
-      allocate: (bytes: number): boolean => ((budgetHeld += bytes), true),
-      free: (bytes: number): void => void (budgetHeld -= bytes),
+      allocate: (bytes: number): boolean => ((held += bytes), true),
+      free: (bytes: number): void => void (held -= bytes),
     };
-    const walk = reachableExtents({
+    // The codecs are synchronous; resolve the fixture's maps up front.
+    const groupsOf = new Map<BlobRef, readonly GroupRef[]>();
+    const rootsOf = new Map<BlobRef, GroupRoot>();
+    for (const table of root.tables)
+      for (const ref of [table.groups, ...table.staged.map((staged) => staged.groups)]) {
+        const groups = await reader.groups(ref);
+        groupsOf.set(ref, groups);
+        for (const group of groups) rootsOf.set(group.root, await reader.groupRoot(group.root));
+      }
+    const walker = reachableExtents({
       decodeRoot: () => root,
-      decodeGroups: (bytes) => groupsAt.get(offsetOf(bytes)) ?? [],
+      decodeGroups: (bytes) => groupsOf.get(refOf(bytes)) ?? [],
       decodeGroupRoot: (bytes) => {
-        const found = rootsAt.get(offsetOf(bytes));
+        const found = rootsOf.get(refOf(bytes));
         if (found === undefined) throw new Error("unknown group root");
         return found;
       },
     });
-    const extents: Array<{ offset: number; length: number }> = [];
-    for await (const extent of walk(new Uint8Array(0), space, budget)) extents.push(extent);
+    const out: Array<BlobRef | ExtentRef> = [];
+    for await (const ref of walker(new Uint8Array(0), space, budget)) out.push(ref);
     expect(leased).toBe(0);
-    expect(budgetHeld).toBe(0);
-    const wanted = new Set(
-      expected
-        // A directory or sketch inside a chunk extent is covered by it; the shared 8 KB pack's
-        // directories lie past it and stand on their own.
-        .filter(
-          (range) =>
-            (range.kind !== "page-directory" && range.kind !== "distinct-sketch") ||
-            !expected.some(
-              (data) =>
-                data.kind === "chunk-data" &&
-                range.offset >= data.offset &&
-                range.offset + range.length <= data.offset + data.length,
-            ),
-        )
-        .map((range) => `${String(range.offset)}:${String(range.length)}`),
-    );
-    expect(
-      new Set(extents.map((extent) => `${String(extent.offset)}:${String(extent.length)}`)),
-    ).toEqual(wanted);
-    expect(extents.length).toBe(wanted.size);
+    expect(held).toBe(0);
+    // Every extent the root reaches is covered (the space takes BlobRef.extent) ...
+    expect(new Set(out.map(extentKey))).toEqual(new Set(expected.map(({ ref }) => extentKey(ref))));
+    // ... and a chunk's directory and sketch, in its data extent, are not repeated.
+    expect(out.length).toBeLessThan(expected.length);
   });
 });

@@ -12,7 +12,9 @@ import {
   type VectorData,
 } from "../vector/vector.js";
 import { int128At, setInt128 } from "../vector/int128.js";
-import { MemoryDataSpace, MemoryExtentAllocator, MemorySpace } from "./memory-extents.js";
+import { MemoryExtentSpace, UNLIMITED } from "./memory-extents.js";
+
+export { UNLIMITED };
 import { ChunkReader } from "./reader.js";
 import { GroupWriter, type GroupWriterOptions, type WrittenGroup } from "./writer.js";
 
@@ -320,8 +322,7 @@ function big(_key: string, value: unknown): unknown {
 }
 
 export interface Written {
-  readonly space: MemoryDataSpace;
-  readonly allocator: MemoryExtentAllocator;
+  readonly space: MemoryExtentSpace;
   readonly group: WrittenGroup;
 }
 
@@ -332,15 +333,16 @@ export async function writeGroup(
     readonly values: readonly TestValue[];
     readonly vector?: VectorOptions;
   }>,
-  options: Partial<GroupWriterOptions> & { readonly batch?: number } = {},
+  options: Partial<Omit<GroupWriterOptions, "writer">> & {
+    readonly batch?: number;
+    readonly space?: MemoryExtentSpace;
+  } = {},
 ): Promise<Written> {
-  const space = new MemoryDataSpace();
-  const allocator = new MemoryExtentAllocator();
+  const space = options.space ?? new MemoryExtentSpace();
   const writer = new GroupWriter({
     ...options,
     columns: columns.map((column, index) => ({ columnId: index + 1, type: column.type })),
-    store: space,
-    allocator,
+    writer: space.beginWrite("test group"),
   });
   const rows = columns[0]?.values.length ?? 0;
   const batch = Math.max(1, options.batch ?? 2048);
@@ -352,24 +354,21 @@ export async function writeGroup(
     const taken = await writer.append(vectors, count);
     if (taken !== count) throw new Error("The group refused rows");
   }
-  return { space, allocator, group: await writer.finish() };
+  return { space, group: await writer.finish() };
 }
 
-/** A budget that admits everything (tests that do not check charging). */
-export const UNLIMITED = { allocate: (): boolean => true, free: (): void => undefined };
-
-/** A reader over `data` with no cache: every load reads (and verifies) the stored bytes. */
+/** A reader over `space` with no cache: every load reads (and verifies) the stored bytes. */
 export async function openChunk(
-  data: MemoryDataSpace,
+  space: MemoryExtentSpace,
   chunk: ColumnChunk,
   budget = UNLIMITED,
 ): Promise<ChunkReader> {
-  return ChunkReader.open(new MemorySpace(data, { cache: false }), chunk, { budget });
+  return ChunkReader.open(space.view({ cache: false }), chunk, { budget });
 }
 
 /** Reads every row of a chunk back as test values. */
 export async function readChunk(
-  space: MemoryDataSpace,
+  space: MemoryExtentSpace,
   chunk: ColumnChunk,
   options: ReadOptions = {},
 ): Promise<TestValue[]> {
@@ -379,5 +378,7 @@ export async function readChunk(
   await reader.load(Array.from({ length: end - first }, (_, index) => first + index));
   const target = targetFor(reader, rows, reader.varlenBytes(0, rows), options);
   reader.decodeRange(0, rows, target, 0);
-  return Array.from({ length: rows }, (_, row) => valueAt(target, row));
+  const values = Array.from({ length: rows }, (_, row) => valueAt(target, row));
+  reader.close();
+  return values;
 }

@@ -20,13 +20,10 @@ import { performance } from "node:perf_hooks";
 import { decodeBlock, encodeBlock } from "../packages/core/src/block-format/index.ts";
 import type { ColumnInput } from "../packages/core/src/block-format/types.ts";
 import type { ColumnChunk } from "../packages/core/src/next/format/manifest.ts";
-import {
-  MemoryDataSpace,
-  MemoryExtentAllocator,
-  MemorySpace,
-} from "../packages/core/src/next/page/memory-extents.ts";
+import { MemoryExtentSpace, UNLIMITED } from "../packages/core/src/next/page/memory-extents.ts";
 import { ChunkReader } from "../packages/core/src/next/page/reader.ts";
-import { targetFor, UNLIMITED } from "../packages/core/src/next/page/test-support.ts";
+import { InflatedPageCache } from "../packages/core/src/next/page/inflated-cache.ts";
+import { targetFor } from "../packages/core/src/next/page/test-support.ts";
 import { GroupWriter } from "../packages/core/src/next/page/writer.ts";
 import type { PhysicalType } from "../packages/core/src/next/types.ts";
 import type { FlatVector, VectorData } from "../packages/core/src/next/vector/vector.ts";
@@ -245,17 +242,16 @@ async function run(bench: Bench): Promise<Result> {
   );
   const inputBytes = groups.reduce((sum, group) => sum + group.bytes, 0);
 
-  let space = new MemoryDataSpace();
+  let space = new MemoryExtentSpace();
   let chunks: ColumnChunk[] = [];
   const write = async (): Promise<void> => {
-    space = new MemoryDataSpace();
-    const allocator = new MemoryExtentAllocator();
+    space = new MemoryExtentSpace();
+    const extents = space.beginWrite(bench.label);
     chunks = [];
     for (const group of groups) {
       const writer = new GroupWriter({
         columns: [{ columnId: 1, type: bench.type }],
-        store: space,
-        allocator,
+        writer: extents,
         gzip: bench.gzip ?? false,
       });
       await writer.append([group.vector], group.vector.length);
@@ -266,19 +262,26 @@ async function run(bench: Bench): Promise<Result> {
   const encodeMs = await timed(write);
 
   // Cold: every page read through the space (xxHash32 verify on the miss) and parsed.
-  // Warm: every blob cached, so open and load run synchronously (peek + parse).
+  // Warm: every blob cached (gzip pages in the inflated-page cache), so open and load run
+  // synchronously (peek + parse).
   let readers: ChunkReader[] = [];
-  const loadWith = async (pages: MemorySpace): Promise<void> => {
+  const inflated = new InflatedPageCache(() => ({ charge: () => true, release: () => undefined }));
+  const loadWith = async (pages: MemoryExtentSpace): Promise<void> => {
     for (const reader of readers) reader.close();
     readers = [];
     for (const chunk of chunks) {
-      const reader = await ChunkReader.open(pages, chunk, { budget: UNLIMITED });
+      const reader = await ChunkReader.open(pages, chunk, { budget: UNLIMITED, inflated });
       await reader.load(reader.directory.pages.map((_, index) => index));
       readers.push(reader);
     }
   };
-  const loadMs = await timed(() => loadWith(new MemorySpace(space, { cache: false })));
-  const warmSpace = new MemorySpace(space);
+  const loadMs = await timed(() => {
+    for (const reader of readers) reader.close();
+    readers = [];
+    inflated.clear();
+    return loadWith(space.view({ cache: false }));
+  });
+  const warmSpace = space.view({});
   await loadWith(warmSpace);
   const warmMs = await timed(() => loadWith(warmSpace));
   const encodingSet = new Set<string>();
