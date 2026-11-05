@@ -218,8 +218,25 @@ is access's `Snapshot`.
 - NUMERIC: a declared scale makes a fixed-scale chunk; an unconstrained NUMERIC keeps each
   value's scale (a per-row section, or one scale per page), and its min/max are normalized sort
   keys (value order, scale ignored, R15.10), chosen by comparing the exact key bytes. Coefficients are stored by the int64 rules when they
-  fit, else as 128-bit limbs. Past 128 bits, and a single value too large for one page, is
-  `UnsupportedPageLayoutError` (large values: Phase 2, R15.4).
+  fit, else as 128-bit limbs. Past 128 bits is `UnsupportedPageLayoutError`.
+- Large values (`large-value.ts`, R15.4): a text, bytes, json or array value over 64 KiB is stored
+  out of line, as consecutive parts of at most 1 MiB (each with its own xxHash32) in the chunk's
+  own extent, written straight from the caller's vector through the builder (the writer holds no
+  copy: about 0.1 MiB of working memory however large the values). Its page slot holds a pointer
+  (offset, length, part checksums) and the page marks the row in a `large` bitmap; such a page
+  is plain, and the chunk's dictionary carries on for the other pages. Bounds use the value's
+  first 33 bytes and the sketch hashes the whole value. The parts are inside the chunk's data
+  range, so the reachability walk reaches them through the chunk and they are reclaimed with it.
+  A value over 64 MiB (`MAX_VALUE_BYTES`) is `UnsupportedPageLayoutError`.
+- Reading large values: `load` reads pages only. `loadValues(from, to)` / `loadValuesOf(rows)`
+  load the out-of-line values a decode will reach, charged to the budget before they are read
+  (the space's lease), in reads of at most 4 MiB, and kept leased (a decode copies the parts
+  straight into the target; no reassembly copy) until `releaseValues`, `release` of their page
+  or `close`. Synchronous when every part is resident. A decode that reaches an unloaded one
+  throws `ValueNotLoadedError`; `varlenBytes` and `gatherBytes` count full value lengths, so a
+  caller can size batches first. A consumer that can stream uses `valueParts(row)`: one verified
+  part (≤ 1 MiB) held at a time, whatever the value's size. Every pointer is checked against
+  the chunk's data range before anything is read. `scripts/large-value-bench.mts` measures it.
 - Floats: min/max follow PostgreSQL's order (NaN above +Infinity): max is NaN when any NaN is
   present, both are NaN only when no other value is.
 - gzip is a second stage only maintenance compaction applies (writer option `gzip`; never a

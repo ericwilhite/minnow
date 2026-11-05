@@ -20,6 +20,7 @@ import { PageEncoding } from "../format/manifest.js";
 import type { FlatVector, Int64Values, Validity, VectorData } from "../vector/vector.js";
 import { copyBits, countBits, fillBits, gatherBits, unpackBools } from "./bits.js";
 import { NUMERIC_MAX_SCALE } from "../types.js";
+import { decodePointer, type LargePointer } from "./large-value.js";
 import {
   align8,
   check,
@@ -58,6 +59,8 @@ export interface PageView {
   readonly scale: number;
   /** Decimals of a mixed-scale chunk with differing scales: one per row. */
   readonly scales: Uint16Array | null;
+  /** Plain varlen pages with out-of-line values: bit set = the slot holds a pointer. */
+  readonly large: Uint32Array | null;
   /** Byte offset of the payload in `bytes`. */
   readonly start: number;
   /** FOR / delta deltas, dictionary codes, plain varlen offsets (by width). */
@@ -94,7 +97,8 @@ const KNOWN_FLAGS =
   PageFlag.specials |
   PageFlag.safe |
   PageFlag.scales |
-  PageFlag.uniformScale;
+  PageFlag.uniformScale |
+  PageFlag.large;
 
 function constantWidth(tag: number): number {
   if (tag === ValueTag.bool) return 1;
@@ -142,6 +146,11 @@ export function parsePage(
   check(!delta || kind === PageEncoding.frameOfReference, "Delta flag outside a FOR page");
   check(!hasSpecials || decimal, "Specials outside a decimal page");
   const hasScales = (flags & PageFlag.scales) !== 0;
+  const hasLarge = (flags & PageFlag.large) !== 0;
+  check(
+    !hasLarge || (tag === ValueTag.varlen && kind === PageEncoding.plain),
+    "Large values outside a plain varlen page",
+  );
   const uniformScale = (flags & PageFlag.uniformScale) !== 0;
   check(!(hasScales && uniformScale), "Page has both a scale section and a uniform scale");
   if (decimal && chunkScale === null)
@@ -186,6 +195,20 @@ export function parsePage(
     for (let row = 0; row < rows; row++)
       check((scales[row] ?? 0) <= NUMERIC_MAX_SCALE, "Decimal scale out of range");
     at += align8(rows * 2);
+  }
+  let large: Uint32Array | null = null;
+  if (hasLarge) {
+    const count = (rows + 31) >>> 5;
+    check(bytes.length >= at + count * 4, "Page large-value section is truncated");
+    large = new Uint32Array(bytes.buffer, bytes.byteOffset + at, count);
+    const rest = rows & 31;
+    check(rest === 0 || (large[count - 1] ?? 0) >>> rest === 0, "Large-value bits past the page");
+    for (let word = 0; word < count; word++)
+      check(
+        validity === null || ((large[word] ?? 0) & ~(validity[word] ?? 0)) === 0,
+        "A null row is marked large",
+      );
+    at += align8(count * 4);
   }
   const start = at;
   let length = start;
@@ -234,6 +257,9 @@ export function parsePage(
           check((offsets[row] ?? 0) <= (offsets[row + 1] ?? 0), "Varlen offsets decrease");
         unsigned = offsets;
         data = bytes.subarray(start + offsetBytes, length);
+        if (large !== null)
+          for (let row = 0; row < rows; row++)
+            if (isBit(large, row)) decodePointer(data, offsets[row] ?? 0, offsets[row + 1] ?? 0);
         break;
       }
       check(width === plainWidth(tag) && width > 0, "Bad plain width");
@@ -326,6 +352,7 @@ export function parsePage(
     specials,
     scale: uniformScale ? aux : (chunkScale ?? 0),
     scales,
+    large,
     start,
     unsigned,
     baseLow,
@@ -889,12 +916,16 @@ export function varlenBytesOf(
     const offsets = view.unsigned;
     return offsets === null ? 0 : (offsets[row + 1] ?? 0) - (offsets[row] ?? 0);
   };
-  if (rows === null && view.kind === PageEncoding.plain) {
+  if (rows === null && view.kind === PageEncoding.plain && view.large === null) {
     const offsets = view.unsigned;
     return offsets === null ? 0 : (offsets[to] ?? 0) - (offsets[from] ?? 0);
   }
   let total = 0;
-  for (let k = from; k < to; k++) total += valueBytes(rows === null ? k : (rows[k] ?? 0) - base0);
+  for (let k = from; k < to; k++) {
+    const row = rows === null ? k : (rows[k] ?? 0) - base0;
+    total +=
+      view.large !== null && isBit(view.large, row) ? largeLength(view, row) : valueBytes(row);
+  }
   return total;
 }
 
@@ -907,6 +938,7 @@ function decodeVarlen(
   base0: number,
   data: VarlenData,
   at: number,
+  values: LargeResolver | null,
 ): void {
   const offsets = data.offsets;
   const bytes = data.bytes;
@@ -952,6 +984,28 @@ function decodeVarlen(
   }
   const source = view.data ?? new Uint8Array(0);
   const pageOffsets = view.unsigned ?? new Uint32Array(1);
+  if (view.large !== null) {
+    // Out-of-line rows copy their resolved value; the others their slot.
+    const large = view.large;
+    for (let k = 0; k < count; k++) {
+      const row = rows === null ? from + k : (rows[k] ?? 0) - base0;
+      if (isBit(large, row)) {
+        const parts = values?.(row) ?? null;
+        if (parts === null) throw new ValueNotLoadedError();
+        for (const part of parts) {
+          bytes.set(part, cursor);
+          cursor += part.length;
+        }
+      } else {
+        const start = pageOffsets[row] ?? 0;
+        const end = pageOffsets[row + 1] ?? 0;
+        copyBytes(source, start, end, bytes, cursor);
+        cursor += end - start;
+      }
+      offsets[at + k + 1] = cursor;
+    }
+    return;
+  }
   if (rows === null) {
     const first = pageOffsets[from] ?? 0;
     const last = pageOffsets[to] ?? 0;
@@ -969,6 +1023,43 @@ function decodeVarlen(
     cursor += end - start;
     offsets[at + k + 1] = cursor;
   }
+}
+
+/**
+ * The parts of the out-of-line value in page row `row` (page-relative), verified and checked
+ * against its pointer by the reader that loaded them, or null when it is not loaded
+ * (`ValueNotLoadedError`). Decoding copies the parts, in order, into the target.
+ */
+export type LargeResolver = (row: number) => readonly Uint8Array[] | null;
+
+/** A decode reached an out-of-line value its caller has not loaded (`ChunkReader.loadValues`). */
+export class ValueNotLoadedError extends Error {
+  readonly code = "MINNOW_VALUE_NOT_LOADED";
+  constructor() {
+    super("An out-of-line value was decoded before it was loaded (ChunkReader.loadValues)");
+    this.name = "ValueNotLoadedError";
+  }
+}
+
+/** The pointer in row `row`'s slot of a plain varlen page with large values (parse checked it). */
+export function largePointer(view: PageView, row: number): LargePointer {
+  const offsets = view.unsigned ?? new Uint32Array(1);
+  return decodePointer(view.data ?? new Uint8Array(0), offsets[row] ?? 0, offsets[row + 1] ?? 0);
+}
+
+/** The length of the out-of-line value in row `row` (its pointer's u32 at byte 4; parse checked it). */
+export function largeLength(view: PageView, row: number): number {
+  const data = view.data ?? new Uint8Array(0);
+  const at = (view.unsigned?.[row] ?? 0) + 4;
+  return (
+    ((data[at] ?? 0) | ((data[at + 1] ?? 0) << 8) | ((data[at + 2] ?? 0) << 16)) +
+    (data[at + 3] ?? 0) * 0x1000000
+  );
+}
+
+/** Whether row `row` of the page is stored out of line. */
+export function isLarge(view: PageView, row: number): boolean {
+  return view.large !== null && isBit(view.large, row);
 }
 
 function isBit(words: Uint32Array, row: number): boolean {
@@ -1023,10 +1114,11 @@ export function decodeRange(
   target: FlatVector,
   at: number,
   dictionary: PageDictionary | null = null,
+  values: LargeResolver | null = null,
 ): void {
   checkRange(view, from, to);
   writeValidityRange(view, from, to - from, target.validity, at);
-  decodeValues(view, null, from, to, 0, target, at, dictionary);
+  decodeValues(view, null, from, to, 0, target, at, dictionary, values);
 }
 
 /**
@@ -1044,13 +1136,24 @@ export function gatherRows(
   target: FlatVector,
   at: number,
   dictionary: PageDictionary | null = null,
+  values: LargeResolver | null = null,
 ): void {
   for (let k = start; k < end; k++) {
     const row = (rows[k] ?? 0) - base;
     if (!(row >= 0 && row < view.rowCount)) throw new RangeError("Selected row outside the page");
   }
   gatherValidity(view, rows, start, end, base, target.validity, at);
-  decodeValues(view, rows.subarray(start, end), 0, end - start, base, target, at, dictionary);
+  decodeValues(
+    view,
+    rows.subarray(start, end),
+    0,
+    end - start,
+    base,
+    target,
+    at,
+    dictionary,
+    values,
+  );
 }
 
 function decodeValues(
@@ -1062,6 +1165,7 @@ function decodeValues(
   target: FlatVector,
   at: number,
   dictionary: PageDictionary | null,
+  values: LargeResolver | null,
 ): void {
   const data = target.data;
   const tag = view.tag;
@@ -1121,7 +1225,7 @@ function decodeValues(
     }
     case "varlen":
       expectTag(tag, ValueTag.varlen);
-      decodeVarlen(view, dictionary, rows, from, to, base0, data, at);
+      decodeVarlen(view, dictionary, rows, from, to, base0, data, at, values);
       return;
     case "fixed16":
       expectTag(tag, ValueTag.fixed16);

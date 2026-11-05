@@ -18,6 +18,7 @@
  * | 16 | | validity words (`flags & validity`), u32 per 32 rows, bit set = valid |
  * | | | decimal specials (`flags & specials`), one `DecimalSpecial` byte per row |
  * | | | decimal scales (`flags & scales`), one u16 per row (mixed-scale chunks) |
+ * | | | large-value rows (`flags & large`, plain varlen only), u32 bit words like validity |
  * | | | payload (below) |
  *
  * Payload by `kind`:
@@ -79,6 +80,11 @@ export const PageFlag = {
   scales: 32,
   /** Decimal page of a mixed-scale chunk whose valid rows share one scale: it is `aux`. */
   uniformScale: 64,
+  /**
+   * Plain varlen page with out-of-line values (large-value.ts): a bitmap section marks the rows
+   * whose slot holds a large-value pointer instead of the value.
+   */
+  large: 128,
 } as const;
 
 /** The directory's scale field of a mixed-scale decimal chunk (each page carries its scales). */

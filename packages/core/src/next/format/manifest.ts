@@ -28,7 +28,9 @@
  *   inside one extent); each `PageEntry.offset` is relative to the start of that blob, so a page's
  *   data-space address is `blobAddress(data) + page.offset`. A chunk never spans extents (a writer
  *   that cannot place it contiguously writes a smaller group). Metadata blobs and pages are at most
- *   1 MiB (storage `MAX_BLOB_BYTES`); a chunk's data blob and an extent have no cap.
+ *   1 MiB (storage `MAX_BLOB_BYTES`); a chunk's data blob and an extent have no cap. The parts of
+ *   a chunk's out-of-line values (page/large-value.ts) lie inside its data blob too, so they need
+ *   no reference of their own: reaching the chunk reaches them, and they are reclaimed with it.
  * - **Size.** The root is O(tables + ledger). A table root is O(1) plus its index runs; its group
  *   directory is O(groups); a group root is O(columns); a page directory is O(pages of one
  *   chunk). Nothing is O(rows). Planning and pruning read directories, never pages.

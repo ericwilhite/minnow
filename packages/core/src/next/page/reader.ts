@@ -24,6 +24,16 @@
  *   index directly, FOR pages too, delta pages walk at most one 128-row block per run of
  *   selected rows. `gatherCodes` does the same for dictionary codes.
  *
+ * - **Out-of-line values (R15.4, large-value.ts).** A page slot may hold a pointer to a value of
+ *   up to 64 MiB stored as ≤ 1 MiB parts in the chunk's data. `load` reads pages only; a decode
+ *   that reaches such a row needs its value loaded first (`loadValues` for a range,
+ *   `loadValuesOf` for a selection; `ValueNotLoadedError` otherwise). Loading charges the parts
+ *   to the budget before it reads them (the space's lease), in reads of at most `MAX_READ_BYTES`,
+ *   and keeps them leased (no reassembly copy) until `releaseValues`, `release` of their page or
+ *   `close`; a decode copies the parts straight into the target. A consumer that can stream
+ *   (`valueParts`) holds one verified part at a time. Every pointer is checked against the
+ *   chunk's data range before anything is read.
+ *
  * Decoding is synchronous over loaded pages; every target buffer is the caller's.
  */
 import type { ChunkData, ColumnChunk, PageEntry } from "../format/manifest.js";
@@ -44,12 +54,17 @@ import {
   dictionaryVector,
   gatherCodes,
   gatherRows,
+  isLarge,
+  largeLength,
+  largePointer,
   parseDictionary,
   parsePage,
   varlenBytesOf,
+  type LargeResolver,
   type PageDictionary,
   type PageView,
 } from "./decode.js";
+import { partsOf } from "./large-value.js";
 import {
   checkDirectoryWithin,
   pageIndexOf,
@@ -173,6 +188,22 @@ function sized(bytes: Uint8Array | undefined, length: number): Uint8Array {
 
 const noop = (): void => undefined;
 
+/** One loaded out-of-line value: its verified parts, and what keeps them alive. */
+interface LoadedValue {
+  readonly parts: readonly Uint8Array[];
+  /** Leases its parts came in (shared with other values of a read), or none when peeked. */
+  readonly leases: readonly SharedLease[];
+  /** Bytes the reader charged (peeked parts). */
+  readonly charged: number;
+}
+
+/** A value to load: its chunk row and its parts as blobs. */
+interface ValueJob {
+  readonly row: number;
+  readonly refs: readonly BlobRef[];
+  readonly bytes: number;
+}
+
 export class ChunkReader {
   readonly chunk: ColumnChunk;
   readonly directory: ChunkDirectory;
@@ -188,6 +219,9 @@ export class ChunkReader {
   #dictionary: PageDictionary | null = null;
   #dictionaryHeld: Held | null = null;
   #dictionaryVector: FlatVector | null = null;
+  /** Loaded out-of-line values by chunk row. */
+  readonly #values = new Map<number, LoadedValue>();
+  readonly #valuesPending = new Map<number, Promise<void>>();
   #closed = false;
 
   private constructor(
@@ -553,12 +587,20 @@ export class ChunkReader {
 
   /** Drops loaded pages (all, or the named ones) and their bytes. The dictionary stays. */
   release(pageIndices?: readonly number[]): void {
+    if (pageIndices === undefined) this.releaseValues();
     const indices = pageIndices ?? this.#pages.map((_, index) => index);
     for (const index of indices) {
       if (this.#pages[index] === undefined) continue;
       this.#pages[index] = undefined;
       this.#drop(this.#held[index]);
       this.#held[index] = undefined;
+      const entry = this.directory.pages[index];
+      if (entry !== undefined && this.#values.size > 0)
+        for (const [row, value] of this.#values)
+          if (row >= entry.firstRow && row < entry.firstRow + entry.rowCount) {
+            this.#values.delete(row);
+            this.#dropValue(value);
+          }
     }
   }
 
@@ -576,6 +618,287 @@ export class ChunkReader {
     this.#dictionaryVector = null;
     this.#options.budget.free(this.#directoryCharge);
     if (this.#directoryPin !== null) this.#options.directories?.unpin(this.#directoryPin);
+  }
+
+  // ── Out-of-line values ──────────────────────────────────────────────────────────────────
+
+  /** The loaded values of a page's out-of-line rows, for its decoder (null: the page has none). */
+  #resolver(view: PageView, entry: PageEntry): LargeResolver | null {
+    if (view.large === null) return null;
+    const first = entry.firstRow;
+    return (row) => this.#values.get(first + row)?.parts ?? null;
+  }
+
+  /** The out-of-line rows (chunk positions, ascending) over `[from, to)`; pages must be loaded. */
+  largeRows(from: number, to: number): number[] {
+    const out: number[] = [];
+    const [first, end] = this.pagesInRange(from, to);
+    for (let page = first; page < end; page++) {
+      const view = this.#view(page);
+      if (view.large === null) continue;
+      const entry = at(this.directory.pages, page);
+      const start = Math.max(from, entry.firstRow);
+      const stop = Math.min(to, entry.firstRow + entry.rowCount);
+      for (let row = start; row < stop; row++)
+        if (isLarge(view, row - entry.firstRow)) out.push(row);
+    }
+    return out;
+  }
+
+  /** The out-of-line rows among the selected `rows[start … end)`; pages must be loaded. */
+  largeRowsOf(rows: Rows, start = 0, end = rows.length): number[] {
+    const out: number[] = [];
+    this.#forPages(rows, start, end, (view, entry, k0, k1) => {
+      if (view.large === null) return;
+      for (let k = k0; k < k1; k++) {
+        const row = rows[k] ?? 0;
+        if (isLarge(view, row - entry.firstRow) && out[out.length - 1] !== row) out.push(row);
+      }
+    });
+    return out;
+  }
+
+  /** Bytes of the out-of-line values over `[from, to)` (what `loadValues` charges). */
+  largeValueBytes(from: number, to: number): number {
+    let total = 0;
+    for (const row of this.largeRows(from, to)) total += this.#largeLength(row);
+    return total;
+  }
+
+  /**
+   * Loads the out-of-line values of rows `[from, to)` (their pages must be loaded), so a decode
+   * of those rows can copy them. Synchronous when there are none, they are loaded, or every part
+   * is resident.
+   */
+  loadValues(from: number, to: number): MaybePromise<void> {
+    if (this.#closed) throw new ReaderClosedError();
+    return this.#loadValues(this.largeRows(from, to));
+  }
+
+  /** `loadValues` for the selected `rows[start … end)`. */
+  loadValuesOf(rows: Rows, start = 0, end = rows.length): MaybePromise<void> {
+    if (this.#closed) throw new ReaderClosedError();
+    return this.#loadValues(this.largeRowsOf(rows, start, end));
+  }
+
+  /** Drops loaded out-of-line values: all, or those of the named chunk rows. */
+  releaseValues(rows?: readonly number[]): void {
+    for (const row of rows ?? [...this.#values.keys()]) {
+      const value = this.#values.get(row);
+      if (value === undefined) continue;
+      this.#values.delete(row);
+      this.#dropValue(value);
+    }
+  }
+
+  /** Whether row `row`'s out-of-line value is loaded. */
+  isValueLoaded(row: number): boolean {
+    return this.#values.has(row);
+  }
+
+  /**
+   * Streams the value of chunk row `row` (its page must be loaded): an inline value as one
+   * array, an out-of-line one part by part (≤ 1 MiB each, verified, charged while it is held).
+   * Each yielded array is valid until the next step; nothing is yielded for null. Memory: one
+   * part, whatever the value's size.
+   */
+  async *valueParts(row: number): AsyncGenerator<Uint8Array> {
+    if (this.#closed) throw new ReaderClosedError();
+    const page = pageIndexOf(this.directory.pages, row);
+    const entry = at(this.directory.pages, page);
+    const view = this.#view(page);
+    const local = row - entry.firstRow;
+    if (local < 0 || local >= entry.rowCount) throw new RangeError("Row outside the chunk");
+    if (view.validity !== null && (((view.validity[local >>> 5] ?? 0) >>> (local & 31)) & 1) === 0)
+      return;
+    if (view.allNull) return;
+    if (!isLarge(view, local)) {
+      const offsets = view.unsigned;
+      const data = view.data;
+      if (
+        view.tag !== ValueTag.varlen ||
+        view.kind !== PageEncoding.plain ||
+        offsets === null ||
+        data === null
+      )
+        throw new TypeError("valueParts streams plain varlen pages");
+      yield data.subarray(offsets[local] ?? 0, offsets[local + 1] ?? 0);
+      return;
+    }
+    const loaded = this.#values.get(row);
+    if (loaded !== undefined) {
+      yield* loaded.parts;
+      return;
+    }
+    for (const ref of this.#valueRefs(view, local)) {
+      // The reader may be closed while the consumer holds a part or a read is in flight.
+      this.#live();
+      const lease = await this.#space.read([ref], this.#options);
+      try {
+        this.#live();
+        yield sized(lease.bytes[0], ref.length);
+      } finally {
+        lease.release();
+      }
+    }
+  }
+
+  #live(): void {
+    if (this.#closed) throw new ReaderClosedError();
+  }
+
+  #largeLength(row: number): number {
+    const page = pageIndexOf(this.directory.pages, row);
+    return largeLength(this.#view(page), row - at(this.directory.pages, page).firstRow);
+  }
+
+  /** The parts of a page row's pointer as blobs, checked against the chunk's data range. */
+  #valueRefs(view: PageView, local: number): BlobRef[] {
+    const pointer = largePointer(view, local);
+    check(
+      pointer.offset + pointer.length <= this.chunk.data.length,
+      "Large value outside its chunk's data",
+    );
+    return partsOf(pointer).map((part) => ({
+      extent: this.chunk.data.extent,
+      offset: this.chunk.data.offset + part.offset,
+      length: part.length,
+      checksum: part.checksum,
+    }));
+  }
+
+  #loadValues(rows: readonly number[]): MaybePromise<void> {
+    const waits = new Set<Promise<void>>();
+    const jobs: ValueJob[] = [];
+    for (const row of rows) {
+      if (this.#values.has(row)) continue;
+      const pending = this.#valuesPending.get(row);
+      if (pending !== undefined) {
+        waits.add(pending);
+        continue;
+      }
+      const page = pageIndexOf(this.directory.pages, row);
+      const entry = at(this.directory.pages, page);
+      const refs = this.#valueRefs(this.#view(page), row - entry.firstRow);
+      jobs.push({ row, refs, bytes: refs.reduce((sum, ref) => sum + ref.length, 0) });
+    }
+    if (jobs.length === 0) return waits.size === 0 ? undefined : Promise.all(waits).then(noop);
+    if (waits.size === 0 && this.#valuesCached(jobs)) return;
+    const run = this.#readValues(jobs);
+    for (const job of jobs) this.#valuesPending.set(job.row, run);
+    const settle = (): void => {
+      for (const job of jobs)
+        if (this.#valuesPending.get(job.row) === run) this.#valuesPending.delete(job.row);
+    };
+    run.then(settle, settle);
+    waits.add(run);
+    return waits.size === 1 ? run : Promise.all(waits).then(noop);
+  }
+
+  /** The sync path: every part resident. All or nothing; the reader charges what it peeked. */
+  #valuesCached(jobs: readonly ValueJob[]): boolean {
+    const found: Uint8Array[][] = [];
+    let total = 0;
+    for (const job of jobs) {
+      const parts: Uint8Array[] = [];
+      for (const ref of job.refs) {
+        const bytes = this.#space.peek(ref);
+        if (bytes === null) return false;
+        parts.push(sized(bytes, ref.length));
+      }
+      found.push(parts);
+      total += job.bytes;
+    }
+    if (!this.#options.budget.allocate(total)) return false;
+    jobs.forEach((job, k) => {
+      this.#values.set(job.row, { parts: at(found, k), leases: [], charged: job.bytes });
+    });
+    return true;
+  }
+
+  /**
+   * Reads values in calls of at most `MAX_READ_BYTES`: whole values grouped while they fit, a
+   * larger value in reads of its own. Each value installs when its last part is in.
+   */
+  async #readValues(jobs: readonly ValueJob[]): Promise<void> {
+    let k = 0;
+    while (k < jobs.length) {
+      // Whole values that fit one read together, or one value split across reads.
+      const group: ValueJob[] = [];
+      let bytes = 0;
+      while (k < jobs.length && bytes + at(jobs, k).bytes <= MAX_READ_BYTES) {
+        bytes += at(jobs, k).bytes;
+        group.push(at(jobs, k++));
+      }
+      if (group.length > 0) {
+        await this.#readGroup(group);
+        continue;
+      }
+      await this.#readSplit(at(jobs, k++));
+    }
+  }
+
+  /** Values whose parts fit one read: one lease, shared by them. */
+  async #readGroup(group: readonly ValueJob[]): Promise<void> {
+    if (this.#closed) throw new ReaderClosedError();
+    const lease = await this.#space.read(
+      group.flatMap((job) => job.refs),
+      this.#options,
+    );
+    const shared = new SharedLease(lease, group.length);
+    let next = 0;
+    let installed = 0;
+    try {
+      for (const job of group) {
+        const parts = job.refs.map((ref) => sized(lease.bytes[next++], ref.length));
+        // `#installValue` owns this hold from here, on success or failure.
+        installed++;
+        this.#installValue(job.row, { parts, leases: [shared], charged: 0 });
+      }
+    } finally {
+      for (let rest = installed; rest < group.length; rest++) shared.drop();
+    }
+  }
+
+  /** One value over several reads: it holds every lease until it is released. */
+  async #readSplit(job: ValueJob): Promise<void> {
+    const leases: SharedLease[] = [];
+    const parts: Uint8Array[] = [];
+    try {
+      let start = 0;
+      while (start < job.refs.length) {
+        let end = start;
+        let bytes = 0;
+        while (end < job.refs.length && bytes + at(job.refs, end).length <= MAX_READ_BYTES)
+          bytes += at(job.refs, end++).length;
+        if (end === start) end++;
+        if (this.#closed) throw new ReaderClosedError();
+        const refs = job.refs.slice(start, end);
+        const lease = await this.#space.read(refs, this.#options);
+        leases.push(new SharedLease(lease, 1));
+        refs.forEach((ref, index) => parts.push(sized(lease.bytes[index], ref.length)));
+        start = end;
+      }
+    } catch (error) {
+      for (const lease of leases) lease.drop();
+      throw error;
+    }
+    this.#installValue(job.row, { parts, leases, charged: 0 });
+  }
+
+  /** Installs a loaded value; a closed reader gives it back and refuses (one owner per hold). */
+  #installValue(row: number, value: LoadedValue): void {
+    if (this.#closed || this.#values.has(row)) {
+      this.#dropValue(value);
+      if (this.#closed) throw new ReaderClosedError();
+      return;
+    }
+    this.#values.set(row, value);
+  }
+
+  #dropValue(value: LoadedValue): void {
+    if (value.charged > 0) this.#options.budget.free(value.charged);
+    for (const lease of value.leases) lease.drop();
   }
 
   #view(index: number): PageView {
@@ -655,7 +978,8 @@ export class ChunkReader {
       if (entry === undefined) continue;
       const start = Math.max(from, entry.firstRow) - entry.firstRow;
       const stop = Math.min(to, entry.firstRow + entry.rowCount) - entry.firstRow;
-      decodeRange(this.#view(page), start, stop, target, out, this.#dictionary);
+      const view = this.#view(page);
+      decodeRange(view, start, stop, target, out, this.#dictionary, this.#resolver(view, entry));
       out += stop - start;
     }
   }
@@ -684,7 +1008,17 @@ export class ChunkReader {
   gather(rows: Rows, target: FlatVector, at = 0, start = 0, end = rows.length): void {
     this.#checkTarget(target);
     this.#forPages(rows, start, end, (view, entry, k0, k1) => {
-      gatherRows(view, rows, k0, k1, entry.firstRow, target, at + k0 - start, this.#dictionary);
+      gatherRows(
+        view,
+        rows,
+        k0,
+        k1,
+        entry.firstRow,
+        target,
+        at + k0 - start,
+        this.#dictionary,
+        this.#resolver(view, entry),
+      );
     });
   }
 

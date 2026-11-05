@@ -376,6 +376,7 @@ export async function readChunk(
   const rows = reader.rowCount;
   const [first, end] = reader.pagesInRange(0, rows);
   await reader.load(Array.from({ length: end - first }, (_, index) => first + index));
+  await reader.loadValues(0, rows); // out-of-line values (large-value.ts), if any
   const target = targetFor(reader, rows, reader.varlenBytes(0, rows), options);
   reader.decodeRange(0, rows, target, 0);
   const values = Array.from({ length: rows }, (_, row) => valueAt(target, row));
