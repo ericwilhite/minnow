@@ -22,7 +22,8 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | `vector/`          | contracts → executor             | Batches (byte-bounded), vectors, validity, exact int64, int128 decimals, UTF-8 builder under a grant, locators                                                                                                                                                                                                                                                                                   |
 | `storage/`         | storage                          | Backend contract (lock + async fence open, async mutations), file store, simulated disk with crash model, the storage kit (conformance + durability sweep); the extent space (`extents.ts`: allocation, writer lifecycle, publish, pins and reclaim, the verified page cache), free map, read coalescing, OPFS backend                                                                           |
 | `keys/`            | contracts → executor, key index  | Memcomparable key encoding: reusable writer, batched encoder over vectors, indexable-type rules                                                                                                                                                                                                                                                                                                  |
-| `format/`          | format, write path               | Log frames and multipart transactions, header slots, in-memory and incremental recovery scans, replay rules, request ledger, manifest types                                                                                                                                                                                                                                                      |
+| `format/`          | format, write path               | Log frames and multipart transactions, header slots, in-memory and incremental recovery scans, replay rules, request ledger, manifest types, the reachability walk (`reachable.ts`)                                                                                                                                                                                                              |
+| `page/`            | format                           | Page codecs, page directory and statistics, streaming group writer, chunk reader (ChunkPages), inflated-page cache                                                                                                                                                                                                                                                                               |
 | `spill/`           | executor (OPFS service: storage) | Spill contract (one long-lived scratch file, batching charged to the operator's budget); in-memory double                                                                                                                                                                                                                                                                                        |
 | `memory/`          | executor                         | Memory governor: admission, progress loans, held vs allocated bytes (reference implementation)                                                                                                                                                                                                                                                                                                   |
 | `exec/`            | executor                         | Entry point (`executor.ts`), result frames (`result.ts`), scans (`scan.ts`, `memory-scan.ts`), table rules (`rules.ts`), push driver (`pipeline.ts`), fetcher (`fetch.ts`), comparators, decimal SUM                                                                                                                                                                                             |
@@ -62,6 +63,7 @@ is access's `Snapshot`.
   hash ← storage ← format ← write
   vector, keys, storage, format, memory ← access ← exec, write, lower
   hash, storage ← spill ← exec;  vector ← ir ← lower
+  types, hash, vector, keys, storage, format, memory ← page ← exec, write
   owner ← everything;  testing ← everything
   ```
 
@@ -196,6 +198,36 @@ is access's `Snapshot`.
   required size, and encoding resumes from where it stopped.
 - Frozen by golden vectors and generated tests over every encodable type.
 
+### Pages (`page/`)
+
+- A column chunk is `[pages][dictionary page][directory]` in one extent. The directory (a
+  `BlobRef` inside the extent) lists every page's rows, encoding, null count, min/max and
+  xxHash32, plus the chunk's distinct sketch, so pruning and planning never read pages.
+- Encodings (`encode.ts` has the selection rules): constant (and all-null), plain, bool bitmap,
+  frame of reference at u8/u16/u32 over an int64 base, delta (FOR over successive differences,
+  a checkpoint every 128 rows), and dictionary codes (u8/u16/u32, or one code) into a
+  group-scoped dictionary. gzip is an opt-in second stage for varlen and uuid pages ≥ 16 KiB,
+  kept only at ≥ 2×; off by default, because the space caches encoded blobs and a gzip page
+  inflates on every load.
+- Every page, dictionary page and directory is one blob of at most 1 MiB. A single value too
+  large for a page is `UnsupportedPageLayoutError` (a large-value layout is still to come).
+- NUMERIC: a declared scale makes a fixed-scale chunk; an unconstrained NUMERIC keeps each
+  value's scale (a per-row section, or one scale per page). Coefficients are stored in the int64
+  rules when they fit, else as 128-bit limbs. Past 128 bits: `UnsupportedPageLayoutError`.
+- `ChunkReader` is the executor's `ChunkPages`: it opens over the extent space's reader (`read`
+  with a lease, `peek` for cache hits). The space verifies each blob's checksum once, on its way
+  in from storage; the reader parses (structural checks) when it loads a page, and a loaded page
+  decodes with no checks. `open`, `load` and `loadDictionary` are synchronous when everything
+  they need is cached. Every byte a loaded page holds is charged to the reader's budget until
+  `release` or `close`. Reads go out in calls of at most 4 MiB.
+- Decoders write into caller-owned vector buffers, with no JS strings and no per-value
+  allocation: by range, by selection (late materialization), or as dictionary codes.
+- The writer streams pages into extents from an `ExtentAllocator` (the write path's free-space
+  map): small chunks share one packed extent, large ones get their own and are relocated if they
+  outgrow it. Every buffer it holds is charged to its grant.
+- `memory-extents.ts` is the in-memory data space and allocator for tests and benchmarks;
+  `scripts/page-format-bench.mts` measures the codecs against today's block format.
+
 ### Manifest (`format/manifest.ts`)
 
 - The root is O(tables + ledger). Nothing is O(rows).
@@ -210,6 +242,10 @@ is access's `Snapshot`.
   current and previous roots) → open the write path (a single log scan and replay, `publishedRows`
   staging included) → spill sweep → ready.
 - Snapshot pins live in memory and are dropped when their client's lock is released.
+- `reachable(root, reader)` lists every range a root references (catalog, table statistics,
+  group directories including staged ones, group roots, deletion bitmaps, row-id columns, chunk
+  extents, page directories, sketches, index entries, fences and Bloom filters); `occupied`
+  merges them into aligned free-space units. A failed metadata read rejects the walk.
 
 ### Storage access (`access/`)
 
