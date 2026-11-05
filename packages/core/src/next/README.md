@@ -119,9 +119,9 @@ is access's `Snapshot`.
   - IndexedDB: a durable epoch record that every transaction checks.
 - Every mutation is async and checks ownership in the same step that applies its effect. A fenced
   owner changes nothing.
-- The store is four long-lived files: log, data space, and two root slots. OPFS adds a fifth, the
-  spill scratch file, opened under the same fence. Extents are reused in place inside the data
-  space.
+- The store is four long-lived files: log, data space, and two root slots. OPFS adds the spill
+  scratch file and an 8-byte epoch file, all six opened under the same fence. Extents are reused in
+  place inside the data space.
 - `publish` is atomic and durable: it flushes data, then writes the inactive root slot.
 - The log has a flush barrier and two header slots.
 - **The extent space** (`extents.ts`) is the only caller of the data-space calls and of `publish`.
@@ -150,6 +150,15 @@ is access's `Snapshot`.
     `space-crash.test.ts` crashes it at every physical step of a workload and reopens.
 - **The in-memory backend** (`memory-store.ts`) is the file store over growable in-memory files:
   the store of an in-memory database and of the end-to-end suites. It has no scratch space.
+- **The OPFS backend** (`opfs.ts`: `createOpfsBackend`, `webLocks`) is the file store over real
+  sync access handles: the Web Lock, then every handle with bounded retry; a lost lock closes them
+  at once; quota signals become `StoreQuotaError` by name. It passes the storage kit over
+  simulated handles (`opfs.test.ts`), and `browser-tests/next-storage.spec.ts` runs conformance,
+  a worker killed during publish, a closed owner tab, the cross-worker fence and spill in real
+  Chromium, Firefox and WebKit.
+- A writer that interleaves many builders (the page format's group writer) passes a `budget` to
+  `beginWrite`: each builder stages up to 256 KiB of its own. Without it, alternating page-by-page
+  appends cost one platform write per page (measured 2–9× a flush on Chromium and Firefox).
 - The simulated disk crashes at any physical step. Every write after the last flush may land
   whole, torn or not at all, and may land out of order. It models honest and lying flush.
 - A backend is accepted by the **storage kit** (`kit.ts`): the conformance cases together with a
@@ -323,6 +332,9 @@ and the owner import it directly.
 - No per-query caps.
 - Write batching is charged to the operator's budget, and is skipped when the budget refuses, so
   spilling never needs memory beyond the page in hand.
+- `scratch-spill.ts` is the service over a backend's `ScratchSpace` (the OPFS `spill` file now,
+  IndexedDB's `spill` store later): one free map, 256 KiB batches written as extents that extend
+  the file's last one, checksummed reads, `sweep` at startup.
 
 ### Memory (`memory/governor.ts`)
 
