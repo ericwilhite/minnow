@@ -26,17 +26,13 @@
 import type { CheckDef, TableDef } from "../access/catalog.js";
 import type { TableRules } from "../access/modify.js";
 import type { ScalarExpr } from "../ir/ir.js";
+import type { TableRuleExpressions } from "../ir/rules.js";
 import { samePhysicalType } from "../types.js";
 import type { Batch } from "../vector/vector.js";
 import { UnsupportedPlanError } from "./errors.js";
 
-/** The lowered forms of a table's rule expressions (built by lowering from the catalog's SQL). */
-export interface TableRuleExpressions {
-  /** One per `TableDef.checks` entry, by `checkId`: a bool expression over the table's columns. */
-  readonly checks: ReadonlyArray<{ readonly checkId: number; readonly condition: ScalarExpr }>;
-  /** One per column with `generatedSql`, by column id: an expression of exactly its type. */
-  readonly generated: ReadonlyArray<{ readonly columnId: number; readonly expr: ScalarExpr }>;
-}
+/** The lowered forms of a table's rule expressions: defined once in ir/rules.ts (lowering builds them). */
+export type { TableRuleExpressions } from "../ir/rules.js";
 
 export class RuleCompileError extends TypeError {
   readonly code = "MINNOW_RULE_COMPILE";
