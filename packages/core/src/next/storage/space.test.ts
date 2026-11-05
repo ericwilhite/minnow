@@ -18,11 +18,12 @@ import {
 } from "./extents.js";
 import { MemoryBackend } from "./memory-store.js";
 import { ENTRY_OVERHEAD, FIXED_CACHE_BYTES } from "./page-cache.js";
-import { openExtentSpace } from "./space.js";
+import { BUILDER_BUFFER_BYTES, openExtentSpace } from "./space.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 import {
   at,
   bytesOf,
+  sameBytes,
   countingBudget,
   countingMemory,
   jsonReachable,
@@ -131,7 +132,7 @@ describe("extent space: writing, publishing and reopening", () => {
     const flat = expected.flat();
     for (let index = 0; index < blobs.length; index++) {
       const lease = await space.read([at(blobs, index)], { budget });
-      expect(lease.bytes[0]).toEqual(flat[index]);
+      expect(sameBytes(lease.bytes[0], flat[index]), `blob ${String(index)}`).toBe(true);
       lease.release();
     }
     await space.publish(rootOf(blobs), { writers: [writer], retired: [] });
@@ -193,6 +194,48 @@ describe("extent space: writing, publishing and reopening", () => {
       /already retired/u,
     );
     expect(space.failed).toBeNull();
+  });
+});
+
+describe("extent space: per-builder staging buffers (writer budget)", () => {
+  it("keeps interleaved builders' bytes exact, charges each buffer, and returns it at seal or abort", async () => {
+    const { space, budget: reader } = await openOver(new MemoryBackend());
+    const charge = countingBudget(3 * BUILDER_BUFFER_BYTES);
+    const writer = space.beginWrite("columns", { budget: charge });
+    const builders = Array.from({ length: 4 }, () => writer.open(1 << 20));
+    // Three buffers fit the budget; the fourth builder shares the slab.
+    expect(charge.used).toBe(3 * BUILDER_BUFFER_BYTES);
+    const expected: Uint8Array[][] = [[], [], [], []];
+    let seed = 1;
+    for (let round = 0; round < 40; round++)
+      for (let index = 0; index < builders.length; index++) {
+        const part = bytesOf(7_000 + ((round * 37 + index * 11) % 9_000), seed++);
+        await at(builders, index).append([part]);
+        at(expected, index).push(part);
+      }
+    const blobs: BlobRef[] = [];
+    for (const builder of builders.slice(0, 3)) {
+      const sealed = await builder.seal();
+      if (sealed === null) throw new Error("sealed empty");
+      blobs.push(...sealed.blobs);
+    }
+    expect(charge.used).toBe(0);
+    for (let index = 0; index < blobs.length; index++) {
+      const lease = await space.read([at(blobs, index)], { budget: reader });
+      expect(
+        sameBytes(lease.bytes[0], expected.slice(0, 3).flat()[index]),
+        `blob ${String(index)}`,
+      ).toBe(true);
+      lease.release();
+    }
+    const aborted = space.beginWrite("aborted", { budget: charge });
+    await aborted.open(DATA_ALIGN).append([bytesOf(100, 1)]);
+    expect(charge.used).toBe(DATA_ALIGN);
+    await aborted.abort();
+    expect(charge.used).toBe(0);
+    await writer.abort();
+    await (space as unknown as { settled(): Promise<void> }).settled();
+    await space.audit();
   });
 });
 
