@@ -120,8 +120,8 @@ is access's `Snapshot`.
 - Every mutation is async and checks ownership in the same step that applies its effect. A fenced
   owner changes nothing.
 - The store is four long-lived files: log, data space, and two root slots. OPFS adds the spill
-  scratch file and an 8-byte epoch file, all six opened under the same fence. Extents are reused in
-  place inside the data space.
+  scratch file and the epoch counter (two checksummed slots, flushed before a lease exists), all six
+  opened under the same fence. Extents are reused in place inside the data space.
 - `publish` is atomic and durable: it flushes data, then writes the inactive root slot.
 - The log has a flush barrier and two header slots.
 - **The extent space** (`extents.ts`) is the only caller of the data-space calls and of `publish`.
