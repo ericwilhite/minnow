@@ -233,13 +233,26 @@ export interface GroupSegment extends SegmentBase {
 export interface MemorySegment extends SegmentBase {
   readonly kind: "memory";
   /**
-   * Chunk `chunk` (rows `chunk × MEMORY_CHUNK_ROWS …`, at most `rowCount`) of `columnId`, in its
-   * exact physical type. While resident it returns a borrowed, immutable flat or dictionary vector
-   * synchronously and ignores `out` (see "Borrow" for how long it stays valid). After a re-point
-   * it decodes into `out` and may return a Promise; a varlen builder answering `full` or `denied`
-   * gives `{ partial: k }` (slots before k complete).
+   * Rows of chunk `chunk` (rows `chunk × MEMORY_CHUNK_ROWS …`, at most `rowCount`) of `columnId`,
+   * in its exact physical type, from chunk-relative row `startRow` (default 0) on.
+   * - **Resident** (the normal case): a borrowed, immutable flat or dictionary vector of the whole
+   *   chunk, synchronously: `firstRow` 0, `complete` true, `out` unused (see "Borrow" for how long
+   *   it stays valid). It covers `startRow` like any result; the caller offsets by `firstRow`.
+   * - **Re-pointed:** decodes rows `startRow …` into `out` (slot k = chunk row `startRow + k`),
+   *   and may return a Promise. If `out.varlen` answers `full` (the batch reached its byte target)
+   *   or `denied` (its grant refused), it stops: `firstRow` = `startRow`, slots `0 … rowCount − 1`
+   *   are complete, `complete` false and `reason` says why. The caller emits (or, for `denied`,
+   *   borrows a progress loan), resets the builder, and calls again with
+   *   `startRow = resumeRow(result)`. `full` always carries at least one row (a builder admits one
+   *   oversized value into an empty batch), so resuming always progresses.
+   * `startRow` outside `0 … chunk length − 1` is a `RangeError`.
    */
-  chunk(columnId: number, chunk: number, out: ChunkOutput): MaybePromise<ChunkResult>;
+  chunk(
+    columnId: number,
+    chunk: number,
+    out: ChunkOutput,
+    startRow?: number,
+  ): MaybePromise<ChunkResult>;
 }
 
 /** Caller-owned buffers for a re-pointed memory chunk (capacity ≥ `MEMORY_CHUNK_ROWS`). */
@@ -249,7 +262,22 @@ export interface ChunkOutput {
   readonly varlen: VarlenBuilder | null;
 }
 
-export type ChunkResult = Vector | { readonly partial: number };
+/** What `MemorySegment.chunk` produced: chunk rows `firstRow … firstRow + rowCount − 1`. */
+export interface ChunkResult {
+  /** Slot k holds chunk row `firstRow + k`. */
+  readonly vector: Vector;
+  readonly firstRow: number;
+  readonly rowCount: number;
+  /** True when the vector reaches the chunk's last row. */
+  readonly complete: boolean;
+  /** Why an incomplete result stopped; null when complete. */
+  readonly reason: "full" | "denied" | null;
+}
+
+/** The `startRow` to resume an incomplete chunk read from, or null when it is complete. */
+export function resumeRow(result: ChunkResult): number | null {
+  return result.complete ? null : result.firstRow + result.rowCount;
+}
 
 /** Memory segments store rows in chunks of this many rows (= `BATCH_ROWS`). */
 export const MEMORY_CHUNK_ROWS = 2048;

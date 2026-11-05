@@ -202,7 +202,8 @@ and the owner import it directly.
   the rest of a block. A standalone `SELECT nextval(…)` is at-least-once: a retry draws new values.
 - **Scans are built on segments.** A snapshot lists each table's segments in locator order (groups,
   then memory), with sound page bounds (exact or null), deletion vectors for live rows, and
-  dictionary codes kept. Groups are read through B1's verified cache with the format chunk readers.
+  dictionary codes kept. Groups are read through B1's verified cache with the format chunk readers. A
+  memory chunk read that stops early (varlen output full or denied) resumes at `resumeRow(result)`.
 - **Retention is bounded.** A reader borrows at most one chunk per memory segment. A frozen memtable
   stays resident (capped, writers wait past the cap) only until its flush publishes; then its
   readers are re-pointed to the published group under a pin taken during that publication, and

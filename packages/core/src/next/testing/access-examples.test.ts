@@ -22,6 +22,9 @@ import {
 import {
   MEMORY_CHUNK_ROWS,
   readBound,
+  resumeRow,
+  type ChunkOutput,
+  type ChunkResult,
   type DeletionVector,
   type MemorySegment,
   type Snapshot,
@@ -40,6 +43,7 @@ import { Governor, type Grant } from "../memory/governor.js";
 import type { PhysicalType } from "../types.js";
 import { packLocator } from "../vector/locator.js";
 import { allocateSelection } from "../vector/validity.js";
+import { decodeUtf8, VarlenBuilder } from "../vector/varlen.js";
 import { allocateFlat, type Batch, type FlatVector, type Selection } from "../vector/vector.js";
 
 const INT: PhysicalType = { kind: "int32", bits: 32 };
@@ -182,9 +186,15 @@ function memoryTable(): TableSnapshot {
         dictionarySize: null,
       },
     ],
-    chunk(columnId) {
-      // Resident: a borrowed vector (valid until another chunk index is read), `out` unused.
-      return ints(SEGMENT.get(columnId) ?? []);
+    chunk(columnId): ChunkResult {
+      // Resident: a borrowed vector of the whole chunk (valid until another chunk index is read).
+      return {
+        vector: ints(SEGMENT.get(columnId) ?? []),
+        firstRow: 0,
+        rowCount: ROWS.length,
+        complete: true,
+        reason: null,
+      };
     },
   };
   return {
@@ -311,9 +321,11 @@ async function sumIds(view: Snapshot, budget: Grant): Promise<number> {
     for (let chunk = 0; chunk * MEMORY_CHUNK_ROWS < segment.rowCount; chunk++) {
       const from = chunk * MEMORY_CHUNK_ROWS;
       const length = Math.min(MEMORY_CHUNK_ROWS, segment.rowCount - from);
-      const vector = await settle(segment.chunk(0, chunk, out));
-      if ("partial" in vector || vector.form !== "flat" || vector.data.layout !== "i32")
-        throw new Error("an int32 column reads as a flat int32 vector here");
+      const result = await settle(segment.chunk(0, chunk, out));
+      const vector = result.vector;
+      // An int32 column never stops early: only varlen output can be partial (see below).
+      if (!result.complete || vector.form !== "flat" || vector.data.layout !== "i32")
+        throw new Error("an int32 column reads as one complete flat int32 vector here");
       if (deleted === null) live.count = 0;
       else deleted.liveRows(from, length, null, live);
       const count = deleted === null ? length : live.count;
@@ -324,6 +336,68 @@ async function sumIds(view: Snapshot, budget: Grant): Promise<number> {
   return sum;
 }
 
+// A re-pointed memory segment: `chunk()` decodes text into the caller's varlen builder, which
+// may fill up mid-chunk. The executor emits what it has and resumes at `resumeRow(result)`.
+
+const TEXT: PhysicalType = { kind: "text" };
+const WORDS = ["aaaa", "bbbb", "cccc", "dddd"];
+
+/** The stand-in's decode path (what the write path does after a re-point). */
+function repointedChunk(out: ChunkOutput, startRow = 0): Promise<ChunkResult> {
+  const builder = out.varlen;
+  if (builder === null) throw new TypeError("text needs a varlen builder");
+  if (!(startRow >= 0 && startRow < WORDS.length)) throw new RangeError("startRow out of range");
+  let row = startRow;
+  let reason: "full" | "denied" | null = null;
+  for (; row < WORDS.length; row++) {
+    const appended = builder.appendString(WORDS[row] ?? "");
+    if (appended !== "ok") {
+      reason = appended;
+      break;
+    }
+  }
+  const rowCount = row - startRow;
+  const vector: FlatVector = {
+    form: "flat",
+    type: TEXT,
+    length: rowCount,
+    validity: null,
+    data: builder.data(),
+  };
+  return Promise.resolve({
+    vector,
+    firstRow: startRow,
+    rowCount,
+    complete: reason === null,
+    reason,
+  });
+}
+
+/** The executor's loop over one re-pointed chunk: emit each part, reset, resume. */
+async function readTextChunk(
+  read: (out: ChunkOutput, startRow: number) => MaybePromise<ChunkResult>,
+  out: ChunkOutput,
+  emit: (firstRow: number, values: string[]) => void,
+): Promise<number> {
+  let calls = 0;
+  let startRow: number | null = 0;
+  while (startRow !== null) {
+    const result = await settle(read(out, startRow));
+    calls += 1;
+    const vector = result.vector;
+    if (vector.form !== "flat" || vector.data.layout !== "varlen") throw new TypeError("text");
+    const data = vector.data;
+    emit(
+      result.firstRow,
+      Array.from({ length: result.rowCount }, (_, k) => decodeUtf8(data, k)),
+    );
+    // `denied` would borrow a progress loan here before resuming.
+    out.varlen?.reset();
+    startRow = resumeRow(result);
+  }
+  return calls;
+}
+
 describe("executor reads through the access contracts", () => {
   it("point read: probe the primary key, fetch through the same pin", async () => {
     const view = readSnapshot();
@@ -331,6 +405,30 @@ describe("executor reads through the access contracts", () => {
     const grant = await smallGrant();
     expect(await pointRead(view, fetcher, grant, 3)).toBe(8);
     expect(await pointRead(view, fetcher, grant, 99)).toBeNull();
+  });
+
+  it("memory chunk: a partial read resumes at its start row in a second call", async () => {
+    // An 8-byte batch target: two 4-byte words fit, the third makes the builder full.
+    const varlen = new VarlenBuilder(MEMORY_CHUNK_ROWS, await smallGrant(), 8, 16);
+    const out: ChunkOutput = {
+      flat: allocateFlat(TEXT),
+      codes: new Int32Array(MEMORY_CHUNK_ROWS),
+      varlen,
+    };
+    const parts: Array<[number, string[]]> = [];
+    const calls = await readTextChunk(repointedChunk, out, (firstRow, values) =>
+      parts.push([firstRow, values]),
+    );
+    expect(calls).toBe(2);
+    expect(parts).toEqual([
+      [0, ["aaaa", "bbbb"]],
+      [2, ["cccc", "dddd"]],
+    ]);
+    const first = await repointedChunk(out, 0);
+    expect([first.complete, first.reason, resumeRow(first)]).toEqual([false, "full", 2]);
+    varlen.reset();
+    const last = await repointedChunk(out, 2);
+    expect([last.complete, last.reason, resumeRow(last)]).toEqual([true, null, null]);
   });
 
   it("scan: segments in locator order, deleted rows filtered", async () => {
