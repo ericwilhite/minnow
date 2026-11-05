@@ -100,8 +100,11 @@ export class SimDisk {
   /** IndexedDB-style durable epoch record (the epoch fence). */
   epoch = 0;
   steps = 0;
+  /** Power losses so far: a simulated IndexedDB reloads its state from disk after each. */
+  crashes = 0;
   readonly #options: SimDiskOptions;
   readonly #random: () => number;
+  #armed = true;
 
   constructor(options: SimDiskOptions = {}) {
     this.#options = options;
@@ -142,7 +145,7 @@ export class SimDisk {
       state.current = apply(state.current, operation);
       state.pending.push(operation);
     }
-    if (step === this.#options.crashAtStep) {
+    if (this.#armed && step === this.#options.crashAtStep) {
       this.powerLoss();
       throw new SimulatedCrash();
     }
@@ -155,8 +158,14 @@ export class SimDisk {
     state.pending = [];
   }
 
-  /** Crash now: resolve every file to one allowed post-crash image, kill handles. */
+  /**
+   * Crash now: resolve every file to one allowed post-crash image, kill handles. A power loss
+   * consumes the planned crash: the next process's own writes (an OPFS acquisition writes its
+   * epoch) never crash again.
+   */
   powerLoss(): void {
+    this.#armed = false;
+    this.crashes += 1;
     const random = this.#random;
     for (const state of this.files.values()) {
       let image = state.durable;
