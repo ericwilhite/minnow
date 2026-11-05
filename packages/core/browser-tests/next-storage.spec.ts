@@ -3,8 +3,10 @@
  * access handles in dedicated workers, on a persistent profile on disk (fixtures.ts):
  * store conformance, kill and tab close during publish, the handle fence across workers, the spill
  * scratch file, and (opt-in, MINNOW_NEXT_STORAGE_BENCH=1) the page format's builder pattern.
+ * The same scenarios run on the IndexedDB backend, on the persistent profile and where OPFS is
+ * absent (Firefox private browsing, a WebKit ephemeral session as in Safari private browsing).
  */
-import { expect } from "@playwright/test";
+import { chromium, expect, firefox, webkit, type Page } from "@playwright/test";
 import { requireWorkerOpfs, test } from "./fixtures.js";
 
 type Run = typeof import("../browser/next-storage-run.js");
@@ -117,5 +119,90 @@ test.describe("rebuild core storage on OPFS", () => {
       contentType: "application/json",
     });
     console.log(JSON.stringify(result));
+  });
+});
+
+/** Conformance, kills in every phase, the fence and spill, on the IndexedDB backend of `page`. */
+async function indexedDbScenarios(page: Page, iterations: number) {
+  return page.evaluate(
+    async ([url, count]) => {
+      const run = (await import(url)) as Run;
+      run.useStore("indexeddb");
+      return {
+        conformance: await run.runConformance(),
+        kill: await run.runKillDuringPublish(count, 0x1dbb),
+        steal: await run.runSteal(),
+        spill: await run.runSpill(),
+      };
+    },
+    [RUN, iterations] as const,
+  );
+}
+
+function expectIndexedDbScenarios(result: Awaited<ReturnType<typeof indexedDbScenarios>>) {
+  expect(result.conformance.filter((entry) => entry.error !== null)).toEqual([]);
+  for (const phase of ["writing", "publishing", "published"] as const)
+    expect(result.kill.iterations.some((iteration) => iteration.target === phase)).toBe(true);
+  for (const iteration of result.kill.iterations) {
+    expect(iteration.round).toBeGreaterThanOrEqual(iteration.acked);
+    if (iteration.round > 1) expect(iteration.previous).toBe(iteration.round - 1);
+  }
+  expect(result.steal.waited).toMatchObject({ ok: false, error: "OwnerUnresponsiveError" });
+  expect(result.steal.stolen.ok).toBe(true);
+  expect(result.steal.loser).toEqual({ lost: true, error: "OwnershipLostError" });
+  expect(result.spill).toMatchObject({ pages: 64, after: 0 });
+}
+
+test.describe("rebuild core storage on IndexedDB", () => {
+  test("persistent profile: conformance, kills in every phase, the epoch fence and spill", async ({
+    page,
+  }) => {
+    test.setTimeout(240_000);
+    await page.goto("/packages/core/browser/");
+    expectIndexedDbScenarios(await indexedDbScenarios(page, 9));
+  });
+
+  test("where OPFS is absent, the owner gets IndexedDB and it works", async ({
+    browserName,
+  }, info) => {
+    test.setTimeout(240_000);
+    test.skip(browserName === "chromium", "Chromium incognito keeps OPFS (its own test)");
+    // Firefox: real private browsing (OPFS is SecurityError). WebKit: an ephemeral session, Safari
+    // private browsing's store (getDirectory is UnknownError).
+    const browser =
+      browserName === "firefox"
+        ? await firefox.launch({ firefoxUserPrefs: { "browser.privatebrowsing.autostart": true } })
+        : await webkit.launch();
+    try {
+      const context = await browser.newContext({ baseURL: info.project.use.baseURL ?? "" });
+      const page = await context.newPage();
+      await page.goto("/packages/core/browser/");
+      const chosen = await page.evaluate(async (url) => {
+        return ((await import(url)) as Run).runChoose();
+      }, RUN);
+      expect(chosen).toEqual({
+        kind: "indexeddb",
+        opfsRefused: browserName === "firefox" ? "SecurityError" : "UnknownError",
+      });
+      expectIndexedDbScenarios(await indexedDbScenarios(page, 6));
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test("Chromium incognito keeps OPFS", async ({ browserName }, info) => {
+    test.skip(browserName !== "chromium", "Chromium only");
+    const browser = await chromium.launch();
+    try {
+      const context = await browser.newContext({ baseURL: info.project.use.baseURL ?? "" });
+      const page = await context.newPage();
+      await page.goto("/packages/core/browser/");
+      const chosen = await page.evaluate(async (url) => {
+        return ((await import(url)) as Run).runChoose();
+      }, RUN);
+      expect(chosen).toEqual({ kind: "opfs", opfsRefused: null });
+    } finally {
+      await browser.close();
+    }
   });
 });

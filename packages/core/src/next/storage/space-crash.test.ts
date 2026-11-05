@@ -9,7 +9,10 @@
 import { describe, expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import type { BlobRef, ExtentRef, ExtentSpace } from "./extents.js";
-import { SimBackend, SimDisk, SimulatedCrash } from "./sim-disk.js";
+import type { StorageBackend } from "./contract.js";
+import { createIndexedDbBackend } from "./indexeddb.js";
+import { SimBackend, SimDisk, SimLocks } from "./sim-disk.js";
+import { simIndexedDb } from "./sim-idb.js";
 import { blobsOf, bytesOf, openOver, rootOf } from "./space-test-support.js";
 import { DATA_ALIGN } from "./contract.js";
 
@@ -66,13 +69,23 @@ async function readAll(space: ExtentSpace, blobs: readonly BlobRef[]): Promise<v
 
 describe("extent space crash sweep", () => {
   it.each([
-    ["growing in place", false],
-    ["relocating at seal (review B1-p2a)", true],
+    ["files", "growing in place", false],
+    ["files", "relocating at seal (review B1-p2a)", true],
+    ["IndexedDB", "growing in place", false],
+    ["IndexedDB", "relocating at seal", true],
   ] as const)(
-    "%s: reopens to an intact current and previous root, an exact free map, and keeps writing",
-    async (_name, forceRelocation) => {
+    "%s, %s: reopens to an intact current and previous root, an exact free map, and keeps writing",
+    async (store, _name, forceRelocation) => {
+      const backendOf = (disk: SimDisk): StorageBackend =>
+        store === "files"
+          ? new SimBackend(disk)
+          : createIndexedDbBackend({
+              database: () => simIndexedDb(disk),
+              name: "db",
+              locks: new SimLocks(),
+            });
       const clean = new SimDisk();
-      const { space } = await openOver(new SimBackend(clean));
+      const { space } = await openOver(backendOf(clean));
       await workload(space, { published: [], inFlight: null }, 5, 1, [], forceRelocation);
       if (forceRelocation) expect(space.stats.relocations).toBeGreaterThan(0);
       else expect(space.stats.relocations).toBe(0);
@@ -83,14 +96,17 @@ describe("extent space crash sweep", () => {
           const disk = new SimDisk({ crashAtStep: step, seed: seed + step * 7919 });
           const ack: Ack = { published: [], inFlight: null };
           try {
-            const { space: first } = await openOver(new SimBackend(disk));
+            const { space: first } = await openOver(backendOf(disk));
             await workload(first, ack, 5, 1, [], forceRelocation);
             disk.powerLoss();
           } catch (error) {
-            if (!(error instanceof SimulatedCrash)) throw error;
+            // Once the disk has crashed the process is dead, whatever its calls then report (a
+            // crash in background work, an IndexedDB release, fails the space; a call in flight
+            // meets a dead handle). Before a crash, any error is a real failure.
+            if (disk.crashes === 0) throw error;
           }
           const label = `crash at step ${String(step)}, seed ${String(seed)}`;
-          const { space: reopened } = await openOver(new SimBackend(disk));
+          const { space: reopened } = await openOver(backendOf(disk));
           const root = text(reopened.root);
           expect([ack.published.at(-1) ?? null, ack.inFlight], label).toContain(root);
           const history = [...ack.published, ...(ack.inFlight === null ? [] : [ack.inFlight])];
@@ -123,7 +139,8 @@ describe("extent space crash sweep", () => {
           checked += 1;
         }
       expect(checked).toBe(steps * SEEDS.length);
-      expect(steps).toBeGreaterThan(30);
+      // The workload reaches dozens of physical steps (fewer for IndexedDB: one log record each).
+      expect(steps).toBeGreaterThan(store === "files" ? 30 : 15);
     },
   );
 

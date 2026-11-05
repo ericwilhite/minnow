@@ -100,6 +100,8 @@ export class SimDisk {
   /** IndexedDB-style durable epoch record (the epoch fence). */
   epoch = 0;
   steps = 0;
+  /** Power losses so far: a simulated IndexedDB reloads its state from disk after each. */
+  crashes = 0;
   readonly #options: SimDiskOptions;
   readonly #random: () => number;
   #armed = true;
@@ -163,6 +165,7 @@ export class SimDisk {
    */
   powerLoss(): void {
     this.#armed = false;
+    this.crashes += 1;
     const random = this.#random;
     for (const state of this.files.values()) {
       let image = state.durable;

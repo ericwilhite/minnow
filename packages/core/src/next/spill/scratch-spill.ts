@@ -1,6 +1,6 @@
 /**
  * The spill service over a backend's scratch space (contract.ts "Implementations"): OPFS's `spill`
- * file now, IndexedDB's `spill` object store later, through the same `ScratchSpace`.
+ * file or IndexedDB's `spill` object store, through the same `ScratchSpace`.
  *
  * - **Space.** One `FreeSpaceMap` over the scratch space. A file is a list of extents; each batch
  *   write first tries to extend the file's last extent in place (`allocateAt`), so a run is written

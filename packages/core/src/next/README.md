@@ -156,6 +156,17 @@ is access's `Snapshot`.
   simulated handles (`opfs.test.ts`), and `browser-tests/next-storage.spec.ts` runs conformance,
   a worker killed during publish, a closed owner tab, the cross-worker fence and spill in real
   Chromium, Firefox and WebKit.
+- **The IndexedDB backend** (`indexeddb.ts` over `idb-like.ts`) is the same contract where OPFS is
+  absent: the Web Lock plus a durable epoch read inside every read-write transaction (a stale
+  owner that never heard of its lock loss, as after Safari's bfcache, changes nothing); byte
+  records keyed by offset, kept disjoint, ArrayBuffers only; relaxed writes, strict publish and
+  log flush; the spill store. `sim-idb.ts` simulates IndexedDB as a checksum-chained write-ahead
+  log on the simulated disk, so the IndexedDB backend passes the same storage kit and extent-space
+  crash sweep as the files. The browser suite runs it on the persistent profile and in Firefox
+  private browsing and a WebKit ephemeral session.
+- `select.ts` (`chooseBackend`) picks OPFS where a dedicated worker can open sync handles, else
+  IndexedDB (reporting OPFS's refusal), else memory (Safari Lockdown Mode). Layout `minnow-core/`
+  and `minnow-core:<name>`, apart from the pre-reset engine's names.
 - A writer that interleaves many builders (the page format's group writer) passes a `budget` to
   `beginWrite`: each builder stages up to 256 KiB of its own. Without it, alternating page-by-page
   appends cost one platform write per page (measured 2–9× a flush on Chromium and Firefox).
@@ -332,8 +343,8 @@ and the owner import it directly.
 - No per-query caps.
 - Write batching is charged to the operator's budget, and is skipped when the budget refuses, so
   spilling never needs memory beyond the page in hand.
-- `scratch-spill.ts` is the service over a backend's `ScratchSpace` (the OPFS `spill` file now,
-  IndexedDB's `spill` store later): one free map, 256 KiB batches written as extents that extend
+- `scratch-spill.ts` is the service over a backend's `ScratchSpace` (the OPFS `spill` file or
+  IndexedDB's `spill` store): one free map, 256 KiB batches written as extents that extend
   the file's last one, checksummed reads, `sweep` at startup.
 
 ### Memory (`memory/governor.ts`)

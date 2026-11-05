@@ -8,6 +8,9 @@ import { storeConformanceCases } from "../src/next/storage/conformance.js";
 import type { StorageBackend } from "../src/next/storage/contract.js";
 import type { BlobRef, ExtentRef, ExtentSpace } from "../src/next/storage/extents.js";
 import { createOpfsBackend, webLocks, type OpfsDirectoryLike } from "../src/next/storage/opfs.js";
+import { openIndexedDb } from "../src/next/storage/idb-like.js";
+import { createIndexedDbBackend } from "../src/next/storage/indexeddb.js";
+import { chooseBackend } from "../src/next/storage/select.js";
 import { openExtentSpace } from "../src/next/storage/space.js";
 import {
   bytesOf,
@@ -17,8 +20,12 @@ import {
 } from "../src/next/storage/space-test-support.js";
 import { ScratchSpillService } from "../src/next/spill/scratch-spill.js";
 
-export type NextStorageRequest =
+/** Which backend an operation runs on (OPFS by default). */
+export type StoreKind = "opfs" | "indexeddb";
+
+export type NextStorageRequest = { readonly store?: StoreKind } & (
   | { readonly op: "conformance"; readonly prefix: string }
+  | { readonly op: "choose" }
   | { readonly op: "publish-loop"; readonly dir: string; readonly rounds: number }
   | { readonly op: "verify"; readonly dir: string; readonly minAcked: number }
   | { readonly op: "hold"; readonly dir: string }
@@ -39,7 +46,8 @@ export type NextStorageRequest =
       readonly alternating: boolean;
       readonly buffered: boolean;
     }
-  | { readonly op: "remove"; readonly dir: string };
+  | { readonly op: "remove"; readonly dir: string }
+);
 
 const scope = self as unknown as {
   postMessage(message: unknown): void;
@@ -54,7 +62,16 @@ async function directory(name: string): Promise<OpfsDirectoryLike & FileSystemDi
 
 const locks = webLocks(navigator.locks);
 
+/** The backend of the request being handled (set by `handle`). */
+let store: StoreKind = "opfs";
+
 async function backendFor(name: string): Promise<StorageBackend> {
+  if (store === "indexeddb")
+    return createIndexedDbBackend({
+      database: () => openIndexedDb(indexedDB, `next-test:${name}`),
+      name: `next-test:${name}`,
+      locks,
+    });
   return createOpfsBackend({ directory: await directory(name), name: `next-test:${name}`, locks });
 }
 
@@ -124,7 +141,12 @@ async function readAll(space: ExtentSpace, blobs: readonly BlobRef[]): Promise<v
 let held: Awaited<ReturnType<typeof openSpace>> | null = null;
 
 async function handle(request: NextStorageRequest): Promise<unknown> {
+  store = request.store ?? "opfs";
   switch (request.op) {
+    case "choose": {
+      const chosen = await chooseBackend(`choose-${String(Date.now())}`);
+      return { kind: chosen.kind, opfsRefused: chosen.opfsRefused };
+    }
     case "conformance": {
       const results: Array<{ name: string; error: string | null }> = [];
       let index = 0;
@@ -207,7 +229,7 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
       const backend = await backendFor(request.dir);
       const lease = await backend.acquire();
       const scratch = backend.scratch(lease);
-      if (scratch === null) throw new Error("OPFS has a scratch file");
+      if (scratch === null) throw new Error("this backend has no scratch space");
       const service = new ScratchSpillService(scratch);
       await service.sweep();
       const file = await service.create(1, countingBudget(1 << 20));
@@ -257,6 +279,18 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
       return { appendMs, sealMs, publishMs, bytes: blobs.length * request.pageBytes };
     }
     case "remove": {
+      if (store === "indexeddb") {
+        await new Promise<void>((resolve) => {
+          const request_ = indexedDB.deleteDatabase(`next-test:${request.dir}`);
+          request_.onsuccess =
+            request_.onerror =
+            request_.onblocked =
+              () => {
+                resolve();
+              };
+        });
+        return null;
+      }
       const root = await navigator.storage.getDirectory();
       const base = await root.getDirectoryHandle("next-storage", { create: true });
       await base.removeEntry(request.dir, { recursive: true }).catch(() => undefined);

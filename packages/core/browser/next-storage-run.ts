@@ -2,7 +2,13 @@
  * Page side of the rebuild core's storage browser suite (browser-tests/next-storage.spec.ts):
  * spawns next-storage-worker.ts workers, kills them mid-publish, and verifies from fresh ones.
  */
-import type { NextStorageRequest, PublishPhase } from "./next-storage-worker.js";
+import type { NextStorageRequest, PublishPhase, StoreKind } from "./next-storage-worker.js";
+
+/** The backend every following scenario runs on (OPFS unless a test picks IndexedDB). */
+let store: StoreKind = "opfs";
+export function useStore(kind: StoreKind): void {
+  store = kind;
+}
 
 interface StorageWorker {
   call<T>(request: NextStorageRequest): Promise<T>;
@@ -75,7 +81,7 @@ async function spawn(): Promise<StorageWorker> {
     const id = next++;
     return new Promise<T>((resolve, reject) => {
       pending.set(id, { resolve: resolve, reject });
-      worker.postMessage({ id, request });
+      worker.postMessage({ id, request: { ...request, store } });
     });
   };
   return {
@@ -308,4 +314,9 @@ export async function runBuilderBench(
   } finally {
     await withWorker((worker) => worker.call({ op: "remove", dir }));
   }
+}
+
+/** What `chooseBackend` picks in a dedicated worker of this page. */
+export async function runChoose(): Promise<{ kind: string; opfsRefused: string | null }> {
+  return withWorker((worker) => worker.call({ op: "choose" }));
 }
