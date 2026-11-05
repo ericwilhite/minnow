@@ -130,8 +130,10 @@ Merge note: `SnapshotReleasedError` and the snapshot type move to `next/access/`
     track's `reachable`), first fit, and released to the platform only as a free tail.
   - Blobs are at most 1 MiB (larger structures span several), and one read asks for at most 4 MiB.
   - It is the write path's only way to the data space: reads, `peek`, writers, `publish`, pins.
-- **Startup order:** fence → session → log recovery → extent space → write path → spill sweep →
-  ready.
+  - A builder can `extend` its extent: in place when the space after it is free, else relocated
+    once at seal. Every `BlobRef` carries its extent and its offset within it.
+  - Startup: fence → store session → extent space (walks both roots) → write path (the single log
+    scan and replay) → spill sweep → ready.
   - One cache of encoded, verified blobs, charged to the governor and evicted before anything
     spills. Misses are read in coalesced slabs (gaps ≤ 64 KiB, slabs ≤ 1 MiB) and copied out, so
     eviction frees exactly what it uncharges. Every leased byte is charged to the reader's budget

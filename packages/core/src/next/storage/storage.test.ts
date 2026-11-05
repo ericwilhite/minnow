@@ -331,6 +331,63 @@ describe("two-slot root publication", () => {
     expect(chooseRoot(torn, two).nextSlot).toBe(0);
     expect(chooseRoot(torn, two).previous).toBeNull();
   });
+
+  it("falls back to the previous root when the current slot is lost, with no older root left", () => {
+    const one = encodeRootSlot(1, root("one"));
+    const two = encodeRootSlot(2, root("two"));
+    const lost = two.slice();
+    lost[lost.length - 1] = (lost[lost.length - 1] ?? 0) ^ 0xff;
+    // Generation 2's slot is lost (a lying flush, media damage): 1 is current, nothing before it.
+    const fallback = chooseRoot(one, lost);
+    expect(fallback.current?.root).toEqual(root("one"));
+    expect(fallback.previous).toBeNull();
+    // An older slot is never reported as newer than the current one, whatever slot order.
+    expect(chooseRoot(two, one).previous?.sequence).toBe(1);
+    expect(chooseRoot(one, two).previous?.sequence).toBe(1);
+  });
+
+  it("reports the root before the current at every crash point of a publish (sessions over the sim disk)", async () => {
+    const publishAll = async (
+      session: StoreSession,
+      done: string[],
+      inFlight: { root: string | null },
+    ) => {
+      for (const name of ["r1", "r2", "r3", "r4"]) {
+        inFlight.root = name;
+        await session.publish(new TextEncoder().encode(name));
+        done.push(name);
+        inFlight.root = null;
+      }
+    };
+    const clean = new SimDisk();
+    const cleanBackend = new SimBackend(clean);
+    await publishAll(await cleanBackend.open(await cleanBackend.acquire()), [], { root: null });
+    const names = ["r1", "r2", "r3", "r4"];
+    for (let step = 0; step < clean.steps; step++)
+      for (let seed = 1; seed <= SEEDS; seed++) {
+        const disk = new SimDisk({ crashAtStep: step, seed: seed * 31 + step });
+        const done: string[] = [];
+        const inFlight = { root: null as string | null };
+        const backend = new SimBackend(disk);
+        try {
+          await publishAll(await backend.open(await backend.acquire()), done, inFlight);
+        } catch (error) {
+          if (!(error instanceof SimulatedCrash)) throw error;
+        }
+        backend.restart();
+        const session = await backend.open(await backend.acquire());
+        const decode = (bytes: Uint8Array | null) =>
+          bytes === null ? null : new TextDecoder().decode(bytes);
+        const current = decode(await session.readRoot());
+        const previous = decode(await session.readPreviousRoot());
+        expect([done.at(-1) ?? null, inFlight.root]).toContain(current);
+        const before = current === null ? null : (names[names.indexOf(current) - 1] ?? null);
+        // The previous root is exactly the one before the current, or gone (its slot was torn by
+        // the interrupted publish); never an older or a newer one.
+        expect([before, null]).toContain(previous);
+        if (previous === null && before !== null) expect(inFlight.root).not.toBeNull();
+      }
+  });
 });
 
 describe("shared errors (Phase B ruling)", () => {

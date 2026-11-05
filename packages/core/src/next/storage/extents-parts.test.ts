@@ -1,11 +1,13 @@
 /**
- * The behaviour under the extent space's interface (extents.ts): the free map, two-generation
- * reclaim under pins, and read coalescing. The space itself arrives in phase 2.
+ * The behaviour under the extent space's interface (extents.ts): the free map, builder
+ * reservations that extend in place or relocate at seal, two-generation reclaim under pins, and
+ * read coalescing. The space itself arrives in phase 2.
  */
 import { describe, expect, it } from "vitest";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import { FreeSpaceMap } from "./free-space.js";
 import { ReclaimLedger } from "./reclaim.js";
+import { ExtentReservation } from "./reservation.js";
 import { MAX_SLAB, MAX_SLAB_GAP, planSlabs } from "./slabs.js";
 
 const A = 4096;
@@ -112,6 +114,124 @@ describe("free space map", () => {
           cursor = range.end;
         }
         expect(cursor).toBe(map.end);
+      }
+    },
+  );
+});
+
+describe("builder reservation (ExtentBuilder.extend, ruling R15.2)", () => {
+  it("grows in place when the space after it is free, and seals with no move", () => {
+    const map = new FreeSpaceMap(A);
+    const reservation = new ExtentReservation(map, A);
+    expect(reservation.extend(A + 1)).toBe(true);
+    expect(reservation.segments).toEqual([{ offset: 0, capacity: 3 * A }]);
+    expect(reservation.pieces(A - 2, 4)).toEqual([{ offset: A - 2, length: 4 }]);
+    const plan = reservation.seal(2 * A + 5);
+    expect(plan).toEqual({ extent: { offset: 0, length: 2 * A + 5 }, moves: [], release: [] });
+  });
+
+  it("reserves a second segment when blocked, splits a straddling write, and relocates at seal", () => {
+    const map = new FreeSpaceMap(A);
+    const reservation = new ExtentReservation(map, A);
+    const neighbour = map.allocate(A); // another builder's extent right after it
+    expect(neighbour).toBe(A);
+    expect(reservation.extend(2 * A)).toBe(false);
+    expect(reservation.segments).toEqual([
+      { offset: 0, capacity: A },
+      { offset: 2 * A, capacity: 2 * A },
+    ]);
+    // A blob may straddle the segments: one physical piece in each.
+    expect(reservation.pieces(A - 10, 30)).toEqual([
+      { offset: A - 10, length: 10 },
+      { offset: 2 * A, length: 20 },
+    ]);
+    const plan = reservation.seal(A + 100);
+    // One contiguous extent past both segments; each segment's written bytes move into it.
+    expect(plan.extent).toEqual({ offset: 4 * A, length: A + 100 });
+    expect(plan.moves).toEqual([
+      { from: 0, to: 4 * A, length: A },
+      { from: 2 * A, to: 5 * A, length: 100 },
+    ]);
+    expect(plan.release).toEqual([
+      { offset: 0, length: A },
+      { offset: 2 * A, length: 2 * A },
+    ]);
+    for (const range of plan.release) map.free(range.offset, range.length);
+    map.free(neighbour, A);
+    expect(map.runs()).toEqual([{ offset: 0, length: 4 * A }]);
+    expect(map.end).toBe(6 * A);
+  });
+
+  it("does not move when everything written fits the first segment, and aborts free every segment", () => {
+    const map = new FreeSpaceMap(A);
+    const reservation = new ExtentReservation(map, 2 * A);
+    map.allocate(A);
+    expect(reservation.extend(A)).toBe(false);
+    const plan = reservation.seal(10);
+    expect(plan.moves).toEqual([]);
+    expect(plan.extent).toEqual({ offset: 0, length: 10 });
+    expect(plan.release).toEqual([
+      { offset: A, length: A },
+      { offset: 3 * A, length: A },
+    ]);
+    expect(() => reservation.extend(1)).toThrow(TypeError);
+    const other = new ExtentReservation(map, A);
+    other.extend(A);
+    expect(other.abort().reduce((bytes, range) => bytes + range.length, 0)).toBe(2 * A);
+    expect(() => other.pieces(0, 1)).toThrow(TypeError);
+  });
+
+  it("refuses writes past the capacity and a sealed length past it", () => {
+    const reservation = new ExtentReservation(new FreeSpaceMap(A), 100);
+    expect(reservation.capacity).toBe(A);
+    expect(() => reservation.pieces(A - 1, 2)).toThrow(RangeError);
+    expect(() => reservation.seal(A + 1)).toThrow(RangeError);
+  });
+
+  it.each(seedsFor("next-extent-reservation", [0xe7e4, 11]))(
+    "keeps every reservation disjoint from all others and from free space (seed %i)",
+    (seed) => {
+      const random = mulberry32(seed);
+      const map = new FreeSpaceMap(A);
+      const open: ExtentReservation[] = [];
+      const sealed: Array<{ offset: number; length: number }> = [];
+      const check = () => {
+        const ranges = [
+          ...open.flatMap((reservation) =>
+            reservation.segments.map(({ offset, capacity }) => ({ offset, length: capacity })),
+          ),
+          ...sealed.map(({ offset, length }) => ({ offset, length: map.sizeOf(length) })),
+          ...map.runs(),
+        ].sort((a, b) => a.offset - b.offset);
+        let cursor = 0;
+        for (const range of ranges) {
+          expect(range.offset).toBe(cursor);
+          cursor += range.length;
+        }
+        expect(cursor).toBe(map.end);
+      };
+      for (let step = 0; step < 600; step++) {
+        const roll = random();
+        if (open.length === 0 || roll < 0.3)
+          open.push(new ExtentReservation(map, 1 + Math.floor(random() * 3 * A)));
+        else if (roll < 0.6)
+          open[Math.floor(random() * open.length)]?.extend(1 + Math.floor(random() * 2 * A));
+        else {
+          const [reservation] = open.splice(Math.floor(random() * open.length), 1);
+          if (reservation === undefined) continue;
+          if (roll < 0.7)
+            for (const range of reservation.abort()) map.free(range.offset, range.length);
+          else {
+            const plan = reservation.seal(1 + Math.floor(random() * reservation.capacity));
+            for (const range of plan.release) map.free(range.offset, range.length);
+            sealed.push(plan.extent);
+          }
+        }
+        if (sealed.length > 0 && random() < 0.2) {
+          const [extent] = sealed.splice(Math.floor(random() * sealed.length), 1);
+          if (extent !== undefined) map.free(extent.offset, extent.length);
+        }
+        check();
       }
     },
   );

@@ -31,16 +31,18 @@
  * - **Scratch** (`ScratchSpace`). The spill service's byte space: never flushed, never named by a
  *   root, emptied on open. OPFS: the `spill` file. IndexedDB: a dedicated `spill` object store.
  *
- * ## Startup order (lead ruling R7; the ownership track drives it)
+ * ## Startup order (lead rulings R13/R16.6; the ownership track drives it)
  * 1. `acquire` the fence (Web Lock, then handles or epoch).
- * 2. `open` the session.
- * 3. Recover the log (format/replay.ts): scan, validate the acknowledged boundary, truncate an
- *    invalid tail. Needs the session only.
- * 4. Open the extent space (`extents.ts` `OpenExtentSpace`): read the current and previous roots,
- *    walk both, build the free map, start the cache.
- * 5. Open the write path over the extent space and the session (memtable replay, ledger).
- * 6. Sweep the scratch space (`SpillService.sweep`), then serve requests.
- * Every later step depends on the earlier ones; nothing writes the data space before step 4.
+ * 2. `open` the store session.
+ * 3. Open the extent space (`extents.ts` `OpenExtentSpace`): read the current and previous roots
+ *    from the root slots, walk both, build the free map, start the cache. It reads no log.
+ * 4. Open the write path over the extent space and the session. It does the **single** log scan:
+ *    validate the acknowledged boundary, truncate an invalid tail, replay (`publishedRows` staging
+ *    included), restore the ledger (format/replay.ts).
+ * 5. Sweep the scratch space (`SpillService.sweep`).
+ * 6. Ready: serve requests.
+ * Each step needs the ones before it. Nothing writes the data space before step 3 has built the
+ * free map, and nothing appends to the log before step 4 has truncated it.
  *
  * ## Calls
  * Every mutating call is async and checks ownership in the same synchronous step that applies

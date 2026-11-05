@@ -11,16 +11,16 @@ import {
   type ExtentRef,
   type ExtentSpace,
   type OpenExtentSpace,
+  type PendingBlob,
   type ReachableExtents,
 } from "./extents.js";
 
 /**
- * Ownership track: the startup order (storage/contract.ts "Startup order", ruling R7). The
- * callbacks stand in for the other tracks' entry points.
+ * Ownership track: the startup order (storage/contract.ts "Startup order", rulings R13/R16.6).
+ * The callbacks stand in for the other tracks' entry points.
  */
 export async function startOwner(
   acquireAndOpen: () => Promise<StoreSession>,
-  recoverLog: (session: StoreSession) => Promise<void>,
   openExtentSpace: OpenExtentSpace,
   governor: { registerCache: Parameters<OpenExtentSpace>[1]["registerCache"] },
   startupGrant: ByteBudget,
@@ -28,27 +28,28 @@ export async function startOwner(
   openWritePath: (space: ExtentSpace, session: StoreSession) => Promise<void>,
   sweepSpill: () => Promise<void>,
 ): Promise<ExtentSpace> {
-  const session = await acquireAndOpen(); // 1–2: fence, then session
-  await recoverLog(session); // 3: scan and truncate the log; no data-space writes yet
-  // 4: walk the current and previous roots; every crash orphan is free, nothing else is swept.
+  const session = await acquireAndOpen(); // 1–2: fence, then store session
+  // 3: walk the current and previous roots; every crash orphan is free. No log is read here.
   const space = await openExtentSpace(session, {
     reachable,
     budget: startupGrant,
     registerCache: (cache) => governor.registerCache(cache),
   });
-  await openWritePath(space, session); // 5: memtable replay over the space
-  await sweepSpill(); // 6: then serve requests
+  await openWritePath(space, session); // 4: the single log scan, truncation and replay
+  await sweepSpill(); // 5: then ready (6)
   return space;
 }
 
-/** Format track: `reachable` walks the root through the space's verified, cached reader. */
+/**
+ * Format track: `reachable` walks the root through the space's verified, cached reader and yields
+ * the blobs it reaches; each carries its extent, so nothing maps an address back to an extent.
+ */
 export const reachableExample: ReachableExtents = async function* (root, reader, budget) {
-  const groupDirectories: BlobRef[] = decodeRootGroupDirectories(root);
-  for (const directory of groupDirectories) {
-    yield extentOf(directory);
+  for (const directory of decodeRootGroupDirectories(root)) {
+    yield directory;
     const lease = await reader.read([directory], { budget });
     try {
-      for (const chunk of decodeChunkExtents(lease.bytes[0] ?? new Uint8Array(0))) yield chunk;
+      yield* decodeChunkBlobs(lease.bytes[0] ?? new Uint8Array(0));
     } finally {
       lease.release();
     }
@@ -58,25 +59,34 @@ export const reachableExample: ReachableExtents = async function* (root, reader,
 /**
  * Write path + format: a memtable flush writes one group (a chunk extent per column holding its
  * pages and then its page directory), a group root, and a new groups list, then publishes a root
- * that names them and retires the old groups list. Every part is ≤ MAX_BLOB_BYTES (1 MiB): a
- * longer groups list would be split across several blobs.
+ * that names them and retires the old groups list. Each chunk is streamed page by page into a
+ * builder reserved from an estimate and extended when the estimate falls short (ruling R15.2).
+ * Every part is ≤ MAX_BLOB_BYTES (1 MiB): a longer groups list would be split across blobs.
  */
 export async function flushGroup(
   space: ExtentSpace,
-  columns: ReadonlyArray<{ readonly pages: readonly Uint8Array[]; readonly bound: number }>,
+  columns: ReadonlyArray<{ readonly pages: Iterable<Uint8Array>; readonly estimate: number }>,
   previousGroupsList: ExtentRef | null,
 ): Promise<number> {
   const writer = space.beginWrite("flush table 7");
   try {
-    const chunks: Array<{ extent: ExtentRef; pages: BlobRef[]; directory: BlobRef }> = [];
+    const chunks: Array<{ extent: ExtentRef; blobs: readonly BlobRef[] }> = [];
     for (const column of columns) {
-      // Reserve an upper bound, append pages and then the directory, trim the rest at seal.
-      const builder = writer.open(column.bound);
-      const pages = await builder.append(column.pages);
-      const [directory] = await builder.append([encodeDirectory(builder.offset, pages)]);
+      const builder = writer.open(column.estimate);
+      const pending: PendingBlob[] = [];
+      for (const page of column.pages) {
+        const short = builder.length + page.length - builder.capacity;
+        // Grow by at least a quarter, so a bad estimate costs few extends and at most one move.
+        if (short > 0) builder.extend(Math.max(short, builder.capacity >> 2));
+        pending.push(...(await builder.append([page])));
+      }
+      const directory = encodeDirectory(pending); // offsets within the chunk: stable at seal
+      if (builder.length + directory.length > builder.capacity)
+        builder.extend(builder.length + directory.length - builder.capacity);
+      await builder.append([directory]);
       const sealed = await builder.seal();
-      if (sealed === null || directory === undefined) throw new Error("empty chunk");
-      chunks.push({ extent: sealed.extent, pages, directory });
+      if (sealed === null) throw new Error("empty chunk");
+      chunks.push(sealed);
     }
     const { blobs: groupRoot } = await writer.write([encodeGroupRoot(chunks)]);
     const { blobs: groupsList } = await writer.write([encodeGroupsList(groupRoot)]);
@@ -176,9 +186,8 @@ export async function lookupFence(
 
 // Placeholder codecs (format track).
 declare function decodeRootGroupDirectories(root: Uint8Array): BlobRef[];
-declare function decodeChunkExtents(directory: Uint8Array): ExtentRef[];
-declare function extentOf(blob: BlobRef): ExtentRef;
-declare function encodeDirectory(chunkOffset: number, pages: readonly BlobRef[]): Uint8Array;
+declare function decodeChunkBlobs(directory: Uint8Array): BlobRef[];
+declare function encodeDirectory(pages: readonly PendingBlob[]): Uint8Array;
 declare function encodeGroupRoot(chunks: ReadonlyArray<{ extent: ExtentRef }>): Uint8Array;
 declare function encodeGroupsList(groupRoot: readonly BlobRef[]): Uint8Array;
 declare function encodeRoot(blobs: readonly BlobRef[]): Uint8Array;

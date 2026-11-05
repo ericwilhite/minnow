@@ -6,9 +6,10 @@
  *
  * ```text
  *   writer = space.beginWrite("flush t7")      ─ one per intended publication
- *   b = writer.open(capacity)                  ─ reserve a contiguous extent
- *   refs = await b.append([page, page, …])     ─ blobs (≤ 1 MiB each), checksummed by the space
- *   chunk = await b.seal()                     ─ trim the unused tail; readable from now on
+ *   b = writer.open(estimate)                  ─ reserve a contiguous extent
+ *   pending = await b.append([page, page, …])  ─ blobs (≤ 1 MiB each), checksummed by the space
+ *   b.extend(more)                             ─ more capacity: in place, or relocated at seal
+ *   chunk = await b.seal()                     ─ the extent and its BlobRefs; readable from now on
  *   …more extents, metadata blobs (writer.write(parts) = open + append + seal)…
  *   gen = await space.publish(rootBytes, { writers: [writer], retired: [...] })
  *                                              ─ data flush, root slot, flush: atomic, durable
@@ -26,8 +27,9 @@
  *   the publish that covers it has resolved.
  * - **Snapshots:** `pin(label)` under each access/ snapshot; `stats` for backpressure (garbage
  *   debt, oldest pin).
- * - **Startup** (storage/contract.ts "Startup order"): fence → session → log recovery → extent
- *   space (walks the current and previous roots) → write path (memtable replay) → ready.
+ * - **Startup** (storage/contract.ts "Startup order", rulings R13/R16.6): fence → store session →
+ *   extent space (walks the current and previous roots) → write path (the single log scan,
+ *   truncation and replay) → spill sweep → ready. The space reads no log.
  *
  * ## Units
  * - An **extent** (`ExtentRef`) is the unit of allocation and reclaim: a contiguous range at a
@@ -36,7 +38,11 @@
  *   pages, or a chunk and its page directory); they are reclaimed together. Extents have no size
  *   cap.
  * - A **blob** (`BlobRef`) is a checksummed byte range inside one extent: what a reader asks for
- *   (a page, a group root, a directory). The space computes every checksum it hands out.
+ *   (a page, a group root, a directory). It carries its extent and its offset within it (ruling
+ *   R15.1), so reclaim and the open walk take a blob's extent from the ref, never infer it from
+ *   an address. Small blobs (metadata, small chunks) share packed extents by the format's packing
+ *   rule (format/manifest.ts); they are reclaimed with their extent. The space computes every
+ *   checksum it hands out.
  * - **Blobs are at most `MAX_BLOB_BYTES` (1 MiB, ruling R8).** A larger structure (a catalog, a
  *   long group list, an index run's entries) is split across several blobs by its format. So every
  *   blob fits one read slab, and no single read pins an unbounded buffer.
@@ -85,7 +91,7 @@
  *   against a fresh walk; the write path's crash sweeps run it after every publish.
  *
  * ## Reads and the cache (`ExtentReader`)
- * - One cache of **encoded, verified blobs**, keyed by exact `(offset, length, checksum)`, charged
+ * - One cache of **encoded, verified blobs**, keyed by exact `(address, length, checksum)`, charged
  *   to the memory governor through its cache handle (`memory/governor.ts` `registerCache`). The
  *   governor evicts it before any grant grows or any operator spills; it has no size dial. Nothing
  *   decoded is cached here: decoded dictionaries and pages belong to the query that decoded them
@@ -160,15 +166,34 @@ export interface ExtentRef {
   readonly length: number;
 }
 
-/** A checksummed byte range inside one extent: what readers ask for. */
+/**
+ * A checksummed byte range inside one extent: what readers ask for. Its data-space address is
+ * `extent.offset + offset`; `offset + length ≤ extent.length` (a ref read from storage that breaks
+ * this is `StoreCorruptionError`).
+ */
 export interface BlobRef {
+  /** The extent the blob lives in: its unit of reclaim (ruling R15.1). */
+  readonly extent: ExtentRef;
+  /** Byte offset within `extent`. */
   readonly offset: number;
   readonly length: number;
   /** xxHash32 (seed 0) of the referenced bytes. */
   readonly checksum: number;
 }
 
-/** An extent and the blobs appended to it, in append order. */
+/** A blob appended to an unsealed builder: its offset within the extent it will be sealed into. */
+export interface PendingBlob {
+  readonly offset: number;
+  readonly length: number;
+  readonly checksum: number;
+}
+
+/** The data-space address of a blob's first byte. */
+export function blobAddress(ref: BlobRef): number {
+  return ref.extent.offset + ref.offset;
+}
+
+/** An extent and the blobs appended to it, in append order, each carrying `extent`. */
 export interface WrittenExtent {
   readonly extent: ExtentRef;
   readonly blobs: readonly BlobRef[];
@@ -198,18 +223,20 @@ export interface EvictableCacheLike {
 // ── Open ───────────────────────────────────────────────────────────────────────────────────────
 
 /**
- * Every extent `root` reaches, supplied by the format track. The space calls it for the current
- * root and then the previous one (most of whose metadata the first walk already cached). It reads
- * metadata through `reader` (verified, cached), charging its leases to `budget` (the open's
- * `OpenSpaceOptions.budget`). Duplicates are fine (shared extents). It must list every extent of every structure the
- * root reaches: catalog, group directories, group roots, chunks, deletion bitmaps, statistics,
- * index runs and their fences and Bloom filters.
+ * Everything `root` reaches, supplied by the format track: the extents, or the blobs (the space
+ * takes `BlobRef.extent`; no address is mapped back to an extent). The space calls it for the
+ * current root and then the previous one (most of whose metadata the first walk already cached).
+ * It reads metadata through `reader` (verified, cached), charging its leases to `budget` (the
+ * open's `OpenSpaceOptions.budget`). Duplicates are fine (shared and packed extents). It must
+ * reach every structure the root reaches: catalog, group directories, group roots, chunks,
+ * deletion bitmaps, statistics, index runs (staged ones included) and their fences and Bloom
+ * filters.
  */
 export type ReachableExtents = (
   root: Uint8Array,
   reader: ExtentReader,
   budget: ByteBudget,
-) => AsyncIterable<ExtentRef> | Iterable<ExtentRef>;
+) => AsyncIterable<ExtentRef | BlobRef> | Iterable<ExtentRef | BlobRef>;
 
 export interface OpenSpaceOptions {
   readonly reachable: ReachableExtents;
@@ -221,8 +248,9 @@ export interface OpenSpaceOptions {
 }
 
 /**
- * Opens the space over a session the owner holds, after log recovery (storage/contract.ts
- * "Startup order"): reads the current and previous roots, walks both, builds the free map, retires
+ * Opens the space over a freshly opened store session, before the write path's log scan
+ * (storage/contract.ts "Startup order"): reads the current and previous roots, walks both, builds
+ * the free map, retires
  * what only the previous root reaches (`ReclaimLedger.retireAtOpen`), returns the free tail. The
  * walks read O(groups + index runs) metadata, coalesced. Nothing is written but the tail release.
  * Implemented in phase 2 as `openExtentSpace`.
@@ -271,8 +299,8 @@ export interface ExtentWriter {
   /** Bytes reserved by open builders plus bytes of sealed extents. */
   readonly bytes: number;
   /**
-   * Reserves one contiguous extent of up to `capacity` bytes (> 0). Synchronous: it only
-   * allocates. Fails only on misuse (writer not open).
+   * Reserves one contiguous extent of `capacity` bytes (> 0), first fit; `extend` adds more.
+   * Synchronous: it only allocates. Fails only on misuse (writer not open).
    */
   open(capacity: number): ExtentBuilder;
   /**
@@ -289,22 +317,38 @@ export interface ExtentWriter {
   abort(): Promise<void>;
 }
 
+/**
+ * One extent being written. Blob offsets are relative to the extent, so they hold however the
+ * builder grows; the extent's address is fixed at `seal` (reservation.ts holds the bookkeeping).
+ */
 export interface ExtentBuilder {
-  /** The reserved extent's offset (a multiple of `DATA_ALIGN`). */
-  readonly offset: number;
+  /** Bytes the builder may hold: the opening capacity plus every `extend`. */
   readonly capacity: number;
   /** Bytes appended so far. */
   readonly length: number;
   /**
-   * Places `parts` back to back after the bytes already appended and returns one checksummed ref
-   * per part (absolute offsets). The caller may reuse `parts`' buffers once it resolves. A
-   * `RangeError` if a part exceeds `MAX_BLOB_BYTES` or they do not fit the remaining capacity
-   * (nothing is written). Refs become readable at `seal`.
+   * Adds `bytes` of capacity, synchronously (ruling R15.2), so a writer can stream a chunk whose
+   * size it only estimated (the page track's `GroupWriter`).
+   * - Returns true when the space after the reservation was free and it grew in place: no cost.
+   * - Returns false when it was not: a new segment is reserved elsewhere, appends continue into
+   *   it (a blob may straddle the two), and `seal` relocates the extent into one contiguous range.
+   *   Relocation costs one read and one rewrite of the extent's bytes through the space's 1 MiB
+   *   write slab (no extra memory; ~2× the extent's I/O, about 3 ms per MiB on Firefox cold), and
+   *   holds both ranges until it finishes. Reserve from page-statistics estimates so it stays rare;
+   *   `stats.relocations` counts it.
    */
-  append(parts: readonly Uint8Array[]): Promise<BlobRef[]>;
+  extend(bytes: number): boolean;
   /**
-   * Writes what is staged, trims the unused capacity back to free space, and returns the extent
-   * and its blobs, or null when nothing was appended (the whole reservation is freed).
+   * Places `parts` back to back after the bytes already appended and returns one checksummed
+   * pending blob per part (offsets within the extent). The caller may reuse `parts`' buffers once
+   * it resolves. A `RangeError` if a part exceeds `MAX_BLOB_BYTES` or they do not fit the
+   * remaining capacity (nothing is written: `extend` first). Blobs become readable at `seal`.
+   */
+  append(parts: readonly Uint8Array[]): Promise<PendingBlob[]>;
+  /**
+   * Writes what is staged, relocates if `extend` had to (see there), trims the unused capacity
+   * back to free space, and returns the extent and its blobs as `BlobRef`s (in append order), or
+   * null when nothing was appended (the whole reservation is freed).
    */
   seal(): Promise<WrittenExtent | null>;
 }
@@ -332,6 +376,8 @@ export interface SpaceStats {
   readonly oldestPin: { readonly label: string; readonly ageMs: number } | null;
   /** Freed and being released to the platform. */
   readonly releasingBytes: number;
+  /** Builders `seal` had to relocate after an `extend` could not grow in place. */
+  readonly relocations: number;
   readonly cache: {
     readonly residentBytes: number;
     readonly pinnedBytes: number;
