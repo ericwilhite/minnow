@@ -27,8 +27,9 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | `memory/`          | executor                         | Memory governor: admission, progress loans, held vs allocated bytes (reference implementation)                                                                                                                                                                                                                         |
 | `exec/`            | executor                         | Push protocol and driver (`pipeline.ts`), row fetcher (`fetch.ts`), array/JSONB comparators (`semantic.ts`), scale-partitioned decimal SUM (`decimal-sum.ts`); kernels and operators to come                                                                                                                           |
 | `ir/`              | lowering, executor               | Operator IR (`ir.ts`); the front-end boundary (`lowering.ts`)                                                                                                                                                                                                                                                          |
+| `access/`          | write path + key index           | Storage access contracts the write path implements: snapshots and segments, catalog, key-index probes and ranges, `modify` (rows, conflicts, RETURNING), transactions, group commit, sequences, delivery |
 | `testing/`         | all                              | Differential-harness adapter for a partial new core                                                                                                                                                                                                                                                                    |
-| `write/` (to come) | write path + key index           | Group commit, memtables, key index runs, maintenance                                                                                                                                                                                                                                                                   |
+| `write/` (to come) | write path + key index           | Group commit, memtables, key index runs, maintenance (implements `access/`)                                                                                                                              |
 | `lower/` (to come) | planner lowering                 | `Lowerer`, cost model, statistics                                                                                                                                                                                                                                                                                      |
 | `owner/` (to come) | ownership                        | Web Lock election, client protocol, step-down, composition root                                                                                                                                                                                                                                                        |
 
@@ -45,8 +46,8 @@ the track that implements it, reviewed adversarially before the consuming tracks
 | Extent allocation (free space from the root) and the data writer's lifecycle                                  | B1 storage                |
 | Key-index lookup, range and batch APIs; `modify` (row ids, conflicts, RETURNING); snapshot and catalog access | B3 write path + key index |
 
-Merge note: `SnapshotReleasedError` and the snapshot type move to `next/access/` (rebuild/write);
-`FetchRequest.snapshot` becomes access's `Snapshot`. Until that merge they stay in `exec/fetch.ts`.
+`SnapshotReleasedError` and the snapshot type live in `access/snapshot.ts`; `FetchRequest.snapshot`
+is access's `Snapshot`.
 
 ## Dependency rules
 
@@ -59,6 +60,7 @@ Merge note: `SnapshotReleasedError` and the snapshot type move to `next/access/`
   types/temporal ← vector ← memory ← exec
   types, hash, vector ← keys ← exec, write
   hash ← storage ← format ← write
+  vector, keys, storage, format, memory ← access ← exec, write, lower
   hash, storage ← spill ← exec;  vector ← ir ← lower
   owner ← everything;  testing ← everything
   ```
@@ -208,6 +210,54 @@ Merge note: `SnapshotReleasedError` and the snapshot type move to `next/access/`
   current and previous roots) → open the write path (a single log scan and replay, `publishedRows`
   staging included) → spill sweep → ready.
 - Snapshot pins live in memory and are dropped when their client's lock is released.
+
+### Storage access (`access/`)
+
+The single read/write contract (ruling R1): the write path implements it; the executor, lowering
+and the owner import it directly.
+
+- **One writer at a time.** `begin()` hands out the writer slot in FIFO order, so transactions never
+  conflict. Readers never take it.
+- **`commit()` is the irreversible boundary.** Before it the owner may cancel; once called, the
+  transaction commits unless the write path fails. The write path records committed outcomes in the
+  ledger (when durable under strict, when applied under relaxed); the owner records failures and
+  settles no-effect requests.
+- **Visibility is one comparison.** Every in-memory change has a `seq`: its commit LSN, or
+  `PENDING_BASE + statement` while its transaction is open. A view sees `seq ≤ bound`. A read
+  snapshot's bound is an LSN; a statement view sees earlier statements of its transaction, never
+  its own.
+- **Strict reads see only durable commits.** Nothing reaches a client before every commit its view
+  observed, and every sequence block it drew from, is durable (`durable(lsn)`).
+- **Sequences are not transactional.** Blocks (1 → 1,024 values, adaptive) are reserved by
+  standalone sequence frames, so a value waits for one group flush, never for COMMIT. A crash skips
+  the rest of a block. A standalone `SELECT nextval(…)` is at-least-once: a retry draws new values.
+- **Scans are built on segments.** A snapshot lists each table's segments in locator order (groups,
+  then memory), with sound page bounds (exact or null), deletion vectors for live rows, and
+  dictionary codes kept. Groups are read through B1's verified cache with the format chunk readers. A
+  memory chunk read that stops early (varlen output full or denied) resumes at `resumeRow(result)`.
+- **Retention is bounded.** A reader borrows at most one chunk per memory segment. A frozen memtable
+  stays resident (capped, writers wait past the cap) only until its flush publishes; then its
+  readers are re-pointed to the published group under a pin taken during that publication, and
+  the memtable is freed. Writers never wait on readers.
+- **Large transactions commit through a staged root.** Rows past the memtable bounds are written as
+  staged groups with staged index runs, published under the transaction's id, and committed by a
+  `publishedRows` frame.
+- **Indexes resolve by tombstones.** Entries are `(key, rowId, put | tombstone)` in layers, newest
+  first. A delete tombstones every index, so a lookup never reads a deletion bitmap
+  (`resolveVersions`).
+- **The executor evaluates, the write path enforces.** Expressions, casts, defaults, generated
+  columns, CHECK (through `TableRules`, which the executor's `compileTableRules` provides) and
+  RETURNING (spooled until the owner acknowledges the commit) belong to the executor. NOT NULL,
+  unique, foreign keys and their actions, and "row affected twice" belong to the write path. Unique
+  and foreign keys are checked at `Statement.end()`; ON CONFLICT probes immediately.
+- **Statements are atomic.** After any error the only call is `rollback()`, which undoes the
+  statement.
+- **`openWritePath` does the single log scan.** It scans, truncates and replays the log itself,
+  after the extent space opens and before the spill sweep.
+- **Storage goes through the extent space only.** No free map of its own; the log is reset only
+  after the publish that covers it resolves; on an idle database with
+  `waitingBytes > max(16 MiB, 5% of the data space)` it publishes one no-change root (ruling R10).
+- **A failed flush or publish fails the write path.** Close and reopen; the ledger answers retries.
 
 ### Spill (`spill/`)
 

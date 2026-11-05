@@ -26,12 +26,16 @@ const ALLOWED: Readonly<Record<string, readonly string[]>> = {
   memory: ["vector"],
   keys: [".", "hash", "vector", "memory"],
   ir: [".", "vector"],
+  // Storage access contracts (track B3): the write path implements them; the executor, lowering
+  // and the owner consume them.
+  access: [".", "vector", "keys", "storage", "format", "memory"],
   // Tracks (not written yet) — their layer, fixed now:
-  exec: [".", "hash", "vector", "keys", "ir", "memory", "spill"],
-  write: [".", "hash", "vector", "keys", "storage", "format", "memory"],
-  lower: [".", "ir", "vector"],
+  exec: [".", "hash", "vector", "keys", "ir", "memory", "spill", "access"],
+  write: [".", "hash", "vector", "keys", "storage", "format", "memory", "access"],
+  lower: [".", "ir", "vector", "access"],
   owner: [
     ".",
+    "access",
     "keys",
     "hash",
     "vector",
@@ -46,6 +50,7 @@ const ALLOWED: Readonly<Record<string, readonly string[]>> = {
   ],
   testing: [
     ".",
+    "access",
     "keys",
     "hash",
     "vector",
