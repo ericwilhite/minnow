@@ -23,6 +23,8 @@ describe("sqlTypeName", () => {
       [{ kind: "timestamp", zoned: true }, "timestamp with time zone"],
       [{ kind: "interval" }, "interval"],
       [{ kind: "text" }, "text"],
+      [{ kind: "text", maxLength: 20 }, "character varying(20)"],
+      [{ kind: "text", maxLength: 1, fixed: true }, "character(1)"],
       [{ kind: "bytes" }, "bytea"],
       [{ kind: "json", binary: false }, "json"],
       [{ kind: "json", binary: true }, "jsonb"],

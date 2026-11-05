@@ -12,7 +12,7 @@ import {
   type PhysicalType,
   type SqlTypeDescriptor,
 } from "../types.js";
-import { UnsupportedPlanError } from "./errors.js";
+import { unsupported } from "./errors.js";
 
 /** A column definition as CREATE TABLE and ALTER TABLE ADD COLUMN compile it. */
 export type FrontEndColumn = Extract<
@@ -39,17 +39,15 @@ export function declaredColumnType(column: FrontEndColumn, context: string): Dec
     ...(column.withoutTimeZone === true ? { withoutTimeZone: true as const } : {}),
     ...(column.enumValues === undefined ? {} : { enumValues: column.enumValues }),
     ...(column.declaredTypeName === undefined ? {} : { declaredTypeName: column.declaredTypeName }),
+    ...(column.declaredLength === undefined ? {} : { declaredLength: column.declaredLength }),
   };
   requireDeclaredWidths(declared, context);
   if (declared.sqlDomain?.kind === "enum" && declared.sqlDomain.values.length === 0)
-    throw new UnsupportedPlanError(
-      "enumType",
-      `column ${context} has enum type ${declared.sqlDomain.name}`,
-    );
+    throw unsupported("enumType", `column ${context} has enum type ${declared.sqlDomain.name}`);
   try {
     return { type: physicalTypeOf(declared), declared };
   } catch (error) {
     if (!(error instanceof TypeError) || declared.sqlDomain?.kind !== "array") throw error;
-    throw new UnsupportedPlanError("columnType", `column ${context}: ${error.message}`);
+    throw unsupported("columnType", `column ${context}: ${error.message}`);
   }
 }

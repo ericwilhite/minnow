@@ -49,10 +49,9 @@ export function renderOf(type: PhysicalType, origin: ValueOrigin): IntegerRender
 }
 
 /**
- * PostgreSQL's printed name of a physical type (`format_type` with a type modifier). TEXT,
- * VARCHAR(n) and CHAR(n) all print `text`: the front end keeps no character width, and neither
- * does storage (DECISIONS.md: widths of text are not enforced). Throws for the internal
- * `locator` type, which is never a result.
+ * PostgreSQL's printed name of a physical type (`format_type` with a type modifier). VARCHAR(n)
+ * and CHAR(n) print their width (R17.4); TEXT and VARCHAR without one print `text`. Throws for
+ * the internal `locator` type, which is never a result.
  */
 export function sqlTypeName(type: PhysicalType): string {
   switch (type.kind) {
@@ -78,7 +77,8 @@ export function sqlTypeName(type: PhysicalType): string {
     case "interval":
       return "interval";
     case "text":
-      return "text";
+      if (type.maxLength === undefined) return "text";
+      return `${type.fixed === true ? "character" : "character varying"}(${String(type.maxLength)})`;
     case "bytes":
       return "bytea";
     case "json":

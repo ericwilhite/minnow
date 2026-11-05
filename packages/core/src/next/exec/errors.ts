@@ -52,10 +52,8 @@ export class ParameterBindError extends ExecutionError {
   }
 }
 
-/** The plan uses an operator, function overload or type the executor does not implement. */
-export class UnsupportedPlanError extends ExecutionError {
-  constructor(what: string) {
-    super(`The executor does not support ${what}`, "MINNOW_UNSUPPORTED_PLAN", "0A000");
-    this.name = "UnsupportedPlanError";
-  }
-}
+/**
+ * The plan uses an operator, function overload or type the executor does not implement: the one
+ * shared class (next/errors.ts, ruling R17.6), `stage: "execute"` by default.
+ */
+export { UnsupportedPlanError } from "../errors.js";

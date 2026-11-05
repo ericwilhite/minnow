@@ -44,3 +44,33 @@ export class SessionLostError extends Error {
     this.name = "SessionLostError";
   }
 }
+
+/**
+ * The new core does not support a construct yet (ruling R17.6: one class for lowering and the
+ * executor). SQLSTATE 0A000, feature_not_supported. The owner reports it as "not supported by the
+ * new core"; the differential harness counts refusals per `construct` instead of treating them as
+ * wrong answers.
+ * - `stage: "lower"`: lowering refused the statement (lower/errors.ts lists the construct keys).
+ * - `stage: "execute"`: the executor's `prepare` (or a kernel) lacks an operator, overload or type.
+ */
+export class UnsupportedPlanError extends Error {
+  readonly code = "MINNOW_UNSUPPORTED_PLAN";
+  readonly sqlState = "0A000";
+  readonly stage: "lower" | "execute";
+  /** A stable key for what is missing (lowering's construct keys; null when not classified). */
+  readonly construct: string | null;
+  constructor(
+    what: string,
+    options: { readonly stage?: "lower" | "execute"; readonly construct?: string } = {},
+  ) {
+    const stage = options.stage ?? "execute";
+    super(
+      stage === "execute"
+        ? `The executor does not support ${what}`
+        : `Not supported yet (${options.construct ?? "unclassified"}): ${what}`,
+    );
+    this.name = "UnsupportedPlanError";
+    this.stage = stage;
+    this.construct = options.construct ?? null;
+  }
+}

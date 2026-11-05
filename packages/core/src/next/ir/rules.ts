@@ -31,5 +31,5 @@ export interface TableRuleExpressions {
    * `compileTableRules` can validate them. A column without an entry defaults to NULL. The
    * `missing` value of rows stored before a column existed is the write path's, not a default.
    */
-  readonly defaults: ReadonlyArray<{ readonly columnId: number; readonly expr: ScalarExpr }>;
+  readonly defaults?: ReadonlyArray<{ readonly columnId: number; readonly expr: ScalarExpr }>;
 }

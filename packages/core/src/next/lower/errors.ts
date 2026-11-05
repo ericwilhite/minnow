@@ -1,3 +1,5 @@
+import { UnsupportedPlanError } from "../errors.js";
+
 /**
  * Errors lowering raises itself. Errors from the front end (parser and passes: `TypeError`,
  * `SqlCompileError`) pass through unchanged, as they do in the current engine.
@@ -27,24 +29,9 @@ export type UnsupportedConstruct =
   /** An ALTER TABLE form beyond ADD / RENAME / DROP COLUMN. */
   | "alterTable";
 
-/**
- * Lowering refuses a statement it cannot translate. Same `code` and SQLSTATE (0A000,
- * feature_not_supported) as the executor's `UnsupportedPlanError` (exec/errors.ts): the owner
- * treats both as "not supported by the new core", which the differential harness reports per
- * `construct` rather than as a wrong answer. Proposed: both move to next/errors.ts as one class
- * with `stage: "lower" | "execute"` (INVENTORY.md "Contract requests").
- */
-export class UnsupportedPlanError extends Error {
-  readonly code = "MINNOW_UNSUPPORTED_PLAN";
-  readonly sqlState = "0A000";
-  readonly stage = "lower";
-  constructor(
-    readonly construct: UnsupportedConstruct,
-    detail: string,
-  ) {
-    super(`Not supported yet (${construct}): ${detail}`);
-    this.name = "UnsupportedPlanError";
-  }
+/** Lowering refuses `detail`: the shared `UnsupportedPlanError` (next/errors.ts, R17.6). */
+export function unsupported(construct: UnsupportedConstruct, detail: string): UnsupportedPlanError {
+  return new UnsupportedPlanError(detail, { stage: "lower", construct });
 }
 
 /**

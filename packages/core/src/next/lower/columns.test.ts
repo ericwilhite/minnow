@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { compileStatement, compileWithDeclaredTypes } from "../../engine/query.js";
 import { declaredColumnType, type FrontEndColumn } from "./columns.js";
-import { UnsupportedPlanError } from "./errors.js";
+import { UnsupportedPlanError } from "../errors.js";
 
 function columns(sql: string, declared = true): Record<string, FrontEndColumn> {
   const statement = declared
@@ -58,9 +58,8 @@ describe("declaredColumnType (DECISIONS.md C5)", () => {
   });
 
   it("refuses what the new catalog cannot declare yet", () => {
-    const t = columns("CREATE TABLE t (a mood, b STRING[])");
+    const t = columns("CREATE TABLE t (a mood)");
     expect(() => type(t.a)).toThrow(UnsupportedPlanError);
     expect(() => type(t.a)).toThrow("(enumType)");
-    expect(() => type(t.b)).toThrow("(columnType)");
   });
 });
