@@ -108,7 +108,8 @@ export interface MemoryExtentSpaceOptions {
 }
 
 export class MemoryExtentSpace implements ExtentReader {
-  bytes = new Uint8Array(1 << 20);
+  /** Grown on the first write (a `view` shares its parent's array instead). */
+  bytes = new Uint8Array(0);
   readonly allocator = new Allocator();
   readonly #cache = new Map<string, Uint8Array>();
   readonly #caching: boolean;
@@ -138,7 +139,7 @@ export class MemoryExtentSpace implements ExtentReader {
   write(offset: number, bytes: Uint8Array): void {
     const end = offset + bytes.length;
     if (end > this.bytes.length) {
-      let size = this.bytes.length * 2;
+      let size = Math.max(1 << 20, this.bytes.length * 2);
       while (size < end) size *= 2;
       const grown = new Uint8Array(size);
       grown.set(this.bytes);

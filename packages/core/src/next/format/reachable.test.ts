@@ -13,9 +13,11 @@ import {
   reachable,
   reachableExtents,
   walkReachable,
+  type Held,
   type ManifestReader,
   type ReachableKind,
 } from "./reachable.js";
+import type { GroupPageEntry, Parsed } from "./manifest-codec.js";
 
 let next = 0;
 /** A fresh extent at the next 8 KiB slot, so each reference is traceable. */
@@ -61,6 +63,8 @@ interface Fixture {
   readonly reader: ManifestReader;
   /** Every reference the root reaches, with its kind. */
   readonly expected: Array<{ ref: BlobRef | ExtentRef; kind: ReachableKind }>;
+  /** Decoded values handed out and not yet released. */
+  readonly outstanding: () => number;
 }
 
 function fixture(): Fixture {
@@ -68,7 +72,8 @@ function fixture(): Fixture {
   const want = (ref: BlobRef | ExtentRef, kind: ReachableKind): void => {
     expected.push({ ref, kind });
   };
-  const directories = new Map<BlobRef, GroupRef[]>();
+  const indexes = new Map<BlobRef, GroupPageEntry[]>();
+  const pages = new Map<BlobRef, GroupRef[]>();
   const roots = new Map<BlobRef, GroupRoot>();
   const wantRuns = (runs: readonly RunRef[]): void => {
     for (const each of runs) {
@@ -112,7 +117,23 @@ function fixture(): Fixture {
         if (column.distinctSketch !== null) want(column.distinctSketch, "distinct-sketch");
       }
     }
-    directories.set(directory, groups);
+    // Pages of 32 groups, so a directory has several.
+    const entries: GroupPageEntry[] = [];
+    for (let start = 0; start < groups.length; start += 32) {
+      const page = groups.slice(start, start + 32);
+      const ref = blob();
+      want(ref, "group-directory-page");
+      pages.set(ref, page);
+      entries.push({
+        ref,
+        firstRowId: page[0]?.firstRowId ?? 1,
+        lastRowId: page[page.length - 1]?.lastRowId ?? 1,
+        groupCount: page.length,
+        rowCount: page.length * 100,
+        liveRowCount: page.length * 90,
+      });
+    }
+    indexes.set(directory, entries);
     return directory;
   };
   const tables: TableRoot[] = [1, 2].map((tableId) => {
@@ -171,15 +192,28 @@ function fixture(): Fixture {
     tables,
     clients: [],
   } as unknown as ManifestRoot;
+  let outstanding = 0;
+  const held = <T>(value: T): Held<T> => {
+    outstanding++;
+    let released = false;
+    return {
+      value,
+      release: () => {
+        if (!released) outstanding--;
+        released = true;
+      },
+    };
+  };
   const reader: ManifestReader = {
-    groups: async (ref) => directories.get(ref) ?? [],
+    groupIndex: async (ref) => held(indexes.get(ref) ?? []),
+    groupPage: async (ref) => held(pages.get(ref) ?? []),
     groupRoot: async (ref) => {
       const found = roots.get(ref);
       if (found === undefined) throw new Error("unknown group root");
-      return found;
+      return held(found);
     },
   };
-  return { root, reader, expected };
+  return { root, reader, expected, outstanding: () => outstanding };
 }
 
 const key = (ref: BlobRef | ExtentRef, kind: string): string =>
@@ -194,8 +228,9 @@ const extentKey = (ref: BlobRef | ExtentRef): string => {
 
 describe("reachability walk", () => {
   it("lists every reference a root reaches, staged index runs included", async () => {
-    const { root, reader, expected } = fixture();
+    const { root, reader, expected, outstanding } = fixture();
     const found = await reachable(root, reader, { concurrency: 8 });
+    expect(outstanding()).toBe(0); // every decoded index, page and root was released
     expect(found.map(({ ref, kind }) => key(ref, kind)).sort()).toEqual(
       expected.map(({ ref, kind }) => key(ref, kind)).sort(),
     );
@@ -216,7 +251,8 @@ describe("reachability walk", () => {
     const { root, reader } = fixture();
     let rootsRead = 0;
     const counting: ManifestReader = {
-      groups: (ref) => reader.groups(ref),
+      groupIndex: (ref) => reader.groupIndex(ref),
+      groupPage: (ref) => reader.groupPage(ref),
       groupRoot: async (ref) => {
         rootsRead++;
         return reader.groupRoot(ref);
@@ -228,14 +264,19 @@ describe("reachability walk", () => {
   });
 
   it("refuses to produce a partial walk when a metadata read fails", async () => {
-    const { root, reader } = fixture();
+    const { root, reader, outstanding } = fixture();
+    let calls = 0;
     const failing: ManifestReader = {
-      groups: (ref) => reader.groups(ref),
-      groupRoot: async () => {
-        throw new Error("Group root checksum mismatch");
+      groupIndex: (ref) => reader.groupIndex(ref),
+      groupPage: (ref) => reader.groupPage(ref),
+      // The fifth group root of a batch fails; the others of its batch were decoded.
+      groupRoot: async (ref) => {
+        if (++calls === 5) throw new Error("Group root checksum mismatch");
+        return reader.groupRoot(ref);
       },
     };
     await expect(reachable(root, failing)).rejects.toThrow("checksum");
+    expect(outstanding()).toBe(0); // nothing decoded stays held after the failure
   });
 
   it("yields every extent for the space, leasing metadata blobs only to decode them", async () => {
@@ -277,21 +318,37 @@ describe("reachability walk", () => {
       free: (bytes: number): void => void (held -= bytes),
     };
     // The codecs are synchronous; resolve the fixture's maps up front.
-    const groupsOf = new Map<BlobRef, readonly GroupRef[]>();
-    const rootsOf = new Map<BlobRef, GroupRoot>();
+    const parsed = <T>(value: T): Parsed<T> => {
+      budget.allocate(10);
+      return { value, charge: 10 };
+    };
+    const unwrap = async <T>(promise: Promise<Held<T>>): Promise<T> => {
+      const holder = await promise;
+      holder.release();
+      return holder.value;
+    };
+    const indexOf = new Map<BlobRef, readonly GroupPageEntry[]>();
+    const pageOf = new Map<BlobRef, readonly GroupRef[]>();
+    const rootOf = new Map<BlobRef, GroupRoot>();
     for (const table of root.tables)
       for (const ref of [table.groups, ...table.staged.map((staged) => staged.groups)]) {
-        const groups = await reader.groups(ref);
-        groupsOf.set(ref, groups);
-        for (const group of groups) rootsOf.set(group.root, await reader.groupRoot(group.root));
+        const entries = await unwrap(reader.groupIndex(ref));
+        indexOf.set(ref, entries);
+        for (const entry of entries) {
+          const groups = await unwrap(reader.groupPage(entry.ref));
+          pageOf.set(entry.ref, groups);
+          for (const group of groups)
+            rootOf.set(group.root, await unwrap(reader.groupRoot(group.root)));
+        }
       }
     const walker = reachableExtents({
-      decodeRoot: () => root,
-      decodeGroups: (bytes) => groupsOf.get(refOf(bytes)) ?? [],
+      decodeRoot: () => parsed(root),
+      decodeGroupIndex: (bytes) => parsed(indexOf.get(refOf(bytes)) ?? []),
+      decodeGroupPage: (bytes) => parsed(pageOf.get(refOf(bytes)) ?? []),
       decodeGroupRoot: (bytes) => {
-        const found = rootsOf.get(refOf(bytes));
+        const found = rootOf.get(refOf(bytes));
         if (found === undefined) throw new Error("unknown group root");
-        return found;
+        return parsed(found);
       },
     });
     const out: Array<BlobRef | ExtentRef> = [];

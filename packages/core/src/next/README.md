@@ -22,7 +22,7 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | `vector/`          | contracts → executor             | Batches (byte-bounded), vectors, validity, exact int64, int128 decimals, UTF-8 builder under a grant, locators                                                                                                                                                                                                                                                                                                         |
 | `storage/`         | storage                          | Backend contract (lock + async fence open, async mutations), file store, simulated disk with crash model, the storage kit (conformance + durability sweep); the extent space (`extents.ts`: allocation, writer lifecycle, publish, pins and reclaim, the verified page cache) and its implementation (`space.ts`, `page-cache.ts`), the in-memory backend (`memory-store.ts`), free map, read coalescing, OPFS backend |
 | `keys/`            | contracts → executor, key index  | Memcomparable key encoding: reusable writer, batched encoder over vectors, indexable-type rules                                                                                                                                                                                                                                                                                                                        |
-| `format/`          | format, write path               | Log frames and multipart transactions, header slots, in-memory and incremental recovery scans, replay rules, request ledger, manifest types, the reachability walk (`reachable.ts`)                                                                                                                                                                                                                                    |
+| `format/`          | format, write path               | Log frames and multipart transactions, header slots, recovery scans, replay rules, request ledger, manifest types and codecs (root, paged group directory, group root), parsed-blob cache, metadata reader, reachability walk                                                                                                                                                                                          |
 | `page/`            | format                           | Page codecs, page directory and statistics, streaming group writer, chunk reader (ChunkPages), inflated-page cache                                                                                                                                                                                                                                                                                                     |
 | `spill/`           | executor (OPFS service: storage) | Spill contract (one long-lived scratch file, batching charged to the operator's budget); in-memory double                                                                                                                                                                                                                                                                                                              |
 | `memory/`          | executor                         | Memory governor: admission, progress loans, held vs allocated bytes (reference implementation)                                                                                                                                                                                                                                                                                                                         |
@@ -261,10 +261,27 @@ is access's `Snapshot`.
   staging included) → spill sweep → ready.
 - Snapshot pins live in memory and are dropped when their client's lock is released.
 - `walkReachable(root, reader)` streams every reference a root reaches (catalog, table
-  statistics, group directories, staged transactions' group directories and index runs, group
-  roots, deletion bitmaps, row-id columns, chunk extents, page directories, sketches, index
-  entries, fences and Bloom filters); `reachableExtents(codecs)` is the extent space's
-  `ReachableExtents` over it. A failed metadata read rejects the walk.
+  statistics, group directory indexes and pages, staged transactions' directories and index runs,
+  group roots, deletion bitmaps, row-id columns, chunk data, page directories, sketches, index
+  entries, fences and Bloom filters); `reachableExtents()` is the extent space's
+  `ReachableExtents` over the real codecs. A failed metadata read rejects the walk.
+
+### Manifest codecs (`format/manifest-codec.ts`, `blob-cache.ts`, `metadata-reader.ts`)
+
+- Binary codecs (version 1) for the root (≤ 1 MiB), group roots and the paged group directory
+  (each blob ≤ 1 MiB). Each blob lists its extents once and gives every reference into one extent
+  the same `ExtentRef`. Encoding is canonical (re-encoding a decoded value gives the same bytes).
+- `TableRoot.groups` names a directory **index**; each index entry names a **page** of up to
+  `GROUPS_PER_PAGE` (4,096) `GroupRef`s with its row-id range and counts. `writeGroupDirectory`
+  keeps unchanged pages, so a flush rewrites only the last page and the index. A table with no
+  groups has a zero-length `groups` reference.
+- Decoders never hash (the space or the root slot verified the bytes); they check structure and
+  throw `ManifestCorruptionError`. Each charges `parseCharge(bytes)` to the caller's budget
+  before it builds anything (`ParseBudgetError` on refusal) and returns the charge with the value.
+- `BlobCache<T>` keeps decoded values across readers: pinned entries are charged to their holder,
+  unpinned ones to the governor, which evicts them first. It backs the chunk-directory cache
+  (`ChunkReadOptions.directories`, R15.7), the inflated-page cache (R15.5) and the
+  `MetadataReader`'s group roots, pages and indexes, which are synchronous on a cache hit.
 
 ### Storage access (`access/`)
 

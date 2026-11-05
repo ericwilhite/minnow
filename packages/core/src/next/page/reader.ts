@@ -54,6 +54,7 @@ import { pageIndexOf, parseDirectory, type ChunkDirectory } from "./directory.js
 import { check, chunkTagOf, PageCorruptionError, ValueTag } from "./format.js";
 import { inflatedLength, inflateInto } from "./gzip.js";
 import type { InflatedPageCache } from "./inflated-cache.js";
+import type { BlobCache } from "../format/blob-cache.js";
 
 export { MAX_BLOB_BYTES, MAX_READ_BYTES };
 
@@ -66,6 +67,11 @@ export interface ChunkReadOptions {
   readonly signal?: AbortSignal;
   /** Where gzip pages stay inflated across loads and readers (R15.5); without it they inflate per load. */
   readonly inflated?: InflatedPageCache;
+  /**
+   * Parsed chunk directories shared across readers (R15.7): a hit opens with no parse and no
+   * read. Without it each `open` parses the directory.
+   */
+  readonly directories?: BlobCache<ChunkDirectory>;
 }
 
 /** The reader could not charge bytes it must hold (a peeked, inflated or parsed structure). */
@@ -171,6 +177,8 @@ export class ChunkReader {
   readonly #held: Array<Held | undefined>;
   readonly #pending = new Map<number, Promise<void>>();
   readonly #directoryCharge: number;
+  /** The directory cache entry this reader pins, or null. */
+  readonly #directoryPin: BlobRef | null;
   #dictionaryPending: Promise<void> | null = null;
   #dictionary: PageDictionary | null = null;
   #dictionaryHeld: Held | null = null;
@@ -183,12 +191,14 @@ export class ChunkReader {
     directory: ChunkDirectory,
     options: ChunkReadOptions,
     directoryBytes: number,
+    directoryPin: BlobRef | null,
   ) {
     this.#space = space;
     this.#options = options;
     this.chunk = chunk;
     this.directory = directory;
     this.#directoryCharge = directoryBytes;
+    this.#directoryPin = directoryPin;
     this.#pages = new Array<PageView | undefined>(directory.pages.length);
     this.#held = new Array<Held | undefined>(directory.pages.length);
   }
@@ -200,21 +210,38 @@ export class ChunkReader {
     options: ChunkReadOptions,
   ): MaybePromise<ChunkReader> {
     const ref = chunk.directory;
+    const cache = options.directories;
+    const hit = cache?.pin(ref) ?? null;
+    if (cache !== undefined && hit !== null) {
+      // Cached and parsed already: charged to this reader while it holds it, unpinned at close.
+      if (hit.value.tag !== chunkTagOf(chunk.type) || !options.budget.allocate(hit.size)) {
+        cache.unpin(ref);
+        if (hit.value.tag !== chunkTagOf(chunk.type))
+          throw new PageCorruptionError("Page directory tag differs from the column type");
+        throw new PageBudgetError(hit.size);
+      }
+      return new ChunkReader(space, chunk, hit.value, options, hit.size, ref);
+    }
     const build = (bytes: Uint8Array): ChunkReader => {
       // Charged from the header's page count before the parse builds anything (B2-2 #4).
       const charge = directoryChargeOf(sized(bytes, ref.length));
       if (!options.budget.allocate(charge)) throw new PageBudgetError(charge);
+      let directory: ChunkDirectory;
       try {
-        const directory = parseDirectory(bytes, chunk.data.length);
+        directory = parseDirectory(bytes, chunk.data.length);
         check(
           directory.tag === chunkTagOf(chunk.type),
           "Page directory tag differs from the column type",
         );
-        return new ChunkReader(space, chunk, directory, options, charge);
       } catch (error) {
         options.budget.free(charge);
         throw error;
       }
+      if (cache === undefined)
+        return new ChunkReader(space, chunk, directory, options, charge, null);
+      // Pinned for this reader; another reader's earlier entry wins a race (same bytes, same charge).
+      const shared = cache.admit(ref, directory, charge);
+      return new ChunkReader(space, chunk, shared, options, charge, ref);
     };
     const cached = space.peek(ref);
     if (cached !== null) return build(cached);
@@ -534,6 +561,7 @@ export class ChunkReader {
     this.#dictionary = null;
     this.#dictionaryVector = null;
     this.#options.budget.free(this.#directoryCharge);
+    if (this.#directoryPin !== null) this.#options.directories?.unpin(this.#directoryPin);
   }
 
   #view(index: number): PageView {
