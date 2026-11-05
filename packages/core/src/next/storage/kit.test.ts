@@ -54,8 +54,10 @@ describe("storage kit (conformance + physical durability sweep)", () => {
       };
       return backend;
     };
+    // The storage track's conformance case ("survives reacquiring") rejects it before the
+    // sweep's clean reopen does; either is the intended reason.
     await expect(runStorageKit(losesPrevious)).rejects.toThrow(
-      /clean reopen: previous root null is not the one before the current/u,
+      /previous survives|clean reopen: previous root null is not the one before the current/u,
     );
   });
 
