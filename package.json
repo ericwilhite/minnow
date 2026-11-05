@@ -63,7 +63,10 @@
     "benchmark:stalls": "vite-node scripts/stall-survey.mts",
     "benchmark:live-wide": "tsc -b packages/core packages/kysely && node scripts/live-wide-bench.mts",
     "test:browser:conformance": "tsc -b packages/core --force && MINNOW_BROWSER_CONFORMANCE=1 playwright test --config playwright.library.config.ts",
-    "benchmark:compare": "vite-node scripts/perf-gate.mts --compare"
+    "benchmark:compare": "vite-node scripts/perf-gate.mts --compare",
+    "test:differential": "vitest run packages/core/src/testing/differential-harness.test.ts",
+    "test:differential:nightly": "MINNOW_DIFFERENTIAL_PROFILE=nightly vitest run packages/core/src/testing/differential-harness.test.ts",
+    "fixture:differential": "vite-node scripts/differential-corpus.mts"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.5",

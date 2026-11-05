@@ -74,3 +74,21 @@ export function createReach<State extends string>(
     },
   };
 }
+
+/** Rebuild campaign: each source plus both successful and refused SQL must execute. */
+export const DIFFERENTIAL_REACH = [
+  "conformance",
+  "fast-check",
+  "interaction",
+  "sqllogictest",
+  "api-contract",
+  "schema",
+  "insertBatch",
+  "upsertBatch",
+  "deleteBatch",
+  "reopen",
+  "transaction",
+  "returning",
+  "success",
+  "refusal",
+] as const;

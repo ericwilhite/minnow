@@ -1091,3 +1091,64 @@ occur when another tab wins the same maintenance work. Those specific maintenanc
 classified by their operation, error type, and identity/revision fields. Generic errors,
 I/O failures, corruption, changed posting chunks, and window or unhandled errors still fail
 the campaign; message text never suppresses a failure.
+
+## Rebuild differential harness
+
+`npm run test:differential` runs the serial rebuild harness in the normal unit suite.
+It replays the same workloads against the current engine on memory, fake IndexedDB and
+the in-memory OPFS shim, then checks committed canonical answers. These are Node models;
+the browser suites above remain necessary for native storage and process failures.
+`npm run test:differential:nightly` selects the larger profile.
+
+A candidate engine implements `EngineFactory` and `EngineUnderTest` in
+`packages/core/src/testing/differential-harness.ts`. Pass its factory to `runWorkload`,
+then pass both outcome arrays to `assertIdentical`. For large profiles, use `compareEngines`
+to compare open engines in lockstep while retaining only one statement’s answers; the caller
+closes those engines in a `finally` block. Each factory call owns a fresh database.
+The interface accepts SQL and parameters, including transaction control and RETURNING,
+the create-table schema objects used by these workloads, batch insert/upsert/delete,
+and reopen. The current adapter is `differential-current.ts`. These are repository
+test helpers, not new exports from the published testing entry point.
+
+Identity includes projected column names and SQL domain metadata, statement kind,
+affected counts, RETURNING, duplicate rows, exact strings and typed values.
+NUMERIC scale and DATE text are preserved. Numbers compare IEEE-754 bytes, including
+signed zero; NaN payloads are not compared because JavaScript does not promise them.
+Arrays preserve order; blobs preserve bytes; object keys are sorted; JSON text stays
+exact text. No floating-point tolerance is enabled. Rows compare as multisets unless
+the source supplies proof of a total SQL order. Error constructor names and optional
+codes compare; messages, stacks, physical IDs, storage metrics and timings do not.
+The contract comment in the harness is the authority for this comparison.
+
+The shared sources are the SQLite/PGlite seeded templates and fixture
+(`conformance-source.ts`), the existing fast-check simple-write arbitrary
+(`live-write-source.ts`), serial traces from the interaction-plan simulator, and
+the committed SQLLogicTest files. The original conformance and live suites import
+the extracted generators too. This harness does not replace their independent
+oracles. It does not replay every property, conformance combination, simulator
+interaction, or live delivery.
+
+The fast profile uses seed 24301, one round of all 115 conformance templates,
+30 fast-check writes with reads after each, a 40-interaction plan filtered to
+serial SQL operations, the first 50 SQLLogicTest operations, and a batch/transaction
+contract workload. It currently has five workloads and 348 operations per store (340 SQL statements).
+The longer profile uses seeds 24301–24304, five template rounds, 300 writes and
+400-interaction plans per seed, and all five standard SQLLogicTest files: 18 workloads and 17,125 operations per store (17,061 SQL statements).
+All generated seeds come from `seedsFor("differential-harness", ...)`;
+`MINNOW_SEED=123 npm run test:differential` replays one seed.
+The soak runner also varies this suite’s seeds. The campaign's declared reach lives in `testing/reach.ts`.
+
+`npm run fixture:differential` records the fast workloads and canonical memory-engine
+answers in `packages/core/testdata/differential-corpus.json`. It refuses a seed override.
+The file contains the actual inputs, including tagged datetime parameters, so replay
+does not depend on keeping an old generator or engine. The frozen test executes those
+inputs through the ordinary API. Keep the file compact (currently about 1.23 MB).
+These answers pin current behaviour as evidence, never as SQL authority. Changing
+them requires a cited PostgreSQL behaviour or a documented Minnow contract, with the
+reason recorded in the change. Do not regenerate them just to silence a mismatch.
+
+Mutant adapters prove that dropping a row, changing NUMERIC scale, swapping an error
+class or introducing negative zero fails at the intended operation. Reversing an
+unordered result passes. Live subscriptions, concurrent openers, crash schedules,
+native browser storage and order-dependent floating aggregates remain outside this
+serial harness; their existing suites still own those checks.

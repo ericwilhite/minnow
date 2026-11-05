@@ -50,6 +50,7 @@
     "indexeddb-schema4-lookups": [],
     "opfs-segment-names": [],
     "unicode-properties": [],
-    "record-json-properties": []
+    "record-json-properties": [],
+    "differential-harness": []
   }
 }
