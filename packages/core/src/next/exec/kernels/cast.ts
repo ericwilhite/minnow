@@ -33,7 +33,12 @@ import {
 } from "../../temporal.js";
 import { MAX_SAFE } from "../../vector/int64.js";
 import type { Batch, FlatVector, Int64Values, Selection, Vector } from "../../vector/vector.js";
-import { CannotConvertError, NumericOutOfRangeError, UnsupportedPlanError } from "../errors.js";
+import {
+  CannotConvertError,
+  DatetimeOverflowError,
+  NumericOutOfRangeError,
+  UnsupportedPlanError,
+} from "../errors.js";
 import { castRefusal } from "./bindings.js";
 import { coefficientAt, scaleAt, specialAt, type DecimalData } from "./numeric.js";
 import {
@@ -482,6 +487,14 @@ class ToDecimal extends CastNode {
   }
 }
 
+/**
+ * The days (since 2000-01-01) whose midnight is a finite TIMESTAMP: 4714-11-24 BC through
+ * 294276-12-31 (PostgreSQL's date2timestamp: later dates are 22008, verified in PGlite). The same
+ * bounds hold for TIMESTAMPTZ under the UTC session zone.
+ */
+const TIMESTAMP_FIRST_DAY = -2_451_545;
+const TIMESTAMP_LAST_DAY = 106_751_982;
+
 class DateToTimestamp extends CastNode {
   readonly #out: FlatVector;
   constructor(type: PhysicalType, input: Compiled, arena: OutputArena) {
@@ -506,12 +519,11 @@ class DateToTimestamp extends CastNode {
       const i = rows[k] ?? 0;
       if (!isValidRow(value, i)) continue;
       const days = read(i) as number;
-      out[i] =
-        days === DATE_POS_INFINITY
-          ? TIMESTAMP_POS_INFINITY
-          : days === DATE_NEG_INFINITY
-            ? TIMESTAMP_NEG_INFINITY
-            : BigInt(days) * MICROS_PER_DAY_BIG;
+      if (days === DATE_POS_INFINITY) out[i] = TIMESTAMP_POS_INFINITY;
+      else if (days === DATE_NEG_INFINITY) out[i] = TIMESTAMP_NEG_INFINITY;
+      else if (days < TIMESTAMP_FIRST_DAY || days > TIMESTAMP_LAST_DAY)
+        throw new DatetimeOverflowError("date out of range for timestamp");
+      else out[i] = BigInt(days) * MICROS_PER_DAY_BIG;
     }
     this.#out.length = length;
     this.#out.validity = validityOf(value);
@@ -590,7 +602,10 @@ export function compileCast(type: PhysicalType, input: Compiled, arena: OutputAr
   if (NUMERIC.has(from.kind) && NUMERIC.has(type.kind)) {
     switch (type.kind) {
       case "int32":
-        if (from.kind === "int32" && (from.bits === type.bits || type.bits === 32)) return input;
+        if (from.kind === "int32" && from.bits === type.bits) return input;
+        // Widening int2 → int4 keeps every value; the node must still carry the target type,
+        // since calls bind their overload from their arguments' compiled types (R19).
+        if (from.kind === "int32" && type.bits === 32) return new Retype(type, input);
         return new ToInt32(type, input, arena);
       case "int64":
         return from.kind === "int64" ? input : new ToInt64(type, input, arena);

@@ -8,7 +8,9 @@
  * through a Uint32Array view of their BigInt64Array (two limbs, sign-extended).
  *
  * Operations report overflow past 128 bits by returning false; the caller then recomputes the
- * batch in the `wide` (bigint) tier, which only values genuinely wider than 128 bits reach.
+ * whole batch in the `wide` tier with one BigInt per value. A batch goes there when one of its
+ * values (an input, an aligned operand or a result) is wider than 128 bits, an input is already
+ * `wide`, or a product passes the display-scale cap; scale diversity alone never sends it there.
  */
 
 const TWO32 = 4294967296;

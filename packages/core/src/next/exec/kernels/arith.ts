@@ -561,7 +561,6 @@ const NEG = 3;
 /** PostgreSQL's largest NUMERIC display scale; a product past it is rounded to it. */
 const NUMERIC_MAX_SCALE = 16_383;
 /** Distinct (scale, scale) pairs a batch is partitioned into before falling back to per row. */
-const MAX_SCALE_PARTITIONS = 32;
 
 function decimalVector(
   type: PhysicalType,
@@ -604,9 +603,20 @@ class DecimalNode extends BinaryNode {
   readonly #tiers: readonly FlatVector[];
   /** Row order grouped by scale pair, and the pairs. */
   readonly #order: Uint16Array;
-  readonly #pairKeys = new Int32Array(MAX_SCALE_PARTITIONS);
-  readonly #pairCounts = new Int32Array(MAX_SCALE_PARTITIONS + 1);
-  readonly #pairOf: Uint8Array;
+  /** Per partition: its (left scale, right scale) key, and its end in `#order`. */
+  readonly #pairKeys: Int32Array;
+  readonly #pairCounts: Int32Array;
+  /** Per row: its partition. */
+  readonly #pairOf: Uint16Array;
+  /**
+   * Key → partition for the current batch: open addressing at load ≤ ½, slots valid only when
+   * their stamp is the batch's (so no clearing per batch).
+   */
+  readonly #slotKeys: Int32Array;
+  readonly #slotPairs: Uint16Array;
+  readonly #slotStamps: Int32Array;
+  readonly #slotMask: number;
+  #stamp = 0;
   #wordsCache: { source: BigInt64Array | null; words: Uint32Array } = {
     source: null,
     words: new Uint32Array(0),
@@ -625,6 +635,8 @@ class DecimalNode extends BinaryNode {
     super(type, left, right);
     this.#op = OPS[op];
     const capacity = arena.capacity;
+    let table = 1;
+    while (table < 2 * capacity) table *= 2;
     arena.take(
       2 * capacity +
         8 * capacity +
@@ -632,7 +644,11 @@ class DecimalNode extends BinaryNode {
         8 * capacity +
         32 * capacity +
         capacity +
-        3 * capacity,
+        2 * capacity +
+        2 * capacity +
+        4 * capacity +
+        4 * (capacity + 1) +
+        10 * table,
     );
     this.#scales = new Uint16Array(capacity);
     this.#safeCoefficients = new Float64Array(capacity);
@@ -642,7 +658,13 @@ class DecimalNode extends BinaryNode {
     this.#wideValues = new Array<bigint>(capacity).fill(0n);
     this.#specials = new Uint8Array(capacity);
     this.#order = new Uint16Array(capacity);
-    this.#pairOf = new Uint8Array(capacity);
+    this.#pairOf = new Uint16Array(capacity);
+    this.#pairKeys = new Int32Array(capacity);
+    this.#pairCounts = new Int32Array(capacity + 1);
+    this.#slotKeys = new Int32Array(table);
+    this.#slotPairs = new Uint16Array(table);
+    this.#slotStamps = new Int32Array(table);
+    this.#slotMask = table - 1;
     this.#validity = arena.validity();
     this.#perSlot = decimalVector(
       type,
@@ -793,8 +815,9 @@ class DecimalNode extends BinaryNode {
     return cache.words;
   }
   /**
-   * Groups the computed valid rows by (left scale, right scale) into `#order`; returns the number
-   * of groups, or −1 past MAX_SCALE_PARTITIONS distinct pairs.
+   * Groups the computed rows by (left scale, right scale) into `#order` (a counting sort over
+   * partitions found through a per-batch hash table, any number of them); returns the number of
+   * partitions, `#pairCounts[p]` then being the end of partition p.
    */
   #partition(
     lf: FlatVector,
@@ -809,16 +832,41 @@ class DecimalNode extends BinaryNode {
     const keys = this.#pairKeys;
     const counts = this.#pairCounts;
     const pairOf = this.#pairOf;
+    const slotKeys = this.#slotKeys;
+    const slotPairs = this.#slotPairs;
+    const stamps = this.#slotStamps;
+    const mask = this.#slotMask;
+    // A new stamp invalidates every slot of the previous batch (wraps after 2^31 batches).
+    const stamp = (this.#stamp = (this.#stamp + 1) | 0) === 0 ? (this.#stamp = 1) : this.#stamp;
     let pairs = 0;
-    counts.fill(0);
+    counts.fill(0, 0, count + 1);
+    // Consecutive rows usually repeat the previous pair: skip the table for them.
+    let lastKey = -1;
+    let lastPair = 0;
     for (let k = 0; k < count; k++) {
       const i = rows[k] ?? 0;
-      const key = (scaleAt(ld, slotIndex(l, i)) << 16) | scaleAt(rd, slotIndex(r, i));
-      let p = 0;
-      while (p < pairs && keys[p] !== key) p++;
-      if (p === pairs) {
-        if (pairs === MAX_SCALE_PARTITIONS) return -1;
-        keys[pairs++] = key;
+      // Scales are ≤ 16,383 (14 bits): the pair fits 28 bits.
+      const key = (scaleAt(ld, slotIndex(l, i)) << 14) | scaleAt(rd, slotIndex(r, i));
+      let p = lastPair;
+      if (key !== lastKey) {
+        let s = (Math.imul(key, 0x9e3779b1) >>> 16) & mask;
+        for (;;) {
+          if (stamps[s] !== stamp) {
+            stamps[s] = stamp;
+            slotKeys[s] = key;
+            slotPairs[s] = pairs;
+            keys[pairs] = key;
+            p = pairs++;
+            break;
+          }
+          if (slotKeys[s] === key) {
+            p = slotPairs[s] ?? 0;
+            break;
+          }
+          s = (s + 1) & mask;
+        }
+        lastKey = key;
+        lastPair = p;
       }
       pairOf[i] = p;
       counts[p + 1] = (counts[p + 1] ?? 0) + 1;
@@ -848,9 +896,11 @@ class DecimalNode extends BinaryNode {
     const rd = rf.data as DecimalData;
     if (ld.coefficients.repr === "wide" || rd.coefficients.repr === "wide") return null;
     const pairs = this.#partition(lf, l, rf, r, rows, count);
-    if (pairs < 0) return null;
     const lw = this.#words(ld, false);
     const rw = this.#words(rd, true);
+    // The representation is chosen once per batch, not switched on per row.
+    const loadLeft = loaderFor(ld);
+    const loadRight = loaderFor(rd);
     const out = this.#limbs;
     const scales = this.#scales;
     const specials = this.#specials;
@@ -863,8 +913,8 @@ class DecimalNode extends BinaryNode {
     for (let p = 0; p < pairs; p++) {
       const end = ends[p] ?? 0;
       const key = this.#pairKeys[p] ?? 0;
-      const sa = key >>> 16;
-      const sb = key & 0xffff;
+      const sa = key >>> 14;
+      const sb = key & 0x3fff;
       const scale = op === MUL ? sa + sb : Math.max(sa, sb);
       if (scale > NUMERIC_MAX_SCALE) return null;
       const da = op === MUL ? 0 : scale - sa;
@@ -876,8 +926,8 @@ class DecimalNode extends BinaryNode {
         if (!validAt(validity, i)) continue;
         const li = slotIndex(l, i);
         const ri = slotIndex(r, i);
-        loadCoefficient(SCRATCH, 0, ld, li, lw);
-        loadCoefficient(SCRATCH, 1, rd, ri, rw);
+        loadLeft(SCRATCH, 0, ld, li, lw);
+        loadRight(SCRATCH, 1, rd, ri, rw);
         const xs = specialAt(ld, li);
         const ys = specialAt(rd, ri);
         if (xs !== 0 || ys !== 0) {
@@ -984,27 +1034,36 @@ function roundHalfAway(c: bigint, digits: number): bigint {
   return 2n * (r < 0n ? -r : r) >= divisor ? q + (c < 0n ? -1n : 1n) : q;
 }
 
-/** Loads coefficient `slot` of a non-wide decimal into limb slot `to` of `t`. */
-function loadCoefficient(
+/** Loads coefficient `slot` of a decimal into limb slot `to` of `t` (one representation each). */
+type Loader = (
   t: Uint32Array,
   to: number,
   data: DecimalData,
   slot: number,
   words: Uint32Array,
-): void {
-  const c = data.coefficients;
-  switch (c.repr) {
+) => void;
+
+const loadSafe: Loader = (t, to, data, slot) => {
+  setNumber(t, to, (data.coefficients as { values: Float64Array }).values[slot] ?? 0);
+};
+const loadInt64: Loader = (t, to, _data, slot, words) => {
+  setInt64(t, to, words, slot);
+};
+const loadInt128: Loader = (t, to, data, slot) => {
+  copy(t, to, (data.coefficients as { limbs: Uint32Array }).limbs, slot);
+};
+
+/** The loader for a non-wide decimal's representation. */
+function loaderFor(data: DecimalData): Loader {
+  switch (data.coefficients.repr) {
     case "safe":
-      setNumber(t, to, c.values[slot] ?? 0);
-      return;
+      return loadSafe;
     case "int64":
-      setInt64(t, to, words, slot);
-      return;
+      return loadInt64;
     case "int128":
-      copy(t, to, c.limbs, slot);
-      return;
+      return loadInt128;
     case "wide":
-      throw new TypeError("loadCoefficient: wide tier");
+      throw new TypeError("loaderFor: wide tier");
   }
 }
 

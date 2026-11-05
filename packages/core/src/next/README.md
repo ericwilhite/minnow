@@ -493,8 +493,11 @@ and the owner import it directly.
   within ±(2^53 − 1), recomputed exactly in BigInt64Array otherwise; floats with PostgreSQL's
   overflow, underflow and division-by-zero errors, REAL rounded with `Math.fround`; decimals with
   per-slot scales, never rescaled to a shared maximum: f64 while exact, then the int64 and int128
-  tiers in 32-bit limbs (no BigInt per value; rows grouped by scale pair), BigInt only past 128
-  bits.
+  tiers in 32-bit limbs (no BigInt per value; rows grouped by scale pair, any number of pairs).
+  A batch is recomputed with one BigInt per value only when a value of it passes 128 bits, an
+  input is already wide, or a product passes the display-scale cap.
+- Casts carry their target type (a widened SMALLINT is an INTEGER to the call above it).
+  DATE → TIMESTAMP(TZ) is 22008 past 294276-12-31, as PostgreSQL.
 - Comparisons follow PostgreSQL: NaN equals NaN and sorts last, decimals compare by value across
   scales, text compares bytes. A dictionary column against a constant is compared once per
   entry.

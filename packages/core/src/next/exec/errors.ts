@@ -101,3 +101,14 @@ export class CannotConvertError extends ExecutionError {
     this.name = "CannotConvertError";
   }
 }
+
+/**
+ * 22008 (datetime_field_overflow): a date or timestamp outside the target type's finite range,
+ * with PostgreSQL's message ("date out of range for timestamp").
+ */
+export class DatetimeOverflowError extends ExecutionError {
+  constructor(message: string) {
+    super(message, "MINNOW_DATETIME_OVERFLOW", "22008");
+    this.name = "DatetimeOverflowError";
+  }
+}

@@ -130,23 +130,40 @@ new PerformanceObserver((list) => {
 }).observe({ entryTypes: ["gc"] });
 const gc = (globalThis as { gc?: () => void }).gc;
 
-/** Bytes allocated per batch by one pass of `run`, or null when it cannot be measured. */
-function allocationPerBatch(run: () => number, batches: number): number | null {
+/** Lets the GC observer deliver pending entries (they arrive on a later task, not synchronously). */
+const drain = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+/**
+ * Heap growth per batch over one pass of `run` that no collection interrupted, or null when it
+ * cannot be measured. GC observer entries arrive asynchronously, so notifications are drained
+ * after the forced collection and after the pass; a pass during which a collection ran is
+ * rejected (its heap difference would understate what it allocated). This is retained growth
+ * over a collection-free pass — the bytes allocated, when nothing allocated was freed — not an
+ * allocation profiler.
+ */
+async function allocationPerBatch(run: () => number, batches: number): Promise<number | null> {
   if (gc === undefined) return null;
   for (let attempt = 0; attempt < 5; attempt++) {
     gc();
+    await drain();
     const before = collections;
     const heap = process.memoryUsage().heapUsed;
     run();
     const grown = process.memoryUsage().heapUsed - heap;
+    await drain();
     if (collections === before) return Math.max(0, grown) / batches;
   }
   return null;
 }
 
-function bench(shape: string, rows: number, reference: string, run: () => number): void {
+async function bench(
+  shape: string,
+  rows: number,
+  reference: string,
+  run: () => number,
+): Promise<void> {
   const { ms, min } = time(run);
-  const bytes = allocationPerBatch(run, Math.ceil(rows / BATCH));
+  const bytes = await allocationPerBatch(run, Math.ceil(rows / BATCH));
   results.push({ shape, rows, ms, min, bytes, reference });
 }
 
@@ -171,7 +188,7 @@ function bench(shape: string, rows: number, reference: string, run: () => number
     }),
     [F64, I64],
   );
-  bench("SUM(v * 1.1 + id)", rows, "DuckDB 5.4 ms (whole query)", () => {
+  await bench("SUM(v * 1.1 + id)", rows, "DuckDB 5.4 ms (whole query)", () => {
     let s = 0;
     for (const batch of data) s += sumOf(sumExpr.evaluate(batch, null), batch.length);
     return s;
@@ -185,11 +202,16 @@ function bench(shape: string, rows: number, reference: string, run: () => number
     },
     [F64, I64],
   );
-  bench("SUM(CASE WHEN v > 50 THEN v ELSE -v END)", rows, "DuckDB 4.5 ms (whole query)", () => {
-    let s = 0;
-    for (const batch of data) s += sumOf(caseExpr.evaluate(batch, null), batch.length);
-    return s;
-  });
+  await bench(
+    "SUM(CASE WHEN v > 50 THEN v ELSE -v END)",
+    rows,
+    "DuckDB 4.5 ms (whole query)",
+    () => {
+      let s = 0;
+      for (const batch of data) s += sumOf(caseExpr.evaluate(batch, null), batch.length);
+      return s;
+    },
+  );
 }
 
 // --- 1M-row filters and arithmetic -----------------------------------------------------------
@@ -235,7 +257,7 @@ function bench(shape: string, rows: number, reference: string, run: () => number
   const context = { arena: new OutputArena(UNCHARGED, BATCH), params: { slots: [] }, input: types };
 
   const lt = new Predicate(cmp("<", col(0, I32), lit(numbers(I32, [500_000]))), context);
-  bench(
+  await bench(
     "WHERE i07 < 500000 (selection)",
     rows,
     "DuckDB 8.9 ms (scan_proj3_agg, whole query)",
@@ -246,7 +268,7 @@ function bench(shape: string, rows: number, reference: string, run: () => number
     },
   );
   const eq = new Predicate(cmp("=", col(1, TEXT), lit(texts(["v7"]))), context);
-  bench("WHERE d = 'v7' (dictionary codes)", rows, "—", () => {
+  await bench("WHERE d = 'v7' (dictionary codes)", rows, "—", () => {
     let kept = 0;
     for (const batch of data) kept += eq.select(batch).count;
     return kept;
@@ -262,13 +284,13 @@ function bench(shape: string, rows: number, reference: string, run: () => number
     },
     context,
   );
-  bench("WHERE i07 < 500000 AND d = 'v7'", rows, "—", () => {
+  await bench("WHERE i07 < 500000 AND d = 'v7'", rows, "—", () => {
     let kept = 0;
     for (const batch of data) kept += both.select(batch).count;
     return kept;
   });
   const decAdd = compile(call("add", N, col(2, D), col(3, D)), types);
-  bench("n00 + n01, NUMERIC(12,2)", rows, "agg_numeric_sum target ≤ 5 ms incl. SUM", () => {
+  await bench("n00 + n01, NUMERIC(12,2)", rows, "agg_numeric_sum target ≤ 5 ms incl. SUM", () => {
     let s = 0;
     for (const batch of data) {
       const out = decAdd.evaluate(batch, null) as FlatVector;
@@ -278,7 +300,7 @@ function bench(shape: string, rows: number, reference: string, run: () => number
     return s;
   });
   const decMul = compile(call("mul", N, col(4, N), col(4, N)), types);
-  bench("n * n, unconstrained NUMERIC (per-slot scales)", rows, "—", () => {
+  await bench("n * n, unconstrained NUMERIC (per-slot scales)", rows, "—", () => {
     let s = 0;
     for (const batch of data) {
       const out = decMul.evaluate(batch, null) as FlatVector;
@@ -286,8 +308,34 @@ function bench(shape: string, rows: number, reference: string, run: () => number
     }
     return s;
   });
+  // Review B4-p2a-2 finding 2: many (scale, scale) pairs per batch stay in the limb tiers.
+  const diverse = batches(rows, (_start, n) => [
+    decimals(
+      N,
+      Array.from(
+        { length: n },
+        () =>
+          [BigInt(Math.floor(random() * 2 ** 40)) * 1000000n, Math.floor(random() * 12)] as const,
+      ),
+      "int64",
+    ),
+    decimals(
+      N,
+      Array.from(
+        { length: n },
+        () => [BigInt(Math.floor(random() * 2 ** 40)), Math.floor(random() * 12)] as const,
+      ),
+      "int64",
+    ),
+  ]);
+  const diverseAdd = compile(call("add", N, col(0, N), col(1, N)), [N, N]);
+  await bench("n + m, int64 tier, ~144 scale pairs per batch", rows, "—", () => {
+    let s = 0;
+    for (const batch of diverse) s += diverseAdd.evaluate(batch, null).length;
+    return s;
+  });
   const intAdd = compile(call("add", I64, col(5, I64), col(5, I64)), types);
-  bench("bigint + bigint (safe representation)", rows, "—", () => {
+  await bench("bigint + bigint (safe representation)", rows, "—", () => {
     let s = 0;
     for (const batch of data) s += sumOf(intAdd.evaluate(batch, null), batch.length);
     return s;

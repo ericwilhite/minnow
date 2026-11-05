@@ -10,11 +10,16 @@
  *   integer, NUMERIC(p, s) typmods including negative scales);
  * - representations: each operand flat, dictionary-encoded or constant;
  * - NULLs with garbage under them (NaN, huge values, zero divisors);
- * - errors: the SQLSTATE must match (the first failing row decides, as PostgreSQL's row order).
+ * - errors: the SQLSTATE must match (the first failing row decides, as PostgreSQL's row order);
+ * - batches of 40 NUMERIC rows over many (scale, scale) pairs (more than 32 per batch);
+ * - CASE with up to 300 branches and COALESCE over text and INTERVAL results, intervals with
+ *   microseconds past 2^53 (the int64 representation).
+ * Declared reach (testing/reach.ts): each seed's run must enter the states its laws depend on.
  */
 import { PGlite } from "@electric-sql/pglite";
 import fc from "fast-check";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createReach } from "../../../testing/reach.js";
 import { seedsFor } from "../../../testing/seeds.js";
 import type { ScalarExpr } from "../../ir/ir.js";
 import type { PhysicalType } from "../../types.js";
@@ -31,6 +36,7 @@ import {
   call,
   cmp,
   col,
+  compileFor,
   decimal,
   decimals,
   dictionary,
@@ -38,7 +44,10 @@ import {
   lit,
   numbers,
   texts,
+  valueAt,
 } from "./test-support.js";
+
+const INTERVAL: PhysicalType = { kind: "interval" };
 
 const SEEDS = seedsFor("next-kernels-pglite", [0x9617, 0x2b]);
 let pg: PGlite;
@@ -569,4 +578,222 @@ describe("kernels against PostgreSQL (PGlite, generated)", () => {
     const theirs = await postgres(sql, [["int4", values]]);
     expect(local.map((v) => (v === null ? "NULL" : v))).toEqual(theirs);
   });
+
+  it.each(SEEDS)(
+    "numeric arithmetic over 40-row batches with many scale pairs (seed %i)",
+    async (seed) => {
+      const D = TYPES.numeric;
+      const reach = createReach("next-kernels-numeric-scale-pairs", [
+        "more than 32 scale pairs",
+        "int64 tier",
+        "int128 tier",
+      ] as const);
+      // One coefficient bound per case (so every non-wide tier is reached), scales 0–12
+      // independently per side and row.
+      const column = (bound: bigint) =>
+        fc.array(
+          withNulls(
+            fc.tuple(fc.bigInt({ min: -bound, max: bound }), fc.integer({ min: 0, max: 12 })),
+          ),
+          { minLength: 40, maxLength: 40 },
+        );
+      await fc.assert(
+        fc.asyncProperty(
+          fc.constantFrom("add", "sub", "mul"),
+          fc
+            .constantFrom(10n ** 9n, 2n ** 62n, 2n ** 100n)
+            .chain((bound) => fc.tuple(column(bound), column(bound))),
+          async (op, [a, b]) => {
+            reach.beginHistory();
+            const pairs = new Set(
+              a.map((x, k) => {
+                const y = b[k];
+                return `${Array.isArray(x) ? String(x[1]) : "-"}/${Array.isArray(y) ? String(y[1]) : "-"}`;
+              }),
+            );
+            if (pairs.size > 32) reach.reach("more than 32 scale pairs");
+            const width = (xs: readonly Value[]) =>
+              xs.reduce<number>(
+                (m, x) => (Array.isArray(x) ? Math.max(m, (x[0] as bigint).toString(2).length) : m),
+                0,
+              );
+            const widest = Math.max(width(a), width(b));
+            if (widest > 53 && widest <= 63) reach.reach("int64 tier");
+            if (widest > 63) reach.reach("int128 tier");
+            return judge(
+              call(op, D, col(0, D), col(1, D)),
+              `c0 ${SYMBOLS[op]} c1`,
+              "numeric",
+              [
+                ["numeric", a],
+                ["numeric", b],
+              ],
+              ["flat", "flat"],
+              0,
+            );
+          },
+        ),
+        { seed, numRuns: 60 },
+      );
+      reach.assertReached();
+    },
+    120_000,
+  );
+
+  it.each(SEEDS)(
+    "CASE (up to 300 branches) and COALESCE over text and wide intervals (seed %i)",
+    async (seed) => {
+      const reach = createReach("next-kernels-case-interval", [
+        "more than 256 branches",
+        "interval result",
+        "interval microseconds past 2^53",
+        "coalesce",
+      ] as const);
+      const microsArb = fc.oneof(
+        fc.bigInt({ min: -(10n ** 9n), max: 10n ** 9n }),
+        fc.bigInt({ min: -(2n ** 62n), max: 2n ** 62n }),
+        fc.bigInt({ min: 2n ** 53n - 3n, max: 2n ** 53n + 3n }),
+      );
+      const intervalArb = withNulls(
+        fc.tuple(
+          fc.integer({ min: -1000, max: 1000 }),
+          fc.integer({ min: -1000, max: 1000 }),
+          microsArb,
+        ),
+      );
+      type Interval = readonly [number, number, bigint] | null;
+      const intervalSql = (v: Interval): string => {
+        if (v === null) return "null::interval";
+        const [months, days, micros] = v;
+        const hours = micros / 3_600_000_000n;
+        const rest = micros - hours * 3_600_000_000n;
+        return `(interval '${String(months)} months' + interval '${String(days)} days' + interval '${hours.toString()} hours' + interval '${rest.toString()} microseconds')`;
+      };
+      const intervalVector = (values: readonly Interval[]): FlatVector => {
+        const validity = new Uint32Array((values.length + 31) >>> 5);
+        values.forEach((v, row) => {
+          if (v !== null) validity[row >>> 5] = (validity[row >>> 5] ?? 0) | (1 << (row & 31));
+        });
+        return {
+          form: "flat",
+          type: INTERVAL,
+          length: values.length,
+          validity: values.some((v) => v === null) ? validity : null,
+          data: {
+            layout: "interval",
+            months: Int32Array.from(values, (v) => v?.[0] ?? 0),
+            days: Int32Array.from(values, (v) => v?.[1] ?? 0),
+            micros: { repr: "int64", values: BigInt64Array.from(values, (v) => v?.[2] ?? 0n) },
+          },
+        };
+      };
+      /** Row `row` of an interval vector as "months/days/micros" (or NULL). */
+      const intervalAt = (vector: Vector, row: number): string => {
+        let flat: FlatVector;
+        let slot = row;
+        if (vector.form === "constant") {
+          flat = vector.value;
+          slot = 0;
+        } else if (vector.form === "dictionary") {
+          if (
+            vector.validity !== null &&
+            ((vector.validity[row >>> 5] ?? 0) & (1 << (row & 31))) === 0
+          )
+            return "NULL";
+          flat = vector.dictionary;
+          slot = vector.codes[row] ?? 0;
+        } else flat = vector;
+        if (flat.validity !== null && ((flat.validity[slot >>> 5] ?? 0) & (1 << (slot & 31))) === 0)
+          return "NULL";
+        if (flat.data.layout !== "interval") throw new TypeError("interval expected");
+        const micros = flat.data.micros;
+        const u =
+          micros.repr === "safe" ? BigInt(micros.values[slot] ?? 0) : (micros.values[slot] ?? 0n);
+        return `${String(flat.data.months[slot] ?? 0)}/${String(flat.data.days[slot] ?? 0)}/${u.toString()}`;
+      };
+      await fc.assert(
+        fc.asyncProperty(
+          fc.oneof(fc.integer({ min: 1, max: 8 }), fc.integer({ min: 257, max: 300 })),
+          fc.boolean(),
+          fc.integer({ min: 1, max: 12 }),
+          fc.boolean(),
+          fc.infiniteStream(intervalArb),
+          fc.array(fc.nat(320), { minLength: 12, maxLength: 12 }),
+          async (n, interval, rows, coalesce, stream, keys) => {
+            reach.beginHistory();
+            if (n > 256) reach.reach("more than 256 branches");
+            const take = (count: number): Interval[] =>
+              Array.from({ length: count }, () => stream.next().value as Interval);
+            const selector = keys.slice(0, rows);
+            const otherwise = take(rows);
+            const results = take(n);
+            const wide = (v: Interval) =>
+              v !== null && (v[2] > 2n ** 53n - 1n || v[2] < -(2n ** 53n - 1n));
+            if (interval) {
+              reach.reach("interval result");
+              if (results.some(wide) || otherwise.some(wide))
+                reach.reach("interval microseconds past 2^53");
+            }
+            if (coalesce) reach.reach("coalesce");
+            const type = interval ? INTERVAL : TEXT;
+            const resultLit = (k: number): ScalarExpr =>
+              interval
+                ? lit(intervalVector([results[k] ?? null]))
+                : lit(texts([results[k] === null ? null : `v${String(k)}`]));
+            const resultSql = (k: number): string =>
+              interval
+                ? intervalSql(results[k] ?? null)
+                : results[k] === null
+                  ? "null::text"
+                  : `'v${String(k)}'`;
+            const other: FlatVector = interval
+              ? intervalVector(otherwise)
+              : texts(otherwise.map((v, row) => (v === null ? null : `o${String(row)}`)));
+            const caseExpr: ScalarExpr = {
+              op: "case",
+              type,
+              branches: Array.from({ length: n }, (_, k) => ({
+                when: cmp("=", col(0, I32), lit(numbers(I32, [k]))),
+                then: resultLit(k),
+              })),
+              otherwise: col(1, type),
+            };
+            const local: ScalarExpr = coalesce
+              ? call("coalesce", type, caseExpr, col(1, type))
+              : caseExpr;
+            const out = compileFor(local, [I32, type]).evaluate(
+              batchOf([numbers(I32, selector), other]),
+              null,
+            );
+            const ours = selector.map((_, row) =>
+              interval ? intervalAt(out, row) : ((valueAt(out, row) as string | null) ?? "NULL"),
+            );
+            const otherSql = (row: number): string =>
+              interval
+                ? intervalSql(otherwise[row] ?? null)
+                : otherwise[row] === null
+                  ? "null::text"
+                  : `'o${String(row)}'`;
+            const caseSql = `case ${Array.from({ length: n }, (_, k) => `when c0 = ${String(k)} then ${resultSql(k)}`).join(" ")} else c1 end`;
+            const expr = coalesce ? `coalesce(${caseSql}, c1)` : caseSql;
+            const shown = interval
+              ? `case when r is null then 'NULL' else (extract(year from r) * 12 + extract(month from r))::int8::text || '/' || extract(day from r)::int8::text || '/' || (extract(hour from r) * 3600000000 + extract(minute from r) * 60000000 + extract(microseconds from r))::int8::text end`
+              : "coalesce(r, 'NULL')";
+            const tuples = selector
+              .map((key, row) => `(${String(row)}, ${String(key)}, ${otherSql(row)})`)
+              .join(", ");
+            const result = await pg.query<{ v: string }>(
+              `select ${shown} as v from (select o, ${expr} as r from (values ${tuples}) t(o, c0, c1)) q order by o`,
+            );
+            expect(ours, `${String(n)} branches, ${interval ? "interval" : "text"}`).toEqual(
+              result.rows.map((row) => row.v),
+            );
+          },
+        ),
+        { seed, numRuns: 40 },
+      );
+      reach.assertReached();
+    },
+    180_000,
+  );
 });
