@@ -1,5 +1,6 @@
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
+import { Governor } from "../memory/governor.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 import { TIMESTAMP_NEG_INFINITY, TIMESTAMP_POS_INFINITY } from "../temporal.js";
@@ -490,7 +491,7 @@ const batchCase = fc.array(columnArb, { minLength: 1, maxLength: 3 }).chain((col
 
 describe("batched key encoding", () => {
   it.each(SEEDS)("encodes vectors exactly as the scalar reference (seed %i)", (seed) => {
-    const out = new KeyBatch();
+    const out = new KeyBatch(unlimited);
     fc.assert(
       fc.property(batchCase, ([columns, rows, wide, forms, select]) => {
         const length = rows.length;
@@ -542,7 +543,7 @@ describe("batched key encoding", () => {
   });
 
   it("reuses its buffers: no allocation per key once grown", () => {
-    const out = new KeyBatch();
+    const out = new KeyBatch(unlimited);
     const vector = vectorOf(
       "int64",
       Array.from({ length: 64 }, (_, i) => BigInt(i)),
@@ -556,5 +557,120 @@ describe("batched key encoding", () => {
       encodeKeyBatch("sort", columns, { length: 64, selection: null }, out);
     expect(out.writer.bytes).toBe(buffer);
     expect(out.offsets).toBe(offsets);
+  });
+});
+
+describe("batched key memory (review A1-3 finding 4)", () => {
+  const MiB = 1 << 20;
+  const textVector = (values: Uint8Array[]): FlatVector => {
+    const builder = new VarlenBuilder(values.length, unlimited);
+    for (const value of values) builder.appendBytes(value);
+    return {
+      form: "flat",
+      type: { kind: "text" },
+      length: values.length,
+      validity: null,
+      data: builder.data(),
+    };
+  };
+  const column = (vector: FlatVector) => [
+    { vector, direction: "asc" as const, nulls: "last" as const },
+  ];
+
+  it("holds one oversized key alone at its exact size, charged, and shrinks on reset (review probe)", async () => {
+    const governor = new Governor(64 * MiB);
+    const grant = await governor.admit({ label: "keys", minimumBytes: 64 * 1024, spillable: true });
+    const out = new KeyBatch(grant);
+    const vector = textVector([new Uint8Array(2 * MiB)]);
+    expect(encodeKeyBatch("equality", column(vector), { length: 1, selection: null }, out)).toEqual(
+      {
+        done: true,
+        encoded: 1,
+      },
+    );
+    // 1 header byte + 2 MiB zeros escaped to 4 MiB + 2-byte terminator; not doubled to 8 MiB.
+    expect(out.key(0).length).toBe(1 + 4 * MiB + 2);
+    expect(out.writer.bytes.byteLength).toBe(1 + 4 * MiB + 2);
+    expect(grant.allocated).toBe(out.retainedBytes);
+    out.writer.reset();
+    expect(out.writer.bytes.byteLength).toBe(4096);
+    expect(grant.allocated).toBe(out.retainedBytes);
+    out.close();
+    expect(grant.allocated).toBe(0);
+    grant.close();
+    expect(governor.usedBytes).toBe(0);
+  });
+
+  it("reports a refused key with its required size, and changes nothing", async () => {
+    const governor = new Governor(16 * MiB);
+    const grant = await governor.admit({
+      label: "keys",
+      minimumBytes: 64 * 1024,
+      spillable: false,
+    });
+    const out = new KeyBatch(grant);
+    const result = encodeKeyBatch(
+      "sort",
+      column(textVector([new Uint8Array(MiB).fill(1)])),
+      { length: 1, selection: null },
+      out,
+    );
+    expect(result).toMatchObject({ done: false, encoded: 0, reason: "denied" });
+    expect(result.done || result.requiredBytes).toBeGreaterThan(MiB);
+    expect(grant.allocated).toBe(out.retainedBytes);
+    // After a loan, the retry fits.
+    const loan = await grant.borrow(2 * MiB);
+    expect(
+      encodeKeyBatch(
+        "sort",
+        column(textVector([new Uint8Array(MiB).fill(1)])),
+        { length: 1, selection: null },
+        out,
+      ).done,
+    ).toBe(true);
+    out.writer.reset();
+    loan.repay();
+    out.close();
+    grant.close();
+    expect(governor.usedBytes).toBe(0);
+  });
+
+  it("stops at the byte target and resumes to the same keys", async () => {
+    const values = Array.from({ length: 50 }, (_, i) =>
+      new Uint8Array(300 + i).fill((i % 250) + 1),
+    );
+    const vector = textVector(values);
+    const whole = new KeyBatch(unlimited, Infinity);
+    encodeKeyBatch("sort", column(vector), { length: 50, selection: null }, whole);
+    const expected = Array.from({ length: 50 }, (_, k) => hex(whole.key(k)));
+    const governor = new Governor(16 * MiB);
+    const grant = await governor.admit({
+      label: "keys",
+      minimumBytes: 64 * 1024,
+      spillable: false,
+    });
+    const out = new KeyBatch(grant, 4096);
+    const seen: string[] = [];
+    let from = 0;
+    let rounds = 0;
+    while (from < 50) {
+      const result = encodeKeyBatch(
+        "sort",
+        column(vector),
+        { length: 50, selection: null },
+        out,
+        from,
+      );
+      for (let k = 0; k < result.encoded; k++) seen.push(hex(out.key(k)));
+      expect(out.writer.bytes.byteLength).toBeLessThanOrEqual(4096);
+      if (!result.done) expect(result.reason).toBe("full");
+      from += result.encoded;
+      rounds += 1;
+    }
+    expect(rounds).toBeGreaterThan(3);
+    expect(seen).toEqual(expected);
+    expect(grant.allocated).toBe(out.retainedBytes);
+    out.close();
+    grant.close();
   });
 });

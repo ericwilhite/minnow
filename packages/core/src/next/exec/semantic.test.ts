@@ -1,6 +1,8 @@
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
+import type { PhysicalType } from "../types.js";
+import { decodeArrayValue, encodeArrayValue, type ArrayValue } from "../vector/array-value.js";
 import {
   arrayEqualityKey,
   compareArrays,
@@ -128,5 +130,68 @@ describe("SQL array semantic order and equality", () => {
       }),
       { seed, numRuns: 3000 },
     );
+  });
+});
+
+describe("arrays: decode the stored value, then operate (review A1-3 finding 1)", () => {
+  const stored = (element: PhysicalType, value: ArrayValue) => encodeArrayValue(element, value);
+  const operate = (element: PhysicalType, bytes: Uint8Array): SqlArray => ({
+    element,
+    ...decodeArrayValue(element, bytes),
+  });
+
+  it("treats {1 mon} and {30 days} as equal arrays while storing them differently", () => {
+    const interval: PhysicalType = { kind: "interval" };
+    const a = stored(interval, {
+      dimensions: [1],
+      lowerBounds: [1],
+      elements: [{ months: 1, days: 0, micros: 0n }],
+    });
+    const b = stored(interval, {
+      dimensions: [1],
+      lowerBounds: [1],
+      elements: [{ months: 0, days: 30, micros: 0n }],
+    });
+    expect(sameBytes(a, b)).toBe(false);
+    expect(compareArrays(operate(interval, a), operate(interval, b))).toBe(0);
+    expect(
+      sameBytes(arrayEqualityKey(operate(interval, a)), arrayEqualityKey(operate(interval, b))),
+    ).toBe(true);
+  });
+
+  it("treats {1.5} and {1.50} as equal while each keeps its display scale", () => {
+    const decimal: PhysicalType = { kind: "decimal", precision: null, scale: null };
+    const a = operate(
+      decimal,
+      stored(decimal, {
+        dimensions: [1],
+        lowerBounds: [1],
+        elements: [{ coefficient: 15n, scale: 1 }],
+      }),
+    );
+    const b = operate(
+      decimal,
+      stored(decimal, {
+        dimensions: [1],
+        lowerBounds: [1],
+        elements: [{ coefficient: 150n, scale: 2 }],
+      }),
+    );
+    expect(compareArrays(a, b)).toBe(0);
+    expect(a.elements[0]).toEqual({ coefficient: 15n, scale: 1 });
+    expect(b.elements[0]).toEqual({ coefficient: 150n, scale: 2 });
+  });
+
+  it("orders decoded arrays element-first, with dimensions and bounds only as tie-breakers", () => {
+    const int: PhysicalType = { kind: "int32", bits: 32 };
+    const value = (
+      elements: Array<number | null>,
+      dimensions = [elements.length],
+      lowerBounds = [1],
+    ) => operate(int, stored(int, { dimensions, lowerBounds, elements }));
+    expect(compareArrays(value([2]), value([1, 9, 9]))).toBe(1);
+    expect(compareArrays(value([1, null]), value([1, 5]))).toBe(1);
+    expect(compareArrays(value([1, 2, 3, 4]), value([1, 2, 3, 4], [2, 2], [1, 1]))).toBe(-1);
+    expect(compareArrays(value([1]), value([1], [1], [0]))).toBe(1);
   });
 });

@@ -59,10 +59,11 @@
  * 7. **Fencing.** Once a newer owner has acquired, every mutating call of an older session
  *    rejects with `OwnershipLostError` and changes nothing.
  *
- * With a lying flush (a device that acknowledges a flush and loses it), guarantees 1 and 3 weaken
- * to "detected, not silent": the checksummed root slots, page references and log chain turn loss
- * into `StoreCorruptionError` / `LogCorruptionError`, except for the newest acknowledged commit
- * group, which has SQLite's exposure.
+ * With an honest flush every acknowledged commit survives. With a lying flush (a write-back cache
+ * lost on power failure) a cleanly truncated log loses at most the newest group, and that loss is
+ * detected; an in-order cache loss can silently drop a run of recent acknowledged groups, which no
+ * on-device format can detect. The log never reorders or invents a group, and a rolled-back root is
+ * detected (format/log-frame.ts).
  *
  * ## Engine obligations (the store cannot check them)
  * - Write data only into free space: never over an extent a durable or pinned root reaches.
@@ -171,14 +172,8 @@ export class OwnershipLostError extends Error {
   }
 }
 
-/** The current owner holds the fence past the timeout (frozen, hung, or busy). */
-export class OwnerUnresponsiveError extends Error {
-  readonly code = "MINNOW_OWNER_UNRESPONSIVE";
-  constructor(timeoutMs: number) {
-    super(`The database owner did not release the store within ${String(timeoutMs)} ms`);
-    this.name = "OwnerUnresponsiveError";
-  }
-}
+/** Defined once in next/errors.ts: storage acquisition and the owner/client protocol share it. */
+export { OwnerUnresponsiveError } from "../errors.js";
 
 /** Stored bytes that cannot be what was written: out-of-range reads, failed checksums. */
 export class StoreCorruptionError extends Error {

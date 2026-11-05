@@ -10,15 +10,22 @@
  *   `from`. Output slot k receives the row of the (from + k)-th active locator: outputs are dense,
  *   in active-row order, with no selection. Repeated locators fill each slot with the same value;
  *   a null locator (validity bit clear: an outer join's null-extended row) fills null.
- * - **Buffers.** The caller owns and sizes every output (`output[c]` for each column, with a
- *   validity bitmap) and supplies one `VarlenBuilder` per variable-width column, built on the
- *   caller's grant. The fetcher allocates nothing per row and never resizes outputs.
+ * - **Capacity.** `capacity` is the most slots one call may fill; every output must hold at least
+ *   that many (checked: `RangeError`). A call never fills more, and never reports `done` while
+ *   active rows remain beyond it: it returns `{ done: false, reason: "capacity" }` instead.
+ * - **Buffers.** The caller owns every output (`output[c]` for each column, with a validity bitmap)
+ *   and supplies one `VarlenBuilder` per variable-width column, built on the caller's grant. The
+ *   fetcher's own staging (the visit order and one page buffer, for at most `capacity` rows) is
+ *   allocated from `grant` before any read; if refused, the call returns `denied` having read
+ *   nothing. It allocates nothing per row and never resizes outputs.
  * - **Partial completion.** If a varlen builder answers `full` (the batch reached its byte target)
  *   or `denied` (the grant cannot supply the bytes), the fetcher stops and returns
  *   `{ done: false, filled, reason }`: slots 0 … filled − 1 are complete. The caller emits them (or,
  *   for `denied`, borrows a progress loan) and calls again with `from + filled`.
- * - **I/O.** One call reads each needed page at most once (locators are visited sorted by segment
- *   and page, values scattered back to their slots), awaiting page reads between pages.
+ * - **I/O.** One call reads each needed page of its (at most `capacity`) rows at most once:
+ *   locators are visited sorted by segment and page, values scattered back to their slots. Pages
+ *   are not retained across calls (beyond the shared page cache), so a resumed call may read a page
+ *   an earlier call already read.
  * - **Cancellation.** If `signal` aborts, the call rejects with its reason between page reads; the
  *   outputs are unspecified and nothing is retained.
  */
@@ -43,6 +50,8 @@ export interface FetchRequest {
   readonly selection: Selection | null;
   /** Active index to start at (0, or a previous result's `from + filled`). */
   readonly from: number;
+  /** The most output slots this call may fill (every output holds at least this many). */
+  readonly capacity: number;
   /** Catalog column ids to fetch, one output each. */
   readonly columns: readonly number[];
   readonly output: readonly FlatVector[];
@@ -55,12 +64,42 @@ export interface FetchRequest {
 
 export type FetchResult =
   | { readonly done: true; readonly filled: number }
-  | { readonly done: false; readonly filled: number; readonly reason: "full" | "denied" };
+  | {
+      readonly done: false;
+      readonly filled: number;
+      readonly reason: "capacity" | "full" | "denied";
+    };
 
 export interface RowFetcher {
   fetch(request: FetchRequest): Promise<FetchResult>;
 }
 
+/** Slots a flat output vector can hold. */
+function slots(vector: FlatVector): number {
+  const data = vector.data;
+  switch (data.layout) {
+    case "varlen":
+      return data.offsets.length - 1;
+    case "fixed16":
+      return data.bytes.length / 16;
+    case "decimal":
+      return data.coefficients.repr === "int128"
+        ? data.coefficients.limbs.length / 4
+        : data.coefficients.values.length;
+    case "interval":
+      return data.months.length;
+    case "int64":
+      return data.values.values.length;
+    default:
+      return data.values.length;
+  }
+}
+
+/**
+ * Merge note (Phase B ruling): this error and the snapshot type move to `next/access/` (created on
+ * rebuild/write), and `FetchRequest.snapshot` becomes access's `Snapshot`. `access/` does not exist
+ * on this branch, so both stay here until the merge.
+ */
 export class SnapshotReleasedError extends Error {
   readonly code = "MINNOW_SNAPSHOT_RELEASED";
   constructor() {
@@ -85,34 +124,33 @@ export class MemoryRowFetcher implements RowFetcher {
 
   async fetch(request: FetchRequest): Promise<FetchResult> {
     if (request.snapshot.released) throw new SnapshotReleasedError();
-    const { locators, selection, output, varlen } = request;
+    const { locators, selection, output, varlen, capacity } = request;
     const data = locators.data;
     if (data.layout !== "f64") throw new TypeError("Locators must be an f64 locator vector");
-    const total = (selection === null ? request.length : selection.count) - request.from;
-    // Visit in (segment, page) order; scatter to dense slots.
-    const order = Array.from({ length: total }, (_, k) => k);
-    const rowOf = (k: number) =>
-      selection === null ? request.from + k : (selection.rows[request.from + k] ?? 0);
-    const sortKey = (k: number) => {
-      const row = rowOf(k);
-      return isValid(locators.validity, row) ? (data.values[row] ?? 0) : -1;
-    };
-    order.sort((a, b) => sortKey(a) - sortKey(b));
-    const pageBytes = 8 * this.pageRows;
-    if (!request.grant.allocate(pageBytes)) return { done: false, filled: 0, reason: "denied" };
+    for (const vector of output)
+      if (slots(vector) < capacity) throw new RangeError("An output is smaller than the capacity");
+    const remaining = (selection === null ? request.length : selection.count) - request.from;
+    const total = Math.min(remaining, capacity);
+    // Staging for this call only: visit order + one value per column per row + one page buffer.
+    const stagingBytes = total * 8 * (1 + output.length) + 8 * this.pageRows;
+    if (!request.grant.allocate(stagingBytes)) return { done: false, filled: 0, reason: "denied" };
     try {
-      let currentPage = "";
-      // Values are produced in page order but committed to builders in slot order, so varlen
-      // columns are filled after the fixed-width pass, slot by slot.
+      const rowOf = (k: number) =>
+        selection === null ? request.from + k : (selection.rows[request.from + k] ?? 0);
+      const sortKey = (k: number) => {
+        const row = rowOf(k);
+        return isValid(locators.validity, row) ? (data.values[row] ?? 0) : -1;
+      };
+      const order = Array.from({ length: total }, (_, k) => k).sort(
+        (a, b) => sortKey(a) - sortKey(b),
+      );
       const values: Array<Array<number | string | null>> = output.map(() =>
         new Array<number | string | null>(total).fill(null),
       );
+      let currentPage = "";
       for (const k of order) {
         const row = rowOf(k);
-        if (!isValid(locators.validity, row)) {
-          for (const column of values) column[k] = null;
-          continue;
-        }
+        if (!isValid(locators.validity, row)) continue;
         const locator = data.values[row] ?? 0;
         const segment = locatorSegment(locator);
         const position = locatorPosition(locator);
@@ -148,9 +186,11 @@ export class MemoryRowFetcher implements RowFetcher {
           vector.length = k + 1;
         }
       }
-      return { done: true, filled: total };
+      return total < remaining
+        ? { done: false, filled: total, reason: "capacity" }
+        : { done: true, filled: total };
     } finally {
-      request.grant.free(pageBytes);
+      request.grant.free(stagingBytes);
     }
   }
 }

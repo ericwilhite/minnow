@@ -64,8 +64,9 @@ function withDeadline<T>(attempt: Promise<T>, ms: number): Promise<Outcome<T>> {
  * backing off from 1 ms to 100 ms, all within `timeoutMs`.
  *
  * - `openFence` may be synchronous or return a promise (`createSyncAccessHandle` does; so does an
- *   IndexedDB epoch bump). The deadline applies while it is pending: if it passes, acquisition
- *   fails with `OwnerUnresponsiveError` and the fence, if it opens later, is closed at once.
+ *   IndexedDB epoch bump). The deadline applies while it is pending and is checked again after it
+ *   opens: past it, acquisition fails with `OwnerUnresponsiveError`, and the fence (opened late,
+ *   or opened after the deadline by a slow synchronous call) is closed at once.
  * - If the lock is stolen while the fence opens, the opened fence is closed and acquisition fails
  *   with `OwnershipLostError`: a newer owner is acquiring.
  * - Every failure releases the lock; a non-busy error is rethrown.
@@ -109,10 +110,14 @@ export async function acquireFenced<T>(
       throw new OwnerUnresponsiveError(timeoutMs);
     }
     if (outcome.kind === "opened") {
-      if (!stolen(lock)) return { lock, fence: outcome.fence };
+      // A synchronous open can overrun the deadline without the timer ever firing: check after.
+      const expired = Date.now() > deadline;
+      if (!stolen(lock) && !expired) return { lock, fence: outcome.fence };
       closeFence(outcome.fence);
       lock.release();
-      throw new OwnershipLostError(0);
+      throw expired && !stolen(lock)
+        ? new OwnerUnresponsiveError(timeoutMs)
+        : new OwnershipLostError(0);
     }
     if (!isBusyError(outcome.error) || Date.now() + delay > deadline) {
       lock.release();

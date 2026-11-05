@@ -1,4 +1,8 @@
 import { describe, expect, it } from "vitest";
+import {
+  OwnerUnresponsiveError as SharedOwnerUnresponsiveError,
+  RequestExpiredError,
+} from "../errors.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 import { storeConformanceCases } from "./conformance.js";
 import {
@@ -83,6 +87,28 @@ describe("fence acquisition", () => {
     expect(await lockIsFree(locks)).toBe(true);
     await new Promise((resolve) => setTimeout(resolve, 60));
     expect(closed).toBe(1);
+  });
+
+  it("fails, closes the fence and releases the lock when the open itself overruns (review probe)", async () => {
+    const locks = new SimLocks();
+    let closed = 0;
+    const start = Date.now();
+    await expect(
+      acquireFenced(
+        locks,
+        "db",
+        () => {
+          while (Date.now() - start < 20) {
+            // A synchronous open that blocks past the deadline.
+          }
+          return "handle";
+        },
+        () => (closed += 1),
+        { timeoutMs: 1 },
+      ),
+    ).rejects.toThrow(OwnerUnresponsiveError);
+    expect(closed).toBe(1);
+    expect(await lockIsFree(locks)).toBe(true);
   });
 
   it("rethrows a non-busy failure (sync or async) and releases the lock", async () => {
@@ -296,5 +322,19 @@ describe("two-slot root publication", () => {
     const torn = encodeRootSlot(3, root("three")).slice(0, 10);
     expect(chooseRoot(torn, two).current?.sequence).toBe(2);
     expect(chooseRoot(torn, two).nextSlot).toBe(0);
+  });
+});
+
+describe("shared errors (Phase B ruling)", () => {
+  it("defines each cross-track error once, with a stable code", () => {
+    expect(OwnerUnresponsiveError).toBe(SharedOwnerUnresponsiveError);
+    expect(new OwnerUnresponsiveError(40)).toMatchObject({
+      name: "OwnerUnresponsiveError",
+      code: "MINNOW_OWNER_UNRESPONSIVE",
+    });
+    expect(new RequestExpiredError(7, 700_000)).toMatchObject({
+      name: "RequestExpiredError",
+      code: "MINNOW_REQUEST_EXPIRED",
+    });
   });
 });

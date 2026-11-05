@@ -94,3 +94,28 @@ describe("exactly-once request ledger", () => {
     expect(restored.admit(request(2), T0).kind).toBe("execute");
   });
 });
+
+describe("settling requests with no durable effect (Phase B ruling)", () => {
+  it("frees a read without recording an outcome, so its retry runs again", () => {
+    const ledger = new RequestLedger();
+    expect(ledger.admit(request(1), T0).kind).toBe("execute");
+    expect(ledger.admit(request(1), T0).kind).toBe("inFlight");
+    ledger.settle("c1", 1);
+    expect(ledger.size).toBe(0);
+    // A retried read is executed again, never answered with a stored outcome.
+    expect(ledger.admit(request(1), T0).kind).toBe("execute");
+  });
+
+  it("does not let a settled request linger in flight or block pruning", () => {
+    const ledger = new RequestLedger();
+    ledger.admit(request(1), T0); // a statement inside an open transaction
+    ledger.admit(request(2), T0); // its commit
+    ledger.settle("c1", 1);
+    ledger.record("c1", 2, committed(10, 1));
+    expect(ledger.admit(request(2), T0).kind).toBe("duplicate");
+    ledger.admit(request(3, { resolvedThrough: 2 }), T0); // a rollback
+    ledger.settle("c1", 3);
+    ledger.prune(T0 + 3 * CLIENT_RETRY_WINDOW_MS);
+    expect(ledger.checkpoint()).toEqual([]);
+  });
+});

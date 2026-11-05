@@ -52,7 +52,14 @@
 import { xxHash32 } from "../hash/xxhash32.js";
 import type { EnumType, PhysicalType } from "../types.js";
 import { int128At } from "../vector/int128.js";
-import type { Batch, FlatVector, Selection, Vector } from "../vector/vector.js";
+import type { ByteCharge } from "../vector/varlen.js";
+import {
+  BATCH_TARGET_BYTES,
+  type Batch,
+  type FlatVector,
+  type Selection,
+  type Vector,
+} from "../vector/vector.js";
 
 export class UnindexableTypeError extends Error {
   readonly code = "MINNOW_UNINDEXABLE_TYPE";
@@ -150,16 +157,53 @@ export function enumRank(type: EnumType, bytes: Uint8Array, start: number, end: 
 }
 
 /** A reusable key buffer (see "Interfaces"). */
+/** Thrown inside a writer when a key would pass its limit or its grant refuses the bytes. */
+class KeyWriterStop extends Error {
+  constructor(
+    readonly reason: "full" | "denied",
+    readonly requiredBytes: number,
+  ) {
+    super(reason);
+  }
+}
+
+/**
+ * A reusable key buffer. With a `charge` (a grant's suballocator, memory/governor.ts rule 4), every
+ * byte of capacity is allocated before it exists, a resize allocates the new buffer before freeing
+ * the old (growth overlap), and `reset` shrinks a buffer an oversized key grew back to its initial
+ * size. Without one (tuple helpers for constants and tests) it is uncharged.
+ */
 export class KeyWriter {
   bytes: Uint8Array;
   length = 0;
+  /** Capacity growth past this throws `full` (set by `KeyBatch` once it holds a key). */
+  limit = Infinity;
+  /** Growth never passes this, except to fit exactly one key larger than it. */
+  target = Infinity;
+  readonly #charge: ByteCharge | null;
+  readonly #initialBytes: number;
   readonly #digits = new Uint8Array(32);
 
-  constructor(initialBytes = 256) {
+  constructor(initialBytes = 256, charge: ByteCharge | null = null) {
+    this.#charge = charge;
+    this.#initialBytes = initialBytes;
+    if (charge !== null && !charge.allocate(initialBytes))
+      throw new RangeError("A key writer's minimum must be admitted before it is built");
     this.bytes = new Uint8Array(initialBytes);
   }
 
   reset(): void {
+    this.length = 0;
+    if (this.bytes.length > this.#initialBytes) {
+      this.#charge?.free(this.bytes.length - this.#initialBytes);
+      this.bytes = new Uint8Array(this.#initialBytes);
+    }
+  }
+
+  /** Returns every byte to the charge. The writer is unusable afterwards. */
+  close(): void {
+    this.#charge?.free(this.bytes.length);
+    this.bytes = new Uint8Array(0);
     this.length = 0;
   }
 
@@ -169,11 +213,18 @@ export class KeyWriter {
   }
 
   #ensure(extra: number): void {
-    if (this.length + extra <= this.bytes.length) return;
-    let size = this.bytes.length * 2;
-    while (size < this.length + extra) size *= 2;
+    const needed = this.length + extra;
+    if (needed <= this.bytes.length) return;
+    if (needed > this.limit) throw new KeyWriterStop("full", needed);
+    let size = Math.max(16, this.bytes.length * 2);
+    while (size < needed) size *= 2;
+    // Never grow past the target except to fit exactly one oversized key.
+    if (this.target !== Infinity) size = Math.min(size, Math.max(needed, this.target));
+    if (this.#charge !== null && !this.#charge.allocate(size))
+      throw new KeyWriterStop("denied", size);
     const grown = new Uint8Array(size);
     grown.set(this.bytes.subarray(0, this.length));
+    this.#charge?.free(this.bytes.length);
     this.bytes = grown;
   }
 
@@ -225,7 +276,10 @@ export class KeyWriter {
   }
 
   escaped(source: Uint8Array, start = 0, end = source.length): void {
-    this.#ensure((end - start) * 2 + 2);
+    // Reserve exactly: each 0x00 expands to two bytes, plus the two-byte terminator.
+    let zeros = 0;
+    for (let index = start; index < end; index++) if (source[index] === 0) zeros += 1;
+    this.#ensure(end - start + zeros + 2);
     for (let index = start; index < end; index++) {
       const byte = source[index] ?? 0;
       this.bytes[this.length++] = byte;
@@ -393,15 +447,68 @@ export interface KeyColumn {
 }
 
 /** Keys of a batch's active rows: key k is `writer.bytes[offsets[k] … offsets[k + 1])`. */
+/**
+ * Keys of a batch's active rows: key k is `writer.bytes[offsets[k] … offsets[k + 1])`. Its bytes
+ * (key buffer and offsets) are allocated from `charge`; the key buffer stops at `targetBytes`,
+ * except that one key larger than the target is held alone.
+ */
 export class KeyBatch {
-  readonly writer = new KeyWriter(4096);
-  offsets = new Int32Array(1);
+  readonly writer: KeyWriter;
+  readonly targetBytes: number;
+  readonly #charge: ByteCharge;
+  offsets: Int32Array;
   count = 0;
+
+  constructor(charge: ByteCharge, targetBytes = BATCH_TARGET_BYTES, initialBytes = 4096) {
+    this.#charge = charge;
+    this.targetBytes = targetBytes;
+    this.writer = new KeyWriter(initialBytes, charge);
+    this.writer.target = targetBytes;
+    if (!charge.allocate(4 * 65)) throw new RangeError("A key batch's minimum must be admitted");
+    this.offsets = new Int32Array(65);
+  }
+
+  /** Grows the offsets to `entries`, charged; false if the grant refuses. */
+  reserveOffsets(entries: number): boolean {
+    if (this.offsets.length >= entries) return true;
+    if (!this.#charge.allocate(4 * entries)) return false;
+    const grown = new Int32Array(entries);
+    grown.set(this.offsets);
+    this.#charge.free(4 * this.offsets.length);
+    this.offsets = grown;
+    return true;
+  }
+
+  /** Bytes allocated from the charge. */
+  get retainedBytes(): number {
+    return this.writer.bytes.byteLength + this.offsets.byteLength;
+  }
 
   key(k: number): Uint8Array {
     return this.writer.bytes.subarray(this.offsets[k] ?? 0, this.offsets[k + 1] ?? 0);
   }
+
+  close(): void {
+    this.writer.close();
+    this.#charge.free(this.offsets.byteLength);
+    this.offsets = new Int32Array(0);
+  }
 }
+
+/**
+ * - `done`: keys for every active row from `from` on are in the batch (`encoded` of them).
+ * - not done: keys for `encoded` rows from `from` are complete; the next row's key did not fit.
+ *   `full`: the batch reached its byte target (emit, then call again from `from + encoded`).
+ *   `denied`: the grant refused `requiredBytes` (spill or borrow a loan, then call again).
+ */
+export type KeyBatchResult =
+  | { readonly done: true; readonly encoded: number }
+  | {
+      readonly done: false;
+      readonly encoded: number;
+      readonly reason: "full" | "denied";
+      readonly requiredBytes: number;
+    };
 
 function isValidAt(validity: Uint32Array | null, row: number): boolean {
   return validity === null || ((validity[row >>> 5] ?? 0) & (1 << (row & 31))) !== 0;
@@ -470,47 +577,64 @@ function writeSlot(writer: KeyWriter, flat: FlatVector, index: number, sort: boo
 }
 
 /**
- * Encodes the key of every active row of `batch` (sort or equality mode) into `out`, reusing its
- * buffers. Columns are read straight from flat, constant and dictionary vectors.
+ * Encodes the key of every active row of `batch`, from active index `from` on, into `out`
+ * (sort or equality mode), reusing its buffers. Columns are read straight from flat, constant and
+ * dictionary vectors. Bounded and charged: see `KeyBatchResult`.
  */
 export function encodeKeyBatch(
   mode: "sort" | "equality",
   columns: readonly KeyColumn[],
   batch: Pick<Batch, "length" | "selection">,
   out: KeyBatch,
-): void {
+  from = 0,
+): KeyBatchResult {
   const selection: Selection | null = batch.selection;
-  const count = selection === null ? batch.length : selection.count;
-  if (out.offsets.length < count + 1) out.offsets = new Int32Array(count + 1);
+  const count = (selection === null ? batch.length : selection.count) - from;
   const writer = out.writer;
   writer.reset();
-  out.count = count;
+  writer.limit = Infinity;
+  out.count = 0;
+  if (!out.reserveOffsets(count + 1))
+    return { done: false, encoded: 0, reason: "denied", requiredBytes: 4 * (count + 1) };
+  out.offsets[0] = 0;
   for (let k = 0; k < count; k++) {
-    out.offsets[k] = writer.length;
-    const row = selection === null ? k : (selection.rows[k] ?? 0);
-    for (const column of columns) {
-      const vector = column.vector;
-      let flat: FlatVector;
-      let index: number;
-      if (vector.form === "flat") {
-        flat = vector;
-        index = row;
-      } else if (vector.form === "constant") {
-        flat = vector.value;
-        index = 0;
-      } else {
-        flat = vector.dictionary;
-        index = vector.codes[row] ?? 0;
-        if (!isValidAt(vector.validity, row)) index = -1;
+    const keyStart = writer.length;
+    const row = selection === null ? from + k : (selection.rows[from + k] ?? 0);
+    try {
+      for (const column of columns) {
+        const vector = column.vector;
+        let flat: FlatVector;
+        let index: number;
+        if (vector.form === "flat") {
+          flat = vector;
+          index = row;
+        } else if (vector.form === "constant") {
+          flat = vector.value;
+          index = 0;
+        } else {
+          flat = vector.dictionary;
+          index = vector.codes[row] ?? 0;
+          if (!isValidAt(vector.validity, row)) index = -1;
+        }
+        const header = writer.length;
+        writer.byte(0x01);
+        const ok = index >= 0 && writeSlot(writer, flat, index, mode === "sort");
+        if (!ok) {
+          writer.length = header;
+          writer.byte(mode === "equality" ? 0x00 : column.nulls === "first" ? 0x00 : 0x02);
+        } else if (mode === "sort" && column.direction === "desc") writer.invertFrom(header + 1);
       }
-      const header = writer.length;
-      writer.byte(0x01);
-      const ok = index >= 0 && writeSlot(writer, flat, index, mode === "sort");
-      if (!ok) {
-        writer.length = header;
-        writer.byte(mode === "equality" ? 0x00 : column.nulls === "first" ? 0x00 : 0x02);
-      } else if (mode === "sort" && column.direction === "desc") writer.invertFrom(header + 1);
+    } catch (error) {
+      if (!(error instanceof KeyWriterStop)) throw error;
+      writer.length = keyStart;
+      writer.limit = Infinity;
+      return { done: false, encoded: k, reason: error.reason, requiredBytes: error.requiredBytes };
     }
+    out.offsets[k + 1] = writer.length;
+    out.count = k + 1;
+    // Once a key is in, the buffer may not grow past the target for the next one.
+    writer.limit = Math.max(out.targetBytes, writer.length);
   }
-  out.offsets[count] = writer.length;
+  writer.limit = Infinity;
+  return { done: true, encoded: count };
 }

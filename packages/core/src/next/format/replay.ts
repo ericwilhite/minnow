@@ -17,6 +17,21 @@
  *   its rows from every transaction with LSN ≤ it. A table created by the transaction at LSN L
  *   starts at `flushedThroughLsn = L − 1`, so that transaction's own rows replay.
  *
+ * ## Large transactions commit through a staged root
+ * A transaction too large to log row by row writes its rows to extents, then publishes a root that
+ * holds them as **staged** under the transaction's id (`TableRoot.staged`: present, invisible),
+ * and only then logs its commit frame with a `publishedRows` effect naming that root's sequence.
+ * The frame is the commit point. Replay of `publishedRows` at LSN L:
+ * - skipped when L ≤ T.flushedThroughLsn: a later root already folded the rows in (so it is never
+ *   applied twice);
+ * - otherwise the durable root must be at least the named root (else the root was rolled back:
+ *   corruption) and must still stage that transaction (else corruption); applying makes the
+ *   staged rows visible and consumes the staging.
+ * After replay, staging no frame claimed belongs to a transaction that never committed: recovery
+ * drops it (`Replayer.unclaimedStaging`), and its extents become free at the next publish. A root
+ * that folds staged rows into the table's groups sets `flushedThroughLsn ≥ L` and removes the
+ * staging entry in the same publish.
+ *
  * ## Writer obligations
  * 1. **A checkpoint covers the rows before the schema it records.** A root whose `globalLsn` covers
  *    a schema change (ALTER) of table T at LSN A must have `T.flushedThroughLsn ≥ A`: before
@@ -44,9 +59,13 @@ import { LogCorruptionError } from "./log-frame.js";
 export interface TableCheckpoint {
   readonly flushedThroughLsn: number;
   readonly schemaVersion: number;
+  /** Transactions whose rows this root stages (published, not yet visible). */
+  readonly staged?: ReadonlySet<number>;
 }
 
 export interface ReplayCheckpoint {
+  /** The durable root's sequence (for `publishedRows`). */
+  readonly rootSequence?: number;
   readonly globalLsn: number;
   readonly nextTableId: number;
   readonly tables: ReadonlyMap<number, TableCheckpoint>;
@@ -60,18 +79,40 @@ export type Effect =
   | { readonly kind: "catalog" }
   | { readonly kind: "sequence" }
   | { readonly kind: "request" }
-  | { readonly kind: "rows"; readonly tableId: number; readonly schemaVersion: number };
+  | { readonly kind: "rows"; readonly tableId: number; readonly schemaVersion: number }
+  | {
+      readonly kind: "publishedRows";
+      readonly tableId: number;
+      readonly schemaVersion: number;
+      /** The staging id the root holds the rows under. */
+      readonly transaction: number;
+      /** Sequence of the root that staged them. */
+      readonly rootSequence: number;
+    };
 
 export class Replayer {
   readonly #globalLsn: number;
+  readonly #rootSequence: number;
   readonly #tables: Map<number, TableCheckpoint>;
+  readonly #unclaimed = new Map<number, Set<number>>();
   #nextTableId: number;
   #lastLsn = 0;
 
   constructor(checkpoint: ReplayCheckpoint) {
     this.#globalLsn = checkpoint.globalLsn;
+    this.#rootSequence = checkpoint.rootSequence ?? 0;
     this.#nextTableId = checkpoint.nextTableId;
     this.#tables = new Map(checkpoint.tables);
+    for (const [tableId, table] of checkpoint.tables)
+      if (table.staged !== undefined && table.staged.size > 0)
+        this.#unclaimed.set(tableId, new Set(table.staged));
+  }
+
+  /** Staging no replayed commit claimed: transactions that never committed (drop them). */
+  unclaimedStaging(): Array<{ readonly tableId: number; readonly transaction: number }> {
+    return [...this.#unclaimed].flatMap(([tableId, transactions]) =>
+      [...transactions].map((transaction) => ({ tableId, transaction })),
+    );
   }
 
   /** The coverage rule; call with the scan's `lastLsn` before replaying. */
@@ -117,6 +158,26 @@ export class Replayer {
           if (effect.schemaVersion !== table.schemaVersion + 1)
             throw new LogCorruptionError(`Table ${String(effect.tableId)} skips a schema version`);
           this.#tables.set(effect.tableId, { ...table, schemaVersion: effect.schemaVersion });
+          return true;
+        }
+        case "publishedRows": {
+          const table = this.#tables.get(effect.tableId);
+          if (table === undefined)
+            throw new LogCorruptionError(
+              `Published rows for missing table ${String(effect.tableId)}`,
+            );
+          if (lsn <= table.flushedThroughLsn) return false;
+          if (effect.schemaVersion !== table.schemaVersion)
+            throw new LogCorruptionError(
+              `Published rows for table ${String(effect.tableId)} under the wrong schema`,
+            );
+          if (this.#rootSequence < effect.rootSequence)
+            throw new LogCorruptionError("A committed transaction's staging root was rolled back");
+          const staged = this.#unclaimed.get(effect.tableId);
+          if (staged?.delete(effect.transaction) !== true)
+            throw new LogCorruptionError(
+              `Transaction ${String(effect.transaction)} is not staged for table ${String(effect.tableId)}`,
+            );
           return true;
         }
         case "rows": {

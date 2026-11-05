@@ -65,7 +65,7 @@ async function setup(capacity: number, targetBytes = 1 << 20) {
   const names = allocateFlat({ kind: "text" }, capacity);
   names.validity = allocateValidity(capacity);
   const builder = new VarlenBuilder(capacity, grant, targetBytes, 256);
-  return { governor, grant, ids, names, builder };
+  return { governor, grant, ids, names, builder, capacity };
 }
 
 function read(ids: FlatVector, names: FlatVector, builder: VarlenBuilder, count: number) {
@@ -78,7 +78,7 @@ function read(ids: FlatVector, names: FlatVector, builder: VarlenBuilder, count:
 
 describe("row fetcher contract (review A1-2 finding 8)", () => {
   it("fills dense slots for selected, repeated and null-extended locators, reading each page once", async () => {
-    const { grant, ids, names, builder } = await setup(16);
+    const { grant, ids, names, builder, capacity } = await setup(16);
     const fetcher = new MemoryRowFetcher(segments);
     const entries = [[1, 2999], null, [0, 5], [1, 2999], [0, 1], [0, 2048], [0, 7]] as const;
     const request: FetchRequest = {
@@ -88,6 +88,7 @@ describe("row fetcher contract (review A1-2 finding 8)", () => {
       length: entries.length,
       selection: { rows: Uint16Array.from([0, 1, 3, 4, 5, 6]), count: 6 },
       from: 0,
+      capacity,
       columns: [ID, NAME],
       output: [ids, names],
       varlen: [null, builder],
@@ -108,7 +109,7 @@ describe("row fetcher contract (review A1-2 finding 8)", () => {
   });
 
   it("stops at the batch byte target and resumes exactly where it stopped", async () => {
-    const { grant, ids, names, builder } = await setup(64, 64);
+    const { grant, ids, names, builder, capacity } = await setup(64, 64);
     const fetcher = new MemoryRowFetcher(segments);
     const entries = Array.from({ length: 40 }, (_, i) => [0, i + 1] as const);
     const all: Array<Array<number | string | null | undefined>> = [];
@@ -122,6 +123,7 @@ describe("row fetcher contract (review A1-2 finding 8)", () => {
         length: entries.length,
         selection: null,
         from,
+        capacity,
         columns: [ID, NAME],
         output: [ids, names],
         varlen: [null, builder],
@@ -137,7 +139,7 @@ describe("row fetcher contract (review A1-2 finding 8)", () => {
   });
 
   it("round-trips locators through a spill page and fetches the same rows", async () => {
-    const { grant, ids, names, builder } = await setup(8);
+    const { grant, ids, names, builder, capacity } = await setup(8);
     const entries = [[1, 10], null, [0, 3]] as const;
     const original = locators(entries);
     const spill = await new MemorySpillService().create(1);
@@ -161,6 +163,7 @@ describe("row fetcher contract (review A1-2 finding 8)", () => {
         length: 3,
         selection: null,
         from: 0,
+        capacity,
         columns: [ID, NAME],
         output: [ids, names],
         varlen: [null, builder],
@@ -176,7 +179,7 @@ describe("row fetcher contract (review A1-2 finding 8)", () => {
   });
 
   it("is cancellable mid-read under a small grant and refuses a released snapshot", async () => {
-    const { governor, grant, ids, names, builder } = await setup(4096);
+    const { governor, grant, ids, names, builder, capacity } = await setup(4096);
     const controller = new AbortController();
     const fetcher = new MemoryRowFetcher(segments, 64, async () => {
       await new Promise((resolve) => setTimeout(resolve, 1));
@@ -190,6 +193,7 @@ describe("row fetcher contract (review A1-2 finding 8)", () => {
       length: entries.length,
       selection: null,
       from: 0,
+      capacity,
       columns: [ID, NAME],
       output: [ids, names],
       varlen: [null, builder],
@@ -206,5 +210,67 @@ describe("row fetcher contract (review A1-2 finding 8)", () => {
     builder.close();
     grant.close();
     expect(governor.usedBytes).toBe(0);
+  });
+});
+
+describe("row fetcher capacity (review A1-3 finding 6)", () => {
+  it("never fills past its capacity, and says so (review probe)", async () => {
+    const governor = new Governor(16 << 20);
+    const grant = await governor.admit({
+      label: "fetch",
+      minimumBytes: 64 * 1024,
+      spillable: false,
+    });
+    const out = allocateFlat({ kind: "int32", bits: 32 }, 1);
+    out.validity = allocateValidity(1);
+    const fetcher = new MemoryRowFetcher([new Map([[1, [11, 22]]])]);
+    const request = (from: number): FetchRequest => ({
+      snapshot: pin(),
+      tableId: 1,
+      locators: locators([
+        [0, 0],
+        [0, 1],
+      ]),
+      length: 2,
+      selection: null,
+      from,
+      capacity: 1,
+      columns: [1],
+      output: [out],
+      varlen: [null],
+      grant,
+    });
+    expect(await fetcher.fetch(request(0))).toEqual({ done: false, filled: 1, reason: "capacity" });
+    expect(out.data.layout === "i32" && [...out.data.values]).toEqual([11]);
+    expect(await fetcher.fetch(request(1))).toEqual({ done: true, filled: 1 });
+    expect(out.data.layout === "i32" && [...out.data.values]).toEqual([22]);
+    await expect(fetcher.fetch({ ...request(0), capacity: 2 })).rejects.toThrow(RangeError);
+    expect(grant.allocated).toBe(0);
+    grant.close();
+  });
+
+  it("charges its staging before reading, and refuses without reading when it cannot", async () => {
+    const governor = new Governor(16 << 20);
+    const grant = await governor.admit({ label: "fetch", minimumBytes: 4096, spillable: false });
+    const ids = allocateFlat({ kind: "int32", bits: 32 }, 2048);
+    const fetcher = new MemoryRowFetcher(segments);
+    const entries = Array.from({ length: 2000 }, (_, i) => [0, i] as const);
+    const result = await fetcher.fetch({
+      snapshot: pin(),
+      tableId: 1,
+      locators: locators(entries),
+      length: entries.length,
+      selection: null,
+      from: 0,
+      capacity: 2048,
+      columns: [ID],
+      output: [ids],
+      varlen: [null],
+      grant,
+    });
+    expect(result).toEqual({ done: false, filled: 0, reason: "denied" });
+    expect(fetcher.pageReads).toBe(0);
+    expect(grant.allocated).toBe(0);
+    grant.close();
   });
 });

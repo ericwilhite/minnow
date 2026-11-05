@@ -15,7 +15,8 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 
 | Module             | Owner track                      | What it is                                                                                                                                                                                   |
 | ------------------ | -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `types.ts`         | contracts                        | Physical types; the one SQL → physical mapping; declared widths are mandatory                                                                                                                |
+| `types.ts`         | contracts                        | Physical types; the one SQL → physical mapping; declared widths are mandatory; column statistics types shared by format and exec                                                             |
+| `errors.ts`        | contracts                        | Errors shared across tracks: `OwnerUnresponsiveError`, `RequestExpiredError`                                                                                                                 |
 | `temporal.ts`      | contracts                        | DATE/TIMESTAMP on PostgreSQL's 2000 epoch; infinities; ISO text                                                                                                                              |
 | `hash/`            | contracts                        | xxHash32, the only checksum                                                                                                                                                                  |
 | `vector/`          | contracts → executor             | Batches (byte-bounded), vectors, validity, exact int64, int128 decimals, UTF-8 builder under a grant, locators                                                                               |
@@ -30,6 +31,22 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | `write/` (to come) | write path + key index           | Group commit, memtables, key index runs, maintenance                                                                                                                                         |
 | `lower/` (to come) | planner lowering                 | `Lowerer`, cost model, statistics                                                                                                                                                            |
 | `owner/` (to come) | ownership                        | Web Lock election, client protocol, step-down, composition root                                                                                                                              |
+
+## Cross-track interfaces (owned by the implementing track)
+
+These integration interfaces are deliberately not frozen here. Each is the first deliverable of
+the track that implements it, reviewed adversarially before the consuming tracks build on it
+(lead ruling on review A1-3 finding 2):
+
+| Interface                                                                                                     | Owner                     |
+| ------------------------------------------------------------------------------------------------------------- | ------------------------- |
+| Owner/client protocol: messages, request identity, step-down, liveness                                        | B5 ownership              |
+| Executor entry: `PhysicalPlan` + parameters + snapshot + grants → streaming columnar results                  | B4 executor               |
+| Extent allocation (free space from the root) and the data writer's lifecycle                                  | B1 storage                |
+| Key-index lookup, range and batch APIs; `modify` (row ids, conflicts, RETURNING); snapshot and catalog access | B3 write path + key index |
+
+Merge note: `SnapshotReleasedError` and the snapshot type move to `next/access/` (rebuild/write);
+`FetchRequest.snapshot` becomes access's `Snapshot`. Until that merge they stay in `exec/fetch.ts`.
 
 ## Dependency rules
 
@@ -72,6 +89,7 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 
 - A batch holds at most 2,048 rows and about 1 MiB in total, so wide rows get fewer rows. One huge
   value is a batch of one.
+- Arrays are stored as reversible values (`array-value.ts`) and decoded before any operation.
 - int64 is exact. It uses `Float64Array` only when every slot is proven to lie within ±(2^53 − 1),
   and `BigInt64Array` otherwise.
 - Decimals have three tiers: int64, then 128-bit limbs, then `bigint[]`. Kernels widen before
@@ -110,8 +128,10 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
   index.
 - The acknowledged boundary must match a transaction end exactly: offset, chain and LSN.
 - Incomplete transactions are dropped, and recovery truncates the log before appending again.
-- Recovery scans incrementally: one frame in memory at a time, transactions handed to a sink that
-  stages their parts.
+- Frames are at most 1 MiB; larger commits are multipart.
+- Recovery scans incrementally: one frame in memory at a time (`RECOVERY_SCAN_BYTES`, admitted and
+  charged before the scan), transactions handed to a sink that stages their parts. If anything
+  fails, the sink's staged parts are abandoned and the memory is freed.
 - A transaction is an ordered list of effects: DDL, sequence reservations, row changes and a
   request outcome, replayed in order. A table created by a transaction replays that
   transaction's rows.
@@ -119,10 +139,16 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
   `flushedThroughLsn`.
 - A checkpoint that covers a schema change of a table also covers that table's rows through it,
   and replay checks schema versions.
+- A transaction too large to log row by row stages its rows in a published root, then commits
+  with a `publishedRows` frame naming that root. Replay applies it exactly once (skipped once
+  folded), detects a rolled-back root, and drops staging no commit claimed.
 - The log must reach every checkpoint the root claims.
 - A rolled-back root is detected through the log header's `rootSequence`.
 - Requests are exactly-once through a bounded per-client ledger of outcomes, with expiry enforced
-  by the receiver.
+  by the receiver (`RequestExpiredError`). A request with no durable effect (a read, a statement
+  in an open transaction, a rollback) is settled without an outcome, so its retry runs again.
+- Errors shared across tracks (`OwnerUnresponsiveError`, `RequestExpiredError`) are defined once,
+  in `errors.ts`.
 
 ### Key encoding (`keys/key-encoding.ts`)
 
@@ -131,7 +157,10 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 - Persisted index keys are scalar types only. Indexes on arrays and JSON are refused at DDL; those
   types sort and group through the semantic comparators in `exec/semantic.ts`.
 - An enum index is equality-only (its key is the label). ORDER BY enum uses the declaration rank.
-- Operators encode a whole batch straight from vectors into a reused buffer (`encodeKeyBatch`).
+- Operators encode a whole batch straight from vectors into a reused buffer (`encodeKeyBatch`). Its
+  buffers are allocated from a grant, stop at the batch byte target (one oversized key is held
+  alone at its exact size) and shrink on reset; a key that does not fit is reported with its
+  required size, and encoding resumes from where it stopped.
 - Frozen by golden vectors and generated tests over every encodable type.
 
 ### Manifest (`format/manifest.ts`)
@@ -156,8 +185,11 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
   operator works inside its admitted minimum.
 - Growth is charged before it happens, including the overlap while a buffer is copied.
 - The page cache is evicted before anything spills.
-- Progress loans are scheduled before admissions and may use the reserve, so a queued admission
-  never blocks an admitted pipeline. A grant repays its loan before borrowing again.
+- Progress loans are scheduled before admissions and may use the reserve: a queued admission,
+  growth or the cache never delays a loan, and a loan waits only for earlier loans to be repaid.
+  Progress follows if each loan covers one bounded step. A loan belongs to its grant from the
+  moment it is served, so a close at any point returns it; `repay` validates before it changes
+  anything.
 - The drain is not reentrant, a closed grant is inert, and abort listeners are removed.
 - The one size error is a single value larger than the reserve.
 
@@ -177,7 +209,8 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 
 - Fully typed, positional and plain data. It is bound once, with parameter slots.
 - Late materialization uses `scan.emitLocator` and `fetch`, executed through the `RowFetcher`
-  contract (`exec/fetch.ts`).
+  contract (`exec/fetch.ts`): an explicit, enforced output capacity, charged and bounded staging,
+  and partial completion that may reread pages.
 - `apply` memoizes only when evaluation multiplicity is unobservable.
 - `lowering.ts` lists the front-end passes that are kept and the code that lowering replaces.
 

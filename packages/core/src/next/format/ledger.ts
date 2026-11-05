@@ -10,7 +10,8 @@
  *   the client holds the outcome of every request ≤ S.
  *
  * ## Admission (`RequestLedger.admit`), checked by the receiver before executing anything
- * - `expired`: `now − sentAtMs > CLIENT_RETRY_WINDOW_MS`. Never executed (`RequestExpiredError`).
+ * - `expired`: `now − sentAtMs > CLIENT_RETRY_WINDOW_MS`. Never executed; the receiver answers
+ *   `RequestExpiredError` (next/errors.ts).
  * - `stale`: sequence ≤ the client's `resolvedThrough`: the client already has the outcome; a
  *   late duplicate is dropped, never executed.
  * - `window`: sequence > resolvedThrough + MAX_OUTSTANDING_REQUESTS: a protocol violation.
@@ -19,6 +20,12 @@
  *   original affected-row counts (RETURNING rows are not replayed: the duplicate gets counts
  *   only); a failure answers with the same error code.
  * - `execute`: first sight; run it.
+ *
+ * ## Settling without an outcome
+ * A request with no durable effect (a read, a statement inside a transaction that is still open,
+ * a rollback) is `settle`d once answered: it leaves `inFlight` and records nothing, so a retry
+ * simply runs again, which is correct for anything that changed nothing. Only a commit records an
+ * outcome; a failure records one only while the owner lives.
  *
  * ## Durability and bounds
  * - Committed outcomes are durable: the commit's log frame carries the request (log-frame.ts
@@ -105,6 +112,14 @@ export class RequestLedger {
     if (client.inFlight.has(request.sequence)) return { kind: "inFlight" };
     client.inFlight.add(request.sequence);
     return { kind: "execute" };
+  }
+
+  /**
+   * Ends an admitted request that has no durable effect without recording an outcome: a retry
+   * runs it again.
+   */
+  settle(clientId: string, sequence: number): void {
+    this.#clients.get(clientId)?.inFlight.delete(sequence);
   }
 
   /** Records the terminal outcome of an admitted request (a commit only once it is durable). */

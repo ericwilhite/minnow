@@ -45,8 +45,17 @@ export const HEADER_MAGIC = 0x484c4e4d; // "MNLH"
 export const LOG_FORMAT_VERSION = 1;
 export const FRAME_HEADER_BYTES = 28;
 export const LOG_HEADER_BYTES = 52;
-/** Largest body one frame carries; bigger transactions split into parts. */
-export const MAX_FRAME_BODY_BYTES = 16 * 1024 * 1024;
+/** Largest frame, envelope included; bigger transactions split into parts. */
+export const MAX_FRAME_BYTES = 1024 * 1024;
+/** Largest body one frame carries (`MAX_FRAME_BYTES` minus the 28-byte header and 4-byte chain). */
+export const MAX_FRAME_BODY_BYTES = MAX_FRAME_BYTES - 32;
+/**
+ * The incremental scanner's own memory: one frame header and one whole frame alive at once.
+ * Recovery admits it (memory/governor.ts) and passes the grant to `scanLogIncremental`. A sink
+ * stages a multipart transaction's parts in its own memory (charged, or spilled), up to
+ * `MAX_FRAME_PARTS` × `MAX_FRAME_BYTES`.
+ */
+export const RECOVERY_SCAN_BYTES = MAX_FRAME_BYTES + FRAME_HEADER_BYTES;
 export const MAX_FRAME_PARTS = 0xffff;
 
 export const FrameKind = { commit: 1 } as const;
@@ -370,30 +379,64 @@ export interface TransactionSink {
   abandon(parts: number): void | Promise<void>;
 }
 
+/** The memory recovery charges the scanner to (a governor `Grant` fits). */
+export interface ScanCharge {
+  allocate(bytes: number): boolean;
+  free(bytes: number): void;
+}
+
 /**
- * Recovery's view of a log of any size: reads one frame at a time (memory is bounded by the
- * largest frame, `MAX_FRAME_BODY_BYTES` + 32), keeps no frame after delivering it, and hands
- * transactions to `sink` in LSN order.
+ * Recovery's view of a log of any size. Memory: `RECOVERY_SCAN_BYTES` (one frame header and one
+ * frame of at most `MAX_FRAME_BYTES`), allocated from `charge` before the first read; recovery
+ * admits that minimum first (`RangeError` otherwise). No frame is kept after its delivery.
+ *
+ * Failure: if the reader, the sink or validation throws, the sink's `abandon` is called for the
+ * parts delivered since the last `commit` (so it can drop staged parts), the charge is freed, and
+ * the original error propagates.
  */
 export async function scanLogIncremental(
   reader: LogReader,
   slots: readonly [Uint8Array | null, Uint8Array | null],
   incarnation: LogIncarnation,
   sink: TransactionSink,
+  charge: ScanCharge,
 ): Promise<LogScanSummary> {
-  const state = new LogScanState(slots, incarnation);
-  for (;;) {
-    if (state.offset + FRAME_HEADER_BYTES + 4 > reader.length) break;
-    const length = state.frameLength(await reader.read(state.offset, FRAME_HEADER_BYTES));
-    if (length === null || state.offset + length > reader.length) break;
-    const accepted = state.accept(await reader.read(state.offset, length));
-    if (accepted === null) break;
-    await sink.part(accepted.frame);
-    if (accepted.completes) await sink.commit(accepted.frame.transaction, accepted.frame.lsn);
+  if (!charge.allocate(RECOVERY_SCAN_BYTES))
+    throw new RangeError("Recovery's scan memory must be admitted before the scan");
+  let delivered = 0;
+  try {
+    const state = new LogScanState(slots, incarnation);
+    for (;;) {
+      if (state.offset + FRAME_HEADER_BYTES + 4 > reader.length) break;
+      const length = state.frameLength(await reader.read(state.offset, FRAME_HEADER_BYTES));
+      if (length === null || length > MAX_FRAME_BYTES || state.offset + length > reader.length)
+        break;
+      const accepted = state.accept(await reader.read(state.offset, length));
+      if (accepted === null) break;
+      delivered += 1;
+      await sink.part(accepted.frame);
+      if (accepted.completes) {
+        await sink.commit(accepted.frame.transaction, accepted.frame.lsn);
+        delivered = 0;
+      }
+    }
+    const summary = state.finish();
+    if (summary.abandonedParts > 0) {
+      delivered = 0;
+      await sink.abandon(summary.abandonedParts);
+    }
+    return summary;
+  } catch (error) {
+    if (delivered > 0)
+      try {
+        await sink.abandon(delivered);
+      } catch {
+        // The original failure is the one to report.
+      }
+    throw error;
+  } finally {
+    charge.free(RECOVERY_SCAN_BYTES);
   }
-  const summary = state.finish();
-  if (summary.abandonedParts > 0) await sink.abandon(summary.abandonedParts);
-  return summary;
 }
 
 /**
@@ -426,7 +469,18 @@ export type BodyEffect =
   | { readonly kind: "catalog"; readonly definition: Uint8Array }
   /** A sequence block reservation: the sequence's new reserved-through value. */
   | { readonly kind: "sequence"; readonly sequenceId: number; readonly reservedThrough: bigint }
-  | ({ readonly kind: "rows" } & TableChange);
+  | ({ readonly kind: "rows" } & TableChange)
+  /**
+   * A large transaction's rows, already published as staged in the root `rootSequence` under
+   * `transaction` (replay.ts "Large transactions"). This frame is their commit point.
+   */
+  | {
+      readonly kind: "publishedRows";
+      readonly tableId: number;
+      readonly schemaVersion: number;
+      readonly transaction: number;
+      readonly rootSequence: number;
+    };
 
 /**
  * Row changes to one table under one schema version. An UPDATE is a delete of the old row id plus

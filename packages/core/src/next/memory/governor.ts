@@ -21,12 +21,15 @@
  *    growth overlap is counted.
  * 5. **Progress is scheduled apart from admission.** An operator that cannot progress by spilling
  *    (one value larger than a batch, a result frame waiting for credit, a spill buffer it must fill
- *    before it can free anything) `borrow`s a **loan**. Loans are served before any admission and
- *    may use the progress reserve (`reserveBytes`), which admissions and growth never take, so a
- *    pending admission never blocks an admitted pipeline's progress (two queries cannot wait on
- *    each other through memory). A grant has at most one loan and repays it before borrowing
- *    again. A loan larger than the reserve is the one size error, `ValueTooLargeError`: about a
- *    value, never a query or table.
+ *    before it can free anything) `borrow`s a **loan**. Loans are served first-come, before any
+ *    admission, and may use the progress reserve (`reserveBytes`), which admissions and growth
+ *    never take. What this proves, and no more: a queued admission, growth or the cache can never
+ *    delay a loan; a loan waits only for earlier loans to be repaid. So progress is guaranteed if
+ *    every loan holder repays without waiting on anything that itself needs memory (the operator
+ *    rule: a loan covers one bounded step). A grant has at most one loan and repays it before
+ *    borrowing again. Ownership of a loan is installed when it is served, atomically with its
+ *    charge: closing the grant at any point returns it. A loan larger than the reserve is the one
+ *    size error, `ValueTooLargeError`: about a value, never a query or table.
  * 6. **The cache yields first.** Before refusing growth or keeping anything waiting, the governor
  *    evicts unpinned encoded pages. Operators spill only after the cache is at its floor.
  * 7. **Cooperative reclaim.** While a loan or an admission waits, the governor calls each other
@@ -79,7 +82,10 @@ export interface AdmitOptions {
   readonly signal?: AbortSignal;
 }
 
-/** A progress loan (rule 5). `repay` returns its bytes; `free` them first. */
+/**
+ * A progress loan (rule 5). `repay` returns its bytes; `free` them first: if they are still
+ * allocated, `repay` throws and changes nothing, so it can be retried.
+ */
 export interface Loan {
   readonly bytes: number;
   repay(): void;
@@ -153,6 +159,7 @@ interface Request {
   readonly grant: GrantImpl | null;
   readonly label: string;
   readonly spillable: boolean;
+  readonly loan: boolean;
   readonly resolve: (grant: GrantImpl) => void;
   readonly reject: (reason: unknown) => void;
   readonly detach: () => void;
@@ -205,13 +212,15 @@ class GrantImpl implements Grant {
     this.loanPending = true;
     return this.governor.lend(this, bytes, signal).then(
       () => {
-        this.loanPending = false;
-        this.loan = bytes;
+        // The loan was installed (and charged) when it was served; a close since then returned it.
+        if (this.closed) throw new GrantClosedError(this.label);
         let repaid = false;
         return {
           bytes,
           repay: () => {
             if (repaid || this.closed) return;
+            if (bytes > this.held - this.allocated)
+              throw new RangeError(`${this.label} must free its loaned bytes before repaying`);
             repaid = true;
             this.loan = 0;
             this.governor.repaid(bytes);
@@ -293,6 +302,11 @@ export class Governor implements MemoryGovernor {
     this.#loaned -= bytes;
   }
 
+  /** Bytes out on loans (for invariant checks). */
+  get loanedBytes(): number {
+    return this.#loaned;
+  }
+
   grow(grant: GrantImpl, bytes: number): boolean {
     if (this.#loans.length > 0 || this.#admissions.length > 0) return false;
     if (!this.#room(bytes, false)) return false;
@@ -359,6 +373,10 @@ export class Governor implements MemoryGovernor {
         this.#grants.add(grant);
       }
       grant.held += request.bytes;
+      if (request.loan) {
+        grant.loan = request.bytes;
+        grant.loanPending = false;
+      }
       request.resolve(grant);
     }
   }
@@ -398,6 +416,7 @@ export class Governor implements MemoryGovernor {
       this.#admissions,
       {
         bytes: options.minimumBytes,
+        loan: false,
         grant: null,
         label: options.label,
         spillable: options.spillable,
@@ -410,7 +429,7 @@ export class Governor implements MemoryGovernor {
     if (bytes > this.reserveBytes) throw new ValueTooLargeError(bytes, this.reserveBytes);
     await this.#enqueue(
       this.#loans,
-      { bytes, grant, label: grant.label, spillable: grant.spillable },
+      { bytes, loan: true, grant, label: grant.label, spillable: grant.spillable },
       signal,
     );
   }

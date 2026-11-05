@@ -7,6 +7,7 @@ import {
   batchTargetFor,
   bigintBytes,
   type EvictableCache,
+  type Loan,
 } from "./governor.js";
 
 const MiB = 1 << 20;
@@ -248,5 +249,157 @@ describe("suballocation inside admitted minimums (rule 4)", () => {
     expect(governor.usedBytes).toBe(0);
     expect(bigintBytes(0n)).toBe(24);
     expect(bigintBytes(2n ** 200n)).toBe(16 + 8 * 4);
+  });
+});
+
+describe("loan races (review A1-3 finding 3)", () => {
+  const ticks = async (count: number) => {
+    for (let i = 0; i < count; i++) await Promise.resolve();
+  };
+  /** After everything is closed: nothing charged, nothing loaned, and the reserve is intact. */
+  async function reserveIntact(governor: Governor) {
+    expect(governor.usedBytes).toBe(0);
+    expect(governor.loanedBytes).toBe(0);
+    const probe = await governor.admit({
+      label: "probe",
+      minimumBytes: governor.capBytes - governor.reserveBytes,
+      spillable: true,
+    });
+    expect(probe.tryGrow(1)).toBe(false);
+    probe.close();
+  }
+
+  it.each([0, 1, 2, 3, 5, 8])(
+    "close %i microtasks after a served borrow returns the loan (review probe)",
+    async (delay) => {
+      const governor = new Governor(16 * MiB);
+      const a = await governor.admit({ label: "A", minimumBytes: 14 * MiB, spillable: true });
+      const pending = a.borrow(2 * MiB);
+      await ticks(delay);
+      a.close();
+      const settled: Loan | GrantClosedError = await pending.then(
+        (loan) => loan,
+        (error: unknown) => {
+          expect(error).toBeInstanceOf(GrantClosedError);
+          return error as GrantClosedError;
+        },
+      );
+      if (!(settled instanceof GrantClosedError)) settled.repay();
+      await reserveIntact(governor);
+    },
+  );
+
+  it.each([0, 1, 3])("close or abort %i microtasks into a queued borrow", async (delay) => {
+    for (const how of ["close", "abort"] as const) {
+      const governor = new Governor(16 * MiB);
+      const full = await governor.admit({
+        label: "full",
+        minimumBytes: 14 * MiB,
+        spillable: false,
+      });
+      const holder = await full.borrow(2 * MiB);
+      const waiter = await governor.admit({ label: "w", minimumBytes: 0, spillable: false });
+      const controller = new AbortController();
+      const pending = waiter.borrow(MiB, controller.signal);
+      await ticks(delay);
+      if (how === "close") waiter.close();
+      else controller.abort(new Error("cancelled"));
+      await expect(pending).rejects.toThrow(how === "close" ? GrantClosedError : Error);
+      holder.repay();
+      full.close();
+      waiter.close();
+      await reserveIntact(governor);
+    }
+  });
+
+  it("repay validates before it mutates, so a refused repay can be retried (review probe)", async () => {
+    const governor = new Governor(16 * MiB);
+    const c = await governor.admit({ label: "C", minimumBytes: 14 * MiB, spillable: true });
+    const loan = await c.borrow(2 * MiB);
+    expect(c.allocate(16 * MiB)).toBe(true);
+    expect(() => {
+      loan.repay();
+    }).toThrow(RangeError);
+    expect(c.held).toBe(16 * MiB);
+    expect(governor.loanedBytes).toBe(2 * MiB);
+    c.free(2 * MiB);
+    loan.repay();
+    expect(c.held).toBe(14 * MiB);
+    expect(governor.loanedBytes).toBe(0);
+    c.close();
+    await reserveIntact(governor);
+  });
+
+  it("keeps its accounting exact under random interleavings of every operation", async () => {
+    for (let seed = 1; seed <= 40; seed++) {
+      let state = seed;
+      const random = () => {
+        state = (Math.imul(state ^ (state >>> 15), 0x2c1b3c6d) + 0x9e3779b9) >>> 0;
+        return state / 2 ** 32;
+      };
+      const governor = new Governor(16 * MiB);
+      interface Live {
+        grant: Awaited<ReturnType<Governor["admit"]>>;
+        loan: { repay(): void } | null;
+      }
+      const grants: Live[] = [];
+      const pending: Array<Promise<unknown>> = [];
+      // Bounds hold at every step; exact equality with the grants' holdings is checked once
+      // everything has settled (an admission is charged a few microtasks before the test sees it).
+      const check = () => {
+        const held = grants.reduce((sum, live) => sum + live.grant.held, 0);
+        expect(governor.usedBytes).toBeGreaterThanOrEqual(held);
+        expect(governor.usedBytes).toBeLessThanOrEqual(governor.capBytes);
+        expect(governor.usedBytes - governor.loanedBytes).toBeLessThanOrEqual(
+          governor.capBytes - governor.reserveBytes,
+        );
+      };
+      for (let step = 0; step < 60; step++) {
+        const roll = random();
+        const live = grants[Math.floor(random() * grants.length)];
+        if (roll < 0.25 || live === undefined) {
+          pending.push(
+            governor
+              .admit({
+                label: `g${String(step)}`,
+                minimumBytes: Math.floor(random() * 4) * MiB,
+                spillable: random() < 0.7,
+              })
+              .then((grant) => {
+                grants.push({ grant, loan: null });
+              }),
+          );
+        } else if (roll < 0.45) live.grant.tryGrow(Math.floor(random() * 4) * MiB);
+        else if (roll < 0.65 && live.loan === null)
+          pending.push(
+            live.grant.borrow(Math.floor(random() * 2 + 1) * (MiB / 2)).then(
+              (loan) => {
+                live.loan = loan;
+              },
+              () => undefined,
+            ),
+          );
+        else if (roll < 0.8 && live.loan !== null) {
+          live.loan.repay();
+          live.loan = null;
+        } else if (roll < 0.9) {
+          live.grant.close();
+          grants.splice(grants.indexOf(live), 1);
+        }
+        await ticks(Math.floor(random() * 4));
+        check();
+      }
+      for (const live of [...grants]) live.grant.close();
+      grants.length = 0;
+      // Anything admitted late is closed as it arrives.
+      for (let round = 0; round < 10; round++) {
+        await ticks(5);
+        for (const live of grants.splice(0)) live.grant.close();
+      }
+      await Promise.all(pending);
+      for (const live of grants.splice(0)) live.grant.close();
+      check();
+      await reserveIntact(governor);
+    }
   });
 });

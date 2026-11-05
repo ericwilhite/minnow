@@ -45,7 +45,9 @@
  */
 import type { ClientLedgerEntry } from "./ledger.js";
 import type { LogIncarnation } from "./log-frame.js";
-import type { PhysicalType } from "../types.js";
+import type { ColumnStatistics, PhysicalType, StatValue } from "../types.js";
+
+export type { ColumnStatistics, StatValue };
 
 export const MANIFEST_FORMAT_VERSION = 1;
 
@@ -100,6 +102,18 @@ export interface TableRoot {
   /** → GroupRef[] in row-id order. */
   readonly groups: BlobRef;
   readonly groupCount: number;
+  /**
+   * Large transactions' rows published but not yet visible (replay.ts "Large transactions"): each
+   * becomes visible when its `publishedRows` commit frame replays, and is folded into `groups`
+   * (with `flushedThroughLsn` past the frame) by a later publish.
+   */
+  readonly staged: ReadonlyArray<{
+    readonly transaction: number;
+    readonly firstRowId: number;
+    readonly rowCount: number;
+    /** → GroupRef[] of the staged rows. */
+    readonly groups: BlobRef;
+  }>;
   readonly keyIndex: IndexRoot | null;
   readonly secondaryIndexes: readonly IndexRoot[];
   /** Mergeable table statistics (row count, distinct sketches, heavy hitters), or null. */
@@ -138,24 +152,9 @@ export interface ColumnChunk {
   /** → PageEntry[] for this column of this group. */
   readonly directory: BlobRef;
   readonly statistics: ColumnStatistics;
-}
-
-/** Page and chunk statistics. Approximate fields never authorize pruning or overflow shortcuts. */
-export interface ColumnStatistics {
-  readonly nullCount: number;
-  /**
-   * Exact bounds in the type's stored encoding (int64 family as bigint; text as UTF-8 bytes in
-   * byte order, possibly truncated with a conservative upper bound), or null if unknown.
-   */
-  readonly min: StatValue | null;
-  readonly max: StatValue | null;
-  /** Dictionary entries, when the chunk is dictionary-encoded. */
-  readonly dictionarySize: number | null;
   /** Mergeable distinct-count sketch (approximate; planning only), or null. */
   readonly distinctSketch: BlobRef | null;
 }
-
-export type StatValue = boolean | number | bigint | Uint8Array;
 
 export const PageEncoding = {
   plain: 1,

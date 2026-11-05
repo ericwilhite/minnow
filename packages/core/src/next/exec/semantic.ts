@@ -5,12 +5,22 @@
  * values compare 0 exactly when their equality keys (`*EqualityKey`) are equal, so hashing the
  * equality key agrees with the comparator.
  *
- * ## JSONB (PostgreSQL's jsonb btree order)
- * Object > Array > Boolean > Number > String > Null, except that an empty top-level array sorts
- * below null (PostgreSQL's historical rule). Objects with more pairs sort higher; then pairs are
- * compared in storage order (keys by length, then bytes), key then value. Arrays with more
- * elements sort higher; then element by element. Numbers compare numerically and exactly
- * (`1` = `1.0`, `2` < `10`). Strings and keys compare by code point (byte) order. false < true.
+ * ## JSONB (PostgreSQL's `compareJsonbContainers`, verified against PGlite)
+ * Both values are walked in storage order as token streams (begin/end of arrays and objects,
+ * keys, values, elements; a top-level scalar is a one-element "raw scalar" array) and compared
+ * token by token:
+ * - Same token, same type: scalars compare as values: null = null, strings (and keys) by bytes
+ *   (C collation), numbers numerically and exactly (`1` = `1.0`, `2` < `10`), false < true;
+ *   arrays: a raw scalar sorts below a real array, but a different element count decides first;
+ *   objects: more pairs sort higher.
+ * - Otherwise: by type, Null < String < Number < Boolean < Array < Object.
+ * Object keys are visited in storage order (shorter first, then bytes), but two keys met at the
+ * same position compare lexically: `{"b":0}` > `{"aa":0}`. Consequences: `[]` < every scalar,
+ * `1` < `[1]`.
+ *
+ * `parseJsonb` accepts exactly PostgreSQL's JSON: whitespace is space, tab, LF, CR only; numbers
+ * have no leading zeros, `+`, bare `.` or trailing `.`; strings have no raw control characters,
+ * no `\u0000`, and no unpaired surrogate (escaped or raw).
  *
  * ## SQL arrays (PostgreSQL's array_cmp)
  * Element by element over the shorter array (null elements sort above non-null ones and equal
@@ -66,56 +76,115 @@ function compareDecimals(a: DecimalKey, b: DecimalKey): number {
   return x === y ? 0 : x < y ? -1 : 1;
 }
 
-function rank(value: JsonbValue): number {
-  if (value === null) return 0;
-  if (typeof value === "string") return 1;
-  if (typeof value === "boolean") return 3;
-  if (Array.isArray(value)) return 4;
-  return "number" in (value as object) ? 2 : 5;
+/** PostgreSQL's jbvType order. */
+const JsonbType = { Null: 0, String: 1, Numeric: 2, Bool: 3, Array: 16, Object: 17 } as const;
+type JsonbType = (typeof JsonbType)[keyof typeof JsonbType];
+
+function typeOf(value: JsonbValue): JsonbType {
+  if (value === null) return JsonbType.Null;
+  if (typeof value === "string") return JsonbType.String;
+  if (typeof value === "boolean") return JsonbType.Bool;
+  if (Array.isArray(value)) return JsonbType.Array;
+  return "number" in (value as object) ? JsonbType.Numeric : JsonbType.Object;
 }
 
-function compareInner(a: JsonbValue, b: JsonbValue): number {
-  const difference = rank(a) - rank(b);
-  if (difference !== 0) return Math.sign(difference);
-  if (a === null || b === null) return 0;
-  if (typeof a === "string") return compareCodePoints(a, b as string);
-  if (typeof a === "boolean") return Number(a) - Number(b);
-  if (Array.isArray(a)) {
-    const list = a as readonly JsonbValue[];
-    const other = b as readonly JsonbValue[];
-    if (list.length !== other.length) return list.length < other.length ? -1 : 1;
-    for (let index = 0; index < list.length; index++) {
-      const order = compareInner(list[index] ?? null, other[index] ?? null);
-      if (order !== 0) return order;
-    }
-    return 0;
+type Token =
+  | { readonly token: "beginArray"; readonly raw: boolean; readonly count: number }
+  | { readonly token: "beginObject"; readonly count: number }
+  | { readonly token: "endArray" | "endObject" }
+  | { readonly token: "key"; readonly value: string }
+  | { readonly token: "value" | "element"; readonly value: JsonbValue };
+
+/** PostgreSQL's iterator order: storage order, scalars inline, containers opened and closed. */
+function tokens(value: JsonbValue): Token[] {
+  const out: Token[] = [];
+  const walk = (item: JsonbValue, position: "value" | "element") => {
+    const type = typeOf(item);
+    if (type === JsonbType.Array) {
+      const items = item as readonly JsonbValue[];
+      out.push({ token: "beginArray", raw: false, count: items.length });
+      for (const element of items) walk(element, "element");
+      out.push({ token: "endArray" });
+    } else if (type === JsonbType.Object) {
+      const entries = (item as JsonbObject).entries;
+      out.push({ token: "beginObject", count: entries.length });
+      for (const [key, member] of entries) {
+        out.push({ token: "key", value: key });
+        walk(member, "value");
+      }
+      out.push({ token: "endObject" });
+    } else out.push({ token: position, value: item });
+  };
+  const type = typeOf(value);
+  if (type === JsonbType.Array || type === JsonbType.Object) walk(value, "element");
+  else {
+    out.push({ token: "beginArray", raw: true, count: 1 });
+    out.push({ token: "element", value });
+    out.push({ token: "endArray" });
   }
-  if ("number" in (a as object))
-    return compareDecimals((a as JsonbNumber).number, (b as JsonbNumber).number);
-  const x = (a as JsonbObject).entries;
-  const y = (b as JsonbObject).entries;
-  if (x.length !== y.length) return x.length < y.length ? -1 : 1;
-  for (let index = 0; index < x.length; index++) {
-    const [keyA, valueA] = x[index] ?? ["", null];
-    const [keyB, valueB] = y[index] ?? ["", null];
-    const order = compareKeys(keyA, keyB) || compareInner(valueA, valueB);
-    if (order !== 0) return order;
-  }
-  return 0;
+  return out;
 }
 
-const isEmptyArray = (value: JsonbValue) => Array.isArray(value) && value.length === 0;
+function tokenType(token: Token): JsonbType {
+  switch (token.token) {
+    case "beginArray":
+    case "endArray":
+      return JsonbType.Array;
+    case "beginObject":
+    case "endObject":
+      return JsonbType.Object;
+    case "key":
+      return JsonbType.String;
+    default:
+      return typeOf(token.value);
+  }
+}
 
-/** PostgreSQL's jsonb order for two top-level values. */
+function compareScalars(a: JsonbValue, b: JsonbValue): number {
+  switch (typeOf(a)) {
+    case JsonbType.Null:
+      return 0;
+    case JsonbType.String:
+      return compareCodePoints(a as string, b as string);
+    case JsonbType.Bool:
+      return Number(a) - Number(b);
+    default:
+      return compareDecimals((a as JsonbNumber).number, (b as JsonbNumber).number);
+  }
+}
+
+/** PostgreSQL's jsonb order (see the header). */
 export function compareJsonb(a: JsonbValue, b: JsonbValue): number {
-  const emptyA = isEmptyArray(a);
-  const emptyB = isEmptyArray(b);
-  if (emptyA || emptyB) return emptyA === emptyB ? 0 : emptyA ? -1 : 1;
-  return compareInner(a, b);
+  const x = tokens(a);
+  const y = tokens(b);
+  for (let index = 0; index < x.length && index < y.length; index++) {
+    const ta = x[index];
+    const tb = y[index];
+    if (ta === undefined || tb === undefined) break;
+    let result = 0;
+    if (ta.token === tb.token) {
+      if (ta.token === "endArray" || ta.token === "endObject") continue;
+      const typeA = tokenType(ta);
+      const typeB = tokenType(tb);
+      if (typeA !== typeB) result = typeA > typeB ? 1 : -1;
+      else if (ta.token === "beginArray" && tb.token === "beginArray") {
+        if (ta.raw !== tb.raw) result = ta.raw ? -1 : 1;
+        if (ta.count !== tb.count) result = ta.count > tb.count ? 1 : -1;
+      } else if (ta.token === "beginObject" && tb.token === "beginObject") {
+        if (ta.count !== tb.count) result = ta.count > tb.count ? 1 : -1;
+      } else if ("value" in ta && "value" in tb) result = compareScalars(ta.value, tb.value);
+    } else {
+      const typeA = tokenType(ta);
+      const typeB = tokenType(tb);
+      result = typeA === typeB ? 0 : typeA > typeB ? 1 : -1;
+    }
+    if (result !== 0) return Math.sign(result);
+  }
+  return Math.sign(x.length - y.length);
 }
 
 function writeJsonb(writer: KeyWriter, value: JsonbValue): void {
-  writer.byte(rank(value));
+  writer.byte(typeOf(value));
   if (value === null) return;
   if (typeof value === "string") return writer.escaped(encoder.encode(value));
   if (typeof value === "boolean") return writer.byte(value ? 1 : 0);
@@ -139,19 +208,68 @@ function writeJsonb(writer: KeyWriter, value: JsonbValue): void {
 /** Bytes equal exactly when `compareJsonb` returns 0 (numbers normalized: 1 = 1.0). */
 export function jsonbEqualityKey(value: JsonbValue): Uint8Array {
   const writer = new KeyWriter(64);
-  writer.byte(isEmptyArray(value) ? 0xff : 0);
   writeJsonb(writer, value);
   return writer.view().slice();
 }
 
-/** Parses JSON text into a JsonbValue: exact numbers, last duplicate key wins, keys sorted. */
+const SPACE = new Set([" ", "\t", "\n", "\r"]);
+const ESCAPES: Readonly<Record<string, string>> = {
+  '"': '"',
+  "\\": "\\",
+  "/": "/",
+  b: "\b",
+  f: "\f",
+  n: "\n",
+  r: "\r",
+  t: "\t",
+};
+
+/** Parses PostgreSQL JSON into a JsonbValue: exact numbers, last duplicate key wins, keys sorted. */
 export function parseJsonb(text: string): JsonbValue {
   let position = 0;
-  const fail = (): never => {
-    throw new SyntaxError(`Invalid JSON at ${String(position)}`);
+  const fail = (what: string): never => {
+    throw new SyntaxError(`Invalid JSON at ${String(position)}: ${what}`);
   };
   const space = () => {
-    while (/\s/u.test(text[position] ?? "")) position += 1;
+    while (SPACE.has(text[position] ?? "")) position += 1;
+  };
+  const string = (): string => {
+    position += 1;
+    let out = "";
+    for (;;) {
+      const char = text[position];
+      if (char === undefined) return fail("unterminated string");
+      position += 1;
+      if (char === '"') break;
+      const code = char.charCodeAt(0);
+      if (code < 0x20) fail("control character in string");
+      if (char !== "\\") {
+        out += char;
+        continue;
+      }
+      const escape = text[position] ?? "";
+      position += 1;
+      if (escape !== "u") {
+        out += ESCAPES[escape] ?? fail("bad escape");
+        continue;
+      }
+      const hex = text.slice(position, position + 4);
+      if (!/^[0-9a-fA-F]{4}$/u.test(hex)) fail("bad \\u escape");
+      position += 4;
+      const unit = parseInt(hex, 16);
+      if (unit === 0) fail("\\u0000 is not supported");
+      out += String.fromCharCode(unit);
+    }
+    // Every surrogate must be paired (PostgreSQL rejects lone surrogates).
+    for (let index = 0; index < out.length; index++) {
+      const unit = out.charCodeAt(index);
+      if (unit >= 0xd800 && unit <= 0xdbff) {
+        const next = out.charCodeAt(index + 1);
+        if (!(next >= 0xdc00 && next <= 0xdfff)) fail("unpaired high surrogate");
+        index += 1;
+      } else if (unit >= 0xdc00 && unit <= 0xdfff) fail("unpaired low surrogate");
+    }
+    return out;
   };
   const value = (): JsonbValue => {
     space();
@@ -164,15 +282,15 @@ export function parseJsonb(text: string): JsonbValue {
       else
         for (;;) {
           space();
-          const key = value();
-          if (typeof key !== "string") fail();
+          if (text[position] !== '"') fail("expected a key");
+          const key = string();
           space();
-          if (text[position++] !== ":") fail();
-          map.set(key as string, value());
+          if (text[position++] !== ":") fail("expected ':'");
+          map.set(key, value());
           space();
           const next = text[position++];
           if (next === "}") break;
-          if (next !== ",") fail();
+          if (next !== ",") fail("expected ',' or '}'");
         }
       return { entries: [...map].sort(([a], [b]) => compareKeys(a, b)) };
     }
@@ -187,15 +305,11 @@ export function parseJsonb(text: string): JsonbValue {
           space();
           const next = text[position++];
           if (next === "]") break;
-          if (next !== ",") fail();
+          if (next !== ",") fail("expected ',' or ']'");
         }
       return items;
     }
-    if (char === '"') {
-      const match = /^"(?:[^"\\]|\\.)*"/u.exec(text.slice(position)) ?? fail();
-      position += match[0].length;
-      return JSON.parse(match[0]) as string;
-    }
+    if (char === '"') return string();
     for (const [word, result] of [
       ["true", true],
       ["false", false],
@@ -205,21 +319,23 @@ export function parseJsonb(text: string): JsonbValue {
         position += word.length;
         return result;
       }
-    const match = /^-?(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?/u.exec(text.slice(position)) ?? fail();
+    const match =
+      /^-?(0|[1-9]\d*)(?:\.(\d+))?(?:[eE]([+-]?\d+))?/u.exec(text.slice(position)) ??
+      fail("expected a value");
     position += match[0].length;
+    if (/^[\d.]/u.test(text[position] ?? "")) fail("malformed number");
     const [, whole = "", fraction = "", exponent = "0"] = match;
-    const negative = match[0].startsWith("-");
     const digits = BigInt(whole + fraction);
     return {
       number: {
-        coefficient: negative ? -digits : digits,
+        coefficient: match[0].startsWith("-") ? -digits : digits,
         scale: fraction.length - Number(exponent),
       },
     };
   };
   const result = value();
   space();
-  if (position !== text.length) fail();
+  if (position !== text.length) fail("trailing characters");
   return result;
 }
 

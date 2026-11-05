@@ -95,7 +95,10 @@ export interface EnumType {
   readonly name: string;
   readonly labels: readonly string[];
 }
-/** An array of `element`: one canonical binary value per row (see DECISIONS.md, item C9). */
+/**
+ * An array of `element`: one reversible stored value per row (vector/array-value.ts; DECISIONS.md
+ * C9). Not a key: it sorts and groups through exec/semantic.ts and cannot be indexed.
+ */
 export interface ArrayType {
   readonly kind: "array";
   readonly element: PhysicalType;
@@ -327,6 +330,26 @@ export function physicalTypeOfName(name: string): PhysicalType {
   const type = ELEMENT_TYPES.get(name.trim().toUpperCase());
   if (type === undefined) throw new TypeError(`Unknown array element type: ${name}`);
   return type;
+}
+
+/**
+ * A statistics bound in the type's stored encoding: int64 family as bigint, text as UTF-8 bytes in
+ * byte order (possibly truncated, with a conservative upper bound), others as their value.
+ */
+export type StatValue = boolean | number | bigint | Uint8Array;
+
+/**
+ * Page and column-chunk statistics, shared by the manifest (format/) and planning and pruning
+ * (exec/, lower/). Exact fields may prune; approximate ones (distinct estimates) are for planning
+ * only and never authorize pruning or overflow shortcuts.
+ */
+export interface ColumnStatistics {
+  readonly nullCount: number;
+  /** Exact bounds, or null if unknown. */
+  readonly min: StatValue | null;
+  readonly max: StatValue | null;
+  /** Dictionary entries, when the chunk is dictionary-encoded. */
+  readonly dictionarySize: number | null;
 }
 
 /** Structural equality of two physical types. */

@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
+import { Governor } from "../memory/governor.js";
 import {
   LogCorruptionError,
+  MAX_FRAME_BODY_BYTES,
+  MAX_FRAME_BYTES,
+  RECOVERY_SCAN_BYTES,
   decodeLogHeader,
   encodeFrame,
   encodeLogHeader,
@@ -12,6 +16,7 @@ import {
 } from "./log-frame.js";
 
 const SALT = 0xabcd_1234;
+const unlimited = { allocate: () => true, free: () => undefined };
 const INCARNATION = { salt: SALT, firstLsn: 1, rootSequence: 5 };
 
 function body(seed: number, length: number): Uint8Array {
@@ -263,26 +268,32 @@ describe("incremental recovery scan (review A1-2 finding 10)", () => {
     const committed: Array<{ transaction: number; lsns: number[]; checksum: number }> = [];
     let staged: Array<{ lsn: number; body: Uint8Array }> = [];
     let abandoned = 0;
-    const summary = await scanLogIncremental(reader, [null, null], INCARNATION, {
-      part(frame) {
-        staged.push({ lsn: frame.lsn, body: frame.body.slice() });
+    const summary = await scanLogIncremental(
+      reader,
+      [null, null],
+      INCARNATION,
+      {
+        part(frame) {
+          staged.push({ lsn: frame.lsn, body: frame.body.slice() });
+        },
+        commit(transaction) {
+          committed.push({
+            transaction,
+            lsns: staged.map((part) => part.lsn),
+            checksum: staged.reduce(
+              (sum, part) => (sum + (part.body[0] ?? 0) + part.body.length) | 0,
+              0,
+            ),
+          });
+          staged = [];
+        },
+        abandon(parts) {
+          abandoned = parts;
+          staged = [];
+        },
       },
-      commit(transaction) {
-        committed.push({
-          transaction,
-          lsns: staged.map((part) => part.lsn),
-          checksum: staged.reduce(
-            (sum, part) => (sum + (part.body[0] ?? 0) + part.body.length) | 0,
-            0,
-          ),
-        });
-        staged = [];
-      },
-      abandon(parts) {
-        abandoned = parts;
-        staged = [];
-      },
-    });
+      unlimited,
+    );
     const whole = scanLog(bytes, [null, null], INCARNATION);
     expect(largestRead).toBeLessThanOrEqual(CAP);
     expect(totalRead).toBeLessThan(bytes.length + 64 * frames.length);
@@ -307,8 +318,127 @@ describe("incremental recovery scan (review A1-2 finding 10)", () => {
     };
     const sink = { part: () => undefined, commit: () => undefined, abandon: () => undefined };
     const missing = header({ ackEnd: bytes.length + 40, ackChain: 1, ackLsn: 3 });
-    await expect(scanLogIncremental(reader, [missing, null], INCARNATION, sink)).rejects.toThrow(
-      LogCorruptionError,
+    await expect(
+      scanLogIncremental(reader, [missing, null], INCARNATION, sink, unlimited),
+    ).rejects.toThrow(LogCorruptionError);
+  });
+});
+
+describe("recovery memory (review A1-3 finding 7)", () => {
+  const MiB = 1024 * 1024;
+  const reader = (bytes: Uint8Array, reads: number[] = []) => ({
+    length: bytes.length,
+    read: async (offset: number, length: number) => {
+      reads.push(length);
+      return bytes.slice(offset, offset + length);
+    },
+  });
+
+  it("caps frames at 1 MiB, so large commits go multipart", () => {
+    expect(frameLength(MAX_FRAME_BODY_BYTES)).toBe(MAX_FRAME_BYTES);
+    expect(() =>
+      encodeFrame(
+        { salt: SALT, lsn: 1, partIndex: 0, partCount: 1 },
+        new Uint8Array(MAX_FRAME_BODY_BYTES + 1),
+        SALT,
+      ),
+    ).toThrow(RangeError);
+  });
+
+  it("scans maximum-size frames inside its admitted minimum under a real Governor", async () => {
+    const governor = new Governor(16 * MiB);
+    const grant = await governor.admit({
+      label: "recovery",
+      minimumBytes: RECOVERY_SCAN_BYTES,
+      spillable: false,
+    });
+    const frames = transactions([1, 3], SALT, 1, MAX_FRAME_BODY_BYTES);
+    const bytes = concat(frames.map((f) => f.bytes));
+    const reads: number[] = [];
+    let peak = 0;
+    let committed = 0;
+    const summary = await scanLogIncremental(
+      reader(bytes, reads),
+      [null, null],
+      INCARNATION,
+      {
+        part() {
+          peak = Math.max(peak, grant.allocated);
+        },
+        commit() {
+          committed += 1;
+        },
+        abandon: () => undefined,
+      },
+      grant,
     );
+    expect(committed).toBe(2);
+    expect(summary.validEnd).toBe(4 * MAX_FRAME_BYTES);
+    expect(Math.max(...reads)).toBe(MAX_FRAME_BYTES);
+    expect(peak).toBe(RECOVERY_SCAN_BYTES);
+    expect(grant.allocated).toBe(0);
+    expect(governor.peakBytes).toBeLessThanOrEqual(governor.capBytes);
+    grant.close();
+  });
+
+  it("refuses to start without its minimum, before reading anything", async () => {
+    const governor = new Governor(16 * MiB);
+    const small = await governor.admit({ label: "small", minimumBytes: 4096, spillable: false });
+    const reads: number[] = [];
+    await expect(
+      scanLogIncremental(
+        reader(new Uint8Array(64), reads),
+        [null, null],
+        INCARNATION,
+        { part: () => undefined, commit: () => undefined, abandon: () => undefined },
+        small,
+      ),
+    ).rejects.toThrow(RangeError);
+    expect(reads).toEqual([]);
+    small.close();
+  });
+
+  it("abandons staged parts and frees its memory when the sink or validation fails", async () => {
+    const governor = new Governor(16 * MiB);
+    const grant = await governor.admit({
+      label: "recovery",
+      minimumBytes: RECOVERY_SCAN_BYTES,
+      spillable: false,
+    });
+    const frames = transactions([1, 3], SALT, 1, 64);
+    const bytes = concat(frames.map((f) => f.bytes));
+    const abandoned: number[] = [];
+    const failing = {
+      part: () => undefined,
+      commit(transaction: number) {
+        if (transaction === 2) throw new Error("sink failed");
+      },
+      abandon(parts: number) {
+        abandoned.push(parts);
+      },
+    };
+    await expect(
+      scanLogIncremental(reader(bytes), [null, null], INCARNATION, failing, grant),
+    ).rejects.toThrow("sink failed");
+    expect(abandoned).toEqual([3]);
+    expect(grant.allocated).toBe(0);
+    // Validation fails after parts of an incomplete transaction were delivered: same cleanup.
+    abandoned.length = 0;
+    const [firstEnd = 0] = ends(frames);
+    const ack = header({ ackEnd: bytes.length + 8, ackChain: 1, ackLsn: 9 });
+    const partial = bytes.slice(0, firstEnd + 2 * (frames[1]?.bytes.length ?? 0));
+    await expect(
+      scanLogIncremental(
+        reader(partial),
+        [ack, null],
+        INCARNATION,
+        { ...failing, commit: () => undefined },
+        grant,
+      ),
+    ).rejects.toThrow(LogCorruptionError);
+    expect(abandoned).toEqual([2]);
+    expect(grant.allocated).toBe(0);
+    grant.close();
+    expect(governor.usedBytes).toBe(0);
   });
 });
