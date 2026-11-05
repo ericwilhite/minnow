@@ -5,12 +5,9 @@
  * `StreamDictionaries`, applying frame-level dictionary deltas in frame order, including frames
  * that reuse earlier entries without sending new ones.
  *
- * `StreamDictionaries` below is a faithful copy of B5's client contract (rebuild/owner e460360,
- * owner/frame.ts): deltas appended in frame order, entries kept as the chunks that arrived (no
- * copy), a delta that does not start at the dictionary's current size is a protocol error. It
- * consumes the frame-level `dictionaries` deltas of R16.5 instead of B5's per-column ones. B5
- * replaces this copy with its own class (importing the payload type from exec/result.ts) and
- * keeps this test.
+ * `StreamDictionaries` is B5's client class (owner/frame.ts): deltas appended in frame order,
+ * entries kept as the chunks that arrived (no copy); a delta that does not start at the
+ * dictionary's current size, or a frame out of sequence, is a protocol error.
  */
 import { describe, expect, it } from "vitest";
 import type { OutputColumn } from "../ir/ir.js";
@@ -21,43 +18,8 @@ import {
   type ResultFrame,
   type WireFlat,
 } from "../exec/result.js";
+import { StreamDictionaries } from "../owner/frame.js";
 import { decodeUtf8 } from "../vector/varlen.js";
-
-/** B5's client-side dictionaries, consuming frame-level deltas. */
-class StreamDictionaries {
-  readonly #dictionaries = new Map<number, { size: number; readonly parts: WireFlat[] }>();
-
-  /** Applies a frame's deltas, in order, before its columns are read. */
-  apply(frame: FramePayload): void {
-    for (const delta of frame.dictionaries) {
-      let dictionary = this.#dictionaries.get(delta.id);
-      if (dictionary === undefined) {
-        dictionary = { size: 0, parts: [] };
-        this.#dictionaries.set(delta.id, dictionary);
-      }
-      if (delta.from !== dictionary.size)
-        throw new RangeError(
-          `Dictionary ${String(delta.id)} delta starts at ${String(delta.from)}, expected ${String(dictionary.size)}`,
-        );
-      dictionary.parts.push(delta.values);
-      dictionary.size += delta.values.length;
-    }
-  }
-
-  size(id: number): number {
-    return this.#dictionaries.get(id)?.size ?? 0;
-  }
-
-  /** The chunk holding `code`, and the code's index inside it. */
-  locate(id: number, code: number): { readonly entries: WireFlat; readonly index: number } {
-    let index = code;
-    for (const entries of this.#dictionaries.get(id)?.parts ?? []) {
-      if (index < entries.length) return { entries, index };
-      index -= entries.length;
-    }
-    throw new RangeError(`Code ${String(code)} is outside dictionary ${String(id)}`);
-  }
-}
 
 const TEXT = { kind: "text" } as const;
 const INT = { kind: "int32", bits: 32 } as const;
@@ -206,6 +168,16 @@ describe("B4 frames decoded by B5's StreamDictionaries", () => {
   it("refuses a delta that skips entries (a lost or reordered frame)", () => {
     const client = new StreamDictionaries();
     const later = dictionaryFrame([2], [1], [{ id: 0, from: 2, values: varlen(["blue"]) }]);
-    expect(() => client.apply({ ...later.payload, sequence: 2 })).toThrow(RangeError);
+    expect(() => client.apply({ ...later.payload, sequence: 0 })).toThrow(
+      /delta starts at 2, expected 0/u,
+    );
+  });
+
+  it("refuses a frame out of sequence", () => {
+    const client = new StreamDictionaries();
+    const later = dictionaryFrame([0], [1], [{ id: 0, from: 0, values: varlen(["blue"]) }]);
+    expect(() => client.apply({ ...later.payload, sequence: 2 })).toThrow(
+      /Frame 2 arrived, expected 0/u,
+    );
   });
 });
