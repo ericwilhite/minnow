@@ -195,9 +195,9 @@ describe("published core tarball", () => {
       // (about 1,004,000 measured), 1,007,000 for ordered live aggregate output (1,006,355
       // measured), 1,011,000 when older tabs step aside for a newer build (1,010,358
       // measured), and 1,012,000 when a swept spill owner takes its pages and the conformance kit
-      // checks it (1,011,923 measured), then 1,015,000 with checked integer execution;
-      // ratchets, not targets. The rebased package measurement is recorded in the follow-up.
-      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_015_000);
+      // checks it (1,011,923 measured), then 1,014,000 with typed integer execution
+      // (1,013,733 measured); ratchets, not targets.
+      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_014_000);
       expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_500_000);
       const emitted = await readFile(join(isolatedCore, "dist", "engine", "optimizer.js"), "utf8");
       expect(emitted).not.toContain("/**");

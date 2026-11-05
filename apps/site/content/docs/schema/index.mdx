@@ -57,9 +57,10 @@ reads and writes JSON text but gives the [Kysely adapter](/docs/adapters/kysely)
 traversal. `column.date()` is a zoneless calendar date: it validates canonical `YYYY-MM-DD` text
 and never adds a time or UTC offset.
 
-Integer arithmetic refuses results outside the safe-integer range with `RangeError`. Number
-`SUM` and `AVG` also refuse an unsafe partial sum of safe integer contributions; cast the input
-to `NUMERIC` when larger exact results are needed. See [SQL types](/docs/sql/ddl).
+Integer arithmetic refuses results outside the safe-integer range with `RangeError`.
+`SUM` and `AVG` with integer-typed arguments also refuse an unsafe partial sum; cast the input
+to `NUMERIC` when larger exact results are needed. `DOUBLE PRECISION` arguments retain approximate
+floating-point aggregation even for whole-valued inputs. See [SQL types](/docs/sql/ddl).
 
 The column modifiers are:
 

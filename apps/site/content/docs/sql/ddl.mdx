@@ -283,9 +283,14 @@ Non-constant integer addition, subtraction, and multiplication throw `RangeError
 result leaves the safe range; they never return a rounded integer. Unary minus, `ABS`,
 remainder, and integer division preserve safe integer inputs. `DIV` and `WIDTH_BUCKET`
 refuse a whole-number result outside the safe range with `RangeError`. `SUM` and `AVG` retain their
-number result contract: summing safe integer contributions throws `RangeError` as soon as a
+number result contract: an integer-typed argument throws `RangeError` as soon as a
 partial sum leaves the safe range, even if later cancellation or division would bring it back.
 This also applies to grouped, DISTINCT, live, and window aggregates, including running sums.
+`DOUBLE PRECISION` arguments retain approximate floating-point accumulation even when every
+value happens to be a whole number. A numeric input of unknown SQL type uses
+floating-point accumulation. A bound JavaScript number follows literal typing: a safe whole
+number is integer, while a fractional or unsafe whole number is floating point. Use an explicit
+`CAST(value AS DOUBLE PRECISION)` to request floating-point aggregation regardless of value.
 Integer intermediates in UPDATE, ON CONFLICT, MERGE, and trigger assignments have the same
 range checks, even when a later operation would return to the safe range. Sequence expressions
 (`NEXTVAL` and `CURRVAL`) and SQL defaults use these checks too. Untyped text operands in

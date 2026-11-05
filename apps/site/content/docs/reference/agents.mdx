@@ -119,9 +119,9 @@ machines: https://minnowdb.com/llms.txt
   writes. New enforced references validate existing rows before attachment. Existing enforced
   references cannot change enforcement, target, or deletion policy, or be dropped by migration.
 - Non-constant integer `+`, `-`, and `*` throw `RangeError` outside the safe-integer range.
-  `SUM` and `AVG` over safe integer contributions also throw if any partial sum leaves that
+  `SUM` and `AVG` over integer-typed arguments also throw if any partial sum leaves that
   range (including grouped, live, and window queries). Cast the input to `NUMERIC` for larger
-  exact results. Sequence expressions and SQL defaults use the same integer checks. `DIV` and `WIDTH_BUCKET` also refuse unsafe whole-number results. Constant arithmetic retains the decimal-string rule below.
+  exact results. `DOUBLE PRECISION` aggregates retain approximate arithmetic, including whole-valued inputs. Sequence expressions and SQL defaults use the same integer checks. `DIV` and `WIDTH_BUCKET` also refuse unsafe whole-number results. Constant arithmetic retains the decimal-string rule below.
 - `INTEGER`, `BIGINT`, and `SMALLINT` accept only JavaScript safe integers, and `/` between two
   integers (columns, constants, `COUNT`, integer aggregates) truncates toward zero as in
   PostgreSQL: `7 / 2` is `3`. Divide by `2.0` or a `DOUBLE PRECISION`/`NUMERIC` operand for a

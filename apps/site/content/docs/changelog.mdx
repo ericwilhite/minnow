@@ -8,20 +8,28 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
-## Unreleased patch
+## 0.19.3 — November 5, 2026
 
-Planned package: `@minnowdb/core`.
+Release packages: `@minnowdb/core@0.19.3`.
 
-- Integer arithmetic now throws `RangeError` when a result leaves JavaScript's safe
-  integer range. `DIV` and `WIDTH_BUCKET` also refuse unsafe whole-number results. Number `SUM` and `AVG`, including grouped, live, and window variants, refuse an
-  unsafe partial sum of safe integer contributions instead of silently rounding. Cast inputs to
-  `NUMERIC` for larger exact calculations. Constant arithmetic beyond the safe range returns an
-  exact decimal string.
+- **Integer results are exact or an error, never silently rounded.** Integer arithmetic past
+  JavaScript's safe integer range returned a rounded number: `9007199254740991 + 2` on an integer
+  column gave `9007199254740992`. It now throws `RangeError`, as PostgreSQL refuses out-of-range
+  integer arithmetic. The same applies to integer `SUM` and `AVG` (grouped, live and window
+  variants), `DIV` and `WIDTH_BUCKET`, and to integer values written by `UPDATE`, `ON CONFLICT`,
+  `MERGE`, triggers, generated columns, `CHECK`, sequences and defaults.
+  - Integer `SUM` and `AVG` refuse as soon as a running sum leaves the safe range, even when a
+    later negative value would bring the total back.
+  - Cast inputs to `NUMERIC` for larger exact calculations.
+  - Constant arithmetic beyond the safe range still returns an exact decimal string.
+  - `DOUBLE PRECISION` arithmetic and aggregates stay approximate floating point, including when
+    the values happen to be whole numbers.
 
-The main entry measures 338.0 KiB gzipped (previously 336.8 KiB); the engine with OPFS
-measures 442.3 KiB (previously 441.4 KiB).
+SIZES_PLACEHOLDER
 
-No stored format changes or data migration. Existing databases open automatically.
+No stored format changes: IndexedDB schema 8 and OPFS layout 13 are unchanged, and 0.19.2 opens
+every database this release writes. No data migration or export/import step is needed. Values
+already rounded by an earlier release stay as they were stored.
 
 ## 0.19.2 — November 5, 2026
 

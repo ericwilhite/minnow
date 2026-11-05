@@ -5,12 +5,8 @@ export function checkedInteger(value: number): number {
   return value;
 }
 
-/** Also protects untyped numeric accumulators when their contributions are exact integers. */
-export function checkedSum(left: number, right: number): number {
+/** Only the planner's integer domain requires exact integer accumulation. */
+export function checkedSum(left: number, right: number, integer: boolean): number {
   const result = left + right;
-  // In-range integer sums are exact; floating sums retain their existing number semantics.
-  if (Math.abs(result) <= Number.MAX_SAFE_INTEGER) return result;
-  return Number.isSafeInteger(left) && Number.isSafeInteger(right)
-    ? checkedInteger(result)
-    : result;
+  return integer ? checkedInteger(result) : result;
 }

@@ -114,3 +114,15 @@ export const INTEGER_ARITHMETIC_EXACTNESS_STATES = [
   "integer text refusal",
   "fractional text refusal",
 ] as const;
+
+/** DOUBLE aggregates retain float arithmetic regardless of whole-valued contributions. */
+export const DOUBLE_AGGREGATE_STATES = [
+  "positive whole safe inputs",
+  "negative whole safe inputs",
+  "positive whole unsafe inputs",
+  "negative whole unsafe inputs",
+  "fractional inputs",
+  "dictionary",
+  "window",
+  "unknown inputs",
+] as const;

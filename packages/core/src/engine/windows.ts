@@ -84,7 +84,7 @@ class FrameAggregate {
     }
     if (typeof left !== "number" || typeof right !== "number")
       throw new TypeError("Window SUM requires numeric values");
-    return checkedSum(left, right);
+    return checkedSum(left, right, this.#window.integerArgument === true);
   }
 
   /** Prefixes grow without subtraction, so each input is combined once without a range tree. */

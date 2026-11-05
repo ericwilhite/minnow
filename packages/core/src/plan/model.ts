@@ -238,6 +238,8 @@ export type Expression =
        * this the internal division cannot know the digits the declared scale will render.
        */
       avgArgumentScale?: number;
+      /** SUM/AVG argument has SQL integer type; whole-valued DOUBLE inputs do not. */
+      integerArgument?: true;
       /** Declared NUMERIC scales retained by text-rendering scalar arguments. */
       argumentDisplayScales?: Array<number | null>;
     }
@@ -316,6 +318,8 @@ export interface WindowSpec {
   partitionAliases: string[];
   orderAliases: Array<{ alias: string; direction: "asc" | "desc"; nulls?: "first" | "last" }>;
   argumentAlias?: string;
+  /** SUM/AVG argument has SQL integer type. */
+  integerArgument?: true;
   offset?: number;
   fallback?: QueryValue;
   frame?: WindowFrame;

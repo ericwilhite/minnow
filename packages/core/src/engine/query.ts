@@ -2560,6 +2560,18 @@ function bindExpression(expression: Expression, values: readonly QueryParameter[
   }
   if (expression.kind === "call") {
     expression.arguments = expression.arguments.map((argument) => bindExpression(argument, values));
+    const argument = expression.arguments[0];
+    if (
+      expression.integerArgument === true &&
+      argument !== undefined &&
+      !integerTypedExpression(
+        argument,
+        () => true,
+        () => true,
+      )
+    ) {
+      delete expression.integerArgument;
+    }
     for (const order of expression.aggregateOrderBy ?? []) {
       order.expression = bindExpression(order.expression, values);
     }
@@ -2780,7 +2792,24 @@ function bindBlock(block: CompiledQuery, values: readonly QueryParameter[]): voi
   for (const source of [block.base, ...block.joins]) {
     if (source.derived !== undefined) bindBlock(source.derived, values);
     for (const member of source.union?.blocks ?? []) bindBlock(member, values);
-    if (source.windowed !== undefined) bindBlock(source.windowed.block, values);
+    if (source.windowed !== undefined) {
+      bindBlock(source.windowed.block, values);
+      for (const window of source.windowed.windows) {
+        const argument = source.windowed.block.select.find(
+          (item) => item.alias === window.argumentAlias,
+        )?.expression;
+        if (
+          window.integerArgument === true &&
+          argument !== undefined &&
+          !integerTypedExpression(
+            argument,
+            () => true,
+            () => true,
+          )
+        )
+          delete window.integerArgument;
+      }
+    }
     if (source.recursive !== undefined) {
       bindBlock(source.recursive.base, values);
       bindBlock(source.recursive.step, values);
@@ -2842,6 +2871,7 @@ export function bindPlanParameters(
   const clone = clonePlanTree(plan);
   bindBlock(clone, params ?? []);
   delete clone.parameterCount;
+  annotatePlanIntegerDivision(clone);
   // A placeholder that has just become a Date literal can now take the range rewrite the
   // optimizer applies to literal calendar equalities at compile time.
   if (clone.optimized === true) rewriteBoundCalendarEqualities(clone);
@@ -4502,6 +4532,20 @@ export function annotateIntegerDivision(
       tableDatetimes,
     );
   }
+  if (expression.kind === "call" && (expression.name === "SUM" || expression.name === "AVG")) {
+    const argument = expression.arguments[0];
+    if (
+      argument !== undefined &&
+      integerTypedExpression(
+        argument,
+        columnInteger,
+        tableIntegerColumns,
+        columnDatetime,
+        tableDatetimes,
+      )
+    )
+      expression.integerArgument = true;
+  }
   if (
     expression.kind === "binary" &&
     expression.operator !== "||" &&
@@ -4657,6 +4701,23 @@ export function annotatePlanIntegerDivision(
   forEachNestedBlock(plan, (nested) =>
     annotatePlanIntegerDivision(nested, tableIntegerColumns, tableDatetimes),
   );
+  for (const source of [plan.base, ...plan.joins]) {
+    if (source.windowed === undefined) continue;
+    const inputs = blockIntegerOutputs(
+      source.windowed.block,
+      tableIntegerColumns,
+      undefined,
+      tableDatetimes,
+    );
+    for (const window of source.windowed.windows) {
+      if (
+        (window.name === "SUM" || window.name === "AVG") &&
+        window.argumentAlias !== undefined &&
+        (inputs === true || inputs.has(window.argumentAlias))
+      )
+        window.integerArgument = true;
+    }
+  }
   const resolver = blockColumnIntegerResolver(plan, tableIntegerColumns, tableDatetimes);
   const datetimeResolver = blockColumnDatetimeResolver(plan, tableDatetimes);
   forEachBlockExpression(plan, (expression) =>
@@ -4697,11 +4758,36 @@ export function planMayHaveIntegerDivision(plan: CompiledQuery): boolean {
       state.found = true;
       return;
     }
+    if (
+      expression.kind === "call" &&
+      (expression.name === "SUM" || expression.name === "AVG") &&
+      expression.integerArgument !== true &&
+      expression.arguments[0] !== undefined &&
+      integerTypedExpression(
+        expression.arguments[0],
+        optimistic,
+        everyColumn,
+        optimisticDate,
+        everyColumnDate,
+      )
+    ) {
+      state.found = true;
+      return;
+    }
     childExpressions(expression).forEach(probe);
   };
   forEachNestedBlock(plan, (nested) => {
     if (!state.found && planMayHaveIntegerDivision(nested)) state.found = true;
   });
+  for (const source of [plan.base, ...plan.joins]) {
+    if (
+      source.windowed?.windows.some(
+        (window) =>
+          (window.name === "SUM" || window.name === "AVG") && window.integerArgument !== true,
+      )
+    )
+      state.found = true;
+  }
   if (!state.found) forEachBlockExpression(plan, probe);
   return state.found;
 }
@@ -6695,12 +6781,15 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
           });
         }
         if (expression.name === "COUNT") return values.length;
-        if (expression.name === "SUM") return values.length === 0 ? null : sumNumericValues(values);
+        if (expression.name === "SUM")
+          return values.length === 0
+            ? null
+            : sumNumericValues(values, expression.integerArgument === true);
         if (expression.name === "AVG")
           return values.length === 0
             ? null
             : (() => {
-                const sum = sumNumericValues(values);
+                const sum = sumNumericValues(values, expression.integerArgument === true);
                 return (
                   exactNumericBinary("/", sum, values.length, expression.avgArgumentScale) ??
                   numeric(sum) / values.length
@@ -7843,13 +7932,13 @@ export function numeric(value: unknown): number {
   return value;
 }
 
-function sumNumericValues(values: readonly unknown[]): unknown {
+function sumNumericValues(values: readonly unknown[], integer: boolean): unknown {
   let total = values[0];
   if (total === undefined) return null;
   for (let index = 1; index < values.length; index += 1) {
     const value = values[index];
     const exact = exactNumericBinary("+", total, value);
-    total = exact === undefined ? checkedSum(numeric(total), numeric(value)) : exact;
+    total = exact === undefined ? checkedSum(numeric(total), numeric(value), integer) : exact;
   }
   return total;
 }

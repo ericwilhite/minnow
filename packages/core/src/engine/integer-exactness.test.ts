@@ -3,6 +3,7 @@ import fc from "fast-check";
 import { seedsFor } from "../testing/seeds.js";
 import {
   createReach,
+  DOUBLE_AGGREGATE_STATES,
   INTEGER_ARITHMETIC_EXACTNESS_STATES,
   INTEGER_MUTATION_EXACTNESS_STATES,
 } from "../testing/reach.js";
@@ -16,9 +17,11 @@ import {
   executeRowQuery,
 } from "./query.js";
 
+const doubleReach = createReach("double-aggregate-exactness", DOUBLE_AGGREGATE_STATES);
 const reach = createReach("integer-exactness", INTEGER_ARITHMETIC_EXACTNESS_STATES);
 const mutationReach = createReach("integer-mutation-exactness", INTEGER_MUTATION_EXACTNESS_STATES);
 afterAll(() => {
+  doubleReach.assertReached();
   reach.assertReached();
   mutationReach.assertReached();
 });
@@ -136,6 +139,126 @@ describe("integer exactness", () => {
       );
     });
   }
+
+  for (const seed of seedsFor("double-aggregate-exactness", [11, 47, 101])) {
+    it(`preserves typed DOUBLE aggregates at integer boundaries, seed ${String(seed)}`, () => {
+      fc.assert(
+        fc.property(
+          fc.boolean(),
+          fc.integer({ min: 0, max: 32 }),
+          fc.constantFrom("whole safe inputs", "whole unsafe inputs", "fractional inputs"),
+          (negative, offset, kind) => {
+            doubleReach.beginHistory();
+            const sign = negative ? -1 : 1;
+            const d =
+              sign *
+              (kind === "whole safe inputs"
+                ? Number.MAX_SAFE_INTEGER - offset
+                : kind === "whole unsafe inputs"
+                  ? 2 ** 53 + offset * 2
+                  : 2 ** 51 + offset + 0.5);
+            const values = [d, d, 0.5];
+            doubleReach.reach(
+              kind === "fractional inputs" ? kind : `${negative ? "negative" : "positive"} ${kind}`,
+            );
+            const rows = values.map((d, id) => ({ d, id, g: "a", k: 0 }));
+            for (const sql of [
+              "SELECT SUM(d) AS v FROM t",
+              "SELECT AVG(d) AS v FROM t",
+              "SELECT SUM(DISTINCT d) AS v FROM t",
+              "SELECT SUM(d) AS v FROM t GROUP BY g",
+              "SELECT SUM(d) AS v FROM t GROUP BY k",
+              "SELECT SUM(d) AS v FROM t GROUP BY g, k",
+              "SELECT SUM(d + 0) AS v FROM t",
+              "SELECT SUM(CASE WHEN g = 'a' THEN d ELSE 0 END) AS v FROM t",
+              "SELECT SUM(d) OVER (ORDER BY id) AS v FROM t",
+              "SELECT AVG(d) OVER (ORDER BY id) AS v FROM t",
+              "SELECT SUM(d) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS v FROM t",
+            ]) {
+              const contributions = sql.includes("DISTINCT")
+                ? [...new Set(values)]
+                : sql.includes("1 PRECEDING")
+                  ? values.slice(-2)
+                  : values;
+              const total = contributions.reduce((a, b) => a + b, 0);
+              const expected = sql.includes("AVG") ? total / contributions.length : total;
+              for (const execute of [executeQuery, executeRowQuery]) {
+                const plan = compileQuery(sql);
+                annotatePlanIntegerDivision(plan, () => new Set());
+                expect(execute(plan, new Map([["t", rows]])).rows.at(-1)?.v, sql).toBe(expected);
+                // No catalog means the column has no integer declaration, even if every value is whole.
+                expect(execute(compileQuery(sql), new Map([["t", rows]])).rows.at(-1)?.v, sql).toBe(
+                  expected,
+                );
+              }
+              if (sql.includes("GROUP BY g") || sql.includes("CASE"))
+                doubleReach.reach("dictionary");
+              if (sql.includes("OVER")) doubleReach.reach("window");
+            }
+            doubleReach.reach("unknown inputs");
+          },
+        ),
+        { seed, numRuns: 80 },
+      );
+    });
+  }
+
+  it("preserves the five catalog DOUBLE aggregate regressions", async () => {
+    const db = new MinnowDatabase(new MemoryBlockStore());
+    try {
+      await db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, d DOUBLE PRECISION, g TEXT)");
+      await db.execute(
+        "INSERT INTO t VALUES (1, 5000000000000000, 'a'), (2, 5000000000000000, 'a'), (3, 0.5, 'b')",
+      );
+      for (const [sql, expected] of [
+        ["SELECT SUM(d) AS v FROM t", [{ v: 1e16 }]],
+        [
+          "SELECT g, SUM(d) AS v FROM t GROUP BY g ORDER BY g",
+          [
+            { g: "a", v: 1e16 },
+            { g: "b", v: 0.5 },
+          ],
+        ],
+        ["SELECT AVG(d) AS v FROM t", [{ v: 1e16 / 3 }]],
+        ["SELECT SUM(d) OVER (ORDER BY id) AS v FROM t", [{ v: 5e15 }, { v: 1e16 }, { v: 1e16 }]],
+        ["SELECT SUM(CASE WHEN g='a' THEN d ELSE 0 END) AS v FROM t", [{ v: 1e16 }]],
+      ] as const) {
+        expect((await db.query(sql)).rows, sql).toEqual(expected);
+        const rows = [
+          { id: 1, d: 5e15, g: "a" },
+          { id: 2, d: 5e15, g: "a" },
+          { id: 3, d: 0.5, g: "b" },
+        ];
+        for (const execute of [executeQuery, executeRowQuery]) {
+          const plan = compileQuery(sql);
+          annotatePlanIntegerDivision(plan, () => new Set(["id"]));
+          expect(execute(plan, new Map([["t", rows]])).rows, sql).toEqual(expected);
+        }
+      }
+      const rows = [{ id: 1 }, { id: 2 }, { id: 3 }];
+      for (const argument of ["$1", "CASE WHEN id = 1 THEN $1 ELSE 5000000000000000 END"]) {
+        for (const suffix of ["", " OVER (ORDER BY id)"]) {
+          const sql = `SELECT SUM(${argument})${suffix} AS v FROM t`;
+          for (const value of [5e15, 0.5, 1e16]) {
+            const contributions = argument === "$1" ? rows.map(() => value) : [value, 5e15, 5e15];
+            const expected = contributions.reduce((a, b) => a + b, 0);
+            for (const execute of [executeQuery, executeRowQuery]) {
+              const plan = bindPlanParameters(compileQuery(sql), [value]);
+              annotatePlanIntegerDivision(plan, () => new Set(["id"]));
+              const run = () => execute(plan, new Map([["t", rows]]));
+              if (value === 5e15) expect(run).toThrow(RangeError);
+              else expect(run().rows.at(-1)?.v, sql).toBe(expected);
+            }
+            const run = db.query(sql, { params: [value] });
+            if (value === 5e15) await expect(run).rejects.toThrow(RangeError);
+            else expect((await run).rows.at(-1)?.v, sql).toBe(expected);
+          }
+        }
+      }
+    } finally {
+      await db.close();
+    }
+  });
 
   it("refuses oversized integer-valued scalar results", () => {
     for (const execute of [executeQuery, executeRowQuery]) {

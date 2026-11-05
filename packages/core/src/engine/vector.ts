@@ -552,6 +552,7 @@ interface BoundSelectItem {
 }
 
 interface AggregateSpec {
+  readonly integerArgument: boolean;
   readonly name: AggregateName;
   readonly argument: BoundExpression;
   /** Per-row separator for STRING_AGG. */
@@ -1963,6 +1964,7 @@ function bindExpression(
         ? conditionalAggregate(argument)
         : undefined;
     aggregateSpecs.push({
+      integerArgument: expression.integerArgument === true,
       name: expression.name,
       argument,
       ...(conditional === undefined ? {} : { conditional }),
@@ -5314,6 +5316,7 @@ class GroupAccumulator {
     const columns: Array<{
       readonly index: number;
       readonly sums: boolean;
+      readonly integerArgument: boolean;
       readonly rows: Int32Array | undefined;
       readonly values: Float64Array;
       readonly validity: Uint8Array;
@@ -5327,6 +5330,7 @@ class GroupAccumulator {
     const conditionals: Array<{
       readonly index: number;
       readonly sums: boolean;
+      readonly integerArgument: boolean;
       readonly spec: ConditionalAggregate;
       readonly rows: Int32Array | undefined;
       readonly branch: Int32Array;
@@ -5409,6 +5413,7 @@ class GroupAccumulator {
         conditionals.push({
           index,
           sums: spec.sums,
+          integerArgument: plan.aggregates[index]?.integerArgument === true,
           spec: conditional,
           rows: batch.rowsBySource[conditional.source],
           branch: conditional.cache.branch,
@@ -5422,6 +5427,7 @@ class GroupAccumulator {
       columns.push({
         index,
         sums: spec.sums,
+        integerArgument: plan.aggregates[index]?.integerArgument === true,
         rows: batch.rowsBySource[raw.source],
         values: raw.vector.values,
         validity: raw.vector.validity,
@@ -5481,6 +5487,7 @@ class GroupAccumulator {
           state.sums[column.index] = checkedSum(
             state.sums[column.index] ?? 0,
             column.values[slot] ?? 0,
+            column.integerArgument,
           );
         }
       }
@@ -5558,7 +5565,11 @@ class GroupAccumulator {
         if (value === null) continue;
         counts[conditional.index] = (counts[conditional.index] ?? 0) + 1;
         if (conditional.sums) {
-          state.sums[conditional.index] = checkedSum(state.sums[conditional.index] ?? 0, value);
+          state.sums[conditional.index] = checkedSum(
+            state.sums[conditional.index] ?? 0,
+            value,
+            conditional.integerArgument,
+          );
         }
       }
     }
@@ -6096,7 +6107,7 @@ function updateAggregates(
       if (value !== null) {
         state.counts[index] = (state.counts[index] ?? 0) + 1;
         if (spec.name === "SUM" || spec.name === "AVG") {
-          state.sums[index] = checkedSum(state.sums[index] ?? 0, value);
+          state.sums[index] = checkedSum(state.sums[index] ?? 0, value, spec.integerArgument);
         } else if (spec.name === "MIN" || spec.name === "MAX") {
           // A raw number compares as a number. NaN keeps compareValues's place, after every
           // finite value: it is never the minimum and always the maximum once seen.
@@ -6307,7 +6318,7 @@ function applyAggregateValue(
       if (sum === null || sum === undefined) throw new Error("Exact NUMERIC sum disappeared");
       replaceAggregateValue(state, index, sum, `${spec.name} aggregate value`, memory);
     } else {
-      state.sums[index] = checkedSum(state.sums[index] ?? 0, numeric(value));
+      state.sums[index] = checkedSum(state.sums[index] ?? 0, numeric(value), spec.integerArgument);
     }
   } else if (
     spec.name === "MIN" &&
