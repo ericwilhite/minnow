@@ -58,6 +58,17 @@ jobs:
           --out=browser-perf-results
           ${{ inputs.update && '--update' || '' }}
           2>&1 | tee browser-perf.txt
+      - name: Storage microbench (rebuild core, recorded, not judged)
+        # The rebuild core's storage in real Chromium on the runner's disk, OPFS and IndexedDB:
+        # cache hits, a cold coalesced slab read, publish latency, commit latency with and without
+        # a log flush. Recorded nightly next to the lane's results; nothing judges it yet.
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p browser-perf-results
+          npm run benchmark:storage 2>&1 | tee storage-microbench.txt
+          grep -o 'STORAGE_MICROBENCH .*' storage-microbench.txt | sed 's/^STORAGE_MICROBENCH //' \
+            > browser-perf-results/storage-microbench.json
       - name: Upload the results
         if: always()
         uses: actions/upload-artifact@v7
@@ -65,6 +76,7 @@ jobs:
           name: browser-perf
           path: |
             browser-perf.txt
+            storage-microbench.txt
             browser-perf-results/
             packages/core/browser-perf-baseline.json
           retention-days: 90

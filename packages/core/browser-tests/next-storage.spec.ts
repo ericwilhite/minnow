@@ -254,3 +254,116 @@ test.describe("rebuild core storage on IndexedDB", () => {
     }
   });
 });
+
+test.describe("rebuild core storage at scale (heavy, opt-in)", () => {
+  test("multi-GB OPFS: fill, reopen, reclaim, then quota pressure and clean recovery", async ({
+    page,
+    browserName,
+  }, info) => {
+    test.skip(
+      browserName !== "chromium" || process.env.MINNOW_NEXT_STORAGE_HEAVY !== "1",
+      "opt-in, Chromium only (CDP quota override)",
+    );
+    test.setTimeout(3_600_000);
+    const gib = Number(process.env.MINNOW_NEXT_STORAGE_GIB ?? "4");
+    await page.goto("/packages/core/browser/");
+    await requireWorkerOpfs(page);
+    const dir = `heavy-${String(Date.now())}`;
+    const step = (request: Record<string, unknown>) =>
+      page.evaluate(async ([url, body]) => ((await import(url)) as Run).heavyStep(body as never), [
+        RUN,
+        request,
+      ] as const) as Promise<Record<string, unknown>>;
+    const restart = () =>
+      page.evaluate(async (url) => {
+        ((await import(url)) as Run).heavyRestart();
+      }, RUN);
+    const report: Record<string, unknown> = { gib };
+
+    expect(await step({ op: "heavy-open", dir })).toMatchObject({ blobs: 0 });
+    report.fill = await step({ op: "heavy-fill", mib: gib * 1024, publishEveryMib: 256 });
+    expect(report.fill).toMatchObject({ blobs: gib * 1024 });
+
+    // Reopen as a new process: the walk, 64 verified samples and an exact audit.
+    await step({ op: "heavy-close" });
+    await restart();
+    report.reopen = await step({ op: "heavy-open", dir });
+    expect(report.reopen).toMatchObject({ blobs: gib * 1024 });
+
+    // Reclaim: half retired; as much again lands in the freed space, so the space does not grow.
+    report.reclaim = await step({ op: "heavy-reclaim", refillMib: gib * 512 });
+    // (A retired blob at the end shortens the space first; the refill may take that tail again.)
+    const reclaim = report.reclaim as { filled: number; after: number };
+    expect(reclaim.after).toBeLessThanOrEqual(reclaim.filled);
+
+    // Quota pressure: 32 MiB of headroom. Writes fail with StoreQuotaError; the space stays up.
+    const cdp = await page.context().newCDPSession(page);
+    const origin = new URL(page.url()).origin;
+    const { usage } = await page.evaluate(
+      async (url) => ((await import(url)) as Run).storageEstimate(),
+      RUN,
+    );
+    await cdp.send("Storage.overrideQuotaForOrigin", { origin, quotaSize: usage + 32 * 2 ** 20 });
+    try {
+      report.quotaWrite = await step({ op: "heavy-quota-write", mib: 256 });
+      expect(report.quotaWrite).toEqual({ error: "StoreQuotaError", spaceFailed: null });
+      // A root too large for what is left fails inside publish: the space fails (indeterminate).
+      report.quotaPublish = await step({ op: "heavy-quota-publish", fillerMib: 64 });
+      expect(report.quotaPublish).toMatchObject({
+        error: "StoreQuotaError",
+        spaceFailed: "StoreQuotaError",
+      });
+    } finally {
+      await cdp.send("Storage.overrideQuotaForOrigin", { origin });
+    }
+
+    // Recovery: a new process opens to an intact root, audits exactly and keeps writing.
+    await step({ op: "heavy-close" });
+    await restart();
+    report.recovered = await step({ op: "heavy-open", dir });
+    report.after = await step({ op: "heavy-fill", mib: 64, publishEveryMib: 64 });
+    await step({ op: "heavy-close" });
+    await restart();
+    await info.attach("multi-gb-opfs", {
+      body: JSON.stringify(report, null, 2),
+      contentType: "application/json",
+    });
+    console.log(`HEAVY ${JSON.stringify(report)}`);
+    await page.evaluate(
+      async ([url, directory]) => {
+        const run = (await import(url)) as Run;
+        await run.heavyStep({ op: "remove", dir: directory });
+        run.heavyRestart();
+      },
+      [RUN, dir] as const,
+    );
+  });
+});
+
+test.describe("rebuild core storage microbench (recorded nightly)", () => {
+  test("storage microbench: cache hits, cold slab, publish and commit latency", async ({
+    page,
+    browserName,
+  }, info) => {
+    test.skip(process.env.MINNOW_STORAGE_MICROBENCH !== "1", "opt-in: MINNOW_STORAGE_MICROBENCH=1");
+    test.setTimeout(600_000);
+    await page.goto("/packages/core/browser/");
+    await requireWorkerOpfs(page);
+    const metrics = await page.evaluate(async (url) => {
+      return ((await import(url)) as Run).runMicrobench();
+    }, RUN);
+    const result = {
+      recordedAt: new Date().toISOString(),
+      browser: browserName,
+      version: page.context().browser()?.version() ?? null,
+      metrics,
+    };
+    expect(metrics.opfs?.coldSlabPlatformReads).toBe(1);
+    await info.attach("storage-microbench", {
+      body: JSON.stringify(result, null, 2),
+      contentType: "application/json",
+    });
+    // One tagged line: the nightly workflow extracts it into the lane's results.
+    console.log(`STORAGE_MICROBENCH ${JSON.stringify(result)}`);
+  });
+});

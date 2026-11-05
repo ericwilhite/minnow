@@ -171,7 +171,10 @@ is access's `Snapshot`.
 - **The IndexedDB backend** (`indexeddb.ts` over `idb-like.ts`) is the same contract where OPFS is
   absent: the Web Lock plus a durable epoch read inside every read-write transaction (a stale
   owner that never heard of its lock loss, as after Safari's bfcache, changes nothing); byte
-  records keyed by offset, kept disjoint, ArrayBuffers only; relaxed writes batched in call order
+  records of ≤ 256 KiB keyed by offset, kept disjoint, ArrayBuffers only, each with an entry in a
+  companion index store that is loaded at open, so no read or write needs a cursor (`idb-bytes.ts`:
+  Firefox's cursor read the neighbouring record's value and held bulk writes to ~6.7 MB/s; now
+  5× faster end to end); relaxed writes batched in call order
   and committed with each barrier (publish, log flush) in one strict transaction; a malformed or
   exhausted epoch refuses ownership; the spill store. `sim-idb.ts` simulates IndexedDB as a
   checksum-chained write-ahead log on the simulated disk with IndexedDB's request order, activity
@@ -179,6 +182,12 @@ is access's `Snapshot`.
   sweep as the files; the browser suite checks the simulator against real IndexedDB on pinned
   scenarios (`idb-scenarios.ts`) and runs the backend on the persistent profile and in Firefox
   private browsing and a WebKit ephemeral session.
+- At scale: an opt-in Chromium run (`MINNOW_NEXT_STORAGE_HEAVY=1`, `MINNOW_NEXT_STORAGE_GIB`,
+  default 4) fills OPFS with gigabytes of extents, reopens (the walk, samples, an exact audit),
+  reclaims half and refills it in place, then lowers the origin's quota over CDP: writes fail with
+  `StoreQuotaError` while the space stays up, an oversized publish fails and fails the space, and a
+  new owner recovers the last root and keeps writing. `npm run benchmark:storage` records the
+  storage microbench nightly (docs: reference/testing).
 - `select.ts` (`chooseBackend`) picks OPFS where a dedicated worker can open sync handles, else
   IndexedDB only on the private modes' refusals (`SecurityError`, `UnknownError`,
   `NotSupportedError`; other errors propagate), else memory (Safari Lockdown Mode). Before

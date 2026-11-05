@@ -73,8 +73,17 @@ export interface IdbDatabaseLike {
 }
 
 /** The object stores of one database. */
-export const IDB_STORES = ["meta", "roots", "data", "log", "spill"] as const;
-export const IDB_VERSION = 1;
+export const IDB_STORES = [
+  "meta",
+  "roots",
+  "data",
+  "data-index",
+  "log",
+  "log-index",
+  "spill",
+  "spill-index",
+] as const;
+export const IDB_VERSION = 2;
 
 const errorName = (error: unknown): string =>
   typeof error === "object" && error !== null && "name" in error ? String(error.name) : "";
