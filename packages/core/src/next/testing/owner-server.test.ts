@@ -12,7 +12,7 @@ import {
 } from "../owner/errors.js";
 import { PROTOCOL_VERSION, type OwnerMessage } from "../owner/protocol.js";
 import type { ServerPort } from "../owner/server.js";
-import { flushTasks, harness, raw, seed, sleep } from "./owner-harness.js";
+import { flushTasks, flushUntil, harness, raw, seed, sleep } from "./owner-harness.js";
 
 describe("handshake", () => {
   it("welcomes the current protocol and refuses another", async () => {
@@ -121,9 +121,7 @@ describe("RETURNING and the commit order (R2)", () => {
       acknowledgedDurable.push(writePath.durableLsn >= writePath.appliedLsn);
     const client = await connect();
     const created = client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
-    await flushTasks();
-    await writePath.flush();
-    await created;
+    await flushUntil(writePath, created);
     const port = raw(server);
     port.deliver(port.statement(1, "INSERT INTO t VALUES ($1, $2, $3) RETURNING *", [7, 1, "x"]));
     await sleep(10);
@@ -148,9 +146,7 @@ describe("RETURNING and the commit order (R2)", () => {
     const { connect, writePath } = harness({ autoFlush: false });
     const client = await connect();
     const created = client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
-    await flushTasks();
-    await writePath.flush();
-    await created;
+    await flushUntil(writePath, created);
     await client.begin(1);
     const inside = await client.query(
       "INSERT INTO t VALUES ($1, $2, $3) RETURNING *",
@@ -160,9 +156,10 @@ describe("RETURNING and the commit order (R2)", () => {
     expect(inside.rows()).toEqual([[1, 0, "a"]]);
     expect(inside.summary.transaction).toBe("open");
     const commit = client.commit(1);
-    await flushTasks();
-    await writePath.flush();
-    expect((await commit).summary).toMatchObject({ command: "COMMIT", counts: { t: 1 } });
+    expect((await flushUntil(writePath, commit)).summary).toMatchObject({
+      command: "COMMIT",
+      counts: { t: 1 },
+    });
   });
 });
 
@@ -460,9 +457,7 @@ describe("cancellation and the commit boundary (R9)", () => {
     const { connect, writePath } = harness({ autoFlush: false });
     const client = await connect();
     const created = client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
-    await flushTasks();
-    await writePath.flush();
-    await created;
+    await flushUntil(writePath, created);
     const insert = client.send({
       t: "statement",
       session: 0,

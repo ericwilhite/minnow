@@ -172,6 +172,23 @@ export function raw(server: OwnerServer, clientId = "0".repeat(31) + "1", genera
 export const flushTasks = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 export const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Flushes the write path until `promise` settles: a request that reaches the write path after one
+ * flush (a loaded machine) still gets its commit durable, without depending on timing.
+ */
+export async function flushUntil<T>(writePath: StandinWritePath, promise: Promise<T>): Promise<T> {
+  const state = { settled: false };
+  const watched = promise.finally(() => {
+    state.settled = true;
+  });
+  watched.catch(() => undefined);
+  for (let round = 0; round < 5_000 && !state.settled; round++) {
+    await writePath.flush();
+    await new Promise<void>((resolve) => setTimeout(resolve, 1));
+  }
+  return watched;
+}
+
 export async function seed(client: ProtocolClient, rows = 3): Promise<void> {
   await client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
   for (let id = 1; id <= rows; id++)

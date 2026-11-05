@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { ProtocolClient } from "../owner/client.js";
-import { flushTasks, harness, raw, seed, sleep } from "./owner-harness.js";
+import { flushUntil, harness, raw, seed, sleep } from "./owner-harness.js";
 
 /** A fake port for client-only probes: answers hello (and prepare) and records what is sent. */
 function fakePort(onSend: (message: Record<string, unknown>) => void = () => undefined) {
@@ -254,8 +254,7 @@ describe("frames and their charge (findings 9, 10, 12)", () => {
     });
     await sleep(10);
     const premature = answered;
-    await writePath.flush();
-    await query;
+    await flushUntil(writePath, query);
     expect(premature).toBe(false);
   });
 
@@ -263,14 +262,11 @@ describe("frames and their charge (findings 9, 10, 12)", () => {
     const { connect, writePath, governor } = harness({ autoFlush: false });
     const client = await connect();
     const created = client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
-    await flushTasks();
-    await writePath.flush();
-    await created;
+    await flushUntil(writePath, created);
     const insert = client.query("INSERT INTO t VALUES ($1, $2, $3) RETURNING *", [1, 0, "a"]);
     await sleep(10);
     expect(governor.usedBytes).toBeGreaterThan(0); // the spool, before the commit is durable
-    await writePath.flush();
-    expect((await insert).rows()).toEqual([[1, 0, "a"]]);
+    expect((await flushUntil(writePath, insert)).rows()).toEqual([[1, 0, "a"]]);
     await sleep(5);
     expect(governor.usedBytes).toBe(0); // released on receipt, grant closed
   });
