@@ -19,7 +19,8 @@
  * `1` < `[1]`.
  *
  * `parseJsonb` accepts exactly PostgreSQL's JSON: whitespace is space, tab, LF, CR only; numbers
- * have no leading zeros, `+`, bare `.` or trailing `.`; strings have no raw control characters,
+ * have no leading zeros, `+`, bare `.` or trailing `.`, and fit NUMERIC (|exponent| ≤ 2^30 − 1,
+ * display scale ≤ 16,383, ≤ 131,072 digits before the point); strings have no raw control characters,
  * no `\u0000`, and no unpaired surrogate (escaped or raw).
  *
  * ## SQL arrays (PostgreSQL's array_cmp)
@@ -224,6 +225,10 @@ const ESCAPES: Readonly<Record<string, string>> = {
   t: "\t",
 };
 
+const NUMERIC_EXPONENT_LIMIT = 1_073_741_823;
+const NUMERIC_MAX_DISPLAY_SCALE = 16_383;
+const NUMERIC_MAX_INTEGER_DIGITS = 131_072;
+
 /** Parses PostgreSQL JSON into a JsonbValue: exact numbers, last duplicate key wins, keys sorted. */
 export function parseJsonb(text: string): JsonbValue {
   let position = 0;
@@ -325,12 +330,19 @@ export function parseJsonb(text: string): JsonbValue {
     position += match[0].length;
     if (/^[\d.]/u.test(text[position] ?? "")) fail("malformed number");
     const [, whole = "", fraction = "", exponent = "0"] = match;
+    // PostgreSQL NUMERIC's limits (checked against PGlite): an exponent of at most 2^30 − 1 in
+    // magnitude (inclusive), a display scale of at most 16,383, and at most 131,072 digits before
+    // the point.
+    const power = exponent.replace(/^[+-]?0*/u, "").length > 10 ? Infinity : Number(exponent);
+    if (!(Math.abs(power) <= NUMERIC_EXPONENT_LIMIT)) fail("numeric exponent out of range");
+    const scale = fraction.length - power;
+    if (scale > NUMERIC_MAX_DISPLAY_SCALE) fail("numeric scale out of range");
+    const significant = (whole + fraction).replace(/^0+/u, "").length;
+    if (significant > 0 && significant - scale > NUMERIC_MAX_INTEGER_DIGITS)
+      fail("numeric value out of range");
     const digits = BigInt(whole + fraction);
     return {
-      number: {
-        coefficient: match[0].startsWith("-") ? -digits : digits,
-        scale: fraction.length - Number(exponent),
-      },
+      number: { coefficient: match[0].startsWith("-") ? -digits : digits, scale },
     };
   };
   const result = value();

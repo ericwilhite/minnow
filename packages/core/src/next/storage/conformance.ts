@@ -131,6 +131,7 @@ export const storeConformanceCases: readonly ConformanceCase[] = [
       await second.session.publish(bytes(7));
       await second.session.publish(bytes(8));
       assert(equal(await second.session.readRoot(), bytes(8)), "newest root");
+      assert(equal(await second.session.readPreviousRoot(), bytes(7)), "previous root survives");
       await second.lease.release();
     },
   },

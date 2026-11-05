@@ -22,11 +22,14 @@
  * holds them as **staged** under the transaction's id (`TableRoot.staged`: present, invisible),
  * and only then logs its commit frame with a `publishedRows` effect naming that root's sequence.
  * The frame is the commit point. Replay of `publishedRows` at LSN L:
+ * - follows the rows rule for an absent table: skipped when the table was dropped by a checkpointed
+ *   drop (L ≤ globalLsn), corruption for an unknown table or after the drop;
  * - skipped when L ≤ T.flushedThroughLsn: a later root already folded the rows in (so it is never
  *   applied twice);
  * - otherwise the durable root must be at least the named root (else the root was rolled back:
  *   corruption) and must still stage that transaction (else corruption); applying makes the
- *   staged rows visible and consumes the staging.
+ *   staged rows and their staged index runs visible together, and consumes the staging. The frame
+ *   names the indexes it built runs for; if they differ from the staged runs, replay refuses.
  * After replay, staging no frame claimed belongs to a transaction that never committed: recovery
  * drops it (`Replayer.unclaimedStaging`), and its extents become free at the next publish. A root
  * that folds staged rows into the table's groups sets `flushedThroughLsn ≥ L` and removes the
@@ -59,8 +62,13 @@ import { LogCorruptionError } from "./log-frame.js";
 export interface TableCheckpoint {
   readonly flushedThroughLsn: number;
   readonly schemaVersion: number;
-  /** Transactions whose rows this root stages (published, not yet visible). */
-  readonly staged?: ReadonlySet<number>;
+  /** Transactions this root stages (rows and their index runs, published, not yet visible). */
+  readonly staged?: ReadonlyMap<number, StagedTransaction>;
+}
+
+/** A staged transaction as the root holds it: its row groups and the indexes it has runs for. */
+export interface StagedTransaction {
+  readonly indexIds: readonly number[];
 }
 
 export interface ReplayCheckpoint {
@@ -88,13 +96,15 @@ export type Effect =
       readonly transaction: number;
       /** Sequence of the root that staged them. */
       readonly rootSequence: number;
+      /** The indexes whose staged runs become visible with the rows. */
+      readonly indexIds: readonly number[];
     };
 
 export class Replayer {
   readonly #globalLsn: number;
   readonly #rootSequence: number;
   readonly #tables: Map<number, TableCheckpoint>;
-  readonly #unclaimed = new Map<number, Set<number>>();
+  readonly #unclaimed = new Map<number, Map<number, StagedTransaction>>();
   #nextTableId: number;
   #lastLsn = 0;
 
@@ -105,13 +115,24 @@ export class Replayer {
     this.#tables = new Map(checkpoint.tables);
     for (const [tableId, table] of checkpoint.tables)
       if (table.staged !== undefined && table.staged.size > 0)
-        this.#unclaimed.set(tableId, new Set(table.staged));
+        this.#unclaimed.set(tableId, new Map(table.staged));
   }
 
-  /** Staging no replayed commit claimed: transactions that never committed (drop them). */
-  unclaimedStaging(): Array<{ readonly tableId: number; readonly transaction: number }> {
+  /**
+   * Staging no replayed commit claimed: transactions that never committed. Drop their groups and
+   * index runs together.
+   */
+  unclaimedStaging(): Array<{
+    readonly tableId: number;
+    readonly transaction: number;
+    readonly indexIds: readonly number[];
+  }> {
     return [...this.#unclaimed].flatMap(([tableId, transactions]) =>
-      [...transactions].map((transaction) => ({ tableId, transaction })),
+      [...transactions].map(([transaction, staged]) => ({
+        tableId,
+        transaction,
+        indexIds: staged.indexIds,
+      })),
     );
   }
 
@@ -124,6 +145,19 @@ export class Replayer {
       throw new LogCorruptionError(
         `The log ends at LSN ${String(lastLsn)} before the root's checkpoint at ${String(needed)}`,
       );
+  }
+
+  /**
+   * Rows (ordinary or published) for a table the catalog lacks at this point of replay: skipped
+   * when the table was dropped and the drop is covered by `globalLsn` (rows from before the drop);
+   * corruption for an unknown id or rows after the drop.
+   */
+  #absentTable(tableId: number, global: boolean): false {
+    if (tableId >= this.#nextTableId)
+      throw new LogCorruptionError(`Rows for unknown table ${String(tableId)}`);
+    if (global)
+      throw new LogCorruptionError(`Rows for table ${String(tableId)} after it was dropped`);
+    return false;
   }
 
   /** Per effect, in order: apply it or not. Throws `LogCorruptionError` on a rule violation. */
@@ -162,10 +196,8 @@ export class Replayer {
         }
         case "publishedRows": {
           const table = this.#tables.get(effect.tableId);
-          if (table === undefined)
-            throw new LogCorruptionError(
-              `Published rows for missing table ${String(effect.tableId)}`,
-            );
+          // The same dropped/unknown-table rule as ordinary rows.
+          if (table === undefined) return this.#absentTable(effect.tableId, global);
           if (lsn <= table.flushedThroughLsn) return false;
           if (effect.schemaVersion !== table.schemaVersion)
             throw new LogCorruptionError(
@@ -173,24 +205,23 @@ export class Replayer {
             );
           if (this.#rootSequence < effect.rootSequence)
             throw new LogCorruptionError("A committed transaction's staging root was rolled back");
-          const staged = this.#unclaimed.get(effect.tableId);
-          if (staged?.delete(effect.transaction) !== true)
+          const staged = this.#unclaimed.get(effect.tableId)?.get(effect.transaction);
+          if (staged === undefined)
             throw new LogCorruptionError(
               `Transaction ${String(effect.transaction)} is not staged for table ${String(effect.tableId)}`,
             );
+          // Rows and index runs are one unit: the commit must name exactly the staged runs.
+          const named = [...effect.indexIds].sort((a, b) => a - b).join();
+          if ([...staged.indexIds].sort((a, b) => a - b).join() !== named)
+            throw new LogCorruptionError(
+              `Transaction ${String(effect.transaction)} commits index runs [${named}] but stages [${staged.indexIds.join()}]`,
+            );
+          this.#unclaimed.get(effect.tableId)?.delete(effect.transaction);
           return true;
         }
         case "rows": {
           const table = this.#tables.get(effect.tableId);
-          if (table === undefined) {
-            if (effect.tableId >= this.#nextTableId)
-              throw new LogCorruptionError(`Rows for unknown table ${String(effect.tableId)}`);
-            if (global)
-              throw new LogCorruptionError(
-                `Rows for table ${String(effect.tableId)} after it was dropped`,
-              );
-            return false;
-          }
+          if (table === undefined) return this.#absentTable(effect.tableId, global);
           if (lsn <= table.flushedThroughLsn) return false;
           if (effect.schemaVersion !== table.schemaVersion)
             throw new LogCorruptionError(

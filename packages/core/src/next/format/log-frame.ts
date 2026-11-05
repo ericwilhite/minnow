@@ -480,6 +480,8 @@ export type BodyEffect =
       readonly schemaVersion: number;
       readonly transaction: number;
       readonly rootSequence: number;
+      /** The indexes whose staged runs this commit makes visible with the rows. */
+      readonly indexIds: readonly number[];
     };
 
 /**

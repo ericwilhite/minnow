@@ -119,3 +119,35 @@ describe("settling requests with no durable effect (Phase B ruling)", () => {
     expect(ledger.checkpoint()).toEqual([]);
   });
 });
+
+describe("statements inside an open transaction (review A1-4 finding 3)", () => {
+  const statement = (rowCount: number) =>
+    ({ kind: "statement", status: "ok", counts: { rowCount }, recordedAtMs: T0 }) as const;
+
+  it("answers a retried in-transaction statement from its session outcome, never twice (review probe)", () => {
+    const ledger = new RequestLedger();
+    let executed = 0;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const admission = ledger.admit(request(1), T0 + attempt);
+      if (admission.kind === "execute") {
+        executed += 1;
+        ledger.record("c1", 1, statement(4));
+      } else expect(admission).toEqual({ kind: "duplicate", outcome: statement(4) });
+    }
+    expect(executed).toBe(1);
+  });
+
+  it("keeps session outcomes out of the durable checkpoint and drops them when the session ends", () => {
+    const ledger = new RequestLedger();
+    ledger.admit(request(1), T0);
+    ledger.record("c1", 1, statement(2));
+    ledger.admit(request(2), T0);
+    ledger.record("c1", 2, committed(10, 2));
+    expect(ledger.checkpoint()[0]?.outcomes.map((o) => o.sequence)).toEqual([2]);
+    ledger.endSession("c1");
+    expect(ledger.admit(request(2), T0).kind).toBe("duplicate");
+    // After the session ended a retry of the statement cannot be answered: it was a new session's
+    // job to never send it (its transaction died with the session).
+    expect(ledger.admit(request(1), T0).kind).toBe("execute");
+  });
+});

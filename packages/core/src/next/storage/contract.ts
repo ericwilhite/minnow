@@ -22,8 +22,8 @@
  * - **Root.** One small byte string (the manifest root). `publish` replaces it atomically.
  * - **Data space.** One long-lived byte space (OPFS: one file; IndexedDB: chunk records) in which
  *   the engine allocates extents (`DATA_ALIGN`-aligned). Space is reused in place: the engine
- *   frees an extent when no durable or pinned root reaches it (format/manifest.ts "Reclaim") and
- *   writes new extents there. Files are never created or deleted per object: browsers do not
+ *   frees an extent only when neither the current nor the previous durable root reaches it and no
+ *   pin does (format/manifest.ts "Reclaim": two generations) and writes new extents there. Files are never created or deleted per object: browsers do not
  *   return quota on truncate (Chromium, WebKit), and WebKit does not let IndexedDB reuse space
  *   freed by deleting OPFS files.
  * - **Log.** An append-only byte sequence with two fixed header slots. The write path appends
@@ -66,7 +66,8 @@
  * detected (format/log-frame.ts).
  *
  * ## Engine obligations (the store cannot check them)
- * - Write data only into free space: never over an extent a durable or pinned root reaches.
+ * - Write data only into free space: never over an extent the current or previous durable root, or
+ *   a pinned root, reaches.
  * - Never `resetLog` or `truncateLog` below a byte the durable root still needs.
  *
  * ## Implementations
@@ -117,6 +118,11 @@ export interface StoreSession {
 
   /** The durable root, or null for a new store. */
   readRoot(): Promise<Uint8Array | null>;
+  /**
+   * The previous durable root (the one the current replaced), or null if none survives. Startup
+   * walks both: extents either reaches are not free (format/manifest.ts "Reclaim").
+   */
+  readPreviousRoot(): Promise<Uint8Array | null>;
   /** Guarantee 1. */
   publish(root: Uint8Array): Promise<void>;
 

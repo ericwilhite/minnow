@@ -464,7 +464,11 @@ export class KeyBatch {
     this.targetBytes = targetBytes;
     this.writer = new KeyWriter(initialBytes, charge);
     this.writer.target = targetBytes;
-    if (!charge.allocate(4 * 65)) throw new RangeError("A key batch's minimum must be admitted");
+    if (!charge.allocate(4 * 65)) {
+      // Roll back the writer's buffer: a failed constructor must hold nothing.
+      this.writer.close();
+      throw new RangeError("A key batch's minimum must be admitted");
+    }
     this.offsets = new Int32Array(65);
   }
 

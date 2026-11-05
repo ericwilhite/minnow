@@ -7,8 +7,9 @@
  *   spill write is flushed for durability.
  * - The space is one long-lived file per database (OPFS: `spill`, its sync handle opened at
  *   acquisition with the store's files), never deleted or created per query: browsers do not
- *   return quota on truncate (Chromium, WebKit), so space is reused inside the file. On open, after
- *   the owner holds its fence, the whole file is free (`SpillService.sweep`), whatever it holds;
+ *   return quota on truncate (Chromium, WebKit), so space is reused inside the file. At startup,
+ *   after the write path has recovered (format/manifest.ts "Startup order"), the whole file is
+ *   free (`SpillService.sweep`), whatever it holds;
  *   only its free tail may be truncated. A crash, kill, cancellation or timeout mid-spill can cost
  *   disk space until the next open, never correctness or the ability to open.
  * - There are no per-query caps on files, pages or runs. The limits are the platform quota

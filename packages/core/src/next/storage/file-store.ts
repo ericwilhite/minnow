@@ -11,7 +11,7 @@
  * Publication order (guarantee 1): flush the data file; write the inactive root slot; flush it.
  * A torn slot fails its checksum and the other slot, the previous root, stays current.
  */
-import { chooseRoot, encodeRootSlot } from "./root-slot.js";
+import { chooseRoot, decodeRootSlot, encodeRootSlot } from "./root-slot.js";
 import {
   DATA_ALIGN,
   LOG_HEADER_SLOT_BYTES,
@@ -91,6 +91,16 @@ export class FileStoreSession implements StoreSession {
 
   async readRoot(): Promise<Uint8Array | null> {
     return this.#chooseRoot().current?.root ?? null;
+  }
+
+  async readPreviousRoot(): Promise<Uint8Array | null> {
+    const [first, second] = this.#live().roots.map((file) => readExact(file, 0, file.getSize()));
+    const current = this.#chooseRoot().current;
+    for (const bytes of [first ?? null, second ?? null]) {
+      const slot = decodeRootSlot(bytes);
+      if (slot !== null && current !== null && slot.sequence < current.sequence) return slot.root;
+    }
+    return null;
   }
 
   #chooseRoot() {

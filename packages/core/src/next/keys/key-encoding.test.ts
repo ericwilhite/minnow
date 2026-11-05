@@ -674,3 +674,14 @@ describe("batched key memory (review A1-3 finding 4)", () => {
     grant.close();
   });
 });
+
+describe("key batch construction (review A1-4 follow-up)", () => {
+  it("holds nothing when its minimum cannot be admitted (review probe)", async () => {
+    const governor = new Governor(16 << 20);
+    const grant = await governor.admit({ label: "keys", minimumBytes: 4096, spillable: false });
+    expect(() => new KeyBatch(grant)).toThrow(RangeError);
+    expect(grant.allocated).toBe(0);
+    grant.close();
+    expect(governor.usedBytes).toBe(0);
+  });
+});

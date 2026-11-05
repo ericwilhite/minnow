@@ -98,12 +98,18 @@ export interface Grant {
   readonly held: number;
   /** Bytes allocated by the holder's buffers (≤ `held`). */
   readonly allocated: number;
+  /** Bytes of the outstanding loan (0 when none): they leave only through `repay`. */
+  readonly loaned: number;
   /** Rule 4. Never waits. */
   allocate(bytes: number): boolean;
   free(bytes: number): void;
   /** Adds held bytes (spillable grants only). Never waits. */
   tryGrow(bytes: number): boolean;
-  /** Returns unallocated held bytes to the governor. */
+  /**
+   * Returns held bytes to the governor: only holdings beyond what is allocated and beyond the
+   * outstanding loan. Loan-backed bytes leave only through `repay` (else `LoanBackedReleaseError`,
+   * and nothing changes).
+   */
   release(bytes: number): void;
   /** Rule 5. */
   borrow(bytes: number, signal?: AbortSignal): Promise<Loan>;
@@ -126,6 +132,12 @@ export interface MemoryGovernor {
   readonly usedBytes: number;
   readonly peakBytes: number;
   admit(options: AdmitOptions): Promise<Grant>;
+  /**
+   * Synchronous admission for the point-read fast path: the grant when nothing is queued and the
+   * minimum fits now (after evicting cache), else null; the caller then uses `admit`. It never
+   * jumps a queued admission or loan and never asks other grants to reclaim.
+   */
+  tryAdmit(options: Omit<AdmitOptions, "signal">): Grant | null;
   registerCache(cache: EvictableCache): {
     charge(bytes: number): boolean;
     release(bytes: number): void;
@@ -137,6 +149,16 @@ export class ValueTooLargeError extends Error {
   constructor(bytes: number, reserve: number) {
     super(`A ${String(bytes)}-byte value exceeds the memory reserve of ${String(reserve)} bytes`);
     this.name = "ValueTooLargeError";
+  }
+}
+
+export class LoanBackedReleaseError extends Error {
+  readonly code = "MINNOW_LOAN_BACKED_RELEASE";
+  constructor(label: string, bytes: number, releasable: number) {
+    super(
+      `${label} cannot release ${String(bytes)} bytes: only ${String(releasable)} are not allocated or loan-backed (repay the loan instead)`,
+    );
+    this.name = "LoanBackedReleaseError";
   }
 }
 
@@ -197,10 +219,14 @@ class GrantImpl implements Grant {
     return this.governor.grow(this, bytes);
   }
 
+  get loaned(): number {
+    return this.loan;
+  }
+
   release(bytes: number): void {
     if (this.closed) return;
-    if (bytes > this.held - this.allocated)
-      throw new RangeError(`${this.label} released bytes it has allocated`);
+    const releasable = this.held - this.allocated - this.loan;
+    if (bytes > releasable) throw new LoanBackedReleaseError(this.label, bytes, releasable);
     this.held -= bytes;
     this.governor.give(bytes);
   }
@@ -423,6 +449,18 @@ export class Governor implements MemoryGovernor {
       },
       options.signal,
     );
+  }
+
+  tryAdmit(options: Omit<AdmitOptions, "signal">): Grant | null {
+    if (options.minimumBytes > this.capBytes - this.reserveBytes)
+      throw new RangeError(`${options.label} needs a minimum above the cap: plan smaller batches`);
+    if (this.#draining || this.#loans.length > 0 || this.#admissions.length > 0) return null;
+    if (!this.#room(options.minimumBytes, false)) return null;
+    this.#take(options.minimumBytes);
+    const grant = new GrantImpl(this, options.label, options.spillable);
+    this.#grants.add(grant);
+    grant.held += options.minimumBytes;
+    return grant;
   }
 
   async lend(grant: GrantImpl, bytes: number, signal?: AbortSignal): Promise<void> {

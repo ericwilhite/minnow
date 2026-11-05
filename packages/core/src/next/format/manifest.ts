@@ -27,10 +27,15 @@
  *   extents and publishes a new root (copy on write up the tree). A metadata-only rewrite (new
  *   statistics, a deletion bitmap, a renamed column) writes a new group root that references the
  *   old chunk extents unchanged; several roots and groups may reference one extent.
- * - **Reclaim.** An extent is free when neither the durable root nor any pinned snapshot's root
- *   reaches it. The owner computes free space on open by walking the root (crash orphans are
- *   simply unreachable: no job records) and maintains it in memory after. Freed space is reused
- *   in place; only a free tail is ever released to the platform.
+ * - **Reclaim (two generations).** An extent is reusable only when neither the current durable root,
+ *   nor the previous durable root (the other root slot), nor any pinned snapshot's root reaches
+ *   it. Keeping the previous generation means a lost flush that rolls back to the previous root
+ *   slot finds its extents intact instead of overwritten. At startup the owner walks both roots
+ *   (crash orphans are simply unreachable: no job records) and maintains free space in memory
+ *   after. Freed space is reused in place; only a free tail is ever released to the platform.
+ * - **Startup order** (one log scan): acquire the fence → open the store session → open the extent
+ *   space (walk the current and previous roots from the store's root slots) → open the write path
+ *   (a single log scan and replay, `publishedRows` staging included) → spill sweep → ready.
  * - **Snapshots (C12).** A reader pins a root (and the memtable views of that moment) for the
  *   length of one query or read transaction; pins are in memory, never durable. A client's pins
  *   are dropped when its Web Lock is released (it vanished) or when it ends the read. There is no
@@ -113,6 +118,15 @@ export interface TableRoot {
     readonly rowCount: number;
     /** → GroupRef[] of the staged rows. */
     readonly groups: BlobRef;
+    /**
+     * The index runs built for the staged rows while staging (one entry per index of the table),
+     * made visible, folded or dropped together with `groups`: replay never rebuilds index
+     * entries from key columns.
+     */
+    readonly indexRuns: ReadonlyArray<{
+      readonly indexId: number;
+      readonly runs: readonly RunRef[];
+    }>;
   }>;
   readonly keyIndex: IndexRoot | null;
   readonly secondaryIndexes: readonly IndexRoot[];

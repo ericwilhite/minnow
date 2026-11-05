@@ -44,6 +44,7 @@ type ToyEffect =
       schemaVersion: number;
       transaction: number;
       rootSequence: number;
+      indexIds: number[];
     };
 
 interface Body {
@@ -61,7 +62,8 @@ interface RootDoc {
     version: number;
     flushed: number;
     rows: string[];
-    staged: Array<[number, string[]]>;
+    index: string[];
+    staged: Array<[number, Staged]>;
   }>;
   readonly sequences: Array<[number, number]>;
   readonly clients: ClientLedgerEntry[];
@@ -77,6 +79,12 @@ const EMPTY_ROOT: RootDoc = {
   clients: [],
 };
 
+/** A staged large transaction: its rows and the index runs built while staging. */
+interface Staged {
+  rows: string[];
+  runs: Array<[number, string[]]>;
+}
+
 interface TableState {
   version: number;
   flushed: number;
@@ -84,8 +92,11 @@ interface TableState {
   alteredAt: number;
   durable: string[];
   memory: string[];
-  /** Large transactions' rows held by the root as staged, by transaction id. */
-  staged: Map<number, string[]>;
+  /** Index 1 (keyed by row value): entries in groups' runs, and entries not yet flushed. */
+  index: string[];
+  memoryIndex: string[];
+  /** Large transactions' rows and runs held by the root as staged, by transaction id. */
+  staged: Map<number, Staged>;
   /** Staged transactions whose commit applied (their rows are in `memory`). */
   claimed: Set<number>;
 }
@@ -136,7 +147,12 @@ class Toy {
     return JSON.stringify({
       tables: [...this.tables]
         .sort(([a], [b]) => a - b)
-        .map(([id, t]) => [id, t.version, [...t.durable, ...t.memory]]),
+        .map(([id, t]) => [
+          id,
+          t.version,
+          [...t.durable, ...t.memory],
+          [...t.index, ...t.memoryIndex].sort(),
+        ]),
       sequences: [...this.sequences].sort(([a], [b]) => a - b),
       ledger: this.ledger
         .checkpoint()
@@ -154,6 +170,8 @@ class Toy {
           alteredAt: 0,
           durable: [],
           memory: [],
+          index: [],
+          memoryIndex: [],
           staged: new Map(),
           claimed: new Set(),
         });
@@ -173,14 +191,19 @@ class Toy {
       case "sequence":
         this.sequences.set(effect.sequenceId, effect.value);
         return;
-      case "rows":
-        this.tables.get(effect.tableId)?.memory.push(...effect.rows);
+      case "rows": {
+        const table = this.tables.get(effect.tableId);
+        table?.memory.push(...effect.rows);
+        table?.memoryIndex.push(...effect.rows);
         return;
+      }
       case "publishedRows": {
         const table = this.tables.get(effect.tableId);
-        const rows = table?.staged.get(effect.transaction);
-        if (table === undefined || rows === undefined) throw new Error("staging missing");
-        table.memory.push(...rows);
+        const staged = table?.staged.get(effect.transaction);
+        if (table === undefined || staged === undefined) throw new Error("staging missing");
+        // Rows and their staged index runs become visible together.
+        table.memory.push(...staged.rows);
+        for (const [, entries] of staged.runs) table.memoryIndex.push(...entries);
         table.claimed.add(effect.transaction);
         return;
       }
@@ -254,6 +277,7 @@ class Toy {
           version,
           flushed: table?.flushed ?? 0,
           rows: table?.durable ?? [],
+          index: table?.index ?? [],
           staged: [...(table?.staged ?? [])],
         };
       }),
@@ -266,6 +290,8 @@ class Toy {
   #flushRows(table: TableState): void {
     table.durable.push(...table.memory);
     table.memory = [];
+    table.index.push(...table.memoryIndex);
+    table.memoryIndex = [];
     table.flushed = this.lsn;
     // Folding: committed staging leaves the root in the same publish that covers its frame.
     for (const transaction of table.claimed) table.staged.delete(transaction);
@@ -274,7 +300,9 @@ class Toy {
 
   /** A large transaction's first half: its rows go to the root as staged; returns the root's sequence. */
   async stage(tableId: number, transaction: number, rows: string[]): Promise<number> {
-    this.tables.get(tableId)?.staged.set(transaction, rows);
+    // The staging root must list the table: checkpoint a table created since the last one.
+    if (!this.checkpointed.versions.has(tableId)) await this.checkpoint();
+    this.tables.get(tableId)?.staged.set(transaction, { rows, runs: [[1, [...rows].sort()]] });
     await this.#publish();
     return this.rootSequence;
   }
@@ -340,6 +368,8 @@ class Toy {
         alteredAt: 0,
         durable: [...t.rows],
         memory: [],
+        index: [...t.index],
+        memoryIndex: [],
         staged: new Map(t.staged),
         claimed: new Set(),
       });
@@ -360,7 +390,12 @@ class Toy {
           {
             flushedThroughLsn: t.flushed,
             schemaVersion: t.version,
-            staged: new Set(t.staged.map(([transaction]) => transaction)),
+            staged: new Map(
+              t.staged.map(([transaction, staged]) => [
+                transaction,
+                { indexIds: staged.runs.map(([indexId]) => indexId) },
+              ]),
+            ),
           },
         ]),
       ),
@@ -483,6 +518,7 @@ async function workload(
           schemaVersion: 2,
           transaction: 501,
           rootSequence: first,
+          indexIds: [1],
         },
       ],
       true,
@@ -509,11 +545,31 @@ async function workload(
         schemaVersion: 2,
         transaction: 502,
         rootSequence: second,
+        indexIds: [1],
       },
       insert(3, 2, ["after-large"]),
     ]),
   );
   await toy.flushTable(3);
+  // A large commit, then a DROP of its table, then a checkpoint covering the drop while the log
+  // still holds the large commit (review A1-4 finding 1); writes and reopens follow.
+  await commit(tx([{ kind: "createTable", tableId: 6 }, insert(6, 1, ["p"])]));
+  const third = await toy.stage(6, 503, rows("Q", 9));
+  await commit(
+    tx([
+      {
+        kind: "publishedRows",
+        tableId: 6,
+        schemaVersion: 1,
+        transaction: 503,
+        rootSequence: third,
+        indexIds: [1],
+      },
+    ]),
+  );
+  await commit(tx([{ kind: "dropTable", tableId: 6 }], true));
+  await toy.checkpoint(options);
+  await commit(tx([insert(1, 2, ["after-drop"])]));
   await toy.recycleLog(0x2222);
   await commit(tx([insert(3, 2, ["h"]), { kind: "alterTable", tableId: 4, schemaVersion: 2 }]));
   await toy.flushTable(3);

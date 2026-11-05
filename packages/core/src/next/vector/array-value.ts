@@ -146,15 +146,107 @@ function fromTwosComplement(bytes: Uint8Array): bigint {
   return BigInt.asIntN(bytes.length * 8, value);
 }
 
-export function encodeArrayValue(element: PhysicalType, value: ArrayValue): Uint8Array {
+/** PostgreSQL's MaxArraySize: the most elements an array may hold. */
+export const MAX_ARRAY_ELEMENTS = 134_217_727;
+const INT32_MIN = -2_147_483_648;
+const INT32_MAX = 2_147_483_647;
+const INT64_MIN = -(2n ** 63n);
+const INT64_MAX = 2n ** 63n - 1n;
+
+const isInt32 = (value: unknown): value is number =>
+  typeof value === "number" && Number.isInteger(value) && value >= INT32_MIN && value <= INT32_MAX;
+const isInt64 = (value: unknown): value is bigint =>
+  typeof value === "bigint" && value >= INT64_MIN && value <= INT64_MAX;
+
+function checkElement(element: PhysicalType, tag: number, item: ArrayElement): void {
+  const bad = (what: string): never => {
+    throw new MalformedArrayError(`Array element out of range for ${element.kind}: ${what}`);
+  };
+  switch (tag) {
+    case 1:
+      if (typeof item !== "boolean") bad("not a boolean");
+      return;
+    case 2:
+      if (!isInt32(item) || item < -32_768 || item > 32_767) bad("not a SMALLINT");
+      return;
+    case 3:
+    case 8:
+      if (!isInt32(item)) bad("not an int32");
+      return;
+    case 4:
+    case 10:
+    case 11:
+      if (!isInt64(item)) bad("not an int64");
+      return;
+    case 9:
+      if (!isInt64(item) || item < 0n || item > 86_400_000_000n) bad("not a TIME");
+      return;
+    case 5:
+      if (typeof item !== "number" || (!Number.isNaN(item) && Math.fround(item) !== item))
+        bad("not a REAL");
+      return;
+    case 6:
+      if (typeof item !== "number") bad("not a DOUBLE");
+      return;
+    case 7: {
+      if (typeof item !== "object" || !("coefficient" in item)) return bad("not a NUMERIC");
+      if (item.special !== undefined) return;
+      if (typeof item.coefficient !== "bigint") bad("NUMERIC coefficient");
+      if (!Number.isInteger(item.scale) || item.scale < 0 || item.scale > 16_383)
+        bad("NUMERIC scale");
+      return;
+    }
+    case 12: {
+      if (typeof item !== "object" || !("months" in item)) return bad("not an INTERVAL");
+      if (!isInt32(item.months) || !isInt32(item.days) || !isInt64(item.micros))
+        bad("INTERVAL field");
+      return;
+    }
+    case 15:
+      if (!(item instanceof Uint8Array) || item.length !== 16) bad("not 16 bytes");
+      return;
+    case 16: {
+      if (!(item instanceof Uint8Array)) return bad("not a label");
+      const label = new TextDecoder().decode(item);
+      if (element.kind === "enum" && !element.labels.includes(label))
+        bad(`unknown label "${label}"`);
+      return;
+    }
+    default:
+      if (!(item instanceof Uint8Array) || item.length > 0xffff_ffff) bad("not bytes");
+  }
+}
+
+/**
+ * Checks a value before anything is written: dimensions and lower bounds are int32, every upper
+ * bound (lower + length − 1) is int32, at most `MAX_ARRAY_ELEMENTS` elements, and every element
+ * is in its type's range. A value that fails is never narrowed or truncated.
+ */
+export function validateArrayValue(element: PhysicalType, value: ArrayValue): void {
   const tag = arrayElementTag(element);
   const { dimensions, lowerBounds, elements } = value;
   if (dimensions.length > MAX_ARRAY_DIMENSIONS || lowerBounds.length !== dimensions.length)
     throw new MalformedArrayError("Bad array dimensions");
-  const count =
-    dimensions.length === 0 ? 0 : dimensions.reduce((product, length) => product * length, 1);
+  let count = dimensions.length === 0 ? 0 : 1;
+  dimensions.forEach((length, index) => {
+    const lower = lowerBounds[index];
+    if (!isInt32(length) || length < 0) throw new MalformedArrayError("Bad array dimension length");
+    if (!isInt32(lower)) throw new MalformedArrayError("Array lower bound out of range");
+    if (lower + length - 1 > INT32_MAX)
+      throw new MalformedArrayError("Array upper bound out of range");
+    count *= length;
+  });
+  if (count > MAX_ARRAY_ELEMENTS) throw new MalformedArrayError("Too many array elements");
   if (count !== elements.length)
     throw new MalformedArrayError("Dimensions do not match the elements");
+  for (const item of elements) if (item !== null) checkElement(element, tag, item);
+}
+
+export function encodeArrayValue(element: PhysicalType, value: ArrayValue): Uint8Array {
+  validateArrayValue(element, value);
+  const tag = arrayElementTag(element);
+  const { dimensions, lowerBounds, elements } = value;
+  const count = elements.length;
   const writer = new Writer();
   const hasNulls = elements.some((item) => item === null);
   writer.u8(1);

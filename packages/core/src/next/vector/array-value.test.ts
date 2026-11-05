@@ -146,3 +146,49 @@ describe("array stored values (review A1-3 finding 1)", () => {
     );
   });
 });
+
+describe("array validation before writing (review A1-4 follow-up)", () => {
+  const int: PhysicalType = { kind: "int32", bits: 32 };
+  const refuse = (element: PhysicalType, value: ArrayValue, label: string) => {
+    expect(() => encodeArrayValue(element, value), label).toThrow(MalformedArrayError);
+  };
+  const one = (item: ArrayElement): ArrayValue => ({
+    dimensions: [1],
+    lowerBounds: [1],
+    elements: [item],
+  });
+
+  it("refuses bounds it would otherwise narrow (review probe: lower bound 2147483648)", () => {
+    refuse(int, { dimensions: [1], lowerBounds: [2_147_483_648], elements: [3] }, "lower bound");
+    refuse(int, { dimensions: [2], lowerBounds: [2_147_483_647], elements: [1, 2] }, "upper bound");
+    refuse(int, { dimensions: [-1], lowerBounds: [1], elements: [] }, "negative length");
+    refuse(int, { dimensions: [1.5], lowerBounds: [1], elements: [1] }, "fractional length");
+    const edge = { dimensions: [1], lowerBounds: [-2_147_483_648], elements: [2_147_483_647] };
+    expect(decodeArrayValue(int, encodeArrayValue(int, edge))).toEqual(edge);
+  });
+
+  it("refuses elements outside their type's range", () => {
+    const cases: Array<[PhysicalType, ArrayElement, string]> = [
+      [{ kind: "int32", bits: 16 }, 32_768, "smallint"],
+      [int, 1.5, "fractional int"],
+      [int, 2 ** 31, "int32 overflow"],
+      [{ kind: "int64" }, 2n ** 63n, "int64 overflow"],
+      [{ kind: "time" }, -1n, "negative time"],
+      [{ kind: "float32" }, 0.1, "not a float32"],
+      [
+        { kind: "decimal", precision: null, scale: null },
+        { coefficient: 1n, scale: 16_384 },
+        "scale",
+      ],
+      [{ kind: "interval" }, { months: 2 ** 31, days: 0, micros: 0n }, "interval months"],
+      [{ kind: "uuid" }, new Uint8Array(15), "uuid length"],
+      [
+        { kind: "enum", name: "mood", labels: ["sad"] },
+        new TextEncoder().encode("glad"),
+        "enum label",
+      ],
+      [{ kind: "text" }, 5, "text"],
+    ];
+    for (const [element, item, label] of cases) refuse(element, one(item), label);
+  });
+});

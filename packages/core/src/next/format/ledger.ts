@@ -21,11 +21,17 @@
  *   only); a failure answers with the same error code.
  * - `execute`: first sight; run it.
  *
- * ## Settling without an outcome
- * A request with no durable effect (a read, a statement inside a transaction that is still open,
- * a rollback) is `settle`d once answered: it leaves `inFlight` and records nothing, so a retry
- * simply runs again, which is correct for anything that changed nothing. Only a commit records an
- * outcome; a failure records one only while the owner lives.
+ * ## Outcomes by kind of request
+ * - **Commit** (a statement in autocommit, or COMMIT): a durable `committed` outcome (below).
+ * - **Statement inside an open transaction**: it changed the transaction's state, so running it
+ *   twice would apply it twice. It records a `statement` outcome (status and counts): in memory
+ *   only, scoped to the client's session, and dropped by `endSession` (when the client's session
+ *   ends: its Web Lock is released or it disconnects), by acknowledgement, or by the window. A
+ *   duplicate gets it back instead of running again.
+ * - **A request that changed nothing** (a read, read-only transaction work, a ROLLBACK of a
+ *   transaction already gone) is `settle`d: it leaves `inFlight` and records nothing, so a retry
+ *   simply runs again.
+ * - **Failure**: a `failed` outcome, in memory only.
  *
  * ## Durability and bounds
  * - Committed outcomes are durable: the commit's log frame carries the request (log-frame.ts
@@ -60,7 +66,15 @@ export type Outcome =
       readonly counts: Readonly<Record<string, number>>;
       readonly recordedAtMs: number;
     }
-  | { readonly kind: "failed"; readonly code: string; readonly recordedAtMs: number };
+  | { readonly kind: "failed"; readonly code: string; readonly recordedAtMs: number }
+  /** A statement inside an open transaction: session-scoped, never durable. */
+  | {
+      readonly kind: "statement";
+      readonly status: "ok" | "failed";
+      readonly counts: Readonly<Record<string, number>>;
+      readonly code?: string;
+      readonly recordedAtMs: number;
+    };
 
 export type Admission =
   | { readonly kind: "execute" }
@@ -115,11 +129,20 @@ export class RequestLedger {
   }
 
   /**
-   * Ends an admitted request that has no durable effect without recording an outcome: a retry
-   * runs it again.
+   * Ends an admitted request that changed nothing (a read, read-only work) without recording an
+   * outcome: a retry runs it again. Never for a statement inside an open transaction: record a
+   * `statement` outcome instead.
    */
   settle(clientId: string, sequence: number): void {
     this.#clients.get(clientId)?.inFlight.delete(sequence);
+  }
+
+  /** Ends a client's session: its `statement` outcomes go (durable and failed outcomes stay). */
+  endSession(clientId: string): void {
+    const client = this.#clients.get(clientId);
+    if (client === undefined) return;
+    for (const [sequence, outcome] of client.outcomes)
+      if (outcome.kind === "statement") client.outcomes.delete(sequence);
   }
 
   /** Records the terminal outcome of an admitted request (a commit only once it is durable). */

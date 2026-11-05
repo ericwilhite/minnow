@@ -135,6 +135,67 @@ describe("JSONB against PostgreSQL (review A1-3 finding 5)", () => {
     expect(accepts('"\ud800"')).toBe(false);
   });
 
+  it("accepts exactly PostgreSQL's NUMERIC range (review A1-4 follow-up)", async () => {
+    const nines = (count: number) => "9".repeat(count);
+    for (const text of [
+      "1e131072",
+      "1e131071",
+      "1e-16384",
+      "1e-16383",
+      "1e9999999999999999999999999999",
+      '{"n":[1e-16384]}',
+      "0e1001",
+      "0e-1001",
+      "0e-16383",
+      "0e-16384",
+      "0e2147483647",
+      "0e1073741822",
+      "0e1073741823",
+      "1.0e-16382",
+      "1.00e-16382",
+      "0.000e5",
+      "-0.0",
+      nines(131072),
+      nines(131073),
+      `${nines(131000)}e72`,
+      `${nines(131000)}e73`,
+      `0.${"1".repeat(16383)}`,
+      `0.${"1".repeat(16384)}`,
+      `1.${"0".repeat(16384)}`,
+      `0.${"1".repeat(16000)}e-383`,
+      `0.${"1".repeat(16000)}e-384`,
+    ])
+      expect(
+        accepts(text),
+        text.length > 40 ? `${text.slice(0, 20)}…(${String(text.length)})` : text,
+      ).toBe(await postgresAccepts(text));
+  }, 60_000);
+
+  const numberEdges = fc
+    .tuple(
+      fc.constantFrom("0", "1", "9.99", "0.5", "-12.3400", "1.0"),
+      fc.oneof(
+        fc.integer({ min: -16_400, max: -16_370 }),
+        fc.integer({ min: 131_060, max: 131_080 }),
+        fc.integer({ min: -2000, max: 2000 }),
+        fc.constantFrom(1_073_741_822, 1_073_741_823, -1_073_741_823, 2_147_483_648),
+      ),
+    )
+    .map(([mantissa, exponent]) => `${mantissa}e${String(exponent)}`);
+
+  it.each(SEEDS)(
+    "agrees with PostgreSQL on numbers near NUMERIC's limits (seed %i)",
+    async (seed) => {
+      await fc.assert(
+        fc.asyncProperty(numberEdges, async (text) => {
+          expect(accepts(text), text).toBe(await postgresAccepts(text));
+        }),
+        { seed, numRuns: 300 },
+      );
+    },
+    60_000,
+  );
+
   it.each(SEEDS)(
     "orders and equates generated values exactly as PostgreSQL does (seed %i)",
     async (seed) => {

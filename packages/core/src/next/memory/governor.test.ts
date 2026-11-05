@@ -6,6 +6,7 @@ import {
   ValueTooLargeError,
   batchTargetFor,
   bigintBytes,
+  LoanBackedReleaseError,
   type EvictableCache,
   type Loan,
 } from "./governor.js";
@@ -106,6 +107,61 @@ describe("memory governor: admission and progress", () => {
     await expect(grant.borrow(MiB)).rejects.toThrow(RangeError);
     loan.repay();
     expect(grant.held).toBe(MiB);
+  });
+});
+
+describe("synchronous admission (ruling R14, ported from rebuild/exec 3ad7c99)", () => {
+  it("tryAdmit admits synchronously when it fits and never jumps a queue", async () => {
+    const governor = new Governor(16 * MiB);
+    const usable = 16 * MiB - governor.reserveBytes;
+    const fast = governor.tryAdmit({ label: "point", minimumBytes: MiB, spillable: false });
+    expect(fast?.held).toBe(MiB);
+    fast?.close();
+    const big = await governor.admit({
+      label: "big",
+      minimumBytes: usable - MiB,
+      spillable: false,
+    });
+    expect(governor.tryAdmit({ label: "no room", minimumBytes: 2 * MiB, spillable: false })).toBe(
+      null,
+    );
+    let served = false;
+    const queued = governor
+      .admit({ label: "queued", minimumBytes: 2 * MiB, spillable: false })
+      .then((grant) => {
+        served = true;
+        return grant;
+      });
+    await settle();
+    // 1 MiB is free, but an admission is queued ahead: the fast path must not take it.
+    expect(governor.tryAdmit({ label: "small", minimumBytes: MiB, spillable: false })).toBeNull();
+    expect(served).toBe(false);
+    big.close();
+    (await queued).close();
+    const again = governor.tryAdmit({ label: "again", minimumBytes: MiB, spillable: false });
+    expect(again?.held).toBe(MiB);
+    again?.close();
+    expect(governor.usedBytes).toBe(0);
+  });
+
+  it("never takes the reserve, and refuses while a loan waits", async () => {
+    const governor = new Governor(16 * MiB);
+    const usable = 16 * MiB - governor.reserveBytes;
+    const full = await governor.admit({ label: "full", minimumBytes: usable, spillable: false });
+    expect(governor.tryAdmit({ label: "reserve", minimumBytes: 1, spillable: false })).toBeNull();
+    const loan = await full.borrow(governor.reserveBytes);
+    const other = await governor.admit({ label: "other", minimumBytes: 0, spillable: false });
+    const waiting = other.borrow(1).then((l) => l.repay());
+    await settle();
+    expect(governor.tryAdmit({ label: "zero", minimumBytes: 0, spillable: false })).toBeNull();
+    expect(() =>
+      governor.tryAdmit({ label: "huge", minimumBytes: usable + 1, spillable: false }),
+    ).toThrow(RangeError);
+    loan.repay();
+    await waiting;
+    full.close();
+    other.close();
+    expect(governor.usedBytes).toBe(0);
   });
 });
 
@@ -330,75 +386,138 @@ describe("loan races (review A1-3 finding 3)", () => {
     await reserveIntact(governor);
   });
 
-  it("keeps its accounting exact under random interleavings of every operation", async () => {
-    for (let seed = 1; seed <= 40; seed++) {
+  it("loan-backed bytes leave only through repay (review A1-4 probe)", async () => {
+    const governor = new Governor(16 * MiB);
+    const a = await governor.admit({ label: "a", minimumBytes: 14 * MiB, spillable: true });
+    const loan = await a.borrow(2 * MiB);
+    expect(() => {
+      a.release(16 * MiB);
+    }).toThrow(LoanBackedReleaseError);
+    expect(a.held).toBe(16 * MiB);
+    a.release(14 * MiB);
+    const b = governor.admit({ label: "b", minimumBytes: 14 * MiB, spillable: true });
+    const admitted = await b;
+    expect(admitted.tryGrow(2 * MiB)).toBe(false);
+    loan.repay();
+    a.close();
+    admitted.close();
+    await reserveIntact(governor);
+  });
+
+  it("keeps the reserve under random interleavings of every operation, loans outstanding", async () => {
+    for (let seed = 1; seed <= 60; seed++) {
       let state = seed;
       const random = () => {
         state = (Math.imul(state ^ (state >>> 15), 0x2c1b3c6d) + 0x9e3779b9) >>> 0;
         return state / 2 ** 32;
       };
+      const pick = <T>(items: readonly T[]) => items[Math.floor(random() * items.length)];
       const governor = new Governor(16 * MiB);
+      let cached = 0;
+      const cache = governor.registerCache({
+        get evictableBytes() {
+          return cached;
+        },
+        evict(bytes) {
+          const freed = Math.min(bytes, cached);
+          cached -= freed;
+          cache.release(freed);
+          return freed;
+        },
+      });
       interface Live {
         grant: Awaited<ReturnType<Governor["admit"]>>;
-        loan: { repay(): void } | null;
+        loan: Loan | null;
       }
       const grants: Live[] = [];
+      const aborts: AbortController[] = [];
       const pending: Array<Promise<unknown>> = [];
-      // Bounds hold at every step; exact equality with the grants' holdings is checked once
-      // everything has settled (an admission is charged a few microtasks before the test sees it).
-      const check = () => {
-        const held = grants.reduce((sum, live) => sum + live.grant.held, 0);
-        expect(governor.usedBytes).toBeGreaterThanOrEqual(held);
-        expect(governor.usedBytes).toBeLessThanOrEqual(governor.capBytes);
-        expect(governor.usedBytes - governor.loanedBytes).toBeLessThanOrEqual(
+      const releasable = (live: Live) => live.grant.held - live.grant.allocated - live.grant.loaned;
+      const check = (step: string) => {
+        expect(governor.usedBytes, step).toBeLessThanOrEqual(governor.capBytes);
+        // The reserve invariant: everything but loans fits under cap − reserve.
+        expect(governor.usedBytes - governor.loanedBytes, step).toBeLessThanOrEqual(
           governor.capBytes - governor.reserveBytes,
         );
       };
-      for (let step = 0; step < 60; step++) {
+      for (let step = 0; step < 80; step++) {
+        const live = pick(grants);
         const roll = random();
-        const live = grants[Math.floor(random() * grants.length)];
-        if (roll < 0.25 || live === undefined) {
+        const amount = Math.floor(random() * 4) * (MiB / 2);
+        if (roll < 0.05 && live !== undefined) {
+          const fast = governor.tryAdmit({
+            label: `t${String(step)}`,
+            minimumBytes: amount,
+            spillable: false,
+          });
+          if (fast !== null) grants.push({ grant: fast, loan: null });
+        } else if (roll < 0.15 || live === undefined) {
+          const spillable = random() < 0.7;
           pending.push(
             governor
-              .admit({
-                label: `g${String(step)}`,
-                minimumBytes: Math.floor(random() * 4) * MiB,
-                spillable: random() < 0.7,
-              })
+              .admit({ label: `g${String(step)}`, minimumBytes: amount, spillable })
               .then((grant) => {
-                grants.push({ grant, loan: null });
+                const entry: Live = { grant, loan: null };
+                grants.push(entry);
+                // Reclaim callbacks release synchronously, within what may be released.
+                if (spillable)
+                  grant.onReclaimRequest((bytes) => {
+                    const give = Math.min(bytes, releasable(entry));
+                    if (give > 0) grant.release(give);
+                  });
               }),
           );
-        } else if (roll < 0.45) live.grant.tryGrow(Math.floor(random() * 4) * MiB);
-        else if (roll < 0.65 && live.loan === null)
+        } else if (roll < 0.25) live.grant.tryGrow(amount);
+        else if (roll < 0.35 && live.loan === null) {
+          const controller = new AbortController();
+          aborts.push(controller);
           pending.push(
-            live.grant.borrow(Math.floor(random() * 2 + 1) * (MiB / 2)).then(
+            live.grant.borrow(Math.max(MiB / 2, amount / 2), controller.signal).then(
               (loan) => {
                 live.loan = loan;
               },
               () => undefined,
             ),
           );
-        else if (roll < 0.8 && live.loan !== null) {
-          live.loan.repay();
-          live.loan = null;
-        } else if (roll < 0.9) {
+        } else if (roll < 0.4) pick(aborts)?.abort(new Error("cancelled"));
+        else if (roll < 0.5 && live.loan !== null) {
+          if (live.grant.held - live.grant.allocated >= live.loan.bytes) {
+            live.loan.repay();
+            live.loan = null;
+          }
+        } else if (roll < 0.62) {
+          const before = { held: live.grant.held, used: governor.usedBytes };
+          if (amount > releasable(live)) {
+            expect(() => {
+              live.grant.release(amount);
+            }).toThrow(LoanBackedReleaseError);
+            expect(live.grant.held).toBe(before.held);
+            expect(governor.usedBytes).toBe(before.used);
+          } else live.grant.release(amount);
+        } else if (roll < 0.72) live.grant.allocate(amount);
+        else if (roll < 0.8) live.grant.free(Math.min(amount, live.grant.allocated));
+        else if (roll < 0.88) {
+          if (cache.charge(amount)) cached += amount;
+        } else if (roll < 0.94) {
           live.grant.close();
           grants.splice(grants.indexOf(live), 1);
         }
         await ticks(Math.floor(random() * 4));
-        check();
+        check(`seed ${String(seed)} step ${String(step)}`);
       }
-      for (const live of [...grants]) live.grant.close();
-      grants.length = 0;
-      // Anything admitted late is closed as it arrives.
-      for (let round = 0; round < 10; round++) {
+      // Quiesce: close everything (including grants admitted late) and empty the cache.
+      for (const controller of aborts) controller.abort(new Error("done"));
+      for (let round = 0; round < 20; round++) {
         await ticks(5);
         for (const live of grants.splice(0)) live.grant.close();
+        if (cached > 0) {
+          cache.release(cached);
+          cached = 0;
+        }
       }
       await Promise.all(pending);
       for (const live of grants.splice(0)) live.grant.close();
-      check();
+      check(`seed ${String(seed)} end`);
       await reserveIntact(governor);
     }
   });

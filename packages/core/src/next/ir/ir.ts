@@ -319,8 +319,23 @@ export type Rel =
       readonly op: "modify";
       readonly kind: "insert" | "update" | "delete" | "upsert";
       readonly tableId: number;
-      /** Rows to write (insert/upsert) or row ids plus new values (update/delete). */
+      /**
+       * Rows to write (insert/upsert); for update, the row locator then one column per `assigned`
+       * column, in that order; for delete, the row locator.
+       */
       readonly input: Rel;
+      /**
+       * UPDATE: the catalog column ids the statement assigns, in input order after the locator
+       * (access/ `TableWriteOptions.assigned`). Empty for insert, upsert and delete.
+       */
+      readonly assigned: readonly number[];
+      /**
+       * A second update or delete of the same row in this statement: `"error"` raises PostgreSQL's
+       * cardinality violation, SQLSTATE 21000 (MERGE, ON CONFLICT DO UPDATE); `"first"` keeps the
+       * first and skips the repeat (UPDATE … FROM, DELETE … USING, as PostgreSQL does).
+       * (access/ `TableWriteOptions.onRepeat`.)
+       */
+      readonly onRepeat: "error" | "first";
       readonly onConflict: {
         readonly indexId: number;
         readonly action: "nothing" | "update";

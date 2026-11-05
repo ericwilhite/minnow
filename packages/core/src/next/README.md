@@ -139,14 +139,17 @@ Merge note: `SnapshotReleasedError` and the snapshot type move to `next/access/`
   `flushedThroughLsn`.
 - A checkpoint that covers a schema change of a table also covers that table's rows through it,
   and replay checks schema versions.
-- A transaction too large to log row by row stages its rows in a published root, then commits
-  with a `publishedRows` frame naming that root. Replay applies it exactly once (skipped once
-  folded), detects a rolled-back root, and drops staging no commit claimed.
+- A transaction too large to log row by row stages its rows and their index runs in a published
+  root, then commits with a `publishedRows` frame naming that root and those indexes. Replay
+  applies rows and runs together exactly once (skipped once folded or after a checkpointed DROP),
+  refuses a mismatch between the frame's indexes and the staged runs or a rolled-back root, and
+  drops staging no commit claimed.
 - The log must reach every checkpoint the root claims.
 - A rolled-back root is detected through the log header's `rootSequence`.
 - Requests are exactly-once through a bounded per-client ledger of outcomes, with expiry enforced
-  by the receiver (`RequestExpiredError`). A request with no durable effect (a read, a statement
-  in an open transaction, a rollback) is settled without an outcome, so its retry runs again.
+  by the receiver (`RequestExpiredError`). A statement inside an open transaction records a
+  session-scoped, non-durable outcome that answers its duplicates until the session ends; only a
+  request that changed nothing (a read) is settled without an outcome, so its retry runs again.
 - Errors shared across tracks (`OwnerUnresponsiveError`, `RequestExpiredError`) are defined once,
   in `errors.ts`.
 
@@ -168,7 +171,11 @@ Merge note: `SnapshotReleasedError` and the snapshot type move to `next/access/`
 - The root is O(tables + ledger). Nothing is O(rows).
 - Each column chunk names its data extent.
 - Every reference carries the checksum of what it names.
-- Space is free when neither the durable root nor any pinned root reaches it.
+- Space is reusable only when neither the current durable root, nor the previous one (the other
+  root slot), nor any pinned root reaches it (two generations), and startup walks both roots.
+- Startup order: acquire the fence → open the store session → open the extent space (walk the
+  current and previous roots) → open the write path (a single log scan and replay, `publishedRows`
+  staging included) → spill sweep → ready.
 - Snapshot pins live in memory and are dropped when their client's lock is released.
 
 ### Spill (`spill/`)
@@ -191,6 +198,10 @@ Merge note: `SnapshotReleasedError` and the snapshot type move to `next/access/`
   moment it is served, so a close at any point returns it; `repay` validates before it changes
   anything.
 - The drain is not reentrant, a closed grant is inert, and abort listeners are removed.
+- Loan-backed bytes leave a grant only through `repay`; `release` returns only holdings beyond the
+  outstanding loan (`LoanBackedReleaseError` otherwise).
+- `tryAdmit` admits synchronously when the minimum fits and nothing is queued (the point-read fast
+  path); it never jumps a queue and otherwise returns null.
 - The one size error is a single value larger than the reserve.
 
 ### Pipeline (`exec/pipeline.ts`)
