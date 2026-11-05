@@ -30,6 +30,7 @@
  * - **Cancellation.** If `signal` aborts, the call rejects with its reason between page reads; the
  *   outputs are unspecified and nothing is retained.
  */
+import type { MaybePromise } from "../access/key-index.js";
 import { SnapshotReleasedError, type Snapshot } from "../access/snapshot.js";
 import type { Grant } from "../memory/governor.js";
 import { locatorPosition, locatorSegment } from "../vector/locator.js";
@@ -66,8 +67,13 @@ export type FetchResult =
       readonly reason: "capacity" | "full" | "denied";
     };
 
+/**
+ * Synchronous when every page it needs is cached (ruling R6: a cached point read never awaits);
+ * the caller awaits only an actual Promise. The production fetcher serves access/ snapshots
+ * (`Snapshot` satisfies `SnapshotPin`) over B2's chunk readers (exec/scan.ts).
+ */
 export interface RowFetcher {
-  fetch(request: FetchRequest): Promise<FetchResult>;
+  fetch(request: FetchRequest): MaybePromise<FetchResult>;
 }
 
 /** Slots a flat output vector can hold. */

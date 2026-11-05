@@ -25,7 +25,7 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | `format/`          | format, write path               | Log frames and multipart transactions, header slots, in-memory and incremental recovery scans, replay rules, request ledger, manifest types                                                              |
 | `spill/`           | executor (OPFS service: storage) | Spill contract (one long-lived file); in-memory double                                                                                                                                                   |
 | `memory/`          | executor                         | Memory governor: admission, progress loans, held vs allocated bytes (reference implementation)                                                                                                           |
-| `exec/`            | executor                         | Push protocol and driver (`pipeline.ts`), row fetcher (`fetch.ts`), array/JSONB comparators (`semantic.ts`), scale-partitioned decimal SUM (`decimal-sum.ts`); kernels and operators to come             |
+| `exec/`            | executor                         | Entry point (`executor.ts`), result frames (`result.ts`), scans (`scan.ts`), table rules (`rules.ts`), push protocol (`pipeline.ts`), fetcher (`fetch.ts`), comparators, decimal SUM                     |
 | `ir/`              | lowering, executor               | Operator IR (`ir.ts`); the front-end boundary (`lowering.ts`)                                                                                                                                            |
 | `access/`          | write path + key index           | Storage access contracts the write path implements: snapshots and segments, catalog, key-index probes and ranges, `modify` (rows, conflicts, RETURNING), transactions, group commit, sequences, delivery |
 | `testing/`         | all                              | Differential-harness adapter for a partial new core                                                                                                                                                      |
@@ -261,21 +261,24 @@ and the owner import it directly.
 - Each edge holds at most one in-flight batch, plus whatever credits the producer has handed out
   as transfers.
 
-### Executor entry point (`exec/executor.ts`, `snapshot.ts`, `modify.ts`, `result.ts`)
+### Executor entry point (`exec/executor.ts`, `result.ts`, `scan.ts`, `rules.ts`)
 
 - `executor.prepare(plan)` compiles a plan once; `bind(values)` fills its placeholders;
-  `execute(request)` runs it against a pinned `QuerySnapshot`, the governor and the spill service.
+  `execute(request)` runs it over the access contracts: a read snapshot for a query, or an open
+  `Statement` for DML, which the executor ends or rolls back. It never commits.
 - The executor admits its own pipelines with plan-bounded minimums. State that outlives a
   pipeline is in spillable grants. Nothing is refused for size.
 - A plan from another catalog version fails with `PlanStaleError` before anything runs.
-- Results are columnar frames of about 1 MiB, pulled under a credit window: a frame counts
-  against the window until the consumer releases it, so a slow client pauses the pipeline. There
-  is no row-count cap.
-- `done` settles only after every grant and spill file is closed and the modify target finished or
-  aborted. Then the owner may release the pin.
-- The executor cannot import `write/`, so `snapshot.ts` and `modify.ts` state what it needs from
-  the write path. DML names rows by snapshot locators, a row named twice changes once, and the
-  statement never sees its own writes.
+- Three completions: `executed` (the plan ran; for DML the statement ended), committed
+  (`acknowledgeCommit()`: autocommit RETURNING waits in a charged, spillable spool until then),
+  and `delivered` (every frame released; the result grant closes).
+- Results are wire-ready frames: a plain-data payload plus a transfer list, about 1 MiB each,
+  with per-stream dictionary deltas up to 1 MiB per stream. A frame stays charged until the
+  client's credit returns, so a slow client pauses the pipeline. There is no row-count cap.
+- A point read whose index blocks and pages are cached runs inside `execute` with no await, and
+  its frame is taken with `results.poll()`. Long work yields every 4 ms.
+- Scans read access/ segments and the page track's chunk readers (`scan.ts`). CHECK and
+  generated columns are compiled by `compileTableRules` into the write path's `TableRules`.
 
 ### IR (`ir/`)
 

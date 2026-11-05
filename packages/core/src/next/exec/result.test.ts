@@ -1,7 +1,8 @@
 /**
  * The result stream's credit window (exec/result.ts) under the pipeline driver: ordering, end,
- * backpressure, demand-driven early frames, errors after frames, consumer cancellation, and one
- * frame larger than the window.
+ * backpressure, demand-driven early frames, the synchronous `poll`, the result grant's lifetime
+ * (`delivered`), errors after frames, consumer cancellation, one frame larger than the window,
+ * and the wire-ready payload checks.
  */
 import { describe, expect, it } from "vitest";
 import type { OutputColumn } from "../ir/ir.js";
@@ -10,29 +11,43 @@ import { allocateFlat, type Batch, type FlatVector } from "../vector/vector.js";
 import { QueryCancelledError } from "./errors.js";
 import { drive, type BatchSource, type Operator, type PushResult } from "./pipeline.js";
 import {
+  FrameBufferError,
   ResultChannel,
   frameByteLength,
   frameTransferList,
-  type FlatFrameColumn,
-  type FrameColumn,
+  type FrameOffer,
   type ResultFrame,
+  type UnnumberedPayload,
+  type WireFlat,
 } from "./result.js";
 
 const INT = { kind: "int32", bits: 32 } as const;
 const COLUMNS: readonly OutputColumn[] = [{ name: "n", type: INT, nullable: false }];
 const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
-function int32Column(values: readonly number[]): FlatFrameColumn {
-  return { form: "flat", validity: null, data: { layout: "i32", values: Int32Array.from(values) } };
+function int32Flat(values: readonly number[]): WireFlat {
+  return {
+    form: "flat",
+    length: values.length,
+    validity: null,
+    data: { layout: "i32", values: Int32Array.from(values) },
+  };
 }
 
-function offerOf(values: readonly number[], onFree: () => void = () => undefined) {
-  const columns = [int32Column(values)];
-  return { rowCount: values.length, byteLength: frameByteLength(columns), columns, free: onFree };
+function offerOf(
+  values: readonly number[],
+  onFree: () => void = () => undefined,
+  requiresLsn = 0,
+): FrameOffer {
+  return {
+    payload: { rowCount: values.length, columns: [int32Flat(values)], dictionaries: [] },
+    requiresLsn,
+    free: onFree,
+  };
 }
 
 function valuesOf(frame: ResultFrame): number[] {
-  const column = frame.columns[0];
+  const column = frame.payload.columns[0];
   if (column?.form !== "flat" || column.data.layout !== "i32") throw new TypeError("int32");
   return [...column.data.values];
 }
@@ -61,9 +76,9 @@ class CountingSource implements BatchSource {
 }
 
 /**
- * A toy result sink: copies each batch into a frame charged to its grant and coalesces batches
- * until a frame reaches `targetRows`, or seals early when the consumer is waiting (`demand`).
- * The real sink (Phase 2) does the same over every vector form.
+ * A toy result sink: copies batches into an exactly sized frame charged to its grant, sealing at
+ * `targetRows` or early when the consumer is waiting (`demand`). The real sink (Phase 2) does the
+ * same over every vector form, with stream dictionaries.
  */
 class ToySink implements Operator {
   #pending: number[] = [];
@@ -110,15 +125,35 @@ async function collect(channel: ResultChannel): Promise<number[][]> {
 describe("ResultChannel", () => {
   it("delivers frames in order with sequence numbers, then null", async () => {
     const channel = new ResultChannel(COLUMNS);
-    channel.offer(offerOf([1, 2]));
+    channel.offer(offerOf([1, 2], undefined, 7));
     channel.offer(offerOf([3]));
     channel.end();
     const first = await channel.next();
     const second = await channel.next();
-    expect([first?.sequence, second?.sequence]).toEqual([0, 1]);
+    expect([first?.payload.sequence, second?.payload.sequence]).toEqual([0, 1]);
     expect(first === null ? [] : valuesOf(first)).toEqual([1, 2]);
+    expect(first?.requiresLsn).toBe(7);
     expect(await channel.next()).toBeNull();
     expect(await channel.next()).toBeNull();
+  });
+
+  it("payloads are plain data: structured-clone safe, release outside", () => {
+    const channel = new ResultChannel(COLUMNS);
+    channel.offer(offerOf([1, 2, 3]));
+    const frame = channel.poll();
+    if (frame === null || frame === undefined) throw new Error("frame expected");
+    const cloned = structuredClone(frame.payload, { transfer: [...frame.transfer] });
+    expect(cloned.rowCount).toBe(3);
+    expect(frame.transfer[0]?.byteLength).toBe(0); // detached: the bytes moved
+  });
+
+  it("polls synchronously: a frame, undefined while running, null at the end", () => {
+    const channel = new ResultChannel(COLUMNS);
+    expect(channel.poll()).toBeUndefined();
+    channel.offer(offerOf([5]));
+    expect(channel.poll()?.payload.rowCount).toBe(1);
+    channel.end();
+    expect(channel.poll()).toBeNull();
   });
 
   it("pauses the pipeline at the window and resumes on release, never holding more", async () => {
@@ -134,11 +169,12 @@ describe("ResultChannel", () => {
     let rows = 0;
     for (let frame = await channel.next(); frame !== null; frame = await channel.next()) {
       peak = Math.max(peak, channel.outstandingBytes, grant.allocated);
-      rows += frame.rowCount;
+      rows += frame.payload.rowCount;
       await tick();
       frame.release();
     }
     await run;
+    await channel.delivered;
     expect(rows).toBe(10_000);
     expect(peak).toBeLessThan(10_000 + 4_000);
     expect(grant.allocated).toBe(0);
@@ -153,7 +189,9 @@ describe("ResultChannel", () => {
     const first = channel.next();
     expect(channel.demand).toBe(true);
     const run = drive(new CountingSource(8, 100), new ToySink(channel, grant, 10_000));
-    expect((await first)?.rowCount).toBe(100);
+    const head = await first;
+    expect(head?.payload.rowCount).toBe(100);
+    head?.release();
     expect(channel.demand).toBe(false);
     await run;
     // The rest coalesced into one frame: nobody was waiting while they were produced.
@@ -161,12 +199,30 @@ describe("ResultChannel", () => {
     grant.close();
   });
 
-  it("delivers queued frames before an execution error", async () => {
+  it("settles delivered only after the end and every release", async () => {
+    const channel = new ResultChannel(COLUMNS);
+    let delivered = false;
+    void channel.delivered.then(() => (delivered = true));
+    channel.offer(offerOf([1]));
+    const frame = await channel.next();
+    channel.end();
+    await tick();
+    expect(delivered).toBe(false); // the handed-out frame still holds the result grant
+    frame?.release();
+    await tick();
+    expect(delivered).toBe(true);
+  });
+
+  it("delivers queued frames before an execution error, then rejects delivered", async () => {
     const channel = new ResultChannel(COLUMNS);
     channel.offer(offerOf([1]));
     channel.fail(new RangeError("division by zero"));
-    expect((await channel.next())?.rowCount).toBe(1);
+    const frame = await channel.next();
+    expect(frame?.payload.rowCount).toBe(1);
     await expect(channel.next()).rejects.toThrow("division by zero");
+    expect(() => channel.poll()).toThrow("division by zero");
+    frame?.release();
+    await expect(channel.delivered).rejects.toThrow("division by zero");
   });
 
   it("rejects a waiting consumer when the execution fails", async () => {
@@ -176,28 +232,26 @@ describe("ResultChannel", () => {
     await expect(waiting).rejects.toThrow("overflow");
   });
 
-  it("cancels: frees queued frames, rejects the producer, calls onCancel once", async () => {
+  it("cancels: frees queued frames, rejects the producer, closes at once, onCancel once", async () => {
     const reasons: unknown[] = [];
     let freed = 0;
     const channel = new ResultChannel(COLUMNS, {
       windowBytes: 4,
       onCancel: (reason) => reasons.push(reason),
     });
-    const handedOut = (() => {
-      channel.offer(offerOf([1], () => (freed += 1)));
-      return channel.next();
-    })();
+    channel.offer(offerOf([1], () => (freed += 1)));
+    const handedOut = channel.poll();
     expect(channel.offer(offerOf([2], () => (freed += 1)))).toBe("blocked");
     const producer = channel.ready();
     channel.cancel("closed by client");
     channel.cancel("again");
     await expect(producer).rejects.toBeInstanceOf(QueryCancelledError);
     await expect(channel.next()).rejects.toBeInstanceOf(QueryCancelledError);
+    await expect(channel.delivered).rejects.toBeInstanceOf(QueryCancelledError);
     expect(reasons).toEqual(["closed by client"]);
     expect(freed).toBe(1); // the queued frame; the handed-out one is still the consumer's
-    const frame = await handedOut;
-    frame?.release();
-    frame?.release();
+    handedOut?.release();
+    handedOut?.release();
     expect(freed).toBe(2);
     expect(channel.outstandingBytes).toBe(0);
     // A producer that offers after the cancel has its frame freed at once.
@@ -221,51 +275,95 @@ describe("ResultChannel", () => {
     expect(channel.offer(offerOf(Array.from({ length: 100 }, (_, i) => i)))).toBe("blocked");
     const producer = channel.ready();
     const frame = await channel.next();
-    expect(frame?.rowCount).toBe(100);
+    expect(frame?.payload.rowCount).toBe(100);
     frame?.release();
     await producer;
     channel.end();
     expect(await channel.next()).toBeNull();
   });
 
-  it("refuses a second concurrent next() and an offer after end", async () => {
+  it("refuses a second next(), a poll while one waits, and an offer after end", async () => {
     const channel = new ResultChannel(COLUMNS);
     const first = channel.next();
     await expect(channel.next()).rejects.toThrow(TypeError);
+    expect(() => channel.poll()).toThrow(TypeError);
     channel.end();
     expect(await first).toBeNull();
     expect(() => channel.offer(offerOf([1]))).toThrow(TypeError);
   });
 });
 
-describe("frame buffers", () => {
-  it("lists each buffer once for transfer and counts bytes by capacity", () => {
+describe("frame payloads", () => {
+  it("lists each buffer once for transfer and counts bytes, dictionary deltas included", () => {
     const shared = new Uint32Array([0b101]);
-    const dictionary = {
-      form: "flat",
-      validity: null,
-      data: { layout: "varlen", bytes: new Uint8Array(6), offsets: Int32Array.from([0, 3, 6]) },
-    } as const;
-    const columns: FrameColumn[] = [
-      { form: "flat", validity: shared, data: { layout: "f64", values: new Float64Array(3) } },
-      { form: "dictionary", codes: new Int32Array(3), validity: shared, dictionary },
-      { form: "constant", value: int32Column([7]) },
-      {
-        form: "flat",
-        validity: null,
-        data: {
-          layout: "decimal",
-          scale: 2,
-          scales: null,
-          coefficients: { repr: "wide", values: [10n ** 40n] },
-          specials: null,
+    const payload: UnnumberedPayload = {
+      rowCount: 3,
+      columns: [
+        {
+          form: "flat",
+          length: 3,
+          validity: shared,
+          data: { layout: "f64", values: new Float64Array(3) },
         },
-      },
-    ];
-    const buffers = frameTransferList(columns);
+        {
+          form: "dictionary",
+          length: 3,
+          codes: new Int32Array(3),
+          validity: shared,
+          dictionary: 0,
+        },
+        { form: "constant", length: 3, value: int32Flat([7]) },
+        {
+          form: "flat",
+          length: 1,
+          validity: null,
+          data: {
+            layout: "decimal",
+            scale: 2,
+            scales: null,
+            coefficients: { repr: "wide", values: [10n ** 40n] },
+            specials: null,
+          },
+        },
+      ],
+      dictionaries: [
+        {
+          id: 0,
+          from: 0,
+          values: {
+            form: "flat",
+            length: 2,
+            validity: null,
+            data: {
+              layout: "varlen",
+              bytes: new Uint8Array(6),
+              offsets: Int32Array.from([0, 3, 6]),
+            },
+          },
+        },
+      ],
+    };
+    const buffers = frameTransferList(payload);
     expect(buffers).toHaveLength(6);
     expect(new Set(buffers).size).toBe(6);
     // 24 + 4 (validity once) + 12 + 6 + 12 + 4, plus the BigInt (16 + 8 × 3 digits).
-    expect(frameByteLength(columns)).toBe(62 + 40);
+    expect(frameByteLength(payload)).toBe(62 + 40);
+  });
+
+  it("refuses a view that does not cover its whole buffer", () => {
+    const big = new Int32Array(16);
+    const payload: UnnumberedPayload = {
+      rowCount: 4,
+      columns: [
+        {
+          form: "flat",
+          length: 4,
+          validity: null,
+          data: { layout: "i32", values: big.subarray(0, 4) },
+        },
+      ],
+      dictionaries: [],
+    };
+    expect(() => frameTransferList(payload)).toThrow(FrameBufferError);
   });
 });

@@ -1,39 +1,60 @@
 /**
- * Streaming results: columnar frames of bounded bytes, pulled by the consumer under a credit
- * window, with no row-count cap.
+ * Streaming results: wire-ready columnar frames of bounded bytes, pulled by the owner under a
+ * credit window, with no row-count cap (ruling R3: this is the one frame-accounting model).
  *
- * ## Frames
- * - A `ResultFrame` is a dense run of result rows: one `FrameColumn` per output column (the
- *   stream's `columns` give names and types once), no selection, `rowCount` rows.
- * - A frame's buffers belong to that frame alone, sized to its rows, so the owner can post them
- *   with `frameTransferList(frame)` as the transfer list (zero copy; the owner's views detach).
- * - Text stays UTF-8 (`varlen`), dictionary columns stay codes plus the dictionary entries the
- *   frame needs, constants stay one value. The client builds JS values and row objects from them,
- *   only on request (PROPOSAL "Public API": columnar-first results).
+ * ## Frames and payloads
+ * - A `ResultFrame` is a dense run of result rows. Its `payload` is plain data, safe for
+ *   `postMessage`; `transfer` lists its ArrayBuffers; `release` and `requiresLsn` stay outside the
+ *   payload. The owner posts `postMessage(frame.payload, frame.transfer)` as is: no second
+ *   compaction, no copy.
+ * - Every typed array in a payload covers its whole ArrayBuffer (offset 0, full length), and no
+ *   buffer is shared with another frame or with the engine, so transferring moves exactly the
+ *   frame's bytes (`frameTransferList` checks it).
+ * - Columns keep their executor form (vector/vector.ts `VectorData`): exact int64 (`safe` f64 or
+ *   BigInt64Array), decimal tiers, UTF-8 bytes, constants as one value. Types travel once, in the
+ *   stream's `columns`. JS values and row objects are built by the client, on request.
+ * - **Dictionaries are per stream.** A dictionary column refers to a stream dictionary by id. The
+ *   first frame that needs entries of it carries them as a delta (`dictionaries`: entries
+ *   appended at `from`); later frames send only the new entries they use; codes index the whole
+ *   stream dictionary. The consumer keeps stream dictionaries until the stream ends. Their total
+ *   bytes per stream are bounded by `STREAM_DICTIONARY_BYTES`: past it, columns are sent as plain
+ *   (flat) values, so the client's dictionary memory stays bounded.
  * - Size: the result sink seals a frame at about `RESULT_FRAME_TARGET_BYTES`, or earlier when the
- *   consumer is waiting with nothing queued (`demand`), so the first rows of `SELECT *` leave at
- *   the first batch while a fast producer still sends large frames. A single row larger than the
- *   target is a frame of one row.
+ *   consumer is waiting with nothing queued (`demand`), so a point read or the first page of
+ *   `SELECT *` leaves at once while a fast producer still sends large frames. One row larger than
+ *   the target is a frame of one row.
  *
- * ## Credits and memory
- * - A frame is charged to the result sink's grant from the moment it is offered until the
- *   consumer calls `release()` (idempotent). Unreleased frame bytes, queued or handed out, are the
- *   stream's **outstanding** bytes; while they reach `windowBytes`, the sink's `push` returns
- *   `blocked` (exec/pipeline.ts) and the whole pipeline pauses. A slow consumer costs at most one
- *   window, never a growing buffer.
- * - The consumer (the owner's protocol layer) releases a frame when the client has taken it: on
- *   the client's credit message, not on `postMessage`, so the client's backlog is bounded too.
- *   A consumer that holds frames without releasing them, and then waits for `next()`, deadlocks
- *   itself once it holds a window; that is a consumer bug.
+ * ## Credits and the result grant
+ * - A frame is charged to the execution's result grant from the moment it is offered until the
+ *   owner calls `release()` (idempotent), which it does when the client's credit for that frame
+ *   returns: not at `postMessage`, so the client's backlog is bounded too. Unreleased bytes,
+ *   queued or handed out, are the stream's outstanding bytes; while they reach `windowBytes`, the
+ *   sink's `push` returns `blocked` (exec/pipeline.ts) and the pipeline pauses.
+ * - The result grant outlives the execution's `executed`. It closes, and `delivered` settles, when
+ *   the stream has ended and every frame was released, or at once when the stream is cancelled
+ *   (the owner cancels on disconnect; frames already transferred then live in the client's heap).
+ * - An owner that holds a window of frames without releasing them and then waits on `next()`
+ *   deadlocks itself; that is an owner bug.
  *
- * ## End, errors, cancellation
- * - `next()` returns frames in order, then `null` after the last. One `next()` at a time.
- * - On an execution error, frames already queued are still delivered (as in PostgreSQL, a client
- *   may have seen rows before the error), then `next()` rejects with the error.
- * - `cancel(reason)` by the consumer: queued frames are released, the producer's pending
- *   `ready()` rejects with `QueryCancelledError`, and the execution is cancelled. Frames already
- *   handed out stay the consumer's to release. After `cancel`, `next()` rejects with
- *   `QueryCancelledError`. Cancelling a finished stream only releases its queue.
+ * ## Delivery rule
+ * `frame.requiresLsn` is the largest LSN the frame's rows depend on (the view's `observedLsn` and
+ * every sequence reservation used so far). Under strict durability the owner posts the frame only
+ * after `writePath.durable(requiresLsn)`, which is null, so no await, when it is already durable.
+ *
+ * ## RETURNING spool (ruling R2)
+ * For DML with RETURNING the sink writes rows into the result spool (charged to the result grant,
+ * spilled through the spill service under pressure) instead of offering frames, and replays it
+ * into frames only after `Execution.acknowledgeCommit()`. A cancel or a failed commit discards it.
+ *
+ * ## Pulling, end, errors, cancellation
+ * - `next()` returns frames in order, then `null` after the last; `poll()` is its synchronous
+ *   form for the fast path (a frame, `null` at the end, `undefined` when none is ready yet). One
+ *   pending `next()` at a time.
+ * - On an execution error, queued frames are still delivered (a client may have seen rows before
+ *   the error, as in PostgreSQL), then `next()` rejects (or `poll()` throws) with the error.
+ * - `cancel(reason)`: queued frames are released, the producer's pending `ready()` rejects with
+ *   `QueryCancelledError`, the execution is cancelled, the result grant closes. Afterwards `next()`
+ *   rejects with `QueryCancelledError`.
  */
 import type { OutputColumn } from "../ir/ir.js";
 import { bigintBytes } from "../memory/governor.js";
@@ -45,32 +66,61 @@ import type { PushResult } from "./pipeline.js";
 export const RESULT_FRAME_TARGET_BYTES = BATCH_TARGET_BYTES;
 /** Default credit window: two frames, so the pipeline fills one while the other is in flight. */
 export const RESULT_WINDOW_BYTES = 2 * RESULT_FRAME_TARGET_BYTES;
+/** Most dictionary bytes one stream sends; later dictionary columns go out plain. */
+export const STREAM_DICTIONARY_BYTES = 1024 * 1024;
 
-export interface FlatFrameColumn {
+export interface WireFlat {
   readonly form: "flat";
+  readonly length: number;
+  /** Bit set = valid; null when every slot is valid. */
   readonly validity: Validity | null;
   readonly data: VectorData;
 }
 
-export type FrameColumn =
-  | FlatFrameColumn
-  /** One value for every row of the frame: `value` has length 1. */
-  | { readonly form: "constant"; readonly value: FlatFrameColumn }
-  /** Codes into `dictionary` (distinct, non-null entries; null is in `validity`). */
-  | {
-      readonly form: "dictionary";
-      readonly codes: Int32Array;
-      readonly validity: Validity | null;
-      readonly dictionary: FlatFrameColumn;
-    };
+export interface WireConstant {
+  readonly form: "constant";
+  readonly length: number;
+  /** Length 1. */
+  readonly value: WireFlat;
+}
 
-export interface ResultFrame {
+export interface WireDictionary {
+  readonly form: "dictionary";
+  readonly length: number;
+  /** Codes into stream dictionary `dictionary` (meaningful only where `validity` says valid). */
+  readonly codes: Int32Array;
+  readonly validity: Validity | null;
+  readonly dictionary: number;
+}
+
+export type WireVector = WireFlat | WireConstant | WireDictionary;
+
+/** Entries appended to stream dictionary `id` at index `from` (distinct, non-null). */
+export interface DictionaryDelta {
+  readonly id: number;
+  readonly from: number;
+  readonly values: WireFlat;
+}
+
+/** Plain data: structured-clone safe, no functions. */
+export interface FramePayload {
   /** 0, 1, 2… within the stream, so a protocol can detect a lost frame. */
   readonly sequence: number;
   readonly rowCount: number;
-  /** Bytes of the frame's buffers, the amount charged until `release`. */
+  /** One per output column, each `length === rowCount`. */
+  readonly columns: readonly WireVector[];
+  /** Dictionary entries first needed by this frame, applied before its columns are read. */
+  readonly dictionaries: readonly DictionaryDelta[];
+}
+
+export interface ResultFrame {
+  readonly payload: FramePayload;
+  /** The payload's ArrayBuffers, for `postMessage`'s transfer list. */
+  readonly transfer: readonly ArrayBuffer[];
+  /** Bytes charged until `release`. */
   readonly byteLength: number;
-  readonly columns: readonly FrameColumn[];
+  /** See "Delivery rule". */
+  readonly requiresLsn: number;
   /** Returns the frame's credit and its bytes. Idempotent. */
   release(): void;
 }
@@ -79,22 +129,26 @@ export interface ResultStream {
   readonly columns: readonly OutputColumn[];
   /** The next frame, or null after the last; rejects with the execution's error. */
   next(): Promise<ResultFrame | null>;
+  /** Synchronous `next`: a frame, null at the end, undefined when none is ready; throws errors. */
+  poll(): ResultFrame | null | undefined;
   /** The consumer no longer wants results: cancels the execution. Idempotent. */
   cancel(reason?: unknown): void;
 }
 
-/** What the result sink offers: a sealed frame and how to free its bytes. */
+/** A payload without its sequence number (the channel numbers frames). */
+export type UnnumberedPayload = Omit<FramePayload, "sequence">;
+
+/** What the result sink offers: a sealed payload and how to free its bytes. */
 export interface FrameOffer {
-  readonly rowCount: number;
-  readonly byteLength: number;
-  readonly columns: readonly FrameColumn[];
-  /** Frees the frame's bytes from the sink's grant (called once, on release). */
+  readonly payload: UnnumberedPayload;
+  readonly requiresLsn: number;
+  /** Frees the frame's bytes from the result grant (called once, on release). */
   readonly free: () => void;
 }
 
 export interface ResultChannelOptions {
   readonly windowBytes?: number;
-  /** Called once when the consumer cancels; the execution aborts its pipelines. */
+  /** Called once when the consumer cancels an open stream; the execution aborts its pipelines. */
   readonly onCancel?: (reason: unknown) => void;
 }
 
@@ -109,12 +163,23 @@ interface Waiter<T> {
   readonly reject: (reason: unknown) => void;
 }
 
+/** Thrown when a payload would transfer bytes it does not own, or a shared buffer. */
+export class FrameBufferError extends Error {
+  readonly code = "MINNOW_FRAME_BUFFER";
+  constructor(message: string) {
+    super(message);
+    this.name = "FrameBufferError";
+  }
+}
+
 /**
- * The credit window between the result sink (producer) and the owner (consumer): the reference
- * and production implementation of `ResultStream`.
+ * The credit window between the result sink (producer) and the owner (consumer): the production
+ * implementation of `ResultStream`.
  */
 export class ResultChannel implements ResultStream {
   readonly windowBytes: number;
+  /** Settles as "Credits and the result grant" says; the execution closes the grant on it. */
+  readonly delivered: Promise<void>;
   readonly #onCancel: ((reason: unknown) => void) | undefined;
   readonly #queue: ResultFrame[] = [];
   #state: State = { kind: "open" };
@@ -122,6 +187,8 @@ export class ResultChannel implements ResultStream {
   #sequence = 0;
   #consumer: Waiter<ResultFrame | null> | null = null;
   #producer: Waiter<void> | null = null;
+  readonly #settle: Waiter<void>;
+  #settled = false;
 
   constructor(
     readonly columns: readonly OutputColumn[],
@@ -129,6 +196,12 @@ export class ResultChannel implements ResultStream {
   ) {
     this.windowBytes = options.windowBytes ?? RESULT_WINDOW_BYTES;
     this.#onCancel = options.onCancel;
+    let settle: Waiter<void> | null = null;
+    this.delivered = new Promise<void>((resolve, reject) => {
+      settle = { resolve, reject };
+    });
+    this.#settle = settle as unknown as Waiter<void>;
+    this.delivered.catch(() => undefined);
   }
 
   /** Unreleased frame bytes (queued or handed out). */
@@ -146,7 +219,7 @@ export class ResultChannel implements ResultStream {
   /**
    * Hands a sealed frame over. `blocked` means it was accepted but the window is full: push
    * nothing more until `ready()` resolves. After a cancel the frame is freed at once and the
-   * result is `blocked` (so the producer meets the rejection in `ready()`).
+   * result is `blocked` (the producer then meets the rejection in `ready()`).
    */
   offer(offer: FrameOffer): PushResult {
     if (this.#state.kind === "ended" || this.#state.kind === "failed")
@@ -180,6 +253,7 @@ export class ResultChannel implements ResultStream {
     if (this.#state.kind !== "open") return;
     this.#state = { kind: "ended" };
     this.#settleConsumer();
+    this.#maybeSettle();
   }
 
   /** The execution failed: queued frames are still delivered, then `next()` rejects. */
@@ -190,6 +264,7 @@ export class ResultChannel implements ResultStream {
       error: error instanceof Error ? error : new Error(String(error), { cause: error }),
     };
     this.#settleConsumer();
+    this.#maybeSettle();
   }
 
   // ---- consumer side (the owner) ----
@@ -211,6 +286,21 @@ export class ResultChannel implements ResultStream {
     }
   }
 
+  poll(): ResultFrame | null | undefined {
+    if (this.#consumer !== null) throw new TypeError("next() is pending");
+    const frame = this.#queue.shift();
+    if (frame !== undefined) return frame;
+    switch (this.#state.kind) {
+      case "ended":
+        return null;
+      case "failed":
+      case "cancelled":
+        throw this.#state.error;
+      case "open":
+        return undefined;
+    }
+  }
+
   cancel(reason?: unknown): void {
     if (this.#state.kind === "cancelled") return;
     const wasOpen = this.#state.kind === "open";
@@ -223,26 +313,33 @@ export class ResultChannel implements ResultStream {
     const producer = this.#producer;
     this.#producer = null;
     producer?.reject(error);
+    if (!this.#settled) {
+      this.#settled = true;
+      this.#settle.reject(error);
+    }
     if (wasOpen) this.#onCancel?.(reason);
   }
 
   #frame(offer: FrameOffer): ResultFrame {
     let released = false;
+    const payload: FramePayload = { ...offer.payload, sequence: this.#sequence++ };
+    const byteLength = frameByteLength(payload);
     return {
-      sequence: this.#sequence++,
-      rowCount: offer.rowCount,
-      byteLength: offer.byteLength,
-      columns: offer.columns,
+      payload,
+      transfer: frameTransferList(payload),
+      byteLength,
+      requiresLsn: offer.requiresLsn,
       release: () => {
         if (released) return;
         released = true;
-        this.#outstanding -= offer.byteLength;
+        this.#outstanding -= byteLength;
         offer.free();
         if (this.#outstanding < this.windowBytes && this.#producer !== null) {
           const producer = this.#producer;
           this.#producer = null;
           producer.resolve();
         }
+        this.#maybeSettle();
       },
     };
   }
@@ -254,94 +351,107 @@ export class ResultChannel implements ResultStream {
     if (this.#state.kind === "failed") consumer.reject(this.#state.error);
     else consumer.resolve(null);
   }
+
+  #maybeSettle(): void {
+    if (this.#settled || this.#queue.length > 0 || this.#outstanding > 0) return;
+    if (this.#state.kind === "ended") {
+      this.#settled = true;
+      this.#settle.resolve();
+    } else if (this.#state.kind === "failed") {
+      this.#settled = true;
+      this.#settle.reject(this.#state.error);
+    }
+  }
 }
 
 type TypedArray =
   Uint8Array | Uint16Array | Uint32Array | Int32Array | Float32Array | Float64Array | BigInt64Array;
 
-function dataArrays(data: VectorData): TypedArray[] {
+function dataArrays(data: VectorData, into: TypedArray[]): void {
   switch (data.layout) {
     case "bool":
     case "i32":
     case "f64":
     case "f32":
-      return [data.values];
+      into.push(data.values);
+      return;
     case "int64":
-      return [data.values.values];
+      into.push(data.values.values);
+      return;
     case "decimal": {
-      const arrays: TypedArray[] = [];
-      if (data.scales !== null) arrays.push(data.scales);
-      if (data.specials !== null) arrays.push(data.specials);
+      if (data.scales !== null) into.push(data.scales);
+      if (data.specials !== null) into.push(data.specials);
       const coefficients = data.coefficients;
-      if (coefficients.repr === "int128") arrays.push(coefficients.limbs);
-      else if (coefficients.repr !== "wide") arrays.push(coefficients.values);
-      return arrays;
+      if (coefficients.repr === "int128") into.push(coefficients.limbs);
+      else if (coefficients.repr !== "wide") into.push(coefficients.values);
+      return;
     }
     case "varlen":
-      return [data.bytes, data.offsets];
+      into.push(data.bytes, data.offsets);
+      return;
     case "fixed16":
-      return [data.bytes];
+      into.push(data.bytes);
+      return;
     case "interval":
-      return [data.months, data.days, data.micros.values];
+      into.push(data.months, data.days, data.micros.values);
+      return;
   }
 }
 
-function flatArrays(column: FlatFrameColumn): TypedArray[] {
-  const arrays = dataArrays(column.data);
-  if (column.validity !== null) arrays.push(column.validity);
+function flats(payload: UnnumberedPayload): WireFlat[] {
+  const out: WireFlat[] = payload.dictionaries.map((delta) => delta.values);
+  for (const column of payload.columns)
+    if (column.form === "flat") out.push(column);
+    else if (column.form === "constant") out.push(column.value);
+  return out;
+}
+
+function payloadArrays(payload: UnnumberedPayload): TypedArray[] {
+  const arrays: TypedArray[] = [];
+  for (const flat of flats(payload)) {
+    dataArrays(flat.data, arrays);
+    if (flat.validity !== null) arrays.push(flat.validity);
+  }
+  for (const column of payload.columns)
+    if (column.form === "dictionary") {
+      arrays.push(column.codes);
+      if (column.validity !== null) arrays.push(column.validity);
+    }
   return arrays;
 }
 
-function columnArrays(column: FrameColumn): TypedArray[] {
-  switch (column.form) {
-    case "flat":
-      return flatArrays(column);
-    case "constant":
-      return flatArrays(column.value);
-    case "dictionary": {
-      const arrays = [column.codes, ...flatArrays(column.dictionary)];
-      if (column.validity !== null) arrays.push(column.validity);
-      return arrays;
-    }
-  }
-}
-
 /**
- * The distinct ArrayBuffers of a frame's columns: `postMessage(frame, frameTransferList(frame))`.
- * Wide decimal coefficients (`bigint[]`) are structured-cloned, not transferred.
+ * The distinct ArrayBuffers of a payload, for `postMessage`'s transfer list. Throws
+ * `FrameBufferError` if a view does not cover its whole buffer or the buffer is shared. Wide
+ * decimal coefficients (`bigint[]`) are structured-cloned, not transferred.
  */
-export function frameTransferList(columns: readonly FrameColumn[]): ArrayBuffer[] {
+export function frameTransferList(payload: UnnumberedPayload): ArrayBuffer[] {
   const buffers = new Set<ArrayBuffer>();
-  for (const column of columns)
-    for (const array of columnArrays(column)) {
-      const buffer = array.buffer;
-      if (buffer instanceof ArrayBuffer) buffers.add(buffer);
-    }
+  for (const view of payloadArrays(payload)) {
+    const buffer = view.buffer;
+    if (!(buffer instanceof ArrayBuffer))
+      throw new FrameBufferError("Frame buffers must be ArrayBuffers, never SharedArrayBuffer");
+    if (buffers.has(buffer)) continue;
+    if (view.byteOffset !== 0 || view.byteLength !== buffer.byteLength)
+      throw new FrameBufferError(
+        `A frame view covers ${String(view.byteLength)} of its buffer's ${String(buffer.byteLength)} bytes`,
+      );
+    buffers.add(buffer);
+  }
   return [...buffers];
 }
 
-function wideBytes(column: FlatFrameColumn): number {
-  const data = column.data;
-  if (data.layout !== "decimal" || data.coefficients.repr !== "wide") return 0;
-  let bytes = 0;
-  for (const value of data.coefficients.values) bytes += bigintBytes(value);
-  return bytes;
-}
-
 /**
- * Bytes a frame's columns occupy: each distinct buffer once, by capacity, plus wide coefficients
- * as the governor counts BigInts. The amount the sink charges per frame.
+ * Bytes a payload occupies: each distinct buffer once, plus wide coefficients as the governor
+ * counts BigInts. The amount charged per frame.
  */
-export function frameByteLength(columns: readonly FrameColumn[]): number {
+export function frameByteLength(payload: UnnumberedPayload): number {
   let bytes = 0;
-  for (const buffer of frameTransferList(columns)) bytes += buffer.byteLength;
-  for (const column of columns)
-    bytes += wideBytes(
-      column.form === "flat"
-        ? column
-        : column.form === "constant"
-          ? column.value
-          : column.dictionary,
-    );
+  for (const buffer of frameTransferList(payload)) bytes += buffer.byteLength;
+  for (const flat of flats(payload)) {
+    const data = flat.data;
+    if (data.layout === "decimal" && data.coefficients.repr === "wide")
+      for (const value of data.coefficients.values) bytes += bigintBytes(value);
+  }
   return bytes;
 }
