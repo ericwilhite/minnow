@@ -11,6 +11,9 @@ describe("memory spill service", () => {
     expect(second.offset).toBe(3);
     expect(service.bytesInUse).toBe(5);
     expect([...(await file.read(first))]).toEqual([1, 2, 3]);
+    const target = new Uint8Array(2);
+    await file.readInto(second, target);
+    expect([...target]).toEqual([4, 5]);
     (file as MemorySpillFile).corrupt(second, 1);
     await expect(file.read(second)).rejects.toThrow(SpillCorruptionError);
     await file.close();

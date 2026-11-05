@@ -28,14 +28,29 @@
  *             varlen offsets and bytes, display scales and specials, each 8-byte aligned
  *   Pages are uncompressed (spill is bandwidth-bound and short-lived). The codec belongs to the
  *   executor track and must round-trip every `VectorData` variant exactly, locators included.
- * - Implementations batch small appends into large sequential writes (≥256 KiB) and may read
- *   several refs with one platform call. Buffers are charged to the writing operator's grant.
+ * - Implementations batch small appends into large sequential writes (≥256 KiB). The batching
+ *   buffer is charged to the `budget` given to `create` (the writing operator's grant); when the
+ *   budget refuses it, appends write each page directly, so spilling never needs memory beyond the
+ *   page the operator already holds. `readInto` reads into the caller's own (charged, reused)
+ *   buffer; `read` returns a new array the caller must account for.
+ *
+ * ## Implementations
+ * - `MemorySpillService` (memory-spill.ts): the test double, and the service on backends with no
+ *   scratch file (IndexedDB, memory).
+ * - The file service (storage track, phase 2: `spill/file-spill.ts`): one `FreeSpaceMap`
+ *   (storage/free-space.ts) over the backend's scratch file (`StorageBackend.scratch`, OPFS
+ *   `spill`), opened under the owner's fence. Each `SpillFile` is a list of extents; it extends
+ *   its last extent in place when the space after it is free (`allocateAt`), so a run is written
+ *   and read back sequentially. Writes are never flushed. `sweep` empties the map and truncates
+ *   the file to zero.
  *
  * ## Lifetime
  * - A file belongs to one query (`queryId`). `close` frees its extents. Cancellation and errors
  *   close every file the query opened; a query is restarted, never resumed.
  * - Only the engine owner touches spill space. Helpers receive page bytes by transfer.
  */
+import type { ByteBudget } from "../storage/extents.js";
+
 export interface SpillPageRef {
   readonly offset: number;
   readonly length: number;
@@ -47,15 +62,19 @@ export interface SpillFile {
   readonly queryId: number;
   /** Bytes appended so far. */
   readonly length: number;
+  /** Appends one page. The caller may reuse `page` once it resolves. */
   append(page: Uint8Array): Promise<SpillPageRef>;
   /** The page's bytes, verified; throws `SpillCorruptionError` on a checksum mismatch. */
   read(ref: SpillPageRef): Promise<Uint8Array>;
+  /** Reads the page into `target` (exactly `ref.length` bytes), verified like `read`. */
+  readInto(ref: SpillPageRef, target: Uint8Array): Promise<void>;
   /** Frees the file's extents for reuse. Idempotent. */
   close(): Promise<void>;
 }
 
 export interface SpillService {
-  create(queryId: number): Promise<SpillFile>;
+  /** A new file for `queryId`; its write batching is charged to `budget` (see "Files and pages"). */
+  create(queryId: number, budget: ByteBudget): Promise<SpillFile>;
   /** Marks the whole spill space free. Called once on open, after the owner's fence. */
   sweep(): Promise<void>;
   /** Spill bytes currently held (diagnostics). */

@@ -50,26 +50,19 @@
  */
 import type { ClientLedgerEntry } from "./ledger.js";
 import type { LogIncarnation } from "./log-frame.js";
+import type { BlobRef, ExtentRef } from "../storage/extents.js";
 import type { ColumnStatistics, PhysicalType, StatValue } from "../types.js";
 
 export type { ColumnStatistics, StatValue };
 
 export const MANIFEST_FORMAT_VERSION = 1;
 
-/** A byte range of the data space whose bytes carry their own checksums (pages). */
-export interface ExtentRef {
-  /** A multiple of `DATA_ALIGN`. */
-  readonly offset: number;
-  readonly length: number;
-}
-
-/** A checksummed byte range of the data space. */
-export interface BlobRef {
-  readonly offset: number;
-  readonly length: number;
-  /** xxHash32 (seed 0) of the referenced bytes. */
-  readonly checksum: number;
-}
+/**
+ * Data-space addresses are the storage track's (storage/extents.ts): an `ExtentRef` is the unit of
+ * allocation and reclaim (a column chunk's pages, contiguously); a `BlobRef` is a checksummed range
+ * inside one extent.
+ */
+export type { BlobRef, ExtentRef } from "../storage/extents.js";
 
 export interface ManifestRoot {
   readonly formatVersion: number;

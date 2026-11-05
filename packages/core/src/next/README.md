@@ -20,10 +20,10 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | `temporal.ts`      | contracts                        | DATE/TIMESTAMP on PostgreSQL's 2000 epoch; infinities; ISO text                                                                                                                              |
 | `hash/`            | contracts                        | xxHash32, the only checksum                                                                                                                                                                  |
 | `vector/`          | contracts → executor             | Batches (byte-bounded), vectors, validity, exact int64, int128 decimals, UTF-8 builder under a grant, locators                                                                               |
-| `storage/`         | storage                          | Backend contract (lock + async fence open, async mutations), file store, simulated disk with crash model, the storage kit (conformance + durability sweep)                                   |
+| `storage/`         | storage                          | Backend contract (lock + async fence open, async mutations), file store, simulated disk with crash model, the storage kit (conformance + durability sweep); the extent space (`extents.ts`: allocation, writer lifecycle, publish, pins and reclaim, the verified page cache), free map, read coalescing, OPFS backend |
 | `keys/`            | contracts → executor, key index  | Memcomparable key encoding: reusable writer, batched encoder over vectors, indexable-type rules                                                                                              |
 | `format/`          | format, write path               | Log frames and multipart transactions, header slots, in-memory and incremental recovery scans, replay rules, request ledger, manifest types                                                  |
-| `spill/`           | executor (OPFS service: storage) | Spill contract (one long-lived file); in-memory double                                                                                                                                       |
+| `spill/`           | executor (OPFS service: storage) | Spill contract (one long-lived scratch file, batching charged to the operator's budget); in-memory double                                                                                                                                                                                                              |
 | `memory/`          | executor                         | Memory governor: admission, progress loans, held vs allocated bytes (reference implementation)                                                                                               |
 | `exec/`            | executor                         | Push protocol and driver (`pipeline.ts`), row fetcher (`fetch.ts`), array/JSONB comparators (`semantic.ts`), scale-partitioned decimal SUM (`decimal-sum.ts`); kernels and operators to come |
 | `ir/`              | lowering, executor               | Operator IR (`ir.ts`); the front-end boundary (`lowering.ts`)                                                                                                                                |
@@ -59,7 +59,7 @@ Merge note: `SnapshotReleasedError` and the snapshot type move to `next/access/`
   types/temporal ← vector ← memory ← exec
   types, hash, vector ← keys ← exec, write
   hash ← storage ← format ← write
-  hash ← spill ← exec;  vector ← ir ← lower
+  hash, storage ← spill ← exec;  vector ← ir ← lower
   owner ← everything;  testing ← everything
   ```
 
@@ -113,10 +113,24 @@ Merge note: `SnapshotReleasedError` and the snapshot type move to `next/access/`
   - IndexedDB: a durable epoch record that every transaction checks.
 - Every mutation is async and checks ownership in the same step that applies its effect. A fenced
   owner changes nothing.
-- The store is four long-lived files: log, data space, and two root slots. Extents are reused in
-  place inside the data space.
+- The store is four long-lived files: log, data space, and two root slots. OPFS adds a fifth, the
+  spill scratch file, opened under the same fence. Extents are reused in place inside the data
+  space.
 - `publish` is atomic and durable: it flushes data, then writes the inactive root slot.
 - The log has a flush barrier and two header slots.
+- **The extent space** (`extents.ts`) is the only caller of the data-space calls and of `publish`.
+  - A writer reserves extents, appends checksummed blobs, seals, and either publishes once or
+    aborts. Abort frees at once; a crash before publish leaves orphans that the walk on open frees.
+  - `publish(root, { writers, retired })` is serialized and atomic. Retired extents are reused only
+    after the publish is durable and no pin of an older root generation remains.
+  - A rejected publish is indeterminate: the space keeps everything allocated and refuses writes
+    until the owner reopens.
+  - Free space is rebuilt on open from the extents the root reaches (the format track's
+    `reachable`), first fit, and released to the platform only as a free tail.
+  - One cache of encoded, verified blobs, charged to the governor and evicted before anything
+    spills. Misses are read in coalesced slabs (gaps ≤ 64 KiB, slabs ≤ 1 MiB) and copied out, so
+    eviction frees exactly what it uncharges. Reads the cache cannot hold are charged to the
+    caller's budget, or refused with `ReadDeniedError` (borrow, then retry).
 - The simulated disk crashes at any physical step. Every write after the last flush may land
   whole, torn or not at all, and may land out of order. It models honest and lying flush.
 - A backend is accepted by the **storage kit** (`kit.ts`): the conformance cases together with a
@@ -180,9 +194,12 @@ Merge note: `SnapshotReleasedError` and the snapshot type move to `next/access/`
 
 ### Spill (`spill/`)
 
-- One long-lived file, with space reused across queries.
+- One long-lived scratch file (`StorageBackend.scratch`, OPFS `spill`), with space reused across
+  queries through the storage free map; backends without one use the in-memory service.
 - Logically emptied on open, never named by the root, catalog or log.
 - No per-query caps.
+- Write batching is charged to the operator's budget, and is skipped when the budget refuses, so
+  spilling never needs memory beyond the page in hand.
 
 ### Memory (`memory/governor.ts`)
 

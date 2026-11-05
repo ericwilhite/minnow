@@ -70,10 +70,16 @@
  *   a pinned root, reaches.
  * - Never `resetLog` or `truncateLog` below a byte the durable root still needs.
  *
+ * ## Who calls what
+ * - The data space (`writeData`, `readData`, `readDataInto`, `releaseData`, `publish`) has one
+ *   caller: the extent space (`extents.ts`), which allocates, caches, reclaims and publishes. No
+ *   other module writes data or publishes a root directly.
+ * - The log calls belong to the write path (group commit, recovery).
+ *
  * ## Implementations
  * - `file-store.ts`: the store over four long-lived files (log, data, two root slots) through a
  *   `SyncFile` interface with the shape of `FileSystemSyncAccessHandle`. OPFS supplies real
- *   handles; `sim-disk.ts` supplies simulated ones with a physical crash model.
+ *   handles (`opfs.ts`); `sim-disk.ts` supplies simulated ones with a physical crash model.
  * - IndexedDB (storage track, after OPFS; needed for Safari and Firefox private browsing): the
  *   same contract with the epoch fence, ArrayBuffer values (never Blobs), log records keyed by
  *   offset and data chunk records.
@@ -84,6 +90,20 @@
 export const DATA_ALIGN = 4096;
 /** Size of each log header slot. A slot write is at most this many bytes. */
 export const LOG_HEADER_SLOT_BYTES = 512;
+
+/**
+ * The subset of `FileSystemSyncAccessHandle` the stores use. Every method is synchronous (Safari
+ * 16.4+), so a call on an open handle is never delayed by its page's main thread (WebKit bug
+ * 326345 delays only the async OPFS calls).
+ */
+export interface SyncFile {
+  read(buffer: Uint8Array, options: { at: number }): number;
+  write(buffer: Uint8Array, options: { at: number }): number;
+  truncate(size: number): void;
+  getSize(): number;
+  flush(): void;
+  close(): void;
+}
 
 export interface DataRange {
   readonly offset: number;
@@ -111,6 +131,12 @@ export interface StorageBackend {
   acquire(options?: AcquireOptions): Promise<OwnerLease>;
   /** A session over the store, valid while `lease` is held. */
   open(lease: OwnerLease): Promise<StoreSession>;
+  /**
+   * The engine's scratch file for the spill service (OPFS: `spill`, opened under the same fence at
+   * acquisition and closed with the lease), or null when the backend has none (IndexedDB, memory:
+   * the owner uses the in-memory spill service). Its contents mean nothing across leases.
+   */
+  scratch(lease: OwnerLease): SyncFile | null;
 }
 
 export interface StoreSession {
@@ -133,6 +159,12 @@ export interface StoreSession {
    * request order, may share one ArrayBuffer, and must not be mutated or transferred (copy first).
    */
   readData(ranges: readonly DataRange[]): Promise<Uint8Array[]>;
+  /**
+   * Reads `target.length` bytes at `offset` into `target` (one platform read on OPFS). The page
+   * cache reads coalesced slabs into one reused buffer this way. Throws `StoreCorruptionError` past
+   * the data length.
+   */
+  readDataInto(offset: number, target: Uint8Array): Promise<void>;
   /** Guarantee 5. */
   releaseData(ranges: readonly DataRange[]): Promise<void>;
   /** Bytes in the data space (the allocator's high-water mark on open). */

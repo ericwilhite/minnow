@@ -19,6 +19,7 @@ export class MemorySpillService implements SpillService {
     return bytes;
   }
 
+  /** Pages are kept in memory, so no batching buffer is charged to a budget. */
   async create(queryId: number): Promise<SpillFile> {
     const file = new MemorySpillFile(queryId, () => this.#files.delete(file));
     this.#files.add(file);
@@ -63,6 +64,11 @@ export class MemorySpillFile implements SpillFile {
     if (page?.length !== ref.length || xxHash32(page) !== ref.checksum)
       throw new SpillCorruptionError(`Spill page at ${String(ref.offset)} failed verification`);
     return page;
+  }
+
+  async readInto(ref: SpillPageRef, target: Uint8Array): Promise<void> {
+    if (target.length !== ref.length) throw new RangeError("Spill read target has the wrong size");
+    target.set(await this.read(ref));
   }
 
   /** Test seam: flips one byte of a stored page. */

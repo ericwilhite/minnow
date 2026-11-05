@@ -19,17 +19,11 @@ import {
   StoreCorruptionError,
   type DataRange,
   type StoreSession,
+  type SyncFile,
 } from "./contract.js";
+import { planSlabs } from "./slabs.js";
 
-/** The subset of `FileSystemSyncAccessHandle` the store uses. */
-export interface SyncFile {
-  read(buffer: Uint8Array, options: { at: number }): number;
-  write(buffer: Uint8Array, options: { at: number }): number;
-  truncate(size: number): void;
-  getSize(): number;
-  flush(): void;
-  close(): void;
-}
+export type { SyncFile } from "./contract.js";
 
 export interface FileSet {
   readonly log: SyncFile;
@@ -39,20 +33,19 @@ export interface FileSet {
 
 export const FILE_NAMES = ["log", "data", "root-0", "root-1"] as const;
 const HEADER_REGION = 2 * LOG_HEADER_SLOT_BYTES;
-/** Coalescing: merge ranges whose gap is at most this, into slabs of at most `MAX_SLAB`. */
-const MAX_GAP = 64 * 1024;
-const MAX_SLAB = 1024 * 1024;
 
-function readExact(file: SyncFile, at: number, length: number): Uint8Array {
-  const buffer = new Uint8Array(length);
+function readFully(file: SyncFile, at: number, buffer: Uint8Array): Uint8Array {
   let done = 0;
-  while (done < length) {
+  while (done < buffer.length) {
     const read = file.read(buffer.subarray(done), { at: at + done });
     if (read <= 0) throw new StoreCorruptionError("Short read inside the file");
     done += read;
   }
   return buffer;
 }
+
+const readExact = (file: SyncFile, at: number, length: number): Uint8Array =>
+  readFully(file, at, new Uint8Array(length));
 
 function writeAll(file: SyncFile, bytes: Uint8Array, at: number): void {
   let done = 0;
@@ -130,30 +123,24 @@ export class FileStoreSession implements StoreSession {
     for (const { offset, length } of ranges)
       if (offset < 0 || length < 0 || offset + length > size)
         throw new StoreCorruptionError("Read outside the data space");
-    const order = ranges
-      .map((range, position) => ({ range, position }))
-      .sort((a, b) => a.range.offset - b.range.offset);
     const results = new Array<Uint8Array>(ranges.length);
-    let index = 0;
-    for (let first = order[0]; first !== undefined; first = order[index]) {
-      let end = first.range.offset + first.range.length;
-      let last = index;
-      for (let next = order[last + 1]; next !== undefined; next = order[last + 1]) {
-        const nextEnd = Math.max(end, next.range.offset + next.range.length);
-        if (next.range.offset - end > MAX_GAP || nextEnd - first.range.offset > MAX_SLAB) break;
-        end = nextEnd;
-        last += 1;
+    for (const slab of planSlabs(ranges)) {
+      const bytes = readExact(data, slab.offset, slab.length);
+      for (const position of slab.members) {
+        const range = ranges[position];
+        if (range === undefined) continue;
+        const start = range.offset - slab.offset;
+        results[position] = bytes.subarray(start, start + range.length);
       }
-      const start = first.range.offset;
-      const slab = readExact(data, start, end - start);
-      for (const { range, position } of order.slice(index, last + 1))
-        results[position] = slab.subarray(
-          range.offset - start,
-          range.offset - start + range.length,
-        );
-      index = last + 1;
     }
     return results;
+  }
+
+  async readDataInto(offset: number, target: Uint8Array): Promise<void> {
+    const data = this.#live().data;
+    if (offset < 0 || offset + target.length > data.getSize())
+      throw new StoreCorruptionError("Read outside the data space");
+    readFully(data, offset, target);
   }
 
   async releaseData(ranges: readonly DataRange[]): Promise<void> {

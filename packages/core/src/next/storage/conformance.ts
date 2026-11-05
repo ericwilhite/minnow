@@ -136,6 +136,44 @@ export const storeConformanceCases: readonly ConformanceCase[] = [
     },
   },
   {
+    name: "readDataInto fills a caller's buffer exactly and refuses a read past the data length",
+    async run(createBackend) {
+      const { lease, session } = await owner(await createBackend());
+      await session.writeData(0, bytes(1, 2, 3, 4));
+      const target = new Uint8Array(3);
+      await session.readDataInto(1, target);
+      assert(equal(target, bytes(2, 3, 4)), "bytes read into the buffer");
+      await rejects(
+        () => session.readDataInto(2, new Uint8Array(3)),
+        StoreCorruptionError,
+        "a read past the data length",
+      );
+      await lease.release();
+    },
+  },
+  {
+    name: "the scratch file, when there is one, is fenced with the store",
+    async run(createBackend) {
+      const backend = await createBackend();
+      const first = await owner(backend);
+      const scratch = backend.scratch(first.lease);
+      if (scratch === null) {
+        await first.lease.release();
+        return;
+      }
+      scratch.write(bytes(7), { at: 0 });
+      const second = await backend.acquire({ steal: true, timeoutMs: 2_000 });
+      await rejects(
+        () => scratch.write(bytes(8), { at: 0 }),
+        Error,
+        "the lost owner's scratch handle is closed",
+      );
+      assert(backend.scratch(second) !== null, "the new owner has the scratch file");
+      await second.release();
+      await first.lease.release();
+    },
+  },
+  {
     name: "the log appends, flushes, keeps header slots, truncates and resets",
     async run(createBackend) {
       const backend = await createBackend();
