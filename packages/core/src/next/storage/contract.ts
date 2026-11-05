@@ -102,6 +102,15 @@
  *   epoch fence checked inside every read-write transaction, ArrayBuffer values (never Blobs) and
  *   byte records keyed by offset; over the platform's IndexedDB in browsers, over `sim-idb.ts` (a
  *   write-ahead log on the simulated disk, same crash model) in the storage kit.
+ *   **Platform assumption** (decided 2026-11-05): data, log and spill writes commit `relaxed`;
+ *   `publish` and `flushLog` commit `strict`. Guarantees 1 and 3 then rest on each engine keeping
+ *   one write-ahead log per database and committing in order, so that a strict commit makes every
+ *   earlier relaxed commit durable too (Chromium's LevelDB log, Firefox's and WebKit's SQLite in
+ *   WAL mode; the storage probe's device-flush counts agree: relaxed transactions issue no flush,
+ *   strict ones one). It is not power-cut tested in a browser. **Backstop:** if an engine broke
+ *   it, a write lost under a durable root is still caught, never read: every blob a root names
+ *   carries its checksum, and the log is checksum-chained, so the loss surfaces as
+ *   `StoreCorruptionError` / `LogCorruptionError`.
  * - `memory-store.ts`: the file store over in-memory files (in-memory databases, the M1 suites).
  * - `select.ts` (`chooseBackend`): OPFS where sync handles work, else IndexedDB, else memory.
  * Every implementation runs `storage/conformance.ts`.

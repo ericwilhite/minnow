@@ -181,7 +181,10 @@ is access's `Snapshot`.
   (streamed into blocks at open, a page at a time); reads select their records from the stored
   index inside their own transaction and refuse a missing or mismatched record. Relaxed writes are
   batched in call order and committed with each barrier (publish, log flush, release, truncate,
-  reset) on one commit chain; range lists of any length are driven iteratively. The log's last
+  reset) on one commit chain (this assumes each engine's one write-ahead log per database commits
+  in order, so a strict commit makes earlier relaxed ones durable; checksums turn a broken
+  assumption into a detected corruption, never a silent read: storage/contract.ts); range lists
+  of any length are driven iteratively. The log's last
   record is kept in memory while under 64 KiB and rewritten whole by the next commit, so log
   records scale with log bytes / 64 KiB rather than with commits; truncate and reset move the
   logical end when called, in order with appends. A malformed or exhausted epoch refuses
