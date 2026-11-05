@@ -169,6 +169,7 @@
     "!dist/block-format/frozen-vectors.*",
     "!dist/testing/differential-*",
     "!dist/testing/conformance-source.*",
-    "!dist/testing/live-write-source.*"
+    "!dist/testing/live-write-source.*",
+    "!dist/next/**"
   ]
 }

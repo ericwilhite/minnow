@@ -12,6 +12,7 @@
  * prefix and the IndexedDB store's key-partition prefix, each found nowhere else in the
  * package, and the SQL tokenizer's own refusal for an unterminated dollar-quoted string.
  */
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { constants, gzipSync } from "node:zlib";
 import { build } from "esbuild";
@@ -400,5 +401,34 @@ describe("core packaging", () => {
       .join("\n");
     expect(lazyText).toContain(OPFS_MARKER);
     expect(lazyText).toContain(IDB_MARKER);
+  });
+
+  it("no published entry point reaches the unreleased rebuild core (src/next)", async () => {
+    const manifest = JSON.parse(
+      readFileSync(join(repoRoot, "packages", "core", "package.json"), "utf8"),
+    ) as { exports: Record<string, string | { default?: string }> };
+    const entries = Object.keys(manifest.exports)
+      .filter((subpath) => {
+        const target = manifest.exports[subpath];
+        return typeof target === "object" && target.default?.endsWith(".js") === true;
+      })
+      .map((subpath) => `@minnowdb/core${subpath.slice(1)}`);
+    expect(entries.length).toBeGreaterThan(20);
+    const result = await build({
+      entryPoints: entries,
+      absWorkingDir: repoRoot,
+      bundle: true,
+      write: false,
+      splitting: true,
+      format: "esm",
+      platform: "browser",
+      target: "es2022",
+      outdir: "next-not-shipped-virtual-out",
+      metafile: true,
+      logLevel: "silent",
+    });
+    const inputs = Object.keys(result.metafile.inputs);
+    expect(inputs.some((path) => path.includes("/dist/engine/"))).toBe(true);
+    expect(inputs.filter((path) => path.includes("/dist/next/"))).toEqual([]);
   });
 });
