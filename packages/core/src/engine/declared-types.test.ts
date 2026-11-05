@@ -72,6 +72,37 @@ describe("declared numeric type names for lowering", () => {
       expect({ ...column, declaredTypeName: undefined }, name).toEqual(plain[name]);
   });
 
+  it("records VARCHAR(n) and CHAR(n) widths (R17.4)", () => {
+    const columns = compileWithDeclaredTypes(() =>
+      createdColumns(
+        "CREATE TABLE w (a VARCHAR(20), b CHARACTER VARYING(5), c CHAR(3), d CHAR, e CHARACTER, " +
+          "f VARCHAR, g TEXT)",
+      ),
+    );
+    expect(Object.values(columns).map((column) => column.declaredLength)).toEqual([
+      { length: 20, fixed: false },
+      { length: 5, fixed: false },
+      { length: 3, fixed: true },
+      { length: 1, fixed: true },
+      { length: 1, fixed: true },
+      undefined,
+      undefined,
+    ]);
+    const plain = createdColumns("CREATE TABLE w (a VARCHAR(20), c CHAR(3))");
+    expect(plain.a).toEqual({ name: "a", type: "string", nullable: true });
+    compileWithDeclaredTypes(() => {
+      expect(castTarget("SELECT CAST(a AS VARCHAR(4)) FROM t")).toEqual({
+        kind: "literal",
+        value: "string",
+        declaredLength: { length: 4, fixed: false },
+      });
+    });
+    expect(castTarget("SELECT CAST(a AS VARCHAR(4)) FROM t")).toEqual({
+      kind: "literal",
+      value: "string",
+    });
+  });
+
   it("records it on ADD COLUMN and JSON_TABLE columns", () => {
     const statement = compileWithDeclaredTypes(() =>
       compileStatement("ALTER TABLE t ADD COLUMN n INT2"),

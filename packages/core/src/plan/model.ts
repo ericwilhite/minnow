@@ -175,6 +175,12 @@ export interface FtsStats {
 export type DeclaredNumericTypeName =
   "smallint" | "integer" | "bigint" | "real" | "double precision";
 
+/** A declared VARCHAR(n) (`fixed` false) or CHAR(n) width (`compileWithDeclaredTypes`). */
+export interface DeclaredTextLength {
+  length: number;
+  fixed: boolean;
+}
+
 export type Expression =
   | {
       kind: "literal";
@@ -207,8 +213,9 @@ export type Expression =
        * the `+00` a TIMESTAMP constant's text does not carry.
        */
       zoned?: true;
-      /** On a numeric CAST target, only under `compileWithDeclaredTypes`. */
+      /** On a numeric or character CAST target, only under `compileWithDeclaredTypes`. */
       declaredTypeName?: DeclaredNumericTypeName;
+      declaredLength?: DeclaredTextLength;
     }
   /** A `?` or `$n` placeholder; `index` is 0-based. Replaced by a literal at bind time. */
   | { kind: "parameter"; index: number }

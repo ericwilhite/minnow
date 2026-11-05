@@ -26,6 +26,7 @@ import type {
   ComparisonOperator,
   CompiledQuery,
   DeclaredNumericTypeName,
+  DeclaredTextLength,
   Expression,
   FtsStats,
   JoinPlan,
@@ -1086,8 +1087,8 @@ const createTableTypeNames: ReadonlyMap<string, SqlColumnType> = new Map([
   ["DATETIME", "datetime"],
 ]);
 
-// Numeric type words by PostgreSQL's canonical name, recorded for the new core's lowering only
-// (next/DECISIONS.md C5, next/lower/INVENTORY.md). `FLOAT(p)` is `real` for p ≤ 24.
+// Numeric type words by PostgreSQL's canonical name, recorded with text widths for the new core's
+// lowering only (next/DECISIONS.md C5, R17.4; next/lower/INVENTORY.md). `FLOAT(p ≤ 24)` is real.
 const declaredNumericNames = new Map<string, DeclaredNumericTypeName>(
   (
     [
@@ -1102,7 +1103,8 @@ const declaredNumericNames = new Map<string, DeclaredNumericTypeName>(
 let recordDeclaredTypes = false;
 
 /**
- * Runs `compile` with `declaredTypeName` on numeric column definitions and CAST targets (C5).
+ * Runs `compile` with `declaredTypeName` / `declaredLength` on numeric and character column
+ * definitions and CAST targets (C5, R17.4).
  * For lowering only: outside it, compiled plans are exactly as before.
  */
 export function compileWithDeclaredTypes<T>(compile: () => T): T {
@@ -1115,11 +1117,18 @@ export function compileWithDeclaredTypes<T>(compile: () => T): T {
   }
 }
 
-function declaredNumericType(
+function declaredType(
   word: string,
   width?: number,
-): { declaredTypeName?: DeclaredNumericTypeName } {
-  const name = recordDeclaredTypes ? declaredNumericNames.get(word) : undefined;
+  varying?: boolean,
+): { declaredTypeName?: DeclaredNumericTypeName; declaredLength?: DeclaredTextLength } {
+  if (!recordDeclaredTypes) return {};
+  // VARCHAR(n) and CHARACTER VARYING(n); CHAR and CHARACTER are CHAR(1) without a width.
+  if (word === "VARCHAR" || (word === "CHARACTER" && varying === true))
+    return width === undefined ? {} : { declaredLength: { length: width, fixed: false } };
+  if (word === "CHAR" || word === "CHARACTER")
+    return { declaredLength: { length: width ?? 1, fixed: true } };
+  const name = declaredNumericNames.get(word);
   if (name === undefined) return {};
   return {
     declaredTypeName: word === "FLOAT" && width !== undefined && width <= 24 ? "real" : name,
@@ -1545,6 +1554,7 @@ export type CompiledStatement =
         withoutTimeZone?: true;
         /** Only under `compileWithDeclaredTypes`. */
         declaredTypeName?: DeclaredNumericTypeName;
+        declaredLength?: DeclaredTextLength;
         nullable?: boolean;
         defaultValue?: ColumnDefault;
         generatedValue?: ColumnGenerated;
@@ -1650,6 +1660,7 @@ export type CompiledStatement =
         withoutTimeZone?: true;
         /** Only under `compileWithDeclaredTypes`. */
         declaredTypeName?: DeclaredNumericTypeName;
+        declaredLength?: DeclaredTextLength;
         nullable?: boolean;
         defaultValue?: ColumnDefault;
         generatedValue?: ColumnGenerated;
@@ -9013,8 +9024,9 @@ class Parser {
    */
   #castTargetLiteral(): Extract<Expression, { kind: "literal" }> {
     const start = this.#index;
-    const { value, declaredTypeName } = this.#castTarget();
-    if (declaredTypeName !== undefined) return { kind: "literal", value, declaredTypeName };
+    const { value, ...declared } = this.#castTarget();
+    if (declared.declaredTypeName !== undefined || declared.declaredLength !== undefined)
+      return { kind: "literal", value, ...declared };
     if (value !== "datetime") return { kind: "literal", value };
     const words = this.tokens
       .slice(start, this.#index)
@@ -9028,7 +9040,11 @@ class Parser {
    * A CAST target: the SqlColumnType, or "number-integer" for the truncating integer names, and a
    * numeric target's declared name under `compileWithDeclaredTypes`.
    */
-  #castTarget(): { value: string; declaredTypeName?: DeclaredNumericTypeName } {
+  #castTarget(): {
+    value: string;
+    declaredTypeName?: DeclaredNumericTypeName;
+    declaredLength?: DeclaredTextLength;
+  } {
     const word = this.#identifier().toUpperCase();
     if (word === "NUMERIC" || word === "DECIMAL") {
       let precision: number | undefined;
@@ -9050,7 +9066,7 @@ class Parser {
     }
     if (word === "DOUBLE") {
       this.#keyword("PRECISION");
-      return { value: "number", ...declaredNumericType(word) };
+      return { value: "number", ...declaredType(word) };
     }
     const mapped = createTableTypeNames.get(word);
     if (mapped === undefined) throw new TypeError(`Unsupported CAST target: ${word}`);
@@ -9065,7 +9081,7 @@ class Parser {
     }
     return {
       value: integerTypeNames.has(word) ? "number-integer" : mapped,
-      ...declaredNumericType(word, width),
+      ...declaredType(word, width, multiWord),
     };
   }
 
@@ -9114,6 +9130,7 @@ class Parser {
     withoutTimeZone?: true;
     serial?: true;
     declaredTypeName?: DeclaredNumericTypeName;
+    declaredLength?: DeclaredTextLength;
   } {
     const declared = this.#identifier();
     const word = declared.toUpperCase();
@@ -9123,7 +9140,7 @@ class Parser {
         type: "number",
         integer: true,
         serial: true,
-        ...declaredNumericType(word),
+        ...declaredType(word),
       };
     }
     if (word === "NUMERIC" || word === "DECIMAL") {
@@ -9150,7 +9167,7 @@ class Parser {
     }
     if (word === "DOUBLE") {
       this.#keyword("PRECISION");
-      return { type: "number", ...declaredNumericType(word) };
+      return { type: "number", ...declaredType(word) };
     }
     const mapped = createTableTypeNames.get(word);
     if (mapped === undefined) {
@@ -9189,7 +9206,7 @@ class Parser {
     return {
       type: mapped,
       ...(integerTypeNames.has(word) ? { integer: true } : {}),
-      ...declaredNumericType(word, width),
+      ...declaredType(word, width, multiWord),
     };
   }
 
@@ -10796,6 +10813,7 @@ class Parser {
           integer?: true;
           sqlDomain?: SqlDomain;
           declaredTypeName?: DeclaredNumericTypeName;
+          declaredLength?: DeclaredTextLength;
           path: string;
         }> = [];
         for (;;) {
@@ -11358,7 +11376,7 @@ class Parser {
     if (this.#peek().kind === "parameter" && this.tokens[this.#index + 1]?.text === "::") {
       const parameter = this.#parameterExpression();
       this.#index += 1;
-      const { value: target, declaredTypeName } = this.#castTarget();
+      const { value: target, ...declared } = this.#castTarget();
       if (this.#peek().text !== "[") {
         throw new TypeError("An ANY/ALL placeholder cast names an array type, as in $1::int[]");
       }
@@ -11372,7 +11390,7 @@ class Parser {
           {
             kind: "literal",
             value: target,
-            ...(declaredTypeName === undefined ? {} : { declaredTypeName }),
+            ...declared,
           },
         ],
       };
