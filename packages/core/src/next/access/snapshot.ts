@@ -1,18 +1,17 @@
 /**
  * Snapshots: what a reader sees, and for how long (owner: write path + key index, track B3).
  *
- * The write path implements these; the executor (scans, `fetch`, `keyLookup`, joins), lowering
- * (catalog) and the owner (pin lifetime) consume them. Nothing here is durable.
+ * This is the executor's only read contract (ruling R1): it builds its scan operators and its
+ * `RowFetcher` (exec/fetch.ts) over these segments and the format track's chunk readers. The
+ * write path implements it; lowering reads the catalog; the owner manages pin lifetime. Nothing
+ * here is durable.
  *
  * ## What a snapshot is
- * A `Snapshot` is a pinned, immutable view: one manifest root plus the in-memory tail of every
+ * A `Snapshot` is a pinned, immutable view: one manifest root (held by an extent-space pin, so
+ * nothing it reaches is reclaimed: B1's two-generation reclaim) plus the in-memory tail of every
  * table (memtables, deletions and key-index deltas) bounded by a **visibility bound** (below). It
- * is O(1) to pin: nothing is copied. Everything reachable from it stays readable, unchanged,
- * until `release()`:
- * - the root's groups, deletion bitmaps and index runs (maintenance publishes new roots and
- *   reclaims only space no pinned root reaches: format/manifest.ts "Reclaim");
- * - the memtables of that moment, including ones frozen or flushed since (a pin keeps a frozen
- *   memtable alive; the write path counts that memory and the pin's age as debt).
+ * is O(1) to pin: nothing is copied. Everything reachable from it reads the same until
+ * `release()`.
  *
  * ## Visibility bound (`Snapshot.bound`)
  * Every in-memory change carries a sequence number `seq`; a change is visible iff
@@ -28,38 +27,73 @@
  *   writes).
  * - Durable structures (groups, deletion bitmaps, index runs) in a pinned root are visible to
  *   every bound that can pin that root: a root checkpoints only LSNs ≤ the durable LSN at its
- *   publication, and no bound is below the durable LSN of its pin time (`WritePath.pin`).
+ *   publication, and no bound is below the durable LSN of its pin time (`WritePath.pin`). Rows a
+ *   root holds as staged (format/replay.ts "Large transactions") are visible only once their
+ *   `publishedRows` commit is (and, before that, to their own transaction's later statements).
  *
  * ## Segments and locators
- * `TableSnapshot.segments` lists the table's rows as the snapshot sees them, in row-id order:
- * the root's groups (`kind: "group"`), then the memtables (`kind: "memory"`, oldest first, the
- * open transaction's rows last). A locator (vector/locator.ts) is `segment index × 65,536 +
- * position`. Each segment has at most 65,536 positions. A position names a stored row whether
- * or not the view considers it deleted: scans filter deletions (`Segment.deletions`), `fetch`
- * reads whatever a locator names.
+ * `TableSnapshot.segments` lists every row the view can see, **in row-id order**, as segments of
+ * at most 65,536 positions: durable groups (`kind: "group"`) and rows still in memory
+ * (`kind: "memory"`). The open transaction's rows come last (a large transaction's rows may be
+ * groups it wrote but has not committed). A locator (vector/locator.ts) is
+ * `segment index × 65,536 + position`. A position names a stored row whether or not the view
+ * considers it deleted: scans filter with `Segment.deletions()`; `fetch` reads whatever a locator
+ * names.
  *
  * A memory segment of a statement view may hold positions past its `rowCount`: rows the current
  * statement wrote. Scans never see them; `fetch` serves locators that `TableWriter.conflicts`
  * returned for them (ON CONFLICT reads the row the statement inserted).
  *
+ * ## Scanning (what the executor builds on)
+ * - **Pruning.** `Segment.statistics(columnId)` and `Segment.pages(columnId)` give sound bounds:
+ *   every stored value of the range (deleted rows included) lies within `[min, max]`, and
+ *   `nullCount` counts its stored nulls exactly. `min`/`max` are exact for fixed-width types; text
+ *   and bytes bounds may be truncated (min a prefix, max rounded up), still sound. Unknown is null,
+ *   never a guess. So they can prune and prove the int64 f64 fast path (vector/int64.ts
+ *   `provenSafe`). Approximate values (distinct sketches) are never here.
+ * - **Groups.** Pages are read through `Snapshot.pages` (B1's verified cache) with the format
+ *   track's chunk readers over `GroupSegment.chunk(columnId)`: dictionary pages decode to
+ *   dictionary vectors (codes kept), and decoded dictionaries are charged to the query that
+ *   decoded them (R5), never to the cache.
+ * - **Memory.** `MemorySegment.chunk` returns a borrowed, zero-copy vector of one
+ *   `MEMORY_CHUNK_ROWS`-row chunk (a dictionary vector where the memtable keeps codes).
+ * - **Live rows.** `Segment.deletions()` gives the view's deletion vector; `liveRows` turns a
+ *   position range into a selection. Deletion bitmaps of groups are blobs read through the cache.
+ *
+ * ## Retention and copy-on-pressure (ruling R5)
+ * A memtable a pin still reads after its rows were flushed and published is **retained** for that
+ * pin. Retained memtables are charged to the write path (non-spillable) up to
+ * `RETAINED_MEMTABLE_CAP_BYTES`. Past it, the write path releases the oldest retained memtable at
+ * once, never waiting for its readers. First, each table snapshot reading it either:
+ * 1. copies its declared columns (`TableReadOptions.columns`) of that segment into buffers
+ *    allocated from its own `TableReadOptions.budget` (the query's spillable grant), synchronously;
+ *    the segment stays a synchronous memory segment; or, if the budget refuses,
+ * 2. re-points the segment to the published group holding the same rows at the same positions
+ *    (the snapshot takes an extent-space pin of that generation, held until its release), so
+ *    `chunk` decodes into the caller's `out` buffers through the page cache and may return a
+ *    Promise.
+ * Vectors handed out before the switch stay valid (memory is never reused, only uncharged): at
+ * most one batch per column per reader. So slow readers never block writers and never pin
+ * unbounded memory. Unflushed frozen memtables are flush debt, bounded by backpressure on writers.
+ *
  * ## Pin lifetime and ownership
- * - The owner pins one snapshot per query (or per read transaction / snapshot scope) and releases
- *   it when the query ends, fails or is cancelled, or when the client's Web Lock is released.
- *   `release` is idempotent and synchronous. A statement view belongs to its statement and is
- *   released by `Statement.end()` / `rollback()`, never by the executor.
- * - After release every method throws `SnapshotReleasedError` (exec/fetch.ts defines the same
- *   error class shape; the owner maps both). Locators die with the pin.
- * - `Snapshot` structurally satisfies exec/fetch.ts `SnapshotPin` (`rootSequence`, `released`,
- *   `release`), so a fetch request carries it as is.
- * - Memory: a pin costs O(1) owner heap. What it retains (frozen memtables, unreclaimable
- *   extents) is the write path's memory, charged to the write path's grant and reported as debt
- *   (`WritePathStats`); never charged to the query. Buffers it hands out (memory chunks, deletion
- *   vectors) are immutable and borrowed for the pin's life: never write to them.
+ * - The owner pins one snapshot per query (or read transaction / snapshot scope), passes it to
+ *   the executor, and releases it after the execution settles, or when the client's Web Lock is
+ *   released. `release` is idempotent and synchronous. A statement view belongs to its statement
+ *   and is released by `Statement.end()` / `rollback()`, never by the executor.
+ * - After release every method throws `SnapshotReleasedError` (defined here; exec/fetch.ts uses
+ *   it). Locators die with the pin.
+ * - Memory: a pin costs O(1) owner heap; what it retains is the write path's, reported as debt
+ *   (`WritePathStats`), and bounded as above. Buffers it hands out are immutable: never write to
+ *   them.
  */
 import type { ColumnChunk, GroupRef, GroupRoot } from "../format/manifest.js";
-import type { FlatVector, Selection } from "../vector/vector.js";
+import type { ColumnStatistics } from "../types.js";
+import type { VarlenBuilder } from "../vector/varlen.js";
+import type { FlatVector, Selection, Vector } from "../vector/vector.js";
 import type { CatalogView, ColumnDef } from "./catalog.js";
-import type { IndexReader } from "./key-index.js";
+import type { IndexReader, MaybePromise } from "./key-index.js";
+import type { ByteBudget, SpaceReader } from "./space.js";
 
 /** Largest LSN; LSNs are safe integers below the pending range. */
 export const MAX_LSN = 2 ** 52 - 1;
@@ -92,7 +126,7 @@ export function isVisible(seq: number, bound: number): boolean {
 }
 
 export interface Snapshot {
-  /** The pinned root's sequence (diagnostics, and exec/fetch.ts `SnapshotPin`). */
+  /** The pinned root's sequence (diagnostics). */
   readonly rootSequence: number;
   readonly released: boolean;
   /** The visibility bound (see the module comment). */
@@ -105,25 +139,46 @@ export interface Snapshot {
   readonly observedLsn: number;
   /** The catalog this view reads (a statement view sees its transaction's own DDL). */
   readonly catalog: CatalogView;
-  /** Throws `UnknownTableError` for a table the catalog lacks. */
-  table(tableId: number): TableSnapshot;
+  /** Verified, cached reads of this pin's blobs (group roots, directories, pages, bitmaps). */
+  readonly pages: SpaceReader;
+  /**
+   * One table as this view sees it. Synchronous when its group directory is cached (always for a
+   * warm point read); otherwise reads it once. Throws `UnknownTableError` for a table the catalog
+   * lacks. Each call returns a new table snapshot with its own declared columns and budget.
+   */
+  table(tableId: number, options: TableReadOptions): MaybePromise<TableSnapshot>;
   /** An index of `tableId` (the primary key, a unique or a secondary index), read in this view. */
   index(tableId: number, indexId: number): IndexReader;
   /** Idempotent. Not allowed on a statement view (its statement releases it). */
   release(): void;
 }
 
+export interface TableReadOptions {
+  /** Every catalog column id the query may read from this table (scans and fetches). */
+  readonly columns: readonly number[];
+  /** The query's spillable grant: pays for copy-on-pressure (see "Retention"). */
+  readonly budget: ByteBudget;
+}
+
 export interface TableSnapshot {
   readonly tableId: number;
+  /** The schema version this view reads the table under. */
+  readonly schemaVersion: number;
   /** The catalog definition this view reads the table under. */
   readonly columns: readonly ColumnDef[];
   /** Rows visible and not deleted in this view, exactly. */
   readonly liveRowCount: number;
-  /** The table's segments in row-id order; `segments[i].index === i` is the locator segment. */
+  /** In row-id order; `segments[i].index === i` is the locator segment. */
   readonly segments: readonly Segment[];
 }
 
 export type Segment = GroupSegment | MemorySegment;
+
+/** One page (or memory chunk) of one column: its row range in the segment and its bounds. */
+export interface PageSummary extends ColumnStatistics {
+  readonly firstRow: number;
+  readonly rowCount: number;
+}
 
 interface SegmentBase {
   /** Position of this segment in `TableSnapshot.segments` (the locator's segment number). */
@@ -134,43 +189,67 @@ interface SegmentBase {
   readonly liveRowCount: number;
   /**
    * The rows this view considers deleted, or null when none is. Synchronous for memory segments
-   * and for groups whose bitmap is cached; otherwise it reads (and verifies) the group's deletion
-   * bitmap once. The result is immutable and shared; it is charged to the page cache, not the
-   * caller.
+   * and for groups whose bitmap is cached; otherwise reads the group's bitmap once. Immutable,
+   * shared, charged to the cache (bitmaps) or the write path (memory deletions).
    */
-  deletions(): DeletionVector | null | Promise<DeletionVector | null>;
+  deletions(): MaybePromise<DeletionVector | null>;
+  /**
+   * Sound bounds of a declared column over the whole segment ("Scanning"), or null when unknown.
+   * Groups: from the group root (`root()` must have resolved).
+   */
+  statistics(columnId: number): ColumnStatistics | null;
+  /**
+   * Bounds per page (groups: from the chunk's page directory, read once through the cache) or per
+   * `MEMORY_CHUNK_ROWS` chunk (memory), in row order, covering 0 … rowCount − 1 without gaps. A
+   * column the group predates is one summary of every row with `ColumnDef.missing`'s bounds.
+   */
+  pages(columnId: number): MaybePromise<readonly PageSummary[]>;
 }
 
-/** A durable column group of the pinned root. Its pages are read through `pages`. */
+/** A durable (or the open transaction's staged) column group. */
 export interface GroupSegment extends SegmentBase {
   readonly kind: "group";
   readonly group: GroupRef;
+  /** True for rows of the open transaction written as a group (visible to it alone). */
+  readonly staged: boolean;
   /** The group root (decoded once, cached, checksum verified when read). */
-  root(): GroupRoot | Promise<GroupRoot>;
+  root(): MaybePromise<GroupRoot>;
   /**
-   * The chunk of `columnId`, or null when the group predates the column (ALTER TABLE ADD COLUMN):
-   * every row then has the column's `ColumnDef.missing` value. Requires `root()` to have resolved.
+   * The chunk of `columnId` for the format track's chunk reader, or null when the group predates
+   * the column (ALTER TABLE ADD COLUMN): every row then has `ColumnDef.missing`. Requires `root()`
+   * to have resolved.
    */
   chunk(columnId: number): ColumnChunk | null;
 }
 
-/**
- * Rows still in memory: a memtable (committed rows, maybe some of the open transaction's). Data
- * is stored as immutable chunks of `MEMORY_CHUNK_ROWS` rows, so batches are zero-copy views.
- */
+/** Rows in memory, stored as immutable chunks of `MEMORY_CHUNK_ROWS` rows. */
 export interface MemorySegment extends SegmentBase {
   readonly kind: "memory";
   /**
-   * Rows `[chunk × MEMORY_CHUNK_ROWS, …)` of `columnId`: a borrowed flat vector of the chunk's
-   * rows visible to this view (`length` = min(MEMORY_CHUNK_ROWS, rowCount − chunk start)), in
-   * the column's exact physical type. Immutable and valid until the pin is released. (Memtable
-   * rows are converted when an ALTER TABLE applies, so every column of the view's catalog exists.)
+   * Chunk `chunk` (rows `chunk × MEMORY_CHUNK_ROWS …`, at most `rowCount`) of a declared column, in
+   * its exact physical type. While resident (the normal case, and after a copy-on-pressure copy)
+   * it returns a borrowed, immutable flat or dictionary vector synchronously and ignores `out`.
+   * After a re-point ("Retention") it decodes into `out` and may return a Promise; a varlen
+   * builder answering `full` or `denied` gives `{ partial: k }` (slots before k complete). A column
+   * not declared in `TableReadOptions.columns` is a `RangeError`.
    */
-  chunk(columnId: number, chunk: number): FlatVector;
+  chunk(columnId: number, chunk: number, out: ChunkOutput): MaybePromise<ChunkResult>;
 }
+
+/** Caller-owned buffers for a re-pointed memory chunk (capacity ≥ `MEMORY_CHUNK_ROWS`). */
+export interface ChunkOutput {
+  readonly flat: FlatVector;
+  readonly codes: Int32Array;
+  readonly varlen: VarlenBuilder | null;
+}
+
+export type ChunkResult = Vector | { readonly partial: number };
 
 /** Memory segments store rows in chunks of this many rows (= `BATCH_ROWS`). */
 export const MEMORY_CHUNK_ROWS = 2048;
+
+/** Retained memtable bytes the write path carries for pins before copy-on-pressure (two memtables). */
+export const RETAINED_MEMTABLE_CAP_BYTES = 2 * 8 * 1024 * 1024;
 
 /** The deleted positions of one segment, as one view sees them. Immutable; synchronous. */
 export interface DeletionVector {
@@ -192,7 +271,7 @@ export class UnknownTableError extends Error {
   }
 }
 
-/** Thrown by every method of a released snapshot (same code as exec/fetch.ts). */
+/** Thrown by every method of a released snapshot, and by fetches through it (exec/fetch.ts). */
 export class SnapshotReleasedError extends Error {
   readonly code = "MINNOW_SNAPSHOT_RELEASED";
   constructor() {

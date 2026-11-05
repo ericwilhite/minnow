@@ -1,16 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { SnapshotReleasedError, type Snapshot } from "../access/snapshot.js";
 import { Governor } from "../memory/governor.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
 import { packLocator } from "../vector/locator.js";
 import { allocateValidity, isValid, setValid } from "../vector/validity.js";
 import { VarlenBuilder, decodeUtf8 } from "../vector/varlen.js";
 import { allocateFlat, type FlatVector } from "../vector/vector.js";
-import {
-  MemoryRowFetcher,
-  SnapshotReleasedError,
-  type FetchRequest,
-  type SnapshotPin,
-} from "./fetch.js";
+import { MemoryRowFetcher, type FetchRequest } from "./fetch.js";
 
 const ID = 1;
 const NAME = 2;
@@ -28,13 +24,27 @@ const segments = [0, 1].map(
     ]),
 );
 
-const pin = (): SnapshotPin => {
+/** A snapshot whose only live part is its pin state (the reference fetcher reads nothing else). */
+const pin = (): Snapshot => {
   let released = false;
+  const unused = (): never => {
+    throw new Error("The reference fetcher reads only the pin state");
+  };
   return {
     rootSequence: 1,
     get released() {
       return released;
     },
+    bound: 1,
+    observedLsn: 1,
+    get catalog() {
+      return unused();
+    },
+    get pages() {
+      return unused();
+    },
+    table: unused,
+    index: unused,
     release() {
       released = true;
     },
