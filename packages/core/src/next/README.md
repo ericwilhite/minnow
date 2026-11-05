@@ -261,6 +261,22 @@ and the owner import it directly.
 - Each edge holds at most one in-flight batch, plus whatever credits the producer has handed out
   as transfers.
 
+### Executor entry point (`exec/executor.ts`, `snapshot.ts`, `modify.ts`, `result.ts`)
+
+- `executor.prepare(plan)` compiles a plan once; `bind(values)` fills its placeholders;
+  `execute(request)` runs it against a pinned `QuerySnapshot`, the governor and the spill service.
+- The executor admits its own pipelines with plan-bounded minimums. State that outlives a
+  pipeline is in spillable grants. Nothing is refused for size.
+- A plan from another catalog version fails with `PlanStaleError` before anything runs.
+- Results are columnar frames of about 1 MiB, pulled under a credit window: a frame counts
+  against the window until the consumer releases it, so a slow client pauses the pipeline. There
+  is no row-count cap.
+- `done` settles only after every grant and spill file is closed and the modify target finished or
+  aborted. Then the owner may release the pin.
+- The executor cannot import `write/`, so `snapshot.ts` and `modify.ts` state what it needs from
+  the write path. DML names rows by snapshot locators, a row named twice changes once, and the
+  statement never sees its own writes.
+
 ### IR (`ir/`)
 
 - Fully typed, positional and plain data. It is bound once, with parameter slots.
