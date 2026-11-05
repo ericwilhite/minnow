@@ -11,25 +11,20 @@
  * Publication order (guarantee 1): flush the data file; write the inactive root slot; flush it.
  * A torn slot fails its checksum and the other slot, the previous root, stays current.
  */
-import { chooseRoot, decodeRootSlot, encodeRootSlot } from "./root-slot.js";
+import { chooseRoot, encodeRootSlot } from "./root-slot.js";
 import {
   DATA_ALIGN,
   LOG_HEADER_SLOT_BYTES,
   StoreClosedError,
   StoreCorruptionError,
   type DataRange,
+  type ScratchSpace,
   type StoreSession,
+  type SyncFile,
 } from "./contract.js";
+import { planSlabs } from "./slabs.js";
 
-/** The subset of `FileSystemSyncAccessHandle` the store uses. */
-export interface SyncFile {
-  read(buffer: Uint8Array, options: { at: number }): number;
-  write(buffer: Uint8Array, options: { at: number }): number;
-  truncate(size: number): void;
-  getSize(): number;
-  flush(): void;
-  close(): void;
-}
+export type { SyncFile } from "./contract.js";
 
 export interface FileSet {
   readonly log: SyncFile;
@@ -39,20 +34,19 @@ export interface FileSet {
 
 export const FILE_NAMES = ["log", "data", "root-0", "root-1"] as const;
 const HEADER_REGION = 2 * LOG_HEADER_SLOT_BYTES;
-/** Coalescing: merge ranges whose gap is at most this, into slabs of at most `MAX_SLAB`. */
-const MAX_GAP = 64 * 1024;
-const MAX_SLAB = 1024 * 1024;
 
-function readExact(file: SyncFile, at: number, length: number): Uint8Array {
-  const buffer = new Uint8Array(length);
+function readFully(file: SyncFile, at: number, buffer: Uint8Array): Uint8Array {
   let done = 0;
-  while (done < length) {
+  while (done < buffer.length) {
     const read = file.read(buffer.subarray(done), { at: at + done });
     if (read <= 0) throw new StoreCorruptionError("Short read inside the file");
     done += read;
   }
   return buffer;
 }
+
+const readExact = (file: SyncFile, at: number, length: number): Uint8Array =>
+  readFully(file, at, new Uint8Array(length));
 
 function writeAll(file: SyncFile, bytes: Uint8Array, at: number): void {
   let done = 0;
@@ -94,13 +88,7 @@ export class FileStoreSession implements StoreSession {
   }
 
   async readPreviousRoot(): Promise<Uint8Array | null> {
-    const [first, second] = this.#live().roots.map((file) => readExact(file, 0, file.getSize()));
-    const current = this.#chooseRoot().current;
-    for (const bytes of [first ?? null, second ?? null]) {
-      const slot = decodeRootSlot(bytes);
-      if (slot !== null && current !== null && slot.sequence < current.sequence) return slot.root;
-    }
-    return null;
+    return this.#chooseRoot().previous?.root ?? null;
   }
 
   #chooseRoot() {
@@ -130,30 +118,24 @@ export class FileStoreSession implements StoreSession {
     for (const { offset, length } of ranges)
       if (offset < 0 || length < 0 || offset + length > size)
         throw new StoreCorruptionError("Read outside the data space");
-    const order = ranges
-      .map((range, position) => ({ range, position }))
-      .sort((a, b) => a.range.offset - b.range.offset);
     const results = new Array<Uint8Array>(ranges.length);
-    let index = 0;
-    for (let first = order[0]; first !== undefined; first = order[index]) {
-      let end = first.range.offset + first.range.length;
-      let last = index;
-      for (let next = order[last + 1]; next !== undefined; next = order[last + 1]) {
-        const nextEnd = Math.max(end, next.range.offset + next.range.length);
-        if (next.range.offset - end > MAX_GAP || nextEnd - first.range.offset > MAX_SLAB) break;
-        end = nextEnd;
-        last += 1;
+    for (const slab of planSlabs(ranges)) {
+      const bytes = readExact(data, slab.offset, slab.length);
+      for (const position of slab.members) {
+        const range = ranges[position];
+        if (range === undefined) continue;
+        const start = range.offset - slab.offset;
+        results[position] = bytes.subarray(start, start + range.length);
       }
-      const start = first.range.offset;
-      const slab = readExact(data, start, end - start);
-      for (const { range, position } of order.slice(index, last + 1))
-        results[position] = slab.subarray(
-          range.offset - start,
-          range.offset - start + range.length,
-        );
-      index = last + 1;
     }
     return results;
+  }
+
+  async readDataInto(offset: number, target: Uint8Array): Promise<void> {
+    const data = this.#live().data;
+    if (offset < 0 || offset + target.length > data.getSize())
+      throw new StoreCorruptionError("Read outside the data space");
+    readFully(data, offset, target);
   }
 
   async releaseData(ranges: readonly DataRange[]): Promise<void> {
@@ -230,5 +212,47 @@ export class FileStoreSession implements StoreSession {
 
   async close(): Promise<void> {
     this.#closed = true;
+  }
+}
+
+/**
+ * The scratch space over one sync handle (OPFS `spill`, or a simulated file). `guard` is the
+ * lease's ownership check, run before every call touches the handle, so a fenced owner gets
+ * `OwnershipLostError` rather than the closed handle's `InvalidStateError`.
+ */
+export class FileScratch implements ScratchSpace {
+  readonly #file: SyncFile;
+  readonly #guard: () => void;
+
+  constructor(file: SyncFile, guard: () => void) {
+    this.#file = file;
+    this.#guard = guard;
+  }
+
+  async write(offset: number, bytes: Uint8Array): Promise<void> {
+    if (offset % DATA_ALIGN !== 0 || offset < 0) throw new RangeError("Unaligned scratch extent");
+    this.#guard();
+    writeAll(this.#file, bytes, offset);
+  }
+
+  async readInto(offset: number, target: Uint8Array): Promise<void> {
+    this.#guard();
+    if (offset < 0 || offset + target.length > this.#file.getSize())
+      throw new StoreCorruptionError("Read outside the scratch space");
+    readFully(this.#file, offset, target);
+  }
+
+  async release(ranges: readonly DataRange[]): Promise<void> {
+    this.#guard();
+    // Only a free tail can be returned; interior space is reused by the spill service's map.
+    let size = this.#file.getSize();
+    for (const range of [...ranges].sort((a, b) => b.offset - a.offset))
+      if (range.offset + range.length >= size && range.offset < size) size = range.offset;
+    if (size < this.#file.getSize()) this.#file.truncate(size);
+  }
+
+  async truncate(size: number): Promise<void> {
+    this.#guard();
+    if (size < this.#file.getSize()) this.#file.truncate(size);
   }
 }

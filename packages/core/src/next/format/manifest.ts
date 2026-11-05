@@ -40,7 +40,7 @@
  *   old chunk extents unchanged; several roots and groups may reference one extent.
  * - **Reclaim (two generations).** An extent is reusable only when neither the current durable root,
  *   nor the previous durable root (the other root slot), nor any pinned snapshot's root reaches
- *   it. Keeping the previous generation means a lost flush that rolls back to the previous root
+ *   it (storage/extents.ts, storage/reclaim.ts). Keeping the previous generation means a lost flush that rolls back to the previous root
  *   slot finds its extents intact instead of overwritten. At startup the owner walks both roots
  *   (crash orphans are simply unreachable: no job records) and maintains free space in memory
  *   after. Freed space is reused in place; only a free tail is ever released to the platform.
@@ -61,6 +61,7 @@
  */
 import type { ClientLedgerEntry } from "./ledger.js";
 import type { LogIncarnation } from "./log-frame.js";
+import type { BlobRef } from "../storage/extents.js";
 import type { ColumnStatistics, PhysicalType, StatValue } from "../types.js";
 
 export type { ColumnStatistics, StatValue };
@@ -68,37 +69,12 @@ export type { ColumnStatistics, StatValue };
 export const MANIFEST_FORMAT_VERSION = 1;
 
 /**
- * Data-space addresses are the storage track's (storage/extents.ts on rebuild/storage 948ae4f,
- * ruling R15.1): these two interfaces and `blobAddress` are identical to its definitions, and at
- * the merge this module re-exports them from there instead.
+ * Data-space addresses are the storage track's (storage/extents.ts, ruling R15.1): an `ExtentRef`
+ * is the unit of allocation and reclaim; a `BlobRef` is a checksummed byte range inside one extent;
+ * `blobAddress` is a blob's data-space address.
  */
-/** A contiguous byte range of the data space: the unit of allocation and reclaim. */
-export interface ExtentRef {
-  /** A multiple of `DATA_ALIGN`. */
-  readonly offset: number;
-  /** Bytes written (the reservation is this rounded up to `DATA_ALIGN`). */
-  readonly length: number;
-}
-
-/**
- * A checksummed byte range inside one extent: what readers ask for. Its data-space address is
- * `extent.offset + offset`; `offset + length ≤ extent.length` (a ref read from storage that breaks
- * this is `StoreCorruptionError`).
- */
-export interface BlobRef {
-  /** The extent the blob lives in: its unit of reclaim (ruling R15.1). */
-  readonly extent: ExtentRef;
-  /** Byte offset within `extent`. */
-  readonly offset: number;
-  readonly length: number;
-  /** xxHash32 (seed 0) of the referenced bytes. */
-  readonly checksum: number;
-}
-
-/** The data-space address of a blob's first byte. */
-export function blobAddress(ref: BlobRef): number {
-  return ref.extent.offset + ref.offset;
-}
+export type { BlobRef, ExtentRef } from "../storage/extents.js";
+export { blobAddress } from "../storage/extents.js";
 
 /**
  * A column chunk's data blob ("Chunks"): where its pages lie, contiguously, inside one extent. A

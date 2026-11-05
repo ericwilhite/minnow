@@ -22,14 +22,16 @@
  * IndexedDB transaction semantics. These states are a subset of what the contract allows; the
  * contract's guarantee 4 is wider (any byte may revert independently).
  */
-import { FileStoreSession, FILE_NAMES, type FileSet, type SyncFile } from "./file-store.js";
+import { FileScratch, FileStoreSession, FILE_NAMES, type FileSet } from "./file-store.js";
 import { acquireFenced, type HeldLock, type LockManagerLike } from "./fence.js";
 import {
   OwnershipLostError,
   type AcquireOptions,
   type OwnerLease,
+  type ScratchSpace,
   type StorageBackend,
   type StoreSession,
+  type SyncFile,
 } from "./contract.js";
 
 export class SimulatedCrash extends Error {
@@ -317,6 +319,8 @@ export class SimLocks implements LockManagerLike {
 export class SimLease implements OwnerLease {
   readonly epoch: number;
   readonly files: FileSet;
+  /** The spill scratch file, opened under the same fence (`StorageBackend.scratch`). */
+  readonly scratch: SyncFile;
   readonly #lock: HeldLock;
   readonly #lost = new AbortController();
   readonly #disk: SimDisk;
@@ -329,12 +333,14 @@ export class SimLease implements OwnerLease {
     fence: "handle" | "epoch",
     lock: HeldLock,
     files: FileSet,
+    scratch: SyncFile,
     epoch: number,
   ) {
     this.#disk = disk;
     this.#fence = fence;
     this.#lock = lock;
     this.files = files;
+    this.scratch = scratch;
     this.epoch = epoch;
     // An owner whose lock is stolen closes its handles immediately (probe: the handle is the fence).
     lock.lost.addEventListener("abort", () => {
@@ -354,7 +360,8 @@ export class SimLease implements OwnerLease {
   }
 
   #close(): void {
-    for (const file of [this.files.log, this.files.data, ...this.files.roots]) file.close();
+    for (const file of [this.files.log, this.files.data, ...this.files.roots, this.scratch])
+      file.close();
   }
 
   /** The ownership check every mutation runs in the step that applies its effect. */
@@ -403,16 +410,22 @@ export class SimBackend implements StorageBackend {
     this.#openDelay = options.openDelay ?? null;
   }
 
-  #openFiles(exclusive: boolean): FileSet {
+  #openFiles(exclusive: boolean): { files: FileSet; scratch: SimFile } {
     const opened: SimFile[] = [];
     try {
-      for (const name of FILE_NAMES) opened.push(this.disk.open(name, exclusive));
+      for (const name of [...FILE_NAMES, "spill"]) opened.push(this.disk.open(name, exclusive));
     } catch (error) {
       for (const file of opened) file.close();
       throw error;
     }
-    const [log, data, root0, root1] = opened as [SimFile, SimFile, SimFile, SimFile];
-    return { log, data, roots: [root0, root1] };
+    const [log, data, root0, root1, scratch] = opened as [
+      SimFile,
+      SimFile,
+      SimFile,
+      SimFile,
+      SimFile,
+    ];
+    return { files: { log, data, roots: [root0, root1] }, scratch };
   }
 
   async acquire(options: AcquireOptions = {}): Promise<SimLease> {
@@ -422,16 +435,23 @@ export class SimBackend implements StorageBackend {
       this.name,
       async () => {
         if (this.#openDelay !== null) await this.#openDelay();
-        const files = this.#openFiles(exclusive);
+        const { files, scratch } = this.#openFiles(exclusive);
         // The epoch fence's durable bump (IndexedDB: one transaction); informational for handles.
-        return { files, epoch: ++this.disk.epoch };
+        return { files, scratch, epoch: ++this.disk.epoch };
       },
-      ({ files }) => {
-        for (const file of [files.log, files.data, ...files.roots]) file.close();
+      ({ files, scratch }) => {
+        for (const file of [files.log, files.data, ...files.roots, scratch]) file.close();
       },
       options,
     );
-    const lease = new SimLease(this.disk, this.fence, lock, fence.files, fence.epoch);
+    const lease = new SimLease(
+      this.disk,
+      this.fence,
+      lock,
+      fence.files,
+      fence.scratch,
+      fence.epoch,
+    );
     this.#leases.add(lease);
     return lease;
   }
@@ -441,6 +461,15 @@ export class SimBackend implements StorageBackend {
       throw new TypeError("The lease was not acquired from this backend");
     lease.guard();
     return new FileStoreSession(lease.files, lease.epoch, () => {
+      lease.guard();
+    });
+  }
+
+  /** The `spill` file under the lease's guard: the handle fence, or the epoch check (IndexedDB). */
+  scratch(lease: OwnerLease): ScratchSpace | null {
+    if (!(lease instanceof SimLease) || !this.#leases.has(lease))
+      throw new TypeError("The lease was not acquired from this backend");
+    return new FileScratch(lease.scratch, () => {
       lease.guard();
     });
   }

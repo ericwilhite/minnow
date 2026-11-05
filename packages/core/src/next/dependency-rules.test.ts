@@ -22,7 +22,7 @@ const ALLOWED: Readonly<Record<string, readonly string[]>> = {
   vector: ["."],
   storage: [".", "hash"],
   format: [".", "hash", "storage", "memory"],
-  spill: ["hash"],
+  spill: ["hash", "storage"],
   memory: ["vector"],
   keys: [".", "hash", "vector", "memory"],
   ir: [".", "vector"],
