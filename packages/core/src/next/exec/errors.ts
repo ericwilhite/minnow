@@ -89,3 +89,15 @@ export class CardinalityError extends ExecutionError {
     this.name = "CardinalityError";
   }
 }
+
+/** 0A000: NaN or ±Infinity cannot become an integer (PostgreSQL's numeric → int casts). */
+export class CannotConvertError extends ExecutionError {
+  constructor(special: number, target: string) {
+    super(
+      `cannot convert ${special === 1 ? "NaN" : "infinity"} to ${target}`,
+      "MINNOW_CANNOT_CONVERT",
+      "0A000",
+    );
+    this.name = "CannotConvertError";
+  }
+}

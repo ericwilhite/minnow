@@ -95,6 +95,8 @@ describe("filter and project", () => {
     const run = drive(
       source([[20, 21, 19, null, 70]]),
       new FilterOperator(predicate, context(), project),
+      undefined,
+      { now: () => 0 }, // a frozen clock: only a real Promise could make it async
     );
     expect(run).toBeUndefined(); // fully synchronous
     expect(sink.rows).toEqual([[42], [140]]);

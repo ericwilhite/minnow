@@ -19,6 +19,8 @@ import { coefficientAt, scaleAt, specialAt, type DecimalData } from "./numeric.j
 import {
   IDENTITY,
   copyFixedSlot,
+  flatOf,
+  nullConstant,
   isValidSlot,
   slotOf,
   type Compiled,
@@ -26,14 +28,36 @@ import {
 } from "./vectors.js";
 
 const TRUE = 1;
-const NONE = 255;
+/** "No part" in the row-owner map (Uint16Array: more than 255 branches are fine). */
+const NONE = 0xffff;
 
 type VarlenData = Extract<VectorData, { layout: "varlen" }>;
 
-/** A source vector and the rows (ascending) whose value it supplies. */
+/** A source vector and the rows (ascending) whose value it supplies; reused across batches. */
 interface Part {
-  readonly vector: Vector;
-  readonly rows: Selection;
+  vector: Vector;
+  rows: Selection;
+}
+
+/** Part objects for every branch, allocated once (no object per batch). */
+class Parts {
+  readonly list: Part[] = [];
+  readonly #pool: Part[];
+  constructor(size: number, type: PhysicalType) {
+    const empty = nullConstant(type);
+    const rows: Selection = { rows: IDENTITY, count: 0 };
+    this.#pool = Array.from({ length: size }, () => ({ vector: empty, rows }));
+  }
+  reset(): void {
+    this.list.length = 0;
+  }
+  push(vector: Vector, rows: Selection): void {
+    const part = this.#pool[this.list.length];
+    if (part === undefined) throw new RangeError("more CASE parts than branches");
+    part.vector = vector;
+    part.rows = rows;
+    this.list.push(part);
+  }
 }
 
 function allValid(vector: Vector): boolean {
@@ -46,19 +70,18 @@ function allValid(vector: Vector): boolean {
   }
 }
 
-/** The values and stride of a flat or constant number-like vector, else null. */
-function numberArray(vector: Vector): [ArrayLike<number>, number] | null {
+/** The values of a flat or constant number-like vector, else null (stride: 1 flat, 0 constant). */
+function numberArray(vector: Vector): ArrayLike<number> | null {
   if (vector.form === "dictionary") return null;
   const data = (vector.form === "flat" ? vector : vector.value).data;
-  const stride = vector.form === "flat" ? 1 : 0;
   if (
     data.layout === "bool" ||
     data.layout === "i32" ||
     data.layout === "f32" ||
     data.layout === "f64"
   )
-    return [data.values, stride];
-  if (data.layout === "int64" && data.values.repr === "safe") return [data.values.values, stride];
+    return data.values;
+  if (data.layout === "int64" && data.values.repr === "safe") return data.values.values;
   return null;
 }
 
@@ -68,7 +91,7 @@ class Assembler {
   readonly #fixed: FlatVector | null = null;
   #int64: FlatVector | null = null;
   readonly #validity: Uint32Array;
-  readonly #owner: Uint8Array;
+  readonly #owner: Uint16Array;
   #bytes: Uint8Array = new Uint8Array(0);
   readonly #offsets: Int32Array | null = null;
   readonly #scales: Uint16Array | null = null;
@@ -84,8 +107,8 @@ class Assembler {
     this.#layout = layoutOf(type);
     const capacity = arena.capacity;
     this.#validity = arena.validity();
-    arena.take(capacity);
-    this.#owner = new Uint8Array(capacity);
+    arena.take(2 * capacity);
+    this.#owner = new Uint16Array(capacity);
     if (this.#layout === "varlen") {
       arena.take(4 * (capacity + 1));
       this.#offsets = new Int32Array(capacity + 1);
@@ -113,8 +136,11 @@ class Assembler {
 
   /** Null when every part is all-valid and no row is missing; else the computed rows' bits. */
   #validityOf(parts: readonly Part[], missing: Selection | null): Uint32Array | null {
-    if ((missing === null || missing.count === 0) && parts.every((part) => allValid(part.vector)))
-      return null;
+    if (missing === null || missing.count === 0) {
+      let valid = true;
+      for (const part of parts) if (!allValid(part.vector)) valid = false;
+      if (valid) return null;
+    }
     const validity = this.#validity;
     for (const part of parts) {
       const { vector, rows } = part;
@@ -137,12 +163,16 @@ class Assembler {
   #fixedOutput(length: number, parts: readonly Part[], validity: Uint32Array | null): FlatVector {
     const out = this.#fixed;
     if (out === null) throw new TypeError("no fixed output");
-    const promote =
-      out.data.layout === "int64" &&
-      parts.some((part) => {
-        const [flat] = slotOf(part.vector, 0);
-        return flat.data.layout === "int64" && flat.data.values.repr === "int64";
-      });
+    // An exact int64 source (or interval µs) promotes the output to BigInt64Array for this batch.
+    let promote = false;
+    for (const part of parts) {
+      const data = flatOf(part.vector).data;
+      if (
+        (data.layout === "int64" && data.values.repr === "int64") ||
+        (data.layout === "interval" && data.micros.repr === "int64")
+      )
+        promote = true;
+    }
     const target = promote ? this.#int64Target(out) : out;
     const data = target.data;
     const values =
@@ -155,11 +185,11 @@ class Assembler {
           ? data.values.values
           : null;
     for (const part of parts) {
-      const fast = values === null ? null : numberArray(part.vector);
+      const source = values === null ? null : numberArray(part.vector);
       const rows = part.rows.rows;
       const count = part.rows.count;
-      if (fast !== null && values !== null) {
-        const [source, stride] = fast;
+      if (source !== null && values !== null) {
+        const stride = part.vector.form === "flat" ? 1 : 0;
         if (stride === 0) {
           const v = source[0] ?? 0;
           for (let k = 0; k < count; k++) values[rows[k] ?? 0] = v;
@@ -184,16 +214,18 @@ class Assembler {
 
   #int64Target(out: FlatVector): FlatVector {
     if (this.#int64 === null) {
-      this.#arena.take(8 * this.#arena.capacity);
+      const capacity = this.#arena.capacity;
+      this.#arena.take(8 * capacity);
+      const micros = { repr: "int64", values: new BigInt64Array(capacity) } as const;
       this.#int64 = {
         form: "flat",
         type: out.type,
         length: 0,
         validity: null,
-        data: {
-          layout: "int64",
-          values: { repr: "int64", values: new BigInt64Array(this.#arena.capacity) },
-        },
+        data:
+          out.data.layout === "interval"
+            ? { layout: "interval", months: out.data.months, days: out.data.days, micros }
+            : { layout: "int64", values: micros },
       };
     }
     return this.#int64;
@@ -206,7 +238,9 @@ class Assembler {
     const owner = this.#owner;
     owner.fill(NONE, 0, length);
     let total = 0;
-    for (const [p, part] of parts.entries())
+    for (let p = 0; p < parts.length; p++) {
+      const part = parts[p];
+      if (part === undefined) continue;
       for (let k = 0; k < part.rows.count; k++) {
         const i = part.rows.rows[k] ?? 0;
         owner[i] = p;
@@ -215,10 +249,11 @@ class Assembler {
         const data = flat.data as VarlenData;
         total += (data.offsets[slot + 1] ?? 0) - (data.offsets[slot] ?? 0);
       }
+    }
     if (this.#bytes.length < total) {
       const size = Math.max(total, 2 * this.#bytes.length);
       this.#arena.take(size);
-      if (this.#bytes.length > 0) this.#arena.charge.free(this.#bytes.length);
+      if (this.#bytes.length > 0) this.#arena.give(this.#bytes.length);
       this.#bytes = new Uint8Array(size);
     }
     const bytes = this.#bytes;
@@ -348,13 +383,15 @@ class CaseNode implements Compiled {
   readonly #a: Selection;
   readonly #b: Selection;
   readonly #all: Selection = { rows: IDENTITY, count: 0 };
-  readonly #parts: Part[] = [];
+  readonly #parts: Parts;
   constructor(
     readonly type: PhysicalType,
     readonly branches: ReadonlyArray<{ readonly when: Compiled; readonly then: Compiled }>,
     readonly otherwise: Compiled | null,
     arena: OutputArena,
   ) {
+    if (branches.length >= NONE) throw new TypeError("too many CASE branches");
+    this.#parts = new Parts(branches.length + 1, type);
     this.#assembler = new Assembler(type, arena);
     this.#taken = branches.map(() => selection(arena));
     this.#a = selection(arena);
@@ -362,17 +399,20 @@ class CaseNode implements Compiled {
   }
   evaluate(batch: Batch, rows: Selection | null): Vector {
     const parts = this.#parts;
-    parts.length = 0;
+    parts.reset();
     // The first WHEN sees the caller's rows as they are (dense when null).
     let pending: Selection | null = rows;
     let rest = this.#a;
-    for (const [b, branch] of this.branches.entries()) {
+    // Index loops, not entries(): no iterator or pair object per batch.
+    for (let b = 0; b < this.branches.length; b++) {
+      const branch = this.branches[b];
+      if (branch === undefined) break;
       if (pending !== null && pending.count === 0) break;
       const when = branch.when.evaluate(batch, pending);
       const taken = this.#taken[b];
       if (taken === undefined) break;
       split(when, pending, batch.length, taken, rest);
-      if (taken.count > 0) parts.push({ vector: branch.then.evaluate(batch, taken), rows: taken });
+      if (taken.count > 0) parts.push(branch.then.evaluate(batch, taken), taken);
       pending = rest;
       rest = rest === this.#a ? this.#b : this.#a;
     }
@@ -382,11 +422,10 @@ class CaseNode implements Compiled {
     }
     let missing: Selection | null = null;
     if (pending.count > 0) {
-      if (this.otherwise !== null)
-        parts.push({ vector: this.otherwise.evaluate(batch, pending), rows: pending });
+      if (this.otherwise !== null) parts.push(this.otherwise.evaluate(batch, pending), pending);
       else missing = pending;
     }
-    return this.#assembler.assemble(batch.length, parts, missing);
+    return this.#assembler.assemble(batch.length, parts.list, missing);
   }
 }
 
@@ -395,12 +434,14 @@ class CoalesceNode implements Compiled {
   readonly #kept: Selection[];
   readonly #a: Selection;
   readonly #b: Selection;
-  readonly #parts: Part[] = [];
+  readonly #parts: Parts;
   constructor(
     readonly type: PhysicalType,
     readonly args: readonly Compiled[],
     arena: OutputArena,
   ) {
+    if (args.length >= NONE) throw new TypeError("too many COALESCE arguments");
+    this.#parts = new Parts(args.length, type);
     this.#assembler = new Assembler(type, arena);
     this.#kept = args.map(() => selection(arena));
     this.#a = selection(arena);
@@ -408,10 +449,12 @@ class CoalesceNode implements Compiled {
   }
   evaluate(batch: Batch, rows: Selection | null): Vector {
     const parts = this.#parts;
-    parts.length = 0;
+    parts.reset();
     let pending: Selection | null = rows;
     let rest = this.#a;
-    for (const [a, arg] of this.args.entries()) {
+    for (let a = 0; a < this.args.length; a++) {
+      const arg = this.args[a];
+      if (arg === undefined) break;
       if (pending !== null && pending.count === 0) break;
       const value = arg.evaluate(batch, pending);
       const kept = this.#kept[a];
@@ -425,12 +468,12 @@ class CoalesceNode implements Compiled {
         if (isValidSlot(value, i)) kept.rows[kept.count++] = i;
         else rest.rows[rest.count++] = i;
       }
-      if (kept.count > 0) parts.push({ vector: value, rows: kept });
+      if (kept.count > 0) parts.push(value, kept);
       pending = rest;
       rest = rest === this.#a ? this.#b : this.#a;
     }
     const missing = pending !== null && pending.count > 0 ? pending : null;
-    return this.#assembler.assemble(batch.length, parts, missing);
+    return this.#assembler.assemble(batch.length, parts.list, missing);
   }
 }
 

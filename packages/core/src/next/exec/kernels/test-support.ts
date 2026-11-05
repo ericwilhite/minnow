@@ -3,6 +3,7 @@
  * evaluation over one batch. Test-only (imported by *.test.ts and scripts/ benches).
  */
 import type { ScalarExpr } from "../../ir/ir.js";
+import { int128At, setInt128 } from "../../vector/int128.js";
 import type { PhysicalType } from "../../types.js";
 import type { Batch, FlatVector, Selection, Vector } from "../../vector/vector.js";
 import { compileExpr, type ParameterSlots } from "./compile.js";
@@ -22,6 +23,14 @@ export const decimal = (precision: number | null, scale: number | null): Physica
   precision,
   scale,
 });
+
+function int128Limbs(values: readonly bigint[]): Uint32Array {
+  const limbs = new Uint32Array(4 * values.length);
+  values.forEach((value, index) => {
+    setInt128(limbs, index, value);
+  });
+  return limbs;
+}
 
 export const UNCHARGED = { allocate: () => true, free: () => undefined };
 
@@ -91,7 +100,7 @@ export type DecimalValue =
 export function decimals(
   type: PhysicalType,
   values: readonly DecimalValue[],
-  tier: "safe" | "int64" | "wide" = "safe",
+  tier: "safe" | "int64" | "int128" | "wide" = "safe",
   uniform: number | null = null,
 ): FlatVector {
   const nulls = values.map((value) => value === null);
@@ -116,7 +125,9 @@ export function decimals(
           ? { repr: "safe", values: Float64Array.from(coefficients.map(Number)) }
           : tier === "int64"
             ? { repr: "int64", values: BigInt64Array.from(coefficients) }
-            : { repr: "wide", values: coefficients },
+            : tier === "int128"
+              ? { repr: "int128", limbs: int128Limbs(coefficients) }
+              : { repr: "wide", values: coefficients },
       specials: specialCodes.some((code) => code !== 0) ? Uint8Array.from(specialCodes) : null,
     },
   };
@@ -246,11 +257,9 @@ export function valueAt(vector: Vector, row: number): unknown {
       const coefficient =
         c.repr === "safe"
           ? BigInt(c.values[slot] ?? 0)
-          : c.repr === "int64"
-            ? c.values[slot]
-            : c.repr === "wide"
-              ? c.values[slot]
-              : 0n;
+          : c.repr === "int128"
+            ? int128At(c.limbs, slot)
+            : (c.values[slot] ?? 0n);
       return [coefficient, scale];
     }
     case "varlen":

@@ -492,7 +492,9 @@ and the owner import it directly.
 - Exact types: int32 with PostgreSQL's range errors; int64 as `safe` f64 while every value stays
   within ±(2^53 − 1), recomputed exactly in BigInt64Array otherwise; floats with PostgreSQL's
   overflow, underflow and division-by-zero errors, REAL rounded with `Math.fround`; decimals with
-  per-slot scales, never rescaled to a shared maximum, exact BigInt past the f64-safe range.
+  per-slot scales, never rescaled to a shared maximum: f64 while exact, then the int64 and int128
+  tiers in 32-bit limbs (no BigInt per value; rows grouped by scale pair), BigInt only past 128
+  bits.
 - Comparisons follow PostgreSQL: NaN equals NaN and sorts last, decimals compare by value across
   scales, text compares bytes. A dictionary column against a constant is compared once per
   entry.
@@ -501,6 +503,12 @@ and the owner import it directly.
 - Hot loops are branch-free (a data-dependent branch mispredicts on half of random rows): range
   checks look at the batch's largest result after the loop, and a suspicious batch is rechecked
   row by row.
+- Memory: output buffers are allocated once per compiled expression; number paths allocate
+  nothing per row, and a batch costs tens to a few hundred bytes of small objects (measured by
+  `scripts/next-kernels-bench.mts`). Only BigInt paths (values past 128 bits, int64 past 2^53 in
+  casts and comparisons) allocate per value.
+- `pglite.test.ts` judges generated cases by PostgreSQL itself: every numeric type, casts, NULLs
+  with garbage under them, flat/dictionary/constant operands, wide values.
 - `ir/functions.ts` lists every function, comparison and cast the kernels implement; a test
   compiles each entry.
 

@@ -20,7 +20,7 @@ import {
   type Vector,
 } from "../../vector/vector.js";
 import { UnsupportedPlanError } from "../errors.js";
-import { compileArithmetic, type ArithOp } from "./arith.js";
+import { compileArithmetic, compileNegate, type ArithOp } from "./arith.js";
 import { compileCase, compileCoalesce } from "./case.js";
 import { compileCast } from "./cast.js";
 import { compileCompare, compileDistinctFrom } from "./compare.js";
@@ -82,13 +82,6 @@ class ParamNode implements Compiled {
     this.#vector.length = batch.length;
     return this.#vector;
   }
-}
-
-/** A zero of `type` as a constant (for unary minus as 0 − x). */
-function zero(type: PhysicalType): FlatVector {
-  const vector = allocateFlat(type, 1);
-  vector.length = 1;
-  return vector;
 }
 
 const ARITH = new Set(["add", "sub", "mul", "div", "mod"]);
@@ -179,13 +172,7 @@ function compileCall(expr: Extract<ScalarExpr, { op: "call" }>, context: Compile
     case "neg": {
       const [arg] = args;
       if (arg === undefined) throw new TypeError("neg takes one argument");
-      return compileArithmetic(
-        "sub",
-        expr.type,
-        new ConstantNode(expr.type, zero(expr.type)),
-        arg,
-        arena,
-      );
+      return compileNegate(expr.type, arg, arena);
     }
     case "coalesce":
       return compileCoalesce(expr.type, args, arena);

@@ -14,7 +14,8 @@ import { slotOrder } from "./compare.js";
 import { constantIsNull } from "./numeric.js";
 import {
   nullConstant,
-  rowsOf,
+  countIn,
+  rowsIn,
   setValidity,
   slotOf,
   validAt,
@@ -83,7 +84,8 @@ class JunctionNode implements Compiled {
   }
   evaluate(batch: Batch, rows: Selection | null): Vector {
     const out = this.#out;
-    const [active, count] = rowsOf(rows, batch.length);
+    const active = rowsIn(rows);
+    const count = countIn(rows, batch.length);
     const neutral = this.and ? TRUE : FALSE;
     for (let k = 0; k < count; k++) {
       const i = active[k] ?? 0;
@@ -130,7 +132,8 @@ class NotNode implements Compiled {
   }
   evaluate(batch: Batch, rows: Selection | null): Vector {
     const value = this.arg.evaluate(batch, rows);
-    const [active, count] = rowsOf(rows, batch.length);
+    const active = rowsIn(rows);
+    const count = countIn(rows, batch.length);
     const out = this.#out;
     let anyNull = false;
     for (let k = 0; k < count; k++) {
@@ -159,7 +162,8 @@ class TestNode implements Compiled {
   }
   evaluate(batch: Batch, rows: Selection | null): Vector {
     const value = this.arg.evaluate(batch, rows);
-    const [active, count] = rowsOf(rows, batch.length);
+    const active = rowsIn(rows);
+    const count = countIn(rows, batch.length);
     const values = this.#out.values;
     const [ifFalse, ifTrue, ifNull] = [this.holds[1], this.holds[0], this.holds[2]];
     if (this.arg.type.kind !== "bool") {
@@ -186,6 +190,9 @@ class InListNode implements Compiled {
   readonly #null = nullConstant(BOOL);
   #entryId = -1;
   #entries = new Uint8Array(0);
+  readonly #items: Vector[] = [];
+  /** The constant values the cached entries were computed against. */
+  readonly #itemValues: Array<FlatVector | null> = [];
   constructor(
     readonly negated: boolean,
     readonly arg: Compiled,
@@ -202,19 +209,31 @@ class InListNode implements Compiled {
       (this.#null as { length: number }).length = batch.length;
       return this.#null;
     }
-    const items = this.list.map((item) => item.evaluate(batch, rows));
-    const [active, count] = rowsOf(rows, batch.length);
+    const items = this.#items;
+    for (let k = 0; k < this.list.length; k++) {
+      const item = this.list[k];
+      if (item !== undefined) items[k] = item.evaluate(batch, rows);
+    }
+    const active = rowsIn(rows);
+    const count = countIn(rows, batch.length);
     const out = this.#out;
     let anyNull = false;
     const hit = this.negated ? 0 : 1;
     if (value.form === "dictionary" && this.constantList) {
-      if (this.#entryId !== value.dictionaryId) {
+      // The per-entry answers depend on the dictionary and on the item values: a parameter
+      // re-bound between executions (or a new constant) invalidates them.
+      if (this.#entryId !== value.dictionaryId || !this.#sameItems(items)) {
         const dictionary = value.dictionary;
         if (this.#entries.length < dictionary.length)
           this.#entries = new Uint8Array(dictionary.length);
         for (let e = 0; e < dictionary.length; e++)
           this.#entries[e] = this.#truth(dictionary, e, items, 0);
         this.#entryId = value.dictionaryId;
+        for (let k = 0; k < items.length; k++) {
+          const item = items[k];
+          if (item === undefined) continue;
+          this.#itemValues[k] = item.form === "constant" ? item.value : null;
+        }
       }
       for (let k = 0; k < count; k++) {
         const i = active[k] ?? 0;
@@ -238,6 +257,14 @@ class InListNode implements Compiled {
       if (truth === NULL) anyNull = true;
     }
     return out.publish(batch.length, anyNull);
+  }
+  #sameItems(items: readonly Vector[]): boolean {
+    for (let k = 0; k < items.length; k++) {
+      const item = items[k];
+      if (item === undefined) continue;
+      if (item.form !== "constant" || this.#itemValues[k] !== item.value) return false;
+    }
+    return true;
   }
   #write(row: number, truth: number, hit: number): void {
     const out = this.#out;

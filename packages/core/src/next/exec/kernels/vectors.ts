@@ -10,8 +10,13 @@
  *   `evaluate` (the caller copies what it keeps longer).
  * - Errors (overflow, division by zero) are raised only for computed rows that are valid; garbage
  *   under null or uncomputed slots never raises (vector/vector.ts "Value rules").
- * - Kernels allocate nothing per row and, after compilation, nothing per batch: every output
- *   buffer is allocated once for `capacity` rows from the compile-time `ByteCharge` (a grant).
+ * - Memory: every output buffer is allocated once, for `capacity` rows, from the compile-time
+ *   `ByteCharge` (a grant), and reused for every batch. Kernels allocate nothing per row on their
+ *   number paths. Per batch, a few nodes allocate small objects (a retyped vector's wrapper, a
+ *   decimal cast's result wrapper is reused, a cache key array): scripts/next-kernels-bench.mts
+ *   measures the bytes per batch. The exact paths that read values as BigInt (the `wide`
+ *   decimal tier, int64 values past 2^53 in casts and comparisons) allocate per value; the
+ *   int64/int128 decimal tiers do not (limbs.ts).
  */
 import type { PhysicalType } from "../../types.js";
 import { BATCH_ROWS, dataBytes, allocateData } from "../../vector/vector.js";
@@ -33,9 +38,14 @@ export interface Compiled {
 /** Rows 0 … 2047, the selection used when every row is active (read-only). */
 export const IDENTITY: Uint16Array = Uint16Array.from({ length: BATCH_ROWS }, (_, k) => k);
 
-/** The active row indexes and their count. */
-export function rowsOf(rows: Selection | null, length: number): [Uint16Array, number] {
-  return rows === null ? [IDENTITY, length] : [rows.rows, rows.count];
+/** The active row indexes: the selection's, or `IDENTITY` when every row is active. */
+export function rowsIn(rows: Selection | null): Uint16Array {
+  return rows === null ? IDENTITY : rows.rows;
+}
+
+/** How many rows are active. */
+export function countIn(rows: Selection | null, length: number): number {
+  return rows === null ? length : rows.count;
 }
 
 export function validAt(validity: Validity | null, row: number): boolean {
@@ -75,6 +85,12 @@ export class OutputArena {
     const words = (this.capacity + 31) >>> 5;
     this.take(4 * words);
     return new Uint32Array(words);
+  }
+
+  /** Returns `bytes` previously taken (a buffer replaced by a larger one). */
+  give(bytes: number): void {
+    this.charge.free(bytes);
+    this.#charged -= bytes;
   }
 
   get bytes(): number {
@@ -134,6 +150,20 @@ export function slotOf(vector: Vector, row: number): [FlatVector, number] {
     case "dictionary":
       return [vector.dictionary, vector.codes[row] ?? 0];
   }
+}
+
+/** The flat vector holding a vector's values: itself, a constant's value, a dictionary. */
+export function flatOf(vector: Vector): FlatVector {
+  return vector.form === "flat"
+    ? vector
+    : vector.form === "constant"
+      ? vector.value
+      : vector.dictionary;
+}
+
+/** The slot of `flatOf(vector)` holding row `row` (no allocation, unlike `slotOf`). */
+export function slotIndex(vector: Vector, row: number): number {
+  return vector.form === "flat" ? row : vector.form === "constant" ? 0 : (vector.codes[row] ?? 0);
 }
 
 /** Copies slot `from` of `source` into slot `to` of fixed-width `target` (same layout). */

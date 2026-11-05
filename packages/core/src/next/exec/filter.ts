@@ -132,8 +132,11 @@ export class ProjectOperator implements Operator {
     this.types = this.#exprs.map((expr) => expr.type);
   }
   push(batch: Batch, transfer?: Transfer): PushResult {
-    for (const [c, expr] of this.#exprs.entries())
+    for (let c = 0; c < this.#exprs.length; c++) {
+      const expr = this.#exprs[c];
+      if (expr === undefined) continue;
       this.#columns[c] = expr.evaluate(batch, batch.selection);
+    }
     const result = this.downstream.push({
       length: batch.length,
       columns: this.#columns,

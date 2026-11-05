@@ -31,11 +31,12 @@ import {
 } from "../../temporal.js";
 import { MAX_SAFE } from "../../vector/int64.js";
 import type { Batch, FlatVector, Int64Values, Selection, Vector } from "../../vector/vector.js";
-import { NumericOutOfRangeError, UnsupportedPlanError } from "../errors.js";
+import { CannotConvertError, NumericOutOfRangeError, UnsupportedPlanError } from "../errors.js";
 import { coefficientAt, scaleAt, specialAt, type DecimalData } from "./numeric.js";
 import {
   nullConstant,
-  rowsOf,
+  countIn,
+  rowsIn,
   slotOf,
   validAt,
   type Compiled,
@@ -65,9 +66,12 @@ function decimalToFloat(c: bigint, scale: number): number {
   return Number(scale === 0 ? c.toString() : `${c.toString()}e-${String(scale)}`);
 }
 
-/** PostgreSQL float8 → numeric: 15 significant digits, trailing fraction zeros dropped. */
-function floatToDecimal(x: number): { coefficient: bigint; scale: number } {
-  const text = x.toPrecision(15);
+/**
+ * PostgreSQL float → numeric: `digits` significant digits (15 for float8, 6 for float4: DBL_DIG
+ * and FLT_DIG), trailing fraction zeros dropped.
+ */
+function floatToDecimal(x: number, significant: number): { coefficient: bigint; scale: number } {
+  const text = x.toPrecision(significant);
   const [mantissa = "0", exponentText] = text.split("e");
   const exponent = exponentText === undefined ? 0 : Number(exponentText);
   const negative = mantissa.startsWith("-");
@@ -103,7 +107,8 @@ abstract class CastNode implements Compiled {
       (this.#null as { length: number }).length = batch.length;
       return this.#null;
     }
-    const [active, count] = rowsOf(rows, batch.length);
+    const active = rowsIn(rows);
+    const count = countIn(rows, batch.length);
     return this.cast(value, active, count, batch.length);
   }
   abstract cast(value: Vector, rows: Uint16Array, count: number, length: number): Vector;
@@ -186,8 +191,9 @@ class ToInt32 extends CastNode {
         const [f, slot] = slotOf(value, i);
         const d = f.data as DecimalData;
         if (specialAt(d, slot) !== 0)
-          throw new NumericOutOfRangeError(
-            `cannot convert ${specialAt(d, slot) === 1 ? "NaN" : "infinity"} to integer`,
+          throw new CannotConvertError(
+            specialAt(d, slot),
+            this.#message.split(" ")[0] ?? "integer",
           );
         const scale = scaleAt(d, slot);
         const c = coefficientAt(d, slot);
@@ -261,10 +267,7 @@ class ToInt64 extends CastNode {
       if (read === null) {
         const [f, slot] = slotOf(value, i);
         const d = f.data as DecimalData;
-        if (specialAt(d, slot) !== 0)
-          throw new NumericOutOfRangeError(
-            `cannot convert ${specialAt(d, slot) === 1 ? "NaN" : "infinity"} to bigint`,
-          );
+        if (specialAt(d, slot) !== 0) throw new CannotConvertError(specialAt(d, slot), "bigint");
         const scale = scaleAt(d, slot);
         const c = coefficientAt(d, slot);
         v = scale === 0 ? c : roundCoefficient(c, scale, 0);
@@ -330,14 +333,18 @@ class ToFloat extends CastNode {
         const [f, slot] = slotOf(value, i);
         const d = f.data as DecimalData;
         const special = specialAt(d, slot);
-        v =
-          special === 1
-            ? NaN
-            : special === 2
-              ? Infinity
-              : special === 3
-                ? -Infinity
-                : decimalToFloat(coefficientAt(d, slot), scaleAt(d, slot));
+        if (special !== 0) v = special === 1 ? NaN : special === 2 ? Infinity : -Infinity;
+        else {
+          // PostgreSQL parses the numeric's text as a float: a finite value past the float range
+          // is an overflow, a nonzero one that rounds to zero an underflow (22003).
+          const c = coefficientAt(d, slot);
+          v = decimalToFloat(c, scaleAt(d, slot));
+          const rounded = real ? Math.fround(v) : v;
+          if (!Number.isFinite(rounded))
+            throw new NumericOutOfRangeError("value out of range: overflow");
+          if (rounded === 0 && c !== 0n)
+            throw new NumericOutOfRangeError("value out of range: underflow");
+        }
       } else {
         const raw = read(i);
         v = typeof raw === "bigint" ? Number(raw) : raw;
@@ -358,6 +365,8 @@ class ToFloat extends CastNode {
 }
 
 class ToDecimal extends CastNode {
+  /** Results by tier and specials: safe, safe + specials, wide, wide + specials. */
+  readonly #outputs: FlatVector[];
   readonly #scales: Uint16Array;
   readonly #safe: Float64Array;
   readonly #wide: bigint[];
@@ -374,6 +383,21 @@ class ToDecimal extends CastNode {
     this.#specials = new Uint8Array(capacity);
     this.#precision = type.kind === "decimal" ? type.precision : null;
     this.#scale = type.kind === "decimal" ? type.scale : null;
+    // A declared scale (negative ones are stored at 0) makes the result uniform.
+    const uniform = this.#scale === null ? null : Math.max(0, this.#scale);
+    const scales = uniform === null ? this.#scales : null;
+    this.#outputs = [
+      { repr: "safe", values: this.#safe } as const,
+      { repr: "wide", values: this.#wide } as const,
+    ].flatMap((coefficients) =>
+      [null, this.#specials].map((specials): FlatVector => ({
+        form: "flat",
+        type,
+        length: 0,
+        validity: null,
+        data: { layout: "decimal", scale: uniform, scales, coefficients, specials },
+      })),
+    );
   }
   cast(value: Vector, rows: Uint16Array, count: number, length: number): Vector {
     const from = this.input.type.kind;
@@ -407,7 +431,9 @@ class ToDecimal extends CastNode {
           if (x !== x) special = 1;
           else if (x === Infinity) special = 2;
           else if (x === -Infinity) special = 3;
-          if (special === 0) ({ coefficient: c, scale: s } = floatToDecimal(x));
+          // PostgreSQL: float8 → numeric through 15 significant digits, float4 through 6.
+          if (special === 0)
+            ({ coefficient: c, scale: s } = floatToDecimal(x, from === "float32" ? 6 : 15));
           else {
             c = 0n;
             s = 0;
@@ -428,32 +454,28 @@ class ToDecimal extends CastNode {
         continue;
       }
       if (target !== null) {
-        const t = Math.max(0, target);
-        if (s > t) c = roundCoefficient(c, s, t);
-        else if (s < t) c *= 10n ** BigInt(t - s);
-        s = t;
+        // Round to the declared scale, which may be negative (NUMERIC(3, −2) rounds to hundreds);
+        // the precision counts the digits at that scale. A negative scale is stored at scale 0.
+        if (s > target) c = roundCoefficient(c, s, target);
+        else if (s < target) c *= 10n ** BigInt(target - s);
+        s = target;
       }
       if (limit !== null && (c < 0n ? -c : c) >= limit)
         throw new NumericOutOfRangeError("numeric field overflow");
+      if (s < 0) {
+        c *= 10n ** BigInt(-s);
+        s = 0;
+      }
       scales[i] = s;
       wide[i] = c;
       if (c >= -BigInt(MAX_SAFE) && c <= BigInt(MAX_SAFE)) safe[i] = Number(c);
       else allSafe = false;
     }
-    const uniform = target === null ? null : Math.max(0, target);
-    return {
-      form: "flat",
-      type: this.type,
-      length,
-      validity: validityOf(value),
-      data: {
-        layout: "decimal",
-        scale: uniform,
-        scales: uniform === null ? scales : null,
-        coefficients: allSafe ? { repr: "safe", values: safe } : { repr: "wide", values: wide },
-        specials: anySpecial ? specials : null,
-      },
-    };
+    const out = this.#outputs[(allSafe ? 0 : 2) + (anySpecial ? 1 : 0)];
+    if (out === undefined) throw new TypeError("no decimal cast output");
+    out.length = length;
+    out.validity = validityOf(value);
+    return out;
   }
 }
 

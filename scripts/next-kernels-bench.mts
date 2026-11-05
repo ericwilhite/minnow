@@ -3,7 +3,13 @@
  * over in-memory batches of 2,048 rows, against the expression part of measured shapes
  * (PROPOSAL "Targets", measurements.md):
  *
- *   npx tsc -b packages/core && node scripts/next-kernels-bench.mts [--repeats 9]
+ *   npx tsc -b packages/core && node --expose-gc --max-semi-space-size=512 \
+ *     scripts/next-kernels-bench.mts [--repeats 9]
+ *
+ * Allocation per batch: with a young generation large enough that no collection runs during one
+ * pass, the growth of the used heap over the pass, divided by its batches, is the bytes allocated
+ * per batch (a garbage-collection observer discards a pass that collected; "—" without
+ * `--expose-gc`).
  *
  * It runs the compiled output (packages/core/dist) under plain Node: vite-node rewrites every
  * import into a property read on a module object, which costs a getter per access inside the hot
@@ -15,7 +21,7 @@
  * the kernel's output standing in for SUM until the aggregation increment lands. Compare them
  * with the whole-query DuckDB-Wasm times only as an upper bound on what the expression may cost.
  */
-import { performance } from "node:perf_hooks";
+import { PerformanceObserver, performance } from "node:perf_hooks";
 import type { ScalarExpr } from "../packages/core/dist/next/ir/ir.js";
 import { Predicate } from "../packages/core/dist/next/exec/filter.js";
 import { compileExpr } from "../packages/core/dist/next/exec/kernels/compile.js";
@@ -109,12 +115,39 @@ function sumOf(vector: Vector, length: number): number {
 }
 
 const random = rng(0x5eed);
-const results: Array<{ shape: string; rows: number; ms: number; min: number; reference: string }> =
-  [];
+const results: Array<{
+  shape: string;
+  rows: number;
+  ms: number;
+  min: number;
+  bytes: number | null;
+  reference: string;
+}> = [];
+
+let collections = 0;
+new PerformanceObserver((list) => {
+  collections += list.getEntries().length;
+}).observe({ entryTypes: ["gc"] });
+const gc = (globalThis as { gc?: () => void }).gc;
+
+/** Bytes allocated per batch by one pass of `run`, or null when it cannot be measured. */
+function allocationPerBatch(run: () => number, batches: number): number | null {
+  if (gc === undefined) return null;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    gc();
+    const before = collections;
+    const heap = process.memoryUsage().heapUsed;
+    run();
+    const grown = process.memoryUsage().heapUsed - heap;
+    if (collections === before) return Math.max(0, grown) / batches;
+  }
+  return null;
+}
 
 function bench(shape: string, rows: number, reference: string, run: () => number): void {
   const { ms, min } = time(run);
-  results.push({ shape, rows, ms, min, reference });
+  const bytes = allocationPerBatch(run, Math.ceil(rows / BATCH));
+  results.push({ shape, rows, ms, min, bytes, reference });
 }
 
 // --- 200k-row shapes (PROPOSAL Targets: DuckDB-Wasm 1T whole query) ---------------------------
@@ -261,9 +294,9 @@ function bench(shape: string, rows: number, reference: string, run: () => number
   });
 }
 
-console.log(`| shape | rows | min ms | median ms | reference |`);
-console.log(`|---|---:|---:|---:|---|`);
+console.log(`| shape | rows | min ms | median ms | bytes allocated per batch | reference |`);
+console.log(`|---|---:|---:|---:|---:|---|`);
 for (const r of results)
   console.log(
-    `| ${r.shape} | ${r.rows.toLocaleString("en-US")} | ${r.min.toFixed(2)} | ${r.ms.toFixed(2)} | ${r.reference} |`,
+    `| ${r.shape} | ${r.rows.toLocaleString("en-US")} | ${r.min.toFixed(2)} | ${r.ms.toFixed(2)} | ${r.bytes === null ? "—" : r.bytes.toFixed(0)} | ${r.reference} |`,
   );

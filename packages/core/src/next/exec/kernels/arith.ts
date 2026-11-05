@@ -30,6 +30,19 @@ import type {
   Vector,
 } from "../../vector/vector.js";
 import { DivisionByZeroError, NumericOutOfRangeError, UnsupportedPlanError } from "../errors.js";
+import {
+  SCRATCH,
+  addTo,
+  copy,
+  fitsInt64,
+  int64Words,
+  multiplyTo,
+  scaleUp,
+  setInt64,
+  setNumber,
+  sign,
+  storeInt64,
+} from "./limbs.js";
 import { ADD, DIV, MUL, SUB, floatLoop, int32Loop, zeroSeen } from "./loops.js";
 import {
   POW10,
@@ -42,10 +55,12 @@ import {
 } from "./numeric.js";
 import {
   combineValidity,
+  flatOf,
+  slotIndex,
   copyFixedSlot,
   nullConstant,
-  rowsOf,
-  slotOf,
+  countIn,
+  rowsIn,
   validAt,
   type Compiled,
   type OutputArena,
@@ -57,22 +72,57 @@ const OPS: Record<ArithOp, number> = { add: ADD, sub: SUB, mul: MUL, div: DIV, m
 
 /** A fixed-width operand read at `row * stride`, dictionaries materialized into `scratch`. */
 class FixedOperand {
-  readonly #scratch: FlatVector | null;
-  constructor(arena: OutputArena, type: PhysicalType, dictionaryPossible: boolean) {
-    this.#scratch = dictionaryPossible ? arena.flat(type).vector : null;
+  readonly #arena: OutputArena;
+  readonly #type: PhysicalType;
+  #scratch: FlatVector | null = null;
+  #wideScratch: FlatVector | null = null;
+  /** The stride of the last `read`: 1 for a flat vector, 0 for a constant. */
+  stride: 0 | 1 = 1;
+  constructor(arena: OutputArena, type: PhysicalType) {
+    this.#arena = arena;
+    this.#type = type;
   }
-  /** Returns [flat, stride] for the computed rows. */
-  read(vector: Vector, rows: Uint16Array, count: number): [FlatVector, 0 | 1] {
-    if (vector.form === "flat") return [vector, 1];
-    if (vector.form === "constant") return [vector.value, 0];
-    const scratch = this.#scratch;
-    if (scratch === null) throw new TypeError("unexpected dictionary operand");
+  /** The flat vector to read for the computed rows (a dictionary is materialized). */
+  read(vector: Vector, rows: Uint16Array, count: number): FlatVector {
+    if (vector.form === "flat") {
+      this.stride = 1;
+      return vector;
+    }
+    if (vector.form === "constant") {
+      this.stride = 0;
+      return vector.value;
+    }
+    this.stride = 1;
+    const source = vector.dictionary.data;
+    // A dictionary of exact int64 values materializes into an int64 scratch (finding 7).
+    const wide = source.layout === "int64" && source.values.repr === "int64";
+    const scratch = wide ? this.#wide() : this.#safe();
     for (let k = 0; k < count; k++) {
       const row = rows[k] ?? 0;
-      copyFixedSlot(vector.dictionary.data, vector.codes[row] ?? 0, scratch.data, row);
+      copyFixedSlot(source, vector.codes[row] ?? 0, scratch.data, row);
     }
     scratch.validity = vector.validity;
-    return [scratch, 1];
+    return scratch;
+  }
+  #safe(): FlatVector {
+    this.#scratch ??= this.#arena.flat(this.#type).vector;
+    return this.#scratch;
+  }
+  #wide(): FlatVector {
+    if (this.#wideScratch === null) {
+      this.#arena.take(8 * this.#arena.capacity);
+      this.#wideScratch = {
+        form: "flat",
+        type: this.#type,
+        length: 0,
+        validity: null,
+        data: {
+          layout: "int64",
+          values: { repr: "int64", values: new BigInt64Array(this.#arena.capacity) },
+        },
+      };
+    }
+    return this.#wideScratch;
   }
 }
 
@@ -110,7 +160,8 @@ abstract class BinaryNode implements Compiled {
       (this.#nullResult as { length: number }).length = batch.length;
       return this.#nullResult;
     }
-    const [active, count] = rowsOf(rows, batch.length);
+    const active = rowsIn(rows);
+    const count = countIn(rows, batch.length);
     return this.compute(batch.length, l, r, active, count);
   }
   abstract compute(length: number, l: Vector, r: Vector, rows: Uint16Array, count: number): Vector;
@@ -144,12 +195,14 @@ class Int32Node extends BinaryNode {
     const output = arena.flat(type);
     this.#out = output.vector;
     this.#validity = output.validity;
-    this.#a = new FixedOperand(arena, left.type, true);
-    this.#b = new FixedOperand(arena, right.type, true);
+    this.#a = new FixedOperand(arena, left.type);
+    this.#b = new FixedOperand(arena, right.type);
   }
   compute(length: number, l: Vector, r: Vector, rows: Uint16Array, count: number): Vector {
-    const [lf, as] = this.#a.read(l, rows, count);
-    const [rf, bs] = this.#b.read(r, rows, count);
+    const lf = this.#a.read(l, rows, count);
+    const as = this.#a.stride;
+    const rf = this.#b.read(r, rows, count);
+    const bs = this.#b.stride;
     const a = (lf.data as { values: Int32Array }).values;
     const b = (rf.data as { values: Int32Array }).values;
     const out = (this.#out.data as { values: Int32Array }).values;
@@ -267,12 +320,14 @@ class Int64Node extends BinaryNode {
         values: { repr: "int64", values: new BigInt64Array(arena.capacity) },
       },
     };
-    this.#a = new FixedOperand(arena, left.type, true);
-    this.#b = new FixedOperand(arena, right.type, true);
+    this.#a = new FixedOperand(arena, left.type);
+    this.#b = new FixedOperand(arena, right.type);
   }
   compute(length: number, l: Vector, r: Vector, rows: Uint16Array, count: number): Vector {
-    const [lf, as] = this.#a.read(l, rows, count);
-    const [rf, bs] = this.#b.read(r, rows, count);
+    const lf = this.#a.read(l, rows, count);
+    const as = this.#a.stride;
+    const rf = this.#b.read(r, rows, count);
+    const bs = this.#b.stride;
     const av = (lf.data as { values: Int64Values }).values;
     const bv = (rf.data as { values: Int64Values }).values;
     const validity = combineValidity(
@@ -427,12 +482,14 @@ class FloatNode extends BinaryNode {
     const output = arena.flat(type);
     this.#out = output.vector;
     this.#validity = output.validity;
-    this.#a = new FixedOperand(arena, left.type, true);
-    this.#b = new FixedOperand(arena, right.type, true);
+    this.#a = new FixedOperand(arena, left.type);
+    this.#b = new FixedOperand(arena, right.type);
   }
   compute(length: number, l: Vector, r: Vector, rows: Uint16Array, count: number): Vector {
-    const [lf, as] = this.#a.read(l, rows, count);
-    const [rf, bs] = this.#b.read(r, rows, count);
+    const lf = this.#a.read(l, rows, count);
+    const as = this.#a.stride;
+    const rf = this.#b.read(r, rows, count);
+    const bs = this.#b.stride;
     const a = (lf.data as { values: Float64Array }).values;
     const b = (rf.data as { values: Float64Array }).values;
     const out = (this.#out.data as { values: Float64Array }).values;
@@ -443,15 +500,20 @@ class FloatNode extends BinaryNode {
       length,
     );
     let m = floatLoop(this.#op, a, as, b, bs, rows, count, out);
-    const zero = zeroSeen;
+    let zero = zeroSeen;
     if (this.#real) {
+      // Range checks apply to the REAL value: a nonzero f64 product can round to zero (underflow)
+      // or past the float4 maximum (overflow) only here.
       m = 0;
+      let z = 0;
       for (let k = 0; k < count; k++) {
         const i = rows[k] ?? 0;
         const v = Math.fround(out[i] ?? 0);
         out[i] = v;
         m = Math.max(m, Math.abs(v));
+        z |= +(v === 0);
       }
+      zero = z !== 0;
     }
     // Overflow, NaN from division by zero, or an underflow candidate: recheck row by row (inputs
     // that are already NaN or infinite make this batch slower, never wrong).
@@ -478,7 +540,8 @@ class FloatNode extends BinaryNode {
       const x = a[i * as] ?? 0;
       const y = b[i * bs] ?? 0;
       const v = out[i] ?? 0;
-      if (op === DIV && y === 0) throw new DivisionByZeroError();
+      // PostgreSQL's float8div / float4div: NaN / 0 is NaN, any other x / 0 is 22012.
+      if (op === DIV && y === 0 && x === x) throw new DivisionByZeroError();
       const finite = Number.isFinite(x) && Number.isFinite(y);
       if ((v === Infinity || v === -Infinity) && finite)
         throw new NumericOutOfRangeError("value out of range: overflow");
@@ -495,14 +558,63 @@ const NAN = 1;
 const POS = 2;
 const NEG = 3;
 
+/** PostgreSQL's largest NUMERIC display scale; a product past it is rounded to it. */
+const NUMERIC_MAX_SCALE = 16_383;
+/** Distinct (scale, scale) pairs a batch is partitioned into before falling back to per row. */
+const MAX_SCALE_PARTITIONS = 32;
+
+function decimalVector(
+  type: PhysicalType,
+  scale: number | null,
+  scales: Uint16Array | null,
+  coefficients: DecimalData["coefficients"],
+  specials: Uint8Array | null,
+): FlatVector {
+  return {
+    form: "flat",
+    type,
+    length: 0,
+    validity: null,
+    data: { layout: "decimal", scale, scales, coefficients, specials },
+  };
+}
+
+/**
+ * Decimal add, sub and mul over every coefficient tier:
+ * 1. safe f64 while every aligned value and result stays within ±(2^53 − 1);
+ * 2. otherwise 128-bit limbs (limbs.ts), rows grouped by their (scale, scale) pair so each group
+ *    aligns with one constant power of ten; the result is the int64 tier when every value fits,
+ *    else int128. No BigInt is created per value;
+ * 3. only past 128 bits (or for `wide` inputs, or a product past the maximum display scale) the
+ *    batch is recomputed exactly in BigInt into the `wide` tier.
+ */
 class DecimalNode extends BinaryNode {
   readonly #op: number;
-  readonly #perSlot: FlatVector;
-  readonly #safeCoefficients: Float64Array;
   readonly #scales: Uint16Array;
+  readonly #safeCoefficients: Float64Array;
+  readonly #limbs: Uint32Array;
+  readonly #int64: BigInt64Array;
+  readonly #int64Words: Uint32Array;
   readonly #wideValues: bigint[];
   readonly #specials: Uint8Array;
   readonly #validity: Validity;
+  readonly #perSlot: FlatVector;
+  readonly #uniformVectors = new Map<number, FlatVector>();
+  /** int64 / int128 / wide outputs, without and with specials. */
+  readonly #tiers: readonly FlatVector[];
+  /** Row order grouped by scale pair, and the pairs. */
+  readonly #order: Uint16Array;
+  readonly #pairKeys = new Int32Array(MAX_SCALE_PARTITIONS);
+  readonly #pairCounts = new Int32Array(MAX_SCALE_PARTITIONS + 1);
+  readonly #pairOf: Uint8Array;
+  #wordsCache: { source: BigInt64Array | null; words: Uint32Array } = {
+    source: null,
+    words: new Uint32Array(0),
+  };
+  #wordsCacheB: { source: BigInt64Array | null; words: Uint32Array } = {
+    source: null,
+    words: new Uint32Array(0),
+  };
   constructor(
     op: ArithOp,
     type: PhysicalType,
@@ -511,35 +623,44 @@ class DecimalNode extends BinaryNode {
     arena: OutputArena,
   ) {
     super(type, left, right);
-    if (op === "div" || op === "mod") throw new UnsupportedPlanError("numeric division and modulo");
     this.#op = OPS[op];
     const capacity = arena.capacity;
-    arena.take(8 * capacity + 2 * capacity + capacity + 32 * capacity);
-    this.#safeCoefficients = new Float64Array(capacity);
+    arena.take(
+      2 * capacity +
+        8 * capacity +
+        16 * capacity +
+        8 * capacity +
+        32 * capacity +
+        capacity +
+        3 * capacity,
+    );
     this.#scales = new Uint16Array(capacity);
-    this.#specials = new Uint8Array(capacity);
+    this.#safeCoefficients = new Float64Array(capacity);
+    this.#limbs = new Uint32Array(4 * capacity);
+    this.#int64 = new BigInt64Array(capacity);
+    this.#int64Words = int64Words(this.#int64);
     this.#wideValues = new Array<bigint>(capacity).fill(0n);
+    this.#specials = new Uint8Array(capacity);
+    this.#order = new Uint16Array(capacity);
+    this.#pairOf = new Uint8Array(capacity);
     this.#validity = arena.validity();
-    this.#perSlot = this.#vector(
+    this.#perSlot = decimalVector(
+      type,
       null,
       this.#scales,
       { repr: "safe", values: this.#safeCoefficients },
       null,
     );
-  }
-  #vector(
-    scale: number | null,
-    scales: Uint16Array | null,
-    coefficients: DecimalData["coefficients"],
-    specials: Uint8Array | null,
-  ): FlatVector {
-    return {
-      form: "flat",
-      type: this.type,
-      length: 0,
-      validity: null,
-      data: { layout: "decimal", scale, scales, coefficients, specials },
-    };
+    const tiers: FlatVector[] = [];
+    for (const coefficients of [
+      { repr: "int64", values: this.#int64 } as const,
+      { repr: "int128", limbs: this.#limbs } as const,
+      { repr: "wide", values: this.#wideValues } as const,
+    ]) {
+      tiers.push(decimalVector(type, null, this.#scales, coefficients, null));
+      tiers.push(decimalVector(type, null, this.#scales, coefficients, this.#specials));
+    }
+    this.#tiers = tiers;
   }
   compute(length: number, l: Vector, r: Vector, rows: Uint16Array, count: number): Vector {
     const validity = combineValidity(
@@ -548,19 +669,16 @@ class DecimalNode extends BinaryNode {
       this.#validity,
       length,
     );
-    const fast = this.#fast(l, r, rows, count, validity, length);
-    if (fast !== null) return fast;
-    return this.#slow(l, r, rows, count, validity, length);
+    const out =
+      this.#fast(l, r, rows, count) ??
+      this.#tiered(l, r, rows, count, validity) ??
+      this.#slow(l, r, rows, count, validity);
+    out.length = length;
+    out.validity = validity;
+    return out;
   }
   /** Both operands flat or constant, safe tier, no specials: f64 while every value stays exact. */
-  #fast(
-    l: Vector,
-    r: Vector,
-    rows: Uint16Array,
-    count: number,
-    validity: Validity | null,
-    length: number,
-  ): FlatVector | null {
+  #fast(l: Vector, r: Vector, rows: Uint16Array, count: number): FlatVector | null {
     if (l.form === "dictionary" || r.form === "dictionary") return null;
     const lf = l.form === "flat" ? l : l.value;
     const rf = r.form === "flat" ? r : r.value;
@@ -573,13 +691,15 @@ class DecimalNode extends BinaryNode {
     const a = ld.coefficients.values;
     const b = rd.coefficients.values;
     const out = this.#safeCoefficients;
-    const uniform = ld.scale !== null && rd.scale !== null;
     const op = this.#op;
+    // Out of the exact range (possibly only under a null, or in an unselected row): recompute
+    // exactly in a wider tier.
     let bad = false;
-    if (uniform) {
+    if (ld.scale !== null && rd.scale !== null) {
       const sa = ld.scale;
       const sb = rd.scale;
       if (op === MUL) {
+        if (sa + sb > NUMERIC_MAX_SCALE) return null;
         for (let k = 0; k < count; k++) {
           const i = rows[k] ?? 0;
           const v = (a[i * as] ?? 0) * (b[i * bs] ?? 0) + 0;
@@ -609,15 +729,9 @@ class DecimalNode extends BinaryNode {
             bad = true;
         }
       }
-      // Out of the exact range (possibly only under a null): recompute exactly.
       if (bad) return null;
-      const scale = op === MUL ? sa + sb : Math.max(sa, sb);
-      const vector = this.#uniform(scale);
-      vector.length = length;
-      vector.validity = validity;
-      return vector;
+      return this.#uniform(op === MUL ? sa + sb : Math.max(sa, sb));
     }
-    // Per-slot scales.
     const scales = this.#scales;
     for (let k = 0; k < count; k++) {
       const i = rows[k] ?? 0;
@@ -627,7 +741,7 @@ class DecimalNode extends BinaryNode {
         const v = (a[i * as] ?? 0) * (b[i * bs] ?? 0) + 0;
         out[i] = v;
         scales[i] = sa + sb;
-        if (v > MAX_SAFE || v < -MAX_SAFE || sa + sb > 16383) bad = true;
+        if (v > MAX_SAFE || v < -MAX_SAFE || sa + sb > NUMERIC_MAX_SCALE) bad = true;
         continue;
       }
       const scale = sa > sb ? sa : sb;
@@ -652,35 +766,165 @@ class DecimalNode extends BinaryNode {
       )
         bad = true;
     }
-    if (bad) return null;
-    const vector = this.#perSlot;
-    vector.length = length;
-    vector.validity = validity;
-    return vector;
+    return bad ? null : this.#perSlot;
   }
-  readonly #uniformVectors = new Map<number, FlatVector>();
   #uniform(scale: number): FlatVector {
     let vector = this.#uniformVectors.get(scale);
     if (vector === undefined) {
-      vector = this.#vector(scale, null, { repr: "safe", values: this.#safeCoefficients }, null);
+      vector = decimalVector(
+        this.type,
+        scale,
+        null,
+        { repr: "safe", values: this.#safeCoefficients },
+        null,
+      );
       this.#uniformVectors.set(scale, vector);
     }
     return vector;
   }
-  /** Exact BigInt path for every case: any tier, specials, dictionaries. */
+  #words(data: DecimalData, second: boolean): Uint32Array {
+    const coefficients = data.coefficients;
+    if (coefficients.repr !== "int64") return EMPTY_WORDS;
+    const cache = second ? this.#wordsCacheB : this.#wordsCache;
+    if (cache.source !== coefficients.values) {
+      cache.source = coefficients.values;
+      cache.words = int64Words(coefficients.values);
+    }
+    return cache.words;
+  }
+  /**
+   * Groups the computed valid rows by (left scale, right scale) into `#order`; returns the number
+   * of groups, or −1 past MAX_SCALE_PARTITIONS distinct pairs.
+   */
+  #partition(
+    lf: FlatVector,
+    l: Vector,
+    rf: FlatVector,
+    r: Vector,
+    rows: Uint16Array,
+    count: number,
+  ): number {
+    const ld = lf.data as DecimalData;
+    const rd = rf.data as DecimalData;
+    const keys = this.#pairKeys;
+    const counts = this.#pairCounts;
+    const pairOf = this.#pairOf;
+    let pairs = 0;
+    counts.fill(0);
+    for (let k = 0; k < count; k++) {
+      const i = rows[k] ?? 0;
+      const key = (scaleAt(ld, slotIndex(l, i)) << 16) | scaleAt(rd, slotIndex(r, i));
+      let p = 0;
+      while (p < pairs && keys[p] !== key) p++;
+      if (p === pairs) {
+        if (pairs === MAX_SCALE_PARTITIONS) return -1;
+        keys[pairs++] = key;
+      }
+      pairOf[i] = p;
+      counts[p + 1] = (counts[p + 1] ?? 0) + 1;
+    }
+    for (let p = 1; p <= pairs; p++) counts[p] = (counts[p] ?? 0) + (counts[p - 1] ?? 0);
+    const order = this.#order;
+    for (let k = 0; k < count; k++) {
+      const i = rows[k] ?? 0;
+      const p = pairOf[i] ?? 0;
+      order[counts[p] ?? 0] = i;
+      counts[p] = (counts[p] ?? 0) + 1;
+    }
+    // counts[p] is now the end of group p.
+    return pairs;
+  }
+  /** The 128-bit limb tier; null when a value passes 128 bits (or the display scale cap). */
+  #tiered(
+    l: Vector,
+    r: Vector,
+    rows: Uint16Array,
+    count: number,
+    validity: Validity | null,
+  ): FlatVector | null {
+    const lf = flatOf(l);
+    const rf = flatOf(r);
+    const ld = lf.data as DecimalData;
+    const rd = rf.data as DecimalData;
+    if (ld.coefficients.repr === "wide" || rd.coefficients.repr === "wide") return null;
+    const pairs = this.#partition(lf, l, rf, r, rows, count);
+    if (pairs < 0) return null;
+    const lw = this.#words(ld, false);
+    const rw = this.#words(rd, true);
+    const out = this.#limbs;
+    const scales = this.#scales;
+    const specials = this.#specials;
+    const order = this.#order;
+    const ends = this.#pairCounts;
+    const op = this.#op;
+    let fits = true;
+    let anySpecial = false;
+    let start = 0;
+    for (let p = 0; p < pairs; p++) {
+      const end = ends[p] ?? 0;
+      const key = this.#pairKeys[p] ?? 0;
+      const sa = key >>> 16;
+      const sb = key & 0xffff;
+      const scale = op === MUL ? sa + sb : Math.max(sa, sb);
+      if (scale > NUMERIC_MAX_SCALE) return null;
+      const da = op === MUL ? 0 : scale - sa;
+      const db = op === MUL ? 0 : scale - sb;
+      for (let k = start; k < end; k++) {
+        const i = order[k] ?? 0;
+        specials[i] = 0;
+        scales[i] = scale;
+        if (!validAt(validity, i)) continue;
+        const li = slotIndex(l, i);
+        const ri = slotIndex(r, i);
+        loadCoefficient(SCRATCH, 0, ld, li, lw);
+        loadCoefficient(SCRATCH, 1, rd, ri, rw);
+        const xs = specialAt(ld, li);
+        const ys = specialAt(rd, ri);
+        if (xs !== 0 || ys !== 0) {
+          specials[i] = special(op, xs, ys, sign(SCRATCH, 0), sign(SCRATCH, 1));
+          anySpecial = true;
+          setNumber(out, i, 0);
+          continue;
+        }
+        let ok: boolean;
+        if (op === MUL) ok = multiplyTo(out, i, SCRATCH, 0, SCRATCH, 1);
+        else
+          ok =
+            scaleUp(SCRATCH, 0, da) &&
+            scaleUp(SCRATCH, 1, db) &&
+            addTo(out, i, SCRATCH, 0, SCRATCH, 1, op === SUB);
+        if (!ok) return null;
+        if (fits && !fitsInt64(out, i)) fits = false;
+      }
+      start = end;
+    }
+    if (fits) {
+      const words = this.#int64Words;
+      for (let k = 0; k < count; k++) {
+        const i = rows[k] ?? 0;
+        storeInt64(out, i, words, i);
+      }
+      return this.#tiers[anySpecial ? 1 : 0] ?? null;
+    }
+    return this.#tiers[anySpecial ? 3 : 2] ?? null;
+  }
+  /** Exact BigInt for values past 128 bits, `wide` inputs, and products past the scale cap. */
   #slow(
     l: Vector,
     r: Vector,
     rows: Uint16Array,
     count: number,
     validity: Validity | null,
-    length: number,
   ): FlatVector {
     const values = this.#wideValues;
     const scales = this.#scales;
     const specials = this.#specials;
     let anySpecial = false;
     const op = this.#op;
+    const lf = flatOf(l);
+    const rf = flatOf(r);
+    const ld = lf.data as DecimalData;
+    const rd = rf.data as DecimalData;
     for (let k = 0; k < count; k++) {
       const i = rows[k] ?? 0;
       specials[i] = 0;
@@ -689,22 +933,22 @@ class DecimalNode extends BinaryNode {
         scales[i] = 0;
         continue;
       }
-      const [lf, li] = slotOf(l, i);
-      const [rf, ri] = slotOf(r, i);
-      const ld = lf.data as DecimalData;
-      const rd = rf.data as DecimalData;
+      const li = slotIndex(l, i);
+      const ri = slotIndex(r, i);
       const xs = specialAt(ld, li);
       const ys = specialAt(rd, ri);
       const sa = scaleAt(ld, li);
       const sb = scaleAt(rd, ri);
       if (xs !== 0 || ys !== 0) {
         anySpecial = true;
+        const x = xs === 0 ? coefficientAt(ld, li) : 0n;
+        const y = ys === 0 ? coefficientAt(rd, ri) : 0n;
         specials[i] = special(
           op,
           xs,
           ys,
-          xs === 0 ? coefficientAt(ld, li) : 0n,
-          ys === 0 ? coefficientAt(rd, ri) : 0n,
+          x > 0n ? 1 : x < 0n ? -1 : 0,
+          y > 0n ? 1 : y < 0n ? -1 : 0,
         );
         values[i] = 0n;
         scales[i] = 0;
@@ -713,8 +957,11 @@ class DecimalNode extends BinaryNode {
       const x = coefficientAt(ld, li);
       const y = coefficientAt(rd, ri);
       if (op === MUL) {
-        values[i] = x * y;
-        scales[i] = sa + sb;
+        // PostgreSQL rounds a product past the largest display scale to it (mul_var's rscale).
+        const scale = sa + sb;
+        values[i] =
+          scale > NUMERIC_MAX_SCALE ? roundHalfAway(x * y, scale - NUMERIC_MAX_SCALE) : x * y;
+        scales[i] = Math.min(scale, NUMERIC_MAX_SCALE);
         continue;
       }
       const scale = sa > sb ? sa : sb;
@@ -723,25 +970,49 @@ class DecimalNode extends BinaryNode {
       values[i] = op === SUB ? ax - ay : ax + ay;
       scales[i] = scale;
     }
-    const vector = this.#vector(
-      null,
-      scales,
-      { repr: "wide", values },
-      anySpecial ? specials : null,
-    );
-    vector.length = length;
-    vector.validity = validity;
-    return vector;
+    return this.#tiers[anySpecial ? 5 : 4] ?? this.#perSlot;
   }
 }
 
-/** PostgreSQL's NUMERIC special arithmetic (x or y is NaN/±Infinity). */
-function special(op: number, xs: number, ys: number, x: bigint, y: bigint): number {
+const EMPTY_WORDS = new Uint32Array(0);
+
+/** c / 10^digits rounded half away from zero. */
+function roundHalfAway(c: bigint, digits: number): bigint {
+  const divisor = 10n ** BigInt(digits);
+  const q = c / divisor;
+  const r = c - q * divisor;
+  return 2n * (r < 0n ? -r : r) >= divisor ? q + (c < 0n ? -1n : 1n) : q;
+}
+
+/** Loads coefficient `slot` of a non-wide decimal into limb slot `to` of `t`. */
+function loadCoefficient(
+  t: Uint32Array,
+  to: number,
+  data: DecimalData,
+  slot: number,
+  words: Uint32Array,
+): void {
+  const c = data.coefficients;
+  switch (c.repr) {
+    case "safe":
+      setNumber(t, to, c.values[slot] ?? 0);
+      return;
+    case "int64":
+      setInt64(t, to, words, slot);
+      return;
+    case "int128":
+      copy(t, to, c.limbs, slot);
+      return;
+    case "wide":
+      throw new TypeError("loadCoefficient: wide tier");
+  }
+}
+
+/** PostgreSQL's NUMERIC special arithmetic (x or y is NaN/±Infinity); sx, sy are finite signs. */
+function special(op: number, xs: number, ys: number, fx: number, fy: number): number {
   if (xs === NAN || ys === NAN) return NAN;
-  const sign = (s: number, v: bigint) =>
-    s === POS ? 1 : s === NEG ? -1 : v > 0n ? 1 : v < 0n ? -1 : 0;
-  const sx = sign(xs, x);
-  const sy = sign(ys, y);
+  const sx = xs === POS ? 1 : xs === NEG ? -1 : fx;
+  const sy = ys === POS ? 1 : ys === NEG ? -1 : fy;
   if (op === MUL) {
     if (sx === 0 || sy === 0) return NAN; // ∞ × 0
     return sx * sy > 0 ? POS : NEG;
@@ -753,6 +1024,143 @@ function special(op: number, xs: number, ys: number, x: bigint, y: bigint): numb
 }
 
 // ------------------------------------------------------------------------------------------------
+
+/**
+ * Unary minus, natively per type (not 0 − x, which loses −0 for floats: −(+0.0) is −0 in
+ * PostgreSQL). Integers check −MIN; decimals flip the coefficient (and ±Infinity); NaN stays NaN.
+ */
+class NegateNode implements Compiled {
+  readonly #null: Vector;
+  readonly #out: FlatVector;
+  readonly #wide: FlatVector | null = null;
+  readonly #operand: FixedOperand;
+  readonly #message: string;
+  readonly #min: number;
+  readonly #decimal: DecimalNode | null;
+  constructor(
+    readonly type: PhysicalType,
+    readonly input: Compiled,
+    arena: OutputArena,
+  ) {
+    this.#null = nullConstant(type);
+    this.#operand = new FixedOperand(arena, type);
+    const small = type.kind === "int32" && type.bits === 16;
+    // −MIN overflows for integers (int64's safe values cannot be MIN); NaN never compares equal.
+    this.#min = type.kind === "int32" ? (small ? INT16_MIN : INT32_MIN) : NaN;
+    this.#message = small
+      ? "smallint out of range"
+      : type.kind === "int32"
+        ? "integer out of range"
+        : "bigint out of range";
+    if (type.kind === "decimal") {
+      // −x = (−1) × x keeps every tier and special exactly (scale 0 × anything adds no scale).
+      const minusOne = decimalVector(
+        type,
+        0,
+        null,
+        { repr: "safe", values: Float64Array.of(-1) },
+        null,
+      );
+      minusOne.length = 1;
+      this.#decimal = new DecimalNode("mul", type, new ConstantNode(type, minusOne), input, arena);
+      this.#out = minusOne;
+      return;
+    }
+    this.#decimal = null;
+    this.#out = arena.flat(type).vector;
+    if (type.kind === "int64") {
+      arena.take(8 * arena.capacity);
+      this.#wide = {
+        form: "flat",
+        type,
+        length: 0,
+        validity: null,
+        data: {
+          layout: "int64",
+          values: { repr: "int64", values: new BigInt64Array(arena.capacity) },
+        },
+      };
+    }
+  }
+  evaluate(batch: Batch, rows: Selection | null): Vector {
+    if (this.#decimal !== null) return this.#decimal.evaluate(batch, rows);
+    const value = this.input.evaluate(batch, rows);
+    if (constantIsNull(value)) {
+      (this.#null as { length: number }).length = batch.length;
+      return this.#null;
+    }
+    const active = rowsIn(rows);
+    const count = countIn(rows, batch.length);
+    const flat = this.#operand.read(value, active, count);
+    const stride = this.#operand.stride;
+    const validity = value.form === "constant" ? null : value.validity;
+    const data = flat.data;
+    let out = this.#out;
+    if (data.layout === "int64" && data.values.repr === "int64") {
+      const wide = this.#wide;
+      if (wide === null) throw new TypeError("negate: no int64 output");
+      const source = data.values.values;
+      const target = ((wide.data as { values: Int64Values }).values as { values: BigInt64Array })
+        .values;
+      for (let k = 0; k < count; k++) {
+        const i = active[k] ?? 0;
+        if (!validAt(validity, i)) continue;
+        const v = source[i * stride] ?? 0n;
+        if (v === INT64_MIN) throw new NumericOutOfRangeError(this.#message);
+        target[i] = -v;
+      }
+      out = wide;
+    } else {
+      const source =
+        data.layout === "int64"
+          ? (data.values as { values: Float64Array }).values
+          : (data as { values: Int32Array | Float32Array | Float64Array }).values;
+      const target =
+        out.data.layout === "int64"
+          ? (out.data.values as { values: Float64Array }).values
+          : (out.data as { values: Int32Array | Float32Array | Float64Array }).values;
+      const integer = this.type.kind === "int32" || this.type.kind === "int64";
+      let bad = false;
+      for (let k = 0; k < count; k++) {
+        const i = active[k] ?? 0;
+        const v = source[i * stride] ?? 0;
+        // Integers never hold −0 (+ 0 drops it); floats keep IEEE negation, −(+0) = −0.
+        target[i] = integer ? -v + 0 : -v;
+        bad ||= v === this.#min;
+      }
+      if (bad)
+        for (let k = 0; k < count; k++) {
+          const i = active[k] ?? 0;
+          if (validAt(validity, i) && source[i * stride] === this.#min)
+            throw new NumericOutOfRangeError(this.#message);
+        }
+    }
+    out.length = batch.length;
+    out.validity = validity;
+    return out;
+  }
+}
+
+/** A constant operand (negation's −1). */
+class ConstantNode implements Compiled {
+  readonly #vector: { form: "constant"; type: PhysicalType; length: number; value: FlatVector };
+  constructor(
+    readonly type: PhysicalType,
+    value: FlatVector,
+  ) {
+    this.#vector = { form: "constant", type, length: 0, value };
+  }
+  evaluate(batch: Batch): Vector {
+    this.#vector.length = batch.length;
+    return this.#vector;
+  }
+}
+
+export function compileNegate(type: PhysicalType, input: Compiled, arena: OutputArena): Compiled {
+  if (!["int32", "int64", "float64", "float32", "decimal"].includes(type.kind))
+    throw new UnsupportedPlanError(`negation of ${type.kind}`);
+  return new NegateNode(type, input, arena);
+}
 
 /** Compiles `left op right` for operands already cast to `type` (lowering inserts the casts). */
 export function compileArithmetic(
@@ -771,6 +1179,8 @@ export function compileArithmetic(
     case "float32":
       return new FloatNode(op, type, left, right, arena);
     case "decimal":
+      if (op === "div" || op === "mod")
+        throw new UnsupportedPlanError("numeric division and modulo");
       return new DecimalNode(op, type, left, right, arena);
     default:
       throw new UnsupportedPlanError(`${op} over ${type.kind}`);

@@ -37,9 +37,11 @@ import {
 import {
   IDENTITY,
   combineValidity,
+  flatOf,
+  slotIndex,
   nullConstant,
-  rowsOf,
-  slotOf,
+  countIn,
+  rowsIn,
   validAt,
   type Compiled,
   type OutputArena,
@@ -378,7 +380,8 @@ class CompareNode implements Compiled {
       return this.#null;
     }
     const length = batch.length;
-    const [active, count] = rowsOf(rows, length);
+    const active = rowsIn(rows);
+    const count = countIn(rows, length);
     const out = (this.#out.data as { values: Uint8Array }).values;
     const lv = l.form === "constant" ? null : l.validity;
     const rv = r.form === "constant" ? null : r.validity;
@@ -389,7 +392,7 @@ class CompareNode implements Compiled {
       const rf = r.form === "flat" ? r : r.value;
       const as = l.form === "flat" ? 1 : 0;
       const bs = r.form === "flat" ? 1 : 0;
-      this.#flat(lf, as, rf, bs, active, count, out, result);
+      this.#flat(lf, as, rf, bs, active, count, out, result, validity);
     } else if (l.form === "dictionary" && r.form === "constant") {
       this.#dictionaryConstant(l, r.value, active, count, out, result, false);
     } else if (r.form === "dictionary" && l.form === "constant") {
@@ -406,11 +409,13 @@ class CompareNode implements Compiled {
         out[i] = (l.codes[i] ?? 0) === (r.codes[i] ?? 0) ? equal : 1 - equal;
       }
     } else {
+      const lf = flatOf(l);
+      const rf = flatOf(r);
       for (let k = 0; k < count; k++) {
         const i = active[k] ?? 0;
-        const [lf, li] = slotOf(l, i);
-        const [rf, ri] = slotOf(r, i);
-        out[i] = result[slotOrder(lf, li, rf, ri) + 1] ?? 0;
+        out[i] = validAt(validity, i)
+          ? (result[slotOrder(lf, slotIndex(l, i), rf, slotIndex(r, i)) + 1] ?? 0)
+          : 0;
       }
     }
     this.#out.length = length;
@@ -427,6 +432,7 @@ class CompareNode implements Compiled {
     count: number,
     out: Uint8Array,
     result: Uint8Array,
+    validity: Validity | null,
   ): void {
     const a = lf.data;
     const b = rf.data;
@@ -455,7 +461,10 @@ class CompareNode implements Compiled {
       }
       for (let k = 0; k < count; k++) {
         const i = active[k] ?? 0;
-        out[i] = result[bigOrder(bigAt(x, i * as), bigAt(y, i * bs)) + 1] ?? 0;
+        // Exact paths read only valid rows: garbage under a null may not even be an integer.
+        out[i] = validAt(validity, i)
+          ? (result[bigOrder(bigAt(x, i * as), bigAt(y, i * bs)) + 1] ?? 0)
+          : 0;
       }
       return;
     }
@@ -474,13 +483,15 @@ class CompareNode implements Compiled {
       }
       for (let k = 0; k < count; k++) {
         const i = active[k] ?? 0;
-        out[i] = result[decimalSlotOrder(a, i * as, bd, i * bs) + 1] ?? 0;
+        out[i] = validAt(validity, i)
+          ? (result[decimalSlotOrder(a, i * as, bd, i * bs) + 1] ?? 0)
+          : 0;
       }
       return;
     }
     for (let k = 0; k < count; k++) {
       const i = active[k] ?? 0;
-      out[i] = result[slotOrder(lf, i * as, rf, i * bs) + 1] ?? 0;
+      out[i] = validAt(validity, i) ? (result[slotOrder(lf, i * as, rf, i * bs) + 1] ?? 0) : 0;
     }
   }
 
@@ -528,22 +539,22 @@ class DistinctFromNode implements Compiled {
   evaluate(batch: Batch, rows: Selection | null): Vector {
     const l = this.left.evaluate(batch, rows);
     const r = this.right.evaluate(batch, rows);
-    const [active, count] = rowsOf(rows, batch.length);
+    const active = rowsIn(rows);
+    const count = countIn(rows, batch.length);
     const out = (this.#out.data as { values: Uint8Array }).values;
     const distinct = this.negated ? 0 : 1;
+    const lf = flatOf(l);
+    const rf = flatOf(r);
+    const lValidity = l.form === "constant" ? l.value.validity : l.validity;
+    const rValidity = r.form === "constant" ? r.value.validity : r.validity;
     for (let k = 0; k < count; k++) {
       const i = active[k] ?? 0;
-      const [lf, li] = slotOf(l, i);
-      const [rf, ri] = slotOf(r, i);
-      const lValid = validAt(
-        l.form === "constant" ? l.value.validity : l.validity,
-        l.form === "constant" ? 0 : i,
-      );
-      const rValid = validAt(
-        r.form === "constant" ? r.value.validity : r.validity,
-        r.form === "constant" ? 0 : i,
-      );
-      const same = lValid && rValid ? slotOrder(lf, li, rf, ri) === 0 : lValid === rValid;
+      const lValid = validAt(lValidity, l.form === "constant" ? 0 : i);
+      const rValid = validAt(rValidity, r.form === "constant" ? 0 : i);
+      const same =
+        lValid && rValid
+          ? slotOrder(lf, slotIndex(l, i), rf, slotIndex(r, i)) === 0
+          : lValid === rValid;
       out[i] = same ? 1 - distinct : distinct;
     }
     this.#out.length = batch.length;
