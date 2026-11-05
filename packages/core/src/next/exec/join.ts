@@ -30,7 +30,8 @@
  *   row gives NULL, else FALSE (so no matching row gives FALSE). `T = T'` is SQL's row
  *   comparison, exact per column: FALSE when some column is provably different, NULL when none
  *   is but one is null — `(1, 2) IN (SELECT 3, NULL)` is FALSE, never a global "has NULL"
- *   shortcut. Without a residual this is `T IN (SELECT T' … WHERE C' = C)`.
+ *   shortcut. Without a residual this is `T IN (SELECT T' … WHERE C' = C)`. The mark's `filter`
+ *   (ruling R20.5) is the subquery's WHERE: a build row takes part only where it is TRUE.
  *
  * ## Execution
  * - **Build.** Rows are copied into a chunked `ColumnStore` under the join's spillable grant. At
@@ -124,6 +125,12 @@ export interface HashJoinSpec {
   readonly correlated?: number;
   /** Remaining ON conditions over probe columns ++ build columns, after the key match. */
   readonly residual: VectorPredicate | null;
+  /**
+   * Mark joins only (ruling R20.5): the subquery's own WHERE, correlated conditions included. A
+   * build row takes part only where it is TRUE (FALSE and NULL exclude it); `residual` is then
+   * only the [NOT] IN / quantified comparison, three-valued.
+   */
+  readonly filter?: VectorPredicate | null;
   /** Runtime filters to publish: filter id and key position (inner, semi and right only). */
   readonly publishes: ReadonlyArray<{ readonly id: number; readonly key: number }>;
 }
@@ -312,6 +319,9 @@ class Shared {
   readonly resident: Selection = { rows: new Uint16Array(BATCH_ROWS), count: 0 };
   readonly out: Selection = { rows: new Uint16Array(BATCH_ROWS), count: 0 };
   readonly passing: Selection = { rows: new Uint16Array(BATCH_ROWS), count: 0 };
+  readonly admitted: Selection = { rows: new Uint16Array(BATCH_ROWS), count: 0 };
+  /** Mark joins: a filter or residual must see each pair (no count shortcuts). */
+  readonly conditioned: boolean;
   readonly markValidity = new Uint32Array(BATCH_ROWS >>> 5);
   readonly probeOut: ColumnStore;
   readonly buildOut: ColumnStore;
@@ -367,6 +377,8 @@ class Shared {
       for (let i = this.correlated; i < keyTypes.length; i++)
         if (spec.nullSafe[i] === true) throw new TypeError("A mark join's tested keys use =");
     }
+    if (spec.kind !== "mark" && (spec.filter ?? null) !== null)
+      throw new TypeError("Only a mark join has a filter apart from its residual");
     if (spec.kind === "mark" && spec.residual !== null && spec.residual.unknown === undefined)
       throw new TypeError("A mark join's residual must report NULL rows (`unknown`)");
     if (spec.publishes.length > 0 && !kindPublishes(spec.kind))
@@ -374,6 +386,7 @@ class Shared {
         `A ${spec.kind} join keeps its probe misses: it cannot publish runtime filters`,
       );
     this.layout = new KeyLayout(keyTypes, spec.nullSafe);
+    this.conditioned = spec.residual !== null || (spec.filter ?? null) !== null;
     this.charge = new Charge(context.grant);
     if (!this.charge.allocate(SCRATCH_BYTES))
       throw new RangeError("A join's minimum must be admitted before it is built");
@@ -1143,7 +1156,7 @@ class Prober {
     const kind = shared.kind;
     const residual = shared.spec.residual;
     if (kind === "mark") {
-      if (residual === null) {
+      if (!shared.conditioned) {
         for (let k = 0; k < count; k++)
           if ((shared.heads[k] ?? 0) !== 0) shared.rowState[resident.rows[k] ?? 0] = TRUE_CLASS;
         this.#phase = 4;
@@ -1281,7 +1294,11 @@ class Prober {
       selection: null,
     };
     const residual = shared.spec.residual;
-    const passing = residual === null ? null : residual.filter(pairs, shared.passing);
+    // A mark's filter decides which pairs take part at all (ruling R20.5).
+    const filter = kind === "mark" ? (shared.spec.filter ?? null) : null;
+    const admitted = filter === null ? null : filter.filter(pairs, shared.admitted);
+    const tested: Batch = admitted === null ? pairs : { ...pairs, selection: admitted };
+    const passing = residual === null ? admitted : residual.filter(tested, shared.passing);
     const count = passing === null ? taken : passing.count;
     const matched = level.matched;
     const state = shared.rowState;
@@ -1294,7 +1311,7 @@ class Prober {
     if (kind === "mark" && residual !== null) {
       // A NULL residual makes the pair's condition NULL, whether its keys were equal (`cls`
       // TRUE) or only not provably different (`cls` NULL): ruling R20.1.
-      const unknown = residual.unknown?.(pairs, shared.out);
+      const unknown = residual.unknown?.(tested, shared.out);
       if (unknown === undefined)
         throw new TypeError("A mark join's residual must report NULL rows");
       for (let i = 0; i < unknown.count; i++) {
@@ -1322,7 +1339,6 @@ class Prober {
   #markCandidates(batch: Batch, level: Level): Step {
     const shared = this.shared;
     const resident = shared.resident;
-    const residual = shared.spec.residual;
     const correlated = shared.correlated;
     const tests = shared.layout.types.length - correlated;
     const cMask = (1 << correlated) - 1;
@@ -1365,7 +1381,7 @@ class Prober {
         continue;
       }
       const probeTNull = (probeNulls & ~cMask) !== 0;
-      if (residual === null && tests === 1) {
+      if (!shared.conditioned && tests === 1) {
         if (probeTNull || groupNullCount(level, groupHead - 1, nextInGroup) > 0)
           state[row] = NULL_CLASS;
         this.#candidate++;
@@ -1378,7 +1394,7 @@ class Prober {
         cursor = nextInGroup(buildRow);
         if (!probeTNull && (tNull?.[buildRow] ?? 0) !== 1) continue;
         if (!compatible(shared, batch, row, store, buildRow)) continue;
-        if (residual === null) {
+        if (!shared.conditioned) {
           state[row] = NULL_CLASS;
           decided = true;
           break;

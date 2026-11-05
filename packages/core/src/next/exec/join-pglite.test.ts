@@ -67,6 +67,8 @@ interface Case {
   readonly nullSafe: readonly boolean[];
   readonly correlated?: number;
   readonly withResidual: boolean;
+  /** Mark only: the subquery's WHERE (ruling R20.5). */
+  readonly withFilter?: boolean;
 }
 
 function sqlFor(c: Case): string {
@@ -99,7 +101,10 @@ function sqlFor(c: Case): string {
     case "mark": {
       const correlated = c.correlated ?? 0;
       const columns = c.keys.map((k) => (k === 0 ? "k1" : "k2"));
-      const correlation = columns.slice(0, correlated).map((col) => `b.${col} = p.${col}`);
+      const correlation = [
+        ...columns.slice(0, correlated).map((col) => `b.${col} = p.${col}`),
+        ...(c.withFilter === true ? [FILTER_SQL] : []),
+      ];
       const tested = columns.slice(correlated);
       const from = `FROM b${correlation.length > 0 ? ` WHERE ${correlation.join(" AND ")}` : ""}`;
       if (!c.withResidual) {
@@ -119,6 +124,14 @@ function sqlFor(c: Case): string {
   }
 }
 
+/** A correlated subquery WHERE for mark joins: NULL when either payload is NULL. */
+const FILTER_SQL = "b.v > p.v - 40";
+const filter = (p: Row, b: Row): boolean | null => {
+  const x = p[2] as number | null;
+  const y = b[2] as number | null;
+  return x === null || y === null ? null : y > x - 40;
+};
+
 const KEYS: ReadonlyArray<readonly number[]> = [[0], [1], [0, 1]];
 
 describe("hash join vs PostgreSQL", () => {
@@ -136,13 +149,24 @@ describe("hash join vs PostgreSQL", () => {
             const markCorrelations =
               kind === "mark" ? (keys.length === 2 ? [0, 1] : [0]) : [undefined];
             for (const correlated of markCorrelations)
-              for (const withResidual of [false, true]) {
+              for (const [withResidual, withFilter] of kind === "mark"
+                ? [
+                    [false, false],
+                    [true, false],
+                    [false, true],
+                    [true, true],
+                  ]
+                : [
+                    [false, false],
+                    [true, false],
+                  ]) {
                 const nullSafe = keys.map(() => kind !== "mark" && random() < 0.35);
                 const c: Case = {
                   kind,
                   keys,
                   nullSafe,
-                  withResidual,
+                  withResidual: withResidual === true,
+                  withFilter: withFilter === true,
                   ...(correlated === undefined ? {} : { correlated }),
                 };
                 const spec: HashJoinSpec = {
@@ -152,7 +176,8 @@ describe("hash join vs PostgreSQL", () => {
                   probeKeys: keys,
                   buildKeys: keys,
                   nullSafe,
-                  residual: withResidual ? residualOf(3, residual) : null,
+                  residual: withResidual === true ? residualOf(3, residual) : null,
+                  filter: withFilter === true ? residualOf(3, filter) : null,
                   publishes: [],
                   ...(correlated === undefined ? {} : { correlated }),
                 };

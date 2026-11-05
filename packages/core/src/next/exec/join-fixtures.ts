@@ -412,6 +412,8 @@ export interface OracleSpec {
   readonly nullSafe: readonly boolean[];
   readonly correlated?: number;
   readonly residual?: (probe: Row, build: Row) => boolean | null;
+  /** Mark only: a build row takes part only where this is TRUE (ruling R20.5). */
+  readonly filter?: (probe: Row, build: Row) => boolean | null;
   readonly probeWidth: number;
   readonly buildWidth: number;
 }
@@ -465,11 +467,13 @@ export function oracleJoin(spec: OracleSpec, build: readonly Row[], probe: reado
   const buildMatched = new Array<boolean>(build.length).fill(false);
   for (const p of probe) {
     if (spec.kind === "mark") {
-      // Ruling R20.1: three-valued OR over the C-matching rows of (T = T' AND residual).
+      // Rulings R20.1/R20.5: three-valued OR, over the C-matching rows whose filter is TRUE, of
+      // (T = T' AND residual).
       const c = spec.correlated ?? 0;
       let mark: Value = false;
       for (const b of build) {
         if (!keyMatch(p, b, 0, c)) continue;
+        if (spec.filter !== undefined && spec.filter(p, b) !== true) continue;
         let cond: boolean | null = true;
         for (let i = c; i < keys && cond !== false; i++) {
           const x = p[spec.probeKeys[i] ?? 0] ?? null;

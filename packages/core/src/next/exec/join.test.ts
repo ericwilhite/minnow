@@ -163,6 +163,29 @@ describe("hash join: examples", () => {
     );
   });
 
+  it("a mark's filter is the subquery's WHERE: rows where it is NULL take no part (R20.5)", async () => {
+    // p(x = 1, w = 0), b(y = 1, z = NULL): x NOT IN (SELECT y FROM b WHERE b.z > p.w) is TRUE
+    // in PostgreSQL, so the mark (x IN …) is FALSE. As a residual it would be NULL.
+    const s = spec("mark", [INT, INT], [INT, INT], 1, { correlated: 0 });
+    const where = (p: Row, b: Row) =>
+      b[1] === null || p[1] === null ? null : (b[1] as number) > (p[1] as number);
+    const asFilter = await runJoin({ ...s, filter: residualOf(2, where) }, [[1, null]], [[1, 0]]);
+    expect(canonical(asFilter.rows)).toEqual(canonical([[1, 0, false]]));
+    const asResidual = await runJoin(
+      { ...s, residual: residualOf(2, where) },
+      [[1, null]],
+      [[1, 0]],
+    );
+    expect(canonical(asResidual.rows)).toEqual(canonical([[1, 0, null]]));
+    expect(
+      () =>
+        new HashJoin(
+          { ...spec("semi", [INT], [INT], 1), filter: residualOf(1, where) },
+          {} as never,
+        ),
+    ).toThrow("Only a mark join has a filter");
+  });
+
   it("IN over an empty set is FALSE even for a NULL", async () => {
     const s = spec("mark", [INT], [INT], 1, { correlated: 0 });
     const result = await check(s, [], [[1], [null]]);
