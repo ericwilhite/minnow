@@ -589,7 +589,6 @@ const CORE_READ_METHODS = [
 type CoreReadMethod = (typeof CORE_READ_METHODS)[number];
 
 const LOGGED_BODY_BUILDERS = {
-  createTempOwner: ([record]: unknown[]) => ({ op: "createTempOwner", record }) as WalEntryBody,
   renewTempOwner: ([input]: unknown[]) => ({ op: "renewTempOwner", input }) as WalEntryBody,
   removeAbortedSegment: ([id, expectedTransactionId]: unknown[]) =>
     ({ op: "removeAbortedSegment", id, expectedTransactionId }) as WalEntryBody,
@@ -797,6 +796,8 @@ export class OpfsLeader {
   #tempRunCount = 0;
   #tempPageBytes = 0;
   #tempLedgerNeedsCheckpoint = false;
+  /** Owners whose orphan pages the loaded checkpoint held; recovery deletes their directories. */
+  readonly #orphanTempOwners = new Set<string>();
   readonly #ftsChunkCache = new Map<string, { chunk: FtsPosting[]; modeledBytes: number }>();
   #ftsChunkCacheBytes = 0;
   #snapshotFrameExport: SnapshotFrameExportState | undefined;
@@ -1105,6 +1106,7 @@ export class OpfsLeader {
     this.#tempRunCount = 0;
     this.#tempPageBytes = 0;
     this.#tempLedgerNeedsCheckpoint = false;
+    this.#orphanTempOwners.clear();
     this.#ftsChunkCache.clear();
     this.#ftsChunkCacheBytes = 0;
     this.#extents?.close();
@@ -1173,7 +1175,7 @@ export class OpfsLeader {
       for (const [key, pointer] of checkpoint.ftsBases) this.#setFtsBasePointer(key, pointer);
       for (const [key, pointer] of checkpoint.ftsBuilds) this.#setFtsBuildPointer(key, pointer);
       await this.#validateStagedPostingBuilds();
-      this.#applyTempPageUpdates(checkpoint.tempPages);
+      this.#applyTempPageUpdates(this.#ownedCheckpointTempPages(checkpoint.tempPages));
       this.#seq = checkpoint.lastSeq;
       this.#checkpointGeneration = checkpoint.generation;
       this.#servedLedger.clear();
@@ -2309,8 +2311,13 @@ export class OpfsLeader {
         return this.#core.removeGarbageCollectionJob(body.id);
       case "removePrunedManifestRecords":
         return this.#core.removePrunedManifestRecords(body.maxItems);
-      case "createTempOwner":
-        return this.#core.createTempOwner(body.record);
+      case "createTempOwner": {
+        // The owners this create swept leave the ledger in the same frame, so no checkpoint
+        // can capture a page whose owner is gone. Replay sweeps the same owners.
+        const swept = this.#core.createTempOwner(body.record);
+        for (const ownerId of swept) this.#removeTempLedgerOwner(ownerId);
+        return swept;
+      }
       case "renewTempOwner":
         return this.#core.renewTempOwner(body.input);
       case "removeTempOwnerIfExpired":
@@ -3262,6 +3269,23 @@ export class OpfsLeader {
     this.#tempPageBytes = bytes;
   }
 
+  /**
+   * The checkpoint's temp pages whose owner record it also holds. Core 0.19.x and earlier swept
+   * expired owners on `createTempOwner` without their pages, so a checkpoint they wrote can hold
+   * pages of an owner it no longer records. Those pages are spill scratch no query can renew,
+   * never data: drop them from the ledger, let the recovery cleanup delete their files, and
+   * publish the corrected ledger in a checkpoint.
+   */
+  #ownedCheckpointTempPages(pages: readonly TempPageLedgerRecord[]): TempPageLedgerRecord[] {
+    const owned = pages.filter((page) => {
+      if (this.#core.getTempOwner(page.ownerId) !== undefined) return true;
+      this.#orphanTempOwners.add(page.ownerId);
+      return false;
+    });
+    if (owned.length !== pages.length) this.#tempLedgerNeedsCheckpoint = true;
+    return owned;
+  }
+
   #removeTempLedgerRun(ownerId: string, runId: string): void {
     const updates = [...this.#tempPages.values()]
       .filter((record) => record.ownerId === ownerId && record.runId === runId)
@@ -3639,6 +3663,7 @@ export class OpfsLeader {
       }
     });
     await attempt(() => this.#deleteUnknownTempPageFiles());
+    await attempt(() => this.#deleteOrphanTempOwnerDirectories());
     for (const [key, ledger] of this.#staleSnapshotFrameLedgers) {
       await attempt(async () => {
         this.#checkpointBeforeDeletingWalPayload();
@@ -3817,6 +3842,17 @@ export class OpfsLeader {
       changed = true;
     }
     return changed;
+  }
+
+  async #deleteOrphanTempOwnerDirectories(): Promise<void> {
+    for (const ownerId of this.#orphanTempOwners) {
+      // A WAL frame replayed after the checkpoint cannot recreate the owner (owner IDs are never
+      // reused), but check anyway: a recorded owner's directory is never ours to delete.
+      if (this.#core.getTempOwner(ownerId) === undefined && !this.#tempOwnerUsage.has(ownerId)) {
+        await this.#tree.deleteTree(["temp", encodeSegment(ownerId)]);
+      }
+      this.#orphanTempOwners.delete(ownerId);
+    }
   }
 
   async #deleteUnknownTempPageFiles(): Promise<void> {
@@ -4114,6 +4150,15 @@ export class OpfsLeader {
     await this.#postCommitCleanup(() =>
       this.#tree.deleteTree(["temp", encodeSegment(ownerId), encodeSegment(runId)]),
     );
+  }
+
+  async createTempOwner(record: TempOwnerRecord): Promise<void> {
+    const swept = (await this.#run(() => this.#logged({ op: "createTempOwner", record }))) as
+      readonly string[] | undefined;
+    if (swept === undefined || swept.length === 0) return;
+    await this.#postCommitCleanup(async () => {
+      for (const ownerId of swept) await this.#tree.deleteTree(["temp", encodeSegment(ownerId)]);
+    });
   }
 
   async removeTempOwner(ownerId: string): Promise<void> {
@@ -5825,6 +5870,9 @@ export class OpfsLeader {
 
       for (const record of this.#tempPages.values()) {
         const location = `temp/${record.ownerId}/${record.runId}/${String(record.pageIndex)}`;
+        if (this.#core.getTempOwner(record.ownerId) === undefined) {
+          issue("temp-page-ownerless", location, "reserved temp page has no owner record");
+        }
         try {
           const size = await this.#tree.fileSize(
             tempPagePath(record.ownerId, record.runId, record.pageIndex),

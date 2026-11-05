@@ -1229,7 +1229,8 @@ class MiniLogStore implements BlockStore {
   async createTempOwner(record: TempOwnerRecord): Promise<void> {
     return this.#run(() =>
       this.#logged({ op: "createTempOwner", record }, () => {
-        this.#core.createTempOwner(record);
+        // An owner the create swept as expired takes its pages with it.
+        for (const swept of this.#core.createTempOwner(record)) this.#dropTempPages(swept);
       }),
     );
   }

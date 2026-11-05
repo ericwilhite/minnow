@@ -315,7 +315,7 @@ export class MemoryBlockStore implements BlockStore {
 
   async createTempOwner(record: TempOwnerRecord): Promise<void> {
     return this.#runAtomic(() => {
-      this.#core.createTempOwner(record);
+      for (const swept of this.#core.createTempOwner(record)) this.#removeTempOwnerPages(swept);
     });
   }
 

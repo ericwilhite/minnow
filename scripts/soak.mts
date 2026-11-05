@@ -76,6 +76,7 @@ const SUITES: Suite[] = [
   { name: "opfs-segment-names", file: "packages/core/src/storage/opfs/files.test.ts" },
   { name: "unicode-properties", file: "packages/core/src/block-format/unicode.test.ts" },
   { name: "record-json-properties", file: "packages/core/src/storage/toolkit/wire.test.ts" },
+  { name: "temp-owner-lifecycle", file: "packages/core/src/storage/temp-owner-lifecycle.test.ts" },
 ];
 
 function argument(flag: string): string | undefined {

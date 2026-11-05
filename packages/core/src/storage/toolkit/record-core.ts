@@ -1760,29 +1760,33 @@ export class RecordCore {
     if (oldest !== undefined) this.#garbageCollectionJobs.delete(oldest.id);
   }
 
-  createTempOwner(record: TempOwnerRecord): void {
+  /**
+   * Creates the owner after sweeping a bounded page of owners already expired at its
+   * `createdAt`, and returns the swept owner IDs. Page bytes are the enclosing store's: it must
+   * remove the swept owners' pages in the same atomic step, exactly as for
+   * `removeTempOwnerIfExpired`, or those pages outlive their owner.
+   */
+  createTempOwner(record: TempOwnerRecord): string[] {
     validateTempOwnerRecord(record);
     if (this.#tempOwners.has(record.ownerId)) {
       throw new Error(`Temp owner already exists: ${record.ownerId}`);
     }
-    for (const expired of boundedExpiryPage(
+    const swept = boundedExpiryPage(
       this.#tempOwners,
       record.createdAt,
       null,
       RESOURCE_EXPIRY_SWEEP_ITEMS,
       (owner) => owner.ownerId,
       "Temp-owner create cleanup",
-    ).records) {
-      this.#tempOwners.delete(expired.ownerId);
+    ).records.map((owner) => owner.ownerId);
+    // Refuse before sweeping: a refused create must leave every owner in place.
+    const remaining = this.#tempOwners.size - swept.length;
+    if (remaining >= MAX_ACTIVE_TEMP_OWNERS) {
+      throw new StorageResourceLimitError("temp owner", remaining + 1, MAX_ACTIVE_TEMP_OWNERS);
     }
-    if (this.#tempOwners.size >= MAX_ACTIVE_TEMP_OWNERS) {
-      throw new StorageResourceLimitError(
-        "temp owner",
-        this.#tempOwners.size + 1,
-        MAX_ACTIVE_TEMP_OWNERS,
-      );
-    }
+    for (const ownerId of swept) this.#tempOwners.delete(ownerId);
     this.#tempOwners.set(record.ownerId, cloneRecord(record));
+    return swept;
   }
 
   getTempOwner(ownerId: string): TempOwnerRecord | undefined {

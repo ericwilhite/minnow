@@ -51,6 +51,7 @@
     "opfs-segment-names": [],
     "unicode-properties": [],
     "record-json-properties": [],
+    "temp-owner-lifecycle": [],
     "differential-harness": []
   }
 }

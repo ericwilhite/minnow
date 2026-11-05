@@ -4747,7 +4747,10 @@ export interface TempSpillStore {
   removeTempRun(ownerId: string, runId: string): Promise<void>;
   /** Removes the owner record and every page under the owner. */
   removeTempOwner(ownerId: string): Promise<void>;
-  /** Sweeps a bounded expired page before atomically enforcing MAX_ACTIVE_TEMP_OWNERS. */
+  /**
+   * Sweeps a bounded expired page before atomically enforcing MAX_ACTIVE_TEMP_OWNERS. A swept
+   * owner's pages go with it, in the same atomic step, as for `removeTempOwnerIfExpired`.
+   */
   createTempOwner(record: TempOwnerRecord): Promise<void>;
   getTempOwner(ownerId: string): Promise<TempOwnerRecord | undefined>;
   renewTempOwner(input: RenewTempOwnerInput): Promise<TempOwnerRecord>;

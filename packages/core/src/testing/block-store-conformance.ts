@@ -1450,6 +1450,97 @@ export function blockStoreConformanceCases(): BlockStoreConformanceCase[] {
       },
     },
     {
+      // A query that dies mid-spill leaves its owner to expire. The next owner's creation may
+      // sweep it (`createTempOwner`); whatever removes an owner record removes its pages too,
+      // and the store must reopen either way. Core 0.19.x's OPFS store swept the record, kept
+      // the pages, and then refused to open: "Temp page has no owner".
+      name: "an expired temp owner swept by a later create takes its pages, and the store reopens",
+      async run(target) {
+        let store = await target.create();
+        const at = (ms: number): string => new Date(Date.parse(T0) + ms).toISOString();
+        const bytes = (fill: number): Uint8Array => new Uint8Array(32).fill(fill);
+        await store.createTempOwner({
+          ownerId: "abandoned-spill",
+          createdAt: T0,
+          expiresAt: at(60_000),
+          revision: 0,
+        });
+        await store.putTempRunPage({
+          ownerId: "abandoned-spill",
+          runId: "run",
+          pageIndex: 0,
+          bytes: bytes(1),
+        });
+        await store.createTempOwner({
+          ownerId: "next-spill",
+          createdAt: at(120_000),
+          expiresAt: at(180_000),
+          revision: 0,
+        });
+        await store.putTempRunPage({
+          ownerId: "next-spill",
+          runId: "run",
+          pageIndex: 0,
+          bytes: bytes(2),
+        });
+        const swept = (await store.getTempOwner("abandoned-spill")) === undefined;
+        // Pages need not survive a reopen (`TempSpillStore`: losing one costs a query), so after
+        // one a live owner's page is either intact or gone. A swept owner's page is always gone.
+        const coherent = async (when: string, durable: boolean): Promise<void> => {
+          const kept = async (ownerId: string, fill: number): Promise<boolean> => {
+            const page = await store.getTempRunPage(ownerId, "run", 0);
+            if (page === undefined && !durable) return true;
+            return (
+              JSON.stringify(page === undefined ? null : [...page]) ===
+              JSON.stringify([...bytes(fill)])
+            );
+          };
+          if (swept) {
+            check(
+              (await store.getTempRunPage("abandoned-spill", "run", 0)) === undefined,
+              `${when}: a swept temp owner's page must be gone`,
+            );
+          } else {
+            check(await kept("abandoned-spill", 1), `${when}: an unswept owner keeps its page`);
+          }
+          check(await kept("next-spill", 2), `${when}: the sweeping owner keeps its page`);
+          check(
+            (await store.getTempOwner("next-spill"))?.expiresAt === at(180_000),
+            `${when}: the sweeping owner's record is kept`,
+          );
+          check(
+            ((await store.getTempOwner("abandoned-spill")) === undefined) === swept,
+            `${when}: a swept owner stays swept`,
+          );
+        };
+        await coherent("after the sweeping create", true);
+        if (target.reopen !== undefined) {
+          store = await target.reopen(store);
+          await coherent("after a reopen", false);
+        }
+        // Spill cleanup reclaims whatever is left once it expires, and the store reopens again.
+        for (const ownerId of (await store.listTempOwnerIdsPage(null, 16)).records) {
+          check(
+            await store.removeTempOwnerIfExpired(ownerId, at(3 * 3_600_000)),
+            `cleanup must reclaim expired owner ${ownerId}`,
+          );
+        }
+        checkEqual(
+          (await store.listTempOwnerIdsPage(null, 16)).records,
+          [],
+          "cleanup must leave no temp owner",
+        );
+        if (target.reopen !== undefined) {
+          store = await target.reopen(store);
+          check(
+            (await store.getTempRunPage("next-spill", "run", 0)) === undefined,
+            "a reclaimed owner's page must stay gone after a reopen",
+          );
+        }
+        store.close();
+      },
+    },
+    {
       name: "compaction job records update by CAS with the exact conflict class",
       async run(target) {
         const store = await target.create();

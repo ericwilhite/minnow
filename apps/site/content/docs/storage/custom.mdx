@@ -179,7 +179,11 @@ an old unpaged API: the v1 contract begins with these cursor boundaries.
 bound live owners, staged journals and accelerator builds, catalog table/view records, manifest
 summaries, segment records, temporary spill, retained terminal metadata, pinned retired history,
 and total obsolete payload bytes. Sweep safely expired owners first, then either save the record
-and its accounting together or throw `StorageResourceLimitError` before either changes. Catalog
+and its accounting together or throw `StorageResourceLimitError` before either changes. A temp
+owner never goes without its pages: when `createTempOwner` sweeps expired owners, it removes
+their pages in the same atomic step, exactly as `removeTempOwnerIfExpired` does. `RecordCore`'s
+`createTempOwner` returns the IDs it swept so the enclosing adapter can do that, and the
+conformance kit checks that a swept owner's page is gone and that the store reopens. Catalog
 accounting includes a transaction-owned pending table. Charge catalog and segment records by
 their exact canonical wire bytes; charge an unpruned manifest for the exact bytes of its eventual
 24-byte UTC tombstone too, so pruning cannot deadlock at the byte ceiling. Treat a negative,

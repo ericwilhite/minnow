@@ -8,6 +8,40 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## 0.19.2 — Unreleased
+
+Release packages: `@minnowdb/core@0.19.2` (not yet published).
+
+- **An OPFS database no longer becomes unopenable after a session of stopped spilling
+  queries.** Opening it failed with `StorageCorruptionError` ("Temp page has no owner"), even
+  though no data was damaged. A query that spills to disk keeps its scratch pages under a spill
+  record. When the query is stopped (a closed tab, a killed worker, a timeout), the record
+  expires, and the next spilling query removes expired records as it starts. That step removed
+  the record but kept its pages. The next checkpoint saved pages that had no record, and every
+  later open refused them. A graceful close writes a checkpoint, so closing the tab normally did
+  not help.
+
+  Removing an expired spill record now removes its pages in the same step. The in-memory store
+  had the same leak, without the refusal: the pages stayed in memory until the store closed.
+
+- **Recovering a database that is already affected.** Open it with this release. Nothing else
+  is needed, and no data is lost. Pages without a record are leftover scratch that no query can
+  use, so the open deletes them, saves the cleaned state, and keeps every table, row, and live
+  spill. If that open is interrupted, the next one finishes the job.
+
+- **Custom storage adapters built on `RecordCore`.** `RecordCore.createTempOwner` now returns
+  the IDs of the expired owners it swept (it returned nothing before). Remove those owners'
+  pages in the same atomic step, as you do after `removeTempOwnerIfExpired`. Otherwise your
+  adapter has the same leak. The conformance kit has a new case that checks this.
+
+IndexedDB was not affected: its store does not remove expired spill records when a query starts.
+`checkIntegrity()` on OPFS now also reports a spill page that has no record
+(`temp-page-ownerless`). The engine with OPFS measures 441.7 KiB gzipped (0.19.1: 441.4 KiB).
+
+No stored format changes: IndexedDB schema 8 and OPFS layout 13 are unchanged. 0.19.1 opens
+every database this release writes, including one this release has already repaired. No data
+migration or export/import step is needed.
+
 ## 0.19.1 — November 4, 2026
 
 Release packages: `@minnowdb/core@0.19.1`.

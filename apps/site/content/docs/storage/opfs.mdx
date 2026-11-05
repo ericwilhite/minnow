@@ -402,9 +402,12 @@ inconsistent state before accepting new growth.
 Temporary spill is bounded across every tab by a durable reservation ledger: 65,536 runs,
 262,144 pages, and 1 GiB per database, with per-owner limits of 1,024 runs, 16,384 pages, and
 512 MiB. Overwriting a page reserves only its byte delta; deleting a run or expired owner releases
-the exact reservation. Reopening streams the temporary directory, reconciles missing and orphaned
-files, rebuilds the counters, and refuses a write before creating a file if a limit would be
-crossed.
+the exact reservation. That includes the expired owners a new owner's creation sweeps: their
+pages leave the ledger in the same step, and their files are deleted after it. Reopening streams
+the temporary directory, reconciles missing and orphaned files, rebuilds the counters, and refuses
+a write before creating a file if a limit would be crossed. It also reclaims pages a checkpoint
+holds for an owner it no longer records — core 0.19.1 and earlier could write such a
+checkpoint — and saves the cleaned ledger, so the database opens instead of refusing them.
 
 Durable history is bounded too. A reader or maintenance pin may lag the current manifest by at
 most 4,096 versions and may retain at most 65,536 retired blocks or 512 MiB. Total retired payload

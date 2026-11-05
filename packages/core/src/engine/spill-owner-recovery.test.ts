@@ -178,3 +178,64 @@ describe("a query killed mid-spill", () => {
       });
     }
 });
+
+describe("the next spilling query after a killed one", () => {
+  // The browser sequence behind 0.19.x's "Temp page has no owner": a spilling query dies, its
+  // owner expires, and the next spilling query's owner creation sweeps the expired owner. That
+  // sweep must take the dead owner's pages too, or the next open refuses the database.
+  for (const target of targets)
+    it(`${target.name} sweeps the dead query's owner with its pages and reopens`, async () => {
+      const { store, reopen } = await target.create();
+      const start = Date.parse("2026-01-01T00:00:00.000Z");
+      let nowMs = start;
+      let stepMs = 1;
+      const now = (): Date => new Date((nowMs += stepMs));
+      const options = { rowsPerBlock: 256, compression: "raw", spillOwnerLeaseMs: 60_000 } as const;
+      const seed = new MinnowDatabase(store, { ...options, now });
+      await seed.createTable({
+        name: "spilled",
+        columns: [
+          { name: "id", type: "number" },
+          { name: "bucket", type: "number" },
+        ],
+      });
+      const rowCount = 20_000;
+      await seed.insertBatch("spilled", {
+        columns: {
+          id: Array.from({ length: rowCount }, (_, index) => index),
+          bucket: Array.from({ length: rowCount }, (_, index) => index % 11),
+        },
+      });
+      const spill = {
+        executionMemoryBudgetBytes: 150_000,
+        spillPageRows: 64,
+        memoize: false,
+      } as const;
+      const sql = "SELECT id, bucket FROM spilled ORDER BY bucket, id DESC";
+
+      stepMs = 2_000;
+      const killed = new MinnowDatabase(killAfterRenewals(store, 1), { ...options, now });
+      await expect(killed.query(sql, spill)).rejects.toBeInstanceOf(SimulatedKill);
+      stepMs = 1;
+      const [dead] = (await store.listTempOwnerIdsPage(null, 16)).records;
+      if (dead === undefined) throw new Error("the killed query left no spill owner");
+      const left = await store.getTempOwner(dead);
+      nowMs = Date.parse(left?.expiresAt ?? "") + 1;
+
+      const next = new MinnowDatabase(store, { ...options, now });
+      expect((await next.query(sql, spill)).rows).toHaveLength(rowCount);
+      const swept = (await store.getTempOwner(dead)) === undefined;
+
+      // The tab closes and a new one opens the same database.
+      const reopened = await reopen();
+      // A store whose create swept the dead owner took its pages too: nothing lists it.
+      if (swept) expect((await reopened.listTempOwnerIdsPage(null, 16)).records).toEqual([]);
+      const after = new MinnowDatabase(reopened, { now });
+      expect((await after.query("SELECT COUNT(*) AS n FROM spilled")).rows).toEqual([
+        { n: rowCount },
+      ]);
+      expect(await after.cleanupQuerySpill()).toMatchObject({ ownersRetained: 0 });
+      expect((await reopened.listTempOwnerIdsPage(null, 16)).records).toEqual([]);
+      (await reopen()).close();
+    });
+});
