@@ -8,7 +8,8 @@ import {
   type StoreSession,
 } from "./contract.js";
 import { chooseRoot, decodeRootSlot, encodeRootSlot } from "./root-slot.js";
-import { SimBackend, SimDisk, SimulatedCrash, type SimLease } from "./sim-disk.js";
+import { acquireFenced } from "./fence.js";
+import { SimBackend, SimDisk, SimLocks, SimulatedCrash, type SimLease } from "./sim-disk.js";
 
 const SEEDS = 12;
 
@@ -21,6 +22,115 @@ describe.each([
     it(testCase.name, () =>
       testCase.run(async () => new SimBackend(new SimDisk({ busyName }), fence)),
     );
+});
+
+describe("store conformance with asynchronous fence opens (createSyncAccessHandle is async)", () => {
+  for (const fence of ["handle", "epoch"] as const)
+    for (const testCase of storeConformanceCases)
+      it(`${fence}: ${testCase.name}`, () =>
+        testCase.run(
+          async () =>
+            new SimBackend(new SimDisk(), fence, {
+              openDelay: () => new Promise((resolve) => setTimeout(resolve, 1)),
+            }),
+        ));
+});
+
+describe("fence acquisition", () => {
+  const busy = () => Object.assign(new Error("busy"), { name: "NoModificationAllowedError" });
+  const lockIsFree = async (locks: SimLocks) => {
+    const lock = await Promise.race([
+      locks.request("db", {}),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 50)),
+    ]);
+    lock?.release();
+    return lock !== null;
+  };
+
+  it("retries an asynchronous busy rejection, then gives up and releases the lock (review probe)", async () => {
+    const locks = new SimLocks();
+    let tries = 0;
+    await expect(
+      acquireFenced(
+        locks,
+        "db",
+        async () => {
+          tries += 1;
+          throw busy();
+        },
+        () => undefined,
+        { timeoutMs: 30 },
+      ),
+    ).rejects.toThrow(OwnerUnresponsiveError);
+    expect(tries).toBeGreaterThan(1);
+    expect(await lockIsFree(locks)).toBe(true);
+  });
+
+  it("enforces the deadline during a slow open and closes the handle that arrives late", async () => {
+    const locks = new SimLocks();
+    let closed = 0;
+    await expect(
+      acquireFenced(
+        locks,
+        "db",
+        () => new Promise<string>((resolve) => setTimeout(() => resolve("handle"), 60)),
+        (fence) => {
+          if (fence === "handle") closed += 1;
+        },
+        { timeoutMs: 20 },
+      ),
+    ).rejects.toThrow(OwnerUnresponsiveError);
+    expect(await lockIsFree(locks)).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(closed).toBe(1);
+  });
+
+  it("rethrows a non-busy failure (sync or async) and releases the lock", async () => {
+    const locks = new SimLocks();
+    for (const openFence of [
+      () => {
+        throw new TypeError("quota");
+      },
+      () => new Promise<never>((_, reject) => setTimeout(() => reject(new TypeError("quota")), 5)),
+    ]) {
+      await expect(acquireFenced(locks, "db", openFence, () => undefined)).rejects.toThrow(
+        TypeError,
+      );
+      expect(await lockIsFree(locks)).toBe(true);
+    }
+  });
+
+  it("closes a fence that opens after its lock was stolen", async () => {
+    const locks = new SimLocks();
+    let closed = false;
+    let finishOpen: (value: string) => void = () => undefined;
+    const acquiring = acquireFenced(
+      locks,
+      "db",
+      () => new Promise<string>((resolve) => (finishOpen = resolve)),
+      () => (closed = true),
+      { timeoutMs: 1_000 },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const thief = await locks.request("db", { steal: true });
+    finishOpen("handle");
+    await expect(acquiring).rejects.toThrow(OwnershipLostError);
+    expect(closed).toBe(true);
+    thief.release();
+  });
+
+  it("a delayed successful open within the deadline acquires", async () => {
+    const locks = new SimLocks();
+    const { lock, fence } = await acquireFenced(
+      locks,
+      "db",
+      () => new Promise<string>((resolve) => setTimeout(() => resolve("handle"), 5)),
+      () => undefined,
+      { timeoutMs: 1_000 },
+    );
+    expect(fence).toBe("handle");
+    lock.release();
+  });
 });
 
 describe("stale owners", () => {

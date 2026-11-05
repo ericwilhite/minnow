@@ -11,31 +11,37 @@
  *    and spillable grants are asked to give memory back; it never fails for size.
  * 3. **Bounded minimums.** A pipeline's minimum is fixed by its plan, never by data: the batch
  *    buffers of its operators at `batchTargetFor` bytes per batch (fewer rows for wide rows),
- *    hash-table and run headers, and spill I/O buffers. `batchTargetFor` shrinks the batch target
- *    so that any pipeline's minimum fits in a quarter of the cap: a minimum above the cap is a
+ *    hash-table and run headers, and spill I/O buffers. A minimum above `cap − reserve` is a
  *    planner bug (`RangeError`), not a size refusal.
- * 4. **Grow or spill.** `tryGrow` grants or returns false, never waits. A spillable operator that is
- *    refused spills (partitions, runs) and retries smaller. Growth is charged before allocating,
- *    and a resize charges the new buffer while the old one still exists (growth overlap); the old
- *    one is released after the copy.
- * 5. **Waiting for progress.** An operator that cannot spill its way forward (one value larger
- *    than a batch, a result frame waiting for the consumer's credit) suspends with `waitFor`: the
- *    pipeline returns `blocked` (exec/pipeline.ts) until the bytes are granted. Waits are served in
- *    order from the progress reserve (`reserveBytes`), which no `tryGrow` can take, so one waiter
- *    at a time always progresses. A single value larger than the reserve cannot be held at all:
- *    `ValueTooLargeError` (the one size error, about a value, never a query or table).
- * 6. **The cache yields first.** Before refusing growth or keeping an admission waiting, the
- *    governor evicts unpinned encoded pages. Operators spill only after the cache is at its floor.
- * 7. **Cooperative reclaim.** While an admission or a wait is pending, the governor calls each
- *    spillable grant's `onReclaimRequest` with the bytes it needs; the operator spills at its next
- *    batch boundary and `release`s.
+ * 4. **Held vs allocated.** A grant *holds* bytes from the governor (its minimum, growth, loan)
+ *    and its holder *allocates* buffers out of them (`allocate`/`free`): a suballocator, so a
+ *    non-spillable operator builds buffers inside its admitted minimum without asking the
+ *    governor. `allocate` takes free held bytes first and grows (spillable grants only) for the
+ *    shortfall; it never waits. A resize allocates the new buffer before freeing the old one, so
+ *    growth overlap is counted.
+ * 5. **Progress is scheduled apart from admission.** An operator that cannot progress by spilling
+ *    (one value larger than a batch, a result frame waiting for credit, a spill buffer it must fill
+ *    before it can free anything) `borrow`s a **loan**. Loans are served before any admission and
+ *    may use the progress reserve (`reserveBytes`), which admissions and growth never take, so a
+ *    pending admission never blocks an admitted pipeline's progress (two queries cannot wait on
+ *    each other through memory). A grant has at most one loan and repays it before borrowing
+ *    again. A loan larger than the reserve is the one size error, `ValueTooLargeError`: about a
+ *    value, never a query or table.
+ * 6. **The cache yields first.** Before refusing growth or keeping anything waiting, the governor
+ *    evicts unpinned encoded pages. Operators spill only after the cache is at its floor.
+ * 7. **Cooperative reclaim.** While a loan or an admission waits, the governor calls each other
+ *    spillable grant's `onReclaimRequest`; the operator spills at its next batch boundary and
+ *    `release`s. A callback (or the cache) may release synchronously: the drain is not reentrant.
+ * 8. **Lifecycle.** `close` returns everything, rejects the grant's queued loan, and makes every
+ *    later call inert (`allocate`/`tryGrow` false, `borrow` rejects `GrantClosedError`). Abort
+ *    listeners are removed when a request settles.
  *
  * ## Accounting unit
- * Bytes of ArrayBuffer capacity (`byteLength` of what is allocated, not what is used), plus
- * `OBJECT_OVERHEAD_BYTES` per JS object an operator keeps per group, partition or run, plus
- * `bigintBytes` per BigInt held in operator state (wide decimals). JS strings are not kept in
- * operator state (text stays UTF-8) except on the collation fallback (DECISIONS.md C8), which
- * charges `stringBytes`. The governor accounts managed memory; Gate D measures browser RSS.
+ * Bytes of ArrayBuffer capacity (`byteLength` allocated, not used), plus `OBJECT_OVERHEAD_BYTES`
+ * per JS object kept per group, partition or run, plus `bigintBytes` per BigInt held in operator
+ * state (wide decimals). JS strings are not kept in operator state (text stays UTF-8) except on the
+ * collation fallback (DECISIONS.md C8), which charges `stringBytes`. Managed memory only; Gate D
+ * measures browser RSS.
  */
 import { BATCH_TARGET_BYTES } from "../vector/vector.js";
 
@@ -43,7 +49,7 @@ export const OBJECT_OVERHEAD_BYTES = 64;
 /** The progress reserve: one eighth of the cap, at least 1 MiB. */
 export const reserveFor = (capBytes: number): number => Math.max(1 << 20, Math.floor(capBytes / 8));
 
-/** Bytes a BigInt occupies in V8 (header plus 64-bit digits), for rule-3 accounting. */
+/** Bytes a BigInt occupies in V8 (header plus 64-bit digits). */
 export function bigintBytes(value: bigint): number {
   const magnitude = value < 0n ? -value : value;
   return 16 + 8 * Math.max(1, Math.ceil(magnitude.toString(16).length / 16));
@@ -73,39 +79,47 @@ export interface AdmitOptions {
   readonly signal?: AbortSignal;
 }
 
+/** A progress loan (rule 5). `repay` returns its bytes; `free` them first. */
+export interface Loan {
+  readonly bytes: number;
+  repay(): void;
+}
+
 export interface Grant {
   readonly label: string;
-  /** Bytes currently held by this grant (its minimum included). */
-  readonly bytes: number;
-  /** Rule 4. Never waits. Only spillable grants grow past their minimum. */
+  readonly spillable: boolean;
+  /** Bytes held from the governor: minimum + growth + loan. */
+  readonly held: number;
+  /** Bytes allocated by the holder's buffers (≤ `held`). */
+  readonly allocated: number;
+  /** Rule 4. Never waits. */
+  allocate(bytes: number): boolean;
+  free(bytes: number): void;
+  /** Adds held bytes (spillable grants only). Never waits. */
   tryGrow(bytes: number): boolean;
-  /** Rule 5: resolves once `bytes` are added to this grant. */
-  waitFor(bytes: number, signal?: AbortSignal): Promise<void>;
-  /** Returns bytes to the governor. */
+  /** Returns unallocated held bytes to the governor. */
   release(bytes: number): void;
+  /** Rule 5. */
+  borrow(bytes: number, signal?: AbortSignal): Promise<Loan>;
   /** Rule 7. */
   onReclaimRequest(callback: (bytes: number) => void): void;
-  /** Releases everything. Idempotent. */
+  /** Rule 8. Idempotent. */
   close(): void;
 }
 
 /** The page cache's side of the governor (rule 6). */
 export interface EvictableCache {
   readonly evictableBytes: number;
-  /** Evicts at least `bytes` if possible; returns the bytes freed (the cache releases them). */
+  /** Evicts at least `bytes` if possible, releasing them through its handle (possibly at once). */
   evict(bytes: number): number;
 }
 
 export interface MemoryGovernor {
   readonly capBytes: number;
   readonly reserveBytes: number;
-  /** Bytes granted across all grants and the cache. Never above `capBytes`. */
   readonly usedBytes: number;
-  /** Peak `usedBytes` since creation (tests assert the cap held). */
   readonly peakBytes: number;
-  /** Rule 2. */
   admit(options: AdmitOptions): Promise<Grant>;
-  /** The cache charges and releases its bytes through this grant-like handle. */
   registerCache(cache: EvictableCache): {
     charge(bytes: number): boolean;
     release(bytes: number): void;
@@ -120,23 +134,35 @@ export class ValueTooLargeError extends Error {
   }
 }
 
+export class GrantClosedError extends Error {
+  readonly code = "MINNOW_GRANT_CLOSED";
+  constructor(label: string) {
+    super(`Memory grant ${label} is closed`);
+    this.name = "GrantClosedError";
+  }
+}
+
 function abortReason(signal: AbortSignal | undefined): Error {
   const reason: unknown = signal?.reason;
   return reason instanceof Error ? reason : new Error("Aborted", { cause: reason });
 }
 
-interface Waiter {
+interface Request {
   readonly bytes: number;
-  readonly fromReserve: boolean;
+  /** Null for an admission (a new grant is made). */
   readonly grant: GrantImpl | null;
-  readonly resolve: (grant: GrantImpl | null) => void;
-  readonly reject: (reason: unknown) => void;
   readonly label: string;
   readonly spillable: boolean;
+  readonly resolve: (grant: GrantImpl) => void;
+  readonly reject: (reason: unknown) => void;
+  readonly detach: () => void;
 }
 
 class GrantImpl implements Grant {
-  bytes = 0;
+  held = 0;
+  allocated = 0;
+  loan = 0;
+  loanPending = false;
   closed = false;
   reclaim: ((bytes: number) => void) | null = null;
   constructor(
@@ -145,19 +171,59 @@ class GrantImpl implements Grant {
     readonly spillable: boolean,
   ) {}
 
+  allocate(bytes: number): boolean {
+    if (this.closed) return false;
+    const shortfall = this.allocated + bytes - this.held;
+    if (shortfall > 0 && !this.tryGrow(shortfall)) return false;
+    this.allocated += bytes;
+    return true;
+  }
+
+  free(bytes: number): void {
+    if (this.closed) return;
+    if (bytes > this.allocated) throw new RangeError(`${this.label} freed more than it allocated`);
+    this.allocated -= bytes;
+  }
+
   tryGrow(bytes: number): boolean {
     if (this.closed || !this.spillable) return false;
     return this.governor.grow(this, bytes);
   }
 
-  waitFor(bytes: number, signal?: AbortSignal): Promise<void> {
-    return this.governor.wait(this, bytes, signal);
+  release(bytes: number): void {
+    if (this.closed) return;
+    if (bytes > this.held - this.allocated)
+      throw new RangeError(`${this.label} released bytes it has allocated`);
+    this.held -= bytes;
+    this.governor.give(bytes);
   }
 
-  release(bytes: number): void {
-    if (bytes > this.bytes) throw new RangeError(`${this.label} released more than it holds`);
-    this.bytes -= bytes;
-    this.governor.give(bytes);
+  borrow(bytes: number, signal?: AbortSignal): Promise<Loan> {
+    if (this.closed) return Promise.reject(new GrantClosedError(this.label));
+    if (this.loan > 0 || this.loanPending)
+      return Promise.reject(new RangeError(`${this.label} must repay its loan before borrowing`));
+    this.loanPending = true;
+    return this.governor.lend(this, bytes, signal).then(
+      () => {
+        this.loanPending = false;
+        this.loan = bytes;
+        let repaid = false;
+        return {
+          bytes,
+          repay: () => {
+            if (repaid || this.closed) return;
+            repaid = true;
+            this.loan = 0;
+            this.governor.repaid(bytes);
+            this.release(bytes);
+          },
+        };
+      },
+      (error: unknown) => {
+        this.loanPending = false;
+        throw error;
+      },
+    );
   }
 
   onReclaimRequest(callback: (bytes: number) => void): void {
@@ -168,11 +234,16 @@ class GrantImpl implements Grant {
     if (this.closed) return;
     this.closed = true;
     this.governor.forget(this);
-    this.release(this.bytes);
+    const held = this.held;
+    this.held = 0;
+    this.allocated = 0;
+    if (this.loan > 0) this.governor.repaid(this.loan);
+    this.loan = 0;
+    this.governor.give(held);
   }
 }
 
-/** The reference governor: rules 1–7 with FIFO waiting. */
+/** The reference governor: rules 1–8. */
 export class Governor implements MemoryGovernor {
   readonly capBytes: number;
   readonly reserveBytes: number;
@@ -180,7 +251,12 @@ export class Governor implements MemoryGovernor {
   peakBytes = 0;
   #cache: EvictableCache | null = null;
   readonly #grants = new Set<GrantImpl>();
-  readonly #waiters: Waiter[] = [];
+  readonly #loans: Request[] = [];
+  readonly #admissions: Request[] = [];
+  #draining = false;
+  #again = false;
+  /** Bytes out on loans: they count against the cap, never against the admission limit. */
+  #loaned = 0;
 
   constructor(capBytes: number) {
     this.capBytes = capBytes;
@@ -192,20 +268,36 @@ export class Governor implements MemoryGovernor {
     this.peakBytes = Math.max(this.peakBytes, this.usedBytes);
   }
 
-  /** Room for `bytes` under `limit`, evicting the cache first (rule 6). */
-  #room(bytes: number, limit: number): boolean {
-    const missing = this.usedBytes + bytes - limit;
+  /**
+   * Bytes missing for a request: loans may use the whole cap; admissions and growth must also fit
+   * `cap − reserve` counting everything except loans.
+   */
+  #missing(bytes: number, loan: boolean): number {
+    const total = this.usedBytes + bytes - this.capBytes;
+    if (loan) return total;
+    return Math.max(
+      total,
+      this.usedBytes - this.#loaned + bytes - (this.capBytes - this.reserveBytes),
+    );
+  }
+
+  /** Room for a request, evicting the cache first (rule 6). */
+  #room(bytes: number, loan: boolean): boolean {
+    const missing = this.#missing(bytes, loan);
     if (missing <= 0) return true;
     if (this.#cache !== null && this.#cache.evictableBytes > 0) this.#cache.evict(missing);
-    return this.usedBytes + bytes <= limit;
+    return this.#missing(bytes, loan) <= 0;
+  }
+
+  repaid(bytes: number): void {
+    this.#loaned -= bytes;
   }
 
   grow(grant: GrantImpl, bytes: number): boolean {
-    // Growth may not take the progress reserve (rule 5), nor jump the admission queue.
-    if (this.#waiters.length > 0 || !this.#room(bytes, this.capBytes - this.reserveBytes))
-      return false;
+    if (this.#loans.length > 0 || this.#admissions.length > 0) return false;
+    if (!this.#room(bytes, false)) return false;
     this.#take(bytes);
-    grant.bytes += bytes;
+    grant.held += bytes;
     return true;
   }
 
@@ -216,45 +308,85 @@ export class Governor implements MemoryGovernor {
 
   forget(grant: GrantImpl): void {
     this.#grants.delete(grant);
+    for (const queue of [this.#loans, this.#admissions])
+      for (const request of [...queue])
+        if (request.grant === grant) {
+          queue.splice(queue.indexOf(request), 1);
+          request.detach();
+          request.reject(new GrantClosedError(grant.label));
+        }
   }
 
+  /** Whether a release reentered the drain while it ran (then it runs again). */
+  #releasedDuringDrain(): boolean {
+    return this.#again;
+  }
+
+  /** Serves loans first (they may use the reserve), then admissions. Never reentrant. */
   #drain(): void {
-    for (let waiter = this.#waiters[0]; waiter !== undefined; waiter = this.#waiters[0]) {
-      const limit = waiter.fromReserve ? this.capBytes : this.capBytes - this.reserveBytes;
-      if (!this.#room(waiter.bytes, limit)) {
-        for (const grant of this.#grants)
-          if (grant.spillable && grant !== waiter.grant) grant.reclaim?.(waiter.bytes);
-        return;
+    if (this.#draining) {
+      this.#again = true;
+      return;
+    }
+    this.#draining = true;
+    try {
+      do {
+        this.#again = false;
+        this.#serve(this.#loans, true);
+        if (this.#loans.length === 0) this.#serve(this.#admissions, false);
+      } while (this.#releasedDuringDrain());
+    } finally {
+      this.#draining = false;
+    }
+  }
+
+  #serve(queue: Request[], loan: boolean): void {
+    for (let request = queue[0]; request !== undefined; request = queue[0]) {
+      if (!this.#room(request.bytes, loan)) {
+        for (const grant of [...this.#grants])
+          if (grant.spillable && grant !== request.grant) grant.reclaim?.(request.bytes);
+        if (!this.#room(request.bytes, loan)) return;
       }
-      this.#waiters.shift();
-      this.#take(waiter.bytes);
-      if (waiter.grant !== null) {
-        waiter.grant.bytes += waiter.bytes;
-        waiter.resolve(waiter.grant);
-      } else {
-        const grant = new GrantImpl(this, waiter.label, waiter.spillable);
-        grant.bytes = waiter.bytes;
+      // A callback may have cancelled or served the head while we asked for room.
+      if (queue[0] !== request) continue;
+      queue.shift();
+      request.detach();
+      this.#take(request.bytes);
+      if (loan) this.#loaned += request.bytes;
+      let grant = request.grant;
+      if (grant === null) {
+        grant = new GrantImpl(this, request.label, request.spillable);
         this.#grants.add(grant);
-        waiter.resolve(grant);
       }
+      grant.held += request.bytes;
+      request.resolve(grant);
     }
   }
 
   #enqueue(
-    waiter: Omit<Waiter, "resolve" | "reject">,
+    queue: Request[],
+    request: Omit<Request, "resolve" | "reject" | "detach">,
     signal?: AbortSignal,
-  ): Promise<GrantImpl | null> {
+  ): Promise<GrantImpl> {
     if (signal?.aborted === true) return Promise.reject(abortReason(signal));
     return new Promise((resolve, reject) => {
-      const entry: Waiter = { ...waiter, resolve, reject };
       const cancel = () => {
-        const index = this.#waiters.indexOf(entry);
-        if (index >= 0) this.#waiters.splice(index, 1);
+        const index = queue.indexOf(entry);
+        if (index >= 0) queue.splice(index, 1);
+        entry.detach();
         reject(abortReason(signal));
         this.#drain();
       };
+      const entry: Request = {
+        ...request,
+        resolve,
+        reject,
+        detach: () => {
+          signal?.removeEventListener("abort", cancel);
+        },
+      };
       signal?.addEventListener("abort", cancel, { once: true });
-      this.#waiters.push(entry);
+      queue.push(entry);
       this.#drain();
     });
   }
@@ -262,24 +394,23 @@ export class Governor implements MemoryGovernor {
   async admit(options: AdmitOptions): Promise<Grant> {
     if (options.minimumBytes > this.capBytes - this.reserveBytes)
       throw new RangeError(`${options.label} needs a minimum above the cap: plan smaller batches`);
-    const grant = await this.#enqueue(
+    return this.#enqueue(
+      this.#admissions,
       {
         bytes: options.minimumBytes,
-        fromReserve: false,
         grant: null,
         label: options.label,
         spillable: options.spillable,
       },
       options.signal,
     );
-    if (grant === null) throw new Error("Admission resolved without a grant");
-    return grant;
   }
 
-  async wait(grant: GrantImpl, bytes: number, signal?: AbortSignal): Promise<void> {
+  async lend(grant: GrantImpl, bytes: number, signal?: AbortSignal): Promise<void> {
     if (bytes > this.reserveBytes) throw new ValueTooLargeError(bytes, this.reserveBytes);
     await this.#enqueue(
-      { bytes, fromReserve: true, grant, label: grant.label, spillable: grant.spillable },
+      this.#loans,
+      { bytes, grant, label: grant.label, spillable: grant.spillable },
       signal,
     );
   }
@@ -288,8 +419,8 @@ export class Governor implements MemoryGovernor {
     this.#cache = cache;
     return {
       charge: (bytes: number): boolean => {
-        if (this.#waiters.length > 0 || this.usedBytes + bytes > this.capBytes - this.reserveBytes)
-          return false;
+        if (this.#loans.length > 0 || this.#admissions.length > 0) return false;
+        if (this.#missing(bytes, false) > 0) return false;
         this.#take(bytes);
         return true;
       },

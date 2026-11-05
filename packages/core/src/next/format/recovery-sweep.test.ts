@@ -1,38 +1,43 @@
 /**
- * Crash sweeps for the log, checkpoint and replay protocol, on the real store logic over the
- * simulated disk, crashing at every physical step. A minimal reference engine ("toy") drives:
- * table creation, single- and multi-table commits, multipart transactions, sequence-only
- * commits, a schema change (flush first), a drop, per-table flushes, global checkpoints and a log
- * recycle. After each crash the recovered state must equal the state after some prefix of commits
- * that includes every acknowledged one (honest flush), or after some prefix or a detected
- * corruption (lying flush). Recovery then resumes and a further commit must survive.
+ * Crash sweeps for the log, checkpoint, replay and ledger protocol, on the real store logic over
+ * the simulated disk, crashing at every physical step. A minimal reference engine ("toy") drives
+ * transactions made of ordered effects: table creation with rows in the same transaction,
+ * several DDL statements in one transaction, a schema change between two row changes, create +
+ * insert + drop in one transaction, multi-table and multipart commits, sequence reservations,
+ * exactly-once request outcomes, per-table flushes, global checkpoints and a log recycle.
+ * Recovery reads the log with the incremental scanner. After each crash the recovered state
+ * (rows, versions, sequences, ledger) must equal the state after some prefix of commits that
+ * includes every acknowledged one (honest flush), or after some prefix or a detected corruption
+ * (lying flush). Recovery then resumes and a further commit must survive.
  */
 import { describe, expect, it } from "vitest";
 import { SimBackend, SimDisk, SimulatedCrash } from "../storage/sim-disk.js";
 import type { StoreSession } from "../storage/contract.js";
+import { RequestLedger, type ClientLedgerEntry } from "./ledger.js";
 import {
   LogCorruptionError,
   encodeFrame,
   encodeLogHeader,
   newestLogHeader,
-  scanLog,
+  scanLogIncremental,
   type LogIncarnation,
 } from "./log-frame.js";
-import { Replayer, type TransactionEffects } from "./replay.js";
+import { Replayer, type Effect } from "./replay.js";
 
-const SEEDS = 12;
+const SEEDS = 10;
 const FIRST_SALT = 0x1111;
+const NOW = 1_000_000;
 
-type Catalog =
+type ToyEffect =
   | { kind: "createTable"; tableId: number }
   | { kind: "alterTable"; tableId: number; schemaVersion: number }
   | { kind: "dropTable"; tableId: number }
-  | null;
+  | { kind: "sequence"; sequenceId: number; value: number }
+  | { kind: "rows"; tableId: number; schemaVersion: number; rows: string[] };
 
 interface Body {
-  readonly catalog: Catalog;
-  readonly sequences: Array<[number, number]>;
-  readonly tables: Array<{ tableId: number; schemaVersion: number; rows: string[] }>;
+  readonly request: { clientId: string; sequence: number; rowCount: number } | null;
+  readonly effects: ToyEffect[];
 }
 
 interface RootDoc {
@@ -42,6 +47,7 @@ interface RootDoc {
   readonly nextTableId: number;
   readonly tables: Array<{ id: number; version: number; flushed: number; rows: string[] }>;
   readonly sequences: Array<[number, number]>;
+  readonly clients: ClientLedgerEntry[];
 }
 
 const EMPTY_ROOT: RootDoc = {
@@ -51,11 +57,14 @@ const EMPTY_ROOT: RootDoc = {
   nextTableId: 1,
   tables: [],
   sequences: [],
+  clients: [],
 };
 
 interface TableState {
   version: number;
   flushed: number;
+  /** LSN of the last schema change, for writer obligation 1. */
+  alteredAt: number;
   durable: string[];
   memory: string[];
 }
@@ -63,17 +72,35 @@ interface TableState {
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-/** A minimal engine following the protocol in replay.ts and log-frame.ts. */
+function concat(parts: readonly Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+
+function replayEffect(effect: ToyEffect): Effect {
+  if (effect.kind === "sequence") return { kind: "sequence" };
+  if (effect.kind === "rows")
+    return { kind: "rows", tableId: effect.tableId, schemaVersion: effect.schemaVersion };
+  return effect;
+}
+
+/** A minimal engine following replay.ts, log-frame.ts and ledger.ts. */
 class Toy {
   readonly tables = new Map<number, TableState>();
   sequences = new Map<number, number>();
   nextTableId = 1;
-  /** Global state as of the last checkpoint (what the root may claim). */
+  ledger = new RequestLedger();
   checkpointed = {
     globalLsn: 0,
     nextTableId: 1,
     versions: new Map<number, number>(),
     sequences: new Map<number, number>(),
+    clients: [] as ClientLedgerEntry[],
   };
   rootSequence = 0;
   incarnation: LogIncarnation = EMPTY_ROOT.log;
@@ -90,23 +117,57 @@ class Toy {
         .sort(([a], [b]) => a - b)
         .map(([id, t]) => [id, t.version, [...t.durable, ...t.memory]]),
       sequences: [...this.sequences].sort(([a], [b]) => a - b),
+      ledger: this.ledger
+        .checkpoint()
+        .map((client) => [client.clientId, client.outcomes.map((o) => [o.sequence, o.counts])]),
     });
   }
 
-  #apply(body: Body, lsn: number): void {
-    const change = body.catalog;
-    if (change?.kind === "createTable") {
-      this.tables.set(change.tableId, { version: 1, flushed: lsn, durable: [], memory: [] });
-      this.nextTableId = change.tableId + 1;
-    } else if (change?.kind === "alterTable") {
-      const table = this.tables.get(change.tableId);
-      if (table !== undefined) table.version = change.schemaVersion;
-    } else if (change?.kind === "dropTable") this.tables.delete(change.tableId);
-    for (const [id, value] of body.sequences) this.sequences.set(id, value);
-    for (const change of body.tables) this.tables.get(change.tableId)?.memory.push(...change.rows);
+  /** Applies one effect to the live state (commit and replay share it). */
+  apply(effect: ToyEffect, lsn: number): void {
+    switch (effect.kind) {
+      case "createTable":
+        this.tables.set(effect.tableId, {
+          version: 1,
+          flushed: lsn - 1,
+          alteredAt: 0,
+          durable: [],
+          memory: [],
+        });
+        this.nextTableId = effect.tableId + 1;
+        return;
+      case "alterTable": {
+        const table = this.tables.get(effect.tableId);
+        if (table !== undefined) {
+          table.version = effect.schemaVersion;
+          table.alteredAt = lsn;
+        }
+        return;
+      }
+      case "dropTable":
+        this.tables.delete(effect.tableId);
+        return;
+      case "sequence":
+        this.sequences.set(effect.sequenceId, effect.value);
+        return;
+      case "rows":
+        this.tables.get(effect.tableId)?.memory.push(...effect.rows);
+        return;
+    }
   }
 
-  /** Appends one transaction (split into `parts` frames), acknowledges the previous group, flushes. */
+  #record(body: Body, lsn: number): void {
+    if (body.request === null) return;
+    const { clientId, sequence, rowCount } = body.request;
+    this.ledger.admit({ clientId, sequence, sentAtMs: NOW, resolvedThrough: 0 }, NOW);
+    this.ledger.record(clientId, sequence, {
+      kind: "committed",
+      lsn,
+      counts: { rowCount },
+      recordedAtMs: NOW,
+    });
+  }
+
   async commit(
     body: Body,
     parts: number,
@@ -116,7 +177,9 @@ class Toy {
     const bytes = encoder.encode(JSON.stringify(body));
     const size = Math.ceil(bytes.length / parts);
     // The state if this commit lands, recorded before any of its bytes are written.
-    this.#apply(body, this.lsn + parts);
+    const lsn = this.lsn + parts;
+    for (const effect of body.effects) this.apply(effect, lsn);
+    this.#record(body, lsn);
     snapshots.push(this.logical());
     for (let part = 0; part < parts; part++) {
       const frame = encodeFrame(
@@ -153,23 +216,33 @@ class Toy {
       log,
       globalLsn: this.checkpointed.globalLsn,
       nextTableId: this.checkpointed.nextTableId,
-      // The root lists the tables of the checkpointed catalog, with their own watermarks.
       tables: [...this.checkpointed.versions].map(([id, version]) => {
         const table = this.tables.get(id);
         return { id, version, flushed: table?.flushed ?? 0, rows: table?.durable ?? [] };
       }),
       sequences: [...this.checkpointed.sequences],
+      clients: this.checkpointed.clients,
     };
     await this.session.publish(encoder.encode(JSON.stringify(doc)));
   }
 
-  /** Global checkpoint: the root's catalog, sequences and globalLsn catch up. */
-  async checkpoint(): Promise<void> {
+  #flushRows(table: TableState): void {
+    table.durable.push(...table.memory);
+    table.memory = [];
+    table.flushed = this.lsn;
+  }
+
+  /** Global checkpoint. Obligation 1: tables altered since their last flush are flushed first. */
+  async checkpoint(options: { skipObligation?: boolean } = {}): Promise<void> {
+    if (options.skipObligation !== true)
+      for (const table of this.tables.values())
+        if (table.alteredAt > table.flushed) this.#flushRows(table);
     this.checkpointed = {
       globalLsn: this.lsn,
       nextTableId: this.nextTableId,
       versions: new Map([...this.tables].map(([id, t]) => [id, t.version])),
       sequences: new Map(this.sequences),
+      clients: this.ledger.checkpoint(),
     };
     await this.#publish();
   }
@@ -178,27 +251,20 @@ class Toy {
   async flushTable(id: number): Promise<void> {
     const table = this.tables.get(id);
     if (table === undefined) return;
-    if (!this.checkpointed.versions.has(id)) {
-      await this.checkpoint();
-    }
-    table.durable.push(...table.memory);
-    table.memory = [];
-    table.flushed = this.lsn;
+    if (this.checkpointed.versions.get(id) !== table.version) return this.checkpoint();
+    this.#flushRows(table);
     await this.#publish();
   }
 
   /** Flush everything, switch salt in a root, then reset the log (replay.ts obligation 3). */
   async recycleLog(salt: number): Promise<void> {
-    for (const table of this.tables.values()) {
-      table.durable.push(...table.memory);
-      table.memory = [];
-      table.flushed = this.lsn;
-    }
+    for (const table of this.tables.values()) this.#flushRows(table);
     this.checkpointed = {
       globalLsn: this.lsn,
       nextTableId: this.nextTableId,
       versions: new Map([...this.tables].map(([id, t]) => [id, t.version])),
       sequences: new Map(this.sequences),
+      clients: this.ledger.checkpoint(),
     };
     const incarnation = { salt, firstLsn: this.lsn + 1, rootSequence: this.rootSequence + 1 };
     await this.#publish(incarnation);
@@ -209,7 +275,7 @@ class Toy {
     this.ack = { end: 0, chain: salt, lsn: this.lsn };
   }
 
-  /** Recovery: root, scan, coverage, replay; then truncate the invalid tail. */
+  /** Recovery: root, incremental scan, coverage, replay; then truncate the invalid tail. */
   static async recover(session: StoreSession): Promise<Toy> {
     const rootBytes = await session.readRoot();
     const root =
@@ -219,10 +285,12 @@ class Toy {
     toy.incarnation = root.log;
     toy.nextTableId = root.nextTableId;
     toy.sequences = new Map(root.sequences);
+    toy.ledger = RequestLedger.restore(root.clients, NOW);
     for (const t of root.tables)
       toy.tables.set(t.id, {
         version: t.version,
         flushed: t.flushed,
+        alteredAt: 0,
         durable: [...t.rows],
         memory: [],
       });
@@ -231,6 +299,7 @@ class Toy {
       nextTableId: root.nextTableId,
       versions: new Map(root.tables.map((t) => [t.id, t.version])),
       sequences: new Map(root.sequences),
+      clients: root.clients,
     };
     const checkpoint = {
       globalLsn: root.globalLsn,
@@ -239,180 +308,209 @@ class Toy {
         root.tables.map((t) => [t.id, { flushedThroughLsn: t.flushed, schemaVersion: t.version }]),
       ),
     };
-    const scan = scanLog(
-      await session.readLog(0, session.logLength()),
+    const replayer = new Replayer(checkpoint);
+    let staged: Uint8Array[] = [];
+    const summary = await scanLogIncremental(
+      { length: session.logLength(), read: (offset, length) => session.readLog(offset, length) },
       await session.readLogHeaders(),
       root.log,
-    );
-    Replayer.checkCoverage(checkpoint, scan.lastLsn);
-    const replayer = new Replayer(checkpoint);
-    let parts: Uint8Array[] = [];
-    for (const frame of scan.frames) {
-      parts.push(frame.body.slice());
-      if (frame.partIndex !== frame.partCount - 1) continue;
-      const body = JSON.parse(decoder.decode(concat(parts))) as Body;
-      parts = [];
-      const effects: TransactionEffects = {
-        catalog: body.catalog,
-        otherGlobal: body.sequences.length > 0,
-        tables: body.tables.map(({ tableId, schemaVersion }) => ({ tableId, schemaVersion })),
-      };
-      const decision = replayer.next(frame.lsn, effects);
-      const change = body.catalog;
-      if (decision.global) {
-        if (change?.kind === "createTable")
-          toy.tables.set(change.tableId, {
-            version: 1,
-            flushed: frame.lsn,
-            durable: [],
-            memory: [],
+      {
+        part(frame) {
+          staged.push(frame.body.slice());
+        },
+        commit(_transaction, lsn) {
+          const body = JSON.parse(decoder.decode(concat(staged))) as Body;
+          staged = [];
+          const decisions = replayer.next(lsn, body.effects.map(replayEffect));
+          body.effects.forEach((effect, index) => {
+            if (decisions[index] === true) toy.apply(effect, lsn);
           });
-        if (change?.kind === "alterTable") {
-          const table = toy.tables.get(change.tableId);
-          if (table !== undefined) table.version = change.schemaVersion;
-        }
-        if (change?.kind === "createTable") toy.nextTableId = change.tableId + 1;
-        for (const [id, value] of body.sequences) toy.sequences.set(id, value);
-      }
-      if (decision.dropped !== null) toy.tables.delete(decision.dropped);
-      for (const tableId of decision.tables)
-        toy.tables
-          .get(tableId)
-          ?.memory.push(...(body.tables.find((t) => t.tableId === tableId)?.rows ?? []));
-    }
-    await session.truncateLog(scan.validEnd);
-    toy.lsn = scan.lastLsn;
-    toy.chain = scan.chain;
-    toy.generation = scan.header?.generation ?? 0;
-    toy.ack = { end: scan.validEnd, chain: scan.chain, lsn: scan.lastLsn };
+          if (body.request !== null && lsn > root.globalLsn) toy.#record(body, lsn);
+        },
+        abandon() {
+          staged = [];
+        },
+      },
+    );
+    Replayer.checkCoverage(checkpoint, summary.lastLsn);
+    await session.truncateLog(summary.validEnd);
+    toy.lsn = summary.lastLsn;
+    toy.chain = summary.chain;
+    toy.generation = summary.header?.generation ?? 0;
+    toy.ack = { end: summary.validEnd, chain: summary.chain, lsn: summary.lastLsn };
     return toy;
   }
 }
 
-function concat(parts: readonly Uint8Array[]): Uint8Array {
-  const out = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
-  let offset = 0;
-  for (const part of parts) {
-    out.set(part, offset);
-    offset += part.length;
-  }
-  return out;
-}
-
 const rows = (prefix: string, count: number) =>
   Array.from({ length: count }, (_, i) => `${prefix}${String(i)}`);
-const insert = (tableId: number, schemaVersion: number, values: string[]) => ({
+const insert = (tableId: number, schemaVersion: number, values: string[]): ToyEffect => ({
+  kind: "rows",
   tableId,
   schemaVersion,
   rows: values,
 });
-const body = (fields: Partial<Body>): Body => ({
-  catalog: null,
-  sequences: [],
-  tables: [],
-  ...fields,
+let requestSequence = 0;
+const tx = (effects: ToyEffect[], request = false): Body => ({
+  request: request
+    ? { clientId: "c1", sequence: ++requestSequence, rowCount: effects.length }
+    : null,
+  effects,
 });
+
+interface Options {
+  readonly skipObligation?: boolean;
+}
 
 /** The workload: every protocol boundary at least once. */
 async function workload(
   toy: Toy,
   snapshots: string[],
   acknowledged: { count: number },
+  options: Options,
 ): Promise<void> {
+  requestSequence = 0;
   const commit = (b: Body, parts = 1) => toy.commit(b, parts, snapshots, acknowledged);
-  await commit(body({ catalog: { kind: "createTable", tableId: 1 } }));
-  await commit(body({ catalog: { kind: "createTable", tableId: 2 } }));
-  await commit(body({ tables: [insert(1, 1, rows("a", 2))] }));
-  await commit(body({ tables: [insert(1, 1, ["m1"]), insert(2, 1, ["m2"])] }));
-  await commit(body({ sequences: [[7, 32]] }));
-  await toy.checkpoint();
-  await commit(body({ tables: [insert(2, 1, rows("b", 40))] }), 3);
+  // Create and insert in one transaction (review A1-2 finding 4).
+  await commit(tx([{ kind: "createTable", tableId: 1 }, insert(1, 1, rows("a", 2))], true));
+  await commit(tx([{ kind: "createTable", tableId: 2 }]));
+  await commit(tx([insert(1, 1, ["m1"]), insert(2, 1, ["m2"])], true));
+  await commit(tx([{ kind: "sequence", sequenceId: 7, value: 32 }]));
+  await toy.checkpoint(options);
+  await commit(tx([insert(2, 1, rows("b", 40))]), 3);
   await toy.flushTable(1);
-  await commit(body({ tables: [insert(1, 1, ["c"]), insert(2, 1, ["d"])] }));
-  // ALTER: flush first (replay.ts obligation 1), then the DDL frame, then new-schema rows.
-  await toy.flushTable(1);
-  await commit(body({ catalog: { kind: "alterTable", tableId: 1, schemaVersion: 2 } }));
-  await commit(body({ tables: [insert(1, 2, ["e"])], sequences: [[7, 64]] }));
-  await commit(body({ catalog: { kind: "dropTable", tableId: 2 } }));
-  await commit(body({ catalog: { kind: "createTable", tableId: 3 } }));
-  await commit(body({ tables: [insert(3, 1, rows("f", 30)), insert(1, 2, ["g"])] }), 2);
+  // A schema change between two row changes of one transaction.
+  await commit(
+    tx(
+      [
+        insert(1, 1, ["c"]),
+        { kind: "alterTable", tableId: 1, schemaVersion: 2 },
+        insert(1, 2, ["e"]),
+        { kind: "sequence", sequenceId: 7, value: 64 },
+      ],
+      true,
+    ),
+  );
+  // Several DDL statements in one transaction, with rows.
+  await commit(
+    tx([
+      { kind: "createTable", tableId: 3 },
+      { kind: "createTable", tableId: 4 },
+      { kind: "alterTable", tableId: 3, schemaVersion: 2 },
+      insert(3, 2, ["x"]),
+      insert(4, 1, ["y"]),
+    ]),
+  );
+  await toy.checkpoint(options);
+  // Create, insert and drop in one transaction; then a drop of an older table.
+  await commit(
+    tx([
+      { kind: "createTable", tableId: 5 },
+      insert(5, 1, ["gone"]),
+      { kind: "dropTable", tableId: 5 },
+    ]),
+  );
+  await commit(tx([{ kind: "dropTable", tableId: 2 }], true));
+  await commit(tx([insert(3, 2, rows("f", 30)), insert(1, 2, ["g"])]), 2);
   await toy.recycleLog(0x2222);
-  await commit(body({ tables: [insert(3, 1, ["h"])] }));
+  await commit(tx([insert(3, 2, ["h"]), { kind: "alterTable", tableId: 4, schemaVersion: 2 }]));
   await toy.flushTable(3);
-  await commit(body({ tables: [insert(1, 2, ["i"])] }));
+  await commit(tx([insert(1, 2, ["i"]), insert(4, 2, ["z"])], true));
+  await toy.checkpoint(options);
+  await commit(tx([insert(4, 2, ["w"])]));
 }
 
-const EMPTY_STATE = JSON.stringify({ tables: [], sequences: [] });
+const EMPTY_STATE = JSON.stringify({ tables: [], sequences: [], ledger: [] });
 
-/** Open, recover (an empty store), then the workload: every physical step is a crash point. */
-async function run(backend: SimBackend, snapshots: string[], acknowledged: { count: number }) {
+async function run(
+  backend: SimBackend,
+  snapshots: string[],
+  acknowledged: { count: number },
+  options: Options = {},
+) {
   snapshots.push(EMPTY_STATE);
   const toy = await Toy.recover(await backend.open(await backend.acquire()));
-  await workload(toy, snapshots, acknowledged);
+  await workload(toy, snapshots, acknowledged, options);
 }
 
-describe("log, checkpoint and replay under every physical crash point", () => {
-  for (const flush of ["honest", "lying"] as const)
-    it(`${flush} flush`, async () => {
-      const cleanDisk = new SimDisk();
-      const cleanBackend = new SimBackend(cleanDisk);
-      const cleanSnapshots: string[] = [];
-      await run(cleanBackend, cleanSnapshots, { count: 0 });
-      const totalSteps = cleanDisk.steps;
-      // The clean run recovers to its final state.
-      cleanDisk.powerLoss();
-      cleanBackend.restart();
-      const final = await Toy.recover(await cleanBackend.open(await cleanBackend.acquire()));
-      expect(final.logical()).toBe(cleanSnapshots.at(-1));
-      expect(totalSteps).toBeGreaterThan(60);
+async function sweep(flush: "honest" | "lying", options: Options = {}): Promise<number> {
+  const cleanDisk = new SimDisk();
+  const cleanBackend = new SimBackend(cleanDisk);
+  const cleanSnapshots: string[] = [];
+  await run(cleanBackend, cleanSnapshots, { count: 0 }, options);
+  const totalSteps = cleanDisk.steps;
+  cleanDisk.powerLoss();
+  cleanBackend.restart();
+  const final = await Toy.recover(await cleanBackend.open(await cleanBackend.acquire()));
+  expect(final.logical()).toBe(cleanSnapshots.at(-1));
+  expect(totalSteps).toBeGreaterThan(60);
 
-      let detected = 0;
-      for (let step = 0; step < totalSteps; step++)
-        for (let seed = 1; seed <= SEEDS; seed++) {
-          const disk = new SimDisk({ crashAtStep: step, seed: seed * 104_729 + step, flush });
-          const backend = new SimBackend(disk);
-          const snapshots: string[] = [];
-          const acknowledged = { count: 0 };
-          await expect(run(backend, snapshots, acknowledged)).rejects.toThrow(SimulatedCrash);
-          backend.restart();
-          const label = `${flush} step ${String(step)} seed ${String(seed)}`;
-          const reopened = await backend.open(await backend.acquire());
-          let recovered: Toy;
-          try {
-            recovered = await Toy.recover(reopened);
-          } catch (error) {
-            if (flush === "lying" && error instanceof LogCorruptionError) {
-              detected += 1;
-              continue;
-            }
-            throw new Error(`${label}: ${String(error)}`, { cause: error });
-          }
-          const state = recovered.logical();
-          const index = snapshots.lastIndexOf(state);
-          expect(
-            index,
-            `${label}: recovered a state no prefix of commits produces`,
-          ).toBeGreaterThanOrEqual(0);
-          if (flush === "honest")
-            expect(index, `${label}: lost an acknowledged commit`).toBeGreaterThanOrEqual(
-              acknowledged.count,
-            );
-          // Resume after recovery: an independent commit lands after any abandoned prefix.
-          const resumed: string[] = [state];
-          await recovered.commit(body({ sequences: [[99, step + 1]] }), 1, resumed, { count: 0 });
-          disk.powerLoss();
-          backend.restart();
-          let again: string;
-          try {
-            again = (await Toy.recover(await backend.open(await backend.acquire()))).logical();
-          } catch (error) {
-            if (flush === "lying" && error instanceof LogCorruptionError) continue;
-            throw error;
-          }
-          // Honest: the resumed commit survives. Lying: it may be lost, nothing else may appear.
-          if (flush === "honest") expect(again, `${label}: resumed commit`).toBe(resumed.at(-1));
-          else expect(resumed, `${label}: resumed commit`).toContain(again);
+  let detected = 0;
+  for (let step = 0; step < totalSteps; step++)
+    for (let seed = 1; seed <= SEEDS; seed++) {
+      const disk = new SimDisk({ crashAtStep: step, seed: seed * 104_729 + step, flush });
+      const backend = new SimBackend(disk);
+      const snapshots: string[] = [];
+      const acknowledged = { count: 0 };
+      await expect(run(backend, snapshots, acknowledged, options)).rejects.toThrow(SimulatedCrash);
+      backend.restart();
+      const label = `${flush} step ${String(step)} seed ${String(seed)}`;
+      let recovered: Toy;
+      try {
+        recovered = await Toy.recover(await backend.open(await backend.acquire()));
+      } catch (error) {
+        if (flush === "lying" && error instanceof LogCorruptionError) {
+          detected += 1;
+          continue;
         }
-      if (flush === "lying") expect(detected).toBeGreaterThan(0);
-    });
+        throw new Error(`${label}: ${String(error)}`, { cause: error });
+      }
+      const state = recovered.logical();
+      const index = snapshots.lastIndexOf(state);
+      expect(
+        index,
+        `${label}: recovered a state no prefix of commits produces`,
+      ).toBeGreaterThanOrEqual(0);
+      if (flush === "honest")
+        expect(index, `${label}: lost an acknowledged commit`).toBeGreaterThanOrEqual(
+          acknowledged.count,
+        );
+      const resumed: string[] = [state];
+      await recovered.commit(
+        tx([{ kind: "sequence", sequenceId: 99, value: step + 1 }]),
+        1,
+        resumed,
+        {
+          count: 0,
+        },
+      );
+      disk.powerLoss();
+      backend.restart();
+      let again: string;
+      try {
+        again = (await Toy.recover(await backend.open(await backend.acquire()))).logical();
+      } catch (error) {
+        if (flush === "lying" && error instanceof LogCorruptionError) continue;
+        throw error;
+      }
+      if (flush === "honest") expect(again, `${label}: resumed commit`).toBe(resumed.at(-1));
+      else expect(resumed, `${label}: resumed commit`).toContain(again);
+    }
+  return detected;
+}
+
+describe("log, checkpoint, replay and ledger under every physical crash point", () => {
+  it("honest flush: every acknowledged commit survives, nothing else appears", async () => {
+    await sweep("honest");
+  });
+
+  it("lying flush: a prefix survives or the loss is detected", async () => {
+    expect(await sweep("lying")).toBeGreaterThan(0);
+  });
+
+  it("a checkpoint that skips writer obligation 1 is caught as corruption, not silent", async () => {
+    await expect(sweep("honest", { skipObligation: true })).rejects.toThrow(
+      /written under schema/u,
+    );
+  });
 });

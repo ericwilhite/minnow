@@ -72,35 +72,54 @@ export async function pushAndWait(
   if (operator.push(batch, transfer) === "blocked") await operator.ready();
 }
 
+function abortReason(signal: AbortSignal): Error {
+  const reason: unknown = signal.reason;
+  return reason instanceof Error ? reason : new Error("Aborted", { cause: reason });
+}
+
+/**
+ * `promise`, rejected early if `signal` aborts. Without a signal it is `promise` itself; with one,
+ * the listener lives only as long as this wait, so a long stream retains nothing per batch.
+ */
+export function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (signal === undefined) return promise;
+  if (signal.aborted) return Promise.reject(abortReason(signal));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      reject(abortReason(signal));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      },
+    );
+  });
+}
+
 /** Runs one pipeline to completion, aborting every stage on error or cancellation. */
 export async function drive(
   source: BatchSource,
   sink: Operator,
   signal?: AbortSignal,
 ): Promise<void> {
-  // Every await races the signal, so cancellation never waits on a blocked consumer.
-  let cancel: ((reason: unknown) => void) | null = null;
-  const cancelled = new Promise<never>((_, reject) => {
-    cancel = reject;
-  });
-  cancelled.catch(() => undefined);
-  const onAbort = () => cancel?.(signal?.reason);
-  signal?.addEventListener("abort", onAbort, { once: true });
-  const guarded = <T>(promise: Promise<T>): Promise<T> => Promise.race([promise, cancelled]);
   try {
     for (;;) {
       signal?.throwIfAborted();
-      const next = await guarded(source.next());
+      const next = await abortable(source.next(), signal);
       if (next === null) break;
-      if (sink.push(next.batch, next.transfer) === "blocked") await guarded(sink.ready());
+      if (sink.push(next.batch, next.transfer) === "blocked") await abortable(sink.ready(), signal);
     }
     signal?.throwIfAborted();
-    await guarded(sink.finish());
+    await abortable(sink.finish(), signal);
   } catch (error) {
     source.abort(error);
     sink.abort(error);
     throw error;
-  } finally {
-    signal?.removeEventListener("abort", onAbort);
   }
 }

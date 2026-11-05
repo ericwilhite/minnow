@@ -21,7 +21,8 @@
  * - A spill page is a batch in vector layout (vector.ts), not JSON:
  *     header: magic u32 "MNSP" | query id u32 | run u32 | partition u32 | sequence u32 |
  *             row count u32 | column count u32 | flags u32
- *     per column: layout u8, physical-type tag, decimal tier and scale, then validity words,
+ *     per column: layout u8, physical-type tag, decimal tier and uniform scale (or the per-slot
+ *             scale array), then validity words,
  *             data buffers (int128 limbs, wide decimals as length-prefixed two's complement),
  *             varlen offsets and bytes, display scales and specials, each 8-byte aligned
  *   Pages are uncompressed (spill is bandwidth-bound and short-lived). The codec belongs to the

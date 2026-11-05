@@ -4,9 +4,17 @@ import { seedsFor } from "../../testing/seeds.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 import { TIMESTAMP_NEG_INFINITY, TIMESTAMP_POS_INFINITY } from "../temporal.js";
 import { INT32_MAX, INT32_MIN, INT64_MAX, INT64_MIN, type PhysicalType } from "../types.js";
+import { setValid, allocateValidity } from "../vector/validity.js";
+import { setInt128 } from "../vector/int128.js";
+import { VarlenBuilder } from "../vector/varlen.js";
+import { newDictionaryId, type FlatVector, type Vector } from "../vector/vector.js";
 import {
+  KeyBatch,
+  UnindexableTypeError,
   encodeEqualityKey,
+  encodeKeyBatch,
   encodeSortKey,
+  indexKeyKind,
   type DecimalKey,
   type IntervalKey,
   type KeyValue,
@@ -112,7 +120,9 @@ describe("key encoding golden vectors", () => {
     expect(eq(MOOD, utf8("ok"))).toBe("016f6b0001");
     expect(eq({ kind: "int32", bits: 32 }, null)).toBe("00");
     expect(() => encodeSortKey([asc(MOOD, utf8("angry"))])).toThrow(RangeError);
-    expect(() => encodeSortKey([asc({ kind: "locator", tableId: 1 }, 1)])).toThrow(TypeError);
+    expect(() => encodeSortKey([asc({ kind: "locator", tableId: 1 }, 1)])).toThrow(
+      UnindexableTypeError,
+    );
   });
 });
 
@@ -120,6 +130,9 @@ describe("key encoding golden vectors", () => {
 
 type Kind =
   | "bool"
+  | "int16"
+  | "time"
+  | "bytes"
   | "int32"
   | "date"
   | "int64"
@@ -134,6 +147,9 @@ type Kind =
 
 const TYPES: Record<Kind, PhysicalType> = {
   bool: { kind: "bool" },
+  int16: { kind: "int32", bits: 16 },
+  time: { kind: "time" },
+  bytes: { kind: "bytes" },
   int32: { kind: "int32", bits: 32 },
   date: { kind: "date" },
   int64: { kind: "int64" },
@@ -153,6 +169,9 @@ const smallBytes = fc
 
 const values: Record<Kind, fc.Arbitrary<KeyValue>> = {
   bool: fc.boolean(),
+  int16: fc.integer({ min: -32_768, max: 32_767 }),
+  time: fc.oneof(fc.bigInt({ min: 0n, max: 3n }), fc.bigInt({ min: 0n, max: 86_400_000_000n })),
+  bytes: fc.uint8Array({ maxLength: 4 }),
   int32: fc.oneof(
     fc.integer({ min: -3, max: 3 }),
     fc.integer(),
@@ -217,10 +236,12 @@ function reference(kind: Kind, a: KeyValue, b: KeyValue): number {
   switch (kind) {
     case "bool":
       return Math.sign(Number(a) - Number(b));
+    case "int16":
     case "int32":
     case "date":
       return Math.sign((a as number) - (b as number));
     case "int64":
+    case "time":
     case "timestamp":
       return bigSign((a as bigint) - (b as bigint));
     case "float64":
@@ -241,6 +262,7 @@ function reference(kind: Kind, a: KeyValue, b: KeyValue): number {
       return bigSign(align(x) - align(y));
     }
     case "text":
+    case "bytes":
     case "uuid":
       return compareBytes(a as Uint8Array, b as Uint8Array);
     case "enum": {
@@ -324,5 +346,215 @@ describe("key encoding consistency (generated)", () => {
       }),
       { seed, numRuns: 4000 },
     );
+  });
+});
+
+describe("what may be a persisted key (lead ruling, review A1-2 finding 3)", () => {
+  it("refuses arrays and JSON at DDL and makes enum indexes equality-only", () => {
+    expect(() => indexKeyKind({ kind: "array", element: { kind: "int32", bits: 32 } })).toThrow(
+      UnindexableTypeError,
+    );
+    expect(() => indexKeyKind({ kind: "json", binary: true })).toThrow(UnindexableTypeError);
+    expect(indexKeyKind(MOOD)).toBe("equality");
+    for (const kind of Object.keys(TYPES) as Kind[])
+      if (kind !== "enum") expect(indexKeyKind(TYPES[kind]), kind).toBe("ordered");
+    expect(indexKeyKind({ kind: "interval" })).toBe("ordered");
+  });
+
+  it("never encodes JSON bytes as a key (review probe: '2' vs '10', '1' vs '1.0')", () => {
+    const json: PhysicalType = { kind: "json", binary: true };
+    for (const text of ["2", "10", "1", "1.0"])
+      expect(() => encodeEqualityKey([{ type: json, value: utf8(text) }])).toThrow(
+        UnindexableTypeError,
+      );
+  });
+});
+
+// ---- The batched vector encoder must equal the scalar reference ----
+
+const unlimited = { allocate: () => true, free: () => undefined };
+
+/** A flat vector holding `items` (null = null slot), in a representation chosen by `repr`. */
+function vectorOf(kind: Kind, items: ReadonlyArray<KeyValue | null>, wide: boolean): FlatVector {
+  const type = TYPES[kind];
+  const length = items.length;
+  const validity = allocateValidity(length);
+  items.forEach((item, row) => {
+    setValid(validity, row, item !== null);
+  });
+  const flat = (data: FlatVector["data"]): FlatVector => ({
+    form: "flat",
+    type,
+    length,
+    validity,
+    data,
+  });
+  switch (kind) {
+    case "bool":
+      return flat({ layout: "bool", values: Uint8Array.from(items, (v) => (v === true ? 1 : 0)) });
+    case "int16":
+    case "int32":
+    case "date":
+      return flat({
+        layout: "i32",
+        values: Int32Array.from(items, (v) => (v as number | null) ?? 0),
+      });
+    case "float64":
+      return flat({
+        layout: "f64",
+        values: Float64Array.from(items, (v) => (v as number | null) ?? 0),
+      });
+    case "float32":
+      return flat({
+        layout: "f32",
+        values: Float32Array.from(items, (v) => (v as number | null) ?? 0),
+      });
+    case "int64":
+    case "time":
+    case "timestamp": {
+      const big = items.map((v) => (v as bigint | null) ?? 0n);
+      const safe = !wide && big.every((v) => v >= -(2n ** 53n) + 1n && v <= 2n ** 53n - 1n);
+      return flat({
+        layout: "int64",
+        values: safe
+          ? { repr: "safe", values: Float64Array.from(big, Number) }
+          : { repr: "int64", values: BigInt64Array.from(big) },
+      });
+    }
+    case "decimal": {
+      const specials = Uint8Array.from(items, (v) => {
+        const special = (v as DecimalKey | null)?.special;
+        return special === "NaN" ? 1 : special === "Infinity" ? 2 : special === "-Infinity" ? 3 : 0;
+      });
+      const scales = new Uint16Array(length);
+      // Stored scales are ≥ 0: a negative key scale becomes a coefficient with zeros at scale 0.
+      const coefficients = items.map((v, row) => {
+        const decimal = v as DecimalKey | null;
+        const scale = Math.max(0, decimal?.scale ?? 0);
+        scales[row] = scale;
+        return (decimal?.coefficient ?? 0n) * 10n ** BigInt(scale - (decimal?.scale ?? 0));
+      });
+      const fits = coefficients.every((c) => c >= -(2n ** 127n) && c < 2n ** 127n);
+      const limbs = new Uint32Array(length * 4);
+      if (fits) coefficients.forEach((c, row) => setInt128(limbs, row, c));
+      return flat({
+        layout: "decimal",
+        scale: null,
+        scales,
+        coefficients: fits ? { repr: "int128", limbs } : { repr: "wide", values: coefficients },
+        specials,
+      });
+    }
+    case "text":
+    case "bytes":
+    case "enum": {
+      const builder = new VarlenBuilder(length, unlimited);
+      for (const v of items) builder.appendBytes((v as Uint8Array | null) ?? new Uint8Array(0));
+      return flat(builder.data());
+    }
+    case "uuid": {
+      const bytes = new Uint8Array(length * 16);
+      items.forEach((v, row) => {
+        if (v !== null) bytes.set(v as Uint8Array, row * 16);
+      });
+      return flat({ layout: "fixed16", bytes });
+    }
+    case "interval": {
+      const intervals = items.map(
+        (v) => (v as IntervalKey | null) ?? { months: 0, days: 0, micros: 0n },
+      );
+      return flat({
+        layout: "interval",
+        months: Int32Array.from(intervals, (v) => v.months),
+        days: Int32Array.from(intervals, (v) => v.days),
+        micros: wide
+          ? { repr: "int64", values: BigInt64Array.from(intervals, (v) => v.micros) }
+          : { repr: "safe", values: Float64Array.from(intervals, (v) => Number(v.micros)) },
+      });
+    }
+  }
+}
+
+const batchCase = fc.array(columnArb, { minLength: 1, maxLength: 3 }).chain((columns) =>
+  fc.tuple(
+    fc.constant(columns),
+    fc.array(tupleArb(columns), { minLength: 1, maxLength: 12 }),
+    fc.boolean(),
+    fc.array(fc.constantFrom("flat" as const, "dictionary" as const, "constant" as const), {
+      minLength: columns.length,
+      maxLength: columns.length,
+    }),
+    fc.boolean(),
+  ),
+);
+
+describe("batched key encoding", () => {
+  it.each(SEEDS)("encodes vectors exactly as the scalar reference (seed %i)", (seed) => {
+    const out = new KeyBatch();
+    fc.assert(
+      fc.property(batchCase, ([columns, rows, wide, forms, select]) => {
+        const length = rows.length;
+        const vectors: Vector[] = columns.map((column, c) => {
+          const items = rows.map((row) => row[c] ?? null);
+          const form = forms[c] ?? "flat";
+          if (form === "constant") {
+            const value = vectorOf(column.kind, [items[0] ?? null], wide);
+            return { form: "constant", type: value.type, length, value };
+          }
+          const flat = vectorOf(column.kind, items, wide);
+          if (form === "flat") return flat;
+          // Dictionary: entries in reverse order, codes point back; nulls in the codes' validity.
+          const dictionary = vectorOf(column.kind, [...items].reverse(), wide);
+          return {
+            form: "dictionary",
+            type: flat.type,
+            length,
+            codes: Int32Array.from(items, (_, row) => length - 1 - row),
+            validity: flat.validity,
+            dictionary,
+            dictionaryId: newDictionaryId(),
+          };
+        });
+        const selected = select ? rows.map((_, row) => row).filter((row) => row % 2 === 0) : null;
+        const selection =
+          selected === null ? null : { rows: Uint16Array.from(selected), count: selected.length };
+        const keyColumns = vectors.map((vector, c) => ({
+          vector,
+          direction: columns[c]?.direction ?? "asc",
+          nulls: columns[c]?.nulls ?? "last",
+        }));
+        const active = selected ?? rows.map((_, row) => row);
+        const effective = (row: number) =>
+          rows[row]?.map((value, c) =>
+            (forms[c] ?? "flat") === "constant" ? (rows[0]?.[c] ?? null) : value,
+          ) ?? [];
+        encodeKeyBatch("sort", keyColumns, { length, selection }, out);
+        active.forEach((row, k) => {
+          expect(hex(out.key(k))).toBe(hex(sortKey(columns, effective(row))));
+        });
+        encodeKeyBatch("equality", keyColumns, { length, selection }, out);
+        active.forEach((row, k) => {
+          expect(hex(out.key(k))).toBe(hex(equalityKey(columns, effective(row))));
+        });
+      }),
+      { seed, numRuns: 1500 },
+    );
+  });
+
+  it("reuses its buffers: no allocation per key once grown", () => {
+    const out = new KeyBatch();
+    const vector = vectorOf(
+      "int64",
+      Array.from({ length: 64 }, (_, i) => BigInt(i)),
+      false,
+    );
+    const columns = [{ vector, direction: "asc" as const, nulls: "last" as const }];
+    encodeKeyBatch("sort", columns, { length: 64, selection: null }, out);
+    const buffer = out.writer.bytes;
+    const offsets = out.offsets;
+    for (let round = 0; round < 10; round++)
+      encodeKeyBatch("sort", columns, { length: 64, selection: null }, out);
+    expect(out.writer.bytes).toBe(buffer);
+    expect(out.offsets).toBe(offsets);
   });
 });

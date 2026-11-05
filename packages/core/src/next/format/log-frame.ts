@@ -27,7 +27,8 @@
  *   recorded chain and LSN; an empty boundary must be (0, salt, firstLsn − 1). Anything else, or
  *   a missing acknowledged frame, is `LogCorruptionError`, never a silently shorter log.
  * - After the boundary, the scan keeps complete transactions and stops at the first invalid
- *   frame or incomplete transaction. The engine truncates to `validEnd` before its first append,
+ *   frame or incomplete transaction. Recovery uses `scanLogIncremental`: one frame in memory at a
+ *   time, transactions handed to a sink that stages their parts. The engine truncates to `validEnd` before its first append,
  *   so an abandoned prefix can never be completed by a later, unrelated transaction.
  * - Frames whose salt is not the root's are another incarnation and are never replayed. A valid
  *   header of another salt whose `rootSequence` is newer than the root's means the root was
@@ -187,9 +188,21 @@ export interface ScannedFrame {
   readonly body: Uint8Array;
 }
 
-export interface LogScan {
+export interface LogScan extends LogScanSummary {
   /** Frames of complete transactions, in LSN order. */
   readonly frames: readonly ScannedFrame[];
+}
+
+/** The root's description of the log incarnation to recover (format/manifest.ts `log`). */
+export interface LogIncarnation {
+  readonly salt: number;
+  readonly firstLsn: number;
+  /** Sequence of the root that started this incarnation. */
+  readonly rootSequence: number;
+}
+
+/** What the scan concluded (both scanners). */
+export interface LogScanSummary {
   /** End of the last complete transaction: truncate here before appending. */
   readonly validEnd: number;
   /** Chain checksum at `validEnd` (seed of the next frame). */
@@ -202,103 +215,191 @@ export interface LogScan {
   readonly header: LogHeader | null;
 }
 
-/** The root's description of the log incarnation to recover (format/manifest.ts `log`). */
-export interface LogIncarnation {
-  readonly salt: number;
-  readonly firstLsn: number;
-  /** Sequence of the root that started this incarnation. */
-  readonly rootSequence: number;
+/**
+ * The scan as a state machine over consecutive frames (shared by `scanLog` and
+ * `scanLogIncremental`). It keeps no frame bytes: only the chain, LSN, open part count and the
+ * last transaction boundary.
+ */
+class LogScanState {
+  readonly header: LogHeader | null;
+  readonly #salt: number;
+  offset = 0;
+  #chain: number;
+  #lsn: number;
+  #openParts = 0;
+  #openCount = 0;
+  #boundary: { end: number; chain: number; lsn: number };
+  #landed: boolean;
+
+  constructor(slots: readonly [Uint8Array | null, Uint8Array | null], incarnation: LogIncarnation) {
+    const salt = incarnation.salt >>> 0;
+    this.#salt = salt;
+    for (const slot of slots) {
+      const other = decodeLogHeader(slot);
+      if (other !== null && other.salt !== salt && other.rootSequence > incarnation.rootSequence)
+        throw new LogCorruptionError("The log belongs to a newer root than the one on disk");
+    }
+    const { header } = newestLogHeader(slots, salt);
+    this.header = header;
+    const empty = incarnation.firstLsn - 1;
+    if (
+      header !== null &&
+      header.ackEnd === 0 &&
+      (header.ackChain !== salt || header.ackLsn !== empty)
+    )
+      throw new LogCorruptionError("An empty acknowledged boundary has the wrong chain or LSN");
+    this.#chain = salt;
+    this.#lsn = empty;
+    this.#boundary = { end: 0, chain: salt, lsn: empty };
+    this.#landed = header === null || header.ackEnd === 0;
+  }
+
+  /** The length of the frame whose first `FRAME_HEADER_BYTES` are `head`, or null to stop. */
+  frameLength(head: Uint8Array): number | null {
+    if (head.length < FRAME_HEADER_BYTES) return null;
+    const view = new DataView(head.buffer, head.byteOffset, FRAME_HEADER_BYTES);
+    if (view.getUint32(0, true) !== FRAME_MAGIC || view.getUint32(4, true) !== this.#salt)
+      return null;
+    const bodyLength = view.getUint32(16, true);
+    return bodyLength > MAX_FRAME_BODY_BYTES ? null : frameLength(bodyLength);
+  }
+
+  /**
+   * Validates the whole frame at the current offset. Returns the frame (its body a view of
+   * `bytes`) and whether it completes its transaction, or null to stop.
+   */
+  accept(bytes: Uint8Array): { readonly frame: ScannedFrame; readonly completes: boolean } | null {
+    const length = bytes.length;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, length);
+    const expected = xxHash32(bytes, this.#chain, 0, length - 4);
+    if (view.getUint32(length - 4, true) !== expected) return null;
+    const frameLsn = getU53(view, 8);
+    const partIndex = view.getUint16(22, true);
+    const partCount = view.getUint16(24, true);
+    if (frameLsn !== this.#lsn + 1 || bytes[20] !== FrameKind.commit) return null;
+    if (bytes[21] !== 0 || view.getUint16(26, true) !== 0) return null;
+    if (partCount < 1 || partIndex >= partCount) return null;
+    const continues =
+      partIndex === 0
+        ? this.#openParts === 0
+        : this.#openParts === partIndex && this.#openCount === partCount;
+    if (!continues) return null;
+    const bodyLength = view.getUint32(16, true);
+    const frame: ScannedFrame = {
+      offset: this.offset,
+      lsn: frameLsn,
+      transaction: frameLsn - partIndex,
+      partIndex,
+      partCount,
+      body: bytes.subarray(FRAME_HEADER_BYTES, FRAME_HEADER_BYTES + bodyLength),
+    };
+    this.#chain = expected;
+    this.#lsn = frameLsn;
+    this.offset += length;
+    this.#openParts = partIndex + 1;
+    this.#openCount = partCount;
+    const completes = partIndex === partCount - 1;
+    const header = this.header;
+    if (completes) {
+      this.#openParts = 0;
+      this.#boundary = { end: this.offset, chain: this.#chain, lsn: this.#lsn };
+      if (header !== null && this.offset === header.ackEnd) {
+        if (this.#chain !== header.ackChain || this.#lsn !== header.ackLsn)
+          throw new LogCorruptionError("The acknowledged boundary does not match its frame");
+        this.#landed = true;
+      }
+    }
+    if (header !== null && !this.#landed && this.offset > header.ackEnd)
+      throw new LogCorruptionError("The acknowledged boundary is not a transaction end");
+    return { frame, completes };
+  }
+
+  finish(): LogScanSummary {
+    if (!this.#landed)
+      throw new LogCorruptionError(
+        `Acknowledged log frames are missing: valid to ${String(this.#boundary.end)}, acknowledged to ${String(this.header?.ackEnd ?? 0)}`,
+      );
+    return {
+      validEnd: this.#boundary.end,
+      chain: this.#boundary.chain,
+      lastLsn: this.#boundary.lsn,
+      abandonedParts: this.#openParts,
+      header: this.header,
+    };
+  }
 }
 
-/** Recovery's view of the log (the promises above). */
+/** Recovery's view of a log held in memory (tests, small logs). */
 export function scanLog(
   body: Uint8Array,
   slots: readonly [Uint8Array | null, Uint8Array | null],
   incarnation: LogIncarnation,
 ): LogScan {
-  const { firstLsn } = incarnation;
-  const salt = incarnation.salt >>> 0;
-  for (const slot of slots) {
-    const other = decodeLogHeader(slot);
-    if (other !== null && other.salt !== salt && other.rootSequence > incarnation.rootSequence)
-      throw new LogCorruptionError("The log belongs to a newer root than the one on disk");
-  }
-  const { header } = newestLogHeader(slots, salt);
-  if (
-    header !== null &&
-    header.ackEnd === 0 &&
-    (header.ackChain !== salt || header.ackLsn !== firstLsn - 1)
-  )
-    throw new LogCorruptionError("An empty acknowledged boundary has the wrong chain or LSN");
-  const view = new DataView(body.buffer, body.byteOffset, body.byteLength);
+  const state = new LogScanState(slots, incarnation);
   const frames: ScannedFrame[] = [];
   const open: ScannedFrame[] = [];
-  let offset = 0;
-  let chain = salt;
-  let lsn = firstLsn - 1;
-  let boundary = { end: 0, chain: salt, lsn: firstLsn - 1 };
-  let landed = header === null || header.ackEnd === 0;
   for (;;) {
-    if (offset + FRAME_HEADER_BYTES + 4 > body.length) break;
-    if (view.getUint32(offset, true) !== FRAME_MAGIC || view.getUint32(offset + 4, true) !== salt)
-      break;
-    const bodyLength = view.getUint32(offset + 16, true);
-    if (bodyLength > MAX_FRAME_BODY_BYTES) break;
-    const length = frameLength(bodyLength);
-    if (offset + length > body.length) break;
-    const expected = xxHash32(body, chain, offset, offset + length - 4);
-    if (view.getUint32(offset + length - 4, true) !== expected) break;
-    const frameLsn = getU53(view, offset + 8);
-    const partIndex = view.getUint16(offset + 22, true);
-    const partCount = view.getUint16(offset + 24, true);
-    if (frameLsn !== lsn + 1 || body[offset + 20] !== FrameKind.commit) break;
-    if (body[offset + 21] !== 0 || view.getUint16(offset + 26, true) !== 0) break;
-    if (partCount < 1 || partIndex >= partCount) break;
-    const previous = open.at(-1);
-    const continues =
-      partIndex === 0
-        ? previous === undefined
-        : previous?.partIndex === partIndex - 1 && previous.partCount === partCount;
-    if (!continues) break;
-    open.push({
-      offset,
-      lsn: frameLsn,
-      transaction: frameLsn - partIndex,
-      partIndex,
-      partCount,
-      body: body.subarray(offset + FRAME_HEADER_BYTES, offset + FRAME_HEADER_BYTES + bodyLength),
-    });
-    chain = expected;
-    lsn = frameLsn;
-    offset += length;
-    if (partIndex === partCount - 1) {
-      frames.push(...open);
-      open.length = 0;
-      boundary = { end: offset, chain, lsn };
-      if (header !== null && offset === header.ackEnd) {
-        if (chain !== header.ackChain || lsn !== header.ackLsn)
-          throw new LogCorruptionError("The acknowledged boundary does not match its frame");
-        landed = true;
-      }
-    }
-    if (header !== null && !landed && offset > header.ackEnd)
-      throw new LogCorruptionError("The acknowledged boundary is not a transaction end");
-  }
-  if (!landed)
-    throw new LogCorruptionError(
-      `Acknowledged log frames are missing: valid to ${String(boundary.end)}, acknowledged to ${String(header?.ackEnd ?? 0)}`,
+    const length = state.frameLength(
+      body.subarray(state.offset, state.offset + FRAME_HEADER_BYTES),
     );
-  return {
-    frames,
-    validEnd: boundary.end,
-    chain: boundary.chain,
-    lastLsn: boundary.lsn,
-    abandonedParts: open.length,
-    header,
-  };
+    if (length === null || state.offset + length > body.length) break;
+    const accepted = state.accept(body.subarray(state.offset, state.offset + length));
+    if (accepted === null) break;
+    open.push(accepted.frame);
+    if (accepted.completes) frames.push(...open.splice(0));
+  }
+  return { ...state.finish(), frames };
 }
 
-/** The contents of a commit transaction (codec: write-path track). Replay rules: replay.ts. */
+/** Where the incremental scan reads the log body from (a `StoreSession` fits). */
+export interface LogReader {
+  readonly length: number;
+  read(offset: number, length: number): Promise<Uint8Array>;
+}
+
+/**
+ * Receives frames as the incremental scan validates them. Parts arrive before the scan knows
+ * their transaction is complete: the sink stages them (a transaction larger than memory is staged
+ * the way a large commit is written: into its table's memtable spill or a staging area) and
+ * applies them on `commit`, or drops them on `abandon` (only the log's tail can be abandoned).
+ */
+export interface TransactionSink {
+  /** `frame.body` is valid only during this call: copy what you keep. */
+  part(frame: ScannedFrame): void | Promise<void>;
+  commit(transaction: number, lastLsn: number): void | Promise<void>;
+  abandon(parts: number): void | Promise<void>;
+}
+
+/**
+ * Recovery's view of a log of any size: reads one frame at a time (memory is bounded by the
+ * largest frame, `MAX_FRAME_BODY_BYTES` + 32), keeps no frame after delivering it, and hands
+ * transactions to `sink` in LSN order.
+ */
+export async function scanLogIncremental(
+  reader: LogReader,
+  slots: readonly [Uint8Array | null, Uint8Array | null],
+  incarnation: LogIncarnation,
+  sink: TransactionSink,
+): Promise<LogScanSummary> {
+  const state = new LogScanState(slots, incarnation);
+  for (;;) {
+    if (state.offset + FRAME_HEADER_BYTES + 4 > reader.length) break;
+    const length = state.frameLength(await reader.read(state.offset, FRAME_HEADER_BYTES));
+    if (length === null || state.offset + length > reader.length) break;
+    const accepted = state.accept(await reader.read(state.offset, length));
+    if (accepted === null) break;
+    await sink.part(accepted.frame);
+    if (accepted.completes) await sink.commit(accepted.frame.transaction, accepted.frame.lsn);
+  }
+  const summary = state.finish();
+  if (summary.abandonedParts > 0) await sink.abandon(summary.abandonedParts);
+  return summary;
+}
+
+/**
+ * The contents of a commit transaction (codec: write-path track): an ordered list of effects,
+ * applied in order on commit and on replay (replay.ts).
+ */
 export interface CommitFrameBody {
   /** The request that produced this commit, for exactly-once (format/ledger.ts). */
   readonly request: {
@@ -309,17 +410,10 @@ export interface CommitFrameBody {
     /** Affected-row counts reported to the client, replayed for a duplicate. */
     readonly counts: Readonly<Record<string, number>>;
   } | null;
-  /** DDL, applied in LSN order with the data (replay.ts). */
-  readonly catalog: CatalogChange | null;
-  /** Sequence blocks reserved by this transaction: each sequence's new reserved-through value. */
-  readonly sequences: ReadonlyArray<{
-    readonly sequenceId: number;
-    readonly reservedThrough: bigint;
-  }>;
-  readonly tables: readonly TableChange[];
+  readonly effects: readonly BodyEffect[];
 }
 
-export type CatalogChange =
+export type BodyEffect =
   | { readonly kind: "createTable"; readonly tableId: number; readonly definition: Uint8Array }
   | {
       readonly kind: "alterTable";
@@ -328,8 +422,11 @@ export type CatalogChange =
       readonly definition: Uint8Array;
     }
   | { readonly kind: "dropTable"; readonly tableId: number }
-  /** Views, sequences, indexes: global catalog state with no table schema change. */
-  | { readonly kind: "other"; readonly definition: Uint8Array };
+  /** Views, sequences, indexes: catalog state with no table schema change. */
+  | { readonly kind: "catalog"; readonly definition: Uint8Array }
+  /** A sequence block reservation: the sequence's new reserved-through value. */
+  | { readonly kind: "sequence"; readonly sequenceId: number; readonly reservedThrough: bigint }
+  | ({ readonly kind: "rows" } & TableChange);
 
 /**
  * Row changes to one table under one schema version. An UPDATE is a delete of the old row id plus
@@ -346,7 +443,7 @@ export interface TableChange {
     readonly columns: readonly Uint8Array[];
   } | null;
   /**
-   * Deleted row ids, ascending, with the equality-key bytes (key-encoding.ts) of every index the
+   * Deleted row ids, ascending, with the equality-key bytes (keys/key-encoding.ts) of every index the
    * row was in: primary key first, then each secondary index in catalog order. Keys of inserted
    * rows are derived from the inserted columns, so they are not repeated.
    */

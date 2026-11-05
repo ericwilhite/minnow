@@ -200,12 +200,12 @@ describe("byte-bounded batches and locators", () => {
 function budget(limit: number) {
   return {
     held: 0,
-    tryGrow(bytes: number) {
+    allocate(bytes: number) {
       if (this.held + bytes > limit) return false;
       this.held += bytes;
       return true;
     },
-    release(bytes: number) {
+    free(bytes: number) {
       this.held -= bytes;
     },
   };
@@ -307,6 +307,8 @@ describe("vector allocation", () => {
     );
     const negative = allocateData({ kind: "decimal", precision: 5, scale: -2 }, 1);
     expect(negative.layout === "decimal" && negative.scale).toBe(0);
+    const free = allocateData({ kind: "decimal", precision: null, scale: null }, 3);
+    expect(free.layout === "decimal" && free.scale === null && free.scales?.length).toBe(3);
     const flat = allocateFlat({ kind: "text" });
     expect(flat.data.layout === "varlen" && flat.data.offsets.length).toBe(BATCH_ROWS + 1);
     expect(newDictionaryId()).not.toBe(newDictionaryId());

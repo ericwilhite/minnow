@@ -23,11 +23,13 @@
  * - Decimal coefficients have three tiers: int64-family, 128-bit limbs (`Int128Values`, no
  *   allocation per value), and `bigint[]` (`WideCoefficients`, past 128 bits). Kernels widen before
  *   overflow and never narrow implicitly; spill pages keep the tier (exact round trip).
- * - Decimal scale (DECISIONS.md C2): coefficient × 10^−scale, `scale` ≥ 0 and uniform per vector;
- *   each value's display scale is ≤ `scale` (PostgreSQL display scales are never negative). A
- *   declared negative scale (NUMERIC(p, −s)) only rounds on write; stored scale is 0. Values of
- *   different display scales share the vector's maximum; rescaling that overflows a tier widens
- *   the tier ("mixed-scale fallback").
+ * - Decimal scale (DECISIONS.md C2): value = coefficient × 10^−s, where s is the vector's uniform
+ *   `scale`, or, when values differ (unconstrained NUMERIC), the slot's own entry in `scales`.
+ *   s is PostgreSQL's display scale (0 … 16,383, never negative): `1.50` is 150 at scale 2. A
+ *   declared negative scale (NUMERIC(p, −s)) only rounds on write; stored scale is 0. Coefficients
+ *   are never rescaled to a shared maximum, so one long fraction cannot inflate its neighbours;
+ *   kernels that combine scales partition by scale (exec: `sumDecimal`) and align once per
+ *   partition, not once per value.
  * - REAL (`f32`) is stored as Float32Array and computed in f64 with `Math.fround` at REAL type
  *   boundaries. Locators (`f64`) are vector/locator.ts.
  * - `varlen` strings are UTF-8 bytes. JS strings are made only when a value leaves the engine
@@ -112,14 +114,11 @@ export type VectorData =
   | { readonly layout: "int64"; readonly values: Int64Values }
   | {
       readonly layout: "decimal";
-      /** Every coefficient is scaled by 10^scale; scale ≥ 0. */
-      readonly scale: number;
+      /** The scale of every slot, or null when `scales` gives each slot its own. */
+      readonly scale: number | null;
+      /** Per-slot scales (when `scale` is null). */
+      readonly scales: Uint16Array | null;
       readonly coefficients: Int64Values | Int128Values | WideCoefficients;
-      /**
-       * PostgreSQL's per-value display scale (0 ≤ d ≤ `scale`), or null when every value displays
-       * at `scale` (always the case for a column declared NUMERIC(p, s) with s ≥ 0).
-       */
-      readonly displayScales: Uint16Array | null;
       /** `DecimalSpecial` per slot, or null when every value is finite. */
       readonly specials: Uint8Array | null;
     }
@@ -204,14 +203,16 @@ export function allocateData(type: PhysicalType, capacity: number, varlenBytes =
       return { layout, values: new Float32Array(capacity) };
     case "int64":
       return { layout, values: int64Values(capacity) };
-    case "decimal":
+    case "decimal": {
+      const declared = type.kind === "decimal" ? type.scale : null;
       return {
         layout,
-        scale: type.kind === "decimal" ? Math.max(0, type.scale ?? 0) : 0,
+        scale: declared === null ? null : Math.max(0, declared),
+        scales: declared === null ? new Uint16Array(capacity) : null,
         coefficients: int64Values(capacity),
-        displayScales: null,
         specials: null,
       };
+    }
     case "varlen":
       return { layout, bytes: new Uint8Array(varlenBytes), offsets: new Int32Array(capacity + 1) };
     case "fixed16":
@@ -236,8 +237,9 @@ export function dataBytes(type: PhysicalType, capacity: number, varlenBytes = 0)
       return capacity * 4;
     case "f64":
     case "int64":
-    case "decimal":
       return capacity * 8;
+    case "decimal":
+      return capacity * (type.kind === "decimal" && type.scale === null ? 10 : 8);
     case "varlen":
       return varlenBytes + (capacity + 1) * 4;
     case "fixed16":

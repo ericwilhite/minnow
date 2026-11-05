@@ -385,15 +385,22 @@ export class SimLease implements OwnerLease {
 /** A storage backend over a simulated disk, with either fence. */
 export class SimBackend implements StorageBackend {
   readonly locks: SimLocks;
+  readonly name: string;
+  readonly #openDelay: (() => Promise<void>) | null;
   readonly #leases = new WeakSet<SimLease>();
 
+  /**
+   * `openDelay` makes the fence open asynchronous, as `createSyncAccessHandle()` and an IndexedDB
+   * epoch transaction are: it runs before the files open.
+   */
   constructor(
     readonly disk: SimDisk,
     readonly fence: "handle" | "epoch" = "handle",
-    locks?: SimLocks,
-    readonly name = "minnow:db",
+    options: { locks?: SimLocks; name?: string; openDelay?: () => Promise<void> } = {},
   ) {
-    this.locks = locks ?? new SimLocks();
+    this.locks = options.locks ?? new SimLocks();
+    this.name = options.name ?? "minnow:db";
+    this.#openDelay = options.openDelay ?? null;
   }
 
   #openFiles(exclusive: boolean): FileSet {
@@ -413,12 +420,18 @@ export class SimBackend implements StorageBackend {
     const { lock, fence } = await acquireFenced(
       this.locks,
       this.name,
-      () => this.#openFiles(exclusive),
+      async () => {
+        if (this.#openDelay !== null) await this.#openDelay();
+        const files = this.#openFiles(exclusive);
+        // The epoch fence's durable bump (IndexedDB: one transaction); informational for handles.
+        return { files, epoch: ++this.disk.epoch };
+      },
+      ({ files }) => {
+        for (const file of [files.log, files.data, ...files.roots]) file.close();
+      },
       options,
     );
-    // The epoch fence's durable bump (IndexedDB: one transaction); informational for handles.
-    const epoch = ++this.disk.epoch;
-    const lease = new SimLease(this.disk, this.fence, lock, fence, epoch);
+    const lease = new SimLease(this.disk, this.fence, lock, fence.files, fence.epoch);
     this.#leases.add(lease);
     return lease;
   }

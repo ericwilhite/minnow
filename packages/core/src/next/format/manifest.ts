@@ -194,7 +194,10 @@ export interface IndexRoot {
 export interface RunRef {
   readonly level: number;
   readonly entryCount: number;
-  /** Sorted entries; memcomparable key bytes (DECISIONS.md C7). */
+  /**
+   * Sorted entries: equality-key bytes (keys/key-encoding.ts), scalar types only. Runs of an
+   * enum index are ordered by label bytes and serve equality lookups only (`indexKeyKind`).
+   */
   readonly entries: BlobRef;
   /** Every Nth key with its entry offset, for binary search without reading the run. */
   readonly fences: BlobRef;

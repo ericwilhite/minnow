@@ -196,6 +196,8 @@ export type Rel =
    * Late materialization (vector/locator.ts): appends `columns` of `tableId`, read through the
    * locator column `locator` of the input, to the input's columns. A null locator (an outer
    * join's null-extended row) yields nulls. Batched: one fetch reads each needed page once.
+   * Executed through the `RowFetcher` contract (exec/fetch.ts): dense output in active-row order,
+   * caller-owned buffers, partial completion on a full or denied varlen builder.
    */
   | (RelBase & {
       readonly op: "fetch";

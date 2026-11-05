@@ -17,18 +17,22 @@ type VarlenData = Extract<VectorData, { layout: "varlen" }>;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
-/** The slice of a memory grant a builder needs (memory/governor.ts `Grant` satisfies it). */
+/**
+ * The slice of a memory grant a builder needs (memory/governor.ts `Grant` satisfies it):
+ * allocation out of the grant's held bytes, growing a spillable grant for any shortfall.
+ */
 export interface ByteCharge {
-  tryGrow(bytes: number): boolean;
-  release(bytes: number): void;
+  allocate(bytes: number): boolean;
+  free(bytes: number): void;
 }
 
 /**
  * - `ok`: appended.
  * - `full`: not appended; the batch already holds rows and this value would pass the byte target.
  *   Emit the batch, `reset`, and append again.
- * - `denied`: not appended; the grant refused the growth. Spill or wait for memory
- *   (exec/pipeline.ts `blocked`), then append again.
+ * - `denied`: not appended; the grant could not supply the bytes. Spill, or borrow a progress
+ *   loan (memory/governor.ts rule 5, the pipeline returns `blocked` meanwhile), then append again:
+ *   the retry allocates from the loaned bytes.
  */
 export type AppendResult = "ok" | "full" | "denied";
 
@@ -53,9 +57,9 @@ export function utf8Length(value: string): number {
 /**
  * Builds varlen data row by row into buffers reused across batches, under a memory grant.
  *
- * - Every byte it holds is charged: the initial arena and offsets at construction (part of the
- *   operator's admitted minimum), and each growth before it happens, counting the old and new
- *   arenas together while the copy runs (growth overlap).
+ * - Every byte it holds is allocated from its grant: the initial arena and offsets at construction
+ *   (inside the operator's admitted minimum, so a non-spillable grant works), and each growth
+ *   before it happens, with the old and new arenas both allocated while the copy runs.
  * - A batch stops at `targetBytes` (`full`), except that one value larger than the target may fill
  *   an empty batch on its own if the grant admits it.
  * - `reset` starts the next batch; if an oversized value grew the arena past the target, it shrinks
@@ -79,7 +83,7 @@ export class VarlenBuilder {
     this.#charge = charge;
     this.#targetBytes = targetBytes;
     this.#initialBytes = Math.max(16, initialBytes);
-    if (!charge.tryGrow(this.#initialBytes + (capacityRows + 1) * 4))
+    if (!charge.allocate(this.#initialBytes + (capacityRows + 1) * 4))
       throw new RangeError("A varlen builder's minimum must be admitted before it is built");
     this.#bytes = new Uint8Array(this.#initialBytes);
     this.#offsets = new Int32Array(capacityRows + 1);
@@ -98,7 +102,7 @@ export class VarlenBuilder {
     this.#rows = 0;
     this.#used = 0;
     if (this.#bytes.length > Math.max(this.#targetBytes, this.#initialBytes)) {
-      this.#charge.release(this.#bytes.length - this.#initialBytes);
+      this.#charge.free(this.#bytes.length - this.#initialBytes);
       this.#bytes = new Uint8Array(this.#initialBytes);
     }
   }
@@ -114,10 +118,10 @@ export class VarlenBuilder {
       size = Math.min(size, Math.max(needed, this.#targetBytes));
     else size = needed;
     // Old and new arenas coexist during the copy: charge the new one in full first.
-    if (!this.#charge.tryGrow(size)) return "denied";
+    if (!this.#charge.allocate(size)) return "denied";
     const grown = new Uint8Array(size);
     grown.set(this.#bytes.subarray(0, this.#used));
-    this.#charge.release(this.#bytes.length);
+    this.#charge.free(this.#bytes.length);
     this.#bytes = grown;
     return "ok";
   }
@@ -154,6 +158,13 @@ export class VarlenBuilder {
     return "ok";
   }
 
+  /** Drops rows past `rows` (a partially filled slot after `full`/`denied`). */
+  truncate(rows: number): void {
+    if (rows < 0 || rows > this.#rows) throw new RangeError("Truncate outside the builder");
+    this.#rows = rows;
+    this.#used = this.#offsets[rows] ?? 0;
+  }
+
   /** The built data. Views alias the builder's buffers until the next `reset`. */
   data(): VarlenData {
     return {
@@ -165,7 +176,7 @@ export class VarlenBuilder {
 
   /** Returns everything to the grant. The builder is unusable afterwards. */
   close(): void {
-    this.#charge.release(this.retainedBytes);
+    this.#charge.free(this.retainedBytes);
     this.#bytes = new Uint8Array(0);
   }
 }

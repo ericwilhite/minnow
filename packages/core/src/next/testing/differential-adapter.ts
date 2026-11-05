@@ -102,14 +102,12 @@ export function oracleDomain(type: PhysicalType): SqlDomain | null {
   }
 }
 
-function decimalText(coefficient: bigint, scale: number, displayScale: number): string {
+function decimalText(coefficient: bigint, scale: number): string {
   const negative = coefficient < 0n;
-  let magnitude = negative ? -coefficient : coefficient;
-  if (displayScale < scale) magnitude /= 10n ** BigInt(scale - displayScale);
-  const digits = magnitude.toString().padStart(displayScale + 1, "0");
-  const split = digits.length - displayScale;
-  const text = displayScale === 0 ? digits : `${digits.slice(0, split)}.${digits.slice(split)}`;
-  return negative && magnitude !== 0n ? `-${text}` : text;
+  const digits = (negative ? -coefficient : coefficient).toString().padStart(scale + 1, "0");
+  const split = digits.length - scale;
+  const text = scale === 0 ? digits : `${digits.slice(0, split)}.${digits.slice(split)}`;
+  return negative ? `-${text}` : text;
 }
 
 function flatValue(vector: FlatVector, row: number): unknown {
@@ -153,7 +151,7 @@ function flatValue(vector: FlatVector, row: number): unknown {
           : coefficients.repr === "int128"
             ? int128At(coefficients.limbs, row)
             : int64At(coefficients, row);
-      return decimalText(coefficient, data.scale, data.displayScales?.[row] ?? data.scale);
+      return decimalText(coefficient, data.scale ?? data.scales?.[row] ?? 0);
     }
     case "varlen":
       if (vector.type.kind === "text" || vector.type.kind === "enum" || vector.type.kind === "json")

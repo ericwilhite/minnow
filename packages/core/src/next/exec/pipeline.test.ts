@@ -3,6 +3,8 @@
  * external-sort output, join fan-out, slow result consumer), plus retain-without-copy credits and
  * cancellation. Toy operators keep the logic visible; real operators follow the same shape.
  */
+import { setFlagsFromString } from "node:v8";
+import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { Governor, type Grant } from "../memory/governor.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
@@ -366,5 +368,53 @@ describe("pipeline push protocol", () => {
     await tick();
     expect(governor.usedBytes).toBe(0);
     expect(spill.bytesInUse).toBe(0);
+  });
+});
+
+describe("pipeline driver memory (review probe)", () => {
+  it("retains nothing per batch over a long stream, with or without a signal", async () => {
+    setFlagsFromString("--expose-gc");
+    const gc = runInNewContext("gc") as () => void;
+    const batch: Batch = { length: 1, columns: [], selection: null };
+    const sink: Operator = {
+      push: () => "ready",
+      ready: () => Promise.resolve(),
+      finish: () => Promise.resolve(),
+      abort: () => undefined,
+    };
+    for (const withSignal of [false, true]) {
+      const controller = new AbortController();
+      let listeners = 0;
+      const add = controller.signal.addEventListener.bind(controller.signal);
+      const remove = controller.signal.removeEventListener.bind(controller.signal);
+      controller.signal.addEventListener = ((...args: Parameters<typeof add>) => {
+        listeners += 1;
+        add(...args);
+      }) as typeof add;
+      controller.signal.removeEventListener = ((...args: Parameters<typeof remove>) => {
+        listeners -= 1;
+        remove(...args);
+      }) as typeof remove;
+      let produced = 0;
+      let growth = 0;
+      gc();
+      const before = process.memoryUsage().heapUsed;
+      await drive(
+        {
+          async next() {
+            if (produced++ < 100_000) return { batch };
+            gc();
+            growth = process.memoryUsage().heapUsed - before;
+            return null;
+          },
+          abort: () => undefined,
+        },
+        sink,
+        withSignal ? controller.signal : undefined,
+      );
+      // The reviewer measured +25.6 MB live heap for 100k batches before the fix.
+      expect(growth, `signal: ${String(withSignal)}`).toBeLessThan(2 * 1024 * 1024);
+      expect(listeners).toBe(0);
+    }
   });
 });

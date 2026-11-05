@@ -16,8 +16,8 @@ function int32Vector(values: number[]): FlatVector {
 
 function textVector(values: string[]): FlatVector {
   const builder = new VarlenBuilder(values.length, {
-    tryGrow: () => true,
-    release: () => undefined,
+    allocate: () => true,
+    free: () => undefined,
   });
   for (const value of values) builder.appendString(value);
   return {

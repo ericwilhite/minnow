@@ -13,22 +13,23 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 
 ## Module map
 
-| Module             | Owner track                      | What it is                                                                                                                     |
-| ------------------ | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `types.ts`         | contracts                        | Physical types; the one SQL → physical mapping; declared widths are mandatory                                                  |
-| `temporal.ts`      | contracts                        | DATE/TIMESTAMP on PostgreSQL's 2000 epoch; infinities; ISO text                                                                |
-| `hash/`            | contracts                        | xxHash32, the only checksum                                                                                                    |
-| `vector/`          | contracts → executor             | Batches (byte-bounded), vectors, validity, exact int64, int128 decimals, UTF-8 builder under a grant, locators                 |
-| `storage/`         | storage                          | Backend contract (lock + fence, async mutations), file store, simulated disk with crash model, conformance cases               |
-| `format/`          | format, write path               | Log frames and multipart transactions, header slots, recovery scan, replay rules, request ledger, key encoding, manifest types |
-| `spill/`           | executor (OPFS service: storage) | Spill contract (one long-lived file); in-memory double                                                                         |
-| `memory/`          | executor                         | Memory governor: admission, reserve, grow-or-spill (reference implementation)                                                  |
-| `exec/`            | executor                         | Push protocol and pipeline driver (`pipeline.ts`); kernels and operators to come                                               |
-| `ir/`              | lowering, executor               | Operator IR (`ir.ts`); the front-end boundary (`lowering.ts`)                                                                  |
-| `testing/`         | all                              | Differential-harness adapter for a partial new core                                                                            |
-| `write/` (to come) | write path + key index           | Group commit, memtables, key index runs, maintenance                                                                           |
-| `lower/` (to come) | planner lowering                 | `Lowerer`, cost model, statistics                                                                                              |
-| `owner/` (to come) | ownership                        | Web Lock election, client protocol, step-down, composition root                                                                |
+| Module             | Owner track                      | What it is                                                                                                                                                                                   |
+| ------------------ | -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `types.ts`         | contracts                        | Physical types; the one SQL → physical mapping; declared widths are mandatory                                                                                                                |
+| `temporal.ts`      | contracts                        | DATE/TIMESTAMP on PostgreSQL's 2000 epoch; infinities; ISO text                                                                                                                              |
+| `hash/`            | contracts                        | xxHash32, the only checksum                                                                                                                                                                  |
+| `vector/`          | contracts → executor             | Batches (byte-bounded), vectors, validity, exact int64, int128 decimals, UTF-8 builder under a grant, locators                                                                               |
+| `storage/`         | storage                          | Backend contract (lock + async fence open, async mutations), file store, simulated disk with crash model, the storage kit (conformance + durability sweep)                                   |
+| `keys/`            | contracts → executor, key index  | Memcomparable key encoding: reusable writer, batched encoder over vectors, indexable-type rules                                                                                              |
+| `format/`          | format, write path               | Log frames and multipart transactions, header slots, in-memory and incremental recovery scans, replay rules, request ledger, manifest types                                                  |
+| `spill/`           | executor (OPFS service: storage) | Spill contract (one long-lived file); in-memory double                                                                                                                                       |
+| `memory/`          | executor                         | Memory governor: admission, progress loans, held vs allocated bytes (reference implementation)                                                                                               |
+| `exec/`            | executor                         | Push protocol and driver (`pipeline.ts`), row fetcher (`fetch.ts`), array/JSONB comparators (`semantic.ts`), scale-partitioned decimal SUM (`decimal-sum.ts`); kernels and operators to come |
+| `ir/`              | lowering, executor               | Operator IR (`ir.ts`); the front-end boundary (`lowering.ts`)                                                                                                                                |
+| `testing/`         | all                              | Differential-harness adapter for a partial new core                                                                                                                                          |
+| `write/` (to come) | write path + key index           | Group commit, memtables, key index runs, maintenance                                                                                                                                         |
+| `lower/` (to come) | planner lowering                 | `Lowerer`, cost model, statistics                                                                                                                                                            |
+| `owner/` (to come) | ownership                        | Web Lock election, client protocol, step-down, composition root                                                                                                                              |
 
 ## Dependency rules
 
@@ -39,6 +40,7 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 
   ```text
   types/temporal ← vector ← memory ← exec
+  types, hash, vector ← keys ← exec, write
   hash ← storage ← format ← write
   hash ← spill ← exec;  vector ← ir ← lower
   owner ← everything;  testing ← everything
@@ -74,14 +76,21 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
   and `BigInt64Array` otherwise.
 - Decimals have three tiers: int64, then 128-bit limbs, then `bigint[]`. Kernels widen before
   overflow, and spill keeps the tier.
+- A decimal vector has one uniform scale, or a scale per slot when values differ. Coefficients are
+  never rescaled to a shared maximum; kernels partition by scale.
+- `VarlenBuilder` allocates from its grant's held bytes, stops at the batch byte target, admits one
+  oversized value alone, and can truncate a partly filled row.
 - Garbage under a null slot never raises an error.
 - Text stays UTF-8 until output.
 - A consumer borrows a batch until it signals readiness, or owns it under an explicit transfer.
 
 ### Storage (`storage/`)
 
-- Ownership comes first. Acquisition takes the Web Lock, then the backend's fence, with bounded
-  retry. If the fence stays busy, it fails with `OwnerUnresponsiveError`. There are two fences:
+- Ownership comes first. Acquisition takes the Web Lock, then opens the backend's fence, which may
+  be asynchronous (`createSyncAccessHandle` is), with bounded retry and the deadline enforced
+  during the open. If the fence stays busy, it fails with `OwnerUnresponsiveError`. A handle that
+  arrives late, or after the lock was stolen, is closed, and every failure releases the lock.
+  There are two fences:
   - OPFS: the sync handles themselves, held by one context at a time.
   - IndexedDB: a durable epoch record that every transaction checks.
 - Every mutation is async and checks ownership in the same step that applies its effect. A fenced
@@ -92,6 +101,8 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 - The log has a flush barrier and two header slots.
 - The simulated disk crashes at any physical step. Every write after the last flush may land
   whole, torn or not at all, and may land out of order. It models honest and lying flush.
+- A backend is accepted by the **storage kit** (`kit.ts`): the conformance cases together with a
+  physical durability sweep. A store that skips its data flush or its log flush fails the kit.
 
 ### Log, replay and ledger (`format/`)
 
@@ -99,20 +110,29 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
   index.
 - The acknowledged boundary must match a transaction end exactly: offset, chain and LSN.
 - Incomplete transactions are dropped, and recovery truncates the log before appending again.
-- DDL and sequence changes are frames, replayed in LSN order with the data.
+- Recovery scans incrementally: one frame in memory at a time, transactions handed to a sink that
+  stages their parts.
+- A transaction is an ordered list of effects: DDL, sequence reservations, row changes and a
+  request outcome, replayed in order. A table created by a transaction replays that
+  transaction's rows.
 - The root checkpoints global state at `globalLsn` and each table's rows at its own
   `flushedThroughLsn`.
-- Schema changes flush their table first, and replay checks schema versions.
+- A checkpoint that covers a schema change of a table also covers that table's rows through it,
+  and replay checks schema versions.
 - The log must reach every checkpoint the root claims.
 - A rolled-back root is detected through the log header's `rootSequence`.
 - Requests are exactly-once through a bounded per-client ledger of outcomes, with expiry enforced
   by the receiver.
 
-### Key encoding (`format/key-encoding.ts`)
+### Key encoding (`keys/key-encoding.ts`)
 
 - Memcomparable: byte order gives SQL order, and byte equality gives SQL equality.
-- Equality keys and sort keys are separate, because they differ for ENUM.
-- Frozen by golden vectors and generated consistency tests.
+- Equality keys (persisted) and sort keys (query time) are separate.
+- Persisted index keys are scalar types only. Indexes on arrays and JSON are refused at DDL; those
+  types sort and group through the semantic comparators in `exec/semantic.ts`.
+- An enum index is equality-only (its key is the label). ORDER BY enum uses the declaration rank.
+- Operators encode a whole batch straight from vectors into a reused buffer (`encodeKeyBatch`).
+- Frozen by golden vectors and generated tests over every encodable type.
 
 ### Manifest (`format/manifest.ts`)
 
@@ -132,9 +152,13 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 
 - One cap, which `usedBytes` never exceeds.
 - Pipelines are admitted with plan-bounded minimums. Admission waits; it is never refused.
+- A grant _holds_ bytes, and its operator _allocates_ buffers out of them, so a non-spillable
+  operator works inside its admitted minimum.
 - Growth is charged before it happens, including the overlap while a buffer is copied.
 - The page cache is evicted before anything spills.
-- Waits are served from a progress reserve.
+- Progress loans are scheduled before admissions and may use the reserve, so a queued admission
+  never blocks an admitted pipeline. A grant repays its loan before borrowing again.
+- The drain is not reentrant, a closed grant is inert, and abort listeners are removed.
 - The one size error is a single value larger than the reserve.
 
 ### Pipeline (`exec/pipeline.ts`)
@@ -144,13 +168,16 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
   Operators resume partly consumed batches themselves.
 - `finish` is async.
 - `abort` releases grants, spill files and transferred batches.
+- The driver adds no cancellation machinery without a signal, and with one each wait removes its
+  listener, so a long stream retains nothing per batch.
 - Each edge holds at most one in-flight batch, plus whatever credits the producer has handed out
   as transfers.
 
 ### IR (`ir/`)
 
 - Fully typed, positional and plain data. It is bound once, with parameter slots.
-- Late materialization uses `scan.emitLocator` and `fetch`.
+- Late materialization uses `scan.emitLocator` and `fetch`, executed through the `RowFetcher`
+  contract (`exec/fetch.ts`).
 - `apply` memoizes only when evaluation multiplicity is unobservable.
 - `lowering.ts` lists the front-end passes that are kept and the code that lowering replaces.
 

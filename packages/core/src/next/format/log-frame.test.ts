@@ -7,6 +7,7 @@ import {
   frameLength,
   newestLogHeader,
   scanLog,
+  scanLogIncremental,
   type LogHeader,
 } from "./log-frame.js";
 
@@ -238,5 +239,76 @@ describe("log header slots and the acknowledged boundary", () => {
       LogCorruptionError,
     );
     expect(scanLog(new Uint8Array(0), [incarnation(4), null], INCARNATION).frames).toEqual([]);
+  });
+});
+
+describe("incremental recovery scan (review A1-2 finding 10)", () => {
+  it("scans a log far larger than its memory cap, one frame at a time, with the same result", async () => {
+    const CAP = 64 * 1024;
+    // ~2.4 MB of log: 300 transactions of 1–3 parts, 8 KiB bodies, then an abandoned tail part.
+    const counts = Array.from({ length: 300 }, (_, i) => 1 + (i % 3));
+    const frames = transactions([...counts, 2], SALT, 1, 8 * 1024);
+    const bytes = concat(frames.slice(0, -1).map((f) => f.bytes));
+    expect(bytes.length).toBeGreaterThan(30 * CAP);
+    let largestRead = 0;
+    let totalRead = 0;
+    const reader = {
+      length: bytes.length,
+      read: async (offset: number, length: number) => {
+        largestRead = Math.max(largestRead, length);
+        totalRead += length;
+        return bytes.slice(offset, offset + length);
+      },
+    };
+    const committed: Array<{ transaction: number; lsns: number[]; checksum: number }> = [];
+    let staged: Array<{ lsn: number; body: Uint8Array }> = [];
+    let abandoned = 0;
+    const summary = await scanLogIncremental(reader, [null, null], INCARNATION, {
+      part(frame) {
+        staged.push({ lsn: frame.lsn, body: frame.body.slice() });
+      },
+      commit(transaction) {
+        committed.push({
+          transaction,
+          lsns: staged.map((part) => part.lsn),
+          checksum: staged.reduce(
+            (sum, part) => (sum + (part.body[0] ?? 0) + part.body.length) | 0,
+            0,
+          ),
+        });
+        staged = [];
+      },
+      abandon(parts) {
+        abandoned = parts;
+        staged = [];
+      },
+    });
+    const whole = scanLog(bytes, [null, null], INCARNATION);
+    expect(largestRead).toBeLessThanOrEqual(CAP);
+    expect(totalRead).toBeLessThan(bytes.length + 64 * frames.length);
+    expect(committed.length).toBe(300);
+    expect(committed.flatMap((t) => t.lsns)).toEqual(whole.frames.map((f) => f.lsn));
+    expect(abandoned).toBe(1);
+    expect(summary).toEqual({
+      validEnd: whole.validEnd,
+      chain: whole.chain,
+      lastLsn: whole.lastLsn,
+      abandonedParts: whole.abandonedParts,
+      header: whole.header,
+    });
+  });
+
+  it("enforces the same boundary rules as the in-memory scan", async () => {
+    const frames = transactions([1, 1]);
+    const bytes = concat(frames.map((f) => f.bytes));
+    const reader = {
+      length: bytes.length,
+      read: async (o: number, l: number) => bytes.slice(o, o + l),
+    };
+    const sink = { part: () => undefined, commit: () => undefined, abandon: () => undefined };
+    const missing = header({ ackEnd: bytes.length + 40, ackChain: 1, ackLsn: 3 });
+    await expect(scanLogIncremental(reader, [missing, null], INCARNATION, sink)).rejects.toThrow(
+      LogCorruptionError,
+    );
   });
 });

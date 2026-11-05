@@ -5,7 +5,7 @@
  * (2026-11-05): the lock frees 2 ms–2 s before the handle of a dead owner, and a lock steal does
  * not free a live owner's handle.
  */
-import { OwnerUnresponsiveError, isBusyError } from "./contract.js";
+import { OwnerUnresponsiveError, OwnershipLostError, isBusyError } from "./contract.js";
 
 /** The slice of the Web Locks API ownership needs (`navigator.locks` adapts to it). */
 export interface LockManagerLike {
@@ -27,17 +27,54 @@ export const DEFAULT_ACQUIRE_TIMEOUT_MS = 5_000;
 const FIRST_RETRY_MS = 1;
 const MAX_RETRY_MS = 100;
 
+/** Re-reads the lock's state after an await (the open may have taken a while). */
+const stolen = (lock: HeldLock): boolean => lock.lost.aborted;
+
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+type Outcome<T> =
+  | { readonly kind: "opened"; readonly fence: T }
+  | { readonly kind: "failed"; readonly error: unknown }
+  | { readonly kind: "deadline" };
+
+/** Settles with the open's outcome, or `deadline` after `ms` (the open keeps running). */
+function withDeadline<T>(attempt: Promise<T>, ms: number): Promise<Outcome<T>> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(
+      () => {
+        resolve({ kind: "deadline" });
+      },
+      Math.max(0, ms),
+    );
+    attempt.then(
+      (fence) => {
+        clearTimeout(timer);
+        resolve({ kind: "opened", fence });
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        resolve({ kind: "failed", error });
+      },
+    );
+  });
+}
+
 /**
- * Takes the lock, then calls `openFence` until it stops throwing a busy error (`isBusyError`),
- * backing off from 1 ms to 100 ms, for at most `timeoutMs` in total. Any other error, or the
- * timeout, releases the lock and rejects (the timeout as `OwnerUnresponsiveError`).
+ * Takes the lock, then opens the backend fence until it stops failing busy (`isBusyError`),
+ * backing off from 1 ms to 100 ms, all within `timeoutMs`.
+ *
+ * - `openFence` may be synchronous or return a promise (`createSyncAccessHandle` does; so does an
+ *   IndexedDB epoch bump). The deadline applies while it is pending: if it passes, acquisition
+ *   fails with `OwnerUnresponsiveError` and the fence, if it opens later, is closed at once.
+ * - If the lock is stolen while the fence opens, the opened fence is closed and acquisition fails
+ *   with `OwnershipLostError`: a newer owner is acquiring.
+ * - Every failure releases the lock; a non-busy error is rethrown.
  */
 export async function acquireFenced<T>(
   locks: LockManagerLike,
   name: string,
-  openFence: () => T,
+  openFence: () => T | Promise<T>,
+  closeFence: (fence: T) => void,
   options: { steal?: boolean; timeoutMs?: number } = {},
 ): Promise<{ readonly lock: HeldLock; readonly fence: T }> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_ACQUIRE_TIMEOUT_MS;
@@ -60,15 +97,26 @@ export async function acquireFenced<T>(
   }
   let delay = FIRST_RETRY_MS;
   for (;;) {
-    // Stolen while we waited for the fence: someone newer is acquiring; step aside.
-    if (lock.lost.aborted) throw new OwnerUnresponsiveError(timeoutMs);
-    try {
-      return { lock, fence: openFence() };
-    } catch (error) {
-      if (!isBusyError(error) || Date.now() + delay > deadline) {
-        lock.release();
-        throw isBusyError(error) ? new OwnerUnresponsiveError(timeoutMs) : error;
-      }
+    if (lock.lost.aborted) {
+      lock.release();
+      throw new OwnershipLostError(0);
+    }
+    const attempt = Promise.resolve().then(openFence);
+    const outcome = await withDeadline(attempt, deadline - Date.now());
+    if (outcome.kind === "deadline") {
+      attempt.then(closeFence, () => undefined);
+      lock.release();
+      throw new OwnerUnresponsiveError(timeoutMs);
+    }
+    if (outcome.kind === "opened") {
+      if (!stolen(lock)) return { lock, fence: outcome.fence };
+      closeFence(outcome.fence);
+      lock.release();
+      throw new OwnershipLostError(0);
+    }
+    if (!isBusyError(outcome.error) || Date.now() + delay > deadline) {
+      lock.release();
+      throw isBusyError(outcome.error) ? new OwnerUnresponsiveError(timeoutMs) : outcome.error;
     }
     await sleep(delay);
     delay = Math.min(delay * 2, MAX_RETRY_MS);

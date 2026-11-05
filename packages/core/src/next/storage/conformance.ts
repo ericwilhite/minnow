@@ -1,8 +1,9 @@
 /**
  * The conformance cases every `StorageBackend` must pass (simulated here with both fences; OPFS
  * and IndexedDB in the storage track, in Node and in real browsers). Plain assertions, no test
- * framework, so browser suites can run them. Crash behaviour needs a physical model and lives
- * with each backend (sim-disk.ts for the simulated one).
+ * framework, so browser suites can run them. Conformance alone is not durability evidence: the
+ * storage kit (kit.ts) runs these cases together with a physical crash sweep, and a backend is
+ * accepted only by the kit.
  */
 import {
   DATA_ALIGN,

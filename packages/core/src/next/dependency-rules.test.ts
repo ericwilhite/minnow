@@ -24,13 +24,15 @@ const ALLOWED: Readonly<Record<string, readonly string[]>> = {
   format: [".", "hash", "storage"],
   spill: ["hash"],
   memory: ["vector"],
+  keys: [".", "hash", "vector"],
   ir: [".", "vector"],
   // Tracks (not written yet) — their layer, fixed now:
-  exec: [".", "hash", "vector", "ir", "memory", "spill"],
-  write: [".", "hash", "vector", "storage", "format", "memory"],
+  exec: [".", "hash", "vector", "keys", "ir", "memory", "spill"],
+  write: [".", "hash", "vector", "keys", "storage", "format", "memory"],
   lower: [".", "ir", "vector"],
   owner: [
     ".",
+    "keys",
     "hash",
     "vector",
     "storage",
@@ -44,6 +46,7 @@ const ALLOWED: Readonly<Record<string, readonly string[]>> = {
   ],
   testing: [
     ".",
+    "keys",
     "hash",
     "vector",
     "storage",
