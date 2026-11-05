@@ -12,7 +12,8 @@
  *   is held to `PROTECTED_SHARE` of resident bytes (its least recently used entries are demoted to
  *   probation). Eviction takes probation's least recently used first. A miss that cannot be
  *   charged evicts probation (never protected) to make room, so a one-pass scan recycles
- *   probation and leaves hot directories, roots and fences alone.
+ *   probation and leaves hot directories, roots and fences alone. `oldestUnusedAt` is when the
+ *   next victim was last used, so the governor can evict across caches oldest first.
  * - **Misses** of one call are planned into slabs (slabs.ts), read one slab at a time into the
  *   shared 1 MiB read slab (serialized: the slab is one buffer), verified and copied out.
  * - **Reentrancy.** The governor may call `evict` from inside any charge or release this class
@@ -54,6 +55,8 @@ interface Entry {
   dropped: boolean;
   /** Used again after its first read: admitted to protected when it unpins. */
   hot: boolean;
+  /** When it was last used: listed after a release, or peeked (`performance.now()`). */
+  usedAt: number;
   prev: Entry | null;
   next: Entry | null;
 }
@@ -176,6 +179,11 @@ export class PageCache implements EvictableCacheLike {
     );
   }
 
+  /** When the entry `evict` takes next was last used (the governor's cross-cache order). */
+  get oldestUnusedAt(): number | undefined {
+    return (this.#probation.tail ?? this.#protected.tail)?.usedAt;
+  }
+
   evict(bytes: number): number {
     let freed = 0;
     while (freed < bytes) {
@@ -193,6 +201,7 @@ export class PageCache implements EvictableCacheLike {
     if (entry === null) return null;
     this.#hits += 1;
     entry.hot = true;
+    entry.usedAt = performance.now();
     this.#touch(entry);
     return entry.bytes;
   }
@@ -347,6 +356,7 @@ export class PageCache implements EvictableCacheLike {
       segment: "pinned",
       dropped: false,
       hot: false,
+      usedAt: 0,
       prev: null,
       next: null,
     };
@@ -373,6 +383,7 @@ export class PageCache implements EvictableCacheLike {
       segment: "pinned",
       dropped: true,
       hot: false,
+      usedAt: 0,
       prev: null,
       next: null,
     };
@@ -409,6 +420,7 @@ export class PageCache implements EvictableCacheLike {
       return;
     }
     entry.segment = "probation";
+    entry.usedAt = performance.now();
     this.#probation.pushFront(entry);
     if (entry.hot) this.#touch(entry);
   }

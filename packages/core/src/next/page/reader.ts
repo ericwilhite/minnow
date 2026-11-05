@@ -50,7 +50,12 @@ import {
   type PageDictionary,
   type PageView,
 } from "./decode.js";
-import { pageIndexOf, parseDirectory, type ChunkDirectory } from "./directory.js";
+import {
+  checkDirectoryWithin,
+  pageIndexOf,
+  parseDirectory,
+  type ChunkDirectory,
+} from "./directory.js";
 import { check, chunkTagOf, PageCorruptionError, ValueTag } from "./format.js";
 import { inflatedLength, inflateInto } from "./gzip.js";
 import type { InflatedPageCache } from "./inflated-cache.js";
@@ -214,10 +219,19 @@ export class ChunkReader {
     const hit = cache?.pin(ref) ?? null;
     if (cache !== undefined && hit !== null) {
       // Cached and parsed already: charged to this reader while it holds it, unpinned at close.
-      if (hit.value.tag !== chunkTagOf(chunk.type) || !options.budget.allocate(hit.size)) {
+      try {
+        check(
+          hit.value.tag === chunkTagOf(chunk.type),
+          "Page directory tag differs from the column type",
+        );
+        // The entry was parsed for whichever chunk read it first (review B2-p2a #1).
+        checkDirectoryWithin(hit.value, chunk.data.length);
+      } catch (error) {
         cache.unpin(ref);
-        if (hit.value.tag !== chunkTagOf(chunk.type))
-          throw new PageCorruptionError("Page directory tag differs from the column type");
+        throw error;
+      }
+      if (!options.budget.allocate(hit.size)) {
+        cache.unpin(ref);
         throw new PageBudgetError(hit.size);
       }
       return new ChunkReader(space, chunk, hit.value, options, hit.size, ref);

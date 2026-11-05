@@ -23,6 +23,15 @@
  * order. A flush rewrites only the last page and the index (`writeGroupDirectory` with `keep`), so
  * a table's metadata write is O(page), and no group count is limited by the 1 MiB blob cap (about
  * 15,000 pages of 4,096 groups). A table with no groups has a zero-length `groups` reference.
+ * The index itself is rewritten on every flush and grows by one entry (~30 bytes) per page, so
+ * the per-flush rewrite is one page (≤ ~115 KB) plus O(pages); a two-level index can bound it if
+ * tables ever reach thousands of pages.
+ *
+ * ## Canonical decoding (review B2-p2a #7)
+ * One value has one encoding, and decoders refuse every other: extent and type tables hold no
+ * duplicate, every entry is used, and entries are first used in table order; integers and
+ * bigints are minimal; ledger counts are in key order (`<` on UTF-16 code units). A blob over
+ * its cap is refused before it is charged.
  */
 import { MAX_BLOB_BYTES } from "../storage/extents.js";
 import type { ByteBudget, ExtentWriter } from "../storage/extents.js";
@@ -83,7 +92,13 @@ function charged<T>(
   bytes: Uint8Array,
   budget: ByteBudget,
   parse: (reader: ByteReader) => T,
+  cap: number = MAX_BLOB_BYTES,
 ): Parsed<T> {
+  // Over its cap, a blob is refused before anything is charged or parsed (review B2-p2a #5).
+  if (bytes.length > cap)
+    throw new ManifestCorruptionError(
+      `A manifest blob of ${String(bytes.length)} bytes passes its ${String(cap)}-byte cap`,
+    );
   const charge = parseCharge(bytes.length);
   if (!budget.allocate(charge)) throw new ParseBudgetError(charge);
   try {
@@ -158,8 +173,14 @@ class RefWriter {
   }
 }
 
+/**
+ * Reads the extent table and references against it. Canonical (review B2-p2a #7): the table has
+ * no duplicate extents, its entries are first referenced in table order (what `RefWriter`
+ * writes), and every entry is referenced (`end`).
+ */
 class RefReader {
   readonly extents: ExtentRef[] = [];
+  #nextNew = 0;
   constructor(
     readonly bytes: ByteReader,
     magic: number,
@@ -168,17 +189,33 @@ class RefReader {
     valid(bytes.u32() === magic, `Not a ${what}`);
     valid(bytes.u8() === VERSION, `Unknown ${what} version`);
     const count = bytes.count(2);
+    const seen = new Set<string>();
     for (let k = 0; k < count; k++) {
       const offset = bytes.uint();
       const length = bytes.uint();
+      const key = `${String(offset)}:${String(length)}`;
+      valid(!seen.has(key), "An extent appears twice in an extent table");
+      seen.add(key);
       this.extents.push({ offset, length });
     }
   }
 
-  data(): ChunkData {
+  #extent(): ExtentRef {
     const index = this.bytes.uint();
     const extent = this.extents[index];
     valid(extent !== undefined, "Reference to an unknown extent");
+    valid(index <= this.#nextNew, "Extent table entries are not in first-use order");
+    if (index === this.#nextNew) this.#nextNew++;
+    return extent;
+  }
+
+  /** Every table entry was referenced. */
+  end(): void {
+    valid(this.#nextNew === this.extents.length, "An extent table entry is never referenced");
+  }
+
+  data(): ChunkData {
+    const extent = this.#extent();
     const offset = this.bytes.uint();
     const length = this.bytes.uint();
     valid(offset + length <= extent.length, "A reference lies outside its extent");
@@ -186,9 +223,7 @@ class RefReader {
   }
 
   blob(): BlobRef {
-    const index = this.bytes.uint();
-    const extent = this.extents[index];
-    valid(extent !== undefined, "Reference to an unknown extent");
+    const extent = this.#extent();
     const offset = this.bytes.uint();
     const length = this.bytes.uint();
     valid(offset + length <= extent.length, "A reference lies outside its extent");
@@ -345,7 +380,28 @@ function readStatistics(reader: ByteReader): ColumnStatistics {
 
 // ── Group root ─────────────────────────────────────────────────────────────────────────────────
 
-const typeKey = (type: PhysicalType): string => JSON.stringify(type);
+/**
+ * A type's identity: exactly the fields its encoding writes (`writeType`), so key order or extra
+ * properties cannot split one type into two table entries.
+ */
+function typeKey(type: PhysicalType): string {
+  switch (type.kind) {
+    case "int32":
+      return `int32:${String(type.bits)}`;
+    case "decimal":
+      return `decimal:${String(type.precision)}:${String(type.scale)}`;
+    case "timestamp":
+      return type.zoned ? "timestamp:z" : "timestamp";
+    case "json":
+      return type.binary ? "json:b" : "json";
+    case "enum":
+      return `enum:${JSON.stringify([type.name, type.labels])}`;
+    case "array":
+      return `array:${typeKey(type.element)}`;
+    default:
+      return type.kind;
+  }
+}
 
 /** A group root's bytes (≤ `MAX_BLOB_BYTES`; about 1,600 columns fit even with long bounds). */
 export function encodeGroupRoot(root: GroupRoot): Uint8Array {
@@ -392,7 +448,16 @@ export function decodeGroupRoot(bytes: Uint8Array, budget: ByteBudget): Parsed<G
       rowIdKind === 0 ? { kind: "dense" } : { kind: "column", ref: refs.blob() };
     const typeCount = reader.count(1);
     const types: PhysicalType[] = [];
-    for (let k = 0; k < typeCount; k++) types.push(readType(reader));
+    // Canonical like the extent table: distinct types, first used in table order, all used.
+    const typeKeys = new Set<string>();
+    for (let k = 0; k < typeCount; k++) {
+      const type = readType(reader);
+      const key = typeKey(type);
+      valid(!typeKeys.has(key), "A type appears twice in a group root's type table");
+      typeKeys.add(key);
+      types.push(type);
+    }
+    let nextType = 0;
     const count = reader.count(8);
     const columns: ColumnChunk[] = [];
     const seen = new Set<number>();
@@ -400,8 +465,11 @@ export function decodeGroupRoot(bytes: Uint8Array, budget: ByteBudget): Parsed<G
       const columnId = reader.uint();
       valid(!seen.has(columnId), "A column appears twice in a group root");
       seen.add(columnId);
-      const type = types[reader.uint()];
+      const typeAt = reader.uint();
+      const type = types[typeAt];
       valid(type !== undefined, "Reference to an unknown column type");
+      valid(typeAt <= nextType, "Type table entries are not in first-use order");
+      if (typeAt === nextType) nextType++;
       const data = refs.data();
       const directory = refs.blob();
       const statistics = readStatistics(reader);
@@ -409,6 +477,8 @@ export function decodeGroupRoot(bytes: Uint8Array, budget: ByteBudget): Parsed<G
       const distinctSketch = refs.optionalBlob();
       columns.push({ columnId, type, data, directory, statistics, distinctSketch });
     }
+    valid(nextType === types.length, "A type table entry is never used");
+    refs.end();
     return { rowCount, rowIds, columns };
   });
 }
@@ -483,6 +553,7 @@ export function decodeGroupPage(bytes: Uint8Array, budget: ByteBudget): Parsed<G
       groups.push({ groupId, firstRowId, lastRowId, rowCount, liveRowCount, root, deletions });
     }
     checkGroups(groups, 0);
+    refs.end();
     return groups;
   });
 }
@@ -530,6 +601,7 @@ export function decodeGroupIndex(bytes: Uint8Array, budget: ByteBudget): Parsed<
       previous = lastRowId;
       pages.push({ ref, firstRowId, lastRowId, groupCount, rowCount, liveRowCount });
     }
+    refs.end();
     return pages;
   });
 }
@@ -727,7 +799,8 @@ function writeClient(out: ByteWriter, client: ClientLedgerEntry): void {
   for (const outcome of client.outcomes) {
     out.uint(outcome.sequence);
     out.uint(outcome.lsn);
-    const counts = Object.entries(outcome.counts);
+    // Sorted by key (UTF-16 code units): the canonical order, so a decoder can see duplicates.
+    const counts = Object.entries(outcome.counts).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
     out.uint(counts.length);
     for (const [key, value] of counts) {
       out.string(key);
@@ -746,10 +819,13 @@ function readClient(reader: ByteReader): ClientLedgerEntry {
     const sequence = reader.uint();
     const lsn = reader.uint();
     const countCount = reader.count(9);
-    const counts: Record<string, number> = {};
+    // A null-prototype map: "__proto__" is a key like any other (review B2-p2a #4).
+    const counts = Object.create(null) as Record<string, number>;
+    let previous: string | null = null;
     for (let c = 0; c < countCount; c++) {
       const key = reader.string();
-      valid(!Object.hasOwn(counts, key), "A ledger count appears twice");
+      valid(previous === null || key > previous, "Ledger counts are duplicated or out of order");
+      previous = key;
       counts[key] = reader.f64();
     }
     outcomes.push({ sequence, lsn, counts, recordedAtMs: reader.f64() });
@@ -784,48 +860,54 @@ export function encodeManifestRoot(root: ManifestRoot): Uint8Array {
 }
 
 export function decodeManifestRoot(bytes: Uint8Array, budget: ByteBudget): Parsed<ManifestRoot> {
-  return charged(bytes, budget, (reader) => {
-    const refs = new RefReader(reader, MAGIC.root, "manifest root");
-    const formatVersion = reader.uint();
-    valid(
-      formatVersion >= 1 && formatVersion <= MANIFEST_FORMAT_VERSION,
-      `Manifest format ${String(formatVersion)} is newer than this build reads`,
-    );
-    const sequence = reader.uint();
-    const epoch = reader.uint();
-    const log = { salt: reader.u32(), firstLsn: reader.uint(), rootSequence: reader.uint() };
-    const globalLsn = reader.uint();
-    const catalogVersion = reader.uint();
-    const catalog = refs.blob();
-    const nextTableId = reader.uint();
-    const sequenceCount = reader.count(2);
-    const sequences: Array<ManifestRoot["sequences"][number]> = [];
-    for (let k = 0; k < sequenceCount; k++)
-      sequences.push({ sequenceId: reader.uint(), reservedThrough: reader.bigint() });
-    const tableCount = reader.count(16);
-    const tables: TableRoot[] = [];
-    const tableIds = new Set<number>();
-    for (let k = 0; k < tableCount; k++) {
-      const table = readTable(refs);
-      valid(!tableIds.has(table.tableId), "A table appears twice in the root");
-      tableIds.add(table.tableId);
-      tables.push(table);
-    }
-    const clientCount = reader.count(3);
-    const clients: ClientLedgerEntry[] = [];
-    for (let k = 0; k < clientCount; k++) clients.push(readClient(reader));
-    return {
-      formatVersion,
-      sequence,
-      epoch,
-      log,
-      globalLsn,
-      catalogVersion,
-      catalog,
-      nextTableId,
-      sequences,
-      tables,
-      clients,
-    };
-  });
+  return charged(
+    bytes,
+    budget,
+    (reader) => {
+      const refs = new RefReader(reader, MAGIC.root, "manifest root");
+      const formatVersion = reader.uint();
+      valid(
+        formatVersion >= 1 && formatVersion <= MANIFEST_FORMAT_VERSION,
+        `Manifest format ${String(formatVersion)} is newer than this build reads`,
+      );
+      const sequence = reader.uint();
+      const epoch = reader.uint();
+      const log = { salt: reader.u32(), firstLsn: reader.uint(), rootSequence: reader.uint() };
+      const globalLsn = reader.uint();
+      const catalogVersion = reader.uint();
+      const catalog = refs.blob();
+      const nextTableId = reader.uint();
+      const sequenceCount = reader.count(2);
+      const sequences: Array<ManifestRoot["sequences"][number]> = [];
+      for (let k = 0; k < sequenceCount; k++)
+        sequences.push({ sequenceId: reader.uint(), reservedThrough: reader.bigint() });
+      const tableCount = reader.count(16);
+      const tables: TableRoot[] = [];
+      const tableIds = new Set<number>();
+      for (let k = 0; k < tableCount; k++) {
+        const table = readTable(refs);
+        valid(!tableIds.has(table.tableId), "A table appears twice in the root");
+        tableIds.add(table.tableId);
+        tables.push(table);
+      }
+      const clientCount = reader.count(3);
+      const clients: ClientLedgerEntry[] = [];
+      for (let k = 0; k < clientCount; k++) clients.push(readClient(reader));
+      refs.end();
+      return {
+        formatVersion,
+        sequence,
+        epoch,
+        log,
+        globalLsn,
+        catalogVersion,
+        catalog,
+        nextTableId,
+        sequences,
+        tables,
+        clients,
+      };
+    },
+    MAX_ROOT_BYTES,
+  );
 }

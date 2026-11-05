@@ -111,13 +111,15 @@ export interface TableRoot {
   readonly tableId: number;
   /** The schema version its groups were written under (replay checks frames against it). */
   readonly schemaVersion: number;
-  /** The next row id this table allocates (row ids start at 1). */
+  /** The next row id this table allocates (row ids start at 1): past every row id it holds. */
   readonly nextRowId: number;
   /** Every frame of this table with LSN ≤ this is in `groups`. */
   readonly flushedThroughLsn: number;
+  /** Σ `GroupRef.liveRowCount` over `groups` (staged rows are not counted). */
   readonly liveRowCount: number;
   /** → GroupRef[] in row-id order. */
   readonly groups: BlobRef;
+  /** Groups in `groups`. The reachability walk checks both totals against the directory. */
   readonly groupCount: number;
   /**
    * Large transactions' rows published but not yet visible (replay.ts "Large transactions"): each
@@ -126,7 +128,9 @@ export interface TableRoot {
    */
   readonly staged: ReadonlyArray<{
     readonly transaction: number;
+    /** No staged group starts before it. */
     readonly firstRowId: number;
+    /** Σ `GroupRef.rowCount` over `groups`. */
     readonly rowCount: number;
     /** → GroupRef[] of the staged rows. */
     readonly groups: BlobRef;

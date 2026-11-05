@@ -278,6 +278,31 @@ export function encodeDirectory(directory: ChunkDirectory): Uint8Array {
   return writer.bytes.slice(0, writer.length);
 }
 
+/** Where each parsed directory's last page (or dictionary) ends: computed once, at parse. */
+const extentEnds = new WeakMap<ChunkDirectory, number>();
+
+function endOf(directory: ChunkDirectory): number {
+  let end =
+    directory.dictionary === null ? 0 : directory.dictionary.offset + directory.dictionary.length;
+  for (const page of directory.pages) end = Math.max(end, page.offset + page.length);
+  return end;
+}
+
+/**
+ * Throws unless every page and the dictionary of `directory` lie inside a chunk of
+ * `extentLength` bytes. A directory parsed for one chunk is checked again when another chunk
+ * references it from a cache (review B2-p2a #1); O(1) after the parse. Page lengths are
+ * positive whichever chunk references it (`parseDirectory` checks that).
+ */
+export function checkDirectoryWithin(directory: ChunkDirectory, extentLength: number): void {
+  let end = extentEnds.get(directory);
+  if (end === undefined) {
+    end = endOf(directory);
+    extentEnds.set(directory, end);
+  }
+  check(end <= extentLength, "Page outside its chunk's extent");
+}
+
 /**
  * Parses a directory blob (already verified against its `BlobRef` checksum). `extentLength` is
  * the chunk's extent length: every page must lie inside it.
@@ -369,7 +394,17 @@ export function parseDirectory(bytes: Uint8Array, extentLength: number): ChunkDi
   let sketch: Uint8Array | null = null;
   if ((flags & 2) !== 0) sketch = reader.raw(reader.u32());
   check(reader.at === bytes.length, "Page directory has trailing bytes");
-  return { tag, rowCount, scale, hasSpecials: (flags & 4) !== 0, pages, dictionary, sketch };
+  const directory = {
+    tag,
+    rowCount,
+    scale,
+    hasSpecials: (flags & 4) !== 0,
+    pages,
+    dictionary,
+    sketch,
+  };
+  extentEnds.set(directory, endOf(directory));
+  return directory;
 }
 
 /** The index of the page holding `row` (binary search over first rows). */

@@ -9,8 +9,9 @@
  *   and it cannot be evicted.
  * - When the last holder lets go, the cache charges the entry through its governor handle
  *   (`CacheMemory.charge`); if the governor has no room, the entry is dropped.
- * - Unpinned entries are evictable (`EvictableCacheLike`), least recently used first; the
- *   governor evicts them before any grant grows or any operator spills.
+ * - Unpinned entries are evictable (`EvictableCacheLike`), least recently released first; the
+ *   governor evicts them before any grant grows or any operator spills, across every registered
+ *   cache by `oldestUnusedAt` (memory/governor.ts rule 6).
  * One holder may pin an entry several times; each `pin` or `admit` is undone by one `unpin`.
  */
 import {
@@ -26,6 +27,8 @@ interface Entry<T> {
   pins: number;
   /** Charged to the cache (only while unpinned). */
   charged: boolean;
+  /** When its last holder let go (`performance.now()`). */
+  usedAt: number;
 }
 
 /** A pinned cache entry: its value and the bytes its holder must have charged. */
@@ -39,8 +42,9 @@ export const blobKey = (ref: BlobRef): string =>
 
 export class BlobCache<T> implements EvictableCacheLike {
   readonly #memory: CacheMemory;
-  /** Insertion order is recency order (an entry is re-inserted when used). */
   readonly #entries = new Map<string, Entry<T>>();
+  /** The unpinned (charged, evictable) entries; insertion order is release order. */
+  readonly #unpinned = new Map<string, Entry<T>>();
   #evictable = 0;
   #resident = 0;
   hits = 0;
@@ -64,17 +68,24 @@ export class BlobCache<T> implements EvictableCacheLike {
     return this.#entries.size;
   }
 
+  /** When the entry `evict` takes next was released (the governor's cross-cache order). */
+  get oldestUnusedAt(): number | undefined {
+    for (const entry of this.#unpinned.values()) return entry.usedAt;
+    return undefined;
+  }
+
   evict(bytes: number): number {
     let freed = 0;
-    for (const [key, entry] of this.#entries) {
+    for (const [key, entry] of this.#unpinned) {
       if (freed >= bytes) break;
-      if (entry.pins > 0) continue;
+      this.#unpinned.delete(key);
       this.#entries.delete(key);
       this.#resident -= entry.size;
-      // Unpinned entries are always charged (unpin drops the ones the governor refused).
-      this.#memory.release(entry.size);
       this.#evictable -= entry.size;
       freed += entry.size;
+      // Unpinned entries are always charged (unpin drops the ones the governor refused). Released
+      // last: the governor may call back into `evict`, which then sees a consistent cache.
+      this.#memory.release(entry.size);
     }
     return freed;
   }
@@ -88,14 +99,18 @@ export class BlobCache<T> implements EvictableCacheLike {
       return null;
     }
     this.hits++;
+    this.#take(key, entry);
+    return { value: entry.value, size: entry.size };
+  }
+
+  /** One more pin; the first takes the entry off the evictable list and out of the cache's charge. */
+  #take(key: string, entry: Entry<T>): void {
     if (entry.pins++ === 0 && entry.charged) {
       entry.charged = false;
+      this.#unpinned.delete(key);
       this.#evictable -= entry.size;
       this.#memory.release(entry.size);
     }
-    this.#entries.delete(key);
-    this.#entries.set(key, entry);
-    return { value: entry.value, size: entry.size };
   }
 
   /**
@@ -107,16 +122,10 @@ export class BlobCache<T> implements EvictableCacheLike {
     const key = blobKey(ref);
     const existing = this.#entries.get(key);
     if (existing !== undefined) {
-      this.#entries.delete(key);
-      this.#entries.set(key, existing);
-      if (existing.pins++ === 0 && existing.charged) {
-        existing.charged = false;
-        this.#evictable -= existing.size;
-        this.#memory.release(existing.size);
-      }
+      this.#take(key, existing);
       return existing.value;
     }
-    this.#entries.set(key, { value, size, pins: 1, charged: false });
+    this.#entries.set(key, { value, size, pins: 1, charged: false, usedAt: 0 });
     this.#resident += size;
     return value;
   }
@@ -129,6 +138,8 @@ export class BlobCache<T> implements EvictableCacheLike {
     if (--entry.pins > 0) return;
     if (this.#memory.charge(entry.size)) {
       entry.charged = true;
+      entry.usedAt = performance.now();
+      this.#unpinned.set(key, entry);
       this.#evictable += entry.size;
     } else {
       this.#entries.delete(key);

@@ -82,7 +82,7 @@ function fixture(): Fixture {
       want(each.bloom, "index-bloom");
     }
   };
-  const makeGroups = (count: number, kind: ReachableKind): BlobRef => {
+  const makeGroups = (count: number, kind: ReachableKind, base = 0): BlobRef => {
     const directory = blob();
     want(directory, kind);
     const groups: GroupRef[] = [];
@@ -101,8 +101,8 @@ function fixture(): Fixture {
       });
       groups.push({
         groupId: k,
-        firstRowId: k * 100 + 1,
-        lastRowId: k * 100 + 100,
+        firstRowId: base + k * 100 + 1,
+        lastRowId: base + k * 100 + 100,
         rowCount: 100,
         liveRowCount: 90,
         root: rootRef,
@@ -155,9 +155,9 @@ function fixture(): Fixture {
         ? [
             {
               transaction: 9,
-              firstRowId: 2000,
+              firstRowId: 301,
               rowCount: 200,
-              groups: makeGroups(2, "staged-group-directory"),
+              groups: makeGroups(2, "staged-group-directory", 300),
               indexRuns: stagedRuns,
             },
           ]
@@ -165,9 +165,10 @@ function fixture(): Fixture {
     return {
       tableId,
       schemaVersion: 1,
-      nextRowId: 1000,
+      // Totals agree with the directories (the walk cross-checks them).
+      nextRowId: tableId === 1 ? 7001 : 501,
       flushedThroughLsn: 5,
-      liveRowCount: 900,
+      liveRowCount: (tableId === 1 ? 70 : 3) * 90,
       groups: makeGroups(tableId === 1 ? 70 : 3, "group-directory"),
       groupCount: tableId === 1 ? 70 : 3,
       staged,

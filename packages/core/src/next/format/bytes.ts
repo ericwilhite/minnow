@@ -21,7 +21,8 @@ export function valid(condition: boolean, message: string): asserts condition {
 }
 
 const encoder = new TextEncoder();
-const decoder = new TextDecoder("utf-8", { fatal: true });
+// ignoreBOM: a leading U+FEFF is part of the string, not a marker to strip (review B2-p2a #3).
+const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 export class ByteWriter {
   #bytes = new Uint8Array(256);
@@ -208,7 +209,13 @@ export class ByteReader {
     for (let k = count - 1; k >= 0; k--)
       value = (value << 8n) | BigInt(this.#bytes[this.at + k] ?? 0);
     this.at += count;
-    return BigInt.asIntN(count * 8, value);
+    const signed = BigInt.asIntN(count * 8, value);
+    // Canonical: the fewest bytes that hold the value (what `ByteWriter.bigint` writes).
+    valid(
+      count === 1 || BigInt.asIntN((count - 1) * 8, signed) !== signed,
+      "Bigint is not minimal",
+    );
+    return signed;
   }
 
   /** Throws unless every byte was consumed. */

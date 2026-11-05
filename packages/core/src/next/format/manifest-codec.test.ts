@@ -1,5 +1,6 @@
 import fc from "fast-check";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
+import { createReach } from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import { DATA_ALIGN } from "../storage/contract.js";
 import type { BlobRef, ByteBudget, ExtentRef } from "../storage/extents.js";
@@ -260,18 +261,54 @@ function tableRoot(pool: readonly ExtentRef[], tableId: number): fc.Arbitrary<Ta
   });
 }
 
+/**
+ * Strings a decoder must keep byte for byte (review B2-p2a #3, #4): a leading byte-order mark,
+ * which a default TextDecoder strips, and keys that name Object.prototype members.
+ */
+const BOM = "\ufeff";
+const ledgerReach = createReach("next-manifest-codecs ledger strings", [
+  "client id with a leading BOM",
+  "count key __proto__",
+  "count key with a leading BOM",
+]);
+const clientId = fc.oneof(
+  fc.string({ unit: "grapheme", maxLength: 40 }),
+  fc.string({ unit: "grapheme", maxLength: 40 }).map((text) => BOM + text),
+);
+const countKey = fc.oneof(
+  { weight: 3, arbitrary: fc.string({ maxLength: 12 }) },
+  fc.constantFrom("__proto__", "constructor", "toString", BOM, `${BOM}inserted`),
+);
+
 const client: fc.Arbitrary<ClientLedgerEntry> = fc.record({
-  clientId: fc.string({ unit: "grapheme", maxLength: 40 }),
+  clientId,
   resolvedThrough: lsn,
   outcomes: fc.array(
     fc.record({
       sequence: lsn,
       lsn,
-      counts: fc.dictionary(fc.string({ maxLength: 12 }), fc.double(), { maxKeys: 4 }),
+      counts: fc.dictionary(countKey, fc.double(), { maxKeys: 4 }),
       recordedAtMs: fc.double(),
     }),
     { maxLength: 5 },
   ),
+});
+
+/** Marks the ledger strings a generated root holds. */
+function reachLedger(root: ManifestRoot): void {
+  ledgerReach.beginHistory();
+  for (const entry of root.clients) {
+    if (entry.clientId.startsWith(BOM)) ledgerReach.reach("client id with a leading BOM");
+    for (const outcome of entry.outcomes)
+      for (const key of Object.keys(outcome.counts)) {
+        if (key === "__proto__") ledgerReach.reach("count key __proto__");
+        if (key.startsWith(BOM)) ledgerReach.reach("count key with a leading BOM");
+      }
+  }
+}
+
+afterAll(() => {
+  ledgerReach.assertReached();
 });
 
 const manifestRoot: fc.Arbitrary<ManifestRoot> = extents.chain((pool) =>
@@ -364,7 +401,10 @@ describe.each(SEEDS)("manifest codecs round-trip (seed %i)", (seed) => {
 
   it("manifest roots", () => {
     fc.assert(
-      fc.property(manifestRoot, (root) => roundTrip(root, encodeManifestRoot, decodeManifestRoot)),
+      fc.property(manifestRoot, (root) => {
+        reachLedger(root);
+        roundTrip(root, encodeManifestRoot, decodeManifestRoot);
+      }),
       {
         seed,
         numRuns: RUNS,

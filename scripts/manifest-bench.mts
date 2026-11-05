@@ -239,9 +239,18 @@ const refs: GroupRef[] = roots.blobs.map((root, k) => ({
   deletions: null,
 }));
 const directory = await writeGroupDirectory(metadata, refs);
+// The walk cross-checks the table's totals against its directory.
 const w5mRoot = encodeManifestRoot({
   ...manifestRoot(1),
-  tables: [{ ...(manifestRoot(1).tables[0] as TableRoot), groups: directory.ref }],
+  tables: [
+    {
+      ...(manifestRoot(1).tables[0] as TableRoot),
+      groups: directory.ref,
+      groupCount: refs.length,
+      liveRowCount: refs.length * 65_536,
+      nextRowId: refs.length * 65_536 + 1,
+    },
+  ],
 });
 const walk = reachableExtents();
 const cold = w5m.view({ cache: false });

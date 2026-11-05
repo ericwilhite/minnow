@@ -18,6 +18,16 @@
  * back to one. Duplicates are allowed (packed and shared extents); `reachableExtents` drops only a
  * repeat of the extent it yielded last, so its memory stays bounded.
  *
+ * The walk checks what it reads against what references it (review B2-p2a #6) and throws
+ * `ManifestCorruptionError` on a contradiction, since free space computed from a wrong directory
+ * frees live data:
+ * - a directory index entry against its page: group count, first and last row id, row and live
+ *   row totals;
+ * - a group against its group root: row count, and for dense row ids, the row-id range;
+ * - a table's directory against the table: group count and live rows (`TableRoot.groupCount`,
+ *   `liveRowCount`), and every row id below `nextRowId`;
+ * - a staged directory against its entry: stored rows (`rowCount`), from `firstRowId` on.
+ *
  * The walk streams: per table it reads the group directory's index, then one directory page at a
  * time (manifest-codec.ts "paged group directory"), then that page's group roots in batches of
  * `concurrency`, yielding as it goes. It holds one index, one page and one batch of group roots at
@@ -25,6 +35,7 @@
  * never read.
  */
 import type { BlobRef, ByteBudget, ExtentReader, ExtentRef } from "../storage/extents.js";
+import { valid } from "./bytes.js";
 import {
   decodeGroupIndex,
   decodeGroupPage,
@@ -116,32 +127,99 @@ export async function* walkReachable(
     if (table.statistics !== null)
       yield { ref: table.statistics, kind: "table-statistics", tableId };
     for (const index of [table.keyIndex, ...table.secondaryIndexes]) yield* runsOf(index, tableId);
-    const directories: Array<{ ref: BlobRef; kind: ReachableKind }> = [
-      { ref: table.groups, kind: "group-directory" },
+    const directories: Directory[] = [
+      {
+        ref: table.groups,
+        kind: "group-directory",
+        expect: (totals) => {
+          valid(totals.groupCount === table.groupCount, "Table group count disagrees");
+          valid(totals.liveRowCount === table.liveRowCount, "Table live row count disagrees");
+        },
+      },
     ];
     for (const staged of table.staged) {
-      directories.push({ ref: staged.groups, kind: "staged-group-directory" });
+      directories.push({
+        ref: staged.groups,
+        kind: "staged-group-directory",
+        expect: (totals) => {
+          valid(totals.rowCount === staged.rowCount, "Staged row count disagrees");
+          valid(
+            totals.firstRowId === null || totals.firstRowId >= staged.firstRowId,
+            "Staged rows before the staged range",
+          );
+        },
+      });
       for (const index of staged.indexRuns) yield* runsOf(index, tableId);
     }
-    for (const { ref, kind } of directories) {
-      if (isEmptyDirectory(ref)) continue;
-      yield { ref, kind, tableId };
-      const index = await reader.groupIndex(ref);
-      try {
-        for (const page of index.value) {
-          yield { ref: page.ref, kind: "group-directory-page", tableId };
-          const groups = await reader.groupPage(page.ref);
-          try {
-            yield* groupsOf(groups.value, reader, concurrency, tableId);
-          } finally {
-            groups.release();
+    for (const { ref, kind, expect } of directories) {
+      const totals: Totals = { groupCount: 0, rowCount: 0, liveRowCount: 0, firstRowId: null };
+      if (!isEmptyDirectory(ref)) {
+        yield { ref, kind, tableId };
+        const index = await reader.groupIndex(ref);
+        try {
+          for (const page of index.value) {
+            yield { ref: page.ref, kind: "group-directory-page", tableId };
+            const groups = await reader.groupPage(page.ref);
+            try {
+              checkPage(page, groups.value);
+              yield* groupsOf(groups.value, reader, concurrency, tableId);
+            } finally {
+              groups.release();
+            }
+            totals.groupCount += page.groupCount;
+            totals.rowCount += page.rowCount;
+            totals.liveRowCount += page.liveRowCount;
+            totals.firstRowId ??= page.firstRowId;
+            valid(page.lastRowId < table.nextRowId, "A row id at or past the table's next row id");
           }
+        } finally {
+          index.release();
         }
-      } finally {
-        index.release();
       }
+      expect(totals);
     }
   }
+}
+
+interface Totals {
+  groupCount: number;
+  rowCount: number;
+  liveRowCount: number;
+  firstRowId: number | null;
+}
+
+interface Directory {
+  readonly ref: BlobRef;
+  readonly kind: ReachableKind;
+  /** Throws `ManifestCorruptionError` unless the directory's totals match what references it. */
+  readonly expect: (totals: Totals) => void;
+}
+
+/** A directory index entry describes the page it references. */
+function checkPage(entry: GroupPageEntry, groups: readonly GroupRef[]): void {
+  let rowCount = 0;
+  let liveRowCount = 0;
+  for (const group of groups) {
+    rowCount += group.rowCount;
+    liveRowCount += group.liveRowCount;
+  }
+  valid(
+    groups.length === entry.groupCount &&
+      groups[0]?.firstRowId === entry.firstRowId &&
+      groups[groups.length - 1]?.lastRowId === entry.lastRowId &&
+      rowCount === entry.rowCount &&
+      liveRowCount === entry.liveRowCount,
+    "A directory index entry disagrees with its page",
+  );
+}
+
+/** A group's reference describes its group root. */
+function checkRoot(group: GroupRef, root: GroupRoot): void {
+  valid(root.rowCount === group.rowCount, "A group root's row count disagrees with its group");
+  valid(
+    root.rowIds.kind !== "dense" || group.lastRowId - group.firstRowId + 1 === root.rowCount,
+    "A dense group's row-id range disagrees with its row count",
+  );
 }
 
 async function* groupsOf(
@@ -164,6 +242,7 @@ async function* groupsOf(
         if (group.deletions !== null) yield { ref: group.deletions, kind: "deletions", tableId };
         const groupRoot = roots[index]?.value;
         if (groupRoot === undefined) continue;
+        checkRoot(group, groupRoot);
         if (groupRoot.rowIds.kind === "column")
           yield { ref: groupRoot.rowIds.ref, kind: "row-ids", tableId };
         for (const chunk of groupRoot.columns) {

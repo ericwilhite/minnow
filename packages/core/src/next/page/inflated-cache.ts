@@ -30,6 +30,10 @@ export class InflatedPageCache implements EvictableCacheLike {
     return this.#cache.misses;
   }
 
+  get oldestUnusedAt(): number | undefined {
+    return this.#cache.oldestUnusedAt;
+  }
+
   evict(bytes: number): number {
     return this.#cache.evict(bytes);
   }

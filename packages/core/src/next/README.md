@@ -274,7 +274,19 @@ is access's `Snapshot`.
 - `TableRoot.groups` names a directory **index**; each index entry names a **page** of up to
   `GROUPS_PER_PAGE` (4,096) `GroupRef`s with its row-id range and counts. `writeGroupDirectory`
   keeps unchanged pages, so a flush rewrites only the last page and the index. A table with no
-  groups has a zero-length `groups` reference.
+  groups has a zero-length `groups` reference. The index has one 30-byte entry per page, so the
+  per-flush rewrite grows with the page count: up to about 113 KiB for the last page plus ~30 bytes per
+  4,096 groups (a two-level index can replace it if that ever matters).
+- Decoding is canonical: an extent table or type table with a duplicate, unused or out-of-order
+  entry, a non-minimal integer, or ledger counts out of key order is refused, and a blob over its
+  cap is refused before anything is charged. Strings keep a leading byte-order mark, and ledger
+  counts decode into a null-prototype object (a `__proto__` key is an ordinary key).
+- The walk checks each directory against what references it: index entries against their pages,
+  pages against the table's `groupCount` and `liveRowCount` (staged directories: their
+  `rowCount` and `firstRowId`), every row id against `nextRowId`, and each group against its group
+  root's row count. A contradiction rejects the walk with `ManifestCorruptionError`.
+- A cached chunk directory is checked against each chunk that opens it (its pages and dictionary
+  must lie inside that chunk's data).
 - Decoders never hash (the space or the root slot verified the bytes); they check structure and
   throw `ManifestCorruptionError`. Each charges `parseCharge(bytes)` to the caller's budget
   before it builds anything (`ParseBudgetError` on refusal) and returns the charge with the value.
@@ -348,7 +360,9 @@ and the owner import it directly.
 - A grant _holds_ bytes, and its operator _allocates_ buffers out of them, so a non-spillable
   operator works inside its admitted minimum.
 - Growth is charged before it happens, including the overlap while a buffer is copied.
-- The page cache is evicted before anything spills.
+- Caches are evicted before anything spills. Several may register (the space's page cache, the
+  decoded directory and metadata caches, the inflated-page cache); eviction takes the entry unused
+  longest across all of them (`oldestUnusedAt`).
 - Progress loans are scheduled before admissions and may use the reserve: a queued admission,
   growth or the cache never delays a loan, and a loan waits only for earlier loans to be repaid.
   Progress follows if each loan covers one bounded step. A loan belongs to its grant from the

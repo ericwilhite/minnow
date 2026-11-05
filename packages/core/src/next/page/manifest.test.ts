@@ -103,13 +103,13 @@ async function writeTable(space: MemoryExtentSpace, groups: number, rows: number
   return { writer, refs, roots, directory };
 }
 
-function table(tableId: number, groups: BlobRef, groupCount: number): TableRoot {
+function table(tableId: number, groups: BlobRef, groupCount: number, rows = 0): TableRoot {
   return {
     tableId,
     schemaVersion: 1,
-    nextRowId: 1,
+    nextRowId: groupCount * rows + 1,
     flushedThroughLsn: 0,
-    liveRowCount: 0,
+    liveRowCount: groupCount * rows,
     groups,
     groupCount,
     staged: [],
@@ -135,7 +135,7 @@ describe("manifest metadata end to end", () => {
       catalog,
       nextTableId: 3,
       sequences: [{ sequenceId: 1, reservedThrough: 100n }],
-      tables: [table(1, directory.ref, 5), table(2, empty, 0)],
+      tables: [table(1, directory.ref, 5, 3000), table(2, empty, 0)],
       clients: [],
     };
     const budget = tracked();
