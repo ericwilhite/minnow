@@ -26,11 +26,11 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | `spill/`           | executor (OPFS service: storage) | Spill contract (one long-lived scratch file, batching charged to the operator's budget); in-memory double                                                                                                                                                                                                                                                                                        |
 | `memory/`          | executor                         | Memory governor: admission, progress loans, held vs allocated bytes (reference implementation)                                                                                                                                                                                                                                                                                                   |
 | `exec/`            | executor                         | Entry point (`executor.ts`), result frames (`result.ts`), scans (`scan.ts`, `memory-scan.ts`), table rules (`rules.ts`), push driver (`pipeline.ts`), fetcher (`fetch.ts`), comparators, decimal SUM                                                                                                                                                                                             |
-| `ir/`              | lowering, executor               | Operator IR (`ir.ts`); the front-end boundary (`lowering.ts`)                                                                                                                                                                                                                                                                                                                                    |
+| `ir/`              | lowering, executor               | Operator IR (`ir.ts`); table rules in IR form (`rules.ts`); executor costs the planner reads (`costs.ts`)                                                                                                                                                                                                                                                                                        |
 | `access/`          | write path + key index           | Storage access contracts the write path implements: snapshots and segments, catalog, key-index probes and ranges, `modify` (rows, conflicts, RETURNING), transactions, group commit, sequences, delivery                                                                                                                                                                                         |
 | `testing/`         | all                              | Differential-harness adapter for a partial new core                                                                                                                                                                                                                                                                                                                                              |
 | `write/` (to come) | write path + key index           | Group commit, memtables, key index runs, maintenance (implements `access/`)                                                                                                                                                                                                                                                                                                                      |
-| `lower/` (to come) | planner lowering                 | `Lowerer`, cost model, statistics                                                                                                                                                                                                                                                                                                                                                                |
+| `lower/`           | planner lowering                 | `Lowerer` (`lowerer.ts`: the front-end boundary), result descriptors, statement classes, DDL column types, statistics and re-planning; front-end inventory (`INVENTORY.md`)                                                                                                                                                                                                                      |
 | `owner/`           | ownership                        | Owner/client protocol (`protocol.ts`), wire payloads (re-exported from exec) and stream dictionaries (`frame.ts`), ledger outcomes per request (`outcomes.ts`), wire errors (`errors.ts`), client sequencing (`sequence.ts`), election, liveness and step-down (`election.ts`), public client API (`api.ts`), engine boundary and idle-transaction timer (`engine.ts`); composition root to come |
 
 ## Cross-track interfaces (owned by the implementing track)
@@ -365,7 +365,22 @@ and the owner import it directly.
   contract (`exec/fetch.ts`): an explicit, enforced output capacity, charged and bounded staging,
   and partial completion that may reread pages.
 - `apply` memoizes only when evaluation multiplicity is unobservable.
-- `lowering.ts` lists the front-end passes that are kept and the code that lowering replaces.
+- `rules.ts` is a table's CHECK, generated and default expressions in IR form: lowering builds
+  them, the executor compiles them (`compileTableRules`).
+
+### Lowering (`lower/`)
+
+- `Lowerer.lower(text, context)` runs the whole front end (parse, catalog passes over access/'s
+  `CatalogView`, shape passes), types every expression, and returns a `LoweredStatement`: a plan
+  with result descriptors, read and write sets and its statistics basis; a catalog change; or a
+  transaction or utility command. `lowerer.ts` lists the front-end passes that are kept and the
+  code that lowering replaces.
+- Pure and synchronous; the owner caches by (text, catalog version) and re-lowers when
+  `statisticsDrifted` says the data moved.
+- Declared numeric widths come from the parser only under `compileWithDeclaredTypes`
+  (engine/query.ts), so the current engine compiles exactly what it did (C5).
+- `INVENTORY.md` maps every front-end construct to its IR operator, lists what is refused at
+  first (`UnsupportedPlanError` with a construct key) and the contract changes lowering needs.
 
 ### Differential adapter (`testing/differential-adapter.ts`)
 

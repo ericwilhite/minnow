@@ -1,6 +1,6 @@
 /**
  * The typed operator IR the new executor consumes. The planner-lowering track produces it from
- * the front end's optimized `CompiledQuery` (lowering.ts); the executor track runs it. Nothing
+ * the front end's optimized `CompiledQuery` (lower/lowerer.ts); the executor track runs it. Nothing
  * else creates or interprets it.
  *
  * ## Invariants
