@@ -28,11 +28,12 @@ function blob(within: ExtentRef = extent(100), offset = 0, length = within.lengt
   return { extent: within, offset, length, checksum: within.offset + offset };
 }
 
+/** A chunk whose data range starts at `at` inside `data` (a nonzero `at`: a packed extent). */
 function chunk(columnId: number, data: ExtentRef = extent(20_000), at = 0): ColumnChunk {
   return {
     columnId,
     type: { kind: "int32", bits: 32 },
-    data,
+    data: { extent: data, offset: at, length: 20_000 },
     directory: blob(data, at + 16_000, 300),
     statistics: { nullCount: 0, min: null, max: null, dictionarySize: null },
     distinctSketch: blob(data, at + 16_300, 90),
@@ -205,6 +206,10 @@ describe("reachability walk", () => {
       for (const ref of [each.entries, each.fences, each.bloom])
         expect(found.some((reached) => reached.ref === ref)).toBe(true);
     expect(found.filter((r) => r.kind === "catalog").map((r) => r.tableId)).toEqual([null]);
+    // A packed chunk's data range starts inside its extent.
+    expect(
+      found.some((r) => r.kind === "chunk-data" && "extent" in r.ref && r.ref.offset === 20_000),
+    ).toBe(true);
   });
 
   it("streams: it yields before it has read every group root", async () => {
@@ -293,6 +298,8 @@ describe("reachability walk", () => {
     for await (const ref of walker(new Uint8Array(0), space, budget)) out.push(ref);
     expect(leased).toBe(0);
     expect(held).toBe(0);
+    // The space gets BlobRefs or bare extents, never a checksum-less chunk data range.
+    for (const ref of out) expect("extent" in ref ? "checksum" in ref : true).toBe(true);
     // Every extent the root reaches is covered (the space takes BlobRef.extent) ...
     expect(new Set(out.map(extentKey))).toEqual(new Set(expected.map(({ ref }) => extentKey(ref))));
     // ... and a chunk's directory and sketch, in its data extent, are not repeated.

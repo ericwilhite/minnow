@@ -2,6 +2,7 @@
  * One test per finding of review B2-1 (reviews/B2-page-format-review-1.md), each running the
  * reviewer's probe (minnow-review-b2/tree/probe.ts) and rejecting the behaviour it found.
  */
+import { dataAddress } from "./reader.js";
 import { describe, expect, it } from "vitest";
 import { encodeSortKey } from "../keys/key-encoding.js";
 import { PageEncoding } from "../format/manifest.js";
@@ -297,14 +298,14 @@ describe("B2-1 #6 / R15.1–R15.2: chunks are written through ExtentBuilders; re
     ]);
     const [small, wide, bools] = group.columns.map((chunk) => chunk);
     for (const chunk of group.columns) {
-      expect(chunk.directory.extent).toBe(chunk.data);
-      expect(chunk.distinctSketch?.extent).toBe(chunk.data);
+      expect(chunk.directory.extent).toBe(chunk.data.extent);
+      expect(chunk.distinctSketch?.extent).toBe(chunk.data.extent);
       expect(blobAddress(chunk.directory) + chunk.directory.length).toBeLessThanOrEqual(
-        chunk.data.offset + chunk.data.length,
+        dataAddress(chunk.data) + chunk.data.length,
       );
     }
-    expect(defined(small).data).toBe(defined(bools).data); // packed together
-    expect(defined(wide).data).not.toBe(defined(small).data);
+    expect(defined(small).data.extent).toBe(defined(bools).data.extent); // packed together
+    expect(defined(wide).data.extent).not.toBe(defined(small).data.extent);
     expect(new Set(group.extents).size).toBe(2);
     for (const chunk of group.columns) expect((await readChunk(space, chunk)).length).toBe(20_000);
   });
@@ -386,7 +387,7 @@ describe("ruling: a page flagged safe is rechecked while decoding", () => {
     const chunk = defined(w.group.columns[0]);
     const reader = await openChunk(w.space, chunk);
     const entry = defined(reader.directory.pages[0]);
-    const at = chunk.data.offset + entry.offset;
+    const at = dataAddress(chunk.data) + entry.offset;
     const bytes = w.space.bytes.slice(at, at + entry.length);
     bytes[2] = (bytes[2] ?? 0) | 16;
     const view = parsePage(bytes, entry, 3);
@@ -488,5 +489,64 @@ describe("parsed directories are charged", () => {
         budget: { allocate: () => false, free: () => undefined },
       }),
     ).rejects.toBeInstanceOf(ReadDeniedError);
+  });
+});
+
+describe("contracts round 5: ColumnChunk.data is the chunk's range inside its extent", () => {
+  it("packed chunks start at nonzero offsets and read correctly, cold, cached and by gather", async () => {
+    const rows = 3000;
+    const columns: Array<{ type: PhysicalType; values: TestValue[] }> = [
+      { type: { kind: "int32", bits: 32 }, values: Array<TestValue>(rows).fill(7) },
+      { type: { kind: "bool" }, values: Array.from({ length: rows }, (_, i) => i % 3 === 0) },
+      {
+        type: { kind: "text" },
+        values: Array.from({ length: rows }, (_, i) => encoder.encode(`k${String(i % 5)}`)),
+      },
+      { type: { kind: "int64" }, values: Array.from({ length: rows }, (_, i) => BigInt(i) * 5n) },
+    ];
+    const { space, group } = await writeGroup(columns);
+    const extent = defined(group.columns[0]).data.extent;
+    expect(group.columns.every((chunk) => chunk.data.extent === extent)).toBe(true); // one pack
+    const offsets = group.columns.map((chunk) => chunk.data.offset);
+    expect(offsets[0]).toBe(0);
+    expect(offsets.slice(1).every((offset) => offset > 0)).toBe(true);
+    // Ranges are disjoint, in order, inside the extent, and cover each chunk's directory.
+    for (const [index, chunk] of group.columns.entries()) {
+      expect(chunk.data.offset + chunk.data.length).toBeLessThanOrEqual(extent.length);
+      const next = group.columns[index + 1];
+      if (next !== undefined)
+        expect(chunk.data.offset + chunk.data.length).toBeLessThanOrEqual(next.data.offset);
+      expect(chunk.directory.offset).toBeGreaterThanOrEqual(chunk.data.offset);
+      expect(chunk.directory.offset + chunk.directory.length).toBe(
+        chunk.data.offset + chunk.data.length,
+      );
+    }
+    const cached = space.view({});
+    for (const [index, chunk] of group.columns.entries()) {
+      const values = defined(columns[index]).values;
+      // Cold (verified reads); each page entry's offset is relative to the data range.
+      const read = await readChunk(space, chunk);
+      expect(read.every((value, row) => sameValue(value, values[row] ?? null))).toBe(true);
+      const cold = await openChunk(space, chunk);
+      for (const page of cold.directory.pages) {
+        const at = dataAddress(chunk.data) + page.offset;
+        expect(space.bytes[at]).toBe(page.encoding & 0x7f); // the page header's kind byte
+        expect(page.offset + page.length).toBeLessThanOrEqual(chunk.data.length);
+      }
+      cold.close();
+      // Cached: synchronous, then a gather.
+      await (await ChunkReader.open(cached, chunk, { budget: UNLIMITED })).load([0]);
+      const reader = ChunkReader.open(cached, chunk, { budget: UNLIMITED });
+      if (reader instanceof Promise) throw new Error("a cached directory opens synchronously");
+      const all = reader.directory.pages.map((_, page) => page);
+      await reader.load(all);
+      expect(reader.load(all)).toBeUndefined();
+      const rowsWanted = Uint16Array.of(0, 1, 2, 999, 1500, rows - 1);
+      const target = targetFor(reader, rowsWanted.length, reader.gatherBytes(rowsWanted));
+      reader.gather(rowsWanted, target, 0);
+      for (const [k, row] of [...rowsWanted].entries())
+        expect(sameValue(valueAt(target, k), values[row] ?? null)).toBe(true);
+      reader.close();
+    }
   });
 });

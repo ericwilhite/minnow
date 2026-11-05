@@ -12,9 +12,9 @@
  *   extent, page directory and distinct sketch;
  * - every index run (key index, secondary indexes, staged runs): entries, fences, Bloom filter.
  *
- * Units (ruling R15.1): a `BlobRef` carries the extent it lives in, so the walk yields blobs and
- * chunk extents as they are; the space takes `BlobRef.extent` and never maps an address back to
- * an extent. Duplicates are allowed (packed and shared extents); `reachableExtents` drops only a
+ * Units (ruling R15.1): a `BlobRef` carries the extent it lives in, and so does a chunk's data
+ * range (`ChunkData`, which has no checksum); the space takes the extent and never maps an address
+ * back to one. Duplicates are allowed (packed and shared extents); `reachableExtents` drops only a
  * repeat of the extent it yielded last, so its memory stays bounded.
  *
  * The walk streams: it reads one group directory, then its group roots in batches of
@@ -22,7 +22,14 @@
  * group roots at a time, and every metadata lease only while decoding. Pages are never read.
  */
 import type { BlobRef, ByteBudget, ExtentReader, ExtentRef } from "../storage/extents.js";
-import type { GroupRef, GroupRoot, IndexRoot, ManifestRoot, RunRef } from "./manifest.js";
+import type {
+  ChunkData,
+  GroupRef,
+  GroupRoot,
+  IndexRoot,
+  ManifestRoot,
+  RunRef,
+} from "./manifest.js";
 
 /** Decodes the metadata blobs the walk descends through. */
 export interface ManifestReader {
@@ -48,8 +55,8 @@ export type ReachableKind =
   | "index-bloom";
 
 export interface Reached {
-  /** A blob (with its extent) or a chunk's data extent. */
-  readonly ref: BlobRef | ExtentRef;
+  /** A blob, or a column chunk's data range (`ChunkData`: inside its extent, no checksum). */
+  readonly ref: BlobRef | ChunkData;
   readonly kind: ReachableKind;
   /** The table it belongs to (null for the catalog). */
   readonly tableId: number | null;
@@ -139,8 +146,6 @@ export interface ManifestCodecs {
   decodeGroupRoot(bytes: Uint8Array): GroupRoot;
 }
 
-const extentOf = (ref: BlobRef | ExtentRef): ExtentRef => ("extent" in ref ? ref.extent : ref);
-
 /**
  * `walkReachable` in the shape the extent space opens with (storage/extents.ts
  * `ReachableExtents`): root bytes in, blobs and extents out, streamed. Metadata blobs are read
@@ -167,6 +172,8 @@ export function reachableExtents(
     };
     const manifest = codecs.decodeRoot(root);
     let last: ExtentRef | null = null;
+    // The space takes a blob's extent; a chunk's data range has no checksum, so it is given as
+    // its extent (the unit the space reclaims).
     for await (const { ref } of walkReachable(
       manifest,
       {
@@ -175,10 +182,10 @@ export function reachableExtents(
       },
       options,
     )) {
-      const extent = extentOf(ref);
+      const extent = ref.extent;
       if (last !== null && last.offset === extent.offset && last.length === extent.length) continue;
       last = extent;
-      yield ref;
+      yield "checksum" in ref ? ref : extent;
     }
   };
 }

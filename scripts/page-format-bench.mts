@@ -299,10 +299,10 @@ async function run(bench: Bench): Promise<Result> {
       pages++;
     }
     storedBytes += (reader.directory.dictionary?.length ?? 0) + chunk.directory.length;
-    const key = `${String(chunk.data.offset)}`;
+    const key = `${String(chunk.data.extent.offset)}`;
     if (!extents.has(key)) {
       extents.add(key);
-      allocatedBytes += Math.ceil(chunk.data.length / 4096) * 4096;
+      allocatedBytes += Math.ceil(chunk.data.extent.length / 4096) * 4096;
     }
   }
 

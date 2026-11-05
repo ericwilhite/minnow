@@ -1,4 +1,5 @@
 import fc from "fast-check";
+import { dataAddress } from "./reader.js";
 import { describe, expect, it } from "vitest";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import { PageEncoding } from "../format/manifest.js";
@@ -150,7 +151,7 @@ async function roundTrip(
   for (let row = 0; row < values.length; row++) if (random() < 0.15) picked.push(row);
   if (picked.length === 0) picked.push(values.length - 1);
   const reader = await openChunk(space, chunk);
-  recordReach(space, chunk.data.offset, reader.directory.pages);
+  recordReach(space, dataAddress(chunk.data), reader.directory.pages);
   if (reader.directory.dictionary !== null) reached.add(`${type.kind}:dictionary-chunk`);
   if (
     reader.directory.pages.some((page) => (page.encoding & 0x7f) === PageEncoding.dictionary) &&
@@ -651,7 +652,7 @@ describe("page encoding selection", () => {
     const reader = await openChunk(space, chunk);
     const page = defined(reader.directory.pages[0]);
     expect(page.rowCount).toBe(4);
-    expect(space.bytes[chunk.data.offset + page.offset + 3]).toBe(4);
+    expect(space.bytes[dataAddress(chunk.data) + page.offset + 3]).toBe(4);
     const read = await readChunk(space, chunk);
     expect(read.every((value, row) => sameValue(value, values[row] ?? null))).toBe(true);
   });

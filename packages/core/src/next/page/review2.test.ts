@@ -2,6 +2,7 @@
  * One test per finding of review B2-2 (reviews/B2-page-format-review-2.md), each running the
  * reviewer's probe (minnow-review-b2b/tree/review-probes.ts) and rejecting what it found.
  */
+import { dataAddress } from "./reader.js";
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
@@ -180,7 +181,7 @@ async function forgedPages(
 ): Promise<Array<{ bytes: Uint8Array; entry: PageEntry }>> {
   const reader = await openChunk(space, chunk);
   const out = reader.directory.pages.map((entry) => {
-    const at = chunk.data.offset + entry.offset;
+    const at = dataAddress(chunk.data) + entry.offset;
     const bytes = space.bytes.slice(at, at + entry.length);
     bytes[2] = (bytes[2] ?? 0) | 16;
     return { bytes, entry };
@@ -309,8 +310,8 @@ describe("B2-2 #3: one cleanup owner per hold, whichever page of a cached load f
     chunk: ColumnChunk,
     entry: { offset: number; length: number; checksum: number },
   ): BlobRef => ({
-    extent: chunk.data,
-    offset: entry.offset,
+    extent: chunk.data.extent,
+    offset: chunk.data.offset + entry.offset,
     length: entry.length,
     checksum: entry.checksum,
   });

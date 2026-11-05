@@ -3,6 +3,7 @@
  * (`PageCorruptionError`) before any value is decoded; and with the checksum bypassed (a writer
  * bug, a hash collision), structural validation still keeps decode inside its sections.
  */
+import { dataAddress } from "./reader.js";
 import { beforeAll, describe, expect, it } from "vitest";
 import { mulberry32 } from "../../testing/seeds.js";
 import type { ColumnChunk, PageEntry } from "../format/manifest.js";
@@ -168,7 +169,7 @@ describe("corruption is refused, never decoded", () => {
     let flips = 0;
     for (const page of pages) {
       await loadOne(page); // intact: loads
-      const start = page.chunk.data.offset + page.entry.offset;
+      const start = dataAddress(page.chunk.data) + page.entry.offset;
       for (let at = start; at < start + page.entry.length; at++) {
         for (const mask of [0x01, 0xff]) {
           const original = bytes[at] ?? 0;
@@ -223,7 +224,7 @@ describe("corruption is refused, never decoded", () => {
       if (page.dictionary || (page.entry.encoding & PageEncoding.gzip) !== 0) continue;
       const reader = await openChunk(written.space, page.chunk);
       const tag = reader.directory.tag;
-      const start = page.chunk.data.offset + page.entry.offset;
+      const start = dataAddress(page.chunk.data) + page.entry.offset;
       for (let at = start; at < start + page.entry.length; at++) {
         for (const mask of [0x01, 0xff]) {
           const copy = bytes.slice(start, start + page.entry.length);

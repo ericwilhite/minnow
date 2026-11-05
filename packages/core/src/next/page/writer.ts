@@ -45,7 +45,7 @@
  *   every value's own scale. int64 and int128 coefficients are stored; coefficients past 128 bits
  *   (`bigint[]`) raise `UnsupportedPageLayoutError` (no stored form yet).
  */
-import type { ColumnChunk, PageEntry, StatValue } from "../format/manifest.js";
+import type { ChunkData, ColumnChunk, PageEntry, StatValue } from "../format/manifest.js";
 import { PageEncoding } from "../format/manifest.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 import {
@@ -1313,16 +1313,23 @@ export class GroupWriter {
   }
 
   /** Appends the dictionary, directory and sketch of one column through `append`. */
+  /**
+   * Appends the dictionary, directory and sketch of one column through `append`. `base` is the
+   * extent offset where the chunk's data starts (0 for its own extent, its place in a pack): page
+   * and dictionary offsets in the directory are relative to it (manifest.ts "Chunks").
+   */
   async #tail(
     column: ColumnWriter,
     append: (parts: readonly Uint8Array[]) => Promise<PendingBlob[]>,
+    base: number,
   ): Promise<{ directory: PendingBlob; sketch: Uint8Array }> {
     const dictionary = column.dictionaryPage();
     let dictionaryEntry: PageEntry | null = null;
     if (dictionary !== null) {
       // The dictionary page is in the shared scratch: append copies it before the next encode.
       const [blob] = await append([dictionary]);
-      dictionaryEntry = this.#dictionaryEntry(column, blob);
+      const entry = this.#dictionaryEntry(column, blob);
+      dictionaryEntry = entry === null ? null : { ...entry, offset: entry.offset - base };
     }
     const sketch = column.sketch.serialize();
     const directory = encodeDirectory({
@@ -1330,7 +1337,10 @@ export class GroupWriter {
       rowCount: this.#rows,
       scale: column.scale(),
       hasSpecials: column.hasSpecials(),
-      pages: column.sink.entries,
+      pages:
+        base === 0
+          ? column.sink.entries
+          : column.sink.entries.map((entry) => ({ ...entry, offset: entry.offset - base })),
       dictionary: dictionaryEntry,
       sketch,
     });
@@ -1341,14 +1351,19 @@ export class GroupWriter {
 
   async #finishStreamed(column: ColumnWriter): Promise<ColumnChunk> {
     const sink = column.sink;
-    const { directory, sketch } = await this.#tail(column, (parts) => sink.appendParts(parts));
+    const { directory, sketch } = await this.#tail(column, (parts) => sink.appendParts(parts), 0);
     const builder = sink.builder;
     if (builder === null) throw new Error("A streamed chunk has no builder");
     const written = await builder.seal();
     sink.builder = null;
     if (written === null) throw new Error("A streamed chunk sealed empty");
     this.#sealed.push(written.extent);
-    return this.#chunk(column, written.extent, directory, sketch);
+    return this.#chunk(
+      column,
+      { extent: written.extent, offset: 0, length: written.extent.length },
+      directory,
+      sketch,
+    );
   }
 
   /** Packs every small chunk into one shared extent, column after column. */
@@ -1361,10 +1376,17 @@ export class GroupWriter {
       if (short > 0) builder.extend(Math.max(short, Math.ceil(builder.capacity / 2)));
       return builder.append(parts);
     };
-    const tails: Array<{ column: ColumnWriter; directory: PendingBlob; sketch: Uint8Array }> = [];
+    const tails: Array<{
+      column: ColumnWriter;
+      base: number;
+      directory: PendingBlob;
+      sketch: Uint8Array;
+    }> = [];
     try {
       for (const column of inline) {
         const sink = column.sink;
+        // The chunk's data starts here in the shared extent; its offsets are relative to it.
+        const base = builder.length;
         const pages = sink.inline.splice(0);
         if (pages.length > 0) {
           const blobs = await append(pages.map((page) => page.bytes));
@@ -1376,7 +1398,7 @@ export class GroupWriter {
           for (const page of pages) this.memory.free(page.bytes.length);
           sink.inlineBytes = 0;
         }
-        tails.push({ column, ...(await this.#tail(column, append)) });
+        tails.push({ column, base, ...(await this.#tail(column, append, base)) });
       }
     } catch (error) {
       const written = await builder.seal();
@@ -1386,10 +1408,15 @@ export class GroupWriter {
     const written = await builder.seal();
     if (written === null) throw new Error("The pack sealed empty");
     this.#sealed.push(written.extent);
-    for (const { column, directory, sketch } of tails)
+    for (const { column, base, directory, sketch } of tails)
       chunks[this.#columns.indexOf(column)] = this.#chunk(
         column,
-        written.extent,
+        // Pages, dictionary and directory: [base, end of the directory) of the pack.
+        {
+          extent: written.extent,
+          offset: base,
+          length: directory.offset + directory.length - base,
+        },
         directory,
         sketch,
       );
@@ -1397,10 +1424,11 @@ export class GroupWriter {
 
   #chunk(
     column: ColumnWriter,
-    extent: ExtentRef,
+    data: ChunkData,
     directory: PendingBlob,
     sketch: Uint8Array,
   ): ColumnChunk {
+    const extent = data.extent;
     const stats = column.stats;
     const statistics: ColumnStatistics = {
       nullCount: stats.nulls,
@@ -1411,7 +1439,7 @@ export class GroupWriter {
     return {
       columnId: column.column.columnId,
       type: column.column.type,
-      data: extent,
+      data,
       directory: { extent, ...directory },
       statistics,
       // The sketch is the directory blob's tail (directory.ts), under its own checksum.

@@ -201,7 +201,9 @@ is access's `Snapshot`.
 ### Pages (`page/`)
 
 - A column chunk is `[pages][dictionary page][directory]` in one extent; each is one blob of at
-  most 1 MiB, and its `BlobRef` carries the extent (R15.1). The directory lists every page's
+  most 1 MiB, and its `BlobRef` carries the extent (R15.1). `ColumnChunk.data` is the chunk's
+  range in that extent (offset 0 for its own extent, its place in a pack otherwise); page and
+  dictionary offsets are relative to it. The directory lists every page's
   rows, encoding, null count, min/max and checksum, plus the chunk's distinct sketch (a range of
   the directory blob), so pruning and planning never read pages.
 - Encodings (`encode.ts` has the selection rules): constant (and all-null), plain, bool bitmap,

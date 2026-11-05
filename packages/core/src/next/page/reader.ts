@@ -26,7 +26,7 @@
  *
  * Decoding is synchronous over loaded pages; every target buffer is the caller's.
  */
-import type { ColumnChunk, PageEntry } from "../format/manifest.js";
+import type { ChunkData, ColumnChunk, PageEntry } from "../format/manifest.js";
 import { PageEncoding } from "../format/manifest.js";
 import {
   MAX_BLOB_BYTES,
@@ -139,10 +139,16 @@ class SharedLease {
   }
 }
 
+/** The data-space address of a chunk's data range (its pages are at this + `PageEntry.offset`). */
+export function dataAddress(data: ChunkData): number {
+  return data.extent.offset + data.offset;
+}
+
+/** A page's blob: its offset is relative to the chunk's data range (manifest.ts "Chunks"). */
 function blobOf(chunk: ColumnChunk, entry: PageEntry): BlobRef {
   return {
-    extent: chunk.data,
-    offset: entry.offset,
+    extent: chunk.data.extent,
+    offset: chunk.data.offset + entry.offset,
     length: entry.length,
     checksum: entry.checksum,
   };
