@@ -157,6 +157,16 @@ export class FreeSpaceMap {
     this.#dropTail();
   }
 
+  /** Whether all of `[offset, offset + bytes)` (rounded up) is allocated: below `end`, not free. */
+  isAllocated(offset: number, bytes: number): boolean {
+    const end = offset + this.#round(bytes);
+    if (offset < 0 || end > this.#end) return false;
+    // The last run starting at or before `offset` must end by it; the next must start at or after `end`.
+    const next = this.#firstStartAfter(offset);
+    if (next > 0 && this.#endOf(next - 1) > offset) return false;
+    return next >= this.#starts.length || this.#startOf(next) >= end;
+  }
+
   /** The free runs, ascending (tests and diagnostics). */
   runs(): Array<{ readonly offset: number; readonly length: number }> {
     return this.#starts.map((start, index) => ({

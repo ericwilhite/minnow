@@ -22,6 +22,7 @@ const ALLOWED: Readonly<Record<string, readonly string[]>> = {
   vector: ["."],
   storage: [".", "hash"],
   format: [".", "hash", "storage", "memory"],
+  page: [".", "hash", "vector", "keys", "storage", "format", "memory"],
   spill: ["hash", "storage"],
   memory: ["vector"],
   keys: [".", "hash", "vector", "memory"],
@@ -30,8 +31,8 @@ const ALLOWED: Readonly<Record<string, readonly string[]>> = {
   // and the owner consume them.
   access: [".", "vector", "keys", "storage", "format", "memory"],
   // Tracks — their layer, fixed now (write and lower are not written yet):
-  exec: [".", "hash", "vector", "keys", "ir", "memory", "spill", "access"],
-  write: [".", "hash", "vector", "keys", "storage", "format", "memory", "access"],
+  exec: [".", "hash", "vector", "keys", "ir", "memory", "spill", "access", "page"],
+  write: [".", "hash", "vector", "keys", "storage", "format", "memory", "access", "page"],
   lower: [".", "ir", "vector", "access"],
   owner: [
     ".",
@@ -41,6 +42,7 @@ const ALLOWED: Readonly<Record<string, readonly string[]>> = {
     "vector",
     "storage",
     "format",
+    "page",
     "spill",
     "memory",
     "ir",
@@ -56,6 +58,7 @@ const ALLOWED: Readonly<Record<string, readonly string[]>> = {
     "vector",
     "storage",
     "format",
+    "page",
     "spill",
     "memory",
     "ir",

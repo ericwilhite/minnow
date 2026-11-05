@@ -190,7 +190,10 @@ export interface StoreSession {
   /** Guarantee 1. */
   publish(root: Uint8Array): Promise<void>;
 
-  /** Writes an extent at `offset` (a multiple of `DATA_ALIGN`). Durable at the next publish. */
+  /**
+   * Writes bytes at `offset` (a multiple of `DATA_ALIGN`). Durable at the next publish. The caller
+   * may reuse `bytes` once the call resolves (the extent space writes from one reused slab).
+   */
   writeData(offset: number, bytes: Uint8Array): Promise<void>;
   /**
    * Reads byte ranges. Adjacent ranges may be coalesced into one platform read. Results are in

@@ -13,25 +13,26 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 
 ## Module map
 
-| Module             | Owner track                      | What it is                                                                                                                                                                                                                                                                                                                                                                                       |
-| ------------------ | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `types.ts`         | contracts                        | Physical types; the one SQL → physical mapping; declared widths are mandatory; column statistics types shared by format and exec                                                                                                                                                                                                                                                                 |
-| `errors.ts`        | contracts                        | Errors shared across tracks: `OwnerUnresponsiveError`, `RequestExpiredError`, `SessionLostError`                                                                                                                                                                                                                                                                                                 |
-| `temporal.ts`      | contracts                        | DATE/TIMESTAMP on PostgreSQL's 2000 epoch; infinities; ISO text                                                                                                                                                                                                                                                                                                                                  |
-| `hash/`            | contracts                        | xxHash32, the only checksum                                                                                                                                                                                                                                                                                                                                                                      |
-| `vector/`          | contracts → executor             | Batches (byte-bounded), vectors, validity, exact int64, int128 decimals, UTF-8 builder under a grant, locators                                                                                                                                                                                                                                                                                   |
-| `storage/`         | storage                          | Backend contract (lock + async fence open, async mutations), file store, simulated disk with crash model, the storage kit (conformance + durability sweep); the extent space (`extents.ts`: allocation, writer lifecycle, publish, pins and reclaim, the verified page cache), free map, read coalescing, OPFS backend                                                                           |
-| `keys/`            | contracts → executor, key index  | Memcomparable key encoding: reusable writer, batched encoder over vectors, indexable-type rules                                                                                                                                                                                                                                                                                                  |
-| `format/`          | format, write path               | Log frames and multipart transactions, header slots, in-memory and incremental recovery scans, replay rules, request ledger, manifest types                                                                                                                                                                                                                                                      |
-| `spill/`           | executor (OPFS service: storage) | Spill contract (one long-lived scratch file, batching charged to the operator's budget); in-memory double                                                                                                                                                                                                                                                                                        |
-| `memory/`          | executor                         | Memory governor: admission, progress loans, held vs allocated bytes (reference implementation)                                                                                                                                                                                                                                                                                                   |
-| `exec/`            | executor                         | Entry point (`executor.ts`), result frames (`result.ts`), scans (`scan.ts`, `memory-scan.ts`), table rules (`rules.ts`), push driver (`pipeline.ts`), fetcher (`fetch.ts`), comparators, decimal SUM                                                                                                                                                                                             |
-| `ir/`              | lowering, executor               | Operator IR (`ir.ts`); scalar function and operator table (`functions.ts`); table rules in IR form (`rules.ts`); executor costs the planner reads (`costs.ts`)                                                                                                                                                                                                                                   |
-| `access/`          | write path + key index           | Storage access contracts the write path implements: snapshots and segments, catalog, key-index probes and ranges, `modify` (rows, conflicts, RETURNING), transactions, group commit, sequences, delivery                                                                                                                                                                                         |
-| `testing/`         | all                              | Differential-harness adapter for a partial new core; IR reference interpreter for lowering's differential tests                                                                                                                                                                                                                                                                                  |
-| `write/` (to come) | write path + key index           | Group commit, memtables, key index runs, maintenance (implements `access/`)                                                                                                                                                                                                                                                                                                                      |
-| `lower/`           | planner lowering                 | `Lowerer` (`lowerer.ts` contract, `create.ts`): front-end passes over the catalog, typing (`coerce.ts`, `expressions.ts`), queries, DML, DDL, table rules, result descriptors; an in-memory catalog; front-end inventory (`INVENTORY.md`)                                                                                                                                                        |
-| `owner/`           | ownership                        | Owner/client protocol (`protocol.ts`), wire payloads (re-exported from exec) and stream dictionaries (`frame.ts`), ledger outcomes per request (`outcomes.ts`), wire errors (`errors.ts`), client sequencing (`sequence.ts`), election, liveness and step-down (`election.ts`), public client API (`api.ts`), engine boundary and idle-transaction timer (`engine.ts`); composition root to come |
+| Module             | Owner track                      | What it is                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ------------------ | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `types.ts`         | contracts                        | Physical types; the one SQL → physical mapping; declared widths are mandatory; column statistics types shared by format and exec                                                                                                                                                                                                                                                                                       |
+| `errors.ts`        | contracts                        | Errors shared across tracks: `OwnerUnresponsiveError`, `RequestExpiredError`, `SessionLostError`                                                                                                                                                                                                                                                                                                                       |
+| `temporal.ts`      | contracts                        | DATE/TIMESTAMP on PostgreSQL's 2000 epoch; infinities; ISO text                                                                                                                                                                                                                                                                                                                                                        |
+| `hash/`            | contracts                        | xxHash32, the only checksum                                                                                                                                                                                                                                                                                                                                                                                            |
+| `vector/`          | contracts → executor             | Batches (byte-bounded), vectors, validity, exact int64, int128 decimals, UTF-8 builder under a grant, locators                                                                                                                                                                                                                                                                                                         |
+| `storage/`         | storage                          | Backend contract (lock + async fence open, async mutations), file store, simulated disk with crash model, the storage kit (conformance + durability sweep); the extent space (`extents.ts`: allocation, writer lifecycle, publish, pins and reclaim, the verified page cache) and its implementation (`space.ts`, `page-cache.ts`), the in-memory backend (`memory-store.ts`), free map, read coalescing, OPFS backend |
+| `keys/`            | contracts → executor, key index  | Memcomparable key encoding: reusable writer, batched encoder over vectors, indexable-type rules                                                                                                                                                                                                                                                                                                                        |
+| `format/`          | format, write path               | Log frames and multipart transactions, header slots, in-memory and incremental recovery scans, replay rules, request ledger, manifest types, the reachability walk (`reachable.ts`)                                                                                                                                                                                                                                    |
+| `page/`            | format                           | Page codecs, page directory and statistics, streaming group writer, chunk reader (ChunkPages), inflated-page cache                                                                                                                                                                                                                                                                                                     |
+| `spill/`           | executor (OPFS service: storage) | Spill contract (one long-lived scratch file, batching charged to the operator's budget); in-memory double                                                                                                                                                                                                                                                                                                              |
+| `memory/`          | executor                         | Memory governor: admission, progress loans, held vs allocated bytes (reference implementation)                                                                                                                                                                                                                                                                                                                         |
+| `exec/`            | executor                         | Entry point (`executor.ts`), result frames (`result.ts`), scans (`scan.ts`, `memory-scan.ts`), table rules (`rules.ts`), push driver (`pipeline.ts`), fetcher (`fetch.ts`), comparators, decimal SUM                                                                                                                                                                                                                   |
+| `ir/`              | lowering, executor               | Operator IR (`ir.ts`); scalar function and operator table (`functions.ts`); table rules in IR form (`rules.ts`); executor costs the planner reads (`costs.ts`)                                                                                                                                                                                                                                                         |
+| `access/`          | write path + key index           | Storage access contracts the write path implements: snapshots and segments, catalog, key-index probes and ranges, `modify` (rows, conflicts, RETURNING), transactions, group commit, sequences, delivery                                                                                                                                                                                                               |
+| `testing/`         | all                              | Differential-harness adapter for a partial new core                                                                                                                                                                                                                                                                                                                                                                    |
+| `write/` (to come) | write path + key index           | Group commit, memtables, key index runs, maintenance (implements `access/`)                                                                                                                                                                                                                                                                                                                                            |
+| `lower/`           | planner lowering                 | `Lowerer` (`lowerer.ts` contract, `create.ts`): front-end passes over the catalog, typing (`coerce.ts`, `expressions.ts`), queries, DML, DDL, table rules, result descriptors; an in-memory catalog; front-end inventory (`INVENTORY.md`)                                                                                                                                                                              |
+| `owner/`           | ownership                        | Owner/client protocol (`protocol.ts`), wire payloads (re-exported from exec) and stream dictionaries (`frame.ts`), ledger outcomes per request (`outcomes.ts`), wire errors (`errors.ts`), client sequencing (`sequence.ts`), election, liveness and step-down (`election.ts`), public client API (`api.ts`), engine boundary and idle-transaction timer (`engine.ts`); composition root to come                       |
 
 ## Cross-track interfaces (owned by the implementing track)
 
@@ -62,6 +63,7 @@ is access's `Snapshot`.
   hash ← storage ← format ← write
   vector, keys, storage, format, memory ← access ← exec, write, lower
   hash, storage ← spill ← exec;  vector ← ir ← lower
+  types, hash, vector, keys, storage, format, memory ← page ← exec, write
   owner ← everything;  testing ← everything
   ```
 
@@ -143,6 +145,11 @@ is access's `Snapshot`.
     eviction frees exactly what it uncharges. Every leased byte is charged to the reader's budget
     until release, or the read is refused with `ReadDeniedError` (borrow, then retry); `peek` is the
     synchronous, uncharged hit path.
+  - Implemented in `space.ts` (writers, publication, reclaim, open walk, `audit`) and
+    `page-cache.ts` (segmented LRU: a one-pass scan recycles probation and leaves hot blobs).
+    `space-crash.test.ts` crashes it at every physical step of a workload and reopens.
+- **The in-memory backend** (`memory-store.ts`) is the file store over growable in-memory files:
+  the store of an in-memory database and of the end-to-end suites. It has no scratch space.
 - The simulated disk crashes at any physical step. Every write after the last flush may land
   whole, torn or not at all, and may land out of order. It models honest and lying flush.
 - A backend is accepted by the **storage kit** (`kit.ts`): the conformance cases together with a
@@ -196,6 +203,49 @@ is access's `Snapshot`.
   required size, and encoding resumes from where it stopped.
 - Frozen by golden vectors and generated tests over every encodable type.
 
+### Pages (`page/`)
+
+- A column chunk is `[pages][dictionary page][directory]` in one extent; each is one blob of at
+  most 1 MiB, and its `BlobRef` carries the extent (R15.1). `ColumnChunk.data` is the chunk's
+  range in that extent (offset 0 for its own extent, its place in a pack otherwise); page and
+  dictionary offsets are relative to it. The directory lists every page's
+  rows, encoding, null count, min/max and checksum, plus the chunk's distinct sketch (a range of
+  the directory blob), so pruning and planning never read pages.
+- Encodings (`encode.ts` has the selection rules): constant (and all-null), plain, bool bitmap,
+  frame of reference at u8/u16/u32 over an int64 base, delta (FOR over successive differences,
+  a checkpoint every 128 rows), and dictionary codes (u8/u16/u32, or one code) into a
+  group-scoped dictionary.
+- NUMERIC: a declared scale makes a fixed-scale chunk; an unconstrained NUMERIC keeps each
+  value's scale (a per-row section, or one scale per page), and its min/max are normalized sort
+  keys (value order, scale ignored, R15.10), chosen by comparing the exact key bytes. Coefficients are stored by the int64 rules when they
+  fit, else as 128-bit limbs. Past 128 bits, and a single value too large for one page, is
+  `UnsupportedPageLayoutError` (large values: Phase 2, R15.4).
+- Floats: min/max follow PostgreSQL's order (NaN above +Infinity): max is NaN when any NaN is
+  present, both are NaN only when no other value is.
+- gzip is a second stage only maintenance compaction applies (writer option `gzip`; never a
+  memtable flush), to varlen and uuid pages ≥ 16 KiB that halve. Readers keep gzip pages inflated
+  in the `InflatedPageCache` (charged at inflated size, evictable when unpinned), so a page
+  inflates once per cache residency and a cached one loads synchronously (R15.5).
+- `GroupWriter` writes through the caller's `ExtentWriter` (R15.2): small chunks are packed into
+  one shared extent at `finish`; a larger chunk opens an `ExtentBuilder` sized from its bytes per
+  row, appends each page as it is encoded and calls `extend` when it runs short. Memory per
+  column is about one raw page (32 KiB) plus its sketch and small-chunk pages; dictionaries are
+  bounded and charged apart. Everything is charged before it is allocated (a 200-column text
+  group peaks at about 10.6 MB without dictionaries).
+- `ChunkReader` is the executor's `ChunkPages` over the space's `ExtentReader`. The space
+  verifies each blob's checksum once; the reader parses (structural checks) when it loads a page.
+  `open`, `load` and `loadDictionary` are synchronous when everything is cached. Concurrent loads
+  of a page share one read; `close` is final, and loads still in flight reject with
+  `ReaderClosedError` after giving back what they read. Every byte held (pages, inflated pages,
+  the parsed directory) is charged to the reader's budget until `release` or `close`.
+- Decoders write into caller-owned vector buffers, with no JS strings and no per-value
+  allocation: by range, by selection (late materialization), or as dictionary codes. A page
+  flagged `safe` is rechecked when decoded into f64 unless its int64 or decimal header bounds every
+  value (interval pages are always rechecked).
+- `memory-extents.ts` is an in-memory extent space (writer, builder with `extend`, verified and
+  cached reads) for tests and benchmarks; `scripts/page-format-bench.mts` measures the codecs
+  against today's block format.
+
 ### Manifest (`format/manifest.ts`)
 
 - The root is O(tables + ledger). Nothing is O(rows).
@@ -210,6 +260,11 @@ is access's `Snapshot`.
   current and previous roots) → open the write path (a single log scan and replay, `publishedRows`
   staging included) → spill sweep → ready.
 - Snapshot pins live in memory and are dropped when their client's lock is released.
+- `walkReachable(root, reader)` streams every reference a root reaches (catalog, table
+  statistics, group directories, staged transactions' group directories and index runs, group
+  roots, deletion bitmaps, row-id columns, chunk extents, page directories, sketches, index
+  entries, fences and Bloom filters); `reachableExtents(codecs)` is the extent space's
+  `ReachableExtents` over it. A failed metadata read rejects the walk.
 
 ### Storage access (`access/`)
 

@@ -126,8 +126,12 @@
  * Fixed: one 1 MiB read slab and one 1 MiB write slab, charged through the cache handle at open
  * (open fails with `RangeError` under a cap too small for them). The free map, pin table and cache
  * index are small (O(free runs + pins + cached blobs)). Writers stage nothing else: `append`
- * copies small parts into the write slab and writes parts ≥ 256 KiB in place, so a chunk of 32
- * pages costs a few platform writes, not 32.
+ * copies parts into the write slab, which one builder holds at a time, so a builder's consecutive
+ * appends become writes of up to 1 MiB (a chunk of 32 pages costs one or two platform writes, not
+ * 32). When another builder appends, the slab is written out and the partial last sector
+ * (< 4 KiB, since the store writes at `DATA_ALIGN` offsets) is kept with its builder; so
+ * builders that alternate page by page cost one platform write per page, plus at most one
+ * rewritten sector per switch.
  *
  * ## Async, cancellation, errors
  * - Methods that touch storage are async; everything else (`beginWrite`, `open`, `pin`, `peek`,
@@ -253,7 +257,7 @@ export interface OpenSpaceOptions {
  * the free map, retires
  * what only the previous root reaches (`ReclaimLedger.retireAtOpen`), returns the free tail. The
  * walks read O(groups + index runs) metadata, coalesced. Nothing is written but the tail release.
- * Implemented in phase 2 as `openExtentSpace`.
+ * Implemented by `openExtentSpace` (space.ts).
  */
 export type OpenExtentSpace = (
   session: StoreSession,
