@@ -7,9 +7,10 @@
  * acquisition and kept open until the lease is released:
  * - `log`, `data`, `root-0`, `root-1` (file-store.ts);
  * - `spill`: the scratch file the spill service uses (`StorageBackend.scratch`);
- * - `epoch`: 8 bytes, the last acquisition's epoch. Each acquisition reads it, adds one and
- *   writes it back, so epochs increase across acquisitions (`OwnerLease.epoch`). It is not
- *   flushed: a crash can only lose the epoch of an owner that died, which no live owner holds.
+ * - `epoch`: the epoch counter, two checksummed slots (`nextEpoch`). Each acquisition writes the
+ *   next value into the other slot and flushes it before the lease exists, so epochs increase
+ *   across acquisitions and crashes (`OwnerLease.epoch`); the flush costs one platform flush per
+ *   acquisition, never per commit.
  * No file is created or removed after the first acquisition: Chromium and WebKit keep quota
  * charged after a truncate (300 MiB written then truncated still counts 384 MiB), WebKit fails
  * opens after ~252 handles per origin (bug 293955), and every
@@ -36,8 +37,10 @@
  * engine never touches OPFS outside these handles, and clients never open these files: any
  * other opener would block the owner.
  */
+import { xxHash32 } from "../hash/xxhash32.js";
 import {
   OwnershipLostError,
+  StoreCorruptionError,
   StoreQuotaError,
   type AcquireOptions,
   type OwnerLease,
@@ -172,13 +175,7 @@ class OpfsLease implements OwnerLease {
   #lose(): void {
     if (this.#lost.signal.aborted) return;
     this.#lost.abort(new OwnershipLostError(this.epoch));
-    for (const handle of this.#handles) {
-      try {
-        handle.close();
-      } catch {
-        // A handle the platform already closed.
-      }
-    }
+    closeAll(this.#handles);
   }
 
   async release(): Promise<void> {
@@ -187,7 +184,92 @@ class OpfsLease implements OwnerLease {
   }
 }
 
-/** Opens every file's handle in order; on any failure closes the ones it opened, then throws. */
+/** Closes every handle, even when some close throws (a handle the platform already closed). */
+function closeAll(handles: readonly SyncFile[]): void {
+  for (const handle of handles) {
+    try {
+      handle.close();
+    } catch {
+      // Keep closing the rest: one leaked handle blocks every later owner.
+    }
+  }
+}
+
+/**
+ * The epoch counter (review B1-p2b finding 2): two checksummed slots in the `epoch` file, one per
+ * 512-byte sector so a torn write damages only the slot being written, chosen like root slots
+ * (the valid slot with the higher value wins; the next write goes to the other). Acquisition
+ * writes value + 1 into the other slot and flushes before the lease exists, so no epoch handed to a
+ * live owner can repeat after a crash; an interrupted acquisition leaves the old value, which no
+ * live owner holds. Slot: magic u32 "MNEP" | value u32 lo | value u32 hi | xxHash32 of the 12.
+ */
+export const EPOCH_SLOT_BYTES = 512;
+const EPOCH_MAGIC = 0x50454e4d; // "MNEP"
+
+export function encodeEpochSlot(value: number): Uint8Array {
+  const bytes = new Uint8Array(16);
+  const view = new DataView(bytes.buffer);
+  view.setUint32(0, EPOCH_MAGIC, true);
+  view.setUint32(4, value >>> 0, true);
+  view.setUint32(8, Math.floor(value / 2 ** 32), true);
+  view.setUint32(12, xxHash32(bytes, 0, 0, 12), true);
+  return bytes;
+}
+
+/** A slot's value, or null when the slot is empty, torn or not an epoch slot. */
+function decodeEpochSlot(bytes: Uint8Array): number | null {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (bytes.length < 16 || view.getUint32(0, true) !== EPOCH_MAGIC) return null;
+  if (view.getUint32(12, true) !== xxHash32(bytes, 0, 0, 12)) return null;
+  const value = view.getUint32(4, true) + view.getUint32(8, true) * 2 ** 32;
+  return Number.isSafeInteger(value) && value >= 1 ? value : null;
+}
+
+function readAll(file: SyncFile, at: number, length: number): Uint8Array {
+  const buffer = new Uint8Array(length);
+  let done = 0;
+  while (done < length) {
+    const read = file.read(buffer.subarray(done), { at: at + done });
+    if (read <= 0) break;
+    done += read;
+  }
+  return buffer;
+}
+
+/**
+ * Reads the counter, writes the next value into the other slot and flushes. No valid slot is a
+ * fresh start only while the store has never been used (`unused`: every other file empty), which
+ * is also the only time a torn write can leave none: once one slot is flushed, every later write
+ * goes to the other. Otherwise it is `StoreCorruptionError`, never a silent restart at 1. A counter
+ * that cannot increase within safe integers is refused.
+ */
+function nextEpoch(file: SyncFile, unused: boolean): number {
+  const size = file.getSize();
+  const slots = [0, 1].map((slot) =>
+    decodeEpochSlot(
+      readAll(
+        file,
+        slot * EPOCH_SLOT_BYTES,
+        Math.min(16, Math.max(0, size - slot * EPOCH_SLOT_BYTES)),
+      ),
+    ),
+  );
+  const [first, second] = slots as [number | null, number | null];
+  if (first === null && second === null && size > 0 && !unused)
+    throw new StoreCorruptionError("The epoch file holds no valid epoch");
+  const current = Math.max(first ?? 0, second ?? 0);
+  const next = current + 1;
+  if (!Number.isSafeInteger(next)) throw new StoreCorruptionError("The epoch counter is exhausted");
+  const slot = first !== null && first === current ? 1 : 0;
+  file.write(encodeEpochSlot(next), { at: slot * EPOCH_SLOT_BYTES });
+  file.flush();
+  return next;
+}
+
+/**
+ * Opens every file's handle in order and advances the epoch; on any failure closes every handle it
+ * opened, then throws (quota failures as `StoreQuotaError`), so a retry finds the files free.
+ */
 async function openFiles(directory: OpfsDirectoryLike): Promise<OpenFiles> {
   const handles: SyncFile[] = [];
   try {
@@ -195,27 +277,21 @@ async function openFiles(directory: OpfsDirectoryLike): Promise<OpenFiles> {
       const file = await directory.getFileHandle(name, { create: true });
       handles.push(await file.createSyncAccessHandle());
     }
+    const [log, data, root0, root1, scratch, epochFile] = handles as [
+      SyncFile,
+      SyncFile,
+      SyncFile,
+      SyncFile,
+      SyncFile,
+      SyncFile,
+    ];
+    const unused = [log, data, root0, root1].every((file) => file.getSize() === 0);
+    const epoch = nextEpoch(new QuotaMappedFile(epochFile, () => false), unused);
+    return { files: { log, data, roots: [root0, root1] }, scratch, epoch, handles };
   } catch (error) {
-    for (const handle of handles) handle.close();
+    closeAll(handles);
     throw error;
   }
-  const [log, data, root0, root1, scratch, epochFile] = handles as [
-    SyncFile,
-    SyncFile,
-    SyncFile,
-    SyncFile,
-    SyncFile,
-    SyncFile,
-  ];
-  const stored = new Uint8Array(8);
-  const read = epochFile.getSize() >= 8 ? epochFile.read(stored, { at: 0 }) : 0;
-  const view = new DataView(stored.buffer);
-  const last = read === 8 ? view.getUint32(0, true) + view.getUint32(4, true) * 2 ** 32 : 0;
-  const epoch = last + 1;
-  view.setUint32(0, epoch >>> 0, true);
-  view.setUint32(4, Math.floor(epoch / 2 ** 32), true);
-  epochFile.write(stored, { at: 0 });
-  return { files: { log, data, roots: [root0, root1] }, scratch, epoch, handles };
 }
 
 /** The OPFS `StorageBackend`: handle fence, scratch file, quota errors mapped by name. */
@@ -234,7 +310,7 @@ export function createOpfsBackend(options: OpfsBackendOptions): StorageBackend {
         `minnow:${options.name}`,
         () => openFiles(options.directory),
         (opened) => {
-          for (const handle of opened.handles) handle.close();
+          closeAll(opened.handles);
         },
         acquire,
       );

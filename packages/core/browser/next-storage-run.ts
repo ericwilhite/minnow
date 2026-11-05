@@ -2,12 +2,23 @@
  * Page side of the rebuild core's storage browser suite (browser-tests/next-storage.spec.ts):
  * spawns next-storage-worker.ts workers, kills them mid-publish, and verifies from fresh ones.
  */
-import type { NextStorageRequest } from "./next-storage-worker.js";
+import type { NextStorageRequest, PublishPhase } from "./next-storage-worker.js";
 
 interface StorageWorker {
   call<T>(request: NextStorageRequest): Promise<T>;
-  /** The last round the worker reported as published (its publish resolved). */
+  /** The publisher's last reported phase, or null before its first round. */
+  readonly progress: { readonly round: number; readonly phase: PublishPhase } | null;
+  /** The highest round this worker reported as published (its publish resolved). */
   readonly acked: number;
+  /** Rounds this worker published. */
+  readonly published: number;
+  /** Starts a publish loop; a failure other than this page's own `terminate` is kept. */
+  publish(dir: string, rounds: number): void;
+  /**
+   * Resolves when `ready()` holds; rejects naming `what`, the last phase and any publisher
+   * failure when it does not within `ms` (a stalled or failed publisher fails the test).
+   */
+  until(ready: () => boolean, what: string, ms?: number): Promise<void>;
   terminate(): void;
 }
 
@@ -17,7 +28,13 @@ async function spawn(): Promise<StorageWorker> {
   });
   const pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void }>();
   let next = 1;
+  let progress: StorageWorker["progress"] = null;
   let acked = 0;
+  let published = 0;
+  let failure: Error | null = null;
+  let terminated = false;
+  /** Waiters checked on every progress message, so no phase can slip by between polls. */
+  const watchers = new Set<() => void>();
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => {
       reject(new Error("storage worker did not start"));
@@ -32,9 +49,16 @@ async function spawn(): Promise<StorageWorker> {
         id?: number;
         result?: unknown;
         error?: string;
-        progress?: { acked?: number };
+        progress?: { round: number; phase: PublishPhase };
       };
-      if (data.progress?.acked !== undefined) acked = data.progress.acked;
+      if (data.progress !== undefined) {
+        progress = data.progress;
+        if (data.progress.phase === "published") {
+          acked = Math.max(acked, data.progress.round);
+          published += 1;
+        }
+        for (const watch of [...watchers]) watch();
+      }
       if (data.id === undefined) return;
       const waiter = pending.get(data.id);
       pending.delete(data.id);
@@ -43,21 +67,65 @@ async function spawn(): Promise<StorageWorker> {
     });
     worker.addEventListener("error", (event) => {
       clearTimeout(timer);
-      reject(new Error(event.message));
+      failure ??= new Error(`storage worker error: ${event.message}`);
+      reject(failure);
     });
   });
+  const call = <T>(request: NextStorageRequest) => {
+    const id = next++;
+    return new Promise<T>((resolve, reject) => {
+      pending.set(id, { resolve: resolve, reject });
+      worker.postMessage({ id, request });
+    });
+  };
   return {
-    call<T>(request: NextStorageRequest) {
-      const id = next++;
-      return new Promise<T>((resolve, reject) => {
-        pending.set(id, { resolve: resolve, reject });
-        worker.postMessage({ id, request });
-      });
+    call,
+    get progress() {
+      return progress;
     },
     get acked() {
       return acked;
     },
+    get published() {
+      return published;
+    },
+    publish(dir, rounds) {
+      call({ op: "publish-loop", dir, rounds }).then(
+        () => {
+          failure ??= new Error("the publisher stopped before it was killed");
+        },
+        (error: unknown) => {
+          if (!terminated) failure ??= error instanceof Error ? error : new Error(String(error));
+        },
+      );
+    },
+    until(ready, what, ms = 20_000) {
+      return new Promise<void>((resolve, reject) => {
+        const finish = (error: Error | null) => {
+          watchers.delete(check);
+          clearInterval(timer);
+          if (error === null) resolve();
+          else reject(error);
+        };
+        const check = () => {
+          if (failure !== null)
+            finish(new Error(`publisher failed before ${what}: ${failure.message}`));
+          else if (ready()) finish(null);
+          else if (performance.now() > deadline)
+            finish(
+              new Error(
+                `publisher stalled before ${what}: last phase ${JSON.stringify(progress)}, ${String(published)} rounds published`,
+              ),
+            );
+        };
+        const deadline = performance.now() + ms;
+        const timer = setInterval(check, 10);
+        watchers.add(check);
+        check();
+      });
+    },
     terminate() {
+      terminated = true;
       worker.terminate();
       for (const waiter of pending.values()) waiter.reject(new Error("terminated"));
       pending.clear();
@@ -81,8 +149,13 @@ export async function runConformance(): Promise<Array<{ name: string; error: str
   return withWorker((worker) => worker.call({ op: "conformance", prefix: unique("conformance") }));
 }
 
+export const PUBLISH_PHASES: readonly PublishPhase[] = ["writing", "publishing", "published"];
+
 export interface KillResult {
   readonly iterations: Array<{
+    /** The phase this iteration aimed its kill at, and where the publisher was when killed. */
+    readonly target: PublishPhase;
+    readonly killedRound: number;
     readonly acked: number;
     readonly round: number;
     readonly previous: number | null;
@@ -91,10 +164,12 @@ export interface KillResult {
 }
 
 /**
- * Starts a publish loop in a worker, terminates the worker after a random delay (while it is
- * publishing: each round ends in two flushes), and verifies the files from a fresh worker:
- * the root is at least the last acknowledged round, its previous root is the round before, every
- * blob of both verifies, the free map is exact (`audit`), and the next owner keeps writing.
+ * Kills a publishing worker in each phase of a round in turn (writing its extents, inside
+ * `publish`, just after `publish` resolved), after a random 2–5 rounds of its own so an idle or
+ * failed publisher stalls the test instead of passing it, then verifies the files from a fresh
+ * worker: the root is at least the last acknowledged round, its previous root is the round
+ * before, every blob of both verifies, the free map is exact (`audit`), and the next owner keeps
+ * writing. Each phase is the target of every third iteration.
  */
 export async function runKillDuringPublish(iterations: number, seed: number): Promise<KillResult> {
   let state = seed >>> 0;
@@ -106,15 +181,20 @@ export async function runKillDuringPublish(iterations: number, seed: number): Pr
   const results: Array<KillResult["iterations"][number]> = [];
   let acked = 0;
   for (let iteration = 0; iteration < iterations; iteration++) {
+    const target = PUBLISH_PHASES[iteration % PUBLISH_PHASES.length] ?? "publishing";
+    const warmup = 2 + Math.floor(random() * 4);
     const writer = await spawn();
-    void writer.call({ op: "publish-loop", dir, rounds: 1_000 }).catch(() => undefined);
-    // Wait for the first acknowledgement, then a random 0–60 ms more.
-    const deadline = performance.now() + 20_000;
-    while (writer.acked <= acked && performance.now() < deadline)
-      await new Promise((resolve) => setTimeout(resolve, 2));
-    await new Promise((resolve) => setTimeout(resolve, Math.floor(random() * 60)));
+    try {
+      writer.publish(dir, 1_000_000);
+      await writer.until(
+        () => writer.published >= warmup && writer.progress?.phase === target,
+        `the ${target} phase after ${String(warmup)} rounds`,
+      );
+    } finally {
+      writer.terminate();
+    }
+    const killedRound = writer.progress?.round ?? 0;
     acked = Math.max(acked, writer.acked);
-    writer.terminate();
     const verified = await withWorker((worker) =>
       worker.call<{ round: number; previous: number | null; openedMs: number }>({
         op: "verify",
@@ -122,7 +202,8 @@ export async function runKillDuringPublish(iterations: number, seed: number): Pr
         minAcked: acked,
       }),
     );
-    results.push({ acked, ...verified });
+    results.push({ target, killedRound, acked, ...verified });
+    // The verifier published one more round.
     acked = verified.round + 1;
   }
   await withWorker((worker) => worker.call({ op: "remove", dir }));
@@ -133,10 +214,8 @@ export async function runKillDuringPublish(iterations: number, seed: number): Pr
 export async function startPublishLoop(): Promise<string> {
   const dir = unique("tab");
   const writer = await spawn();
-  void writer.call({ op: "publish-loop", dir, rounds: 100_000 }).catch(() => undefined);
-  const deadline = performance.now() + 20_000;
-  while (writer.acked < 3 && performance.now() < deadline)
-    await new Promise((resolve) => setTimeout(resolve, 2));
+  writer.publish(dir, 1_000_000);
+  await writer.until(() => writer.published >= 3, "three published rounds");
   return dir;
 }
 

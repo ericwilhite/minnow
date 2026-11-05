@@ -172,4 +172,54 @@ describe("scratch spill service", () => {
       expect(service.bytesInUse).toBe(0);
     },
   );
+
+  it("keeps O(1) bookkeeping per flush: a sequential file is one coalesced run (review B1-p2b 3)", async () => {
+    const scratch = new FileScratch(
+      new MemoryFile({ bytes: new Uint8Array(0), size: 0, holder: null }),
+      () => undefined,
+    );
+    const service = new ScratchSpillService(scratch);
+    const charge = budget(1 << 20);
+    const file = await service.create(1, charge);
+    for (let index = 0; index < 1000; index++)
+      await file.append(new Uint8Array(SPILL_BATCH_BYTES / 2));
+    expect((file as unknown as { extentRuns: number }).extentRuns).toBe(1);
+    expect(service.bytesInUse).toBe(1000 * (SPILL_BATCH_BYTES / 2));
+    await file.close();
+    expect(charge.used).toBe(0);
+  });
+
+  it("shares one cleanup between concurrent close calls (review B1-p2b 4)", async () => {
+    let unblock!: () => void;
+    const gate = new Promise<void>((resolve) => (unblock = resolve));
+    const backing = new FileScratch(
+      new MemoryFile({ bytes: new Uint8Array(0), size: 0, holder: null }),
+      () => undefined,
+    );
+    const slow: ScratchSpace = {
+      write: async (offset, bytes) => {
+        await gate;
+        await backing.write(offset, bytes);
+      },
+      readInto: (offset, target) => backing.readInto(offset, target),
+      release: (ranges) => backing.release(ranges),
+      truncate: (size) => backing.truncate(size),
+    };
+    const service = new ScratchSpillService(slow);
+    const charge = budget(1 << 20);
+    const file = await service.create(2, charge);
+    const appending = file.append(page(SPILL_BATCH_BYTES + 1, 1));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    let settled = 0;
+    const first = file.close().then(() => (settled += 1));
+    const second = file.close().then(() => (settled += 1));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(settled).toBe(0);
+    unblock();
+    await appending;
+    await Promise.all([first, second]);
+    expect(settled).toBe(2);
+    expect(charge.used).toBe(0);
+    expect(service.bytesInUse).toBe(0);
+  });
 });

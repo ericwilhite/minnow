@@ -80,11 +80,16 @@ async function openSpace(name: string, timeoutMs = 10_000) {
 }
 
 /** One round: a streamed chunk (extended, sometimes relocated) and a small blob; retire `previous`. */
+/** The phases of one round the page can aim a kill at (next-storage-run.ts). */
+export type PublishPhase = "writing" | "publishing" | "published";
+
 async function round(
   space: ExtentSpace,
   number: number,
   previous: readonly ExtentRef[],
+  phase: (phase: PublishPhase) => void = () => undefined,
 ): Promise<ExtentRef[]> {
+  phase("writing");
   const writer = space.beginWrite(`round ${String(number)}`);
   const chunk = writer.open(16_384);
   const small = number % 2 === 0 ? await writer.write([bytesOf(300 + number, number)]) : null;
@@ -96,10 +101,12 @@ async function round(
   const sealed = await chunk.seal();
   const tail = small ?? (await writer.write([bytesOf(300 + number, number)]));
   if (sealed === null) throw new Error("sealed empty");
+  phase("publishing");
   await space.publish(encodeRoot({ round: number, blobs: [...sealed.blobs, ...tail.blobs] }), {
     writers: [writer],
     retired: previous,
   });
+  phase("published");
   return [sealed.extent, tail.extent];
 }
 
@@ -138,9 +145,10 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
       let number = decodeRoot(space.root)?.round ?? 0;
       for (let left = 0; left < request.rounds; left++) {
         number += 1;
-        scope.postMessage({ progress: { started: number } });
-        previous = await round(space, number, previous);
-        scope.postMessage({ progress: { acked: number } });
+        const current = number;
+        previous = await round(space, current, previous, (phase) => {
+          scope.postMessage({ progress: { round: current, phase } });
+        });
       }
       return { finished: number };
     }

@@ -24,7 +24,9 @@ test.describe("rebuild core storage on OPFS", () => {
     expect(results.filter((result) => result.error !== null)).toEqual([]);
   });
 
-  test("survives a worker killed during publish, again and again", async ({ page }, info) => {
+  test("survives a worker killed in every phase of publishing, again and again", async ({
+    page,
+  }, info) => {
     test.setTimeout(180_000);
     const result = await page.evaluate(async (url) => {
       return ((await import(url)) as Run).runKillDuringPublish(12, 0x6b11);
@@ -34,8 +36,14 @@ test.describe("rebuild core storage on OPFS", () => {
       contentType: "application/json",
     });
     expect(result.iterations).toHaveLength(12);
+    // Every phase of a round was the moment of a kill, several times (review B1-p2b finding 5).
+    for (const phase of ["writing", "publishing", "published"] as const)
+      expect(result.iterations.filter((iteration) => iteration.target === phase)).toHaveLength(4);
     for (const iteration of result.iterations) {
+      expect(iteration.killedRound).toBeGreaterThan(1);
       expect(iteration.round).toBeGreaterThanOrEqual(iteration.acked);
+      if (iteration.target === "published")
+        expect(iteration.round).toBeGreaterThanOrEqual(iteration.killedRound);
       if (iteration.round > 1) expect(iteration.previous).toBe(iteration.round - 1);
     }
   });

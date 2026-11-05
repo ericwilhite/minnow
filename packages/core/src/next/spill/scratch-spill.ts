@@ -102,11 +102,11 @@ export class ScratchSpillService implements SpillService {
     await this.#scratch.readInto(offset, target);
   }
 
-  /** Shrinks a never-written tail of `extent` to fit `used` bytes; returns the kept extent. */
-  trim(extent: DataRange, used: number): DataRange {
+  /** Frees the never-written tail of a reserved `extent` beyond `used` bytes; returns its size. */
+  trim(extent: DataRange, used: number): number {
     const kept = this.#map.sizeOf(used);
     if (kept < extent.length) this.#map.free(extent.offset + kept, extent.length - kept);
-    return { offset: extent.offset, length: kept };
+    return extent.length - kept;
   }
 
   /** Returns a closed file's extents: released to the platform, then reusable. */
@@ -124,7 +124,14 @@ class ScratchSpillFile implements SpillFile {
   readonly generation: number;
   readonly #service: ScratchSpillService;
   readonly #budget: ByteBudget;
-  readonly #extents: DataRange[] = [];
+  /**
+   * The file's space, adjacent ranges coalesced (a sequential run is one entry), so bookkeeping is
+   * O(1) per flush (review B1-p2b finding 3). The pending batch's reservation is always the tail of
+   * the last entry.
+   */
+  readonly #extents: Array<{ offset: number; length: number }> = [];
+  #extentBytes = 0;
+  #closing: Promise<void> | null = null;
   /** The batch buffer, or null when the budget refused it or the file is closed. */
   #batch: Uint8Array | null;
   /** Where the batch's bytes will go: the scratch offset of its first byte, once allocated. */
@@ -154,9 +161,21 @@ class ScratchSpillFile implements SpillFile {
   }
 
   get extentBytes(): number {
-    let bytes = 0;
-    for (const extent of this.#extents) bytes += extent.length;
-    return bytes;
+    return this.#extentBytes;
+  }
+
+  /** Runs of contiguous space the file holds (diagnostics: a sequential file holds one). */
+  get extentRuns(): number {
+    return this.#extents.length;
+  }
+
+  /** Records newly allocated space, extending the last entry when it is adjacent. */
+  #claim(range: DataRange): void {
+    const last = this.#extents.at(-1);
+    if (last !== undefined && last.offset + last.length === range.offset)
+      last.length += range.length;
+    else this.#extents.push({ offset: range.offset, length: range.length });
+    this.#extentBytes += range.length;
   }
 
   /** The service swept: nothing of this file exists any more. */
@@ -187,7 +206,7 @@ class ScratchSpillFile implements SpillFile {
       // No batch buffer, or a page larger than it: flush what is batched, then write it alone.
       await this.#flush();
       const extent = this.#service.allocate(page.length, this.#extents.at(-1) ?? null);
-      this.#extents.push(extent);
+      this.#claim(extent);
       await this.#service.write(extent.offset, page);
       this.#length += page.length;
       return { offset: extent.offset, length: page.length, checksum };
@@ -200,7 +219,7 @@ class ScratchSpillFile implements SpillFile {
     if (batch === null) throw new Error("No batch buffer");
     if (this.#batchLength === 0) {
       this.#batchExtent = this.#service.allocate(batch.length, this.#extents.at(-1) ?? null);
-      this.#extents.push(this.#batchExtent);
+      this.#claim(this.#batchExtent);
     }
     const extent = this.#batchExtent;
     if (extent === null) throw new Error("No batch extent");
@@ -220,8 +239,11 @@ class ScratchSpillFile implements SpillFile {
     const extent = this.#batchExtent;
     if (batch === null || extent === null || this.#batchLength === 0) return;
     await this.#service.write(extent.offset, batch.subarray(0, this.#batchLength));
-    const index = this.#extents.indexOf(extent);
-    this.#extents[index] = this.#service.trim(extent, this.#batchLength);
+    // The batch's reservation is the tail of the last entry: give back its unused part there.
+    const freed = this.#service.trim(extent, this.#batchLength);
+    const last = this.#extents.at(-1);
+    if (last !== undefined) last.length -= freed;
+    this.#extentBytes -= freed;
     this.#batched.clear();
     this.#batchLength = 0;
     this.#batchExtent = null;
@@ -256,14 +278,20 @@ class ScratchSpillFile implements SpillFile {
     this.#budget.free(SPILL_BATCH_BYTES);
   }
 
-  async close(): Promise<void> {
-    if (this.#state === "closed") return;
+  /** Every caller shares one cleanup (review B1-p2b finding 4): all resolve when it is done. */
+  close(): Promise<void> {
+    this.#closing ??= this.#close();
+    return this.#closing;
+  }
+
+  async #close(): Promise<void> {
     const live = this.#state === "open";
     this.#state = "closed";
     await this.#queue;
     this.#dropBatch();
     this.#batched.clear();
     const extents = live ? this.#extents.splice(0) : [];
+    this.#extentBytes = 0;
     this.#length = 0;
     await this.#service.release(this, extents);
   }
