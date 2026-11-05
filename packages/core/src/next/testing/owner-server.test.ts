@@ -487,6 +487,10 @@ describe("connections ending", () => {
     await seed(client, 1);
     await client.begin(1);
     expect(writePath.writerBusy).toBe(true);
+    // Not watched until the client declares its lock held.
+    expect(liveness.size).toBe(0);
+    client.liveness(true);
+    await flushTasks();
     expect(liveness.size).toBe(1);
     [...liveness.values()][0]?.abort();
     await flushTasks();

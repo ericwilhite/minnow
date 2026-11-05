@@ -1,0 +1,284 @@
+/**
+ * The owner runtime: what runs inside the owner worker (a dedicated worker a page started, or a
+ * dedicated worker hosting in place). It takes the fence, opens the engine, serves clients and
+ * steps down (election.ts).
+ *
+ * ## Startup (rulings R13, R16.6)
+ * 1. `acquireFenced`: the fence lock `minnow:<db>`, then the engine's sync handles with bounded
+ *    retry (the lock frees before a dead owner's handles).
+ * 2. `factory.open(fence)`: store session → extent space → write path (one log scan and replay)
+ *    → spill sweep. With stand-ins it loads their durable file.
+ * 3. The protocol server; the host page's own client connects on `clientPort`.
+ * 4. The host lock, stolen from the page that won the election: from now on the owner holds it.
+ * 5. Registration with the broker; answers on the skew channel.
+ * 6. `minnow:ready` to the page.
+ *
+ * ## Stepping down
+ * - `terminate` (`freeze`, `pagehide`, a stolen lock): synchronous — the server ends every
+ *   connection (requests past the commit boundary complete in memory but their replies go
+ *   nowhere), the fence's handles close, the lock is released. A page host also terminates the
+ *   worker. Relaxed commits acknowledged since the last flush may be lost, as on power loss.
+ * - `stepDown` (`hidden` on mobile, superseded by a newer build): the server tells every client
+ *   (`stepDown`), the engine flushes and closes, then the fence closes and the lock is released.
+ * - `flush` (`hidden` elsewhere): `engine.flushPending()`; ownership stays.
+ * - A stolen fence lock closes the handles at once (storage probe: the steal alone does not stop a
+ *   hung owner; only closing the handle does).
+ */
+import { acquireFenced } from "../storage/fence.js";
+import {
+  BROKER_PROTOCOL,
+  hostLockName,
+  lifecycleAction,
+  ownerLockName,
+  skewChannelName,
+  type BrokerMessage,
+  type LifecycleEvent,
+  type Platform,
+  type SkewSignal,
+} from "./election.js";
+import type { OwnerEngine } from "./engine.js";
+import { toWireError } from "./errors.js";
+import { PROTOCOL_VERSION, type StepDown } from "./protocol.js";
+import { OwnerServer } from "./server.js";
+import { watchLock, webLocks, type WebLockManager } from "./web-locks.js";
+
+/** The first message a page posts to the owner worker. */
+export interface OwnerHostInit {
+  readonly t: "minnow:host";
+  readonly database: string;
+  readonly build: string;
+  /** The host page's own client connection. */
+  readonly clientPort: MessagePort;
+  /** A port to the broker SharedWorker, or null without one. */
+  readonly brokerPort: MessagePort | null;
+  /** Engine settings (durability, idle timeout; stand-in knobs in tests). Structured-clone data. */
+  readonly settings: Readonly<Record<string, unknown>>;
+}
+
+/** Messages the host posts to its page. */
+export type OwnerHostStatus =
+  | { readonly t: "minnow:ready"; readonly ownerId: string }
+  | { readonly t: "minnow:failed"; readonly error: ReturnType<typeof toWireError> }
+  | { readonly t: "minnow:stopped"; readonly reason: StepDown["reason"] };
+
+/** Messages the page posts to its owner worker after `minnow:host`. */
+export type OwnerHostCommand =
+  | { readonly t: "minnow:lifecycle"; readonly event: LifecycleEvent; readonly platform: Platform }
+  | { readonly t: "minnow:stepDown" };
+
+/** How the host opens the engine on the fence; the composition root supplies it. */
+export interface OwnerEngineFactory<F> {
+  /** Opens the fence: the store's sync handles. Busy errors are retried by `acquireFenced`. */
+  openFence(database: string): F | Promise<F>;
+  closeFence(fence: F): void;
+  /** Opens the engine on the fence (recovery runs here). */
+  open(fence: F, settings: Readonly<Record<string, unknown>>): OwnerEngine | Promise<OwnerEngine>;
+}
+
+export interface OwnerHost {
+  readonly ownerId: string;
+  readonly server: OwnerServer;
+  readonly engine: OwnerEngine;
+  /** Handles a lifecycle event the page relayed. */
+  lifecycle(event: LifecycleEvent, platform: Platform): void;
+  /** Steps down; `graceful` flushes and closes the engine first. */
+  stop(reason: StepDown["reason"], graceful: boolean): Promise<void>;
+}
+
+export interface OwnerHostDeps {
+  readonly locks: WebLockManager;
+  /** Posts a status message to the page (`self.postMessage` in the worker). */
+  readonly post: (status: OwnerHostStatus) => void;
+  /** Bound for taking the fence (default `acquireFenced`'s). */
+  readonly acquireTimeoutMs?: number;
+}
+
+const randomId = (): string => {
+  const bytes = new Uint8Array(8);
+  crypto.getRandomValues(bytes);
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+};
+
+export async function startOwnerHost<F>(
+  init: OwnerHostInit,
+  factory: OwnerEngineFactory<F>,
+  deps: OwnerHostDeps,
+): Promise<OwnerHost> {
+  const database = init.database;
+  const protocol =
+    typeof init.settings.protocol === "number" ? init.settings.protocol : PROTOCOL_VERSION;
+  let acquired: Awaited<ReturnType<typeof acquireFenced<F>>>;
+  let engine: OwnerEngine;
+  try {
+    acquired = await acquireFenced(
+      webLocks(deps.locks),
+      ownerLockName(database),
+      () => factory.openFence(database),
+      (fence) => {
+        factory.closeFence(fence);
+      },
+      deps.acquireTimeoutMs === undefined ? {} : { timeoutMs: deps.acquireTimeoutMs },
+    );
+  } catch (error) {
+    deps.post({ t: "minnow:failed", error: toWireError(error) });
+    throw error;
+  }
+  const { lock, fence } = acquired;
+  try {
+    engine = await factory.open(fence, init.settings);
+  } catch (error) {
+    factory.closeFence(fence);
+    lock.release();
+    deps.post({ t: "minnow:failed", error: toWireError(error) });
+    throw error;
+  }
+
+  // The host lock moves to the owner itself: the page held it only to serialize the election.
+  // Held here, any death of the owner (terminate, crash, closed tab) frees it at once, so waiting
+  // clients elect a successor (election.ts "Locks").
+  let hostLock: Awaited<ReturnType<ReturnType<typeof webLocks>["request"]>>;
+  try {
+    hostLock = await webLocks(deps.locks).request(hostLockName(database), { steal: true });
+  } catch (error) {
+    await engine.close().catch(() => undefined);
+    factory.closeFence(fence);
+    lock.release();
+    deps.post({ t: "minnow:failed", error: toWireError(error) });
+    throw error;
+  }
+
+  const ownerId = randomId();
+  const idle = init.settings.transactionIdleTimeoutMs;
+  const server = new OwnerServer(engine, {
+    ownerId,
+    epoch: 1,
+    build: init.build,
+    protocol,
+    ...(typeof idle === "number" ? { transactionIdleTimeoutMs: idle } : {}),
+    watchLiveness: (name) => watchLock(deps.locks, name),
+  });
+  server.accept(init.clientPort);
+
+  // The context id the platform gives this owner's host lock, for the broker's liveness check.
+  const lockHolder =
+    (await deps.locks.query?.().then(
+      (state) =>
+        (state.held ?? []).find((held) => held.name === hostLockName(database))?.clientId ?? null,
+      () => null,
+    )) ?? null;
+
+  const broker = init.brokerPort;
+  if (broker !== null) {
+    broker.onmessage = (event: MessageEvent) => {
+      const message = event.data as BrokerMessage;
+      if (message.t === "client") server.accept(message.port);
+    };
+    broker.postMessage({
+      t: "register",
+      v: BROKER_PROTOCOL,
+      db: database,
+      ownerId,
+      protocol,
+      build: init.build,
+      lockHolder,
+    } satisfies BrokerMessage);
+  }
+
+  const skew =
+    typeof BroadcastChannel === "undefined"
+      ? null
+      : new BroadcastChannel(skewChannelName(database));
+
+  let stopped: Promise<void> | null = null;
+  const release = (reason: StepDown["reason"]) => {
+    factory.closeFence(fence);
+    lock.release();
+    hostLock.release();
+    skew?.close();
+    if (broker !== null) {
+      broker.postMessage({
+        t: "unregister",
+        v: BROKER_PROTOCOL,
+        db: database,
+        ownerId,
+      } satisfies BrokerMessage);
+      broker.close();
+    }
+    deps.post({ t: "minnow:stopped", reason });
+  };
+  const stop = (reason: StepDown["reason"], graceful: boolean): Promise<void> => {
+    if (stopped !== null) return stopped;
+    server.stepDown(reason);
+    if (!graceful) {
+      // Synchronous: the handles must be closed before the page is suspended or the lock stolen.
+      release(reason);
+      stopped = Promise.resolve();
+      return stopped;
+    }
+    stopped = engine
+      .close()
+      .catch(() => undefined)
+      .then(() => {
+        release(reason);
+      });
+    return stopped;
+  };
+
+  if (skew !== null)
+    skew.onmessage = (event: MessageEvent) => {
+      const signal = event.data as SkewSignal;
+      if (signal.t === "whoOwns")
+        skew.postMessage({ t: "owner", protocol, build: init.build, ownerId } satisfies SkewSignal);
+      else if (signal.t === "supersede" && signal.protocol > protocol)
+        void stop("superseded", true);
+    };
+
+  lock.lost.addEventListener("abort", () => void stop("lockLost", false), { once: true });
+
+  const host: OwnerHost = {
+    ownerId,
+    server,
+    engine,
+    lifecycle(event, platform) {
+      const action = lifecycleAction(event, platform);
+      if (action === "flush") void engine.flushPending();
+      else if (action === "stepDown") void stop("hidden", true);
+      else if (action === "terminate") void stop(event === "freeze" ? "freeze" : "pagehide", false);
+    },
+    stop,
+  };
+  deps.post({ t: "minnow:ready", ownerId });
+  return host;
+}
+
+/**
+ * The owner worker's entry: waits for `minnow:host`, starts the host, then relays the page's
+ * lifecycle commands. `scope` is the worker's global scope.
+ */
+export function serveOwnerWorker<F>(
+  scope: {
+    onmessage: ((event: MessageEvent) => void) | null;
+    postMessage(message: unknown): void;
+  },
+  factory: OwnerEngineFactory<F>,
+  locks: WebLockManager,
+): void {
+  let host: Promise<OwnerHost> | null = null;
+  scope.onmessage = (event: MessageEvent) => {
+    const message = event.data as OwnerHostInit | OwnerHostCommand;
+    if (message.t === "minnow:host") {
+      host = startOwnerHost(message, factory, {
+        locks,
+        post: (status) => {
+          scope.postMessage(status);
+        },
+      });
+      host.catch(() => undefined);
+      return;
+    }
+    void host?.then((started) => {
+      if (message.t === "minnow:lifecycle") started.lifecycle(message.event, message.platform);
+      else void started.stop("closing", true);
+    });
+  };
+}

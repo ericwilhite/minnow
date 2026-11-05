@@ -123,7 +123,8 @@
  *   keeps holding it until the terminal reply. The owner watches that lock only while it has
  *   such requests or pins of the client; a grant ends the connection (above).
  * - Requests are never delayed to take the lock: the client sends `live: false` until the lock is
- *   granted, then sends `liveness` once, which makes all its outstanding requests live. Opening a
+ *   granted, then sends `liveness { held: true }`, which makes its outstanding requests and pins
+ *   watched; before releasing the lock it sends `liveness { held: false }`. Opening a
  *   cursor or a transaction (they pin a snapshot) waits for the lock.
  * - While a client has requests in flight the owner sends `alive` at least every
  *   `ALIVE_INTERVAL_MS`. The client's deadline counts silence, not wall time.
@@ -371,9 +372,14 @@ export interface Release {
   readonly through: number;
 }
 
-/** The client now holds its liveness lock: every request it has outstanding is `live`. */
+/**
+ * `held: true`: the client now holds its liveness lock, so its outstanding requests and its pins
+ * (open transactions, cursors) may be watched. `held: false`, sent before it releases the lock
+ * (no pins, nothing in flight): stop watching.
+ */
 export interface Liveness {
   readonly t: "liveness";
+  readonly held: boolean;
 }
 
 /**

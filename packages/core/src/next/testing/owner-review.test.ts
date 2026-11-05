@@ -196,7 +196,7 @@ describe("frames and their charge (findings 9, 10, 12)", () => {
     const { connect, server } = harness({ liveness });
     const client = await connect();
     await seed(client, 3);
-    client.liveness();
+    client.liveness(true);
     client.cursor("SELECT * FROM t");
     await sleep(20);
     expect(server.stats.outstandingFrames).toBeGreaterThan(0);
@@ -207,7 +207,7 @@ describe("frames and their charge (findings 9, 10, 12)", () => {
     const { connect, executor, governor } = harness();
     const client = await connect();
     await seed(client, 1);
-    client.liveness();
+    client.liveness(true);
     const cursor = client.cursor("SELECT * FROM t WHERE id = $1", [1]);
     await sleep(20);
     cursor.close();

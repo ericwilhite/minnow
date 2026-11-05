@@ -153,6 +153,28 @@ export class SavepointNotFoundError extends Error {
   }
 }
 
+/**
+ * The owner refused the connection (protocol.ts `refused`): another protocol version, or the
+ * owner is stepping down or superseded. The connector decides what follows (election.ts "Version
+ * skew").
+ */
+export class ConnectionRefusedError extends Error {
+  readonly code = "MINNOW_CONNECTION_REFUSED";
+  override readonly name = "ConnectionRefusedError";
+  readonly reason: "version" | "steppingDown" | "superseded" | "staleGeneration";
+  readonly ownerProtocol: number;
+  constructor(
+    reason: "version" | "steppingDown" | "superseded" | "staleGeneration",
+    ownerProtocol: number,
+  ) {
+    super(
+      `The database owner refused the connection: ${reason} (owner protocol ${String(ownerProtocol)})`,
+    );
+    this.reason = reason;
+    this.ownerProtocol = ownerProtocol;
+  }
+}
+
 /** A statement inside a failed transaction (PostgreSQL 25P02): only ROLLBACK ends it. */
 export class InFailedTransactionError extends Error {
   readonly code = "MINNOW_IN_FAILED_TRANSACTION";
@@ -220,4 +242,5 @@ export const ownerErrorRegistry: ErrorRegistry = new Map<string, new (...args: n
   ["ReadOnlyTransactionError", ReadOnlyTransactionError],
   ["SequenceStateError", SequenceStateError],
   ["RecordedFailureError", RecordedFailureError],
+  ["ConnectionRefusedError", ConnectionRefusedError],
 ]);

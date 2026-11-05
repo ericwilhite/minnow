@@ -242,17 +242,44 @@ class StandinTransaction {
   }
 }
 
+/**
+ * Where a stand-in write path keeps its durable state across owners: the owner worker gives it a
+ * sync access handle on one OPFS file (the handle is the fence), Node tests a string. `save` runs
+ * at every flush with the whole durable state; `load` once at open.
+ */
+export interface StandinPersistence {
+  load(): string | null;
+  /** May be asynchronous (IndexedDB): the flush, and so durability, waits for it. */
+  save(text: string): void | Promise<void>;
+}
+
+interface Saved {
+  readonly lsn: number;
+  readonly version: number;
+  readonly nextTableId: number;
+  readonly tables: ReadonlyArray<{
+    readonly def: TableDef;
+    readonly rows: ReadonlyArray<readonly [string, Row]>;
+  }>;
+  readonly sequences: ReadonlyArray<readonly [number, string]>;
+  readonly ledger: ReturnType<RequestLedger["checkpoint"]>;
+}
+
 export interface StandinWritePathOptions {
+  readonly persistence?: StandinPersistence;
   readonly durability?: "strict" | "relaxed";
   /** Flush automatically after each commit (a timer of `flushDelayMs`). Default true. */
   readonly autoFlush?: boolean;
   readonly flushDelayMs?: number;
+  /** Tests: while true, scheduled flushes wait (a commit stays applied, not durable). */
+  readonly flushHeld?: () => boolean;
   readonly now?: () => number;
 }
 
 export class StandinWritePath implements WritePath {
   readonly durability: "strict" | "relaxed";
-  readonly ledger = new RequestLedger();
+  ledger: RequestLedger;
+  readonly #persistence: StandinPersistence | null;
   readonly failure: Error | null = null;
   appliedLsn = 0;
   durableLsn = 0;
@@ -261,6 +288,8 @@ export class StandinWritePath implements WritePath {
   #durable: State = cloneState(this.applied);
   readonly #autoFlush: boolean;
   readonly #flushDelayMs: number;
+  readonly #flushHeld: () => boolean;
+  #flushing: Promise<void> = Promise.resolve();
   readonly #now: () => number;
   #slot: StandinTransaction | null = null;
   readonly #waiters: Array<{
@@ -279,7 +308,46 @@ export class StandinWritePath implements WritePath {
     this.durability = options.durability ?? "strict";
     this.#autoFlush = options.autoFlush ?? true;
     this.#flushDelayMs = options.flushDelayMs ?? 0;
+    this.#flushHeld = options.flushHeld ?? (() => false);
     this.#now = options.now ?? Date.now;
+    this.#persistence = options.persistence ?? null;
+    this.ledger = new RequestLedger();
+    const text = this.#persistence?.load() ?? null;
+    if (text !== null && text !== "") {
+      // Recovery: the durable state, sequences and committed outcomes of the last flush.
+      const saved = JSON.parse(text) as Saved;
+      this.applied = {
+        version: saved.version,
+        nextTableId: saved.nextTableId,
+        tables: new Map(
+          saved.tables.map((table) => [
+            table.def.id,
+            { def: table.def, rows: new Map(table.rows) },
+          ]),
+        ),
+      };
+      this.#durable = this.applied;
+      this.appliedLsn = saved.lsn;
+      this.durableLsn = saved.lsn;
+      for (const [id, value] of saved.sequences) this.#sequenceValues.set(id, BigInt(value));
+      this.ledger = RequestLedger.restore(saved.ledger, this.#now());
+    }
+  }
+
+  #save(lsn: number): void | Promise<void> {
+    if (this.#persistence === null) return;
+    const saved: Saved = {
+      lsn,
+      version: this.applied.version,
+      nextTableId: this.applied.nextTableId,
+      tables: [...this.applied.tables.values()].map((table) => ({
+        def: table.def,
+        rows: [...table.rows],
+      })),
+      sequences: [...this.#sequenceValues].map(([id, value]) => [id, String(value)] as const),
+      ledger: this.ledger.checkpoint(),
+    };
+    return this.#persistence.save(JSON.stringify(saved));
   }
 
   get catalog(): CatalogView {
@@ -403,6 +471,10 @@ export class StandinWritePath implements WritePath {
     if (!this.#autoFlush || this.#flushTimer !== null) return;
     this.#flushTimer = setTimeout(() => {
       this.#flushTimer = null;
+      if (this.#flushHeld()) {
+        this.#scheduleFlush();
+        return;
+      }
       void this.flush();
     }, this.#flushDelayMs);
   }
@@ -415,18 +487,30 @@ export class StandinWritePath implements WritePath {
   }
 
   /** One group flush: everything applied so far becomes durable. */
+  /**
+   * One group flush: everything applied so far is saved, then durable. Committed outcomes are
+   * recorded first so the saved ledger holds them. Flushes run one at a time.
+   */
   flush(): Promise<void> {
+    this.#flushing = this.#flushing.then(() => this.#flushOnce());
+    return this.#flushing;
+  }
+
+  async #flushOnce(): Promise<void> {
     this.flushes++;
-    this.durableLsn = this.appliedLsn;
-    this.#durable = this.applied;
+    const lsn = this.appliedLsn;
+    const state = this.applied;
     for (const outcome of this.#pendingOutcomes.splice(0))
       this.#record(outcome.lsn, outcome.request);
+    const saving = this.#save(lsn);
+    if (saving !== undefined) await saving;
+    this.durableLsn = Math.max(this.durableLsn, lsn);
+    this.#durable = state;
     const ready = this.#durableWaiters.filter((waiter) => waiter.lsn <= this.durableLsn);
     for (const waiter of ready) {
       this.#durableWaiters.splice(this.#durableWaiters.indexOf(waiter), 1);
       waiter.resolve();
     }
-    return Promise.resolve();
   }
 
   stats(): WritePathStats {
@@ -486,6 +570,26 @@ interface Program {
   readonly run: (context: ProgramContext) => ProgramResult;
   /** Stream frames of this many rows asynchronously (window and cancellation tests). */
   readonly streamBy: number | null;
+  /**
+   * Busy CPU work of this many ms before the result, in slices of `YIELD_SLICE_MS` with a task
+   * yield between them, as the executor's driver yields (ruling R16.4): an analytic load.
+   */
+  readonly spinMs?: (params: readonly ParameterValue[]) => number;
+}
+
+/** The executor yields at least this often (B4 `YIELD_INTERVAL_MS`). */
+export const YIELD_SLICE_MS = 4;
+
+/** A task boundary (a message, not a timer: no clamping). */
+function yieldTask(): Promise<void> {
+  return new Promise((resolve) => {
+    const channel = new MessageChannel();
+    channel.port1.onmessage = () => {
+      channel.port1.close();
+      resolve();
+    };
+    channel.port2.postMessage(null);
+  });
 }
 
 const programs = new WeakMap<PhysicalPlan, Program>();
@@ -682,6 +786,11 @@ class StandinExecution implements Execution {
       });
       return;
     }
+    const spin = this.program.spinMs?.(params) ?? 0;
+    if (spin > 0) {
+      void this.#spin(spin, summary, result.rows);
+      return;
+    }
     if (this.program.streamBy !== null) {
       void this.#emit(result.rows, this.program.streamBy).then(() => {
         this.#executedWith(summary);
@@ -689,6 +798,20 @@ class StandinExecution implements Execution {
       return;
     }
     void this.#emit(result.rows, null);
+    this.#executedWith(summary);
+  }
+
+  async #spin(ms: number, summary: ExecutionSummary, rows: Row[]): Promise<void> {
+    const end = performance.now() + ms;
+    while (performance.now() < end) {
+      if (this.#cancelled) return;
+      const slice = Math.min(end, performance.now() + YIELD_SLICE_MS);
+      while (performance.now() < slice) {
+        // busy: an analytic kernel
+      }
+      await yieldTask();
+    }
+    void this.#emit(rows, null);
     this.#executedWith(summary);
   }
 
@@ -901,7 +1024,8 @@ export class PlanningError extends Error {
 
 /**
  * The SQL the stand-in plans (case-insensitive, one statement):
- * `CREATE TABLE t (k INT PRIMARY KEY, c INT|TEXT|BIGINT, …)`; `SELECT * FROM t WHERE k = $1`
+ * `CREATE TABLE t (k INT PRIMARY KEY, c INT|TEXT|BIGINT, …)`; `SELECT spin($1)` (an analytic load of
+ * $1 ms, yielding every 4 ms); `SELECT * FROM t WHERE k = $1`
  * (point read); `SELECT * FROM t [STREAM BY n]`; `SELECT nextval('s')`; `SELECT fail()` (a 22012
  * error); `INSERT INTO t VALUES ($1, …) [RETURNING *]`; `UPDATE t SET c = c + 1 WHERE k = $1
  * [RETURNING *]`; `DELETE FROM t WHERE k = $1`; BEGIN [READ ONLY], START TRANSACTION, COMMIT,
@@ -1011,6 +1135,25 @@ export class StandinPlanner implements StatementPlanner {
           run: () => {
             throw new ExecutionError("division by zero", "MINNOW_DIVISION_BY_ZERO", "22012");
           },
+        }),
+      };
+    }
+
+    if (/^SELECT spin\(\$1\)$/iu.test(sql)) {
+      const columns = [{ name: "spin", type: INT, nullable: false }];
+      return {
+        ...base,
+        kind: "query",
+        command: "SELECT",
+        parameters: [INT],
+        reads: [],
+        pointRead: false,
+        columns: columns.map(meta),
+        plan: plan(columns, 1, catalog.version, {
+          kind: "query",
+          streamBy: null,
+          spinMs: (params) => Number(params[0] ?? 0),
+          run: () => ({ rows: [[1]], affected: 0, requiresLsn: 0 }),
         }),
       };
     }

@@ -63,7 +63,13 @@ export const test = base.extend<{ storageContext: BrowserContext }>({
     const profile = info.outputPath("storage-profile");
     const environment =
       browserName === "webkit" ? { ...process.env, CFFIXED_USER_HOME: profile } : undefined;
+    // Opt-in for hosts where Playwright's WebKit build lacks system libraries (non-Ubuntu Linux):
+    // MINNOW_WEBKIT_EXECUTABLE names a launcher that supplies them (see the storage probe's
+    // webkit-run.sh). Unset, nothing changes.
+    const webkitExecutable =
+      browserName === "webkit" ? process.env.MINNOW_WEBKIT_EXECUTABLE : undefined;
     const persistent = await launcher.launchPersistentContext(profile, {
+      ...(webkitExecutable === undefined ? {} : { executablePath: webkitExecutable }),
       baseURL: info.project.use.baseURL ?? "",
       // Playwright's macOS WebKit embedder redirects IndexedDB and caches into userDataDir but
       // leaves OPFS in Cocoa's application-wide data directory. Isolate that default under this

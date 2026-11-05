@@ -7,7 +7,7 @@
  * | Name                         | Held by                                     | While                        |
  * | ---------------------------- | ------------------------------------------- | ---------------------------- |
  * | `minnow:<db>`                | the owner worker (`storage/fence.ts`)       | it holds the store's handles |
- * | `minnow:<db>:host`           | the host: the context running the owner     | the owner runs               |
+ * | `minnow:<db>:host`           | the owner (stolen from the page that won)    | the owner runs               |
  * | `minnow:<db>:client:<id>`    | a client                                    | it has pins or `live` requests |
  *
  * - Hosts (`canHost`): a page, which starts a dedicated owner worker (the package's owner entry),
@@ -142,6 +142,12 @@ export type BrokerMessage =
       readonly ownerId: string;
       readonly protocol: number;
       readonly build: string;
+      /**
+       * The Web Locks client id holding the host lock (from `navigator.locks.query()`), or null
+       * where the platform does not report it: the broker hands out this registration only while
+       * that very holder still holds the lock.
+       */
+      readonly lockHolder: string | null;
     }
   | { readonly t: "unregister"; readonly v: number; readonly db: string; readonly ownerId: string }
   /** Broker → client (the port is in the transfer list). */
@@ -155,7 +161,10 @@ export type BrokerMessage =
   /** Broker → owner: a new client connection. */
   | { readonly t: "client"; readonly clientId: string; readonly port: MessagePort }
   /** Broker → every connected context. */
-  | { readonly t: "registered"; readonly db: string; readonly ownerId: string };
+  | { readonly t: "registered"; readonly db: string; readonly ownerId: string }
+  /** Diagnostics: a bare round trip to the broker (the latency lane's platform baseline). */
+  | { readonly t: "ping"; readonly v: number; readonly nonce: number }
+  | { readonly t: "pong"; readonly nonce: number };
 
 // --- Skew --------------------------------------------------------------------------------------
 

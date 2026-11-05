@@ -18,6 +18,8 @@
     "../vite.library.config.ts",
     "../playwright.library.config.ts",
     "../playwright.site.config.ts",
+    "../playwright.next-owner.config.ts",
+    "../vite.next-owner.config.ts",
     "../playwright-flaky-reporter.mjs",
     "strip-dist-comments.mjs"
   ],

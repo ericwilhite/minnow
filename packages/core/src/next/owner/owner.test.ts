@@ -206,7 +206,7 @@ describe("parseClientMessage", () => {
     expect(parseClientMessage(structuredClone(statement))).toEqual(statement);
     expect(parseClientMessage({ t: "cancel", target: 3, close: false }).t).toBe("cancel");
     expect(parseClientMessage({ t: "release", target: 3, through: 0 }).t).toBe("release");
-    expect(parseClientMessage({ t: "liveness" }).t).toBe("liveness");
+    expect(parseClientMessage({ t: "liveness", held: true }).t).toBe("liveness");
     expect(parseClientMessage({ t: "hello", protocol: PROTOCOL_VERSION }).t).toBe("hello");
   });
 

@@ -18,7 +18,12 @@
  */
 import { SessionLostError } from "../errors.js";
 import { decodeUtf8 } from "../vector/varlen.js";
-import { ClientClosedError, fromWireError, ownerErrorRegistry } from "./errors.js";
+import {
+  ClientClosedError,
+  ConnectionRefusedError,
+  fromWireError,
+  ownerErrorRegistry,
+} from "./errors.js";
 import { StreamDictionaries, type FramePayload, type WireFlat, type WireVector } from "./frame.js";
 import {
   DEFAULT_RESULT_WINDOW_BYTES,
@@ -44,6 +49,8 @@ export interface ClientResult {
 
 export interface ProtocolClientOptions {
   readonly clientId?: string;
+  /** The protocol this client speaks; `PROTOCOL_VERSION` (other values are for skew tests). */
+  readonly protocol?: number;
   readonly build?: string;
   readonly livenessLock?: string;
   readonly now?: () => number;
@@ -146,9 +153,18 @@ function makeResult(
 export class ProtocolClient {
   readonly clientId: string;
   readonly #build: string;
-  readonly #livenessLock: string;
+  /**
+   * The liveness lock this client holds and announces in `hello` (election.ts `clientLockName`).
+   * The connector sets it before connecting; it must name the lock actually held, or the owner
+   * watches a free lock and ends the connection.
+   */
+  livenessLock: string;
   readonly #now: () => number;
+  readonly protocol: number;
   readonly #sequencer = new RequestSequencer();
+  /** Each session's transaction state, from replies: a non-idle session pins a snapshot. */
+  readonly #sessions = new Map<number, TransactionState>();
+  #cursors = 0;
   readonly #pending = new Map<number, Pending>();
   readonly #session0 = { transaction: "idle" as TransactionState, unresolvedControl: 0 };
   #port: MessagePort | null = null;
@@ -160,13 +176,33 @@ export class ProtocolClient {
   readonly #preparedControl = new Map<number, boolean>();
   #closed = false;
   onSessionAborted: ((session: number) => void) | null = null;
+  /** Called whenever requests in flight or pins change (the connector's liveness and watcher). */
+  onActivity: (() => void) | null = null;
   onStepDown: ((reason: StepDown["reason"]) => void) | null = null;
 
   constructor(options: ProtocolClientOptions = {}) {
     this.clientId = options.clientId ?? randomClientId();
     this.#build = options.build ?? "test";
-    this.#livenessLock = options.livenessLock ?? `client:${this.clientId}`;
+    this.livenessLock = options.livenessLock ?? `client:${this.clientId}`;
     this.#now = options.now ?? Date.now;
+    this.protocol = options.protocol ?? PROTOCOL_VERSION;
+  }
+
+  /** Requests sent and not yet answered. */
+  get pendingCount(): number {
+    return this.#pending.size;
+  }
+
+  /** Whether the owner holds pins for this client: an open transaction or an open cursor. */
+  get hasPins(): boolean {
+    if (this.#cursors > 0) return true;
+    for (const state of this.#sessions.values()) if (state !== "idle") return true;
+    return false;
+  }
+
+  /** Whether a connection is open (welcomed and not lost). */
+  get connected(): boolean {
+    return this.#port !== null && this.#welcome === null;
   }
 
   get generation(): number {
@@ -211,10 +247,10 @@ export class ProtocolClient {
       this.#welcome = { resolve, reject };
       port.postMessage({
         t: "hello",
-        protocol: PROTOCOL_VERSION,
+        protocol: this.protocol,
         build: this.#build,
         clientId: this.clientId,
-        livenessLock: this.#livenessLock,
+        livenessLock: this.livenessLock,
         previousOwnerId: this.#ownerId,
         generation: this.#generation,
       });
@@ -367,9 +403,9 @@ export class ProtocolClient {
     this.#port?.postMessage({ t: "cancel", target: seq, close });
   }
 
-  /** Declares the liveness lock held (protocol.ts `liveness`). */
-  liveness(): void {
-    this.#port?.postMessage({ t: "liveness" });
+  /** Declares the liveness lock held, or about to be released (protocol.ts `liveness`). */
+  liveness(held: boolean): void {
+    this.#port?.postMessage({ t: "liveness", held });
   }
 
   #request(
@@ -410,7 +446,16 @@ export class ProtocolClient {
     };
     if (control && session === 0) this.#session0.unresolvedControl++;
     this.#pending.set(seq, pending);
+    if (cursor !== null) {
+      this.#cursors++;
+      const closeCursor = () => {
+        this.#cursors--;
+        this.onActivity?.();
+      };
+      promise.then(closeCursor, closeCursor);
+    }
     this.#send(pending, false);
+    this.onActivity?.();
     return { seq, promise };
   }
 
@@ -433,6 +478,7 @@ export class ProtocolClient {
     this.#pending.delete(seq);
     this.#sequencer.resolve(seq);
     if (pending.control && pending.session === 0) this.#session0.unresolvedControl--;
+    queueMicrotask(() => this.onActivity?.());
   }
 
   // ---- incoming ----
@@ -445,7 +491,7 @@ export class ProtocolClient {
         this.#welcome = null;
         return;
       case "refused":
-        this.#welcome?.reject(new Error(`Refused: ${message.reason}`));
+        this.#welcome?.reject(new ConnectionRefusedError(message.reason, message.ownerProtocol));
         this.#welcome = null;
         return;
       case "rows":
@@ -479,6 +525,8 @@ export class ProtocolClient {
         }
         if (message.t === "done") {
           if (pending.session === 0) this.#session0.transaction = message.summary.transaction;
+          if (pending.session !== null)
+            this.#sessions.set(pending.session, message.summary.transaction);
           this.#settle(message.seq);
           const result = makeResult(
             pending.columns ?? [],
@@ -533,6 +581,7 @@ export class ProtocolClient {
       }
       case "sessionAborted":
         if (message.session === 0) this.#session0.transaction = "timedOut";
+        this.#sessions.set(message.session, "timedOut");
         this.onSessionAborted?.(message.session);
         return;
       case "stepDown":

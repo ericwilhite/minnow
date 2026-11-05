@@ -47,6 +47,9 @@
     "index-takeover-run.ts",
     "index-takeover-worker.ts",
     "unresponsive-worker.ts",
-    "supersede-run.ts"
+    "supersede-run.ts",
+    "next-owner/run.ts",
+    "next-owner/owner-worker.ts",
+    "next-owner/broker-worker.ts"
   ]
 }

@@ -34,6 +34,7 @@
  * ledger (`endSession`).
  */
 import { RequestExpiredError, SessionLostError } from "../errors.js";
+import { LIVENESS_IDLE_RELEASE_MS } from "./election.js";
 import { QueryCancelledError } from "../exec/errors.js";
 import type { ResultFrame, ResultStream } from "../exec/result.js";
 import type { Admission, Outcome } from "../format/ledger.js";
@@ -86,6 +87,8 @@ export interface OwnerServerOptions {
   /** The storage fence epoch held. */
   readonly epoch: number;
   readonly build: string;
+  /** The protocol this owner speaks; `PROTOCOL_VERSION` (other values are for skew tests). */
+  readonly protocol?: number;
   readonly now?: () => number;
   readonly transactionIdleTimeoutMs?: number;
   readonly aliveIntervalMs?: number;
@@ -279,6 +282,7 @@ class Connection {
   #aliveTimer: ReturnType<typeof setInterval> | null = null;
   #sweepTimer: ReturnType<typeof setInterval> | null = null;
   #watch: { readonly gone: AbortSignal; stop(): void } | null = null;
+  #watchIdle: ReturnType<typeof setTimeout> | null = null;
   #livenessHeld = false;
 
   constructor(server: OwnerServer, port: ServerPort) {
@@ -327,9 +331,9 @@ class Connection {
         this.#release(message.target, message.through);
         return;
       case "liveness":
-        this.#livenessHeld = true;
-        for (const running of this.#running.values()) running.live = true;
-        for (const stream of this.#streams.values()) stream.live = true;
+        this.#livenessHeld = message.held;
+        for (const running of this.#running.values()) running.live = message.held;
+        for (const stream of this.#streams.values()) stream.live = message.held;
         this.#watchIfNeeded();
         return;
       case "liveAck":
@@ -360,11 +364,12 @@ class Connection {
 
   #hello(hello: Hello): void {
     const server = this.#server;
-    if (hello.protocol !== PROTOCOL_VERSION) {
+    const protocol = server.options.protocol ?? PROTOCOL_VERSION;
+    if (hello.protocol !== protocol) {
       this.post({
         t: "refused",
         reason: "version",
-        ownerProtocol: PROTOCOL_VERSION,
+        ownerProtocol: protocol,
         ownerBuild: server.options.build,
       });
       return;
@@ -373,7 +378,7 @@ class Connection {
       this.post({
         t: "refused",
         reason: server.steppingDown === "superseded" ? "superseded" : "steppingDown",
-        ownerProtocol: PROTOCOL_VERSION,
+        ownerProtocol: protocol,
         ownerBuild: server.options.build,
       });
       return;
@@ -404,7 +409,7 @@ class Connection {
     server.supersede(this.clientId, this.generation, this);
     this.post({
       t: "welcome",
-      protocol: PROTOCOL_VERSION,
+      protocol,
       build: server.options.build,
       ownerId: server.options.ownerId,
       epoch: server.options.epoch,
@@ -1265,31 +1270,54 @@ class Connection {
 
   // ---- liveness, heartbeats, abandoned streams ----
 
+  /** Whether this client's liveness matters now: live requests, live frames, open transactions. */
+  #livenessNeeded(): boolean {
+    for (const running of this.#running.values()) if (running.live) return true;
+    // Frames posted to a live client hold the executor's charge: keep watching until released.
+    for (const stream of this.#streams.values())
+      if (stream.live && stream.posted.length > 0) return true;
+    // Only a client that declared its lock held is watched for its sessions: an undeclared lock is
+    // not held, and its grant would end a healthy client.
+    if (this.#livenessHeld)
+      for (const slot of this.#sessions.values())
+        if ((slot.engine?.transaction ?? "idle") !== "idle") return true;
+    return false;
+  }
+
+  /**
+   * Starts watching the client's liveness lock when needed, and stops it only after
+   * `LIVENESS_IDLE_RELEASE_MS` without need: a request loop pays one lock request, not one per
+   * request (lock calls cross processes). A grant ends the connection only if the client still
+   * has something to protect; granted while idle, it just ends the watch.
+   */
   #watchIfNeeded(): void {
     const watch = this.#server.options.watchLiveness;
     if (watch === undefined || this.#state !== "open" || this.#livenessLock === "") return;
-    let needs = false;
-    for (const running of this.#running.values()) if (running.live) needs = true;
-    // Frames posted to a live client hold the executor's charge: keep watching until released.
-    for (const stream of this.#streams.values())
-      if (stream.live && stream.posted.length > 0) needs = true;
-    for (const slot of this.#sessions.values()) {
-      const state = slot.engine?.transaction ?? "idle";
-      if (state !== "idle") needs = true;
-    }
-    if (needs && this.#watch === null) {
-      this.#watch = watch(this.#livenessLock);
-      this.#watch.gone.addEventListener(
+    const needs = this.#livenessNeeded();
+    if (needs) {
+      if (this.#watchIdle !== null) clearTimeout(this.#watchIdle);
+      this.#watchIdle = null;
+      if (this.#watch !== null) return;
+      const started = watch(this.#livenessLock);
+      this.#watch = started;
+      started.gone.addEventListener(
         "abort",
         () => {
-          this.end("livenessLost");
+          if (this.#watch !== started) return;
+          this.#watch = null;
+          if (this.#livenessNeeded()) this.end("livenessLost");
         },
         { once: true },
       );
-    } else if (!needs && this.#watch !== null) {
-      this.#watch.stop();
-      this.#watch = null;
+      return;
     }
+    if (this.#watch === null || this.#watchIdle !== null) return;
+    this.#watchIdle = setTimeout(() => {
+      this.#watchIdle = null;
+      if (this.#livenessNeeded()) return;
+      this.#watch?.stop();
+      this.#watch = null;
+    }, LIVENESS_IDLE_RELEASE_MS);
   }
 
   #updateAlive(): void {
@@ -1365,6 +1393,8 @@ class Connection {
     this.#sweepTimer = null;
     this.#watch?.stop();
     this.#watch = null;
+    if (this.#watchIdle !== null) clearTimeout(this.#watchIdle);
+    this.#watchIdle = null;
     this.#server.dropped(this);
     this.#port.onmessage = null;
     this.#port.close?.();
