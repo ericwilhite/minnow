@@ -17,18 +17,18 @@
  *   ledger (the owner refuses it as `expired`, or pruned its outcome). The client then resolves it
  *   and fails it with `OutcomeUnknownError`, so one lost reply cannot stall the window forever.
  *
- * ## Standalone (protocol.ts "Exactly-once")
- * A request is standalone when running it on a fresh connection means what it meant when sent:
+ * ## Resendable (protocol.ts "Exactly-once")
+ * A request is resendable when running it on a fresh connection means what it meant when sent:
  * - statements and writes on session 0 while session 0 is known idle: no transaction open, and no
  *   earlier session-0 request unresolved that may change that (`mayControlTransaction`), since it
- *   could have been `BEGIN`. Concurrent autocommit statements stay standalone;
+ *   could have been `BEGIN`. Concurrent autocommit statements stay resendable;
  * - `prepare`, `subscribe`, `admin`.
  * Everything that depends on session state is not: statements and writes in sessions ≥ 1, or in
  * session 0 inside (or possibly inside) a transaction; `begin`, `commit`, `rollback`. On a new
- * connection, a non-standalone request is answered from the ledger if it committed, and is
+ * connection, a non-resendable request is answered from the ledger if it committed, and is
  * otherwise refused with `SessionLostError`, untouched.
  *
- * Standalone is about meaning, not about exactly-once: a standalone query is still
+ * Resendable is about meaning, not about exactly-once: a resendable query is still
  * at-least-once (outcomes.ts). Only commits are exactly-once.
  */
 import { MAX_OUTSTANDING_REQUESTS } from "../format/ledger.js";
@@ -85,8 +85,8 @@ export interface DefaultSessionView {
   readonly unresolvedControl: number;
 }
 
-/** Whether `request` (its header aside) is standalone. See the module comment. */
-export function isStandalone(
+/** Whether `request` (its header aside) is resendable. See the module comment. */
+export function isResendable(
   request: { readonly t: Request["t"]; readonly session?: number },
   defaultSession: DefaultSessionView,
 ): boolean {
@@ -123,7 +123,7 @@ const CONTROL_WORDS = new Set([
 /**
  * Whether SQL `text` may open, end or change a transaction: its first keyword is a
  * transaction-control word, or it may hold more than one statement (any `;` before trailing
- * whitespace and semicolons, even inside a literal: false positives only cost standalone-ness).
+ * whitespace and semicolons, even inside a literal: false positives only cost resendability).
  * Prepared statements get this from the owner instead (`Prepared.controlsTransaction`).
  */
 export function mayControlTransaction(text: string): boolean {

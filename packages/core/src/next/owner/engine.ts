@@ -66,6 +66,7 @@ import type { ResultFrame, ResultStream } from "../exec/result.js";
 import type { PhysicalType } from "../types.js";
 import type { WireInputColumn } from "./frame.js";
 import type { LedgerSession, OwnerLedger } from "./outcomes.js";
+import type { LoweredStatement } from "./planner.js";
 import type { StatementSummary, TransactionState, WireColumnMeta, WireValue } from "./protocol.js";
 
 /** A statement planned for the current catalog version. Cached; shared across connections. */
@@ -78,12 +79,20 @@ export interface PlannedStatement {
   /** For transaction control: what it does (outcomes.ts `AnsweredRequest.control`). */
   readonly control: "begin" | "commit" | "rollback" | "other" | null;
   readonly catalogVersion: number;
+  /** The planner's output (planner.ts), for the composition that runs it. */
+  readonly lowered: LoweredStatement;
+  /** A point read the owner tries on the synchronous path first (ruling R6). */
+  readonly pointRead: boolean;
 }
 
 export interface RunContext {
   readonly signal: AbortSignal;
-  /** The identity for the commit frame (B3 `CommitRequest`), or null if this run commits nothing. */
-  readonly request: CommitRequest | null;
+  /**
+   * The request identity for the commit frame, or null if this run commits nothing itself. The
+   * composition adds the affected-row counts it learns at execution and passes the whole B3
+   * `CommitRequest` to `commit()`.
+   */
+  readonly request: Omit<CommitRequest, "counts"> | null;
   /** Unreleased frame bytes allowed: the executor's `resultWindowBytes`. */
   readonly windowBytes: number;
   /** Upper bound on rows per frame, or null. */
@@ -98,8 +107,13 @@ export interface Run {
   readonly results: ResultStream;
   /** Owner-facing: the terminal `done` may be sent (see "Completions"). */
   readonly done: Promise<RunOutcome>;
-  /** Whether the server has called the write path's `commit()` for this run. */
+  /** Whether the composition has called the write path's `commit()` for this run (read it after `done` settles). */
   readonly reachedCommit: boolean;
+  /**
+   * The run commits if it succeeds (an autocommit write or DDL, or COMMIT of a read-write
+   * transaction): its outcome is the write path's to record (outcomes.ts `commits`).
+   */
+  readonly commits: boolean;
 }
 
 /** The synchronous fast path's whole answer (ruling R6). */
@@ -161,6 +175,11 @@ export interface EngineSession {
    * the client sends ROLLBACK or COMMIT.
    */
   expire(): void;
+  /**
+   * A statement failed before reaching the engine (planning or binding): an open transaction
+   * becomes `failed`, as PostgreSQL aborts it on any error.
+   */
+  fail(): void;
   /** Rolls back anything open and drops every pin. Idempotent. */
   close(): void;
 }
@@ -172,8 +191,14 @@ export interface OwnerEngine {
   readonly ledger: OwnerLedger;
   /** Parses, rewrites and lowers `text`, or returns the cached plan. Throws SQL errors. */
   plan(text: string): PlannedStatement;
+  /**
+   * The write path's delivery rule (access/write-path.ts "Delivery"): null when everything up to
+   * `lsn` is durable (or the mode is relaxed), else a promise for it. The server checks it per
+   * frame before posting.
+   */
+  durable(lsn: number): Promise<void> | null;
   /** A new session; its ledger key comes from the connection's generation. */
-  openSession(clientId: string, generation: number): EngineSession;
+  openSession(clientId: string, generation: number, sessionId?: string): EngineSession;
   /** Tables a statement's result depends on: subscriptions re-run after commits touching them. */
   readSet(statement: PlannedStatement): readonly number[];
   /** Calls `listener` after each commit with the ids of the tables it changed. */

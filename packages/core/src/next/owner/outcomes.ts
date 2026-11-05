@@ -96,3 +96,59 @@ export function ledgerAction(request: AnsweredRequest): LedgerAction {
   if (request.failed || request.opened) return "statement";
   return request.plan === "query" ? "settle" : "statement";
 }
+
+/** What the owner knows about a request when it admits it (before running it). */
+export interface ArrivingRequest {
+  readonly kind: Request["t"];
+  /** For SQL transaction control (`statement` requests), else null. */
+  readonly control: PlannedStatement["control"];
+  /** The session's transaction state when the request reaches the head of its session's queue. */
+  readonly before: TransactionState;
+  readonly retry: boolean;
+  readonly resendable: boolean;
+}
+
+/**
+ * The ledger scope of a request (ruling R18.2): `transaction` for a statement inside a transaction
+ * the client opened (or opening one: `begin`, SQL `BEGIN`), `standalone` for everything else —
+ * autocommit writes and DDL, COMMIT and ROLLBACK, queries outside a transaction, prepares,
+ * subscriptions, admin calls. A resent request that is not resendable belonged to a session's
+ * state; unless it ends a transaction (whose COMMIT may have committed and must find its outcome)
+ * it is `transaction` scope, so an ended generation answers `sessionLost`.
+ */
+export function ledgerScope(request: ArrivingRequest): "transaction" | "standalone" {
+  const ends =
+    request.kind === "commit" ||
+    request.kind === "rollback" ||
+    request.control === "commit" ||
+    request.control === "rollback";
+  if (ends) return "standalone";
+  if (request.kind === "begin" || request.control === "begin") return "transaction";
+  if (request.retry && !request.resendable) return "transaction";
+  if (request.kind === "prepare" || request.kind === "subscribe" || request.kind === "admin")
+    return "standalone";
+  return request.before === "idle" ? "standalone" : "transaction";
+}
+
+/** The ledger identity the owner derives for a request (ruling R18.2). */
+export function ledgerIdentity(
+  clientId: string,
+  header: {
+    readonly seq: number;
+    readonly sentAtMs: number;
+    readonly resolvedThrough: number;
+    readonly generation: number;
+  },
+  session: number,
+  scope: "transaction" | "standalone",
+): RequestIdentity {
+  return {
+    clientId,
+    sessionId: String(session),
+    generation: header.generation,
+    scope,
+    sequence: header.seq,
+    sentAtMs: header.sentAtMs,
+    resolvedThrough: header.resolvedThrough,
+  };
+}

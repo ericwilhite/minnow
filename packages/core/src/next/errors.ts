@@ -31,17 +31,28 @@ export class RequestExpiredError extends Error {
 }
 
 /**
- * A statement of an explicit transaction arrived after its session's generation ended (a
- * reconnect, format/ledger.ts `sessionLost`). It was not executed: the transaction rolled back
- * with the old generation. The client starts the transaction again.
+ * Connection state a request depended on is gone, and nothing of the request took effect:
+ * - `transaction`: a statement of an explicit transaction arrived after its session's generation
+ *   ended (a reconnect, format/ledger.ts `sessionLost`), or the owner changed under it; the
+ *   transaction rolled back with the old generation. The client starts it again.
+ * - `cursor`, `subscription`, `result`: the owner changed or dropped the client's pins (liveness
+ *   lock released, a page restored from bfcache, an abandoned stream). Open it again.
+ * One class for every track (ruling R18.1): the owner re-exports it and rehydrates it on the wire.
  */
 export class SessionLostError extends Error {
   readonly code = "MINNOW_SESSION_LOST";
-  constructor(sequence: number) {
+  readonly lost: "transaction" | "cursor" | "subscription" | "result";
+  /** The request's sequence, when one request was refused. */
+  readonly sequence: number | null;
+  constructor(lost: "transaction" | "cursor" | "subscription" | "result", sequence?: number) {
     super(
-      `Request ${String(sequence)} belongs to a session that ended; its transaction was rolled back`,
+      sequence === undefined
+        ? `The ${lost} was lost when the connection to the database owner changed; nothing took effect`
+        : `Request ${String(sequence)} belongs to a ${lost} that was lost when the connection to the database owner changed; nothing took effect`,
     );
     this.name = "SessionLostError";
+    this.lost = lost;
+    this.sequence = sequence ?? null;
   }
 }
 

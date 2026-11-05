@@ -85,8 +85,14 @@
  *     subscriptions are `settle`d: no outcome, and a retry runs again.
  *   - **Failures** of requests that would have committed are recorded by the owner (in memory);
  *     a retry gets the same error.
- * - A connection is one **generation** of its sessions: the owner numbers each client's
- *   connections, and when one ends it ends each of its sessions in the ledger. In-transaction
+ * - The ledger identity is derived by the owner (ruling R18.2), never sent: `sessionId` is the
+ *   request's session (`String(session)`), `generation` the request's, and `scope` comes from the
+ *   routing table (outcomes.ts `ledgerScope`): `transaction` for a statement inside a transaction
+ *   the client opened, `standalone` for everything else (autocommit writes and DDL, COMMIT,
+ *   queries). A resent request that is not resendable is admitted with `transaction` scope, so an
+ *   ended generation answers `sessionLost`.
+ * - A connection is one **generation** of its sessions: the client numbers its connections
+ *   (`Hello.generation`), and when one ends the owner ends each of its sessions in the ledger. In-transaction
  *   statements of an ended generation are dropped with its rolled-back transaction, and their
  *   late completions are not recorded; a commit already past the boundary still records.
  * - After a reconnect, the client resends every request it has no terminal reply for, unchanged
@@ -95,9 +101,9 @@
  * - The owner answers a recorded duplicate from the ledger: a committed write gets `done` with
  *   `summary.replayed: true` and the original counts. RETURNING rows are not replayed: the client
  *   rejects with `CommittedWithoutResultError` if the caller asked for them.
- * - `standalone` says whether a request means the same thing on a fresh connection (sequence.ts
+ * - `resendable` says whether a request means the same thing on a fresh connection (sequence.ts
  *   rules). A resent request (`retry`) that the ledger admits as first sight and that is not
- *   standalone is refused with `SessionLostError` and never executed. So a transaction's
+ *   resendable is refused with `SessionLostError` and never executed. So a transaction's
  *   statements never run outside it, and a COMMIT whose fate is unknown resolves from the ledger:
  *   committed, or definitely not.
  *
@@ -203,6 +209,12 @@ export interface Hello {
   readonly livenessLock: string;
   /** The owner this client last talked to, if any (diagnostics and step-down accounting). */
   readonly previousOwnerId: string | null;
+  /**
+   * This connection's generation: 1 for the client's first connection, +1 for each reconnect
+   * (format/ledger.ts `SessionRef.generation`). A hello from a newer generation ends the client's
+   * older connections to this owner.
+   */
+  readonly generation: number;
 }
 
 export interface RequestHeader {
@@ -215,9 +227,11 @@ export interface RequestHeader {
   /** The sender holds its liveness lock until this request's terminal reply. */
   readonly live: boolean;
   /** Means the same on any connection (see "Exactly-once"). */
-  readonly standalone: boolean;
+  readonly resendable: boolean;
   /** Resent after a reconnect; the first send may or may not have reached an owner. */
   readonly retry: boolean;
+  /** The generation of the connection the request was first sent on (≤ the current one). */
+  readonly generation: number;
 }
 
 /**
@@ -483,7 +497,7 @@ export interface Prepared {
   readonly columns: readonly WireColumnMeta[];
   readonly parameters: readonly PhysicalType[];
   readonly catalogVersion: number;
-  /** The statement may open, end or change a transaction (sequence.ts `isStandalone`). */
+  /** The statement may open, end or change a transaction (sequence.ts `isResendable`). */
   readonly controlsTransaction: boolean;
 }
 
@@ -629,11 +643,17 @@ export function parseClientMessage(value: unknown): ClientMessage {
     )
       throw new ProtocolError("Request resolvedThrough must be in [0, seq)");
     if (
+      typeof header.generation !== "number" ||
+      !Number.isSafeInteger(header.generation) ||
+      header.generation < 1
+    )
+      throw new ProtocolError("Request generation must be a positive integer");
+    if (
       typeof header.live !== "boolean" ||
-      typeof header.standalone !== "boolean" ||
+      typeof header.resendable !== "boolean" ||
       typeof header.retry !== "boolean"
     )
-      throw new ProtocolError("Request live, standalone and retry must be booleans");
+      throw new ProtocolError("Request live, resendable and retry must be booleans");
   }
   if (kind === "hello" && (value as Partial<Hello>).protocol === undefined)
     throw new ProtocolError("Hello without a protocol version");

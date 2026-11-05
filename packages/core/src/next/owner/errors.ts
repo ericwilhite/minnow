@@ -12,7 +12,7 @@
  * - Errors from the SQL front end, the executor and storage cross the same way; the client's
  *   registry includes their classes (composition, Phase 2).
  */
-import { OwnerUnresponsiveError, RequestExpiredError } from "../errors.js";
+import { OwnerUnresponsiveError, RequestExpiredError, SessionLostError } from "../errors.js";
 import {
   rehydrateError,
   serializeError,
@@ -21,30 +21,13 @@ import {
 } from "../../worker-protocol/index.js";
 
 /** Defined once for every track (next/errors.ts); re-exported for the client API. */
-export { OwnerUnresponsiveError, RequestExpiredError };
+export { OwnerUnresponsiveError, RequestExpiredError, SessionLostError };
 
 export type WireError = SerializedError;
 
 export const toWireError = (error: unknown): WireError => serializeError(error);
 export const fromWireError = (error: WireError, registry: ErrorRegistry): Error =>
   rehydrateError(error, registry);
-
-/**
- * Connection state this request depended on is gone: the owner changed, stepped down, or dropped
- * the client's pins after its liveness lock was released (a page restored from bfcache). Nothing
- * of the request took effect. Open a new transaction, cursor or subscription.
- */
-export class SessionLostError extends Error {
-  readonly code = "MINNOW_SESSION_LOST";
-  override readonly name = "SessionLostError";
-  readonly lost: "transaction" | "cursor" | "subscription" | "result";
-  constructor(lost: "transaction" | "cursor" | "subscription" | "result") {
-    super(
-      `The ${lost} was lost when the connection to the database owner changed; nothing took effect`,
-    );
-    this.lost = lost;
-  }
-}
 
 /**
  * The write had already committed (its reply was lost with a connection, and the retry was
@@ -150,6 +133,55 @@ export class TransactionIdleTimeoutError extends Error {
   }
 }
 
+/** A statement inside a failed transaction (PostgreSQL 25P02): only ROLLBACK ends it. */
+export class InFailedTransactionError extends Error {
+  readonly code = "MINNOW_IN_FAILED_TRANSACTION";
+  override readonly name = "InFailedTransactionError";
+  readonly sqlState = "25P02";
+  constructor() {
+    super(
+      "The current transaction is aborted; commands are ignored until the end of the transaction block",
+    );
+  }
+}
+
+/** A write inside a READ ONLY transaction (PostgreSQL 25006). */
+export class ReadOnlyTransactionError extends Error {
+  readonly code = "MINNOW_READ_ONLY_TRANSACTION";
+  override readonly name = "ReadOnlyTransactionError";
+  readonly sqlState = "25006";
+  constructor(command: string) {
+    super(`Cannot execute ${command} in a read-only transaction`);
+  }
+}
+
+/** currval or lastval before nextval in this session (PostgreSQL 55000). */
+export class SequenceStateError extends Error {
+  readonly code = "MINNOW_SEQUENCE_STATE";
+  override readonly name = "SequenceStateError";
+  readonly sqlState = "55000";
+  constructor(fn: "currval" | "lastval", sequenceId: number | null) {
+    super(
+      fn === "currval"
+        ? `currval of sequence ${String(sequenceId)} is not yet defined in this session`
+        : "lastval is not yet defined in this session",
+    );
+  }
+}
+
+/**
+ * The answer to a duplicate of a request that failed: the ledger keeps the failure's code, not the
+ * whole error, so the client gets this with the original `code` (format/ledger.ts `failed`).
+ */
+export class RecordedFailureError extends Error {
+  override readonly name = "RecordedFailureError";
+  readonly code: string;
+  constructor(code: string) {
+    super(`The request already failed with ${code}; this is its recorded outcome`);
+    this.code = code;
+  }
+}
+
 /** The classes above, keyed by name, for `fromWireError`. */
 export const ownerErrorRegistry: ErrorRegistry = new Map<string, new (...args: never[]) => Error>([
   ["OwnerUnresponsiveError", OwnerUnresponsiveError],
@@ -162,4 +194,8 @@ export const ownerErrorRegistry: ErrorRegistry = new Map<string, new (...args: n
   ["OwnerUnreachableError", OwnerUnreachableError],
   ["ClientClosedError", ClientClosedError],
   ["TransactionIdleTimeoutError", TransactionIdleTimeoutError],
+  ["InFailedTransactionError", InFailedTransactionError],
+  ["ReadOnlyTransactionError", ReadOnlyTransactionError],
+  ["SequenceStateError", SequenceStateError],
+  ["RecordedFailureError", RecordedFailureError],
 ]);

@@ -26,7 +26,7 @@ import {
   parseClientMessage,
   type StatementRequest,
 } from "./protocol.js";
-import { RequestSequencer, isStandalone, mayControlTransaction } from "./sequence.js";
+import { RequestSequencer, isResendable, mayControlTransaction } from "./sequence.js";
 
 /** Autocommit requests on the connection's default session, first generation. */
 const SESSION = { sessionId: "0", generation: 1, scope: "standalone" } as const;
@@ -137,25 +137,25 @@ describe("RequestSequencer", () => {
   });
 });
 
-describe("standalone requests", () => {
+describe("resendable requests", () => {
   const idle = { transaction: "idle", unresolvedControl: 0 } as const;
 
-  it("keeps concurrent autocommit statements standalone", () => {
-    expect(isStandalone({ t: "statement", session: 0 }, idle)).toBe(true);
-    expect(isStandalone({ t: "write", session: 0 }, idle)).toBe(true);
-    expect(isStandalone({ t: "prepare" }, idle)).toBe(true);
+  it("keeps concurrent autocommit statements resendable", () => {
+    expect(isResendable({ t: "statement", session: 0 }, idle)).toBe(true);
+    expect(isResendable({ t: "write", session: 0 }, idle)).toBe(true);
+    expect(isResendable({ t: "prepare" }, idle)).toBe(true);
   });
 
-  it("is never standalone inside, or possibly inside, a transaction", () => {
-    expect(isStandalone({ t: "statement", session: 1 }, idle)).toBe(false);
+  it("is never resendable inside, or possibly inside, a transaction", () => {
+    expect(isResendable({ t: "statement", session: 1 }, idle)).toBe(false);
     expect(
-      isStandalone({ t: "statement", session: 0 }, { transaction: "open", unresolvedControl: 0 }),
+      isResendable({ t: "statement", session: 0 }, { transaction: "open", unresolvedControl: 0 }),
     ).toBe(false);
     expect(
-      isStandalone({ t: "statement", session: 0 }, { transaction: "idle", unresolvedControl: 1 }),
+      isResendable({ t: "statement", session: 0 }, { transaction: "idle", unresolvedControl: 1 }),
     ).toBe(false);
     for (const t of ["begin", "commit", "rollback"] as const)
-      expect(isStandalone({ t, session: 2 }, idle)).toBe(false);
+      expect(isResendable({ t, session: 2 }, idle)).toBe(false);
   });
 
   it("classifies transaction control conservatively", () => {
@@ -191,8 +191,9 @@ describe("parseClientMessage", () => {
     sentAtMs: 1,
     resolvedThrough: 2,
     live: false,
-    standalone: true,
+    resendable: true,
     retry: false,
+    generation: 1,
     session: 0,
     text: "SELECT 1",
     prepared: null,
