@@ -36,9 +36,6 @@ jobs:
     # with the datasets cached, about 45. A 4-vCPU runner is slower and loads every night, so the
     # default run gets 240 minutes. The large scales take hours and are opt-in.
     timeout-minutes: ${{ (inputs.scale || 'default') == 'default' && 240 || 355 }}
-    env:
-      # On the runner's disk, never tmpfs; the lane refuses a memory filesystem.
-      MINNOW_BROWSER_PERF_DIR: ${{ runner.temp }}/minnow-browser-perf
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -51,6 +48,10 @@ jobs:
       - name: Run the lane
         # An explicit Bash shell enables pipefail, so tee cannot turn a failed lane into a green job.
         shell: bash
+        env:
+          # On the runner's disk, never tmpfs; the lane refuses a memory filesystem. The `runner`
+          # context is only available at step level.
+          MINNOW_BROWSER_PERF_DIR: ${{ runner.temp }}/minnow-browser-perf
         run: >-
           npm run benchmark:browser --
           --scale=${{ inputs.scale || 'default' }}
