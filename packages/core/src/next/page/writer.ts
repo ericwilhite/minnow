@@ -78,9 +78,15 @@ import {
   hashInt128,
   type EncodedPage,
 } from "./encode.js";
-import { chunkTagOf, UnsupportedPageLayoutError, ValueTag } from "./format.js";
+import { chunkTagOf, STAT_PREFIX_BYTES, UnsupportedPageLayoutError, ValueTag } from "./format.js";
 import { gzipPage } from "./gzip.js";
-import { DistinctSketch, hashInt64, mix32 } from "./sketch.js";
+import { DistinctSketch, hashBytes, hashInt64, mix32 } from "./sketch.js";
+import {
+  encodePointer,
+  LARGE_VALUE_BYTES,
+  MAX_VALUE_BYTES,
+  VALUE_PART_BYTES,
+} from "./large-value.js";
 import { int128At, setInt128 } from "../vector/int128.js";
 import { encodeSortKey } from "../keys/key-encoding.js";
 
@@ -107,6 +113,12 @@ export interface GroupWriterOptions {
   /** Dictionary bounds per chunk (default 65,536 entries, 256 KiB). */
   readonly dictionaryEntries?: number;
   readonly dictionaryBytes?: number;
+  /**
+   * The most data bytes one column chunk takes (default `MAX_CHUNK_BYTES`, 1 GiB): `append`
+   * takes fewer rows (the group is full) before a varlen chunk would pass it, so directory
+   * offsets (u32) always hold. A group takes at least one row however large.
+   */
+  readonly maxChunkBytes?: number;
 }
 
 export interface WrittenGroup {
@@ -117,6 +129,8 @@ export interface WrittenGroup {
 }
 
 export const MAX_GROUP_ROWS = 65_536;
+/** Default `GroupWriterOptions.maxChunkBytes`: far below the 4 GiB directory offsets address. */
+export const MAX_CHUNK_BYTES = 1024 * 1024 * 1024;
 /**
  * Raw page bytes never pass this (offsets, validity and header fit the rest of a 1 MiB blob),
  * and a dictionary's entries never pass `MAX_DICTIONARY_BYTES` (its offsets fit the rest).
@@ -241,6 +255,11 @@ class ChunkSink {
     }
     if (this.builder === null) await this.#open(bytes.length);
     await this.#append([bytes], [entry]);
+  }
+
+  /** Moves a still-inline chunk into its own builder (out-of-line values need one). */
+  async ensureBuilder(): Promise<void> {
+    if (this.builder === null) await this.#open(0);
   }
 
   async #open(next: number): Promise<void> {
@@ -397,6 +416,16 @@ abstract class ColumnWriter {
   abstract copyValues(vector: Vector, from: number, count: number): void;
   abstract encode(): EncodedPage;
   abstract resetPage(): void;
+  /** Rows of `[from, from + count)` this chunk takes before passing `maxChunkBytes`. */
+  rowsFitting(_vector: Vector, _from: number, count: number): number {
+    return count;
+  }
+
+  /** The current page's large-value region (BytesWriter), recorded in its directory entry. */
+  pageRegion(): { offset: number; length: number } | null {
+    return null;
+  }
+
   /** Bytes the raw page holds now (for the byte-based cut). */
   rawBytes(): number {
     return this.rows * this.rawWidth;
@@ -454,6 +483,7 @@ abstract class ColumnWriter {
         `A page of ${String(stored.length)} bytes passes the 1 MiB blob cap: values that large need a large-value layout, not stored yet`,
       );
     this.#mergeStats(page);
+    const largeRegion = this.pageRegion();
     await this.sink.add(stored, {
       length: stored.length,
       firstRow: this.rowsWritten,
@@ -462,6 +492,7 @@ abstract class ColumnWriter {
       nullCount: page.nullCount,
       min: page.min,
       max: page.max,
+      ...(largeRegion === null ? {} : { largeRegion }),
     });
     this.bytesWritten += stored.length;
   }
@@ -494,6 +525,14 @@ abstract class ColumnWriter {
   close(): void {
     this.sink.close();
   }
+}
+
+/** Whether slot `index` of a vector is valid. */
+function validAt(vector: Vector, index: number): boolean {
+  if (vector.form === "constant")
+    return vector.value.validity === null || ((vector.value.validity[0] ?? 0) & 1) === 1;
+  const validity = vector.validity;
+  return validity === null || (((validity[index >>> 5] ?? 0) >>> (index & 31)) & 1) === 1;
 }
 
 /** Source row of slot `row` of a vector: flat as is, constant 0, dictionary its code. */
@@ -906,6 +945,14 @@ class BytesWriter extends ColumnWriter {
   readonly bounds = new ByteBounds();
   readonly dictionary: DictionaryBuilder;
   #useDictionary = true;
+  /** Rows of the current page stored out of line (large-value.ts), and their value prefixes. */
+  readonly #large: Uint32Array;
+  readonly #prefixes = new Map<number, Uint8Array>();
+  /** The current page's large-value region: its parts are appended back to back. */
+  #regionStart = -1;
+  #regionEnd = 0;
+  /** Varlen bytes taken into this chunk (values, plus 4 per row for offsets). */
+  #takenBytes = 0;
 
   constructor(writer: GroupWriter, column: WriterColumn) {
     const fixed = column.type.kind === "uuid";
@@ -917,6 +964,7 @@ class BytesWriter extends ColumnWriter {
     this.fixed = fixed;
     this.bytes = writer.memory.uint8(fixed ? capacity * 16 : writer.options.rawPageBytes);
     this.offsets = writer.memory.int32(fixed ? 1 : capacity + 1);
+    this.#large = writer.memory.uint32(fixed ? 0 : (capacity + 31) >>> 5);
     this.dictionary = new DictionaryBuilder(
       fixed,
       writer.memory.dictionaries,
@@ -939,6 +987,8 @@ class BytesWriter extends ColumnWriter {
     while (take < rows) {
       const row = sourceRow(vector, from + take);
       const length = (data.offsets[row + 1] ?? 0) - (data.offsets[row] ?? 0);
+      // An out-of-line value is taken on its own (`append`).
+      if (length > LARGE_VALUE_BYTES && validAt(vector, from + take)) break;
       // A page under half its limit takes one more value, however large: every page but the
       // last holds ≥ limit / 2 bytes or a full row target, which bounds the page count (and so
       // the directory blob, ≤ 1 MiB) by the chunk's bytes.
@@ -958,8 +1008,27 @@ class BytesWriter extends ColumnWriter {
     );
   }
   override async append(vector: Vector, from: number, count: number): Promise<void> {
+    if (!this.fixed) {
+      const data = sourceFlat(vector).data;
+      if (data.layout === "varlen")
+        for (let k = 0; k < count; k++) {
+          const row = sourceRow(vector, from + k);
+          this.#takenBytes +=
+            4 +
+            (validAt(vector, from + k)
+              ? (data.offsets[row + 1] ?? 0) - (data.offsets[row] ?? 0)
+              : 0);
+        }
+    }
     let done = 0;
     while (done < count) {
+      if (!this.fixed && this.#isLargeAt(vector, from + done)) {
+        if (this.rows >= this.pageRows) await this.flushPage();
+        await this.#appendLarge(vector, from + done);
+        done++;
+        if (this.isFull()) await this.flushPage();
+        continue;
+      }
       let take = this.room(vector, from + done, count - done);
       if (take === 0) {
         await this.flushPage();
@@ -1014,6 +1083,59 @@ class BytesWriter extends ColumnWriter {
       this.offsets[at + k + 1] = cursor;
     }
   }
+  #isLargeAt(vector: Vector, index: number): boolean {
+    const data = sourceFlat(vector).data;
+    if (data.layout !== "varlen" || !validAt(vector, index)) return false;
+    const row = sourceRow(vector, index);
+    return (data.offsets[row + 1] ?? 0) - (data.offsets[row] ?? 0) > LARGE_VALUE_BYTES;
+  }
+
+  /**
+   * Writes one value out of line (large-value.ts): its parts go straight from the caller's vector
+   * into the chunk's builder (no copy is held), and the page gets the pointer.
+   */
+  async #appendLarge(vector: Vector, index: number): Promise<void> {
+    const data = sourceFlat(vector).data;
+    if (data.layout !== "varlen") throw new TypeError("Expected varlen data");
+    const row = sourceRow(vector, index);
+    const start = data.offsets[row] ?? 0;
+    const end = data.offsets[row + 1] ?? 0;
+    const length = end - start;
+    if (length > MAX_VALUE_BYTES)
+      throw new UnsupportedPageLayoutError(
+        `A value of ${String(length)} bytes passes the ${String(MAX_VALUE_BYTES)}-byte limit`,
+      );
+    await this.sink.ensureBuilder();
+    const parts: Uint8Array[] = [];
+    for (let at = start; at < end; at += VALUE_PART_BYTES)
+      parts.push(data.bytes.subarray(at, Math.min(end, at + VALUE_PART_BYTES)));
+    const blobs = await this.sink.appendParts(parts);
+    const first = blobs[0];
+    if (first === undefined) throw new Error("A large value wrote no parts");
+    // The builder places parts back to back: part i is at offset + i × VALUE_PART_BYTES, and the
+    // page's values follow each other (nothing else is appended to the chunk in between).
+    if (this.#regionStart < 0) this.#regionStart = first.offset;
+    else if (first.offset !== this.#regionEnd)
+      throw new Error("A page's out-of-line values are not contiguous");
+    this.#regionEnd = first.offset + length;
+    const pointer = encodePointer({
+      offset: first.offset,
+      length,
+      checksums: blobs.map((blob) => blob.checksum),
+    });
+    this.sketch.add(hashBytes(data.bytes, start, end));
+    const slot = this.rows;
+    this.setValidity(vector, index, 1);
+    const cursor = this.offsets[slot] ?? 0;
+    if (cursor + pointer.length > this.bytes.length) this.#growBytes(cursor + pointer.length);
+    this.bytes.set(pointer, cursor);
+    this.offsets[slot + 1] = cursor + pointer.length;
+    this.#large[slot >>> 5] = (this.#large[slot >>> 5] ?? 0) | (1 << (slot & 31));
+    this.#prefixes.set(slot, data.bytes.slice(start, start + STAT_PREFIX_BYTES + 1));
+    this.rows++;
+    this.bytesWritten += length;
+  }
+
   #growBytes(needed: number): void {
     let size = this.bytes.length * 2;
     while (size < needed) size *= 2;
@@ -1037,8 +1159,14 @@ class BytesWriter extends ColumnWriter {
     const rows = this.rows;
     const codes = this.writer.codes(rows);
     const scratch = this.writer.scratch;
+    // A page with out-of-line values is plain; the dictionary carries on for the next pages.
+    const large = this.#prefixes.size > 0;
     // An all-null page needs no dictionary (a chunk of only such pages has none).
-    if (this.#useDictionary && (!this.mayHaveNulls || countBits(this.validity, rows) > 0)) {
+    if (
+      !large &&
+      this.#useDictionary &&
+      (!this.mayHaveNulls || countBits(this.validity, rows) > 0)
+    ) {
       const dictionary = this.dictionary;
       const oldSize = dictionary.size;
       const oldBytes = dictionary.byteLength;
@@ -1080,6 +1208,7 @@ class BytesWriter extends ColumnWriter {
         this.bounds,
         scratch,
       );
+    const prefixes = this.#prefixes;
     return encodeVarlenPage(
       this.bytes,
       this.offsets,
@@ -1088,10 +1217,40 @@ class BytesWriter extends ColumnWriter {
       this.sketch,
       this.bounds,
       scratch,
+      large
+        ? { bitmap: this.#large, prefix: (row) => prefixes.get(row) ?? new Uint8Array(0) }
+        : null,
     );
   }
+  override pageRegion(): { offset: number; length: number } | null {
+    return this.#regionStart < 0
+      ? null
+      : { offset: this.#regionStart, length: this.#regionEnd - this.#regionStart };
+  }
+
+  override rowsFitting(vector: Vector, from: number, count: number): number {
+    if (this.fixed) return count;
+    const data = sourceFlat(vector).data;
+    if (data.layout !== "varlen") return count;
+    let room = this.writer.options.maxChunkBytes - this.#takenBytes;
+    for (let k = 0; k < count; k++) {
+      const row = sourceRow(vector, from + k);
+      const cost =
+        4 +
+        (validAt(vector, from + k) ? (data.offsets[row + 1] ?? 0) - (data.offsets[row] ?? 0) : 0);
+      if (cost > room) return k;
+      room -= cost;
+    }
+    return count;
+  }
+
   resetPage(): void {
     this.offsets[0] = 0;
+    this.#regionStart = -1;
+    if (this.#prefixes.size > 0) {
+      this.#large.fill(0);
+      this.#prefixes.clear();
+    }
   }
   override dictionaryPage(): Uint8Array | null {
     const dictionary = this.dictionary;
@@ -1141,6 +1300,7 @@ function columnWriter(writer: GroupWriter, column: WriterColumn): ColumnWriter {
 
 interface ResolvedOptions {
   readonly maxRows: number;
+  readonly maxChunkBytes: number;
   readonly pageBytes: number;
   readonly rawPageBytes: number;
   readonly inlineBytes: number;
@@ -1177,6 +1337,7 @@ export class GroupWriter {
       gzip: options.gzip ?? false,
       dictionaryEntries: Math.min(options.dictionaryEntries ?? 65_536, maxRows),
       dictionaryBytes: Math.min(MAX_DICTIONARY_BYTES, options.dictionaryBytes ?? 256 * 1024),
+      maxChunkBytes: Math.min(MAX_CHUNK_BYTES, options.maxChunkBytes ?? MAX_CHUNK_BYTES),
     };
     this.extents = options.writer;
     this.memory = new Charged(options.charge ?? null);
@@ -1238,7 +1399,7 @@ export class GroupWriter {
     if (this.#state !== "open") throw new Error("The group writer is closed");
     if (columns.length !== this.#columns.length)
       throw new RangeError("One vector per column is required");
-    const take = Math.min(count, this.options.maxRows - this.#rows);
+    let take = Math.min(count, this.options.maxRows - this.#rows);
     if (take <= 0) return 0;
     for (let index = 0; index < columns.length; index++) {
       const vector = columns[index];
@@ -1251,6 +1412,15 @@ export class GroupWriter {
       if (vector.length < from + take)
         throw new RangeError("A vector is shorter than the rows appended");
     }
+    // A varlen chunk stops short of `maxChunkBytes`; an empty group takes one row regardless.
+    for (let index = 0; index < columns.length; index++) {
+      const vector = columns[index];
+      const writer = this.#columns[index];
+      if (vector !== undefined && writer !== undefined)
+        take = Math.min(take, writer.rowsFitting(vector, from, take));
+    }
+    if (this.#rows === 0) take = Math.max(take, 1);
+    if (take === 0) return 0;
     try {
       for (let index = 0; index < columns.length; index++) {
         const vector = columns[index];

@@ -26,6 +26,7 @@ import {
 import { openChunk, UNLIMITED } from "./test-support.js";
 import { defined } from "./test-support.js";
 import { DELTA_BLOCK, UnsupportedPageLayoutError } from "./format.js";
+import { MAX_VALUE_BYTES } from "./large-value.js";
 import { GroupWriter } from "./writer.js";
 import { MemoryExtentSpace } from "./memory-extents.js";
 import { vectorOf } from "./test-support.js";
@@ -161,6 +162,7 @@ async function roundTrip(
   for (const rows of [Uint16Array.from(picked), Int32Array.from(picked)]) {
     reader.release();
     await reader.load(reader.pagesForRows(rows));
+    await reader.loadValuesOf(rows); // out-of-line values (large-value.ts), if any
     const target = targetFor(reader, rows.length, reader.gatherBytes(rows));
     reader.gather(rows, target, 0);
     for (let k = 0; k < rows.length; k++) {
@@ -1054,9 +1056,14 @@ describe("the 1 MiB blob cap", () => {
     expect(read.every((value, row) => sameValue(value, values[row] ?? null))).toBe(true);
   });
 
-  it("refuses one value too large for a page with a typed error", async () => {
+  it("stores a value over the blob cap out of line, and refuses one over MAX_VALUE_BYTES with a typed error", async () => {
+    // Ruling R15.4: values up to 64 MiB are stored out of line in ≤ 1 MiB parts (large-value.ts).
+    const over = noise(MAX_BLOB_BYTES + 1, 4);
+    const { space, group } = await writeGroup([{ type: { kind: "bytes" }, values: [over] }]);
+    const read = await readChunk(space, defined(group.columns[0]));
+    expect(sameValue(read[0] ?? null, over)).toBe(true);
     await expect(
-      writeGroup([{ type: { kind: "bytes" }, values: [noise(MAX_BLOB_BYTES + 1, 4)] }]),
+      writeGroup([{ type: { kind: "bytes" }, values: [new Uint8Array(MAX_VALUE_BYTES + 1)] }]),
     ).rejects.toBeInstanceOf(UnsupportedPageLayoutError);
   });
 });

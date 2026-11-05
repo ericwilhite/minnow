@@ -5,8 +5,9 @@
  *
  * What a root reaches:
  * - the catalog; each table's statistics blob;
- * - each table's group directory (`groups`) and, for every staged large transaction, its group
- *   directory (`staged[].groups`) and the index runs built for it (`staged[].indexRuns`);
+ * - each table's group directory (`groups`: an index blob and its pages) and, for every staged
+ *   large transaction, its group directory (`staged[].groups`) and the index runs built for it
+ *   (`staged[].indexRuns`);
  * - through each `GroupRef`: its group root and its deletion bitmap;
  * - through each `GroupRoot`: its row-id column (merged groups) and every column chunk's data
  *   extent, page directory and distinct sketch;
@@ -17,11 +18,33 @@
  * back to one. Duplicates are allowed (packed and shared extents); `reachableExtents` drops only a
  * repeat of the extent it yielded last, so its memory stays bounded.
  *
- * The walk streams: it reads one group directory, then its group roots in batches of
- * `concurrency`, yielding as it goes. It holds one directory's `GroupRef[]` and one batch of
- * group roots at a time, and every metadata lease only while decoding. Pages are never read.
+ * The walk checks what it reads against what references it (review B2-p2a #6) and throws
+ * `ManifestCorruptionError` on a contradiction, since free space computed from a wrong directory
+ * frees live data:
+ * - a directory index entry against its page: group count, first and last row id, row and live
+ *   row totals;
+ * - a group against its group root: row count, and for dense row ids, the row-id range;
+ * - a table's directory against the table: group count and live rows (`TableRoot.groupCount`,
+ *   `liveRowCount`), and every row id below `nextRowId`;
+ * - a staged directory against its entry: stored rows (`rowCount`), from `firstRowId` on.
+ *
+ * The walk streams: per table it reads the group directory's index, then one directory page at a
+ * time (manifest-codec.ts "paged group directory"), then that page's group roots in batches of
+ * `concurrency`, yielding as it goes. It holds one index, one page and one batch of group roots at
+ * a time, each released (its parse charge returned) when the walk moves past it. Data pages are
+ * never read.
  */
 import type { BlobRef, ByteBudget, ExtentReader, ExtentRef } from "../storage/extents.js";
+import { valid } from "./bytes.js";
+import {
+  decodeGroupIndex,
+  decodeGroupPage,
+  decodeGroupRoot,
+  decodeManifestRoot,
+  isEmptyDirectory,
+  type GroupPageEntry,
+  type Parsed,
+} from "./manifest-codec.js";
 import type {
   ChunkData,
   GroupRef,
@@ -31,12 +54,20 @@ import type {
   RunRef,
 } from "./manifest.js";
 
-/** Decodes the metadata blobs the walk descends through. */
+/** A decoded blob the walk holds while it uses it; `release` returns its parse charge. */
+export interface Held<T> {
+  readonly value: T;
+  release(): void;
+}
+
+/** Reads and decodes the metadata blobs the walk descends through (manifest-codec.ts). */
 export interface ManifestReader {
-  /** The `GroupRef[]` a group directory blob holds. */
-  groups(ref: BlobRef): Promise<readonly GroupRef[]>;
+  /** The page entries of a group directory's index blob (`TableRoot.groups`). */
+  groupIndex(ref: BlobRef): Promise<Held<readonly GroupPageEntry[]>>;
+  /** The `GroupRef`s of one directory page. */
+  groupPage(ref: BlobRef): Promise<Held<readonly GroupRef[]>>;
   /** The `GroupRoot` a group root blob holds. */
-  groupRoot(ref: BlobRef): Promise<GroupRoot>;
+  groupRoot(ref: BlobRef): Promise<Held<GroupRoot>>;
 }
 
 export type ReachableKind =
@@ -44,6 +75,7 @@ export type ReachableKind =
   | "table-statistics"
   | "group-directory"
   | "staged-group-directory"
+  | "group-directory-page"
   | "group-root"
   | "deletions"
   | "row-ids"
@@ -95,35 +127,133 @@ export async function* walkReachable(
     if (table.statistics !== null)
       yield { ref: table.statistics, kind: "table-statistics", tableId };
     for (const index of [table.keyIndex, ...table.secondaryIndexes]) yield* runsOf(index, tableId);
-    const directories: Array<{ ref: BlobRef; kind: ReachableKind }> = [
-      { ref: table.groups, kind: "group-directory" },
+    const directories: Directory[] = [
+      {
+        ref: table.groups,
+        kind: "group-directory",
+        expect: (totals) => {
+          valid(totals.groupCount === table.groupCount, "Table group count disagrees");
+          valid(totals.liveRowCount === table.liveRowCount, "Table live row count disagrees");
+        },
+      },
     ];
     for (const staged of table.staged) {
-      directories.push({ ref: staged.groups, kind: "staged-group-directory" });
+      directories.push({
+        ref: staged.groups,
+        kind: "staged-group-directory",
+        expect: (totals) => {
+          valid(totals.rowCount === staged.rowCount, "Staged row count disagrees");
+          valid(
+            totals.firstRowId === null || totals.firstRowId >= staged.firstRowId,
+            "Staged rows before the staged range",
+          );
+        },
+      });
       for (const index of staged.indexRuns) yield* runsOf(index, tableId);
     }
-    for (const { ref, kind } of directories) {
-      if (ref.length === 0) continue;
-      yield { ref, kind, tableId };
-      const groups = await reader.groups(ref);
-      for (let start = 0; start < groups.length; start += concurrency) {
-        const batch = groups.slice(start, start + concurrency);
-        const roots = await Promise.all(batch.map((group) => reader.groupRoot(group.root)));
-        for (const [index, group] of batch.entries()) {
-          yield { ref: group.root, kind: "group-root", tableId };
-          if (group.deletions !== null) yield { ref: group.deletions, kind: "deletions", tableId };
-          const groupRoot = roots[index];
-          if (groupRoot === undefined) continue;
-          if (groupRoot.rowIds.kind === "column")
-            yield { ref: groupRoot.rowIds.ref, kind: "row-ids", tableId };
-          for (const chunk of groupRoot.columns) {
-            yield { ref: chunk.data, kind: "chunk-data", tableId };
-            yield { ref: chunk.directory, kind: "page-directory", tableId };
-            if (chunk.distinctSketch !== null)
-              yield { ref: chunk.distinctSketch, kind: "distinct-sketch", tableId };
+    for (const { ref, kind, expect } of directories) {
+      const totals: Totals = { groupCount: 0, rowCount: 0, liveRowCount: 0, firstRowId: null };
+      if (!isEmptyDirectory(ref)) {
+        yield { ref, kind, tableId };
+        const index = await reader.groupIndex(ref);
+        try {
+          for (const page of index.value) {
+            yield { ref: page.ref, kind: "group-directory-page", tableId };
+            const groups = await reader.groupPage(page.ref);
+            try {
+              checkPage(page, groups.value);
+              yield* groupsOf(groups.value, reader, concurrency, tableId);
+            } finally {
+              groups.release();
+            }
+            totals.groupCount += page.groupCount;
+            totals.rowCount += page.rowCount;
+            totals.liveRowCount += page.liveRowCount;
+            totals.firstRowId ??= page.firstRowId;
+            valid(page.lastRowId < table.nextRowId, "A row id at or past the table's next row id");
           }
+        } finally {
+          index.release();
         }
       }
+      expect(totals);
+    }
+  }
+}
+
+interface Totals {
+  groupCount: number;
+  rowCount: number;
+  liveRowCount: number;
+  firstRowId: number | null;
+}
+
+interface Directory {
+  readonly ref: BlobRef;
+  readonly kind: ReachableKind;
+  /** Throws `ManifestCorruptionError` unless the directory's totals match what references it. */
+  readonly expect: (totals: Totals) => void;
+}
+
+/** A directory index entry describes the page it references. */
+function checkPage(entry: GroupPageEntry, groups: readonly GroupRef[]): void {
+  let rowCount = 0;
+  let liveRowCount = 0;
+  for (const group of groups) {
+    rowCount += group.rowCount;
+    liveRowCount += group.liveRowCount;
+  }
+  valid(
+    groups.length === entry.groupCount &&
+      groups[0]?.firstRowId === entry.firstRowId &&
+      groups[groups.length - 1]?.lastRowId === entry.lastRowId &&
+      rowCount === entry.rowCount &&
+      liveRowCount === entry.liveRowCount,
+    "A directory index entry disagrees with its page",
+  );
+}
+
+/** A group's reference describes its group root. */
+function checkRoot(group: GroupRef, root: GroupRoot): void {
+  valid(root.rowCount === group.rowCount, "A group root's row count disagrees with its group");
+  valid(
+    root.rowIds.kind !== "dense" || group.lastRowId - group.firstRowId + 1 === root.rowCount,
+    "A dense group's row-id range disagrees with its row count",
+  );
+}
+
+async function* groupsOf(
+  groups: readonly GroupRef[],
+  reader: ManifestReader,
+  concurrency: number,
+  tableId: number,
+): AsyncGenerator<Reached> {
+  for (let start = 0; start < groups.length; start += concurrency) {
+    const batch = groups.slice(start, start + concurrency);
+    const settled = await Promise.allSettled(batch.map((group) => reader.groupRoot(group.root)));
+    const roots = settled.flatMap((result) =>
+      result.status === "fulfilled" ? [result.value] : [],
+    );
+    try {
+      const failed = settled.find((result) => result.status === "rejected");
+      if (failed !== undefined) throw failed.reason;
+      for (const [index, group] of batch.entries()) {
+        yield { ref: group.root, kind: "group-root", tableId };
+        if (group.deletions !== null) yield { ref: group.deletions, kind: "deletions", tableId };
+        const groupRoot = roots[index]?.value;
+        if (groupRoot === undefined) continue;
+        checkRoot(group, groupRoot);
+        if (groupRoot.rowIds.kind === "column")
+          yield { ref: groupRoot.rowIds.ref, kind: "row-ids", tableId };
+        for (const chunk of groupRoot.columns) {
+          yield { ref: chunk.data, kind: "chunk-data", tableId };
+          yield { ref: chunk.directory, kind: "page-directory", tableId };
+          if (chunk.distinctSketch !== null)
+            yield { ref: chunk.distinctSketch, kind: "distinct-sketch", tableId };
+        }
+      }
+    } finally {
+      for (const root of roots) root.release();
     }
   }
 }
@@ -139,22 +269,31 @@ export async function reachable(
   return out;
 }
 
-/** The byte codecs of the metadata the walk descends through (format track, Phase 2: R15.3). */
+/** The decoders the walk uses (manifest-codec.ts by default; tests substitute their own). */
 export interface ManifestCodecs {
-  decodeRoot(bytes: Uint8Array): ManifestRoot;
-  decodeGroups(bytes: Uint8Array): readonly GroupRef[];
-  decodeGroupRoot(bytes: Uint8Array): GroupRoot;
+  decodeRoot(bytes: Uint8Array, budget: ByteBudget): Parsed<ManifestRoot>;
+  decodeGroupIndex(bytes: Uint8Array, budget: ByteBudget): Parsed<readonly GroupPageEntry[]>;
+  decodeGroupPage(bytes: Uint8Array, budget: ByteBudget): Parsed<readonly GroupRef[]>;
+  decodeGroupRoot(bytes: Uint8Array, budget: ByteBudget): Parsed<GroupRoot>;
 }
+
+export const MANIFEST_CODECS: ManifestCodecs = {
+  decodeRoot: decodeManifestRoot,
+  decodeGroupIndex,
+  decodeGroupPage,
+  decodeGroupRoot,
+};
 
 /**
  * `walkReachable` in the shape the extent space opens with (storage/extents.ts
  * `ReachableExtents`): root bytes in, blobs and extents out, streamed. Metadata blobs are read
- * through the space (verified, cached), each lease charged to `budget` only while it is decoded.
- * A reference in the same extent as the one yielded just before it (a chunk's directory and
- * sketch, the next chunk of a pack) is not repeated.
+ * through the space (verified, cached); each lease is held only while its blob is decoded, and
+ * each decoded value's parse charge only while the walk uses it, both on `budget`. The space
+ * takes a blob's extent; a chunk's data range has no checksum, so it is given as its extent. A
+ * reference in the same extent as the one yielded just before it is not repeated.
  */
 export function reachableExtents(
-  codecs: ManifestCodecs,
+  codecs: ManifestCodecs = MANIFEST_CODECS,
   options: ReachableOptions = {},
 ): (
   root: Uint8Array,
@@ -162,30 +301,47 @@ export function reachableExtents(
   budget: ByteBudget,
 ) => AsyncIterable<BlobRef | ExtentRef> {
   return async function* walk(root, reader, budget) {
-    const decode = async <T>(ref: BlobRef, decoder: (bytes: Uint8Array) => T): Promise<T> => {
+    const decode = async <T>(
+      ref: BlobRef,
+      decoder: (bytes: Uint8Array, budget: ByteBudget) => Parsed<T>,
+    ): Promise<Held<T>> => {
       const lease = await reader.read([ref], { budget });
+      let parsed: Parsed<T>;
       try {
-        return decoder(lease.bytes[0] ?? new Uint8Array(0));
+        parsed = decoder(lease.bytes[0] ?? new Uint8Array(0), budget);
       } finally {
         lease.release();
       }
+      let released = false;
+      return {
+        value: parsed.value,
+        release: () => {
+          if (released) return;
+          released = true;
+          budget.free(parsed.charge);
+        },
+      };
     };
-    const manifest = codecs.decodeRoot(root);
-    let last: ExtentRef | null = null;
-    // The space takes a blob's extent; a chunk's data range has no checksum, so it is given as
-    // its extent (the unit the space reclaims).
-    for await (const { ref } of walkReachable(
-      manifest,
-      {
-        groups: (blob) => decode(blob, (bytes) => codecs.decodeGroups(bytes)),
-        groupRoot: (blob) => decode(blob, (bytes) => codecs.decodeGroupRoot(bytes)),
-      },
-      options,
-    )) {
-      const extent = ref.extent;
-      if (last !== null && last.offset === extent.offset && last.length === extent.length) continue;
-      last = extent;
-      yield "checksum" in ref ? ref : extent;
+    const manifest = codecs.decodeRoot(root, budget);
+    try {
+      let last: ExtentRef | null = null;
+      for await (const { ref } of walkReachable(
+        manifest.value,
+        {
+          groupIndex: (blob) => decode(blob, (bytes, b) => codecs.decodeGroupIndex(bytes, b)),
+          groupPage: (blob) => decode(blob, (bytes, b) => codecs.decodeGroupPage(bytes, b)),
+          groupRoot: (blob) => decode(blob, (bytes, b) => codecs.decodeGroupRoot(bytes, b)),
+        },
+        options,
+      )) {
+        const extent = ref.extent;
+        if (last !== null && last.offset === extent.offset && last.length === extent.length)
+          continue;
+        last = extent;
+        yield "checksum" in ref ? ref : extent;
+      }
+    } finally {
+      budget.free(manifest.charge);
     }
   };
 }

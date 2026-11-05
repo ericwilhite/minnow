@@ -189,6 +189,51 @@ describe("memory governor: cache, reclaim and lifecycle", () => {
     expect(governor.usedBytes).toBeLessThanOrEqual(16 * MiB - governor.reserveBytes);
   });
 
+  it("evicts several caches oldest entry first; one without times first; a stuck one is skipped (review B2-p2a #2)", () => {
+    const governor = new Governor(16 * MiB);
+    const order: string[] = [];
+    /** A cache of `entries` 1 MiB entries, last used at the given times (oldest first). */
+    const fake = (name: string, times: number[] | null, frees = true) => {
+      const left = [...(times ?? [0, 0])];
+      let asked = 0;
+      const cache: EvictableCache = {
+        get evictableBytes() {
+          return left.length * MiB;
+        },
+        get oldestUnusedAt() {
+          return times === null ? undefined : left[0];
+        },
+        evict() {
+          if (!frees) {
+            // Asked once per eviction pass at most: asked again, it would be asked forever.
+            if (++asked > 1) throw new Error(`${name} was asked again after freeing nothing`);
+            return 0;
+          }
+          left.shift();
+          order.push(name);
+          handle.release(MiB);
+          return MiB;
+        },
+      };
+      const handle = governor.registerCache(cache);
+      expect(handle.charge(MiB * left.length)).toBe(true);
+      return cache;
+    };
+    fake("a", [10, 40]);
+    fake("b", [20, 30]);
+    fake("stuck", [1], false);
+    fake("untimed", null);
+    const limit = governor.capBytes - governor.reserveBytes;
+    const grant = governor.tryAdmit({
+      label: "big",
+      minimumBytes: limit - governor.usedBytes + 6 * MiB,
+      spillable: true,
+    });
+    expect(grant).not.toBeNull();
+    expect(order).toEqual(["untimed", "untimed", "a", "b", "b", "a"]);
+    grant?.close();
+  });
+
   it("charges each request once when the cache releases synchronously (review probe)", async () => {
     const governor = new Governor(16 * MiB);
     let cached = 14 * MiB;

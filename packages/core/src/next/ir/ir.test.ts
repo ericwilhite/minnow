@@ -32,3 +32,48 @@ describe("IR modify node (ruling R14)", () => {
     expect(incomplete.op).toBe("modify");
   });
 });
+
+describe("IR additions (ruling R17.5)", () => {
+  it("expresses ON CONFLICT arbiters, MERGE, client rows and index ranges", () => {
+    const int4 = { kind: "int32", bits: 32 } as const;
+    const rows: Rel = { op: "input", id: 1, output: [{ name: "id", type: int4, nullable: false }] };
+    const upsert: Extract<Rel, { op: "modify" }> = {
+      op: "modify",
+      id: 2,
+      output: [],
+      kind: "upsert",
+      tableId: 7,
+      input: rows,
+      assigned: [],
+      onRepeat: "error",
+      onConflict: { arbiters: [], indexId: -1, action: "nothing", assignments: [], where: null },
+      returning: null,
+    };
+    const range: Rel = {
+      op: "indexRange",
+      id: 3,
+      output: [],
+      tableId: 7,
+      indexId: 1,
+      lower: { keys: [{ op: "param", slot: 0, type: int4 }], inclusive: true },
+      upper: null,
+      descending: false,
+      columns: [1],
+      emitLocator: true,
+    };
+    const merge: Extract<Rel, { op: "modify" }> = {
+      ...upsert,
+      kind: "merge",
+      onConflict: null,
+      input: range,
+      merge: {
+        sourceColumns: 1,
+        actions: [
+          { when: "matched", condition: null, action: { kind: "delete" } },
+          { when: "notMatched", condition: null, action: { kind: "nothing" } },
+        ],
+      },
+    };
+    expect([upsert.onConflict?.arbiters, merge.merge?.actions.length]).toEqual([[], 2]);
+  });
+});

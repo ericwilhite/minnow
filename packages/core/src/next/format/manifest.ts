@@ -28,7 +28,9 @@
  *   inside one extent); each `PageEntry.offset` is relative to the start of that blob, so a page's
  *   data-space address is `blobAddress(data) + page.offset`. A chunk never spans extents (a writer
  *   that cannot place it contiguously writes a smaller group). Metadata blobs and pages are at most
- *   1 MiB (storage `MAX_BLOB_BYTES`); a chunk's data blob and an extent have no cap.
+ *   1 MiB (storage `MAX_BLOB_BYTES`); a chunk's data blob and an extent have no cap. The parts of
+ *   a chunk's out-of-line values (page/large-value.ts) lie inside its data blob too, so they need
+ *   no reference of their own: reaching the chunk reaches them, and they are reclaimed with it.
  * - **Size.** The root is O(tables + ledger). A table root is O(1) plus its index runs; its group
  *   directory is O(groups); a group root is O(columns); a page directory is O(pages of one
  *   chunk). Nothing is O(rows). Planning and pruning read directories, never pages.
@@ -111,13 +113,15 @@ export interface TableRoot {
   readonly tableId: number;
   /** The schema version its groups were written under (replay checks frames against it). */
   readonly schemaVersion: number;
-  /** The next row id this table allocates (row ids start at 1). */
+  /** The next row id this table allocates (row ids start at 1): past every row id it holds. */
   readonly nextRowId: number;
   /** Every frame of this table with LSN ≤ this is in `groups`. */
   readonly flushedThroughLsn: number;
+  /** Σ `GroupRef.liveRowCount` over `groups` (staged rows are not counted). */
   readonly liveRowCount: number;
   /** → GroupRef[] in row-id order. */
   readonly groups: BlobRef;
+  /** Groups in `groups`. The reachability walk checks both totals against the directory. */
   readonly groupCount: number;
   /**
    * Large transactions' rows published but not yet visible (replay.ts "Large transactions"): each
@@ -126,7 +130,9 @@ export interface TableRoot {
    */
   readonly staged: ReadonlyArray<{
     readonly transaction: number;
+    /** No staged group starts before it. */
     readonly firstRowId: number;
+    /** Σ `GroupRef.rowCount` over `groups`. */
     readonly rowCount: number;
     /** → GroupRef[] of the staged rows. */
     readonly groups: BlobRef;
@@ -206,6 +212,13 @@ export interface PageEntry {
   readonly min: StatValue | null;
   readonly max: StatValue | null;
   readonly checksum: number;
+  /**
+   * The out-of-line values of a plain varlen page (page/large-value.ts): the range, relative to
+   * `ColumnChunk.data`, that the parts of its pointers tile exactly, in row order. It lies after
+   * the previous page and before this one, so no value can alias another or overlap a page.
+   * Absent when the page holds none.
+   */
+  readonly largeRegion?: { readonly offset: number; readonly length: number };
 }
 
 /** A key index or secondary index: leveled sorted runs of (key, rowId, seq). */

@@ -22,16 +22,16 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | `vector/`          | contracts → executor             | Batches (byte-bounded), vectors, validity, exact int64, int128 decimals, UTF-8 builder under a grant, locators                                                                                                                                                                                                                                                                                                         |
 | `storage/`         | storage                          | Backend contract (lock + async fence open, async mutations), file store, simulated disk with crash model, the storage kit (conformance + durability sweep); the extent space (`extents.ts`: allocation, writer lifecycle, publish, pins and reclaim, the verified page cache) and its implementation (`space.ts`, `page-cache.ts`), the in-memory backend (`memory-store.ts`), free map, read coalescing, OPFS backend |
 | `keys/`            | contracts → executor, key index  | Memcomparable key encoding: reusable writer, batched encoder over vectors, indexable-type rules                                                                                                                                                                                                                                                                                                                        |
-| `format/`          | format, write path               | Log frames and multipart transactions, header slots, in-memory and incremental recovery scans, replay rules, request ledger, manifest types, the reachability walk (`reachable.ts`)                                                                                                                                                                                                                                    |
+| `format/`          | format, write path               | Log frames and multipart transactions, header slots, recovery scans, replay rules, request ledger, manifest types and codecs (root, paged group directory, group root), parsed-blob cache, metadata reader, reachability walk                                                                                                                                                                                          |
 | `page/`            | format                           | Page codecs, page directory and statistics, streaming group writer, chunk reader (ChunkPages), inflated-page cache                                                                                                                                                                                                                                                                                                     |
 | `spill/`           | executor (OPFS service: storage) | Spill contract (one long-lived scratch file, batching charged to the operator's budget); in-memory double                                                                                                                                                                                                                                                                                                              |
 | `memory/`          | executor                         | Memory governor: admission, progress loans, held vs allocated bytes (reference implementation)                                                                                                                                                                                                                                                                                                                         |
 | `exec/`            | executor                         | Entry point (`executor.ts`), result frames (`result.ts`), scans (`scan.ts`, `memory-scan.ts`), table rules (`rules.ts`), push driver (`pipeline.ts`), fetcher (`fetch.ts`), comparators, decimal SUM                                                                                                                                                                                                                   |
-| `ir/`              | lowering, executor               | Operator IR (`ir.ts`); the front-end boundary (`lowering.ts`)                                                                                                                                                                                                                                                                                                                                                          |
+| `ir/`              | lowering, executor               | Operator IR (`ir.ts`); scalar function and operator table (`functions.ts`); table rules in IR form (`rules.ts`); executor costs the planner reads (`costs.ts`)                                                                                                                                                                                                                                                         |
 | `access/`          | write path + key index           | Storage access contracts the write path implements: snapshots and segments, catalog, key-index probes and ranges, `modify` (rows, conflicts, RETURNING), transactions, group commit, sequences, delivery                                                                                                                                                                                                               |
 | `testing/`         | all                              | Differential-harness adapter for a partial new core                                                                                                                                                                                                                                                                                                                                                                    |
 | `write/` (to come) | write path + key index           | Group commit, memtables, key index runs, maintenance (implements `access/`)                                                                                                                                                                                                                                                                                                                                            |
-| `lower/` (to come) | planner lowering                 | `Lowerer`, cost model, statistics                                                                                                                                                                                                                                                                                                                                                                                      |
+| `lower/`           | planner lowering                 | `Lowerer` (`lowerer.ts` contract, `create.ts`): front-end passes over the catalog, typing (`coerce.ts`, `expressions.ts`), queries, DML, DDL, table rules, result descriptors; an in-memory catalog; front-end inventory (`INVENTORY.md`)                                                                                                                                                                              |
 | `owner/`           | ownership                        | Owner/client protocol (`protocol.ts`), wire payloads (re-exported from exec) and stream dictionaries (`frame.ts`), ledger outcomes per request (`outcomes.ts`), wire errors (`errors.ts`), client sequencing (`sequence.ts`), election, liveness and step-down (`election.ts`), public client API (`api.ts`), engine boundary and idle-transaction timer (`engine.ts`); composition root to come                       |
 
 ## Cross-track interfaces (owned by the implementing track)
@@ -245,8 +245,35 @@ is access's `Snapshot`.
 - NUMERIC: a declared scale makes a fixed-scale chunk; an unconstrained NUMERIC keeps each
   value's scale (a per-row section, or one scale per page), and its min/max are normalized sort
   keys (value order, scale ignored, R15.10), chosen by comparing the exact key bytes. Coefficients are stored by the int64 rules when they
-  fit, else as 128-bit limbs. Past 128 bits, and a single value too large for one page, is
-  `UnsupportedPageLayoutError` (large values: Phase 2, R15.4).
+  fit, else as 128-bit limbs. Past 128 bits is `UnsupportedPageLayoutError`.
+- Large values (`large-value.ts`, R15.4): a text, bytes, json or array value over 64 KiB is stored
+  out of line, as consecutive parts of at most 1 MiB (each with its own xxHash32) in the chunk's
+  own extent, written straight from the caller's vector through the builder (the writer holds no
+  copy: about 0.1 MiB of working memory however large the values). Its page slot holds a pointer
+  (offset, length, part checksums) and the page marks the row in a `large` bitmap; such a page
+  is plain, and the chunk's dictionary carries on for the other pages. Bounds use the value's
+  first 33 bytes and the sketch hashes the whole value. The parts are inside the chunk's data
+  range, so the reachability walk reaches them through the chunk and they are reclaimed with it.
+  Each page's directory entry records its large-value region (`PageEntry.largeRegion`): it lies
+  after the previous page and before this one (pages are in order and never overlap), and the
+  page's pointers must tile it exactly, in row order (checked when the page is parsed, one
+  comparison per value), so a value can alias neither another value nor a page. A value over
+  64 MiB (`MAX_VALUE_BYTES`) is `UnsupportedPageLayoutError`. A group ends before a varlen chunk
+  passes `maxChunkBytes` (1 GiB, far below what the directory's u32 offsets address); it always
+  takes at least one row.
+- Reading large values: `load` reads pages only. `loadValues(from, to)` / `loadValuesOf(rows)`
+  load the out-of-line values a decode will reach, charged to the budget before they are read
+  (the space's lease), in reads of at most 4 MiB, and kept leased (a decode copies the parts
+  straight into the target; no reassembly copy) until `releaseValues`, `release` of their page
+  or `close`. Synchronous when every part is resident. A decode that reaches an unloaded one
+  throws `ValueNotLoadedError`; `varlenBytes` and `gatherBytes` count full value lengths, so a
+  caller can size batches first. Values read together share one lease, charged until the last
+  of them is released; a release while a load is in flight wins (the load gives its holds back,
+  and a later load reads afresh). A consumer that can stream uses `valueParts(row)`: one
+  verified part (≤ 1 MiB) held at a time, whatever the value's size. `close` ends every stream
+  and releases what it holds. A stream may yield verified parts before a later part fails: a
+  failed stream is wholly invalid, and its consumer must discard what it got; `loadValues` (and
+  so every decode) verifies every part first. `scripts/large-value-bench.mts` measures it.
 - Floats: min/max follow PostgreSQL's order (NaN above +Infinity): max is NaN when any NaN is
   present, both are NaN only when no other value is.
 - gzip is a second stage only maintenance compaction applies (writer option `gzip`; never a
@@ -288,10 +315,39 @@ is access's `Snapshot`.
   staging included) → spill sweep → ready.
 - Snapshot pins live in memory and are dropped when their client's lock is released.
 - `walkReachable(root, reader)` streams every reference a root reaches (catalog, table
-  statistics, group directories, staged transactions' group directories and index runs, group
-  roots, deletion bitmaps, row-id columns, chunk extents, page directories, sketches, index
-  entries, fences and Bloom filters); `reachableExtents(codecs)` is the extent space's
-  `ReachableExtents` over it. A failed metadata read rejects the walk.
+  statistics, group directory indexes and pages, staged transactions' directories and index runs,
+  group roots, deletion bitmaps, row-id columns, chunk data, page directories, sketches, index
+  entries, fences and Bloom filters); `reachableExtents()` is the extent space's
+  `ReachableExtents` over the real codecs. A failed metadata read rejects the walk.
+
+### Manifest codecs (`format/manifest-codec.ts`, `blob-cache.ts`, `metadata-reader.ts`)
+
+- Binary codecs (version 1) for the root (≤ 1 MiB), group roots and the paged group directory
+  (each blob ≤ 1 MiB). Each blob lists its extents once and gives every reference into one extent
+  the same `ExtentRef`. Encoding is canonical (re-encoding a decoded value gives the same bytes).
+- `TableRoot.groups` names a directory **index**; each index entry names a **page** of up to
+  `GROUPS_PER_PAGE` (4,096) `GroupRef`s with its row-id range and counts. `writeGroupDirectory`
+  keeps unchanged pages, so a flush rewrites only the last page and the index. A table with no
+  groups has a zero-length `groups` reference. The index has one 30-byte entry per page, so the
+  per-flush rewrite grows with the page count: up to about 113 KiB for the last page plus ~30 bytes per
+  4,096 groups (a two-level index can replace it if that ever matters).
+- Decoding is canonical: an extent table or type table with a duplicate, unused or out-of-order
+  entry, a non-minimal integer, or ledger counts out of key order is refused, and a blob over its
+  cap is refused before anything is charged. Strings keep a leading byte-order mark, and ledger
+  counts decode into a null-prototype object (a `__proto__` key is an ordinary key).
+- The walk checks each directory against what references it: index entries against their pages,
+  pages against the table's `groupCount` and `liveRowCount` (staged directories: their
+  `rowCount` and `firstRowId`), every row id against `nextRowId`, and each group against its group
+  root's row count. A contradiction rejects the walk with `ManifestCorruptionError`.
+- A cached chunk directory is checked against each chunk that opens it (its pages and dictionary
+  must lie inside that chunk's data).
+- Decoders never hash (the space or the root slot verified the bytes); they check structure and
+  throw `ManifestCorruptionError`. Each charges `parseCharge(bytes)` to the caller's budget
+  before it builds anything (`ParseBudgetError` on refusal) and returns the charge with the value.
+- `BlobCache<T>` keeps decoded values across readers: pinned entries are charged to their holder,
+  unpinned ones to the governor, which evicts them first. It backs the chunk-directory cache
+  (`ChunkReadOptions.directories`, R15.7), the inflated-page cache (R15.5) and the
+  `MetadataReader`'s group roots, pages and indexes, which are synchronous on a cache hit.
 
 ### Storage access (`access/`)
 
@@ -361,7 +417,9 @@ and the owner import it directly.
 - A grant _holds_ bytes, and its operator _allocates_ buffers out of them, so a non-spillable
   operator works inside its admitted minimum.
 - Growth is charged before it happens, including the overlap while a buffer is copied.
-- The page cache is evicted before anything spills.
+- Caches are evicted before anything spills. Several may register (the space's page cache, the
+  decoded directory and metadata caches, the inflated-page cache); eviction takes the entry unused
+  longest across all of them (`oldestUnusedAt`).
 - Progress loans are scheduled before admissions and may use the reserve: a queued admission,
   growth or the cache never delays a loan, and a loan waits only for earlier loans to be repaid.
   Progress follows if each loan covers one bounded step. A loan belongs to its grant from the
@@ -450,7 +508,38 @@ and the owner import it directly.
   contract (`exec/fetch.ts`): an explicit, enforced output capacity, charged and bounded staging,
   and partial completion that may reread pages.
 - `apply` memoizes only when evaluation multiplicity is unobservable.
-- `lowering.ts` lists the front-end passes that are kept and the code that lowering replaces.
+- `rules.ts` is a table's CHECK, generated and default expressions in IR form: lowering builds
+  them, the executor compiles them (`compileTableRules`).
+
+### Lowering (`lower/`)
+
+- `Lowerer.lower(text, context)` runs the whole front end (parse, catalog passes over access/'s
+  `CatalogView`, shape passes), types every expression, and returns a `LoweredStatement`: a plan
+  with result descriptors, read and write sets and its statistics basis; a catalog change; or a
+  transaction or utility command. `lowerer.ts` lists the front-end passes that are kept and the
+  code that lowering replaces.
+- Pure and synchronous; the owner caches by (text, catalog version) and re-lowers when
+  `statisticsDrifted` says the data moved.
+- Declared numeric widths and VARCHAR(n) / CHAR(n) widths come from the parser only under
+  `compileWithDeclaredTypes` (engine/query.ts), so the current engine compiles exactly what it
+  did (C5, R17.4).
+- Types follow PostgreSQL: integer constants are int4 → int8 → numeric by magnitude, string
+  constants and placeholders take the type of their context, overloads resolve against
+  `ir/functions.ts` with implicit casts, and values written to a column get assignment casts.
+- A unique key fixed by `=` constants (or one `IN` list) becomes `keyLookup`: a point read. A
+  constant that cannot be a key of the column's type keeps the scan.
+- int8 renders `bigint` only when an operand does (R17.1); SUM(int8) is `decimal(null, 0)`
+  rendered `bigint` (R17.2).
+- Milestone M1 surface. Joins, subqueries, windows, set operations and recursion are refused
+  with `UnsupportedPlanError` (stage "lower", a construct key) until milestone M3.
+- `testing/lowering-differential.test.ts` runs DDL, seed rows, 41 queries, writes, RETURNING
+  and failing writes through the current engine and through lowering + the IR reference
+  interpreter (`testing/ir-reference.ts`), and requires identical results;
+  `testing/lowering-pglite.test.ts` does the same against PostgreSQL (PGlite), the authority;
+  `testing/ir-check.ts` type-checks every plan they run.
+- Under `compileWithDeclaredTypes` the front end keeps constants typed (no folding with the
+  current engine's numbers), keeps INSERT values as expressions, marks TRUNCATE and leaves bare
+  ON CONFLICT names unqualified; lowering folds integer constants after overload resolution.
 
 ### Differential adapter (`testing/differential-adapter.ts`)
 

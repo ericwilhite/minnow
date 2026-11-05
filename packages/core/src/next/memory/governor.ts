@@ -31,7 +31,10 @@
  *    charge: closing the grant at any point returns it. A loan larger than the reserve is the one
  *    size error, `ValueTooLargeError`: about a value, never a query or table.
  * 6. **The cache yields first.** Before refusing growth or keeping anything waiting, the governor
- *    evicts unpinned encoded pages. Operators spill only after the cache is at its floor.
+ *    evicts unpinned encoded pages. Operators spill only after the cache is at its floor. Several
+ *    caches may register (the space's page cache, decoded directories and metadata, inflated
+ *    pages): eviction takes the entry unused the longest across all of them, asking the cache
+ *    whose `oldestUnusedAt` is smallest for one entry at a time.
  * 7. **Cooperative reclaim.** While a loan or an admission waits, the governor calls each other
  *    spillable grant's `onReclaimRequest`; the operator spills at its next batch boundary and
  *    `release`s. A callback (or the cache) may release synchronously: the drain is not reentrant.
@@ -119,11 +122,17 @@ export interface Grant {
   close(): void;
 }
 
-/** The page cache's side of the governor (rule 6). */
+/** A cache's side of the governor (rule 6). */
 export interface EvictableCache {
   readonly evictableBytes: number;
   /** Evicts at least `bytes` if possible, releasing them through its handle (possibly at once). */
   evict(bytes: number): number;
+  /**
+   * When the entry `evict` would take next was last used (`performance.now()` milliseconds), so
+   * the governor can evict across caches oldest first. Absent (or undefined): the cache is asked
+   * before any cache that reports a time.
+   */
+  readonly oldestUnusedAt?: number | undefined;
 }
 
 export interface MemoryGovernor {
@@ -284,7 +293,7 @@ export class Governor implements MemoryGovernor {
   readonly reserveBytes: number;
   usedBytes = 0;
   peakBytes = 0;
-  #cache: EvictableCache | null = null;
+  readonly #caches: EvictableCache[] = [];
   readonly #grants = new Set<GrantImpl>();
   readonly #loans: Request[] = [];
   readonly #admissions: Request[] = [];
@@ -316,12 +325,41 @@ export class Governor implements MemoryGovernor {
     );
   }
 
-  /** Room for a request, evicting the cache first (rule 6). */
+  /** Room for a request, evicting the caches first (rule 6). */
   #room(bytes: number, loan: boolean): boolean {
     const missing = this.#missing(bytes, loan);
     if (missing <= 0) return true;
-    if (this.#cache !== null && this.#cache.evictableBytes > 0) this.#cache.evict(missing);
+    this.#evict(missing);
     return this.#missing(bytes, loan) <= 0;
+  }
+
+  /** Evicts up to `bytes` across the registered caches, the entry unused longest first. */
+  #evict(bytes: number): void {
+    const only = this.#caches.length === 1 ? this.#caches[0] : undefined;
+    if (only !== undefined) {
+      if (only.evictableBytes > 0) only.evict(bytes);
+      return;
+    }
+    let remaining = bytes;
+    // A cache that frees nothing when asked is not asked again in this call.
+    const stuck = new Set<EvictableCache>();
+    while (remaining > 0) {
+      let victim: EvictableCache | null = null;
+      let oldest = Number.POSITIVE_INFINITY;
+      for (const cache of this.#caches) {
+        if (cache.evictableBytes <= 0 || stuck.has(cache)) continue;
+        const at = cache.oldestUnusedAt ?? Number.NEGATIVE_INFINITY;
+        if (victim === null || at < oldest) {
+          victim = cache;
+          oldest = at;
+        }
+      }
+      if (victim === null) return;
+      // One entry at a time (`evict` takes at least one): the next one may be in another cache.
+      const freed = victim.evict(1);
+      if (freed <= 0) stuck.add(victim);
+      else remaining -= freed;
+    }
   }
 
   repaid(bytes: number): void {
@@ -472,8 +510,9 @@ export class Governor implements MemoryGovernor {
     );
   }
 
+  /** Registers one more cache (rule 6); every registered cache is evicted before anything waits. */
   registerCache(cache: EvictableCache) {
-    this.#cache = cache;
+    if (!this.#caches.includes(cache)) this.#caches.push(cache);
     return {
       charge: (bytes: number): boolean => {
         if (this.#loans.length > 0 || this.#admissions.length > 0) return false;

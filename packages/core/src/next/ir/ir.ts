@@ -1,6 +1,6 @@
 /**
  * The typed operator IR the new executor consumes. The planner-lowering track produces it from
- * the front end's optimized `CompiledQuery` (lowering.ts); the executor track runs it. Nothing
+ * the front end's optimized `CompiledQuery` (lower/lowerer.ts); the executor track runs it. Nothing
  * else creates or interprets it.
  *
  * ## Invariants
@@ -45,7 +45,20 @@ export type ScalarExpr =
       readonly args: readonly ScalarExpr[];
       readonly type: PhysicalType;
     }
-  | { readonly op: "cast"; readonly input: ScalarExpr; readonly type: PhysicalType }
+  /**
+   * A cast to `type`. Explicit casts (`CAST`, `::`) follow PostgreSQL's explicit rules: a text
+   * value longer than a `text` type's `maxLength` is truncated. `assignment` (additive, R17.4)
+   * marks PostgreSQL's assignment cast, which lowering puts on every value written to a column
+   * (INSERT values, UPDATE SET, ON CONFLICT and MERGE assignments, defaults, generated columns):
+   * there a value longer than `maxLength` is SQLSTATE 22001 (string_data_right_truncation), and
+   * numeric range and precision errors are raised as for an explicit cast.
+   */
+  | {
+      readonly op: "cast";
+      readonly input: ScalarExpr;
+      readonly type: PhysicalType;
+      readonly assignment?: true;
+    }
   | {
       readonly op: "compare";
       readonly cmp: "=" | "<>" | "<" | "<=" | ">" | ">=";
@@ -169,6 +182,22 @@ export interface RuntimeFilter {
   readonly column: number;
 }
 
+/**
+ * `mark` (a decorrelated [NOT] IN / ANY / ALL with SQL's three-valued result; rulings R20.1 and
+ * R20.5): the output is the probe (left) columns plus one `bool` column, last, one row per probe
+ * row. Two kinds of condition decide it:
+ * - **Participation.** A build row takes part when its correlation keys (`join.correlated`
+ *   leading keys, `=`: a NULL key matches none) equal the probe row's and `join.filter` (the
+ *   subquery's own WHERE, including correlated conditions such as `b.z > p.w`) is TRUE: with
+ *   WHERE semantics, FALSE and NULL both exclude the row.
+ * - **The comparison.** Over the participating rows, the tested keys (the keys after the
+ *   correlation keys) and `join.residual` (only the quantified comparison itself and any extra
+ *   comparison columns) give the mark: TRUE if the comparison is TRUE for any row; else UNKNOWN
+ *   (NULL) if it is UNKNOWN for any; else FALSE. No participating row gives FALSE. A composite
+ *   tested key compares per column, so `(1, 2) IN (SELECT 3, NULL)` is FALSE.
+ * PostgreSQL (verified in PGlite): p(x = 1, w = 0), b(y = 1, z = NULL):
+ * `x NOT IN (SELECT y FROM b WHERE b.z > p.w)` is TRUE, since b's row does not participate.
+ */
 export type JoinKind = "inner" | "left" | "right" | "full" | "semi" | "anti" | "mark" | "cross";
 
 interface RelBase {
@@ -211,10 +240,43 @@ export type Rel =
       readonly tableId: number;
       /** The key index, or a secondary index id. */
       readonly indexId: number;
-      /** One tuple of key expressions (constants or params) per probe. */
+      /**
+       * One tuple of key expressions (constants or params) per probe, each already of the key
+       * column's exact type (lowering casts or drops a constant that does not fit). A constant
+       * may also be a `cast` of a literal or param (`DATE '…'`), evaluated once. A tuple with a
+       * NULL key matches nothing (`=` never matches NULL); duplicate tuples return a row once.
+       */
       readonly keys: ReadonlyArray<readonly ScalarExpr[]>;
       readonly columns: readonly number[];
+      /** Also output a row locator (type `locator`, last), as `scan.emitLocator` (additive). */
+      readonly emitLocator?: boolean;
     })
+  /**
+   * Rows of an `ordered` index between two bounds, in key order (additive, R17.5). `lower` and
+   * `upper` are key prefixes (constants or params of the key columns' exact types, as for
+   * `keyLookup`), `inclusive` per bound; null is unbounded. Equality on a prefix is
+   * `lower = upper`, both inclusive. Lowering uses it only for an `ordered` index and comparisons
+   * under the default byte-order collation (C8). A null bound value (a NULL parameter) selects
+   * nothing. `descending` returns the rows in reverse key order (for ORDER BY … DESC LIMIT).
+   */
+  | (RelBase & {
+      readonly op: "indexRange";
+      readonly tableId: number;
+      readonly indexId: number;
+      readonly lower: { readonly keys: readonly ScalarExpr[]; readonly inclusive: boolean } | null;
+      readonly upper: { readonly keys: readonly ScalarExpr[]; readonly inclusive: boolean } | null;
+      readonly descending: boolean;
+      readonly columns: readonly number[];
+      readonly emitLocator: boolean;
+    })
+  /**
+   * The rows of a client batch write, supplied with the execution rather than read from storage
+   * (additive, R17.5): its `output` columns, in order, are the client's columns already converted
+   * to these types by the executor's bind (exec/ `ExecuteRequest`, B4 Phase 2). At most one per
+   * plan. Lowering builds batch writes (`Lowerer.lowerWrite`) on it, so defaults, generated
+   * columns, casts and RETURNING are the same plan as SQL INSERT.
+   */
+  | (RelBase & { readonly op: "input" })
   | (RelBase & { readonly op: "values"; readonly rows: ReadonlyArray<readonly ScalarExpr[]> })
   | (RelBase & { readonly op: "filter"; readonly input: Rel; readonly predicate: ScalarExpr })
   | (RelBase & {
@@ -234,7 +296,22 @@ export type Rel =
       readonly rightKeys: readonly ScalarExpr[];
       /** Per key: `IS NOT DISTINCT FROM` instead of `=`. */
       readonly nullSafe: readonly boolean[];
-      /** Remaining ON conditions, over left output ++ right output, after the key match. */
+      /**
+       * Mark joins: how many leading keys are correlation keys (R20.1); absent is 0. Never set on
+       * other kinds.
+       */
+      readonly correlated?: number;
+      /**
+       * Mark joins: the participation condition over left output ++ right output, with WHERE
+       * semantics (R20.5, additive; see `JoinKind`). Absent or null: every build row with matching
+       * correlation keys participates. Never set on other kinds, whose `residual` is the whole
+       * remaining ON condition.
+       */
+      readonly filter?: ScalarExpr | null;
+      /**
+       * Remaining ON conditions, over left output ++ right output, after the key match. On a mark
+       * join, only the quantified comparison, evaluated three-valued (R20.5).
+       */
       readonly residual: ScalarExpr | null;
       /** Filters this join's build side publishes into scans under `left`. */
       readonly publishes: readonly RuntimeFilter[];
@@ -315,15 +392,38 @@ export type Rel =
       } | null;
       readonly memoize: boolean;
     })
+  /**
+   * What `modify`'s expressions read (additive wording, R17.5). "Table row" means every column of
+   * the table in catalog order (access/catalog.ts `TableDef.columns`), complete.
+   * - `onConflict.assignments` and `onConflict.where`: the existing (conflicting) table row, then
+   *   the proposed row (PostgreSQL's EXCLUDED), so column `i` is existing and `n + i` proposed.
+   *   Assignments are evaluated in list order, each once per row, and assignment `j` may also
+   *   read column `2n + i` for `i < j`: the value assignment `i` produced. Lowering recomputes a
+   *   stored generated column from those values, so a volatile assigned expression is evaluated
+   *   once (review B6-p2a finding 3).
+   * - `returning`: the affected table row (new values for insert, update and upsert; old values
+   *   for delete), then the input's passthrough columns (`passthrough`, below).
+   * - `merge` actions: see `MergeAction`.
+   */
   | (RelBase & {
       readonly op: "modify";
-      readonly kind: "insert" | "update" | "delete" | "upsert";
+      /**
+       * `truncate` (TRUNCATE): removes every row of the table, statement-atomic; the input is an
+       * empty `values` the executor never reads, and there is no RETURNING. Lowering refuses a
+       * table another table's foreign key references (PostgreSQL's 0A000 without CASCADE).
+       */
+      readonly kind: "insert" | "update" | "delete" | "upsert" | "merge" | "truncate";
       readonly tableId: number;
       /**
-       * Rows to write (insert/upsert); for update, the row locator then one column per `assigned`
-       * column, in that order; for delete, the row locator.
+       * Rows to write (insert/upsert): every table column in catalog order, defaults and
+       * generated columns filled, each of exactly its column's type. Update: the row locator,
+       * then one column per `assigned` column, in that order. Delete: the row locator. Merge: see
+       * `merge`. For update, delete and merge, the last `passthrough` input columns follow (values
+       * RETURNING reads that are not table columns, such as UPDATE … FROM's source columns).
        */
       readonly input: Rel;
+      /** Trailing input columns that only RETURNING reads (additive; absent is 0). */
+      readonly passthrough?: number;
       /**
        * UPDATE: the catalog column ids the statement assigns, in input order after the locator
        * (access/ `TableWriteOptions.assigned`). Empty for insert, upsert and delete.
@@ -337,13 +437,60 @@ export type Rel =
        */
       readonly onRepeat: "error" | "first";
       readonly onConflict: {
+        /**
+         * The unique indexes a proposed row conflicts on, tried in order (access/
+         * `TableWriter.conflicts`); empty means every unique index (a bare ON CONFLICT DO
+         * NOTHING). Additive (R17.5): `indexId` is kept and equals `arbiters[0]`, or −1 when
+         * `arbiters` is empty.
+         */
+        readonly arbiters: readonly number[];
         readonly indexId: number;
         readonly action: "nothing" | "update";
         readonly assignments: ReadonlyArray<{ readonly column: number; readonly expr: ScalarExpr }>;
         readonly where: ScalarExpr | null;
       } | null;
       readonly returning: readonly ScalarExpr[] | null;
+      /** Present iff `kind` is `"merge"` (additive, R17.5). */
+      readonly merge?: MergeSpec;
     });
+
+/**
+ * MERGE (additive, R17.5). The modify input is the source LEFT JOIN target on the match
+ * condition: the source columns, then the target's row locator (null when no target row
+ * matched), then the target row's columns in catalog order (null-extended), then passthrough
+ * columns. For each input row the first action whose `when` matches (a locator present for
+ * `matched`) and whose `condition` is true (null `condition` is true) runs; a row no action
+ * takes is skipped. A target row matched by two source rows is SQLSTATE 21000 (`onRepeat:
+ * "error"`). Conditions and values read the input columns.
+ */
+export interface MergeSpec {
+  /** Number of leading source columns; the locator is input column `sourceColumns`. */
+  readonly sourceColumns: number;
+  readonly actions: readonly MergeAction[];
+}
+
+export type MergeAction =
+  | {
+      readonly when: "matched";
+      readonly condition: ScalarExpr | null;
+      /** Update: assigned table column ids and their values (assignment-cast to the columns). */
+      readonly action:
+        | {
+            readonly kind: "update";
+            readonly assigned: readonly number[];
+            readonly values: readonly ScalarExpr[];
+          }
+        | { readonly kind: "delete" }
+        | { readonly kind: "nothing" };
+    }
+  | {
+      readonly when: "notMatched";
+      readonly condition: ScalarExpr | null;
+      /** Insert: one value per table column in catalog order (defaults filled), or nothing. */
+      readonly action:
+        | { readonly kind: "insert"; readonly values: readonly ScalarExpr[] }
+        | { readonly kind: "nothing" };
+    };
 
 export interface PhysicalPlan {
   readonly root: Rel;

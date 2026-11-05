@@ -855,10 +855,19 @@ export function upperBound(bytes: Uint8Array, start: number, end: number): Uint8
   return null;
 }
 
+/** The out-of-line rows of a varlen page (large-value.ts) and what stands in for their bytes. */
+export interface LargeRows {
+  /** Bit set: the row's slot holds a pointer, not the value. */
+  readonly bitmap: Uint32Array;
+  /** The value's first `STAT_PREFIX_BYTES + 1` bytes, for the page's bounds. */
+  prefix(row: number): Uint8Array;
+}
+
 /**
  * A plain varlen page from `bytes` and `offsets` (`offsets[0 … rows]`, absolute into `bytes`).
  * Null slots must be empty (`offsets[i] = offsets[i + 1]`). Constant when every valid value has
- * the same bytes.
+ * the same bytes. With `large`, the marked rows hold pointers: the page is plain with a `large`
+ * section, their bounds come from `large.prefix`, and the caller has hashed them for the sketch.
  */
 export function encodeVarlenPage(
   bytes: Uint8Array,
@@ -868,15 +877,21 @@ export function encodeVarlenPage(
   sketch: DistinctSketch | null,
   bounds: ByteBounds,
   scratch: PageScratch,
+  large: LargeRows | null = null,
 ): EncodedPage {
   const tag = ValueTag.varlen;
   let nulls = 0;
   let first = -1;
-  let constant = true;
+  let constant = large === null;
   bounds.reset();
   for (let row = 0; row < rows; row++) {
     if (!isValidAt(validity, row)) {
       nulls++;
+      continue;
+    }
+    if (large !== null && isValidAt(large.bitmap, row)) {
+      const prefix = large.prefix(row);
+      bounds.add(prefix, 0, prefix.length);
       continue;
     }
     const start = offsets[row] ?? 0;
@@ -891,8 +906,9 @@ export function encodeVarlenPage(
       constant = false;
   }
   if (nulls === rows) return allNullPage(scratch, tag, rows);
-  const flags = validityFlags(rows, nulls);
-  const start = sectionStart(rows, nulls);
+  const flags = validityFlags(rows, nulls) | (large === null ? 0 : PageFlag.large);
+  const largeAt = sectionStart(rows, nulls);
+  const start = largeAt + (large === null ? 0 : align8(validityBytes(rows)));
   const base = offsets[0] ?? 0;
   if (constant) {
     const valueStart = offsets[first] ?? 0;
@@ -917,6 +933,16 @@ export function encodeVarlenPage(
   const buffer = scratch.take(start + offsetBytes + total);
   header(buffer, PageEncoding.plain, tag, flags, width, rows, total);
   writeValidity(buffer, PAGE_HEADER_BYTES, validity, rows, nulls);
+  if (large !== null) {
+    const words = (rows + 31) >>> 5;
+    const section = new Uint32Array(buffer, largeAt, words);
+    section.set(large.bitmap.subarray(0, words));
+    const rest = rows & 31;
+    if (rest !== 0) section[words - 1] = (section[words - 1] ?? 0) & ((1 << rest) - 1);
+    // A pointer under a null slot means nothing: clear it so the section marks valid rows only.
+    if (validity !== null)
+      for (let w = 0; w < words; w++) section[w] = (section[w] ?? 0) & (validity[w] ?? 0);
+  }
   const out =
     width === 2
       ? new Uint16Array(buffer, start, rows + 1)

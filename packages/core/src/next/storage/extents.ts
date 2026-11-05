@@ -230,6 +230,11 @@ export interface CacheMemory {
 export interface EvictableCacheLike {
   readonly evictableBytes: number;
   evict(bytes: number): number;
+  /**
+   * When the entry `evict` takes next was last used (`performance.now()` ms): the governor evicts
+   * across several registered caches oldest first (`memory/governor.ts` rule 6).
+   */
+  readonly oldestUnusedAt?: number | undefined;
 }
 
 // ── Open ───────────────────────────────────────────────────────────────────────────────────────

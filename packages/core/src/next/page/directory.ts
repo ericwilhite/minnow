@@ -12,7 +12,8 @@
  * | row count, page count, decimal scale (`MIXED_SCALE` when pages carry their own) | 3 × u32 |
  * | dictionary page (flag 1): offset, length, entries, checksum, encoding, 3 × 0 | 4 × u32 + 4 × u8 |
  * | per page: offset, length, first row, rows, nulls, checksum | 6 × u32 |
- * | per page: encoding, statistics flags (1 min, 2 max) | 2 × u8 |
+ * | per page: encoding, flags (1 min, 2 max, 4 large-value region) | 2 × u8 |
+ * | per page: large-value region (flag 4): offset, length | 2 × u32 |
  * | per page: min, max when present | by tag (below) |
  * | sketch (flag 2): length, bytes | u32 + bytes |
  *
@@ -22,12 +23,16 @@
  * truncated, `ByteBounds` in encode.ts). Interval has none.
  *
  * The directory is a `BlobRef` with its own checksum; `parseDirectory` additionally checks that
- * pages tile the chunk's rows in order and lie inside its extent.
+ * pages tile the chunk's rows in order, lie inside its extent in byte order without overlapping
+ * (the dictionary page after them), and that each large-value region (`PageEntry.largeRegion`,
+ * plain varlen pages only) lies between the previous page and its own: the page's pointers must
+ * tile it (decode.ts `parsePage`), so no value aliases another or a page (review B2-p2b #1).
  */
 import type { PageEntry, StatValue } from "../format/manifest.js";
 import { PageEncoding } from "../format/manifest.js";
 import { NUMERIC_MAX_SCALE } from "../types.js";
 import { check, MIXED_SCALE, ValueTag } from "./format.js";
+import { LARGE_VALUE_BYTES } from "./large-value.js";
 
 const MAGIC = 0x3144_504d; // "MPD1"
 /** Every blob is at most 1 MiB (storage track ruling); a page directory is a blob. */
@@ -263,7 +268,15 @@ export function encodeDirectory(directory: ChunkDirectory): Uint8Array {
     writer.u32(page.checksum);
     writer.u8(page.encoding);
     const stats = hasStats(directory.tag);
-    writer.u8(stats ? (page.min !== null ? 1 : 0) | (page.max !== null ? 2 : 0) : 0);
+    const region = page.largeRegion;
+    writer.u8(
+      (stats ? (page.min !== null ? 1 : 0) | (page.max !== null ? 2 : 0) : 0) |
+        (region === undefined ? 0 : 4),
+    );
+    if (region !== undefined) {
+      writer.u32(region.offset);
+      writer.u32(region.length);
+    }
     if (stats && page.min !== null) writeStat(writer, directory.tag, page.min);
     if (stats && page.max !== null) writeStat(writer, directory.tag, page.max);
   }
@@ -276,6 +289,31 @@ export function encodeDirectory(directory: ChunkDirectory): Uint8Array {
       `A page directory of ${String(writer.length)} bytes exceeds the 1 MiB blob cap`,
     );
   return writer.bytes.slice(0, writer.length);
+}
+
+/** Where each parsed directory's last page (or dictionary) ends: computed once, at parse. */
+const extentEnds = new WeakMap<ChunkDirectory, number>();
+
+function endOf(directory: ChunkDirectory): number {
+  let end =
+    directory.dictionary === null ? 0 : directory.dictionary.offset + directory.dictionary.length;
+  for (const page of directory.pages) end = Math.max(end, page.offset + page.length);
+  return end;
+}
+
+/**
+ * Throws unless every page and the dictionary of `directory` lie inside a chunk of
+ * `extentLength` bytes. A directory parsed for one chunk is checked again when another chunk
+ * references it from a cache (review B2-p2a #1); O(1) after the parse. Page lengths are
+ * positive whichever chunk references it (`parseDirectory` checks that).
+ */
+export function checkDirectoryWithin(directory: ChunkDirectory, extentLength: number): void {
+  let end = extentEnds.get(directory);
+  if (end === undefined) {
+    end = endOf(directory);
+    extentEnds.set(directory, end);
+  }
+  check(end <= extentLength, "Page outside its chunk's extent");
 }
 
 /**
@@ -332,6 +370,8 @@ export function parseDirectory(bytes: Uint8Array, extentLength: number): ChunkDi
   check(pageCount <= rowCount && (rowCount === 0) === (pageCount === 0), "Bad page count");
   const pages: PageEntry[] = [];
   let next = 0;
+  // Pages (and each one's large-value region, just before it) lie in order and never overlap.
+  let end = 0;
   for (let index = 0; index < pageCount; index++) {
     const offset = reader.u32();
     const length = reader.u32();
@@ -343,7 +383,28 @@ export function parseDirectory(bytes: Uint8Array, extentLength: number): ChunkDi
     const statFlags = reader.u8();
     check(firstRow === next && rows > 0 && nullCount <= rows, "Pages do not tile the chunk's rows");
     check(validEncoding(encoding), "Bad page encoding");
-    check((statFlags & ~3) === 0 && (hasStats(tag) || statFlags === 0), "Bad statistics flags");
+    check(
+      (statFlags & ~7) === 0 && (hasStats(tag) || (statFlags & 3) === 0),
+      "Bad statistics flags",
+    );
+    let largeRegion: PageEntry["largeRegion"];
+    if ((statFlags & 4) !== 0) {
+      check(
+        tag === ValueTag.varlen && (encoding & ~PageEncoding.gzip) === PageEncoding.plain,
+        "Large values outside a plain varlen page",
+      );
+      const regionOffset = reader.u32();
+      const regionLength = reader.u32();
+      check(
+        regionLength > LARGE_VALUE_BYTES &&
+          regionOffset >= end &&
+          regionOffset + regionLength <= offset,
+        "A large-value region overlaps a page or another region",
+      );
+      largeRegion = { offset: regionOffset, length: regionLength };
+    }
+    check(offset >= end, "Pages overlap or are out of order");
+    end = offset + length;
     if (
       encoding === PageEncoding.dictionary ||
       encoding === (PageEncoding.dictionary | PageEncoding.gzip)
@@ -362,14 +423,26 @@ export function parseDirectory(bytes: Uint8Array, extentLength: number): ChunkDi
       min,
       max,
       checksum,
+      ...(largeRegion === undefined ? {} : { largeRegion }),
     });
     next += rows;
   }
   check(next === rowCount, "Pages do not cover the chunk's rows");
+  check(dictionary === null || dictionary.offset >= end, "The dictionary page overlaps a page");
   let sketch: Uint8Array | null = null;
   if ((flags & 2) !== 0) sketch = reader.raw(reader.u32());
   check(reader.at === bytes.length, "Page directory has trailing bytes");
-  return { tag, rowCount, scale, hasSpecials: (flags & 4) !== 0, pages, dictionary, sketch };
+  const directory = {
+    tag,
+    rowCount,
+    scale,
+    hasSpecials: (flags & 4) !== 0,
+    pages,
+    dictionary,
+    sketch,
+  };
+  extentEnds.set(directory, endOf(directory));
+  return directory;
 }
 
 /** The index of the page holding `row` (binary search over first rows). */
