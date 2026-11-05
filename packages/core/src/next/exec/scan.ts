@@ -15,10 +15,13 @@
  *   any page is read, and exact int64-family bounds prove the f64 `safe` representation.
  * - **Live rows.** `segment.deletions()` and `liveRows` turn each batch range into the live
  *   selection before any column is decoded.
- * - **Memory segments.** `chunk(columnId, k, out)` returns a borrowed, immutable vector (flat or
- *   dictionary) synchronously while resident; after a re-point it decodes into `out` and may
- *   return a Promise or `{ partial }`. Borrowed vectors are emitted as is (zero copy) and never
- *   written to.
+ * - **Memory segments** (exec/memory-scan.ts, ruling R16.3). A scan borrows at most one chunk
+ *   of a memory segment at a time: `chunk(columnId, k, out)` lends chunk k (one row range, all its
+ *   columns) until the scan's next `chunk()` call on that segment or the snapshot's release, and
+ *   the scan asks for chunk k + 1 only after the batch built from chunk k was released downstream.
+ *   While resident the call returns a borrowed, immutable vector synchronously (zero copy); after
+ *   the write path re-points a slow reader to the published group it decodes into `out` and may
+ *   return a Promise, which the scan's `next()` passes on.
  * - **Groups.** `root()`, then `chunk(columnId)`: null means the group predates the column, read
  *   as `ColumnDef.missing` (a constant vector). A chunk is read with
  *   `ChunkReads.open(snapshot.pages, chunk, budget)`.
@@ -44,7 +47,9 @@
  * - B2: `ChunkReader` satisfies `ChunkPages`, opened over access/space.ts `SpaceReader` (lease +
  *   peek) instead of `PageSource`, with `load` and `loadDictionary` returning `MaybePromise`
  *   (today they are `async`).
- * - B3: access/ as of rebuild/write 1562cd9.
+ * - B3: access/ as of rebuild/write 1562cd9, with ruling R16.3's borrow rule read as "one row
+ *   chunk across the declared columns": the vectors of chunk k of several columns stay valid
+ *   together until a call for another chunk index.
  */
 import type { MaybePromise } from "../access/key-index.js";
 import type { GroupSegment } from "../access/snapshot.js";

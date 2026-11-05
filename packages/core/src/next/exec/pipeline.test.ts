@@ -17,6 +17,7 @@ import {
   type Operator,
   type PushResult,
   type Transfer,
+  YIELD_INTERVAL_MS,
 } from "./pipeline.js";
 
 const INT = { kind: "int32", bits: 32 } as const;
@@ -416,5 +417,96 @@ describe("pipeline driver memory (review probe)", () => {
       expect(growth, `signal: ${String(withSignal)}`).toBeLessThan(2 * 1024 * 1024);
       expect(listeners).toBe(0);
     }
+  });
+});
+
+describe("driver: synchronous progress and task-level yields (R16.4)", () => {
+  const vector = allocateFlat(INT, 2048);
+  /** A fully cached scan: every `next()` returns a value, never a Promise. */
+  function cachedScan(batches: number): BatchSource & { pulled: number } {
+    return {
+      pulled: 0,
+      next() {
+        if (this.pulled === batches) return null;
+        this.pulled += 1;
+        return { batch: batchOf(vector, 2048) };
+      },
+      abort: () => undefined,
+    };
+  }
+  /** A synchronous aggregate: SUM over the batch, `passes` times (CPU work, no waits). */
+  function summing(passes: number): Operator & { sum: number; finished: boolean } {
+    return {
+      sum: 0,
+      finished: false,
+      push(batch) {
+        const rows = values(batch);
+        for (let pass = 0; pass < passes; pass++) for (const value of rows) this.sum += value;
+        return "ready";
+      },
+      ready: () => Promise.resolve(),
+      finish() {
+        this.finished = true;
+      },
+      abort: () => undefined,
+    };
+  }
+
+  it("runs a ready pipeline synchronously: no Promise, no await", () => {
+    const sink = summing(1);
+    expect(drive(cachedScan(3), sink, undefined, { now: () => 0 })).toBeUndefined();
+    expect(sink.finished).toBe(true);
+  });
+
+  it("services an owner message during a cached analytical scan", async () => {
+    // A fake clock: each reading advances 1 ms, so the driver yields every few batches.
+    let clock = 0;
+    const source = cachedScan(200);
+    const owner = new MessageChannel();
+    let servicedAt = -1;
+    owner.port1.onmessage = () => {
+      servicedAt = source.pulled;
+    };
+    owner.port2.postMessage("point read");
+    const run = drive(source, summing(1), undefined, { now: () => clock++ });
+    expect(run).toBeInstanceOf(Promise); // it had to yield
+    await run;
+    owner.port1.close();
+    expect(servicedAt).toBeGreaterThan(0);
+    expect(servicedAt).toBeLessThan(200); // serviced mid-scan, not after it
+  });
+
+  it("yields at least every interval of real synchronous work", async () => {
+    const source = cachedScan(400);
+    const owner = new MessageChannel();
+    const start = performance.now();
+    let waitedMs = -1;
+    owner.port1.onmessage = () => {
+      waitedMs = performance.now() - start;
+    };
+    owner.port2.postMessage("commit");
+    await drive(source, summing(20));
+    const totalMs = performance.now() - start;
+    owner.port1.close();
+    expect(waitedMs).toBeGreaterThanOrEqual(0);
+    // Serviced long before the scan ends (the scan takes several intervals).
+    expect(totalMs).toBeGreaterThan(4 * YIELD_INTERVAL_MS);
+    expect(waitedMs).toBeLessThan(totalMs / 2);
+  });
+
+  it("aborts a synchronous pipeline at the next batch boundary", () => {
+    const controller = new AbortController();
+    let aborted: unknown = null;
+    const source = cachedScan(10);
+    const sink = summing(1);
+    sink.push = (batch) => {
+      if (source.pulled === 3) controller.abort(new Error("cancel"));
+      void batch;
+      return "ready";
+    };
+    sink.abort = (reason) => (aborted = reason);
+    expect(() => drive(source, sink, controller.signal, { now: () => 0 })).toThrow("cancel");
+    expect(source.pulled).toBe(3);
+    expect(aborted).toBeInstanceOf(Error);
   });
 });

@@ -49,11 +49,12 @@
  *   the transaction's start time, as in PostgreSQL.
  *
  * ## DML
- * - The executor gets writers from `statement.table(tableId, { assigned, onRepeat })`:
- *   `onRepeat: "first"` for UPDATE … FROM and DELETE … USING, `"error"` for ON CONFLICT DO UPDATE
- *   and MERGE. Batches use access/modify.ts shapes: insert = every column in catalog order;
- *   update = locator, then the assigned columns; delete = locator. ON CONFLICT asks
- *   `TableWriter.conflicts` first and routes rows by `ConflictKind`.
+ * - The executor gets writers from `statement.table(tableId, { assigned, onRepeat })`, taking both
+ *   from the IR's `modify` node (lowering sets `onRepeat: "first"` for UPDATE … FROM and DELETE …
+ *   USING, `"error"` for ON CONFLICT DO UPDATE and MERGE). Batches use access/modify.ts shapes:
+ *   insert = every column in catalog order; update = locator, then the assigned columns;
+ *   delete = locator. ON CONFLICT asks `TableWriter.conflicts` first and routes rows by
+ *   `ConflictKind`.
  * - The executor evaluates every expression, RETURNING over exactly the rows `written` reports,
  *   and CHECK and generated columns through `TableRules` (the write path calls them).
  * - When the input is exhausted the executor calls `statement.end()` (unique and foreign-key checks,
@@ -61,6 +62,8 @@
  *   `statement.rollback()`. It never commits: the owner commits the transaction.
  *
  * ## The three completions (ruling R2)
+ * Names (ruling R16.8): **executed** is `Execution.executed`, **committed** is the owner's
+ * `acknowledgeCommit()` call, **delivered** is `Execution.delivered`.
  * 1. **`executed`** resolves with the summary when the plan has run: for a query, when its last
  *    frame has been offered; for DML, after `statement.end()`. By then every pipeline grant and
  *    spill file is closed except the result grant and the RETURNING spool, and the view is no
@@ -89,8 +92,9 @@
  * - Targets: owner-side warm PK read ≤ 10 µs; uncontended cross-tab warm PK read ≤ 0.25 ms on
  *   Chromium, ≤ 0.4 ms on Firefox, ≤ 0.6 ms on WebKit; p95 ≤ 5 ms beside a running analytical
  *   query.
- * - Long work yields to the event loop at a batch boundary after at most `YIELD_INTERVAL_MS` of
- *   synchronous work, so point reads and commits wait at most about that long behind it.
+ * - Long work yields to the event loop with a task (not a microtask) at a batch boundary after at
+ *   most `YIELD_INTERVAL_MS` of synchronous work (exec/pipeline.ts `drive`), so point reads,
+ *   commits and cancels wait at most about that long behind it, even behind a cached scan.
  *
  * ## Cancellation and errors
  * - `request.signal`, `cancel(reason)` or `results.cancel()` abort every pipeline (exec/pipeline.ts
@@ -119,8 +123,7 @@ import type { FlatVector } from "../vector/vector.js";
 import type { ResultStream } from "./result.js";
 import type { ChunkReads } from "./scan.js";
 
-/** Most synchronous work an execution does before yielding to the event loop. */
-export const YIELD_INTERVAL_MS = 4;
+export { YIELD_INTERVAL_MS } from "./pipeline.js";
 
 /**
  * A client value for one parameter slot. Accepted forms by slot type (anything else, or a value

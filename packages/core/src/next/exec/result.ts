@@ -13,12 +13,17 @@
  * - Columns keep their executor form (vector/vector.ts `VectorData`): exact int64 (`safe` f64 or
  *   BigInt64Array), decimal tiers, UTF-8 bytes, constants as one value. Types travel once, in the
  *   stream's `columns`. JS values and row objects are built by the client, on request.
- * - **Dictionaries are per stream.** A dictionary column refers to a stream dictionary by id. The
- *   first frame that needs entries of it carries them as a delta (`dictionaries`: entries
- *   appended at `from`); later frames send only the new entries they use; codes index the whole
- *   stream dictionary. The consumer keeps stream dictionaries until the stream ends. Their total
- *   bytes per stream are bounded by `STREAM_DICTIONARY_BYTES`: past it, columns are sent as plain
- *   (flat) values, so the client's dictionary memory stays bounded.
+ * - **The one wire definition** (ruling R16.5). The owner imports and re-exports these payload
+ *   types; nothing else defines result frames.
+ * - **Dictionaries are per stream, deltas are per frame.** A dictionary column names a stream
+ *   dictionary by id; its codes index that whole (cumulative) dictionary. A frame's
+ *   `dictionaries` lists the entries it adds: each delta appends `values` to dictionary `id`
+ *   starting at code `from`, which must equal that dictionary's size so far (otherwise a frame was
+ *   lost or reordered: a protocol error). The client applies a frame's deltas, in order, before
+ *   reading its columns, and keeps stream dictionaries until the stream ends. A frame whose codes
+ *   use only entries sent earlier carries no delta. Dictionary bytes per stream are bounded by
+ *   `STREAM_DICTIONARY_BYTES`: past it, columns go out plain (flat varlen), so the client's
+ *   dictionary memory stays bounded.
  * - Size: the result sink seals a frame at about `RESULT_FRAME_TARGET_BYTES`, or earlier when the
  *   consumer is waiting with nothing queued (`demand`), so a point read or the first page of
  *   `SELECT *` leaves at once while a fast producer still sends large frames. One row larger than
@@ -41,10 +46,16 @@
  * every sequence reservation used so far). Under strict durability the owner posts the frame only
  * after `writePath.durable(requiresLsn)`, which is null, so no await, when it is already durable.
  *
- * ## RETURNING spool (ruling R2)
- * For DML with RETURNING the sink writes rows into the result spool (charged to the result grant,
- * spilled through the spill service under pressure) instead of offering frames, and replays it
- * into frames only after `Execution.acknowledgeCommit()`. A cancel or a failed commit discards it.
+ * ## Completions and the RETURNING spool (rulings R2, R11, R16.8)
+ * An execution has three completions: **executed** (`Execution.executed`: the plan ran; for DML
+ * the statement ended), **committed** (the owner's `Execution.acknowledgeCommit()` after the
+ * commit is acknowledged), **delivered** (`delivered`: every frame released, the result grant
+ * closed). For DML with RETURNING the sink writes rows into the result spool (charged to the
+ * result grant, spilled through the spill service under pressure) instead of offering frames:
+ * - autocommit (`returning: "atCommit"`): the spool becomes frames only after committed;
+ * - inside an explicit transaction (`returning: "atExecuted"`): the spool becomes frames as soon
+ *   as executed, before COMMIT, as PostgreSQL returns them.
+ * A cancel, a rollback or a failed commit discards the spool.
  *
  * ## Pulling, end, errors, cancellation
  * - `next()` returns frames in order, then `null` after the last; `poll()` is its synchronous

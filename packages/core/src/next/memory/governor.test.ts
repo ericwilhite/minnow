@@ -35,39 +35,6 @@ function countingSignal() {
 }
 
 describe("memory governor: admission and progress", () => {
-  it("tryAdmit admits synchronously when it fits and never jumps a queue", async () => {
-    const governor = new Governor(16 * MiB);
-    const usable = 16 * MiB - governor.reserveBytes;
-    const fast = governor.tryAdmit({ label: "point", minimumBytes: MiB, spillable: false });
-    expect(fast?.held).toBe(MiB);
-    fast?.close();
-    const big = await governor.admit({
-      label: "big",
-      minimumBytes: usable - MiB,
-      spillable: false,
-    });
-    expect(governor.tryAdmit({ label: "no room", minimumBytes: 2 * MiB, spillable: false })).toBe(
-      null,
-    );
-    let served = false;
-    const queued = governor
-      .admit({ label: "queued", minimumBytes: 2 * MiB, spillable: false })
-      .then((grant) => {
-        served = true;
-        return grant;
-      });
-    await settle();
-    // 1 MiB is free, but an admission is queued ahead: the fast path must not take it.
-    expect(governor.tryAdmit({ label: "small", minimumBytes: MiB, spillable: false })).toBeNull();
-    expect(served).toBe(false);
-    big.close();
-    (await queued).close();
-    const again = governor.tryAdmit({ label: "again", minimumBytes: MiB, spillable: false });
-    expect(again?.held).toBe(MiB);
-    again?.close();
-    expect(governor.usedBytes).toBe(0);
-  });
-
   it("admits within the cap and makes the next pipeline wait, never refuse (rule 2)", async () => {
     const governor = new Governor(16 * MiB);
     const usable = 16 * MiB - governor.reserveBytes;

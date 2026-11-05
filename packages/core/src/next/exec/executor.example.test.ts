@@ -295,6 +295,8 @@ function insertPlan(values: number[], returning: boolean): PhysicalPlan {
       tableId: TABLE,
       input,
       output: returning ? OUT : [],
+      assigned: [],
+      onRepeat: "error",
       onConflict: null,
       returning: returning ? [{ op: "column", index: 0, type: INT }] : null,
     },

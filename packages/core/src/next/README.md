@@ -25,7 +25,7 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | `format/`          | format, write path               | Log frames and multipart transactions, header slots, in-memory and incremental recovery scans, replay rules, request ledger, manifest types                                                              |
 | `spill/`           | executor (OPFS service: storage) | Spill contract (one long-lived file); in-memory double                                                                                                                                                   |
 | `memory/`          | executor                         | Memory governor: admission, progress loans, held vs allocated bytes (reference implementation)                                                                                                           |
-| `exec/`            | executor                         | Entry point (`executor.ts`), result frames (`result.ts`), scans (`scan.ts`), table rules (`rules.ts`), push protocol (`pipeline.ts`), fetcher (`fetch.ts`), comparators, decimal SUM                     |
+| `exec/`            | executor                         | Entry point (`executor.ts`), result frames (`result.ts`), scans (`scan.ts`, `memory-scan.ts`), table rules (`rules.ts`), push driver (`pipeline.ts`), fetcher (`fetch.ts`), comparators, decimal SUM     |
 | `ir/`              | lowering, executor               | Operator IR (`ir.ts`); the front-end boundary (`lowering.ts`)                                                                                                                                            |
 | `access/`          | write path + key index           | Storage access contracts the write path implements: snapshots and segments, catalog, key-index probes and ranges, `modify` (rows, conflicts, RETURNING), transactions, group commit, sequences, delivery |
 | `testing/`         | all                              | Differential-harness adapter for a partial new core                                                                                                                                                      |
@@ -254,14 +254,18 @@ and the owner import it directly.
 - Kernels are synchronous.
 - `push` returns `ready` or `blocked`, and a blocked batch stays borrowed until `ready()`.
   Operators resume partly consumed batches themselves.
-- `finish` is async.
+- `next()` and `finish()` return a value when nothing waits and a Promise only when they must
+  wait; the driver awaits only real Promises, and `drive` returns no Promise when the whole
+  pipeline finished synchronously.
+- After `YIELD_INTERVAL_MS` (4 ms) of synchronous work the driver yields a task (`setImmediate`
+  or a `MessageChannel` message, never a resolved Promise) at the next batch boundary.
 - `abort` releases grants, spill files and transferred batches.
 - The driver adds no cancellation machinery without a signal, and with one each wait removes its
   listener, so a long stream retains nothing per batch.
 - Each edge holds at most one in-flight batch, plus whatever credits the producer has handed out
   as transfers.
 
-### Executor entry point (`exec/executor.ts`, `result.ts`, `scan.ts`, `rules.ts`)
+### Executor entry point (`exec/executor.ts`, `result.ts`, `scan.ts`, `memory-scan.ts`, `rules.ts`)
 
 - `executor.prepare(plan)` compiles a plan once; `bind(values)` fills its placeholders;
   `execute(request)` runs it over the access contracts: a read snapshot for a query, or an open
@@ -275,9 +279,14 @@ and the owner import it directly.
 - Results are wire-ready frames: a plain-data payload plus a transfer list, about 1 MiB each,
   with per-stream dictionary deltas up to 1 MiB per stream. A frame stays charged until the
   client's credit returns, so a slow client pauses the pipeline. There is no row-count cap.
-- A point read whose index blocks and pages are cached runs inside `execute` with no await, and
-  its frame is taken with `results.poll()`. Long work yields every 4 ms.
-- Scans read access/ segments and the page track's chunk readers (`scan.ts`). CHECK and
+- The pipeline driver progresses synchronously whenever sources and sinks are ready and awaits
+  only real Promises, so a point read whose index blocks and pages are cached runs inside
+  `execute` and its frame is taken with `results.poll()`. Long work yields a task (not a
+  microtask) every 4 ms, so owner messages are serviced even during a cached scan.
+- The frame payload in `result.ts` is the one wire definition (the owner re-exports it); its
+  dictionary deltas are per frame, over per-stream dictionaries.
+- Scans read access/ segments and the page track's chunk readers (`scan.ts`); a memory-segment
+  scan (`memory-scan.ts`) borrows one chunk at a time and passes on async re-pointed chunks. CHECK and
   generated columns are compiled by `compileTableRules` into the write path's `TableRules`.
 
 ### IR (`ir/`)
