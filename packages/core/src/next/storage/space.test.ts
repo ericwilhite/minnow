@@ -19,6 +19,7 @@ import {
 import { MemoryBackend } from "./memory-store.js";
 import { ENTRY_OVERHEAD, FIXED_CACHE_BYTES } from "./page-cache.js";
 import { openExtentSpace } from "./space.js";
+import { xxHash32 } from "../hash/xxhash32.js";
 import {
   at,
   bytesOf,
@@ -455,5 +456,152 @@ describe("extent space: test support", () => {
     });
     expect(space.root).toBeNull();
     expect(space.generation).toBe(0);
+  });
+});
+
+/** Each probe of review B1-p2a (161efd9), kept as a test. */
+describe("review B1-p2a findings", () => {
+  const options = () => ({
+    reachable: jsonReachable,
+    budget: countingBudget(Infinity),
+    registerCache: () => countingMemory(Infinity),
+  });
+
+  it("1: refuses roots that name one offset with two lengths, before truncating anything", async () => {
+    const backend = new MemoryBackend();
+    const session = await backend.open(await backend.acquire());
+    await session.writeData(0, bytesOf(8192, 1));
+    await session.publish(rootOf([], [{ offset: 0, length: 8192 }]));
+    await session.publish(rootOf([], [{ offset: 0, length: 4096 }]));
+    await expect(openExtentSpace(session, options())).rejects.toThrow(/different extents at 0/u);
+    // The previous root's data is untouched.
+    expect(await session.dataLength()).toBe(8192);
+    const [bytes] = await session.readData([{ offset: 0, length: 8192 }]);
+    expect(bytes).toEqual(bytesOf(8192, 1));
+  });
+
+  it("2: reads distinct blobs at one address by full identity, zero-length ones included", async () => {
+    const { space, budget } = await openOver(new MemoryBackend());
+    const writer = space.beginWrite("zero");
+    const written = await writer.write([new Uint8Array(0), new Uint8Array([42])]);
+    const both = await space.read(written.blobs, { budget });
+    expect(both.bytes.map((bytes) => [...bytes])).toEqual([[], [42]]);
+    both.release();
+    const bad = { ...at(written.blobs, 1), checksum: 123 };
+    await expect(space.read([at(written.blobs, 1), bad], { budget })).rejects.toThrow(
+      /failed its checksum/u,
+    );
+    const wrongEmpty = { ...at(written.blobs, 0), checksum: 7 };
+    await expect(space.read([wrongEmpty], { budget })).rejects.toThrow(StoreCorruptionError);
+    // A prefix blob at the same address as a longer one: both are verified and returned.
+    const pair = await writer.write([new Uint8Array([1, 2])]);
+    const whole = at(pair.blobs, 0);
+    const prefix = { ...whole, length: 1, checksum: xxHash32(new Uint8Array([1])) };
+    const mixed = await space.read([whole, prefix], { budget });
+    expect(mixed.bytes.map((bytes) => [...bytes])).toEqual([[1, 2], [1]]);
+    mixed.release();
+    expect(budget.used).toBe(0);
+    const fractional = { ...whole, offset: 0.5 };
+    await expect(space.read([fractional], { budget })).rejects.toThrow(StoreCorruptionError);
+  });
+
+  it("3: an abort racing a seal frees each range once (plain, empty and relocating seals)", async () => {
+    for (const kind of ["plain", "empty", "relocating"] as const) {
+      const { space } = await openOver(new MemoryBackend());
+      const writer = space.beginWrite(kind);
+      const builder = writer.open(DATA_ALIGN);
+      if (kind !== "empty") await builder.append([bytesOf(4000, 2)]);
+      if (kind === "relocating") {
+        await writer.write([bytesOf(10, 3)]); // blocks in-place growth
+        expect(builder.extend(DATA_ALIGN)).toBe(false);
+        await builder.append([bytesOf(500, 4)]);
+      }
+      const results = await Promise.allSettled([builder.seal(), writer.abort()]);
+      expect(results[1].status, kind).toBe("fulfilled");
+      if (results[0].status === "rejected")
+        expect(String(results[0].reason), kind).toMatch(/aborted during the seal/u);
+      await (space as unknown as { settled(): Promise<void> }).settled();
+      expect(space.failed, kind).toBeNull();
+      expect(space.stats.writerBytes, kind).toBe(0);
+      expect(space.stats.dataBytes, kind).toBe(0);
+      await space.audit();
+    }
+  });
+
+  it("3: a relocation that fails leaves its ranges to the writer's abort", async () => {
+    let failWrites = false;
+    const { space } = await openOver(new MemoryBackend(), {
+      wrap: (session) =>
+        new Proxy(session, {
+          get(target, key, receiver) {
+            if (key === "writeData" && failWrites)
+              return () => Promise.reject(new Error("device gone"));
+            const value: unknown = Reflect.get(target, key, receiver);
+            return typeof value === "function" ? (value as () => unknown).bind(target) : value;
+          },
+        }),
+    });
+    const writer = space.beginWrite("t");
+    const builder = writer.open(DATA_ALIGN);
+    await builder.append([bytesOf(4000, 1)]);
+    await writer.write([bytesOf(10, 2)]);
+    expect(builder.extend(DATA_ALIGN)).toBe(false);
+    await builder.append([bytesOf(500, 3)]);
+    failWrites = true;
+    await expect(builder.seal()).rejects.toThrow("device gone");
+    failWrites = false;
+    await writer.abort();
+    await (space as unknown as { settled(): Promise<void> }).settled();
+    expect(space.stats.dataBytes).toBe(0);
+    await space.audit();
+  });
+
+  it("4: refuses an extent whose exact end passes the data length, or with unsafe coordinates", async () => {
+    for (const extent of [
+      { offset: 0, length: 4000 },
+      { offset: 0, length: 0.5 },
+      { offset: 4096.25, length: 1 },
+      { offset: -4096, length: 1 },
+      { offset: 0, length: Number.MAX_SAFE_INTEGER + 1 },
+    ]) {
+      const backend = new MemoryBackend();
+      const session = await backend.open(await backend.acquire());
+      await session.writeData(0, new Uint8Array([1]));
+      await session.publish(rootOf([], [extent]));
+      await expect(openExtentSpace(session, options()), JSON.stringify(extent)).rejects.toThrow(
+        StoreCorruptionError,
+      );
+      expect(await session.dataLength()).toBe(1);
+    }
+  });
+
+  it("5: unpublished space being released is not garbage debt", async () => {
+    let unblock!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((resolve) => (unblock = resolve));
+    const started = new Promise<void>((resolve) => (entered = resolve));
+    const { space } = await openOver(new MemoryBackend(), {
+      wrap: (session) =>
+        new Proxy(session, {
+          get(target, key) {
+            if (key === "releaseData")
+              return async (ranges: Parameters<StoreSession["releaseData"]>[0]) => {
+                entered();
+                await gate;
+                return session.releaseData(ranges);
+              };
+            const value: unknown = Reflect.get(target, key);
+            return typeof value === "function" ? (value as () => unknown).bind(target) : value;
+          },
+        }),
+    });
+    const writer = space.beginWrite("stats");
+    await writer.write([bytesOf(4096, 1)]);
+    const pending = writer.abort();
+    await started;
+    expect(space.stats.waitingBytes).toBe(0);
+    expect(space.stats.releasingBytes).toBe(4096);
+    unblock();
+    await pending;
   });
 });

@@ -98,6 +98,36 @@ export interface CacheStats {
 
 const charge = (entry: Entry) => entry.length + ENTRY_OVERHEAD;
 
+const EMPTY = new Uint8Array(0);
+/** xxHash32 (seed 0) of no bytes: the only valid checksum of a zero-length blob. */
+const EMPTY_CHECKSUM = xxHash32(EMPTY);
+
+/** A blob's full identity: its extent, its place in it, its length and its checksum. */
+const identity = (ref: BlobRef): string =>
+  `${String(ref.extent.offset)}/${String(ref.extent.length)}/${String(ref.offset)}/${String(ref.length)}/${String(ref.checksum)}`;
+
+/** Refuses a ref whose stored coordinates cannot be right, before any I/O. */
+function checkRef(ref: BlobRef): void {
+  const { extent, offset, length, checksum } = ref;
+  if (length > MAX_BLOB_BYTES)
+    throw new RangeError(`A blob of ${String(length)} bytes exceeds MAX_BLOB_BYTES`);
+  const integral = [extent.offset, extent.length, offset, length].every(
+    (value) => Number.isSafeInteger(value) && value >= 0,
+  );
+  if (
+    !integral ||
+    !(Number.isInteger(checksum) && checksum >= 0 && checksum <= 0xffffffff) ||
+    offset + length > extent.length
+  )
+    throw new StoreCorruptionError(
+      `Blob ${String(offset)}+${String(length)} does not lie inside its extent at ${String(extent.offset)} (${String(extent.length)} bytes)`,
+    );
+  if (length === 0 && checksum !== EMPTY_CHECKSUM)
+    throw new StoreCorruptionError(
+      `A zero-length blob at ${String(extent.offset + offset)} has a checksum that is not of no bytes`,
+    );
+}
+
 export class PageCache implements EvictableCacheLike {
   readonly #session: StoreSession;
   readonly #byAddress = new Map<number, Entry>();
@@ -167,23 +197,23 @@ export class PageCache implements EvictableCacheLike {
     return entry.bytes;
   }
 
+  /**
+   * Requests are deduplicated by full identity (extent, offset, length, checksum), never by
+   * address alone (review B1-p2a finding 2): two different refs at one address are each resolved
+   * and verified. A zero-length blob needs no I/O and no charge, but its checksum must still be
+   * that of no bytes.
+   */
   async read(refs: readonly BlobRef[], options: ReadOptions): Promise<ReadLease> {
     this.#live();
     const { budget, signal } = options;
     signal?.throwIfAborted();
-    // Distinct blobs by address; each ref is checked against its extent first.
-    const distinct = new Map<number, BlobRef>();
+    const distinct = new Map<string, BlobRef>();
     let total = 0;
     for (const ref of refs) {
-      if (ref.length > MAX_BLOB_BYTES)
-        throw new RangeError(`A blob of ${String(ref.length)} bytes exceeds MAX_BLOB_BYTES`);
-      if (ref.offset < 0 || ref.length < 0 || ref.offset + ref.length > ref.extent.length)
-        throw new StoreCorruptionError(
-          `Blob at ${String(ref.offset)}+${String(ref.length)} lies outside its extent at ${String(ref.extent.offset)}`,
-        );
-      const address = ref.extent.offset + ref.offset;
-      if (distinct.has(address)) continue;
-      distinct.set(address, ref);
+      checkRef(ref);
+      const key = identity(ref);
+      if (distinct.has(key)) continue;
+      distinct.set(key, ref);
       total += ref.length;
     }
     if (total > MAX_READ_BYTES)
@@ -191,13 +221,18 @@ export class PageCache implements EvictableCacheLike {
     // Charge the reader first: the governor may evict cache entries to make room.
     if (!budget.allocate(total)) throw new ReadDeniedError(total);
     const held: Entry[] = [];
+    const resolved = new Map<string, Uint8Array>();
     try {
-      const misses: BlobRef[] = [];
+      const misses: Array<{ readonly key: string; readonly ref: BlobRef }> = [];
       let uncharge = 0;
-      for (const ref of distinct.values()) {
+      for (const [key, ref] of distinct) {
+        if (ref.length === 0) {
+          resolved.set(key, EMPTY);
+          continue;
+        }
         const entry = this.#find(ref);
         if (entry === null) {
-          misses.push(ref);
+          misses.push({ key, ref });
           continue;
         }
         this.#hits += 1;
@@ -210,20 +245,21 @@ export class PageCache implements EvictableCacheLike {
         }
         entry.pins += 1;
         held.push(entry);
+        resolved.set(key, entry.bytes);
       }
       // Hits are pinned before the cache's charge goes back: a nested eviction cannot take them.
       if (uncharge > 0) this.#memory?.release(uncharge);
-      if (misses.length > 0) await this.#readMisses(misses, held, signal);
+      if (misses.length > 0) await this.#readMisses(misses, held, resolved, signal);
     } catch (error) {
       this.#unpinAll(held);
       budget.free(total);
       throw error;
     }
-    const byAddress = new Map<number, Uint8Array>();
-    for (const entry of held) byAddress.set(entry.address, entry.bytes);
-    const bytes = refs.map(
-      (ref) => byAddress.get(ref.extent.offset + ref.offset) ?? new Uint8Array(0),
-    );
+    const bytes = refs.map((ref) => {
+      const found = resolved.get(identity(ref));
+      if (found === undefined) throw new Error("A requested blob was not resolved");
+      return found;
+    });
     let released = false;
     return {
       bytes,
@@ -237,11 +273,12 @@ export class PageCache implements EvictableCacheLike {
   }
 
   async #readMisses(
-    misses: readonly BlobRef[],
+    misses: ReadonlyArray<{ readonly key: string; readonly ref: BlobRef }>,
     held: Entry[],
+    resolved: Map<string, Uint8Array>,
     signal: AbortSignal | undefined,
   ): Promise<void> {
-    const ranges = misses.map((ref) => ({
+    const ranges = misses.map(({ ref }) => ({
       offset: ref.extent.offset + ref.offset,
       length: ref.length,
     }));
@@ -261,8 +298,9 @@ export class PageCache implements EvictableCacheLike {
         this.#platformReads += 1;
         this.#bytesRead += slab.length;
         for (const member of slab.members) {
-          const ref = misses[member];
-          if (ref === undefined) continue;
+          const miss = misses[member];
+          if (miss === undefined) continue;
+          const { key, ref } = miss;
           const address = ref.extent.offset + ref.offset;
           const start = address - slab.offset;
           const bytes = target.slice(start, start + ref.length);
@@ -271,7 +309,9 @@ export class PageCache implements EvictableCacheLike {
               `The blob at ${String(address)} (extent ${String(ref.extent.offset)}, ${String(ref.length)} bytes) failed its checksum`,
             );
           this.#misses += 1;
-          held.push(this.#insertPinned(ref, address, bytes));
+          const entry = this.#insertPinned(ref, address, bytes);
+          held.push(entry);
+          resolved.set(key, entry.bytes);
         }
       }
     } finally {
@@ -292,8 +332,11 @@ export class PageCache implements EvictableCacheLike {
       existing.pins += 1;
       return existing;
     }
-    const stale = this.#byAddress.get(address);
-    if (stale !== undefined) this.#drop(stale);
+    // Another blob at this address (a different length or checksum) keeps its place while a
+    // lease pins it: this one is then private to its lease, never cached. Unpinned, it yields.
+    const other = this.#byAddress.get(address);
+    if (other !== undefined && other.pins > 0) return this.#privateEntry(ref, address, bytes);
+    if (other !== undefined) this.#drop(other);
     const entry: Entry = {
       address,
       extent: ref.extent.offset,
@@ -316,6 +359,23 @@ export class PageCache implements EvictableCacheLike {
     set.add(entry);
     this.#pinnedBytes += entry.length;
     return entry;
+  }
+
+  #privateEntry(ref: BlobRef, address: number, bytes: Uint8Array): Entry {
+    this.#pinnedBytes += ref.length;
+    return {
+      address,
+      extent: ref.extent.offset,
+      length: ref.length,
+      checksum: ref.checksum,
+      bytes,
+      pins: 1,
+      segment: "pinned",
+      dropped: true,
+      hot: false,
+      prev: null,
+      next: null,
+    };
   }
 
   #unpinAll(held: readonly Entry[]): void {

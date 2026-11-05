@@ -50,7 +50,7 @@ import {
 import { FreeSpaceMap } from "./free-space.js";
 import { PageCache } from "./page-cache.js";
 import { ReclaimLedger, type RootPin } from "./reclaim.js";
-import { ExtentReservation } from "./reservation.js";
+import { ExtentReservation, type SealPlan } from "./reservation.js";
 import { MAX_SLAB } from "./slabs.js";
 
 const alignDown = (value: number) => value - (value % DATA_ALIGN);
@@ -74,29 +74,65 @@ class Mutex {
   }
 }
 
-/** Every extent `root` reaches, by offset, with its aligned size. */
+/**
+ * Every extent `root` reaches, by offset, with its exact length. Each is checked as stored
+ * coordinates before anything uses it: safe integers, an aligned offset, a positive length, and an
+ * exact end within `dataLength` (not its aligned end: a short file is corruption, review B1-p2a
+ * finding 4). One offset with two lengths is corruption.
+ */
 async function collect(
   root: Uint8Array | null,
   reachable: ReachableExtents,
   space: { read: ExtentSpace["read"]; peek: ExtentSpace["peek"] },
   budget: ByteBudget,
-  sizeOf: (bytes: number) => number,
+  dataLength: number,
 ): Promise<Map<number, number>> {
   const extents = new Map<number, number>();
   if (root === null) return extents;
   for await (const item of reachable(root, space, budget)) {
-    const extent = "extent" in item ? item.extent : item;
-    if (!(extent.offset >= 0 && extent.offset % DATA_ALIGN === 0 && extent.length > 0))
+    const { offset, length } = "extent" in item ? item.extent : item;
+    if (!(
+      Number.isSafeInteger(offset) &&
+      Number.isSafeInteger(length) &&
+      offset >= 0 &&
+      offset % DATA_ALIGN === 0 &&
+      length > 0 &&
+      offset + length <= dataLength
+    ))
       throw new StoreCorruptionError(
-        `A root names an invalid extent at ${String(extent.offset)} (${String(extent.length)} bytes)`,
+        `A root names an invalid extent at ${String(offset)} (${String(length)} bytes; data space ${String(dataLength)} bytes)`,
       );
-    const size = sizeOf(extent.length);
-    const known = extents.get(extent.offset);
-    if (known !== undefined && known !== size)
-      throw new StoreCorruptionError(`Two extents at ${String(extent.offset)} differ in size`);
-    extents.set(extent.offset, size);
+    const known = extents.get(offset);
+    if (known !== undefined && known !== length)
+      throw new StoreCorruptionError(`Two extents at ${String(offset)} differ in length`);
+    extents.set(offset, length);
   }
   return extents;
+}
+
+/**
+ * The extents of both kept roots, validated as one set before anything is freed or truncated
+ * (review B1-p2a finding 1): an offset both roots name must be the same extent in both. Returns
+ * the union and the extents only the previous root reaches.
+ */
+function unite(
+  current: ReadonlyMap<number, number>,
+  previous: ReadonlyMap<number, number>,
+): { union: DataRange[]; previousOnly: DataRange[] } {
+  const union: DataRange[] = [];
+  const previousOnly: DataRange[] = [];
+  for (const [offset, length] of current) union.push({ offset, length });
+  for (const [offset, length] of previous) {
+    const known = current.get(offset);
+    if (known === undefined) {
+      union.push({ offset, length });
+      previousOnly.push({ offset, length });
+    } else if (known !== length)
+      throw new StoreCorruptionError(
+        `The current and previous roots name different extents at ${String(offset)} (${String(known)} and ${String(length)} bytes)`,
+      );
+  }
+  return { union, previousOnly };
 }
 
 export const openExtentSpace: OpenExtentSpace = async (session, options) => {
@@ -107,29 +143,34 @@ export const openExtentSpace: OpenExtentSpace = async (session, options) => {
   const cache = new PageCache(session);
   cache.attach(options.registerCache(cache));
   try {
-    const sizeOf = (bytes: number) => Math.ceil(bytes / DATA_ALIGN) * DATA_ALIGN;
     const reader = {
       read: (refs: readonly BlobRef[], read: ReadOptions) => cache.read(refs, read),
       peek: (ref: BlobRef) => cache.peek(ref),
     };
-    const current = await collect(root, options.reachable, reader, options.budget, sizeOf);
+    const current = await collect(root, options.reachable, reader, options.budget, dataLength);
     options.signal?.throwIfAborted();
-    const previous = await collect(previousRoot, options.reachable, reader, options.budget, sizeOf);
-    const previousOnly: DataRange[] = [];
-    for (const [offset, length] of previous)
-      if (!current.has(offset)) previousOnly.push({ offset, length });
+    const previous = await collect(
+      previousRoot,
+      options.reachable,
+      reader,
+      options.budget,
+      dataLength,
+    );
+    const { union, previousOnly } = unite(current, previous);
     let map: FreeSpaceMap;
     try {
-      map = FreeSpaceMap.fromAllocated(DATA_ALIGN, dataLength, [
-        ...[...current].map(([offset, length]) => ({ offset, length })),
-        ...previousOnly,
-      ]);
+      map = FreeSpaceMap.fromAllocated(DATA_ALIGN, dataLength, union);
     } catch (error) {
       throw new StoreCorruptionError(
         `The durable roots name inconsistent extents: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
-    return new Space(session, options, cache, map, root, previousRoot, previousOnly, dataLength);
+    // Only now, with both roots validated together, may anything be retired or truncated.
+    const retired = previousOnly.map(({ offset, length }) => ({
+      offset,
+      length: map.sizeOf(length),
+    }));
+    return new Space(session, options, cache, map, root, previousRoot, retired, dataLength);
   } catch (error) {
     cache.close();
     throw error;
@@ -158,6 +199,8 @@ class Space implements ExtentSpace {
   #failed: Error | null = null;
   #closed = false;
   #releasingBytes = 0;
+  /** The retired part of `#releasingBytes` (so waiting debt excludes it, review finding 5). */
+  #releasingRetired = 0;
   #relocations = 0;
   /** Bytes the data space holds as far as this space knows (written or kept since open). */
   #fileLength: number;
@@ -213,11 +256,12 @@ class Space implements ExtentSpace {
     for (const writer of this.writers) writerBytes += writer.bytes;
     let retired = 0;
     for (const size of this.#retired.values()) retired += size;
+    retired -= this.#releasingRetired;
     return {
       dataBytes: this.#map.end,
       freeBytes: this.#map.freeBytes,
       writerBytes,
-      waitingBytes: retired - this.#releasingBytes,
+      waitingBytes: retired,
       releasingBytes: this.#releasingBytes,
       relocations: this.#relocations,
       pinCount: this.#ledger.pinCount,
@@ -342,20 +386,25 @@ class Space implements ExtentSpace {
   async free(ranges: readonly DataRange[]): Promise<void> {
     if (ranges.length === 0) return;
     let bytes = 0;
+    let retired = 0;
     for (const range of ranges) {
       this.#cache.dropExtent(range.offset);
       bytes += range.length;
+      if (this.#retired.has(range.offset)) retired += range.length;
     }
     this.#releasingBytes += bytes;
+    this.#releasingRetired += retired;
     try {
       await this.#session.releaseData(ranges);
     } catch (error) {
       // The space stays allocated (a leak until reopen), never handed out twice.
       this.fail(error);
       this.#releasingBytes -= bytes;
+      this.#releasingRetired -= retired;
       return;
     }
     this.#releasingBytes -= bytes;
+    this.#releasingRetired -= retired;
     for (const range of ranges) {
       this.#map.free(range.offset, range.length);
       this.#retired.delete(range.offset);
@@ -475,8 +524,19 @@ class Space implements ExtentSpace {
       throw new Error(`Extent audit: ${message}`);
     };
     const sizeOf = (bytes: number) => this.#map.sizeOf(bytes);
-    const current = await collect(this.#root, this.#reachable, this, this.#budget, sizeOf);
-    const previous = await collect(this.#previousRoot, this.#reachable, this, this.#budget, sizeOf);
+    const exactCurrent = await collect(this.#root, this.#reachable, this, this.#budget, Infinity);
+    const exactPrevious = await collect(
+      this.#previousRoot,
+      this.#reachable,
+      this,
+      this.#budget,
+      Infinity,
+    );
+    unite(exactCurrent, exactPrevious);
+    const aligned = (extents: ReadonlyMap<number, number>) =>
+      new Map([...extents].map(([offset, length]) => [offset, sizeOf(length)]));
+    const current = aligned(exactCurrent);
+    const previous = aligned(exactPrevious);
     const accounted: DataRange[] = [];
     for (const [offset, length] of current) {
       if (!this.#map.isAllocated(offset, length))
@@ -531,9 +591,9 @@ class Writer implements ExtentWriter {
   state: WriterState = "open";
   readonly builders = new Set<Builder>();
   readonly #extents: ExtentRef[] = [];
-  /** Calls in flight (appends, seals): abort waits for them. */
+  /** Calls in flight (appends, whole seals): abort waits for them. */
   busy = 0;
-  #idle: (() => void) | null = null;
+  readonly #idle: Array<() => void> = [];
 
   constructor(space: Space, label: string) {
     this.space = space;
@@ -562,7 +622,7 @@ class Writer implements ExtentWriter {
       return await work();
     } finally {
       this.busy -= 1;
-      if (this.busy === 0) this.#idle?.();
+      if (this.busy === 0) for (const resolve of this.#idle.splice(0)) resolve();
     }
   }
 
@@ -606,9 +666,11 @@ class Writer implements ExtentWriter {
     if (this.state === "aborted") return;
     if (this.state !== "open") throw new TypeError(`Writer ${this.label} is ${this.state}`);
     this.state = "aborted";
-    if (this.busy > 0)
+    // Every call in flight finishes first, so each range has exactly one owner when abort takes
+    // what is left (review B1-p2a finding 3).
+    while (this.busy > 0)
       await new Promise<void>((resolve) => {
-        this.#idle = resolve;
+        this.#idle.push(resolve);
       });
     const ranges: DataRange[] = [];
     await this.space.writeLock.run(async () => {
@@ -703,23 +765,32 @@ class Builder implements ExtentBuilder {
     return blobs;
   }
 
+  /**
+   * The whole seal is one tracked call (abort waits for it), and ownership moves in single
+   * synchronous steps: the reservation is the builder's until the plan is made; then the plan's
+   * ranges (`#leftover`) until the bytes are in place; then the extent is the writer's and the
+   * trimmed or vacated ranges are this call's to free. A failed relocation leaves `#leftover` to
+   * the writer's abort.
+   */
   async seal(): Promise<WrittenExtent | null> {
     this.#usable();
     if (this.#appending) throw new TypeError("seal during an append");
     this.#state = "sealed";
     const space = this.writer.space;
-    if (this.#length === 0) {
-      const ranges = await space.writeLock.run(async () => {
-        if (space.staged?.builder === this) space.staged = null;
-        return this.reservation.abort();
-      });
-      this.writer.sealed(this, null);
-      await space.free(ranges);
-      return null;
-    }
-    const plan = await this.writer
-      .track(() =>
-        space.writeLock.run(async () => {
+    return this.writer.track(async () => {
+      if (this.#length === 0) {
+        const ranges = await space.writeLock.run(async () => {
+          if (space.staged?.builder === this) space.staged = null;
+          const reserved = this.reservation.abort();
+          this.writer.sealed(this, null);
+          return reserved;
+        });
+        await space.free(ranges);
+        return null;
+      }
+      let plan: SealPlan;
+      try {
+        plan = await space.writeLock.run(async () => {
           if (space.staged?.builder === this) await space.flushStaged(false);
           if (this.failure !== null) throw this.failure;
           const sealed = this.reservation.seal(this.#length);
@@ -738,21 +809,20 @@ class Builder implements ExtentBuilder {
               }
             space.relocated();
           }
+          this.#leftover = null;
+          this.tail = null;
+          this.writer.sealed(this, sealed.extent);
           return sealed;
-        }),
-      )
-      .catch((error: unknown) => {
+        });
+      } catch (error) {
         this.failure ??= error instanceof Error ? error : new Error(String(error));
         throw error;
-      });
-    const extent: ExtentRef = plan.extent;
-    this.#leftover = null;
-    this.tail = null;
-    this.writer.sealed(this, extent);
-    await space.free(plan.release);
-    return {
-      extent,
-      blobs: this.#pending.map((blob) => ({ extent, ...blob })),
-    };
+      }
+      await space.free(plan.release);
+      if (this.writer.state === "aborted")
+        throw new TypeError(`Writer ${this.writer.label} was aborted during the seal`);
+      const extent: ExtentRef = plan.extent;
+      return { extent, blobs: this.#pending.map((blob) => ({ extent, ...blob })) };
+    });
   }
 }

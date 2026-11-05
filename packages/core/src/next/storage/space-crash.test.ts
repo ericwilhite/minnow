@@ -30,18 +30,23 @@ async function workload(
   rounds: number,
   first = 1,
   retireFirst: ExtentRef[] = [],
+  forceRelocation = false,
 ): Promise<void> {
   let previous = retireFirst;
   for (let round = first; round < first + rounds; round++) {
     const writer = space.beginWrite(`round ${String(round)}`);
     const chunk = writer.open(DATA_ALIGN);
+    // The reviewer's variant: a small extent right after the chunk blocks in-place growth.
+    const early = forceRelocation
+      ? await writer.write([bytesOf(300 + round, round * 10 + 9)])
+      : null;
     for (let page = 0; page < 3; page++) {
       const part = bytesOf(1500 + round * 97 + page * 11, round * 10 + page);
       if (chunk.length + part.length > chunk.capacity) chunk.extend(part.length);
       await chunk.append([part]);
     }
     const sealed = await chunk.seal();
-    const small = await writer.write([bytesOf(300 + round, round * 10 + 9)]);
+    const small = early ?? (await writer.write([bytesOf(300 + round, round * 10 + 9)]));
     if (sealed === null) throw new Error("sealed empty");
     const blobs = [...sealed.blobs, ...small.blobs];
     const root = rootOf(blobs);
@@ -60,52 +65,67 @@ async function readAll(space: ExtentSpace, blobs: readonly BlobRef[]): Promise<v
 }
 
 describe("extent space crash sweep", () => {
-  it("reopens to an intact current and previous root, an exact free map, and keeps writing", async () => {
-    const clean = new SimDisk();
-    const { space } = await openOver(new SimBackend(clean));
-    await workload(space, { published: [], inFlight: null }, 5);
-    const steps = clean.steps;
-    let checked = 0;
-    for (let step = 0; step < steps; step++)
-      for (const seed of SEEDS) {
-        const disk = new SimDisk({ crashAtStep: step, seed: seed + step * 7919 });
-        const ack: Ack = { published: [], inFlight: null };
-        try {
-          const { space: first } = await openOver(new SimBackend(disk));
-          await workload(first, ack, 5);
-          disk.powerLoss();
-        } catch (error) {
-          if (!(error instanceof SimulatedCrash)) throw error;
-        }
-        const label = `crash at step ${String(step)}, seed ${String(seed)}`;
-        const { space: reopened } = await openOver(new SimBackend(disk));
-        const root = text(reopened.root);
-        expect([ack.published.at(-1) ?? null, ack.inFlight], label).toContain(root);
-        const history = [...ack.published, ...(ack.inFlight === null ? [] : [ack.inFlight])];
-        if (root !== null) {
-          const before = history[history.indexOf(root) - 1] ?? null;
-          const previous = text(reopened.previousRoot);
-          // The previous root is the one before, or lost with the slot an interrupted publish tore.
-          if (previous !== null) expect(previous, label).toBe(before);
-          await readAll(reopened, blobsOf(reopened.root ?? new Uint8Array(0)));
-          if (reopened.previousRoot !== null)
-            await readAll(reopened, blobsOf(reopened.previousRoot));
-        }
-        await reopened.audit();
-        // The reopened space keeps going: two more rounds, the first retiring what its root reached.
-        const reached = blobsOf(reopened.root ?? rootOf([]))
-          .map((blob) => blob.extent)
-          .filter(
-            (extent, index, all) => all.findIndex((e) => e.offset === extent.offset) === index,
+  it.each([
+    ["growing in place", false],
+    ["relocating at seal (review B1-p2a)", true],
+  ] as const)(
+    "%s: reopens to an intact current and previous root, an exact free map, and keeps writing",
+    async (_name, forceRelocation) => {
+      const clean = new SimDisk();
+      const { space } = await openOver(new SimBackend(clean));
+      await workload(space, { published: [], inFlight: null }, 5, 1, [], forceRelocation);
+      if (forceRelocation) expect(space.stats.relocations).toBeGreaterThan(0);
+      else expect(space.stats.relocations).toBe(0);
+      const steps = clean.steps;
+      let checked = 0;
+      for (let step = 0; step < steps; step++)
+        for (const seed of SEEDS) {
+          const disk = new SimDisk({ crashAtStep: step, seed: seed + step * 7919 });
+          const ack: Ack = { published: [], inFlight: null };
+          try {
+            const { space: first } = await openOver(new SimBackend(disk));
+            await workload(first, ack, 5, 1, [], forceRelocation);
+            disk.powerLoss();
+          } catch (error) {
+            if (!(error instanceof SimulatedCrash)) throw error;
+          }
+          const label = `crash at step ${String(step)}, seed ${String(seed)}`;
+          const { space: reopened } = await openOver(new SimBackend(disk));
+          const root = text(reopened.root);
+          expect([ack.published.at(-1) ?? null, ack.inFlight], label).toContain(root);
+          const history = [...ack.published, ...(ack.inFlight === null ? [] : [ack.inFlight])];
+          if (root !== null) {
+            const before = history[history.indexOf(root) - 1] ?? null;
+            const previous = text(reopened.previousRoot);
+            // The previous root is the one before, or lost with the slot an interrupted publish tore.
+            if (previous !== null) expect(previous, label).toBe(before);
+            await readAll(reopened, blobsOf(reopened.root ?? new Uint8Array(0)));
+            if (reopened.previousRoot !== null)
+              await readAll(reopened, blobsOf(reopened.previousRoot));
+          }
+          await reopened.audit();
+          // The reopened space keeps going: two more rounds, the first retiring what its root reached.
+          const reached = blobsOf(reopened.root ?? rootOf([]))
+            .map((blob) => blob.extent)
+            .filter(
+              (extent, index, all) => all.findIndex((e) => e.offset === extent.offset) === index,
+            );
+          await workload(
+            reopened,
+            { published: [], inFlight: null },
+            2,
+            50,
+            reached,
+            forceRelocation,
           );
-        await workload(reopened, { published: [], inFlight: null }, 2, 50, reached);
-        await readAll(reopened, blobsOf(reopened.root ?? new Uint8Array(0)));
-        await reopened.audit();
-        checked += 1;
-      }
-    expect(checked).toBe(steps * SEEDS.length);
-    expect(steps).toBeGreaterThan(30);
-  });
+          await readAll(reopened, blobsOf(reopened.root ?? new Uint8Array(0)));
+          await reopened.audit();
+          checked += 1;
+        }
+      expect(checked).toBe(steps * SEEDS.length);
+      expect(steps).toBeGreaterThan(30);
+    },
+  );
 
   it("falls back to the previous root intact when the newest root slot is lost", async () => {
     const disk = new SimDisk();
