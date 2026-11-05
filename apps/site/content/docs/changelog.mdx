@@ -8,6 +8,21 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## Unreleased patch
+
+Planned package: `@minnowdb/core`.
+
+- Integer arithmetic now throws `RangeError` when a result leaves JavaScript's safe
+  integer range. `DIV` and `WIDTH_BUCKET` also refuse unsafe whole-number results. Number `SUM` and `AVG`, including grouped, live, and window variants, refuse an
+  unsafe partial sum of safe integer contributions instead of silently rounding. Cast inputs to
+  `NUMERIC` for larger exact calculations. Constant arithmetic beyond the safe range returns an
+  exact decimal string.
+
+The main entry measures 338.0 KiB gzipped (previously 336.8 KiB); the engine with OPFS
+measures 442.3 KiB (previously 441.4 KiB).
+
+No stored format changes or data migration. Existing databases open automatically.
+
 ## 0.19.2 — November 5, 2026
 
 Release packages: `@minnowdb/core@0.19.2`.

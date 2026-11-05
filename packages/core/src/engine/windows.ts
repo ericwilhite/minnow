@@ -1,3 +1,4 @@
+import { checkedSum } from "./integer-exactness.js";
 import type {
   QueryResult,
   QueryRow,
@@ -83,7 +84,7 @@ class FrameAggregate {
     }
     if (typeof left !== "number" || typeof right !== "number")
       throw new TypeError("Window SUM requires numeric values");
-    return left + right;
+    return checkedSum(left, right);
   }
 
   /** Prefixes grow without subtraction, so each input is combined once without a range tree. */

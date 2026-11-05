@@ -10439,6 +10439,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           rowCount,
           valueAt,
           cascadeBudget,
+          statement.bindings.map((binding) =>
+            table.columns.find((column) => column.name === binding.column),
+          ),
         );
       }
     }
@@ -10547,6 +10550,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     rowCount: number,
     valueAt: (source: "new" | "old", column: string, rowIndex: number) => BatchValue,
     cascadeBudget: number,
+    parameterColumns: ReadonlyArray<TableColumnRecord | undefined>,
   ): Promise<void> {
     const target = await this.#findTable(compiled.table);
     const keyColumn = getUniqueKeyColumn(target);
@@ -10554,6 +10558,53 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       throw new TypeError(
         `Trigger body ${compiled.kind.toUpperCase()}s need a keyed table: ${target.name}`,
       );
+    }
+    compiled = clonePlanTree(compiled);
+    const integerColumn = (reference: string): boolean =>
+      target.columns.some(
+        (column) =>
+          column.name === reference.slice(reference.lastIndexOf(".") + 1) &&
+          column.integer === true,
+      );
+    // NEW/OLD placeholders retain their source domains before values replace the parameters.
+    // In particular, a whole-valued DOUBLE stays floating point, while DATE - DATE is integer.
+    const typeParameters = (expression: Expression): Expression => {
+      if (expression.kind === "parameter") {
+        const column = parameterColumns[expression.index];
+        const target =
+          column?.type === "number"
+            ? column.integer === true
+              ? "number-integer"
+              : "number"
+            : column?.sqlDomain?.kind === "date"
+              ? "date"
+              : undefined;
+        return target === undefined
+          ? expression
+          : {
+              kind: "call",
+              name: "CAST",
+              arguments: [expression, { kind: "literal", value: target }],
+            };
+      }
+      const typed = mapChildExpressions(expression, typeParameters);
+      if (typed.kind === "binary") delete typed.integer;
+      return typed;
+    };
+    const datetimes = tableDatetimeColumns(target);
+    const mark = (expression: Expression): Expression => {
+      const typed = typeParameters(expression);
+      annotateIntegerDivision(typed, integerColumn, undefined, (reference) =>
+        datetimes.get(reference.slice(reference.lastIndexOf(".") + 1)),
+      );
+      return typed;
+    };
+    if (compiled.kind === "update")
+      for (const assignment of compiled.assignments)
+        assignment.expression = mark(assignment.expression);
+    for (const predicate of compiled.predicates) {
+      predicate.left = mark(predicate.left);
+      predicate.right = mark(predicate.right);
     }
     const mergedKeys: BatchValue[] = [];
     const seenKeys = new Set<string>();
@@ -14484,8 +14535,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         throw new TypeError(`RETURNING column does not exist: ${name}`);
       }
     }
-    const assignments = onConflict.assignments ?? [];
-    const conflictWhere = onConflict.where;
+    const assignments = (onConflict.assignments ?? []).map((assignment) => ({
+      ...assignment,
+      expression: tableTypedExpression(table, clonePlanTree(assignment.expression)),
+    }));
+    const conflictWhere =
+      onConflict.where === undefined
+        ? undefined
+        : tableTypedExpression(table, clonePlanTree(onConflict.where));
     const conflictExpressions = [
       ...assignments.map((assignment) => assignment.expression),
       ...(conflictWhere === undefined ? [] : [conflictWhere]),
@@ -15044,6 +15101,48 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     const keyColumn = getUniqueKeyColumn(target);
     if (keyColumn === undefined) {
       throw new TypeError(`MERGE requires a table with a unique key: ${target.name}`);
+    }
+    statement = clonePlanTree(statement);
+    const sourcePlan = compileQuery(mergeSourceSql(statement), { optimize: false });
+    const sourceColumns = inferBlockSchema(
+      sourcePlan,
+      catalogQuerySchemas(await this.store.listTables()),
+    );
+    const integerColumn = (reference: string): boolean => {
+      const dot = reference.lastIndexOf(".");
+      const alias = reference.slice(0, dot);
+      const name = reference.slice(dot + 1);
+      if (alias === statement.alias)
+        return target.columns.some((column) => column.name === name && column.integer === true);
+      if (alias === statement.source.alias)
+        return sourceColumns.some((column) => column.name === name && column.integer === true);
+      return false;
+    };
+    const targetDatetimes = tableDatetimeColumns(target);
+    const columnDatetime = (reference: string): DatetimeTypeKind | undefined => {
+      const dot = reference.lastIndexOf(".");
+      const alias = reference.slice(0, dot);
+      const name = reference.slice(dot + 1);
+      if (alias === statement.alias) return targetDatetimes.get(name);
+      if (alias !== statement.source.alias) return undefined;
+      const column = sourceColumns.find((candidate) => candidate.name === name);
+      const kind = column?.sqlDomain?.kind;
+      return kind === "date" || kind === "interval"
+        ? kind
+        : column?.withoutTimeZone === true
+          ? "local"
+          : undefined;
+    };
+    annotateIntegerDivision(statement.on, integerColumn, undefined, columnDatetime);
+    for (const branch of statement.branches) {
+      if (branch.condition !== undefined)
+        annotateIntegerDivision(branch.condition, integerColumn, undefined, columnDatetime);
+      if (branch.action.kind === "update")
+        for (const assignment of branch.action.assignments)
+          annotateIntegerDivision(assignment.expression, integerColumn, undefined, columnDatetime);
+      if (branch.action.kind === "insert")
+        for (const value of branch.action.values)
+          annotateIntegerDivision(value, integerColumn, undefined, columnDatetime);
     }
     const sourceKey = mergeSourceKeyExpression(statement, keyColumn.name);
     // The source's key value per row, and the target row it matches (or none).

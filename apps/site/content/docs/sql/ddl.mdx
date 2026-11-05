@@ -279,6 +279,21 @@ a number column. An integer _constant_ beyond that range is not an error: it sta
 PostgreSQL's `int8` and `NUMERIC` typing of large constants, and writing one to an integer column
 is rejected rather than rounded.
 
+Non-constant integer addition, subtraction, and multiplication throw `RangeError` if the
+result leaves the safe range; they never return a rounded integer. Unary minus, `ABS`,
+remainder, and integer division preserve safe integer inputs. `DIV` and `WIDTH_BUCKET`
+refuse a whole-number result outside the safe range with `RangeError`. `SUM` and `AVG` retain their
+number result contract: summing safe integer contributions throws `RangeError` as soon as a
+partial sum leaves the safe range, even if later cancellation or division would bring it back.
+This also applies to grouped, DISTINCT, live, and window aggregates, including running sums.
+Integer intermediates in UPDATE, ON CONFLICT, MERGE, and trigger assignments have the same
+range checks, even when a later operation would return to the safe range. Sequence expressions
+(`NEXTVAL` and `CURRVAL`) and SQL defaults use these checks too. Untyped text operands in
+integer arithmetic follow the integer CAST rules before conversion: out-of-range or fractional
+integer text is refused.
+Use `CAST(value AS NUMERIC)` before arithmetic or aggregation for exact decimal strings and
+larger results. Constant arithmetic beyond the safe range returns an exact decimal string.
+
 Integer division is PostgreSQL's. When both operands of `/` are integers — integer columns,
 integer constants, `COUNT`, an integer `CAST`, a `date - date` difference, or integer arithmetic
 and aggregates over them, including a `CASE`, `COALESCE`, or `NULLIF` whose non-`NULL` values are

@@ -92,3 +92,25 @@ export const DIFFERENTIAL_REACH = [
   "success",
   "refusal",
 ] as const;
+
+/** Required boundary states for the integer arithmetic/aggregate campaign. */
+export const INTEGER_EXACTNESS_STATES = ["positive overflow", "negative overflow", "safe"] as const;
+
+export const INTEGER_MUTATION_EXACTNESS_STATES = [
+  ...INTEGER_EXACTNESS_STATES,
+  "integer trigger source",
+  "float trigger source",
+  "date-derived safe",
+  "date-derived overflow",
+  "sequence safe",
+  "sequence overflow",
+] as const;
+
+export const INTEGER_ARITHMETIC_EXACTNESS_STATES = [
+  ...INTEGER_EXACTNESS_STATES,
+  "fractional parameter",
+  "dictionary aggregate",
+  "integer text safe",
+  "integer text refusal",
+  "fractional text refusal",
+] as const;

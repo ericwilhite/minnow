@@ -215,7 +215,7 @@ export type Expression =
       left: Expression;
       right: Expression;
       /**
-       * Integer division: both operands are integer-typed, so `/` truncates toward zero as
+       * Both operands are integer-typed: arithmetic checks the safe-integer range and `/` truncates toward zero as
        * PostgreSQL's integer `/` does. Set by the compiler for constants and by catalog
        * binding for columns; absent, `/` is ordinary Float64 or exact-NUMERIC division.
        */

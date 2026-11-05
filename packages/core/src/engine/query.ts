@@ -1,3 +1,4 @@
+import { checkedInteger, checkedSum } from "./integer-exactness.js";
 import { castSqlValue, datetimeText } from "./sql-casts.js";
 import { parseJson } from "../block-format/json-parse.js";
 export { datetimeText } from "./sql-casts.js";
@@ -2542,6 +2543,19 @@ function bindExpression(expression: Expression, values: readonly QueryParameter[
   if (expression.kind === "binary" || expression.kind === "logical") {
     expression.left = bindExpression(expression.left, values);
     expression.right = bindExpression(expression.right, values);
+    if (
+      expression.kind === "binary" &&
+      expression.integer === true &&
+      !integerTypedExpression(
+        expression,
+        () => true,
+        () => true,
+      )
+    ) {
+      // Binding a fractional parameter can invalidate a constant partner's integer inference.
+      // Columns remain optimistic here; catalog binding resolves their actual types later.
+      delete expression.integer;
+    }
     return expression;
   }
   if (expression.kind === "call") {
@@ -4405,7 +4419,7 @@ function dateDifference(
 }
 
 /**
- * Scalar functions PostgreSQL declares as returning `integer` whatever their arguments:
+ * Functions PostgreSQL declares as returning an integer-family type, including sequence BIGINTs:
  * `LENGTH(name) / 2` truncates there and in SQLite. INSTR is POSITION's compiled form.
  */
 const integerResultFunctionNames: ReadonlySet<string> = new Set([
@@ -4417,6 +4431,8 @@ const integerResultFunctionNames: ReadonlySet<string> = new Set([
   "NUM_NULLS",
   "NUM_NONNULLS",
   "WIDTH_BUCKET",
+  "NEXTVAL",
+  "CURRVAL",
 ]);
 
 /**
@@ -4461,8 +4477,9 @@ export function integerQuotient(left: number, right: number): number | null {
 }
 
 /**
- * Marks every `/` in one expression whose operands are integers, subquery blocks included, so
- * that every evaluator truncates it the way PostgreSQL does. Children are marked first: the
+ * Marks arithmetic whose operands are integers, subquery blocks included, so every evaluator
+ * checks the result range and truncates division the way PostgreSQL does. The historical name
+ * is retained for callers that bind plans. Children are marked first: the
  * parent's typing reads the children, and `(a / b) / c` is integer only once `a / b` is.
  */
 export function annotateIntegerDivision(
@@ -4487,7 +4504,7 @@ export function annotateIntegerDivision(
   }
   if (
     expression.kind === "binary" &&
-    expression.operator === "/" &&
+    expression.operator !== "||" &&
     expression.integer !== true &&
     integerTypedExpression(
       expression,
@@ -4627,7 +4644,7 @@ function blockColumnIntegerResolver(
 }
 
 /**
- * Marks integer division throughout a plan, nested blocks first. Without a catalog only
+ * Marks integer arithmetic throughout a plan, nested blocks first. Without a catalog only
  * constants, COUNT, integer CASTs, and differences of DATE constants type as integers; with
  * one, INTEGER columns and differences of DATE columns do too, and a derived source's outputs
  * follow from its own select list.
@@ -4673,7 +4690,7 @@ export function planMayHaveIntegerDivision(plan: CompiledQuery): boolean {
     }
     if (
       expression.kind === "binary" &&
-      expression.operator === "/" &&
+      expression.operator !== "||" &&
       expression.integer !== true &&
       integerTypedExpression(expression, optimistic, everyColumn, optimisticDate, everyColumnDate)
     ) {
@@ -5831,9 +5848,10 @@ function scalarArgumentDisplayScales(
  * The exact fold of a constant arithmetic subtree, or undefined where none applies. PostgreSQL
  * types every decimal constant — and every integer constant too large for its integer types —
  * as NUMERIC, so arithmetic among constants happens in exact decimal space before any float8
- * context sees the result: `0.1 + 0.2` is exactly 0.3. A subtree folds only when it is
- * "seeded" by such a constant (one carrying exact digits); pure safe-integer arithmetic keeps
- * its historical Float64 evaluation, including non-truncating division.
+ * context sees the result: `0.1 + 0.2` is exactly 0.3. A subtree folds when it is seeded by
+ * such a constant (one carrying exact digits), or when safe-integer arithmetic would leave
+ * the safe range.
+ * Other unseeded arithmetic retains its historical number evaluation.
  */
 function exactConstantFold(
   expression: Expression,
@@ -5855,7 +5873,22 @@ function exactConstantFold(
   if (left === undefined) return undefined;
   const right = exactConstantFold(expression.right);
   if (right === undefined) return undefined;
-  const seeded = left.seeded || right.seeded;
+  const promoteIntegers =
+    !left.seeded &&
+    !right.seeded &&
+    typeof left.value === "number" &&
+    typeof right.value === "number" &&
+    Number.isSafeInteger(left.value) &&
+    Number.isSafeInteger(right.value) &&
+    ["+", "-", "*"].includes(expression.operator) &&
+    !Number.isSafeInteger(
+      expression.operator === "+"
+        ? left.value + right.value
+        : expression.operator === "-"
+          ? left.value - right.value
+          : left.value * right.value,
+    );
+  const seeded = left.seeded || right.seeded || promoteIntegers;
   if (left.value === null || right.value === null) return { value: null, seeded };
   if (
     expression.integer === true &&
@@ -5865,7 +5898,13 @@ function exactConstantFold(
   ) {
     return { value: integerQuotient(left.value, right.value), seeded };
   }
-  const folded = exactNumericBinary(expression.operator, left.value, right.value, 0, false);
+  const folded = exactNumericBinary(
+    expression.operator,
+    promoteIntegers ? exactNumericValue(left.value) : left.value,
+    promoteIntegers ? exactNumericValue(right.value) : right.value,
+    0,
+    false,
+  );
   return folded === undefined ? undefined : { value: folded, seeded };
 }
 
@@ -6512,11 +6551,15 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
       // read before the integer check, so `'7' / 2` truncates as its typing says.
       const leftValue =
         typeof left === "string" && typeof right === "number" && !isSqlDomainValue(left)
-          ? readUntypedText("number", left)
+          ? expression.integer === true
+            ? castSqlValue(left, "number-integer")
+            : readUntypedText("number", left)
           : left;
       const rightValue =
         typeof right === "string" && typeof left === "number" && !isSqlDomainValue(right)
-          ? readUntypedText("number", right)
+          ? expression.integer === true
+            ? castSqlValue(right, "number-integer")
+            : readUntypedText("number", right)
           : right;
       if (typeof leftValue !== "number" || typeof rightValue !== "number") {
         const temporal = datetimeArithmeticValue(expression.operator, leftValue, rightValue);
@@ -6528,9 +6571,9 @@ function evaluate(expression: Expression, context: RowContext, group?: RowContex
       if (exact !== undefined) return exact;
       const a = numeric(leftValue);
       const b = numeric(rightValue);
-      if (expression.operator === "+") return a + b;
-      if (expression.operator === "-") return a - b;
-      if (expression.operator === "*") return a * b;
+      if (expression.operator === "+") return expression.integer ? checkedInteger(a + b) : a + b;
+      if (expression.operator === "-") return expression.integer ? checkedInteger(a - b) : a - b;
+      if (expression.operator === "*") return expression.integer ? checkedInteger(a * b) : a * b;
       // Division and remainder by zero are NULL, matching SQLite, not Infinity/NaN.
       if (b === 0) return null;
       return expression.operator === "%" ? computedNumber(a % b) : a / b;
@@ -7806,7 +7849,7 @@ function sumNumericValues(values: readonly unknown[]): unknown {
   for (let index = 1; index < values.length; index += 1) {
     const value = values[index];
     const exact = exactNumericBinary("+", total, value);
-    total = exact === undefined ? numeric(total) + numeric(value) : exact;
+    total = exact === undefined ? checkedSum(numeric(total), numeric(value)) : exact;
   }
   return total;
 }

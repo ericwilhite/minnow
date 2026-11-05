@@ -1,3 +1,4 @@
+import { checkedInteger } from "./integer-exactness.js";
 /**
  * Table-driven scalar functions: the PostgreSQL string, math, datetime, regex, and formatting
  * functions that need no special parsing. Each entry carries its arity, its result type, and a
@@ -1290,7 +1291,7 @@ export const simpleScalarFunctions: ReadonlyMap<string, SimpleScalarFunction> = 
         if (exact !== undefined) return exact;
         const divisor = number("DIV", values[1]);
         if (divisor === 0) throw new TypeError("DIV by zero");
-        return computedNumber(Math.trunc(number("DIV", values[0]) / divisor));
+        return computedNumber(checkedInteger(Math.trunc(number("DIV", values[0]) / divisor)));
       },
     },
   ],
@@ -1304,17 +1305,17 @@ export const simpleScalarFunctions: ReadonlyMap<string, SimpleScalarFunction> = 
         const operand = number("WIDTH_BUCKET", values[0]);
         const low = number("WIDTH_BUCKET", values[1]);
         const high = number("WIDTH_BUCKET", values[2]);
-        const count = integer("WIDTH_BUCKET", values[3]);
+        const count = checkedInteger(integer("WIDTH_BUCKET", values[3]));
         if (count <= 0) throw new TypeError("WIDTH_BUCKET count must be positive");
         if (low === high) throw new TypeError("WIDTH_BUCKET bounds must differ");
         if (low < high) {
           if (operand < low) return 0;
-          if (operand >= high) return count + 1;
-          return Math.floor(((operand - low) / (high - low)) * count) + 1;
+          if (operand >= high) return checkedInteger(count + 1);
+          return checkedInteger(Math.floor(((operand - low) / (high - low)) * count) + 1);
         }
         if (operand > low) return 0;
-        if (operand <= high) return count + 1;
-        return Math.floor(((low - operand) / (low - high)) * count) + 1;
+        if (operand <= high) return checkedInteger(count + 1);
+        return checkedInteger(Math.floor(((low - operand) / (low - high)) * count) + 1);
       },
     },
   ],

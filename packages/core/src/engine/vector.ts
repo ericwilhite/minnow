@@ -1,3 +1,5 @@
+import { castSqlValue } from "./sql-casts.js";
+import { checkedInteger, checkedSum } from "./integer-exactness.js";
 import { dateMilliseconds } from "../date-value.js";
 import { parseJson } from "../block-format/json-parse.js";
 import { crossJoinPlan, isCrossJoinPlan } from "../plan/model.js";
@@ -340,7 +342,7 @@ type BoundExpression =
       operator: "+" | "-" | "*" | "/";
       left: BoundExpression;
       right: BoundExpression;
-      /** PostgreSQL integer division: truncate toward zero. */
+      /** Integer arithmetic: checked range and division truncated toward zero. */
       integer?: true;
       signature: string;
     }
@@ -5476,7 +5478,10 @@ class GroupAccumulator {
         if (!isValid(column.validity, slot)) continue;
         counts[column.index] = (counts[column.index] ?? 0) + 1;
         if (column.sums) {
-          state.sums[column.index] = (state.sums[column.index] ?? 0) + (column.values[slot] ?? 0);
+          state.sums[column.index] = checkedSum(
+            state.sums[column.index] ?? 0,
+            column.values[slot] ?? 0,
+          );
         }
       }
       // Only COUNT(DISTINCT) plans pay for this loop: an empty for-of per row cost every grouped
@@ -5553,7 +5558,7 @@ class GroupAccumulator {
         if (value === null) continue;
         counts[conditional.index] = (counts[conditional.index] ?? 0) + 1;
         if (conditional.sums) {
-          state.sums[conditional.index] = (state.sums[conditional.index] ?? 0) + value;
+          state.sums[conditional.index] = checkedSum(state.sums[conditional.index] ?? 0, value);
         }
       }
     }
@@ -6091,7 +6096,7 @@ function updateAggregates(
       if (value !== null) {
         state.counts[index] = (state.counts[index] ?? 0) + 1;
         if (spec.name === "SUM" || spec.name === "AVG") {
-          state.sums[index] = (state.sums[index] ?? 0) + value;
+          state.sums[index] = checkedSum(state.sums[index] ?? 0, value);
         } else if (spec.name === "MIN" || spec.name === "MAX") {
           // A raw number compares as a number. NaN keeps compareValues's place, after every
           // finite value: it is never the minimum and always the maximum once seen.
@@ -6302,7 +6307,7 @@ function applyAggregateValue(
       if (sum === null || sum === undefined) throw new Error("Exact NUMERIC sum disappeared");
       replaceAggregateValue(state, index, sum, `${spec.name} aggregate value`, memory);
     } else {
-      state.sums[index] = (state.sums[index] ?? 0) + numeric(value);
+      state.sums[index] = checkedSum(state.sums[index] ?? 0, numeric(value));
     }
   } else if (
     spec.name === "MIN" &&
@@ -6746,9 +6751,21 @@ function compileNumericArithmetic(
   const right = compileNumericArithmetic(expression.right);
   if (left === undefined || right === undefined) return undefined;
   const operator = expression.operator as string;
-  if (operator === "+") return (rows, row) => left(rows, row) + right(rows, row);
-  if (operator === "-") return (rows, row) => left(rows, row) - right(rows, row);
-  if (operator === "*") return (rows, row) => left(rows, row) * right(rows, row);
+  if (operator === "+")
+    return (rows, row) => {
+      const value = left(rows, row) + right(rows, row);
+      return expression.integer && !Number.isNaN(value) ? checkedInteger(value) : value;
+    };
+  if (operator === "-")
+    return (rows, row) => {
+      const value = left(rows, row) - right(rows, row);
+      return expression.integer && !Number.isNaN(value) ? checkedInteger(value) : value;
+    };
+  if (operator === "*")
+    return (rows, row) => {
+      const value = left(rows, row) * right(rows, row);
+      return expression.integer && !Number.isNaN(value) ? checkedInteger(value) : value;
+    };
   if (operator === "/") {
     if (expression.integer === true) {
       return (rows, row) => integerQuotient(left(rows, row), right(rows, row)) ?? NaN;
@@ -7531,9 +7548,9 @@ function binaryValue(
 ): number | string | Date | null {
   if (left === null || left === undefined || right === null || right === undefined) return null;
   if (typeof left === "number" && typeof right === "number") {
-    if (operator === "+") return left + right;
-    if (operator === "-") return left - right;
-    if (operator === "*") return left * right;
+    if (operator === "+") return integer ? checkedInteger(left + right) : left + right;
+    if (operator === "-") return integer ? checkedInteger(left - right) : left - right;
+    if (operator === "*") return integer ? checkedInteger(left * right) : left * right;
     if (operator === "/")
       return integer ? integerQuotient(left, right) : right === 0 ? null : left / right;
     if (operator === "%") return right === 0 ? null : computedNumber(left % right);
@@ -7543,11 +7560,11 @@ function binaryValue(
   // that does not read as a number is left for `numeric` to refuse below: recursing on it
   // would never terminate.
   if (typeof left === "string" && typeof right === "number" && !isSqlDomainValue(left)) {
-    const read = readUntypedText("number", left);
+    const read = integer ? castSqlValue(left, "number-integer") : readUntypedText("number", left);
     if (typeof read === "number") return binaryValue(operator, read, right, integer);
   }
   if (typeof right === "string" && typeof left === "number" && !isSqlDomainValue(right)) {
-    const read = readUntypedText("number", right);
+    const read = integer ? castSqlValue(right, "number-integer") : readUntypedText("number", right);
     if (typeof read === "number") return binaryValue(operator, left, read, integer);
   }
   const temporal = datetimeArithmeticValue(operator, left, right);
