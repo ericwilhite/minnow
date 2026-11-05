@@ -13,20 +13,20 @@
  * current engine continues through every step of every seed.
  *
  * Statements: multi-row INSERT (duplicate keys, in the batch and against stored rows; NULLs in a
- * UNIQUE column), UPDATE by primary key (of a UNIQUE and an indexed column, and of the key itself
- * when no child references it), DELETE by primary key (refused while children reference it), child
- * INSERT / DELETE under a RESTRICT foreign key, explicit transactions that commit or roll back,
- * and reopen / crash of the write path. Small memtables put flushes, publishes and replay in the
+ * UNIQUE column), UPDATE by primary key (of a UNIQUE and an indexed column, and of the key itself,
+ * which its references follow), DELETE by primary key, child INSERT / DELETE in three child tables
+ * whose foreign keys differ ON DELETE (RESTRICT, CASCADE, SET NULL; all follow a rekey, which
+ * PostgreSQL is told as ON UPDATE CASCADE), explicit transactions that commit or roll back, and
+ * reopen / crash of the write path. Small memtables put flushes, publishes and replay in the
  * middle of every run.
  *
  * The current engine always runs a step inside BEGIN … COMMIT / ROLLBACK (so it can be undone when
  * it differs); its autocommit behaviour for single statements is not compared. The write path and
  * PostgreSQL run single statements as autocommit.
  *
- * Limits: the parent rekey with children (PostgreSQL's default refuses it, the current engine
- * cascades it; the write path's rekey-follow lands in increment 2), ON DELETE CASCADE / SET NULL,
- * and statements the write path does not take yet (ALTER TABLE, staged large transactions) are not
- * generated.
+ * Limits: multi-level cascades, self references and composite keys are not generated (fk-actions
+ * tests pin them), nor statements the write path does not take yet (ALTER TABLE, staged large
+ * transactions).
  */
 import { describe, expect, it } from "vitest";
 import { PGlite } from "@electric-sql/pglite";
@@ -55,6 +55,7 @@ import {
   texts,
   type Value,
 } from "../write/test-support.js";
+import { need } from "../write/bytes.js";
 import {
   intendedDivergence,
   type DifferingRow,
@@ -161,6 +162,8 @@ interface Op {
   readonly sql: string;
   /** What it does, for the divergence registry (divergences.ts `StatementFacts`, without sql). */
   readonly facts: Omit<StatementFacts, "sql">;
+  /** A parent delete or rekey: the key it removes from t (for the reach counters). */
+  readonly removes?: number;
   readonly run: (statement: Statement, ids: Ids, step: StepLog) => Promise<unknown>;
 }
 
@@ -170,9 +173,18 @@ interface StepLog {
   readonly moved: Array<readonly [from: number, to: number]>;
 }
 
+/** The child tables: each references t(id) and follows a rekey; they differ ON DELETE. */
+const CHILDREN = [
+  { name: "c", onDelete: "restrict", sql: "" },
+  { name: "cc", onDelete: "cascade", sql: " ON DELETE CASCADE" },
+  { name: "cn", onDelete: "setNull", sql: " ON DELETE SET NULL" },
+] as const;
+
+type ChildName = (typeof CHILDREN)[number]["name"];
+
 interface Ids {
   readonly t: number;
-  readonly c: number;
+  readonly children: Readonly<Record<ChildName, number>>;
   readonly u: number;
   readonly v: number;
   readonly vIndex: number;
@@ -251,13 +263,13 @@ class Workload {
   }
 
   /** One operation over the current parent ids and their child counts. */
-  op(parents: readonly number[], children: ReadonlyMap<number, number>): Op {
+  op(parents: readonly number[]): Op {
     const pick = () =>
       parents.length > 0 && this.chance(0.8)
         ? (parents[this.int(parents.length)] ?? 0)
         : this.int(80);
     const kind = this.int(100);
-    if (kind < 35) {
+    if (kind < 30) {
       const count = 1 + this.int(5);
       const rows = Array.from({ length: count }, () => ({
         id: this.chance(0.15) ? pick() : this.int(80),
@@ -290,7 +302,7 @@ class Workload {
           ),
       };
     }
-    if (kind < 55) {
+    if (kind < 48) {
       const id = pick();
       const u = this.maybe(120, 0.3);
       const v = this.maybe(10);
@@ -313,15 +325,13 @@ class Workload {
         },
       };
     }
-    if (kind < 62) {
-      // A rekey, only of a parent no child references (see Limits).
-      const free = parents.filter((id) => (children.get(id) ?? 0) === 0);
-      const id = free.length > 0 ? (free[this.int(free.length)] ?? 0) : this.int(80) + 1000;
+    if (kind < 56) {
+      // A rekey: references follow it (ON UPDATE CASCADE; the current engine always does).
+      const id = pick();
       const next = this.chance(0.3) ? pick() : this.int(80);
-      if ((children.get(next) ?? 0) > 0 || (children.get(id) ?? 0) > 0)
-        return this.op(parents, children);
       return {
         facts: { kind: "rekey", table: "t", newKeys: [next], matchedKeys: [id], references: [] },
+        removes: id,
         sql: `UPDATE t SET id = ${String(next)} WHERE id = ${String(id)}`,
         run: async (statement, ids, step) => {
           const def = statement.catalog.table(ids.t);
@@ -334,10 +344,11 @@ class Workload {
         },
       };
     }
-    if (kind < 77) {
+    if (kind < 70) {
       const id = pick();
       return {
         facts: { kind: "delete", table: "t", newKeys: [], matchedKeys: [id], references: [] },
+        removes: id,
         sql: `DELETE FROM t WHERE id = ${String(id)}`,
         run: async (statement, ids) => {
           const at = await locate(statement.view, ids.t, primaryOf(statement, ids.t), id);
@@ -346,30 +357,34 @@ class Workload {
         },
       };
     }
-    if (kind < 92) {
+    const child = need(CHILDREN[this.int(CHILDREN.length)]).name;
+    if (kind < 94) {
       const id = this.int(60);
       const pid = this.chance(0.15) ? null : pick();
       return {
         facts: {
           kind: "insert",
-          table: "c",
+          table: child,
           newKeys: [id],
           matchedKeys: [],
           references: pid === null ? [] : [{ table: "t", value: pid }],
         },
-        sql: `INSERT INTO c VALUES (${String(id)}, ${sql(pid)})`,
+        sql: `INSERT INTO ${child} VALUES (${String(id)}, ${sql(pid)})`,
         run: (statement, ids) =>
-          Promise.resolve(statement.table(ids.c).insert(batch(ints([id]), ints([pid])), null)),
+          Promise.resolve(
+            statement.table(ids.children[child]).insert(batch(ints([id]), ints([pid])), null),
+          ),
       };
     }
     const id = this.int(60);
     return {
-      facts: { kind: "delete", table: "c", newKeys: [], matchedKeys: [id], references: [] },
-      sql: `DELETE FROM c WHERE id = ${String(id)}`,
+      facts: { kind: "delete", table: child, newKeys: [], matchedKeys: [id], references: [] },
+      sql: `DELETE FROM ${child} WHERE id = ${String(id)}`,
       run: async (statement, ids) => {
-        const at = await locate(statement.view, ids.c, primaryOf(statement, ids.c), id);
+        const table = ids.children[child];
+        const at = await locate(statement.view, table, primaryOf(statement, table), id);
         if (at === null) return;
-        await statement.table(ids.c).delete(batch(locators([at], ids.c)), null);
+        await statement.table(table).delete(batch(locators([at], table)), null);
       },
     };
   }
@@ -382,12 +397,14 @@ function primaryOf(statement: Statement, table: number): number {
 const SCHEMA = [
   "CREATE TABLE t(id INTEGER PRIMARY KEY, u INTEGER UNIQUE, v INTEGER, s TEXT)",
   "CREATE INDEX t_v ON t(v)",
-  "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES t(id))",
+  ...CHILDREN.map(
+    (child) =>
+      `CREATE TABLE ${child.name}(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES t(id)${child.sql} ON UPDATE CASCADE)`,
+  ),
 ];
 
 async function setUp(path: WritePathImpl): Promise<Ids> {
   let t = 0;
-  let c = 0;
   await transaction(path, false, async (statement) => {
     t =
       (
@@ -411,28 +428,36 @@ async function setUp(path: WritePathImpl): Promise<Ids> {
       index: { tableId: t, name: "t_v", columnIds: [v], unique: false, role: "secondary" },
     }),
   );
-  await transaction(path, false, async (statement) => {
-    c =
-      (
-        await statement.changeCatalog({
-          kind: "createTable",
-          table: tableInput("c", [column("id", INT, false), column("pid", INT)], {
-            foreignKeys: [
-              {
-                name: "fk",
-                columns: [1],
-                parentTableId: t,
-                parentIndexId: "primary",
-                onDelete: "restrict",
-                enforced: true,
-              },
-            ],
-          }),
-        })
-      ).id ?? 0;
-  });
+  const children: Partial<Record<ChildName, number>> = {};
+  for (const child of CHILDREN)
+    await transaction(path, false, async (statement) => {
+      children[child.name] =
+        (
+          await statement.changeCatalog({
+            kind: "createTable",
+            table: tableInput(child.name, [column("id", INT, false), column("pid", INT)], {
+              foreignKeys: [
+                {
+                  name: `${child.name}_fk`,
+                  columns: [1],
+                  parentTableId: t,
+                  parentIndexId: "primary",
+                  onDelete: child.onDelete,
+                  enforced: true,
+                },
+              ],
+            }),
+          })
+        ).id ?? 0;
+    });
   const vIndex = path.catalog.table(t)?.indexes.find((index) => index.name === "t_v")?.id ?? 0;
-  return { t, c, u: def?.columns[1]?.id ?? 0, v, vIndex };
+  return {
+    t,
+    children: { c: children.c ?? 0, cc: children.cc ?? 0, cn: children.cn ?? 0 },
+    u: def?.columns[1]?.id ?? 0,
+    v,
+    vIndex,
+  };
 }
 
 /**
@@ -476,14 +501,15 @@ async function compare(
   const view = path.pin();
   try {
     const parents = byId(await rowsOf(view, ids.t));
-    const children = byId(await rowsOf(view, ids.c));
     for (const oracle of oracles) {
       expect(parents, `t after ${step} (${oracle.name})`).toEqual(
         await oracleRows(oracle, "t", "id, u, v, s"),
       );
-      expect(children, `c after ${step} (${oracle.name})`).toEqual(
-        await oracleRows(oracle, "c", "id, pid"),
-      );
+      for (const child of CHILDREN)
+        expect(
+          byId(await rowsOf(view, ids.children[child.name])),
+          `${child.name} after ${step} (${oracle.name})`,
+        ).toEqual(await oracleRows(oracle, child.name, "id, pid"));
     }
     // The indexes agree with the rows: the primary key, the UNIQUE column, the secondary index.
     const def = path.catalog.table(ids.t);
@@ -511,14 +537,11 @@ async function compare(
   }
 }
 
-/** Children per parent id, from the write path's own (just compared) rows. */
-async function childCounts(path: WritePathImpl, ids: Ids): Promise<Map<number, number>> {
-  const view = path.pin();
-  const counts = new Map<number, number>();
-  for (const row of await rowsOf(view, ids.c))
-    if (row[1] !== null) counts.set(Number(row[1]), (counts.get(Number(row[1])) ?? 0) + 1);
-  view.release();
-  return counts;
+/** Every table's rows on an oracle, as value arrays ordered by id. */
+async function allRows(oracle: Oracle): Promise<Record<string, Value[][]>> {
+  const rows: Record<string, Value[][]> = { t: await oracleRows(oracle, "t", "id, u, v, s") };
+  for (const child of CHILDREN) rows[child.name] = await oracleRows(oracle, child.name, "id, pid");
+  return rows;
 }
 
 interface Observed {
@@ -536,7 +559,7 @@ async function stepOnCurrent(
   sqls: readonly string[],
   rollback: boolean,
   expected: { readonly outcome: Outcome },
-  rows: { readonly t: Value[][]; readonly c: Value[][] },
+  rows: Readonly<Record<string, Value[][]>>,
 ): Promise<{
   readonly same: boolean;
   readonly outcome: Outcome;
@@ -562,9 +585,11 @@ async function stepOnCurrent(
   let rowsDiffer = false;
   const differingRows: DifferingRow[] = [];
   if (same && outcome === "ok" && !rollback) {
-    const t = await oracleRows(current, "t", "id, u, v, s");
-    const c = await oracleRows(current, "c", "id, pid");
-    differingRows.push(...differing("t", t, rows.t, null), ...differing("c", c, rows.c, 1));
+    const mine = await allRows(current);
+    for (const [table, list] of Object.entries(mine))
+      differingRows.push(...differing(table, list, rows[table] ?? [], table === "t" ? null : 1));
+    for (const [table, list] of Object.entries(rows))
+      if (!(table in mine)) differingRows.push(...differing(table, [], list, null));
     rowsDiffer = differingRows.length > 0;
     same = !rowsDiffer;
   }
@@ -614,6 +639,8 @@ function differing(
 
 describe("write path vs PostgreSQL and the current engine (generated)", () => {
   const observed: Observed[] = [];
+  /** Foreign-key actions the steps asked for: restrict, cascade, setNull, follow (a rekey). */
+  const reach = new Map<string, number>();
   let compared = 0;
   for (const seed of SEEDS)
     it(`seed ${String(seed)}`, async () => {
@@ -644,11 +671,20 @@ describe("write path vs PostgreSQL and the current engine (generated)", () => {
             continue;
           }
           const count = roll < 20 ? 2 + workload.int(2) : 1;
-          const children = await childCounts(path, ids);
-          const ops = Array.from({ length: count }, () => workload.op(parents, children));
+          const ops = Array.from({ length: count }, () => workload.op(parents));
           const rollback = count > 1 && workload.chance(0.3);
           const sqls = ops.map((op) => op.sql);
           const label = `step ${String(step)}: ${sqls.join("; ")}${rollback ? " (rolled back)" : ""}`;
+          // Reach: which foreign-key actions this step asks of the engines.
+          const before = await allRows(pg);
+          for (const op of ops) {
+            if (op.removes === undefined) continue;
+            for (const child of CHILDREN)
+              if ((before[child.name] ?? []).some((row) => row[1] === op.removes)) {
+                const action = op.sql.startsWith("UPDATE") ? "follow" : child.onDelete;
+                reach.set(action, (reach.get(action) ?? 0) + 1);
+              }
+          }
           const expected = await runOn(pg, sqls, rollback);
           const log: StepLog = { moved: [] };
           const actual = await transaction(
@@ -660,10 +696,7 @@ describe("write path vs PostgreSQL and the current engine (generated)", () => {
             expected.outcome,
           );
           outcomes.set(actual, (outcomes.get(actual) ?? 0) + 1);
-          const rows = {
-            t: await oracleRows(pg, "t", "id, u, v, s"),
-            c: await oracleRows(pg, "c", "id, pid"),
-          };
+          const rows = await allRows(pg);
           // The current engine: equal to PostgreSQL, or an intended divergence (R21).
           let result = await stepOnCurrent(current, sqls, rollback, expected, rows);
           if (!result.same) {
@@ -681,7 +714,7 @@ describe("write path vs PostgreSQL and the current engine (generated)", () => {
                 nowMs: clock.ms,
                 primaryKeys: new Map([
                   ["t", "id"],
-                  ["c", "id"],
+                  ...CHILDREN.map((c) => [c.name, "id"] as [string, string]),
                 ]),
                 // id is each table's first column.
                 keyColumns: new Map([
@@ -740,6 +773,9 @@ describe("write path vs PostgreSQL and the current engine (generated)", () => {
     console.info(
       `intended divergences (R21):\n${observed.map((o) => `  ${o.divergence.id} at ${o.step}: ${String(o.current)}`).join("\n")}\ncompared with the current engine: ${String(compared)} steps`,
     );
+    console.info(`foreign-key actions reached: ${JSON.stringify(Object.fromEntries(reach))}`);
+    for (const action of ["restrict", "cascade", "setNull", "follow"])
+      expect(reach.get(action) ?? 0, `reach: ${action}`).toBeGreaterThanOrEqual(10);
     expect(observed.length).toBeGreaterThan(0);
     expect(new Set(observed.map((o) => o.divergence.id))).toEqual(new Set(["key-forwarding"]));
   });
