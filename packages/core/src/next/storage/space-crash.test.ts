@@ -139,8 +139,9 @@ describe("extent space crash sweep", () => {
           checked += 1;
         }
       expect(checked).toBe(steps * SEEDS.length);
-      // The workload reaches dozens of physical steps (fewer for IndexedDB: one log record each).
-      expect(steps).toBeGreaterThan(store === "files" ? 30 : 15);
+      // The workload reaches dozens of physical steps on files; on IndexedDB, batching leaves at
+      // least a commit and a flush per publish (five publishes).
+      expect(steps).toBeGreaterThan(store === "files" ? 30 : 2 * 5 - 1);
     },
   );
 

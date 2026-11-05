@@ -5,9 +5,16 @@
  * browser-tests/next-storage.spec.ts.
  */
 import { describe, expect, it } from "vitest";
-import { OwnershipLostError, type StorageBackend } from "./contract.js";
+import {
+  OwnershipLostError,
+  StoreCorruptionError,
+  type StorageBackend,
+  type StoreSession,
+} from "./contract.js";
+import type { IdbDatabaseLike } from "./idb-like.js";
+import { EXPECTED_IDB_OUTCOMES, runIdbScenarios } from "./idb-scenarios.js";
 import { runStorageKit } from "./kit.js";
-import { createIndexedDbBackend } from "./indexeddb.js";
+import { IDB_BATCH_BYTES, createIndexedDbBackend } from "./indexeddb.js";
 import { SimDisk, SimLocks, SimulatedCrash } from "./sim-disk.js";
 import { simIndexedDb } from "./sim-idb.js";
 
@@ -29,6 +36,7 @@ describe("IndexedDB backend over the simulated IndexedDB", () => {
     const first = await backend.acquire();
     const session = await backend.open(first);
     await session.writeData(0, bytes(100, 1));
+    await session.publish(new Uint8Array([1])); // queued writes reach the store with a barrier
     // A second owner in another tab: its own backend (and Web Lock view) over the same database.
     const other = backendOver(disk, locks);
     const second = await other.acquire({ steal: true });
@@ -141,8 +149,8 @@ describe("simulated IndexedDB", () => {
     wal.current.fill(0, recordLength, 2 * recordLength);
     wal.durable = wal.current;
     disk.powerLoss();
-    await put(2, 22); // the same size as the lost record: it ends where old record 3 begins
-    await simIndexedDb(disk).transaction(["meta"], "readwrite", "strict", () => undefined);
+    // The same size as the lost record: it ends where old record 3 begins. Strict: flushed.
+    await put(2, 22, "strict");
     disk.powerLoss();
     const found: number[] = [];
     await simIndexedDb(disk).transaction(["meta"], "readonly", "relaxed", (tx) => {
@@ -170,5 +178,161 @@ describe("simulated IndexedDB", () => {
       });
     });
     expect(value).toBeUndefined();
+  });
+
+  it("matches IndexedDB's semantics on the pinned scenarios (order, clones, activity, ranges)", async () => {
+    expect(await runIdbScenarios(simIndexedDb(new SimDisk()))).toEqual(EXPECTED_IDB_OUTCOMES);
+  });
+
+  it("does not flush a strict transaction that changed nothing", async () => {
+    const disk = new SimDisk();
+    const db = simIndexedDb(disk);
+    const before = disk.steps;
+    await db.transaction(["meta"], "readwrite", "strict", (tx) => {
+      tx.store("meta").get("nothing", () => undefined);
+    });
+    expect(disk.steps).toBe(before);
+  });
+});
+
+/** Each finding of review B1-p2c, kept as tests. */
+describe("review B1-p2c: IndexedDB epochs, fencing, batching and empty ranges", () => {
+  const setEpoch = (disk: SimDisk, value: unknown) =>
+    simIndexedDb(disk).transaction(["meta"], "readwrite", "strict", (tx) => {
+      tx.store("meta").put("epoch", value);
+    });
+
+  it("1: a missing epoch starts at 1; malformed, unsafe or exhausted ones refuse ownership", async () => {
+    expect((await backendOver(new SimDisk()).acquire()).epoch).toBe(1);
+    for (const value of [Number.MAX_SAFE_INTEGER, 2 ** 53, "7", -1, 0, 1.5, Number.NaN, null]) {
+      const disk = new SimDisk();
+      await setEpoch(disk, value);
+      await expect(backendOver(disk).acquire({ timeoutMs: 200 }), String(value)).rejects.toThrow(
+        StoreCorruptionError,
+      );
+    }
+  });
+
+  it("1: refuses an unaware stale owner on every mutation path", async () => {
+    type Path = (
+      session: StoreSession,
+      backend: StorageBackend,
+      lease: Awaited<ReturnType<StorageBackend["acquire"]>>,
+    ) => Promise<unknown>;
+    const barrier = (session: StoreSession) => session.flushLog();
+    const paths: Record<string, Path> = {
+      publish: (session) => session.publish(new Uint8Array([9])),
+      "writeData then a barrier": async (session) => {
+        await session.writeData(0, bytes(10, 9));
+        await barrier(session);
+      },
+      "appendLog then a barrier": async (session) => {
+        await session.appendLog(new Uint8Array([9]));
+        await barrier(session);
+      },
+      "writeLogHeader then a barrier": async (session) => {
+        await session.writeLogHeader(0, new Uint8Array([9]));
+        await barrier(session);
+      },
+      flushLog: (session) => session.flushLog(),
+      releaseData: (session) => session.releaseData([{ offset: 0, length: 4096 }]),
+      truncateLog: (session) => session.truncateLog(0),
+      resetLog: (session) => session.resetLog(),
+      "scratch write": (_session, backend, lease) =>
+        backend.scratch(lease)?.write(0, bytes(10, 9)) ?? Promise.resolve(),
+      "scratch release": (_session, backend, lease) =>
+        backend.scratch(lease)?.release([{ offset: 0, length: 4096 }]) ?? Promise.resolve(),
+      "scratch truncate": (_session, backend, lease) =>
+        backend.scratch(lease)?.truncate(0) ?? Promise.resolve(),
+    };
+    for (const [name, path] of Object.entries(paths)) {
+      const disk = new SimDisk();
+      // Separate lock managers: the stale owner never hears that its lock is gone.
+      const staleBackend = backendOver(disk, new SimLocks());
+      const staleLease = await staleBackend.acquire();
+      const stale = await staleBackend.open(staleLease);
+      await stale.writeData(0, bytes(100, 1));
+      await stale.appendLog(new Uint8Array([1, 2]));
+      await stale.publish(new Uint8Array([1]));
+      await stale.flushLog();
+      const ownerBackend = backendOver(disk, new SimLocks());
+      const owner = await ownerBackend.open(await ownerBackend.acquire());
+      await expect(path(stale, staleBackend, staleLease), name).rejects.toThrow(OwnershipLostError);
+      expect(await owner.readRoot(), name).toEqual(new Uint8Array([1]));
+      expect((await owner.readData([{ offset: 0, length: 100 }]))[0], name).toEqual(bytes(100, 1));
+      expect(await owner.readLog(0, 2), name).toEqual(new Uint8Array([1, 2]));
+    }
+  });
+
+  it("6: commits a burst of writes in one transaction, bounds a batch, and keeps call order", async () => {
+    const disk = new SimDisk();
+    let writes = 0;
+    const counted = (): IdbDatabaseLike => {
+      const inner = simIndexedDb(disk);
+      return {
+        transaction: (names, mode, durability, body) => {
+          if (mode === "readwrite") writes += 1;
+          return inner.transaction(names, mode, durability, body);
+        },
+        close: () => undefined,
+      };
+    };
+    const backend = createIndexedDbBackend({
+      database: counted,
+      name: "db",
+      locks: new SimLocks(),
+    });
+    const session = await backend.open(await backend.acquire());
+    writes = 0;
+    const image = new Uint8Array(64 * 4096);
+    for (let index = 0; index < 100; index++) {
+      const offset = (index % 50) * 4096;
+      const data = bytes(3000 + index, index);
+      await session.writeData(offset, data);
+      image.set(data, offset);
+      await session.appendLog(new Uint8Array([index]));
+    }
+    await session.flushLog();
+    expect(writes).toBe(1); // 200 queued writes and the barrier: one strict transaction
+    const length = await session.dataLength();
+    const [read] = await session.readData([{ offset: 0, length }]);
+    expect(read).toEqual(image.subarray(0, length));
+    expect(await session.readLog(0, 100)).toEqual(Uint8Array.from({ length: 100 }, (_, i) => i));
+    writes = 0;
+    for (let index = 0; index < 6; index++)
+      await session.writeData(index << 20, bytes(1 << 20, index));
+    expect(writes).toBeGreaterThanOrEqual(1); // the 4 MiB bound committed without a barrier
+    expect(IDB_BATCH_BYTES).toBe(4 << 20);
+  });
+
+  it("4: flushLog makes appends durable even when their batch already committed (the flush marker)", async () => {
+    for (let seed = 1; seed <= 24; seed++) {
+      const disk = new SimDisk({ seed });
+      const backend = backendOver(disk);
+      const session = await backend.open(await backend.acquire());
+      await session.appendLog(new Uint8Array([1, 2, 3]));
+      // Let the queued append commit on its own (relaxed: written, not flushed).
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await session.flushLog();
+      disk.powerLoss();
+      const reopened = backendOver(disk);
+      const after = await reopened.open(await reopened.acquire());
+      expect(after.logLength(), `seed ${String(seed)}`).toBeGreaterThanOrEqual(3);
+    }
+  });
+
+  it("5: empty ranges never reach IndexedDB (the real one refuses them)", async () => {
+    const backend = backendOver(new SimDisk());
+    const session = await backend.open(await backend.acquire());
+    await session.writeData(0, new Uint8Array(0));
+    await session.writeData(4096, bytes(10, 1));
+    await session.releaseData([{ offset: 0, length: 0 }]);
+    expect((await session.readData([{ offset: 4096, length: 0 }]))[0]).toEqual(new Uint8Array(0));
+    expect(await session.readLog(0, 0)).toEqual(new Uint8Array(0));
+    await session.appendLog(new Uint8Array(0));
+    await session.truncateLog(session.logLength());
+    await session.publish(new Uint8Array([1]));
+    const scratch = backend.scratch(await backend.acquire({ steal: true }));
+    void scratch;
   });
 });

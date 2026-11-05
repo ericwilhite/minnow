@@ -11,6 +11,9 @@ import { createOpfsBackend, webLocks, type OpfsDirectoryLike } from "../src/next
 import { openIndexedDb } from "../src/next/storage/idb-like.js";
 import { createIndexedDbBackend } from "../src/next/storage/indexeddb.js";
 import { chooseBackend } from "../src/next/storage/select.js";
+import { runIdbScenarios } from "../src/next/storage/idb-scenarios.js";
+import { SimDisk } from "../src/next/storage/sim-disk.js";
+import { simIndexedDb } from "../src/next/storage/sim-idb.js";
 import { openExtentSpace } from "../src/next/storage/space.js";
 import {
   bytesOf,
@@ -25,7 +28,9 @@ export type StoreKind = "opfs" | "indexeddb";
 
 export type NextStorageRequest = { readonly store?: StoreKind } & (
   | { readonly op: "conformance"; readonly prefix: string }
-  | { readonly op: "choose" }
+  | { readonly op: "choose"; readonly name?: string }
+  | { readonly op: "idb-scenarios" }
+  | { readonly op: "bench-idb"; readonly dir: string; readonly batching: boolean }
   | { readonly op: "publish-loop"; readonly dir: string; readonly rounds: number }
   | { readonly op: "verify"; readonly dir: string; readonly minAcked: number }
   | { readonly op: "hold"; readonly dir: string }
@@ -144,8 +149,67 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
   store = request.store ?? "opfs";
   switch (request.op) {
     case "choose": {
-      const chosen = await chooseBackend(`choose-${String(Date.now())}`);
-      return { kind: chosen.kind, opfsRefused: chosen.opfsRefused };
+      try {
+        const chosen = await chooseBackend(request.name ?? `choose-${String(Date.now())}`);
+        return { kind: chosen.kind, opfsRefused: chosen.opfsRefused, error: null };
+      } catch (error) {
+        const failure = error as Error & { store?: string; location?: string };
+        return {
+          kind: null,
+          opfsRefused: null,
+          error: { name: failure.name, store: failure.store, location: failure.location },
+        };
+      }
+    }
+    case "idb-scenarios": {
+      // The same scenarios on the platform's IndexedDB and on the simulator: they must agree.
+      const name = `next-test:scenarios-${String(Date.now())}-${String(Math.random()).slice(2, 8)}`;
+      const real = await openIndexedDb(indexedDB, name);
+      try {
+        return {
+          real: await runIdbScenarios(real),
+          simulated: await runIdbScenarios(simIndexedDb(new SimDisk())),
+        };
+      } finally {
+        real.close();
+        indexedDB.deleteDatabase(name);
+      }
+    }
+    case "bench-idb": {
+      const backend = createIndexedDbBackend({
+        database: () => openIndexedDb(indexedDB, `next-test:${request.dir}`),
+        name: `next-test:${request.dir}`,
+        locks,
+        batching: request.batching,
+      });
+      const lease = await backend.acquire();
+      const session = await backend.open(lease);
+      const space = await openExtentSpace(session, {
+        reachable: jsonReachable,
+        budget: countingBudget(Infinity),
+        registerCache: () => countingMemory(Infinity),
+      });
+      // Bulk: 16 MiB as 32 KiB pages through 16 interleaved builders, then one publish.
+      let start = performance.now();
+      const writer = space.beginWrite("bench", { budget: countingBudget(Infinity) });
+      const builders = Array.from({ length: 16 }, () => writer.open(1 << 20));
+      const page = bytesOf(32_768, 3);
+      for (let index = 0; index < 32; index++)
+        for (const builder of builders) await builder.append([page]);
+      const blobs: BlobRef[] = [];
+      for (const builder of builders) blobs.push(...((await builder.seal())?.blobs ?? []));
+      await space.publish(encodeRoot({ round: 1, blobs }), { writers: [writer], retired: [] });
+      const bulkMs = performance.now() - start;
+      // Commits: 100 groups of 4 small log appends and one flush.
+      start = performance.now();
+      for (let group = 0; group < 100; group++) {
+        for (let frame = 0; frame < 4; frame++) await session.appendLog(bytesOf(200, frame));
+        await session.flushLog();
+      }
+      const commitMs = performance.now() - start;
+      await space.close();
+      await lease.release();
+      return { bulkMs, commitMs };
     }
     case "conformance": {
       const results: Array<{ name: string; error: string | null }> = [];

@@ -2,6 +2,8 @@
  * Page side of the rebuild core's storage browser suite (browser-tests/next-storage.spec.ts):
  * spawns next-storage-worker.ts workers, kills them mid-publish, and verifies from fresh ones.
  */
+import { column, schema, table } from "@minnowdb/core";
+import { MinnowDatabaseClient } from "@minnowdb/core/client";
 import type { NextStorageRequest, PublishPhase, StoreKind } from "./next-storage-worker.js";
 
 /** The backend every following scenario runs on (OPFS unless a test picks IndexedDB). */
@@ -81,7 +83,7 @@ async function spawn(): Promise<StorageWorker> {
     const id = next++;
     return new Promise<T>((resolve, reject) => {
       pending.set(id, { resolve: resolve, reject });
-      worker.postMessage({ id, request: { ...request, store } });
+      worker.postMessage({ id, request: { store, ...request } });
     });
   };
   return {
@@ -316,7 +318,52 @@ export async function runBuilderBench(
   }
 }
 
-/** What `chooseBackend` picks in a dedicated worker of this page. */
-export async function runChoose(): Promise<{ kind: string; opfsRefused: string | null }> {
-  return withWorker((worker) => worker.call({ op: "choose" }));
+export interface ChooseResult {
+  readonly kind: string | null;
+  readonly opfsRefused: string | null;
+  readonly error: { name: string; store?: string; location?: string } | null;
+}
+
+/** What `chooseBackend` picks in a dedicated worker of this page (for `name`, or a fresh one). */
+export async function runChoose(name?: string): Promise<ChooseResult> {
+  return withWorker((worker) =>
+    worker.call({ op: "choose", ...(name === undefined ? {} : { name }) }),
+  );
+}
+
+/** The IndexedDB scenarios on the platform's IndexedDB and on the simulator. */
+export async function runIdbDifferential(): Promise<{ real: unknown; simulated: unknown }> {
+  return withWorker((worker) => worker.call({ op: "idb-scenarios" }));
+}
+
+/**
+ * The pre-reset engine creates a database (in OPFS or IndexedDB) and writes a row; then
+ * `chooseBackend` for the same name must refuse with `LegacyDataError` and create nothing.
+ */
+export async function runLegacyDetection(kind: "opfs" | "indexeddb"): Promise<ChooseResult> {
+  const name = `legacy-${kind}-${crypto.randomUUID()}`;
+  const store =
+    kind === "indexeddb" ? { kind: "indexeddb" as const, name } : { kind: "opfs" as const, name };
+  const client = new MinnowDatabaseClient(
+    new Worker(new URL("./published-worker.ts", import.meta.url), { type: "module" }),
+    { store },
+  );
+  await client.migrate(schema([table("notes", { id: column.integer().unique() })]));
+  await client.execute("INSERT INTO notes VALUES (1)");
+  await client.close({ terminateWorker: true });
+  return runChoose(name);
+}
+
+/** The IndexedDB backend's bulk write and small-commit costs, with and without batching. */
+export async function runIdbBench(
+  batching: boolean,
+): Promise<{ bulkMs: number; commitMs: number }> {
+  const dir = unique("idb-bench");
+  try {
+    return await withWorker((worker) =>
+      worker.call({ op: "bench-idb", dir, batching, store: "indexeddb" }),
+    );
+  } finally {
+    await withWorker((worker) => worker.call({ op: "remove", dir, store: "indexeddb" }));
+  }
 }

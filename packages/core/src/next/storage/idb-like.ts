@@ -9,7 +9,14 @@
  * - Read-write transactions whose scopes overlap run one at a time, in creation order.
  * - `strict` durability: when the transaction completes, it and every transaction committed before
  *   it are durable. `relaxed`: durable at the next strict commit (one write-ahead log per origin
- *   database: Chromium's LevelDB, Firefox's and WebKit's SQLite).
+ *   database: Chromium's LevelDB, Firefox's and WebKit's SQLite). A transaction that changed
+ *   nothing need not flush, so callers that need a barrier write something.
+ * - Requests execute in the order they are issued; a read sees every earlier request of its
+ *   transaction and none after. Values cross a structured-clone boundary at `put` and at every
+ *   read. A request issued while the transaction is not active (outside its body and its
+ *   callbacks, or after it finished) throws `TransactionInactiveError`; an empty key range throws
+ *   `DataError`; a write in a read-only transaction throws `ReadOnlyError`. `idb-scenarios.ts` pins
+ *   these, and the browser suite checks the simulator against the platform on them.
  * - An exception in a callback, or `abort(reason)`, aborts the transaction: nothing it did
  *   applies, and the promise rejects with the reason. A quota failure rejects with
  *   `StoreQuotaError`.

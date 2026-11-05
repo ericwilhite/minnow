@@ -20,11 +20,19 @@
  *   record before it and the records inside it, and reads gaps as zeros. Freed space is deleted
  *   (`releaseData`), which returns it to the platform: unlike OPFS, IndexedDB does give quota back.
  *
- * ## Durability
- * Writes commit `relaxed`; `publish`, `flushLog`, `truncateLog` and `resetLog` commit `strict`.
- * The platforms keep one write-ahead log per database and commit in order, so a strict commit
- * makes every earlier commit durable too (idb-like.ts). Each call is one transaction, and
- * read-write transactions all include `meta`, so they run in call order.
+ * ## Durability and batching
+ * Relaxed writes are queued and committed together, in call order (`IdbSession`); `publish` and
+ * `flushLog` commit the queue and themselves in one strict transaction, and a strict
+ * transaction always writes something (`flushLog` its marker), since an engine need not flush one
+ * that changed nothing. `releaseData`, `truncateLog` and `resetLog` commit the queue, then run
+ * alone. The platforms keep one write-ahead log per database and commit in order, so a strict
+ * commit makes every earlier commit durable too (idb-like.ts). Read-write transactions all
+ * include `meta`, so they run in call order.
+ *
+ * ## Epoch record
+ * Missing means a new store (epoch 1). A record that is not a safe positive integer, or one that
+ * cannot be incremented, refuses ownership with `StoreCorruptionError`: two owners must never
+ * share an epoch.
  */
 import {
   LOG_HEADER_SLOT_BYTES,
@@ -48,6 +56,8 @@ export interface IndexedDbBackendOptions {
   /** The database name; the lock is `minnow:<name>`. */
   readonly name: string;
   readonly locks: LockManagerLike;
+  /** Queue relaxed writes into batches (the default); false commits each alone (benchmarks). */
+  readonly batching?: boolean;
 }
 
 const record = (offset: number, bytes: ArrayBuffer): ByteRecord => ({ offset, bytes });
@@ -60,6 +70,11 @@ const exact = (bytes: Uint8Array): ArrayBuffer => bytes.slice().buffer;
  * calls `then`. Loads at most the two straddling records, never the records inside.
  */
 function clearRange(store: IdbStoreLike, start: number, end: number, then: () => void): void {
+  // An empty range clears nothing (and IndexedDB refuses an empty key range: DataError).
+  if (end <= start) {
+    then();
+    return;
+  }
   store.last({ upper: start, upperOpen: true }, (value) => {
     const before = value as ByteRecord | undefined;
     if (before !== undefined) {
@@ -177,6 +192,23 @@ class IdbLease implements OwnerLease {
   }
 }
 
+/** One queued relaxed write: issues its requests, then calls `next` (so writes keep their order). */
+type QueuedWrite = (tx: IdbTransactionLike, next: () => void) => void;
+
+/** A batch of relaxed writes is committed once it holds this many bytes or operations. */
+export const IDB_BATCH_BYTES = 4 * 1024 * 1024;
+export const IDB_BATCH_OPERATIONS = 256;
+
+/**
+ * The session. Relaxed writes (`writeData`, `appendLog`, `writeLogHeader`) are queued and committed
+ * together, in call order, in one transaction (review B1-p2c finding 6): at the next macrotask,
+ * when the batch reaches `IDB_BATCH_BYTES` or `IDB_BATCH_OPERATIONS` (then the call waits for it:
+ * backpressure), before any read, and inside the same transaction as a barrier (`publish`,
+ * `flushLog`), so a barrier commits everything queued before it, atomically and in order. A
+ * queued write's failure (quota, a moved epoch) fails the session: every later call rejects with
+ * it, and nothing of the batch applied. Releases, truncation and reset flush the queue, then run
+ * alone. The queue holds copies (at most one batch, ≤ 4 MiB, plus the batch in flight).
+ */
 class IdbSession implements StoreSession {
   readonly epoch: number;
   readonly #lease: IdbLease;
@@ -184,22 +216,100 @@ class IdbSession implements StoreSession {
   #dataLength: number;
   #logLength: number;
   #closed = false;
+  #queue: QueuedWrite[] = [];
+  #queuedStores = new Set<string>();
+  #queuedBytes = 0;
+  #scheduled = false;
+  /** Every commit runs after the previous one (call order). */
+  #committing: Promise<void> = Promise.resolve();
+  #failure: Error | null = null;
 
-  constructor(lease: IdbLease, dataLength: number, logLength: number) {
+  readonly #batching: boolean;
+
+  constructor(lease: IdbLease, dataLength: number, logLength: number, batching: boolean) {
     this.#lease = lease;
     this.#database = lease.database;
     this.epoch = lease.epoch;
     this.#dataLength = dataLength;
     this.#logLength = logLength;
+    this.#batching = batching;
   }
 
   #live(): void {
     if (this.#closed) throw new StoreClosedError();
   }
 
-  #read(stores: readonly string[], body: (tx: IdbTransactionLike) => void): Promise<void> {
+  /** Mutations also refuse once a batch failed (reads go on: the extent space still reads). */
+  #mutable(): void {
     this.#live();
-    return this.#database.transaction(stores, "readonly", "relaxed", body);
+    if (this.#failure !== null) throw this.#failure;
+  }
+
+  /** Queues a relaxed write; waits only when the batch is full. */
+  async #enqueue(stores: readonly string[], bytes: number, write: QueuedWrite): Promise<void> {
+    this.#mutable();
+    this.#lease.guard();
+    this.#queue.push(write);
+    for (const store of stores) this.#queuedStores.add(store);
+    this.#queuedBytes += bytes;
+    if (
+      !this.#batching ||
+      this.#queuedBytes >= IDB_BATCH_BYTES ||
+      this.#queue.length >= IDB_BATCH_OPERATIONS
+    ) {
+      await this.#commit();
+      return;
+    }
+    if (!this.#scheduled) {
+      this.#scheduled = true;
+      setTimeout(() => {
+        this.#scheduled = false;
+        this.#commit().catch(() => undefined);
+      }, 0);
+    }
+  }
+
+  /**
+   * Commits everything queued, with `barrier` (a strict write) last in the same transaction when
+   * given. Resolves when that transaction completes.
+   */
+  #commit(
+    barrier: { readonly stores: readonly string[]; readonly write: QueuedWrite } | null = null,
+  ): Promise<void> {
+    const writes = this.#queue;
+    const stores = [...this.#queuedStores, ...(barrier?.stores ?? [])];
+    this.#queue = [];
+    this.#queuedStores = new Set();
+    this.#queuedBytes = 0;
+    const all = barrier === null ? writes : [...writes, barrier.write];
+    const run = this.#committing.then(async () => {
+      if (this.#failure !== null) throw this.#failure;
+      if (all.length === 0) return;
+      try {
+        await this.#lease.write(stores, barrier === null ? "relaxed" : "strict", (tx) => {
+          const next = (index: number) => {
+            const write = all[index];
+            if (write !== undefined)
+              write(tx, () => {
+                next(index + 1);
+              });
+          };
+          next(0);
+        });
+      } catch (error) {
+        this.#failure ??= error instanceof Error ? error : new Error(String(error));
+        throw this.#failure;
+      }
+    });
+    this.#committing = run.catch(() => undefined);
+    return run;
+  }
+
+  /** A read: everything queued is committed first, so it sees every earlier write. */
+  async #read(stores: readonly string[], body: (tx: IdbTransactionLike) => void): Promise<void> {
+    this.#live();
+    if (this.#failure === null) await this.#commit();
+    await this.#database.transaction(stores, "readonly", "relaxed", body);
   }
 
   async #slots(): Promise<ReturnType<typeof chooseRoot>> {
@@ -208,9 +318,7 @@ class IdbSession implements StoreSession {
       const roots = tx.store("roots");
       roots.get("slot-0", (first) => {
         roots.get("slot-1", (second) => {
-          const bytes = (value: unknown) =>
-            value instanceof ArrayBuffer ? new Uint8Array(value) : null;
-          slots = [bytes(first), bytes(second)];
+          slots = [slotBytes(first), slotBytes(second)];
         });
       });
     });
@@ -225,33 +333,40 @@ class IdbSession implements StoreSession {
     return (await this.#slots()).previous?.root ?? null;
   }
 
+  /** Guarantee 1: every queued write, then the root, in one strict transaction. */
   async publish(root: Uint8Array): Promise<void> {
-    this.#live();
-    await this.#lease.write(["roots"], "strict", (tx) => {
-      const roots = tx.store("roots");
-      roots.get("slot-0", (first) => {
-        roots.get("slot-1", (second) => {
-          const bytes = (value: unknown) =>
-            value instanceof ArrayBuffer ? new Uint8Array(value) : null;
-          const { nextSlot, nextSequence } = chooseRoot(bytes(first), bytes(second));
-          roots.put(`slot-${String(nextSlot)}`, encodeRootSlot(nextSequence, root).buffer);
+    this.#mutable();
+    this.#lease.guard();
+    const copy = root.slice();
+    await this.#commit({
+      stores: ["roots"],
+      write: (tx, next) => {
+        const roots = tx.store("roots");
+        roots.get("slot-0", (first) => {
+          roots.get("slot-1", (second) => {
+            const { nextSlot, nextSequence } = chooseRoot(slotBytes(first), slotBytes(second));
+            roots.put(`slot-${String(nextSlot)}`, encodeRootSlot(nextSequence, copy).buffer);
+            next();
+          });
         });
-      });
+      },
     });
   }
 
   async writeData(offset: number, bytes: Uint8Array): Promise<void> {
-    this.#live();
+    this.#mutable();
     if (offset % 4096 !== 0 || offset < 0) throw new RangeError("Unaligned data extent");
+    if (bytes.length === 0) return;
     const end = offset + bytes.length;
     const copy = exact(bytes);
-    await this.#lease.write(["data"], "relaxed", (tx) => {
+    this.#dataLength = Math.max(this.#dataLength, end);
+    await this.#enqueue(["data"], bytes.length, (tx, next) => {
       const data = tx.store("data");
       clearRange(data, offset, end, () => {
         data.put(offset, record(offset, copy));
+        next();
       });
     });
-    this.#dataLength = Math.max(this.#dataLength, end);
   }
 
   #checkData(offset: number, length: number): void {
@@ -281,7 +396,8 @@ class IdbSession implements StoreSession {
   }
 
   async releaseData(ranges: readonly DataRange[]): Promise<void> {
-    this.#live();
+    this.#mutable();
+    await this.#commit();
     let length = this.#dataLength;
     await this.#lease.write(["data"], "relaxed", (tx) => {
       const data = tx.store("data");
@@ -317,6 +433,7 @@ class IdbSession implements StoreSession {
     if (offset < 0 || length < 0 || offset + length > this.#logLength)
       throw new StoreCorruptionError("Read outside the log");
     const target = new Uint8Array(length);
+    if (length === 0) return target;
     await this.#read(["log"], (tx) => {
       readRange(tx.store("log"), offset, target, () => undefined);
     });
@@ -329,9 +446,7 @@ class IdbSession implements StoreSession {
       const meta = tx.store("meta");
       meta.get("header-0", (first) => {
         meta.get("header-1", (second) => {
-          const bytes = (value: unknown) =>
-            value instanceof ArrayBuffer ? new Uint8Array(value) : null;
-          headers = [bytes(first), bytes(second)];
+          headers = [slotBytes(first), slotBytes(second)];
         });
       });
     });
@@ -339,42 +454,47 @@ class IdbSession implements StoreSession {
   }
 
   async appendLog(bytes: Uint8Array): Promise<number> {
-    this.#live();
+    this.#mutable();
     const offset = this.#logLength;
+    if (bytes.length === 0) return offset;
     this.#logLength += bytes.length;
     const copy = exact(bytes);
-    try {
-      await this.#lease.write(["log"], "relaxed", (tx) => {
-        tx.store("log").put(offset, record(offset, copy));
-      });
-    } catch (error) {
-      if (this.#logLength === offset + bytes.length) this.#logLength = offset;
-      throw error;
-    }
+    await this.#enqueue(["log"], bytes.length, (tx, next) => {
+      tx.store("log").put(offset, record(offset, copy));
+      next();
+    });
     return offset;
   }
 
   async writeLogHeader(slot: 0 | 1, bytes: Uint8Array): Promise<void> {
-    this.#live();
+    this.#mutable();
     if (bytes.length > LOG_HEADER_SLOT_BYTES) throw new RangeError("Log header slot overflow");
     const padded = new Uint8Array(LOG_HEADER_SLOT_BYTES);
     padded.set(bytes);
-    await this.#lease.write(["meta"], "relaxed", (tx) => {
+    await this.#enqueue(["meta"], LOG_HEADER_SLOT_BYTES, (tx, next) => {
       tx.store("meta").put(`header-${String(slot)}`, padded.buffer);
+      next();
     });
   }
 
+  /** Guarantee 3: every queued write, then a flush marker, in one strict transaction. */
   async flushLog(): Promise<void> {
-    this.#live();
+    this.#mutable();
+    this.#lease.guard();
     const length = this.#logLength;
-    await this.#lease.write(["meta"], "strict", (tx) => {
-      tx.store("meta").put("flush", length);
+    await this.#commit({
+      stores: ["meta"],
+      write: (tx, next) => {
+        tx.store("meta").put("flush", length);
+        next();
+      },
     });
   }
 
   async truncateLog(length: number): Promise<void> {
-    this.#live();
+    this.#mutable();
     if (length < 0 || length > this.#logLength) throw new RangeError("Truncate outside the log");
+    await this.#commit();
     await this.#lease.write(["log"], "strict", (tx) => {
       clearRange(tx.store("log"), length, Infinity, () => undefined);
     });
@@ -382,7 +502,8 @@ class IdbSession implements StoreSession {
   }
 
   async resetLog(): Promise<void> {
-    this.#live();
+    this.#mutable();
+    await this.#commit();
     await this.#lease.write(["log"], "strict", (tx) => {
       tx.store("log").clear();
       tx.store("meta").delete("header-0");
@@ -392,9 +513,13 @@ class IdbSession implements StoreSession {
   }
 
   async close(): Promise<void> {
+    if (this.#closed) return;
+    await this.#commit().catch(() => undefined);
     this.#closed = true;
   }
 }
+
+const slotBytes = (value: unknown) => (value instanceof ArrayBuffer ? new Uint8Array(value) : null);
 
 /** The spill store under the epoch fence: records in `spill`, relaxed, never recovered. */
 class IdbScratch implements ScratchSpace {
@@ -475,7 +600,17 @@ export function createIndexedDbBackend(options: IndexedDbBackendOptions): Storag
           await db.transaction(["meta"], "readwrite", "strict", (tx) => {
             const meta = tx.store("meta");
             meta.get("epoch", (stored) => {
-              epoch = (typeof stored === "number" ? stored : 0) + 1;
+              // Missing: a new store. Anything else must be a counter that can still increase
+              // (review B1-p2c finding 1): a malformed or exhausted one would let two owners share
+              // an epoch, so ownership is refused instead.
+              if (stored === undefined) epoch = 1;
+              else if (typeof stored !== "number" || !Number.isSafeInteger(stored) || stored < 1) {
+                tx.abort(new StoreCorruptionError("The epoch record is malformed"));
+                return;
+              } else if (!Number.isSafeInteger(stored + 1)) {
+                tx.abort(new StoreCorruptionError("The epoch counter is exhausted"));
+                return;
+              } else epoch = stored + 1;
               meta.put("epoch", epoch);
             });
           });
@@ -501,7 +636,7 @@ export function createIndexedDbBackend(options: IndexedDbBackendOptions): Storag
           logLength = length;
         });
       });
-      return new IdbSession(owned, dataLength, logLength);
+      return new IdbSession(owned, dataLength, logLength, options.batching ?? true);
     },
     scratch(lease: OwnerLease): ScratchSpace {
       return new IdbScratch(own(lease));

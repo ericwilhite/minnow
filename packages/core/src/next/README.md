@@ -159,14 +159,21 @@ is access's `Snapshot`.
 - **The IndexedDB backend** (`indexeddb.ts` over `idb-like.ts`) is the same contract where OPFS is
   absent: the Web Lock plus a durable epoch read inside every read-write transaction (a stale
   owner that never heard of its lock loss, as after Safari's bfcache, changes nothing); byte
-  records keyed by offset, kept disjoint, ArrayBuffers only; relaxed writes, strict publish and
-  log flush; the spill store. `sim-idb.ts` simulates IndexedDB as a checksum-chained write-ahead
-  log on the simulated disk, so the IndexedDB backend passes the same storage kit and extent-space
-  crash sweep as the files. The browser suite runs it on the persistent profile and in Firefox
+  records keyed by offset, kept disjoint, ArrayBuffers only; relaxed writes batched in call order
+  and committed with each barrier (publish, log flush) in one strict transaction; a malformed or
+  exhausted epoch refuses ownership; the spill store. `sim-idb.ts` simulates IndexedDB as a
+  checksum-chained write-ahead log on the simulated disk with IndexedDB's request order, activity
+  and clone rules, so the IndexedDB backend passes the same storage kit and extent-space crash
+  sweep as the files; the browser suite checks the simulator against real IndexedDB on pinned
+  scenarios (`idb-scenarios.ts`) and runs the backend on the persistent profile and in Firefox
   private browsing and a WebKit ephemeral session.
 - `select.ts` (`chooseBackend`) picks OPFS where a dedicated worker can open sync handles, else
-  IndexedDB (reporting OPFS's refusal), else memory (Safari Lockdown Mode). Layout `minnow-core/`
-  and `minnow-core:<name>`, apart from the pre-reset engine's names.
+  IndexedDB only on the private modes' refusals (`SecurityError`, `UnknownError`,
+  `NotSupportedError`; other errors propagate), else memory (Safari Lockdown Mode). Before
+  creating anything it refuses the pre-reset engine's data (`minnowdb/<name>` in OPFS, or an
+  IndexedDB database of the old engine's stores under the bare name) with `LegacyDataError`, and
+  refuses to open OPFS over this name's IndexedDB store (`StoreConflictError`). Layout
+  `minnow-core/` and `minnow-core:<name>`.
 - A writer that interleaves many builders (the page format's group writer) passes a `budget` to
   `beginWrite`: each builder stages up to 256 KiB of its own. Without it, alternating page-by-page
   appends cost one platform write per page (measured 2–9× a flush on Chromium and Firefox).

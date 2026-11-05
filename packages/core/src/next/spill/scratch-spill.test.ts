@@ -41,7 +41,9 @@ async function scratchOver(disk = new SimDisk()) {
 
 describe("scratch spill service", () => {
   it("batches pages, serves reads from the batch and from the scratch space, and frees on close", async () => {
-    const { scratch, disk } = await scratchOver();
+    // An in-memory file: the simulated disk copies its whole image on every write.
+    const file_ = new MemoryFile({ bytes: new Uint8Array(0), size: 0, holder: null });
+    const scratch = new FileScratch(file_, () => undefined);
     const service = new ScratchSpillService(scratch);
     const charge = budget(1 << 20);
     const file = await service.create(1, charge);
@@ -50,7 +52,7 @@ describe("scratch spill service", () => {
     for (let index = 0; index < 40; index++) refs.push(await file.append(page(20_000, index)));
     // 40 × 20 KB crossed the 256 KiB batch several times; every page reads back.
     for (const [index, ref] of refs.entries())
-      expect(await file.read(ref)).toEqual(page(20_000, index));
+      expect(same(await file.read(ref), page(20_000, index)), `page ${String(index)}`).toBe(true);
     const target = new Uint8Array(20_000);
     const last = refs.at(-1);
     if (last === undefined) throw new Error("no refs");
@@ -59,7 +61,7 @@ describe("scratch spill service", () => {
     // Batches are written as consecutive extents: a run reads back sequentially.
     const offsets = refs.map((ref) => ref.offset);
     expect(offsets).toEqual([...offsets].sort((a, b) => a - b));
-    expect((disk.files.get("spill")?.current.length ?? 0) > 0).toBe(true);
+    expect(file_.getSize()).toBeGreaterThan(0);
     await file.close();
     await file.close();
     expect(charge.used).toBe(0);
@@ -70,7 +72,10 @@ describe("scratch spill service", () => {
   });
 
   it("writes each page directly when the budget refuses the batch, and oversized pages alone", async () => {
-    const { scratch } = await scratchOver();
+    const scratch = new FileScratch(
+      new MemoryFile({ bytes: new Uint8Array(0), size: 0, holder: null }),
+      () => undefined,
+    );
     const service = new ScratchSpillService(scratch);
     const refused = budget(0);
     const file = await service.create(1, refused);

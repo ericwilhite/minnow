@@ -7,6 +7,7 @@
  * absent (Firefox private browsing, a WebKit ephemeral session as in Safari private browsing).
  */
 import { chromium, expect, firefox, webkit, type Page } from "@playwright/test";
+import { EXPECTED_IDB_OUTCOMES } from "../src/next/storage/idb-scenarios.js";
 import { requireWorkerOpfs, test } from "./fixtures.js";
 
 type Run = typeof import("../browser/next-storage-run.js");
@@ -183,11 +184,58 @@ test.describe("rebuild core storage on IndexedDB", () => {
       expect(chosen).toEqual({
         kind: "indexeddb",
         opfsRefused: browserName === "firefox" ? "SecurityError" : "UnknownError",
+        error: null,
       });
       expectIndexedDbScenarios(await indexedDbScenarios(page, 6));
     } finally {
       await browser.close();
     }
+  });
+
+  test("the IndexedDB abstraction: the simulator answers exactly as the platform", async ({
+    page,
+  }) => {
+    await page.goto("/packages/core/browser/");
+    const result = await page.evaluate(async (url) => {
+      return ((await import(url)) as Run).runIdbDifferential();
+    }, RUN);
+    expect(result.real).toEqual(EXPECTED_IDB_OUTCOMES);
+    expect(result.simulated).toEqual(result.real);
+  });
+
+  test("refuses the pre-reset engine's data, in OPFS and IndexedDB", async ({ page }) => {
+    test.setTimeout(120_000);
+    await page.goto("/packages/core/browser/");
+    await requireWorkerOpfs(page);
+    for (const kind of ["opfs", "indexeddb"] as const) {
+      const result = await page.evaluate(
+        async ([url, store]) => {
+          return ((await import(url)) as Run).runLegacyDetection(store);
+        },
+        [RUN, kind] as const,
+      );
+      expect(result.kind, kind).toBeNull();
+      expect(result.error, kind).toMatchObject({ name: "LegacyDataError", store: kind });
+    }
+  });
+
+  test("IndexedDB batching: bulk writes and small commits (bench)", async ({ page }, info) => {
+    test.skip(process.env.MINNOW_NEXT_STORAGE_BENCH !== "1", "opt-in bench");
+    test.setTimeout(300_000);
+    await page.goto("/packages/core/browser/");
+    const result = await page.evaluate(async (url) => {
+      const run = (await import(url)) as Run;
+      const samples = [];
+      for (let repeat = 0; repeat < 3; repeat++)
+        for (const batching of [true, false])
+          samples.push({ batching, ...(await run.runIdbBench(batching)) });
+      return samples;
+    }, RUN);
+    await info.attach("idb-bench", {
+      body: JSON.stringify(result, null, 2),
+      contentType: "application/json",
+    });
+    console.log(JSON.stringify(result));
   });
 
   test("Chromium incognito keeps OPFS", async ({ browserName }, info) => {
@@ -200,7 +248,7 @@ test.describe("rebuild core storage on IndexedDB", () => {
       const chosen = await page.evaluate(async (url) => {
         return ((await import(url)) as Run).runChoose();
       }, RUN);
-      expect(chosen).toEqual({ kind: "opfs", opfsRefused: null });
+      expect(chosen).toEqual({ kind: "opfs", opfsRefused: null, error: null });
     } finally {
       await browser.close();
     }

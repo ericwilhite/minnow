@@ -194,7 +194,8 @@ class SimDatabase {
 
   /** Appends one committed transaction; `flush` for strict durability. */
   #commit(ops: readonly Op[], flush: boolean): void {
-    if (ops.length > 0) {
+    if (ops.length === 0) return;
+    {
       const body = encodeOps(ops);
       const record = new Uint8Array(HEADER + body.length + 4);
       const view = new DataView(record.buffer);
@@ -231,79 +232,146 @@ class SimDatabase {
     body: (tx: IdbTransactionLike) => void,
   ): Promise<void> {
     const scope = new Set(names);
-    const pending: Array<() => void> = [];
+    /** Requests in issuance order; each executes when reached, then its callback runs. */
+    const requests: Array<() => void> = [];
     const ops: Op[] = [];
     const undo: Array<() => void> = [];
     // Set from callbacks: a holder, so the loop below sees each change.
-    const state: { failure: Error | null } = { failure: null };
+    const state: { failure: Error | null; active: boolean; finished: boolean } = {
+      failure: null,
+      active: false,
+      finished: false,
+    };
     const fail = (error: unknown) => {
       state.failure ??= error instanceof Error ? error : new Error(String(error));
     };
-    const call = (work: () => void) => {
+    /** Runs body or a callback with the transaction active (requests allowed only then). */
+    const activate = (work: () => void) => {
+      state.active = true;
       try {
         work();
       } catch (error) {
         fail(error);
+      } finally {
+        state.active = false;
       }
+    };
+    const issue = (request: () => void) => {
+      if (!state.active || state.finished)
+        throw named("TransactionInactiveError", "The transaction is not active");
+      requests.push(request);
     };
     const write = (op: Op) => {
-      if (mode !== "readwrite") throw new Error("A readonly transaction cannot write");
-      const store = this.store(op.store);
-      if (op.kind === "clear") {
-        const saved = new Map(store.values);
-        const keys = store.keys.slice();
-        undo.push(() => {
-          store.values.clear();
-          for (const [key, value] of saved) store.values.set(key, value);
-          store.keys = keys;
+      if (mode !== "readwrite") throw named("ReadOnlyError", "The transaction is read-only");
+      issue(() => {
+        const store = this.store(op.store);
+        if (op.kind === "clear") {
+          const saved = new Map(store.values);
+          const keys = store.keys.slice();
+          undo.push(() => {
+            store.values.clear();
+            for (const [key, value] of saved) store.values.set(key, value);
+            store.keys = keys;
+          });
+        } else {
+          const had = store.values.has(op.key);
+          const before = store.values.get(op.key);
+          undo.push(() => {
+            if (had) store.put(op.key, before);
+            else store.delete(op.key);
+          });
+        }
+        this.#apply(op);
+        ops.push(op);
+      });
+    };
+    /** A read executes in order and hands its callback structured-clone copies, as IndexedDB. */
+    const read = <T>(compute: () => T, then: (value: T) => void) => {
+      issue(() => {
+        const value = structuredClone(compute());
+        activate(() => {
+          then(value);
         });
-      } else {
-        const had = store.values.has(op.key);
-        const before = store.values.get(op.key);
-        undo.push(() => {
-          if (had) store.put(op.key, before);
-          else store.delete(op.key);
-        });
-      }
-      this.#apply(op);
-      ops.push(op);
+      });
     };
     const storeOf = (name: string): IdbStoreLike => {
-      if (!scope.has(name)) throw new Error(`Store ${name} is not in the transaction's scope`);
+      if (!scope.has(name)) throw named("NotFoundError", `Store ${name} is not in the scope`);
       const store = this.store(name);
       return {
-        get: (key, then) => pending.push(() => then(store.values.get(key))),
-        getAll: (range, then) =>
-          pending.push(() => then(store.inRange(range).map((key) => store.values.get(key)))),
-        last: (range, then) =>
-          pending.push(() => {
-            const keys = store.inRange(range);
-            const key = keys.at(-1);
-            then(key === undefined ? undefined : store.values.get(key));
-          }),
-        put: (key, value) => write({ kind: "put", store: name, key, value }),
-        delete: (key) => write({ kind: "delete", store: name, key }),
-        deleteRange: (range) => {
-          for (const key of store.inRange(range)) write({ kind: "delete", store: name, key });
+        get: (key, then) => {
+          read(() => store.values.get(key), then);
         },
-        clear: () => write({ kind: "clear", store: name }),
+        getAll: (range, then) => {
+          checkRange(range);
+          read(() => store.inRange(range).map((key) => store.values.get(key)), then);
+        },
+        last: (range, then) => {
+          if (range !== null) checkRange(range);
+          read(() => {
+            const key = store.inRange(range).at(-1);
+            return key === undefined ? undefined : store.values.get(key);
+          }, then);
+        },
+        // The value is cloned when the request is made, as IndexedDB clones at put().
+        put: (key, value) => {
+          write({ kind: "put", store: name, key, value: structuredClone(value) });
+        },
+        delete: (key) => {
+          write({ kind: "delete", store: name, key });
+        },
+        deleteRange: (range) => {
+          checkRange(range);
+          if (mode !== "readwrite") throw named("ReadOnlyError", "The transaction is read-only");
+          issue(() => {
+            for (const key of store.inRange(range)) {
+              const before = store.values.get(key);
+              undo.push(() => {
+                store.put(key, before);
+              });
+              store.delete(key);
+              ops.push({ kind: "delete", store: name, key });
+            }
+          });
+        },
+        clear: () => {
+          write({ kind: "clear", store: name });
+        },
       };
     };
-    call(() => {
+    activate(() => {
       body({ store: storeOf, abort: fail });
     });
-    while (state.failure === null && pending.length > 0) {
+    while (state.failure === null && requests.length > 0) {
       await Promise.resolve();
-      const next = pending.shift();
-      if (next !== undefined) call(next);
+      const next = requests.shift();
+      if (next !== undefined)
+        try {
+          next();
+        } catch (error) {
+          fail(error);
+        }
     }
+    state.finished = true;
     if (state.failure !== null) {
       for (const restore of undo.reverse()) restore();
       throw state.failure;
     }
-    // A crash while committing (SimulatedCrash from the disk) rejects the transaction.
+    // A crash while committing (SimulatedCrash from the disk) rejects the transaction. A
+    // transaction that changed nothing writes and flushes nothing.
     this.#commit(ops, mode === "readwrite" && durability === "strict");
   }
+}
+
+function named(name: string, message: string): Error {
+  return Object.assign(new Error(message), { name });
+}
+
+/** IndexedDB refuses a key range that holds no key (`IDBKeyRange` throws DataError). */
+function checkRange(range: IdbRange): void {
+  const { lower, upper, lowerOpen = false, upperOpen = false } = range;
+  if (lower === undefined || upper === undefined) return;
+  if (lower > upper || (lower === upper && (lowerOpen || upperOpen)))
+    throw named("DataError", "The key range is empty");
 }
 
 const databases = new WeakMap<SimDisk, { crashes: number; database: SimDatabase }>();
