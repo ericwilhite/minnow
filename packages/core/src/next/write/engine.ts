@@ -75,14 +75,17 @@ import { ByteWriter } from "./bytes.js";
 import { Catalog, decodeLogged, type LoggedChange } from "./catalog.js";
 import { decodeColumn, isNullAt, MEMORY_CHUNK_ROWS } from "./columns.js";
 import { LogAppender, type LogPosition } from "./log.js";
+import { BlobCache } from "../format/blob-cache.js";
 import {
-  decodeGroupRoot,
-  decodeGroups,
-  decodeRoot,
+  decodeManifestRoot,
   encodeGroupRoot,
-  encodeGroups,
-  encodeRoot,
-} from "./manifest-codec.js";
+  encodeManifestRoot,
+  GROUPS_PER_PAGE,
+  isEmptyDirectory,
+  writeGroupDirectory,
+  type GroupPageEntry,
+} from "../format/manifest-codec.js";
+import { manifestReader, MetadataReader } from "../format/metadata-reader.js";
 import { readRows } from "./rows.js";
 import { encodeRun, RunReader, runRef } from "./runs.js";
 import { Sequences } from "./sequences.js";
@@ -111,9 +114,17 @@ interface TableState {
   flushedThroughLsn: number;
   nextRowId: number;
   nextGroupId: number;
-  /** Decoded group roots of its durable groups (statistics, re-point). */
-  readonly groupRoots: Map<number, GroupRoot>;
+  /** The pages of its durable group directory (`root.groups`), in row-id order. */
+  pages: readonly GroupPageEntry[];
 }
+
+/** `TableRoot.groups` of a table without groups (format/manifest-codec.ts: nothing is read). */
+const EMPTY_DIRECTORY: BlobRef = {
+  extent: { offset: 0, length: 0 },
+  offset: 0,
+  length: 0,
+  checksum: 0,
+};
 
 function blobKey(ref: BlobRef): string {
   return `${String(ref.extent.offset)}:${String(ref.offset)}:${String(ref.length)}:${String(ref.checksum)}`;
@@ -258,7 +269,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
   readonly #runReaders = new Map<string, RunReader | Promise<RunReader>>();
   /** The same readers by `RunRef` identity (the hot path: no key string per probe). */
   readonly #runsByRef = new WeakMap<RunRef, RunReader>();
-  readonly #groupRootCache = new Map<string, GroupRoot | Promise<GroupRoot>>();
+  /** Group roots, directory pages and indexes: decoded once, cached under the governor. */
+  readonly #metadata: MetadataReader;
+  readonly #metadataCaches: ReadonlyArray<BlobCache<unknown>>;
   readonly #summaries = new Map<number, Map<number, ColumnTotals>>();
   #labels = 0;
   /** Published memtables older readers may still hold (deltas, borrowed chunks). */
@@ -276,6 +289,17 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#session = input.session;
     this.#space = input.space;
     this.#grant = grant;
+    const caches = {
+      groupRoots: new BlobCache<GroupRoot>((cache) => input.governor.registerCache(cache)),
+      groupPages: new BlobCache<readonly GroupRef[]>((cache) =>
+        input.governor.registerCache(cache),
+      ),
+      groupIndexes: new BlobCache<readonly GroupPageEntry[]>((cache) =>
+        input.governor.registerCache(cache),
+      ),
+    };
+    this.#metadataCaches = [caches.groupRoots, caches.groupPages, caches.groupIndexes];
+    this.#metadata = new MetadataReader(input.space, caches);
     this.#governorCap = input.governor.capBytes;
     this.#now = input.options.now ?? Date.now;
     this.#root = root;
@@ -304,7 +328,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       readers: new ReaderRegistry(),
       pinState: (state, label) => this.#pinState(state, label),
       runReader: (ref) => this.#runReader(ref),
-      groupRoot: (ref) => this.#groupRoot(ref),
+      groupRoot: (ref, budget) => this.#metadata.groupRoot(ref, budget),
       bitmap: (ref) => this.#bitmap(ref),
     };
   }
@@ -341,9 +365,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
           clients: [],
         };
         await session.resetLog();
-        await space.publish(encodeRoot(root), { writers: [writer], retired: [] });
+        await space.publish(encodeManifestRoot(root), { writers: [writer], retired: [] });
       } else {
-        root = decodeRoot(space.root);
+        // The decoded root is kept for the session; its parse charge is returned at once.
+        const parsed = decodeManifestRoot(space.root, grant);
+        grant.free(parsed.charge);
+        root = parsed.value;
         catalog = Catalog.decode(await readBlob(space, root.catalog, grant));
       }
       const engine = new WritePathImpl(input, grant, root, catalog);
@@ -361,10 +388,18 @@ export class WritePathImpl implements WritePath, EngineHooks {
   async #load(): Promise<void> {
     const root = this.#root;
     for (const table of root.tables) {
-      const groups =
-        table.groupCount === 0
-          ? []
-          : [...decodeGroups(await readBlob(this.#space, table.groups, this.#grant))];
+      const groups: GroupRef[] = [];
+      let pages: readonly GroupPageEntry[] = [];
+      if (!isEmptyDirectory(table.groups)) {
+        const index = await this.#metadata.groupIndex(table.groups, this.#grant);
+        pages = [...index.value];
+        index.release();
+        for (const page of pages) {
+          const held = await this.#metadata.groupPage(page.ref, this.#grant);
+          groups.push(...held.value);
+          held.release();
+        }
+      }
       const runs = new Map<number, readonly RunRef[]>();
       for (const index of [table.keyIndex, ...table.secondaryIndexes])
         if (index !== null) runs.set(index.indexId, index.runs);
@@ -384,12 +419,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
         flushedThroughLsn: table.flushedThroughLsn,
         nextRowId: table.nextRowId,
         nextGroupId: groups.reduce((max, group) => Math.max(max, group.groupId + 1), 1),
-        groupRoots: new Map(),
+        pages,
       };
       for (const group of groups) {
-        const groupRoot = await this.#groupRoot(group.root);
-        state.groupRoots.set(group.groupId, groupRoot);
-        this.#summarize(table.tableId, groupRoot);
+        const held = await this.#metadata.groupRoot(group.root, this.#grant);
+        this.#summarize(table.tableId, held.value);
+        held.release();
       }
       this.#tables.set(table.tableId, state);
     }
@@ -771,7 +806,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       flushedThroughLsn: 0,
       nextRowId: 1,
       nextGroupId: 1,
-      groupRoots: new Map(),
+      pages: [],
     });
     this.#publishState();
   }
@@ -1208,6 +1243,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     for (const memtable of this.#published) memtable.releaseAll();
     this.#currentPin?.release();
     this.#currentPin = null;
+    for (const cache of this.#metadataCaches) cache.clear();
     this.#grant.close();
   }
 
@@ -1246,26 +1282,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
     }
     this.#runReaders.set(key, opened);
     return opened;
-  }
-
-  #groupRoot(ref: BlobRef): GroupRoot | Promise<GroupRoot> {
-    const key = blobKey(ref);
-    const cached = this.#groupRootCache.get(key);
-    if (cached !== undefined) return cached;
-    const peeked = this.#space.peek(ref);
-    if (peeked !== null) {
-      const root = decodeGroupRoot(peeked);
-      this.#groupRootCache.set(key, root);
-      return root;
-    }
-    const pending = readBlob(this.#space, ref, this.#grant).then((bytes) => {
-      const root = decodeGroupRoot(bytes);
-      this.#groupRootCache.set(key, root);
-      return root;
-    });
-    this.#groupRootCache.set(key, pending);
-    pending.catch(() => this.#groupRootCache.delete(key));
-    return pending;
   }
 
   #bitmap(ref: BlobRef): Uint32Array | Promise<Uint32Array> {
@@ -1380,9 +1396,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
         groups.push({ ...group, deletions, liveRowCount: group.liveRowCount - folded.length });
       }
       groups.push(...newGroups);
-      const directory = need((await writer.write([encodeGroups(groups)])).blobs[0]);
-      if (state.root !== null && state.root.groupCount > 0) retired.push(state.root.groups.extent);
-      else if (state.root !== null) retired.push(state.root.groups.extent);
+      const { directory, pages } = await this.#writeDirectory(
+        writer,
+        state,
+        view.groups,
+        groups,
+        retired,
+      );
       const runs = new Map<number, readonly RunRef[]>();
       for (const index of def.indexes) {
         const fresh = [...published.values()]
@@ -1409,7 +1429,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         statistics: null,
       };
       const root = await this.#nextRoot(writer, retired, new Map([[state.tableId, tableRoot]]));
-      await this.#space.publish(encodeRoot(root), { writers: [writer], retired });
+      await this.#space.publish(encodeManifestRoot(root), { writers: [writer], retired });
       // Re-point readers in the same step the publish resolves (ruling R16.3).
       const pin: SpacePin = this.#space.pin(`re-point t${String(state.tableId)}`);
       const flushed = [...set];
@@ -1429,13 +1449,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
         memtable.state = "published";
         memtable.release();
         if (entry !== undefined) {
-          state.groupRoots.set(entry.group.groupId, entry.root);
           this.#summarize(state.tableId, entry.root);
         }
       }
       this.#root = root;
       this.#pruneCatalogs(root.globalLsn);
       state.root = tableRoot;
+      state.pages = pages;
       state.flushedThroughLsn = through;
       for (const [indexId, pending] of this.#pendingIndexes)
         if (pending.tableId === state.tableId && pending.lsn <= through)
@@ -1496,6 +1516,49 @@ export class WritePathImpl implements WritePath, EngineHooks {
     return need((await writer.write([new Uint8Array(bits.buffer)])).blobs[0]);
   }
 
+  /**
+   * Writes a table's group directory for `groups` (`before` is the durable list): leading full
+   * pages whose groups are all unchanged are kept (format/manifest-codec.ts "paged group
+   * directory"), the rest are rewritten. Extents of the old directory that the new one does not use
+   * are added to `retired` (the pages one flush writes share an extent, which goes with its last
+   * page).
+   */
+  async #writeDirectory(
+    writer: ExtentWriter,
+    state: TableState,
+    before: readonly GroupRef[],
+    groups: readonly GroupRef[],
+    retired: ExtentRef[],
+  ): Promise<{ directory: BlobRef; pages: readonly GroupPageEntry[] }> {
+    const keep: GroupPageEntry[] = [];
+    let kept = 0;
+    for (const page of state.pages) {
+      if (page.groupCount !== GROUPS_PER_PAGE) break;
+      let same = true;
+      for (let k = kept; k < kept + page.groupCount && same; k++) same = groups[k] === before[k];
+      if (!same) break;
+      keep.push(page);
+      kept += page.groupCount;
+    }
+    let directory = EMPTY_DIRECTORY;
+    let pages: readonly GroupPageEntry[] = [];
+    if (groups.length > 0) {
+      const written = await writeGroupDirectory(writer, groups.slice(kept), keep);
+      directory = written.ref;
+      pages = written.pages;
+    }
+    const live = new Set<number>();
+    if (!isEmptyDirectory(directory)) live.add(directory.extent.offset);
+    for (const page of pages) live.add(page.ref.extent.offset);
+    const old: ExtentRef[] = state.pages.map((page) => page.ref.extent);
+    const index = state.root?.groups;
+    if (index !== undefined && !isEmptyDirectory(index)) old.push(index.extent);
+    for (const extent of old)
+      if (!live.has(extent.offset) && !retired.some((known) => sameExtent(known, extent)))
+        retired.push(extent);
+    return { directory, pages };
+  }
+
   /** The next root: global state as of the durable LSN, `changed` tables replaced. */
   async #nextRoot(
     writer: ExtentWriter,
@@ -1530,8 +1593,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
         continue;
       }
       if (state === undefined) continue;
-      // First root to include the table: an empty group directory.
-      const directory = need((await writer.write([encodeGroups([])])).blobs[0]);
+      // First root to include the table: an empty group directory (nothing written).
+      const directory = EMPTY_DIRECTORY;
       const root: TableRoot = {
         tableId: def.id,
         schemaVersion: def.schemaVersion,
@@ -1578,10 +1641,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
   async #tableExtents(table: TableRoot): Promise<ExtentRef[]> {
     const single: ManifestRoot = { ...this.#root, tables: [table] };
     const extents: ExtentRef[] = [];
-    for await (const reached of walkReachable(single, {
-      groups: async (ref) => decodeGroups(await readBlob(this.#space, ref, this.#grant)),
-      groupRoot: async (ref) => decodeGroupRoot(await readBlob(this.#space, ref, this.#grant)),
-    })) {
+    for await (const reached of walkReachable(
+      single,
+      manifestReader(this.#metadata, this.#grant),
+    )) {
       if (reached.kind === "catalog") continue;
       const extent = "extent" in reached.ref ? reached.ref.extent : reached.ref;
       if (!extents.some((known) => sameExtent(known, extent))) extents.push(extent);

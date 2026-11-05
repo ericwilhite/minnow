@@ -7,7 +7,9 @@
  * bound hides everything newer: memtable rows and marks, key deltas, and `GroupDeletes`.
  */
 import type { Space, SpacePin } from "../access/space.js";
+import type { MaybePromise } from "../access/key-index.js";
 import type { BlobRef, GroupRef, GroupRoot, ManifestRoot, RunRef } from "../format/manifest.js";
+import type { Held } from "../format/reachable.js";
 import type { ByteBudget } from "../storage/extents.js";
 import type { Memtable } from "./memtable.js";
 import type { RunReader } from "./runs.js";
@@ -146,7 +148,11 @@ export interface Shared {
    */
   pinState(state: WriteState, label: string): SpacePin;
   runReader(ref: RunRef): RunReader | Promise<RunReader>;
-  groupRoot(ref: BlobRef): GroupRoot | Promise<GroupRoot>;
+  /**
+   * A group's root through the metadata reader (format/metadata-reader.ts): cached and shared,
+   * synchronous on a hit, charged to `budget` until the `Held` is released.
+   */
+  groupRoot(ref: BlobRef, budget: ByteBudget): MaybePromise<Held<GroupRoot>>;
   /** A group's durable deletion bitmap (bit set = deleted), or null. */
   bitmap(ref: BlobRef): Uint32Array | Promise<Uint32Array>;
 }

@@ -22,7 +22,6 @@ import type { StorageBackend } from "../storage/contract.js";
 import type { ExtentSpace } from "../storage/extents.js";
 import { MemoryBackend } from "../storage/memory-store.js";
 import { openExtentSpace } from "../storage/space.js";
-import { manifestCodecs } from "./manifest-codec.js";
 
 export const INT: PhysicalType = { kind: "int32", bits: 32 };
 export const BIG: PhysicalType = { kind: "int64" };
@@ -98,7 +97,7 @@ export class Harness {
       spillable: true,
     });
     this.space = await openExtentSpace(session, {
-      reachable: reachableExtents(manifestCodecs),
+      reachable: reachableExtents(),
       budget: startup,
       registerCache: (cache) => this.governor.registerCache(cache),
     });

@@ -15,6 +15,7 @@ import type {
   TableDef,
   TableInput,
   ViewDef,
+  TypeDef,
 } from "../access/catalog.js";
 import { CatalogChangeError } from "../access/catalog.js";
 import type { PhysicalType } from "../types.js";
@@ -38,6 +39,14 @@ class Snapshot implements CatalogView {
   }
   sequence(sequenceId: number): SequenceDef | undefined {
     return this.sequences.find((sequence) => sequence.id === sequenceId);
+  }
+  // Named types (R17.7): the in-memory catalog defines none.
+  readonly types: readonly TypeDef[] = [];
+  type(): TypeDef | undefined {
+    return undefined;
+  }
+  typeByName(): TypeDef | undefined {
+    return undefined;
   }
 }
 
@@ -122,8 +131,16 @@ export class MemoryCatalog {
       id: key.id ?? this.#id(),
       name: key.name,
       columnIds: key.columns.map(columnId),
-      parentTableId: key.parentTableId,
-      parentIndexId: key.parentIndexId,
+      // R17.7: "self" names the table being defined, and its key by "primary" or unique name.
+      parentTableId: key.parentTableId === "self" ? id : key.parentTableId,
+      parentIndexId:
+        typeof key.parentIndexId === "number"
+          ? key.parentIndexId
+          : key.parentIndexId === "primary"
+            ? (primaryKey ?? -1)
+            : (indexes.find(
+                (index) => index.name === (key.parentIndexId as { unique: string }).unique,
+              )?.id ?? -1),
       supportIndexId: null,
       onDelete: key.onDelete,
       enforced: key.enforced,

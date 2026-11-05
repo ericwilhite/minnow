@@ -4,6 +4,7 @@
  * from the published group after a re-point), and index probes and ranges that resolve put and
  * tombstone entries across memtable deltas and durable runs under the view's bound.
  */
+import type { Held } from "../format/reachable.js";
 import type { CatalogView, ColumnDef, IndexDef, TableDef } from "../access/catalog.js";
 import {
   inKeyRange,
@@ -143,12 +144,25 @@ class GroupSegmentImpl implements GroupSegment {
     );
   }
 
+  /** The group root's read while it is in flight (concurrent first calls share it). */
+  #pending: Promise<Held<GroupRoot>> | null = null;
+
+  /**
+   * The group root, through the write path's metadata reader (cached, synchronous on a hit). The
+   * segment holds it, charged to the table snapshot's budget, until its snapshot is released.
+   */
   root(): MaybePromise<GroupRoot> {
     this.view.snapshot.check();
     if (this.#root !== null) return this.#root;
-    return settle(this.view.snapshot.shared.groupRoot(this.group.root), (root) => {
-      this.#root = root;
-      return root;
+    const got =
+      this.#pending ?? this.view.snapshot.shared.groupRoot(this.group.root, this.view.budget);
+    if (got instanceof Promise) this.#pending = got;
+    return settle(got, (held) => {
+      if (this.#root === null) {
+        this.#root = held.value;
+        this.view.snapshot.hold(held);
+      }
+      return this.#root;
     });
   }
 
@@ -622,9 +636,23 @@ export class SnapshotImpl implements Snapshot {
   /** Table snapshots handed out (their memory segments' borrows end with the snapshot). */
   #handed: TableSnapshotImpl[] | null = null;
 
+  /** Metadata the snapshot's segments hold (group roots), released with it. */
+  #holds: Array<{ release(): void }> | null = null;
+
+  /** Keeps `held` until the snapshot is released (at once, if it already is). */
+  hold(held: { release(): void }): void {
+    if (this.#released) {
+      held.release();
+      return;
+    }
+    (this.#holds ??= []).push(held);
+  }
+
   releaseInternal(): void {
     if (this.#released) return;
     this.#released = true;
+    if (this.#holds !== null) for (const held of this.#holds) held.release();
+    this.#holds = null;
     if (this.#handed !== null) for (const table of this.#handed) table.endBorrows();
     this.#pin.release();
     this.shared.readers.close(this.#reader);
