@@ -773,43 +773,62 @@ export class StatementImpl implements Statement {
     }
   }
 
-  /** Children of a statement's changed parent keys follow them (see `#actions`). */
+  /**
+   * Children of a statement's changed parent keys follow them (see `#actions`). One view serves
+   * every child foreign key of the round (review B3-p2b-2 B1): each child row's new reference
+   * values are computed from the parents' original keys before any child is updated, and a row
+   * that several foreign keys reach (sharing a column or not) is updated once, with all of them.
+   */
   async #follow(checks: readonly ParentCheck[]): Promise<void> {
+    const view = this.current();
+    /** Child table → row id → column id → its new value. */
+    type NewValues = Map<number, { readonly vector: Vector; readonly row: number }>;
+    const plans = new Map<number, Map<number, NewValues>>();
     for (const child of this.tx.catalog.tables)
       for (const fk of child.foreignKeys) {
         if (!fk.enforced || fk.supportIndexId === null) continue;
         const mine = checks.filter((check) => check.indexId === fk.parentIndexId);
         if (mine.length === 0) continue;
         const support = need(child.indexes.find((index) => index.id === fk.supportIndexId));
-        // Every key's children, in one view, before any is moved.
-        const view = this.current();
         const index = new ViewIndex(nonUnique(support), view.internalTable(child.id));
-        const moves: Array<{ check: ParentCheck; children: number[] }> = [];
         for (const check of mine) {
           const children = await index.holders(
             check.key,
             support.columnIds.length > fk.columnIds.length,
           );
-          if (children.length > 0) moves.push({ check, children });
-        }
-        // A child row holds one value per foreign key, so the sets are disjoint.
-        for (const { check, children } of moves) {
+          if (children.length === 0) continue;
           const parent = need(this.tx.catalog.table(check.parentTableId));
           const key = need(parent.indexes.find((candidate) => candidate.id === check.indexId));
-          const sources = key.columnIds.map((columnId) => ({
-            vector: need(
-              check.next?.vectors[parent.columns.findIndex((column) => column.id === columnId)],
-            ),
-            row: check.next?.row ?? 0,
-          }));
-          await new TableWriterImpl(this, child, { onRepeat: "first" }).applyUpdate(
-            children,
-            fk.columnIds,
-            sources,
-            true,
-          );
+          let rows = plans.get(child.id);
+          if (rows === undefined) plans.set(child.id, (rows = new Map<number, NewValues>()));
+          for (const rowId of children) {
+            let columns = rows.get(rowId);
+            if (columns === undefined) rows.set(rowId, (columns = new Map() as NewValues));
+            fk.columnIds.forEach((columnId, k) => {
+              if (columns.has(columnId)) return; // a shared column: the same original key
+              const parentColumn = key.columnIds[k];
+              columns.set(columnId, {
+                vector: need(
+                  check.next?.vectors[
+                    parent.columns.findIndex((column) => column.id === parentColumn)
+                  ],
+                ),
+                row: check.next?.row ?? 0,
+              });
+            });
+          }
         }
       }
+    for (const [childId, rows] of plans) {
+      const def = need(this.tx.catalog.table(childId));
+      for (const [rowId, columns] of rows)
+        await new TableWriterImpl(this, def, { onRepeat: "first" }).applyUpdate(
+          [rowId],
+          [...columns.keys()],
+          [...columns.values()],
+          true,
+        );
+    }
   }
 
   /** A parent row left: CASCADE, SET NULL or RESTRICT per child foreign key (see `#actions`). */

@@ -17,6 +17,7 @@ import { ForeignKeyViolationError } from "../access/modify.js";
 import { encodeKeyBatch, KeyBatch } from "../keys/key-encoding.js";
 import { createReach } from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
+import { need } from "./bytes.js";
 import type { WritePathImpl } from "./engine.js";
 import {
   autocommit,
@@ -42,12 +43,23 @@ const SQL_ACTION: Record<Action, string> = {
 const REACH = [
   "follow-overlap",
   "follow-swap-chain",
+  "follow-shared-column",
+  "follow-two-columns",
   "two-paths-mixed",
   "two-paths-refused",
   "two-paths-freeze",
 ] as const;
 const reach = createReach("next-write-fk-generated", REACH);
-afterAll(() => {
+
+/** One PostgreSQL per test file (each round drops its tables): starting PGlite is the cost. */
+let instance: PGlite | null = null;
+async function postgres(): Promise<PGlite> {
+  instance ??= await PGlite.create();
+  return instance;
+}
+
+afterAll(async () => {
+  await instance?.close();
   reach.assertReached();
 });
 
@@ -123,15 +135,28 @@ describe("foreign-key actions vs PostgreSQL (generated)", () => {
         // PostgreSQL updates rows in insertion order and checks each at once: insert so that every
         // moved row's target is already vacated (descending for an upward shift).
         const order = [...ids].sort((a, b) => (shift > 0 ? b - a : a - b));
+        // The child's shape (review B3-p2b-2 B1): one foreign key; two sharing one column; two on
+        // two columns, each following its own parent.
+        const shape = (["single", "shared", "two"] as const)[int(3)] ?? "single";
         const children = ids.flatMap((id) => Array.from({ length: int(3) }, () => id));
-        const pg = await PGlite.create();
+        const second = children.map(() => need(ids[int(ids.length)]));
+        const pg = await postgres();
         try {
           await pg.exec(
             "CREATE TABLE p(id int PRIMARY KEY);" +
-              "CREATE TABLE c(id int PRIMARY KEY, ref int REFERENCES p ON UPDATE CASCADE ON DELETE CASCADE);" +
+              (shape === "single"
+                ? "CREATE TABLE c(id int PRIMARY KEY, ref int REFERENCES p ON UPDATE CASCADE ON DELETE CASCADE);"
+                : shape === "shared"
+                  ? "CREATE TABLE c(id int PRIMARY KEY, ref int REFERENCES p ON UPDATE CASCADE ON DELETE CASCADE, FOREIGN KEY (ref) REFERENCES p ON UPDATE CASCADE ON DELETE CASCADE);"
+                  : "CREATE TABLE c(id int PRIMARY KEY, ref int REFERENCES p ON UPDATE CASCADE ON DELETE CASCADE, ref2 int REFERENCES p ON UPDATE CASCADE ON DELETE CASCADE);") +
               `INSERT INTO p VALUES ${order.map((id) => `(${String(id)})`).join(",")};` +
               (children.length > 0
-                ? `INSERT INTO c VALUES ${children.map((ref, k) => `(${String(k + 1)}, ${String(ref)})`).join(",")};`
+                ? `INSERT INTO c VALUES ${children
+                    .map(
+                      (ref, k) =>
+                        `(${String(k + 1)}, ${String(ref)}${shape === "two" ? `, ${String(second[k])}` : ""})`,
+                    )
+                    .join(",")};`
                 : ""),
           );
           try {
@@ -141,18 +166,42 @@ describe("foreign-key actions vs PostgreSQL (generated)", () => {
           } catch {
             continue; // a statement PostgreSQL refuses is not compared
           }
-          const expected = await pgRows(pg, "SELECT id, ref FROM c ORDER BY id");
+          const expected = await pgRows(
+            pg,
+            shape === "two"
+              ? "SELECT id, ref, ref2 FROM c ORDER BY id"
+              : "SELECT id, ref FROM c ORDER BY id",
+          );
           const harness = new Harness("strict", "memory", 1 + int(3));
           const path = await harness.open();
           try {
             const p = await create(path, "p", [column("id", INT, false)]);
-            const c = await create(path, "c", [column("id", INT, false), column("ref", INT)], {
-              foreignKeys: [fk(p, "cascade", [1], "c_ref")],
-            });
+            const c = await create(
+              path,
+              "c",
+              shape === "two"
+                ? [column("id", INT, false), column("ref", INT), column("ref2", INT)]
+                : [column("id", INT, false), column("ref", INT)],
+              {
+                foreignKeys:
+                  shape === "single"
+                    ? [fk(p, "cascade", [1], "c_ref")]
+                    : shape === "shared"
+                      ? [fk(p, "cascade", [1], "c_ref"), fk(p, "cascade", [1], "c_ref_again")]
+                      : [fk(p, "cascade", [1], "c_ref"), fk(p, "cascade", [2], "c_ref2")],
+              },
+            );
             await autocommit(path, (s) => s.table(p).insert(batch(ints(order)), null));
             if (children.length > 0)
               await autocommit(path, (s) =>
-                s.table(c).insert(batch(ints(children.map((_, k) => k + 1)), ints(children)), null),
+                s
+                  .table(c)
+                  .insert(
+                    shape === "two"
+                      ? batch(ints(children.map((_, k) => k + 1)), ints(children), ints(second))
+                      : batch(ints(children.map((_, k) => k + 1)), ints(children)),
+                    null,
+                  ),
               );
             const keyColumn = path.catalog.table(p)?.columns[0]?.id ?? 0;
             await autocommit(path, async (s) =>
@@ -173,11 +222,15 @@ describe("foreign-key actions vs PostgreSQL (generated)", () => {
             const after = new Set(moved.map((id) => id + shift));
             if (moved.some((id) => after.has(id))) reach.reach("follow-overlap");
             if (moved.filter((id) => after.has(id)).length >= 2) reach.reach("follow-swap-chain");
+            if (shape === "shared" && moved.some((id) => after.has(id)))
+              reach.reach("follow-shared-column");
+            if (shape === "two" && moved.some((id) => after.has(id)))
+              reach.reach("follow-two-columns");
           } finally {
             await harness.close();
           }
         } finally {
-          await pg.close();
+          await pg.exec("DROP TABLE IF EXISTS c; DROP TABLE IF EXISTS p;");
         }
       }
       expect(compared).toBeGreaterThan(0);
@@ -200,7 +253,7 @@ describe("foreign-key actions vs PostgreSQL (generated)", () => {
         const doomed = parents.filter(() => random() < 0.5);
         if (doomed.length === 0) continue;
         const sql = (value: number | null | undefined) => (value == null ? "NULL" : String(value));
-        const pg = await PGlite.create();
+        const pg = await postgres();
         let refused = false;
         let expected: unknown[][];
         try {
@@ -219,7 +272,7 @@ describe("foreign-key actions vs PostgreSQL (generated)", () => {
           }
           expected = await pgRows(pg, "SELECT id, r1, r2 FROM c ORDER BY id");
         } finally {
-          await pg.close();
+          await pg.exec("DROP TABLE IF EXISTS c; DROP TABLE IF EXISTS p;");
         }
         const rows = 1 + int(3);
         const harness = new Harness("strict", "memory", rows);

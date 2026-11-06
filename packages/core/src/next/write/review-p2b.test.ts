@@ -208,3 +208,40 @@ it("review: PG accepts both SET NULL paths and composite MATCH SIMPLE", async ()
     await h.close();
   }
 }, 60000);
+
+it("review 2 B1: two foreign keys sharing a child column follow an overlapping rekey once", async () => {
+  const pg = await PGlite.create();
+  const h = new Harness();
+  const path = await h.open();
+  try {
+    await pg.exec(
+      "CREATE TABLE p(id int primary key); CREATE TABLE c(id int primary key, ref int REFERENCES p ON UPDATE CASCADE, FOREIGN KEY(ref) REFERENCES p ON UPDATE CASCADE); INSERT INTO p VALUES(2),(1); INSERT INTO c VALUES(10,1),(20,2); UPDATE p SET id=id+1",
+    );
+    const expected = (
+      await pg.query<{ id: number; ref: number }>("SELECT id,ref FROM c ORDER BY id")
+    ).rows.map((r) => [r.id, r.ref]);
+    expect(expected).toEqual([
+      [10, 2],
+      [20, 3],
+    ]);
+    const p = await create(path, "p", [column("id", INT, false)]);
+    const c = await create(path, "c", [column("id", INT, false), column("ref", INT)], {
+      foreignKeys: [
+        { ...fk(p, "cascade"), name: "f1" },
+        { ...fk(p, "cascade"), name: "f2" },
+      ],
+    });
+    await autocommit(path, (s) => s.table(p).insert(batch(ints([2, 1])), null));
+    await autocommit(path, (s) => s.table(c).insert(batch(ints([10, 20]), ints([1, 2])), null));
+    const at = await locate(path, p, [2, 1]);
+    await autocommit(path, (s) =>
+      s
+        .table(p, { assigned: [need(need(path.catalog.table(p)).columns[0]).id] })
+        .update(batch(locators(at, p), ints([3, 2])), null),
+    );
+    expect(await sorted(path, c)).toEqual(expected);
+  } finally {
+    await h.close();
+    await pg.close();
+  }
+}, 60000);
