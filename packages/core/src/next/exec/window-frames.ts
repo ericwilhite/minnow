@@ -24,6 +24,9 @@
  */
 import { SLICE_ROWS, type Slice, type SlicedJob } from "./slices.js";
 
+/** Fixed-cost prefix/frame work between task-clock checks. */
+export const WINDOW_STEP_ROWS = 1024;
+
 export type FrameUnit = "rows" | "range" | "groups";
 export type FrameBoundKind =
   "unbounded-preceding" | "preceding" | "current-row" | "following" | "unbounded-following";
@@ -339,10 +342,12 @@ export function* aggregate(
   // Prefix counts of valid rows (count, avg's divisor, "all NULL" for sum/min/max).
   const counts = work !== null && work.counts.length > n ? work.counts : new Int32Array(n + 1);
   counts[0] = 0;
-  for (let i = 0; i < n; i++)
+  for (let i = 0; i < n; i++) {
     counts[i + 1] = (counts[i] ?? 0) + (valid === null || valid[i] === 1 ? 1 : 0);
+    if ((i & (WINDOW_STEP_ROWS - 1)) === WINDOW_STEP_ROWS - 1 && slice.due()) yield;
+  }
   const countIn = (a: number, b: number) => (counts[b + 1] ?? 0) - (counts[a] ?? 0);
-  const running = exclude === "no-others" && isRunning(starts, n);
+  const running = exclude === "no-others" && (yield* isRunning(starts, n, slice));
   // Exact sums: prefix sums in doubles while they stay exact, else bigints.
   let prefix: Float64Array | null = null;
   let bigPrefix: bigint[] | null = null;
@@ -350,23 +355,30 @@ export function* aggregate(
     if (exact && arg?.big !== null && arg?.big !== undefined) {
       bigPrefix = new Array<bigint>(n + 1);
       bigPrefix[0] = 0n;
-      for (let i = 0; i < n; i++)
+      for (let i = 0; i < n; i++) {
         bigPrefix[i + 1] = (bigPrefix[i] ?? 0n) + (valid[i] === 1 ? (arg.big[i] ?? 0n) : 0n);
+        if ((i & (WINDOW_STEP_ROWS - 1)) === WINDOW_STEP_ROWS - 1 && slice.due()) yield;
+      }
     } else if (exact || running) {
       // Exact integers below 2^53 in total, or floats added left to right (a running frame's
       // members are a prefix, so its sum is the prefix itself).
       prefix = work !== null && work.prefix.length > n ? work.prefix : new Float64Array(n + 1);
       prefix[0] = 0;
       let sum = 0;
+      let unsafe = false;
       for (let i = 0; i < n; i++) {
         if (valid[i] === 1) sum += values[i] ?? 0;
         prefix[i + 1] = sum;
+        if (exact && !Number.isSafeInteger(sum)) unsafe = true;
+        if ((i & (WINDOW_STEP_ROWS - 1)) === WINDOW_STEP_ROWS - 1 && slice.due()) yield;
       }
-      if (exact && !Number.isSafeInteger(maxAbs(prefix, n))) {
+      if (unsafe) {
         bigPrefix = new Array<bigint>(n + 1);
         bigPrefix[0] = 0n;
-        for (let i = 0; i < n; i++)
+        for (let i = 0; i < n; i++) {
           bigPrefix[i + 1] = (bigPrefix[i] ?? 0n) + (valid[i] === 1 ? BigInt(values[i] ?? 0) : 0n);
+          if ((i & (WINDOW_STEP_ROWS - 1)) === WINDOW_STEP_ROWS - 1 && slice.due()) yield;
+        }
         prefix = null;
       }
     }
@@ -394,9 +406,16 @@ export function* aggregate(
           // A frame without NULLs (every member counted) needs no validity test.
           if (values === null) sum = 0;
           else if (valid === null || count === e - s + 1)
-            for (let j = s; j <= e; j++) sum += values[j] ?? 0;
-          else for (let j = s; j <= e; j++) if (valid[j] === 1) sum += values[j] ?? 0;
-          if (e - s > 64 && slice.tick()) yield;
+            for (let j = s; j <= e; j++) {
+              sum += values[j] ?? 0;
+              if ((j & (WINDOW_STEP_ROWS - 1)) === WINDOW_STEP_ROWS - 1 && slice.due()) yield;
+            }
+          else
+            for (let j = s; j <= e; j++) {
+              if (valid[j] === 1) sum += values[j] ?? 0;
+              if ((j & (WINDOW_STEP_ROWS - 1)) === WINDOW_STEP_ROWS - 1 && slice.due()) yield;
+            }
+          if (e - s > 64 && slice.due()) yield;
         }
         out.values[i] = kind === "avg" ? sum / count : sum;
         out.valid[i] = 1;
@@ -443,9 +462,11 @@ export function* aggregate(
         let sum = 0;
         for (let r = 0; r < k; r++) {
           const to = ranges[2 * r + 1] ?? -1;
-          for (let j = ranges[2 * r] ?? 0; j <= to; j++)
+          for (let j = ranges[2 * r] ?? 0; j <= to; j++) {
             if (valid?.[j] === 1) sum += values?.[j] ?? 0;
-          if (to - (ranges[2 * r] ?? 0) > 64 && slice.tick()) yield;
+            if ((j & (WINDOW_STEP_ROWS - 1)) === WINDOW_STEP_ROWS - 1 && slice.due()) yield;
+          }
+          if (to - (ranges[2 * r] ?? 0) > 64 && slice.due()) yield;
         }
         out.values[i] = kind === "avg" ? sum / count : sum;
       }
@@ -456,10 +477,12 @@ export function* aggregate(
       if (running && k === 1 && (ranges[0] ?? 0) === 0) {
         const to = ranges[1] ?? -1;
         for (let j = runningAt + 1; j <= to; j++) {
-          if (valid?.[j] !== 1) continue;
-          const v = values?.[j] ?? 0;
-          if (runningSeen === 0 || better(v, runningExtreme, max)) runningExtreme = v;
-          runningSeen++;
+          if (valid?.[j] === 1) {
+            const v = values?.[j] ?? 0;
+            if (runningSeen === 0 || better(v, runningExtreme, max)) runningExtreme = v;
+            runningSeen++;
+          }
+          if ((j & (WINDOW_STEP_ROWS - 1)) === WINDOW_STEP_ROWS - 1 && slice.due()) yield;
         }
         runningAt = Math.max(runningAt, to);
         out.values[i] = runningExtreme;
@@ -469,12 +492,14 @@ export function* aggregate(
         for (let r = 0; r < k; r++) {
           const to = ranges[2 * r + 1] ?? -1;
           for (let j = ranges[2 * r] ?? 0; j <= to; j++) {
-            if (valid?.[j] !== 1) continue;
-            const v = values?.[j] ?? 0;
-            if (!seen || better(v, best, max)) best = v;
-            seen = true;
+            if (valid?.[j] === 1) {
+              const v = values?.[j] ?? 0;
+              if (!seen || better(v, best, max)) best = v;
+              seen = true;
+            }
+            if ((j & (WINDOW_STEP_ROWS - 1)) === WINDOW_STEP_ROWS - 1 && slice.due()) yield;
           }
-          if (to - (ranges[2 * r] ?? 0) > 64 && slice.tick()) yield;
+          if (to - (ranges[2 * r] ?? 0) > 64 && slice.due()) yield;
         }
         out.values[i] = best;
       }
@@ -521,9 +546,11 @@ function* bigExtremes(
     let best: bigint | null = null;
     for (let r = 0; r < k; r++)
       for (let j = ranges[2 * r] ?? 0; j <= (ranges[2 * r + 1] ?? -1); j++) {
-        if (arg.valid[j] !== 1) continue;
-        const v = big[j] ?? 0n;
-        if (best === null || (max ? v > best : v < best)) best = v;
+        if (arg.valid[j] === 1) {
+          const v = big[j] ?? 0n;
+          if (best === null || (max ? v > best : v < best)) best = v;
+        }
+        if ((j & (WINDOW_STEP_ROWS - 1)) === WINDOW_STEP_ROWS - 1 && slice.due()) yield;
       }
     result[i] = best ?? 0n;
     if (slice.tick()) yield;
@@ -537,15 +564,12 @@ function better(v: number, best: number, max: boolean): boolean {
   return max ? v > best : v < best;
 }
 
-function maxAbs(prefix: Float64Array, n: number): number {
-  let m = 0;
-  for (let i = 0; i <= n; i++) m = Math.max(m, Math.abs(prefix[i] ?? 0));
-  return m;
-}
-
 /** Whether every frame starts at the partition's first row. */
-function isRunning(starts: Int32Array, n: number): boolean {
-  for (let i = 0; i < n; i++) if ((starts[i] ?? 0) !== 0) return false;
+function* isRunning(starts: Int32Array, n: number, slice: Slice): SlicedJob<boolean> {
+  for (let i = 0; i < n; i++) {
+    if ((starts[i] ?? 0) !== 0) return false;
+    if ((i & (WINDOW_STEP_ROWS - 1)) === WINDOW_STEP_ROWS - 1 && slice.due()) yield;
+  }
   return true;
 }
 

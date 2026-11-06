@@ -799,6 +799,10 @@ and the owner import it directly.
 
 ### Windows (`exec/window.ts`, `window-sort.ts`, `window-frames.ts`, `window-stream.ts`)
 
+- Prefix counts, ordinary and bigint sums, promotion, and long moving-frame aggregate scans
+  check the shared task clock inside bounded chunks. Resumptions after a task yield check
+  cancellation before continuing the kernel. Short streamed frames keep a synchronous path.
+
 - Float RANGE offsets follow PostgreSQL's `in_range_float8_float8`: NaN peers compare equal,
   NaN sorts above infinity, and NULL validity stays separate from numeric values. Infinite
   offsets retain PostgreSQL's infinity rules on both resident and streamed paths.

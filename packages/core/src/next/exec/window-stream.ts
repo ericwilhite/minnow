@@ -32,7 +32,13 @@ import { keysEqual, markChanges, type SortColumn } from "./sort-keys.js";
 import type { Slice, SlicedJob } from "./slices.js";
 import type { SpilledRun } from "./spill-pages.js";
 import type { Charge, Pool, SpillIo } from "./spill-pool.js";
-import { floatRangeContains, WindowError, type Frame, type FrameBound } from "./window-frames.js";
+import {
+  WINDOW_STEP_ROWS,
+  floatRangeContains,
+  WindowError,
+  type Frame,
+  type FrameBound,
+} from "./window-frames.js";
 
 /** nth_value's largest n a stream serves from its copy of the partition's first rows. */
 export const NTH_LIMIT = 4096;
@@ -1019,7 +1025,10 @@ export class PartitionStream {
         this.#next = next;
         const keep = this.#keepFrom(next);
         this.#pageChanges(placed);
-        for (let r = 0; r < page.rows; r++) this.#take(placed, r, keep);
+        for (let r = 0; r < page.rows; r++) {
+          this.#take(placed, r, keep);
+          if ((r & 511) === 511 && this.host.slice.due()) yield;
+        }
         if (this.host.slice.due()) yield;
       }
       if (next >= this.#read) break;
@@ -1050,7 +1059,7 @@ export class PartitionStream {
           for (let f = 0; f < this.#calls.length; f++) {
             const s = this.#calls[f];
             if (s === undefined) continue;
-            this.#compute(
+            const computation = this.#compute(
               s,
               f,
               j,
@@ -1060,8 +1069,10 @@ export class PartitionStream {
               bigs,
               ranges,
             );
+            if (computation !== undefined) yield* computation;
           }
           outRows++;
+          if (this.host.slice.due()) yield;
         }
         next += taken;
         if (outRows === BATCH_ROWS) yield* flush();
@@ -1113,7 +1124,7 @@ export class PartitionStream {
     valid: Uint8Array,
     bigs: Array<bigint[] | null>,
     ranges: number[],
-  ): void {
+  ): void | SlicedJob<void> {
     const fn = s.call.fn;
     const g = this.#groupOf(i);
     const ps = this.#groupStart(g);
@@ -1216,6 +1227,12 @@ export class PartitionStream {
         sum = sumTo(ranges[1] ?? -1);
         r = 1;
       }
+      if (scanRows(ranges, r, k) > WINDOW_STEP_ROWS)
+        return this.#longFrame(s, f, at, values, valid, bigs, ranges, r, k, {
+          kind: "sum",
+          value: sum,
+          count,
+        });
       for (; r < k; r++) {
         const b = ranges[2 * r + 1] ?? -1;
         for (let j = ranges[2 * r] ?? 0; j <= b; j++)
@@ -1238,6 +1255,11 @@ export class PartitionStream {
           best = s.extremeBig?.[b - this.#base] ?? BigInt(s.extreme[b - this.#base] ?? 0);
         r = 1;
       }
+      if (scanRows(ranges, r, k) > WINDOW_STEP_ROWS)
+        return this.#longFrame(s, f, at, values, valid, bigs, ranges, r, k, {
+          kind: "big",
+          value: best,
+        });
       for (; r < k; r++) {
         const b = ranges[2 * r + 1] ?? -1;
         for (let j = ranges[2 * r] ?? 0; j <= b; j++) {
@@ -1265,6 +1287,12 @@ export class PartitionStream {
       }
       r = 1;
     }
+    if (scanRows(ranges, r, k) > WINDOW_STEP_ROWS)
+      return this.#longFrame(s, f, at, values, valid, bigs, ranges, r, k, {
+        kind: "float",
+        value: best,
+        seen,
+      });
     for (; r < k; r++) {
       const b = ranges[2 * r + 1] ?? -1;
       for (let j = ranges[2 * r] ?? 0; j <= b; j++) {
@@ -1278,6 +1306,56 @@ export class PartitionStream {
     valid[at] = seen ? 1 : 0;
     const out = bigs[f];
     if (out !== null && out !== undefined) out[at] = seen ? BigInt(best) : 0n;
+  }
+
+  /** Long moving-frame scans suspend inside a frame; short frames keep the synchronous path. */
+  *#longFrame(
+    s: CallState,
+    f: number,
+    at: number,
+    values: Float64Array,
+    valid: Uint8Array,
+    bigs: Array<bigint[] | null>,
+    ranges: readonly number[],
+    from: number,
+    k: number,
+    state:
+      | { kind: "sum"; value: number; count: number }
+      | { kind: "float"; value: number; seen: boolean }
+      | { kind: "big"; value: bigint | null },
+  ): SlicedJob<void> {
+    const max = s.call.fn === "max";
+    for (let r = from; r < k; r++) {
+      const end = ranges[2 * r + 1] ?? -1;
+      for (let j = ranges[2 * r] ?? 0; j <= end; j++) {
+        const slot = j - this.#base;
+        if (s.ok[slot] === 1) {
+          if (state.kind === "sum") state.value += s.v[slot] ?? 0;
+          else if (state.kind === "big") {
+            const value = s.vBig?.[slot] ?? BigInt(s.v[slot] ?? 0);
+            if (state.value === null || (max ? value > state.value : value < state.value))
+              state.value = value;
+          } else {
+            const value = s.v[slot] ?? 0;
+            if (!state.seen || better(value, state.value, max)) state.value = value;
+            state.seen = true;
+          }
+        }
+        if ((j & (WINDOW_STEP_ROWS - 1)) === WINDOW_STEP_ROWS - 1 && this.host.slice.due()) yield;
+      }
+    }
+    if (state.kind === "sum")
+      values[at] = s.call.fn === "avg" ? state.value / state.count : state.value;
+    else if (state.kind === "big") {
+      values[at] = state.value === null ? 0 : Number(state.value);
+      valid[at] = state.value === null ? 0 : 1;
+      exactOut(bigs, f, at, values, valid)[at] = state.value ?? 0n;
+    } else {
+      values[at] = state.value;
+      valid[at] = state.seen ? 1 : 0;
+      const out = bigs[f];
+      if (out !== null && out !== undefined) out[at] = state.seen ? BigInt(state.value) : 0n;
+    }
   }
 
   /** The member row a first / last / nth value reads for row i (−1: none). */
@@ -1391,4 +1469,12 @@ function better(v: number, best: number, max: boolean): boolean {
   if (Number.isNaN(v)) return max && !Number.isNaN(best);
   if (Number.isNaN(best)) return !max;
   return max ? v > best : v < best;
+}
+
+/** Members that still require a scan (prefix ranges were already handled by cumulative state). */
+function scanRows(ranges: readonly number[], from: number, count: number): number {
+  let rows = 0;
+  for (let r = from; r < count; r++)
+    rows += Math.max(0, (ranges[2 * r + 1] ?? -1) - (ranges[2 * r] ?? 0) + 1);
+  return rows;
 }
