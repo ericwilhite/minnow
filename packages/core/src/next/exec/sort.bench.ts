@@ -245,7 +245,15 @@ for (const name of names) {
       { grant: grant as never, spill: new MemorySpillService(), queryId: 1 },
       sink,
     );
-    await drive(new ArraySource(s.input), operator, undefined, { yieldIntervalMs: Infinity });
+    const execute = () =>
+      drive(new ArraySource(s.input), operator, undefined, { yieldIntervalMs: Infinity });
+    const profileRegion = (
+      globalThis as {
+        minnowBenchProfile?: (label: string, run: () => void | Promise<void>) => Promise<void>;
+      }
+    ).minnowBenchProfile;
+    if (i === RUNS && profileRegion !== undefined) await profileRegion(name, execute);
+    else await execute();
     const ms = performance.now() - start;
     const used = process.cpuUsage(usage);
     if (sink.rows !== s.expect)
@@ -257,6 +265,7 @@ for (const name of names) {
     profile = (operator as SortOperator).profile;
     peak = governor.peakBytes;
   }
+  if (process.env.BENCH_JSON === "1") console.log(JSON.stringify({ name, cpuMs: cpu }));
   console.log(
     `${name}: ${stats(times)} (CPU ${stats(cpu)}); peak ${(peak / 2 ** 20).toFixed(1)} MiB, runs ${String(profile?.runs ?? 0)}, spilled ${((profile?.spilledBytes ?? 0) / 2 ** 20).toFixed(1)} MiB, mode ${profile?.mode ?? "?"}`,
   );

@@ -308,7 +308,11 @@ const stats = (ms: number[]) => {
   return `min ${(sorted[0] ?? 0).toFixed(0)}, median ${(sorted[sorted.length >> 1] ?? 0).toFixed(0)} ms`;
 };
 
-async function time(make: (grant: never, sink: Operator) => Operator, minimum: number) {
+async function time(
+  make: (grant: never, sink: Operator) => Operator,
+  minimum: number,
+  label: string,
+) {
   const wall: number[] = [];
   const cpu: number[] = [];
   let out = 0;
@@ -320,9 +324,15 @@ async function time(make: (grant: never, sink: Operator) => Operator, minimum: n
     const usage = process.cpuUsage();
     const start = performance.now();
     const op = make(grant as never, sink);
-    await drive(new ArraySource(input), op, undefined, {
-      yieldIntervalMs: Infinity,
-    });
+    const execute = () =>
+      drive(new ArraySource(input), op, undefined, { yieldIntervalMs: Infinity });
+    const profileRegion = (
+      globalThis as {
+        minnowBenchProfile?: (label: string, run: () => void | Promise<void>) => Promise<void>;
+      }
+    ).minnowBenchProfile;
+    if (r === RUNS && profileRegion !== undefined) await profileRegion(label, execute);
+    else await execute();
     const profile = (op as { profile?: { groupedRows?: number; groupedFallbacks?: number } })
       .profile;
     if (r === 0 && profile?.groupedRows !== undefined)
@@ -337,7 +347,7 @@ async function time(make: (grant: never, sink: Operator) => Operator, minimum: n
       cpu.push((used.user + used.system) / 1000);
     }
   }
-  return { wall: stats(wall), cpu: stats(cpu), out };
+  return { wall: stats(wall), cpu: stats(cpu), out, cpuMs: cpu };
 }
 
 let input: Batch[] = [];
@@ -361,10 +371,12 @@ for (const name of names) {
               sink,
             ),
           sortMinimumBytes(s.types),
+          name,
         )
       : await time(
           (grant, sink) => new WindowOperator(spec, context(grant), sink),
           windowMinimumBytes(s.types, spec.functions.length),
+          name,
         );
   const sort =
     process.env.SORT === "0"
@@ -377,7 +389,10 @@ for (const name of names) {
               sink,
             ),
           sortMinimumBytes(s.types),
+          `sort-${name}`,
         );
+  if (process.env.BENCH_JSON === "1")
+    console.log(JSON.stringify({ name, cpuMs: run.cpuMs, rows: run.out }));
   console.log(
     `${name}: ${run.wall} (CPU ${run.cpu}); sort alone ${sort.wall} (CPU ${sort.cpu}); ${String(run.out)} rows`,
   );
