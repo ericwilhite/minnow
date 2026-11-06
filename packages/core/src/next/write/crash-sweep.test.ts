@@ -20,6 +20,7 @@ import {
   ints,
   locators,
   rowsOf,
+  rules,
   tableInput,
 } from "./test-support.js";
 
@@ -32,6 +33,8 @@ interface Outcome {
   readonly acked: Expect;
   /** Ids an interrupted operation touched: either state is allowed. */
   readonly uncertain: Map<number, Array<number | "deleted" | "absent">>;
+  /** Ids one transaction inserted: after any crash, all of them or none (atomic commit). */
+  readonly atomic?: number[][];
 }
 
 async function probe(
@@ -123,6 +126,111 @@ async function scenario(harness: Harness, outcome: Outcome): Promise<void> {
   await harness.close();
 }
 
+/**
+ * Large transactions (format/replay.ts "Large transactions"): committed rows, then a transaction
+ * of many calls over small memtables that stages, deletes one of its staged rows, rolls back to a
+ * savepoint and commits; then one that stages and rolls back; then a reopen and more rows. A crash
+ * at any step keeps or loses each transaction whole.
+ */
+async function stagedScenario(harness: Harness, outcome: Outcome): Promise<void> {
+  let path = await harness.open();
+  let t = 0;
+  await autocommit(path, async (s) => {
+    t =
+      (
+        await s.changeCatalog({
+          kind: "createTable",
+          table: tableInput("t", [column("id", INT, false), column("v", INT)]),
+        })
+      ).id ?? 0;
+  });
+  const v = path.catalog.table(t)?.columns[1]?.id ?? 0;
+  await autocommit(path, (s) =>
+    s.changeCatalog({
+      kind: "createIndex",
+      index: { tableId: t, name: "v_idx", columnIds: [v], unique: false, role: "secondary" },
+    }),
+  );
+  const commit = async (ids: number[]) => {
+    for (const id of ids) outcome.uncertain.set(id, ["absent", id * 10]);
+    await autocommit(path, (s) =>
+      s.table(t).insert(batch(ints(ids), ints(ids.map((id) => id * 10))), null),
+    );
+    for (const id of ids) {
+      outcome.uncertain.delete(id);
+      outcome.acked.set(id, id * 10);
+    }
+  };
+  await commit(Array.from({ length: 12 }, (_, k) => k));
+  // The large transaction: 6 calls of 8 rows stage; a savepoint drops the last 2 calls.
+  const tx = await path.begin();
+  const kept: number[] = [];
+  const s = tx.statement({ rules });
+  for (let call = 0; call < 6; call++) {
+    const ids = Array.from({ length: 8 }, (_, k) => 100 + call * 8 + k);
+    await s.table(t).insert(batch(ints(ids), ints(ids.map((id) => id * 10))), null);
+    kept.push(...ids);
+  }
+  await s.end();
+  const savepoint = tx.savepoint();
+  const later = tx.statement({ rules });
+  for (let call = 0; call < 2; call++) {
+    const ids = Array.from({ length: 8 }, (_, k) => 200 + call * 8 + k);
+    await later.table(t).insert(batch(ints(ids), ints(ids.map((id) => id * 10))), null);
+  }
+  await later.end();
+  expect(path.maintenance.stages).toBeGreaterThan(0);
+  tx.rollbackTo(savepoint);
+  // A staged row deleted by a later statement.
+  const d = tx.statement({ rules });
+  const [located] = await probeIn(d, t, [100]);
+  await d.table(t).delete(batch(locators([located ?? 0], t)), null);
+  await d.end();
+  const committed = kept.filter((id) => id !== 100);
+  for (const id of committed) outcome.uncertain.set(id, ["absent", id * 10]);
+  outcome.atomic?.push(committed);
+  const receipt = await tx.commit(null);
+  await receipt.durable;
+  for (const id of committed) {
+    outcome.uncertain.delete(id);
+    outcome.acked.set(id, id * 10);
+  }
+  // One that stages and rolls back: none of it may ever appear.
+  const gone = await path.begin();
+  const g = gone.statement({ rules });
+  for (let call = 0; call < 4; call++) {
+    const ids = Array.from({ length: 8 }, (_, k) => 300 + call * 8 + k);
+    await g.table(t).insert(batch(ints(ids), ints(ids)), null);
+  }
+  await g.end();
+  gone.rollback();
+  await path.quiesce();
+  path = await harness.reopen();
+  await commit(Array.from({ length: 20 }, (_, k) => 400 + k));
+  await path.quiesce();
+  await harness.close();
+}
+
+/** Locators of `ids` in a statement's view (primary key). */
+async function probeIn(
+  statement: { view: import("../access/snapshot.js").Snapshot },
+  t: number,
+  ids: number[],
+): Promise<number[]> {
+  const view = statement.view;
+  const encoded = new KeyBatch(FREE);
+  encodeKeyBatch(
+    "equality",
+    [{ vector: ints(ids), direction: "asc", nulls: "first" }],
+    { length: ids.length, selection: null },
+    encoded,
+  );
+  const out = { probes: new Int32Array(64), locators: new Float64Array(64), count: 0 };
+  await view.index(t, view.catalog.table(t)?.primaryKey ?? 0).probe(encoded, out);
+  encoded.close();
+  return Array.from(out.locators.subarray(0, out.count));
+}
+
 async function verify(harness: Harness, outcome: Outcome): Promise<void> {
   const path = await harness.open();
   const t = path.catalog.tableByName("t")?.id;
@@ -144,6 +252,13 @@ async function verify(harness: Harness, outcome: Outcome): Promise<void> {
   for (const [id, value] of rows) {
     const allowed = outcome.uncertain.get(id) ?? [outcome.acked.get(id) ?? "absent"];
     expect(allowed, `row ${String(id)} = ${String(value)}`).toContain(value);
+  }
+  for (const group of outcome.atomic ?? []) {
+    const present = group.filter((id) => rows.has(id)).length;
+    expect(
+      [0, group.length],
+      `a transaction's ${String(group.length)} rows, all or none`,
+    ).toContain(present);
   }
   // Indexes agree with the rows.
   const def = path.catalog.table(t);
@@ -197,9 +312,12 @@ describe("crash sweep", () => {
   });
 
   /** Crashes `make(disk)`'s scenario at every step of a clean run's step count. */
-  async function sweep(make: (disk?: SimDisk) => Harness): Promise<void> {
+  async function sweep(
+    make: (disk?: SimDisk) => Harness,
+    run: (harness: Harness, outcome: Outcome) => Promise<void> = scenario,
+  ): Promise<void> {
     const clean = make();
-    await scenario(clean, { acked: new Map(), uncertain: new Map() });
+    await run(clean, { acked: new Map(), uncertain: new Map() });
     const steps = clean.disk.steps;
     // The scenario really crosses flushes: the clean store holds several published groups.
     const done = await clean.open();
@@ -214,9 +332,9 @@ describe("crash sweep", () => {
     let crashes = 0;
     for (let at = Number(process.env.MINNOW_CRASH_STEP ?? 0); at < steps; at++) {
       const disk = new SimDisk({ seed: at, crashAtStep: at });
-      const outcome: Outcome = { acked: new Map(), uncertain: new Map() };
+      const outcome: Outcome = { acked: new Map(), uncertain: new Map(), atomic: [] };
       try {
-        await scenario(make(disk), outcome);
+        await run(make(disk), outcome);
       } catch (error) {
         // Any failure after the power loss is the dead world; one before it is a real bug.
         if (disk.steps <= at) throw error;
@@ -274,5 +392,17 @@ describe("crash sweep", () => {
     expect(Math.max(...levels)).toBeGreaterThanOrEqual(2);
     await probe.close();
     await sweep(make);
+  }, 1_800_000);
+
+  it("survives a crash at every physical step of large transactions (staging, commit, fold)", async () => {
+    const make = (disk?: SimDisk) =>
+      new Harness("strict", "sim", 8, disk, { merges: { mode: "off" } });
+    // The clean run stages, folds, and drops a rolled-back staging.
+    const clean = make();
+    await stagedScenario(clean, { acked: new Map(), uncertain: new Map(), atomic: [] });
+    const path = await clean.open();
+    expect(path.state().root.tables.every((table) => table.staged.length === 0)).toBe(true);
+    await clean.close();
+    await sweep(make, stagedScenario);
   }, 1_800_000);
 });

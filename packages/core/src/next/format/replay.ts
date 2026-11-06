@@ -30,6 +30,9 @@
  *   corruption) and must still stage that transaction (else corruption); applying makes the
  *   staged rows and their staged index runs visible together, and consumes the staging. The frame
  *   names the indexes it built runs for; if they differ from the staged runs, replay refuses.
+ * A rowless memtable holding replayed deletion deltas occupies no row ids. Its allocation
+ * start may be ahead of staged groups that still need replay; retain its tombstones without
+ * treating that start as occupied rows when checking group overlap.
  * After replay, staging no frame claimed belongs to a transaction that never committed: recovery
  * drops it (`Replayer.unclaimedStaging`) with a publish whose root no longer lists it. That publish
  * retires the staging's extents; they are reused only once neither durable root (current and

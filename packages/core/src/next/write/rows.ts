@@ -10,6 +10,7 @@ import { ChunkReader } from "../page/reader.js";
 import type { FlatVector } from "../vector/vector.js";
 import { allocateData } from "../vector/vector.js";
 import { ColumnChunk, MEMORY_CHUNK_ROWS } from "./columns.js";
+import { groupRootOf } from "./memtable.js";
 import type { TableSnapshotImpl } from "./view.js";
 
 const ONE = new Uint16Array(1);
@@ -55,7 +56,12 @@ export function readRows(
         }
         continue;
       }
-      pending.push(readGroupRows(table, memtable.published.groupRoot, rows, sources));
+      const root = groupRootOf(memtable.published.groupRoot);
+      pending.push(
+        root instanceof Promise
+          ? root.then((resolved) => readGroupRows(table, resolved, rows, sources))
+          : readGroupRows(table, root, rows, sources),
+      );
       continue;
     }
     const root = segment.root();

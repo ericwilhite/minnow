@@ -117,6 +117,8 @@ describe("next/ dependency rules", () => {
       for (const edge of importsOf(file).filter((candidate) => inNext(candidate.target))) {
         const target = moduleOf(edge.target);
         if (target === module) continue;
+        // R23.5 owns the worker scheduler here; this is the sole write -> exec exception.
+        if (module === "write" && edge.target === join(NEXT, "exec/pipeline.js")) continue;
         expect(allowed, `${relative(SRC, file)} imports next/${target}`).toContain(target);
       }
     }

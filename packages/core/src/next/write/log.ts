@@ -9,8 +9,13 @@
  *   header slot not holding the newest header (generation + 1) acknowledging the previous durable
  *   group, and calls `flushLog` once. Frames queued meanwhile form the next group. Strict mode
  *   starts a flush as soon as the current task ends; relaxed mode within `RELAXED_DELAY_MS`.
- * - After the last flush, an idle flush (`IDLE_FLUSH_MS`) writes a header acknowledging the newest
- *   group, so every acknowledged group but none is exposed to a cleanly truncated log.
+ * - After the last flush, an idle flush writes a header acknowledging the newest group.
+ *   Its target is `IDLE_FLUSH_MS` from the last append (commit), including the initial flush.
+ *   The 45 ms timer budget starts at append; an initial flush that consumes that budget arms
+ *   the idle timer immediately when it finishes. The 100 ms target assumes the initial flush,
+ *   timer dispatch (up to ~55 ms under continuous execution), and acknowledging I/O fit that
+ *   deadline. Slow storage or a suspended worker can exceed it; this is not an unconditional
+ *   wall-clock guarantee. While commits continue each flush acknowledges the previous group.
  * - Any append or flush failure fails the appender: every waiter rejects with
  *   `WritePathFailedError` and later calls throw it.
  * - **Recycling** (access/write-path.ts "Log recycling"): `beginRecycle` fixes the cut (the last
@@ -32,7 +37,10 @@ import {
 import type { StoreSession } from "../storage/contract.js";
 import { need } from "./bytes.js";
 
+/** Idle acknowledgement target from the last append, subject to scheduling and I/O latency. */
 export const IDLE_FLUSH_MS = 100;
+/** Timer budget from append, including initial flush time: leaves ~55 ms for dispatch and I/O. */
+export const IDLE_ARM_MS = 45;
 export const RELAXED_DELAY_MS = 5;
 
 export interface LogPosition {
@@ -99,6 +107,7 @@ export class LogAppender {
   #flushing: Promise<void> | null = null;
   #scheduled = false;
   #idle: ReturnType<typeof setTimeout> | null = null;
+  #lastAppendAt = performance.now();
   #failure: Error | null = null;
   readonly #waiters: Array<{ lsn: number; resolve: () => void; reject: (error: Error) => void }> =
     [];
@@ -158,6 +167,7 @@ export class LogAppender {
     this.#check();
     const parts = Math.max(1, Math.ceil(body.length / MAX_FRAME_BODY_BYTES));
     if (parts > MAX_FRAME_PARTS) throw new RangeError("A transaction is too large for the log");
+    this.#lastAppendAt = performance.now();
     const first = this.#lastLsn + 1;
     if (first + parts - 1 > MAX_LSN) throw new LogExhaustedError(this.#lastLsn, parts);
     if (this.#deferred !== null) {
@@ -396,10 +406,13 @@ export class LogAppender {
 
   #armIdle(): void {
     if (this.#acked.lsn >= this.#durable.lsn || this.#idle !== null) return;
-    this.#idle = setTimeout(() => {
-      this.#idle = null;
-      void this.#idleFlush();
-    }, IDLE_FLUSH_MS);
+    this.#idle = setTimeout(
+      () => {
+        this.#idle = null;
+        void this.#idleFlush();
+      },
+      Math.max(0, IDLE_ARM_MS - (performance.now() - this.#lastAppendAt)),
+    );
     const timer = this.#idle as { unref?: () => void };
     timer.unref?.();
   }

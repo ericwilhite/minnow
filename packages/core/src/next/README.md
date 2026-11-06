@@ -71,6 +71,10 @@ is access's `Snapshot`.
   - `lower/` may call the front end (parser, catalog rewrites, optimizer);
   - `owner/` is the composition root;
   - `testing/` holds the differential adapter.
+- `write/` also imports `exec/pipeline.ts` for the shared worker task clock and task yields
+  (R23.5). This is the only write-to-exec dependency: retirement and merge slice checks use that
+  clock, and every write task yield stamps it through the shared scheduler. Publication, table
+  and merge entry never reset it. Cached metadata promises do not begin a task.
 - The executor never calls the front end.
 
 ## Contracts and their invariants

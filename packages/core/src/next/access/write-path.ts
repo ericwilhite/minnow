@@ -22,16 +22,56 @@
  *    groups with their index runs: snapshot.ts "Segments") first publishes a root that stages
  *    those groups and runs under the transaction's id (`TableRoot.staged`), and its frame carries
  *    a `publishedRows` effect naming that root and the indexes it built runs for, instead of the
- *    rows (format/replay.ts "Large transactions"); the frame is still the commit point;
+ *    rows (format/replay.ts "Large transactions"); the frame is still the commit point.
+ *    What stages (memtable.ts "Staged"): a frozen memtable of the open transaction's rows alone,
+ *    in a table whose catalog entry the transaction did not change, once a root can carry the
+ *    table, and only after every earlier memtable of its rows is staged (the commit's effects
+ *    stay in row-id order). It stages at the transaction's next statement call. Its own index
+ *    puts become the staged runs; other entries (tombstones of older rows) stay resident. A
+ *    rollback truncates; at commit the staging is made exact first (emptied memtables dropped,
+ *    truncated tails deleted and filtered from their runs), and the commit's live tail freezes so
+ *    the next flush folds the staged groups into the table. No flush ever takes a memtable
+ *    holding uncommitted rows (C1's forced tail freeze included).
+ *    **Limit (quadratic metadata, follow-up):** each stage publication rewrites the staging's
+ *    whole directory and its root lists every staged run again (`TableRoot.staged` names one
+ *    directory blob, so true append-only needs a format change). Over a transaction that stages
+ *    G groups that is G(G+1)/2 directory entries (about 30 B each) and the same number of run
+ *    references per index in roots (about 46 B each). Measured: 1M narrow rows at 65,536-row
+ *    memtables stage 15 groups: 120 entries, about 3.6 KB of directories and 5.5 KB of root per
+ *    index over the whole load; 100M rows stage 1,526 groups: 1.17M entries, about 35 MB of
+ *    directories and 54 MB of roots per index (a few percent of the rows' bytes). Follow-up:
+ *    a chained staged directory (append a page per stage) and run lists held by reference;
  * 3. appends the frames, makes the transaction's changes committed in memory (restamping its
  *    pending seqs to its LSN), and releases the writer slot. `commit` resolves here;
  * 4. the frames become durable with the next log flush: if none is running one starts at once;
  *    commits appended while one runs share the next (one flush per group). That flush also writes
- *    the header slot acknowledging the previous group; an idle flush ≤ 100 ms after the last
- *    commit acknowledges the newest. `receipt.durable` resolves after it.
+ *    the header slot acknowledging the previous group. The idle acknowledgement targets
+ *    100 ms from the last append (commit). Its 45 ms timer budget includes the initial flush:
+ *    if that flush consumes the budget, the idle timer is armed immediately when it completes.
+ *    The target assumes the initial flush, timer dispatch and acknowledging I/O fit the deadline;
+ *    slow storage or a suspended worker can exceed it. Continuous execution can delay timers
+ *    about 50 ms plus one slice, so the timer leaves that allowance instead of waiting 100 ms.
+ *    While commits continue each group's flush acknowledges the previous group. `receipt.durable`
+ *    resolves after the commit's own flush, before the idle acknowledgement.
  * **No-effect transactions** (nothing written, or everything rolled back) write no frame:
  * `receipt.wrote` is false, `lsn` is the base LSN. The owner then settles the request without an
  * outcome (format/ledger.ts `settle`); a retry runs again, which is correct for a no-op.
+ *
+ * Reads of published or staged chunks, including recovered lazy groups, load pages and then
+ * their out-of-line values before decoding (page/large-value.ts). The fold reuses group metadata;
+ * index-run merges read keys and row ids, without decoding row chunks.
+ *
+ * Recovery schedules the staging fold in a later task, after open has delivered ready;
+ * no group-root read begins as part of open, including its queued microtasks.
+ *
+ * Retirement of unclaimed staging runs in task slices, checks close and the open signal,
+ * and deduplicates extent identities in a set. It runs at the first publication after open.
+ * Its conservative task-start bound is retained across tables and publications, advancing only
+ * after a real task yield. This is interim integration; R23.5 requires the shared per-worker
+ * task clock before merge, without an exception for a per-operation clock.
+ *
+ * Closing cancels in-flight staging at write boundaries and waits for its writer to settle
+ * before rolling back or releasing the memtables and grants it uses.
  *
  * ## Ledger (ruling R9)
  * The owner admits every request (`ledger.admit`), records failures and the session-scoped
