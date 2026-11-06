@@ -252,11 +252,6 @@ export class AggregateOperator implements Operator {
       if (this.#isAborted()) throw this.#abortReason;
       if (this.#now() - sliceStart >= this.#interval) return yieldTask().then(() => this.#emit());
       let count = Math.min(BATCH_ROWS, total - this.#emitted);
-      // Expensive per-group results (AVG over NUMERIC) are prepared under the slice's deadline,
-      // and the batch shrinks to what is ready: the rest resumes after a task yield.
-      for (const { accumulator } of this.#aggregates)
-        if (accumulator.prepare !== undefined)
-          count = Math.min(count, accumulator.prepare(this.#emitted, count, expired));
       let bytes = this.#outputBytes(this.#emitted, count);
       while (count > 1 && bytes > this.#target) {
         count = Math.max(1, Math.floor(count / 2));
@@ -272,6 +267,17 @@ export class AggregateOperator implements Operator {
         bytes = this.#outputBytes(this.#emitted, count);
       }
       this.#outputHeld = bytes;
+      // Expensive per-group results (AVG over NUMERIC) are prepared under the slice's deadline,
+      // only for this batch, after its output charge: the batch shrinks to what is ready (its
+      // charge stays an upper bound) and the rest resumes after a task yield.
+      try {
+        for (const { accumulator } of this.#aggregates)
+          if (accumulator.prepare !== undefined)
+            count = Math.min(count, accumulator.prepare(this.#emitted, count, expired));
+      } catch (error) {
+        this.#releaseOutput();
+        throw error;
+      }
       const columns: FlatVector[] = [];
       try {
         const groups = this.#groups;

@@ -1219,11 +1219,7 @@ class DecimalSumAccumulator implements Accumulator {
   prepare(from: number, count: number, expired: () => boolean): number {
     if (!this.average) return count;
     const cache = this.#prepared;
-    if (cache.from !== from) {
-      cache.from = from;
-      cache.coefficients.length = 0;
-      cache.scales.length = 0;
-    }
+    if (cache.from !== from) this.#clearPrepared(from);
     const uniform = this.#scale >= 0 ? this.#scale : null;
     const sums = this.#sums;
     let since = 0;
@@ -1242,6 +1238,10 @@ class DecimalSumAccumulator implements Accumulator {
         coefficient = checkNumericRange(outcome.coefficient, outcome.scale);
         scale = outcome.scale;
       }
+      // Charged before it is kept (the governor's bigintBytes, plus its two array slots).
+      const bytes = (coefficient === 0n ? 0 : bigintBytes(coefficient)) + 2 * SLOT_BYTES;
+      this.#memory.take(bytes);
+      cache.bytes += bytes;
       cache.coefficients.push(coefficient);
       cache.scales.push(scale);
       since += 1;
@@ -1251,12 +1251,27 @@ class DecimalSumAccumulator implements Accumulator {
     return cache.coefficients.length;
   }
 
-  /** AVG results prepared for groups `from …` (see `prepare`). */
-  readonly #prepared: { from: number; coefficients: bigint[]; scales: number[] } = {
+  /**
+   * AVG results prepared for groups `from …` (see `prepare`), and the bytes charged for them. The
+   * operator prepares only what its next output batch holds, which `#average` then takes whole:
+   * nothing prepared outlives that batch (a yield, backpressure); close and abort clear it.
+   */
+  readonly #prepared: { from: number; coefficients: bigint[]; scales: number[]; bytes: number } = {
     from: -1,
     coefficients: [],
     scales: [],
+    bytes: 0,
   };
+
+  /** Drops prepared results and their charge; the cache restarts at `from`. */
+  #clearPrepared(from: number): void {
+    const cache = this.#prepared;
+    if (cache.bytes > 0) this.#memory.give(cache.bytes);
+    cache.bytes = 0;
+    cache.from = from;
+    cache.coefficients.length = 0;
+    cache.scales.length = 0;
+  }
 
   #average(
     from: number,
@@ -1269,10 +1284,22 @@ class DecimalSumAccumulator implements Accumulator {
     const cache = this.#prepared;
     const coefficients = cache.coefficients.slice(0, count);
     const scales = Uint16Array.from(cache.scales.slice(0, count));
-    // The cache moves on to the groups after this batch.
-    cache.from = from + count;
-    cache.coefficients.splice(0, count);
-    cache.scales.splice(0, count);
+    // The output batch holds them now (charged as output): the cache and its charge go, and it
+    // moves on to the groups after this batch.
+    if (cache.coefficients.length === count) this.#clearPrepared(from + count);
+    else {
+      // Only a direct emit of fewer groups than prepared (not the operator's path) keeps a rest:
+      // its charge is re-derived from what stays.
+      cache.coefficients.splice(0, count);
+      cache.scales.splice(0, count);
+      const kept = cache.coefficients.reduce(
+        (n, c) => n + (c === 0n ? 0 : bigintBytes(c)) + 2 * SLOT_BYTES,
+        0,
+      );
+      this.#memory.give(cache.bytes - kept);
+      cache.bytes = kept;
+      cache.from = from + count;
+    }
     let anySpecial = false;
     for (let k = 0; k < count; k++) if (specials[k] !== 0) anySpecial = true;
     return {
@@ -1290,6 +1317,7 @@ class DecimalSumAccumulator implements Accumulator {
     };
   }
   close(): void {
+    this.#clearPrepared(-1);
     this.#memory.close();
     this.#sums.close();
   }

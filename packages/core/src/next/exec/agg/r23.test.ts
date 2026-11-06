@@ -156,8 +156,9 @@ describe("R23: the aggregate operator's finish", () => {
       let tickB = 0;
       const a = collector();
       const b = collector();
-      // Small output batches: the byte bound trims a batch below what AVG prepared, so
-      // prepared state outlives a slice and must belong to its own operator.
+      // Small output batches and slices: many yields between the two instances' batches (AVG
+      // prepares only what each batch holds, so nothing prepared outlives a slice; per-instance
+      // state such as output charges and the cursor must still stay apart).
       const opA = operator([0], AGGREGATES, a.sink, { now: () => tickA++, targetBytes: 8192 });
       const opB = operator([0], AGGREGATES, b.sink, {
         now: () => (tickB += 3),
