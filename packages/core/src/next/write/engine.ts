@@ -140,6 +140,7 @@ import {
   planMerge,
   runExtent,
   yieldTask,
+  YIELD_INTERVAL_MS,
   type MergePlan,
   type MergePolicy,
 } from "./merge.js";
@@ -400,6 +401,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   readonly #space: Space;
   readonly #grant: Grant;
   readonly #now: () => number;
+  readonly #signal: AbortSignal | undefined;
   #appender!: LogAppender;
   #catalog: Catalog;
   /** The catalog of the current root (as of its global LSN). */
@@ -592,6 +594,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#afterDeltaPrepared = input.tuning?.afterDeltaPrepared ?? null;
     this.#stageFault = input.tuning?.stageFault ?? null;
     this.#now = input.options.now ?? Date.now;
+    this.#signal = input.options.signal;
     this.#root = root;
     this.#catalog = catalog;
     this.#baseCatalog = catalog;
@@ -3863,13 +3866,29 @@ export class WritePathImpl implements WritePath, EngineHooks {
   async #tableExtents(table: TableRoot): Promise<ExtentRef[]> {
     const single: ManifestRoot = { ...this.#root, tables: [table] };
     const extents: ExtentRef[] = [];
+    const seen = new Set<string>();
+    // Until the shared worker task clock lands (R23.5), keep the deadline across all
+    // cached metadata continuations, resetting only after a real task yield.
+    let start = performance.now();
     for await (const reached of walkReachable(
       single,
       manifestReader(this.#metadata, this.#grant),
     )) {
+      this.#check();
+      this.#signal?.throwIfAborted();
+      if (performance.now() - start >= YIELD_INTERVAL_MS) {
+        await yieldTask();
+        start = performance.now();
+        this.#check();
+        this.#signal?.throwIfAborted();
+      }
       if (reached.kind === "catalog") continue;
       const extent = "extent" in reached.ref ? reached.ref.extent : reached.ref;
-      if (!extents.some((known) => sameExtent(known, extent))) extents.push(extent);
+      const key = `${String(extent.offset)}:${String(extent.length)}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        extents.push(extent);
+      }
     }
     return extents;
   }
