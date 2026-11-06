@@ -13152,11 +13152,14 @@ function assertDistinctOnLeadsOrder(
     }
     return resolveAlias(expression);
   };
-  const bare = (expression: Expression) =>
-    expression.kind === "column" ? (expression.reference.split(".").at(-1) ?? "") : undefined;
+  // Column references compare by bare name at any depth (`b.id + 0` is `id + 0`): names are not
+  // bound to sources yet, and this can only let a mismatch through, never refuse a valid query.
+  const bareColumns = (expression: Expression): Expression =>
+    expression.kind === "column"
+      ? { kind: "column", reference: expression.reference.split(".").at(-1) ?? "" }
+      : mapChildExpressions(expression, bareColumns);
   const same = (left: Expression, right: Expression) =>
-    encodeQueryIdentity(left) === encodeQueryIdentity(right) ||
-    (bare(left) !== undefined && bare(left) === bare(right));
+    encodeQueryIdentity(bareColumns(left)) === encodeQueryIdentity(bareColumns(right));
   const keys = distinctOn.map(resolve);
   const covered: Expression[] = [];
   const seen: Expression[] = [];

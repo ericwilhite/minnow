@@ -1288,6 +1288,8 @@ function distinctOnCases(): Case[] {
     ),
     // Integer constants are select-list positions in DISTINCT ON and in its ORDER BY, which
     // decides both the row each group keeps and the order of the result.
+    // A qualified spelling inside an expression is the same sort target (review B6-streamA-1).
+    pg(`SELECT DISTINCT ON (id + 0) id, amount FROM data ORDER BY data.id + 0, amount DESC`),
     pg(`SELECT DISTINCT ON (1) region, id, amount FROM data ORDER BY 1 NULLS LAST, 3 DESC, 2`),
     pg(`SELECT DISTINCT ON (region) region, id, amount FROM data ORDER BY 1 NULLS LAST, 3, 2 DESC`),
     pg(`SELECT DISTINCT ON (2, 1) active, region, id FROM data ORDER BY 1, 2 NULLS LAST, 3 DESC`),
@@ -2788,6 +2790,57 @@ describe("SQL conformance against SQLite and PGlite", () => {
     expect(mismatches.slice(0, 10).join("\n"), `${String(mismatches.length)} differ`).toBe("");
     // The pool must reach both outcomes, or the comparison above checks only one of them.
     expect(refused).toBeGreaterThan(50);
+    expect(refused).toBeLessThan(keyLists.length * orders.length);
+  });
+
+  it("matches DISTINCT ON keys to ORDER BY however the expression is spelled, as PostgreSQL", async () => {
+    // The same expression qualified or not, inside arithmetic, or through its output alias, is
+    // one sort target (PostgreSQL resolves both lists to target entries before comparing).
+    const fixture = buildFixture(DEFAULT_FIXTURE_SEED);
+    const database = await minnowFixture(fixture);
+    const postgres = await pgliteOracle(fixture);
+    const keyLists = ["id % 7", "data.id % 7", "k"];
+    const pool = ["id % 7", "data.id % 7 DESC", "k", "active", "data.region NULLS LAST"];
+    const orders: string[][] = [];
+    for (const a of pool) {
+      orders.push([a]);
+      for (const b of pool.filter((item) => item !== a)) {
+        orders.push([a, b]);
+        for (const c of pool.filter((item) => item !== a && item !== b)) orders.push([a, b, c]);
+      }
+    }
+    const mismatches: string[] = [];
+    let refused = 0;
+    try {
+      for (const keys of keyLists)
+        for (const order of orders) {
+          const sql = `SELECT DISTINCT ON (${keys}) id % 7 AS k, active FROM data ORDER BY ${order.join(", ")}`;
+          let expected: string;
+          try {
+            expected = `rows ${String((await postgres.execute({ sql, ordered: false })).rows.length)}`;
+          } catch (error) {
+            expected = `error ${String((error as { code?: string }).code)}`;
+          }
+          let actual: string;
+          try {
+            actual = `rows ${String((await database.query(sql)).rows.length)}`;
+          } catch (error) {
+            actual = String(error).includes(
+              "SELECT DISTINCT ON expressions must match initial ORDER BY expressions",
+            )
+              ? "error 42P10"
+              : `error ${String(error)}`;
+          }
+          if (expected === "error 42P10") refused += 1;
+          if (actual !== expected)
+            mismatches.push(`${sql}\n  pglite: ${expected}\n  minnow: ${actual}`);
+        }
+    } finally {
+      await postgres.close();
+      await database.close();
+    }
+    expect(mismatches.slice(0, 10).join("\n"), `${String(mismatches.length)} differ`).toBe("");
+    expect(refused).toBeGreaterThan(20);
     expect(refused).toBeLessThan(keyLists.length * orders.length);
   });
 
