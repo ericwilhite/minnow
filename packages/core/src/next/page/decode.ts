@@ -149,11 +149,28 @@ function max32(codes: Uint32Array, rows: number): number {
   return max;
 }
 
+/**
+ * Every code of a dictionary page lies inside its chunk's dictionary of `size` entries: the
+ * one check of the dictionary domain (review B2-p2d #1). `parsePage` already proved `aux` ≥
+ * every code, so it is O(1). Called where the page is validated against its chunk (the reader's
+ * parse, once per page or cache residency) and by every consumer handed a page directly.
+ */
+export function checkDictionaryCodes(view: PageView, size: number): void {
+  if (view.kind !== PageEncoding.dictionary || view.allNull) return;
+  check(view.aux < size, "Dictionary code outside the dictionary");
+}
+
+/**
+ * `dictionarySize`: the chunk's dictionary entries (its directory's dictionary page), checked
+ * against a dictionary page's codes (`checkDictionaryCodes`); omitted, the caller checks before
+ * it decodes or selects.
+ */
 export function parsePage(
   stored: Uint8Array,
   entry: PageEntry,
   chunkTag: number,
   chunkScale: number | null = 0,
+  dictionarySize?: number,
 ): PageView {
   const bytes = aligned(stored);
   check(bytes.length >= PAGE_HEADER_BYTES, "Page is shorter than its header");
@@ -395,7 +412,7 @@ export function parsePage(
     safe &&
     (tag === ValueTag.i64 || tag === ValueTag.dec64) &&
     headerBoundsSafe(kind, width, baseNumber, checkpoints, rows);
-  return {
+  const view: PageView = {
     bytes,
     kind,
     tag,
@@ -421,6 +438,8 @@ export function parsePage(
     plain,
     data,
   };
+  if (dictionarySize !== undefined) checkDictionaryCodes(view, dictionarySize);
+  return view;
 }
 
 /**
@@ -1231,13 +1250,7 @@ function decodeValues(
   const count = to - from;
   if (view.kind === PageEncoding.dictionary && dictionary === null)
     throw new RangeError("A dictionary page needs its chunk's dictionary");
-  if (
-    view.kind === PageEncoding.dictionary &&
-    dictionary !== null &&
-    view.aux >= dictionary.size &&
-    !view.allNull
-  )
-    throw new RangeError("Dictionary code outside the dictionary");
+  if (dictionary !== null) checkDictionaryCodes(view, dictionary.size);
   switch (data.layout) {
     case "bool": {
       expectTag(tag, ValueTag.bool);

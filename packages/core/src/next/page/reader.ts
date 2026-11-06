@@ -601,7 +601,15 @@ export class ChunkReader {
         this.#dictionaryHeld = held;
         this.#dictionaryVector = dictionaryVector(dictionary, this.chunk.type);
       } else {
-        this.#pages[page] = parsePage(bytes, entry, this.directory.tag, this.directory.scale);
+        // Validated against the chunk, its dictionary's domain included: every consumer
+        // (select, refine, gather, decode) relies on this one check (review B2-p2d #1).
+        this.#pages[page] = parsePage(
+          bytes,
+          entry,
+          this.directory.tag,
+          this.directory.scale,
+          this.directory.dictionary?.rowCount ?? 0,
+        );
         this.#held[page] = held;
       }
     } catch (error) {

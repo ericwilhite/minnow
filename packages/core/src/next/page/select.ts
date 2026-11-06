@@ -12,12 +12,14 @@
  * - plain int32, float, bool and varlen pages compare the stored values in place.
  * Delta pages, plain int64 and decimal pages, 128-bit decimals and decimal specials decode the
  * needed rows into the caller's `SelectScratch` (reused, no per-row allocation) and compare
- * there: int64 as word pairs, 128-bit coefficients as limbs, never as BigInts.
+ * there: int64 as word pairs, 128-bit coefficients as limbs. Bounds become numbers once per
+ * page; no row loop does BigInt work.
  */
 import type { PageEntry } from "../format/manifest.js";
 import { PageEncoding } from "../format/manifest.js";
 import type { FlatVector } from "../vector/vector.js";
 import {
+  checkDictionaryCodes,
   decodeRange,
   gatherRows,
   isLarge,
@@ -149,29 +151,59 @@ function inWordRanges(high: number, low: number, ranges: WordRanges): boolean {
   return false;
 }
 
-/** 128-bit bounds as BigInts compared with limbs read into two f64 halves (exact). */
-function inLimbRanges(limbs: Uint32Array, row: number, compiled: CompiledPredicate): boolean {
-  // high = signed upper 64 bits as a double pair; compare (h3, h2, h1, h0) lexicographically.
-  const h3 = limbs[row * 4 + 3] ?? 0;
+/**
+ * 128-bit bounds as numeric limbs, prepared once per page (review B2-p2d #2): per range, the
+ * clipped low and high bounds as [signed limb 3, limb 2, limb 1, limb 0] (lower limbs
+ * unsigned), so the row loop compares numbers, never BigInts.
+ */
+interface LimbRanges {
+  readonly limbs: Float64Array;
+  readonly count: number;
+}
+
+function limbsOf(value: bigint, out: number[]): void {
+  out.push(
+    Number(BigInt.asIntN(32, value >> 96n)),
+    Number(BigInt.asUintN(32, value >> 64n)),
+    Number(BigInt.asUintN(32, value >> 32n)),
+    Number(BigInt.asUintN(32, value)),
+  );
+}
+
+function limbRanges(compiled: CompiledPredicate): LimbRanges {
+  const out: number[] = [];
   for (const [low, high] of compiled.ints) {
     const a = low === null || low < INT128_MIN ? INT128_MIN : low;
     const b = high === null || high > INT128_MAX ? INT128_MAX : high;
     if (a > b) continue;
-    if (compareLimbs(limbs, row, h3, a) >= 0 && compareLimbs(limbs, row, h3, b) <= 0) return true;
+    limbsOf(a, out);
+    limbsOf(b, out);
   }
-  return false;
+  return { limbs: Float64Array.from(out), count: out.length / 8 };
 }
 
-function compareLimbs(limbs: Uint32Array, row: number, h3: number, bound: bigint): number {
-  const signedTop = h3 | 0;
-  const boundTop = Number(BigInt.asIntN(32, bound >> 96n));
-  if (signedTop !== boundTop) return signedTop < boundTop ? -1 : 1;
+/** −1, 0, 1: row `row`'s coefficient (4 u32 limbs, low first) against bound `at` of `bounds`. */
+function compareLimbs(limbs: Uint32Array, row: number, bounds: Float64Array, at: number): number {
+  const top = (limbs[row * 4 + 3] ?? 0) | 0;
+  const boundTop = bounds[at] ?? 0;
+  if (top !== boundTop) return top < boundTop ? -1 : 1;
   for (let limb = 2; limb >= 0; limb--) {
     const value = limbs[row * 4 + limb] ?? 0;
-    const other = Number(BigInt.asUintN(32, bound >> BigInt(limb * 32)));
+    const other = bounds[at + 3 - limb] ?? 0;
     if (value !== other) return value < other ? -1 : 1;
   }
   return 0;
+}
+
+function inLimbRanges(limbs: Uint32Array, row: number, ranges: LimbRanges): boolean {
+  const bounds = ranges.limbs;
+  for (let k = 0; k < ranges.count; k++)
+    if (
+      compareLimbs(limbs, row, bounds, k * 8) >= 0 &&
+      compareLimbs(limbs, row, bounds, k * 8 + 4) <= 0
+    )
+      return true;
+  return false;
 }
 
 function floatMatches(value: number, compiled: CompiledPredicate): boolean {
@@ -524,7 +556,10 @@ function dictionaryPage(
 ): number {
   const { view, entry } = context;
   const codes = context.codes;
-  if (codes === null) throw new RangeError("A dictionary page needs its chunk's code matches");
+  if (codes === null || context.dictionary === null)
+    throw new RangeError("A dictionary page needs its chunk's dictionary and code matches");
+  // A page handed in directly is checked here; the reader's pages were at parse (one check).
+  checkDictionaryCodes(view, context.dictionary.size);
   const first = entry.firstRow;
   const validity = view.validity;
   const stored = view.unsigned;
@@ -694,7 +729,7 @@ function decodedMatches(context: SelectContext, slot: number, scratch: SelectScr
           ? compiled.specials.positive
           : compiled.specials.negative;
   }
-  if (view.tag === ValueTag.dec128) return inLimbRanges(scratch.limbs, slot, compiled);
+  if (view.tag === ValueTag.dec128) return inLimbRanges(scratch.limbs, slot, limbRanges(compiled));
   const words = new Int32Array(
     scratch.int64.buffer,
     scratch.int64.byteOffset,
@@ -721,6 +756,7 @@ function decodedPage(
     view.tag === ValueTag.i32 ? numberRanges(compiled, 0n, -(2n ** 31n), 2n ** 31n - 1n) : null;
   const words =
     view.tag === ValueTag.i64 || view.tag === ValueTag.dec64 ? wordRanges(compiled) : null;
+  const limbs = view.tag === ValueTag.dec128 ? limbRanges(compiled) : null;
   const pairs = new Int32Array(
     scratch.int64.buffer,
     scratch.int64.byteOffset,
@@ -746,7 +782,7 @@ function decodedPage(
       else if (int32 !== null) match = inRanges(scratch.int32[slot] ?? 0, int32);
       else if (words !== null && view.tag !== ValueTag.dec128)
         match = inWordRanges(pairs[slot * 2 + 1] ?? 0, (pairs[slot * 2] ?? 0) >>> 0, words);
-      else match = inLimbRanges(scratch.limbs, slot, compiled);
+      else match = limbs !== null && inLimbRanges(scratch.limbs, slot, limbs);
       if (match) out[at + count++] = first + row;
     }
   }

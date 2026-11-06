@@ -303,7 +303,8 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
   bitmap of matching dictionary entries built once per chunk; frame-of-reference pages compare
   stored deltas with bounds moved into delta space once per page; plain int32, float, bool and
   varlen pages compare in place. Delta, plain int64 and decimal pages decode into a reused
-  scratch and compare word pairs or limbs, never BigInts. `reader.refine(compiled, rows, …)`
+  scratch and compare word pairs or 128-bit limbs. Row loops do no BigInt work: bounds become
+  numbers once per page, and the dictionary-code bitmap once per chunk. `reader.refine(compiled, rows, …)`
   narrows a selection (in place allowed), for conjunctions across columns.
 - Semantics are PostgreSQL's: NULLs never satisfy a comparison; float NaN equals NaN and sorts
   above +Infinity, −0 equals +0; decimals compare exactly (specials −Infinity < finite <
@@ -311,6 +312,9 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
 - Selection-aware decode: `gather` decodes only the selected rows of the other columns; at or
   above `DENSE_SELECTION` (40 %, measured) of a span, `prefersDense` says decode the span with
   `decodeRange` and keep the selection instead.
+- Every dictionary page's codes are checked against its chunk's dictionary once, when the page
+  is validated (`checkDictionaryCodes` in `parsePage`), so select, refine, gather and decode all
+  rely on the same check.
 - Memory: no per-row allocation. The code bitmaps and the decode scratch are charged to the
   reader's budget and returned at `close`.
 - `scripts/pushdown-bench.mts` measures it on the W1M table's columns against decode-then-filter.
