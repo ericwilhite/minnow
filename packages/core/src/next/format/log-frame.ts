@@ -18,8 +18,9 @@
  *  28 u32 ackChain  32 u53 ackLsn  40 u53 rootSequence  48 u32 xxHash32 of bytes 0…48 (seed 0)
  * (u53 = two u32 words, the high word ≤ 0x1F_FFFF.) A commit group appends its frames and, in the
  * same flush, writes the slot not holding the newest header with generation + 1 and `ack*` = the
- * end, chain and LSN of the previous acknowledged group. An idle flush (≤100 ms after the last
- * commit) acknowledges the newest group. `rootSequence` is the sequence of the root that started
+ * end, chain and LSN of the previous acknowledged group. An idle flush acknowledges the newest
+ * group, targeting 100 ms from the last append subject to scheduling and I/O latency (see
+ * access/write-path.ts "Commit"). `rootSequence` is the sequence of the root that started
  * this incarnation (its salt), so a rolled-back root is detected.
  *
  * ## What recovery promises (`scanLog`)

@@ -45,11 +45,14 @@
  *    pending seqs to its LSN), and releases the writer slot. `commit` resolves here;
  * 4. the frames become durable with the next log flush: if none is running one starts at once;
  *    commits appended while one runs share the next (one flush per group). That flush also writes
- *    the header slot acknowledging the previous group; an idle flush ≤ 100 ms after the last
- *    commit acknowledges the newest. Its timer is armed 45 ms after that commit's flush, not at
- *    100 ms: under continuous query execution a due timer can wait up to ~50 ms plus one slice
- *    (the executor's yieldTask timer turn), and while commits continue each group's own flush
- *    writes the acknowledging header. `receipt.durable` resolves after it.
+ *    the header slot acknowledging the previous group. The idle acknowledgement targets
+ *    100 ms from the last append (commit). Its 45 ms timer budget includes the initial flush:
+ *    if that flush consumes the budget, the idle timer is armed immediately when it completes.
+ *    The target assumes the initial flush, timer dispatch and acknowledging I/O fit the deadline;
+ *    slow storage or a suspended worker can exceed it. Continuous execution can delay timers
+ *    about 50 ms plus one slice, so the timer leaves that allowance instead of waiting 100 ms.
+ *    While commits continue each group's flush acknowledges the previous group. `receipt.durable`
+ *    resolves after the commit's own flush, before the idle acknowledgement.
  * **No-effect transactions** (nothing written, or everything rolled back) write no frame:
  * `receipt.wrote` is false, `lsn` is the base LSN. The owner then settles the request without an
  * outcome (format/ledger.ts `settle`); a retry runs again, which is correct for a no-op.
