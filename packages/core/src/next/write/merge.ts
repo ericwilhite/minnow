@@ -8,9 +8,10 @@
  * placed where its inputs were: recency order is kept, so a tombstone stays in the same layer as its
  * put or a newer one (access/key-index.ts "Structure"), and resolution is unchanged.
  * - **Sorted runs.** At level 0 each run counts. At a higher level a run counts unless it continues
- *   the one before it in ascending key order (a merge's output may be split into several runs with
- *   disjoint ascending key ranges when it outgrows one run's block index; together they are one
- *   sorted run).
+ *   the one before it in ascending key order (a merge's output may be split into several runs in
+ *   ascending key order when it outgrows one run's block index, possibly inside one key's entries,
+ *   so a piece may start with the key the previous one ended on; together they are one sorted
+ *   run).
  * - **Debt.** A level holding `fanIn` sorted runs (8) is debt. Merges run only while some level is
  *   in debt, lowest level first, and stop when none is. So each entry is rewritten once per level it
  *   climbs: write amplification is 1 + ⌈log₈(entries / memtable entries)⌉ (2 at 1M keyed rows, 3 at
@@ -23,7 +24,12 @@
  *   charged to the merge's grant), entries go through a heap of the inputs' current entries into a
  *   `RunEncoder`, and the encoder's parts are appended to an `ExtentBuilder` 256 KiB at a time. The
  *   output's block index and fences (≤ 1 MiB each) are the only parts held whole; past
- *   `splitBytes` the output is split at the next key boundary.
+ *   `splitBytes` the output is split before the next entry (never between a put and its own
+ *   tombstone), so fences stay bounded even when one key has many row ids.
+ * - A merge that fails before its publish (a run it cannot encode, a read the budget refuses)
+ *   never fails the write path (engine.ts): its writer is aborted, the inputs stay, the failure is
+ *   counted, and it is retried once with a quarter of the split bound before the inputs are left
+ *   alone until they change.
  * - Charges its working memory to a grant of its own, admitted before it starts.
  * - Yields to the event loop (a task, not a microtask) after `YIELD_INTERVAL_MS` of synchronous work
  *   (ruling R23), and stops at a slice boundary when the write path closes. Its scratch is owned by
@@ -86,8 +92,9 @@ export function yieldTask(): Promise<void> {
   });
 }
 
+/** `b` continues `a` in key order (a split piece may start with the key the previous one ended on). */
 const before = (a: RunRef, b: RunRef): boolean =>
-  compareBytes(a.maxKey, 0, a.maxKey.length, b.minKey, 0, b.minKey.length) < 0;
+  compareBytes(a.maxKey, 0, a.maxKey.length, b.minKey, 0, b.minKey.length) <= 0;
 
 /** Sorted runs among `runs[from, to)`, all of one level (see "Levels"). */
 export function sortedRuns(runs: readonly RunRef[], from: number, to: number): number {
@@ -371,7 +378,7 @@ export async function mergeRuns(input: MergeInput): Promise<MergeOutput> {
       const full =
         encoder.indexBytes > policy.splitBytes ||
         (policy.splitEntries !== null && encoder.entryCount >= policy.splitEntries);
-      if (full && encoder.differsFromPending(top.bytes, top.keyStart, top.keyEnd)) {
+      if (full && encoder.canEndBefore(top.bytes, top.keyStart, top.keyEnd, top.rowId)) {
         await finishRun();
         encoder = new RunEncoder((part) => {
           queue.push(part);

@@ -143,10 +143,18 @@ export class RunEncoder {
     return Math.max(this.#index.length, this.#fences.length) + 8;
   }
 
-  /** True when `bytes[start … end)` differs from the pending entry's key (or nothing is pending). */
-  differsFromPending(bytes: Uint8Array, start: number, end: number): boolean {
+  /**
+   * Whether the run may end before the entry `(bytes[start … end), rowId)`: true unless it is the
+   * pending entry's put or tombstone (they must meet to cancel). A run may end inside a key's
+   * entries (review B3-p2b-1 #3): one popular key with many row ids then spans several runs of one
+   * merge, which are probed together (their key ranges share that key).
+   */
+  canEndBefore(bytes: Uint8Array, start: number, end: number, rowId: number): boolean {
     if (!this.#hasPending) return true;
-    return compareBytes(bytes, start, end, this.#pendingKey, 0, this.#pendingLength) !== 0;
+    return (
+      rowId !== this.#pendingRowId ||
+      compareBytes(bytes, start, end, this.#pendingKey, 0, this.#pendingLength) !== 0
+    );
   }
 
   /** Adds one entry, the key `bytes[start … end)` (copied). Entries must come in (key, rowId) order. */

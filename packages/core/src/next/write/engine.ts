@@ -452,6 +452,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
     mergesDuringFlush: 0,
     /** Merges dropped at publish because their inputs changed (a drop). */
     mergesAbandoned: 0,
+    /** Merges that failed before their publish (inputs kept), and the last failure's message. */
+    mergeFailures: 0,
+    lastMergeFailure: null as string | null,
     /** Log recycles completed, and the log bytes each one cut. */
     recycles: 0,
     recycledBytes: 0,
@@ -1957,6 +1960,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
 
   // ── Idle maintenance (ruling R10) ───────────────────────────────────────────────────────
 
+  /** Whether the write path has failed (a call, so a check after an await is not narrowed away). */
+  #hasFailed(): boolean {
+    return this.failure !== null;
+  }
+
   /** True once `close` began. */
   get closed(): boolean {
     return this.#closed;
@@ -2240,16 +2248,34 @@ export class WritePathImpl implements WritePath, EngineHooks {
           this.#armIdlePublish();
           return;
         }
-        try {
-          await this.#merge(job.state, job.indexId, job.plan, job.inputs);
-        } catch (error) {
-          if (error instanceof MergeAbortedError) return;
-          this.#failure ??= error instanceof Error ? error : new Error(String(error));
-          return;
+        // A merge that fails before its publish leaves its inputs as they are (review B3-p2b-1
+        // #3): it is retried once with a quarter of the split bound, then its inputs are left
+        // alone. Only a failed publish (the space failed) fails the write path.
+        let done = false;
+        for (const divisor of [1, 4]) {
+          try {
+            await this.#merge(job.state, job.indexId, job.plan, job.inputs, divisor);
+            done = true;
+            break;
+          } catch (error) {
+            if (error instanceof MergeAbortedError) return;
+            // The publish failed (the space refuses everything after) or something else failed.
+            if (this.#space.failed !== null || this.#hasFailed()) {
+              this.#failure ??= error instanceof Error ? error : new Error(String(error));
+              return;
+            }
+            this.maintenance.mergeFailures += 1;
+            this.maintenance.lastMergeFailure =
+              error instanceof Error ? error.message : String(error);
+          }
         }
+        if (!done) this.#unmergeable.add(need(job.inputs[0]));
       }
     });
   }
+
+  /** First inputs of merges that failed twice: not tried again until their level changes. */
+  readonly #unmergeable = new WeakSet<RunRef>();
 
   /** The lowest level in debt across every table's indexes, or null. */
   #nextMerge(): MergeJob | null {
@@ -2260,6 +2286,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       for (const index of def.indexes) {
         const runs = state.view.runs.get(index.id) ?? [];
         const plan = planMerge(runs, this.#mergePolicy.fanIn);
+        if (plan !== null && this.#unmergeable.has(need(runs[plan.from]))) continue;
         if (plan !== null && (best === null || plan.level < best.plan.level))
           best = { state, indexId: index.id, plan, inputs: runs.slice(plan.from, plan.to) };
       }
@@ -2284,6 +2311,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
     indexId: number,
     plan: MergePlan,
     inputs: readonly RunRef[],
+    /** The split bound is divided by this (a retry after a failure). */
+    divisor = 1,
   ): Promise<void> {
     const started = performance.now();
     const grant = await this.#governor.admit({
@@ -2313,7 +2342,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
         readers,
         level: plan.level + 1,
         bottom: plan.bottom,
-        policy: this.#mergePolicy,
+        policy:
+          divisor === 1
+            ? this.#mergePolicy
+            : {
+                ...this.#mergePolicy,
+                splitBytes: Math.floor(this.#mergePolicy.splitBytes / divisor),
+              },
         stopped: () => this.#closed || this.failure !== null,
       });
       unlock = await this.#lock();

@@ -10,7 +10,7 @@
  * - Ruling R23: a merge yields to the event loop in slices, and stops at a slice when the write
  *   path closes.
  */
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { encodeKeyBatch, KeyBatch } from "../keys/key-encoding.js";
 import type { RunRef } from "../format/manifest.js";
 import type { Snapshot } from "../access/snapshot.js";
@@ -40,11 +40,17 @@ const compare = (a: Uint8Array, b: Uint8Array) => compareBytes(a, 0, a.length, b
 const hex = (key: Uint8Array) =>
   Array.from(key, (byte) => byte.toString(16).padStart(2, "0")).join("");
 
+const streamReach = createReach("next-write-run-merge", ["split", "split-inside-key"] as const);
+
 describe("streaming merge", () => {
+  afterAll(() => {
+    streamReach.assertReached();
+  });
   const SEEDS = seedsFor("next-write-run-merge", [101, 102, 103, 104, 105, 106]);
   for (const seed of SEEDS)
     it(`merges generated runs like the model (seed ${String(seed)})`, async () => {
       const random = mulberry32(seed);
+      streamReach.beginHistory();
       const harness = new Harness("strict", "memory");
       await harness.open();
       const space = harness.space;
@@ -55,6 +61,9 @@ describe("streaming merge", () => {
         const length = long ? 300 + Math.floor(random() * 700) : 1 + Math.floor(random() * 12);
         return Uint8Array.from({ length }, () => 97 + Math.floor(random() * 3));
       });
+      // A hot key (review B3-p2b-1 #3): one long key holding many row ids, so splits must fall
+      // inside its entries.
+      const hot = random() < 0.5 ? new Uint8Array(600 + Math.floor(random() * 600)).fill(98) : null;
       // Entries per input run (index 0 = newest). Each (key, row) has at most one put and one
       // tombstone, the tombstone in the same run or a newer one; some tombstones' puts lie below.
       interface Entry {
@@ -66,7 +75,8 @@ describe("streaming merge", () => {
       const expected = new Map<string, { key: Uint8Array; rowId: number; tombstone: boolean }>();
       let rowId = 1;
       for (let k = 0; k < 300 + Math.floor(random() * 3000); k++) {
-        const key = need(keys[Math.floor(random() * keys.length)]);
+        const key =
+          hot !== null && random() < 0.4 ? hot : need(keys[Math.floor(random() * keys.length)]);
         const id = rowId++;
         const entry = (tombstone: boolean) => ({ key, rowId: id, tombstone });
         const name = (tombstone: boolean) => `${hex(key)}:${String(id)}:${String(tombstone)}`;
@@ -122,14 +132,18 @@ describe("streaming merge", () => {
         policy: { fanIn: 2, splitBytes, splitEntries: null, sliceEntries: 64 },
         stopped: () => false,
       });
-      // Disjoint, ascending runs.
-      for (let k = 1; k < output.runs.length; k++)
-        expect(compare(need(output.runs[k - 1]).maxKey, need(output.runs[k]).minKey)).toBeLessThan(
-          0,
-        );
+      // Ascending runs; a piece may start with the key the previous one ended on (a split inside
+      // that key's entries), and they are one sorted run.
+      for (let k = 1; k < output.runs.length; k++) {
+        const order = compare(need(output.runs[k - 1]).maxKey, need(output.runs[k]).minKey);
+        expect(order).toBeLessThanOrEqual(0);
+        if (order === 0) streamReach.reach("split-inside-key");
+      }
+      if (output.runs.length > 1) streamReach.reach("split");
       expect(sortedRuns(output.runs, 0, output.runs.length)).toBe(output.runs.length > 0 ? 1 : 0);
       // Exactly the surviving entries, in order.
       const got: string[] = [];
+      readers.length = 0;
       for (const ref of output.runs) {
         expect(ref.level).toBe(1);
         const reader = await RunReader.open(space, ref, FREE, FREE);
@@ -137,19 +151,22 @@ describe("streaming merge", () => {
           got.push(`${hex(key)}:${String(id)}:${String(tombstone)}`);
           return false;
         });
-        // Point lookups agree with the model for keys in this run's range.
-        for (const key of keys) {
-          if (compare(key, ref.minKey) < 0 || compare(key, ref.maxKey) > 0) continue;
-          const found: RunEntry[] = [];
+        readers.push(reader);
+      }
+      // Point lookups over every piece whose range holds the key agree with the model.
+      for (const key of hot === null ? keys : [...keys, hot]) {
+        const found: RunEntry[] = [];
+        for (const reader of readers) {
+          if (compare(key, reader.ref.minKey) < 0 || compare(key, reader.ref.maxKey) > 0) continue;
           await reader.lookup(space, key, found, FREE);
-          const want = [...expected.values()]
-            .filter((entry) => compare(entry.key, key) === 0)
-            .sort((a, b) => a.rowId - b.rowId)
-            .map((entry) => `${String(entry.rowId)}:${String(entry.tombstone)}`);
-          expect(found.map((entry) => `${String(entry.rowId)}:${String(entry.tombstone)}`)).toEqual(
-            want,
-          );
         }
+        const want = [...expected.values()]
+          .filter((entry) => compare(entry.key, key) === 0)
+          .sort((a, b) => a.rowId - b.rowId)
+          .map((entry) => `${String(entry.rowId)}:${String(entry.tombstone)}`);
+        expect(found.map((entry) => `${String(entry.rowId)}:${String(entry.tombstone)}`)).toEqual(
+          want,
+        );
       }
       const want = [...expected.values()]
         .sort((a, b) => compare(a.key, b.key) || a.rowId - b.rowId)
