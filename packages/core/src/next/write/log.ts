@@ -9,8 +9,12 @@
  *   header slot not holding the newest header (generation + 1) acknowledging the previous durable
  *   group, and calls `flushLog` once. Frames queued meanwhile form the next group. Strict mode
  *   starts a flush as soon as the current task ends; relaxed mode within `RELAXED_DELAY_MS`.
- * - After the last flush, an idle flush (`IDLE_FLUSH_MS`) writes a header acknowledging the newest
- *   group, so every acknowledged group but none is exposed to a cleanly truncated log.
+ * - After the last flush, an idle flush writes a header acknowledging the newest group, so every
+ *   acknowledged group but none is exposed to a cleanly truncated log. It is due within
+ *   `IDLE_FLUSH_MS` of the last commit; its timer is armed `IDLE_ARM_MS` after that commit's
+ *   flush, because under continuous query execution a due timer can wait up to ~50 ms plus one
+ *   slice (the executor's yieldTask timer turn, joint review R10/idle-flush note). While commits
+ *   continue, each group's flush writes the header acknowledging the previous group anyway.
  * - Any append or flush failure fails the appender: every waiter rejects with
  *   `WritePathFailedError` and later calls throw it.
  * - **Recycling** (access/write-path.ts "Log recycling"): `beginRecycle` fixes the cut (the last
@@ -32,7 +36,10 @@ import {
 import type { StoreSession } from "../storage/contract.js";
 import { need } from "./bytes.js";
 
+/** The bound on the idle flush after the last commit (access/write-path.ts "Commit" step 4). */
 export const IDLE_FLUSH_MS = 100;
+/** When the idle flush's timer is armed after a flush: ≤ IDLE_FLUSH_MS − ~50 ms − one slice. */
+export const IDLE_ARM_MS = 45;
 export const RELAXED_DELAY_MS = 5;
 
 export interface LogPosition {
@@ -399,7 +406,7 @@ export class LogAppender {
     this.#idle = setTimeout(() => {
       this.#idle = null;
       void this.#idleFlush();
-    }, IDLE_FLUSH_MS);
+    }, IDLE_ARM_MS);
     const timer = this.#idle as { unref?: () => void };
     timer.unref?.();
   }
