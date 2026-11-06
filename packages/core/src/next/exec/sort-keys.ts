@@ -225,9 +225,10 @@ function identity(from: number, count: number): { rows: Uint16Array; count: numb
 }
 
 /**
- * Sorts `ids` by `compare` (stably) in slices: blocks of 1,024 sorted directly, then bottom-up
- * merges through `temp` (at least `ids.length`, the caller's charged scratch), yielding when
- * `slice` is due (checked every `SLICE_ROWS` elements moved).
+ * Sorts `ids` by `compare` (stably) in slices: insertion sort of runs of 8, then bottom-up
+ * merges through `temp` (at least `ids.length`, the caller's charged scratch). Every comparison
+ * counts toward the slice (`Slice.tick`), since a comparison's cost is unbounded (wide keys,
+ * decoded values); copies are checked every `SLICE_ROWS` elements.
  */
 export function* mergeSortJob(
   ids: Int32Array,
@@ -236,16 +237,25 @@ export function* mergeSortJob(
   slice: Slice,
 ): Generator<void, void, void> {
   const n = ids.length;
-  const block = 1024;
-  for (let at = 0; at < n; at += block) {
-    ids.subarray(at, Math.min(n, at + block)).sort(compare);
-    if (slice.due()) yield;
+  const run = 8;
+  for (let lo = 0; lo < n; lo += run) {
+    const hi = Math.min(n, lo + run);
+    for (let i = lo + 1; i < hi; i++) {
+      const value = ids[i] ?? 0;
+      let j = i - 1;
+      for (; j >= lo; j--) {
+        const order = compare(ids[j] ?? 0, value);
+        if (slice.tick()) yield;
+        if (order <= 0) break;
+        ids[j + 1] = ids[j] ?? 0;
+      }
+      ids[j + 1] = value;
+    }
   }
-  if (n <= block) return;
+  if (n <= run) return;
   let from: Int32Array = ids;
   let to: Int32Array = temp.subarray(0, n);
-  let moved = 0;
-  for (let width = block; width < n; width *= 2) {
+  for (let width = run; width < n; width *= 2) {
     for (let lo = 0; lo < n; lo += 2 * width) {
       const mid = Math.min(n, lo + width);
       const hi = Math.min(n, lo + 2 * width);
@@ -254,17 +264,26 @@ export function* mergeSortJob(
       let k = lo;
       while (i < mid && j < hi) {
         to[k++] = compare(from[i] ?? 0, from[j] ?? 0) <= 0 ? (from[i++] ?? 0) : (from[j++] ?? 0);
-        if ((++moved & (SLICE_ROWS - 1)) === 0 && slice.due()) yield;
+        if (slice.tick()) yield;
       }
-      while (i < mid) to[k++] = from[i++] ?? 0;
-      while (j < hi) to[k++] = from[j++] ?? 0;
-      if (slice.due()) yield;
+      while (i < mid) {
+        to[k++] = from[i++] ?? 0;
+        if ((k & (SLICE_ROWS - 1)) === 0 && slice.due()) yield;
+      }
+      while (j < hi) {
+        to[k++] = from[j++] ?? 0;
+        if ((k & (SLICE_ROWS - 1)) === 0 && slice.due()) yield;
+      }
     }
     const swap = from;
     from = to;
     to = swap;
   }
-  if (from !== ids) ids.set(from);
+  if (from !== ids)
+    for (let at = 0; at < n; at += SLICE_ROWS) {
+      ids.set(from.subarray(at, Math.min(n, at + SLICE_ROWS)), at);
+      if (slice.due()) yield;
+    }
 }
 
 // --- compare mode -------------------------------------------------------------------------

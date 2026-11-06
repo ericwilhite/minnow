@@ -20,12 +20,23 @@ export class Slice {
   due(): boolean {
     return this.now() - this.#start >= this.ms;
   }
+  #ticks = 0;
+  /**
+   * One unit of comparator-bound work (a comparison, whose cost a row count does not bound:
+   * wide keys, decoded trees); true when the slice is due, checked every `TICKS` units.
+   */
+  tick(): boolean {
+    return (++this.#ticks & (TICKS - 1)) === 0 && this.due();
+  }
   reset(): void {
     this.#start = this.now();
   }
 }
 
-/** Rows a sliced loop runs between deadline checks. */
+/** Comparisons between deadline checks (`Slice.tick`). */
+export const TICKS = 8;
+
+/** Rows a sliced loop runs between deadline checks (cheap, fixed-cost work per row). */
 export const SLICE_ROWS = 8192;
 
 /**

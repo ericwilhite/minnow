@@ -93,6 +93,10 @@ export const MAX_FAN_IN = 64;
  */
 const SCRATCH_PER_ROW = 4 + 2 * 4 * TUPLE_WORDS;
 const POOL_BYTES = 1024 * 1024;
+/** Most operand bytes one decode step builds (the store-wide decode is sliced by them). */
+const DECODE_BYTES = 256 * 1024;
+/** Most varlen bytes of an arriving batch handled in one step (encoding, filtering, copying). */
+const ARRIVAL_BYTES = 512 * 1024;
 /**
  * A sorter's own scratch (R23.1), charged at construction: survivor rows, partition key
  * lengths, identity rows and group survivors per batch row, and the radix histograms.
@@ -456,9 +460,39 @@ class Sorter {
     this.profile.rowsIn += count;
     if (count === 0) return;
     const ids = batch.selection?.rows ?? null;
-    if (this.mode === "keys") return this.#addKeyed(batch.columns, ids, count);
-    if (this.mode === "ranks" && !this.#collect(batch.columns, ids, count)) this.#toCompare();
-    return this.#append(batch.columns, ids, count, [], 0);
+    const first = partRows(batch.columns, ids, 0, count);
+    if (first >= count) return this.#addRows(batch.columns, ids, count);
+    return this.#addParts(batch.columns, ids ?? this.#identity, count, first);
+  }
+
+  #addRows(columns: readonly Vector[], ids: Uint16Array | null, count: number): MaybePromise<void> {
+    if (this.mode === "keys") return this.#addKeyed(columns, ids, count);
+    if (this.mode === "ranks" && !this.#collect(columns, ids, count)) this.#toCompare();
+    return this.#append(columns, ids, count, [], 0);
+  }
+
+  /**
+   * A batch with more than `ARRIVAL_BYTES` of varlen values arrives in parts of at most that
+   * (one row at least), a task yield and the abort check between them: its encoding, filtering,
+   * decoding and copying are bounded by bytes, not rows (R23.2). The parts are copies.
+   */
+  async #addParts(
+    columns: readonly Vector[],
+    rows: Uint16Array,
+    count: number,
+    first: number,
+  ): Promise<void> {
+    let at = 0;
+    let n = first;
+    for (;;) {
+      const done = this.#addRows(columns, rows.slice(at, at + n), n);
+      if (isPromise(done)) await done;
+      at += n;
+      if (at >= count) return;
+      await yieldTask();
+      this.checkAborted();
+      n = partRows(columns, rows, at, count - at);
+    }
   }
 
   #addKeyed(
@@ -788,7 +822,7 @@ class Sorter {
       const id = survivors[i] ?? 0;
       if (i > 0 && !this.samePartitionIds(survivors[i - 1] ?? 0, id)) inGroup = 0;
       inGroup++;
-      if ((i & (SLICE_ROWS - 1)) === SLICE_ROWS - 1 && slice.due()) yield;
+      if (slice.tick()) yield;
       if (inGroup !== keep) continue;
       const [bytes, start, end] = keyOf(store, this.keyColumn, id);
       const length = valueAt32(store, this.prefixColumn + PREFIX_WORDS, id);
@@ -807,7 +841,7 @@ class Sorter {
       if (this.spec.withTies && n > 0)
         while (n < ids.length && this.compareIds(ids[n - 1] ?? 0, ids[n] ?? 0) === 0) {
           n++;
-          if ((n & (SLICE_ROWS - 1)) === 0 && slice.due()) yield;
+          if (slice.tick()) yield;
         }
       return ids.subarray(0, n);
     }
@@ -818,7 +852,7 @@ class Sorter {
       if (i > 0 && !this.samePartitionIds(ids[i - 1] ?? 0, id)) inGroup = 0;
       if (inGroup < keep) ids[m++] = id;
       inGroup++;
-      if ((i & (SLICE_ROWS - 1)) === SLICE_ROWS - 1 && slice.due()) yield;
+      if (slice.tick()) yield;
     }
     return ids.subarray(0, m);
   }
@@ -875,14 +909,28 @@ class Sorter {
    * the bytes the charge refused (what is decoded stays).
    */
   #decodeStore(): number {
+    return runToEnd(this.#decodeStoreJob(new Slice(Infinity)));
+  }
+
+  /**
+   * `#decodeStore` as a sliced job: rows are decoded in ranges of at most `DECODE_BYTES` of
+   * operands (a decode's cost is its bytes), the deadline checked after each.
+   */
+  *#decodeStoreJob(slice: Slice): SlicedJob<number> {
     if (this.mode !== "compare" || !this.decodes) return 0;
     const store = this.store;
     const operands = this.operands;
+    const { types, keys } = this.spec;
     while (operands.rows < store.rows) {
       const from = operands.rows & store.chunkMask;
-      const to = Math.min(store.chunkRows, from + store.rows - operands.rows);
+      const end = Math.min(store.chunkRows, from + store.rows - operands.rows);
       const columns = chunkColumns(store, operands.rows >>> store.chunkShift);
-      const { types, keys } = this.spec;
+      let to = from + 1;
+      let bytes = operandBytes(types, keys, columns, from, to);
+      while (to < end && bytes < DECODE_BYTES) {
+        bytes += operandBytes(types, keys, columns, to, to + 1);
+        to++;
+      }
       let needed = decodeOperands(types, keys, columns, from, to, this.charge, operands);
       if (needed > 0 && to - from > 1) {
         // Refused as a whole: as many single rows as fit (a loaned row always gets its own).
@@ -891,6 +939,7 @@ class Sorter {
           needed = decodeOperands(types, keys, columns, row, row + 1, this.charge, operands);
       }
       if (needed > 0) return needed;
+      if (slice.due()) yield;
     }
     if (operands.bytes > this.profile.operandBytes) this.profile.operandBytes = operands.bytes;
     return 0;
@@ -1094,7 +1143,7 @@ class Sorter {
       }
       this.#toCompare();
     }
-    if (this.#decodeStore() > 0) return null;
+    if ((yield* this.#decodeStoreJob(slice)) > 0) return null;
     yield* mergeSortJob(ids, temp, (a, b) => this.compareIds(a, b), slice);
     return ids;
   }
@@ -1124,7 +1173,8 @@ class Sorter {
           if (!this.charge.allocate(bytes)) return null;
           charged += bytes;
           strings.push(value);
-          if ((id & (SLICE_ROWS - 1)) === SLICE_ROWS - 1 && slice.due()) yield;
+          // A decode's cost is the value's bytes: each one counts.
+          if (slice.tick()) yield;
         }
         // The order, its merge buffer and the rank of each value: charged while they live.
         if (!this.charge.allocate(3 * set.size * 4)) return null;
@@ -1151,7 +1201,10 @@ class Sorter {
         if (!this.charge.allocate(n * 4)) return null;
         this.#rankBytes += n * 4;
         const rankOf = new Int32Array(set.size);
-        order.forEach((id, rank) => (rankOf[id] = rank));
+        for (let rank = 0; rank < order.length; rank++) {
+          rankOf[order[rank] ?? 0] = rank;
+          if ((rank & (SLICE_ROWS - 1)) === SLICE_ROWS - 1 && slice.due()) yield;
+        }
         const perRow = new Int32Array(n).fill(-1);
         for (let c = 0; c < store.chunkCount; c++) {
           const vector = store.chunk(key.column, c);
@@ -1160,6 +1213,8 @@ class Sorter {
             if (value !== null)
               perRow[c * store.chunkRows + i] =
                 rankOf[set.find(value.bytes, value.start, value.end)] ?? 0;
+            // A lookup hashes the value's bytes: each one counts.
+            if (slice.tick()) yield;
           }
           if (slice.due()) yield;
         }
@@ -1542,6 +1597,45 @@ function varlenLength(vector: Vector, row: number): number {
 }
 
 /** UTF-8 bytes of a text row, or null. */
+/** Bytes of row `row`'s value in a varlen vector (0 for null or fixed-width vectors). */
+function varlenBytes(vector: Vector, row: number): number {
+  const flat =
+    vector.form === "flat" ? vector : vector.form === "constant" ? vector.value : vector.dictionary;
+  if (flat.data.layout !== "varlen") return 0;
+  const slot =
+    vector.form === "flat" ? row : vector.form === "constant" ? 0 : (vector.codes[row] ?? 0);
+  return (flat.data.offsets[slot + 1] ?? 0) - (flat.data.offsets[slot] ?? 0);
+}
+
+/**
+ * How many of rows `from … from + count` (by `ids`) fit `ARRIVAL_BYTES` of varlen values, at
+ * least one: `count` without a scan when the batch has no varlen columns.
+ */
+function partRows(
+  columns: readonly Vector[],
+  ids: Uint16Array | null,
+  from: number,
+  count: number,
+): number {
+  const varlen = columns.filter((vector) => {
+    const flat =
+      vector.form === "flat"
+        ? vector
+        : vector.form === "constant"
+          ? vector.value
+          : vector.dictionary;
+    return flat.data.layout === "varlen";
+  });
+  if (varlen.length === 0) return count;
+  let bytes = 0;
+  for (let k = 0; k < count; k++) {
+    const row = ids === null ? from + k : (ids[from + k] ?? 0);
+    for (const vector of varlen) bytes += varlenBytes(vector, row);
+    if (bytes > ARRIVAL_BYTES) return Math.max(1, k);
+  }
+  return count;
+}
+
 function textAt(
   vector: Vector,
   row: number,
@@ -1857,7 +1951,7 @@ export class SortOperator implements Operator {
     if (spec.withTies && spec.limit !== null && end > spec.offset && end < all.length)
       while (end < all.length && sorter.compareIds(all[end - 1] ?? 0, all[end] ?? 0) === 0) {
         end++;
-        if ((end & (SLICE_ROWS - 1)) === 0 && slice.due()) yield;
+        if (slice.tick()) yield;
       }
     const count = Math.max(0, end - spec.offset);
     const range: Range = { kind: "store", ids: all, from: spec.offset, count };
@@ -2059,7 +2153,7 @@ export class GroupTopKOperator implements Operator {
         const range: Range = { kind: "store", ids: kept, from: i, count: 1 };
         yield* emitJob(this.#emitter, range, i, 1, rowNumber, slice);
       }
-      if ((i & (SLICE_ROWS - 1)) === SLICE_ROWS - 1 && slice.due()) yield;
+      if (slice.tick()) yield;
     }
     const flushed = this.#emitter.flush();
     if (isPromise(flushed)) yield flushed;

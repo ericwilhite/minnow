@@ -20,7 +20,15 @@ import {
   type Row,
 } from "./join-fixtures.js";
 import { drive, type Operator, type PushResult } from "./pipeline.js";
-import { RadixScratch, type SortColumn } from "./sort-keys.js";
+import {
+  PREFIX_WORDS,
+  RadixScratch,
+  TUPLE_WORDS,
+  mergeSortJob,
+  msdSort,
+  type SortColumn,
+} from "./sort-keys.js";
+import { Slice } from "./slices.js";
 import { GroupTopKOperator, SortOperator, sortMinimumBytes } from "./sort.js";
 
 const JSONB: PhysicalType = { kind: "json", binary: true };
@@ -488,6 +496,138 @@ describe("wide sort keys under a tight grant", () => {
       expect(governor.usedBytes).toBe(0);
       expect(spill.bytesInUse).toBe(0);
     }, 60_000);
+});
+
+describe("review B7-p2b-2 #2: slices bound work, not rows", () => {
+  // A controlled clock: each comparison costs one unit; the deadline is four units.
+  it("refining equal prefixes yields within a few comparisons (reviewer: 1,664 units)", () => {
+    let now = 0;
+    const slice = new Slice(4, () => now);
+    const n = 400;
+    const tuples = new Uint32Array(n * TUPLE_WORDS);
+    for (let i = 0; i < n; i++) tuples[i * TUPLE_WORDS + PREFIX_WORDS] = i;
+    const job = msdSort(
+      tuples,
+      new Uint32Array(n * TUPLE_WORDS),
+      n,
+      (a, b) => {
+        now++;
+        return b - a;
+      },
+      slice,
+      new RadixScratch(),
+    );
+    expect(job.next().done).toBe(false);
+    expect(now).toBeLessThanOrEqual(16);
+    let steps = 0;
+    while (job.next().done !== true) steps++;
+    expect(steps).toBeGreaterThan(10);
+    for (let i = 0; i < n; i++) expect(tuples[i * TUPLE_WORDS + PREFIX_WORDS]).toBe(n - 1 - i);
+  });
+
+  it("a merge sort yields within a few comparisons (reviewer: 5,120 units)", () => {
+    let now = 0;
+    const slice = new Slice(4, () => now);
+    const ids = Int32Array.from({ length: 1024 }, (_, i) => 1024 - i);
+    const job = mergeSortJob(
+      ids,
+      new Int32Array(1024),
+      (a, b) => {
+        now++;
+        return a - b;
+      },
+      slice,
+    );
+    job.next();
+    expect(now).toBeLessThanOrEqual(10);
+    while (job.next().done !== true);
+    expect([...ids]).toEqual(Array.from({ length: 1024 }, (_, i) => i + 1));
+  });
+
+  it("400 keys sharing a 64 KiB prefix: finish's first synchronous segment stays short", async () => {
+    // The reviewer's operator case: 598 ms in one segment before the fix.
+    const types = [TEXT, INT];
+    const { context: ctx, governor } = await context(types);
+    const sink = new CollectSink();
+    const op = new SortOperator(
+      { types, keys: [asc(0)], limit: null, offset: 0, withTies: false },
+      ctx,
+      sink,
+    );
+    const prefix = "x".repeat(65_536);
+    const rows: Row[] = Array.from({ length: 400 }, (_, i) => [
+      prefix + String(400 - i).padStart(4, "0"),
+      i,
+    ]);
+    for (const batch of batchesOf(types, rows, { batchRows: 1 }))
+      if (op.push(batch) === "blocked") await op.ready();
+    let serviced = false;
+    const timer = setTimeout(() => {
+      serviced = true;
+    }, 0);
+    const start = performance.now();
+    const result = op.finish();
+    const first = performance.now() - start;
+    await result;
+    clearTimeout(timer);
+    expect(serviced).toBe(true);
+    expect(first).toBeLessThan(150);
+    expect(sink.rows.map((row) => row[1])).toEqual(rows.map((_, i) => 399 - i));
+    expect(governor.usedBytes).toBe(0);
+  }, 60_000);
+
+  it("a batch of wide values arrives in byte-bounded parts with task yields between", async () => {
+    const types = [TEXT, INT];
+    const { context: ctx } = await context(types);
+    const sink = new CollectSink();
+    const op = new SortOperator(
+      { types, keys: [asc(0)], limit: null, offset: 0, withTies: false },
+      ctx,
+      sink,
+    );
+    const rows: Row[] = Array.from({ length: 400 }, (_, i) => ["y".repeat(65_536) + String(i), i]);
+    const [batch] = [...batchesOf(types, rows, { batchRows: 400 })];
+    if (batch === undefined) throw new Error("no batch");
+    let serviced = false;
+    const timer = setTimeout(() => {
+      serviced = true;
+    }, 0);
+    expect(op.push(batch)).toBe("blocked");
+    await op.ready();
+    clearTimeout(timer);
+    expect(serviced).toBe(true);
+    await op.finish();
+    expect(sink.rows).toHaveLength(400);
+  }, 60_000);
+});
+
+describe("review B7-p2b-2 #3: suspended sorts hold charged histograms", () => {
+  it("two sorts suspended mid-finish both show their radix histograms in their grants", async () => {
+    const make = async () => {
+      const { context: ctx } = await context([INT]);
+      const sink = new CollectSink();
+      const op = new SortOperator(
+        { types: [INT], keys: [asc(0)], limit: null, offset: 0, withTies: false },
+        ctx,
+        sink,
+      );
+      await pushAll(
+        op,
+        [INT],
+        Array.from({ length: 300_000 }, (_, i) => [(i * 7919) % 300_000]),
+      );
+      return { op, ctx, sink };
+    };
+    const sorts = [await make(), await make()];
+    let settled = 0;
+    const finishing = sorts.map((x) => Promise.resolve(x.op.finish()).then(() => settled++));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(settled).toBe(0);
+    for (const x of sorts)
+      expect(x.ctx.grant.allocated).toBeGreaterThanOrEqual(RadixScratch.BYTES + 300_000 * 4);
+    await Promise.all(finishing);
+    for (const x of sorts) expect(x.sink.rows).toHaveLength(300_000);
+  }, 60_000);
 });
 
 describe("review B7-p2b-1 resource probes", () => {
