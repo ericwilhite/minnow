@@ -48,6 +48,7 @@ import {
   type CommitReceipt,
   type CommitRequest,
   type Durability,
+  type ExtentDeltaSink,
   type OpenWritePathInput,
   type PinOptions,
   type TableSummary,
@@ -412,6 +413,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   /** The running log recycle, if any. */
   #recycling: Promise<void> | null = null;
   readonly #idleGarbageBytes: number;
+  readonly #extentDeltas: ExtentDeltaSink | null;
   /** The armed idle-publish check (R10), if any. */
   #idleTimer: ReturnType<typeof setTimeout> | null = null;
   /** `performance.now()` of the last commit (idleness for R10). */
@@ -512,6 +514,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#beforeFlushPublish = input.tuning?.beforeFlushPublish ?? null;
     this.#logRecycleBytes = input.tuning?.logRecycleBytes ?? LOG_RECYCLE_BYTES;
     this.#idleGarbageBytes = input.tuning?.idleGarbageBytes ?? IDLE_GARBAGE_BYTES;
+    this.#extentDeltas = input.extentDeltas ?? null;
     this.#now = input.options.now ?? Date.now;
     this.#root = root;
     this.#catalog = catalog;
@@ -586,6 +589,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
           clients: [],
         };
         await session.resetLog();
+        await emitDelta(input.extentDeltas ?? null, root.sequence, writer, []);
         const bytes = encodeManifestRoot(root);
         rootCharge = parseCharge(bytes.length);
         if (!metadataGrant.allocate(rootCharge)) throw new ParseBudgetError(rootCharge);
@@ -1851,6 +1855,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         statistics,
       };
       const root = await this.#nextRoot(writer, retired, new Map([[state.tableId, tableRoot]]));
+      await this.#emitDelta(root.sequence, writer, retired);
       const rootBytes = encodeManifestRoot(root);
       // The resident state this publish adds (page index growth, the new root) is charged first.
       // The pending publication owns both charges across the await (review B3-p2a-3 #3): they
@@ -1963,6 +1968,17 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#scheduleMerge();
   }
 
+  // ── Extent deltas (ruling R25) ──────────────────────────────────────────────────────────
+
+  /**
+   * Tells the storage track's sink this publication's extent delta (access/write-path.ts
+   * `PublishDelta`), after the root's contents are fixed and before it is encoded; adds what the
+   * sink retires of its own to `retired`.
+   */
+  async #emitDelta(sequence: number, writer: ExtentWriter, retired: ExtentRef[]): Promise<void> {
+    await emitDelta(this.#extentDeltas, sequence, writer, retired);
+  }
+
   // ── Idle maintenance (ruling R10) ───────────────────────────────────────────────────────
 
   /** Whether the write path has failed (a call, so a check after an await is not narrowed away). */
@@ -2030,13 +2046,15 @@ export class WritePathImpl implements WritePath, EngineHooks {
         await writer.abort();
         return;
       }
-      const root = await this.#nextRoot(writer, [], new Map());
+      const released: ExtentRef[] = [];
+      const root = await this.#nextRoot(writer, released, new Map());
+      await this.#emitDelta(root.sequence, writer, released);
       const bytes = encodeManifestRoot(root);
       const charge = parseCharge(bytes.length);
       this.#chargeMetadata(charge);
       this.#roots.set(root, { refs: 1, bytes: charge });
       madeRoot = root;
-      await this.#space.publish(bytes, { writers: [writer], retired: [] });
+      await this.#space.publish(bytes, { writers: [writer], retired: released });
       this.#root = root;
       this.#pruneCatalogs(root.globalLsn);
       this.#publishState();
@@ -2113,13 +2131,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
       const bytes = this.#appender.end;
       const cut = this.#appender.beginRecycle();
       await this.#appender.flushEncoded();
-      // Frozen memtables first (they flush in order), then every table's live memtable.
-      for (;;) {
-        this.#scheduleFlush();
-        await this.#flushes;
-        this.#check();
-        if (!this.#hasFrozen()) break;
-      }
+      // A flush in flight finishes first. The recycle then flushes each table's frozen and live
+      // memtables itself, through the cut: a frozen memtable whose last commit continues into the
+      // live one cannot flush alone, so waiting for the ordinary flushes to drain them would never
+      // end.
+      await this.#flushes;
+      this.#check();
       const quiet = new Map<number, TableRoot>();
       for (const state of [...this.#tables.values()]) {
         const def = this.#catalog.table(state.tableId);
@@ -2191,6 +2208,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         root.sequence !== sequence
       )
         throw new RangeError("A log recycle's root does not cover the log it would reset");
+      await this.#emitDelta(root.sequence, writer, retired);
       const rootBytes = encodeManifestRoot(root);
       const rootCharge = parseCharge(rootBytes.length);
       this.#chargeMetadata(rootCharge);
@@ -2398,6 +2416,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       };
       const retired: ExtentRef[] = inputs.map(runExtent);
       const next = await this.#nextRoot(writer, retired, new Map([[state.tableId, tableRoot]]));
+      await this.#emitDelta(next.sequence, writer, retired);
       const rootBytes = encodeManifestRoot(next);
       const rootCharge = parseCharge(rootBytes.length);
       this.#chargeMetadata(rootCharge);
@@ -2582,6 +2601,25 @@ export class WritePathImpl implements WritePath, EngineHooks {
       state.root = root;
       tables.push(root);
     }
+    // Indexes a table's previous root had and its new root lacks were dropped: their runs go.
+    // (Found by the R25 delta test: they were left allocated and unreachable.)
+    for (const table of tables) {
+      const before = this.#root.tables.find((previous) => previous.tableId === table.tableId);
+      if (before === undefined || before === table) continue;
+      const kept = new Set(
+        [table.keyIndex, ...table.secondaryIndexes]
+          .filter((index): index is IndexRoot => index !== null)
+          .map((index) => index.indexId),
+      );
+      for (const index of [before.keyIndex, ...before.secondaryIndexes])
+        if (index !== null && !kept.has(index.indexId)) {
+          for (const run of index.runs) retired.push(runExtent(run));
+          const runs = index.runs;
+          this.shared.readers.holdUntilOlderClose(() => {
+            this.#dropRunReaders(runs);
+          });
+        }
+    }
     // Tables the previous root had and this one lacks were dropped: retire everything they reach.
     for (const previous of this.#root.tables)
       if (!tables.some((table) => table.tableId === previous.tableId))
@@ -2692,6 +2730,23 @@ async function readBlob(space: Space, ref: BlobRef, budget: Grant): Promise<Uint
   } finally {
     lease.release();
   }
+}
+
+/** One publication's delta to `sink` (see `WritePathImpl.#emitDelta`). */
+async function emitDelta(
+  sink: ExtentDeltaSink | null,
+  sequence: number,
+  writer: ExtentWriter,
+  retired: ExtentRef[],
+): Promise<void> {
+  if (sink === null) return;
+  const result = await sink({
+    sequence,
+    added: [...writer.extents],
+    released: [...retired],
+    writer,
+  });
+  if (result !== null) retired.push(...result.retire);
 }
 
 /** `openWritePath` (access/write-path.ts `OpenWritePath`). */

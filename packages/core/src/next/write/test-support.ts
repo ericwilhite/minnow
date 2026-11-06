@@ -7,7 +7,12 @@ import type { SqlTypeDescriptor } from "../types.js";
 import type { ColumnDef, TableInput } from "../access/catalog.js";
 import type { TableRules } from "../access/modify.js";
 import type { Snapshot, TableSnapshot } from "../access/snapshot.js";
-import type { Durability, WritePath, WriteTransaction } from "../access/write-path.js";
+import type {
+  Durability,
+  ExtentDeltaSink,
+  WritePath,
+  WriteTransaction,
+} from "../access/write-path.js";
 import { Governor } from "../memory/governor.js";
 import { SimBackend, SimDisk } from "../storage/sim-disk.js";
 import type { PhysicalType } from "../types.js";
@@ -77,6 +82,8 @@ export class Harness {
   #release: (() => Promise<void>) | null = null;
   space!: ExtentSpace;
   path!: WritePathImpl;
+  /** The R25 extent-delta sink passed to every open (access/write-path.ts `ExtentDeltaSink`). */
+  extentDeltas: ExtentDeltaSink | null = null;
   /** Called with the extent space before the write path opens over it (tests instrument reads). */
   onSpace: ((space: ExtentSpace) => void) | null = null;
   /** Wall time of the last open's two phases: the extent space (its walk), then the write path. */
@@ -122,6 +129,7 @@ export class Harness {
         space: this.space,
         governor: this.governor,
         options: { durability: this.durability },
+        ...(this.extentDeltas === null ? {} : { extentDeltas: this.extentDeltas }),
         tuning: {
           ...this.tuning,
           ...(this.memtableRows === undefined ? {} : { memtableRows: this.memtableRows }),

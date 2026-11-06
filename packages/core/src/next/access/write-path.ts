@@ -124,7 +124,8 @@ import type { Int64Values } from "../vector/vector.js";
 import type { CatalogView } from "./catalog.js";
 import type { Statement, StatementOptions } from "./modify.js";
 import type { Snapshot } from "./snapshot.js";
-import type { Space } from "./space.js";
+import type { ExtentRef } from "../storage/extents.js";
+import type { Space, SpaceWriter } from "./space.js";
 
 export type Durability = "strict" | "relaxed";
 
@@ -300,7 +301,51 @@ export interface OpenWritePathInput {
   readonly space: Space;
   readonly governor: MemoryGovernor;
   readonly options: WritePathOptions;
+  /** Ruling R25: told each publication's extent delta (see `PublishDelta`). */
+  readonly extentDeltas?: ExtentDeltaSink;
 }
+
+/**
+ * One publication's change to the set of extents its root reaches (ruling R25: each root
+ * references a paged, offset-sorted list of the extents it reaches, kept by the storage track, so
+ * startup rebuilds free space from the two roots' lists instead of walking them).
+ *
+ * Exact by construction: the extents the new root reaches are those the previous root reaches,
+ * minus `released`, plus `added`. The write path builds every root this way and never publishes
+ * one otherwise, so replaying the deltas from an empty set gives each root's reachable set.
+ */
+export interface PublishDelta {
+  /** The root sequence the publication will make current. */
+  readonly sequence: number;
+  /** Extents the new root reaches and the previous one does not: every extent `writer` sealed. */
+  readonly added: readonly ExtentRef[];
+  /** Extents the previous root reaches and the new one does not: exactly the publish's `retired`. */
+  readonly released: readonly ExtentRef[];
+  /**
+   * The publication's writer, still open: the sink may write its own list pages into it. Those
+   * pages are the sink's: `added` does not include them, and the sink lists them itself.
+   */
+  readonly writer: SpaceWriter;
+}
+
+/** What a sink returns for one publication. */
+export interface ExtentDeltaResult {
+  /**
+   * Extents of the sink's own the new root no longer reaches (list pages it replaced): the write
+   * path retires them in the same publish. (The root's reference to the list, ruling R25, is the
+   * storage and format tracks' to add; it will come back here too.)
+   */
+  readonly retire: readonly ExtentRef[];
+}
+
+/**
+ * Called once per publication, after its root's contents are fixed and before the root is
+ * encoded and published, in publish order. A rejection fails that publication (nothing was
+ * published; the write path fails as for any publish error). The sink may not publish.
+ */
+export type ExtentDeltaSink = (
+  delta: PublishDelta,
+) => Promise<ExtentDeltaResult | null> | ExtentDeltaResult | null;
 
 /**
  * Step 4 of "Startup order": scan, truncate and replay the log, then serve. Throws
