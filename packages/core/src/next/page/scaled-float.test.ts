@@ -13,9 +13,10 @@
  */
 import fc from "fast-check";
 import { afterAll, describe, expect, it } from "vitest";
-import { createReach } from "../../testing/reach.js";
+import { createReach, SCALED_FLOAT_BOUNDARY_REACH } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { PageEncoding } from "../format/manifest.js";
+import { SCALED_FLOAT_MAX_EXPONENT } from "./format.js";
 import type { Vector } from "../vector/vector.js";
 import { MemoryExtentSpace } from "./memory-extents.js";
 import { ChunkReader } from "./reader.js";
@@ -41,8 +42,10 @@ const STATES = [
   "a scaled page within 2^32 of the safe-integer bound",
 ] as const;
 const reach = createReach("next-scaled-float", STATES);
+const boundaryReach = createReach("next-scaled-float-boundary", SCALED_FLOAT_BOUNDARY_REACH);
 afterAll(() => {
   reach.assertReached();
+  boundaryReach.assertReached();
 });
 
 const bitsOf = (value: number): bigint => {
@@ -68,7 +71,7 @@ describe.each(SEEDS)("scaledFloat pages round-trip every float64 bit for bit (se
         fc.integer({ min: 1, max: 3000 }),
         // The share of rows that are not exact decimals: none, within the patch limit, past it.
         fc.constantFrom(0, 0.01, 0.04, 0.3),
-        fc.integer({ min: 0, max: 6 }),
+        fc.integer({ min: 0, max: SCALED_FLOAT_MAX_EXPONENT }),
         fc.constantFrom(1, 10, 300, 70_000, 2 ** 31, 2 ** 40),
         // Offsets around zero, and at the positive and negative safe-integer bounds (review
         // B2-p2i #1): a page's integers then sit within its width of 2^53.
@@ -85,8 +88,45 @@ describe.each(SEEDS)("scaledFloat pages round-trip every float64 bit for bit (se
           ),
         ),
         fc.array(fc.bigInt({ min: 0n, max: (1n << 64n) - 1n }), { minLength: 8, maxLength: 8 }),
-        async (rowCount, noise, exponent, spread, offset, randomBits) => {
+        // A boundary cell (review B2-p2i-2 #3): the sign of the bound, the delta width the
+        // spread aims at, and the exponent band; it overrides the offset, spread, exponent and
+        // noise above. Its reach is read back from the stored header.
+        fc.option(
+          fc.record({
+            sign: fc.constantFrom(1, -1),
+            width: fc.constantFrom(1, 2, 4),
+            band: fc.constantFrom(0, 1, 2),
+            pick: fc.nat(),
+          }),
+          { nil: undefined },
+        ),
+        async (rows0, noise0, exponent0, spread0, offset0, randomBits, boundary) => {
           reach.beginHistory();
+          boundaryReach.beginHistory();
+          const spread =
+            boundary === undefined
+              ? spread0
+              : boundary.width === 1
+                ? 200
+                : boundary.width === 2
+                  ? 60_000
+                  : 2 ** 31;
+          const offset =
+            boundary === undefined
+              ? offset0
+              : boundary.sign > 0
+                ? Number.MAX_SAFE_INTEGER - spread + 1
+                : -Number.MAX_SAFE_INTEGER;
+          const exponent =
+            boundary === undefined
+              ? exponent0
+              : boundary.band === 0
+                ? 0
+                : boundary.band === 1
+                  ? 1 + (boundary.pick % 6)
+                  : 7 + (boundary.pick % 9);
+          const noise = boundary === undefined ? noise0 : 0;
+          const rowCount = boundary === undefined ? rows0 : Math.max(rows0, 64);
           const power = 10 ** exponent;
           let state = (seed ^ rowCount ^ (offset << 7)) >>> 0 || 1;
           const next = (): number => {
@@ -186,8 +226,13 @@ describe.each(SEEDS)("scaledFloat pages round-trip every float64 bit for bit (se
                     : 0),
                 1,
               )[0] ?? 0;
-            if (Math.abs(base) > Number.MAX_SAFE_INTEGER - 2 ** 32)
+            if (Math.abs(base) > Number.MAX_SAFE_INTEGER - 2 ** 32) {
               reach.reach("a scaled page within 2^32 of the safe-integer bound");
+              if (width === 1 || width === 2 || width === 4)
+                boundaryReach.reach(
+                  `${base < 0 ? "negative" : "positive"} bound, width ${String(width)}, ${e === 0 ? "exponent 0" : e <= 6 ? "exponents 1-6" : "exponents 7-15"}`,
+                );
+            }
             if (e === 0) reach.reach("exponent 0");
             if (e >= 3) reach.reach("exponent 3 or more");
             const present = pageValues.filter((each): each is number => each !== null);
