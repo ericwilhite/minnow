@@ -175,13 +175,20 @@ const LOG10_2 = Math.log10(2);
 
 /**
  * Whether coefficient × 10^−scale has at most 131,072 digits before the point. Decides from the
- * hex length (linear time) unless the value is within a digit of the limit, so a huge coefficient
- * is refused without a quadratic decimal conversion.
+ * bounded binary truncation for far oversized values, then hex length (linear time), and an
+ * exact decimal conversion only within a digit of the limit. No huge textual conversion is
+ * needed merely to refuse an input.
  */
 function numericFits(coefficient: bigint, scale: number): boolean {
-  const magnitude = coefficient < 0n ? -coefficient : coefficient;
-  if (magnitude === 0n) return true;
+  if (coefficient === 0n) return true;
   const limit = NUMERIC_MAX_INTEGER_DIGITS + scale;
+  // 10^limit <= 1000^ceil(limit/3) < 2^(10*ceil(limit/3)). Every legal
+  // coefficient therefore fits this signed width. Refuse larger values before
+  // copying a negative magnitude or converting the entire coefficient to text.
+  // The truncated working value is at most 491,521 bits, independent of input size.
+  const maximumBits = 10 * Math.ceil(limit / 3);
+  if (BigInt.asIntN(maximumBits + 1, coefficient) !== coefficient) return false;
+  const magnitude = coefficient < 0n ? -coefficient : coefficient;
   const bits = (magnitude.toString(16).length - 1) * 4; // magnitude ≥ 2^bits
   if (Math.floor(bits * LOG10_2) + 1 > limit + 1) return false;
   if (Math.ceil((bits + 4) * LOG10_2) + 1 < limit) return true;

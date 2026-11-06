@@ -95,7 +95,9 @@ is access's `Snapshot`.
   value is a batch of one.
 - Arrays are stored as reversible values (`array-value.ts`) and decoded before any operation.
   Values are validated on write and on read: int32 bounds, element ranges, NUMERIC limits, and
-  an empty array only as zero dimensions.
+  an empty array only as zero dimensions. Far oversized NUMERIC coefficients are refused by a
+  bounded bit-width check before text conversion; values near the digit limit still receive an
+  exact decimal-digit check. The stored bytes and accepted value range are unchanged.
 - int64 is exact. It uses `Float64Array` only when every slot is proven to lie within ±(2^53 − 1),
   and `BigInt64Array` otherwise.
 - Decimals have three tiers: int64, then 128-bit limbs, then `bigint[]`. Kernels widen before
