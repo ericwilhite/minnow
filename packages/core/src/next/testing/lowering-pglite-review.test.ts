@@ -5,7 +5,7 @@
  */
 import { PGlite } from "@electric-sql/pglite";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createReach, RANGE_KEY_STATES } from "../../testing/reach.js";
+import { createReach, RANGE_KEY_STATES, RANGE_NULL_STATES } from "../../testing/reach.js";
 import { sqlTypeOf, type SqlType } from "../ir/functions.js";
 import { PlanningError } from "../lower/errors.js";
 import { LoweredDatabase } from "./lowering-harness.js";
@@ -445,5 +445,96 @@ describe("aggregate signatures against PostgreSQL (review B6-p2b-3 finding 2)", 
           failures.push(`${fn}(${declared}): pglite ${expected}, next ${actual}`);
       }
     expect(failures).toEqual([]);
+  });
+});
+
+describe("NULL keys in RANGE offset frames (the B7 report)", () => {
+  // Authority: PostgreSQL's nodeWindowAgg: for a non-NULL current row an offset bound compares
+  // only non-NULL keys, and NULLs sort below every key (NULLS FIRST) or above (NULLS LAST), so a
+  // frame that runs to that end of the partition (UNBOUNDED, or an offset past every key)
+  // includes them. A NULL row's frame is its NULL peers.
+  const TABLES = [
+    {
+      name: "ni",
+      setup: [
+        "CREATE TABLE ni (id integer PRIMARY KEY, k integer)",
+        "INSERT INTO ni VALUES (1, NULL), (2, 1), (3, 2), (4, NULL), (5, 5), (6, 2)",
+      ],
+    },
+    {
+      name: "nn",
+      setup: [
+        "CREATE TABLE nn (id integer PRIMARY KEY, k numeric)",
+        "INSERT INTO nn VALUES (1, NULL), (2, 1.5), (3, 2), (4, 9007199254740993), (5, NULL)",
+      ],
+    },
+    {
+      name: "nf",
+      setup: [
+        "CREATE TABLE nf (id integer PRIMARY KEY, k double precision)",
+        "INSERT INTO nf VALUES (1, NULL), (2, 'Infinity'), (3, 0.5), (4, '-Infinity'), (5, NULL), (6, 'NaN')",
+      ],
+    },
+  ];
+  const ORDERS = [
+    "k",
+    "k NULLS FIRST",
+    "k NULLS LAST",
+    "k DESC",
+    "k DESC NULLS FIRST",
+    "k DESC NULLS LAST",
+  ];
+  const BOUNDS = [
+    (o: string) => `${o} PRECEDING AND CURRENT ROW`,
+    (o: string) => `CURRENT ROW AND ${o} FOLLOWING`,
+    (o: string) => `${o} PRECEDING AND ${o} FOLLOWING`,
+    (o: string) => `UNBOUNDED PRECEDING AND ${o} PRECEDING`,
+    (o: string) => `UNBOUNDED PRECEDING AND ${o} FOLLOWING`,
+    (o: string) => `${o} PRECEDING AND UNBOUNDED FOLLOWING`,
+    (o: string) => `${o} FOLLOWING AND UNBOUNDED FOLLOWING`,
+    (o: string) => `${o} FOLLOWING AND ${o} FOLLOWING`,
+    (o: string) => `${o} PRECEDING AND ${o} PRECEDING`,
+  ];
+  // 0 and 1 stay inside the keys; 10 runs past every finite one, to the NULLs at that end.
+  const OFFSETS = ["0", "1", "10"];
+
+  it("puts NULL keys where NULLS FIRST / LAST sorts them, as PostgreSQL", async () => {
+    const reach = createReach("RANGE NULL keys", RANGE_NULL_STATES);
+    const failures: string[] = [];
+    for (const table of TABLES) {
+      await pg.exec(`DROP TABLE IF EXISTS ${table.name}`);
+      const next = new LoweredDatabase();
+      for (const sql of table.setup) {
+        await pg.exec(sql);
+        next.execute(sql);
+      }
+      for (const order of ORDERS)
+        for (const bound of BOUNDS)
+          for (const offset of OFFSETS) {
+            reach.beginHistory();
+            const frame = `ORDER BY ${order} RANGE BETWEEN ${bound(offset)}`;
+            const sql = `SELECT id, k IS NULL AS null_key, count(*) OVER (${frame}) AS n, count(k) OVER (${frame}) AS c, min(id) OVER (${frame}) AS m FROM ${table.name} ORDER BY id`;
+            const expected = await pgOutcome(pg, sql);
+            const actual = nextOutcome(next, sql);
+            if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+              failures.push(
+                `${sql}\n  pglite: ${JSON.stringify(expected)}\n  next:   ${JSON.stringify(actual)}`,
+              );
+              continue;
+            }
+            if (!("rows" in expected)) continue;
+            const nullsFirst = order.includes("NULLS FIRST") || order === "k DESC";
+            for (const row of expected.rows as unknown[][]) {
+              const [, nullKey, n, c] = row;
+              if (nullKey === true) reach.reach("null row");
+              else if (Number(n) > Number(c))
+                reach.reach(nullsFirst ? "nulls first in a frame" : "nulls last in a frame");
+              else reach.reach("nulls outside a frame");
+            }
+          }
+    }
+    expect(failures.slice(0, 3).join("\n")).toBe("");
+    expect(failures.length).toBe(0);
+    reach.assertReached();
   });
 });

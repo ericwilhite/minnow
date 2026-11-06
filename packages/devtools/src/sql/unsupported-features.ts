@@ -352,4 +352,22 @@ export const unsupportedFeatures: readonly UnsupportedFeatureRecord[] = [
     notes:
       "An aggregate used as a window function cannot take DISTINCT; PostgreSQL rejects this form too. DISTINCT aggregates work in grouped aggregation, so aggregate in a grouped block and window over that.",
   },
+  {
+    id: "window.frame-negative-offset",
+    error: "frame starting offset must not be negative",
+    notes:
+      "A negative frame offset is an error, as in PostgreSQL (22013), and so is a NULL one (22004). One difference: PostgreSQL raises a negative RANGE offset only when it compares a row, so over no rows, as here, it returns none. Minnow refuses the statement before reading any row. A negative ROWS or GROUPS offset fails before any row in both.",
+  },
+  {
+    id: "window.frame-range-interval-offset",
+    error: "Window frame offsets other than numeric literals are not supported",
+    notes:
+      "PostgreSQL measures a date or timestamp RANGE frame with an interval offset. Minnow takes only numeric literal offsets, so interval offsets are refused.",
+  },
+  {
+    id: "window.frame-range-string-offset",
+    error: "Window frame offsets other than numeric literals are not supported",
+    notes:
+      "PostgreSQL reads a quoted offset as a value of the ORDER BY type. Write the offset as a number literal: RANGE BETWEEN 1 PRECEDING.",
+  },
 ];

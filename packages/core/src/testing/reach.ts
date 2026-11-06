@@ -481,3 +481,16 @@ export const HAVING_NAME_STATES = [
   "ungrouped column",
   "unknown table",
 ] as const;
+
+/**
+ * NULL keys in RANGE offset frames against PostgreSQL (next/testing/lowering-pglite-review.test.ts,
+ * the B7 report): for a non-NULL current row, NULLs sort below every key (NULLS FIRST) or above
+ * (NULLS LAST), so a frame that runs to that end includes them; a NULL row's frame is its NULL
+ * peers.
+ */
+export const RANGE_NULL_STATES = [
+  "nulls first in a frame",
+  "nulls last in a frame",
+  "nulls outside a frame",
+  "null row",
+] as const;
