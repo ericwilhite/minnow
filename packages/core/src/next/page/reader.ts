@@ -69,6 +69,19 @@ import {
 } from "./decode.js";
 import { partsOf } from "./large-value.js";
 import {
+  compilePredicate,
+  pageMayMatch,
+  type ColumnPredicate,
+  type CompiledPredicate,
+} from "./predicate.js";
+import {
+  dictionaryMatches,
+  newScratch,
+  scratchBytes,
+  selectPage,
+  type SelectScratch,
+} from "./select.js";
+import {
   checkDirectoryWithin,
   pageIndexOf,
   parseDirectory,
@@ -80,6 +93,18 @@ import type { InflatedPageCache } from "./inflated-cache.js";
 import type { BlobCache } from "../format/blob-cache.js";
 
 export { MAX_BLOB_BYTES, MAX_READ_BYTES };
+
+/**
+ * Selection-aware decode: below this fraction of a span's rows, `gather` of the selected rows
+ * beats `decodeRange` of the span; at or above it, decode the span densely and keep the
+ * selection over it. Measured by scripts/pushdown-bench.mts on the W1M table's 30 projected
+ * columns (gather / dense: 0.31 at 10 %, 0.74 at 30 %, 1.1–1.25 at 50–60 %, 2.2 at 70 % and up).
+ */
+export const DENSE_SELECTION = 0.4;
+
+/** Whether `selected` rows of a `span`-row range should be decoded densely (`DENSE_SELECTION`). */
+export const prefersDense = (selected: number, span: number): boolean =>
+  selected >= span * DENSE_SELECTION;
 
 type Rows = Uint16Array | Uint32Array | Int32Array;
 export type MaybePromise<T> = T | Promise<T>;
@@ -140,6 +165,8 @@ function at<T>(values: readonly T[], index: number): T {
   if (value === undefined) throw new RangeError("Index outside the list");
   return value;
 }
+/** `at`, for methods whose `at` parameter shadows it. */
+const at_ = at;
 
 const isDictionary = (entry: PageEntry): boolean =>
   (entry.encoding & 0x7f) === PageEncoding.dictionary;
@@ -239,6 +266,10 @@ export class ChunkReader {
   readonly #generations = new Map<number, number>();
   /** `valueParts` streams not finished: `close` releases what they hold (review B2-p2b #2). */
   readonly #streams = new Set<Stream>();
+  /** Each compiled predicate's matching dictionary codes, charged until `close`. */
+  readonly #codes = new Map<CompiledPredicate, Uint32Array>();
+  #scratch: SelectScratch | null = null;
+  #scratchCharge = 0;
   #closed = false;
 
   private constructor(
@@ -638,6 +669,11 @@ export class ChunkReader {
       lease?.release();
     }
     this.#streams.clear();
+    for (const codes of this.#codes.values()) this.#options.budget.free(codes.byteLength);
+    this.#codes.clear();
+    this.#options.budget.free(this.#scratchCharge);
+    this.#scratchCharge = 0;
+    this.#scratch = null;
     this.release();
     this.#drop(this.#dictionaryHeld);
     this.#dictionaryHeld = null;
@@ -645,6 +681,121 @@ export class ChunkReader {
     this.#dictionaryVector = null;
     this.#options.budget.free(this.#directoryCharge);
     if (this.#directoryPin !== null) this.#options.directories?.unpin(this.#directoryPin);
+  }
+
+  // ── Predicates on encoded pages (predicate.ts, select.ts) ─────────────────────────────
+
+  /**
+   * `predicate` compiled for this chunk, or null when it is not pushed down for its type (the
+   * caller evaluates it on decoded values). Compile once per chunk and reuse it for every batch.
+   */
+  compilePredicate(predicate: ColumnPredicate): CompiledPredicate | null {
+    return compilePredicate(this.chunk.type, this.directory.scale, predicate);
+  }
+
+  /**
+   * The pages over `[from, to)` that may hold a qualifying row (the others are skipped by their
+   * statistics, without being read): load these before `select`.
+   */
+  pagesMatching(compiled: CompiledPredicate, from = 0, to = this.rowCount): number[] {
+    const [first, end] = this.pagesInRange(from, to);
+    const out: number[] = [];
+    for (let page = first; page < end; page++)
+      if (pageMayMatch(compiled, at(this.directory.pages, page))) out.push(page);
+    return out;
+  }
+
+  /**
+   * Writes the group positions of the rows of `[from, to)` that satisfy `compiled` to
+   * `out[at …]`, ascending, and returns how many. Pages its statistics rule out are skipped
+   * unread; every other page in the range must be loaded (and the dictionary, which `load`
+   * brings with a dictionary page). `out` needs room for `to − from` positions.
+   */
+  select(compiled: CompiledPredicate, from: number, to: number, out: Uint16Array, at = 0): number {
+    this.#live();
+    if (out.length - at < to - from) throw new RangeError("The selection buffer is too small");
+    const [first, end] = this.pagesInRange(from, to);
+    let count = 0;
+    for (let page = first; page < end; page++) {
+      const entry = at_(this.directory.pages, page);
+      if (!pageMayMatch(compiled, entry)) continue;
+      const start = Math.max(from, entry.firstRow) - entry.firstRow;
+      const stop = Math.min(to, entry.firstRow + entry.rowCount) - entry.firstRow;
+      count += selectPage(this.#context(compiled, page), null, start, stop, out, at + count);
+    }
+    return count;
+  }
+
+  /**
+   * Keeps the rows of the selection `rows[start … end)` (group positions, ascending) that also
+   * satisfy `compiled`, writing them to `out[at …]` (which may be `rows` itself when `at ≤
+   * start`); returns how many.
+   */
+  refine(
+    compiled: CompiledPredicate,
+    rows: Rows,
+    start: number,
+    end: number,
+    out: Uint16Array,
+    at = 0,
+  ): number {
+    this.#live();
+    if (out.length - at < end - start) throw new RangeError("The selection buffer is too small");
+    const pages = this.directory.pages;
+    let count = 0;
+    let k = start;
+    while (k < end) {
+      const page = pageIndexOf(pages, rows[k] ?? 0);
+      const entry = at_(pages, page);
+      const limit = entry.firstRow + entry.rowCount;
+      let stop = k + 1;
+      while (stop < end && (rows[stop] ?? 0) < limit) stop++;
+      if (pageMayMatch(compiled, entry))
+        count += selectPage(this.#context(compiled, page), rows, k, stop, out, at + count);
+      k = stop;
+    }
+    return count;
+  }
+
+  #context(compiled: CompiledPredicate, page: number) {
+    const view = this.#view(page);
+    const entry = at_(this.directory.pages, page);
+    let codes: Uint32Array | null = null;
+    if (view.kind === PageEncoding.dictionary && compiled.nulls === null) {
+      codes = this.#codes.get(compiled) ?? null;
+      if (codes === null) {
+        const dictionary = this.#dictionary;
+        if (dictionary === null)
+          throw new RangeError("A dictionary page needs its dictionary loaded");
+        const bytes = ((dictionary.size + 31) >>> 5) * 4;
+        if (!this.#options.budget.allocate(bytes)) throw new PageBudgetError(bytes);
+        codes = dictionaryMatches(dictionary, compiled);
+        this.#codes.set(compiled, codes);
+      }
+    }
+    return {
+      view,
+      entry,
+      compiled,
+      codes,
+      dictionary: this.#dictionary,
+      scratch: this.#selectScratch(),
+      values: this.#resolver(view, entry),
+      type: this.chunk.type,
+    };
+  }
+
+  /** Decode scratch for pages compared after decoding: one page's rows, charged until close. */
+  #selectScratch(): SelectScratch {
+    if (this.#scratch !== null) return this.#scratch;
+    let rows = 1;
+    for (const page of this.directory.pages) rows = Math.max(rows, page.rowCount);
+    rows = Math.min(rows, 4096); // decoded in chunks of this many rows
+    const bytes = scratchBytes(rows);
+    if (!this.#options.budget.allocate(bytes)) throw new PageBudgetError(bytes);
+    this.#scratchCharge = bytes;
+    this.#scratch = newScratch(rows);
+    return this.#scratch;
   }
 
   // ── Out-of-line values ──────────────────────────────────────────────────────────────────

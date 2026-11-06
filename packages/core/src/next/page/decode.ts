@@ -113,6 +113,42 @@ function constantWidth(tag: number): number {
  * `chunkScale` is the decimal chunk's directory scale: a fixed scale, or null for a mixed-scale
  * chunk (whose pages carry `scales` or `uniformScale`). Ignored for other tags.
  */
+// Monomorphic scans for the parse checks: one function per array type, so each loop's element
+// loads stay specialized (a loop over a union of typed arrays runs several times slower).
+function nonDecreasing16(offsets: Uint16Array, rows: number): boolean {
+  let previous = 0;
+  for (let row = 1; row <= rows; row++) {
+    const next = offsets[row] ?? 0;
+    if (next < previous) return false;
+    previous = next;
+  }
+  return true;
+}
+function nonDecreasing32(offsets: Uint32Array, rows: number): boolean {
+  let previous = 0;
+  for (let row = 1; row <= rows; row++) {
+    const next = offsets[row] ?? 0;
+    if (next < previous) return false;
+    previous = next;
+  }
+  return true;
+}
+function max8(codes: Uint8Array, rows: number): number {
+  let max = 0;
+  for (let row = 0; row < rows; row++) if ((codes[row] ?? 0) > max) max = codes[row] ?? 0;
+  return max;
+}
+function max16(codes: Uint16Array, rows: number): number {
+  let max = 0;
+  for (let row = 0; row < rows; row++) if ((codes[row] ?? 0) > max) max = codes[row] ?? 0;
+  return max;
+}
+function max32(codes: Uint32Array, rows: number): number {
+  let max = 0;
+  for (let row = 0; row < rows; row++) if ((codes[row] ?? 0) > max) max = codes[row] ?? 0;
+  return max;
+}
+
 export function parsePage(
   stored: Uint8Array,
   entry: PageEntry,
@@ -257,8 +293,12 @@ export function parsePage(
             ? new Uint16Array(buffer, offset + start, rows + 1)
             : new Uint32Array(buffer, offset + start, rows + 1);
         check(offsets[0] === 0 && offsets[rows] === aux, "Varlen offsets do not span the bytes");
-        for (let row = 0; row < rows; row++)
-          check((offsets[row] ?? 0) <= (offsets[row + 1] ?? 0), "Varlen offsets decrease");
+        check(
+          offsets instanceof Uint16Array
+            ? nonDecreasing16(offsets, rows)
+            : nonDecreasing32(offsets, rows),
+          "Varlen offsets decrease",
+        );
         unsigned = offsets;
         data = bytes.subarray(start + offsetBytes, length);
         if (large !== null) {
@@ -333,8 +373,12 @@ export function parsePage(
       fits(length);
       if (width > 0) {
         const codes = unsignedView(buffer, offset + start, width, rows);
-        let max = 0;
-        for (let row = 0; row < rows; row++) if ((codes[row] ?? 0) > max) max = codes[row] ?? 0;
+        const max =
+          codes instanceof Uint8Array
+            ? max8(codes, rows)
+            : codes instanceof Uint16Array
+              ? max16(codes, rows)
+              : max32(codes, rows);
         check(max <= aux, "Dictionary code above the page's maximum");
         unsigned = codes;
       }

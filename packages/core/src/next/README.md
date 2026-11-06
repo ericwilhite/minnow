@@ -285,6 +285,36 @@ is access's `Snapshot`.
   cached reads) for tests and benchmarks; `scripts/page-format-bench.mts` measures the codecs
   against today's block format.
 
+### Predicates on encoded pages (`page/predicate.ts`, `page/select.ts`)
+
+The read-side pushdown the executor's scan uses; four calls and one helper:
+
+- `reader.compilePredicate(predicate)`: one column compared with constants (`=`, `<>`, `<`, `<=`,
+  `>`, `>=`, `in`, `between`, `isNull`, `isNotNull`), compiled once per chunk into intervals in
+  the column's order. Null when the type or operator is not pushed down (interval, json, arrays,
+  mixed-scale decimals, enum ordering): the caller evaluates it on decoded values. Constants are
+  in stored form (integers as bigint or number, decimals as `{coefficient, scale}` or a special,
+  text/bytes/uuid as bytes).
+- `chunkMayMatch(compiled, rowCount, chunk.statistics)` prunes a group; `reader.pagesMatching`
+  lists the pages a range needs (load only those). Statistics prune only when they prove no row
+  qualifies; absent or differently shaped statistics never prune.
+- `reader.select(compiled, from, to, out)` writes the qualifying group positions (`Uint16Array`,
+  ascending) of loaded pages without materializing values: dictionary pages test codes against a
+  bitmap of matching dictionary entries built once per chunk; frame-of-reference pages compare
+  stored deltas with bounds moved into delta space once per page; plain int32, float, bool and
+  varlen pages compare in place. Delta, plain int64 and decimal pages decode into a reused
+  scratch and compare word pairs or limbs, never BigInts. `reader.refine(compiled, rows, …)`
+  narrows a selection (in place allowed), for conjunctions across columns.
+- Semantics are PostgreSQL's: NULLs never satisfy a comparison; float NaN equals NaN and sorts
+  above +Infinity, −0 equals +0; decimals compare exactly (specials −Infinity < finite <
+  +Infinity < NaN); text, bytes and uuid in byte order (C collation).
+- Selection-aware decode: `gather` decodes only the selected rows of the other columns; at or
+  above `DENSE_SELECTION` (40 %, measured) of a span, `prefersDense` says decode the span with
+  `decodeRange` and keep the selection instead.
+- Memory: no per-row allocation. The code bitmaps and the decode scratch are charged to the
+  reader's budget and returned at `close`.
+- `scripts/pushdown-bench.mts` measures it on the W1M table's columns against decode-then-filter.
+
 ### Manifest (`format/manifest.ts`)
 
 - The root is O(tables + ledger). Nothing is O(rows).
