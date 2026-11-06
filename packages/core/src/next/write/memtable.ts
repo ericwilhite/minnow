@@ -54,12 +54,43 @@ class Counter implements Charge {
   }
 }
 
+/**
+ * A group root read only when first needed (review B3-p2c-1 #2): a staged group recovered at open
+ * names its root but does not read it, so an open walks no group root (R25).
+ */
+export class LazyGroupRoot {
+  #value: GroupRoot | null = null;
+  #loading: Promise<GroupRoot> | null = null;
+
+  constructor(readonly read: () => Promise<GroupRoot>) {}
+
+  get(): GroupRoot | Promise<GroupRoot> {
+    if (this.#value !== null) return this.#value;
+    this.#loading ??= this.read().then(
+      (root) => (this.#value = root),
+      (error: unknown) => {
+        this.#loading = null; // a failed read is tried again by the next reader
+        throw error;
+      },
+    );
+    return this.#loading;
+  }
+}
+
+/** A group root, decoded or still to be read. */
+export type GroupRootRef = GroupRoot | LazyGroupRoot;
+
+/** The decoded root of `ref`, reading it the first time when it is lazy. */
+export function groupRootOf(ref: GroupRootRef): GroupRoot | Promise<GroupRoot> {
+  return ref instanceof LazyGroupRoot ? ref.get() : ref;
+}
+
 /** A staged memtable's durable parts (rows and its own index puts). */
 export interface StagedPart {
   /** The staging id the root lists them under. */
   readonly stagingId: number;
   readonly group: GroupRef;
-  readonly groupRoot: GroupRoot;
+  readonly groupRoot: GroupRootRef;
   /** Runs of the memtable's own puts per index, oldest first (replay may hold several). */
   readonly runs: ReadonlyMap<number, readonly RunRef[]>;
   /** Held while the staged group can be read through this memtable. */
@@ -70,7 +101,7 @@ export interface StagedPart {
 
 export interface Published {
   readonly group: GroupRef;
-  readonly groupRoot: GroupRoot;
+  readonly groupRoot: GroupRootRef;
   /** The run each index's delta became (absent: the delta was empty). */
   readonly runs: ReadonlyMap<number, RunRef>;
   /** Held for re-pointed readers; released when no reader can still reach this memtable. */

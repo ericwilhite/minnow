@@ -11,7 +11,13 @@
  *   space, and its readers are re-pointed (ruling R16.3).
  * - **Recovery** (`openWritePath`): the single log scan, truncation and replay of startup step 4.
  */
-import { Memtable, MEMTABLE_ROWS, type StagedPart } from "./memtable.js";
+import {
+  groupRootOf,
+  LazyGroupRoot,
+  Memtable,
+  MEMTABLE_ROWS,
+  type StagedPart,
+} from "./memtable.js";
 import type { KeyDelta } from "./key-hash.js";
 
 /**
@@ -860,18 +866,18 @@ export class WritePathImpl implements WritePath, EngineHooks {
       const table = state?.root;
       const entry = table?.staged.find((staged) => staged.transaction === unclaimed.transaction);
       if (state === undefined || table == null || entry === undefined) continue;
-      this.#pendingRetire.push(
-        ...(await this.#tableExtents({
-          ...table,
-          groups: EMPTY_DIRECTORY,
-          groupCount: 0,
-          liveRowCount: 0,
-          keyIndex: null,
-          secondaryIndexes: [],
-          statistics: null,
-          staged: [entry],
-        })),
-      );
+      // Its extents are found by a walk of the entry, done by the first root (after the open,
+      // which reads no group root: review B3-p2c-1 #2).
+      this.#unclaimedWalks.push({
+        ...table,
+        groups: EMPTY_DIRECTORY,
+        groupCount: 0,
+        liveRowCount: 0,
+        keyIndex: null,
+        secondaryIndexes: [],
+        statistics: null,
+        staged: [entry],
+      });
       state.root = { ...table, staged: table.staged.filter((staged) => staged !== entry) };
       this.maintenance.stagingDropped += 1;
     }
@@ -1106,9 +1112,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
     for (const [k, ref] of refs.entries()) {
       if (ref.firstRowId < end)
         throw new LogCorruptionError("Staged rows overlap rows replayed before them");
-      const held = await this.#metadata.groupRoot(ref.root, this.#grant);
-      const groupRoot = held.value;
-      held.release();
+      // Read when first needed (rows read, or the fold's statistics): an open reads no group
+      // root (R25; review B3-p2c-1 #2).
+      const groupRoot = new LazyGroupRoot(async () => {
+        const held = await this.#metadata.groupRoot(ref.root, this.#grant);
+        try {
+          return held.value;
+        } finally {
+          held.release();
+        }
+      });
       const memtable = new Memtable(
         def.id,
         ref.firstRowId,
@@ -2240,7 +2253,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
           for (const [indexId, list] of part.runs)
             if (!indexIds.has(indexId)) retired.push(...list.map(runExtent));
           newGroups.push(group);
-          published.set(memtable, { group, root: part.groupRoot, runs });
+          published.set(memtable, { group, root: await groupRootOf(part.groupRoot), runs });
           this.maintenance.stagedFolds += 1;
           continue;
         }
@@ -2508,6 +2521,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
   #nextStagingId = 1;
   /** The open transaction's staging id, once it staged anything. */
   readonly #txStaging = new WeakMap<TransactionImpl, number>();
+  /** Staging an open dropped (no frame claimed it), whose extents the first root walks. */
+  #unclaimedWalks: TableRoot[] = [];
   /** Extents of dropped staging the durable root still reaches: retired by the next root. */
   #pendingRetire: ExtentRef[] = [];
   /** Rollbacks' staging drops, each under the publish lock (close and quiesce wait for them). */
@@ -3670,6 +3685,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
     // Never twice: a dropped table's walk below also reaches staging its root still lists. They
     // leave the pending list only once this root is installed: a publication that fails after
     // this point keeps them for the next one (found by the staged-failure test: they leaked).
+    if (this.#unclaimedWalks.length > 0) {
+      const walks = [...this.#unclaimedWalks];
+      const found: ExtentRef[] = [];
+      for (const stub of walks) found.push(...(await this.#tableExtents(stub)));
+      this.#unclaimedWalks = this.#unclaimedWalks.filter((stub) => !walks.includes(stub));
+      this.#pendingRetire.push(...found);
+    }
     const drained = [...this.#pendingRetire];
     if (drained.length > 0) retireOnce(retired, drained);
     // A quiet table's index build has no entries: this root settles it (an empty index root and a

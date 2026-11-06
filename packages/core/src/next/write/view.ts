@@ -47,7 +47,7 @@ import type { FlatVector, Selection } from "../vector/vector.js";
 import { compareBytes } from "../vector/varlen.js";
 import { MEMORY_CHUNK_ROWS } from "./columns.js";
 import type { GroupDirectory } from "./groups.js";
-import type { Memtable } from "./memtable.js";
+import { groupRootOf, type Memtable } from "./memtable.js";
 import type { RunEntry } from "./runs.js";
 import { groupDeletions, type Shared, type TableView, type WriteState } from "./state.js";
 import { need } from "./bytes.js";
@@ -310,7 +310,12 @@ class MemorySegmentImpl implements MemorySegment {
         reason: null,
       };
     }
-    return this.#decodePublished(published.groupRoot, columnId, first, startRow, length, out);
+    const root = groupRootOf(published.groupRoot);
+    return root instanceof Promise
+      ? root.then((resolved) =>
+          this.#decodePublished(resolved, columnId, first, startRow, length, out),
+        )
+      : this.#decodePublished(root, columnId, first, startRow, length, out);
   }
 
   #decodePublished(

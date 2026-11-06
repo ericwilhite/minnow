@@ -306,3 +306,133 @@ describe("staged large transactions", () => {
     await harness.close();
   });
 });
+
+/** Group-root blobs start with the codec's magic "MGR1". */
+const isGroupRoot = (bytes: Uint8Array) =>
+  bytes[0] === 0x4d && bytes[1] === 0x47 && bytes[2] === 0x52 && bytes[3] === 0x31;
+
+/**
+ * Counts, during the next open only, the group-root extents read through the space (`roots`) and
+ * the log scans (one header read per scan). Reads by a flush the open scheduled (the fold, after
+ * ready: it reads each staged root once for the table's statistics) are counted apart (`fold`).
+ */
+function watchOpen(harness: Harness): {
+  roots: Set<number>;
+  fold: Set<number>;
+  scans: () => number;
+  stop: () => void;
+} {
+  const roots = new Set<number>();
+  const fold = new Set<number>();
+  let scans = 0;
+  let watching = true;
+  const flushing = () => (new Error().stack ?? "").includes("#writeFlush");
+  harness.onSpace = (space) => {
+    const read = space.read.bind(space);
+    space.read = async (refs, options) => {
+      const byFlush = flushing();
+      const lease = await read(refs, options);
+      if (watching)
+        lease.bytes.forEach((bytes, k) => {
+          if (isGroupRoot(bytes)) (byFlush ? fold : roots).add(need(refs[k]).extent.offset);
+        });
+      return lease;
+    };
+    const peek = space.peek.bind(space);
+    space.peek = (ref) => {
+      const bytes = peek(ref);
+      if (watching && bytes !== null && isGroupRoot(bytes))
+        (flushing() ? fold : roots).add(ref.extent.offset);
+      return bytes;
+    };
+  };
+  const open = harness.backend.open.bind(harness.backend);
+  harness.backend.open = async (lease) => {
+    const session = await open(lease);
+    const headers = session.readLogHeaders.bind(session);
+    session.readLogHeaders = () => {
+      if (watching) scans += 1;
+      return headers();
+    };
+    return session;
+  };
+  return {
+    roots,
+    fold,
+    scans: () => scans,
+    stop: () => {
+      watching = false;
+      harness.onSpace = null;
+    },
+  };
+}
+
+describe("an open with staging reads no group root (R25; review B3-p2c-1 #2)", () => {
+  it("a committed large transaction not yet folded: replay names its groups, reads none", async () => {
+    // The crashed process never folds (its flushes never publish).
+    let generation = 0;
+    const harness = new Harness("strict", "sim", 8, undefined, {
+      merges: { mode: "off" },
+      beforeFlushPublish: async () => {
+        if (generation === 0) await new Promise<never>(() => undefined);
+      },
+    });
+    const path = await harness.open();
+    const t = await createTable(path);
+    const tx = await path.begin();
+    const s = tx.statement({ rules });
+    await insertIn(s.table(t), range(0, 40));
+    await s.end();
+    await (
+      await tx.commit(null)
+    ).durable;
+    expect(tableRoot(path, t)?.staged.length).toBe(1);
+    generation = 1;
+    const watch = watchOpen(harness);
+    const crashed = await harness.crash();
+    expect([...watch.roots], "group roots read at open").toEqual([]);
+    expect(watch.scans(), "one log scan").toBe(1);
+    expect(crashed.maintenance.publishedReplays).toBe(1);
+    // The fold the open scheduled reads them after ready: the watch does see such reads.
+    await crashed.quiesce();
+    expect(watch.fold.size, "the fold read the staged roots").toBeGreaterThan(0);
+    watch.stop();
+    // Every row of the commit is visible at once, through its index too.
+    expect(await seen(crashed, t)).toEqual(range(0, 40));
+    const view = crashed.pin();
+    expect(await probe(view, t, range(0, 40))).toBe(40);
+    view.release();
+    await crashed.quiesce();
+    expect(tableRoot(crashed, t)?.staged).toEqual([]);
+    expect(await seen(crashed, t)).toEqual(range(0, 40));
+    await harness.space.audit();
+    await harness.close();
+  });
+
+  it("staging no frame claimed: the open drops it without walking it; the first root retires it", async () => {
+    const harness = new Harness("strict", "sim", 8, undefined, { merges: { mode: "off" } });
+    const path = await harness.open();
+    const t = await createTable(path);
+    const tx = await path.begin();
+    const s = tx.statement({ rules });
+    await insertIn(s.table(t), range(0, 40));
+    await s.end();
+    expect(tableRoot(path, t)?.staged.length).toBe(1);
+    const watch = watchOpen(harness);
+    const crashed = await harness.crash();
+    watch.stop();
+    expect([...watch.roots], "group roots read at open").toEqual([]);
+    expect(watch.scans(), "one log scan").toBe(1);
+    expect(crashed.maintenance.stagingDropped).toBe(1);
+    expect(await seen(crashed, t)).toEqual([]);
+    // The first publication walks and retires it.
+    await autocommit(crashed, (s2) =>
+      s2.table(t).insert(batch(ints(range(0, 8)), ints(range(0, 8))), null),
+    );
+    await autocommit(crashed, (s2) => s2.table(t).insert(batch(ints([8]), ints([8])), null));
+    await crashed.quiesce();
+    expect(tableRoot(crashed, t)?.staged).toEqual([]);
+    await harness.space.audit();
+    await harness.close();
+  });
+});
