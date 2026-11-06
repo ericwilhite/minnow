@@ -73,6 +73,11 @@ b.id = a.id)` was false when no row of `b` matched. An aggregate without `GROUP 
   with `table name "a" specified more than once`. The same applies to `UPDATE … FROM` and
   `DELETE … USING` when a source has the target's name. Give each source its own alias.
 
+- **Unknown names are reported before grouping errors.** `SELECT id FROM a GROUP BY nope`
+  reported that `id` must appear in `GROUP BY`; it now reports the unknown column, as
+  PostgreSQL does. The same holds for `HAVING` and unknown table qualifiers. `count(z.*)` over
+  a table `z` that is not in the `FROM` clause now fails with "missing FROM-clause entry for
+  table" instead of counting rows.
 - **Block comments nest**, as in PostgreSQL: `/* outer /* inner */ still outer */` is one
   comment. It used to end at the first `*/`, so the rest became part of the statement.
 

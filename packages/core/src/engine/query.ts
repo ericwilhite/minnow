@@ -3779,7 +3779,6 @@ export function referencedColumns(
   if (new Set(sourceAliases).size !== sourceAliases.length)
     throw new TypeError("Table aliases must be unique");
   plan = unifyPlanGroupedReferences(plan, (tableName) => schemas.get(tableName));
-  validateGrouping(plan);
   const aliases = new Map(sources.map((source) => [source.alias, source.table]));
   const requested = new Map<string, Set<string>>(
     sources.map((source) => [source.table, new Set<string>()]),
@@ -3833,7 +3832,62 @@ export function referencedColumns(
   };
   for (const expression of expressions) collect(expression, false);
   for (const { expression } of plan.orderBy) collect(expression, true);
+  for (const expression of expressions) assertWildcardSources(expression, sourceAliases);
+  // Grouping is judged once every name resolved: an unknown name is reported as unknown
+  // (PostgreSQL), not as an ungrouped column.
+  validateGrouping(plan);
   return new Map([...requested].map(([table, columns]) => [table, [...columns]]));
+}
+
+/** A `t.*` argument (`count(t.*)`) names one of the block's sources (PostgreSQL's 42P01). */
+function assertWildcardSources(expression: Expression, aliases: readonly string[]): void {
+  for (const child of childExpressions(expression)) {
+    if (child.kind === "wildcard" && child.table !== undefined && !aliases.includes(child.table))
+      throw new TypeError(`missing FROM-clause entry for table "${child.table}"`);
+    assertWildcardSources(child, aliases);
+  }
+}
+
+/**
+ * Before grouping is judged (lowering's path, prepareColumnarShape): every name the top-level
+ * block reads resolves, else PostgreSQL's error for it — `missing FROM-clause entry for table
+ * "z"` (42P01) for a qualifier no source has, `column "x" does not exist` (42703) for a name no
+ * source has. A source whose columns are unknown here (a derived table) is assumed to have the
+ * name; a bare name may also be an output alias. The top-level block has no outer scope, so an
+ * unknown qualifier is an error there.
+ */
+function assertTopLevelNamesResolve(
+  plan: CompiledQuery,
+  columnsOf: (tableName: string) => readonly string[] | undefined,
+): void {
+  const sources = [plan.base, ...plan.joins];
+  const aliases = sources.map((source) => source.alias);
+  const known = sources.map((source) => columnsOf(source.table));
+  const outputs = new Set(plan.select.map((item) => item.alias));
+  const check = (expression: Expression): void => {
+    for (const reference of expressionColumns(expression)) {
+      const dot = reference.indexOf(".");
+      if (dot !== -1) {
+        const position = aliases.indexOf(reference.slice(0, dot));
+        if (position === -1)
+          throw new TypeError(`missing FROM-clause entry for table "${reference.slice(0, dot)}"`);
+        const columns = known[position];
+        if (columns !== undefined && !columns.includes(reference.slice(dot + 1)))
+          throw new TypeError(`column ${reference} does not exist`);
+      } else if (
+        !outputs.has(reference) &&
+        known.every((columns) => columns !== undefined && !columns.includes(reference))
+      )
+        throw new TypeError(`column "${reference}" does not exist`);
+    }
+    assertWildcardSources(expression, aliases);
+  };
+  for (const expression of plan.groupBy) check(expression);
+  for (const predicate of plan.having) {
+    check(predicate.left);
+    check(predicate.right);
+  }
+  for (const item of plan.select) if (item.expression.kind !== "wildcard") check(item.expression);
 }
 
 /**
@@ -3984,6 +4038,7 @@ export function prepareColumnarShape(
   plan = expandQualifiedWildcards(plan, columnsOf);
   plan = expandDistinctWildcard(plan, columnsOf);
   plan = unifyPlanGroupedReferences(plan, columnsOf);
+  if (plan.base.table !== DUAL_TABLE) assertTopLevelNamesResolve(plan, columnsOf);
   validateGrouping(plan);
   return plan;
 }
