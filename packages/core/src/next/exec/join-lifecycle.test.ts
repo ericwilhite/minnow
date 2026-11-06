@@ -29,6 +29,7 @@ import { JoinTable } from "./join-table.js";
 import { HashJoin, hashJoinMinimumBytes, type HashJoinKind, type HashJoinSpec } from "./join.js";
 import type { Operator, PushResult } from "./pipeline.js";
 import { Slice, runToEnd } from "./slices.js";
+import { TaskClock, taskClock } from "./pipeline.js";
 
 const FREE = { allocate: () => true, free: () => undefined };
 
@@ -410,15 +411,16 @@ describe("review B7-p2c-1 #3: join work is bounded by key bytes", () => {
         keyColumns.map(() => false),
       );
       const scratch = new KeyScratch(layout, 2048, FREE);
-      const slice = new Slice(4);
+      // A private task clock: the loop below is the runner, each yield beginning a task.
+      const slice = new Slice(4, new TaskClock(() => performance.now()));
       const job = JoinTable.buildJob(store, [...keyColumns], layout, 0, FREE, scratch, slice);
       const start = performance.now();
       let step = job.next();
       const first = performance.now() - start;
       let segments = 1;
       while (step.done !== true) {
-        // A runner starts a new slice at each yield (runSliced does).
-        slice.reset();
+        // A runner begins a task at each yield (runSliced's yield does).
+        slice.clock.begin();
         step = job.next();
         segments++;
       }
@@ -492,7 +494,8 @@ describe("review B7-p2c-1 #3: join work is bounded by key bytes", () => {
 describe("review B7-p2c-2: every byte of key work is in a step", () => {
   const types2 = [TEXT, INT];
   /** An always-due slice; the runners below reset it at each yield, as `runSliced` does. */
-  const due = new Slice(0);
+  // Always due, on a private task clock the runners below begin a task on at each yield.
+  const due = new Slice(0, new TaskClock(() => performance.now()));
   /** Runs a job with an always-due slice, returning the most work any one step did. */
   const stepWork = <T>(
     job: Generator<Promise<void> | void, T, void>,
@@ -504,7 +507,7 @@ describe("review B7-p2c-2: every byte of key work is in a step", () => {
       const step = job.next();
       max = Math.max(max, work.total - before);
       if (step.done === true) return { max, value: step.value };
-      due.reset();
+      due.clock.begin();
     }
   };
   // A step may end up to one chunk (4 KiB) past the budget, and a hash step spends two seeds.
@@ -603,7 +606,7 @@ describe("review B7-p2c-2: every byte of key work is in a step", () => {
       if (steps === 0) firstMs = performance.now() - start;
       max = Math.max(max, work.total - before);
       steps++;
-      due.reset();
+      due.clock.begin();
       if (step.done === true) {
         expect(step.value?.inserted).toBe(2);
         step.value?.close();
@@ -644,7 +647,8 @@ describe("review B7-p2c-2: every byte of key work is in a step", () => {
 });
 
 describe("review B7-p2c-3: no key work past a due step", () => {
-  const due = new Slice(0);
+  // Always due, on a private task clock the runners below begin a task on at each yield.
+  const due = new Slice(0, new TaskClock(() => performance.now()));
   /** The most key work any one step of `job` did (a runner resetting `due` at each yield). */
   const stepWork = <T>(job: Generator<Promise<void> | void, T, void>, work: KeyWork) => {
     let max = 0;
@@ -653,7 +657,7 @@ describe("review B7-p2c-3: no key work past a due step", () => {
       const step = job.next();
       max = Math.max(max, work.total - before);
       if (step.done === true) return { max, value: step.value };
-      due.reset();
+      due.clock.begin();
     }
   };
   // A step may end one chunk (4 KiB) past the budget, plus a slot or two.
@@ -669,7 +673,7 @@ describe("review B7-p2c-3: no key work past a due step", () => {
     const relaxed = new KeyWork(100);
     for (let i = 0; i < 10; i++) expect(relaxed.spend(60, later)).toBe(false);
     // After the runner's reset the work goes on.
-    due.reset();
+    due.clock.begin();
     expect(work.spend(1, due)).toBe(false);
   });
 
@@ -795,21 +799,20 @@ describe("review B7-p2c-3 #2: mark joins hash and compare in steps", () => {
     await join.build.finish();
     const sink = new CountSink();
     const probe = join.probe(sink);
-    // A clock that moves 10 ms per reading: every deadline check is due, so the slices begun
-    // (resets) count the checks the walk makes. Without a checkpoint per candidate the walk
-    // makes none: a handful of resets from the other phases.
-    // (From the real now: the slice's start and last use are real readings.)
+    // A clock that moves 10 ms per reading: every deadline check is due, so the tasks begun
+    // (yields) count the checks the walk makes. Without a checkpoint per candidate the walk
+    // makes none: a handful of yields from the other phases.
+    // (From the real now: the task's start is a real reading.)
     let t = performance.now();
     const clock = vi.spyOn(performance, "now").mockImplementation(() => (t += 10));
-    const resets = vi.spyOn(Slice.prototype, "reset");
+    const before = taskClock.epoch;
     try {
       await pushAll(probe, [INT, INT], [[-5, null]]);
       await probe.finish();
     } finally {
       clock.mockRestore();
     }
-    const slices = resets.mock.calls.length;
-    resets.mockRestore();
+    const slices = taskClock.epoch - before;
     // Each step's budget covers KEY_STEP_BYTES / 16 candidates.
     expect(slices).toBeGreaterThanOrEqual(Math.floor((rows * 16) / KEY_STEP_BYTES));
     expect(sink.rows).toBe(1);
@@ -820,7 +823,8 @@ describe("review B7-p2c-3 #2: mark joins hash and compare in steps", () => {
 
 describe("review B7-p2c-3 #4: encoded join keys copy text once, in steps", () => {
   const types2 = [TEXT, INT];
-  const due = new Slice(0);
+  // Always due, on a private task clock the runners below begin a task on at each yield.
+  const due = new Slice(0, new TaskClock(() => performance.now()));
 
   for (const zero of [false, true])
     it(`a 10 MiB ${zero ? "zero-filled " : ""}text key: one copy, never escaped, in bounded steps`, () => {
@@ -841,7 +845,7 @@ describe("review B7-p2c-3 #4: encoded join keys copy text once, in steps", () =>
           expect(step.value).toBe(1);
           break;
         }
-        due.reset();
+        due.clock.begin();
       }
       // The int's encoding (5 bytes), a header and a length (5), the text as stored: zeros are
       // not doubled (escaping is for order, not equality).
@@ -888,7 +892,7 @@ describe("review B7-p2c-3 #4: encoded join keys copy text once, in steps", () =>
         const step = job.next();
         most = Math.max(most, copied);
         if (step.done === true) break;
-        due.reset();
+        due.clock.begin();
       }
     } finally {
       spy.mockRestore();

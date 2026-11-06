@@ -648,9 +648,8 @@ and the owner import it directly.
 - Pushed predicates on the decoded fallback (below) load the values they read when they
   evaluate, before the batch is sized.
 - Long runs that emit nothing (ranges, chunks and groups filtered or pruned away) yield to the
-  event loop with a task every 4 ms (R23). The slice runs on across `next()` calls and resolved
-  continuations and restarts only after a task yield (R23.4), as the driver's and the
-  aggregate's do.
+  event loop with a task once 4 ms have passed since the worker's task began (R23, R23.5: the
+  one task clock, so `next()` calls and resolved continuations never start a slice).
 - Ending: at the end of the table the scan gives back everything it holds by itself; `abort` (a
   cancellation, an error, a LIMIT) does the same at once and repays a loan, never throwing. A
   `next()` still waiting on a read then resolves null: whatever settles after the abort (a reader
@@ -800,10 +799,12 @@ and the owner import it directly.
 
 ### Windows (`exec/window.ts`, `window-sort.ts`, `window-frames.ts`, `window-stream.ts`)
 
-- Sort, top-k, window and join slices (`exec/slices.ts`) continue across calls and across
-  backpressure that resolves at once: a new slice starts only after a real task yield, or at an
-  entry after the slice sat unused for a whole slice interval (ruling R23.4), so short calls
-  chained by resolved `ready()`s still yield, and a short call after a wait stays synchronous.
+- One task clock per worker (`exec/pipeline.ts` `TaskClock`, ruling R23.5): the driver, scans,
+  aggregation, join, sort, top-k and window all yield once `YIELD_INTERVAL_MS` has passed since
+  the worker's task began, and keep no slice start of their own, so several operators in one
+  task share the one bound. The clock is stamped only when a `yieldTask` resolves and at the
+  owner's task entry points (the server's message dispatch): never in `drive()`, an operator's
+  entry or a resolved promise. A missing stamp yields early, never late.
 - `WindowOperator` evaluates a `window` rel. Its rows are ordered by (PARTITION BY, ORDER BY),
   then evaluated one partition at a time. Output is the input columns, then one column per
   function.

@@ -15,7 +15,8 @@
  * - Long synchronous work yields to the event loop with a **task** (`yieldTask`: `setImmediate`
  *   where it exists, else a `MessageChannel` message with a `setTimeout` timer turn at least every
  *   `TIMER_TURN_MS`; never a resolved Promise, which would only run microtasks) at a batch
- *   boundary once `YIELD_INTERVAL_MS` of synchronous work has passed.
+ *   boundary once `YIELD_INTERVAL_MS` has passed since the task began: one clock per worker
+ *   (`TaskClock`, ruling R23.5), stamped when a yield resolves and at the owner's task entries.
  *   So an owner message (a point read, a commit, a cancel) waits at most about that long behind an
  *   analytical query, even one served entirely from cache.
  *
@@ -132,6 +133,64 @@ export function isPromise<T>(value: MaybePromise<T>): value is Promise<T> {
   return typeof (value as { then?: unknown } | null)?.then === "function";
 }
 
+/**
+ * When the current task began (ruling R23.5). The 4 ms bound is on the worker's task, not on one
+ * operator: the driver, every breaker, scans, aggregation, join, sort, top-k and window ask the
+ * same clock whether `YIELD_INTERVAL_MS` has passed since the task began, and keep no slice start
+ * of their own (per-operator starts let several operators in one task add up).
+ *
+ * It is stamped only where a task genuinely begins: when a `yieldTask` resolves, and at the
+ * owner's task entry points (the server's message dispatch, timers that start exec or write
+ * work: `beginTask`). Never in `drive()`, an operator's entry or a resolved promise, which can
+ * run mid-task. A missing stamp errs safe: the start is older, and work yields early.
+ *
+ * The worker's clock (`taskClock`) is event-loop state, like `lastTimerTurn`, not query scratch
+ * (R23.1). Tests inject a clock (an operator's `now` option makes a private one over it) or call
+ * `beginTask()` before a run they expect to be synchronous.
+ */
+export class TaskClock {
+  #start: number;
+  /** Tasks begun on this clock (a job checks a yield by it: join-keys.ts `KeyWork`). */
+  epoch = 0;
+  constructor(public now: () => number) {
+    this.#start = now();
+  }
+  /** A task begins now. */
+  begin(): void {
+    this.#start = this.now();
+    this.epoch++;
+  }
+  /** Milliseconds since the current task began. */
+  elapsed(): number {
+    return this.now() - this.#start;
+  }
+  /** Whether `interval` ms have passed since the current task began. */
+  due(interval = YIELD_INTERVAL_MS): boolean {
+    return this.now() - this.#start >= interval;
+  }
+}
+
+/** The worker's task clock (see `TaskClock`). */
+export const taskClock = new TaskClock(() => performance.now());
+
+/** The owner's task entry points stamp the worker's clock (R23.5). */
+export function beginTask(): void {
+  taskClock.begin();
+}
+
+/** The worker's clock, or for a test's `now` a private clock over it. */
+export function clockFor(now?: () => number): TaskClock {
+  return now === undefined ? taskClock : new TaskClock(now);
+}
+
+/**
+ * After a `yieldTask`: the worker's clock was stamped by it; a private (test) clock begins its
+ * task here.
+ */
+export function afterYield(clock: TaskClock): void {
+  if (clock !== taskClock) clock.begin();
+}
+
 /** What `yieldTask` schedules with (the global scope; tests pass a model event loop). */
 export interface TaskHost {
   readonly setImmediate?: (callback: () => void) => unknown;
@@ -165,7 +224,12 @@ export function createYieldTask(host: TaskHost): () => Promise<void> {
   let lastTimerTurn = host.now();
   const immediate = host.setImmediate;
   return () =>
-    new Promise<void>((resolve) => {
+    new Promise<void>((resolved) => {
+      // A task begins as the yield resolves (R23.5), before anything awaiting it resumes.
+      const resolve = () => {
+        taskClock.begin();
+        resolved();
+      };
       if (immediate !== undefined) {
         immediate(resolve);
         return;
@@ -204,7 +268,7 @@ export const yieldTask: () => Promise<void> = createYieldTask(globalHost);
 export interface DriveOptions {
   /** Synchronous work between task yields (default `YIELD_INTERVAL_MS`). */
   readonly yieldIntervalMs?: number;
-  /** The clock in ms (default `performance.now`); injectable for tests. */
+  /** Tests: a clock in ms, read through a private task clock (default the worker's, R23.5). */
   readonly now?: () => number;
 }
 
@@ -224,8 +288,8 @@ export function drive(
 
 class Driver {
   readonly #interval: number;
-  readonly #now: () => number;
-  #sliceStart: number;
+  /** The task clock (R23.5): the driver never stamps it, it only asks it. */
+  readonly #clock: TaskClock;
   /** A pulled item not pushed yet (`undefined`: nothing pulled). */
   #item: SourceItem | null | undefined = undefined;
   #finished = false;
@@ -237,8 +301,7 @@ class Driver {
     options: DriveOptions,
   ) {
     this.#interval = options.yieldIntervalMs ?? YIELD_INTERVAL_MS;
-    this.#now = options.now ?? (() => performance.now());
-    this.#sliceStart = this.#now();
+    this.#clock = clockFor(options.now);
   }
 
   run(): MaybePromise<void> {
@@ -273,9 +336,9 @@ class Driver {
       this.signal?.throwIfAborted();
       if (this.#finished) return null;
       if (this.#item === undefined) {
-        if (this.#now() - this.#sliceStart >= this.#interval)
+        if (this.#clock.due(this.#interval))
           return yieldTask().then(() => {
-            this.#sliceStart = this.#now();
+            afterYield(this.#clock);
           });
         const next = this.source.next();
         if (isPromise(next))

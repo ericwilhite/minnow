@@ -20,7 +20,16 @@ import {
   rowsOf,
   type Row,
 } from "./join-fixtures.js";
-import { drive, type Operator, type PushResult } from "./pipeline.js";
+import {
+  TaskClock,
+  YIELD_INTERVAL_MS,
+  beginTask,
+  drive,
+  taskClock,
+  type BatchSource,
+  type Operator,
+  type PushResult,
+} from "./pipeline.js";
 import {
   PREFIX_WORDS,
   RadixScratch,
@@ -523,7 +532,7 @@ describe("review B7-p2b-2 #2: slices bound work, not rows", () => {
   // A controlled clock: each comparison costs one unit; the deadline is four units.
   it("refining equal prefixes yields within a few comparisons (reviewer: 1,664 units)", () => {
     let now = 0;
-    const slice = new Slice(4, () => now);
+    const slice = new Slice(4, new TaskClock(() => now));
     const n = 400;
     const tuples = new Uint32Array(n * TUPLE_WORDS);
     for (let i = 0; i < n; i++) tuples[i * TUPLE_WORDS + PREFIX_WORDS] = i;
@@ -548,7 +557,7 @@ describe("review B7-p2b-2 #2: slices bound work, not rows", () => {
 
   it("a merge sort yields within a few comparisons (reviewer: 5,120 units)", () => {
     let now = 0;
-    const slice = new Slice(4, () => now);
+    const slice = new Slice(4, new TaskClock(() => now));
     const ids = Int32Array.from({ length: 1024 }, (_, i) => 1024 - i);
     const job = mergeSortJob(
       ids,
@@ -936,12 +945,15 @@ describe("the merge sort checks its deadline inside run tails (review B7-p2b-2 #
     let readings = 0;
     let stretch = 0;
     let longest = 0;
-    const slice = new Slice(Infinity, () => {
-      readings++;
-      stretch++;
-      longest = Math.max(longest, stretch);
-      return readings;
-    });
+    const slice = new Slice(
+      Infinity,
+      new TaskClock(() => {
+        readings++;
+        stretch++;
+        longest = Math.max(longest, stretch);
+        return readings;
+      }),
+    );
     const job = mergeSortJob(
       ids,
       new Int32Array(n),
@@ -1021,27 +1033,84 @@ describe("the store-wide operand decode checks its deadline per chunk (review B7
   }, 60_000);
 });
 
-describe("R23.4: a slice starts again only after a real yield or an idle wait", () => {
-  it("entries chained by resolved ready()s come due; an entry after an idle wait does not", () => {
+describe("R23.5: one task clock per worker", () => {
+  // The worker's clock reads a fake time here (restored after): every operator's deadline is a
+  // Slice on it, as in production.
+  function withTime(run: (advance: (ms: number) => number) => void): void {
+    const real = taskClock.now;
     let t = 0;
-    const slice = new Slice(4, () => t);
-    // Ten short calls, 1 ms each, resumed back to back (a resolved ready between them).
-    let due = 0;
-    for (let call = 0; call < 10; call++) {
-      slice.resume();
-      t += 1;
-      if (slice.due()) {
-        due++;
-        // The operator yields a task here, then resets.
-        slice.reset();
-      }
+    taskClock.now = () => t;
+    try {
+      beginTask();
+      run((ms) => (t += ms));
+    } finally {
+      taskClock.now = real;
+      beginTask();
     }
-    expect(due).toBe(2);
-    // An entry after 10 ms of others' work (or the caller's yield) starts a new slice: a short
-    // call then completes without a yield.
-    t += 10;
-    slice.resume();
-    t += 1;
-    expect(slice.due()).toBe(false);
+  }
+
+  it("two breakers alternating in one task yield by ~4 ms in total, not 4 ms each", () => {
+    withTime((advance) => {
+      // A breaker's entry: 3 ms of work in 1 ms steps, checking its deadline after each.
+      const entry = (slice: Slice): boolean => {
+        for (let ms = 0; ms < 3; ms++) {
+          advance(1);
+          if (slice.due()) return true;
+        }
+        return false;
+      };
+      const a = new Slice(YIELD_INTERVAL_MS);
+      let yieldedAt = -1;
+      if (entry(a)) yieldedAt = 3;
+      // The second breaker is made just before its first entry (a downstream stage set up as
+      // rows reach it); per-operator clocks would start it fresh here.
+      const b = new Slice(YIELD_INTERVAL_MS);
+      let t = 3;
+      for (let round = 0; yieldedAt < 0 && round < 4; round++) {
+        const slice = round % 2 === 0 ? b : a;
+        for (let ms = 0; ms < 3; ms++) {
+          t += 1;
+          advance(1);
+          if (slice.due()) {
+            yieldedAt = t;
+            break;
+          }
+        }
+      }
+      expect(yieldedAt).toBeGreaterThan(0);
+      expect(yieldedAt).toBeLessThanOrEqual(YIELD_INTERVAL_MS);
+    });
+  });
+
+  it("drive() does not start a task: a pipeline started late in a task yields after its first batch", () => {
+    withTime((advance) => {
+      // 3 ms of the task went to other work before this pipeline started.
+      advance(3);
+      let pushes = 0;
+      let left = 10;
+      const source: BatchSource = {
+        next: () => {
+          advance(1);
+          return left-- > 0
+            ? { batch: { length: 1, columns: [], selection: null }, transfer: null as never }
+            : null;
+        },
+        abort: () => undefined,
+      };
+      const sink: Operator = {
+        push: () => {
+          pushes++;
+          return "ready";
+        },
+        ready: () => Promise.resolve(),
+        finish: () => undefined,
+        abort: () => undefined,
+      };
+      const run = drive(source, sink);
+      // The task's 4 ms ran out after the first batch: the driver yields (a Promise).
+      expect(run).toBeInstanceOf(Promise);
+      expect(pushes).toBe(1);
+      void run;
+    });
   });
 });

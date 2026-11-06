@@ -469,11 +469,10 @@ class Shared {
 
   /**
    * Runs a job in the current slice: task yields between slices, the abort check at each
-   * resumption. The slice is not restarted here (R23.4: it starts again only after a real task
-   * yield, so many short calls still come due).
+   * resumption. Its deadline is the worker's task clock (R23.5: nothing here starts a slice; a
+   * task begins only at a real yield or an owner entry point).
    */
   sliced<T>(job: SlicedJob<T>): MaybePromise<T> {
-    this.slice.resume();
     return runSliced(job, this.slice, () => {
       this.checkAborted();
     });
@@ -484,7 +483,6 @@ class Shared {
     if (!this.slice.due()) return null;
     return yieldTask().then(() => {
       this.checkAborted();
-      this.slice.reset();
     });
   }
 
@@ -1126,9 +1124,8 @@ class Prober {
   }
 
   #yieldStep(): Promise<void> {
-    return yieldTask().then(() => {
-      this.shared.slice.reset();
-    });
+    // The yield begins a task: it stamps the worker's clock (R23.5).
+    return yieldTask();
   }
 
   start(batch: Batch, level: Level, chunk: ChunkState | null): void {
@@ -1156,10 +1153,7 @@ class Prober {
       if (step !== DONE) return step;
       // Between steps (each at most one output batch): a task yield once the slice is due;
       // `continue` checks the signal when it resumes.
-      if (this.#phase !== 9 && this.shared.slice.due())
-        return yieldTask().then(() => {
-          this.shared.slice.reset();
-        });
+      if (this.#phase !== 9 && this.shared.slice.due()) return yieldTask();
     }
   }
 
@@ -2073,7 +2067,6 @@ export class HashJoin {
     let result: MaybePromise<void>;
     try {
       shared.checkAborted();
-      shared.slice.resume();
       result = this.#level.endBuild();
     } catch (error) {
       this.#fail(error);
@@ -2127,9 +2120,8 @@ export class HashJoin {
   pushProbe(batch: Batch): PushResult {
     if (!this.#built) throw new TypeError("The join's build has not finished");
     this.#shared.checkAborted();
-    // A push continues the current slice (R23.4: no fresh slice per push, so short pushes
+    // No fresh slice per push (R23.5: the task clock's start is the task's, so short pushes
     // whose output blocks with a resolved ready still come due and yield).
-    this.#shared.slice.resume();
     // More key bytes than one step: the batch goes through in parts (raw keys count a
     // dictionary once, since they hash and look up each distinct entry once).
     const selection = batch.selection;
@@ -2183,7 +2175,6 @@ export class HashJoin {
       if (at >= active) return;
       await yieldTask();
       shared.checkAborted();
-      shared.slice.reset();
       n = keyStepRows(keys, ids, at, active - at, KEY_STEP_BYTES / 2, !raw);
     }
   }
@@ -2199,7 +2190,6 @@ export class HashJoin {
     } catch (error) {
       this.#fail(error);
     }
-    shared.slice.resume();
     if (level.parts === null && level.matched === null) {
       this.#release();
       return downstream.finish();

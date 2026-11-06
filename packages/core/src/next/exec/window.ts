@@ -567,9 +567,8 @@ class Evaluator implements Operator {
     this.context.signal?.throwIfAborted();
   }
 
-  /** Runs a job in the current slice (R23.4: restarted only after a real task yield). */
+  /** Runs a job against the worker's task clock (R23.5: nothing here starts a slice). */
   #sliced<T>(job: SlicedJob<T>): MaybePromise<T> {
-    this.slice.resume();
     return runSliced(job, this.slice, () => {
       this.checkAborted();
     });

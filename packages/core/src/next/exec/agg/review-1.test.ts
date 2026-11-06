@@ -231,7 +231,8 @@ describe("review B4-p2b-1", () => {
       finish: () => undefined,
       abort: () => undefined,
     };
-    const op = aggregate([I32], [0], [], charge, sink);
+    // A frozen task clock: only a real Promise could make the finish async (ruling R23.5).
+    const op = aggregate([I32], [0], [], charge, sink, { now: () => 0 });
     op.push({
       length: 1000,
       selection: null,

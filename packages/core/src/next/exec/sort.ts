@@ -828,11 +828,10 @@ class Sorter {
 
   /**
    * Runs a job in the current slice: task yields between slices, the abort check at each
-   * resumption. The slice is not restarted here (R23.4: it starts again only after a real task
-   * yield, so many short calls still come due).
+   * resumption. Its deadline is the worker's task clock (R23.5: nothing here starts a slice; a
+   * task begins only at a real yield or an owner entry point).
    */
   sliced<T>(job: SlicedJob<T>): MaybePromise<T> {
-    this.slice.resume();
     return runSliced(job, this.slice, () => {
       this.checkAborted();
     });
@@ -843,7 +842,6 @@ class Sorter {
     if (!this.slice.due()) return null;
     return yieldTask().then(() => {
       this.checkAborted();
-      this.slice.reset();
     });
   }
 

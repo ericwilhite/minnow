@@ -12,7 +12,19 @@ import {
 } from "../owner/errors.js";
 import { PROTOCOL_VERSION, type OwnerMessage } from "../owner/protocol.js";
 import type { ServerPort } from "../owner/server.js";
+import { taskClock } from "../exec/pipeline.js";
 import { flushTasks, flushUntil, harness, raw, seed, sleep } from "./owner-harness.js";
+
+describe("the task clock (ruling R23.5)", () => {
+  it("a client message begins a task on the worker's clock", async () => {
+    const { server, connect } = harness();
+    await connect();
+    const port = raw(server);
+    const before = taskClock.epoch;
+    port.port.onmessage?.({ data: { t: "ping" } } as MessageEvent);
+    expect(taskClock.epoch).toBe(before + 1);
+  });
+});
 
 describe("handshake", () => {
   it("welcomes the current protocol and refuses another", async () => {
