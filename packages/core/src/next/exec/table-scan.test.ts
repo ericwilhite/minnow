@@ -847,6 +847,62 @@ describe("review B4-p2c-2: the scan's lifecycle, budget and pacing", () => {
     }
   });
 
+  it("R23.4: the slice runs on across next() calls a caller makes at once", async () => {
+    // Each next() rejects one resident segment, then emits the next one's chunk. A caller that
+    // asks again at once (await, a microtask) is no task yield, so the scan's slice must not
+    // restart per call: a task queued before the loop runs long before its 200 calls end.
+    const space = new MemoryExtentSpace();
+    const hit = numbers(
+      I32,
+      Array.from({ length: 2048 }, () => 2),
+    );
+    const miss = numbers(
+      I32,
+      Array.from({ length: 2048 }, () => 1),
+    );
+    const segment = memorySegment(0, [], new Set());
+    const segments: Segment[] = Array.from({ length: 400 }, (_, index) => ({
+      ...segment,
+      index,
+      rowCount: 2048,
+      liveRowCount: 2048,
+      chunk: () => ({
+        vector: index % 2 === 0 ? miss : hit,
+        firstRow: 0,
+        rowCount: 2048,
+        complete: true,
+        reason: null,
+      }),
+    }));
+    const table: TableSnapshot = {
+      tableId: 9,
+      schemaVersion: 1,
+      columns: DEFS,
+      liveRowCount: 0,
+      segments,
+    };
+    let tick = 0;
+    const scan = scanOf(table, space, cmp("=", col(0, I32), lit(numbers(I32, [2]))), {
+      columns: [1],
+      now: () => tick++,
+    });
+    let calls = 0;
+    let callsBeforeTask = -1;
+    const handle = setImmediate(() => {
+      callsBeforeTask = calls;
+    });
+    for (;;) {
+      const item = await scan.next();
+      if (item === null) break;
+      calls += 1;
+    }
+    clearImmediate(handle);
+    scan.close();
+    expect(calls).toBe(200);
+    expect(callsBeforeTask).toBeGreaterThanOrEqual(0);
+    expect(callsBeforeTask).toBeLessThan(20);
+  });
+
   it("5. abort during a memory chunk's asynchronous read: no batch, no later read", async () => {
     const space = new MemoryExtentSpace();
     const rows = rowsOf(mulberry32(3), 10, false);

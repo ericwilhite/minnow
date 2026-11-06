@@ -648,7 +648,9 @@ and the owner import it directly.
 - Pushed predicates on the decoded fallback (below) load the values they read when they
   evaluate, before the batch is sized.
 - Long runs that emit nothing (ranges, chunks and groups filtered or pruned away) yield to the
-  event loop with a task every 4 ms inside one `next()` (R23).
+  event loop with a task every 4 ms (R23). The slice runs on across `next()` calls and resolved
+  continuations and restarts only after a task yield (R23.4), as the driver's and the
+  aggregate's do.
 - Ending: at the end of the table the scan gives back everything it holds by itself; `abort` (a
   cancellation, an error, a LIMIT) does the same at once and repays a loan, never throwing. A
   `next()` still waiting on a read then resolves null: whatever settles after the abort (a reader
