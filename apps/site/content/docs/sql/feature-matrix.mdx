@@ -51,7 +51,7 @@ exact error it raises.
 
 Two refusals are stricter than PostgreSQL. A negative `RANGE` frame offset fails before any row is
 read; PostgreSQL raises the same error only when it compares a row, so over no rows it returns
-none. And a `RANGE` offset a double cannot hold (`1e400`, `1e-400`) is refused, though PostgreSQL
+none. And a positive `RANGE` offset a double cannot hold (`1e400`, `1e-400`) is refused, though PostgreSQL
 runs it over a `NUMERIC` key.
 
 ## Supported SQL
