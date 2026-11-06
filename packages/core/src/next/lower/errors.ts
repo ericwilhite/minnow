@@ -79,21 +79,45 @@ export class PlanningError extends Error {
  * errors carry none). The front end checks some conditions in its own order, so a statement
  * with two faults may report the other one PostgreSQL would report first.
  */
-const FRONT_END_STATES: ReadonlyArray<readonly [RegExp, string]> = [
+export const FRONT_END_STATES: ReadonlyArray<readonly [RegExp, string]> = [
   [/^SELECT \* requires known columns for: /u, "42P01"],
   [/^Unknown table alias: /u, "42P01"],
+  [/^Unknown table for \S+: /u, "42P01"],
+  [/references an unavailable outer source: /u, "42P01"],
+  // Grammar constructs, not functions: a wrong argument count is a syntax error in PostgreSQL.
+  [/^(COALESCE|NULLIF|GREATEST|LEAST) requires /u, "42601"],
   [/^(Unknown|Unsupported) function: /u, "42883"],
-  [/ requires (exactly |at least |at most )?\w+ arguments?\b/u, "42883"],
+  // An argument count no overload takes: "LENGTH requires exactly one argument", "ROUND
+  // requires one or two arguments", "CONCAT takes at least 1 arguments", "NOW takes no arguments".
+  [
+    /^\S+ (requires|takes) (exactly |at least |at most )?(no|one|two|three|four|\d+)( or (one|two|three|\d+))? arguments?$/u,
+    "42883",
+  ],
+  // An argument type no overload takes: "UPPER requires a string argument".
+  [/^\S+ (requires an? [\w ]+ argument|takes [\w ]+ arguments)$/u, "42883"],
   [/^Unsupported CAST target: /u, "42704"],
   [/column names must be unique/u, "42701"],
   [/must appear in GROUP BY/u, "42803"],
+  [/^HAVING conditions must use aggregates, literals, or GROUP BY expressions$/u, "42803"],
+  [/^Offset RANGE frames require exactly one ORDER BY expression$/u, "42P20"],
   [/^Ambiguous or missing column: /u, "42702"],
-  [/references an unavailable outer source: /u, "42P01"],
   [
     /not supported|is only supported|are supported only|supports? only|cannot (use|contain|select)|^Unsupported /u,
     "0A000",
   ],
 ];
+
+/**
+ * The SQLSTATE of a front-end failure: the first `FRONT_END_STATES` pattern its message
+ * matches; else 42601 for the parser's positioned errors (a syntax error), and 42000 (syntax
+ * error or access rule violation) for a pass's refusal.
+ */
+export function frontEndSqlState(message: string, positioned: boolean): string {
+  return (
+    FRONT_END_STATES.find(([pattern]) => pattern.test(message))?.[1] ??
+    (positioned ? "42601" : "42000")
+  );
+}
 
 /** A front-end failure as a `PlanningError` (see FRONT_END_STATES); others are returned as is. */
 export function frontEndError(error: unknown): unknown {
@@ -103,10 +127,7 @@ export function frontEndError(error: unknown): unknown {
     "offset" in error && typeof error.offset === "number" && "length" in error
       ? { offset: error.offset, length: Number(error.length) }
       : undefined;
-  const mapped = FRONT_END_STATES.find(([pattern]) => pattern.test(message))?.[1];
-  // A positioned failure the table does not name is the parser's: a syntax error. Anything
-  // else is a refusal of the SQL by a pass, in the syntax-or-access-rule class.
-  const sqlState = mapped ?? (located === undefined ? "42000" : "42601");
+  const sqlState = frontEndSqlState(message, located !== undefined);
   const relation = /^SELECT \* requires known columns for: (.+)$/u.exec(message)?.[1];
   return new PlanningError(
     relation === undefined ? message : `relation "${relation}" does not exist`,

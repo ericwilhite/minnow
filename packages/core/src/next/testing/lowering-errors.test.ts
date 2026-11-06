@@ -118,33 +118,81 @@ describe("lowering's errors carry PostgreSQL's SQLSTATE", () => {
   });
 });
 
-describe("BEGIN READ ONLY (ruling R11.2)", () => {
-  it("lowers the access mode", () => {
+describe("transaction modes (ruling R11.2, review B6-p2b-2 findings 1 and 2)", () => {
+  /** PostgreSQL's access mode after `begin` (on / off), or its SQLSTATE. */
+  const pgMode = async (begin: string): Promise<string> => {
+    try {
+      await pg.exec(begin);
+      const shown = await pg.query<{ transaction_read_only: string }>("SHOW transaction_read_only");
+      return shown.rows[0]?.transaction_read_only ?? "missing";
+    } catch (error) {
+      return String((error as { code?: string }).code);
+    } finally {
+      await pg.exec("ROLLBACK");
+    }
+  };
+  const ourMode = (next: LoweredDatabase, begin: string): string => {
+    try {
+      const lowered = next.lower(begin);
+      if (lowered.kind !== "transactionControl") return lowered.kind;
+      return lowered.readOnly ? "on" : "off";
+    } catch (error) {
+      return error instanceof PlanningError ? error.sqlState : String(error);
+    }
+  };
+
+  it("BEGIN and START TRANSACTION apply the last access mode written, as PostgreSQL", async () => {
     const next = new LoweredDatabase();
-    const mode = (sql: string) => {
-      const lowered = next.lower(sql);
-      if (lowered.kind !== "transactionControl") throw new Error(`${sql}: ${lowered.kind}`);
-      return [lowered.action, lowered.readOnly];
-    };
-    expect(mode("BEGIN READ ONLY")).toEqual(["begin", true]);
-    expect(mode("START TRANSACTION READ ONLY")).toEqual(["begin", true]);
-    expect(mode("BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY")).toEqual([
-      "begin",
-      true,
-    ]);
-    expect(mode("BEGIN")).toEqual(["begin", false]);
-    expect(mode("BEGIN READ WRITE")).toEqual(["begin", false]);
-    expect(mode("BEGIN ISOLATION LEVEL READ COMMITTED")).toEqual(["begin", false]);
-    expect(mode("COMMIT")).toEqual(["commit", false]);
+    for (const begin of [
+      "BEGIN",
+      "BEGIN READ ONLY",
+      "BEGIN READ WRITE",
+      "BEGIN READ ONLY READ WRITE",
+      "BEGIN READ ONLY, READ WRITE",
+      "BEGIN READ WRITE, READ ONLY",
+      "BEGIN TRANSACTION READ ONLY",
+      "BEGIN WORK ISOLATION LEVEL READ COMMITTED READ ONLY",
+      "START TRANSACTION READ ONLY",
+      "START TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY, NOT DEFERRABLE",
+      "BEGIN -- READ ONLY\n",
+      "BEGIN /* READ ONLY */ READ WRITE",
+      "BEGIN 'READ ONLY'",
+      "BEGIN ONLY READ",
+      "BEGIN READ",
+      "BEGIN READ ONLY,",
+      "BEGIN , READ ONLY",
+    ])
+      expect(ourMode(next, begin), begin).toBe(await pgMode(begin));
   });
 
-  it("ignores READ ONLY inside a comment", () => {
+  it("SET TRANSACTION is a typed instruction carrying its modes, never a no-op", async () => {
     const next = new LoweredDatabase();
-    const line = next.lower("BEGIN -- READ ONLY\n");
-    expect(line.kind === "transactionControl" && line.readOnly).toBe(false);
-    const block = next.lower("BEGIN /* READ ONLY */ READ WRITE");
-    expect(block.kind === "transactionControl" && block.readOnly).toBe(false);
-    const after = next.lower("BEGIN /* mode */ READ ONLY");
-    expect(after.kind === "transactionControl" && after.readOnly).toBe(true);
+    for (const set of [
+      "SET TRANSACTION READ ONLY",
+      "SET TRANSACTION READ WRITE",
+      "SET TRANSACTION READ ONLY, READ WRITE",
+      "SET TRANSACTION ISOLATION LEVEL READ COMMITTED READ ONLY",
+    ]) {
+      const lowered = next.lower(set);
+      if (lowered.kind !== "transactionControl") throw new Error(`${set}: ${lowered.kind}`);
+      expect(lowered.action, set).toBe("setTransaction");
+      expect(lowered.controlsTransaction, set).toBe(true);
+      // PostgreSQL's mode after BEGIN; SET TRANSACTION … inside the transaction.
+      await pg.exec("BEGIN");
+      await pg.exec(set);
+      const shown = await pg.query<{ transaction_read_only: string }>("SHOW transaction_read_only");
+      await pg.exec("ROLLBACK");
+      expect(lowered.modes.readOnly ? "on" : "off", set).toBe(shown.rows[0]?.transaction_read_only);
+    }
+    const modes = next.lower("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+    expect(modes.kind === "transactionControl" ? modes.modes : null).toEqual({
+      readOnly: null,
+      isolation: "repeatable read",
+      deferrable: null,
+    });
+    // Forms that cannot be honoured are refused, not acknowledged.
+    expect(ourMode(next, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")).toBe("0A000");
+    expect(ourMode(next, "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")).toBe("0A000");
+    expect(ourMode(next, "SET TRANSACTION")).toBe("42601");
   });
 });

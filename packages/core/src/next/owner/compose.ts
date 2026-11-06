@@ -1050,6 +1050,16 @@ class ComposedSession implements EngineSession {
         }
         return done(lowered.command);
       }
+      case "setTransaction":
+        // Lowering now hands SET TRANSACTION over as a typed instruction with its `modes` (B6
+        // e8f741c). Applying them, with PostgreSQL's 25001 after the first statement, is the
+        // owner's (B5 follow-up): until then it is refused, never silently ignored.
+        return failedRun(
+          new UnsupportedPlanError("SET TRANSACTION isn't applied by the owner yet", {
+            stage: "lower",
+            construct: "setTransaction",
+          }),
+        );
     }
   }
 

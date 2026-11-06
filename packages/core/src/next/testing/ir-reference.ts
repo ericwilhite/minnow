@@ -1007,6 +1007,7 @@ function windowRows(rel: Extract<Rel, { op: "window" }>, env: Environment): Row[
       return key === undefined ? null : evaluate(key.expr, row, env);
     };
     const descending = rel.orderBy[0]?.direction === "desc";
+    const nullsFirst = (rel.orderBy[0]?.nulls ?? (descending ? "first" : "last")) === "first";
     /** The rows of `call`'s frame for the row at `index`, in order (PostgreSQL's frame rules). */
     const frameOf = (call: WindowCall, row: Row, index: number): Row[] => {
       const frame = call.frame;
@@ -1036,26 +1037,37 @@ function windowRows(rel: Extract<Rel, { op: "window" }>, env: Environment): Row[
           const [first, last] = at(groups, group);
           return end ? last : first;
         }
-        // RANGE with an offset: the rows whose key is within `amount` of this row's, along the
-        // sort direction. A NULL key frames only its NULL peers; NULLs are in no other range.
+        // RANGE with an offset (PostgreSQL's in_range): the target is this row's key moved by
+        // `amount` along the sort direction, exactly (bigint for integer keys). A frame start is
+        // the first row not before the target in sort order, a frame end the last row not after
+        // it; NULL keys sort where NULLS FIRST / LAST puts them, so a range can run into them.
+        // A NULL key's own frame is its NULL peers.
         const own = sortKey(row);
         if (own === null) return end ? peers[1] : peers[0];
-        const target = Number(own) + (descending ? -sign : sign) * Number(amount);
-        const inside = (candidate: Row) => {
-          const key = sortKey(candidate);
-          if (key === null) return false;
-          const value = Number(key);
-          const before = descending ? value > target : value < target;
-          const after = descending ? value < target : value > target;
-          return end ? !after : !before;
+        const step = descending ? -sign : sign;
+        const target: Value =
+          typeof own === "bigint"
+            ? own + BigInt(step) * BigInt(amount)
+            : Number(own) + step * Number(amount);
+        const relative = (key: Value): number => {
+          if (key === null) return nullsFirst ? -1 : 1;
+          const order =
+            typeof key === "bigint" && typeof target === "bigint"
+              ? key < target
+                ? -1
+                : key > target
+                  ? 1
+                  : 0
+              : Math.sign(Number(key) - Number(target));
+          return descending ? -order : order;
         };
         if (end) {
           for (let candidate = n - 1; candidate >= 0; candidate -= 1)
-            if (inside(at(sorted, candidate))) return candidate;
+            if (relative(sortKey(at(sorted, candidate))) <= 0) return candidate;
           return -1;
         }
         for (let candidate = 0; candidate < n; candidate += 1)
-          if (inside(at(sorted, candidate))) return candidate;
+          if (relative(sortKey(at(sorted, candidate))) >= 0) return candidate;
         return n;
       };
       const start = Math.max(0, position(frame.start, false));

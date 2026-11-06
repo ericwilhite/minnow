@@ -217,3 +217,45 @@ describe("window frames and functions against PostgreSQL (review B6-p2b finding 
     ]);
   });
 });
+
+describe("RANGE offsets at NULL boundaries and past 2^53 (review B6-p2b-2 finding 3)", () => {
+  it("matches PostgreSQL over every placement, bound pair and exclusion", async () => {
+    const tables = [
+      {
+        setup: [
+          "CREATE TABLE r (id integer PRIMARY KEY, k integer)",
+          "INSERT INTO r VALUES (1, 1), (2, 1), (3, 3), (4, NULL), (5, 6), (6, NULL), (7, 4)",
+        ],
+        name: "r",
+      },
+      {
+        setup: [
+          "CREATE TABLE big (id integer PRIMARY KEY, k bigint)",
+          // Through text casts, so the keys do not depend on how big literals are typed.
+          "INSERT INTO big VALUES (1, CAST('9007199254740992' AS bigint)), (2, CAST('9007199254740993' AS bigint)), (3, CAST('9007199254740994' AS bigint)), (4, NULL), (5, CAST('9007199254740996' AS bigint)), (6, CAST('-9007199254740993' AS bigint))",
+        ],
+        name: "big",
+      },
+    ];
+    const orders = ["k", "k NULLS FIRST", "k DESC", "k DESC NULLS LAST"];
+    const bounds = [
+      "1 PRECEDING AND CURRENT ROW",
+      "CURRENT ROW AND 1 FOLLOWING",
+      "1 FOLLOWING AND UNBOUNDED FOLLOWING",
+      "UNBOUNDED PRECEDING AND 1 PRECEDING",
+      "0 PRECEDING AND 0 FOLLOWING",
+      "2 PRECEDING AND 1 PRECEDING",
+    ];
+    const exclusions = ["", " EXCLUDE CURRENT ROW", " EXCLUDE GROUP", " EXCLUDE TIES"];
+    for (const table of tables) {
+      const cases: Case[] = [];
+      for (const order of orders)
+        for (const bound of bounds)
+          for (const exclusion of exclusions)
+            cases.push({
+              sql: `SELECT id, count(*) OVER (ORDER BY ${order} RANGE BETWEEN ${bound}${exclusion}) AS n, min(id) OVER (ORDER BY ${order} RANGE BETWEEN ${bound}${exclusion}) AS m FROM ${table.name} ORDER BY id`,
+            });
+      await check(table.setup, cases);
+    }
+  });
+});

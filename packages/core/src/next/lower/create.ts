@@ -3,7 +3,7 @@
  */
 import type { CatalogChange, CatalogView, TableDef } from "../access/catalog.js";
 import type { CreateTableInput } from "../../engine/catalog-mutations.js";
-import type { CompiledStatement } from "../../engine/query.js";
+import type { CompiledStatement, TransactionMode } from "../../engine/query.js";
 import type { OutputColumn, PhysicalPlan, Rel } from "../ir/ir.js";
 import type { TableRuleExpressions } from "../ir/rules.js";
 import { ParameterTypes } from "./coerce.js";
@@ -18,6 +18,7 @@ import type {
   LoweredStatement,
   Lowerer,
   LoweringContext,
+  TransactionModes,
   WriteShape,
 } from "./lowerer.js";
 import {
@@ -168,17 +169,17 @@ function lowerModify(
   };
 }
 
-/**
- * BEGIN / START TRANSACTION … READ ONLY (R11.2). The front end accepts and drops the access mode,
- * and a transaction statement it parsed holds only keywords and commas, so the words of the text
- * decide, comments aside.
- */
-function readsOnly(text: string): boolean {
-  const words = text
-    .replace(/--[^\n]*|\/\*[\s\S]*?\*\//gu, " ")
-    .toUpperCase()
-    .match(/[A-Z]+/gu);
-  return (words ?? []).some((word, index) => word === "READ" && words?.[index + 1] === "ONLY");
+/** The modes as they apply: the last of each kind wins, as in PostgreSQL. */
+function transactionModes(modes: readonly TransactionMode[]): TransactionModes {
+  let readOnly: boolean | null = null;
+  let isolation: TransactionModes["isolation"] = null;
+  let deferrable: boolean | null = null;
+  for (const mode of modes) {
+    if (mode.kind === "access") readOnly = mode.readOnly;
+    else if (mode.kind === "isolation") isolation = mode.level;
+    else deferrable = mode.deferrable;
+  }
+  return { readOnly, isolation, deferrable };
 }
 
 const TRANSACTION_ACTIONS = {
@@ -216,17 +217,35 @@ function lowerStatement(text: string, context: LoweringContext): LoweredStatemen
       return lowerModify(text, statement, context);
     case "merge":
       return lowerModify(text, statement, context);
-    case "transaction":
+    case "transaction": {
+      const modes = transactionModes(statement.modes ?? []);
       return {
         ...base,
         kind: "transactionControl",
         parameters: [],
         action: TRANSACTION_ACTIONS[statement.action],
         savepoint: statement.name ?? null,
-        readOnly: statement.action === "begin" && readsOnly(text),
+        modes,
+        readOnly: statement.action === "begin" && modes.readOnly === true,
       };
-    case "set":
+    }
+    case "set": {
+      // SET TRANSACTION changes the transaction: a typed instruction, never a no-op utility.
+      if (statement.transactionModes !== undefined) {
+        const modes = transactionModes(statement.transactionModes);
+        return {
+          ...base,
+          controlsTransaction: true,
+          kind: "transactionControl",
+          parameters: [],
+          action: "setTransaction",
+          savepoint: null,
+          modes,
+          readOnly: modes.readOnly === true,
+        };
+      }
       return { ...base, kind: "utility", parameters: [], show: null };
+    }
     case "show": {
       const name = statement.name.toLowerCase();
       const value = SETTINGS[name];

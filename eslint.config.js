@@ -96,6 +96,9 @@ export default tseslint.config(
       "packages/core/src/storage/contract-boundaries.test.ts",
       // The same, for the rebuild core's module layers (next/README.md).
       "packages/core/src/next/dependency-rules.test.ts",
+      // Reads the front end's sources off disk to pin the messages lowering's SQLSTATE map
+      // depends on (lower/errors.ts).
+      "packages/core/src/next/testing/front-end-states.test.ts",
       // Exposes the collector through node:v8/node:vm to measure the driver's live heap.
       "packages/core/src/next/exec/pipeline.test.ts",
       // The same, to prove the aggregate keeps no reference to a pushed batch's buffers.

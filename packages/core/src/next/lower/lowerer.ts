@@ -132,14 +132,34 @@ export interface LoweredDdl extends LoweredBase {
 
 export interface LoweredTransactionControl extends LoweredBase {
   readonly kind: "transactionControl";
-  readonly action: "begin" | "commit" | "rollback" | "savepoint" | "rollbackTo" | "release";
+  /**
+   * `setTransaction` is SET TRANSACTION: it changes the current transaction's `modes` (the owner
+   * applies them; PostgreSQL refuses a change of access mode or isolation after the
+   * transaction's first query, 25001, and a SET TRANSACTION outside a transaction only warns).
+   */
+  readonly action:
+    "begin" | "commit" | "rollback" | "savepoint" | "rollbackTo" | "release" | "setTransaction";
   /** The savepoint name (normalized identifier), else null. */
   readonly savepoint: string | null;
   /**
-   * BEGIN READ ONLY / START TRANSACTION READ ONLY: the owner pins a snapshot and takes no writer
-   * slot (ruling R11.2). False for every other statement, READ WRITE included.
+   * The transaction modes BEGIN / START TRANSACTION or SET TRANSACTION name, after PostgreSQL's
+   * rule that the last of each kind applies; null where the statement names none (the current
+   * or default mode stays). All null for the other actions.
+   */
+  readonly modes: TransactionModes;
+  /**
+   * `modes.readOnly === true` on BEGIN / START TRANSACTION and SET TRANSACTION: the owner pins a
+   * snapshot and takes no writer slot (ruling R11.2). False otherwise, READ WRITE included.
    */
   readonly readOnly: boolean;
+}
+
+/** Transaction modes as they apply (see `LoweredTransactionControl.modes`). */
+export interface TransactionModes {
+  readonly readOnly: boolean | null;
+  /** Every level the engine accepts is met by its one snapshot level; SERIALIZABLE is refused. */
+  readonly isolation: "read uncommitted" | "read committed" | "repeatable read" | null;
+  readonly deferrable: boolean | null;
 }
 
 export interface LoweredUtility extends LoweredBase {

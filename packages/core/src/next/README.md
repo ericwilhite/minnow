@@ -1269,7 +1269,12 @@ with a fixed threshold; use `MODE=encode` and `MODE=filter` in interleaved round
 - Every failure is a `PlanningError` with PostgreSQL's SQLSTATE (42601 syntax, 42P01 relation,
   42703 column, 42883 function, 42704 type, …) or an `UnsupportedPlanError` (0A000). Front-end
   errors are translated by message (`frontEndError`), keeping the parse position and the
-  original as `cause`. `BEGIN READ ONLY` lowers with `readOnly: true` (R11.2).
+  original as `cause`. The messages it depends on are pinned (`testing/front-end-states.test.ts`:
+  a snapshot of every mapped front-end message, and per pattern a PGlite-checked statement).
+- Transaction modes come from the parser's AST in written order; `modes` holds what applies (the
+  last of each kind). `BEGIN READ ONLY` lowers with `readOnly: true` (R11.2); `SET TRANSACTION …`
+  lowers to `transactionControl` action `setTransaction` with its `modes`, for the owner to apply.
+  SERIALIZABLE and SET SESSION CHARACTERISTICS are refused (0A000).
 - Declared numeric widths and VARCHAR(n) / CHAR(n) widths come from the parser only under
   `compileWithDeclaredTypes` (engine/query.ts), so the current engine compiles exactly what it
   did (C5, R17.4).
@@ -1309,8 +1314,11 @@ with a fixed threshold; use `MODE=encode` and `MODE=filter` in interleaved round
   `testing/lowering-pglite-m3.test.ts` do the same against PostgreSQL (PGlite), the authority,
   through `testing/pglite-oracle.ts`, and `testing/lowering-pglite-review.test.ts` holds review
   B6-p2b's cases (lazy init plans, set-operation types, FULL JOIN extension, window frames,
-  decimal casts). `testing/ir-check.ts` type-checks every plan they run, init plans, slot wiring,
-  window signatures and frames, and work tables included (`ir-check.test.ts`).
+  decimal casts, RANGE offsets at NULL boundaries and past 2^53). `testing/ir-check.ts` checks every
+  plan they run: every declared slot filled by exactly one producer that dominates its readers
+  (placeholders, the clock, init plans without cycles, apply bindings within their apply), LIMIT /
+  OFFSET bounds, positions on both sides, aggregate FILTER / ORDER BY and signatures, window
+  signatures and frames, recursion widths and work tables (`ir-check.test.ts`).
 - Lowering cost (`scripts/lowering-bench.mts`, warm, median on a loaded host): a point read
   ~160 µs, a 3-way join ~350 µs, a 6- to 9-way chain 530–840 µs.
 - Under `compileWithDeclaredTypes` the front end keeps constants typed (no folding with the

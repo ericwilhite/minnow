@@ -29,12 +29,25 @@ function fail(where: string, message: string): never {
 interface Context {
   readonly parameters: readonly PhysicalType[];
   readonly workTables: Map<number, readonly OutputColumn[]>;
+  /** Slots filled for the whole plan: placeholders, the clock, init plans. */
+  readonly global: ReadonlySet<number>;
+  /** Slots of the `apply` bindings enclosing the expression being checked. */
+  readonly bound: Set<number>;
+  /** Init-plan slots read, collected while one init plan's body is checked (for cycles). */
+  reads: Set<number> | null;
 }
 
 // checkPlan is synchronous: the plan under check, set for the duration of one call.
-let context: Context = { parameters: [], workTables: new Map() };
+let context: Context = {
+  parameters: [],
+  workTables: new Map(),
+  global: new Set(),
+  bound: new Set(),
+  reads: null,
+};
 
-function checkSlot(slot: number, type: PhysicalType, where: string): void {
+/** A slot's declared type (writes and reads). */
+function checkSlotType(slot: number, type: PhysicalType, where: string): void {
   const declared = context.parameters[slot];
   if (declared === undefined)
     fail(where, `slot ${String(slot)} of ${String(context.parameters.length)}`);
@@ -42,9 +55,103 @@ function checkSlot(slot: number, type: PhysicalType, where: string): void {
     fail(where, `slot ${String(slot)} is ${declared.kind}, read as ${type.kind}`);
 }
 
+/** A read of a slot: of its type, and filled where it is read (globally or by an enclosing apply). */
+function checkSlot(slot: number, type: PhysicalType, where: string): void {
+  checkSlotType(slot, type, where);
+  if (!context.global.has(slot) && !context.bound.has(slot))
+    fail(where, `slot ${String(slot)} is read where nothing fills it`);
+  context.reads?.add(slot);
+}
+
+/** A LIMIT / OFFSET bound: a non-negative integer, or a filled bigint slot. */
+function checkBound(bound: unknown, where: string): void {
+  if (bound === null) return;
+  const shape = bound as { kind?: unknown; value?: unknown; slot?: unknown };
+  if (shape.kind === "const" && Number.isInteger(shape.value) && (shape.value as number) >= 0)
+    return;
+  if (shape.kind === "param" && typeof shape.slot === "number") {
+    checkSlot(shape.slot, INT8_TYPE, where);
+    return;
+  }
+  fail(where, `malformed bound ${JSON.stringify(bound)}`);
+}
+
+const INT8_TYPE: PhysicalType = { kind: "int64" };
+
+/** An input column position: an integer within `[0, width)`. */
+function checkPosition(index: number, width: number, where: string, what: string): void {
+  if (!Number.isInteger(index) || index < 0 || index >= width)
+    fail(where, `${what} ${String(index)} of ${String(width)}`);
+}
+
+/** Output columns equal to the input's (types modulo modifiers). */
+function checkSameColumns(
+  input: readonly OutputColumn[],
+  output: readonly OutputColumn[],
+  where: string,
+): void {
+  if (input.length !== output.length) fail(where, "output width differs from its input");
+  for (const [index, column] of output.entries())
+    if (!sameBase(column.type, at(input, index).type))
+      fail(where, `output ${String(index)} of another type than its input`);
+}
+
 const INT8: PhysicalType = { kind: "int64" };
 const INT4: PhysicalType = { kind: "int32", bits: 32 };
 const FLOAT8: PhysicalType = { kind: "float64" };
+
+/** An aggregate's argument and result types (PostgreSQL's, as lower/query.ts types them; C11). */
+function checkAggregateSignature(
+  fn: string,
+  args: readonly ScalarExpr[],
+  type: PhysicalType,
+  where: string,
+): void {
+  const arg = args[0]?.type;
+  const expect = (ok: boolean, what: string) => {
+    if (!ok) fail(where, `aggregate ${fn}: ${what}`);
+  };
+  switch (fn) {
+    case "count_star":
+      expect(args.length === 0 && sameBase(type, INT8), "() → bigint");
+      return;
+    case "count":
+      expect(args.length === 1 && sameBase(type, INT8), "(T) → bigint");
+      return;
+    case "sum":
+      expect(
+        arg !== undefined &&
+          args.length === 1 &&
+          (arg.kind === "int32"
+            ? sameBase(type, INT8)
+            : arg.kind === "int64"
+              ? type.kind === "decimal" && type.scale === 0
+              : sameBase(type, arg)),
+        "int2/int4 → bigint, int8 → numeric(scale 0), else its argument's type",
+      );
+      return;
+    case "avg":
+      expect(
+        arg !== undefined &&
+          args.length === 1 &&
+          (arg.kind === "int32" ||
+          arg.kind === "int64" ||
+          arg.kind === "float32" ||
+          arg.kind === "float64"
+            ? sameBase(type, FLOAT8)
+            : sameBase(type, arg)),
+        "integers and floats → double precision, else its argument's type",
+      );
+      return;
+    case "min":
+    case "max":
+    case "single_value":
+      expect(arg !== undefined && args.length === 1 && sameBase(type, arg), "(T) → T");
+      return;
+    default:
+      return;
+  }
+}
 
 /** A window call's argument and result types (lower/windows.ts, PostgreSQL's signatures). */
 function checkWindowCall(call: WindowCall, orderBy: readonly SortKey[], where: string): void {
@@ -259,24 +366,64 @@ function checkRel(rel: Rel, catalog: CatalogView): void {
     case "filter":
       checkRel(rel.input, catalog);
       checkExpr(rel.predicate, rel.input.output, where);
+      if (rel.predicate.type.kind !== "bool") fail(where, "predicate is not boolean");
+      checkSameColumns(rel.input.output, rel.output, where);
       return;
+    case "distinct":
+      checkRel(rel.input, catalog);
+      checkSameColumns(rel.input.output, rel.output, where);
+      return;
+    case "fetch": {
+      checkRel(rel.input, catalog);
+      checkPosition(rel.locator, rel.input.output.length, where, "locator");
+      if (at(rel.input.output, rel.locator).type.kind !== "locator")
+        fail(where, "fetch locator is not a locator");
+      const table = catalog.table(rel.tableId);
+      if (table === undefined) fail(where, "unknown table");
+      for (const id of rel.columns)
+        if (!table.columns.some((column) => column.id === id))
+          fail(where, `unknown column ${String(id)}`);
+      return;
+    }
     case "project":
       checkRel(rel.input, catalog);
       for (const expr of rel.exprs) checkExpr(expr, rel.input.output, where);
       checkOutput(rel.exprs, rel.output, where);
       return;
-    case "aggregate":
+    case "aggregate": {
       checkRel(rel.input, catalog);
-      for (const call of rel.aggregates)
-        for (const arg of call.args) checkExpr(arg, rel.input.output, where);
+      const input = rel.input.output;
+      for (const index of rel.groupBy) checkPosition(index, input.length, where, "group key");
+      for (const set of rel.groupingSets ?? [])
+        for (const member of set)
+          checkPosition(member, rel.groupBy.length, where, "grouping set member");
+      for (const call of rel.aggregates) {
+        for (const arg of call.args) checkExpr(arg, input, where);
+        if (call.filter !== null) {
+          checkExpr(call.filter, input, where);
+          if (call.filter.type.kind !== "bool") fail(where, "aggregate FILTER is not boolean");
+        }
+        for (const key of call.orderBy) checkExpr(key.expr, input, where);
+        checkAggregateSignature(call.fn, call.args, call.type, where);
+      }
       if (rel.output.length !== rel.groupBy.length + rel.aggregates.length)
         fail(where, "output width");
+      for (const [position, index] of rel.groupBy.entries())
+        if (!sameBase(at(rel.output, position).type, at(input, index).type))
+          fail(where, `group key output ${String(position)} of another type`);
+      for (const [position, call] of rel.aggregates.entries())
+        if (!sameBase(at(rel.output, rel.groupBy.length + position).type, call.type))
+          fail(where, `aggregate output ${String(position)} of another type`);
       return;
+    }
     case "sort":
     case "limit":
       checkRel(rel.input, catalog);
       if (rel.op === "sort")
         for (const key of rel.keys) checkExpr(key.expr, rel.input.output, where);
+      checkBound(rel.limit, where);
+      checkBound(rel.offset, where);
+      checkSameColumns(rel.input.output, rel.output, where);
       return;
     case "modify": {
       checkRel(rel.input, catalog);
@@ -416,12 +563,21 @@ function checkRel(rel: Rel, catalog: CatalogView): void {
         fail(where, `output width ${String(rel.output.length)}, expected ${String(width)}`);
       return;
     }
-    case "apply":
+    case "apply": {
       checkRel(rel.outer, catalog);
-      checkRel(rel.inner, catalog);
       for (const binding of rel.bindings) {
         checkExpr(binding.expr, rel.outer.output, where);
-        checkSlot(binding.slot, binding.expr.type, where);
+        checkSlotType(binding.slot, binding.expr.type, where);
+      }
+      // The bindings fill their slots for the inner relation only.
+      const added = rel.bindings
+        .map((binding) => binding.slot)
+        .filter((slot) => !context.bound.has(slot));
+      for (const slot of added) context.bound.add(slot);
+      try {
+        checkRel(rel.inner, catalog);
+      } finally {
+        for (const slot of added) context.bound.delete(slot);
       }
       if (rel.quantified !== null) {
         checkExpr(rel.quantified.test, rel.outer.output, where);
@@ -431,10 +587,11 @@ function checkRel(rel: Rel, catalog: CatalogView): void {
       }
       if (rel.output.length !== rel.outer.output.length + 1) fail(where, "apply output width");
       return;
+    }
     case "window":
       checkRel(rel.input, catalog);
       for (const index of rel.partitionBy)
-        if (index >= rel.input.output.length) fail(where, "partition key out of range");
+        checkPosition(index, rel.input.output.length, where, "partition key");
       for (const key of rel.orderBy) checkExpr(key.expr, rel.input.output, where);
       for (const call of rel.functions) {
         for (const arg of call.args) checkExpr(arg, rel.input.output, where);
@@ -469,10 +626,12 @@ function checkRel(rel: Rel, catalog: CatalogView): void {
       } finally {
         context.workTables.delete(rel.workTable);
       }
-      for (const side of [rel.base, rel.step])
+      for (const side of [rel.base, rel.step]) {
+        if (side.output.length !== rel.output.length) fail(where, "recursive width differs");
         for (const [index, column] of side.output.entries())
-          if (!sameBase(column.type, rel.output[index]?.type ?? column.type))
+          if (!sameBase(column.type, at(rel.output, index).type))
             fail(where, `recursive column ${String(index)} of another type`);
+      }
       return;
     }
     case "workTableScan": {
@@ -492,12 +651,21 @@ function checkRel(rel: Rel, catalog: CatalogView): void {
 /** Checks `plan` against `catalog` (see the module comment). */
 export function checkPlan(plan: PhysicalPlan, catalog: CatalogView): void {
   const saved = context;
-  context = { parameters: plan.parameters, workTables: new Map() };
+  const global = new Set<number>();
+  context = {
+    parameters: plan.parameters,
+    workTables: new Map(),
+    global,
+    bound: new Set(),
+    reads: null,
+  };
   try {
     if (plan.placeholderCount > plan.parameters.length) fail("plan", "placeholders past the slots");
+    for (let slot = 0; slot < plan.placeholderCount; slot += 1) global.add(slot);
     if (plan.clockSlot !== null) {
-      checkSlot(plan.clockSlot, { kind: "timestamp", zoned: true }, "clock");
+      checkSlotType(plan.clockSlot, { kind: "timestamp", zoned: true }, "clock");
       if (plan.clockSlot < plan.placeholderCount) fail("clock", "slot is a placeholder");
+      global.add(plan.clockSlot);
     }
     const initSlots = new Set<number>();
     for (const init of plan.initPlans) {
@@ -506,11 +674,58 @@ export function checkPlan(plan: PhysicalPlan, catalog: CatalogView): void {
         fail(where, "slot is a placeholder or the clock");
       if (initSlots.has(init.slot)) fail(where, "slot filled twice");
       initSlots.add(init.slot);
+      global.add(init.slot);
+    }
+    // Every declared slot has exactly one producer: a placeholder, the clock, an init plan or
+    // an apply binding (which fills it for its inner relation only, checked where it is read).
+    const producers = new Map<number, number>();
+    for (const slot of global) producers.set(slot, 1);
+    const visitApplies = (value: unknown): void => {
+      if (value === null || typeof value !== "object") return;
+      if (Array.isArray(value)) {
+        for (const item of value) visitApplies(item);
+        return;
+      }
+      const node = value as { op?: unknown; bindings?: ReadonlyArray<{ slot: number }> };
+      if (node.op === "apply")
+        for (const binding of node.bindings ?? [])
+          producers.set(binding.slot, (producers.get(binding.slot) ?? 0) + 1);
+      for (const child of Object.values(node)) visitApplies(child);
+    };
+    visitApplies(plan.root);
+    for (const init of plan.initPlans) visitApplies(init.plan);
+    for (let slot = 0; slot < plan.parameters.length; slot += 1) {
+      const count = producers.get(slot) ?? 0;
+      if (count !== 1)
+        fail(
+          `slot ${String(slot)}`,
+          count === 0 ? "nothing fills it" : `${String(count)} producers fill it`,
+        );
+    }
+    for (const slot of producers.keys())
+      if (slot >= plan.parameters.length) fail(`slot ${String(slot)}`, "is not declared");
+    // Init plans: one column of their slot's type, reading only plan-wide slots, no cycle.
+    const reads = new Map<number, Set<number>>();
+    for (const init of plan.initPlans) {
+      const where = `init plan for slot ${String(init.slot)}`;
+      context.reads = new Set();
       checkRel(init.plan, catalog);
+      reads.set(init.slot, new Set([...context.reads].filter((slot) => initSlots.has(slot))));
+      context.reads = null;
       const [only, ...more] = init.plan.output;
       if (only === undefined || more.length > 0) fail(where, "not one column");
-      checkSlot(init.slot, only.type, where);
+      checkSlotType(init.slot, only.type, where);
     }
+    const state = new Map<number, "visiting" | "done">();
+    const visit = (slot: number): void => {
+      if (state.get(slot) === "done") return;
+      if (state.get(slot) === "visiting")
+        fail(`init plan for slot ${String(slot)}`, "reads itself");
+      state.set(slot, "visiting");
+      for (const next of reads.get(slot) ?? []) visit(next);
+      state.set(slot, "done");
+    };
+    for (const slot of initSlots) visit(slot);
     checkRel(plan.root, catalog);
     checkOutput(
       plan.columns.map((column) => ({ op: "literal", type: column.type }) as ScalarExpr),

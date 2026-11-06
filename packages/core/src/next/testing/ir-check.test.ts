@@ -116,7 +116,7 @@ describe("checkPlan traverses init plans and checks slot wiring", () => {
       if (column === undefined) throw new Error("Expected a column");
       return { ...base, root, columns: [...base.columns, { ...column, name: "x" }] };
     };
-    expect(check(binding(5))).toThrow("slot 5 of 0");
+    expect(check(binding(5))).toThrow("slot 5: is not declared");
     const typed = binding(0);
     (typed as Mutable<PhysicalPlan>).parameters = [{ kind: "text" }];
     expect(check(typed)).toThrow("slot 0 is text, read as int32");
@@ -145,6 +145,7 @@ describe("checkPlan checks window calls and work tables", () => {
       start: { kind: "preceding", offset: { op: "param", slot: 0, type: INT4 } },
     };
     (rows as Mutable<PhysicalPlan>).parameters = [INT4];
+    (rows as Mutable<PhysicalPlan>).placeholderCount = 1;
     expect(check(rows)).toThrow("rows offset is not bigint");
     const misplaced = plan(sql);
     const [other] = windowOf(misplaced);
@@ -176,5 +177,129 @@ describe("checkPlan checks window calls and work tables", () => {
     if (scan?.op !== "workTableScan") throw new Error("Expected a work-table scan");
     (scan as Mutable<typeof scan>).workTable = node.workTable + 100;
     expect(check(recursive)).toThrow("work table outside its recursive step");
+  });
+});
+
+describe("checkPlan: slot producers and every expression position (review B6-p2b-2 finding 6)", () => {
+  it("rejects a declared slot nothing fills (the init plan removed)", () => {
+    const { plan, check } = setup();
+    const unfilled = plan("SELECT (SELECT 1) AS x");
+    (unfilled as Mutable<PhysicalPlan>).initPlans = [];
+    expect(check(unfilled)).toThrow("nothing fills it");
+    // A declared slot nothing reads either: only the producer count sees it.
+    const spare = plan("SELECT id FROM a");
+    (spare as Mutable<PhysicalPlan>).parameters = [INT4];
+    expect(check(spare)).toThrow("slot 0: nothing fills it");
+  });
+
+  it("rejects an apply-bound slot read outside the apply", () => {
+    const { plan, check } = setup();
+    const base = plan("SELECT id FROM a");
+    const param: ScalarExpr = { op: "param", slot: 0, type: INT4 };
+    const root: Rel = {
+      op: "project",
+      id: 950,
+      input: {
+        op: "apply",
+        id: 951,
+        mode: "scalar",
+        outer: base.root,
+        inner: {
+          op: "values",
+          id: 952,
+          rows: [
+            [
+              {
+                op: "literal",
+                type: INT4,
+                value: base.root.op === "project" ? (base.root.exprs[0] as never) : (null as never),
+              },
+            ],
+          ],
+          output: [{ name: "x", type: INT4, nullable: true }],
+        },
+        bindings: [{ slot: 0, expr: { op: "column", index: 0, type: INT4 } }],
+        quantified: null,
+        memoize: true,
+        output: [...base.root.output, { name: "x", type: INT4, nullable: true }],
+      },
+      exprs: [param],
+      output: [{ name: "y", type: INT4, nullable: true }],
+    };
+    const outside: PhysicalPlan = {
+      ...base,
+      root,
+      parameters: [INT4],
+      columns: base.columns.slice(0, 1).map((column) => ({ ...column, name: "y" })),
+    };
+    expect(check(outside)).toThrow("slot 0 is read where nothing fills it");
+  });
+
+  it("rejects an init plan that reads itself", () => {
+    const { plan, check } = setup();
+    const cyclic = plan("SELECT (SELECT 1) AS x");
+    const [init] = cyclic.initPlans;
+    if (init === undefined) throw new Error("Expected an init plan");
+    const type = init.plan.output[0]?.type ?? INT4;
+    (init as Mutable<typeof init>).plan = {
+      op: "values",
+      id: 960,
+      rows: [[{ op: "param", slot: init.slot, type }]],
+      output: [{ name: "x", type, nullable: true }],
+    };
+    expect(check(cyclic)).toThrow("reads itself");
+  });
+
+  it("checks LIMIT / OFFSET bounds", () => {
+    const { plan, check } = setup();
+    const limited = plan("SELECT id FROM a LIMIT 1");
+    const limit = all(limited.root).find((rel) => rel.op === "limit" || rel.op === "sort");
+    if (limit === undefined) throw new Error("Expected a limit");
+    (limit as unknown as { limit: unknown }).limit = {
+      op: "column",
+      index: 999,
+      type: { kind: "int64" },
+    };
+    expect(check(limited)).toThrow("malformed bound");
+    const negative = plan("SELECT id FROM a LIMIT 1");
+    const node = all(negative.root).find((rel) => rel.op === "limit" || rel.op === "sort");
+    (node as unknown as { limit: unknown }).limit = { kind: "const", value: -1 };
+    expect(check(negative)).toThrow("malformed bound");
+  });
+
+  it("checks positions on both sides, aggregate FILTER and ORDER BY, and aggregate signatures", () => {
+    const { plan, check } = setup();
+    const windowed = plan("SELECT sum(id) OVER (PARTITION BY id) AS s FROM a");
+    const window = all(windowed.root).find((rel) => rel.op === "window");
+    (window as unknown as { partitionBy: number[] }).partitionBy = [-1];
+    expect(check(windowed)).toThrow("partition key -1");
+    const grouped = plan("SELECT v, count(*) FILTER (WHERE id > 1) AS n FROM a GROUP BY v");
+    const aggregate = all(grouped.root).find((rel) => rel.op === "aggregate");
+    if (aggregate?.op !== "aggregate") throw new Error("Expected an aggregate");
+    const [call] = aggregate.aggregates;
+    (call as unknown as { filter: ScalarExpr }).filter = { op: "column", index: 0, type: INT4 };
+    expect(check(grouped)).toThrow("aggregate FILTER is not boolean");
+    const keys = plan("SELECT v, count(*) AS n FROM a GROUP BY v");
+    const keyed = all(keys.root).find((rel) => rel.op === "aggregate");
+    (keyed as unknown as { groupBy: number[] }).groupBy = [-1];
+    expect(check(keys)).toThrow("group key -1");
+    const summed = plan("SELECT sum(id) AS s FROM a");
+    const sum = all(summed.root).find((rel) => rel.op === "aggregate");
+    if (sum?.op !== "aggregate") throw new Error("Expected an aggregate");
+    (sum.aggregates[0] as unknown as { type: unknown }).type = INT4;
+    (sum.output[0] as unknown as { type: unknown }).type = INT4;
+    expect(check(summed)).toThrow("aggregate sum");
+  });
+
+  it("checks a recursion's widths", () => {
+    const { plan, check } = setup();
+    const recursive = plan(
+      "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r",
+    );
+    const node = all(recursive.root).find((rel) => rel.op === "recursive");
+    if (node?.op !== "recursive") throw new Error("Expected a recursion");
+    (node as unknown as { output: unknown[] }).output = [...node.output, ...node.output];
+    // The work-table scan, checked inside the step, sees the mismatch first.
+    expect(check(recursive)).toThrow(/work table width|recursive width differs/u);
   });
 });
