@@ -2590,7 +2590,13 @@ interface OpenStatementTransaction {
   timer: ReturnType<typeof setInterval>;
   busy: number;
   activeAt: number;
-  savepoints: Array<{ name: string; checkpoint: TransactionCheckpoint; retainedBytes: number }>;
+  savepoints: Array<{
+    name: string;
+    checkpoint: TransactionCheckpoint;
+    retainedBytes: number;
+    /** The access mode when the savepoint was set: ROLLBACK TO and RELEASE restore it. */
+    readOnly: boolean;
+  }>;
   /** BEGIN … READ ONLY or SET TRANSACTION READ ONLY: no write may run (PostgreSQL's 25006). */
   readOnly: boolean;
   /** A statement has run: READ WRITE can no longer be set (PostgreSQL's 25001). */
@@ -13964,6 +13970,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       // the transaction's first statement.
       const readOnly = accessMode(statement.transactionModes);
       if (current !== undefined && readOnly !== undefined) {
+        // PostgreSQL's check_transaction_read_only: out of read-only mode, never inside a
+        // savepoint (a subtransaction), and at top level only before the first statement.
+        if (!readOnly && current.readOnly && current.savepoints.length > 0)
+          throw new TypeError(
+            "cannot set transaction read-write mode inside a read-only transaction",
+          );
         if (!readOnly && current.readOnly && current.queried)
           throw new TypeError("transaction read-write mode must be set before any query");
         current.readOnly = readOnly;
@@ -14466,7 +14478,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           );
         }
         const checkpoint = await open.session.checkpoint();
-        open.savepoints.push({ name, checkpoint, retainedBytes });
+        open.savepoints.push({ name, checkpoint, retainedBytes, readOnly: open.readOnly });
       });
       return { kind: "transaction", action, name };
     }
@@ -14484,10 +14496,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         const checkpoint = open.savepoints[index]?.checkpoint;
         if (checkpoint === undefined) throw new Error(`Savepoint disappeared: ${name}`);
         await this.#duringTransaction(open, () => open.session.rollbackTo(checkpoint));
-        // The named marker remains usable; everything established after it is gone.
+        // The named marker remains usable; everything established after it is gone, the
+        // access mode set since included (a subtransaction's SET TRANSACTION, as PostgreSQL).
+        open.readOnly = open.savepoints[index]?.readOnly ?? open.readOnly;
         open.savepoints.splice(index + 1);
       } else {
-        // PostgreSQL RELEASE closes the named marker and every marker nested inside it.
+        // PostgreSQL RELEASE closes the named marker and every marker nested inside it. A
+        // subtransaction's access mode ends with it, released or rolled back (xact.c restores
+        // the parent's XactReadOnly either way).
+        open.readOnly = open.savepoints[index]?.readOnly ?? open.readOnly;
         open.savepoints.splice(index);
       }
       return { kind: "transaction", action, name };

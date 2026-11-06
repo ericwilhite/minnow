@@ -65,6 +65,10 @@ b.id = a.id)` was false when no row of `b` matched. An aggregate without `GROUP 
   PostgreSQL. Both rules hold however a statement arrives: `execute`, `query`, `queryCursor` or a
   built query's `run` (a `query` call is a statement). Open the transaction with `BEGIN` (or
   `READ WRITE`) to write.
+  - Inside a savepoint, switching a read-only transaction back with `SET TRANSACTION READ WRITE`
+    fails with "cannot set transaction read-write mode inside a read-only transaction".
+  - A mode set after `SAVEPOINT` ends with the savepoint: `ROLLBACK TO` and `RELEASE` return to
+    the mode the transaction had when the savepoint was set, as in PostgreSQL.
 - **Transaction statements follow PostgreSQL's grammar.** `BEGIN`, `START TRANSACTION` and
   `SET TRANSACTION` accepted their keywords in any order and ignored anything else, so
   `BEGIN ONLY READ` and `BEGIN 'READ ONLY'` ran. They now fail with `syntax error at or near …`.

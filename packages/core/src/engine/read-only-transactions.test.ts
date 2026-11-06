@@ -67,6 +67,8 @@ function minnowClass(error: unknown): string {
   const message = String(error);
   if (message.includes("in a read-only transaction")) return "25006";
   if (message.includes("read-write mode must be set before any query")) return "25001";
+  if (message.includes("cannot set transaction read-write mode inside a read-only transaction"))
+    return "25001";
   return `error ${message}`;
 }
 
@@ -145,7 +147,10 @@ const ENTRY_POINTS: ReadonlyArray<
 /** Reads a read-only transaction refuses, or runs (review B6 stream A 2, finding 1). */
 const READS = ["SELECT count(*) AS n FROM t", "SELECT nextval('s') AS n"];
 
-/** Statement sequences where a read is the transaction's first statement (finding 1). */
+/**
+ * Statement sequences where a read is the transaction's first statement (finding 1), and that
+ * move the access mode around savepoints and COMMIT (finding 2).
+ */
 const SEQUENCES: ReadonlyArray<readonly string[]> = [
   [
     "BEGIN READ WRITE",
@@ -155,6 +160,87 @@ const SEQUENCES: ReadonlyArray<readonly string[]> = [
   ],
   ["BEGIN READ ONLY", "SELECT count(*) AS n FROM t", "SET TRANSACTION READ WRITE"],
   ["BEGIN READ ONLY", "SET TRANSACTION READ WRITE", "INSERT INTO t VALUES (9, 9)"],
+  // A released savepoint's mode ends with it, back to the mode its parent level had.
+  [
+    "BEGIN",
+    "SAVEPOINT x",
+    "SET TRANSACTION READ ONLY",
+    "SAVEPOINT y",
+    "RELEASE y",
+    "INSERT INTO t VALUES (9, 9)",
+  ],
+  [
+    "BEGIN",
+    "SAVEPOINT x",
+    "SAVEPOINT y",
+    "SET TRANSACTION READ ONLY",
+    "RELEASE y",
+    "INSERT INTO t VALUES (9, 9)",
+  ],
+  [
+    "BEGIN",
+    "SAVEPOINT x",
+    "SET TRANSACTION READ ONLY",
+    "ROLLBACK TO x",
+    "INSERT INTO t VALUES (9, 9)",
+  ],
+  ["BEGIN", "SAVEPOINT x", "SET TRANSACTION READ ONLY", "RELEASE x", "INSERT INTO t VALUES (9, 9)"],
+  ["BEGIN READ ONLY", "SAVEPOINT x", "SET TRANSACTION READ WRITE"],
+  [
+    "BEGIN READ ONLY",
+    "SAVEPOINT x",
+    "RELEASE x",
+    "SET TRANSACTION READ WRITE",
+    "INSERT INTO t VALUES (9, 9)",
+  ],
+  ["BEGIN READ ONLY", "SAVEPOINT x", "ROLLBACK TO x", "SET TRANSACTION READ WRITE"],
+  [
+    "BEGIN",
+    "SAVEPOINT x",
+    "SET TRANSACTION READ ONLY",
+    "SAVEPOINT y",
+    "ROLLBACK TO y",
+    "INSERT INTO t VALUES (9, 9)",
+  ],
+  [
+    "BEGIN",
+    "SAVEPOINT x",
+    "SAVEPOINT y",
+    "SET TRANSACTION READ ONLY",
+    "ROLLBACK TO x",
+    "INSERT INTO t VALUES (9, 9)",
+  ],
+  ["BEGIN", "SAVEPOINT x", "SET TRANSACTION READ ONLY", "SET TRANSACTION READ WRITE"],
+  ["BEGIN", "SET TRANSACTION READ ONLY", "SAVEPOINT x", "SET TRANSACTION READ WRITE"],
+  [
+    "BEGIN",
+    "SAVEPOINT x",
+    "SELECT 1 AS one",
+    "SET TRANSACTION READ ONLY",
+    "ROLLBACK TO x",
+    "SET TRANSACTION READ WRITE",
+    "INSERT INTO t VALUES (9, 9)",
+  ],
+  [
+    "BEGIN",
+    "SAVEPOINT x",
+    "SET TRANSACTION READ ONLY",
+    "ROLLBACK TO x",
+    "SAVEPOINT y",
+    "SET TRANSACTION READ ONLY",
+    "RELEASE y",
+    "INSERT INTO t VALUES (9, 9)",
+  ],
+  // COMMIT ends the transaction and its mode: the next one starts read-write.
+  ["BEGIN READ ONLY", "SAVEPOINT x", "COMMIT", "BEGIN", "INSERT INTO t VALUES (9, 9)"],
+  [
+    "BEGIN",
+    "SAVEPOINT x",
+    "SET TRANSACTION READ ONLY",
+    "COMMIT",
+    "BEGIN",
+    "INSERT INTO t VALUES (9, 9)",
+  ],
 ];
 
 /**
@@ -196,7 +282,7 @@ async function minnowRun(
   }
 }
 
-describe("READ ONLY across entry points (review B6 stream A 2)", () => {
+describe("READ ONLY across entry points and savepoints (review B6 stream A 2)", () => {
   it("refuses sequence changes through every read entry point, as PostgreSQL", async () => {
     const mismatches: string[] = [];
     const reach = createReach<string>("read-only reads", REFUSAL_STATES);
@@ -217,7 +303,7 @@ describe("READ ONLY across entry points (review B6 stream A 2)", () => {
     reach.assertReached();
   });
 
-  it("counts a read from any entry point as the first statement", async () => {
+  it("scopes the access mode to savepoints and counts a read from any entry point as the first statement", async () => {
     const mismatches: string[] = [];
     const reach = createReach<string>("first statement", REFUSAL_STATES);
     for (const statements of SEQUENCES) {
