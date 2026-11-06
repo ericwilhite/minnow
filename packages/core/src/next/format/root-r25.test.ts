@@ -1,7 +1,12 @@
 /** Frozen writer bytes are loaded through ordinary backends, opened, written and reopened. */
 import { describe, expect, it } from "vitest";
 import fixture from "./root-r25.fixture.json";
-import { decodeManifestRoot, encodeManifestRoot } from "./manifest-codec.js";
+import development from "./root-before-r25.fixture.json";
+import {
+  decodeManifestRoot,
+  encodeManifestRoot,
+  ManifestCorruptionError,
+} from "./manifest-codec.js";
 import { listedRootExtents, reachableExtents } from "./reachable.js";
 import { ExtentListKeeper } from "../storage/extent-list.js";
 import { createOpfsBackend } from "../storage/opfs.js";
@@ -134,4 +139,32 @@ for (const kind of ["opfs", "indexeddb"] as const)
         }
       }
     });
+  });
+
+for (const kind of ["opfs", "indexeddb"] as const)
+  it(`refuses the frozen pre-R25 development root through ordinary ${kind} open`, async () => {
+    const store = backend(kind);
+    const seed = await store.acquire();
+    try {
+      const session = await store.open(seed);
+      for (const payload of development.payloads)
+        await session.writeData(payload.offset, bytes(payload.hex));
+      await session.publish(bytes(development.rootHex));
+      await session.close();
+    } finally {
+      await seed.release();
+    }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const lease = await store.acquire();
+      try {
+        const session = await store.open(lease);
+        await expect(openExtentSpace(session, options())).rejects.toBeInstanceOf(
+          ManifestCorruptionError,
+        );
+        expect(await session.readRoot()).toEqual(bytes(development.rootHex));
+        await session.close();
+      } finally {
+        await lease.release();
+      }
+    }
   });

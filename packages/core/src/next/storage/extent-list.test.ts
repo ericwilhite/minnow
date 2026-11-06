@@ -117,7 +117,7 @@ async function round(
   owner: { space: ExtentSpace; keeper: ExtentListKeeper },
   state: Published,
   random: () => number,
-  hooks: { inFlight?: (round: number) => void; between?: () => void } = {},
+  hooks: { inFlight?: (round: number) => void; between?: () => void | Promise<void> } = {},
 ): Promise<void> {
   const { space, keeper } = owner;
   const writer = space.beginWrite("round");
@@ -141,7 +141,7 @@ async function round(
     writer,
   });
   const blobs = [...old, ...sealed].flatMap((entry) => entry.blobs);
-  hooks.between?.();
+  await hooks.between?.();
   hooks.inFlight?.(next);
   try {
     await space.publish(encodeRoot({ round: next, blobs, list: prepared.list }), {
@@ -437,13 +437,27 @@ describe.each(["opfs", "indexeddb"] as const)("%s: concurrent openers", (kind) =
     const state = publishedOf(null);
     const random = mulberry32(31);
     for (let at = 0; at < 5; at++) await round(first, state, random);
-    // A new opener steals while the old owner is in the middle of a round.
-    const stealing = openOwner(backendOver(kind, disk, locks), { steal: true });
-    const failed = round(first, { ...state, extents: new Map(state.extents) }, random).then(
+    let prepared!: () => void;
+    let resume!: () => void;
+    const atPrepared = new Promise<void>((resolve) => {
+      prepared = resolve;
+    });
+    const continuePublish = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    const failed = round(first, { ...state, extents: new Map(state.extents) }, random, {
+      between: async () => {
+        prepared();
+        await continuePublish;
+      },
+    }).then(
       () => "published",
       () => "fenced",
     );
-    const second = await stealing;
+    // The exact barrier is after keeper.prepare, before this attempt can publish its root.
+    await atPrepared;
+    const second = await openOwner(backendOver(kind, disk, locks), { steal: true });
+    resume();
     expect(await failed).toBe("fenced");
     await verify(second.space, second.root);
     const next = publishedOf(second.root);
@@ -453,4 +467,73 @@ describe.each(["opfs", "indexeddb"] as const)("%s: concurrent openers", (kind) =
     await second.lease.release();
     await first.lease.release();
   });
+});
+
+describe.each(["opfs", "indexeddb"] as const)("%s: actual keeper page retirement", (kind) => {
+  it.each([false, true])(
+    "holds a replaced list page through the previous root and pin=%s",
+    async (pinned) => {
+      const disk = new SimDisk({ seed: 0x258 });
+      const owner = await openOwner(backendOver(kind, disk), { pageExtents: 1 });
+      let sequence = 0;
+      let blobs: BlobRef[] = [];
+      const publish = async () => {
+        const writer = owner.space.beginWrite("actual keeper page");
+        const written = await writer.write([new Uint8Array([++sequence])]);
+        const prepared = await owner.keeper.prepare(sequence, {
+          added: [...writer.extents],
+          released: [],
+          writer,
+        });
+        blobs = [...blobs, ...written.blobs];
+        await owner.space.publish(encodeRoot({ round: sequence, blobs, list: prepared.list }), {
+          writers: [writer],
+          retired: prepared.retire,
+        });
+        owner.keeper.commit(sequence, sequence);
+        return prepared;
+      };
+      const initial = await publish();
+      const page = initial.list[0];
+      if (page === undefined) throw new Error("No actual keeper page");
+      const retiredPage = page.blob.extent;
+      const pin = pinned ? owner.space.pin("actual keeper list page") : null;
+      const noReuse = async () => {
+        const writer = owner.space.beginWrite("held page probe");
+        try {
+          const written = await writer.write([new Uint8Array(retiredPage.length)]);
+          expect(written.extent.offset).not.toBe(retiredPage.offset);
+        } finally {
+          await writer.abort();
+        }
+      };
+      try {
+        const replaced = await publish();
+        expect(replaced.retire).toContainEqual(retiredPage);
+        await owner.space.audit();
+        await noReuse(); // previous durable root still names the actual old page
+        await publish();
+        await owner.space.audit();
+        if (pin !== null) {
+          await noReuse();
+          pin.release();
+          await owner.space.audit();
+        }
+        const writer = owner.space.beginWrite("released keeper page reuse");
+        try {
+          const written = await writer.write([new Uint8Array(retiredPage.length)]);
+          expect(written.extent.offset).toBe(retiredPage.offset);
+        } finally {
+          await writer.abort();
+        }
+        await owner.space.audit();
+      } finally {
+        pin?.release();
+        owner.keeper.close();
+        await owner.space.close();
+        await owner.session.close();
+        await owner.lease.release();
+      }
+    },
+  );
 });

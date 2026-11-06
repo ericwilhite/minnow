@@ -183,6 +183,7 @@ describe("extent deltas (ruling R25)", () => {
         await new Promise((resolve) => setTimeout(resolve, 150));
         await path.quiesce();
         expect(need(harness.space.root).length).toBeGreaterThan(0);
+        await harness.space.audit();
         const walked = await walk(harness.space);
         const extra = [...set].filter(([offset]) => !walked.has(offset));
         const missing = [...walked].filter(([offset]) => !set.has(offset));
