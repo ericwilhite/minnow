@@ -30,6 +30,7 @@ import {
   ALIVE_INTERVAL_MS,
   PROTOCOL_VERSION,
   SILENCE_DEADLINE_MS,
+  SILENT_PROBES_LIMIT,
   type StepDown,
 } from "../owner/protocol.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
@@ -209,6 +210,7 @@ function tab(
     readonly mobile?: boolean;
     readonly onSuperseded?: () => void;
     readonly silenceDeadlineMs?: number;
+    readonly handshakeTimeoutMs?: number;
     readonly announcements?: boolean;
   } = {},
 ): Tab {
@@ -249,6 +251,9 @@ function tab(
     ...(options.silenceDeadlineMs === undefined
       ? {}
       : { silenceDeadlineMs: options.silenceDeadlineMs }),
+    ...(options.handshakeTimeoutMs === undefined
+      ? {}
+      : { handshakeTimeoutMs: options.handshakeTimeoutMs }),
     ...(options.announcements === undefined ? {} : { announcements: options.announcements }),
     onSuperseded: () => {
       state.superseded = true;
@@ -1643,5 +1648,156 @@ describe("D1 (B5-p2d review 1): announcements are hints, checked before anything
     } finally {
       globalThis.BroadcastChannel = original;
     }
+  });
+});
+
+describe("D2 (B5-p2d review 2): a silent connection is probed, backed off, and eventually replaced", () => {
+  /**
+   * The review's probe: a hosts; b connects through an owner whose posts to b's ports (old and
+   * new) can be dropped, while the owner and its locks live. `hide()` makes `locks.query` absent,
+   * as on a platform that hides lock holders.
+   */
+  async function silentOwner(options: Parameters<typeof tab>[1] = {}) {
+    const w = world();
+    const a = tab(w);
+    await a.connector.start();
+    await a.client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
+    await a.client.query("INSERT INTO t VALUES ($1, $2, $3)", [1, 0, "x"]);
+    const host = w.owners[0]?.host;
+    if (host === null || host === undefined) throw new Error("no owner");
+    const accept = host.server.accept.bind(host.server);
+    const drop = { on: false, dropped: 0 };
+    host.server.accept = (port) => {
+      const post = port.postMessage.bind(port);
+      port.postMessage = (...args: Parameters<typeof post>) => {
+        if (drop.on) drop.dropped++;
+        else post(...args);
+      };
+      accept(port);
+    };
+    const b = tab(w, options);
+    await b.connector.start();
+    const locks = b.locks as unknown as { query?: unknown };
+    const hide = () => {
+      locks.query = undefined;
+    };
+    const connects = () => w.connects.get(b.client) ?? 0;
+    return { w, a, b, host, drop, hide, connects };
+  }
+
+  it("the review's probe at the production deadline: no rediscovery loop", async () => {
+    const { b, drop, hide, connects } = await silentOwner();
+    hide();
+    drop.on = true;
+    const before = connects();
+    const generation = b.client.generation;
+    const pending = b.client.query("SELECT 1").catch(() => undefined);
+    await sleep(2_800);
+    // Was 68. Now: the deadline (2.5 s), then a probe that waits its answer: none yet.
+    expect(connects() - before).toBeLessThanOrEqual(1);
+    expect(b.client.generation).toBe(generation);
+    b.connector.close();
+    await pending;
+  }, 10_000);
+
+  it("bounded attempts, then a new generation, and the request resolves once the owner answers", async () => {
+    const deadline = 40;
+    const { b, drop, hide, connects, w } = await silentOwner({
+      silenceDeadlineMs: deadline,
+      handshakeTimeoutMs: 200,
+    });
+    hide();
+    drop.on = true;
+    const before = connects();
+    const generation = b.client.generation;
+    const started = Date.now();
+    const pending = b.client.query("SELECT * FROM t WHERE id = $1", [1]);
+    // Three unanswered probes, backing off (deadlines × 1, 2, 4, each plus a probe's wait):
+    // two rediscoveries that resume, then the connection is dead and a new generation starts.
+    await until(() => b.client.generation > generation, 3_000);
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeGreaterThanOrEqual(deadline * (1 + 2 + 4) + deadline * 3 - 20);
+    expect(connects() - before).toBe(3);
+    // Its handshake is dropped too: one attempt per handshake timeout, never a loop.
+    await sleep(500);
+    const attempts = connects() - before;
+    expect(attempts).toBeGreaterThanOrEqual(4);
+    expect(attempts).toBeLessThanOrEqual(3 + Math.ceil(500 / 200) + 1);
+    // The owner answers again: the next handshake is welcomed and the read resent, answered.
+    drop.on = false;
+    const result = await Promise.race([pending, sleep(2_000).then(() => null)]);
+    expect(result?.rows()).toEqual([[1, 0, "x"]]);
+    expect(w.owners).toHaveLength(1);
+    expect(connects() - before).toBeLessThanOrEqual(3 + Math.ceil((Date.now() - started) / 200));
+  });
+
+  it("a healthy transaction under a long statement is kept: the probe is answered, nothing else happens", async () => {
+    const w = world();
+    // Silent owner (`alive` once a minute) on a platform that hides lock holders: only the probe
+    // can tell that the connection lives.
+    const a = tab(w, { settings: { aliveIntervalMs: 60_000 } });
+    await a.connector.start();
+    await a.client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
+    await a.client.query("INSERT INTO t VALUES ($1, $2, $3)", [1, 0, "x"]);
+    const b = tab(w, { silenceDeadlineMs: 100 });
+    await b.connector.start();
+    (b.locks as unknown as { query?: unknown }).query = undefined;
+    const generation = b.client.generation;
+    const before = w.connects.get(b.client) ?? 0;
+    await b.client.query("BEGIN", [], { session: 1 });
+    await b.client.query("UPDATE t SET n = n + 1 WHERE id = $1", [1], { session: 1 });
+    // 1.5 s without a message of the owner's own: fifteen deadlines.
+    await b.client.query("SELECT spin($1)", [1_500], { session: 1 });
+    // Each deadline's probe is answered. On a loaded host one answer can come later than its
+    // wait (100 ms): one rediscovery, which resumes; never a loop, and never a new generation.
+    expect((w.connects.get(b.client) ?? 0) - before).toBeLessThanOrEqual(1);
+    expect(b.client.generation).toBe(generation);
+    expect(b.client.lostSessions.size).toBe(0);
+    await b.client.query("COMMIT", [], { session: 1 });
+    expect(await value(b.client)).toBe(1);
+  });
+
+  it("a connection that ended without a word is replaced, even while the owner holds its lock", async () => {
+    const w = world();
+    const a = tab(w);
+    await a.connector.start();
+    await a.client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
+    await a.client.query("INSERT INTO t VALUES ($1, $2, $3)", [1, 0, "x"]);
+    const host = w.owners[0]?.host;
+    if (host === null || host === undefined) throw new Error("no owner");
+    const accept = host.server.accept.bind(host.server);
+    let endOld: () => void = () => undefined;
+    host.server.accept = (port) => {
+      accept(port);
+      const receive = port.onmessage;
+      endOld = () => {
+        receive?.call(port as MessagePort, { data: { t: "bye" } } as MessageEvent);
+      };
+    };
+    const b = tab(w, { silenceDeadlineMs: 40 });
+    await b.connector.start();
+    const generation = b.client.generation;
+    await b.client.query("BEGIN", [], { session: 1 });
+    // The owner ends b's connection (rolling its transaction back); b is not told.
+    endOld();
+    // Holders visible: the lock shows b's owner alive. The probe is what notices.
+    const outcome = await Promise.race([
+      b.client.query("SELECT 1", [], { session: 1 }).then(
+        () => "resolved",
+        (error: unknown) => (error as Error).name,
+      ),
+      sleep(3_000).then(() => "hung"),
+    ]);
+    expect(outcome).toBe("SessionLostError");
+    expect(b.client.generation).toBeGreaterThan(generation);
+    expect(b.client.ownerId).toBe(w.owners[0]?.host?.ownerId);
+    // The session is usable once its loss is acknowledged.
+    await b.client.query("ROLLBACK", [], { session: 1 });
+    await b.client.query("UPDATE t SET n = n + 1 WHERE id = $1", [1], { session: 1 });
+    expect(await value(b.client)).toBe(1);
+  });
+
+  it("pins the probe limit", () => {
+    expect(SILENT_PROBES_LIMIT).toBe(3);
   });
 });

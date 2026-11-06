@@ -220,6 +220,7 @@ export class ProtocolClient {
   #ownerLockHolder: string | null = null;
   #ownerEpoch = 0;
   #lastHeardAt = 0;
+  #lastMessageAt = 0;
   #welcome: { resolve: (welcome: Welcome) => void; reject: (error: Error) => void } | null = null;
   #prepared = 0;
   /** Prepared id → its statement kind, as the owner's front end classified it (`Prepared`). */
@@ -286,9 +287,14 @@ export class ProtocolClient {
     return this.#lastHeardAt;
   }
 
-  /** Restarts the silence count: the connector confirmed the owner is alive. */
-  heard(): void {
-    this.#lastHeardAt = this.#now();
+  /** When the last message from an owner arrived (`now()` clock), 0 before any. */
+  get lastMessageAt(): number {
+    return this.#lastMessageAt;
+  }
+
+  /** Asks the owner to answer `alive` on the current connection (protocol.ts `Ping`). */
+  ping(): void {
+    if (this.connected) this.#port?.postMessage({ t: "ping" });
   }
 
   get resolvedThrough(): number {
@@ -735,6 +741,7 @@ export class ProtocolClient {
 
   #receive(message: OwnerMessage): void {
     this.#lastHeardAt = this.#now();
+    this.#lastMessageAt = this.#lastHeardAt;
     switch (message.t) {
       case "welcome": {
         this.#ownerId = message.ownerId;

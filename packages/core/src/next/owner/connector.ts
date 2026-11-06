@@ -33,9 +33,14 @@
  * - Rediscovery that finds the very owner it is still connected to resumes that connection: a
  *   new generation would end the old one and roll its transactions back.
  * - Backstop (a missed announcement, a hung port): with requests in flight and nothing heard for
- *   `SILENCE_DEADLINE_MS`, the connector compares the host lock's holder with its owner's
- *   (`Welcome.lockHolder`). The same: alive and only slow (throttled, or a WebKit owner running a
- *   long statement sends no `alive`); the count restarts. Otherwise: reconnect and resend.
+ *   `SILENCE_DEADLINE_MS`, the connector probes the connection (`ping`, answered by `alive` at
+ *   once). Answered: alive and only slow (throttled, or a WebKit owner running a long statement
+ *   sends no `alive` of its own); the count restarts. Unanswered: it compares the host lock's
+ *   holder with its owner's (`Welcome.lockHolder`). Another or none: reconnect and resend. Hidden:
+ *   rediscover (the same owner resumes). The same: wait. Each unanswered probe doubles the next
+ *   deadline (× 1, 2, 4), and after `SILENT_PROBES_LIMIT` of them the connection is dead
+ *   whatever the lock or the broker says (a live owner is not a live connection): a new
+ *   generation, resolved through the ledger. Any message from the owner resets the count.
  *
  * ## Liveness
  * The client's liveness lock is held while it has requests in flight or pins (open transactions,
@@ -71,7 +76,12 @@ import {
 } from "./election.js";
 import { ClientClosedError, ConnectionRefusedError, OwnerUnreachableError } from "./errors.js";
 import type { OwnerHostInit } from "./host.js";
-import { SILENCE_DEADLINE_MS, type StepDown } from "./protocol.js";
+import {
+  ALIVE_INTERVAL_MS,
+  SILENCE_DEADLINE_MS,
+  SILENT_PROBES_LIMIT,
+  type StepDown,
+} from "./protocol.js";
 import { watchLock, webLocks, type WebLockManager } from "./web-locks.js";
 
 /** A started owner, as the connector controls it. */
@@ -139,6 +149,15 @@ export class OwnerConnector {
   #registered: Array<() => void> = [];
   #hosting: { readonly handle: OwnerHandle; readonly lock: HeldLock } | null = null;
   #silenceTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * The silence backstop's state for the current connection. `rounds`: probes unanswered since the
+   * owner last spoke (at `messageAt`, the client's `lastMessageAt`). `roundAt`: when the last
+   * round ended, the earliest point the next deadline counts from. `probeAt`: a `ping` awaiting
+   * its answer.
+   */
+  #silence = { rounds: 0, messageAt: 0, roundAt: 0, probeAt: null as number | null };
+  /** The next connection must be a new generation, never a resume (the old one is dead). */
+  #fresh = false;
   /** Owner announcements on the database's channel (host.ts), or null without BroadcastChannel. */
   readonly #announcements: BroadcastChannel | null;
   /** An owner this context is starting (not yet ready), or the host-lock wait before it. */
@@ -273,10 +292,13 @@ export class OwnerConnector {
       if (answer.t === "port") {
         // The same live owner we are still connected to (D1 b): resume, never a new generation,
         // which would end the old one and roll its transactions back.
-        if (answer.ownerId === this.#client.ownerId && this.#client.connected) {
+        if (answer.ownerId === this.#client.ownerId && this.#client.connected && !this.#fresh) {
           answer.port.postMessage({ t: "bye" });
           answer.port.close();
           this.#status = "connected";
+          // The next deadline counts from now, with the backoff the rounds have reached: a resume
+          // is not an answer (B5-p2d review 2, D2).
+          this.#silence.roundAt = Date.now();
           this.#activity();
           return;
         }
@@ -322,6 +344,13 @@ export class OwnerConnector {
       this.#throwIfClosed();
       this.#everConnected = true;
       this.#ownerProtocol = welcome.protocol;
+      this.#fresh = false;
+      this.#silence = {
+        rounds: 0,
+        messageAt: this.#client.lastMessageAt,
+        roundAt: 0,
+        probeAt: null,
+      };
       this.#status = "connected";
       this.#activity();
       return true;
@@ -561,54 +590,91 @@ export class OwnerConnector {
   }
 
   /**
-   * The backstop for an announcement missed or never sent: while requests are in flight, a
-   * silence of `SILENCE_DEADLINE_MS` makes the connector ask who holds the host lock. Its owner's
-   * holder (`Welcome.lockHolder`): alive, only slow; the count restarts. Anyone else, nobody, or a
-   * platform that hides holders: the owner is gone; reconnect and resend.
+   * The backstop for an announcement missed or never sent, or a connection that ended without a
+   * word: while requests are in flight, a silence past the deadline sends a `ping`; an unanswered
+   * one asks who holds the host lock. See "Losing the owner" for the outcomes and the backoff.
    */
   #updateSilence(): void {
     const needs = this.#status === "connected" && this.#client.pendingCount > 0;
     if (!needs) {
       if (this.#silenceTimer !== null) clearTimeout(this.#silenceTimer);
       this.#silenceTimer = null;
+      this.#silence.probeAt = null;
       return;
     }
-    if (this.#silenceTimer === null) this.#armSilence();
+    if (this.#silenceTimer === null) this.#armSilence(this.#silenceDueAt() - Date.now());
   }
 
-  #armSilence(): void {
-    const deadline = this.#options.silenceDeadlineMs ?? SILENCE_DEADLINE_MS;
-    const wait = Math.max(0, this.#client.lastHeardAt + deadline - Date.now());
-    this.#silenceTimer = setTimeout(() => {
-      void this.#checkSilence();
-    }, wait);
+  #silenceDeadlineMs(): number {
+    return this.#options.silenceDeadlineMs ?? SILENCE_DEADLINE_MS;
+  }
+
+  /** The deadline, doubled per unanswered probe (× 1, 2, 4, capped), from the later baseline. */
+  #silenceDueAt(): number {
+    const { rounds, roundAt } = this.#silence;
+    const from = Math.max(this.#client.lastHeardAt, roundAt);
+    return from + this.#silenceDeadlineMs() * 2 ** Math.min(rounds, 2);
+  }
+
+  #armSilence(wait: number): void {
+    this.#silenceTimer = setTimeout(
+      () => {
+        void this.#checkSilence();
+      },
+      Math.max(0, wait),
+    );
   }
 
   async #checkSilence(): Promise<void> {
+    this.#silenceTimer = null;
     if (this.#status !== "connected" || this.#client.pendingCount === 0) {
-      this.#silenceTimer = null;
+      this.#silence.probeAt = null;
       return;
     }
-    const deadline = this.#options.silenceDeadlineMs ?? SILENCE_DEADLINE_MS;
-    if (Date.now() - this.#client.lastHeardAt < deadline) {
-      this.#armSilence();
+    // The owner spoke since the count started (a probe answered included): start again.
+    if (this.#client.lastMessageAt !== this.#silence.messageAt) {
+      this.#silence = {
+        rounds: 0,
+        messageAt: this.#client.lastMessageAt,
+        roundAt: 0,
+        probeAt: null,
+      };
+    }
+    const state = this.#silence;
+    const now = Date.now();
+    if (state.probeAt === null) {
+      const due = this.#silenceDueAt();
+      if (now < due) {
+        this.#armSilence(due - now);
+        return;
+      }
+      // Silent past the deadline: is the connection still there?
+      state.probeAt = now;
+      this.#client.ping();
+      this.#armSilence(Math.min(this.#silenceDeadlineMs(), ALIVE_INTERVAL_MS));
+      return;
+    }
+    // The probe went unanswered.
+    state.probeAt = null;
+    state.rounds++;
+    state.roundAt = now;
+    if (state.rounds >= SILENT_PROBES_LIMIT) {
+      // Dead, whoever holds the lock: a new generation, never a resume.
+      this.#fresh = true;
+      this.#ownerLeft("closing");
       return;
     }
     const owner = this.#client.ownerLockHolder;
     const generation = this.#client.generation;
     const holder = await this.#hostHolder();
     // The connection may have changed while the query ran (D1 d): same connection only.
-    if (!this.#isConnected() || this.#client.generation !== generation) {
-      this.#silenceTimer = null;
-      return;
-    }
+    if (!this.#isConnected() || this.#client.generation !== generation) return;
     if (owner !== null && owner !== "" && holder === owner) {
-      // The owner still holds the host lock: alive, only slow (throttled, busy).
-      this.#client.heard();
-      this.#armSilence();
+      // The owner still holds the host lock: alive; wait, backing off.
+      this.#updateSilence();
       return;
     }
-    this.#silenceTimer = null;
+    // Another holder, none, or hidden: rediscover (the same owner resumes, with the backoff).
     this.#ownerLeft("closing");
   }
 

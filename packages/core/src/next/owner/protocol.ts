@@ -156,13 +156,18 @@
  *   resend: an owner watches only what its own connection was told.
  * - While a client has requests in flight the owner sends `alive` at least every
  *   `ALIVE_INTERVAL_MS`. The client's deadline counts silence, not wall time:
- *   `SILENCE_DEADLINE_MS` without a message, it checks the host lock's holder against
- *   `Welcome.lockHolder`, and reconnects and resends only if the owner is no longer the holder.
+ *   `SILENCE_DEADLINE_MS` without a message, it probes the connection (below).
  * - A new owner announces itself on the database's BroadcastChannel (`{ t: "owner", ownerId,
  *   epoch }`, its fence epoch). A hint: a connected client acts on it only if the epoch is above
  *   its owner's (`Welcome.epoch`) and the host lock no longer shows its owner's holder; then it
  *   reconnects at once, idle or not. Rediscovering the same live owner resumes the connection.
  * - The owner sends an overdue `alive` from the request and frame paths too, not only its timer.
+ * - A silent connection is probed: past the deadline the client sends `ping`, which the owner
+ *   answers with `alive` at once from its message handler (it runs between a statement's
+ *   yields). Unanswered, the client checks the host lock or rediscovers; it backs off
+ *   (`SILENCE_DEADLINE_MS` × 1, 2, 4, each from the previous unanswered probe), and after
+ *   `SILENT_PROBES_LIMIT` unanswered probes it ends the connection and opens a new generation,
+ *   resolving through the ledger.
  *
  * ## Version skew
  * - `PROTOCOL_VERSION` changes with any change to these messages or to frame.ts. The owner refuses
@@ -209,21 +214,31 @@ export type TransactionState = "idle" | "open" | "failed" | "timedOut";
 export const DEFAULT_TRANSACTION_IDLE_TIMEOUT_MS = 30_000;
 
 /** Bumped by every change to a message in this file or in frame.ts. */
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 
 /** The owner sends `alive` at least this often while a client has requests in flight. */
 export const ALIVE_INTERVAL_MS = 1_000;
 /**
- * A client with requests in flight that has heard nothing from its owner for this long checks
- * the host lock: still held by the owner's `Welcome.lockHolder`, the owner is alive and only slow
- * (the deadline restarts); held by another context or by none, the owner was replaced or died, and
- * the client reconnects and resends. 2.5 × `ALIVE_INTERVAL_MS`: above the worst gap measured
- * between `alive` messages in Chromium and Firefox (1.04 s; headless Playwright, visible tabs:
- * hidden tabs could not be produced there). WebKit's owner sends no `alive` while it runs a long
- * statement, so the lock check, not the value, keeps a slow owner's clients connected: a false
- * alarm costs one lock query, never a reconnect, unless the platform hides lock holders.
+ * A client with requests in flight that has heard nothing from its owner for this long sends
+ * `ping`. Answered: the owner is alive and only slow (the deadline restarts). Unanswered, it checks
+ * the host lock: held by another context or by none, the owner was replaced or died, and the
+ * client reconnects and resends (see "Liveness" for hidden holders, the backoff and
+ * `SILENT_PROBES_LIMIT`). 2.5 × `ALIVE_INTERVAL_MS`: above the worst gap measured between `alive`
+ * messages in Chromium and Firefox (1.04 s; headless Playwright, visible tabs: hidden tabs could
+ * not be produced there). WebKit's owner sends no `alive` of its own while it runs a long
+ * statement, so the probe, not the value, keeps a slow owner's clients connected: a false alarm
+ * costs one message, never a reconnect.
  */
 export const SILENCE_DEADLINE_MS = 2_500;
+/**
+ * Unanswered `ping`s after which a client treats its connection as dead, even when its owner still
+ * holds the host lock or is the one rediscovery returns: a broker's answer, or a held lock, shows
+ * the owner lives, not that the connection does. With the backoff and each probe's wait (up to
+ * `ALIVE_INTERVAL_MS`): pings at 2.5 s, 8.5 s and 19.5 s of silence, replacement at 20.5 s. About
+ * 20.5 s plus overhead (scheduling, lock queries, the broker), while the client gets execution
+ * time.
+ */
+export const SILENT_PROBES_LIMIT = 3;
 /** Default silence after which a client reports `OwnerUnresponsiveError`. */
 export const DEFAULT_UNRESPONSIVE_AFTER_MS = 10_000;
 /** Default result window: two frames of ~1 MiB, equal to the executor's `RESULT_WINDOW_BYTES`. */
@@ -450,12 +465,20 @@ export interface Unprepare {
   readonly id: number;
 }
 
+/**
+ * Is this connection still there? The owner answers `alive` at once, whatever is in flight. Sent
+ * by a client that has heard nothing for its silence deadline (see "Liveness").
+ */
+export interface Ping {
+  readonly t: "ping";
+}
+
 /** The client is closing this connection: drop its sessions, cursors, pins and subscriptions. */
 export interface Bye {
   readonly t: "bye";
 }
 
-export type Signal = Cancel | Release | Liveness | LiveAck | Unprepare | Bye;
+export type Signal = Cancel | Release | Liveness | LiveAck | Unprepare | Ping | Bye;
 
 export type ClientMessage = Hello | Request | Signal;
 
@@ -610,7 +633,7 @@ export interface LiveEnded {
   readonly reason: "unacknowledged" | "catalogChanged" | "unknown";
 }
 
-/** The owner is working on this client's requests (sent while any is in flight). */
+/** The owner is working on this client's requests (sent while any is in flight), or a `ping`'s answer. */
 export interface Alive {
   readonly t: "alive";
 }
@@ -681,6 +704,7 @@ const CLIENT_KINDS = new Set<string>([
   "liveness",
   "liveAck",
   "unprepare",
+  "ping",
   "bye",
 ]);
 

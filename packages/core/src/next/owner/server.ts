@@ -369,6 +369,9 @@ class Connection {
         return;
       case "liveAck":
         return;
+      case "ping":
+        this.post({ t: "alive" });
+        return;
       case "unprepare":
         this.#prepared.delete(message.id);
         return;
