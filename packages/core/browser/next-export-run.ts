@@ -67,6 +67,7 @@ export async function exportPass(options: {
   /** Bench-only comparison: both loop modules are imported before timing. */
   readonly baselineStream?: boolean;
   readonly readMiB?: 4 | 8;
+  readonly groupDepth?: 1 | 2;
 }): Promise<ExportPass[]> {
   if (built === null) throw new Error("build the table first");
   const groups = built.groups.slice(0, options.groups ?? built.groups.length);
@@ -84,6 +85,7 @@ export async function exportPass(options: {
     ...(options.windowMiB === undefined ? {} : { windowMiB: options.windowMiB }),
     capMiB: options.capMiB,
     passes: options.passes,
+    ...(options.groupDepth === undefined ? {} : { groupDepth: options.groupDepth }),
     ...(options.readMiB === undefined ? {} : { readMiB: options.readMiB }),
     ...(options.profile === true ? { profile: true } : {}),
     ...(options.profilePhases === true ? { profilePhases: true } : {}),

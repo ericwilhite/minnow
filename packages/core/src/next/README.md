@@ -571,6 +571,13 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     `scripts/read-batch-bench.mts` runs full read/verify/release over contiguous and gapped
     ranges in memory, with CPU/wall samples and charge checks. The candidate does not change
     the engine's bound: fewer calls alone are not evidence of a faster export.
+  - `MINNOW_EXPORT_DEPTH_COMPARE=1` compares retaining one versus two whole groups, five
+    interleaved cold/warm attempts each. Two groups are opened and prefetched before decoding
+    the first; their existing shared leases pay for both groups until release. It does not
+    create IO overlap on a sync handle. The default stays one group. The isolated
+    `scripts/readahead-bench.mts` runs the actual page-export loop and PageCache over a wide
+    fixture outside IO, checks row/charge totals, and reports five CPU/wall rounds. Its memory
+    peak is only the cache handle; the OPFS comparison reports the full governor and RSS.
 - The checksum-load CPU hypothesis from the export profile is reproducible with
   `npx vite-node scripts/hash-load-bench.mts`: five rotating rounds in fresh processes, CPU and
   wall medians/min/max, aligned and unaligned inputs, byte offsets, stripe tails, and consumed

@@ -103,6 +103,8 @@ export interface ExportOptions {
   /** Called every 8 batches (memory sampling). */
   readonly sample?: (rows: number) => void;
   readonly phases?: ExportPhases;
+  /** Bench-only depth experiment: hold the next group too; sync OPFS still cannot overlap. */
+  readonly groupDepth?: 1 | 2;
 }
 
 export interface ExportResult {
@@ -162,8 +164,8 @@ export async function exportStream(
   let batches = 0;
   const open = { budget: options.budget, directories: options.directories, once: options.once };
   const windowBytes = options.windowBytes ?? 0;
-  for (const group of groups) {
-    let t = performance.now();
+  const prepare = async (group: ExportGroup): Promise<ChunkReader[]> => {
+    const t = performance.now();
     const readers: ChunkReader[] = [];
     for (const chunk of group.chunks) {
       const reader = await ChunkReader.open(space, chunk, open);
@@ -184,6 +186,30 @@ export async function exportStream(
         throw new Error("Phase profiling expects uncompressed flushed pages");
     }
     openMs += performance.now() - t;
+    return readers;
+  };
+  const prepared = new Map<number, ChunkReader[]>();
+  for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+    const group = groups[groupIndex] ?? fail();
+    const readers = prepared.get(groupIndex) ?? (await prepare(group));
+    prepared.delete(groupIndex);
+    let t: number;
+    if (options.groupDepth === 2 && groupIndex % 2 === 0) {
+      const next = groups[groupIndex + 1];
+      if (next) {
+        const future = await prepare(next);
+        prepared.set(groupIndex + 1, future);
+        t = performance.now();
+        await ChunkReader.loadTogether(
+          [...readers, ...future].map((reader) => ({
+            reader,
+            pages: reader.directory.pages.map((_, i) => i),
+          })),
+        );
+        loadMs += performance.now() - t;
+        loads++;
+      }
+    }
     const loadedFrom = readers.map(() => 0);
     /** Pages behind `from` were emitted: let them go. */
     const releaseBehind = (column: number, reader: ChunkReader, from: number, to: number) => {

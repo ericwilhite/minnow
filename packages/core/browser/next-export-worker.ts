@@ -58,6 +58,7 @@ export type ExportRequest =
       /** Bench-only comparison: both loop modules are imported before timing. */
       readonly baselineStream?: boolean;
       readonly readMiB?: 4 | 8;
+      readonly groupDepth?: 1 | 2;
     }
   | { readonly op: "remove"; readonly dir: string };
 
@@ -274,6 +275,7 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
       readahead: request.readaheadKiB * 1024,
       windowBytes: (request.windowMiB ?? 0) * MiB,
       ...(phases ? { phases } : {}),
+      ...(request.groupDepth === undefined ? {} : { groupDepth: request.groupDepth }),
       ...(phases
         ? {
             sample: (rows: number) =>
