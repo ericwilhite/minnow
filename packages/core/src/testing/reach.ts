@@ -582,3 +582,12 @@ export const AUTOPARAMETERIZE_LITERAL_STATES = [
   "refused",
   "not lifted",
 ] as const;
+
+/** Every lock intent survives the parameterized point-read cache. */
+export const ROW_LOCK_CACHE_STATES = [
+  "none",
+  "keyShare",
+  "share",
+  "noKeyUpdate",
+  "update",
+] as const;
