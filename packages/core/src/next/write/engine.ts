@@ -1113,7 +1113,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
         last.measure();
       }
     }
-    let end = memtables[memtables.length - 1]?.rowIdEnd ?? 0;
+    // A replayed delete can create a rowless delta carrier at the root's nextRowId,
+    // beyond groups whose earlier commit still needs replay. It occupies no row ids;
+    // preserve its tombstones, but check overlap against actual stored rows only.
+    let end = 0;
+    for (let at = memtables.length - 1; at >= 0; at--) {
+      const memtable = need(memtables[at]);
+      if (memtable.rowCount === 0) continue;
+      end = memtable.rowIdEnd;
+      break;
+    }
     const staged: Memtable[] = [];
     for (const [k, ref] of refs.entries()) {
       if (ref.firstRowId < end)
