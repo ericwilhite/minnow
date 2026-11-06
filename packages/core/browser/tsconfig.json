@@ -8,6 +8,8 @@
     "run.ts",
     "next-storage-run.ts",
     "next-storage-worker.ts",
+    "next-yield-run.ts",
+    "next-yield-worker.ts",
     "worker-run.ts",
     "offline-identity-run.ts",
     "write-scope-admission-run.ts",

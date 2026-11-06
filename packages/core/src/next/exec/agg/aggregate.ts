@@ -439,18 +439,29 @@ export class AggregateOperator implements Operator {
 
   /** Emits every group in charged, byte-bounded batches and paced slices (see the header). */
   finish(): MaybePromise<void> {
+    this.#sliceStart = this.#now();
     return this.#emit();
   }
+
+  /**
+   * When the current slice began: at `finish`, then after each task yield. Resuming from
+   * downstream backpressure does not start a new slice (`ready()` may resolve at once, a
+   * microtask): only a task yield does, so many short batches cannot run past the slice.
+   */
+  #sliceStart = 0;
 
   #emit(): MaybePromise<void> {
     if (this.#isAborted()) throw this.#abortReason;
     const total = this.#groups === null ? 1 : this.#groups.groupCount;
-    const sliceStart = this.#now();
-    const expired = (): boolean => this.#closed || this.#now() - sliceStart >= this.#interval;
+    const expired = (): boolean => this.#closed || this.#now() - this.#sliceStart >= this.#interval;
     while (this.#emitted < total) {
       // A downstream push may abort this operator: check before every batch.
       if (this.#isAborted()) throw this.#abortReason;
-      if (this.#now() - sliceStart >= this.#interval) return yieldTask().then(() => this.#emit());
+      if (this.#now() - this.#sliceStart >= this.#interval)
+        return yieldTask().then(() => {
+          this.#sliceStart = this.#now();
+          return this.#emit();
+        });
       let count = Math.min(BATCH_ROWS, total - this.#emitted);
       let bytes = this.#outputBytes(this.#emitted, count);
       while (count > 1 && bytes > this.#target) {
