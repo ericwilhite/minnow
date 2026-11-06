@@ -145,9 +145,12 @@ import { need } from "./bytes.js";
  * Log bytes past which the write path recycles the log (access/write-path.ts "Log recycling"):
  * every table is flushed through the log's end, a root covering it switches to a new incarnation,
  * and the log is reset. The log stays within about this plus what accumulates while a recycle
- * waits for the writer slot.
+ * waits for the writer slot. Chosen so the open's log scan stays under ~100 ms
+ * (scripts/write-log-scan-bench.mts, Node, memory store, load ~16: a full 32 MiB log cost 303 ms of
+ * write-path open, 8 MiB 89 ms, 4 MiB 77 ms, of which ~70 ms is fixed); a 5M-row keyed load
+ * recycles 4 times instead of once, at the same write amplification.
  */
-export const LOG_RECYCLE_BYTES = 32 * 1024 * 1024;
+export const LOG_RECYCLE_BYTES = 8 * 1024 * 1024;
 
 /**
  * Ruling R10: on an idle database whose retired space waiting for the next publish passes
