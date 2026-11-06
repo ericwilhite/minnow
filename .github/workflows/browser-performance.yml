@@ -73,6 +73,19 @@ jobs:
           npm run benchmark:storage 2>&1 | tee storage-microbench.txt
           grep -o 'STORAGE_MICROBENCH .*' storage-microbench.txt | sed 's/^STORAGE_MICROBENCH //' \
             > browser-perf-results/storage-microbench.json
+      - name: Aggregation microbench (rebuild core, recorded, not judged)
+        # The analytics harness's aggregation shapes (agg_highcard_int, agg_3dims_20aggs,
+        # agg_count_distinct, agg_numeric_sum) through the rebuild core's aggregate operator in
+        # real Chromium: prebuilt batches, operator cost only, wall time min and median of five.
+        # Recorded nightly so layout changes (row layout, partitioning) are measured on a quiet
+        # host; nothing judges it.
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p browser-perf-results
+          npm run benchmark:agg-browser 2>&1 | tee agg-microbench.txt
+          grep -o 'AGG_MICROBENCH .*' agg-microbench.txt | sed 's/^AGG_MICROBENCH //' \
+            > browser-perf-results/agg-microbench.json
       - name: Upload the results
         if: always()
         uses: actions/upload-artifact@v7
@@ -81,6 +94,7 @@ jobs:
           path: |
             browser-perf.txt
             storage-microbench.txt
+            agg-microbench.txt
             browser-perf-results/
             packages/core/browser-perf-baseline.json
           retention-days: 90
