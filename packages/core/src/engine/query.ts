@@ -1630,7 +1630,14 @@ export type CompiledStatement =
     }
   | { kind: "drop-view"; view: string; ifExists?: boolean; parameterCount?: number }
   /** A session setting, accepted and ignored: `SET name TO value`, `RESET name`. */
-  | { kind: "set"; action: "set" | "reset"; name: string; parameterCount?: number }
+  | {
+      kind: "set";
+      action: "set" | "reset";
+      name: string;
+      parameterCount?: number;
+      /** SET TRANSACTION's modes, in written order: they change the current transaction. */
+      transactionModes?: TransactionMode[];
+    }
   /** `SHOW name`: the engine's value for a PostgreSQL setting, as one row. */
   | { kind: "show"; name: string; parameterCount?: number }
   | {
@@ -1638,6 +1645,8 @@ export type CompiledStatement =
       action: "begin" | "commit" | "rollback" | "savepoint" | "rollback-to" | "release";
       name?: string;
       parameterCount?: number;
+      /** BEGIN / START TRANSACTION's modes, in written order (absent when none). */
+      modes?: TransactionMode[];
     }
   | {
       kind: "merge";
@@ -1755,15 +1764,21 @@ function parseSettingStatement(keyword: string, tokens: Token[]): CompiledStatem
     }
     return { kind: "set", action: "set", name: "timezone" };
   }
-  if (upperAt(index) === "TRANSACTION" || upperAt(index) === "CONSTRAINTS") {
-    // Every transaction reads one snapshot and commits atomically, which satisfies READ
-    // UNCOMMITTED, READ COMMITTED, and REPEATABLE READ; SERIALIZABLE promises more than that.
-    if (words.some((word) => word.text.toUpperCase() === "SERIALIZABLE")) {
-      throw new TypeError(
-        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE is not supported: the engine has one isolation level",
-      );
+  if (index === 2 && upperAt(1) === "SESSION" && upperAt(2) === "CHARACTERISTICS") {
+    throw new TypeError(
+      "SET SESSION CHARACTERISTICS AS TRANSACTION is not supported: set each transaction's mode with BEGIN or SET TRANSACTION",
+    );
+  }
+  if (upperAt(index) === "TRANSACTION") {
+    const transactionModes = parseTransactionModes(words, index + 1, "SET TRANSACTION");
+    if (transactionModes.length === 0) {
+      const last = words.at(-1);
+      throw new SqlCompileError("syntax error at end of input", last?.end ?? 0, 0);
     }
-    return { kind: "set", action: "set", name: (upperAt(index) ?? "").toLowerCase() };
+    return { kind: "set", action: "set", name: "transaction", transactionModes };
+  }
+  if (upperAt(index) === "CONSTRAINTS") {
+    return { kind: "set", action: "set", name: "constraints" };
   }
   const name = words[index];
   if (name?.kind !== "identifier") {
@@ -1869,52 +1884,113 @@ function parseTransactionStatement(keyword: string, tokens: Token[]): CompiledSt
     }
     return { kind: "transaction", action: "rollback-to", name };
   }
-  const words = tokens
-    .filter((token) => token.kind === "identifier")
-    .map((token) => token.text.toUpperCase());
-  const action =
-    keyword === "START" || keyword === "BEGIN"
-      ? "begin"
-      : keyword === "END"
-        ? "commit"
-        : keyword === "ABORT"
-          ? "rollback"
-          : keyword.toLowerCase();
-  if (words.includes("SERIALIZABLE")) {
-    throw new TypeError(
-      "BEGIN ISOLATION LEVEL SERIALIZABLE is not supported: the engine has one isolation level",
-    );
+  // BEGIN [WORK | TRANSACTION] [mode [[,] mode] …], START TRANSACTION [modes],
+  // COMMIT | END | ROLLBACK | ABORT [WORK | TRANSACTION] (PostgreSQL's grammar).
+  const upper = (index: number): string | undefined => {
+    const token = tokens[index];
+    return token?.kind === "identifier" && token.quoted !== true
+      ? token.text.toUpperCase()
+      : undefined;
+  };
+  let index = 1;
+  if (keyword === "START") {
+    if (upper(index) !== "TRANSACTION") throw new TypeError("Expected START TRANSACTION");
+    index += 1;
+  } else if (upper(index) === "WORK" || upper(index) === "TRANSACTION") index += 1;
+  const begins = keyword === "START" || keyword === "BEGIN";
+  const action = begins
+    ? "begin"
+    : keyword === "END"
+      ? "commit"
+      : keyword === "ABORT"
+        ? "rollback"
+        : (keyword.toLowerCase() as "commit" | "rollback");
+  if (!begins) {
+    const extra = tokens[index];
+    if (extra !== undefined && extra.kind !== "eof")
+      throw new TypeError(`${keyword} takes no ${extra.text}: this engine has one isolation level`);
+    return { kind: "transaction", action };
   }
-  // READ ONLY / READ WRITE / [NOT] DEFERRABLE name transaction modes the engine already has.
-  const allowed = new Set([
-    "BEGIN",
-    "START",
-    "COMMIT",
-    "END",
-    "ROLLBACK",
-    "ABORT",
-    "WORK",
-    "TRANSACTION",
-    "READ",
-    "ONLY",
-    "WRITE",
-    "NOT",
-    "DEFERRABLE",
-    "ISOLATION",
-    "LEVEL",
-    "COMMITTED",
-    "UNCOMMITTED",
-    "REPEATABLE",
-  ]);
-  for (const word of words) {
-    if (!allowed.has(word)) {
-      throw new TypeError(`${keyword} takes no ${word}: this engine has one isolation level`);
+  const modes = parseTransactionModes(tokens, index, "BEGIN");
+  return { kind: "transaction", action, ...(modes.length === 0 ? {} : { modes }) };
+}
+
+/**
+ * One transaction mode as written (PostgreSQL's `transaction_mode`), in order: when a kind
+ * repeats, the last one applies, as in PostgreSQL (`BEGIN READ ONLY, READ WRITE` writes).
+ */
+export type TransactionMode =
+  | { readonly kind: "access"; readonly readOnly: boolean }
+  | {
+      readonly kind: "isolation";
+      readonly level: "read uncommitted" | "read committed" | "repeatable read";
     }
+  | { readonly kind: "deferrable"; readonly deferrable: boolean };
+
+/**
+ * `mode [[,] mode] …` from `tokens[start]` to the end. Every transaction reads one snapshot and
+ * commits atomically, which satisfies READ UNCOMMITTED, READ COMMITTED and REPEATABLE READ;
+ * SERIALIZABLE promises more than that and is refused.
+ */
+function parseTransactionModes(
+  tokens: readonly Token[],
+  start: number,
+  statement: string,
+): TransactionMode[] {
+  const upper = (index: number): string | undefined => {
+    const token = tokens[index];
+    return token?.kind === "identifier" && token.quoted !== true
+      ? token.text.toUpperCase()
+      : undefined;
+  };
+  const syntax = (index: number): never => {
+    const token = tokens[index];
+    throw new SqlCompileError(
+      `syntax error at or near "${token?.kind === "eof" || token === undefined ? "end of input" : token.text}"`,
+      token?.start ?? 0,
+      token === undefined || token.kind === "eof" ? 0 : token.end - token.start,
+    );
+  };
+  const modes: TransactionMode[] = [];
+  let index = start;
+  const done = () => tokens[index] === undefined || tokens[index]?.kind === "eof";
+  while (!done()) {
+    if (modes.length > 0 && tokens[index]?.kind === "punctuation" && tokens[index]?.text === ",") {
+      index += 1;
+      if (done()) syntax(index);
+    }
+    const word = upper(index);
+    if (word === "READ" && (upper(index + 1) === "ONLY" || upper(index + 1) === "WRITE")) {
+      modes.push({ kind: "access", readOnly: upper(index + 1) === "ONLY" });
+      index += 2;
+    } else if (word === "DEFERRABLE") {
+      modes.push({ kind: "deferrable", deferrable: true });
+      index += 1;
+    } else if (word === "NOT" && upper(index + 1) === "DEFERRABLE") {
+      modes.push({ kind: "deferrable", deferrable: false });
+      index += 2;
+    } else if (word === "ISOLATION" && upper(index + 1) === "LEVEL") {
+      const level = upper(index + 2);
+      if (level === "SERIALIZABLE")
+        throw new TypeError(
+          `${statement} ISOLATION LEVEL SERIALIZABLE is not supported: the engine has one isolation level`,
+        );
+      if (level === "REPEATABLE" && upper(index + 3) === "READ") {
+        modes.push({ kind: "isolation", level: "repeatable read" });
+        index += 4;
+      } else if (
+        level === "READ" &&
+        (upper(index + 3) === "COMMITTED" || upper(index + 3) === "UNCOMMITTED")
+      ) {
+        modes.push({
+          kind: "isolation",
+          level: upper(index + 3) === "COMMITTED" ? "read committed" : "read uncommitted",
+        });
+        index += 4;
+      } else syntax(index + 2);
+    } else syntax(index);
   }
-  if (keyword === "START" && words[1] !== "TRANSACTION") {
-    throw new TypeError("Expected START TRANSACTION");
-  }
-  return { kind: "transaction", action: action as "begin" | "commit" | "rollback" };
+  return modes;
 }
 
 /**
@@ -11815,6 +11891,8 @@ class Parser {
       // one SUBSTR call; the comma form falls through to the ordinary call path below.
       const restore = this.#index;
       this.#expectPunctuation("(");
+      // SUBSTRING() names no overload (PostgreSQL's 42883), not a malformed expression.
+      if (this.#peek().text === ")") throw new TypeError("SUBSTRING requires a string argument");
       const operand = this.#expression();
       if (this.#isKeyword("FROM")) {
         this.#keyword("FROM");

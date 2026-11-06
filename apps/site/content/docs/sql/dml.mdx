@@ -324,9 +324,14 @@ COMMIT;
 
 Statements inside see each other — a `SELECT` after the `UPDATE` reads the new value — and
 `ROLLBACK` (or `ABORT`) discards the lot (`END` commits, as `COMMIT` does). `BEGIN` and
-`SET TRANSACTION` accept `READ ONLY`, `READ WRITE`, and `ISOLATION LEVEL` below `SERIALIZABLE`:
-every transaction reads one snapshot and commits atomically, which satisfies those levels, while
-`SERIALIZABLE` is refused rather than silently downgraded. Session settings — `SET name TO
+`SET TRANSACTION` accept `READ ONLY`, `READ WRITE`, `[NOT] DEFERRABLE`, and `ISOLATION LEVEL`
+below `SERIALIZABLE`, in PostgreSQL's grammar: modes are separated by spaces or commas, and the
+last one of each kind applies. Every transaction reads one snapshot and commits atomically, which
+satisfies those levels, while `SERIALIZABLE` is refused rather than silently downgraded. A
+`READ ONLY` transaction refuses writes, as in PostgreSQL: `INSERT`, `UPDATE`, `DELETE`, `MERGE`,
+`TRUNCATE`, schema changes and `nextval` fail with "cannot execute … in a read-only
+transaction". `SET TRANSACTION READ ONLY` makes the open transaction read-only at any point;
+`SET TRANSACTION READ WRITE` is refused once it has run a statement. Session settings — `SET name TO
 value`, `SET LOCAL …`, `SET TRANSACTION …`, `RESET name` — are accepted and ignored, since an
 embedded single-session engine has nothing to configure by them; `SET TIME ZONE` accepts only UTC.
 `SHOW setting` answers the questions drivers ask on connection (`server_version`, `search_path`,

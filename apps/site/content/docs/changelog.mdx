@@ -57,6 +57,17 @@ b.id = a.id)` was false when no row of `b` matched. An aggregate without `GROUP 
   cannot be used with SELECT \*; name the columns", as plain `ORDER BY 1` over `SELECT *` already
   did.
 
+- **`READ ONLY` transactions are read-only.** `BEGIN READ ONLY` and `SET TRANSACTION READ ONLY`
+  were accepted and ignored, so writes inside them succeeded. Now `INSERT`, `UPDATE`, `DELETE`,
+  `MERGE`, `TRUNCATE`, schema changes and `nextval` in a read-only transaction fail with "cannot
+  execute … in a read-only transaction", and `SET TRANSACTION READ WRITE` after the transaction's
+  first statement fails with "transaction read-write mode must be set before any query", as in
+  PostgreSQL. Open the transaction with `BEGIN` (or `READ WRITE`) to write.
+- **Transaction statements follow PostgreSQL's grammar.** `BEGIN`, `START TRANSACTION` and
+  `SET TRANSACTION` accepted their keywords in any order and ignored anything else, so
+  `BEGIN ONLY READ` and `BEGIN 'READ ONLY'` ran. They now fail with `syntax error at or near …`.
+  Modes may be separated by spaces or commas; the last mode of each kind applies.
+  `SET SESSION CHARACTERISTICS AS TRANSACTION` is refused with a message that says so.
 - **A FROM clause that names a source twice is now an error**, as in PostgreSQL:
   `SELECT a.id FROM a a, b a` ran and read `a.id` from whichever source came first. It now fails
   with `table name "a" specified more than once`. The same applies to `UPDATE … FROM` and

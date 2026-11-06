@@ -374,6 +374,7 @@ import {
   extendGroupByWithKeyDependents,
   expandRowReferences,
   type MutationSources,
+  type TransactionMode,
 } from "./query.js";
 import {
   copyQueryResult,
@@ -2590,6 +2591,28 @@ interface OpenStatementTransaction {
   busy: number;
   activeAt: number;
   savepoints: Array<{ name: string; checkpoint: TransactionCheckpoint; retainedBytes: number }>;
+  /** BEGIN … READ ONLY or SET TRANSACTION READ ONLY: no write may run (PostgreSQL's 25006). */
+  readOnly: boolean;
+  /** A statement has run: READ WRITE can no longer be set (PostgreSQL's 25001). */
+  queried: boolean;
+}
+
+/** The access mode transaction modes set, the last one written winning; undefined if none. */
+function accessMode(modes: readonly TransactionMode[] | undefined): boolean | undefined {
+  let readOnly: boolean | undefined;
+  for (const mode of modes ?? []) if (mode.kind === "access") readOnly = mode.readOnly;
+  return readOnly;
+}
+
+/** PostgreSQL's refusal of a write in a read-only transaction (read_only_sql_transaction). */
+function readOnlyTransactionError(command: string): TypeError {
+  return new TypeError(`cannot execute ${command} in a read-only transaction`);
+}
+
+/** The command PostgreSQL names in that refusal: the statement's tag. */
+function writeCommand(statement: CompiledStatement): string {
+  if (statement.kind === "delete" && "truncate" in statement) return "TRUNCATE TABLE";
+  return statement.kind.toUpperCase().replaceAll("-", " ");
 }
 
 export interface VisibleSegment {
@@ -13908,8 +13931,31 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       if (statement.action === "rollback") return { kind: "transaction", action: "rollback" };
     }
     if (statement.kind === "transaction") {
-      return this.#runTransactionStatement(statement.action, statement.name);
+      return this.#runTransactionStatement(statement.action, statement.name, statement.modes);
     }
+    const current = this.#openTransaction;
+    if (statement.kind === "set" && statement.transactionModes !== undefined) {
+      // SET TRANSACTION changes the open transaction (outside one it has no effect, as in
+      // PostgreSQL, which only warns). READ ONLY may be set at any point; READ WRITE only before
+      // the transaction's first statement.
+      const readOnly = accessMode(statement.transactionModes);
+      if (current !== undefined && readOnly !== undefined) {
+        if (!readOnly && current.readOnly && current.queried)
+          throw new TypeError("transaction read-write mode must be set before any query");
+        current.readOnly = readOnly;
+      }
+      return externalizeExecuteResult(await this.runStatement(statement));
+    }
+    if (current?.readOnly === true) {
+      if (statement.kind === "select") {
+        if (compileQuery(statement.sql).usesSequenceCalls === true)
+          throw readOnlyTransactionError("nextval()");
+      } else if (statement.kind !== "set" && statement.kind !== "show") {
+        throw readOnlyTransactionError(writeCommand(statement));
+      }
+    }
+    if (current !== undefined && statement.kind !== "set" && statement.kind !== "show")
+      current.queried = true;
     if (statement.kind === "select") {
       return {
         kind: "rows",
@@ -14305,6 +14351,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   async #runTransactionStatement(
     action: "begin" | "commit" | "rollback" | "savepoint" | "rollback-to" | "release",
     name?: string,
+    modes?: readonly TransactionMode[],
   ): Promise<ExecuteResult> {
     if (action === "begin") {
       if (this.#openTransaction !== undefined) {
@@ -14345,6 +14392,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         busy: 0,
         activeAt: dateMilliseconds(this.#now()),
         savepoints: [],
+        readOnly: accessMode(modes) === true,
+        queried: false,
         finished: finished.then(
           ({ version }) => ({ version }),
           (error: unknown) => {
