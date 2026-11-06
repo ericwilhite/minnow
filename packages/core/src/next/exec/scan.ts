@@ -90,6 +90,12 @@ export interface ChunkPages {
   loadValues(from: number, to: number): MaybePromise<void>;
   loadValuesOf(rows: GroupRows, start?: number, end?: number): MaybePromise<void>;
   releaseValues(rows?: readonly number[]): void;
+  /**
+   * Bytes `loadValues` / `loadValuesOf` charge for the out-of-line values of a range or of the
+   * selected rows (pages loaded), so a scan can reserve them before the load.
+   */
+  largeValueBytes(from: number, to: number): number;
+  largeValueBytesOf(rows: GroupRows, start?: number, end?: number): number;
   /** What a decimal target needs: the chunk's one scale (null: per-slot scales), … */
   readonly directory: { readonly scale: number | null };
   /** … 128-bit coefficients, … */

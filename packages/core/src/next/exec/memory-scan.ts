@@ -49,7 +49,7 @@ export class MemorySegmentScan implements BatchSource {
   readonly #out: readonly ChunkOutput[];
   readonly #vectors: Vector[];
   readonly #results: Array<ChunkResult | undefined>;
-  readonly #selection: Selection = allocateSelection(MEMORY_CHUNK_ROWS);
+  readonly #selection: Selection;
   #segment = 0;
   /** The chunk index the next read continues, or starts when `#start` is 0. */
   #chunk = 0;
@@ -64,14 +64,19 @@ export class MemorySegmentScan implements BatchSource {
 
   /**
    * `columnIds` are declared columns of the table snapshot; `out[c]` are the scan's own buffers
-   * (from its grant) that a re-pointed chunk decodes into, one per column.
+   * (from its grant) that a re-pointed chunk decodes into, one per column; `selection`, of at
+   * least `MEMORY_CHUNK_ROWS` rows, is the scan's own too when given (else made here).
    */
   constructor(
     segments: readonly MemorySegment[],
     columnIds: readonly number[],
     out: readonly ChunkOutput[],
+    selection?: Selection,
   ) {
     if (out.length !== columnIds.length) throw new RangeError("One output per column");
+    if (selection !== undefined && selection.rows.length < MEMORY_CHUNK_ROWS)
+      throw new RangeError("A memory scan's selection holds a whole chunk");
+    this.#selection = selection ?? allocateSelection(MEMORY_CHUNK_ROWS);
     this.#segments = segments;
     this.#columnIds = columnIds;
     this.#out = out;
@@ -118,13 +123,18 @@ export class MemorySegmentScan implements BatchSource {
     }
   }
 
-  #read(segment: MemorySegment, length: number, from: number): MaybePromise<SourceItem> {
+  #read(segment: MemorySegment, length: number, from: number): MaybePromise<SourceItem | null> {
     for (let c = from; c < this.#columnIds.length; c++) {
       const out = this.#out[c];
       if (out === undefined) throw new RangeError("Missing output");
       const result = segment.chunk(this.#columnIds[c] ?? -1, this.#chunk, out, this.#start);
       if (isPromise(result))
         return result.then((value) => {
+          // Aborted while the read was in flight: no later column is read, no batch built.
+          if (this.#aborted) {
+            this.#results.fill(undefined);
+            return null;
+          }
           this.#results[c] = value;
           return this.#read(segment, length, c + 1);
         });

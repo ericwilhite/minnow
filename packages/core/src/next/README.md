@@ -615,15 +615,33 @@ and the owner import it directly.
 - Group segments: prune → pushed predicates → decode the selected positions. The filter's
   conjuncts that compare one column with constants (comparisons, `IN`, `IS [NOT] NULL`) go to the
   page format: groups whose statistics rule one out are skipped unread, then per range the live
-  rows are narrowed by `select` / `refine` on encoded pages, loading only the pages a predicate
-  cannot rule out. The rest of the filter (the residual) runs on decoded values.
-- At or above 40 % of a range selected, columns decode densely and keep the selection; below it
-  only the selected positions are gathered. With a residual, its columns decode first and the
-  others only for the rows it keeps.
-- Out-of-line values are loaded for exactly what is decoded and released when the batch's borrow
-  ends. Batches are sized from full value lengths before any value is read; one row larger than
-  the target is a batch of its own, and if the grant refuses even that row the scan borrows a
-  progress loan (R18.3) and repays it when the batch is released.
+  rows are narrowed by `select` / `refine` on encoded pages. `select` over a whole range loads
+  only the pages the predicate cannot rule out; `refine` (after deletions or an earlier conjunct)
+  loads every page its positions touch. The rest of the filter (the residual) runs on decoded
+  values.
+- At or above 40 % of a range selected, every column decodes densely (residual columns too) and
+  keeps the selection, the residual then narrowing it. Below it only the selected positions are
+  gathered; with a residual, its columns are gathered first and the others only for the rows it
+  keeps.
+- Batches are bounded by their decoded bytes: validity, values or codes, scales, limbs,
+  specials, offsets, varlen bytes (full value lengths, out-of-line values included) and
+  locators, all known from page headers before any value is read. One row larger than the target
+  is a batch of its own. Decode buffers grow with the batches (at least 64 rows, doubling, at
+  most 2,048), so a small target takes small buffers.
+- Before a batch decodes, the scan reserves its whole working set from the grant: the
+  out-of-line values it leases and every buffer it grows. A refusal halves the batch; for one
+  row the scan borrows a progress loan (R18.3) for that working set and repays it once the row's
+  buffers and values are given back, after the batch's borrow ends. Out-of-line values are
+  released when the batch's borrow ends; the scan's own scratch (position lists, selections,
+  locators, memory-segment staging) is charged before it is built.
+- Pushed predicates on the decoded fallback (below) load the values they read when they
+  evaluate, before the batch is sized.
+- Long runs that emit nothing (ranges, chunks and groups filtered or pruned away) yield to the
+  event loop with a task every 4 ms inside one `next()` (R23).
+- Ending: at the end of the table the scan gives back everything it holds by itself; `abort` (a
+  cancellation, an error, a LIMIT) does the same at once and repays a loan. A `next()` still
+  waiting on a read then resolves null: whatever settles after the abort (a reader opened, a
+  loan served) is closed or repaid, and nothing more is read, decoded or emitted.
 - Pushdown (`pushdown.ts`): pushed conjuncts run on encoded pages through the page format's
   read-side pushdown (`compilePredicate`, `pagesMatching`, `select`, `refine`, `chunkMayMatch`;
   "Predicates on encoded pages" above). Where it does not push a predicate down for a chunk
@@ -636,7 +654,11 @@ and the owner import it directly.
 - `table-scan.test.ts` checks generated tables (groups through the page writer, memory segments,
   deletions, columns some groups predate, values stored out of line) and filters, with pushed
   conjuncts on encoded pages or forced onto decoded values, against the same scan with pushdown
-  off (decode-then-filter), and that against the source rows.
+  off (decode-then-filter), and that against the source rows; every batch it decodes stays
+  within the byte target, and the scan holds nothing once it ends. Pinned tests cover loans
+  (repaid on close, on abort, after a failure; sized for a row's value lease and buffers), abort
+  at every suspension of a group scan and during a memory chunk's read, pacing over rejected
+  rows, and the charged scratch.
 
 ### Aggregation (`exec/agg/`)
 

@@ -8,8 +8,12 @@
  * - int64-family columns decode into the f64 `safe` representation when the pages prove it
  *   (`isSafe`), else into a BigInt64Array; decimals into the chunk's scale or per-slot scales, the
  *   int128 tier when the chunk needs it, specials when it has them.
- * - Varlen bytes grow to what `varlenBytes` / `gatherBytes` say (full value lengths, out-of-line
- *   values included), charged first; the caller sizes batches so that stays bounded.
+ * - Buffers are sized to the rows a decode needs (at least `MIN_ROWS`, doubling, at most
+ *   `capacity`), so a small grant's small batches take small buffers. Varlen bytes grow to what
+ *   `varlenBytes` / `gatherBytes` say (full value lengths, out-of-line values included).
+ * - Sizing reads the same layout description as decoding (`shapeOf`): `outputBytes` is what a
+ *   decode produces (fixed and variable parts) and `growthFor` what it newly charges, so a scan
+ *   bounds batches and reserves memory before it decodes anything.
  * The vector returned is valid until the next decode into the same target.
  */
 import type { PhysicalType } from "../types.js";
@@ -49,11 +53,65 @@ function dictionaryIdOf(dictionary: FlatVector): number {
 
 type Typed = Uint8Array | Uint16Array | Uint32Array | Int32Array | Float32Array | Float64Array;
 
+/** One reusable buffer of a target: its element type and how many elements `rows` rows need. */
+interface BufferSpec<T extends Typed | BigInt64Array> {
+  readonly name: string;
+  readonly Type: { new (length: number): T; readonly BYTES_PER_ELEMENT: number };
+  readonly elements: (rows: number) => number;
+  /** Stands in for the buffer while a decode is only being sized. */
+  readonly empty: T;
+}
+
+function spec<T extends Typed | BigInt64Array>(
+  name: string,
+  Type: { new (length: number): T; readonly BYTES_PER_ELEMENT: number },
+  perRow = 1,
+  extra = 0,
+): BufferSpec<T> {
+  return { name, Type, elements: (rows) => perRow * rows + extra, empty: new Type(0) };
+}
+
+const VALIDITY: BufferSpec<Uint32Array> = {
+  name: "validity",
+  Type: Uint32Array,
+  elements: (rows) => (rows + 31) >>> 5,
+  empty: new Uint32Array(0),
+};
+const CODES = spec("codes", Int32Array);
+const U8 = spec("u8", Uint8Array);
+const I32 = spec("i32", Int32Array);
+const F32 = spec("f32", Float32Array);
+const F64 = spec("f64", Float64Array);
+const I64 = spec("i64", BigInt64Array);
+const MONTHS = spec("months", Int32Array);
+const DAYS = spec("days", Int32Array);
+const FIXED16 = spec("fixed16", Uint8Array, 16);
+const SCALES = spec("scales", Uint16Array);
+const LIMBS = spec("limbs", Uint32Array, 4);
+const SPECIALS = spec("specials", Uint8Array);
+const OFFSETS = spec("offsets", Int32Array, 1, 1);
+const NO_BYTES = new Uint8Array(0);
+
+/** Fixed buffers grow to at least this many rows (fewer reallocations for small batches). */
+const MIN_ROWS = 64;
+
+/** What a decode takes from a target: its buffers (by spec) and varlen bytes. */
+interface Use {
+  buffer<T extends Typed | BigInt64Array>(spec: BufferSpec<T>): T;
+  varlen(bytes: number): Uint8Array;
+}
+
+/** What a decode of a spec produces: dictionary codes, or flat data (validity in both). */
+type Shape =
+  | { readonly codes: Int32Array; readonly validity: Uint32Array; readonly dictionary: FlatVector }
+  | { readonly data: VectorData; readonly validity: Uint32Array };
+
 export class ColumnTarget {
   readonly #memory: TargetMemory;
   readonly #layout: ReturnType<typeof layoutOf>;
   #charged = 0;
-  readonly #buffers = new Map<string, Typed | BigInt64Array>();
+  /** Buffers by name, with the rows each was made for (at most `capacity`). */
+  readonly #buffers = new Map<string, { array: Typed | BigInt64Array; rows: number }>();
   #bytes: Uint8Array = new Uint8Array(0);
 
   constructor(
@@ -65,26 +123,38 @@ export class ColumnTarget {
     this.#layout = layoutOf(type);
   }
 
-  /** A buffer `name` of `length` elements, made (charged first) on first use. */
-  #buffer<T extends Typed | BigInt64Array>(
-    name: string,
-    Type: { new (length: number): T; readonly BYTES_PER_ELEMENT: number },
-    length: number,
-  ): T {
-    const existing = this.#buffers.get(name);
-    if (existing !== undefined) return existing as T;
-    const bytes = length * Type.BYTES_PER_ELEMENT;
+  /** The rows a buffer made for `held` rows grows to for a decode of `rows` (0: no growth). */
+  #grownRows(held: number, rows: number): number {
+    if (held >= rows) return 0;
+    return Math.min(this.capacity, Math.max(rows, 2 * held, MIN_ROWS));
+  }
+
+  /**
+   * Buffer `spec` with room for `rows` rows: grown (the new one charged first, then the old one
+   * given back), or made on first use.
+   */
+  #buffer<T extends Typed | BigInt64Array>(spec: BufferSpec<T>, rows: number): T {
+    const existing = this.#buffers.get(spec.name);
+    const held = existing?.rows ?? 0;
+    const grown = this.#grownRows(held, rows);
+    if (existing !== undefined && grown === 0) return existing.array as T;
+    const bytes = spec.elements(grown) * spec.Type.BYTES_PER_ELEMENT;
     this.#memory.take(bytes);
     this.#charged += bytes;
     let made: T;
     try {
-      made = new Type(length);
+      made = new spec.Type(spec.elements(grown));
     } catch (error) {
       this.#memory.give(bytes);
       this.#charged -= bytes;
       throw error;
     }
-    this.#buffers.set(name, made);
+    if (existing !== undefined) {
+      const old = existing.array.byteLength;
+      this.#memory.give(old);
+      this.#charged -= old;
+    }
+    this.#buffers.set(spec.name, { array: made, rows: grown });
     return made;
   }
 
@@ -93,19 +163,60 @@ export class ColumnTarget {
     return Math.max(bytes, 2 * this.#bytes.length, 4096);
   }
 
-  /**
-   * Bytes a decode needing `bytes` of varlen data newly takes (the new buffer, charged before the
-   * old one is given back), or 0 when the buffer is large enough.
-   */
-  growthFor(bytes: number): number {
+  /** Varlen bytes a decode needing `bytes` newly takes (0 when the buffer is large enough). */
+  #varlenGrowth(bytes: number): number {
     return this.#bytes.length >= bytes ? 0 : this.#grownSize(bytes);
   }
 
-  /** Gives back the varlen buffer (after an oversized row, before its loan is repaid). */
+  /**
+   * Bytes decoding `spec` newly takes from this target's memory: every buffer it grows (the new
+   * one, charged before the old one is given back) and the varlen buffer. Pages loaded.
+   */
+  growthFor(pages: ChunkPages, spec: DecodeSpec): number {
+    const rows = rowsOf(spec);
+    let bytes = 0;
+    this.#shape(pages, spec, {
+      buffer: (b) => {
+        // As `#buffer`: made on first use, or grown.
+        const existing = this.#buffers.get(b.name);
+        const grown = this.#grownRows(existing?.rows ?? 0, rows);
+        if (existing === undefined || grown > 0)
+          bytes += b.elements(grown) * b.Type.BYTES_PER_ELEMENT;
+        return b.empty;
+      },
+      varlen: (n) => {
+        bytes += this.#varlenGrowth(n);
+        return NO_BYTES;
+      },
+    });
+    return bytes;
+  }
+
+  /**
+   * Bytes of the vector decoding `spec` produces, as decoded: validity, codes or values, scales,
+   * limbs, specials, offsets and varlen bytes (full value lengths). Pages loaded.
+   */
+  static outputBytes(pages: ChunkPages, type: PhysicalType, spec: DecodeSpec): number {
+    const rows = rowsOf(spec);
+    let bytes = 0;
+    shapeOf(layoutOf(type), pages, spec, {
+      buffer: (b) => {
+        bytes += b.elements(rows) * b.Type.BYTES_PER_ELEMENT;
+        return b.empty;
+      },
+      varlen: (n) => {
+        bytes += n;
+        return NO_BYTES;
+      },
+    });
+    return bytes;
+  }
+
+  /** Gives back every buffer (after an oversized row, before its loan is repaid). */
   shrink(): void {
-    if (this.#bytes.length === 0) return;
-    this.#memory.give(this.#bytes.length);
-    this.#charged -= this.#bytes.length;
+    if (this.#charged > 0) this.#memory.give(this.#charged);
+    this.#charged = 0;
+    this.#buffers.clear();
     this.#bytes = new Uint8Array(0);
   }
 
@@ -129,32 +240,29 @@ export class ColumnTarget {
     return next;
   }
 
-  #validity(count: number): Validity {
-    const validity = this.#buffer("validity", Uint32Array, (this.capacity + 31) >>> 5);
-    validity.fill(0, 0, (count + 31) >>> 5);
-    return validity;
+  #shape(pages: ChunkPages, spec: DecodeSpec, use: Use): Shape {
+    return shapeOf(this.#layout, pages, spec, use);
   }
 
   /** Bytes a varlen decode of `spec` needs (0 for fixed-width columns). */
   static varlenBytesOf(pages: ChunkPages, type: PhysicalType, spec: DecodeSpec): number {
     const layout = layoutOf(type);
     if (layout !== "varlen") return 0;
-    return "from" in spec
-      ? pages.varlenBytes(spec.from, spec.to)
-      : pages.gatherBytes(spec.rows, 0, spec.count);
+    return varlenBytes(pages, spec);
   }
 
   /** Decodes `spec` (pages and out-of-line values loaded) into this target. */
   decode(pages: ChunkPages, spec: DecodeSpec): Vector {
-    const count = "from" in spec ? spec.to - spec.from : spec.count;
+    const count = rowsOf(spec);
     if (count > this.capacity) throw new RangeError("A decode larger than its target");
-    const [lo, hi] =
-      "from" in spec
-        ? [spec.from, spec.to]
-        : [spec.rows[0] ?? 0, (spec.rows[Math.max(0, spec.count - 1)] ?? 0) + 1];
-    if (count > 0 && pages.isDictionaryRange(lo, hi) && pages.dictionary !== null) {
-      const codes = this.#buffer("codes", Int32Array, this.capacity);
-      const validity = this.#validity(count);
+    const shape = this.#shape(pages, spec, {
+      buffer: (b) => this.#buffer(b, count),
+      varlen: (n) => this.#varlen(n),
+    });
+    const validity = shape.validity;
+    validity.fill(0, 0, (count + 31) >>> 5);
+    if ("codes" in shape) {
+      const codes = shape.codes;
       if ("from" in spec) pages.decodeCodes(spec.from, spec.to, codes, validity, 0);
       else pages.gatherCodes(spec.rows, codes, validity, 0, 0, spec.count);
       return {
@@ -163,72 +271,20 @@ export class ColumnTarget {
         length: count,
         codes,
         validity: allValid(validity, count) ? null : validity,
-        dictionary: pages.dictionary,
-        dictionaryId: dictionaryIdOf(pages.dictionary),
+        dictionary: shape.dictionary,
+        dictionaryId: dictionaryIdOf(shape.dictionary),
       };
     }
-    const [first, end] = pages.pagesInRange(lo, Math.max(hi, lo + 1));
     const target: FlatVector = {
       form: "flat",
       type: this.type,
       length: count,
-      validity: this.#validity(count),
-      data: this.#data(pages, spec, first, end),
+      validity,
+      data: shape.data,
     };
     if ("from" in spec) pages.decodeRange(spec.from, spec.to, target, 0);
     else pages.gather(spec.rows, target, 0, 0, spec.count);
     return allValid(target.validity, count) ? { ...target, validity: null } : target;
-  }
-
-  #int64(pages: ChunkPages, first: number, end: number): Int64Values {
-    return pages.isSafe(first, end)
-      ? { repr: "safe", values: this.#buffer("f64", Float64Array, this.capacity) }
-      : { repr: "int64", values: this.#buffer("i64", BigInt64Array, this.capacity) };
-  }
-
-  #data(pages: ChunkPages, spec: DecodeSpec, first: number, end: number): VectorData {
-    const capacity = this.capacity;
-    switch (this.#layout) {
-      case "bool":
-        return { layout: "bool", values: this.#buffer("u8", Uint8Array, capacity) };
-      case "i32":
-        return { layout: "i32", values: this.#buffer("i32", Int32Array, capacity) };
-      case "f32":
-        return { layout: "f32", values: this.#buffer("f32", Float32Array, capacity) };
-      case "f64":
-        return { layout: "f64", values: this.#buffer("f64", Float64Array, capacity) };
-      case "int64":
-        return { layout: "int64", values: this.#int64(pages, first, end) };
-      case "interval":
-        return {
-          layout: "interval",
-          months: this.#buffer("months", Int32Array, capacity),
-          days: this.#buffer("days", Int32Array, capacity),
-          micros: this.#int64(pages, first, end),
-        };
-      case "fixed16":
-        return { layout: "fixed16", bytes: this.#buffer("fixed16", Uint8Array, 16 * capacity) };
-      case "decimal": {
-        const scale = pages.directory.scale;
-        return {
-          layout: "decimal",
-          scale,
-          scales: scale === null ? this.#buffer("scales", Uint16Array, capacity) : null,
-          coefficients: pages.needsInt128
-            ? { repr: "int128", limbs: this.#buffer("limbs", Uint32Array, 4 * capacity) }
-            : this.#int64(pages, first, end),
-          specials: pages.hasDecimalSpecials
-            ? this.#buffer("specials", Uint8Array, capacity)
-            : null,
-        };
-      }
-      case "varlen":
-        return {
-          layout: "varlen",
-          bytes: this.#varlen(ColumnTarget.varlenBytesOf(pages, this.type, spec)),
-          offsets: this.#buffer("offsets", Int32Array, capacity + 1),
-        };
-    }
   }
 
   /** Bytes this target holds from its memory. */
@@ -237,11 +293,92 @@ export class ColumnTarget {
   }
 
   close(): void {
-    if (this.#charged > 0) this.#memory.give(this.#charged);
-    this.#charged = 0;
-    this.#buffers.clear();
-    this.#bytes = new Uint8Array(0);
+    this.shrink();
   }
+}
+
+function rowsOf(spec: DecodeSpec): number {
+  return "from" in spec ? spec.to - spec.from : spec.count;
+}
+
+function varlenBytes(pages: ChunkPages, spec: DecodeSpec): number {
+  return "from" in spec
+    ? pages.varlenBytes(spec.from, spec.to)
+    : pages.gatherBytes(spec.rows, 0, spec.count);
+}
+
+/**
+ * The buffers a decode of `spec` uses (through `use`): the one description both sizing
+ * (`growthFor`, `outputBytes`) and decoding read, so they cannot disagree.
+ */
+function shapeOf(
+  layout: ReturnType<typeof layoutOf>,
+  pages: ChunkPages,
+  spec: DecodeSpec,
+  use: Use,
+): Shape {
+  const count = rowsOf(spec);
+  const [lo, hi] =
+    "from" in spec
+      ? [spec.from, spec.to]
+      : [spec.rows[0] ?? 0, (spec.rows[Math.max(0, spec.count - 1)] ?? 0) + 1];
+  const dictionary = pages.dictionary;
+  if (count > 0 && dictionary !== null && pages.isDictionaryRange(lo, hi))
+    return { codes: use.buffer(CODES), validity: use.buffer(VALIDITY), dictionary };
+  const validity = use.buffer(VALIDITY);
+  const [first, end] = pages.pagesInRange(lo, Math.max(hi, lo + 1));
+  const int64 = (): Int64Values =>
+    pages.isSafe(first, end)
+      ? { repr: "safe", values: use.buffer(F64) }
+      : { repr: "int64", values: use.buffer(I64) };
+  let data: VectorData;
+  switch (layout) {
+    case "bool":
+      data = { layout: "bool", values: use.buffer(U8) };
+      break;
+    case "i32":
+      data = { layout: "i32", values: use.buffer(I32) };
+      break;
+    case "f32":
+      data = { layout: "f32", values: use.buffer(F32) };
+      break;
+    case "f64":
+      data = { layout: "f64", values: use.buffer(F64) };
+      break;
+    case "int64":
+      data = { layout: "int64", values: int64() };
+      break;
+    case "interval":
+      data = {
+        layout: "interval",
+        months: use.buffer(MONTHS),
+        days: use.buffer(DAYS),
+        micros: int64(),
+      };
+      break;
+    case "fixed16":
+      data = { layout: "fixed16", bytes: use.buffer(FIXED16) };
+      break;
+    case "decimal": {
+      const scale = pages.directory.scale;
+      data = {
+        layout: "decimal",
+        scale,
+        scales: scale === null ? use.buffer(SCALES) : null,
+        coefficients: pages.needsInt128 ? { repr: "int128", limbs: use.buffer(LIMBS) } : int64(),
+        specials: pages.hasDecimalSpecials ? use.buffer(SPECIALS) : null,
+      };
+      break;
+    }
+    case "varlen":
+      data = {
+        layout: "varlen",
+        bytes: use.varlen(varlenBytes(pages, spec)),
+        offsets: use.buffer(OFFSETS),
+      };
+      break;
+  }
+  return { data, validity };
 }
 
 function allValid(validity: Validity | null, count: number): boolean {

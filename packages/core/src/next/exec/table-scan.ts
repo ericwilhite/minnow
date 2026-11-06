@@ -7,25 +7,41 @@
  * - **Prune.** The filter's pushable conjuncts (exec/pushdown.ts) are compiled per column chunk;
  *   a group whose chunk statistics rule one out is skipped without reading a page.
  * - **Select.** Per range of `BATCH_ROWS` positions: the live rows (`deletions().liveRows`), then
- *   each pushed conjunct `select`s (or `refine`s) qualifying positions on encoded pages, loading
- *   only the pages it cannot rule out.
- * - **Decode.** At or above `DENSE_SELECTION` of the range the output columns decode densely
- *   (`decodeRange`, the selection kept); below it only the selected positions (`gather`, a compact
- *   batch). With a residual (conjuncts not pushed down), its columns decode first, the residual
- *   narrows the candidates, and only then are the other columns gathered for the survivors.
+ *   each pushed conjunct `select`s qualifying positions on encoded pages (over a whole range,
+ *   loading only the pages it cannot rule out) or `refine`s them (loading the pages they touch).
+ * - **Decode.** At or above `DENSE_SELECTION` of the range every output column decodes densely
+ *   (`decodeRange`, the selection kept; the residual then narrows it); below it only the selected
+ *   positions (`gather`, a compact batch). There, with a residual (conjuncts not pushed down), its
+ *   columns decode first, the residual narrows the candidates, and only then are the other
+ *   columns gathered for the survivors.
  * - **Out-of-line values** (page/large-value.ts) are loaded for exactly what is decoded
  *   (`loadValues` for a dense range, `loadValuesOf` for positions) and released when the batch's
  *   borrow ends; pages before the next range are released as the scan moves on.
- * - **Byte-bounded batches.** Varlen bytes (`varlenBytes` / `gatherBytes`: full value lengths) are
- *   known before any value is read; a batch that would pass `targetBytes` decodes a prefix of its
- *   positions and resumes with the rest. One row larger than the target is a batch of its own; if
- *   the grant refuses even that row's bytes, the scan borrows a progress loan for them (ruling
- *   R18.3, memory/governor.ts rule 5) and repays it once that batch's borrow ends.
+ * - **Byte-bounded batches.** A batch's decoded bytes (ColumnTarget.outputBytes: validity, values
+ *   or codes, scales, limbs, specials, offsets, varlen bytes at full value lengths; plus
+ *   locators) are known from page headers before any value is read; a batch that would pass
+ *   `targetBytes` decodes a prefix of its positions and resumes with the rest. One row larger
+ *   than the target is a batch of its own.
+ * - **Reserved working set.** Before decoding, the scan prepays the batch's working set: the
+ *   out-of-line values it leases and every target buffer it grows (`ScanMemory`, which both the
+ *   targets and the chunk readers charge, draws on that reserve first). A refusal halves the
+ *   batch; for one row the scan borrows a progress loan (ruling R18.3, memory/governor.ts rule 5)
+ *   for it, and repays it once that batch's borrow ends and its buffers and values are back.
  * - A column the group predates reads `ColumnDef.missing` (a constant).
  *
  * ## Memory segments
  * Read through `MemorySegmentScan` (exec/memory-scan.ts: one borrowed chunk at a time, zero copy
  * while resident); the whole filter is the residual there.
+ *
+ * ## Pacing and ending (ruling R23)
+ * - Work inside one `next()` that has emitted nothing yet (ranges, chunks and groups filtered or
+ *   pruned away) yields with a task every `yieldIntervalMs`, so a long run of rejected rows does
+ *   not hold the owner.
+ * - At the end of the table the scan releases everything it holds (readers, values, buffers,
+ *   scratch) and repays a loan. `abort` (a cancellation, an error, a LIMIT; `close` is the same)
+ *   does so at once; a `next()` suspended on a read then resolves null: whatever settles after
+ *   the abort (a reader opened, a loan served) is closed or repaid, and nothing more is read,
+ *   decoded or emitted.
  *
  * ## Borrowing, sync-when-cached
  * A batch's vectors are the scan's own buffers (or a memory segment's lent chunk), valid until the
@@ -35,23 +51,26 @@
  */
 import type { MaybePromise } from "../access/key-index.js";
 import type { ColumnDef } from "../access/catalog.js";
-import type {
-  ChunkOutput,
-  DeletionVector,
-  GroupSegment,
-  MemorySegment,
-  Segment,
-  TableSnapshot,
+import {
+  MEMORY_CHUNK_ROWS,
+  type ChunkOutput,
+  type DeletionVector,
+  type GroupSegment,
+  type MemorySegment,
+  type Segment,
+  type TableSnapshot,
 } from "../access/snapshot.js";
 import type { ByteBudget, SpaceReader } from "../access/space.js";
 import type { ScalarExpr } from "../ir/ir.js";
 import type { Loan } from "../memory/governor.js";
 import type { PhysicalType } from "../types.js";
 import { LOCATOR_POSITIONS } from "../vector/locator.js";
+import { allocateSelection } from "../vector/validity.js";
 import {
   BATCH_ROWS,
   BATCH_TARGET_BYTES,
   allocateFlat,
+  dataBytes,
   type Batch,
   type FlatVector,
   type Selection,
@@ -61,7 +80,13 @@ import { ColumnTarget, type DecodeSpec, type TargetMemory } from "./column-targe
 import { Predicate } from "./filter.js";
 import type { CompileContext } from "./kernels/compile.js";
 import { MemorySegmentScan } from "./memory-scan.js";
-import { isPromise, type BatchSource, type SourceItem } from "./pipeline.js";
+import {
+  YIELD_INTERVAL_MS,
+  isPromise,
+  yieldTask,
+  type BatchSource,
+  type SourceItem,
+} from "./pipeline.js";
 import {
   CompiledFallback,
   pushedColumn,
@@ -96,6 +121,8 @@ export interface ScanStats {
   /** Pushed conjuncts per chunk evaluated on encoded pages (B2), and on decoded values. */
   encodedPredicates: number;
   decodedPredicates: number;
+  /** Task yields inside a `next()` that had not emitted yet (R23 pacing). */
+  yields: number;
 }
 
 export interface TableScanOptions {
@@ -121,26 +148,19 @@ export interface TableScanOptions {
   /** False: no pushdown, dense decode, the whole filter on decoded values (decode-then-filter). */
   readonly pushdown?: boolean;
   readonly targetBytes?: number;
+  /** Synchronous work inside one `next()` between task yields (default `YIELD_INTERVAL_MS`). */
+  readonly yieldIntervalMs?: number;
+  /** The clock in ms (default `performance.now`); injectable for tests. */
+  readonly now?: () => number;
 }
 
 // ── Sync-when-possible steps ────────────────────────────────────────────────────────────────
 
 type Step<T> = Generator<Promise<unknown>, T, unknown>;
 
-/** Waits for `value` only when it is a Promise. */
-function* wait<T>(value: MaybePromise<T>): Step<T> {
-  return isPromise(value) ? ((yield value) as T) : value;
-}
-
-/** Runs a step generator, synchronously until it yields a Promise. */
-function run<T>(step: Step<T>, input?: unknown, failure?: { error: unknown }): MaybePromise<T> {
-  const result = failure === undefined ? step.next(input) : step.throw(failure.error);
-  if (result.done) return result.value;
-  return result.value.then(
-    (value) => run(step, value),
-    (error: unknown) => run(step, undefined, { error }),
-  );
-}
+/** Thrown into a step resumed after `abort`: it unwinds (closing what it opened) to `next`. */
+class ScanAborted extends Error {}
+const ABORTED = new ScanAborted("The scan was aborted");
 
 // ── Group segments ──────────────────────────────────────────────────────────────────────────
 
@@ -159,8 +179,7 @@ interface OpenGroup {
   readonly deletions: DeletionVector | null;
   /** Next range start. */
   from: number;
-  /** Positions still to emit from the current range (a byte-bounded batch left them). */
-  pending: Uint16Array;
+  /** Positions (in the scan's `#pending`) still to emit from the current range. */
   pendingCount: number;
   pendingFrom: number;
   pendingTo: number;
@@ -168,20 +187,33 @@ interface OpenGroup {
   fresh: boolean;
 }
 
-/** Memory charged through the scan's budget; `reserve` holds bytes taken ahead of a decode. */
-class ScanMemory implements TargetMemory {
+/**
+ * Memory charged through the scan's budget: its own buffers (`take`) and, as the `ByteBudget` its
+ * chunk readers charge, their page and value leases. `reserve` holds bytes taken ahead of a
+ * decode; both kinds of charge draw on it first, so one prepayment covers a decode's whole
+ * working set (values leased and the buffers decoded into).
+ */
+class ScanMemory implements TargetMemory, ByteBudget {
   reserve = 0;
   constructor(readonly budget: ByteBudget) {}
-  take(bytes: number): void {
-    if (this.reserve >= bytes) {
+  allocate(bytes: number): boolean {
+    if (bytes <= this.reserve) {
       this.reserve -= bytes;
-      return;
+      return true;
     }
-    if (!this.budget.allocate(bytes))
+    if (!this.budget.allocate(bytes - this.reserve)) return false;
+    this.reserve = 0;
+    return true;
+  }
+  free(bytes: number): void {
+    this.budget.free(bytes);
+  }
+  take(bytes: number): void {
+    if (!this.allocate(bytes))
       throw new RangeError(`A ${String(bytes)}-byte scan buffer was refused by its grant`);
   }
   give(bytes: number): void {
-    this.budget.free(bytes);
+    this.free(bytes);
   }
   /** Takes `bytes` ahead of a decode; false when the budget refuses. */
   prepay(bytes: number): boolean {
@@ -197,6 +229,11 @@ class ScanMemory implements TargetMemory {
   }
 }
 
+/** The scan's fixed scratch: position lists, selections and (with `emitLocator`) locators. */
+function scratchBytes(emitLocator: boolean): number {
+  return 5 * BATCH_ROWS * Uint16Array.BYTES_PER_ELEMENT + (emitLocator ? BATCH_ROWS * 8 : 0);
+}
+
 export class TableScan implements BatchSource {
   readonly stats: ScanStats = {
     groupsPruned: 0,
@@ -209,6 +246,7 @@ export class TableScan implements BatchSource {
     loans: 0,
     encodedPredicates: 0,
     decodedPredicates: 0,
+    yields: 0,
   };
   readonly #options: TableScanOptions;
   readonly #defs: readonly ColumnDef[];
@@ -218,22 +256,31 @@ export class TableScan implements BatchSource {
   readonly #residual: Predicate | null;
   /** Output columns the residual reads (decoded first on the gather path). */
   readonly #residualColumns: ReadonlySet<number>;
+  readonly #all: readonly number[];
   readonly #memory: ScanMemory;
   readonly #targets: ColumnTarget[];
-  readonly #positions = new Uint16Array(BATCH_ROWS);
-  readonly #survivors = new Uint16Array(BATCH_ROWS);
-  readonly #selection: Selection = { rows: new Uint16Array(BATCH_ROWS), count: 0 };
-  readonly #live: Selection = { rows: new Uint16Array(BATCH_ROWS), count: 0 };
+  readonly #scratchBytes: number;
+  readonly #positions: Uint16Array;
+  readonly #survivors: Uint16Array;
+  /** The open group's positions still to emit (one group is open at a time). */
+  readonly #pending: Uint16Array;
+  readonly #selection: Selection;
+  readonly #live: Selection;
   readonly #locators: Float64Array;
   readonly #locatorType: PhysicalType;
   readonly #placeholder: Vector;
   readonly #target: number;
+  readonly #interval: number;
+  readonly #now: () => number;
+  #sliceStart = 0;
   #segment = 0;
   #group: OpenGroup | null = null;
   #memoryScan: MemorySegmentScan | null = null;
-  #memoryOut: ChunkOutput[] | null = null;
+  /** Memory segments' staging (re-pointed chunks decode into it) and selection, charged. */
+  #memoryOut: { out: ChunkOutput[]; selection: Selection; bytes: number } | null = null;
   #loan: Loan | null = null;
   #aborted = false;
+  #released = false;
 
   constructor(options: TableScanOptions) {
     this.#options = options;
@@ -244,6 +291,7 @@ export class TableScan implements BatchSource {
       return def;
     });
     this.#types = this.#defs.map((def) => def.type);
+    this.#all = this.#defs.map((_, c) => c);
     const context: CompileContext = { ...options.context, input: this.#types };
     const split =
       options.pushdown === false
@@ -257,7 +305,21 @@ export class TableScan implements BatchSource {
     this.#residualColumns = new Set(split.residual === null ? [] : columnsOf(split.residual));
     this.#memory = new ScanMemory(options.budget);
     this.#targets = this.#types.map((type) => new ColumnTarget(type, BATCH_ROWS, this.#memory));
-    this.#locators = new Float64Array(BATCH_ROWS);
+    // The scratch is charged before it is built (a refusal throws, holding nothing).
+    const scratch = scratchBytes(options.emitLocator);
+    this.#memory.take(scratch);
+    try {
+      this.#positions = new Uint16Array(BATCH_ROWS);
+      this.#survivors = new Uint16Array(BATCH_ROWS);
+      this.#pending = new Uint16Array(BATCH_ROWS);
+      this.#selection = { rows: new Uint16Array(BATCH_ROWS), count: 0 };
+      this.#live = { rows: new Uint16Array(BATCH_ROWS), count: 0 };
+      this.#locators = new Float64Array(options.emitLocator ? BATCH_ROWS : 0);
+    } catch (error) {
+      this.#memory.give(scratch);
+      throw error;
+    }
+    this.#scratchBytes = scratch;
     this.#locatorType = { kind: "locator", tableId: table.tableId };
     this.#placeholder = {
       form: "constant",
@@ -266,10 +328,64 @@ export class TableScan implements BatchSource {
       value: allocateFlat({ kind: "bool" }, 1),
     };
     this.#target = options.targetBytes ?? BATCH_TARGET_BYTES;
+    this.#interval = options.yieldIntervalMs ?? YIELD_INTERVAL_MS;
+    this.#now = options.now ?? (() => performance.now());
   }
 
   next(): MaybePromise<SourceItem | null> {
-    return run(this.#next());
+    this.#sliceStart = this.#now();
+    return this.#run(this.#next());
+  }
+
+  /**
+   * Runs a step generator, synchronously until it yields a Promise. After `abort`, a resumed step
+   * is thrown `ABORTED` (a rejection, often the abort's own doing, too), so it unwinds through its
+   * cleanup and `next` ends with null.
+   */
+  #run(
+    step: Step<SourceItem | null>,
+    input?: unknown,
+    failure?: { error: unknown },
+  ): MaybePromise<SourceItem | null> {
+    let result: IteratorResult<Promise<unknown>, SourceItem | null>;
+    try {
+      if (failure !== undefined) result = step.throw(this.#aborted ? ABORTED : failure.error);
+      else result = step.next(input);
+    } catch (error) {
+      if (error === ABORTED) return null;
+      throw error;
+    }
+    if (result.done) return result.value;
+    return result.value.then(
+      (value) => this.#run(step, value),
+      (error: unknown) => this.#run(step, undefined, { error }),
+    );
+  }
+
+  /**
+   * Waits for `value` only when it is a Promise; resumed after `abort`, disposes of what it
+   * resolved to (a reader opened, a loan served) and unwinds.
+   */
+  *#wait<T>(value: MaybePromise<T>, dispose?: (value: T) => void): Step<T> {
+    if (!isPromise(value)) return value;
+    const resolved = (yield value) as T;
+    if (this.#aborted) {
+      dispose?.(resolved);
+      throw ABORTED;
+    }
+    return resolved;
+  }
+
+  /**
+   * Scan progress that emits nothing (ranges, chunks and groups filtered or pruned away) yields
+   * with a task once `yieldIntervalMs` has passed since `next` began (ruling R23), so a long run
+   * of rejected rows does not hold the owner for the whole table.
+   */
+  *#pace(): Step<void> {
+    if (this.#now() - this.#sliceStart < this.#interval) return;
+    this.stats.yields += 1;
+    yield* this.#wait(yieldTask());
+    this.#sliceStart = this.#now();
   }
 
   *#next(): Step<SourceItem | null> {
@@ -277,7 +393,11 @@ export class TableScan implements BatchSource {
     for (;;) {
       if (this.#aborted) return null;
       const segment: Segment | undefined = this.#options.table.segments[this.#segment];
-      if (segment === undefined) return null;
+      if (segment === undefined) {
+        // The end: the last batch's borrow has ended, so everything goes back now.
+        this.#release();
+        return null;
+      }
       const item =
         segment.kind === "group"
           ? yield* this.#fromGroup(segment)
@@ -285,6 +405,7 @@ export class TableScan implements BatchSource {
       if (item !== null) return item;
       this.#closeSegment();
       this.#segment += 1;
+      yield* this.#pace();
     }
   }
 
@@ -294,33 +415,67 @@ export class TableScan implements BatchSource {
     if (group !== null) for (const column of group.columns) column.pages?.releaseValues();
     this.#memory.settle();
     if (this.#loan !== null) {
-      // The oversized buffer goes back first, so the loan's bytes are free to repay.
+      // The oversized buffers go back first, so the loan's bytes are free to repay.
       for (const target of this.#targets) target.shrink();
-      this.#loan.repay();
-      this.#loan = null;
+      try {
+        this.#repay();
+      } catch {
+        // Still allocated elsewhere in the grant: kept, and retried (next batch, `close`).
+      }
     }
+  }
+
+  /** Repays an outstanding loan (Loan: throws, changing nothing, while its bytes are in use). */
+  #repay(): void {
+    const loan = this.#loan;
+    if (loan === null) return;
+    loan.repay();
+    this.#loan = null;
   }
 
   // ── Memory segments ──
 
+  #memoryBuffers(): { out: ChunkOutput[]; selection: Selection } {
+    if (this.#memoryOut !== null) return this.#memoryOut;
+    const bytes =
+      this.#types.reduce((sum, type) => sum + dataBytes(type, BATCH_ROWS), 0) +
+      this.#types.length * BATCH_ROWS * Int32Array.BYTES_PER_ELEMENT +
+      MEMORY_CHUNK_ROWS * Uint16Array.BYTES_PER_ELEMENT;
+    this.#memory.take(bytes);
+    try {
+      this.#memoryOut = {
+        out: this.#types.map((type) => ({
+          flat: allocateFlat(type, BATCH_ROWS),
+          codes: new Int32Array(BATCH_ROWS),
+          varlen: null,
+        })),
+        selection: allocateSelection(MEMORY_CHUNK_ROWS),
+        bytes,
+      };
+    } catch (error) {
+      this.#memory.give(bytes);
+      throw error;
+    }
+    return this.#memoryOut;
+  }
+
   *#fromMemory(segment: MemorySegment): Step<SourceItem | null> {
     if (this.#memoryScan === null) {
-      this.#memoryOut ??= this.#types.map((type) => ({
-        flat: allocateFlat(type, BATCH_ROWS),
-        codes: new Int32Array(BATCH_ROWS),
-        varlen: null,
-      }));
-      this.#memoryScan = new MemorySegmentScan([segment], this.#options.columns, this.#memoryOut);
+      const { out, selection } = this.#memoryBuffers();
+      this.#memoryScan = new MemorySegmentScan([segment], this.#options.columns, out, selection);
     }
     const scan = this.#memoryScan;
     for (;;) {
-      const item = yield* wait(scan.next());
+      const item = yield* this.#wait(scan.next());
       if (item === null) return null;
       let batch = item.batch;
       if (this.#options.filter !== null) {
         const predicate = this.#memoryPredicate();
         const rows = predicate.select(batch);
-        if (rows.count === 0) continue;
+        if (rows.count === 0) {
+          yield* this.#pace();
+          continue;
+        }
         batch = { ...batch, selection: rows };
       }
       this.stats.memoryBatches += 1;
@@ -358,7 +513,7 @@ export class TableScan implements BatchSource {
   // ── Group segments ──
 
   *#open(segment: GroupSegment): Step<OpenGroup | null> {
-    yield* wait(segment.root());
+    yield* this.#wait(segment.root());
     const columns: GroupColumn[] = [];
     const opened: ChunkPages[] = [];
     try {
@@ -369,8 +524,12 @@ export class TableScan implements BatchSource {
           columns.push({ pages: null, missing: def.missing ?? nullOf(def.type) });
           continue;
         }
-        const pages = yield* wait(
-          this.#options.reads.open(this.#options.pages, chunk, { budget: this.#options.budget }),
+        // Its page and value leases are charged through the scan's memory (see `ScanMemory`).
+        const pages = yield* this.#wait(
+          this.#options.reads.open(this.#options.pages, chunk, { budget: this.#memory }),
+          (late) => {
+            late.close();
+          },
         );
         opened.push(pages);
         columns.push({ pages, missing: null });
@@ -409,7 +568,7 @@ export class TableScan implements BatchSource {
         else this.stats.decodedPredicates += 1;
         pushed.push(compiled);
       }
-      const deletions = yield* wait(segment.deletions());
+      const deletions = yield* this.#wait(segment.deletions());
       this.stats.groupsRead += 1;
       return {
         segment,
@@ -417,7 +576,6 @@ export class TableScan implements BatchSource {
         pushed,
         deletions,
         from: 0,
-        pending: new Uint16Array(BATCH_ROWS),
         pendingCount: 0,
         pendingFrom: 0,
         pendingTo: 0,
@@ -447,6 +605,7 @@ export class TableScan implements BatchSource {
       if (group.pendingCount > 0) {
         const item = yield* this.#emitPositions(group, group.pendingFrom, group.pendingTo);
         if (item !== null) return item;
+        yield* this.#pace();
         continue;
       }
       if (group.from >= segment.rowCount) return null;
@@ -470,23 +629,25 @@ export class TableScan implements BatchSource {
         if (count === 0) break;
         if (pushed === ALWAYS) continue;
         if (all) {
-          yield* wait(pushed.prepare(from, to));
+          yield* this.#wait(pushed.prepare(from, to));
           count = pushed.select(from, to, positions);
           all = false;
         } else {
-          yield* wait(pushed.prepareRows(positions, count));
+          yield* this.#wait(pushed.prepareRows(positions, count));
           count = pushed.refine(positions, count);
         }
       }
-      if (count === 0) continue;
-      if (all) for (let k = 0; k < count; k++) positions[k] = from + k;
-      group.pending.set(positions.subarray(0, count));
-      group.pendingCount = count;
-      group.pendingFrom = from;
-      group.pendingTo = to;
-      group.fresh = true;
-      const item = yield* this.#emitPositions(group, from, to);
-      if (item !== null) return item;
+      if (count > 0) {
+        if (all) for (let k = 0; k < count; k++) positions[k] = from + k;
+        this.#pending.set(positions.subarray(0, count));
+        group.pendingCount = count;
+        group.pendingFrom = from;
+        group.pendingTo = to;
+        group.fresh = true;
+        const item = yield* this.#emitPositions(group, from, to);
+        if (item !== null) return item;
+      }
+      yield* this.#pace();
     }
   }
 
@@ -501,61 +662,85 @@ export class TableScan implements BatchSource {
     }
   }
 
-  /** Varlen bytes the given output columns need for `spec`. */
-  #bytesFor(group: OpenGroup, spec: DecodeSpec, columns: readonly number[]): number {
-    let bytes = 0;
-    for (const c of columns) {
-      const pages = group.columns[c]?.pages ?? null;
-      if (pages !== null) bytes += ColumnTarget.varlenBytesOf(pages, at(this.#types, c), spec);
+  /**
+   * Bytes of the batch decoding `spec` produces: every output column as decoded (validity, codes
+   * or values, varlen bytes; ColumnTarget.outputBytes) plus the locators. Pages loaded.
+   */
+  #bytesFor(group: OpenGroup, spec: DecodeSpec): number {
+    let bytes = this.#options.emitLocator ? 8 * rowsIn(spec) : 0;
+    for (let c = 0; c < this.#types.length; c++) {
+      const pages = at(group.columns, c).pages;
+      if (pages !== null) bytes += ColumnTarget.outputBytes(pages, at(this.#types, c), spec);
     }
     return bytes;
   }
 
-  /** Loads pages (and out-of-line values) of `columns` for `spec`. */
-  /** Loads the pages of `columns` that `spec` touches (sizing and decoding read them). */
-  *#loadPages(group: OpenGroup, spec: DecodeSpec, columns: readonly number[]): Step<void> {
-    for (const c of columns) {
-      const pages = group.columns[c]?.pages ?? null;
+  /** Loads the pages of every output column that `spec` touches (sizing and decoding read them). */
+  *#loadPages(group: OpenGroup, spec: DecodeSpec): Step<void> {
+    for (const column of group.columns) {
+      const pages = column.pages;
       if (pages === null) continue;
       if ("from" in spec) {
         const [first, end] = pages.pagesInRange(spec.from, spec.to);
-        yield* wait(pages.load(Array.from({ length: end - first }, (_, k) => first + k)));
-      } else yield* wait(pages.load(pages.pagesForRows(spec.rows, 0, spec.count)));
+        yield* this.#wait(pages.load(Array.from({ length: end - first }, (_, k) => first + k)));
+      } else yield* this.#wait(pages.load(pages.pagesForRows(spec.rows, 0, spec.count)));
     }
   }
 
   /** Loads pages, then the out-of-line values of exactly what `spec` decodes. */
   *#load(group: OpenGroup, spec: DecodeSpec, columns: readonly number[]): Step<void> {
-    yield* this.#loadPages(group, spec, columns);
     for (const c of columns) {
-      const pages = group.columns[c]?.pages ?? null;
+      const pages = at(group.columns, c).pages;
       if (pages === null) continue;
-      if ("from" in spec) yield* wait(pages.loadValues(spec.from, spec.to));
-      else yield* wait(pages.loadValuesOf(spec.rows, 0, spec.count));
+      if ("from" in spec) {
+        const [first, end] = pages.pagesInRange(spec.from, spec.to);
+        yield* this.#wait(pages.load(Array.from({ length: end - first }, (_, k) => first + k)));
+        yield* this.#wait(pages.loadValues(spec.from, spec.to));
+      } else {
+        yield* this.#wait(pages.load(pages.pagesForRows(spec.rows, 0, spec.count)));
+        yield* this.#wait(pages.loadValuesOf(spec.rows, 0, spec.count));
+      }
     }
   }
 
-  /** Charges what decoding `spec` into the targets of `columns` will grow, or borrows it. */
-  *#prepay(group: OpenGroup, spec: DecodeSpec, columns: readonly number[]): Step<boolean> {
-    let growth = 0;
-    for (const c of columns) {
-      const pages = group.columns[c]?.pages ?? null;
+  /**
+   * The working set decoding `spec` (every output column) newly takes: the out-of-line values
+   * leased for it and every target buffer it grows. Pages loaded.
+   */
+  #workingSet(group: OpenGroup, spec: DecodeSpec): number {
+    let bytes = 0;
+    for (let c = 0; c < this.#types.length; c++) {
+      const pages = at(group.columns, c).pages;
       if (pages === null) continue;
-      growth += at(this.#targets, c).growthFor(
-        ColumnTarget.varlenBytesOf(pages, at(this.#types, c), spec),
-      );
+      bytes +=
+        at(this.#targets, c).growthFor(pages, spec) +
+        ("from" in spec
+          ? pages.largeValueBytes(spec.from, spec.to)
+          : pages.largeValueBytesOf(spec.rows, 0, spec.count));
     }
-    if (this.#memory.prepay(growth)) return true;
-    const rows = "from" in spec ? spec.to - spec.from : spec.count;
-    if (rows > 1) return false; // the caller decodes fewer rows
-    // One row the grant cannot hold: a progress loan (R18.3), repaid when this batch's borrow ends.
+    return bytes;
+  }
+
+  /**
+   * Reserves the working set of decoding `spec` (`#workingSet`), so the decode cannot be refused
+   * halfway. False when the grant refuses a batch of several rows (the caller decodes fewer); for
+   * one row, borrows a progress loan for it (R18.3), repaid when the batch's borrow ends.
+   */
+  *#prepay(group: OpenGroup, spec: DecodeSpec): Step<boolean> {
+    const need = this.#workingSet(group, spec);
+    if (this.#memory.prepay(need)) return true;
+    if (rowsIn(spec) > 1) return false;
     const loans = this.#options.loans;
     if (loans === undefined)
-      throw new RangeError(`A ${String(growth)}-byte row was refused by the scan's grant`);
-    this.#loan = yield* wait(loans.borrow(growth));
+      throw new RangeError(`A ${String(need)}-byte row was refused by the scan's grant`);
+    // A grant has one loan at a time: an earlier one not yet repaid goes first (or this throws).
+    this.#repay();
+    this.#loan = yield* this.#wait(loans.borrow(need), (late) => {
+      late.repay();
+    });
     this.stats.loans += 1;
-    if (!this.#memory.prepay(growth))
-      throw new RangeError(`A ${String(growth)}-byte row was refused even after a loan`);
+    if (!this.#memory.prepay(need))
+      throw new RangeError(`A ${String(need)}-byte row was refused even after a loan`);
     return true;
   }
 
@@ -566,7 +751,7 @@ export class TableScan implements BatchSource {
     out: Vector[],
   ): Step<void> {
     yield* this.#load(group, spec, columns);
-    const length = "from" in spec ? spec.to - spec.from : spec.count;
+    const length = rowsIn(spec);
     for (const c of columns) {
       const column = at(group.columns, c);
       out[c] =
@@ -584,24 +769,32 @@ export class TableScan implements BatchSource {
   /**
    * Emits a batch from the pending positions of range `[from, to)`: dense or gathered, byte
    * bounded, the residual applied. Null when the residual left nothing (the caller goes on).
+   * What was reserved and not used goes back once the batch is decoded.
    */
   *#emitPositions(group: OpenGroup, from: number, to: number): Step<SourceItem | null> {
+    try {
+      return yield* this.#emitReserved(group, from, to);
+    } finally {
+      this.#memory.settle();
+    }
+  }
+
+  *#emitReserved(group: OpenGroup, from: number, to: number): Step<SourceItem | null> {
     const span = to - from;
-    const all = this.#defs.map((_, c) => c);
+    const all = this.#all;
     const count = group.pendingCount;
-    const positions = group.pending;
+    const positions = this.#pending;
     // Dense when enough of the range is selected and the whole range fits the byte target.
     const fresh = group.fresh;
     group.fresh = false;
     let dense = fresh && count >= span * DENSE_SELECTION;
     if (dense) {
       // Sizing reads page headers: the range's pages first (no values yet).
-      yield* this.#loadPages(group, { from, to }, all);
+      yield* this.#loadPages(group, { from, to });
       dense =
-        this.#bytesFor(group, { from, to }, all) <= this.#target &&
-        (yield* this.#prepay(group, { from, to }, all));
+        this.#bytesFor(group, { from, to }) <= this.#target &&
+        (yield* this.#prepay(group, { from, to }));
     }
-    if (!dense) yield* this.#loadPages(group, { rows: positions, count }, all);
     const columns: Vector[] = new Array<Vector>(this.#defs.length);
     if (dense) {
       yield* this.#decode(group, { from, to }, all, columns);
@@ -623,11 +816,17 @@ export class TableScan implements BatchSource {
       this.stats.denseBatches += 1;
       return { batch: this.#withLocators(batch, group, (k) => from + k) };
     }
-    // Gather: a prefix of the positions that fits the byte target (at least one row).
+    yield* this.#loadPages(group, { rows: positions, count });
+    // Gather: a prefix of the positions that fits the byte target (at least one row), then the
+    // grant (halving until it holds the prefix's working set, or one row under a loan).
     let take = count;
-    while (take > 1 && this.#bytesFor(group, { rows: positions, count: take }, all) > this.#target)
-      take = Math.max(1, Math.floor(take / 2));
-    while (!(yield* this.#prepay(group, { rows: positions, count: take }, all)))
+    for (;;) {
+      if (take <= 1) break;
+      const bytes = this.#bytesFor(group, { rows: positions, count: take });
+      if (bytes <= this.#target) break;
+      take = Math.max(1, Math.min(take - 1, Math.floor((take * this.#target) / bytes)));
+    }
+    while (!(yield* this.#prepay(group, { rows: positions, count: take })))
       take = Math.max(1, Math.floor(take / 2));
     if (take < count) this.stats.splits += 1;
     // The taken positions move to `#survivors` before `pending` is shifted (below).
@@ -638,7 +837,7 @@ export class TableScan implements BatchSource {
       // Residual columns first, for the candidates; the rest only for the survivors.
       const first = all.filter((c) => this.#residualColumns.has(c));
       const probe: Vector[] = all.map(() => this.#placeholder);
-      yield* this.#decode(group, { rows: positions, count: take }, first, probe);
+      yield* this.#decode(group, { rows: survivors, count: take }, first, probe);
       const rows = this.#residual.select({ length: take, columns: probe, selection: null });
       this.stats.residualBatches += 1;
       kept = rows.count;
@@ -650,12 +849,11 @@ export class TableScan implements BatchSource {
     if (kept === 0) return null;
     yield* this.#decode(group, { rows: survivors, count: kept }, all, columns);
     this.stats.gatherBatches += 1;
-    const emitted = survivors.slice(0, kept);
     return {
       batch: this.#withLocators(
         { length: kept, columns, selection: null },
         group,
-        (k) => emitted[k] ?? 0,
+        (k) => survivors[k] ?? 0,
       ),
     };
   }
@@ -673,18 +871,41 @@ export class TableScan implements BatchSource {
     this.#memoryScan = null;
   }
 
+  /**
+   * Gives back everything the scan holds (readers, pages, values, buffers, scratch, staging),
+   * then repays an outstanding loan (its bytes are free by then). Once; `#repay` retries.
+   */
+  #release(): void {
+    if (!this.#released) {
+      this.#released = true;
+      this.#memoryScan?.abort();
+      this.#closeSegment();
+      this.#memory.settle();
+      for (const target of this.#targets) target.close();
+      if (this.#memoryOut !== null) this.#memory.give(this.#memoryOut.bytes);
+      this.#memoryOut = null;
+      this.#memory.give(this.#scratchBytes);
+    }
+    this.#repay();
+  }
+
+  /**
+   * Ends the scan early (cancellation, an error, a LIMIT): everything is released and a loan
+   * repaid at once; a `next()` still pending resolves null without reading or decoding more.
+   */
   abort(): void {
     this.#aborted = true;
-    this.#memoryScan?.abort();
-    this.#closeSegment();
-    this.#memory.settle();
-    for (const target of this.#targets) target.close();
+    this.#release();
   }
 
   /** Releases every buffer and reader (after the last batch's borrow ended). */
   close(): void {
     this.abort();
   }
+}
+
+function rowsIn(spec: DecodeSpec): number {
+  return "from" in spec ? spec.to - spec.from : spec.count;
 }
 
 /** A pushed conjunct decided once for a missing column (it held). */
