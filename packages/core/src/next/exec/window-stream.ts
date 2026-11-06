@@ -28,7 +28,7 @@ import type { PhysicalType } from "../types.js";
 import type { FlatVector, Vector } from "../vector/vector.js";
 import { BATCH_ROWS } from "../vector/vector.js";
 import { ColumnStore, nullConstant } from "./column-store.js";
-import { keysEqual, type SortColumn } from "./sort-keys.js";
+import { keysEqual, markChanges, type SortColumn } from "./sort-keys.js";
 import type { Slice, SlicedJob } from "./slices.js";
 import type { SpilledRun } from "./spill-pages.js";
 import type { Charge, Pool, SpillIo } from "./spill-pool.js";
@@ -113,6 +113,8 @@ function needsCount(call: StreamFunction, ordered: boolean): boolean {
 /** Per-call state over the ring. */
 interface CallState {
   readonly call: StreamFunction;
+  /** A one-row NULL of the call's type (made once, for the gathers of NULL results). */
+  nullValue?: Vector;
   readonly frame: Frame;
   readonly exact: boolean;
   /** Ring arrays: argument value, validity, cumulative sum / count through the row, running extreme. */
@@ -221,6 +223,8 @@ export class PartitionStream {
   #keyOk = new Uint8Array(0);
   readonly #prev: ColumnStore;
   #prevVectors: Vector[] = [];
+  /** The current page's peer changes (`markChanges`), charged as it grows. */
+  #changed = new Uint8Array(0);
   readonly #orderColumns: readonly number[];
   readonly #gathers: Array<ColumnStore | null>;
   readonly #out: ColumnStore;
@@ -280,6 +284,8 @@ export class PartitionStream {
     if (this.#ringBytes > 0) this.host.charge.free(this.#ringBytes);
     this.#ringBytes = 0;
     this.#prev.close();
+    if (this.#changed.length > 0) this.host.charge.free(this.#changed.length);
+    this.#changed = new Uint8Array(0);
     this.#out.close();
     for (const state of this.#calls) {
       state.head?.close();
@@ -456,21 +462,39 @@ export class PartitionStream {
 
   // --- the main pass ---------------------------------------------------------------------
 
+  /** The page's peer changes into `#changed` (row r against row r − 1, for r ≥ 1). */
+  #pageChanges(page: Page): void {
+    if (this.#orderColumns.length === 0) return;
+    if (page.rows > this.#changed.length) {
+      const size = Math.max(page.rows, 2 * this.#changed.length, 512);
+      if (!this.host.charge.allocate(size - this.#changed.length))
+        throw new RangeError("A window stream's peer flags could not be allocated");
+      this.#changed = new Uint8Array(size);
+    }
+    this.#changed.fill(0, 0, page.rows);
+    markChanges(this.spec.types, this.spec.orderBy, page.columns, page.rows, this.#changed);
+  }
+
   /** Takes row `#read` from `page` (row r) into the ring. */
   #take(page: Page, r: number, keep: number): void {
     this.#fit(keep);
     const j = this.#read;
     const at = j - this.#base;
-    // Peer group: a new one when the ORDER BY keys differ from the previous row's.
+    // Peer group: a new one when the ORDER BY keys differ from the previous row's (within the
+    // page: its flags; its first row: the last row of the page before, kept in `#prev`).
     const columns = page.columns;
     const same =
-      j > 0 && keysEqual(this.spec.types, this.spec.orderBy, this.#prevVectors, 0, columns, r);
+      j > 0 &&
+      (this.#orderColumns.length === 0 ||
+        (r > 0
+          ? this.#changed[r] === 0
+          : keysEqual(this.spec.types, this.spec.orderBy, this.#prevVectors, 0, columns, r)));
     if (!same) {
       this.#groupStarts.push(j);
       this.#groups++;
     }
     this.#group[at] = this.#groups - 1;
-    if (this.#orderColumns.length > 0) {
+    if (this.#orderColumns.length > 0 && r === page.rows - 1) {
       this.#prev.reset();
       this.#prev.append(
         this.#orderColumns.map((c) => columns[c] ?? nullConstant({ kind: "int32", bits: 32 }, 1)),
@@ -485,6 +509,8 @@ export class PartitionStream {
         if (v !== undefined) vectors[c] = v;
       });
       this.#prevVectors = vectors;
+    }
+    if (this.#orderColumns.length > 0) {
       const key = numberAt(
         columns[this.#orderColumns[0] ?? 0] ?? nullConstant({ kind: "int32", bits: 32 }, 1),
         r,
@@ -809,6 +835,7 @@ export class PartitionStream {
         this.#pages.push(placed);
         this.#next = next;
         const keep = this.#keepFrom(next);
+        this.#pageChanges(placed);
         for (let r = 0; r < page.rows; r++) this.#take(placed, r, keep);
         if (this.host.slice.due()) yield;
       }
@@ -819,29 +846,43 @@ export class PartitionStream {
       while (next < this.#read && this.#ready(next)) {
         const page = this.#pageOf(next);
         if (page === null) throw new RangeError("A window row's page is gone");
-        // The output chunk is full of bytes: flush it; an empty one makes room for one row.
-        while (this.#out.append(page.columns, null, next - page.start, 1) !== 1) {
+        // A run of ready rows of one page goes into the output chunk at once.
+        const pageEnd = page.start + page.rows;
+        let end = next + 1;
+        while (
+          end < this.#read &&
+          end < pageEnd &&
+          end - next < BATCH_ROWS - outRows &&
+          this.#ready(end)
+        )
+          end++;
+        const taken = this.#out.append(page.columns, null, next - page.start, end - next);
+        if (taken === 0) {
+          // The output chunk is full of bytes: flush it; an empty one makes room for one row.
           if (outRows > 0) yield* flush();
           else yield this.host.io.need(this.#out.appendNeed(page.columns, next - page.start));
+          continue;
         }
-        for (let f = 0; f < this.#calls.length; f++) {
-          const s = this.#calls[f];
-          if (s === undefined) continue;
-          this.#compute(
-            s,
-            f,
-            next,
-            outRows,
-            values[f] ?? new Float64Array(0),
-            valid[f] ?? new Uint8Array(0),
-            bigs,
-            ranges,
-          );
+        for (let j = next; j < next + taken; j++) {
+          for (let f = 0; f < this.#calls.length; f++) {
+            const s = this.#calls[f];
+            if (s === undefined) continue;
+            this.#compute(
+              s,
+              f,
+              j,
+              outRows,
+              values[f] ?? new Float64Array(0),
+              valid[f] ?? new Uint8Array(0),
+              bigs,
+              ranges,
+            );
+          }
+          outRows++;
         }
-        outRows++;
-        next++;
+        next += taken;
         if (outRows === BATCH_ROWS) yield* flush();
-        if (this.host.slice.tick()) yield;
+        if (this.host.slice.due()) yield;
       }
       // Release what no future row needs.
       this.#release(Math.min(next, this.#keepFrom(next)));
@@ -1062,13 +1103,18 @@ export class PartitionStream {
       // The partition's first rows are in `head`, later rows in the pages, the last in `last`.
       const page = this.#pageOf(row);
       if (page !== null)
-        gather.append([page.columns[arg] ?? nullConstant(type, 1)], null, row - page.start, 1);
+        gather.append(
+          [page.columns[arg] ?? (s.nullValue ??= nullConstant(type, 1))],
+          null,
+          row - page.start,
+          1,
+        );
       else if (s.head !== null && row < s.head.rows) gather.appendFrom(s.head, [0], [row], 0, 1);
       else if (s.last !== null && row === this.#n - 1 && s.last.rows === 1)
         gather.appendFrom(s.last, [0], [0], 0, 1);
       else throw new RangeError("A window value row is gone");
     };
-    const nul = () => gather.append([nullConstant(type, 1)], null, 0, 1);
+    const nul = () => gather.append([(s.nullValue ??= nullConstant(type, 1))], null, 0, 1);
     if (fn === "lag" || fn === "lead") {
       const k = typeof s.call.amount === "number" ? s.call.amount : 1;
       const target = fn === "lag" ? i - k : i + k;
