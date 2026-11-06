@@ -13503,6 +13503,12 @@ function desugarComposedFullJoin(
 }
 
 function desugarFullJoin(parts: SelectBlockParts, nextSequence: () => number): CompiledQuery {
+  // NATURAL's merged columns are known only at schema binding, after this rewrite; refused
+  // rather than run with no join condition.
+  if (parts.joins[0]?.natural === true)
+    throw new TypeError(
+      "NATURAL FULL JOIN is not supported; name the shared columns: FULL JOIN … USING (columns)",
+    );
   if (parts.joins[0]?.using !== undefined) parts = mergeFullJoinUsing(parts);
   const join = parts.joins[0];
   if (parts.joins.length !== 1 || join?.full !== true) {

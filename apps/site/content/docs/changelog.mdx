@@ -82,6 +82,9 @@ b.id = a.id)` was false when no row of `b` matched. An aggregate without `GROUP 
   `row_number(1) OVER ()` failed with "Expected )"; they now say the function takes no
   arguments, `rank(1) OVER ()` says it needs `WITHIN GROUP`, and `CURRENT_TIMESTAMP(3)` says a
   precision is not supported.
+- **`NATURAL FULL JOIN` is refused with a clear message**, "NATURAL FULL JOIN is not supported;
+  name the shared columns", instead of failing with "JOIN condition must reference the new
+  alias". Write `FULL JOIN … USING (columns)` instead.
 - **Block comments nest**, as in PostgreSQL: `/* outer /* inner */ still outer */` is one
   comment. It used to end at the first `*/`, so the rest became part of the statement.
 
