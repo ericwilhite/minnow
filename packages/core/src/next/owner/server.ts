@@ -99,6 +99,8 @@ export interface OwnerServerOptions {
    * gone). The browser host passes a Web Locks implementation; absent, liveness is not watched.
    */
   readonly watchLiveness?: (lockName: string) => { readonly gone: AbortSignal; stop(): void };
+  /** The Web Locks client id holding this owner's host lock, sent in `welcome` (null: unknown). */
+  readonly lockHolder?: string | null;
 }
 
 export interface OwnerServerStats {
@@ -427,6 +429,7 @@ class Connection {
         frameBytes: BATCH_TARGET_BYTES,
         aliveIntervalMs: server.options.aliveIntervalMs ?? ALIVE_INTERVAL_MS,
       },
+      lockHolder: server.options.lockHolder ?? null,
     });
   }
 

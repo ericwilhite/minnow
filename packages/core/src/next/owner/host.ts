@@ -10,7 +10,8 @@
  *    → spill sweep. With stand-ins it loads their durable file.
  * 3. The host lock, stolen from the page that won the election: from now on the owner holds it.
  * 4. The protocol server; the host page's own client connects on `clientPort`.
- * 5. Registration with the broker; answers on the skew channel.
+ * 5. Registration with the broker; answers on the skew channel, and an `owner` announcement there,
+ *    so clients of a previous owner reconnect at once.
  * 6. `minnow:ready` to the page.
  *
  * A newer owner may steal the fence lock while startup awaits (steps 2 and 3, and the lock query
@@ -183,7 +184,11 @@ export async function startOwnerHost<F>(
     build: init.build,
     protocol,
     ...(typeof idle === "number" ? { transactionIdleTimeoutMs: idle } : {}),
+    ...(typeof init.settings.aliveIntervalMs === "number"
+      ? { aliveIntervalMs: init.settings.aliveIntervalMs }
+      : {}),
     watchLiveness: (name) => watchLock(deps.locks, name),
+    lockHolder,
   });
   server.accept(init.clientPort);
 
@@ -254,6 +259,11 @@ export async function startOwnerHost<F>(
     };
 
   lock.lost.addEventListener("abort", () => void stop("lockLost", false), { once: true });
+
+  // Announce this owner, now registered: a client connected to a previous owner (idle, its port
+  // dead without a word) learns of the change at once and reconnects (connector.ts "Losing the
+  // owner").
+  skew?.postMessage({ t: "owner", protocol, build: init.build, ownerId } satisfies SkewSignal);
 
   const host: OwnerHost = {
     ownerId,

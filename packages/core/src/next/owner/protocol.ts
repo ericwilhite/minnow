@@ -155,7 +155,11 @@
  * - A held lock is declared again on every new connection, right after `welcome` and before any
  *   resend: an owner watches only what its own connection was told.
  * - While a client has requests in flight the owner sends `alive` at least every
- *   `ALIVE_INTERVAL_MS`. The client's deadline counts silence, not wall time.
+ *   `ALIVE_INTERVAL_MS`. The client's deadline counts silence, not wall time:
+ *   `SILENCE_DEADLINE_MS` without a message, it checks the host lock's holder against
+ *   `Welcome.lockHolder`, and reconnects and resends only if the owner is no longer the holder.
+ * - A new owner announces itself on the database's BroadcastChannel (`{ t: "owner", ownerId }`):
+ *   a connected client of another owner reconnects at once, idle or not.
  *
  * ## Version skew
  * - `PROTOCOL_VERSION` changes with any change to these messages or to frame.ts. The owner refuses
@@ -202,10 +206,21 @@ export type TransactionState = "idle" | "open" | "failed" | "timedOut";
 export const DEFAULT_TRANSACTION_IDLE_TIMEOUT_MS = 30_000;
 
 /** Bumped by every change to a message in this file or in frame.ts. */
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 /** The owner sends `alive` at least this often while a client has requests in flight. */
 export const ALIVE_INTERVAL_MS = 1_000;
+/**
+ * A client with requests in flight that has heard nothing from its owner for this long checks
+ * the host lock: still held by the owner's `Welcome.lockHolder`, the owner is alive and only slow
+ * (the deadline restarts); held by another context or by none, the owner was replaced or died, and
+ * the client reconnects and resends. 2.5 × `ALIVE_INTERVAL_MS`: above the worst gap measured
+ * between `alive` messages in Chromium and Firefox (1.04 s; headless Playwright, visible tabs:
+ * hidden tabs could not be produced there). WebKit's owner sends no `alive` while it runs a long
+ * statement, so the lock check, not the value, keeps a slow owner's clients connected: a false
+ * alarm costs one lock query, never a reconnect, unless the platform hides lock holders.
+ */
+export const SILENCE_DEADLINE_MS = 2_500;
 /** Default silence after which a client reports `OwnerUnresponsiveError`. */
 export const DEFAULT_UNRESPONSIVE_AFTER_MS = 10_000;
 /** Default result window: two frames of ~1 MiB, equal to the executor's `RESULT_WINDOW_BYTES`. */
@@ -463,6 +478,12 @@ export interface Welcome {
   readonly epoch: number;
   readonly durability: "strict" | "relaxed";
   readonly limits: OwnerLimits;
+  /**
+   * The Web Locks client id holding the host lock for this owner (`navigator.locks.query()`), or
+   * null where the platform does not say. A client whose owner falls silent compares it with the
+   * lock's current holder before it gives up on the connection (`SILENCE_DEADLINE_MS`).
+   */
+  readonly lockHolder: string | null;
 }
 
 export interface Refused {

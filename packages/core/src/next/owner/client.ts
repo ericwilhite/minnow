@@ -217,6 +217,8 @@ export class ProtocolClient {
   #port: MessagePort | null = null;
   #generation = 0;
   #ownerId: string | null = null;
+  #ownerLockHolder: string | null = null;
+  #lastHeardAt = 0;
   #welcome: { resolve: (welcome: Welcome) => void; reject: (error: Error) => void } | null = null;
   #prepared = 0;
   /** Prepared id → its statement kind, as the owner's front end classified it (`Prepared`). */
@@ -257,6 +259,30 @@ export class ProtocolClient {
 
   get generation(): number {
     return this.#generation;
+  }
+
+  /** The current owner's id (`Welcome.ownerId`), or null before the first welcome. */
+  get ownerId(): string | null {
+    return this.#ownerId;
+  }
+
+  /** The Web Locks client id holding the current owner's host lock, if the owner said. */
+  get ownerLockHolder(): string | null {
+    return this.#ownerLockHolder;
+  }
+
+  /**
+   * When the client last heard from its owner (any message), or when its requests came into
+   * flight if later (`now()` clock): the connector's silence deadline (protocol.ts
+   * `SILENCE_DEADLINE_MS`) counts from here.
+   */
+  get lastHeardAt(): number {
+    return this.#lastHeardAt;
+  }
+
+  /** Restarts the silence count: the connector confirmed the owner is alive. */
+  heard(): void {
+    this.#lastHeardAt = this.#now();
   }
 
   get resolvedThrough(): number {
@@ -590,6 +616,8 @@ export class ProtocolClient {
       reject,
     };
     if (control && session === 0) this.#session0.unresolvedControl++;
+    // Silence is counted from when requests came into flight, not from an idle stretch before.
+    if (this.#pending.size === 0) this.#lastHeardAt = this.#now();
     this.#pending.set(seq, pending);
     if (cursor !== null) {
       this.#cursors++;
@@ -700,9 +728,11 @@ export class ProtocolClient {
   // ---- incoming ----
 
   #receive(message: OwnerMessage): void {
+    this.#lastHeardAt = this.#now();
     switch (message.t) {
       case "welcome": {
         this.#ownerId = message.ownerId;
+        this.#ownerLockHolder = message.lockHolder;
         const welcome = this.#welcome;
         this.#welcome = null;
         // Before any resend or new request: the owner watches the lock only once announced.

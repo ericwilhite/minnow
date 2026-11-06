@@ -200,6 +200,22 @@ export async function closeBeforeReady(name: string): Promise<string> {
   return `${outcome}${(await hostHeld()) ? ` (host lock still held: ${pending.join(", ")})` : ""}`;
 }
 
+/**
+ * Gaps (ms) between successive messages the client heard from its owner over `ms`, sampled from
+ * `lastHeardAt` every 10 ms: with a long request in flight, the owner's `alive` cadence.
+ */
+export async function heardGaps(ms: number): Promise<number[]> {
+  const client = current().client;
+  const seen: number[] = [];
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    const heard = client.lastHeardAt;
+    if (seen.at(-1) !== heard) seen.push(heard);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return seen.slice(1).map((at, i) => at - (seen[i] ?? at));
+}
+
 export async function settle(key: string) {
   const promise = sent.get(key);
   if (promise === undefined) throw new Error(`nothing sent as ${key}`);

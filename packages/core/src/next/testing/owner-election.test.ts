@@ -21,7 +21,12 @@ import { composeEngine } from "../owner/compose.js";
 import { OwnerConnector, type OwnerHandle, type StartOwner } from "../owner/connector.js";
 import { LIVENESS_IDLE_RELEASE_MS, hostLockName, type HostContext } from "../owner/election.js";
 import { startOwnerHost, type OwnerEngineFactory, type OwnerHost } from "../owner/host.js";
-import { PROTOCOL_VERSION, type StepDown } from "../owner/protocol.js";
+import {
+  ALIVE_INTERVAL_MS,
+  PROTOCOL_VERSION,
+  SILENCE_DEADLINE_MS,
+  type StepDown,
+} from "../owner/protocol.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
 import { FakeLockRegistry, type FakeLockContext } from "./fake-locks.js";
 import { createLowerer } from "../lower/create.js";
@@ -181,6 +186,8 @@ function tab(
     readonly protocol?: number;
     readonly mobile?: boolean;
     readonly onSuperseded?: () => void;
+    readonly silenceDeadlineMs?: number;
+    readonly announcements?: boolean;
   } = {},
 ): Tab {
   const locks = world.registry.context();
@@ -210,6 +217,10 @@ function tab(
     }),
     settings: options.settings ?? {},
     retryMs: 50,
+    ...(options.silenceDeadlineMs === undefined
+      ? {}
+      : { silenceDeadlineMs: options.silenceDeadlineMs }),
+    ...(options.announcements === undefined ? {} : { announcements: options.announcements }),
     onSuperseded: () => {
       state.superseded = true;
       options.onSuperseded?.();
@@ -1405,4 +1416,83 @@ describe("B1 (B5-p2d review 1): after a reconnect, a session's state is the reso
     },
     200_000,
   );
+});
+
+describe("p2d: a client notices that its owner was replaced", () => {
+  /**
+   * a hosts; b is connected to a's owner and idle. a's owner dies; a's page elects a new owner at
+   * once (a request of its own). b's port to the dead owner never says so.
+   */
+  async function replaced(options: Parameters<typeof tab>[1] = {}) {
+    const w = world();
+    const a = tab(w);
+    await a.connector.start();
+    await a.client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
+    await a.client.query("INSERT INTO t VALUES ($1, $2, $3)", [1, 0, "x"]);
+    const b = tab(w, options);
+    await b.connector.start();
+    const generation = b.client.generation;
+    const firstOwner = b.client.ownerId;
+    w.owners[0]?.kill();
+    await a.client.query("SELECT * FROM t WHERE id = $1", [1]);
+    await until(() => w.owners.length === 2 && w.owners[1]?.host !== null);
+    return { w, a, b, generation, firstOwner };
+  }
+
+  it("1: the new owner's announcement moves an idle client at once", async () => {
+    const { b, generation, firstOwner } = await replaced();
+    // Before b sends anything: it reconnected on the announcement alone.
+    // (The generation counts from the start of a reconnect; the owner id changes at its welcome.)
+    await until(() => b.client.connected && b.client.ownerId !== firstOwner, 1_000);
+    expect(b.client.generation).toBeGreaterThan(generation);
+    const started = Date.now();
+    await b.client.query("UPDATE t SET n = n + 1 WHERE id = $1", [1]);
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(await value(b.client)).toBe(1);
+  });
+
+  it("2: without the announcement, the silence deadline reconnects and the write runs once", async () => {
+    const { b, generation } = await replaced({ announcements: false, silenceDeadlineMs: 300 });
+    await sleep(100);
+    expect(b.client.generation).toBe(generation);
+    const started = Date.now();
+    // Sent to the dead owner's port: no reply, no alive. The deadline, then the lock check.
+    const write = b.client
+      .query("UPDATE t SET n = n + 1 WHERE id = $1", [1])
+      .then(() => "answered");
+    expect(await Promise.race([write, sleep(3_000).then(() => "hung")])).toBe("answered");
+    const took = Date.now() - started;
+    expect(took).toBeGreaterThanOrEqual(250);
+    expect(took).toBeLessThan(3_000);
+    expect(b.client.generation).toBeGreaterThan(generation);
+    // Resent once to the new owner, which ran it once: the ledger, not a second run.
+    expect(await value(b.client)).toBe(1);
+  });
+
+  it("2: an owner alive but silent past the deadline is confirmed by its lock, not left", async () => {
+    const w = world();
+    // An owner that sends `alive` only once a minute: silent, but alive and holding its lock.
+    const a = tab(w, { settings: { aliveIntervalMs: 60_000 } });
+    await a.connector.start();
+    await a.client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
+    await a.client.query("INSERT INTO t VALUES ($1, $2, $3)", [1, 0, "x"]);
+    const b = tab(w, { silenceDeadlineMs: 150 });
+    await b.connector.start();
+    const generation = b.client.generation;
+    await b.client.query("BEGIN", [], { session: 1 });
+    await b.client.query("UPDATE t SET n = n + 1 WHERE id = $1", [1], { session: 1 });
+    // A long statement: no message for 800 ms, five deadlines.
+    const spin = await b.client.query("SELECT spin($1)", [800], { session: 1 });
+    expect(spin.summary.command).toBe("SELECT");
+    // No reconnect: the transaction is intact and commits.
+    expect(b.client.generation).toBe(generation);
+    expect(b.client.lostSessions.size).toBe(0);
+    await b.client.query("COMMIT", [], { session: 1 });
+    expect(await value(b.client)).toBe(1);
+  });
+
+  it("2: pins the deadline at 2.5 alive intervals", () => {
+    expect(SILENCE_DEADLINE_MS).toBe(2_500);
+    expect(SILENCE_DEADLINE_MS).toBe(2.5 * ALIVE_INTERVAL_MS);
+  });
 });

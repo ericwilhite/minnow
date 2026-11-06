@@ -715,6 +715,19 @@ and the owner import it directly.
   connection. The handshake is watched (an owner dying mid-handshake frees the host lock) and
   bounded (`HANDSHAKE_TIMEOUT_MS`, 5 s); either way the connector starts over. The broker holds a
   client's port only until the next registration of a database it asked about.
+- A client learns that its owner was replaced even while idle: a new owner announces itself on
+  the database's BroadcastChannel (`{t: "owner", ownerId}`), and a connected client of another
+  owner reconnects and resends at once. Without it, an idle client kept its dead owner's port
+  (a port does not report its other end's death) and its next request waited forever.
+- The backstop is a silence deadline, `SILENCE_DEADLINE_MS` = 2.5 s (2.5 × `ALIVE_INTERVAL_MS`):
+  a client with requests in flight that hears nothing for that long compares the host lock's
+  holder with its owner's (`Welcome.lockHolder`). The same: the owner is alive and only slow, and
+  the count restarts, so a false alarm costs one lock query, not a reconnect (which would end the
+  client's open transactions). Another or none: it reconnects and resends; reads stay
+  at-least-once and writes go through the ledger, as on any reconnect. Measured `alive` gaps
+  (headless Playwright, visible tabs; no engine here can hide a tab): Chromium and Firefox about
+  1.0 s, at most 1.04 s; WebKit sends none while the owner runs a long statement, which the lock
+  confirmation covers.
 - `freeze` (on the document) and `pagehide` terminate the owner without calling back into the
   page: Firefox can abandon a closing page's handler midway, and the `hidden` that follows must
   then find no live owner to flush.
