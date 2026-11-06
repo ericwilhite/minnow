@@ -1404,11 +1404,12 @@ function decodeValues(
       if (view.allNull) return;
       const out = data.values;
       if (view.kind === PageEncoding.constant) {
-        const value =
-          data.layout === "f64"
-            ? (new Float64Array(view.bytes.buffer, view.bytes.byteOffset + view.start, 1)[0] ?? 0)
-            : (new Float32Array(view.bytes.buffer, view.bytes.byteOffset + view.start, 1)[0] ?? 0);
-        out.fill(value, at, at + count);
+        // Copied as bytes, never through a JS number: the constant keeps its bit pattern.
+        const width = data.layout === "f64" ? 8 : 4;
+        const lane = new Uint8Array(out.buffer, out.byteOffset + at * width, count * width);
+        lane.set(view.bytes.subarray(view.start, view.start + width));
+        for (let filled = width; filled < lane.length; filled *= 2)
+          lane.copyWithin(filled, 0, Math.min(filled, lane.length - filled));
         return;
       }
       const values = view.plain as Float64Array | Float32Array;

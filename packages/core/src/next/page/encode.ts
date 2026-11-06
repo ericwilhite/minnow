@@ -651,14 +651,26 @@ export function encodeFloatPage(
   let sawNumber = false;
   let constant = true;
   let first: number | null = null;
+  // Constant means one bit pattern, not one value: NaN payloads (and ±0) differ (review B2-p2i
+  // #2), so rows are compared as raw words, never as JS numbers.
+  const words = new Uint32Array(values.buffer, values.byteOffset, rows * (wide ? 2 : 1));
+  let firstRow = -1;
   for (let row = 0; row < rows; row++) {
     if (!isValidAt(validity, row)) {
       nulls++;
       continue;
     }
     const value = values[row] ?? 0;
-    if (first === null) first = value;
-    else if (constant && !Object.is(first, value)) constant = false;
+    if (first === null) {
+      first = value;
+      firstRow = row;
+    } else if (
+      constant &&
+      (wide
+        ? words[row * 2] !== words[firstRow * 2] || words[row * 2 + 1] !== words[firstRow * 2 + 1]
+        : words[row] !== words[firstRow])
+    )
+      constant = false;
     if (value !== value) sawNaN = true;
     else {
       sawNumber = true;
@@ -675,8 +687,10 @@ export function encodeFloatPage(
     const buffer = scratch.take(start + 8);
     header(buffer, PageEncoding.constant, tag, flags, width, rows, 0);
     writeValidity(buffer, PAGE_HEADER_BYTES, validity, rows, nulls);
-    if (wide) new Float64Array(buffer, start, 1)[0] = first;
-    else new Float32Array(buffer, start, 1)[0] = first;
+    // The row's own bytes, never through a JS number (a NaN keeps its payload).
+    new Uint8Array(buffer, start, width).set(
+      new Uint8Array(values.buffer, values.byteOffset + firstRow * width, width),
+    );
     return finish(buffer, start + width, PageEncoding.constant, rows, nulls, low, high);
   }
   if (wide) {

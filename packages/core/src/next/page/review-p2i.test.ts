@@ -68,3 +68,28 @@ describe("review B2-p2i #1: scaled-float pages near 2^53", () => {
     expect(() => parsePage(bytes, entry, ValueTag.f64)).toThrow(PageCorruptionError);
   });
 });
+
+describe("review B2-p2i #2: every float64 bit pattern, constant pages included", () => {
+  it("keeps distinct NaN payloads on an all-NaN page (the probe, inverted)", () => {
+    const values = new Float64Array(128);
+    const raw = new BigUint64Array(values.buffer);
+    for (let i = 0; i < 128; i++) raw[i] = 0x7ff8_0000_0000_0001n + BigInt(i);
+    const { encoding, bits } = roundTrip(values);
+    expect(encoding).not.toBe(PageEncoding.constant);
+    expect([...bits]).toEqual([...raw]);
+  });
+
+  it("keeps a constant page's own payload, signalling NaNs included", () => {
+    for (const pattern of [
+      0x7ff0_0000_0000_0001n,
+      0xfff4_dead_beef_0001n,
+      0x7ff8_0000_0000_0000n,
+    ]) {
+      const values = new Float64Array(64);
+      new BigUint64Array(values.buffer).fill(pattern);
+      const { encoding, bits } = roundTrip(values);
+      expect(encoding).toBe(PageEncoding.constant);
+      expect([...new Set(bits)]).toEqual([pattern]);
+    }
+  });
+});

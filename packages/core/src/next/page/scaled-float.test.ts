@@ -16,7 +16,10 @@ import { afterAll, describe, expect, it } from "vitest";
 import { createReach } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { PageEncoding } from "../format/manifest.js";
+import type { FlatVector } from "../vector/vector.js";
+import { MemoryExtentSpace } from "./memory-extents.js";
 import { ChunkReader } from "./reader.js";
+import { GroupWriter } from "./writer.js";
 import { defined, targetFor, UNLIMITED, writeGroup } from "./test-support.js";
 
 const SEEDS = seedsFor("next-scaled-float", [0xf64, 0x1e3]);
@@ -214,6 +217,139 @@ describe.each(SEEDS)("scaledFloat pages round-trip every float64 bit for bit (se
     );
   }, 240_000);
 });
+
+const RAW_SEEDS = seedsFor("next-float-raw-bits", [0xbad5eed, 0x77]);
+const RAW_STATES = [
+  "a constant page of one NaN payload",
+  "a constant page of a signalling NaN",
+  "a constant page of -0",
+  "an all-NaN page of distinct payloads",
+  "a page of random 64-bit patterns",
+  "a scaled page with raw patches",
+  "nulls",
+] as const;
+const rawReach = createReach("next-float-raw-bits", RAW_STATES);
+afterAll(() => {
+  rawReach.assertReached();
+});
+
+const NAN_EXPONENT = 0x7ff0_0000_0000_0000n;
+const MANTISSA = 0x000f_ffff_ffff_ffffn;
+const isNaNBits = (bits: bigint): boolean =>
+  (bits & NAN_EXPONENT) === NAN_EXPONENT && (bits & MANTISSA) !== 0n;
+const isSignalling = (bits: bigint): boolean =>
+  isNaNBits(bits) && (bits & 0x0008_0000_0000_0000n) === 0n;
+
+describe.each(RAW_SEEDS)(
+  "every float64 bit pattern round-trips, from raw bits (seed %i)",
+  (seed) => {
+    it("decodes and gathers each valid row to its own 64 bits, constant pages included", async () => {
+      await fc.assert(
+        fc.asyncProperty(
+          fc.integer({ min: 1, max: 1500 }),
+          fc.constantFrom("constant", "nan payloads", "random", "decimal with patches"),
+          fc.bigInt({ min: 0n, max: (1n << 64n) - 1n }),
+          fc.boolean(),
+          async (rows, mode, pick, withNulls) => {
+            rawReach.beginHistory();
+            let state = BigInt(seed) ^ pick ^ BigInt(rows);
+            const next = (): bigint => {
+              state ^= (state << 13n) & 0xffff_ffff_ffff_ffffn;
+              state ^= state >> 7n;
+              state ^= (state << 17n) & 0xffff_ffff_ffff_ffffn;
+              return state & 0xffff_ffff_ffff_ffffn;
+            };
+            const values = new Float64Array(rows);
+            const bits = new BigUint64Array(values.buffer);
+            const view = new DataView(new ArrayBuffer(8));
+            const constants = [
+              0x7ff8_0000_dead_beefn, // quiet NaN with a payload
+              0x7ff0_0000_0000_0001n, // signalling NaN
+              0xfff4_0000_0000_00ffn, // negative signalling NaN with a payload
+              0x8000_0000_0000_0000n, // −0
+              pick,
+            ];
+            const constant = constants[Number(pick % BigInt(constants.length))] ?? pick;
+            for (let row = 0; row < rows; row++) {
+              if (mode === "constant") bits[row] = constant;
+              else if (mode === "nan payloads") bits[row] = 0x7ff8_0000_0000_0001n + BigInt(row);
+              else if (mode === "random") bits[row] = next();
+              else if (row % 37 === 0) bits[row] = next();
+              else {
+                view.setFloat64(0, Number(next() % 1_000_000n) / 100, true);
+                bits[row] = view.getBigUint64(0, true);
+              }
+            }
+            let validity: Uint32Array | null = null;
+            if (withNulls && rows > 1) {
+              validity = new Uint32Array(Math.ceil(rows / 32)).fill(0xffff_ffff);
+              validity[0] = (validity[0] ?? 0) & ~2; // row 1 null
+              rawReach.reach("nulls");
+            }
+            const space = new MemoryExtentSpace();
+            const type = { kind: "float64" } as const;
+            const writer = new GroupWriter({
+              columns: [{ columnId: 1, type }],
+              writer: space.beginWrite("raw"),
+            });
+            const vector: FlatVector = {
+              form: "flat",
+              type,
+              length: rows,
+              validity,
+              data: { layout: "f64", values },
+            };
+            await writer.append([vector], rows);
+            const chunk = defined((await writer.finish()).columns[0]);
+            const reader = await ChunkReader.open(space, chunk, { budget: UNLIMITED });
+            await reader.load(reader.directory.pages.map((_, page) => page));
+            const target = targetFor(reader, rows, 0);
+            reader.decodeRange(0, rows, target, 0);
+            if (target.data.layout !== "f64") throw new Error("expected f64");
+            const decoded = new BigUint64Array(
+              target.data.values.buffer,
+              target.data.values.byteOffset,
+              rows,
+            );
+            const valid = (row: number): boolean =>
+              validity === null || (((validity[row >>> 5] ?? 0) >>> (row & 31)) & 1) === 1;
+            for (let row = 0; row < rows; row++)
+              if (valid(row)) expect(decoded[row], `row ${String(row)}`).toBe(bits[row]);
+            const chosen = Uint32Array.from({ length: Math.ceil(rows / 3) }, (_, k) => k * 3);
+            const gathered = targetFor(reader, chosen.length, 0);
+            reader.gather(chosen, gathered, 0);
+            if (gathered.data.layout !== "f64") throw new Error("expected f64");
+            const gatheredBits = new BigUint64Array(
+              gathered.data.values.buffer,
+              gathered.data.values.byteOffset,
+              chosen.length,
+            );
+            chosen.forEach((row, slot) => {
+              if (valid(row))
+                expect(gatheredBits[slot], `gathered row ${String(row)}`).toBe(bits[row]);
+            });
+            for (const entry of reader.directory.pages) {
+              const kind = entry.encoding & 0x7f;
+              if (mode === "constant" && kind === PageEncoding.constant) {
+                if (constant === 0x8000_0000_0000_0000n) rawReach.reach("a constant page of -0");
+                else if (isSignalling(constant))
+                  rawReach.reach("a constant page of a signalling NaN");
+                else if (isNaNBits(constant)) rawReach.reach("a constant page of one NaN payload");
+              }
+              if (mode === "nan payloads" && entry.rowCount - entry.nullCount > 1)
+                rawReach.reach("an all-NaN page of distinct payloads");
+              if (mode === "random") rawReach.reach("a page of random 64-bit patterns");
+              if (mode === "decimal with patches" && kind === PageEncoding.scaledFloat)
+                rawReach.reach("a scaled page with raw patches");
+            }
+            reader.close();
+          },
+        ),
+        { seed, numRuns: 150 },
+      );
+    }, 240_000);
+  },
+);
 
 describe("scaledFloat pages: pinned", () => {
   it("store W1M's f00 shape (three decimals, below 10^6) in 4 bytes a row, not 8", async () => {
