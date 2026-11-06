@@ -15429,12 +15429,23 @@ function tokenize(sql: string): Token[] {
       continue;
     }
     if (pair === "/*") {
-      // T351: bracketed comments, which the standard does not nest.
-      const close = sql.indexOf("*/", index + 2);
-      if (close === -1) {
-        throw new SqlCompileError("Unterminated comment", index, sql.length - index);
+      // T351: bracketed comments, nested as PostgreSQL nests them (`/* a /* b */ c */` is one).
+      const start = index;
+      let depth = 0;
+      while (index < sql.length) {
+        const next = sql.slice(index, index + 2);
+        if (next === "/*") {
+          depth += 1;
+          index += 2;
+        } else if (next === "*/") {
+          depth -= 1;
+          index += 2;
+          if (depth === 0) break;
+        } else index += 1;
       }
-      index = close + 2;
+      if (depth !== 0) {
+        throw new SqlCompileError("Unterminated comment", start, sql.length - start);
+      }
       continue;
     }
     if (character === ";") {

@@ -73,6 +73,9 @@ b.id = a.id)` was false when no row of `b` matched. An aggregate without `GROUP 
   with `table name "a" specified more than once`. The same applies to `UPDATE … FROM` and
   `DELETE … USING` when a source has the target's name. Give each source its own alias.
 
+- **Block comments nest**, as in PostgreSQL: `/* outer /* inner */ still outer */` is one
+  comment. It used to end at the first `*/`, so the rest became part of the statement.
+
 No stored format changes, and no migration step is needed.
 
 ## 0.19.3 — November 5, 2026
