@@ -57,6 +57,10 @@
  * `receipt.wrote` is false, `lsn` is the base LSN. The owner then settles the request without an
  * outcome (format/ledger.ts `settle`); a retry runs again, which is correct for a no-op.
  *
+ * Reads of published or staged chunks, including recovered lazy groups, load pages and then
+ * their out-of-line values before decoding (page/large-value.ts). The fold reuses group metadata;
+ * index-run merges read keys and row ids, without decoding row chunks.
+ *
  * Recovery schedules the staging fold in a later task, after open has delivered ready;
  * no group-root read begins as part of open, including its queued microtasks.
  *

@@ -5,7 +5,9 @@
  * (committed ones and its own, staged or not), takes savepoints and rolls back to them, fails
  * statements on duplicate keys, then commits, rolls back, or the process crashes. After each one
  * the visible rows and every key probe equal the model's committed rows; the space audit runs
- * often, and crashes and reopens replay the log.
+ * often, and crashes and reopens replay the log. A non-indexed text column includes values over
+ * 64 KiB; value equality and declared reach cover staged, recovered lazy and folded reads.
+ * Updating only v must preserve body through the write path's published-row reader.
  */
 import { describe, expect, it } from "vitest";
 import { UniqueViolationError } from "../access/modify.js";
@@ -15,6 +17,8 @@ import { createReach } from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import { need } from "./bytes.js";
 import type { WritePathImpl } from "./engine.js";
+import { LazyGroupRoot, type Memtable } from "./memtable.js";
+import { LARGE_VALUE_BYTES } from "../page/large-value.js";
 import {
   autocommit,
   batch,
@@ -26,7 +30,14 @@ import {
   rowsOf,
   rules,
   tableInput,
+  TEXT,
+  texts,
 } from "./test-support.js";
+
+// Non-ASCII payload: 24,000 characters are 72,000 UTF-8 bytes, beyond the page inline limit.
+const LARGE_BODY = "界".repeat(24_000);
+const largeId = (id: number) => id % 17 === 0;
+const bodyOf = (id: number) => `${String(id)}:${largeId(id) ? LARGE_BODY : "small"}`;
 
 const FREE = { allocate: () => true, free: () => undefined };
 
@@ -41,6 +52,10 @@ const REACH = [
   "residual-tombstones",
   "unique-violation",
   "savepoint-rollback",
+  "large-value",
+  "staged-large-value",
+  "lazy-large-value",
+  "folded-large-value",
 ] as const;
 const reach = createReach("next-write-staged", REACH);
 
@@ -70,6 +85,8 @@ async function contents(view: Snapshot, t: number): Promise<Map<number, number>>
   for (const row of await rowsOf(view, t)) {
     const id = Number(row[0]);
     expect(out.has(id), `row ${String(id)} is seen once`).toBe(false);
+    expect(row[2], `body of row ${String(id)}`).toBe(bodyOf(id));
+    if (largeId(id)) reach.reach("large-value");
     out.set(id, Number(row[1]));
   }
   return out;
@@ -86,6 +103,19 @@ async function check(path: WritePathImpl, t: number, model: Map<number, number>,
     // Every key resolves through the index layers (staged runs included) to exactly its row.
     const present = [...model.keys()];
     if (present.length > 0) await locate(view, t, present);
+    const large = present.filter(largeId);
+    if (large.length > 0) {
+      const table = view.table(t, { budget: FREE });
+      for (const locator of await locate(view, t, large)) {
+        const segment = need(table.segments[Math.floor(locator / 65_536)]);
+        if (segment.kind === "group") reach.reach("folded-large-value");
+        else {
+          const memtable = (segment as unknown as { memtable: Memtable }).memtable;
+          if (memtable.staged !== null) reach.reach("staged-large-value");
+          if (memtable.staged?.groupRoot instanceof LazyGroupRoot) reach.reach("lazy-large-value");
+        }
+      }
+    }
     const keys = new KeyBatch(FREE);
     const absent = Array.from({ length: 20 }, (_, k) => 5000 + k);
     encodeKeyBatch(
@@ -107,6 +137,7 @@ describe("staged large transactions, generated", () => {
   const SEEDS = seedsFor("next-write-staged", [901, 902, 903, 904]);
   for (const seed of SEEDS)
     it(`histories of large transactions equal the model (seed ${String(seed)})`, async () => {
+      expect(new TextEncoder().encode(LARGE_BODY).byteLength).toBeGreaterThan(LARGE_VALUE_BYTES);
       const random = mulberry32(seed);
       const int = (n: number) => Math.floor(random() * n);
       // Flushes can be held before they publish: a crash right after a commit then finds its
@@ -129,7 +160,11 @@ describe("staged large transactions, generated", () => {
           (
             await s.changeCatalog({
               kind: "createTable",
-              table: tableInput("t", [column("id", INT, false), column("v", INT)]),
+              table: tableInput("t", [
+                column("id", INT, false),
+                column("v", INT),
+                column("body", TEXT),
+              ]),
             })
           ).id ?? 0;
       });
@@ -170,7 +205,9 @@ describe("staged large transactions, generated", () => {
               for (let call = 0; call < calls; call++) {
                 const ids = Array.from({ length: 1 + int(7) }, () => next++);
                 const values = ids.map(() => int(1000));
-                await s.table(t).insert(batch(ints(ids), ints(values)), null);
+                await s
+                  .table(t)
+                  .insert(batch(ints(ids), ints(values), texts(ids.map(bodyOf))), null);
                 ids.forEach((id, k) => mine.set(id, values[k] ?? 0));
               }
               await s.end();
@@ -199,9 +236,9 @@ describe("staged large transactions, generated", () => {
             } else if (roll < 80 && mine.size > 0) {
               // A duplicate key fails the statement: all of it rolls back.
               const ids = [next++, next++];
-              await s.table(t).insert(batch(ints(ids), ints([1, 2])), null);
+              await s.table(t).insert(batch(ints(ids), ints([1, 2]), texts(ids.map(bodyOf))), null);
               const dup = need([...mine.keys()][int(mine.size)]);
-              await s.table(t).insert(batch(ints([dup]), ints([3])), null);
+              await s.table(t).insert(batch(ints([dup]), ints([3]), texts([bodyOf(dup)])), null);
               await expect(s.end()).rejects.toBeInstanceOf(UniqueViolationError);
               reach.reach("unique-violation");
               s.rollback();
