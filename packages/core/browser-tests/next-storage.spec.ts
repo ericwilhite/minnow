@@ -592,6 +592,24 @@ test.describe("rebuild core storage kill campaign (Gate A)", () => {
       });
 });
 
+test.describe("rebuild core storage kill campaign: its isolated page", () => {
+  test("only the campaign's page is cross-origin isolated; a plain page stays as it was", async ({
+    page,
+    context,
+  }) => {
+    // This test's own profile, before any isolated page set its cookie: what every other lane's
+    // pages get.
+    await page.goto("/packages/core/browser/");
+    expect(await page.evaluate(() => crossOriginIsolated)).toBe(false);
+    const similar = await context.newPage();
+    await similar.goto("/packages/core/browser/?isolated=10&notisolated=1");
+    expect(await similar.evaluate(() => crossOriginIsolated)).toBe(false);
+    const chaos = await context.newPage();
+    await chaos.goto(CHAOS_PAGE);
+    expect(await chaos.evaluate(() => crossOriginIsolated)).toBe(true);
+  });
+});
+
 test.describe("rebuild core storage kill campaign: its own failure paths (review B1-p2f)", () => {
   test("a failure posted before the kill fails it, though it arrives after, in both kill modes", async ({
     page,
