@@ -33,15 +33,35 @@ export interface StatementFacts {
   readonly references: ReadonlyArray<{ readonly table: string; readonly value: number }>;
 }
 
+/** How one side ended a step. */
+export interface StepOutcome {
+  readonly outcome: OutcomeClass;
+  /** The error message (PostgreSQL's with its DETAIL appended, `message: detail`), if it failed. */
+  readonly message: string | null;
+  /** The index in `statements` of the statement that failed, when known. */
+  readonly statement?: number | null;
+}
+
+/** A row that differs between the two sides after a step both committed. */
+export interface DifferingRow {
+  readonly table: string;
+  /** Its primary key. */
+  readonly key: number;
+  /** Foreign-key values it holds on either side, with the table each references. */
+  readonly references: ReadonlyArray<{ readonly table: string; readonly value: number }>;
+}
+
 /** One step on which the current engine and the authority disagreed. */
 export interface DivergenceObservation {
   readonly statements: readonly StatementFacts[];
-  /** The current engine's outcome, and its error message if it failed. */
-  readonly oracle: { readonly outcome: OutcomeClass; readonly message: string | null };
-  /** PostgreSQL's outcome, likewise. */
-  readonly authority: { readonly outcome: OutcomeClass; readonly message: string | null };
+  /** The current engine's outcome. */
+  readonly oracle: StepOutcome;
+  /** PostgreSQL's outcome. */
+  readonly authority: StepOutcome;
   /** Both succeeded and their rows differ. */
   readonly rowsDiffer: boolean;
+  /** When `rowsDiffer`: exactly the rows that differ (by primary key, either side). */
+  readonly differingRows?: readonly DifferingRow[];
   readonly facts: DivergenceFacts;
 }
 
@@ -52,6 +72,8 @@ export interface DivergenceFacts {
   readonly primaryKeys: ReadonlyMap<string, string>;
   /** Primary keys a committed rekey moved a row away from, per table: key → when (same clock). */
   readonly rekeyedAway: ReadonlyMap<string, ReadonlyMap<number, number>>;
+  /** Where each of those keys moved, per table: old key → new key (a later rekey may move it on). */
+  readonly movedTo?: ReadonlyMap<string, ReadonlyMap<number, number>>;
   /** The current engine's `keyForwardRetentionMs` (default 10 days). */
   readonly keyForwardRetentionMs?: number;
 }
@@ -72,17 +94,43 @@ function forwarding(observation: DivergenceObservation, table: string, key: numb
 }
 
 const DUPLICATE = /^Duplicate value for (\w+)\.(\w+): (-?\d+)$/u;
+/** PostgreSQL's 23503 DETAIL for a missing parent: `Key (col)=(v) is not present in table "t".` */
+const MISSING_PARENT = /Key \((\w+)\)=\((-?\d+)\) is not present in table "(\w+)"/u;
+
+/**
+ * The key a forwarding key of `table` reaches in the current engine: its row's key now, following
+ * later rekeys of that row; null when the move is unknown.
+ */
+function forwardTarget(
+  observation: DivergenceObservation,
+  table: string,
+  key: number,
+): number | null {
+  const moves = observation.facts.movedTo?.get(table);
+  const first = moves?.get(key);
+  if (moves === undefined || first === undefined) return null;
+  let at: number = first;
+  for (let hop = 0; hop < 64; hop++) {
+    const next: number | undefined = moves.get(at);
+    if (next === undefined || !forwarding(observation, table, at)) return at;
+    at = next;
+  }
+  return at;
+}
 
 /**
  * Key forwarding explains a step when its effect is the one forwarding has (docs:
  * engine/rekeying, "The old key keeps working"):
  * - the current engine refuses a duplicate PostgreSQL accepts, and the duplicate is a forwarding
  *   key in its table's primary-key column, written as a new key (an INSERT, or a rekey onto it);
- * - the current engine accepts a foreign-key write PostgreSQL refuses, which names a forwarding
- *   key of the referenced table (the engine stored the key it forwards to);
+ * - the current engine accepts a foreign-key write PostgreSQL refuses: the statement PostgreSQL
+ *   refused writes a reference to the key PostgreSQL names as missing, and that key forwards (the
+ *   engine stored the key it forwards to);
  * - the current engine refuses (RESTRICT) a DELETE or rekey PostgreSQL accepts, which matched a
  *   forwarding key (the engine reached the moved row and its children);
- * - both succeed with different rows, and an UPDATE, DELETE or rekey matched a forwarding key.
+ * - both succeed with different rows, and every differing row is one the current engine reached
+ *   through a forwarding key an UPDATE, DELETE or rekey matched: the row it forwards to (a rekey's
+ *   new key too), or a child referencing one of those.
  */
 function explainedByForwarding(observation: DivergenceObservation): boolean {
   const { oracle, authority, statements } = observation;
@@ -108,16 +156,51 @@ function explainedByForwarding(observation: DivergenceObservation): boolean {
       )
     );
   }
-  if (oracle.outcome === "ok" && authority.outcome === "foreignKey")
-    return statements.some((statement) =>
-      statement.references.some((reference) =>
-        forwarding(observation, reference.table, reference.value),
-      ),
+  if (oracle.outcome === "ok" && authority.outcome === "foreignKey") {
+    // PostgreSQL refused a reference to a missing parent: the refused key must be a forwarding
+    // key, written as a reference by the very statement PostgreSQL refused (review B3-p2a-3 #4).
+    const missing = MISSING_PARENT.exec(authority.message ?? "");
+    if (missing === null) return false;
+    const [, , text = "", table = ""] = missing;
+    const key = Number(text);
+    const at = authority.statement;
+    if (at === undefined || at === null || !forwarding(observation, table, key)) return false;
+    return (
+      statements[at]?.references.some(
+        (reference) => reference.table === table && reference.value === key,
+      ) ?? false
     );
+  }
   if (oracle.outcome === "foreignKey" && authority.outcome === "ok")
     return matchedForwarding(["delete", "rekey"]);
-  if (oracle.outcome === "ok" && authority.outcome === "ok" && observation.rowsDiffer)
-    return matchedForwarding(["update", "delete", "rekey"]);
+  if (oracle.outcome === "ok" && authority.outcome === "ok" && observation.rowsDiffer) {
+    // Every differing row must be one the current engine reached through a forwarding key: the
+    // row it forwards to (and a rekey's new key), or a child referencing one of those.
+    const differing = observation.differingRows ?? [];
+    if (differing.length === 0) return false;
+    const reached = new Map<string, Set<number>>();
+    const add = (table: string, key: number) => {
+      let keys = reached.get(table);
+      if (keys === undefined) reached.set(table, (keys = new Set()));
+      keys.add(key);
+    };
+    for (const statement of statements) {
+      if (statement.kind === "insert") continue;
+      for (const key of statement.matchedKeys) {
+        if (!forwarding(observation, statement.table, key)) continue;
+        const target = forwardTarget(observation, statement.table, key);
+        if (target === null) continue;
+        add(statement.table, target);
+        if (statement.kind === "rekey")
+          for (const next of statement.newKeys) add(statement.table, next);
+      }
+    }
+    return differing.every(
+      (row) =>
+        reached.get(row.table)?.has(row.key) === true ||
+        row.references.some((reference) => reached.get(reference.table)?.has(reference.value)),
+    );
+  }
   return false;
 }
 

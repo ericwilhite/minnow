@@ -55,7 +55,12 @@ import {
   texts,
   type Value,
 } from "../write/test-support.js";
-import { intendedDivergence, type Divergence, type StatementFacts } from "./divergences.js";
+import {
+  intendedDivergence,
+  type DifferingRow,
+  type Divergence,
+  type StatementFacts,
+} from "./divergences.js";
 import { DEFAULT_KEY_FORWARD_RETENTION_MS } from "../../engine/key-forwards.js";
 
 const SEEDS = seedsFor("next-write-differential", [0xd1ff, 7, 4242, 90210]);
@@ -127,21 +132,25 @@ async function runOn(
   oracle: Oracle,
   sqls: readonly string[],
   rollback: boolean,
-): Promise<{ outcome: Outcome; message: string | null }> {
+): Promise<{ outcome: Outcome; message: string | null; statement: number | null }> {
   const transaction = sqls.length > 1;
   if (transaction) await oracle.execute("BEGIN");
-  for (const text of sqls)
+  for (const [at, text] of sqls.entries())
     try {
       await oracle.execute(text);
     } catch (error) {
       if (transaction) await oracle.execute("ROLLBACK");
-      return {
-        outcome: oracle.classify(error),
-        message: error instanceof Error ? error.message : String(error),
-      };
+      return { outcome: oracle.classify(error), message: errorText(error), statement: at };
     }
   if (transaction) await oracle.execute(rollback ? "ROLLBACK" : "COMMIT");
-  return { outcome: "ok", message: null };
+  return { outcome: "ok", message: null, statement: null };
+}
+
+/** An error's message, with PostgreSQL's DETAIL appended (`message: detail`) when it has one. */
+function errorText(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const detail = (error as { detail?: unknown }).detail;
+  return typeof detail === "string" && detail !== "" ? `${message}: ${detail}` : message;
 }
 
 const sql = (value: number | string | null) =>
@@ -157,8 +166,8 @@ interface Op {
 
 /** What a step's write-path run did that the divergence facts need. */
 interface StepLog {
-  /** Keys of t a rekey moved a row away from. */
-  readonly moved: number[];
+  /** Keys of t a rekey moved a row away from, and where each moved. */
+  readonly moved: Array<readonly [from: number, to: number]>;
 }
 
 interface Ids {
@@ -314,7 +323,7 @@ class Workload {
           await statement
             .table(ids.t, { assigned: [def?.columns[0]?.id ?? 0] })
             .update(batch(locators([at], ids.t), ints([next])), null);
-          if (next !== id) step.moved.push(id);
+          if (next !== id) step.moved.push([id, next]);
         },
       };
     }
@@ -525,30 +534,65 @@ async function stepOnCurrent(
   readonly same: boolean;
   readonly outcome: Outcome;
   readonly error: string | null;
+  readonly statement: number | null;
   readonly rowsDiffer: boolean;
+  readonly differingRows: DifferingRow[];
 }> {
   await current.execute("BEGIN");
   let outcome: Outcome = "ok";
   let error: string | null = null;
-  for (const text of sqls)
+  let statement: number | null = null;
+  for (const [at, text] of sqls.entries())
     try {
       await current.execute(text);
     } catch (caught) {
       outcome = current.classify(caught);
-      error = caught instanceof Error ? caught.message : String(caught);
+      error = errorText(caught);
+      statement = at;
       break;
     }
   let same = outcome === expected.outcome;
   let rowsDiffer = false;
+  const differingRows: DifferingRow[] = [];
   if (same && outcome === "ok" && !rollback) {
     const t = await oracleRows(current, "t", "id, u, v, s");
     const c = await oracleRows(current, "c", "id, pid");
-    rowsDiffer =
-      JSON.stringify(t) !== JSON.stringify(rows.t) || JSON.stringify(c) !== JSON.stringify(rows.c);
+    differingRows.push(...differing("t", t, rows.t, null), ...differing("c", c, rows.c, 1));
+    rowsDiffer = differingRows.length > 0;
     same = !rowsDiffer;
   }
   await current.execute(same && outcome === "ok" && !rollback ? "COMMIT" : "ROLLBACK");
-  return { same, outcome, error, rowsDiffer };
+  return { same, outcome, error, statement, rowsDiffer, differingRows };
+}
+
+/**
+ * Rows of `table` (value arrays, the key first) that differ between two sides, by key; `parent` is
+ * the column holding a reference to t, whose values on either side the row reports.
+ */
+function differing(
+  table: string,
+  left: readonly Value[][],
+  right: readonly Value[][],
+  parent: number | null,
+): DifferingRow[] {
+  const byKey = (rows: readonly Value[][]) =>
+    new Map(rows.map((row) => [Number(row[0]), row] as const));
+  const a = byKey(left);
+  const b = byKey(right);
+  const out: DifferingRow[] = [];
+  for (const key of new Set([...a.keys(), ...b.keys()])) {
+    const x = a.get(key);
+    const y = b.get(key);
+    if (JSON.stringify(x) === JSON.stringify(y)) continue;
+    const references =
+      parent === null
+        ? []
+        : [x?.[parent], y?.[parent]]
+            .filter((value): value is number => typeof value === "number")
+            .map((value) => ({ table: "t", value }));
+    out.push({ table, key, references });
+  }
+  return out;
 }
 
 describe("write path vs PostgreSQL and the current engine (generated)", () => {
@@ -570,6 +614,8 @@ describe("write path vs PostgreSQL and the current engine (generated)", () => {
       let parents: number[] = [];
       /** Keys of t a committed rekey moved away from → when (the current engine's clock). */
       const rekeyedAway = new Map<number, number>();
+      /** Where each of those keys moved. */
+      const movedTo = new Map<number, number>();
       const outcomes = new Map<Outcome, number>();
       try {
         for (let step = 0; step < STEPS; step++) {
@@ -606,9 +652,14 @@ describe("write path vs PostgreSQL and the current engine (generated)", () => {
           if (!result.same) {
             const divergence = intendedDivergence({
               statements: ops.map((op) => ({ sql: op.sql, ...op.facts })),
-              oracle: { outcome: result.outcome, message: result.error },
-              authority: { outcome: expected.outcome, message: expected.message },
+              oracle: {
+                outcome: result.outcome,
+                message: result.error,
+                statement: result.statement,
+              },
+              authority: expected,
               rowsDiffer: result.rowsDiffer,
+              differingRows: result.differingRows,
               facts: {
                 nowMs: clock.ms,
                 primaryKeys: new Map([
@@ -616,6 +667,7 @@ describe("write path vs PostgreSQL and the current engine (generated)", () => {
                   ["c", "id"],
                 ]),
                 rekeyedAway: new Map([["t", rekeyedAway]]),
+                movedTo: new Map([["t", movedTo]]),
               },
             });
             expect(
@@ -631,6 +683,7 @@ describe("write path vs PostgreSQL and the current engine (generated)", () => {
             // Past the forward window the current engine must match PostgreSQL exactly.
             clock.ms += DEFAULT_KEY_FORWARD_RETENTION_MS + 1;
             rekeyedAway.clear();
+            movedTo.clear();
             result = await stepOnCurrent(current, sqls, rollback, expected, rows);
             expect(
               result.same,
@@ -639,7 +692,10 @@ describe("write path vs PostgreSQL and the current engine (generated)", () => {
           }
           compared += 1;
           if (expected.outcome === "ok" && !rollback)
-            for (const key of log.moved) rekeyedAway.set(key, clock.ms);
+            for (const [from, to] of log.moved) {
+              rekeyedAway.set(from, clock.ms);
+              movedTo.set(from, to);
+            }
           parents = await compare(path, oracles, ids, workload, label);
         }
         await path.quiesce();

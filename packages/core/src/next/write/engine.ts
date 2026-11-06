@@ -91,6 +91,7 @@ import { manifestReader, MetadataReader } from "../format/metadata-reader.js";
 import { readRows } from "./rows.js";
 import { encodeRun, RunReader, runRef } from "./runs.js";
 import { Sequences } from "./sequences.js";
+import { GroupDirectory } from "./groups.js";
 import {
   GroupDeletes,
   groupDeletions,
@@ -118,21 +119,22 @@ interface TableState {
   nextGroupId: number;
   /** The pages of its durable group directory (`root.groups`), in row-id order. */
   pages: readonly GroupPageEntry[];
-  /** Bytes charged for its resident directory (`directoryBytes`) on the metadata grant. */
+  /**
+   * Bytes charged for `pages` (`pageIndexBytes`) on the metadata grant. The groups themselves are
+   * charged by their directory chunks (groups.ts), refcounted by the write states that hold them.
+   */
   metadataBytes: number;
 }
 
 /**
- * Resident bytes of a table's directory state, charged before it is materialized (review
- * B3-p2a-2 #1). Measured with V8 (decodeGroupPage over 160k realistic GroupRefs, a third with a
- * deletion bitmap): about 270 B per decoded GroupRef (its two BlobRefs; extents are shared per
- * page) and 193 B per page index entry. The estimate adds room for the view's array slot and
- * groups carrying both refs.
+ * Resident bytes of a table's directory page index (one `GroupPageEntry` per `GROUPS_PER_PAGE`
+ * groups: a page `BlobRef`, its extent, row-id range and counts), charged before it is
+ * materialized. V8 measures about 193 B per decoded entry with its array slot; 512 B covers any
+ * field shape (four objects of at most 8 fields, every number a heap double). It is O(groups / 4,096):
+ * 25 entries at 100k groups.
  */
-const GROUP_REF_BYTES = 320;
-const PAGE_ENTRY_BYTES = 224;
-const directoryBytes = (groups: number, pages: number): number =>
-  groups * GROUP_REF_BYTES + pages * PAGE_ENTRY_BYTES;
+const PAGE_ENTRY_BYTES = 512;
+const pageIndexBytes = (pages: number): number => pages * PAGE_ENTRY_BYTES;
 
 /** `TableRoot.groups` of a table without groups (format/manifest-codec.ts: nothing is read). */
 const EMPTY_DIRECTORY: BlobRef = {
@@ -148,18 +150,6 @@ function blobKey(ref: BlobRef): string {
 
 function sameExtent(a: ExtentRef, b: ExtentRef): boolean {
   return a.offset === b.offset && a.length === b.length;
-}
-
-/** The index of group `groupId` in `groups` (ascending group ids), or −1. */
-function groupIndex(groups: readonly GroupRef[], groupId: number): number {
-  let lo = 0;
-  let hi = groups.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >>> 1;
-    if ((groups[mid]?.groupId ?? 0) < groupId) lo = mid + 1;
-    else hi = mid;
-  }
-  return groups[lo]?.groupId === groupId ? lo : -1;
 }
 
 /** The highest seq of anything in a memtable (rows, delta entries). */
@@ -197,6 +187,8 @@ class StatePin implements SpacePin {
     readonly label: string,
     readonly pins: Map<WriteState, unknown>,
     readonly state: WriteState,
+    /** The last holder of the state is gone: its generation's metadata is released. */
+    readonly onLast: (state: WriteState) => void,
   ) {}
 
   get generation(): number {
@@ -214,6 +206,7 @@ class StatePin implements SpacePin {
     if (this.entry.count > 0) return;
     this.entry.pin.release();
     this.pins.delete(this.state);
+    this.onLast(this.state);
   }
 }
 
@@ -287,8 +280,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
    * label and a refusal raises `ParseBudgetError` instead of growing the heap unseen.
    */
   readonly #metadataGrant: Grant;
-  /** Bytes charged for the current root (its parse bound). */
-  #rootCharge: number;
+  /**
+   * Decoded roots and their parse charges, refcounted by the write states that hold them (review
+   * B3-p2a-3 #2): an older root stays charged until the last reader of its generation closes. A
+   * root starts with one reference, owned by its publication until a state installs it.
+   */
+  readonly #roots = new Map<ManifestRoot, { refs: number; readonly bytes: number }>();
   /** Group roots, directory pages and indexes: decoded once, cached under the governor. */
   readonly #metadata: MetadataReader;
   readonly #metadataCaches: ReadonlyArray<BlobCache<unknown>>;
@@ -311,7 +308,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     metadata: { readonly grant: Grant; readonly rootCharge: number },
   ) {
     this.#metadataGrant = metadata.grant;
-    this.#rootCharge = metadata.rootCharge;
+    this.#roots.set(root, { refs: 1, bytes: metadata.rootCharge });
     this.durability = input.options.durability;
     this.#memtableRows = input.tuning?.memtableRows ?? MEMTABLE_ROWS;
     this.#session = input.session;
@@ -428,53 +425,78 @@ export class WritePathImpl implements WritePath, EngineHooks {
 
   async #load(): Promise<void> {
     const root = this.#root;
-    for (const table of root.tables) {
-      const groups: GroupRef[] = [];
-      let pages: readonly GroupPageEntry[] = [];
-      let metadataBytes = 0;
-      if (!isEmptyDirectory(table.groups)) {
-        const index = await this.#metadata.groupIndex(table.groups, this.#grant);
-        pages = [...index.value];
-        index.release();
-        // The resident directory is charged before it is materialized (review B3-p2a-2 #1).
-        metadataBytes = directoryBytes(table.groupCount, pages.length);
-        this.#chargeMetadata(metadataBytes);
-        for (const page of pages) {
-          const held = await this.#metadata.groupPage(page.ref, this.#grant);
-          groups.push(...held.value);
+    const built: GroupDirectory[] = [];
+    try {
+      for (const table of root.tables) {
+        let groups = GroupDirectory.EMPTY;
+        let pages: readonly GroupPageEntry[] = [];
+        let metadataBytes = 0;
+        if (!isEmptyDirectory(table.groups)) {
+          const index = await this.#metadata.groupIndex(table.groups, this.#grant);
+          // The page index is charged before it is materialized; each directory chunk is charged
+          // (exactly) before its buffer exists (review B3-p2a-3, ruling on findings 1, 2, 6).
+          metadataBytes = pageIndexBytes(index.value.length);
+          try {
+            this.#chargeMetadata(metadataBytes);
+          } catch (error) {
+            index.release();
+            throw error;
+          }
+          pages = [...index.value];
+          index.release();
+          const builder = GroupDirectory.builder(this.#metadataGrant).expect(table.groupCount);
+          try {
+            for (const page of pages) {
+              const held = await this.#metadata.groupPage(page.ref, this.#grant);
+              try {
+                for (const group of held.value) builder.add(group);
+              } finally {
+                held.release();
+              }
+            }
+            groups = builder.finish();
+          } catch (error) {
+            builder.abandon();
+            this.#chargeMetadata(-metadataBytes);
+            throw error;
+          }
+          built.push(groups);
+        }
+        const runs = new Map<number, readonly RunRef[]>();
+        for (const index of [table.keyIndex, ...table.secondaryIndexes])
+          if (index !== null) runs.set(index.indexId, index.runs);
+        const state: TableState = {
+          tableId: table.tableId,
+          view: {
+            tableId: table.tableId,
+            groups,
+            runs,
+            groupDeletes: new GroupDeletes(),
+            foldedThrough: table.flushedThroughLsn,
+            groupSources: new Map(),
+            memtables: [],
+          },
+          root: table,
+          createdLsn: 0,
+          flushedThroughLsn: table.flushedThroughLsn,
+          nextRowId: table.nextRowId,
+          nextGroupId: groups.nextGroupId,
+          pages,
+          metadataBytes,
+        };
+        for (let position = 0; position < groups.count; position++) {
+          const held = await this.#metadata.groupRoot(groups.root(position), this.#grant);
+          this.#summarize(table.tableId, held.value);
           held.release();
         }
+        this.#tables.set(table.tableId, state);
       }
-      const runs = new Map<number, readonly RunRef[]>();
-      for (const index of [table.keyIndex, ...table.secondaryIndexes])
-        if (index !== null) runs.set(index.indexId, index.runs);
-      const state: TableState = {
-        tableId: table.tableId,
-        view: {
-          tableId: table.tableId,
-          groups,
-          runs,
-          groupDeletes: new GroupDeletes(),
-          foldedThrough: table.flushedThroughLsn,
-          groupSources: new Map(),
-          memtables: [],
-        },
-        root: table,
-        createdLsn: 0,
-        flushedThroughLsn: table.flushedThroughLsn,
-        nextRowId: table.nextRowId,
-        nextGroupId: groups.reduce((max, group) => Math.max(max, group.groupId + 1), 1),
-        pages,
-        metadataBytes,
-      };
-      for (const group of groups) {
-        const held = await this.#metadata.groupRoot(group.root, this.#grant);
-        this.#summarize(table.tableId, held.value);
-        held.release();
-      }
-      this.#tables.set(table.tableId, state);
+      this.#publishState();
+    } finally {
+      // The first state holds them now (or the open failed and nothing does).
+      for (const directory of built) directory.releaseCreation();
+      this.#releaseRoot(root);
     }
-    this.#publishState();
   }
 
   async #recover(): Promise<void> {
@@ -674,12 +696,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
         memtable.deletions.set(rowId - memtable.firstRowId, seq);
         return;
       }
-    const group = state.view.groups.find(
-      (candidate) => rowId >= candidate.firstRowId && rowId <= candidate.lastRowId,
-    );
-    if (group === undefined)
-      throw new LogCorruptionError(`A logged delete names unknown row ${String(rowId)}`);
-    state.view.groupDeletes.add(group.groupId, rowId - group.firstRowId, seq);
+    const groups = state.view.groups;
+    const at = groups.indexOfRow(rowId);
+    if (at < 0) throw new LogCorruptionError(`A logged delete names unknown row ${String(rowId)}`);
+    state.view.groupDeletes.add(groups.groupId(at), rowId - groups.firstRowId(at), seq);
   }
 
   /** Index puts for row ids `rowIds` (physical `rows` of `vectors`, or all) into `memtable`, at `seq`. */
@@ -840,7 +860,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       tableId,
       view: {
         tableId,
-        groups: [],
+        groups: GroupDirectory.EMPTY,
         runs: new Map(),
         groupDeletes: new GroupDeletes(),
         foldedThrough: 0,
@@ -895,9 +915,32 @@ export class WritePathImpl implements WritePath, EngineHooks {
 
   /** Bytes charged for resident metadata: the root and every table's directory state. */
   get residentMetadataBytes(): number {
-    let total = this.#rootCharge;
-    for (const state of this.#tables.values()) total += state.metadataBytes;
+    let total = this.#roots.get(this.#root)?.bytes ?? 0;
+    for (const state of this.#tables.values())
+      total += state.metadataBytes + state.view.groups.chargedBytes;
     return total;
+  }
+
+  #releaseRoot(root: ManifestRoot): void {
+    const entry = this.#roots.get(root);
+    if (entry === undefined) return;
+    entry.refs -= 1;
+    if (entry.refs > 0) return;
+    this.#roots.delete(root);
+    this.#chargeMetadata(-entry.bytes);
+  }
+
+  /** A write state now holds its root and every table's directory chunks (one reference each). */
+  #retainState(state: WriteState): void {
+    const root = this.#roots.get(state.root);
+    if (root !== undefined) root.refs += 1;
+    for (const view of state.tables.values()) view.groups.retain();
+  }
+
+  /** The last holder of `state` is gone. */
+  #releaseState(state: WriteState): void {
+    for (const view of state.tables.values()) view.groups.release();
+    this.#releaseRoot(state.root);
   }
 
   /** Total bytes of every table's memtables (live, frozen, retained). */
@@ -1182,10 +1225,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const def = this.#catalog.table(tableId);
     const state = this.#tables.get(tableId);
     if (def === undefined || state === undefined) return null;
-    let rowCount = 0;
-    for (const group of state.view.groups) rowCount += group.liveRowCount;
-    for (const group of state.view.groups)
-      rowCount -= groupDeletions(state.view, group.groupId, MAX_LSN).length;
+    // Only groups with deletions above the bitmaps are visited (not every group).
+    let rowCount = state.view.groups.liveRowCount;
+    const changed = new Set<number>(state.view.groupDeletes.byGroup.keys());
+    for (const groupId of state.view.groupSources.keys()) changed.add(groupId);
+    for (const groupId of changed) rowCount -= groupDeletions(state.view, groupId, MAX_LSN).length;
     for (const memtable of state.view.memtables)
       rowCount += memtable.rowCount - memtable.deletions.size;
     const totals = this.#summaries.get(tableId);
@@ -1319,9 +1363,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
     if (held === undefined) {
       held = { pin: this.#space.pin(label), count: 0 };
       this.#statePins.set(state, held);
+      this.#retainState(state);
     }
     held.count += 1;
-    return new StatePin(held, label, this.#statePins, state);
+    return new StatePin(held, label, this.#statePins, state, (released) => {
+      this.#releaseState(released);
+    });
   }
 
   #runReader(ref: RunRef): RunReader | Promise<RunReader> {
@@ -1408,6 +1455,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
     if (def === undefined) return;
     const writer = this.#space.beginWrite(`flush t${String(state.tableId)}`);
     const retired: ExtentRef[] = [];
+    // Directory chunks and the root this publication made: it owns them until a state holds them.
+    let created: GroupDirectory | null = null;
+    let madeRoot: ManifestRoot | null = null;
     try {
       const view = state.view;
       const newGroups: GroupRef[] = [];
@@ -1447,26 +1497,30 @@ export class WritePathImpl implements WritePath, EngineHooks {
       }
       // Fold deletions (≤ through) of older groups into their bitmaps: only groups with pending
       // deletions are visited (review B3-p2a-2 #5), and the first changed one bounds page reuse.
-      const groups: GroupRef[] = view.groups.slice();
-      let firstChanged = groups.length;
-      let liveRowCount = state.root?.liveRowCount ?? 0;
+      const before = view.groups;
+      const changes = new Map<number, GroupRef>();
+      let firstChanged = before.count + newGroups.length;
       const candidates = new Set<number>(view.groupDeletes.byGroup.keys());
       for (const groupId of view.groupSources.keys()) candidates.add(groupId);
-      for (const groupId of [...candidates].sort((a, b) => a - b)) {
-        const at = groupIndex(groups, groupId);
-        const group = groups[at];
-        if (group === undefined) continue;
+      for (const groupId of [...candidates].sort((x, y) => x - y)) {
+        const at = before.indexOfGroupId(groupId);
+        if (at < 0) continue;
         const folded = groupDeletions(view, groupId, through);
         if (folded.length === 0) continue;
+        const group = before.get(at);
         const old = group.deletions === null ? null : await this.#bitmap(group.deletions);
         const deletions = await this.#writeBitmap(writer, group.rowCount, old, folded);
         if (group.deletions !== null) retired.push(group.deletions.extent);
-        groups[at] = { ...group, deletions, liveRowCount: group.liveRowCount - folded.length };
-        liveRowCount -= folded.length;
+        changes.set(at, { ...group, deletions, liveRowCount: group.liveRowCount - folded.length });
         firstChanged = Math.min(firstChanged, at);
       }
-      groups.push(...newGroups);
-      for (const group of newGroups) liveRowCount += group.liveRowCount;
+      firstChanged = Math.min(firstChanged, before.count);
+      // The next generation's directory: unchanged chunks shared, changed ones and the tail
+      // copied, each charged before it is allocated (review B3-p2a-3 #1, #2, #6). This publication
+      // owns the new chunks' creation references until a state holds them (or it fails).
+      const groups = before.with(changes, newGroups, this.#metadataGrant);
+      created = groups;
+      const liveRowCount = groups.liveRowCount;
       const { directory, pages } = await this.#writeDirectory(
         writer,
         state,
@@ -1489,7 +1543,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         flushedThroughLsn: through,
         liveRowCount,
         groups: directory,
-        groupCount: groups.length,
+        groupCount: groups.count,
         staged: [],
         keyIndex: indexRoot(def, def.primaryKey, runs),
         secondaryIndexes: def.indexes
@@ -1500,25 +1554,32 @@ export class WritePathImpl implements WritePath, EngineHooks {
       };
       const root = await this.#nextRoot(writer, retired, new Map([[state.tableId, tableRoot]]));
       const rootBytes = encodeManifestRoot(root);
-      // The resident state this publish adds (directory growth, the new root) is charged first.
-      const metadataBytes = directoryBytes(groups.length, pages.length);
+      // The resident state this publish adds (page index growth, the new root) is charged first.
+      // The pending publication owns both charges across the await (review B3-p2a-3 #3): they
+      // pass to the table state and the new write state when it installs, or are refunded.
+      const metadataBytes = pageIndexBytes(pages.length);
+      const growth = metadataBytes - state.metadataBytes;
       const rootCharge = parseCharge(rootBytes.length);
-      this.#chargeMetadata(metadataBytes - state.metadataBytes);
+      this.#chargeMetadata(growth);
       try {
         this.#chargeMetadata(rootCharge);
       } catch (error) {
-        this.#chargeMetadata(state.metadataBytes - metadataBytes);
+        this.#chargeMetadata(-growth);
         throw error;
       }
+      this.#roots.set(root, { refs: 1, bytes: rootCharge });
+      madeRoot = root;
       try {
         await this.#space.publish(rootBytes, { writers: [writer], retired });
       } catch (error) {
-        this.#chargeMetadata(state.metadataBytes - metadataBytes - rootCharge);
+        this.#chargeMetadata(-growth);
         throw error;
       }
-      this.#chargeMetadata(-this.#rootCharge);
-      this.#rootCharge = rootCharge;
-      state.metadataBytes = metadataBytes;
+      // A table dropped while the publish was in flight never holds the new page index: its own
+      // charge went (or goes) with the drop, so the growth is refunded here.
+      const live = this.#tables.get(state.tableId) === state;
+      if (live) state.metadataBytes = metadataBytes;
+      else this.#chargeMetadata(-growth);
       // Re-point readers in the same step the publish resolves (ruling R16.3).
       const pin: SpacePin = this.#space.pin(`re-point t${String(state.tableId)}`);
       const flushed = [...set];
@@ -1567,7 +1628,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       }
       for (const [memtable, entry] of published) sources.set(entry.group.groupId, memtable);
 
-      this.#setView(state, {
+      const nextView: TableView = {
         tableId: state.tableId,
         groups,
         runs,
@@ -1575,11 +1636,20 @@ export class WritePathImpl implements WritePath, EngineHooks {
         foldedThrough: through,
         groupSources: sources,
         memtables: current.memtables.filter((memtable) => !set.includes(memtable)),
-      });
+      };
+      // The new state retains the root and (for a live table) the directory's chunks.
+      if (live) this.#setView(state, nextView);
+      else {
+        state.view = nextView;
+        this.#publishState();
+      }
       this.publications += 1;
     } catch (error) {
       if (writer.state === "open") await writer.abort().catch(() => undefined);
       throw error;
+    } finally {
+      created?.releaseCreation();
+      if (madeRoot !== null) this.#releaseRoot(madeRoot);
     }
   }
 
@@ -1626,7 +1696,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   async #writeDirectory(
     writer: ExtentWriter,
     state: TableState,
-    groups: readonly GroupRef[],
+    groups: GroupDirectory,
     firstChanged: number,
     retired: ExtentRef[],
   ): Promise<{ directory: BlobRef; pages: readonly GroupPageEntry[] }> {
@@ -1640,7 +1710,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
     }
     let directory = EMPTY_DIRECTORY;
     let pages: readonly GroupPageEntry[] = [];
-    if (groups.length > 0) {
+    if (groups.count > 0) {
+      // Only the rewritten pages' groups are decoded (at most a page plus changed pages).
       const written = await writeGroupDirectory(writer, groups.slice(kept), keep);
       directory = written.ref;
       pages = written.pages;

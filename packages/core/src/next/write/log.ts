@@ -14,6 +14,7 @@
  * - Any append or flush failure fails the appender: every waiter rejects with
  *   `WritePathFailedError` and later calls throw it.
  */
+import { MAX_LSN } from "../access/snapshot.js";
 import { WritePathFailedError } from "../access/write-path.js";
 import {
   encodeFrame,
@@ -47,6 +48,23 @@ interface Boundary {
   readonly end: number;
   readonly chain: number;
   readonly lsn: number;
+}
+
+/**
+ * The log has used every committed LSN (`MAX_LSN`, 2^52 − 1): the transaction was not appended and
+ * nothing changed. Unreachable in practice (a million commits a second for 142 years).
+ */
+export class LogExhaustedError extends Error {
+  readonly code = "MINNOW_LOG_EXHAUSTED";
+  constructor(
+    readonly lastLsn: number,
+    readonly parts: number,
+  ) {
+    super(
+      `The log cannot take a ${String(parts)}-frame transaction after LSN ${String(lastLsn)}: committed LSNs end at ${String(MAX_LSN)}`,
+    );
+    this.name = "LogExhaustedError";
+  }
 }
 
 export class LogAppender {
@@ -116,12 +134,21 @@ export class LogAppender {
     if (this.#failure !== null) throw this.#failure;
   }
 
-  /** Queues one transaction (one or more frames); returns its last LSN. Synchronous. */
+  /**
+   * Queues one transaction (one or more frames); returns its last LSN. Synchronous. A transaction
+   * whose last frame would pass `MAX_LSN` (committed LSNs end there; pending statement seqs lie
+   * above it) is refused with `LogExhaustedError` before anything changes (review B3-p2a-3 #5);
+   * so is one too large for the log.
+   */
   append(body: Uint8Array): number {
     this.#check();
     const parts = Math.max(1, Math.ceil(body.length / MAX_FRAME_BODY_BYTES));
     if (parts > MAX_FRAME_PARTS) throw new RangeError("A transaction is too large for the log");
     const first = this.#lastLsn + 1;
+    if (first + parts - 1 > MAX_LSN) throw new LogExhaustedError(this.#lastLsn, parts);
+    // Frames are encoded first and committed together: a failure leaves the log unchanged.
+    const frames: Uint8Array[] = [];
+    let chain = this.#chain;
     for (let part = 0; part < parts; part++) {
       const slice =
         parts === 1
@@ -130,13 +157,17 @@ export class LogAppender {
       const frame = encodeFrame(
         { salt: this.#salt, lsn: first + part, partIndex: part, partCount: parts },
         slice,
-        this.#chain,
+        chain,
       );
-      this.#chain = frame.chain;
-      this.#end += frame.bytes.length;
-      this.bytes += frame.bytes.length;
-      this.#queued.push(frame.bytes);
-      this.#queuedBytes += frame.bytes.length;
+      chain = frame.chain;
+      frames.push(frame.bytes);
+    }
+    this.#chain = chain;
+    for (const bytes of frames) {
+      this.#end += bytes.length;
+      this.bytes += bytes.length;
+      this.#queued.push(bytes);
+      this.#queuedBytes += bytes.length;
     }
     this.#lastLsn = first + parts - 1;
     this.#schedule();

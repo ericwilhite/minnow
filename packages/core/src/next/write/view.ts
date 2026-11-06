@@ -46,6 +46,7 @@ import { allocateData } from "../vector/vector.js";
 import type { FlatVector, Selection } from "../vector/vector.js";
 import { compareBytes } from "../vector/varlen.js";
 import { MEMORY_CHUNK_ROWS } from "./columns.js";
+import type { GroupDirectory } from "./groups.js";
 import type { Memtable } from "./memtable.js";
 import type { RunEntry } from "./runs.js";
 import { groupDeletions, type Shared, type TableView, type WriteState } from "./state.js";
@@ -110,34 +111,39 @@ class GroupSegmentImpl implements GroupSegment {
   readonly kind = "group" as const;
   readonly staged = false;
   readonly rowCount: number;
+  readonly #groupId: number;
+  #group: GroupRef | null = null;
   #root: GroupRoot | null = null;
   #deleted: number | null = null;
 
+  /** Group `position` of `directory`, read from its columns (`group` decodes it on demand). */
   constructor(
     readonly index: number,
-    readonly group: GroupRef,
+    readonly directory: GroupDirectory,
+    readonly position: number,
     readonly view: TableSnapshotImpl,
   ) {
-    this.rowCount = group.rowCount;
+    this.rowCount = directory.rowCount(position);
+    this.#groupId = directory.groupId(position);
+  }
+
+  get group(): GroupRef {
+    return (this.#group ??= this.directory.get(this.position));
   }
 
   get liveRowCount(): number {
     if (this.#deleted === null) {
-      const delta = groupDeletions(
-        this.view.tableView,
-        this.group.groupId,
-        this.view.snapshot.bound,
-      );
-      // The durable bitmap is in `group.liveRowCount`; delta positions are not in it.
-      this.#deleted = this.group.rowCount - this.group.liveRowCount + delta.length;
+      const delta = groupDeletions(this.view.tableView, this.#groupId, this.view.snapshot.bound);
+      // The durable bitmap is in the group's live count; delta positions are not in it.
+      this.#deleted = this.rowCount - this.directory.liveRows(this.position) + delta.length;
     }
-    return this.group.rowCount - this.#deleted;
+    return this.rowCount - this.#deleted;
   }
 
   deletions(): MaybePromise<DeletionVector | null> {
     this.view.snapshot.check();
-    const delta = groupDeletions(this.view.tableView, this.group.groupId, this.view.snapshot.bound);
-    const ref = this.group.deletions;
+    const delta = groupDeletions(this.view.tableView, this.#groupId, this.view.snapshot.bound);
+    const ref = this.directory.deletions(this.position);
     if (ref === null) return deletionVector(this.rowCount, null, delta);
     return settle(this.view.snapshot.shared.bitmap(ref), (bits) =>
       deletionVector(this.rowCount, bits, delta),
@@ -155,7 +161,8 @@ class GroupSegmentImpl implements GroupSegment {
     this.view.snapshot.check();
     if (this.#root !== null) return this.#root;
     const got =
-      this.#pending ?? this.view.snapshot.shared.groupRoot(this.group.root, this.view.budget);
+      this.#pending ??
+      this.view.snapshot.shared.groupRoot(this.directory.root(this.position), this.view.budget);
     if (got instanceof Promise && this.#pending !== got) {
       this.#pending = got;
       // A failed read is not kept: concurrent callers share its rejection, a later call retries
@@ -436,31 +443,12 @@ function columnIndex(def: TableDef): ReadonlyMap<number, number> {
   return index;
 }
 
-/** First row id of every segment of a table view (groups, then memtables), computed once. */
-const firstRowIdsOf = new WeakMap<TableView, Float64Array>();
-
-function firstRowIds(view: TableView): Float64Array {
-  let firsts = firstRowIdsOf.get(view);
-  if (firsts === undefined) {
-    firsts = new Float64Array(view.groups.length + view.memtables.length);
-    view.groups.forEach((group, k) => {
-      need(firsts)[k] = group.firstRowId;
-    });
-    view.memtables.forEach((memtable, k) => {
-      need(firsts)[view.groups.length + k] = memtable.firstRowId;
-    });
-    firstRowIdsOf.set(view, firsts);
-  }
-  return firsts;
-}
-
 export class TableSnapshotImpl implements TableSnapshot {
   readonly tableId: number;
   readonly schemaVersion: number;
   readonly columns: readonly ColumnDef[];
   #segments: readonly Segment[] | null = null;
   readonly #columnIndex: ReadonlyMap<number, number>;
-  readonly firstRowIds: Float64Array;
 
   constructor(
     readonly snapshot: SnapshotImpl,
@@ -472,15 +460,15 @@ export class TableSnapshotImpl implements TableSnapshot {
     this.schemaVersion = def.schemaVersion;
     this.columns = def.columns;
     this.#columnIndex = columnIndex(def);
-    this.firstRowIds = firstRowIds(tableView);
   }
 
   /** Built on first use (point reads and inserts never need them). */
   get segments(): readonly Segment[] {
     if (this.#segments === null) {
       const segments: Segment[] = [];
-      for (const group of this.tableView.groups)
-        segments.push(new GroupSegmentImpl(segments.length, group, this));
+      const groups = this.tableView.groups;
+      for (let position = 0; position < groups.count; position++)
+        segments.push(new GroupSegmentImpl(segments.length, groups, position, this));
       for (const memtable of this.tableView.memtables)
         segments.push(new MemorySegmentImpl(segments.length, memtable, this));
       this.#segments = segments;
@@ -516,25 +504,37 @@ export class TableSnapshotImpl implements TableSnapshot {
     return index;
   }
 
-  /** The locator of `rowId` in this view. */
+  /**
+   * The locator of `rowId` in this view: segments are the groups (searched in the directory's
+   * columns), then the memtables. Nothing per view is materialized.
+   */
   locator(rowId: number): number {
-    const firsts = this.firstRowIds;
+    const memtables = this.tableView.memtables;
+    const groups = this.tableView.groups;
+    for (let k = memtables.length - 1; k >= 0; k--) {
+      const first = need(memtables[k]).firstRowId;
+      if (first <= rowId) return packLocator(groups.count + k, rowId - first);
+    }
+    // Last group whose first row id ≤ rowId.
     let lo = 0;
-    let hi = firsts.length;
+    let hi = groups.count;
     while (lo < hi) {
       const mid = (lo + hi) >>> 1;
-      if ((firsts[mid] ?? 0) <= rowId) lo = mid + 1;
+      if (groups.firstRowId(mid) <= rowId) lo = mid + 1;
       else hi = mid;
     }
     const segment = lo - 1;
     if (segment < 0) throw new RangeError(`Row ${String(rowId)} is not in this view`);
-    return packLocator(segment, rowId - (firsts[segment] ?? 0));
+    return packLocator(segment, rowId - groups.firstRowId(segment));
   }
 
   /** The row id a locator names. */
   rowId(locator: number): number {
     const segment = Math.floor(locator / 65_536);
-    const first = this.firstRowIds[segment];
+    const groups = this.tableView.groups;
+    const memtable = this.tableView.memtables[segment - groups.count];
+    const first =
+      segment < groups.count && segment >= 0 ? groups.firstRowId(segment) : memtable?.firstRowId;
     if (first === undefined) throw new RangeError("A locator names no segment of this view");
     return first + (locator % 65_536);
   }

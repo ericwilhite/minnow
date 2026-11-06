@@ -17,6 +17,7 @@ const facts = (rekeyedAt = 99) => ({
     ["c", "id"],
   ]),
   rekeyedAway: new Map([["t", new Map([[51, rekeyedAt]])]]),
+  movedTo: new Map([["t", new Map([[51, 99]])]]),
 });
 
 const statement = (
@@ -119,26 +120,83 @@ describe("key-forwarding matcher", () => {
   });
 
   it("explains a child write the oracle stored through a forward that PostgreSQL refused", () => {
-    const child = statement({
-      kind: "insert",
-      table: "c",
-      newKeys: [1],
-      references: [{ table: "t", value: 51 }],
+    const child = (value: number, key = 1) =>
+      statement({
+        kind: "insert",
+        table: "c",
+        newKeys: [key],
+        references: [{ table: "t", value }],
+      });
+    const missing = (value: number, at: number) => ({
+      outcome: "foreignKey" as const,
+      message:
+        'insert or update on table "c" violates foreign key constraint "c_pid_fkey": ' +
+        `Key (pid)=(${String(value)}) is not present in table "t".`,
+      statement: at,
     });
-    const fk = { outcome: "foreignKey" as const, message: "violates foreign key constraint" };
-    expect(id(observation({ statements: [child], authority: fk }))).toBe("key-forwarding");
+    expect(id(observation({ statements: [child(51)], authority: missing(51, 0) }))).toBe(
+      "key-forwarding",
+    );
+    expect(id(observation({ statements: [child(52)], authority: missing(52, 0) }))).toBeNull();
+    // The refused key must be the forwarded one, and the refused statement the one writing it.
+    expect(id(observation({ statements: [child(51)], authority: missing(52, 0) }))).toBeNull();
+    expect(
+      id(
+        observation({
+          statements: [child(7, 1), child(51, 2)],
+          authority: { ...missing(51, 0) },
+        }),
+      ),
+    ).toBeNull();
+    // No refused statement or no DETAIL: no evidence, no match.
+    expect(
+      id(
+        observation({ statements: [child(51)], authority: { ...missing(51, 0), statement: null } }),
+      ),
+    ).toBeNull();
+    expect(
+      id(
+        observation({
+          statements: [child(51)],
+          authority: {
+            outcome: "foreignKey",
+            message: "violates foreign key constraint",
+            statement: 0,
+          },
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  it("does not explain an unrelated FK failure beside a forwarded reference (review B3-p2a-3 #4)", () => {
+    // The step inserts child (1, 999), then child (2, 51); 51 forwards, 999 never existed.
+    // PostgreSQL refuses the first statement for missing parent 999.
     expect(
       id(
         observation({
           statements: [
             statement({
+              sql: "INSERT INTO c VALUES (1, 999)",
               kind: "insert",
               table: "c",
               newKeys: [1],
-              references: [{ table: "t", value: 52 }],
+              references: [{ table: "t", value: 999 }],
+            }),
+            statement({
+              sql: "INSERT INTO c VALUES (2, 51)",
+              kind: "insert",
+              table: "c",
+              newKeys: [2],
+              references: [{ table: "t", value: 51 }],
             }),
           ],
-          authority: fk,
+          authority: {
+            outcome: "foreignKey",
+            message:
+              'insert or update on table "c" violates foreign key constraint "c_parent_fkey": ' +
+              'Key (parent)=(999) is not present in table "t".',
+            statement: 0,
+          },
         }),
       ),
     ).toBeNull();
@@ -165,6 +223,41 @@ describe("key-forwarding matcher", () => {
         }),
       ),
     ).toBeNull();
+    const differ = (...rows: Array<[string, number, number?]>) => ({
+      rowsDiffer: true,
+      differingRows: rows.map(([table, key, parent]) => ({
+        table,
+        key,
+        references: parent === undefined ? [] : [{ table: "t", value: parent }],
+      })),
+    });
+    // The UPDATE through 51 reached row 99 (where 51 moved): exactly that row differs.
+    expect(
+      id(
+        observation({
+          statements: [statement({ kind: "update", table: "t", matchedKeys: [51] })],
+          ...differ(["t", 99]),
+        }),
+      ),
+    ).toBe("key-forwarding");
+    // A child of the reached row may differ too (a cascade through it).
+    expect(
+      id(
+        observation({
+          statements: [statement({ kind: "delete", table: "t", matchedKeys: [51] })],
+          ...differ(["t", 99], ["c", 4, 99]),
+        }),
+      ),
+    ).toBe("key-forwarding");
+    // Any other differing row is not explained, even beside the forward.
+    expect(
+      id(
+        observation({
+          statements: [statement({ kind: "update", table: "t", matchedKeys: [51] })],
+          ...differ(["t", 99], ["t", 7]),
+        }),
+      ),
+    ).toBeNull();
     expect(
       id(
         observation({
@@ -172,12 +265,12 @@ describe("key-forwarding matcher", () => {
           rowsDiffer: true,
         }),
       ),
-    ).toBe("key-forwarding");
+    ).toBeNull();
     expect(
       id(
         observation({
           statements: [statement({ kind: "update", table: "t", matchedKeys: [52] })],
-          rowsDiffer: true,
+          ...differ(["t", 99]),
         }),
       ),
     ).toBeNull();

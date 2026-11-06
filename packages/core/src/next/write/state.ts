@@ -8,7 +8,8 @@
  */
 import type { Space, SpacePin } from "../access/space.js";
 import type { MaybePromise } from "../access/key-index.js";
-import type { BlobRef, GroupRef, GroupRoot, ManifestRoot, RunRef } from "../format/manifest.js";
+import type { BlobRef, GroupRoot, ManifestRoot, RunRef } from "../format/manifest.js";
+import type { GroupDirectory } from "./groups.js";
 import type { Held } from "../format/reachable.js";
 import type { ByteBudget } from "../storage/extents.js";
 import type { Memtable } from "./memtable.js";
@@ -66,8 +67,8 @@ export class GroupDeletes {
 
 export interface TableView {
   readonly tableId: number;
-  /** Durable groups in row-id order. */
-  readonly groups: readonly GroupRef[];
+  /** Durable groups in row-id order (shared immutable chunks, refcounted by write states). */
+  readonly groups: GroupDirectory;
   /** Durable runs per index id, newest first. */
   readonly runs: ReadonlyMap<number, readonly RunRef[]>;
   readonly groupDeletes: GroupDeletes;
