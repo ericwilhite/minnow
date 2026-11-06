@@ -34,6 +34,15 @@
  *   block. Width 0 means every delta is 0. Arithmetic wraps modulo 2^64 (int64) and is exact.
  * - **dictionary**: `rowCount` codes of `width` bytes into the chunk's dictionary (width 0: every
  *   row has code `aux`).
+ * - **scaledFloat** (float64 only): exact decimals. `aux` is the exponent e (≤
+ *   `SCALED_FLOAT_MAX_EXPONENT`), `width` 0, 1, 2 or 4. An 8-byte f64 base (a safe integer, the
+ *   smallest n), then `rowCount` unsigned deltas of `width` bytes padded to 8, then a u32 patch
+ *   count and a u32 0, the patched rows (u32, increasing) padded to 8, and each patched row's own
+ *   8 bytes. A row decodes as (base + delta) / 10^e, a patched row as its bytes: bit-identical
+ *   for every float64. The writer patches every value that does not satisfy that formula
+ *   exactly (−0, NaN with its payload, ±Infinity, subnormals, inexact decimals) and keeps the
+ *   page plain when more than 1 in 16 valid rows would be patched or it would not be smaller.
+ *   Null and patched rows hold delta 0. A reader decodes the page into a plain f64 lane.
  *
  * The page's length is exactly the end of its last section, so every header field is checked
  * against it: a page whose computed length differs from its stored length is corrupt.
@@ -42,6 +51,9 @@
  * The stored bytes of a page are either the page itself, or, when `PageEntry.encoding` has the
  * gzip bit, a u32 raw length followed by a gzip stream of the page. The xxHash32 in the page's
  * directory entry covers the stored bytes and is checked once when they come from storage.
+ * Every page, dictionary page and directory starts at an 8-byte offset of its extent (the
+ * writer puts up to 7 zero bytes before it), so pages read together into one buffer are viewed
+ * in place.
  */
 import type { PhysicalType } from "../types.js";
 
@@ -49,6 +61,8 @@ export const PAGE_FORMAT_VERSION = 1;
 export const PAGE_HEADER_BYTES = 16;
 /** Rows per delta block: a delta page restarts its prefix sum every this many rows. */
 export const DELTA_BLOCK = 128;
+/** The largest exponent of a `scaledFloat` page (10^15 is exact; integers stay safe). */
+export const SCALED_FLOAT_MAX_EXPONENT = 15;
 /** Text and bytes statistics keep at most this many bytes of a bound. */
 export const STAT_PREFIX_BYTES = 32;
 

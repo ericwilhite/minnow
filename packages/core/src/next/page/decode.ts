@@ -28,6 +28,7 @@ import {
   PageCorruptionError,
   LITTLE_ENDIAN,
   PAGE_HEADER_BYTES,
+  SCALED_FLOAT_MAX_EXPONENT,
   PageFlag,
   plainWidth,
   validityBytes,
@@ -275,6 +276,8 @@ export function parsePage(
   let checkpoints: Int32Array | null = null;
   let baseLow = 0;
   let baseHigh = 0;
+  /** A `scaledFloat` page decoded into a plain f64 lane (`plain`). */
+  let materialized = false;
   const buffer = bytes.buffer;
   const offset = bytes.byteOffset;
   const fits = (end: number): void => check(bytes.length >= end, "Page payload is truncated");
@@ -401,6 +404,52 @@ export function parsePage(
       }
       break;
     }
+    case PageEncoding.scaledFloat: {
+      // Exact decimals as integers over 10^aux, plus patched rows (format.ts). Materialized here
+      // into an f64 lane, so the page is read as a plain one from now on; the reader charges the
+      // lane (8 bytes per row) and attaches no descriptor of it.
+      check(tag === ValueTag.f64, "Scaled-float page outside float64");
+      check(width === 0 || width === 1 || width === 2 || width === 4, "Bad scaled-float width");
+      check(aux <= SCALED_FLOAT_MAX_EXPONENT, "Scaled-float exponent out of range");
+      check(!allNull, "All-null scaled-float page");
+      fits(start + 8);
+      const base = new Float64Array(buffer, offset + start, 1)[0] ?? Number.NaN;
+      const top = base + (width === 0 ? 0 : 2 ** (8 * width) - 1);
+      check(
+        Number.isSafeInteger(base) && Number.isSafeInteger(top),
+        "Scaled-float base out of range",
+      );
+      const deltasAt = start + 8;
+      const deltaBytes = align8(rows * width);
+      fits(deltasAt + deltaBytes + 8);
+      const header = new Uint32Array(buffer, offset + deltasAt + deltaBytes, 2);
+      const patches = header[0] ?? 0;
+      check(header[1] === 0 && patches <= rows, "Bad scaled-float patch count");
+      const positionsAt = deltasAt + deltaBytes + 8;
+      const valuesAt = positionsAt + align8(patches * 4);
+      length = valuesAt + patches * 8;
+      fits(length);
+      const lane = new Float64Array(rows);
+      const power = 10 ** aux;
+      if (width === 0) lane.fill(base / power);
+      else {
+        const deltas = unsignedView(buffer, offset + deltasAt, width, rows);
+        for (let row = 0; row < rows; row++) lane[row] = (base + (deltas[row] ?? 0)) / power;
+      }
+      const positions = new Uint32Array(buffer, offset + positionsAt, patches);
+      const laneBytes = new Uint8Array(lane.buffer);
+      let previous = -1;
+      for (let k = 0; k < patches; k++) {
+        const row = positions[k] ?? 0;
+        check(row > previous && row < rows, "Scaled-float patches out of order");
+        previous = row;
+        // The patched value's own 8 bytes (a NaN keeps its payload).
+        laneBytes.set(bytes.subarray(valuesAt + k * 8, valuesAt + k * 8 + 8), row * 8);
+      }
+      plain = lane;
+      materialized = true;
+      break;
+    }
     default:
       check(false, "Unknown page encoding");
   }
@@ -414,12 +463,12 @@ export function parsePage(
     headerBoundsSafe(kind, width, baseNumber, checkpoints, rows);
   const view: PageView = {
     bytes,
-    kind,
+    kind: materialized ? PageEncoding.plain : kind,
     tag,
     flags,
-    width,
+    width: materialized ? 8 : width,
     rowCount: rows,
-    aux,
+    aux: materialized ? 0 : aux,
     nullCount,
     validity,
     allNull,

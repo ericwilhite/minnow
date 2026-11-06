@@ -230,7 +230,7 @@ function validEncoding(encoding: number): boolean {
   return (
     (encoding & ~(PageEncoding.gzip | 0x7)) === 0 &&
     base >= PageEncoding.plain &&
-    base <= PageEncoding.dictionary
+    base <= PageEncoding.scaledFloat
   );
 }
 

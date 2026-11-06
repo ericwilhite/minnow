@@ -263,8 +263,13 @@ is access's `Snapshot`.
   the directory blob), so pruning and planning never read pages.
 - Encodings (`encode.ts` has the selection rules): constant (and all-null), plain, bool bitmap,
   frame of reference at u8/u16/u32 over an int64 base, delta (FOR over successive differences,
-  a checkpoint every 128 rows), and dictionary codes (u8/u16/u32, or one code) into a
-  group-scoped dictionary.
+  a checkpoint every 128 rows), dictionary codes (u8/u16/u32, or one code) into a
+  group-scoped dictionary, and scaled float (float64 exact decimals as FOR integers over 10^e,
+  every other value patched with its own 8 bytes, bit-identical; a reader decodes it into an f64
+  lane it is charged for). Every page starts at an 8-byte offset of its extent. Bit-packed FOR
+  widths were measured and not adopted: unpacking cost +38% to +659% in the decode kernel and
+  +46% to +194% in the pushdown compare (`scripts/bitpack-bench.mts`, 7–20 bits, two runs), far
+  past the ~5% a 6% size saving was allowed to cost.
 - NUMERIC: a declared scale makes a fixed-scale chunk; an unconstrained NUMERIC keeps each
   value's scale (a per-row section, or one scale per page), and its min/max are normalized sort
   keys (value order, scale ignored, R15.10), chosen by comparing the exact key bytes. Coefficients are stored by the int64 rules when they
@@ -428,10 +433,11 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
   High-cardinality text is 34% (`h02`'s free text alone 113 B/row), float64 31%, nullable
   floats 9%, int32 9%, decimals 8%; dictionary text 3%. Compaction gzip stores 869 B/row (−18%)
   but slows the decode stream from 224k to 65k rows/s from memory (inflate), so it does not pay
-  for an export. Candidates, measured on the same values and page boundaries (format changes,
-  not made): float64 pages whose values are exact decimals stored as frame-of-reference
-  integers, −103 B/row (−10%); frame of reference bit-packed instead of u8/u16/u32 widths,
-  −63 B/row (−6%).
+  for an export. Candidates, measured on the same values and page boundaries: float64 pages
+  whose values are exact decimals stored as frame-of-reference integers, estimated −103 B/row
+  (−10%), now the `scaledFloat` encoding: W1M stores 926.5 B/row (−12%), the OPFS table 998 MiB
+  instead of 1,137; frame of reference bit-packed instead of u8/u16/u32 widths, −63 B/row
+  (−6%), not adopted (its decode cost, under Pages above).
 - First batch (`SELECT *` first page, and `ORDER BY` the primary key, the same rows): a scan opens
   each projected column's chunk (its directory only), loads just the pages the batch covers (with
   the dictionary for dictionary pages) and decodes those rows; nothing is done for the rest of the

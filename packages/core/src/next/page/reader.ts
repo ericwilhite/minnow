@@ -874,7 +874,20 @@ export class ChunkReader {
         // Validated against the chunk, its dictionary's domain included: every consumer
         // (select, refine, gather, decode) relies on this one check (review B2-p2d #1), run once
         // per cache residency when the page's descriptor rides on its cache entry.
-        this.#pages[page] = this.#parse(entry, bytes, stored);
+        if ((entry.encoding & 0x7f) === PageEncoding.scaledFloat) {
+          // Decoded into an f64 lane the reader holds (8 bytes per row), charged before it is
+          // allocated, never attached to the cache entry (its bytes are not the entry's).
+          const lane = entry.rowCount * 8;
+          if (!this.#options.budget.allocate(lane)) throw new PageBudgetError(lane);
+          held = { ...held, charged: held.charged + lane };
+          this.#pages[page] = parsePage(
+            bytes,
+            entry,
+            this.directory.tag,
+            this.directory.scale,
+            this.directory.dictionary?.rowCount ?? 0,
+          );
+        } else this.#pages[page] = this.#parse(entry, bytes, stored);
         this.#held[page] = held;
       }
     } catch (error) {
