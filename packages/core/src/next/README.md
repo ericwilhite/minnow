@@ -593,11 +593,13 @@ and the owner import it directly.
   (512) every one is lowered again (~150 µs).
 - Table rules (CHECK, generated columns, defaults) are compiled per catalog identity, never per
   (table id, version) (`owner/rule-cache.ts`): the committed catalog's in one bounded (512 entries)
-  cache charged to the memory governor, which drops older committed catalogs' entries and yields
-  memory on reclaim; a transaction's own schema in a session cache dropped on ROLLBACK and
-  ROLLBACK TO.
+  cache that drops older committed catalogs' entries and closes with the engine; a transaction's
+  own schema in a session cache dropped on ROLLBACK and ROLLBACK TO. Both are the governor's
+  evictable caches (`registerCache`): charged at a size walked from the expressions, and evicted,
+  oldest unused across caches, before growth is refused or an operator spills.
 - SQL `BEGIN READ ONLY` (and `START TRANSACTION READ ONLY`) is refused with 0A000 until lowering
-  reports a BEGIN's access mode; the protocol's read-only begin works. The refusal goes when
+  reports a BEGIN's access mode; the protocol's read-only begin works. The guard reads the modes
+  as the front end does (identifier words, punctuation ignored); it is not a grammar. The refusal goes when
   lowering's fix lands, and the owner's test then requires 25006 for a write in it.
 - Tests: in process (`testing/owner-*.test.ts`, the election ones on in-memory Web Locks) and
   across real tabs in Chromium, Firefox and WebKit (`npm run test:browser:next-owner`), over real

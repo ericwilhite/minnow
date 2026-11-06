@@ -150,6 +150,11 @@ export interface MemoryGovernor {
   registerCache(cache: EvictableCache): {
     charge(bytes: number): boolean;
     release(bytes: number): void;
+    /**
+     * Stops asking this cache to evict (a cache that closes; release its bytes first). Optional:
+     * a cache that lives as long as its governor need not call it.
+     */
+    unregister?(): void;
   };
 }
 
@@ -522,6 +527,10 @@ export class Governor implements MemoryGovernor {
       },
       release: (bytes: number): void => {
         this.give(bytes);
+      },
+      unregister: (): void => {
+        const at = this.#caches.indexOf(cache);
+        if (at >= 0) this.#caches.splice(at, 1);
       },
     };
   }

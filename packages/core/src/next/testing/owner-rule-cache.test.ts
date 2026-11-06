@@ -35,7 +35,7 @@ describe("RuleCache", () => {
     const rules = engine as unknown as {
       rules(catalog: CatalogView, tableId: number, local?: RuleCache | null): TableRules;
     };
-    const local = new RuleCache(null, "test");
+    const local = new RuleCache(null);
     const a = rules.rules(plain, tableId, local);
     expect(rules.rules(plain, tableId, local)).toBe(a);
     expect(rules.rules(checked, tableId, local)).not.toBe(a);
@@ -45,7 +45,7 @@ describe("RuleCache", () => {
 
   it("evicts least recently used entries past its bound, and returns their bytes", () => {
     const governor = new Governor(64 * 1024 * 1024);
-    const cache = new RuleCache(governor, "test", 3);
+    const cache = new RuleCache(governor, 3);
     const catalog = new MemoryCatalog().view;
     const rules = (id: number) => ({ check: () => null, generate: () => undefined, id });
     const expressions = { checks: [], generated: [], defaults: [] };
@@ -60,7 +60,7 @@ describe("RuleCache", () => {
 
   it("gives its bytes back when the governor asks (cooperative reclaim)", async () => {
     const governor = new Governor(8 * 1024 * 1024);
-    const cache = new RuleCache(governor, "test");
+    const cache = new RuleCache(governor);
     const catalog = new MemoryCatalog().view;
     const expressions = { checks: [], generated: [], defaults: [] };
     for (let id = 1; id <= 20; id++)

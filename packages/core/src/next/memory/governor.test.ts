@@ -167,6 +167,35 @@ describe("synchronous admission (ruling R14, ported from rebuild/exec 3ad7c99)",
 });
 
 describe("memory governor: cache, reclaim and lifecycle", () => {
+  it("never asks an unregistered cache to evict", () => {
+    const governor = new Governor(16 * MiB);
+    let asked = 0;
+    let cached = 4 * MiB;
+    const handle = governor.registerCache({
+      get evictableBytes() {
+        return cached;
+      },
+      evict(bytes) {
+        asked++;
+        const freed = Math.min(bytes, cached);
+        cached -= freed;
+        handle.release(freed);
+        return freed;
+      },
+    });
+    expect(handle.charge(4 * MiB)).toBe(true);
+    handle.unregister();
+    // Only eviction could make room for this one, and the cache is no longer the governor's to ask.
+    const grant = governor.tryAdmit({
+      label: "big",
+      minimumBytes: 16 * MiB - governor.reserveBytes,
+      spillable: false,
+    });
+    expect({ grant, asked }).toEqual({ grant: null, asked: 0 });
+    handle.release(cached);
+    expect(governor.usedBytes).toBe(0);
+  });
+
   it("evicts the cache before refusing growth, and growth never takes the reserve", async () => {
     const governor = new Governor(16 * MiB);
     let cached = 8 * MiB;

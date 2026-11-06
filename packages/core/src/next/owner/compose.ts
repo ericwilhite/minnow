@@ -252,7 +252,7 @@ class ComposedEngine implements OwnerEngine {
     this.#options = options;
     this.#now = options.now ?? Date.now;
     this.#statistics = options.statistics ?? { table: () => null };
-    this.#rules = new RuleCache(options.governor, "owner/table rules");
+    this.#rules = new RuleCache(options.governor);
   }
 
   /**
@@ -391,8 +391,13 @@ class ComposedEngine implements OwnerEngine {
     return this.#options.writePath.flush();
   }
 
-  close(): Promise<void> {
-    return this.#options.writePath.close();
+  async close(): Promise<void> {
+    try {
+      await this.#options.writePath.close();
+    } finally {
+      // The committed catalog's rules go with the engine, whether or not the write path closed.
+      this.#rules.close();
+    }
   }
 }
 
@@ -539,7 +544,7 @@ class ComposedSession implements EngineSession {
 
   /** Rules compiled against this transaction's own schema: dropped with it (rule-cache.ts). */
   #privateRules(): RuleCache {
-    this.#txRules ??= new RuleCache(this.#engine.options.governor, "owner/transaction rules");
+    this.#txRules ??= new RuleCache(this.#engine.options.governor);
     return this.#txRules;
   }
 
