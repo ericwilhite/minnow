@@ -281,3 +281,30 @@ export function decimalValue(value: unknown): string {
   }
   return `${c.toString()}e-${String(s)}`;
 }
+
+/** A value as the PGlite differentials write it (sqlLiteral). */
+export type SqlValue = number | bigint | string | boolean | readonly [bigint, number] | null;
+
+/**
+ * A PostgreSQL literal of `value` cast to `type` (int2, int4, int8, float4, float8, numeric,
+ * numeric(p,s), text, bool), for the differential suites; a string is text, or a NUMERIC or
+ * float special ("NaN", "Infinity", "-Infinity"). Every value is quoted, then cast:
+ * unquoted, `-2147483648::int4` casts 2147483648 before the minus and fails with 22003, a
+ * PostgreSQL error from the literal that a suite comparing SQLSTATEs would take for the
+ * operation's answer. Text doubles its apostrophes. NUMERIC is [coefficient, scale]; floats keep
+ * −0.
+ */
+export function sqlLiteral(type: string, value: SqlValue): string {
+  if (value === null) return `null::${type}`;
+  if (Array.isArray(value)) {
+    const [c, s] = value as readonly [bigint, number];
+    const negative = c < 0n;
+    const digits = (negative ? -c : c).toString().padStart(s + 1, "0");
+    const text =
+      s === 0 ? digits : `${digits.slice(0, digits.length - s)}.${digits.slice(digits.length - s)}`;
+    return `'${negative ? "-" : ""}${text}'::${type}`;
+  }
+  if (typeof value === "number" && Object.is(value, -0)) return `'-0'::${type}`;
+  if (typeof value === "string") return `'${value.replaceAll("'", "''")}'::${type}`;
+  return `'${String(value)}'::${type}`;
+}

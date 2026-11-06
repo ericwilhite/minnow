@@ -33,6 +33,7 @@ import { drive, type Operator } from "../packages/core/dist/next/exec/pipeline.j
 import type { AggregateCall, OutputColumn } from "../packages/core/dist/next/ir/ir.js";
 import type { PhysicalType } from "../packages/core/dist/next/types.js";
 import type { Batch, Vector } from "../packages/core/dist/next/vector/vector.js";
+import { aggShapes } from "../packages/core/browser/next-agg-shapes.ts";
 
 const repeatsArg = process.argv.indexOf("--repeats");
 const REPEATS = repeatsArg >= 0 ? Number(process.argv[repeatsArg + 1]) : 7;
@@ -283,161 +284,42 @@ for (const [groups, reference] of [
   );
 }
 
-// agg_3dims_20aggs as the harness runs it (analytics-harness gen.js and queries.js): d00, d01, d02
-// of 5 (skewed: u² × 5), 10 and 20 values, so at most 1,000 groups, and its 21 aggregates over
-// int4, float8, a nullable int, a text and a timestamp column.
+// The analytics harness's aggregation shapes as gen.js generates them, shared with the browser
+// lane (packages/core/browser/next-agg-shapes.ts): agg_highcard_int, agg_3dims_20aggs (at most
+// 1,000 groups), agg_count_distinct, agg_numeric_sum.
 {
-  const mix = (a: number, b: number): number => {
-    let h = Math.imul(a ^ 0x5bd1e995, 0x9e3779b1) ^ Math.imul(b + 0x7f4a7c15, 0x85ebca77);
-    h ^= h >>> 16;
-    h = Math.imul(h, 0x7feb352d);
-    h ^= h >>> 15;
-    h = Math.imul(h, 0x846ca68b);
-    h ^= h >>> 16;
-    return h >>> 0;
-  };
-  const U = 4294967296;
-  const DCARDS = [5, 10, 20, 50, 100, 200, 500, 1000];
-  const dimCodes = (k: number, start: number, n: number): number[] => {
-    const card = DCARDS[k % 8] as number;
-    return Array.from({ length: n }, (_, j) => {
-      const u = mix(start + j, 10 + k);
-      return k % 3 === 0 ? Math.floor((u / U) * (u / U) * card) : u % card;
-    });
-  };
-  const dimEntries = (k: number) =>
-    texts(Array.from({ length: DCARDS[k % 8] as number }, (_, v) => `d${String(k)}_${String(v)}`));
-  const intCol = (k: number, start: number, n: number) =>
-    numbers(
-      I32,
-      Array.from({ length: n }, (_, j) => {
-        const u = mix(start + j, 1000 + k);
-        return [
-          u % 100,
-          u % 1000,
-          u % 1000000,
-          Math.floor((start + j) / 100),
-          (u % 2000000001) - 1000000000,
-          u % 10,
-          u % 65536,
-          u % 1000000,
-          (u % 10000) - 5000,
-          u % 1000,
-        ][k % 10] as number;
-      }),
+  const lib = { I32, I64, F64, TEXT, TS, decimal, numbers, texts, dictionary, decimals, col };
+  const names = ["agg_highcard_int", "agg_3dims_20aggs", "agg_count_distinct", "agg_numeric_sum"];
+  const breakdown = ONLY.startsWith("3dims part");
+  const wanted = names.filter(
+    (name) => `harness ${name}`.includes(ONLY) || (breakdown && name === "agg_3dims_20aggs"),
+  );
+  for (const shape of wanted.length === 0 ? [] : aggShapes(lib, M, wanted)) {
+    await bench(`harness ${shape.name}`, M, `${shape.reference} (whole query)`, () =>
+      run(shape.batches, shape.input, shape.groupBy, shape.aggregates),
     );
-  const floatCol = (k: number, start: number, n: number) =>
-    numbers(
-      F64,
-      Array.from({ length: n }, (_, j) => {
-        const i = start + j;
-        const u = mix(i, 2000 + k);
-        switch (k % 4) {
-          case 0:
-            return (u % 1000000) / 1000;
-          case 1:
-            return ((u % 10000) + (mix(i, 2500 + k) % 10000)) / 100 - 100;
-          case 2:
-            return (u / U) * 1e6;
-          default:
-            return (u % 100000) / 100;
-        }
-      }),
+    if (shape.name !== "agg_3dims_20aggs") continue;
+    // What each kind of aggregate adds to the key cost (`--only "3dims part"`).
+    const all = shape.aggregates;
+    const countStar = all.slice(0, 1);
+    await bench("3dims part: COUNT(*) only", M, "key cost of the shape above", () =>
+      run(shape.batches, shape.input, shape.groupBy, countStar),
     );
-  const dims = [0, 1, 2, 10].map(dimEntries);
-  let start = 0;
-  const data = batches(M, (n) => {
-    const columns: Vector[] = [
-      ...[0, 1, 2].map((k, d) =>
-        dictionary(dims[d] as Vector & { form: "flat" }, dimCodes(k, start, n)),
-      ),
-      ...[10, 11, 12, 13, 15].map((k) => intCol(k, start, n)), // 3–7
-      ...[10, 11, 12, 13, 14, 15, 16].map((k) => floatCol(k, start, n)), // 8–14
-      ...[16, 17, 18].map((k) => intCol(k, start, n)), // 15–17
-      ...[17, 18].map((k) => floatCol(k, start, n)), // 18–19
-      // x00: int, 10 % NULL.
-      numbers(
-        I32,
-        Array.from({ length: n }, (_, j) =>
-          mix(start + j, 5000) / U < 0.1 ? null : mix(start + j, 6000) % 100000,
-        ),
-      ), // 20
-      dictionary(dims[3] as Vector & { form: "flat" }, dimCodes(10, start, n)), // 21: d10
-      numbers(
-        TS,
-        Array.from(
-          { length: n },
-          (_, j) => (1704067200000 + (start + j) * 30000 + (mix(start + j, 1) % 30000)) * 1000,
-        ),
-      ), // 22: ts (µs)
+    const parts: Array<[string, AggregateCall[]]> = [
+      ["5 × SUM(int4)", all.slice(1, 6)],
+      ["5 × AVG(float8)", all.slice(6, 11)],
+      ["MIN/MAX float8, int4", all.slice(11, 15)],
+      ["2 × SUM(float8)", all.slice(15, 17)],
+      ["AVG(int4)", all.slice(17, 18)],
+      ["COUNT(nullable int)", all.slice(18, 19)],
+      ["MIN(text)", all.slice(19, 20)],
+      ["MAX(timestamp)", all.slice(20, 21)],
     ];
-    start += n;
-    return columns;
-  });
-  const input: PhysicalType[] = [
-    TEXT,
-    TEXT,
-    TEXT,
-    I32,
-    I32,
-    I32,
-    I32,
-    I32,
-    F64,
-    F64,
-    F64,
-    F64,
-    F64,
-    F64,
-    F64,
-    I32,
-    I32,
-    I32,
-    F64,
-    F64,
-    I32,
-    TEXT,
-    TS,
-  ];
-  const aggregates: AggregateCall[] = [
-    call("count_star", I64, null, I64),
-    ...[3, 4, 5, 6, 7].map((c) => call("sum", I64, c, I32)),
-    ...[8, 9, 10, 11, 12].map((c) => call("avg", F64, c, F64)),
-    call("min", F64, 13, F64),
-    call("max", F64, 14, F64),
-    call("min", I32, 15, I32),
-    call("max", I32, 16, I32),
-    call("sum", F64, 18, F64),
-    call("sum", F64, 19, F64),
-    call("avg", D, 17, I32),
-    call("count", I64, 20, I32),
-    call("min", TEXT, 21, TEXT),
-    call("max", TS, 22, TS),
-  ];
-  await bench(
-    "agg_3dims_20aggs (harness shape, ≤ 1,000 groups)",
-    M,
-    "DuckDB 134 ms (whole query)",
-    () => run(data, input, [0, 1, 2], aggregates),
-  );
-  await bench("agg_3dims_20aggs, COUNT(*) only", M, "key cost of the shape above", () =>
-    run(data, input, [0, 1, 2], [call("count_star", I64, null, I64)]),
-  );
-  // What each kind of aggregate adds to the key cost (`--only "3dims part"`).
-  const parts: Array<[string, AggregateCall[]]> = [
-    ["5 × SUM(int4)", aggregates.slice(1, 6)],
-    ["5 × AVG(float8)", aggregates.slice(6, 11)],
-    ["MIN/MAX float8, int4", aggregates.slice(11, 15)],
-    ["2 × SUM(float8)", aggregates.slice(15, 17)],
-    ["AVG(int4)", aggregates.slice(17, 18)],
-    ["COUNT(nullable int)", aggregates.slice(18, 19)],
-    ["MIN(text)", aggregates.slice(19, 20)],
-    ["MAX(timestamp)", aggregates.slice(20, 21)],
-  ];
-  for (const [label, some] of parts)
-    await bench(`3dims part: COUNT(*) + ${label}`, M, "minus the key cost", () =>
-      run(data, input, [0, 1, 2], [call("count_star", I64, null, I64), ...some]),
-    );
+    for (const [label, some] of parts)
+      await bench(`3dims part: COUNT(*) + ${label}`, M, "minus the key cost", () =>
+        run(shape.batches, shape.input, shape.groupBy, [...countStar, ...some]),
+      );
+  }
 }
 
 // agg_count_distinct: COUNT(DISTINCT) over two high-cardinality text columns.
