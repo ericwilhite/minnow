@@ -48,6 +48,8 @@ const REACH = [
   "idle-publish",
   "drop-table",
   "drop-index",
+  "abandoned",
+  "flush-of-dropped-table",
   "reopen",
 ] as const;
 const reach = createReach("next-write-extent-deltas", REACH);
@@ -74,30 +76,55 @@ describe("extent deltas (ruling R25)", () => {
     it(`replaying the deltas gives each root's reachable extents (seed ${String(seed)})`, async () => {
       const random = mulberry32(seed);
       const int = (n: number) => Math.floor(random() * n);
+      // Some merges fail right after their prepare (the merge is abandoned, the path goes on).
       const harness = new Harness("strict", "sim", 6, undefined, {
         merges: { fanIn: 2 },
         logRecycleBytes: 1500 + int(2000),
         idleGarbageBytes: 1,
+        afterDeltaPrepared: (kind) => {
+          if (kind === "merge" && random() < 0.3) {
+            throw new Error("injected failure after prepare");
+          }
+        },
       });
       reach.beginHistory();
       const set = new Map<number, number>();
       let sequence = 0;
       const deltas: PublishDelta[] = [];
-      harness.extentDeltas = (delta) => {
-        expect(delta.sequence, "deltas come in publish order").toBe(sequence + 1);
-        sequence = delta.sequence;
-        for (const extent of delta.released) {
-          expect(set.has(extent.offset), `released ${String(extent.offset)} is reached`).toBe(true);
-          set.delete(extent.offset);
-        }
-        for (const extent of delta.added) {
-          expect(set.has(extent.offset), `added ${String(extent.offset)} is new`).toBe(false);
-          set.set(extent.offset, extent.length);
-        }
-        deltas.push(delta);
-        if (delta.added.length > 0) reach.reach("added");
-        if (delta.released.length > 0) reach.reach("released");
-        return null;
+      // The committed list changes only at published(); a prepared delta waits for its settle.
+      let pending: PublishDelta | null = null;
+      harness.extentDeltas = {
+        prepare: (delta) => {
+          expect(pending, "one publication at a time").toBeNull();
+          expect(delta.sequence, "deltas come in publish order").toBe(sequence + 1);
+          for (const extent of delta.released)
+            expect(set.has(extent.offset), `released ${String(extent.offset)} is reached`).toBe(
+              true,
+            );
+          for (const extent of delta.added)
+            expect(set.has(extent.offset), `added ${String(extent.offset)} is new`).toBe(false);
+          pending = delta;
+          return null;
+        },
+        published: (published) => {
+          const delta = need(pending);
+          expect(published).toBe(delta.sequence);
+          pending = null;
+          sequence = delta.sequence;
+          for (const extent of delta.released) set.delete(extent.offset);
+          for (const extent of delta.added) set.set(extent.offset, extent.length);
+          deltas.push(delta);
+          if (delta.added.length > 0) reach.reach("added");
+          if (delta.released.length > 0) reach.reach("released");
+        },
+        abandoned: (abandoned) => {
+          expect(abandoned).toBe(need(pending).sequence);
+          pending = null;
+          reach.reach("abandoned");
+        },
+        failed: (_sequence, error) => {
+          throw new Error(`no publish fails in this test: ${String(error)}`, { cause: error });
+        },
       };
       let path: WritePathImpl = await harness.open();
       const check = async (label: string) => {
@@ -196,11 +223,47 @@ describe("extent deltas (ruling R25)", () => {
         if (path.maintenance.merges > 0) reach.reach("merge");
         if (path.maintenance.recycles > 0) reach.reach("recycle");
         if (path.maintenance.idlePublishes > 0) reach.reach("idle-publish");
+        if (path.maintenance.flushesAbandoned > 0) reach.reach("flush-of-dropped-table");
       }
       await check("the end");
       expect(deltas.length).toBeGreaterThan(5);
       await harness.close();
     }, 300_000);
+
+  it("a rejected publish settles its prepared delta as failed, never as published", async () => {
+    const harness = new Harness("strict", "memory", 2);
+    const calls: string[] = [];
+    harness.extentDeltas = {
+      prepare: (delta) => {
+        calls.push(`prepare ${String(delta.sequence)}`);
+        return null;
+      },
+      published: (sequence) => calls.push(`published ${String(sequence)}`),
+      abandoned: (sequence) => calls.push(`abandoned ${String(sequence)}`),
+      failed: (sequence) => calls.push(`failed ${String(sequence)}`),
+    };
+    const path = await harness.open();
+    let t = 0;
+    await autocommit(path, async (s) => {
+      t =
+        (
+          await s.changeCatalog({
+            kind: "createTable",
+            table: tableInput("t", [column("id", INT, false)]),
+          })
+        ).id ?? 0;
+    });
+    const failure = new Error("injected publish refusal");
+    harness.space.publish = () => Promise.reject(failure);
+    // Two commits: the first fills a memtable, the second freezes it, so its flush publishes.
+    await autocommit(path, (s) => s.table(t).insert(batch(ints([1, 2])), null));
+    await autocommit(path, (s) => s.table(t).insert(batch(ints([3])), null));
+    await path.quiesce().catch(() => undefined);
+    expect(path.failure).toBe(failure);
+    // The initial root, then a prepared flush that failed: nothing after it was published.
+    expect(calls).toEqual(["prepare 1", "published 1", "prepare 2", "failed 2"]);
+    await harness.close();
+  });
 
   it("reached every declared state", () => {
     reach.assertReached();

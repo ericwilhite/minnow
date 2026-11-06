@@ -34,6 +34,8 @@ export type EngineInput = OpenWritePathInput & {
     readonly beforeFlushPublish?: () => Promise<void>;
     /** Log bytes past which the log is recycled (default `LOG_RECYCLE_BYTES`). */
     readonly logRecycleBytes?: number;
+    /** Tests: called after each R25 prepare, before the root is encoded; a throw fails there. */
+    readonly afterDeltaPrepared?: (kind: PublicationKind, sequence: number) => void;
     /** The garbage floor of the idle publish (ruling R10; default `IDLE_GARBAGE_BYTES`). */
     readonly idleGarbageBytes?: number;
   };
@@ -418,6 +420,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   #recycling: Promise<void> | null = null;
   readonly #idleGarbageBytes: number;
   readonly #extentDeltas: ExtentDeltaSink | null;
+  readonly #afterDeltaPrepared: ((kind: PublicationKind, sequence: number) => void) | null;
   /** The armed idle-publish check (R10), if any. */
   #idleTimer: ReturnType<typeof setTimeout> | null = null;
   /** An idle publication the timer started and that has not finished. */
@@ -460,6 +463,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
     mergesDuringFlush: 0,
     /** Merges dropped at publish because their inputs changed (a drop). */
     mergesAbandoned: 0,
+    /** Flushes dropped at publish because their table was dropped meanwhile. */
+    flushesAbandoned: 0,
     /** Merges that failed before their publish (inputs kept), and the last failure's message. */
     mergeFailures: 0,
     lastMergeFailure: null as string | null,
@@ -521,6 +526,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#logRecycleBytes = input.tuning?.logRecycleBytes ?? LOG_RECYCLE_BYTES;
     this.#idleGarbageBytes = input.tuning?.idleGarbageBytes ?? IDLE_GARBAGE_BYTES;
     this.#extentDeltas = input.extentDeltas ?? null;
+    this.#afterDeltaPrepared = input.tuning?.afterDeltaPrepared ?? null;
     this.#now = input.options.now ?? Date.now;
     this.#root = root;
     this.#catalog = catalog;
@@ -595,11 +601,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
           clients: [],
         };
         await session.resetLog();
-        await emitDelta(input.extentDeltas ?? null, root.sequence, writer, []);
-        const bytes = encodeManifestRoot(root);
-        rootCharge = parseCharge(bytes.length);
-        if (!metadataGrant.allocate(rootCharge)) throw new ParseBudgetError(rootCharge);
-        await space.publish(bytes, { writers: [writer], retired: [] });
+        const delta = new DeltaPublication("initial", input.extentDeltas ?? null);
+        try {
+          await delta.prepare(root.sequence, writer, []);
+          const bytes = encodeManifestRoot(root);
+          rootCharge = parseCharge(bytes.length);
+          if (!metadataGrant.allocate(rootCharge)) throw new ParseBudgetError(rootCharge);
+          await delta.publish(space, bytes, writer, []);
+        } finally {
+          delta.settle();
+        }
       } else {
         // The decoded root stays resident for the session: its parse charge stays with it.
         const parsed = decodeManifestRoot(space.root, metadataGrant);
@@ -1730,6 +1741,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     let created: GroupDirectory | null = null;
     let madeRoot: ManifestRoot | null = null;
     let unlock: (() => void) | null = null;
+    const delta = new DeltaPublication("flush", this.#extentDeltas, this.#afterDeltaPrepared);
     this.#flushesWriting += 1;
     let writing = true;
     try {
@@ -1838,6 +1850,15 @@ export class WritePathImpl implements WritePath, EngineHooks {
       unlock = await this.#lock();
       this.#flushesWriting -= 1;
       writing = false;
+      // A table dropped while this flush wrote its groups publishes nothing: the next root
+      // retires everything the dropped table reached, and these groups would be reachable from
+      // no root (found by the R25 delta test: extents retired twice). Its memtables go with the
+      // drop.
+      if (this.#tables.get(state.tableId) !== state) {
+        await writer.abort();
+        this.maintenance.flushesAbandoned += 1;
+        return;
+      }
       if (this.#merging) this.maintenance.flushesDuringMerge += 1;
       const runs = new Map<number, readonly RunRef[]>();
       for (const index of def.indexes) {
@@ -1868,7 +1889,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         statistics,
       };
       const root = await this.#nextRoot(writer, retired, new Map([[state.tableId, tableRoot]]));
-      await this.#emitDelta(root.sequence, writer, retired);
+      await delta.prepare(root.sequence, writer, retired);
       const rootBytes = encodeManifestRoot(root);
       // The resident state this publish adds (page index growth, the new root) is charged first.
       // The pending publication owns both charges across the await (review B3-p2a-3 #3): they
@@ -1886,7 +1907,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#roots.set(root, { refs: 1, bytes: rootCharge });
       madeRoot = root;
       try {
-        await this.#space.publish(rootBytes, { writers: [writer], retired });
+        await delta.publish(this.#space, rootBytes, writer, retired);
       } catch (error) {
         this.#chargeMetadata(-growth);
         throw error;
@@ -1973,23 +1994,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (writer.state === "open") await writer.abort().catch(() => undefined);
       throw error;
     } finally {
+      delta.settle();
       created?.releaseCreation();
       if (madeRoot !== null) this.#releaseRoot(madeRoot);
       unlock?.();
       if (writing) this.#flushesWriting -= 1;
     }
     this.#scheduleMerge();
-  }
-
-  // ── Extent deltas (ruling R25) ──────────────────────────────────────────────────────────
-
-  /**
-   * Tells the storage track's sink this publication's extent delta (access/write-path.ts
-   * `PublishDelta`), after the root's contents are fixed and before it is encoded; adds what the
-   * sink retires of its own to `retired`.
-   */
-  async #emitDelta(sequence: number, writer: ExtentWriter, retired: ExtentRef[]): Promise<void> {
-    await emitDelta(this.#extentDeltas, sequence, writer, retired);
   }
 
   // ── Idle maintenance (ruling R10) ───────────────────────────────────────────────────────
@@ -2058,6 +2069,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     }
     const unlock = await this.#lock();
     let madeRoot: ManifestRoot | null = null;
+    const delta = new DeltaPublication("idle", this.#extentDeltas, this.#afterDeltaPrepared);
     const writer = this.#space.beginWrite("idle publish");
     try {
       // The lock may have waited: closed, or garbage reclaimed by a publish meanwhile.
@@ -2067,13 +2079,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
       }
       const released: ExtentRef[] = [];
       const root = await this.#nextRoot(writer, released, new Map());
-      await this.#emitDelta(root.sequence, writer, released);
+      await delta.prepare(root.sequence, writer, released);
       const bytes = encodeManifestRoot(root);
       const charge = parseCharge(bytes.length);
       this.#chargeMetadata(charge);
       this.#roots.set(root, { refs: 1, bytes: charge });
       madeRoot = root;
-      await this.#space.publish(bytes, { writers: [writer], retired: released });
+      await delta.publish(this.#space, bytes, writer, released);
       this.#root = root;
       this.#pruneCatalogs(root.globalLsn);
       this.#publishState();
@@ -2082,6 +2094,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (writer.state === "open") await writer.abort().catch(() => undefined);
       throw error;
     } finally {
+      delta.settle();
       if (madeRoot !== null) this.#releaseRoot(madeRoot);
       unlock();
     }
@@ -2144,6 +2157,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     let switched = false;
     let unlock: (() => void) | null = null;
     let madeRoot: ManifestRoot | null = null;
+    const delta = new DeltaPublication("recycle", this.#extentDeltas, this.#afterDeltaPrepared);
     let writer: ExtentWriter | null = null;
     try {
       this.#check();
@@ -2227,13 +2241,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
         root.sequence !== sequence
       )
         throw new RangeError("A log recycle's root does not cover the log it would reset");
-      await this.#emitDelta(root.sequence, writer, retired);
+      await delta.prepare(root.sequence, writer, retired);
       const rootBytes = encodeManifestRoot(root);
       const rootCharge = parseCharge(rootBytes.length);
       this.#chargeMetadata(rootCharge);
       this.#roots.set(root, { refs: 1, bytes: rootCharge });
       madeRoot = root;
-      await this.#space.publish(rootBytes, { writers: [writer], retired });
+      await delta.publish(this.#space, rootBytes, writer, retired);
       switched = true;
       this.#root = root;
       this.#pruneCatalogs(root.globalLsn);
@@ -2257,6 +2271,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (!switched) this.#appender.abandonRecycle();
       else if (this.#appender.recycling)
         this.#appender.failRecycle(new Error("The log reset after a recycle's publish failed"));
+      delta.settle();
       if (madeRoot !== null) this.#releaseRoot(madeRoot);
       unlock?.();
       this.#maintenanceHolds = false;
@@ -2389,6 +2404,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     });
     let unlock: (() => void) | null = null;
     let madeRoot: ManifestRoot | null = null;
+    const delta = new DeltaPublication("merge", this.#extentDeltas, this.#afterDeltaPrepared);
     this.#merging = true;
     try {
       const readers: RunReader[] = [];
@@ -2442,13 +2458,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
       };
       const retired: ExtentRef[] = inputs.map(runExtent);
       const next = await this.#nextRoot(writer, retired, new Map([[state.tableId, tableRoot]]));
-      await this.#emitDelta(next.sequence, writer, retired);
+      await delta.prepare(next.sequence, writer, retired);
       const rootBytes = encodeManifestRoot(next);
       const rootCharge = parseCharge(rootBytes.length);
       this.#chargeMetadata(rootCharge);
       this.#roots.set(next, { refs: 1, bytes: rootCharge });
       madeRoot = next;
-      await this.#space.publish(rootBytes, { writers: [writer], retired });
+      await delta.publish(this.#space, rootBytes, writer, retired);
       this.#root = next;
       this.#pruneCatalogs(next.globalLsn);
       state.root = tableRoot;
@@ -2477,6 +2493,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       throw error;
     } finally {
       this.#merging = false;
+      delta.settle();
       if (madeRoot !== null) this.#releaseRoot(madeRoot);
       unlock?.();
       grant.close();
@@ -2758,21 +2775,60 @@ async function readBlob(space: Space, ref: BlobRef, budget: Grant): Promise<Uint
   }
 }
 
-/** One publication's delta to `sink` (see `WritePathImpl.#emitDelta`). */
-async function emitDelta(
-  sink: ExtentDeltaSink | null,
-  sequence: number,
-  writer: ExtentWriter,
-  retired: ExtentRef[],
-): Promise<void> {
-  if (sink === null) return;
-  const result = await sink({
-    sequence,
-    added: [...writer.extents],
-    released: [...retired],
-    writer,
-  });
-  if (result !== null) retired.push(...result.retire);
+/**
+ * One publication's R25 conversation with the sink (access/write-path.ts `ExtentDeltaSink`):
+ * `prepare`, then `publish`, which settles it as published or failed; `settle` (always called in
+ * the publication's finally) abandons a prepared delta that was never published.
+ */
+/** What a publication is (tests and diagnostics). */
+export type PublicationKind = "initial" | "flush" | "merge" | "recycle" | "idle";
+
+class DeltaPublication {
+  #pending: number | null = null;
+
+  constructor(
+    readonly kind: PublicationKind,
+    readonly sink: ExtentDeltaSink | null,
+    readonly afterPrepared: ((kind: PublicationKind, sequence: number) => void) | null = null,
+  ) {}
+
+  async prepare(sequence: number, writer: ExtentWriter, retired: ExtentRef[]): Promise<void> {
+    if (this.sink === null) return;
+    const result = await this.sink.prepare({
+      sequence,
+      added: [...writer.extents],
+      released: [...retired],
+      writer,
+    });
+    this.#pending = sequence;
+    if (result !== null) retired.push(...result.retire);
+    this.afterPrepared?.(this.kind, sequence);
+  }
+
+  async publish(
+    space: Space,
+    root: Uint8Array,
+    writer: ExtentWriter,
+    retired: readonly ExtentRef[],
+  ): Promise<void> {
+    try {
+      await space.publish(root, { writers: [writer], retired });
+    } catch (error) {
+      const pending = this.#pending;
+      this.#pending = null;
+      if (pending !== null) this.sink?.failed(pending, error);
+      throw error;
+    }
+    const pending = this.#pending;
+    this.#pending = null;
+    if (pending !== null) this.sink?.published(pending);
+  }
+
+  settle(): void {
+    const pending = this.#pending;
+    this.#pending = null;
+    if (pending !== null) this.sink?.abandoned(pending);
+  }
 }
 
 /** `openWritePath` (access/write-path.ts `OpenWritePath`). */

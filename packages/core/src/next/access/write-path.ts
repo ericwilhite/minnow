@@ -339,13 +339,26 @@ export interface ExtentDeltaResult {
 }
 
 /**
- * Called once per publication, after its root's contents are fixed and before the root is
- * encoded and published, in publish order. A rejection fails that publication (nothing was
- * published; the write path fails as for any publish error). The sink may not publish.
+ * The storage track's side of R25, told every publication in two phases, in publish order:
+ * 1. `prepare(delta)`, after the root's contents are fixed and before it is encoded (the sink may
+ *    write its list pages into `delta.writer`); a rejection fails that publication;
+ * 2. exactly one of:
+ *    - `published(sequence)`: the root is durable and current; the prepared change is now real;
+ *    - `abandoned(sequence)`: nothing was published (the writer was aborted, its pages with it,
+ *      the previous root is still current): forget the prepared change. A merge or idle publish
+ *      that fails before its publish leaves the write path running, so this happens in service;
+ *    - `failed(sequence, error)`: the publish was rejected; the root may or may not be durable, the
+ *      space has failed and refuses further publishes. The sink's in-memory list must not be used
+ *      again; the owner reopens, and startup rebuilds from the durable roots' own lists.
+ * So the sink's committed list only ever changes at `published`, and never diverges from the
+ * current root.
  */
-export type ExtentDeltaSink = (
-  delta: PublishDelta,
-) => Promise<ExtentDeltaResult | null> | ExtentDeltaResult | null;
+export interface ExtentDeltaSink {
+  prepare(delta: PublishDelta): Promise<ExtentDeltaResult | null> | ExtentDeltaResult | null;
+  published(sequence: number): void;
+  abandoned(sequence: number): void;
+  failed(sequence: number, error: unknown): void;
+}
 
 /**
  * Step 4 of "Startup order": scan, truncate and replay the log, then serve. Throws
