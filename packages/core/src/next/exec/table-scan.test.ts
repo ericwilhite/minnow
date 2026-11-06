@@ -23,7 +23,7 @@ import type {
   TableSnapshot,
 } from "../access/snapshot.js";
 import type { ScalarExpr } from "../ir/ir.js";
-import type { Loan } from "../memory/governor.js";
+import { Governor, type Loan } from "../memory/governor.js";
 import { MemoryExtentSpace } from "../page/memory-extents.js";
 import { ChunkReader } from "../page/reader.js";
 import { writeGroup, type TestValue } from "../page/test-support.js";
@@ -992,4 +992,245 @@ describe("review B4-p2c-2: the scan's lifecycle, budget and pacing", () => {
     scan.close();
     expect(budget.held).toBe(0);
   });
+});
+
+/**
+ * Review B4-p2c-3: loan lifecycles under the real governor (memory/governor.ts rule 5 and `Loan`:
+ * a loan covers one bounded step, its bytes are freed before it is repaid, and a grant repays
+ * before borrowing again), and the scan's abort contract (table-scan.ts "Pacing and ending").
+ */
+describe("review B4-p2c-3: loans under the real governor", () => {
+  /** A 150,000-byte grant (no growth beyond it) and its loans, counted. */
+  async function grantOf(): Promise<{
+    governor: Governor;
+    grant: Awaited<ReturnType<Governor["admit"]>>;
+    loans: { borrow(bytes: number): Promise<Loan> };
+    counts: { borrowed: number; repaid: number };
+  }> {
+    const governor = new Governor(16 * 1024 * 1024);
+    const grant = await governor.admit({ label: "scan", minimumBytes: 150_000, spillable: false });
+    const counts = { borrowed: 0, repaid: 0 };
+    const loans = {
+      async borrow(bytes: number): Promise<Loan> {
+        counts.borrowed += 1;
+        const loan = await grant.borrow(bytes);
+        return {
+          bytes,
+          repay() {
+            loan.repay();
+            counts.repaid += 1;
+          },
+        };
+      },
+    };
+    return { governor, grant, loans, counts };
+  }
+
+  /** Rows whose text is a distinct ~200 KB value (out of line), and its table. */
+  async function hugeRows(
+    space: MemoryExtentSpace,
+    count: number,
+  ): Promise<{ rows: Row[]; table: TableSnapshot }> {
+    const rows = rowsOf(mulberry32(3), count, false).map((r, k) => ({
+      ...r,
+      i: k,
+      t: `${String(k)}${"y".repeat(200_000)}`,
+    }));
+    const table: TableSnapshot = {
+      tableId: 9,
+      schemaVersion: 1,
+      columns: DEFS,
+      liveRowCount: count,
+      segments: [await groupSegment(0, rows, new Set(), false, space)],
+    };
+    return { rows, table };
+  }
+
+  it("1. a rejected oversized row gives its working set back and repays before the next", async () => {
+    const space = new MemoryExtentSpace();
+    const { table } = await hugeRows(space, 3);
+    const { governor, grant, loans, counts } = await grantOf();
+    // OR stays residual with default pushdown; it reads the huge text column and rejects all.
+    const filter: ScalarExpr = {
+      op: "or",
+      args: [cmp("=", C(3), lit(texts(["no match"]))), cmp("=", C(3), lit(texts(["also not"])))],
+      type: { kind: "bool" },
+    };
+    const scan = scanOf(table, space, filter, { budget: grant, loans, targetBytes: 65_536 });
+    expect(await collect(scan)).toEqual([]);
+    scan.close();
+    expect(counts.borrowed).toBeGreaterThan(1);
+    expect(counts.repaid).toBe(counts.borrowed);
+    expect([grant.allocated, grant.loaned]).toEqual([0, 0]);
+    grant.close();
+    expect(governor.usedBytes).toBe(0);
+  });
+
+  it("2. abort during an in-flight charged value read repays once the read settles", async () => {
+    const space = new MemoryExtentSpace({ cache: false });
+    const rows = rowsOf(mulberry32(3), 1, false).map((r) => ({ ...r, t: "x".repeat(200_000) }));
+    const table: TableSnapshot = {
+      tableId: 9,
+      schemaVersion: 1,
+      columns: DEFS,
+      liveRowCount: 1,
+      segments: [await groupSegment(0, rows, new Set(), false, space)],
+    };
+    const { governor, grant, loans, counts } = await grantOf();
+    // Holds back only the large value's read, after the space charged its lease.
+    let resume = (): void => undefined;
+    let reached = (): void => undefined;
+    const paused = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    const view = space.view({ cache: false });
+    const delayed = new Proxy(view, {
+      get(target, key) {
+        const member: unknown = Reflect.get(target, key, target);
+        if (typeof member !== "function") return member;
+        return (...args: unknown[]) => {
+          const result: unknown = Reflect.apply(member, target, args);
+          const refs = args[0] as ReadonlyArray<{ length: number }>;
+          if (key !== "read" || !refs.some((ref) => ref.length >= 200_000)) return result;
+          return Promise.resolve(result).then(
+            (lease) =>
+              new Promise((settle) => {
+                resume = () => {
+                  settle(lease);
+                };
+                reached();
+              }),
+          );
+        };
+      },
+    });
+    const reads: ChunkReads = {
+      open: (_pages, chunk, options) => ChunkReader.open(delayed, chunk, options),
+    };
+    const scan = scanOf(table, space, null, { budget: grant, loans, reads });
+    const pending = Promise.resolve(scan.next());
+    await paused;
+    // Abort while the scan's own read holds loan-backed bytes: no throw, repayment pending.
+    expect(() => {
+      scan.abort();
+    }).not.toThrow();
+    resume();
+    expect(await pending).toBeNull();
+    expect({ repaid: counts.repaid, allocated: grant.allocated, loaned: grant.loaned }).toEqual({
+      repaid: 1,
+      allocated: 0,
+      loaned: 0,
+    });
+    scan.close();
+    grant.close();
+    expect(governor.usedBytes).toBe(0);
+  });
+
+  it("abort after a decode failure under a real loan returns every byte and the loan", async () => {
+    const space = new MemoryExtentSpace();
+    const rows = rowsOf(mulberry32(3), 1, false).map((r) => ({ ...r, t: "x".repeat(200_000) }));
+    const table: TableSnapshot = {
+      tableId: 9,
+      schemaVersion: 1,
+      columns: DEFS,
+      liveRowCount: 1,
+      segments: [await groupSegment(0, rows, new Set(), false, space)],
+    };
+    const { governor, grant, loans } = await grantOf();
+    const reads: ChunkReads = {
+      open: async (_pages, chunk, options) => {
+        const reader = await ChunkReader.open(space.view({ cache: true }), chunk, options);
+        return new Proxy(reader, {
+          get(target, key) {
+            const member: unknown = Reflect.get(target, key, target);
+            if (typeof member !== "function") return member;
+            return (...args: unknown[]) => {
+              const result: unknown = Reflect.apply(member, target, args);
+              if ((key === "decodeRange" || key === "gather") && chunk.type.kind === "text")
+                throw new Error("injected after decode");
+              return result;
+            };
+          },
+        });
+      },
+    };
+    const scan = scanOf(table, space, null, { budget: grant, loans, reads, targetBytes: 65_536 });
+    await expect(collect(scan)).rejects.toThrow("injected after decode");
+    expect(grant.loaned).toBeGreaterThan(0);
+    scan.abort();
+    scan.close();
+    expect([grant.allocated, grant.loaned]).toEqual([0, 0]);
+    grant.close();
+    expect(governor.usedBytes).toBe(0);
+  });
+
+  it.each(SEEDS)(
+    "oversized rows under a real grant: residuals keep or reject them, loans balance (seed %i)",
+    async (seed) => {
+      const reach = createReach("next-table-scan-loans", [
+        "rejected oversized row",
+        "kept oversized row",
+        "consecutive rejected oversized rows",
+      ] as const);
+      await fc.assert(
+        fc.asyncProperty(
+          fc.array(fc.boolean(), { minLength: 1, maxLength: 7 }),
+          fc.array(fc.integer({ min: 0, max: 6 }), { minLength: 0, maxLength: 3 }),
+          fc.boolean(),
+          fc.integer(),
+          async (huge, kept, dense, inner) => {
+            reach.beginHistory();
+            const space = new MemoryExtentSpace();
+            const rows = rowsOf(mulberry32(inner), huge.length, false).map((r, k) => ({
+              ...r,
+              i: k,
+              t: huge[k] === true ? `${String(k)}${"z".repeat(200_000)}` : `small${String(k)}`,
+            }));
+            const table: TableSnapshot = {
+              tableId: 9,
+              schemaVersion: 1,
+              columns: DEFS,
+              liveRowCount: rows.length,
+              segments: [await groupSegment(0, rows, new Set(), false, space)],
+            };
+            // A residual over the text column (OR is never pushed): rows `kept` match.
+            const wanted = new Set(kept.filter((k) => k < rows.length).map((k) => at(rows, k).t));
+            const filter: ScalarExpr = {
+              op: "or",
+              args: [
+                cmp("=", C(3), lit(texts(["never"]))),
+                ...[...wanted].map((t) => cmp("=", C(3), lit(texts([t])))),
+              ],
+              type: { kind: "bool" },
+            };
+            const { governor, grant, loans, counts } = await grantOf();
+            const scan = scanOf(table, space, filter, {
+              budget: grant,
+              loans,
+              targetBytes: dense ? 1 << 20 : 65_536,
+            });
+            const ours = await collect(scan);
+            scan.close();
+            const expected = rows.filter((r) => wanted.has(r.t));
+            expect(ours.map((r) => r[3])).toEqual(expected.map((r) => r.t));
+            expect(counts.repaid).toBe(counts.borrowed);
+            expect([grant.allocated, grant.loaned]).toEqual([0, 0]);
+            grant.close();
+            expect(governor.usedBytes).toBe(0);
+            let run = 0;
+            rows.forEach((r, k) => {
+              if (huge[k] !== true) return;
+              const keep = wanted.has(r.t);
+              reach.reach(keep ? "kept oversized row" : "rejected oversized row");
+              run = keep ? 0 : run + 1;
+              if (run >= 2) reach.reach("consecutive rejected oversized rows");
+            });
+          },
+        ),
+        { seed, numRuns: 20 },
+      );
+      reach.assertReached();
+    },
+    300_000,
+  );
 });

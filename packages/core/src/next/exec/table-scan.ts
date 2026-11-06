@@ -26,7 +26,8 @@
  *   out-of-line values it leases and every target buffer it grows (`ScanMemory`, which both the
  *   targets and the chunk readers charge, draws on that reserve first). A refusal halves the
  *   batch; for one row the scan borrows a progress loan (ruling R18.3, memory/governor.ts rule 5)
- *   for it, and repays it once that batch's borrow ends and its buffers and values are back.
+ *   for it, and repays it once its buffers and values are back: when that batch's borrow ends,
+ *   or at once when the residual rejected the row (before the scan moves on or borrows again).
  * - A column the group predates reads `ColumnDef.missing` (a constant).
  *
  * ## Memory segments
@@ -38,10 +39,12 @@
  *   pruned away) yields with a task every `yieldIntervalMs`, so a long run of rejected rows does
  *   not hold the owner.
  * - At the end of the table the scan releases everything it holds (readers, values, buffers,
- *   scratch) and repays a loan. `abort` (a cancellation, an error, a LIMIT; `close` is the same)
- *   does so at once; a `next()` suspended on a read then resolves null: whatever settles after
- *   the abort (a reader opened, a loan served) is closed or repaid, and nothing more is read,
- *   decoded or emitted.
+ *   scratch) and repays a loan. `abort` (a cancellation, an error, a LIMIT) does so at once and
+ *   never throws; a `next()` suspended on a read then resolves null: whatever settles after the
+ *   abort (a reader opened, a loan served) is closed or repaid, and nothing more is read, decoded
+ *   or emitted. While the scan's own read still holds loan-backed bytes, the loan is repaid when
+ *   that read settles and the step unwinds. `close` is `abort`, and reports a loan that another
+ *   operator's bytes still hold.
  *
  * ## Borrowing, sync-when-cached
  * A batch's vectors are the scan's own buffers (or a memory segment's lent chunk), valid until the
@@ -281,6 +284,8 @@ export class TableScan implements BatchSource {
   #loan: Loan | null = null;
   #aborted = false;
   #released = false;
+  /** A step is suspended on a Promise (an access in flight). */
+  #suspended = false;
 
   constructor(options: TableScanOptions) {
     this.#options = options;
@@ -348,14 +353,20 @@ export class TableScan implements BatchSource {
     failure?: { error: unknown },
   ): MaybePromise<SourceItem | null> {
     let result: IteratorResult<Promise<unknown>, SourceItem | null>;
+    this.#suspended = false;
     try {
       if (failure !== undefined) result = step.throw(this.#aborted ? ABORTED : failure.error);
       else result = step.next(input);
     } catch (error) {
-      if (error === ABORTED) return null;
-      throw error;
+      if (error !== ABORTED) throw error;
+      this.#settleAborted();
+      return null;
     }
-    if (result.done) return result.value;
+    if (result.done) {
+      if (this.#aborted) this.#settleAborted();
+      return result.value;
+    }
+    this.#suspended = true;
     return result.value.then(
       (value) => this.#run(step, value),
       (error: unknown) => this.#run(step, undefined, { error }),
@@ -409,7 +420,11 @@ export class TableScan implements BatchSource {
     }
   }
 
-  /** The previous batch's borrow ended: release its values, repay a loan it needed. */
+  /**
+   * The previous batch's borrow ended, or a candidate the residual rejected is done: release its
+   * values, and repay a loan it needed (its buffers go back first) before the scan moves on or
+   * borrows again.
+   */
   #endBorrow(): void {
     const group = this.#group;
     if (group !== null) for (const column of group.columns) column.pages?.releaseValues();
@@ -422,6 +437,20 @@ export class TableScan implements BatchSource {
       } catch {
         // Still allocated elsewhere in the grant: kept, and retried (next batch, `close`).
       }
+    }
+  }
+
+  /**
+   * After an abort, once no step is suspended: a loan whose repayment the abort could not make
+   * (its own in-flight read still held loan-backed bytes, given back when that read settled) is
+   * repaid now. Still refused: kept for `close`.
+   */
+  #settleAborted(): void {
+    if (this.#loan === null) return;
+    try {
+      this.#repay();
+    } catch {
+      // Held elsewhere in the grant: `close` retries and reports it.
     }
   }
 
@@ -605,6 +634,8 @@ export class TableScan implements BatchSource {
       if (group.pendingCount > 0) {
         const item = yield* this.#emitPositions(group, group.pendingFrom, group.pendingTo);
         if (item !== null) return item;
+        // Rejected by the residual: its working set ends here (no borrow will end it).
+        this.#endBorrow();
         yield* this.#pace();
         continue;
       }
@@ -646,6 +677,8 @@ export class TableScan implements BatchSource {
         group.fresh = true;
         const item = yield* this.#emitPositions(group, from, to);
         if (item !== null) return item;
+        // Rejected by the residual: its working set ends here (no borrow will end it).
+        this.#endBorrow();
       }
       yield* this.#pace();
     }
@@ -886,21 +919,29 @@ export class TableScan implements BatchSource {
       this.#memoryOut = null;
       this.#memory.give(this.#scratchBytes);
     }
-    this.#repay();
+    // A read still in flight may hold loan-backed bytes until it settles: then the suspended
+    // step's unwinding repays (`#settleAborted`).
+    this.#settleAborted();
   }
 
   /**
    * Ends the scan early (cancellation, an error, a LIMIT): everything is released and a loan
-   * repaid at once; a `next()` still pending resolves null without reading or decoding more.
+   * repaid at once, or, while the scan's own read is in flight, as soon as that read settles; a
+   * `next()` still pending then resolves null without reading or decoding more. Never throws.
    */
   abort(): void {
     this.#aborted = true;
     this.#release();
   }
 
-  /** Releases every buffer and reader (after the last batch's borrow ended). */
+  /**
+   * Releases every buffer and reader (after the last batch's borrow ended). A loan that cannot be
+   * repaid with nothing of the scan in flight (another operator of the grant holds its bytes)
+   * throws here.
+   */
   close(): void {
     this.abort();
+    if (!this.#suspended) this.#repay();
   }
 }
 

@@ -636,7 +636,8 @@ and the owner import it directly.
 - Before a batch decodes, the scan reserves its whole working set from the grant: the
   out-of-line values it leases and every buffer it grows. A refusal halves the batch; for one
   row the scan borrows a progress loan (R18.3) for that working set and repays it once the row's
-  buffers and values are given back, after the batch's borrow ends. Out-of-line values are
+  buffers and values are given back: after the batch's borrow ends, or at once when the
+  residual rejected the row. Out-of-line values are
   released when the batch's borrow ends; the scan's own scratch (position lists, selections,
   locators, memory-segment staging) is charged before it is built.
 - Pushed predicates on the decoded fallback (below) load the values they read when they
@@ -644,9 +645,11 @@ and the owner import it directly.
 - Long runs that emit nothing (ranges, chunks and groups filtered or pruned away) yield to the
   event loop with a task every 4 ms inside one `next()` (R23).
 - Ending: at the end of the table the scan gives back everything it holds by itself; `abort` (a
-  cancellation, an error, a LIMIT) does the same at once and repays a loan. A `next()` still
-  waiting on a read then resolves null: whatever settles after the abort (a reader opened, a
-  loan served) is closed or repaid, and nothing more is read, decoded or emitted.
+  cancellation, an error, a LIMIT) does the same at once and repays a loan, never throwing. A
+  `next()` still waiting on a read then resolves null: whatever settles after the abort (a reader
+  opened, a loan served) is closed or repaid, and nothing more is read, decoded or emitted. A
+  loan the abort could not repay because the scan's own read still held loan-backed bytes is
+  repaid when that read settles; `close` reports one that another operator's bytes still hold.
 - Pushdown (`pushdown.ts`): pushed conjuncts run on encoded pages through the page format's
   read-side pushdown (`compilePredicate`, `pagesMatching`, `select`, `refine`, `chunkMayMatch`;
   "Predicates on encoded pages" above). Where it does not push a predicate down for a chunk
