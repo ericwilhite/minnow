@@ -48,7 +48,7 @@ const WARM_SHARE = 0.98;
  * minutes on a loaded host.
  */
 const DISTINCT = Number(process.env.MINNOW_EXPORT_DISTINCT ?? 4);
-/** MINNOW_EXPORT_FOCUS=1: only Gate A's configuration (cold ×4, warm ×2, a profiled pass). */
+/** MINNOW_EXPORT_FOCUS=1: only Gate A's configuration (cold ×5, warm ×5, a profiled pass). */
 const FOCUS = process.env.MINNOW_EXPORT_FOCUS === "1";
 /** The row window of the focused passes (MINNOW_EXPORT_WINDOW_MIB, default 64). */
 const WINDOW_MIB = Number(process.env.MINNOW_EXPORT_WINDOW_MIB ?? 64);
@@ -175,6 +175,7 @@ async function workers(page: Page) {
   const pending = new Map<number, (value: unknown) => void>();
   const profiles: CpuProfile[] = [];
   let next = 1;
+  let external = 0;
   const send = (sessionId: string, method: string, params: object = {}): Promise<unknown> => {
     const id = next++;
     const answer = new Promise<unknown>((resolve) => {
@@ -233,10 +234,18 @@ async function workers(page: Page) {
       for (const sessionId of sessions) {
         const result = (await send(sessionId, "Runtime.getHeapUsage")) as {
           usedSize?: number;
+          backingStorageSize?: number;
         } | null;
         used += result?.usedSize ?? 0;
+        external = Math.max(external, result?.backingStorageSize ?? 0);
       }
       return used;
+    },
+    /** The largest ArrayBuffer backing-store size seen since the last call (Chromium's CDP). */
+    takeExternal(): number {
+      const seen = external;
+      external = 0;
+      return seen;
     },
   };
 }
@@ -280,6 +289,10 @@ interface Row {
   readonly platformReads: number;
   readonly governorPeakMiB: number;
   readonly cacheResidentMiB: number;
+  /** Idle pooled one-pass buffers at the end of the pass. */
+  readonly poolMiB: number;
+  /** The worker's largest ArrayBuffer backing store seen during the pass (CDP), or 0. */
+  readonly arrayBufferPeakMiB: number;
   /** The page cache's protected segment before → after the export. */
   readonly protectedMiB: string;
   /** Hot set and scanned pages left after evicting everything but the hot set's size. */
@@ -349,6 +362,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       // The export worker's thread CPU: threads that appear during the pass, at their last sample.
       const threadsBefore = new Set(workerThreadCpu(profile).keys());
       const passCpu = new Map<string, number>();
+      targets.takeExternal();
       const sampling = { on: true };
       const sampler = (async () => {
         while (sampling.on) {
@@ -387,6 +401,8 @@ test.describe("rebuild core export on OPFS (bench)", () => {
         platformReads: pass.platformReads,
         governorPeakMiB: Math.round(pass.governorPeakMiB),
         cacheResidentMiB: Number(pass.cacheResidentMiB.toFixed(1)),
+        poolMiB: Number(pass.poolMiB.toFixed(1)),
+        arrayBufferPeakMiB: Math.round(targets.takeExternal() / MiB),
         protectedMiB: `${pass.protectedBeforeMiB.toFixed(1)} → ${pass.protectedAfterMiB.toFixed(1)}`,
         hotKept: pass.kept?.hot ?? "",
         scannedKept: pass.kept?.scanned ?? "",
@@ -405,7 +421,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       // window, export-stream.ts `windowBytes`), so host drift falls on both alike.
       const perColumn = { ...base, readaheadKiB: 256 };
       const windowed = { ...base, readaheadKiB: 256, windowMiB: WINDOW_MIB };
-      for (let run = 1; run <= 3; run++) {
+      for (let run = 1; run <= 5; run++) {
         await measure(`cold, readahead 256 KiB, run ${String(run)}`, true, false, perColumn);
         await measure(
           `cold, window ${String(WINDOW_MIB)} MiB, run ${String(run)}`,
@@ -414,7 +430,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
           windowed,
         );
       }
-      for (let run = 1; run <= 2; run++) {
+      for (let run = 1; run <= 5; run++) {
         await measure(`warm, readahead 256 KiB, run ${String(run)}`, false, true, perColumn);
         await measure(
           `warm, window ${String(WINDOW_MIB)} MiB, run ${String(run)}`,
@@ -458,14 +474,21 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     const hotspots = recorded === undefined ? [] : selfTimes(recorded, 15);
     console.log(`warm pass profile (self time):\n  ${hotspots.join("\n  ")}`);
 
+    const report = {
+      rows,
+      built,
+      opfsBytes: onDisk,
+      heapSampling: targets.ok,
+      device,
+      hotspots,
+      results,
+    };
     await info.attach("export-bench", {
-      body: JSON.stringify(
-        { rows, built, opfsBytes: onDisk, heapSampling: targets.ok, device, hotspots, results },
-        null,
-        2,
-      ),
+      body: JSON.stringify(report, null, 2),
       contentType: "application/json",
     });
+    // One line the nightly workflow keeps (browser-performance.yml): recorded, not judged.
+    console.log(`EXPORT_BENCH ${JSON.stringify(report)}`);
     await page.evaluate(async (url) => ((await import(url)) as Run).remove(), RUN);
   });
 });

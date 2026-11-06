@@ -42,7 +42,8 @@
  *   for every float64. The writer patches every value that does not satisfy that formula
  *   exactly (−0, NaN with its payload, ±Infinity, subnormals, inexact decimals) and keeps the
  *   page plain when more than 1 in 16 valid rows would be patched or it would not be smaller.
- *   Null and patched rows hold delta 0. A reader decodes the page into a plain f64 lane.
+ *   Null and patched rows hold delta 0. Readers decode it straight into a target; predicates
+ *   read a plain f64 lane materialized on first use.
  *
  * The page's length is exactly the end of its last section, so every header field is checked
  * against it: a page whose computed length differs from its stored length is corrupt.

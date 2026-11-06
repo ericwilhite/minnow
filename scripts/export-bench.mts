@@ -98,6 +98,16 @@ async function exportOnce(pass: number): Promise<void> {
   });
   const seconds = (performance.now() - started) / 1000;
   const used = process.cpuUsage(cpu);
+  console.log(
+    `EXPORT_SAMPLE ${JSON.stringify({
+      rows: emitted,
+      seconds,
+      cpuSeconds: (used.user + used.system) / 1e6,
+      rowsPerSecond: emitted / seconds,
+      rowsPerCpuSecond: emitted / ((used.user + used.system) / 1e6),
+      rssDeltaMiB: (peakRss - baseline.rss) / MiB,
+    })}`,
+  );
   const protectedMiB = cache.stats.protectedBytes / MiB;
   let kept = "";
   if (pass === PASSES) {

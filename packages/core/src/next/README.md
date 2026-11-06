@@ -297,8 +297,9 @@ is access's `Snapshot`.
   frame of reference at u8/u16/u32 over an int64 base, delta (FOR over successive differences,
   a checkpoint every 128 rows), dictionary codes (u8/u16/u32, or one code) into a
   group-scoped dictionary, and scaled float (float64 exact decimals as FOR integers over 10^e,
-  every other value patched with its own 8 bytes, bit-identical; a reader decodes it into an f64
-  lane it is charged for). Every page starts at an 8-byte offset of its extent. Bit-packed FOR
+  every other value patched with its own 8 bytes, bit-identical; decoded and gathered straight into
+  the target, while predicates read an f64 lane the reader materializes on first use and is
+  charged for). Every page starts at an 8-byte offset of its extent. Bit-packed FOR
   widths were measured and not adopted: unpacking cost +38% to +659% in the decode kernel and
   +46% to +194% in the pushdown compare (`scripts/bitpack-bench.mts`, 7–20 bits, two runs), far
   past the ~5% a 6% size saving was allowed to cost.
@@ -459,8 +460,30 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     core): the miss path fell from 29% to 5% of a warm pass, the sync access handle's `read` is
     now the largest item (28%); per CPU-second of the export worker, warm 330–376k rows/s with a
     64 MiB window (per-column 328k), cold 200–320k; wall rows/s on this host 105–297k cold and
-    119–344k warm, renderer RSS +125 to +172 MiB at 64 MiB (one earlier run reached +268 MiB:
-    released one-pass buffers wait for the collector, and cache buffers are never pooled).
+    119–344k warm, renderer RSS +125 to +172 MiB at 64 MiB (one earlier run reached +268 MiB,
+    not profiled; released one-pass buffers waiting for the collector are the likely cause).
+  - One-pass page buffers are pooled (`ReadOptions.reuseBuffers`, increment 10): a one-pass read
+    of pages packs its slabs into one pooled buffer (power-of-two sizes from 64 KiB to 16 MiB),
+    charged whole to its lease (overlapping references refund their excess initial charge); on
+    release the buffer returns to the pool, charged to the cache
+    while idle (at most 64 MiB, evicted first, dropped when the governor refuses) and poisoned in
+    test builds. Readers ask for it for page loads only, never a dictionary or a value they hand
+    out past its lease: an inline `valueParts` stream retains the page's shared read lease until
+    its next step, return or reader close (the whole buffer stays charged). Peeked/inflated pages
+    without a lease use a charged value-sized copy. At 1M × 200 on OPFS, renderer RSS +104 to +172 MiB over 22 passes in two runs with the
+    pool, +75 to +251 MiB over 11 passes without it (on a 262,144-row table, where the collector
+    keeps up, the pool's idle 64 MiB makes it +76 to +124 against +45 to +98).
+  - The nightly browser-performance workflow runs the export bench (`npm run benchmark:export`,
+    1M × 200, five cold and five warm rounds per configuration) and records rows/s, the worker's CPU seconds and rows per CPU-second, RSS, worker
+    heap and pool residency per pass in `export-bench.json`; nothing judges it yet. Locally, the
+    export is judged per CPU-second: this host gives the worker about half a core.
+- Reproduce increment 10 comparisons with `scripts/gather-bench.mts` (finite float64 gathers,
+  all-word / Number-only / production NaN-only copies) and `scripts/export-compare.mts --dir
+~/.cache/minnow-export` (the whole file-backed page export against p2i on identical stored data).
+  Both use at least five interleaved rounds in fresh processes and print CPU and wall medians,
+  min/max spread and every sample; the export also records sampled RSS. The file comparison uses
+  one untimed priming pass per variant, keeps the OS cache, and does not establish the cold OPFS Gate A target. Number-only is a finite-input
+  comparator: NaNs still require raw copies to preserve their bits.
 - What an export reads (`scripts/export-size.mts`, 262,144 rows of W1M): 1,055 B/row as flushed.
   High-cardinality text is 34% (`h02`'s free text alone 113 B/row), float64 31%, nullable
   floats 9%, int32 9%, decimals 8%; dictionary text 3%. Compaction gzip stores 869 B/row (−18%)

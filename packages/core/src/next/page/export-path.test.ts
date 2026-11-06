@@ -172,6 +172,37 @@ describe("one-pass misses: views of one buffer per slab, charged with their gaps
   });
 });
 
+describe("one-pass page buffers are pooled; the dictionary is not", () => {
+  it("keeps a one-pass reader's dictionary out of the pool: its vector outlives the reader", async () => {
+    const memory = countingMemory(Number.POSITIVE_INFINITY);
+    const { space, budget } = await openOver(new MemoryBackend(), { memory });
+    const type = { kind: "text" } as const;
+    const encoder = new TextEncoder();
+    const values = Array.from({ length: 6000 }, (_, k) => encoder.encode(`word-${String(k % 9)}`));
+    const writer = new GroupWriter({
+      columns: [{ columnId: 1, type }],
+      writer: space.beginWrite("pool"),
+      inlineBytes: 0,
+      pageBytes: 1024,
+      rawPageBytes: 1024,
+    });
+    await writer.append([vectorOf(type, values)], values.length);
+    const chunk = defined((await writer.finish()).columns[0]);
+    const reader = await ChunkReader.open(space, chunk, { budget, once: true });
+    await reader.load(reader.directory.pages.map((_, page) => page));
+    const dictionary = defined(reader.dictionary ?? undefined);
+    if (dictionary.data.layout !== "varlen") throw new Error("expected varlen");
+    const before = dictionary.data.bytes.slice();
+    reader.close();
+    // Another one-pass reader takes the pooled page buffers back.
+    const again = await ChunkReader.open(space, chunk, { budget, once: true });
+    await again.load(again.directory.pages.map((_, page) => page));
+    again.close();
+    expect(dictionary.data.bytes).toEqual(before);
+    expect(budget.used).toBe(0);
+  });
+});
+
 // ── Generated: alignment and loadTogether ─────────────────────────────────────────────────────
 
 const SEEDS = seedsFor("next-export-path", [0x919, 0x2c]);

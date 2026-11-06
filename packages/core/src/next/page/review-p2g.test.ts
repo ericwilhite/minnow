@@ -336,7 +336,9 @@ describe("review B2-p2g #3: no descriptor of a one-pass reader's private bytes",
     expect(privateBytes()).not.toBe(space.peek(ref, { once: true }));
     expect(space.parsed?.(ref) ?? null).toBeNull();
     expect(budget.used).toBe(0);
-    expect(memory.used - before).toBe(ref.length + ENTRY_OVERHEAD);
+    // The scan's released page buffer may wait in the one-pass pool, charged as the pool's
+    // reservation (increment 10's ruling); nothing else stays.
+    expect(memory.used - before - space.stats.cache.poolBytes).toBe(ref.length + ENTRY_OVERHEAD);
   });
 
   it("a dictionary page: the same", async () => {

@@ -86,7 +86,9 @@ describe("one-pass scans", () => {
     reader.close();
     expect(directories.entryCount).toBe(0);
     expect(refs.every((ref) => space.parsed?.(ref) == null && space.peek(ref) === null)).toBe(true);
-    expect([memory.used - before, budget.used]).toEqual([0, 0]);
+    // Its released page buffers may wait in the one-pass pool, charged as the pool's reservation
+    // (increment 10's ruling); no cached blob, descriptor or directory stays.
+    expect([memory.used - before - space.stats.cache.poolBytes, budget.used]).toEqual([0, 0]);
     // A directory an ordinary reader cached is still used by a once reader.
     const warm = await ChunkReader.open(space, chunk, { budget, directories });
     warm.close();
