@@ -577,3 +577,46 @@ describe("ByteArena.equals four bytes at a time (generated)", () => {
     120_000,
   );
 });
+
+describe("hashed key tables keep ids through growth past 65,536 slots", () => {
+  it("text and float8 keys keep their ids through growth past 65,536 slots", () => {
+    // Law: first-seen ids and emitted keys are independent of the table's growth (Slots, and
+    // NumberKeys' key beside each slot, resized with it). 100,000 distinct keys take the table
+    // well past 65,536 slots, checked against a model.
+    for (const kind of ["text", "float8"] as const) {
+      const table = new GroupTable([kind === "text" ? TEXT : F64], UNCHARGED);
+      const gids = new Int32Array(2048);
+      const random = mulberry32(kind === "text" ? 7 : 8);
+      const model = new Map<string | number, number>();
+      const first: Array<string | number> = [];
+      for (let batch = 0; batch < 120; batch++) {
+        const keys = Array.from({ length: 2048 }, () => {
+          const k = Math.floor(random() * 100_000);
+          return kind === "text" ? `k${String(k)}` : k / 8 + 0.5;
+        });
+        const vector = kind === "text" ? texts(keys as string[]) : numbers(F64, keys as number[]);
+        table.assign([vector], 2048, null, gids);
+        keys.forEach((key, r) => {
+          let id = model.get(key);
+          if (id === undefined) {
+            id = model.size;
+            model.set(key, id);
+            first.push(key);
+          }
+          if (gids[r] !== id) expect(gids[r], `${kind} row ${String(r)}`).toBe(id);
+        });
+      }
+      expect(model.size).toBeGreaterThan(90_000);
+      expect(table.groupCount).toBe(model.size);
+      for (let from = 0; from < model.size; from += 2048) {
+        const count = Math.min(2048, model.size - from);
+        const out = table.emitKey(0, from, count);
+        for (let k = 0; k < count; k++) {
+          const value = valueAt(out, k);
+          if (value !== first[from + k]) expect(value).toBe(first[from + k]);
+        }
+      }
+      table.close();
+    }
+  });
+});
