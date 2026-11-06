@@ -1,3 +1,5 @@
+// eslint-disable-next-line no-restricted-imports -- Node-only benchmark compiler; never shipped.
+import { execFileSync } from "node:child_process";
 import { defineConfig, type Plugin } from "vite";
 
 /**
@@ -25,8 +27,36 @@ const isolatedPages: Plugin = {
   },
 };
 
+const exportBaselineRevision = process.env.MINNOW_EXPORT_BASELINE_COMMIT ?? "18548e34";
+const exportBaseline =
+  process.env.MINNOW_EXPORT_COMPARE_STREAM === "1"
+    ? execFileSync(
+        "git",
+        ["show", `${exportBaselineRevision}:scripts/browser-perf/page/export-stream.ts`],
+        { encoding: "utf8" },
+      )
+    : null;
+
 export default defineConfig({
-  plugins: [isolatedPages],
+  plugins: [isolatedPages, ...(exportBaseline === null
+      ? []
+      : [
+          {
+            name: "export-baseline",
+            enforce: "pre",
+            load(id) {
+              const [file, query] = id.split("?");
+              if (
+                file?.endsWith("/scripts/browser-perf/page/export-stream.ts") &&
+                new URLSearchParams(query).has("exportBaseline")
+              )
+                return (
+                  exportBaseline +
+                  `\nexport const EXPORT_BASELINE_REVISION = ${JSON.stringify(exportBaselineRevision)};\n`
+                );
+            },
+          },
+        ])],
   // Test pages only: the next/ engine re-verifies cached bytes at every lease release and
   // eviction, so a writer into them fails in the browser lanes too
   // (packages/core/src/next/storage/verify-cached.ts). Off only for the opt-in OPFS export bench

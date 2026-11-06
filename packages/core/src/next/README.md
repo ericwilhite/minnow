@@ -535,6 +535,32 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
   min/max spread and every sample; the export also records sampled RSS. The file comparison uses
   one untimed priming pass per variant, keeps the OS cache, and does not establish the cold OPFS Gate A target. Number-only is a finite-input
   comparator: NaNs still require raw copies to preserve their bits.
+- Export phase profiling (`MINNOW_EXPORT_PROFILE_ONLY=1` with `MINNOW_NEXT_EXPORT_BENCH=1`
+  on `next-export-bench.spec.ts`) runs a cold and a warm Chromium/OPFS profile, then unprofiled
+  references. `MINNOW_EXPORT_ROWS` selects the rows (default 1,048,576), with 200 columns.
+  Root open, worker imports, dataset construction and the hot-set audit are outside the timed
+  export; this mode skips hot-set prefill entirely. Cold file residency is recorded; warm still
+  requires at least 98% residency at its start, not a promise it stays resident under pressure.
+  - The wall phases are synchronous `readDataInto` (native read/wait and validation), target
+    decode, window/buffer planning and release, and residual directory/page load work (checksum,
+    parsing, allocation, GC and coordination). Raw CDP CPU profiles are attached to the HTML
+    report; thread CPU at CDP profile boundaries excludes setup, with clock-tick/notification
+    latency. The wall counters are cross-checked against platform reads and batch decode calls.
+  - Decompression is zero for these uncompressed flushed pages (the profiler refuses gzip
+    pages rather than silently misattribute them). Gather and row transfer are not exercised:
+    this bench range-decodes reusable column buffers and sends only its summary back. It is the
+    page-streaming half, not a SQL/result-transport Gate A certification.
+  - `MINNOW_EXPORT_COMPARE_STREAM=1` runs five interleaved cold/warm attempts per loop version,
+    without CPU profiling. `MINNOW_EXPORT_BASELINE_COMMIT` (default `18548e34`) freezes only the
+    old export loop; both versions use the current engine and both loop modules are imported
+    before timing. This checks disabled-probe overhead, not an arbitrary engine change.
+- The checksum-load CPU hypothesis from the export profile is reproducible with
+  `npx vite-node scripts/hash-load-bench.mts`: five rotating rounds in fresh processes, CPU and
+  wall medians/min/max, aligned and unaligned inputs, byte offsets, stripe tails, and consumed
+  hash results checked across variants. The aligned unsigned/signed native-word candidates stay
+  in this benchmark only: neither cleared the median-versus-spread rule. The engine keeps its
+  explicit little-endian `DataView` reads. Cold IO/directory coordination and fixed-width decode
+  remain the next profile-led candidates; window assembly is a smaller share of this workload.
 - What an export reads (`scripts/export-size.mts`, 262,144 rows of W1M): 1,055 B/row as flushed.
   High-cardinality text is 34% (`h02`'s free text alone 113 B/row), float64 31%, nullable
   floats 9%, int32 9%, decimals 8%; dictionary text 3%. Compaction gzip stores 869 B/row (−18%)

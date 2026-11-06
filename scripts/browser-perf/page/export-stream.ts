@@ -15,7 +15,11 @@ import type { BlobCache } from "../../../packages/core/src/next/format/blob-cach
 import type { ChunkDirectory } from "../../../packages/core/src/next/page/directory.js";
 import { ChunkReader } from "../../../packages/core/src/next/page/reader.js";
 import { targetFor } from "../../../packages/core/src/next/page/test-support.js";
-import type { ColumnChunk, PageEntry } from "../../../packages/core/src/next/format/manifest.js";
+import {
+  PageEncoding,
+  type ColumnChunk,
+  type PageEntry,
+} from "../../../packages/core/src/next/format/manifest.js";
 import type {
   BlobRef,
   ByteBudget,
@@ -30,6 +34,40 @@ export const EXPORT_BATCH = 2048;
 export interface ExportGroup {
   readonly rows: number;
   readonly chunks: readonly ColumnChunk[];
+}
+
+/** Exclusive wall phases of the page-stream bench, not SQL execution/result transport. */
+export interface ExportPhases {
+  active: boolean;
+  readMs: number;
+  readCalls: number;
+  decodeMs: number;
+  decodeCalls: number;
+  gatherCalls: number;
+  compressedPages: number;
+  assemblyMs: number;
+  otherLoadMs: number;
+  /** This bench does range decode only; no gathers, decompression or row transfers. */
+  gatherMs: number;
+  decompressMs: number;
+  transferMs: number;
+}
+
+export function exportPhases(): ExportPhases {
+  return {
+    active: false,
+    readMs: 0,
+    readCalls: 0,
+    decodeMs: 0,
+    decodeCalls: 0,
+    gatherCalls: 0,
+    compressedPages: 0,
+    assemblyMs: 0,
+    otherLoadMs: 0,
+    gatherMs: 0,
+    decompressMs: 0,
+    transferMs: 0,
+  };
 }
 
 export interface ExportOptions {
@@ -52,6 +90,7 @@ export interface ExportOptions {
   readonly windowBytes?: number;
   /** Called every 8 batches (memory sampling). */
   readonly sample?: () => void;
+  readonly phases?: ExportPhases;
 }
 
 export interface ExportResult {
@@ -74,6 +113,30 @@ interface Buffer {
 /** One reused batch buffer per column, kept across passes (the executor reuses its own). */
 const buffers = new Map<number, Buffer>();
 
+function profileReader(reader: ChunkReader, phases: ExportPhases): void {
+  const timed =
+    <Args extends unknown[]>(fn: (...args: Args) => void, gather: boolean) =>
+    (...args: Args): void => {
+      const start = performance.now();
+      try {
+        fn(...args);
+      } finally {
+        const elapsed = performance.now() - start;
+        if (gather) {
+          phases.gatherMs += elapsed;
+          phases.gatherCalls++;
+        } else {
+          phases.decodeMs += elapsed;
+          phases.decodeCalls++;
+        }
+      }
+    };
+  reader.decodeRange = timed(reader.decodeRange.bind(reader), false);
+  reader.decodeCodes = timed(reader.decodeCodes.bind(reader), false);
+  reader.gather = timed(reader.gather.bind(reader), true);
+  reader.gatherCodes = timed(reader.gatherCodes.bind(reader), true);
+}
+
 export async function exportStream(
   space: ExtentReader,
   groups: readonly ExportGroup[],
@@ -90,7 +153,24 @@ export async function exportStream(
   for (const group of groups) {
     let t = performance.now();
     const readers: ChunkReader[] = [];
-    for (const chunk of group.chunks) readers.push(await ChunkReader.open(space, chunk, open));
+    for (const chunk of group.chunks) {
+      const reader = await ChunkReader.open(space, chunk, open);
+      if (options.phases) profileReader(reader, options.phases);
+      readers.push(reader);
+    }
+    if (options.phases) {
+      for (const reader of readers)
+        for (const page of reader.directory.pages)
+          if ((page.encoding & PageEncoding.gzip) !== 0) options.phases.compressedPages++;
+      for (const reader of readers)
+        if (
+          reader.directory.dictionary &&
+          (reader.directory.dictionary.encoding & PageEncoding.gzip) !== 0
+        )
+          options.phases.compressedPages++;
+      if (options.phases.compressedPages > 0)
+        throw new Error("Phase profiling expects uncompressed flushed pages");
+    }
     openMs += performance.now() - t;
     const loadedFrom = readers.map(() => 0);
     /** Pages behind `from` were emitted: let them go. */
@@ -170,9 +250,9 @@ export async function exportStream(
           };
           buffers.set(column, buffer);
         }
-        if (reader.isDictionaryRange(from, to))
+        if (reader.isDictionaryRange(from, to)) {
           reader.decodeCodes(from, to, buffer.codes, buffer.validity);
-        else {
+        } else {
           const bytes = reader.varlenBytes(from, to);
           const kept = buffer.target;
           // A buffer of another column's type (a reused slot) or too small for this batch.
@@ -190,7 +270,13 @@ export async function exportStream(
     }
     for (const reader of readers) reader.close();
   }
-  return { rows, ms: performance.now() - started, loadMs, openMs, loads };
+  const ms = performance.now() - started;
+  if (options.phases) {
+    options.phases.otherLoadMs = openMs + loadMs - options.phases.readMs;
+    options.phases.assemblyMs =
+      ms - openMs - loadMs - options.phases.decodeMs - options.phases.gatherMs;
+  }
+  return { rows, ms, loadMs, openMs, loads };
 }
 
 function fail(): never {

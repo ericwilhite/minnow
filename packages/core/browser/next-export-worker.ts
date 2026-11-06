@@ -16,6 +16,9 @@ import { countingBudget, jsonReachable } from "../src/next/storage/space-test-su
 import { VERIFY_CACHED_BYTES } from "../src/next/storage/verify-cached.js";
 import {
   establishWorkingSet,
+  exportPhases,
+  EXPORT_BATCH,
+  type ExportPhases,
   exportStream,
   rebaseExtents,
   survivors,
@@ -49,6 +52,11 @@ export type ExportRequest =
       readonly passes: number;
       /** Brackets the passes with console.profile / profileEnd (the spec's CDP profiler). */
       readonly profile?: boolean;
+      /** Empty engine cache, exclusive export wall phases; excludes open/hot-set setup. */
+      readonly profilePhases?: boolean;
+      readonly auditWorkingSet?: boolean;
+      /** Bench-only comparison: both loop modules are imported before timing. */
+      readonly baselineStream?: boolean;
     }
   | { readonly op: "remove"; readonly dir: string };
 
@@ -76,6 +84,8 @@ export interface ExportPass {
   readonly protectedAfterMiB: number;
   /** After the last pass, everything but the hot set's size evicted: what survived (else null). */
   readonly kept: { hot: string; scanned: string } | null;
+  readonly phases?: ExportPhases;
+  readonly baselineCommit?: string;
 }
 
 const scope = self as unknown as {
@@ -95,6 +105,7 @@ async function open(
   name: string,
   governor: Governor | null,
   registered?: (cache: EvictableCache) => void,
+  phases?: ExportPhases,
 ) {
   const backend = createOpfsBackend({
     directory: await directory(name),
@@ -103,6 +114,21 @@ async function open(
   });
   const lease = await backend.acquire({ timeoutMs: 10_000 });
   const session = await backend.open(lease);
+  if (phases) {
+    const read = session.readDataInto.bind(session);
+    // This backend is FileStoreSession: its async method performs synchronous OPFS reads
+    // before returning. Time that synchronous call, not overlapping promise continuations.
+    session.readDataInto = (offset, target) => {
+      if (!phases.active) return read(offset, target);
+      const start = performance.now();
+      try {
+        return read(offset, target);
+      } finally {
+        phases.readMs += performance.now() - start;
+        phases.readCalls++;
+      }
+    };
+  }
   const space = await openExtentSpace(session, {
     reachable: jsonReachable,
     budget: countingBudget(Number.POSITIVE_INFINITY),
@@ -173,34 +199,76 @@ async function build(dir: string, rows: number, distinct: number): Promise<Build
 }
 
 async function runExport(request: Extract<ExportRequest, { op: "export" }>): Promise<ExportPass[]> {
+  if (request.profilePhases && request.passes !== 1)
+    throw new Error("Phase profiling expects one pass");
+  let stream = exportStream;
+  let baselineCommit: string | undefined;
+  if (request.baselineStream !== undefined) {
+    const url = new URL(
+      "../../../scripts/browser-perf/page/export-stream.ts?exportBaseline",
+      import.meta.url,
+    );
+    const baseline = (await import(
+      /* @vite-ignore */ url.href
+    )) as typeof import("../../../scripts/browser-perf/page/export-stream.js") & {
+      EXPORT_BASELINE_REVISION?: string;
+    };
+    baselineCommit = baseline.EXPORT_BASELINE_REVISION;
+    if (!baselineCommit) throw new Error("Export baseline compiler plugin is not enabled");
+    if (request.baselineStream) stream = baseline.exportStream;
+  }
   const governor = new Governor(request.capMiB * MiB);
   let cache: EvictableCache | null = null;
-  const { lease, space } = await open(request.dir, governor, (registered) => {
-    cache = registered;
-  });
+  const phases = request.profilePhases ? exportPhases() : undefined;
+  const { lease, space } = await open(
+    request.dir,
+    governor,
+    (registered) => {
+      cache = registered;
+    },
+    phases,
+  );
   const directories = new BlobCache<ChunkDirectory>((evictable) =>
     governor.registerCache(evictable),
   );
   const grant = await governor.admit({ label: "export", minimumBytes: 32 * MiB, spillable: true });
   const first = request.groups[0];
   if (first === undefined) throw new Error("no groups");
-  const working = await establishWorkingSet(space, first, request.outside, {
-    budget: grant,
-    directories,
-  });
+  const working =
+    request.profilePhases || request.auditWorkingSet === false
+      ? null
+      : await establishWorkingSet(space, first, request.outside, {
+          budget: grant,
+          directories,
+        });
   const protectedBefore = space.stats.cache.protectedBytes / MiB;
   const passes: ExportPass[] = [];
   if (request.profile === true) console.profile("export");
   for (let pass = 0; pass < request.passes; pass++) {
     const readsBefore = space.stats.cache.platformReads;
-    const result = await exportStream(space, request.groups, {
+    if (phases) phases.active = true;
+    const result = await stream(space, request.groups, {
       budget: grant,
       directories,
       once: request.once,
       readahead: request.readaheadKiB * 1024,
       windowBytes: (request.windowMiB ?? 0) * MiB,
+      ...(phases ? { phases } : {}),
     });
+    if (phases) {
+      phases.active = false;
+      const expected = request.groups.reduce(
+        (sum, group) => sum + Math.ceil(group.rows / EXPORT_BATCH) * group.chunks.length,
+        0,
+      );
+      if (phases.decodeCalls !== expected)
+        throw new Error("Unaccounted batch decode in phase profile");
+      if (phases.readCalls !== space.stats.cache.platformReads - readsBefore)
+        throw new Error("Unaccounted platform read in phase profile");
+    }
     passes.push({
+      ...(phases ? { phases: { ...phases } } : {}),
+      ...(baselineCommit ? { baselineCommit } : {}),
       verifying: VERIFY_CACHED_BYTES,
       ...result,
       platformReads: space.stats.cache.platformReads - readsBefore,
@@ -219,7 +287,7 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
   }
   const evictable = cache as EvictableCache | null;
   const last = passes.at(-1);
-  if (evictable !== null && last !== undefined) {
+  if (evictable !== null && last !== undefined && working !== null) {
     const left = survivors(space, evictable, working);
     passes[passes.length - 1] = {
       ...last,

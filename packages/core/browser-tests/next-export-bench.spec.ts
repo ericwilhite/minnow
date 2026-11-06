@@ -49,6 +49,8 @@ const WARM_SHARE = 0.98;
  */
 const DISTINCT = Number(process.env.MINNOW_EXPORT_DISTINCT ?? 4);
 /** MINNOW_EXPORT_FOCUS=1: only Gate A's configuration (cold ×5, warm ×5, a profiled pass). */
+const COMPARE_STREAM = process.env.MINNOW_EXPORT_COMPARE_STREAM === "1";
+const PROFILE_ONLY = process.env.MINNOW_EXPORT_PROFILE_ONLY === "1";
 const FOCUS = process.env.MINNOW_EXPORT_FOCUS === "1";
 /** The row window of the focused passes (MINNOW_EXPORT_WINDOW_MIB, default 64). */
 const WINDOW_MIB = Number(process.env.MINNOW_EXPORT_WINDOW_MIB ?? 64);
@@ -169,11 +171,13 @@ interface CpuProfile {
  * CPU profile of a pass that brackets itself with console.profile / profileEnd (the Profiler
  * domain is enabled on every worker as it attaches).
  */
-async function workers(page: Page) {
+async function workers(page: Page, profileDirectory: string) {
   const cdp: CDPSession = await page.context().newCDPSession(page);
   const sessions = new Set<string>();
   const pending = new Map<number, (value: unknown) => void>();
   const profiles: CpuProfile[] = [];
+  const profileCpuSeconds: number[] = [];
+  const starts = new Map<string, Map<string, number>>();
   let next = 1;
   let external = 0;
   const send = (sessionId: string, method: string, params: object = {}): Promise<unknown> => {
@@ -196,9 +200,11 @@ async function workers(page: Page) {
   cdp.on("Target.attachedToTarget", (event) => {
     if (event.targetInfo.type !== "worker") return;
     sessions.add(event.sessionId);
-    void send(event.sessionId, "Profiler.enable").then(() =>
-      send(event.sessionId, "Profiler.setSamplingInterval", { interval: 500 }),
-    );
+    void send(event.sessionId, "Profiler.enable")
+      .then(() => send(event.sessionId, "Profiler.setSamplingInterval", { interval: 500 }))
+      .then(() =>
+        PROFILE_ONLY ? send(event.sessionId, "Runtime.runIfWaitingForDebugger") : undefined,
+      );
   });
   cdp.on("Target.detachedFromTarget", (event) => {
     sessions.delete(event.sessionId);
@@ -210,8 +216,17 @@ async function workers(page: Page) {
       result?: unknown;
       params?: { profile?: CpuProfile };
     };
-    if (message.method === "Profiler.consoleProfileFinished" && message.params?.profile)
+    if (message.method === "Profiler.consoleProfileStarted")
+      starts.set(event.sessionId, workerThreadCpu(profileDirectory));
+    if (message.method === "Profiler.consoleProfileFinished" && message.params?.profile) {
       profiles.push(message.params.profile);
+      const before = starts.get(event.sessionId);
+      let used = 0;
+      for (const [tid, seconds] of workerThreadCpu(profileDirectory))
+        if (before?.has(tid)) used += seconds - (before.get(tid) ?? seconds);
+      profileCpuSeconds.push(used);
+      starts.delete(event.sessionId);
+    }
     if (message.id === undefined) return;
     pending.get(message.id)?.(message.result ?? null);
     pending.delete(message.id);
@@ -220,7 +235,7 @@ async function workers(page: Page) {
   try {
     await cdp.send("Target.setAutoAttach", {
       autoAttach: true,
-      waitForDebuggerOnStart: false,
+      waitForDebuggerOnStart: PROFILE_ONLY,
       flatten: false,
     });
   } catch {
@@ -229,6 +244,7 @@ async function workers(page: Page) {
   return {
     ok,
     profiles,
+    profileCpuSeconds,
     async heap(): Promise<number> {
       let used = 0;
       for (const sessionId of sessions) {
@@ -302,6 +318,9 @@ interface Row {
   readonly workerHeapPeakMiB: number;
   /** The export worker's thread CPU (whole worker, setup included; sampled every 200 ms). */
   readonly workerCpuSeconds: number;
+  /** Thread CPU delta at CDP profile boundaries; setup excluded, tick/CDP latency applies. */
+  readonly exportCpuSeconds?: number;
+  readonly phases?: Awaited<ReturnType<Run["exportPass"]>>[number]["phases"];
   /** Rows per second of that CPU: the pass's cost, whatever share of a core the host gave it. */
   readonly rowsPerCpuSecond: number;
 }
@@ -318,7 +337,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     await page.goto("/packages/core/browser/");
     await requireWorkerOpfs(page);
     const profile = info.outputPath("storage-profile");
-    const targets = await workers(page);
+    const targets = await workers(page, profile);
 
     // One group more than the export reads: the measured hot set comes from it, so the export
     // never touches it (export-stream.ts `establishWorkingSet`).
@@ -385,10 +404,19 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       const pass = passes.at(-1);
       if (pass === undefined) throw new Error("no pass");
       // vite.library.config.ts drops the cached-bytes guard when this bench is opted in.
+      if (COMPARE_STREAM)
+        expect(pass.baselineCommit).toBe(process.env.MINNOW_EXPORT_BASELINE_COMMIT ?? "18548e34");
       expect(pass.verifying, "the cached-bytes guard re-hashes every release").toBe(false);
       const bytes = (built.dataBytes * pass.rows) / (rows + 65_536);
       const cpuSeconds = [...passCpu.values()].reduce((sum, seconds) => sum + seconds, 0);
+      const exportCpu = targets.profileCpuSeconds.at(-1);
       const row: Row = {
+        ...(pass.phases
+          ? {
+              phases: pass.phases,
+              ...(exportCpu === undefined ? {} : { exportCpuSeconds: exportCpu }),
+            }
+          : {}),
         label: established
           ? label
           : `${label.replace("warm", "partial residency")} (${(100 * share).toFixed(0)}% resident)`,
@@ -416,7 +444,42 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     };
 
     const base = { once: true, capMiB: 512, passes: 1, groups: exported };
-    if (FOCUS) {
+    if (COMPARE_STREAM) {
+      const options = { ...base, readaheadKiB: 256, windowMiB: WINDOW_MIB, auditWorkingSet: false };
+      for (let round = 0; round < 5; round++) {
+        for (const baselineStream of round % 2 === 0 ? [true, false] : [false, true]) {
+          const variant = baselineStream ? "baseline" : "current";
+          await measure(`cold ${variant} round ${String(round)}`, true, false, {
+            ...options,
+            baselineStream,
+          });
+          await measure(`warm ${variant} round ${String(round)}`, false, true, {
+            ...options,
+            baselineStream,
+          });
+        }
+      }
+    } else if (PROFILE_ONLY) {
+      const options = {
+        ...base,
+        readaheadKiB: 256,
+        windowMiB: WINDOW_MIB,
+        profile: true,
+        profilePhases: true,
+      };
+      await measure(`cold, window ${String(WINDOW_MIB)} MiB, phase profile`, true, false, options);
+      await measure(`warm, window ${String(WINDOW_MIB)} MiB, phase profile`, false, true, options);
+      expect(targets.profiles).toHaveLength(2);
+      // Unprofiled references omit the same setup and hot-set prefill as the profiles.
+      const reference = {
+        ...base,
+        readaheadKiB: 256,
+        windowMiB: WINDOW_MIB,
+        auditWorkingSet: false,
+      };
+      await measure("cold, unprofiled reference", true, false, reference);
+      await measure("warm, unprofiled reference", false, true, reference);
+    } else if (FOCUS) {
       // Gate A's configuration, repeated and interleaved (per-column readahead, then the row
       // window, export-stream.ts `windowBytes`), so host drift falls on both alike.
       const perColumn = { ...base, readaheadKiB: 256 };
@@ -464,12 +527,18 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       });
     }
     // Where a warm pass spends its time: a CPU profile of the worker (CDP), by self time.
-    await measure(`warm, window ${String(WINDOW_MIB)} MiB, profiled`, false, true, {
-      ...base,
-      readaheadKiB: 256,
-      windowMiB: WINDOW_MIB,
-      profile: true,
-    });
+    if (!PROFILE_ONLY && !COMPARE_STREAM)
+      await measure(`warm, window ${String(WINDOW_MIB)} MiB, profiled`, false, true, {
+        ...base,
+        readaheadKiB: 256,
+        windowMiB: WINDOW_MIB,
+        profile: true,
+      });
+    for (const [index, profile] of targets.profiles.entries())
+      await info.attach(`export-cpu-${String(index)}`, {
+        body: JSON.stringify(profile),
+        contentType: "application/json",
+      });
     const recorded = targets.profiles.at(-1);
     const hotspots = recorded === undefined ? [] : selfTimes(recorded, 15);
     console.log(`warm pass profile (self time):\n  ${hotspots.join("\n  ")}`);
@@ -481,6 +550,13 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       heapSampling: targets.ok,
       device,
       hotspots,
+      profileHotspots: targets.profiles.map((profile) => selfTimes(profile, 30)),
+      ...(COMPARE_STREAM
+        ? {
+            comparisonScope: "stream loop only; both use the current engine",
+            baselineStreamRevision: process.env.MINNOW_EXPORT_BASELINE_COMMIT ?? "18548e34",
+          }
+        : {}),
       results,
     };
     await info.attach("export-bench", {
