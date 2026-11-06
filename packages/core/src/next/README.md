@@ -970,6 +970,13 @@ and the owner import it directly.
   with a real task yield between them; each slice and each resumption after backpressure checks
   the abort signal (ruling R23). Scratch that lives across a suspension belongs to the operator.
 
+The isolated CPU benchmarks `exec/sort-radix.bench.ts` and `exec/window-sort.bench.ts`
+measure prefix sorting and grouped window sorting separately from input construction and
+window evaluation. Bundle each with esbuild for Node and run with `node --expose-gc`; `ROWS`
+and `RUNS` set the input size and measured repetitions. The grouped benchmark also accepts
+`GROUPS`. Compare revision bundles in at least five interleaved rounds. These component
+measurements do not establish the whole-query browser performance gates.
+
 ### Windows (`exec/window.ts`, `window-sort.ts`, `window-frames.ts`, `window-stream.ts`)
 
 - Prefix counts, ordinary and bigint sums, promotion, and long moving-frame aggregate scans
