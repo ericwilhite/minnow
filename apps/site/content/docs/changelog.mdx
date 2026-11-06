@@ -76,7 +76,8 @@ b.id = a.id)` was false when no row of `b` matched. An aggregate without `GROUP 
   `execute`, `query`, `queryCursor`, a built query's `run` and live subscriptions alike. As in
   PostgreSQL, `nextval` is refused when it runs: `currval` works, and so does a `nextval` that no
   row evaluates (a `CASE` branch not taken, a false `WHERE`). Open the transaction with
-  `BEGIN` (or `READ WRITE`) to write.
+  `BEGIN` (or `READ WRITE`) to write. An outer locking clause reaches tables inside FROM
+  subqueries, but leaves CTE references and constant-only sources unlocked, as in PostgreSQL.
   - Switching back with `SET TRANSACTION READ WRITE` fails with "transaction read-write mode
     must be set before any query" once the transaction has run a statement (a `query` call
     counts), and with "cannot set transaction read-write mode inside a read-only transaction"

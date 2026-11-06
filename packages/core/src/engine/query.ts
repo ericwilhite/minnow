@@ -8319,6 +8319,7 @@ class Parser {
     return this.#derivedSequence;
   };
   readonly #ctes = new Map<string, CompiledQuery>();
+  readonly #cteReferences = new WeakSet<CompiledQuery>();
   /** Named windows of the block being parsed: `WINDOW w AS (...)`, referenced by `OVER w`. */
   #namedWindows = new Map<string, { start: number; end: number }>();
   readonly #ctesInProgress = new Set<string>();
@@ -10091,10 +10092,25 @@ class Parser {
   /** LIMIT/OFFSET in either dialect order: LIMIT n [OFFSET m], or OFFSET m [FETCH FIRST ...]. */
   /**
    * `FOR UPDATE | NO KEY UPDATE | SHARE | KEY SHARE [OF table, …] [NOWAIT | SKIP LOCKED]`: row
-   * locks for concurrent sessions, which a single-session engine has no need of. Accepted and
-   * ignored so a query written for PostgreSQL runs unchanged.
+   * locks are not acquired. Retain the strongest clause that reaches a relation so a read-only
+   * transaction can refuse it, as PostgreSQL does.
    */
-  #lockingClause(overSource: boolean): void {
+  #locksRelation(source: TableSource): boolean {
+    if (source.recursive !== undefined) return false;
+    if (source.derived !== undefined) {
+      return !this.#cteReferences.has(source.derived) && this.#blockLocksRelation(source.derived);
+    }
+    if (source.union !== undefined)
+      return source.union.blocks.some((block) => this.#blockLocksRelation(block));
+    if (source.windowed !== undefined) return this.#blockLocksRelation(source.windowed.block);
+    return source.table !== DUAL_TABLE;
+  }
+
+  #blockLocksRelation(block: CompiledQuery): boolean {
+    return [block.base, ...block.joins].some((source) => this.#locksRelation(source));
+  }
+
+  #lockingClause(sources: true | TableSource[]): void {
     while (this.#isKeyword("FOR")) {
       this.#keyword("FOR");
       let strength: RowLocking;
@@ -10116,18 +10132,25 @@ class Parser {
       } else {
         throw new TypeError(`Expected UPDATE or SHARE after FOR, found ${this.#peek().text}`);
       }
-      // A FROM-less SELECT locks no row, so PostgreSQL runs `SELECT 1 FOR UPDATE` anywhere.
+      const targets: string[] = [];
+      if (this.#isKeyword("OF")) {
+        this.#keyword("OF");
+        targets.push(this.#identifier());
+        while (this.#punctuation(",")) targets.push(this.#identifier());
+      }
+      // An outer lock propagates through FROM subqueries, but never through CTE references.
+      const locks =
+        sources === true ||
+        sources.some(
+          (source) =>
+            (targets.length === 0 || targets.includes(source.alias)) && this.#locksRelation(source),
+        );
       if (
-        overSource &&
+        locks &&
         (this.rowLocking === undefined ||
           ROW_LOCKING_ORDER.indexOf(strength) > ROW_LOCKING_ORDER.indexOf(this.rowLocking))
       )
         this.rowLocking = strength;
-      if (this.#isKeyword("OF")) {
-        this.#keyword("OF");
-        this.#identifier();
-        while (this.#punctuation(",")) this.#identifier();
-      }
       if (this.#isKeyword("NOWAIT")) this.#keyword("NOWAIT");
       else if (this.#isKeyword("SKIP")) {
         this.#keyword("SKIP");
@@ -10288,7 +10311,7 @@ class Parser {
     }
     const orderBy = compoundMember ? [] : this.#orderByClause();
     const tail = compoundMember ? {} : this.#tailClauses();
-    if (!compoundMember) this.#lockingClause(base.table !== DUAL_TABLE);
+    if (!compoundMember) this.#lockingClause([base, ...joins]);
     if (distinctOn !== undefined) {
       return this.#distinctOnBlock(
         sql,
@@ -11155,6 +11178,7 @@ class Parser {
     const cte = this.#ctes.get(table);
     if (cte !== undefined) {
       const source = clonePlanTree(cte);
+      this.#cteReferences.add(source);
       if (this.#peek().text === "(") {
         this.#expectPunctuation("(");
         this.#applyColumnAliases(source);

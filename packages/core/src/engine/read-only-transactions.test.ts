@@ -7,7 +7,7 @@
 import { PGlite } from "@electric-sql/pglite";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { MemoryBlockStore } from "../storage/index.js";
-import { createReach, REFUSAL_STATES } from "../testing/reach.js";
+import { createReach, REFUSAL_STATES, ROW_LOCK_TARGET_STATES } from "../testing/reach.js";
 import { MinnowDatabase } from "./database.js";
 import { compileQuery } from "./query.js";
 
@@ -152,6 +152,16 @@ const ENTRY_POINTS: ReadonlyArray<
 ];
 
 /** Reads a read-only transaction refuses, or runs (review B6 stream A 2, findings 1 and 3). */
+const LOCK_TARGETS = [
+  ["constant derived", "SELECT * FROM (SELECT 1 AS n) s FOR UPDATE"],
+  ["CTE", "WITH x AS (SELECT * FROM t) SELECT * FROM x FOR UPDATE"],
+  ["table derived", "SELECT * FROM (SELECT * FROM t) s FOR UPDATE"],
+  ["table derived", "SELECT * FROM (SELECT * FROM t) s FOR UPDATE OF s"],
+  ["OF constant", "SELECT t.id FROM t, (SELECT 1 AS n) s FOR UPDATE OF s"],
+  ["OF table", "SELECT t.id FROM t, (SELECT 1 AS n) s FOR UPDATE OF t"],
+  ["series", "SELECT * FROM generate_series(1, 2) s FOR UPDATE"],
+  ["empty table", "SELECT * FROM t WHERE false FOR UPDATE"],
+] as const;
 const READS = [
   "SELECT count(*) AS n FROM t",
   "SELECT nextval('s') AS n",
@@ -181,6 +191,7 @@ const READS = [
   "SELECT * FROM t WHERE id IN (SELECT id FROM u FOR SHARE)",
   "WITH c AS (SELECT * FROM t FOR UPDATE) SELECT * FROM c",
   "SELECT 1 AS one FOR UPDATE",
+  ...LOCK_TARGETS.map(([, sql]) => sql),
 ];
 
 /**
@@ -322,14 +333,18 @@ describe("READ ONLY across entry points, row locks and savepoints (review B6 str
   it("refuses sequence changes and row locks through every read entry point, as PostgreSQL", async () => {
     const mismatches: string[] = [];
     const reach = createReach<string>("read-only reads", REFUSAL_STATES);
+    const targets = createReach<string>("row lock targets", ROW_LOCK_TARGET_STATES);
+    targets.beginHistory();
     for (const begin of ["BEGIN READ ONLY", "BEGIN", "BEGIN READ WRITE"])
       for (const read of READS) {
         const expected = await pgRun([begin, read]);
         for (const [name, entry] of ENTRY_POINTS) {
           reach.beginHistory();
           const actual = await minnowRun([begin, read], entry);
-          if (actual === expected) reach.reach(expected === "ok" ? "accepted" : "refused");
-          else
+          if (actual === expected) {
+            reach.reach(expected === "ok" ? "accepted" : "refused");
+            for (const [shape, sql] of LOCK_TARGETS) if (sql === read) targets.reach(shape);
+          } else
             mismatches.push(
               `${name}: ${begin}; ${read}\n  pglite: ${expected}\n  minnow: ${actual}`,
             );
@@ -337,6 +352,7 @@ describe("READ ONLY across entry points, row locks and savepoints (review B6 str
       }
     expect(mismatches.join("\n")).toBe("");
     reach.assertReached();
+    targets.assertReached();
   });
 
   it("scopes the access mode to savepoints and counts a read from any entry point as the first statement", async () => {

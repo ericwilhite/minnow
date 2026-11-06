@@ -361,3 +361,14 @@ export const DISTINCT_ON_STATES = [
 
 /** A generated refusal campaign: both outcomes, compared against PostgreSQL. */
 export const REFUSAL_STATES = ["refused", "accepted"] as const;
+
+/** Outer locking target shapes compared with PostgreSQL in the read-only campaign. */
+export const ROW_LOCK_TARGET_STATES = [
+  "constant derived",
+  "CTE",
+  "table derived",
+  "OF constant",
+  "OF table",
+  "series",
+  "empty table",
+] as const;
