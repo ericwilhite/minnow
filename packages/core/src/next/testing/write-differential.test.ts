@@ -583,11 +583,13 @@ function differing(
     row === undefined
       ? null
       : {
+          values: row,
           references:
             parent === null
               ? []
               : [
                   {
+                    column: parent,
                     table: "t",
                     value: typeof row[parent] === "number" ? row[parent] : null,
                   },

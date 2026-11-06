@@ -3,10 +3,12 @@
  * cause explains the discrepancy, never merely because a relevant value appears in the step.
  */
 import { describe, expect, it } from "vitest";
+import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import {
   intendedDivergence,
   type DifferingRow,
   type DivergenceObservation,
+  type RowSide,
   type StatementFacts,
 } from "./divergences.js";
 
@@ -41,6 +43,11 @@ const observation = (part: Partial<DivergenceObservation>): DivergenceObservatio
 });
 
 const id = (o: DivergenceObservation) => intendedDivergence(o)?.id ?? null;
+
+/** A child row (id, ref → t, note) as one side holds it. */
+function child(key: number, ref: number | null, note: unknown = "n"): RowSide {
+  return { values: [key, ref, note], references: [{ column: 1, table: "t", value: ref }] };
+}
 
 describe("key-forwarding matcher", () => {
   it("does not explain an unrelated duplicate while a parent key forwards (the reviewer's probe)", () => {
@@ -228,8 +235,8 @@ describe("key-forwarding matcher", () => {
     const parentRow = (key: number): DifferingRow => ({
       table: "t",
       key,
-      oracle: { references: [] },
-      authority: { references: [] },
+      oracle: { values: [key, 1], references: [] },
+      authority: { values: [key, 2], references: [] },
     });
     /** A child whose PostgreSQL version references `before` and the current engine's `after`. */
     const childRow = (
@@ -239,8 +246,8 @@ describe("key-forwarding matcher", () => {
     ): DifferingRow => ({
       table: "c",
       key,
-      authority: { references: [{ table: "t", value: before }] },
-      oracle: after === "absent" ? null : { references: [{ table: "t", value: after }] },
+      authority: child(key, before),
+      oracle: after === "absent" ? null : child(key, after),
     });
     const differ = (...rows: DifferingRow[]) => ({ rowsDiffer: true, differingRows: rows });
     // The UPDATE through 51 reached row 99 (where 51 moved): exactly that row differs.
@@ -326,8 +333,8 @@ describe("key-forwarding matcher", () => {
               {
                 table: "c",
                 key: 123,
-                authority: { references: [{ table: "t", value: 99 }] },
-                oracle: after === "absent" ? null : { references: [{ table: "t", value: after }] },
+                authority: child(123, 99),
+                oracle: after === "absent" ? null : child(123, after),
               },
             ],
           }),
@@ -361,4 +368,82 @@ describe("key-forwarding matcher", () => {
     expect(id(observation({ statements, oracle: refused(null) }))).toBeNull();
     expect(id(observation({ statements, oracle: refused(1) }))).toBe("key-forwarding");
   });
+
+  it("one explained reference does not excuse another changed reference (review B3-p2b-2 A1)", () => {
+    // DELETE through 51 (forwarding to 99): child 123's reference to t may become NULL; its
+    // reference to `other` (7 → 999) is not the forward's doing.
+    const side = (t: number | null, other: number): RowSide => ({
+      values: [123, t, other],
+      references: [
+        { column: 1, table: "t", value: t },
+        { column: 2, table: "other", value: other },
+      ],
+    });
+    const del = statement({ kind: "delete", table: "t", matchedKeys: [51] });
+    const row = (after: RowSide): DifferingRow => ({
+      table: "c",
+      key: 123,
+      authority: side(99, 7),
+      oracle: after,
+    });
+    expect(
+      id(
+        observation({ statements: [del], rowsDiffer: true, differingRows: [row(side(null, 999))] }),
+      ),
+    ).toBeNull();
+    expect(
+      id(observation({ statements: [del], rowsDiffer: true, differingRows: [row(side(null, 7))] })),
+    ).toBe("key-forwarding");
+  });
+
+  const SEEDS = seedsFor("next-testing-forwarding-matcher", [801, 802, 803, 804]);
+  for (const seed of SEEDS)
+    it(`a child difference matches only when every changed field is the forward's (seed ${String(seed)})`, () => {
+      const random = mulberry32(seed);
+      const int = (n: number) => Math.floor(random() * n);
+      let positives = 0;
+      let negatives = 0;
+      for (let k = 0; k < 300; k++) {
+        const kind = random() < 0.5 ? "delete" : "rekey";
+        const target = 99;
+        const before = child(int(1000), target, `v${String(int(5))}`);
+        // The forward's own effect on the child (SET NULL, or follow to the rekey's new key).
+        let after: RowSide = child(
+          Number(before.values[0]),
+          kind === "delete" ? null : 60,
+          before.values[2],
+        );
+        // Sometimes also an unrelated change: the note, or the reference to something else.
+        const unrelated = random() < 0.5;
+        if (unrelated) {
+          after =
+            random() < 0.5
+              ? child(Number(after.values[0]), after.references[0]?.value ?? null, "changed")
+              : child(Number(after.values[0]), kind === "delete" ? 7 : 61, after.values[2]);
+        }
+        const matched = id(
+          observation({
+            statements: [
+              statement({
+                kind,
+                table: "t",
+                matchedKeys: [51],
+                newKeys: kind === "rekey" ? [60] : [],
+              }),
+            ],
+            rowsDiffer: true,
+            differingRows: [
+              { table: "c", key: Number(before.values[0]), authority: before, oracle: after },
+            ],
+          }),
+        );
+        expect(matched, `seed ${String(seed)} case ${String(k)}`).toBe(
+          unrelated ? null : "key-forwarding",
+        );
+        if (unrelated) negatives += 1;
+        else positives += 1;
+      }
+      expect(positives).toBeGreaterThan(50);
+      expect(negatives).toBeGreaterThan(50);
+    });
 });

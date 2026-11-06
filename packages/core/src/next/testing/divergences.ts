@@ -44,7 +44,14 @@ export interface StepOutcome {
 
 /** One side's version of a differing row: its foreign-key values, in the table's FK order. */
 export interface RowSide {
-  readonly references: ReadonlyArray<{ readonly table: string; readonly value: number | null }>;
+  /** Every column's value, in the table's column order (review B3-p2b-2 A1). */
+  readonly values: readonly unknown[];
+  /** Its foreign-key columns: which column (into `values`), the table it references, the value. */
+  readonly references: ReadonlyArray<{
+    readonly column: number;
+    readonly table: string;
+    readonly value: number | null;
+  }>;
 }
 
 /** A row that differs between the two sides after a step both committed. */
@@ -219,20 +226,38 @@ function explainedByForwarding(observation: DivergenceObservation): boolean {
           reach.table === row.table &&
           (reach.target === row.key || reach.newKeys.includes(row.key)),
       );
+    // A child is explained only if every column that differs is explained (review B3-p2b-2
+    // A1): one reference the forward explains cannot excuse another reference or a value.
     const child = (row: DifferingRow) => {
       const before = row.authority;
       if (before === null) return false;
-      return before.references.some((reference, at) => {
-        const followed = reaches.find(
-          (reach) => reach.table === reference.table && reach.target === reference.value,
+      const after = row.oracle;
+      // Gone on the current engine's side: a CASCADE through a DELETE of a parent it referenced.
+      if (after === null)
+        return before.references.some((reference) =>
+          reaches.some(
+            (reach) =>
+              reach.kind === "delete" &&
+              reach.table === reference.table &&
+              reach.target === reference.value,
+          ),
         );
-        if (followed === undefined) return false;
-        const after = row.oracle?.references[at]?.value;
-        if (followed.kind === "delete") return row.oracle === null || after === null;
-        if (followed.kind === "rekey")
-          return after !== undefined && after !== null && followed.newKeys.includes(after);
-        return false;
-      });
+      if (before.values.length !== after.values.length) return false;
+      for (let column = 0; column < before.values.length; column++) {
+        if (Object.is(before.values[column], after.values[column])) continue;
+        const reference = before.references.find((candidate) => candidate.column === column);
+        if (reference === undefined) return false; // a non-key value changed
+        const now = after.references.find((candidate) => candidate.column === column)?.value;
+        const explained = reaches.some(
+          (reach) =>
+            reach.table === reference.table &&
+            reach.target === reference.value &&
+            ((reach.kind === "delete" && now === null) ||
+              (reach.kind === "rekey" && now != null && reach.newKeys.includes(now))),
+        );
+        if (!explained) return false;
+      }
+      return true;
     };
     return differing.every((row) => parent(row) || child(row));
   }
