@@ -71,7 +71,10 @@ const BATCH = 2048;
 
 // Text keys (GroupTable over one text column: the COUNT(DISTINCT) harness shape's hot path).
 // Levers 1 (word-at-a-time copy and compare) and 2 (the value table's growth).
-{
+if (
+  "text keys: emails ~22 B, ~585k distinct".includes(ONLY) ||
+  "text keys: accounts ~11 B, ~200k distinct".includes(ONLY)
+) {
   const random = rng(0x51);
   const keyed = (make: () => string) =>
     Array.from({ length: ROWS / BATCH }, () => texts(Array.from({ length: BATCH }, make)));
@@ -94,8 +97,86 @@ const BATCH = 2048;
     });
 }
 
+// Dictionary COUNT(DISTINCT)'s value-id mapping: 128 entries per 2,048-row batch.
+if ("dictionary keys (128 entries per batch)".includes(ONLY)) {
+  const random = rng(0x51);
+  const batches = Array.from({ length: ROWS / BATCH }, () => {
+    const entries = texts(
+      Array.from(
+        { length: 128 },
+        () => `user${String(Math.floor(random() * 800000))}@mail.example.com`,
+      ),
+    );
+    return support.dictionary(
+      entries,
+      Array.from({ length: BATCH }, () => Math.floor(random() * 128)),
+    );
+  });
+  const ids = new Int32Array(BATCH);
+  measure("dictionary keys (128 entries per batch)", () => {
+    const table = new GroupTable([TEXT], UNCHARGED);
+    for (const batch of batches) table.assign([batch], BATCH, null, ids);
+    table.close();
+  });
+}
+
+// Accumulator update only: prebuilt, warm states, no growth or output ownership costs.
+const { accumulatorFor } =
+  await load<typeof import("../packages/core/dist/next/exec/agg/states.js")>(
+    "next/exec/agg/states.js",
+  );
+const { I32, TS, F64, numbers } = support;
+const rows = Uint16Array.from({ length: BATCH }, (_, i) => i);
+const gids = Int32Array.from({ length: BATCH }, (_, i) => i % 1000);
+for (const [name, fn, type] of [
+  ["int32 MIN update", "min", I32],
+  ["timestamp MAX update", "max", TS],
+  ["float64 AVG update", "avg", F64],
+] as const) {
+  if (!name.includes(ONLY)) continue;
+  const random = rng(0xa66);
+  const batches = Array.from({ length: ROWS / BATCH }, () =>
+    numbers(
+      type,
+      Array.from({ length: BATCH }, () => Math.floor(random() * 1e12)),
+    ),
+  );
+  const state = accumulatorFor(fn, type, type, UNCHARGED);
+  state.grow(1000);
+  measure(name, () => {
+    for (const batch of batches) state.update(batch, gids, rows, BATCH, false);
+  });
+  state.close();
+}
+
+// Small batches amplify descriptor costs without including vector construction in the timer.
+if ("reader scratch (64k batches of 16 rows)".includes(ONLY)) {
+  const vector = numbers(
+    I32,
+    Array.from({ length: 16 }, (_, i) => i),
+  );
+  const state = accumulatorFor("min", I32, I32, UNCHARGED);
+  state.grow(1000);
+  measure("reader scratch (64k batches of 16 rows)", () => {
+    for (let i = 0; i < ROWS / 16; i++) state.update(vector, gids, rows, 16, false);
+  });
+  state.close();
+}
+
+// Repeated grow calls on established groups: isolates the empty-value wrapper and type cache.
+if ("MIN grow steady (1M batches)".includes(ONLY)) {
+  const state = accumulatorFor("min", TEXT, TEXT, UNCHARGED);
+  state.grow(1000);
+  measure("MIN grow steady (1M batches)", () => {
+    for (let i = 0; i < ROWS; i++) state.grow(1000);
+  });
+  state.close();
+}
+
 console.log(`components (CPU ms per run, ${String(REPEATS)} runs) — dist ${DIST}`);
 for (const r of results)
   console.log(
-    `${r.name}: min ${r.min.toFixed(1)} median ${r.median.toFixed(1)} runs ${r.runs.map((x) => x.toFixed(0)).join(" ")}`,
+    `${r.name}: min ${r.min.toFixed(1)} median ${r.median.toFixed(1)} spread ${(Math.max(...r.runs) - Math.min(...r.runs)).toFixed(1)} runs ${r.runs.map((x) => x.toFixed(0)).join(" ")}`,
   );
+
+console.log(JSON.stringify(results));

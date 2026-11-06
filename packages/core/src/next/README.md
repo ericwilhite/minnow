@@ -898,9 +898,24 @@ and the owner import it directly.
   two words, NUMERIC as f64 or 128-bit limbs; only coefficients past 128 bits are BigInts, each
   charged at the governor's `bigintBytes` (its size change charged before a replacement). Exact
   sums' offsets past 128 bits are charged the same way, and output estimates use those sizes.
+  Int64-family MIN/MAX also charges an 8-byte numeric winner cache per allocated group slot;
+  comparisons use it only while both values are safe integers, otherwise comparing exact words.
 - NUMERIC results past PostgreSQL's limits (131,072 digits before the decimal point) are 22003 at
   emission, SUM's and AVG's alike; exact intermediates may pass them and come back.
 - `distinct.ts`: exact DISTINCT through value ids and a (group, value id) set.
+- Scan statistics hints (future; pre-sizing and AVG Sxx skipping are deferred).
+  High-cardinality pre-sizing is deferred. The scan would need to supply a conservative NDV
+  estimate for the grouping expressions (not merely a row count), its scope across pages and
+  dictionaries, and whether a selection/filter invalidates it. A shared dictionary's entry count
+  can bound one dictionary key; per-page counts must not be added as if dictionaries were disjoint.
+  Composite keys need a joint estimate. The aggregate must charge any reservation before growth,
+  cap it to the grant, and retain ordinary incremental growth when the estimate is absent or low.
+  AVG also needs a query-wide finite max|x| and upper row count N, excluding NaN and infinities.
+  A written bound must prove PostgreSQL's rounded Youngs-Cramer tmp, tmp²/(n(n−1)), and
+  accumulated Sxx cannot overflow for any input order. Per-batch bounds are insufficient:
+  once skipped, the omitted Sxx cannot be reconstructed in PostgreSQL's operation order
+  when a later batch approaches overflow. Keep the exact path until that proof exists.
+
 - Memory: every typed array is charged before it is constructed, and a constructor that fails
   releases what it took. A refused growth fails the query until partitioned spill (milestone 3).
   Not yet: GROUPING SETS, ordered-set and string/array/JSON aggregates (`UnsupportedPlanError`,

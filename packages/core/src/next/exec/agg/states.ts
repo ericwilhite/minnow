@@ -939,6 +939,22 @@ function sumDense(
 /**
  * float8_accum over rows 0 … while every state stays finite (no NULLs, grouped): returns the first
  * row it did not take. A separate function so its loop compiles on its own.
+ *
+ * Do not skip Sxx using a per-batch bound: a later unsafe batch needs the exact previous
+ * PostgreSQL transition state. Neither recomputing sum(x*x)-Sx*Sx/N nor merging partial
+ * states preserves that operation order near overflow.
+ * A future scan hint must bound the entire query's finite |x| by M and row count by N,
+ * excluding NaN/Inf, and prove every ordered transition safe, including rounded sums,
+ * tmp = x*n-Sx, tmp*tmp, its division by n*(n-1), and accumulated Sxx. Until such a
+ * whole-query proof is available, keep PostgreSQL's Youngs-Cramer transitions intact.
+ * One sufficient (deliberately loose) future certificate is N <= 2^26 and M <= 2^400.
+ * With binary64 u=2^-53, (1+u)^N < 2: every ordered rounded Sx is bounded by
+ * 2*n*2^400. Allowing a factor two at each multiply/subtract gives |tmp| <=
+ * 8*N*2^400 <= 2^429; rounded tmp^2 <= 2^859. n*(n-1) is an exact integer
+ * <= 2^52 and >= 2 for n>=2, so each rounded increment is <= 2^860 and the
+ * accumulated Sxx <= 2*N*2^860 <= 2^887, far below binary64 overflow. Subnormal
+ * rounding errors fit within these slack factors too. The hint must bound the AVG
+ * argument after expressions, across the complete scan snapshot, not just one batch.
  */
 function averageDense(
   sums: Float64Array,
@@ -1723,6 +1739,8 @@ class MinMaxAccumulator implements Accumulator {
   readonly #values: GroupValues;
   readonly #memory: Charged;
   #has: Uint8Array = new Uint8Array(0);
+  // Exact numeric winners; NaN marks a winner requiring the word comparator.
+  #numeric: Float64Array = new Float64Array(0);
   /** Byte-compared layouts (varlen, fixed16): may take the ranked path. */
   readonly #bytes: boolean;
   #ranking: Ranking | null = null;
@@ -1753,11 +1771,14 @@ class MinMaxAccumulator implements Accumulator {
     if (groups > this.#has.length) {
       const capacity = grownCapacity(this.#has.length, groups);
       this.#has = this.#memory.uint8(this.#has, capacity);
+      if (layoutOf(this.type) === "int64")
+        this.#numeric = this.#memory.float64(this.#numeric, capacity);
       if (this.#bytes) {
         this.#position = this.#memory.float64(this.#position, capacity);
         this.#positionEpoch = this.#memory.int32(this.#positionEpoch, capacity);
       }
     }
+    if (this.#values.length >= groups) return;
     const nothing: Vector = {
       form: "constant",
       type: this.type,
@@ -1788,6 +1809,37 @@ class MinMaxAccumulator implements Accumulator {
     const values = this.#values;
     const has = this.#has;
     const better = this.max ? 1 : -1;
+    const data = reader.flat.data;
+    if (data.layout === "int64") {
+      const source = data.values;
+      const numeric = this.#numeric;
+      const words = source.repr === "int64" ? int64Words(source.values) : null;
+      for (let k = 0; k < count; k++) {
+        const i = rows[k] ?? 0;
+        if (!validAt(reader.validity, i)) continue;
+        const g = scalar ? 0 : (gids[i] ?? 0);
+        const slot = slotAt(reader, i);
+        const v =
+          words === null
+            ? Number(source.values[slot] ?? 0)
+            : ((words[2 * slot + 1] ?? 0) | 0) * 4294967296 + ((words[2 * slot] ?? 0) >>> 0);
+        // Check each value, including wide values in otherwise safe batches. Rounded values
+        // outside the safe range never participate in a numeric comparison (2^53 ties).
+        const exact = Number.isSafeInteger(v);
+        const stored = numeric[g] ?? 0;
+        const take =
+          has[g] === 0 ||
+          (exact && Number.isSafeInteger(stored)
+            ? !(this.max ? stored > v : stored < v)
+            : compareToStored(values, g, reader.flat, slot) !== better);
+        if (take) {
+          values.set(g, vector, i);
+          has[g] = 1;
+          numeric[g] = exact ? v : NaN;
+        }
+      }
+      return;
+    }
     // Bests stored here have no position among a ranking's ranks.
     this.#epoch += 1;
     for (let k = 0; k < count; k++) {

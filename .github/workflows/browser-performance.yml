@@ -75,7 +75,7 @@ jobs:
             > browser-perf-results/storage-microbench.json
       - name: Aggregation microbench (rebuild core, recorded, not judged)
         # The analytics harness's aggregation shapes (agg_highcard_int, agg_3dims_20aggs,
-        # agg_count_distinct, agg_numeric_sum) through the rebuild core's aggregate operator in
+        # agg_count_distinct, agg_count_distinct_dictionary, agg_numeric_sum) through the rebuild core's aggregate operator in
         # real Chromium: prebuilt batches, operator cost only, wall time min and median of five.
         # Recorded nightly so layout changes (row layout, partitioning) are measured on a quiet
         # host; nothing judges it.
