@@ -1384,6 +1384,9 @@ commerce scale 1,667 / wide 5M × 200-column generators (three wide dimensions i
 a 256 MiB governor. Each reopen starts a fresh worker, opens the real backend and extent space,
 recovers `WritePathImpl`, sweeps scratch, and starts the real owner host with no broker.
 The executor is a stand-in and is unused before `minnow:ready`; the harness asserts that.
+The owner factory acquires handles in `openFence` and runs session/space/write-path recovery
+in `open`, as the host contract requires. The default fence deadline is unchanged; the ready
+timer includes both acquisition and recovery.
 
 Three wall-only samples report backend/ByteStore loading, extent space, write-path recovery,
 and host overhead separately, plus page-observed host ready. Three separate CPU-bracketed

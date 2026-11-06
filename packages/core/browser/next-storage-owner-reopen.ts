@@ -3,13 +3,15 @@
  * recovery -> owner host ready. The executor is a stand-in and is UNUSED during startup.
  * Its optional first SELECT count(*) reads write-path row statistics only; it measures planning,
  * protocol and delivery, not a scan or the integrated executor. No startup phase uses fake data.
+ * The factory acquires handles in openFence; session/space/write-path recovery runs in open,
+ * as host.ts requires, outside the fence-acquisition deadline. The ready timer includes both.
  * Native reads count returned OPFS bytes / IndexedDB cloned byte payloads; IndexedDB's physical
  * disk I/O is opaque. Index/meta numeric values and keys are reported separately (8 B each).
  */
 import { createOpfsBackend, webLocks, type OpfsDirectoryLike } from "../src/next/storage/opfs.js";
 import { createIndexedDbBackend } from "../src/next/storage/indexeddb.js";
 import { openIndexedDb, type IdbDatabaseLike } from "../src/next/storage/idb-like.js";
-import type { StorageBackend, OwnerLease, StoreSession } from "../src/next/storage/contract.js";
+import type { StorageBackend } from "../src/next/storage/contract.js";
 import { openExtentSpace } from "../src/next/storage/space.js";
 import { listedRootExtents, reachableExtents } from "../src/next/format/reachable.js";
 import { decodeManifestRoot } from "../src/next/format/manifest-codec.js";
@@ -152,12 +154,27 @@ export async function openRealStorage(
   started = performance.now(),
   capBytes = 256 << 20,
 ) {
+  return recoverRealStorage(await openRealFence(store, db, phase, started, capBytes));
+}
+
+async function openRealFence(
+  store: OwnerReopenStore,
+  db: string,
+  phase: (phase: OwnerPhase) => void | Promise<void>,
+  started: number,
+  capBytes = 256 << 20,
+) {
   const counts: ReadCounts = { payloadBytes: 0, numericBytes: 0, reads: 0 };
   const meter = new OwnerPhaseMeter(counts, phase, () => performance.now(), started);
   const finish = (name: OwnerReopenPhase) => meter.finish(name);
   const governor = new Governor(capBytes);
   const backend = await backendFor(store, `b1-owner-data-${db}`, counts, governor);
   const lease = await backend.acquire({ timeoutMs: 30_000 });
+  return { backend, lease, governor, finish, counts };
+}
+
+async function recoverRealStorage(fence: Awaited<ReturnType<typeof openRealFence>>) {
+  const { backend, lease, governor, finish, counts } = fence;
   const session = await backend.open(lease);
   await finish("backend");
   const startup = await governor.admit({
@@ -231,17 +248,18 @@ export async function startMeasuredOwner(
     },
   });
   // Acquisition/session open belongs to the backend phase, including the outer host lock wait.
-  const factory: OwnerEngineFactory<{ lease: OwnerLease; session: StoreSession }> = {
-    async openFence() {
-      opened = await openRealStorage(store, db, phase, started);
-      return { lease: opened.lease, session: opened.session };
+  const factory: OwnerEngineFactory<Awaited<ReturnType<typeof openRealFence>>> = {
+    openFence() {
+      return openRealFence(store, db, phase, started);
     },
     epochOf: (fence) => fence.lease.epoch,
     closeFence(fence) {
       release = fence.lease.release();
     },
-    open() {
-      if (opened === null) throw new Error("Missing real storage");
+    async open(fence) {
+      // OwnerEngineFactory.openFence acquires handles only. Session loading and recovery are
+      // startup step 2 (host.ts), outside acquireFenced's 5s handle-acquisition deadline.
+      opened = await recoverRealStorage(fence);
       const storage = opened;
       const engine = composeEngine({
         planner: {

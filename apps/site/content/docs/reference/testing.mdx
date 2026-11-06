@@ -1425,3 +1425,5 @@ separate bracketed runs; wall samples have no sampling barriers. The executor st
 during startup. Its first `SELECT count(*)` is explicitly statistics-only and measures the owner
 protocol around the recovered row count, not an integrated scan. Native IndexedDB disk bytes
 are unavailable; the report counts returned byte payloads and numeric index/meta reads.
+The factory acquires handles in `openFence` and recovers in `open`, following the host contract.
+The default fence deadline is unchanged; the ready timer includes acquisition and recovery.

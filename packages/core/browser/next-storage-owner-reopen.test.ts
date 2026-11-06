@@ -12,6 +12,7 @@ import {
 } from "./next-storage-owner-reopen.js";
 import { FakeLockRegistry } from "../src/next/testing/fake-locks.js";
 import { Governor } from "../src/next/memory/governor.js";
+import { WritePathImpl } from "../src/next/write/engine.js";
 import { SimDisk } from "../src/next/storage/sim-disk.js";
 import {
   autocommit,
@@ -111,6 +112,8 @@ it("captures ready in the real host callback and counts through the real recover
     storage: { getDirectory: async () => ({ getDirectoryHandle: async () => directory }) },
   });
   let owner: Awaited<ReturnType<typeof startMeasuredOwner>> | null = null;
+  let restoreDate: () => void = () => undefined;
+  let restoreRecovery: () => void = () => undefined;
   try {
     const seed = await openRealStorage("opfs", "unit-ready-endpoint");
     try {
@@ -137,6 +140,17 @@ it("captures ready in the real host callback and counts through the real recover
     }
     const phases: OwnerPhase[] = [];
     let readyCalls = 0;
+    // OwnerEngineFactory's contract puts recovery in open(), after fence acquisition. A long
+    // recovery must not consume the 5s fence/handle acquisition budget (host.ts startup step 2).
+    const at = Date.now();
+    const date = vi.spyOn(Date, "now").mockReturnValue(at);
+    restoreDate = () => date.mockRestore();
+    const open = WritePathImpl.open.bind(WritePathImpl);
+    const recovery = vi.spyOn(WritePathImpl, "open").mockImplementation((options) => {
+      date.mockReturnValue(at + 6_000);
+      return open(options);
+    });
+    restoreRecovery = () => recovery.mockRestore();
     owner = await startMeasuredOwner(
       "opfs",
       "unit-ready-endpoint",
@@ -162,6 +176,8 @@ it("captures ready in the real host callback and counts through the real recover
     ]);
   } finally {
     await owner?.close();
+    restoreRecovery();
+    restoreDate();
     vi.unstubAllGlobals();
     admissions.mockRestore();
     locks.kill();
