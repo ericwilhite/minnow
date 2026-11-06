@@ -839,7 +839,7 @@ function exactSumValid(
 /** Float sums of grouped rows without NULLs until the first non-finite sum; returns that row. */
 function sumDense(
   sums: Float64Array,
-  counts: Float64Array,
+  has: Uint8Array,
   values: Float64Array,
   gids: Int32Array,
   rows: Uint16Array,
@@ -852,7 +852,7 @@ function sumDense(
     const next = (sums[g] ?? 0) + (values[i] ?? 0);
     if (next - next !== 0) break;
     sums[g] = next;
-    counts[g] = (counts[g] ?? 0) + 1;
+    has[g] = 1;
   }
   return k;
 }
@@ -891,7 +891,9 @@ function averageDense(
 class FloatSumAccumulator implements Accumulator {
   readonly #memory: Charged;
   #sums: Float64Array = new Float64Array(0);
+  /** AVG: the count per group. SUM keeps only `#has` (1 byte a group: it stays in cache). */
   #counts: Float64Array = new Float64Array(0);
+  #has: Uint8Array = new Uint8Array(0);
   /**
    * AVG only: the sum of squared deviations (float8_accum's Sxx, Youngs–Cramer). AVG does not
    * output it, but PostgreSQL raises 22003 when it overflows from finite inputs.
@@ -912,8 +914,10 @@ class FloatSumAccumulator implements Accumulator {
     // SUM starts from −0, the additive identity (PostgreSQL's first value is the state, so
     // SUM(−0) is −0); AVG's sum starts from 0 (float8_accum's initial {0,0,0}).
     if (!this.average) this.#sums.fill(-0, before);
-    this.#counts = this.#memory.float64(this.#counts, capacity);
-    if (this.average) this.#squares = this.#memory.float64(this.#squares, capacity);
+    if (this.average) {
+      this.#counts = this.#memory.float64(this.#counts, capacity);
+      this.#squares = this.#memory.float64(this.#squares, capacity);
+    } else this.#has = this.#memory.uint8(this.#has, capacity);
   }
   update(
     vector: Vector | null,
@@ -932,7 +936,7 @@ class FloatSumAccumulator implements Accumulator {
     );
     const validity = reader.validity;
     const sums = this.#sums;
-    const counts = this.#counts;
+    const has = this.#has;
     if (this.average) {
       this.#accumulate(values, validity, gids, rows, count, scalar);
       return;
@@ -951,8 +955,8 @@ class FloatSumAccumulator implements Accumulator {
           sum = next;
         }
         sums[0] = sum;
-        counts[0] = (counts[0] ?? 0) + k;
-      } else k = sumDense(sums, counts, values, gids, rows, count);
+        if (k > 0) has[0] = 1;
+      } else k = sumDense(sums, has, values, gids, rows, count);
     }
     if (k < count) this.#exact(values, validity, gids, rows, k, count, scalar, float32);
   }
@@ -1019,7 +1023,7 @@ class FloatSumAccumulator implements Accumulator {
     float32: boolean,
   ): void {
     const sums = this.#sums;
-    const counts = this.#counts;
+    const has = this.#has;
     for (let k = from; k < count; k++) {
       const i = rows[k] ?? 0;
       if (!validAt(validity, i)) continue;
@@ -1036,7 +1040,7 @@ class FloatSumAccumulator implements Accumulator {
       )
         throw new NumericOutOfRangeError("value out of range: overflow");
       sums[g] = sum;
-      counts[g] = (counts[g] ?? 0) + 1;
+      has[g] = 1;
     }
   }
   outputBytes(_from: number, count: number): number {
@@ -1044,7 +1048,12 @@ class FloatSumAccumulator implements Accumulator {
   }
   emit(from: number, count: number): FlatVector {
     const present = new Uint8Array(count);
-    for (let k = 0; k < count; k++) present[k] = (this.#counts[from + k] ?? 0) > 0 ? 1 : 0;
+    for (let k = 0; k < count; k++)
+      present[k] = this.average
+        ? (this.#counts[from + k] ?? 0) > 0
+          ? 1
+          : 0
+        : (this.#has[from + k] ?? 0);
     const validity = validityFrom(present, 0, count);
     if (this.type.kind === "float32") {
       const out = Float32Array.from(this.#sums.subarray(from, from + count));

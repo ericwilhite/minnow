@@ -657,6 +657,12 @@ and the owner import it directly.
   tuple for several keys: direct-mapped (the value ids bit-packed into a slot of a table of at
   most 2^16) while the columns' value counts fit, hashed column by column past that. SQL GROUP BY equality: NULLs together, −0 = 0, NaN = NaN, NUMERIC by
   value.
+- With more than 4,096 groups and at least four aggregates over the batch's own rows, the
+  operator hands its accumulators the rows stably sorted by group id (LSD radix, 11 bits a
+  pass), so each one's state arrays are read nearly sequentially; a group's rows keep their input
+  order, which float sums and MIN/MAX ties depend on. Measured faster than a group-row state
+  layout for many aggregates (which gained 10–25 %), and not used for few aggregates, where it
+  costs more than it saves.
 - `states.ts`: struct-of-arrays state per aggregate, no object per group. Integer and NUMERIC
   sums are exact at any size: an f64 part within ±2^52, a 128-bit carry, and past that an exact
   BigInt offset per group that changes only when the carry overflows (or for inputs already

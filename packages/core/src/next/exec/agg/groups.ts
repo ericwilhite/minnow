@@ -125,6 +125,13 @@ function hashNumber(value: number): number {
   return finalize((WORDS[0] ?? 0) ^ Math.imul(WORDS[1] ?? 0, 0x9e3779b1));
 }
 
+/**
+ * Int32Keys' table: grows past this load (linear probing over (key, id) pairs stays short at ¾,
+ * and a smaller table misses the cache less), 4× at once from `LARGE_TABLE` slots on.
+ */
+const MAX_LOAD = 0.75;
+const LARGE_TABLE = 1 << 16;
+
 /** A 32-bit integer's hash (Int32Keys). */
 function hashInt32(value: number): number {
   let h = Math.imul(value, 0x9e3779b1);
@@ -361,7 +368,8 @@ class Int32Keys implements KeyColumn {
     this.#keys = memory.make(Int32Array, 1024);
   }
   #grow(): void {
-    const size = 2 * (this.#mask + 1);
+    // Large tables grow 4× (less total rehashing on the way to many groups).
+    const size = (this.#mask + 1 >= LARGE_TABLE ? 4 : 2) * (this.#mask + 1);
     const table = this.#memory.make(Int32Array, 2 * size);
     this.#memory.give(this.#table.byteLength);
     const mask = size - 1;
@@ -418,7 +426,7 @@ class Int32Keys implements KeyColumn {
         this.#keys[id] = value;
         table[2 * s] = value;
         table[2 * s + 1] = id + 1;
-        if (2 * this.count > mask + 1) this.#grow();
+        if (this.count > MAX_LOAD * (mask + 1)) this.#grow();
       }
       ids[i] = id;
     }

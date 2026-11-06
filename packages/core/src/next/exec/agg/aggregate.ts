@@ -45,6 +45,13 @@ import { accumulatorFor, fusedSums, type Accumulator } from "./states.js";
 
 type AggregateRel = Extract<Rel, { op: "aggregate" }>;
 
+/**
+ * Group-ordered updates pay off once enough accumulators walk the rows over enough groups
+ * (measured: 20 aggregates over 10,000 groups 2.2× faster sorted; 2 over 632,000 slower).
+ */
+const SORT_MIN_AGGREGATES = 4;
+const SORT_MIN_GROUPS = 4096;
+
 /** What a cleared fused-column slot holds (no borrowed array). */
 const NO_COLUMN = new Float64Array(0);
 
@@ -100,6 +107,8 @@ export interface AggregateOptions {
    * backpressure; once aborted, `finish` rejects with its reason.
    */
   readonly signal?: AbortSignal;
+  /** False: never order a batch's rows by group (tests compare against it). Default: by size. */
+  readonly groupOrder?: boolean;
 }
 
 /** Refuses what the operator cannot compile, before anything is allocated. */
@@ -129,6 +138,13 @@ export class AggregateOperator implements Operator {
   #fused: readonly CompiledAggregate[] = [];
   readonly #fusedColumns: Float64Array[] = [];
   readonly #fusedMembers: CompiledAggregate[] = [];
+  /** Group-ordered rows (`#sortByGroup`): two buffers, the histogram, the selection handed out. */
+  #sortA = new Uint16Array(0);
+  #sortB = new Uint16Array(0);
+  #histogram = new Int32Array(0);
+  readonly #sorted: { rows: Uint16Array; count: number } = { rows: new Uint16Array(0), count: 0 };
+  /** Accumulators updated over the batch's own rows (no FILTER): what a sort serves. */
+  #sortPasses = 0;
   #fusedTotals = new Float64Array(0);
   readonly #gids: Int32Array = new Int32Array(0);
   readonly #keyVectors: Vector[];
@@ -207,6 +223,16 @@ export class AggregateOperator implements Operator {
         if (sharing) shared.set(key, compiled);
       });
       this.#groups = keyTypes.length === 0 ? null : new GroupTable(keyTypes, charge);
+      this.#sortPasses =
+        options.groupOrder === false
+          ? 0
+          : this.#aggregates.filter((a) => a.updates && a.filter === null).length;
+      if (this.#groups !== null && this.#sortPasses >= SORT_MIN_AGGREGATES) {
+        this.#takeArena(context, 2 * 2 * capacity + 4 * 2049);
+        this.#sortA = new Uint16Array(capacity);
+        this.#sortB = new Uint16Array(capacity);
+        this.#histogram = new Int32Array(2049);
+      }
       if (this.#groups === null) {
         for (const aggregate of this.#aggregates)
           if (aggregate.updates) aggregate.accumulator.grow(1);
@@ -297,6 +323,14 @@ export class AggregateOperator implements Operator {
       for (const aggregate of this.#aggregates) aggregate.accumulator.grow(groups.groupCount);
     }
     if (scalar && this.#fused.length > 0) this.#pushFused(batch, length);
+    // Many groups and several aggregates: the accumulators walk the batch's rows in group order
+    // (`#sortByGroup`), so each one's state arrays are read nearly sequentially.
+    const sorted =
+      groups !== null &&
+      this.#sortPasses >= SORT_MIN_AGGREGATES &&
+      groups.groupCount > SORT_MIN_GROUPS
+        ? this.#sortByGroup(gids, batch.selection, length, groups.groupCount)
+        : null;
     for (const aggregate of this.#aggregates) {
       if (!aggregate.updates || (scalar && aggregate.fusable)) continue;
       let rows: Selection | null = batch.selection;
@@ -304,12 +338,54 @@ export class AggregateOperator implements Operator {
         rows = aggregate.filter.select(batch);
         if (rows.count === 0) continue;
       }
+      // Arguments evaluate over the batch's own (ascending) selection; only the accumulator and
+      // the DISTINCT set read the rows in group order.
       const value = aggregate.argument === null ? null : aggregate.argument.evaluate(batch, rows);
+      if (aggregate.filter === null && sorted !== null) rows = sorted;
       if (aggregate.distinct !== null && value !== null)
         rows = aggregate.distinct.filter(value, gids, length, rows, scalar, aggregate.selection);
       aggregate.accumulator.update(value, gids, rowsIn(rows), countIn(rows, length), scalar);
     }
     return "ready";
+  }
+
+  /**
+   * The active rows ordered by group id, stably (a group's rows keep their input order, which
+   * float sums and MIN/MAX ties depend on): an LSD radix sort, 11 bits of group id per pass.
+   */
+  #sortByGroup(
+    gids: Int32Array,
+    selection: Selection | null,
+    length: number,
+    groupCount: number,
+  ): Selection {
+    const rows = rowsIn(selection);
+    const count = countIn(selection, length);
+    const histogram = this.#histogram;
+    let source = rows;
+    let target = this.#sortA;
+    let other = this.#sortB;
+    for (let shift = 0; groupCount - 1 >= 1 << shift || shift === 0; shift += 11) {
+      histogram.fill(0);
+      for (let k = 0; k < count; k++) {
+        const bucket = (((gids[source[k] ?? 0] ?? 0) >>> shift) & 2047) + 1;
+        histogram[bucket] = (histogram[bucket] ?? 0) + 1;
+      }
+      for (let b = 1; b <= 2048; b++) histogram[b] = (histogram[b] ?? 0) + (histogram[b - 1] ?? 0);
+      for (let k = 0; k < count; k++) {
+        const row = source[k] ?? 0;
+        const bucket = ((gids[row] ?? 0) >>> shift) & 2047;
+        const at = histogram[bucket] ?? 0;
+        target[at] = row;
+        histogram[bucket] = at + 1;
+      }
+      source = target;
+      [target, other] = [other, target];
+      if (shift >= 22) break;
+    }
+    this.#sorted.rows = source;
+    this.#sorted.count = count;
+    return this.#sorted;
   }
 
   /**
