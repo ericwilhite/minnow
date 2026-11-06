@@ -54,6 +54,56 @@ Install the browser binaries once before using a browser runner:
 npx playwright install chromium firefox webkit
 ```
 
+### WebKit on a Linux host Playwright does not support
+
+Playwright's Linux WebKit build is made for Ubuntu 24.04. On a distribution with newer system
+libraries (an Arch-based host with ICU 78, for one), every WebKit case fails before it runs:
+`Host system is missing dependencies to run browsers`, then
+`libicudata.so.74: cannot open shared object file`. `npx playwright install-deps` needs apt and
+root, and you do not need either. WebKit needs three libraries that are older than the system's:
+ICU 74, libxml2 2.9 (`libxml2.so.2`) and flite 2.2. Take them from Ubuntu 24.04's packages, keep
+them out of the system's library folders, and give Playwright a private browsers folder whose
+MiniBrowser wrapper puts them on the library path:
+
+```bash
+WK="${WK:-$HOME/.cache/minnow-webkit}"   # scratch for the libraries and the browser mirror
+BUILD=webkit-2336                         # the WebKit build Playwright installed (ls ~/.cache/ms-playwright)
+mkdir -p "$WK/debs" "$WK/x" "$WK/lib"
+cd "$WK/debs"
+for deb in main/i/icu/libicu74_74.2-1ubuntu3_amd64.deb \
+           main/libx/libxml2/libxml2_2.9.14+dfsg-1.3ubuntu3_amd64.deb \
+           universe/f/flite/libflite1_2.2-6build3_amd64.deb; do
+  curl -fsSLO "http://archive.ubuntu.com/ubuntu/pool/$deb"
+done
+for deb in *.deb; do bsdtar -xOf "$deb" 'data.tar*' | bsdtar -xf - -C "$WK/x"; done
+cp -a "$WK"/x/usr/lib/x86_64-linux-gnu/*.so.* "$WK/lib/"
+# A private browsers folder: links to the installed build, with a MiniBrowser wrapper that keeps
+# these libraries on the path (the installed wrapper replaces LD_LIBRARY_PATH).
+SRC="$HOME/.cache/ms-playwright/$BUILD"
+DST="$WK/browsers/$BUILD"
+rm -rf "$DST" && mkdir -p "$DST/minibrowser-wpe"
+for f in "$SRC"/*; do [ "$(basename "$f")" = minibrowser-wpe ] || ln -s "$f" "$DST/"; done
+for f in "$SRC"/minibrowser-wpe/*; do [ "$(basename "$f")" = MiniBrowser ] || ln -s "$f" "$DST/minibrowser-wpe/"; done
+sed -e 's|readlink -f $0|echo $0|' \
+    -e "s|^export LD_LIBRARY_PATH=\"\(.*\)\"|export LD_LIBRARY_PATH=\"\1:$WK/lib\"|" \
+    "$SRC/minibrowser-wpe/MiniBrowser" > "$DST/minibrowser-wpe/MiniBrowser"
+chmod +x "$DST/minibrowser-wpe/MiniBrowser"
+```
+
+Then run any browser runner with WebKit through that folder:
+
+```bash
+export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1
+export PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/minnow-webkit/browsers"
+npx playwright test --config playwright.next-owner.config.ts --project=webkit
+```
+
+`PLAYWRIGHT_BROWSERS_PATH` here holds only WebKit, so set it only for WebKit runs. A Playwright
+upgrade installs a new WebKit build: set `BUILD` to it and run the block again. Check with
+`ldd` that nothing else is missing (`LD_LIBRARY_PATH=<build>/minibrowser-wpe/lib:<build>/minibrowser-wpe/sys/lib:$WK/lib ldd <build>/minibrowser-wpe/bin/MiniBrowser | grep "not found"`).
+This runs Linux WebKit, not Safari: the build has no worker OPFS (see below), so it covers
+WebKit's IndexedDB path only. CI runs WebKit on macOS.
+
 The merge gate and fast SQLLogicTest profile run in `.github/workflows/ci.yml` on every push and pull
 request, spread across parallel jobs. One job runs the format, type, lint, build, API contract, and
 SQLLogicTest checks. The unit suite runs under coverage in four Vitest shards, with the maintenance
