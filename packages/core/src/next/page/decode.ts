@@ -970,6 +970,57 @@ function copyBytes(
 type VarlenData = Extract<VectorData, { layout: "varlen" }>;
 
 /** Bytes `decodeRange` / `gatherRows` will append for these rows of a varlen page. */
+function countBitsRange(words: Uint32Array, from: number, to: number): number {
+  let count = 0;
+  for (let row = from; row < to; row++) count += ((words[row >>> 5] ?? 0) >>> (row & 31)) & 1;
+  return count;
+}
+function codeBytes8(
+  codes: Uint8Array,
+  entries: Int32Array,
+  validity: Uint32Array | null,
+  from: number,
+  to: number,
+): number {
+  let total = 0;
+  for (let row = from; row < to; row++) {
+    if (validity !== null && (((validity[row >>> 5] ?? 0) >>> (row & 31)) & 1) === 0) continue;
+    const code = codes[row] ?? 0;
+    total += (entries[code + 1] ?? 0) - (entries[code] ?? 0);
+  }
+  return total;
+}
+function codeBytes16(
+  codes: Uint16Array,
+  entries: Int32Array,
+  validity: Uint32Array | null,
+  from: number,
+  to: number,
+): number {
+  let total = 0;
+  for (let row = from; row < to; row++) {
+    if (validity !== null && (((validity[row >>> 5] ?? 0) >>> (row & 31)) & 1) === 0) continue;
+    const code = codes[row] ?? 0;
+    total += (entries[code + 1] ?? 0) - (entries[code] ?? 0);
+  }
+  return total;
+}
+function codeBytes32(
+  codes: Uint32Array,
+  entries: Int32Array,
+  validity: Uint32Array | null,
+  from: number,
+  to: number,
+): number {
+  let total = 0;
+  for (let row = from; row < to; row++) {
+    if (validity !== null && (((validity[row >>> 5] ?? 0) >>> (row & 31)) & 1) === 0) continue;
+    const code = codes[row] ?? 0;
+    total += (entries[code + 1] ?? 0) - (entries[code] ?? 0);
+  }
+  return total;
+}
+
 export function varlenBytesOf(
   view: PageView,
   dictionary: PageDictionary | null,
@@ -978,7 +1029,8 @@ export function varlenBytesOf(
   to: number,
   base0 = 0,
 ): number {
-  if (view.allNull) return 0;
+  // Only varlen pages have varlen bytes (a fixed-width page's target needs none).
+  if (view.allNull || view.tag !== ValueTag.varlen) return 0;
   const count = to - from;
   if (view.kind === PageEncoding.constant) return count * view.aux;
   const valueBytes = (row: number): number => {
@@ -997,6 +1049,21 @@ export function varlenBytesOf(
   if (rows === null && view.kind === PageEncoding.plain && view.large === null) {
     const offsets = view.unsigned;
     return offsets === null ? 0 : (offsets[to] ?? 0) - (offsets[from] ?? 0);
+  }
+  // A dictionary page over a range: one monomorphic loop per code width (the closure below,
+  // over a union of code arrays, ran tens of ns per row).
+  const entries = dictionary?.offsets ?? null;
+  if (rows === null && view.kind === PageEncoding.dictionary && entries !== null) {
+    const codes = view.unsigned;
+    if (codes === null) {
+      const valid = view.validity === null ? count : countBitsRange(view.validity, from, to);
+      return valid * ((entries[view.aux + 1] ?? 0) - (entries[view.aux] ?? 0));
+    }
+    return codes instanceof Uint8Array
+      ? codeBytes8(codes, entries, view.validity, from, to)
+      : codes instanceof Uint16Array
+        ? codeBytes16(codes, entries, view.validity, from, to)
+        : codeBytes32(codes, entries, view.validity, from, to);
   }
   let total = 0;
   for (let k = from; k < to; k++) {

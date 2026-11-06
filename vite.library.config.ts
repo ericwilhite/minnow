@@ -1,6 +1,10 @@
 import { defineConfig } from "vite";
 
 export default defineConfig({
+  // Test pages only: the next/ engine re-verifies cached bytes at every lease release and
+  // eviction, so a writer into them fails in the browser lanes too
+  // (packages/core/src/next/storage/verify-cached.ts).
+  define: { "globalThis.__MINNOW_VERIFY_CACHED_BYTES__": "true" },
   // The browser conformance runner loads the same vendored SQLite Wasm and PGlite distributions
   // as the benchmark site. Serving this directory preserves each package's relative asset URLs.
   publicDir: "apps/site/public",

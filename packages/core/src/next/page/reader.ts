@@ -217,6 +217,34 @@ class PageDescriptor {
   }
 }
 
+/**
+ * A chunk's parsed dictionary riding on its dictionary page's cache entry, with what it was
+ * checked against (measured 306–413 bytes: a 50-entry uuid and a 1,000-entry text dictionary;
+ * charged at `PAGE_DESCRIPTOR_BYTES`).
+ */
+class DictionaryDescriptor {
+  readonly #encoding: number;
+  readonly #rowCount: number;
+  readonly #tag: number;
+  constructor(
+    readonly dictionary: PageDictionary,
+    /** The cached bytes it views. */
+    readonly source: Uint8Array,
+    entry: PageEntry,
+    tag: number,
+  ) {
+    this.#encoding = entry.encoding;
+    this.#rowCount = entry.rowCount;
+    this.#tag = tag;
+  }
+
+  fits(entry: PageEntry, tag: number): boolean {
+    return (
+      entry.encoding === this.#encoding && entry.rowCount === this.#rowCount && tag === this.#tag
+    );
+  }
+}
+
 /** `at`, for methods whose `at` parameter shadows it. */
 const at_ = at;
 
@@ -320,6 +348,11 @@ export class ChunkReader {
   readonly #streams = new Set<Stream>();
   /** Each compiled predicate's matching dictionary codes, charged until `close`. */
   readonly #codes = new Map<CompiledPredicate, Uint32Array>();
+  /** Translation maps by interner (`translationMap`), charged until `close`. */
+  readonly #translations = new Map<
+    (bytes: Uint8Array, start: number, end: number) => number,
+    Int32Array
+  >();
   #scratch: SelectScratch | null = null;
   #scratchCharge = 0;
   #closed = false;
@@ -671,7 +704,7 @@ export class ChunkReader {
     try {
       if (this.#closed) throw new ReaderClosedError();
       if (page === null) {
-        const dictionary = parseDictionary(bytes, entry, this.directory.tag);
+        const dictionary = this.#parseDictionary(entry, bytes, stored);
         this.#dictionary = dictionary;
         this.#dictionaryHeld = held;
         this.#dictionaryVector = dictionaryVector(dictionary, this.chunk.type);
@@ -716,6 +749,32 @@ export class ChunkReader {
     return view;
   }
 
+  /**
+   * The chunk's dictionary: the one its cache entry carries when it was parsed for the same
+   * entry fields and tag, else a fresh parse, attached for the next reader (as `#parse` does
+   * for pages). The dictionary vector over it is built per reader, for this chunk's type.
+   */
+  #parseDictionary(entry: PageEntry, bytes: Uint8Array, stored: BlobRef | null): PageDictionary {
+    const tag = this.directory.tag;
+    if (stored === null) return parseDictionary(bytes, entry, tag);
+    const cached = this.#space.parsed?.(stored) ?? null;
+    if (
+      cached instanceof DictionaryDescriptor &&
+      cached.source === bytes &&
+      cached.fits(entry, tag)
+    )
+      return cached.dictionary;
+    const dictionary = parseDictionary(bytes, entry, tag);
+    // Only views of the entry's own bytes may ride on it (parse copies a misaligned blob).
+    if (cached === null && dictionary.bytes.buffer === bytes.buffer)
+      this.#space.attach?.(
+        stored,
+        new DictionaryDescriptor(dictionary, bytes, entry, tag),
+        PAGE_DESCRIPTOR_BYTES,
+      );
+    return dictionary;
+  }
+
   #drop(held: Held | undefined | null): void {
     if (held === undefined || held === null) return;
     if (held.charged > 0) this.#options.budget.free(held.charged);
@@ -732,6 +791,37 @@ export class ChunkReader {
     if (pending !== null) return pending.then(() => this.#dictionaryVector);
     if (this.#loadCached([], true)) return this.#dictionaryVector;
     return this.#start([], true).then(() => this.#dictionaryVector);
+  }
+
+  /**
+   * A code translation map for this chunk's dictionary: `map[code] = intern(bytes, start, end)`
+   * for each entry (its stored bytes: UTF-8 text, bytes, or 16 uuid bytes), so codes of
+   * different groups translate into one id space (the executor's GROUP BY and join keys across
+   * groups). Built once per reader and `intern`, O(dictionary) whatever the rows, charged to the
+   * budget (4 bytes per entry) until `close`; a repeated call returns the same map. Null when
+   * the chunk has no dictionary; the dictionary must be loaded (`loadDictionary`, or `load` of a
+   * dictionary page).
+   */
+  translationMap(
+    intern: (bytes: Uint8Array, start: number, end: number) => number,
+  ): Int32Array | null {
+    this.#live();
+    if (this.directory.dictionary === null) return null;
+    const dictionary = this.#dictionary;
+    if (dictionary === null) throw new RangeError("The chunk's dictionary is not loaded");
+    const kept = this.#translations.get(intern);
+    if (kept !== undefined) return kept;
+    const bytes = dictionary.size * 4;
+    if (!this.#options.budget.allocate(bytes)) throw new PageBudgetError(bytes);
+    const map = new Int32Array(dictionary.size);
+    const offsets = dictionary.offsets;
+    for (let code = 0; code < dictionary.size; code++) {
+      const start = offsets === null ? code * 16 : (offsets[code] ?? 0);
+      const end = offsets === null ? start + 16 : (offsets[code + 1] ?? 0);
+      map[code] = intern(dictionary.bytes, start, end);
+    }
+    this.#translations.set(intern, map);
+    return map;
   }
 
   /** The chunk's dictionary as an immutable flat vector, once loaded. */
@@ -777,6 +867,8 @@ export class ChunkReader {
     this.#streams.clear();
     for (const codes of this.#codes.values()) this.#options.budget.free(codes.byteLength);
     this.#codes.clear();
+    for (const map of this.#translations.values()) this.#options.budget.free(map.byteLength);
+    this.#translations.clear();
     this.#options.budget.free(this.#scratchCharge);
     this.#scratchCharge = 0;
     this.#scratch = null;

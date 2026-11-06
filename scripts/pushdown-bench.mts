@@ -30,10 +30,9 @@ import { chunkMayMatch, type ColumnPredicate } from "../packages/core/src/next/p
 import { ChunkReader, prefersDense } from "../packages/core/src/next/page/reader.ts";
 import { targetFor } from "../packages/core/src/next/page/test-support.ts";
 import { GroupWriter } from "../packages/core/src/next/page/writer.ts";
-import type { PhysicalType } from "../packages/core/src/next/types.ts";
-import { allocateValidity, setValid } from "../packages/core/src/next/vector/validity.ts";
-import type { FlatVector, VectorData } from "../packages/core/src/next/vector/vector.ts";
-import { wideSpec, wideValue, type WideColumn } from "./browser-perf/page/wide-data.ts";
+import type { FlatVector } from "../packages/core/src/next/vector/vector.ts";
+import { wideSpec } from "./browser-perf/page/wide-data.ts";
+import { typeOf, vectorOf } from "./wide-table.mts";
 
 const args = process.argv.slice(2);
 const option = (name: string, fallback: number): number => {
@@ -55,7 +54,6 @@ const GATE_COLUMNS = args.includes("--columns") && args[args.indexOf("--columns"
 const WAY = args.includes("--way") ? (args[args.indexOf("--way") + 1] ?? "") : null;
 const REPEATS = option("repeats", 5);
 const GROUP = 65_536;
-const encoder = new TextEncoder();
 
 const C30 =
   "id ts day d00 d01 d02 d03 d04 d05 h00 h01 h05 i00 i01 i02 i03 i04 f00 f01 f02 f03 n00 n01 n02 b00 b01 x00 x01 x02 x03".split(
@@ -63,123 +61,6 @@ const C30 =
   );
 const EXTRA = ["i09", "i07", "i05"];
 const spec = new Map(wideSpec(200).map((column) => [column.name, column]));
-
-function typeOf(column: WideColumn): PhysicalType {
-  switch (column.family) {
-    case "id":
-      return { kind: "int64" };
-    case "ts":
-      return { kind: "timestamp", zoned: false };
-    case "day":
-      return { kind: "date" };
-    case "d":
-    case "h":
-      return { kind: "text" };
-    case "i":
-      return { kind: "int32", bits: 32 };
-    case "f":
-      return { kind: "float64" };
-    case "n":
-      return { kind: "decimal", precision: 12, scale: 2 };
-    case "b":
-      return { kind: "bool" };
-    case "x":
-      return column.mixed === 0
-        ? { kind: "int32", bits: 32 }
-        : column.mixed === 1
-          ? { kind: "float64" }
-          : column.mixed === 2
-            ? { kind: "text" }
-            : { kind: "bool" };
-  }
-}
-
-/** One group's vector of `column`, built straight into typed arrays. */
-function vectorOf(
-  column: WideColumn,
-  type: PhysicalType,
-  first: number,
-  count: number,
-): FlatVector {
-  let validity: Uint32Array | null = null;
-  const valueAt = (k: number): ReturnType<typeof wideValue> => {
-    const value = wideValue(column, first + k, ROWS);
-    if (value === null) {
-      validity ??= (() => {
-        const all = allocateValidity(count);
-        for (let r = 0; r < count; r++) setValid(all, r, true);
-        return all;
-      })();
-      setValid(validity, k, false);
-    }
-    return value;
-  };
-  let data: VectorData;
-  switch (type.kind) {
-    case "int64":
-    case "timestamp": {
-      const values = new Float64Array(count);
-      for (let k = 0; k < count; k++) {
-        const value = valueAt(k) as number;
-        values[k] = type.kind === "timestamp" ? (value - 946_684_800_000) * 1000 : value;
-      }
-      data = { layout: "int64", values: { repr: "safe", values } };
-      break;
-    }
-    case "date": {
-      const values = new Int32Array(count);
-      for (let k = 0; k < count; k++)
-        values[k] = Math.floor((Date.parse(valueAt(k) as string) - 946_684_800_000) / 86_400_000);
-      data = { layout: "i32", values };
-      break;
-    }
-    case "int32": {
-      const values = new Int32Array(count);
-      for (let k = 0; k < count; k++) values[k] = (valueAt(k) as number | null) ?? 0;
-      data = { layout: "i32", values };
-      break;
-    }
-    case "float64": {
-      const values = new Float64Array(count);
-      for (let k = 0; k < count; k++) values[k] = (valueAt(k) as number | null) ?? 0;
-      data = { layout: "f64", values };
-      break;
-    }
-    case "bool": {
-      const values = new Uint8Array(count);
-      for (let k = 0; k < count; k++) values[k] = valueAt(k) === true ? 1 : 0;
-      data = { layout: "bool", values };
-      break;
-    }
-    case "decimal": {
-      const values = new Float64Array(count);
-      for (let k = 0; k < count; k++) values[k] = Math.round(Number(valueAt(k) as string) * 100);
-      data = {
-        layout: "decimal",
-        scale: 2,
-        scales: null,
-        coefficients: { repr: "safe", values },
-        specials: null,
-      };
-      break;
-    }
-    default: {
-      const parts = Array.from({ length: count }, (_, k) =>
-        encoder.encode(String(valueAt(k) ?? "")),
-      );
-      const offsets = new Int32Array(count + 1);
-      let total = 0;
-      parts.forEach((part, k) => {
-        total += part.length;
-        offsets[k + 1] = total;
-      });
-      const bytes = new Uint8Array(total);
-      parts.forEach((part, k) => bytes.set(part, offsets[k] ?? 0));
-      data = { layout: "varlen", bytes, offsets };
-    }
-  }
-  return { form: "flat", type, length: count, validity, data };
-}
 
 // ── The table ────────────────────────────────────────────────────────────────────────────────
 
@@ -204,7 +85,7 @@ for (let first = 0; first < ROWS; first += GROUP) {
     writer: space.beginWrite("bench"),
   });
   await writer.append(
-    columns.map(({ column, type }) => vectorOf(column, type, first, count)),
+    columns.map(({ column, type }) => vectorOf(column, type, first, count, ROWS)),
     count,
   );
   const written = await writer.finish();

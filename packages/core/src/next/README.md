@@ -162,6 +162,15 @@ is access's `Snapshot`.
   - Implemented in `space.ts` (writers, publication, reclaim, open walk, `audit`) and
     `page-cache.ts` (segmented LRU: a one-pass scan recycles probation and leaves hot blobs).
     `space-crash.test.ts` crashes it at every physical step of a workload and reopens.
+  - A reader's parsed descriptor rides on its entry (`attachParsed`) and is charged to the cache
+    from attachment until the entry is gone, pinned or not; pinning moves only the blob's bytes
+    and overhead to the leases. `page-cache-model.test.ts` checks every charge after each step of
+    random operation sequences, concurrent cold reads included.
+  - Cached bytes are immutable by contract. Test builds enforce it (`verify-cached.ts`): with
+    `MINNOW_VERIFY_CACHED_BYTES=1` (every Vitest suite) or `globalThis.__MINNOW_VERIFY_CACHED_BYTES__`
+    (a browser harness, or the define in `vite.library.config.ts` for the browser lanes), a lease
+    release and an eviction hash the blob again and throw `CachedBytesWrittenError` if a consumer
+    wrote into it. Off, it is one branch on a module constant.
 - **The in-memory backend** (`memory-store.ts`) is the file store over growable in-memory files:
   the store of an in-memory database and of the end-to-end suites. It has no scratch space.
 - **The OPFS backend** (`opfs.ts`: `createOpfsBackend`, `webLocks`) is the file store over real
@@ -352,6 +361,21 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
 - Memory: no per-row allocation. The code bitmaps and the decode scratch are charged to the
   reader's budget and returned at `close`.
 - `scripts/pushdown-bench.mts` measures it on the W1M table's columns against decode-then-filter.
+- Dictionary translation: `reader.translationMap(intern)` maps the chunk's dictionary codes into
+  the query's id space (`map[code] = intern(entry bytes)`), so text GROUP BY and join keys agree
+  across groups without strings. Built once per reader and interner at O(dictionary), charged
+  (4 bytes per entry) until `close`; null for a chunk with no dictionary. A dictionary never has
+  more entries than the rows it codes: the writer keeps a page dictionary-encoded only while its
+  codes and new entries cost no more than the plain page, so a group of mostly distinct values is
+  stored plain, and a map never costs more than the rows it replaces.
+- First batch (`SELECT *` first page, and `ORDER BY` the primary key, the same rows): a scan opens
+  each projected column's chunk (its directory only), loads just the pages the batch covers (with
+  the dictionary for dictionary pages) and decodes those rows; nothing is done for the rest of the
+  group. `scripts/first-batch-bench.mts`, 2,048 rows, warm with descriptors (load 15–27): W1M
+  (200 columns) 4.2 ms, W500 (500 columns) 11.9–13.9 ms; cold (no byte or directory cache) 21–24
+  ms and 62–79 ms, about half opening (directory read, checksum and parse), most of the rest page
+  reads and their checksums. `varlenBytes` counts nothing for non-varlen pages and sums
+  dictionary entry lengths in one loop per code width.
 - Parsed pages ride on their space-cache entries (`ExtentReader.parsed` / `attach`): a reader
   attaches the page's descriptor (its `PageView`: views into the entry's own bytes, the validated
   structure) to the entry, charged in that entry at `PAGE_DESCRIPTOR_BYTES` (768; measured
@@ -359,8 +383,12 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
   dropped with it. Later readers reuse it when it was validated against the same directory fields
   (encoding, rows, nulls, large-value region, tag, scale, dictionary size), so a page is validated
   once per cache residency, not once per load. Views share the cached bytes, so nothing is
-  counted twice. gzip pages (inflated per residency, R15.5) and dictionary pages are parsed per
-  reader. W1M, 0.1 % filter returning 30 columns, warm: 82.6 ms without descriptors, 52.9 ms with
+  counted twice. A chunk's dictionary rides on its dictionary page's entry the same way (the
+  parsed dictionary, 306–413 bytes measured, charged at the same bound; each reader builds its own
+  vector over it): 83 dictionaries of the W500 table load in 1.1–1.3 ms instead of 1.4–1.7. gzip
+  pages are parsed per load: parsing inflated pages measured 1–11 % of a warm scan of a compacted
+  text column (inflating, the larger cost, already happens once per residency, R15.5), so they
+  get no descriptor. W1M, 0.1 % filter returning 30 columns, warm: 82.6 ms without descriptors, 52.9 ms with
   (load ≈ 16); W5M: 235 ms warm.
 
 ### Manifest (`format/manifest.ts`)
