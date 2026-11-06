@@ -181,6 +181,13 @@ export class Memtable {
     }
   }
 
+  /** Rollback can reuse an index while an older generation there is still borrowed. */
+  #holdBorrowed(chunk: number, stored: ColumnChunk[]): void {
+    const held = this.#lent.get(chunk);
+    if (held === undefined) this.#lent.set(chunk, stored);
+    else held.push(...stored);
+  }
+
   /** Bytes of released chunks still borrowed by readers. */
   get borrowedBytes(): number {
     let total = 0;
@@ -334,7 +341,7 @@ export class Memtable {
     const chunkCount = this.chunks[0]?.length ?? 0;
     for (let chunk = keepChunks; chunk < chunkCount; chunk++) {
       const stored = this.chunks.map((list) => need(list[chunk]));
-      if (this.#borrows.has(chunk)) this.#lent.set(chunk, stored);
+      if (this.#borrows.has(chunk)) this.#holdBorrowed(chunk, stored);
       else for (const column of stored) column.releaseCharge();
     }
     for (const list of this.chunks) {
@@ -362,7 +369,7 @@ export class Memtable {
     const chunkCount = this.chunks[0]?.length ?? 0;
     for (let chunk = 0; chunk < chunkCount; chunk++) {
       const stored = this.chunks.map((list) => need(list[chunk]));
-      if (this.#borrows.has(chunk)) this.#lent.set(chunk, stored);
+      if (this.#borrows.has(chunk)) this.#holdBorrowed(chunk, stored);
       else for (const column of stored) column.releaseCharge();
     }
     this.chunks = this.columns.map(() => []);
