@@ -58,8 +58,9 @@ column of that table may appear in the select list, `HAVING`, or `ORDER BY` ungr
 String constants take PostgreSQL's spellings too: `'it''s'`, `E'tab\there'` with C-style
 escapes, and `$tag$…$tag$` dollar quotes; `5.` and `.5` are numbers; `~~`, `!~~`, `~~*`, and
 `!~~*` spell `LIKE`, `NOT LIKE`, `ILIKE`, and `NOT ILIKE`; `TABLE name` is `SELECT * FROM name`;
-and a trailing `FOR UPDATE` or `FOR SHARE` is accepted and ignored, since a single-session engine
-has no other session to lock rows against.
+and a trailing `FOR UPDATE` or `FOR SHARE` takes no row locks. In a `READ ONLY` transaction,
+a clause that reaches a table or view is refused, including through FROM subqueries. An outer
+clause on a CTE reference or constant-only source locks nothing and is allowed.
 
 Casts take either spelling, `CAST(total AS INTEGER)` or `total::INTEGER`; the postfix form binds
 tighter than every operator, so `-total::INTEGER * 2` is `(-(total::INTEGER)) * 2`. A double
