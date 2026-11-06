@@ -31,7 +31,11 @@ export interface Slab {
  * Groups `ranges` (any order; overlaps and duplicates allowed) into slabs in offset order. Every
  * range lies wholly inside exactly one slab.
  */
-export function planSlabs(ranges: readonly DataRange[]): Slab[] {
+/**
+ * `limit`: the largest slab (default `MAX_SLAB`, the shared read slab). A reader that owns each
+ * slab's buffer (a one-pass read, page-cache.ts) may plan larger ones.
+ */
+export function planSlabs(ranges: readonly DataRange[], limit = MAX_SLAB): Slab[] {
   const order = ranges.map((range, index) => ({ range, index }));
   order.sort((a, b) => a.range.offset - b.range.offset);
   const slabs: Slab[] = [];
@@ -44,7 +48,7 @@ export function planSlabs(ranges: readonly DataRange[]): Slab[] {
     if (members.length > 0) {
       const mergedEnd = Math.max(end, rangeEnd);
       // A range inside the slab costs nothing; otherwise bound the gap and the slab.
-      if (rangeEnd <= end || (offset - end <= MAX_SLAB_GAP && mergedEnd - start <= MAX_SLAB)) {
+      if (rangeEnd <= end || (offset - end <= MAX_SLAB_GAP && mergedEnd - start <= limit)) {
         end = mergedEnd;
         members.push(index);
         continue;

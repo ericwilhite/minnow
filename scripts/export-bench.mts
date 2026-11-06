@@ -41,6 +41,8 @@ const CAP_MIB = Number(option("cap-mib", "512"));
 /** Stored bytes of pages a column loads ahead of its batch (`ChunkReader.pagesAhead`). */
 const READAHEAD = Number(option("readahead-kib", "256")) * 1024;
 const MiB = 1024 * 1024;
+/** Row-window readahead across all columns (export-stream.ts `windowBytes`); 0: per column. */
+const WINDOW = Number(option("window-mib", "0")) * MiB;
 
 const allGroups = JSON.parse(readFileSync(join(DIR, "groups.json"), "utf8"), jsonReviver) as Array<{
   rows: number;
@@ -87,6 +89,7 @@ async function exportOnce(pass: number): Promise<void> {
     directories,
     once: ONCE,
     readahead: READAHEAD,
+    windowBytes: WINDOW,
     sample: () => {
       const memory = process.memoryUsage();
       peakRss = Math.max(peakRss, memory.rss);
@@ -105,7 +108,7 @@ async function exportOnce(pass: number): Promise<void> {
     [
       `pass ${String(pass)}: ${String(emitted)} rows × 200 columns`,
       `once ${ONCE ? "on" : "off"}`,
-      `readahead ${String(READAHEAD / 1024)} KiB, ${String(cache.stats.platformReads)} platform reads`,
+      `${WINDOW > 0 ? `window ${String(WINDOW / MiB)} MiB` : `readahead ${String(READAHEAD / 1024)} KiB`}, ${String(cache.stats.platformReads)} platform reads`,
       `${(emitted / seconds / 1000).toFixed(0)}k rows/s (${seconds.toFixed(1)} s)`,
       `CPU ${((used.user + used.system) / 1e6).toFixed(1)} s`,
       `peak RSS +${((peakRss - baseline.rss) / MiB).toFixed(0)} MiB (baseline ${(baseline.rss / MiB).toFixed(0)} MiB)`,

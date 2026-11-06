@@ -38,6 +38,8 @@ import { requireWorkerOpfs, test } from "./fixtures.js";
 type Run = typeof import("../browser/next-export-run.js");
 const RUN = "/packages/core/browser/next-export-run.ts";
 const MiB = 1024 * 1024;
+/** Clock ticks per second of /proc's utime and stime (Linux USER_HZ). */
+const CLOCK_TICKS = 100;
 /** A warm pass needs at least this share of the store's files resident when it starts. */
 const WARM_SHARE = 0.98;
 /**
@@ -46,6 +48,10 @@ const WARM_SHARE = 0.98;
  * minutes on a loaded host.
  */
 const DISTINCT = Number(process.env.MINNOW_EXPORT_DISTINCT ?? 4);
+/** MINNOW_EXPORT_FOCUS=1: only Gate A's configuration (cold ×4, warm ×2, a profiled pass). */
+const FOCUS = process.env.MINNOW_EXPORT_FOCUS === "1";
+/** The row window of the focused passes (MINNOW_EXPORT_WINDOW_MIB, default 64). */
+const WINDOW_MIB = Number(process.env.MINNOW_EXPORT_WINDOW_MIB ?? 64);
 
 /** Every file under the profile's OPFS storage ("File System"). */
 function opfsFiles(profile: string): string[] {
@@ -116,6 +122,31 @@ function chromeProcesses(profile: string): Map<number, { kind: string; rss: numb
     for (const [child, entry] of table) if (entry.ppid === pid) add(child);
   };
   for (const [pid] of roots) add(pid);
+  return out;
+}
+
+/** CPU seconds (utime + stime) of each dedicated-worker thread of the renderers, by thread id. */
+function workerThreadCpu(profile: string): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const [pid, process] of chromeProcesses(profile)) {
+    if (process.kind !== "renderer") continue;
+    let tasks: string[];
+    try {
+      tasks = readdirSync(`/proc/${String(pid)}/task`);
+    } catch {
+      continue;
+    }
+    for (const tid of tasks)
+      try {
+        const comm = readFileSync(`/proc/${String(pid)}/task/${tid}/comm`, "utf8");
+        if (!comm.startsWith("DedicatedWorker")) continue;
+        const stat = readFileSync(`/proc/${String(pid)}/task/${tid}/stat`, "utf8");
+        const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+        out.set(`${String(pid)}/${tid}`, (Number(fields[11]) + Number(fields[12])) / CLOCK_TICKS);
+      } catch {
+        // The thread ended while it was being read.
+      }
+  }
   return out;
 }
 
@@ -256,6 +287,10 @@ interface Row {
   readonly scannedKept: string;
   readonly rendererRssPeakMiB: number;
   readonly workerHeapPeakMiB: number;
+  /** The export worker's thread CPU (whole worker, setup included; sampled every 200 ms). */
+  readonly workerCpuSeconds: number;
+  /** Rows per second of that CPU: the pass's cost, whatever share of a core the host gave it. */
+  readonly rowsPerCpuSecond: number;
 }
 
 test.describe("rebuild core export on OPFS (bench)", () => {
@@ -311,10 +346,15 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       const rssBefore = rendererRss(profile);
       let rssPeak = rssBefore;
       let heapPeak = 0;
+      // The export worker's thread CPU: threads that appear during the pass, at their last sample.
+      const threadsBefore = new Set(workerThreadCpu(profile).keys());
+      const passCpu = new Map<string, number>();
       const sampling = { on: true };
       const sampler = (async () => {
         while (sampling.on) {
           rssPeak = Math.max(rssPeak, rendererRss(profile));
+          for (const [tid, seconds] of workerThreadCpu(profile))
+            if (!threadsBefore.has(tid)) passCpu.set(tid, seconds);
           heapPeak = Math.max(heapPeak, await targets.heap());
           await new Promise((resolve) => setTimeout(resolve, 200));
         }
@@ -333,6 +373,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       // vite.library.config.ts drops the cached-bytes guard when this bench is opted in.
       expect(pass.verifying, "the cached-bytes guard re-hashes every release").toBe(false);
       const bytes = (built.dataBytes * pass.rows) / (rows + 65_536);
+      const cpuSeconds = [...passCpu.values()].reduce((sum, seconds) => sum + seconds, 0);
       const row: Row = {
         label: established
           ? label
@@ -351,39 +392,66 @@ test.describe("rebuild core export on OPFS (bench)", () => {
         scannedKept: pass.kept?.scanned ?? "",
         rendererRssPeakMiB: Math.round((rssPeak - rssBefore) / MiB),
         workerHeapPeakMiB: Math.round(heapPeak / MiB),
+        workerCpuSeconds: Number(cpuSeconds.toFixed(2)),
+        rowsPerCpuSecond: cpuSeconds > 0 ? Math.round(pass.rows / cpuSeconds) : 0,
       };
       results.push(row);
       console.log(JSON.stringify(row));
     };
 
     const base = { once: true, capMiB: 512, passes: 1, groups: exported };
-    for (const readaheadKiB of [0, 64, 256, 1024])
-      await measure(`cold, readahead ${String(readaheadKiB)} KiB`, true, false, {
+    if (FOCUS) {
+      // Gate A's configuration, repeated and interleaved (per-column readahead, then the row
+      // window, export-stream.ts `windowBytes`), so host drift falls on both alike.
+      const perColumn = { ...base, readaheadKiB: 256 };
+      const windowed = { ...base, readaheadKiB: 256, windowMiB: WINDOW_MIB };
+      for (let run = 1; run <= 3; run++) {
+        await measure(`cold, readahead 256 KiB, run ${String(run)}`, true, false, perColumn);
+        await measure(
+          `cold, window ${String(WINDOW_MIB)} MiB, run ${String(run)}`,
+          true,
+          false,
+          windowed,
+        );
+      }
+      for (let run = 1; run <= 2; run++) {
+        await measure(`warm, readahead 256 KiB, run ${String(run)}`, false, true, perColumn);
+        await measure(
+          `warm, window ${String(WINDOW_MIB)} MiB, run ${String(run)}`,
+          false,
+          true,
+          windowed,
+        );
+      }
+    } else {
+      for (const readaheadKiB of [0, 64, 256, 1024])
+        await measure(`cold, readahead ${String(readaheadKiB)} KiB`, true, false, {
+          ...base,
+          readaheadKiB,
+        });
+      for (const readaheadKiB of [0, 256, 1024])
+        await measure(`warm, readahead ${String(readaheadKiB)} KiB`, false, true, {
+          ...base,
+          readaheadKiB,
+        });
+      await measure("cold, once off, readahead 256 KiB", true, false, {
         ...base,
-        readaheadKiB,
+        once: false,
+        readaheadKiB: 256,
       });
-    for (const readaheadKiB of [0, 256, 1024])
-      await measure(`warm, readahead ${String(readaheadKiB)} KiB`, false, true, {
-        ...base,
-        readaheadKiB,
+      await measure("cached (pass 2, 4 groups, once off)", false, false, {
+        once: false,
+        capMiB: 1024,
+        passes: 2,
+        groups: 4,
+        readaheadKiB: 256,
       });
-    await measure("cold, once off, readahead 256 KiB", true, false, {
-      ...base,
-      once: false,
-      readaheadKiB: 256,
-    });
-    await measure("cached (pass 2, 4 groups, once off)", false, false, {
-      once: false,
-      capMiB: 1024,
-      passes: 2,
-      groups: 4,
-      readaheadKiB: 256,
-    });
-
+    }
     // Where a warm pass spends its time: a CPU profile of the worker (CDP), by self time.
-    await measure("warm, readahead 256 KiB, profiled", false, true, {
+    await measure(`warm, window ${String(WINDOW_MIB)} MiB, profiled`, false, true, {
       ...base,
       readaheadKiB: 256,
+      windowMiB: WINDOW_MIB,
       profile: true,
     });
     const recorded = targets.profiles.at(-1);

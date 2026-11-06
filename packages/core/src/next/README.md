@@ -403,6 +403,27 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
   xxHash32 11%, decode about 20%. Memory with `once`: renderer RSS +96 to +157 MiB over the
   value before the pass, the worker's JS heap at most 28 MiB, governor peak 53–78 MiB; without
   `once`, +621 to +656 MiB and the hot set is lost.
+- The export's read path (increment 9). Measured first: a warm W1M pass spent 0.39 s in the
+  platform reads, 0.64 s copying 57,452 blobs (1.1 GB) out of the shared slab with `slice`,
+  0.65 s in xxHash32 and 0.12 s in entries and planning; a cold one 6.25 s in the reads alone
+  (176 MB/s from a device dd reads at 1.1 GB/s), because each column read its own 256 KiB
+  window, so a batch made 200 strided synchronous reads. Now:
+  - the writer starts every page, dictionary page and directory at an 8-byte offset of its
+    extent (up to 7 zero bytes before it; directories allow the gaps), so a page read together
+    with its neighbours is viewed in place;
+  - a one-pass read's misses (storage `#readPrivate`) are read into one buffer per slab that its
+    lease alone holds (slabs up to `MAX_READ_BYTES`), every blob a verified, aligned view of it:
+    no copy, no `Entry`, no shared slab; the lease is charged for the blobs and the gaps between
+    them and gives both back on release;
+  - `ChunkReader.loadTogether` loads several readers' pages through shared reads in address
+    order, and the export stream's row window (`windowBytes`) loads every column's next rows at
+    once, so a group is read as a few large reads per column instead of one per batch.
+    In Chromium on OPFS (1M × 200, interleaved runs on a host giving the worker about half a
+    core): the miss path fell from 29% to 5% of a warm pass, the sync access handle's `read` is
+    now the largest item (28%); per CPU-second of the export worker, warm 330–376k rows/s with a
+    64 MiB window (per-column 328k), cold 200–320k; wall rows/s on this host 105–297k cold and
+    119–344k warm, renderer RSS +125 to +172 MiB at 64 MiB (one earlier run reached +268 MiB:
+    released one-pass buffers wait for the collector, and cache buffers are never pooled).
 - What an export reads (`scripts/export-size.mts`, 262,144 rows of W1M): 1,055 B/row as flushed.
   High-cardinality text is 34% (`h02`'s free text alone 113 B/row), float64 31%, nullable
   floats 9%, int32 9%, decimals 8%; dictionary text 3%. Compaction gzip stores 869 B/row (−18%)

@@ -219,6 +219,44 @@ class Charged {
   }
 }
 
+/** Zero bytes that move the next part to an 8-byte offset. */
+const PADDING = new Uint8Array(7);
+
+/**
+ * Appends `parts` to `builder`, extending it first when they do not fit, and returns their
+ * blobs. With `aligned`, each part starts at an 8-byte offset of the extent (extents start
+ * `DATA_ALIGN`-aligned): up to 7 zero bytes go before it, as their own unreferenced blob. A page
+ * read with its neighbours into one buffer is then viewed in place by typed arrays, never
+ * copied to align it (page/format.ts "Stored form"). Directories allow the gaps.
+ */
+async function appendTo(
+  builder: ExtentBuilder,
+  parts: readonly Uint8Array[],
+  aligned: boolean,
+): Promise<PendingBlob[]> {
+  const written: Uint8Array[] = [];
+  const real: number[] = [];
+  let at = builder.length;
+  for (const part of parts) {
+    const misaligned = at & 7;
+    if (aligned && misaligned !== 0) {
+      written.push(PADDING.subarray(0, 8 - misaligned));
+      at += 8 - misaligned;
+    }
+    real.push(written.length);
+    written.push(part);
+    at += part.length;
+  }
+  const short = at - builder.capacity;
+  if (short > 0) builder.extend(Math.max(short, Math.ceil(builder.capacity / 2)));
+  const blobs = await builder.append(written);
+  return real.map((index) => {
+    const blob = blobs[index];
+    if (blob === undefined) throw new Error("the builder returned fewer blobs than parts");
+    return blob;
+  });
+}
+
 // ---------------------------------------------------------------------------------------------
 // Sink: a chunk's pages, inline (in memory, small) or streaming into its own builder
 
@@ -278,21 +316,22 @@ class ChunkSink {
     for (const page of pages) this.writer.memory.free(page.bytes.length);
   }
 
-  /** Appends parts to the builder, extending it first when they do not fit. */
-  async appendParts(parts: readonly Uint8Array[]): Promise<PendingBlob[]> {
+  /**
+   * Appends parts to the builder, extending it first when they do not fit. `aligned`: each part
+   * starts at an 8-byte offset of the extent (pages, dictionaries, directories); large-value
+   * parts, which tile their region exactly, are not.
+   */
+  async appendParts(parts: readonly Uint8Array[], aligned = false): Promise<PendingBlob[]> {
     const builder = this.builder;
     if (builder === null) throw new Error("append to a chunk without a builder");
-    const total = parts.reduce((sum, part) => sum + part.length, 0);
-    const short = builder.length + total - builder.capacity;
-    if (short > 0) builder.extend(Math.max(short, Math.ceil(builder.capacity / 2)));
-    return builder.append(parts);
+    return appendTo(builder, parts, aligned);
   }
 
   async #append(
     parts: readonly Uint8Array[],
     entries: ReadonlyArray<PendingPage["entry"]>,
   ): Promise<void> {
-    const blobs = await this.appendParts(parts);
+    const blobs = await this.appendParts(parts, true);
     blobs.forEach((blob, index) => {
       const entry = entries[index];
       if (entry !== undefined)
@@ -1521,7 +1560,11 @@ export class GroupWriter {
 
   async #finishStreamed(column: ColumnWriter): Promise<ColumnChunk> {
     const sink = column.sink;
-    const { directory, sketch } = await this.#tail(column, (parts) => sink.appendParts(parts), 0);
+    const { directory, sketch } = await this.#tail(
+      column,
+      (parts) => sink.appendParts(parts, true),
+      0,
+    );
     const builder = sink.builder;
     if (builder === null) throw new Error("A streamed chunk has no builder");
     const written = await builder.seal();
@@ -1540,12 +1583,8 @@ export class GroupWriter {
   async #pack(inline: ColumnWriter[], chunks: Array<ColumnChunk | null>): Promise<void> {
     const estimate = inline.reduce((sum, column) => sum + column.sink.inlineBytes + 2048, 0);
     const builder = this.extents.open(estimate);
-    const append = async (parts: readonly Uint8Array[]): Promise<PendingBlob[]> => {
-      const total = parts.reduce((sum, part) => sum + part.length, 0);
-      const short = builder.length + total - builder.capacity;
-      if (short > 0) builder.extend(Math.max(short, Math.ceil(builder.capacity / 2)));
-      return builder.append(parts);
-    };
+    const append = (parts: readonly Uint8Array[]): Promise<PendingBlob[]> =>
+      appendTo(builder, parts, true);
     const tails: Array<{
       column: ColumnWriter;
       base: number;

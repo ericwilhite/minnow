@@ -54,6 +54,7 @@ export async function build(
 export async function exportPass(options: {
   readonly once: boolean;
   readonly readaheadKiB: number;
+  readonly windowMiB?: number;
   readonly capMiB: number;
   readonly passes: number;
   readonly groups?: number;
@@ -72,6 +73,7 @@ export async function exportPass(options: {
     outside,
     once: options.once,
     readaheadKiB: options.readaheadKiB,
+    ...(options.windowMiB === undefined ? {} : { windowMiB: options.windowMiB }),
     capMiB: options.capMiB,
     passes: options.passes,
     ...(options.profile === true ? { profile: true } : {}),

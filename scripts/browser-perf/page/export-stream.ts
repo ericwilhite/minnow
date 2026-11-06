@@ -36,8 +36,20 @@ export interface ExportOptions {
   readonly budget: ByteBudget;
   readonly directories: BlobCache<ChunkDirectory>;
   readonly once: boolean;
-  /** Stored bytes of pages a column loads ahead of its batch (0: only the batch's pages). */
+  /**
+   * Per-column readahead: stored bytes of pages a column loads ahead of its batch (0: only the
+   * batch's pages). Ignored when `windowBytes` is set.
+   */
   readonly readahead: number;
+  /**
+   * Row-window readahead (increment 9): every column loads the same window of rows at once,
+   * about `windowBytes` stored bytes across all columns, in one `ChunkReader.loadTogether` in
+   * the order of their data in the file, then the stream decodes the window's batches with no
+   * loads. A group is then read as
+   * a few hundred large, nearly sequential reads instead of a strided read per column per
+   * batch, which the OS's own readahead can stream. 0 or absent: per-column readahead.
+   */
+  readonly windowBytes?: number;
   /** Called every 8 batches (memory sampling). */
   readonly sample?: () => void;
 }
@@ -74,31 +86,79 @@ export async function exportStream(
   let rows = 0;
   let batches = 0;
   const open = { budget: options.budget, directories: options.directories, once: options.once };
+  const windowBytes = options.windowBytes ?? 0;
   for (const group of groups) {
     let t = performance.now();
     const readers: ChunkReader[] = [];
     for (const chunk of group.chunks) readers.push(await ChunkReader.open(space, chunk, open));
     openMs += performance.now() - t;
     const loadedFrom = readers.map(() => 0);
+    /** Pages behind `from` were emitted: let them go. */
+    const releaseBehind = (column: number, reader: ChunkReader, from: number, to: number) => {
+      const [firstPage] = reader.pagesInRange(from, to);
+      const behind = loadedFrom[column] ?? 0;
+      if (firstPage > behind) {
+        reader.release(Array.from({ length: firstPage - behind }, (_, k) => behind + k));
+        loadedFrom[column] = firstPage;
+      }
+    };
+    // The row window: whole batches covering about `windowBytes` of this group's stored bytes.
+    const groupBytes = group.chunks.reduce((sum, chunk) => sum + chunk.data.length, 0);
+    const windowRows =
+      windowBytes > 0
+        ? Math.min(
+            group.rows,
+            Math.max(
+              1,
+              Math.floor((windowBytes * group.rows) / Math.max(1, groupBytes) / EXPORT_BATCH),
+            ) * EXPORT_BATCH,
+          )
+        : 0;
+    /** Columns in the order of their data in the file. */
+    const byAddress = readers
+      .map((reader, column) => ({ reader, column }))
+      .sort(
+        (a, b) =>
+          a.reader.chunk.data.extent.offset +
+          a.reader.chunk.data.offset -
+          (b.reader.chunk.data.extent.offset + b.reader.chunk.data.offset),
+      );
     for (let from = 0; from < group.rows; from += EXPORT_BATCH) {
       const to = Math.min(group.rows, from + EXPORT_BATCH);
-      for (const [column, reader] of readers.entries()) {
-        const [firstPage, endPage] = reader.pagesInRange(from, to);
-        // Pages behind the batch were emitted: let them go.
-        const behind = loadedFrom[column] ?? 0;
-        if (firstPage > behind) {
-          reader.release(Array.from({ length: firstPage - behind }, (_, k) => behind + k));
-          loadedFrom[column] = firstPage;
+      if (windowRows > 0 && from % windowRows === 0) {
+        // Every column's pages of the window, in one shared load (ChunkReader.loadTogether):
+        // the space coalesces neighbouring columns' pages into large reads.
+        const end = Math.min(group.rows, from + windowRows);
+        const loadsOf: Array<{ reader: ChunkReader; pages: number[] }> = [];
+        for (const { reader, column } of byAddress) {
+          releaseBehind(column, reader, from, to);
+          const [firstPage, endPage] = reader.pagesInRange(from, end);
+          const pages: number[] = [];
+          for (let page = firstPage; page < endPage; page++)
+            if (!reader.isLoaded(page)) pages.push(page);
+          if (pages.length > 0) loadsOf.push({ reader, pages });
         }
-        if (!reader.isLoaded(Math.max(firstPage, endPage - 1))) {
-          const missing = reader
-            .pagesAhead(from, to, options.readahead)
-            .filter((page) => !reader.isLoaded(page));
-          if (missing.length > 0) {
-            t = performance.now();
-            await reader.load(missing);
-            loadMs += performance.now() - t;
-            loads++;
+        if (loadsOf.length > 0) {
+          t = performance.now();
+          await ChunkReader.loadTogether(loadsOf);
+          loadMs += performance.now() - t;
+          loads++;
+        }
+      }
+      for (const [column, reader] of readers.entries()) {
+        if (windowRows === 0) {
+          const [firstPage, endPage] = reader.pagesInRange(from, to);
+          releaseBehind(column, reader, from, to);
+          if (!reader.isLoaded(Math.max(firstPage, endPage - 1))) {
+            const missing = reader
+              .pagesAhead(from, to, options.readahead)
+              .filter((page) => !reader.isLoaded(page));
+            if (missing.length > 0) {
+              t = performance.now();
+              await reader.load(missing);
+              loadMs += performance.now() - t;
+              loads++;
+            }
           }
         }
         let buffer = buffers.get(column);

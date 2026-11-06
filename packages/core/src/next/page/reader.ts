@@ -42,6 +42,7 @@
 import type { ChunkData, ColumnChunk, PageEntry } from "../format/manifest.js";
 import { PageEncoding } from "../format/manifest.js";
 import {
+  blobAddress,
   MAX_BLOB_BYTES,
   MAX_READ_BYTES,
   type BlobRef,
@@ -279,6 +280,13 @@ interface Held {
   readonly lease: SharedLease | null;
   /** The inflated-page cache entry it pins. */
   readonly inflated: BlobRef | null;
+}
+
+/** One page of `ChunkReader.loadTogether`. */
+interface TogetherJob {
+  readonly reader: ChunkReader;
+  readonly entry: PageEntry;
+  readonly page: number;
 }
 
 class SharedLease {
@@ -544,6 +552,113 @@ export class ChunkReader {
   }
 
   /** Starts one read for `missing` (and the dictionary) and registers it as their pending load. */
+  /**
+   * Loads pages of several readers through shared reads (increment 9): their pages, in the
+   * order of their addresses, go to the space in batches of up to `MAX_READ_BYTES`, so the
+   * space coalesces neighbouring pages of different columns into large reads (a scan's window
+   * over every column becomes a few large, nearly sequential reads). Every page is installed in
+   * its own reader as `load` would install it, holding its share of the shared lease. Readers
+   * must share the first reader's space, budget and `once`; one that does not, that needs its
+   * dictionary, or that has gzip pages to load, loads on its own (`load`). Resolves when every
+   * page is loaded; a reader closed meanwhile only loses its own pages (its loads give back what
+   * they read, as `close` says), and other errors reject.
+   */
+  static loadTogether(
+    loads: ReadonlyArray<{ readonly reader: ChunkReader; readonly pages: readonly number[] }>,
+  ): Promise<void> {
+    const first = loads[0]?.reader;
+    if (first === undefined) return Promise.resolve();
+    const waits: Array<PromiseLike<void>> = [];
+    const jobs: TogetherJob[] = [];
+    const missingOf = new Map<ChunkReader, number[]>();
+    for (const { reader, pages } of loads) {
+      if (reader.#closed) throw new ReaderClosedError();
+      const entries = reader.directory.pages;
+      const missing: number[] = [];
+      let alone =
+        reader.#space !== first.#space ||
+        reader.#options.budget !== first.#options.budget ||
+        (reader.#options.once === true) !== (first.#options.once === true);
+      for (const index of new Set(pages)) {
+        const entry = entries[index];
+        if (entry === undefined) throw new RangeError("Page index outside the chunk");
+        if (isDictionary(entry) && reader.#dictionary === null) alone = true;
+        if (isGzip(entry)) alone = true;
+        if (reader.#pages[index] !== undefined) continue;
+        const pending = reader.#pending.get(index);
+        if (pending !== undefined) waits.push(pending);
+        else missing.push(index);
+      }
+      if (alone) {
+        const loaded = reader.load(pages);
+        // As in the shared reads: a reader closed meanwhile only loses its own pages.
+        if (loaded !== undefined)
+          waits.push(
+            loaded.then(noop, (error: unknown) => {
+              if (!(error instanceof ReaderClosedError && reader.#closed)) throw error;
+            }),
+          );
+        continue;
+      }
+      if (missing.length === 0) continue;
+      missingOf.set(reader, missing);
+      for (const page of missing) jobs.push({ reader, entry: at(entries, page), page });
+    }
+    if (jobs.length > 0) {
+      jobs.sort(
+        (a, b) =>
+          blobAddress(blobOf(a.reader.chunk, a.entry)) -
+          blobAddress(blobOf(b.reader.chunk, b.entry)),
+      );
+      const run = ChunkReader.#readTogether(first.#space, first.#options, jobs);
+      for (const [reader, missing] of missingOf) {
+        for (const index of missing) reader.#pending.set(index, run);
+        const settle = (): void => {
+          for (const index of missing)
+            if (reader.#pending.get(index) === run) reader.#pending.delete(index);
+        };
+        run.then(settle, settle);
+      }
+      waits.push(run);
+    }
+    return Promise.all(waits).then(noop);
+  }
+
+  static async #readTogether(
+    space: ExtentReader,
+    options: ChunkReadOptions,
+    jobs: readonly TogetherJob[],
+  ): Promise<void> {
+    let start = 0;
+    while (start < jobs.length) {
+      let end = start;
+      let bytes = 0;
+      while (end < jobs.length && bytes + at(jobs, end).entry.length <= MAX_READ_BYTES)
+        bytes += at(jobs, end++).entry.length;
+      if (end === start) end++;
+      const batch = jobs.slice(start, end);
+      const lease = await space.read(
+        batch.map(({ reader, entry }) => blobOf(reader.chunk, entry)),
+        options,
+      );
+      const shared = new SharedLease(lease, batch.length);
+      // `#settle` takes over one hold on the lease per job, success or failure; a reader closed
+      // meanwhile gives its share back there (`#install`).
+      for (let k = 0; k < batch.length; k++) {
+        const { reader, entry, page } = at(batch, k);
+        try {
+          await reader.#settle(entry, page, lease.bytes[k], shared);
+        } catch (error) {
+          // A reader closed meanwhile only loses its own pages; the others still load.
+          if (error instanceof ReaderClosedError) continue;
+          for (let rest = k + 1; rest < batch.length; rest++) shared.drop();
+          throw error;
+        }
+      }
+      start = end;
+    }
+  }
+
   #start(missing: readonly number[], wantsDictionary: boolean): Promise<void> {
     const run = this.#loadRead(missing, wantsDictionary);
     for (const index of missing) this.#pending.set(index, run);

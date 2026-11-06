@@ -31,13 +31,14 @@ import {
   MAX_READ_BYTES,
   ReadDeniedError,
   type BlobRef,
+  type ByteBudget,
   type CacheMemory,
   type EvictableCacheLike,
   type PeekOptions,
   type ReadLease,
   type ReadOptions,
 } from "./extents.js";
-import { MAX_SLAB, planSlabs } from "./slabs.js";
+import { MAX_SLAB, MAX_SLAB_GAP, planSlabs } from "./slabs.js";
 
 /** Bytes charged per cached entry beyond its data (governor `OBJECT_OVERHEAD_BYTES`). */
 export const ENTRY_OVERHEAD = 64;
@@ -113,6 +114,13 @@ export interface CacheStats {
   readonly misses: number;
   readonly platformReads: number;
   readonly bytesRead: number;
+}
+
+/** The slab buffers a one-pass lease owns: its gap bytes, its blobs' bytes, its views. */
+interface OwnedSlabs {
+  gaps: number;
+  bytes: number;
+  readonly views: Array<{ readonly bytes: Uint8Array; readonly checksum: number }>;
 }
 
 /** What an unpinned entry is charged: its bytes, its overhead and any attached descriptor. */
@@ -303,6 +311,7 @@ export class PageCache implements EvictableCacheLike {
     if (!budget.allocate(total)) throw new ReadDeniedError(total);
     const held: Entry[] = [];
     const resolved = new Map<string, Uint8Array>();
+    const owned: OwnedSlabs = { gaps: 0, bytes: 0, views: [] };
     try {
       const misses: Array<{ readonly key: string; readonly ref: BlobRef }> = [];
       let uncharge = 0;
@@ -332,11 +341,14 @@ export class PageCache implements EvictableCacheLike {
       }
       // Hits are pinned before the cache's charge goes back: a nested eviction cannot take them.
       if (uncharge > 0) this.#memory?.release(uncharge);
-      if (misses.length > 0)
-        await this.#readMisses(misses, held, resolved, signal, options.once === true);
+      if (misses.length > 0) {
+        if (options.once === true) await this.#readPrivate(misses, resolved, signal, budget, owned);
+        else await this.#readMisses(misses, held, resolved, signal);
+      }
     } catch (error) {
       this.#unpinAll(held, options.once === true);
-      budget.free(total);
+      this.#pinnedBytes -= owned.bytes;
+      budget.free(total + owned.gaps);
       throw error;
     }
     const bytes = refs.map((ref) => {
@@ -350,10 +362,14 @@ export class PageCache implements EvictableCacheLike {
       release: () => {
         if (released) return;
         released = true;
-        if (VERIFY_CACHED_BYTES)
+        if (VERIFY_CACHED_BYTES) {
           for (const entry of held) verifyCached(entry.bytes, entry.checksum, "lease release");
+          for (const { bytes, checksum } of owned.views)
+            verifyCached(bytes, checksum, "lease release");
+        }
         this.#unpinAll(held, options.once === true);
-        budget.free(total);
+        this.#pinnedBytes -= owned.bytes;
+        budget.free(total + owned.gaps);
       },
     };
   }
@@ -363,7 +379,6 @@ export class PageCache implements EvictableCacheLike {
     held: Entry[],
     resolved: Map<string, Uint8Array>,
     signal: AbortSignal | undefined,
-    once: boolean,
   ): Promise<void> {
     const ranges = misses.map(({ ref }) => ({
       offset: ref.extent.offset + ref.offset,
@@ -396,16 +411,70 @@ export class PageCache implements EvictableCacheLike {
               `The blob at ${String(address)} (extent ${String(ref.extent.offset)}, ${String(ref.length)} bytes) failed its checksum`,
             );
           this.#misses += 1;
-          // A one-pass scan keeps what it misses to itself: never admitted, never findable.
-          const entry = once
-            ? this.#privateEntry(ref, address, bytes, true)
-            : this.#insertPinned(ref, address, bytes);
+          const entry = this.#insertPinned(ref, address, bytes);
           held.push(entry);
           resolved.set(key, entry.bytes);
         }
       }
     } finally {
       done();
+    }
+  }
+
+  /**
+   * A one-pass read's misses (review B2-p2h, increment 9): never admitted, never findable, and
+   * never copied. Each slab is read into a buffer of its own, which this lease alone holds, and
+   * every blob is a verified view of it (the writer starts pages at 8-byte offsets, so the views
+   * are aligned for typed arrays). The lease is charged for the blobs (by `read`) and for the gap
+   * bytes between them inside the slabs (here, before any read), and gives both back on
+   * release, when the buffers become garbage. No shared slab, no `Entry`, no copy.
+   */
+  async #readPrivate(
+    misses: ReadonlyArray<{ readonly key: string; readonly ref: BlobRef }>,
+    resolved: Map<string, Uint8Array>,
+    signal: AbortSignal | undefined,
+    budget: ByteBudget,
+    owned: OwnedSlabs,
+  ): Promise<void> {
+    // Each slab is this lease's own buffer, so it may be as large as a read (not the shared slab).
+    const slabs = planSlabs(
+      misses.map(({ ref }) => ({ offset: ref.extent.offset + ref.offset, length: ref.length })),
+      MAX_READ_BYTES + 2 * MAX_SLAB_GAP,
+    );
+    let gaps = 0;
+    let members = 0;
+    for (const slab of slabs) {
+      let inside = 0;
+      for (const member of slab.members) inside += misses[member]?.ref.length ?? 0;
+      gaps += Math.max(0, slab.length - inside);
+      members += inside;
+    }
+    if (gaps > 0 && !budget.allocate(gaps)) throw new ReadDeniedError(gaps);
+    owned.gaps = gaps;
+    owned.bytes = members;
+    this.#pinnedBytes += members;
+    for (const slab of slabs) {
+      signal?.throwIfAborted();
+      this.#live();
+      const buffer = new Uint8Array(slab.length);
+      await this.#session.readDataInto(slab.offset, buffer);
+      this.#platformReads += 1;
+      this.#bytesRead += slab.length;
+      for (const member of slab.members) {
+        const miss = misses[member];
+        if (miss === undefined) continue;
+        const { key, ref } = miss;
+        const address = ref.extent.offset + ref.offset;
+        const start = address - slab.offset;
+        const bytes = buffer.subarray(start, start + ref.length);
+        if (xxHash32(bytes) !== ref.checksum)
+          throw new StoreCorruptionError(
+            `The blob at ${String(address)} (extent ${String(ref.extent.offset)}, ${String(ref.length)} bytes) failed its checksum`,
+          );
+        this.#misses += 1;
+        resolved.set(key, bytes);
+        if (VERIFY_CACHED_BYTES) owned.views.push({ bytes, checksum: ref.checksum });
+      }
     }
   }
 
@@ -454,7 +523,7 @@ export class PageCache implements EvictableCacheLike {
     return entry;
   }
 
-  #privateEntry(ref: BlobRef, address: number, bytes: Uint8Array, once = false): Entry {
+  #privateEntry(ref: BlobRef, address: number, bytes: Uint8Array): Entry {
     this.#pinnedBytes += ref.length;
     return {
       address,
@@ -463,7 +532,7 @@ export class PageCache implements EvictableCacheLike {
       checksum: ref.checksum,
       bytes,
       pins: 1,
-      oncePins: once ? 1 : 0,
+      oncePins: 0,
       segment: "pinned",
       dropped: true,
       hot: false,

@@ -43,6 +43,8 @@ export type ExportRequest =
       readonly outside: ExportGroup;
       readonly once: boolean;
       readonly readaheadKiB: number;
+      /** Row-window readahead across all columns (export-stream.ts `windowBytes`); 0: per column. */
+      readonly windowMiB?: number;
       readonly capMiB: number;
       readonly passes: number;
       /** Brackets the passes with console.profile / profileEnd (the spec's CDP profiler). */
@@ -194,6 +196,7 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
       directories,
       once: request.once,
       readahead: request.readaheadKiB * 1024,
+      windowBytes: (request.windowMiB ?? 0) * MiB,
     });
     passes.push({
       verifying: VERIFY_CACHED_BYTES,
