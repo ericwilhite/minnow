@@ -78,6 +78,14 @@ export interface IndexedDbBackendOptions {
   /** Queue relaxed writes into batches (the default); false commits each alone (benchmarks). */
   readonly batching?: boolean;
   /**
+   * Run every transaction of the connection through one serialized chain (the default).
+   * WebKit can leave IndexedDB blocked for the browser session when a worker dies with two
+   * independent chains of transactions in flight on its connection (DECISIONS.md "Step-down");
+   * one chain never did (0 of 45 kills in the plain repro, against 3 of 45 with two). False runs
+   * independent transactions concurrently (benchmarks).
+   */
+  readonly serializeTransactions?: boolean;
+  /**
    * Charged with the resident record indexes of the data and log spaces (idb-bytes.ts, "Cost"),
    * growing and shrinking with them, released at close: the owner registers it with the memory
    * governor. None by default.
@@ -151,9 +159,12 @@ class TrackedConnection implements IdbDatabaseLike {
   readonly #inner: IdbDatabaseLike;
   readonly #inFlight = new Set<Promise<void>>();
   #closing = false;
+  /** With `serialize`: the last transaction issued; the next is created once it settles. */
+  #tail: Promise<void> | null;
 
-  constructor(inner: IdbDatabaseLike) {
+  constructor(inner: IdbDatabaseLike, serialize: boolean) {
     this.#inner = inner;
+    this.#tail = serialize ? Promise.resolve() : null;
   }
 
   transaction(
@@ -163,7 +174,17 @@ class TrackedConnection implements IdbDatabaseLike {
     body: (tx: IdbTransactionLike) => void,
   ): Promise<void> {
     if (this.#closing) return Promise.reject(new StoreClosedError());
-    const run = this.#inner.transaction(stores, mode, durability, body);
+    let run: Promise<void>;
+    if (this.#tail === null) run = this.#inner.transaction(stores, mode, durability, body);
+    else {
+      // One chain per connection: data, log, spill and fence transactions alike wait for the
+      // previous one to settle before they are created.
+      run = this.#tail.then(() => this.#inner.transaction(stores, mode, durability, body));
+      this.#tail = run.then(
+        () => undefined,
+        () => undefined,
+      );
+    }
     this.#inFlight.add(run);
     const forget = () => {
       this.#inFlight.delete(run);
@@ -868,7 +889,9 @@ export function createIndexedDbBackend(options: IndexedDbBackendOptions): Storag
   const leases = new WeakSet<IdbLease>();
   let opened: Promise<TrackedConnection> | null = null;
   const database = () =>
-    (opened ??= Promise.resolve(options.database()).then((db) => new TrackedConnection(db)));
+    (opened ??= Promise.resolve(options.database()).then(
+      (db) => new TrackedConnection(db, options.serializeTransactions ?? true),
+    ));
   /** Drains and closes the current connection; the next acquisition opens a new one. */
   const closeConnection = async (connection: TrackedConnection) => {
     if (opened !== null && (await opened) === connection) opened = null;

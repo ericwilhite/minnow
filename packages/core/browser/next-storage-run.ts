@@ -378,11 +378,12 @@ export async function runLegacyDetection(kind: "opfs" | "indexeddb"): Promise<Ch
 /** The IndexedDB backend's bulk write and small-commit costs, with and without batching. */
 export async function runIdbBench(
   batching: boolean,
+  serialize = true,
 ): Promise<{ bulkMs: number; commitMs: number }> {
   const dir = unique("idb-bench");
   try {
     return await withWorker((worker) =>
-      worker.call({ op: "bench-idb", dir, batching, store: "indexeddb" }),
+      worker.call({ op: "bench-idb", dir, batching, store: "indexeddb", serialize }),
     );
   } finally {
     await withWorker((worker) => worker.call({ op: "remove", dir, store: "indexeddb" }));
@@ -487,6 +488,8 @@ interface ChaosRun {
   armed: { target: ChaosStep; remaining: number; fire: (intent: ChaosIntent) => void } | null;
   /** When the last message arrived (draining after a kill). */
   lastMessage: number;
+  /** Operations completed (throughput). */
+  completed: number;
 }
 
 let chaos: ChaosRun | null = null;
@@ -503,6 +506,7 @@ export async function chaosBegin(
   inject: ChaosInjection | null = null,
   mode: ChaosMode = "serial",
   lanes: readonly string[] | null = null,
+  serialize = true,
 ): Promise<ChaosRecovery> {
   useStore(kind);
   const worker = await spawnForChaos();
@@ -519,6 +523,7 @@ export async function chaosBegin(
     recovered: null,
     armed: null,
     lastMessage: performance.now(),
+    completed: 0,
   };
   chaos = run;
   channel.port1.onmessage = (event: MessageEvent<ChaosMessage>) => {
@@ -531,8 +536,10 @@ export async function chaosBegin(
     else if (message.chaos === "failure") run.failure ??= new Error(message.message);
     else if (message.chaos === "began") run.began.add(message.sequence);
     else if (message.chaos === "settled") run.settled.add(message.sequence);
-    else if (message.chaos === "done") run.inFlight.delete(message.sequence);
-    else {
+    else if (message.chaos === "done") {
+      run.inFlight.delete(message.sequence);
+      run.completed += 1;
+    } else {
       if (run.hold) return; // armed for a page close: nothing new starts
       run.inFlight.set(message.intent.sequence, message.intent);
       if (mode === "concurrent") {
@@ -561,6 +568,7 @@ export async function chaosBegin(
       mode,
       ...(inject === null ? {} : { inject }),
       ...(lanes === null ? {} : { lanes }),
+      serialize,
     })
     .catch((error: unknown) => {
       // Only this page's own terminate() is not a failure.
@@ -803,4 +811,26 @@ export async function chaosStepDown(delayMs: number): Promise<StepDown> {
   run.port.close();
   if (failure !== null) throw failure;
   return { expect: expectOf(run), quiesceMs, leftInFlight, ...released };
+}
+
+/**
+ * The concurrent workload's throughput on store `dir`: operations its lanes complete in `ms`, with
+ * IndexedDB transactions serialized per connection or not; then a graceful step-down.
+ */
+export async function chaosThroughput(
+  kind: StoreKind,
+  dir: string,
+  serialize: boolean,
+  ms: number,
+): Promise<{ operations: number; perSecond: number }> {
+  await chaosBegin(kind, dir, 0x7e57, null, null, "concurrent", null, serialize);
+  const run = chaos;
+  if (run === null) throw new Error("no chaos run");
+  const before = run.completed;
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+  const operations = run.completed - before;
+  await chaosStepDown(0);
+  return { operations, perSecond: (operations * 1000) / ms };
 }

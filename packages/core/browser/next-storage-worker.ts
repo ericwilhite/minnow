@@ -40,7 +40,11 @@ import {
 /** Which backend an operation runs on (OPFS by default). */
 export type StoreKind = "opfs" | "indexeddb";
 
-export type NextStorageRequest = { readonly store?: StoreKind } & (
+export type NextStorageRequest = {
+  readonly store?: StoreKind;
+  /** IndexedDB: one serialized transaction chain per connection (the default) or not. */
+  readonly serialize?: boolean;
+} & (
   | { readonly op: "conformance"; readonly prefix: string }
   | { readonly op: "choose"; readonly name?: string }
   | { readonly op: "idb-scenarios" }
@@ -115,6 +119,7 @@ const locks = webLocks(navigator.locks);
 
 /** The backend of the request being handled (set by `handle`). */
 let store: StoreKind = "opfs";
+let serializeIdb = true;
 
 /** Platform requests, counted below the backends: OPFS data-file reads and IndexedDB `get`s. */
 const platform = { dataFileReads: 0, idbGets: 0 };
@@ -178,6 +183,7 @@ async function backendFor(name: string): Promise<StorageBackend> {
       database: async () => countingDatabase(await openIndexedDb(indexedDB, `next-test:${name}`)),
       name: `next-test:${name}`,
       locks,
+      serializeTransactions: serializeIdb,
     });
   return createOpfsBackend({
     directory: countingDirectory(await directory(name)),
@@ -408,6 +414,7 @@ async function heavySample(count: number): Promise<void> {
 
 async function handle(request: NextStorageRequest): Promise<unknown> {
   store = request.store ?? "opfs";
+  serializeIdb = request.serialize ?? true;
   switch (request.op) {
     case "choose": {
       try {
@@ -442,6 +449,7 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
         name: `next-test:${request.dir}`,
         locks,
         batching: request.batching,
+        serializeTransactions: serializeIdb,
       });
       const lease = await backend.acquire();
       const session = await backend.open(lease);

@@ -130,6 +130,15 @@ These rulings follow the storage probe of 2026-11-05.
     ≤ 7 ms; the next owner recovered every time in WebKit, Chromium and Firefox. OPFS is the
     default wherever a worker has sync access handles; this matters on IndexedDB, WebKit's
     private-browsing fallback.
+  - **A worker can die without a step-down** (the browser kills it at unload, a crash, OOM), so
+    the IndexedDB backend also runs every transaction of its connection through one serialized
+    chain (`serializeTransactions`, the default everywhere): in the plain repro one chain never
+    wedged (0 of 45 kills, against 3 of 45 with two chains; spill on its own connection or in its
+    own database also 0 of 45), and the abrupt-kill concurrent campaign in WebKit, 2–5 workload
+    operations in flight at every kill, wedged 0 times in 100 kills (before: within 5–17). Cost
+    under the concurrent workload, medians of 8 rounds: Chromium 81 vs. 92 operations/s, Firefox
+    71 vs. 80 (about 11%, within a noisy spread); single-chain bulk writes and commits show no
+    consistent difference.
 - **Files.**
   - A few long-lived files (log, data, two root slots, spill, epoch), opened at acquisition and kept
     open.

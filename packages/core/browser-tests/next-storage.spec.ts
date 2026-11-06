@@ -675,17 +675,9 @@ test.describe("rebuild core storage concurrent kill campaign (Gate A)", () => {
           nightly > 0 && browserName !== "chromium",
           "the nightly campaign runs in Chromium",
         );
-        // WebKit: a worker terminated with several IndexedDB transactions in flight leaves the
-        // database blocked for the rest of the browser session: the next owner's fence
-        // transaction never runs, even with the lock stolen and from a fresh page (seen at kill 5
-        // and kill 12 with 5 operations in flight; the serialized campaign, one transaction in
-        // flight, never wedges). A platform finding for the ownership track, not a corruption.
-        test.fixme(
-          browserName === "webkit" &&
-            kind === "indexeddb" &&
-            process.env.MINNOW_WEBKIT_WEDGE !== "1",
-          "WebKit wedges IndexedDB after a worker is terminated mid-transactions",
-        );
+        // WebKit once wedged IndexedDB for the session when a worker died with two independent
+        // chains of transactions in flight on its connection; the backend now runs one
+        // serialized chain per connection (serializeTransactions), and this lane runs everywhere.
         test.setTimeout(Math.max(600_000, kills * 5_000));
         const page: Page = first;
         await page.goto("/packages/core/browser/");
@@ -901,5 +893,39 @@ test.describe("rebuild core storage graceful step-down (the WebKit IndexedDB wed
       contentType: "application/json",
     });
     console.log(`STORAGE_STEP_DOWN ${JSON.stringify(report)}`);
+  });
+});
+
+test.describe("rebuild core storage: the cost of one serialized IndexedDB chain (bench)", () => {
+  test("concurrent workload throughput and bulk/commit cost, serialized vs. concurrent", async ({
+    page,
+    browserName,
+  }, info) => {
+    test.skip(process.env.MINNOW_NEXT_STORAGE_BENCH !== "1", "opt-in bench");
+    test.setTimeout(600_000);
+    await page.goto("/packages/core/browser/");
+    const rounds = Number(process.env.MINNOW_SERIAL_BENCH_ROUNDS ?? "3");
+    const results: Record<string, unknown[]> = { serialized: [], concurrent: [] };
+    for (let round = 0; round < rounds; round++)
+      for (const serialize of [true, false]) {
+        const dir = `serial-bench-${String(serialize)}-${String(round)}-${Date.now().toString(36)}`;
+        const result = await page.evaluate(
+          async ([url, directory, serialized]) => {
+            const run = (await import(url)) as Run;
+            const throughput = await run.chaosThroughput("indexeddb", directory, serialized, 5_000);
+            await run.chaosEnd("indexeddb", directory);
+            const bench = await run.runIdbBench(true, serialized);
+            return { ...throughput, ...bench };
+          },
+          [RUN, dir, serialize] as const,
+        );
+        results[serialize ? "serialized" : "concurrent"]?.push(result);
+      }
+    const report = { browser: browserName, ...results };
+    await info.attach("serial-chain-bench", {
+      body: JSON.stringify(report, null, 2),
+      contentType: "application/json",
+    });
+    console.log(`SERIAL_BENCH ${JSON.stringify(report)}`);
   });
 });
