@@ -624,7 +624,8 @@ and the owner import it directly.
   (key, id) tables for 32-bit and 64-bit integers (int8 by its two words, whatever its
   representation: no BigInt, no Map), an f64 table for floats, xxHash32 over bytes for text (a
   dictionary column translated once per entry), key encoding for NUMERIC and the rest, and an id
-  tuple for several keys. SQL GROUP BY equality: NULLs together, −0 = 0, NaN = NaN, NUMERIC by
+  tuple for several keys: direct-mapped (the value ids bit-packed into a slot of a table of at
+  most 2^16) while the columns' value counts fit, hashed column by column past that. SQL GROUP BY equality: NULLs together, −0 = 0, NaN = NaN, NUMERIC by
   value.
 - `states.ts`: struct-of-arrays state per aggregate, no object per group. Integer and NUMERIC
   sums are exact at any size: an f64 part within ±2^52, a 128-bit carry, and past that an exact

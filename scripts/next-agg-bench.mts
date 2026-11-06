@@ -276,6 +276,10 @@ for (const [groups, reference] of [
   await bench("GROUP BY 3 text dims, 20 aggregates", M, "DuckDB 134 ms (whole query)", () =>
     run(data, input, [0, 1, 2], aggregates),
   );
+  // The composite key alone (TupleKeys over three dictionary columns).
+  await bench("GROUP BY 3 text dims, COUNT(*) only", M, "key cost of the shape above", () =>
+    run(data, input, [0, 1, 2], [call("count_star", I64, null, I64)]),
+  );
 }
 
 // agg_count_distinct: COUNT(DISTINCT) over two high-cardinality text columns.

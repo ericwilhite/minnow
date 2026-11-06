@@ -858,29 +858,173 @@ function keyColumnFor(type: PhysicalType, memory: Charged): KeyColumn {
   return new EncodedKeys(type, memory);
 }
 
-/** Group ids over the tuple of per-column value ids (several keys). */
+/** Most slots of the direct-mapped composite table (2^16 group-id slots, 256 KiB). */
+const DIRECT_BITS = 16;
+
+/**
+ * Group ids over the tuple of per-column value ids (several keys), in one of two modes:
+ * - **Direct-mapped** while every column's value count, rounded up to a power of two, multiplies
+ *   to at most 2^DIRECT_BITS: a group's slot is its value ids bit-packed (column c shifted by the
+ *   bits of the columns before it), so a row costs one table read and no hash. Low-cardinality
+ *   dimensions (dictionary-encoded text, small integers) stay here. A column whose value count
+ *   passes its radix widens it and the table is rebuilt from the groups' ids; past 2^DIRECT_BITS
+ *   slots the table switches to hashing for good.
+ * - **Hashed**: open addressing over a hash of the tuple; the hash is computed column by column
+ *   into a per-batch vector (one tight loop per column), then each row probes.
+ */
 class TupleKeys {
   readonly #slots: Slots;
   /** Per key column: the value id of each group. */
   readonly columnIds: Int32Array[];
   #hashes: Int32Array;
   count = 0;
+  /** Direct mode: bits per column, and the slot → group id + 1 table; null once hashing. */
+  #bits: number[];
+  #direct: Int32Array | null;
+  /** Per batch row: the direct slot, or the running hash. */
+  readonly #rowKeys: Int32Array;
   constructor(
     readonly width: number,
     readonly memory: Charged,
+    capacity: number,
   ) {
     this.#hashes = memory.make(Int32Array, 1024);
     this.columnIds = [];
     for (let c = 0; c < width; c++) this.columnIds.push(memory.make(Int32Array, 1024));
     this.#slots = new Slots(memory);
+    this.#rowKeys = memory.make(Int32Array, capacity);
+    this.#bits = Array.from({ length: width }, () => 0);
+    this.#direct = memory.make(Int32Array, 1);
   }
-  assign(ids: readonly Int32Array[], rows: Uint16Array, count: number, gids: Int32Array): void {
+
+  /** Whether the composite keys are still direct-mapped (tests, benches). */
+  get direct(): boolean {
+    return this.#direct !== null;
+  }
+
+  /** Widens the direct table's radices for `counts`, rebuilding it, or switches to hashing. */
+  #fit(counts: readonly number[]): void {
+    let changed = false;
+    for (let c = 0; c < this.width; c++) {
+      let bits = this.#bits[c] ?? 0;
+      while ((counts[c] ?? 0) > 1 << bits) bits += 1;
+      if (bits !== this.#bits[c]) {
+        this.#bits[c] = bits;
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    const total = this.#bits.reduce((a, b) => a + b, 0);
+    const old = this.#direct;
+    if (total > DIRECT_BITS) {
+      // Hash from now on: place every group in the slot table.
+      if (old !== null) this.memory.give(old.byteLength);
+      this.#direct = null;
+      for (let g = 0; g < this.count; g++) {
+        const h = this.#hashOfGroup(g);
+        this.#hashes[g] = h;
+        let s = h & this.#slots.mask;
+        while (this.#slots.ids[s] !== 0) s = (s + 1) & this.#slots.mask;
+        this.#slots.ids[s] = g + 1;
+        this.#slots.hashes[s] = h;
+        if (this.#slots.full(g + 1)) this.#slots.grow(this.#hashes, g + 1, null);
+      }
+      return;
+    }
+    const table = this.memory.make(Int32Array, 1 << total);
+    if (old !== null) this.memory.give(old.byteLength);
+    for (let g = 0; g < this.count; g++) table[this.#slotOfGroup(g)] = g + 1;
+    this.#direct = table;
+  }
+
+  #slotOfGroup(g: number): number {
+    let slot = 0;
+    let shift = 0;
+    for (let c = 0; c < this.width; c++) {
+      slot |= (this.columnIds[c]?.[g] ?? 0) << shift;
+      shift += this.#bits[c] ?? 0;
+    }
+    return slot;
+  }
+
+  #hashOfGroup(g: number): number {
+    let h = 0x2545f491;
+    for (let c = 0; c < this.width; c++)
+      h = Math.imul(h ^ (this.columnIds[c]?.[g] ?? 0), 0x9e3779b1) + c;
+    return finalize(h);
+  }
+
+  #newGroup(ids: readonly Int32Array[], i: number, h: number): number {
+    const g = this.count++;
+    if (g >= this.#hashes.length) {
+      const size = 2 * this.#hashes.length;
+      this.#hashes = this.memory.int32(this.#hashes, size);
+      this.columnIds.forEach((column, c) => {
+        this.columnIds[c] = this.memory.int32(column, size);
+      });
+    }
+    this.#hashes[g] = h;
+    for (let c = 0; c < this.width; c++) {
+      const column = this.columnIds[c];
+      if (column !== undefined) column[g] = ids[c]?.[i] ?? 0;
+    }
+    return g;
+  }
+
+  /** `counts[c]`: column c's value count after this batch's ids were assigned. */
+  assign(
+    ids: readonly Int32Array[],
+    rows: Uint16Array,
+    count: number,
+    gids: Int32Array,
+    counts: readonly number[],
+  ): void {
+    if (this.#direct !== null) this.#fit(counts);
+    const keys = this.#rowKeys;
+    const direct = this.#direct;
+    if (direct !== null) {
+      // Column by column: each row's direct slot.
+      let shift = 0;
+      for (let c = 0; c < this.width; c++) {
+        const column = ids[c] ?? keys;
+        if (c === 0) for (let k = 0; k < count; k++) keys[rows[k] ?? 0] = column[rows[k] ?? 0] ?? 0;
+        else
+          for (let k = 0; k < count; k++) {
+            const i = rows[k] ?? 0;
+            keys[i] = (keys[i] ?? 0) | ((column[i] ?? 0) << shift);
+          }
+        shift += this.#bits[c] ?? 0;
+      }
+      for (let k = 0; k < count; k++) {
+        const i = rows[k] ?? 0;
+        const slot = keys[i] ?? 0;
+        let g = (direct[slot] ?? 0) - 1;
+        if (g < 0) {
+          g = this.#newGroup(ids, i, 0);
+          direct[slot] = g + 1;
+        }
+        gids[i] = g;
+      }
+      return;
+    }
+    // Column by column: each row's running hash, then one probe per row.
+    for (let c = 0; c < this.width; c++) {
+      const column = ids[c] ?? keys;
+      if (c === 0)
+        for (let k = 0; k < count; k++) {
+          const i = rows[k] ?? 0;
+          keys[i] = Math.imul(0x2545f491 ^ (column[i] ?? 0), 0x9e3779b1);
+        }
+      else
+        for (let k = 0; k < count; k++) {
+          const i = rows[k] ?? 0;
+          keys[i] = Math.imul((keys[i] ?? 0) ^ (column[i] ?? 0), 0x9e3779b1) + c;
+        }
+    }
     const width = this.width;
     for (let k = 0; k < count; k++) {
       const i = rows[k] ?? 0;
-      let h = 0x2545f491;
-      for (let c = 0; c < width; c++) h = Math.imul(h ^ (ids[c]?.[i] ?? 0), 0x9e3779b1) + c;
-      h = finalize(h);
+      const h = finalize(keys[i] ?? 0);
       const slots = this.#slots;
       let s = h & slots.mask;
       let g = -1;
@@ -903,19 +1047,7 @@ class TupleKeys {
         s = (s + 1) & slots.mask;
       }
       if (g < 0) {
-        g = this.count++;
-        if (g >= this.#hashes.length) {
-          const size = 2 * this.#hashes.length;
-          this.#hashes = this.memory.int32(this.#hashes, size);
-          this.columnIds.forEach((column, c) => {
-            this.columnIds[c] = this.memory.int32(column, size);
-          });
-        }
-        this.#hashes[g] = h;
-        for (let c = 0; c < width; c++) {
-          const column = this.columnIds[c];
-          if (column !== undefined) column[g] = ids[c]?.[i] ?? 0;
-        }
+        g = this.#newGroup(ids, i, h);
         slots.ids[s] = g + 1;
         slots.hashes[s] = h;
         if (slots.full(this.count)) slots.grow(this.#hashes, this.count, null);
@@ -942,7 +1074,7 @@ export class GroupTable {
     try {
       for (const type of keyTypes) this.#columns.push(keyColumnFor(type, this.#memory));
       if (keyTypes.length > 1) {
-        this.#tuple = new TupleKeys(keyTypes.length, this.#memory);
+        this.#tuple = new TupleKeys(keyTypes.length, this.#memory, capacity);
         while (this.#ids.length < keyTypes.length)
           this.#ids.push(this.#memory.make(Int32Array, capacity));
       }
@@ -970,6 +1102,7 @@ export class GroupTable {
       rows === null ? IDENTITY : rows.rows,
       rows === null ? length : rows.count,
       gids,
+      this.#columns.map((column) => column.count),
     );
   }
 
@@ -982,6 +1115,11 @@ export class GroupTable {
     const ids = this.#tuple.columnIds[c];
     if (ids === undefined) throw new RangeError(`No key column ${String(c)}`);
     return [column, type, ids];
+  }
+
+  /** Whether composite keys are direct-mapped (false for one key or once hashing). */
+  get directMapped(): boolean {
+    return this.#tuple?.direct ?? false;
   }
 
   /** An upper bound of the bytes `emitKey(c, from, count)` allocates. */

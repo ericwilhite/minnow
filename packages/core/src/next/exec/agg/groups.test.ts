@@ -7,6 +7,7 @@
  */
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
+import { createReach } from "../../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../../testing/seeds.js";
 import type { PhysicalType } from "../../types.js";
 import type { FlatVector, Selection, Vector } from "../../vector/vector.js";
@@ -128,7 +129,8 @@ interface Scenario {
   readonly seed: number;
 }
 
-function check({ kinds, card, rows, seed }: Scenario): void {
+/** Returns whether the composite table was still direct-mapped at the end. */
+function check({ kinds, card, rows, seed }: Scenario): boolean {
   const random = mulberry32(seed);
   const table = new GroupTable(
     kinds.map((kind) => TYPES[kind]),
@@ -193,7 +195,9 @@ function check({ kinds, card, rows, seed }: Scenario): void {
         );
     });
   }
+  const direct = table.directMapped;
   table.close();
+  return direct;
 }
 
 const KINDS: readonly Kind[] = ["int4", "int8", "float8", "text", "numeric"];
@@ -221,6 +225,8 @@ describe("GroupTable against a GROUP BY model (generated)", () => {
   it.each(SEEDS)(
     "composite keys of mixed kinds (seed %i)",
     (seed) => {
+      // Direct-mapped while the radices fit 2^16 slots, hashed past that (TupleKeys).
+      const reach = createReach("next-group-table-composite", ["direct-mapped", "hashed"] as const);
       fc.assert(
         fc.property(
           fc.array(fc.constantFrom(...KINDS), { minLength: 2, maxLength: 3 }),
@@ -228,12 +234,52 @@ describe("GroupTable against a GROUP BY model (generated)", () => {
           fc.integer({ min: 1, max: 8_000 }),
           fc.integer(),
           (kinds, card, rows, inner) => {
-            check({ kinds, card, rows, seed: inner });
+            reach.beginHistory();
+            reach.reach(check({ kinds, card, rows, seed: inner }) ? "direct-mapped" : "hashed");
           },
         ),
         { seed, numRuns: 30 },
       );
+      reach.assertReached();
     },
     180_000,
   );
+
+  it("switches a full direct-mapped composite table (65,536 groups) to hashing, keeping ids", () => {
+    const table = new GroupTable([I32, I32], UNCHARGED);
+    const gids = new Int32Array(2048);
+    const all = Array.from({ length: 65_536 }, (_, t) => [t >>> 8, t & 255] as const);
+    const assign = (tuples: ReadonlyArray<readonly [number, number]>): number[] => {
+      const out: number[] = [];
+      for (let start = 0; start < tuples.length; start += 2048) {
+        const part = tuples.slice(start, start + 2048);
+        table.assign(
+          [
+            numbers(
+              I32,
+              part.map(([a]) => a),
+            ),
+            numbers(
+              I32,
+              part.map(([, b]) => b),
+            ),
+          ],
+          part.length,
+          null,
+          gids,
+        );
+        out.push(...gids.subarray(0, part.length));
+      }
+      return out;
+    };
+    const first = assign(all);
+    expect(first).toEqual(Array.from({ length: 65_536 }, (_, t) => t));
+    expect(table.directMapped).toBe(true);
+    // A 257th value of the first column needs a 17th bit: hash from now on.
+    expect(assign([[256, 0]])).toEqual([65_536]);
+    expect(table.directMapped).toBe(false);
+    expect(assign(all)).toEqual(first);
+    expect(table.groupCount).toBe(65_537);
+    table.close();
+  });
 });
