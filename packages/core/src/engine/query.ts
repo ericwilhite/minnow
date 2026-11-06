@@ -6168,6 +6168,15 @@ function exactConstantFold(
  * for execution to report.
  */
 function resolveExactNumericConstants(expression: Expression): Expression {
+  // Lowering types and folds constants itself, after overload resolution (PostgreSQL's types:
+  // `9007199254740993 - 1` is bigint arithmetic, not a NUMERIC constant).
+  if (
+    recordDeclaredTypes &&
+    expression.kind !== "subquery" &&
+    expression.kind !== "exists" &&
+    expression.kind !== "window"
+  )
+    return mapChildExpressions(expression, resolveExactNumericConstants);
   if (expression.kind === "call" && expression.name === "CAST") {
     const [source, target] = expression.arguments;
     if (source !== undefined && target?.kind === "literal" && target.value === "number-integer") {
@@ -11720,6 +11729,8 @@ class Parser {
         value: tagged,
         internalSqlValue: true,
         sqlDomain: { kind: "numeric" },
+        // Lowering types an integer spelling as PostgreSQL does: bigint up to int8's range.
+        ...(recordDeclaredTypes ? { exactText: token.text } : {}),
       };
     }
     if (token.kind === "string") {

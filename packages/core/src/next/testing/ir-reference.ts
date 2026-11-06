@@ -238,6 +238,27 @@ function arithmetic(fn: string, args: readonly Value[], type: PhysicalType): Val
         return roundHalfEven(x);
     }
   }
+  if (type.kind === "decimal") {
+    // Approximated as numbers, like decimal constants (see the module comment): enough for the
+    // small constants the tests compute with, not an exact NUMERIC.
+    const x = Number(a);
+    const y = Number(b);
+    switch (fn) {
+      case "add":
+        return x + y;
+      case "sub":
+        return x - y;
+      case "mul":
+        return x * y;
+      case "div":
+        if (y === 0) throw new ReferenceSqlError("division by zero", "22012");
+        return x / y;
+      case "neg":
+        return -x;
+      case "abs":
+        return Math.abs(x);
+    }
+  }
   throw new ReferenceUnsupportedError(`${fn} over ${type.kind}`);
 }
 

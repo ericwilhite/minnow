@@ -155,7 +155,13 @@ export function castTargetType(target: Expression): PhysicalType {
 /** The literal of a front-end numeric constant: int4, int8 or numeric by magnitude. */
 function numberLiteral(value: number, exactText: string | undefined, decimal: boolean): Typed {
   const text = exactText ?? String(value);
-  if (!decimal && Number.isInteger(value) && /^[+-]?\d+$/u.test(text)) {
+  // An integer spelling is int4, int8 or numeric by magnitude (PostgreSQL), whatever the front
+  // end's `decimal` flag says: there it marks digits beyond 2^53, not a fraction.
+  const integerSpelling =
+    exactText === undefined
+      ? !decimal && Number.isInteger(value) && /^[+-]?\d+$/u.test(text)
+      : /^[+-]?\d+$/u.test(exactText);
+  if (integerSpelling) {
     const whole = BigInt(text);
     const expr =
       integerLiteral(whole, { kind: "int32", bits: 32 }) ??
@@ -183,6 +189,8 @@ function lowerLiteral(expression: Extract<Expression, { kind: "literal" }>): Typ
     const domain = expression.sqlDomain;
     switch (domain.kind) {
       case "numeric": {
+        if (expression.exactText !== undefined && /^[+-]?\d+$/u.test(expression.exactText))
+          return numberLiteral(Number(expression.exactText), expression.exactText, false);
         const parsed = parseDecimalText(text);
         if (parsed !== null)
           return {
