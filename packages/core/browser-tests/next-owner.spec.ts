@@ -485,3 +485,53 @@ test("explicit streaming export relinquishes worker buffers only on release", as
     ordinaryRows: [[1, 0, "x"]],
   });
 });
+
+test("literal families and typed transaction modes cross real owner ports", async ({
+  page,
+  context,
+}) => {
+  const name = dbName("plan-modes");
+  const a = await tab(page);
+  await call(a, "wipe", name);
+  await call(a, "open", name);
+  const b = await tab(await context.newPage());
+  await call(b, "open", name);
+  await call(a, "query", "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+  await call(a, "query", "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+  for (let pass = 0; pass < 2; pass++)
+    for (const [id, value] of [
+      [1, "a"],
+      [2, "b"],
+      [3, "c"],
+    ] as const) {
+      expect(await call(b, "query", `SELECT v FROM t WHERE id = ${String(id)}`)).toMatchObject({
+        rows: [[value]],
+      });
+      // Text-to-integer coercion is a refusal marker: raw constants stay text-specific.
+      expect(await call(a, "query", `SELECT v FROM t WHERE id = '${String(id)}'`)).toMatchObject({
+        rows: [[value]],
+      });
+    }
+  await call(b, "query", "BEGIN READ ONLY", [], 1);
+  expect(await call(b, "query", "SELECT id FROM t WHERE id = 1", [], 1)).toMatchObject({
+    rows: [[1]],
+  });
+  expect(await call(b, "query", "SET TRANSACTION READ WRITE", [], 1)).toMatchObject({
+    error: "TransactionModeError",
+  });
+  await call(b, "query", "ROLLBACK", [], 1);
+  await call(b, "query", "BEGIN READ WRITE", [], 1);
+  expect(
+    await call(b, "query", "SET TRANSACTION READ ONLY, ISOLATION LEVEL READ COMMITTED", [], 1),
+  ).toMatchObject({ summary: { transaction: "open" } });
+  expect(await call(b, "query", "SHOW transaction_isolation", [], 1)).toMatchObject({
+    rows: [["read committed"]],
+  });
+  expect(await call(b, "query", "INSERT INTO t VALUES (4, 'd')", [], 1)).toMatchObject({
+    error: "ReadOnlyTransactionError",
+  });
+  await call(b, "query", "ROLLBACK", [], 1);
+  expect(
+    await call(a, "query", "UPDATE t SET v = $1 WHERE id = 2 RETURNING id, v", ["updated"]),
+  ).toMatchObject({ rows: [[2, "updated"]] });
+});

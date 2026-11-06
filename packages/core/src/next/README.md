@@ -1715,10 +1715,18 @@ with no stored-format change.
   own schema in a session cache dropped on ROLLBACK and ROLLBACK TO. Both are the governor's
   evictable caches (`registerCache`): charged at a size walked from the expressions, and evicted,
   oldest unused across caches, before growth is refused or an operator spills.
-- SQL `BEGIN READ ONLY` (and `START TRANSACTION READ ONLY`) is refused with 0A000 until lowering
-  reports a BEGIN's access mode; the protocol's read-only begin works. The guard reads the modes
-  as the front end does (identifier words, punctuation ignored); it is not a grammar. The refusal goes when
-  lowering's fix lands, and the owner's test then requires 25006 for a write in it.
+- SQL `BEGIN` / `START TRANSACTION` and `SET TRANSACTION` apply lowering's typed modes,
+  including the last option of each kind. READ ONLY pins a snapshot and takes no writer slot;
+  READ WRITE takes the writer slot. A write in READ ONLY fails with 25006. Before data work,
+  SET can switch those resources and change isolation/deferrable modes. After the first data
+  statement starts (including synchronous point reads), SET fails with 25001 and aborts the
+  transaction; ROLLBACK TO does not reset that boundary. A savepoint keeps its modes: ROLLBACK TO
+  restores them and their resources, while RELEASE keeps subsequent changes. Modes reset at
+  transaction end. SHOW transaction_isolation reports the selected level per session; the
+  default is repeatable read. Every accepted isolation level uses the engine's snapshot level
+  (lowering refuses SERIALIZABLE), so DEFERRABLE has no execution effect. SET outside a
+  transaction changes nothing; the wire has no PostgreSQL warning notices. Other session SET
+  settings remain the lowerer's fixed utility behavior.
 - Tests: in process (`testing/owner-*.test.ts`, the election ones on in-memory Web Locks) and
   across real tabs in Chromium, Firefox and WebKit (`npm run test:browser:next-owner`), over real
   lowering and the stand-in executor and write path persisted in OPFS (IndexedDB where workers

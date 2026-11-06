@@ -62,10 +62,9 @@ import type { MemoryGovernor } from "../memory/governor.js";
 import { ReturnPool } from "../exec/return-pool.js";
 import type { SpillService } from "../spill/contract.js";
 import { PG_EPOCH_UNIX_MICROS } from "../temporal.js";
-import { UnsupportedPlanError } from "../errors.js";
+import type { TransactionModes } from "../lower/lowerer.js";
 import { RuleCache } from "./rule-cache.js";
 import { PlanCache } from "./plan-cache.js";
-import { requestsReadOnly } from "./sequence.js";
 import type {
   EngineSession,
   OwnerEngine,
@@ -82,6 +81,7 @@ import {
   ReadOnlyTransactionError,
   SequenceStateError,
   TransactionIdleTimeoutError,
+  TransactionModeError,
 } from "./errors.js";
 import type { WireInputColumn } from "./frame.js";
 import type { OwnerLedger } from "./outcomes.js";
@@ -126,6 +126,14 @@ export interface ComposeOptions {
   readonly transactionIdleTimeoutMs?: number;
 }
 
+type AppliedTransactionModes = {
+  readonly [K in keyof TransactionModes]: NonNullable<TransactionModes[K]>;
+};
+const DEFAULT_TRANSACTION_MODES: AppliedTransactionModes = {
+  readOnly: false,
+  isolation: "repeatable read",
+  deferrable: false,
+};
 type CachedPlan =
   | PlannedStatement
   | NotParameterizable
@@ -545,7 +553,8 @@ class ComposedSession implements EngineSession {
   readonly sequences = new Sequences();
   readonly #engine: ComposedEngine;
   #state: TransactionState = "idle";
-  #readOnly = false;
+  #modes: AppliedTransactionModes = { ...DEFAULT_TRANSACTION_MODES };
+  #startedStatement = false;
   #tx: WriteTransaction | null = null;
   #readPin: Snapshot | null = null;
   #startedAtMs: number | null = null;
@@ -558,6 +567,7 @@ class ComposedSession implements EngineSession {
   #savepoints: Array<{
     readonly name: string;
     readonly savepoint: Savepoint | null;
+    readonly modes: AppliedTransactionModes;
     readonly counts: Readonly<Record<string, number>>;
   }> = [];
   /**
@@ -580,7 +590,7 @@ class ComposedSession implements EngineSession {
   }
 
   get readOnly(): boolean {
-    return this.#readOnly;
+    return this.#modes.readOnly;
   }
 
   get lastCommitLsn(): number | null {
@@ -675,7 +685,8 @@ class ComposedSession implements EngineSession {
     this.#tx = null;
     this.#readPin?.release();
     this.#readPin = null;
-    this.#readOnly = false;
+    this.#modes = { ...DEFAULT_TRANSACTION_MODES };
+    this.#startedStatement = false;
     this.#startedAtMs = null;
     this.#savepoints = [];
     this.#privatePlans?.clear();
@@ -693,7 +704,7 @@ class ComposedSession implements EngineSession {
     if (this.#state === "failed" && !ends) return new InFailedTransactionError();
     if (this.#state === "timedOut" && !ends)
       return new TransactionIdleTimeoutError(this.#engine.options.transactionIdleTimeoutMs ?? 0);
-    if (this.#readOnly && (lowered.kind === "modify" || lowered.kind === "ddl"))
+    if (this.#modes.readOnly && (lowered.kind === "modify" || lowered.kind === "ddl"))
       return new ReadOnlyTransactionError(lowered.command);
     return null;
   }
@@ -715,8 +726,9 @@ class ComposedSession implements EngineSession {
   ): SyncRun | { readonly continued: Run } | null {
     const lowered = statement.lowered;
     if (lowered.kind !== "query" || !lowered.pointRead) return null;
-    const inReadOnly = this.#state === "open" && this.#readOnly;
+    const inReadOnly = this.#state === "open" && this.#modes.readOnly;
     if (this.#state !== "idle" && !inReadOnly) return null;
+    if (inReadOnly) this.#startedStatement = true;
     const pin = inReadOnly ? this.#transactionPin() : this.#writePath().pin(this.#pinOptions());
     const releasePin = () => {
       if (!inReadOnly) pin.release();
@@ -784,6 +796,11 @@ class ComposedSession implements EngineSession {
     const refused = this.#guard(statement);
     if (refused !== null) return failedRun(refused);
     const lowered = statement.lowered;
+    if (
+      this.#state === "open" &&
+      (lowered.kind === "query" || lowered.kind === "modify" || lowered.kind === "ddl")
+    )
+      this.#startedStatement = true;
     switch (lowered.kind) {
       case "query":
         return this.#query(lowered, boundParameters(statement, params), context);
@@ -798,7 +815,12 @@ class ComposedSession implements EngineSession {
           results:
             lowered.show === null
               ? emptyStream()
-              : oneTextRow(lowered.show.column, lowered.show.value),
+              : oneTextRow(
+                  lowered.show.column,
+                  lowered.show.column.name === "transaction_isolation"
+                    ? this.#modes.isolation
+                    : lowered.show.value,
+                ),
           done: Promise.resolve({
             command: lowered.command,
             rowCount: lowered.show === null ? null : 1,
@@ -853,7 +875,7 @@ class ComposedSession implements EngineSession {
         commits: false,
       };
     }
-    const inReadOnly = this.#state === "open" && this.#readOnly;
+    const inReadOnly = this.#state === "open" && this.#modes.readOnly;
     const pin = inReadOnly ? this.#transactionPin() : this.#writePath().pin(this.#pinOptions());
     const releasePin = () => {
       if (!inReadOnly) pin.release();
@@ -1091,21 +1113,19 @@ class ComposedSession implements EngineSession {
     switch (lowered.action) {
       case "begin": {
         if (this.#state !== "idle") return done(lowered.command); // PostgreSQL: a warning only
-        // Lowering does not report BEGIN READ ONLY's access mode yet (B6): never let it open a
-        // writable transaction. Remove when lowering sets `readOnly` (B5-p2c review 1, finding 1).
-        if (!lowered.readOnly && requestsReadOnly(lowered.text))
-          return failedRun(
-            new UnsupportedPlanError(
-              "BEGIN READ ONLY isn't supported yet; use the protocol's read-only begin",
-              { stage: "lower", construct: "readOnlyBegin" },
-            ),
-          );
-        const begun = this.begin(lowered.readOnly, context.signal).then(() => ({
-          command: lowered.command,
-          rowCount: null,
-          counts: null,
-          lsn: null,
-        }));
+        const begun = this.begin(lowered.modes.readOnly ?? false, context.signal).then(() => {
+          this.#modes = {
+            readOnly: this.#modes.readOnly,
+            isolation: lowered.modes.isolation ?? DEFAULT_TRANSACTION_MODES.isolation,
+            deferrable: lowered.modes.deferrable ?? DEFAULT_TRANSACTION_MODES.deferrable,
+          };
+          return {
+            command: lowered.command,
+            rowCount: null,
+            counts: null,
+            lsn: null,
+          };
+        });
         return { results: emptyStream(), done: begun, reachedCommit: false, commits: false };
       }
       case "commit":
@@ -1118,6 +1138,7 @@ class ComposedSession implements EngineSession {
         this.#savepoints.push({
           name: lowered.savepoint ?? "",
           savepoint: this.#tx?.savepoint() ?? null,
+          modes: { ...this.#modes },
           counts: { ...this.#txCounts },
         });
         return done(lowered.command);
@@ -1142,20 +1163,58 @@ class ComposedSession implements EngineSession {
           this.#privatePlans?.clear();
           this.#txRules?.clear();
           if (this.#state === "failed") this.#state = "open";
+          const restored = this.#applyModes(entry.modes, context.signal).then(() => ({
+            command: lowered.command,
+            rowCount: null,
+            counts: null,
+            lsn: null,
+          }));
+          return { results: emptyStream(), done: restored, reachedCommit: false, commits: false };
         }
         return done(lowered.command);
       }
-      case "setTransaction":
-        // Lowering now hands SET TRANSACTION over as a typed instruction with its `modes` (B6
-        // e8f741c). Applying them, with PostgreSQL's 25001 after the first statement, is the
-        // owner's (B5 follow-up): until then it is refused, never silently ignored.
-        return failedRun(
-          new UnsupportedPlanError("SET TRANSACTION isn't applied by the owner yet", {
-            stage: "lower",
-            construct: "setTransaction",
-          }),
-        );
+      case "setTransaction": {
+        // Outside BEGIN this has no effect (PostgreSQL warns; this wire has no notices).
+        if (this.#state === "idle") return done(lowered.command);
+        if (this.#startedStatement) return failedRun(new TransactionModeError());
+        const changed = this.#applyModes(lowered.modes, context.signal).then(() => ({
+          command: lowered.command,
+          rowCount: null,
+          counts: null,
+          lsn: null,
+        }));
+        return { results: emptyStream(), done: changed, reachedCommit: false, commits: false };
+      }
     }
+  }
+
+  /** Switch resources before publishing modes, including restoration after ROLLBACK TO. */
+  async #applyModes(modes: TransactionModes, signal: AbortSignal): Promise<void> {
+    const readOnly = modes.readOnly ?? this.#modes.readOnly;
+    if (readOnly !== this.#modes.readOnly) {
+      if (readOnly) {
+        const pin = this.#writePath().pin(this.#pinOptions());
+        this.#tx?.rollback();
+        this.#tx = null;
+        this.#readPin = pin;
+        this.#savepoints = this.#savepoints.map((entry) => ({ ...entry, savepoint: null }));
+      } else {
+        const tx = await this.#writePath().begin({ signal });
+        this.#tx = tx;
+        this.#readPin?.release();
+        this.#readPin = null;
+        this.#savepoints = this.#savepoints.map((entry) => ({
+          ...entry,
+          savepoint: tx.savepoint(),
+        }));
+      }
+    }
+    this.#modes = {
+      readOnly,
+      isolation: modes.isolation ?? this.#modes.isolation,
+      // Without SERIALIZABLE (refused by lowering), DEFERRABLE has no execution effect.
+      deferrable: modes.deferrable ?? this.#modes.deferrable,
+    };
   }
 
   write(
@@ -1184,10 +1243,11 @@ class ComposedSession implements EngineSession {
       throw new TypeError("A transaction is already open in this session");
     if (readOnly) {
       this.#readPin = this.#writePath().pin(this.#pinOptions());
-      this.#readOnly = true;
     } else {
       this.#tx = await this.#writePath().begin({ signal });
     }
+    this.#modes = { ...DEFAULT_TRANSACTION_MODES, readOnly };
+    this.#startedStatement = false;
     this.#startedAtMs = this.#engine.now();
     this.#state = "open";
   }

@@ -209,6 +209,16 @@ export class InFailedTransactionError extends Error {
   }
 }
 
+/** SET TRANSACTION after this transaction's first data statement (PostgreSQL 25001). */
+export class TransactionModeError extends Error {
+  readonly code = "MINNOW_TRANSACTION_MODE";
+  override readonly name = "TransactionModeError";
+  readonly sqlState = "25001";
+  constructor() {
+    super("SET TRANSACTION must precede the transaction's first query or data statement");
+  }
+}
+
 /** A write inside a READ ONLY transaction (PostgreSQL 25006). */
 export class ReadOnlyTransactionError extends Error {
   readonly code = "MINNOW_READ_ONLY_TRANSACTION";
@@ -262,6 +272,7 @@ export const ownerErrorRegistry: ErrorRegistry = new Map<string, new (...args: n
   ["NoActiveTransactionError", NoActiveTransactionError],
   ["SavepointNotFoundError", SavepointNotFoundError],
   ["ReadOnlyTransactionError", ReadOnlyTransactionError],
+  ["TransactionModeError", TransactionModeError],
   ["SequenceStateError", SequenceStateError],
   ["RecordedFailureError", RecordedFailureError],
   ["ConnectionRefusedError", ConnectionRefusedError],

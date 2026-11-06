@@ -1174,3 +1174,24 @@ export const OWNER_PRIVATE_PLAN_CACHE_STATES = [
   "private commit",
   "private close",
 ] as const;
+
+/** Actual typed-mode transitions, data boundaries, savepoints and transaction cleanup. */
+export const OWNER_TRANSACTION_MODE_STATES = [
+  "read-only begin",
+  "read-write begin",
+  "read-only refusal",
+  "query boundary",
+  "modify boundary",
+  "ddl boundary",
+  "set read-only",
+  "set read-write",
+  "isolation metadata",
+  "deferrable",
+  "not deferrable",
+  "commit reset",
+  "rollback reset",
+  "rollback modes",
+  "release modes",
+  "last read-only wins",
+  "last read-write wins",
+] as const;
