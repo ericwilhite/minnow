@@ -7,12 +7,14 @@ import { MinnowDatabaseClient } from "@minnowdb/core/client";
 import type {
   ChaosExpect,
   ChaosInjection,
+  ChaosMode,
   ChaosIntent,
   ChaosMessage,
   ChaosRecovery,
   ChaosState,
   ChaosStep,
 } from "./next-storage-chaos.js";
+import type { ReopenBuild, ReopenLayout, ReopenTiming } from "./next-storage-reopen.js";
 import type { NextStorageRequest, PublishPhase, StoreKind } from "./next-storage-worker.js";
 
 /** The backend every following scenario runs on (OPFS unless a test picks IndexedDB). */
@@ -499,6 +501,7 @@ export async function chaosBegin(
   seed: number,
   expect: ChaosExpect | null,
   inject: ChaosInjection | null = null,
+  mode: ChaosMode = "serial",
 ): Promise<ChaosRecovery> {
   useStore(kind);
   const worker = await spawnForChaos();
@@ -531,6 +534,10 @@ export async function chaosBegin(
     else {
       if (run.hold) return; // armed for a page close: nothing new starts
       run.inFlight.set(message.intent.sequence, message.intent);
+      if (mode === "concurrent") {
+        run.port.postMessage({ go: message.intent.sequence }); // at once: lanes stay concurrent
+        return;
+      }
       const armed = run.armed;
       if (armed !== null && armed.target === message.intent.step) {
         armed.remaining -= 1;
@@ -545,7 +552,7 @@ export async function chaosBegin(
   };
   worker.post({ chaosPort: channel.port2 }, [channel.port2]);
   worker
-    .call({ op: "chaos", dir, seed, expect, ...(inject === null ? {} : { inject }) })
+    .call({ op: "chaos", dir, seed, expect, mode, ...(inject === null ? {} : { inject }) })
     .catch((error: unknown) => {
       // Only this page's own terminate() is not a failure.
       if (error instanceof Error && error.name === "WorkerTerminated") return;
@@ -635,6 +642,46 @@ export function chaosKill(plan: KillPlan): Promise<KillLanding | null> {
   });
 }
 
+/** Where a concurrent kill landed: the operations whose storage work it interrupted. */
+export interface ConcurrentLanding {
+  /** Steps that had begun their storage work and not returned from it, sorted. */
+  readonly inOperation: readonly ChaosStep[];
+  /** Steps announced and not done (in operation, or returned and not yet reported done). */
+  readonly inFlight: readonly ChaosStep[];
+  readonly expect: ChaosExpect;
+}
+
+/**
+ * Kills the running concurrent chaos worker `delayMs` after it was armed (a wall-clock moment, not
+ * a step boundary), drains what it posted before it died, and returns every acknowledgement and
+ * the operations in flight. A workload failure observed at any time rejects.
+ */
+export async function chaosKillAfter(delayMs: number): Promise<ConcurrentLanding> {
+  const run = chaos;
+  if (run === null) throw new Error("chaosBegin first");
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, delayMs);
+  });
+  // No operation starts after this: everything the worker does until the kill takes effect was
+  // announced (terminate() is asynchronous; what the worker posts meanwhile may be dropped).
+  run.hold = true;
+  run.worker.terminate();
+  chaos = null;
+  await drain(run);
+  run.port.close();
+  const failure = failed(run);
+  if (failure !== null) throw failure;
+  const intents = [...run.inFlight.values()];
+  return {
+    inOperation: intents
+      .filter((intent) => run.began.has(intent.sequence) && !run.settled.has(intent.sequence))
+      .map((intent) => intent.step)
+      .sort(),
+    inFlight: intents.map((intent) => intent.step).sort(),
+    expect: expectOf(run),
+  };
+}
+
 /**
  * The page-close boundary (review B1-p2f finding 2): the page stops processing the worker's
  * messages and returns what it received up to now; the caller closes the page next, and the page
@@ -659,4 +706,43 @@ export async function chaosEnd(kind: StoreKind, dir: string): Promise<void> {
   chaos = null;
   useStore(kind);
   await withWorker((worker) => worker.call({ op: "remove", dir }));
+}
+
+/**
+ * Gate A's reopen at the storage layer (next-storage-reopen.ts): builds a space of `blobs` blobs in
+ * `layout` once, then reopens it `repeats` times, each in a fresh worker, and returns the build and
+ * every timing.
+ */
+export async function runReopenBench(
+  kind: StoreKind,
+  layout: ReopenLayout,
+  blobs: number,
+  repeats: number,
+): Promise<{
+  build: ReopenBuild;
+  reopens: ReopenTiming[];
+  /** IndexedDB only: open's requests timed alone. */
+  requests: Record<string, number> | null;
+}> {
+  useStore(kind);
+  const dir = unique(`reopen-${kind}-${layout}`);
+  try {
+    const build = await withWorker((worker) =>
+      worker.call<ReopenBuild>({ op: "reopen-build", dir, layout, blobs }),
+    );
+    const reopens: ReopenTiming[] = [];
+    for (let run = 0; run < repeats; run++)
+      reopens.push(
+        await withWorker((worker) => worker.call<ReopenTiming>({ op: "reopen-measure", dir })),
+      );
+    const requests =
+      kind === "indexeddb"
+        ? await withWorker((worker) =>
+            worker.call<Record<string, number>>({ op: "reopen-idb-requests", dir }),
+          )
+        : null;
+    return { build, reopens, requests };
+  } finally {
+    await withWorker((worker) => worker.call({ op: "remove", dir }));
+  }
 }

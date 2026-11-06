@@ -11,7 +11,12 @@
  */
 import { chromium, expect, firefox, webkit, type Page } from "@playwright/test";
 import { EXPECTED_IDB_OUTCOMES } from "../src/next/storage/idb-scenarios.js";
-import { createReach, STORAGE_KILL_EDGE_REACH, STORAGE_KILL_REACH } from "../src/testing/reach.js";
+import {
+  createReach,
+  STORAGE_CONCURRENT_KILL_REACH,
+  STORAGE_KILL_EDGE_REACH,
+  STORAGE_KILL_REACH,
+} from "../src/testing/reach.js";
 import { mulberry32, seedsFor } from "../src/testing/seeds.js";
 import type { ChaosExpect, ChaosStep } from "../browser/next-storage-chaos.js";
 import type { KillPlan } from "../browser/next-storage-run.js";
@@ -454,9 +459,11 @@ test.describe("rebuild core storage kill campaign (Gate A)", () => {
           );
         const started = Date.now();
         let expected: ChaosExpect | null = null;
+        let order: ChaosStep[] = [...KILL_TARGETS];
         let pageKills = 0;
         let workerStartRetries = 0;
         let verifiedLogBytes = 0;
+        let lockSteals = 0;
         let previous = "none";
         for (let iteration = 0; iteration <= kills; iteration++) {
           let recovery;
@@ -469,8 +476,18 @@ test.describe("rebuild core storage kill campaign (Gate A)", () => {
             );
           }
           verifiedLogBytes += recovery.verifiedLogBytes;
+          if (recovery.stolenLock) lockSteals += 1;
           if (iteration === kills) break;
-          const target = KILL_TARGETS[Math.floor(random() * KILL_TARGETS.length)] ?? "write";
+          // Each pass over the targets is a seeded shuffle, so every phase is aimed at in every
+          // pass (reach), in a seeded order.
+          if (iteration % KILL_TARGETS.length === 0) {
+            order = [...KILL_TARGETS];
+            for (let at = order.length - 1; at > 0; at--) {
+              const other = Math.floor(random() * (at + 1));
+              [order[at], order[other]] = [order[other] ?? "write", order[at] ?? "write"];
+            }
+          }
+          const target = order[iteration % order.length] ?? "write";
           const plan: KillPlan = {
             target,
             occurrence: 1 + Math.floor(random() * 3),
@@ -539,6 +556,7 @@ test.describe("rebuild core storage kill campaign (Gate A)", () => {
           workerStartRetries,
           corruptions: 0,
           verifiedLogBytes,
+          lockSteals,
           seconds: Math.round((Date.now() - started) / 1000),
           landed: Object.fromEntries([...table].sort(([a], [b]) => a.localeCompare(b))),
           reach: Object.fromEntries(reach.counts()),
@@ -640,4 +658,169 @@ test.describe("rebuild core storage kill campaign: its own failure paths (review
     expect(result.boundary.expect.inFlight).toEqual([]);
     expect(result.boundary.expect.state.round).toBe(result.before + 1);
   });
+});
+
+test.describe("rebuild core storage concurrent kill campaign (Gate A)", () => {
+  const nightly = Number(process.env.MINNOW_NEXT_STORAGE_KILLS ?? "0");
+  const kills = nightly > 0 ? nightly : 50;
+  for (const kind of ["opfs", "indexeddb"] as const)
+    for (const seed of seedsFor(`next-storage-concurrent-kills-${kind}`, [
+      kind === "opfs" ? 0xc0c1 : 0xc0c2,
+    ]))
+      test(`${kind}: kills at random moments of a concurrent workload reopen to a legal state (seed ${String(seed)})`, async ({
+        page: first,
+        browserName,
+      }, info) => {
+        test.skip(
+          nightly > 0 && browserName !== "chromium",
+          "the nightly campaign runs in Chromium",
+        );
+        // WebKit: a worker terminated with several IndexedDB transactions in flight leaves the
+        // database blocked for the rest of the browser session: the next owner's fence
+        // transaction never runs, even with the lock stolen and from a fresh page (seen at kill 5
+        // and kill 12 with 5 operations in flight; the serialized campaign, one transaction in
+        // flight, never wedges). A platform finding for the ownership track, not a corruption.
+        test.fixme(
+          browserName === "webkit" && kind === "indexeddb",
+          "WebKit wedges IndexedDB after a worker is terminated mid-transactions",
+        );
+        test.setTimeout(Math.max(600_000, kills * 5_000));
+        const page: Page = first;
+        await page.goto("/packages/core/browser/");
+        if (kind === "opfs") await requireWorkerOpfs(page);
+        const random = mulberry32(seed);
+        const dir = `concurrent-${kind}-${String(seed)}-${Date.now().toString(36)}`;
+        // IndexedDB's storage work is asynchronous: kills land inside interleaved operations,
+        // and every interleaving is required. OPFS's calls are synchronous: each operation starts
+        // in its own task (after its go) and its storage calls finish within it, so a kill never
+        // finds two OPFS operations inside storage; there the interleavings are the simulated
+        // power-loss sweep's (storage/chaos-crash.test.ts, STORAGE_CONCURRENT_CRASH_REACH).
+        const required: ReadonlyArray<(typeof STORAGE_CONCURRENT_KILL_REACH)[number]> =
+          kind === "indexeddb" ? STORAGE_CONCURRENT_KILL_REACH : [];
+        const reach = createReach(`concurrent storage kills ${kind} ${browserName}`, required, {
+          minimum: Math.max(1, Math.floor(kills / 50)),
+        });
+        const inFlightCounts = new Map<number, number>();
+        const pairs = new Map<string, number>();
+        const started = Date.now();
+        let expected: ChaosExpect | null = null;
+        let previous = "none";
+        let verifiedLogBytes = 0;
+        let lockSteals = 0;
+        for (let iteration = 0; iteration <= kills; iteration++) {
+          let recovery;
+          const begin = () =>
+            page.evaluate(
+              async ([url, store, directory, workerSeed, expectation]) =>
+                ((await import(url)) as Run).chaosBegin(
+                  store,
+                  directory,
+                  workerSeed,
+                  expectation,
+                  null,
+                  "concurrent",
+                ),
+              [RUN, kind, dir, (seed + iteration * 0x9e3779b9) >>> 0, expected] as const,
+            );
+          try {
+            recovery = await begin();
+          } catch (error) {
+            throw new Error(
+              `${kind}/${browserName}: recovery after concurrent kill ${String(iteration)} failed (replay: MINNOW_SEED=${String(seed)}; ${previous}): ${String(error)}`,
+              { cause: error },
+            );
+          }
+          verifiedLogBytes += recovery.verifiedLogBytes;
+          if (recovery.stolenLock) lockSteals += 1;
+          if (iteration === kills) break;
+          const delayMs = 20 + Math.floor(random() * 500);
+          let landing;
+          try {
+            landing = await page.evaluate(
+              async ([url, delay]) => ((await import(url)) as Run).chaosKillAfter(delay),
+              [RUN, delayMs] as const,
+            );
+          } catch (error) {
+            throw new Error(
+              `${kind}/${browserName}: concurrent kill ${String(iteration)} observed a workload failure (replay: MINNOW_SEED=${String(seed)}; ${previous}): ${String(error)}`,
+              { cause: error },
+            );
+          }
+          expected = landing.expect;
+          previous = `kill ${String(iteration)} after ${String(delayMs)} ms, in storage ${landing.inOperation.join("+") || "nothing"}, in flight ${landing.inFlight.join("+") || "nothing"}, expecting ${JSON.stringify(landing.expect)}`;
+          // Reach counts operations inside their storage work at the kill.
+          const steps = landing.inOperation;
+          inFlightCounts.set(steps.length, (inFlightCounts.get(steps.length) ?? 0) + 1);
+          for (const step of new Set(steps)) pairs.set(step, (pairs.get(step) ?? 0) + 1);
+          const has = (step: ChaosStep) => steps.includes(step);
+          const entered: string[] = [];
+          if (steps.length >= 2) entered.push("two-or-more-in-operation");
+          if ((has("publish") || has("reclaim")) && has("log-flush"))
+            entered.push("publish-with-log-flush");
+          if (has("reclaim") && has("read")) entered.push("reclaim-with-read");
+          if (steps.filter((step) => step === "write").length >= 2)
+            entered.push("write-with-write");
+          if (has("spill") && steps.length >= 2) entered.push("spill-with-another");
+          reach.recordHistory(entered);
+        }
+        await page.evaluate(
+          async ([url, store, directory]) =>
+            ((await import(url)) as Run).chaosEnd(store, directory),
+          [RUN, kind, dir] as const,
+        );
+        const report = {
+          mode: "concurrent",
+          browser: browserName,
+          version: page.context().browser()?.version() ?? null,
+          store: kind,
+          seed,
+          kills,
+          corruptions: 0,
+          verifiedLogBytes,
+          lockSteals,
+          seconds: Math.round((Date.now() - started) / 1000),
+          inOperationAtKill: Object.fromEntries([...inFlightCounts].sort(([a], [b]) => a - b)),
+          stepInOperationAtKill: Object.fromEntries(
+            [...pairs].sort(([a], [b]) => a.localeCompare(b)),
+          ),
+          reach: Object.fromEntries(reach.counts()),
+          reachBackedBy: required.length === 0 ? "storage/chaos-crash.test.ts" : null,
+        };
+        await info.attach(`storage-concurrent-kills-${kind}`, {
+          body: JSON.stringify(report, null, 2),
+          contentType: "application/json",
+        });
+        console.log(`STORAGE_KILLS ${JSON.stringify(report)}`);
+        reach.assertReached();
+      });
+});
+
+test.describe("rebuild core storage reopen at a million blobs (Gate A, opt-in)", () => {
+  const blobs = Number(process.env.MINNOW_NEXT_STORAGE_REOPEN_BLOBS ?? "1000000");
+  for (const [kind, layout] of [
+    ["opfs", "packed"],
+    ["indexeddb", "packed"],
+    ["indexeddb", "scattered"],
+  ] as const)
+    test(`${kind}, ${layout}: reopen time and its parts`, async ({ page, browserName }, info) => {
+      test.skip(
+        browserName !== "chromium" || process.env.MINNOW_NEXT_STORAGE_REOPEN !== "1",
+        "opt-in: MINNOW_NEXT_STORAGE_REOPEN=1, Chromium",
+      );
+      test.setTimeout(3_600_000);
+      await page.goto("/packages/core/browser/");
+      if (kind === "opfs") await requireWorkerOpfs(page);
+      const result = await page.evaluate(
+        async ([url, store, shape, count]) =>
+          ((await import(url)) as Run).runReopenBench(store, shape, count, 3),
+        [RUN, kind, layout, blobs] as const,
+      );
+      const report = { browser: browserName, store: kind, ...result };
+      await info.attach(`storage-reopen-${kind}-${layout}`, {
+        body: JSON.stringify(report, null, 2),
+        contentType: "application/json",
+      });
+      console.log(`STORAGE_REOPEN ${JSON.stringify(report)}`);
+      expect(result.reopens).toHaveLength(3);
+    });
 });

@@ -221,7 +221,17 @@ is access's `Snapshot`.
   each phase's storage work; OPFS's storage calls are synchronous, so kills land at their edges
   and the simulated physical crash sweeps cover the inside. 50 kills per store and browser in the
   browser lane, 1,000 per store in Chromium nightly (`npm run test:storage-kills`), with declared
-  reach (`STORAGE_KILL_REACH`, `STORAGE_KILL_EDGE_REACH`). `npm run benchmark:storage` records the
+  reach (`STORAGE_KILL_REACH`, `STORAGE_KILL_EDGE_REACH`).
+- Concurrent kill campaign: the same workload as lanes that run at once (two writers with their
+  builders, a pinned reader, the log, spill, settling reclaims), each operation still announced and
+  given a go at once, killed at random wall-clock moments; at the kill the page stops giving gos,
+  so everything the worker does before the kill takes effect was announced, and recovery accepts
+  the acknowledged root or any announced one. On IndexedDB kills land inside two to five
+  interleaved operations (reach `STORAGE_CONCURRENT_KILL_REACH`); OPFS's synchronous calls never
+  overlap at a kill, so `storage/chaos-crash.test.ts` runs the same workload in Node over the
+  simulated OPFS and IndexedDB stores, with every session call deferred by a task, and loses power
+  at a seeded physical step among interleaved operations (`STORAGE_CONCURRENT_CRASH_REACH`). The
+  workload and recovery live in `storage/chaos-workload.ts`. `npm run benchmark:storage` records the
   storage microbench nightly (docs: reference/testing).
 - `select.ts` (`chooseBackend`) picks OPFS where a dedicated worker can open sync handles, else
   IndexedDB only on the private modes' refusals (`SecurityError`, `UnknownError`,

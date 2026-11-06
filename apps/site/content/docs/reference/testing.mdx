@@ -1118,7 +1118,11 @@ posted before it died: before a step's storage work began, inside it, or after i
 same campaign runs 50 kills per store in every browser lane. It declares reach: on IndexedDB,
 kills must land inside writes, publishes, reclaims, log flushes, truncations and spills; OPFS's
 storage calls are synchronous, so there kills land at their edges, and the simulated power-loss
-sweeps cover what happens inside them. It
+sweeps cover what happens inside them. A concurrent mode runs the workload as lanes that operate
+at once (two writers, a reader holding a pin, the log, spill, reclaim) and kills at random
+wall-clock moments; on IndexedDB those kills land inside several interleaved operations, and a
+Node sweep (`chaos-crash.test.ts`) loses power under the same interleaved workload over the
+simulated stores. It
 prints one `STORAGE_KILLS` JSON line per store with the kill and phase table, which the nightly
 workflow saves as `browser-perf-results/storage-kills.jsonl`. A failure names its seed: set
 `MINNOW_SEED` to replay the same plan of kills (where each kill lands still depends on timing).

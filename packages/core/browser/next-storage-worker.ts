@@ -23,7 +23,19 @@ import {
   jsonReachable,
 } from "../src/next/storage/space-test-support.js";
 import { ScratchSpillService } from "../src/next/spill/scratch-spill.js";
-import { identity, runChaos, type ChaosExpect, type ChaosInjection } from "./next-storage-chaos.js";
+import {
+  identity,
+  runChaos,
+  type ChaosExpect,
+  type ChaosInjection,
+  type ChaosMode,
+} from "./next-storage-chaos.js";
+import {
+  buildReopenSpace,
+  measureIdbOpenRequests,
+  measureReopen,
+  type ReopenLayout,
+} from "./next-storage-reopen.js";
 
 /** Which backend an operation runs on (OPFS by default). */
 export type StoreKind = "opfs" | "indexeddb";
@@ -68,11 +80,20 @@ export type NextStorageRequest = { readonly store?: StoreKind } & (
   | { readonly op: "heavy-close" }
   | { readonly op: "microbench"; readonly dir: string }
   | {
+      readonly op: "reopen-build";
+      readonly dir: string;
+      readonly layout: ReopenLayout;
+      readonly blobs: number;
+    }
+  | { readonly op: "reopen-measure"; readonly dir: string }
+  | { readonly op: "reopen-idb-requests"; readonly dir: string }
+  | {
       readonly op: "chaos";
       readonly dir: string;
       readonly seed: number;
       readonly expect: ChaosExpect | null;
       readonly inject?: ChaosInjection;
+      readonly mode?: ChaosMode;
     }
 );
 
@@ -701,6 +722,18 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
     }
     case "microbench":
       return microbench(request.dir);
+    case "reopen-build":
+      return buildReopenSpace(await backendFor(request.dir), request.layout, request.blobs);
+    case "reopen-measure":
+      return measureReopen(await backendFor(request.dir));
+    case "reopen-idb-requests": {
+      const db = await openIndexedDb(indexedDB, `next-test:${request.dir}`);
+      try {
+        return await measureIdbOpenRequests(db);
+      } finally {
+        db.close();
+      }
+    }
     case "chaos": {
       const port = chaosPort;
       if (port === null) throw new Error("no chaos channel");
@@ -720,7 +753,10 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
               goes.set(sequence, resolve);
             }),
         },
-        request.inject ?? null,
+        {
+          ...(request.inject === undefined ? {} : { inject: request.inject }),
+          ...(request.mode === undefined ? {} : { mode: request.mode }),
+        },
       ).catch((error: unknown) => {
         port.postMessage({
           chaos: "failure",

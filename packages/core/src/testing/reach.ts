@@ -156,3 +156,27 @@ export const STORAGE_KILL_EDGE_REACH = [
   "at-truncate",
   "at-spill",
 ] as const;
+
+/**
+ * The concurrent storage kill campaign: kills at wall-clock moments must land while two or more
+ * operations are inside their storage work, in the interleavings the workload is built for.
+ */
+export const STORAGE_CONCURRENT_KILL_REACH = [
+  "two-or-more-in-operation",
+  "publish-with-log-flush",
+  "reclaim-with-read",
+  "write-with-write",
+  "spill-with-another",
+] as const;
+
+/**
+ * The concurrent workload under simulated power loss (storage/chaos-crash.test.ts): the crash must
+ * land while several operations are inside their storage work, data and log work among them.
+ */
+export const STORAGE_CONCURRENT_CRASH_REACH = [
+  "two-or-more-in-operation",
+  "three-or-more-in-operation",
+  "data-with-log",
+  "write-with-write",
+  "spill-with-another",
+] as const;
