@@ -34,7 +34,7 @@
       "id": "select.locking-clause",
       "status": "supported",
       "example": "SELECT region, amount FROM rows FOR UPDATE",
-      "notes": "FOR UPDATE, FOR NO KEY UPDATE, FOR SHARE, and FOR KEY SHARE, with OF, NOWAIT, or SKIP LOCKED, are accepted and ignored: row locks coordinate concurrent sessions, and a single-session engine has none to coordinate."
+      "notes": "FOR UPDATE, FOR NO KEY UPDATE, FOR SHARE, and FOR KEY SHARE, with OF, NOWAIT, or SKIP LOCKED, take no row locks. In READ ONLY transactions, a clause targeting a table or view is refused, including through FROM subqueries. An outer clause on a CTE reference or constant-only source is allowed."
     },
     {
       "id": "select.table-command",
