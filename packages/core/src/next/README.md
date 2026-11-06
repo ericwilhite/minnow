@@ -223,11 +223,12 @@ is access's `Snapshot`.
   worker announces each step and waits for the page's go, and posts when the step's storage work
   begins and returns, on its own channel; the backends post every platform request (an IndexedDB
   transaction once created and when it ends, an OPFS sync call) through a test-only observer. The
-  worker numbers every message and moves a counter in shared memory past each one it posts; the
+  worker numbers every message and atomically claims its number in shared memory before posting; the
   page reads the counter just before the kill and receives every message up to it before it
   judges anything (a message that never arrives fails the campaign), so it knows every
-  acknowledgement and failure posted before the kill. What the worker posts after the counter is
-  read is an unobserved tail, its operation left in flight for recovery to find done or not. The
+  acknowledgement and failure posted before the counter read. A claim interrupted before posting
+  fails the barrier deadline, rather than passing with a missing message; its operation has an
+  unknown outcome. What the worker claims after the counter is read is an unobserved tail, its operation left in flight for recovery to find done or not. The
   page is cross-origin isolated for this (`?isolated=1`). A kill lands before, inside (a platform
   request open), in the window (begun, no request open) or after a step's storage work. A page
   close takes its expectation at a boundary just before the close. Any failure the workload

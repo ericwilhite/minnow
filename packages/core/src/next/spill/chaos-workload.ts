@@ -9,10 +9,12 @@
  * Before each step the worker announces its intent and waits for the page's go; after it, it
  * reports its acknowledgement (a published root, a flushed log). The backends report every
  * platform request (`postingObserver`). Messages on one port arrive in order and are numbered; the
- * worker moves a shared counter past each one it posts, and the page, reading it just before the
- * kill, receives every message up to it (the observation barrier). So it knows every acknowledged
- * state posted before the kill, plus the steps in flight; anything posted after the read leaves
- * its step in flight. The next worker is handed that knowledge (`ChaosExpect`) and checks:
+ * worker atomically claims each number in a shared counter before posting. The page reads it just
+ * before the kill and receives every message up to it (the observation barrier), so it knows every acknowledged
+ * state posted before that read, plus the steps in flight; anything claimed after the read leaves
+ * its step in flight. A claim interrupted before posting fails the barrier deadline rather than
+ * passing with a missing acknowledgement; its operation has an unknown outcome. The next worker
+ * is handed that knowledge (`ChaosExpect`) and checks:
  * - **Root.** The recovered root is the last acknowledged one, or the one an in-flight publish was
  *   writing; its round and the identity of every blob (coordinates and checksum) match. Every blob
  *   it names reads back and verifies, and the free map is exact (`audit`).

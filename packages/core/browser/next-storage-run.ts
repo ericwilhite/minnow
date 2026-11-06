@@ -470,13 +470,13 @@ export function setChaosBarrierTimeout(ms: number): void {
 
 /**
  * What the page observed of a killed worker (review B1-p2g finding 1). The worker numbers every
- * campaign message and moves a shared counter past each one once it is posted; the page reads the
+ * campaign message and claims its number in shared memory before posting; the page reads the
  * counter just before the kill and receives every message up to it before it judges anything.
- * Messages posted after that read (while termination takes effect) are an unobserved tail: their
+ * Messages claimed after that read (while termination takes effect) are an unobserved tail: their
  * operations stay in flight in the expectation, so recovery may find them done or not.
  */
 export interface Observation {
-  /** Messages the worker had posted when the page decided the kill: every one was received. */
+  /** Claimed prefix at the kill decision (legacy name); every message was received. */
   readonly posted: number;
   /** Messages received before the page stopped observing (beyond `posted`: the tail seen). */
   readonly received: number;
@@ -669,8 +669,8 @@ const openRequests = (run: ChaosRun): string[] => [...run.requests.values()].sor
 const postedNow = (run: ChaosRun): number => Atomics.load(run.counter, 0);
 
 /**
- * The observation barrier: waits until every message up to `posted` has arrived (they were posted
- * before the kill, so they must; past `barrierMs` the campaign fails), then stops observing.
+ * The observation barrier: waits until every message up to `posted` has arrived (their numbers were claimed
+ * before the kill; past `barrierMs` the campaign fails, including a claim interrupted before post), then stops observing.
  */
 async function observeThrough(run: ChaosRun, posted: number): Promise<Observation> {
   if (run.received < posted)
@@ -685,7 +685,7 @@ async function observeThrough(run: ChaosRun, posted: number): Promise<Observatio
         run.waiters.delete(check);
         reject(
           new Error(
-            `observation barrier: the worker had posted ${String(posted)} campaign messages when ` +
+            `observation barrier: the worker had claimed ${String(posted)} campaign messages when ` +
               `it was killed, but only ${String(run.received)} arrived within ${String(barrierMs)} ms`,
           ),
         );
@@ -697,7 +697,7 @@ async function observeThrough(run: ChaosRun, posted: number): Promise<Observatio
   return { posted, received: run.received };
 }
 
-/** Terminates the worker after reading its counter, then observes everything posted before. */
+/** Terminates the worker after reading its counter, then observes the claimed prefix. */
 async function terminateObserved(run: ChaosRun): Promise<Observation> {
   const posted = postedNow(run);
   run.worker.terminate();
@@ -788,7 +788,7 @@ export async function chaosKillAfter(delayMs: number): Promise<ConcurrentLanding
     setTimeout(resolve, delayMs);
   });
   // No operation starts after this: everything the worker does until the kill takes effect was
-  // announced (what it posts after the counter is read is the unobserved tail).
+  // announced (claims after the counter read are the unobserved tail).
   run.hold = true;
   const observation = await terminateObserved(run);
   const failure = failed(run);
@@ -808,8 +808,8 @@ export async function chaosKillAfter(delayMs: number): Promise<ConcurrentLanding
 
 /**
  * The page-close boundary (review B1-p2f finding 2): the page stops answering intents, receives
- * every message the worker had posted when the boundary was taken, stops observing and returns;
- * the caller closes the page next. What the worker posts after (it lives until the page closes) is
+ * every message claimed when the boundary was taken, stops observing and returns;
+ * the caller closes the page next. What the worker claims after (it lives until the page closes) is
  * the unobserved tail: the step in flight may have completed (its root is accepted as pending).
  * A failure observed up to here rejects.
  */

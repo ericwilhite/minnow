@@ -1116,10 +1116,13 @@ and that the free-space audit is exact, then carries on. Any other outcome fails
 does any failure the workload reports while it runs. Each kill is classed by what the worker
 posted before it died: before a step's storage work began, inside it (a platform request, such as
 an IndexedDB transaction, was open), in its window (begun, but no request open), or after it
-returned. The worker numbers its messages and keeps a count of them in shared memory, which the
-page reads just before the kill; the page then waits for every message up to that count, so no
-acknowledgement or failure posted before the kill is missed (the test page is cross-origin
-isolated for this). The
+returned. The worker numbers its messages and atomically claims each number in shared memory
+before posting; the page reads that counter just before the kill; the page then waits for every message up to that count, so no
+acknowledgement or failure posted before that read is missed (the test page is cross-origin
+isolated for this). If a kill interrupts a claim before the post, the barrier deadline fails
+the campaign rather than passing with a missing message; the operation has an unknown outcome.
+Messages claimed after the read are an unobserved tail: recovery accepts their operations as
+pending, whether they completed or not. The
 same campaign runs 50 kills per store in every browser lane. It declares reach: on IndexedDB,
 kills must land inside writes, publishes, reclaims, log flushes, truncations and spills; OPFS's
 storage calls are synchronous, so a kill never stops one halfway: there kills must land at each

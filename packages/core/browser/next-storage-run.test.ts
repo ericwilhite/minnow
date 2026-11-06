@@ -1,12 +1,13 @@
+import { chaosPoster } from "./next-storage-post.js";
 /**
  * The kill campaign's page controller (next-storage-run.ts) under a scheduling double (review
  * B1-p2g findings 1–3): a Worker and MessageChannel whose campaign messages can be delivered late
  * (in order, as a port delivers), lost, or posted after the kill decision, with the worker's
- * posted-message counter in shared memory as in the browser. The controller is the exported one.
+ * claimed-message counter in shared memory as in the browser. The controller is the exported one.
  *
  * - A failure or a strict acknowledgement posted before the kill is received through the
  *   observation barrier however late it arrives; a message posted before the kill that never
- *   arrives fails the campaign loudly; what is posted after the counter is read is not waited for.
+ *   arrives fails the campaign loudly; claims after the counter read are not waited for.
  * - A step that posted `began` with no platform request open lands in its window, not inside it.
  * - The failure-path regression kills once the counter shows the injected failure posted.
  */
@@ -33,6 +34,7 @@ class PortDouble {
   #queue: Promise<void> = Promise.resolve();
   /** The delivery delay of a message posted on this end; Infinity: lost (and all after it). */
   delayOf: (data: unknown) => number = () => 0;
+  afterEnqueue: () => void = () => undefined;
 
   postMessage(data: unknown): void {
     const peer = this.peer;
@@ -42,6 +44,7 @@ class PortDouble {
       await sleep(delay);
       if (peer !== null && !peer.closed) peer.onmessage?.({ data });
     });
+    this.afterEnqueue();
   }
 
   close(): void {
@@ -93,14 +96,16 @@ class WorkerDouble {
     if (message.chaosPort !== undefined) {
       const port = message.chaosPort;
       const counter = new Int32Array(message.counter ?? new SharedArrayBuffer(4));
-      let posted = 0;
+      const post = chaosPoster(port, counter);
       const scripted: Scripted = {
         port,
         post: (chaos) => {
           if (this.#dead) return;
-          posted += 1;
-          port.postMessage({ ...chaos, n: posted });
-          Atomics.store(counter, 0, posted);
+          try {
+            post(chaos);
+          } catch (error) {
+            if (error !== PAUSED) throw error;
+          }
         },
         onGo: () => undefined,
         onTerminate: () => undefined,
@@ -144,6 +149,8 @@ afterEach(() => {
   Object.assign(globalThis, saved);
 });
 
+const PAUSED = new Error("worker paused after postMessage, before its next instruction");
+
 const ACKED: ChaosState = { round: 1, identity: "1:acked", generation: 1, flushed: 0 };
 
 describe("the observation barrier (finding 1)", () => {
@@ -173,6 +180,29 @@ describe("the observation barrier (finding 1)", () => {
     const landing = await chaosKillAfter(20);
     expect(landing.expect.state).toEqual(ACKED);
     expect(landing.observation.received).toBeGreaterThanOrEqual(landing.observation.posted);
+  });
+
+  it("requires a strict ack when interrupted between postMessage and the next instruction", async () => {
+    let postedAck!: () => void;
+    const ack = new Promise<void>((resolve) => {
+      postedAck = resolve;
+    });
+    scenario = (worker) => {
+      worker.post({ chaos: "intent", intent: { step: "publish", sequence: 1 } });
+      worker.onGo = () => {
+        worker.post({ chaos: "began", sequence: 1 });
+        worker.port.delayOf = () => 200;
+        worker.port.afterEnqueue = () => {
+          postedAck();
+          throw PAUSED;
+        };
+        worker.post({ chaos: "ack", state: ACKED });
+      };
+    };
+    await chaosBegin("indexeddb", "post-counter-gap", 1, null, null, "concurrent");
+    await ack;
+    const landing = await chaosKillAfter(0);
+    expect(landing.expect.state).toEqual(ACKED);
   });
 
   it("a message posted before the kill that never arrives fails the campaign loudly", async () => {

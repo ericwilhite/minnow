@@ -1,3 +1,4 @@
+import { chaosPoster } from "./next-storage-post.js";
 /**
  * The rebuild core's storage in a real dedicated worker over real OPFS sync access handles
  * (packages/core/src/next/storage). Driven by next-storage-run.ts through a small RPC; each
@@ -27,7 +28,6 @@ import {
   identity,
   postingObserver,
   runChaos,
-  type ChaosMessage,
   type ChaosExpect,
   type ChaosInjection,
   type ChaosMode,
@@ -823,14 +823,9 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
     case "chaos": {
       const port = chaosPort;
       if (port === null) throw new Error("no chaos channel");
-      // Every message is numbered, and the shared counter is moved past it once it is posted: the
-      // page reads the counter just before it kills this worker and then waits for exactly the
-      // messages posted up to there (review B1-p2g finding 1).
-      const post = (message: ChaosMessage) => {
-        posted += 1;
-        port.postMessage({ ...message, n: posted });
-        if (postedCounter !== null) Atomics.store(postedCounter, 0, posted);
-      };
+      // Claim each numbered message atomically BEFORE posting it (review B1-p2h-4).
+      // A kill between postMessage and the next instruction cannot hide a posted ack.
+      const post = chaosPoster(port, postedCounter);
       storageObserver = postingObserver(post);
       // A failure goes out on the campaign's channel too: a worker killed just after it still
       // delivers it there (the request's own reply may never leave a terminated worker).
@@ -892,12 +887,11 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
 
 /**
  * The page's answers to chaos intents (next-storage-chaos.ts), on the campaign's own channel:
- * what the worker posted on it before being killed still reaches the page.
+ * the page drains its claimed prefix before judging recovery (see chaosPoster).
  */
 const goes = new Map<number, () => void>();
 let chaosPort: MessagePort | null = null;
-/** Messages posted on the campaign's channel, and the counter the page reads (shared memory). */
-let posted = 0;
+/** Claimed campaign-message prefix that the page reads in shared memory. */
 let postedCounter: Int32Array | null = null;
 /** The running chaos workload's graceful step-down (next-storage-chaos.ts). */
 let chaosRelease: (() => Promise<StepDownRelease>) | null = null;
