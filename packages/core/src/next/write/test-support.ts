@@ -16,7 +16,7 @@ import { allocateSelection } from "../vector/validity.js";
 import { allocateFlat, type Batch, type FlatVector } from "../vector/vector.js";
 import { decodeUtf8, VarlenBuilder } from "../vector/varlen.js";
 import { MEMORY_CHUNK_ROWS } from "./columns.js";
-import { WritePathImpl } from "./engine.js";
+import { WritePathImpl, type EngineInput } from "./engine.js";
 import { reachableExtents } from "../format/reachable.js";
 import type { StorageBackend } from "../storage/contract.js";
 import type { ExtentSpace } from "../storage/extents.js";
@@ -83,6 +83,8 @@ export class Harness {
     readonly store: "sim" | "memory" = "sim",
     readonly memtableRows?: number,
     disk?: SimDisk,
+    /** Internal tuning beyond `memtableRows` (merges: engine.ts `EngineInput`). */
+    readonly tuning: Omit<NonNullable<EngineInput["tuning"]>, "memtableRows"> = {},
   ) {
     if (disk !== undefined) this.disk = disk;
     this.backend = store === "sim" ? new SimBackend(this.disk) : new MemoryBackend();
@@ -113,7 +115,10 @@ export class Harness {
         space: this.space,
         governor: this.governor,
         options: { durability: this.durability },
-        ...(this.memtableRows === undefined ? {} : { tuning: { memtableRows: this.memtableRows } }),
+        tuning: {
+          ...this.tuning,
+          ...(this.memtableRows === undefined ? {} : { memtableRows: this.memtableRows }),
+        },
       });
     } catch (error) {
       // A refused open leaves nothing held: the next open can take the lock.

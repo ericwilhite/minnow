@@ -18,7 +18,21 @@ import { Memtable, MEMTABLE_ROWS } from "./memtable.js";
  * make crash sweeps cross many flushes and publishes in a short scenario.
  */
 export type EngineInput = OpenWritePathInput & {
-  readonly tuning?: { readonly memtableRows?: number };
+  readonly tuning?: {
+    readonly memtableRows?: number;
+    /**
+     * Index run merges (merge.ts): `auto` (the default) merges whenever a level is in debt;
+     * `manual` only in `runMaintenance()`; `off` never (benchmark baselines). The policy fields
+     * shrink merges for tests.
+     */
+    readonly merges?: Partial<MergePolicy> & {
+      readonly mode?: "auto" | "manual" | "off";
+      /** Level-0 runs of one index at which writers wait for merges (default 3 × fan-in). */
+      readonly stallRuns?: number;
+    };
+    /** Tests: awaited by a flush after it wrote its groups, before it takes the publish lock. */
+    readonly beforeFlushPublish?: () => Promise<void>;
+  };
 };
 import { CatalogChangeError, type TableDef } from "../access/catalog.js";
 import { FROZEN_MEMTABLE_CAP_BYTES, MAX_LSN } from "../access/snapshot.js";
@@ -91,6 +105,18 @@ import { manifestReader, MetadataReader } from "../format/metadata-reader.js";
 import { readRows } from "./rows.js";
 import { encodeRun, RunReader, runRef } from "./runs.js";
 import { Sequences } from "./sequences.js";
+import {
+  DEFAULT_MERGE_POLICY,
+  levelZero,
+  MERGE_FIXED_BYTES,
+  MERGE_INPUT_BYTES,
+  MergeAbortedError,
+  mergeRuns,
+  planMerge,
+  runExtent,
+  type MergePlan,
+  type MergePolicy,
+} from "./merge.js";
 import { GroupDirectory } from "./groups.js";
 import {
   GroupDeletes,
@@ -106,6 +132,14 @@ import { need } from "./bytes.js";
 
 /** The write path's working memory admitted at open (scan buffer, key batches, metadata). */
 const MINIMUM_BYTES = RECOVERY_SCAN_BYTES + 4 * 1024 * 1024;
+
+/** One merge to run: every run of `plan.level` of one index. */
+interface MergeJob {
+  readonly state: TableState;
+  readonly indexId: number;
+  readonly plan: MergePlan;
+  readonly inputs: readonly RunRef[];
+}
 
 interface TableState {
   readonly tableId: number;
@@ -297,6 +331,51 @@ export class WritePathImpl implements WritePath, EngineHooks {
   readonly #memtableRows: number;
   /** True while open replays the log (no flush runs before the appender exists). */
   #recovering = true;
+  readonly #governor: EngineInput["governor"];
+  readonly #mergePolicy: MergePolicy;
+  readonly #mergeMode: "auto" | "manual" | "off";
+  readonly #stallRuns: number;
+  readonly #beforeFlushPublish: (() => Promise<void>) | null;
+  /** The merge chain (one merge at a time, beside the flush chain). */
+  #merges: Promise<void> = Promise.resolve();
+  #mergeScheduled = false;
+  /**
+   * The publish lock: a flush and a merge each build their root from the current state, publish
+   * and install it while holding it, so neither builds on a root the other is replacing.
+   */
+  #locked: Promise<void> = Promise.resolve();
+  /** Maintenance counters (benchmarks, tests): bytes written by flushes and merges, merges. */
+  readonly maintenance = {
+    flushes: 0,
+    /** Bytes every flush wrote (groups, runs, directory, catalog). */
+    flushBytes: 0,
+    /** Of those, index runs. */
+    flushRunBytes: 0,
+    flushRunEntries: 0,
+    merges: 0,
+    /** Merges whose inputs reached the oldest run (tombstones dropped). */
+    bottomMerges: 0,
+    /** Merges whose output was split into several runs. */
+    splitMerges: 0,
+    mergeEntriesIn: 0,
+    mergeEntriesOut: 0,
+    /** Entries a put and its tombstone cancelled. */
+    mergeCancelled: 0,
+    mergeBytes: 0,
+    /** Task yields merges took (R23 slices). */
+    mergeSlices: 0,
+    /** Flushes published while a merge was running. */
+    flushesDuringMerge: 0,
+    /** Merges published while a flush was writing (the flush then builds on the merged runs). */
+    mergesDuringFlush: 0,
+    /** Merges dropped at publish because their inputs changed (a drop). */
+    mergesAbandoned: 0,
+    mergeMs: 0,
+    mergesByLevel: [] as number[],
+  };
+  #merging = false;
+  /** Flushes writing their groups (started, not yet holding the publish lock). */
+  #flushesWriting = 0;
   /** Publications (flushes that reached a durable root). */
   publications = 0;
 
@@ -326,6 +405,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#metadataCaches = [caches.groupRoots, caches.groupPages, caches.groupIndexes];
     this.#metadata = new MetadataReader(input.space, caches);
     this.#governorCap = input.governor.capBytes;
+    this.#governor = input.governor;
+    const merges = input.tuning?.merges;
+    this.#mergePolicy = { ...DEFAULT_MERGE_POLICY, ...merges };
+    this.#mergeMode = merges?.mode ?? "auto";
+    this.#stallRuns = merges?.stallRuns ?? 3 * this.#mergePolicy.fanIn;
+    this.#beforeFlushPublish = input.tuning?.beforeFlushPublish ?? null;
     this.#now = input.options.now ?? Date.now;
     this.#root = root;
     this.#catalog = catalog;
@@ -415,6 +500,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       await engine.#recover();
       engine.#recovering = false;
       engine.#scheduleFlush();
+      engine.#scheduleMerge();
       return engine;
     } catch (error) {
       metadataGrant.close();
@@ -904,6 +990,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         for (const memtable of state.view.memtables) memtable.releaseAll();
         this.#chargeMetadata(-state.metadataBytes);
         state.metadataBytes = 0;
+        this.#dropRunReaders([...state.view.runs.values()].flat());
       });
   }
 
@@ -913,11 +1000,17 @@ export class WritePathImpl implements WritePath, EngineHooks {
     return memtable;
   }
 
-  /** Bytes charged for resident metadata: the root and every table's directory state. */
+  /**
+   * Bytes charged for the current generation's resident metadata: the root, every table's
+   * directory state, and the opened runs' resident parts.
+   */
   get residentMetadataBytes(): number {
     let total = this.#roots.get(this.#root)?.bytes ?? 0;
     for (const state of this.#tables.values())
       total += state.metadataBytes + state.view.groups.chargedBytes;
+    // The resident parts of the index runs opened (fences, block refs, Bloom filters).
+    for (const reader of this.#runReaders.values())
+      if (!(reader instanceof Promise)) total += reader.bytes;
     return total;
   }
 
@@ -1095,6 +1188,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#check();
     }
     if (this.#memtableBytes() > this.#memtableCap) await this.#relieve(0);
+    // Level-0 runs past their stall bound make writers wait for merges (merges never wait on
+    // writers, so this cannot deadlock).
+    while (this.#mergeMode === "auto" && this.#levelZeroMax() >= this.#stallRuns) {
+      this.#scheduleMerge();
+      await this.#merges;
+      this.#check();
+    }
     const tx = new TransactionImpl(this, this.appliedLsn);
     this.#holder = tx;
     return tx;
@@ -1193,10 +1293,17 @@ export class WritePathImpl implements WritePath, EngineHooks {
     for (;;) {
       await this.#appender.flush();
       await this.#flushes;
+      await this.#merges;
       this.#check();
-      if (this.#nextFlushReady() === null && this.#appender.durableLsn >= this.#appender.lastLsn)
+      const merging = this.#mergeMode === "auto" && this.#nextMerge() !== null;
+      if (
+        this.#nextFlushReady() === null &&
+        !merging &&
+        this.#appender.durableLsn >= this.#appender.lastLsn
+      )
         return;
       this.#scheduleFlush();
+      this.#scheduleMerge();
     }
   }
 
@@ -1290,7 +1397,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         memtableBytes += memtable.bytes;
         if (memtable.state === "frozen") frozen += 1;
       }
-      for (const list of state.view.runs.values()) runs += list.length;
+      for (const list of state.view.runs.values()) runs += levelZero(list);
     }
     const space = this.#space.stats;
     return {
@@ -1310,7 +1417,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
       garbageBytes: space.waitingBytes,
       pins: space.pinCount,
       oldestPin: space.oldestPin,
-      backpressure: this.#frozenBytes() > FROZEN_MEMTABLE_CAP_BYTES,
+      backpressure:
+        this.#frozenBytes() > FROZEN_MEMTABLE_CAP_BYTES ||
+        (this.#mergeMode === "auto" && this.#levelZeroMax() >= this.#stallRuns),
     };
   }
 
@@ -1342,6 +1451,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#holder?.rollback();
     for (const waiter of this.#queue.splice(0)) waiter.reject(new WritePathClosedError());
     await this.#flushes;
+    // A running merge stops at its next slice and aborts its writer.
+    await this.#merges;
     if (this.#appender.failure === null) await this.#appender.close();
     this.keys.close();
     for (const state of this.#tables.values())
@@ -1380,10 +1491,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (!(cached instanceof Promise)) this.#runsByRef.set(ref, cached);
       return cached;
     }
-    const opened = RunReader.open(this.#space, ref, this.#grant);
+    // Its resident parts are charged to the metadata grant before they are built (runs.ts).
+    const opened = RunReader.open(this.#space, ref, this.#grant, this.#metadataGrant);
     if (opened instanceof Promise) {
       const pending = opened.then((reader) => {
-        this.#runReaders.set(key, reader);
+        // A drop while it opened took the entry away: give the charge back.
+        if (this.#runReaders.get(key) === pending) this.#runReaders.set(key, reader);
+        else this.#chargeMetadata(-reader.bytes);
         return reader;
       });
       this.#runReaders.set(key, pending);
@@ -1458,6 +1572,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
     // Directory chunks and the root this publication made: it owns them until a state holds them.
     let created: GroupDirectory | null = null;
     let madeRoot: ManifestRoot | null = null;
+    let unlock: (() => void) | null = null;
+    this.#flushesWriting += 1;
+    let writing = true;
     try {
       const view = state.view;
       const newGroups: GroupRef[] = [];
@@ -1528,12 +1645,20 @@ export class WritePathImpl implements WritePath, EngineHooks {
         firstChanged,
         retired,
       );
+      // From here to the install, the root is built from the current state: a merge that
+      // published while this flush wrote its groups has replaced runs (`state.view.runs`, not the
+      // view this flush started from).
+      if (this.#beforeFlushPublish !== null) await this.#beforeFlushPublish();
+      unlock = await this.#lock();
+      this.#flushesWriting -= 1;
+      writing = false;
+      if (this.#merging) this.maintenance.flushesDuringMerge += 1;
       const runs = new Map<number, readonly RunRef[]>();
       for (const index of def.indexes) {
         const fresh = [...published.values()]
           .map((entry) => entry.runs.get(index.id))
           .filter((run): run is RunRef => run !== undefined);
-        runs.set(index.id, [...fresh.reverse(), ...(view.runs.get(index.id) ?? [])]);
+        runs.set(index.id, [...fresh.reverse(), ...(state.view.runs.get(index.id) ?? [])]);
       }
       const nextRowId = Math.max(state.nextRowId, ...newGroups.map((group) => group.lastRowId + 1));
       const tableRoot: TableRoot = {
@@ -1577,6 +1702,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
       }
       // A table dropped while the publish was in flight never holds the new page index: its own
       // charge went (or goes) with the drop, so the growth is refunded here.
+      this.maintenance.flushes += 1;
+      this.maintenance.flushBytes += writer.bytes;
+      for (const entry of published.values())
+        for (const run of entry.runs.values()) {
+          this.maintenance.flushRunBytes += runExtent(run).length;
+          this.maintenance.flushRunEntries += run.entryCount;
+        }
       const live = this.#tables.get(state.tableId) === state;
       if (live) state.metadataBytes = metadataBytes;
       else this.#chargeMetadata(-growth);
@@ -1650,6 +1782,202 @@ export class WritePathImpl implements WritePath, EngineHooks {
     } finally {
       created?.releaseCreation();
       if (madeRoot !== null) this.#releaseRoot(madeRoot);
+      unlock?.();
+      if (writing) this.#flushesWriting -= 1;
+    }
+    this.#scheduleMerge();
+  }
+
+  // ── Merges (merge.ts) ───────────────────────────────────────────────────────────────────
+
+  /** Takes the publish lock; resolves with its release. */
+  async #lock(): Promise<() => void> {
+    const previous = this.#locked;
+    let release!: () => void;
+    this.#locked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    return release;
+  }
+
+  #scheduleMerge(): void {
+    if (this.#mergeMode === "auto") this.#runMerges();
+  }
+
+  /** Runs merges until no level is in debt (any mode but `off`); resolves when they stop. */
+  runMaintenance(): Promise<void> {
+    this.#runMerges();
+    return this.#merges;
+  }
+
+  #runMerges(): void {
+    if (this.#mergeScheduled || this.#closed || this.#mergeMode === "off") return;
+    this.#mergeScheduled = true;
+    this.#merges = this.#merges.then(async () => {
+      this.#mergeScheduled = false;
+      for (;;) {
+        if (this.failure !== null || this.#closed) return;
+        const job = this.#nextMerge();
+        if (job === null) return;
+        try {
+          await this.#merge(job.state, job.indexId, job.plan, job.inputs);
+        } catch (error) {
+          if (error instanceof MergeAbortedError) return;
+          this.#failure ??= error instanceof Error ? error : new Error(String(error));
+          return;
+        }
+      }
+    });
+  }
+
+  /** The lowest level in debt across every table's indexes, or null. */
+  #nextMerge(): MergeJob | null {
+    let best: MergeJob | null = null;
+    for (const state of this.#tables.values()) {
+      const def = this.#catalog.table(state.tableId);
+      if (def === undefined || state.root === null) continue;
+      for (const index of def.indexes) {
+        const runs = state.view.runs.get(index.id) ?? [];
+        const plan = planMerge(runs, this.#mergePolicy.fanIn);
+        if (plan !== null && (best === null || plan.level < best.plan.level))
+          best = { state, indexId: index.id, plan, inputs: runs.slice(plan.from, plan.to) };
+      }
+    }
+    return best;
+  }
+
+  /** The most level-0 runs any index has (writers wait at `#stallRuns`). */
+  #levelZeroMax(): number {
+    let most = 0;
+    for (const state of this.#tables.values()) {
+      const def = this.#catalog.table(state.tableId);
+      if (def === undefined) continue;
+      for (const index of def.indexes)
+        most = Math.max(most, levelZero(state.view.runs.get(index.id) ?? []));
+    }
+    return most;
+  }
+
+  async #merge(
+    state: TableState,
+    indexId: number,
+    plan: MergePlan,
+    inputs: readonly RunRef[],
+  ): Promise<void> {
+    const started = performance.now();
+    const grant = await this.#governor.admit({
+      label: `merge t${String(state.tableId)} i${String(indexId)}`,
+      minimumBytes: MERGE_FIXED_BYTES + inputs.length * MERGE_INPUT_BYTES,
+      spillable: false,
+    });
+    // The encoder's buffers and the staging queue (the space charges leases and its own staging).
+    const working = MERGE_FIXED_BYTES - 512 * 1024;
+    if (!grant.allocate(working)) {
+      grant.close();
+      throw new RangeError("A merge's admitted grant cannot hold its working memory");
+    }
+    const writer = this.#space.beginWrite(`merge t${String(state.tableId)} i${String(indexId)}`, {
+      budget: grant,
+    });
+    let unlock: (() => void) | null = null;
+    let madeRoot: ManifestRoot | null = null;
+    this.#merging = true;
+    try {
+      const readers: RunReader[] = [];
+      for (const ref of inputs) readers.push(await this.#runReader(ref));
+      const output = await mergeRuns({
+        space: this.#space,
+        writer,
+        grant,
+        readers,
+        level: plan.level + 1,
+        bottom: plan.bottom,
+        policy: this.#mergePolicy,
+        stopped: () => this.#closed || this.failure !== null,
+      });
+      unlock = await this.#lock();
+      // The inputs must still be where they were: contiguous in the current list of a live table
+      // whose root holds the index (a drop or DROP INDEX meanwhile abandons the merge).
+      const current = state.view.runs.get(indexId) ?? [];
+      const at = current.indexOf(need(inputs[0]));
+      const root = state.root;
+      const holds =
+        root !== null &&
+        (root.keyIndex?.indexId === indexId ||
+          root.secondaryIndexes.some((index) => index.indexId === indexId));
+      if (
+        this.#tables.get(state.tableId) !== state ||
+        this.#catalog.table(state.tableId)?.indexes.some((index) => index.id === indexId) !==
+          true ||
+        !holds ||
+        at < 0 ||
+        inputs.some((run, k) => current[at + k] !== run)
+      ) {
+        await writer.abort();
+        this.maintenance.mergesAbandoned += 1;
+        return;
+      }
+      // Flushes only prepend: inputs that reached the oldest run still do.
+      const runs = [...current.slice(0, at), ...output.runs, ...current.slice(at + inputs.length)];
+      const withRuns = (index: IndexRoot): IndexRoot =>
+        index.indexId === indexId ? { ...index, runs } : index;
+      const tableRoot: TableRoot = {
+        ...root,
+        keyIndex: root.keyIndex === null ? null : withRuns(root.keyIndex),
+        secondaryIndexes: root.secondaryIndexes.map(withRuns),
+      };
+      const retired: ExtentRef[] = inputs.map(runExtent);
+      const next = await this.#nextRoot(writer, retired, new Map([[state.tableId, tableRoot]]));
+      const rootBytes = encodeManifestRoot(next);
+      const rootCharge = parseCharge(rootBytes.length);
+      this.#chargeMetadata(rootCharge);
+      this.#roots.set(next, { refs: 1, bytes: rootCharge });
+      madeRoot = next;
+      await this.#space.publish(rootBytes, { writers: [writer], retired });
+      this.#root = next;
+      this.#pruneCatalogs(next.globalLsn);
+      state.root = tableRoot;
+      const viewRuns = new Map(state.view.runs);
+      viewRuns.set(indexId, runs);
+      this.#setView(state, { ...state.view, runs: viewRuns });
+      // Readers older than this publication may still read the inputs (their pins keep the
+      // extents); the inputs' resident parts go once they close.
+      this.shared.readers.holdUntilOlderClose(() => {
+        this.#dropRunReaders(inputs);
+      });
+      const counters = this.maintenance;
+      counters.merges += 1;
+      if (this.#flushesWriting > 0) counters.mergesDuringFlush += 1;
+      if (plan.bottom) counters.bottomMerges += 1;
+      if (output.runs.length > 1) counters.splitMerges += 1;
+      counters.mergeEntriesIn += output.entriesIn;
+      counters.mergeEntriesOut += output.entriesOut;
+      counters.mergeCancelled += output.cancelled;
+      counters.mergeBytes += output.bytesWritten;
+      counters.mergeSlices += output.slices;
+      counters.mergesByLevel[plan.level] = (counters.mergesByLevel[plan.level] ?? 0) + 1;
+      counters.mergeMs += performance.now() - started;
+    } catch (error) {
+      if (writer.state === "open") await writer.abort().catch(() => undefined);
+      throw error;
+    } finally {
+      this.#merging = false;
+      if (madeRoot !== null) this.#releaseRoot(madeRoot);
+      unlock?.();
+      grant.close();
+    }
+  }
+
+  /** Forgets the resident parts of runs no view can reach any more, returning their charge. */
+  #dropRunReaders(runs: readonly RunRef[]): void {
+    for (const run of runs) {
+      const key = blobKey(run.entries);
+      const reader = this.#runReaders.get(key);
+      if (reader === undefined) continue;
+      this.#runReaders.delete(key);
+      // One still opening returns its charge when it resolves (#runReader sees it gone).
+      if (!(reader instanceof Promise)) this.#chargeMetadata(-reader.bytes);
     }
   }
 

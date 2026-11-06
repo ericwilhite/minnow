@@ -196,8 +196,9 @@ describe("crash sweep", () => {
     await harness.close();
   });
 
-  it("survives a crash at every physical step of commit, flush and publish", async () => {
-    const clean = new Harness("strict", "sim", MEMTABLE_ROWS);
+  /** Crashes `make(disk)`'s scenario at every step of a clean run's step count. */
+  async function sweep(make: (disk?: SimDisk) => Harness): Promise<void> {
+    const clean = make();
     await scenario(clean, { acked: new Map(), uncertain: new Map() });
     const steps = clean.disk.steps;
     // The scenario really crosses flushes: the clean store holds several published groups.
@@ -215,15 +216,14 @@ describe("crash sweep", () => {
       const disk = new SimDisk({ seed: at, crashAtStep: at });
       const outcome: Outcome = { acked: new Map(), uncertain: new Map() };
       try {
-        await scenario(new Harness("strict", "sim", MEMTABLE_ROWS, disk), outcome);
+        await scenario(make(disk), outcome);
       } catch (error) {
         // Any failure after the power loss is the dead world; one before it is a real bug.
         if (disk.steps <= at) throw error;
         crashes += 1;
       }
-      const recover = new Harness("strict", "sim", MEMTABLE_ROWS, disk);
       try {
-        await verify(recover, outcome);
+        await verify(make(disk), outcome);
       } catch (error) {
         throw new Error(`Crash at step ${String(at)} of ${String(steps)}: ${String(error)}`, {
           cause: error,
@@ -231,5 +231,32 @@ describe("crash sweep", () => {
       }
     }
     expect(crashes).toBeGreaterThan(steps / 2);
+    console.info(`crash sweep: ${String(steps)} steps, ${String(crashes)} crashed mid-scenario`);
+  }
+
+  it("survives a crash at every physical step of commit, flush and publish", async () => {
+    await sweep(
+      (disk) => new Harness("strict", "sim", MEMTABLE_ROWS, disk, { merges: { mode: "off" } }),
+    );
+  }, 1_800_000);
+
+  it("survives a crash at every physical step of index merges", async () => {
+    // Fan-in 2: every second flush merges, at every level; slices by entry count keep the
+    // interleaving of merges with commits the same in every run.
+    const make = (disk?: SimDisk) =>
+      new Harness("strict", "sim", MEMTABLE_ROWS / 2, disk, {
+        merges: { fanIn: 2, sliceEntries: 4 },
+      });
+    // The clean run merges at more than one level, and its publications retire merged runs.
+    const probe = make();
+    await scenario(probe, { acked: new Map(), uncertain: new Map() });
+    const path = await probe.open();
+    const t = path.catalog.tableByName("t")?.id ?? 0;
+    const levels = [...(path.state().tables.get(t)?.runs.values() ?? [])].flatMap((runs) =>
+      runs.map((run) => run.level),
+    );
+    expect(Math.max(...levels)).toBeGreaterThanOrEqual(2);
+    await probe.close();
+    await sweep(make);
   }, 1_800_000);
 });

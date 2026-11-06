@@ -3,14 +3,15 @@
  * sorted `(key, rowId, put | tombstone)` entries, written once, read through the extent space's
  * verified cache. Runs carry no seq: a run is visible to every view that pins its root (ruling).
  *
- * ## Stored form (one extent per run, parts back to back, every blob ≤ 1 MiB)
+ * ## Stored form (one extent per run, parts back to back from its start, every blob ≤ 1 MiB)
  * - **Blocks** of about `BLOCK_BYTES`: `u16 count`, `u16 offsets[count]` (each entry's start in the
  *   block), then entries `varuint keyLength, key, u32 rowId low, u16 rowId high, u8 flags`
  *   (bit 0 = tombstone). Entries are in (key bytes, rowId) order, so a block is binary-searched in
  *   place, never decoded.
  * - **Bloom partitions**: one Bloom filter per `PARTITION_BLOCKS` consecutive blocks over the keys
  *   with an entry in them (about 10 bits per key, 7 probes, double hashing over xxHash32 with two
- *   seeds): `u32 bits, u8 hashes`, then the bit array.
+ *   seeds): `u32 bits, u8 hashes`, then the bit array. Each follows the last block it covers, so a
+ *   run streams out in one pass (readers find every part through the index and directory).
  * - **Block index** (`RunRef.entries`): `varuint count`, then per block
  *   `varuint offset, varuint length, u32 checksum` within the run's extent.
  * - **Fences** (`RunRef.fences`): each block's first key: `varuint count`, then
@@ -29,17 +30,18 @@
  * the caller's budget only while the block is searched). `cursor` streams every entry in order
  * (merges, range scans).
  *
- * ## Writing (`RunBuilder`)
+ * ## Writing (`RunEncoder`; `RunBuilder` collects one in memory)
  * Entries are added in (key, rowId) order. A put and a tombstone of the same row id cancel (the
  * row was inserted and deleted within the merged layers); a run written to the bottom level also
  * drops the tombstones left (no older put can exist below it).
  */
 import type { BlobRef, RunRef } from "../format/manifest.js";
 import { xxHash32 } from "../hash/xxhash32.js";
+import { ParseBudgetError } from "../format/manifest-codec.js";
 import { StoreCorruptionError } from "../storage/contract.js";
 import type { ByteBudget, SpaceReader } from "../access/space.js";
 import { compareBytes } from "../vector/varlen.js";
-import { ByteReader, ByteWriter, need } from "./bytes.js";
+import { ByteReader, ByteWriter, copyRange, need } from "./bytes.js";
 import type { MaybePromise } from "../access/key-index.js";
 
 export const BLOCK_BYTES = 4096;
@@ -63,149 +65,262 @@ export interface SortedKey {
 const compare = (a: Uint8Array, b: Uint8Array): number =>
   compareBytes(a, 0, a.length, b, 0, b.length);
 
-function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length) return false;
-  for (let k = 0; k < a.length; k++) if (a[k] !== b[k]) return false;
-  return true;
-}
-
 /** The parts of one run, ready for `ExtentWriter.write`, and how to assemble its `RunRef`. */
 export interface EncodedRun {
-  /** Blocks, Bloom partitions, then the block index, fences and Bloom directory (last three). */
+  /** Blocks and Bloom partitions in stored order, then the block index, fences and Bloom directory. */
   readonly parts: readonly Uint8Array[];
   readonly entryCount: number;
   readonly minKey: Uint8Array;
   readonly maxKey: Uint8Array;
 }
 
-/** Streams sorted entries into a run (see "Writing"). */
-export class RunBuilder {
-  readonly #blocks: Uint8Array[] = [];
-  readonly #firstKeys: Uint8Array[] = [];
-  /** Bloom probes (h1, h2) of each block's distinct keys. */
-  readonly #blockHashes: number[][] = [];
-  #hashes: number[] = [];
+/** What a finished `RunEncoder` reports (its tail parts were emitted last). */
+export interface RunSummary {
+  readonly entryCount: number;
+  readonly minKey: Uint8Array;
+  readonly maxKey: Uint8Array;
+}
+
+/** Bytes of one entry as the block-fill rule counts them (a varuint length is at most 5). */
+const entrySize = (keyLength: number): number => 5 + keyLength + 7;
+
+/**
+ * Streams sorted entries into a run's parts (see "Writing"), synchronously: each finished block
+ * and Bloom partition is handed to `emit` at once, so a merge keeps only the block being filled,
+ * the current partition's key hashes, and the block index and fences (≤ 1 MiB each) in memory.
+ * Parts are placed back to back from offset 0 of the run's own extent, in emit order: blocks,
+ * each partition's Bloom filter after its last block, then the block index, fences and Bloom
+ * directory. Scratch (the pending entry, the last key, the block) belongs to the instance: two
+ * encoders never share it, and nothing of it is live across a caller's await (R23).
+ */
+export class RunEncoder {
+  readonly #emit: (part: Uint8Array) => void;
+  readonly #dropTombstones: boolean;
+  /** Offset of the next part within the run's extent. */
+  #offset = 0;
+  /** Per block: varuint offset, varuint length, u32 checksum (the count is prefixed at finish). */
+  readonly #index = new ByteWriter(4096);
+  /** Per block: its first key, length-prefixed. */
+  readonly #fences = new ByteWriter(4096);
+  /** Per partition: varuint offset, varuint length, u32 checksum. */
+  readonly #directory = new ByteWriter(64);
+  #blockCount = 0;
+  #partitions = 0;
+  #blocksInPartition = 0;
+  /** Bloom probes (h1, h2) of the current partition's keys, one pair per distinct key per block. */
+  #hashes = new Uint32Array(2048);
+  #hashCount = 0;
+  /** The block being filled: entries, and each entry's start. */
   readonly #block = new ByteWriter(BLOCK_BYTES + 512);
-  #offsets: number[] = [];
-  #firstKey: Uint8Array | null = null;
-  #lastBlockKey: Uint8Array | null = null;
-  #pending: { key: Uint8Array; rowId: number; tombstone: boolean } | null = null;
+  readonly #offsets = new Uint16Array(BLOCK_BYTES);
+  #count = 0;
+  /** The pending entry (held back so a put and its tombstone can cancel). */
+  #pendingKey = new Uint8Array(64);
+  #pendingLength = 0;
+  #pendingRowId = 0;
+  #pendingTombstone = false;
+  #hasPending = false;
+  /** The last emitted key, and whether it is in the block being filled. */
+  #lastKey = new Uint8Array(64);
+  #lastLength = 0;
+  #lastInBlock = false;
   #entryCount = 0;
   #minKey: Uint8Array | null = null;
-  #maxKey: Uint8Array | null = null;
+  /** Entries a put/tombstone pair cancelled (both counted). */
+  cancelled = 0;
 
-  constructor(readonly dropTombstones = false) {}
-
-  /** Adds one entry; `key` is copied. Entries must come in (key, rowId) order. */
-  add(key: Uint8Array, rowId: number, tombstone: boolean): void {
-    const pending = this.#pending;
-    if (pending !== null) {
-      if (
-        pending.rowId === rowId &&
-        pending.tombstone !== tombstone &&
-        sameBytes(pending.key, key)
-      ) {
-        this.#pending = null; // a put and its tombstone cancel
-        return;
-      }
-      this.#emit(pending);
-    }
-    this.#pending = { key: key.slice(), rowId, tombstone };
-  }
-
-  #emit(entry: { key: Uint8Array; rowId: number; tombstone: boolean }): void {
-    if (entry.tombstone && this.dropTombstones) return;
-    const key = entry.key;
-    if (key.length > BLOCK_BYTES / 2) throw new RangeError("An index key is longer than 2 KiB");
-    const size = 5 + key.length + 7;
-    if (
-      this.#offsets.length > 0 &&
-      (this.#block.length + size + (this.#offsets.length + 1) * 2 > BLOCK_BYTES ||
-        this.#offsets.length >= 0xfff0)
-    )
-      this.#flush();
-    if (this.#offsets.length === 0) this.#firstKey = key;
-    if (this.#lastBlockKey === null || !sameBytes(this.#lastBlockKey, key)) {
-      const [h1, h2] = bloomProbes(key);
-      this.#hashes.push(h1, h2);
-      this.#lastBlockKey = key;
-    }
-    this.#offsets.push(this.#block.length);
-    this.#block.varuint(key.length);
-    this.#block.raw(key);
-    this.#block.u32(entry.rowId % 2 ** 32);
-    this.#block.u16(Math.floor(entry.rowId / 2 ** 32));
-    this.#block.u8(entry.tombstone ? 1 : 0);
-    this.#entryCount += 1;
-    this.#minKey ??= key;
-    this.#maxKey = key;
-  }
-
-  #flush(): void {
-    const count = this.#offsets.length;
-    if (count === 0) return;
-    const header = 2 + count * 2;
-    const out = new Uint8Array(header + this.#block.length);
-    const view = new DataView(out.buffer);
-    view.setUint16(0, count, true);
-    this.#offsets.forEach((offset, k) => {
-      view.setUint16(2 + k * 2, header + offset, true);
-    });
-    out.set(this.#block.bytes.subarray(0, this.#block.length), header);
-    this.#blocks.push(out);
-    this.#firstKeys.push(this.#firstKey ?? new Uint8Array(0));
-    this.#blockHashes.push(this.#hashes);
-    this.#hashes = [];
-    this.#lastBlockKey = null;
-    this.#block.reset();
-    this.#offsets = [];
-    this.#firstKey = null;
+  constructor(emit: (part: Uint8Array) => void, dropTombstones = false) {
+    this.#emit = emit;
+    this.#dropTombstones = dropTombstones;
   }
 
   get entryCount(): number {
     return this.#entryCount;
   }
 
-  /** The finished run, or null when nothing remains. */
-  finish(): EncodedRun | null {
-    if (this.#pending !== null) this.#emit(this.#pending);
-    this.#pending = null;
-    this.#flush();
-    if (this.#entryCount === 0 || this.#minKey === null || this.#maxKey === null) return null;
-    const blocks = this.#blocks;
-    const partitions: Uint8Array[] = [];
-    for (let first = 0; first < blocks.length; first += PARTITION_BLOCKS)
-      partitions.push(encodeBloom(this.#blockHashes.slice(first, first + PARTITION_BLOCKS).flat()));
-    // Parts are placed back to back from the extent's start: offsets are prefix sums.
-    let offset = 0;
-    const index = new ByteWriter();
-    index.varuint(blocks.length);
-    for (const bytes of blocks) {
-      index.varuint(offset);
-      index.varuint(bytes.length);
-      index.u32(xxHash32(bytes));
-      offset += bytes.length;
+  /** Bytes the block index or the fences would take now (the larger): a run splits past a bound. */
+  get indexBytes(): number {
+    return Math.max(this.#index.length, this.#fences.length) + 8;
+  }
+
+  /** True when `bytes[start … end)` differs from the pending entry's key (or nothing is pending). */
+  differsFromPending(bytes: Uint8Array, start: number, end: number): boolean {
+    if (!this.#hasPending) return true;
+    return compareBytes(bytes, start, end, this.#pendingKey, 0, this.#pendingLength) !== 0;
+  }
+
+  /** Adds one entry, the key `bytes[start … end)` (copied). Entries must come in (key, rowId) order. */
+  add(bytes: Uint8Array, start: number, end: number, rowId: number, tombstone: boolean): void {
+    const length = end - start;
+    if (this.#hasPending) {
+      if (
+        this.#pendingRowId === rowId &&
+        this.#pendingTombstone !== tombstone &&
+        this.#pendingLength === length &&
+        compareBytes(bytes, start, end, this.#pendingKey, 0, length) === 0
+      ) {
+        this.#hasPending = false; // a put and its tombstone cancel
+        this.cancelled += 2;
+        return;
+      }
+      this.#emitPending();
     }
-    const directory = new ByteWriter();
+    if (length > this.#pendingKey.length)
+      this.#pendingKey = new Uint8Array(Math.max(length, this.#pendingKey.length * 2));
+    copyRange(this.#pendingKey, 0, bytes, start, end);
+    this.#pendingLength = length;
+    this.#pendingRowId = rowId;
+    this.#pendingTombstone = tombstone;
+    this.#hasPending = true;
+  }
+
+  #emitPending(): void {
+    this.#hasPending = false;
+    if (this.#pendingTombstone && this.#dropTombstones) return;
+    const key = this.#pendingKey;
+    const length = this.#pendingLength;
+    if (length > BLOCK_BYTES / 2) throw new RangeError("An index key is longer than 2 KiB");
+    if (
+      this.#count > 0 &&
+      (this.#block.length + entrySize(length) + (this.#count + 1) * 2 > BLOCK_BYTES ||
+        this.#count >= 0xfff0)
+    )
+      this.#closeBlock();
+    const same =
+      this.#lastLength === length && compareBytes(key, 0, length, this.#lastKey, 0, length) === 0;
+    if (this.#count === 0) {
+      this.#fences.varuint(length);
+      this.#fences.rawRange(key, 0, length);
+    }
+    if (!(this.#lastInBlock && same)) {
+      if (this.#hashCount + 2 > this.#hashes.length) {
+        const grown = new Uint32Array(this.#hashes.length * 2);
+        grown.set(this.#hashes);
+        this.#hashes = grown;
+      }
+      const probe = key.subarray(0, length);
+      this.#hashes[this.#hashCount++] = xxHash32(probe, 0) >>> 0;
+      this.#hashes[this.#hashCount++] = (xxHash32(probe, BLOOM_SEED) | 1) >>> 0;
+    }
+    this.#lastInBlock = true;
+    if (!same) {
+      if (length > this.#lastKey.length)
+        this.#lastKey = new Uint8Array(Math.max(length, this.#lastKey.length * 2));
+      copyRange(this.#lastKey, 0, key, 0, length);
+      this.#lastLength = length;
+    }
+    const block = this.#block;
+    this.#offsets[this.#count++] = block.length;
+    block.varuint(length);
+    block.rawRange(key, 0, length);
+    const rowId = this.#pendingRowId;
+    block.u32(rowId % 2 ** 32);
+    block.u16(Math.floor(rowId / 2 ** 32));
+    block.u8(this.#pendingTombstone ? 1 : 0);
+    this.#entryCount += 1;
+    this.#minKey ??= key.slice(0, length);
+  }
+
+  #closeBlock(): void {
+    const count = this.#count;
+    if (count === 0) return;
+    const header = 2 + count * 2;
+    const out = new Uint8Array(header + this.#block.length);
+    const view = new DataView(out.buffer);
+    view.setUint16(0, count, true);
+    for (let k = 0; k < count; k++)
+      view.setUint16(2 + k * 2, header + (this.#offsets[k] ?? 0), true);
+    out.set(this.#block.bytes.subarray(0, this.#block.length), header);
+    this.#index.varuint(this.#offset);
+    this.#index.varuint(out.length);
+    this.#index.u32(xxHash32(out));
+    this.#put(out);
+    this.#blockCount += 1;
+    this.#block.reset();
+    this.#count = 0;
+    this.#lastInBlock = false;
+    this.#blocksInPartition += 1;
+    if (this.#blocksInPartition === PARTITION_BLOCKS) this.#closePartition();
+  }
+
+  #closePartition(): void {
+    if (this.#blocksInPartition === 0) return;
+    const bloom = encodeBloom(this.#hashes, this.#hashCount);
+    this.#directory.varuint(this.#offset);
+    this.#directory.varuint(bloom.length);
+    this.#directory.u32(xxHash32(bloom));
+    this.#put(bloom);
+    this.#partitions += 1;
+    this.#blocksInPartition = 0;
+    this.#hashCount = 0;
+  }
+
+  #put(part: Uint8Array): void {
+    this.#offset += part.length;
+    this.#emit(part);
+  }
+
+  /**
+   * Emits what is left and the tail parts (block index, fences, Bloom directory: the run's last
+   * three blobs). Null when the run holds no entry (nothing at all was emitted then).
+   */
+  finish(): RunSummary | null {
+    if (this.#hasPending) this.#emitPending();
+    this.#closeBlock();
+    this.#closePartition();
+    const minKey = this.#minKey;
+    if (this.#entryCount === 0 || minKey === null) return null;
+    const index = new ByteWriter(this.#index.length + 8);
+    index.varuint(this.#blockCount);
+    index.rawRange(this.#index.bytes, 0, this.#index.length);
+    const fences = new ByteWriter(this.#fences.length + 8);
+    fences.varuint(this.#blockCount);
+    fences.rawRange(this.#fences.bytes, 0, this.#fences.length);
+    const directory = new ByteWriter(this.#directory.length + 16);
     directory.varuint(PARTITION_BLOCKS);
-    directory.varuint(partitions.length);
-    for (const bytes of partitions) {
-      directory.varuint(offset);
-      directory.varuint(bytes.length);
-      directory.u32(xxHash32(bytes));
-      offset += bytes.length;
-    }
-    const fences = new ByteWriter();
-    fences.varuint(this.#firstKeys.length);
-    for (const key of this.#firstKeys) fences.blob(key);
+    directory.varuint(this.#partitions);
+    directory.rawRange(this.#directory.bytes, 0, this.#directory.length);
     if (index.length > MAX_INDEX_BYTES || fences.length > MAX_INDEX_BYTES)
       throw new RangeError("An index run has more blocks than one run can index");
+    this.#put(index.finish());
+    this.#put(fences.finish());
+    this.#put(directory.finish());
     return {
-      parts: [...blocks, ...partitions, index.finish(), fences.finish(), directory.finish()],
       entryCount: this.#entryCount,
-      minKey: this.#minKey,
-      maxKey: this.#maxKey,
+      minKey,
+      maxKey: this.#lastKey.slice(0, this.#lastLength),
     };
+  }
+}
+
+/** Collects a whole run in memory (a flush's run: one memtable's delta). */
+export class RunBuilder {
+  readonly #parts: Uint8Array[] = [];
+  readonly #encoder: RunEncoder;
+
+  constructor(dropTombstones = false) {
+    this.#encoder = new RunEncoder((part) => this.#parts.push(part), dropTombstones);
+  }
+
+  /** Adds one entry; `key` is copied. Entries must come in (key, rowId) order. */
+  add(key: Uint8Array, rowId: number, tombstone: boolean): void {
+    this.#encoder.add(key, 0, key.length, rowId, tombstone);
+  }
+
+  /** `add` of the key `bytes[start … end)`. */
+  addRange(bytes: Uint8Array, start: number, end: number, rowId: number, tombstone: boolean): void {
+    this.#encoder.add(bytes, start, end, rowId, tombstone);
+  }
+
+  get entryCount(): number {
+    return this.#encoder.entryCount;
+  }
+
+  /** The finished run, or null when nothing remains. */
+  finish(): EncodedRun | null {
+    const summary = this.#encoder.finish();
+    if (summary === null) return null;
+    return { parts: this.#parts, ...summary };
   }
 }
 
@@ -235,13 +350,13 @@ function bloomProbes(key: Uint8Array): [number, number] {
   return [xxHash32(key, 0) >>> 0, (xxHash32(key, BLOOM_SEED) | 1) >>> 0];
 }
 
-function encodeBloom(hashes: readonly number[]): Uint8Array {
-  const keys = hashes.length / 2;
+function encodeBloom(hashes: Uint32Array, count: number): Uint8Array {
+  const keys = count / 2;
   const bits = Math.max(64, Math.ceil((keys * BLOOM_BITS_PER_KEY) / 8) * 8);
   const out = new Uint8Array(5 + bits / 8);
   new DataView(out.buffer).setUint32(0, bits, true);
   out[4] = BLOOM_HASHES;
-  for (let k = 0; k < hashes.length; k += 2) {
+  for (let k = 0; k < count; k += 2) {
     const h1 = hashes[k] ?? 0;
     const h2 = hashes[k + 1] ?? 0;
     for (let p = 0; p < BLOOM_HASHES; p++) {
@@ -316,6 +431,7 @@ export class RunReader {
     index: Uint8Array,
     partitionBlocks: number,
     blooms: readonly Uint8Array[],
+    charged: number,
   ) {
     const fenceReader = new ByteReader(fences);
     const fenceCount = fenceReader.varuint();
@@ -330,14 +446,51 @@ export class RunReader {
     this.#blooms = blooms.map(parseBloom);
     if (this.#blooms.length !== Math.ceil(fenceCount / partitionBlocks))
       throw new StoreCorruptionError("A run's Bloom partitions do not cover its blocks");
-    this.bytes =
-      this.#blooms.reduce((sum, bloom) => sum + bloom.array.byteLength, 0) +
-      this.#firstKeys.reduce((sum, key) => sum + key.byteLength + 48, 0) +
-      fenceCount * 64;
+    this.bytes = charged;
   }
 
-  /** Loads a run's resident parts (synchronously when they are all cached). */
-  static open(space: SpaceReader, ref: RunRef, budget: ByteBudget): MaybePromise<RunReader> {
+  /**
+   * The charge for a run's resident parts, from the raw bytes before anything is built: every
+   * Bloom partition, every fence key with its object (48 B), and each block's ref (64 B). It bounds
+   * what the constructor keeps (the partitions less their 5-byte headers, the keys less their
+   * length prefixes).
+   */
+  static residentCharge(fences: Uint8Array, blooms: readonly Uint8Array[]): number {
+    const count = new ByteReader(fences).varuint();
+    let total = fences.length + count * (48 + 64);
+    for (const bloom of blooms) total += bloom.length;
+    return total;
+  }
+
+  static #build(
+    ref: RunRef,
+    fences: Uint8Array,
+    index: Uint8Array,
+    partitionBlocks: number,
+    blooms: readonly Uint8Array[],
+    charge: ByteBudget,
+  ): RunReader {
+    const bytes = RunReader.residentCharge(fences, blooms);
+    if (!charge.allocate(bytes)) throw new ParseBudgetError(bytes);
+    try {
+      return new RunReader(ref, fences, index, partitionBlocks, blooms, bytes);
+    } catch (error) {
+      charge.free(bytes);
+      throw error;
+    }
+  }
+
+  /**
+   * Loads a run's resident parts (synchronously when they are all cached). Reads are leased on
+   * `budget`; the resident parts are charged to `charge` (`bytes`, `ParseBudgetError` on refusal)
+   * before they are built, and the caller frees `bytes` when it drops the reader.
+   */
+  static open(
+    space: SpaceReader,
+    ref: RunRef,
+    budget: ByteBudget,
+    charge: ByteBudget,
+  ): MaybePromise<RunReader> {
     const fences = space.peek(ref.fences);
     const index = space.peek(ref.entries);
     const directory = space.peek(ref.bloom);
@@ -345,7 +498,7 @@ export class RunReader {
       const { partitionBlocks, refs } = RunReader.#directory(ref, directory);
       const blooms = refs.map((blob) => space.peek(blob));
       if (blooms.every((bytes): bytes is Uint8Array => bytes !== null))
-        return new RunReader(ref, fences, index, partitionBlocks, blooms);
+        return RunReader.#build(ref, fences, index, partitionBlocks, blooms, charge);
     }
     return (async () => {
       const [fenceBytes, indexBytes, directoryBytes] = await readAll(
@@ -355,7 +508,14 @@ export class RunReader {
       );
       const { partitionBlocks, refs } = RunReader.#directory(ref, need(directoryBytes));
       const blooms = await readAll(space, refs, budget);
-      return new RunReader(ref, need(fenceBytes), need(indexBytes), partitionBlocks, blooms);
+      return RunReader.#build(
+        ref,
+        need(fenceBytes),
+        need(indexBytes),
+        partitionBlocks,
+        blooms,
+        charge,
+      );
     })();
   }
 
@@ -495,7 +655,11 @@ export class RunReader {
   }
 }
 
-/** Entry k's key range in a block, written into `located` (no allocation per probe step). */
+/**
+ * Entry k's key range in a block, written into `located` (no allocation per probe step). Module
+ * scratch, allowed by ruling R23 only because every use is inside one synchronous call
+ * (`searchBlock`, `forEachEntry` and its visitor) that never suspends.
+ */
 const located = { keyStart: 0, keyEnd: 0 };
 function locate(block: Uint8Array, view: DataView, k: number): typeof located {
   let at = view.getUint16(2 + k * 2, true);

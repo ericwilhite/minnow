@@ -4,6 +4,7 @@
  * when a deletion folds into one of its groups, retires exactly the directory extents no longer
  * used (the extent audit), and reopens with every row.
  */
+import { GroupDirectory } from "./groups.js";
 import { describe, expect, it } from "vitest";
 import { GROUPS_PER_PAGE, ParseBudgetError, parseCharge } from "../format/manifest-codec.js";
 import {
@@ -153,7 +154,8 @@ describe("resident directory memory (review B3-p2a-2 #1)", () => {
     }
     await path.quiesce();
     const grown = path.residentMetadataBytes;
-    expect(grown).toBeGreaterThanOrEqual(groups * 320);
+    // At least the directory's exact charge (groups.ts) on top of the root's.
+    expect(grown).toBeGreaterThanOrEqual(GroupDirectory.buildCharge(groups));
     // Each publish charged its growth on the grant itself.
     expect(metadata.grant?.allocated).toBe(grown);
     await harness.close();
