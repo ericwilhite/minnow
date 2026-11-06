@@ -40,6 +40,23 @@ const exportBaseline =
 export default defineConfig({
   plugins: [
     isolatedPages,
+    ...(process.env.MINNOW_EXPORT_READ_COMPARE === "1"
+      ? [
+          {
+            name: "export-read-call-candidate",
+            enforce: "pre" as const,
+            transform(source: string, id: string) {
+              if (!id.endsWith("/next/storage/extents.ts")) return;
+              const anchor = "export const MAX_READ_BYTES = 4 * MAX_SLAB;";
+              if (!source.includes(anchor)) throw new Error("Read bound anchor moved");
+              return source.replace(
+                anchor,
+                'export const MAX_READ_BYTES = Number(new URL(globalThis.location.href).searchParams.get("readMiB") ?? 4) * MAX_SLAB;',
+              );
+            },
+          },
+        ]
+      : []),
     ...(process.env.MINNOW_EXPORT_VARIANCE === "1"
       ? [
           {
@@ -67,8 +84,8 @@ export function xxHash32(bytes: Uint8Array, seed = 0, start = 0, end = bytes.len
       : [
           {
             name: "export-baseline",
-            enforce: "pre",
-            load(id) {
+            enforce: "pre" as const,
+            load(id: string) {
               const [file, query] = id.split("?");
               if (
                 file?.endsWith("/scripts/browser-perf/page/export-stream.ts") &&

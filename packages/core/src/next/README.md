@@ -565,6 +565,12 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     buffers and verify their views in place; OS cache residency does not switch on a blob copy.
     OPFS sync reads block this worker, so outstanding promises do not mean concurrent IO or
     decode/read overlap. The row window is also capped at one group, even when configured larger.
+  - `MINNOW_EXPORT_READ_COMPARE=1` tests a benchmark-only 8 MiB read-call candidate against
+    the current 4 MiB bound, five interleaved cold/warm rounds. Both use the existing 16 MiB
+    maximum pool class and 64 MiB idle cap, with normal lease charging. The isolated
+    `scripts/read-batch-bench.mts` runs full read/verify/release over contiguous and gapped
+    ranges in memory, with CPU/wall samples and charge checks. The candidate does not change
+    the engine's bound: fewer calls alone are not evidence of a faster export.
 - The checksum-load CPU hypothesis from the export profile is reproducible with
   `npx vite-node scripts/hash-load-bench.mts`: five rotating rounds in fresh processes, CPU and
   wall medians/min/max, aligned and unaligned inputs, byte offsets, stripe tails, and consumed

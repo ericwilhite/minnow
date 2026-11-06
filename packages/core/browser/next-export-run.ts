@@ -9,7 +9,10 @@ const DIR = "wide";
 let built: BuildResult | null = null;
 
 async function withWorker<T>(request: ExportRequest): Promise<T> {
-  const worker = new Worker(new URL("./next-export-worker.ts", import.meta.url), {
+  const url = new URL("./next-export-worker.ts", import.meta.url);
+  if (request.op === "export" && request.readMiB !== undefined)
+    url.searchParams.set("readMiB", String(request.readMiB));
+  const worker = new Worker(url, {
     type: "module",
   });
   try {
@@ -63,6 +66,7 @@ export async function exportPass(options: {
   readonly auditWorkingSet?: boolean;
   /** Bench-only comparison: both loop modules are imported before timing. */
   readonly baselineStream?: boolean;
+  readonly readMiB?: 4 | 8;
 }): Promise<ExportPass[]> {
   if (built === null) throw new Error("build the table first");
   const groups = built.groups.slice(0, options.groups ?? built.groups.length);
@@ -80,6 +84,7 @@ export async function exportPass(options: {
     ...(options.windowMiB === undefined ? {} : { windowMiB: options.windowMiB }),
     capMiB: options.capMiB,
     passes: options.passes,
+    ...(options.readMiB === undefined ? {} : { readMiB: options.readMiB }),
     ...(options.profile === true ? { profile: true } : {}),
     ...(options.profilePhases === true ? { profilePhases: true } : {}),
     ...(options.auditWorkingSet === false ? { auditWorkingSet: false } : {}),

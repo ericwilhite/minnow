@@ -9,7 +9,7 @@ import { BlobCache } from "../src/next/format/blob-cache.js";
 import { Governor, type EvictableCache } from "../src/next/memory/governor.js";
 import type { ChunkDirectory } from "../src/next/page/directory.js";
 import { GroupWriter } from "../src/next/page/writer.js";
-import type { ExtentRef, ExtentWriter } from "../src/next/storage/extents.js";
+import { MAX_READ_BYTES, type ExtentRef, type ExtentWriter } from "../src/next/storage/extents.js";
 import { createOpfsBackend, webLocks } from "../src/next/storage/opfs.js";
 import { openExtentSpace } from "../src/next/storage/space.js";
 import { countingBudget, jsonReachable } from "../src/next/storage/space-test-support.js";
@@ -57,6 +57,7 @@ export type ExportRequest =
       readonly auditWorkingSet?: boolean;
       /** Bench-only comparison: both loop modules are imported before timing. */
       readonly baselineStream?: boolean;
+      readonly readMiB?: 4 | 8;
     }
   | { readonly op: "remove"; readonly dir: string };
 
@@ -86,6 +87,7 @@ export interface ExportPass {
   readonly kept: { hot: string; scanned: string } | null;
   readonly phases?: ExportPhases;
   readonly baselineCommit?: string;
+  readonly readMiB: number;
 }
 
 const scope = self as unknown as {
@@ -213,6 +215,8 @@ async function build(dir: string, rows: number, distinct: number): Promise<Build
 }
 
 async function runExport(request: Extract<ExportRequest, { op: "export" }>): Promise<ExportPass[]> {
+  if (request.readMiB !== undefined && request.readMiB * MiB !== MAX_READ_BYTES)
+    throw new Error("Read candidate compiler is not enabled");
   if (request.profilePhases && request.passes !== 1)
     throw new Error("Phase profiling expects one pass");
   let stream = exportStream;
@@ -297,6 +301,7 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
     passes.push({
       ...(phases ? { phases: { ...phases } } : {}),
       ...(baselineCommit ? { baselineCommit } : {}),
+      readMiB: MAX_READ_BYTES / MiB,
       verifying: VERIFY_CACHED_BYTES,
       ...result,
       platformReads: space.stats.cache.platformReads - readsBefore,

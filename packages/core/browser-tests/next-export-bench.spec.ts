@@ -51,6 +51,7 @@ const WARM_SHARE = 0.98;
 const DISTINCT = Number(process.env.MINNOW_EXPORT_DISTINCT ?? 4);
 /** MINNOW_EXPORT_FOCUS=1: only Gate A's configuration (cold ×5, warm ×5, a profiled pass). */
 const COMPARE_STREAM = process.env.MINNOW_EXPORT_COMPARE_STREAM === "1";
+const READ_COMPARE = process.env.MINNOW_EXPORT_READ_COMPARE === "1";
 const VARIANCE = process.env.MINNOW_EXPORT_VARIANCE === "1";
 const PROFILE_ONLY = process.env.MINNOW_EXPORT_PROFILE_ONLY === "1" || VARIANCE;
 const FOCUS = process.env.MINNOW_EXPORT_FOCUS === "1";
@@ -301,6 +302,7 @@ interface Row {
   readonly residentBeforeMiB: number;
   readonly rows: number;
   readonly rowsPerSecond: number;
+  readonly readMiB: number;
   readonly seconds: number;
   readonly loadShare: number;
   readonly mbPerSecond: number;
@@ -453,6 +455,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
           : `${label.replace("warm", "partial residency")} (${(100 * share).toFixed(0)}% resident)`,
         residentBeforeMiB: Math.round(residentBefore / MiB),
         rows: pass.rows,
+        readMiB: pass.readMiB,
         rowsPerSecond: Math.round(pass.rows / (pass.ms / 1000)),
         seconds: Number((pass.ms / 1000).toFixed(1)),
         loadShare: Number((pass.loadMs / pass.ms).toFixed(2)),
@@ -475,7 +478,20 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     };
 
     const base = { once: true, capMiB: 512, passes: 1, groups: exported };
-    if (COMPARE_STREAM) {
+    if (READ_COMPARE) {
+      const options = { ...base, readaheadKiB: 256, windowMiB: WINDOW_MIB, auditWorkingSet: false };
+      for (let round = 0; round < 5; round++)
+        for (const readMiB of round % 2 === 0 ? ([4, 8] as const) : ([8, 4] as const)) {
+          await measure(`cold read ${String(readMiB)} MiB round ${String(round)}`, true, false, {
+            ...options,
+            readMiB,
+          });
+          await measure(`warm read ${String(readMiB)} MiB round ${String(round)}`, false, true, {
+            ...options,
+            readMiB,
+          });
+        }
+    } else if (COMPARE_STREAM) {
       const options = { ...base, readaheadKiB: 256, windowMiB: WINDOW_MIB, auditWorkingSet: false };
       for (let round = 0; round < 5; round++) {
         for (const baselineStream of round % 2 === 0 ? [true, false] : [false, true]) {
@@ -575,7 +591,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       });
     }
     // Where a warm pass spends its time: a CPU profile of the worker (CDP), by self time.
-    if (!PROFILE_ONLY && !COMPARE_STREAM)
+    if (!PROFILE_ONLY && !COMPARE_STREAM && !READ_COMPARE)
       await measure(`warm, window ${String(WINDOW_MIB)} MiB, profiled`, false, true, {
         ...base,
         readaheadKiB: 256,
