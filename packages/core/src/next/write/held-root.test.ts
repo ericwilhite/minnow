@@ -9,6 +9,7 @@
  * - a table dropped after that LSN stays in the root as it was (replay starts before the drop).
  */
 import { describe, expect, it } from "vitest";
+import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import { need } from "./bytes.js";
 import type { WritePathImpl } from "./engine.js";
 import {
@@ -36,14 +37,14 @@ async function createTable(path: WritePathImpl, name: string): Promise<number> {
   return t;
 }
 
-async function createIndex(path: WritePathImpl, t: number): Promise<number> {
+async function createIndex(path: WritePathImpl, t: number, name?: string): Promise<number> {
   const lsn = path.appliedLsn;
   await autocommit(path, (s) =>
     s.changeCatalog({
       kind: "createIndex",
       index: {
         tableId: t,
-        name: `t${String(t)}_v`,
+        name: name ?? `t${String(t)}_v`,
         columnIds: [need(path.catalog.table(t)?.columns[1]).id],
         unique: false,
         role: "secondary",
@@ -187,4 +188,95 @@ describe("roots an index build holds back", () => {
     await harness.space.audit();
     await harness.close();
   });
+});
+
+/** The index ids a table's root carries, and those its current catalog entry has (sorted). */
+function indexSets(path: WritePathImpl, t: number): { root: number[]; catalog: number[] } {
+  const table = path.state().root.tables.find((candidate) => candidate.tableId === t);
+  const root = [table?.keyIndex, ...(table?.secondaryIndexes ?? [])]
+    .filter((index) => index != null)
+    .map((index) => index.indexId)
+    .sort((a, b) => a - b);
+  const catalog = (path.catalog.table(t)?.indexes ?? [])
+    .map((index) => index.id)
+    .sort((a, b) => a - b);
+  return { root, catalog };
+}
+
+describe("an empty table's index replaced (review B3-p2b-4 D2)", () => {
+  let names = 0;
+  const fresh = () => `i${String(++names)}`;
+  async function setUp() {
+    const harness = new Harness("strict", "memory", 2, undefined, { merges: { mode: "off" } });
+    const path = await harness.open();
+    const t = await createTable(path, "t");
+    const u = await createTable(path, "u");
+    let next = 1;
+    // A publication through u (two commits: the first fills a memtable and flushes whole).
+    const publish = async (on: WritePathImpl) => {
+      await insert(on, u, [next++, next++]);
+      await insert(on, u, [next++]);
+      await on.quiesce();
+    };
+    return { harness, path, t, publish };
+  }
+
+  it("drop and create of the same count keeps the new index (the reviewer's probe, with reopen)", async () => {
+    const { harness, path, t, publish } = await setUp();
+    await createIndex(path, t, "old");
+    await publish(path);
+    const old = need(path.catalog.table(t)?.indexes.find((index) => index.name === "old")).id;
+    await autocommit(path, (s) => s.changeCatalog({ kind: "dropIndex", indexId: old }));
+    await createIndex(path, t, "new");
+    await publish(path);
+    const sets = indexSets(path, t);
+    expect(sets.root).toEqual(sets.catalog);
+    expect(sets.root).not.toContain(old);
+    await harness.space.audit();
+    const reopened = await harness.reopen();
+    const again = indexSets(reopened, t);
+    expect(again.root).toEqual(again.catalog);
+    await publish(reopened);
+    expect(indexSets(reopened, t).root).toEqual(again.catalog);
+    await harness.close();
+  });
+
+  const SEEDS = seedsFor("next-write-quiet-index-replace", [831, 832, 833, 834]);
+  for (const seed of SEEDS)
+    it(`creates, drops and replacements on a quiet table keep root and catalog equal (seed ${String(seed)})`, async () => {
+      const random = mulberry32(seed);
+      const { harness, t, publish } = await setUp();
+      let path = harness.path;
+      let replaced = 0;
+      for (let step = 0; step < 24; step++) {
+        const indexes = (path.catalog.table(t)?.indexes ?? []).filter(
+          (index) => index.role === "secondary",
+        );
+        const roll = random();
+        if (roll < 0.4 || indexes.length === 0) await createIndex(path, t, fresh());
+        else if (roll < 0.7) {
+          const victim = need(indexes[Math.floor(random() * indexes.length)]);
+          await autocommit(path, (s) => s.changeCatalog({ kind: "dropIndex", indexId: victim.id }));
+        } else {
+          // Replacement: a drop and a create between two publications (same count).
+          const victim = need(indexes[Math.floor(random() * indexes.length)]);
+          await autocommit(path, (s) => s.changeCatalog({ kind: "dropIndex", indexId: victim.id }));
+          await createIndex(path, t, fresh());
+          replaced += 1;
+        }
+        await publish(path);
+        const sets = indexSets(path, t);
+        expect(sets.root, `seed ${String(seed)} step ${String(step)}`).toEqual(sets.catalog);
+        if (random() < 0.2) {
+          path = await harness.reopen();
+          const again = indexSets(path, t);
+          expect(again.root, `seed ${String(seed)} step ${String(step)} reopened`).toEqual(
+            again.catalog,
+          );
+        }
+      }
+      expect(replaced).toBeGreaterThan(2);
+      await harness.space.audit();
+      await harness.close();
+    });
 });

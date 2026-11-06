@@ -2855,7 +2855,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         // drop and its frames name the table, so the root keeps the table as the previous root
         // had it, and its extents stay reachable until a root covers the drop.
         const kept = this.#root.tables.find((previous) => previous.tableId === def.id);
-        if (kept !== undefined) tables.push(withCatalogIndexes(kept, def));
+        if (kept !== undefined) tables.push(withCatalogIndexes(kept, def, true));
         else tables.push(emptyTableRoot(def, 1, globalLsn));
         continue;
       }
@@ -2867,6 +2867,18 @@ export class WritePathImpl implements WritePath, EngineHooks {
       );
       state.root = root;
       tables.push(root);
+    }
+    // The root agrees with its catalog (format/manifest.ts "Checkpoints and replay"): every table
+    // root has every index its catalog entry has (review B3-p2b-4 D2).
+    for (const table of tables) {
+      const def = catalog.table(table.tableId);
+      const has = new Set(
+        [table.keyIndex, ...table.secondaryIndexes]
+          .filter((index): index is IndexRoot => index !== null)
+          .map((index) => index.indexId),
+      );
+      if (def?.indexes.some((index) => !has.has(index.id)) === true)
+        throw new TypeError("A root's table must carry every index its catalog has");
     }
     // Indexes a table's previous root had and its new root lacks were dropped: their runs go.
     // (Found by the R25 delta test: they were left allocated and unreachable.)
@@ -2947,7 +2959,13 @@ function withCatalogIndexes(root: TableRoot, def: TableDef, addBuilt = false): T
       )
         secondaryIndexes.push(need(indexRoot(def, index.id, new Map())));
   }
-  if (keyIndex === root.keyIndex && secondaryIndexes.length === root.secondaryIndexes.length)
+  // Unchanged only if every index root is the same one (review B3-p2b-4 D2: a drop and a create
+  // of the same count is a change).
+  if (
+    keyIndex === root.keyIndex &&
+    secondaryIndexes.length === root.secondaryIndexes.length &&
+    secondaryIndexes.every((index, k) => index === root.secondaryIndexes[k])
+  )
     return root;
   return { ...root, keyIndex, secondaryIndexes };
 }
