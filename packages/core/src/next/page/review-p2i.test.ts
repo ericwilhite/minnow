@@ -17,7 +17,9 @@ import type { FlatVector } from "../vector/vector.js";
 import { decodeRange, parsePage } from "./decode.js";
 import { encodeFloatPage, PageScratch } from "./encode.js";
 import { PageCorruptionError, ValueTag } from "./format.js";
+import { ChunkReader } from "./reader.js";
 import { DistinctSketch } from "./sketch.js";
+import { defined, targetFor, writeGroup } from "./test-support.js";
 
 /** Encodes `values` as one float64 page and decodes it as a reader does, into raw bits. */
 function roundTrip(values: Float64Array): { encoding: number; bits: BigUint64Array } {
@@ -91,5 +93,27 @@ describe("review B2-p2i #2: every float64 bit pattern, constant pages included",
       expect(encoding).toBe(PageEncoding.constant);
       expect([...new Set(bits)]).toEqual([pattern]);
     }
+  });
+});
+
+describe("review B2-p2i #3: loadTogether with a reader more than once", () => {
+  it("installs each page once and gives every charge back (the probe, inverted)", async () => {
+    const { space, group } = await writeGroup([
+      { type: { kind: "float64" }, values: Array.from({ length: 128 }, (_, i) => i / 100) },
+    ]);
+    let used = 0;
+    const budget = {
+      allocate: (n: number) => ((used += n), true),
+      free: (n: number) => void (used -= n),
+    };
+    const reader = await ChunkReader.open(space, defined(group.columns[0]), { budget, once: true });
+    await ChunkReader.loadTogether([
+      { reader, pages: [0] },
+      { reader, pages: [0] },
+    ]);
+    const target = targetFor(reader, 128, 0);
+    reader.decodeRange(0, 128, target, 0);
+    reader.close();
+    expect(used).toBe(0);
   });
 });

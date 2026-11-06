@@ -559,7 +559,8 @@ export class ChunkReader {
    * over every column becomes a few large, nearly sequential reads). Every page is installed in
    * its own reader as `load` would install it, holding its share of the shared lease. Readers
    * must share the first reader's space, budget and `once`; one that does not, that needs its
-   * dictionary, or that has gzip pages to load, loads on its own (`load`). Resolves when every
+   * dictionary, or that has gzip pages to load, loads on its own (`load`). A reader may appear
+   * more than once, with overlapping pages: its requests are merged. Resolves when every
    * page is loaded; a reader closed meanwhile only loses its own pages (its loads give back what
    * they read, as `close` says), and other errors reject.
    */
@@ -571,15 +572,28 @@ export class ChunkReader {
     const waits: Array<PromiseLike<void>> = [];
     const jobs: TogetherJob[] = [];
     const missingOf = new Map<ChunkReader, number[]>();
+    // One page set per reader before any work (review B2-p2i #3): a reader named twice, or
+    // overlapping page arrays, must not install a page twice (the second install would drop
+    // the first's lease share without releasing it).
+    const merged = new Map<ChunkReader, Set<number>>();
     for (const { reader, pages } of loads) {
       if (reader.#closed) throw new ReaderClosedError();
+      let set = merged.get(reader);
+      if (set === undefined) {
+        set = new Set();
+        merged.set(reader, set);
+      }
+      for (const page of pages) set.add(page);
+    }
+    for (const [reader, requested] of merged) {
+      const pages = [...requested];
       const entries = reader.directory.pages;
       const missing: number[] = [];
       let alone =
         reader.#space !== first.#space ||
         reader.#options.budget !== first.#options.budget ||
         (reader.#options.once === true) !== (first.#options.once === true);
-      for (const index of new Set(pages)) {
+      for (const index of pages) {
         const entry = entries[index];
         if (entry === undefined) throw new RangeError("Page index outside the chunk");
         if (isDictionary(entry) && reader.#dictionary === null) alone = true;

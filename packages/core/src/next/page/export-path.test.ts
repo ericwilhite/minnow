@@ -183,6 +183,7 @@ const reach = createReach("next-export-path", [
   "a reader loading alone (dictionary)",
   "a reader closed before the shared load settles",
   "pages already loaded",
+  "a reader requested twice with overlapping pages",
 ]);
 afterAll(() => {
   reach.assertReached();
@@ -286,6 +287,15 @@ describe.each(SEEDS)("export read path (seed %i)", (seed) => {
           }
           const closed = (picks[1] ?? 0) % 3 === 0 ? readers.length - 1 : -1;
           const loads = readers.map((reader, k) => ({ reader, pages: wanted[k] ?? [] }));
+          // Readers named more than once, with overlapping pages (review B2-p2i #3): the
+          // requests merge, each page is installed once, and every charge comes back.
+          for (const [k, reader] of readers.entries()) {
+            const pages = wanted[k] ?? [];
+            if (pages.length === 0 || ((picks[k % picks.length] ?? 0) + k) % 2 !== 0) continue;
+            loads.push({ reader, pages: pages.slice(0, Math.ceil(pages.length / 2)) });
+            loads.push({ reader, pages: [...pages].reverse().slice(0, 2) });
+            reach.reach("a reader requested twice with overlapping pages");
+          }
           if (
             loads.some(({ reader, pages }) =>
               pages.some((page) =>
