@@ -26,7 +26,7 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | `page/`            | format                           | Page codecs, page directory and statistics, streaming group writer, chunk reader (ChunkPages), inflated-page cache                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `spill/`           | executor (OPFS service: storage) | Spill contract (one long-lived scratch file, batching charged to the operator's budget); in-memory double                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `memory/`          | executor                         | Memory governor: admission, progress loans, held vs allocated bytes (reference implementation)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `exec/`            | executor                         | Entry point (`executor.ts`), result frames (`result.ts`), scans (`scan.ts`, `memory-scan.ts`), table rules (`rules.ts`), push driver (`pipeline.ts`), fetcher (`fetch.ts`), expression kernels (`kernels/`), filter and project (`filter.ts`), aggregation (`agg/`), comparators, decimal SUM                                                                                                                                                                                                                                                                                                                                                    |
+| `exec/`            | executor                         | Entry point (`executor.ts`), result frames (`result.ts`), scans (`scan.ts` contract, `table-scan.ts`, `memory-scan.ts`, `column-target.ts`, the pushdown seam `pushdown.ts`), table rules (`rules.ts`), push driver (`pipeline.ts`), fetcher (`fetch.ts`), expression kernels (`kernels/`), filter and project (`filter.ts`), aggregation (`agg/`), comparators, decimal SUM                                                                                                                                                                                                                                                                     |
 | `ir/`              | lowering, executor               | Operator IR (`ir.ts`); scalar function and operator table (`functions.ts`); table rules in IR form (`rules.ts`); executor costs the planner reads (`costs.ts`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `access/`          | write path + key index           | Storage access contracts the write path implements: snapshots and segments, catalog, key-index probes and ranges, `modify` (rows, conflicts, RETURNING), transactions, group commit, sequences, delivery                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `testing/`         | all                              | Differential-harness adapter for a partial new core; stand-ins for the write path and executor that the owner's composition runs over, with real lowering, until those tracks land (`owner-standins.ts`), an in-memory Web Locks for election tests (`fake-locks.ts`)                                                                                                                                                                                                                                                                                                                                                                            |
@@ -607,6 +607,33 @@ and the owner import it directly.
 - NUMERIC division and modulo (`decimal-div.ts`, `DecimalDivNode`): PostgreSQL's result scale
   (`select_div_scale`: at least 16 significant digits, capped at 1000), rounded half away from
   zero; 128-bit limbs while the scaled operands fit, BigInt past that.
+
+### Table scan (`exec/table-scan.ts`, `exec/pushdown.ts`, `exec/column-target.ts`)
+
+- One table of a snapshot, every segment in row-id order, batches of at most 2,048 rows and about
+  1 MiB, the scan's columns in output order (plus a locator column for late materialization).
+- Group segments: prune → pushed predicates → decode the selected positions. The filter's
+  conjuncts that compare one column with constants (comparisons, `IN`, `IS [NOT] NULL`) go to the
+  page format: groups whose statistics rule one out are skipped unread, then per range the live
+  rows are narrowed by `select` / `refine` on encoded pages, loading only the pages a predicate
+  cannot rule out. The rest of the filter (the residual) runs on decoded values.
+- At or above 40 % of a range selected, columns decode densely and keep the selection; below it
+  only the selected positions are gathered. With a residual, its columns decode first and the
+  others only for the rows it keeps.
+- Out-of-line values are loaded for exactly what is decoded and released when the batch's borrow
+  ends. Batches are sized from full value lengths before any value is read; one row larger than
+  the target is a batch of its own, and if the grant refuses even that row the scan borrows a
+  progress loan (R18.3) and repays it when the batch is released.
+- The pushdown seam (`pushdown.ts`): the format track's encoded-page evaluation
+  (`compilePredicate`, `pagesMatching`, `select`, `refine`, `selectMask`, `chunkMayMatch`) is used
+  when the chunk reader has it; otherwise, and for any predicate it does not compile, the same
+  comparison runs on decoded values with the executor's kernels. Semantics are PostgreSQL's
+  either way, so where a conjunct runs never changes the answer.
+- Memory segments are read through `memory-scan.ts` (one lent chunk at a time, zero copy), the
+  whole filter as the residual.
+- `table-scan.test.ts` checks generated tables (groups through the page writer, memory segments,
+  deletions, columns some groups predate, values stored out of line) and filters against the
+  same scan with pushdown off (decode-then-filter), and that against the source rows.
 
 ### Aggregation (`exec/agg/`)
 

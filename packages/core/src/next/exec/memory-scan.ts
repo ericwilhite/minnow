@@ -58,6 +58,9 @@ export class MemorySegmentScan implements BatchSource {
   /** The current segment's deletions; undefined until read. */
   #deletions: DeletionVector | null | undefined = undefined;
   #aborted = false;
+  /** Where the last batch came from: its segment and the position of its slot 0. */
+  #lastSegment = -1;
+  #lastStart = 0;
 
   /**
    * `columnIds` are declared columns of the table snapshot; `out[c]` are the scan's own buffers
@@ -160,6 +163,8 @@ export class MemorySegmentScan implements BatchSource {
       );
     }
     const selection = this.#select(start - firstRow, end - start, length);
+    this.#lastSegment = this.#segments[this.#segment]?.index ?? -1;
+    this.#lastStart = this.#chunk * MEMORY_CHUNK_ROWS + firstRow;
     if (end === length) {
       this.#chunk += 1;
       this.#start = 0;
@@ -188,6 +193,16 @@ export class MemorySegmentScan implements BatchSource {
       for (let k = 0; k < selection.count; k++)
         selection.rows[k] = (selection.rows[k] ?? 0) + offset;
     return selection;
+  }
+
+  /** The segment (`Segment.index`) the last batch came from (locators). */
+  get lastSegment(): number {
+    return this.#lastSegment;
+  }
+
+  /** The segment position of the last batch's slot 0: slot k is position `lastStart + k`. */
+  get lastStart(): number {
+    return this.#lastStart;
   }
 
   abort(): void {

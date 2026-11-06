@@ -81,7 +81,24 @@ export interface ChunkPages {
   isDictionaryRange(from: number, to: number): boolean;
   /** Whether int64-family values over pages `[first, end)` fit the f64 `safe` representation. */
   isSafe(first?: number, end?: number): boolean;
-  /** Varlen bytes a target needs for rows `[from, to)`, or for the selected rows. */
+  /**
+   * Out-of-line values (page/large-value.ts): a decode reaching such a row needs it loaded first,
+   * for a range or for the selected rows; values stay leased until `releaseValues` (all, or the
+   * named rows), `release` of their page or `close`.
+   */
+  loadValues(from: number, to: number): MaybePromise<void>;
+  loadValuesOf(rows: GroupRows, start?: number, end?: number): MaybePromise<void>;
+  releaseValues(rows?: readonly number[]): void;
+  /** What a decimal target needs: the chunk's one scale (null: per-slot scales), … */
+  readonly directory: { readonly scale: number | null };
+  /** … 128-bit coefficients, … */
+  readonly needsInt128: boolean;
+  /** … and NaN / ±Infinity flags. */
+  readonly hasDecimalSpecials: boolean;
+  /** Releases everything the reader holds (pages, values, the parsed directory). */
+  close(): void;
+  /** Varlen bytes a target needs for rows `[from, to)`, or for the selected rows (full value
+   * lengths, out-of-line values included, so a batch can be sized before anything is loaded). */
   varlenBytes(from: number, to: number): number;
   gatherBytes(rows: GroupRows, start?: number, end?: number): number;
   /** Decoding is synchronous over loaded pages, into the caller's target from slot `at`. */
