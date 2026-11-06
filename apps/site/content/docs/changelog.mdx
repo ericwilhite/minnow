@@ -78,6 +78,10 @@ b.id = a.id)` was false when no row of `b` matched. An aggregate without `GROUP 
   PostgreSQL does. The same holds for `HAVING` and unknown table qualifiers. `count(z.*)` over
   a table `z` that is not in the `FROM` clause now fails with "missing FROM-clause entry for
   table" instead of counting rows.
+- **Clearer errors for calls with arguments their function does not take.** `now(1)` and
+  `row_number(1) OVER ()` failed with "Expected )"; they now say the function takes no
+  arguments, `rank(1) OVER ()` says it needs `WITHIN GROUP`, and `CURRENT_TIMESTAMP(3)` says a
+  precision is not supported.
 - **Block comments nest**, as in PostgreSQL: `/* outer /* inner */ still outer */` is one
   comment. It used to end at the first `*/`, so the rest became part of the statement.
 

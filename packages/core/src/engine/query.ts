@@ -11924,6 +11924,18 @@ class Parser {
       // an explicit precision is not accepted, since the engine keeps milliseconds either way.
       if (this.#peek().text === "(") {
         this.#expectPunctuation("(");
+        // NOW has no overload with arguments (PostgreSQL's 42883); CURRENT_TIME,
+        // CURRENT_TIMESTAMP, LOCALTIME and LOCALTIMESTAMP take a precision PostgreSQL accepts and
+        // this engine does not. CURRENT_DATE takes none, a syntax error below.
+        if (this.#peek().text !== ")" && upper === "NOW")
+          throw new TypeError("NOW takes no arguments");
+        if (
+          this.#peek().text !== ")" &&
+          ["CURRENT_TIME", "CURRENT_TIMESTAMP", "LOCALTIME", "LOCALTIMESTAMP"].includes(upper)
+        )
+          throw new TypeError(
+            `${upper}(precision) is not supported: the engine keeps milliseconds`,
+          );
         this.#expectPunctuation(")");
       }
       this.usesStatementDatetime = true;
@@ -12081,6 +12093,15 @@ class Parser {
         upper === "PERCENT_RANK" ||
         upper === "CUME_DIST"
       ) {
+        if (this.#peek().text !== ")") {
+          // PostgreSQL: rank(x) … is the ordered-set aggregate (42809 without WITHIN GROUP),
+          // row_number(x) has no such overload (42883).
+          throw new TypeError(
+            upper === "ROW_NUMBER"
+              ? "ROW_NUMBER takes no arguments"
+              : `WITHIN GROUP is required for ordered-set aggregate ${upper.toLowerCase()}`,
+          );
+        }
         this.#expectPunctuation(")");
         this.#keyword("OVER");
         const { partitionBy, orderBy, frame } = this.#overClause();
