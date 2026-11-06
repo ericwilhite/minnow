@@ -1694,10 +1694,15 @@ with no stored-format change.
 - `freeze` (on the document) and `pagehide` start the bounded step-down without asking the page
   for its context: Firefox can abandon a closing page's handler midway, and the `hidden` that
   follows must then find no live owner to flush.
-- Statements go through real lowering (`lower/`, B6): the owner caches plans by (text, catalog
-  version) and the executor's prepared plan per plan, so a warm prepared or parameterized read
-  lowers nothing. A literal per key (`WHERE id = 7`) is a new text each time: past the plan cache
-  (512) every one is lowered again (~150 µs).
+- Statements go through real lowering (`lower/`, B6). The owner's bounded cache (512 entries by
+  default, disabled at zero) stores `lowerParameterized` templates or `NotParameterizable`
+  markers under normalized keys, including catalog version and client parameter types when
+  supplied. A marker falls back to `lower(text)`, cached under that exact text only: constants
+  never leak between family members. Each execution binds its own lifted literals after client
+  parameters with `bindParameterized`. Warm prepared, parameterized and eligible literal reads
+  neither lower nor prepare again, even when distinct literal texts exceed the cache capacity.
+  Plans with no statistics basis skip drift checks. Uncommitted schemas retain session-private,
+  full-text plans, cleared on rollback; they never populate the shared cache.
 - Table rules (CHECK, generated columns, defaults) are compiled per catalog identity, never per
   (table id, version) (`owner/rule-cache.ts`): the committed catalog's in one bounded (512 entries)
   cache that drops older committed catalogs' entries and closes with the engine; a transaction's

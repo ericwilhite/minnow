@@ -65,6 +65,7 @@ import type { SequenceSession } from "../exec/executor.js";
 import type { ResultFrame, ResultStream } from "../exec/result.js";
 import type { ReturnPool } from "../exec/return-pool.js";
 import type { PhysicalType } from "../types.js";
+import type { ParameterizedPlan, ParameterizedText } from "../lower/parameterize.js";
 import type { WireInputColumn } from "./frame.js";
 import type { LedgerSession, OwnerLedger } from "./outcomes.js";
 import type { LoweredStatement } from "./planner.js";
@@ -84,6 +85,11 @@ export interface PlannedStatement {
   readonly lowered: LoweredStatement;
   /** A point read the owner tries on the synchronous path first (ruling R6). */
   readonly pointRead: boolean;
+  /** This text's literal values for the cached family template; never shared between texts. */
+  readonly parameterization?: {
+    readonly template: ParameterizedPlan;
+    readonly text: ParameterizedText;
+  };
 }
 
 export interface RunContext {

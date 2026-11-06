@@ -52,6 +52,11 @@ import { ResultChannel, type ResultFrame, type ResultStream } from "../exec/resu
 import type { ChunkReads } from "../exec/scan.js";
 import type { ExecutorCosts } from "../ir/costs.js";
 import type { OutputColumn, PhysicalPlan } from "../ir/ir.js";
+import {
+  bindParameterized,
+  type ParameterizedPlan,
+  type NotParameterizable,
+} from "../lower/parameterize.js";
 import { statisticsDrifted, type PlanningStatistics } from "../lower/statistics.js";
 import type { MemoryGovernor } from "../memory/governor.js";
 import { ReturnPool } from "../exec/return-pool.js";
@@ -79,7 +84,12 @@ import {
 } from "./errors.js";
 import type { WireInputColumn } from "./frame.js";
 import type { OwnerLedger } from "./outcomes.js";
-import type { LoweredModify, LoweredStatement, StatementPlanner } from "./planner.js";
+import type {
+  LoweredModify,
+  LoweredStatement,
+  StatementPlanner,
+  PlannerContext,
+} from "./planner.js";
 import type { TransactionState, WireColumnMeta, WireValue } from "./protocol.js";
 
 export interface ComposeOptions {
@@ -107,13 +117,31 @@ export interface ComposeOptions {
   readonly rules?: (catalog: CatalogView, tableId: number) => TableRules;
   /** Device clock in ms (the statement clock and the ledger's). */
   readonly now?: () => number;
-  /** Plans kept per catalog version; default 512. */
+  /** Shared templates, refusal markers and full-text plans retained across catalogs; default 512. */
   readonly planCacheSize?: number;
   /** The idle-transaction timeout the server applies (reported in errors). */
   readonly transactionIdleTimeoutMs?: number;
 }
 
 const DEFAULT_PLAN_CACHE = 512;
+type CachedPlan =
+  | PlannedStatement
+  | NotParameterizable
+  | {
+      readonly kind: "parameterized";
+      readonly template: ParameterizedPlan;
+      readonly planned: PlannedStatement;
+    };
+function boundParameters(
+  statement: PlannedStatement,
+  params: readonly WireValue[],
+): readonly WireValue[] {
+  const binding = statement.parameterization;
+  // The public binder appends only number/bigint/string literals to these wire values.
+  return binding === undefined
+    ? params
+    : (bindParameterized(binding.template, binding.text, params) as WireValue[]);
+}
 
 const toOutputColumns = (columns: readonly WireColumnMeta[]): OutputColumn[] =>
   columns.map((column) => ({ name: column.name, type: column.type, nullable: column.nullable }));
@@ -245,7 +273,7 @@ class ComposedEngine implements OwnerEngine {
   }
   readonly #options: ComposeOptions & { readonly executor: Executor };
   readonly #now: () => number;
-  readonly #plans = new Map<string, PlannedStatement>();
+  readonly #plans = new Map<string, CachedPlan>();
   readonly #statistics: PlanningStatistics;
   /** Compiled table rules for the committed catalog (rule-cache.ts). */
   readonly #rules: RuleCache;
@@ -319,7 +347,7 @@ class ComposedEngine implements OwnerEngine {
     return ++this.#sessionId;
   }
 
-  #context(catalog: CatalogView) {
+  #context(catalog: CatalogView): PlannerContext {
     return { catalog, statistics: this.#statistics, costs: this.#options.costs ?? EXECUTOR_COSTS };
   }
 
@@ -328,25 +356,68 @@ class ComposedEngine implements OwnerEngine {
     return toPlanned(this.#options.planner.lower(text, this.#context(catalog)));
   }
 
-  /**
-   * The cached plan of `text` at `catalog`'s version, re-lowered when the row counts it was
-   * costed on drifted (lower/statistics.ts `statisticsDrifted`).
-   */
-  plan(text: string, catalog: CatalogView = this.#options.writePath.catalog): PlannedStatement {
-    const key = `${String(catalog.version)}\u0000${text}`;
-    const cached = this.#plans.get(key);
-    if (
-      cached !== undefined &&
-      !("basis" in cached.lowered && statisticsDrifted(cached.lowered.basis, this.#statistics))
-    )
-      return cached;
-    const lowered = this.#options.planner.lower(text, this.#context(catalog));
-    const planned = toPlanned(lowered);
-    if (this.#plans.size >= (this.#options.planCacheSize ?? DEFAULT_PLAN_CACHE)) {
+  #drifted(statement: LoweredStatement): boolean {
+    return (
+      "basis" in statement &&
+      statement.basis.length > 0 &&
+      statisticsDrifted(statement.basis, this.#statistics)
+    );
+  }
+
+  #remember(key: string, value: CachedPlan): void {
+    const max = this.#options.planCacheSize ?? DEFAULT_PLAN_CACHE;
+    if (max <= 0) return;
+    this.#plans.delete(key);
+    if (this.#plans.size >= max) {
       const oldest = this.#plans.keys().next();
       if (oldest.done !== true) this.#plans.delete(oldest.value);
     }
-    this.#plans.set(key, planned);
+    this.#plans.set(key, value);
+  }
+
+  /** Public lowering results/markers use normalized keys; raw constants use full text only. */
+  plan(text: string, catalog: CatalogView = this.#options.writePath.catalog): PlannedStatement {
+    const context = this.#context(catalog);
+    const prefix = `${String(catalog.version)}\u0000${JSON.stringify(context.parameterTypes ?? [])}\u0000`;
+    const parameterized = this.#options.planner.parameterize(text);
+    if (parameterized !== null) {
+      const key = `${prefix}normalized\u0000${parameterized.key}`;
+      let cached = this.#plans.get(key);
+      if (cached?.kind === "parameterized" && this.#drifted(cached.template.statement))
+        cached = undefined;
+      if (
+        cached === undefined ||
+        (cached.kind !== "parameterized" && cached.kind !== "notParameterizable")
+      ) {
+        const result = this.#options.planner.lowerParameterized(parameterized, context);
+        cached =
+          result.kind === "notParameterizable"
+            ? result
+            : {
+                kind: "parameterized",
+                template: result,
+                planned: toPlanned(result.statement),
+              };
+        this.#remember(key, cached);
+      }
+      if (cached.kind === "parameterized")
+        return {
+          ...cached.planned,
+          text,
+          parameterization: { template: cached.template, text: parameterized },
+        };
+    }
+    const key = `${prefix}text\u0000${text}`;
+    const cached = this.#plans.get(key);
+    if (
+      cached !== undefined &&
+      cached.kind !== "parameterized" &&
+      cached.kind !== "notParameterizable" &&
+      !this.#drifted(cached.lowered)
+    )
+      return cached;
+    const planned = toPlanned(this.#options.planner.lower(text, context));
+    this.#remember(key, planned);
     return planned;
   }
 
@@ -638,7 +709,7 @@ class ComposedSession implements EngineSession {
     try {
       execution = this.#execute(
         lowered.plan,
-        params,
+        boundParameters(statement, params),
         context,
         { snapshot: pin, statement: null },
         "atExecuted",
@@ -699,9 +770,9 @@ class ComposedSession implements EngineSession {
     const lowered = statement.lowered;
     switch (lowered.kind) {
       case "query":
-        return this.#query(lowered, params, context);
+        return this.#query(lowered, boundParameters(statement, params), context);
       case "modify":
-        return this.#modify(lowered, params, context);
+        return this.#modify(lowered, boundParameters(statement, params), context);
       case "ddl":
         return this.#ddl(lowered, context);
       case "transactionControl":
@@ -957,7 +1028,8 @@ class ComposedSession implements EngineSession {
         throw error;
       }
       if (lowered.followUp !== null) {
-        const followUp = this.plan(lowered.followUp).lowered;
+        const plannedFollowUp = this.plan(lowered.followUp);
+        const followUp = plannedFollowUp.lowered;
         if (followUp.kind !== "modify") throw new TypeError("A DDL follow-up must be a write");
         const next = tx.statement({
           rules: this.#rules(() => next.catalog),
@@ -965,7 +1037,7 @@ class ComposedSession implements EngineSession {
         });
         const execution = this.#execute(
           followUp.plan,
-          [],
+          boundParameters(plannedFollowUp, []),
           context,
           { snapshot: null, statement: next },
           "atExecuted",

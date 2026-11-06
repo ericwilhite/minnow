@@ -9,6 +9,7 @@ import { Governor } from "../memory/governor.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
 import { ProtocolClient } from "../owner/client.js";
 import { composeEngine } from "../owner/compose.js";
+import type { StatementPlanner } from "../owner/planner.js";
 import { PROTOCOL_VERSION, type OwnerMessage, type WireValue } from "../owner/protocol.js";
 import { OwnerServer, type ServerPort } from "../owner/server.js";
 import { createLowerer } from "../lower/create.js";
@@ -20,6 +21,8 @@ afterEach(() => {
 });
 
 export interface HarnessOptions {
+  readonly planner?: StatementPlanner;
+  readonly planCacheSize?: number;
   readonly durability?: "strict" | "relaxed";
   readonly autoFlush?: boolean;
   readonly idleMs?: number;
@@ -40,7 +43,7 @@ export function harness(options: HarnessOptions = {}) {
     options.rowsPerFrame === undefined ? {} : { rowsPerFrame: options.rowsPerFrame },
   );
   // Lowering itself (B6, on main), plus the tests' analytic-load statement.
-  const planner = withTestStatements(createLowerer());
+  const planner = options.planner ?? withTestStatements(createLowerer());
   const governor = new Governor(64 * 1024 * 1024);
   const engine = composeEngine({
     planner,
@@ -49,6 +52,7 @@ export function harness(options: HarnessOptions = {}) {
     governor,
     spill: new MemorySpillService(),
     reads: {} as ChunkReads,
+    ...(options.planCacheSize === undefined ? {} : { planCacheSize: options.planCacheSize }),
     ...(options.idleMs === undefined ? {} : { transactionIdleTimeoutMs: options.idleMs }),
   });
   const liveness = options.liveness;
