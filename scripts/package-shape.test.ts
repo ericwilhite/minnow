@@ -189,6 +189,13 @@ describe("published core tarball", () => {
       );
       expect(report?.files.map(({ path }) => path)).toContain("dist/engine/query.d.ts");
       expect(report?.files.filter(({ path }) => path.startsWith("dist/next/"))).toEqual([]);
+      // prepare-package.mjs strips only the JavaScript it expects to ship; every shipped file
+      // must come out stripped, so a too-wide skip rule fails here.
+      for (const { path } of report?.files ?? []) {
+        if (!path.endsWith(".js")) continue;
+        const shipped = await readFile(join(isolatedCore, path), "utf8");
+        expect(shipped, path).not.toMatch(/^\s*(?:\/\*\*|\/\/)/mu);
+      }
       // Existing publication budgets also cover declaration pruning. Raised from 870,000 and
       // 4,300,000 with 0.10.1's coordination and recovery fixes, then to 920,000 and 4,500,000
       // when the interaction-plan simulator joined the published testing entry, then to 955,000

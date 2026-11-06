@@ -131,6 +131,20 @@ export function compactEmbeddedStyles(source) {
 }
 
 /**
+ * Stripping rewrites only JavaScript a tarball can ship. Tests, specs and the unexported rebuild
+ * core (`dist/next/`) are excluded by every package's `files` list and are over half of core's
+ * compiled JavaScript, so rewriting them only slowed every pack. If this ever skips a shipped
+ * file, package-shape.test.ts fails on the comments left in the tarball.
+ * @param {string} dist
+ * @param {string} file
+ */
+function shipsJavaScript(dist, file) {
+  if (!file.endsWith(".js")) return false;
+  const path = relative(dist, file).split(sep).join("/");
+  return !path.startsWith("next/") && !/\.(?:test|spec)\.js$/u.test(path);
+}
+
+/**
  * @param {string} packageRoot
  * @param {{ stripJavaScriptComments?: boolean, compactStyles?: boolean }} [options]
  */
@@ -142,7 +156,7 @@ export function preparePackage(packageRoot, options = {}) {
     throw new Error(`Refusing to replace an unrecognized ${ignoreFile}`);
   }
   if (options.stripJavaScriptComments === true) {
-    for (const file of filesUnder(dist).filter((file) => file.endsWith(".js"))) {
+    for (const file of filesUnder(dist).filter((file) => shipsJavaScript(dist, file))) {
       const source = readFileSync(file, "utf8");
       const stripped = stripComments(source);
       if (stripped !== source) writeFileSync(file, stripped);
