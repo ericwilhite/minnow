@@ -85,9 +85,9 @@ function sqlFor(c: Case): string {
       ? `p.${column} IS NOT DISTINCT FROM b.${column}`
       : `p.${column} = b.${column}`;
   };
-  const on = [...c.keys.map((_, i) => cmp(i)), ...(c.withResidual ? [RESIDUAL_SQL] : [])].join(
-    " AND ",
-  );
+  const on =
+    [...c.keys.map((_, i) => cmp(i)), ...(c.withResidual ? [RESIDUAL_SQL] : [])].join(" AND ") ||
+    "true";
   switch (c.kind) {
     case "inner":
       return `SELECT p.*, b.* FROM p JOIN b ON ${on}`;
@@ -139,7 +139,9 @@ const filter = (p: Row, b: Row): boolean | null => {
   return x === null || y === null ? null : y > x - 40;
 };
 
-const KEYS: ReadonlyArray<readonly number[]> = [[0], [1], [0, 1]];
+// [] is a join on its residual alone (ruling R24.2; a FULL one is checked against PostgreSQL's
+// rewrite, LEFT JOIN UNION ALL the unmatched build rows, since PostgreSQL refuses it: 0A000).
+const KEYS: ReadonlyArray<readonly number[]> = [[0], [1], [0, 1], []];
 
 /**
  * Every kind and condition shape over one pair of tables, compared with PostgreSQL. `tight`:
@@ -157,6 +159,7 @@ async function compareRound(
   await load("p", probe, wide);
   for (const kind of ["inner", "left", "right", "full", "semi", "anti", "mark"] as const)
     for (const keys of KEYS) {
+      if (kind === "mark" && keys.length === 0) continue;
       const markCorrelations = kind === "mark" ? (keys.length === 2 ? [0, 1] : [0]) : [undefined];
       for (const correlated of markCorrelations)
         for (const [withResidual, withFilter] of kind === "mark"

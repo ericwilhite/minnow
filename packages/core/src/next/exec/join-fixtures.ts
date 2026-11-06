@@ -301,6 +301,30 @@ export function rowsOf(batch: Batch): Row[] {
   return rows;
 }
 
+/**
+ * Counts rows; every push returns `blocked` with an already-resolved `ready()` (ruling R23.4:
+ * an operator must not start a fresh slice on such a resumption).
+ */
+export class ResolvedBlockSink implements Operator {
+  rows = 0;
+  pushes = 0;
+  finished = false;
+  push(batch: Batch): PushResult {
+    this.rows += batch.selection === null ? batch.length : batch.selection.count;
+    this.pushes++;
+    return "blocked";
+  }
+  ready(): Promise<void> {
+    return Promise.resolve();
+  }
+  finish(): void {
+    this.finished = true;
+  }
+  abort(): void {
+    this.finished = false;
+  }
+}
+
 /** Collects output rows; with `blockEvery`, every n-th push returns `blocked` for one task. */
 export class CollectSink implements Operator {
   readonly rows: Row[] = [];

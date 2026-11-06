@@ -26,7 +26,7 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | `page/`       | format                           | Page codecs, page directory and statistics, streaming group writer, chunk reader (ChunkPages), inflated-page cache                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `spill/`      | executor (OPFS service: storage) | Spill contract (one long-lived scratch file, batching charged to the operator's budget); in-memory double                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `memory/`     | executor                         | Memory governor: admission, progress loans, held vs allocated bytes (reference implementation)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `exec/`       | executor                         | Entry point (`executor.ts`), result frames (`result.ts`), scans (`scan.ts` contract, `table-scan.ts`, `memory-scan.ts`, `column-target.ts`, the pushdown seam `pushdown.ts`), table rules (`rules.ts`), push driver (`pipeline.ts`), fetcher (`fetch.ts`), expression kernels (`kernels/`), filter and project (`filter.ts`), aggregation (`agg/`), comparators, decimal SUM; heavy operators (track B7): hash join (`join*.ts`), sort / top-N / per-group top-k (`sort*.ts`), column store (`column-store.ts`), spill pages (`spill-pages.ts`) and the spill pool (`spill-pool.ts`) shared by join, sort and aggregation spill                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `exec/`       | executor                         | Entry point (`executor.ts`), result frames (`result.ts`), scans (`scan.ts` contract, `table-scan.ts`, `memory-scan.ts`, `column-target.ts`, the pushdown seam `pushdown.ts`), table rules (`rules.ts`), push driver (`pipeline.ts`), fetcher (`fetch.ts`), expression kernels (`kernels/`), filter and project (`filter.ts`), aggregation (`agg/`), comparators, decimal SUM; heavy operators (track B7): hash join (`join*.ts`), sort / top-N / per-group top-k (`sort*.ts`), windows (`window*.ts`), column store (`column-store.ts`), spill pages (`spill-pages.ts`) and the spill pool (`spill-pool.ts`) shared by join, sort and aggregation spill                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `ir/`         | lowering, executor               | Operator IR (`ir.ts`); scalar function and operator table (`functions.ts`); table rules in IR form (`rules.ts`); executor costs the planner reads (`costs.ts`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `access/`     | write path + key index           | Storage access contracts the write path implements: snapshots and segments, catalog, key-index probes and ranges, `modify` (rows, conflicts, RETURNING), transactions, group commit, sequences, delivery                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `testing/`    | all                              | Differential-harness adapter for a partial new core; stand-ins for the write path and executor that the owner's composition runs over, with real lowering, until those tracks land (`owner-standins.ts`), an in-memory Web Locks for election tests (`fake-locks.ts`); the registry of intended divergences from the current engine (R21, `divergences.ts`); the write path's generated differential against PostgreSQL and the current engine                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
@@ -818,9 +818,8 @@ and the owner import it directly.
 - Pushed predicates on the decoded fallback (below) load the values they read when they
   evaluate, before the batch is sized.
 - Long runs that emit nothing (ranges, chunks and groups filtered or pruned away) yield to the
-  event loop with a task every 4 ms (R23). The slice runs on across `next()` calls and resolved
-  continuations and restarts only after a task yield (R23.4), as the driver's and the
-  aggregate's do.
+  event loop with a task once 4 ms have passed since the worker's task began (R23, R23.5: the
+  one task clock, so `next()` calls and resolved continuations never start a slice).
 - Ending: at the end of the table the scan gives back everything it holds by itself; `abort` (a
   cancellation, an error, a LIMIT) does the same at once and repays a loan, never throwing. A
   `next()` still waiting on a read then resolves null: whatever settles after the abort (a reader
@@ -911,7 +910,11 @@ and the owner import it directly.
 
 ### Hash join (`exec/join.ts`, `join-keys.ts`, `join-table.ts`, `join-filter.ts`) and shared heavy-operator files (`column-store.ts`, `spill-pages.ts`)
 
-- Every kind: inner, left, right, full, semi, anti and mark. Equality is SQL's: `=` never
+- Every kind: inner, left, right, full, semi, anti and mark. A join may also have no keys,
+  only a residual (ruling R24.2: PostgreSQL refuses such a FULL JOIN, 0A000, for an
+  implementation reason; the result is the LEFT JOIN plus the unmatched build rows): it runs
+  over one constant key, so every pair is a candidate and memory stays bounded by chunk mode.
+  Equality is SQL's: `=` never
   matches NULL, `nullSafe` keys use IS NOT DISTINCT FROM, floats treat −0 = 0 and NaN = NaN,
   NUMERIC and INTERVAL compare normalized. A residual ON condition is a vector predicate over
   the pairs; FALSE and NULL both reject.
@@ -938,6 +941,9 @@ and the owner import it directly.
 - Inner, semi and right joins publish runtime filters (exact bitmap, split-block Bloom, bounds)
   when the build stays resident; a filter never drops a row that can match, and stops testing
   when it keeps over 90 % of probes.
+- Probe continuations check cancellation and the remaining worker-task deadline immediately
+  after downstream readiness. An already-resolved readiness promise never restarts the clock.
+
 - Push returns `blocked` when the downstream blocks or a spill write waits; with no spill the
   whole join runs without an await.
 
@@ -963,6 +969,71 @@ and the owner import it directly.
 - Finish work (compaction, the sort, the merge, emission) runs in slices of `YIELD_INTERVAL_MS`
   with a real task yield between them; each slice and each resumption after backpressure checks
   the abort signal (ruling R23). Scratch that lives across a suspension belongs to the operator.
+
+### Windows (`exec/window.ts`, `window-sort.ts`, `window-frames.ts`, `window-stream.ts`)
+
+- Prefix counts, ordinary and bigint sums, promotion, and long moving-frame aggregate scans
+  check the shared task clock inside bounded chunks. Resumptions after a task yield check
+  cancellation before continuing the kernel. Short streamed frames keep a synchronous path.
+
+- Float RANGE offsets follow PostgreSQL's `in_range_float8_float8`: NaN peers compare equal,
+  NaN sorts above infinity, and NULL validity stays separate from numeric values. Infinite
+  offsets retain PostgreSQL's infinity rules on both resident and streamed paths. NaN and
+  negative offsets are rejected with SQLSTATE 22013; positive infinity offsets remain valid.
+
+- One task clock per worker (`exec/pipeline.ts` `TaskClock`, ruling R23.5): the driver, scans,
+  aggregation, join, sort, top-k and window all yield once `YIELD_INTERVAL_MS` has passed since
+  the worker's task began, and keep no slice start of their own, so several operators in one
+  task share the one bound. The clock is stamped only when a `yieldTask` resolves and at the
+  owner's task entry points (the server's message dispatch): never in `drive()`, an operator's
+  entry or a resolved promise. A missing stamp yields early, never late.
+- `WindowOperator` evaluates a `window` rel. Its rows are ordered by (PARTITION BY, ORDER BY),
+  then evaluated one partition at a time. Output is the input columns, then one column per
+  function.
+- The grouped sort (`window-sort.ts`) orders them when it applies: at most one PARTITION BY
+  column of text, bytes, an integer, date, time or timestamp type, and ORDER BY keys that are
+  all fixed-width numbers, dates or times. Rows are held with a partition id (a dictionary
+  column translated once per dictionary) and their keys normalized to two 32-bit words each;
+  partitions are ranked by value and rows placed by an LSD radix on the rank (no comparisons),
+  then each partition by an MSD radix on the first key (skipped when the rows arrive in order),
+  ties ordered by the other keys. Each row is gathered once, in order. A partition column
+  nothing else reads is neither stored nor gathered: it goes out as a constant vector of the
+  partition's value.
+- Otherwise the sort operator orders the rows, and the grouped sort moves its rows there when
+  the grant refuses its memory.
+- Functions:
+  - ranking: row_number, rank, dense_rank, percent_rank, cume_dist, ntile;
+  - values: lag, lead, first_value, last_value, nth_value, over any type;
+  - aggregates: count, and sum, avg, min, max of integers and floats.
+- Frames follow PostgreSQL:
+  - ROWS, RANGE (one numeric ORDER BY key) and GROUPS, with offsets;
+  - EXCLUDE CURRENT ROW, GROUP and TIES;
+  - for a non-NULL row, RANGE offsets treat NULL keys as below every value (NULLS FIRST) or
+    above every value (NULLS LAST).
+- Float sums add a frame's members in order, as PostgreSQL does; exact sums use prefix sums.
+- int8 values stay exact past 2^53 on both paths, as bigints where a double would round:
+  sums, MIN/MAX, and RANGE keys and their offsets (RANGE over int8 compares exactly). COUNT
+  counts non-NULL rows only. Bigint state derived from int64 values is reserved at 48 bytes per fixed-capacity
+  slot (up to 128-bit sums), including promotions caused by sums of safe inputs. The resident
+  path reserves a conservative bound before evaluating and streams on refusal. Streaming bigint
+  arrays grow at explicit capacities, with replacements charged while old arrays are live
+  (governor rule 4). Result references are dropped before their charge is released.
+- lag and lead accept negative offsets (lead(x, −k) looks back), resident and streamed.
+- A partition is held in memory and evaluated over typed arrays while the grant holds it, up
+  to `streamRows` (4,194,304) rows.
+- A larger partition, or one the grant cannot hold, streams from its spilled pages. Memory is
+  then bounded by the frame, not by the partition:
+  - ROWS frames and running aggregates keep the frame's rows;
+  - RANGE and GROUPS frames keep the peers plus the frame's extent;
+  - frames that need the whole partition (UNBOUNDED FOLLOWING, ntile, percent_rank,
+    cume_dist) read it twice, counting first.
+- A few combinations cannot stream: a column-valued lag, lead, ntile or nth_value amount;
+  nth_value past 4,096; and float sums or MIN/MAX over a moving frame that ends at UNBOUNDED
+  FOLLOWING. Such a partition must fit the grant.
+- Partition and peer boundaries are found a batch at a time, column by column; plain frames
+  (no EXCLUDE) sum and count from prefix arrays reused across partitions.
+- Arrival, the per-partition kernels and emission run in slices, checking the abort signal
+  (ruling R23).
 
 ### Owner and client protocol (`owner/`)
 

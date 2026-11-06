@@ -3,22 +3,22 @@
  * (`Slice`), jobs written as generators that yield when it is due or when they block
  * (`SlicedJob`), and the runner that gives the event loop a real task between slices.
  */
-import { yieldTask } from "./pipeline.js";
+import { TaskClock, afterYield, taskClock, yieldTask } from "./pipeline.js";
 
 /**
- * The deadline of one slice of synchronous work (R16.4, R23.2): `due()` once `ms` have passed
- * since the slice began. Long loops check it per chunk of rows, never per element.
+ * The deadline of synchronous work (R16.4, R23.2, R23.5): `due()` once `ms` have passed since the
+ * current **task** began, on the worker's task clock (pipeline.ts `TaskClock`). A slice keeps no
+ * start of its own: every operator in a task shares the one bound. Long loops check it per chunk
+ * of rows, never per element. `Slice(0)` is always due, `Slice(Infinity)` never; tests pass a
+ * private clock.
  */
 export class Slice {
-  #start: number;
   constructor(
     readonly ms: number,
-    readonly now: () => number = () => performance.now(),
-  ) {
-    this.#start = now();
-  }
+    readonly clock: TaskClock = taskClock,
+  ) {}
   due(): boolean {
-    return this.now() - this.#start >= this.ms;
+    return this.clock.due(this.ms);
   }
   #ticks = 0;
   /**
@@ -27,12 +27,6 @@ export class Slice {
    */
   tick(): boolean {
     return (++this.#ticks & (TICKS - 1)) === 0 && this.due();
-  }
-  /** How many times the slice was reset (a new slice began): `KeyWork` checks yields by it. */
-  resets = 0;
-  reset(): void {
-    this.#start = this.now();
-    this.resets++;
   }
 }
 
@@ -61,8 +55,9 @@ export function runSliced<T>(job: SlicedJob<T>, slice: Slice, between: () => voi
     for (;;) {
       const blocked = step.value;
       if (blocked === undefined) {
+        // The yield begins a task (it stamps the worker's clock; a test clock begins here).
         await yieldTask();
-        slice.reset();
+        afterYield(slice.clock);
       } else await blocked;
       between();
       step = job.next();
@@ -72,14 +67,16 @@ export function runSliced<T>(job: SlicedJob<T>, slice: Slice, between: () => voi
 }
 
 /**
- * Runs a job that never blocks to completion, synchronously (no deadline). `slice`, when the
- * job has one that can come due, is reset at each of its yields, as `runSliced` does.
+ * Runs a job that never blocks to completion, synchronously (no deadline: production passes a
+ * `Slice(Infinity)`). Tests stepping a job whose slice comes due pass that slice: with a private
+ * clock, each yield begins a task on it, as `runSliced`'s yield does (the worker's clock is
+ * never stamped here: no task begins in a synchronous loop).
  */
 export function runToEnd<T>(job: SlicedJob<T>, slice?: Slice): T {
   for (;;) {
     const step = job.next();
     if (step.done === true) return step.value;
     if (step.value !== undefined) throw new Error("A synchronous sort job blocked");
-    slice?.reset();
+    if (slice !== undefined) afterYield(slice.clock);
   }
 }

@@ -41,6 +41,7 @@ import type { ByteCharge } from "../vector/varlen.js";
 import type { FlatVector, Validity, Vector } from "../vector/vector.js";
 import { UnsupportedPlanError } from "./errors.js";
 import { hiOfSafe, wordsOf } from "./column-store.js";
+import type { TaskClock } from "./pipeline.js";
 import { Slice, runToEnd, type SlicedJob } from "./slices.js";
 
 export const HASH_SEED = 0x2f0b_3c4d;
@@ -621,33 +622,33 @@ function hashInto(out: KeyScratch, k: number, bytes: Uint8Array, start: number, 
  * A budget of key bytes per step (review B7-p2c-2: every byte of hashing and equality counts).
  * `spend(bytes, slice)` returns true ("yield now") when the step is used up and the slice is
  * due; the budget then starts again. Every caller must yield on true before more key work
- * (review B7-p2c-3 #1): the next `spend` throws when the slice was not reset since a "yield
- * now" (its runner resets it at the yield), so an ignored signal fails loudly rather than
+ * (review B7-p2c-3 #1): the next `spend` throws when no task began on the slice's clock since a
+ * "yield now" (the runner's yield begins one), so an ignored signal fails loudly rather than
  * running a chain in one step. `total` is the bytes spent overall (tests read it per step).
  */
 export class KeyWork {
   left: number;
   total = 0;
-  /** The slice and its reset count when "yield now" was last returned (else null). */
-  #owedSlice: Slice | null = null;
+  /** The clock and its task count when "yield now" was last returned (else null). */
+  #owedClock: TaskClock | null = null;
   #owedAt = 0;
   constructor(readonly step = KEY_STEP_BYTES) {
     this.left = step;
   }
   spend(bytes: number, slice: Slice): boolean {
-    const owed = this.#owedSlice;
+    const owed = this.#owedClock;
     if (owed !== null) {
-      if (owed.resets === this.#owedAt)
+      if (owed.epoch === this.#owedAt)
         throw new Error("Key work went on past a due slice: a caller ignored spend's yield");
-      this.#owedSlice = null;
+      this.#owedClock = null;
     }
     this.total += bytes;
     this.left -= bytes;
     if (this.left > 0) return false;
     this.left = this.step;
     if (!slice.due()) return false;
-    this.#owedSlice = slice;
-    this.#owedAt = slice.resets;
+    this.#owedClock = slice.clock;
+    this.#owedAt = slice.clock.epoch;
     return true;
   }
 }

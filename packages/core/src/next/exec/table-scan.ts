@@ -36,9 +36,9 @@
  *
  * ## Pacing and ending (ruling R23)
  * - Work that emits nothing (ranges, chunks and groups filtered or pruned away) yields with a task
- *   once `yieldIntervalMs` has passed in the slice, so a long run of rejected rows does not hold
- *   the owner. The slice begins at construction and again only after that task yield, not at
- *   each `next()` (R23.4: a caller resuming at once, in a microtask, is no yield).
+ *   once `yieldIntervalMs` has passed since the worker's task began (R23.5: the one task clock,
+ *   stamped by that yield; nothing here starts a slice, not construction nor a `next()`), so a
+ *   long run of rejected rows does not hold the owner.
  * - At the end of the table the scan releases everything it holds (readers, values, buffers,
  *   scratch) and repays a loan. `abort` (a cancellation, an error, a LIMIT) does so at once and
  *   never throws; a `next()` suspended on a read then resolves null: whatever settles after the
@@ -87,6 +87,9 @@ import { MemorySegmentScan } from "./memory-scan.js";
 import {
   YIELD_INTERVAL_MS,
   isPromise,
+  afterYield,
+  clockFor,
+  type TaskClock,
   yieldTask,
   type BatchSource,
   type SourceItem,
@@ -275,8 +278,8 @@ export class TableScan implements BatchSource {
   readonly #placeholder: Vector;
   readonly #target: number;
   readonly #interval: number;
-  readonly #now: () => number;
-  #sliceStart = 0;
+  /** The worker's task clock, or a test's (R23.5): no slice start of its own. */
+  readonly #clock: TaskClock;
   #segment = 0;
   #group: OpenGroup | null = null;
   #memoryScan: MemorySegmentScan | null = null;
@@ -335,13 +338,12 @@ export class TableScan implements BatchSource {
     };
     this.#target = options.targetBytes ?? BATCH_TARGET_BYTES;
     this.#interval = options.yieldIntervalMs ?? YIELD_INTERVAL_MS;
-    this.#now = options.now ?? (() => performance.now());
-    this.#sliceStart = this.#now();
+    this.#clock = clockFor(options.now);
   }
 
   next(): MaybePromise<SourceItem | null> {
-    // The slice does not restart here (R23.4): a caller resuming at once (a resolved Promise, a
-    // microtask) is no task yield, so only `#pace`'s own yield starts a new slice.
+    // No slice starts here (R23.4, R23.5): a caller resuming at once (a resolved Promise, a
+    // microtask) is no task yield; only a yield begins the worker's task.
     return this.#run(this.#next());
   }
 
@@ -392,16 +394,16 @@ export class TableScan implements BatchSource {
 
   /**
    * Scan progress that emits nothing (ranges, chunks and groups filtered or pruned away) yields
-   * with a task once `yieldIntervalMs` has passed since the slice began (ruling R23), so a long
-   * run of rejected rows does not hold the owner for the whole table. The slice begins at
-   * construction and again only after this task yield (R23.4): not at each `next()`, which a
-   * caller may make again at once, in a microtask.
+   * with a task once `yieldIntervalMs` has passed since the task began (rulings R23, R23.5: the
+   * worker's task clock, stamped by the yield itself), so a long run of rejected rows does not
+   * hold the owner for the whole table. Nothing here starts a slice: not construction, not a
+   * `next()`, which a caller may make again at once, in a microtask.
    */
   *#pace(): Step<void> {
-    if (this.#now() - this.#sliceStart < this.#interval) return;
+    if (!this.#clock.due(this.#interval)) return;
     this.stats.yields += 1;
     yield* this.#wait(yieldTask());
-    this.#sliceStart = this.#now();
+    afterYield(this.#clock);
   }
 
   *#next(): Step<SourceItem | null> {

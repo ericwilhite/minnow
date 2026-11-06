@@ -79,7 +79,12 @@ class Collect implements Operator {
   }
 }
 
+/** A frozen task clock for runs expected to be synchronous (R23.5). */
+const FROZEN = { now: () => 0 };
+
 describe("filter and project", () => {
+  // Runs expected synchronous use a frozen clock (`FROZEN`): only a real Promise can make them
+  // async, whatever the worker's task clock says (ruling R23.5).
   it("flattens nested ANDs into conjuncts", () => {
     const a = cmp(">", col(0, I32), int(1));
     expect(conjuncts(and(a, and(a, a)))).toHaveLength(3);
@@ -121,6 +126,8 @@ describe("filter and project", () => {
         [5, null],
       ]),
       new FilterOperator(cmp(">", col(0, I32), int(0)), context(), spy),
+      undefined,
+      FROZEN,
     );
     expect(sink.rows).toEqual([[1], [2], [5]]);
     expect(sink.pushes).toBe(2);
@@ -137,7 +144,12 @@ describe("filter and project", () => {
       })(),
       abort: () => undefined,
     };
-    void drive(one, new FilterOperator(cmp(">", col(0, I32), int(0)), context(), sink));
+    void drive(
+      one,
+      new FilterOperator(cmp(">", col(0, I32), int(0)), context(), sink),
+      undefined,
+      FROZEN,
+    );
     expect(sink.rows).toEqual([[1], [2]]);
   });
 
@@ -160,6 +172,8 @@ describe("filter and project", () => {
     const run = drive(
       source([[1], [2]], transfers),
       new FilterOperator(cmp(">", col(0, I32), int(0)), context(), slow),
+      undefined,
+      FROZEN,
     );
     expect(transfers.released).toBe(0);
     unblock();
@@ -175,9 +189,9 @@ describe("filter and project", () => {
       { ...context(), params },
       sink,
     );
-    void drive(source([[1, 5]]), filter);
+    void drive(source([[1, 5]]), filter, undefined, FROZEN);
     params.slots = [numbers(I32, [0])];
-    void drive(source([[1, 5]]), filter);
+    void drive(source([[1, 5]]), filter, undefined, FROZEN);
     expect(sink.rows).toEqual([[5], [1], [5]]);
   });
 });

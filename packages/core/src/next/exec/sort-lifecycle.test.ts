@@ -5,7 +5,7 @@
  * after backpressure, and compare mode's decoded operands charged to the grant. Also the review's
  * resource probes: an oversized row refused cleanly, and a wide spill that stays bounded.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { Governor } from "../memory/governor.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
 import type { PhysicalType } from "../types.js";
@@ -13,13 +13,23 @@ import type { Batch } from "../vector/vector.js";
 import {
   ArraySource,
   CollectSink,
+  ResolvedBlockSink,
   INT,
   TEXT,
   batchesOf,
   rowsOf,
   type Row,
 } from "./join-fixtures.js";
-import { drive, type Operator, type PushResult } from "./pipeline.js";
+import {
+  TaskClock,
+  YIELD_INTERVAL_MS,
+  beginTask,
+  drive,
+  taskClock,
+  type BatchSource,
+  type Operator,
+  type PushResult,
+} from "./pipeline.js";
 import {
   PREFIX_WORDS,
   RadixScratch,
@@ -29,7 +39,10 @@ import {
   msdStackWords,
   type SortColumn,
 } from "./sort-keys.js";
+import * as sortKeys from "./sort-keys.js";
 import { Slice } from "./slices.js";
+
+const original = sortKeys.decodeOperands;
 import { GroupTopKOperator, SortOperator, sortMinimumBytes } from "./sort.js";
 
 const JSONB: PhysicalType = { kind: "json", binary: true };
@@ -255,6 +268,21 @@ describe("R23.2/R23.3: finish runs in task-yielding slices", () => {
         Array.from({ length: 30_000 }, (_, i) => [JSON.stringify({ k: (i * 7919) % 30_000 })]),
     },
   ];
+  for (const c of cases)
+    it(`a zero-delay timer runs before finish completes: ${c.name}, downstream blocked with a resolved ready (R23.4)`, async () => {
+      const { context: ctx } = await context(c.types, c.slack);
+      const sink = new ResolvedBlockSink();
+      const op = c.make(ctx, sink);
+      await pushAll(op, c.types, c.rows());
+      let serviced = false;
+      const timer = setTimeout(() => {
+        serviced = true;
+      }, 0);
+      await op.finish();
+      clearTimeout(timer);
+      expect(serviced).toBe(true);
+      expect(sink.finished).toBe(true);
+    }, 60_000);
   for (const c of cases)
     it(`a zero-delay timer runs before finish completes: ${c.name}`, async () => {
       const { context: ctx } = await context(c.types, c.slack);
@@ -504,7 +532,7 @@ describe("review B7-p2b-2 #2: slices bound work, not rows", () => {
   // A controlled clock: each comparison costs one unit; the deadline is four units.
   it("refining equal prefixes yields within a few comparisons (reviewer: 1,664 units)", () => {
     let now = 0;
-    const slice = new Slice(4, () => now);
+    const slice = new Slice(4, new TaskClock(() => now));
     const n = 400;
     const tuples = new Uint32Array(n * TUPLE_WORDS);
     for (let i = 0; i < n; i++) tuples[i * TUPLE_WORDS + PREFIX_WORDS] = i;
@@ -529,7 +557,7 @@ describe("review B7-p2b-2 #2: slices bound work, not rows", () => {
 
   it("a merge sort yields within a few comparisons (reviewer: 5,120 units)", () => {
     let now = 0;
-    const slice = new Slice(4, () => now);
+    const slice = new Slice(4, new TaskClock(() => now));
     const ids = Int32Array.from({ length: 1024 }, (_, i) => 1024 - i);
     const job = mergeSortJob(
       ids,
@@ -905,4 +933,184 @@ describe("review B7-p2b-1 resource probes", () => {
       expect(governor.usedBytes).toBe(0);
     }, 60_000);
   }
+});
+
+describe("the merge sort checks its deadline inside run tails (review B7-p2b-2 #2)", () => {
+  it("a long tail copy reads the clock without any comparison", () => {
+    // Sorted input: every merge exhausts its left run by comparisons, then copies the right
+    // run's tail with none. 2^19 ids take 16 merge levels (no copy back at the end), so the
+    // only clock readings without a comparison between them are the tails' checks.
+    const n = 1 << 19;
+    const ids = Int32Array.from({ length: n }, (_, i) => i);
+    let readings = 0;
+    let stretch = 0;
+    let longest = 0;
+    const slice = new Slice(
+      Infinity,
+      new TaskClock(() => {
+        readings++;
+        stretch++;
+        longest = Math.max(longest, stretch);
+        return readings;
+      }),
+    );
+    const job = mergeSortJob(
+      ids,
+      new Int32Array(n),
+      (a, b) => {
+        stretch = 0;
+        return a - b;
+      },
+      slice,
+    );
+    while (job.next().done !== true);
+    expect(Array.from(ids.subarray(0, 4))).toEqual([0, 1, 2, 3]);
+    // The last merge copies a 2^18-row tail: a check every 8,192 copies is 32 readings.
+    expect(longest).toBeGreaterThanOrEqual(16);
+  });
+});
+
+describe("the store-wide operand decode checks its deadline per chunk (review B7-p2b-2 #3)", () => {
+  it("an ICU sort that falls back to compare mode at its sort decodes in sliced chunks", async () => {
+    // 6,000 distinct ~400-character values under an ICU collation, with a grant that holds the
+    // rows and their distinct set but not the ranks' strings: the sort falls back to compare
+    // mode and decodes every stored row's operand (DECODE_BYTES at a time) before sorting.
+    const types = [TEXT, INT];
+    const rows: Row[] = Array.from({ length: 6000 }, (_, i) => [
+      `é${"v".repeat(400)}${String((i * 7919) % 6000)}`,
+      i,
+    ]);
+    const minimum = sortMinimumBytes(types);
+    const governor = new Governor(minimum + 12 * (1 << 20));
+    const grant = await governor.admit({ label: "sort", minimumBytes: minimum, spillable: true });
+    const sink = new CollectSink();
+    const op = new SortOperator(
+      {
+        types,
+        keys: [{ column: 0, direction: "asc", nulls: "last", collation: "en-US-x-icu" }],
+        limit: null,
+        offset: 0,
+        withTies: false,
+      },
+      { grant, spill: new MemorySpillService(), queryId: 7 },
+      sink,
+    );
+    // Per decode call, whether it decoded more than one row (a chunk of DECODE_BYTES).
+    const events: boolean[] = [];
+    const decode = vi.spyOn(sortKeys, "decodeOperands");
+    decode.mockImplementation((...args) => {
+      events.push(args[4] - args[3] > 1);
+      return original(...args);
+    });
+    const due = vi.spyOn(Slice.prototype, "due");
+    const checks: number[] = [];
+    const decodes: number[] = [];
+    try {
+      await drive(new ArraySource(batchesOf(types, rows)), op);
+    } finally {
+      // (Read before the restore, which clears them.)
+      checks.push(...due.mock.invocationCallOrder);
+      decodes.push(...decode.mock.invocationCallOrder);
+      decode.mockRestore();
+      due.mockRestore();
+    }
+    // A multi-row decode followed by a check before the next decode.
+    let checked = 0;
+    let multi = 0;
+    for (let i = 0; i < decodes.length; i++) {
+      const at = decodes[i] ?? 0;
+      const next = decodes[i + 1] ?? Infinity;
+      if (events[i] !== true) continue;
+      multi++;
+      if (checks.some((c) => c > at && c < next)) checked++;
+    }
+    expect(op.profile.mode).toBe("compare");
+    expect(multi).toBeGreaterThanOrEqual(10);
+    expect(checked).toBeGreaterThanOrEqual(multi - 2);
+    expect(sink.rows.length).toBe(6000);
+    await op.closed;
+    expect(governor.usedBytes).toBe(0);
+  }, 60_000);
+});
+
+describe("R23.5: one task clock per worker", () => {
+  // The worker's clock reads a fake time here (restored after): every operator's deadline is a
+  // Slice on it, as in production.
+  function withTime(run: (advance: (ms: number) => number) => void): void {
+    const real = taskClock.now;
+    let t = 0;
+    taskClock.now = () => t;
+    try {
+      beginTask();
+      run((ms) => (t += ms));
+    } finally {
+      taskClock.now = real;
+      beginTask();
+    }
+  }
+
+  it("two breakers alternating in one task yield by ~4 ms in total, not 4 ms each", () => {
+    withTime((advance) => {
+      // A breaker's entry: 3 ms of work in 1 ms steps, checking its deadline after each.
+      const entry = (slice: Slice): boolean => {
+        for (let ms = 0; ms < 3; ms++) {
+          advance(1);
+          if (slice.due()) return true;
+        }
+        return false;
+      };
+      const a = new Slice(YIELD_INTERVAL_MS);
+      let yieldedAt = -1;
+      if (entry(a)) yieldedAt = 3;
+      // The second breaker is made just before its first entry (a downstream stage set up as
+      // rows reach it); per-operator clocks would start it fresh here.
+      const b = new Slice(YIELD_INTERVAL_MS);
+      let t = 3;
+      for (let round = 0; yieldedAt < 0 && round < 4; round++) {
+        const slice = round % 2 === 0 ? b : a;
+        for (let ms = 0; ms < 3; ms++) {
+          t += 1;
+          advance(1);
+          if (slice.due()) {
+            yieldedAt = t;
+            break;
+          }
+        }
+      }
+      expect(yieldedAt).toBeGreaterThan(0);
+      expect(yieldedAt).toBeLessThanOrEqual(YIELD_INTERVAL_MS);
+    });
+  });
+
+  it("drive() does not start a task: a pipeline started late in a task yields after its first batch", () => {
+    withTime((advance) => {
+      // 3 ms of the task went to other work before this pipeline started.
+      advance(3);
+      let pushes = 0;
+      let left = 10;
+      const source: BatchSource = {
+        next: () => {
+          advance(1);
+          return left-- > 0
+            ? { batch: { length: 1, columns: [], selection: null }, transfer: null as never }
+            : null;
+        },
+        abort: () => undefined,
+      };
+      const sink: Operator = {
+        push: () => {
+          pushes++;
+          return "ready";
+        },
+        ready: () => Promise.resolve(),
+        finish: () => undefined,
+        abort: () => undefined,
+      };
+      const run = drive(source, sink);
+      // The task's 4 ms ran out after the first batch: the driver yields (a Promise).
+      expect(run).toBeInstanceOf(Promise);
+      expect(pushes).toBe(1);
+      void run;
+    });
+  });
 });

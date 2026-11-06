@@ -42,6 +42,8 @@ const TWO_32 = 4_294_967_296;
  * a view per value; past it the view's cost is negligible next to the copy.
  */
 const LOOP_COPY_BYTES = 4096;
+/** Contiguous fixed-width appends of at most this many rows copy by a loop. */
+const SMALL_COPY = 16;
 const MAX_SAFE = Number.MAX_SAFE_INTEGER;
 
 type Varlen = Extract<VectorData, { layout: "varlen" }>;
@@ -501,7 +503,9 @@ export class ColumnStore {
 
   /**
    * Appends rows of `source` by store row id: `ids[start … start + count)`, where −1 appends a
-   * null row. Columns map store-to-store by position (`columns[c]` is the source column of `c`).
+   * null row. Columns map store-to-store by position (`columns[c]` is the source column of `c`);
+   * `columns[c] < 0` skips column c: its slots are left unwritten (empty for varlen), for a
+   * caller that never reads them (the window's partition column, emitted as a constant).
    */
   appendFrom(
     source: ColumnStore,
@@ -520,7 +524,9 @@ export class ColumnStore {
         );
       },
       (c, n, done) =>
-        this.#varlenNeedStore(source, columns[c] ?? 0, { ids, from: start + done, count: n }),
+        (columns[c] ?? 0) < 0
+          ? 0
+          : this.#varlenNeedStore(source, columns[c] ?? 0, { ids, from: start + done, count: n }),
     );
   }
 
@@ -697,7 +703,7 @@ export class ColumnStore {
     void rows;
     for (let c = 0; c < this.#columns.length; c++) {
       const column = this.#columns[c];
-      if (column === undefined) continue;
+      if (column === undefined || (columns[c] ?? 0) < 0) continue;
       const need = source.#col(columns[c] ?? 0).tier;
       if (need > column.tier && !this.#upgrade(column, need)) return false;
     }
@@ -726,6 +732,10 @@ export class ColumnStore {
     for (let c = 0; c < this.#columns.length; c++) {
       const column = this.#columns[c];
       if (column === undefined) continue;
+      if ((columns[c] ?? 0) < 0) {
+        skipRows(column, k, at, rows.count);
+        continue;
+      }
       writeFromStore(column, k, at, source.#col(columns[c] ?? 0), source.chunkShift, rows);
     }
     if (this.#columns.some((column) => column.tier === TIER_WIDE))
@@ -1027,6 +1037,16 @@ function writeSlot(
 }
 
 /** Finishes a null slot: a varlen null is an empty value; the bitmap carries the null. */
+/** Leaves `count` slots from `at` unwritten (a varlen column's values empty). */
+function skipRows(column: Column, k: number, at: number, count: number): void {
+  const target = column.chunks[k];
+  if (target?.data.layout !== "varlen") return;
+  const used = column.used[k] ?? 0;
+  const offsets = target.data.offsets;
+  if (at === 0) offsets[0] = 0;
+  for (let i = 1; i <= count; i++) offsets[at + i] = used;
+}
+
 function writeNull(column: Column, k: number, target: FlatVector, at: number, used: number): void {
   setNull(column, k, at);
   if (target.data.layout === "varlen") target.data.offsets[at + 1] = used;
@@ -1050,7 +1070,10 @@ function writeFromSource(column: Column, k: number, at: number, source: Source, 
           source.flat.data as { values: Int32Array | Float64Array | Float32Array | Uint8Array }
         ).values;
         const dst = out.values;
-        if (ids === null) dst.set(src.subarray(rows.from, rows.from + n), at);
+        // A few rows copy by a loop: a subarray per call costs more than it saves.
+        if (ids === null && n <= SMALL_COPY)
+          for (let i = 0; i < n; i++) dst[at + i] = src[rows.from + i] ?? 0;
+        else if (ids === null) dst.set(src.subarray(rows.from, rows.from + n), at);
         else if (dst instanceof Int32Array) copyI32(src as Int32Array, ids, rows.from, n, dst, at);
         else if (dst instanceof Float64Array)
           copyF64(src as Float64Array, ids, rows.from, n, dst, at);
@@ -1064,7 +1087,9 @@ function writeFromSource(column: Column, k: number, at: number, source: Source, 
         const src = (source.flat.data as typeof out).values;
         const dst = out.values;
         if (src.repr === "safe" && dst.repr === "safe") {
-          if (ids === null) dst.values.set(src.values.subarray(rows.from, rows.from + n), at);
+          if (ids === null && n <= SMALL_COPY)
+            for (let i = 0; i < n; i++) dst.values[at + i] = src.values[rows.from + i] ?? 0;
+          else if (ids === null) dst.values.set(src.values.subarray(rows.from, rows.from + n), at);
           else copyF64(src.values, ids, rows.from, n, dst.values, at);
         } else if (src.repr === "int64" && dst.repr === "int64") {
           const from = wordsOf(src.values);

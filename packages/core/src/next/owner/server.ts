@@ -35,6 +35,7 @@
  */
 import { RequestExpiredError, SessionLostError } from "../errors.js";
 import { LIVENESS_IDLE_RELEASE_MS } from "./election.js";
+import { beginTask } from "../exec/pipeline.js";
 import { QueryCancelledError } from "../exec/errors.js";
 import type { ResultFrame, ResultStream } from "../exec/result.js";
 import type { Admission, Outcome } from "../format/ledger.js";
@@ -221,6 +222,8 @@ export class OwnerServer {
     const connection = new Connection(this, port);
     this.#connections.add(connection);
     port.onmessage = (event: MessageEvent) => {
+      // A message is a task entry point: the worker's task clock starts here (ruling R23.5).
+      beginTask();
       connection.receive(event.data);
     };
   }

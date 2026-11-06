@@ -31,7 +31,7 @@ import type { Batch } from "../vector/vector.js";
 import { HASH_SEED, fmix32, levelHash } from "./join-keys.js";
 import { HashJoin, hashJoinMinimumBytes } from "./join.js";
 import { Charge, Pool } from "./spill-pool.js";
-import { drive, type Operator } from "./pipeline.js";
+import { beginTask, drive, taskClock, type Operator } from "./pipeline.js";
 import type { HashJoinKind, HashJoinSpec } from "./join.js";
 
 const KINDS: readonly HashJoinKind[] = ["inner", "left", "right", "full", "semi", "anti", "mark"];
@@ -453,15 +453,24 @@ describe("hash join: lifecycle", () => {
 
   it("runs synchronously end to end when nothing spills", async () => {
     const { governor, join } = await setup(spec("inner", types, types, 1), 64 << 20);
-    // No task yields (they are the driver's, tested in pipeline.test.ts): the join never awaits.
+    // No task yields (the task clock is frozen, and a task begins first: R23.5): the join itself
+    // never awaits.
     const options = { yieldIntervalMs: Infinity };
-    expect(
-      drive(new ArraySource(batchesOf(types, rows(3000))), join.build, undefined, options),
-    ).toBeUndefined();
+    const real = taskClock.now;
+    taskClock.now = () => 0;
     const sink = new CollectSink();
-    expect(
-      drive(new ArraySource(batchesOf(types, rows(3000))), join.probe(sink), undefined, options),
-    ).toBeUndefined();
+    try {
+      beginTask();
+      expect(
+        drive(new ArraySource(batchesOf(types, rows(3000))), join.build, undefined, options),
+      ).toBeUndefined();
+      expect(
+        drive(new ArraySource(batchesOf(types, rows(3000))), join.probe(sink), undefined, options),
+      ).toBeUndefined();
+    } finally {
+      taskClock.now = real;
+      beginTask();
+    }
     expect(sink.finished).toBe(true);
     expect(governor.usedBytes).toBe(0);
   });
