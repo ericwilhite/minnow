@@ -60,6 +60,7 @@ import {
   type ScratchSpace,
   type StorageBackend,
   type StoreSession,
+  type WriteDataOptions,
 } from "./contract.js";
 import { acquireFenced, type HeldLock, type LockManagerLike } from "./fence.js";
 import { ByteStore, inOrder } from "./idb-bytes.js";
@@ -232,6 +233,8 @@ export const IDB_BATCH_OPERATIONS = 256;
  */
 class IdbSession implements StoreSession {
   readonly epoch: number;
+  /** Relaxed writes are queued until their batch commits (`transfer` saves the copy). */
+  readonly keepsWrites = true;
   readonly #lease: IdbLease;
   readonly #data: ByteStore;
   readonly #log: ByteStore;
@@ -406,11 +409,13 @@ class IdbSession implements StoreSession {
     });
   }
 
-  async writeData(offset: number, bytes: Uint8Array): Promise<void> {
+  async writeData(offset: number, bytes: Uint8Array, options?: WriteDataOptions): Promise<void> {
     this.#mutable();
     if (offset % 4096 !== 0 || offset < 0) throw new RangeError("Unaligned data extent");
     if (bytes.length === 0) return;
-    const copy = copyOf(bytes);
+    // A transferred standalone buffer is the caller's no longer: queue it as it is (no copy).
+    const whole = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength;
+    const copy = options?.transfer === true && whole ? bytes : copyOf(bytes);
     this.#queuedDataEnd = Math.max(this.#queuedDataEnd, offset + bytes.length);
     await this.#enqueue([this.#data], [], bytes.length, (tx, next) => {
       this.#data.write(tx, offset, copy, next);

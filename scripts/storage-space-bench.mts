@@ -11,7 +11,15 @@
  */
 import { performance } from "node:perf_hooks";
 import type { BlobRef, ExtentRef } from "../packages/core/src/next/storage/extents.ts";
+import type { StorageBackend } from "../packages/core/src/next/storage/contract.ts";
+import type {
+  IdbDatabaseLike,
+  IdbRange,
+  IdbStoreLike,
+} from "../packages/core/src/next/storage/idb-like.ts";
+import { createIndexedDbBackend } from "../packages/core/src/next/storage/indexeddb.ts";
 import { MemoryBackend } from "../packages/core/src/next/storage/memory-store.ts";
+import { SimLocks } from "../packages/core/src/next/storage/sim-disk.ts";
 import { openExtentSpace } from "../packages/core/src/next/storage/space.ts";
 import {
   bytesOf,
@@ -110,4 +118,110 @@ async function main(): Promise<void> {
   await space.close();
 }
 
-await main();
+/**
+ * An IndexedDB that answers requests in order and keeps values by reference (no structured clone,
+ * no disk): the IndexedDB backend's own CPU, isolated. Never a model of IndexedDB's semantics.
+ */
+function nullIndexedDb(): IdbDatabaseLike {
+  const stores = new Map<string, Map<number | string, unknown>>();
+  const storeOf = (name: string) => {
+    let store = stores.get(name);
+    if (store === undefined) {
+      store = new Map();
+      stores.set(name, store);
+    }
+    return store;
+  };
+  const inRange = (store: Map<number | string, unknown>, range: IdbRange | null) =>
+    [...store.keys()]
+      .filter((key): key is number => typeof key === "number")
+      .filter((key) => range?.lower === undefined || key >= range.lower)
+      .filter(
+        (key) =>
+          range?.upper === undefined ||
+          key < range.upper ||
+          (key === range.upper && range.upperOpen !== true),
+      )
+      .sort((a, b) => a - b);
+  return {
+    async transaction(_names, _mode, _durability, body) {
+      const requests: Array<() => void> = [];
+      const wrap = (name: string): IdbStoreLike => {
+        const store = storeOf(name);
+        return {
+          get: (key, then) => requests.push(() => then(store.get(key))),
+          getAll: (range, then) =>
+            requests.push(() => then(inRange(store, range).map((key) => store.get(key)))),
+          getAllKeys: (range, then) => requests.push(() => then(inRange(store, range))),
+          last: (range, then) =>
+            requests.push(() => {
+              const key = inRange(store, range).at(-1);
+              then(key === undefined ? undefined : store.get(key));
+            }),
+          put: (key, value) => requests.push(() => store.set(key, value)),
+          delete: (key) => requests.push(() => store.delete(key)),
+          deleteRange: (range) =>
+            requests.push(() => inRange(store, range).forEach((key) => store.delete(key))),
+          clear: () => requests.push(() => store.clear()),
+        };
+      };
+      body({
+        store: wrap,
+        abort: (reason) => {
+          throw reason;
+        },
+      });
+      while (requests.length > 0) {
+        await Promise.resolve();
+        requests.shift()?.();
+      }
+    },
+    close: () => undefined,
+  };
+}
+
+/** CPU only: 16 interleaved builders with their own buffers, 16 MiB of 32 KiB pages, a publish. */
+async function builderRun(backend: StorageBackend): Promise<number> {
+  const session = await backend.open(await backend.acquire());
+  const space = await openExtentSpace(session, {
+    reachable: jsonReachable,
+    budget: countingBudget(Infinity),
+    registerCache: () => countingMemory(Infinity),
+  });
+  const page = bytesOf(PAGE, 3);
+  const start = performance.now();
+  const writer = space.beginWrite("columns", { budget: countingBudget(Infinity) });
+  const builders = Array.from({ length: 16 }, () => writer.open(MiB));
+  for (let index = 0; index < 32; index++)
+    for (const builder of builders) await builder.append([page]);
+  const blobs: BlobRef[] = [];
+  for (const builder of builders) blobs.push(...((await builder.seal())?.blobs ?? []));
+  await space.publish(rootOf(blobs.slice(0, 1)), { writers: [writer], retired: [] });
+  const ms = performance.now() - start;
+  await space.close();
+  return ms;
+}
+
+async function builderLane(): Promise<void> {
+  const runs = Number(process.env.RUNS ?? "9");
+  for (const [name, make] of [
+    ["memory backend", () => new MemoryBackend()],
+    [
+      "IndexedDB backend over a null IndexedDB",
+      () =>
+        createIndexedDbBackend({ database: nullIndexedDb, name: "bench", locks: new SimLocks() }),
+    ],
+  ] as const) {
+    const samples: number[] = [];
+    for (let run = 0; run < runs; run++) samples.push(await builderRun(make()));
+    samples.sort((a, b) => a - b);
+    console.log(
+      `16 builders x 1 MiB, 32 KiB pages, ${name}`.padEnd(64),
+      `median ${(samples[Math.floor(runs / 2)] ?? 0).toFixed(1)} ms  min ${(samples[0] ?? 0).toFixed(1)} ms  (${String(runs)} runs)`,
+    );
+  }
+}
+
+// `LANE=builders` runs only the builder lane (the p2e before/after comparison).
+if (process.env.LANE !== "builders") await main();
+await builderLane();

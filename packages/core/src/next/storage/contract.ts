@@ -164,6 +164,12 @@ export interface ScratchSpace {
   dispose?(): Promise<void>;
 }
 
+/** `StoreSession.writeData` options. */
+export interface WriteDataOptions {
+  /** The caller hands the bytes' buffer over (see `writeData`). */
+  readonly transfer?: boolean;
+}
+
 export interface DataRange {
   readonly offset: number;
   readonly length: number;
@@ -200,6 +206,13 @@ export interface StorageBackend {
 
 export interface StoreSession {
   readonly epoch: number;
+  /**
+   * True when `writeData` keeps the caller's bytes until a later commit (the IndexedDB session
+   * queues them), so handing a buffer over (`transfer`) saves a copy. A session that writes at
+   * once copies into its file anyway; a caller then keeps reusing its buffer (an additive member,
+   * absent meaning false).
+   */
+  readonly keepsWrites?: boolean;
 
   /** The durable root, or null for a new store. */
   readRoot(): Promise<Uint8Array | null>;
@@ -217,8 +230,13 @@ export interface StoreSession {
   /**
    * Writes bytes at `offset` (a multiple of `DATA_ALIGN`). Durable at the next publish. The caller
    * may reuse `bytes` once the call resolves (the extent space writes from one reused slab).
+   *
+   * With `transfer` (an additive option), the caller hands `bytes` and its whole buffer over: the
+   * session may keep them instead of copying (the IndexedDB session queues them as they are), and
+   * the caller must never read, write or reuse that buffer again. A session that writes at once
+   * (the file store) ignores it; callers transfer only to a session that `keepsWrites`.
    */
-  writeData(offset: number, bytes: Uint8Array): Promise<void>;
+  writeData(offset: number, bytes: Uint8Array, options?: WriteDataOptions): Promise<void>;
   /**
    * Reads byte ranges. Adjacent ranges may be coalesced into one platform read. Results are in
    * request order, may share one ArrayBuffer, and must not be mutated or transferred (copy first).

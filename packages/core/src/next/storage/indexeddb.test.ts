@@ -96,6 +96,33 @@ describe("IndexedDB backend over the simulated IndexedDB", () => {
     await session.releaseData([{ offset: 2 * 4096, length: 3 * 4096 }]);
     expect(await session.dataLength()).toBe(4096);
   });
+
+  it("queues a transferred whole buffer as it is and copies everything else (p2e)", async () => {
+    const backend = backendOver(new SimDisk());
+    const session = await backend.open(await backend.acquire());
+    expect(session.keepsWrites).toBe(true);
+    // Writes are queued (batched) until the publish. A caller that changes its buffer after the
+    // call resolves changes nothing unless it transferred the buffer (which it promised not to do:
+    // the change here only shows that no copy was made).
+    const copied = bytes(4096, 1);
+    const transferred = bytes(4096, 2);
+    const view = bytes(2 * 4096, 3).subarray(4096); // not a whole buffer: copied even if offered
+    await session.writeData(0, copied);
+    await session.writeData(4096, transferred, { transfer: true });
+    await session.writeData(2 * 4096, view, { transfer: true });
+    copied.fill(9);
+    transferred.fill(9);
+    view.fill(9);
+    await session.publish(new Uint8Array([1]));
+    const [first, second, third] = await session.readData([
+      { offset: 0, length: 4096 },
+      { offset: 4096, length: 4096 },
+      { offset: 2 * 4096, length: 4096 },
+    ]);
+    expect(first).toEqual(bytes(4096, 1));
+    expect(second).toEqual(new Uint8Array(4096).fill(9));
+    expect(third).toEqual(bytes(2 * 4096, 3).subarray(4096));
+  });
 });
 
 describe("simulated IndexedDB", () => {

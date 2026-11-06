@@ -214,7 +214,10 @@ is access's `Snapshot`.
   `minnow-core/` and `minnow-core:<name>`.
 - A writer that interleaves many builders (the page format's group writer) passes a `budget` to
   `beginWrite`: each builder stages up to 256 KiB of its own. Without it, alternating page-by-page
-  appends cost one platform write per page (measured 2–9× a flush on Chromium and Firefox).
+  appends cost one platform write per page (measured 2–9× a flush on Chromium and Firefox). To a
+  session that keeps its writes until a commit (`keepsWrites`: IndexedDB), a full buffer is handed
+  over (`transfer`) instead of copied, and the builder stages on in a fresh one; a session that
+  writes at once (OPFS, memory) copies into its file, so the buffer is reused.
 - The simulated disk crashes at any physical step. Every write after the last flush may land
   whole, torn or not at all, and may land out of order. It models honest and lying flush.
 - A backend is accepted by the **storage kit** (`kit.ts`): the conformance cases together with a

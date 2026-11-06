@@ -237,6 +237,96 @@ describe("extent space: per-builder staging buffers (writer budget)", () => {
     await (space as unknown as { settled(): Promise<void> }).settled();
     await space.audit();
   });
+
+  it("transfers nothing to a session that writes at once (it copies into its file anyway)", async () => {
+    let transfers = 0;
+    const { space } = await openOver(new MemoryBackend(), {
+      wrap: (session) =>
+        new Proxy(session, {
+          get(target, key) {
+            const value: unknown = Reflect.get(target, key);
+            if (key === "writeData")
+              return (offset: number, bytes: Uint8Array, options?: { transfer?: boolean }) => {
+                if (options?.transfer === true) transfers += 1;
+                return target.writeData(offset, bytes, options);
+              };
+            return typeof value === "function"
+              ? (value as (...args: unknown[]) => unknown).bind(target)
+              : value;
+          },
+        }),
+    });
+    const writer = space.beginWrite("t", { budget: countingBudget(Infinity) });
+    const builder = writer.open(2 << 20);
+    await builder.append([bytesOf(3 * BUILDER_BUFFER_BYTES, 1)]);
+    expect(await builder.seal()).not.toBeNull();
+    expect(transfers).toBe(0);
+    await writer.abort();
+  });
+
+  it("hands a full buffer to the session and never touches it again; budgets return exactly once", async () => {
+    // Every buffer the space transfers, with its bytes at handover.
+    const handed: Array<{ readonly bytes: Uint8Array; readonly snapshot: Uint8Array }> = [];
+    const { space, budget: reader } = await openOver(new MemoryBackend(), {
+      wrap: (session) =>
+        new Proxy(session, {
+          get(target, key) {
+            // A session that keeps what it is given (as the IndexedDB session queues writes).
+            if (key === "keepsWrites") return true;
+            if (key !== "writeData") {
+              const value: unknown = Reflect.get(target, key);
+              return typeof value === "function"
+                ? (value as (...args: unknown[]) => unknown).bind(target)
+                : value;
+            }
+            return (offset: number, bytes: Uint8Array, options?: { transfer?: boolean }) => {
+              if (options?.transfer === true) {
+                expect(bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength).toBe(
+                  true,
+                );
+                handed.push({ bytes, snapshot: bytes.slice() });
+              }
+              return target.writeData(offset, bytes, options);
+            };
+          },
+        }),
+    });
+    const charge = countingBudget(2 * BUILDER_BUFFER_BYTES);
+    const writer = space.beginWrite("columns", { budget: charge });
+    const builders = [writer.open(2 << 20), writer.open(2 << 20)];
+    const expected: Uint8Array[][] = [[], []];
+    let seed = 1;
+    // About 1.1 MiB each: four full buffers per builder.
+    for (let round = 0; round < 70; round++)
+      for (let index = 0; index < builders.length; index++) {
+        const part = bytesOf(9_000 + ((round * 977 + index * 7) % 13_000), seed++);
+        await at(builders, index).append([part]);
+        at(expected, index).push(part);
+      }
+    // Both builders filled their buffer several times: each full one was handed over.
+    expect(handed.length).toBe(8);
+    expect(new Set(handed.map(({ bytes }) => bytes.buffer)).size).toBe(handed.length);
+    const sealed = await at(builders, 0).seal();
+    if (sealed === null) throw new Error("sealed empty");
+    expect(charge.used).toBe(BUILDER_BUFFER_BYTES);
+    // The sealed builder's bytes are exact.
+    const flat = at(expected, 0);
+    for (let index = 0; index < sealed.blobs.length; index++) {
+      const lease = await space.read([at(sealed.blobs, index)], { budget: reader });
+      expect(sameBytes(lease.bytes[0], flat[index]), `blob ${String(index)}`).toBe(true);
+      lease.release();
+    }
+    // A third builder takes the freed buffer's budget, then everything still open is aborted.
+    const late = writer.open(1 << 20);
+    await late.append([bytesOf(BUILDER_BUFFER_BYTES + 5_000, 99)]);
+    await writer.abort();
+    expect(charge.used).toBe(0);
+    // Nothing wrote into a buffer after handing it over.
+    for (const [index, { bytes, snapshot }] of handed.entries())
+      expect(sameBytes(bytes, snapshot), `handed buffer ${String(index)}`).toBe(true);
+    await (space as unknown as { settled(): Promise<void> }).settled();
+    await space.audit();
+  });
 });
 
 describe("extent space: two-generation reclaim (ruling R8)", () => {
