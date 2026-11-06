@@ -668,8 +668,9 @@ export class ChunkReader {
       lease.drop();
       throw new PageBudgetError(length);
     }
-    let raw: Uint8Array = new Uint8Array(length);
+    let raw: Uint8Array;
     try {
+      raw = new Uint8Array(length); // inside: a failed allocation gives the charge back too
       await inflateInto(sized(stored, entry.length), raw);
     } catch (error) {
       this.#options.budget.free(length);
@@ -813,12 +814,20 @@ export class ChunkReader {
     if (kept !== undefined) return kept;
     const bytes = dictionary.size * 4;
     if (!this.#options.budget.allocate(bytes)) throw new PageBudgetError(bytes);
-    const map = new Int32Array(dictionary.size);
-    const offsets = dictionary.offsets;
-    for (let code = 0; code < dictionary.size; code++) {
-      const start = offsets === null ? code * 16 : (offsets[code] ?? 0);
-      const end = offsets === null ? start + 16 : (offsets[code + 1] ?? 0);
-      map[code] = intern(dictionary.bytes, start, end);
+    // Provisional until every entry is interned: a throwing interner (or allocation) gives the
+    // reservation back and records nothing (review B2-p2f #1).
+    let map: Int32Array;
+    try {
+      map = new Int32Array(dictionary.size);
+      const offsets = dictionary.offsets;
+      for (let code = 0; code < dictionary.size; code++) {
+        const start = offsets === null ? code * 16 : (offsets[code] ?? 0);
+        const end = offsets === null ? start + 16 : (offsets[code + 1] ?? 0);
+        map[code] = intern(dictionary.bytes, start, end);
+      }
+    } catch (error) {
+      this.#options.budget.free(bytes);
+      throw error;
     }
     this.#translations.set(intern, map);
     return map;
@@ -996,7 +1005,12 @@ export class ChunkReader {
           throw new RangeError("A dictionary page needs its dictionary loaded");
         const bytes = ((dictionary.size + 31) >>> 5) * 4;
         if (!this.#options.budget.allocate(bytes)) throw new PageBudgetError(bytes);
-        codes = dictionaryMatches(dictionary, compiled);
+        try {
+          codes = dictionaryMatches(dictionary, compiled);
+        } catch (error) {
+          this.#options.budget.free(bytes);
+          throw error;
+        }
         this.#codes.set(compiled, codes);
       }
     }
@@ -1020,9 +1034,16 @@ export class ChunkReader {
     rows = Math.min(rows, 4096); // decoded in chunks of this many rows
     const bytes = scratchBytes(rows);
     if (!this.#options.budget.allocate(bytes)) throw new PageBudgetError(bytes);
+    let scratch: SelectScratch;
+    try {
+      scratch = newScratch(rows);
+    } catch (error) {
+      this.#options.budget.free(bytes);
+      throw error;
+    }
     this.#scratchCharge = bytes;
-    this.#scratch = newScratch(rows);
-    return this.#scratch;
+    this.#scratch = scratch;
+    return scratch;
   }
 
   // ── Out-of-line values ──────────────────────────────────────────────────────────────────
