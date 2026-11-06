@@ -8,9 +8,11 @@
  * - `tx`: one transaction of `rows` keyed rows (id INT PRIMARY KEY, v TEXT, n INT) inserted in
  *   calls of `batch` rows (staged as it goes), committed, then quiesced (the fold).
  * - `commits`: the same rows in autocommit transactions of `commit` rows.
- * - `single`: `singles` one-row autocommit inserts after a 100k-row table: µs per insert (wall
- *   and process CPU), the relaxed lane's owner cost.
- * Reported: wall and CPU per phase, rows/s, staged and flushed counts. The memory store has no
+ * - `single`: `singles` one-row transactions after a 100k-row table, each acknowledged as its
+ *   durability says (strict: after its flush; relaxed: at commit): µs per insert (wall and process
+ *   CPU), the relaxed lane's owner cost.
+ * Rows are built before the clock starts (the engine's cost alone is measured). Reported: wall
+ * and CPU per phase, rows/s, staged and flushed counts. The memory store has no
  * disk: durable here means the log's flush calls complete, not a real fsync. The machine is
  * shared: compare runs made back to back.
  */
@@ -79,40 +81,48 @@ if (MODE === "single") {
     await autocommit(path, (s) => s.table(t).insert(columns(ids), null));
   }
   await path.quiesce();
+  // Built before the clock starts: the engine's cost alone is measured.
+  const singles = Array.from({ length: SINGLES }, (_, k) => columns([1_000_000 + k]));
   const wall0 = performance.now();
   const cpu0 = cpu();
-  for (let k = 0; k < SINGLES; k++) {
-    const id = 1_000_000 + k;
-    await autocommit(path, (s) => s.table(t).insert(columns([id]), null));
+  // A commit is acknowledged as its mode says: strict after the log flush, relaxed at commit.
+  for (const row of singles) {
+    const tx = await path.begin();
+    const s = tx.statement({ rules });
+    await s.table(t).insert(row, null);
+    await s.end();
+    const receipt = await tx.commit(null);
+    if (DURABILITY === "strict") await receipt.durable;
   }
+  await path.flush();
   report.singleWallUs = Number((((performance.now() - wall0) * 1000) / SINGLES).toFixed(1));
   report.singleCpuUs = Number((((cpu() - cpu0) * 1000) / SINGLES).toFixed(1));
 } else {
+  // Every batch is built before the clock starts: the engine's cost alone is measured.
+  const batches: Array<{ commit: number; batch: ReturnType<typeof columns> }> = [];
+  for (let from = 0; from < ROWS; from += BATCH) {
+    const ids = Array.from({ length: Math.min(BATCH, ROWS - from) }, (_, k) => from + k);
+    batches.push({ commit: Math.floor(from / COMMIT), batch: columns(ids) });
+  }
   const wall0 = performance.now();
   const cpu0 = cpu();
   gcMs = 0;
   if (MODE === "tx") {
     const tx = await path.begin();
     const s = tx.statement({ rules });
-    for (let from = 0; from < ROWS; from += BATCH) {
-      const ids = Array.from({ length: Math.min(BATCH, ROWS - from) }, (_, k) => from + k);
-      await s.table(t).insert(columns(ids), null);
-    }
+    for (const { batch: part } of batches) await s.table(t).insert(part, null);
     await s.end();
     await (
       await tx.commit(null)
     ).durable;
   } else {
-    for (let from = 0; from < ROWS; from += COMMIT) {
+    // Batches of `batch` rows grouped into commits of about `commit` rows.
+    for (let k = 0; k < batches.length;) {
+      const commit = batches[k]?.commit;
       const tx = await path.begin();
       const s = tx.statement({ rules });
-      for (let at = from; at < Math.min(ROWS, from + COMMIT); at += BATCH) {
-        const ids = Array.from(
-          { length: Math.min(BATCH, from + COMMIT - at, ROWS - at) },
-          (_, k) => at + k,
-        );
-        await s.table(t).insert(columns(ids), null);
-      }
+      for (; k < batches.length && batches[k]?.commit === commit; k++)
+        await s.table(t).insert(batches[k]?.batch ?? columns([]), null);
       await s.end();
       await (
         await tx.commit(null)
