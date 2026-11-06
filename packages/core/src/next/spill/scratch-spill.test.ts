@@ -9,7 +9,7 @@ import {
 import { FileScratch } from "../storage/file-store.js";
 import { MemoryFile } from "../storage/memory-store.js";
 import { SimBackend, SimDisk } from "../storage/sim-disk.js";
-import { sameBytes as same } from "../storage/space-test-support.js";
+import { expectBytes } from "../storage/space-test-support.js";
 import { SpillCorruptionError, SpillQuotaError, type SpillPageRef } from "./contract.js";
 import { SPILL_BATCH_BYTES, ScratchSpillService } from "./scratch-spill.js";
 
@@ -52,7 +52,7 @@ describe("scratch spill service", () => {
     for (let index = 0; index < 40; index++) refs.push(await file.append(page(20_000, index)));
     // 40 × 20 KB crossed the 256 KiB batch several times; every page reads back.
     for (const [index, ref] of refs.entries())
-      expect(same(await file.read(ref), page(20_000, index)), `page ${String(index)}`).toBe(true);
+      expectBytes(await file.read(ref), page(20_000, index), `page ${String(index)}`);
     const target = new Uint8Array(20_000);
     const last = refs.at(-1);
     if (last === undefined) throw new Error("no refs");
@@ -82,12 +82,12 @@ describe("scratch spill service", () => {
     const small = await file.append(page(100, 1));
     const big = await file.append(page(SPILL_BATCH_BYTES + 5, 2));
     expect(await file.read(small)).toEqual(page(100, 1));
-    expect(await file.read(big)).toEqual(page(SPILL_BATCH_BYTES + 5, 2));
+    expectBytes(await file.read(big), page(SPILL_BATCH_BYTES + 5, 2));
     const batched = await service.create(2, budget(1 << 20));
     const before = await batched.append(page(10, 3));
     const huge = await batched.append(page(SPILL_BATCH_BYTES + 1, 4));
     expect(await batched.read(before)).toEqual(page(10, 3));
-    expect(await batched.read(huge)).toEqual(page(SPILL_BATCH_BYTES + 1, 4));
+    expectBytes(await batched.read(huge), page(SPILL_BATCH_BYTES + 1, 4));
   });
 
   it("refuses a corrupted page, maps quota to SpillQuotaError, and fences a lost owner", async () => {
@@ -167,11 +167,12 @@ describe("scratch spill service", () => {
           entry.pages.push([await entry.file.append(bytes), bytes]);
         } else if (entry.pages.length > 0) {
           const [ref, bytes] = entry.pages[Math.floor(random() * entry.pages.length)] ?? [];
-          if (ref !== undefined) expect(same(await entry.file.read(ref), bytes)).toBe(true);
+          if (ref !== undefined && bytes !== undefined)
+            expectBytes(await entry.file.read(ref), bytes);
         }
       }
       for (const { file, pages } of files.values()) {
-        for (const [ref, bytes] of pages) expect(same(await file.read(ref), bytes)).toBe(true);
+        for (const [ref, bytes] of pages) expectBytes(await file.read(ref), bytes);
         await file.close();
       }
       expect(service.bytesInUse).toBe(0);

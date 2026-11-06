@@ -23,6 +23,8 @@ import { xxHash32 } from "../hash/xxhash32.js";
 import {
   at,
   bytesOf,
+  expectBytes,
+  firstDifference,
   sameBytes,
   countingBudget,
   countingMemory,
@@ -32,7 +34,7 @@ import {
 } from "./space-test-support.js";
 
 describe("test support", () => {
-  it("bytesOf is its per-byte pattern, and sameBytes finds any difference, aligned or not", () => {
+  it("bytesOf is its per-byte pattern; firstDifference finds the first difference, aligned or not", () => {
     // Both helpers avoid per-byte loops (coverage counts every iteration); they must still mean
     // exactly what the per-byte definitions meant, or every byte check here would be vacuous.
     for (const length of [0, 1, 255, 256, 257, 511, 513, 4095, 100_003])
@@ -47,9 +49,20 @@ describe("test support", () => {
     for (const at of [0, 3, 4, 5_000, 9_999, 10_000]) {
       const changed = base.slice();
       changed[at] = (changed[at] ?? 0) ^ 1;
+      expect(firstDifference(changed, base)).toBe(at);
       expect(sameBytes(base, changed)).toBe(false);
+      // Unaligned views take the bytewise path.
+      expect(firstDifference(changed.subarray(1), base.subarray(1))).toBe(at === 0 ? -1 : at - 1);
       expect(sameBytes(base.subarray(1), changed.subarray(1))).toBe(at === 0);
+      expect(() => {
+        expectBytes(changed, base, "probe");
+      }).toThrow(`first difference at offset ${String(at)}`);
     }
+    // A prefix differs at the shorter length.
+    expect(firstDifference(base.subarray(0, 7), base)).toBe(7);
+    expect(() => {
+      expectBytes(undefined, base);
+    }).toThrow("got undefined");
     expect(sameBytes(base, base.slice())).toBe(true);
     expect(sameBytes(base.subarray(2, 900), base.slice(2, 900))).toBe(true);
     expect(sameBytes(base, base.subarray(1))).toBe(false);
@@ -77,7 +90,10 @@ describe("extent space: writing, publishing and reopening", () => {
     expect(await space.publish(rootOf(blobs), { writers: [writer], retired: [] })).toBe(1);
     expect(writer.state).toBe("published");
     const lease = await space.read(blobs, { budget });
-    expect(lease.bytes).toEqual([bytesOf(10, 1), bytesOf(5000, 2), bytesOf(30, 3)]);
+    expect(lease.bytes.length).toBe(3);
+    [bytesOf(10, 1), bytesOf(5000, 2), bytesOf(30, 3)].forEach((bytes, index) => {
+      expectBytes(lease.bytes[index], bytes, `blob ${String(index)}`);
+    });
     lease.release();
     await space.audit();
     await space.close();
@@ -85,7 +101,7 @@ describe("extent space: writing, publishing and reopening", () => {
     const again = await openOver(backend, { reuseLock: true });
     expect(again.space.root).toEqual(rootOf(blobs));
     const reread = await again.space.read(blobs, { budget: again.budget });
-    expect(reread.bytes[1]).toEqual(bytesOf(5000, 2));
+    expectBytes(reread.bytes[1], bytesOf(5000, 2), "reread blob 1");
     reread.release();
     await again.space.audit();
   });
@@ -110,14 +126,18 @@ describe("extent space: writing, publishing and reopening", () => {
     expect(moved.extent.length).toBe(4090 + 20 + 5000);
     const blobs = [...grown.blobs, ...neighbour.blobs, ...moved.blobs];
     const lease = await space.read(blobs, { budget });
-    expect(lease.bytes).toEqual([
+    const parts = [
       bytesOf(4000, 1),
       bytesOf(9000, 2),
       bytesOf(100, 4),
       bytesOf(4090, 3),
       bytesOf(20, 5),
       bytesOf(5000, 6),
-    ]);
+    ];
+    expect(lease.bytes.length).toBe(parts.length);
+    parts.forEach((bytes, index) => {
+      expectBytes(lease.bytes[index], bytes, `blob ${String(index)}`);
+    });
     lease.release();
     await space.publish(rootOf(blobs), { writers: [writer], retired: [] });
     await space.audit();
@@ -157,7 +177,7 @@ describe("extent space: writing, publishing and reopening", () => {
     const flat = expected.flat();
     for (let index = 0; index < blobs.length; index++) {
       const lease = await space.read([at(blobs, index)], { budget });
-      expect(sameBytes(lease.bytes[0], flat[index]), `blob ${String(index)}`).toBe(true);
+      expectBytes(lease.bytes[0], at(flat, index), `blob ${String(index)}`);
       lease.release();
     }
     await space.publish(rootOf(blobs), { writers: [writer], retired: [] });
@@ -247,10 +267,7 @@ describe("extent space: per-builder staging buffers (writer budget)", () => {
     expect(charge.used).toBe(0);
     for (let index = 0; index < blobs.length; index++) {
       const lease = await space.read([at(blobs, index)], { budget: reader });
-      expect(
-        sameBytes(lease.bytes[0], expected.slice(0, 3).flat()[index]),
-        `blob ${String(index)}`,
-      ).toBe(true);
+      expectBytes(lease.bytes[0], at(expected.slice(0, 3).flat(), index), `blob ${String(index)}`);
       lease.release();
     }
     const aborted = space.beginWrite("aborted", { budget: charge });
@@ -338,7 +355,7 @@ describe("extent space: per-builder staging buffers (writer budget)", () => {
     const flat = at(expected, 0);
     for (let index = 0; index < sealed.blobs.length; index++) {
       const lease = await space.read([at(sealed.blobs, index)], { budget: reader });
-      expect(sameBytes(lease.bytes[0], flat[index]), `blob ${String(index)}`).toBe(true);
+      expectBytes(lease.bytes[0], at(flat, index), `blob ${String(index)}`);
       lease.release();
     }
     // A third builder takes the freed buffer's budget, then everything still open is aborted.
@@ -348,7 +365,7 @@ describe("extent space: per-builder staging buffers (writer budget)", () => {
     expect(charge.used).toBe(0);
     // Nothing wrote into a buffer after handing it over.
     for (const [index, { bytes, snapshot }] of handed.entries())
-      expect(sameBytes(bytes, snapshot), `handed buffer ${String(index)}`).toBe(true);
+      expectBytes(bytes, snapshot, `handed buffer ${String(index)}`);
     await (space as unknown as { settled(): Promise<void> }).settled();
     await space.audit();
   });
@@ -635,7 +652,7 @@ describe("review B1-p2a findings", () => {
     // The previous root's data is untouched.
     expect(await session.dataLength()).toBe(8192);
     const [bytes] = await session.readData([{ offset: 0, length: 8192 }]);
-    expect(bytes).toEqual(bytesOf(8192, 1));
+    expectBytes(bytes, bytesOf(8192, 1));
   });
 
   it("2: reads distinct blobs at one address by full identity, zero-length ones included", async () => {

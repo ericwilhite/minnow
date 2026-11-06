@@ -9,6 +9,7 @@
  */
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import { describe, expect, it } from "vitest";
+import { expectBytes } from "./space-test-support.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import { OwnershipLostError, StoreCorruptionError } from "./contract.js";
 import { ByteStore, IDB_RECORD_BYTES } from "./idb-bytes.js";
@@ -71,8 +72,8 @@ describe("reads select inside their transaction (finding 1)", () => {
     await Promise.all([rearranging, reading]);
     fresh.commit();
     // IndexedDB runs the read after the read-write transaction created before it.
-    expect(target.subarray(0, 4096)).toEqual(new Uint8Array(4096));
-    expect(target.subarray(4096)).toEqual(filled(4096, 2));
+    expectBytes(target.subarray(0, 4096), new Uint8Array(4096), "released half");
+    expectBytes(target.subarray(4096), filled(4096, 2), "rewritten half");
     db.close();
   });
 
@@ -170,7 +171,7 @@ describe("reads select inside their transaction (finding 1)", () => {
     await session.writeData(0, filled(100, 1));
     await session.writeData(3 * 4096, filled(100, 2));
     const [hole] = await session.readData([{ offset: 4096, length: 8192 }]);
-    expect(hole).toEqual(new Uint8Array(8192));
+    expectBytes(hole, new Uint8Array(8192), "hole");
     const [edge] = await session.readData([{ offset: 50, length: 100 }]);
     expect(edge).toEqual(Uint8Array.from({ length: 100 }, (_, index) => (index < 50 ? 1 : 0)));
     await session.close();
@@ -267,7 +268,7 @@ describe("the stored index is validated (finding 2)", () => {
     const session = await backend.open(await backend.acquire());
     const [bytes] = await session.readData([{ offset: 0, length: 4106 }]);
     expect(bytes?.subarray(0, 4)).toEqual(filled(4, 7));
-    expect(bytes?.subarray(4, 4096)).toEqual(new Uint8Array(4092));
+    expectBytes(bytes?.subarray(4, 4096), new Uint8Array(4092), "gap");
     expect(bytes?.subarray(4096)).toEqual(filled(10, 7));
     await session.close();
     db.close();

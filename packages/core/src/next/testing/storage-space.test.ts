@@ -10,7 +10,7 @@ import type { BlobRef } from "../storage/extents.js";
 import { MemoryBackend } from "../storage/memory-store.js";
 import { ENTRY_OVERHEAD, FIXED_CACHE_BYTES } from "../storage/page-cache.js";
 import { openExtentSpace } from "../storage/space.js";
-import { at, bytesOf, jsonReachable } from "../storage/space-test-support.js";
+import { at, bytesOf, expectBytes, jsonReachable } from "../storage/space-test-support.js";
 
 const MiB = 1 << 20;
 
@@ -67,7 +67,7 @@ describe("extent space under the memory governor", () => {
     const pinned = await space.read([at(blobs, 0)], { budget: query });
     expect(query.tryGrow(10 * MiB)).toBe(true);
     expect(space.stats.cache.residentBytes).toBeLessThan(resident);
-    expect(space.peek(at(blobs, 0))).toEqual(bytesOf(32_768, 0));
+    expectBytes(space.peek(at(blobs, 0)), bytesOf(32_768, 0), "pinned blob");
     entries = Math.round(
       (space.stats.cache.residentBytes - space.stats.cache.pinnedBytes) / 32_768,
     );

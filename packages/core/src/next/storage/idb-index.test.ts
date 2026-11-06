@@ -4,6 +4,7 @@
  * registration, and small log appends of one batch share records.
  */
 import { describe, expect, it } from "vitest";
+import { expectBytes } from "./space-test-support.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import { ByteStore, CHARGE_STEP, INDEX_BLOCK, IntervalIndex, type Interval } from "./idb-bytes.js";
 import { LOG_COALESCE_BYTES, createIndexedDbBackend } from "./indexeddb.js";
@@ -173,7 +174,7 @@ describe("the in-memory index (finding 4)", () => {
     const log = await ByteStore.load(db, "log");
     // 200,000 bytes in ≤ 64 KiB runs: 4 records (and 1 for the large append).
     expect(log.records).toBe(Math.ceil(200_000 / LOG_COALESCE_BYTES) + 1);
-    expect(await session.readLog(0, length)).toEqual(expected.subarray(0, length));
+    expectBytes(await session.readLog(0, length), expected.subarray(0, length), "log");
     await session.close();
   });
 });
