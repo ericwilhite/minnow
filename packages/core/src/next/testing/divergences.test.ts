@@ -110,7 +110,7 @@ describe("key-forwarding matcher", () => {
     expect(
       id(
         observation({
-          statements: [statement({ kind: "update", table: "t", matchedKeys: [51] })],
+          statements: [statement({ kind: "update", table: "t", matchedKeys: [51], assigned: [1] })],
           oracle: refused,
         }),
       ),
@@ -232,10 +232,17 @@ describe("key-forwarding matcher", () => {
         }),
       ),
     ).toBeNull();
+    /** A parent t(id, v) updated through the forward (v 2 -> 1), or deleted through it. */
     const parentRow = (key: number): DifferingRow => ({
       table: "t",
       key,
       oracle: { values: [key, 1], references: [] },
+      authority: { values: [key, 2], references: [] },
+    });
+    const deletedParent = (key: number): DifferingRow => ({
+      table: "t",
+      key,
+      oracle: null,
       authority: { values: [key, 2], references: [] },
     });
     /** A child whose PostgreSQL version references `before` and the current engine's `after`. */
@@ -254,7 +261,7 @@ describe("key-forwarding matcher", () => {
     expect(
       id(
         observation({
-          statements: [statement({ kind: "update", table: "t", matchedKeys: [51] })],
+          statements: [statement({ kind: "update", table: "t", matchedKeys: [51], assigned: [1] })],
           ...differ(parentRow(99)),
         }),
       ),
@@ -264,7 +271,7 @@ describe("key-forwarding matcher", () => {
       id(
         observation({
           statements: [statement({ kind: "delete", table: "t", matchedKeys: [51] })],
-          ...differ(parentRow(99), childRow(4, 99, "absent")),
+          ...differ(deletedParent(99), childRow(4, 99, "absent")),
         }),
       ),
     ).toBe("key-forwarding");
@@ -272,7 +279,7 @@ describe("key-forwarding matcher", () => {
     expect(
       id(
         observation({
-          statements: [statement({ kind: "update", table: "t", matchedKeys: [51] })],
+          statements: [statement({ kind: "update", table: "t", matchedKeys: [51], assigned: [1] })],
           ...differ(parentRow(99), parentRow(7)),
         }),
       ),
@@ -280,7 +287,7 @@ describe("key-forwarding matcher", () => {
     expect(
       id(
         observation({
-          statements: [statement({ kind: "update", table: "t", matchedKeys: [51] })],
+          statements: [statement({ kind: "update", table: "t", matchedKeys: [51], assigned: [1] })],
           rowsDiffer: true,
         }),
       ),
@@ -288,7 +295,7 @@ describe("key-forwarding matcher", () => {
     expect(
       id(
         observation({
-          statements: [statement({ kind: "update", table: "t", matchedKeys: [52] })],
+          statements: [statement({ kind: "update", table: "t", matchedKeys: [52], assigned: [1] })],
           ...differ(parentRow(99)),
         }),
       ),
@@ -296,7 +303,7 @@ describe("key-forwarding matcher", () => {
     expect(
       id(
         observation({
-          statements: [statement({ kind: "update", table: "t", matchedKeys: [51] })],
+          statements: [statement({ kind: "update", table: "t", matchedKeys: [51], assigned: [1] })],
           rowsDiffer: false,
         }),
       ),
@@ -308,8 +315,19 @@ describe("key-forwarding matcher", () => {
     expect(id(observation({ statements: [del], ...differ(childRow(4, 99, null)) }))).toBe(
       "key-forwarding",
     );
+    const moved = (key: number): DifferingRow => ({
+      table: "t",
+      key,
+      oracle: { values: [key, 2], references: [] },
+      authority: null,
+    });
     expect(
-      id(observation({ statements: [rekey], ...differ(parentRow(60), childRow(4, 99, 60)) })),
+      id(
+        observation({
+          statements: [rekey],
+          ...differ(deletedParent(99), moved(60), childRow(4, 99, 60)),
+        }),
+      ),
     ).toBe("key-forwarding");
     expect(id(observation({ statements: [rekey], ...differ(childRow(4, 99, 61)) }))).toBeNull();
     expect(id(observation({ statements: [del], ...differ(childRow(4, 98, "absent")) }))).toBeNull();
@@ -441,6 +459,103 @@ describe("key-forwarding matcher", () => {
           unrelated ? null : "key-forwarding",
         );
         if (unrelated) negatives += 1;
+        else positives += 1;
+      }
+      expect(positives).toBeGreaterThan(50);
+      expect(negatives).toBeGreaterThan(50);
+    });
+
+  it("a forwarded DELETE does not explain a retained parent with a changed value (review B3-p2b-3 A2)", () => {
+    expect(
+      id(
+        observation({
+          statements: [
+            statement({
+              sql: "DELETE FROM t WHERE id=51",
+              kind: "delete",
+              table: "t",
+              matchedKeys: [51],
+            }),
+          ],
+          rowsDiffer: true,
+          differingRows: [
+            {
+              table: "t",
+              key: 99,
+              authority: { values: [99, "correct"], references: [] },
+              oracle: { values: [99, "corrupted"], references: [] },
+            },
+          ],
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  const PARENT_SEEDS = seedsFor("next-testing-forwarding-parent", [811, 812, 813, 814]);
+  for (const seed of PARENT_SEEDS)
+    it(`a parent difference matches only the effect its operation has (seed ${String(seed)})`, () => {
+      const random = mulberry32(seed);
+      const int = (n: number) => Math.floor(random() * n);
+      let positives = 0;
+      let negatives = 0;
+      for (let k = 0; k < 300; k++) {
+        // t(id, a, b): 51 forwards to 99; the statement goes through 51.
+        const original: unknown[] = [99, int(10), `b${String(int(5))}`];
+        const kind = (["delete", "update", "rekey"] as const)[int(3)] ?? "delete";
+        const assignedColumn = 1 + int(2); // an UPDATE assigns a or b
+        const unassigned = assignedColumn === 1 ? 2 : 1;
+        const kept = (after: unknown[]): DifferingRow => ({
+          table: "t",
+          key: 99,
+          oracle: { values: after, references: [] },
+          authority: { values: original, references: [] },
+        });
+        const gone: DifferingRow = {
+          table: "t",
+          key: 99,
+          oracle: null,
+          authority: { values: original, references: [] },
+        };
+        const arrived = (after: unknown[]): DifferingRow => ({
+          table: "t",
+          key: 60,
+          oracle: { values: after, references: [] },
+          authority: null,
+        });
+        const wrong = random() < 0.5;
+        let rows: DifferingRow[];
+        if (kind === "delete")
+          // Wrong: the row kept, a value changed.
+          rows = wrong ? [kept([99, "x", original[2]])] : [gone];
+        else if (kind === "update") {
+          const after = [...original];
+          after[assignedColumn] = "set";
+          // Wrong: a column the UPDATE does not assign changed too.
+          if (wrong) after[unassigned] = "unassigned";
+          rows = [kept(after)];
+        } else
+          // Wrong: the moved row lost a value on the way.
+          rows = [gone, arrived(wrong ? [60, "lost", original[2]] : [60, ...original.slice(1)])];
+        const matched = id(
+          observation({
+            statements: [
+              statement({
+                kind,
+                table: "t",
+                matchedKeys: [51],
+                newKeys: kind === "rekey" ? [60] : [],
+                ...(kind === "update" ? { assigned: [assignedColumn] } : {}),
+              }),
+            ],
+            rowsDiffer: true,
+            differingRows: rows,
+          }),
+        );
+        expect(
+          matched,
+          `seed ${String(seed)} case ${String(k)} (${kind}, wrong ${String(wrong)})`,
+        ).toBe(wrong ? null : "key-forwarding");
+        if (wrong) negatives += 1;
         else positives += 1;
       }
       expect(positives).toBeGreaterThan(50);

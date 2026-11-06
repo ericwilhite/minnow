@@ -31,6 +31,8 @@ export interface StatementFacts {
   readonly matchedKeys: readonly number[];
   /** Foreign-key values it writes, with the table each references. */
   readonly references: ReadonlyArray<{ readonly table: string; readonly value: number }>;
+  /** For an UPDATE: the columns (positions in the table's column order) it assigns. */
+  readonly assigned?: readonly number[];
 }
 
 /** How one side ended a step. */
@@ -203,6 +205,7 @@ function explainedByForwarding(observation: DivergenceObservation): boolean {
       readonly kind: StatementFacts["kind"];
       readonly target: number;
       readonly newKeys: readonly number[];
+      readonly assigned: readonly number[];
     }
     const reaches: Reach[] = [];
     for (const statement of statements) {
@@ -216,16 +219,54 @@ function explainedByForwarding(observation: DivergenceObservation): boolean {
             kind: statement.kind,
             target,
             newKeys: statement.kind === "rekey" ? statement.newKeys : [],
+            assigned: statement.kind === "update" ? (statement.assigned ?? []) : [],
           });
       }
     }
     if (reaches.length === 0) return false;
+    // A parent row is explained only by the effect its operation has (review B3-p2b-3 A2): a
+    // forwarded DELETE removed the forwarded-to row (the current engine lacks it, PostgreSQL keeps
+    // it as it was); a rekey moved it to the new key (the moved row equals PostgreSQL's original
+    // apart from the key columns); an UPDATE changed only the columns it assigns.
+    const differs = (a: readonly unknown[], b: readonly unknown[]): number[] | null => {
+      if (a.length !== b.length) return null;
+      const out: number[] = [];
+      for (let column = 0; column < a.length; column++)
+        if (!Object.is(a[column], b[column])) out.push(column);
+      return out;
+    };
     const parent = (row: DifferingRow) =>
-      reaches.some(
-        (reach) =>
-          reach.table === row.table &&
-          (reach.target === row.key || reach.newKeys.includes(row.key)),
-      );
+      reaches.some((reach) => {
+        if (reach.table !== row.table) return false;
+        const { oracle: after, authority: before } = row;
+        if (reach.kind === "delete")
+          return row.key === reach.target && after === null && before !== null;
+        if (reach.kind === "update") {
+          if (row.key !== reach.target || after === null || before === null) return false;
+          const changed = differs(before.values, after.values);
+          return changed?.every((column) => reach.assigned.includes(column)) === true;
+        }
+        if (reach.kind === "rekey") {
+          if (row.key === reach.target) return after === null && before !== null;
+          if (!reach.newKeys.includes(row.key) || after === null || before !== null) return false;
+          // The moved row: PostgreSQL's original, with the old key replaced by the new one.
+          const original = differing.find(
+            (candidate) => candidate.table === row.table && candidate.key === reach.target,
+          )?.authority;
+          if (original === undefined || original === null) return false;
+          const changed = differs(original.values, after.values);
+          return (
+            changed !== null &&
+            changed.length > 0 &&
+            changed.every(
+              (column) =>
+                Object.is(original.values[column], reach.target) &&
+                Object.is(after.values[column], row.key),
+            )
+          );
+        }
+        return false;
+      });
     // A child is explained only if every column that differs is explained (review B3-p2b-2
     // A1): one reference the forward explains cannot excuse another reference or a value.
     const child = (row: DifferingRow) => {

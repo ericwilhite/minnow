@@ -295,7 +295,14 @@ class Workload {
       const u = this.maybe(120, 0.3);
       const v = this.maybe(10);
       return {
-        facts: { kind: "update", table: "t", newKeys: [], matchedKeys: [id], references: [] },
+        facts: {
+          kind: "update",
+          table: "t",
+          newKeys: [],
+          matchedKeys: [id],
+          references: [],
+          assigned: [1, 2], // t(id, u, v, s): u and v
+        },
         sql: `UPDATE t SET u = ${sql(u)}, v = ${sql(v)} WHERE id = ${String(id)}`,
         run: async (statement, ids) => {
           const at = await locate(statement.view, ids.t, primaryOf(statement, ids.t), id);
