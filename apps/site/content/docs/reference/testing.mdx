@@ -1411,3 +1411,8 @@ MINNOW_NEXT_STORAGE_REOPEN=1 npx playwright test --config playwright.library.con
 The keeper admission regressions use finite governor grants. They require refusal before any
 write, bounded page-at-a-time preparation, charges held across suspended readers, and complete
 scratch cleanup after failed reads, failed writes and aborted publication attempts.
+
+Storage task-slicing regressions queue timers before large preparation and cached-list reads,
+then require service before completion. They also cancel at task turns and immediate read
+resumptions, exercise union and free-map construction independently, and verify that two
+preparations share the worker's task clock rather than starting fresh slices.

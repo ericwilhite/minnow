@@ -18,6 +18,8 @@
  * Cost: allocation scans the runs (O(runs)); free and exact placement are O(log runs) plus the
  * array splice. Runs stay few because placement is first fit and frees coalesce.
  */
+import { pauseIfDue, sortInSlices, type TaskWork } from "../task.js";
+
 export class FreeSpaceMap {
   readonly align: number;
   /** Start of each free run, ascending. */
@@ -61,6 +63,51 @@ export class FreeSpaceMap {
       previous = extent;
     }
     map.#end = cursor;
+    return map;
+  }
+
+  /** Startup's task-sliced variant; cancellation is checked on every real resumption. */
+  static async fromAllocatedAsync(
+    align: number,
+    length: number,
+    allocated: Iterable<{ readonly offset: number; readonly length: number }>,
+    work?: TaskWork,
+  ): Promise<FreeSpaceMap> {
+    const firstPause = pauseIfDue(work);
+    if (firstPause !== undefined) await firstPause;
+    const map = new FreeSpaceMap(align);
+    const extents: Array<{ offset: number; end: number }> = [];
+    for (const extent of allocated) {
+      if (extents.length % 128 === 0) {
+        const pending = pauseIfDue(work);
+        if (pending !== undefined) await pending;
+      }
+      extents.push({ offset: extent.offset, end: extent.offset + map.#round(extent.length) });
+    }
+    await sortInSlices(extents, (a, b) => a.offset - b.offset || a.end - b.end, work);
+    let cursor = 0;
+    let previous: { offset: number; end: number } | null = null;
+    for (let index = 0; index < extents.length; index++) {
+      if (index % 128 === 0) {
+        const pending = pauseIfDue(work);
+        if (pending !== undefined) await pending;
+      }
+      const extent = extents[index];
+      if (extent === undefined) continue;
+      map.#check(extent.offset);
+      if (previous !== null && previous.offset === extent.offset && previous.end === extent.end)
+        continue;
+      if (extent.offset < cursor)
+        throw new RangeError(`Extent at ${String(extent.offset)} overlaps another`);
+      if (extent.end > map.#round(length))
+        throw new RangeError(`Extent at ${String(extent.offset)} runs past the file`);
+      if (extent.offset > cursor) map.#push(cursor, extent.offset);
+      cursor = extent.end;
+      previous = extent;
+    }
+    map.#end = cursor;
+    const pending = pauseIfDue(work);
+    if (pending !== undefined) await pending;
     return map;
   }
 

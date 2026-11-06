@@ -161,6 +161,7 @@
  * as staged records, one transaction per call, the epoch check inside each. The space never
  * assumes a file.
  */
+import type { TaskWork } from "../task.js";
 import type { StoreSession } from "./contract.js";
 import type { RootPin } from "./reclaim.js";
 import { MAX_SLAB } from "./slabs.js";
@@ -255,9 +256,10 @@ export type ReachableExtents = (
   root: Uint8Array,
   reader: ExtentReader,
   budget: ByteBudget,
+  work?: TaskWork,
 ) => AsyncIterable<ExtentRef | BlobRef> | Iterable<ExtentRef | BlobRef>;
 
-export interface OpenSpaceOptions {
+export interface OpenSpaceOptions extends TaskWork {
   /**
    * What each root reaches, as startup reads it: the root's extent list (ruling R25,
    * extent-list.ts `listedExtents`), or a full walk where a root has no list.
@@ -284,7 +286,8 @@ export interface OpenSpaceOptions {
  * reaches (its extent list, ruling R25), builds
  * the free map, retires
  * what only the previous root reaches (`ReclaimLedger.retireAtOpen`), returns the free tail. The
- * walks read O(groups + index runs) metadata, coalesced. Nothing is written but the tail release.
+ * startup reads the kept roots' list pages, coalesced; audit/test open separately performs the
+ * full O(groups + index runs) cross-check. Nothing is written but the tail release.
  * Implemented by `openExtentSpace` (space.ts).
  */
 export type OpenExtentSpace = (

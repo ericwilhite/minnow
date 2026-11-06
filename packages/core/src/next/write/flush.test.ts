@@ -212,16 +212,21 @@ describe("flush and publish", () => {
     const gate = new Promise<void>((resolve) => {
       open = resolve;
     });
+    let publishing!: () => void;
+    const publishingReached = new Promise<void>((resolve) => {
+      publishing = resolve;
+    });
     let held = false;
     space.publish = async (...args: unknown[]) => {
       if (!held) {
         held = true;
+        publishing();
         await gate;
       }
       return publish(...args);
     };
     await load(path, t, 0, MEMTABLE_ROWS + 10); // freezes the first memtable; its flush now waits
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await publishingReached;
     expect(held).toBe(true);
     // While the publish is held: a second memtable fills and freezes, and rows are deleted.
     await load(path, t, MEMTABLE_ROWS + 10, MEMTABLE_ROWS);
@@ -265,16 +270,21 @@ describe("flush and publish", () => {
     const gate = new Promise<void>((resolve) => {
       open = resolve;
     });
+    let publishing!: () => void;
+    const publishingReached = new Promise<void>((resolve) => {
+      publishing = resolve;
+    });
     let held = false;
     space.publish = async (...args: unknown[]) => {
       if (!held) {
         held = true;
+        publishing();
         await gate;
       }
       return publish(...args);
     };
     await load(path, t, MEMTABLE_ROWS + 10, MEMTABLE_ROWS); // freezes the next; its flush waits
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await publishingReached;
     expect(held).toBe(true);
     // A row of the published group is deleted after the held flush took its bound.
     const view = path.pin();

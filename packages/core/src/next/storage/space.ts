@@ -18,6 +18,7 @@
  *   the range enter the free map. A free tail is then released (truncated) at once: every byte the
  *   space may still write past `end` is reserved in the map, so this never cuts live data.
  */
+import { pauseIfDue, type TaskWork } from "../task.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 import {
   DATA_ALIGN,
@@ -91,10 +92,13 @@ async function collect(
   space: { read: ExtentSpace["read"]; peek: ExtentSpace["peek"] },
   budget: ByteBudget,
   dataLength: number,
+  work?: TaskWork,
 ): Promise<Map<number, number>> {
   const extents = new Map<number, number>();
   if (root === null) return extents;
-  for await (const item of reachable(root, space, budget)) {
+  for await (const item of reachable(root, space, budget, work)) {
+    const pending = pauseIfDue(work);
+    if (pending !== undefined) await pending;
     const { offset, length } = "extent" in item ? item.extent : item;
     if (!(
       Number.isSafeInteger(offset) &&
@@ -120,14 +124,26 @@ async function collect(
  * (review B1-p2a finding 1): an offset both roots name must be the same extent in both. Returns
  * the union and the extents only the previous root reaches.
  */
-function unite(
+async function unite(
   current: ReadonlyMap<number, number>,
   previous: ReadonlyMap<number, number>,
-): { union: DataRange[]; previousOnly: DataRange[] } {
+  work?: TaskWork,
+): Promise<{ union: DataRange[]; previousOnly: DataRange[] }> {
   const union: DataRange[] = [];
   const previousOnly: DataRange[] = [];
-  for (const [offset, length] of current) union.push({ offset, length });
+  for (const [offset, length] of current) {
+    if (union.length % 128 === 0) {
+      const pending = pauseIfDue(work);
+      if (pending !== undefined) await pending;
+    }
+    union.push({ offset, length });
+  }
+  let examined = 0;
   for (const [offset, length] of previous) {
+    if (examined++ % 128 === 0) {
+      const pending = pauseIfDue(work);
+      if (pending !== undefined) await pending;
+    }
     const known = current.get(offset);
     if (known === undefined) {
       union.push({ offset, length });
@@ -144,12 +160,18 @@ function unite(
  * Checks that a root's startup source (its extent list) and the full walk name exactly the same
  * extents (ruling R25): anything else is `StoreCorruptionError`.
  */
-function sameExtents(
+async function sameExtents(
   listed: ReadonlyMap<number, number>,
   walked: ReadonlyMap<number, number>,
   which: string,
-): void {
+  work?: TaskWork,
+): Promise<void> {
+  let examined = 0;
   for (const [offset, length] of walked) {
+    if (examined++ % 128 === 0) {
+      const pending = pauseIfDue(work);
+      if (pending !== undefined) await pending;
+    }
     const listedLength = listed.get(offset);
     if (listedLength === undefined)
       throw new StoreCorruptionError(
@@ -160,27 +182,48 @@ function sameExtents(
         `The ${which} root's extent list gives the extent at ${String(offset)} ${String(listedLength)} bytes, the walk ${String(length)}`,
       );
   }
-  for (const offset of listed.keys())
+  for (const offset of listed.keys()) {
+    if (examined++ % 128 === 0) {
+      const pending = pauseIfDue(work);
+      if (pending !== undefined) await pending;
+    }
     if (!walked.has(offset))
       throw new StoreCorruptionError(
         `The ${which} root's extent list names the extent at ${String(offset)}, which it does not reach`,
       );
+  }
 }
 
 export const openExtentSpace: OpenExtentSpace = async (session, options) => {
   options.signal?.throwIfAborted();
   if (options.verifyAtOpen === true) await session.audit?.(options.signal);
+  const beginning = pauseIfDue(options);
+  if (beginning !== undefined) await beginning;
   const root = await session.readRoot();
+  const afterRoot = pauseIfDue(options);
+  if (afterRoot !== undefined) await afterRoot;
   const previousRoot = await session.readPreviousRoot();
+  const afterPrevious = pauseIfDue(options);
+  if (afterPrevious !== undefined) await afterPrevious;
   const dataLength = await session.dataLength();
+  const afterLength = pauseIfDue(options);
+  if (afterLength !== undefined) await afterLength;
   const cache = new PageCache(session);
   cache.attach(options.registerCache(cache));
+  let opened: Space | null = null;
   try {
     const reader = {
       read: (refs: readonly BlobRef[], read: ReadOptions) => cache.read(refs, read),
       peek: (ref: BlobRef, peek?: PeekOptions) => cache.peek(ref, peek),
     };
-    const current = await collect(root, options.reachable, reader, options.budget, dataLength);
+    const current = await collect(
+      root,
+      options.reachable,
+      reader,
+      options.budget,
+      dataLength,
+      options,
+    );
     options.signal?.throwIfAborted();
     const previous = await collect(
       previousRoot,
@@ -188,36 +231,50 @@ export const openExtentSpace: OpenExtentSpace = async (session, options) => {
       reader,
       options.budget,
       dataLength,
+      options,
     );
     const walk = options.walk;
     if (walk !== undefined && options.verifyAtOpen === true) {
-      sameExtents(
+      await sameExtents(
         current,
-        await collect(root, walk, reader, options.budget, dataLength),
+        await collect(root, walk, reader, options.budget, dataLength, options),
         "current",
+        options,
       );
-      sameExtents(
+      await sameExtents(
         previous,
-        await collect(previousRoot, walk, reader, options.budget, dataLength),
+        await collect(previousRoot, walk, reader, options.budget, dataLength, options),
         "previous",
+        options,
       );
     }
-    const { union, previousOnly } = unite(current, previous);
+    const { union, previousOnly } = await unite(current, previous, options);
     let map: FreeSpaceMap;
     try {
-      map = FreeSpaceMap.fromAllocated(DATA_ALIGN, dataLength, union);
+      map = await FreeSpaceMap.fromAllocatedAsync(DATA_ALIGN, dataLength, union, options);
     } catch (error) {
+      if (!(error instanceof RangeError) || error === options.signal?.reason) throw error;
       throw new StoreCorruptionError(
         `The durable roots name inconsistent extents: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
     // Only now, with both roots validated together, may anything be retired or truncated.
-    const retired = previousOnly.map(({ offset, length }) => ({
-      offset,
-      length: map.sizeOf(length),
-    }));
-    return new Space(session, options, cache, map, root, previousRoot, retired, dataLength);
+    const retired: DataRange[] = [];
+    for (const { offset, length } of previousOnly) {
+      if (retired.length % 128 === 0) {
+        const pending = pauseIfDue(options);
+        if (pending !== undefined) await pending;
+      }
+      retired.push({ offset, length: map.sizeOf(length) });
+    }
+    const space = new Space(session, options, cache, map, root, previousRoot, dataLength);
+    opened = space;
+    await space.initialize(retired, options);
+    const ready = pauseIfDue(options);
+    if (ready !== undefined) await ready;
+    return space;
   } catch (error) {
+    await opened?.close();
     cache.close();
     throw error;
   }
@@ -259,7 +316,6 @@ class Space implements ExtentSpace {
     map: FreeSpaceMap,
     root: Uint8Array | null,
     previousRoot: Uint8Array | null,
-    previousOnly: readonly DataRange[],
     dataLength: number,
   ) {
     this.#session = session;
@@ -274,7 +330,19 @@ class Space implements ExtentSpace {
     this.#ledger = new ReclaimLedger<DataRange>((ranges) => {
       this.#background_(this.free(ranges));
     });
-    for (const range of previousOnly) this.#retired.set(range.offset, range.length);
+  }
+
+  async initialize(previousOnly: readonly DataRange[], work: TaskWork): Promise<void> {
+    let count = 0;
+    for (const range of previousOnly) {
+      if (count++ % 128 === 0) {
+        const pending = pauseIfDue(work);
+        if (pending !== undefined) await pending;
+      }
+      this.#retired.set(range.offset, range.length);
+    }
+    const pending = pauseIfDue(work);
+    if (pending !== undefined) await pending;
     this.#ledger.retireAtOpen(previousOnly);
     this.#releaseTail();
   }
@@ -655,15 +723,15 @@ class Space implements ExtentSpace {
       this.#budget,
       Infinity,
     );
-    unite(exactCurrent, exactPrevious);
+    await unite(exactCurrent, exactPrevious);
     // Ruling R25: the lists startup read must name exactly what the full walk reaches.
     if (this.#walk !== null) {
-      sameExtents(
+      await sameExtents(
         exactCurrent,
         await collect(this.#root, this.#walk, this, this.#budget, Infinity),
         "current",
       );
-      sameExtents(
+      await sameExtents(
         exactPrevious,
         await collect(this.#previousRoot, this.#walk, this, this.#budget, Infinity),
         "previous",

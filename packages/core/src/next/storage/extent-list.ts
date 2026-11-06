@@ -24,6 +24,7 @@
  * the durable root's list at open, never from earlier callbacks (a sink that failed mid-publication
  * is rebuilt by reopening).
  */
+import { pauseIfDue, sortInSlices, type TaskWork } from "../task.js";
 import { StoreCorruptionError } from "./contract.js";
 import {
   MAX_READ_BYTES,
@@ -133,7 +134,10 @@ async function readPages(
   pages: readonly ExtentListPage[],
   reader: ExtentReader,
   budget: ByteBudget,
+  work?: TaskWork,
 ): Promise<{ pages: ExtentRef[][]; release(): void }> {
+  const firstPause = pauseIfDue(work);
+  if (firstPause !== undefined) await firstPause;
   const charge = 128 + pages.reduce((sum, page) => sum + 128 + page.count * EXTENT_MEMORY_BYTES, 0);
   reserve(budget, charge);
   let lease: import("./extents.js").ReadLease | null = null;
@@ -142,11 +146,18 @@ async function readPages(
       pages.map((page) => page.blob),
       { budget },
     );
-    const decoded = pages.map((page, index) => {
-      const bytes = lease?.bytes[index];
-      if (bytes === undefined) throw new StoreCorruptionError("An extent list page is missing");
-      return decodeListPage(bytes, page);
-    });
+    const resumed = pauseIfDue(work);
+    if (resumed !== undefined) await resumed;
+    const decoded: ExtentRef[][] = [];
+    for (let index = 0; index < pages.length; index++) {
+      const pending = pauseIfDue(work);
+      if (pending !== undefined) await pending;
+      const page = pages[index];
+      const bytes = lease.bytes[index];
+      if (page === undefined || bytes === undefined)
+        throw new StoreCorruptionError("An extent list page is missing");
+      decoded.push(decodeListPage(bytes, page));
+    }
     const held = lease;
     let released = false;
     return {
@@ -174,13 +185,25 @@ export async function* listedExtents(
   list: ExtentList,
   reader: ExtentReader,
   budget: ByteBudget,
+  work?: TaskWork,
 ): AsyncGenerator<ExtentRef | BlobRef> {
-  checkOrder(list);
+  const firstPause = pauseIfDue(work);
+  if (firstPause !== undefined) await firstPause;
+  for (let index = 1; index < list.length; index++) {
+    if (index % 128 === 0) {
+      const pending = pauseIfDue(work);
+      if (pending !== undefined) await pending;
+    }
+    const before = list[index - 1];
+    const page = list[index];
+    if (before !== undefined && page !== undefined && page.first <= before.first)
+      throw new StoreCorruptionError("The extent list's pages are not in offset order");
+  }
   reserve(budget, 512); // two bounded page-reference vectors across a generator suspension
   try {
     let pageIndex = 0;
     for (const batch of batches(list)) {
-      const decoded = await readPages(batch, reader, budget);
+      const decoded = await readPages(batch, reader, budget, work);
       try {
         for (let index = 0; index < batch.length; index++) {
           const page = batch[index];
@@ -193,8 +216,15 @@ export async function* listedExtents(
             throw new StoreCorruptionError(
               `Extent list page at ${String(page.first)} reaches past the next page's first offset`,
             );
+          const pending = pauseIfDue(work);
+          if (pending !== undefined) await pending;
           yield page.blob;
-          yield* extents;
+          for (const extent of extents) {
+            const pending = pauseIfDue(work);
+            if (pending !== undefined) await pending;
+            yield extent;
+            work?.signal?.throwIfAborted();
+          }
         }
       } finally {
         decoded.release();
@@ -242,7 +272,7 @@ export interface PreparedList {
   readonly list: ExtentList;
 }
 
-export interface ExtentListKeeperOptions {
+export interface ExtentListKeeperOptions extends TaskWork {
   /** Reads the pages a delta touches (the extent space). */
   readonly reader: ExtentReader;
   /** Admits keeper scratch, read leases and retained prepared/committed list metadata. */
@@ -259,6 +289,7 @@ const byOffset = (a: ExtentRef, b: ExtentRef) => a.offset - b.offset;
  */
 export class ExtentListKeeper {
   readonly #reader: ExtentReader;
+  readonly #work: TaskWork;
   readonly #budget: ByteBudget;
   readonly #pageExtents: number;
   #committed: ExtentList;
@@ -277,6 +308,7 @@ export class ExtentListKeeper {
     checkOrder(list);
     this.#committed = list;
     this.#reader = options.reader;
+    this.#work = options;
     this.#budget = options.budget;
     this.#pageExtents = options.pageExtents ?? LIST_PAGE_EXTENTS;
   }
@@ -294,6 +326,13 @@ export class ExtentListKeeper {
     this.#preparing = true;
     try {
       const prepared = await this.#apply(delta);
+      try {
+        const resumed = pauseIfDue(this.#work);
+        if (resumed !== undefined) await resumed;
+      } catch (error) {
+        this.#budget.free(prepared.charge + prepared.retireCharge);
+        throw error;
+      }
       this.#pending = {
         attempt,
         list: prepared.list,
@@ -356,6 +395,8 @@ export class ExtentListKeeper {
     charge: number;
     retireCharge: number;
   }> {
+    const firstPause = pauseIfDue(this.#work);
+    if (firstPause !== undefined) await firstPause;
     const pages = this.#committed;
     if (delta.added.length === 0 && delta.released.length === 0)
       return { list: pages, retire: [], charge: 0, retireCharge: 0 };
@@ -371,8 +412,10 @@ export class ExtentListKeeper {
     reserve(this.#budget, charge);
     let retained = 0;
     try {
-      const added = [...delta.added].sort(byOffset);
-      const released = [...delta.released].sort(byOffset);
+      const added = [...delta.added];
+      const released = [...delta.released];
+      await sortInSlices(added, byOffset, this.#work);
+      await sortInSlices(released, byOffset, this.#work);
       const out: ExtentListPage[] = [];
       let buffer: ExtentRef[] = [];
       let previousEnd = -1;
@@ -383,6 +426,8 @@ export class ExtentListKeeper {
         if (first === undefined) return;
         const bytes = encodeListPage(buffer);
         const written = await delta.writer.write([bytes]);
+        const resumed = pauseIfDue(this.#work);
+        if (resumed !== undefined) await resumed;
         const blob = written.blobs[0];
         if (blob === undefined) throw new Error("Extent list: a page was not written");
         out.push({ blob, first: first.offset, count: buffer.length });
@@ -399,13 +444,27 @@ export class ExtentListKeeper {
         return undefined;
       };
       for (let index = 0; index < Math.max(1, pages.length); index++) {
+        const pending = pauseIfDue(this.#work);
+        if (pending !== undefined) await pending;
         const page = pages[index];
         const next = pages[index + 1];
         const end = next?.first ?? Infinity;
         const addStart = ai;
         const releaseStart = ri;
-        while ((added[ai]?.offset ?? Infinity) < end) ai++;
-        while ((released[ri]?.offset ?? Infinity) < end) ri++;
+        while ((added[ai]?.offset ?? Infinity) < end) {
+          if (ai % 128 === 0) {
+            const pending = pauseIfDue(this.#work);
+            if (pending !== undefined) await pending;
+          }
+          ai++;
+        }
+        while ((released[ri]?.offset ?? Infinity) < end) {
+          if (ri % 128 === 0) {
+            const pending = pauseIfDue(this.#work);
+            if (pending !== undefined) await pending;
+          }
+          ri++;
+        }
         const mergeNeighbour =
           page !== undefined &&
           buffer.length > 0 &&
@@ -417,11 +476,18 @@ export class ExtentListKeeper {
           continue;
         }
         const held =
-          page === undefined ? null : await readPages([page], this.#reader, this.#budget);
+          page === undefined
+            ? null
+            : await readPages([page], this.#reader, this.#budget, this.#work);
         try {
           let a = addStart;
           let r = releaseStart;
+          let processed = 0;
           for (const extent of held?.pages[0] ?? []) {
+            if (processed++ % 128 === 0) {
+              const pending = pauseIfDue(this.#work);
+              if (pending !== undefined) await pending;
+            }
             const removal = released[r];
             if (r < ri && removal !== undefined && removal.offset < extent.offset)
               throw new StoreCorruptionError(
@@ -437,6 +503,10 @@ export class ExtentListKeeper {
               r++;
             }
             while (a < ai && (added[a]?.offset ?? Infinity) < extent.offset) {
+              if (a % 128 === 0) {
+                const pending = pauseIfDue(this.#work);
+                if (pending !== undefined) await pending;
+              }
               const addition = added[a++];
               if (addition !== undefined) {
                 const pending = append(addition);
@@ -457,6 +527,10 @@ export class ExtentListKeeper {
               "Extent list: the publication releases extents the list does not name",
             );
           while (a < ai) {
+            if (a % 128 === 0) {
+              const pending = pauseIfDue(this.#work);
+              if (pending !== undefined) await pending;
+            }
             const addition = added[a++];
             if (addition !== undefined) {
               const pending = append(addition);
@@ -479,7 +553,9 @@ export class ExtentListKeeper {
           await flush();
       }
       await flush();
-      const retire = retiredPageExtents(pages, out);
+      const retire = await retiredInSlices(pages, out, this.#work);
+      const pending = pauseIfDue(this.#work);
+      if (pending !== undefined) await pending;
       const listCharge = 128 + out.length * PAGE_MEMORY_BYTES;
       const retireCharge = 64 + retire.length * 16;
       retained = listCharge + retireCharge;
@@ -497,4 +573,39 @@ export function retiredPageExtents(before: ExtentList, after: ExtentList): Exten
   for (const page of before)
     if (!kept.has(page.blob.extent.offset)) out.set(page.blob.extent.offset, page.blob.extent);
   return [...out.values()];
+}
+
+async function retiredInSlices(
+  before: ExtentList,
+  after: ExtentList,
+  work: TaskWork,
+): Promise<ExtentRef[]> {
+  const kept = new Set<number>();
+  const retired = new Map<number, ExtentRef>();
+  for (let index = 0; index < after.length; index++) {
+    if (index % 128 === 0) {
+      const pending = pauseIfDue(work);
+      if (pending !== undefined) await pending;
+    }
+    const page = after[index];
+    if (page !== undefined) kept.add(page.blob.extent.offset);
+  }
+  for (let index = 0; index < before.length; index++) {
+    if (index % 128 === 0) {
+      const pending = pauseIfDue(work);
+      if (pending !== undefined) await pending;
+    }
+    const page = before[index];
+    if (page !== undefined && !kept.has(page.blob.extent.offset))
+      retired.set(page.blob.extent.offset, page.blob.extent);
+  }
+  const out: ExtentRef[] = [];
+  for (const extent of retired.values()) {
+    if (out.length % 128 === 0) {
+      const pending = pauseIfDue(work);
+      if (pending !== undefined) await pending;
+    }
+    out.push(extent);
+  }
+  return out;
 }

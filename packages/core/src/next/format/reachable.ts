@@ -34,6 +34,7 @@
  * a time, each released (its parse charge returned) when the walk moves past it. Data pages are
  * never read.
  */
+import type { TaskWork } from "../task.js";
 import { listedExtents } from "../storage/extent-list.js";
 import type { BlobRef, ByteBudget, ExtentReader, ExtentRef } from "../storage/extents.js";
 import { valid } from "./bytes.js";
@@ -361,11 +362,12 @@ export function listedRootExtents(
   root: Uint8Array,
   reader: ExtentReader,
   budget: ByteBudget,
+  work?: TaskWork,
 ) => AsyncIterable<BlobRef | ExtentRef> {
-  return async function* listed(root, reader, budget) {
+  return async function* listed(root, reader, budget, work) {
     const manifest = codecs.decodeRoot(root, budget);
     try {
-      yield* listedExtents(manifest.value.extentList, reader, budget);
+      yield* listedExtents(manifest.value.extentList, reader, budget, work);
     } finally {
       budget.free(manifest.charge);
     }

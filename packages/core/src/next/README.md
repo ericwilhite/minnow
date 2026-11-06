@@ -1368,3 +1368,11 @@ Build, module boot and cleanup are excluded. Data-read bytes count coalesced lis
 payload bytes are separate. IndexedDB's native metadata/range lookup time is included, but its
 opaque on-disk byte count is unavailable. The fixture uses a real zero-column catalog,
 group roots, directory pages and table statistics, not a full SQL workload.
+
+R25 preparation and startup use the worker-wide R23.5 task clock reexported by
+`exec/pipeline.ts` (implemented in `task.ts` so storage does not depend on the executor).
+No operation entry or resolved read restarts it. Bounded loops check the deadline, yield a real
+task when due, and check cancellation on resume. Sorting uses an in-place sliced heapsort;
+startup collection, root union, free-map construction and retirement installation also cooperate.
+Timer/cancellation regressions include cached reads, immediate writes and two preparations
+sharing one task's elapsed time.

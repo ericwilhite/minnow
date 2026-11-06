@@ -126,144 +126,24 @@ export function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise
 }
 
 /** Most synchronous work a pipeline does before yielding to the event loop with a task. */
-export const YIELD_INTERVAL_MS = 4;
+export {
+  YIELD_INTERVAL_MS,
+  TaskClock,
+  taskClock,
+  beginTask,
+  clockFor,
+  afterYield,
+  createYieldTask,
+  TIMER_TURN_MS,
+  yieldTask,
+  type TaskHost,
+} from "../task.js";
+import { YIELD_INTERVAL_MS, yieldTask, clockFor, afterYield, type TaskClock } from "../task.js";
 
 /** True for a Promise (or any thenable): what the driver must wait on. */
 export function isPromise<T>(value: MaybePromise<T>): value is Promise<T> {
   return typeof (value as { then?: unknown } | null)?.then === "function";
 }
-
-/**
- * When the current task began (ruling R23.5). The 4 ms bound is on the worker's task, not on one
- * operator: the driver, every breaker, scans, aggregation, join, sort, top-k and window ask the
- * same clock whether `YIELD_INTERVAL_MS` has passed since the task began, and keep no slice start
- * of their own (per-operator starts let several operators in one task add up).
- *
- * It is stamped only where a task genuinely begins: when a `yieldTask` resolves, and at the
- * owner's task entry points (the server's message dispatch, timers that start exec or write
- * work: `beginTask`). Never in `drive()`, an operator's entry or a resolved promise, which can
- * run mid-task. A missing stamp errs safe: the start is older, and work yields early.
- *
- * The worker's clock (`taskClock`) is event-loop state, like `lastTimerTurn`, not query scratch
- * (R23.1). Tests inject a clock (an operator's `now` option makes a private one over it) or call
- * `beginTask()` before a run they expect to be synchronous.
- */
-export class TaskClock {
-  #start: number;
-  /** Tasks begun on this clock (a job checks a yield by it: join-keys.ts `KeyWork`). */
-  epoch = 0;
-  constructor(public now: () => number) {
-    this.#start = now();
-  }
-  /** A task begins now. */
-  begin(): void {
-    this.#start = this.now();
-    this.epoch++;
-  }
-  /** Milliseconds since the current task began. */
-  elapsed(): number {
-    return this.now() - this.#start;
-  }
-  /** Whether `interval` ms have passed since the current task began. */
-  due(interval = YIELD_INTERVAL_MS): boolean {
-    return this.now() - this.#start >= interval;
-  }
-}
-
-/** The worker's task clock (see `TaskClock`). */
-export const taskClock = new TaskClock(() => performance.now());
-
-/** The owner's task entry points stamp the worker's clock (R23.5). */
-export function beginTask(): void {
-  taskClock.begin();
-}
-
-/** The worker's clock, or for a test's `now` a private clock over it. */
-export function clockFor(now?: () => number): TaskClock {
-  return now === undefined ? taskClock : new TaskClock(now);
-}
-
-/**
- * After a `yieldTask`: the worker's clock was stamped by it; a private (test) clock begins its
- * task here.
- */
-export function afterYield(clock: TaskClock): void {
-  if (clock !== taskClock) clock.begin();
-}
-
-/** What `yieldTask` schedules with (the global scope; tests pass a model event loop). */
-export interface TaskHost {
-  readonly setImmediate?: (callback: () => void) => unknown;
-  readonly setTimeout: (callback: () => void, ms: number) => unknown;
-  readonly MessageChannel?: new () => MessageChannel;
-  readonly now: () => number;
-}
-
-/** In a browser or worker, yields take a timer turn at least this often (ms). */
-export const TIMER_TURN_MS = 50;
-
-/**
- * A `yieldTask` over `host`. The returned Promise resolves in a later **task** (macrotask), never
- * a microtask:
- * - **Node** (`setImmediate`): the check phase follows the timers phase on every loop iteration,
- *   so due timers and pending I/O run before the work resumes.
- * - **Browsers and workers**: one shared `MessageChannel` message (no 4 ms timer clamp), except
- *   that once `TIMER_TURN_MS` has passed without a timer turn the yield is `setTimeout(…, 0)`.
- *   A user agent may service message tasks ahead of timers indefinitely (WebKit was seen to;
- *   review B5-p2d-1), so a query yielding only through messages could starve the owner's timers
- *   (liveness, idle flush, transaction timeouts). Timers due before ours run before it, so every
- *   timer due by then has run when the work resumes: a due timer waits about `TIMER_TURN_MS`
- *   plus one slice at most, whatever the task-source order.
- * `#lastTimerTurn` is the worker's event-loop state, shared by every pipeline on it on purpose
- * (not query scratch, R23): one timer turn serves them all.
- */
-export function createYieldTask(host: TaskHost): () => Promise<void> {
-  type Resolver = () => void;
-  let channel: MessageChannel | null = null;
-  const waiting: Resolver[] = [];
-  let lastTimerTurn = host.now();
-  const immediate = host.setImmediate;
-  return () =>
-    new Promise<void>((resolved) => {
-      // A task begins as the yield resolves (R23.5), before anything awaiting it resumes.
-      const resolve = () => {
-        taskClock.begin();
-        resolved();
-      };
-      if (immediate !== undefined) {
-        immediate(resolve);
-        return;
-      }
-      const Channel = host.MessageChannel;
-      if (Channel === undefined || host.now() - lastTimerTurn >= TIMER_TURN_MS) {
-        host.setTimeout(() => {
-          lastTimerTurn = host.now();
-          resolve();
-        }, 0);
-        return;
-      }
-      if (channel === null) {
-        channel = new Channel();
-        channel.port1.onmessage = () => {
-          waiting.shift()?.();
-        };
-      }
-      waiting.push(resolve);
-      channel.port2.postMessage(null);
-    });
-}
-
-const globalHost: TaskHost = {
-  ...(typeof setImmediate === "function"
-    ? { setImmediate: (callback: () => void) => setImmediate(callback) }
-    : {}),
-  setTimeout: (callback, ms) => setTimeout(callback, ms),
-  ...(typeof MessageChannel === "function" ? { MessageChannel } : {}),
-  now: () => performance.now(),
-};
-
-/** Resolves in a later task (see `createYieldTask`), over the global scope. */
-export const yieldTask: () => Promise<void> = createYieldTask(globalHost);
 
 export interface DriveOptions {
   /** Synchronous work between task yields (default `YIELD_INTERVAL_MS`). */
