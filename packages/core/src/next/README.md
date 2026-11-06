@@ -297,8 +297,9 @@ is access's `Snapshot`.
   frame of reference at u8/u16/u32 over an int64 base, delta (FOR over successive differences,
   a checkpoint every 128 rows), dictionary codes (u8/u16/u32, or one code) into a
   group-scoped dictionary, and scaled float (float64 exact decimals as FOR integers over 10^e,
-  every other value patched with its own 8 bytes, bit-identical; a reader decodes it into an f64
-  lane it is charged for). Every page starts at an 8-byte offset of its extent. Bit-packed FOR
+  every other value patched with its own 8 bytes, bit-identical; decoded and gathered straight into
+  the target, while predicates read an f64 lane the reader materializes on first use and is
+  charged for). Every page starts at an 8-byte offset of its extent. Bit-packed FOR
   widths were measured and not adopted: unpacking cost +38% to +659% in the decode kernel and
   +46% to +194% in the pushdown compare (`scripts/bitpack-bench.mts`, 7–20 bits, two runs), far
   past the ~5% a 6% size saving was allowed to cost.

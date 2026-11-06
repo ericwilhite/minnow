@@ -77,6 +77,12 @@ export interface PageView {
   readonly plain: Int32Array | Float64Array | Float32Array | Uint32Array | null;
   /** Plain varlen value bytes. */
   readonly data: Uint8Array | null;
+  /**
+   * `scaledFloat` pages: the patched rows (increasing) and their 8 bytes each. The integers are
+   * `baseNumber` + `unsigned` (null for width 0), over 10^`aux`.
+   */
+  readonly patches: Uint32Array | null;
+  readonly patchBytes: Uint8Array | null;
 }
 
 /** A chunk's dictionary: its entries as an immutable flat vector (aliases the page bytes). */
@@ -277,8 +283,9 @@ export function parsePage(
   let checkpoints: Int32Array | null = null;
   let baseLow = 0;
   let baseHigh = 0;
-  /** A `scaledFloat` page decoded into a plain f64 lane (`plain`). */
-  let materialized = false;
+  let scaledBase = 0;
+  let patches: Uint32Array | null = null;
+  let patchBytes: Uint8Array | null = null;
   const buffer = bytes.buffer;
   const offset = bytes.byteOffset;
   const fits = (end: number): void => check(bytes.length >= end, "Page payload is truncated");
@@ -406,53 +413,45 @@ export function parsePage(
       break;
     }
     case PageEncoding.scaledFloat: {
-      // Exact decimals as integers over 10^aux, plus patched rows (format.ts). Materialized here
-      // into an f64 lane, so the page is read as a plain one from now on; the reader charges the
-      // lane (8 bytes per row) and attaches no descriptor of it.
+      // Exact decimals as integers over 10^aux, plus patched rows (format.ts). Decoded straight
+      // into a target (`decodeValues`); predicates read a plain lane the reader materializes
+      // (`materializeScaledFloat`) and charges.
       check(tag === ValueTag.f64, "Scaled-float page outside float64");
       check(width === 0 || width === 1 || width === 2 || width === 4, "Bad scaled-float width");
       check(aux <= SCALED_FLOAT_MAX_EXPONENT, "Scaled-float exponent out of range");
       check(!allNull, "All-null scaled-float page");
       fits(start + 8);
-      const base = new Float64Array(buffer, offset + start, 1)[0] ?? Number.NaN;
+      scaledBase = new Float64Array(buffer, offset + start, 1)[0] ?? Number.NaN;
       const deltasAt = start + 8;
       const deltaBytes = align8(rows * width);
       fits(deltasAt + deltaBytes + 8);
       // The writer's own rule (format.ts `scaledFloatSafe`) on the stored deltas, not on what
       // the width could hold (review B2-p2i #1).
-      const stored = width === 0 ? null : unsignedView(buffer, offset + deltasAt, width, rows);
+      if (width > 0) unsigned = unsignedView(buffer, offset + deltasAt, width, rows);
       const maxDelta =
-        stored === null
+        unsigned === null
           ? 0
-          : stored instanceof Uint8Array
-            ? max8(stored, rows)
-            : stored instanceof Uint16Array
-              ? max16(stored, rows)
-              : max32(stored, rows);
-      check(scaledFloatSafe(base, maxDelta), "Scaled-float integers out of the safe range");
-      const header = new Uint32Array(buffer, offset + deltasAt + deltaBytes, 2);
-      const patches = header[0] ?? 0;
-      check(header[1] === 0 && patches <= rows, "Bad scaled-float patch count");
+          : unsigned instanceof Uint8Array
+            ? max8(unsigned, rows)
+            : unsigned instanceof Uint16Array
+              ? max16(unsigned, rows)
+              : max32(unsigned, rows);
+      check(scaledFloatSafe(scaledBase, maxDelta), "Scaled-float integers out of the safe range");
+      const counts = new Uint32Array(buffer, offset + deltasAt + deltaBytes, 2);
+      const count = counts[0] ?? 0;
+      check(counts[1] === 0 && count <= rows, "Bad scaled-float patch count");
       const positionsAt = deltasAt + deltaBytes + 8;
-      const valuesAt = positionsAt + align8(patches * 4);
-      length = valuesAt + patches * 8;
+      const valuesAt = positionsAt + align8(count * 4);
+      length = valuesAt + count * 8;
       fits(length);
-      const lane = new Float64Array(rows);
-      const power = 10 ** aux;
-      if (stored === null) lane.fill(base / power);
-      else for (let row = 0; row < rows; row++) lane[row] = (base + (stored[row] ?? 0)) / power;
-      const positions = new Uint32Array(buffer, offset + positionsAt, patches);
-      const laneBytes = new Uint8Array(lane.buffer);
+      patches = new Uint32Array(buffer, offset + positionsAt, count);
       let previous = -1;
-      for (let k = 0; k < patches; k++) {
-        const row = positions[k] ?? 0;
+      for (let k = 0; k < count; k++) {
+        const row = patches[k] ?? 0;
         check(row > previous && row < rows, "Scaled-float patches out of order");
         previous = row;
-        // The patched value's own 8 bytes (a NaN keeps its payload).
-        laneBytes.set(bytes.subarray(valuesAt + k * 8, valuesAt + k * 8 + 8), row * 8);
       }
-      plain = lane;
-      materialized = true;
+      patchBytes = bytes.subarray(valuesAt, length);
       break;
     }
     default:
@@ -468,12 +467,12 @@ export function parsePage(
     headerBoundsSafe(kind, width, baseNumber, checkpoints, rows);
   const view: PageView = {
     bytes,
-    kind: materialized ? PageEncoding.plain : kind,
+    kind,
     tag,
     flags,
-    width: materialized ? 8 : width,
+    width,
     rowCount: rows,
-    aux: materialized ? 0 : aux,
+    aux,
     nullCount,
     validity,
     allNull,
@@ -487,10 +486,12 @@ export function parsePage(
     unsigned,
     baseLow,
     baseHigh,
-    baseNumber,
+    baseNumber: kind === PageEncoding.scaledFloat ? scaledBase : baseNumber,
     checkpoints,
     plain,
     data,
+    patches,
+    patchBytes,
   };
   if (dictionarySize !== undefined) checkDictionaryCodes(view, dictionarySize);
   return view;
@@ -1414,6 +1415,10 @@ function decodeValues(
           lane.copyWithin(filled, 0, Math.min(filled, lane.length - filled));
         return;
       }
+      if (view.kind === PageEncoding.scaledFloat) {
+        scaledInto(view, rows, from, to, base0, out as Float64Array, at);
+        return;
+      }
       const values = view.plain as Float64Array | Float32Array;
       if (rows === null) out.set(values.subarray(from, to), at);
       else {
@@ -1612,4 +1617,91 @@ export function gatherCodes(
     return;
   }
   for (let k = start; k < end; k++) codes[at + k - start] = source[(rows[k] ?? 0) - base] ?? 0;
+}
+
+// ---------------------------------------------------------------------------------------------
+// scaledFloat
+
+/**
+ * Rows `[from, to)` of a `scaledFloat` page (or the selected `rows` minus `base0`) decoded into
+ * `out` from `at`: (base + delta) / 10^e, then each patched row's own 8 bytes. Bit-identical to
+ * the materialized lane, with no lane.
+ */
+function scaledInto(
+  view: PageView,
+  rows: Rows | null,
+  from: number,
+  to: number,
+  base0: number,
+  out: Float64Array,
+  at: number,
+): void {
+  const power = 10 ** view.aux;
+  const base = view.baseNumber;
+  const deltas = view.unsigned;
+  const count = to - from;
+  if (rows === null) {
+    if (deltas === null) out.fill(base / power, at, at + count);
+    else for (let k = 0; k < count; k++) out[at + k] = (base + (deltas[from + k] ?? 0)) / power;
+  } else {
+    for (let k = 0; k < count; k++) {
+      const row = (rows[k] ?? 0) - base0;
+      out[at + k] = (base + (deltas === null ? 0 : (deltas[row] ?? 0))) / power;
+    }
+  }
+  const patches = view.patches;
+  const bytes = view.patchBytes;
+  if (patches === null || bytes === null || patches.length === 0) return;
+  const outBytes = new Uint8Array(out.buffer, out.byteOffset, out.length * 8);
+  const patch = (k: number, slot: number): void => {
+    outBytes.set(bytes.subarray(k * 8, k * 8 + 8), (at + slot) * 8);
+  };
+  if (rows === null) {
+    for (let k = firstPatchAtOrAfter(patches, from); k < patches.length; k++) {
+      const row = patches[k] ?? 0;
+      if (row >= to) break;
+      patch(k, row - from);
+    }
+    return;
+  }
+  // Selected rows ascend: walk them and the patches together.
+  let k = firstPatchAtOrAfter(patches, (rows[0] ?? 0) - base0);
+  for (let slot = 0; slot < count && k < patches.length; slot++) {
+    const row = (rows[slot] ?? 0) - base0;
+    while (k < patches.length && (patches[k] ?? 0) < row) k++;
+    if (k < patches.length && patches[k] === row) patch(k, slot);
+  }
+}
+
+function firstPatchAtOrAfter(patches: Uint32Array, row: number): number {
+  let low = 0;
+  let high = patches.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if ((patches[middle] ?? 0) < row) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+/** Bytes a materialized `scaledFloat` lane takes (charged by its reader). */
+export const scaledFloatLaneBytes = (view: PageView): number => view.rowCount * 8;
+
+/**
+ * A `scaledFloat` page as a plain f64 view over a lane decoded from it (predicates, selection
+ * and masks read `plain`). The caller charges `scaledFloatLaneBytes` first.
+ */
+export function materializeScaledFloat(view: PageView): PageView {
+  const lane = new Float64Array(view.rowCount);
+  scaledInto(view, null, 0, view.rowCount, 0, lane, 0);
+  return {
+    ...view,
+    kind: PageEncoding.plain,
+    width: 8,
+    aux: 0,
+    plain: lane,
+    unsigned: null,
+    patches: null,
+    patchBytes: null,
+  };
 }

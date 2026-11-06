@@ -19,6 +19,7 @@ import { PageEncoding } from "../format/manifest.js";
 import { SCALED_FLOAT_MAX_EXPONENT } from "./format.js";
 import type { Vector } from "../vector/vector.js";
 import { MemoryExtentSpace } from "./memory-extents.js";
+import { compilePredicate } from "./predicate.js";
 import { ChunkReader } from "./reader.js";
 import { GroupWriter } from "./writer.js";
 import { defined, targetFor, UNLIMITED, writeGroup } from "./test-support.js";
@@ -192,6 +193,39 @@ describe.each(SEEDS)("scaledFloat pages round-trip every float64 bit for bit (se
             expect(bitsOf(decoded[row] ?? 0), `row ${String(row)}: ${String(expected)}`).toBe(
               bitsOf(expected),
             );
+          }
+          // A sub-range starting inside a page, into a target at an offset: the same bits.
+          const r0 = Math.floor(rows / 3);
+          const r1 = Math.max(r0, rows - Math.floor(rows / 5));
+          if (r1 > r0) {
+            const part = targetFor(reader, r1 - r0 + 5, 0);
+            reader.decodeRange(r0, r1, part, 5);
+            if (part.data.layout !== "f64") throw new Error("expected f64");
+            for (let row = r0; row < r1; row++) {
+              const expected = values[row];
+              if (expected === null || expected === undefined) continue;
+              expect(bitsOf(part.data.values[row - r0 + 5] ?? 0), `range row ${String(row)}`).toBe(
+                bitsOf(expected),
+              );
+            }
+          }
+          // Gathered rows (an ascending subset), decoded straight from the page: the same bits.
+          const chosen = Uint32Array.from(
+            Array.from({ length: rows }, (_, row) => row).filter(
+              (row) => (row * 2654435761) % 7 < 3,
+            ),
+          );
+          if (chosen.length > 0) {
+            const gathered = targetFor(reader, chosen.length, 0);
+            reader.gather(chosen, gathered, 0);
+            if (gathered.data.layout !== "f64") throw new Error("expected f64");
+            for (const [slot, row] of chosen.entries()) {
+              const expected = values[row];
+              if (expected === null || expected === undefined) continue;
+              expect(bitsOf(gathered.data.values[slot] ?? 0), `gathered row ${String(row)}`).toBe(
+                bitsOf(expected),
+              );
+            }
           }
           // Reach, from what the writer chose (the stored header) and what it then had to patch.
           for (const entry of reader.directory.pages) {
@@ -463,7 +497,7 @@ describe("scaledFloat pages: pinned", () => {
     reader.close();
   });
 
-  it("charges the decoded lane to the reader and gives it back", async () => {
+  it("decodes with no lane; a predicate's lane is charged once and given back", async () => {
     const values = Array.from({ length: 4096 }, (_, row) => row / 100);
     const { space, group } = await writeGroup([{ type: { kind: "float64" }, values }]);
     let held = 0;
@@ -475,7 +509,20 @@ describe("scaledFloat pages: pinned", () => {
     const before = held;
     await reader.load(reader.directory.pages.map((_, page) => page));
     const stored = reader.directory.pages.reduce((sum, page) => sum + page.length, 0);
-    expect(held - before).toBe(stored + values.length * 8);
+    const target = targetFor(reader, values.length, 0);
+    reader.decodeRange(0, values.length, target, 0);
+    expect(held - before).toBe(stored); // decoded straight into the target
+    const compiled = defined(
+      compilePredicate({ kind: "float64" }, 0, { op: ">=", value: 20 }) ?? undefined,
+    );
+    const out = new Uint16Array(values.length);
+    const count = reader.select(compiled, 0, values.length, out);
+    expect(count).toBe(values.filter((value) => value >= 20).length);
+    // The predicates' lane (and the selection scratch, charged until close), once.
+    const afterFirst = held - before;
+    expect(afterFirst).toBeGreaterThanOrEqual(stored + values.length * 8);
+    reader.select(compiled, 0, values.length, out);
+    expect(held - before).toBe(afterFirst);
     reader.close();
     expect(held).toBe(0);
   });

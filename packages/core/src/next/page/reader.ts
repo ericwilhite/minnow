@@ -61,8 +61,10 @@ import {
   isLarge,
   largeLength,
   largePointer,
+  materializeScaledFloat,
   parseDictionary,
   parsePage,
+  scaledFloatLaneBytes,
   varlenBytesOf,
   type LargeResolver,
   type PageDictionary,
@@ -888,20 +890,7 @@ export class ChunkReader {
         // Validated against the chunk, its dictionary's domain included: every consumer
         // (select, refine, gather, decode) relies on this one check (review B2-p2d #1), run once
         // per cache residency when the page's descriptor rides on its cache entry.
-        if ((entry.encoding & 0x7f) === PageEncoding.scaledFloat) {
-          // Decoded into an f64 lane the reader holds (8 bytes per row), charged before it is
-          // allocated, never attached to the cache entry (its bytes are not the entry's).
-          const lane = entry.rowCount * 8;
-          if (!this.#options.budget.allocate(lane)) throw new PageBudgetError(lane);
-          held = { ...held, charged: held.charged + lane };
-          this.#pages[page] = parsePage(
-            bytes,
-            entry,
-            this.directory.tag,
-            this.directory.scale,
-            this.directory.dictionary?.rowCount ?? 0,
-          );
-        } else this.#pages[page] = this.#parse(entry, bytes, stored);
+        this.#pages[page] = this.#parse(entry, bytes, stored);
         this.#held[page] = held;
       }
     } catch (error) {
@@ -1208,7 +1197,7 @@ export class ChunkReader {
   }
 
   #context(compiled: CompiledPredicate, page: number) {
-    const view = this.#view(page);
+    const view = this.#plainView(page);
     const entry = at_(this.directory.pages, page);
     let codes: Uint32Array | null = null;
     if (view.kind === PageEncoding.dictionary && compiled.nulls === null) {
@@ -1605,6 +1594,23 @@ export class ChunkReader {
   #dropValue(value: LoadedValue): void {
     if (value.charged > 0) this.#options.budget.free(value.charged);
     for (const lease of value.leases) lease.drop();
+  }
+
+  /**
+   * The page as predicates read it: a `scaledFloat` page is materialized into a plain f64 lane
+   * once (decode and gather read it directly instead), charged to the reader with the page.
+   */
+  #plainView(index: number): PageView {
+    const view = this.#view(index);
+    if (view.kind !== PageEncoding.scaledFloat) return view;
+    const held = this.#held[index];
+    if (held === undefined) throw new RangeError(`Page ${String(index)} is not loaded`);
+    const lane = scaledFloatLaneBytes(view);
+    if (!this.#options.budget.allocate(lane)) throw new PageBudgetError(lane);
+    const plain = materializeScaledFloat(view);
+    this.#held[index] = { ...held, charged: held.charged + lane };
+    this.#pages[index] = plain;
+    return plain;
   }
 
   #view(index: number): PageView {
