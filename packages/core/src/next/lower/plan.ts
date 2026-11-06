@@ -26,6 +26,12 @@ export interface LoweredRel {
   readonly columns: readonly RelColumn[];
   /** Estimated output rows (planning only; lower/statistics.ts defaults when unknown). */
   readonly rows?: number;
+  /**
+   * Per output column of a query block, the select item when it is a constant whose type the
+   * context decides (PostgreSQL's unknown: NULL, a string literal), before it settled to text.
+   * A set operation resolves it against the other side (lower/from.ts `lowerSetOperation`).
+   */
+  readonly pending?: ReadonlyArray<Typed | undefined>;
 }
 
 /**

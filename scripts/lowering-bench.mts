@@ -67,6 +67,8 @@ const cases: ReadonlyArray<readonly [string, string]> = [
     "SELECT c.name, r.manager, o.amount FROM orders o JOIN customers c ON c.id = o.customer_id JOIN regions r ON r.name = c.region WHERE o.qty > $1",
   ],
   ["6-way chain", chain(6)],
+  // The exhaustive join-order search's largest case (EXHAUSTIVE_JOIN_LIMIT relations).
+  ["8-way chain", chain(8)],
   ["9-way chain", chain(9)],
   [
     "correlated sub",

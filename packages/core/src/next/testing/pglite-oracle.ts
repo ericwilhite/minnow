@@ -45,8 +45,15 @@ function normalized(value: unknown): unknown {
 export async function pgOutcome(pg: PGlite, sql: string): Promise<Outcome> {
   try {
     const result = await pg.query<Record<string, unknown>>(sql);
+    // NUMERIC arrives as text; the lowering harness returns a number. Compared as numbers (the
+    // cases' values are small, so the conversion is exact).
+    const numeric = result.fields.map((field) => field.dataTypeID === 1700);
     return {
-      rows: result.rows.map((row) => Object.values(row).map(normalized)),
+      rows: result.rows.map((row) =>
+        Object.values(row).map((value, index) =>
+          normalized(numeric[index] === true && typeof value === "string" ? Number(value) : value),
+        ),
+      ),
       types: result.fields.map(
         (field) => OID_NAMES[field.dataTypeID] ?? `oid ${String(field.dataTypeID)}`,
       ),

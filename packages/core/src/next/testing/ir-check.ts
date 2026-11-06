@@ -2,13 +2,15 @@
  * Structural type checks of a physical plan, for tests: every column reference is in range and
  * of its input column's type, every projection and VALUES row produces its declared output
  * types, every call's argument types are an overload of `ir/functions.ts` (R19), every explicit
- * cast exists, and `modify` inputs have the shapes access/ requires. Types are compared modulo
- * modifiers (VARCHAR(n) widths, NUMERIC precision and scale) where ir/functions.ts allows it.
- * Throws a `TypeError` naming the first violation.
+ * cast exists, and `modify` inputs have the shapes access/ requires. Parameter reads, init plans
+ * and apply bindings are checked against the plan's slot types; window calls against their
+ * signatures and frames; work-table scans against the recursion that binds them. Types are
+ * compared modulo modifiers (VARCHAR(n) widths, NUMERIC precision and scale) where
+ * ir/functions.ts allows it. Throws a `TypeError` naming the first violation.
  */
 import type { CatalogView } from "../access/catalog.js";
 import { explicitCastAllowed, FUNCTIONS, sqlTypeOf } from "../ir/functions.js";
-import type { OutputColumn, PhysicalPlan, Rel, ScalarExpr } from "../ir/ir.js";
+import type { OutputColumn, PhysicalPlan, Rel, ScalarExpr, SortKey, WindowCall } from "../ir/ir.js";
 import { samePhysicalType, type PhysicalType } from "../types.js";
 
 function base(type: PhysicalType): PhysicalType {
@@ -21,6 +23,117 @@ const sameBase = (a: PhysicalType, b: PhysicalType) => samePhysicalType(base(a),
 
 function fail(where: string, message: string): never {
   throw new TypeError(`${where}: ${message}`);
+}
+
+/** What the plan being checked declares: slot types, and the work tables in scope. */
+interface Context {
+  readonly parameters: readonly PhysicalType[];
+  readonly workTables: Map<number, readonly OutputColumn[]>;
+}
+
+// checkPlan is synchronous: the plan under check, set for the duration of one call.
+let context: Context = { parameters: [], workTables: new Map() };
+
+function checkSlot(slot: number, type: PhysicalType, where: string): void {
+  const declared = context.parameters[slot];
+  if (declared === undefined)
+    fail(where, `slot ${String(slot)} of ${String(context.parameters.length)}`);
+  if (!sameBase(declared, type))
+    fail(where, `slot ${String(slot)} is ${declared.kind}, read as ${type.kind}`);
+}
+
+const INT8: PhysicalType = { kind: "int64" };
+const INT4: PhysicalType = { kind: "int32", bits: 32 };
+const FLOAT8: PhysicalType = { kind: "float64" };
+
+/** A window call's argument and result types (lower/windows.ts, PostgreSQL's signatures). */
+function checkWindowCall(call: WindowCall, orderBy: readonly SortKey[], where: string): void {
+  const args = call.args.map((arg) => arg.type);
+  const [first] = args;
+  const expect = (ok: boolean, what: string) => {
+    if (!ok) fail(where, `window ${call.fn}: ${what}`);
+  };
+  switch (call.fn) {
+    case "row_number":
+    case "rank":
+    case "dense_rank":
+      expect(args.length === 0 && sameBase(call.type, INT8), "() → bigint");
+      break;
+    case "percent_rank":
+    case "cume_dist":
+      expect(args.length === 0 && sameBase(call.type, FLOAT8), "() → double precision");
+      break;
+    case "ntile":
+      expect(
+        args.length === 1 &&
+          first !== undefined &&
+          sameBase(first, INT4) &&
+          sameBase(call.type, INT4),
+        "(integer) → integer",
+      );
+      break;
+    case "lag":
+    case "lead":
+      expect(
+        args.length >= 2 &&
+          args.length <= 3 &&
+          first !== undefined &&
+          sameBase(first, call.type) &&
+          sameBase(args[1] ?? FLOAT8, INT4) &&
+          (args[2] === undefined || sameBase(args[2], call.type)),
+        "(T, integer[, T]) → T",
+      );
+      break;
+    case "first_value":
+    case "last_value":
+      expect(args.length === 1 && first !== undefined && sameBase(first, call.type), "(T) → T");
+      break;
+    case "nth_value":
+      expect(
+        args.length === 2 &&
+          first !== undefined &&
+          sameBase(first, call.type) &&
+          sameBase(args[1] ?? FLOAT8, INT4),
+        "(T, integer) → T",
+      );
+      break;
+    case "count_star":
+      expect(args.length === 0 && sameBase(call.type, INT8), "() → bigint");
+      break;
+    case "count":
+      expect(args.length === 1 && sameBase(call.type, INT8), "(T) → bigint");
+      break;
+    case "min":
+    case "max":
+      expect(args.length === 1 && first !== undefined && sameBase(first, call.type), "(T) → T");
+      break;
+    case "sum":
+    case "avg":
+      expect(args.length === 1, "one argument");
+      break;
+    default:
+      fail(where, `unknown window function ${call.fn}`);
+  }
+  const frame = call.frame;
+  if (frame === null) return;
+  for (const bound of [frame.start, frame.end]) {
+    const offset = bound.offset;
+    const offsetKind = bound.kind === "preceding" || bound.kind === "following";
+    if (offsetKind !== (offset !== null)) fail(where, `frame bound ${bound.kind} offset`);
+    if (offset === null) continue;
+    checkExpr(offset, [], where);
+    if (frame.unit !== "range") {
+      if (!sameBase(offset.type, INT8)) fail(where, `${frame.unit} offset is not bigint`);
+      continue;
+    }
+    const [key, ...more] = orderBy;
+    if (key === undefined || more.length > 0)
+      fail(where, "RANGE with an offset needs exactly one ORDER BY key");
+    const ordered = key.expr.type.kind;
+    const temporal = ordered === "timestamp" || ordered === "date" || ordered === "time";
+    if (!(temporal ? offset.type.kind === "interval" : sameBase(offset.type, key.expr.type)))
+      fail(where, `RANGE offset ${offset.type.kind} over a ${ordered} key`);
+  }
 }
 
 function checkExpr(expr: ScalarExpr, input: readonly OutputColumn[], where: string): void {
@@ -41,6 +154,7 @@ function checkExpr(expr: ScalarExpr, input: readonly OutputColumn[], where: stri
         fail(where, "literal vector of another type");
       return;
     case "param":
+      checkSlot(expr.slot, expr.type, where);
       return;
     case "cast":
       checkExpr(expr.input, input, where);
@@ -305,7 +419,10 @@ function checkRel(rel: Rel, catalog: CatalogView): void {
     case "apply":
       checkRel(rel.outer, catalog);
       checkRel(rel.inner, catalog);
-      for (const binding of rel.bindings) checkExpr(binding.expr, rel.outer.output, where);
+      for (const binding of rel.bindings) {
+        checkExpr(binding.expr, rel.outer.output, where);
+        checkSlot(binding.slot, binding.expr.type, where);
+      }
       if (rel.quantified !== null) {
         checkExpr(rel.quantified.test, rel.outer.output, where);
         const inner = rel.inner.output[0];
@@ -319,10 +436,19 @@ function checkRel(rel: Rel, catalog: CatalogView): void {
       for (const index of rel.partitionBy)
         if (index >= rel.input.output.length) fail(where, "partition key out of range");
       for (const key of rel.orderBy) checkExpr(key.expr, rel.input.output, where);
-      for (const call of rel.functions)
+      for (const call of rel.functions) {
         for (const arg of call.args) checkExpr(arg, rel.input.output, where);
+        checkWindowCall(call, rel.orderBy, where);
+      }
       if (rel.output.length !== rel.input.output.length + rel.functions.length)
         fail(where, "window output width");
+      for (const [index, column] of rel.output.entries()) {
+        const type =
+          index < rel.input.output.length
+            ? at(rel.input.output, index).type
+            : at(rel.functions, index - rel.input.output.length).type;
+        if (!sameBase(column.type, type)) fail(where, `window output ${String(index)} type`);
+      }
       return;
     case "setOp":
       for (const input of rel.inputs) {
@@ -333,14 +459,31 @@ function checkRel(rel: Rel, catalog: CatalogView): void {
             fail(where, `set operation column ${String(index)} of another type`);
       }
       return;
-    case "recursive":
+    case "recursive": {
+      if (context.workTables.has(rel.workTable)) fail(where, "work table bound twice");
       checkRel(rel.base, catalog);
-      checkRel(rel.step, catalog);
+      // Only the step reads the work table: the rows of the previous iteration.
+      context.workTables.set(rel.workTable, rel.output);
+      try {
+        checkRel(rel.step, catalog);
+      } finally {
+        context.workTables.delete(rel.workTable);
+      }
       for (const side of [rel.base, rel.step])
         for (const [index, column] of side.output.entries())
           if (!sameBase(column.type, rel.output[index]?.type ?? column.type))
             fail(where, `recursive column ${String(index)} of another type`);
       return;
+    }
+    case "workTableScan": {
+      const bound = context.workTables.get(rel.workTable);
+      if (bound === undefined) fail(where, "work table outside its recursive step");
+      if (bound.length !== rel.output.length) fail(where, "work table width");
+      for (const [index, column] of rel.output.entries())
+        if (!sameBase(column.type, at(bound, index).type))
+          fail(where, `work table column ${String(index)} of another type`);
+      return;
+    }
     default:
       return;
   }
@@ -348,12 +491,35 @@ function checkRel(rel: Rel, catalog: CatalogView): void {
 
 /** Checks `plan` against `catalog` (see the module comment). */
 export function checkPlan(plan: PhysicalPlan, catalog: CatalogView): void {
-  checkRel(plan.root, catalog);
-  checkOutput(
-    plan.columns.map((column) => ({ op: "param", slot: 0, type: column.type })),
-    plan.root.output,
-    "plan columns",
-  );
+  const saved = context;
+  context = { parameters: plan.parameters, workTables: new Map() };
+  try {
+    if (plan.placeholderCount > plan.parameters.length) fail("plan", "placeholders past the slots");
+    if (plan.clockSlot !== null) {
+      checkSlot(plan.clockSlot, { kind: "timestamp", zoned: true }, "clock");
+      if (plan.clockSlot < plan.placeholderCount) fail("clock", "slot is a placeholder");
+    }
+    const initSlots = new Set<number>();
+    for (const init of plan.initPlans) {
+      const where = `init plan for slot ${String(init.slot)}`;
+      if (init.slot < plan.placeholderCount || init.slot === plan.clockSlot)
+        fail(where, "slot is a placeholder or the clock");
+      if (initSlots.has(init.slot)) fail(where, "slot filled twice");
+      initSlots.add(init.slot);
+      checkRel(init.plan, catalog);
+      const [only, ...more] = init.plan.output;
+      if (only === undefined || more.length > 0) fail(where, "not one column");
+      checkSlot(init.slot, only.type, where);
+    }
+    checkRel(plan.root, catalog);
+    checkOutput(
+      plan.columns.map((column) => ({ op: "literal", type: column.type }) as ScalarExpr),
+      plan.root.output,
+      "plan columns",
+    );
+  } finally {
+    context = saved;
+  }
 }
 
 /** `items[index]`, which the plan's shape guarantees exists. */

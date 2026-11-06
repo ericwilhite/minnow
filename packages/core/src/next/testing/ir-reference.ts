@@ -1,17 +1,20 @@
 /**
- * A row-at-a-time reference interpreter for the IR subset lowering emits at milestone M1, used
- * only by tests: it checks that lowered plans compute what the current engine computes
- * (lowering-differential.test.ts) before the real executor exists. It is deliberately simple
- * and slow, and it is not the executor's specification: the IR contract comments are.
+ * A row-at-a-time reference interpreter for the IR lowering emits (milestones M1 and M3), used
+ * only by tests: it checks that lowered plans compute what PostgreSQL and the current engine
+ * compute (the lowering-pglite and lowering-differential suites) before the real executor
+ * exists. It is deliberately simple and slow, and it is not the executor's specification: the
+ * IR contract comments are. Init plans run lazily, on the first read of their slot (R24.1);
+ * window frames follow PostgreSQL's ROWS / RANGE / GROUPS and EXCLUDE rules.
  *
  * Values: null; booleans; every integer as an exact `bigint`, range-checked at its type
  * (PostgreSQL's 22003); floats as numbers; text as strings. Decimal constants are approximated
- * as numbers (the tests only cast them to floats and integers); decimal arithmetic, intervals,
- * dates and JSON are outside the subset and throw `ReferenceUnsupportedError`.
+ * as numbers, and so are casts to decimal (from integers, floats, text and decimals, rounded
+ * half away from zero to the scale); decimal arithmetic, intervals, dates and JSON are outside
+ * the subset and throw `ReferenceUnsupportedError`.
  * Tables are arrays of rows in catalog order; a locator is the row's index.
  */
 import type { CatalogView, TableDef } from "../access/catalog.js";
-import type { Rel, ScalarExpr, SortKey } from "../ir/ir.js";
+import type { Rel, ScalarExpr, SortKey, WindowCall, WindowFrameBound } from "../ir/ir.js";
 import type { TableRuleExpressions } from "../ir/rules.js";
 import {
   INT16_MAX,
@@ -133,6 +136,23 @@ function castValue(value: Value, from: PhysicalType, to: PhysicalType): Value {
     if (Number.isNaN(number) && typeof value === "string" && value.trim().toLowerCase() !== "nan")
       throw new ReferenceSqlError(`invalid input syntax: "${value}"`, "22P02");
     return to.kind === "float32" ? Math.fround(number) : number;
+  }
+  if (to.kind === "decimal") {
+    // Approximated as a number, like decimal constants; PostgreSQL rounds half away from zero
+    // to the scale and raises 22003 when the integer digits exceed precision − scale.
+    let number: number;
+    if (typeof value === "bigint" || typeof value === "number") number = Number(value);
+    else if (typeof value === "string") {
+      if (!/^\s*[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?\s*$/u.test(value))
+        throw new ReferenceSqlError(`invalid input syntax for type numeric: "${value}"`, "22P02");
+      number = Number(value);
+    } else throw new ReferenceUnsupportedError(`casts from ${from.kind} to decimal`);
+    if (to.scale === null) return number;
+    const factor = 10 ** to.scale;
+    const rounded = roundHalfAway(number * factor) / factor;
+    if (to.precision !== null && Math.abs(rounded) >= 10 ** (to.precision - to.scale))
+      throw new ReferenceSqlError("numeric field overflow", "22003");
+    return rounded;
   }
   if (to.kind === "text") {
     const text =
@@ -272,6 +292,32 @@ export interface Environment {
   sequences: Map<number, bigint>;
   /** Recursive work tables in scope, by id. */
   readonly workTables?: ReadonlyMap<number, readonly Row[]>;
+  /**
+   * Init plans by slot (ir.ts `initPlans`, R24.1): each runs on the first read of its slot and
+   * keeps its value, so a query whose rows never reach the read never runs it.
+   */
+  readonly initPlans?: ReadonlyMap<number, () => Value>;
+}
+
+/** `env` with `plan`'s init plans evaluated lazily, once each, on the first read of their slot. */
+export function withInitPlans(
+  plan: { readonly initPlans: ReadonlyArray<{ readonly slot: number; readonly plan: Rel }> },
+  env: Environment,
+): Environment {
+  const thunks = new Map<number, () => Value>();
+  const lazy: Environment = { ...env, initPlans: thunks };
+  for (const init of plan.initPlans) {
+    let done = false;
+    let value: Value = null;
+    thunks.set(init.slot, () => {
+      if (!done) {
+        value = run(init.plan, lazy)[0]?.[0] ?? null;
+        done = true;
+      }
+      return value;
+    });
+  }
+  return lazy;
 }
 
 export function evaluate(expr: ScalarExpr, row: readonly Value[], env: Environment): Value {
@@ -286,8 +332,10 @@ export function evaluate(expr: ScalarExpr, row: readonly Value[], env: Environme
     }
     case "literal":
       return literalValue(expr.value);
-    case "param":
-      return env.params[expr.slot] ?? null;
+    case "param": {
+      const init = env.initPlans?.get(expr.slot);
+      return init === undefined ? (env.params[expr.slot] ?? null) : init();
+    }
     case "cast": {
       const value = evaluate(expr.input, row, env);
       if (
@@ -585,15 +633,18 @@ export function run(rel: Rel, env: Environment): Row[] {
       ]);
     }
     case "sort": {
+      const limit = boundValue(rel.limit, env);
+      // LIMIT 0 pulls no row, so nothing below it is evaluated (PostgreSQL's Limit node).
+      if (limit === 0) return [];
       const sorted = sortRows(run(rel.input, env), rel.keys, env);
       const offset = boundValue(rel.offset, env) ?? 0;
-      const limit = boundValue(rel.limit, env);
       return sorted.slice(offset, limit === null ? undefined : offset + limit);
     }
     case "limit": {
+      const limit = boundValue(rel.limit, env);
+      if (limit === 0) return [];
       const rows = run(rel.input, env);
       const offset = boundValue(rel.offset, env) ?? 0;
-      const limit = boundValue(rel.limit, env);
       return rows.slice(offset, limit === null ? undefined : offset + limit);
     }
     case "modify":
@@ -943,11 +994,85 @@ function windowRows(rel: Extract<Rel, { op: "window" }>, env: Environment): Row[
       return start;
     });
     const n = sorted.length;
+    // Peer groups in order: each row's group number, and each group's first and last row.
+    const groupOf: number[] = [];
+    const groups: Array<[number, number]> = [];
+    for (let index = 0; index < n; index += 1) {
+      if (index === 0 || peersStart[index] === index)
+        groups.push([index, peersEnd[index] ?? index]);
+      groupOf.push(groups.length - 1);
+    }
+    const sortKey = (row: Row): Value => {
+      const [key] = rel.orderBy;
+      return key === undefined ? null : evaluate(key.expr, row, env);
+    };
+    const descending = rel.orderBy[0]?.direction === "desc";
+    /** The rows of `call`'s frame for the row at `index`, in order (PostgreSQL's frame rules). */
+    const frameOf = (call: WindowCall, row: Row, index: number): Row[] => {
+      const frame = call.frame;
+      const peers: [number, number] = [peersStart[index] ?? index, peersEnd[index] ?? index];
+      if (frame === null) return rel.orderBy.length === 0 ? sorted : sorted.slice(0, peers[1] + 1);
+      const offset = (bound: WindowFrameBound): Value =>
+        bound.offset === null ? null : evaluate(bound.offset, row, env);
+      const position = (bound: WindowFrameBound, end: boolean): number => {
+        switch (bound.kind) {
+          case "unbounded-preceding":
+            return 0;
+          case "unbounded-following":
+            return n - 1;
+          case "current-row":
+            return frame.unit === "rows" ? index : end ? peers[1] : peers[0];
+        }
+        const amount = offset(bound);
+        if (amount === null) throw new ReferenceSqlError("frame offset must not be null", "22004");
+        if (Number(amount) < 0)
+          throw new ReferenceSqlError("frame offset must not be negative", "22013");
+        const sign = bound.kind === "preceding" ? -1 : 1;
+        if (frame.unit === "rows") return index + sign * Number(amount);
+        if (frame.unit === "groups") {
+          const group = (groupOf[index] ?? 0) + sign * Number(amount);
+          if (group < 0) return end ? -1 : 0;
+          if (group >= groups.length) return end ? n - 1 : n;
+          const [first, last] = at(groups, group);
+          return end ? last : first;
+        }
+        // RANGE with an offset: the rows whose key is within `amount` of this row's, along the
+        // sort direction. A NULL key frames only its NULL peers; NULLs are in no other range.
+        const own = sortKey(row);
+        if (own === null) return end ? peers[1] : peers[0];
+        const target = Number(own) + (descending ? -sign : sign) * Number(amount);
+        const inside = (candidate: Row) => {
+          const key = sortKey(candidate);
+          if (key === null) return false;
+          const value = Number(key);
+          const before = descending ? value > target : value < target;
+          const after = descending ? value < target : value > target;
+          return end ? !after : !before;
+        };
+        if (end) {
+          for (let candidate = n - 1; candidate >= 0; candidate -= 1)
+            if (inside(at(sorted, candidate))) return candidate;
+          return -1;
+        }
+        for (let candidate = 0; candidate < n; candidate += 1)
+          if (inside(at(sorted, candidate))) return candidate;
+        return n;
+      };
+      const start = Math.max(0, position(frame.start, false));
+      const end = Math.min(n - 1, position(frame.end, true));
+      const members: number[] = [];
+      for (let candidate = start; candidate <= end; candidate += 1) {
+        const peer = candidate >= peers[0] && candidate <= peers[1];
+        if (frame.exclude === "current-row" && candidate === index) continue;
+        if (frame.exclude === "group" && peer) continue;
+        if (frame.exclude === "ties" && peer && candidate !== index) continue;
+        members.push(candidate);
+      }
+      return members.map((member) => at(sorted, member));
+    };
     for (const [index, row] of sorted.entries()) {
       const values = rel.functions.map((call) => {
-        const frameEnd = rel.orderBy.length === 0 ? n - 1 : (peersEnd[index] ?? index);
-        if (call.frame !== null) throw new ReferenceUnsupportedError("explicit window frames");
-        const frame = sorted.slice(0, frameEnd + 1);
+        const frame = frameOf(call, row, index);
         const arg = (target: Row) =>
           call.args[0] === undefined ? true : evaluate(call.args[0], target, env);
         switch (call.fn) {
@@ -955,9 +1080,38 @@ function windowRows(rel: Extract<Rel, { op: "window" }>, env: Environment): Row[
             return BigInt(index + 1);
           case "rank":
             return BigInt((peersStart[index] ?? index) + 1);
-          case "dense_rank": {
-            const groups = new Set(sorted.slice(0, index + 1).map(orderKey));
-            return BigInt(groups.size);
+          case "dense_rank":
+            return BigInt((groupOf[index] ?? 0) + 1);
+          case "percent_rank":
+            return n <= 1 ? 0 : (peersStart[index] ?? index) / (n - 1);
+          case "cume_dist":
+            return ((peersEnd[index] ?? index) + 1) / n;
+          case "ntile": {
+            const buckets = call.args[0] === undefined ? null : evaluate(call.args[0], row, env);
+            if (buckets === null) return null;
+            const count = Number(buckets);
+            if (count <= 0)
+              throw new ReferenceSqlError("argument of ntile must be greater than zero", "22014");
+            // PostgreSQL: n / count rows per bucket, the first n % count buckets one row more.
+            const size = Math.floor(n / count);
+            const larger = n % count;
+            const boundary = larger * (size + 1);
+            return BigInt(
+              index < boundary
+                ? Math.floor(index / (size + 1)) + 1
+                : larger + Math.floor((index - boundary) / Math.max(size, 1)) + 1,
+            );
+          }
+          case "nth_value": {
+            const nth = call.args[1] === undefined ? null : evaluate(call.args[1], row, env);
+            if (nth === null) return null;
+            if (Number(nth) <= 0)
+              throw new ReferenceSqlError(
+                "argument of nth_value must be greater than zero",
+                "22016",
+              );
+            const target = frame[Number(nth) - 1];
+            return target === undefined ? null : arg(target);
           }
           case "lag":
           case "lead": {

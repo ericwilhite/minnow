@@ -1210,28 +1210,28 @@ export function lowerSetOperation(
         `each ${op.toUpperCase()} query must have the same number of columns`,
         "42601",
       );
-    const types = acc.columns.map((col, position) => {
-      const other = at(next.columns, position);
-      return commonType(
-        [
-          { expr: column(position, col.type), nullable: col.nullable, big: col.big },
-          { expr: column(position, other.type), nullable: other.nullable, big: other.big },
-        ],
-        builder.parameters,
-        op.toUpperCase(),
+    // PostgreSQL resolves each pair of a set operation: an unknown-typed constant (NULL, a
+    // string literal) of one side takes the other side's type, and two unknowns are text. So an
+    // arm's unknowns are resolved here, against its partner, never settled first.
+    const side = (rel: LoweredRel, position: number): Typed => {
+      const col = at(rel.columns, position);
+      return (
+        rel.pending?.[position] ?? {
+          expr: column(position, col.type),
+          nullable: col.nullable,
+          big: col.big,
+        }
       );
-    });
-    const conform = (side: LoweredRel): LoweredRel => {
-      const casts = side.columns.map((col, position) =>
-        coerce(
-          { expr: column(position, col.type), nullable: col.nullable, big: col.big },
-          at(types, position),
-          "implicit",
-          builder.parameters,
-        ),
+    };
+    const types = acc.columns.map((_, position) =>
+      commonType([side(acc, position), side(next, position)], builder.parameters, op.toUpperCase()),
+    );
+    const conform = (input: LoweredRel): LoweredRel => {
+      const casts = input.columns.map((_, position) =>
+        coerce(side(input, position), at(types, position), "implicit", builder.parameters),
       );
-      if (casts.every((cast) => cast.expr.op === "column")) return side;
-      const columns = side.columns.map((col, position) => ({
+      if (casts.every((cast) => cast.expr.op === "column")) return input;
+      const columns = input.columns.map((col, position) => ({
         ...col,
         type: casts[position]?.expr.type ?? col.type,
       }));
@@ -1239,12 +1239,12 @@ export function lowerSetOperation(
         rel: {
           op: "project",
           id: builder.id(),
-          input: side.rel,
+          input: input.rel,
           exprs: casts.map((cast) => cast.expr),
           output: outputColumns(columns),
         },
         columns,
-        ...(side.rows === undefined ? {} : { rows: side.rows }),
+        ...(input.rows === undefined ? {} : { rows: input.rows }),
       };
     };
     const left = conform(acc);

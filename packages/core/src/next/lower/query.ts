@@ -431,8 +431,11 @@ export function lowerBlock(
       state,
     ),
   );
-  const items: Collated[] = select.map((item) =>
-    settle(lowerExpression(item.expression, outputScope, state), builder.parameters),
+  const raw = select.map((item) => lowerExpression(item.expression, outputScope, state));
+  const items: Collated[] = raw.map((typed) => settle(typed, builder.parameters));
+  // Unknown-typed constants a set operation still resolves (placeholders keep their own rule).
+  const pending = raw.map((typed) =>
+    typed.pending?.kind === "null" || typed.pending?.kind === "text" ? typed : undefined,
   );
   const names = select.map((item) => item.alias);
   // ORDER BY: an output column by name, else an expression over the block's rows (hidden).
@@ -572,6 +575,7 @@ export function lowerBlock(
     ...current,
     rows: limited,
     pointRead: base.pointRead && grouping === null && order.length === 0,
+    ...(pending.some((typed) => typed !== undefined) ? { pending } : {}),
   };
 }
 

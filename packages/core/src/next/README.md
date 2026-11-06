@@ -1282,9 +1282,18 @@ with a fixed threshold; use `MODE=encode` and `MODE=filter` in interleaved round
   null-supplies it.
 - A range on an ordered index under byte-order collation becomes `indexRange` when it reads at
   most 5% of the table by the estimate (`access-path.ts`), else a scan with a filter.
-- Subqueries the decorrelator leaves: `x [NOT] IN (simple subquery)` is a mark join (the
-  subquery's WHERE in `filter`, R20.5); others are an `apply` with correlated values in parameter
-  slots; uncorrelated scalar and EXISTS subqueries where no join can attach are init plans.
+- Subqueries: the decorrelator rewrites correlated IN / EXISTS / scalar / quantified subqueries
+  into joins first. What reaches lowering as a subquery: `x [NOT] IN (simple subquery)` is a mark
+  join (the subquery's WHERE in `filter`, R20.5); anything else correlated is an `apply` with
+  correlated values in parameter slots (rare from SQL); uncorrelated scalar and EXISTS subqueries
+  where no join can attach are init plans, run lazily on the first read of their slot (R24.1).
+  The front end refuses correlated subqueries in HAVING, in grouped or nested select lists, and
+  with GROUP BY / HAVING inside them, and a FULL JOIN after another join or under a window
+  (INVENTORY.md "Still needed" 4).
+- Set operations resolve each pair's column types as PostgreSQL does: an unknown-typed constant
+  (NULL, a string literal) takes the other arm's type, and two unknowns are text.
+- A FULL JOIN with no hash-joinable condition lowers, though PostgreSQL refuses it (0A000): an
+  intended extension (R24.2), checked against PostgreSQL's LEFT JOIN UNION ALL anti-join rewrite.
 - Windows, set operations, recursive CTEs and GENERATE_SERIES, UPDATE … FROM, DELETE … USING and
   MERGE lower too. Still refused (`UnsupportedPlanError`, stage "lower"): ordered-set and JSON
   aggregates, JSON / array / regex functions, batch UPDATE / DELETE (`batchWrite`), LATERAL the
@@ -1294,7 +1303,10 @@ with a fixed threshold; use `MODE=encode` and `MODE=filter` in interleaved round
   current engine and through lowering + the IR reference interpreter (`testing/ir-reference.ts`),
   and requires identical results; `testing/lowering-pglite.test.ts` and
   `testing/lowering-pglite-m3.test.ts` do the same against PostgreSQL (PGlite), the authority,
-  through `testing/pglite-oracle.ts`; `testing/ir-check.ts` type-checks every plan they run.
+  through `testing/pglite-oracle.ts`, and `testing/lowering-pglite-review.test.ts` holds review
+  B6-p2b's cases (lazy init plans, set-operation types, FULL JOIN extension, window frames,
+  decimal casts). `testing/ir-check.ts` type-checks every plan they run, init plans, slot wiring,
+  window signatures and frames, and work tables included (`ir-check.test.ts`).
 - Lowering cost (`scripts/lowering-bench.mts`, warm, median on a loaded host): a point read
   ~160 µs, a 3-way join ~350 µs, a 6- to 9-way chain 530–840 µs.
 - Under `compileWithDeclaredTypes` the front end keeps constants typed (no folding with the
