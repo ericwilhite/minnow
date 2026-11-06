@@ -246,6 +246,88 @@ export class KeyDelta {
   }
 
   /**
+   * `sorted` without the objects: each entry with `seq ≤ bound` (and `keep`, if given), in key-byte
+   * order and, per key, (row id, put before tombstone) order, handed to `visit` as the key's range
+   * in `arena` plus the entry's fields. Allocates only the key order (one Int32Array) and a reused
+   * scratch for keys with several entries.
+   */
+  forEachSorted(
+    bound: number,
+    visit: (
+      arena: Uint8Array,
+      start: number,
+      end: number,
+      rowId: number,
+      tombstone: boolean,
+    ) => void,
+    keep: ((rowId: number, tombstone: boolean) => boolean) | null = null,
+  ): void {
+    const arena = this.#arena;
+    const starts = this.#keyStart;
+    const ends = this.#keyEnd;
+    const compareSlots = (a: number, b: number) =>
+      compareBytes(arena, starts[a] ?? 0, ends[a] ?? 0, arena, starts[b] ?? 0, ends[b] ?? 0);
+    const order = new Int32Array(this.keyCount);
+    let ascending = true;
+    for (let k = 0; k < this.keyCount; k++) {
+      order[k] = k;
+      if (ascending && k > 0 && compareSlots(k - 1, k) > 0) ascending = false;
+    }
+    if (!ascending) order.sort(compareSlots);
+    const rowIds = this.#rowIds;
+    const seqs = this.#seqs;
+    const tombstones = this.#tombstones;
+    const next = this.#next;
+    let scratch = this.#scratch;
+    for (const keySlot of order) {
+      const start = starts[keySlot] ?? 0;
+      const end = ends[keySlot] ?? 0;
+      // One entry: the common case, no gathering.
+      const head = this.#head[keySlot] ?? -1;
+      if (head >= 0 && (next[head] ?? -1) < 0) {
+        const rowId = rowIds[head] ?? 0;
+        const tombstone = tombstones[head] === 1;
+        if ((seqs[head] ?? 0) <= bound && (keep === null || keep(rowId, tombstone)))
+          visit(arena, start, end, rowId, tombstone);
+        continue;
+      }
+      let count = 0;
+      for (let entry = head; entry >= 0; entry = next[entry] ?? -1) {
+        if ((seqs[entry] ?? 0) > bound) continue;
+        const rowId = rowIds[entry] ?? 0;
+        const tombstone = tombstones[entry] === 1;
+        if (keep !== null && !keep(rowId, tombstone)) continue;
+        if (count >= scratch.length) {
+          const grown = new Int32Array(scratch.length * 2);
+          grown.set(scratch);
+          scratch = this.#scratch = grown;
+        }
+        // Insertion by (row id, put before tombstone): chains are short.
+        let at = count++;
+        while (at > 0) {
+          const prior = scratch[at - 1] ?? 0;
+          const priorRow = rowIds[prior] ?? 0;
+          if (
+            priorRow < rowId ||
+            (priorRow === rowId && (tombstones[prior] ?? 0) <= (tombstone ? 1 : 0))
+          )
+            break;
+          scratch[at] = prior;
+          at -= 1;
+        }
+        scratch[at] = entry;
+      }
+      for (let k = 0; k < count; k++) {
+        const entry = scratch[k] ?? 0;
+        visit(arena, start, end, rowIds[entry] ?? 0, tombstones[entry] === 1);
+      }
+    }
+  }
+
+  /** Scratch for one key's entries in `forEachSorted`. */
+  #scratch = new Int32Array(16);
+
+  /**
    * Key slots in key-byte order, each with its entries in (row id, put before tombstone) order,
    * keeping only entries with `seq ≤ bound`. Keys whose entries are all filtered out are skipped.
    */

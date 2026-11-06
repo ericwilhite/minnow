@@ -14,7 +14,7 @@
  * disk: durable here means the log's flush calls complete, not a real fsync. The machine is
  * shared: compare runs made back to back.
  */
-import { performance } from "node:perf_hooks";
+import { performance, PerformanceObserver } from "node:perf_hooks";
 import {
   autocommit,
   batch,
@@ -39,6 +39,18 @@ const MODE = option("mode", "tx");
 const DURABILITY = option("durability", "strict") as "strict" | "relaxed";
 const COMMIT = Number(option("commit", "10000"));
 const SINGLES = Number(option("singles", "20000"));
+
+// Garbage-collection pauses in the measured phases (every GC entry Node reports).
+let gcMs = 0;
+const gcObserver = new PerformanceObserver((list) => {
+  for (const entry of list.getEntries()) gcMs += entry.duration;
+});
+gcObserver.observe({ entryTypes: ["gc"] });
+/** GC time so far (entries arrive asynchronously: take what is buffered first). */
+const gcSoFar = () => {
+  for (const entry of gcObserver.takeRecords()) gcMs += entry.duration;
+  return gcMs;
+};
 
 const cpu = () => {
   const usage = process.cpuUsage();
@@ -78,6 +90,7 @@ if (MODE === "single") {
 } else {
   const wall0 = performance.now();
   const cpu0 = cpu();
+  gcMs = 0;
   if (MODE === "tx") {
     const tx = await path.begin();
     const s = tx.statement({ rules });
@@ -112,6 +125,8 @@ if (MODE === "single") {
   report.loadWallMs = Math.round(loaded - wall0);
   report.loadCpuMs = Math.round(loadCpu - cpu0);
   report.settleWallMs = Math.round(performance.now() - loaded);
+  report.totalCpuMs = Math.round(cpu() - cpu0);
+  report.gcMs = Math.round(gcSoFar());
   report.totalWallMs = Math.round(performance.now() - wall0);
   report.rowsPerSecond = Math.round(ROWS / ((performance.now() - wall0) / 1000));
   report.stages = path.maintenance.stages;

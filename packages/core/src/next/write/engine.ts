@@ -131,7 +131,7 @@ import {
 } from "../format/manifest-codec.js";
 import { manifestReader, MetadataReader } from "../format/metadata-reader.js";
 import { readRows } from "./rows.js";
-import { encodeRun, RunBuilder, RunReader, runRef } from "./runs.js";
+import { RunBuilder, RunReader, runRef, type EncodedRun } from "./runs.js";
 import { Sequences } from "./sequences.js";
 import {
   DEFAULT_MERGE_POLICY,
@@ -2282,7 +2282,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
           for (const index of def.indexes) {
             const delta = memtable.deltas.get(index.id);
             if (delta === undefined || delta.entryCount === 0) continue;
-            const run = encodeRun(delta.sorted(through));
+            const run = encodeDelta(delta, through);
             if (run === null) continue;
             runs.set(index.id, runRef(run, (await writer.write(run.parts)).blobs));
           }
@@ -2318,7 +2318,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
           for (const index of def.indexes) {
             const delta = memtable.deltas.get(index.id);
             if (delta === undefined) continue;
-            const run = encodeRun(delta.sorted(through));
+            const run = encodeDelta(delta, through);
             if (run === null) continue;
             runs.set(index.id, runRef(run, (await writer.write(run.parts)).blobs));
           }
@@ -2350,7 +2350,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         for (const index of def.indexes) {
           const delta = memtable.deltas.get(index.id);
           if (delta === undefined) continue;
-          const run = encodeRun(delta.sorted(through));
+          const run = encodeDelta(delta, through);
           if (run === null) continue;
           const written = await writer.write(run.parts);
           runs.set(index.id, runRef(run, written.blobs));
@@ -2968,16 +2968,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const remaps = new Map<KeyDelta, { delta: KeyDelta; entries: Int32Array }>();
     this.#stageFault?.("runs", index);
     for (const [indexId, old] of memtable.deltas) {
-      const own = old
-        .sorted(Infinity)
-        .map(({ key, entries }) => ({
-          key,
-          entries: entries.filter(
-            (entry) => !entry.tombstone && entry.rowId >= first && entry.rowId < end,
-          ),
-        }))
-        .filter((key) => key.entries.length > 0);
-      const run = encodeRun(own);
+      const run = encodeDelta(
+        old,
+        Infinity,
+        (rowId, tombstone) => !tombstone && rowId >= first && rowId < end,
+      );
       if (run !== null) {
         const written = await writer.write(run.parts);
         this.#check();
@@ -4069,6 +4064,26 @@ function quietTable(state: TableState): boolean {
       [...source.deletions.values()].some((seq) => seq > state.view.foldedThrough),
     )
   );
+}
+
+/**
+ * A run of `delta`'s entries with `seq ≤ bound` (and `keep`), streamed from the delta into the
+ * encoder: no per-key or per-entry objects (perf step 1).
+ */
+function encodeDelta(
+  delta: KeyDelta,
+  bound: number,
+  keep: ((rowId: number, tombstone: boolean) => boolean) | null = null,
+): EncodedRun | null {
+  const builder = new RunBuilder();
+  delta.forEachSorted(
+    bound,
+    (arena, start, end, rowId, tombstone) => {
+      builder.addRange(arena, start, end, rowId, tombstone);
+    },
+    keep,
+  );
+  return builder.finish();
 }
 
 /** Adds `extents` to a publication's retirements, each at most once. */
