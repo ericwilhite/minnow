@@ -26,7 +26,7 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | `page/`            | format                           | Page codecs, page directory and statistics, streaming group writer, chunk reader (ChunkPages), inflated-page cache                                                                                                                                                                                                                                                                                                     |
 | `spill/`           | executor (OPFS service: storage) | Spill contract (one long-lived scratch file, batching charged to the operator's budget); in-memory double                                                                                                                                                                                                                                                                                                              |
 | `memory/`          | executor                         | Memory governor: admission, progress loans, held vs allocated bytes (reference implementation)                                                                                                                                                                                                                                                                                                                         |
-| `exec/`            | executor                         | Entry point (`executor.ts`), result frames (`result.ts`), scans (`scan.ts`, `memory-scan.ts`), table rules (`rules.ts`), push driver (`pipeline.ts`), fetcher (`fetch.ts`), comparators, decimal SUM                                                                                                                                                                                                                   |
+| `exec/`            | executor                         | Entry point (`executor.ts`), result frames (`result.ts`), scans (`scan.ts`, `memory-scan.ts`), table rules (`rules.ts`), push driver (`pipeline.ts`), fetcher (`fetch.ts`), expression kernels (`kernels/`), filter and project (`filter.ts`), comparators, decimal SUM                                                                                                                                                |
 | `ir/`              | lowering, executor               | Operator IR (`ir.ts`); scalar function and operator table (`functions.ts`); table rules in IR form (`rules.ts`); executor costs the planner reads (`costs.ts`)                                                                                                                                                                                                                                                         |
 | `access/`          | write path + key index           | Storage access contracts the write path implements: snapshots and segments, catalog, key-index probes and ranges, `modify` (rows, conflicts, RETURNING), transactions, group commit, sequences, delivery                                                                                                                                                                                                               |
 | `testing/`         | all                              | Differential-harness adapter for a partial new core                                                                                                                                                                                                                                                                                                                                                                    |
@@ -484,6 +484,39 @@ and the owner import it directly.
   scan (`memory-scan.ts`) borrows one chunk at a time, passes on async re-pointed chunks, and
   resumes a partial one (a full or denied varlen builder) at `resumeRow`. CHECK and
   generated columns are compiled by `compileTableRules` into the write path's `TableRules`.
+
+### Expression kernels (`exec/kernels/`, `exec/filter.ts`)
+
+- Prebuilt kernels, no code generation. An IR expression compiles once per pipeline instance;
+  its output buffers come from the grant at compile time and are reused for every batch.
+- Exact types: int32 with PostgreSQL's range errors; int64 as `safe` f64 while every value stays
+  within ±(2^53 − 1), recomputed exactly in BigInt64Array otherwise; floats with PostgreSQL's
+  overflow, underflow and division-by-zero errors, REAL rounded with `Math.fround`; decimals with
+  per-slot scales, never rescaled to a shared maximum: f64 while exact, then the int64 and int128
+  tiers in 32-bit limbs (no BigInt per value; rows grouped by scale pair, any number of pairs).
+  A batch is recomputed with one BigInt per value only when a value of it passes 128 bits, an
+  input is already wide, or a product passes the display-scale cap.
+- Casts carry their target type (a widened SMALLINT is an INTEGER to the call above it).
+  DATE → TIMESTAMP(TZ) is 22008 past 294276-12-31, as PostgreSQL.
+- Comparisons follow PostgreSQL: NaN equals NaN and sorts last, decimals compare by value across
+  scales, text compares bytes. A dictionary column against a constant is compared once per
+  entry.
+- AND, OR, CASE and COALESCE evaluate a later argument only on the rows still undecided, so a
+  guarded division never divides by zero. Filters narrow a selection vector conjunct by conjunct.
+- Hot loops are branch-free (a data-dependent branch mispredicts on half of random rows): range
+  checks look at the batch's largest result after the loop, and a suspicious batch is rechecked
+  row by row.
+- Memory: output buffers are allocated once per compiled expression; number paths allocate
+  nothing per row, and a batch costs tens to a few hundred bytes of small objects (measured by
+  `scripts/next-kernels-bench.mts`). Only BigInt paths (values past 128 bits, int64 past 2^53 in
+  casts and comparisons) allocate per value.
+- `pglite.test.ts` judges generated cases by PostgreSQL itself: every numeric type, casts, NULLs
+  with garbage under them, flat/dictionary/constant operands, wide values.
+- `ir/functions.ts` (lowering's) is the one table of functions, overloads and casts (R19).
+  `exec/kernels/bindings.ts` binds each entry to a kernel or refuses it with a construct key
+  (`UnsupportedPlanError`, stage "execute"); `bindings.test.ts` fails on an unbound entry, a
+  stale binding, or a kernel binding that does not evaluate. Not implemented yet: date, time and
+  interval arithmetic, text and math functions, casts to and from text, bounded text casts.
 
 ### Owner and client protocol (`owner/`)
 

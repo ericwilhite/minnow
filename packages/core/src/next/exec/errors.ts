@@ -57,3 +57,58 @@ export class ParameterBindError extends ExecutionError {
  * shared class (next/errors.ts, ruling R17.6), `stage: "execute"` by default.
  */
 export { UnsupportedPlanError } from "../errors.js";
+
+/** 22012: division (or modulo) by zero, for every numeric type (PostgreSQL raises it for floats too). */
+export class DivisionByZeroError extends ExecutionError {
+  constructor() {
+    super("division by zero", "MINNOW_DIVISION_BY_ZERO", "22012");
+    this.name = "DivisionByZeroError";
+  }
+}
+
+/**
+ * 22003: a result outside its type, with PostgreSQL's message: "smallint out of range",
+ * "integer out of range", "bigint out of range", "value out of range: overflow" (float),
+ * "value out of range: underflow" (float), "numeric field overflow".
+ */
+export class NumericOutOfRangeError extends ExecutionError {
+  constructor(message: string) {
+    super(message, "MINNOW_NUMERIC_OUT_OF_RANGE", "22003");
+    this.name = "NumericOutOfRangeError";
+  }
+}
+
+/** 21000: a scalar subquery or init plan returned more than one row. */
+export class CardinalityError extends ExecutionError {
+  constructor() {
+    super(
+      "more than one row returned by a subquery used as an expression",
+      "MINNOW_CARDINALITY",
+      "21000",
+    );
+    this.name = "CardinalityError";
+  }
+}
+
+/** 0A000: NaN or ±Infinity cannot become an integer (PostgreSQL's numeric → int casts). */
+export class CannotConvertError extends ExecutionError {
+  constructor(special: number, target: string) {
+    super(
+      `cannot convert ${special === 1 ? "NaN" : "infinity"} to ${target}`,
+      "MINNOW_CANNOT_CONVERT",
+      "0A000",
+    );
+    this.name = "CannotConvertError";
+  }
+}
+
+/**
+ * 22008 (datetime_field_overflow): a date or timestamp outside the target type's finite range,
+ * with PostgreSQL's message ("date out of range for timestamp").
+ */
+export class DatetimeOverflowError extends ExecutionError {
+  constructor(message: string) {
+    super(message, "MINNOW_DATETIME_OVERFLOW", "22008");
+    this.name = "DatetimeOverflowError";
+  }
+}
