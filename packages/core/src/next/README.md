@@ -1030,6 +1030,41 @@ and the owner import it directly.
   connection. The handshake is watched (an owner dying mid-handshake frees the host lock) and
   bounded (`HANDSHAKE_TIMEOUT_MS`, 5 s); either way the connector starts over. The broker holds a
   client's port only until the next registration of a database it asked about.
+- The broker can be replaced under its ports: WebKit 26.6 restarts a SharedWorker on a
+  cross-origin-isolated page when the page that created it closes, with empty state, the other
+  pages' ports reattached, and messages sent during the switch dropped
+  (`owner/webkit-sharedworker.md`). So every broker request is bounded: it waits
+  `BROKER_REQUEST_TIMEOUT_MS` (1 s), doubling, first on the same port and then on fresh ones, and
+  past `BROKER_REQUEST_BOUND_MS` (15 s) it fails with `OwnerUnreachableError` and the connector
+  becomes `unreachable` instead of staying `connecting`. The same 15 s budget bounds the whole
+  discovery/startup attempt, including repeated `noOwner` or `unreachable` answers, refused or
+  unanswered handshakes, queued election and a worker that never reports ready. Broker or worker
+  construction failures also arm the SQL grace and release the pending election. Replies never
+  restart this budget. The next request, a broker that announces
+  itself, or an owner announcement starts it again. Each broker instance has a random id it
+  announces on every port: the client sends its unanswered requests again to it, and an owner
+  registers again on a new id, but only while it still holds both its locks. Registration is
+  confirmed by an acknowledgement naming that instance and owner. Unacknowledged registrations
+  retry at 1, 2, 4 and 8 s, checking both locks and the stopped state each time, and fail at 15 s.
+  A terminal failure is exposed in `OwnerHost.registration.error` and `minnow:failed`; the owner
+  steps down instead of holding the database while undiscoverable. Repeated announcements of the
+  same instance never restart the budget. An older broker without acknowledgements also reaches
+  this explicit failure; reload its contexts to replace it. A connect request id is deduplicated
+  within one instance's 1,024-entry cache; restart or eviction can create another connection,
+  while SQL commit identity remains protected by the ledger.
+- Requests issued before the first connection are sent on that connection, once and in issue
+  order. After the first `unreachable` status, `unresponsiveAfterMs` (10 s by default) bounds
+  waiting requests: `OwnerUnreachableError` reports effect `none` for a never-sent request and
+  `unknown` for an unanswered sent request. A sent BEGIN or unknown statement keeps its session
+  lost until an explicit end. After the deadline, new requests fail immediately with `none` and
+  trigger another connection attempt. A successful connection clears the deadline; closing cancels it.
+  A continuously disconnected request therefore waits at most 15 s plus 10 s at defaults,
+  conditional on event-loop execution. Retries do not renew the latter deadline. This is a
+  connection-availability bound, not a timeout on connected SQL execution.
+  Supersession by a newer protocol fails pending SQL immediately with the same effect rule;
+  a reload prompt never stands in for completing those calls.
+  Closing cancels the underlying discovery work, including skew discovery's timer and
+  BroadcastChannel, synchronously; it does not merely reject the promise waiting on it.
 - A client learns that its owner was replaced even while idle: a new owner announces itself on
   the database's BroadcastChannel (`{t: "owner", ownerId, epoch}`, the fence epoch, strictly
   increasing). An announcement is a hint: a client acts only on an epoch above its owner's, and

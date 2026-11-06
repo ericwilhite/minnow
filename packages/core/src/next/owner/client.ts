@@ -15,7 +15,17 @@
  * `reconnect(port)` opens the next generation and resends, unchanged, every request without a
  * terminal reply, except streams whose frames it already handed out (those fail with
  * `SessionLostError`). The ledger answers duplicates; a non-resendable request the new owner has
- * not seen fails with `SessionLostError` and never runs.
+ * not seen fails with `SessionLostError` and never runs. `connect(port)`, the first connection,
+ * sends the same way every request made before it (while `connecting`), in issue order, with
+ * the same request ids. Neither sends again a request already posted on the new connection
+ * during its handshake.
+ *
+ * ## Giving up (connector.ts "unresponsive")
+ * `giveUp(detail)`: no owner was reachable for `DEFAULT_UNRESPONSIVE_AFTER_MS`. Every waiting
+ * request fails with `OwnerUnreachableError`: effect `none` if it was never sent on any
+ * connection, `unknown` if it was sent and never answered. A sent BEGIN or unknown statement
+ * leaves its session lost, as on a reconnect. New requests fail at once (`none`) until the next
+ * connection.
  *
  * ## Sessions bound to their generation
  * A session with an open transaction (any state but `idle`) belongs to the connection generation
@@ -101,7 +111,11 @@ type Body = Request extends infer R
 interface Pending {
   readonly seq: number;
   readonly sentAtMs: number;
-  readonly generation: number;
+  /**
+   * The connection generation it belongs to (the ledger keys it by this): the one it was first
+   * sent on. A request issued while no connection was open takes the next one's.
+   */
+  generation: number;
   readonly resendable: boolean;
   readonly body: Body;
   /** What it does to its session's transaction (null: not a session request). */
@@ -117,6 +131,8 @@ interface Pending {
   handedOut: boolean;
   /** Posted on a connection at least once (else it provably never reached an owner). */
   sent: boolean;
+  /** The generation of the connection it was last posted on (0: never posted). */
+  sentOn: number;
   readonly cursor: CursorQueue | null;
   readonly resolve: (result: ClientResult) => void;
   readonly reject: (error: Error) => void;
@@ -221,6 +237,8 @@ export class ProtocolClient {
   #ownerEpoch = 0;
   #lastHeardAt = 0;
   #lastMessageAt = 0;
+  /** Why the client gave up on reaching an owner (`giveUp`), until the next connection. */
+  #unreachable: string | null = null;
   #welcome: { resolve: (welcome: Welcome) => void; reject: (error: Error) => void } | null = null;
   #prepared = 0;
   /** Prepared id → its statement kind, as the owner's front end classified it (`Prepared`). */
@@ -302,8 +320,12 @@ export class ProtocolClient {
   }
 
   /** Opens the first connection. */
-  connect(port: MessagePort, signal?: AbortSignal): Promise<Welcome> {
-    return this.#open(port, signal);
+  async connect(port: MessagePort, signal?: AbortSignal): Promise<Welcome> {
+    const welcome = await this.#open(port, signal);
+    this.#unreachable = null;
+    // Requests made while connecting were never sent: they go now, as a reconnect's would.
+    this.#resendPending(true);
+    return welcome;
   }
 
   /** Sessions a reconnect lost, refused until ended (see "Sessions bound to their generation"). */
@@ -339,15 +361,29 @@ export class ProtocolClient {
     if (this.#session0.transaction !== "idle") this.#addCause(0, 0);
     for (const session of this.#lostCauses.keys()) this.#sessions.set(session, "idle");
     this.#session0.transaction = "idle";
+    this.#unreachable = null;
+    this.#resendPending(false);
+    return welcome;
+  }
+
+  /**
+   * Sends every request without a terminal reply on the new connection (`connect`, `reconnect`):
+   * once, in issue order, with its original request id. A request already posted on this very
+   * connection (issued during its handshake) is not sent again.
+   */
+  #resendPending(first: boolean): void {
     // In send order. Nothing is decided here: every request that was sent goes back to the new
     // owner unchanged, whose ledger answers it (a recorded outcome, or a refusal saying what its
     // absence proves). A request that depended on the old connection is not resendable, so the
     // new owner never runs it.
     for (const pending of [...this.#pending.values()].sort((a, b) => a.seq - b.seq)) {
+      if (pending.sentOn === this.#generation) continue;
       const { session, kind } = pending;
       // An unanswered BEGIN (or unknown text) may have opened a transaction there: a cause at its
-      // place in the sequence, discharged only by a confirmed end after it.
-      if (session !== null && (kind === "begin" || kind === "unknown"))
+      // place in the sequence, discharged only by a confirmed end after it. On the first
+      // connection only one actually sent (on a handshake that failed) can have: one made while
+      // connecting and never sent opened nothing, and goes now like any other.
+      if (session !== null && (kind === "begin" || kind === "unknown") && (!first || pending.sent))
         this.#addCause(session, pending.seq);
       if (!pending.sent && session !== null && this.#isLost(session) && kind !== "rollback") {
         // Never sent, so nothing took effect; on the new owner it would run outside the lost
@@ -366,7 +402,32 @@ export class ProtocolClient {
       pending.columns = null;
       this.#send(pending, pending.sent);
     }
-    return welcome;
+  }
+
+  /**
+   * No owner was reachable for the unresponsive deadline (connector.ts): every waiting request
+   * fails with `OwnerUnreachableError`, effect `none` if never sent, `unknown` if sent and never
+   * answered. A sent BEGIN or unknown statement leaves its session lost (a cause at its place, as
+   * on a reconnect). New requests fail at once until the next connection.
+   */
+  giveUp(detail: string): void {
+    if (this.#closed) return;
+    this.#unreachable = detail;
+    for (const pending of [...this.#pending.values()].sort((a, b) => a.seq - b.seq)) {
+      const effect = pending.sent ? "unknown" : "none";
+      if (
+        pending.sent &&
+        pending.session !== null &&
+        (pending.kind === "begin" || pending.kind === "unknown")
+      )
+        this.#addCause(pending.session, pending.seq);
+      this.#fail(pending, new OwnerUnreachableError(detail, { sequence: pending.seq, effect }));
+    }
+  }
+
+  /** Whether the client gave up (`giveUp`) and has not connected since. */
+  get gaveUp(): boolean {
+    return this.#unreachable !== null;
   }
 
   #open(port: MessagePort, signal?: AbortSignal): Promise<Welcome> {
@@ -589,6 +650,16 @@ export class ProtocolClient {
     cursor: CursorQueue | null = null,
   ): { readonly seq: number; readonly promise: Promise<ClientResult> } {
     if (this.#closed) return this.#refuse(new ClientClosedError(), cursor);
+    if (this.#unreachable !== null) {
+      // Gave up on reaching an owner: never sent, so nothing takes effect. Still activity: the
+      // connector tries to connect again.
+      const refused = this.#refuse(
+        new OwnerUnreachableError(this.#unreachable, { effect: "none" }),
+        cursor,
+      );
+      this.onActivity?.();
+      return refused;
+    }
     const session = "session" in body ? body.session : null;
     const kind = this.#kindOf(body);
     const control = kind !== null && kind !== "other";
@@ -623,6 +694,7 @@ export class ProtocolClient {
       dictionaries: new StreamDictionaries(),
       handedOut: false,
       sent: false,
+      sentOn: 0,
       cursor,
       resolve,
       reject,
@@ -645,7 +717,12 @@ export class ProtocolClient {
   }
 
   #send(pending: Pending, retry: boolean): void {
-    if (this.#port !== null) pending.sent = true;
+    if (this.#port !== null) {
+      // First sent now: it belongs to this connection (generation 0 means none was ever open).
+      if (!pending.sent) pending.generation = this.#generation;
+      pending.sent = true;
+      pending.sentOn = this.#generation;
+    }
     const releases = this.#takeReleases();
     this.#port?.postMessage({
       ...pending.body,

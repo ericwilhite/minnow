@@ -123,7 +123,10 @@ One more 2359 behaviour matters to the owner lanes: on a cross-origin isolated p
 that created a SharedWorker makes 2359 start a fresh instance of it, move the other tabs' ports to
 the new one and drop messages sent in the gap (roughly 80–300 ms). Build 2336, Chromium and Firefox
 keep the same instance, isolated or not, and 2359 keeps it on a page that is not isolated. A
-multi-tab owner case that hangs only on 2359 is likely this, not OPFS.
+multi-tab owner case that hangs only on 2359 is likely this, not OPFS. The rebuild core's owner
+protocol survives it: every broker request is bounded and retried, and each broker instance
+announces an id so clients resend and owners register again;
+`packages/core/src/next/owner/webkit-sharedworker.md` has the measurements and the repro.
 
 The merge gate and fast SQLLogicTest profile run in `.github/workflows/ci.yml` on every push and pull
 request, spread across parallel jobs. One job runs the format, type, lint, build, API contract, and

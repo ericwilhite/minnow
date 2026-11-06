@@ -38,6 +38,15 @@
  *   ~55–65 µs Chromium, ~140 µs Firefox, ~280 µs WebKit (p95 520 µs).
  * - The broker checks the host lock with `navigator.locks.query()` before handing out a port, so a
  *   registration whose host died is never used. It takes no locks itself.
+ * - A broker instance can be replaced under its ports: WebKit 26.6 restarts a SharedWorker on a
+ *   cross-origin-isolated page when the page that created it closes, with empty state, the other
+ *   pages' ports reattached, and the messages sent during the switch dropped (owner/webkit-sharedworker.md).
+ *   So each instance has a random id it announces on every port it accepts (`instance`); an owner
+ *   that sees a new id registers again (only while it still holds its locks), and a client sends
+ *   every unanswered request again to each instance that announces itself on its ports. Every client request is bounded: `BROKER_REQUEST_TIMEOUT_MS`, retried
+ *   with backoff on the same port once, then on fresh ports, up to `BROKER_REQUEST_BOUND_MS`; past
+ *   that, `OwnerUnreachableError`. A retry carries the same request id (`nonce`), and the broker
+ *   answers a request id once: a duplicate never makes a second connection.
  * - The broker script has no imports and its own `BROKER_PROTOCOL`, so builds that share it share
  *   one SharedWorker (same script URL). The owner tab's own client skips the broker: it talks to
  *   its owner worker over a MessageChannel it creates.
@@ -77,6 +86,21 @@
  * - A newer client whose broker cannot see a live owner (the older build uses another broker
  *   script) finds it by asking on the BroadcastChannel (`whoOwns`), then sends `supersede`.
  */
+
+/** One attempt of a client's broker request waits this long before it is sent again. */
+export const BROKER_REQUEST_TIMEOUT_MS = 1_000;
+/**
+ * A client's broker request, retried with doubling timeouts (1, 2, 4, 8 s), fails with
+ * `OwnerUnreachableError` after this long.
+ */
+export const BROKER_REQUEST_BOUND_MS = 15_000;
+
+/** A random 64-bit id, hex (owner ids, broker instance ids). */
+export const randomId = (): string => {
+  const bytes = new Uint8Array(8);
+  crypto.getRandomValues(bytes);
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+};
 
 /** The broker message format version, independent of `PROTOCOL_VERSION`. */
 export const BROKER_PROTOCOL = 1;
@@ -149,10 +173,16 @@ export type BrokerMessage =
       readonly v: number;
       readonly db: string;
       readonly clientId: string;
+      /**
+       * The request id, unique per client: every retry of one request carries the same one, and
+       * the broker answers it once (a duplicate makes no second connection).
+       */
       readonly nonce: number;
     }
   | {
       readonly t: "register";
+      /** Target instance; absent only for legacy senders that do not await acknowledgement. */
+      readonly instance?: string;
       readonly v: number;
       readonly db: string;
       readonly ownerId: string;
@@ -176,8 +206,20 @@ export type BrokerMessage =
   | { readonly t: "noOwner" | "unreachable"; readonly nonce: number }
   /** Broker → owner: a new client connection. */
   | { readonly t: "client"; readonly clientId: string; readonly port: MessagePort }
+  /** Broker → owner: registration was installed by this exact instance. */
+  | {
+      readonly t: "registrationAck";
+      readonly db: string;
+      readonly ownerId: string;
+      readonly instance: string;
+    }
   /** Broker → every connected context. */
   | { readonly t: "registered"; readonly db: string; readonly ownerId: string }
+  /**
+   * Broker → every port it accepts, first: the instance's random id. A new id on a port means the
+   * broker was replaced and lost its registrations and pending requests.
+   */
+  | { readonly t: "instance"; readonly instance: string }
   /** Diagnostics: a bare round trip to the broker (the latency lane's platform baseline). */
   | { readonly t: "ping"; readonly v: number; readonly nonce: number }
   | { readonly t: "pong"; readonly nonce: number };

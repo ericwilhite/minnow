@@ -253,3 +253,42 @@ export const STORAGE_SHARED_CONNECTION_REACH = [
   "release-while-another-in-flight",
   "both-backends-owned",
 ] as const;
+
+/**
+ * A broker replaced under its ports (next/testing/owner-election.test.ts, WebKit 26.6's
+ * SharedWorker restart, next/owner/webkit-sharedworker.md): the restart overlapped a client's
+ * broker request; it emptied a live owner's registration; it emptied a client's wait for one; a
+ * request id reached one instance twice.
+ */
+export const BROKER_RESTART_STATES = [
+  "restart during connect",
+  "restart while the owner is registered",
+  "restart with a client waiting",
+  "duplicate request delivered",
+] as const;
+
+/** Discovery must finish despite responsive negative replies, failed hellos or stuck startup. */
+export const OWNER_DISCOVERY_STATES = [
+  "noOwner",
+  "unreachable",
+  "handshake timeout",
+  "handshake refusal",
+  "handshake newer",
+  "never ready",
+  "lock wait",
+  "sent unanswered",
+  "never sent",
+  "startup throws",
+  "broker throws",
+] as const;
+
+/** Registration loss is independent of instance announcements and includes lost acknowledgements. */
+export const BROKER_REGISTRATION_STATES = [
+  "register lost after announcement",
+  "ack lost",
+  "recovered registration",
+  "terminal failure",
+  "stop cancels retry",
+  "host fence cancels retry",
+  "same instance repeated",
+] as const;

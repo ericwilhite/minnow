@@ -10,9 +10,15 @@
  *    → spill sweep. With stand-ins it loads their durable file.
  * 3. The host lock, stolen from the page that won the election: from now on the owner holds it.
  * 4. The protocol server; the host page's own client connects on `clientPort`.
- * 5. Registration with the broker; answers on the skew channel, and an `owner` announcement there,
- *    so clients of a previous owner reconnect at once.
- * 6. `minnow:ready` to the page.
+ * 5. Arm registration with the broker (its instance announcement starts the acknowledged retry
+ *    loop); answer on the skew channel, and send an `owner` announcement there,
+ *    so clients of a previous owner reconnect at once. The registration is repeated whenever the
+ *    broker port announces an instance id other than the last one seen (a replaced broker starts
+ *    empty, election.ts "Reaching the owner"), but only while this owner holds both its locks and
+ *    has not stopped: a stale owner never registers again. Each send awaits an acknowledgement
+ *    for that instance; retries back off within 15 s. Terminal failure is reported and steps the
+ *    owner down. Repeated same-instance announcements cannot reset this budget.
+ * 6. `minnow:ready` to the page (local service is ready; broker confirmation is asynchronous).
  *
  * A newer owner may steal the fence lock while startup awaits (steps 2 and 3, and the lock query
  * that names the holder for the broker). After every await the host checks; a lost fence tears
@@ -34,10 +40,13 @@ import { OwnershipLostError } from "../storage/contract.js";
 import { acquireFenced, type HeldLock } from "../storage/fence.js";
 import {
   BROKER_PROTOCOL,
+  BROKER_REQUEST_TIMEOUT_MS,
+  BROKER_REQUEST_BOUND_MS,
   hostLockName,
   lifecycleAction,
   openChannel,
   ownerLockName,
+  randomId,
   skewChannelName,
   type BrokerMessage,
   type LifecycleEvent,
@@ -45,7 +54,7 @@ import {
   type SkewSignal,
 } from "./election.js";
 import type { OwnerEngine } from "./engine.js";
-import { toWireError } from "./errors.js";
+import { OwnerUnreachableError, toWireError } from "./errors.js";
 import { PROTOCOL_VERSION, type StepDown } from "./protocol.js";
 import { OwnerServer } from "./server.js";
 import { watchLock, webLocks, type WebLockManager } from "./web-locks.js";
@@ -92,6 +101,12 @@ export interface OwnerHost {
   readonly ownerId: string;
   readonly server: OwnerServer;
   readonly engine: OwnerEngine;
+  /** Confirmation/failure for the current broker instance; null instance when no broker is used. */
+  readonly registration: {
+    readonly instance: string | null;
+    readonly confirmed: boolean;
+    readonly error: OwnerUnreachableError | null;
+  };
   /** Handles a lifecycle event the page relayed. */
   lifecycle(event: LifecycleEvent, platform: Platform): void;
   /** Steps down; `graceful` flushes and closes the engine first. */
@@ -104,13 +119,10 @@ export interface OwnerHostDeps {
   readonly post: (status: OwnerHostStatus) => void;
   /** Bound for taking the fence (default `acquireFenced`'s). */
   readonly acquireTimeoutMs?: number;
+  /** Registration retry interval and whole per-instance budget (default 1 s and 15 s). */
+  readonly registrationTimeoutMs?: number;
+  readonly registrationBoundMs?: number;
 }
-
-const randomId = (): string => {
-  const bytes = new Uint8Array(8);
-  crypto.getRandomValues(bytes);
-  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-};
 
 export async function startOwnerHost<F>(
   init: OwnerHostInit,
@@ -199,26 +211,92 @@ export async function startOwnerHost<F>(
   });
   server.accept(init.clientPort);
 
+  let stopped: Promise<void> | null = null;
   const broker = init.brokerPort;
+  let instance: string | null = null;
+  let confirmedInstance: string | null = null;
+  let registrationError: OwnerUnreachableError | null = null;
+  let registrationTimer: ReturnType<typeof setTimeout> | null = null;
+  let registrationDeadline: ReturnType<typeof setTimeout> | null = null;
+  const cancelRegistration = () => {
+    if (registrationTimer !== null) clearTimeout(registrationTimer);
+    registrationTimer = null;
+    if (registrationDeadline !== null) clearTimeout(registrationDeadline);
+    registrationDeadline = null;
+  };
   if (broker !== null) {
+    const fenced = () => stopped === null && !lock.lost.aborted && !heldHostLock.lost.aborted;
+    const beginRegistration = (target: string) => {
+      cancelRegistration();
+      instance = target;
+      confirmedInstance = null;
+      registrationError = null;
+      const timeout = Math.max(1, deps.registrationTimeoutMs ?? BROKER_REQUEST_TIMEOUT_MS);
+      const bound = Math.max(1, deps.registrationBoundMs ?? BROKER_REQUEST_BOUND_MS);
+      let attempts = 0;
+      const fail = () => {
+        if (instance !== target || confirmedInstance === target || stopped !== null) return;
+        if (!fenced()) {
+          void stop("lockLost", false);
+          return;
+        }
+        cancelRegistration();
+        registrationError = new OwnerUnreachableError(
+          `broker ${target} did not acknowledge registration within ${String(bound)} ms; reload if it is an older broker`,
+        );
+        console.error("Owner broker registration failed", registrationError);
+        deps.post({ t: "minnow:failed", error: toWireError(registrationError) });
+        // Do not strand a live, unreachable owner holding both locks after terminal failure.
+        void stop("closing", true);
+      };
+      // Independent of retries and repeated announcements, including a lost acknowledgement.
+      registrationDeadline = setTimeout(fail, bound);
+      const attempt = () => {
+        registrationTimer = null;
+        if (instance !== target || confirmedInstance === target || stopped !== null) return;
+        // No await separates either fence check from register, on EVERY retry.
+        if (!fenced()) {
+          void stop("lockLost", false);
+          return;
+        }
+        const wait = Math.min(timeout * 2 ** attempts++, bound);
+        registrationTimer = setTimeout(attempt, wait);
+        broker.postMessage({
+          t: "register",
+          v: BROKER_PROTOCOL,
+          instance: target,
+          db: database,
+          ownerId,
+          protocol,
+          build: init.build,
+          lockHolder,
+        } satisfies BrokerMessage);
+      };
+      attempt();
+    };
     broker.onmessage = (event: MessageEvent) => {
       const message = event.data as BrokerMessage;
-      if (message.t === "client") server.accept(message.port);
+      if (message.t === "client") {
+        if (stopped === null) server.accept(message.port);
+        else message.port.close();
+      } else if (message.t === "instance" && message.instance !== instance) {
+        if (fenced()) beginRegistration(message.instance);
+      } else if (
+        message.t === "registrationAck" &&
+        message.instance === instance &&
+        message.db === database &&
+        message.ownerId === ownerId &&
+        fenced()
+      ) {
+        confirmedInstance = message.instance;
+        cancelRegistration();
+      }
     };
-    broker.postMessage({
-      t: "register",
-      v: BROKER_PROTOCOL,
-      db: database,
-      ownerId,
-      protocol,
-      build: init.build,
-      lockHolder,
-    } satisfies BrokerMessage);
+    // The instance announcement precedes registration; an unacknowledged send proves nothing.
   }
 
   const skew = openChannel(skewChannelName(database));
 
-  let stopped: Promise<void> | null = null;
   const release = (reason: StepDown["reason"]) => {
     factory.closeFence(fence);
     lock.release();
@@ -237,6 +315,7 @@ export async function startOwnerHost<F>(
   };
   const stop = (reason: StepDown["reason"], graceful: boolean): Promise<void> => {
     if (stopped !== null) return stopped;
+    cancelRegistration();
     server.stepDown(reason);
     if (!graceful) {
       // Synchronous: the handles must be closed before the page is suspended or the lock stolen.
@@ -269,6 +348,7 @@ export async function startOwnerHost<F>(
     };
 
   lock.lost.addEventListener("abort", () => void stop("lockLost", false), { once: true });
+  heldHostLock.lost.addEventListener("abort", () => void stop("lockLost", false), { once: true });
 
   // Announce this owner, now registered: a client connected to a previous owner (idle, its port
   // dead without a word) learns of the change at once and reconnects (connector.ts "Losing the
@@ -285,6 +365,13 @@ export async function startOwnerHost<F>(
     ownerId,
     server,
     engine,
+    get registration() {
+      return {
+        instance,
+        confirmed: stopped === null && instance !== null && confirmedInstance === instance,
+        error: registrationError,
+      };
+    },
     lifecycle(event, platform) {
       const action = lifecycleAction(event, platform);
       if (action === "flush") void engine.flushPending();

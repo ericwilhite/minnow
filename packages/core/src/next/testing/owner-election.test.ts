@@ -6,9 +6,12 @@
  * across real tabs.
  */
 import fc from "fast-check";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   BARRIER_RESOLUTION_STATES,
+  BROKER_RESTART_STATES,
+  OWNER_DISCOVERY_STATES,
+  BROKER_REGISTRATION_STATES,
   LEDGER_RESOLUTION_STATES,
   createReach,
 } from "../../testing/reach.js";
@@ -35,6 +38,8 @@ import {
 } from "../owner/protocol.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
 import { FakeLockRegistry, type FakeLockContext } from "./fake-locks.js";
+import { harness as ownerHarness } from "./owner-harness.js";
+import { RestartingBroker } from "./restarting-broker.js";
 import { createLowerer } from "../lower/create.js";
 import { StandinExecutor, StandinWritePath, withTestStatements } from "./owner-standins.js";
 
@@ -60,19 +65,27 @@ interface World {
   readonly epochs: Map<string, number>;
   /** Discovery requests (`connect` to the broker) per client. */
   readonly connects: Map<ProtocolClient, number>;
-  readonly broker: Broker;
+  /** The broker SharedWorker; it can be replaced under its ports (restarting-broker.ts). */
+  readonly broker: RestartingBroker;
+  /** Ports each client opened to the broker. */
+  readonly brokerPorts: Map<ProtocolClient, number>;
   /** Owners started, newest last. */
   readonly owners: Array<{ host: OwnerHost | null; kill: () => void; context: FakeLockContext }>;
 }
 
-function world(): World {
+function world(options: { readonly brokerQueryDelayMs?: number } = {}): World {
   const registry = new FakeLockRegistry();
+  const locks = registry.context();
+  const delay = options.brokerQueryDelayMs ?? 0;
   return {
     registry,
     files: new Map(),
     epochs: new Map(),
     connects: new Map(),
-    broker: new Broker(registry.context()),
+    broker: new RestartingBroker(
+      delay === 0 ? locks : { query: () => sleep(delay).then(() => locks.query()) },
+    ),
+    brokerPorts: new Map(),
     owners: [],
   };
 }
@@ -146,6 +159,12 @@ function inProcessOwner(world: World, engines = factory(world)): StartOwner {
     const entry: World["owners"][number] = { host: null, context, kill: () => undefined };
     const started = startOwnerHost({ ...init, t: "minnow:host" }, engines, {
       locks: context,
+      ...(typeof init.settings.registrationTimeoutMs === "number"
+        ? { registrationTimeoutMs: init.settings.registrationTimeoutMs }
+        : {}),
+      ...(typeof init.settings.registrationBoundMs === "number"
+        ? { registrationBoundMs: init.settings.registrationBoundMs }
+        : {}),
       post: (status) => {
         if (status.t === "minnow:stopped") resolveStopped(status.reason);
       },
@@ -212,6 +231,9 @@ function tab(
     readonly silenceDeadlineMs?: number;
     readonly handshakeTimeoutMs?: number;
     readonly announcements?: boolean;
+    readonly brokerTimeoutMs?: number;
+    readonly brokerBoundMs?: number;
+    readonly retryMs?: number;
   } = {},
 ): Tab {
   const locks = world.registry.context();
@@ -225,7 +247,8 @@ function tab(
     locks,
     openBroker: () => {
       const { port1, port2 } = new MessageChannel();
-      world.broker.accept(port1);
+      world.brokerPorts.set(client, (world.brokerPorts.get(client) ?? 0) + 1);
+      world.broker.accept(port1, port2);
       // Count discovery: every `connect` this tab asks the broker.
       const serve = port1.onmessage;
       port1.onmessage = (event: MessageEvent) => {
@@ -247,7 +270,7 @@ function tab(
       superseded: state.superseded,
     }),
     settings: options.settings ?? {},
-    retryMs: 50,
+    retryMs: options.retryMs ?? 50,
     ...(options.silenceDeadlineMs === undefined
       ? {}
       : { silenceDeadlineMs: options.silenceDeadlineMs }),
@@ -255,6 +278,8 @@ function tab(
       ? {}
       : { handshakeTimeoutMs: options.handshakeTimeoutMs }),
     ...(options.announcements === undefined ? {} : { announcements: options.announcements }),
+    ...(options.brokerTimeoutMs === undefined ? {} : { brokerTimeoutMs: options.brokerTimeoutMs }),
+    ...(options.brokerBoundMs === undefined ? {} : { brokerBoundMs: options.brokerBoundMs }),
     onSuperseded: () => {
       state.superseded = true;
       options.onSuperseded?.();
@@ -301,6 +326,8 @@ describe("election and the broker", () => {
         const { port1, port2 } = new MessageChannel();
         w.broker.accept(port1);
         port2.onmessage = (event: MessageEvent) => {
+          // The instance announcement comes first on every port; the answer follows.
+          if ((event.data as { t: string }).t === "instance") return;
           resolve((event.data as { t: string }).t);
           port1.close();
           port2.close();
@@ -351,6 +378,8 @@ describe("the broker's liveness check", () => {
       const { port1, port2 } = new MessageChannel();
       w.broker.accept(port1);
       port2.onmessage = (event: MessageEvent) => {
+        // The instance announcement comes first on every port; the answer follows.
+        if ((event.data as { t: string }).t === "instance") return;
         resolve((event.data as { t: string }).t);
         port1.close();
         port2.close();
@@ -1800,4 +1829,892 @@ describe("D2 (B5-p2d review 2): a silent connection is probed, backed off, and e
   it("pins the probe limit", () => {
     expect(SILENT_PROBES_LIMIT).toBe(3);
   });
+});
+
+/** a hosts with one row; returns a's owner. */
+async function hosted(w: World, options: Parameters<typeof tab>[1] = {}) {
+  const a = tab(w, options);
+  await a.connector.start();
+  await a.client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
+  await a.client.query("INSERT INTO t VALUES ($1, $2, $3)", [1, 0, "x"]);
+  const owner = w.owners[0]?.host;
+  if (owner === null || owner === undefined) throw new Error("no owner");
+  return { a, owner };
+}
+
+describe("a broker replaced under its ports (WebKit 26.6, owner/webkit-sharedworker.md)", () => {
+  const within = <T>(promise: Promise<T>, ms: number): Promise<T | "timed out"> =>
+    Promise.race([promise, sleep(ms).then(() => "timed out" as const)]);
+
+  it("the owner's tab closes while the broker restarts: the survivor elects itself and its request resolves", async () => {
+    const w = world();
+    const { a } = await hosted(w);
+    const b = tab(w, { brokerTimeoutMs: 50 });
+    await b.connector.start();
+    // In flight, so b watches the host lock and asks the broker the moment a's owner dies.
+    const spin = b.client.query("SELECT spin($1)", [200]);
+    await sleep(30);
+    // WebKit: the page that created the SharedWorker closes, and the broker is replaced; b's
+    // question to it is sent inside the switch and lost.
+    const restarted = w.broker.restart({ dropMs: 120 });
+    killTab(w, a, 0);
+    const result = await within(spin, 3_000);
+    await restarted;
+    expect(result === "timed out" ? result : result.summary.command).toBe("SELECT");
+    expect(w.broker.dropped.get("connect") ?? 0).toBeGreaterThan(0);
+    expect(b.connector.status).toBe("connected");
+    expect(b.connector.hosting).toBe(true);
+    // The new owner registered with the new instance.
+    expect(w.broker.current?.registrations.get("db")).toBe(b.client.ownerId);
+  });
+
+  it("a new instance makes an unanswered request ask again at once, not at its timeout", async () => {
+    const w = world();
+    const { owner } = await hosted(w);
+    // The restart starts before c asks: c's question is dropped. Its retry is 5 s away; only the
+    // new instance's announcement can bring the answer sooner.
+    const restarted = w.broker.restart({ dropMs: 100 });
+    const c = tab(w, { brokerTimeoutMs: 5_000 });
+    const started = Date.now();
+    expect(await within(c.connector.start(), 2_000)).toBeUndefined();
+    await restarted;
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(w.broker.dropped.get("connect") ?? 0).toBeGreaterThan(0);
+    expect(c.client.ownerId).toBe(owner.ownerId);
+  });
+
+  it("a live owner registers again with the new instance, and a new tab reaches it", async () => {
+    const w = world();
+    const { owner } = await hosted(w);
+    await w.broker.restart({ dropMs: 30 });
+    await until(() => w.broker.current?.registrations.get("db") === owner.ownerId, 1_000);
+    const c = tab(w);
+    expect(await within(c.connector.start(), 2_000)).toBeUndefined();
+    expect(c.client.ownerId).toBe(owner.ownerId);
+    expect(await value(c.client)).toBe(0);
+  });
+
+  it("a stale owner (its host lock stolen) never registers again", async () => {
+    const w = world();
+    const { owner } = await hosted(w);
+    // A successor took the host lock; the old owner has not noticed anything else yet.
+    void w.registry
+      .context()
+      .request(hostLockName("db"), { steal: true }, () => new Promise<void>(() => undefined));
+    await sleep(5);
+    await w.broker.restart({ dropMs: 10 });
+    await sleep(50);
+    expect(w.broker.current?.registrations.has("db")).toBe(false);
+    expect(owner.ownerId).toBeDefined();
+  });
+
+  it("registering again is idempotent: one registration, one connection per client", async () => {
+    const w = world();
+    const { owner } = await hosted(w);
+    w.broker.duplicateNext("register");
+    await w.broker.restart({ dropMs: 10 });
+    await until(() => w.broker.current?.registrations.get("db") === owner.ownerId, 1_000);
+    expect(w.broker.duplicated).toBe(1);
+    expect(w.broker.current?.registrations.size).toBe(1);
+    const before = owner.server.stats.connections;
+    const c = tab(w);
+    await c.connector.start();
+    await sleep(20);
+    expect(owner.server.stats.connections).toBe(before + 1);
+  });
+
+  it("a duplicate connect reaching the same instance makes no second connection", async () => {
+    const w = world();
+    const { owner } = await hosted(w);
+    const before = owner.server.stats.connections;
+    w.broker.duplicateNext("connect");
+    const c = tab(w);
+    await c.connector.start();
+    await sleep(20);
+    // The law first: one connection for c.
+    expect(owner.server.stats.connections).toBe(before + 1);
+    expect(w.broker.duplicated).toBe(1);
+    // The injected copy, and the client's own repeat on the instance's announcement.
+    expect(w.broker.duplicates).toBeGreaterThanOrEqual(1);
+    expect(await value(c.client)).toBe(0);
+  });
+
+  it("a retry of a slow answer reaches the same instance: answered once, one connection", async () => {
+    // The broker's lock query takes 60 ms; c's first attempt times out after 15 ms.
+    const w = world({ brokerQueryDelayMs: 60 });
+    const { owner } = await hosted(w);
+    const before = owner.server.stats.connections;
+    const c = tab(w, { brokerTimeoutMs: 15 });
+    await c.connector.start();
+    await sleep(100);
+    expect(owner.server.stats.connections).toBe(before + 1);
+    expect(w.broker.duplicates).toBeGreaterThan(0);
+    expect(await value(c.client)).toBe(0);
+  });
+});
+
+/**
+ * A connector (that never hosts) whose broker ports, old and new, drop every message while
+ * `silent.on`, and reach the world's broker otherwise.
+ */
+function silentTab(
+  w: World,
+  unreachable: Error[],
+  options: { readonly silent?: boolean; readonly unresponsiveAfterMs?: number } = {},
+) {
+  /** `posts`: messages the broker side dropped; `sent`: messages the client sent (at once). */
+  const silent = { on: options.silent ?? true, ports: 0, posts: 0, sent: 0 };
+  const client = new ProtocolClient();
+  const connector = new OwnerConnector({
+    database: "db",
+    client,
+    locks: w.registry.context(),
+    openBroker: () => {
+      const { port1, port2 } = new MessageChannel();
+      silent.ports++;
+      // A port opened while silent reaches the broker (and hears its announcement) only once the
+      // silence ends; a port that reached it drops what it sends while silent.
+      let route: ((event: MessageEvent) => void) | null = null;
+      const reach = () => {
+        if (route !== null) return;
+        w.broker.accept(port1);
+        route = port1.onmessage;
+        port1.onmessage = receive;
+      };
+      const receive = (event: MessageEvent) => {
+        if (silent.on) {
+          silent.posts++;
+          return;
+        }
+        reach();
+        route?.call(port1, event);
+      };
+      if (silent.on) port1.onmessage = receive;
+      else reach();
+      const post = port2.postMessage.bind(port2);
+      port2.postMessage = ((message: unknown, transfer?: Transferable[]) => {
+        silent.sent++;
+        post(message, transfer ?? []);
+      }) as typeof port2.postMessage;
+      cleanups.push(() => {
+        port1.close();
+        port2.close();
+      });
+      return port2;
+    },
+    startOwner: null,
+    context: (): HostContext => ({
+      kind: "page",
+      visible: true,
+      platform: { mobile: false },
+      superseded: false,
+    }),
+    announcements: false,
+    retryMs: 50,
+    brokerTimeoutMs: 20,
+    brokerBoundMs: 150,
+    ...(options.unresponsiveAfterMs === undefined
+      ? {}
+      : { unresponsiveAfterMs: options.unresponsiveAfterMs }),
+    onUnreachable: (error) => {
+      unreachable.push(error);
+    },
+  });
+  cleanups.push(() => {
+    connector.close();
+  });
+  return { connector, client, silent };
+}
+
+/**
+ * Tracks the timers the connector and the client set (not earlier tests' in-process owners, which
+ * keep scheduling theirs in this worker). `pending` is what is still to fire; `restore()` puts the
+ * real functions back.
+ */
+function trackOwnerTimers() {
+  const pending = new Set<unknown>();
+  const realSet = globalThis.setTimeout;
+  const realClear = globalThis.clearTimeout;
+  globalThis.setTimeout = ((handler: () => void, ms?: number) => {
+    const id = realSet(() => {
+      pending.delete(id);
+      handler();
+    }, ms);
+    if (/owner\/(connector|client)\.ts/.test(new Error().stack ?? "")) pending.add(id);
+    return id;
+  }) as typeof setTimeout;
+  globalThis.clearTimeout = ((id: ReturnType<typeof setTimeout>) => {
+    pending.delete(id);
+    realClear(id);
+  }) as typeof clearTimeout;
+  return {
+    pending,
+    wait: (ms: number) => new Promise((resolve) => realSet(resolve, ms)),
+    restore: () => {
+      globalThis.setTimeout = realSet;
+      globalThis.clearTimeout = realClear;
+    },
+  };
+}
+
+describe("a broker request is bounded (connector.ts ConnectorStatus)", () => {
+  it("a broker that never answers: OwnerUnreachableError at the bound, never left connecting", async () => {
+    const w = world();
+    const unreachable: Error[] = [];
+    const { connector, silent } = silentTab(w, unreachable);
+    const started = Date.now();
+    const error = await connector.start().then(
+      () => null,
+      (caught: unknown) => caught as Error,
+    );
+    const took = Date.now() - started;
+    expect(error?.name).toBe("OwnerUnreachableError");
+    expect((error as { code?: string } | null)?.code).toBe("MINNOW_OWNER_UNREACHABLE");
+    expect(took).toBeGreaterThanOrEqual(140);
+    expect(took).toBeLessThan(1_000);
+    expect(connector.status).toBe("unreachable");
+    expect(unreachable).toHaveLength(1);
+    // Attempts at 0, 20 and 60 ms on the first port, a fresh one, another fresh one (20+40+80 ms).
+    expect(silent.posts).toBe(4);
+    expect(silent.ports).toBe(3);
+  });
+
+  it("after giving up, the next request makes it connect again once the broker answers", async () => {
+    const w = world();
+    const { owner } = await hosted(w);
+    const unreachable: Error[] = [];
+    const { connector, client, silent } = silentTab(w, unreachable);
+    await connector.start().catch(() => undefined);
+    expect(connector.status).toBe("unreachable");
+    silent.on = false;
+    // A request is activity: connecting starts again (bounded, as always). This client never
+    // had a connection, and a request made before the first one is not sent on it (client.ts
+    // sends unsent requests on a reconnect only), so it is the next request that is answered.
+    void client.query("SELECT 1").catch(() => undefined);
+    await until(() => connector.status === "connected", 2_000);
+    expect(client.ownerId).toBe(owner.ownerId);
+    expect(await value(client)).toBe(0);
+  });
+
+  it("a second answer to a request already answered is closed with bye, never used", async () => {
+    const w = world();
+    const { owner } = await hosted(w);
+    let brokerSide: MessagePort | null = null;
+    const c = tab(w);
+    // The world's broker side of c's port: the last port the broker accepted for c.
+    const accept = w.broker.accept.bind(w.broker);
+    w.broker.accept = (port: MessagePort) => {
+      brokerSide = port;
+      accept(port);
+    };
+    await c.connector.start();
+    w.broker.accept = accept;
+    const before = owner.server.stats.connections;
+    const extra = new MessageChannel();
+    const bye = new Promise<unknown>((resolve) => {
+      extra.port2.onmessage = (event: MessageEvent) => {
+        resolve(event.data);
+      };
+    });
+    // A late answer to c's first request (nonce 1), as a dead instance's could be.
+    (brokerSide as MessagePort | null)?.postMessage(
+      { t: "port", nonce: 1, ownerId: owner.ownerId, port: extra.port1 },
+      [extra.port1],
+    );
+    expect(await Promise.race([bye, sleep(1_000).then(() => "no bye")])).toEqual({ t: "bye" });
+    expect(owner.server.stats.connections).toBe(before);
+    expect(c.connector.status).toBe("connected");
+    extra.port2.close();
+  });
+
+  it("close() mid-request leaves no timer and sends nothing more", async () => {
+    const w = world();
+    const timers = trackOwnerTimers();
+    try {
+      const { connector, silent } = silentTab(w, []);
+      const start = connector.start().catch((error: unknown) => (error as Error).name);
+      await timers.wait(50);
+      expect(timers.pending.size).toBeGreaterThan(0);
+      connector.close();
+      expect(await start).toBe("ClientClosedError");
+      expect(timers.pending.size).toBe(0);
+      const sent = silent.sent;
+      await timers.wait(200);
+      expect(silent.sent).toBe(sent);
+    } finally {
+      timers.restore();
+    }
+  });
+});
+
+describe("generated: a broker restart at any point never strands a tab", () => {
+  const scenario = fc.record({
+    killOwner: fc.boolean(),
+    /** When the broker is replaced, relative to the owner's tab closing (or to the write). */
+    restartAt: fc.integer({ min: -40, max: 80 }),
+    dropMs: fc.integer({ min: 0, max: 200 }),
+    duplicate: fc.constantFrom("none", "connect", "register"),
+    newTab: fc.boolean(),
+  });
+
+  const SEEDS = seedsFor("next-owner-broker-restart", [0xb0b5]);
+
+  it.each(SEEDS)(
+    "every live tab connects to one registered owner, and the write runs once (seed %i)",
+    async (seed) => {
+      const reach = createReach("next-owner-broker-restart", BROKER_RESTART_STATES, {
+        minimum: 3,
+      });
+      await fc.assert(
+        fc.asyncProperty(scenario, async ({ killOwner, restartAt, dropMs, duplicate, newTab }) => {
+          const entered = new Set<string>();
+          const w = world();
+          const { a } = await hosted(w, { brokerTimeoutMs: 30 });
+          const b = tab(w, { brokerTimeoutMs: 30 });
+          await b.connector.start();
+          if (duplicate !== "none") w.broker.duplicateNext(duplicate);
+          // b's write, in flight when the owner's tab closes (if it does).
+          const write = b.client.query("UPDATE t SET n = n + 1 WHERE id = $1", [1]);
+          const spin = b.client.query("SELECT spin($1)", [60]);
+          const events: Array<[number, () => void]> = [
+            [restartAt, () => void w.broker.restart({ dropMs })],
+          ];
+          if (killOwner) events.push([0, () => killTab(w, a, 0)]);
+          // A tab opened during the switch (set from a scheduled event, so held in an object).
+          const opened: { c: Tab | null } = { c: null };
+          if (newTab)
+            events.push([
+              restartAt + Math.floor(dropMs / 2),
+              () => {
+                const c = tab(w, { brokerTimeoutMs: 30 });
+                opened.c = c;
+                void c.connector.start().catch(() => undefined);
+              },
+            ]);
+          events.sort((x, y) => x[0] - y[0]);
+          let now = Math.min(0, ...events.map(([at]) => at));
+          for (const [at, run] of events) {
+            await sleep(at - now);
+            now = at;
+            run();
+          }
+          // Laws, within a bound: every live tab connected, all to one owner, registered with
+          // the broker instance of the moment; the write applied exactly once.
+          const live = [...(killOwner ? [] : [a]), b, ...(opened.c === null ? [] : [opened.c])];
+          await until(
+            () =>
+              w.broker.current !== null && live.every((t) => t.connector.status === "connected"),
+            3_000,
+          );
+          await Promise.all([write, spin]);
+          const ownerIds = new Set(live.map((t) => t.client.ownerId));
+          expect(ownerIds.size).toBe(1);
+          const ownerId = [...ownerIds][0] ?? null;
+          await until(() => w.broker.current?.registrations.get("db") === ownerId, 2_000);
+          expect(await value(b.client)).toBe(1);
+          // No second session from a duplicate: once unused handshakes ended, one connection per
+          // live tab.
+          const owner = w.owners.find((entry) => entry.host?.ownerId === ownerId)?.host;
+          await until(() => owner?.server.stats.connections === live.length, 2_000);
+
+          const restart = w.broker.restarts[0];
+          if ((w.broker.dropped.get("connect") ?? 0) > 0 || w.broker.lostReplies > 0)
+            entered.add("restart during connect");
+          if (restart !== undefined && restart.registered > 0)
+            entered.add("restart while the owner is registered");
+          if (restart !== undefined && restart.waiting > 0)
+            entered.add("restart with a client waiting");
+          if (w.broker.duplicates > 0) entered.add("duplicate request delivered");
+          reach.recordHistory(entered);
+          for (const cleanup of cleanups.splice(0).reverse()) cleanup();
+        }),
+        { seed, numRuns: 40 },
+      );
+      reach.assertReached();
+    },
+    200_000,
+  );
+});
+
+describe("requests end in bounded time too (client.ts connect and giveUp)", () => {
+  const settledAs = (promise: Promise<unknown>) =>
+    promise.then(
+      () => ({ ok: true as const, error: null }),
+      (error: unknown) => ({
+        ok: false as const,
+        error: error as Error & { effect?: string; code?: string; sequence?: number | null },
+      }),
+    );
+
+  it("requests made while connecting go out on the first connection, once each, in order", async () => {
+    const w = world();
+    const { a } = await hosted(w);
+    await a.client.query("INSERT INTO t VALUES ($1, $2, $3)", [2, 0, "y"]);
+    const c = tab(w);
+    // Not connected yet: none of these can be sent. Order matters: (0 × 2) + 1 = 1, but
+    // (0 + 1) × 2 = 2, and any request run twice moves n further.
+    const double = c.client.query("UPDATE t SET n = n * 2 WHERE id = $1", [1]);
+    const inc = c.client.query("UPDATE t SET n = n + 1 WHERE id = $1", [1]);
+    const read = c.client.query("SELECT * FROM t WHERE id = $1", [1]);
+    // A transaction opened before the first connection (on another row: sessions run
+    // concurrently): BEGIN never sent opened nothing, so it goes like any other request.
+    const begin = c.client.query("BEGIN", [], { session: 1 });
+    const inTx = c.client.query("UPDATE t SET n = n + 10 WHERE id = $1", [2], { session: 1 });
+    const commit = c.client.query("COMMIT", [], { session: 1 });
+    await c.connector.start();
+    await Promise.all([double, inc, begin, inTx, commit]);
+    expect((await read).rows()[0]?.[1]).toBe(1);
+    expect(c.client.lostSessions.size).toBe(0);
+    expect(await value(a.client)).toBe(1);
+    const second = await a.client.query("SELECT * FROM t WHERE id = $1", [2]);
+    expect(second.rows()[0]?.[1]).toBe(10);
+  });
+
+  it("a request issued during the first handshake is posted once, not again after the welcome", async () => {
+    const w = world();
+    const { a, owner } = await hosted(w);
+    const client = new ProtocolClient();
+    const { port1, port2 } = new MessageChannel();
+    cleanups.push(() => {
+      client.close();
+      port1.close();
+      port2.close();
+    });
+    const posts = new Map<number, number>();
+    const post = port2.postMessage.bind(port2);
+    port2.postMessage = ((message: unknown, transfer?: Transferable[]) => {
+      const seq = (message as { seq?: number }).seq;
+      if (typeof seq === "number") posts.set(seq, (posts.get(seq) ?? 0) + 1);
+      post(message, transfer ?? []);
+    }) as typeof port2.postMessage;
+    const connecting = client.connect(port2);
+    // The port is open but not welcomed: this goes right after the hello.
+    const { seq, promise } = client.send({
+      t: "statement",
+      session: 0,
+      text: "UPDATE t SET n = n + 1 WHERE id = $1",
+      prepared: null,
+      knownColumnsVersion: -1,
+      params: [1],
+      result: { windowBytes: 1 << 20, frameRows: null, wantRows: true },
+    });
+    owner.server.accept(port1);
+    await connecting;
+    await promise;
+    expect(posts.get(seq)).toBe(1);
+    expect(await value(a.client)).toBe(1);
+  });
+
+  it("the deadline (fake timers): unreachable for unresponsiveAfterMs, then waiting requests fail", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    // Over the fake timers: counts only the connector's and the client's.
+    const timers = trackOwnerTimers();
+    try {
+      const w = world();
+      const { connector, client } = silentTab(w, [], { unresponsiveAfterMs: 1_000 });
+      // Never sent: there is no connection yet.
+      const waiting = settledAs(client.query("SELECT 1"));
+      let settled = false;
+      void waiting.then(() => {
+        settled = true;
+      });
+      void connector.start().catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(150);
+      expect(connector.status).toBe("unreachable");
+      await vi.advanceTimersByTimeAsync(999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      const outcome = await waiting;
+      expect(outcome.ok).toBe(false);
+      expect(outcome.error?.name).toBe("OwnerUnreachableError");
+      expect(outcome.error?.code).toBe("MINNOW_OWNER_UNREACHABLE");
+      expect(outcome.error?.effect).toBe("none");
+      expect(typeof outcome.error?.sequence).toBe("number");
+      // Past the deadline a new request fails at once, never sent.
+      const late = await settledAs(client.query("SELECT 2"));
+      expect(late.error?.effect).toBe("none");
+      // close() leaves nothing scheduled (the deadline was armed and fired; retries stopped).
+      connector.close();
+      expect(timers.pending.size).toBe(0);
+    } finally {
+      timers.restore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("a sent, unanswered request fails unknown; the session stays lost; a reconnect recovers", async () => {
+    const w = world();
+    const { a } = await hosted(w);
+    const { connector, client, silent } = silentTab(w, [], {
+      silent: false,
+      unresponsiveAfterMs: 100,
+    });
+    await connector.start();
+    await client.query("BEGIN", [], { session: 1 });
+    await client.query("UPDATE t SET n = n + 1 WHERE id = $1", [1], { session: 1 });
+    // Sent, and its owner dies before answering.
+    const spin = settledAs(client.query("SELECT spin($1)", [5_000], { session: 1 }));
+    await sleep(20);
+    silent.on = true;
+    killTab(w, a, 0);
+    // Posted on the dead owner's port: sent, never answered. A BEGIN may have opened a
+    // transaction, so its session must stay lost.
+    const begin2 = settledAs(client.query("BEGIN", [], { session: 2 }));
+    const outcome = await Promise.race([spin, sleep(3_000).then(() => null)]);
+    expect((await begin2).error?.effect).toBe("unknown");
+    // Check before recovery: a missing loss cause must fail here, not hang later.
+    expect(client.lostSessions.has(2)).toBe(true);
+    expect(outcome?.error?.name).toBe("OwnerUnreachableError");
+    // The dangerous direction: it was sent, so it may have taken effect. Never "none".
+    expect(outcome?.error?.effect).toBe("unknown");
+    expect(client.gaveUp).toBe(true);
+    // A new owner, and the broker answers again.
+    const d = tab(w);
+    await d.connector.start();
+    silent.on = false;
+    // Refused at once (never sent), and it makes the connector try again.
+    const refused = await settledAs(client.query("SELECT 1"));
+    expect(refused.error?.effect).toBe("none");
+    await until(() => connector.status === "connected", 2_000);
+    expect(client.gaveUp).toBe(false);
+    expect(client.ownerId).toBe(d.client.ownerId);
+    expect((await client.query("SELECT * FROM t WHERE id = $1", [1])).rows()[0]?.[1]).toBe(0);
+    // Session 1's transaction went with the dead owner: refused until an explicit ROLLBACK.
+    expect(client.lostSessions.has(1)).toBe(true);
+    expect(client.lostSessions.has(2)).toBe(true);
+    const inLost = await settledAs(client.query("SELECT 1", [], { session: 1 }));
+    expect(inLost.error?.name).toBe("SessionLostError");
+    await client.query("ROLLBACK", [], { session: 1 });
+    expect(client.lostSessions.has(1)).toBe(false);
+  });
+
+  it("close() while unreachable, deadline armed, leaves no timer", async () => {
+    const w = world();
+    const timers = trackOwnerTimers();
+    try {
+      const { connector, client } = silentTab(w, [], { unresponsiveAfterMs: 10_000 });
+      const waiting = settledAs(client.query("SELECT 1"));
+      await connector.start().catch(() => undefined);
+      expect(connector.status).toBe("unreachable");
+      expect(timers.pending.size).toBeGreaterThan(0);
+      connector.close();
+      expect(timers.pending.size).toBe(0);
+      expect((await waiting).error?.name).toBe("ClientClosedError");
+    } finally {
+      timers.restore();
+    }
+  });
+});
+
+/** Whole-attempt liveness, independent of whether individual discovery messages are answered. */
+describe("review P1: responsive discovery still has a deadline", () => {
+  const seeds = seedsFor("next-owner-discovery-bound", [0xd15c]);
+  it.each(seeds)(
+    "generated negative replies and failed handshakes (seed %i)",
+    async (seed) => {
+      const reach = createReach("next-owner-discovery-bound", OWNER_DISCOVERY_STATES, {
+        minimum: 2,
+      });
+      await fc.assert(
+        fc.asyncProperty(
+          fc.record({
+            mode: fc.constantFrom(
+              "noOwner",
+              "unreachable",
+              "handshake timeout",
+              "handshake refusal",
+              "handshake newer",
+              "never ready",
+              "lock wait",
+              "startup throws",
+              "broker throws",
+            ),
+            bound: fc.integer({ min: 30, max: 60 }),
+            unresponsive: fc.integer({ min: 15, max: 30 }),
+            sent: fc.boolean(),
+          }),
+          async ({ mode, bound, unresponsive, sent }) => {
+            const registry = new FakeLockRegistry();
+            const held = registry.context();
+            const ports: MessagePort[] = [];
+            let requests = 0;
+            let terminated = 0;
+            let spawned = 0;
+            if (mode === "lock wait" || mode.startsWith("handshake")) {
+              await new Promise<void>((resolve) => {
+                void held.request(hostLockName("bounded-discovery"), {}, () => {
+                  resolve();
+                  return new Promise<void>(() => undefined);
+                });
+              });
+            }
+            const client = new ProtocolClient();
+            let warm: ReturnType<typeof ownerHarness> | null = null;
+            if (sent) {
+              warm = ownerHarness();
+              const channel = new MessageChannel();
+              ports.push(channel.port1, channel.port2);
+              const post = channel.port1.postMessage.bind(channel.port1);
+              channel.port1.postMessage = ((message: { t: string }, transfer?: Transferable[]) => {
+                if (message.t === "welcome") post(message, transfer ?? []);
+              }) as typeof channel.port1.postMessage;
+              warm.server.accept(channel.port1);
+              await client.connect(channel.port2);
+            }
+            const connector = new OwnerConnector({
+              database: "bounded-discovery",
+              client,
+              locks: registry.context(),
+              announcements: false,
+              brokerBoundMs: bound,
+              brokerTimeoutMs: 5,
+              retryMs: 2,
+              handshakeTimeoutMs: 5,
+              unresponsiveAfterMs: unresponsive,
+              context: () => ({
+                kind: "page",
+                visible: true,
+                superseded: false,
+                platform: { mobile: false },
+              }),
+              openBroker:
+                mode === "never ready" || mode === "lock wait" || mode === "startup throws"
+                  ? null
+                  : () => {
+                      if (mode === "broker throws") throw new Error("broker construction failed");
+                      const channel = new MessageChannel();
+                      ports.push(channel.port1, channel.port2);
+                      channel.port1.onmessage = (event) => {
+                        const request = event.data as { t: string; nonce: number };
+                        if (request.t !== "connect") return;
+                        requests++;
+                        if (!mode.startsWith("handshake")) {
+                          channel.port1.postMessage({ t: mode, nonce: request.nonce });
+                          return;
+                        }
+                        const owner = new MessageChannel();
+                        ports.push(owner.port1);
+                        owner.port1.onmessage = () => {
+                          if (mode === "handshake newer")
+                            owner.port1.postMessage({
+                              t: "refused",
+                              reason: "version",
+                              ownerProtocol: PROTOCOL_VERSION + 1,
+                              ownerBuild: "newer",
+                            });
+                          if (mode === "handshake refusal")
+                            owner.port1.postMessage({
+                              t: "refused",
+                              reason: "steppingDown",
+                              ownerProtocol: PROTOCOL_VERSION,
+                              ownerBuild: "test",
+                            });
+                        };
+                        channel.port1.postMessage(
+                          { t: "port", ownerId: "silent", nonce: request.nonce, port: owner.port2 },
+                          [owner.port2],
+                        );
+                      };
+                      return channel.port2;
+                    },
+              startOwner:
+                mode === "never ready" || mode === "lock wait" || mode === "startup throws"
+                  ? () => {
+                      spawned++;
+                      if (mode === "startup throws") throw new Error("worker construction failed");
+                      return {
+                        ready: new Promise(() => undefined),
+                        stopped: new Promise(() => undefined),
+                        lifecycle() {
+                          return undefined;
+                        },
+                        terminate() {
+                          terminated++;
+                        },
+                      };
+                    }
+                  : null,
+            });
+            let ended = false;
+            let effect: string | undefined;
+            const waiting = client
+              .query("SELECT 1")
+              .catch((error: unknown) => {
+                effect = (error as { effect?: string }).effect;
+              })
+              .finally(() => {
+                ended = true;
+              });
+            let startEnded = false;
+            const connecting = connector
+              .start()
+              .catch(() => undefined)
+              .finally(() => {
+                startEnded = true;
+              });
+            try {
+              await sleep(bound + unresponsive + 100);
+              // Capture before close: cleanup must not provide the promised bound.
+              expect(startEnded).toBe(true);
+              expect(ended).toBe(true);
+              expect(effect).toBe(sent ? "unknown" : "none");
+              expect(connector.status).toBe(
+                mode === "handshake newer" ? "superseded" : "unreachable",
+              );
+              if (mode === "startup throws")
+                expect(registry.held(hostLockName("bounded-discovery"))).toBe(false);
+              if (
+                mode === "noOwner" ||
+                (mode.startsWith("handshake") && mode !== "handshake newer")
+              )
+                expect(requests).toBeGreaterThan(1);
+              if (mode === "never ready") {
+                expect(spawned).toBeGreaterThan(0);
+                expect(terminated).toBe(spawned);
+              }
+              reach.recordHistory(new Set([mode, sent ? "sent unanswered" : "never sent"]));
+            } finally {
+              connector.close();
+              held.kill();
+              for (const port of ports) port.close();
+              warm?.server.stepDown("closing");
+              await warm?.engine.close();
+              await Promise.all([waiting, connecting]);
+            }
+          },
+        ),
+        { seed, numRuns: 80 },
+      );
+      reach.assertReached();
+    },
+    60_000,
+  );
+});
+
+it("P1: recovery to the same owner after give-up creates a usable connection", async () => {
+  const w = world();
+  const { owner } = await hosted(w);
+  const { connector, client, silent } = silentTab(w, [], {
+    silent: false,
+    unresponsiveAfterMs: 30,
+  });
+  await connector.start();
+  const generation = client.generation;
+  const waiting = client.query("SELECT spin($1)", [5_000]).catch((error: unknown) => error);
+  silent.on = true;
+  client.onStepDown?.("closing");
+  await until(() => client.gaveUp, 2_000);
+  expect(await waiting).toMatchObject({ effect: "unknown" });
+  silent.on = false;
+  await client.query("SELECT 1").catch(() => undefined); // activity retries discovery
+  await until(() => connector.status === "connected", 2_000);
+  expect(client.ownerId).toBe(owner.ownerId);
+  expect(client.gaveUp).toBe(false);
+  expect(client.generation).toBeGreaterThan(generation);
+  expect((await client.query("SELECT 1")).rows()).toEqual([[1]]);
+});
+
+it("P2: losing one register after the instance announcement does not strand its owner", async () => {
+  const w = world();
+  const { owner } = await hosted(w, {
+    settings: { registrationTimeoutMs: 5, registrationBoundMs: 200 },
+  });
+  await until(() => w.broker.current?.registrations.get("db") === owner.ownerId);
+  w.broker.dropRegistrations(1);
+  await w.broker.restart({ dropMs: 0 });
+  await sleep(150);
+  expect(w.broker.dropped.get("register")).toBe(1);
+  expect(w.broker.current?.registrations.get("db")).toBe(owner.ownerId);
+});
+
+describe("P2: acknowledged registration survives independent loss", () => {
+  const seeds = seedsFor("next-owner-broker-registration", [0xb052]);
+  it.each(seeds)(
+    "generated registration and acknowledgement loss (seed %i)",
+    async (seed) => {
+      const reach = createReach("next-owner-broker-registration", BROKER_REGISTRATION_STATES, {
+        minimum: 2,
+      });
+      await fc.assert(
+        fc.asyncProperty(
+          fc.record({
+            outcome: fc.constantFrom("recover", "fail", "stop", "host fence"),
+            drops: fc.integer({ min: 1, max: 2 }),
+            ackDrops: fc.integer({ min: 0, max: 1 }),
+            repeatAnnouncements: fc.boolean(),
+            failureAtAck: fc.boolean(),
+          }),
+          async ({ outcome, drops, ackDrops, repeatAnnouncements, failureAtAck }) => {
+            const w = world();
+            const { owner } = await hosted(w, {
+              settings: { registrationTimeoutMs: 5, registrationBoundMs: 200 },
+            });
+            await until(() => w.broker.current?.registrations.get("db") === owner.ownerId);
+            const before = w.broker.dropped.get("register") ?? 0;
+            const beforeCurrentDrop = w.broker.currentInstanceRegistrationDrops;
+            const failAtAck = outcome === "fail" && failureAtAck;
+            w.broker.dropRegistrations(outcome === "recover" ? drops : failAtAck ? 0 : Infinity);
+            const beforeAck = w.broker.lostRegistrationAcks;
+            w.broker.dropRegistrationAcks(failAtAck ? Infinity : ackDrops);
+            await w.broker.restart({ dropMs: 0 });
+            const announcements = repeatAnnouncements
+              ? setInterval(() => w.broker.announceAgain(), 3)
+              : null;
+            const thief = w.registry.context();
+            const entered = new Set<string>();
+            try {
+              await until(() =>
+                failAtAck
+                  ? w.broker.lostRegistrationAcks > beforeAck
+                  : (w.broker.dropped.get("register") ?? 0) > before,
+              );
+              if (failAtAck) entered.add("ack lost");
+              if (w.broker.currentInstanceRegistrationDrops > beforeCurrentDrop)
+                entered.add("register lost after announcement");
+              if (outcome === "stop") await owner.stop("closing", false);
+              if (outcome === "host fence")
+                await new Promise<void>((resolve) => {
+                  void thief.request(hostLockName("db"), { steal: true }, () => {
+                    resolve();
+                    return new Promise<void>(() => undefined);
+                  });
+                });
+              const count = w.broker.registrationAttempts.get(owner.ownerId) ?? 0;
+              await sleep(outcome === "recover" || outcome === "fail" ? 300 : 50);
+              if (outcome === "recover") {
+                expect(w.broker.current?.registrations.get("db")).toBe(owner.ownerId);
+                expect(owner.registration.confirmed).toBe(true);
+                expect(owner.registration.error).toBe(null);
+                const c = tab(w);
+                await c.connector.start();
+                expect(c.client.ownerId).toBe(owner.ownerId);
+                expect(await value(c.client)).toBe(0);
+                entered.add("recovered registration");
+                if (w.broker.lostRegistrationAcks > 0) entered.add("ack lost");
+              } else if (outcome === "fail") {
+                expect(w.broker.registrationAttempts.get(owner.ownerId) ?? 0).toBeGreaterThan(1);
+                expect(owner.registration.error?.name).toBe("OwnerUnreachableError");
+                expect(owner.registration.confirmed).toBe(false);
+                entered.add("terminal failure");
+              } else {
+                expect(w.broker.registrationAttempts.get(owner.ownerId) ?? 0).toBe(count);
+                expect(w.broker.current?.registrations.get("db")).not.toBe(owner.ownerId);
+                entered.add(outcome === "stop" ? "stop cancels retry" : "host fence cancels retry");
+              }
+              if (outcome === "fail" && repeatAnnouncements && w.broker.repeatedAnnouncements > 0)
+                entered.add("same instance repeated");
+              reach.recordHistory(entered);
+            } finally {
+              if (announcements !== null) clearInterval(announcements);
+              thief.kill();
+              for (const cleanup of cleanups.splice(0).reverse()) cleanup();
+            }
+          },
+        ),
+        { seed, numRuns: 80 },
+      );
+      reach.assertReached();
+    },
+    90_000,
+  );
 });
