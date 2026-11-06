@@ -242,6 +242,8 @@ describe("every acquisition has its own connection (finding 2)", () => {
     const session = await backend.open(second);
     await first.release();
     expect(closed).toEqual([1]);
+    // The reviewer's sequence: the successor's read after the obsolete lease's release.
+    expect(await session.readRoot()).toBe(null);
     await session.publish(new Uint8Array([2]));
     expect(await session.readRoot()).toEqual(new Uint8Array([2]));
     await second.release();
