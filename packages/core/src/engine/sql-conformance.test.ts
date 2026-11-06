@@ -366,6 +366,39 @@ function correlatedAggregateLimitCases(): Case[] {
   return cases;
 }
 
+/**
+ * EXISTS over a correlated aggregate without GROUP BY: the subquery yields one row whatever it
+ * reads, so EXISTS is TRUE unless LIMIT 0 or an OFFSET empties it (PostgreSQL). Crossed:
+ * aggregate × bound × EXISTS in WHERE, NOT EXISTS with a non-equality correlation, and EXISTS
+ * as a selected value. Kept few, like correlatedAggregateLimitCases, for the unoptimized share.
+ */
+function existsAggregateCases(): Case[] {
+  const cases: Case[] = [];
+  for (const aggregate of ["COUNT(*)", "MAX(d.amount)"])
+    for (const bound of ["", "LIMIT 0", "OFFSET 1"]) {
+      const skip = bound === "OFFSET 1" ? { skip: ["sqlite"] as const } : {};
+      const over = (where: string) => `(SELECT ${aggregate} FROM data d WHERE ${where} ${bound})`;
+      cases.push(
+        {
+          sql: `SELECT m.region FROM dims m WHERE EXISTS ${over("d.region = m.region")} ORDER BY m.region`,
+          ordered: true,
+          ...skip,
+        },
+        {
+          sql: `SELECT m.region FROM dims m WHERE NOT EXISTS ${over("d.id < m.rank * 20")} ORDER BY m.region`,
+          ordered: true,
+          ...skip,
+        },
+        {
+          sql: `SELECT m.region, EXISTS ${over("d.region = m.region")} AS e FROM dims m ORDER BY m.region`,
+          ordered: true,
+          ...skip,
+        },
+      );
+    }
+  return cases;
+}
+
 /** Datetime literals and calendar arithmetic, which only PostgreSQL spells the same way. */
 function datetimeCases(): Case[] {
   const cases: Case[] = [
@@ -1395,6 +1428,7 @@ function combinationCases(): Case[] {
     ...joinCases(),
     ...qualifiedOrderCases(),
     ...correlatedAggregateLimitCases(),
+    ...existsAggregateCases(),
     ...datetimeCases(),
     ...cteCases(),
     ...derivedWindowCases(),

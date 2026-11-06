@@ -39,6 +39,10 @@ Not yet released. The next release will name its packages here.
   An aggregate without `GROUP BY` returns one row, so `LIMIT 1` now changes nothing, and
   `LIMIT 0` or any `OFFSET` makes the subquery empty and its value `NULL`, as in PostgreSQL.
   `ORDER BY 1` inside such a subquery is also accepted now.
+- **`EXISTS` over a correlated aggregate is now true.** `EXISTS (SELECT max(v) FROM b WHERE
+b.id = a.id)` was false when no row of `b` matched. An aggregate without `GROUP BY` always
+  returns one row, so the subquery is never empty, unless `LIMIT 0` or an `OFFSET` removes that
+  row. `NOT EXISTS` changes the same way.
 
 No stored format changes, and no migration step is needed.
 

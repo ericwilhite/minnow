@@ -1260,6 +1260,13 @@ function decorrelatePredicate(
     if (node.negated) negated = !negated;
     const inner = node.block;
     if (!blockReferencesOutside(inner)) return undefined;
+    const answered = existsOverAggregateRow(inner);
+    if (answered !== undefined)
+      return {
+        left: negated ? { kind: "not", operand: answered } : answered,
+        operator: "IS TRUE",
+        right: { kind: "literal", value: true },
+      };
     rejectGroupedInner(inner, "EXISTS");
     if (!canExtractCorrelation(inner, scope, "EXISTS", true)) {
       const replacement = decorrelateExistsWithProbes(
@@ -2535,6 +2542,8 @@ function decorrelateExistsExpression(
   nextAlias: NextAlias,
 ): Expression {
   const inner = exists.block;
+  const answered = existsOverAggregateRow(inner);
+  if (answered !== undefined) return exists.negated ? { kind: "not", operand: answered } : answered;
   rejectGroupedInner(inner, "EXISTS");
   if (!canExtractCorrelation(inner, scope, "EXISTS", true)) {
     return decorrelateExistsWithProbes(block, exists, scope, nextAlias);
@@ -3272,6 +3281,18 @@ function rewriteUncorrelatedIn(
     right: { kind: "column", reference: `${alias}.${correlationValueAlias}` },
   });
   return "consumed";
+}
+
+/**
+ * EXISTS over an aggregate without GROUP BY or HAVING: the subquery yields exactly one row
+ * whatever it reads, so EXISTS is whether its LIMIT and OFFSET keep that row — TRUE unless they
+ * empty it (PostgreSQL). Undefined for any other subquery.
+ */
+function existsOverAggregateRow(inner: CompiledQuery): Expression | undefined {
+  if (inner.groupBy.length > 0 || inner.having.length > 0) return undefined;
+  if (!inner.select.some((item) => hasAggregate(item.expression))) return undefined;
+  const kept = aggregateRowKept(inner);
+  return typeof kept === "boolean" ? { kind: "literal", value: kept } : kept;
 }
 
 function rejectGroupedInner(inner: CompiledQuery, label: string): void {
