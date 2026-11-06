@@ -90,6 +90,8 @@ function apply(image: Uint8Array, operation: Operation): Uint8Array {
 export interface SimDiskOptions {
   readonly seed?: number;
   readonly crashAtStep?: number;
+  /** Called at the planned crash, before the crashing call throws (a test snapshots its state). */
+  readonly onCrash?: () => void;
   readonly flush?: "honest" | "lying";
   /** The busy error name exclusive opens throw (WebKit uses InvalidStateError). */
   readonly busyName?: "NoModificationAllowedError" | "InvalidStateError";
@@ -146,6 +148,7 @@ export class SimDisk {
       state.pending.push(operation);
     }
     if (this.#armed && step === this.#options.crashAtStep) {
+      this.#options.onCrash?.();
       this.powerLoss();
       throw new SimulatedCrash();
     }

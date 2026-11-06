@@ -1,3 +1,4 @@
+import { chaosPoster } from "./next-storage-post.js";
 /**
  * The rebuild core's storage in a real dedicated worker over real OPFS sync access handles
  * (packages/core/src/next/storage). Driven by next-storage-run.ts through a small RPC; each
@@ -7,7 +8,7 @@
 import { storeConformanceCases } from "../src/next/storage/conformance.js";
 import type { StorageBackend } from "../src/next/storage/contract.js";
 import type { BlobRef, ExtentRef, ExtentSpace } from "../src/next/storage/extents.js";
-import type { SyncFile } from "../src/next/storage/contract.js";
+import type { StorageObserver, SyncFile } from "../src/next/storage/contract.js";
 import { createOpfsBackend, webLocks, type OpfsDirectoryLike } from "../src/next/storage/opfs.js";
 import { openIndexedDb, type IdbDatabaseLike } from "../src/next/storage/idb-like.js";
 import { createIndexedDbBackend } from "../src/next/storage/indexeddb.js";
@@ -23,11 +24,30 @@ import {
   jsonReachable,
 } from "../src/next/storage/space-test-support.js";
 import { ScratchSpillService } from "../src/next/spill/scratch-spill.js";
+import {
+  identity,
+  postingObserver,
+  runChaos,
+  type ChaosExpect,
+  type ChaosInjection,
+  type ChaosMode,
+  type StepDownRelease,
+} from "./next-storage-chaos.js";
+import {
+  buildReopenSpace,
+  measureIdbOpenRequests,
+  measureReopen,
+  type ReopenLayout,
+} from "./next-storage-reopen.js";
 
 /** Which backend an operation runs on (OPFS by default). */
 export type StoreKind = "opfs" | "indexeddb";
 
-export type NextStorageRequest = { readonly store?: StoreKind } & (
+export type NextStorageRequest = {
+  readonly store?: StoreKind;
+  /** IndexedDB: one serialized transaction chain per connection (the default) or not. */
+  readonly serialize?: boolean;
+} & (
   | { readonly op: "conformance"; readonly prefix: string }
   | { readonly op: "choose"; readonly name?: string }
   | { readonly op: "idb-scenarios" }
@@ -66,6 +86,25 @@ export type NextStorageRequest = { readonly store?: StoreKind } & (
   | { readonly op: "heavy-quota-publish"; readonly fillerMib: number }
   | { readonly op: "heavy-close" }
   | { readonly op: "microbench"; readonly dir: string }
+  | {
+      readonly op: "reopen-build";
+      readonly dir: string;
+      readonly layout: ReopenLayout;
+      readonly blobs: number;
+    }
+  | { readonly op: "reopen-measure"; readonly dir: string }
+  | { readonly op: "reopen-idb-requests"; readonly dir: string }
+  | { readonly op: "diagnose-wedge"; readonly dir: string }
+  | { readonly op: "chaos-release" }
+  | {
+      readonly op: "chaos";
+      readonly dir: string;
+      readonly seed: number;
+      readonly expect: ChaosExpect | null;
+      readonly inject?: ChaosInjection;
+      readonly mode?: ChaosMode;
+      readonly lanes?: readonly string[];
+    }
 );
 
 const scope = self as unknown as {
@@ -83,6 +122,9 @@ const locks = webLocks(navigator.locks);
 
 /** The backend of the request being handled (set by `handle`). */
 let store: StoreKind = "opfs";
+let serializeIdb = true;
+/** The chaos campaign's observer of platform requests (null outside a chaos run). */
+let storageObserver: StorageObserver | null = null;
 
 /** Platform requests, counted below the backends: OPFS data-file reads and IndexedDB `get`s. */
 const platform = { dataFileReads: 0, idbGets: 0 };
@@ -146,11 +188,14 @@ async function backendFor(name: string): Promise<StorageBackend> {
       database: async () => countingDatabase(await openIndexedDb(indexedDB, `next-test:${name}`)),
       name: `next-test:${name}`,
       locks,
+      serializeTransactions: serializeIdb,
+      ...(storageObserver === null ? {} : { observe: storageObserver }),
     });
   return createOpfsBackend({
     directory: countingDirectory(await directory(name)),
     name: `next-test:${name}`,
     locks,
+    ...(storageObserver === null ? {} : { observe: storageObserver }),
   });
 }
 
@@ -365,25 +410,6 @@ async function heavyFill(mib: number, every: number): Promise<void> {
   await writer.abort();
 }
 
-/** The identity of a root's blobs: their count and a hash of every coordinate and checksum. */
-function identity(blobs: readonly BlobRef[]): string {
-  let hash = 0x811c9dc5;
-  for (const blob of blobs)
-    for (const part of [
-      blob.extent.offset,
-      blob.extent.length,
-      blob.offset,
-      blob.length,
-      blob.checksum,
-    ]) {
-      const text = String(part);
-      for (let index = 0; index < text.length; index++)
-        hash = Math.imul(hash ^ text.charCodeAt(index), 0x01000193) >>> 0;
-      hash = Math.imul(hash ^ 0x2c, 0x01000193) >>> 0;
-    }
-  return `${String(blobs.length)}:${hash.toString(16)}`;
-}
-
 /** Reads `count` random blobs of the current root (each verified by the space). */
 async function heavySample(count: number): Promise<void> {
   const state = heavyState();
@@ -395,6 +421,7 @@ async function heavySample(count: number): Promise<void> {
 
 async function handle(request: NextStorageRequest): Promise<unknown> {
   store = request.store ?? "opfs";
+  serializeIdb = request.serialize ?? true;
   switch (request.op) {
     case "choose": {
       try {
@@ -429,6 +456,7 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
         name: `next-test:${request.dir}`,
         locks,
         batching: request.batching,
+        serializeTransactions: serializeIdb,
       });
       const lease = await backend.acquire();
       const session = await backend.open(lease);
@@ -712,6 +740,123 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
     }
     case "microbench":
       return microbench(request.dir);
+    case "reopen-build":
+      return buildReopenSpace(await backendFor(request.dir), request.layout, request.blobs);
+    case "reopen-measure":
+      return measureReopen(await backendFor(request.dir));
+    case "chaos-release": {
+      if (chaosRelease === null) throw new Error("no chaos workload to release");
+      return chaosRelease();
+    }
+    case "diagnose-wedge": {
+      // Where a recovering owner is stuck (the WebKit wedge): the lock manager's view, a bounded
+      // plain lock request, and a bounded open and write on the database, each alone.
+      const lockName = `minnow:next-test:${request.dir}`;
+      const bounded = <T>(work: Promise<T>, ms: number) =>
+        Promise.race([
+          work.then((value) => ({ ok: true as const, value })),
+          new Promise<{ ok: false; value: string }>((resolve) => {
+            setTimeout(() => {
+              resolve({ ok: false, value: "timeout" });
+            }, ms);
+          }),
+        ]);
+      const query = await navigator.locks.query();
+      const describe = (list: readonly LockInfo[] | undefined) =>
+        (list ?? []).filter((info) => info.name === lockName).map((info) => info.mode);
+      const lock = await bounded(
+        navigator.locks.request(lockName, { signal: AbortSignal.timeout(3_000) }, () => "granted"),
+        3_500,
+      ).catch((error: unknown) => ({ ok: false as const, value: String(error) }));
+      // Then keep probing (one bounded write every 3 s) for up to 120 s: does it ever clear?
+      const probeStarted = performance.now();
+      let clearedAfterMs: number | null = null;
+      while (performance.now() - probeStarted < 120_000) {
+        const attempt = await bounded(
+          (async () => {
+            const db = await openIndexedDb(indexedDB, `next-test:${request.dir}`);
+            try {
+              await db.transaction(["meta"], "readwrite", "strict", (tx) => {
+                tx.store("meta").put("diagnose", 1);
+              });
+            } finally {
+              db.close();
+            }
+          })(),
+          3_000,
+        );
+        if (attempt.ok) {
+          clearedAfterMs = Math.round(performance.now() - probeStarted);
+          break;
+        }
+      }
+      const write = await bounded(
+        (async () => {
+          const db = await openIndexedDb(indexedDB, `next-test:${request.dir}`);
+          try {
+            await db.transaction(["meta"], "readwrite", "strict", (tx) => {
+              tx.store("meta").put("diagnose", 1);
+            });
+            return "committed";
+          } finally {
+            db.close();
+          }
+        })(),
+        3_000,
+      );
+      return {
+        held: describe(query.held),
+        pending: describe(query.pending),
+        lock,
+        clearedAfterMs,
+        write,
+      };
+    }
+    case "reopen-idb-requests": {
+      const db = await openIndexedDb(indexedDB, `next-test:${request.dir}`);
+      try {
+        return await measureIdbOpenRequests(db);
+      } finally {
+        db.close();
+      }
+    }
+    case "chaos": {
+      const port = chaosPort;
+      if (port === null) throw new Error("no chaos channel");
+      // Claim each numbered message atomically BEFORE posting it (review B1-p2h-4).
+      // A kill between postMessage and the next instruction cannot hide a posted ack.
+      const post = chaosPoster(port, postedCounter);
+      storageObserver = postingObserver(post);
+      // A failure goes out on the campaign's channel too: a worker killed just after it still
+      // delivers it there (the request's own reply may never leave a terminated worker).
+      return runChaos(
+        request.dir,
+        request.seed,
+        request.expect,
+        {
+          backendFor,
+          post,
+          go: (sequence) =>
+            new Promise<void>((resolve) => {
+              goes.set(sequence, resolve);
+            }),
+          registerRelease: (release) => {
+            chaosRelease = release;
+          },
+        },
+        {
+          ...(request.inject === undefined ? {} : { inject: request.inject }),
+          ...(request.mode === undefined ? {} : { mode: request.mode }),
+          ...(request.lanes === undefined ? {} : { lanes: request.lanes }),
+        },
+      ).catch((error: unknown) => {
+        post({
+          chaos: "failure",
+          message: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+        });
+        throw error;
+      });
+    }
     case "heavy-close": {
       const state = heavyState();
       await state.opened.space.close().catch(() => undefined);
@@ -740,7 +885,33 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
   }
 }
 
+/**
+ * The page's answers to chaos intents (next-storage-chaos.ts), on the campaign's own channel:
+ * the page drains its claimed prefix before judging recovery (see chaosPoster).
+ */
+const goes = new Map<number, () => void>();
+let chaosPort: MessagePort | null = null;
+/** Claimed campaign-message prefix that the page reads in shared memory. */
+let postedCounter: Int32Array | null = null;
+/** The running chaos workload's graceful step-down (next-storage-chaos.ts). */
+let chaosRelease: (() => Promise<StepDownRelease>) | null = null;
+
 scope.addEventListener("message", (event: MessageEvent<unknown>) => {
+  const { chaosPort: port, counter } = event.data as {
+    chaosPort?: MessagePort;
+    counter?: SharedArrayBuffer;
+  };
+  if (port !== undefined) {
+    chaosPort = port;
+    postedCounter = counter === undefined ? null : new Int32Array(counter);
+    port.onmessage = (message: MessageEvent<{ go?: number }>) => {
+      const go = message.data.go;
+      if (go === undefined) return;
+      goes.get(go)?.();
+      goes.delete(go);
+    };
+    return;
+  }
   const { id, request } = event.data as { id: number; request: NextStorageRequest };
   handle(request).then(
     (result) => {

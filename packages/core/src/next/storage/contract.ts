@@ -187,8 +187,48 @@ export interface OwnerLease {
   readonly epoch: number;
   /** Aborted when ownership is lost (lock stolen, epoch moved). The session refuses mutations. */
   readonly signal: AbortSignal;
-  /** Closes handles and releases the lock. Idempotent. */
-  release(): Promise<void>;
+  /**
+   * Closes handles and releases the lock. Idempotent. The owner awaits it before terminating its
+   * worker (IndexedDB: in-flight transactions finish, bounded, then any left are aborted, and the
+   * connection closes before the lock is released; WebKit can otherwise block IndexedDB for the
+   * session: DECISIONS.md "Step-down"). Backends with transactions to settle report them.
+   *
+   * Rejects with `ReleaseUnsettledError` when an aborted transaction never reported its end within
+   * a second bound: the lock is released and the connection closed anyway, so a successor can take
+   * over, but the outcome of those transactions is unknown. The owner host decides the policy (log,
+   * terminate, suggest a reload); it must not treat this as a clean release.
+   */
+  // Additive: a lease with nothing to settle (OPFS, memory) still returns `Promise<void>`.
+  // eslint-disable-next-line @typescript-eslint/no-invalid-void-type
+  release(): Promise<ReleaseReport | void>;
+}
+
+/**
+ * One request a backend issued to the platform (test instrumentation): an IndexedDB transaction
+ * (`target` its stores other than `meta`, joined by `+`; `op` its mode and durability) or an OPFS
+ * sync access handle call (`target` the file, `op` the call).
+ */
+export interface PlatformRequest {
+  readonly target: string;
+  readonly op: string;
+}
+
+/**
+ * Told when a backend issues a platform request (an IndexedDB transaction once created, an OPFS
+ * sync call before it runs); the function it returns is called when the request has ended. Test
+ * instrumentation (the storage kill campaign): it must not throw.
+ */
+export type StorageObserver = (request: PlatformRequest) => () => void;
+
+/** What a lease release did with the transactions in flight on its connection (IndexedDB). */
+export interface ReleaseReport {
+  /** Transactions that settled by themselves (committed or failed) while the release waited. */
+  readonly drained: number;
+  /**
+   * Transactions the release aborted once the wait ran out, or refused before they began: none of
+   * their effects applied, and each rejected with `StoreClosedError`.
+   */
+  readonly aborted: number;
 }
 
 export interface StorageBackend {
@@ -307,8 +347,8 @@ export class StoreCorruptionError extends Error {
 
 export class StoreClosedError extends Error {
   readonly code = "MINNOW_STORE_CLOSED";
-  constructor() {
-    super("Store session is closed");
+  constructor(message = "Store session is closed") {
+    super(message);
     this.name = "StoreClosedError";
   }
 }
@@ -318,6 +358,51 @@ export class StoreClosedError extends Error {
  * `QuotaExceededError` everywhere, and `InvalidStateError` from a sync-handle *write* on WebKit
  * when the disk is full (bug 327929).
  */
+/**
+ * One transaction a release gave up on (diagnostics): the platform created it, the release aborted
+ * it, and it never reported complete or abort. Work that was never created is refused instead and
+ * counted under `aborted`.
+ */
+export interface UnsettledTransaction {
+  readonly stores: readonly string[];
+  readonly mode: "readonly" | "readwrite";
+  readonly durability: "strict" | "relaxed";
+}
+
+/**
+ * A lease release gave up waiting for aborted transactions to end (`OwnerLease.release`). The lock
+ * is released and the connection close requested, but `unsettled` transactions have an unknown
+ * outcome: each of their operations rejects with this error, so a strict commit among them is
+ * never acknowledged (it may or may not be durable). Repeated releases reject with the same error.
+ */
+export class ReleaseUnsettledError extends Error {
+  readonly code = "MINNOW_RELEASE_UNSETTLED";
+  readonly drained: number;
+  readonly aborted: number;
+  readonly unsettled: number;
+  readonly transactions: readonly UnsettledTransaction[];
+  /** From the start of the release to giving up. */
+  readonly waitedMs: number;
+  constructor(
+    report: ReleaseReport & {
+      readonly unsettled: number;
+      readonly transactions: readonly UnsettledTransaction[];
+      readonly waitedMs: number;
+    },
+  ) {
+    super(
+      `The lease was released with ${String(report.unsettled)} transaction(s) that never ended ` +
+        `after being aborted (${String(report.waitedMs)} ms): their outcome is unknown`,
+    );
+    this.name = "ReleaseUnsettledError";
+    this.drained = report.drained;
+    this.aborted = report.aborted;
+    this.unsettled = report.unsettled;
+    this.transactions = report.transactions;
+    this.waitedMs = report.waitedMs;
+  }
+}
+
 export class StoreQuotaError extends Error {
   readonly code = "MINNOW_STORE_QUOTA";
   constructor(message: string) {

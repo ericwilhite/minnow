@@ -180,3 +180,76 @@ export const BARRIER_RESOLUTION_STATES = [
   "lost again after a confirmed end",
   "ran, never lost",
 ] as const;
+
+/**
+ * The storage kill campaign (browser-tests/next-storage.spec.ts, Gate A) on IndexedDB: kills must
+ * land inside each kind of step's storage work: the worker had posted `began` and not `settled`,
+ * and a platform request (an IndexedDB transaction created and not ended) was open (review B1-p2g
+ * finding 2: `began` alone lands `window-<step>`, which reaches nothing).
+ */
+export const STORAGE_KILL_REACH = [
+  "in-write",
+  "in-publish",
+  "in-reclaim",
+  "in-log-flush",
+  "in-truncate",
+  "in-spill",
+] as const;
+
+/**
+ * The same campaign on OPFS, whose storage calls are synchronous: termination stops the worker
+ * between JavaScript steps, so a kill lands at a step's edges (before it began, between its calls,
+ * or after it returned) or after a sync call began and before its end was posted (the call itself
+ * has returned), never halfway through a call. Each phase must be hit at an edge; interruption
+ * inside the synchronous operations is the simulated physical crash sweeps' (the storage kit over
+ * simulated handles, space-crash.test.ts), which crash at every write step.
+ */
+export const STORAGE_KILL_EDGE_REACH = [
+  "at-write",
+  "at-publish",
+  "at-reclaim",
+  "at-log-flush",
+  "at-truncate",
+  "at-spill",
+] as const;
+
+/**
+ * The concurrent kill campaign on IndexedDB: kills at wall-clock moments must land with a platform
+ * request open (a transaction created and not ended; the backend runs one at a time per
+ * connection), of each kind, and while two or more operations are in their windows (review B1-p2g
+ * finding 2: windows alone are reported, not counted).
+ */
+export const STORAGE_CONCURRENT_KILL_REACH = [
+  "request-open",
+  "publish-request-open",
+  "log-request-open",
+  "spill-request-open",
+  "data-request-open",
+  "request-open-with-two-operations-in-windows",
+] as const;
+
+/**
+ * The concurrent workload under simulated power loss (spill/chaos-crash.test.ts): the crash must
+ * land while several storage calls (session and spill calls that have run and not yet returned
+ * their result, review B1-p2g finding 2) are issued, data and log calls among them.
+ */
+export const STORAGE_CONCURRENT_CRASH_REACH = [
+  "two-or-more-calls-issued",
+  "three-or-more-calls-issued",
+  "data-call-with-log-call",
+  // A data write issued while two write operations are open (began, not settled): the space's
+  // write lock admits one data write at a time, so two issued data writes never coexist.
+  "data-write-with-two-writers-open",
+  "spill-call-with-another",
+] as const;
+
+/**
+ * Acquisitions sharing one IndexedDB connection object (storage/idb-chain.test.ts): steals and
+ * releases must land while another acquisition has a transaction in flight on it, from both
+ * backends over the object.
+ */
+export const STORAGE_SHARED_CONNECTION_REACH = [
+  "steal-while-another-in-flight",
+  "release-while-another-in-flight",
+  "both-backends-owned",
+] as const;

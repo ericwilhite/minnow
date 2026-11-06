@@ -33,6 +33,8 @@
     "block-properties-worker.ts",
     "sql-differential-run.ts",
     "sql-feature-probes.test.ts",
+    "next-storage-run.test.ts",
+    "next-storage-post.test.ts",
     "clock-run.ts",
     "clock-worker.ts",
     "lock-holder-worker.ts",

@@ -203,6 +203,13 @@ is access's `Snapshot`.
   the memory registration); truncate and reset move the
   logical end when called, in order with appends. A malformed or exhausted epoch refuses
   ownership; the spill store's record index is charged to the spill service's registration.
+  Every acquisition opens its own connection, and every transaction of it runs through one
+  serialized chain. Releasing the lease lets in-flight transactions finish (up to 500 ms), aborts
+  any left and waits for their abort events (up to 1 s more: past it, the release still closes and
+  unlocks but rejects with `ReleaseUnsettledError`, the outcome unknown), closes the connection,
+  then releases the lock, and reports how many drained and how many it aborted: WebKit can block IndexedDB for the browser
+  session when a worker dies with two chains of transactions in flight on its connection
+  (DECISIONS.md "Step-down").
   `sim-idb.ts` simulates IndexedDB as a
   checksum-chained write-ahead log on the simulated disk with IndexedDB's request order, activity
   and clone rules, so the IndexedDB backend passes the same storage kit and extent-space crash
@@ -217,7 +224,45 @@ is access's `Snapshot`.
   oversized publish fails and fails the space, and a new owner recovers exactly the last
   successful root (its round and every blob's coordinates and checksum; finding no root is
   refused) and keeps writing. Chromium refuses even the first megabyte of growth under 32 MiB of
-  headroom by `estimate()`, so the run records where the refusal came rather than assuming it. `npm run benchmark:storage` records the
+  headroom by `estimate()`, so the run records where the refusal came rather than assuming it.
+- Kill campaign (Gate A, `browser/next-storage-chaos.ts`): a worker runs a seeded random workload
+  (builders, publish, retire and reclaim, log append, flush, truncate and reset, spill) and is
+  killed at seeded moments (`worker.terminate()`, sometimes a page close); the next worker reopens,
+  checks the acknowledged root and every acknowledged log byte, audits exactly, and carries on. The
+  worker announces each step and waits for the page's go, and posts when the step's storage work
+  begins and returns, on its own channel; the backends post every platform request (an IndexedDB
+  transaction once created and when it ends, an OPFS sync call) through a test-only observer. The
+  worker numbers every message and atomically claims its number in shared memory before posting; the
+  page reads the counter just before the kill and receives every message up to it before it
+  judges anything (a message that never arrives fails the campaign), so it knows every
+  acknowledgement and failure posted before the counter read. A claim interrupted before posting
+  fails the barrier deadline, rather than passing with a missing message; its operation has an
+  unknown outcome. What the worker claims after the counter is read is an unobserved tail, its operation left in flight for recovery to find done or not. The
+  page is cross-origin isolated for this (`?isolated=1`). A kill lands before, inside (a platform
+  request open), in the window (begun, no request open) or after a step's storage work. A page
+  close takes its expectation at a boundary just before the close. Any failure the workload
+  reports, at any time, fails the campaign. On IndexedDB kills land inside each phase's storage
+  work. OPFS's storage calls are synchronous: termination stops the worker between JavaScript
+  steps, so a kill can take effect after a sync call began and before its end was posted (the
+  call itself has returned), never halfway through one; kills are required at each step's edges,
+  and the simulated
+  physical crash sweeps cover the inside. 50 kills per store and browser in the browser lane,
+  1,000 per store in Chromium nightly (`npm run test:storage-kills`), with declared reach
+  (`STORAGE_KILL_REACH`, `STORAGE_KILL_EDGE_REACH`).
+- Concurrent kill campaign: the same workload as lanes that run at once (two writers with their
+  builders, a pinned reader, the log, spill, settling reclaims), each operation still announced and
+  given a go at once, killed at random wall-clock moments; at the kill the page stops giving gos,
+  so everything the worker does before the kill takes effect was announced, and recovery accepts
+  the acknowledged root or any announced one. On IndexedDB kills land with a transaction open
+  (one at a time: the backend serializes them per connection) of each kind, beside two to five
+  operations in their windows; the reach counts open requests, windows are only reported
+  (`STORAGE_CONCURRENT_KILL_REACH`). OPFS's synchronous calls never overlap at a kill (at most one
+  is open, and never halfway through), so
+  `spill/chaos-crash.test.ts` runs the same workload in Node over the simulated OPFS and IndexedDB
+  stores, with every session and spill call's result handed back one to three tasks after the call
+  ran, and loses power at a seeded physical step; its reach counts the calls that had run and not
+  returned at that step (`STORAGE_CONCURRENT_CRASH_REACH`). The
+  workload and recovery live in `spill/chaos-workload.ts`. `npm run benchmark:storage` records the
   storage microbench nightly (docs: reference/testing).
 - `select.ts` (`chooseBackend`) picks OPFS where a dedicated worker can open sync handles, else
   IndexedDB only on the private modes' refusals (`SecurityError`, `UnknownError`,

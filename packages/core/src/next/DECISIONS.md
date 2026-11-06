@@ -116,6 +116,40 @@ These rulings follow the storage probe of 2026-11-05.
   - In `pagehide`, the owner's page flushes and terminates its owner worker, which matters for
     Safari bfcache.
   - The owner does not step down on every visibility change.
+  - **Before terminating its worker, the owner stops starting storage work, lets what is in
+    flight finish, closes its session and awaits `lease.release()`** (2026-11-06). WebKit
+    (Playwright's 26.5) leaves IndexedDB blocked for the rest of the browser session when a worker
+    is terminated with two independent chains of IndexedDB transactions in flight on its
+    connection: 5 of 40 such kills in a plain-IndexedDB repro (no Minnow code), 0 of 25 in
+    Chromium and in Firefox. A probe still blocked 120 s later. Closing the connection just
+    before the kill does not prevent it (2 of 40); letting the in-flight transactions finish first
+    does (0 of 40). The IndexedDB backend's `release()` does that part: it refuses new
+    transactions, waits up to 500 ms for those in flight, aborts any still running and waits for
+    their abort events (an aborted strict commit fails: not durable), closes the connection, and
+    only then releases the lock, so the next owner never starts beside a live transaction; it
+    reports how many transactions drained and how many it aborted. Every acquisition opens its own
+    connection, so releasing a stolen lease never closes its successor's (review B1-p2h-1); a
+    connection object handed to several acquisitions still has one chain (review B1-p2h-2). If an
+    aborted transaction never reports its end within 1 s more, the release closes, releases the
+    lock anyway and rejects with `ReleaseUnsettledError` (counts and the transactions' scopes); those
+    transactions' operations reject with it too, so a strict commit among them is unknown, never
+    acknowledged. Holding the lock forever would give no successor a chance; releasing it cannot
+    promise the database progresses. The owner host decides what follows (B5: log, terminate,
+    suggest a reload). Measured graceful step-down under the concurrent kill workload, 40 cycles each: waiting
+    for in-flight operations median 88–153 ms, p95 200–481 ms; session close ≤ 33 ms; release
+    ≤ 7 ms; the next owner recovered every time in WebKit, Chromium and Firefox. OPFS is the
+    default wherever a worker has sync access handles; this matters on IndexedDB, WebKit's
+    private-browsing fallback.
+  - **A worker can die without a step-down** (the browser kills it at unload, a crash, OOM), so
+    the IndexedDB backend also runs every transaction of its connection through one serialized
+    chain (`serializeTransactions`, the default everywhere): in the plain repro one chain never
+    wedged (0 of 45 kills, against 3 of 45 with two chains; spill on its own connection or in its
+    own database also 0 of 45), and the abrupt-kill concurrent campaign in WebKit, 2–5 workload
+    operations in their windows at every kill (windows, not platform requests: with one chain at
+    most one transaction is open), wedged 0 times in 100 kills (before: within 5–17). Cost
+    under the concurrent workload, medians of 8 rounds: Chromium 81 vs. 92 operations/s, Firefox
+    71 vs. 80 (about 11%, within a noisy spread); single-chain bulk writes and commits show no
+    consistent difference.
 - **Files.**
   - A few long-lived files (log, data, two root slots, spill, epoch), opened at acquisition and kept
     open.

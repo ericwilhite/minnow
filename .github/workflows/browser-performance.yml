@@ -103,6 +103,20 @@ jobs:
           npm run benchmark:export 2>&1 | tee export-bench.txt
           grep -o 'EXPORT_BENCH .*' export-bench.txt | sed 's/^EXPORT_BENCH //' \
             > browser-perf-results/export-bench.json
+      - name: Storage kill campaign (rebuild core, Gate A)
+        # The rebuild core's storage in real Chromium, OPFS and IndexedDB: 1,000 seeded random kills
+        # of a worker running builders, publish, reclaim, log flush and truncate, and spill; after
+        # each, a new worker reopens, checks the acknowledged root and log bytes, audits exactly and
+        # carries on. Any corruption fails the step; the kill and phase table is recorded.
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p browser-perf-results
+          status=0
+          npm run test:storage-kills 2>&1 | tee storage-kills.txt || status=$?
+          { grep -o 'STORAGE_KILLS .*' storage-kills.txt || true; } | sed 's/^STORAGE_KILLS //' \
+            > browser-perf-results/storage-kills.jsonl
+          exit "$status"
       - name: Upload the results
         if: always()
         uses: actions/upload-artifact@v7
@@ -113,6 +127,7 @@ jobs:
             storage-microbench.txt
             agg-microbench.txt
             export-bench.txt
+            storage-kills.txt
             browser-perf-results/
             packages/core/browser-perf-baseline.json
           retention-days: 90

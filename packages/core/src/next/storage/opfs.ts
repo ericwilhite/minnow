@@ -47,6 +47,7 @@ import {
   type ScratchSpace,
   type StorageBackend,
   type StoreSession,
+  type StorageObserver,
   type SyncFile,
 } from "./contract.js";
 import { acquireFenced, type HeldLock, type LockManagerLike } from "./fence.js";
@@ -68,6 +69,8 @@ export interface OpfsBackendOptions {
   /** The database name; the lock is `minnow:<name>`. */
   readonly name: string;
   readonly locks: LockManagerLike;
+  /** Told about every sync call the sessions make (test instrumentation). */
+  readonly observe?: StorageObserver;
 }
 
 /** The files of one database directory, in acquisition order. */
@@ -141,6 +144,56 @@ class QuotaMappedFile implements SyncFile {
   }
 }
 
+/** A sync handle whose calls are reported to `observe` before they run and after they return. */
+class ObservedFile implements SyncFile {
+  readonly #handle: SyncFile;
+  readonly #name: string;
+  readonly #observe: StorageObserver;
+
+  constructor(handle: SyncFile, name: string, observe: StorageObserver) {
+    this.#handle = handle;
+    this.#name = name;
+    this.#observe = observe;
+  }
+
+  #call<T>(op: string, call: () => T): T {
+    const done = this.#observe({ target: this.#name, op });
+    try {
+      return call();
+    } finally {
+      done();
+    }
+  }
+
+  read(buffer: Uint8Array, options: { at: number }): number {
+    return this.#call("read", () => this.#handle.read(buffer, options));
+  }
+
+  write(buffer: Uint8Array, options: { at: number }): number {
+    return this.#call("write", () => this.#handle.write(buffer, options));
+  }
+
+  truncate(size: number): void {
+    this.#call("truncate", () => {
+      this.#handle.truncate(size);
+    });
+  }
+
+  getSize(): number {
+    return this.#handle.getSize();
+  }
+
+  flush(): void {
+    this.#call("flush", () => {
+      this.#handle.flush();
+    });
+  }
+
+  close(): void {
+    this.#handle.close();
+  }
+}
+
 interface OpenFiles {
   readonly files: FileSet;
   readonly scratch: SyncFile;
@@ -156,18 +209,21 @@ class OpfsLease implements OwnerLease {
   readonly #lock: HeldLock;
   readonly #lost = new AbortController();
 
-  constructor(lock: HeldLock, opened: OpenFiles) {
+  constructor(lock: HeldLock, opened: OpenFiles, observe: StorageObserver | null) {
     this.#lock = lock;
     this.#handles = opened.handles;
     this.epoch = opened.epoch;
     const lost = () => this.#lost.signal.aborted;
-    const wrap = (file: SyncFile) => new QuotaMappedFile(file, lost);
-    this.files = {
-      log: wrap(opened.files.log),
-      data: wrap(opened.files.data),
-      roots: [wrap(opened.files.roots[0]), wrap(opened.files.roots[1])],
+    const wrap = (file: SyncFile, name: string): SyncFile => {
+      const mapped = new QuotaMappedFile(file, lost);
+      return observe === null ? mapped : new ObservedFile(mapped, name, observe);
     };
-    this.scratchFile = wrap(opened.scratch);
+    this.files = {
+      log: wrap(opened.files.log, "log"),
+      data: wrap(opened.files.data, "data"),
+      roots: [wrap(opened.files.roots[0], "root-0"), wrap(opened.files.roots[1], "root-1")],
+    };
+    this.scratchFile = wrap(opened.scratch, "spill");
     // The handle, not the lock, stops a hung owner: close every handle the moment the lock goes.
     if (lock.lost.aborted) this.#lose();
     else
@@ -326,7 +382,7 @@ export function createOpfsBackend(options: OpfsBackendOptions): StorageBackend {
         },
         acquire,
       );
-      const lease = new OpfsLease(lock, fence);
+      const lease = new OpfsLease(lock, fence, options.observe ?? null);
       leases.add(lease);
       return lease;
     },
