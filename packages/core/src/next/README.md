@@ -1352,7 +1352,10 @@ cursor across read batches, so traversing the root’s page references is linear
 group, published in batches of 16,384 through `ExtentListKeeper`. Each of three reopens uses a
 fresh worker over the disk-backed profile. It reports backend setup, fence, session/index loading, extent-space
 startup and list-cache bytes read (including coalescing gaps). Root byte counts are separate;
-IndexedDB's record-index reads are included in session time, not the list byte count. OS caches
+IndexedDB's open is currently O(records): it enumerates the complete data and log record indexes
+before list startup. Those reads are included in session time, not the list byte count. The
+three bulk requests per index page are issued together; list-directed/lazy opening is a separate
+R25.5 follow-up required before claiming Gate A on IndexedDB. OS caches
 remain warm. This measures storage startup, not log replay or owner ready time; timings are
 observations against the 500 ms target, not a portable latency assertion.
 

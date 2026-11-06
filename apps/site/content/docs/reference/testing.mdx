@@ -1395,7 +1395,10 @@ lists. Each dataset is reopened in three fresh workers. The report separates bac
 fence acquisition, session/index loading and extent-space startup, against the 500 ms reopen
 target. It also reports owner-worker and whole-browser CPU ticks, coalesced list-data bytes read,
 and root payload bytes. CPU samples exclude build, module boot and cleanup; OS caches remain
-warm. Native IndexedDB index enumeration is included in time, but its physical bytes are opaque.
+warm. IndexedDB open is currently O(records), enumerating the full data and log indexes before list
+startup. Three bulk requests per index page are issued together. This enumeration is included
+in time, but its physical bytes are opaque; R25.5 requires a list-directed/lazy-open follow-up
+before IndexedDB reopen can count toward Gate A.
 This is a storage-startup measurement, not owner readiness, log replay or full query Gate A.
 
 ```sh

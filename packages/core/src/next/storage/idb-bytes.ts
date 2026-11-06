@@ -418,25 +418,39 @@ export class ByteStore {
       await db.transaction([name, indexName], "readonly", "relaxed", (tx) => {
         const page = (after: number | null) => {
           const range = after === null ? {} : { lower: after, lowerOpen: true };
+          // Queue all three bulk requests before any callback. Their results describe one
+          // transaction snapshot; validate only after the last callback, then enqueue a page.
+          let left = 3;
+          let entries: unknown[] = [];
+          let indexKeys: IdbKey[] = [];
+          let recordKeys: IdbKey[] = [];
+          const loaded = () => {
+            if (--left !== 0) return;
+            check(entries, indexKeys, recordKeys);
+            const last = indexKeys.at(-1);
+            if (indexKeys.length >= LOAD_PAGE && typeof last === "number") page(last);
+          };
           tx.store(indexName).getAll(
             range,
-            (entries) => {
-              tx.store(indexName).getAllKeys(
-                range,
-                (indexKeys) => {
-                  tx.store(name).getAllKeys(
-                    range,
-                    (recordKeys) => {
-                      check(entries, indexKeys, recordKeys);
-                      const last = indexKeys.at(-1);
-                      // A short page is the last (its record keys matched it, so none follow).
-                      if (indexKeys.length >= LOAD_PAGE && typeof last === "number") page(last);
-                    },
-                    LOAD_PAGE,
-                  );
-                },
-                LOAD_PAGE,
-              );
+            (values) => {
+              entries = values;
+              loaded();
+            },
+            LOAD_PAGE,
+          );
+          tx.store(indexName).getAllKeys(
+            range,
+            (keys) => {
+              indexKeys = keys;
+              loaded();
+            },
+            LOAD_PAGE,
+          );
+          tx.store(name).getAllKeys(
+            range,
+            (keys) => {
+              recordKeys = keys;
+              loaded();
             },
             LOAD_PAGE,
           );
