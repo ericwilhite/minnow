@@ -779,22 +779,36 @@ export class OwnerConnector {
   /** Asks who owns; supersedes an older owner, or is superseded by a newer one. */
   async #settleSkew(): Promise<void> {
     const signal = this.#attempt?.signal;
+    if (signal === undefined) return;
+    this.#throwIfClosed();
     const channel = openChannel(skewChannelName(this.#options.database));
     if (channel === null) return;
     const owner = await new Promise<number | null>((resolve) => {
-      const timer = setTimeout(() => {
-        resolve(null);
-      }, 200);
-      channel.onmessage = (event: MessageEvent) => {
-        const signal = event.data as SkewSignal;
-        if (signal.t !== "owner") return;
+      let finished = false;
+      const finish = (owner: number | null) => {
+        if (finished) return;
+        finished = true;
         clearTimeout(timer);
-        resolve(signal.protocol);
+        signal.removeEventListener("abort", cancel);
+        channel.close();
+        resolve(owner);
+      };
+      const cancel = () => finish(null);
+      const timer = setTimeout(cancel, 200);
+      // close() aborts the attempt synchronously. Cancelling its outer race alone would leave
+      // this timer and channel alive until the discovery timeout.
+      signal.addEventListener("abort", cancel, { once: true });
+      if (signal.aborted) {
+        cancel();
+        return;
+      }
+      channel.onmessage = (event: MessageEvent) => {
+        const message = event.data as SkewSignal;
+        if (message.t === "owner") finish(message.protocol);
       };
       channel.postMessage({ t: "whoOwns", protocol: this.#client.protocol } satisfies SkewSignal);
     });
-    channel.close();
-    if (owner === null || signal?.aborted || this.#status === "closed") return;
+    if (owner === null || signal.aborted || this.#status === "closed") return;
     const relation = compareProtocol(this.#client.protocol, owner);
     if (relation === "clientNewer") this.#supersedeOlderOwner();
     else if (relation === "clientOlder") this.#superseded();

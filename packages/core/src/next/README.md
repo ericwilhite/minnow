@@ -995,6 +995,8 @@ and the owner import it directly.
   connection-availability bound, not a timeout on connected SQL execution.
   Supersession by a newer protocol fails pending SQL immediately with the same effect rule;
   a reload prompt never stands in for completing those calls.
+  Closing cancels the underlying discovery work, including skew discovery's timer and
+  BroadcastChannel, synchronously; it does not merely reject the promise waiting on it.
 - A client learns that its owner was replaced even while idle: a new owner announces itself on
   the database's BroadcastChannel (`{t: "owner", ownerId, epoch}`, the fence epoch, strictly
   increasing). An announcement is a hint: a client acts only on an epoch above its owner's, and
