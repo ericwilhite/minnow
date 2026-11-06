@@ -540,7 +540,12 @@ and the owner import it directly.
   wait; the driver awaits only real Promises, and `drive` returns no Promise when the whole
   pipeline finished synchronously.
 - After `YIELD_INTERVAL_MS` (4 ms) of synchronous work the driver yields a task (`setImmediate`
-  or a `MessageChannel` message, never a resolved Promise) at the next batch boundary.
+  or a `MessageChannel` message, never a resolved Promise) at the next batch boundary. In a
+  browser or worker, a yield is a `setTimeout(…, 0)` timer turn once `TIMER_TURN_MS` (50 ms) has
+  passed without one, because a user agent may run message tasks ahead of timers indefinitely.
+  So a timer due during a long query (owner liveness, idle flush, transaction timeouts) runs
+  within about 50 ms plus a slice. `pipeline-yield.test.ts` checks this on an event loop that
+  always runs messages first. Node's `setImmediate` already follows the timers phase.
 - `abort` releases grants, spill files and transferred batches.
 - The driver adds no cancellation machinery without a signal, and with one each wait removes its
   listener, so a long stream retains nothing per batch.

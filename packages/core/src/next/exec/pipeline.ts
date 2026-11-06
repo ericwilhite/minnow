@@ -13,8 +13,9 @@
  *   `undefined` (not a Promise) when the whole pipeline finished without waiting: a cached point
  *   read completes inside the call (exec/executor.ts "Running").
  * - Long synchronous work yields to the event loop with a **task** (`yieldTask`: `setImmediate`
- *   where it exists, else a `MessageChannel` message; never a resolved Promise, which would only
- *   run microtasks) at a batch boundary once `YIELD_INTERVAL_MS` of synchronous work has passed.
+ *   where it exists, else a `MessageChannel` message with a `setTimeout` timer turn at least every
+ *   `TIMER_TURN_MS`; never a resolved Promise, which would only run microtasks) at a batch
+ *   boundary once `YIELD_INTERVAL_MS` of synchronous work has passed.
  *   So an owner message (a point read, a commit, a cancel) waits at most about that long behind an
  *   analytical query, even one served entirely from cache.
  *
@@ -131,30 +132,74 @@ export function isPromise<T>(value: MaybePromise<T>): value is Promise<T> {
   return typeof (value as { then?: unknown } | null)?.then === "function";
 }
 
-type Resolver = () => void;
-let channel: MessageChannel | null = null;
-const waiting: Resolver[] = [];
+/** What `yieldTask` schedules with (the global scope; tests pass a model event loop). */
+export interface TaskHost {
+  readonly setImmediate?: (callback: () => void) => unknown;
+  readonly setTimeout: (callback: () => void, ms: number) => unknown;
+  readonly MessageChannel?: new () => MessageChannel;
+  readonly now: () => number;
+}
+
+/** In a browser or worker, yields take a timer turn at least this often (ms). */
+export const TIMER_TURN_MS = 50;
 
 /**
- * Resolves in a later **task** (macrotask), so pending messages and timers run first:
- * `setImmediate` where it exists (Node), else one shared `MessageChannel` (browsers, workers).
+ * A `yieldTask` over `host`. The returned Promise resolves in a later **task** (macrotask), never
+ * a microtask:
+ * - **Node** (`setImmediate`): the check phase follows the timers phase on every loop iteration,
+ *   so due timers and pending I/O run before the work resumes.
+ * - **Browsers and workers**: one shared `MessageChannel` message (no 4 ms timer clamp), except
+ *   that once `TIMER_TURN_MS` has passed without a timer turn the yield is `setTimeout(…, 0)`.
+ *   A user agent may service message tasks ahead of timers indefinitely (WebKit was seen to;
+ *   review B5-p2d-1), so a query yielding only through messages could starve the owner's timers
+ *   (liveness, idle flush, transaction timeouts). Timers due before ours run before it, so every
+ *   timer due by then has run when the work resumes: a due timer waits about `TIMER_TURN_MS`
+ *   plus one slice at most, whatever the task-source order.
+ * `#lastTimerTurn` is the worker's event-loop state, shared by every pipeline on it on purpose
+ * (not query scratch, R23): one timer turn serves them all.
  */
-export function yieldTask(): Promise<void> {
-  return new Promise<void>((resolve) => {
-    if (typeof setImmediate === "function") {
-      setImmediate(resolve);
-      return;
-    }
-    if (channel === null) {
-      channel = new MessageChannel();
-      channel.port1.onmessage = () => {
-        waiting.shift()?.();
-      };
-    }
-    waiting.push(resolve);
-    channel.port2.postMessage(null);
-  });
+export function createYieldTask(host: TaskHost): () => Promise<void> {
+  type Resolver = () => void;
+  let channel: MessageChannel | null = null;
+  const waiting: Resolver[] = [];
+  let lastTimerTurn = host.now();
+  const immediate = host.setImmediate;
+  return () =>
+    new Promise<void>((resolve) => {
+      if (immediate !== undefined) {
+        immediate(resolve);
+        return;
+      }
+      const Channel = host.MessageChannel;
+      if (Channel === undefined || host.now() - lastTimerTurn >= TIMER_TURN_MS) {
+        host.setTimeout(() => {
+          lastTimerTurn = host.now();
+          resolve();
+        }, 0);
+        return;
+      }
+      if (channel === null) {
+        channel = new Channel();
+        channel.port1.onmessage = () => {
+          waiting.shift()?.();
+        };
+      }
+      waiting.push(resolve);
+      channel.port2.postMessage(null);
+    });
 }
+
+const globalHost: TaskHost = {
+  ...(typeof setImmediate === "function"
+    ? { setImmediate: (callback: () => void) => setImmediate(callback) }
+    : {}),
+  setTimeout: (callback, ms) => setTimeout(callback, ms),
+  ...(typeof MessageChannel === "function" ? { MessageChannel } : {}),
+  now: () => performance.now(),
+};
+
+/** Resolves in a later task (see `createYieldTask`), over the global scope. */
+export const yieldTask: () => Promise<void> = createYieldTask(globalHost);
 
 export interface DriveOptions {
   /** Synchronous work between task yields (default `YIELD_INTERVAL_MS`). */
