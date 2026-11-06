@@ -800,6 +800,10 @@ and the owner import it directly.
 
 ### Windows (`exec/window.ts`, `window-sort.ts`, `window-frames.ts`, `window-stream.ts`)
 
+- Sort, top-k, window and join slices (`exec/slices.ts`) continue across calls and across
+  backpressure that resolves at once: a new slice starts only after a real task yield, or at an
+  entry after the slice sat unused for a whole slice interval (ruling R23.4), so short calls
+  chained by resolved `ready()`s still yield, and a short call after a wait stays synchronous.
 - `WindowOperator` evaluates a `window` rel. Its rows are ordered by (PARTITION BY, ORDER BY),
   then evaluated one partition at a time. Output is the input columns, then one column per
   function.

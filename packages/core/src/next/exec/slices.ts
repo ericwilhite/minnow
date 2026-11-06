@@ -16,9 +16,29 @@ export class Slice {
     readonly now: () => number = () => performance.now(),
   ) {
     this.#start = now();
+    this.#last = this.#start;
   }
   due(): boolean {
-    return this.now() - this.#start >= this.ms;
+    const now = this.now();
+    this.#last = now;
+    return now - this.#start >= this.ms;
+  }
+  /** When the slice was last used (a deadline check, a reset or a resume). */
+  #last = 0;
+  /**
+   * An operator's entry point (a push, a finish): continues the current slice, so a chain of
+   * short calls resumed by already-resolved `ready()`s comes due and yields a task (R23.4).
+   * Only when the slice sat unused for at least `ms` — the time went to other work, or the
+   * caller yielded — does a new slice start, so a short call after an idle wait still runs
+   * synchronously.
+   */
+  resume(): void {
+    const now = this.now();
+    if (now - this.#last >= this.ms) {
+      this.#start = now;
+      this.resets++;
+    }
+    this.#last = now;
   }
   #ticks = 0;
   /**
@@ -32,6 +52,7 @@ export class Slice {
   resets = 0;
   reset(): void {
     this.#start = this.now();
+    this.#last = this.#start;
     this.resets++;
   }
 }

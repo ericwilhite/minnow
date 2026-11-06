@@ -13,6 +13,7 @@ import type { Batch } from "../vector/vector.js";
 import {
   ArraySource,
   CollectSink,
+  ResolvedBlockSink,
   INT,
   TEXT,
   batchesOf,
@@ -258,6 +259,21 @@ describe("R23.2/R23.3: finish runs in task-yielding slices", () => {
         Array.from({ length: 30_000 }, (_, i) => [JSON.stringify({ k: (i * 7919) % 30_000 })]),
     },
   ];
+  for (const c of cases)
+    it(`a zero-delay timer runs before finish completes: ${c.name}, downstream blocked with a resolved ready (R23.4)`, async () => {
+      const { context: ctx } = await context(c.types, c.slack);
+      const sink = new ResolvedBlockSink();
+      const op = c.make(ctx, sink);
+      await pushAll(op, c.types, c.rows());
+      let serviced = false;
+      const timer = setTimeout(() => {
+        serviced = true;
+      }, 0);
+      await op.finish();
+      clearTimeout(timer);
+      expect(serviced).toBe(true);
+      expect(sink.finished).toBe(true);
+    }, 60_000);
   for (const c of cases)
     it(`a zero-delay timer runs before finish completes: ${c.name}`, async () => {
       const { context: ctx } = await context(c.types, c.slack);
@@ -1003,4 +1019,29 @@ describe("the store-wide operand decode checks its deadline per chunk (review B7
     await op.closed;
     expect(governor.usedBytes).toBe(0);
   }, 60_000);
+});
+
+describe("R23.4: a slice starts again only after a real yield or an idle wait", () => {
+  it("entries chained by resolved ready()s come due; an entry after an idle wait does not", () => {
+    let t = 0;
+    const slice = new Slice(4, () => t);
+    // Ten short calls, 1 ms each, resumed back to back (a resolved ready between them).
+    let due = 0;
+    for (let call = 0; call < 10; call++) {
+      slice.resume();
+      t += 1;
+      if (slice.due()) {
+        due++;
+        // The operator yields a task here, then resets.
+        slice.reset();
+      }
+    }
+    expect(due).toBe(2);
+    // An entry after 10 ms of others' work (or the caller's yield) starts a new slice: a short
+    // call then completes without a yield.
+    t += 10;
+    slice.resume();
+    t += 1;
+    expect(slice.due()).toBe(false);
+  });
 });

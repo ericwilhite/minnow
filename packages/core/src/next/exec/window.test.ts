@@ -19,6 +19,7 @@ import {
   ArraySource,
   BIG,
   CollectSink,
+  ResolvedBlockSink,
   DBL,
   INT,
   TEXT,
@@ -1158,6 +1159,21 @@ describe("window: R23 slices and the abort signal", () => {
         expect(op.profile.streamedPartitions > 0).toBe(streamed);
         expect(op.profile.groupedRows).toBe(path === "grouped" ? 150_000 : 0);
       }, 120_000);
+
+  for (const path of ["grouped", "sort"] as const)
+    it(`a zero-delay timer runs before finish completes, downstream blocked with a resolved ready (R23.4, ${path})`, async () => {
+      const sink = new ResolvedBlockSink();
+      const { op } = await operator({ ...spec(), sortPath: path }, sink);
+      await pushAll(op, generateRows(mulberry32(7), 150_000, 3));
+      let serviced = false;
+      const timer = setTimeout(() => {
+        serviced = true;
+      }, 0);
+      await op.finish();
+      clearTimeout(timer);
+      expect(serviced).toBe(true);
+      expect(sink.rows).toBe(150_000);
+    }, 120_000);
 
   for (const path of ["grouped", "sort"] as const)
     it(`an abort before finish rejects and releases everything (${path})`, async () => {

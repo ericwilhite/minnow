@@ -185,6 +185,64 @@ describe("R23.2/R23.3: join phases run in task-yielding slices", () => {
     expect(sink.rows).toBe(2000 * 2048);
   }, 60_000);
 
+  it("a zero-delay timer runs before finishProbe completes: unmatched build rows, downstream blocked with a resolved ready (R23.4)", async () => {
+    const s = spec("right", [INT, INT]);
+    const { join } = await setup(s);
+    await pushAll(join.build, s.buildTypes, sparse(400_000));
+    await join.build.finish();
+    const sink = new CountSink(1);
+    const probe = join.probe(sink);
+    expect(await servicedDuring(() => probe.finish())).toBe(true);
+    expect(sink.rows).toBe(400_000);
+  }, 60_000);
+
+  it("many short probe pushes, each blocked with a resolved ready, still yield a task (R23.4)", async () => {
+    // Each push is far shorter than a slice; a slice restarted at every push never comes due.
+    const s = spec("inner", [INT, INT]);
+    const { join } = await setup(s);
+    await pushAll(
+      join.build,
+      s.buildTypes,
+      Array.from({ length: 64 }, (_, i): Row => [i, i]),
+    );
+    await join.build.finish();
+    const sink = new CountSink(1);
+    const probe = join.probe(sink);
+    const batch = [
+      ...batchesOf(
+        s.probeTypes,
+        Array.from({ length: 64 }, (_, i): Row => [i, i]),
+      ),
+    ];
+    const serviced = await servicedDuring(async () => {
+      const start = performance.now();
+      // At least 200 ms of pushes (a slice is 4 ms).
+      while (performance.now() - start < 200)
+        for (const b of batch) if (probe.push(b) === "blocked") await probe.ready();
+    });
+    expect(serviced).toBe(true);
+    await probe.finish();
+  }, 60_000);
+
+  it("a zero-delay timer runs during a probe whose every output blocks with a resolved ready (R23.4)", async () => {
+    const s = spec("inner", [INT, INT]);
+    const { join } = await setup(s);
+    const rows = Array.from({ length: 2048 }, (_, i): Row => [i % 4, i]);
+    await pushAll(join.build, s.buildTypes, rows);
+    await join.build.finish();
+    // Every probe row matches 512 build rows: many output batches per probe batch.
+    const sink = new CountSink(1);
+    const probe = join.probe(sink);
+    const probeRows = Array.from({ length: 4096 }, (_, i): Row => [i % 4, i]);
+    expect(
+      await servicedDuring(async () => {
+        await pushAll(probe, s.probeTypes, probeRows);
+        await probe.finish();
+      }),
+    ).toBe(true);
+    expect(sink.rows).toBe(4096 * 512);
+  }, 120_000);
+
   it("a zero-delay timer runs before finishProbe completes: unmatched build rows", async () => {
     const s = spec("right", [INT, INT]);
     const { join } = await setup(s);
@@ -740,7 +798,8 @@ describe("review B7-p2c-3 #2: mark joins hash and compare in steps", () => {
     // A clock that moves 10 ms per reading: every deadline check is due, so the slices begun
     // (resets) count the checks the walk makes. Without a checkpoint per candidate the walk
     // makes none: a handful of resets from the other phases.
-    let t = 0;
+    // (From the real now: the slice's start and last use are real readings.)
+    let t = performance.now();
     const clock = vi.spyOn(performance, "now").mockImplementation(() => (t += 10));
     const resets = vi.spyOn(Slice.prototype, "reset");
     try {

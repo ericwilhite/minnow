@@ -826,9 +826,13 @@ class Sorter {
     if (isPromise(done)) return done.then(() => undefined);
   }
 
-  /** Runs a job on a fresh slice: task yields between slices, the abort check at each resumption. */
+  /**
+   * Runs a job in the current slice: task yields between slices, the abort check at each
+   * resumption. The slice is not restarted here (R23.4: it starts again only after a real task
+   * yield, so many short calls still come due).
+   */
   sliced<T>(job: SlicedJob<T>): MaybePromise<T> {
-    this.slice.reset();
+    this.slice.resume();
     return runSliced(job, this.slice, () => {
       this.checkAborted();
     });

@@ -467,9 +467,13 @@ class Shared {
     this.context.signal?.throwIfAborted();
   }
 
-  /** Runs a job on a fresh slice: task yields between slices, the abort check at each resumption. */
+  /**
+   * Runs a job in the current slice: task yields between slices, the abort check at each
+   * resumption. The slice is not restarted here (R23.4: it starts again only after a real task
+   * yield, so many short calls still come due).
+   */
   sliced<T>(job: SlicedJob<T>): MaybePromise<T> {
-    this.slice.reset();
+    this.slice.resume();
     return runSliced(job, this.slice, () => {
       this.checkAborted();
     });
@@ -2069,7 +2073,7 @@ export class HashJoin {
     let result: MaybePromise<void>;
     try {
       shared.checkAborted();
-      shared.slice.reset();
+      shared.slice.resume();
       result = this.#level.endBuild();
     } catch (error) {
       this.#fail(error);
@@ -2123,8 +2127,9 @@ export class HashJoin {
   pushProbe(batch: Batch): PushResult {
     if (!this.#built) throw new TypeError("The join's build has not finished");
     this.#shared.checkAborted();
-    // Each probe push may run one slice before it yields (R23.2).
-    this.#shared.slice.reset();
+    // A push continues the current slice (R23.4: no fresh slice per push, so short pushes
+    // whose output blocks with a resolved ready still come due and yield).
+    this.#shared.slice.resume();
     // More key bytes than one step: the batch goes through in parts (raw keys count a
     // dictionary once, since they hash and look up each distinct entry once).
     const selection = batch.selection;
@@ -2194,7 +2199,7 @@ export class HashJoin {
     } catch (error) {
       this.#fail(error);
     }
-    shared.slice.reset();
+    shared.slice.resume();
     if (level.parts === null && level.matched === null) {
       this.#release();
       return downstream.finish();
