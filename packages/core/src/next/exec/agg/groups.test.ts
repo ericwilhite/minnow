@@ -219,8 +219,10 @@ interface IntScenario {
 function checkInts(scenario: IntScenario): ReadonlySet<Int32KeyEvent> {
   const random = mulberry32(scenario.seed);
   const table = new GroupTable([I32], UNCHARGED);
-  const model = new Map<string, number>();
-  const firstValue: unknown[] = [];
+  // Keyed by the generated value itself (NULL as null): each row's value is in `values`, which
+  // the vector forms only encode differently.
+  const model = new Map<number | null, number>();
+  const firstValue: Array<number | null> = [];
   const gids = new Int32Array(2048);
   const clamp = (x: number): number => Math.max(-0x8000_0000, Math.min(0x7fff_ffff, x));
   let reach = scenario.card;
@@ -248,21 +250,25 @@ function checkInts(scenario: IntScenario): ReadonlySet<Int32KeyEvent> {
         ? Array.from({ length }, (_, row) => row)
         : Array.from(selection.rows.subarray(0, selection.count));
     for (const row of active) {
-      const key = canonical("int4", valueAt(vector, row));
+      const key = values[row] ?? null;
       let id = model.get(key);
       if (id === undefined) {
         id = model.size;
         model.set(key, id);
-        firstValue.push(valueAt(vector, row));
+        firstValue.push(key);
       }
-      expect(gids[row], `row ${String(row)} key ${key}`).toBe(id);
+      // One cheap comparison per row; the assertion (and its message) only on a mismatch.
+      if (gids[row] !== id) expect(gids[row], `row ${String(row)} key ${String(key)}`).toBe(id);
     }
   }
   expect(table.groupCount).toBe(model.size);
   for (let from = 0; from < model.size; from += 2048) {
     const count = Math.min(2048, model.size - from);
     const emitted = table.emitKey(0, from, count);
-    for (let k = 0; k < count; k++) expect(valueAt(emitted, k)).toBe(firstValue[from + k]);
+    for (let k = 0; k < count; k++) {
+      const value = valueAt(emitted, k);
+      if (value !== firstValue[from + k]) expect(value).toBe(firstValue[from + k]);
+    }
   }
   const history = new Set(table.keyHistory(0));
   table.close();
