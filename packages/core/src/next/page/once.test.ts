@@ -6,11 +6,12 @@
  */
 import { describe, expect, it } from "vitest";
 import { BlobCache } from "../format/blob-cache.js";
-import type { ColumnChunk } from "../format/manifest.js";
+import { PageEncoding, type ColumnChunk } from "../format/manifest.js";
 import type { BlobRef } from "../storage/extents.js";
 import { MemoryBackend } from "../storage/memory-store.js";
 import { countingMemory, openOver } from "../storage/space-test-support.js";
 import type { ChunkDirectory } from "./directory.js";
+import { InflatedPageCache } from "./inflated-cache.js";
 import { UNLIMITED } from "./memory-extents.js";
 import { ChunkReader } from "./reader.js";
 import { defined, targetFor, valueAt, vectorOf, writeGroup } from "./test-support.js";
@@ -94,6 +95,45 @@ describe("one-pass scans", () => {
     const again = await ChunkReader.open(space, chunk, { budget, directories, once: true });
     again.close();
     expect(directories.hits).toBe(hits + 1);
+  });
+
+  it("keep no gzip page they inflate, and still use one already inflated", async () => {
+    const encoder = new TextEncoder();
+    const text = Array.from({ length: 3000 }, (_, row) =>
+      encoder.encode(`event ${String(row % 600)} ok`),
+    );
+    const { space, group } = await writeGroup([{ type: { kind: "text" }, values: text }], {
+      dictionaryEntries: 1,
+      pageBytes: 64 * 1024,
+      gzip: true,
+    });
+    const chunk = defined(group.columns[0]);
+    const memory = countingMemory(Number.POSITIVE_INFINITY);
+    const inflated = new InflatedPageCache(() => memory);
+    const view = space.view({ cache: false });
+    const all = (reader: ChunkReader): number[] => reader.directory.pages.map((_, page) => page);
+    const scan = await ChunkReader.open(view, chunk, { budget: UNLIMITED, inflated, once: true });
+    expect(scan.directory.pages.some((page) => (page.encoding & PageEncoding.gzip) !== 0)).toBe(
+      true,
+    );
+    await scan.load(all(scan));
+    const target = targetFor(scan, scan.rowCount, scan.varlenBytes(0, scan.rowCount));
+    scan.decodeRange(0, scan.rowCount, target, 0);
+    expect(Array.from({ length: text.length }, (_, row) => valueAt(target, row))).toEqual(text);
+    scan.close();
+    expect([inflated.residentBytes, memory.used]).toEqual([0, 0]);
+    // An ordinary reader keeps them; a one-pass scan then hits them.
+    const warm = await ChunkReader.open(view, chunk, { budget: UNLIMITED, inflated });
+    await warm.load(all(warm));
+    warm.close();
+    const resident = inflated.residentBytes;
+    expect(resident).toBeGreaterThan(0);
+    const hits = inflated.hits;
+    const again = await ChunkReader.open(view, chunk, { budget: UNLIMITED, inflated, once: true });
+    await again.load(all(again));
+    again.close();
+    expect(inflated.hits).toBeGreaterThan(hits);
+    expect(inflated.residentBytes).toBe(resident);
   });
 
   it("are honoured by the in-memory test space too", async () => {

@@ -123,8 +123,9 @@ export interface ChunkReadOptions {
   readonly directories?: BlobCache<ChunkDirectory>;
   /**
    * A one-pass scan (storage/extents.ts `ReadOptions.once`): what the reader reads is not kept
-   * in the space's cache, and a directory it parses is not admitted to `directories` (cached
-   * ones are still used), so a full export leaves the hot working set alone and its memory flat.
+   * in the space's cache, a directory it parses is not admitted to `directories`, and a gzip
+   * page it inflates is not admitted to `inflated` (cached ones are still used), so a full export
+   * leaves the hot working set alone and its memory flat.
    * Its pages then carry no descriptor (they are parsed per load, once).
    */
   readonly once?: boolean;
@@ -716,8 +717,9 @@ export class ChunkReader {
     } finally {
       lease.drop();
     }
-    // If the reader was closed while this page inflated, `#install` gives the charge back.
-    const cache = this.#options.inflated;
+    // If the reader was closed while this page inflated, `#install` gives the charge back. A
+    // one-pass scan keeps nothing it inflated (`options.once`): the page is its own, charged to it.
+    const cache = this.#options.once === true ? undefined : this.#options.inflated;
     const ref = blobOf(this.chunk, entry);
     if (cache !== undefined) raw = cache.admit(ref, raw);
     this.#install(entry, page, raw, {
