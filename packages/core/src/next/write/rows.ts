@@ -109,6 +109,8 @@ async function readGroupRows(
     const reader = await ChunkReader.open(shared.space, stored, { budget: shared.budget });
     try {
       await reader.load(reader.pagesForRows(positions));
+      // Out-of-line values decode only once loaded.
+      await reader.loadValuesOf(positions);
       const bytes = reader.gatherBytes(positions);
       const target: FlatVector = {
         form: "flat",

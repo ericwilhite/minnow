@@ -297,6 +297,7 @@ export async function rowsOf(view: Snapshot, tableId: number): Promise<Value[][]
       });
       const pages = Array.from({ length: reader.directory.pages.length }, (_, k) => k);
       await reader.load(pages);
+      await reader.loadValues(0, segment.rowCount);
       const { allocateData } = await import("../vector/vector.js");
       const target: FlatVector = {
         form: "flat",

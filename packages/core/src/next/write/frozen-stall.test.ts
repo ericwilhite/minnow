@@ -76,9 +76,8 @@ describe("frozen memtables whose commit continues into the live one", () => {
       await harness.close();
     }, 300_000);
 
-  // The reviewer's probe used 1 MiB values; a value that large needs the page track's
-  // out-of-line layout, which this write path does not use yet, so the flush itself refuses it.
-  // 1,000,000-byte values keep the shape (a commit over many memtables past the frozen cap).
+  // The reviewer's probe used 1 MiB values. 1,000,000-byte values keep its shape (a commit over
+  // many memtables past the frozen cap); the flush stores them out of line (page/large-value.ts).
   it("21 values of 1,000,000 bytes over 4-row memtables in one commit (the reviewer's second probe)", async () => {
     const harness = new Harness("strict", "memory", 4, undefined, {
       logRecycleBytes: 256 * 1024 * 1024,

@@ -687,3 +687,65 @@ describe("deletion vectors", () => {
 });
 
 export type { FlatVector };
+
+describe("values stored out of line (page/large-value.ts)", () => {
+  // Values past LARGE_VALUE_BYTES live in the chunk's own extent and decode only once
+  // ChunkReader.loadValues has read them; every write-path read of a published chunk must.
+  it("update, delete and an index build read a flushed row whose text is over 64 KiB", async () => {
+    const harness = new Harness("strict", "memory", 2);
+    let path = await harness.open();
+    const t = await createTable(path, [
+      column("id", INT, false),
+      column("body", TEXT),
+      column("n", INT),
+    ]);
+    const big = "x".repeat(100_000);
+    await autocommit(path, (s) =>
+      s
+        .table(t)
+        .insert(
+          batch(ints([1, 2, 3, 4]), texts([big, `${big}y`, "small", big]), ints([1, 2, 3, 4])),
+          null,
+        ),
+    );
+    // A reader pinned before the flush is re-pointed to the published groups (view.ts).
+    const early = path.pin();
+    // A later commit freezes the memtable the big commit ended in, so the whole commit flushes.
+    await autocommit(path, (s) =>
+      s.table(t).insert(batch(ints([5, 6]), texts(["e", "f"]), ints([5, 6])), null),
+    );
+    await path.quiesce();
+    expect(path.publications).toBeGreaterThan(0);
+    expect(path.stats().repointPins).toBe(1);
+    const repointed = (await rowsOf(early, t)).sort((a, b) => Number(a[0]) - Number(b[0]));
+    early.release();
+    expect(repointed.map((row) => row[1])).toEqual([big, `${big}y`, "small", big]);
+    path = await harness.reopen();
+    const pinned = path.pin();
+    const kinds = pinned.table(t, { budget: FREE }).segments.map((segment) => segment.kind);
+    pinned.release();
+    expect(kinds.slice(0, 2)).toEqual(["group", "group"]);
+    const n = path.catalog.table(t)?.columns[2]?.id ?? 0;
+    await autocommit(path, async (s) => {
+      await s.changeCatalog({
+        kind: "createIndex",
+        index: { name: "by_n", tableId: t, columnIds: [n], unique: false, role: "secondary" },
+      });
+    });
+    const [one] = await locate(path, t, [1]);
+    await autocommit(path, (s) =>
+      s.table(t, { assigned: [n] }).update(batch(locators([one ?? 0], t), ints([10])), null),
+    );
+    const [two] = await locate(path, t, [2]);
+    await autocommit(path, (s) => s.table(t).delete(batch(locators([two ?? 0], t)), null));
+    const live = (await rows(path, t)).sort((a, b) => Number(a[0]) - Number(b[0]));
+    expect(live).toEqual([
+      [1, big, 10],
+      [3, "small", 3],
+      [4, big, 4],
+      [5, "e", 5],
+      [6, "f", 6],
+    ]);
+    await harness.close();
+  }, 120_000);
+});

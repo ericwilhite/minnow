@@ -332,13 +332,16 @@ class MemorySegmentImpl implements MemorySegment {
       (reader) => {
         const [firstPage, endPage] = reader.pagesInRange(from, to);
         const pages = Array.from({ length: endPage - firstPage }, (_, k) => firstPage + k);
-        return settle(reader.load(pages), () => {
-          try {
-            return decodeInto(reader, stored, from, to, startRow, out);
-          } finally {
-            reader.close();
-          }
-        });
+        // Out-of-line values (page/large-value.ts) decode only once loaded.
+        return settle(reader.load(pages), () =>
+          settle(reader.loadValues(from, to), () => {
+            try {
+              return decodeInto(reader, stored, from, to, startRow, out);
+            } finally {
+              reader.close();
+            }
+          }),
+        );
       },
     );
   }
