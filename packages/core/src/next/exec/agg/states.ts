@@ -60,7 +60,7 @@ import {
 } from "../kernels/limbs.js";
 import { POW10, coefficientAt, scaleAt, specialAt, type DecimalData } from "../kernels/numeric.js";
 import { IDENTITY, flatOf } from "../kernels/vectors.js";
-import { Charged } from "./groups.js";
+import { Charged, grownCapacity } from "./groups.js";
 import { bigintBytes } from "../../memory/governor.js";
 import { GroupValues } from "./values.js";
 
@@ -198,7 +198,7 @@ class CountAccumulator implements Accumulator {
   }
   grow(groups: number): void {
     if (groups > this.#counts.length)
-      this.#counts = this.#memory.float64(this.#counts, Math.max(groups, 2 * this.#counts.length));
+      this.#counts = this.#memory.float64(this.#counts, grownCapacity(this.#counts.length, groups));
   }
   update(
     vector: Vector | null,
@@ -301,7 +301,7 @@ class ExactSums {
   grow(groups: number): void {
     if (groups <= this.sums.length) return;
     const before = this.sums.length;
-    const capacity = Math.max(groups, 2 * this.sums.length);
+    const capacity = grownCapacity(this.sums.length, groups);
     this.sums = this.#memory.float64(this.sums, capacity);
     this.carry = this.#memory.uint32(this.carry, 4 * capacity);
     this.has = this.#memory.uint8(this.has, capacity);
@@ -908,7 +908,7 @@ class FloatSumAccumulator implements Accumulator {
   }
   grow(groups: number): void {
     if (groups <= this.#sums.length) return;
-    const capacity = Math.max(groups, 2 * this.#sums.length);
+    const capacity = grownCapacity(this.#sums.length, groups);
     const before = this.#sums.length;
     this.#sums = this.#memory.float64(this.#sums, capacity);
     // SUM starts from −0, the additive identity (PostgreSQL's first value is the state, so
@@ -1115,7 +1115,7 @@ class DecimalSumAccumulator implements Accumulator {
   grow(groups: number): void {
     this.#sums.grow(groups);
     if (groups <= this.#flags.length) return;
-    const capacity = Math.max(groups, 2 * this.#flags.length);
+    const capacity = grownCapacity(this.#flags.length, groups);
     this.#scales = this.#memory.uint16(this.#scales, capacity);
     this.#flags = this.#memory.uint8(this.#flags, capacity);
     this.#counts = this.#memory.float64(this.#counts, capacity);
@@ -1610,7 +1610,7 @@ class MinMaxAccumulator implements Accumulator {
   }
   grow(groups: number): void {
     if (groups > this.#has.length)
-      this.#has = this.#memory.uint8(this.#has, Math.max(groups, 2 * this.#has.length));
+      this.#has = this.#memory.uint8(this.#has, grownCapacity(this.#has.length, groups));
     const nothing: Vector = {
       form: "constant",
       type: this.type,
@@ -1720,7 +1720,7 @@ class NumberMinMaxAccumulator implements Accumulator {
   }
   grow(groups: number): void {
     if (groups <= this.#best.length) return;
-    const capacity = Math.max(groups, 2 * this.#best.length);
+    const capacity = grownCapacity(this.#best.length, groups);
     this.#best = this.#memory.float64(this.#best, capacity);
     this.#has = this.#memory.uint8(this.#has, capacity);
   }
@@ -1846,7 +1846,7 @@ class BoolAccumulator implements Accumulator {
   }
   grow(groups: number): void {
     if (groups > this.#state.length)
-      this.#state = this.#memory.uint8(this.#state, Math.max(groups, 2 * this.#state.length));
+      this.#state = this.#memory.uint8(this.#state, grownCapacity(this.#state.length, groups));
   }
   update(
     vector: Vector | null,
@@ -1907,7 +1907,7 @@ class SingleValueAccumulator implements Accumulator {
   }
   grow(groups: number): void {
     if (groups > this.#seen.length)
-      this.#seen = this.#memory.uint8(this.#seen, Math.max(groups, 2 * this.#seen.length));
+      this.#seen = this.#memory.uint8(this.#seen, grownCapacity(this.#seen.length, groups));
     const nothing: Vector = {
       form: "constant",
       type: this.type,
