@@ -300,6 +300,9 @@ class SharedLease {
   ) {
     this.#holders = holders;
   }
+  retain(): void {
+    this.#holders += 1;
+  }
   drop(): void {
     if (--this.#holders === 0) this.lease.release();
   }
@@ -351,6 +354,10 @@ interface ValueJob {
 interface Stream {
   live: boolean;
   lease: ReadLease | null;
+  /** Inline copies belong to the stream, not to the reader's released page. */
+  charged: number;
+  /** Retained until advance/return/close, independently of reader.release(). */
+  page: SharedLease | null;
 }
 
 export class ChunkReader {
@@ -968,7 +975,8 @@ export class ChunkReader {
 
   /**
    * Read options for page loads: a one-pass reader lets the space reuse its page buffers once a
-   * lease is released (`ReadOptions.reuseBuffers`): its views of page bytes die with the page.
+   * lease is released (`ReadOptions.reuseBuffers`). A suspended inline stream retains its
+   * own share, independently of the reader releasing the page.
    */
   get #pageReads(): ReadOptions {
     return this.#options.once === true ? { ...this.#options, reuseBuffers: true } : this.#options;
@@ -1088,9 +1096,7 @@ export class ChunkReader {
     this.#closed = true;
     for (const stream of this.#streams) {
       stream.live = false;
-      const lease = stream.lease;
-      stream.lease = null;
-      lease?.release();
+      this.#dropStream(stream);
     }
     this.#streams.clear();
     for (const codes of this.#codes.values()) this.#options.budget.free(codes.byteLength);
@@ -1367,8 +1373,10 @@ export class ChunkReader {
   /**
    * Streams the value of chunk row `row` (its page must be loaded): an inline value as one
    * array, an out-of-line one part by part (≤ 1 MiB each, verified, charged while it is held).
-   * Each yielded array is valid until the next step; nothing is yielded for null. Memory: one
-   * part, whatever the value's size.
+   * Each yielded array is valid until the next step; nothing is yielded for null. Inline
+   * parts retain the page's shared read lease (possibly covering other pages too), independent
+   * of page release, or a charged copy if the page was peeked/inflated without a lease.
+   * Out-of-line memory: one part, whatever the value's size. Retained leases stay charged whole.
    *
    * **A failed stream is wholly invalid** (review B2-p2b #4). Every part is verified before it
    * is yielded, but a later part may still fail (`StoreCorruptionError`, a refused budget, an
@@ -1380,15 +1388,13 @@ export class ChunkReader {
    * step throws `ReaderClosedError`.
    */
   async *valueParts(row: number): AsyncGenerator<Uint8Array> {
-    const stream: Stream = { live: true, lease: null };
+    const stream: Stream = { live: true, lease: null, charged: 0, page: null };
     this.#live();
     this.#streams.add(stream);
     try {
       yield* this.#streamParts(row, stream);
     } finally {
-      const lease = stream.lease;
-      stream.lease = null;
-      lease?.release();
+      this.#dropStream(stream);
       this.#streams.delete(stream);
     }
   }
@@ -1396,29 +1402,17 @@ export class ChunkReader {
   async *#streamParts(row: number, stream: Stream): AsyncGenerator<Uint8Array> {
     const live = (): void => {
       if (!stream.live || this.#closed) throw new ReaderClosedError();
+      this.#options.signal?.throwIfAborted();
     };
-    const page = pageIndexOf(this.directory.pages, row);
-    const entry = at(this.directory.pages, page);
-    const view = this.#view(page);
-    const local = row - entry.firstRow;
-    if (local < 0 || local >= entry.rowCount) throw new RangeError("Row outside the chunk");
-    if (view.validity !== null && (((view.validity[local >>> 5] ?? 0) >>> (local & 31)) & 1) === 0)
-      return;
-    if (view.allNull) return;
-    if (!isLarge(view, local)) {
-      const offsets = view.unsigned;
-      const data = view.data;
-      if (
-        view.tag !== ValueTag.varlen ||
-        view.kind !== PageEncoding.plain ||
-        offsets === null ||
-        data === null
-      )
-        throw new TypeError("valueParts streams plain varlen pages");
-      yield data.subarray(offsets[local] ?? 0, offsets[local + 1] ?? 0);
+    live();
+    const value = this.#streamValue(row, stream);
+    if (value === null) return;
+    if (value instanceof Uint8Array) {
+      yield value;
+      live();
       return;
     }
-    const refs = this.#valueRefs(view, local);
+    const refs = value;
     for (const [index, ref] of refs.entries()) {
       live();
       // A loaded value's parts are held by it (and released by `releaseValues` or `close`).
@@ -1441,6 +1435,64 @@ export class ChunkReader {
         lease.release();
       }
     }
+  }
+
+  /** Preparing a part never suspends, so its page view cannot linger in a generator frame. */
+  #streamValue(row: number, stream: Stream): Uint8Array | readonly BlobRef[] | null {
+    const page = pageIndexOf(this.directory.pages, row);
+    const entry = at(this.directory.pages, page);
+    const view: PageView = this.#view(page);
+    const local = row - entry.firstRow;
+    if (local < 0 || local >= entry.rowCount) throw new RangeError("Row outside the chunk");
+    if (view.validity !== null && (((view.validity[local >>> 5] ?? 0) >>> (local & 31)) & 1) === 0)
+      return null;
+    if (view.allNull) return null;
+    return isLarge(view, local)
+      ? this.#valueRefs(view, local)
+      : this.#inlinePart(view, local, stream, this.#held[page]?.lease ?? null);
+  }
+
+  /** Retain the lease where possible; otherwise make a value-sized, charged copy. */
+  #inlinePart(
+    view: PageView,
+    local: number,
+    stream: Stream,
+    lease: SharedLease | null,
+  ): Uint8Array {
+    const offsets = view.unsigned;
+    const data = view.data;
+    if (
+      view.tag !== ValueTag.varlen ||
+      view.kind !== PageEncoding.plain ||
+      offsets === null ||
+      data === null
+    )
+      throw new TypeError("valueParts streams plain varlen pages");
+    // A suspended stream owns a share independently of reader.release(). Retaining is
+    // cheaper per value than copying; a peeked/inflated page has no lease, so copy it.
+    const from = offsets[local] ?? 0;
+    const end = offsets[local + 1] ?? 0;
+    if (lease !== null) {
+      lease.retain();
+      stream.page = lease;
+      return data.subarray(from, end);
+    }
+    const length = end - from;
+    if (!this.#options.budget.allocate(length)) throw new PageBudgetError(length);
+    stream.charged = length; // outer finally also handles a failed copy allocation
+    return data.slice(from, end);
+  }
+
+  /** Release one suspended part; both close and generator cleanup may call this. */
+  #dropStream(stream: Stream): void {
+    const lease = stream.lease;
+    stream.lease = null;
+    lease?.release();
+    const page = stream.page;
+    stream.page = null;
+    page?.drop();
+    this.#options.budget.free(stream.charged);
+    stream.charged = 0;
   }
 
   #live(): void {

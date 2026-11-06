@@ -296,8 +296,8 @@ export interface ReadOptions {
   /**
    * With `once`: the lease's bytes may live in a pooled buffer that is reused once the lease is
    * released, so the caller keeps no view of them past `release` (a reader's page bytes, never
-   * a dictionary or value it hands out). The lease is charged for the whole buffer. Bounds RSS
-   * for a one-pass scan, whose released buffers would otherwise wait for the collector. Default
+   * a dictionary). An inline value stream must retain the page lease until its next step.
+   * The lease is charged for the whole buffer. Bounds RSS for a one-pass scan, whose released buffers would otherwise wait for the collector. Default
    * false: every array a lease hands out is never reused.
    */
   readonly reuseBuffers?: boolean;

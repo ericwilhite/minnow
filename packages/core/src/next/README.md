@@ -467,7 +467,9 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     charged whole to its lease; on release the buffer returns to the pool, charged to the cache
     while idle (at most 64 MiB, evicted first, dropped when the governor refuses) and poisoned in
     test builds. Readers ask for it for page loads only, never a dictionary or a value they hand
-    out. At 1M × 200 on OPFS, renderer RSS +104 to +172 MiB over 22 passes in two runs with the
+    out past its lease: an inline `valueParts` stream retains the page's shared read lease until
+    its next step, return or reader close (the whole buffer stays charged). Peeked/inflated pages
+    without a lease use a charged value-sized copy. At 1M × 200 on OPFS, renderer RSS +104 to +172 MiB over 22 passes in two runs with the
     pool, +75 to +251 MiB over 11 passes without it (on a 262,144-row table, where the collector
     keeps up, the pool's idle 64 MiB makes it +76 to +124 against +45 to +98).
   - The nightly browser-performance workflow runs the export bench (`npm run benchmark:export`,
