@@ -13,6 +13,13 @@
  *   group, so every acknowledged group but none is exposed to a cleanly truncated log.
  * - Any append or flush failure fails the appender: every waiter rejects with
  *   `WritePathFailedError` and later calls throw it.
+ * - **Recycling** (access/write-path.ts "Log recycling"): `beginRecycle` fixes the cut (the last
+ *   LSN appended); later appends keep their LSNs but are only kept as bodies (deferred). The
+ *   engine makes everything through the cut durable (`flushEncoded`), publishes a root covering
+ *   it with the new incarnation, resets the log, and calls `finishRecycle`, which starts the new
+ *   incarnation empty at the cut and writes the deferred bodies as its first frames. A crash
+ *   before then loses only deferred frames, which no caller waited for durably.
+ *   `abandonRecycle` writes them into the old log instead.
  */
 import { MAX_LSN } from "../access/snapshot.js";
 import { WritePathFailedError } from "../access/write-path.js";
@@ -80,6 +87,12 @@ export class LogAppender {
   /** The newest durable group's boundary. */
   #durable: Boundary;
   #rootSequence: number;
+  /** LSN of the last frame encoded (`lastLsn` unless frames are deferred by a recycle). */
+  #encodedLsn: number;
+  /** Bodies appended since `beginRecycle` (copied), with their first LSNs; null when none is running. */
+  #deferred: Array<{ readonly body: Uint8Array; readonly first: number }> | null = null;
+  #recycled: Promise<void> | null = null;
+  #recycledResolve: (() => void) | null = null;
   /** Frames appended and not yet written to the log file (written by the next flush). */
   #queued: Uint8Array[] = [];
   #queuedBytes = 0;
@@ -106,6 +119,7 @@ export class LogAppender {
     this.#chain = position.chain;
     this.#end = position.end;
     this.#lastLsn = position.lastLsn;
+    this.#encodedLsn = position.lastLsn;
     this.#generation = position.generation;
     this.#nextSlot = position.nextSlot;
     this.#acked = position.acked;
@@ -146,6 +160,19 @@ export class LogAppender {
     if (parts > MAX_FRAME_PARTS) throw new RangeError("A transaction is too large for the log");
     const first = this.#lastLsn + 1;
     if (first + parts - 1 > MAX_LSN) throw new LogExhaustedError(this.#lastLsn, parts);
+    if (this.#deferred !== null) {
+      // A recycle is switching incarnations: keep the body (the caller may reuse its buffer).
+      this.#deferred.push({ body: body.slice(), first });
+      this.#lastLsn = first + parts - 1;
+      return this.#lastLsn;
+    }
+    this.#encode(body, first, parts);
+    this.#schedule();
+    return this.#lastLsn;
+  }
+
+  /** Encodes one transaction's frames at `first …` and queues them (all or nothing). */
+  #encode(body: Uint8Array, first: number, parts: number): void {
     // Frames are encoded first and committed together: a failure leaves the log unchanged.
     const frames: Uint8Array[] = [];
     let chain = this.#chain;
@@ -169,9 +196,106 @@ export class LogAppender {
       this.#queued.push(bytes);
       this.#queuedBytes += bytes.length;
     }
-    this.#lastLsn = first + parts - 1;
-    this.#schedule();
-    return this.#lastLsn;
+    this.#encodedLsn = first + parts - 1;
+    if (this.#deferred === null) this.#lastLsn = this.#encodedLsn;
+  }
+
+  /** Transactions deferred by the running recycle. */
+  get deferredCount(): number {
+    return this.#deferred?.length ?? 0;
+  }
+
+  /** True while a recycle defers appends. */
+  get recycling(): boolean {
+    return this.#deferred !== null;
+  }
+
+  /** Starts a recycle: returns the cut (every LSN ≤ it is in the old log). See "Recycling". */
+  beginRecycle(): number {
+    this.#check();
+    if (this.#deferred !== null) throw new RangeError("A log recycle is already running");
+    this.#deferred = [];
+    this.#recycled = new Promise<void>((resolve) => {
+      this.#recycledResolve = resolve;
+    });
+    return this.#encodedLsn;
+  }
+
+  /** Makes every encoded frame (through the cut, during a recycle) durable. */
+  async flushEncoded(): Promise<void> {
+    this.#check();
+    while (this.#durable.lsn < this.#encodedLsn) {
+      if (this.#flushing !== null) await this.#flushing;
+      else await this.#flush();
+      this.#check();
+    }
+    if (this.#flushing !== null) await this.#flushing;
+  }
+
+  /**
+   * Starts `incarnation` (the log was reset after the root naming it was published): empty at the
+   * cut, with fresh header slots; then writes the deferred bodies as its first frames.
+   */
+  async finishRecycle(incarnation: {
+    readonly salt: number;
+    readonly firstLsn: number;
+    readonly rootSequence: number;
+  }): Promise<void> {
+    const deferred = this.#deferred;
+    if (deferred === null) throw new RangeError("No log recycle is running");
+    if (this.#flushing !== null) await this.#flushing;
+    if (this.#idle !== null) {
+      clearTimeout(this.#idle);
+      this.#idle = null;
+    }
+    const cut = incarnation.firstLsn - 1;
+    if (cut !== this.#encodedLsn || this.#durable.lsn !== cut)
+      throw new RangeError("The new incarnation does not start at the durable cut");
+    const salt = incarnation.salt >>> 0;
+    this.#salt = salt;
+    this.#chain = salt;
+    this.#end = 0;
+    this.#generation = 1;
+    this.#nextSlot = 0;
+    this.#acked = { end: 0, chain: salt, lsn: cut };
+    this.#durable = { end: 0, chain: salt, lsn: cut };
+    this.#rootSequence = incarnation.rootSequence;
+    this.#release(deferred);
+  }
+
+  /** Ends a recycle that did not switch: the deferred bodies go to the current log. */
+  abandonRecycle(): void {
+    const deferred = this.#deferred;
+    if (deferred === null) return;
+    this.#release(deferred);
+  }
+
+  /** A recycle failed after its switch: the appender fails, and waiters on the deferred reject. */
+  failRecycle(cause: unknown): void {
+    if (this.#deferred === null) return;
+    this.#deferred = null;
+    this.#fail(cause);
+    this.#recycledResolve?.();
+    this.#recycled = null;
+    this.#recycledResolve = null;
+  }
+
+  #release(deferred: ReadonlyArray<{ readonly body: Uint8Array; readonly first: number }>): void {
+    const last = this.#lastLsn;
+    this.#deferred = null;
+    try {
+      for (const { body, first } of deferred) {
+        const parts = Math.max(1, Math.ceil(body.length / MAX_FRAME_BODY_BYTES));
+        this.#encode(body, first, parts);
+      }
+    } catch (error) {
+      this.#fail(error);
+    }
+    this.#lastLsn = last;
+    this.#recycledResolve?.();
+    this.#recycled = null;
+    this.#recycledResolve = null;
+    if (this.#lastLsn > this.#durable.lsn) this.#schedule();
   }
 
   #schedule(): void {
@@ -199,8 +323,10 @@ export class LogAppender {
     });
   }
 
-  /** Flushes everything queued now; resolves when it is durable. */
+  /** Flushes everything queued now; resolves when it is durable (after a running recycle). */
   async flush(): Promise<void> {
+    this.#check();
+    if (this.#recycled !== null) await this.#recycled;
     this.#check();
     const target = this.#lastLsn;
     while (this.#durable.lsn < target) {
@@ -212,7 +338,7 @@ export class LogAppender {
 
   #flush(): Promise<void> {
     if (this.#flushing !== null) return this.#flushing;
-    const group: Boundary = { end: this.#end, chain: this.#chain, lsn: this.#lastLsn };
+    const group: Boundary = { end: this.#end, chain: this.#chain, lsn: this.#encodedLsn };
     if (group.lsn <= this.#durable.lsn) return Promise.resolve();
     const run = (async () => {
       try {
@@ -228,7 +354,7 @@ export class LogAppender {
         this.#flushing = null;
       }
       this.#settle();
-      if (this.#lastLsn > this.#durable.lsn) this.#schedule();
+      if (this.#encodedLsn > this.#durable.lsn) this.#schedule();
       else this.#armIdle();
     })();
     this.#flushing = run;
@@ -290,7 +416,7 @@ export class LogAppender {
       } finally {
         this.#flushing = null;
       }
-      if (this.#lastLsn > this.#durable.lsn) this.#schedule();
+      if (this.#encodedLsn > this.#durable.lsn) this.#schedule();
     })();
     this.#flushing = run;
     await run;

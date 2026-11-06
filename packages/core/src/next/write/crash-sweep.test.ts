@@ -240,6 +240,22 @@ describe("crash sweep", () => {
     );
   }, 1_800_000);
 
+  it("survives a crash at every physical step of log recycling", async () => {
+    // A small log bound: the scenario recycles several times, each with its flushes, the
+    // switching root, the reset and the first frames of the new incarnation.
+    const make = (disk?: SimDisk) =>
+      new Harness("strict", "sim", MEMTABLE_ROWS, disk, {
+        logRecycleBytes: 400,
+        merges: { mode: "off" },
+      });
+    const probe = make();
+    await scenario(probe, { acked: new Map(), uncertain: new Map() });
+    const path = await probe.open();
+    expect(path.state().root.log.firstLsn).toBeGreaterThan(1);
+    await probe.close();
+    await sweep(make);
+  }, 1_800_000);
+
   it("survives a crash at every physical step of index merges", async () => {
     // Fan-in 2: every second flush merges, at every level; slices by entry count keep the
     // interleaving of merges with commits the same in every run.

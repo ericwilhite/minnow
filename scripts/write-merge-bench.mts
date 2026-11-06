@@ -3,7 +3,7 @@
  * owner-side, in Node:
  *
  *   npx vite-node scripts/write-merge-bench.mts [--rows 1000000] [--key int|uuid]
- *     [--merges auto|off|manual] [--checkpoints 131072,262144]
+ *     [--merges auto|off|manual] [--checkpoints 131072,262144] [--log-bytes 33554432]
  *
  * A keyed load of `rows` rows (key, n INT) in 2,048-row strict autocommit inserts, then a wait
  * until maintenance settles. Reported:
@@ -12,6 +12,7 @@
  *   runs them alone, so `isolated.mergeCpuMs` is their CPU;
  * - write amplification: index bytes written by flushes and merges over the index's final bytes,
  *   and all bytes written (groups, runs, directories, roots) over the flushes' bytes;
+ * - the largest log seen during the load and the log recycles (`--log-bytes` sets the bound);
  * - the primary key's runs per level, the root's bytes and the charged resident metadata;
  * - warm point probes (key → locator through the key index, one key per call, all blocks cached):
  *   µs per probe for present keys and for absent ones (a unique check of a new key), the median of
@@ -47,6 +48,8 @@ const CHECKPOINTS = option("checkpoints", "")
   .split(",")
   .filter((text) => text !== "")
   .map(Number);
+/** The log recycle bound (default: the engine's `LOG_RECYCLE_BYTES`). */
+const LOG_BYTES = option("log-bytes", "");
 const PROBES = 20_000;
 const FREE = { allocate: () => true, free: () => undefined };
 
@@ -113,7 +116,11 @@ const sample = (limit: number, offset: number): number[] =>
     (_, k) => ((Math.imul(k + 1, 2_654_435_761) >>> 0) % limit) + offset,
   );
 
-const harness = new Harness("strict", "memory", undefined, undefined, { merges: { mode: MODE } });
+const harness = new Harness("strict", "memory", undefined, undefined, {
+  merges: { mode: MODE },
+  ...(LOG_BYTES === "" ? {} : { logRecycleBytes: Number(LOG_BYTES) }),
+});
+let largestLog = 0;
 const path = await harness.open();
 let t = 0;
 await autocommit(path, async (s) => {
@@ -144,6 +151,7 @@ for (let start = 0; start < ROWS; start += 2048) {
   await autocommit(path, (s) =>
     s.table(t).insert(batch(keys(ids), ints(ids.map((id) => id % 1000))), null),
   );
+  largestLog = Math.max(largestLog, path.stats().logBytes);
   const done = start + n;
   if (CHECKPOINTS.includes(done)) {
     await path.quiesce();
@@ -201,6 +209,8 @@ console.log(
     presentProbeUs: Number(present.toFixed(2)),
     absentProbeUs: Number(absent.toFixed(2)),
     isolated,
+    largestLogBytes: largestLog,
+    recycles: m.recycles,
     mergeEntriesIn: m.mergeEntriesIn,
     checkpoints,
   }),

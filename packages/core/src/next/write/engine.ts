@@ -32,6 +32,8 @@ export type EngineInput = OpenWritePathInput & {
     };
     /** Tests: awaited by a flush after it wrote its groups, before it takes the publish lock. */
     readonly beforeFlushPublish?: () => Promise<void>;
+    /** Log bytes past which the log is recycled (default `LOG_RECYCLE_BYTES`). */
+    readonly logRecycleBytes?: number;
   };
 };
 import { CatalogChangeError, type TableDef } from "../access/catalog.js";
@@ -129,6 +131,14 @@ import {
 import { hexId, TransactionImpl, type EngineHooks } from "./transaction.js";
 import { SnapshotImpl } from "./view.js";
 import { need } from "./bytes.js";
+
+/**
+ * Log bytes past which the write path recycles the log (access/write-path.ts "Log recycling"):
+ * every table is flushed through the log's end, a root covering it switches to a new incarnation,
+ * and the log is reset. The log stays within about this plus what accumulates while a recycle
+ * waits for the writer slot.
+ */
+export const LOG_RECYCLE_BYTES = 32 * 1024 * 1024;
 
 /** The write path's working memory admitted at open (scan buffer, key batches, metadata). */
 const MINIMUM_BYTES = RECOVERY_SCAN_BYTES + 4 * 1024 * 1024;
@@ -302,7 +312,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
   #failure: Error | null = null;
   #closed = false;
   #holder: TransactionImpl | null = null;
-  readonly #queue: Array<{ resolve: () => void; reject: (error: unknown) => void }> = [];
+  /** Writers and maintenance waiting for the slot, FIFO; `take` claims it for the waiter. */
+  readonly #queue: Array<{
+    resolve: () => void;
+    reject: (error: unknown) => void;
+    take: () => void;
+  }> = [];
   #flushes: Promise<void> = Promise.resolve();
   #flushScheduled = false;
   readonly #runReaders = new Map<string, RunReader | Promise<RunReader>>();
@@ -336,6 +351,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
   readonly #mergeMode: "auto" | "manual" | "off";
   readonly #stallRuns: number;
   readonly #beforeFlushPublish: (() => Promise<void>) | null;
+  readonly #logRecycleBytes: number;
+  /** The running log recycle, if any. */
+  #recycling: Promise<void> | null = null;
+  /** True while maintenance (a log recycle) holds the writer slot. */
+  #maintenanceHolds = false;
   /** The merge chain (one merge at a time, beside the flush chain). */
   #merges: Promise<void> = Promise.resolve();
   #mergeScheduled = false;
@@ -370,6 +390,18 @@ export class WritePathImpl implements WritePath, EngineHooks {
     mergesDuringFlush: 0,
     /** Merges dropped at publish because their inputs changed (a drop). */
     mergesAbandoned: 0,
+    /** Log recycles completed, and the log bytes each one cut. */
+    recycles: 0,
+    recycledBytes: 0,
+    /** Recycles given up before switching (an index build not yet published). */
+    recyclesAbandoned: 0,
+    /** Tables a recycle flushed, and tables it only moved the checkpoint of. */
+    recycleFlushedTables: 0,
+    recycleQuietTables: 0,
+    /** Frames appended while a recycle switched incarnations (written to the new log). */
+    deferredFrames: 0,
+    /** Runs written for memtables without rows (their tombstones). */
+    rowlessRuns: 0,
     mergeMs: 0,
     mergesByLevel: [] as number[],
   };
@@ -411,6 +443,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#mergeMode = merges?.mode ?? "auto";
     this.#stallRuns = merges?.stallRuns ?? 3 * this.#mergePolicy.fanIn;
     this.#beforeFlushPublish = input.tuning?.beforeFlushPublish ?? null;
+    this.#logRecycleBytes = input.tuning?.logRecycleBytes ?? LOG_RECYCLE_BYTES;
     this.#now = input.options.now ?? Date.now;
     this.#root = root;
     this.#catalog = catalog;
@@ -501,6 +534,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       engine.#recovering = false;
       engine.#scheduleFlush();
       engine.#scheduleMerge();
+      if (engine.#appender.end >= engine.#logRecycleBytes) engine.#maybeRecycle();
       return engine;
     } catch (error) {
       metadataGrant.close();
@@ -1160,55 +1194,91 @@ export class WritePathImpl implements WritePath, EngineHooks {
     });
   }
 
+  /** The writer slot is held (by a transaction or by maintenance). */
+  get #slotBusy(): boolean {
+    return this.#holder !== null || this.#maintenanceHolds || this.#claimed;
+  }
+
+  /** A writer that has its turn and waits on backpressure holds the slot already. */
+  #claimed = false;
+
   async begin(options: BeginOptions = {}): Promise<TransactionImpl> {
     this.#check();
-    if (this.#holder !== null || this.#queue.length > 0)
-      await new Promise<void>((resolve, reject) => {
-        const waiter = { resolve, reject };
-        this.#queue.push(waiter);
-        options.signal?.addEventListener(
-          "abort",
-          () => {
-            const index = this.#queue.indexOf(waiter);
-            if (index >= 0) {
-              this.#queue.splice(index, 1);
-              const reason: unknown = options.signal?.reason;
-              reject(reason instanceof Error ? reason : new Error("Aborted", { cause: reason }));
-            }
-          },
-          { once: true },
-        );
-      });
-    this.#check();
-    // Backpressure: frozen memtables awaiting publication past their cap, or memtables across
-    // every table past theirs, make writers wait (ruling 6).
-    while (this.#frozenBytes() > FROZEN_MEMTABLE_CAP_BYTES) {
-      this.#scheduleFlush();
-      await this.#flushes;
+    await this.#takeSlot("writer", options.signal);
+    try {
       this.#check();
+      // Backpressure: frozen memtables awaiting publication past their cap, or memtables across
+      // every table past theirs, make writers wait (ruling 6). None of it needs the slot.
+      while (this.#frozenBytes() > FROZEN_MEMTABLE_CAP_BYTES) {
+        this.#scheduleFlush();
+        await this.#flushes;
+        this.#check();
+      }
+      if (this.#memtableBytes() > this.#memtableCap) await this.#relieve(0);
+      // Level-0 runs past their stall bound make writers wait for merges (merges never wait on
+      // writers, so this cannot deadlock).
+      while (this.#mergeMode === "auto" && this.#levelZeroMax() >= this.#stallRuns) {
+        this.#scheduleMerge();
+        await this.#merges;
+        this.#check();
+      }
+    } catch (error) {
+      this.#claimed = false;
+      this.#passSlot();
+      throw error;
     }
-    if (this.#memtableBytes() > this.#memtableCap) await this.#relieve(0);
-    // Level-0 runs past their stall bound make writers wait for merges (merges never wait on
-    // writers, so this cannot deadlock).
-    while (this.#mergeMode === "auto" && this.#levelZeroMax() >= this.#stallRuns) {
-      this.#scheduleMerge();
-      await this.#merges;
-      this.#check();
-    }
+    this.#claimed = false;
     const tx = new TransactionImpl(this, this.appliedLsn);
     this.#holder = tx;
     return tx;
   }
 
+  /** Waits (FIFO) until the slot is free; the caller takes it before its next await. */
+  /**
+   * Takes the slot for a writer (`claimed`, until its transaction exists) or for maintenance:
+   * at once when it is free and nobody waits, else in FIFO order. The hand-off claims the slot for
+   * the next waiter in the same step that frees it, so nothing can take it between (a writer and a
+   * recycle both holding it would deadlock: the recycle defers the writer's commit frames).
+   */
+  async #takeSlot(kind: "writer" | "maintenance", signal?: AbortSignal): Promise<void> {
+    const take = () => {
+      if (kind === "writer") this.#claimed = true;
+      else this.#maintenanceHolds = true;
+    };
+    if (!this.#slotBusy && this.#queue.length === 0) {
+      take();
+      return;
+    }
+    await new Promise<void>((resolve, reject) => {
+      const waiter = { resolve, reject, take };
+      this.#queue.push(waiter);
+      signal?.addEventListener(
+        "abort",
+        () => {
+          const index = this.#queue.indexOf(waiter);
+          if (index >= 0) {
+            this.#queue.splice(index, 1);
+            const reason: unknown = signal.reason;
+            reject(reason instanceof Error ? reason : new Error("Aborted", { cause: reason }));
+          }
+        },
+        { once: true },
+      );
+    });
+  }
+
+  /** Frees the slot and hands it to the next waiter, claimed for it in the same step. */
+  #passSlot(): void {
+    const next = this.#queue.shift();
+    if (next === undefined) return;
+    next.take();
+    next.resolve();
+  }
+
   release(tx: TransactionImpl): void {
     if (this.#holder !== tx) return;
     this.#holder = null;
-    const next = this.#queue.shift();
-    if (next !== undefined) {
-      // The next writer takes the slot as soon as it resumes.
-      this.#holder = null;
-      next.resolve();
-    }
+    this.#passSlot();
     // A frozen memtable may have waited for this writer's pending rows.
     if (this.#hasFrozen()) this.#scheduleFlush();
   }
@@ -1262,6 +1332,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
           }
         }
       }
+      if (this.#appender.end >= this.#logRecycleBytes) this.#maybeRecycle();
       const receipt = new Receipt(lsn, this.#appender);
       if (request !== null) {
         const record = () => {
@@ -1291,6 +1362,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   /** Waits until everything appended is durable and no flush can run (tests, benchmarks, close). */
   async quiesce(): Promise<void> {
     for (;;) {
+      await this.#recycling;
       await this.#appender.flush();
       await this.#flushes;
       await this.#merges;
@@ -1450,6 +1522,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#closed = true;
     this.#holder?.rollback();
     for (const waiter of this.#queue.splice(0)) waiter.reject(new WritePathClosedError());
+    await this.#recycling;
     await this.#flushes;
     // A running merge stops at its next slice and aborts its writer.
     await this.#merges;
@@ -1583,8 +1656,22 @@ export class WritePathImpl implements WritePath, EngineHooks {
         { group: GroupRef; root: GroupRoot; runs: Map<number, RunRef> }
       >();
       let nextGroupId = state.nextGroupId;
+      /** Runs of memtables without rows (a recycle flushes their tombstones). */
+      const rowless = new Map<Memtable, Map<number, RunRef>>();
       for (const memtable of set) {
-        if (memtable.rowCount === 0) continue;
+        if (memtable.rowCount === 0) {
+          const runs = new Map<number, RunRef>();
+          for (const index of def.indexes) {
+            const delta = memtable.deltas.get(index.id);
+            if (delta === undefined || delta.entryCount === 0) continue;
+            const run = encodeRun(delta.sorted(through));
+            if (run === null) continue;
+            runs.set(index.id, runRef(run, (await writer.write(run.parts)).blobs));
+          }
+          if (runs.size > 0) rowless.set(memtable, runs);
+          this.maintenance.rowlessRuns += runs.size;
+          continue;
+        }
         const groupRoot = await this.#writeGroup(writer, def, memtable);
         const rootBlob = need((await writer.write([encodeGroupRoot(groupRoot)])).blobs[0]);
         const deleted = memtable.deletedUnder(through, memtable.rowCount);
@@ -1655,8 +1742,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (this.#merging) this.maintenance.flushesDuringMerge += 1;
       const runs = new Map<number, readonly RunRef[]>();
       for (const index of def.indexes) {
-        const fresh = [...published.values()]
-          .map((entry) => entry.runs.get(index.id))
+        // One run per memtable that had entries, in memtable order (oldest first).
+        const fresh = set
+          .map(
+            (memtable) =>
+              published.get(memtable)?.runs.get(index.id) ?? rowless.get(memtable)?.get(index.id),
+          )
           .filter((run): run is RunRef => run !== undefined);
         runs.set(index.id, [...fresh.reverse(), ...(state.view.runs.get(index.id) ?? [])]);
       }
@@ -1704,8 +1795,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
       // charge went (or goes) with the drop, so the growth is refunded here.
       this.maintenance.flushes += 1;
       this.maintenance.flushBytes += writer.bytes;
-      for (const entry of published.values())
-        for (const run of entry.runs.values()) {
+      for (const runs of [
+        ...[...published.values()].map((entry) => entry.runs),
+        ...rowless.values(),
+      ])
+        for (const run of runs.values()) {
           this.maintenance.flushRunBytes += runExtent(run).length;
           this.maintenance.flushRunEntries += run.entryCount;
         }
@@ -1786,6 +1880,173 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (writing) this.#flushesWriting -= 1;
     }
     this.#scheduleMerge();
+  }
+
+  // ── Log recycling ───────────────────────────────────────────────────────────────────────
+
+  /** Starts a log recycle unless one is running (or the write path cannot run one). */
+  #maybeRecycle(): void {
+    if (this.#recycling !== null || this.#closed || this.#recovering || this.failure !== null)
+      return;
+    this.#recycling = this.#recycleLog()
+      .catch((error: unknown) => {
+        if (this.#closed) return; // a close refused its wait for the slot
+        this.#failure ??= error instanceof Error ? error : new Error(String(error));
+      })
+      .finally(() => {
+        this.#recycling = null;
+      });
+  }
+
+  /** Recycles the log now (tests); resolves when it is done or was not possible. */
+  recycleLog(): Promise<void> {
+    this.#maybeRecycle();
+    return this.#recycling ?? Promise.resolve();
+  }
+
+  /**
+   * Recycles the log (access/write-path.ts "Log recycling", DECISIONS.md difference 4):
+   * 1. takes the writer slot (no commit runs meanwhile; sequence frames keep coming);
+   * 2. fixes the cut: every later append is deferred by the appender (log.ts "Recycling"), and
+   *    everything through the cut is made durable;
+   * 3. flushes every table through the cut (rows, tombstones, folded deletions), or, for a table
+   *    with nothing in memory, only moves its checkpoint to the cut;
+   * 4. publishes a root whose global state and every table are checkpointed at the cut and which
+   *    names a new incarnation (new salt, first LSN cut + 1, its own sequence);
+   * 5. only once that publish resolved, resets the log and starts the new incarnation with the
+   *    deferred frames.
+   * A crash before 4 resolves recovers from the old root and log; after it, from the new root with
+   * an empty (or old-salt) log. An index build whose entries are not yet in runs keeps the global
+   * checkpoint below it; then the recycle gives up and the deferred frames go to the old log.
+   */
+  async #recycleLog(): Promise<void> {
+    await this.#takeSlot("maintenance");
+    if (this.#closed) {
+      this.#maintenanceHolds = false;
+      this.#passSlot();
+      return;
+    }
+    let switched = false;
+    let unlock: (() => void) | null = null;
+    let madeRoot: ManifestRoot | null = null;
+    let writer: ExtentWriter | null = null;
+    try {
+      this.#check();
+      const bytes = this.#appender.end;
+      const cut = this.#appender.beginRecycle();
+      await this.#appender.flushEncoded();
+      // Frozen memtables first (they flush in order), then every table's live memtable.
+      for (;;) {
+        this.#scheduleFlush();
+        await this.#flushes;
+        this.#check();
+        if (!this.#hasFrozen()) break;
+      }
+      const quiet = new Map<number, TableRoot>();
+      for (const state of [...this.#tables.values()]) {
+        const def = this.#catalog.table(state.tableId);
+        if (def === undefined) continue;
+        const last = state.view.memtables[state.view.memtables.length - 1];
+        const pending =
+          state.view.memtables.some(
+            (memtable) =>
+              memtable.state !== "published" &&
+              (memtable.rowCount > 0 ||
+                [...memtable.deltas.values()].some((delta) => delta.entryCount > 0) ||
+                memtable.deletions.size > 0),
+          ) ||
+          [...state.view.groupDeletes.byGroup.values()].some((positions) =>
+            [...positions.values()].some((seq) => seq > state.view.foldedThrough),
+          ) ||
+          [...state.view.groupSources.values()].some((source) =>
+            [...source.deletions.values()].some((seq) => seq > state.view.foldedThrough),
+          );
+        if (!pending) {
+          this.maintenance.recycleQuietTables += 1;
+          state.flushedThroughLsn = Math.max(state.flushedThroughLsn, cut);
+          if (state.root !== null && state.root.flushedThroughLsn < cut)
+            quiet.set(state.tableId, { ...state.root, flushedThroughLsn: cut });
+          continue;
+        }
+        if (last?.state === "live") {
+          last.state = "frozen";
+          last.measure();
+          this.#setView(state, { ...state.view });
+        }
+        this.maintenance.recycleFlushedTables += 1;
+        // On the flush chain, with whatever is still frozen when it runs.
+        const flush = this.#flushes.then(async () => {
+          const set = state.view.memtables.filter((memtable) => memtable.state === "frozen");
+          if (set.length > 0) await this.#flushTable(state, set, cut);
+        });
+        this.#flushes = flush.catch(() => undefined);
+        await flush;
+        this.#check();
+      }
+      unlock = await this.#lock();
+      // Every table must now be checkpointed at the cut (or have nothing to checkpoint), and no
+      // index build may wait for its runs; otherwise the log cannot go yet.
+      const uncovered = [...this.#tables.values()].some(
+        (state) =>
+          this.#catalog.table(state.tableId) !== undefined &&
+          !quiet.has(state.tableId) &&
+          state.flushedThroughLsn < cut,
+      );
+      if (this.#pendingIndexes.size > 0 || uncovered) {
+        this.maintenance.recyclesAbandoned += 1;
+        return;
+      }
+      for (const tableId of [...quiet.keys()]) {
+        const state = this.#tables.get(tableId);
+        if (state?.root == null || state.root.flushedThroughLsn >= cut) quiet.delete(tableId);
+        else quiet.set(tableId, { ...state.root, flushedThroughLsn: cut });
+      }
+      writer = this.#space.beginWrite("log recycle");
+      const salt = (crypto.getRandomValues(new Uint32Array(1))[0] ?? 1) >>> 0 || 1;
+      const sequence = this.#root.sequence + 1;
+      const incarnation = { salt, firstLsn: cut + 1, rootSequence: sequence };
+      const retired: ExtentRef[] = [];
+      const root = await this.#nextRoot(writer, retired, quiet, incarnation);
+      if (
+        root.globalLsn !== cut ||
+        root.tables.some((table) => table.flushedThroughLsn < cut) ||
+        root.sequence !== sequence
+      )
+        throw new RangeError("A log recycle's root does not cover the log it would reset");
+      const rootBytes = encodeManifestRoot(root);
+      const rootCharge = parseCharge(rootBytes.length);
+      this.#chargeMetadata(rootCharge);
+      this.#roots.set(root, { refs: 1, bytes: rootCharge });
+      madeRoot = root;
+      await this.#space.publish(rootBytes, { writers: [writer], retired });
+      switched = true;
+      this.#root = root;
+      this.#pruneCatalogs(root.globalLsn);
+      for (const [tableId, table] of quiet) {
+        const state = this.#tables.get(tableId);
+        if (state !== undefined) state.root = table;
+      }
+      this.#publishState();
+      // The root covering the old log is durable: only now may the log go.
+      await this.#session.resetLog();
+      this.maintenance.deferredFrames += this.#appender.deferredCount;
+      await this.#appender.finishRecycle(incarnation);
+      this.maintenance.recycles += 1;
+      this.maintenance.recycledBytes += bytes;
+    } catch (error) {
+      if (writer?.state === "open") await writer.abort().catch(() => undefined);
+      throw error;
+    } finally {
+      // Before the switch the deferred frames go to the old log; a failure after it (the reset,
+      // the new incarnation) fails the appender, so nothing waits on the deferred frames forever.
+      if (!switched) this.#appender.abandonRecycle();
+      else if (this.#appender.recycling)
+        this.#appender.failRecycle(new Error("The log reset after a recycle's publish failed"));
+      if (madeRoot !== null) this.#releaseRoot(madeRoot);
+      unlock?.();
+      this.#maintenanceHolds = false;
+      this.#passSlot();
+    }
   }
 
   // ── Merges (merge.ts) ───────────────────────────────────────────────────────────────────
@@ -2061,6 +2322,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
     writer: ExtentWriter,
     retired: ExtentRef[],
     changed: ReadonlyMap<number, TableRoot>,
+    /** A new log incarnation (a recycle's switching root). */
+    incarnation: ManifestRoot["log"] | null = null,
   ): Promise<ManifestRoot> {
     let globalLsn = Math.max(this.#root.globalLsn, this.durableLsn);
     for (const pending of this.#pendingIndexes.values()) {
@@ -2123,7 +2386,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       formatVersion: MANIFEST_FORMAT_VERSION,
       sequence: this.#root.sequence + 1,
       epoch: this.#session.epoch,
-      log: this.#root.log,
+      log: incarnation ?? this.#root.log,
       globalLsn,
       catalogVersion: catalog.version,
       catalog: catalogRef,
