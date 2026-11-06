@@ -235,6 +235,10 @@ FROM orders
 ORDER BY customer_id, placed_at DESC
 ```
 
+As in PostgreSQL, a `DISTINCT ON` query with an `ORDER BY` must start it with the `DISTINCT ON`
+expressions, in any order. `DISTINCT ON (customer_id) … ORDER BY placed_at DESC, customer_id`
+fails with "SELECT DISTINCT ON expressions must match initial ORDER BY expressions".
+
 `SELECT DISTINCT` over a grouped, aggregated, or windowed block takes the distinct rows of that
 block's output — `SELECT DISTINCT category, COUNT(*) … GROUP BY category, brand` — with `ORDER BY`
 and `LIMIT` applied to the distinct rows, as in PostgreSQL.

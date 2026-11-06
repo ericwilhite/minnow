@@ -43,6 +43,10 @@ Not yet released. The next release will name its packages here.
 b.id = a.id)` was false when no row of `b` matched. An aggregate without `GROUP BY` always
   returns one row, so the subquery is never empty, unless `LIMIT 0` or an `OFFSET` removes that
   row. `NOT EXISTS` changes the same way.
+- **`DISTINCT ON` now requires `ORDER BY` to start with its expressions**, as PostgreSQL does.
+  `SELECT DISTINCT ON (id) id, v FROM b ORDER BY v, id` used to run and keep an arbitrary row
+  per `id`. It now fails with "SELECT DISTINCT ON expressions must match initial ORDER BY
+  expressions". Put the `DISTINCT ON` expressions first in `ORDER BY` to keep the query working.
 
 No stored format changes, and no migration step is needed.
 

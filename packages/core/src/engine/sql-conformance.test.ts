@@ -2721,6 +2721,63 @@ describe("SQL conformance against SQLite and PGlite", () => {
     240_000,
   );
 
+  it("refuses exactly the DISTINCT ON orderings PostgreSQL refuses", async () => {
+    // PostgreSQL (parse_clause.c transformDistinctOnClause): once an ORDER BY item that is not a
+    // DISTINCT ON expression appears, no later item may be one, and every DISTINCT ON expression
+    // must already be covered: else 42P10, "SELECT DISTINCT ON expressions must match initial
+    // ORDER BY expressions". Expressions match after ordinal and output-alias resolution. Every
+    // key list × every ORDER BY of one to three items from the pool runs on PGlite and Minnow:
+    // both refuse, or both return the same number of rows (which row a group keeps depends on
+    // ties, its count does not).
+    const fixture = buildFixture(DEFAULT_FIXTURE_SEED);
+    const database = await minnowFixture(fixture);
+    const postgres = await pgliteOracle(fixture);
+    const keyLists = ["region", "region, active", "active, region", "LOWER(region)"];
+    const pool = ["region NULLS LAST", "active", "id", "LOWER(region) DESC", "place"];
+    const orders: string[][] = [];
+    for (const a of pool) {
+      orders.push([a]);
+      for (const b of pool.filter((item) => item !== a)) {
+        orders.push([a, b]);
+        for (const c of pool.filter((item) => item !== a && item !== b)) orders.push([a, b, c]);
+      }
+    }
+    const mismatches: string[] = [];
+    let refused = 0;
+    try {
+      for (const keys of keyLists)
+        for (const order of orders) {
+          const sql = `SELECT DISTINCT ON (${keys}) region AS place, active, id FROM data ORDER BY ${order.join(", ")}`;
+          let expected: string;
+          try {
+            expected = `rows ${String((await postgres.execute({ sql, ordered: false })).rows.length)}`;
+          } catch (error) {
+            expected = `error ${String((error as { code?: string }).code)}`;
+          }
+          let actual: string;
+          try {
+            actual = `rows ${String((await database.query(sql)).rows.length)}`;
+          } catch (error) {
+            actual = String(error).includes(
+              "SELECT DISTINCT ON expressions must match initial ORDER BY expressions",
+            )
+              ? "error 42P10"
+              : `error ${String(error)}`;
+          }
+          if (expected === "error 42P10") refused += 1;
+          if (actual !== expected)
+            mismatches.push(`${sql}\n  pglite: ${expected}\n  minnow: ${actual}`);
+        }
+    } finally {
+      await postgres.close();
+      await database.close();
+    }
+    expect(mismatches.slice(0, 10).join("\n"), `${String(mismatches.length)} differ`).toBe("");
+    // The pool must reach both outcomes, or the comparison above checks only one of them.
+    expect(refused).toBeGreaterThan(50);
+    expect(refused).toBeLessThan(keyLists.length * orders.length);
+  });
+
   it("keeps every select item when output names repeat, as both oracles do", async () => {
     // PostgreSQL and SQLite both return two columns named `c` for `SELECT a AS c, b AS c`. A
     // Minnow row is keyed by name, so each later repeat is numbered (`c_2`). Values are compared

@@ -10191,6 +10191,7 @@ class Parser {
       }
       return expression;
     };
+    assertDistinctOnLeadsOrder(distinctOn, parts.orderBy, parts.select, windowExpression);
     const outerOrderBy: CompiledQuery["orderBy"] = [];
     parts.orderBy.forEach((order, index) => {
       const expression = order.expression;
@@ -13096,6 +13097,58 @@ export function unifyPlanGroupedReferences(
     }
     return owner === undefined ? undefined : `${owner}.${reference}`;
   });
+}
+
+/**
+ * PostgreSQL's DISTINCT ON rule (parse_clause.c transformDistinctOnClause): ORDER BY must lead
+ * with the DISTINCT ON expressions. Once an ORDER BY item that is not one of them appears, no
+ * later item may be one, and every DISTINCT ON expression must already have appeared — else
+ * 42P10. A repeated ORDER BY target is dropped first. Both sides are compared after output-alias
+ * and ordinal resolution. Names are not bound
+ * to sources yet, so two columns with the same bare name count as the same expression: that can
+ * only let a mismatch through, never refuse a valid query.
+ */
+function assertDistinctOnLeadsOrder(
+  distinctOn: readonly Expression[],
+  orderBy: CompiledQuery["orderBy"],
+  select: readonly SelectItem[],
+  resolveAlias: (expression: Expression) => Expression,
+): void {
+  if (orderBy.length === 0) return;
+  const resolve = (expression: Expression): Expression => {
+    if (
+      expression.kind === "literal" &&
+      typeof expression.value === "number" &&
+      Number.isInteger(expression.value)
+    ) {
+      const item = select[expression.value - 1];
+      if (item !== undefined && item.expression.kind !== "wildcard") return item.expression;
+    }
+    return resolveAlias(expression);
+  };
+  const bare = (expression: Expression) =>
+    expression.kind === "column" ? (expression.reference.split(".").at(-1) ?? "") : undefined;
+  const same = (left: Expression, right: Expression) =>
+    encodeQueryIdentity(left) === encodeQueryIdentity(right) ||
+    (bare(left) !== undefined && bare(left) === bare(right));
+  const keys = distinctOn.map(resolve);
+  const covered: Expression[] = [];
+  const seen: Expression[] = [];
+  let skipped = false;
+  const refuse = (): never => {
+    throw new TypeError("SELECT DISTINCT ON expressions must match initial ORDER BY expressions");
+  };
+  for (const order of orderBy) {
+    const expression = resolve(order.expression);
+    // A repeated sort target is dropped from the sort list, as PostgreSQL does.
+    if (seen.some((earlier) => same(earlier, expression))) continue;
+    seen.push(expression);
+    if (keys.some((key) => same(key, expression))) {
+      if (skipped) refuse();
+      covered.push(expression);
+    } else skipped = true;
+  }
+  if (skipped && keys.some((key) => !covered.some((expression) => same(key, expression)))) refuse();
 }
 
 /**
