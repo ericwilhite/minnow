@@ -552,6 +552,25 @@ describe("public SQL queries", () => {
     expect(executeRowQuery(plan, input)).toEqual(expected);
   });
 
+  it("refuses DISTINCT ON positions over SELECT * rather than reading them as constants", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute("CREATE TABLE b (id INTEGER, v INTEGER)");
+    await database.execute("INSERT INTO b VALUES (1, 2), (1, 8), (2, 7)");
+    for (const sql of [
+      "SELECT DISTINCT ON (1) * FROM b ORDER BY 1, 2 DESC",
+      "SELECT DISTINCT ON (id) * FROM b ORDER BY 1, 2 DESC",
+    ])
+      await expect(database.query(sql), sql).rejects.toThrow(
+        "positions cannot be used with SELECT *",
+      );
+    // Names work with `*`.
+    const named = await database.query("SELECT DISTINCT ON (id) * FROM b ORDER BY id, v DESC");
+    expect(named.rows).toEqual([
+      { id: 1, v: 8 },
+      { id: 2, v: 7 },
+    ]);
+  });
+
   it("refuses a statement that names a source twice (42712), UPDATE and DELETE targets included", async () => {
     const database = new MinnowDatabase(new MemoryBlockStore());
     await database.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)");

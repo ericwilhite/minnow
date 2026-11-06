@@ -10182,10 +10182,13 @@ class Parser {
       if (
         expression.kind !== "literal" ||
         typeof expression.value !== "number" ||
-        !Number.isInteger(expression.value) ||
-        parts.select.some((item) => item.expression.kind === "wildcard")
+        !Number.isInteger(expression.value)
       )
         return expression;
+      // A position needs the select list's width, which `*` only has after schema binding; read
+      // as a constant it would be one partition (one row). Refused, as plain ORDER BY is.
+      if (parts.select.some((item) => item.expression.kind === "wildcard"))
+        throw new TypeError(`${clause} positions cannot be used with SELECT *; name the columns`);
       const item = parts.select[expression.value - 1];
       if (item === undefined)
         throw new TypeError(`${clause} position ${String(expression.value)} is not in select list`);

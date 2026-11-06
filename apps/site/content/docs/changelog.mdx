@@ -37,7 +37,8 @@ Not yet released. The next release will name its packages here.
   taking the maximum, so it returned the first matching value instead of the largest. `SUM`,
   `COUNT` and the other aggregates had the same problem, in the select list and in `WHERE`.
   An aggregate without `GROUP BY` returns one row, so `LIMIT 1` now changes nothing, and
-  `LIMIT 0` or any `OFFSET` makes the subquery empty and its value `NULL`, as in PostgreSQL.
+  `LIMIT 0` or a positive `OFFSET` makes the subquery empty and its value `NULL`, as in
+  PostgreSQL.
   `ORDER BY 1` inside such a subquery is also accepted now.
 - **`EXISTS` over a correlated aggregate is now true.** `EXISTS (SELECT max(v) FROM b WHERE
 b.id = a.id)` was false when no row of `b` matched. An aggregate without `GROUP BY` always
@@ -51,7 +52,10 @@ b.id = a.id)` was false when no row of `b` matched. An aggregate without `GROUP 
   `SELECT DISTINCT ON (1) id, v FROM b ORDER BY 1, 2 DESC` treated `1` and `2` as constants: it
   returned a single row and ignored the sort. They now mean the first and second selected
   columns, as in PostgreSQL. A position past the select list fails with "DISTINCT ON position
-  … is not in select list".
+  … is not in select list". With `SELECT *` such positions cannot be resolved yet, so
+  `SELECT DISTINCT ON (1) * …` (which returned one row) now fails with "DISTINCT ON positions
+  cannot be used with SELECT \*; name the columns", as plain `ORDER BY 1` over `SELECT *` already
+  did.
 
 - **A FROM clause that names a source twice is now an error**, as in PostgreSQL:
   `SELECT a.id FROM a a, b a` ran and read `a.id` from whichever source came first. It now fails
