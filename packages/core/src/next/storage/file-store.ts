@@ -52,7 +52,9 @@ function writeAll(file: SyncFile, bytes: Uint8Array, at: number): void {
   let done = 0;
   while (done < bytes.length) {
     const written = file.write(bytes.subarray(done), { at: at + done });
-    if (written <= 0) throw new StoreCorruptionError("Short write");
+    // A count past what was asked is no more trustworthy than none (opfs.ts, QuotaMappedFile).
+    if (written <= 0 || written > bytes.length - done)
+      throw new StoreCorruptionError(`Write reported ${String(written)} bytes`);
     done += written;
   }
 }

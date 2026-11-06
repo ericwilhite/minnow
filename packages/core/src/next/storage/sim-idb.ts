@@ -74,17 +74,43 @@ class Store {
     this.keys.splice(this.#index(key), 1);
   }
 
-  /** Numeric keys inside `range`, ascending. */
+  /** Numeric keys inside `range`, ascending (binary search for the lower bound). */
   inRange(range: IdbRange | null): number[] {
+    const { lower, upper, lowerOpen = false, upperOpen = false } = range ?? {};
     const out: number[] = [];
-    for (const key of this.keys) {
+    let at = lower === undefined ? 0 : this.#index(lower);
+    if (lowerOpen && this.keys[at] === lower) at += 1;
+    for (; at < this.keys.length; at++) {
+      const key = this.keys[at];
       if (typeof key !== "number") break;
-      const { lower, upper, lowerOpen = false, upperOpen = false } = range ?? {};
-      if (lower !== undefined && (key < lower || (lowerOpen && key === lower))) continue;
       if (upper !== undefined && (key > upper || (upperOpen && key === upper))) break;
       out.push(key);
     }
     return out;
+  }
+
+  /** The highest numeric key inside `range`, if any. */
+  lastInRange(range: IdbRange | null): number | undefined {
+    const { lower, upper, lowerOpen = false, upperOpen = false } = range ?? {};
+    let at = upper === undefined ? this.#numeric() : this.#index(upper);
+    // `at` is the first key at or above `upper` (or the end of the numbers).
+    if (upper !== undefined && !upperOpen && this.keys[at] === upper) at += 1;
+    const key = this.keys[at - 1];
+    if (typeof key !== "number") return undefined;
+    if (lower !== undefined && (key < lower || (lowerOpen && key === lower))) return undefined;
+    return key;
+  }
+
+  /** The number of numeric keys (they sort first). */
+  #numeric(): number {
+    let low = 0;
+    let high = this.keys.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (typeof this.keys[middle] === "number") low = middle + 1;
+      else high = middle;
+    }
+    return low;
   }
 }
 
@@ -305,10 +331,14 @@ class SimDatabase {
           checkRange(range);
           read(() => store.inRange(range).map((key) => store.values.get(key)), then);
         },
+        getAllKeys: (range, then) => {
+          checkRange(range);
+          read(() => store.inRange(range), then);
+        },
         last: (range, then) => {
           if (range !== null) checkRange(range);
           read(() => {
-            const key = store.inRange(range).at(-1);
+            const key = store.lastInRange(range);
             return key === undefined ? undefined : store.values.get(key);
           }, then);
         },
@@ -323,12 +353,19 @@ class SimDatabase {
           checkRange(range);
           if (mode !== "readwrite") throw named("ReadOnlyError", "The transaction is read-only");
           issue(() => {
-            for (const key of store.inRange(range)) {
-              const before = store.values.get(key);
-              undo.push(() => {
-                store.put(key, before);
-              });
-              store.delete(key);
+            // One contiguous run of keys: removed (and restored on abort) in one splice.
+            const keys = store.inRange(range);
+            const first = keys[0];
+            if (first === undefined) return;
+            const at = store.keys.indexOf(first);
+            const before = keys.map((key) => store.values.get(key));
+            undo.push(() => {
+              keys.forEach((key, index) => store.values.set(key, before[index]));
+              store.keys = [...store.keys.slice(0, at), ...keys, ...store.keys.slice(at)];
+            });
+            store.keys.splice(at, keys.length);
+            for (const key of keys) {
+              store.values.delete(key);
               ops.push({ kind: "delete", store: name, key });
             }
           });
@@ -341,9 +378,10 @@ class SimDatabase {
     activate(() => {
       body({ store: storeOf, abort: fail });
     });
-    while (state.failure === null && requests.length > 0) {
+    // A cursor, not shift(): a transaction may issue hundreds of thousands of requests.
+    for (let at = 0; state.failure === null && at < requests.length; at++) {
       await Promise.resolve();
-      const next = requests.shift();
+      const next = requests[at];
       if (next !== undefined)
         try {
           next();

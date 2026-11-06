@@ -164,19 +164,24 @@ is access's `Snapshot`.
   the store of an in-memory database and of the end-to-end suites. It has no scratch space.
 - **The OPFS backend** (`opfs.ts`: `createOpfsBackend`, `webLocks`) is the file store over real
   sync access handles: the Web Lock, then every handle with bounded retry; a lost lock closes them
-  at once; quota signals become `StoreQuotaError` by name. It passes the storage kit over
+  at once; quota signals become `StoreQuotaError` by name, as does a write the platform reports
+  short (Chromium returns a bogus count for a write the quota cuts short instead of throwing). It passes the storage kit over
   simulated handles (`opfs.test.ts`), and `browser-tests/next-storage.spec.ts` runs conformance,
   a worker killed during publish, a closed owner tab, the cross-worker fence and spill in real
   Chromium, Firefox and WebKit.
 - **The IndexedDB backend** (`indexeddb.ts` over `idb-like.ts`) is the same contract where OPFS is
-  absent: the Web Lock plus a durable epoch read inside every read-write transaction (a stale
-  owner that never heard of its lock loss, as after Safari's bfcache, changes nothing); byte
-  records of ≤ 256 KiB keyed by offset, kept disjoint, ArrayBuffers only, each with an entry in a
-  companion index store that is loaded at open, so no read or write needs a cursor (`idb-bytes.ts`:
-  Firefox's cursor read the neighbouring record's value and held bulk writes to ~6.7 MB/s; now
-  5× faster end to end); relaxed writes batched in call order
-  and committed with each barrier (publish, log flush) in one strict transaction; a malformed or
-  exhausted epoch refuses ownership; the spill store. `sim-idb.ts` simulates IndexedDB as a
+  absent: the Web Lock plus a durable epoch read inside every transaction, reads included (a stale
+  owner that never heard of its lock loss, as after Safari's bfcache, changes and reads nothing);
+  byte records of ≤ 256 KiB keyed by offset, kept disjoint, ArrayBuffers only, each with an entry
+  in a companion index store, so no read or write needs a cursor over record values
+  (`idb-bytes.ts`: Firefox's cursor read the neighbouring record's value and held bulk writes to
+  ~6.7 MB/s; now 5× faster end to end). The index is validated at open (an orphan record, an
+  entry without its record, overlap or a malformed entry is `StoreCorruptionError`) and kept in
+  memory for writes only, in blocks of ≤ 512 entries charged to an optional memory registration;
+  reads select their records from the stored index inside their own transaction and refuse a
+  missing or mismatched record. Relaxed writes are batched in call order (small log appends of one
+  batch share a record) and committed with each barrier (publish, log flush, release, truncate,
+  reset) on one commit chain; a malformed or exhausted epoch refuses ownership; the spill store. `sim-idb.ts` simulates IndexedDB as a
   checksum-chained write-ahead log on the simulated disk with IndexedDB's request order, activity
   and clone rules, so the IndexedDB backend passes the same storage kit and extent-space crash
   sweep as the files; the browser suite checks the simulator against real IndexedDB on pinned
@@ -184,9 +189,13 @@ is access's `Snapshot`.
   private browsing and a WebKit ephemeral session.
 - At scale: an opt-in Chromium run (`MINNOW_NEXT_STORAGE_HEAVY=1`, `MINNOW_NEXT_STORAGE_GIB`,
   default 4) fills OPFS with gigabytes of extents, reopens (the walk, samples, an exact audit),
-  reclaims half and refills it in place, then lowers the origin's quota over CDP: writes fail with
-  `StoreQuotaError` while the space stays up, an oversized publish fails and fails the space, and a
-  new owner recovers the last root and keeps writing. `npm run benchmark:storage` records the
+  reclaims half and refills it in place, then lowers the origin's quota over CDP: a writer fails
+  with `StoreQuotaError` while the space stays up (the same space then reads retained blobs and
+  audits exactly under the lowered quota, and writes and publishes again once there is room), an
+  oversized publish fails and fails the space, and a new owner recovers exactly the last
+  successful root (its round and every blob's coordinates and checksum; finding no root is
+  refused) and keeps writing. Chromium refuses even the first megabyte of growth under 32 MiB of
+  headroom by `estimate()`, so the run records where the refusal came rather than assuming it. `npm run benchmark:storage` records the
   storage microbench nightly (docs: reference/testing).
 - `select.ts` (`chooseBackend`) picks OPFS where a dedicated worker can open sync handles, else
   IndexedDB only on the private modes' refusals (`SecurityError`, `UnknownError`,

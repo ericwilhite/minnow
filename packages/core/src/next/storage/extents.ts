@@ -409,7 +409,10 @@ export interface SpaceStats {
     readonly pinnedBytes: number;
     readonly hits: number;
     readonly misses: number;
-    /** Platform read calls and bytes they read (gaps included). */
+    /**
+     * Store read calls (`readDataInto`, one per coalesced slab) and the bytes they read (gaps
+     * included). On OPFS each is one file read; on IndexedDB a transaction of several requests.
+     */
     readonly platformReads: number;
     readonly bytesRead: number;
   };

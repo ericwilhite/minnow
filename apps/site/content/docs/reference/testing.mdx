@@ -1100,7 +1100,8 @@ npm run benchmark:browser -- --suite=analytics --scale=large         # W5M and S
 **Storage microbench.** The nightly run also records `npm run benchmark:storage`: the rebuild
 core's storage layer (`packages/core/src/next/storage`, not yet shipped) on OPFS and on IndexedDB in
 the same profile. It times a cached `peek` and a leased cache hit, a cold read of 32 pages after
-reopening (it must be one coalesced platform read), a small write plus publish, and a log append
+reopening (it must be one coalesced store read on both backends, and one file read on OPFS; on
+IndexedDB it also counts the `get` requests), a small write plus publish, and a log append
 with and without a flush. The run prints one `STORAGE_MICROBENCH` JSON line, which the nightly
 workflow saves as `browser-perf-results/storage-microbench.json` next to the lane's results. Nothing judges them yet, and the page is not cross-origin isolated, so
 sub-millisecond numbers on Firefox are rounded to the millisecond.

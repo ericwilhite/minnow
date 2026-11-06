@@ -48,6 +48,8 @@ export interface IdbStoreLike {
   get(key: IdbKey, then: (value: unknown) => void): void;
   /** Values with numeric keys in `range`, in key order. */
   getAll(range: IdbRange, then: (values: unknown[]) => void): void;
+  /** Keys in `range`, in key order (no values are read). */
+  getAllKeys(range: IdbRange, then: (keys: IdbKey[]) => void): void;
   /** The value with the highest key in `range` (or in the store), or undefined. */
   last(range: IdbRange | null, then: (value: unknown) => void): void;
   put(key: IdbKey, value: unknown): void;
@@ -161,6 +163,10 @@ export async function openIndexedDb(factory: IDBFactory, name: string): Promise<
             getAll(range, then) {
               const request = store.getAll(keyRange(range));
               request.onsuccess = () => guarded(then)(request.result);
+            },
+            getAllKeys(range, then) {
+              const request = store.getAllKeys(keyRange(range));
+              request.onsuccess = () => guarded(then)(request.result as IdbKey[]);
             },
             last(range, then) {
               const request = store.openCursor(keyRange(range), "prev");

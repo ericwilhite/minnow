@@ -42,7 +42,7 @@ describe("IndexedDB byte space (records + in-memory index)", () => {
         }
         if (step % 10 === 9) {
           const target = new Uint8Array(space.end);
-          await db.transaction([space.name], "readonly", "relaxed", (tx) => {
+          await db.transaction([space.name, space.indexName], "readonly", "relaxed", (tx) => {
             space.read(tx, 0, target, () => undefined);
           });
           const expected = image.subarray(0, space.end);

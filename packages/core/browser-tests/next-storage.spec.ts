@@ -296,31 +296,50 @@ test.describe("rebuild core storage at scale (heavy, opt-in)", () => {
     const reclaim = report.reclaim as { filled: number; after: number };
     expect(reclaim.after).toBeLessThanOrEqual(reclaim.filled);
 
-    // Quota pressure: 32 MiB of headroom. Writes fail with StoreQuotaError; the space stays up.
+    // Quota pressure: 32 MiB of headroom by `estimate()`. Chromium refuses even the first 1 MiB
+    // of growth under it (`writtenMib` records where the refusal came), so the space must survive
+    // a refusal at once. Writers fail with StoreQuotaError; the space stays up.
     const cdp = await page.context().newCDPSession(page);
     const origin = new URL(page.url()).origin;
-    const { usage } = await page.evaluate(
-      async (url) => ((await import(url)) as Run).storageEstimate(),
-      RUN,
-    );
-    await cdp.send("Storage.overrideQuotaForOrigin", { origin, quotaSize: usage + 32 * 2 ** 20 });
+    const lowerQuota = async () => {
+      const { usage } = await page.evaluate(
+        async (url) => ((await import(url)) as Run).storageEstimate(),
+        RUN,
+      );
+      await cdp.send("Storage.overrideQuotaForOrigin", { origin, quotaSize: usage + 32 * 2 ** 20 });
+    };
+    let lastRoot: { round: number; identity: string };
+    await lowerQuota();
     try {
+      // The writer fails; the same space then reads retained blobs and audits exactly.
       report.quotaWrite = await step({ op: "heavy-quota-write", mib: 256 });
-      expect(report.quotaWrite).toEqual({ error: "StoreQuotaError", spaceFailed: null });
+      expect(report.quotaWrite).toMatchObject({
+        error: "StoreQuotaError",
+        spaceFailed: null,
+        afterAudit: null,
+      });
+      // With room again, the same space writes and publishes 4 MiB.
+      await cdp.send("Storage.overrideQuotaForOrigin", { origin });
+      report.continued = await step({ op: "heavy-continue", mib: 4 });
+      expect(report.continued).toMatchObject({ published: 1, spaceFailed: null });
       // A root too large for what is left fails inside publish: the space fails (indeterminate).
+      await lowerQuota();
       report.quotaPublish = await step({ op: "heavy-quota-publish", fillerMib: 64 });
       expect(report.quotaPublish).toMatchObject({
         error: "StoreQuotaError",
         spaceFailed: "StoreQuotaError",
       });
+      lastRoot = (report.quotaPublish as { lastRoot: typeof lastRoot }).lastRoot;
     } finally {
       await cdp.send("Storage.overrideQuotaForOrigin", { origin });
     }
 
-    // Recovery: a new process opens to an intact root, audits exactly and keeps writing.
+    // Recovery: a new process opens to exactly the last successful root (round and every blob's
+    // identity; no root at all is refused), audits exactly and keeps writing.
     await step({ op: "heavy-close" });
     await restart();
-    report.recovered = await step({ op: "heavy-open", dir });
+    report.recovered = await step({ op: "heavy-open", dir, expect: lastRoot });
+    expect(report.recovered).toMatchObject(lastRoot);
     report.after = await step({ op: "heavy-fill", mib: 64, publishEveryMib: 64 });
     await step({ op: "heavy-close" });
     await restart();
@@ -358,7 +377,11 @@ test.describe("rebuild core storage microbench (recorded nightly)", () => {
       version: page.context().browser()?.version() ?? null,
       metrics,
     };
-    expect(metrics.opfs?.coldSlabPlatformReads).toBe(1);
+    // One coalesced store read on both backends; on OPFS that is one file read.
+    expect(metrics.opfs?.coldSlabStoreReads).toBe(1);
+    expect(metrics.indexeddb?.coldSlabStoreReads).toBe(1);
+    expect(metrics.opfs?.coldSlabFileReads).toBe(1);
+    expect(metrics.indexeddb?.coldSlabIdbGets).toBeGreaterThan(0);
     await info.attach("storage-microbench", {
       body: JSON.stringify(result, null, 2),
       contentType: "application/json",

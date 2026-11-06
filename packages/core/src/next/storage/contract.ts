@@ -72,7 +72,9 @@
  * 6. **Truncate and reset are durable on resolve.** A crash during either may leave any state
  *    between the old log and the result.
  * 7. **Fencing.** Once a newer owner has acquired, every mutating call of an older session
- *    rejects with `OwnershipLostError` and changes nothing.
+ *    rejects with `OwnershipLostError` and changes nothing. Its reads may reject the same way
+ *    (OPFS closes its handles; IndexedDB checks the epoch in every read transaction), and are never
+ *    answered from a store the newer owner has rearranged.
  *
  * With an honest flush every acknowledged commit survives. With a lying flush (a write-back cache
  * lost on power failure) a cleanly truncated log loses at most the newest group, and that loss is
