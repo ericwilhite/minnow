@@ -561,9 +561,13 @@ and the owner import it directly.
 - What a request does to its transaction comes from authority: the owner's front end for a
   prepared statement (`Prepared.statementKind`), and for SQL text a classifier that follows the
   front end's lexer (`classifyStatementText`, tested against `compileStatement`); multi-statement
-  text is `unknown`. An unanswered BEGIN or unknown request is never resent and loses its
-  session, session 0 included. `SessionLostError.effect` is `none` only when "nothing took
-  effect" is proven, `unknown` otherwise.
+  text is `unknown`. A request that may open, end or change a transaction is never resendable.
+- After a reconnect every sent, unanswered request goes back unchanged, in send order, and the
+  new owner's ledger resolves it: a recorded outcome is delivered; a retry it has no outcome for
+  is refused, never run, with `SessionLostError.effect` `none` for a BEGIN, COMMIT or ROLLBACK
+  (a commit records its outcome atomically with its effect) and `unknown` otherwise. The client
+  itself decides only "never sent" (`none`). A session open at the loss, or with a BEGIN or
+  unknown request unanswered, refuses new requests until the owner confirms a ROLLBACK.
 - `close()` settles everything it interrupts: requests and cursors fail with
   `ClientClosedError`, and so does a `start()` still electing, discovering or waiting for its
   owner to be ready.
