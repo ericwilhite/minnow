@@ -72,6 +72,8 @@ import {
   type ManifestRoot,
   type RunRef,
   type TableRoot,
+  type ColumnTotals,
+  type TableStatistics,
 } from "../format/manifest.js";
 import { Replayer, type Effect } from "../format/replay.js";
 import { walkReachable } from "../format/reachable.js";
@@ -100,6 +102,9 @@ import {
   isEmptyDirectory,
   ParseBudgetError,
   parseCharge,
+  decodeTableStatistics,
+  encodeTableStatistics,
+  ManifestCorruptionError,
   writeGroupDirectory,
   type GroupPageEntry,
 } from "../format/manifest-codec.js";
@@ -278,13 +283,55 @@ function compareStat(a: StatValue, b: StatValue): number {
   return x < y ? -1 : x > y ? 1 : 0;
 }
 
-interface ColumnTotals {
-  nullCount: number;
-  min: StatValue | null;
-  max: StatValue | null;
-  unknown: boolean;
-  bytes: number;
-  values: number;
+/** A column's planning totals while they are maintained (format/manifest.ts `ColumnTotals`). */
+type Totals = { -readonly [K in keyof ColumnTotals]: ColumnTotals[K] };
+
+/** A table's totals by column id, copied before a publish changes them. */
+function cloneTotals(totals: ReadonlyMap<number, Totals> | undefined): Map<number, Totals> {
+  const out = new Map<number, Totals>();
+  for (const [id, total] of totals ?? []) out.set(id, { ...total });
+  return out;
+}
+
+/** Adds one group's chunk statistics to `totals`. */
+function addGroup(totals: Map<number, Totals>, root: GroupRoot): void {
+  for (const chunk of root.columns) {
+    let total = totals.get(chunk.columnId);
+    if (total === undefined) {
+      total = {
+        columnId: chunk.columnId,
+        nullCount: 0,
+        values: 0,
+        bytes: 0,
+        unbounded: false,
+        min: null,
+        max: null,
+      };
+      totals.set(chunk.columnId, total);
+    }
+    const statistics = chunk.statistics;
+    total.nullCount += statistics.nullCount;
+    total.values += root.rowCount - statistics.nullCount;
+    total.bytes += chunk.data.length;
+    if (statistics.min === null || statistics.max === null) {
+      if (root.rowCount > statistics.nullCount) total.unbounded = true;
+      continue;
+    }
+    if (total.min === null || compareStat(statistics.min, total.min) < 0)
+      total.min = statistics.min;
+    if (total.max === null || compareStat(statistics.max, total.max) > 0)
+      total.max = statistics.max;
+  }
+}
+
+/** The stored form of a table's totals (`TableRoot.statistics`). */
+function tableStatistics(groupCount: number, totals: ReadonlyMap<number, Totals>): TableStatistics {
+  const columns = [...totals.values()]
+    .map((total) =>
+      total.unbounded || total.values === 0 ? { ...total, min: null, max: null } : { ...total },
+    )
+    .sort((a, b) => a.columnId - b.columnId);
+  return { groupCount, columns };
 }
 
 export class WritePathImpl implements WritePath, EngineHooks {
@@ -338,7 +385,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
   /** Group roots, directory pages and indexes: decoded once, cached under the governor. */
   readonly #metadata: MetadataReader;
   readonly #metadataCaches: ReadonlyArray<BlobCache<unknown>>;
-  readonly #summaries = new Map<number, Map<number, ColumnTotals>>();
+  /** Planning totals per table (from `TableRoot.statistics` at open; updated at each flush). */
+  readonly #summaries = new Map<number, Map<number, Totals>>();
   #labels = 0;
   /** Published memtables older readers may still hold (deltas, borrowed chunks). */
   readonly #published = new Set<Memtable>();
@@ -604,11 +652,26 @@ export class WritePathImpl implements WritePath, EngineHooks {
           pages,
           metadataBytes,
         };
-        for (let position = 0; position < groups.count; position++) {
-          const held = await this.#metadata.groupRoot(groups.root(position), this.#grant);
-          this.#summarize(table.tableId, held.value);
-          held.release();
-        }
+        // Planning totals come from the table's statistics blob: one read per table, never a
+        // group root (Gate A reopen). Its parse charge stays with the table's metadata.
+        if (table.statistics !== null) {
+          const parsed = decodeTableStatistics(
+            await readBlob(this.#space, table.statistics, this.#grant),
+            this.#metadataGrant,
+          );
+          state.metadataBytes += parsed.charge;
+          if (parsed.value.groupCount !== table.groupCount)
+            throw new ManifestCorruptionError(
+              `Table ${String(table.tableId)}'s statistics cover ${String(parsed.value.groupCount)} of ${String(table.groupCount)} groups`,
+            );
+          this.#summaries.set(
+            table.tableId,
+            new Map(parsed.value.columns.map((column) => [column.columnId, { ...column }])),
+          );
+        } else if (table.groupCount > 0)
+          throw new ManifestCorruptionError(
+            `Table ${String(table.tableId)} has groups but no statistics`,
+          );
         this.#tables.set(table.tableId, state);
       }
       this.#publishState();
@@ -1425,39 +1488,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
         return {
           nullCount: total.nullCount,
           distinct: null,
-          min: total.unknown ? null : total.min,
-          max: total.unknown ? null : total.max,
+          min: total.unbounded ? null : total.min,
+          max: total.unbounded ? null : total.max,
           averageWidth: fixed ?? (total.values === 0 ? 16 : total.bytes / total.values),
         };
       },
     };
-  }
-
-  #summarize(tableId: number, root: GroupRoot): void {
-    let totals = this.#summaries.get(tableId);
-    if (totals === undefined) {
-      totals = new Map();
-      this.#summaries.set(tableId, totals);
-    }
-    for (const chunk of root.columns) {
-      let total = totals.get(chunk.columnId);
-      if (total === undefined) {
-        total = { nullCount: 0, min: null, max: null, unknown: false, bytes: 0, values: 0 };
-        totals.set(chunk.columnId, total);
-      }
-      const statistics = chunk.statistics;
-      total.nullCount += statistics.nullCount;
-      total.values += root.rowCount - statistics.nullCount;
-      total.bytes += chunk.data.length;
-      if (statistics.min === null || statistics.max === null) {
-        if (root.rowCount > statistics.nullCount) total.unknown = true;
-        continue;
-      }
-      if (total.min === null || compareStat(statistics.min, total.min) < 0)
-        total.min = statistics.min;
-      if (total.max === null || compareStat(statistics.max, total.max) > 0)
-        total.max = statistics.max;
-    }
   }
 
   stats(): WritePathStats {
@@ -1732,6 +1768,21 @@ export class WritePathImpl implements WritePath, EngineHooks {
         firstChanged,
         retired,
       );
+      // The table's planning totals with the new groups, stored with the root (`statistics`), so
+      // an open never reads group roots for them. Folded deletions do not change them (they
+      // cover stored rows).
+      const totals = cloneTotals(this.#summaries.get(state.tableId));
+      for (const entry of published.values()) addGroup(totals, entry.root);
+      let statistics: BlobRef | null = state.root?.statistics ?? null;
+      let statisticsCharge = 0;
+      if (newGroups.length > 0 || (statistics === null && groups.count > 0)) {
+        const bytes = encodeTableStatistics(tableStatistics(groups.count, totals));
+        statisticsCharge = parseCharge(bytes.length);
+        const old = statistics;
+        statistics = need((await writer.write([bytes])).blobs[0]);
+        if (old !== null) retired.push(old.extent);
+      } else if (statistics !== null && state.root !== null)
+        statisticsCharge = state.metadataBytes - pageIndexBytes(state.pages.length);
       // From here to the install, the root is built from the current state: a merge that
       // published while this flush wrote its groups has replaced runs (`state.view.runs`, not the
       // view this flush started from).
@@ -1766,14 +1817,14 @@ export class WritePathImpl implements WritePath, EngineHooks {
           .filter((index) => index.id !== def.primaryKey)
           .map((index) => indexRoot(def, index.id, runs))
           .filter((index): index is IndexRoot => index !== null),
-        statistics: null,
+        statistics,
       };
       const root = await this.#nextRoot(writer, retired, new Map([[state.tableId, tableRoot]]));
       const rootBytes = encodeManifestRoot(root);
       // The resident state this publish adds (page index growth, the new root) is charged first.
       // The pending publication owns both charges across the await (review B3-p2a-3 #3): they
       // pass to the table state and the new write state when it installs, or are refunded.
-      const metadataBytes = pageIndexBytes(pages.length);
+      const metadataBytes = pageIndexBytes(pages.length) + statisticsCharge;
       const growth = metadataBytes - state.metadataBytes;
       const rootCharge = parseCharge(rootBytes.length);
       this.#chargeMetadata(growth);
@@ -1804,8 +1855,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
           this.maintenance.flushRunEntries += run.entryCount;
         }
       const live = this.#tables.get(state.tableId) === state;
-      if (live) state.metadataBytes = metadataBytes;
-      else this.#chargeMetadata(-growth);
+      if (live) {
+        state.metadataBytes = metadataBytes;
+        this.#summaries.set(state.tableId, totals);
+      } else this.#chargeMetadata(-growth);
       // Re-point readers in the same step the publish resolves (ruling R16.3).
       const pin: SpacePin = this.#space.pin(`re-point t${String(state.tableId)}`);
       const flushed = [...set];
@@ -1827,9 +1880,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
           memtable.published = { group: entry.group, groupRoot: entry.root, runs: entry.runs, pin };
         memtable.state = "published";
         memtable.release();
-        if (entry !== undefined) {
-          this.#summarize(state.tableId, entry.root);
-        }
       }
       this.#root = root;
       this.#pruneCatalogs(root.globalLsn);

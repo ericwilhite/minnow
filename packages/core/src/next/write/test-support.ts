@@ -77,6 +77,10 @@ export class Harness {
   #release: (() => Promise<void>) | null = null;
   space!: ExtentSpace;
   path!: WritePathImpl;
+  /** Called with the extent space before the write path opens over it (tests instrument reads). */
+  onSpace: ((space: ExtentSpace) => void) | null = null;
+  /** Wall time of the last open's two phases: the extent space (its walk), then the write path. */
+  lastOpen = { spaceMs: 0, pathMs: 0 };
 
   constructor(
     readonly durability: Durability = "strict",
@@ -98,11 +102,14 @@ export class Harness {
       minimumBytes: 8 * 1024 * 1024,
       spillable: true,
     });
+    const started = performance.now();
     this.space = await openExtentSpace(session, {
       reachable: reachableExtents(),
       budget: startup,
       registerCache: (cache) => this.governor.registerCache(cache),
     });
+    const spaceDone = performance.now();
+    this.onSpace?.(this.space);
     const release = async () => {
       await this.space.close();
       startup.close();
@@ -126,6 +133,7 @@ export class Harness {
       throw error;
     }
     this.#release = release;
+    this.lastOpen = { spaceMs: spaceDone - started, pathMs: performance.now() - spaceDone };
     return this.path;
   }
 

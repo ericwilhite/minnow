@@ -90,6 +90,8 @@ for (const groups of SIZES) {
       residentBytesPerGroup: Number((resident / Math.max(1, groupCount)).toFixed(1)),
       reopenMs: Math.round(reopenMs),
       reopenCpuMs: Math.round(reopenCpu),
+      spaceOpenMs: Math.round(harness.lastOpen.spaceMs),
+      writePathOpenMs: Math.round(harness.lastOpen.pathMs),
       appendFlushCpuMs: Number(median(appendCpu).toFixed(2)),
     }),
   );

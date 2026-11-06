@@ -146,8 +146,37 @@ export interface TableRoot {
   }>;
   readonly keyIndex: IndexRoot | null;
   readonly secondaryIndexes: readonly IndexRoot[];
-  /** Mergeable table statistics (row count, distinct sketches, heavy hitters), or null. */
+  /**
+   * → `TableStatistics`: the table's planning statistics aggregated over every group in `groups`,
+   * maintained at each publish, so an open reads one blob per table instead of every group root
+   * (Gate A reopen). Null exactly when the table has no groups.
+   */
   readonly statistics: BlobRef | null;
+}
+
+/**
+ * Per-table planning statistics over the stored rows of every group (deleted rows included; sound
+ * bounds, approximate counts). One entry per column some group stores, ascending column id.
+ */
+export interface TableStatistics {
+  /** Groups summarized: the table's `groupCount` when written. */
+  readonly groupCount: number;
+  readonly columns: readonly ColumnTotals[];
+}
+
+export interface ColumnTotals {
+  readonly columnId: number;
+  /** Σ chunk null counts. */
+  readonly nullCount: number;
+  /** Σ non-null values stored. */
+  readonly values: number;
+  /** Σ chunk data bytes (average width = bytes / values). */
+  readonly bytes: number;
+  /** True when some group with values stored no bounds: `min`/`max` are then unknown. */
+  readonly unbounded: boolean;
+  /** The least and greatest bound over the groups (null when unknown or no values). */
+  readonly min: StatValue | null;
+  readonly max: StatValue | null;
 }
 
 export interface GroupRef {

@@ -12,10 +12,12 @@ import {
   decodeGroupPage,
   decodeGroupRoot,
   decodeManifestRoot,
+  decodeTableStatistics,
   encodeGroupIndex,
   encodeGroupPage,
   encodeGroupRoot,
   encodeManifestRoot,
+  encodeTableStatistics,
   GROUPS_PER_PAGE,
   MAX_ROOT_BYTES,
   ParseBudgetError,
@@ -31,6 +33,7 @@ import type {
   ManifestRoot,
   RunRef,
   TableRoot,
+  TableStatistics,
 } from "./manifest.js";
 
 const SEEDS = seedsFor("next-manifest-codecs", [0x3a9e, 0x77]);
@@ -133,6 +136,39 @@ const statistics: fc.Arbitrary<ColumnStatistics> = fc.record({
   max: statValue,
   dictionarySize: fc.option(fc.nat({ max: 65_536 }), { nil: null }),
 });
+
+const nonNullStat: fc.Arbitrary<StatValue> = fc.oneof(
+  fc.boolean(),
+  fc.double(),
+  fc.bigInt({ min: -(2n ** 200n), max: 2n ** 200n }),
+  fc.uint8Array({ maxLength: 40 }),
+);
+
+/** Table statistics: ascending distinct column ids; bounds exactly when bounded with values. */
+const tableStatistics: fc.Arbitrary<TableStatistics> = fc
+  .record({
+    groupCount: fc.nat({ max: 2 ** 40 }),
+    columns: fc.uniqueArray(
+      fc.record({
+        columnId: fc.nat({ max: 5000 }),
+        nullCount: fc.nat({ max: 2 ** 45 }),
+        values: fc.nat({ max: 2 ** 45 }),
+        bytes: fc.nat({ max: 2 ** 50 }),
+        unbounded: fc.boolean(),
+        min: nonNullStat,
+        max: nonNullStat,
+      }),
+      { selector: (column) => column.columnId, maxLength: 30 },
+    ),
+  })
+  .map(({ groupCount, columns }) => ({
+    groupCount,
+    columns: [...columns]
+      .sort((a, b) => a.columnId - b.columnId)
+      .map((column) =>
+        column.unbounded || column.values === 0 ? { ...column, min: null, max: null } : column,
+      ),
+  }));
 
 const groupRoot: fc.Arbitrary<GroupRoot> = extents
   .chain((pool) =>
@@ -399,6 +435,15 @@ describe.each(SEEDS)("manifest codecs round-trip (seed %i)", (seed) => {
     );
   });
 
+  it("table statistics", () => {
+    fc.assert(
+      fc.property(tableStatistics, (value) =>
+        roundTrip(value, encodeTableStatistics, decodeTableStatistics),
+      ),
+      { seed, numRuns: RUNS },
+    );
+  });
+
   it("manifest roots", () => {
     fc.assert(
       fc.property(manifestRoot, (root) => {
@@ -415,7 +460,11 @@ describe.each(SEEDS)("manifest codecs round-trip (seed %i)", (seed) => {
   it("refuses every damaged byte as ManifestCorruptionError or decodes a value, never crashes", () => {
     fc.assert(
       fc.property(
-        fc.oneof(groupRoot.map(encodeGroupRoot), manifestRoot.map(encodeManifestRoot)),
+        fc.oneof(
+          groupRoot.map(encodeGroupRoot),
+          manifestRoot.map(encodeManifestRoot),
+          tableStatistics.map(encodeTableStatistics),
+        ),
         (bytes) => {
           const random = mulberry32(bytes.length);
           for (let k = 0; k < Math.min(bytes.length, 200); k++) {
@@ -429,6 +478,7 @@ describe.each(SEEDS)("manifest codecs round-trip (seed %i)", (seed) => {
                 decodeManifestRoot,
                 decodeGroupPage,
                 decodeGroupIndex,
+                decodeTableStatistics,
               ]) {
                 try {
                   const parsed = decode(candidate, budget);
@@ -444,6 +494,41 @@ describe.each(SEEDS)("manifest codecs round-trip (seed %i)", (seed) => {
       ),
       { seed, numRuns: 20 },
     );
+  });
+});
+
+describe("table statistics codec", () => {
+  const column = {
+    columnId: 3,
+    nullCount: 1,
+    values: 5,
+    bytes: 40,
+    unbounded: false,
+    min: 1,
+    max: 9,
+  } as const;
+  it("refuses columns out of order and bounds that disagree with their column, at encode", () => {
+    expect(() =>
+      encodeTableStatistics({ groupCount: 1, columns: [column, { ...column, columnId: 2 }] }),
+    ).toThrow(RangeError);
+    expect(() =>
+      encodeTableStatistics({ groupCount: 1, columns: [{ ...column, unbounded: true }] }),
+    ).toThrow(RangeError);
+  });
+  it("refuses the same at decode, and a trailing byte", () => {
+    const budget = tracked();
+    const good = encodeTableStatistics({ groupCount: 1, columns: [column] });
+    // Hand-written: a bounded column with values but no bounds (tags 0, 0 for min and max).
+    const out = new ByteWriter();
+    out.u32(0x3154_534d);
+    out.u8(1);
+    for (const value of [1, 1, 3, 1, 5, 40]) out.uint(value);
+    out.u8(0);
+    out.u8(0);
+    out.u8(0);
+    for (const bytes of [out.finish(), Uint8Array.from([...good, 0])])
+      expect(() => decodeTableStatistics(bytes, budget)).toThrow(ManifestCorruptionError);
+    expect(budget.held).toBe(0);
   });
 });
 
