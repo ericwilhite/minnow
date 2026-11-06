@@ -54,6 +54,9 @@
  * `receipt.wrote` is false, `lsn` is the base LSN. The owner then settles the request without an
  * outcome (format/ledger.ts `settle`); a retry runs again, which is correct for a no-op.
  *
+ * Closing cancels in-flight staging at write boundaries and waits for its writer to settle
+ * before rolling back or releasing the memtables and grants it uses.
+ *
  * ## Ledger (ruling R9)
  * The owner admits every request (`ledger.admit`), records failures and the session-scoped
  * `statement` outcomes of statements inside an open transaction, and settles requests that changed

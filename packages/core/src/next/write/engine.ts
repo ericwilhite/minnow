@@ -2027,6 +2027,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#closed = true;
     if (this.#idleTimer !== null) clearTimeout(this.#idleTimer);
     this.#idleTimer = null;
+    // Staging owns memtables until its writer has settled. Rollback may release them.
+    await Promise.allSettled(this.#stagingRuns);
     this.#holder?.rollback();
     for (const waiter of this.#queue.splice(0)) waiter.reject(new WritePathClosedError());
     await this.#recycling;
@@ -2592,12 +2594,25 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   /** Stages `candidates` (from `admit`, the writer's own call): one publication. */
-  async #stage(candidates: ReadonlyMap<TableState, readonly Memtable[]>): Promise<void> {
+  #stagingRuns = new Set<Promise<unknown>>();
+
+  #trackStaging<T>(run: Promise<T>): Promise<T> {
+    this.#stagingRuns.add(run);
+    void run.finally(() => this.#stagingRuns.delete(run)).catch(() => undefined);
+    return run;
+  }
+
+  #stage(candidates: ReadonlyMap<TableState, readonly Memtable[]>): Promise<void> {
+    return this.#trackStaging(this.#stageNow(candidates));
+  }
+
+  async #stageNow(candidates: ReadonlyMap<TableState, readonly Memtable[]>): Promise<void> {
     const tx = need(this.#holder);
     const unlock = await this.#lock();
     try {
       this.#check();
       await this.#publishStaging(tx, candidates, false);
+      this.#check();
     } finally {
       unlock();
     }
@@ -2609,11 +2624,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
    * what each table's `publishedRows` names. The rows' only durable form is then exactly the
    * committed rows.
    */
-  async #restage(tx: TransactionImpl, id: number): Promise<Map<number, PublishedRows>> {
+  #restage(tx: TransactionImpl, id: number): Promise<Map<number, PublishedRows>> {
+    return this.#trackStaging(this.#restageNow(tx, id));
+  }
+
+  async #restageNow(tx: TransactionImpl, id: number): Promise<Map<number, PublishedRows>> {
     const unlock = await this.#lock();
     try {
       this.#check();
       await this.#publishStaging(tx, new Map(), true);
+      this.#check();
     } finally {
       unlock();
     }
@@ -2647,6 +2667,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
     if (tables.size === 0) return;
     id ??= this.#nextStagingId++;
     const writer = this.#space.beginWrite("stage");
+    const write = writer.write.bind(writer);
+    writer.write = async (...args) => {
+      this.#check();
+      const result = await write(...args);
+      this.#check();
+      return result;
+    };
     const delta = new DeltaPublication(
       "stage",
       this.#extentDeltas,
@@ -2691,11 +2718,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
             const part = need(memtable.staged);
             if (part.group.liveRowCount === memtable.rowCount) continue;
             parts.set(memtable, await this.#truncateStaged(writer, memtable, part, retired));
+            this.#check();
             rewrote = true;
             this.maintenance.stagedTruncations += 1;
           }
         for (const [part, memtable] of (adds.get(state) ?? []).entries()) {
           const written = await this.#writeStaged(writer, def, memtable, id, owned, part);
+          this.#check();
           parts.set(memtable, written.part);
           residuals.set(memtable, written.residual);
           for (const [old, map] of written.remaps) remaps.set(old, map);
@@ -2713,6 +2742,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
             groupId: k + 1,
           }));
           const written = await writeGroupDirectory(writer, refs);
+          this.#check();
           directory = [written.ref.extent, ...written.pages.map((page) => page.ref.extent)];
           entry = {
             transaction: id,
@@ -2785,7 +2815,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
         return;
       }
       const root = await this.#nextRoot(writer, retired, changed);
+      this.#check();
       await delta.prepare(root.sequence, writer, retired);
+      this.#check();
       const bytes = encodeManifestRoot(root);
       const charge = parseCharge(bytes.length);
       this.#chargeMetadata(charge);
@@ -2838,7 +2870,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const from = writer.extents.length;
     this.#stageFault?.("group", index);
     const groupRoot = await this.#writeGroup(writer, def, memtable);
+    this.#check();
     const rootBlob = need((await writer.write([encodeGroupRoot(groupRoot)])).blobs[0]);
+    this.#check();
     const first = memtable.firstRowId;
     const end = first + memtable.rowCount;
     const runs = new Map<number, RunRef[]>();
@@ -2856,7 +2890,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
         }))
         .filter((key) => key.entries.length > 0);
       const run = encodeRun(own);
-      if (run !== null) runs.set(indexId, [runRef(run, (await writer.write(run.parts)).blobs)]);
+      if (run !== null) {
+        const written = await writer.write(run.parts);
+        this.#check();
+        runs.set(indexId, [runRef(run, written.blobs)]);
+      }
       const next = memtable.newDelta();
       owned.deltas.push(next);
       const entries = new Int32Array(old.entryCount).fill(-1);
@@ -2910,6 +2948,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const live = memtable.rowCount;
     const tail = Array.from({ length: memtable.storedRows - live }, (_, k) => live + k);
     const deletions = await this.#writeBitmap(writer, memtable.storedRows, null, tail);
+    this.#check();
     const old: ExtentRef[] = [];
     if (part.group.deletions !== null) old.push(part.group.deletions.extent);
     const end = memtable.firstRowId + live;
@@ -2919,13 +2958,19 @@ export class WritePathImpl implements WritePath, EngineHooks {
       for (const run of list) {
         old.push(runExtent(run));
         const reader = await this.#runReader(run);
+        this.#check();
         const builder = new RunBuilder();
         await reader.cursor(this.#space, this.#grant, (key, rowId, tombstone) => {
           if (rowId < end) builder.add(key.slice(), rowId, tombstone);
           return false;
         });
+        this.#check();
         const encoded = builder.finish();
-        if (encoded !== null) kept.push(runRef(encoded, (await writer.write(encoded.parts)).blobs));
+        if (encoded !== null) {
+          const written = await writer.write(encoded.parts);
+          this.#check();
+          kept.push(runRef(encoded, written.blobs));
+        }
       }
       if (kept.length > 0) runs.set(indexId, kept);
     }
