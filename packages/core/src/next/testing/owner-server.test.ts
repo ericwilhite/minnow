@@ -95,14 +95,16 @@ describe("statements end to end", () => {
   it("maps engine errors onto the wire with their code and SQLSTATE", async () => {
     const { connect } = harness();
     const client = await connect();
-    await expect(client.query("SELECT fail()")).rejects.toMatchObject({
+    await expect(client.query("SELECT 1 / 0")).rejects.toMatchObject({
       name: "ExecutionError",
       code: "MINNOW_DIVISION_BY_ZERO",
       sqlState: "22012",
     });
-    await expect(client.query("SELEKT 1")).rejects.toMatchObject({
+    // The front end's own syntax error, passed through (it carries a position, no SQLSTATE yet).
+    await expect(client.query("SELEKT 1")).rejects.toMatchObject({ name: "SqlCompileError" });
+    await expect(client.query("SELECT id FROM missing")).rejects.toMatchObject({
       name: "PlanningError",
-      sqlState: "42601",
+      sqlState: "42P01",
     });
     await seed(client, 1);
     await expect(
@@ -250,7 +252,8 @@ describe("exactly-once and resends (R12, R16, R18.2)", () => {
   });
 
   it("re-runs a resent standalone nextval: at-least-once (R16.2)", async () => {
-    const { server } = harness();
+    const { server, connect } = harness();
+    await (await connect()).query("CREATE SEQUENCE s");
     const clientId = "d".repeat(32);
     const first = raw(server, clientId, 1);
     first.deliver(first.statement(1, "SELECT nextval('s')"));
@@ -295,7 +298,7 @@ describe("transaction state", () => {
     const client = await connect();
     await seed(client, 1);
     await client.query("BEGIN");
-    await expect(client.query("SELECT fail()")).rejects.toMatchObject({ sqlState: "22012" });
+    await expect(client.query("SELECT 1 / 0")).rejects.toMatchObject({ sqlState: "22012" });
     await expect(client.query("SELECT * FROM t WHERE id = $1", [1])).rejects.toBeInstanceOf(
       InFailedTransactionError,
     );
@@ -326,11 +329,11 @@ describe("transaction state", () => {
   });
 
   it("keeps a transaction with a request running past the timeout", async () => {
-    const { connect } = harness({ idleMs: 20 });
+    const { connect } = harness({ rowsPerFrame: 10, idleMs: 20 });
     const client = await connect();
     await seed(client, 40);
     await client.query("BEGIN");
-    const cursor = client.cursor("SELECT * FROM t STREAM BY 10", [], { windowBytes: 1 });
+    const cursor = client.cursor("SELECT * FROM t", [], { windowBytes: 1 });
     let taken = 0;
     for await (const frame of cursor.frames) {
       taken += frame.rowCount;
@@ -343,10 +346,10 @@ describe("transaction state", () => {
 
 describe("result windows and releases (R3)", () => {
   it("bounds the frames in flight by the window and releases them as the cursor takes them", async () => {
-    const { connect, server } = harness();
+    const { connect, server } = harness({ rowsPerFrame: 10 });
     const client = await connect();
     await seed(client, 100);
-    const cursor = client.cursor("SELECT * FROM t STREAM BY 10", [], { windowBytes: 1 });
+    const cursor = client.cursor("SELECT * FROM t", [], { windowBytes: 1 });
     await sleep(20);
     // A 1-byte window: one frame outstanding at a time.
     expect(server.stats.outstandingFrames).toBe(1);
@@ -364,11 +367,11 @@ describe("result windows and releases (R3)", () => {
   });
 
   it("sends the next frame only when the client releases one (a 1-byte window)", async () => {
-    const { connect, server } = harness();
+    const { connect, server } = harness({ rowsPerFrame: 10 });
     await seed(await connect(), 100);
     const port = raw(server);
     port.deliver(
-      port.statement(1, "SELECT * FROM t STREAM BY 10", [], {
+      port.statement(1, "SELECT * FROM t", [], {
         result: { windowBytes: 1, frameRows: null, wantRows: true },
       }),
     );
@@ -389,10 +392,10 @@ describe("result windows and releases (R3)", () => {
   });
 
   it("releases every outstanding frame when the connection ends", async () => {
-    const { connect, server, executor } = harness();
+    const { connect, server, executor } = harness({ rowsPerFrame: 10 });
     const client = await connect();
     await seed(client, 50);
-    client.cursor("SELECT * FROM t STREAM BY 10", [], { windowBytes: 1 << 20 });
+    client.cursor("SELECT * FROM t", [], { windowBytes: 1 << 20 });
     await sleep(20);
     expect(server.stats.outstandingFrames).toBeGreaterThan(0);
     expect(executor.outstandingBytes).toBeGreaterThan(0);
@@ -405,10 +408,10 @@ describe("result windows and releases (R3)", () => {
   });
 
   it("ends a cursor early with done { closedEarly }", async () => {
-    const { connect } = harness();
+    const { connect } = harness({ rowsPerFrame: 10 });
     const client = await connect();
     await seed(client, 50);
-    const cursor = client.cursor("SELECT * FROM t STREAM BY 10", [], { windowBytes: 1 });
+    const cursor = client.cursor("SELECT * FROM t", [], { windowBytes: 1 });
     const first = await cursor.frames.next();
     expect(first.done).toBe(false);
     cursor.close();
@@ -418,10 +421,10 @@ describe("result windows and releases (R3)", () => {
   });
 
   it("cancels an abandoned non-live stream", async () => {
-    const { connect, server } = harness({ abandonedStreamMs: 20 });
+    const { connect, server } = harness({ rowsPerFrame: 10, abandonedStreamMs: 20 });
     const client = await connect();
     await seed(client, 50);
-    const cursor = client.cursor("SELECT * FROM t STREAM BY 10", [], { windowBytes: 1 });
+    const cursor = client.cursor("SELECT * FROM t", [], { windowBytes: 1 });
     await sleep(80);
     expect(server.stats.outstandingFrames).toBe(0);
     await expect(async () => {

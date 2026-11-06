@@ -29,7 +29,7 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | `exec/`            | executor                         | Entry point (`executor.ts`), result frames (`result.ts`), scans (`scan.ts`, `memory-scan.ts`), table rules (`rules.ts`), push driver (`pipeline.ts`), fetcher (`fetch.ts`), expression kernels (`kernels/`), filter and project (`filter.ts`), comparators, decimal SUM                                                                                                                                                                                                                                                                                                                                                                          |
 | `ir/`              | lowering, executor               | Operator IR (`ir.ts`); scalar function and operator table (`functions.ts`); table rules in IR form (`rules.ts`); executor costs the planner reads (`costs.ts`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `access/`          | write path + key index           | Storage access contracts the write path implements: snapshots and segments, catalog, key-index probes and ranges, `modify` (rows, conflicts, RETURNING), transactions, group commit, sequences, delivery                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `testing/`         | all                              | Differential-harness adapter for a partial new core; stand-ins for the write path, executor and planner that the owner's composition runs over until those tracks land (`owner-standins.ts`), an in-memory Web Locks for election tests (`fake-locks.ts`)                                                                                                                                                                                                                                                                                                                                                                                        |
+| `testing/`         | all                              | Differential-harness adapter for a partial new core; stand-ins for the write path and executor that the owner's composition runs over, with real lowering, until those tracks land (`owner-standins.ts`), an in-memory Web Locks for election tests (`fake-locks.ts`)                                                                                                                                                                                                                                                                                                                                                                            |
 | `write/` (to come) | write path + key index           | Group commit, memtables, key index runs, maintenance (implements `access/`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `lower/`           | planner lowering                 | `Lowerer` (`lowerer.ts` contract, `create.ts`): front-end passes over the catalog, typing (`coerce.ts`, `expressions.ts`), queries, DML, DDL, table rules, result descriptors; an in-memory catalog; front-end inventory (`INVENTORY.md`)                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `owner/`           | ownership                        | Owner/client protocol (`protocol.ts`), wire payloads (re-exported from exec) and stream dictionaries (`frame.ts`), ledger routing (`outcomes.ts`), wire errors (`errors.ts`), client sequencing (`sequence.ts`), election, liveness and step-down (`election.ts`), public client API (`api.ts`), engine boundary and idle-transaction timer (`engine.ts`), planner port (`planner.ts`), the composed engine (`compose.ts`), the protocol server (`server.ts`) and client (`client.ts`), the owner worker runtime (`host.ts`), the port broker (`broker.ts`), the client-side election and lifecycle (`connector.ts`), Web Locks (`web-locks.ts`) |
@@ -550,21 +550,55 @@ and the owner import it directly.
   `CommittedWithoutResultError`, never an empty result.
 - Result frames are the executor's payloads, pulled and transferred without a copy, and charged
   until the client releases them. Dictionaries are per stream, sent as frame-level deltas.
+- A message whose buffers total less than `TRANSFER_MIN_BYTES` (1 KiB) is cloned, not
+  transferred: below it a copy is cheaper than detaching the buffers (R22.1; the latency lane
+  measures the crossover per engine). Releases ride on the client's next request, or go alone
+  after `RELEASE_DELAY_MS` (10 ms) or once half the result window is unreleased (R22.2).
+- A session with an open transaction belongs to its connection generation. After a reconnect
+  every request on it fails with `SessionLostError` in the client, unsent, until the client ends
+  the session (ROLLBACK); nothing meant for the lost transaction runs as autocommit. A COMMIT in
+  flight at the loss is resent and answered from the ledger, prepared or not.
+- What a request does to its transaction comes from authority: the owner's front end for a
+  prepared statement (`Prepared.statementKind`), and for SQL text a classifier that follows the
+  front end's lexer (`classifyStatementText`, tested against `compileStatement`); multi-statement
+  text is `unknown`. An unanswered BEGIN or unknown request is never resent and loses its
+  session, session 0 included. `SessionLostError.effect` is `none` only when "nothing took
+  effect" is proven, `unknown` otherwise.
+- `close()` settles everything it interrupts: requests and cursors fail with
+  `ClientClosedError`, and so does a `start()` still electing, discovering or waiting for its
+  owner to be ready.
 - A warm cross-tab key read has a synchronous owner path and one message each way: targets
   ≤ 0.25 ms Chromium, ≤ 0.4 ms Firefox, ≤ 0.6 ms WebKit; p95 ≤ 5 ms beside analytics.
 - Another protocol version is refused; a newer build supersedes older tabs, which reload.
 - The owner worker (`host.ts`) takes the fence, opens the engine, then steals the host lock
-  from the page that won the election, so any death of the owner frees it. The broker hands out
+  from the page that won the election, so any death of the owner frees it. After every startup
+  await it checks the fence; a stolen fence tears everything down before anything is served. The broker hands out
   a registration only while its recorded lock holder still holds the host lock. Clients watch the
   host lock while requests are in flight, and the owner watches a client's liveness lock while it
   holds that client's pins or live requests; both watches stop only after 1 s idle, so a request
-  loop pays no lock call per request.
+  loop pays no lock call per request. The client re-announces its liveness lock on every new
+  connection. The handshake is watched (an owner dying mid-handshake frees the host lock) and
+  bounded (`HANDSHAKE_TIMEOUT_MS`, 5 s); either way the connector starts over. The broker holds a
+  client's port only until the next registration of a database it asked about.
+- `freeze` (on the document) and `pagehide` terminate the owner without calling back into the
+  page: Firefox can abandon a closing page's handler midway, and the `hidden` that follows must
+  then find no live owner to flush.
+- Statements go through real lowering (`lower/`, B6): the owner caches plans by (text, catalog
+  version) and the executor's prepared plan per plan, so a warm prepared or parameterized read
+  lowers nothing. A literal per key (`WHERE id = 7`) is a new text each time: past the plan cache
+  (512) every one is lowered again (~150 µs).
 - Tests: in process (`testing/owner-*.test.ts`, the election ones on in-memory Web Locks) and
-  across real tabs in Chromium, Firefox and WebKit (`npm run test:browser:next-owner`), on the
-  stand-ins persisted in OPFS (IndexedDB where workers have no OPFS). The browser run includes the
-  cross-tab point-read latency lane: it asserts at most 4× a bare round trip to the broker in the
-  same run, and R6's absolute targets with `MINNOW_PERF_LANE=1` on a quiet host. The server's own
-  work on a warm point read is ~1.4 µs (p50, Node, `testing/owner-point-read.bench.test.ts`).
+  across real tabs in Chromium, Firefox and WebKit (`npm run test:browser:next-owner`), over real
+  lowering and the stand-in executor and write path persisted in OPFS (IndexedDB where workers
+  have no OPFS). The browser run includes the cross-tab point-read latency lane: it asserts at most
+  4× a bare round trip to the broker in the same run, and R6's absolute targets with
+  `MINNOW_PERF_LANE=1`, judged on the nightly browser-performance workflow (job `owner`) and on a
+  quiet local run (R22.3).
+- Owner-side cost of a warm prepared point read (p50, Node, `testing/owner-point-read.bench.test.ts`):
+  the server alone ~3 µs; the owner's share in the full composition (server, plan-cache hit,
+  admission, frames) ~15 µs, gated at 50 µs. The stand-in executor's key lookup scans the table
+  (~100 µs at 1,000 rows); it is reported, not gated, until B3's key index and B4's executor
+  replace it.
 
 ### IR (`ir/`)
 

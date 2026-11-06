@@ -38,16 +38,20 @@ import type { CatalogView } from "../access/catalog.js";
 import type { Statement, TableRules } from "../access/modify.js";
 import type { Snapshot } from "../access/snapshot.js";
 import type { Savepoint, WritePath, WriteTransaction } from "../access/write-path.js";
-import type {
-  Execution,
-  ExecutionSummary,
-  Executor,
-  PreparedPlan,
-  SequenceSession,
+import {
+  EXECUTOR_COSTS,
+  type Execution,
+  type ExecutionSummary,
+  type Executor,
+  type PreparedPlan,
+  type SequenceSession,
 } from "../exec/executor.js";
+import { compileTableRules } from "../exec/rules.js";
 import { ResultChannel, type ResultFrame, type ResultStream } from "../exec/result.js";
 import type { ChunkReads } from "../exec/scan.js";
+import type { ExecutorCosts } from "../ir/costs.js";
 import type { OutputColumn, PhysicalPlan } from "../ir/ir.js";
+import { statisticsDrifted, type PlanningStatistics } from "../lower/statistics.js";
 import type { MemoryGovernor } from "../memory/governor.js";
 import type { SpillService } from "../spill/contract.js";
 import { PG_EPOCH_UNIX_MICROS } from "../temporal.js";
@@ -74,17 +78,27 @@ import type { LoweredModify, LoweredStatement, StatementPlanner } from "./planne
 import type { TransactionState, WireColumnMeta, WireValue } from "./protocol.js";
 
 export interface ComposeOptions {
+  /** Lowering (lower/create.ts `createLowerer()`), or a test double of its shape. */
   readonly planner: StatementPlanner;
+  /**
+   * The planning statistics lowering costs plans with (lower/statistics.ts), read synchronously
+   * per table; the write path provides them (ruling R17.7). Default: none, so lowering plans with
+   * its defaults.
+   */
+  readonly statistics?: PlanningStatistics;
+  /** The executor's per-row costs the cost model reads; default the executor's own. */
+  readonly costs?: ExecutorCosts;
   readonly executor: Executor;
   readonly writePath: WritePath;
   readonly governor: MemoryGovernor;
   readonly spill: SpillService;
   readonly reads: ChunkReads;
   /**
-   * The executor's row rules for a table at a catalog version (exec `compileTableRules` over the
-   * planner's `lowerTableRules`); the composition passes it to every write statement.
+   * The executor's row rules for a table at a catalog version. Default: exec `compileTableRules`
+   * over the planner's `lowerTableRules`, cached per (table id, catalog version); the composition
+   * passes them to every write statement.
    */
-  readonly rules: (catalog: CatalogView, tableId: number) => TableRules;
+  readonly rules?: (catalog: CatalogView, tableId: number) => TableRules;
   /** Device clock in ms (the statement clock and the ledger's). */
   readonly now?: () => number;
   /** Plans kept per catalog version; default 512. */
@@ -223,6 +237,9 @@ class ComposedEngine implements OwnerEngine {
   readonly #options: ComposeOptions;
   readonly #now: () => number;
   readonly #plans = new Map<string, PlannedStatement>();
+  readonly #statistics: PlanningStatistics;
+  /** Compiled table rules by `tableId:catalogVersion`. */
+  readonly #rules = new Map<string, TableRules>();
   readonly #prepared = new WeakMap<PhysicalPlan, PreparedPlan>();
   readonly #commitListeners = new Set<(tables: readonly number[]) => void>();
   #queryId = 0;
@@ -231,6 +248,30 @@ class ComposedEngine implements OwnerEngine {
   constructor(options: ComposeOptions) {
     this.#options = options;
     this.#now = options.now ?? Date.now;
+    this.#statistics = options.statistics ?? { table: () => null };
+  }
+
+  /**
+   * A table's row rules at `catalog`: the composition's override, or lowering's rule expressions
+   * compiled by the executor, cached per (table id, catalog version).
+   */
+  rules(catalog: CatalogView, tableId: number): TableRules {
+    const override = this.#options.rules;
+    if (override !== undefined) return override(catalog, tableId);
+    const key = `${String(tableId)}:${String(catalog.version)}`;
+    let rules = this.#rules.get(key);
+    if (rules === undefined) {
+      const table = catalog.table(tableId);
+      if (table === undefined)
+        throw new TypeError(`Table ${String(tableId)} is not in the catalog`);
+      rules = compileTableRules(
+        table,
+        catalog.version,
+        this.#options.planner.lowerTableRules(table, catalog),
+      );
+      this.#rules.set(key, rules);
+    }
+    return rules;
   }
 
   get durability() {
@@ -265,16 +306,28 @@ class ComposedEngine implements OwnerEngine {
     return ++this.#sessionId;
   }
 
-  /** Lowers without caching: plans against uncommitted schema state (session-private). */
-  lower(text: string, catalog: CatalogView): PlannedStatement {
-    return toPlanned(this.#options.planner.lower(text, { catalog }));
+  #context(catalog: CatalogView) {
+    return { catalog, statistics: this.#statistics, costs: this.#options.costs ?? EXECUTOR_COSTS };
   }
 
+  /** Lowers without caching: plans against uncommitted schema state (session-private). */
+  lower(text: string, catalog: CatalogView): PlannedStatement {
+    return toPlanned(this.#options.planner.lower(text, this.#context(catalog)));
+  }
+
+  /**
+   * The cached plan of `text` at `catalog`'s version, re-lowered when the row counts it was
+   * costed on drifted (lower/statistics.ts `statisticsDrifted`).
+   */
   plan(text: string, catalog: CatalogView = this.#options.writePath.catalog): PlannedStatement {
     const key = `${String(catalog.version)}\u0000${text}`;
     const cached = this.#plans.get(key);
-    if (cached !== undefined) return cached;
-    const lowered = this.#options.planner.lower(text, { catalog });
+    if (
+      cached !== undefined &&
+      !("basis" in cached.lowered && statisticsDrifted(cached.lowered.basis, this.#statistics))
+    )
+      return cached;
+    const lowered = this.#options.planner.lower(text, this.#context(catalog));
     const planned = toPlanned(lowered);
     if (this.#plans.size >= (this.#options.planCacheSize ?? DEFAULT_PLAN_CACHE)) {
       const oldest = this.#plans.keys().next();
@@ -472,7 +525,7 @@ class ComposedSession implements EngineSession {
   }
 
   #rules(catalog: () => CatalogView) {
-    return (tableId: number) => this.#engine.options.rules(catalog(), tableId);
+    return (tableId: number) => this.#engine.rules(catalog(), tableId);
   }
 
   #execute(

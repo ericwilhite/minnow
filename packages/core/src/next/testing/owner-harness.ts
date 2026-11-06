@@ -11,12 +11,8 @@ import { ProtocolClient } from "../owner/client.js";
 import { composeEngine } from "../owner/compose.js";
 import { PROTOCOL_VERSION, type OwnerMessage, type WireValue } from "../owner/protocol.js";
 import { OwnerServer, type ServerPort } from "../owner/server.js";
-import {
-  StandinExecutor,
-  StandinPlanner,
-  StandinWritePath,
-  standinRules,
-} from "./owner-standins.js";
+import { createLowerer } from "../lower/create.js";
+import { StandinExecutor, StandinWritePath, withTestStatements } from "./owner-standins.js";
 
 export const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -29,6 +25,8 @@ export interface HarnessOptions {
   readonly idleMs?: number;
   readonly abandonedStreamMs?: number;
   readonly liveness?: Map<string, AbortController>;
+  /** Results of more rows stream asynchronously in frames of this many rows (window tests). */
+  readonly rowsPerFrame?: number;
 }
 
 export function harness(options: HarnessOptions = {}) {
@@ -36,8 +34,11 @@ export function harness(options: HarnessOptions = {}) {
     durability: options.durability ?? "strict",
     autoFlush: options.autoFlush ?? true,
   });
-  const executor = new StandinExecutor();
-  const planner = new StandinPlanner();
+  const executor = new StandinExecutor(
+    options.rowsPerFrame === undefined ? {} : { rowsPerFrame: options.rowsPerFrame },
+  );
+  // Lowering itself (B6, on main), plus the tests' analytic-load statement.
+  const planner = withTestStatements(createLowerer());
   const governor = new Governor(64 * 1024 * 1024);
   const engine = composeEngine({
     planner,
@@ -46,7 +47,6 @@ export function harness(options: HarnessOptions = {}) {
     governor,
     spill: new MemorySpillService(),
     reads: {} as ChunkReads,
-    rules: standinRules,
     ...(options.idleMs === undefined ? {} : { transactionIdleTimeoutMs: options.idleMs }),
   });
   const liveness = options.liveness;
@@ -190,7 +190,7 @@ export async function flushUntil<T>(writePath: StandinWritePath, promise: Promis
 }
 
 export async function seed(client: ProtocolClient, rows = 3): Promise<void> {
-  await client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
+  await client.query("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, name TEXT)");
   for (let id = 1; id <= rows; id++)
     await client.query("INSERT INTO t VALUES ($1, $2, $3)", [id, 0, `row ${String(id)}`]);
 }

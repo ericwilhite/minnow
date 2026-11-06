@@ -24,12 +24,8 @@ import { startOwnerHost, type OwnerEngineFactory, type OwnerHost } from "../owne
 import { PROTOCOL_VERSION, type StepDown } from "../owner/protocol.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
 import { FakeLockRegistry, type FakeLockContext } from "./fake-locks.js";
-import {
-  StandinExecutor,
-  StandinPlanner,
-  StandinWritePath,
-  standinRules,
-} from "./owner-standins.js";
+import { createLowerer } from "../lower/create.js";
+import { StandinExecutor, StandinWritePath, withTestStatements } from "./owner-standins.js";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -96,13 +92,12 @@ function factory(world: World): OwnerEngineFactory<{ readonly db: string }> {
         },
       });
       return composeEngine({
-        planner: new StandinPlanner(),
+        planner: withTestStatements(createLowerer()),
         executor: new StandinExecutor(),
         writePath,
         governor: new Governor(64 * 1024 * 1024),
         spill: new MemorySpillService(),
         reads: {} as ChunkReads,
-        rules: standinRules,
       });
     },
   };

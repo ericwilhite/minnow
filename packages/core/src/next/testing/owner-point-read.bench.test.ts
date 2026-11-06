@@ -1,23 +1,28 @@
 /**
- * The point-read path's owner-side cost (ruling R6: owner-side warm PK read ≤ 10 µs), measured in
- * Node over the composition with stand-in engines, so it measures what this track adds: envelope
- * check, plan-cache hit, admission, the session queue, `runNow`, settle, the reply. The stand-in
- * executor's own work is a Map lookup. The cross-tab round trip is the browser lane's (increment
- * 2); the in-process MessageChannel round trip here is reported for reference only.
+ * The point-read path's owner-side cost (ruling R6), measured in Node.
  *
- * Every read must take the synchronous path; the timing bound is loose (shared machines), the
- * printed numbers are the measurement.
+ * - **Server alone** (a stub engine whose point read costs nothing): what the protocol server adds
+ *   (envelope check, admission, the session queue, `runNow`, settle, the reply). Gated at 10 µs.
+ * - **The full composition** over real lowering and the stand-in executor and write path, split per
+ *   read into lowering, execution (the executor and what it calls), the write path (snapshot pins),
+ *   and the rest: the server plus the composition (plan-cache hit, statistics check, admission,
+ *   frames to the wire). The owner's share (the rest plus lowering) is gated at 50 µs; warm
+ *   prepared and parameterized reads must not lower at all. Execution is reported, not gated: the
+ *   stand-in has no key index (B3's is not on main), so its key lookup scans the table and its
+ *   cost is not the real executor's. R6's absolute target for the whole read is judged once B3's
+ *   write path and B4's executor replace the stand-ins.
+ * - **Literal statements** (`WHERE id = 7`, a new text per key) are reported: past the plan cache
+ *   every one is lowered again, which is what the split shows.
+ *
+ * Every read must take the synchronous path; the timing bounds are loose (shared machines), the
+ * printed numbers are the measurement. The timing wrappers add well under a µs per call.
  */
 import { describe, expect, it } from "vitest";
 import type { ChunkReads } from "../exec/scan.js";
 import { Governor } from "../memory/governor.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
-import {
-  StandinExecutor,
-  StandinPlanner,
-  StandinWritePath,
-  standinRules,
-} from "./owner-standins.js";
+import { createLowerer } from "../lower/create.js";
+import { StandinExecutor, StandinWritePath, withTestStatements } from "./owner-standins.js";
 import { ProtocolClient } from "../owner/client.js";
 import { composeEngine } from "../owner/compose.js";
 import type { EngineSession, OwnerEngine, PlannedStatement, SyncRun } from "../owner/engine.js";
@@ -32,16 +37,83 @@ function quantile(sorted: readonly number[], q: number): number {
   return sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))] ?? Number.NaN;
 }
 
+/** Time spent inside a component's calls (the outermost call only, so nesting never counts twice). */
+interface Meter {
+  ms: number;
+  calls: number;
+}
+const depth = { value: 0 };
+
+function hasMethods(value: object): boolean {
+  for (
+    let o: object | null = value;
+    o !== null && o !== Object.prototype;
+    o = Object.getPrototypeOf(o) as object | null
+  )
+    for (const key of Object.getOwnPropertyNames(o))
+      if (
+        key !== "constructor" &&
+        typeof Object.getOwnPropertyDescriptor(o, key)?.value === "function"
+      )
+        return true;
+  return false;
+}
+
+/**
+ * Wraps `target`'s methods to charge `meter`. `deep`: objects with methods that they return (a
+ * prepared plan, an execution, its result channel) are wrapped too. Data (arrays, typed arrays,
+ * maps, promises, bound parameters) is never wrapped: callers key WeakMaps by it.
+ */
+function metered<T extends object>(target: T, meter: Meter, deep: boolean): T {
+  return new Proxy(target, {
+    get(object, prop) {
+      const value: unknown = Reflect.get(object, prop, object);
+      if (typeof value !== "function") return value;
+      return (...args: unknown[]) => {
+        const outer = depth.value === 0;
+        depth.value++;
+        const start = performance.now();
+        try {
+          const result: unknown = (value as (...values: unknown[]) => unknown).apply(object, args);
+          const wrap =
+            deep &&
+            result !== null &&
+            typeof result === "object" &&
+            !(result instanceof Promise) &&
+            !Array.isArray(result) &&
+            !ArrayBuffer.isView(result) &&
+            !(result instanceof Map) &&
+            !(result instanceof Set) &&
+            hasMethods(result);
+          return wrap ? metered(result, meter, true) : result;
+        } finally {
+          depth.value--;
+          if (outer) {
+            meter.ms += performance.now() - start;
+            meter.calls++;
+          }
+        }
+      };
+    },
+  });
+}
+
 async function setup() {
+  const meters = {
+    lowering: { ms: 0, calls: 0 },
+    execution: { ms: 0, calls: 0 },
+    writePath: { ms: 0, calls: 0 },
+  };
+  const lowerer = withTestStatements(createLowerer());
   const writePath = new StandinWritePath();
+  const executor = new StandinExecutor();
   const engine = composeEngine({
-    planner: new StandinPlanner(),
-    executor: new StandinExecutor(),
-    writePath,
+    planner: metered(lowerer, meters.lowering, false),
+    executor: metered(executor, meters.execution, true),
+    writePath: metered(writePath, meters.writePath, false),
     governor: new Governor(64 * 1024 * 1024),
     spill: new MemorySpillService(),
     reads: {} as ChunkReads,
-    rules: standinRules,
   });
   const server = new OwnerServer(engine, { ownerId: "bench", epoch: 1, build: "bench" });
   const { port1, port2 } = new MessageChannel();
@@ -54,6 +126,8 @@ async function setup() {
   return {
     server,
     client,
+    meters,
+    executor,
     close: () => {
       client.close();
       port1.close();
@@ -197,28 +271,27 @@ describe("point read (R6)", () => {
     expect(quantile(times, 0.5)).toBeLessThan(10);
   }, 60_000);
 
-  it("measures the full composition over the stand-ins, and the in-process round trip", async () => {
-    const { server, client, close } = await setup();
+  it("splits the composition's point read into lowering, execution, the write path and the owner's share", async () => {
+    const { server, client, meters, executor, close } = await setup();
     const prepared = await client.prepare("SELECT * FROM t WHERE id = $1");
 
     // Owner side: a hand-driven port, messages delivered synchronously; replies released at once.
-    const replies: unknown[] = [];
+    let errors = 0;
     const port: ServerPort = {
       onmessage: null,
       postMessage: (message) => {
-        replies.push(message);
+        if ((message as { t?: string }).t === "error") errors++;
       },
     };
     server.accept(port);
     const deliver = (data: unknown) => {
       port.onmessage?.({ data } as MessageEvent);
     };
-    const clientId = "e".repeat(32);
     deliver({
       t: "hello",
       protocol: PROTOCOL_VERSION,
       build: "b",
-      clientId,
+      clientId: "e".repeat(32),
       livenessLock: "",
       previousOwnerId: null,
       generation: 1,
@@ -235,39 +308,107 @@ describe("point read (R6)", () => {
       id: 1,
       text: "SELECT * FROM t WHERE id = $1",
     });
-    void prepared;
-    const synchronousBefore = server.stats.synchronous;
-    const times: number[] = [];
     let seq = 1;
-    for (let i = 0; i < READS; i++) {
-      seq++;
-      const message = {
-        t: "statement",
-        seq,
-        sentAtMs: Date.now(),
-        resolvedThrough: seq - 1,
-        live: false,
-        resendable: true,
-        retry: false,
-        generation: 1,
-        session: 0,
-        text: null,
-        prepared: 1,
-        knownColumnsVersion: server.engine.catalogVersion,
-        params: [1 + (i % ROWS)],
-        result: { windowBytes: 1 << 20, frameRows: null, wantRows: true },
+
+    /** Runs `count` reads; returns per-read µs quantiles of each part (the warm last three quarters). */
+    const run = (count: number, form: "prepared" | "text" | "literal") => {
+      const parts = {
+        total: [] as number[],
+        lowering: [] as number[],
+        execution: [] as number[],
+        writePath: [] as number[],
+        owner: [] as number[],
       };
-      const start = performance.now();
-      deliver(message);
-      times.push((performance.now() - start) * 1000);
-      deliver({ t: "release", target: seq, through: 0 });
-      replies.length = 0;
-    }
-    expect(server.stats.synchronous - synchronousBefore).toBe(READS);
+      let lowerCalls = 0;
+      let executorPrepares = 0;
+      const synchronousBefore = server.stats.synchronous;
+      for (let i = 0; i < count; i++) {
+        seq++;
+        const key = 1 + (i % ROWS);
+        const before = {
+          lowering: meters.lowering.ms,
+          calls: meters.lowering.calls,
+          execution: meters.execution.ms,
+          writePath: meters.writePath.ms,
+          prepares: executor.prepared,
+        };
+        const message = {
+          t: "statement",
+          seq,
+          sentAtMs: Date.now(),
+          resolvedThrough: seq - 1,
+          live: false,
+          resendable: true,
+          retry: false,
+          generation: 1,
+          session: 0,
+          text:
+            form === "prepared"
+              ? null
+              : form === "text"
+                ? "SELECT * FROM t WHERE id = $1"
+                : `SELECT * FROM t WHERE id = ${String(key)}`,
+          prepared: form === "prepared" ? 1 : null,
+          knownColumnsVersion: server.engine.catalogVersion,
+          params: form === "literal" ? [] : [key],
+          result: { windowBytes: 1 << 20, frameRows: null, wantRows: true },
+        };
+        const start = performance.now();
+        deliver(message);
+        const total = (performance.now() - start) * 1000;
+        deliver({ t: "release", target: seq, through: 0 });
+        if (i < count / 4) continue;
+        const lowering = (meters.lowering.ms - before.lowering) * 1000;
+        const execution = (meters.execution.ms - before.execution) * 1000;
+        const writePath = (meters.writePath.ms - before.writePath) * 1000;
+        lowerCalls += meters.lowering.calls - before.calls;
+        executorPrepares += executor.prepared - before.prepares;
+        parts.total.push(total);
+        parts.lowering.push(lowering);
+        parts.execution.push(execution);
+        parts.writePath.push(writePath);
+        parts.owner.push(total - execution - writePath);
+      }
+      const p50 = (values: number[]) =>
+        quantile(
+          [...values].sort((a, b) => a - b),
+          0.5,
+        );
+      return {
+        synchronous: server.stats.synchronous - synchronousBefore,
+        lowerCalls,
+        executorPrepares,
+        warm: parts.total.length,
+        total: p50(parts.total),
+        p99: quantile(
+          [...parts.total].sort((a, b) => a - b),
+          0.99,
+        ),
+        lowering: p50(parts.lowering),
+        execution: p50(parts.execution),
+        writePath: p50(parts.writePath),
+        owner: p50(parts.owner),
+      };
+    };
+    const line = (name: string, r: ReturnType<typeof run>) =>
+      `${name}: p50 ${r.total.toFixed(1)} µs (p99 ${r.p99.toFixed(1)}) = owner's share ${r.owner.toFixed(1)} ` +
+      `(lowering ${r.lowering.toFixed(1)}, ${String(r.lowerCalls)} lower calls in ${String(r.warm)} warm reads) ` +
+      `+ execution ${r.execution.toFixed(1)} (stand-in, scans ${String(ROWS)} rows) + write path ${r.writePath.toFixed(1)}`;
+
+    const preparedReads = run(READS, "prepared");
+    const textReads = run(READS / 2, "text");
+    const literalReads = run(READS / 4, "literal");
+    expect(errors).toBe(0);
+    // Every prepared read takes the synchronous path; no warm read is lowered again.
+    expect(preparedReads.synchronous).toBe(READS);
+    expect(preparedReads.lowerCalls).toBe(0);
+    expect(textReads.lowerCalls).toBe(0);
+    // …and none is prepared again by the executor (the composition caches it per plan).
+    expect(preparedReads.executorPrepares).toBe(0);
+    expect(textReads.executorPrepares).toBe(0);
+    // A literal per key outgrows the plan cache: every warm read is lowered.
+    expect(literalReads.lowerCalls).toBe(literalReads.warm);
     expect(server.stats.outstandingFrames).toBe(0);
-    const warm = times.slice(READS / 4).sort((a, b) => a - b);
-    const ownerP50 = quantile(warm, 0.5);
-    const ownerP99 = quantile(warm, 0.99);
 
     // Reference: a whole request/response over an in-process MessageChannel.
     const rtt: number[] = [];
@@ -278,10 +419,15 @@ describe("point read (R6)", () => {
     }
     rtt.sort((a, b) => a - b);
     console.log(
-      `owner-side point read: p50 ${ownerP50.toFixed(1)} µs, p99 ${ownerP99.toFixed(1)} µs; ` +
-        `in-process MessageChannel round trip: p50 ${quantile(rtt, 0.5).toFixed(1)} µs, p99 ${quantile(rtt, 0.99).toFixed(1)} µs`,
+      [
+        line("prepared point read", preparedReads),
+        line("parameterized text", textReads),
+        line("literal per key", literalReads),
+        `in-process MessageChannel round trip (prepared): p50 ${quantile(rtt, 0.5).toFixed(1)} µs, p99 ${quantile(rtt, 0.99).toFixed(1)} µs`,
+      ].join("\n"),
     );
-    expect(ownerP50).toBeLessThan(50);
+    expect(preparedReads.owner).toBeLessThan(50);
+    expect(textReads.owner).toBeLessThan(50);
     close();
-  }, 60_000);
+  }, 120_000);
 });

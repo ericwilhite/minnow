@@ -45,7 +45,8 @@ describe("transaction state (findings 6, 7, 8)", () => {
     const { connect } = harness();
     const client = await connect();
     await seed(client, 1);
-    await client.query("BEGIN READ ONLY");
+    // The protocol's own read-only BEGIN: lowering does not read BEGIN READ ONLY's access mode yet.
+    await client.begin(0, true);
     await expect(client.query("UPDATE t SET n = n + 1 WHERE id = $1", [1])).rejects.toMatchObject({
       sqlState: "25006",
     });
@@ -75,7 +76,7 @@ describe("transaction state (findings 6, 7, 8)", () => {
   it("allows savepoints in a read-only transaction", async () => {
     const { connect } = harness();
     const client = await connect();
-    await client.query("BEGIN READ ONLY");
+    await client.begin(0, true);
     expect((await client.query("SAVEPOINT a")).summary.command).toBe("SAVEPOINT");
   });
 
@@ -101,7 +102,10 @@ describe("transaction state (findings 6, 7, 8)", () => {
     // Another table t reaches the same catalog version, committed, with other columns. A plan
     // made inside the rolled-back transaction must not be reused for it.
     await client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT)");
-    await client.query("INSERT INTO t VALUES ($1, $2, $3)", [1, 0, "a"]);
+    await expect(
+      client.query("INSERT INTO t VALUES ($1, $2, $3)", [1, 0, "a"]),
+    ).rejects.toMatchObject({ name: "PlanningError" });
+    await client.query("INSERT INTO t VALUES ($1, $2)", [1, 0]);
     expect(writePath.rows("t")).toEqual([[1, 0]]);
   });
 });
@@ -252,6 +256,7 @@ describe("frames and their charge (findings 9, 10, 12)", () => {
   it("answers a strict nextval only once its sequence block is durable", async () => {
     const { connect, writePath } = harness({ autoFlush: false });
     const client = await connect();
+    await flushUntil(writePath, client.query("CREATE SEQUENCE s"));
     let answered = false;
     const query = client.query("SELECT nextval('s')").then(() => {
       answered = true;
@@ -278,10 +283,10 @@ describe("frames and their charge (findings 9, 10, 12)", () => {
 
 describe("cancellation and failed commits (findings 2, 4)", () => {
   it("never runs a write cancelled while it waited behind its session", async () => {
-    const { connect, writePath } = harness();
+    const { connect, writePath } = harness({ rowsPerFrame: 1 });
     const client = await connect();
     await seed(client, 20);
-    const cursor = client.cursor("SELECT * FROM t STREAM BY 1", [], { windowBytes: 1 });
+    const cursor = client.cursor("SELECT * FROM t", [], { windowBytes: 1 });
     await sleep(10);
     const update = client.send({
       t: "statement",

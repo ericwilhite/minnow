@@ -1,22 +1,31 @@
 /**
  * Stand-ins for the tracks whose implementations have not landed, so the owner's composition
- * (owner/compose.ts) and protocol server (owner/server.ts) run end to end in Node:
+ * (owner/compose.ts) and protocol server (owner/server.ts) run end to end over **real lowering**
+ * (lower/, B6, on main):
  *
  * - `StandinWritePath` implements B3's `WritePath`: one writer slot (FIFO), transactions over a
- *   copied table state, savepoints, group commit with a controllable flush, strict/relaxed
- *   visibility, the request ledger (committed outcomes recorded once durable / applied), and
- *   sequences.
- * - `StandinExecutor` implements B4's `Executor` for the programs the stand-in planner attaches to
- *   its plans: frames through B4's real `ResultChannel` (window, releases, cancellation), the
- *   RETURNING spool (`atCommit` → `acknowledgeCommit`), synchronous completion for point reads,
- *   asynchronous streaming for `… STREAM BY n` scans.
- * - `StandinPlanner` implements the owner's planner port for a fixed SQL subset (see `lower`).
+ *   copied state, savepoints, group commit with a controllable flush, strict/relaxed visibility,
+ *   the request ledger (committed outcomes recorded once durable / applied), sequences, and a
+ *   durable state through a persistence port (OPFS or IndexedDB in the browser lane). Its catalog is
+ *   lowering's `MemoryCatalog`, replayed from the catalog changes lowering produced.
+ * - `StandinExecutor` implements B4's `Executor` by interpreting the plans lowering produces, for
+ *   the subset the owner's tests use: `values`, `scan`, `keyLookup`, `project`, `filter`, and
+ *   `modify` insert/update/delete with RETURNING; comparisons, AND/OR/NOT, IS NULL, casts,
+ *   arithmetic with PostgreSQL's errors, `nextval`/`currval`/`lastval`. Anything else is
+ *   `UnsupportedPlanError`. Frames go through B4's real `ResultChannel` (window, releases,
+ *   cancellation), with the RETURNING spool and the result grant as B4's contract states.
+ * - `withTestStatements` adds `SELECT spin($1)`, the latency lane's analytic load.
  *
  * They honour the contracts the composition depends on; they are not models of the real engines
  * (no MVCC beyond copies, no key index, no pages). Replace each with the real track as it lands.
  */
-import type { CatalogChange, CatalogView, TableDef } from "../access/catalog.js";
-import type { Statement, StatementOptions, TableRules } from "../access/modify.js";
+import {
+  CatalogChangeError,
+  type CatalogChange,
+  type CatalogView,
+  type TableDef,
+} from "../access/catalog.js";
+import type { Statement, StatementOptions } from "../access/modify.js";
 import type { Snapshot } from "../access/snapshot.js";
 import type {
   BeginOptions,
@@ -30,7 +39,12 @@ import type {
   WriteTransaction,
 } from "../access/write-path.js";
 import { TransactionStateError } from "../access/write-path.js";
-import { ExecutionError, QueryCancelledError } from "../exec/errors.js";
+import {
+  ExecutionError,
+  ParameterBindError,
+  QueryCancelledError,
+  UnsupportedPlanError,
+} from "../exec/errors.js";
 import type {
   BoundParameters,
   ExecuteRequest,
@@ -49,53 +63,89 @@ import {
 } from "../exec/result.js";
 import { RequestLedger } from "../format/ledger.js";
 import type { Grant } from "../memory/governor.js";
-import type { OutputColumn, PhysicalPlan } from "../ir/ir.js";
+import type { OutputColumn, PhysicalPlan, Rel, ScalarExpr } from "../ir/ir.js";
+import { MemoryCatalog } from "../lower/memory-catalog.js";
 import type {
-  LoweredModify,
+  LoweredQuery,
   LoweredStatement,
   PlannerContext,
   StatementPlanner,
-  WriteShape,
 } from "../owner/planner.js";
-import type { WireColumnMeta } from "../owner/protocol.js";
 import type { PhysicalType } from "../types.js";
-import type { Int64Values } from "../vector/vector.js";
+import { decodeUtf8 } from "../vector/varlen.js";
+import type { FlatVector, Int64Values } from "../vector/vector.js";
 
-type Value = number | string | bigint | null;
+type Value = boolean | number | bigint | string | null;
+/** A table row: one value per column in catalog order. */
 type Row = readonly Value[];
 
-interface TableState {
-  readonly def: TableDef;
-  /** By primary-key value. Rows are immutable; an update replaces the row. */
-  readonly rows: Map<string, Row>;
-}
-
+/**
+ * A database state: the catalog as the list of changes that built it (replayed through lowering's
+ * `MemoryCatalog`, which assigns ids as the contract says), and each table's rows by row id (the
+ * locator). Rows are immutable; an update replaces the row.
+ */
 interface State {
-  version: number;
-  nextTableId: number;
-  readonly tables: Map<number, TableState>;
+  readonly changes: CatalogChange[];
+  catalog: CatalogView;
+  readonly tables: Map<number, Map<number, Row>>;
+  nextRowId: number;
 }
 
-const cloneState = (state: State): State => ({
-  version: state.version,
-  nextTableId: state.nextTableId,
-  tables: new Map(
-    [...state.tables].map(([id, table]) => [id, { def: table.def, rows: new Map(table.rows) }]),
-  ),
+const emptyState = (): State => ({
+  changes: [],
+  catalog: new MemoryCatalog().view,
+  tables: new Map(),
+  nextRowId: 1,
 });
 
-function catalogOf(state: State): CatalogView {
-  const tables = [...state.tables.values()].map((table) => table.def);
-  return {
-    version: state.version,
-    tables,
-    sequences: [],
-    views: [],
-    table: (id) => state.tables.get(id)?.def,
-    tableByName: (name) => tables.find((table) => table.name === name),
-    sequence: () => undefined,
-  };
+const cloneState = (state: State): State => ({
+  changes: [...state.changes],
+  catalog: state.catalog,
+  tables: new Map([...state.tables].map(([id, rows]) => [id, new Map(rows)])),
+  nextRowId: state.nextRowId,
+});
+
+const catalogOf = (state: State): CatalogView => state.catalog;
+
+/** Applies one catalog change to `state`: replays the catalog with it, keeps table rows in step. */
+function applyChange(state: State, change: CatalogChange): { readonly id: number | null } {
+  const memory = new MemoryCatalog();
+  for (const earlier of state.changes) memory.apply(earlier);
+  const result = memory.apply(change);
+  state.changes.push(change);
+  state.catalog = memory.view;
+  if (change.kind === "createTable" && result.id !== null) state.tables.set(result.id, new Map());
+  if (change.kind === "dropTable") state.tables.delete(change.tableId);
+  return result;
 }
+
+/** JSON with bigints and typed arrays (catalog changes and rows carry both). */
+const encode = (value: unknown): string =>
+  JSON.stringify(value, (_key, item: unknown) => {
+    if (typeof item === "bigint") return { $bigint: String(item) };
+    if (ArrayBuffer.isView(item) && !(item instanceof DataView))
+      return {
+        $typed: item.constructor.name,
+        values: Array.from(item as unknown as ArrayLike<number | bigint>, String),
+      };
+    return item;
+  });
+
+const decode = (text: string): unknown =>
+  JSON.parse(text, (_key, item: unknown) => {
+    if (typeof item !== "object" || item === null) return item;
+    if ("$bigint" in item) return BigInt((item as { $bigint: string }).$bigint);
+    if ("$typed" in item) {
+      const { $typed, values } = item as { $typed: string; values: string[] };
+      const constructor = (
+        globalThis as unknown as Record<string, { from(v: unknown[]): unknown }>
+      )[$typed];
+      return constructor?.from(
+        values.map((value) => ($typed.startsWith("Big") ? BigInt(value) : Number(value))),
+      );
+    }
+    return item;
+  });
 
 /** A view over a copied state: what the stand-in executor reads. */
 class StandinSnapshot {
@@ -150,30 +200,16 @@ class StandinStatement {
   }
 
   changeCatalog(change: CatalogChange): { readonly id: number | null } {
-    if (change.kind !== "createTable")
-      throw new TypeError(`The stand-in supports createTable only, not ${change.kind}`);
-    const state = this.#tx.working;
-    if (catalogOf(state).tableByName(change.table.name) !== undefined)
-      throw new ExecutionError(
-        `relation "${change.table.name}" already exists`,
-        "MINNOW_DUPLICATE_TABLE",
-        "42P07",
-      );
-    const id = state.nextTableId++;
-    const def: TableDef = {
-      id,
-      name: change.table.name,
-      schemaVersion: 1,
-      columns: change.table.columns.map((column, index) => ({ ...column, id: index + 1 })),
-      primaryKey: change.table.primaryKey?.[0] ?? null,
-      indexes: [],
-      foreignKeys: [],
-      checks: [],
-    };
-    state.tables.set(id, { def, rows: new Map() });
-    state.version++;
+    let result: { readonly id: number | null };
+    try {
+      result = applyChange(this.#tx.working, change);
+    } catch (error) {
+      if (error instanceof CatalogChangeError)
+        throw new ExecutionError(error.message, "MINNOW_CATALOG_CHANGE", "42P07", { cause: error });
+      throw error;
+    }
     this.wrote++;
-    return { id };
+    return result;
   }
 
   end(): Promise<void> {
@@ -255,12 +291,9 @@ export interface StandinPersistence {
 
 interface Saved {
   readonly lsn: number;
-  readonly version: number;
-  readonly nextTableId: number;
-  readonly tables: ReadonlyArray<{
-    readonly def: TableDef;
-    readonly rows: ReadonlyArray<readonly [string, Row]>;
-  }>;
+  readonly changes: CatalogChange[];
+  readonly nextRowId: number;
+  readonly tables: ReadonlyArray<readonly [number, ReadonlyArray<readonly [number, Row]>]>;
   readonly sequences: ReadonlyArray<readonly [number, string]>;
   readonly ledger: ReturnType<RequestLedger["checkpoint"]>;
 }
@@ -283,7 +316,7 @@ export class StandinWritePath implements WritePath {
   readonly failure: Error | null = null;
   appliedLsn = 0;
   durableLsn = 0;
-  applied: State = { version: 1, nextTableId: 1, tables: new Map() };
+  applied: State = emptyState();
   /** The state readers see under strict durability: as of the last flush. */
   #durable: State = cloneState(this.applied);
   readonly #autoFlush: boolean;
@@ -315,17 +348,12 @@ export class StandinWritePath implements WritePath {
     const text = this.#persistence?.load() ?? null;
     if (text !== null && text !== "") {
       // Recovery: the durable state, sequences and committed outcomes of the last flush.
-      const saved = JSON.parse(text) as Saved;
-      this.applied = {
-        version: saved.version,
-        nextTableId: saved.nextTableId,
-        tables: new Map(
-          saved.tables.map((table) => [
-            table.def.id,
-            { def: table.def, rows: new Map(table.rows) },
-          ]),
-        ),
-      };
+      const saved = decode(text) as Saved;
+      const restored = emptyState();
+      for (const change of saved.changes) applyChange(restored, change);
+      for (const [tableId, rows] of saved.tables) restored.tables.set(tableId, new Map(rows));
+      restored.nextRowId = saved.nextRowId;
+      this.applied = restored;
       this.#durable = this.applied;
       this.appliedLsn = saved.lsn;
       this.durableLsn = saved.lsn;
@@ -338,16 +366,13 @@ export class StandinWritePath implements WritePath {
     if (this.#persistence === null) return;
     const saved: Saved = {
       lsn,
-      version: this.applied.version,
-      nextTableId: this.applied.nextTableId,
-      tables: [...this.applied.tables.values()].map((table) => ({
-        def: table.def,
-        rows: [...table.rows],
-      })),
+      changes: this.applied.changes,
+      nextRowId: this.applied.nextRowId,
+      tables: [...this.applied.tables].map(([tableId, rows]) => [tableId, [...rows]] as const),
       sequences: [...this.#sequenceValues].map(([id, value]) => [id, String(value)] as const),
       ledger: this.ledger.checkpoint(),
     };
-    return this.#persistence.save(JSON.stringify(saved));
+    return this.#persistence.save(encode(saved));
   }
 
   get catalog(): CatalogView {
@@ -537,13 +562,13 @@ export class StandinWritePath implements WritePath {
     return this.flush();
   }
 
-  /** Test helper: rows of a table by name, as committed in memory. */
+  /** Test helper: rows of a table by name, as committed in memory, in insertion order. */
   rows(table: string): Row[] {
-    const def = catalogOf(this.applied).tableByName(table);
+    const def = this.applied.catalog.tableByName(table);
     if (def === undefined) return [];
-    return [...(this.applied.tables.get(def.id)?.rows.values() ?? [])].sort(
-      (a, b) => Number(a[0]) - Number(b[0]),
-    );
+    return [...(this.applied.tables.get(def.id) ?? new Map<number, Row>())]
+      .sort(([a], [b]) => a - b)
+      .map(([, row]) => row);
   }
 }
 
@@ -616,16 +641,47 @@ function columnVector(type: PhysicalType, values: readonly Value[]): WireFlat {
     });
     return { form: "flat", length, validity, data: { layout: "varlen", bytes, offsets } };
   }
-  if (type.kind === "int64")
+  if (type.kind === "int64") {
+    // Proven safe when every value is (the client reads numbers); exact bigint otherwise.
+    const safe = values.every(
+      (value) => value === null || Number.isSafeInteger(Number(value as number | bigint)),
+    );
     return {
       form: "flat",
       length,
       validity,
       data: {
         layout: "int64",
-        values: { repr: "safe", values: Float64Array.from(values, (value) => Number(value ?? 0)) },
+        values: safe
+          ? { repr: "safe", values: Float64Array.from(values, (value) => Number(value ?? 0)) }
+          : {
+              repr: "int64",
+              values: BigInt64Array.from(values, (value) =>
+                BigInt((value as number | bigint | null) ?? 0),
+              ),
+            },
       },
     };
+  }
+  if (type.kind === "bool")
+    return {
+      form: "flat",
+      length,
+      validity,
+      data: {
+        layout: "bool",
+        values: Uint8Array.from(values, (value) => (value === true ? 1 : 0)),
+      },
+    };
+  if (type.kind === "float64")
+    return {
+      form: "flat",
+      length,
+      validity,
+      data: { layout: "f64", values: Float64Array.from(values, (value) => Number(value ?? 0)) },
+    };
+  if (type.kind !== "int32")
+    throw new UnsupportedPlanError(`${type.kind} results in the stand-in executor`);
   return {
     form: "flat",
     length,
@@ -764,11 +820,14 @@ class StandinExecution implements Execution {
       return;
     }
     this.#requiresLsn = Math.max(result.requiresLsn, view.observedLsn);
+    const by = this.program.streamBy;
+    // Results larger than a frame stream asynchronously under the window, as B4's do.
+    const streams = by !== null && result.rows.length > by;
     const summary: ExecutionSummary = {
       rowCount: this.program.kind === "modify" ? result.affected : result.rows.length,
       counts: { inserted: 0, updated: 0, deleted: 0 },
       requiresLsn: this.#requiresLsn,
-      profile: profile(this.program.streamBy === null),
+      profile: profile(!streams),
     };
     if (this.program.kind === "modify" && statement !== null) {
       statement.wrote += result.affected;
@@ -791,8 +850,8 @@ class StandinExecution implements Execution {
       void this.#spin(spin, summary, result.rows);
       return;
     }
-    if (this.program.streamBy !== null) {
-      void this.#emit(result.rows, this.program.streamBy).then(() => {
+    if (streams) {
+      void this.#emit(result.rows, by).then(() => {
         this.#executedWith(summary);
       });
       return;
@@ -898,8 +957,18 @@ class StandinExecution implements Execution {
   }
 }
 
+export interface StandinExecutorOptions {
+  /** Results of more rows than this stream asynchronously in frames of this many rows. */
+  readonly rowsPerFrame?: number;
+}
+
 export class StandinExecutor implements Executor {
   prepared = 0;
+  readonly #rowsPerFrame: number | null;
+
+  constructor(options: StandinExecutorOptions = {}) {
+    this.#rowsPerFrame = options.rowsPerFrame ?? null;
+  }
   /** Every result channel created, for frame-accounting assertions. */
   readonly channels = new Set<ResultChannel>();
   /** Called on every `acknowledgeCommit()` (completion 2), for ordering assertions. */
@@ -913,8 +982,19 @@ export class StandinExecutor implements Executor {
   }
 
   prepare(plan: PhysicalPlan): PreparedPlan {
-    const program = programs.get(plan);
-    if (program === undefined) throw new TypeError("Not a stand-in plan");
+    const program: Program = programs.get(plan) ?? {
+      kind: plan.root.op === "modify" ? "modify" : "query",
+      columns: plan.columns,
+      streamBy: this.#rowsPerFrame,
+      run: (context) =>
+        interpret(plan, {
+          params: context.params,
+          state: context.state,
+          sequences: context.sequences,
+          sequenceSession: context.sequenceSession,
+          sequenceLsn: 0,
+        }),
+    };
     this.prepared++;
     return {
       plan,
@@ -946,382 +1026,448 @@ export class StandinExecutor implements Executor {
   }
 }
 
-/** Rules are unused by the stand-ins (no CHECK, no generated columns). */
-export const standinRules = (): TableRules => ({}) as TableRules;
+// ---- the interpreter: real plans from lowering ----
 
-// ---- planner ----
+/** A row as an operator yields it: one value per output column of the relation. */
+type Tuple = Value[];
 
-const INT: PhysicalType = { kind: "int32", bits: 32 };
-const TEXT: PhysicalType = { kind: "text" };
-const BIGINT: PhysicalType = { kind: "int64" };
-
-const meta = (column: {
-  readonly name: string;
-  readonly type: PhysicalType;
-  readonly nullable: boolean;
-}): WireColumnMeta => ({
-  name: column.name,
-  type: column.type,
-  nullable: column.nullable,
-  sqlType:
-    column.type.kind === "text" ? "text" : column.type.kind === "int64" ? "bigint" : "integer",
-  render: column.type.kind === "int64" ? "bigint" : null,
-});
-
-function plan(
-  columns: readonly OutputColumn[],
-  placeholders: number,
-  version: number,
-  program: Omit<Program, "columns">,
-): PhysicalPlan {
-  const physical = {
-    root: { id: 0, op: "values", rows: [], output: columns },
-    columns,
-    parameters: Array.from({ length: placeholders }, () => INT),
-    placeholderCount: placeholders,
-    clockSlot: null,
-    initPlans: [],
-    catalogVersion: version,
-    volatile: false,
-  } as unknown as PhysicalPlan;
-  programs.set(physical, { ...program, columns });
-  return physical;
+interface Context {
+  readonly params: readonly ParameterValue[];
+  readonly state: State;
+  readonly sequences: SequenceAccess | null;
+  readonly sequenceSession: ExecuteRequest["sequenceSession"];
+  /** The largest sequence-block LSN drawn from (the delivery rule). */
+  sequenceLsn: number;
 }
 
-function coerce(type: PhysicalType, value: ParameterValue): Value {
+const INT32_MIN = -2147483648;
+const INT32_MAX = 2147483647;
+
+function literalValue(vector: FlatVector): Value {
+  if (vector.validity !== null && ((vector.validity[0] ?? 0) & 1) === 0) return null;
+  const data = vector.data;
+  switch (data.layout) {
+    case "bool":
+      return data.values[0] === 1;
+    case "i32":
+    case "f64":
+    case "f32":
+      return data.values[0] ?? null;
+    case "int64":
+      return data.values.repr === "safe"
+        ? BigInt(data.values.values[0] ?? 0)
+        : (data.values.values[0] ?? null);
+    case "varlen":
+      return decodeUtf8(data, 0);
+    default:
+      throw new UnsupportedPlanError(`a ${data.layout} literal in the stand-in executor`);
+  }
+}
+
+/** A client value bound to a slot of `type` (exec `ParameterValue` rules, the subset used). */
+function bindValue(type: PhysicalType, value: ParameterValue, slot: number): Value {
   if (value === null) return null;
-  if (type.kind === "text") return String(value);
-  if (type.kind === "int64") return typeof value === "bigint" ? Number(value) : Number(value);
-  if (typeof value !== "number" || !Number.isInteger(value))
-    throw new ExecutionError(
-      `invalid input for integer: ${String(value)}`,
-      "MINNOW_PARAMETER_BIND",
-      "22P02",
-    );
+  const fail = (): never => {
+    throw new ParameterBindError(`Parameter $${String(slot + 1)} does not fit ${type.kind}`, slot);
+  };
+  switch (type.kind) {
+    case "int32": {
+      const number = typeof value === "bigint" ? Number(value) : value;
+      if (typeof number !== "number" || !Number.isInteger(number)) return fail();
+      if (number < INT32_MIN || number > INT32_MAX) return fail();
+      return number;
+    }
+    case "int64":
+      if (typeof value === "bigint") return value;
+      if (typeof value === "number" && Number.isSafeInteger(value)) return BigInt(value);
+      return fail();
+    case "float64":
+    case "float32":
+      return typeof value === "number" ? value : fail();
+    case "bool":
+      return typeof value === "boolean" ? value : fail();
+    case "text":
+      return typeof value === "string" ? value : fail();
+    default:
+      throw new UnsupportedPlanError(`a ${type.kind} parameter in the stand-in executor`);
+  }
+}
+
+function checkInt32(value: number): number {
+  if (!Number.isInteger(value) || value < INT32_MIN || value > INT32_MAX)
+    throw new ExecutionError("integer out of range", "MINNOW_NUMERIC_OUT_OF_RANGE", "22003");
   return value;
 }
 
-const tableOf = (state: State, name: string): TableState => {
-  const def = catalogOf(state).tableByName(name);
-  const table = def === undefined ? undefined : state.tables.get(def.id);
-  if (table === undefined)
-    throw new ExecutionError(
-      `relation "${name}" does not exist`,
-      "MINNOW_UNDEFINED_TABLE",
-      "42P01",
-    );
-  return table;
-};
+function arithmetic(fn: string, type: PhysicalType, left: Value, right: Value): Value {
+  if (left === null || right === null) return null;
+  if (type.kind === "int64") {
+    const a = BigInt(left);
+    const b = BigInt(right);
+    if ((fn === "div" || fn === "mod") && b === 0n)
+      throw new ExecutionError("division by zero", "MINNOW_DIVISION_BY_ZERO", "22012");
+    return fn === "add"
+      ? a + b
+      : fn === "sub"
+        ? a - b
+        : fn === "mul"
+          ? a * b
+          : fn === "div"
+            ? a / b
+            : a % b;
+  }
+  const a = Number(left);
+  const b = Number(right);
+  if ((fn === "div" || fn === "mod") && b === 0 && type.kind === "int32")
+    throw new ExecutionError("division by zero", "MINNOW_DIVISION_BY_ZERO", "22012");
+  const result =
+    fn === "add"
+      ? a + b
+      : fn === "sub"
+        ? a - b
+        : fn === "mul"
+          ? a * b
+          : fn === "div"
+            ? type.kind === "int32"
+              ? Math.trunc(a / b)
+              : a / b
+            : a % b;
+  return type.kind === "int32" ? checkInt32(result) : result;
+}
 
-export class PlanningError extends Error {
-  readonly code = "MINNOW_SYNTAX";
-  readonly sqlState = "42601";
-  constructor(message: string) {
-    super(message);
-    this.name = "PlanningError";
+function compareValues(left: Value, right: Value): number {
+  if (typeof left === "string" && typeof right === "string")
+    return left < right ? -1 : left > right ? 1 : 0;
+  const a =
+    typeof left === "bigint" || typeof right === "bigint" ? BigInt(left as number) : Number(left);
+  const b =
+    typeof left === "bigint" || typeof right === "bigint" ? BigInt(right as number) : Number(right);
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function evaluate(expr: ScalarExpr, row: Tuple, context: Context): Value {
+  switch (expr.op) {
+    case "column":
+      return row[expr.index] ?? null;
+    case "literal":
+      return literalValue(expr.value);
+    case "param":
+      return bindValue(expr.type, context.params[expr.slot] ?? null, expr.slot);
+    case "cast": {
+      const value = evaluate(expr.input, row, context);
+      if (value === null) return null;
+      switch (expr.type.kind) {
+        case "int32":
+          return checkInt32(Number(value));
+        case "int64":
+          return BigInt(value);
+        case "float64":
+        case "float32":
+          return Number(value);
+        case "text":
+          return String(value);
+        case "bool":
+          return Boolean(value);
+        default:
+          throw new UnsupportedPlanError(`a cast to ${expr.type.kind} in the stand-in executor`);
+      }
+    }
+    case "compare": {
+      const left = evaluate(expr.left, row, context);
+      const right = evaluate(expr.right, row, context);
+      if (left === null || right === null) return null;
+      const order = compareValues(left, right);
+      switch (expr.cmp) {
+        case "=":
+          return order === 0;
+        case "<>":
+          return order !== 0;
+        case "<":
+          return order < 0;
+        case "<=":
+          return order <= 0;
+        case ">":
+          return order > 0;
+        case ">=":
+          return order >= 0;
+      }
+    }
+    // falls through (unreachable: every comparison returns)
+    case "and":
+    case "or": {
+      let unknown = false;
+      for (const arg of expr.args) {
+        const value = evaluate(arg, row, context);
+        if (value === null) unknown = true;
+        else if (value === (expr.op === "or")) return value;
+      }
+      return unknown ? null : expr.op === "and";
+    }
+    case "not": {
+      const value = evaluate(expr.arg, row, context);
+      return value === null ? null : !value;
+    }
+    case "isNull": {
+      const isNull = evaluate(expr.arg, row, context) === null;
+      return expr.negated ? !isNull : isNull;
+    }
+    case "call":
+      return call(
+        expr.fn,
+        expr.type,
+        expr.args.map((arg) => evaluate(arg, row, context)),
+        context,
+      );
+    default:
+      throw new UnsupportedPlanError(`${expr.op} in the stand-in executor`);
   }
 }
 
-/**
- * The SQL the stand-in plans (case-insensitive, one statement):
- * `CREATE TABLE t (k INT PRIMARY KEY, c INT|TEXT|BIGINT, …)`; `SELECT spin($1)` (an analytic load of
- * $1 ms, yielding every 4 ms); `SELECT * FROM t WHERE k = $1`
- * (point read); `SELECT * FROM t [STREAM BY n]`; `SELECT nextval('s')`; `SELECT fail()` (a 22012
- * error); `INSERT INTO t VALUES ($1, …) [RETURNING *]`; `UPDATE t SET c = c + 1 WHERE k = $1
- * [RETURNING *]`; `DELETE FROM t WHERE k = $1`; BEGIN [READ ONLY], START TRANSACTION, COMMIT,
- * END, ROLLBACK, SAVEPOINT x, ROLLBACK TO x, RELEASE x; SHOW x; SET x = y.
- */
-export class StandinPlanner implements StatementPlanner {
-  lowered = 0;
-
-  lower(text: string, context: PlannerContext): LoweredStatement {
-    this.lowered++;
-    const catalog = context.catalog;
-    const sql = text.trim().replace(/;$/u, "").trim();
-    const base = {
-      text,
-      catalogVersion: catalog.version,
-      controlsTransaction: false,
-      parameters: [] as PhysicalType[],
-    };
-    let match: RegExpExecArray | null;
-
-    const control = (
-      action: "begin" | "commit" | "rollback" | "savepoint" | "rollbackTo" | "release",
-      command: string,
-      savepoint: string | null = null,
-      readOnly = false,
-    ): LoweredStatement => ({
-      ...base,
-      kind: "transactionControl",
-      command,
-      controlsTransaction: true,
-      action,
-      savepoint,
-      readOnly,
-    });
-    if (/^(BEGIN|START TRANSACTION)( READ ONLY)?$/iu.test(sql))
-      return control("begin", "BEGIN", null, /READ ONLY/iu.test(sql));
-    if (/^(COMMIT|END)$/iu.test(sql)) return control("commit", "COMMIT");
-    if (/^(ROLLBACK|ABORT)$/iu.test(sql)) return control("rollback", "ROLLBACK");
-    if ((match = /^SAVEPOINT (\w+)$/iu.exec(sql)) !== null)
-      return control("savepoint", "SAVEPOINT", match[1] ?? "");
-    if ((match = /^ROLLBACK TO (?:SAVEPOINT )?(\w+)$/iu.exec(sql)) !== null)
-      return control("rollbackTo", "ROLLBACK", match[1] ?? "");
-    if ((match = /^RELEASE (?:SAVEPOINT )?(\w+)$/iu.exec(sql)) !== null)
-      return control("release", "RELEASE", match[1] ?? "");
-    if ((match = /^SHOW (\w+)$/iu.exec(sql)) !== null)
-      return {
-        ...base,
-        kind: "utility",
-        command: "SHOW",
-        show: { column: meta({ name: match[1] ?? "", type: TEXT, nullable: false }), value: "UTC" },
-      };
-    if (/^SET /iu.test(sql)) return { ...base, kind: "utility", command: "SET", show: null };
-
-    if ((match = /^CREATE TABLE (\w+) \((.+)\)$/iu.exec(sql)) !== null) {
-      const columns = (match[2] ?? "").split(",").map((part) => part.trim().split(/\s+/u));
-      const primary = columns.findIndex((part) => /PRIMARY/iu.test(part.join(" ")));
-      return {
-        ...base,
-        kind: "ddl",
-        command: "CREATE TABLE",
-        followUp: null,
-        change:
-          catalog.tableByName(match[1] ?? "") !== undefined
-            ? null
-            : {
-                kind: "createTable",
-                table: {
-                  name: match[1] ?? "",
-                  columns: columns.map((part) => ({
-                    name: part[0] ?? "",
-                    type: /TEXT/iu.test(part[1] ?? "")
-                      ? TEXT
-                      : /BIGINT/iu.test(part[1] ?? "")
-                        ? BIGINT
-                        : INT,
-                    declared: {
-                      type: "number",
-                      declaredTypeName: part[1] ?? "",
-                    } as unknown as TableDef["columns"][number]["declared"],
-                    nullable: !/PRIMARY/iu.test(part.join(" ")),
-                    defaultSql: null,
-                    generatedSql: null,
-                    identitySequence: null,
-                    missing: null,
-                  })),
-                  primaryKey: primary < 0 ? null : [primary],
-                  unique: [],
-                  foreignKeys: [],
-                  checks: [],
-                },
-              },
-      };
+function call(fn: string, type: PhysicalType, args: readonly Value[], context: Context): Value {
+  switch (fn) {
+    case "add":
+    case "sub":
+    case "mul":
+    case "div":
+    case "mod":
+      return arithmetic(fn, type, args[0] ?? null, args[1] ?? null);
+    case "neg": {
+      const value = args[0] ?? null;
+      if (value === null) return null;
+      return typeof value === "bigint"
+        ? -value
+        : type.kind === "int32"
+          ? checkInt32(-Number(value))
+          : -Number(value);
     }
-
-    if (/^SELECT fail\(\)$/iu.test(sql)) {
-      const columns = [{ name: "fail", type: INT, nullable: true }];
-      return {
-        ...base,
-        kind: "query",
-        command: "SELECT",
-        reads: [],
-        pointRead: false,
-        columns: columns.map(meta),
-        plan: plan(columns, 0, catalog.version, {
-          kind: "query",
-          streamBy: null,
-          run: () => {
-            throw new ExecutionError("division by zero", "MINNOW_DIVISION_BY_ZERO", "22012");
-          },
-        }),
-      };
+    case "nextval": {
+      const id = Number(args[0]);
+      const out: Int64Values = { repr: "int64", values: new BigInt64Array(1) };
+      const lsn = context.sequences?.next(id, 1, out, 0) ?? 0;
+      context.sequenceLsn = Math.max(context.sequenceLsn, lsn);
+      const value = out.values[0] ?? 0n;
+      context.sequenceSession?.record(id, value);
+      return value;
     }
+    case "currval":
+      return context.sequenceSession?.current(Number(args[0])) ?? null;
+    case "lastval":
+      return context.sequenceSession?.last() ?? null;
+    default:
+      throw new UnsupportedPlanError(`the function ${fn} in the stand-in executor`);
+  }
+}
 
-    if (/^SELECT spin\(\$1\)$/iu.test(sql)) {
-      const columns = [{ name: "spin", type: INT, nullable: false }];
-      return {
-        ...base,
-        kind: "query",
-        command: "SELECT",
-        parameters: [INT],
-        reads: [],
-        pointRead: false,
-        columns: columns.map(meta),
-        plan: plan(columns, 1, catalog.version, {
-          kind: "query",
-          streamBy: null,
-          spinMs: (params) => Number(params[0] ?? 0),
-          run: () => ({ rows: [[1]], affected: 0, requiresLsn: 0 }),
-        }),
-      };
+const columnIndex = (table: TableDef, columnId: number): number => {
+  const index = table.columns.findIndex((column) => column.id === columnId);
+  if (index < 0) throw new TypeError(`Column ${String(columnId)} is not in table ${table.name}`);
+  return index;
+};
+
+function tableOf(context: Context, tableId: number): { def: TableDef; rows: Map<number, Row> } {
+  const def = context.state.catalog.table(tableId);
+  const rows = context.state.tables.get(tableId);
+  if (def === undefined || rows === undefined)
+    throw new ExecutionError(
+      `relation ${String(tableId)} does not exist`,
+      "MINNOW_UNDEFINED_TABLE",
+      "42P01",
+    );
+  return { def, rows };
+}
+
+/** The rows of a relation (no pipelines: the stand-in materializes). */
+function rowsOf(rel: Rel, context: Context): Tuple[] {
+  switch (rel.op) {
+    case "values":
+      return rel.rows.map((exprs) => exprs.map((expr) => evaluate(expr, [], context)));
+    case "project":
+      return rowsOf(rel.input, context).map((row) =>
+        rel.exprs.map((expr) => evaluate(expr, row, context)),
+      );
+    case "filter":
+      return rowsOf(rel.input, context).filter(
+        (row) => evaluate(rel.predicate, row, context) === true,
+      );
+    case "scan": {
+      const { def, rows } = tableOf(context, rel.tableId);
+      const positions = rel.columns.map((id) => columnIndex(def, id));
+      const out: Tuple[] = [];
+      for (const [rowId, row] of [...rows].sort(([a], [b]) => a - b)) {
+        const tuple: Tuple = positions.map((position) => row[position] ?? null);
+        if (rel.filter !== null && evaluate(rel.filter, tuple, context) !== true) continue;
+        if (rel.emitLocator) tuple.push(rowId);
+        out.push(tuple);
+      }
+      return out;
     }
-
-    if ((match = /^SELECT nextval\('(\w+)'\)$/iu.exec(sql)) !== null) {
-      const name = match[1] ?? "";
-      let id = 0;
-      for (let i = 0; i < name.length; i++) id += name.charCodeAt(i);
-      const columns = [{ name: "nextval", type: BIGINT, nullable: false }];
-      return {
-        ...base,
-        kind: "query",
-        command: "SELECT",
-        reads: [],
-        pointRead: false,
-        columns: columns.map(meta),
-        plan: plan(columns, 0, catalog.version, {
-          kind: "query",
-          streamBy: null,
-          run: (context) => {
-            const out: Int64Values = { repr: "safe", values: new Float64Array(1) };
-            const lsn = context.sequences?.next(id, 1, out, 0) ?? 0;
-            const value = out.values[0] ?? 0;
-            context.sequenceSession?.record(id, BigInt(value));
-            return { rows: [[value]], affected: 0, requiresLsn: lsn };
-          },
-        }),
-      };
+    case "keyLookup": {
+      const { def, rows } = tableOf(context, rel.tableId);
+      const index = def.indexes.find((candidate) => candidate.id === rel.indexId);
+      if (index === undefined)
+        throw new TypeError(`Index ${String(rel.indexId)} is not on ${def.name}`);
+      const keyPositions = index.columnIds.map((id) => columnIndex(def, id));
+      const positions = rel.columns.map((id) => columnIndex(def, id));
+      const out: Tuple[] = [];
+      const seen = new Set<number>();
+      for (const keys of rel.keys) {
+        const values = keys.map((key) => evaluate(key, [], context));
+        if (values.some((value) => value === null)) continue;
+        for (const [rowId, row] of rows) {
+          if (seen.has(rowId)) continue;
+          if (
+            !keyPositions.every(
+              (position, i) => compareValues(row[position] ?? null, values[i] ?? null) === 0,
+            )
+          )
+            continue;
+          seen.add(rowId);
+          const tuple: Tuple = positions.map((position) => row[position] ?? null);
+          if (rel.emitLocator === true) tuple.push(rowId);
+          out.push(tuple);
+        }
+      }
+      return out;
     }
+    default:
+      throw new UnsupportedPlanError(`${rel.op} in the stand-in executor`);
+  }
+}
 
-    const tableDef = (name: string): TableDef => {
-      const def = catalog.tableByName(name);
-      if (def === undefined)
+function checkUnique(def: TableDef, rows: Map<number, Row>, row: Row, self: number | null): void {
+  for (const index of def.indexes) {
+    if (!index.unique) continue;
+    const positions = index.columnIds.map((id) => columnIndex(def, id));
+    if (positions.some((position) => row[position] === null)) continue;
+    for (const [rowId, other] of rows)
+      if (
+        rowId !== self &&
+        positions.every(
+          (position) => compareValues(other[position] ?? null, row[position] ?? null) === 0,
+        )
+      )
         throw new ExecutionError(
-          `relation "${name}" does not exist`,
-          "MINNOW_UNDEFINED_TABLE",
-          "42P01",
+          `duplicate key value violates unique constraint "${index.name}"`,
+          "MINNOW_UNIQUE_VIOLATION",
+          "23505",
         );
-      return def;
-    };
-    const outputs = (def: TableDef): OutputColumn[] =>
-      def.columns.map((column) => ({
-        name: column.name,
-        type: column.type,
-        nullable: column.nullable,
-      }));
+  }
+  def.columns.forEach((column, position) => {
+    if (!column.nullable && row[position] === null)
+      throw new ExecutionError(
+        `null value in column "${column.name}" violates not-null constraint`,
+        "MINNOW_NOT_NULL_VIOLATION",
+        "23502",
+      );
+  });
+}
 
-    if ((match = /^SELECT \* FROM (\w+) WHERE (\w+) = \$1$/iu.exec(sql)) !== null) {
-      const def = tableDef(match[1] ?? "");
-      const columns = outputs(def);
-      const name = def.name;
-      return {
-        ...base,
-        kind: "query",
-        command: "SELECT",
+/** Runs a plan: query rows, or a modify's effect and its RETURNING rows. */
+function interpret(plan: PhysicalPlan, context: Context): ProgramResult {
+  const root = plan.root;
+  if (root.op !== "modify")
+    return { rows: rowsOf(root, context), affected: 0, requiresLsn: context.sequenceLsn };
+  const { def, rows } = tableOf(context, root.tableId);
+  const input = rowsOf(root.input, context);
+  const returned: Row[] = [];
+  const passthrough = root.passthrough ?? 0;
+  const returning = (row: Row, extra: readonly Value[]) => {
+    if (root.returning === null) return;
+    const full: Tuple = [...row, ...extra];
+    returned.push(root.returning.map((expr) => evaluate(expr, full, context)));
+  };
+  let affected = 0;
+  for (const tuple of input) {
+    const extra = passthrough === 0 ? [] : tuple.slice(tuple.length - passthrough);
+    switch (root.kind) {
+      case "insert": {
+        const row = tuple.slice(0, def.columns.length);
+        checkUnique(def, rows, row, null);
+        rows.set(context.state.nextRowId++, row);
+        returning(row, extra);
+        affected++;
+        break;
+      }
+      case "update": {
+        const rowId = Number(tuple[0]);
+        const old = rows.get(rowId);
+        if (old === undefined) break;
+        const row = [...old];
+        root.assigned.forEach((columnId, i) => {
+          row[columnIndex(def, columnId)] = tuple[1 + i] ?? null;
+        });
+        checkUnique(def, rows, row, rowId);
+        rows.set(rowId, row);
+        returning(row, extra);
+        affected++;
+        break;
+      }
+      case "delete": {
+        const rowId = Number(tuple[0]);
+        const old = rows.get(rowId);
+        if (old === undefined) break;
+        rows.delete(rowId);
+        returning(old, extra);
+        affected++;
+        break;
+      }
+      default:
+        throw new UnsupportedPlanError(`${root.kind} in the stand-in executor`);
+    }
+  }
+  return { rows: returned, affected, requiresLsn: context.sequenceLsn };
+}
+
+// ---- test statements ----
+
+/** Statements only the tests know, planned by the stand-ins and run by the stand-in executor. */
+const SPIN = /^\s*SELECT\s+spin\(\$1\)\s*;?\s*$/iu;
+
+/**
+ * Lowering, plus `SELECT spin($1)`: an analytic load of $1 ms in the owner, working in
+ * `YIELD_SLICE_MS` slices with a task yield between them, as the executor's driver must (ruling
+ * R16.4). The latency lane measures point reads beside it. Everything else is lowering's.
+ */
+export function withTestStatements(lowerer: StatementPlanner): StatementPlanner {
+  return {
+    lower(text: string, context: PlannerContext): LoweredStatement {
+      if (!SPIN.test(text)) return lowerer.lower(text, context);
+      const INT: PhysicalType = { kind: "int32", bits: 32 };
+      const columns: OutputColumn[] = [{ name: "spin", type: INT, nullable: false }];
+      const physical = {
+        root: { id: 0, op: "values", rows: [[]], output: columns },
+        columns,
         parameters: [INT],
-        reads: [def.id],
-        pointRead: true,
-        columns: columns.map(meta),
-        plan: plan(columns, 1, catalog.version, {
-          kind: "query",
-          streamBy: null,
-          run: (context) => {
-            const row = tableOf(context.state, name).rows.get(String(context.params[0]));
-            return { rows: row === undefined ? [] : [row], affected: 0, requiresLsn: 0 };
-          },
-        }),
-      };
-    }
-
-    if ((match = /^SELECT \* FROM (\w+)(?: STREAM BY (\d+))?$/iu.exec(sql)) !== null) {
-      const def = tableDef(match[1] ?? "");
-      const columns = outputs(def);
-      const name = def.name;
-      return {
-        ...base,
+        placeholderCount: 1,
+        clockSlot: null,
+        initPlans: [],
+        catalogVersion: context.catalog.version,
+        volatile: true,
+      } as unknown as PhysicalPlan;
+      programs.set(physical, {
         kind: "query",
-        command: "SELECT",
-        reads: [def.id],
-        pointRead: false,
-        columns: columns.map(meta),
-        plan: plan(columns, 0, catalog.version, {
-          kind: "query",
-          streamBy: match[2] === undefined ? null : Number(match[2]),
-          run: (context) => ({
-            rows: [...tableOf(context.state, name).rows.values()].sort(
-              (a, b) => Number(a[0]) - Number(b[0]),
-            ),
-            affected: 0,
-            requiresLsn: 0,
-          }),
-        }),
-      };
-    }
-
-    const modify = (
-      def: TableDef,
-      returning: boolean,
-      placeholders: number,
-      command: string,
-      run: Program["run"],
-    ): LoweredModify => {
-      const columns = returning ? outputs(def) : [];
+        columns,
+        streamBy: null,
+        spinMs: (params) => Number(params[0] ?? 0),
+        run: () => ({ rows: [[1]], affected: 0, requiresLsn: 0 }),
+      });
       return {
-        ...base,
-        kind: "modify",
-        command,
-        parameters: Array.from({ length: placeholders }, () => INT),
-        reads: [def.id],
-        writes: [def.id],
-        columns: columns.map(meta),
-        plan: plan(columns, placeholders, catalog.version, { kind: "modify", streamBy: null, run }),
+        kind: "query",
+        text,
+        catalogVersion: context.catalog.version,
+        command: "SELECT",
+        controlsTransaction: false,
+        parameters: [INT],
+        plan: physical,
+        columns: [
+          { ...columns[0], sqlType: "integer", render: null } as LoweredQuery["columns"][number],
+        ],
+        reads: [],
+        basis: [],
+        pointRead: false,
       };
-    };
-
-    if ((match = /^INSERT INTO (\w+) VALUES \((.+)\)( RETURNING \*)?$/iu.exec(sql)) !== null) {
-      const def = tableDef(match[1] ?? "");
-      const slots = (match[2] ?? "").split(",").map((part) => Number(part.trim().slice(1)) - 1);
-      const name = def.name;
-      return modify(def, match[3] !== undefined, slots.length, "INSERT", (context) => {
-        const table = tableOf(context.state, name);
-        const row = def.columns.map((column, index) =>
-          coerce(column.type, context.params[slots[index] ?? 0] ?? null),
-        );
-        const key = String(row[def.primaryKey ?? 0]);
-        if (table.rows.has(key))
-          throw new ExecutionError(
-            `duplicate key value violates unique constraint "${name}_pkey"`,
-            "MINNOW_UNIQUE_VIOLATION",
-            "23505",
-          );
-        table.rows.set(key, row);
-        return { rows: [row], affected: 1, requiresLsn: 0 };
-      });
-    }
-
-    if (
-      (match = /^UPDATE (\w+) SET (\w+) = (\w+) \+ 1 WHERE (\w+) = \$1( RETURNING \*)?$/iu.exec(
-        sql,
-      )) !== null
-    ) {
-      const def = tableDef(match[1] ?? "");
-      const column = def.columns.findIndex((candidate) => candidate.name === match?.[2]);
-      const name = def.name;
-      return modify(def, match[5] !== undefined, 1, "UPDATE", (context) => {
-        const table = tableOf(context.state, name);
-        const key = String(context.params[0]);
-        const row = table.rows.get(key);
-        if (row === undefined) return { rows: [], affected: 0, requiresLsn: 0 };
-        const next = row.map((value, index) => (index === column ? Number(value) + 1 : value));
-        table.rows.set(key, next);
-        return { rows: [next], affected: 1, requiresLsn: 0 };
-      });
-    }
-
-    if ((match = /^DELETE FROM (\w+) WHERE (\w+) = \$1$/iu.exec(sql)) !== null) {
-      const def = tableDef(match[1] ?? "");
-      const name = def.name;
-      return modify(def, false, 1, "DELETE", (context) => {
-        const deleted = tableOf(context.state, name).rows.delete(String(context.params[0]));
-        return { rows: [], affected: deleted ? 1 : 0, requiresLsn: 0 };
-      });
-    }
-
-    throw new PlanningError(`syntax error at or near "${sql.split(/\s+/u)[0] ?? ""}"`);
-  }
-
-  lowerWrite(shape: WriteShape): LoweredModify {
-    throw new TypeError(`The stand-in planner has no batch writes (${shape.op} ${shape.table})`);
-  }
+    },
+    lowerWrite: (shape, context) => lowerer.lowerWrite(shape, context),
+    lowerTableRules: (table, catalog) => lowerer.lowerTableRules(table, catalog),
+  };
 }

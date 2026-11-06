@@ -5,8 +5,9 @@ import { test } from "./fixtures.js";
 /**
  * The next core's owner across real tabs (B5 increment 2): election through the Web Lock, the
  * broker SharedWorker, the owner worker with its fence, owner death and resends, lifecycle
- * step-down and flush, version skew. The engines are the stand-ins (testing/owner-standins.ts)
- * over OPFS, or IndexedDB where workers have no OPFS.
+ * step-down and flush, version skew. Statements go through real lowering; the executor and write
+ * path are the stand-ins (testing/owner-standins.ts) over OPFS, or IndexedDB where workers have no
+ * OPFS.
  */
 type Run = typeof import("../browser/next-owner/run.js");
 const RUN = "/packages/core/browser/next-owner/run.ts";
@@ -174,10 +175,10 @@ test("hidden flushes pending relaxed commits before the owner can be lost", asyn
     await a.close();
     const b = await tab(await context.newPage());
     await call(b, "open", name);
-    const result = await call(b, "query", "SELECT * FROM t");
-    // With the flush the rows survived the owner; without it (the control) they are gone.
+    const result = await call(b, "query", "SELECT id, n, name FROM t");
+    // With the flush the rows survived the owner; without it (the control) even the table is gone.
     if (flushOnHidden) expect(result).toMatchObject({ rows: [[1, 0, "x"]] });
-    else expect(result).toMatchObject({ error: "ExecutionError" });
+    else expect(result).toMatchObject({ error: "PlanningError" });
     await b.close();
   }
 });

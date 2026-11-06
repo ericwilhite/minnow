@@ -1,6 +1,6 @@
 /**
- * The owner worker of the browser lane: the next core's owner host (owner/host.ts) over the
- * stand-in engines (testing/owner-standins.ts), whose durable state lives in one OPFS file opened
+ * The owner worker of the browser lane: the next core's owner host (owner/host.ts) over real
+ * lowering (lower/, B6) and the stand-in executor and write path (testing/owner-standins.ts), whose durable state lives in one OPFS file opened
  * with a sync access handle (the fence) — or, where workers have no OPFS (WebKit's pinned Linux
  * build), in IndexedDB, fenced by the Web Lock alone.
  *
@@ -14,11 +14,11 @@ import { serveOwnerWorker, type OwnerEngineFactory } from "../../dist/next/owner
 import type { WebLockManager } from "../../dist/next/owner/web-locks.js";
 import { Governor } from "../../dist/next/memory/governor.js";
 import { MemorySpillService } from "../../dist/next/spill/memory-spill.js";
+import { createLowerer } from "../../dist/next/lower/create.js";
 import {
   StandinExecutor,
-  StandinPlanner,
   StandinWritePath,
-  standinRules,
+  withTestStatements,
 } from "../../dist/next/testing/owner-standins.js";
 import type { ChunkReads } from "../../dist/next/exec/scan.js";
 
@@ -124,13 +124,12 @@ const factory: OwnerEngineFactory<Fence> = {
       },
     });
     return composeEngine({
-      planner: new StandinPlanner(),
+      planner: withTestStatements(createLowerer()),
       executor: new StandinExecutor(),
       writePath,
       governor: new Governor(64 * 1024 * 1024),
       spill: new MemorySpillService(),
       reads: {} as ChunkReads,
-      rules: standinRules,
     });
   },
 };
