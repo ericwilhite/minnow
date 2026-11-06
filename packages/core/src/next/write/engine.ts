@@ -1262,6 +1262,17 @@ export class WritePathImpl implements WritePath, EngineHooks {
     return this.#baseCatalog;
   }
 
+  /**
+   * After a publication: every table's root is the published one (a root may reconcile a table it
+   * did not otherwise change, review B3-p2b-3 C3), so later publications build on what is durable.
+   */
+  #adoptTableRoots(root: ManifestRoot): void {
+    for (const table of root.tables) {
+      const state = this.#tables.get(table.tableId);
+      if (state !== undefined && state.root !== null) state.root = table;
+    }
+  }
+
   /** Forgets catalog history a root at `globalLsn` covers. */
   #pruneCatalogs(globalLsn: number): void {
     let last = -1;
@@ -1995,6 +2006,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       }
       this.#root = root;
       this.#pruneCatalogs(root.globalLsn);
+      this.#adoptTableRoots(root);
       state.root = tableRoot;
       state.pages = pages;
       state.flushedThroughLsn = through;
@@ -2130,6 +2142,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       await delta.publish(this.#space, bytes, writer, released);
       this.#root = root;
       this.#pruneCatalogs(root.globalLsn);
+      this.#adoptTableRoots(root);
       this.#publishState();
       this.maintenance.idlePublishes += 1;
     } catch (error) {
@@ -2293,6 +2306,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       switched = true;
       this.#root = root;
       this.#pruneCatalogs(root.globalLsn);
+      this.#adoptTableRoots(root);
       for (const [tableId, table] of quiet) {
         const state = this.#tables.get(tableId);
         if (state !== undefined) state.root = table;
@@ -2509,6 +2523,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       await delta.publish(this.#space, rootBytes, writer, retired);
       this.#root = next;
       this.#pruneCatalogs(next.globalLsn);
+      this.#adoptTableRoots(next);
       state.root = tableRoot;
       const viewRuns = new Map(state.view.runs);
       viewRuns.set(indexId, runs);
@@ -2661,7 +2676,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
         continue;
       }
       if (state?.root !== null && state?.root !== undefined) {
-        tables.push(state.root);
+        // Reconciled with this root's catalog (review B3-p2b-3 C3): an index the catalog dropped
+        // leaves the table root in this publication even when the table itself did not change;
+        // the index-drop pass below retires its runs.
+        tables.push(withCatalogIndexes(state.root, def));
         continue;
       }
       if (state === undefined) continue;
@@ -2742,6 +2760,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
     }
     return extents;
   }
+}
+
+/** `root` without the indexes `def` (the publication's catalog) no longer has. */
+function withCatalogIndexes(root: TableRoot, def: TableDef): TableRoot {
+  const ids = new Set(def.indexes.map((index) => index.id));
+  const keyIndex = root.keyIndex !== null && !ids.has(root.keyIndex.indexId) ? null : root.keyIndex;
+  const secondaryIndexes = root.secondaryIndexes.filter((index) => ids.has(index.indexId));
+  if (keyIndex === root.keyIndex && secondaryIndexes.length === root.secondaryIndexes.length)
+    return root;
+  return { ...root, keyIndex, secondaryIndexes };
 }
 
 function indexRoot(
