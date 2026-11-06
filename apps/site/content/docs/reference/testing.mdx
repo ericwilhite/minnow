@@ -1416,3 +1416,12 @@ Storage task-slicing regressions queue timers before large preparation and cache
 then require service before completion. They also cancel at task turns and immediate read
 resumptions, exercise union and free-map construction independently, and verify that two
 preparations share the worker's task clock rather than starting fresh slices.
+
+The unexported rebuild core also has an opt-in owner-ready measurement:
+`MINNOW_OWNER_REOPEN=1` with `next-storage-owner-reopen.spec.ts` in Chromium. It loads the
+actual S5 commerce and W5M wide datasets through the real write path, then measures backend
+open, extent-space open, write-path recovery and owner host ready separately. CPU samples use
+separate bracketed runs; wall samples have no sampling barriers. The executor stand-in is unused
+during startup. Its first `SELECT count(*)` is explicitly statistics-only and measures the owner
+protocol around the recovered row count, not an integrated scan. Native IndexedDB disk bytes
+are unavailable; the report counts returned byte payloads and numeric index/meta reads.

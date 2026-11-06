@@ -1376,3 +1376,28 @@ task when due, and check cancellation on resume. Sorting uses an in-place sliced
 startup collection, root union, free-map construction and retirement installation also cooperate.
 Timer/cancellation regressions include cached reads, immediate writes and two preparations
 sharing one task's elapsed time.
+
+`MINNOW_OWNER_REOPEN=1` enables `browser-tests/next-storage-owner-reopen.spec.ts`, the
+actual S5/W5M owner-ready lane in Chromium over OPFS and IndexedDB. It loads the canonical
+commerce scale 1,667 / wide 5M × 200-column generators (three wide dimensions included), in
+50,000-row transactions through the real write path, using its default maintenance tuning and
+a 256 MiB governor. Each reopen starts a fresh worker, opens the real backend and extent space,
+recovers `WritePathImpl`, sweeps scratch, and starts the real owner host with no broker.
+The executor is a stand-in and is unused before `minnow:ready`; the harness asserts that.
+
+Three wall-only samples report backend/ByteStore loading, extent space, write-path recovery,
+and host overhead separately, plus page-observed host ready. Three separate CPU-bracketed
+samples report worker and browser-tree CPU ticks for those phases without charging the sampler's
+barrier wait to phase wall time. Returned OPFS bytes and IndexedDB cloned byte payloads are
+counted per phase, with numeric index/meta reads separate; native IndexedDB disk bytes are opaque.
+Build, module boot, metadata collection and cleanup are outside owner-ready. Disk caches stay warm.
+The reported first `SELECT count(*)` uses real lowering, owner/client protocol and frame delivery,
+but a statistics-only executor stand-in: it reads the real write path's row count, not table pages.
+Client connection/metadata overhead is reported separately. This is not integrated query execution.
+
+`MINNOW_OWNER_REOPEN_CACHE` can retain profiles outside Playwright's output directory;
+`MINNOW_OWNER_REOPEN_REUSE=1` explicitly reuses completed loads marked by the harness, so a
+later clock rebase can measure the same stored roots. The report includes actual group, extent,
+list-page and native IndexedDB record counts rather than deriving them from row counts.
+`MINNOW_OWNER_REOPEN_SMOKE=1` caps each table at 1,000 rows to verify the harness only; those
+samples are labelled and never count as Gate A measurements.

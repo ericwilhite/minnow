@@ -18,8 +18,10 @@
  *   one in a strict transaction; the other keeps the previous root.
  * - `data`, `log`, `spill`: byte spaces (idb-bytes.ts): disjoint records of ≤ 256 KiB keyed by
  *   offset, each with an entry in `data-index`, `log-index` or `spill-index` (offset → length).
- *   Writes find overlaps in an in-memory copy of the index loaded (and validated) at open; reads
- *   select records from the stored index inside their transaction. Gaps read as zeros. Freed space
+ *   Data/log open loads only the last index boundary. Reads select records from the persisted
+ *   index; writes select at most two boundary records and delete interior ranges in the same
+ *   transaction. Full orphan/missing-record validation runs in audit and test-build open (R25.5).
+ *   Gaps read as zeros. Freed space
  *   is deleted (`releaseData`), which returns it to the platform: unlike OPFS, IndexedDB does give
  *   quota back.
  *
@@ -105,9 +107,9 @@ export interface IndexedDbBackendOptions {
   /** Told about every transaction once created, and when it ends (test instrumentation). */
   readonly observe?: StorageObserver;
   /**
-   * Charged with the resident record indexes of the data and log spaces (idb-bytes.ts, "Cost"),
-   * growing and shrinking with them, released at close: the owner registers it with the memory
-   * governor. None by default.
+   * Charged with the retained log-tail buffer; data/log use lazy persisted index lookups, with
+   * no resident record directory (idb-bytes.ts "Cost"). Released at close. The owner registers
+   * it with the memory governor. None by default.
    */
   readonly memory?: CacheMemory;
 }

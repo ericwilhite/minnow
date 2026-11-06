@@ -975,6 +975,8 @@ class StandinExecution implements Execution {
 }
 
 export interface StandinExecutorOptions {
+  /** Bench-only count from real write-path statistics; null delegates to the test interpreter. */
+  readonly countFromStatistics?: (plan: PhysicalPlan) => number | null;
   /** Results of more rows than this stream asynchronously in frames of this many rows. */
   readonly rowsPerFrame?: number;
 }
@@ -982,9 +984,11 @@ export interface StandinExecutorOptions {
 export class StandinExecutor implements Executor {
   prepared = 0;
   readonly #rowsPerFrame: number | null;
+  readonly #countFromStatistics: ((plan: PhysicalPlan) => number | null) | undefined;
 
   constructor(options: StandinExecutorOptions = {}) {
     this.#rowsPerFrame = options.rowsPerFrame ?? null;
+    this.#countFromStatistics = options.countFromStatistics;
   }
   /** Every result channel created, for frame-accounting assertions. */
   readonly channels = new Set<ResultChannel>();
@@ -999,19 +1003,28 @@ export class StandinExecutor implements Executor {
   }
 
   prepare(plan: PhysicalPlan): PreparedPlan {
-    const program: Program = programs.get(plan) ?? {
-      kind: plan.root.op === "modify" ? "modify" : "query",
-      columns: plan.columns,
-      streamBy: this.#rowsPerFrame,
-      run: (context) =>
-        interpret(plan, {
-          params: context.params,
-          state: context.state,
-          sequences: context.sequences,
-          sequenceSession: context.sequenceSession,
-          sequenceLsn: 0,
-        }),
-    };
+    const statistics = this.#countFromStatistics?.(plan) ?? null;
+    const program: Program =
+      statistics === null
+        ? (programs.get(plan) ?? {
+            kind: plan.root.op === "modify" ? "modify" : "query",
+            columns: plan.columns,
+            streamBy: this.#rowsPerFrame,
+            run: (context) =>
+              interpret(plan, {
+                params: context.params,
+                state: context.state,
+                sequences: context.sequences,
+                sequenceSession: context.sequenceSession,
+                sequenceLsn: 0,
+              }),
+          })
+        : {
+            kind: "query",
+            columns: plan.columns,
+            streamBy: null,
+            run: () => ({ rows: [[BigInt(statistics)]], affected: 0, requiresLsn: 0 }),
+          };
     this.prepared++;
     return {
       plan,

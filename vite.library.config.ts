@@ -29,10 +29,10 @@ export default defineConfig({
   plugins: [isolatedPages],
   // Test pages only: the next/ engine re-verifies cached bytes at every lease release and
   // eviction, so a writer into them fails in the browser lanes too
-  // (packages/core/src/next/storage/verify-cached.ts). Off only for the opt-in OPFS export bench
-  // (browser-tests/next-export-bench.spec.ts), which times reads the guard would re-hash.
+  // (packages/core/src/next/storage/verify-cached.ts). Off for the opt-in OPFS export and owner-ready timing lanes
+  // (next-export-bench / next-storage-owner-reopen.spec.ts), which time reads the guard would re-hash.
   define:
-    process.env.MINNOW_NEXT_EXPORT_BENCH === "1"
+    process.env.MINNOW_NEXT_EXPORT_BENCH === "1" || process.env.MINNOW_OWNER_REOPEN === "1"
       ? {}
       : { "globalThis.__MINNOW_VERIFY_CACHED_BYTES__": "true" },
   // The browser conformance runner loads the same vendored SQLite Wasm and PGlite distributions
