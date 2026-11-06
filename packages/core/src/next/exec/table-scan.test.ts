@@ -26,12 +26,7 @@ import type { ScalarExpr } from "../ir/ir.js";
 import type { Loan } from "../memory/governor.js";
 import { MemoryExtentSpace } from "../page/memory-extents.js";
 import { ChunkReader } from "../page/reader.js";
-import {
-  targetFor,
-  valueAt as pageValueAt,
-  writeGroup,
-  type TestValue,
-} from "../page/test-support.js";
+import { writeGroup, type TestValue } from "../page/test-support.js";
 import type { PhysicalType } from "../types.js";
 import type { ByteBudget } from "../access/space.js";
 import type { Batch, Selection, Vector } from "../vector/vector.js";
@@ -55,7 +50,6 @@ import {
 } from "./kernels/test-support.js";
 import { OutputArena } from "./kernels/vectors.js";
 import type { ChunkReads, ColumnChunkRef } from "./scan.js";
-import type { ColumnPredicate, PredicateConstant, PushdownReader } from "./pushdown.js";
 import { TableScan, type ScanStats, type TableScanOptions } from "./table-scan.js";
 
 /** `xs[i]`, which must exist. */
@@ -235,113 +229,10 @@ function memorySegment(
   };
 }
 
-/**
- * A stand-in for B2's encoded-page pushdown (page/predicate.ts, select.ts): the reader gains
- * `compilePredicate` / `pagesMatching` / `select` / `refine` / `selectMask`, evaluating the
- * `ColumnPredicate` in plain JS over the chunk's decoded values with PostgreSQL's rules (NULL never
- * satisfies a comparison; NaN = NaN and greatest; decimals exact; bytes in byte order). It checks
- * the scan's seam and its constants independently of the executor's kernels.
- */
-async function withFakePushdown(reader: ChunkReader): Promise<ChunkReader> {
-  // The stand-in decodes the whole chunk once, up front (it models results, not page skipping).
-  const rows = reader.rowCount;
-  const [first, end] = reader.pagesInRange(0, rows);
-  await reader.load(Array.from({ length: end - first }, (_, k) => first + k));
-  await reader.loadValues(0, rows);
-  const target = targetFor(reader, rows, reader.varlenBytes(0, rows));
-  reader.decodeRange(0, rows, target, 0);
-  const values = Array.from({ length: rows }, (_, row) => pageValueAt(target, row));
-  reader.releaseValues();
-  const decoded = (): TestValue[] => values;
-  const scale = reader.directory.scale ?? 0;
-  const order = (a: TestValue, b: PredicateConstant): number => {
-    if (typeof a === "number" && typeof b !== "object") {
-      if (Number.isInteger(a) && (typeof b === "bigint" || Number.isInteger(b)))
-        return BigInt(a) < BigInt(b) ? -1 : BigInt(a) > BigInt(b) ? 1 : 0;
-      const y = Number(b);
-      if (a !== a) return y !== y ? 0 : 1;
-      if (y !== y) return -1;
-      return a < y ? -1 : a > y ? 1 : 0;
-    }
-    if (typeof a === "bigint") {
-      const y = BigInt(b as number | bigint);
-      return a < y ? -1 : a > y ? 1 : 0;
-    }
-    if (a instanceof Uint8Array && b instanceof Uint8Array) {
-      for (let k = 0; k < Math.min(a.length, b.length); k++)
-        if (a[k] !== b[k]) return (a[k] ?? 0) < (b[k] ?? 0) ? -1 : 1;
-      return a.length < b.length ? -1 : a.length > b.length ? 1 : 0;
-    }
-    const d = a as { coefficient: bigint };
-    const c = b as { coefficient: bigint; scale: number };
-    const x = d.coefficient * 10n ** BigInt(c.scale);
-    const y = c.coefficient * 10n ** BigInt(scale);
-    return x < y ? -1 : x > y ? 1 : 0;
-  };
-  const holds = (value: TestValue, p: ColumnPredicate): boolean => {
-    if (p.op === "isNull") return value === null;
-    if (p.op === "isNotNull") return value !== null;
-    if (value === null) return false;
-    switch (p.op) {
-      case "in":
-        return p.values.some((v) => order(value, v) === 0);
-      case "between":
-        return order(value, p.low) >= 0 && order(value, p.high) <= 0;
-      default: {
-        const o = order(value, p.value);
-        if (p.op === "=") return o === 0;
-        if (p.op === "<>") return o !== 0;
-        if (p.op === "<") return o < 0;
-        if (p.op === "<=") return o <= 0;
-        if (p.op === ">") return o > 0;
-        return o >= 0;
-      }
-    }
-  };
-  const fake: PushdownReader = {
-    compilePredicate: (predicate) => predicate,
-    pagesMatching: (_c, from = 0, to = reader.rowCount) => {
-      const [first, end] = reader.pagesInRange(from, to);
-      return Array.from({ length: end - first }, (_, k) => first + k);
-    },
-    select: (c, from, to, out, at = 0) => {
-      const all = decoded();
-      let n = 0;
-      for (let r = from; r < to; r++)
-        if (holds(all[r] ?? null, c as ColumnPredicate)) out[at + n++] = r;
-      return n;
-    },
-    refine: (c, rows, start, end, out, at = 0) => {
-      const all = decoded();
-      let n = 0;
-      for (let k = start; k < end; k++) {
-        const r = rows[k] ?? 0;
-        if (holds(all[r] ?? null, c as ColumnPredicate)) out[at + n++] = r;
-      }
-      return n;
-    },
-    selectMask: (c, from, to, mask, at = 0) => {
-      const all = decoded();
-      let n = 0;
-      for (let r = from; r < to; r++) {
-        const hit = holds(all[r] ?? null, c as ColumnPredicate);
-        mask[at + r - from] = hit ? 1 : 0;
-        if (hit) n++;
-      }
-      return n;
-    },
-  };
-  return Object.assign(reader, fake);
-}
-
 /** Chunk readers over the in-memory extent space (with its cache, as production). */
-function readsOver(space: MemoryExtentSpace, encoded = false): ChunkReads {
+function readsOver(space: MemoryExtentSpace): ChunkReads {
   return {
-    open: (_pages, chunk, options) => {
-      const opened = ChunkReader.open(space.view({ cache: true }), chunk, options);
-      if (!encoded) return opened;
-      return Promise.resolve(opened).then(withFakePushdown);
-    },
+    open: (_pages, chunk, options) => ChunkReader.open(space.view({ cache: true }), chunk, options),
   };
 }
 
@@ -441,12 +332,13 @@ function scanOf(
   space: MemoryExtentSpace,
   filter: ScalarExpr | null,
   options: Partial<TableScanOptions> = {},
-  encoded = false,
+  encoded = true,
 ): TableScan {
   return new TableScan({
     table,
     pages: { read: () => Promise.reject(new Error("unused")), peek: () => null },
-    reads: readsOver(space, encoded),
+    reads: readsOver(space),
+    encodedPushdown: encoded,
     budget: options.budget ?? UNCHARGED,
     columns: DEFS.map((d) => d.id),
     filter,
@@ -471,6 +363,7 @@ describe("table scan: pushdown, gather and late materialization never change the
         "group predates a column",
         "group pruned",
         "encoded-page pushdown",
+        "decoded fallback",
       ] as const);
       await fc.assert(
         fc.asyncProperty(
@@ -537,8 +430,7 @@ describe("table scan: pushdown, gather and late materialization never change the
                 .map((s) => [...expectedRow(s.row, s.late), s.locator]),
             );
             const budget = counting();
-            // Pushed conjuncts on the encoded-page seam (a B2 stand-in) or the decoded fallback.
-            if (encoded) reach.reach("encoded-page pushdown");
+            // Pushed conjuncts on encoded pages (the page format) or, forced, on decoded values.
             const scan = scanOf(
               table,
               space,
@@ -559,6 +451,8 @@ describe("table scan: pushdown, gather and late materialization never change the
             if (stats.residualBatches > 0) reach.reach("residual");
             if (stats.splits > 0) reach.reach("byte-bounded split");
             if (stats.groupsPruned > 0) reach.reach("group pruned");
+            if (stats.encodedPredicates > 0) reach.reach("encoded-page pushdown");
+            if (stats.decodedPredicates > 0) reach.reach("decoded fallback");
           },
         ),
         { seed, numRuns: 40 },

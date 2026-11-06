@@ -1,11 +1,11 @@
 /**
- * The scan's predicate-pushdown seam: which filter conjuncts go to the page format, and the one
- * small interface the scan calls for them. The format track's read-side pushdown (B2,
- * rebuild/format-p2d/p2e: `ChunkReader.compilePredicate`, `pagesMatching`, `select`, `refine`,
- * `selectMask`, and `chunkMayMatch`; next/README "Predicates on encoded pages") is used when the
- * chunk reader has it; until then, and for any predicate it does not compile, `decodedColumn`
- * evaluates the same comparison with the executor's kernels on decoded values. Swapping in B2's
- * implementation is local to `pushedColumn` (and passing its `chunkMayMatch`).
+ * The scan's predicate pushdown: which filter conjuncts go to the page format, and the one small
+ * interface the scan calls for them. The format's read-side pushdown (page/predicate.ts,
+ * page/select.ts; next/README "Predicates on encoded pages": `ChunkPages.compilePredicate`,
+ * `pagesMatching`, `select`, `refine`, `selectMask`, and `chunkMayMatch`) evaluates them on
+ * encoded pages. Only where it does not push a predicate down for a chunk (`compilePredicate`
+ * returns null) does `DecodedColumn` evaluate the same comparison with the executor's kernels on
+ * decoded values; that path does not prune by statistics.
  *
  * ## What is pushed down
  * A conjunct comparing one scan column with non-null constants, the shapes B2 compiles:
@@ -23,13 +23,19 @@
  */
 import type { ScalarExpr } from "../ir/ir.js";
 import type { ColumnStatistics, PhysicalType } from "../types.js";
+import {
+  chunkMayMatch,
+  type ColumnPredicate,
+  type CompiledPredicate,
+  type PredicateConstant,
+} from "../page/predicate.js";
 import type { FlatVector, Vector } from "../vector/vector.js";
 import type { MaybePromise } from "../access/key-index.js";
 import { compileExpr, selectTrue, type CompileContext } from "./kernels/compile.js";
 import { int128At } from "../vector/int128.js";
 import type { Compiled } from "./kernels/vectors.js";
 import { isPromise } from "./pipeline.js";
-import type { ChunkPages, ColumnChunkRef, GroupRows } from "./scan.js";
+import type { ChunkPages, ColumnChunkRef } from "./scan.js";
 import { decodeInto, ColumnTarget } from "./column-target.js";
 
 /** `xs[i]`, which must exist. */
@@ -39,43 +45,9 @@ function at<T>(xs: readonly T[], i: number): T {
   return x;
 }
 
-// ── B2's predicate shapes (page/predicate.ts on rebuild/format-p2e), structurally ─────────────
+// ── B2's predicate shapes (page/predicate.ts) ─────────────────────────────────────────────────
 
-export interface DecimalConstant {
-  readonly coefficient: bigint;
-  readonly scale: number;
-  readonly special?: "NaN" | "Infinity" | "-Infinity";
-}
-export type PredicateConstant = boolean | number | bigint | Uint8Array | DecimalConstant;
-export type ColumnPredicate =
-  | { readonly op: "=" | "<>" | "<" | "<=" | ">" | ">="; readonly value: PredicateConstant }
-  | { readonly op: "in"; readonly values: readonly PredicateConstant[] }
-  | { readonly op: "between"; readonly low: PredicateConstant; readonly high: PredicateConstant }
-  | { readonly op: "isNull" }
-  | { readonly op: "isNotNull" };
-
-/** The reader methods of B2's pushdown; a reader without them uses the decoded fallback. */
-export interface PushdownReader {
-  compilePredicate(predicate: ColumnPredicate): unknown;
-  pagesMatching(compiled: unknown, from?: number, to?: number): number[];
-  select(compiled: unknown, from: number, to: number, out: Uint16Array, at?: number): number;
-  refine(
-    compiled: unknown,
-    rows: GroupRows,
-    start: number,
-    end: number,
-    out: Uint16Array,
-    at?: number,
-  ): number;
-  selectMask(compiled: unknown, from: number, to: number, mask: Uint8Array, at?: number): number;
-}
-
-/** B2's `chunkMayMatch(compiled, rowCount, statistics)` (group pruning). */
-export type ChunkMayMatch = (
-  compiled: unknown,
-  rowCount: number,
-  statistics: ColumnStatistics,
-) => boolean;
+export type { ColumnPredicate, DecimalConstant, PredicateConstant } from "../page/predicate.js";
 
 // ── Extraction ──────────────────────────────────────────────────────────────────────────────
 
@@ -256,6 +228,8 @@ function flatten(expr: ScalarExpr): ScalarExpr[] {
 
 /** One pushed predicate over one column chunk. */
 export interface PushedColumn {
+  /** Evaluated on encoded pages (B2), or on decoded values (the fallback). */
+  readonly encoded: boolean;
   /** Whether the chunk's statistics allow a qualifying row (false prunes the group). */
   mayMatch(rowCount: number, statistics: ColumnStatistics): boolean;
   /** Loads what `select(from, to)` needs (pages it cannot rule out). */
@@ -270,41 +244,35 @@ export interface PushedColumn {
   selectMask(from: number, to: number, mask: Uint8Array): number;
 }
 
-const hasPushdown = (pages: ChunkPages): pages is ChunkPages & PushdownReader =>
-  typeof (pages as Partial<PushdownReader>).compilePredicate === "function";
-
 /**
- * The pushed predicate over a chunk: B2's encoded-page evaluation when the reader has it and
- * compiles the predicate, else the decoded fallback. `chunkMayMatch` is B2's group pruning.
+ * The pushed predicate over a chunk: B2's encoded-page evaluation (`ChunkPages.compilePredicate`
+ * and the calls after it, `chunkMayMatch` for the group), or, when it does not push the predicate
+ * down for this chunk (it returns null: interval, json, arrays, mixed-scale decimals, enum order)
+ * or `encoded` is false (tests), the decoded fallback.
  */
 export function pushedColumn(
   pages: ChunkPages,
-  chunk: ColumnChunkRef,
+  _chunk: ColumnChunkRef,
   pushed: PushedPredicate,
   fallback: CompiledFallback,
-  chunkMayMatch: ChunkMayMatch | null,
+  encoded = true,
 ): PushedColumn {
-  if (hasPushdown(pages)) {
-    let compiled: unknown = null;
-    try {
-      compiled = pages.compilePredicate(pushed.predicate);
-    } catch (error) {
-      if (!(error instanceof RangeError)) throw error;
-    }
-    if (compiled !== null) return new EncodedColumn(pages, compiled, chunkMayMatch);
+  if (encoded) {
+    const compiled = pages.compilePredicate(pushed.predicate);
+    if (compiled !== null) return new EncodedColumn(pages, compiled);
   }
-  return new DecodedColumn(pages, chunk.type, fallback);
+  return new DecodedColumn(pages, fallback);
 }
 
 /** B2's pushdown on encoded pages. */
 class EncodedColumn implements PushedColumn {
+  readonly encoded = true;
   constructor(
-    readonly pages: ChunkPages & PushdownReader,
-    readonly compiled: unknown,
-    readonly prune: ChunkMayMatch | null,
+    readonly pages: ChunkPages,
+    readonly compiled: CompiledPredicate,
   ) {}
   mayMatch(rowCount: number, statistics: ColumnStatistics): boolean {
-    return this.prune === null ? true : this.prune(this.compiled, rowCount, statistics);
+    return chunkMayMatch(this.compiled, rowCount, statistics);
   }
   prepare(from: number, to: number): MaybePromise<void> {
     return this.pages.load(this.pages.pagesMatching(this.compiled, from, to));
@@ -349,9 +317,9 @@ export class CompiledFallback {
 
 /** The fallback: decode the column, evaluate the comparison with the kernels. */
 class DecodedColumn implements PushedColumn {
+  readonly encoded = false;
   constructor(
     readonly pages: ChunkPages,
-    readonly type: PhysicalType,
     readonly fallback: CompiledFallback,
   ) {}
   mayMatch(): boolean {

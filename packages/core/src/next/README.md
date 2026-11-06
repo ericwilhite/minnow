@@ -624,16 +624,19 @@ and the owner import it directly.
   ends. Batches are sized from full value lengths before any value is read; one row larger than
   the target is a batch of its own, and if the grant refuses even that row the scan borrows a
   progress loan (R18.3) and repays it when the batch is released.
-- The pushdown seam (`pushdown.ts`): the format track's encoded-page evaluation
-  (`compilePredicate`, `pagesMatching`, `select`, `refine`, `selectMask`, `chunkMayMatch`) is used
-  when the chunk reader has it; otherwise, and for any predicate it does not compile, the same
-  comparison runs on decoded values with the executor's kernels. Semantics are PostgreSQL's
-  either way, so where a conjunct runs never changes the answer.
+- Pushdown (`pushdown.ts`): pushed conjuncts run on encoded pages through the page format's
+  read-side pushdown (`compilePredicate`, `pagesMatching`, `select`, `refine`, `chunkMayMatch`;
+  "Predicates on encoded pages" above). Where it does not push a predicate down for a chunk
+  (interval, json, arrays, mixed-scale decimals, enum order: `compilePredicate` returns null),
+  the same comparison runs on decoded values with the executor's kernels, without statistics
+  pruning. Semantics are PostgreSQL's either way, so where a conjunct runs never changes the
+  answer. `selectMask` (the fused dense filter and aggregate) is not called by any operator yet.
 - Memory segments are read through `memory-scan.ts` (one lent chunk at a time, zero copy), the
   whole filter as the residual.
 - `table-scan.test.ts` checks generated tables (groups through the page writer, memory segments,
-  deletions, columns some groups predate, values stored out of line) and filters against the
-  same scan with pushdown off (decode-then-filter), and that against the source rows.
+  deletions, columns some groups predate, values stored out of line) and filters, with pushed
+  conjuncts on encoded pages or forced onto decoded values, against the same scan with pushdown
+  off (decode-then-filter), and that against the source rows.
 
 ### Aggregation (`exec/agg/`)
 

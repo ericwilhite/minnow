@@ -54,6 +54,7 @@
 import type { MaybePromise } from "../access/key-index.js";
 import type { GroupSegment } from "../access/snapshot.js";
 import type { ByteBudget, SpaceReader } from "../access/space.js";
+import type { ColumnPredicate, CompiledPredicate } from "../page/predicate.js";
 import type { FlatVector, Validity } from "../vector/vector.js";
 
 /** A column chunk as a group segment names it (format/manifest.ts `ColumnChunk`). */
@@ -97,6 +98,36 @@ export interface ChunkPages {
   readonly hasDecimalSpecials: boolean;
   /** Releases everything the reader holds (pages, values, the parsed directory). */
   close(): void;
+  /**
+   * Read-side pushdown (page/predicate.ts, page/select.ts; next/README "Predicates on encoded
+   * pages"): a one-column predicate compiled for this chunk (null when not pushed down for its
+   * type), the pages over a range it cannot rule out, and its qualifying positions, refinement or
+   * 0/1 mask over loaded pages, without materializing values.
+   */
+  compilePredicate(predicate: ColumnPredicate): CompiledPredicate | null;
+  pagesMatching(compiled: CompiledPredicate, from?: number, to?: number): number[];
+  select(
+    compiled: CompiledPredicate,
+    from: number,
+    to: number,
+    out: Uint16Array,
+    at?: number,
+  ): number;
+  refine(
+    compiled: CompiledPredicate,
+    rows: GroupRows,
+    start: number,
+    end: number,
+    out: Uint16Array,
+    at?: number,
+  ): number;
+  selectMask(
+    compiled: CompiledPredicate,
+    from: number,
+    to: number,
+    mask: Uint8Array,
+    at?: number,
+  ): number;
   /** Varlen bytes a target needs for rows `[from, to)`, or for the selected rows (full value
    * lengths, out-of-line values included, so a batch can be sized before anything is loaded). */
   varlenBytes(from: number, to: number): number;

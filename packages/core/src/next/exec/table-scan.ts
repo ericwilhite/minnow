@@ -66,7 +66,6 @@ import {
   CompiledFallback,
   pushedColumn,
   splitFilter,
-  type ChunkMayMatch,
   type PushedColumn,
   type PushedPredicate,
 } from "./pushdown.js";
@@ -94,6 +93,9 @@ export interface ScanStats {
   /** Batches cut short by the byte target. */
   splits: number;
   loans: number;
+  /** Pushed conjuncts per chunk evaluated on encoded pages (B2), and on decoded values. */
+  encodedPredicates: number;
+  decodedPredicates: number;
 }
 
 export interface TableScanOptions {
@@ -111,8 +113,11 @@ export interface TableScanOptions {
   readonly context: CompileContext;
   /** The pipeline grant's progress loans (R18.3); without them a refused single row fails. */
   readonly loans?: { borrow(bytes: number): Promise<Loan> };
-  /** B2's group pruning (page/predicate.ts `chunkMayMatch`) once its pushdown is in. */
-  readonly chunkMayMatch?: ChunkMayMatch;
+  /**
+   * False: pushed conjuncts run on decoded values (the fallback) even where the page format
+   * pushes them down (tests compare the two). Default true.
+   */
+  readonly encodedPushdown?: boolean;
   /** False: no pushdown, dense decode, the whole filter on decoded values (decode-then-filter). */
   readonly pushdown?: boolean;
   readonly targetBytes?: number;
@@ -202,6 +207,8 @@ export class TableScan implements BatchSource {
     memoryBatches: 0,
     splits: 0,
     loans: 0,
+    encodedPredicates: 0,
+    decodedPredicates: 0,
   };
   readonly #options: TableScanOptions;
   readonly #defs: readonly ColumnDef[];
@@ -391,13 +398,15 @@ export class TableScan implements BatchSource {
           chunk,
           predicate,
           at(this.#fallbacks, p),
-          this.#options.chunkMayMatch ?? null,
+          this.#options.encodedPushdown ?? true,
         );
         if (!compiled.mayMatch(segment.rowCount, chunk.statistics)) {
           for (const pages of opened) pages.close();
           this.stats.groupsPruned += 1;
           return null;
         }
+        if (compiled.encoded) this.stats.encodedPredicates += 1;
+        else this.stats.decodedPredicates += 1;
         pushed.push(compiled);
       }
       const deletions = yield* wait(segment.deletions());
@@ -680,6 +689,7 @@ export class TableScan implements BatchSource {
 
 /** A pushed conjunct decided once for a missing column (it held). */
 const ALWAYS: PushedColumn = {
+  encoded: false,
   mayMatch: () => true,
   prepare: () => undefined,
   prepareRows: () => undefined,
