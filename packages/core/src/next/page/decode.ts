@@ -1416,7 +1416,19 @@ function decodeValues(
       }
       const values = view.plain as Float64Array | Float32Array;
       if (rows === null) out.set(values.subarray(from, to), at);
-      else for (let k = 0; k < count; k++) out[at + k] = values[(rows[k] ?? 0) - base0] ?? 0;
+      else {
+        // Gathered as raw words, never through a JS number (ECMAScript NumericToRawBytes lets
+        // an engine store any NaN for a Number; review B2-p2i-2 #2).
+        const words = values.BYTES_PER_ELEMENT / 4;
+        const source = new Uint32Array(values.buffer, values.byteOffset, values.length * words);
+        const target = new Uint32Array(out.buffer, out.byteOffset, out.length * words);
+        for (let k = 0; k < count; k++) {
+          const row = ((rows[k] ?? 0) - base0) * words;
+          const slot = (at + k) * words;
+          target[slot] = source[row] ?? 0;
+          if (words === 2) target[slot + 1] = source[row + 1] ?? 0;
+        }
+      }
       return;
     }
     case "varlen":

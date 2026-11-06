@@ -731,9 +731,31 @@ class FloatWriter extends ColumnWriter {
     if (data.layout !== "f64" && data.layout !== "f32") throw new TypeError("Expected float data");
     if (vector.form === "flat")
       this.values.set(data.values.subarray(from, from + count), this.rows);
-    else
+    else if (data.values.BYTES_PER_ELEMENT !== this.values.BYTES_PER_ELEMENT)
       for (let k = 0; k < count; k++)
         this.values[this.rows + k] = data.values[sourceRow(vector, from + k)] ?? 0;
+    else {
+      // A constant or dictionary vector expanded as raw words, never through a JS number: an
+      // engine may store any NaN for a Number (ECMAScript NumericToRawBytes), so a NaN's
+      // payload survives only as bits (review B2-p2i-2 #2).
+      const words = this.values.BYTES_PER_ELEMENT / 4;
+      const source = new Uint32Array(
+        data.values.buffer,
+        data.values.byteOffset,
+        data.values.length * words,
+      );
+      const target = new Uint32Array(
+        this.values.buffer,
+        this.values.byteOffset,
+        this.values.length * words,
+      );
+      for (let k = 0; k < count; k++) {
+        const row = sourceRow(vector, from + k) * words;
+        const slot = (this.rows + k) * words;
+        target[slot] = source[row] ?? 0;
+        if (words === 2) target[slot + 1] = source[row + 1] ?? 0;
+      }
+    }
   }
   encode(): EncodedPage {
     return encodeFloatPage(

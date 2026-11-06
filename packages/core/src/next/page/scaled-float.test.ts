@@ -16,7 +16,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { createReach } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { PageEncoding } from "../format/manifest.js";
-import type { FlatVector } from "../vector/vector.js";
+import type { Vector } from "../vector/vector.js";
 import { MemoryExtentSpace } from "./memory-extents.js";
 import { ChunkReader } from "./reader.js";
 import { GroupWriter } from "./writer.js";
@@ -227,6 +227,9 @@ const RAW_STATES = [
   "a page of random 64-bit patterns",
   "a scaled page with raw patches",
   "nulls",
+  "a constant input vector",
+  "a dictionary input vector",
+  "a NaN payload through a constant or dictionary input",
 ] as const;
 const rawReach = createReach("next-float-raw-bits", RAW_STATES);
 afterAll(() => {
@@ -250,7 +253,10 @@ describe.each(RAW_SEEDS)(
           fc.constantFrom("constant", "nan payloads", "random", "decimal with patches"),
           fc.bigInt({ min: 0n, max: (1n << 64n) - 1n }),
           fc.boolean(),
-          async (rows, mode, pick, withNulls) => {
+          // The writer's input: a flat lane, or a constant or dictionary vector it expands
+          // (review B2-p2i-2 #2).
+          fc.constantFrom("flat", "flat", "constant vector", "dictionary vector"),
+          async (rows, mode, pick, withNulls, shape) => {
             rawReach.beginHistory();
             let state = BigInt(seed) ^ pick ^ BigInt(rows);
             const next = (): bigint => {
@@ -292,13 +298,60 @@ describe.each(RAW_SEEDS)(
               columns: [{ columnId: 1, type }],
               writer: space.beginWrite("raw"),
             });
-            const vector: FlatVector = {
-              form: "flat",
-              type,
-              length: rows,
-              validity,
-              data: { layout: "f64", values },
-            };
+            let vector: Vector;
+            if (shape === "constant vector") {
+              // One value for every row (a constant vector has no validity of its own here).
+              validity = null;
+              bits.fill(bits[0] ?? 0n);
+              const value = new Float64Array(1);
+              new BigUint64Array(value.buffer)[0] = bits[0] ?? 0n;
+              vector = {
+                form: "constant",
+                type,
+                length: rows,
+                value: {
+                  form: "flat",
+                  type,
+                  length: 1,
+                  validity: null,
+                  data: { layout: "f64", values: value },
+                },
+              };
+              rawReach.reach("a constant input vector");
+            } else if (shape === "dictionary vector") {
+              // Codes into a dictionary of the first rows' patterns.
+              const size = Math.min(rows, 1 + Number(pick % 61n));
+              const entries = new Float64Array(size);
+              const entryBits = new BigUint64Array(entries.buffer);
+              entryBits.set(bits.subarray(0, size));
+              const codes = Int32Array.from({ length: rows }, (_, row) => (row * 7) % size);
+              codes.forEach((code, row) => (bits[row] = entryBits[code] ?? 0n));
+              vector = {
+                form: "dictionary",
+                type,
+                length: rows,
+                codes,
+                validity,
+                dictionary: {
+                  form: "flat",
+                  type,
+                  length: size,
+                  validity: null,
+                  data: { layout: "f64", values: entries },
+                },
+                dictionaryId: 0,
+              };
+              rawReach.reach("a dictionary input vector");
+            } else
+              vector = {
+                form: "flat",
+                type,
+                length: rows,
+                validity,
+                data: { layout: "f64", values },
+              };
+            if (shape !== "flat" && [...bits].some(isNaNBits))
+              rawReach.reach("a NaN payload through a constant or dictionary input");
             await writer.append([vector], rows);
             const chunk = defined((await writer.finish()).columns[0]);
             const reader = await ChunkReader.open(space, chunk, { budget: UNLIMITED });
