@@ -143,7 +143,8 @@ describe("the in-memory index (finding 4)", () => {
     await session.writeData(0, filled(4096, 1));
     await session.appendLog(filled(10, 2));
     await session.flushLog();
-    expect(charged).toBe(2 * CHARGE_STEP);
+    // One granule per space's index, and the log tail's buffer.
+    expect(charged).toBe(2 * CHARGE_STEP + LOG_COALESCE_BYTES);
     await session.close();
     expect(charged).toBe(0);
   });

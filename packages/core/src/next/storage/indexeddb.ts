@@ -37,7 +37,8 @@
  * tail): an append that continues it is copied into it, and the next commit rewrites that one
  * record whole (a range delete of the old record and one put, no get). Records therefore number
  * about log bytes / 64 KiB however small the group commits; a commit rewrites at most 64 KiB.
- * A crash during a rewrite leaves the previous complete record (the transaction is atomic).
+ * A crash during a rewrite leaves the previous complete record (the transaction is atomic). The
+ * tail's buffer is charged to the backend's memory registration while the session holds it.
  * `truncateLog` and `resetLog` move the logical end when called, in call order with appends, and
  * forget the tail; if their transaction then fails, the session fails (later appends were placed
  * after the new end). The platforms keep one write-ahead log per database and commit in order, so a strict
@@ -86,6 +87,30 @@ export interface IndexedDbBackendOptions {
 
 /** Consecutive log appends in one batch are joined into records of up to this many bytes. */
 export const LOG_COALESCE_BYTES = 64 * 1024;
+
+/**
+ * A release of more ranges than this is split into transactions of at most this many, with a task
+ * between them (review B1-p2e finding 2: one transaction of 12,000 range deletes held the commit
+ * chain). Safe to split: released space is free (no durable root, previous root or pin reaches it,
+ * and the caller reuses it only once the release resolves), so a crash between chunks leaves some
+ * of it deleted and some not; what remains only occupies free space until it is reused, and never
+ * a byte a root names.
+ */
+export const RELEASE_CHUNK = 1024;
+
+/** Lets other tasks run (between chunks of a long release). */
+const yieldTask = () =>
+  new Promise<void>((resolve) => {
+    setTimeout(resolve, 0);
+  });
+
+/** `ranges` in consecutive chunks of at most `RELEASE_CHUNK`. */
+function chunksOf<T>(ranges: readonly T[]): T[][] {
+  const chunks: T[][] = [];
+  for (let at = 0; at < ranges.length; at += RELEASE_CHUNK)
+    chunks.push(ranges.slice(at, at + RELEASE_CHUNK));
+  return chunks;
+}
 
 /** A copy the caller cannot change afterwards (it may reuse its buffer once a call resolves). */
 const copyOf = (bytes: Uint8Array): Uint8Array => bytes.slice();
@@ -256,17 +281,40 @@ class IdbSession implements StoreSession {
   /** Counts drained batches (`LogTail.queued`). */
   #batch = 0;
   #logTail: LogTail | null = null;
+  readonly #memory: CacheMemory | null;
+  #tailCharged = false;
   /** Every commit runs after the previous one (call order). */
   #committing: Promise<void> = Promise.resolve();
   #failure: Error | null = null;
 
-  constructor(lease: IdbLease, data: ByteStore, log: ByteStore, batching: boolean) {
+  constructor(
+    lease: IdbLease,
+    data: ByteStore,
+    log: ByteStore,
+    batching: boolean,
+    memory: CacheMemory | null,
+  ) {
     this.#lease = lease;
     this.epoch = lease.epoch;
     this.#data = data;
     this.#log = log;
     this.#batching = batching;
     this.#logLength = log.end;
+    this.#memory = memory;
+  }
+
+  /**
+   * Sets the log tail. Its 64 KiB buffer is charged to the memory registration while the session
+   * holds one (review B1-p2e finding 3); a refused charge is not retried (the buffer is bounded).
+   */
+  #setTail(tail: LogTail | null): void {
+    this.#logTail = tail;
+    if (tail !== null && !this.#tailCharged && this.#memory !== null)
+      this.#tailCharged = this.#memory.charge(LOG_COALESCE_BYTES);
+    else if (tail === null && this.#tailCharged) {
+      this.#memory?.release(LOG_COALESCE_BYTES);
+      this.#tailCharged = false;
+    }
   }
 
   #live(): void {
@@ -460,23 +508,29 @@ class IdbSession implements StoreSession {
   async releaseData(ranges: readonly DataRange[]): Promise<void> {
     this.#mutable();
     this.#lease.guard();
-    const copy = ranges.map(({ offset, length }) => ({ offset, length }));
-    await this.#commit({
-      durability: "relaxed",
-      spaces: [this.#data],
-      extra: [],
-      write: (tx, done) => {
-        inOrder(
-          copy.length,
-          (index, next) => {
-            const range = copy[index];
-            if (range === undefined) next();
-            else this.#data.clear(tx, range.offset, range.offset + range.length, next);
+    // Every chunk joins the commit chain now, in call order; a task runs between chunks.
+    const runs = chunksOf(ranges.map(({ offset, length }) => ({ offset, length }))).map(
+      (chunk, index) => {
+        if (index > 0) this.#committing = this.#committing.then(yieldTask);
+        return this.#commit({
+          durability: "relaxed",
+          spaces: [this.#data],
+          extra: [],
+          write: (tx, done) => {
+            inOrder(
+              chunk.length,
+              (at, next) => {
+                const range = chunk[at];
+                if (range === undefined) next();
+                else this.#data.clear(tx, range.offset, range.offset + range.length, next);
+              },
+              done,
+            );
           },
-          done,
-        );
+        });
       },
-    });
+    );
+    await Promise.all(runs);
   }
 
   async dataLength(): Promise<number> {
@@ -538,7 +592,7 @@ class IdbSession implements StoreSession {
       return offset;
     }
     if (bytes.length >= LOG_COALESCE_BYTES) {
-      this.#logTail = null;
+      this.#setTail(null);
       const copy = copyOf(bytes);
       await this.#enqueue([this.#log], [], bytes.length, (tx, next) => {
         this.#log.write(tx, offset, copy, next);
@@ -552,7 +606,7 @@ class IdbSession implements StoreSession {
       queued: this.#batch,
     };
     started.buffer.set(bytes);
-    this.#logTail = started;
+    this.#setTail(started);
     await this.#enqueue([this.#log], [], bytes.length, this.#rewrite(started));
     return offset;
   }
@@ -597,7 +651,7 @@ class IdbSession implements StoreSession {
     this.#lease.guard();
     // The logical end moves now, in call order with appends; a failure below fails the session.
     this.#logLength = length;
-    this.#logTail = null;
+    this.#setTail(null);
     await this.#commit({
       durability: "strict",
       spaces: [this.#log],
@@ -612,7 +666,7 @@ class IdbSession implements StoreSession {
     this.#mutable();
     this.#lease.guard();
     this.#logLength = 0;
-    this.#logTail = null;
+    this.#setTail(null);
     await this.#commit({
       durability: "strict",
       spaces: [this.#log],
@@ -631,6 +685,7 @@ class IdbSession implements StoreSession {
     this.#closed = true;
     this.#data.close();
     this.#log.close();
+    this.#setTail(null);
   }
 }
 
@@ -703,19 +758,25 @@ class IdbScratch implements ScratchSpace {
     });
   }
 
+  /** Chunked like `releaseData` (`RELEASE_CHUNK`, a task between transactions). */
   async release(ranges: readonly DataRange[]): Promise<void> {
-    const copy = ranges.map(({ offset, length }) => ({ offset, length }));
-    await this.#mutate((spill, tx) => {
-      inOrder(
-        copy.length,
-        (index, next) => {
-          const range = copy[index];
-          if (range === undefined) next();
-          else spill.clear(tx, range.offset, range.offset + range.length, next);
-        },
-        () => undefined,
-      );
-    });
+    const runs = chunksOf(ranges.map(({ offset, length }) => ({ offset, length }))).map(
+      (chunk, index) => {
+        if (index > 0) this.#chain = this.#chain.then(yieldTask);
+        return this.#mutate((spill, tx) => {
+          inOrder(
+            chunk.length,
+            (at, next) => {
+              const range = chunk[at];
+              if (range === undefined) next();
+              else spill.clear(tx, range.offset, range.offset + range.length, next);
+            },
+            () => undefined,
+          );
+        });
+      },
+    );
+    await Promise.all(runs);
   }
 
   async truncate(size: number): Promise<void> {
@@ -782,7 +843,7 @@ export function createIndexedDbBackend(options: IndexedDbBackendOptions): Storag
         data.close();
         throw error;
       });
-      return new IdbSession(owned, data, log, options.batching ?? true);
+      return new IdbSession(owned, data, log, options.batching ?? true, memory);
     },
     scratch(lease: OwnerLease): ScratchSpace {
       return new IdbScratch(own(lease));

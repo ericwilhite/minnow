@@ -184,9 +184,12 @@ is access's `Snapshot`.
   reset) on one commit chain (this assumes each engine's one write-ahead log per database commits
   in order, so a strict commit makes earlier relaxed ones durable; checksums turn a broken
   assumption into a detected corruption, never a silent read: storage/contract.ts); range lists
-  of any length are driven iteratively. The log's last
+  of any length are driven iteratively, and a release of more than 1,024 ranges is split into
+  transactions of at most that many with a task between them (released space is free, so a crash
+  between them only leaves free space to be reused). The log's last
   record is kept in memory while under 64 KiB and rewritten whole by the next commit, so log
-  records scale with log bytes / 64 KiB rather than with commits; truncate and reset move the
+  records scale with log bytes / 64 KiB rather than with commits (the tail's buffer is charged to
+  the memory registration); truncate and reset move the
   logical end when called, in order with appends. A malformed or exhausted epoch refuses
   ownership; the spill store's record index is charged to the spill service's registration.
   `sim-idb.ts` simulates IndexedDB as a
@@ -451,7 +454,9 @@ and the owner import it directly.
   IndexedDB's `spill` store): one free map, 256 KiB batches written as extents that extend
   the file's last one, checksummed reads, `sweep` at startup. It owns an optional memory
   registration, charged over its lifetime with what the scratch space keeps per extent
-  (IndexedDB's record index; `chargeTo`), returned at `sweep` and `close` (`dispose`).
+  (IndexedDB's record index; `chargeTo`), returned at `sweep` and `close` (`dispose`). Its `close`
+  is terminal: it refuses new files, lets every file finish what already started and release its
+  space, and returns the charge last.
 
 ### Memory (`memory/governor.ts`)
 
