@@ -206,11 +206,17 @@ export interface ChaosHooks {
   readonly go: (sequence: number) => Promise<void>;
   /**
    * Receives the graceful step-down once recovery is done: close the session (its queue commits),
-   * then release the lease (the IndexedDB backend drains and closes its connection first).
+   * then release the lease (the IndexedDB backend drains and closes its connection first);
+   * `aborted` is what the release aborted once its wait ran out (`ReleaseReport`).
    */
-  readonly registerRelease?: (
-    release: () => Promise<{ readonly sessionMs: number; readonly releaseMs: number }>,
-  ) => void;
+  readonly registerRelease?: (release: () => Promise<StepDownRelease>) => void;
+}
+
+/** A graceful step-down's release, timed. */
+export interface StepDownRelease {
+  readonly sessionMs: number;
+  readonly releaseMs: number;
+  readonly aborted: number;
 }
 
 /**
@@ -338,8 +344,12 @@ export async function runChaos(
     const started = performance.now();
     await session.close();
     const closed = performance.now();
-    await lease.release();
-    return { sessionMs: closed - started, releaseMs: performance.now() - closed };
+    const report = await lease.release();
+    return {
+      sessionMs: closed - started,
+      releaseMs: performance.now() - closed,
+      aborted: report?.aborted ?? 0,
+    };
   });
   hooks.post({
     chaos: "recovered",

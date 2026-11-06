@@ -189,10 +189,24 @@ export interface OwnerLease {
   readonly signal: AbortSignal;
   /**
    * Closes handles and releases the lock. Idempotent. The owner awaits it before terminating its
-   * worker (IndexedDB: in-flight transactions finish, bounded, and the connection closes first;
-   * WebKit can otherwise block IndexedDB for the session: DECISIONS.md "Step-down").
+   * worker (IndexedDB: in-flight transactions finish, bounded, then any left are aborted, and the
+   * connection closes before the lock is released; WebKit can otherwise block IndexedDB for the
+   * session: DECISIONS.md "Step-down"). Backends with transactions to settle report them.
    */
-  release(): Promise<void>;
+  // Additive: a lease with nothing to settle (OPFS, memory) still returns `Promise<void>`.
+  // eslint-disable-next-line @typescript-eslint/no-invalid-void-type
+  release(): Promise<ReleaseReport | void>;
+}
+
+/** What a lease release did with the transactions in flight on its connection (IndexedDB). */
+export interface ReleaseReport {
+  /** Transactions that settled by themselves (committed or failed) while the release waited. */
+  readonly drained: number;
+  /**
+   * Transactions the release aborted once the wait ran out, or refused before they began: none of
+   * their effects applied, and each rejected with `StoreClosedError`.
+   */
+  readonly aborted: number;
 }
 
 export interface StorageBackend {
@@ -311,8 +325,8 @@ export class StoreCorruptionError extends Error {
 
 export class StoreClosedError extends Error {
   readonly code = "MINNOW_STORE_CLOSED";
-  constructor() {
-    super("Store session is closed");
+  constructor(message = "Store session is closed") {
+    super(message);
     this.name = "StoreClosedError";
   }
 }

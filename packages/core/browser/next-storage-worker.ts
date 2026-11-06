@@ -29,6 +29,7 @@ import {
   type ChaosExpect,
   type ChaosInjection,
   type ChaosMode,
+  type StepDownRelease,
 } from "./next-storage-chaos.js";
 import {
   buildReopenSpace,
@@ -883,7 +884,7 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
 const goes = new Map<number, () => void>();
 let chaosPort: MessagePort | null = null;
 /** The running chaos workload's graceful step-down (next-storage-chaos.ts). */
-let chaosRelease: (() => Promise<{ sessionMs: number; releaseMs: number }>) | null = null;
+let chaosRelease: (() => Promise<StepDownRelease>) | null = null;
 
 scope.addEventListener("message", (event: MessageEvent<unknown>) => {
   const port = (event.data as { chaosPort?: MessagePort }).chaosPort;

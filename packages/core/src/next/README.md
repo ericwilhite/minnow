@@ -194,10 +194,12 @@ is access's `Snapshot`.
   the memory registration); truncate and reset move the
   logical end when called, in order with appends. A malformed or exhausted epoch refuses
   ownership; the spill store's record index is charged to the spill service's registration.
-  Every transaction of the connection runs through one serialized chain, and releasing the
-  lease lets in-flight transactions finish (up to 500 ms), closes the connection, then releases
-  the lock: WebKit can block IndexedDB for the browser session when a worker dies with two
-  chains of transactions in flight on its connection (DECISIONS.md "Step-down").
+  Every acquisition opens its own connection, and every transaction of it runs through one
+  serialized chain. Releasing the lease lets in-flight transactions finish (up to 500 ms), aborts
+  any left and waits for their abort events, closes the connection, then releases the lock, and
+  reports how many drained and how many it aborted: WebKit can block IndexedDB for the browser
+  session when a worker dies with two chains of transactions in flight on its connection
+  (DECISIONS.md "Step-down").
   `sim-idb.ts` simulates IndexedDB as a
   checksum-chained write-ahead log on the simulated disk with IndexedDB's request order, activity
   and clone rules, so the IndexedDB backend passes the same storage kit and extent-space crash

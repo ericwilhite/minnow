@@ -864,6 +864,8 @@ test.describe("rebuild core storage graceful step-down (the WebKit IndexedDB wed
         [RUN, 20 + Math.floor(random() * 500)] as const,
       );
       expect(stepDown.leftInFlight).toBe(0);
+      // Everything had settled: the release closed without aborting anything.
+      expect(stepDown.aborted).toBe(0);
       expected = stepDown.expect;
       timings.push(stepDown);
     }

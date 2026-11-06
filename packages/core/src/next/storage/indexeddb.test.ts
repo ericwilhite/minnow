@@ -398,12 +398,13 @@ describe("release drains the connection, then closes it (the WebKit wedge mitiga
       setTimeout(resolve, 0);
     });
     events.length = 0;
-    await Promise.all([publishing, lease.release()]);
+    const [, report] = await Promise.all([publishing, lease.release()]);
+    expect(report).toEqual({ drained: 1, aborted: 0 });
     // Every transaction that was in flight settled before the connection closed.
     expect(events.at(-1)).toBe("closed");
     expect(events.filter((event) => event === "closed")).toHaveLength(1);
     await expect(session.readRoot()).rejects.toThrow();
-    // The next owner opens a new connection and sees what was published.
+    // The next owner opens its own connection and sees what was published.
     const next = await backend.open(await backend.acquire());
     expect(connections).toBe(2);
     expect(await next.readRoot()).toEqual(new Uint8Array([1]));

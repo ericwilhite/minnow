@@ -124,8 +124,11 @@ These rulings follow the storage probe of 2026-11-05.
     Chromium and in Firefox. A probe still blocked 120 s later. Closing the connection just
     before the kill does not prevent it (2 of 40); letting the in-flight transactions finish first
     does (0 of 40). The IndexedDB backend's `release()` does that part: it refuses new
-    transactions, waits up to 500 ms for those in flight, closes the connection, then releases the
-    lock. Measured graceful step-down under the concurrent kill workload, 40 cycles each: waiting
+    transactions, waits up to 500 ms for those in flight, aborts any still running and waits for
+    their abort events (an aborted strict commit fails: not durable), closes the connection, and
+    only then releases the lock, so the next owner never starts beside a live transaction; it
+    reports how many transactions drained and how many it aborted. Every acquisition opens its own
+    connection, so releasing a stolen lease never closes its successor's (review B1-p2h-1). Measured graceful step-down under the concurrent kill workload, 40 cycles each: waiting
     for in-flight operations median 88–153 ms, p95 200–481 ms; session close ≤ 33 ms; release
     ≤ 7 ms; the next owner recovered every time in WebKit, Chromium and Firefox. OPFS is the
     default wherever a worker has sync access handles; this matters on IndexedDB, WebKit's

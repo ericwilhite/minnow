@@ -780,6 +780,8 @@ export interface StepDown {
   /** Closing the session (its queue commits) and releasing the lease (drain, close, unlock). */
   readonly sessionMs: number;
   readonly releaseMs: number;
+  /** Transactions the release aborted when its wait ran out (0 after a full quiesce). */
+  readonly aborted: number;
 }
 
 /**
@@ -801,9 +803,11 @@ export async function chaosStepDown(delayMs: number): Promise<StepDown> {
     });
   const quiesceMs = performance.now() - started;
   const leftInFlight = run.inFlight.size;
-  const released = await run.worker.call<{ sessionMs: number; releaseMs: number }>({
-    op: "chaos-release",
-  });
+  const released = await run.worker.call<{ sessionMs: number; releaseMs: number; aborted: number }>(
+    {
+      op: "chaos-release",
+    },
+  );
   const failure = failed(run);
   run.worker.terminate();
   chaos = null;
