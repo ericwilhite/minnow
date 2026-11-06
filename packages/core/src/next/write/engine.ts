@@ -417,6 +417,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
   readonly #extentDeltas: ExtentDeltaSink | null;
   /** The armed idle-publish check (R10), if any. */
   #idleTimer: ReturnType<typeof setTimeout> | null = null;
+  /** An idle publication the timer started and that has not finished. */
+  #idleRun: Promise<void> | null = null;
   /** `performance.now()` of the last commit (idleness for R10). */
   #lastCommitAt = 0;
   /** True while maintenance (a log recycle) holds the writer slot. */
@@ -1599,6 +1601,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
     await this.#flushes;
     // A running merge stops at its next slice and aborts its writer.
     await this.#merges;
+    // An idle publication already started finishes (or, not yet publishing, sees close and
+    // stops) before anything is released: nothing publishes after close resolves.
+    await this.#idleRun;
     if (this.#appender.failure === null) await this.#appender.close();
     this.keys.close();
     for (const state of this.#tables.values())
@@ -2012,9 +2017,15 @@ export class WritePathImpl implements WritePath, EngineHooks {
     if (!this.#garbageOverBound()) return;
     this.#idleTimer = setTimeout(() => {
       this.#idleTimer = null;
-      this.#idlePublish().catch((error: unknown) => {
-        this.#failure ??= error instanceof Error ? error : new Error(String(error));
-      });
+      // Kept, so close() waits for a publication the timer already started (review B3-p2b-2 B3).
+      const run = this.#idlePublish()
+        .catch((error: unknown) => {
+          this.#failure ??= error instanceof Error ? error : new Error(String(error));
+        })
+        .finally(() => {
+          if (this.#idleRun === run) this.#idleRun = null;
+        });
+      this.#idleRun = run;
     }, IDLE_FLUSH_MS);
     (this.#idleTimer as { unref?: () => void }).unref?.();
   }
@@ -2343,7 +2354,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         // B3-p2b-2 B2): no merge will reduce them until a new flush changes the level, which a
         // waiting writer would prevent.
         const first = runs[0];
-        if (first !== undefined && first.level === 0 && this.#unmergeable.has(first)) continue;
+        if (first?.level === 0 && this.#unmergeable.has(first)) continue;
         most = Math.max(most, levelZero(runs));
       }
     }

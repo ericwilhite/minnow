@@ -116,3 +116,69 @@ describe("level-0 stall", () => {
     await harness.close();
   });
 });
+
+describe("idle publish and close (review B3-p2b-2 B3)", () => {
+  async function gated(sim: boolean) {
+    const harness = new Harness("strict", sim ? "sim" : "memory", 8, undefined, {
+      merges: { fanIn: 2 },
+      idleGarbageBytes: 1,
+    });
+    const path = await harness.open();
+    const t = await table(path);
+    await load(path, t, 0, 40);
+    await path.quiesce();
+    let resume!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const publish = harness.space.publish.bind(harness.space);
+    harness.space.publish = async (root, options) => {
+      entered();
+      await gate;
+      return publish(root, options);
+    };
+    await started; // the idle publication is in flight
+    return { harness, path, t, resume, restore: () => (harness.space.publish = publish) };
+  }
+
+  it("close waits for an idle publication already in flight (the reviewer's probe)", async () => {
+    const { harness, path, t, resume, restore } = await gated(false);
+    let closed = false;
+    const closing = path.close().then(() => {
+      closed = true;
+    });
+    await pause(30);
+    const closedWhilePublishing = closed;
+    resume();
+    await closing;
+    restore();
+    expect(closedWhilePublishing).toBe(false);
+    expect(path.maintenance.idlePublishes).toBe(1);
+    // Reopen: the idle root is the current one, every row is there, the audit passes.
+    await harness.reopen();
+    const view = harness.path.pin();
+    const { rowsOf } = await import("./test-support.js");
+    expect((await rowsOf(view, t)).length).toBe(40);
+    view.release();
+    await harness.space.audit();
+    await harness.close();
+  }, 30_000);
+
+  it("power loss during an idle publication reopens on the previous root, intact", async () => {
+    const { harness, t, restore } = await gated(true);
+    restore();
+    // The gated publication never reached the disk; the power goes now.
+    await harness.crash();
+    const view = harness.path.pin();
+    const { rowsOf } = await import("./test-support.js");
+    expect((await rowsOf(view, t)).length).toBe(40);
+    view.release();
+    await harness.path.quiesce();
+    await harness.space.audit();
+    await harness.close();
+  }, 30_000);
+});
