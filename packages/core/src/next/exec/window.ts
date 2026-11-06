@@ -123,9 +123,8 @@ export interface WindowProfile {
 }
 
 const POOL_BYTES = 1024 * 1024;
-/** Charged bytes of one bigint array slot (the slot and a heap BigInt). */
-const BIGINT_BYTES = 40;
-const MAX_SAFE = 9007199254740991n;
+/** Charged bytes of an int64-derived bigint value and its fixed-capacity array slot (up to 128 bits). */
+const BIGINT_BYTES = 48;
 const RANKING: ReadonlySet<string> = new Set([
   "row_number",
   "rank",
@@ -152,7 +151,7 @@ export function windowMinimumBytes(types: readonly PhysicalType[], functions = 1
     POOL_BYTES +
     2 * 2048 * row +
     16 * 1024 * (types.length + 2) +
-    functions * (BATCH_ROWS * 24 + 32 * 1024) +
+    functions * (BATCH_ROWS * (32 + 9 + BIGINT_BYTES) + 32 * 1024) +
     // A streaming partition's working set for a bounded frame: its ring (4,096 rows), a few
     // pages in flight and the output chunk (window-stream.ts).
     functions * 4096 * 48 +
@@ -1072,7 +1071,7 @@ class Evaluator implements Operator {
       yield* this.#reset();
       return;
     }
-    const scratch = yield* this.#scratchFor(n);
+    let scratch = yield* this.#scratchFor(n);
     if (scratch === null) {
       // Its per-row arrays do not fit: the partition streams after all (all of it to the run).
       if (this.#held.rows > 0) yield this.#spillHeld();
@@ -1085,12 +1084,17 @@ class Evaluator implements Operator {
     }
     const peers = scratch.peers;
     fillPeers(peers, this.#newGroup, n);
-    // Exact int64 arguments past 2^53 keep bigint arrays (the argument, and per function a
-    // prefix and a result): charged before they exist (review B7-p2d-1 #5).
-    const wide = this.#wideArgs();
-    if (wide > 0) {
-      const bytes = n * BIGINT_BYTES * (wide + 2 * this.spec.functions.length);
+    // Exact arguments and potentially unsafe sums keep charged bigint arrays before they exist.
+    const bytes = yield* this.#bigReservation(n);
+    if (bytes > 0) {
       if (!this.charge.allocate(bytes)) {
+        if (this.#canStream) {
+          // Drop the local owner before streamResident releases the resident scratch.
+          // eslint-disable-next-line no-useless-assignment
+          scratch = null;
+          yield* this.#streamResident();
+          return;
+        }
         if (this.#loan !== null)
           throw new RangeError("A window partition's exact values do not fit");
         yield this.grant.borrow(bytes, this.context.signal).then((loan) => {
@@ -1103,7 +1107,11 @@ class Evaluator implements Operator {
       this.#bigBytes = bytes;
     }
     const args = this.#extract(scratch, n);
-    yield* this.#compute(scratch, args, n);
+    try {
+      yield* this.#compute(scratch, args, n);
+    } finally {
+      args.length = 0;
+    }
     yield* this.#emit(scratch, n);
     yield* this.#reset();
   }
@@ -1179,26 +1187,65 @@ class Evaluator implements Operator {
   }
 
   /** The argument columns as numbers (and bigints for int64 past 2^53). */
-  /** Argument columns holding an int64 past 2^53 (their bigint arrays, `#extract`). */
-  #wideArgs(): number {
+  /**
+   * Reserve exact arguments and every prefix/result that can promote, including sums of
+   * individually safe integers. n * max(abs(input)) bounds every integer frame/prefix sum.
+   * Int64 inputs and an addressable JS array need at most 128 bits; 48 bytes per value/slot
+   * is conservative for that width, rather than a universal arbitrary-bigint estimate.
+   */
+  *#bigReservation(n: number): SlicedJob<number> {
     const store = this.#args;
-    let wide = 0;
-    for (let a = 0; a < this.#argColumns.length; a++)
+    const magnitudes: number[] = [];
+    const wide: boolean[] = [];
+    let slots = 0;
+    for (let a = 0; a < this.#argColumns.length; a++) {
+      let max = 0;
+      let exact = false;
       for (let k = 0; k < store.chunkCount; k++) {
-        const data = store.chunk(a, k).data;
-        if (data.layout !== "int64" || data.values.repr !== "int64") continue;
-        const values = data.values.values;
-        let found = false;
-        for (let i = 0; i < values.length && !found; i++) {
-          const v = values[i] ?? 0n;
-          found = v > MAX_SAFE || v < -MAX_SAFE;
+        const vector = store.chunk(a, k);
+        const data = vector.data;
+        if (data.layout !== "int64" && data.layout !== "i32") continue;
+        for (let i = 0; i < vector.length; i++) {
+          if (vector.validity !== null && ((vector.validity[i >>> 5] ?? 0) & (1 << (i & 31))) === 0)
+            continue;
+          const value =
+            data.layout === "i32"
+              ? (data.values[i] ?? 0)
+              : data.values.repr === "safe"
+                ? (data.values.values[i] ?? 0)
+                : (data.values.values[i] ?? 0n);
+          const number = Number(value);
+          max = Math.max(max, Math.abs(number));
+          exact ||= !Number.isSafeInteger(number);
         }
-        if (found) {
-          wide++;
-          break;
-        }
+        if (this.slice.due()) yield;
       }
-    return wide;
+      magnitudes[a] = max;
+      wide[a] = exact;
+      if (exact) slots += n;
+    }
+    for (const call of this.spec.functions) {
+      if (call.arg === null) continue;
+      const a = this.#argColumns.indexOf(call.arg);
+      if (
+        (call.fn === "sum" || call.fn === "avg") &&
+        (wide[a] || n * (magnitudes[a] ?? 0) > Number.MAX_SAFE_INTEGER)
+      )
+        slots += 2 * n + 1;
+      else if ((call.fn === "min" || call.fn === "max") && wide[a]) slots += n;
+    }
+    return slots * BIGINT_BYTES;
+  }
+
+  /** Charge refusal switches the entire resident partition to bounded streamed evaluation. */
+  *#streamResident(): SlicedJob<void> {
+    this.#dropScratch();
+    if (this.#held.rows > 0) yield this.#spillHeld();
+    this.#args.truncate(0);
+    for (const source of this.#sources) source?.truncate(0);
+    this.#streaming = true;
+    yield* this.#streamPartition();
+    yield* this.#reset();
   }
 
   #extract(scratch: Scratch, n: number): NumberArg[] {
@@ -1562,6 +1609,7 @@ class Evaluator implements Operator {
 
   /** Empties the partition (held rows, run, arguments, sources) and repays a loan. */
   *#reset(): SlicedJob<void> {
+    this.#scratch?.big.fill(null);
     if (this.#bigBytes > 0) this.charge.free(this.#bigBytes);
     this.#bigBytes = 0;
     // Multi-chunk stores: truncate frees every chunk (reset is for one-chunk stores).
@@ -1614,6 +1662,7 @@ class Evaluator implements Operator {
     this.#staged = null;
     if (this.#scratchBytes > 0) this.charge.free(this.#scratchBytes);
     if (this.#newGroupBytes > 0) this.charge.free(this.#newGroupBytes);
+    this.#scratch?.big.fill(null);
     if (this.#bigBytes > 0) this.charge.free(this.#bigBytes);
     this.#bigBytes = 0;
     this.charge.free(this.spec.functions.length * BATCH_ROWS * 32 + 2 * this.#partChanged.length);

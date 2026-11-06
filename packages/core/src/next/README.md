@@ -835,8 +835,11 @@ and the owner import it directly.
 - Float sums add a frame's members in order, as PostgreSQL does; exact sums use prefix sums.
 - int8 values stay exact past 2^53 on both paths, as bigints where a double would round:
   sums, MIN/MAX, and RANGE keys and their offsets (RANGE over int8 compares exactly). COUNT
-  counts non-NULL rows only. Bigint state is charged (40 bytes a value), and every growing
-  array is charged in full before the old one is freed (governor rule 4).
+  counts non-NULL rows only. Bigint state derived from int64 values is reserved at 48 bytes per fixed-capacity
+  slot (up to 128-bit sums), including promotions caused by sums of safe inputs. The resident
+  path reserves a conservative bound before evaluating and streams on refusal. Streaming bigint
+  arrays grow at explicit capacities, with replacements charged while old arrays are live
+  (governor rule 4). Result references are dropped before their charge is released.
 - lag and lead accept negative offsets (lead(x, −k) looks back), resident and streamed.
 - A partition is held in memory and evaluated over typed arrays while the grant holds it, up
   to `streamRows` (4,194,304) rows.

@@ -179,7 +179,7 @@ export interface StreamHost {
 
 const SAFE = 9007199254740991;
 /** Charged bytes of one bigint ring slot (the array slot and a heap BigInt). */
-const BIGINT_BYTES = 40;
+const BIGINT_BYTES = 48;
 
 /** An int64 value past 2^53 (its double rounds: only its bigint is exact). */
 function wide(x: { value: number; big: bigint | null }): boolean {
@@ -230,6 +230,8 @@ export class PartitionStream {
   #base = 0;
   #capacity = 0;
   #ringBytes = 0;
+  #resultBytes = 0;
+  #resultBig: Array<bigint[] | null> = [];
   // Peer groups: each row's group, each group's first row (from `#groupBase`).
   #group = new Int32Array(0);
   #groupStarts: number[] = [];
@@ -310,6 +312,19 @@ export class PartitionStream {
   close(): void {
     for (const page of this.#pages) this.host.io.releasePage(page.held);
     this.#pages = [];
+    this.#resultBig.fill(null);
+    if (this.#resultBytes > 0) this.host.charge.free(this.#resultBytes);
+    this.#resultBytes = 0;
+    this.#keyBig = null;
+    for (const state of this.#calls) {
+      state.big = null;
+      state.vBig = null;
+      state.extremeBig = null;
+      state.runBig = null;
+      state.runExtremeBig = null;
+      state.totalBig = null;
+      state.totalExtremeBig = null;
+    }
     if (this.#ringBytes > 0) this.host.charge.free(this.#ringBytes);
     this.#ringBytes = 0;
     this.#prev.close();
@@ -454,7 +469,7 @@ export class PartitionStream {
       return;
     }
     const capacity = Math.max(1024, this.#capacity * 2);
-    const bytes = capacity * this.#perRow();
+    const bytes = capacity * this.#perRow() + this.#bigArrays * BIGINT_BYTES;
     // The new arrays are charged in full while the old ones are still live (governor rule 4:
     // the overlap), and the old charge goes once they are copied (review B7-p2d-1 #5).
     if (!this.host.charge.allocate(bytes))
@@ -481,6 +496,20 @@ export class PartitionStream {
       s.count = grow(s.count, (n) => new Float64Array(n));
       s.extreme = grow(s.extreme, (n) => new Float64Array(n));
     }
+    // Bigint backing arrays also grow at explicit capacities: no uncharged push/splice
+    // spare capacity. Their replacements overlap the old arrays under the charge above.
+    const growBig = (array: bigint[] | null): bigint[] | null => {
+      if (array === null) return null;
+      const next = new Array<bigint>(capacity);
+      for (let i = 0; i < this.#read - this.#base; i++) next[i] = array[i] ?? 0n;
+      return next;
+    };
+    this.#keyBig = growBig(this.#keyBig);
+    for (const s of this.#calls) {
+      s.big = growBig(s.big);
+      s.vBig = growBig(s.vBig);
+      s.extremeBig = growBig(s.extremeBig);
+    }
     this.#capacity = capacity;
     this.host.charge.free(old);
   }
@@ -495,7 +524,7 @@ export class PartitionStream {
    * for the ring's capacity now, and with every ring growth after.
    */
   #chargeBig(): void {
-    const bytes = Math.max(this.#capacity, 1024) * BIGINT_BYTES;
+    const bytes = (Math.max(this.#capacity, 1024) + 1) * BIGINT_BYTES;
     if (!this.host.charge.allocate(bytes))
       throw new RangeError("A window frame's exact (bigint) values do not fit the grant");
     this.#ringBytes += bytes;
@@ -506,11 +535,11 @@ export class PartitionStream {
   #widen(s: CallState, at: number): void {
     this.#chargeBig();
     this.#chargeBig();
-    s.vBig = [];
-    s.extremeBig = [];
+    s.vBig = new Array<bigint>(this.#capacity);
+    s.extremeBig = new Array<bigint>(this.#capacity);
     for (let k = 0; k < at; k++) {
-      s.vBig.push(s.ok[k] === 1 ? BigInt(s.v[k] ?? 0) : 0n);
-      s.extremeBig.push((s.count[k] ?? 0) > 0 ? BigInt(s.extreme[k] ?? 0) : 0n);
+      s.vBig[k] = s.ok[k] === 1 ? BigInt(s.v[k] ?? 0) : 0n;
+      s.extremeBig[k] = (s.count[k] ?? 0) > 0 ? BigInt(s.extreme[k] ?? 0) : 0n;
     }
     if (s.runSeen) s.runExtremeBig = BigInt(s.runExtreme);
   }
@@ -521,17 +550,22 @@ export class PartitionStream {
     move(this.#group);
     move(this.#key);
     move(this.#keyOk);
+    const moveBig = (array: bigint[] | null) => {
+      if (array === null) return;
+      array.copyWithin(0, drop, drop + live);
+      array.fill(0n, live);
+    };
     for (const s of this.#calls) {
       move(s.v);
       move(s.ok);
       move(s.sum);
       move(s.count);
       move(s.extreme);
-      if (s.big !== null) s.big.splice(0, drop);
-      s.vBig?.splice(0, drop);
-      s.extremeBig?.splice(0, drop);
+      moveBig(s.big);
+      moveBig(s.vBig);
+      moveBig(s.extremeBig);
     }
-    this.#keyBig?.splice(0, drop);
+    moveBig(this.#keyBig);
     this.#base += drop;
   }
 
@@ -596,8 +630,8 @@ export class PartitionStream {
       // A RANGE key past 2^53 keeps its exact value (review B7-p2d-1 #3).
       if (this.#keyBig === null && key.ok && wide(key) && this.#ranged) {
         this.#chargeBig();
-        this.#keyBig = [];
-        for (let k = 0; k < at; k++) this.#keyBig.push(BigInt(this.#key[k] ?? 0));
+        this.#keyBig = new Array<bigint>(this.#capacity);
+        for (let k = 0; k < at; k++) this.#keyBig[k] = BigInt(this.#key[k] ?? 0);
       }
       if (this.#keyBig !== null) this.#keyBig[at] = key.ok ? (key.big ?? BigInt(key.value)) : 0n;
     }
@@ -627,8 +661,8 @@ export class PartitionStream {
           ) {
             if (s.big === null) {
               this.#chargeBig();
-              s.big = [];
-              for (let k = 0; k < at; k++) s.big.push(BigInt(s.sum[k] ?? 0));
+              s.big = new Array<bigint>(this.#capacity);
+              for (let k = 0; k < at; k++) s.big[k] = BigInt(s.sum[k] ?? 0);
             }
             s.runBig = (s.runBig ?? BigInt(s.runSum)) + (x.big ?? BigInt(x.value));
           } else s.runSum += x.value;
@@ -930,9 +964,14 @@ export class PartitionStream {
   }
 
   *#main(run: SpilledRun): SlicedJob<void> {
+    // Result doubles/validity and possible exact result arrays are separate from ring state.
+    const bytes = this.#calls.length * BATCH_ROWS * (9 + BIGINT_BYTES);
+    if (!this.host.charge.allocate(bytes))
+      throw new RangeError("A window's result batch does not fit");
+    this.#resultBytes = bytes;
     const values = this.#calls.map(() => new Float64Array(BATCH_ROWS));
     const valid = this.#calls.map(() => new Uint8Array(BATCH_ROWS));
-    const bigs: Array<bigint[] | null> = this.#calls.map(() => null);
+    const bigs: Array<bigint[] | null> = (this.#resultBig = this.#calls.map(() => null));
     let next = 0;
     let outRows = 0;
     let p = 0;
