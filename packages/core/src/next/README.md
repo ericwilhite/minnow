@@ -394,8 +394,9 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
   1,048,576 rows in a fresh worker. Cold means the profile's OPFS files were synced and dropped
   from the OS page cache (`dd iflag=nocache`, checked with `fincore`). Two runs on this host
   (load 13–18): cold 103–127k rows/s without readahead, 116–207k at 256 KiB per column,
-  129–144k at 1 MiB; OS cache warm 123–141k, 162–225k, 121–224k; from the page cache (decode
-  only) 0.6–1.2M. Readahead cuts platform reads from 49,013 to 8,094 (256 KiB) and 6,819
+  129–144k at 1 MiB; on later passes whose OS-cache residency was not controlled (76–95% of
+  the files resident; the bench now primes and verifies a warm pass, review B2-p2h #3)
+  123–141k, 162–225k, 121–224k; from the page cache (decode only) 0.6–1.2M. Readahead cuts platform reads from 49,013 to 8,094 (256 KiB) and 6,819
   (1 MiB); 256 KiB is the default. It is not disk-bound: dd reads the same file at 1,119 MB/s
   cold, the export 110–241 MB/s, and loads take 68–79% of a pass warm or cold. A warm pass's
   CPU profile: `PageCache` miss handling 29% self time, the sync access handle's `read` 9%,

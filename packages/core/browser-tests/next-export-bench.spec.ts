@@ -8,7 +8,9 @@
  * - Cold: the profile's OPFS files are synced and dropped from the OS page cache first
  *   (`dd iflag=nocache count=0`, posix_fadvise DONTNEED on a file this user owns), and `fincore`
  *   confirms how much stayed resident.
- * - Warm: the OS cache holds the files (residency reported) but the worker's page cache is new.
+ * - Warm: the files are read through the OS page cache (dd) right before the pass and `fincore`
+ *   must find at least 98% of them resident (review B2-p2h #3); a pass that finds less is
+ *   labelled "partial residency" with its share, not warm. The worker's page cache is new.
  * - Cached: a prefix of the table read twice with `once` off and a cap that holds it; the second
  *   pass never reads storage (the decode half in the browser).
  *
@@ -36,6 +38,8 @@ import { requireWorkerOpfs, test } from "./fixtures.js";
 type Run = typeof import("../browser/next-export-run.js");
 const RUN = "/packages/core/browser/next-export-run.ts";
 const MiB = 1024 * 1024;
+/** A warm pass needs at least this share of the store's files resident when it starts. */
+const WARM_SHARE = 0.98;
 /**
  * Groups generated in the browser (MINNOW_EXPORT_DISTINCT, default 4); the rest are byte copies
  * at new addresses (distinct file bytes, the same encoded content), so a 1M-row table builds in
@@ -294,10 +298,16 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     const measure = async (
       label: string,
       cold: boolean,
+      /** Prime and verify OS-cache residency first (else the pass inherits what is there). */
+      warm: boolean,
       options: Parameters<Run["exportPass"]>[0],
     ): Promise<void> => {
       if (cold) dropCache(files);
+      // Warm is established, not assumed: primed now and checked (review B2-p2h #3).
+      if (warm) for (const file of files) ddRead(file);
       const residentBefore = resident(files);
+      const share = residentBefore / onDisk;
+      const established = !warm || share >= WARM_SHARE;
       const rssBefore = rendererRss(profile);
       let rssPeak = rssBefore;
       let heapPeak = 0;
@@ -324,7 +334,9 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       expect(pass.verifying, "the cached-bytes guard re-hashes every release").toBe(false);
       const bytes = (built.dataBytes * pass.rows) / (rows + 65_536);
       const row: Row = {
-        label,
+        label: established
+          ? label
+          : `${label.replace("warm", "partial residency")} (${(100 * share).toFixed(0)}% resident)`,
         residentBeforeMiB: Math.round(residentBefore / MiB),
         rows: pass.rows,
         rowsPerSecond: Math.round(pass.rows / (pass.ms / 1000)),
@@ -346,21 +358,21 @@ test.describe("rebuild core export on OPFS (bench)", () => {
 
     const base = { once: true, capMiB: 512, passes: 1, groups: exported };
     for (const readaheadKiB of [0, 64, 256, 1024])
-      await measure(`cold, readahead ${String(readaheadKiB)} KiB`, true, {
+      await measure(`cold, readahead ${String(readaheadKiB)} KiB`, true, false, {
         ...base,
         readaheadKiB,
       });
     for (const readaheadKiB of [0, 256, 1024])
-      await measure(`warm, readahead ${String(readaheadKiB)} KiB`, false, {
+      await measure(`warm, readahead ${String(readaheadKiB)} KiB`, false, true, {
         ...base,
         readaheadKiB,
       });
-    await measure("cold, once off, readahead 256 KiB", true, {
+    await measure("cold, once off, readahead 256 KiB", true, false, {
       ...base,
       once: false,
       readaheadKiB: 256,
     });
-    await measure("cached (pass 2, 4 groups, once off)", false, {
+    await measure("cached (pass 2, 4 groups, once off)", false, false, {
       once: false,
       capMiB: 1024,
       passes: 2,
@@ -369,7 +381,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     });
 
     // Where a warm pass spends its time: a CPU profile of the worker (CDP), by self time.
-    await measure("warm, readahead 256 KiB, profiled", false, {
+    await measure("warm, readahead 256 KiB, profiled", false, true, {
       ...base,
       readaheadKiB: 256,
       profile: true,
