@@ -825,30 +825,43 @@ export function* msdSort(
   refine: ((a: number, b: number) => number) | null,
   slice: Slice,
   radix: RadixScratch,
+  stack: Int32Array = new Int32Array(msdStackWords(n)),
 ): Generator<void, void, void> {
   const S = TUPLE_WORDS;
   const bytes = 4 * PREFIX_WORDS;
   const { counts, starts } = radix;
-  // Explicit stack of [lo, hi, byte].
-  const stack: number[] = [0, n, 0];
-  while (stack.length > 0) {
-    const b = stack.pop() ?? 0;
-    const hi = stack.pop() ?? 0;
-    const lo = stack.pop() ?? 0;
-    if (hi - lo < 2) continue;
-    if (hi - lo <= 48 || b >= bytes) {
-      // Insertion sort by the prefix (no moves when every prefix is equal), then the full key
-      // among equal prefixes.
-      for (let i = lo + 1; i < hi; i++) {
-        for (let j = i; j > lo && compareTuples(tuples, (j - 1) * S, j * S) > 0; j--)
-          for (let x = 0; x < S; x++) {
-            const t = tuples[(j - 1) * S + x] ?? 0;
-            tuples[(j - 1) * S + x] = tuples[j * S + x] ?? 0;
-            tuples[j * S + x] = t;
-          }
-        if (((i - lo) & (SLICE_ROWS - 1)) === 0 && slice.due()) yield;
-      }
-      if (refine !== null) yield* refineRuns(tuples, scratch, lo, hi, refine, slice);
+  /** A range of at most LEAF_ROWS rows, or whose prefix bytes are all consumed. */
+  function* leaf(lo: number, hi: number): Generator<void, void, void> {
+    // Insertion sort by the prefix (no moves when every prefix is equal), then the full key
+    // among equal prefixes.
+    for (let i = lo + 1; i < hi; i++) {
+      for (let j = i; j > lo && compareTuples(tuples, (j - 1) * S, j * S) > 0; j--)
+        for (let x = 0; x < S; x++) {
+          const t = tuples[(j - 1) * S + x] ?? 0;
+          tuples[(j - 1) * S + x] = tuples[j * S + x] ?? 0;
+          tuples[j * S + x] = t;
+        }
+      if (((i - lo) & (SLICE_ROWS - 1)) === 0 && slice.due()) yield;
+    }
+    if (refine !== null) yield* refineRuns(tuples, scratch, lo, hi, refine, slice);
+  }
+  // The pending ranges [lo, hi, byte]: each holds more than LEAF_ROWS rows (smaller ones are
+  // sorted at once) and they are disjoint, so the caller's `msdStackWords(n)` words suffice.
+  let top = 0;
+  const push = (lo: number, hi: number, b: number) => {
+    if (top + 3 > stack.length) throw new RangeError("MSD sort stack overflow");
+    stack[top++] = lo;
+    stack[top++] = hi;
+    stack[top++] = b;
+  };
+  if (n > LEAF_ROWS) push(0, n, 0);
+  else if (n > 1) yield* leaf(0, n);
+  while (top > 0) {
+    const b = stack[--top] ?? 0;
+    const hi = stack[--top] ?? 0;
+    const lo = stack[--top] ?? 0;
+    if (b >= bytes) {
+      yield* leaf(lo, hi);
       if (slice.due()) yield;
       continue;
     }
@@ -868,7 +881,7 @@ export function* msdSort(
     // Every tuple shares this digit: nothing to move.
     const first = ((tuples[lo * S + word] ?? 0) >>> shift) & mask;
     if (counts[first + 1] === hi - lo) {
-      stack.push(lo, hi, b + width);
+      push(lo, hi, b + width);
       continue;
     }
     for (let d = 0; d < buckets; d++) counts[d + 1] = (counts[d + 1] ?? 0) + (counts[d] ?? 0);
@@ -884,10 +897,23 @@ export function* msdSort(
     for (let d = 0; d < buckets; d++) {
       const start = lo + (starts[d] ?? 0);
       const end = lo + (starts[d + 1] ?? 0);
-      if (end - start > 1) stack.push(start, end, b + width);
+      if (end - start > LEAF_ROWS) push(start, end, b + width);
+      else if (end - start > 1) {
+        // Small buckets are finished now: only large ones wait (the bound above).
+        yield* leaf(start, end);
+        if (slice.tick()) yield;
+      }
     }
     if (slice.due()) yield;
   }
+}
+
+/** Ranges of at most this many rows are insertion-sorted at once (never pushed). */
+const LEAF_ROWS = 48;
+
+/** Words of an MSD sort's stack for n rows: pending ranges are disjoint, each > LEAF_ROWS. */
+export function msdStackWords(n: number): number {
+  return 3 * (Math.floor(n / (LEAF_ROWS + 1)) + 2);
 }
 
 /**

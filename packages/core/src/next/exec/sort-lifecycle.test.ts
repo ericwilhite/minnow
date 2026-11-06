@@ -26,6 +26,7 @@ import {
   TUPLE_WORDS,
   mergeSortJob,
   msdSort,
+  msdStackWords,
   type SortColumn,
 } from "./sort-keys.js";
 import { Slice } from "./slices.js";
@@ -692,6 +693,170 @@ describe("top-N whose grant cannot hold the compaction reserve", () => {
     expect(governor.usedBytes).toBe(0);
     expect(spill.bytesInUse).toBe(0);
   }, 120_000);
+});
+
+describe("review B7-p2c-1 #1: group top-k thresholds are charged", () => {
+  const types = [INT, TEXT];
+  const rows: Row[] = Array.from({ length: 66_000 }, (_, i) => [
+    i % 1000,
+    "x".repeat(1024) + String(66_000 - i).padStart(6, "0"),
+  ]);
+  /** Counts the bytes of threshold copies (Uint8Array slices made by #setGroupThresholds). */
+  const copied = async (run: () => unknown): Promise<number> => {
+    let bytes = 0;
+    // TypedArray's slice, shadowed on Uint8Array.prototype for the run, then unshadowed.
+    const typed = Object.getPrototypeOf(Uint8Array.prototype) as object;
+    const original = Object.getOwnPropertyDescriptor(typed, "slice")?.value as (
+      this: Uint8Array,
+      start?: number,
+      end?: number,
+    ) => Uint8Array;
+    Object.defineProperty(Uint8Array.prototype, "slice", {
+      configurable: true,
+      writable: true,
+      value: function (this: Uint8Array, start?: number, end?: number): Uint8Array {
+        const result = original.call(this, start, end);
+        if (new Error().stack?.includes("setGroupThresholds") === true) bytes += result.length;
+        return result;
+      },
+    });
+    try {
+      await run();
+    } finally {
+      Reflect.deleteProperty(Uint8Array.prototype, "slice");
+    }
+    return bytes;
+  };
+  const best = (out: readonly Row[]) => {
+    expect(out).toHaveLength(1000);
+    for (const row of out) {
+      const p = row[0] as number;
+      // The best (smallest) key of partition p: the last of its rows (66,000 − i descending).
+      const last = 66_000 - 1 - ((66_000 - 1 - p) % 1000);
+      expect(row[1]).toBe("x".repeat(1024) + String(66_000 - last).padStart(6, "0"));
+    }
+  };
+
+  it("every copied threshold byte is charged (review probe: 1,038,000 bytes)", async () => {
+    const { context: ctx, governor } = await context(types);
+    const sink = new CollectSink();
+    const op = new GroupTopKOperator(
+      { types, partitionBy: [0], orderBy: [asc(1)], k: 1 },
+      ctx,
+      sink,
+    );
+    const bytes = await copied(() => drive(new ArraySource(batchesOf(types, rows)), op));
+    expect(bytes).toBe(1_038_000);
+    expect(op.profile.thresholdBytes).toBe(bytes);
+    best(sink.rows);
+    await op.closed;
+    expect(governor.usedBytes).toBe(0);
+  }, 60_000);
+
+  it("a refused threshold drops the optimization and keeps every row", async () => {
+    const { context: ctx, governor } = await context(types);
+    // The grant refuses the threshold copies only (1,038 bytes each: the partition and order
+    // key), not the partition set's growth: the operator must carry on without them.
+    const grant = ctx.grant;
+    const refusing = new Proxy(grant, {
+      get(target, property) {
+        if (property === "allocate")
+          return (bytes: number) =>
+            bytes === 1038 && new Error().stack?.includes("setGroupThresholds") === true
+              ? false
+              : target.allocate(bytes);
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function"
+          ? (value as (...a: unknown[]) => unknown).bind(target)
+          : value;
+      },
+    });
+    const sink = new CollectSink();
+    const op = new GroupTopKOperator(
+      { types, partitionBy: [0], orderBy: [asc(1)], k: 1 },
+      { ...ctx, grant: refusing },
+      sink,
+    );
+    const bytes = await copied(() => drive(new ArraySource(batchesOf(types, rows)), op));
+    expect(bytes).toBe(0);
+    expect(op.profile.thresholdBytes).toBe(0);
+    expect(op.profile.compactions).toBeGreaterThan(0);
+    best(sink.rows);
+    await op.closed;
+    expect(governor.usedBytes).toBe(0);
+  }, 60_000);
+});
+
+describe("review B7-p2c-1 #2: the MSD stack is bounded and charged", () => {
+  // The reviewer's high-fanout keys: a shared first two bytes, then 65,536 two-row buckets.
+  const n = 131_072;
+  const fill = (t: Uint32Array) => {
+    const S = TUPLE_WORDS;
+    for (let i = 0; i < n; i++) {
+      const v = (i >>> 1) * 256 + (i & 1);
+      t[i * S] = 0x0100_0000 | (v >>> 8);
+      t[i * S + 1] = (v << 24) >>> 0;
+      t[i * S + PREFIX_WORDS] = i;
+    }
+  };
+  it("two jobs in lockstep sort within a stack of n / 49 ranges (reviewer: 196,608 live numbers)", () => {
+    const S = TUPLE_WORDS;
+    const a = new Uint32Array(n * S);
+    const b = new Uint32Array(n * S);
+    fill(a);
+    fill(b);
+    const words = msdStackWords(n);
+    expect(words).toBeLessThan(8100);
+    const ga = msdSort(
+      a,
+      new Uint32Array(n * S),
+      n,
+      null,
+      new Slice(0),
+      new RadixScratch(),
+      new Int32Array(words),
+    );
+    const gb = msdSort(
+      b,
+      new Uint32Array(n * S),
+      n,
+      null,
+      new Slice(0),
+      new RadixScratch(),
+      new Int32Array(words),
+    );
+    let da = false;
+    let db = false;
+    while (!da || !db) {
+      if (!da) da = ga.next().done === true;
+      if (!db) db = gb.next().done === true;
+    }
+    for (let i = 0; i < n; i++) {
+      expect(a[i * S + PREFIX_WORDS]).toBe(i);
+      expect(b[i * S + PREFIX_WORDS]).toBe(i);
+    }
+  }, 60_000);
+
+  it("the high-fanout keys sort under a full grant", async () => {
+    const types = [INT];
+    const { context: ctx, governor, spill } = await context(types, 0);
+    const sink = new CollectSink();
+    const op = new SortOperator(
+      { types, keys: [asc(0)], limit: null, offset: 0, withTies: false },
+      ctx,
+      sink,
+    );
+    const keys = Array.from({ length: n }, (_, i) => -2_147_483_648 + (i >>> 1) * 256 + (i & 1));
+    const shuffled: Row[] = keys.map((_, i) => [keys[(i * 7919) % n] ?? 0]);
+    await drive(new ArraySource(batchesOf(types, shuffled)), op);
+    await op.closed;
+    // The first out-of-place row (a 131,072-row diff would take minutes to render).
+    expect(sink.rows).toHaveLength(n);
+    const wrong = sink.rows.findIndex((row, i) => row[0] !== keys[i]);
+    expect(wrong).toBe(-1);
+    expect(governor.usedBytes).toBe(0);
+    expect(spill.bytesInUse).toBe(0);
+  }, 60_000);
 });
 
 describe("review B7-p2b-1 resource probes", () => {

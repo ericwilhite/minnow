@@ -62,6 +62,7 @@ import {
   TUPLE_WORDS,
   directWidth,
   msdSort,
+  msdStackWords,
   collatorFor,
   compareRanges,
   compareRows,
@@ -89,9 +90,10 @@ const BIGINT: PhysicalType = { kind: "int64" };
 export const MAX_FAN_IN = 64;
 /**
  * Sort scratch reserved per row as rows arrive: ids, then (prefix words, row id) tuples and the
- * radix's copy of them (compare and ranks modes use ids and a merge buffer, 8 bytes).
+ * radix's copy of them, and a byte for the MSD stack (n / 49 ranges of 12 bytes; compare and
+ * ranks modes use ids and a merge buffer, 8 bytes).
  */
-const SCRATCH_PER_ROW = 4 + 2 * 4 * TUPLE_WORDS;
+const SCRATCH_PER_ROW = 4 + 2 * 4 * TUPLE_WORDS + 1;
 const POOL_BYTES = 1024 * 1024;
 /** Most operand bytes one decode step builds (the store-wide decode is sliced by them). */
 const DECODE_BYTES = 256 * 1024;
@@ -146,6 +148,8 @@ export interface SortProfile {
   loans: number;
   /** Compare mode: most bytes of decoded operands (JSONB, arrays, ICU text) held, charged. */
   operandBytes: number;
+  /** Per-group top-k: most bytes of partition threshold keys held (charged). */
+  thresholdBytes: number;
 }
 
 /** Bytes a sort needs admitted before it runs (encoder, pool, output chunk). */
@@ -160,6 +164,8 @@ export function sortMinimumBytes(types: readonly PhysicalType[]): number {
     2 * (2048 * (PREFIX_WORDS * 4 + 4) + 4096 + 260) +
     2048 * (row + SCRATCH_PER_ROW) +
     16 * 1024 * (types.length + 2) +
+    // Byte sets (ICU ranks, group thresholds): their initial arenas and slots.
+    (types.length + 1) * (4096 + 256) +
     64 * 1024
   );
 }
@@ -185,7 +191,12 @@ class ByteSet {
   ends: number[] = [];
   hashes: number[] = [];
   charged = 0;
-  constructor(readonly charge: { allocate(n: number): boolean; free(n: number): void }) {}
+  /** Charges its initial arena and slot array (the caller's minimum covers them). */
+  constructor(readonly charge: { allocate(n: number): boolean; free(n: number): void }) {
+    const initial = 4096 + 64 * 4;
+    if (!charge.allocate(initial)) throw new RangeError("A sort's byte set must be admitted");
+    this.charged = initial;
+  }
 
   get size(): number {
     return this.starts.length;
@@ -232,7 +243,9 @@ class ByteSet {
     if ((this.size + 1) * 2 > this.#slots.length) {
       const size = this.#slots.length * 2;
       if (!this.charge.allocate(size * 4)) return -1;
-      this.charged += size * 4;
+      // The old slots go back once the new ones are held.
+      this.charged += size * 4 - this.#slots.length * 4;
+      this.charge.free(this.#slots.length * 4);
       this.#slots = new Int32Array(size).fill(-1);
       for (let id = 0; id < this.size; id++) this.#place(id);
     }
@@ -358,6 +371,10 @@ class Sorter {
   /** Per-group top-k: partition key → its k-th order key so far (rows must beat it). */
   readonly #groups: ByteSet | null;
   #groupThresholds: Array<Uint8Array | undefined> = [];
+  /** Bytes of the threshold copies (charged before each copy, freed on replace and close). */
+  #thresholdBytes = 0;
+  /** The grant refused a threshold: the optimization is off (rows are kept, just not filtered). */
+  #groupThresholdsOff = false;
   #lastSurvivors = 0;
   /**
    * Top-N: bytes held for the next compaction's store, so a full grant can always compact
@@ -437,6 +454,7 @@ class Sorter {
       peakHeldBytes: 0,
       loans: 0,
       operandBytes: 0,
+      thresholdBytes: 0,
     };
   }
 
@@ -885,7 +903,7 @@ class Sorter {
   /** After a per-group compaction: each partition with k survivors gets its k-th key. */
   *#setGroupThresholds(survivors: Int32Array, keep: number, slice: Slice): SlicedJob<void> {
     const groups = this.#groups;
-    if (groups === null) return;
+    if (groups === null || this.#groupThresholdsOff) return;
     const store = this.store;
     let inGroup = 0;
     for (let i = 0; i < survivors.length; i++) {
@@ -897,9 +915,29 @@ class Sorter {
       const [bytes, start, end] = keyOf(store, this.keyColumn, id);
       const length = valueAt32(store, this.prefixColumn + PREFIX_WORDS, id);
       const group = groups.add(bytes, start, start + length);
-      if (group < 0) return;
+      // Charged before the copy; the old one (overlapping it) goes back after.
+      if (group < 0 || !this.charge.allocate(end - start)) {
+        this.#dropGroupThresholds();
+        return;
+      }
+      const old = this.#groupThresholds[group];
       this.#groupThresholds[group] = bytes.slice(start, end);
+      this.#thresholdBytes += end - start;
+      if (this.#thresholdBytes > this.profile.thresholdBytes)
+        this.profile.thresholdBytes = this.#thresholdBytes;
+      if (old !== undefined) {
+        this.charge.free(old.length);
+        this.#thresholdBytes -= old.length;
+      }
     }
+  }
+
+  /** Frees every threshold copy and stops making them (no row is lost: none is filtered). */
+  #dropGroupThresholds(): void {
+    if (this.#thresholdBytes > 0) this.charge.free(this.#thresholdBytes);
+    this.#thresholdBytes = 0;
+    this.#groupThresholds = [];
+    this.#groupThresholdsOff = true;
   }
 
   /** From sorted ids, the ones to keep: the first `keep` (with ties), or per partition. */
@@ -1195,6 +1233,8 @@ class Sorter {
         covered ? null : (a, b) => this.compareIds(a, b),
         slice,
         this.radix,
+        // Its stack (at most n / 49 ranges of 3 words): the reserve's last byte per row.
+        new Int32Array(msdStackWords(n)),
       );
       for (let i = 0; i < n; i++) {
         ids[i] = tuples[i * S + PREFIX_WORDS] ?? 0;
@@ -1594,6 +1634,9 @@ class Sorter {
     this.encoder?.close(this.pool);
     this.directEncoder?.close(this.pool);
     this.#groups?.close();
+    if (this.#thresholdBytes > 0) this.charge.free(this.#thresholdBytes);
+    this.#thresholdBytes = 0;
+    this.#groupThresholds = [];
     this.partEncoder?.close(this.pool);
     for (const set of this.#sets) set?.close();
     if (this.#reserved > 0) this.charge.free(this.#reserved);
