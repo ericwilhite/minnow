@@ -467,26 +467,35 @@ class Connection {
     this.#runTask(slot, task);
   }
 
+  /**
+   * Runs `task`, then every task queued behind it that finishes synchronously, until one goes
+   * asynchronous (its completion continues the queue) or the queue is empty. A synchronous answer
+   * (a refusal, a replay) must not stall the requests waiting behind it.
+   */
   #runTask(slot: SessionSlot, task: () => void | Promise<void>): void {
-    let result: void | Promise<void>;
-    try {
-      result = task();
-    } catch {
-      result = undefined;
+    let current: (() => void | Promise<void>) | undefined = task;
+    while (current !== undefined) {
+      let result: void | Promise<void>;
+      try {
+        result = current();
+      } catch {
+        result = undefined;
+      }
+      if (isPromise(result)) {
+        slot.busy = true;
+        result.then(
+          () => {
+            this.#taskDone(slot);
+          },
+          () => {
+            this.#taskDone(slot);
+          },
+        );
+        return;
+      }
+      this.#afterTask(slot);
+      current = this.#state === "closed" ? undefined : slot.queue.shift();
     }
-    if (isPromise(result)) {
-      slot.busy = true;
-      result.then(
-        () => {
-          this.#taskDone(slot);
-        },
-        () => {
-          this.#taskDone(slot);
-        },
-      );
-      return;
-    }
-    this.#afterTask(slot);
   }
 
   #taskDone(slot: SessionSlot): void {
@@ -588,12 +597,25 @@ class Connection {
     if (admission.kind !== "execute")
       return this.#answerAdmission(request, admission, planned, slot);
     if (request.retry && !request.resendable) {
-      // First sight of a request that depended on its old connection: never run it here.
+      // First sight of a request that depended on its old connection: never run it here. What
+      // the ledger's silence proves depends on the request. A BEGIN, COMMIT or ROLLBACK leaves
+      // nothing durable but a commit, whose outcome the commit itself records (format/ledger.ts
+      // "Durability"): absent, it did not commit. A statement inside a transaction records its
+      // outcome in memory only, and its transaction may have committed after it: unknown.
+      const control =
+        request.t === "begin" ||
+        request.t === "commit" ||
+        request.t === "rollback" ||
+        planned?.control === "begin" ||
+        planned?.control === "commit" ||
+        planned?.control === "rollback";
       engine.ledger.settle(this.clientId, request.seq);
       this.post({
         t: "error",
         seq: request.seq,
-        error: toWireError(new SessionLostError("transaction", request.seq)),
+        error: toWireError(
+          new SessionLostError("transaction", request.seq, control ? "none" : "unknown"),
+        ),
       });
       return;
     }
@@ -651,10 +673,12 @@ class Connection {
         });
         return;
       case "sessionLost":
+        // A statement of an ended generation's transaction: that transaction may have committed
+        // before the generation ended (its statements' outcomes went with it), so not "none".
         this.post({
           t: "error",
           seq,
-          error: toWireError(new SessionLostError("transaction", seq)),
+          error: toWireError(new SessionLostError("transaction", seq, "unknown")),
         });
         return;
       case "inFlight": {
@@ -1400,7 +1424,13 @@ class Connection {
     }
     this.#streams.clear();
     this.#prepared.clear();
-    for (const slot of this.#sessions.values()) if (!slot.busy) this.#closeSession(slot);
+    // The ledger ends every session's generation now, busy or not: a retry arriving before a busy
+    // session's task finishes must already find it ended (format/ledger.ts `endSession`; a late
+    // completion is ignored). Only the engine session waits for its task.
+    for (const slot of this.#sessions.values()) {
+      this.#endGeneration(slot);
+      if (!slot.busy) this.#closeSession(slot);
+    }
     if (this.#aliveTimer !== null) clearInterval(this.#aliveTimer);
     if (this.#sweepTimer !== null) clearInterval(this.#sweepTimer);
     this.#aliveTimer = null;
@@ -1419,6 +1449,12 @@ class Connection {
     slot.queue.length = 0;
     slot.timer.dispose();
     slot.engine?.close();
+    this.#endGeneration(slot);
+    this.#sessions.delete(slot.id);
+  }
+
+  /** Ends this connection's generation of `slot`'s session in the ledger (idempotent). */
+  #endGeneration(slot: SessionSlot): void {
     if (this.clientId !== "")
       this.#server.engine.ledger.endSession(
         this.clientId,
@@ -1426,7 +1462,6 @@ class Connection {
         this.generation,
         this.#server.now(),
       );
-    this.#sessions.delete(slot.id);
   }
 }
 

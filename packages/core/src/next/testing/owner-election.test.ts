@@ -5,7 +5,10 @@
  * MessageChannel. The browser suite (browser-tests/next-owner.spec.ts) runs the same scenarios
  * across real tabs.
  */
+import fc from "fast-check";
 import { afterEach, describe, expect, it } from "vitest";
+import { LEDGER_RESOLUTION_STATES, createReach } from "../../testing/reach.js";
+import { seedsFor } from "../../testing/seeds.js";
 import type { ChunkReads } from "../exec/scan.js";
 import { Governor } from "../memory/governor.js";
 import { Broker } from "../owner/broker.js";
@@ -54,7 +57,8 @@ function world(): World {
 
 /** The engine on an in-memory file; the open "handle" is the fence (busy while open). */
 function factory(world: World): OwnerEngineFactory<{ readonly db: string }> {
-  const open = new Set<string>();
+  /** The open fence per database: a save through a closed one is a dead owner's, and is lost. */
+  const open = new Map<string, { readonly db: string }>();
   return {
     openFence(db) {
       if (open.has(db)) {
@@ -62,11 +66,12 @@ function factory(world: World): OwnerEngineFactory<{ readonly db: string }> {
         busy.name = "NoModificationAllowedError";
         throw busy;
       }
-      open.add(db);
-      return { db };
+      const fence = { db };
+      open.set(db, fence);
+      return fence;
     },
     closeFence(fence) {
-      open.delete(fence.db);
+      if (open.get(fence.db) === fence) open.delete(fence.db);
     },
     open(fence, settings) {
       const onSave = settings.onSave as ((text: string) => void) | undefined;
@@ -79,6 +84,8 @@ function factory(world: World): OwnerEngineFactory<{ readonly db: string }> {
         persistence: {
           load: () => world.files.get(fence.db) ?? null,
           save: (text) => {
+            // A killed owner's timers may still fire in process; its handles are closed.
+            if (open.get(fence.db) !== fence) return;
             world.files.set(fence.db, text);
             onSave?.(text);
           },
@@ -884,7 +891,7 @@ describe("review of increment 2 (B5-p2b-review-1)", () => {
     await until(() => broker.heldPorts === 0);
   });
 
-  it("1: the client never resends a lost session's in-flight statement (only its COMMIT)", async () => {
+  it("1: a lost session's in-flight requests all go back to the ledger, none resendable (review 3)", async () => {
     const sent: Array<Record<string, unknown>> = [];
     const fake = () => {
       const port = {
@@ -932,19 +939,14 @@ describe("review of increment 2 (B5-p2b-review-1)", () => {
     const commitSeq = sent.at(-1)?.seq as number;
     sent.length = 0;
     await client.reconnect(fake() as unknown as MessagePort);
-    const resent = sent.filter((message) => message.retry === true).map((message) => message.seq);
-    expect(resent).not.toContain(updateSeq);
-    expect(resent).toEqual([commitSeq]);
-    expect(
-      await Promise.race([
-        update.then(
-          () => "ran",
-          (error: unknown) => (error as { lost?: string }).lost,
-        ),
-        sleep(50).then(() => "pending"),
-      ]),
-    ).toBe("transaction");
+    // Both are resent, in send order, and neither may run on the new owner: its ledger answers.
+    const resent = sent.filter((message) => message.retry === true);
+    expect(resent.map((message) => [message.seq, message.resendable])).toEqual([
+      [updateSeq, false],
+      [commitSeq, false],
+    ]);
     client.close();
+    await update.catch(() => undefined);
     await commit.catch(() => undefined);
   });
 
@@ -1018,4 +1020,226 @@ describe("review 2 of increment 2 (B5-p2b-review-2)", () => {
     expect(w.owners).toHaveLength(2);
     expect(b.client.lostSessions.has(1)).toBe(false);
   });
+});
+
+/**
+ * A client connected straight to owner `index`'s server through a port whose replies can be
+ * dropped from a given moment (a reply lost with its owner), and reconnected to another owner.
+ */
+function wiredClient(w: World, index: number) {
+  const channel = new MessageChannel();
+  const drop = { all: false, commitReplies: false };
+  const serverPort = {
+    onmessage: null as ((event: MessageEvent) => void) | null,
+    postMessage(message: { t: string; summary?: { command?: string } }) {
+      if (drop.all) return;
+      if (drop.commitReplies && message.t === "done" && message.summary?.command === "COMMIT")
+        return;
+      channel.port1.postMessage(message);
+    },
+    close() {
+      channel.port1.close();
+    },
+  };
+  channel.port1.onmessage = (event) => serverPort.onmessage?.(event);
+  const host = w.owners[index]?.host;
+  if (host === undefined || host === null) throw new Error("no owner");
+  host.server.accept(serverPort);
+  const client = new ProtocolClient();
+  cleanups.push(() => {
+    client.close();
+    channel.port1.close();
+    channel.port2.close();
+  });
+  const reconnectTo = async (owner: number) => {
+    const next = new MessageChannel();
+    const target = w.owners[owner]?.host;
+    if (target === undefined || target === null) throw new Error("no owner");
+    target.server.accept(next.port1);
+    cleanups.push(() => {
+      next.port1.close();
+      next.port2.close();
+    });
+    await client.reconnect(next.port2);
+  };
+  return { client, drop, connect: () => client.connect(channel.port2), reconnectTo };
+}
+
+describe("review 3 of increment 2 (B5-p2b-review-3): pending requests resolve through the ledger", () => {
+  async function setup(settings: Readonly<Record<string, unknown>> = {}) {
+    const w = world();
+    const saves = { count: 0, killAt: Number.POSITIVE_INFINITY };
+    const a: Tab = tab(w, {
+      settings: {
+        ...settings,
+        onSave: () => {
+          saves.count++;
+          if (saves.count === saves.killAt) killTab(w, a, 0);
+        },
+      },
+    });
+    await a.connector.start();
+    await a.client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
+    await a.client.query("INSERT INTO t VALUES ($1, $2, $3)", [1, 0, "x"]);
+    const wired = wiredClient(w, 0);
+    await wired.connect();
+    /** Kills owner 0 at the `n`-th save from now. */
+    const killAtSave = (n: number) => {
+      saves.killAt = saves.count + n;
+    };
+    /** A new tab elects a new owner over the same file; the wired client moves to it. */
+    const failover = async () => {
+      const d = tab(w);
+      await d.connector.start();
+      await wired.reconnectTo(w.owners.length - 1);
+      return d;
+    };
+    return { w, a, wired, saves, killAtSave, failover };
+  }
+
+  it("1: a durable autocommit after an unanswered COMMIT is answered from the ledger (the review's probe)", async () => {
+    const { wired, saves, killAtSave, failover } = await setup();
+    const c = wired.client;
+    await c.begin(0);
+    await c.query("UPDATE t SET n = n + 1 WHERE id = $1", [1]);
+    wired.drop.commitReplies = true;
+    // The old owner commits, runs the next increment as autocommit, saves both, then dies.
+    killAtSave(2);
+    const commit = c.commit(0);
+    const write = c.query("UPDATE t SET n = n + 1 WHERE id = $1", [1]);
+    await until(() => saves.count >= saves.killAt);
+    const d = await failover();
+    const [committed, written] = await Promise.all([commit, write]);
+    expect(committed.summary).toMatchObject({ command: "COMMIT", replayed: true });
+    expect(written.summary).toMatchObject({ command: "UPDATE", replayed: true });
+    expect(await value(d.client)).toBe(2);
+    expect(c.lostSessions.has(0)).toBe(false);
+  });
+
+  it("1: when the COMMIT never became durable: it is none, and the statement after it unknown", async () => {
+    let held = false;
+    const { wired, failover, w } = await setup({ flushHeld: () => held });
+    const c = wired.client;
+    await c.begin(0);
+    await c.query("UPDATE t SET n = n + 1 WHERE id = $1", [1]);
+    wired.drop.all = true;
+    held = true;
+    const commit = c.commit(0).then(
+      () => "ok",
+      (error: unknown) => (error as { effect?: string }).effect,
+    );
+    const write = c.query("UPDATE t SET n = n + 1 WHERE id = $1", [1]).then(
+      () => "ok",
+      (error: unknown) => (error as { effect?: string }).effect,
+    );
+    await sleep(30);
+    // Applied, never durable: the owner dies with both.
+    w.owners[0]?.kill();
+    held = false;
+    const d = await failover();
+    expect(await commit).toBe("none");
+    expect(await write).toBe("unknown");
+    expect(await value(d.client)).toBe(0);
+  });
+
+  type Op = "begin" | "inc" | "commit" | "rollback";
+  /** A valid session-0 script: BEGIN only when idle, COMMIT/ROLLBACK only inside a transaction. */
+  const script = fc
+    .array(fc.constantFrom<Op>("begin", "inc", "commit", "rollback"), {
+      minLength: 1,
+      maxLength: 7,
+    })
+    .map((ops) => {
+      let open = false;
+      const valid: Op[] = [];
+      for (const op of ops) {
+        if (op === "begin" && open) continue;
+        if ((op === "commit" || op === "rollback") && !open) continue;
+        if (op === "begin") open = true;
+        if (op === "commit" || op === "rollback") open = false;
+        valid.push(op);
+      }
+      return valid.length === 0 ? (["inc"] as Op[]) : valid;
+    });
+
+  const SEEDS = seedsFor("next-owner-ledger-resolution", [0x1ed6]);
+
+  it.each(SEEDS)(
+    "generated: every reported effect is consistent with the durable state (seed %i)",
+    async (seed) => {
+      const reach = createReach("next-owner-ledger-resolution", LEDGER_RESOLUTION_STATES, {
+        minimum: 3,
+      });
+      await fc.assert(
+        fc.asyncProperty(script, fc.integer({ min: 1, max: 4 }), async (ops, killAt) => {
+          const entered = new Set<string>();
+          const { wired, saves, killAtSave, failover, w } = await setup();
+          const c = wired.client;
+          wired.drop.all = true;
+          killAtSave(killAt);
+          const sql: Record<Op, string> = {
+            begin: "BEGIN",
+            inc: "UPDATE t SET n = n + 1 WHERE id = $1",
+            commit: "COMMIT",
+            rollback: "ROLLBACK",
+          };
+          const results = ops.map((op) =>
+            c.query(sql[op], op === "inc" ? [1] : []).then(
+              (result) => ({ ok: true, replayed: result.summary.replayed, effect: null }),
+              (error: unknown) => ({
+                ok: false,
+                replayed: false,
+                effect:
+                  (error as { effect?: string }).effect ??
+                  `error ${(error as Error).name}: ${(error as Error).message}`,
+              }),
+            ),
+          );
+          // Let the old owner run what it gets to, then make sure it is dead.
+          await until(() => saves.count >= saves.killAt, 300).catch(() => undefined);
+          w.owners[0]?.kill();
+          const d = await failover();
+          const outcomes = await Promise.all(results);
+          const durable = (await value(d.client)) as number;
+          // Bounds from what the client was told, in send order.
+          let confirmed = 0;
+          let unknown = 0;
+          let open = false;
+          let txIncs = 0;
+          ops.forEach((op, i) => {
+            const result = outcomes[i];
+            if (result === undefined) return;
+            if (result.replayed) entered.add(`${op} replayed`);
+            if (!result.ok && result.effect === "none") entered.add(`${op} none`);
+            if (!result.ok && result.effect === "unknown") entered.add(`${op} unknown`);
+            if (op === "begin") {
+              open = true;
+              txIncs = 0;
+            } else if (op === "inc") {
+              if (open) txIncs++;
+              else if (result.ok) confirmed++;
+              else if (result.effect !== "none") unknown++;
+            } else if (op === "commit") {
+              if (result.ok) confirmed += txIncs;
+              else if (result.effect !== "none") unknown += txIncs;
+              open = false;
+            } else {
+              open = false;
+            }
+          });
+          reach.recordHistory(entered);
+          // Every request ends: answered, or refused with what is known about its effect.
+          for (const result of outcomes)
+            expect(result.ok || result.effect === "none" || result.effect === "unknown").toBe(true);
+          // A "none" that took effect, or a lost "ok", breaks these.
+          expect(durable).toBeGreaterThanOrEqual(confirmed);
+          expect(durable).toBeLessThanOrEqual(confirmed + unknown);
+          for (const cleanup of cleanups.splice(0).reverse()) cleanup();
+        }),
+        { seed, numRuns: 60 },
+      );
+      reach.assertReached();
+    },
+    120_000,
+  );
 });

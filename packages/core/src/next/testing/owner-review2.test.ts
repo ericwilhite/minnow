@@ -84,7 +84,24 @@ const outcome = (promise: Promise<unknown>) =>
     (error: unknown) => (error as Error).name,
   );
 
-describe("finding 1: a lost BEGIN binds its session, however it was spelled", () => {
+/** What the client resent after a reconnect: every retry, each of which must not be resendable. */
+const retries = (owner: ReturnType<typeof fakeOwner>) =>
+  owner.sent.filter((message) => message.retry === true);
+
+/** The owner's refusal of a non-resendable retry it has no outcome for (server.ts). */
+const refuse = (owner: ReturnType<typeof fakeOwner>, seq: number, effect: "none" | "unknown") => {
+  owner.reply({
+    t: "error",
+    seq,
+    error: {
+      name: "SessionLostError",
+      message: "lost",
+      props: { code: "MINNOW_SESSION_LOST", lost: "transaction", sequence: seq, effect },
+    },
+  });
+};
+
+describe("finding 1: a lost BEGIN binds its session, however it was spelled (review 3: through the ledger)", () => {
   const spellings = [
     "BEGIN",
     "start transaction",
@@ -100,21 +117,27 @@ describe("finding 1: a lost BEGIN binds its session, however it was spelled", ()
         const client = new ProtocolClient();
         const first = fakeOwner();
         await client.connect(first.port);
-        const begun = outcome(client.query(text, [], { session }));
+        const begun = client.query(text, [], { session });
+        const seq = first.lastSeq();
+        // A BEGIN is never resendable: a new owner refuses it rather than open a transaction.
+        expect(first.sent.at(-1)?.resendable).toBe(false);
         const second = fakeOwner();
         await client.reconnect(second.port);
-        // Never resent: it may have opened a transaction on the old owner.
-        expect(second.sent.filter((message) => message.retry === true)).toEqual([]);
-        expect(await begun).toBe("SessionLostError");
+        // Resent to the new owner's ledger, unchanged and still not runnable there.
+        expect(retries(second).map((m) => [m.seq, m.resendable])).toEqual([[seq, false]]);
         expect(client.lostSessions.has(session)).toBe(true);
-        // What follows on the session is refused, unsent, until it is ended explicitly.
-        const update = outcome(client.query("UPDATE t SET n = n + 1", [], { session }));
-        expect(await update).toBe("SessionLostError");
+        refuse(second, seq, "none");
+        await expect(begun).rejects.toMatchObject({ name: "SessionLostError", effect: "none" });
+        // What follows on the session is refused, unsent (so provably nothing took effect).
+        const update = client.query("UPDATE t SET n = n + 1", [], { session });
+        await expect(update).rejects.toMatchObject({ name: "SessionLostError", effect: "none" });
         expect(second.sent.some((message) => message.text === "UPDATE t SET n = n + 1")).toBe(
           false,
         );
+        // ROLLBACK goes through; the session stays lost until the owner confirms it.
         const rollback = client.query("ROLLBACK", [], { session });
         expect(second.sent.at(-1)?.text).toBe("ROLLBACK");
+        expect(client.lostSessions.has(session)).toBe(true);
         second.done(second.lastSeq(), "ROLLBACK", "idle");
         await rollback;
         expect(client.lostSessions.has(session)).toBe(false);
@@ -130,44 +153,52 @@ describe("finding 1: a lost BEGIN binds its session, however it was spelled", ()
       first.prepared(first.lastSeq(), 1, "begin");
       const { id } = await prepare;
       const begun = outcome(client.execute(id, [], session));
+      const seq = first.lastSeq();
       const second = fakeOwner();
       await client.reconnect(second.port);
-      expect(second.sent.filter((message) => message.retry === true)).toEqual([]);
-      expect(await begun).toBe("SessionLostError");
+      expect(retries(second).map((m) => [m.seq, m.resendable])).toEqual([[seq, false]]);
       expect(client.lostSessions.has(session)).toBe(true);
+      refuse(second, seq, "none");
+      expect(await begun).toBe("SessionLostError");
       client.close();
     });
 
-  it("a statement in flight after an unanswered BEGIN is part of the lost transaction", async () => {
+  it("a statement in flight after an unanswered BEGIN goes to the ledger too, unresendable", async () => {
     const client = new ProtocolClient();
     const first = fakeOwner();
     await client.connect(first.port);
     const begun = outcome(client.query("BEGIN", [], { session: 1 }));
-    const update = outcome(client.query("UPDATE t SET n = 1", [], { session: 1 }));
+    const update = client.query("UPDATE t SET n = 1", [], { session: 1 });
     const second = fakeOwner();
     await client.reconnect(second.port);
-    expect(second.sent.filter((message) => message.retry === true)).toEqual([]);
-    expect([await begun, await update]).toEqual(["SessionLostError", "SessionLostError"]);
+    const sent = retries(second);
+    expect(sent.map((m) => m.resendable)).toEqual([false, false]);
+    refuse(second, sent[0]?.seq as number, "none");
+    refuse(second, sent[1]?.seq as number, "unknown");
+    expect(await begun).toBe("SessionLostError");
+    // The owner said what its ledger proves; the client claims nothing more.
+    await expect(update).rejects.toMatchObject({ name: "SessionLostError", effect: "unknown" });
     client.close();
   });
 
-  it("a multi-statement text is unknown: refused, the session lost, its effect not claimed", async () => {
+  it("a multi-statement text is unknown: unresendable, its session lost, its effect the owner's", async () => {
     const client = new ProtocolClient();
     const first = fakeOwner();
     await client.connect(first.port);
     const multi = client.query("UPDATE t SET n = 1; COMMIT", [], { session: 0 });
     const second = fakeOwner();
     await client.reconnect(second.port);
-    expect(second.sent.filter((message) => message.retry === true)).toEqual([]);
+    expect(retries(second).map((m) => m.resendable)).toEqual([false]);
+    expect(client.lostSessions.has(0)).toBe(true);
+    refuse(second, retries(second)[0]?.seq as number, "unknown");
     await expect(multi).rejects.toMatchObject({ name: "SessionLostError", effect: "unknown" });
     await multi.catch((error: unknown) => {
       expect((error as Error).message).not.toContain("nothing took effect");
     });
-    expect(client.lostSessions.has(0)).toBe(true);
     client.close();
   });
 
-  it("an autocommit statement on idle session 0 is still resent", async () => {
+  it("an autocommit statement on idle session 0 is still resent, resendable", async () => {
     const client = new ProtocolClient();
     const first = fakeOwner();
     await client.connect(first.port);
@@ -175,15 +206,49 @@ describe("finding 1: a lost BEGIN binds its session, however it was spelled", ()
     const seq = first.lastSeq();
     const second = fakeOwner();
     await client.reconnect(second.port);
-    expect(second.sent.filter((message) => message.retry === true).map((m) => m.seq)).toEqual([
-      seq,
-    ]);
+    expect(retries(second).map((m) => [m.seq, m.resendable])).toEqual([[seq, true]]);
     second.done(seq, "UPDATE", "idle");
     await update;
     expect(client.lostSessions.size).toBe(0);
     client.close();
   });
+
+  it("a request issued while no connection was open was never sent: refused with none", async () => {
+    const client = new ProtocolClient();
+    const first = fakeOwner();
+    await client.connect(first.port);
+    const begin = client.begin(1);
+    first.done(first.lastSeq(), "BEGIN", "inTransaction");
+    await begin;
+    // The handshake to a new owner is abandoned: the client has no connection.
+    const abort = new AbortController();
+    const reconnecting = outcome(client.reconnect(fakeSilent(), abort.signal));
+    abort.abort();
+    expect(await reconnecting).toBe("OwnerUnreachableError");
+    const update = client.query("UPDATE t SET n = 1", [], { session: 1 }).then(
+      () => "ran",
+      (error: unknown) =>
+        `${(error as Error).name}:${String((error as { effect?: string }).effect)}`,
+    );
+    const second = fakeOwner();
+    await client.reconnect(second.port);
+    expect(await Promise.race([update, delay().then(() => "sent and pending")])).toBe(
+      "SessionLostError:none",
+    );
+    expect(retries(second)).toEqual([]);
+    expect(second.sent.some((message) => message.text === "UPDATE t SET n = 1")).toBe(false);
+    client.close();
+  });
 });
+
+/** A port that never answers. */
+function fakeSilent(): MessagePort {
+  return {
+    onmessage: null,
+    close: () => undefined,
+    postMessage: () => undefined,
+  } as unknown as MessagePort;
+}
 
 describe("finding 2: a prepared COMMIT goes through the ledger like a typed one", () => {
   it("is resent after a reconnect, and its replayed answer ends the lost session", async () => {
@@ -225,7 +290,7 @@ describe("finding 2: a prepared COMMIT goes through the ledger like a typed one"
     client.close();
   });
 
-  it("a prepared statement whose kind the owner never sent is unknown, never resent", async () => {
+  it("a prepared statement whose kind the owner never sent is unknown: unresendable", async () => {
     const client = new ProtocolClient();
     const first = fakeOwner();
     await client.connect(first.port);
@@ -233,7 +298,9 @@ describe("finding 2: a prepared COMMIT goes through the ledger like a typed one"
     const run = client.execute(9, [], 1);
     const second = fakeOwner();
     await client.reconnect(second.port);
-    expect(second.sent.filter((message) => message.retry === true)).toEqual([]);
+    expect(retries(second).map((m) => m.resendable)).toEqual([false]);
+    expect(client.lostSessions.has(1)).toBe(true);
+    refuse(second, retries(second)[0]?.seq as number, "unknown");
     await expect(run).rejects.toMatchObject({ name: "SessionLostError", effect: "unknown" });
     client.close();
   });
@@ -249,7 +316,10 @@ describe("finding 3: reconnect failures reach cursor consumers", () => {
     await begin;
     const cursor = client.cursor("SELECT * FROM t", [], { session: 1 });
     const waiting = outcome(cursor.frames.next());
-    await client.reconnect(fakeOwner().port);
+    const second = fakeOwner();
+    await client.reconnect(second.port);
+    // Resent unresendable; the owner's refusal reaches the cursor's consumer.
+    refuse(second, retries(second)[0]?.seq as number, "unknown");
     expect(await Promise.race([waiting, delay().then(() => "hung")])).toBe("SessionLostError");
     client.close();
   });

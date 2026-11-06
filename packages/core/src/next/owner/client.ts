@@ -19,13 +19,14 @@
  * ## Sessions bound to their generation
  * A session with an open transaction (any state but `idle`) belongs to the connection generation
  * it ran on. Each request knows its kind (sequence.ts "Statement kinds": typed messages, the
- * owner's `statementKind` for prepared statements, `classifyStatementText` for SQL). On a
- * reconnect, in send order: an unanswered `begin` or `unknown` request is failed, never resent,
- * and its session is lost; a `commit` is resent and the ledger answers it (ending the session);
- * a `rollback` ends the session; any other request of a lost session is failed. Afterwards every
- * request on a lost session fails with `SessionLostError("transaction")` without being sent, so
- * nothing can fall through to autocommit on the new owner, until the client ends the session
- * explicitly. Failures reach a cursor's consumer as well as its promise (`#fail`).
+ * owner's `statementKind` for prepared statements, `classifyStatementText` for SQL); one that may
+ * open, end or change a transaction is never resendable. On a reconnect every sent, unanswered
+ * request goes back unchanged, in send order, and the new owner's ledger resolves it (protocol.ts
+ * "Exactly-once"): the client decides nothing but "never sent" (`none`) and "frames handed out"
+ * (`unknown`). A session open at the loss, or with a BEGIN or unknown request unanswered, is
+ * lost: every new request on it fails with `SessionLostError("transaction")` without being
+ * sent, until the owner confirms an explicit ROLLBACK ended it. Every failure, early or late,
+ * reaches a cursor's consumer as well as its promise (`#refuse`, `#fail`).
  *
  * ## Handshake
  * `connect` and `reconnect` take an optional `AbortSignal`: the connector aborts a handshake whose
@@ -106,6 +107,8 @@ interface Pending {
   dictionaries: StreamDictionaries;
   /** Frames already handed to a cursor consumer: the request cannot be resent. */
   handedOut: boolean;
+  /** Posted on a connection at least once (else it provably never reached an owner). */
+  sent: boolean;
   readonly cursor: CursorQueue | null;
   readonly resolve: (result: ClientResult) => void;
   readonly reject: (error: Error) => void;
@@ -262,33 +265,20 @@ export class ProtocolClient {
     if (this.#session0.transaction !== "idle") lost.add(0);
     for (const session of lost) this.#sessions.set(session, "idle");
     this.#session0.transaction = "idle";
-    // In send order, so a BEGIN in flight makes the session's later requests part of it.
+    // In send order. Nothing is decided here: every request that was sent goes back to the new
+    // owner unchanged, whose ledger answers it (a recorded outcome, or a refusal saying what its
+    // absence proves). A request that depended on the old connection is not resendable, so the
+    // new owner never runs it.
     for (const pending of [...this.#pending.values()].sort((a, b) => a.seq - b.seq)) {
       const { session, kind } = pending;
-      if (session !== null && kind !== null) {
-        if (kind === "begin" || kind === "unknown") {
-          // It may have opened a transaction (or, unknown, done anything): never resend it, and
-          // refuse what follows on the session until it is ended explicitly.
-          lost.add(session);
-          this.#fail(
-            pending,
-            new SessionLostError(
-              "transaction",
-              pending.seq,
-              kind === "unknown" ? "unknown" : "none",
-            ),
-          );
-          continue;
-        }
-        if (kind === "rollback") {
-          // The ROLLBACK the client already asked for: the transaction is gone either way.
-          lost.delete(session);
-        } else if (kind !== "commit" && lost.has(session)) {
-          // It ran, if at all, inside a transaction that rolled back with the old owner.
-          this.#fail(pending, new SessionLostError("transaction", pending.seq));
-          continue;
-        }
-        // A COMMIT is resent unchanged: the new owner's ledger answers it if it committed.
+      // An unanswered BEGIN (or unknown text) may have opened a transaction there: the session
+      // is lost too, so nothing new reaches it until a confirmed ROLLBACK.
+      if (session !== null && (kind === "begin" || kind === "unknown")) lost.add(session);
+      if (!pending.sent && session !== null && lost.has(session)) {
+        // Never sent, so nothing took effect; on the new owner it would run outside the lost
+        // transaction.
+        this.#fail(pending, new SessionLostError("transaction", pending.seq, "none"));
+        continue;
       }
       if (pending.handedOut) {
         // Frames already reached the caller, so it cannot start again. An autocommit write's
@@ -299,7 +289,7 @@ export class ProtocolClient {
       pending.frames.length = 0;
       pending.dictionaries = new StreamDictionaries();
       pending.columns = null;
-      this.#send(pending, true);
+      this.#send(pending, pending.sent);
     }
     return welcome;
   }
@@ -516,24 +506,21 @@ export class ProtocolClient {
     body: Body,
     cursor: CursorQueue | null = null,
   ): { readonly seq: number; readonly promise: Promise<ClientResult> } {
-    if (this.#closed) return { seq: -1, promise: Promise.reject(new ClientClosedError()) };
+    if (this.#closed) return this.#refuse(new ClientClosedError(), cursor);
     const session = "session" in body ? body.session : null;
     const kind = this.#kindOf(body);
     const control = kind !== null && kind !== "other";
-    if (session !== null && this.#lostSessions.has(session)) {
-      // Never sent, so nothing took effect: on the new owner it would run outside the lost
-      // transaction (autocommit). Only an explicit end (ROLLBACK, ABORT) goes through.
-      if (kind !== "rollback")
-        return { seq: -1, promise: Promise.reject(new SessionLostError("transaction")) };
-      this.#lostSessions.delete(session);
-    }
+    // Never sent, so nothing took effect: on the new owner it would run outside the lost
+    // transaction (autocommit). Only an explicit end (ROLLBACK, ABORT) goes through, and the
+    // session stays lost until the owner's reply confirms it.
+    if (session !== null && this.#lostSessions.has(session) && kind !== "rollback")
+      return this.#refuse(new SessionLostError("transaction", undefined, "none"), cursor);
     const seq = this.#sequencer.issue();
     if (seq === null)
-      return {
-        seq: -1,
-        promise: Promise.reject(new RangeError("Outstanding request window is full")),
-      };
-    const resendable = isResendable(body, this.#session0);
+      return this.#refuse(new RangeError("Outstanding request window is full"), cursor);
+    // A request that may open, end or change a transaction never means the same on a fresh
+    // connection: it is never resendable, so a new owner refuses it rather than running it.
+    const resendable = !control && isResendable(body, this.#session0);
     let resolve: (result: ClientResult) => void = () => undefined;
     let reject: (error: Error) => void = () => undefined;
     const promise = new Promise<ClientResult>((res, rej) => {
@@ -553,6 +540,7 @@ export class ProtocolClient {
       frames: [],
       dictionaries: new StreamDictionaries(),
       handedOut: false,
+      sent: false,
       cursor,
       resolve,
       reject,
@@ -573,6 +561,7 @@ export class ProtocolClient {
   }
 
   #send(pending: Pending, retry: boolean): void {
+    if (this.#port !== null) pending.sent = true;
     this.#port?.postMessage({
       ...pending.body,
       seq: pending.seq,
@@ -592,6 +581,21 @@ export class ProtocolClient {
     this.#sequencer.resolve(seq);
     if (pending.control && pending.session === 0) this.#session0.unresolvedControl--;
     queueMicrotask(() => this.onActivity?.());
+  }
+
+  /**
+   * A request refused before it was issued (closed, a lost session, a full window): its promise
+   * rejects, and so does a cursor's queue, which its consumer waits on.
+   */
+  #refuse(
+    error: Error,
+    cursor: CursorQueue | null,
+  ): { readonly seq: number; readonly promise: Promise<ClientResult> } {
+    if (cursor !== null) {
+      cursor.error = error;
+      cursor.wake?.();
+    }
+    return { seq: -1, promise: Promise.reject(error) };
   }
 
   /**
@@ -649,8 +653,13 @@ export class ProtocolClient {
             this.#port?.postMessage({ t: "release", target: message.seq, through: last.sequence });
         }
         if (message.t === "done") {
-          // A COMMIT resent after a reconnect, answered (from the ledger): the session ended.
-          if (pending.session !== null && pending.kind === "commit")
+          // The owner confirmed the session ended (a COMMIT answered from the ledger, or a ROLLBACK
+          // that succeeded): a lost session is usable again. Never on send.
+          if (
+            pending.session !== null &&
+            (pending.kind === "commit" || pending.kind === "rollback") &&
+            message.summary.transaction === "idle"
+          )
             this.#lostSessions.delete(pending.session);
           if (pending.session === 0) this.#session0.transaction = message.summary.transaction;
           if (pending.session !== null)

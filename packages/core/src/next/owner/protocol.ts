@@ -107,20 +107,27 @@
  *   statements never run outside it, and a COMMIT whose fate is unknown resolves from the ledger:
  *   committed, or definitely not.
  * - A session with an open transaction belongs to its connection generation (B5-p2b reviews 1
- *   and 2). What a request does to its session's transaction comes from authority: a prepared
+ *   to 3). What a request does to its session's transaction comes from authority: a prepared
  *   statement's kind from this owner's `prepared` reply (`statementKind`), SQL text from the
  *   client's classifier, which follows the front end's lexer (sequence.ts
- *   `classifyStatementText`; multi-statement text is `unknown`). After a reconnect, in send order:
- *   a request in flight whose kind is `begin` or `unknown` is refused and never resent, and its
- *   session is lost (session 0 included); `commit` is resent and the ledger answers it
- *   (committed: the session ends); `rollback` ends the session; anything else on a lost session
- *   is refused. Until the client ends a lost session (ROLLBACK, ABORT), every new request on it
- *   fails with `SessionLostError("transaction")` in the client, unsent: nothing meant for the lost
- *   transaction runs as autocommit on the new owner.
- * - `SessionLostError.effect` says whether "nothing took effect" is proven (`none`: never sent,
- *   ran only inside a transaction that rolled back, or no commit in the ledger) or not
- *   (`unknown`: a multi-statement text, a cursor whose frames were handed out, a result whose
- *   statement passed its commit point). Only `none` claims nothing took effect. *
+ *   `classifyStatementText`; multi-statement text is `unknown`). A request that may open, end or
+ *   change a transaction is never `resendable`.
+ * - After a reconnect, every request the client sent and has no reply for goes back to the new
+ *   owner unchanged, in send order, and the ledger resolves it: a recorded outcome is delivered;
+ *   a non-resendable retry it has no outcome for is refused, never run. The client decides no
+ *   outcome itself, except for a request it provably never sent (refused with `none`) and a
+ *   cursor whose frames it already handed out (`unknown`: its rows cannot be replayed).
+ * - A session open at the loss, or with a BEGIN or unknown request unanswered, is lost: every
+ *   new request on it fails with `SessionLostError("transaction")` in the client, unsent, so
+ *   nothing meant for the lost transaction runs as autocommit. Only ROLLBACK / ABORT is sent, and
+ *   the session is usable again only once the owner's reply confirms it ended (a ROLLBACK that
+ *   left it idle, or a COMMIT answered from the ledger), never on send.
+ * - `SessionLostError.effect` says whether "nothing took effect" is proven. `none`: never sent;
+ *   or a BEGIN, COMMIT or ROLLBACK the owner's ledger has no outcome for (a commit records its
+ *   outcome atomically with its effect, format/ledger.ts "Durability"); or a run the owner stopped
+ *   before its commit point. `unknown` otherwise: a statement of a transaction that may have
+ *   committed after it (in memory only in the ledger), a multi-statement text, a cursor whose
+ *   frames were handed out, a result whose statement passed its commit point. *
  * ## Idle transactions (ruling R16.7)
  * - The owner rolls back a transaction left idle for `transactionIdleTimeoutMs` (default 30 s, as
  *   in 0.19): no request of its session running and none arriving. The timer starts when the

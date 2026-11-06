@@ -57,9 +57,10 @@ export class SessionLostError extends Error {
     effect: "none" | "unknown" = "none",
   ) {
     const outcome =
-      effect === "none"
+      (effect === "none"
         ? "nothing took effect"
-        : "it may have taken effect before the connection changed: check before retrying";
+        : "it may have taken effect before the connection changed: check before retrying") +
+      (lost === "transaction" ? "; send ROLLBACK to use the session again" : "");
     super(
       sequence === undefined
         ? `The ${lost} was lost when the connection to the database owner changed; ${outcome}`

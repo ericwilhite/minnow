@@ -22,9 +22,12 @@
  * - When the owner changes, the client reconnects and resends unanswered requests; the ledger
  *   makes writes exactly-once. Prepared statements are re-prepared and subscriptions resubscribed
  *   transparently.
- * - Open transactions and cursors cannot move: they fail with `SessionLostError` (nothing took
- *   effect). A retried write whose RETURNING rows were lost fails with
- *   `CommittedWithoutResultError` (it did commit).
+ * - Open transactions and cursors cannot move: they fail with `SessionLostError`. Its `effect`
+ *   says what is proven: `none` (it never ran, or the ledger proves it did not commit) or
+ *   `unknown` (it may have taken effect: check before retrying). A session that lost its
+ *   transaction refuses every request until the app sends ROLLBACK and the owner confirms it.
+ *   A retried write whose RETURNING rows were lost fails with `CommittedWithoutResultError` (it
+ *   did commit).
  * - A frozen owner fails reads with `OwnerUnresponsiveError` after `unresponsiveAfterMs`, and
  *   writes in flight with `OutcomeUnknownError { reason: "unresponsive" }`: they may still commit.
  */

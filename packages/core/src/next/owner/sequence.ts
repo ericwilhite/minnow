@@ -199,8 +199,8 @@ function lex(sql: string): Token[] | null {
 /**
  * What SQL `text` does to its session's transaction, classified as the front end routes it
  * (engine/query.ts `compileStatement`, `parseTransactionStatement`): BEGIN, START [TRANSACTION]
- * → `begin`; COMMIT, END → `commit`; ROLLBACK, ABORT → `rollback`; ROLLBACK TO, SAVEPOINT,
- * RELEASE → `savepoint`; any other leading word → `other`. Text with a statement separator
+ * → `begin`; COMMIT, END → `commit`; ROLLBACK, ABORT → `rollback`; ROLLBACK [WORK |
+ * TRANSACTION] TO, SAVEPOINT, RELEASE → `savepoint`; any other leading word → `other`. Text with a statement separator
  * other than one trailing `;` (the front end strips exactly one) is `unknown`, as is text the
  * front end could not lex. The suite `owner-statement-kind.test.ts` checks it against the front
  * end itself. Prepared statements take their kind from the owner instead (`Prepared`).
@@ -222,7 +222,12 @@ export function classifyStatementText(text: string): StatementKind {
     case "ABORT":
       return "rollback";
     case "ROLLBACK": {
-      const next = tokens[1];
+      // ROLLBACK [WORK | TRANSACTION] TO [SAVEPOINT] name undoes to a savepoint; the front end
+      // accepts only the bare spelling and refuses the others, but none of them ends the
+      // transaction, so none is a rollback.
+      let next = tokens[1];
+      if (next?.kind === "word" && (next.upper === "WORK" || next.upper === "TRANSACTION"))
+        next = tokens[2];
       return next?.kind === "word" && next.upper === "TO" ? "savepoint" : "rollback";
     }
     case "SAVEPOINT":

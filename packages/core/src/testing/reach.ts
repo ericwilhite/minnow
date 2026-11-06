@@ -140,3 +140,15 @@ export const STATEMENT_KIND_STATES = [
   "multi-statement",
   "refused by the front end",
 ] as const;
+
+/**
+ * Pending requests resolved through the ledger after an owner death (next/testing/owner-election
+ * .test.ts, review 3): a lost reply answered from the ledger, an absence proven, an effect left
+ * unknown.
+ */
+export const LEDGER_RESOLUTION_STATES = [
+  "commit replayed",
+  "commit none",
+  "inc replayed",
+  "inc unknown",
+] as const;
