@@ -35,12 +35,14 @@ class PortDouble {
   /** The delivery delay of a message posted on this end; Infinity: lost (and all after it). */
   delayOf: (data: unknown) => number = () => 0;
   afterEnqueue: () => void = () => undefined;
+  beforeDelivery: (data: unknown) => Promise<void> = () => Promise.resolve();
 
   postMessage(data: unknown): void {
     const peer = this.peer;
     const delay = this.delayOf(data);
     this.#queue = this.#queue.then(async () => {
       if (delay === Infinity) await new Promise<never>(() => undefined);
+      await this.beforeDelivery(data);
       await sleep(delay);
       if (peer !== null && !peer.closed) peer.onmessage?.({ data });
     });
@@ -278,12 +280,25 @@ describe("inside storage needs an open platform request (finding 2)", () => {
   });
 
   it("concurrent: windows and open requests are reported apart", async () => {
+    let releaseSecondGo!: () => void;
+    const secondGo = new Promise<void>((resolve) => {
+      releaseSecondGo = resolve;
+    });
+    let markersPosted!: () => void;
+    const markers = new Promise<void>((resolve) => {
+      markersPosted = resolve;
+    });
     scenario = (worker) => {
+      // Deliberately hold the second lane: wall time cannot establish that it began.
+      const pagePort = worker.port.peer;
+      if (pagePort === null) throw new Error("no page port");
+      pagePort.beforeDelivery = (data) =>
+        (data as { go?: number }).go === 2 ? secondGo : Promise.resolve();
       worker.post({ chaos: "intent", intent: { step: "write", sequence: 1 } });
       worker.post({ chaos: "intent", intent: { step: "spill", sequence: 2 } });
       worker.onGo = (sequence) => {
         worker.post({ chaos: "began", sequence });
-        if (sequence === 2)
+        if (sequence === 2) {
           worker.post({
             chaos: "request",
             id: 7,
@@ -291,12 +306,20 @@ describe("inside storage needs an open platform request (finding 2)", () => {
             target: "spill+spill-index",
             op: "readwrite/relaxed",
           });
+          markersPosted();
+        }
       };
     };
     await chaosBegin("indexeddb", "windows", 1, null, null, "concurrent");
-    const landing = await chaosKillAfter(20);
-    expect(landing.inOperation).toEqual(["spill", "write"]);
-    expect(landing.requests).toEqual(["spill+spill-index:readwrite/relaxed"]);
+    try {
+      releaseSecondGo();
+      await markers;
+      const landing = await chaosKillAfter(0);
+      expect(landing.inOperation).toEqual(["spill", "write"]);
+      expect(landing.requests).toEqual(["spill+spill-index:readwrite/relaxed"]);
+    } finally {
+      releaseSecondGo();
+    }
   });
 });
 
