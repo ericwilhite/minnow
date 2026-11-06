@@ -215,28 +215,47 @@ function* rangeBounds(
     }
     return;
   }
-  // Along the sort direction, "after" means a larger key ascending, a smaller one descending.
-  const dir = descending ? -1 : 1;
-  const nullValue = nullsFirst ? -Infinity : Infinity;
-  const at = (j: number) => (valid[j] === 1 ? (values[j] ?? 0) * dir : nullValue);
   let p = 0;
   for (let i = 0; i < n; i++) {
     if (valid[i] === 0) {
       out[i] = (end ? peers.end[i] : peers.start[i]) ?? i;
       continue;
     }
-    const target = (values[i] ?? 0) * dir + delta;
+    const contains = (j: number) =>
+      valid[j] !== 1
+        ? end
+          ? nullsFirst
+          : !nullsFirst
+        : floatRangeContains(values[j] ?? 0, values[i] ?? 0, delta, descending, end);
     if (end) {
-      // Last row with sort value ≤ target (non-decreasing in i).
-      while (p < n && at(p) <= target) p++;
+      while (p < n && contains(p)) p++;
       out[i] = p - 1;
     } else {
-      // First row with sort value ≥ target.
-      while (p < n && at(p) < target) p++;
+      while (p < n && !contains(p)) p++;
       out[i] = p;
     }
     if ((i & (SLICE_ROWS - 1)) === SLICE_ROWS - 1 && slice.due()) yield;
   }
+}
+
+/**
+ * PostgreSQL float.c in_range_float8_float8: NaN is above every non-NaN and equal to
+ * itself; an infinite base and cancelling infinite offset admit every non-NaN value.
+ * NULL validity is handled by the caller, never encoded as an infinity sentinel.
+ */
+export function floatRangeContains(
+  value: number,
+  base: number,
+  delta: number,
+  descending: boolean,
+  end: boolean,
+): boolean {
+  const less = end !== descending;
+  if (Number.isNaN(value)) return Number.isNaN(base) || !less;
+  if (Number.isNaN(base)) return less;
+  const target = base + (descending ? -delta : delta);
+  if (Number.isNaN(target)) return true;
+  return less ? value <= target : value >= target;
 }
 
 /** A numeric argument of one partition: values and validity per row. */

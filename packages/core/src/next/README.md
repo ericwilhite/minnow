@@ -799,6 +799,10 @@ and the owner import it directly.
 
 ### Windows (`exec/window.ts`, `window-sort.ts`, `window-frames.ts`, `window-stream.ts`)
 
+- Float RANGE offsets follow PostgreSQL's `in_range_float8_float8`: NaN peers compare equal,
+  NaN sorts above infinity, and NULL validity stays separate from numeric values. Infinite
+  offsets retain PostgreSQL's infinity rules on both resident and streamed paths.
+
 - One task clock per worker (`exec/pipeline.ts` `TaskClock`, ruling R23.5): the driver, scans,
   aggregation, join, sort, top-k and window all yield once `YIELD_INTERVAL_MS` has passed since
   the worker's task began, and keep no slice start of their own, so several operators in one

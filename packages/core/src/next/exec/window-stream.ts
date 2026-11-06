@@ -32,7 +32,7 @@ import { keysEqual, markChanges, type SortColumn } from "./sort-keys.js";
 import type { Slice, SlicedJob } from "./slices.js";
 import type { SpilledRun } from "./spill-pages.js";
 import type { Charge, Pool, SpillIo } from "./spill-pool.js";
-import { WindowError, type Frame, type FrameBound } from "./window-frames.js";
+import { floatRangeContains, WindowError, type Frame, type FrameBound } from "./window-frames.js";
 
 /** nth_value's largest n a stream serves from its copy of the partition's first rows. */
 export const NTH_LIMIT = 4096;
@@ -737,33 +737,36 @@ export class PartitionStream {
     const at = i - this.#base;
     if (this.#keyOk[at] !== 1) return end ? (pe < 0 ? null : pe) : ps;
     if (this.#keyBig !== null) return this.#rangeBoundExact(i, delta, end);
-    const dir = this.spec.orderBy[0]?.direction === "desc" ? -1 : 1;
-    const target = (this.#key[at] ?? 0) * dir + delta;
-    // NULL keys sort below (NULLS FIRST) or above (NULLS LAST) every value (PostgreSQL).
-    const nullValue = this.spec.orderBy[0]?.nulls === "first" ? -Infinity : Infinity;
-    const keyAt = (j: number) =>
-      this.#keyOk[j - this.#base] === 1 ? (this.#key[j - this.#base] ?? 0) * dir : nullValue;
-    const okAt = (j: number) => j >= this.#base;
+    const base = this.#key[at] ?? 0;
+    // Finite offsets cannot move an infinity; no offset moves a NaN. Their boundary is
+    // the peer edge even when older peer rows have left the ring.
+    if (Number.isNaN(base) || (!Number.isFinite(base) && Number.isFinite(delta)))
+      return end ? (pe < 0 ? null : pe) : ps;
+    const descending = this.spec.orderBy[0]?.direction === "desc";
+    const nullsFirst = this.spec.orderBy[0]?.nulls === "first";
+    const contains = (j: number) =>
+      this.#keyOk[j - this.#base] !== 1
+        ? end
+          ? nullsFirst
+          : !nullsFirst
+        : floatRangeContains(
+            this.#key[j - this.#base] ?? 0,
+            this.#key[at] ?? 0,
+            delta,
+            descending,
+            end,
+          );
+    // Find either side of i: offsets leave NaN/infinity peers unchanged, so the boundary
+    // need not lie on the side of i suggested by the offset's sign.
+    let j = i;
     if (end) {
-      // The last non-NULL row with key·dir ≤ target (−1-like when none: an empty frame).
-      if (delta >= 0) {
-        let j = i;
-        while (j + 1 < this.#read && okAt(j + 1) && keyAt(j + 1) <= target) j++;
-        if (j + 1 >= this.#read && !this.#ended) return null;
-        return j;
-      }
-      let j = i;
-      while (j >= this.#base && (!okAt(j) || keyAt(j) > target)) j--;
-      return j < this.#base ? this.#base - 1 : j;
-    }
-    // The first non-NULL row with key·dir ≥ target (n when none: an empty frame).
-    if (delta <= 0) {
-      let j = i;
-      while (j - 1 >= this.#base && okAt(j - 1) && keyAt(j - 1) >= target) j--;
+      while (j >= this.#base && !contains(j)) j--;
+      while (j + 1 < this.#read && contains(j + 1)) j++;
+      if (j + 1 >= this.#read && !this.#ended) return null;
       return j;
     }
-    let j = i;
-    while (j < this.#read && (!okAt(j) || keyAt(j) < target)) j++;
+    while (j > this.#base && contains(j - 1)) j--;
+    while (j < this.#read && !contains(j)) j++;
     if (j >= this.#read) return this.#ended ? this.#total() : null;
     return j;
   }
@@ -913,11 +916,13 @@ export class PartitionStream {
       }
       if (s.frame.start.kind === "unbounded-preceding") continue;
       // A start ahead of the row needs nothing before it (but the row before, for differences).
-      if (s.frame.start.kind === "following") {
+      if (s.frame.start.kind === "following" && s.frame.unit === "rows") {
         keep = Math.min(keep, i - 1);
         continue;
       }
-      // Other starts depend only on rows read; unknown, everything stays.
+      // RANGE/GROUPS FOLLOWING can still start at an earlier peer (zero offsets, NaN
+      // or infinity). Retain its actual prefix boundary, not merely i - 1. An unknown
+      // start conservatively keeps everything read so far.
       const start = this.#bound(s, i, s.frame.start, false);
       keep = Math.min(keep, start === null ? this.#base : start - 1);
     }
