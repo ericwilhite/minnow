@@ -269,6 +269,7 @@ export const BROKER_RESTART_STATES = [
 
 /** Discovery must finish despite responsive negative replies, failed hellos or stuck startup. */
 export const OWNER_DISCOVERY_STATES = [
+  "delayed event-loop turn",
   "noOwner",
   "unreachable",
   "handshake timeout",
@@ -291,4 +292,23 @@ export const BROKER_REGISTRATION_STATES = [
   "stop cancels retry",
   "host fence cancels retry",
   "same instance repeated",
+] as const;
+
+/** Owner lease release (next/testing/owner-step-down.test.ts): publication waits for release. */
+export const OWNER_RELEASE_STATES = [
+  "storage session close awaited",
+  "active work drains",
+  "disconnected work drains",
+  "unsettled report",
+  "release pending",
+  "clean void",
+  "clean report",
+  "sync unsettled",
+  "async unsettled",
+  "freeze",
+  "pagehide",
+  "hidden",
+  "superseded",
+  "closing",
+  "lockLost",
 ] as const;

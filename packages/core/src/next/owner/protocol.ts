@@ -660,6 +660,14 @@ export interface StepDown {
   readonly reason: "freeze" | "pagehide" | "hidden" | "superseded" | "closing" | "lockLost";
 }
 
+/**
+ * A coordination diagnostic with this context and SessionLostError(effect unknown) means lease
+ * release did not settle. Clients fail pending calls before reconnecting and suggest a reload.
+ * This uses the existing diagnostic wire shape; it is not a successful commit acknowledgement.
+ */
+export const LEASE_RELEASE_FAILURE_CONTEXT =
+  "lease.release: outcome unknown; reload this page before continuing";
+
 /** A failure that belongs to no request (maintenance, coordination), for `onOwnerError`. */
 export interface Diagnostic {
   readonly t: "diagnostic";

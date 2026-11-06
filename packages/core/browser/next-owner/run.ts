@@ -9,14 +9,17 @@ import {
   relayPageLifecycle,
   workerOwner,
 } from "../../dist/next/owner/connector.js";
-import type { LifecycleEvent } from "../../dist/next/owner/election.js";
+import { STEP_DOWN_BOUND_MS, type LifecycleEvent } from "../../dist/next/owner/election.js";
 import type { WireValue } from "../../dist/next/owner/protocol.js";
 
 interface Opened {
   readonly name: string;
   readonly client: ProtocolClient;
   readonly connector: OwnerConnector;
-  readonly state: { superseded: boolean };
+  readonly state: {
+    superseded: boolean;
+    stepDowns: Array<{ stepDownMs: number; reloadSuggested: boolean }>;
+  };
 }
 
 let opened: Opened | null = null;
@@ -71,7 +74,10 @@ export async function lockCalls(): Promise<{
 
 export async function open(name: string, options: OpenOptions = {}): Promise<{ hosting: boolean }> {
   const mobile = options.mobile ?? false;
-  const state = { superseded: false };
+  const state = {
+    superseded: false,
+    stepDowns: [] as Array<{ stepDownMs: number; reloadSuggested: boolean }>,
+  };
   const client = new ProtocolClient(
     options.protocol === undefined ? {} : { protocol: options.protocol },
   );
@@ -85,7 +91,24 @@ export async function open(name: string, options: OpenOptions = {}): Promise<{ h
         name: "minnow-next-broker",
       }).port,
     startOwner: workerOwner(
-      () => new Worker(new URL("./owner-worker.ts", import.meta.url), { type: "module" }),
+      () => {
+        const worker = new Worker(new URL("./owner-worker.ts", import.meta.url), {
+          type: "module",
+        });
+        worker.addEventListener("message", (event: MessageEvent) => {
+          const status = event.data as {
+            t: string;
+            stepDownMs?: number;
+            reloadSuggested?: boolean;
+          };
+          if (status.t === "minnow:stopped")
+            state.stepDowns.push({
+              stepDownMs: status.stepDownMs ?? -1,
+              reloadSuggested: status.reloadSuggested ?? false,
+            });
+        });
+        return worker;
+      },
       { mobile },
     ),
     context: () => ({
@@ -114,6 +137,9 @@ const plain = (result: ClientResult) => ({
 const errorOf = (error: unknown) => ({
   error: error instanceof Error ? error.name : "Error",
   message: error instanceof Error ? error.message : String(error),
+  ...(typeof error === "object" && error !== null && "effect" in error
+    ? { effect: error.effect }
+    : {}),
 });
 
 export async function query(sql: string, params: WireValue[] = [], session = 0) {
@@ -190,11 +216,11 @@ export async function closeBeforeReady(name: string): Promise<string> {
     settled,
     new Promise<string>((resolve) => setTimeout(() => resolve("hung"), 2_000)),
   ]);
-  // A released Web Lock leaves the manager's state asynchronously: allow it a second.
+  // Startup close also awaits graceful release. Allow its public bound and asynchronous lock cleanup.
   const hostHeld = async () =>
     (await navigator.locks.query()).held?.some((lock) => lock.name === `minnow:${name}:host`) ===
     true;
-  for (let tries = 0; tries < 100 && (await hostHeld()); tries++)
+  for (let tries = 0; tries < (STEP_DOWN_BOUND_MS + 1_000) / 10 && (await hostHeld()); tries++)
     await new Promise((resolve) => setTimeout(resolve, 10));
   const pending = (await navigator.locks.query()).held?.map((lock) => lock.name) ?? [];
   return `${outcome}${(await hostHeld()) ? ` (host lock still held: ${pending.join(", ")})` : ""}`;
@@ -379,4 +405,54 @@ export async function pointReads(count: number, warmup = 200, keys = 100) {
     p99: quantile(times, 0.99),
     max: times.at(-1) ?? Number.NaN,
   };
+}
+
+/** Keep this page alive to observe the release acknowledgement, but retire its connector. */
+export async function stepDownAndWait(event: "freeze" | "pagehide") {
+  const { connector, state } = current();
+  const previous = state.stepDowns.length;
+  connector.lifecycle(event);
+  connector.close();
+  const deadline = Date.now() + 5_000;
+  while (state.stepDowns.length === previous && Date.now() < deadline)
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  const report = state.stepDowns[previous];
+  if (report === undefined)
+    throw new Error("The worker was terminated without a release acknowledgement");
+  return report;
+}
+
+/** Fixture-only barrier: the worker confirms execution or an applied, unacknowledged commit. */
+export async function waitForOwnerPhase(
+  name: string,
+  phase: "held" | "executing" | "commitPending",
+) {
+  const channel = new BroadcastChannel(`minnow-next-test:${name}`);
+  const deadline = Date.now() + 5_000;
+  try {
+    while (Date.now() < deadline) {
+      const nonce = crypto.randomUUID();
+      const reached = await new Promise<boolean>((resolve) => {
+        const timer = setTimeout(() => resolve(false), 1_000);
+        channel.onmessage = (event: MessageEvent) => {
+          const reply = event.data as {
+            t: string;
+            nonce?: string;
+            held?: boolean;
+            executing?: boolean;
+            commitPending?: boolean;
+          };
+          if (reply.t !== "phase" || reply.nonce !== nonce) return;
+          clearTimeout(timer);
+          resolve(reply[phase] === true);
+        };
+        channel.postMessage({ t: "phase?", nonce });
+      });
+      if (reached) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(`Owner did not reach ${phase}`);
+  } finally {
+    channel.close();
+  }
 }

@@ -374,3 +374,81 @@ test("an idle tab whose owner was replaced reconnects at once (the owner's tab r
   expect(Date.now() - started).toBeLessThan(10_000);
   expect(await n(a)).toBe(1);
 });
+
+test("graceful step-down under concurrent reads and writes recovers every time", async ({
+  page,
+  context,
+  browserName,
+}) => {
+  test.setTimeout(300_000);
+  const samples: number[] = [];
+  for (let round = 0; round < 5; round++) {
+    const name = dbName(`step-down-${String(round)}`);
+    const a = await tab(round === 0 ? page : await context.newPage());
+    const b = await tab(await context.newPage());
+    try {
+      await call(a, "wipe", name);
+      await call(a, "open", name);
+      await seed(a);
+      await call(b, "open", name);
+      await call(b, "send", "scan", "SELECT spin($1)", [5_000], 1);
+      // One ordered write stream, concurrent with the scan. Unanswered commits retain their
+      // identities across replacement, so all eight increments must appear exactly once.
+      for (let i = 0; i < 8; i++)
+        await call(b, "send", `write-${String(i)}`, "UPDATE t SET n = n + 1 WHERE id = $1", [1]);
+      await call(a, "waitForOwnerPhase", name, "executing");
+      const report = await call(a, "stepDownAndWait", round % 2 === 0 ? "pagehide" : "freeze");
+      expect(report.reloadSuggested).toBe(false);
+      expect(report.stepDownMs).toBeGreaterThanOrEqual(0);
+      samples.push(report.stepDownMs);
+      for (let i = 0; i < 8; i++)
+        expect(await call(b, "settle", `write-${String(i)}`)).toMatchObject({
+          summary: { rowCount: 1 },
+        });
+      await call(b, "settle", "scan");
+      expect(await n(b)).toBe(8);
+      expect((await call(b, "status")).hosting).toBe(true);
+      expect(await call(b, "query", "UPDATE t SET n = n + 1 WHERE id = $1", [1])).toMatchObject({
+        summary: { rowCount: 1 },
+      });
+      expect(await n(b)).toBe(9);
+    } finally {
+      await a.close();
+      await b.close();
+    }
+  }
+  samples.sort((a, b) => a - b);
+  // Record, do not enforce absolute saturated-host timing (R22.3). Five samples do not certify
+  // the quiet-host p95 target; the assertion above requires a clean release on every round.
+  console.log(
+    JSON.stringify({
+      lane: "owner-step-down",
+      browserName,
+      samplesMs: samples,
+      p95Ms: samples[Math.ceil(samples.length * 0.95) - 1],
+    }),
+  );
+});
+
+test("an unsettled release reports unknown before client reconnect", async ({ page, context }) => {
+  const name = dbName("release-unsettled");
+  const a = await tab(page);
+  const b = await tab(await context.newPage());
+  await call(a, "wipe", name);
+  await call(a, "open", name, { settings: { releaseUnsettled: true } });
+  await seed(a);
+  await call(b, "open", name);
+  await call(a, "knob", name, { t: "hold", value: true });
+  await call(a, "waitForOwnerPhase", name, "held");
+  await call(b, "send", "write", "UPDATE t SET n = n + 1 WHERE id = $1", [1]);
+  await call(a, "waitForOwnerPhase", name, "commitPending");
+  expect(await call(a, "stepDownAndWait", "pagehide")).toMatchObject({ reloadSuggested: true });
+  expect(await call(b, "settle", "write")).toMatchObject({
+    error: "SessionLostError",
+    effect: "unknown",
+  });
+  // The client must check before retrying. A fresh session may observe either outcome.
+  const c = await tab(await context.newPage());
+  await call(c, "open", name);
+  expect([0, 1]).toContain(await n(c));
+});

@@ -26,22 +26,21 @@
  * anything is served. Steps 4 to 6 run with no await between them.
  *
  * ## Stepping down
- * - `terminate` (`freeze`, `pagehide`, a stolen lock): synchronous — the server ends every
- *   connection (requests past the commit boundary complete in memory but their replies go
- *   nowhere), the fence's handles close, the lock is released. A page host also terminates the
- *   worker. Relaxed commits acknowledged since the last flush may be lost, as on power loss.
- * - `stepDown` (`hidden` on mobile, superseded by a newer build): the server tells every client
- *   (`stepDown`), the engine flushes and closes, then the fence closes and the lock is released.
- * - `flush` (`hidden` elsewhere): `engine.flushPending()`; ownership stays.
- * - A stolen fence lock closes the handles at once (storage probe: the steal alone does not stop a
- *   hung owner; only closing the handle does).
+ * Deliberate shutdown (freeze, pagehide, replacement, close, mobile hidden) refuses new work,
+ * drains active tasks and closes their sessions/engine within STEP_DOWN_DRAIN_MS, then awaits
+ * closeFence (the lease.release adapter). Only then may the page terminate the worker.
+ * Release failure or a drain timeout is logged and reported as SessionLostError(effect unknown)
+ * with a reload suggestion. A stolen fence forces release immediately. Hidden on desktop only
+ * flushes. Abrupt page destruction can still kill the worker before this protocol finishes.
+
  */
-import { OwnershipLostError } from "../storage/contract.js";
+import { OwnershipLostError, type OwnerLease } from "../storage/contract.js";
 import { acquireFenced, type HeldLock } from "../storage/fence.js";
 import {
   BROKER_PROTOCOL,
   BROKER_REQUEST_TIMEOUT_MS,
   BROKER_REQUEST_BOUND_MS,
+  STEP_DOWN_DRAIN_MS,
   hostLockName,
   lifecycleAction,
   openChannel,
@@ -76,18 +75,39 @@ export interface OwnerHostInit {
 export type OwnerHostStatus =
   | { readonly t: "minnow:ready"; readonly ownerId: string }
   | { readonly t: "minnow:failed"; readonly error: ReturnType<typeof toWireError> }
-  | { readonly t: "minnow:stopped"; readonly reason: StepDown["reason"] };
+  | {
+      readonly t: "minnow:stopped";
+      readonly reason: StepDown["reason"];
+      /** From the start of the step-down to the fence released (measurement). */
+      readonly stepDownMs: number;
+      /** Release did not settle cleanly: the page should reload before continuing. */
+      readonly reloadSuggested?: boolean;
+    };
 
 /** Messages the page posts to its owner worker after `minnow:host`. */
 export type OwnerHostCommand =
   | { readonly t: "minnow:lifecycle"; readonly event: LifecycleEvent; readonly platform: Platform }
-  | { readonly t: "minnow:stepDown" };
+  /** Step down gracefully (DECISIONS.md "Step-down"): the page terminates the worker on `stopped`. */
+  | { readonly t: "minnow:stepDown"; readonly reason?: StepDown["reason"] };
+
+/** The public lease's result, also allowing adapters with no asynchronous work. */
+type FenceRelease = Awaited<ReturnType<OwnerLease["release"]>>;
 
 /** How the host opens the engine on the fence; the composition root supplies it. */
 export interface OwnerEngineFactory<F> {
   /** Opens the fence: the store's sync handles. Busy errors are retried by `acquireFenced`. */
   openFence(database: string): F | Promise<F>;
-  closeFence(fence: F): void;
+  /**
+   * Closes the fence: the store's handles, or the IndexedDB connection. A graceful step-down
+   * awaits it (the real backend's `lease.release()` drains in-flight transactions first); a
+   * forced one does not. A returned report carrying `unsettled > 0` is also a failed release.
+   */
+  closeFence(fence: F): FenceRelease | Promise<FenceRelease>;
+  /**
+   * Closes a storage StoreSession the factory owns, after engine close and before lease release.
+   * Omit only if there is no separate store session or engine.close() already closes it.
+   */
+  closeSession?(fence: F): Promise<void>;
   /** Opens the engine on the fence (recovery runs here). */
   open(fence: F, settings: Readonly<Record<string, unknown>>): OwnerEngine | Promise<OwnerEngine>;
   /**
@@ -140,7 +160,9 @@ export async function startOwnerHost<F>(
       ownerLockName(database),
       () => factory.openFence(database),
       (fence) => {
-        factory.closeFence(fence);
+        void Promise.resolve(factory.closeFence(fence)).catch((error: unknown) => {
+          console.error("Owner acquisition release failed; reload this page", error);
+        });
       },
       deps.acquireTimeoutMs === undefined ? {} : { timeoutMs: deps.acquireTimeoutMs },
     );
@@ -154,16 +176,42 @@ export async function startOwnerHost<F>(
   // down before serving anything (the handles first: only closing them stops this owner).
   let engineOpened: OwnerEngine | null = null;
   let hostLock: HeldLock | null = null;
-  const abandon = (error: unknown): never => {
-    factory.closeFence(fence);
+  // Signals may change across the startup awaits; a fresh read avoids a stale flow narrowing.
+  const fenceLost = () => lock.lost.aborted;
+  const abandon = async (error: unknown): Promise<never> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let releasing = false;
+    const mayCloseSession = () => !releasing;
+    try {
+      const closing = (async () => {
+        if (engineOpened !== null) await engineOpened.close();
+        if (mayCloseSession()) await factory.closeSession?.(fence);
+      })();
+      if (lock.lost.aborted) void closing.catch(() => undefined);
+      else
+        await Promise.race([
+          closing,
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, STEP_DOWN_DRAIN_MS);
+          }),
+        ]);
+    } catch (closeError) {
+      console.error("Owner startup close failed; reload this page", closeError);
+    } finally {
+      clearTimeout(timer);
+    }
+    releasing = true;
+    try {
+      // Reporting failure lets the connector stop this worker. Its lease must have completed
+      // release first, including the abort-settle window on a failed engine open.
+      await factory.closeFence(fence);
+    } catch (releaseError) {
+      console.error("Owner startup release failed; reload this page", releaseError);
+    }
     lock.release();
     hostLock?.release();
-    if (engineOpened !== null) void engineOpened.close().catch(() => undefined);
     deps.post({ t: "minnow:failed", error: toWireError(error) });
     throw error;
-  };
-  const checkFence = () => {
-    if (lock.lost.aborted) abandon(new OwnershipLostError(0));
   };
   try {
     engine = await factory.open(fence, init.settings);
@@ -171,7 +219,7 @@ export async function startOwnerHost<F>(
     return abandon(error);
   }
   engineOpened = engine;
-  checkFence();
+  if (fenceLost()) return abandon(new OwnershipLostError(0));
 
   // The host lock moves to the owner itself: the page held it only to serialize the election.
   // Held here, any death of the owner (terminate, crash, closed tab) frees it at once, so waiting
@@ -181,7 +229,7 @@ export async function startOwnerHost<F>(
   } catch (error) {
     return abandon(error);
   }
-  checkFence();
+  if (fenceLost()) return abandon(new OwnershipLostError(0));
 
   // The context id the platform gives this owner's host lock, for the broker's liveness check.
   const lockHolder =
@@ -190,7 +238,7 @@ export async function startOwnerHost<F>(
         (state.held ?? []).find((held) => held.name === hostLockName(database))?.clientId ?? null,
       () => null,
     )) ?? null;
-  checkFence();
+  if (fenceLost()) return abandon(new OwnershipLostError(0));
   const heldHostLock = hostLock;
 
   // No await from here to `minnow:ready`: the lock checks above cover the whole startup.
@@ -297,38 +345,105 @@ export async function startOwnerHost<F>(
 
   const skew = openChannel(skewChannelName(database));
 
-  const release = (reason: StepDown["reason"]) => {
-    factory.closeFence(fence);
-    lock.release();
-    heldHostLock.release();
-    skew?.close();
-    if (broker !== null) {
-      broker.postMessage({
-        t: "unregister",
-        v: BROKER_PROTOCOL,
-        db: database,
-        ownerId,
-      } satisfies BrokerMessage);
-      broker.close();
+  let fenceClosing: Promise<FenceRelease> | null = null;
+  const closeFence = () => {
+    if (fenceClosing !== null) return fenceClosing;
+    try {
+      fenceClosing = Promise.resolve(factory.closeFence(fence));
+    } catch (error) {
+      fenceClosing = Promise.reject(error instanceof Error ? error : new Error(String(error)));
     }
-    deps.post({ t: "minnow:stopped", reason });
+    // A forced release may begin before the graceful path gets to await it.
+    fenceClosing.catch(() => undefined);
+    return fenceClosing;
   };
+  const isReleasing = () => fenceClosing !== null;
   const stop = (reason: StepDown["reason"], graceful: boolean): Promise<void> => {
-    if (stopped !== null) return stopped;
-    cancelRegistration();
-    server.stepDown(reason);
-    if (!graceful) {
-      // Synchronous: the handles must be closed before the page is suspended or the lock stolen.
-      release(reason);
-      stopped = Promise.resolve();
+    if (stopped !== null) {
+      if (!graceful)
+        void closeFence().catch((error: unknown) => {
+          console.error("Forced owner release failed; reload this page", error);
+        });
       return stopped;
     }
-    stopped = engine
-      .close()
-      .catch(() => undefined)
-      .then(() => {
-        release(reason);
+    cancelRegistration();
+    const started = performance.now();
+    const quiescence = graceful ? server.quiesce(reason) : null;
+    if (!graceful) server.stepDown(reason);
+    stopped = (async () => {
+      let failure: unknown;
+      if (quiescence !== null) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([
+            // A timed-out drain or a stolen fence may already have begun release. A late
+            // continuation must not start another storage flush on that released lease.
+            quiescence.drained.then(async () => {
+              if (isReleasing()) return;
+              await engine.close();
+              if (!isReleasing()) await factory.closeSession?.(fence);
+            }),
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(
+                () => reject(new Error("Owner drain did not settle")),
+                STEP_DOWN_DRAIN_MS,
+              );
+            }),
+          ]);
+        } catch (error) {
+          failure = error;
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+      // closeFence is the public lease.release adapter. In particular, do not swallow
+      // ReleaseUnsettledError or terminate before its bounded abort-settle wait completes.
+      try {
+        const closing = closeFence();
+        if (graceful) {
+          const report = await closing;
+          if (
+            report !== undefined &&
+            "unsettled" in report &&
+            typeof report.unsettled === "number" &&
+            report.unsettled > 0
+          )
+            failure = new Error(
+              `Lease release reported ${String(report.unsettled)} unsettled transaction(s)`,
+            );
+        } else
+          void Promise.resolve(closing).catch((error: unknown) => {
+            console.error("Forced owner release failed; reload this page", error);
+          });
+      } catch (error) {
+        failure = error;
+      }
+      if (failure !== undefined) console.error("Owner release failed; reload this page", failure);
+      try {
+        quiescence?.finish(failure);
+      } catch (error) {
+        failure = error;
+        console.error("Owner could not report release; reload this page", error);
+      }
+      lock.release();
+      heldHostLock.release();
+      skew?.close();
+      if (broker !== null) {
+        broker.postMessage({
+          t: "unregister",
+          v: BROKER_PROTOCOL,
+          db: database,
+          ownerId,
+        } satisfies BrokerMessage);
+        broker.close();
+      }
+      deps.post({
+        t: "minnow:stopped",
+        reason,
+        stepDownMs: Math.round(performance.now() - started),
+        ...(failure === undefined ? {} : { reloadSuggested: true }),
       });
+    })();
     return stopped;
   };
 
@@ -373,10 +488,11 @@ export async function startOwnerHost<F>(
       };
     },
     lifecycle(event, platform) {
+      if (stopped !== null) return;
       const action = lifecycleAction(event, platform);
       if (action === "flush") void engine.flushPending();
       else if (action === "stepDown") void stop("hidden", true);
-      else if (action === "terminate") void stop(event === "freeze" ? "freeze" : "pagehide", false);
+      else if (action === "terminate") void stop(event === "freeze" ? "freeze" : "pagehide", true);
     },
     stop,
   };
@@ -409,9 +525,11 @@ export function serveOwnerWorker<F>(
       host.catch(() => undefined);
       return;
     }
-    void host?.then((started) => {
-      if (message.t === "minnow:lifecycle") started.lifecycle(message.event, message.platform);
-      else void started.stop("closing", true);
-    });
+    void host
+      ?.then((started) => {
+        if (message.t === "minnow:lifecycle") started.lifecycle(message.event, message.platform);
+        else void started.stop(message.reason ?? "closing", true);
+      })
+      .catch(() => undefined); // Startup already reported failure after releasing its lease.
   };
 }

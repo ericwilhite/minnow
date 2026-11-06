@@ -63,6 +63,7 @@ import {
 import {
   DEFAULT_RESULT_WINDOW_BYTES,
   RELEASE_DELAY_MS,
+  LEASE_RELEASE_FAILURE_CONTEXT,
   PROTOCOL_VERSION,
   type OwnerMessage,
   type PreparedStatementKind,
@@ -251,6 +252,7 @@ export class ProtocolClient {
   /** Called whenever requests in flight or pins change (the connector's liveness and watcher). */
   onActivity: (() => void) | null = null;
   onStepDown: ((reason: StepDown["reason"]) => void) | null = null;
+  onOwnerError: ((event: { kind: string; context: string; error: Error }) => void) | null = null;
 
   constructor(options: ProtocolClientOptions = {}) {
     this.clientId = options.clientId ?? randomClientId();
@@ -932,6 +934,25 @@ export class ProtocolClient {
         this.#sessions.set(message.session, "timedOut");
         this.onSessionAborted?.(message.session);
         return;
+      case "diagnostic": {
+        const error = fromWireError(message.error, ownerErrorRegistry);
+        if (
+          message.context === LEASE_RELEASE_FAILURE_CONTEXT &&
+          error instanceof SessionLostError
+        ) {
+          // No pending strict commit can be called successful after an unsettled release. Keep
+          // its session's barrier even if its BEGIN had not yet been acknowledged.
+          for (const pending of [...this.#pending.values()]) {
+            if (pending.session !== null && pending.sent)
+              this.#addCause(pending.session, pending.seq);
+            this.#fail(pending, new SessionLostError("transaction", pending.seq, "unknown"));
+          }
+        }
+        if (this.onOwnerError !== null)
+          this.onOwnerError({ kind: message.kind, context: message.context, error });
+        else console.error(message.context, error);
+        return;
+      }
       case "stepDown":
         this.onStepDown?.(message.reason);
         return;
