@@ -501,7 +501,9 @@ export class ColumnStore {
 
   /**
    * Appends rows of `source` by store row id: `ids[start … start + count)`, where −1 appends a
-   * null row. Columns map store-to-store by position (`columns[c]` is the source column of `c`).
+   * null row. Columns map store-to-store by position (`columns[c]` is the source column of `c`);
+   * `columns[c] < 0` skips column c: its slots are left unwritten (empty for varlen), for a
+   * caller that never reads them (the window's partition column, emitted as a constant).
    */
   appendFrom(
     source: ColumnStore,
@@ -520,7 +522,9 @@ export class ColumnStore {
         );
       },
       (c, n, done) =>
-        this.#varlenNeedStore(source, columns[c] ?? 0, { ids, from: start + done, count: n }),
+        (columns[c] ?? 0) < 0
+          ? 0
+          : this.#varlenNeedStore(source, columns[c] ?? 0, { ids, from: start + done, count: n }),
     );
   }
 
@@ -697,7 +701,7 @@ export class ColumnStore {
     void rows;
     for (let c = 0; c < this.#columns.length; c++) {
       const column = this.#columns[c];
-      if (column === undefined) continue;
+      if (column === undefined || (columns[c] ?? 0) < 0) continue;
       const need = source.#col(columns[c] ?? 0).tier;
       if (need > column.tier && !this.#upgrade(column, need)) return false;
     }
@@ -726,6 +730,10 @@ export class ColumnStore {
     for (let c = 0; c < this.#columns.length; c++) {
       const column = this.#columns[c];
       if (column === undefined) continue;
+      if ((columns[c] ?? 0) < 0) {
+        skipRows(column, k, at, rows.count);
+        continue;
+      }
       writeFromStore(column, k, at, source.#col(columns[c] ?? 0), source.chunkShift, rows);
     }
     if (this.#columns.some((column) => column.tier === TIER_WIDE))
@@ -1027,6 +1035,16 @@ function writeSlot(
 }
 
 /** Finishes a null slot: a varlen null is an empty value; the bitmap carries the null. */
+/** Leaves `count` slots from `at` unwritten (a varlen column's values empty). */
+function skipRows(column: Column, k: number, at: number, count: number): void {
+  const target = column.chunks[k];
+  if (target?.data.layout !== "varlen") return;
+  const used = column.used[k] ?? 0;
+  const offsets = target.data.offsets;
+  if (at === 0) offsets[0] = 0;
+  for (let i = 1; i <= count; i++) offsets[at + i] = used;
+}
+
 function writeNull(column: Column, k: number, target: FlatVector, at: number, used: number): void {
   setNull(column, k, at);
   if (target.data.layout === "varlen") target.data.offsets[at + 1] = used;

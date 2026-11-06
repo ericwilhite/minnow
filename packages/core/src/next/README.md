@@ -798,11 +798,22 @@ and the owner import it directly.
   with a real task yield between them; each slice and each resumption after backpressure checks
   the abort signal (ruling R23). Scratch that lives across a suspension belongs to the operator.
 
-### Windows (`exec/window.ts`, `window-frames.ts`, `window-stream.ts`)
+### Windows (`exec/window.ts`, `window-sort.ts`, `window-frames.ts`, `window-stream.ts`)
 
-- `WindowOperator` evaluates a `window` rel. Its rows are sorted by (PARTITION BY, ORDER BY)
-  with the sort operator, then evaluated one partition at a time. Output is the input columns,
-  then one column per function.
+- `WindowOperator` evaluates a `window` rel. Its rows are ordered by (PARTITION BY, ORDER BY),
+  then evaluated one partition at a time. Output is the input columns, then one column per
+  function.
+- The grouped sort (`window-sort.ts`) orders them when it applies: at most one PARTITION BY
+  column of text, bytes, an integer, date, time or timestamp type, and ORDER BY keys that are
+  all fixed-width numbers, dates or times. Rows are held with a partition id (a dictionary
+  column translated once per dictionary) and their keys normalized to two 32-bit words each;
+  partitions are ranked by value and rows placed by an LSD radix on the rank (no comparisons),
+  then each partition by an MSD radix on the first key (skipped when the rows arrive in order),
+  ties ordered by the other keys. Each row is gathered once, in order. A partition column
+  nothing else reads is neither stored nor gathered: it goes out as a constant vector of the
+  partition's value.
+- Otherwise the sort operator orders the rows, and the grouped sort moves its rows there when
+  the grant refuses its memory.
 - Functions:
   - ranking: row_number, rank, dense_rank, percent_rank, cume_dist, ntile;
   - values: lag, lead, first_value, last_value, nth_value, over any type;

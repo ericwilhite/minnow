@@ -257,7 +257,7 @@ function fallbackValue(call: WindowFunctionSpec): Value {
 export async function runWindow(
   spec: WindowSpec,
   rows: readonly Row[],
-  options: { slack?: number; blockEvery?: number; batchRows?: number } = {},
+  options: { slack?: number; blockEvery?: number; batchRows?: number; dictionary?: boolean } = {},
 ) {
   const minimum = windowMinimumBytes(spec.types, spec.functions.length);
   const cap =
@@ -273,7 +273,12 @@ export async function runWindow(
   const sink = new CollectSink(options.blockEvery ?? 0);
   const op = new WindowOperator(spec, { grant, spill, queryId: 6 }, sink);
   await drive(
-    new ArraySource(batchesOf(spec.types, rows, { batchRows: options.batchRows ?? 2048 })),
+    new ArraySource(
+      batchesOf(spec.types, rows, {
+        batchRows: options.batchRows ?? 2048,
+        dictionary: options.dictionary ?? false,
+      }),
+    ),
     op,
   );
   await op.closed;
@@ -312,7 +317,7 @@ export function checkWindow(spec: WindowSpec, input: readonly Row[], output: rea
       if (sameKeys(prev, row, partKeys)) continue;
     }
     const partition = output.slice(start, i);
-    const name = JSON.stringify(spec.partitionBy.map((c) => partition[0]?.[c] ?? null));
+    const name = JSON.stringify(spec.partitionBy.map((c) => String(partition[0]?.[c] ?? null)));
     expect(seen.has(name)).toBe(false);
     seen.add(name);
     const expected = oracle(
@@ -548,6 +553,136 @@ describe("window: generated against the oracle", () => {
       }, 120_000);
 });
 
+describe("window: the grouped sort against the oracle (window-sort.ts)", () => {
+  // Partition keys of every grouped kind (int, text — plain or dictionary — int64) or none;
+  // ORDER BY keys of ints, floats (NaN-free, NULLs) and int64 (negative), either direction and
+  // NULL placement; both paths on the same rows, and a grant tight enough to move the rows to
+  // the sort operator part way (the fallback).
+  const parts = [[], [P], [T], [Y]] as const;
+  const orderKeys = [K, X, Y, ID] as const;
+  for (const seed of seedsFor("next-window-grouped", [0x6a1, 0x2b7]))
+    it(`seed ${String(seed)}`, async () => {
+      const random = mulberry32(seed);
+      let grouped = 0;
+      let fallbacks = 0;
+      for (let round = 0; round < 18; round++) {
+        const partitionBy = [...(parts[Math.floor(random() * parts.length)] ?? [])];
+        const orderBy: SortColumn[] = Array.from(
+          { length: random() < 0.15 ? 0 : 1 + Math.floor(random() * 2) },
+          (): SortColumn => ({
+            column: orderKeys[Math.floor(random() * orderKeys.length)] ?? K,
+            direction: random() < 0.5 ? "asc" : "desc",
+            nulls: random() < 0.5 ? "first" : "last",
+            collation: null,
+          }),
+        );
+        const single = orderBy.length === 1 ? orderBy[0]?.column : undefined;
+        const rangeOk = single === K || single === X;
+        const functions = Array.from({ length: 1 + Math.floor(random() * 3) }, () =>
+          fixTypes(randomCall(random, rangeOk)),
+        );
+        const tight = round % 6 === 5;
+        const base: WindowSpec = { types: TYPES, partitionBy, orderBy, functions };
+        const spec: WindowSpec = tight
+          ? {
+              ...base,
+              functions: functions.filter((call) => streamable(base, call) === null),
+              streamRows: 1024,
+            }
+          : base;
+        if (spec.functions.length === 0) continue;
+        const rows = generateRows(
+          random,
+          tight ? 24_000 : 1 + Math.floor(random() * 3000),
+          tight ? 24 : 1 + Math.floor(random() * 40),
+          tight ? 5000 : 20,
+        );
+        const options = {
+          ...(tight ? { slack: 0 } : {}),
+          blockEvery: random() < 0.3 ? 2 : 0,
+          batchRows: 1 + Math.floor(random() * 2048),
+          dictionary: random() < 0.5,
+        };
+        const result = await runWindow(spec, rows, options);
+        checkWindow(spec, rows, result.rows);
+        grouped += result.profile.groupedRows > 0 ? 1 : 0;
+        fallbacks += result.profile.groupedFallbacks;
+        // The sort operator's path gives the same rows (as sets: order among peers is free).
+        if (!tight) {
+          const sorted = await runWindow({ ...spec, sortPath: "sort" }, rows, options);
+          expect(sorted.profile.groupedRows).toBe(0);
+          const key = (row: readonly unknown[]) =>
+            JSON.stringify(row, (_, v: unknown) => (typeof v === "bigint" ? `${String(v)}n` : v));
+          const order = (rowsOf: ReadonlyArray<readonly unknown[]>) =>
+            new Map(rowsOf.map((row) => [row[ID], key(row)]));
+          const mine = order(result.rows);
+          const theirs = order(sorted.rows);
+          // Peer-order-dependent functions (row_number, first_value, …) may differ among
+          // peers: compare only when the order is total (ID is a key).
+          if (orderBy.some((k) => k.column === ID))
+            for (const [id, row] of mine) expect(row, `id ${String(id)}`).toBe(theirs.get(id));
+        }
+      }
+      expect(grouped).toBeGreaterThan(10);
+      void fallbacks;
+    }, 600_000);
+
+  it("rows the grant refuses move to the sort operator part way (the fallback)", async () => {
+    const random = mulberry32(0x5f1);
+    const rows = generateRows(random, 60_000, 30, 5000);
+    const spec: WindowSpec = {
+      types: TYPES,
+      partitionBy: [T],
+      orderBy: [
+        { column: K, direction: "desc", nulls: "first", collation: null },
+        { column: ID, direction: "asc", nulls: "last", collation: null },
+      ],
+      functions: [
+        { fn: "row_number", arg: null, frame: null, type: BIG },
+        { fn: "lag", arg: X, frame: null, type: DBL },
+        {
+          fn: "sum",
+          arg: X,
+          frame: {
+            unit: "rows",
+            start: { kind: "preceding", offset: 3 },
+            end: { kind: "current-row", offset: null },
+            exclude: "no-others",
+          },
+          type: DBL,
+        },
+      ],
+      streamRows: 1024,
+    };
+    for (const dictionary of [false, true]) {
+      const result = await runWindow(spec, rows, { slack: 0, dictionary, batchRows: 700 });
+      expect(result.profile.groupedFallbacks).toBe(1);
+      expect(result.profile.sort.rowsIn).toBe(60_000);
+      checkWindow(spec, rows, result.rows);
+    }
+  }, 120_000);
+
+  it("a partition column a function reads is stored and gathered (first_value, count of it)", async () => {
+    const random = mulberry32(0x91);
+    const rows = generateRows(random, 2000, 7);
+    const spec: WindowSpec = {
+      types: TYPES,
+      partitionBy: [T],
+      orderBy: [{ column: ID, direction: "desc", nulls: "last", collation: null }],
+      functions: [
+        { fn: "first_value", arg: T, frame: null, type: TEXT },
+        { fn: "count", arg: T, frame: null, type: BIG },
+        { fn: "lag", arg: T, frame: null, type: TEXT },
+      ],
+    };
+    for (const dictionary of [false, true]) {
+      const result = await runWindow(spec, rows, { dictionary, batchRows: 300 });
+      expect(result.profile.groupedRows).toBe(2000);
+      checkWindow(spec, rows, result.rows);
+    }
+  });
+});
+
 describe("window: streamed partitions against the oracle", () => {
   // `streamRows` 64: nearly every partition streams (window-stream.ts), through its frames.
   for (const seed of SEEDS)
@@ -664,34 +799,59 @@ describe("window: R23 slices and the abort signal", () => {
   async function pushAll(op: Operator, rows: readonly Row[]) {
     for (const batch of batchesOf(TYPES, rows)) if (op.push(batch) === "blocked") await op.ready();
   }
-  for (const streamed of [false, true])
-    it(`a zero-delay timer runs before finish completes (${streamed ? "streamed" : "resident"})`, async () => {
-      const sink = new CollectSink();
-      const { op } = await operator(spec(streamed ? 1024 : undefined), sink);
-      await pushAll(op, generateRows(mulberry32(3), 150_000, 3));
-      let serviced = false;
-      const timer = setTimeout(() => {
-        serviced = true;
-      }, 0);
-      await op.finish();
-      clearTimeout(timer);
-      expect(serviced).toBe(true);
-      expect(sink.rows).toHaveLength(150_000);
-      expect(op.profile.streamedPartitions > 0).toBe(streamed);
-    }, 120_000);
+  for (const path of ["grouped", "sort"] as const)
+    for (const streamed of [false, true])
+      it(`a zero-delay timer runs before finish completes (${streamed ? "streamed" : "resident"}, ${path})`, async () => {
+        const sink = new CollectSink();
+        const { op } = await operator(
+          { ...spec(streamed ? 1024 : undefined), sortPath: path },
+          sink,
+        );
+        await pushAll(op, generateRows(mulberry32(3), 150_000, 3));
+        let serviced = false;
+        const timer = setTimeout(() => {
+          serviced = true;
+        }, 0);
+        await op.finish();
+        clearTimeout(timer);
+        expect(serviced).toBe(true);
+        expect(sink.rows).toHaveLength(150_000);
+        expect(op.profile.streamedPartitions > 0).toBe(streamed);
+        expect(op.profile.groupedRows).toBe(path === "grouped" ? 150_000 : 0);
+      }, 120_000);
 
-  it("an abort before finish rejects and releases everything", async () => {
+  for (const path of ["grouped", "sort"] as const)
+    it(`an abort before finish rejects and releases everything (${path})`, async () => {
+      const controller = new AbortController();
+      const sink = new CollectSink();
+      const { op, governor, spill } = await operator(
+        { ...spec(), sortPath: path },
+        sink,
+        controller.signal,
+      );
+      await pushAll(op, generateRows(mulberry32(4), 5000, 3));
+      controller.abort(new Error("cancel requested"));
+      await expect(Promise.resolve().then(() => op.finish())).rejects.toThrow("cancel requested");
+      expect(sink.rows).toHaveLength(0);
+      await op.closed;
+      expect(governor.usedBytes).toBe(0);
+      expect(spill.bytesInUse).toBe(0);
+    });
+
+  it("an abort while the grouped sort runs rejects and releases everything", async () => {
     const controller = new AbortController();
     const sink = new CollectSink();
     const { op, governor, spill } = await operator(spec(), sink, controller.signal);
-    await pushAll(op, generateRows(mulberry32(4), 5000, 3));
-    controller.abort(new Error("cancel requested"));
-    await expect(Promise.resolve().then(() => op.finish())).rejects.toThrow("cancel requested");
-    expect(sink.rows).toHaveLength(0);
+    await pushAll(op, generateRows(mulberry32(6), 200_000, 3));
+    setTimeout(() => {
+      controller.abort(new Error("cancelled mid-sort"));
+    }, 0);
+    await expect(Promise.resolve().then(() => op.finish())).rejects.toThrow("cancelled mid-sort");
     await op.closed;
+    expect(sink.rows.length).toBeLessThan(200_000);
     expect(governor.usedBytes).toBe(0);
     expect(spill.bytesInUse).toBe(0);
-  });
+  }, 60_000);
 
   it("emission checks the signal after downstream backpressure", async () => {
     const controller = new AbortController();

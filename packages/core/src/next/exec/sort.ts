@@ -183,7 +183,7 @@ interface Cursor {
 }
 
 /** A small open-addressing set of byte strings (ICU ranks), charged; ids in insertion order. */
-class ByteSet {
+export class ByteSet {
   #slots = new Int32Array(64).fill(-1);
   #arena = new Uint8Array(4096);
   #used = 0;
@@ -2153,6 +2153,11 @@ export class SortOperator implements Operator {
     this.#done = true;
     this.#emitter.close();
     this.#sorter.close();
+  }
+
+  /** Releases a sort that took no rows and never will (its owner sorted another way). */
+  discard(): void {
+    this.#end();
   }
 
   abort(reason: unknown): void {

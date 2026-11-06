@@ -319,9 +319,16 @@ async function time(make: (grant: never, sink: Operator) => Operator, minimum: n
     const sink = new CountSink();
     const usage = process.cpuUsage();
     const start = performance.now();
-    await drive(new ArraySource(input), make(grant as never, sink), undefined, {
+    const op = make(grant as never, sink);
+    await drive(new ArraySource(input), op, undefined, {
       yieldIntervalMs: Infinity,
     });
+    const profile = (op as { profile?: { groupedRows?: number; groupedFallbacks?: number } })
+      .profile;
+    if (r === 0 && profile?.groupedRows !== undefined)
+      process.stderr.write(
+        `  grouped ${String(profile.groupedRows)} rows, ${String(profile.groupedFallbacks)} fallbacks\n`,
+      );
     const ms = performance.now() - start;
     const used = process.cpuUsage(usage);
     out = sink.rows;
@@ -359,15 +366,18 @@ for (const name of names) {
           (grant, sink) => new WindowOperator(spec, context(grant), sink),
           windowMinimumBytes(s.types, spec.functions.length),
         );
-  const sort = await time(
-    (grant, sink) =>
-      new SortOperator(
-        { types: s.types, keys, limit: null, offset: 0, withTies: false },
-        context(grant),
-        sink,
-      ),
-    sortMinimumBytes(s.types),
-  );
+  const sort =
+    process.env.SORT === "0"
+      ? { wall: "-", cpu: "-" }
+      : await time(
+          (grant, sink) =>
+            new SortOperator(
+              { types: s.types, keys, limit: null, offset: 0, withTies: false },
+              context(grant),
+              sink,
+            ),
+          sortMinimumBytes(s.types),
+        );
   console.log(
     `${name}: ${run.wall} (CPU ${run.cpu}); sort alone ${sort.wall} (CPU ${sort.cpu}); ${String(run.out)} rows`,
   );

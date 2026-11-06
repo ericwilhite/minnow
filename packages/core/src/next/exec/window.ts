@@ -2,8 +2,11 @@
  * The window operator (B7 increment 3): `window` rels with PostgreSQL's frames (ROWS / RANGE /
  * GROUPS with offsets, EXCLUDE), grant-or-spill like the sort and the join, sliced per R23.
  *
- * - **Order.** Rows are sorted by (PARTITION BY, ORDER BY) with the sort operator (sort.ts:
- *   its runs, merges, slices and abort checks), over the same grant (the evaluator closes it).
+ * - **Order.** Rows are ordered by (PARTITION BY, ORDER BY): by the grouped sort where it
+ *   applies (window-sort.ts: partition ids, normalized key words, radix passes, one gather), else
+ *   by the sort operator (sort.ts: its runs, merges, slices and abort checks), over the same
+ *   grant (the evaluator closes it). A grouped sort the grant refuses moves its rows to the
+ *   sort operator (`#fallback`).
  * - **Partitions.** The evaluator takes the sorted rows one partition at a time. Its rows are
  *   held in a column store; a partition larger than the grant spills them to pages in order,
  *   so only the function arguments stay resident (a column store of the argument columns, and
@@ -32,12 +35,14 @@ import { ColumnStore, nullConstant } from "./column-store.js";
 import {
   YIELD_INTERVAL_MS,
   isPromise,
+  yieldTask,
   type Operator,
   type PushResult,
   type Transfer,
 } from "./pipeline.js";
 import { keysEqual, markChanges, type SortColumn } from "./sort-keys.js";
 import { PartitionStream, streamable, type StreamHost } from "./window-stream.js";
+import { GroupedRows, groupedSortable } from "./window-sort.js";
 import { SortOperator, sortMinimumBytes, type SortContext, type SortProfile } from "./sort.js";
 import { Slice, runSliced, type SlicedJob } from "./slices.js";
 import { PageWriter, SpillFiles, SpilledRun } from "./spill-pages.js";
@@ -86,6 +91,11 @@ export interface WindowSpec {
    * instead of being held whole. Default `STREAM_ROWS`; tests lower it.
    */
   readonly streamRows?: number;
+  /**
+   * Test seam: `"sort"` orders rows with the sort operator even where the grouped sort applies
+   * (window-sort.ts). Default: the grouped sort when it applies.
+   */
+  readonly sortPath?: "grouped" | "sort";
 }
 
 /**
@@ -106,6 +116,9 @@ export interface WindowProfile {
   spilledBytes: number;
   peakHeldBytes: number;
   loans: number;
+  /** Rows ordered by the grouped sort (window-sort.ts), and its refusals (rows moved to the sort). */
+  groupedRows: number;
+  groupedFallbacks: number;
   sort: SortProfile;
 }
 
@@ -201,6 +214,25 @@ function check(spec: WindowSpec): void {
   }
 }
 
+/**
+ * Whether anything but the partitioning reads the (single) partition column: a function's
+ * argument or amount, or an ORDER BY key. Otherwise the grouped path neither stores nor gathers
+ * it per row (window-sort.ts): its value goes out as a constant.
+ */
+function partitionRead(spec: WindowSpec): boolean {
+  const part = spec.partitionBy[0];
+  if (part === undefined || spec.partitionBy.length !== 1) return true;
+  if (spec.orderBy.some((key) => key.column === part)) return true;
+  return spec.functions.some(
+    (call) =>
+      call.arg === part ||
+      (call.amount !== undefined &&
+        call.amount !== null &&
+        typeof call.amount !== "number" &&
+        call.amount.column === part),
+  );
+}
+
 function rangeable(type: PhysicalType): boolean {
   return numeric(type) || type.kind === "date";
 }
@@ -223,6 +255,9 @@ export class WindowOperator implements Operator {
   readonly spec: WindowSpec;
   readonly #sort: SortOperator;
   readonly #evaluator: Evaluator;
+  /** The grouped sort's rows while it applies (null: the sort operator has the rows). */
+  #grouped: GroupedRows | null = null;
+  #pending: Promise<void> | null = null;
 
   constructor(spec: WindowSpec, context: SortContext, downstream: Operator) {
     check(spec);
@@ -230,6 +265,19 @@ export class WindowOperator implements Operator {
     const grant = deferClose(context.grant);
     const shared: SortContext = { ...context, grant };
     this.#evaluator = new Evaluator(spec, shared, context.grant, downstream);
+    if (spec.sortPath !== "sort" && groupedSortable(spec.types, spec.partitionBy, spec.orderBy))
+      try {
+        this.#grouped = new GroupedRows(
+          spec.types,
+          spec.partitionBy,
+          spec.orderBy,
+          new Charge(grant),
+          partitionRead(spec),
+        );
+      } catch {
+        // Its first buffers were refused: the sort operator takes the rows.
+        this.#grouped = null;
+      }
     const keys: SortColumn[] = [
       ...spec.partitionBy.map((column): SortColumn => ({
         column,
@@ -252,12 +300,50 @@ export class WindowOperator implements Operator {
     return profile;
   }
 
+  /**
+   * The grant refused the grouped sort: its rows move to the sort operator (the last chunk
+   * first, each freed once the sort has it, so memory passes from one to the other), and the
+   * sort operator takes everything from here on.
+   */
+  async #fallback(): Promise<void> {
+    const grouped = this.#grouped;
+    if (grouped === null) return;
+    this.#grouped = null;
+    this.#evaluator.profile.groupedFallbacks++;
+    try {
+      const store = grouped.store;
+      for (let k = store.chunkCount - 1; k >= 0; k--) {
+        const columns = grouped.batchColumns(k);
+        const length = columns[0]?.length ?? 0;
+        if (length > 0 && this.#sort.push({ length, columns, selection: null }) === "blocked")
+          await this.#sort.ready();
+        store.truncate(k * store.chunkRows);
+        await yieldTask();
+        this.#evaluator.checkAborted();
+      }
+    } finally {
+      grouped.close();
+    }
+  }
+
   get closed(): Promise<void> {
     return Promise.all([this.#sort.closed, this.#evaluator.closed]).then(() => undefined);
   }
 
   push(batch: Batch, transfer?: Transfer): PushResult {
     try {
+      const grouped = this.#grouped;
+      if (grouped !== null) {
+        this.#evaluator.checkAborted();
+        if (grouped.add(batch)) {
+          transfer?.release();
+          return "ready";
+        }
+        this.#pending = this.#fallback().then(() => {
+          if (this.#sort.push(batch, transfer) === "blocked") return this.#sort.ready();
+        });
+        return "blocked";
+      }
       return this.#sort.push(batch, transfer);
     } catch (error) {
       this.abort(error);
@@ -266,7 +352,9 @@ export class WindowOperator implements Operator {
   }
 
   ready(): Promise<void> {
-    return this.#sort.ready().catch((error: unknown) => {
+    const pending = this.#pending;
+    this.#pending = null;
+    return (pending ?? this.#sort.ready()).catch((error: unknown) => {
       this.abort(error);
       throw error;
     });
@@ -275,7 +363,22 @@ export class WindowOperator implements Operator {
   finish(): MaybePromise<void> {
     let result: MaybePromise<void>;
     try {
-      result = this.#sort.finish();
+      const grouped = this.#grouped;
+      if (grouped !== null) {
+        // Once sorted, the sort operator is not needed: released before the evaluator ends.
+        const sorted = this.#evaluator.finishGrouped(grouped, () => {
+          this.#sort.discard();
+        });
+        const after = (done: boolean): MaybePromise<void> => {
+          if (done) {
+            this.#grouped = null;
+            return;
+          }
+          // The grant refused the sort's arrays: the sort operator sorts instead.
+          return this.#fallback().then(() => this.#sort.finish());
+        };
+        result = isPromise(sorted) ? sorted.then(after) : after(sorted);
+      } else result = this.#sort.finish();
     } catch (error) {
       this.abort(error);
       throw error;
@@ -290,6 +393,8 @@ export class WindowOperator implements Operator {
   abort(reason: unknown): void {
     this.#sort.abort(reason);
     this.#evaluator.abort(reason);
+    this.#grouped?.close();
+    this.#grouped = null;
   }
 }
 
@@ -342,6 +447,21 @@ class Evaluator implements Operator {
   #scratchBytes = 0;
   #newGroupBytes = 0;
   readonly #outputs: Output[];
+  /** Every input column (the grouped path's gathers). */
+  readonly #allColumns: readonly number[];
+  /**
+   * The grouped path's gather of the held rows: the partition column skipped (−1), since a
+   * partition's rows all share its value, which goes out as a constant (`#partitionValue`).
+   */
+  readonly #heldColumns: readonly number[];
+  readonly #partitionColumn: number;
+  #partitionStore: ColumnStore | null = null;
+  #partitionValue: FlatVector | null = null;
+  /** The grouped path's block of rows for a streaming partition (made when first needed). */
+  #block: ColumnStore | null = null;
+  #blockRows = 0;
+  /** Held row ids of the grouped path's current block (its arguments copy from them). */
+  readonly #identity = new Int32Array(BATCH_ROWS);
   #loan: Loan | null = null;
   /** Every function can stream: a partition the grant cannot hold streams instead of borrowing. */
   readonly #canStream: boolean;
@@ -359,6 +479,8 @@ class Evaluator implements Operator {
     spilledBytes: 0,
     peakHeldBytes: 0,
     loans: 0,
+    groupedRows: 0,
+    groupedFallbacks: 0,
     sort: undefined as unknown as SortProfile,
   };
 
@@ -383,6 +505,11 @@ class Evaluator implements Operator {
       this.checkAborted();
     });
     this.#held = new ColumnStore(spec.types, this.charge);
+    this.#allColumns = spec.types.map((_, c) => c);
+    this.#partitionColumn = spec.partitionBy.length === 1 ? (spec.partitionBy[0] ?? -1) : -1;
+    // Skipped only when nothing else reads it (else args and sources read it from the held rows).
+    const skip = partitionRead(spec) ? -1 : this.#partitionColumn;
+    this.#heldColumns = this.#allColumns.map((c) => (c === skip && c >= 0 ? -1 : c));
     this.#canStream = spec.functions.every((call) => streamable(spec, call) === null);
     const columns = new Set<number>();
     for (const call of spec.functions) {
@@ -492,6 +619,203 @@ class Evaluator implements Operator {
     };
     if (isPromise(result)) return result.then(done, fail);
     return done().catch(fail);
+  }
+
+  /**
+   * The grouped sort's path (window-sort.ts): orders the rows, takes each partition straight
+   * from their store (one gather into the partition's stores), then finishes like `finish`.
+   * False, with nothing emitted, when the grant refused the sort's arrays.
+   */
+  finishGrouped(rows: GroupedRows, onSorted: () => void): MaybePromise<boolean> {
+    let result: MaybePromise<boolean>;
+    try {
+      this.checkAborted();
+      result = this.#sliced(this.#groupedJob(rows, onSorted));
+    } catch (error) {
+      this.abort(error);
+      throw error;
+    }
+    const done = async (sorted: boolean): Promise<boolean> => {
+      if (!sorted) return false;
+      this.close();
+      await this.closed;
+      await this.downstream.finish();
+      return true;
+    };
+    const fail = (error: unknown): never => {
+      this.abort(error);
+      throw error;
+    };
+    if (isPromise(result)) return result.then(done, fail);
+    return done(result).catch(fail);
+  }
+
+  *#groupedJob(rows: GroupedRows, onSorted: () => void): SlicedJob<boolean> {
+    const order = yield* rows.sortJob(this.slice);
+    if (order === null) return false;
+    onSorted();
+    const { ids, starts, breaks, groupOf } = order;
+    this.profile.rowsIn += rows.rows;
+    this.profile.groupedRows += rows.rows;
+    for (let p = 0; p + 1 < starts.length; p++) {
+      const s = starts[p] ?? 0;
+      const e = starts[p + 1] ?? 0;
+      if (e > s && this.#partitionColumn >= 0) {
+        // The partition's value, once: its rows go out with it as a constant.
+        const value = (this.#partitionStore ??= new ColumnStore(
+          [this.spec.types[this.#partitionColumn] ?? { kind: "int32", bits: 32 }],
+          this.pool,
+          { chunkRows: 1, varlenBytes: 64 },
+        ));
+        value.truncate(0);
+        const one = rows.partitionValue(groupOf[p] ?? 0);
+        if (one !== null) {
+          while (value.append([one], null, 0, 1) < 1)
+            yield this.io.need(value.appendNeed([one], 0));
+          this.#partitionValue = value.chunk(0, 0);
+        }
+      }
+      for (let at = s; at < e; at += BATCH_ROWS) {
+        const count = Math.min(BATCH_ROWS, e - at);
+        for (let i = 0; i < count; i++) {
+          const j = at + i;
+          this.#flag(this.#rows + i, j === s ? 1 : (breaks[j] ?? 1));
+        }
+        yield* this.#gatherFrom(rows.store, ids, at, count);
+      }
+      yield* this.#flushPartition();
+      this.#partitionValue = null;
+    }
+    // The partitions hold their own copies: the rows and the sort's arrays go now.
+    rows.close();
+    return true;
+  }
+
+  /**
+   * `#gather` for the grouped path: rows `ids[at … at + count)` of `store`. The held rows are
+   * gathered first (the one random gather); arguments and sources then copy from them in order
+   * when they all stayed in the held store, else from `store` again.
+   */
+  *#gatherFrom(store: ColumnStore, ids: Int32Array, at: number, count: number): SlicedJob<void> {
+    if (!this.#streaming && this.#rows + count > (this.spec.streamRows ?? STREAM_ROWS))
+      yield* this.#startStream();
+    if (this.#streaming) {
+      yield* this.#stageFrom(store, ids, at, count);
+      return;
+    }
+    const before = this.#held.rows;
+    let spilled = false;
+    let done = 0;
+    while (done < count) {
+      done += this.#held.appendFrom(store, this.#heldColumns, ids, at + done, count - done);
+      if (done >= count) break;
+      spilled = true;
+      if (this.#held.rows > 0) {
+        yield this.#spillHeld();
+        continue;
+      }
+      // Not even one row fits an empty store: it goes to the pages directly.
+      const block = yield* this.#blockOf(store, ids, at + done, 1);
+      yield this.#stageRow(
+        this.spec.types.map((_, c) => block.chunk(c, 0)),
+        0,
+      );
+      done++;
+    }
+    let source = store;
+    let rowIds = ids;
+    let from = at;
+    if (!spilled) {
+      // The block is the held rows before … before + count.
+      const identity = this.#identity;
+      for (let i = 0; i < count; i++) identity[i] = before + i;
+      source = this.#held;
+      rowIds = identity;
+      from = 0;
+    }
+    this.#rows += count;
+    if (
+      this.#argColumns.length > 0 &&
+      !(yield* this.#appendAllFrom(this.#args, source, this.#argColumns, rowIds, from, count))
+    ) {
+      // The partition streams: the held rows (this block's included) go to its run.
+      yield* this.#startStream();
+      return;
+    }
+    for (let f = 0; f < this.#sources.length; f++) {
+      const target = this.#sources[f];
+      const call = this.spec.functions[f];
+      if (target === null || target === undefined || call?.arg === null || call === undefined)
+        continue;
+      if (!(yield* this.#appendAllFrom(target, source, [call.arg], rowIds, from, count))) {
+        yield* this.#startStream();
+        return;
+      }
+    }
+  }
+
+  /** `#appendAll` from a store by row ids (true when done; false: the partition streams). */
+  *#appendAllFrom(
+    target: ColumnStore,
+    source: ColumnStore,
+    columns: readonly number[],
+    ids: Int32Array,
+    at: number,
+    count: number,
+  ): SlicedJob<boolean> {
+    let done = 0;
+    while (done < count) {
+      done += target.appendFrom(source, columns, ids, at + done, count - done);
+      if (done >= count) return true;
+      if (this.#canStream) return false;
+      if (this.#loan !== null) throw new RangeError("A window partition's arguments do not fit");
+      const need = target.appendFromNeed(source, columns, ids[at + done] ?? 0) + 64 * 1024;
+      yield this.grant.borrow(need, this.context.signal).then((loan) => {
+        this.#loan = loan;
+        this.profile.loans++;
+      });
+    }
+    return true;
+  }
+
+  /**
+   * Rows `ids[at …]` (up to `count`) of `store` copied into the block store (at least one), the
+   * partition column skipped as in the held rows.
+   */
+  *#blockOf(
+    store: ColumnStore,
+    ids: Int32Array,
+    at: number,
+    count: number,
+  ): SlicedJob<ColumnStore> {
+    const block = (this.#block ??= new ColumnStore(this.spec.types, this.pool, {
+      chunkRows: BATCH_ROWS,
+      targetBytes: 64 * 1024,
+      varlenBytes: 4096,
+    }));
+    block.truncate(0);
+    for (;;) {
+      const taken = block.appendFrom(store, this.#heldColumns, ids, at, count);
+      if (taken > 0) {
+        this.#blockRows = taken;
+        return block;
+      }
+      yield this.io.need(block.appendFromNeed(store, this.#heldColumns, ids[at] ?? 0));
+    }
+  }
+
+  /** A streaming partition's rows from a store: staged to its run a block at a time. */
+  *#stageFrom(store: ColumnStore, ids: Int32Array, at: number, count: number): SlicedJob<void> {
+    let done = 0;
+    while (done < count) {
+      const block = yield* this.#blockOf(store, ids, at + done, Math.min(count - done, BATCH_ROWS));
+      const taken = this.#blockRows;
+      for (let k = 0; k < block.chunkCount; k++) {
+        const columns = this.spec.types.map((_, c) => block.chunk(c, k));
+        yield* this.#stage(columns, 0, columns[0]?.length ?? 0);
+      }
+      done += taken;
+    }
   }
 
   // --- arrival ---------------------------------------------------------------------------
@@ -789,7 +1113,16 @@ class Evaluator implements Operator {
     }
   }
 
+  /** The grouped path's partition column as a constant (its rows were gathered without it). */
+  #withPartition(columns: Vector[], count: number): Vector[] {
+    const value = this.#partitionValue;
+    if (value !== null)
+      columns[this.#partitionColumn] = { form: "constant", type: value.type, length: count, value };
+    return columns;
+  }
+
   *#pushDense(columns: Vector[], count: number): SlicedJob<void> {
+    this.#withPartition(columns, count);
     this.profile.rowsOut += count;
     if (this.downstream.push({ length: count, columns, selection: null }) === "blocked")
       yield this.downstream.ready();
@@ -1016,7 +1349,7 @@ class Evaluator implements Operator {
     count: number,
     n: number,
   ): SlicedJob<void> {
-    const columns: Vector[] = [...held];
+    const columns: Vector[] = this.#withPartition([...held], count);
     for (let f = 0; f < this.spec.functions.length; f++) {
       const call = this.spec.functions[f];
       const output = this.#outputs[f];
@@ -1218,12 +1551,17 @@ class Evaluator implements Operator {
     this.#args.close();
     for (const source of this.#sources) source?.close();
     for (const output of this.#outputs) output.gather?.close();
+    this.#block?.close();
+    this.#block = null;
+    this.#partitionStore?.close();
+    this.#partitionStore = null;
+    this.#partitionValue = null;
     this.#last.close();
     this.#staged?.close();
     this.#staged = null;
     if (this.#scratchBytes > 0) this.charge.free(this.#scratchBytes);
     if (this.#newGroupBytes > 0) this.charge.free(this.#newGroupBytes);
-    this.charge.free(this.spec.functions.length * BATCH_ROWS * 32);
+    this.charge.free(this.spec.functions.length * BATCH_ROWS * 32 + 2 * this.#partChanged.length);
     this.#scratchBytes = 0;
     this.#newGroupBytes = 0;
     this.#loan?.repay();
