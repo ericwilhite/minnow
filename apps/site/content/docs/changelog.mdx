@@ -73,7 +73,9 @@ b.id = a.id)` was false when no row of `b` matched. An aggregate without `GROUP 
   `FOR SHARE`, `FOR NO KEY UPDATE`, `FOR KEY SHARE`, also when written inside a view the statement
   reads) in a read-only transaction fail with
   "cannot execute … in a read-only transaction", as in PostgreSQL. That applies through
-  `execute`, `query`, `queryCursor`, a built query's `run` and live subscriptions alike. As in
+  `execute`, `query`, `queryCursor`, a built query's `run` and live subscriptions alike.
+  Compiled `BEGIN` and `SET TRANSACTION` commands passed to `runStatement` keep their access
+  modes and use the same serial execution path as SQL text. As in
   PostgreSQL, `nextval` is refused when it runs: `currval` works, and so does a `nextval` that no
   row evaluates (a `CASE` branch not taken, a false `WHERE`). Open the transaction with
   `BEGIN` (or `READ WRITE`) to write. An outer locking clause reaches tables inside FROM

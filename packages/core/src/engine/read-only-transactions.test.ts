@@ -9,7 +9,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { MemoryBlockStore } from "../storage/index.js";
 import { createReach, REFUSAL_STATES, ROW_LOCK_TARGET_STATES } from "../testing/reach.js";
 import { MinnowDatabase } from "./database.js";
-import { compileQuery } from "./query.js";
+import { compileQuery, compileStatement } from "./query.js";
 
 let pg: PGlite;
 
@@ -312,12 +312,24 @@ async function pgRun(statements: readonly string[]): Promise<string> {
 async function minnowRun(
   statements: readonly string[],
   entry: (database: MinnowDatabase, sql: string) => Promise<unknown>,
+  compiledControl = false,
 ): Promise<string> {
   const database = new MinnowDatabase(new MemoryBlockStore());
   for (const sql of SETUP) await database.execute(sql);
   try {
     for (const sql of statements)
       if (sql.startsWith("SELECT") || sql.startsWith("WITH")) await entry(database, sql);
+      else if (
+        compiledControl &&
+        (sql.startsWith("BEGIN") ||
+          sql.startsWith("START") ||
+          sql.startsWith("SET ") ||
+          sql.startsWith("SAVEPOINT") ||
+          sql.startsWith("RELEASE") ||
+          sql.startsWith("ROLLBACK") ||
+          sql.startsWith("COMMIT"))
+      )
+        await database.runStatement(compileStatement(sql));
       else await database.execute(sql);
     return "ok";
   } catch (error) {
@@ -353,6 +365,24 @@ describe("READ ONLY across entry points, row locks and savepoints (review B6 str
     expect(mismatches.join("\n")).toBe("");
     reach.assertReached();
     targets.assertReached();
+  });
+
+  it("preserves compiled transaction modes and the first-statement rule", async () => {
+    const mismatches: string[] = [];
+    const reach = createReach<string>("compiled transaction modes", REFUSAL_STATES);
+    reach.beginHistory();
+    const sequences = [
+      ...PREFIXES.map(({ statements }) => [...statements, "INSERT INTO t VALUES (9, 9)"]),
+      ...SEQUENCES,
+    ];
+    for (const statements of sequences) {
+      const expected = await pgRun(statements);
+      const actual = await minnowRun(statements, (db, sql) => db.query(sql), true);
+      if (actual === expected) reach.reach(expected === "ok" ? "accepted" : "refused");
+      else mismatches.push(`${statements.join("; ")}: ${expected} / ${actual}`);
+    }
+    expect(mismatches.join("\n")).toBe("");
+    reach.assertReached();
   });
 
   it("scopes the access mode to savepoints and counts a read from any entry point as the first statement", async () => {

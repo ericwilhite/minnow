@@ -13975,12 +13975,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     params?: readonly QueryParameter[],
     options: ExecuteOptions = {},
   ): Promise<ExecuteResult> {
+    return this.#serializeExecute(() => this.#executeSerial(sql, params, options));
+  }
+
+  async #serializeExecute(run: () => Promise<ExecuteResult>): Promise<ExecuteResult> {
     if (this.#closed) throw new DatabaseClosedError();
     if (this.#pendingExecutes >= MAX_DATABASE_PENDING_WRITES) {
       throw new RangeError("Too many pending SQL statements; await a statement");
     }
     this.#pendingExecutes += 1;
-    const run = () => this.#executeSerial(sql, params, options);
     const operation = this.#executeChain.then(run, run);
     this.#executeChain = operation.then(
       () => undefined,
@@ -14000,8 +14003,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   ): Promise<ExecuteResult> {
     if (this.#closed) throw new DatabaseClosedError();
     throwIfAborted(options.signal);
+    return this.#executeCompiledSerial(this.#queries.compileStatement(sql), params, options);
+  }
+
+  async #executeCompiledSerial(
+    statement: CompiledStatement,
+    params: readonly QueryParameter[] | undefined,
+    options: ExecuteOptions,
+  ): Promise<ExecuteResult> {
+    if (this.#closed) throw new DatabaseClosedError();
+    throwIfAborted(options.signal);
     await this.#settleExpiredStatementTransaction();
-    const statement = this.#queries.compileStatement(sql);
     if (this.#statementTransactionExpired) {
       if (
         statement.kind !== "transaction" ||
@@ -14032,7 +14044,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           throw new TypeError("transaction read-write mode must be set before any query");
         current.readOnly = readOnly;
       }
-      return externalizeExecuteResult(await this.runStatement(statement));
+      return { kind: "set", action: statement.action, name: statement.name };
     }
     // A SELECT is admitted by `query`, below; SET and SHOW are not statements of it.
     if (
@@ -15413,6 +15425,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     statement: CompiledStatement,
     options: RunStatementOptions = {},
   ): Promise<ExecuteResult> {
+    if (
+      statement.kind === "transaction" ||
+      (statement.kind === "set" && statement.transactionModes !== undefined)
+    ) {
+      return this.#serializeExecute(() => this.#executeCompiledSerial(statement, undefined, {}));
+    }
     // A catalog statement takes one turn as the database's writer for the whole of its
     // validation and publication, so no coordinated writer in any tab can be mid-transaction
     // against the schema it replaces. CREATE INDEX manages its own turns: it marks the index
@@ -15985,10 +16003,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         return { kind: "drop-trigger", name: statement.name };
       }
       if (statement.kind === "transaction") {
-        const action = statement.action === "rollback-to" ? "ROLLBACK TO" : statement.action;
-        return this.execute(
-          `${action}${statement.name === undefined ? "" : ` ${quoteSqlIdentifier(statement.name)}`}`,
-        );
+        return this.#serializeExecute(() => this.#executeCompiledSerial(statement, undefined, {}));
       }
       if (options.writer === undefined) {
         // Selection, assignment evaluation, constraint proofs, trigger derivation, and the write
