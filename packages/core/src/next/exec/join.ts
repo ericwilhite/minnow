@@ -1502,6 +1502,8 @@ function groupNullCount(level: Level, head: number, nextInGroup: (row: number) =
 }
 
 const FREE: ByteCharge = { allocate: () => true, free: () => undefined };
+// Module scratch, sync-only (R23.1): `compatible` fills and reads it inside one synchronous call,
+// so operators sharing a key type never see each other's rows.
 const compatScratch = new WeakMap<
   PhysicalType,
   { probe: KeyScratch; build: KeyScratch; ids: Int32Array }

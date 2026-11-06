@@ -405,6 +405,36 @@ describe("hash join: spill", () => {
   });
 });
 
+describe("hash join: R23.1 two joins interleaved on one worker", () => {
+  it("spilled joins with different key types keep their own scratch", async () => {
+    // Both spill, block on their sinks and resume interleaved: shared module scratch (key
+    // extraction, the mark join's compatibility test) would mix their rows.
+    const random = mulberry32(0x23_1);
+    const ints = (count: number, domain: number): Row[] =>
+      Array.from({ length: count }, (_, i): Row => [
+        random() < 0.05 ? null : Math.floor(random() * domain),
+        random() < 0.05 ? null : Math.floor(random() * 4),
+        `i${String(i)}-${"x".repeat(i % 30)}`,
+      ]);
+    const texts = (count: number, domain: number): Row[] =>
+      Array.from({ length: count }, (_, i): Row => [
+        random() < 0.05 ? null : `k${String(Math.floor(random() * domain))}`,
+        random() < 0.05 ? null : `c${String(Math.floor(random() * 4))}`,
+        i,
+      ]);
+    const options = { cap: "tight", slack: 128 * 1024, blockEvery: 1 } as const;
+    const a = spec("mark", [INT, INT, TEXT], [INT, INT, TEXT], 2, { correlated: 1 });
+    const b = spec("mark", [TEXT, TEXT, INT], [TEXT, TEXT, INT], 2, { correlated: 1 });
+    const c = spec("full", [INT, INT, TEXT], [INT, INT, TEXT], 2);
+    const results = await Promise.all([
+      check(a, ints(6000, 3000), ints(5000, 3000), options),
+      check(b, texts(6000, 3000), texts(5000, 3000), options),
+      check(c, ints(6000, 3000), ints(5000, 3000), options),
+    ]);
+    for (const result of results) expect(result.join.profile.spilledBytes).toBeGreaterThan(0);
+  }, 120_000);
+});
+
 describe("hash join: lifecycle", () => {
   const types = [INT, TEXT];
   const rows = (n: number): Row[] =>

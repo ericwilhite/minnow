@@ -187,6 +187,9 @@ export class SpillIo {
     readonly checkAborted: () => void,
   ) {}
 
+  /** Called with each staging chunk before it is encoded as a page (the sort measures pages). */
+  onFlush: ((staging: ColumnStore) => void) | null = null;
+
   /** Room in the pool for one bounded step of `bytes` (see `Pool`). */
   need(bytes: number): Promise<void> {
     return this.pool.need(bytes, this.context.grant, this.context.signal);
@@ -241,6 +244,7 @@ export class SpillIo {
     header: { run: number; partition: number },
   ): Promise<void> {
     if (staging.rows === 0) return;
+    this.onFlush?.(staging);
     const columns = staging.vectors();
     const pageHeader = {
       queryId: this.context.queryId,

@@ -166,3 +166,61 @@ describe("ORDER BY vs PostgreSQL", () => {
       }
     }, 120_000);
 });
+
+describe("ORDER BY vs PostgreSQL at the prefix-word boundaries (review B7-p2b-1 probe)", () => {
+  it("text keys around the 4 × PREFIX_WORDS byte prefix, both directions and NULLS", async () => {
+    // Keys equal through the prefix words and differing just past them, or ending inside them.
+    const values = [
+      null,
+      "",
+      "ab",
+      "abc",
+      ...[11, 12, 13, 19, 20, 21, 22, 23].map((n) => "a".repeat(n)),
+    ];
+    values.push(
+      "a".repeat(21) + "b",
+      "a".repeat(21) + "a",
+      "a".repeat(19) + "é",
+      "a".repeat(20) + "\u0001",
+    );
+    const rows: Row[] = Array.from({ length: 1100 }, (_, i) => [
+      values[i % values.length] ?? null,
+      i,
+    ]);
+    await pg.exec('DROP TABLE IF EXISTS p; CREATE TABLE p (t text COLLATE "C", id int)');
+    await pg.query(
+      "INSERT INTO p SELECT v, ord::int - 1 FROM unnest($1::text[]) WITH ORDINALITY a(v, ord)",
+      [rows.map((row) => row[0])],
+    );
+    const types = [TEXT, INT];
+    for (const direction of ["asc", "desc"] as const)
+      for (const nulls of ["first", "last"] as const) {
+        const expected = (
+          await pg.query<{ id: number }>(
+            `SELECT id FROM p ORDER BY t ${direction.toUpperCase()} NULLS ${nulls.toUpperCase()}, id`,
+          )
+        ).rows.map((row) => row.id);
+        const governor = new Governor(64 << 20);
+        const grant = await governor.admit({
+          label: "prefix",
+          minimumBytes: sortMinimumBytes(types),
+          spillable: true,
+        });
+        const sink = new CollectSink();
+        const keys: SortColumn[] = [
+          { column: 0, direction, nulls, collation: null },
+          { column: 1, direction: "asc", nulls: "last", collation: null },
+        ];
+        const operator = new SortOperator(
+          { types, keys, limit: null, offset: 0, withTies: false },
+          { grant, spill: new MemorySpillService(), queryId: 9 },
+          sink,
+        );
+        await drive(new ArraySource(batchesOf(types, rows)), operator);
+        expect(
+          sink.rows.map((row) => row[1]),
+          `${direction} nulls ${nulls}`,
+        ).toEqual(expected);
+      }
+  }, 60_000);
+});

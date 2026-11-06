@@ -54,6 +54,7 @@ export const TIER_INT64 = 1;
 export const TIER_INT128 = 2;
 export const TIER_WIDE = 3;
 
+// A cache, not scratch (R23.1): each view is fixed by its array, so sharing it is safe.
 const wordViews = new WeakMap<BigInt64Array, Int32Array>();
 
 /** The (lo, hi) Int32 words of a BigInt64Array, cached per array: no BigInt per read. */

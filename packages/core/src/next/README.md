@@ -683,11 +683,16 @@ and the owner import it directly.
   radix sort over the words, refining by bytes only when a key is longer than the prefix.
 - An ICU `COLLATE` sorts by query-wide ranks from `Intl.Collator` (ties by bytes) when the
   distinct values fit; otherwise, and for JSON and array keys, a value comparator (compare
-  mode), in memory and across runs (DECISIONS.md C8).
+  mode), in memory and across runs (DECISIONS.md C8). Compare mode decodes each row's JSONB,
+  array and ICU text keys once, as the row arrives (for a merge, once per page), and charges the
+  decoded values to the grant, so a run's comparisons never decode.
 - Top-N keeps rows only while they beat the k-th best key and compacts at 2k (O(k) memory, WITH
   TIES kept). `GroupTopKOperator` is ROW_NUMBER() ≤ k per partition (the row number appended).
 - Grant-or-spill: sorted runs of typed spill pages, merged with a fan-in the spill pool's room
   allows, in passes when needed; OFFSET rows are counted, not materialized.
+- Finish work (compaction, the sort, the merge, emission) runs in slices of `YIELD_INTERVAL_MS`
+  with a real task yield between them; each slice and each resumption after backpressure checks
+  the abort signal (ruling R23). Scratch that lives across a suspension belongs to the operator.
 
 ### Owner and client protocol (`owner/`)
 

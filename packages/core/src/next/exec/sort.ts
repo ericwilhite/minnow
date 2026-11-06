@@ -46,17 +46,36 @@ import {
   type Vector,
 } from "../vector/vector.js";
 import { ColumnStore } from "./column-store.js";
-import { isPromise, type Operator, type PushResult, type Transfer } from "./pipeline.js";
+import {
+  YIELD_INTERVAL_MS,
+  isPromise,
+  yieldTask,
+  type Operator,
+  type PushResult,
+  type Transfer,
+} from "./pipeline.js";
 import {
   PREFIX_WORDS,
   SortKeyEncoder,
   collatorFor,
   compareRanges,
   compareRows,
+  decodeOperands,
+  dropOperands,
+  emptyOperands,
   isByteCollation,
-  sortByPrefix,
+  mergeSortJob,
+  needsOperands,
+  operandBytes,
+  runSliced,
+  runToEnd,
+  Slice,
+  SLICE_ROWS,
+  sortByPrefixJob,
   sortMode,
   sortScratchBytes,
+  type Operands,
+  type SlicedJob,
   type SortColumn,
 } from "./sort-keys.js";
 import { PageWriter, SpillFiles, SpilledRun } from "./spill-pages.js";
@@ -112,6 +131,8 @@ export interface SortProfile {
   spilledBytes: number;
   peakHeldBytes: number;
   loans: number;
+  /** Compare mode: most bytes of decoded operands (JSONB, arrays, ICU text) held, charged. */
+  operandBytes: number;
 }
 
 /** Bytes a sort needs admitted before it runs (encoder, pool, output chunk). */
@@ -135,6 +156,8 @@ interface Cursor {
   page: number;
   held: { bytes: Uint8Array; charged: number } | null;
   columns: readonly FlatVector[];
+  /** Compare mode: the page's decoded operands, charged to the pool while the page is held. */
+  readonly operands: Operands;
   rows: number;
   pos: number;
 }
@@ -263,6 +286,8 @@ type Range =
   | {
       readonly kind: "page";
       readonly columns: readonly Vector[];
+      /** Compare mode: the page's decoded operands (rows as in `columns`). */
+      readonly operands: Operands;
       readonly from: number;
       readonly count: number;
     };
@@ -286,6 +311,25 @@ class Sorter {
   readonly runs: SpilledRun[] = [];
   readonly profile: SortProfile;
   #reserved = 0;
+  /** Operator-owned scratch (R23.1): it lives across `#makeRoom`'s awaits. */
+  readonly keptRows = new Uint16Array(BATCH_ROWS);
+  readonly partLengths = new Int32Array(BATCH_ROWS);
+  /** Rows 0 … BATCH_ROWS − 1 (never written after construction). */
+  readonly #identity = Uint16Array.from({ length: BATCH_ROWS }, (_, i) => i);
+  /**
+   * Compare mode: the resident rows' decoded operands by row id, charged as the rows arrive, so
+   * a run's comparisons never decode (and a full store already holds what its sort needs).
+   */
+  readonly operands: Operands;
+  /** Whether compare mode decodes operands (a JSONB, array or ICU key). */
+  readonly decodes: boolean;
+  readonly #partKeys: readonly SortColumn[];
+  /** The slice of the current finish or compaction work (R23.2); merges and runs pace by it. */
+  readonly slice = new Slice(YIELD_INTERVAL_MS);
+  /** Compare mode: most operand bytes of one written page (a merge input holds one). */
+  #pageOperands = 0;
+  /** A loan for operands of rows stored before compare mode (repaid after their run). */
+  #operandLoan: { repay(): void } | null = null;
   /** Longest key bytes stored: within the prefix words no full comparison is needed. */
   #maxKey = 0;
   #threshold: Uint8Array | null = null;
@@ -303,13 +347,23 @@ class Sorter {
     this.spec = spec;
     this.width = spec.types.length;
     this.mode = sortMode(spec.types, spec.keys);
+    this.operands = emptyOperands(spec.types, spec.keys);
+    this.decodes = needsOperands(spec.types, spec.keys);
+    this.#partKeys = spec.keys.slice(0, spec.partition);
     this.charge = new Charge(context.grant);
     this.pool = new Pool(this.charge, POOL_BYTES);
+    if (!this.charge.allocate(BATCH_ROWS * 8))
+      throw new RangeError("A sort's minimum must be admitted");
     this.files = new SpillFiles(context.spill, context.queryId, this.charge);
     this.pages = new PageWriter(this.pool, 16 * 1024);
     this.io = new SpillIo(this.pool, this.files, this.pages, context, () => {
       this.checkAborted();
     });
+    if (this.mode !== "keys" && this.decodes)
+      this.io.onFlush = (staging) => {
+        const bytes = operandBytes(spec.types, spec.keys, staging.vectors(), 0, staging.rows);
+        if (bytes > this.#pageOperands) this.#pageOperands = bytes;
+      };
     this.encoder = this.mode === "keys" ? new SortKeyEncoder(spec.keys, this.pool) : null;
     this.partEncoder =
       this.mode === "keys" && spec.partition > 0
@@ -330,6 +384,7 @@ class Sorter {
       spilledBytes: 0,
       peakHeldBytes: 0,
       loans: 0,
+      operandBytes: 0,
     };
   }
 
@@ -387,8 +442,7 @@ class Sorter {
     if (threshold !== null && this.spec.partition === 0) {
       // Top-N: rows whose key cannot beat the k-th best so far are not stored at all.
       const encoded = encoder.encode(columns, ids, 0, count);
-      if (encoded.done < count)
-        return this.#needThen(2 * encoded.requiredBytes, () => this.#addKeyed(columns, ids, count));
+      if (encoded.done < count) return this.#split(columns, ids, count, encoded);
       const keys = encoder.keys;
       let m = 0;
       for (let k = 0; k < count; k++) {
@@ -401,16 +455,15 @@ class Sorter {
           threshold.length,
         );
         if (order < 0 || (order === 0 && this.spec.withTies))
-          keptRows[m++] = ids === null ? k : (ids[k] ?? 0);
+          this.keptRows[m++] = ids === null ? k : (ids[k] ?? 0);
       }
       this.profile.rejected += count - m;
       if (m === 0) return;
-      rows = keptRows.subarray(0, m);
+      rows = this.keptRows.subarray(0, m);
       n = m;
     }
     const encoded = encoder.encode(columns, rows, 0, n);
-    if (encoded.done < n)
-      return this.#needThen(2 * encoded.requiredBytes, () => this.#addKeyed(columns, ids, count));
+    if (encoded.done < n) return this.#split(columns, rows, n, encoded);
     const tail = encoder.tail;
     const offsets = encoder.keys.offsets;
     for (let k = 0; k < n; k++) {
@@ -419,11 +472,10 @@ class Sorter {
     }
     if (this.partEncoder !== null) {
       const part = this.partEncoder.encode(columns, rows, 0, n);
-      if (part.done < n)
-        return this.#needThen(2 * part.requiredBytes, () => this.#addKeyed(columns, ids, count));
+      if (part.done < n) return this.#split(columns, rows, n, part);
       const offsets = this.partEncoder.keys.offsets;
-      for (let k = 0; k < n; k++) partLengths[k] = (offsets[k + 1] ?? 0) - (offsets[k] ?? 0);
-      tail.push(partLengthVector(n));
+      for (let k = 0; k < n; k++) this.partLengths[k] = (offsets[k + 1] ?? 0) - (offsets[k] ?? 0);
+      tail.push(partLengthVector(this.partLengths, n));
     }
     return this.#append(columns, rows, n, tail, 0);
   }
@@ -439,9 +491,12 @@ class Sorter {
     tail: readonly Vector[],
     done: number,
   ): MaybePromise<void> {
-    while (done < n) {
+    // Rows stored before compare mode get their operands first (or the store is spilled).
+    const decoding = this.mode === "compare" && this.decodes;
+    while (done < n && (!decoding || this.#decodeStore() === 0)) {
       const want = Math.min(n - done, 2048);
       if (!this.#reserve(this.store.rows + want)) break;
+      const before = this.store.rows;
       const taken = this.store.append(
         columns,
         ids,
@@ -450,12 +505,16 @@ class Sorter {
         tail.length > 0 ? { vectors: tail, from: done } : undefined,
       );
       done += taken;
+      if (decoding && this.#decodeStore() > 0) {
+        // Rows whose operands do not fit go back out, and in again once room is made.
+        const decoded = this.operands.rows;
+        this.store.truncate(decoded);
+        done -= before + taken - decoded;
+        break;
+      }
       if (taken < want) break;
     }
-    if (done >= n) {
-      this.#maybeCompact();
-      return;
-    }
+    if (done >= n) return this.#maybeCompact();
     const row = ids === null ? done : (ids[done] ?? 0);
     return this.#makeRoom(columns, row, tail, done).then(() =>
       this.#append(columns, ids, n, tail, done),
@@ -493,39 +552,89 @@ class Sorter {
     return true;
   }
 
+  /**
+   * The key bytes of `count` rows did not fit the encoder: the rows go in as parts (those that
+   * were encoded, then the rest), each encoded alone, down to one row, whose key bytes are one
+   * bounded step of room (rule 5). The parts are copies, so no scratch is shared across awaits.
+   */
+  #split(
+    columns: readonly Vector[],
+    ids: Uint16Array | null,
+    count: number,
+    encoded: { done: number; requiredBytes: number },
+  ): MaybePromise<void> {
+    if (count === 1)
+      return this.#needThen(2 * encoded.requiredBytes, () => this.#addKeyed(columns, ids, 1));
+    const rows = ids ?? this.#identity;
+    const cut = encoded.done > 0 ? encoded.done : count >>> 1;
+    const first = rows.slice(0, cut);
+    const rest = rows.slice(cut, count);
+    const done = this.#addKeyed(columns, first, first.length);
+    if (isPromise(done)) return done.then(() => this.#addKeyed(columns, rest, rest.length));
+    return this.#addKeyed(columns, rest, rest.length);
+  }
+
   async #needThen(bytes: number, then: () => MaybePromise<void>): Promise<void> {
     await this.io.need(bytes);
     await then();
   }
 
-  /** Top-N / per-group: compacts the buffer once it holds a few times what is kept. */
-  #maybeCompact(): void {
+  /**
+   * Top-N / per-group: compacts the buffer once it holds a few times what is kept, in slices
+   * (the push blocks while a long compaction yields).
+   */
+  #maybeCompact(): MaybePromise<void> {
     const keep = this.spec.keep;
     if (keep === null || this.mode !== "keys" || this.runs.length > 0) return;
     const floor = this.spec.partition > 0 ? 65_536 : keep + 4096;
     if (this.store.rows < Math.max(2 * keep, floor, 4 * this.#lastSurvivors)) return;
-    this.compact();
+    const done = this.sliced(this.compactJob());
+    if (isPromise(done)) return done.then(() => undefined);
+  }
+
+  /** Runs a job on a fresh slice: task yields between slices, the abort check at each resumption. */
+  sliced<T>(job: SlicedJob<T>): MaybePromise<T> {
+    this.slice.reset();
+    return runSliced(job, this.slice, () => {
+      this.checkAborted();
+    });
+  }
+
+  /** Between merge and run steps: a task yield and the abort check once the slice is due. */
+  pace(): Promise<void> | null {
+    if (!this.slice.due()) return null;
+    return yieldTask().then(() => {
+      this.checkAborted();
+      this.slice.reset();
+    });
   }
 
   /** Keeps the best `keep` rows (per partition when grouped); false when it did not fit. */
   compact(): boolean {
+    return runToEnd(this.compactJob(new Slice(Infinity)));
+  }
+
+  /** `compact` as a sliced job (sort, cut, then the survivors copied in bounded steps). */
+  *compactJob(slice: Slice = this.slice): SlicedJob<boolean> {
     const keep = this.spec.keep;
     if (keep === null || this.mode !== "keys") return false;
-    const ids = this.sortedIds();
+    const ids = yield* this.sortJob(slice);
     if (ids === null) return false;
-    const survivors = this.cut(ids);
+    const survivors = yield* this.cutJob(ids, slice);
     if (survivors.length === this.store.rows) {
       this.#lastSurvivors = survivors.length;
       return true;
     }
     const next = this.#newStore();
-    const taken = next.appendFrom(
-      this.store,
-      this.storeTypes.map((_, c) => c),
-      survivors,
-      0,
-      survivors.length,
-    );
+    const columns = this.storeTypes.map((_, c) => c);
+    let taken = 0;
+    while (taken < survivors.length) {
+      const want = Math.min(SLICE_ROWS, survivors.length - taken);
+      const got = next.appendFrom(this.store, columns, survivors, taken, want);
+      taken += got;
+      if (got < want) break;
+      if (slice.due()) yield;
+    }
     if (taken < survivors.length) {
       next.close();
       return false;
@@ -542,13 +651,16 @@ class Sorter {
   }
 
   /** From sorted ids, the ones to keep: the first `keep` (with ties), or per partition. */
-  cut(ids: Int32Array): Int32Array {
+  *cutJob(ids: Int32Array, slice: Slice): SlicedJob<Int32Array> {
     const keep = this.spec.keep;
     if (keep === null) return ids;
     if (this.spec.partition === 0) {
       let n = Math.min(keep, ids.length);
       if (this.spec.withTies && n > 0)
-        while (n < ids.length && this.compareIds(ids[n - 1] ?? 0, ids[n] ?? 0) === 0) n++;
+        while (n < ids.length && this.compareIds(ids[n - 1] ?? 0, ids[n] ?? 0) === 0) {
+          n++;
+          if ((n & (SLICE_ROWS - 1)) === 0 && slice.due()) yield;
+        }
       return ids.subarray(0, n);
     }
     let m = 0;
@@ -558,6 +670,7 @@ class Sorter {
       if (i > 0 && !this.samePartitionIds(ids[i - 1] ?? 0, id)) inGroup = 0;
       if (inGroup < keep) ids[m++] = id;
       inGroup++;
+      if ((i & (SLICE_ROWS - 1)) === SLICE_ROWS - 1 && slice.due()) yield;
     }
     return ids.subarray(0, m);
   }
@@ -594,7 +707,56 @@ class Sorter {
       a & store.chunkMask,
       chunkColumns(store, b >>> store.chunkShift),
       b & store.chunkMask,
+      this.operands,
+      this.operands,
+      a,
+      b,
     );
+  }
+
+  /**
+   * Compare mode: decodes the operands of resident rows not yet decoded (charged first); 0, or
+   * the bytes the charge refused (what is decoded stays).
+   */
+  #decodeStore(): number {
+    if (this.mode !== "compare" || !this.decodes) return 0;
+    const store = this.store;
+    const operands = this.operands;
+    while (operands.rows < store.rows) {
+      const from = operands.rows & store.chunkMask;
+      const to = Math.min(store.chunkRows, from + store.rows - operands.rows);
+      const columns = chunkColumns(store, operands.rows >>> store.chunkShift);
+      const { types, keys } = this.spec;
+      let needed = decodeOperands(types, keys, columns, from, to, this.charge, operands);
+      if (needed > 0 && to - from > 1) {
+        // Refused as a whole: as many single rows as fit (a loaned row always gets its own).
+        needed = 0;
+        for (let row = from; row < to && needed === 0; row++)
+          needed = decodeOperands(types, keys, columns, row, row + 1, this.charge, operands);
+      }
+      if (needed > 0) return needed;
+    }
+    if (operands.bytes > this.profile.operandBytes) this.profile.operandBytes = operands.bytes;
+    return 0;
+  }
+
+  /** Bytes the resident rows' missing operands would charge. */
+  #missingOperandBytes(): number {
+    const store = this.store;
+    let bytes = 0;
+    for (let row = this.operands.rows; row < store.rows;) {
+      const from = row & store.chunkMask;
+      const to = Math.min(store.chunkRows, from + store.rows - row);
+      bytes += operandBytes(
+        this.spec.types,
+        this.spec.keys,
+        chunkColumns(store, row >>> store.chunkShift),
+        from,
+        to,
+      );
+      row += to - from;
+    }
+    return bytes;
   }
 
   samePartitionIds(a: number, b: number): boolean {
@@ -602,11 +764,19 @@ class Sorter {
     const shift = store.chunkShift;
     const mask = store.chunkMask;
     if (this.mode !== "keys")
-      return this.samePartition(
-        chunkColumns(store, a >>> shift),
-        a & mask,
-        chunkColumns(store, b >>> shift),
-        b & mask,
+      return (
+        compareRows(
+          this.spec.types,
+          this.#partKeys,
+          chunkColumns(store, a >>> shift),
+          a & mask,
+          chunkColumns(store, b >>> shift),
+          b & mask,
+          this.operands,
+          this.operands,
+          a,
+          b,
+        ) === 0
       );
     // Direct reads: the partition key length, then that prefix of the key bytes.
     const plen = this.keyColumn + 1 + PREFIX_WORDS;
@@ -625,12 +795,17 @@ class Sorter {
     return compareRanges(x.bytes, xs, xs + la, y.bytes, ys, ys + la) === 0;
   }
 
-  /** Whether two rows (store or page vectors) are in one partition. */
-  samePartition(a: readonly Vector[], i: number, b: readonly Vector[], j: number): boolean {
+  /** Whether two rows (page or held vectors, with their operands) are in one partition. */
+  samePartition(
+    a: readonly Vector[],
+    i: number,
+    b: readonly Vector[],
+    j: number,
+    ao: Operands | null = null,
+    bo: Operands | null = null,
+  ): boolean {
     if (this.mode !== "keys")
-      return (
-        compareRows(this.spec.types, this.spec.keys.slice(0, this.spec.partition), a, i, b, j) === 0
-      );
+      return compareRows(this.spec.types, this.#partKeys, a, i, b, j, ao, bo) === 0;
     const plen = this.keyColumn + 1 + PREFIX_WORDS;
     const la = int32At(a[plen], i);
     if (la !== int32At(b[plen], j)) return false;
@@ -641,9 +816,17 @@ class Sorter {
     return compareRanges(x.bytes, xs, xs + la, y.bytes, ys, ys + la) === 0;
   }
 
-  /** Whether two rows (store or page vectors) have equal keys (ties). */
-  sameKey(a: readonly Vector[], i: number, b: readonly Vector[], j: number): boolean {
-    if (this.mode !== "keys") return compareRows(this.spec.types, this.spec.keys, a, i, b, j) === 0;
+  /** Whether two rows (page or held vectors, with their operands) have equal keys (ties). */
+  sameKey(
+    a: readonly Vector[],
+    i: number,
+    b: readonly Vector[],
+    j: number,
+    ao: Operands | null = null,
+    bo: Operands | null = null,
+  ): boolean {
+    if (this.mode !== "keys")
+      return compareRows(this.spec.types, this.spec.keys, a, i, b, j, ao, bo) === 0;
     const x = varlenOf(a[this.keyColumn]);
     const y = varlenOf(b[this.keyColumn]);
     return (
@@ -674,7 +857,7 @@ class Sorter {
       this.spec.keep !== null &&
       this.mode === "keys" &&
       this.runs.length === 0 &&
-      this.compact() &&
+      (await this.sliced(this.compactJob())) &&
       this.store.rows < before
     )
       return;
@@ -685,15 +868,23 @@ class Sorter {
     // One row larger than everything the grant has left: a loan for it (rule 5).
     if (this.#rowLoan !== null) throw new RangeError("A sort row could not be stored");
     const key = tail[0] === undefined ? 0 : varlenLength(tail[0], k);
-    const bytes = this.store.appendNeed(columns, row) + key + 2048 * SCRATCH_PER_ROW;
+    const operands =
+      this.mode === "compare" && this.decodes
+        ? operandBytes(this.spec.types, this.spec.keys, columns, row, row + 1)
+        : 0;
+    const bytes = this.store.appendNeed(columns, row) + key + operands + 2048 * SCRATCH_PER_ROW;
     this.#rowLoan = await this.context.grant.borrow(bytes, this.context.signal);
     this.profile.loans++;
   }
 
   // --- sorting ---------------------------------------------------------------------------
 
-  /** Row ids of the store in order, or null when the scratch could not be allocated. */
-  sortedIds(): Int32Array | null {
+  /**
+   * The in-memory sort as a sliced job (see `sortByPrefixJob`, `mergeSortJob`): row ids of the
+   * store in order, or null when its memory (rank arrays, operands) was refused. Its scratch was
+   * reserved as the rows arrived.
+   */
+  *sortJob(slice: Slice = this.slice): SlicedJob<Int32Array | null> {
     const store = this.store;
     const n = store.rows;
     if (!this.#reserve(n)) return null;
@@ -708,36 +899,41 @@ class Sorter {
             .values;
           for (let i = 0; i < length; i++) words[(base + i) * PREFIX_WORDS + w] = values[i] ?? 0;
         }
+        if (slice.due()) yield;
       }
       const covered = this.#maxKey <= 4 * PREFIX_WORDS;
-      sortByPrefix(
+      yield* sortByPrefixJob(
         n,
         words,
         ids,
         new Uint32Array(sortScratchBytes(n) / 4),
         covered ? null : (a, b) => this.compareIds(a, b),
         Math.ceil(this.#maxKey / 4),
+        slice,
       );
       return ids;
     }
     for (let i = 0; i < n; i++) ids[i] = i;
+    // Inside the reserve (ids and the merge buffer are 8 of its bytes per row).
+    const temp = new Int32Array(n);
     if (this.mode === "ranks") {
-      const order = this.#rankOrder();
+      const order = yield* this.#rankOrder(slice);
       if (order !== null) {
-        ids.sort(order);
+        yield* mergeSortJob(ids, temp, order, slice);
         return ids;
       }
       this.#toCompare();
     }
-    ids.sort((a, b) => this.compareIds(a, b));
+    if (this.#decodeStore() > 0) return null;
+    yield* mergeSortJob(ids, temp, (a, b) => this.compareIds(a, b), slice);
     return ids;
   }
 
   /**
    * Ranks mode (C8): a comparator over query-wide ranks of the collated keys, or null when the
-   * ranks or their decoded strings do not fit (compare mode then).
+   * ranks or their decoded strings do not fit (compare mode then). Sliced like the sort.
    */
-  #rankOrder(): ((a: number, b: number) => number) | null {
+  *#rankOrder(slice: Slice): SlicedJob<((a: number, b: number) => number) | null> {
     const store = this.store;
     const n = store.rows;
     const ranks: Array<Int32Array | null> = [];
@@ -758,21 +954,32 @@ class Sorter {
           if (!this.charge.allocate(bytes)) return null;
           charged += bytes;
           strings.push(value);
+          if ((id & (SLICE_ROWS - 1)) === SLICE_ROWS - 1 && slice.due()) yield;
         }
+        // The order, its merge buffer and the rank of each value: charged while they live.
+        if (!this.charge.allocate(3 * set.size * 4)) return null;
+        charged += 3 * set.size * 4;
         const collator = collatorFor(key.collation ?? "");
-        const order = Int32Array.from({ length: set.size }, (_, id) => id).sort((a, b) => {
-          const c = collator.compare(strings[a] ?? "", strings[b] ?? "");
-          if (c !== 0) return c;
-          return compareRanges(
-            set.arena,
-            set.starts[a] ?? 0,
-            set.ends[a] ?? 0,
-            set.arena,
-            set.starts[b] ?? 0,
-            set.ends[b] ?? 0,
-          );
-        });
-        if (!this.charge.allocate(n * 4 + set.size * 4)) return null;
+        const order = Int32Array.from({ length: set.size }, (_, id) => id);
+        yield* mergeSortJob(
+          order,
+          new Int32Array(set.size),
+          (a, b) => {
+            const c = collator.compare(strings[a] ?? "", strings[b] ?? "");
+            if (c !== 0) return c;
+            return compareRanges(
+              set.arena,
+              set.starts[a] ?? 0,
+              set.ends[a] ?? 0,
+              set.arena,
+              set.starts[b] ?? 0,
+              set.ends[b] ?? 0,
+            );
+          },
+          slice,
+        );
+        if (!this.charge.allocate(n * 4)) return null;
+        this.#rankBytes += n * 4;
         const rankOf = new Int32Array(set.size);
         order.forEach((id, rank) => (rankOf[id] = rank));
         const perRow = new Int32Array(n).fill(-1);
@@ -784,9 +991,8 @@ class Sorter {
               perRow[c * store.chunkRows + i] =
                 rankOf[set.find(value.bytes, value.start, value.end)] ?? 0;
           }
+          if (slice.due()) yield;
         }
-        this.charge.free(set.size * 4);
-        this.#rankBytes += n * 4;
         ranks.push(perRow);
       } finally {
         this.charge.free(charged);
@@ -809,6 +1015,7 @@ class Sorter {
           if (x !== y) return (key.direction === "desc" ? y - x : x - y) < 0 ? -1 : 1;
           continue;
         }
+        // Ranks mode's other keys are byte-comparable (no operands).
         const order = compareRows(
           types,
           [key],
@@ -828,23 +1035,33 @@ class Sorter {
 
   /** Sorts the rows in memory and writes them as one run; the store is emptied. */
   async #spillRun(): Promise<void> {
-    if (this.mode === "ranks") this.#toCompare();
     const store = this.store;
     if (store.rows === 0) return;
-    const ids = this.sortedIds();
+    let ids = await this.sliced(this.sortJob());
+    if (
+      ids === null &&
+      this.mode === "compare" &&
+      this.#rowLoan === null &&
+      this.#operandLoan === null
+    ) {
+      // Rows stored before compare mode (ranks that did not fit) lack operands the grant cannot
+      // hold: one loan for them (rule 5), repaid when their run is written.
+      const needed = this.#missingOperandBytes();
+      this.#operandLoan = await this.context.grant.borrow(needed, this.context.signal);
+      this.profile.loans++;
+      ids = await this.sliced(this.sortJob());
+    }
     if (ids === null) throw new RangeError("Sort scratch could not be allocated");
     const run = new SpilledRun();
-    const staging = new ColumnStore(store.types, this.pool, {
-      chunkRows: 512,
-      targetBytes: 64 * 1024,
-      varlenBytes: 4096,
-    });
+    const staging = new ColumnStore(store.types, this.pool, this.#stagingOptions());
     const columns = store.types.map((_, c) => c);
     const header = { run: this.runs.length, partition: 0 };
     try {
       let at = 0;
       while (at < ids.length) {
         this.checkAborted();
+        const paced = this.pace();
+        if (paced !== null) await paced;
         at += staging.appendFrom(store, columns, ids, at, ids.length - at);
         if (at >= ids.length) break;
         if (staging.rows > 0) await this.io.flush(staging, run, header);
@@ -863,6 +1080,9 @@ class Sorter {
     this.profile.runs++;
     this.profile.spilledBytes = this.files.written;
     store.truncate(0);
+    dropOperands(this.operands, this.charge);
+    // Later rows compare (a run's ranks do not carry over): their operands come as they arrive.
+    if (this.mode === "ranks") this.#toCompare();
     // The scratch goes back with the rows: the next run reserves its own.
     if (this.#reserved > 0) this.charge.free(this.#reserved);
     this.#reserved = 0;
@@ -874,26 +1094,38 @@ class Sorter {
       this.#rowLoan.repay();
       this.#rowLoan = null;
     }
+    if (this.#operandLoan !== null) {
+      this.#operandLoan.repay();
+      this.#operandLoan = null;
+    }
+  }
+
+  /**
+   * Spill page staging: 64 KiB pages, or 8 KiB (128 rows) when compare mode decodes, since a
+   * merge input holds its page's operands too (JSONB trees run to ~24 bytes per byte).
+   */
+  #stagingOptions(): { chunkRows: number; targetBytes: number; varlenBytes: number } {
+    return this.mode !== "keys" && this.decodes
+      ? { chunkRows: 128, targetBytes: 8 * 1024, varlenBytes: 4096 }
+      : { chunkRows: 512, targetBytes: 64 * 1024, varlenBytes: 4096 };
   }
 
   /** Writes what is in memory as a run, then merges runs in passes down to `MAX_FAN_IN`. */
   async prepareMerge(): Promise<void> {
     if (this.store.rows > 0) await this.#spillRun();
-    // Each input holds one page from the pool: the fan-in is what the pool's room allows.
+    // Each input holds one page (and its operands) from the pool: the fan-in is what the pool's
+    // room allows.
     let page = 0;
     for (const run of this.runs) for (const ref of run.pages) page = Math.max(page, ref.length);
+    const input = 2 * page + this.#pageOperands;
     const fanIn = Math.max(
       2,
-      Math.min(MAX_FAN_IN, Math.floor(this.pool.room / Math.max(1, 2 * page))),
+      Math.min(MAX_FAN_IN, Math.floor(this.pool.room / Math.max(1, input))),
     );
     while (this.runs.length > fanIn) {
       const inputs = this.runs.splice(0, fanIn);
       const run = new SpilledRun();
-      const staging = new ColumnStore(this.storeTypes, this.pool, {
-        chunkRows: 512,
-        targetBytes: 64 * 1024,
-        varlenBytes: 4096,
-      });
+      const staging = new ColumnStore(this.storeTypes, this.pool, this.#stagingOptions());
       const header = { run: this.runs.length + fanIn, partition: 0 };
       try {
         for await (const part of this.merge(inputs))
@@ -917,7 +1149,15 @@ class Sorter {
     const cursors: Cursor[] = [];
     try {
       for (const run of runs) {
-        const cursor: Cursor = { run, page: -1, held: null, columns: [], rows: 0, pos: 0 };
+        const cursor: Cursor = {
+          run,
+          page: -1,
+          held: null,
+          columns: [],
+          operands: emptyOperands(this.spec.types, this.spec.keys),
+          rows: 0,
+          pos: 0,
+        };
         cursors.push(cursor);
         if (!(await this.#nextPage(cursor, types))) cursors.pop();
       }
@@ -950,8 +1190,17 @@ class Sorter {
         let end = top.pos + 1;
         if (next === null) end = top.rows;
         else while (end < top.rows && this.#compareCursors(top, end, next, next.pos) <= 0) end++;
-        yield { kind: "page", columns: top.columns, from: top.pos, count: end - top.pos };
+        yield {
+          kind: "page",
+          columns: top.columns,
+          operands: top.operands,
+          from: top.pos,
+          count: end - top.pos,
+        };
         top.pos = end;
+        // The consumer's work counts toward the slice too: a task yield once it is due.
+        const paced = this.pace();
+        if (paced !== null) await paced;
         if (top.pos >= top.rows && !(await this.#nextPage(top, types))) {
           const last = heap.pop();
           if (last !== undefined && last !== top) heap[0] = last;
@@ -959,16 +1208,25 @@ class Sorter {
         if (heap.length > 0) sift(0);
       }
     } finally {
-      for (const cursor of cursors) if (cursor.held !== null) this.io.releasePage(cursor.held);
+      for (const cursor of cursors) this.#releaseCursor(cursor);
     }
   }
 
+  #releaseCursor(cursor: Cursor): void {
+    if (cursor.held !== null) this.io.releasePage(cursor.held);
+    cursor.held = null;
+    dropOperands(cursor.operands, this.pool);
+  }
+
+  /**
+   * Moves a cursor to its run's next non-empty page: read, decoded into views, and (compare
+   * mode) its operands decoded once. When the operands do not fit, the page goes back and the
+   * page, its copies and its operands are made room for as one step before it is read again.
+   */
   async #nextPage(cursor: Cursor, types: readonly PhysicalType[]): Promise<boolean> {
+    let retried = false;
     for (;;) {
-      if (cursor.held !== null) {
-        this.io.releasePage(cursor.held);
-        cursor.held = null;
-      }
+      this.#releaseCursor(cursor);
       cursor.page++;
       if (cursor.page >= cursor.run.pages.length) return false;
       const held = await this.io.readPage(cursor.run, cursor.page);
@@ -977,13 +1235,40 @@ class Sorter {
       cursor.columns = decoded.columns;
       cursor.rows = decoded.rows;
       cursor.pos = 0;
-      if (cursor.rows > 0) return true;
+      if (cursor.rows === 0) continue;
+      if (this.mode === "keys" || !this.decodes) return true;
+      const { types: values, keys } = this.spec;
+      const needed = decodeOperands(
+        values,
+        keys,
+        decoded.columns,
+        0,
+        decoded.rows,
+        this.pool,
+        cursor.operands,
+      );
+      if (needed === 0) return true;
+      if (retried) throw new RangeError("A spill page's sort operands could not be decoded");
+      retried = true;
+      const step = held.charged + needed;
+      this.#releaseCursor(cursor);
+      cursor.page--;
+      await this.io.need(step);
     }
   }
 
   #compareCursors(a: Cursor, i: number, b: Cursor, j: number): number {
     if (this.mode !== "keys")
-      return compareRows(this.spec.types, this.spec.keys, a.columns, i, b.columns, j);
+      return compareRows(
+        this.spec.types,
+        this.spec.keys,
+        a.columns,
+        i,
+        b.columns,
+        j,
+        a.operands,
+        b.operands,
+      );
     for (let w = 0; w < PREFIX_WORDS; w++) {
       const x = int32At(a.columns[this.keyColumn + 1 + w], i) >>> 0;
       const y = int32At(b.columns[this.keyColumn + 1 + w], j) >>> 0;
@@ -1015,6 +1300,10 @@ class Sorter {
     for (const set of this.#sets) set?.close();
     if (this.#reserved > 0) this.charge.free(this.#reserved);
     if (this.#rankBytes > 0) this.charge.free(this.#rankBytes);
+    dropOperands(this.operands, this.charge);
+    this.charge.free(BATCH_ROWS * 8);
+    this.#operandLoan?.repay();
+    this.#operandLoan = null;
     this.#reserved = 0;
     this.#rankBytes = 0;
     this.pages.close();
@@ -1038,16 +1327,8 @@ function cursorAt(heap: readonly Cursor[], i: number): Cursor {
   return cursor;
 }
 
-const keptRows = new Uint16Array(BATCH_ROWS);
-const partLengths = new Int32Array(BATCH_ROWS);
-function partLengthVector(n: number): FlatVector {
-  return {
-    form: "flat",
-    type: INT,
-    length: n,
-    validity: null,
-    data: { layout: "i32", values: partLengths },
-  };
+function partLengthVector(values: Int32Array, n: number): FlatVector {
+  return { form: "flat", type: INT, length: n, validity: null, data: { layout: "i32", values } };
 }
 
 function chunkColumns(store: ColumnStore, k: number): FlatVector[] {
@@ -1181,7 +1462,12 @@ class Emitter {
       this.out.reset(this.sorter.pool.owes);
       this.sorter.pool.settle();
     };
-    if (result === "blocked") return this.downstream.ready().then(done);
+    if (result === "blocked")
+      return this.downstream.ready().then(() => {
+        done();
+        // A resumption after backpressure: the query may have been cancelled meanwhile.
+        this.sorter.checkAborted();
+      });
     done();
   }
 
@@ -1190,7 +1476,41 @@ class Emitter {
   }
 }
 
-/** Takes as many rows of `count` as the chunk holds; flushes when full; one oversized row borrows. */
+/** Bytes the emitter's chunk needs for row `from + done` of a range (one oversized row). */
+function rowNeed(emitter: Emitter, range: Range, at: number): number {
+  return range.kind === "store"
+    ? emitter.out.appendFromNeed(emitter.sorter.store, emitter.payload, range.ids[at] ?? 0)
+    : emitter.out.appendNeed(range.columns.slice(0, emitter.sorter.width), at);
+}
+
+/**
+ * Emits rows `from … from + count` of a range as a sliced job: flushes as the chunk fills
+ * (blocking on the downstream when it blocks, yielding when the slice is due); one oversized
+ * row makes room for itself first.
+ */
+function* emitJob(
+  emitter: Emitter,
+  range: Range,
+  from: number,
+  count: number,
+  rowNumber: number,
+  slice: Slice,
+): SlicedJob<void> {
+  let done = 0;
+  while (done < count) {
+    done += emitter.take(range, from + done, count - done, rowNumber + done);
+    if (done >= count && !emitter.full) return;
+    if (emitter.out.rows === 0) {
+      yield emitter.sorter.io.need(rowNeed(emitter, range, from + done));
+      continue;
+    }
+    const flushed = emitter.flush();
+    if (isPromise(flushed)) yield flushed;
+    else if (slice.due()) yield;
+  }
+}
+
+/** `emitJob` from async code (merge output): a task yield whenever its slice is due. */
 async function emitRange(
   emitter: Emitter,
   range: Range,
@@ -1198,21 +1518,65 @@ async function emitRange(
   count: number,
   rowNumber: number,
 ): Promise<void> {
-  let done = 0;
-  while (done < count) {
-    const taken = emitter.take(range, from + done, count - done, rowNumber + done);
-    done += taken;
-    if (done < count) {
-      if (emitter.out.rows > 0) await emitter.flush();
-      else {
-        const id = range.kind === "store" ? (range.ids[from + done] ?? 0) : from + done;
-        const need =
-          range.kind === "store"
-            ? emitter.out.appendFromNeed(emitter.sorter.store, emitter.payload, id)
-            : emitter.out.appendNeed(range.columns.slice(0, emitter.sorter.width), id);
-        await emitter.sorter.io.need(need);
-      }
+  const done = runSliced(
+    emitJob(emitter, range, from, count, rowNumber, emitter.sorter.slice),
+    emitter.sorter.slice,
+    () => {
+      emitter.sorter.checkAborted();
+    },
+  );
+  if (isPromise(done)) await done;
+}
+
+/**
+ * One row held past its page (WITH TIES' last row, a group's first row), with its operands in
+ * compare mode; both charged to the pool.
+ */
+class HeldRow {
+  readonly store: ColumnStore;
+  readonly operands: Operands;
+  constructor(readonly sorter: Sorter) {
+    this.store = new ColumnStore(sorter.storeTypes, sorter.pool, { chunkRows: 1, varlenBytes: 64 });
+    this.operands = emptyOperands(sorter.spec.types, sorter.spec.keys);
+  }
+
+  get empty(): boolean {
+    return this.store.rows === 0;
+  }
+
+  get vectors(): readonly Vector[] {
+    return this.store.vectors();
+  }
+
+  /** Holds row `row` of `columns` in place of the last one; room is made for it when refused. */
+  async hold(columns: readonly Vector[], row: number): Promise<void> {
+    const sorter = this.sorter;
+    const { types, keys } = sorter.spec;
+    const decodes = sorter.mode !== "keys" && sorter.decodes;
+    for (let attempt = 0; ; attempt++) {
+      this.#drop();
+      const stored = this.store.append(columns, null, row, 1) === 1;
+      if (
+        stored &&
+        (!decodes ||
+          decodeOperands(types, keys, columns, row, row + 1, sorter.pool, this.operands) === 0)
+      )
+        return;
+      this.#drop();
+      if (attempt > 0) throw new RangeError("A held sort row could not be allocated");
+      const operands = decodes ? operandBytes(types, keys, columns, row, row + 1) : 0;
+      await sorter.io.need(this.store.appendNeed(columns, row) + operands);
     }
+  }
+
+  #drop(): void {
+    this.store.reset();
+    dropOperands(this.operands, this.sorter.pool);
+  }
+
+  close(): void {
+    this.store.close();
+    dropOperands(this.operands, this.sorter.pool);
   }
 }
 
@@ -1279,78 +1643,56 @@ export class SortOperator implements Operator {
 
   finish(): MaybePromise<void> {
     const sorter = this.#sorter;
+    let resident: MaybePromise<boolean>;
     try {
-      if (sorter.runs.length === 0) {
-        if (sorter.spec.keep !== null) sorter.compact();
-        const ids = sorter.sortedIds();
-        if (ids !== null) {
-          const result = this.#emitMemory(ids);
-          if (!isPromise(result)) {
-            this.#end();
-            return this.#emitter.downstream.finish();
-          }
-          return result.then(
-            () => {
-              this.#end();
-              return this.#emitter.downstream.finish();
-            },
-            (error: unknown) => {
-              this.abort(error);
-              throw error;
-            },
-          );
-        }
-      }
+      sorter.checkAborted();
+      resident = sorter.runs.length === 0 ? sorter.sliced(this.#memoryJob()) : false;
     } catch (error) {
       this.abort(error);
       throw error;
     }
-    return this.#emitMerged().then(
-      async () => {
+    const fail = (error: unknown): never => {
+      this.abort(error);
+      throw error;
+    };
+    const after = (inMemory: boolean): MaybePromise<void> => {
+      if (inMemory) {
+        this.#end();
+        return this.#emitter.downstream.finish();
+      }
+      return this.#emitMerged().then(async () => {
         this.#end();
         await sorter.closed;
         await this.#emitter.downstream.finish();
-      },
-      (error: unknown) => {
-        this.abort(error);
-        throw error;
-      },
-    );
+      }, fail);
+    };
+    if (isPromise(resident)) return resident.then(after, fail);
+    return after(resident);
   }
 
-  /** In-memory output: offset, limit and ties over sorted ids; synchronous unless it blocks. */
-  #emitMemory(all: Int32Array): MaybePromise<void> {
+  /**
+   * In-memory output as a sliced job: compaction (top-N), the sort, then offset, limit and ties
+   * over the sorted ids. False when the sort's memory was refused (the rows go out merged).
+   */
+  *#memoryJob(): SlicedJob<boolean> {
     const sorter = this.#sorter;
+    const slice = sorter.slice;
     const spec = this.spec;
+    if (spec.limit !== null) yield* sorter.compactJob(slice);
+    const all = yield* sorter.sortJob(slice);
+    if (all === null) return false;
     let end = spec.limit === null ? all.length : Math.min(all.length, spec.offset + spec.limit);
     if (spec.withTies && spec.limit !== null && end > spec.offset && end < all.length)
-      while (end < all.length && sorter.compareIds(all[end - 1] ?? 0, all[end] ?? 0) === 0) end++;
-    const ids = all;
-    const range: Range = {
-      kind: "store",
-      ids,
-      from: spec.offset,
-      count: Math.max(0, end - spec.offset),
-    };
-    const emitter = this.#emitter;
-    let at = spec.offset;
-    const step = (): MaybePromise<void> => {
-      while (at < end) {
-        const taken = emitter.take(range, at, end - at, 0);
-        at += taken;
-        if (taken === 0 || emitter.full) {
-          if (taken === 0 && emitter.out.rows === 0) {
-            const need = emitter.out.appendFromNeed(sorter.store, emitter.payload, ids[at] ?? 0);
-            return sorter.io.need(need).then(step);
-          }
-          const flushed = emitter.flush();
-          if (isPromise(flushed)) return flushed.then(step);
-        }
+      while (end < all.length && sorter.compareIds(all[end - 1] ?? 0, all[end] ?? 0) === 0) {
+        end++;
+        if ((end & (SLICE_ROWS - 1)) === 0 && slice.due()) yield;
       }
-      const flushed = emitter.flush();
-      if (isPromise(flushed)) return flushed;
-    };
-    return step();
+    const count = Math.max(0, end - spec.offset);
+    const range: Range = { kind: "store", ids: all, from: spec.offset, count };
+    yield* emitJob(this.#emitter, range, spec.offset, count, 0, slice);
+    const flushed = this.#emitter.flush();
+    if (isPromise(flushed)) yield flushed;
+    return true;
   }
 
   /** External output: the merge, with offset counted, limit and ties. */
@@ -1360,7 +1702,7 @@ export class SortOperator implements Operator {
     await sorter.prepareMerge();
     let skip = spec.offset;
     let left = spec.limit ?? Infinity;
-    const last = new ColumnStore(sorter.storeTypes, sorter.pool, { chunkRows: 1, varlenBytes: 64 });
+    const last = new HeldRow(sorter);
     try {
       for await (const range of sorter.merge()) {
         let from = range.from;
@@ -1374,9 +1716,13 @@ export class SortOperator implements Operator {
         }
         if (left <= 0) {
           // WITH TIES: rows equal to the last one emitted still go out.
-          if (!spec.withTies || last.rows === 0) break;
+          if (!spec.withTies || last.empty) break;
           let ties = 0;
-          while (ties < count && sorter.sameKey(last.vectors(), 0, range.columns, from + ties))
+          const held = last.vectors;
+          while (
+            ties < count &&
+            sorter.sameKey(held, 0, range.columns, from + ties, last.operands, range.operands)
+          )
             ties++;
           if (ties > 0) await emitRange(this.#emitter, range, from, ties, 0);
           if (ties < count) break;
@@ -1386,14 +1732,14 @@ export class SortOperator implements Operator {
         await emitRange(this.#emitter, range, from, n, 0);
         left -= n;
         if (spec.withTies) {
-          last.reset();
-          last.append(range.columns, null, from + n - 1, 1);
+          await last.hold(range.columns, from + n - 1);
           // Ties past the limit inside this range.
           if (left <= 0 && n < count) {
             let ties = 0;
+            const held = last.vectors;
             while (
               n + ties < count &&
-              sorter.sameKey(last.vectors(), 0, range.columns, from + n + ties)
+              sorter.sameKey(held, 0, range.columns, from + n + ties, last.operands, range.operands)
             )
               ties++;
             if (ties > 0) await emitRange(this.#emitter, range, from + n, ties, 0);
@@ -1493,61 +1839,99 @@ export class GroupTopKOperator implements Operator {
   }
 
   finish(): MaybePromise<void> {
-    return this.#run().then(
-      async () => {
+    const sorter = this.#sorter;
+    let resident: MaybePromise<boolean>;
+    try {
+      sorter.checkAborted();
+      resident = sorter.runs.length === 0 ? sorter.sliced(this.#memoryJob()) : false;
+    } catch (error) {
+      this.abort(error);
+      throw error;
+    }
+    const fail = (error: unknown): never => {
+      this.abort(error);
+      throw error;
+    };
+    const after = (inMemory: boolean): MaybePromise<void> => {
+      if (inMemory) {
         this.#end();
-        await this.#sorter.closed;
+        return this.#emitter.downstream.finish();
+      }
+      return this.#emitMerged().then(async () => {
+        this.#end();
+        await sorter.closed;
         await this.#emitter.downstream.finish();
-      },
-      (error: unknown) => {
-        this.abort(error);
-        throw error;
-      },
-    );
+      }, fail);
+    };
+    if (isPromise(resident)) return resident.then(after, fail);
+    return after(resident);
   }
 
-  async #run(): Promise<void> {
+  /**
+   * In-memory output as a sliced job: compaction, the sort, then row numbers restarting at each
+   * partition (compare mode cuts here). False when the sort's memory was refused.
+   */
+  *#memoryJob(): SlicedJob<boolean> {
+    const sorter = this.#sorter;
+    const slice = sorter.slice;
+    const k = this.spec.k;
+    yield* sorter.compactJob(slice);
+    const ids = yield* sorter.sortJob(slice);
+    if (ids === null) return false;
+    const kept = sorter.mode === "keys" ? yield* sorter.cutJob(ids, slice) : ids;
+    let rowNumber = 0;
+    for (let i = 0; i < kept.length; i++) {
+      const id = kept[i] ?? 0;
+      if (i === 0 || !sorter.samePartitionIds(kept[i - 1] ?? 0, id)) rowNumber = 0;
+      rowNumber++;
+      if (rowNumber <= k) {
+        const range: Range = { kind: "store", ids: kept, from: i, count: 1 };
+        yield* emitJob(this.#emitter, range, i, 1, rowNumber, slice);
+      }
+      if ((i & (SLICE_ROWS - 1)) === SLICE_ROWS - 1 && slice.due()) yield;
+    }
+    const flushed = this.#emitter.flush();
+    if (isPromise(flushed)) yield flushed;
+    return true;
+  }
+
+  /** External output: the merge, row numbers restarting where the partition changes. */
+  async #emitMerged(): Promise<void> {
     const sorter = this.#sorter;
     const k = this.spec.k;
-    if (sorter.runs.length === 0) {
-      sorter.compact();
-      const ids = sorter.sortedIds();
-      if (ids !== null) {
-        const kept = sorter.mode === "keys" ? sorter.cut(ids) : ids;
-        // Row numbers restart at each partition; compare mode also cuts here.
-        let i = 0;
-        let rowNumber = 0;
-        while (i < kept.length) {
-          const id = kept[i] ?? 0;
-          if (i === 0 || !sorter.samePartitionIds(kept[i - 1] ?? 0, id)) rowNumber = 0;
-          rowNumber++;
-          if (rowNumber <= k) {
-            const range: Range = { kind: "store", ids: kept, from: i, count: 1 };
-            await emitRange(this.#emitter, range, i, 1, rowNumber);
-          }
-          i++;
-        }
-        await this.#emitter.flush();
-        return;
-      }
-    }
     await sorter.prepareMerge();
-    const last = new ColumnStore(sorter.storeTypes, sorter.pool, { chunkRows: 1, varlenBytes: 64 });
+    // The partition's first row: rows of one partition have equal partition keys.
+    const first = new HeldRow(sorter);
     let rowNumber = 0;
     try {
       for await (const range of sorter.merge()) {
-        for (let r = range.from; r < range.from + range.count; r++) {
-          if (last.rows === 0 || !sorter.samePartition(last.vectors(), 0, range.columns, r))
+        const end = range.from + range.count;
+        for (let r = range.from; r < end; r++) {
+          if (
+            first.empty ||
+            !sorter.samePartition(
+              first.vectors,
+              0,
+              range.columns,
+              r,
+              first.operands,
+              range.operands,
+            )
+          ) {
             rowNumber = 0;
+            await first.hold(range.columns, r);
+          }
           rowNumber++;
-          last.reset();
-          last.append(range.columns, null, r, 1);
           if (rowNumber <= k) await emitRange(this.#emitter, range, r, 1, rowNumber);
+          else if ((r & (SLICE_ROWS - 1)) === 0) {
+            const paced = sorter.pace();
+            if (paced !== null) await paced;
+          }
         }
       }
       await this.#emitter.flush();
     } finally {
-      last.close();
+      first.close();
     }
   }
 

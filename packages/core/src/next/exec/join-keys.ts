@@ -157,6 +157,7 @@ export function levelHash(hash: number, level: number): number {
 
 // --- extraction ------------------------------------------------------------------------------
 
+// Module scratch, sync-only (R23.1): written and read inside one synchronous extraction.
 const f64 = new Float64Array(1);
 const f64Words = new Int32Array(f64.buffer);
 
@@ -421,6 +422,8 @@ export function extractKeys(
 }
 
 /** A selection view over explicit row ids for the key encoder (identity rows get a scratch). */
+// Module scratch (R23.1), safe across awaits: filled once with identity rows and never written
+// again, so a view handed out stays valid when the array is later replaced by a longer one.
 let identity = new Uint16Array(0);
 function rowsSelection(
   ids: ArrayLike<number> | null,

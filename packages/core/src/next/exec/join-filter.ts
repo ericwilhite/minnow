@@ -312,6 +312,7 @@ function valueOf(part: string | undefined, scratch: KeyScratch, k: number): numb
   return f64[0] ?? 0;
 }
 
+// Module scratch, sync-only (R23.1): written and read inside one synchronous conversion.
 const f64 = new Float64Array(1);
 const f64Words = new Int32Array(f64.buffer);
 
