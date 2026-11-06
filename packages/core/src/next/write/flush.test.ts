@@ -214,6 +214,84 @@ describe("flush and publish", () => {
     await harness.close();
   });
 
+  it("keeps a deletion committed while a later flush publishes (folded positions are pruned, it is not)", async () => {
+    const { harness, path, t } = await setup();
+    await load(path, t, 0, MEMTABLE_ROWS + 10); // the first group publishes
+    await path.quiesce();
+    expect(path.publications).toBe(1);
+    const space = (
+      path as unknown as { shared: { space: { publish: (...args: unknown[]) => Promise<number> } } }
+    ).shared.space;
+    const publish = space.publish.bind(space);
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    let held = false;
+    space.publish = async (...args: unknown[]) => {
+      if (!held) {
+        held = true;
+        await gate;
+      }
+      return publish(...args);
+    };
+    await load(path, t, MEMTABLE_ROWS + 10, MEMTABLE_ROWS); // freezes the next; its flush waits
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(held).toBe(true);
+    // A row of the published group is deleted after the held flush took its bound.
+    const view = path.pin();
+    const keys = new KeyBatch(FREE);
+    encodeKeyBatch(
+      "equality",
+      [{ vector: ints([5]), direction: "asc", nulls: "first" }],
+      { length: 1, selection: null },
+      keys,
+    );
+    const out = { probes: new Int32Array(1), locators: new Float64Array(1), count: 0 };
+    await view.index(t, path.catalog.table(t)?.primaryKey ?? 0).probe(keys, out);
+    view.release();
+    await autocommit(path, (s) =>
+      s.table(t).delete(batch(locators(Array.from(out.locators), t)), null),
+    );
+    open();
+    await path.quiesce();
+    expect(path.publications).toBe(2);
+    // The publish pruned what it folded; the later deletion stays (before any reopen).
+    expect(await probe(path, t, [5, 6])).toBe(1);
+    const rows = await rowsOf(path.pin(), t);
+    expect(rows.length).toBe(2 * MEMTABLE_ROWS + 10 - 1);
+    await harness.close();
+  });
+
+  it("keeps folded deletions for a reader older than the publish that folded them", async () => {
+    const { harness, path, t } = await setup();
+    await load(path, t, 0, MEMTABLE_ROWS + 10);
+    await path.quiesce();
+    const view = path.pin();
+    const keys = new KeyBatch(FREE);
+    encodeKeyBatch(
+      "equality",
+      [{ vector: ints([5]), direction: "asc", nulls: "first" }],
+      { length: 1, selection: null },
+      keys,
+    );
+    const out = { probes: new Int32Array(1), locators: new Float64Array(1), count: 0 };
+    await view.index(t, path.catalog.table(t)?.primaryKey ?? 0).probe(keys, out);
+    view.release();
+    await autocommit(path, (s) =>
+      s.table(t).delete(batch(locators(Array.from(out.locators), t)), null),
+    );
+    // A reader from before the fold: its group has the old bitmap, without row 5.
+    const old = path.pin();
+    await load(path, t, MEMTABLE_ROWS + 10, MEMTABLE_ROWS); // the next flush folds the deletion
+    await path.quiesce();
+    expect(path.publications).toBe(2);
+    expect((await rowsOf(old, t)).some((row) => row[0] === 5)).toBe(false);
+    old.release();
+    expect(await probe(path, t, [5])).toBe(0);
+    await harness.close();
+  });
+
   it("retires every extent of a dropped table at the next publish", async () => {
     const { harness, path, t } = await setup();
     await load(path, t, 0, MEMTABLE_ROWS + 10);

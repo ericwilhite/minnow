@@ -127,24 +127,38 @@ export class MemoryCatalog {
     const liveIds = new Set(columns.map((column) => column.id));
     for (const index of keep)
       if (index.columnIds.every((columnId) => liveIds.has(columnId))) indexes.push(index);
-    const foreignKeys: ForeignKeyDef[] = input.foreignKeys.map((key) => ({
-      id: key.id ?? this.#id(),
-      name: key.name,
-      columnIds: key.columns.map(columnId),
-      // R17.7: "self" names the table being defined, and its key by "primary" or unique name.
-      parentTableId: key.parentTableId === "self" ? id : key.parentTableId,
-      parentIndexId:
-        typeof key.parentIndexId === "number"
-          ? key.parentIndexId
-          : key.parentIndexId === "primary"
-            ? (primaryKey ?? -1)
-            : (indexes.find(
-                (index) => index.name === (key.parentIndexId as { unique: string }).unique,
-              )?.id ?? -1),
-      supportIndexId: null,
-      onDelete: key.onDelete,
-      enforced: key.enforced,
-    }));
+    // R17.7: "self" names the table being defined; "primary" and { unique } name a key of the
+    // parent (this table, or the one `parentTableId` names), as the write path's catalog does.
+    const foreignKeys: ForeignKeyDef[] = input.foreignKeys.map((key) => {
+      const self = key.parentTableId === "self";
+      const parent = self ? undefined : this.#view.table(key.parentTableId);
+      if (!self && parent === undefined)
+        throw new CatalogChangeError(`Foreign key ${key.name} names a missing table`);
+      const reference = key.parentIndexId;
+      const parentIndexes = parent?.indexes ?? indexes;
+      const found =
+        typeof reference === "number"
+          ? reference
+          : reference === "primary"
+            ? parent === undefined
+              ? primaryKey
+              : parent.primaryKey
+            : parentIndexes.find((index) => index.name === reference.unique)?.id;
+      if (found === undefined || found === null)
+        throw new CatalogChangeError(
+          `Foreign key ${key.name} names no key of ${parent?.name ?? input.name}`,
+        );
+      return {
+        id: key.id ?? this.#id(),
+        name: key.name,
+        columnIds: key.columns.map(columnId),
+        parentTableId: self ? id : (parent?.id ?? 0),
+        parentIndexId: found,
+        supportIndexId: null,
+        onDelete: key.onDelete,
+        enforced: key.enforced,
+      };
+    });
     const checks: CheckDef[] = input.checks.map((check) => ({
       id: check.id ?? this.#id(),
       name: check.name,

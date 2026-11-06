@@ -49,6 +49,14 @@ export class GroupDeletes {
     return out;
   }
 
+  /** Forgets positions deleted with seq ≤ `through` (folded into bitmaps every reader uses). */
+  prune(through: number): void {
+    for (const [groupId, positions] of this.byGroup) {
+      for (const [position, seq] of positions) if (seq <= through) positions.delete(position);
+      if (positions.size === 0) this.byGroup.delete(groupId);
+    }
+  }
+
   get size(): number {
     let size = 0;
     for (const positions of this.byGroup.values()) size += positions.size;

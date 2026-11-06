@@ -82,6 +82,8 @@ import {
   encodeManifestRoot,
   GROUPS_PER_PAGE,
   isEmptyDirectory,
+  ParseBudgetError,
+  parseCharge,
   writeGroupDirectory,
   type GroupPageEntry,
 } from "../format/manifest-codec.js";
@@ -116,7 +118,21 @@ interface TableState {
   nextGroupId: number;
   /** The pages of its durable group directory (`root.groups`), in row-id order. */
   pages: readonly GroupPageEntry[];
+  /** Bytes charged for its resident directory (`directoryBytes`) on the metadata grant. */
+  metadataBytes: number;
 }
+
+/**
+ * Resident bytes of a table's directory state, charged before it is materialized (review
+ * B3-p2a-2 #1). Measured with V8 (decodeGroupPage over 160k realistic GroupRefs, a third with a
+ * deletion bitmap): about 270 B per decoded GroupRef (its two BlobRefs; extents are shared per
+ * page) and 193 B per page index entry. The estimate adds room for the view's array slot and
+ * groups carrying both refs.
+ */
+const GROUP_REF_BYTES = 320;
+const PAGE_ENTRY_BYTES = 224;
+const directoryBytes = (groups: number, pages: number): number =>
+  groups * GROUP_REF_BYTES + pages * PAGE_ENTRY_BYTES;
 
 /** `TableRoot.groups` of a table without groups (format/manifest-codec.ts: nothing is read). */
 const EMPTY_DIRECTORY: BlobRef = {
@@ -132,6 +148,18 @@ function blobKey(ref: BlobRef): string {
 
 function sameExtent(a: ExtentRef, b: ExtentRef): boolean {
   return a.offset === b.offset && a.length === b.length;
+}
+
+/** The index of group `groupId` in `groups` (ascending group ids), or −1. */
+function groupIndex(groups: readonly GroupRef[], groupId: number): number {
+  let lo = 0;
+  let hi = groups.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if ((groups[mid]?.groupId ?? 0) < groupId) lo = mid + 1;
+    else hi = mid;
+  }
+  return groups[lo]?.groupId === groupId ? lo : -1;
 }
 
 /** The highest seq of anything in a memtable (rows, delta entries). */
@@ -269,6 +297,14 @@ export class WritePathImpl implements WritePath, EngineHooks {
   readonly #runReaders = new Map<string, RunReader | Promise<RunReader>>();
   /** The same readers by `RunRef` identity (the hot path: no key string per probe). */
   readonly #runsByRef = new WeakMap<RunRef, RunReader>();
+  /**
+   * The long-lived charge for metadata the engine keeps resident (the root, every table's
+   * directory state), apart from the evictable caches: a grant of its own, so it shows under its
+   * label and a refusal raises `ParseBudgetError` instead of growing the heap unseen.
+   */
+  readonly #metadataGrant: Grant;
+  /** Bytes charged for the current root (its parse bound). */
+  #rootCharge: number;
   /** Group roots, directory pages and indexes: decoded once, cached under the governor. */
   readonly #metadata: MetadataReader;
   readonly #metadataCaches: ReadonlyArray<BlobCache<unknown>>;
@@ -283,7 +319,15 @@ export class WritePathImpl implements WritePath, EngineHooks {
   /** Publications (flushes that reached a durable root). */
   publications = 0;
 
-  private constructor(input: EngineInput, grant: Grant, root: ManifestRoot, catalog: Catalog) {
+  private constructor(
+    input: EngineInput,
+    grant: Grant,
+    root: ManifestRoot,
+    catalog: Catalog,
+    metadata: { readonly grant: Grant; readonly rootCharge: number },
+  ) {
+    this.#metadataGrant = metadata.grant;
+    this.#rootCharge = metadata.rootCharge;
     this.durability = input.options.durability;
     this.#memtableRows = input.tuning?.memtableRows ?? MEMTABLE_ROWS;
     this.#session = input.session;
@@ -342,8 +386,14 @@ export class WritePathImpl implements WritePath, EngineHooks {
       spillable: true,
       ...(input.options.signal === undefined ? {} : { signal: input.options.signal }),
     });
+    const metadataGrant = await input.governor.admit({
+      label: "write path metadata",
+      minimumBytes: 0,
+      spillable: true,
+    });
     try {
       const { space, session } = input;
+      let rootCharge: number;
       let root: ManifestRoot;
       let catalog: Catalog;
       if (space.root === null) {
@@ -365,21 +415,28 @@ export class WritePathImpl implements WritePath, EngineHooks {
           clients: [],
         };
         await session.resetLog();
-        await space.publish(encodeManifestRoot(root), { writers: [writer], retired: [] });
+        const bytes = encodeManifestRoot(root);
+        rootCharge = parseCharge(bytes.length);
+        if (!metadataGrant.allocate(rootCharge)) throw new ParseBudgetError(rootCharge);
+        await space.publish(bytes, { writers: [writer], retired: [] });
       } else {
-        // The decoded root is kept for the session; its parse charge is returned at once.
-        const parsed = decodeManifestRoot(space.root, grant);
-        grant.free(parsed.charge);
+        // The decoded root stays resident for the session: its parse charge stays with it.
+        const parsed = decodeManifestRoot(space.root, metadataGrant);
+        rootCharge = parsed.charge;
         root = parsed.value;
         catalog = Catalog.decode(await readBlob(space, root.catalog, grant));
       }
-      const engine = new WritePathImpl(input, grant, root, catalog);
+      const engine = new WritePathImpl(input, grant, root, catalog, {
+        grant: metadataGrant,
+        rootCharge,
+      });
       await engine.#load();
       await engine.#recover();
       engine.#recovering = false;
       engine.#scheduleFlush();
       return engine;
     } catch (error) {
+      metadataGrant.close();
       grant.close();
       throw error;
     }
@@ -390,10 +447,14 @@ export class WritePathImpl implements WritePath, EngineHooks {
     for (const table of root.tables) {
       const groups: GroupRef[] = [];
       let pages: readonly GroupPageEntry[] = [];
+      let metadataBytes = 0;
       if (!isEmptyDirectory(table.groups)) {
         const index = await this.#metadata.groupIndex(table.groups, this.#grant);
         pages = [...index.value];
         index.release();
+        // The resident directory is charged before it is materialized (review B3-p2a-2 #1).
+        metadataBytes = directoryBytes(table.groupCount, pages.length);
+        this.#chargeMetadata(metadataBytes);
         for (const page of pages) {
           const held = await this.#metadata.groupPage(page.ref, this.#grant);
           groups.push(...held.value);
@@ -420,6 +481,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         nextRowId: table.nextRowId,
         nextGroupId: groups.reduce((max, group) => Math.max(max, group.groupId + 1), 1),
         pages,
+        metadataBytes,
       };
       for (const group of groups) {
         const held = await this.#metadata.groupRoot(group.root, this.#grant);
@@ -807,6 +869,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       nextRowId: 1,
       nextGroupId: 1,
       pages: [],
+      metadataBytes: 0,
     });
     this.#publishState();
   }
@@ -817,6 +880,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
    * reopen replays the build.
    */
   readonly #pendingIndexes = new Map<number, { readonly tableId: number; readonly lsn: number }>();
+
+  /** Charges (or, negative, returns) resident metadata bytes; a refusal is `ParseBudgetError`. */
+  #chargeMetadata(bytes: number): void {
+    if (bytes < 0) this.#metadataGrant.free(-bytes);
+    else if (bytes > 0 && !this.#metadataGrant.allocate(bytes)) throw new ParseBudgetError(bytes);
+  }
 
   #dropTableState(tableId: number): void {
     for (const [indexId, pending] of this.#pendingIndexes)
@@ -829,6 +898,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
     if (state !== undefined)
       this.shared.readers.holdUntilOlderClose(() => {
         for (const memtable of state.view.memtables) memtable.releaseAll();
+        this.#chargeMetadata(-state.metadataBytes);
+        state.metadataBytes = 0;
       });
   }
 
@@ -836,6 +907,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const { memtable } = this.liveMemtable(tableId);
     if (!memtable.deltas.has(indexId)) memtable.addDelta(indexId);
     return memtable;
+  }
+
+  /** Bytes charged for resident metadata: the root and every table's directory state. */
+  get residentMetadataBytes(): number {
+    let total = this.#rootCharge;
+    for (const state of this.#tables.values()) total += state.metadataBytes;
+    return total;
   }
 
   /** Total bytes of every table's memtables (live, frozen, retained). */
@@ -1244,6 +1322,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#currentPin?.release();
     this.#currentPin = null;
     for (const cache of this.#metadataCaches) cache.clear();
+    this.#metadataGrant.close();
     this.#grant.close();
   }
 
@@ -1382,25 +1461,33 @@ export class WritePathImpl implements WritePath, EngineHooks {
         newGroups.push(group);
         published.set(memtable, { group, root: groupRoot, runs });
       }
-      // Fold deletions (≤ through) of older groups into their bitmaps.
-      const groups: GroupRef[] = [];
-      for (const group of view.groups) {
-        const folded = groupDeletions(view, group.groupId, through);
-        if (folded.length === 0) {
-          groups.push(group);
-          continue;
-        }
+      // Fold deletions (≤ through) of older groups into their bitmaps: only groups with pending
+      // deletions are visited (review B3-p2a-2 #5), and the first changed one bounds page reuse.
+      const groups: GroupRef[] = view.groups.slice();
+      let firstChanged = groups.length;
+      let liveRowCount = state.root?.liveRowCount ?? 0;
+      const candidates = new Set<number>(view.groupDeletes.byGroup.keys());
+      for (const groupId of view.groupSources.keys()) candidates.add(groupId);
+      for (const groupId of [...candidates].sort((a, b) => a - b)) {
+        const at = groupIndex(groups, groupId);
+        const group = groups[at];
+        if (group === undefined) continue;
+        const folded = groupDeletions(view, groupId, through);
+        if (folded.length === 0) continue;
         const old = group.deletions === null ? null : await this.#bitmap(group.deletions);
         const deletions = await this.#writeBitmap(writer, group.rowCount, old, folded);
         if (group.deletions !== null) retired.push(group.deletions.extent);
-        groups.push({ ...group, deletions, liveRowCount: group.liveRowCount - folded.length });
+        groups[at] = { ...group, deletions, liveRowCount: group.liveRowCount - folded.length };
+        liveRowCount -= folded.length;
+        firstChanged = Math.min(firstChanged, at);
       }
       groups.push(...newGroups);
+      for (const group of newGroups) liveRowCount += group.liveRowCount;
       const { directory, pages } = await this.#writeDirectory(
         writer,
         state,
-        view.groups,
         groups,
+        firstChanged,
         retired,
       );
       const runs = new Map<number, readonly RunRef[]>();
@@ -1410,7 +1497,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
           .filter((run): run is RunRef => run !== undefined);
         runs.set(index.id, [...fresh.reverse(), ...(view.runs.get(index.id) ?? [])]);
       }
-      const liveRowCount = groups.reduce((sum, group) => sum + group.liveRowCount, 0);
       const nextRowId = Math.max(state.nextRowId, ...newGroups.map((group) => group.lastRowId + 1));
       const tableRoot: TableRoot = {
         tableId: state.tableId,
@@ -1429,13 +1515,35 @@ export class WritePathImpl implements WritePath, EngineHooks {
         statistics: null,
       };
       const root = await this.#nextRoot(writer, retired, new Map([[state.tableId, tableRoot]]));
-      await this.#space.publish(encodeManifestRoot(root), { writers: [writer], retired });
+      const rootBytes = encodeManifestRoot(root);
+      // The resident state this publish adds (directory growth, the new root) is charged first.
+      const metadataBytes = directoryBytes(groups.length, pages.length);
+      const rootCharge = parseCharge(rootBytes.length);
+      this.#chargeMetadata(metadataBytes - state.metadataBytes);
+      try {
+        this.#chargeMetadata(rootCharge);
+      } catch (error) {
+        this.#chargeMetadata(state.metadataBytes - metadataBytes);
+        throw error;
+      }
+      try {
+        await this.#space.publish(rootBytes, { writers: [writer], retired });
+      } catch (error) {
+        this.#chargeMetadata(state.metadataBytes - metadataBytes - rootCharge);
+        throw error;
+      }
+      this.#chargeMetadata(-this.#rootCharge);
+      this.#rootCharge = rootCharge;
+      state.metadataBytes = metadataBytes;
       // Re-point readers in the same step the publish resolves (ruling R16.3).
       const pin: SpacePin = this.#space.pin(`re-point t${String(state.tableId)}`);
       const flushed = [...set];
       // Older readers keep the published group (pin) and the memtables' key deltas (ruling 2).
       for (const memtable of flushed) this.#published.add(memtable);
+      // Folded deletions stay for readers older than this publication, then go (with the pin).
+      const folded = state.view.groupDeletes;
       this.shared.readers.holdUntilOlderClose(() => {
+        folded.prune(through);
         pin.release();
         for (const memtable of flushed) {
           memtable.releaseAll();
@@ -1466,7 +1574,15 @@ export class WritePathImpl implements WritePath, EngineHooks {
       // flush stay (the flush only removes what it published).
       const current = state.view;
       const sources = new Map(current.groupSources);
+      // A source whose deletions are all folded now has nothing left to say (later deletions of
+      // its rows go to groupDeletes): drop it, so a flush visits only groups that changed.
+      for (const [groupId, source] of sources) {
+        let pending = false;
+        for (const seq of source.deletions.values()) if (seq > through) pending = true;
+        if (!pending) sources.delete(groupId);
+      }
       for (const [memtable, entry] of published) sources.set(entry.group.groupId, memtable);
+
       this.#setView(state, {
         tableId: state.tableId,
         groups,
@@ -1517,26 +1633,24 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   /**
-   * Writes a table's group directory for `groups` (`before` is the durable list): leading full
-   * pages whose groups are all unchanged are kept (format/manifest-codec.ts "paged group
-   * directory"), the rest are rewritten. Extents of the old directory that the new one does not use
+   * Writes a table's group directory for `groups`, of which those before `firstChanged` are the
+   * durable ones unchanged: leading full pages wholly before it are kept (format/manifest-codec.ts
+   * "paged group directory"), the rest are rewritten. Extents of the old directory that the new one does not use
    * are added to `retired` (the pages one flush writes share an extent, which goes with its last
    * page).
    */
   async #writeDirectory(
     writer: ExtentWriter,
     state: TableState,
-    before: readonly GroupRef[],
     groups: readonly GroupRef[],
+    firstChanged: number,
     retired: ExtentRef[],
   ): Promise<{ directory: BlobRef; pages: readonly GroupPageEntry[] }> {
+    // Full pages wholly before the first changed group are kept: O(pages), no group is compared.
     const keep: GroupPageEntry[] = [];
     let kept = 0;
     for (const page of state.pages) {
-      if (page.groupCount !== GROUPS_PER_PAGE) break;
-      let same = true;
-      for (let k = kept; k < kept + page.groupCount && same; k++) same = groups[k] === before[k];
-      if (!same) break;
+      if (page.groupCount !== GROUPS_PER_PAGE || kept + page.groupCount > firstChanged) break;
       keep.push(page);
       kept += page.groupCount;
     }

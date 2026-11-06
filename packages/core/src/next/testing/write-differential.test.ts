@@ -19,6 +19,10 @@
  * and reopen / crash of the write path. Small memtables put flushes, publishes and replay in the
  * middle of every run.
  *
+ * The current engine always runs a step inside BEGIN … COMMIT / ROLLBACK (so it can be undone when
+ * it differs); its autocommit behaviour for single statements is not compared. The write path and
+ * PostgreSQL run single statements as autocommit.
+ *
  * Limits: the parent rekey with children (PostgreSQL's default refuses it, the current engine
  * cascades it; the write path's rekey-follow lands in increment 2), ON DELETE CASCADE / SET NULL,
  * and statements the write path does not take yet (ALTER TABLE, staged large transactions) are not
@@ -51,7 +55,7 @@ import {
   texts,
   type Value,
 } from "../write/test-support.js";
-import { intendedDivergence, type Divergence } from "./divergences.js";
+import { intendedDivergence, type Divergence, type StatementFacts } from "./divergences.js";
 import { DEFAULT_KEY_FORWARD_RETENTION_MS } from "../../engine/key-forwards.js";
 
 const SEEDS = seedsFor("next-write-differential", [0xd1ff, 7, 4242, 90210]);
@@ -146,8 +150,8 @@ const sql = (value: number | string | null) =>
 /** One generated operation: its SQL for the oracles and its write-path form. */
 interface Op {
   readonly sql: string;
-  /** Values of t's primary key the operation names (written, matched or referenced). */
-  readonly keys: readonly number[];
+  /** What it does, for the divergence registry (divergences.ts `StatementFacts`, without sql). */
+  readonly facts: Omit<StatementFacts, "sql">;
   readonly run: (statement: Statement, ids: Ids, step: StepLog) => Promise<unknown>;
 }
 
@@ -253,7 +257,13 @@ class Workload {
         s: this.text(),
       }));
       return {
-        keys: rows.map((row) => row.id),
+        facts: {
+          kind: "insert",
+          table: "t",
+          newKeys: rows.map((row) => row.id),
+          matchedKeys: [],
+          references: [],
+        },
         sql: `INSERT INTO t VALUES ${rows.map((row) => `(${sql(row.id)}, ${sql(row.u)}, ${sql(row.v)}, ${sql(row.s)})`).join(", ")}`,
         run: (statement, ids) =>
           Promise.resolve(
@@ -276,7 +286,7 @@ class Workload {
       const u = this.maybe(120, 0.3);
       const v = this.maybe(10);
       return {
-        keys: [id],
+        facts: { kind: "update", table: "t", newKeys: [], matchedKeys: [id], references: [] },
         sql: `UPDATE t SET u = ${sql(u)}, v = ${sql(v)} WHERE id = ${String(id)}`,
         run: async (statement, ids) => {
           const at = await locate(statement.view, ids.t, primaryOf(statement, ids.t), id);
@@ -295,7 +305,7 @@ class Workload {
       if ((children.get(next) ?? 0) > 0 || (children.get(id) ?? 0) > 0)
         return this.op(parents, children);
       return {
-        keys: [id, next],
+        facts: { kind: "rekey", table: "t", newKeys: [next], matchedKeys: [id], references: [] },
         sql: `UPDATE t SET id = ${String(next)} WHERE id = ${String(id)}`,
         run: async (statement, ids, step) => {
           const def = statement.catalog.table(ids.t);
@@ -311,7 +321,7 @@ class Workload {
     if (kind < 77) {
       const id = pick();
       return {
-        keys: [id],
+        facts: { kind: "delete", table: "t", newKeys: [], matchedKeys: [id], references: [] },
         sql: `DELETE FROM t WHERE id = ${String(id)}`,
         run: async (statement, ids) => {
           const at = await locate(statement.view, ids.t, primaryOf(statement, ids.t), id);
@@ -324,7 +334,13 @@ class Workload {
       const id = this.int(60);
       const pid = this.chance(0.15) ? null : pick();
       return {
-        keys: pid === null ? [] : [pid],
+        facts: {
+          kind: "insert",
+          table: "c",
+          newKeys: [id],
+          matchedKeys: [],
+          references: pid === null ? [] : [{ table: "t", value: pid }],
+        },
         sql: `INSERT INTO c VALUES (${String(id)}, ${sql(pid)})`,
         run: (statement, ids) =>
           Promise.resolve(statement.table(ids.c).insert(batch(ints([id]), ints([pid])), null)),
@@ -332,7 +348,7 @@ class Workload {
     }
     const id = this.int(60);
     return {
-      keys: [],
+      facts: { kind: "delete", table: "c", newKeys: [], matchedKeys: [id], references: [] },
       sql: `DELETE FROM c WHERE id = ${String(id)}`,
       run: async (statement, ids) => {
         const at = await locate(statement.view, ids.c, primaryOf(statement, ids.c), id);
@@ -505,7 +521,12 @@ async function stepOnCurrent(
   rollback: boolean,
   expected: { readonly outcome: Outcome },
   rows: { readonly t: Value[][]; readonly c: Value[][] },
-): Promise<{ readonly same: boolean; readonly error: string | null }> {
+): Promise<{
+  readonly same: boolean;
+  readonly outcome: Outcome;
+  readonly error: string | null;
+  readonly rowsDiffer: boolean;
+}> {
   await current.execute("BEGIN");
   let outcome: Outcome = "ok";
   let error: string | null = null;
@@ -518,14 +539,16 @@ async function stepOnCurrent(
       break;
     }
   let same = outcome === expected.outcome;
+  let rowsDiffer = false;
   if (same && outcome === "ok" && !rollback) {
     const t = await oracleRows(current, "t", "id, u, v, s");
     const c = await oracleRows(current, "c", "id, pid");
-    same =
-      JSON.stringify(t) === JSON.stringify(rows.t) && JSON.stringify(c) === JSON.stringify(rows.c);
+    rowsDiffer =
+      JSON.stringify(t) !== JSON.stringify(rows.t) || JSON.stringify(c) !== JSON.stringify(rows.c);
+    same = !rowsDiffer;
   }
   await current.execute(same && outcome === "ok" && !rollback ? "COMMIT" : "ROLLBACK");
-  return { same, error };
+  return { same, outcome, error, rowsDiffer };
 }
 
 describe("write path vs PostgreSQL and the current engine (generated)", () => {
@@ -582,11 +605,18 @@ describe("write path vs PostgreSQL and the current engine (generated)", () => {
           let result = await stepOnCurrent(current, sqls, rollback, expected, rows);
           if (!result.same) {
             const divergence = intendedDivergence({
-              statements: sqls,
-              keys: new Map([["t", ops.flatMap((op) => op.keys)]]),
-              oracleError: result.error,
-              authorityError: expected.message,
-              facts: { nowMs: clock.ms, rekeyedAway: new Map([["t", rekeyedAway]]) },
+              statements: ops.map((op) => ({ sql: op.sql, ...op.facts })),
+              oracle: { outcome: result.outcome, message: result.error },
+              authority: { outcome: expected.outcome, message: expected.message },
+              rowsDiffer: result.rowsDiffer,
+              facts: {
+                nowMs: clock.ms,
+                primaryKeys: new Map([
+                  ["t", "id"],
+                  ["c", "id"],
+                ]),
+                rekeyedAway: new Map([["t", rekeyedAway]]),
+              },
             });
             expect(
               divergence?.id,

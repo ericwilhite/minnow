@@ -156,7 +156,14 @@ class GroupSegmentImpl implements GroupSegment {
     if (this.#root !== null) return this.#root;
     const got =
       this.#pending ?? this.view.snapshot.shared.groupRoot(this.group.root, this.view.budget);
-    if (got instanceof Promise) this.#pending = got;
+    if (got instanceof Promise && this.#pending !== got) {
+      this.#pending = got;
+      // A failed read is not kept: concurrent callers share its rejection, a later call retries
+      // (review B3-p2a-2 #3).
+      got.catch(() => {
+        if (this.#pending === got) this.#pending = null;
+      });
+    }
     return settle(got, (held) => {
       if (this.#root === null) {
         this.#root = held.value;

@@ -101,19 +101,26 @@ export class Harness {
       budget: startup,
       registerCache: (cache) => this.governor.registerCache(cache),
     });
-    this.path = await WritePathImpl.open({
-      session,
-      space: this.space,
-      governor: this.governor,
-      options: { durability: this.durability },
-      ...(this.memtableRows === undefined ? {} : { tuning: { memtableRows: this.memtableRows } }),
-    });
-    this.#release = async () => {
+    const release = async () => {
       await this.space.close();
       startup.close();
       await session.close();
       await lease.release();
     };
+    try {
+      this.path = await WritePathImpl.open({
+        session,
+        space: this.space,
+        governor: this.governor,
+        options: { durability: this.durability },
+        ...(this.memtableRows === undefined ? {} : { tuning: { memtableRows: this.memtableRows } }),
+      });
+    } catch (error) {
+      // A refused open leaves nothing held: the next open can take the lock.
+      await release();
+      throw error;
+    }
+    this.#release = release;
     return this.path;
   }
 
