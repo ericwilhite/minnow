@@ -150,6 +150,37 @@ describe("R23: the aggregate operator's finish", () => {
     expect(pushes()).toBe(1);
   });
 
+  it("yields a task even when every output batch meets backpressure that is ready at once", async () => {
+    // Review B4-p2c-4 finding 1: one group per batch, each push "blocked" with a ready() already
+    // resolved (a microtask), 1 ms of downstream work per push. The slice must still end at
+    // 4 ms and yield a task, so a queued task runs long before the 200 batches are done.
+    let tick = 0;
+    let pushes = 0;
+    let pushesBeforeTask = -1;
+    const sink: Operator = {
+      push: () => {
+        pushes += 1;
+        tick += 1;
+        return "blocked";
+      },
+      ready: () => Promise.resolve(),
+      finish: () => undefined,
+      abort: () => undefined,
+    };
+    const op = operator([0], [call("count_star", I64, null)], sink, {
+      now: () => tick,
+      targetBytes: 1,
+    });
+    op.push(batch(0, 200, 200, (r) => BigInt(r)));
+    setImmediate(() => {
+      pushesBeforeTask = pushes;
+    });
+    await op.finish();
+    expect(pushes).toBe(200);
+    expect(pushesBeforeTask).toBeGreaterThanOrEqual(0);
+    expect(pushesBeforeTask).toBeLessThanOrEqual(8);
+  });
+
   it("two interleaved instances (yielding, NUMERIC limbs, DISTINCT) give each one's answer", async () => {
     const run = async (interleave: boolean) => {
       let tickA = 0;
@@ -157,8 +188,8 @@ describe("R23: the aggregate operator's finish", () => {
       const a = collector();
       const b = collector();
       // Small output batches and slices: many yields between the two instances' batches (AVG
-      // prepares only what each batch holds, so nothing prepared outlives a slice; per-instance
-      // state such as output charges and the cursor must still stay apart).
+      // prepares at most what each batch holds, charged and per instance; per-instance state such
+      // as prepared results, output charges and the cursor must stay apart).
       const opA = operator([0], AGGREGATES, a.sink, { now: () => tickA++, targetBytes: 8192 });
       const opB = operator([0], AGGREGATES, b.sink, {
         now: () => (tickB += 3),

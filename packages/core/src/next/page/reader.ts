@@ -978,6 +978,13 @@ export class ChunkReader {
     return total;
   }
 
+  /** `largeValueBytes` for the selected `rows[start … end)` (what `loadValuesOf` charges). */
+  largeValueBytesOf(rows: Rows, start = 0, end = rows.length): number {
+    let total = 0;
+    for (const row of this.largeRowsOf(rows, start, end)) total += this.#largeLength(row);
+    return total;
+  }
+
   /**
    * Loads the out-of-line values of rows `[from, to)` (their pages must be loaded), so a decode
    * of those rows can copy them. Synchronous when there are none, they are loaded, or every part

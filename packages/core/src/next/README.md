@@ -26,7 +26,7 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | `page/`            | format                           | Page codecs, page directory and statistics, streaming group writer, chunk reader (ChunkPages), inflated-page cache                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `spill/`           | executor (OPFS service: storage) | Spill contract (one long-lived scratch file, batching charged to the operator's budget); in-memory double                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `memory/`          | executor                         | Memory governor: admission, progress loans, held vs allocated bytes (reference implementation)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `exec/`            | executor                         | Entry point (`executor.ts`), result frames (`result.ts`), scans (`scan.ts`, `memory-scan.ts`), table rules (`rules.ts`), push driver (`pipeline.ts`), fetcher (`fetch.ts`), expression kernels (`kernels/`), filter and project (`filter.ts`), aggregation (`agg/`), comparators, decimal SUM                                                                                                                                                                                                                                                                                                                                                    |
+| `exec/`            | executor                         | Entry point (`executor.ts`), result frames (`result.ts`), scans (`scan.ts` contract, `table-scan.ts`, `memory-scan.ts`, `column-target.ts`, the pushdown seam `pushdown.ts`), table rules (`rules.ts`), push driver (`pipeline.ts`), fetcher (`fetch.ts`), expression kernels (`kernels/`), filter and project (`filter.ts`), aggregation (`agg/`), comparators, decimal SUM                                                                                                                                                                                                                                                                     |
 | `ir/`              | lowering, executor               | Operator IR (`ir.ts`); scalar function and operator table (`functions.ts`); table rules in IR form (`rules.ts`); executor costs the planner reads (`costs.ts`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `access/`          | write path + key index           | Storage access contracts the write path implements: snapshots and segments, catalog, key-index probes and ranges, `modify` (rows, conflicts, RETURNING), transactions, group commit, sequences, delivery                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `testing/`         | all                              | Differential-harness adapter for a partial new core; stand-ins for the write path and executor that the owner's composition runs over, with real lowering, until those tracks land (`owner-standins.ts`), an in-memory Web Locks for election tests (`fake-locks.ts`)                                                                                                                                                                                                                                                                                                                                                                            |
@@ -540,7 +540,17 @@ and the owner import it directly.
   wait; the driver awaits only real Promises, and `drive` returns no Promise when the whole
   pipeline finished synchronously.
 - After `YIELD_INTERVAL_MS` (4 ms) of synchronous work the driver yields a task (`setImmediate`
-  or a `MessageChannel` message, never a resolved Promise) at the next batch boundary.
+  or a `MessageChannel` message, never a resolved Promise) at the next batch boundary. In a
+  browser or worker, a yield is a `setTimeout(…, 0)` timer turn once `TIMER_TURN_MS` (50 ms) has
+  passed without one, because a user agent may run message tasks ahead of timers indefinitely.
+  So a timer due during a long query (owner liveness, idle flush, transaction timeouts) runs
+  within about 50 ms plus a slice of becoming due: an extra scheduling-latency budget, not a
+  deadline, so a timer that must finish its work by a deadline has to be armed that much
+  earlier. Operators pace their own output the same way: a slice ends only at a task yield, not
+  when downstream backpressure resolves at once. `pipeline-yield.test.ts` checks the yield on an
+  event loop that always runs messages first, and `browser-tests/next-yield.spec.ts` in real
+  Chromium, Firefox and WebKit (where message-only yields serviced no timer at all). Node's
+  `setImmediate` already follows the timers phase.
 - `abort` releases grants, spill files and transferred batches.
 - The driver adds no cancellation machinery without a signal, and with one each wait removes its
   listener, so a long stream retains nothing per batch.
@@ -608,6 +618,63 @@ and the owner import it directly.
   (`select_div_scale`: at least 16 significant digits, capped at 1000), rounded half away from
   zero; 128-bit limbs while the scaled operands fit, BigInt past that.
 
+### Table scan (`exec/table-scan.ts`, `exec/pushdown.ts`, `exec/column-target.ts`)
+
+- One table of a snapshot, every segment in row-id order, batches of at most 2,048 rows and about
+  1 MiB, the scan's columns in output order (plus a locator column for late materialization).
+- Group segments: prune → pushed predicates → decode the selected positions. The filter's
+  conjuncts that compare one column with constants (comparisons, `IN`, `IS [NOT] NULL`) go to the
+  page format: groups whose statistics rule one out are skipped unread, then per range the live
+  rows are narrowed by `select` / `refine` on encoded pages. `select` over a whole range loads
+  only the pages the predicate cannot rule out; `refine` (after deletions or an earlier conjunct)
+  loads every page its positions touch. The rest of the filter (the residual) runs on decoded
+  values.
+- At or above 40 % of a range selected, every column decodes densely (residual columns too) and
+  keeps the selection, the residual then narrowing it. Below it only the selected positions are
+  gathered; with a residual, its columns are gathered first and the others only for the rows it
+  keeps.
+- Batches are bounded by their decoded bytes: validity, values or codes, scales, limbs,
+  specials, offsets, varlen bytes (full value lengths, out-of-line values included) and
+  locators, all known from page headers before any value is read. One row larger than the target
+  is a batch of its own. Decode buffers grow with the batches (at least 64 rows, doubling, at
+  most 2,048), so a small target takes small buffers.
+- Before a batch decodes, the scan reserves its whole working set from the grant: the
+  out-of-line values it leases and every buffer it grows. A refusal halves the batch; for one
+  row the scan borrows a progress loan (R18.3) for that working set and repays it once the row's
+  buffers and values are given back: after the batch's borrow ends, or at once when the
+  residual rejected the row. Out-of-line values are
+  released when the batch's borrow ends; the scan's own scratch (position lists, selections,
+  locators, memory-segment staging) is charged before it is built.
+- Pushed predicates on the decoded fallback (below) load the values they read when they
+  evaluate, before the batch is sized.
+- Long runs that emit nothing (ranges, chunks and groups filtered or pruned away) yield to the
+  event loop with a task every 4 ms (R23). The slice runs on across `next()` calls and resolved
+  continuations and restarts only after a task yield (R23.4), as the driver's and the
+  aggregate's do.
+- Ending: at the end of the table the scan gives back everything it holds by itself; `abort` (a
+  cancellation, an error, a LIMIT) does the same at once and repays a loan, never throwing. A
+  `next()` still waiting on a read then resolves null: whatever settles after the abort (a reader
+  opened, a loan served) is closed or repaid, and nothing more is read, decoded or emitted. A
+  loan the abort could not repay because the scan's own read still held loan-backed bytes is
+  repaid when that read settles; `close` reports one that another operator's bytes still hold.
+- Pushdown (`pushdown.ts`): pushed conjuncts run on encoded pages through the page format's
+  read-side pushdown (`compilePredicate`, `pagesMatching`, `select`, `refine`, `chunkMayMatch`;
+  "Predicates on encoded pages" above). Where it does not push a predicate down for a chunk
+  (interval, json, arrays, mixed-scale decimals, enum order: `compilePredicate` returns null),
+  the same comparison runs on decoded values with the executor's kernels, without statistics
+  pruning. Semantics are PostgreSQL's either way, so where a conjunct runs never changes the
+  answer. `selectMask` (the fused dense filter and aggregate) is not called by any operator yet.
+- Memory segments are read through `memory-scan.ts` (one lent chunk at a time, zero copy), the
+  whole filter as the residual.
+- `table-scan.test.ts` checks generated tables (groups through the page writer, memory segments,
+  deletions, columns some groups predate, values stored out of line) and filters, with pushed
+  conjuncts on encoded pages or forced onto decoded values, against the same scan with pushdown
+  off (decode-then-filter), and that against the source rows; every batch it decodes stays
+  within the byte target, and the scan holds nothing once it ends. Pinned tests cover loans
+  (repaid on close, on abort, after a failure; sized for a row's value lease and buffers), abort
+  at every suspension of a group scan and during a memory chunk's read, pacing over rejected
+  rows, and the charged scratch.
+
 ### Aggregation (`exec/agg/`)
 
 - `aggregate.ts`: the `aggregate` operator. Each batch maps its rows to dense group ids, then
@@ -615,8 +682,9 @@ and the owner import it directly.
   first-seen order in batches of at most 2,048 groups and about 1 MiB, each charged to the grant
   before it is built and released when downstream is done with it; it yields to the event loop
   with a task every 4 ms, checking the deadline per group inside AVG(NUMERIC)'s divisions and
-  resuming mid-batch (it prepares only what the next batch holds, charged by `bigintBytes`,
-  and released as the batch takes it); after an abort, or once its abort signal fires (checked at every slice and
+  resuming mid-batch (it prepares at most what the next batch holds, charged by `bigintBytes`,
+  and released as a batch takes it; with several AVG columns one may keep up to a batch's worth
+  across a yield or backpressure, still charged, until the next batch or close/abort); after an abort, or once its abort signal fires (checked at every slice and
   after backpressure, R23), it rejects with the reason. Scratch that outlives a slice belongs to
   the operator; module-level scratch is used only within one synchronous call (R23). Without
   GROUP BY there is one row even over no input.
@@ -624,15 +692,37 @@ and the owner import it directly.
   (key, id) tables for 32-bit and 64-bit integers (int8 by its two words, whatever its
   representation: no BigInt, no Map), an f64 table for floats, xxHash32 over bytes for text (a
   dictionary column translated once per entry), key encoding for NUMERIC and the rest, and an id
-  tuple for several keys. SQL GROUP BY equality: NULLs together, −0 = 0, NaN = NaN, NUMERIC by
+  tuple for several keys: direct-mapped (the value ids bit-packed into a slot of a table of at
+  most 2^16) while the columns' value counts fit, hashed column by column past that. SQL GROUP BY equality: NULLs together, −0 = 0, NaN = NaN, NUMERIC by
   value.
+- One int2/int4/date key whose range spans no more slots than the hash table would hold (twice
+  its slots, at most 2^22 values) is direct-mapped instead: slot `key − base`, no hashing or
+  probing, half the bytes. A key past the span widens it; a range too wide goes back to hashing;
+  modes change only between batches, and ids stay first-seen either way. Per-group arrays grow
+  2× while small and 4× from 65,536 elements (less fresh memory on the way to many groups).
+- With more than 4,096 groups and at least four aggregates over the batch's own rows, the
+  operator hands its accumulators the rows stably sorted by group id (LSD radix, 11 bits a
+  pass), so each one's state arrays are read nearly sequentially; a group's rows keep their input
+  order, which float sums and MIN/MAX ties depend on. Measured faster than a group-row state
+  layout for many aggregates (which gained 10–25 %), and not used for few aggregates, where it
+  costs more than it saves.
 - `states.ts`: struct-of-arrays state per aggregate, no object per group. Integer and NUMERIC
   sums are exact at any size: an f64 part within ±2^52, a 128-bit carry, and past that an exact
   BigInt offset per group that changes only when the carry overflows (or for inputs already
   wider than 128 bits), never per row. A scalar NUMERIC SUM over a declared precision ≤ 12 is
-  fused: four accumulators, no per-row check. Float SUM and AVG follow PostgreSQL's float8pl and
+  fused: four accumulators, no per-row check. Without GROUP BY, the batches of several such
+  columns that qualify (no NULL, every row) are summed in one loop over up to four columns
+  (`fusedSums`), and a SUM and an AVG of one exact column share one state. Accumulator loops
+  start from −0 (a double), so V8 keeps them unboxed. Float SUM and AVG follow PostgreSQL's float8pl and
   float8_accum, including their 22003 rules. MIN/MAX ties take the newer value, as PostgreSQL
   does (MIN(1.5, 1.50) is 1.50); int8 and NUMERIC comparisons use words and limbs.
+- MIN/MAX over dictionary-encoded text, bytea and uuid compare ranks, not codes (page
+  dictionaries are first-seen order): a dictionary small for its batch is ranked by value once,
+  and a group's best gets its place among those ranks by a binary search over values when the
+  dictionary first meets it. Groups and dictionaries are only ever compared by value.
+- SUM over int2/int4 reads the decoded Int32Array directly and, while no batch can push a part
+  past ±2^52 (a bound on every part, rescanned about once per 2^21 rows), skips the per-row
+  check; near the limit it takes the checked loop and the carry.
 - `values.ts`: per-group values for MIN/MAX and NUMERIC keys: int8 and interval microseconds as
   two words, NUMERIC as f64 or 128-bit limbs; only coefficients past 128 bits are BigInts, each
   charged at the governor's `bigintBytes` (its size change charged before a replacement). Exact

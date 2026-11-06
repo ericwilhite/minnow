@@ -60,7 +60,7 @@ import {
 } from "../kernels/limbs.js";
 import { POW10, coefficientAt, scaleAt, specialAt, type DecimalData } from "../kernels/numeric.js";
 import { IDENTITY, flatOf } from "../kernels/vectors.js";
-import { Charged } from "./groups.js";
+import { Charged, grownCapacity } from "./groups.js";
 import { bigintBytes } from "../../memory/governor.js";
 import { GroupValues } from "./values.js";
 
@@ -84,6 +84,20 @@ export interface Accumulator {
    */
   prepare?(from: number, count: number, expired: () => boolean): number;
   close(): void;
+  /**
+   * One state serving a SUM and an AVG of the same argument (aggregate.ts shares it): the sum
+   * (`average` false) or the average, as a vector of `type`. Exact sums only (NUMERIC, integers);
+   * float SUM and AVG differ in their identity (−0 / 0) and overflow rules, so they never share.
+   */
+  emitAs?(average: boolean, type: PhysicalType, from: number, count: number): FlatVector;
+  /**
+   * The fused scalar pass (aggregate.ts): this batch's values as one Float64Array when it can be
+   * summed exactly in one loop with other columns (dense rows, no NULL, the state's one scale,
+   * |value| < 2^53 / 2,048), else null. A non-null result commits the batch to `addFused`.
+   */
+  fusedValues?(vector: Vector, rows: Uint16Array, count: number): Float64Array | null;
+  /** Adds `count` values whose exact total is `total` (after `fusedValues`). */
+  addFused?(total: number, count: number): void;
 }
 
 /** The f64 part of an exact sum stays within ±LIMIT so every addition of a value ≤ LIMIT is exact. */
@@ -184,7 +198,7 @@ class CountAccumulator implements Accumulator {
   }
   grow(groups: number): void {
     if (groups > this.#counts.length)
-      this.#counts = this.#memory.float64(this.#counts, Math.max(groups, 2 * this.#counts.length));
+      this.#counts = this.#memory.float64(this.#counts, grownCapacity(this.#counts.length, groups));
   }
   update(
     vector: Vector | null,
@@ -275,6 +289,11 @@ class ExactSums {
   carry: Uint32Array = new Uint32Array(0);
   /** 1 once the group has a value. */
   has: Uint8Array = new Uint8Array(0);
+  /**
+   * An upper bound of every |sums[g]| (each stays within ±LIMIT). `addFlat32` skips its per-row
+   * check while a batch cannot push a part past LIMIT from it; every other writer raises it.
+   */
+  bound = 0;
   /** Groups whose carry is nonzero (so emit can pick the safe tier quickly). */
   carried = 0;
   /** The offsets past 128 bits, or null while every total fits the carry. */
@@ -287,7 +306,7 @@ class ExactSums {
   grow(groups: number): void {
     if (groups <= this.sums.length) return;
     const before = this.sums.length;
-    const capacity = Math.max(groups, 2 * this.sums.length);
+    const capacity = grownCapacity(this.sums.length, groups);
     this.sums = this.#memory.float64(this.sums, capacity);
     this.carry = this.#memory.uint32(this.carry, 4 * capacity);
     this.has = this.#memory.uint8(this.has, capacity);
@@ -369,10 +388,23 @@ class ExactSums {
       return;
     }
     const s = (this.sums[g] ?? 0) + v;
+    let stored = s;
     if (s > LIMIT || s < -LIMIT) {
       this.spill(g, this.sums[g] ?? 0);
-      this.sums[g] = v;
-    } else this.sums[g] = s;
+      stored = v;
+    }
+    this.sums[g] = stored;
+    const size = stored < 0 ? -stored : stored;
+    if (size > this.bound) this.bound = size;
+  }
+  /** Tightens `bound` to the largest |part| (O(groups): about once per 2^21 int32 rows). */
+  rescan(): void {
+    let bound = 0;
+    for (const v of this.sums) {
+      const size = v < 0 ? -v : v;
+      if (size > bound) bound = size;
+    }
+    this.bound = bound;
   }
   /**
    * Group g's sum into limb slot `to` of `t` when it fits 128 bits; false when it does not (read
@@ -435,6 +467,11 @@ function addIntegers(
     }
     return;
   }
+  if (!scalar && data.layout === "i32" && reader.codes === null && reader.stride === 1) {
+    // Flat int32 (int2, int4): read the decoded Int32Array as it is, no float64 copy.
+    addFlat32(sums, data.values, validity, gids, rows, count);
+    return;
+  }
   const values = rowValues(
     data.layout === "int64"
       ? (data.values as { values: Float64Array }).values
@@ -444,8 +481,8 @@ function addIntegers(
   );
   if (scalar && data.layout === "i32") {
     // int32: a batch sums below 2^42, exactly, with no per-row check.
-    let s0 = 0;
-    let s1 = 0;
+    let s0 = -0; // −0: a double from the start (see exactSumIdentity)
+    let s1 = -0;
     let n = 0;
     if (validity === null) {
       let k = 0;
@@ -495,6 +532,8 @@ function addFlat(
 ): void {
   const parts = sums.sums;
   const has = sums.has;
+  // Parts written here stay within ±LIMIT, which is all `bound` may then assume.
+  sums.bound = LIMIT;
   if (validity === null)
     for (let k = 0; k < count; k++) {
       const i = rows[k] ?? 0;
@@ -516,6 +555,60 @@ function addFlat(
       if (total > LIMIT || total < -LIMIT) sums.add(g, v);
       else parts[g] = total;
     }
+}
+
+/** What one batch of `count` int32 values can add to any one part: `count` × 2^31. */
+const INT32_STEP = 2 ** 31;
+
+/**
+ * `addFlat` over int32 values read from their Int32Array (a separate function, so both loops
+ * stay monomorphic): the same exact rule, a ±2^31 value added to a part within ±2^52.
+ */
+function addFlat32(
+  sums: ExactSums,
+  values: Int32Array,
+  validity: Validity | null,
+  gids: Int32Array,
+  rows: Uint16Array,
+  count: number,
+): void {
+  const parts = sums.sums;
+  const has = sums.has;
+  // While every part stays within ±LIMIT whatever this batch adds (each row adds less than 2^31
+  // to one part), the loop needs no per-row check and every sum stays exact.
+  const step = INT32_STEP * count;
+  if (sums.bound + step > LIMIT) sums.rescan();
+  if (sums.bound + step <= LIMIT) {
+    sums.bound += step;
+    if (validity === null)
+      for (let k = 0; k < count; k++) {
+        const i = rows[k] ?? 0;
+        const g = gids[i] ?? 0;
+        parts[g] = (parts[g] ?? 0) + (values[i] ?? 0);
+        has[g] = 1;
+      }
+    else
+      for (let k = 0; k < count; k++) {
+        const i = rows[k] ?? 0;
+        if (((validity[i >>> 5] ?? 0) & (1 << (i & 31))) === 0) continue;
+        const g = gids[i] ?? 0;
+        parts[g] = (parts[g] ?? 0) + (values[i] ?? 0);
+        has[g] = 1;
+      }
+    return;
+  }
+  // Parts near LIMIT: the checked loop, spilling to the carry.
+  sums.bound = LIMIT;
+  for (let k = 0; k < count; k++) {
+    const i = rows[k] ?? 0;
+    if (validity !== null && ((validity[i >>> 5] ?? 0) & (1 << (i & 31))) === 0) continue;
+    const g = gids[i] ?? 0;
+    const v = values[i] ?? 0;
+    const total = (parts[g] ?? 0) + v;
+    has[g] = 1;
+    if (total > LIMIT || total < -LIMIT) sums.add(g, v);
+    else parts[g] = total;
+  }
 }
 
 class IntegerSumAccumulator implements Accumulator {
@@ -550,9 +643,13 @@ class IntegerSumAccumulator implements Accumulator {
     return validityBytes(count) + count * 24 + this.#sums.wideOutputBytes(from, count);
   }
   emit(from: number, count: number): FlatVector {
+    return this.emitAs(this.average, this.type, from, count);
+  }
+  emitAs(average: boolean, type: PhysicalType, from: number, count: number): FlatVector {
     const sums = this.#sums;
     const validity = validityFrom(sums.has, from, count);
-    if (this.#counts !== null) {
+    if (average) {
+      if (this.#counts === null) throw new TypeError("AVG from a SUM-only state");
       const out = new Float64Array(count);
       for (let k = 0; k < count; k++) {
         const g = from + k;
@@ -562,20 +659,20 @@ class IntegerSumAccumulator implements Accumulator {
       }
       return {
         form: "flat",
-        type: this.type,
+        type: type,
         length: count,
         validity,
         data: { layout: "f64", values: out },
       };
     }
     // SUM(int2/int4) is int64; SUM(int8) is NUMERIC(·, 0) (exact past 2^63).
-    const decimal = this.type.kind === "decimal";
+    const decimal = type.kind === "decimal";
     if (sums.carried === 0 && sums.wide === null) {
       const values = sums.sums.slice(from, from + count);
       return decimal
         ? {
             form: "flat",
-            type: this.type,
+            type: type,
             length: count,
             validity,
             data: {
@@ -588,7 +685,7 @@ class IntegerSumAccumulator implements Accumulator {
           }
         : {
             form: "flat",
-            type: this.type,
+            type: type,
             length: count,
             validity,
             data: { layout: "int64", values: { repr: "safe", values } },
@@ -605,7 +702,7 @@ class IntegerSumAccumulator implements Accumulator {
     if (wide)
       return {
         form: "flat",
-        type: this.type,
+        type,
         length: count,
         validity,
         data: {
@@ -629,7 +726,7 @@ class IntegerSumAccumulator implements Accumulator {
       return decimal
         ? {
             form: "flat",
-            type: this.type,
+            type: type,
             length: count,
             validity,
             data: {
@@ -642,7 +739,7 @@ class IntegerSumAccumulator implements Accumulator {
           }
         : {
             form: "flat",
-            type: this.type,
+            type: type,
             length: count,
             validity,
             data: { layout: "int64", values },
@@ -650,7 +747,7 @@ class IntegerSumAccumulator implements Accumulator {
     }
     return {
       form: "flat",
-      type: this.type,
+      type: type,
       length: count,
       validity,
       data: {
@@ -671,10 +768,157 @@ class IntegerSumAccumulator implements Accumulator {
 // ---------------------------------------------------------------------------------------------
 // Float sums and averages
 
+/**
+ * Σ values[0 … count) with four independent accumulators. Exact when the caller bounds the result
+ * below 2^53 (the fused NUMERIC SUM: |c| < 10^12 and count ≤ 2,048). Standalone functions so each
+ * loop compiles on its own (inside a large method V8 compiles it several times slower).
+ */
+function exactSumIdentity(values: Float64Array, count: number): number {
+  // −0, not 0: a double from the start, so V8 keeps the accumulators unboxed (a small-integer
+  // start costs ~3× here); −0 is also the additive identity, so no sum changes.
+  let s0 = -0;
+  let s1 = -0;
+  let s2 = -0;
+  let s3 = -0;
+  let k = 0;
+  for (; k + 3 < count; k += 4) {
+    s0 += values[k] ?? 0;
+    s1 += values[k + 1] ?? 0;
+    s2 += values[k + 2] ?? 0;
+    s3 += values[k + 3] ?? 0;
+  }
+  for (; k < count; k++) s0 += values[k] ?? 0;
+  return s0 + s1 + (s2 + s3);
+}
+
+/** Σ values[rows[0 … count)], as `exactSumIdentity`. */
+function exactSumRows(values: Float64Array, rows: Uint16Array, count: number): number {
+  // −0, not 0: a double from the start, so V8 keeps the accumulators unboxed (a small-integer
+  // start costs ~3× here); −0 is also the additive identity, so no sum changes.
+  let s0 = -0;
+  let s1 = -0;
+  let s2 = -0;
+  let s3 = -0;
+  let k = 0;
+  for (; k + 3 < count; k += 4) {
+    s0 += values[rows[k] ?? 0] ?? 0;
+    s1 += values[rows[k + 1] ?? 0] ?? 0;
+    s2 += values[rows[k + 2] ?? 0] ?? 0;
+    s3 += values[rows[k + 3] ?? 0] ?? 0;
+  }
+  for (; k < count; k++) s0 += values[rows[k] ?? 0] ?? 0;
+  return s0 + s1 + (s2 + s3);
+}
+
+/** Σ of rows 0 … count − 1 of two to four columns in one loop, into out[at …]. */
+function fused2(
+  a: Float64Array,
+  b: Float64Array,
+  count: number,
+  out: Float64Array,
+  at: number,
+): void {
+  let sa = -0;
+  let sb = -0;
+  for (let k = 0; k < count; k++) {
+    sa += a[k] ?? 0;
+    sb += b[k] ?? 0;
+  }
+  out[at] = sa;
+  out[at + 1] = sb;
+}
+function fused3(
+  a: Float64Array,
+  b: Float64Array,
+  c: Float64Array,
+  count: number,
+  out: Float64Array,
+  at: number,
+): void {
+  let sa = -0;
+  let sb = -0;
+  let sc = -0;
+  for (let k = 0; k < count; k++) {
+    sa += a[k] ?? 0;
+    sb += b[k] ?? 0;
+    sc += c[k] ?? 0;
+  }
+  out[at] = sa;
+  out[at + 1] = sb;
+  out[at + 2] = sc;
+}
+function fused4(
+  a: Float64Array,
+  b: Float64Array,
+  c: Float64Array,
+  d: Float64Array,
+  count: number,
+  out: Float64Array,
+  at: number,
+): void {
+  let sa = -0;
+  let sb = -0;
+  let sc = -0;
+  let sd = -0;
+  for (let k = 0; k < count; k++) {
+    sa += a[k] ?? 0;
+    sb += b[k] ?? 0;
+    sc += c[k] ?? 0;
+    sd += d[k] ?? 0;
+  }
+  out[at] = sa;
+  out[at + 1] = sb;
+  out[at + 2] = sc;
+  out[at + 3] = sd;
+}
+
+const EMPTY_F64 = new Float64Array(0);
+
+/**
+ * The fused scalar pass: out[j] = Σ columns[j][0 … count) for j < n, reading up to four columns
+ * per loop (one loop over several columns runs ~1.7× faster than one loop per column: their
+ * additions are independent). Exact under `fusedValues`'s bound (each sum below 2^51).
+ */
+export function fusedSums(
+  columns: readonly Float64Array[],
+  n: number,
+  count: number,
+  out: Float64Array,
+): void {
+  let j = 0;
+  const at = (c: number): Float64Array => columns[c] ?? EMPTY_F64;
+  for (; j + 3 < n; j += 4) fused4(at(j), at(j + 1), at(j + 2), at(j + 3), count, out, j);
+  if (n - j === 3) fused3(at(j), at(j + 1), at(j + 2), count, out, j);
+  else if (n - j === 2) fused2(at(j), at(j + 1), count, out, j);
+  else if (n - j === 1) out[j] = exactSumIdentity(at(j), count);
+}
+
+/** The valid rows counted by the last `exactSumValid`. */
+let validCount = 0;
+
+/** Σ of the valid values[rows[0 … count)], branch-free; their number goes to `validCount`. */
+function exactSumValid(
+  values: Float64Array,
+  rows: Uint16Array,
+  count: number,
+  validity: Validity,
+): number {
+  let s0 = -0;
+  let n = 0;
+  for (let k = 0; k < count; k++) {
+    const i = rows[k] ?? 0;
+    const bit = ((validity[i >>> 5] ?? 0) >>> (i & 31)) & 1;
+    s0 += (values[i] ?? 0) * bit;
+    n += bit;
+  }
+  validCount = n;
+  return s0;
+}
+
 /** Float sums of grouped rows without NULLs until the first non-finite sum; returns that row. */
 function sumDense(
   sums: Float64Array,
-  counts: Float64Array,
+  has: Uint8Array,
   values: Float64Array,
   gids: Int32Array,
   rows: Uint16Array,
@@ -687,7 +931,7 @@ function sumDense(
     const next = (sums[g] ?? 0) + (values[i] ?? 0);
     if (next - next !== 0) break;
     sums[g] = next;
-    counts[g] = (counts[g] ?? 0) + 1;
+    has[g] = 1;
   }
   return k;
 }
@@ -726,7 +970,9 @@ function averageDense(
 class FloatSumAccumulator implements Accumulator {
   readonly #memory: Charged;
   #sums: Float64Array = new Float64Array(0);
+  /** AVG: the count per group. SUM keeps only `#has` (1 byte a group: it stays in cache). */
   #counts: Float64Array = new Float64Array(0);
+  #has: Uint8Array = new Uint8Array(0);
   /**
    * AVG only: the sum of squared deviations (float8_accum's Sxx, Youngs–Cramer). AVG does not
    * output it, but PostgreSQL raises 22003 when it overflows from finite inputs.
@@ -741,14 +987,16 @@ class FloatSumAccumulator implements Accumulator {
   }
   grow(groups: number): void {
     if (groups <= this.#sums.length) return;
-    const capacity = Math.max(groups, 2 * this.#sums.length);
+    const capacity = grownCapacity(this.#sums.length, groups);
     const before = this.#sums.length;
     this.#sums = this.#memory.float64(this.#sums, capacity);
     // SUM starts from −0, the additive identity (PostgreSQL's first value is the state, so
     // SUM(−0) is −0); AVG's sum starts from 0 (float8_accum's initial {0,0,0}).
     if (!this.average) this.#sums.fill(-0, before);
-    this.#counts = this.#memory.float64(this.#counts, capacity);
-    if (this.average) this.#squares = this.#memory.float64(this.#squares, capacity);
+    if (this.average) {
+      this.#counts = this.#memory.float64(this.#counts, capacity);
+      this.#squares = this.#memory.float64(this.#squares, capacity);
+    } else this.#has = this.#memory.uint8(this.#has, capacity);
   }
   update(
     vector: Vector | null,
@@ -767,7 +1015,7 @@ class FloatSumAccumulator implements Accumulator {
     );
     const validity = reader.validity;
     const sums = this.#sums;
-    const counts = this.#counts;
+    const has = this.#has;
     if (this.average) {
       this.#accumulate(values, validity, gids, rows, count, scalar);
       return;
@@ -786,8 +1034,8 @@ class FloatSumAccumulator implements Accumulator {
           sum = next;
         }
         sums[0] = sum;
-        counts[0] = (counts[0] ?? 0) + k;
-      } else k = sumDense(sums, counts, values, gids, rows, count);
+        if (k > 0) has[0] = 1;
+      } else k = sumDense(sums, has, values, gids, rows, count);
     }
     if (k < count) this.#exact(values, validity, gids, rows, k, count, scalar, float32);
   }
@@ -854,7 +1102,7 @@ class FloatSumAccumulator implements Accumulator {
     float32: boolean,
   ): void {
     const sums = this.#sums;
-    const counts = this.#counts;
+    const has = this.#has;
     for (let k = from; k < count; k++) {
       const i = rows[k] ?? 0;
       if (!validAt(validity, i)) continue;
@@ -871,7 +1119,7 @@ class FloatSumAccumulator implements Accumulator {
       )
         throw new NumericOutOfRangeError("value out of range: overflow");
       sums[g] = sum;
-      counts[g] = (counts[g] ?? 0) + 1;
+      has[g] = 1;
     }
   }
   outputBytes(_from: number, count: number): number {
@@ -879,7 +1127,12 @@ class FloatSumAccumulator implements Accumulator {
   }
   emit(from: number, count: number): FlatVector {
     const present = new Uint8Array(count);
-    for (let k = 0; k < count; k++) present[k] = (this.#counts[from + k] ?? 0) > 0 ? 1 : 0;
+    for (let k = 0; k < count; k++)
+      present[k] = this.average
+        ? (this.#counts[from + k] ?? 0) > 0
+          ? 1
+          : 0
+        : (this.#has[from + k] ?? 0);
     const validity = validityFrom(present, 0, count);
     if (this.type.kind === "float32") {
       const out = Float32Array.from(this.#sums.subarray(from, from + count));
@@ -941,7 +1194,7 @@ class DecimalSumAccumulator implements Accumulator {
   grow(groups: number): void {
     this.#sums.grow(groups);
     if (groups <= this.#flags.length) return;
-    const capacity = Math.max(groups, 2 * this.#flags.length);
+    const capacity = grownCapacity(this.#flags.length, groups);
     this.#scales = this.#memory.uint16(this.#scales, capacity);
     this.#flags = this.#memory.uint8(this.#flags, capacity);
     this.#counts = this.#memory.float64(this.#counts, capacity);
@@ -995,44 +1248,20 @@ class DecimalSumAccumulator implements Accumulator {
         precision <= 12
       ) {
         // The fused SUM: |c| < 10^12, so a batch of ≤ 2,048 sums below 2^51 exactly.
-        let s0 = 0;
-        let s1 = 0;
-        let s2 = 0;
-        let s3 = 0;
         let n = count;
-        if (validity === null && rows === IDENTITY) {
-          // Dense: every row, no indirection.
-          let k = 0;
-          for (; k + 3 < count; k += 4) {
-            s0 += values[k] ?? 0;
-            s1 += values[k + 1] ?? 0;
-            s2 += values[k + 2] ?? 0;
-            s3 += values[k + 3] ?? 0;
-          }
-          for (; k < count; k++) s0 += values[k] ?? 0;
-        } else if (validity === null) {
-          let k = 0;
-          for (; k + 3 < count; k += 4) {
-            s0 += values[rows[k] ?? 0] ?? 0;
-            s1 += values[rows[k + 1] ?? 0] ?? 0;
-            s2 += values[rows[k + 2] ?? 0] ?? 0;
-            s3 += values[rows[k + 3] ?? 0] ?? 0;
-          }
-          for (; k < count; k++) s0 += values[rows[k] ?? 0] ?? 0;
-        } else {
-          n = 0;
-          for (let k = 0; k < count; k++) {
-            const i = rows[k] ?? 0;
-            const bit = ((validity[i >>> 5] ?? 0) >>> (i & 31)) & 1;
-            s0 += (values[i] ?? 0) * bit;
-            n += bit;
-          }
+        let total: number;
+        if (validity === null)
+          total =
+            rows === IDENTITY ? exactSumIdentity(values, count) : exactSumRows(values, rows, count);
+        else {
+          total = exactSumValid(values, rows, count, validity);
+          n = validCount;
         }
         if (n > 0) {
           flags[0] = (flags[0] ?? 0) | HAS;
           sums.has[0] = 1;
           counts[0] = (counts[0] ?? 0) + n;
-          sums.add(0, s0 + s1 + (s2 + s3));
+          sums.add(0, total);
         }
         return true;
       }
@@ -1153,7 +1382,28 @@ class DecimalSumAccumulator implements Accumulator {
       bytes += Math.max(this.#sums.offsetBytes(from + k), 48) + 24 + 8;
     return bytes;
   }
+  fusedValues(vector: Vector, rows: Uint16Array, count: number): Float64Array | null {
+    if (vector.form !== "flat" || vector.validity !== null || rows !== IDENTITY) return null;
+    const data = vector.data as DecimalData;
+    const precision = this.#precision;
+    if (precision === null || precision > 12 || data.specials !== null) return null;
+    const scale = data.scale;
+    if (scale === null || (this.#scale !== SCALE_NONE && this.#scale !== scale)) return null;
+    if (data.coefficients.repr !== "safe" || count > BATCH_ROWS) return null;
+    this.#scale = scale;
+    return data.coefficients.values;
+  }
+  addFused(total: number, count: number): void {
+    if (count === 0) return;
+    this.#flags[0] = (this.#flags[0] ?? 0) | HAS;
+    this.#sums.has[0] = 1;
+    this.#counts[0] = (this.#counts[0] ?? 0) + count;
+    this.#sums.add(0, total);
+  }
   emit(from: number, count: number): FlatVector {
+    return this.emitAs(this.average, this.type, from, count);
+  }
+  emitAs(average: boolean, type: PhysicalType, from: number, count: number): FlatVector {
     const sums = this.#sums;
     const flags = this.#flags;
     const present = new Uint8Array(count);
@@ -1169,7 +1419,7 @@ class DecimalSumAccumulator implements Accumulator {
     const validity = validityFrom(present, 0, count);
     const uniform = this.#scale >= 0 ? this.#scale : null;
     const scales = uniform === null ? this.#scales.slice(from, from + count) : null;
-    if (this.average) return this.#average(from, count, validity, specials);
+    if (average) return this.#average(type, from, count, validity, specials);
     let coefficients: DecimalData["coefficients"];
     if (sums.carried === 0 && sums.wide === null)
       coefficients = { repr: "safe", values: sums.sums.slice(from, from + count) };
@@ -1197,7 +1447,7 @@ class DecimalSumAccumulator implements Accumulator {
     }
     return {
       form: "flat",
-      type: this.type,
+      type: type,
       length: count,
       validity,
       data: {
@@ -1253,8 +1503,11 @@ class DecimalSumAccumulator implements Accumulator {
 
   /**
    * AVG results prepared for groups `from …` (see `prepare`), and the bytes charged for them. The
-   * operator prepares only what its next output batch holds, which `#average` then takes whole:
-   * nothing prepared outlives that batch (a yield, backpressure); close and abort clear it.
+   * operator prepares at most what its next output batch holds, and `#average` takes what that
+   * batch holds. With several AVG columns the batch shrinks to the fewest any of them prepared
+   * before the deadline, so the others keep the rest of theirs (less than one batch's worth
+   * each, still charged) across the yield or backpressure that follows, for the next batch.
+   * Close and abort clear it and return its charge.
    */
   readonly #prepared: { from: number; coefficients: bigint[]; scales: number[]; bytes: number } = {
     from: -1,
@@ -1274,6 +1527,7 @@ class DecimalSumAccumulator implements Accumulator {
   }
 
   #average(
+    type: PhysicalType,
     from: number,
     count: number,
     validity: Validity | null,
@@ -1288,8 +1542,9 @@ class DecimalSumAccumulator implements Accumulator {
     // moves on to the groups after this batch.
     if (cache.coefficients.length === count) this.#clearPrepared(from + count);
     else {
-      // Only a direct emit of fewer groups than prepared (not the operator's path) keeps a rest:
-      // its charge is re-derived from what stays.
+      // A batch shorter than what was prepared keeps the rest for the next batch: with several
+      // AVG columns, the batch shrinks to the fewest any of them prepared. Its charge is
+      // re-derived from what stays.
       cache.coefficients.splice(0, count);
       cache.scales.splice(0, count);
       const kept = cache.coefficients.reduce(
@@ -1304,7 +1559,7 @@ class DecimalSumAccumulator implements Accumulator {
     for (let k = 0; k < count; k++) if (specials[k] !== 0) anySpecial = true;
     return {
       form: "flat",
-      type: this.type,
+      type: type,
       length: count,
       validity,
       data: {
@@ -1417,10 +1672,66 @@ function compareToStored(values: GroupValues, g: number, flat: FlatVector, slot:
   }
 }
 
+/** Byte range `[start, end)` of dictionary entry `code` (varlen or fixed16 entries). */
+function entryStart(flat: FlatVector, code: number): number {
+  const data = flat.data;
+  return data.layout === "varlen" ? (data.offsets[code] ?? 0) : code * 16;
+}
+function entryEnd(flat: FlatVector, code: number): number {
+  const data = flat.data;
+  return data.layout === "varlen" ? (data.offsets[code + 1] ?? 0) : code * 16 + 16;
+}
+function entryBytes(flat: FlatVector): Uint8Array {
+  const data = flat.data;
+  if (data.layout === "varlen" || data.layout === "fixed16") return data.bytes;
+  throw new TypeError(`No entry bytes in a ${data.layout} dictionary`);
+}
+
+/**
+ * A dictionary's entries ranked by value (`compareBytes`, the order MIN/MAX compare text, bytea
+ * and uuid in): `rank[code]`, equal entries sharing a rank, and `byRank[r]` one code of each.
+ * Codes are first-seen order (page/dictionary.ts), never value order, so they are only ranked.
+ */
+interface Ranking {
+  readonly dictionaryId: number;
+  /**
+   * The ranked entries, held weakly: the same immutable dictionary under another batch's id is
+   * recognized without keeping a borrowed dictionary alive between batches (comparisons read the
+   * current batch's own entries).
+   */
+  readonly flat: WeakRef<FlatVector>;
+  readonly rank: Int32Array;
+  readonly byRank: Int32Array;
+  readonly ranks: number;
+}
+
+/**
+ * MIN / MAX over any comparable type: the best value per group in `GroupValues`, compared with
+ * the stored one per row (`compareToStored`). Ties take the new value, as PostgreSQL's
+ * float8smaller / numeric_larger… do (MIN(1.5, 1.50) is 1.50; MIN(0, −0) is −0).
+ *
+ * Text, bytea and uuid batches whose dictionary is small for the batch (at most a quarter of its
+ * rows) compare ranks instead of bytes: the dictionary is ranked by value once (`Ranking`), each
+ * row compares its entry's rank with its group's best, and only a better row stores its bytes.
+ * A group's best from another dictionary or a plain batch gets its position among this
+ * dictionary's ranks by a binary search over values the first time this dictionary meets it
+ * (`#position`, cached per group and invalidated by `#epoch`): 2r when it equals rank r, 2r − 1
+ * between ranks r − 1 and r. So groups and dictionaries are only ever compared by value; equal
+ * ranks are equal bytes, so a tie stores nothing new.
+ */
 class MinMaxAccumulator implements Accumulator {
   readonly #values: GroupValues;
   readonly #memory: Charged;
   #has: Uint8Array = new Uint8Array(0);
+  /** Byte-compared layouts (varlen, fixed16): may take the ranked path. */
+  readonly #bytes: boolean;
+  #ranking: Ranking | null = null;
+  #rankingBytes = 0;
+  /** Per group: its best's position among `#ranking`'s ranks (see above), valid at `#epoch`. */
+  #position: Float64Array = new Float64Array(0);
+  #positionEpoch: Int32Array = new Int32Array(0);
+  /** Bumped when positions go stale: a new ranking, or a best stored outside the ranked path. */
+  #epoch = 1;
   constructor(
     readonly type: PhysicalType,
     readonly max: boolean,
@@ -1435,10 +1746,18 @@ class MinMaxAccumulator implements Accumulator {
       throw new UnsupportedPlanError(`MIN/MAX over ${type.kind}`, { construct: "aggregate" });
     this.#values = new GroupValues(type, charge);
     this.#memory = new Charged(charge);
+    const layout = layoutOf(type);
+    this.#bytes = layout === "varlen" || layout === "fixed16";
   }
   grow(groups: number): void {
-    if (groups > this.#has.length)
-      this.#has = this.#memory.uint8(this.#has, Math.max(groups, 2 * this.#has.length));
+    if (groups > this.#has.length) {
+      const capacity = grownCapacity(this.#has.length, groups);
+      this.#has = this.#memory.uint8(this.#has, capacity);
+      if (this.#bytes) {
+        this.#position = this.#memory.float64(this.#position, capacity);
+        this.#positionEpoch = this.#memory.int32(this.#positionEpoch, capacity);
+      }
+    }
     const nothing: Vector = {
       form: "constant",
       type: this.type,
@@ -1455,11 +1774,22 @@ class MinMaxAccumulator implements Accumulator {
     scalar: boolean,
   ): void {
     if (vector === null) return;
+    if (
+      this.#bytes &&
+      vector.form === "dictionary" &&
+      vector.dictionary.validity === null &&
+      4 * vector.dictionary.length <= count
+    ) {
+      this.#updateRanked(vector, this.#rankingOf(vector), gids, rows, count, scalar);
+      return;
+    }
     const reader = readerOf(vector);
     if (reader.empty) return;
     const values = this.#values;
     const has = this.#has;
     const better = this.max ? 1 : -1;
+    // Bests stored here have no position among a ranking's ranks.
+    this.#epoch += 1;
     for (let k = 0; k < count; k++) {
       const i = rows[k] ?? 0;
       if (!validAt(reader.validity, i)) continue;
@@ -1468,12 +1798,137 @@ class MinMaxAccumulator implements Accumulator {
       if (has[g] === 0) {
         has[g] = 1;
         values.set(g, vector, i);
-      } else if (compareToStored(values, g, reader.flat, slot) !== better)
-        // Ties take the new value, as PostgreSQL's float8smaller / numeric_larger… do
-        // (MIN(1.5, 1.50) is 1.50; MIN(0, −0) is −0).
-        values.set(g, vector, i);
+      } else if (compareToStored(values, g, reader.flat, slot) !== better) values.set(g, vector, i);
     }
   }
+
+  /** The ranking of `vector`'s dictionary: kept while the dictionary is the same. */
+  #rankingOf(vector: Vector & { form: "dictionary" }): Ranking {
+    const known = this.#ranking;
+    if (
+      known !== null &&
+      (known.dictionaryId === vector.dictionaryId || known.flat.deref() === vector.dictionary)
+    )
+      return known;
+    const flat = vector.dictionary;
+    const size = flat.length;
+    const bytes = entryBytes(flat);
+    const order = Array.from({ length: size }, (_, code) => code);
+    const compare = (a: number, b: number): number =>
+      compareBytes(
+        bytes,
+        entryStart(flat, a),
+        entryEnd(flat, a),
+        bytes,
+        entryStart(flat, b),
+        entryEnd(flat, b),
+      );
+    order.sort(compare);
+    // Charged before they are built (`order` is a JS array of at most a quarter-batch of codes).
+    const charged = 8 * size;
+    const rank = this.#memory.make(Int32Array, size);
+    const byRank = this.#memory.make(Int32Array, size);
+    let ranks = 0;
+    for (let k = 0; k < size; k++) {
+      const code = order[k] ?? 0;
+      if (k === 0 || compare(order[k - 1] ?? 0, code) !== 0) byRank[ranks++] = code;
+      rank[code] = ranks - 1;
+    }
+    if (this.#rankingBytes > 0) this.#memory.give(this.#rankingBytes);
+    this.#rankingBytes = charged;
+    this.#epoch += 1;
+    this.#ranking = {
+      dictionaryId: vector.dictionaryId,
+      flat: new WeakRef(flat),
+      rank,
+      byRank,
+      ranks,
+    };
+    return this.#ranking;
+  }
+
+  /**
+   * Group g's best's position among `ranking`'s ranks (2r: equal to rank r; odd: between), over
+   * `flat`, the ranked dictionary's entries.
+   */
+  #positionOf(ranking: Ranking, flat: FlatVector, g: number): number {
+    const values = this.#values;
+    const arena = values.byteArena;
+    const start = values.start(g);
+    const end = values.end(g);
+    const bytes = entryBytes(flat);
+    // The first rank whose entry is ≥ the best.
+    let lo = 0;
+    let hi = ranking.ranks;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      const code = ranking.byRank[mid] ?? 0;
+      const c = compareBytes(
+        bytes,
+        entryStart(flat, code),
+        entryEnd(flat, code),
+        arena,
+        start,
+        end,
+      );
+      if (c < 0) lo = mid + 1;
+      else hi = mid;
+    }
+    if (lo < ranking.ranks) {
+      const code = ranking.byRank[lo] ?? 0;
+      const c = compareBytes(
+        bytes,
+        entryStart(flat, code),
+        entryEnd(flat, code),
+        arena,
+        start,
+        end,
+      );
+      if (c === 0) return 2 * lo;
+    }
+    return 2 * lo - 1;
+  }
+
+  #updateRanked(
+    vector: Vector & { form: "dictionary" },
+    ranking: Ranking,
+    gids: Int32Array,
+    rows: Uint16Array,
+    count: number,
+    scalar: boolean,
+  ): void {
+    const values = this.#values;
+    const has = this.#has;
+    const position = this.#position;
+    const positionEpoch = this.#positionEpoch;
+    const epoch = this.#epoch;
+    const rank = ranking.rank;
+    const codes = vector.codes;
+    const validity = vector.validity;
+    const max = this.max;
+    for (let k = 0; k < count; k++) {
+      const i = rows[k] ?? 0;
+      if (validity !== null && ((validity[i >>> 5] ?? 0) & (1 << (i & 31))) === 0) continue;
+      const g = scalar ? 0 : (gids[i] ?? 0);
+      const r = 2 * (rank[codes[i] ?? 0] ?? 0);
+      if (has[g] === 0) {
+        has[g] = 1;
+        values.set(g, vector, i);
+      } else {
+        if (positionEpoch[g] !== epoch) {
+          position[g] = this.#positionOf(ranking, vector.dictionary, g);
+          positionEpoch[g] = epoch;
+        }
+        const best = position[g] ?? 0;
+        // Equal ranks are equal bytes: a tie stores nothing new.
+        if (max ? r <= best : r >= best) continue;
+        values.set(g, vector, i);
+      }
+      position[g] = r;
+      positionEpoch[g] = epoch;
+    }
+  }
+
   outputBytes(from: number, count: number): number {
     return this.#values.outputBytes(null, from, count);
   }
@@ -1483,6 +1938,8 @@ class MinMaxAccumulator implements Accumulator {
   close(): void {
     this.#values.close();
     this.#memory.close();
+    this.#ranking = null;
+    this.#rankingBytes = 0;
   }
 }
 
@@ -1548,7 +2005,7 @@ class NumberMinMaxAccumulator implements Accumulator {
   }
   grow(groups: number): void {
     if (groups <= this.#best.length) return;
-    const capacity = Math.max(groups, 2 * this.#best.length);
+    const capacity = grownCapacity(this.#best.length, groups);
     this.#best = this.#memory.float64(this.#best, capacity);
     this.#has = this.#memory.uint8(this.#has, capacity);
   }
@@ -1674,7 +2131,7 @@ class BoolAccumulator implements Accumulator {
   }
   grow(groups: number): void {
     if (groups > this.#state.length)
-      this.#state = this.#memory.uint8(this.#state, Math.max(groups, 2 * this.#state.length));
+      this.#state = this.#memory.uint8(this.#state, grownCapacity(this.#state.length, groups));
   }
   update(
     vector: Vector | null,
@@ -1735,7 +2192,7 @@ class SingleValueAccumulator implements Accumulator {
   }
   grow(groups: number): void {
     if (groups > this.#seen.length)
-      this.#seen = this.#memory.uint8(this.#seen, Math.max(groups, 2 * this.#seen.length));
+      this.#seen = this.#memory.uint8(this.#seen, grownCapacity(this.#seen.length, groups));
     const nothing: Vector = {
       form: "constant",
       type: this.type,

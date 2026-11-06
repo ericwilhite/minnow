@@ -49,7 +49,7 @@ export class MemorySegmentScan implements BatchSource {
   readonly #out: readonly ChunkOutput[];
   readonly #vectors: Vector[];
   readonly #results: Array<ChunkResult | undefined>;
-  readonly #selection: Selection = allocateSelection(MEMORY_CHUNK_ROWS);
+  readonly #selection: Selection;
   #segment = 0;
   /** The chunk index the next read continues, or starts when `#start` is 0. */
   #chunk = 0;
@@ -58,17 +58,25 @@ export class MemorySegmentScan implements BatchSource {
   /** The current segment's deletions; undefined until read. */
   #deletions: DeletionVector | null | undefined = undefined;
   #aborted = false;
+  /** Where the last batch came from: its segment and the position of its slot 0. */
+  #lastSegment = -1;
+  #lastStart = 0;
 
   /**
    * `columnIds` are declared columns of the table snapshot; `out[c]` are the scan's own buffers
-   * (from its grant) that a re-pointed chunk decodes into, one per column.
+   * (from its grant) that a re-pointed chunk decodes into, one per column; `selection`, of at
+   * least `MEMORY_CHUNK_ROWS` rows, is the scan's own too when given (else made here).
    */
   constructor(
     segments: readonly MemorySegment[],
     columnIds: readonly number[],
     out: readonly ChunkOutput[],
+    selection?: Selection,
   ) {
     if (out.length !== columnIds.length) throw new RangeError("One output per column");
+    if (selection !== undefined && selection.rows.length < MEMORY_CHUNK_ROWS)
+      throw new RangeError("A memory scan's selection holds a whole chunk");
+    this.#selection = selection ?? allocateSelection(MEMORY_CHUNK_ROWS);
     this.#segments = segments;
     this.#columnIds = columnIds;
     this.#out = out;
@@ -115,13 +123,18 @@ export class MemorySegmentScan implements BatchSource {
     }
   }
 
-  #read(segment: MemorySegment, length: number, from: number): MaybePromise<SourceItem> {
+  #read(segment: MemorySegment, length: number, from: number): MaybePromise<SourceItem | null> {
     for (let c = from; c < this.#columnIds.length; c++) {
       const out = this.#out[c];
       if (out === undefined) throw new RangeError("Missing output");
       const result = segment.chunk(this.#columnIds[c] ?? -1, this.#chunk, out, this.#start);
       if (isPromise(result))
         return result.then((value) => {
+          // Aborted while the read was in flight: no later column is read, no batch built.
+          if (this.#aborted) {
+            this.#results.fill(undefined);
+            return null;
+          }
           this.#results[c] = value;
           return this.#read(segment, length, c + 1);
         });
@@ -160,6 +173,8 @@ export class MemorySegmentScan implements BatchSource {
       );
     }
     const selection = this.#select(start - firstRow, end - start, length);
+    this.#lastSegment = this.#segments[this.#segment]?.index ?? -1;
+    this.#lastStart = this.#chunk * MEMORY_CHUNK_ROWS + firstRow;
     if (end === length) {
       this.#chunk += 1;
       this.#start = 0;
@@ -188,6 +203,16 @@ export class MemorySegmentScan implements BatchSource {
       for (let k = 0; k < selection.count; k++)
         selection.rows[k] = (selection.rows[k] ?? 0) + offset;
     return selection;
+  }
+
+  /** The segment (`Segment.index`) the last batch came from (locators). */
+  get lastSegment(): number {
+    return this.#lastSegment;
+  }
+
+  /** The segment position of the last batch's slot 0: slot k is position `lastStart + k`. */
+  get lastStart(): number {
+    return this.#lastStart;
   }
 
   abort(): void {

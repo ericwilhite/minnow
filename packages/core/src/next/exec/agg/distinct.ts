@@ -12,7 +12,7 @@ import type { PhysicalType } from "../../types.js";
 import type { ByteCharge } from "../../vector/varlen.js";
 import type { Selection, Vector } from "../../vector/vector.js";
 import { IDENTITY } from "../kernels/vectors.js";
-import { Charged, GroupTable } from "./groups.js";
+import { Charged, GroupTable, grownCapacity } from "./groups.js";
 
 function mix(a: number, b: number): number {
   let h = Math.imul(a ^ Math.imul(b, 0x9e3779b1), 0x85ebca6b);
@@ -73,7 +73,7 @@ export class DistinctSet {
       if (this.#seen.length < this.#values.groupCount)
         this.#seen = this.#memory.uint8(
           this.#seen,
-          Math.max(this.#values.groupCount, 2 * this.#seen.length),
+          grownCapacity(this.#seen.length, this.#values.groupCount),
         );
       const seen = this.#seen;
       for (let k = 0; k < count; k++) {

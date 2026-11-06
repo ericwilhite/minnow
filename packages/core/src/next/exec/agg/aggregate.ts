@@ -41,9 +41,19 @@ import { countIn, rowsIn, type Compiled } from "../kernels/vectors.js";
 import { YIELD_INTERVAL_MS, yieldTask, type Operator, type PushResult } from "../pipeline.js";
 import { DistinctSet } from "./distinct.js";
 import { GroupTable } from "./groups.js";
-import { accumulatorFor, type Accumulator } from "./states.js";
+import { accumulatorFor, fusedSums, type Accumulator } from "./states.js";
 
 type AggregateRel = Extract<Rel, { op: "aggregate" }>;
+
+/**
+ * Group-ordered updates pay off once enough accumulators walk the rows over enough groups
+ * (measured: 20 aggregates over 10,000 groups 2.2× faster sorted; 2 over 632,000 slower).
+ */
+const SORT_MIN_AGGREGATES = 4;
+const SORT_MIN_GROUPS = 4096;
+
+/** What a cleared fused-column slot holds (no borrowed array). */
+const NO_COLUMN = new Float64Array(0);
 
 const UNSUPPORTED = new Set([
   "string_agg",
@@ -60,6 +70,28 @@ interface CompiledAggregate {
   readonly filter: Predicate | null;
   readonly distinct: DistinctSet | null;
   readonly selection: Selection;
+  /** The output's type and, for a shared state, which of its results it reads. */
+  readonly type: PhysicalType;
+  readonly reads: "own" | "sum" | "average";
+  /** False for the second reader of a shared state (it neither updates nor closes it). */
+  readonly updates: boolean;
+  /** In the fused scalar pass (no GROUP BY, no FILTER or DISTINCT, an exact sum). */
+  readonly fusable: boolean;
+}
+
+/**
+ * Plain SUM / AVG over one input column of an exact type (integers, NUMERIC): candidates for a
+ * shared state. Floats never share: SUM starts from −0 and AVG from 0, and their overflow rules
+ * differ (float8pl, float8_accum).
+ */
+function shareKey(call: AggregateCall, input: readonly PhysicalType[]): string | null {
+  const [arg] = call.args;
+  if ((call.fn !== "sum" && call.fn !== "avg") || call.distinct || call.filter !== null)
+    return null;
+  if (call.args.length !== 1 || arg?.op !== "column") return null;
+  const kind = input[arg.index]?.kind;
+  if (kind !== "int32" && kind !== "int64" && kind !== "decimal") return null;
+  return String(arg.index);
 }
 
 /** Output pacing (tests inject a clock). */
@@ -75,6 +107,8 @@ export interface AggregateOptions {
    * backpressure; once aborted, `finish` rejects with its reason.
    */
   readonly signal?: AbortSignal;
+  /** False: never order a batch's rows by group (tests compare against it). Default: by size. */
+  readonly groupOrder?: boolean;
 }
 
 /** Refuses what the operator cannot compile, before anything is allocated. */
@@ -100,6 +134,18 @@ export class AggregateOperator implements Operator {
   readonly #keys: readonly number[];
   readonly #groups: GroupTable | null = null;
   readonly #aggregates: CompiledAggregate[] = [];
+  /** The fused scalar pass's members, and per-batch scratch. */
+  #fused: readonly CompiledAggregate[] = [];
+  readonly #fusedColumns: Float64Array[] = [];
+  readonly #fusedMembers: CompiledAggregate[] = [];
+  /** Group-ordered rows (`#sortByGroup`): two buffers, the histogram, the selection handed out. */
+  #sortA = new Uint16Array(0);
+  #sortB = new Uint16Array(0);
+  #histogram = new Int32Array(0);
+  readonly #sorted: { rows: Uint16Array; count: number } = { rows: new Uint16Array(0), count: 0 };
+  /** Accumulators updated over the batch's own rows (no FILTER): what a sort serves. */
+  #sortPasses = 0;
+  #fusedTotals = new Float64Array(0);
   readonly #gids: Int32Array = new Int32Array(0);
   readonly #keyVectors: Vector[];
   readonly #charge: ByteCharge;
@@ -146,11 +192,55 @@ export class AggregateOperator implements Operator {
     try {
       this.#takeArena(context, 4 * capacity);
       this.#gids = new Int32Array(capacity);
-      for (const call of rel.aggregates)
-        this.#aggregates.push(this.#compile(call, context, capacity));
+      // A SUM and an AVG of the same column share one exact-sum state (one pass over it).
+      const keys = rel.aggregates.map((call) => shareKey(call, context.input));
+      const both = new Set(
+        keys.filter(
+          (key, k) =>
+            key !== null &&
+            rel.aggregates.some(
+              (other, o) => keys[o] === key && other.fn !== rel.aggregates[k]?.fn,
+            ),
+        ),
+      );
+      const shared = new Map<string, CompiledAggregate>();
+      rel.aggregates.forEach((call, k) => {
+        const key = keys[k] ?? null;
+        const sharing = key !== null && both.has(key);
+        const owner = sharing ? shared.get(key) : undefined;
+        if (owner?.accumulator.emitAs !== undefined) {
+          this.#aggregates.push({
+            ...owner,
+            type: call.type,
+            reads: call.fn === "avg" ? "average" : "sum",
+            updates: false,
+            fusable: false,
+          });
+          return;
+        }
+        const compiled = this.#compile(call, context, capacity, sharing);
+        this.#aggregates.push(compiled);
+        if (sharing) shared.set(key, compiled);
+      });
       this.#groups = keyTypes.length === 0 ? null : new GroupTable(keyTypes, charge);
-      if (this.#groups === null)
-        for (const aggregate of this.#aggregates) aggregate.accumulator.grow(1);
+      this.#sortPasses =
+        options.groupOrder === false
+          ? 0
+          : this.#aggregates.filter((a) => a.updates && a.filter === null).length;
+      if (this.#groups !== null && this.#sortPasses >= SORT_MIN_AGGREGATES) {
+        this.#takeArena(context, 2 * 2 * capacity + 4 * 2049);
+        this.#sortA = new Uint16Array(capacity);
+        this.#sortB = new Uint16Array(capacity);
+        this.#histogram = new Int32Array(2049);
+      }
+      if (this.#groups === null) {
+        for (const aggregate of this.#aggregates)
+          if (aggregate.updates) aggregate.accumulator.grow(1);
+        this.#fused = this.#aggregates.filter((a) => a.fusable);
+        // Charged like the operator's other per-instance buffers (returned on a failed build).
+        this.#takeArena(context, 8 * this.#fused.length);
+        this.#fusedTotals = new Float64Array(this.#fused.length);
+      }
     } catch (error) {
       this.#close();
       context.arena.give(this.#arenaBytes);
@@ -163,11 +253,22 @@ export class AggregateOperator implements Operator {
     this.#arenaBytes += bytes;
   }
 
-  #compile(call: AggregateCall, context: CompileContext, capacity: number): CompiledAggregate {
+  #compile(
+    call: AggregateCall,
+    context: CompileContext,
+    capacity: number,
+    sharedState: boolean,
+  ): CompiledAggregate {
     const [arg] = call.args;
     const argument =
       call.fn === "count_star" || arg === undefined ? null : compileExpr(arg, context);
-    const accumulator = accumulatorFor(call.fn, call.type, argument?.type ?? null, this.#charge);
+    // A shared state is built as AVG's (it also counts) and read as either.
+    const accumulator = accumulatorFor(
+      sharedState ? "avg" : call.fn,
+      call.type,
+      argument?.type ?? null,
+      this.#charge,
+    );
     let distinct: DistinctSet | null = null;
     let filter: Predicate | null;
     let selection: Selection;
@@ -191,6 +292,19 @@ export class AggregateOperator implements Operator {
       filter,
       distinct,
       selection,
+      type: call.type,
+      reads:
+        sharedState && accumulator.emitAs !== undefined
+          ? call.fn === "avg"
+            ? "average"
+            : "sum"
+          : "own",
+      updates: true,
+      fusable:
+        call.filter === null &&
+        !call.distinct &&
+        argument !== null &&
+        accumulator.fusedValues !== undefined,
     };
   }
 
@@ -208,18 +322,104 @@ export class AggregateOperator implements Operator {
       groups.assign(this.#keyVectors, length, batch.selection, gids);
       for (const aggregate of this.#aggregates) aggregate.accumulator.grow(groups.groupCount);
     }
+    if (scalar && this.#fused.length > 0) this.#pushFused(batch, length);
+    // Many groups and several aggregates: the accumulators walk the batch's rows in group order
+    // (`#sortByGroup`), so each one's state arrays are read nearly sequentially.
+    const sorted =
+      groups !== null &&
+      this.#sortPasses >= SORT_MIN_AGGREGATES &&
+      groups.groupCount > SORT_MIN_GROUPS
+        ? this.#sortByGroup(gids, batch.selection, length, groups.groupCount)
+        : null;
     for (const aggregate of this.#aggregates) {
+      if (!aggregate.updates || (scalar && aggregate.fusable)) continue;
       let rows: Selection | null = batch.selection;
       if (aggregate.filter !== null) {
         rows = aggregate.filter.select(batch);
         if (rows.count === 0) continue;
       }
+      // Arguments evaluate over the batch's own (ascending) selection; only the accumulator and
+      // the DISTINCT set read the rows in group order.
       const value = aggregate.argument === null ? null : aggregate.argument.evaluate(batch, rows);
+      if (aggregate.filter === null && sorted !== null) rows = sorted;
       if (aggregate.distinct !== null && value !== null)
         rows = aggregate.distinct.filter(value, gids, length, rows, scalar, aggregate.selection);
       aggregate.accumulator.update(value, gids, rowsIn(rows), countIn(rows, length), scalar);
     }
     return "ready";
+  }
+
+  /**
+   * The active rows ordered by group id, stably (a group's rows keep their input order, which
+   * float sums and MIN/MAX ties depend on): an LSD radix sort, 11 bits of group id per pass.
+   */
+  #sortByGroup(
+    gids: Int32Array,
+    selection: Selection | null,
+    length: number,
+    groupCount: number,
+  ): Selection {
+    const rows = rowsIn(selection);
+    const count = countIn(selection, length);
+    const histogram = this.#histogram;
+    let source = rows;
+    let target = this.#sortA;
+    let other = this.#sortB;
+    for (let shift = 0; groupCount - 1 >= 1 << shift || shift === 0; shift += 11) {
+      histogram.fill(0);
+      for (let k = 0; k < count; k++) {
+        const bucket = (((gids[source[k] ?? 0] ?? 0) >>> shift) & 2047) + 1;
+        histogram[bucket] = (histogram[bucket] ?? 0) + 1;
+      }
+      for (let b = 1; b <= 2048; b++) histogram[b] = (histogram[b] ?? 0) + (histogram[b - 1] ?? 0);
+      for (let k = 0; k < count; k++) {
+        const row = source[k] ?? 0;
+        const bucket = ((gids[row] ?? 0) >>> shift) & 2047;
+        const at = histogram[bucket] ?? 0;
+        target[at] = row;
+        histogram[bucket] = at + 1;
+      }
+      source = target;
+      [target, other] = [other, target];
+      if (shift >= 22) break;
+    }
+    this.#sorted.rows = source;
+    this.#sorted.count = count;
+    return this.#sorted;
+  }
+
+  /**
+   * The fused scalar pass: members whose batch qualifies (`Accumulator.fusedValues`) are summed in
+   * one loop over their columns; the others update one by one as usual.
+   */
+  #pushFused(batch: Batch, length: number): void {
+    const rows = rowsIn(batch.selection);
+    const count = countIn(batch.selection, length);
+    const columns = this.#fusedColumns;
+    const members = this.#fusedMembers;
+    let n = 0;
+    try {
+      for (const aggregate of this.#fused) {
+        if (aggregate.argument === null) continue;
+        const value = aggregate.argument.evaluate(batch, batch.selection);
+        const values = aggregate.accumulator.fusedValues?.(value, rows, count) ?? null;
+        if (values === null) {
+          aggregate.accumulator.update(value, this.#gids, rows, count, true);
+          continue;
+        }
+        columns[n] = values;
+        members[n] = aggregate;
+        n += 1;
+      }
+      if (n === 0) return;
+      const totals = this.#fusedTotals;
+      fusedSums(columns, n, count, totals);
+      for (let j = 0; j < n; j++) members[j]?.accumulator.addFused?.(totals[j] ?? 0, count);
+    } finally {
+      // The batch's coefficient arrays are borrowed: keep no reference once the push returns
+      // (on every exit, an exception included), so a released input is never kept alive.
+      for (let j = 0; j < n; j++) columns[j] = NO_COLUMN;
+    }
   }
 
   ready(): Promise<void> {
@@ -239,18 +439,29 @@ export class AggregateOperator implements Operator {
 
   /** Emits every group in charged, byte-bounded batches and paced slices (see the header). */
   finish(): MaybePromise<void> {
+    this.#sliceStart = this.#now();
     return this.#emit();
   }
+
+  /**
+   * When the current slice began: at `finish`, then after each task yield. Resuming from
+   * downstream backpressure does not start a new slice (`ready()` may resolve at once, a
+   * microtask): only a task yield does, so many short batches cannot run past the slice.
+   */
+  #sliceStart = 0;
 
   #emit(): MaybePromise<void> {
     if (this.#isAborted()) throw this.#abortReason;
     const total = this.#groups === null ? 1 : this.#groups.groupCount;
-    const sliceStart = this.#now();
-    const expired = (): boolean => this.#closed || this.#now() - sliceStart >= this.#interval;
+    const expired = (): boolean => this.#closed || this.#now() - this.#sliceStart >= this.#interval;
     while (this.#emitted < total) {
       // A downstream push may abort this operator: check before every batch.
       if (this.#isAborted()) throw this.#abortReason;
-      if (this.#now() - sliceStart >= this.#interval) return yieldTask().then(() => this.#emit());
+      if (this.#now() - this.#sliceStart >= this.#interval)
+        return yieldTask().then(() => {
+          this.#sliceStart = this.#now();
+          return this.#emit();
+        });
       let count = Math.min(BATCH_ROWS, total - this.#emitted);
       let bytes = this.#outputBytes(this.#emitted, count);
       while (count > 1 && bytes > this.#target) {
@@ -285,7 +496,16 @@ export class AggregateOperator implements Operator {
           for (let c = 0; c < this.#keys.length; c++)
             columns.push(groups.emitKey(c, this.#emitted, count));
         for (const aggregate of this.#aggregates)
-          columns.push(aggregate.accumulator.emit(this.#emitted, count));
+          columns.push(
+            aggregate.reads === "own" || aggregate.accumulator.emitAs === undefined
+              ? aggregate.accumulator.emit(this.#emitted, count)
+              : aggregate.accumulator.emitAs(
+                  aggregate.reads === "average",
+                  aggregate.type,
+                  this.#emitted,
+                  count,
+                ),
+          );
       } catch (error) {
         this.#releaseOutput();
         throw error;
@@ -326,6 +546,7 @@ export class AggregateOperator implements Operator {
     this.#releaseOutput();
     this.#groups?.close();
     for (const aggregate of this.#aggregates) {
+      if (!aggregate.updates) continue;
       aggregate.accumulator.close();
       aggregate.distinct?.close();
     }
