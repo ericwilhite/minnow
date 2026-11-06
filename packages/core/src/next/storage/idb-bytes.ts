@@ -14,6 +14,11 @@
  *   split) can change the selection under it, and checks each record against its entry: a missing
  *   record, or one whose length differs from its entry, is `StoreCorruptionError`, never zeros.
  *   Gaps that no entry covers were never written (or were released) and read as zeros.
+ *   The selection is made in request callbacks (`index.last`, then `getAll`), never in the
+ *   transaction body, which the platform adapter runs when the transaction is created: a callback
+ *   runs only once the transaction is live, after every overlapping read-write transaction created
+ *   before it has committed. Nothing here depends on the epoch get that `IdbLease.read` issues
+ *   first (idb-integrity.test.ts reads through a bare transaction to pin that).
  * - **Open validates** the persisted index (safe integers, `0 < length ≤ IDB_RECORD_BYTES`, key
  *   equal to the entry's offset, sorted, no overlap) and that the record store's keys are exactly
  *   the index's: an orphan record or an entry without its record is `StoreCorruptionError`. It

@@ -46,6 +46,36 @@ function forge(
 }
 
 describe("reads select inside their transaction (finding 1)", () => {
+  it("a byte space's read selects from the stored index in its own transaction, with no epoch get before it", async () => {
+    // Two byte spaces over one database: `stale` keeps the index it loaded, `fresh` rearranges
+    // the records. A read through `stale`, in a bare transaction (no epoch get, nothing else
+    // delaying it), is created before `fresh`'s rearranging transaction commits and must still
+    // answer from what is stored when it runs, never from its own in-memory index.
+    const db = await fakeDb();
+    const fresh = await ByteStore.load(db, "data");
+    await db.transaction(["data", "data-index"], "readwrite", "strict", (tx) => {
+      fresh.write(tx, 0, filled(8192, 1), () => undefined);
+    });
+    fresh.commit();
+    const stale = await ByteStore.load(db, "data");
+    // `fresh` splits the record (releases the first half) and rewrites the second half with 2s.
+    const rearranging = db.transaction(["data", "data-index"], "readwrite", "strict", (tx) => {
+      fresh.clear(tx, 0, 4096, () => {
+        fresh.write(tx, 4096, filled(4096, 2), () => undefined);
+      });
+    });
+    const target = new Uint8Array(8192).fill(5);
+    const reading = db.transaction(["data", "data-index"], "readonly", "relaxed", (tx) => {
+      stale.read(tx, 0, target, () => undefined);
+    });
+    await Promise.all([rearranging, reading]);
+    fresh.commit();
+    // IndexedDB runs the read after the read-write transaction created before it.
+    expect(target.subarray(0, 4096)).toEqual(new Uint8Array(4096));
+    expect(target.subarray(4096)).toEqual(filled(4096, 2));
+    db.close();
+  });
+
   it("a read racing a release on the same session returns the bytes it asked for", async () => {
     const db = await fakeDb();
     const backend = backendOver(db);
