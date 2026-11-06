@@ -471,9 +471,16 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     pool, +75 to +251 MiB over 11 passes without it (on a 262,144-row table, where the collector
     keeps up, the pool's idle 64 MiB makes it +76 to +124 against +45 to +98).
   - The nightly browser-performance workflow runs the export bench (`npm run benchmark:export`,
-    1M × 200) and records rows/s, the worker's CPU seconds and rows per CPU-second, RSS, worker
+    1M × 200, five cold and five warm rounds per configuration) and records rows/s, the worker's CPU seconds and rows per CPU-second, RSS, worker
     heap and pool residency per pass in `export-bench.json`; nothing judges it yet. Locally, the
     export is judged per CPU-second: this host gives the worker about half a core.
+- Reproduce increment 10 comparisons with `scripts/gather-bench.mts` (finite float64 gathers,
+  all-word / Number-only / production NaN-only copies) and `scripts/export-compare.mts --dir
+~/.cache/minnow-export` (the whole file-backed page export against p2i on identical stored data).
+  Both use at least five interleaved rounds in fresh processes and print CPU and wall medians,
+  min/max spread and every sample; the export also records sampled RSS. The file comparison uses
+  one untimed priming pass per variant, keeps the OS cache, and does not establish the cold OPFS Gate A target. Number-only is a finite-input
+  comparator: NaNs still require raw copies to preserve their bits.
 - What an export reads (`scripts/export-size.mts`, 262,144 rows of W1M): 1,055 B/row as flushed.
   High-cardinality text is 34% (`h02`'s free text alone 113 B/row), float64 31%, nullable
   floats 9%, int32 9%, decimals 8%; dictionary text 3%. Compaction gzip stores 869 B/row (−18%)

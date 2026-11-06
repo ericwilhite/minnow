@@ -48,7 +48,7 @@ const WARM_SHARE = 0.98;
  * minutes on a loaded host.
  */
 const DISTINCT = Number(process.env.MINNOW_EXPORT_DISTINCT ?? 4);
-/** MINNOW_EXPORT_FOCUS=1: only Gate A's configuration (cold ×4, warm ×2, a profiled pass). */
+/** MINNOW_EXPORT_FOCUS=1: only Gate A's configuration (cold ×5, warm ×5, a profiled pass). */
 const FOCUS = process.env.MINNOW_EXPORT_FOCUS === "1";
 /** The row window of the focused passes (MINNOW_EXPORT_WINDOW_MIB, default 64). */
 const WINDOW_MIB = Number(process.env.MINNOW_EXPORT_WINDOW_MIB ?? 64);
@@ -421,7 +421,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       // window, export-stream.ts `windowBytes`), so host drift falls on both alike.
       const perColumn = { ...base, readaheadKiB: 256 };
       const windowed = { ...base, readaheadKiB: 256, windowMiB: WINDOW_MIB };
-      for (let run = 1; run <= 3; run++) {
+      for (let run = 1; run <= 5; run++) {
         await measure(`cold, readahead 256 KiB, run ${String(run)}`, true, false, perColumn);
         await measure(
           `cold, window ${String(WINDOW_MIB)} MiB, run ${String(run)}`,
@@ -430,7 +430,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
           windowed,
         );
       }
-      for (let run = 1; run <= 2; run++) {
+      for (let run = 1; run <= 5; run++) {
         await measure(`warm, readahead 256 KiB, run ${String(run)}`, false, true, perColumn);
         await measure(
           `warm, window ${String(WINDOW_MIB)} MiB, run ${String(run)}`,
