@@ -328,18 +328,23 @@ Statements inside see each other — a `SELECT` after the `UPDATE` reads the new
 below `SERIALIZABLE`, in PostgreSQL's grammar: modes are separated by spaces or commas, and the
 last one of each kind applies. Every transaction reads one snapshot and commits atomically, which
 satisfies those levels, while `SERIALIZABLE` is refused rather than silently downgraded. A
-`READ ONLY` transaction refuses writes, as in PostgreSQL: `INSERT`, `UPDATE`, `DELETE`, `MERGE`,
+`READ ONLY` transaction refuses writes, as in PostgreSQL. `INSERT`, `UPDATE`, `DELETE`, `MERGE`,
 `TRUNCATE`, schema changes, `nextval` and row locks (`SELECT … FOR UPDATE`, `FOR SHARE`, and the
-`KEY` forms) fail with "cannot execute … in a read-only transaction", however the statement
-arrives: through `execute`, `query`, `queryCursor` or a built query's `run`. `SET TRANSACTION READ ONLY` makes the open transaction read-only at any point;
-`SET TRANSACTION READ WRITE` is refused once it has run a statement, a `query` call included,
-and always inside a savepoint. As in PostgreSQL, a mode set after `SAVEPOINT` lasts only until
-that savepoint ends: `ROLLBACK TO` and `RELEASE` both return to the mode the transaction had when
-the savepoint was set.
-Inserts and updates through the table methods (`insert`, `update`, …) are not SQL statements of
-the transaction: they wait for it to finish and then commit on their own. Session settings —
-`SET name TO value`, `SET LOCAL …`, `SET TRANSACTION …`, `RESET name` — are accepted and ignored, since an
-embedded single-session engine has nothing to configure by them; `SET TIME ZONE` accepts only UTC.
+`KEY` forms) fail with "cannot execute … in a read-only transaction". This holds however the
+statement arrives: through `execute`, `query`, `queryCursor` or a built query's `run`.
+
+`SET TRANSACTION READ ONLY` makes the open transaction read-only at any point. Switching a
+read-only transaction back with `SET TRANSACTION READ WRITE` is refused once the transaction
+has run a statement (reads count, whichever method ran them), and always inside a savepoint.
+Setting `READ WRITE` on a transaction that is already read-write is allowed. As in PostgreSQL, a
+mode set after `SAVEPOINT` lasts only until that savepoint ends: `ROLLBACK TO` and `RELEASE`
+both return to the mode the transaction had when the savepoint was set. Inserts and updates
+through the table methods (`insert`, `update`, …) are not SQL statements of the transaction.
+They wait for it to finish and then commit on their own.
+
+Other session settings — `SET name TO value`, `SET LOCAL …`, `RESET name` — are accepted and
+ignored, since an embedded single-session engine has nothing to configure by them; `SET TIME ZONE`
+accepts only UTC.
 `SHOW setting` answers the questions drivers ask on connection (`server_version`, `search_path`,
 `timezone`, `transaction_isolation`, …) with the engine's fixed values. Two rules keep an open transaction from becoming a leak: schema
 changes are refused inside one, because the catalog commits outside the scope and a rollback could
