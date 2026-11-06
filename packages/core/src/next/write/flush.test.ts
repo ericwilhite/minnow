@@ -17,6 +17,7 @@ import {
   ints,
   locators,
   rowsOf,
+  rules,
   tableInput,
   TEXT,
   texts,
@@ -74,6 +75,43 @@ async function setup(): Promise<{ harness: Harness; path: WritePathImpl; t: numb
 }
 
 describe("flush and publish", () => {
+  it("finishes a flush decision while the next memtable holds only pending rows (seq past 2^52)", async () => {
+    // Found by the generated differential (seed 4242 step 126): minSeq binary-searched the seq
+    // space up to 2^53, and with a pending seq (PENDING_BASE + statement) the midpoint of two safe
+    // integers rounded up to `hi`, so the search never ended, synchronously, inside #nextFlush.
+    const harness = new Harness("strict", "sim", 16);
+    const path = await harness.open();
+    let t = 0;
+    await autocommit(path, async (s) => {
+      t =
+        (
+          await s.changeCatalog({
+            kind: "createTable",
+            table: tableInput("p", [column("id", INT, false)]),
+          })
+        ).id ?? 0;
+    });
+    await autocommit(path, (s) =>
+      s.table(t).insert(batch(ints(Array.from({ length: 10 }, (_, k) => k))), null),
+    );
+    const tx = await path.begin();
+    for (let k = 0; k < 2; k++) await tx.statement({ rules }).end();
+    // Statement 3: the batch does not fit, so the committed memtable freezes and a flush is
+    // scheduled while the new memtable holds only this statement's pending rows.
+    const third = tx.statement({ rules });
+    await third.table(t).insert(batch(ints(Array.from({ length: 10 }, (_, k) => 100 + k))), null);
+    await third.end();
+    await (
+      await tx.commit(null)
+    ).durable;
+    await path.quiesce();
+    const reopened = await harness.reopen();
+    const view = reopened.pin();
+    expect((await rowsOf(view, t)).length).toBe(20);
+    view.release();
+    await harness.close();
+  });
+
   it("publishes full memtables as groups and runs; probes and scans read them; a reopen keeps them", async () => {
     const { harness, path, t } = await setup();
     const total = MEMTABLE_ROWS * 2 + 1000;

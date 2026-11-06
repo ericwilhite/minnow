@@ -164,16 +164,8 @@ function groupIndex(groups: readonly GroupRef[], groupId: number): number {
 
 /** The highest seq of anything in a memtable (rows, delta entries). */
 function maxSeq(memtable: Memtable, rows: number): number {
-  let max = memtable.visibleRows(0) === rows ? 0 : -1;
-  // Marks are non-decreasing: the row seq bound is the smallest bound that shows every row.
-  let lo = 0;
-  let hi = MAX_LSN;
-  while (lo < hi) {
-    const mid = Math.floor((lo + hi) / 2);
-    if (memtable.visibleRows(mid) >= rows) hi = mid;
-    else lo = mid + 1;
-  }
-  max = Math.max(max, lo);
+  // The smallest bound that shows every row, from the marks (at most MAX_LSN: committed rows).
+  let max = Math.min(memtable.seqCovering(rows), MAX_LSN);
   for (const delta of memtable.deltas.values())
     for (let entry = 0; entry < delta.entryCount; entry++) max = Math.max(max, delta.seq(entry));
   return max;
@@ -227,17 +219,9 @@ class StatePin implements SpacePin {
 
 /** The lowest seq of anything in a memtable (its first rows or delta entries), or Infinity. */
 function minSeq(memtable: Memtable): number {
-  let min = Infinity;
-  if (memtable.rowCount > 0) {
-    let lo = 0;
-    let hi = Number.MAX_SAFE_INTEGER;
-    while (lo < hi) {
-      const mid = Math.floor((lo + hi) / 2);
-      if (memtable.visibleRows(mid) > 0) hi = mid;
-      else lo = mid + 1;
-    }
-    min = lo;
-  }
+  // The bound that shows its first row, from the marks (a pending seq when it holds only
+  // pending rows; Infinity when none is marked).
+  let min = memtable.rowCount > 0 ? memtable.seqCovering(1) : Infinity;
   for (const delta of memtable.deltas.values())
     for (let entry = 0; entry < delta.entryCount; entry++) min = Math.min(min, delta.seq(entry));
   return min;

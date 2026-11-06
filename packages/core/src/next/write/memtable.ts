@@ -183,6 +183,25 @@ export class Memtable {
   }
 
   /** Rows a view with `bound` sees: a prefix. */
+  /**
+   * The smallest seq bound under which the first `rows` rows are visible: the seq of the first
+   * mark covering them (0 for none), or Infinity while some of them are not marked. Read from the
+   * marks, never searched for over the seq space (pending seqs sit near 2^52, where the midpoint
+   * of a search over safe integers is no longer exact).
+   */
+  seqCovering(rows: number): number {
+    if (rows <= 0) return 0;
+    const counts = this.#markRows;
+    let lo = 0;
+    let hi = counts.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if ((counts[mid] ?? 0) >= rows) hi = mid;
+      else lo = mid + 1;
+    }
+    return lo < counts.length ? (this.#markSeqs[lo] ?? Infinity) : Infinity;
+  }
+
   visibleRows(bound: number): number {
     const seqs = this.#markSeqs;
     let lo = 0;
