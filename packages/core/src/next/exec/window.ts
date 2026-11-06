@@ -36,7 +36,7 @@ import {
   type PushResult,
   type Transfer,
 } from "./pipeline.js";
-import { keysEqual, type SortColumn } from "./sort-keys.js";
+import { keysEqual, markChanges, type SortColumn } from "./sort-keys.js";
 import { PartitionStream, streamable, type StreamHost } from "./window-stream.js";
 import { SortOperator, sortMinimumBytes, type SortContext, type SortProfile } from "./sort.js";
 import { Slice, runSliced, type SlicedJob } from "./slices.js";
@@ -88,8 +88,11 @@ export interface WindowSpec {
   readonly streamRows?: number;
 }
 
-/** Partitions up to this many rows are evaluated resident; larger ones stream. */
-export const STREAM_ROWS = 65_536;
+/**
+ * Partitions up to this many rows are evaluated resident while the grant holds them (one it
+ * refuses streams anyway); larger ones always stream.
+ */
+export const STREAM_ROWS = 1 << 22;
 
 export interface WindowProfile {
   rowsIn: number;
@@ -332,6 +335,9 @@ class Evaluator implements Operator {
   #lastVectors: Vector[] = [];
   #rows = 0;
   #newGroup = new Uint8Array(0);
+  /** One batch's partition and peer boundaries (`markChanges`), charged (2 bytes a row). */
+  #partChanged = new Uint8Array(BATCH_ROWS);
+  #peerChanged = new Uint8Array(BATCH_ROWS);
   #scratch: Scratch | null = null;
   #scratchBytes = 0;
   #newGroupBytes = 0;
@@ -417,7 +423,7 @@ class Evaluator implements Operator {
           : new ColumnStore([call.type], this.pool, { varlenBytes: 4096 }),
       ids: new Int32Array(BATCH_ROWS),
     }));
-    if (!this.charge.allocate(spec.functions.length * BATCH_ROWS * 32))
+    if (!this.charge.allocate(spec.functions.length * BATCH_ROWS * 32 + 2 * BATCH_ROWS))
       throw new RangeError("A window's minimum must be admitted");
   }
 
@@ -497,24 +503,40 @@ class Evaluator implements Operator {
     this.profile.rowsIn += count;
     const columns = batch.columns;
     const types = this.spec.types;
+    // Partition and peer boundaries for the whole batch, column by column (row 0 against the
+    // last row taken).
+    if (count > this.#partChanged.length) {
+      if (!this.charge.allocate(2 * (count - this.#partChanged.length)))
+        throw new RangeError("Window boundary flags could not be allocated");
+      this.#partChanged = new Uint8Array(count);
+      this.#peerChanged = new Uint8Array(count);
+    }
+    const partChanged = this.#partChanged;
+    const peerChanged = this.#peerChanged;
+    partChanged.fill(0, 0, count);
+    peerChanged.fill(0, 0, count);
+    markChanges(types, this.#partKeys, columns, count, partChanged);
+    markChanges(types, this.spec.orderBy, columns, count, peerChanged);
+    if (count > 0 && this.#rows > 0) {
+      const prev = this.#lastVectors;
+      partChanged[0] = keysEqual(types, this.#partKeys, prev, 0, columns, 0) ? 0 : 1;
+      peerChanged[0] = keysEqual(types, this.spec.orderBy, prev, 0, columns, 0) ? 0 : 1;
+    }
     let from = 0;
     for (let r = 0; r < count; r++) {
       if (this.#rows + (r - from) === 0) {
         this.#flag(0, 1);
         continue;
       }
-      const prev = r === 0 ? this.#lastVectors : columns;
-      const p = r === 0 ? 0 : r - 1;
-      if (!keysEqual(types, this.#partKeys, prev, p, columns, r)) {
+      if (partChanged[r] === 1) {
         yield* this.#gather(columns, from, r - from);
         from = r;
         yield* this.#flushPartition();
         this.#flag(0, 1);
         continue;
       }
-      const peer = keysEqual(types, this.spec.orderBy, prev, p, columns, r);
-      this.#flag(this.#rows + (r - from), peer ? 0 : 1);
-      if ((r & 255) === 255 && this.slice.tick()) yield;
+      this.#flag(this.#rows + (r - from), peerChanged[r] ?? 1);
+      if ((r & 1023) === 1023 && this.slice.due()) yield;
     }
     yield* this.#gather(columns, from, count - from);
     if (count > 0) this.#remember(columns, count - 1);
@@ -933,6 +955,7 @@ class Evaluator implements Operator {
         ends,
         out,
         this.slice,
+        scratch,
       );
       scratch.big[f] = out.big;
     }
@@ -1238,11 +1261,14 @@ class Scratch {
   readonly amountValid: Uint8Array[];
   /** Exact results past 2^53 (bigints, charged with the scratch's per-row allowance). */
   readonly big: Array<bigint[] | null>;
+  /** The aggregate kernels' prefix arrays (capacity + 1; the 12-byte per-row allowance). */
+  readonly counts: Int32Array;
+  readonly prefix: Float64Array;
 
   static bytes(capacity: number, functions: number, args: number): number {
     // Peers (5 × 4), bounds (2 × 4), per function 22 (results, targets, a constant amount), per
     // argument 9, and an allowance for the kernels' prefix arrays (12 per row).
-    return capacity * (20 + 8 + 22 * functions + 9 * args + 12);
+    return capacity * (20 + 8 + 22 * functions + 9 * args + 12) + 12;
   }
 
   constructor(
@@ -1269,6 +1295,8 @@ class Scratch {
     this.amountValues = Array.from({ length: functions }, () => new Float64Array(capacity));
     this.amountValid = Array.from({ length: functions }, () => new Uint8Array(capacity));
     this.big = Array.from({ length: functions }, () => null);
+    this.counts = new Int32Array(capacity + 1);
+    this.prefix = new Float64Array(capacity + 1);
   }
 }
 

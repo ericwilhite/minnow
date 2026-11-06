@@ -809,8 +809,8 @@ and the owner import it directly.
   - for a non-NULL row, RANGE offsets treat NULL keys as below every value (NULLS FIRST) or
     above every value (NULLS LAST).
 - Float sums add a frame's members in order, as PostgreSQL does; exact sums use prefix sums.
-- A partition up to `streamRows` (65,536) rows is held in memory and evaluated over typed
-  arrays.
+- A partition is held in memory and evaluated over typed arrays while the grant holds it, up
+  to `streamRows` (4,194,304) rows.
 - A larger partition, or one the grant cannot hold, streams from its spilled pages. Memory is
   then bounded by the frame, not by the partition:
   - ROWS frames and running aggregates keep the frame's rows;
@@ -820,6 +820,8 @@ and the owner import it directly.
 - A few combinations cannot stream: a column-valued lag, lead, ntile or nth_value amount;
   nth_value past 4,096; and float sums or MIN/MAX over a moving frame that ends at UNBOUNDED
   FOLLOWING. Such a partition must fit the grant.
+- Partition and peer boundaries are found a batch at a time, column by column; plain frames
+  (no EXCLUDE) sum and count from prefix arrays reused across partitions.
 - Arrival, the per-partition kernels and emission run in slices, checking the abort signal
   (ruling R23).
 

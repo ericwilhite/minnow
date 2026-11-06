@@ -172,16 +172,32 @@ export class SortKeyEncoder {
     const done = result.encoded;
     const keys = this.keys;
     const bytes = keys.writer.bytes;
+    const offsets = keys.offsets;
+    const prefixes = this.prefixes;
     for (let k = 0; k < done; k++) {
-      const start = keys.offsets[k] ?? 0;
-      const end = keys.offsets[k + 1] ?? 0;
+      const start = offsets[k] ?? 0;
+      const end = offsets[k + 1] ?? 0;
+      if (end - start >= 4 * PREFIX_WORDS) {
+        // The usual case for wide keys: every prefix byte is a key byte.
+        for (let w = 0; w < PREFIX_WORDS; w++) {
+          const at = start + 4 * w;
+          const prefix = prefixes[w];
+          if (prefix === undefined) continue;
+          prefix[k] =
+            ((bytes[at] ?? 0) << 24) |
+            ((bytes[at + 1] ?? 0) << 16) |
+            ((bytes[at + 2] ?? 0) << 8) |
+            (bytes[at + 3] ?? 0);
+        }
+        continue;
+      }
       for (let w = 0; w < PREFIX_WORDS; w++) {
         let word = 0;
         for (let b = 0; b < 4; b++) {
           const index = start + w * 4 + b;
           word = (word << 8) | (index < end ? (bytes[index] ?? 0) : 0);
         }
-        const prefix = this.prefixes[w];
+        const prefix = prefixes[w];
         if (prefix !== undefined) prefix[k] = word;
       }
     }
@@ -796,9 +812,11 @@ export const TUPLE_WORDS = PREFIX_WORDS + 1;
  * operator (R23.1: a sort job pauses between slices).
  */
 export class RadixScratch {
-  static readonly BYTES = 2 * 65_537 * 4;
+  static readonly BYTES = 2 * 65_537 * 4 + 4 * PREFIX_WORDS;
   readonly counts = new Int32Array(65_537);
   readonly starts = new Int32Array(65_537);
+  /** Per prefix word, the bits in which some tuple of a range differs from its first. */
+  readonly diffs = new Uint32Array(PREFIX_WORDS);
 }
 
 /** Unsigned order of two tuples' prefix words. */
@@ -878,10 +896,12 @@ export function* msdSort(
       counts[digit + 1] = (counts[digit + 1] ?? 0) + 1;
       if (((i - lo) & (SLICE_ROWS - 1)) === SLICE_ROWS - 1 && slice.due()) yield;
     }
-    // Every tuple shares this digit: nothing to move.
+    // Every tuple shares this digit: nothing to move. The next digits are often shared too
+    // (high bytes of small integers, a common text prefix): one pass finds the first byte in
+    // which any tuple differs, instead of a counting pass per shared digit.
     const first = ((tuples[lo * S + word] ?? 0) >>> shift) & mask;
     if (counts[first + 1] === hi - lo) {
-      push(lo, hi, b + width);
+      push(lo, hi, yield* firstDifference(tuples, lo, hi, b + width, slice, radix.diffs));
       continue;
     }
     for (let d = 0; d < buckets; d++) counts[d + 1] = (counts[d + 1] ?? 0) + (counts[d] ?? 0);
@@ -906,6 +926,38 @@ export function* msdSort(
     }
     if (slice.due()) yield;
   }
+}
+
+/**
+ * The first prefix byte at or after `from` in which some tuple of `lo … hi` differs from tuple
+ * `lo` (`4 × PREFIX_WORDS` when none does).
+ */
+function* firstDifference(
+  tuples: Uint32Array,
+  lo: number,
+  hi: number,
+  from: number,
+  slice: Slice,
+  diffs: Uint32Array,
+): Generator<void, number, void> {
+  const S = TUPLE_WORDS;
+  const w0 = from >>> 2;
+  if (w0 >= PREFIX_WORDS) return 4 * PREFIX_WORDS;
+  diffs.fill(0);
+  const base = lo * S;
+  for (let i = lo + 1; i < hi; i++) {
+    const at = i * S;
+    for (let w = w0; w < PREFIX_WORDS; w++)
+      diffs[w] = (diffs[w] ?? 0) | ((tuples[at + w] ?? 0) ^ (tuples[base + w] ?? 0));
+    if (((i - lo) & (SLICE_ROWS - 1)) === 0 && slice.due()) yield;
+  }
+  // Bytes of the first word before `from` are already known to be shared.
+  diffs[w0] = (diffs[w0] ?? 0) & (0xffff_ffff >>> (8 * (from & 3)));
+  for (let w = w0; w < PREFIX_WORDS; w++) {
+    const diff = diffs[w] ?? 0;
+    if (diff !== 0) return 4 * w + (Math.clz32(diff) >>> 3);
+  }
+  return 4 * PREFIX_WORDS;
 }
 
 /** Ranges of at most this many rows are insertion-sorted at once (never pushed). */
@@ -942,6 +994,91 @@ function* refineRuns(
       for (let k = 0; k < length; k++) tuples[(start + k) * S + PREFIX_WORDS] = ids[k] ?? 0;
     }
     start = i;
+  }
+}
+
+/**
+ * Marks `changed[r] = 1` for each row r in 1 … count − 1 of `columns` whose `keys` differ from
+ * row r − 1's (`keysEqual`'s equality), else leaves it; `changed[0]` is untouched. Flat
+ * fixed-width and varlen keys compare column by column in typed loops; other forms and types
+ * go row by row through `keysEqual`. The caller zeroes `changed` first.
+ */
+export function markChanges(
+  types: readonly PhysicalType[],
+  keys: readonly SortColumn[],
+  columns: readonly Vector[],
+  count: number,
+  changed: Uint8Array,
+): void {
+  for (const key of keys) {
+    const vector = columns[key.column];
+    const type = types[key.column];
+    if (vector === undefined || type === undefined) continue;
+    const bits = vector.form === "flat" ? vector.validity : null;
+    const differs = (r: number): boolean => {
+      if (bits === null) return false;
+      const a = ((bits[r >>> 5] ?? 0) >>> (r & 31)) & 1;
+      const b = ((bits[(r - 1) >>> 5] ?? 0) >>> ((r - 1) & 31)) & 1;
+      return a !== b;
+    };
+    const valid = (r: number): boolean =>
+      bits === null || (((bits[r >>> 5] ?? 0) >>> (r & 31)) & 1) === 1;
+    const data = vector.form === "flat" ? vector.data : null;
+    if (
+      data !== null &&
+      (data.layout === "i32" ||
+        data.layout === "f64" ||
+        data.layout === "f32" ||
+        data.layout === "bool")
+    ) {
+      const values = data.values;
+      for (let r = 1; r < count; r++) {
+        if (changed[r] === 1) continue;
+        if (differs(r)) changed[r] = 1;
+        else if (valid(r)) {
+          const x = values[r] ?? 0;
+          const y = values[r - 1] ?? 0;
+          // −0 = 0 (===), NaN = NaN.
+          if (x !== y && (x === x || y === y)) changed[r] = 1;
+        }
+      }
+      continue;
+    }
+    if (data !== null && data.layout === "int64") {
+      const values = data.values.values;
+      for (let r = 1; r < count; r++) {
+        if (changed[r] === 1) continue;
+        if (differs(r)) changed[r] = 1;
+        else if (valid(r) && values[r] !== values[r - 1]) changed[r] = 1;
+      }
+      continue;
+    }
+    if (data !== null && data.layout === "varlen") {
+      const { bytes, offsets } = data;
+      for (let r = 1; r < count; r++) {
+        if (changed[r] === 1) continue;
+        if (differs(r)) {
+          changed[r] = 1;
+          continue;
+        }
+        if (!valid(r)) continue;
+        const s = offsets[r] ?? 0;
+        const e = offsets[r + 1] ?? 0;
+        const ps = offsets[r - 1] ?? 0;
+        if (e - s !== s - ps) {
+          changed[r] = 1;
+          continue;
+        }
+        for (let b = 0; b < e - s; b++)
+          if (bytes[s + b] !== bytes[ps + b]) {
+            changed[r] = 1;
+            break;
+          }
+      }
+      continue;
+    }
+    for (let r = 1; r < count; r++)
+      if (changed[r] !== 1 && !keysEqual(types, [key], columns, r - 1, columns, r)) changed[r] = 1;
   }
 }
 

@@ -278,13 +278,15 @@ export function* aggregate(
   ends: Int32Array,
   out: NumberResult,
   slice: Slice,
+  work: AggregateScratch | null = null,
 ): SlicedJob<void> {
   const n = peers.n;
   const ranges = new Int32Array(6);
   const valid = arg?.valid ?? null;
   const values = arg?.values ?? null;
   // Prefix counts of valid rows (count, avg's divisor, "all NULL" for sum/min/max).
-  const counts = new Int32Array(n + 1);
+  const counts = work !== null && work.counts.length > n ? work.counts : new Int32Array(n + 1);
+  counts[0] = 0;
   for (let i = 0; i < n; i++)
     counts[i + 1] = (counts[i] ?? 0) + (valid === null || valid[i] === 1 ? 1 : 0);
   const countIn = (a: number, b: number) => (counts[b + 1] ?? 0) - (counts[a] ?? 0);
@@ -301,7 +303,8 @@ export function* aggregate(
     } else if (exact || running) {
       // Exact integers below 2^53 in total, or floats added left to right (a running frame's
       // members are a prefix, so its sum is the prefix itself).
-      prefix = new Float64Array(n + 1);
+      prefix = work !== null && work.prefix.length > n ? work.prefix : new Float64Array(n + 1);
+      prefix[0] = 0;
       let sum = 0;
       for (let i = 0; i < n; i++) {
         if (valid[i] === 1) sum += values[i] ?? 0;
@@ -317,6 +320,39 @@ export function* aggregate(
     }
   }
   if (bigPrefix !== null) out.big = new Array<bigint>(n);
+  if (exclude === "no-others" && bigPrefix === null && kind !== "min" && kind !== "max") {
+    // The common case: one member range per row, [start, end] (empty when end < start).
+    for (let i = 0; i < n; i++) {
+      const s = starts[i] ?? 0;
+      const e = ends[i] ?? -1;
+      const empty = e < s;
+      const count = empty ? 0 : (counts[e + 1] ?? 0) - (counts[s] ?? 0);
+      if (kind === "count_star" || kind === "count") {
+        out.values[i] = kind === "count" ? count : empty ? 0 : e - s + 1;
+        out.valid[i] = 1;
+      } else if (count === 0) {
+        out.values[i] = 0;
+        out.valid[i] = 0;
+      } else {
+        let sum: number;
+        if (prefix !== null) sum = (prefix[e + 1] ?? 0) - (prefix[s] ?? 0);
+        else {
+          // Floats over a moving frame: re-added from the frame's head, in order.
+          sum = 0;
+          // A frame without NULLs (every member counted) needs no validity test.
+          if (values === null) sum = 0;
+          else if (valid === null || count === e - s + 1)
+            for (let j = s; j <= e; j++) sum += values[j] ?? 0;
+          else for (let j = s; j <= e; j++) if (valid[j] === 1) sum += values[j] ?? 0;
+          if (e - s > 64 && slice.tick()) yield;
+        }
+        out.values[i] = kind === "avg" ? sum / count : sum;
+        out.valid[i] = 1;
+      }
+      if ((i & 1023) === 1023 && slice.due()) yield;
+    }
+    return;
+  }
   let runningExtreme = Number.NaN;
   let runningSeen = 0;
   let runningAt = -1;
@@ -459,6 +495,12 @@ function maxAbs(prefix: Float64Array, n: number): number {
 function isRunning(starts: Int32Array, n: number): boolean {
   for (let i = 0; i < n; i++) if ((starts[i] ?? 0) !== 0) return false;
   return true;
+}
+
+/** Reusable prefix arrays for `aggregate` (the caller's charged scratch, n + 1 entries). */
+export interface AggregateScratch {
+  readonly counts: Int32Array;
+  readonly prefix: Float64Array;
 }
 
 export type RankingKind =

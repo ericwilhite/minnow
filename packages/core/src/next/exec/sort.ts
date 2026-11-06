@@ -1214,15 +1214,30 @@ class Sorter {
       // radix over them; 4 + 2 × 4 × TUPLE_WORDS bytes per row, inside the reserve.
       const S = TUPLE_WORDS;
       const tuples = new Uint32Array(n * S);
+      // Written through a signed view of the same words (the stored words are int32).
+      const words = new Int32Array(tuples.buffer);
+      const prefix = (w: number, k: number): Int32Array =>
+        (store.chunk(this.prefixColumn + w, k).data as { values: Int32Array }).values;
       for (let k = 0; k < store.chunkCount; k++) {
         const base = k * store.chunkRows;
         const length = store.chunk(0, k).length;
-        for (let w = 0; w < PREFIX_WORDS; w++) {
-          const values = (store.chunk(this.prefixColumn + w, k).data as { values: Int32Array })
-            .values;
-          for (let i = 0; i < length; i++) tuples[(base + i) * S + w] = (values[i] ?? 0) >>> 0;
+        // Row by row (one pass over the tuples); PREFIX_WORDS is 5.
+        const [p0, p1, p2, p3, p4] = [0, 1, 2, 3, 4].map((w) => prefix(w, k)) as [
+          Int32Array,
+          Int32Array,
+          Int32Array,
+          Int32Array,
+          Int32Array,
+        ];
+        for (let i = 0; i < length; i++) {
+          const at = (base + i) * S;
+          words[at] = p0[i] ?? 0;
+          words[at + 1] = p1[i] ?? 0;
+          words[at + 2] = p2[i] ?? 0;
+          words[at + 3] = p3[i] ?? 0;
+          words[at + 4] = p4[i] ?? 0;
+          words[at + 5] = base + i;
         }
-        for (let i = 0; i < length; i++) tuples[(base + i) * S + PREFIX_WORDS] = base + i;
         if (slice.due()) yield;
       }
       const covered = this.direct || this.#maxKey <= 4 * PREFIX_WORDS;
