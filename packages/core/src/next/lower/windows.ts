@@ -130,6 +130,13 @@ function frameOf(
     if (frame.unit !== "range") return { kind: input.kind, offset: int(input.offset, INT8) };
     if (orderType === null)
       throw new PlanningError("RANGE with offset requires exactly one ORDER BY column", "42P20");
+    // PostgreSQL's in_range takes an integer key with an integer offset only: a decimal literal
+    // (`0.5`, `-0.0`) is numeric there, refused before its value is checked.
+    if (input.offsetNumeric === true && (orderType.kind === "int32" || orderType.kind === "int64"))
+      throw new PlanningError(
+        `RANGE with offset PRECEDING/FOLLOWING is not supported for column type ${orderType.kind === "int64" ? "bigint" : orderType.bits === 16 ? "smallint" : "integer"} and offset type numeric`,
+        "0A000",
+      );
     const typed: Typed = lowerExpression(
       { kind: "literal", value: input.offset },
       { column: () => undefined },

@@ -463,7 +463,8 @@ FROM orders
 explicit `ROWS`, `RANGE`, and `GROUPS` frames, including exclusions. Numeric `RANGE` offsets
 measure ordering-value distance and require exactly one numeric `ORDER BY` expression. A
 negative or `NULL` frame offset is an error, as in PostgreSQL (`frame starting offset must not be
-negative`). Temporal interval offsets and `DISTINCT` window aggregates are not supported. Windows work in both the
+negative`); `-0` is zero. A `ROWS` or `GROUPS` offset written as a decimal is rounded half away
+from zero, so `1.5 PRECEDING` means 2 rows. Temporal interval offsets and `DISTINCT` window aggregates are not supported. Windows work in both the
 select list and `ORDER BY`; `WHERE`, `GROUP BY`, and `HAVING` cannot contain them.
 
 Compatible windows share sorting and prepare peer information only when a function or frame

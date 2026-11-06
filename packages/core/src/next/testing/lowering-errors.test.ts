@@ -260,7 +260,26 @@ describe("HAVING names and frame offsets (review B6-p2b-3 finding 3)", () => {
   it("an invalid frame offset is 22004 or 22013, as PostgreSQL", async () => {
     const next = await fixture(DATA);
     const reach = createReach("frame offsets", FRAME_OFFSET_STATES);
-    const offsets = ["-1", "- 2", "NULL", "0", "1", "'1'", "INTERVAL '1 day'"];
+    const offsets = [
+      "-1",
+      "- 2",
+      "NULL",
+      "0",
+      "1",
+      "'1'",
+      "INTERVAL '1 day'",
+      // Review B6-p2b-4: a sign is not a value. Signed zeros are zero; ROWS / GROUPS round a
+      // numeric literal half away from zero before the sign check (-0.4 is 0, -0.5 is -1).
+      "-0",
+      "- 0",
+      "-0.0",
+      "-0e4",
+      "+1",
+      "0.4",
+      "-0.4",
+      "-0.5",
+      "1.5",
+    ];
     const bounds = [
       (o: string) => `BETWEEN ${o} PRECEDING AND CURRENT ROW`,
       (o: string) => `BETWEEN CURRENT ROW AND ${o} FOLLOWING`,
@@ -268,6 +287,7 @@ describe("HAVING names and frame offsets (review B6-p2b-3 finding 3)", () => {
     ];
     const failures: string[] = [];
     const divergences: string[] = [];
+    const precedence: string[] = [];
     for (const table of ["a", "e"])
       for (const unit of ["ROWS", "RANGE", "GROUPS"])
         for (const offset of offsets)
@@ -278,6 +298,11 @@ describe("HAVING names and frame offsets (review B6-p2b-3 finding 3)", () => {
             const actual = nextOutcome(next, sql);
             if (JSON.stringify(actual) === JSON.stringify(expected)) {
               const state = "error" in expected ? expected.error : "accepted";
+              if (state === "accepted" && /^- ?0/u.test(offset))
+                reach.reach("signed zero accepted");
+              if (state === "accepted" && unit !== "RANGE" && offset.includes("."))
+                reach.reach("rounded offset accepted");
+              if (state === "0A000") reach.reach("numeric offset on an integer key");
               if (state === "accepted") reach.reach("accepted");
               else if (state === "22004") reach.reach("null offset");
               else if (state === "22013") reach.reach("negative offset");
@@ -286,6 +311,19 @@ describe("HAVING names and frame offsets (review B6-p2b-3 finding 3)", () => {
             // A refusal (0A000) of SQL PostgreSQL runs: interval and string offsets.
             if ("rows" in expected && "error" in actual && actual.error === "0A000") {
               reach.reach("refused");
+              continue;
+            }
+            // A negative decimal RANGE offset on an integer key has two faults: PostgreSQL reports
+            // the type (0A000) first; the parser, which does not know the key, the sign (22013).
+            if (
+              unit === "RANGE" &&
+              (offset === "-0.4" || offset === "-0.5") &&
+              "error" in expected &&
+              expected.error === "0A000" &&
+              "error" in actual &&
+              actual.error === "22013"
+            ) {
+              precedence.push(sql);
               continue;
             }
             // PostgreSQL checks a negative RANGE offset when a row first compares; lowering
@@ -307,6 +345,8 @@ describe("HAVING names and frame offsets (review B6-p2b-3 finding 3)", () => {
     expect(failures.join("\n")).toBe("");
     // Exactly the negative RANGE offsets over the empty table: two spellings, three bounds.
     expect(divergences.length).toBe(6);
+    // Exactly -0.4 and -0.5 on the integer key (RANGE does not round), three bounds, both tables.
+    expect(precedence.length).toBe(12);
     reach.assertReached();
   });
 });

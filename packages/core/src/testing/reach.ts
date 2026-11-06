@@ -472,6 +472,11 @@ export const FRAME_OFFSET_STATES = [
   "null offset",
   "negative offset",
   "refused",
+  // Review B6-p2b-4: a minus sign on zero is zero; ROWS / GROUPS round decimals to bigint; a
+  // decimal on an integer RANGE key is PostgreSQL's 0A000.
+  "signed zero accepted",
+  "rounded offset accepted",
+  "numeric offset on an integer key",
 ] as const;
 
 /** HAVING names against PostgreSQL (review B6-p2b-3 finding 3). */

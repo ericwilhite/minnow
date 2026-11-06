@@ -12872,30 +12872,42 @@ class Parser {
       if (which === "starting") throw new TypeError("frame starting offset must not be null");
       throw new TypeError("frame ending offset must not be null");
     }
-    if (this.#peek().kind === "operator" && this.#peek().text === "-") {
-      this.#index += 1;
-      this.#take("number");
-      if (which === "starting") throw new TypeError("frame starting offset must not be negative");
-      throw new TypeError("frame ending offset must not be negative");
-    }
     if (this.#isKeyword("INTERVAL") && unit === "rows")
       throw new TypeError("argument of ROWS must be type bigint, not type interval");
     if (this.#isKeyword("INTERVAL") && unit === "groups")
       throw new TypeError("argument of GROUPS must be type bigint, not type interval");
     if (this.#isKeyword("INTERVAL") || this.#peek().kind === "string")
       throw new TypeError("Window frame offsets other than numeric literals are not supported");
-    const offset = Number(this.#take("number").text);
-    if (!Number.isFinite(offset) || offset < 0 || (unit !== "range" && !Number.isInteger(offset))) {
+    // A sign is not a value: `-0` and `-0.0` are zero, which PostgreSQL accepts.
+    let negated = false;
+    if (
+      this.#peek().kind === "operator" &&
+      (this.#peek().text === "-" || this.#peek().text === "+")
+    ) {
+      negated = this.#peek().text === "-";
+      this.#index += 1;
+    }
+    const literal = this.#take("number").text;
+    // ROWS and GROUPS take a bigint: PostgreSQL rounds a numeric literal half away from zero
+    // (`-0.4` is 0, `-0.5` is -1) before checking its sign. RANGE keeps the value.
+    const value = unit === "range" ? Number(literal) : roundedFrameOffset(literal);
+    if (!Number.isFinite(value)) {
       throw new TypeError(
         "Window frame offsets must be non-negative integers, or numeric RANGE offsets",
       );
     }
+    if (negated && value !== 0) {
+      if (which === "starting") throw new TypeError("frame starting offset must not be negative");
+      throw new TypeError("frame ending offset must not be negative");
+    }
+    const offset = value === 0 ? 0 : value;
+    const numeric = /[.eE]/u.test(literal) ? { offsetNumeric: true as const } : {};
     if (this.#isKeyword("PRECEDING")) {
       this.#keyword("PRECEDING");
-      return { kind: "preceding", offset };
+      return { kind: "preceding", offset, ...numeric };
     }
     this.#keyword("FOLLOWING");
-    return { kind: "following", offset };
+    return { kind: "following", offset, ...numeric };
   }
 
   #comparison(): ComparisonOperator {
@@ -14957,6 +14969,26 @@ function timestampLiteral(text: string): Date {
 }
 
 /** The parser's OFFSET range contract, shared with the typed builder. */
+/**
+ * A ROWS / GROUPS frame offset literal as PostgreSQL's numeric → bigint cast reads it: rounded
+ * half away from zero, exactly from the digits (`2.5` is 3, `0.4999…` is 0). NaN when the text
+ * is not a plain decimal literal.
+ */
+function roundedFrameOffset(literal: string): number {
+  const match = /^(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/u.exec(literal);
+  if (match === null) return Number.NaN;
+  const [, whole = "", fraction = "", exponent = "0"] = match;
+  let coefficient = BigInt(`${whole}${fraction}` || "0");
+  let scale = fraction.length - Number(exponent);
+  if (scale < 0) {
+    coefficient *= 10n ** BigInt(-scale);
+    scale = 0;
+  }
+  const divisor = 10n ** BigInt(scale);
+  let rounded = coefficient / divisor;
+  if ((coefficient % divisor) * 2n >= divisor) rounded += 1n;
+  return Number(rounded);
+}
 
 export function validateOffset(offset: number): number {
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > 100_000_000)

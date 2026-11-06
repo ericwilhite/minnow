@@ -314,6 +314,8 @@ export type WindowFunctionName =
 export interface WindowFrameBound {
   kind: "unbounded-preceding" | "preceding" | "current-row" | "following" | "unbounded-following";
   offset?: number;
+  /** The offset was written as a decimal (`1.5`, `-0.0`, `0e4`), which PostgreSQL types numeric. */
+  offsetNumeric?: true;
 }
 
 export type WindowFrameExclusion = "no-others" | "current-row" | "group" | "ties";
