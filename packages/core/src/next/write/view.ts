@@ -731,7 +731,7 @@ export class ViewIndex implements IndexReader {
   #begin(bytes: Uint8Array, start: number, end: number): Promise<void> | undefined {
     this.#hitCount = 0;
     this.#deadRows?.clear();
-    const done = this.#resolveFrom(bytes, start, end, 0);
+    const done = this.#resolveFrom(bytes, start, end, 0, 0);
     return done instanceof Promise ? done : undefined;
   }
 
@@ -757,34 +757,64 @@ export class ViewIndex implements IndexReader {
     for (const memtable of this.table.tableView.memtables) {
       const run = memtable.published?.runs.get(this.def.id);
       if (run !== undefined && outside(run)) (skip ??= new Set()).add(run);
+      for (const staged of memtable.staged?.runs.get(this.def.id) ?? NO_RUNS)
+        if (outside(staged)) (skip ??= new Set()).add(staged);
     }
     this.#skip = skip;
   }
 
   #skip: Set<RunRef> | null = null;
 
-  #resolveFrom(bytes: Uint8Array, start: number, end: number, from: number): MaybePromise<void> {
+  /**
+   * Resolution from layer `from`, sub-layer `sub`. A memtable is one layer: sub-layer 0 is its
+   * delta (or, once published and its deltas dropped, its published run), sub-layer j ≥ 1 its
+   * staged run j − 1, whose entries count only for rows the view sees (runs carry no seq).
+   */
+  #resolveFrom(
+    bytes: Uint8Array,
+    start: number,
+    end: number,
+    from: number,
+    sub: number,
+  ): MaybePromise<void> {
     const bound = this.table.snapshot.bound;
     const unique = this.def.unique;
     const memtables = this.table.tableView.memtables;
     const runs = this.table.tableView.runs.get(this.def.id) ?? NO_RUNS;
     const layers = memtables.length + runs.length;
-    for (let layer = from; layer < layers; layer++) {
-      let run: RunRef | undefined;
+    const key = () => (start === 0 && end === bytes.length ? bytes : bytes.subarray(start, end));
+    for (let layer = from; layer < layers; layer++, sub = 0) {
       if (layer < memtables.length) {
         const memtable = need(memtables[memtables.length - 1 - layer]);
-        const published = memtable.published;
-        // Retained deltas answer for readers older than the publication (ruling 2).
-        if (published === null || !memtable.deltasDropped) {
-          if (this.#deltaLayer(memtable, bytes, start, end, bound) && unique) return;
-          continue;
+        if (sub === 0) {
+          const published = memtable.published;
+          // Retained deltas answer for readers older than the publication (ruling 2).
+          if (published === null || !memtable.deltasDropped) {
+            if (this.#deltaLayer(memtable, bytes, start, end, bound) && unique) return;
+          } else {
+            const run = published.runs.get(this.def.id);
+            if (run !== undefined && this.#skip?.has(run) !== true) {
+              const pending = this.#runLayer(run, key(), layer, 0, 1, Infinity);
+              if (pending !== null) return pending;
+              if (unique && this.#hitCount > 0) return;
+            }
+          }
         }
-        run = published.runs.get(this.def.id);
-        if (run === undefined) continue;
-      } else run = runs[layer - memtables.length];
+        const staged = memtable.staged?.runs.get(this.def.id);
+        if (staged === undefined) continue;
+        const limit = memtable.visibleRowIdEnd(bound);
+        for (let k = Math.max(0, sub - 1); k < staged.length; k++) {
+          const run = need(staged[k]);
+          if (this.#skip?.has(run) === true) continue;
+          const pending = this.#runLayer(run, key(), layer, k + 1, k + 2, limit);
+          if (pending !== null) return pending;
+          if (unique && this.#hitCount > 0) return;
+        }
+        continue;
+      }
+      const run = runs[layer - memtables.length];
       if (run === undefined || this.#skip?.has(run) === true) continue;
-      const key = start === 0 && end === bytes.length ? bytes : bytes.subarray(start, end);
-      const pending = this.#runLayer(run, key, layer);
+      const pending = this.#runLayer(run, key(), layer, 0, -1, Infinity);
       if (pending !== null) return pending;
       if (unique && this.#hitCount > 0) return;
     }
@@ -816,31 +846,45 @@ export class ViewIndex implements IndexReader {
     return added;
   }
 
-  /** One run layer; a Promise that finishes the resolution when it had to read, else null. */
-  #runLayer(run: RunRef, key: Uint8Array, layer: number): Promise<void> | null {
+  /**
+   * One run, at (`layer`, `sub`); a Promise that finishes the resolution when it had to read, else
+   * null. It continues at (`layer`, `next`), or at the next layer when `next` is −1. Puts at or past
+   * `limit` (a row id) are not visible.
+   */
+  #runLayer(
+    run: RunRef,
+    key: Uint8Array,
+    layer: number,
+    sub: number,
+    next: number,
+    limit: number,
+  ): Promise<void> | null {
     const shared = this.table.snapshot.shared;
     const reader = shared.runReader(run);
     if (reader instanceof Promise)
       return reader.then(async () => {
-        await this.#resolveFrom(key, 0, key.length, layer);
+        await this.#resolveFrom(key, 0, key.length, layer, sub);
       });
     const entries = this.#layer;
     entries.length = 0;
     const read = reader.lookup(shared.space, key, entries, shared.budget);
     if (read instanceof Promise)
       return read.then(async () => {
-        this.#applyLayer(entries);
+        this.#applyLayer(entries, limit);
         if (this.def.unique && this.#hitCount > 0) return;
-        await this.#resolveFrom(key, 0, key.length, layer + 1);
+        await (next < 0
+          ? this.#resolveFrom(key, 0, key.length, layer + 1, 0)
+          : this.#resolveFrom(key, 0, key.length, layer, next));
       });
-    this.#applyLayer(entries);
+    this.#applyLayer(entries, limit);
     return null;
   }
 
-  #applyLayer(layer: readonly RunEntry[]): void {
+  #applyLayer(layer: readonly RunEntry[], limit: number): void {
     for (const entry of layer) if (entry.tombstone) this.#dead.add(entry.rowId);
     for (const entry of layer) {
-      if (entry.tombstone || this.#deadRows?.has(entry.rowId) === true) continue;
+      if (entry.tombstone || entry.rowId >= limit || this.#deadRows?.has(entry.rowId) === true)
+        continue;
       this.#hit(entry.rowId);
       if (this.def.unique) return;
     }
@@ -928,6 +972,10 @@ export class ViewIndex implements IndexReader {
       if (inKeyRange(range, key)) keys.set(String.fromCharCode(...key), key.slice());
     };
     for (const memtable of this.table.tableView.memtables) {
+      for (const run of memtable.staged?.runs.get(this.def.id) ?? []) {
+        const reader = await shared.runReader(run);
+        await reader.scan(shared.space, shared.budget, accept, (key) => add(key));
+      }
       const published = memtable.published;
       if (published !== null && memtable.deltasDropped) {
         const run = published.runs.get(this.def.id);

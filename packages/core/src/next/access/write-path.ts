@@ -22,7 +22,16 @@
  *    groups with their index runs: snapshot.ts "Segments") first publishes a root that stages
  *    those groups and runs under the transaction's id (`TableRoot.staged`), and its frame carries
  *    a `publishedRows` effect naming that root and the indexes it built runs for, instead of the
- *    rows (format/replay.ts "Large transactions"); the frame is still the commit point;
+ *    rows (format/replay.ts "Large transactions"); the frame is still the commit point.
+ *    What stages (memtable.ts "Staged"): a frozen memtable of the open transaction's rows alone,
+ *    in a table whose catalog entry the transaction did not change, once a root can carry the
+ *    table, and only after every earlier memtable of its rows is staged (the commit's effects
+ *    stay in row-id order). It stages at the transaction's next statement call. Its own index
+ *    puts become the staged runs; other entries (tombstones of older rows) stay resident. A
+ *    rollback truncates; at commit the staging is made exact first (emptied memtables dropped,
+ *    truncated tails deleted and filtered from their runs), and the commit's live tail freezes so
+ *    the next flush folds the staged groups into the table. No flush ever takes a memtable
+ *    holding uncommitted rows (C1's forced tail freeze included);
  * 3. appends the frames, makes the transaction's changes committed in memory (restamping its
  *    pending seqs to its LSN), and releases the writer slot. `commit` resolves here;
  * 4. the frames become durable with the next log flush: if none is running one starts at once;

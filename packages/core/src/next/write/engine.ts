@@ -11,7 +11,8 @@
  *   space, and its readers are re-pointed (ruling R16.3).
  * - **Recovery** (`openWritePath`): the single log scan, truncation and replay of startup step 4.
  */
-import { Memtable, MEMTABLE_ROWS } from "./memtable.js";
+import { Memtable, MEMTABLE_ROWS, type StagedPart } from "./memtable.js";
+import type { KeyDelta } from "./key-hash.js";
 
 /**
  * `openWritePath`'s input plus internal tuning for tests (never a public dial): smaller memtables
@@ -116,7 +117,7 @@ import {
 } from "../format/manifest-codec.js";
 import { manifestReader, MetadataReader } from "../format/metadata-reader.js";
 import { readRows } from "./rows.js";
-import { encodeRun, RunReader, runRef } from "./runs.js";
+import { encodeRun, RunBuilder, RunReader, runRef } from "./runs.js";
 import { Sequences } from "./sequences.js";
 import {
   DEFAULT_MERGE_POLICY,
@@ -140,7 +141,7 @@ import {
   type TableView,
   type WriteState,
 } from "./state.js";
-import { hexId, TransactionImpl, type EngineHooks } from "./transaction.js";
+import { hexId, TransactionImpl, type EngineHooks, type PublishedRows } from "./transaction.js";
 import { SnapshotImpl } from "./view.js";
 import { need } from "./bytes.js";
 
@@ -190,6 +191,24 @@ interface TableState {
    * charged by their directory chunks (groups.ts), refcounted by the write states that hold them.
    */
   metadataBytes: number;
+  /** Large transactions' staged rows not yet folded into `groups`, by staging id. */
+  stagings: Map<number, Staging>;
+}
+
+/**
+ * One large transaction's staged rows in one table (format/replay.ts "Large transactions"): the
+ * memtables staged so far and the root entry that lists them (`TableRoot.staged`).
+ */
+interface Staging {
+  readonly id: number;
+  /** Staged memtables in row-id order (a rollback may leave some empty or out of the view). */
+  memtables: Memtable[];
+  /** The entry as the table's root has it (null until a root first lists it). */
+  entry: TableRoot["staged"][number] | null;
+  /** The entry's directory blobs (index and pages): retired when it is rewritten or folded. */
+  directory: ExtentRef[];
+  /** Sequence of the root that published `entry` (a commit's `publishedRows` names it). */
+  rootSequence: number;
 }
 
 /**
@@ -473,6 +492,20 @@ export class WritePathImpl implements WritePath, EngineHooks {
     mergesAbandoned: 0,
     /** Flushes dropped at publish because their table was dropped meanwhile. */
     flushesAbandoned: 0,
+    /** Stage publications (large transactions' rows written before commit), rows staged, folds. */
+    stages: 0,
+    stagedRows: 0,
+    stagedFolds: 0,
+    /** Staging an open found no commit for (dropped and retired). */
+    stagingDropped: 0,
+    /** Staged memtables a commit's restage truncated (tail deleted) or dropped (emptied). */
+    stagedTruncations: 0,
+    stagedMemtablesDropped: 0,
+    /** Stagings a rollback dropped; staged commits replayed at open. */
+    stagingRollbacks: 0,
+    publishedReplays: 0,
+    /** Delta entries staged memtables kept resident (tombstones of older rows). */
+    stagedResidualEntries: 0,
     /** Flushes held because their table is newer than the root an index build holds back. */
     flushesHeld: 0,
     /** Index builds on quiet tables a published root settled (empty index, checkpoint moved). */
@@ -724,6 +757,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
           flushedThroughLsn: table.flushedThroughLsn,
           nextRowId: table.nextRowId,
           nextGroupId: groups.nextGroupId,
+          stagings: new Map(),
           pages,
           metadataBytes,
         };
@@ -767,11 +801,23 @@ export class WritePathImpl implements WritePath, EngineHooks {
       tables: new Map(
         root.tables.map((table) => [
           table.tableId,
-          { flushedThroughLsn: table.flushedThroughLsn, schemaVersion: table.schemaVersion },
+          {
+            flushedThroughLsn: table.flushedThroughLsn,
+            schemaVersion: table.schemaVersion,
+            staged: new Map(
+              table.staged.map((staged) => [
+                staged.transaction,
+                { indexIds: staged.indexRuns.map((runs) => runs.indexId) },
+              ]),
+            ),
+          },
         ]),
       ),
     };
     const replayer = new Replayer(checkpoint);
+    for (const table of root.tables)
+      for (const staged of table.staged)
+        this.#nextStagingId = Math.max(this.#nextStagingId, staged.transaction + 1);
     const headers = await session.readLogHeaders();
     let parts: Uint8Array[] = [];
     const summary: LogScanSummary = await scanLogIncremental(
@@ -794,6 +840,28 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#grant,
     );
     Replayer.checkCoverage(checkpoint, summary.lastLsn);
+    // Staging no frame claimed: its transaction never committed. The first root leaves it out
+    // and retires its rows and runs together.
+    for (const unclaimed of replayer.unclaimedStaging()) {
+      const state = this.#tables.get(unclaimed.tableId);
+      const table = state?.root;
+      const entry = table?.staged.find((staged) => staged.transaction === unclaimed.transaction);
+      if (state === undefined || table == null || entry === undefined) continue;
+      this.#pendingRetire.push(
+        ...(await this.#tableExtents({
+          ...table,
+          groups: EMPTY_DIRECTORY,
+          groupCount: 0,
+          liveRowCount: 0,
+          keyIndex: null,
+          secondaryIndexes: [],
+          statistics: null,
+          staged: [entry],
+        })),
+      );
+      state.root = { ...table, staged: table.staged.filter((staged) => staged !== entry) };
+      this.maintenance.stagingDropped += 1;
+    }
     if (session.logLength() > summary.validEnd) await session.truncateLog(summary.validEnd);
     const { header, nextSlot } = newestLogHeader(headers, root.log.salt);
     const position: LogPosition = {
@@ -818,6 +886,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const effects: Effect[] = body.effects.map((effect) => replayEffect(effect));
     if (body.request !== null) effects.push({ kind: "request" });
     const decisions = replayer.next(lsn, effects);
+    let published: Set<number> | null = null;
     for (let k = 0; k < body.effects.length; k++) {
       if (decisions[k] !== true) continue;
       const effect = need(body.effects[k]);
@@ -833,9 +902,22 @@ export class WritePathImpl implements WritePath, EngineHooks {
         case "rows":
           await this.#replayRows(effect, lsn);
           break;
-        case "alterTable":
         case "publishedRows":
+          await this.#replayPublished(effect, lsn);
+          (published ??= new Set()).add(effect.tableId);
+          break;
+        case "alterTable":
           throw new LogCorruptionError(`The write path cannot replay ${effect.kind} yet`);
+      }
+    }
+    // As at commit: a staged commit's live tail freezes, so its fold can run once replay ends.
+    for (const tableId of published ?? []) {
+      const state = this.#tables.get(tableId);
+      const last = state?.view.memtables[state.view.memtables.length - 1];
+      if (state !== undefined && last?.state === "live" && last.rowCount > 0) {
+        last.state = "frozen";
+        last.measure();
+        this.#setView(state, { ...state.view });
       }
     }
     if (body.request !== null && decisions[body.effects.length] === true)
@@ -917,7 +999,20 @@ export class WritePathImpl implements WritePath, EngineHooks {
       });
       let done = 0;
       while (done < inserts.rowCount) {
-        const { memtable } = this.liveMemtable(effect.tableId, inserts.rowCount - done);
+        let { memtable } = this.liveMemtable(effect.tableId, inserts.rowCount - done);
+        const logged = inserts.firstRowId + done;
+        // Staging moves the root's next row id past its rows; after a rollback the ids it used
+        // (never committed) may be used again by rows logged but not flushed. An empty memtable
+        // starts at the logged row then, never before what precedes it.
+        if (
+          memtable.rowCount === 0 &&
+          logged < memtable.firstRowId &&
+          logged >= this.#rowFloor(state, memtable)
+        )
+          memtable = this.#liveAt(state, logged);
+        // Row ids a rolled-back staging used and the next rows skipped: a forward gap.
+        if (memtable.firstRowId + memtable.rowCount < logged)
+          memtable = this.#liveAt(state, logged);
         const next = memtable.firstRowId + memtable.rowCount;
         if (next !== inserts.firstRowId + done)
           throw new LogCorruptionError(
@@ -946,6 +1041,107 @@ export class WritePathImpl implements WritePath, EngineHooks {
         this.#markDeleted(state, rowId, lsn);
       });
     }
+  }
+
+  /**
+   * Replay of a large transaction's commit (format/replay.ts "Large transactions"): its staged
+   * groups become staged memtables committed at `lsn`, after the memtables replayed so far, in
+   * row-id order; a later flush folds them in (with `flushedThroughLsn ≥ lsn`).
+   */
+  async #replayPublished(
+    effect: Extract<BodyEffect, { kind: "publishedRows" }>,
+    lsn: number,
+  ): Promise<void> {
+    const def = this.#catalog.table(effect.tableId);
+    const state = this.#tables.get(effect.tableId);
+    const entry = state?.root?.staged.find((staged) => staged.transaction === effect.transaction);
+    if (def === undefined || state === undefined || entry === undefined)
+      throw new LogCorruptionError(
+        `Transaction ${String(effect.transaction)} is not staged for table ${String(effect.tableId)}`,
+      );
+    const refs: GroupRef[] = [];
+    const directory: ExtentRef[] = [];
+    if (!isEmptyDirectory(entry.groups)) {
+      directory.push(entry.groups.extent);
+      const index = await this.#metadata.groupIndex(entry.groups, this.#grant);
+      try {
+        for (const page of index.value) {
+          directory.push(page.ref.extent);
+          const held = await this.#metadata.groupPage(page.ref, this.#grant);
+          try {
+            refs.push(...held.value);
+          } finally {
+            held.release();
+          }
+        }
+      } finally {
+        index.release();
+      }
+    }
+    const memtables = [...state.view.memtables];
+    const last = memtables[memtables.length - 1];
+    if (last?.state === "live") {
+      if (last.rowCount === 0 && [...last.deltas.values()].every((delta) => delta.entryCount === 0))
+        memtables.pop();
+      else {
+        last.state = "frozen";
+        last.measure();
+      }
+    }
+    let end = memtables[memtables.length - 1]?.rowIdEnd ?? 0;
+    const staged: Memtable[] = [];
+    for (const [k, ref] of refs.entries()) {
+      if (ref.firstRowId < end)
+        throw new LogCorruptionError("Staged rows overlap rows replayed before them");
+      const held = await this.#metadata.groupRoot(ref.root, this.#grant);
+      const groupRoot = held.value;
+      held.release();
+      const memtable = new Memtable(
+        def.id,
+        ref.firstRowId,
+        def.schemaVersion,
+        def.columns,
+        def.indexes.map((index) => index.id),
+        this.#grant,
+        this.#memtableRows,
+      );
+      memtable.rowCount = ref.rowCount;
+      memtable.storedRows = ref.rowCount;
+      memtable.mark(lsn);
+      if (ref.deletions !== null) {
+        const bits = await this.#bitmap(ref.deletions);
+        for (let position = 0; position < ref.rowCount; position++)
+          if (((bits[position >>> 5] ?? 0) & (1 << (position & 31))) !== 0)
+            memtable.deletions.set(position, lsn);
+      }
+      // Every staged run of the commit is visible with its rows: the first memtable holds them.
+      const runs = new Map<number, readonly RunRef[]>(
+        k === 0 ? entry.indexRuns.map((index) => [index.indexId, index.runs]) : [],
+      );
+      const pin = this.#space.pin(`staged t${String(def.id)}`);
+      memtable.staged = {
+        stagingId: effect.transaction,
+        group: ref,
+        groupRoot,
+        runs,
+        pin,
+        extents: [],
+      };
+      memtable.published = { group: ref, groupRoot, runs: new Map(), pin };
+      memtable.state = "staged";
+      staged.push(memtable);
+      end = memtable.rowIdEnd;
+    }
+    state.nextRowId = Math.max(state.nextRowId, end);
+    this.#setView(state, { ...state.view, memtables: [...memtables, ...staged] });
+    this.maintenance.publishedReplays += 1;
+    state.stagings.set(effect.transaction, {
+      id: effect.transaction,
+      memtables: staged,
+      entry,
+      directory,
+      rootSequence: this.#root.sequence,
+    });
   }
 
   #markDeleted(state: TableState, rowId: number, seq: number): void {
@@ -1077,9 +1273,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     }
     const def = this.#def(tableId);
     const firstRowId =
-      last === undefined
-        ? state.nextRowId
-        : Math.max(state.nextRowId, last.firstRowId + last.rowCount);
+      last === undefined ? state.nextRowId : Math.max(state.nextRowId, last.rowIdEnd);
     const memtable = new Memtable(
       tableId,
       firstRowId,
@@ -1092,6 +1286,42 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#setView(state, { ...state.view, memtables: [...memtables, memtable] });
     if (frozen !== null && !this.#recovering) this.#scheduleFlush();
     return { memtable, created: true, frozen };
+  }
+
+  /** The first row id `memtable` may start at: past the memtables before it and every group. */
+  #rowFloor(state: TableState, memtable: Memtable): number {
+    const memtables = state.view.memtables;
+    const at = memtables.indexOf(memtable);
+    const previous = at > 0 ? memtables[at - 1] : undefined;
+    if (previous !== undefined) return previous.rowIdEnd;
+    const groups = state.view.groups;
+    return groups.count > 0 ? groups.get(groups.count - 1).lastRowId + 1 : 1;
+  }
+
+  /** A live memtable starting at `firstRowId` (replay past a gap): the current one ends first. */
+  #liveAt(state: TableState, firstRowId: number): Memtable {
+    const memtables = [...state.view.memtables];
+    const last = memtables[memtables.length - 1];
+    if (last?.state === "live") {
+      if (last.rowCount === 0 && [...last.deltas.values()].every((delta) => delta.entryCount === 0))
+        memtables.pop();
+      else {
+        last.state = "frozen";
+        last.measure();
+      }
+    }
+    const def = this.#def(state.tableId);
+    const memtable = new Memtable(
+      state.tableId,
+      firstRowId,
+      def.schemaVersion,
+      def.columns,
+      def.indexes.map((index) => index.id),
+      this.#grant,
+      this.#memtableRows,
+    );
+    this.#setView(state, { ...state.view, memtables: [...memtables, memtable] });
+    return memtable;
   }
 
   undoFreeze(tableId: number, created: Memtable, frozen: Memtable | null): void {
@@ -1130,6 +1360,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       flushedThroughLsn: 0,
       nextRowId: 1,
       nextGroupId: 1,
+      stagings: new Map(),
       pages: [],
       metadataBytes: 0,
     });
@@ -1237,6 +1468,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
    * `MemtableMemoryError` when nothing more can be freed.
    */
   admit(bytes: number): MaybePromise<void> {
+    // A large transaction's full memtables are staged first: its rows never stay resident whole.
+    const stage = this.#stageCandidates();
+    if (stage !== null)
+      return this.#stage(stage).then(() =>
+        this.#headroom(bytes) ? undefined : this.#relieve(bytes),
+      );
     if (this.#headroom(bytes)) return;
     return this.#relieve(bytes);
   }
@@ -1460,6 +1697,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
 
   release(tx: TransactionImpl): void {
     if (this.#holder !== tx) return;
+    // Staging a commit did not claim (a rollback, or a commit that failed before its frame).
+    const staging = this.#txStaging.get(tx);
+    if (staging !== undefined) {
+      this.#txStaging.delete(tx);
+      this.#dropStaging(staging);
+    }
     this.#holder = null;
     this.#passSlot();
     // A frozen memtable may have waited for this writer's pending rows.
@@ -1483,7 +1726,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
       const previous = memtables[memtables.length - 2];
       if (
         last?.state !== "live" ||
-        previous?.state !== "frozen" ||
+        previous === undefined ||
+        !awaitsFlush(previous) ||
         last.rowCount === 0 ||
         last.visibleRows(MAX_LSN) < last.rowCount ||
         minSeq(last) > maxSeq(previous, previous.rowCount)
@@ -1499,14 +1743,32 @@ export class WritePathImpl implements WritePath, EngineHooks {
 
   #hasFrozen(): boolean {
     for (const state of this.#tables.values())
-      for (const memtable of state.view.memtables) if (memtable.state === "frozen") return true;
+      for (const memtable of state.view.memtables) if (awaitsFlush(memtable)) return true;
     return false;
   }
 
   commit(tx: TransactionImpl, request: CommitRequest | null): Promise<CommitReceipt> {
+    const staging = this.#txStaging.get(tx);
+    if (staging === undefined) return this.#commitNow(tx, request, () => null);
+    // A large transaction: its staging is made exact first, then its frame names that root.
+    return this.#restage(tx, staging).then(
+      (names) => this.#commitNow(tx, request, (tableId) => names.get(tableId) ?? null),
+      (error: unknown) => {
+        tx.undoTo(0);
+        this.release(tx);
+        throw error;
+      },
+    );
+  }
+
+  #commitNow(
+    tx: TransactionImpl,
+    request: CommitRequest | null,
+    staged: (tableId: number) => PublishedRows | null,
+  ): Promise<CommitReceipt> {
     try {
       this.#check();
-      const effects = tx.effects(this.#columns);
+      const effects = tx.effects(this.#columns, staged);
       if (effects.length === 0) {
         this.release(tx);
         this.#afterAppend(); // sequence frames may have grown the log meanwhile
@@ -1514,6 +1776,22 @@ export class WritePathImpl implements WritePath, EngineHooks {
       }
       const lsn = this.#appender.append(encodeBody({ request, effects }, this.#body));
       tx.restamp(lsn);
+      // Claimed by the frame. A staged commit spans memtables, and a commit flushes whole: its
+      // live tail (committed now) freezes, so the fold can run at once.
+      if (this.#txStaging.delete(tx))
+        for (const state of this.#tables.values()) {
+          const last = state.view.memtables[state.view.memtables.length - 1];
+          if (
+            last?.state === "live" &&
+            last.rowCount > 0 &&
+            last.visibleRows(MAX_LSN) === last.rowCount &&
+            state.view.memtables.some((memtable) => memtable.staged !== null)
+          ) {
+            last.state = "frozen";
+            last.measure();
+            this.#setView(state, { ...state.view });
+          }
+        }
       if (tx.catalog !== this.#catalog) {
         this.#catalog = tx.catalog;
         this.#catalogHistory.push({ lsn, catalog: tx.catalog });
@@ -1579,6 +1857,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   async quiesce(): Promise<void> {
     for (;;) {
       await this.#recycling;
+      await this.#stagingDrops;
       await this.#appender.flush();
       await this.#flushes;
       await this.#merges;
@@ -1603,7 +1882,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       let through = 0;
       for (let k = 0; k < memtables.length; k++) {
         const memtable = need(memtables[k]);
-        if (memtable.state !== "frozen" || memtable.visibleRows(MAX_LSN) < memtable.rowCount) break;
+        if (!awaitsFlush(memtable) || memtable.visibleRows(MAX_LSN) < memtable.rowCount) break;
         through = Math.max(through, maxSeq(memtable, memtable.rowCount));
         const next = memtables[k + 1];
         if (next === undefined || minSeq(next) > through) {
@@ -1659,7 +1938,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     for (const state of this.#tables.values()) {
       for (const memtable of state.view.memtables) {
         memtableBytes += memtable.bytes;
-        if (memtable.state === "frozen") frozen += 1;
+        if (awaitsFlush(memtable)) frozen += 1;
       }
       for (const list of state.view.runs.values()) runs += levelZero(list);
     }
@@ -1705,7 +1984,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     let total = 0;
     for (const state of this.#tables.values())
       for (const memtable of state.view.memtables)
-        if (memtable.state === "frozen") total += memtable.bytes;
+        if (awaitsFlush(memtable)) total += memtable.bytes;
     return total;
   }
 
@@ -1718,6 +1997,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     for (const waiter of this.#queue.splice(0)) waiter.reject(new WritePathClosedError());
     await this.#recycling;
     await this.#flushes;
+    await this.#stagingDrops;
     // A running merge stops at its next slice and aborts its writer.
     await this.#merges;
     // An idle publication already started finishes (or, not yet publishing, sees close and
@@ -1822,7 +2102,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       let through = 0;
       for (let k = 0; k < memtables.length; k++) {
         const memtable = need(memtables[k]);
-        if (memtable.state !== "frozen") break;
+        if (!awaitsFlush(memtable)) break;
         const rows = memtable.rowCount;
         if (memtable.visibleRows(MAX_LSN) < rows) break; // pending rows
         through = Math.max(through, maxSeq(memtable, rows));
@@ -1886,6 +2166,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
       let nextGroupId = state.nextGroupId;
       /** Runs of memtables without rows (a recycle flushes their tombstones). */
       const rowless = new Map<Memtable, Map<number, RunRef>>();
+      /** Staging ids whose staged memtables this flush folds into the table's groups. */
+      const foldedStagings = new Set<number>();
       for (const memtable of set) {
         if (memtable.rowCount === 0) {
           const runs = new Map<number, RunRef>();
@@ -1898,6 +2180,47 @@ export class WritePathImpl implements WritePath, EngineHooks {
           }
           if (runs.size > 0) rowless.set(memtable, runs);
           this.maintenance.rowlessRuns += runs.size;
+          continue;
+        }
+        const part = memtable.staged;
+        if (part !== null) {
+          // A committed large transaction's staged rows: the group and its runs are written
+          // already; deletions since staging are folded into its bitmap, and the other entries
+          // the memtable kept (tombstones of older rows) become a run of their own.
+          foldedStagings.add(part.stagingId);
+          const base =
+            part.group.deletions === null ? null : await this.#bitmap(part.group.deletions);
+          const isSet = (position: number) =>
+            base !== null && ((base[position >>> 5] ?? 0) & (1 << (position & 31))) !== 0;
+          const deleted = memtable
+            .deletedUnder(through, memtable.rowCount)
+            .filter((position) => !isSet(position));
+          let deletions = part.group.deletions;
+          if (deleted.length > 0) {
+            deletions = await this.#writeBitmap(writer, memtable.storedRows, base, deleted);
+            if (part.group.deletions !== null) retired.push(part.group.deletions.extent);
+          }
+          const group: GroupRef = {
+            ...part.group,
+            groupId: nextGroupId++,
+            liveRowCount: part.group.liveRowCount - deleted.length,
+            deletions,
+          };
+          const runs = new Map<number, RunRef>();
+          for (const index of def.indexes) {
+            const delta = memtable.deltas.get(index.id);
+            if (delta === undefined) continue;
+            const run = encodeRun(delta.sorted(through));
+            if (run === null) continue;
+            runs.set(index.id, runRef(run, (await writer.write(run.parts)).blobs));
+          }
+          // Staged runs of an index dropped since staging do not fold: they are retired here.
+          const indexIds = new Set(def.indexes.map((index) => index.id));
+          for (const [indexId, list] of part.runs)
+            if (!indexIds.has(indexId)) retired.push(...list.map(runExtent));
+          newGroups.push(group);
+          published.set(memtable, { group, root: part.groupRoot, runs });
+          this.maintenance.stagedFolds += 1;
           continue;
         }
         const groupRoot = await this.#writeGroup(writer, def, memtable);
@@ -1995,15 +2318,34 @@ export class WritePathImpl implements WritePath, EngineHooks {
       const runs = new Map<number, readonly RunRef[]>();
       for (const index of def.indexes) {
         // One run per memtable that had entries, in memtable order (oldest first).
-        const fresh = set
-          .map(
-            (memtable) =>
-              published.get(memtable)?.runs.get(index.id) ?? rowless.get(memtable)?.get(index.id),
-          )
-          .filter((run): run is RunRef => run !== undefined);
+        const fresh = set.flatMap((memtable) => {
+          const own =
+            published.get(memtable)?.runs.get(index.id) ?? rowless.get(memtable)?.get(index.id);
+          // A folded memtable's staged puts are older than the entries it kept. Only a memtable
+          // this flush folds (a dropped staged memtable's runs are retired, not the table's).
+          const staged =
+            memtable.staged !== null && published.has(memtable)
+              ? (memtable.staged.runs.get(index.id) ?? [])
+              : [];
+          return own === undefined ? [...staged] : [...staged, own];
+        });
         runs.set(index.id, [...fresh.reverse(), ...(state.view.runs.get(index.id) ?? [])]);
       }
-      const nextRowId = Math.max(state.nextRowId, ...newGroups.map((group) => group.lastRowId + 1));
+      const nextRowId = Math.max(
+        state.nextRowId,
+        state.root?.nextRowId ?? 0,
+        ...newGroups.map((group) => group.lastRowId + 1),
+      );
+      // Other transactions' staging stays listed; a folded one leaves with its directory.
+      for (const id of foldedStagings) {
+        const staging = state.stagings.get(id);
+        if (
+          staging === undefined ||
+          staging.memtables.some((memtable) => memtable.rowCount > 0 && !set.includes(memtable))
+        )
+          throw new TypeError("A commit's staged rows must fold in one flush");
+        retired.push(...staging.directory);
+      }
       const tableRoot: TableRoot = {
         tableId: state.tableId,
         schemaVersion: def.schemaVersion,
@@ -2012,7 +2354,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
         liveRowCount,
         groups: directory,
         groupCount: groups.count,
-        staged: [],
+        staged: (state.root?.staged ?? []).filter(
+          (staged) => !foldedStagings.has(staged.transaction),
+        ),
         keyIndex: indexRoot(def, def.primaryKey, runs),
         secondaryIndexes: def.indexes
           .filter((index) => index.id !== def.primaryKey)
@@ -2094,6 +2438,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
           this.#pendingIndexes.delete(indexId);
       state.nextGroupId = nextGroupId;
       state.nextRowId = nextRowId;
+      for (const id of foldedStagings) state.stagings.delete(id);
       // Rebuilt from the view as it is now: memtables, deletions and sources added during the
       // flush stay (the flush only removes what it published).
       const current = state.view;
@@ -2134,6 +2479,454 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (writing) this.#flushesWriting -= 1;
     }
     this.#scheduleMerge();
+  }
+
+  // ── Staged large transactions (format/replay.ts "Large transactions") ─────────────────────
+
+  /** Staging ids: unique per open write path, above every id a root at open listed. */
+  #nextStagingId = 1;
+  /** The open transaction's staging id, once it staged anything. */
+  readonly #txStaging = new WeakMap<TransactionImpl, number>();
+  /** Extents of dropped staging the durable root still reaches: retired by the next root. */
+  #pendingRetire: ExtentRef[] = [];
+  /** Rollbacks' staging drops, each under the publish lock (close and quiesce wait for them). */
+  #stagingDrops: Promise<void> = Promise.resolve();
+
+  /**
+   * Frozen memtables holding only the open transaction's rows that can be staged now, per table.
+   * The transaction must not have changed the table's catalog entry, a root must be able to carry
+   * the table now (`#flushable`), and every earlier memtable with the transaction's rows must be
+   * staged already, except a first one that also holds committed rows: so the commit's effects
+   * stay in row-id order (rows, then one `publishedRows`, then rows).
+   */
+  #stageCandidates(): Map<TableState, Memtable[]> | null {
+    const tx = this.#holder;
+    if (tx === null || this.#recovering || this.#closed) return null;
+    let out: Map<TableState, Memtable[]> | null = null;
+    for (const state of this.#tables.values()) {
+      const committed = this.#catalog.table(state.tableId);
+      const now = tx.catalog.table(state.tableId);
+      if (
+        committed === undefined ||
+        now?.schemaVersion !== committed.schemaVersion ||
+        now.indexes.length !== committed.indexes.length ||
+        now.indexes.some((index, k) => index.id !== committed.indexes[k]?.id)
+      )
+        continue;
+      let list: Memtable[] | null = null;
+      let staged = false;
+      for (const memtable of state.view.memtables) {
+        if (memtable.staged !== null) {
+          staged = true;
+          continue;
+        }
+        const committedRows = memtable.visibleRows(MAX_LSN);
+        if (committedRows === memtable.rowCount) continue;
+        if (committedRows > 0 && !staged) continue; // the first memtable, holding committed rows
+        if (memtable.state !== "frozen" || committedRows > 0 || !this.#stageable(tx, memtable))
+          break;
+        (list ??= []).push(memtable);
+        staged = true;
+      }
+      if (list !== null && this.#flushable(state, state.flushedThroughLsn))
+        (out ??= new Map()).set(state, list);
+    }
+    return out;
+  }
+
+  /**
+   * Whether each undo entry into `memtable`'s deltas is all own puts (the staged run takes them)
+   * or all other entries (they stay resident): staging remaps entries, never splits one.
+   */
+  #stageable(tx: TransactionImpl, memtable: Memtable): boolean {
+    if (memtable.rowCount === 0) return false;
+    const first = memtable.firstRowId;
+    const end = first + memtable.rowCount;
+    const deltas = new Set(memtable.deltas.values());
+    for (const entry of tx.undo) {
+      if (entry.kind !== "delta" || !deltas.has(entry.delta)) continue;
+      const delta = entry.delta;
+      const own = (at: number) =>
+        !delta.isTombstone(at) && delta.rowId(at) >= first && delta.rowId(at) < end;
+      const kind = own(entry.entry);
+      for (let at = entry.entry + 1; at < entry.entry + entry.count; at++)
+        if (own(at) !== kind) return false;
+    }
+    return true;
+  }
+
+  /** Stages `candidates` (from `admit`, the writer's own call): one publication. */
+  async #stage(candidates: ReadonlyMap<TableState, readonly Memtable[]>): Promise<void> {
+    const tx = need(this.#holder);
+    const unlock = await this.#lock();
+    try {
+      this.#check();
+      await this.#publishStaging(tx, candidates, false);
+    } finally {
+      unlock();
+    }
+  }
+
+  /**
+   * At commit: brings every table's staging of `tx` up to date (memtables a rollback emptied
+   * dropped, truncated ones' tails marked deleted, their runs rewritten without them) and returns
+   * what each table's `publishedRows` names. The rows' only durable form is then exactly the
+   * committed rows.
+   */
+  async #restage(tx: TransactionImpl, id: number): Promise<Map<number, PublishedRows>> {
+    const unlock = await this.#lock();
+    try {
+      this.#check();
+      await this.#publishStaging(tx, new Map(), true);
+    } finally {
+      unlock();
+    }
+    const out = new Map<number, PublishedRows>();
+    for (const state of this.#tables.values()) {
+      const staging = state.stagings.get(id);
+      if (staging?.entry == null) continue;
+      out.set(state.tableId, {
+        transaction: id,
+        rootSequence: staging.rootSequence,
+        indexIds: staging.entry.indexRuns.map((runs) => runs.indexId),
+      });
+    }
+    return out;
+  }
+
+  /**
+   * One root with `tx`'s staging brought up to date in each table it touches: `adds` written as
+   * staged groups and runs; memtables a rollback emptied or removed dropped (their extents
+   * retired); with `final`, truncated memtables' tails marked deleted. The caller holds the lock.
+   */
+  async #publishStaging(
+    tx: TransactionImpl,
+    adds: ReadonlyMap<TableState, readonly Memtable[]>,
+    final: boolean,
+  ): Promise<void> {
+    let id = this.#txStaging.get(tx);
+    const tables = new Set<TableState>(adds.keys());
+    if (id !== undefined)
+      for (const state of this.#tables.values()) if (state.stagings.has(id)) tables.add(state);
+    if (tables.size === 0) return;
+    id ??= this.#nextStagingId++;
+    const writer = this.#space.beginWrite("stage");
+    const delta = new DeltaPublication(
+      "stage",
+      this.#extentDeltas,
+      this.#nextAttempt,
+      this.#afterDeltaPrepared,
+      this.#sinkFailed,
+    );
+    const retired: ExtentRef[] = [];
+    const changed = new Map<number, TableRoot>();
+    const installs: Array<() => void> = [];
+    const remaps = new Map<KeyDelta, { delta: KeyDelta; entries: Int32Array }>();
+    let madeRoot: ManifestRoot | null = null;
+    try {
+      for (const state of tables) {
+        if (this.#tables.get(state.tableId) !== state) continue;
+        const def = this.#catalog.table(state.tableId);
+        if (def === undefined) continue;
+        const staging: Staging = state.stagings.get(id) ?? {
+          id,
+          memtables: [],
+          entry: null,
+          directory: [],
+          rootSequence: 0,
+        };
+        const kept: Memtable[] = [];
+        const dropped: Memtable[] = [];
+        for (const memtable of staging.memtables)
+          (memtable.rowCount > 0 && state.view.memtables.includes(memtable) ? kept : dropped).push(
+            memtable,
+          );
+        const parts = new Map<Memtable, StagedPart>();
+        const residuals = new Map<Memtable, Map<number, KeyDelta>>();
+        for (const memtable of dropped) retired.push(...need(memtable.staged).extents);
+        // Tails a rollback truncated: deleted in the group's bitmap, gone from its runs.
+        let rewrote = false;
+        if (final)
+          for (const memtable of kept) {
+            const part = need(memtable.staged);
+            if (part.group.liveRowCount === memtable.rowCount) continue;
+            parts.set(memtable, await this.#truncateStaged(writer, memtable, part, retired));
+            rewrote = true;
+            this.maintenance.stagedTruncations += 1;
+          }
+        for (const memtable of adds.get(state) ?? []) {
+          const written = await this.#writeStaged(writer, def, memtable, id);
+          parts.set(memtable, written.part);
+          residuals.set(memtable, written.residual);
+          for (const [old, map] of written.remaps) remaps.set(old, map);
+        }
+        if (dropped.length === 0 && !rewrote && (adds.get(state)?.length ?? 0) === 0) continue;
+        const memtables = [...kept, ...(adds.get(state) ?? [])];
+        const partOf = (memtable: Memtable) => parts.get(memtable) ?? need(memtable.staged);
+        retired.push(...staging.directory);
+        let entry: TableRoot["staged"][number] | null = null;
+        let directory: ExtentRef[] = [];
+        if (memtables.length > 0) {
+          const refs = memtables.map((memtable, k) => ({
+            ...partOf(memtable).group,
+            groupId: k + 1,
+          }));
+          const written = await writeGroupDirectory(writer, refs);
+          directory = [written.ref.extent, ...written.pages.map((page) => page.ref.extent)];
+          entry = {
+            transaction: id,
+            firstRowId: need(refs[0]).firstRowId,
+            rowCount: refs.reduce((sum, ref) => sum + ref.rowCount, 0),
+            groups: written.ref,
+            indexRuns: def.indexes.map((index) => ({
+              indexId: index.id,
+              runs: memtables.flatMap((memtable) => partOf(memtable).runs.get(index.id) ?? []),
+            })),
+          };
+        }
+        const base = state.root ?? emptyTableRoot(def, state.nextRowId, state.flushedThroughLsn);
+        const end = Math.max(0, ...memtables.map((memtable) => memtable.rowIdEnd));
+        const others = base.staged.filter((staged) => staged.transaction !== id);
+        const tableRoot: TableRoot = {
+          ...base,
+          nextRowId: Math.max(base.nextRowId, end),
+          staged: entry === null ? others : [...others, entry],
+        };
+        changed.set(state.tableId, tableRoot);
+        const stagingId = id;
+        installs.push(() => {
+          state.root = tableRoot;
+          state.nextRowId = Math.max(state.nextRowId, end);
+          for (const [memtable, part] of parts) {
+            memtable.staged = part;
+            memtable.published = {
+              group: part.group,
+              groupRoot: part.groupRoot,
+              runs: new Map(),
+              pin: part.pin,
+            };
+            const residual = residuals.get(memtable);
+            if (residual !== undefined) {
+              memtable.storedRows = memtable.rowCount;
+              memtable.state = "staged";
+              memtable.release();
+              memtable.replaceDeltas(residual);
+              for (const delta of residual.values())
+                this.maintenance.stagedResidualEntries += delta.entryCount;
+              this.maintenance.stagedRows += memtable.rowCount;
+            }
+          }
+          this.maintenance.stagedMemtablesDropped += dropped.length;
+          for (const memtable of dropped) {
+            const gone = memtable;
+            this.shared.readers.holdUntilOlderClose(() => gone.releaseAll());
+          }
+          if (entry === null) state.stagings.delete(stagingId);
+          else
+            state.stagings.set(stagingId, {
+              ...staging,
+              memtables,
+              entry,
+              directory,
+              rootSequence: 0, // set below
+            });
+          // Dropped staged memtables (emptied by a rollback) leave the view: their extents are
+          // retired by this root.
+          const gone = new Set(dropped);
+          this.#setView(state, {
+            ...state.view,
+            memtables: state.view.memtables.filter((memtable) => !gone.has(memtable)),
+          });
+        });
+      }
+      if (changed.size === 0) {
+        await writer.abort();
+        return;
+      }
+      const root = await this.#nextRoot(writer, retired, changed);
+      await delta.prepare(root.sequence, writer, retired);
+      const bytes = encodeManifestRoot(root);
+      const charge = parseCharge(bytes.length);
+      this.#chargeMetadata(charge);
+      this.#roots.set(root, { refs: 1, bytes: charge });
+      madeRoot = root;
+      await delta.publish(this.#space, bytes, writer, retired);
+      this.#root = root;
+      this.#pruneCatalogs(root.globalLsn);
+      this.#adoptTableRoots(root);
+      for (const install of installs) install();
+      for (const state of tables) {
+        const staging = state.stagings.get(id);
+        if (staging !== undefined) staging.rootSequence = root.sequence;
+      }
+      tx.remapDeltas(remaps);
+      this.#txStaging.set(tx, id);
+      this.maintenance.stages += 1;
+      this.publications += 1;
+    } catch (error) {
+      if (writer.state === "open") await writer.abort().catch(() => undefined);
+      throw error;
+    } finally {
+      delta.settle();
+      if (madeRoot !== null) this.#releaseRoot(madeRoot);
+    }
+  }
+
+  /**
+   * Writes one frozen memtable of pending rows as a staged group and runs of its own puts; the
+   * other delta entries go to residual deltas (same order, so undo can be remapped).
+   */
+  async #writeStaged(
+    writer: ExtentWriter,
+    def: TableDef,
+    memtable: Memtable,
+    stagingId: number,
+  ): Promise<{
+    part: StagedPart;
+    residual: Map<number, KeyDelta>;
+    remaps: Map<KeyDelta, { delta: KeyDelta; entries: Int32Array }>;
+  }> {
+    const from = writer.extents.length;
+    const groupRoot = await this.#writeGroup(writer, def, memtable);
+    const rootBlob = need((await writer.write([encodeGroupRoot(groupRoot)])).blobs[0]);
+    const first = memtable.firstRowId;
+    const end = first + memtable.rowCount;
+    const runs = new Map<number, RunRef[]>();
+    const residual = new Map<number, KeyDelta>();
+    const remaps = new Map<KeyDelta, { delta: KeyDelta; entries: Int32Array }>();
+    for (const [indexId, old] of memtable.deltas) {
+      const own = old
+        .sorted(Infinity)
+        .map(({ key, entries }) => ({
+          key,
+          entries: entries.filter(
+            (entry) => !entry.tombstone && entry.rowId >= first && entry.rowId < end,
+          ),
+        }))
+        .filter((key) => key.entries.length > 0);
+      const run = encodeRun(own);
+      if (run !== null) runs.set(indexId, [runRef(run, (await writer.write(run.parts)).blobs)]);
+      const next = memtable.newDelta();
+      const entries = new Int32Array(old.entryCount).fill(-1);
+      const arena = old.keyArena();
+      for (let at = 0; at < old.entryCount; at++) {
+        const rowId = old.rowId(at);
+        if (!old.isTombstone(at) && rowId >= first && rowId < end) continue;
+        const slot = old.keyOf(at);
+        entries[at] = next.add(
+          arena,
+          old.keyStart(slot),
+          old.keyEnd(slot),
+          rowId,
+          old.seq(at),
+          old.isTombstone(at),
+        );
+      }
+      residual.set(indexId, next);
+      remaps.set(old, { delta: next, entries });
+    }
+    const group: GroupRef = {
+      groupId: 0,
+      firstRowId: first,
+      lastRowId: end - 1,
+      rowCount: memtable.rowCount,
+      liveRowCount: memtable.rowCount,
+      root: rootBlob,
+      deletions: null,
+    };
+    const part: StagedPart = {
+      stagingId,
+      group,
+      groupRoot,
+      runs,
+      pin: this.#space.pin(`staged t${String(memtable.tableId)}`),
+      extents: writer.extents.slice(from),
+    };
+    return { part, residual, remaps };
+  }
+
+  /** A staged memtable whose tail a rollback truncated: tail deleted in a bitmap, runs filtered. */
+  async #truncateStaged(
+    writer: ExtentWriter,
+    memtable: Memtable,
+    part: StagedPart,
+    retired: ExtentRef[],
+  ): Promise<StagedPart> {
+    const from = writer.extents.length;
+    const live = memtable.rowCount;
+    const tail = Array.from({ length: memtable.storedRows - live }, (_, k) => live + k);
+    const deletions = await this.#writeBitmap(writer, memtable.storedRows, null, tail);
+    const old: ExtentRef[] = [];
+    if (part.group.deletions !== null) old.push(part.group.deletions.extent);
+    const end = memtable.firstRowId + live;
+    const runs = new Map<number, RunRef[]>();
+    for (const [indexId, list] of part.runs) {
+      const kept: RunRef[] = [];
+      for (const run of list) {
+        old.push(runExtent(run));
+        const reader = await this.#runReader(run);
+        const builder = new RunBuilder();
+        await reader.cursor(this.#space, this.#grant, (key, rowId, tombstone) => {
+          if (rowId < end) builder.add(key.slice(), rowId, tombstone);
+          return false;
+        });
+        const encoded = builder.finish();
+        if (encoded !== null) kept.push(runRef(encoded, (await writer.write(encoded.parts)).blobs));
+      }
+      if (kept.length > 0) runs.set(indexId, kept);
+    }
+    retired.push(...old);
+    const extents = [
+      ...part.extents.filter((extent: ExtentRef) => !old.some((gone) => sameExtent(gone, extent))),
+      ...writer.extents.slice(from),
+    ];
+    return {
+      ...part,
+      group: { ...part.group, deletions, liveRowCount: live },
+      runs,
+      extents,
+    };
+  }
+
+  /** Drops `id`'s staging after its transaction rolled back (or failed before its frame). */
+  #dropStaging(id: number): void {
+    const drops: Array<{ state: TableState; staging: Staging }> = [];
+    for (const state of this.#tables.values()) {
+      const staging = state.stagings.get(id);
+      if (staging === undefined) continue;
+      state.stagings.delete(id);
+      drops.push({ state, staging });
+      const gone = new Set(staging.memtables);
+      this.#setView(state, {
+        ...state.view,
+        memtables: state.view.memtables.filter((memtable) => !gone.has(memtable)),
+      });
+      this.shared.readers.holdUntilOlderClose(() => {
+        for (const memtable of gone) memtable.releaseAll();
+      });
+    }
+    if (drops.length === 0) return;
+    this.maintenance.stagingRollbacks += 1;
+    // The durable root still lists them: the next root leaves them out and retires their extents
+    // (under the lock, so no publication in flight adopts the old entry back).
+    this.#stagingDrops = this.#stagingDrops.then(async () => {
+      const unlock = await this.#lock();
+      try {
+        for (const { state, staging } of drops) {
+          if (staging.entry === null) continue;
+          this.#pendingRetire.push(...staging.directory);
+          for (const memtable of staging.memtables)
+            this.#pendingRetire.push(...need(memtable.staged).extents);
+          if (state.root !== null)
+            state.root = {
+              ...state.root,
+              staged: state.root.staged.filter((staged) => staged.transaction !== id),
+            };
+        }
+      } finally {
+        unlock();
+      }
+    });
   }
 
   // ── Idle maintenance (ruling R10) ───────────────────────────────────────────────────────
@@ -2348,7 +3141,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         this.maintenance.recycleFlushedTables += 1;
         // On the flush chain, with whatever is still frozen when it runs.
         const flush = this.#flushes.then(async () => {
-          const set = state.view.memtables.filter((memtable) => memtable.state === "frozen");
+          const set = state.view.memtables.filter(awaitsFlush);
           if (set.length > 0) await this.#flushTable(state, set, cut);
         });
         this.#flushes = flush.catch(() => undefined);
@@ -2831,6 +3624,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
     incarnation: ManifestRoot["log"] | null = null,
   ): Promise<ManifestRoot> {
     const globalLsn = this.#rootLsn(changed);
+    // Dropped staging the durable root still reaches (a rollback's), retired by this root.
+    // Never twice: a dropped table's walk below also reaches staging its root still lists.
+    if (this.#pendingRetire.length > 0) {
+      retireOnce(retired, this.#pendingRetire);
+      this.#pendingRetire = [];
+    }
     // A quiet table's index build has no entries: this root settles it (an empty index root and a
     // checkpoint past the build), so the build stops holding the root's LSN back. Without this an
     // index on a table that gets no rows held every later root (and log recycling) back for good.
@@ -2928,7 +3727,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     // Tables the previous root had and this one lacks were dropped: retire everything they reach.
     for (const previous of this.#root.tables)
       if (!tables.some((table) => table.tableId === previous.tableId))
-        retired.push(...(await this.#tableExtents(previous)));
+        retireOnce(retired, await this.#tableExtents(previous));
     const clients = this.ledger.checkpoint().map((entry) => ({
       ...entry,
       outcomes: entry.outcomes.filter((outcome) => outcome.lsn <= globalLsn),
@@ -3016,6 +3815,16 @@ function quietTable(state: TableState): boolean {
       [...source.deletions.values()].some((seq) => seq > state.view.foldedThrough),
     )
   );
+}
+
+/** Adds `extents` to a publication's retirements, each at most once. */
+function retireOnce(retired: ExtentRef[], extents: readonly ExtentRef[]): void {
+  const known = new Set(retired.map((extent) => extent.offset));
+  for (const extent of extents)
+    if (!known.has(extent.offset)) {
+      known.add(extent.offset);
+      retired.push(extent);
+    }
 }
 
 /** A table's root with nothing written: an empty group directory and no runs. */
@@ -3112,7 +3921,15 @@ async function readBlob(space: Space, ref: BlobRef, budget: Grant): Promise<Uint
 }
 
 /** What a publication is (tests and diagnostics). */
-export type PublicationKind = "initial" | "flush" | "merge" | "recycle" | "idle";
+export type PublicationKind = "initial" | "flush" | "merge" | "recycle" | "idle" | "stage";
+
+/**
+ * A memtable whose flush is due once its rows are committed: frozen, or staged (its flush folds
+ * the staged group in).
+ */
+function awaitsFlush(memtable: Memtable): boolean {
+  return memtable.state === "frozen" || memtable.state === "staged";
+}
 
 /**
  * The R25 sink failed (its `prepare` threw, or asked for what this build cannot do): the write

@@ -15,6 +15,7 @@ import { need } from "./bytes.js";
 import { ExtentSinkError, type WritePathImpl } from "./engine.js";
 import { yieldTask } from "./merge.js";
 import {
+  rules,
   autocommit,
   batch,
   column,
@@ -58,6 +59,8 @@ const REACH = [
   "flush-held-by-build",
   "build-settled",
   "reopen",
+  "stage",
+  "stage-rollback",
 ] as const;
 const reach = createReach("next-write-extent-deltas", REACH);
 
@@ -230,7 +233,32 @@ describe("extent deltas (ruling R25)", () => {
         const t = need(tables[int(tables.length)]);
         const live = need(rows.get(t));
         const roll = int(100);
-        if (roll < 50) {
+        if (roll < 8) {
+          // A large transaction: many calls stage full memtables before the commit; some roll
+          // back to a savepoint, some roll back whole (their staging is retired).
+          const tx = await path.begin();
+          const s = tx.statement({ rules });
+          const ids: number[] = [];
+          for (let call = 0; call < 3 + int(5); call++) {
+            const fresh = Array.from(
+              { length: 4 + int(4) },
+              (_, k) => 10_000 + step * 100 + call * 10 + k,
+            ).filter((id) => !live.has(id));
+            await s.table(t).insert(batch(ints(fresh), ints(fresh)), null);
+            ids.push(...fresh);
+          }
+          await s.end();
+          if (random() < 0.3) {
+            tx.rollback();
+            reach.reach("stage-rollback");
+          } else {
+            await (
+              await tx.commit(null)
+            ).durable;
+            for (const id of ids) live.add(id);
+          }
+          if (path.maintenance.stages > 0) reach.reach("stage");
+        } else if (roll < 50) {
           const ids = Array.from({ length: 1 + int(8) }, () => int(500)).filter(
             (id) => !live.has(id),
           );

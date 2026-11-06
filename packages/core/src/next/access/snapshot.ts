@@ -34,8 +34,8 @@
  * ## Segments and locators
  * `TableSnapshot.segments` lists every row the view can see, **in row-id order**, as segments of
  * at most 65,536 positions: durable groups (`kind: "group"`) and rows still in memory
- * (`kind: "memory"`). The open transaction's rows come last (a large transaction's rows may be
- * groups it wrote but has not committed). A locator (vector/locator.ts) is
+ * (`kind: "memory"`). The open transaction's rows come last (a large transaction's memory
+ * segments may read from groups it staged but has not committed). A locator (vector/locator.ts) is
  * `segment index × 65,536 + position`. A position names a stored row whether or not the view
  * considers it deleted: scans filter with `Segment.deletions()`; `fetch` reads whatever a locator
  * names.

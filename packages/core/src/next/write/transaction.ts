@@ -147,7 +147,19 @@ export type Undo =
       readonly statement: number;
       readonly memtable: Memtable;
       readonly indexId: number;
+    }
+  | {
+      /** A change staging made durable (a staged memtable's own index puts): nothing to undo. */
+      readonly kind: "staged";
+      readonly statement: number;
     };
+
+/** What a commit's `publishedRows` effect names for one table (the engine's staging). */
+export interface PublishedRows {
+  readonly transaction: number;
+  readonly rootSequence: number;
+  readonly indexIds: readonly number[];
+}
 
 const settle = <T, R>(
   value: MaybePromise<T>,
@@ -219,6 +231,26 @@ export class TransactionImpl implements WriteTransaction {
     return { statement: this.#ordinal };
   }
 
+  /**
+   * Staging replaced a memtable's key deltas (`replaced`: old delta → new delta and, per old
+   * entry, its index in the new one or −1 for an own put the staged run now holds). Undo entries
+   * keep their places (savepoints and statements hold undo lengths): an own-put entry becomes
+   * `staged`, any other points at the new delta.
+   */
+  remapDeltas(replaced: ReadonlyMap<KeyDelta, { delta: KeyDelta; entries: Int32Array }>): void {
+    for (let k = 0; k < this.undo.length; k++) {
+      const entry = need(this.undo[k]);
+      if (entry.kind !== "delta") continue;
+      const map = replaced.get(entry.delta);
+      if (map === undefined) continue;
+      const first = map.entries[entry.entry] ?? -1;
+      this.undo[k] =
+        first < 0
+          ? { kind: "staged", statement: entry.statement }
+          : { ...entry, delta: map.delta, entry: first };
+    }
+  }
+
   rollbackTo(savepoint: Savepoint): void {
     this.#requireOpen();
     if (this.#open !== null) throw new TransactionStateError("A statement is open");
@@ -269,7 +301,10 @@ export class TransactionImpl implements WriteTransaction {
    * The log body's effects. Inserted columns are views into `scratch` (reused across commits):
    * valid until the body is encoded.
    */
-  effects(scratch: ByteWriter): BodyEffect[] {
+  effects(
+    scratch: ByteWriter,
+    staged: (tableId: number) => PublishedRows | null = () => null,
+  ): BodyEffect[] {
     scratch.reset();
     const effects: BodyEffect[] = [];
     // Column byte ranges in `scratch` as (effect's column list, start, end) triples: views are
@@ -280,10 +315,26 @@ export class TransactionImpl implements WriteTransaction {
     // lists effects in the order the transaction made them (format/replay.ts "ordered effects").
     // Usually one memtable: a short list beats a map.
     const inserts: Array<{ memtable: Memtable; from: number; to: number }> = [];
+    // A staged table's rows are one `publishedRows` effect, at its first staged memtable.
+    const published = new Set<number>();
     let deletes: Map<number, Array<{ rowId: number; keys: readonly Uint8Array[] }>> | null = null;
     const emitRows = () => {
       for (const range of inserts) {
         const memtable = range.memtable;
+        if (memtable.staged !== null) {
+          if (published.has(memtable.tableId) || memtable.rowCount === 0) continue;
+          published.add(memtable.tableId);
+          const names = need(staged(memtable.tableId));
+          effects.push({
+            kind: "publishedRows",
+            tableId: memtable.tableId,
+            schemaVersion: memtable.schemaVersion,
+            transaction: names.transaction,
+            rootSequence: names.rootSequence,
+            indexIds: names.indexIds,
+          });
+          continue;
+        }
         for (let from = range.from; from < range.to;) {
           const chunk = Math.floor(from / MEMORY_CHUNK_ROWS);
           const slot = from % MEMORY_CHUNK_ROWS;
@@ -434,6 +485,8 @@ function undoEntry(tx: TransactionImpl, entry: Undo): void {
       break;
     case "indexDelta":
       entry.memtable.removeDelta(entry.indexId);
+      break;
+    case "staged":
       break;
   }
 }

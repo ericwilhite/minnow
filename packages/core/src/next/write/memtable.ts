@@ -13,9 +13,21 @@
  * `published` (its flush is in a durable root). Publishing frees the rows and deltas: readers still
  * on it are re-pointed (ruling R16.3) to the published group and runs, which `published` names,
  * protected by an extent-space pin the flush took during publication.
+ *
+ * ## Staged (a large transaction: format/replay.ts "Large transactions")
+ * A frozen memtable of the open transaction's rows alone can be **staged**: its rows are written
+ * as a group and its own index puts as runs (`staged`), a root lists them under the transaction's
+ * staging id (`TableRoot.staged`), and the rows are freed (`published` names the group, so reads
+ * re-point as above). The marks stay: the rows are still pending, visible by the same prefix rule,
+ * and a staged run's entries are visible exactly when their row is (`visibleRowIdEnd`). Every
+ * other delta entry (tombstones of older rows) stays in `deltas`, seq-qualified as before. A
+ * rollback truncates the marks only (`rowCount` drops; `storedRows` keeps the group's count). At
+ * commit the marks are restamped like any memtable's; a later flush folds the staged group and
+ * runs into the table's directory instead of writing them again.
  */
 import type { ColumnDef } from "../access/catalog.js";
 import type { SpacePin } from "../access/space.js";
+import type { ExtentRef } from "../storage/extents.js";
 import type { GroupRef, GroupRoot, RunRef } from "../format/manifest.js";
 import type { Vector } from "../vector/vector.js";
 import { ColumnChunk, MEMORY_CHUNK_ROWS } from "./columns.js";
@@ -42,6 +54,20 @@ class Counter implements Charge {
   }
 }
 
+/** A staged memtable's durable parts (rows and its own index puts). */
+export interface StagedPart {
+  /** The staging id the root lists them under. */
+  readonly stagingId: number;
+  readonly group: GroupRef;
+  readonly groupRoot: GroupRoot;
+  /** Runs of the memtable's own puts per index, oldest first (replay may hold several). */
+  readonly runs: ReadonlyMap<number, readonly RunRef[]>;
+  /** Held while the staged group can be read through this memtable. */
+  readonly pin: SpacePin;
+  /** Every extent written for it (group, runs, tail bitmap): retired if the staging is dropped. */
+  readonly extents: readonly ExtentRef[];
+}
+
 export interface Published {
   readonly group: GroupRef;
   readonly groupRoot: GroupRoot;
@@ -61,8 +87,12 @@ export class Memtable {
   readonly deletions = new Map<number, number>();
   #markRows: number[] = [];
   #markSeqs: number[] = [];
-  state: "live" | "frozen" | "published" = "live";
+  state: "live" | "frozen" | "staged" | "published" = "live";
   published: Published | null = null;
+  /** Set once staged (see "Staged"); kept after a fold for its runs. */
+  staged: StagedPart | null = null;
+  /** Rows the staged group stores (≥ `rowCount`: a rollback truncates the marks only). */
+  storedRows = 0;
   readonly #counter: Counter;
   /** Readers borrowing each chunk index (memory segments: one chunk at a time each). */
   readonly #borrows = new Map<number, number>();
@@ -126,6 +156,34 @@ export class Memtable {
     for (const chunks of this.#lent.values())
       for (const stored of chunks) total += stored.chargedBytes;
     return total;
+  }
+
+  /** One past the last row id this memtable holds or held (staged rows keep their ids). */
+  get rowIdEnd(): number {
+    return this.firstRowId + Math.max(this.rowCount, this.storedRows);
+  }
+
+  /**
+   * One past the last row id a view with `bound` sees here: a staged run's entry is visible iff
+   * its row id is below it (runs carry no seq). Infinity when every row is visible.
+   */
+  visibleRowIdEnd(bound: number): number {
+    const visible = this.visibleRows(bound);
+    return visible >= this.rowCount && this.storedRows <= this.rowCount
+      ? Infinity
+      : this.firstRowId + visible;
+  }
+
+  /** Replaces the key deltas (staging keeps only entries that are not its own puts). */
+  replaceDeltas(deltas: ReadonlyMap<number, KeyDelta>): void {
+    for (const delta of this.deltas.values()) delta.releaseCharge();
+    this.deltas.clear();
+    for (const [indexId, delta] of deltas) this.deltas.set(indexId, delta);
+  }
+
+  /** A key delta charged to this memtable (staging's residual deltas). */
+  newDelta(): KeyDelta {
+    return new KeyDelta(this.#counter);
   }
 
   get capacity(): number {
@@ -281,6 +339,7 @@ export class Memtable {
 
   /** Returns every charged byte (the memtable is gone: dropped table, closed write path). */
   releaseAll(): void {
+    this.staged?.pin.release(); // idempotent
     for (const list of this.chunks) for (const stored of list) stored.releaseCharge();
     for (const chunks of this.#lent.values()) for (const stored of chunks) stored.releaseCharge();
     this.#lent.clear();
