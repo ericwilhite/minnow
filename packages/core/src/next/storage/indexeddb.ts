@@ -281,10 +281,12 @@ class TrackedConnection implements IdbDatabaseLike {
         else body(tx);
       });
       // The platform's own end (complete or abort), even after a release gave up on it.
-      const ended = () => {
-        issued.ended();
-      };
-      created.then(ended, ended);
+      if (this.#observe !== null) {
+        const ended = () => {
+          issued.ended();
+        };
+        created.then(ended, ended);
+      }
       return created;
     };
     const run = new Promise<void>((resolve, reject) => {
