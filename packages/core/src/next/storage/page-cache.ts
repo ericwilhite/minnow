@@ -118,10 +118,10 @@ export interface CacheStats {
   readonly bytesRead: number;
 }
 
-/** The slab buffers a one-pass lease owns: its gap bytes, its blobs' bytes, its views. */
+/** The slab buffers a one-pass lease owns: its charge adjustment, its blobs' bytes, its views. */
 interface OwnedSlabs {
-  /** Bytes charged to the lease beyond its blobs: gaps inside slabs, or a pooled buffer's rest. */
-  gaps: number;
+  /** Signed adjustment from blob charges to backing bytes: negative for overlapping refs. */
+  chargeDelta: number;
   bytes: number;
   readonly views: Array<{ readonly bytes: Uint8Array; readonly checksum: number }>;
   /** The pooled buffer the lease's views live in (`ReadOptions.reuseBuffers`), or null. */
@@ -344,7 +344,7 @@ export class PageCache implements EvictableCacheLike {
     if (!budget.allocate(total)) throw new ReadDeniedError(total);
     const held: Entry[] = [];
     const resolved = new Map<string, Uint8Array>();
-    const owned: OwnedSlabs = { gaps: 0, bytes: 0, views: [], pooled: null };
+    const owned: OwnedSlabs = { chargeDelta: 0, bytes: 0, views: [], pooled: null };
     try {
       const misses: Array<{ readonly key: string; readonly ref: BlobRef }> = [];
       let uncharge = 0;
@@ -389,7 +389,7 @@ export class PageCache implements EvictableCacheLike {
     } catch (error) {
       this.#unpinAll(held, options.once === true);
       this.#pinnedBytes -= owned.bytes;
-      budget.free(total + owned.gaps);
+      budget.free(total + owned.chargeDelta);
       this.#givePooled(owned);
       throw error;
     }
@@ -411,7 +411,7 @@ export class PageCache implements EvictableCacheLike {
         }
         this.#unpinAll(held, options.once === true);
         this.#pinnedBytes -= owned.bytes;
-        budget.free(total + owned.gaps);
+        budget.free(total + owned.chargeDelta);
         this.#givePooled(owned);
       },
     };
@@ -500,7 +500,10 @@ export class PageCache implements EvictableCacheLike {
     const size = reuse ? poolClass(packed) : null;
     const extra = size === null ? gaps : size - members;
     if (extra > 0 && !budget.allocate(extra)) throw new ReadDeniedError(extra);
-    owned.gaps = extra;
+    // read() charged distinct reference lengths, which can exceed their buffer's union.
+    // Apply both signs, so release/error cleanup frees exactly the net allocation.
+    if (extra < 0) budget.free(-extra);
+    owned.chargeDelta = extra;
     owned.bytes = members;
     this.#pinnedBytes += members;
     if (size !== null) owned.pooled = this.#takePooled(size);

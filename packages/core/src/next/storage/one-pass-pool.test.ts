@@ -38,9 +38,29 @@ const refs: BlobRef[] = lengths.map((length, k) => ({
   checksum: xxHash32(data.subarray(k * 65_536, k * 65_536 + length)),
 }));
 
-function cache(deny: () => boolean = () => false, poolIdleBytes = POOL_IDLE_BYTES) {
+/** Distinct shifted or nested references; identity deduplication cannot remove their overlap. */
+function overlappingRefs(nested = false, group = 0): BlobRef[] {
+  const extent = { offset: group * 131072, length: 131072 };
+  return [0, 1, 2].map((k) => {
+    const offset = nested ? (k === 2 ? 8 : 0) : k * 8;
+    const length = nested ? 65536 / 2 ** k : 65536;
+    return {
+      extent,
+      offset,
+      length,
+      checksum: xxHash32(data.subarray(extent.offset + offset, extent.offset + offset + length)),
+    };
+  });
+}
+
+function cache(
+  deny: () => boolean = () => false,
+  poolIdleBytes = POOL_IDLE_BYTES,
+  failRead: () => boolean = () => false,
+) {
   const session = {
     readDataInto(at: number, out: Uint8Array): Promise<void> {
+      if (failRead()) throw new Error("injected pool read");
       out.set(data.subarray(at, at + out.length));
       return Promise.resolve();
     },
@@ -115,6 +135,45 @@ describe("the one-pass buffer pool", () => {
     expect(memory.used).toBe(0);
   });
 
+  it.each(["release", "read error", "checksum error", "close held", "refusal"] as const)(
+    "balances the reviewer's overlapping refs after %s",
+    async (mode) => {
+      const { pages, memory } = cache(
+        () => false,
+        POOL_IDLE_BYTES,
+        () => mode === "read error",
+      );
+      const budget = countingBudget(mode === "refusal" ? 1 : Infinity);
+      const input = overlappingRefs().map((ref, k) =>
+        mode === "checksum error" && k === 2 ? { ...ref, checksum: (ref.checksum + 1) >>> 0 } : ref,
+      );
+      try {
+        const read = pages.read(input, { budget, once: true, reuseBuffers: true });
+        if (mode === "read error" || mode === "checksum error" || mode === "refusal") {
+          await expect(read).rejects.toThrow(
+            mode === "refusal" ? /denied|budget|bytes/u : /injected|checksum/u,
+          );
+          expect(budget.used).toBe(0);
+        } else {
+          const lease = await read;
+          expect(defined(lease.bytes[0]).buffer.byteLength).toBe(131072);
+          expect(budget.used).toBe(131072);
+          if (mode === "close held") pages.close();
+          lease.bytes.forEach((bytes, k) =>
+            expect(xxHash32(bytes)).toBe(defined(input[k]).checksum),
+          );
+          lease.release();
+          lease.release();
+          expect(budget.used).toBe(0);
+        }
+      } finally {
+        pages.close();
+      }
+      expect(budget.used).toBe(0);
+      expect(memory.used).toBe(0);
+    },
+  );
+
   it("poisons a released buffer in test builds: a stale view reads garbage", async () => {
     const { pages } = cache();
     const lease = await pages.read([defined(refs[7])], reused);
@@ -134,6 +193,10 @@ const reach = createReach("next-one-pass-pool", [
   "a released buffer dropped (governor refused)",
   "idle buffers evicted",
   "a read without reuse",
+  "shifted overlapping refs",
+  "nested overlapping refs",
+  "overlap read failure cleaned",
+  "close with overlapping lease held",
 ]);
 afterAll(() => {
   reach.assertReached();
@@ -151,9 +214,15 @@ describe.each(SEEDS)("the one-pass buffer pool under random use (seed %i)", (see
       let deny = false;
       // A small pool, so it fills: at most four 64 KiB buffers idle.
       const limit = 4 * POOL_MIN_BUFFER;
-      const { pages, memory } = cache(() => deny, limit);
+      let failRead = false;
+      const { pages, memory } = cache(
+        () => deny,
+        limit,
+        () => failRead,
+      );
       const budget = countingBudget(Number.POSITIVE_INFINITY);
-      const held: Array<{ lease: ReadLease; ids: number[]; charged: number }> = [];
+      const held: Array<{ lease: ReadLease; refs: BlobRef[]; charged: number; overlap: boolean }> =
+        [];
       const where = (step: number) =>
         `seed ${String(seed)} history ${String(history)} step ${String(step)}`;
       for (let step = 0; step < 120; step++) {
@@ -164,21 +233,33 @@ describe.each(SEEDS)("the one-pass buffer pool under random use (seed %i)", (see
           const ids = Array.from({ length: count }, () => random(BLOBS));
           const reuse = random(5) !== 0;
           if (!reuse) reach.reach("a read without reuse");
+          const overlap = reuse && random(4) === 0;
+          const nested = random(2) === 0;
+          const input = overlap
+            ? overlappingRefs(nested, random(31))
+            : ids.map((id) => defined(refs[id]));
+          if (overlap) reach.reach(nested ? "nested overlapping refs" : "shifted overlapping refs");
+          failRead = overlap && random(4) === 0;
           const poolBefore = pages.stats.poolBytes;
           const usedBefore = budget.used;
-          const lease = await pages.read(
-            ids.map((id) => defined(refs[id])),
-            { budget, once: true, reuseBuffers: reuse },
-          );
-          const charged = budget.used - usedBefore;
-          if (reuse) {
-            const size = defined(lease.bytes[0]).buffer.byteLength;
-            if (size > POOL_MIN_BUFFER) reach.reach("a larger size class");
-            if (pages.stats.poolBytes < poolBefore) reach.reach("a pooled buffer reused");
-            else if (held.length > 0) reach.reach("a new buffer while others are held");
-            expect(charged, where(step)).toBe(size);
+          const read = pages.read(input, { budget, once: true, reuseBuffers: reuse });
+          if (failRead) {
+            await expect(read).rejects.toThrow("injected pool read");
+            expect(budget.used, where(step)).toBe(usedBefore);
+            reach.reach("overlap read failure cleaned");
+          } else {
+            const lease = await read;
+            const charged = budget.used - usedBefore;
+            if (reuse) {
+              const size = defined(lease.bytes[0]).buffer.byteLength;
+              if (size > POOL_MIN_BUFFER) reach.reach("a larger size class");
+              if (pages.stats.poolBytes < poolBefore) reach.reach("a pooled buffer reused");
+              else if (held.length > 0) reach.reach("a new buffer while others are held");
+              expect(charged, where(step)).toBe(size);
+            }
+            held.push({ lease, refs: input, charged, overlap });
           }
-          held.push({ lease, ids, charged });
+          failRead = false;
         } else if (op < 8 && held.length > 0) {
           const [gone] = held.splice(random(held.length), 1);
           if (gone === undefined) continue;
@@ -196,14 +277,18 @@ describe.each(SEEDS)("the one-pass buffer pool under random use (seed %i)", (see
           reach.reach("idle buffers evicted");
         }
         // Every held lease still has its own verified bytes: nothing it holds was reused.
-        for (const { lease, ids } of held)
+        for (const { lease, refs: input } of held)
           lease.bytes.forEach((bytes, k) => {
-            expect(xxHash32(bytes), where(step)).toBe(defined(refs[ids[k] ?? 0]).checksum);
+            expect(xxHash32(bytes), where(step)).toBe(defined(input[k]).checksum);
           });
         // The leases pay for what they hold; the cache for the fixed slabs and idle buffers.
         expect(budget.used, where(step)).toBe(held.reduce((sum, { charged }) => sum + charged, 0));
         expect(memory.used, where(step)).toBe(FIXED_CACHE_BYTES + pages.stats.poolBytes);
         expect(pages.stats.poolBytes).toBeLessThanOrEqual(limit);
+      }
+      if (history % 2 === 0) {
+        if (held.some((item) => item.overlap)) reach.reach("close with overlapping lease held");
+        pages.close();
       }
       for (const { lease } of held.splice(0)) lease.release();
       pages.close();

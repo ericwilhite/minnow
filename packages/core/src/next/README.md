@@ -464,7 +464,8 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     not profiled; released one-pass buffers waiting for the collector are the likely cause).
   - One-pass page buffers are pooled (`ReadOptions.reuseBuffers`, increment 10): a one-pass read
     of pages packs its slabs into one pooled buffer (power-of-two sizes from 64 KiB to 16 MiB),
-    charged whole to its lease; on release the buffer returns to the pool, charged to the cache
+    charged whole to its lease (overlapping references refund their excess initial charge); on
+    release the buffer returns to the pool, charged to the cache
     while idle (at most 64 MiB, evicted first, dropped when the governor refuses) and poisoned in
     test builds. Readers ask for it for page loads only, never a dictionary or a value they hand
     out past its lease: an inline `valueParts` stream retains the page's shared read lease until
