@@ -14,7 +14,7 @@
 import { describe, expect, it } from "vitest";
 import { PageEncoding } from "../format/manifest.js";
 import type { FlatVector } from "../vector/vector.js";
-import { decodeRange, parsePage } from "./decode.js";
+import { decodeRange, gatherRows, parsePage } from "./decode.js";
 import { encodeFloatPage, PageScratch } from "./encode.js";
 import { PageCorruptionError, ValueTag } from "./format.js";
 import { ChunkReader } from "./reader.js";
@@ -115,5 +115,34 @@ describe("review B2-p2i #3: loadTogether with a reader more than once", () => {
     reader.decodeRange(0, 128, target, 0);
     reader.close();
     expect(used).toBe(0);
+  });
+});
+
+describe("review B2-p2i-2 #1: empty ranges of a constant float page", () => {
+  it("empty decode and gather of float constants are no-ops (the reviewer's test)", () => {
+    for (const values of [new Float64Array(8).fill(42), new Float32Array(8).fill(42)]) {
+      const wide = values instanceof Float64Array;
+      const encoded = encodeFloatPage(values, null, 8, new DistinctSketch(), new PageScratch());
+      expect(encoded.encoding).toBe(PageEncoding.constant);
+      const entry = {
+        ...encoded,
+        firstRow: 0,
+        offset: 0,
+        length: encoded.bytes.length,
+        checksum: 0,
+      };
+      const view = parsePage(encoded.bytes, entry, wide ? ValueTag.f64 : ValueTag.f32);
+      const out = wide ? new Float64Array(1).fill(99) : new Float32Array(1).fill(99);
+      const target = {
+        form: "flat",
+        type: { kind: wide ? "float64" : "float32" },
+        length: 1,
+        validity: null,
+        data: wide ? { layout: "f64", values: out } : { layout: "f32", values: out },
+      } as FlatVector;
+      expect(() => decodeRange(view, 0, 0, target, 0)).not.toThrow();
+      expect(() => gatherRows(view, new Uint32Array(), 0, 0, 0, target, 0)).not.toThrow();
+      expect(out[0]).toBe(99); // nothing written
+    }
   });
 });

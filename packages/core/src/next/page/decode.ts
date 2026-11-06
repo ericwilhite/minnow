@@ -1404,7 +1404,9 @@ function decodeValues(
       if (view.allNull) return;
       const out = data.values;
       if (view.kind === PageEncoding.constant) {
-        // Copied as bytes, never through a JS number: the constant keeps its bit pattern.
+        // Copied as bytes, never through a JS number: the constant keeps its bit pattern. An
+        // empty range (checkRange allows from === to) copies nothing (review B2-p2i-2 #1).
+        if (count === 0) return;
         const width = data.layout === "f64" ? 8 : 4;
         const lane = new Uint8Array(out.buffer, out.byteOffset + at * width, count * width);
         lane.set(view.bytes.subarray(view.start, view.start + width));
