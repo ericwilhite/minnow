@@ -738,6 +738,32 @@ interface Resume extends ProbeResume {
 /** Resolution of one key across the view's layers. */
 const NO_RUNS: readonly RunRef[] = [];
 
+/** A fresh single key beyond every other layer needs no constraint-check snapshot. */
+export function otherIndexLayersEndBefore(
+  table: TableView,
+  indexId: number,
+  key: Uint8Array,
+  own: KeyDelta,
+): boolean {
+  const before = (max: Uint8Array) => compareBytes(max, 0, max.length, key, 0, key.length) < 0;
+  for (const run of table.runs.get(indexId) ?? NO_RUNS) if (!before(run.maxKey)) return false;
+  for (const memtable of table.memtables) {
+    for (const run of memtable.staged?.runs.get(indexId) ?? NO_RUNS)
+      if (!before(run.maxKey)) return false;
+    const published = memtable.published;
+    if (published !== null && memtable.deltasDropped) {
+      const run = published.runs.get(indexId);
+      if (run !== undefined && !before(run.maxKey)) return false;
+      continue;
+    }
+    const delta = memtable.deltas.get(indexId);
+    if (delta === undefined || delta === own) continue;
+    const range = delta.keyRange();
+    if (range !== null && !before(range.max)) return false;
+  }
+  return true;
+}
+
 export class ViewIndex implements IndexReader {
   /** Row ids a newer layer tombstoned (made on the first tombstone). */
   #deadRows: Set<number> | null = null;

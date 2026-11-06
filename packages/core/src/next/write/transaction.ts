@@ -54,7 +54,12 @@ import type { KeyDelta } from "./key-hash.js";
 import type { Memtable } from "./memtable.js";
 import { readRows } from "./rows.js";
 import type { GroupDeletes, Shared, WriteState } from "./state.js";
-import { SnapshotImpl, ViewIndex, type TableSnapshotImpl } from "./view.js";
+import {
+  SnapshotImpl,
+  ViewIndex,
+  otherIndexLayersEndBefore,
+  type TableSnapshotImpl,
+} from "./view.js";
 import { need } from "./bytes.js";
 
 /** Everything committed and pending (constraint checks see the whole transaction). */
@@ -1164,7 +1169,10 @@ export class TableWriterImpl implements TableWriter {
         count: added,
       });
       if (!index.unique) continue;
-      const check = this.#suspect(index, delta, first, delta.entryCount);
+      const check =
+        added === 1
+          ? this.#suspectOne(index, delta, first)
+          : this.#suspect(index, delta, first, delta.entryCount);
       if (check !== undefined) (checks ??= []).push(check);
     }
     return checks === null ? undefined : Promise.all(checks).then(() => undefined);
@@ -1175,6 +1183,21 @@ export class TableWriterImpl implements TableWriter {
    * (re-verified at the end of the statement). The keys are read from the delta's arena, which
    * keeps them (no copies).
    */
+  #suspectOne(index: IndexDef, delta: KeyDelta, from: number): Promise<void> | undefined {
+    // Retained writers across DDL keep the existing catalog/view checks.
+    if (this.statement.catalog.table(this.tableId) !== this.def)
+      return this.#suspect(index, delta, from, from + 1);
+    const slot = delta.keyOf(from);
+    if (delta.head(slot) === from && delta.nextEntry(from) < 0) {
+      const key = delta.keyBytes(slot);
+      const table = need(this.statement.tx.hooks.state().tables.get(this.tableId));
+      // A synchronous range/chain proof needs no snapshot, pin, reader or skipped-run Set.
+      if (otherIndexLayersEndBefore(table, index.id, key, delta)) return undefined;
+    }
+    return this.#suspect(index, delta, from, from + 1);
+  }
+
+  /** The existing batch checker, with the single-key proof outside its hot body. */
   #suspect(index: IndexDef, delta: KeyDelta, from: number, to: number): Promise<void> | undefined {
     const current = this.statement.current();
     const reader = new ViewIndex(nonUnique(index), current.internalTable(this.tableId));
