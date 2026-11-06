@@ -28,7 +28,7 @@
  * - **Snapshots:** `pin(label)` under each access/ snapshot; `stats` for backpressure (garbage
  *   debt, oldest pin).
  * - **Startup** (storage/contract.ts "Startup order", rulings R13/R16.6): fence → store session →
- *   extent space (walks the current and previous roots) → write path (the single log scan,
+ *   extent space (reads the current and previous roots' extent lists) → write path (the single log scan,
  *   truncation and replay) → spill sweep → ready. The space reads no log.
  *
  * ## Units
@@ -280,7 +280,8 @@ export interface OpenSpaceOptions {
 
 /**
  * Opens the space over a freshly opened store session, before the write path's log scan
- * (storage/contract.ts "Startup order"): reads the current and previous roots, walks both, builds
+ * (storage/contract.ts "Startup order"): reads the current and previous roots, reads what each
+ * reaches (its extent list, ruling R25), builds
  * the free map, retires
  * what only the previous root reaches (`ReclaimLedger.retireAtOpen`), returns the free tail. The
  * walks read O(groups + index runs) metadata, coalesced. Nothing is written but the tail release.

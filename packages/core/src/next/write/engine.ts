@@ -99,6 +99,7 @@ import { encodeKeyBatch, KeyBatch } from "../keys/key-encoding.js";
 import type { Grant } from "../memory/governor.js";
 import { GroupWriter } from "../page/writer.js";
 import type { StoreSession } from "../storage/contract.js";
+import { ExtentListKeeper, type ExtentList, type PreparedList } from "../storage/extent-list.js";
 import type { ExtentWriter } from "../storage/extents.js";
 import type { StatValue } from "../types.js";
 import { layoutOf } from "../types.js";
@@ -458,6 +459,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
   #recycling: Promise<void> | null = null;
   readonly #idleGarbageBytes: number;
   readonly #extentDeltas: ExtentDeltaSink | null;
+  /** Ruling R25: the committed extent list every root this write path publishes carries. */
+  readonly #lists: ExtentListKeeper;
   readonly #afterDeltaPrepared: ((kind: PublicationKind, sequence: number) => void) | null;
   readonly #stageFault: NonNullable<EngineInput["tuning"]>["stageFault"] | null;
   /** R25 attempts so far (the initial root of a new store was attempt 1). */
@@ -560,9 +563,14 @@ export class WritePathImpl implements WritePath, EngineHooks {
     grant: Grant,
     root: ManifestRoot,
     catalog: Catalog,
-    metadata: { readonly grant: Grant; readonly rootCharge: number },
+    metadata: {
+      readonly grant: Grant;
+      readonly rootCharge: number;
+      readonly lists: ExtentListKeeper;
+    },
   ) {
     this.#metadataGrant = metadata.grant;
+    this.#lists = metadata.lists;
     this.#roots.set(root, { refs: 1, bytes: metadata.rootCharge });
     this.durability = input.options.durability;
     this.#memtableRows = input.tuning?.memtableRows ?? MEMTABLE_ROWS;
@@ -648,7 +656,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
       let rootCharge = 0;
       let root: ManifestRoot;
       let catalog: Catalog;
+      let lists: ExtentListKeeper;
       if (space.root === null) {
+        lists = new ExtentListKeeper([], { reader: space, budget: grant });
         catalog = Catalog.empty();
         const writer = space.beginWrite("initial root");
         const written = await writer.write([catalog.encode()]);
@@ -665,12 +675,14 @@ export class WritePathImpl implements WritePath, EngineHooks {
           sequences: [],
           tables: [],
           clients: [],
+          extentList: [],
         };
         await session.resetLog();
         const sink: { failure: ExtentSinkError | null } = { failure: null };
         const delta = new DeltaPublication(
           "initial",
           input.extentDeltas ?? null,
+          lists,
           () => 1,
           input.tuning?.afterDeltaPrepared ?? null,
           (error) => {
@@ -679,7 +691,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         );
         let failed: unknown = null;
         try {
-          await delta.prepare(root.sequence, writer, []);
+          root = { ...root, extentList: await delta.prepare(root.sequence, writer, []) };
           const bytes = encodeManifestRoot(root);
           rootCharge = parseCharge(bytes.length);
           if (!metadataGrant.allocate(rootCharge)) throw new ParseBudgetError(rootCharge);
@@ -700,11 +712,14 @@ export class WritePathImpl implements WritePath, EngineHooks {
         const parsed = decodeManifestRoot(space.root, metadataGrant);
         rootCharge = parsed.charge;
         root = parsed.value;
+        // Built from the durable root's list, never from earlier callbacks (ruling R25).
+        lists = new ExtentListKeeper(root.extentList, { reader: space, budget: grant });
         catalog = Catalog.decode(await readBlob(space, root.catalog, grant));
       }
       const engine = new WritePathImpl(input, grant, root, catalog, {
         grant: metadataGrant,
         rootCharge,
+        lists,
       });
       await engine.#load();
       await engine.#recover();
@@ -2200,6 +2215,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const delta = new DeltaPublication(
       "flush",
       this.#extentDeltas,
+      this.#lists,
       this.#nextAttempt,
       this.#afterDeltaPrepared,
       this.#sinkFailed,
@@ -2414,8 +2430,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
           .filter((index): index is IndexRoot => index !== null),
         statistics,
       };
-      const root = await this.#nextRoot(writer, retired, new Map([[state.tableId, tableRoot]]));
-      await delta.prepare(root.sequence, writer, retired);
+      let root = await this.#nextRoot(writer, retired, new Map([[state.tableId, tableRoot]]));
+      root = await this.#listed(root, (sequence) => delta.prepare(sequence, writer, retired));
       const rootBytes = encodeManifestRoot(root);
       // The resident state this publish adds (page index growth, the new root) is charged first.
       // The pending publication owns both charges across the await (review B3-p2a-3 #3): they
@@ -3111,6 +3127,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const delta = new DeltaPublication(
       "idle",
       this.#extentDeltas,
+      this.#lists,
       this.#nextAttempt,
       this.#afterDeltaPrepared,
       this.#sinkFailed,
@@ -3123,8 +3140,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
         return;
       }
       const released: ExtentRef[] = [];
-      const root = await this.#nextRoot(writer, released, new Map());
-      await delta.prepare(root.sequence, writer, released);
+      let root = await this.#nextRoot(writer, released, new Map());
+      root = await this.#listed(root, (sequence) => delta.prepare(sequence, writer, released));
       const bytes = encodeManifestRoot(root);
       const charge = parseCharge(bytes.length);
       this.#chargeMetadata(charge);
@@ -3206,6 +3223,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const delta = new DeltaPublication(
       "recycle",
       this.#extentDeltas,
+      this.#lists,
       this.#nextAttempt,
       this.#afterDeltaPrepared,
       this.#sinkFailed,
@@ -3287,14 +3305,15 @@ export class WritePathImpl implements WritePath, EngineHooks {
       const sequence = this.#root.sequence + 1;
       const incarnation = { salt, firstLsn: cut + 1, rootSequence: sequence };
       const retired: ExtentRef[] = [];
-      const root = await this.#nextRoot(writer, retired, quiet, incarnation);
+      let root = await this.#nextRoot(writer, retired, quiet, incarnation);
       if (
         root.globalLsn !== cut ||
         root.tables.some((table) => table.flushedThroughLsn < cut) ||
         root.sequence !== sequence
       )
         throw new RangeError("A log recycle's root does not cover the log it would reset");
-      await delta.prepare(root.sequence, writer, retired);
+      const recycling = writer;
+      root = await this.#listed(root, (sequence) => delta.prepare(sequence, recycling, retired));
       const rootBytes = encodeManifestRoot(root);
       const rootCharge = parseCharge(rootBytes.length);
       this.#chargeMetadata(rootCharge);
@@ -3466,6 +3485,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const delta = new DeltaPublication(
       "merge",
       this.#extentDeltas,
+      this.#lists,
       this.#nextAttempt,
       this.#afterDeltaPrepared,
       this.#sinkFailed,
@@ -3522,8 +3542,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
         secondaryIndexes: root.secondaryIndexes.map(withRuns),
       };
       const retired: ExtentRef[] = inputs.map(runExtent);
-      const next = await this.#nextRoot(writer, retired, new Map([[state.tableId, tableRoot]]));
-      await delta.prepare(next.sequence, writer, retired);
+      let next = await this.#nextRoot(writer, retired, new Map([[state.tableId, tableRoot]]));
+      next = await this.#listed(next, (sequence) => delta.prepare(sequence, writer, retired));
       const rootBytes = encodeManifestRoot(next);
       const rootCharge = parseCharge(rootBytes.length);
       this.#chargeMetadata(rootCharge);
@@ -3867,10 +3887,27 @@ export class WritePathImpl implements WritePath, EngineHooks {
       sequences: this.sequences.checkpoint(globalLsn),
       tables,
       clients,
+      // Replaced by the publication's prepared list (`#listed`) before it is encoded.
+      extentList: this.#root.extentList,
     };
     if (settled.size > 0) this.#settles.set(next, settled.size);
     if (drained.length > 0) this.#drainedBy.set(next, drained);
     return next;
+  }
+
+  /**
+   * `root` with the extent list its publication prepared (ruling R25): the list is prepared once
+   * the root's contents are fixed, and the root is encoded with it. What `#settles` holds for the
+   * root moves to the listed one.
+   */
+  async #listed(
+    root: ManifestRoot,
+    prepare: (sequence: number) => Promise<ExtentList>,
+  ): Promise<ManifestRoot> {
+    const listed: ManifestRoot = { ...root, extentList: await prepare(root.sequence) };
+    const settles = this.#settles.get(root);
+    if (settles !== undefined) this.#settles.set(listed, settles);
+    return listed;
   }
 
   /** Every extent one table of the current root reaches (for a dropped table's retirement). */
@@ -3891,7 +3928,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
         this.#check();
         this.#signal?.throwIfAborted();
       }
-      if (reached.kind === "catalog") continue;
+      // The table's own structures only: not the catalog, nor the root's extent list pages.
+      if (reached.tableId === null) continue;
       const extent = "extent" in reached.ref ? reached.ref.extent : reached.ref;
       const key = `${String(extent.offset)}:${String(extent.length)}`;
       if (!seen.has(key)) {
@@ -4095,23 +4133,32 @@ class DeltaPublication {
   #attempt: number | null = null;
   #sequence = 0;
   #durable = false;
+  /** The keeper holds a prepared list for the attempt; the sink was asked to prepare. */
+  #listPrepared = false;
+  #sinkAsked = false;
 
   constructor(
     readonly kind: PublicationKind,
     readonly sink: ExtentDeltaSink | null,
+    /** Ruling R25: the write path's own extent list, carried by every root it publishes. */
+    readonly lists: ExtentListKeeper,
     readonly nextAttempt: () => number,
     readonly afterPrepared: ((kind: PublicationKind, sequence: number) => void) | null,
     readonly fail: (error: ExtentSinkError) => void,
   ) {}
 
-  async prepare(sequence: number, writer: ExtentWriter, retired: ExtentRef[]): Promise<void> {
-    if (this.sink === null) return;
+  /**
+   * Prepares the attempt's extent list (its pages written into `writer`, the pages it replaces
+   * added to `retired`) and returns it for the root; then tells the sink, if any, the attempt's
+   * whole delta (the list pages included, so `added`/`released` stay exact for a full walk).
+   */
+  async prepare(sequence: number, writer: ExtentWriter, retired: ExtentRef[]): Promise<ExtentList> {
     const attempt = this.nextAttempt();
     this.#attempt = attempt;
     this.#sequence = sequence;
-    let result: ExtentDeltaResult | null;
+    let prepared: PreparedList;
     try {
-      result = await this.sink.prepare(attempt, {
+      prepared = await this.lists.prepare(attempt, {
         added: [...writer.extents],
         released: [...retired],
         writer,
@@ -4119,16 +4166,32 @@ class DeltaPublication {
     } catch (error) {
       throw new ExtentSinkError(error); // settle() aborts the attempt
     }
-    if (result !== null) {
-      if (result.pages.length > 0)
-        throw new ExtentSinkError(
-          new RangeError("The root cannot reference extent-list pages yet (R25's format part)"),
-        );
-      // Retired by this publication like `released`: held under R8 (both durable roots and every
-      // pin) before the space reuses them.
-      retired.push(...result.retire);
+    this.#listPrepared = true;
+    // Retired by this publication like `released`: held under R8 (both durable roots and every
+    // pin) before the space reuses them.
+    retired.push(...prepared.retire);
+    if (this.sink !== null) {
+      this.#sinkAsked = true;
+      let result: ExtentDeltaResult | null;
+      try {
+        result = await this.sink.prepare(attempt, {
+          added: [...writer.extents],
+          released: [...retired],
+          writer,
+        });
+      } catch (error) {
+        throw new ExtentSinkError(error); // settle() aborts the attempt
+      }
+      if (result !== null) {
+        if (result.pages.length > 0)
+          throw new ExtentSinkError(
+            new RangeError("The root's extent list is the write path's own (ruling R25)"),
+          );
+        retired.push(...result.retire);
+      }
     }
     this.afterPrepared?.(this.kind, sequence);
+    return prepared.list;
   }
 
   /** Publishes; a refused or rejected publish propagates (`settle` aborts the attempt). */
@@ -4146,7 +4209,20 @@ class DeltaPublication {
   settle(): void {
     const attempt = this.#attempt;
     this.#attempt = null;
-    if (attempt === null || this.sink === null) return;
+    if (attempt === null) return;
+    const listPrepared = this.#listPrepared;
+    const sinkAsked = this.#sinkAsked;
+    this.#listPrepared = false;
+    this.#sinkAsked = false;
+    try {
+      if (listPrepared) {
+        if (this.#durable) this.lists.commit(attempt, this.#sequence);
+        else this.lists.abort(attempt);
+      }
+    } catch (error) {
+      this.fail(new ExtentSinkError(error));
+    }
+    if (!sinkAsked || this.sink === null) return;
     try {
       if (this.#durable) this.sink.commit(attempt, this.#sequence);
       else this.sink.abort(attempt);

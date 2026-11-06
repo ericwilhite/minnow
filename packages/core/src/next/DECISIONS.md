@@ -108,8 +108,8 @@ rules, and the harness `["datetime"]` encoding at cut-over.
   by reference, and retires replaced page extents in the same publication (the R8 hold applies,
   as to `released`). Prepared lists are provisional until `commit`, dropped on `abort`, and the
   keeper is rebuilt from the durable root's list at every open.
-- **Stored format.** The root gains a field (the format track's manifest codec; increment 2 of
-  R25). No supported writer of rebuild-core roots exists: `next/` is unexported, and the package
+- **Stored format.** The root gains `extentList` (`format/manifest.ts`, manifest format 2; the
+  codec checks the pages' order and counts). No supported writer of rebuild-core roots exists: `next/` is unexported, and the package
   excludes `dist/next/**` (`files` in `packages/core/package.json`, checked by
   `scripts/package-shape.test.ts`), so no released build wrote one. Roots written by development
   builds and tests before R25 are refused at open rather than upgraded; pre-reset data is refused

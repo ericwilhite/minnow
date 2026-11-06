@@ -580,7 +580,7 @@ describe("out-of-line values", () => {
     ]);
     const catalog = defined((await writer.write([new Uint8Array(4)])).blobs[0]);
     const manifest: ManifestRoot = {
-      formatVersion: 1,
+      formatVersion: 2,
       sequence: 1,
       epoch: 1,
       log: { salt: 1, firstLsn: 1, rootSequence: 1 },
@@ -605,6 +605,7 @@ describe("out-of-line values", () => {
         },
       ],
       clients: [],
+      extentList: [],
     };
     const key = (extent: { offset: number; length: number }): string =>
       `${String(extent.offset)}:${String(extent.length)}`;

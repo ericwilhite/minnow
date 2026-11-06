@@ -126,7 +126,7 @@ describe("manifest metadata end to end", () => {
     const catalog = defined((await writer.write([encoder.encode('{"tables":[]}')])).blobs[0]);
     const empty: BlobRef = { extent: { offset: 0, length: 0 }, offset: 0, length: 0, checksum: 0 };
     const root: ManifestRoot = {
-      formatVersion: 1,
+      formatVersion: 2,
       sequence: 1,
       epoch: 1,
       log: { salt: 7, firstLsn: 1, rootSequence: 1 },
@@ -137,6 +137,7 @@ describe("manifest metadata end to end", () => {
       sequences: [{ sequenceId: 1, reservedThrough: 100n }],
       tables: [table(1, directory.ref, 5, 3000), table(2, empty, 0)],
       clients: [],
+      extentList: [],
     };
     const budget = tracked();
     const yielded = new Set<string>();
@@ -251,7 +252,7 @@ describe("manifest metadata end to end", () => {
     // The walk works over the same reader (a ManifestReader).
     const found = await reachable(
       {
-        formatVersion: 1,
+        formatVersion: 2,
         sequence: 1,
         epoch: 1,
         log: { salt: 1, firstLsn: 1, rootSequence: 1 },
@@ -262,6 +263,7 @@ describe("manifest metadata end to end", () => {
         sequences: [],
         tables: [],
         clients: [],
+        extentList: [],
       },
       manifestReader(reader, budget),
     );

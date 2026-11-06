@@ -34,6 +34,7 @@
  * a time, each released (its parse charge returned) when the walk moves past it. Data pages are
  * never read.
  */
+import { listedExtents } from "../storage/extent-list.js";
 import type { BlobRef, ByteBudget, ExtentReader, ExtentRef } from "../storage/extents.js";
 import { valid } from "./bytes.js";
 import {
@@ -72,6 +73,7 @@ export interface ManifestReader {
 
 export type ReachableKind =
   | "catalog"
+  | "extent-list-page"
   | "table-statistics"
   | "group-directory"
   | "staged-group-directory"
@@ -122,6 +124,8 @@ export async function* walkReachable(
 ): AsyncGenerator<Reached> {
   const concurrency = Math.max(1, options.concurrency ?? 32);
   yield { ref: root.catalog, kind: "catalog", tableId: null };
+  for (const page of root.extentList)
+    yield { ref: page.blob, kind: "extent-list-page", tableId: null };
   for (const table of root.tables) {
     const tableId = table.tableId;
     if (table.statistics !== null)
@@ -340,6 +344,28 @@ export function reachableExtents(
         last = extent;
         yield "checksum" in ref ? ref : extent;
       }
+    } finally {
+      budget.free(manifest.charge);
+    }
+  };
+}
+
+/**
+ * Startup's source of what a root reaches (ruling R25), in the shape the extent space opens with:
+ * the root's extent list, read page by page (storage/extent-list.ts `listedExtents`). No group
+ * root is read. `reachableExtents` is the full walk the audit checks it against.
+ */
+export function listedRootExtents(
+  codecs: Pick<ManifestCodecs, "decodeRoot"> = MANIFEST_CODECS,
+): (
+  root: Uint8Array,
+  reader: ExtentReader,
+  budget: ByteBudget,
+) => AsyncIterable<BlobRef | ExtentRef> {
+  return async function* listed(root, reader, budget) {
+    const manifest = codecs.decodeRoot(root, budget);
+    try {
+      yield* listedExtents(manifest.value.extentList, reader, budget);
     } finally {
       budget.free(manifest.charge);
     }

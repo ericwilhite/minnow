@@ -33,6 +33,7 @@
  * bigints are minimal; ledger counts are in key order (`<` on UTF-16 code units). A blob over
  * its cap is refused before it is charged.
  */
+import { LIST_PAGE_EXTENTS, type ExtentListPage } from "../storage/extent-list.js";
 import { MAX_BLOB_BYTES } from "../storage/extents.js";
 import type { ByteBudget, ExtentWriter } from "../storage/extents.js";
 import type { ColumnStatistics, PhysicalType, StatValue } from "../types.js";
@@ -928,6 +929,12 @@ export function encodeManifestRoot(root: ManifestRoot): Uint8Array {
   for (const table of root.tables) writeTable(out, table);
   body.uint(root.clients.length);
   for (const client of root.clients) writeClient(body, client);
+  body.uint(root.extentList.length);
+  for (const page of root.extentList) {
+    out.blob(page.blob);
+    body.uint(page.first);
+    body.uint(page.count);
+  }
   return out.finish(MAGIC.root, MAX_ROOT_BYTES, "A manifest root");
 }
 
@@ -939,8 +946,14 @@ export function decodeManifestRoot(bytes: Uint8Array, budget: ByteBudget): Parse
       const refs = new RefReader(reader, MAGIC.root, "manifest root");
       const formatVersion = reader.uint();
       valid(
-        formatVersion >= 1 && formatVersion <= MANIFEST_FORMAT_VERSION,
+        formatVersion <= MANIFEST_FORMAT_VERSION,
         `Manifest format ${String(formatVersion)} is newer than this build reads`,
+      );
+      // Format 1 predates the extent list (ruling R25): only development builds wrote it, so it
+      // is refused rather than upgraded (DECISIONS.md "R25").
+      valid(
+        formatVersion === MANIFEST_FORMAT_VERSION,
+        `Manifest format ${String(formatVersion)} was written by a development build before extent lists; no supported release reads it`,
       );
       const sequence = reader.uint();
       const epoch = reader.uint();
@@ -965,6 +978,19 @@ export function decodeManifestRoot(bytes: Uint8Array, budget: ByteBudget): Parse
       const clientCount = reader.count(3);
       const clients: ClientLedgerEntry[] = [];
       for (let k = 0; k < clientCount; k++) clients.push(readClient(reader));
+      const pageCount = reader.count(3);
+      const extentList: ExtentListPage[] = [];
+      for (let k = 0; k < pageCount; k++) {
+        const blob = refs.blob();
+        const first = reader.uint();
+        const count = reader.uint();
+        valid(count >= 1 && count <= LIST_PAGE_EXTENTS, "An extent list page has a bad count");
+        valid(
+          k === 0 || first > (extentList[k - 1]?.first ?? -1),
+          "The extent list's pages are not in offset order",
+        );
+        extentList.push({ blob, first, count });
+      }
       refs.end();
       return {
         formatVersion,
@@ -978,6 +1004,7 @@ export function decodeManifestRoot(bytes: Uint8Array, budget: ByteBudget): Parse
         sequences,
         tables,
         clients,
+        extentList,
       };
     },
     MAX_ROOT_BYTES,

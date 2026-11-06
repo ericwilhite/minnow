@@ -581,16 +581,24 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
   to their chunk's data blob.
 - Every reference carries the checksum of what it names (a chunk's pages carry theirs).
 - Space is reusable only when neither the current durable root, nor the previous one (the other
-  root slot), nor any pinned root reaches it (two generations), and startup walks both roots.
-- Startup order: acquire the fence → open the store session → open the extent space (walk the
-  current and previous roots) → open the write path (a single log scan and replay, `publishedRows`
+  root slot), nor any pinned root reaches it (two generations), and startup reads both roots'
+  extent lists (ruling R25: `ManifestRoot.extentList`, format 2; format 1 roots, written only by
+  development builds, are refused).
+- Startup order: acquire the fence → open the store session → open the extent space (read the
+  current and previous roots' extent lists) → open the write path (a single log scan and replay, `publishedRows`
   staging included) → spill sweep → ready.
 - Snapshot pins live in memory and are dropped when their client's lock is released.
 - `walkReachable(root, reader)` streams every reference a root reaches (catalog, table
   statistics, group directory indexes and pages, staged transactions' directories and index runs,
   group roots, deletion bitmaps, row-id columns, chunk data, page directories, sketches, index
-  entries, fences and Bloom filters); `reachableExtents()` is the extent space's
-  `ReachableExtents` over the real codecs. A failed metadata read rejects the walk.
+  entries, fences and Bloom filters) and the root's extent list pages; `reachableExtents()` is
+  that walk as the extent space's `ReachableExtents` over the real codecs, the audit's
+  cross-check. `listedRootExtents()` is what the space opens with: the root's extent list only,
+  no group root. A failed metadata read rejects either.
+- The write path keeps each root's extent list (`write/engine.ts`, an `ExtentListKeeper` built
+  from the durable root at open): it prepares the list once a root's contents are fixed, encodes
+  the root with it, and commits or aborts it with the publication. An injected `extentDeltas`
+  sink is told the whole delta, list pages included.
 
 ### Manifest codecs (`format/manifest-codec.ts`, `blob-cache.ts`, `metadata-reader.ts`)
 
