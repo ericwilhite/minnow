@@ -286,6 +286,42 @@ export async function brokerRoundTrips(
   return { count: times.length, p50: quantile(times, 0.5), p95: quantile(times, 0.95) };
 }
 
+/**
+ * R22.1's measurement: round trips to the broker carrying `bytes` of payload in four buffers,
+ * transferred and cloned, p50 µs per size. The smallest size where transferring wins is the
+ * engine's crossover; `TRANSFER_MIN_BYTES` should sit near it.
+ */
+export async function transferCrossover(sizes = [256, 1024, 4096, 16_384, 65_536], count = 600) {
+  const port = new SharedWorker(new URL("./broker-worker.ts", import.meta.url), {
+    type: "module",
+    name: "minnow-next-broker",
+  }).port;
+  const p50 = async (bytes: number, transfer: boolean) => {
+    const times: number[] = [];
+    for (let i = 0; i < count + 100; i++) {
+      const arrays = [0, 1, 2, 3].map(() => new Uint8Array(Math.max(1, bytes / 4)));
+      const start = performance.now();
+      await new Promise<void>((resolve) => {
+        port.onmessage = () => {
+          resolve();
+        };
+        port.postMessage(
+          { t: "ping", v: 1, nonce: i, arrays },
+          transfer ? arrays.map((array) => array.buffer) : [],
+        );
+      });
+      if (i >= 100) times.push((performance.now() - start) * 1000);
+    }
+    times.sort((a, b) => a - b);
+    return quantile(times, 0.5);
+  };
+  const rows: Array<{ bytes: number; transfer: number; clone: number }> = [];
+  for (const bytes of sizes)
+    rows.push({ bytes, transfer: await p50(bytes, true), clone: await p50(bytes, false) });
+  port.close();
+  return rows;
+}
+
 /** Whether this page has fine timers (cross-origin isolated), and the clock's observed step. */
 export function timerResolution(): { readonly isolated: boolean; readonly stepUs: number } {
   let step = Infinity;

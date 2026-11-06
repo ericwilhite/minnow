@@ -4,6 +4,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { ProtocolClient } from "../owner/client.js";
+import { RELEASE_DELAY_MS } from "../owner/protocol.js";
 import { flushUntil, harness, raw, seed, sleep } from "./owner-harness.js";
 
 /** A fake port for client-only probes: answers hello (and prepare) and records what is sent. */
@@ -270,8 +271,8 @@ describe("frames and their charge (findings 9, 10, 12)", () => {
     await sleep(10);
     expect(governor.usedBytes).toBeGreaterThan(0); // the spool, before the commit is durable
     expect((await flushUntil(writePath, insert)).rows()).toEqual([[1, 0, "a"]]);
-    await sleep(5);
-    expect(governor.usedBytes).toBe(0); // released on receipt, grant closed
+    await sleep(RELEASE_DELAY_MS + 10);
+    expect(governor.usedBytes).toBe(0); // released (standalone, nothing to ride on), grant closed
   });
 });
 

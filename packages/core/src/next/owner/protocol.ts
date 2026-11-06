@@ -39,10 +39,15 @@
  * - The owner pulls frames from the executor's result stream (exec/result.ts `ResultStream`) and
  *   posts each one as soon as it has it; frames already queued go out together in one message.
  *   The last frames ride in the terminal `done`, so a small result is one message.
- * - A frame stays charged to the owner until the client sends `release { target, through }` for
- *   it. The client releases a cursor frame when the caller takes it from the iterator, and a
- *   buffered result's frames as they arrive. Unreleased bytes reach the request's `windowBytes`
- *   and the executor pauses: a slow consumer costs one window, never a growing buffer.
+ * - A frame stays charged to the owner until the client releases it: in the `releases` of its
+ *   next request, or in a standalone `release { target, through }` when no request follows within
+ *   `RELEASE_DELAY_MS` or the unreleased bytes reach half the request's window (ruling R22.2; the
+ *   owner accepts both). The client releases a cursor frame when the caller takes it from the
+ *   iterator, and a buffered result's frames as they arrive. Unreleased bytes reach the request's
+ *   `windowBytes` and the executor pauses: a slow consumer costs one window, never a growing
+ *   buffer.
+ * - Messages whose buffers add up to less than `TRANSFER_MIN_BYTES` (frame.ts) are cloned, larger
+ *   ones transferred (ruling R22.1).
  * - RETURNING rows (ruling R2) are delivered only once the write is committed: for an autocommit
  *   write, after its commit is acknowledged per durability mode (strict: durable; relaxed:
  *   applied). Until then the executor keeps them in a charged, spillable spool and offers no
@@ -197,7 +202,7 @@ export type TransactionState = "idle" | "open" | "failed" | "timedOut";
 export const DEFAULT_TRANSACTION_IDLE_TIMEOUT_MS = 30_000;
 
 /** Bumped by every change to a message in this file or in frame.ts. */
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 /** The owner sends `alive` at least this often while a client has requests in flight. */
 export const ALIVE_INTERVAL_MS = 1_000;
@@ -205,6 +210,8 @@ export const ALIVE_INTERVAL_MS = 1_000;
 export const DEFAULT_UNRESPONSIVE_AFTER_MS = 10_000;
 /** Default result window: two frames of ~1 MiB, equal to the executor's `RESULT_WINDOW_BYTES`. */
 export const DEFAULT_RESULT_WINDOW_BYTES = 2 * 1024 * 1024;
+/** A release waits at most this long for a request to ride on (ruling R22.2). */
+export const RELEASE_DELAY_MS = 10;
 /** A non-live stream with frames unreleased this long is abandoned. */
 export const ABANDONED_STREAM_MS = 30_000;
 
@@ -256,6 +263,11 @@ export interface RequestHeader {
   readonly retry: boolean;
   /** The generation of the connection the request was first sent on (≤ the current one). */
   readonly generation: number;
+  /**
+   * Releases riding on this request (ruling R22.2): applied before the request runs, as if each
+   * had been a `release` signal. Absent or empty when none are pending.
+   */
+  readonly releases?: ReadonlyArray<{ readonly target: number; readonly through: number }>;
 }
 
 /**
@@ -696,6 +708,19 @@ export function parseClientMessage(value: unknown): ClientMessage {
       typeof header.retry !== "boolean"
     )
       throw new ProtocolError("Request live, resendable and retry must be booleans");
+    const releases = (header as { releases?: unknown }).releases;
+    if (
+      releases !== undefined &&
+      (!Array.isArray(releases) ||
+        releases.some(
+          (release: unknown) =>
+            typeof release !== "object" ||
+            release === null ||
+            !isSeq((release as { target?: unknown }).target) ||
+            typeof (release as { through?: unknown }).through !== "number",
+        ))
+    )
+      throw new ProtocolError("Request releases must be { target, through } pairs");
   }
   if (kind === "hello" && (value as Partial<Hello>).protocol === undefined)
     throw new ProtocolError("Hello without a protocol version");

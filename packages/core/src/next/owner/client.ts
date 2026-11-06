@@ -6,8 +6,9 @@
  * MessageChannel.
  *
  * ## Releases
- * A buffered result releases each frame as it arrives (`release { through }` once per message);
- * a cursor releases a frame when the caller takes it. Either way the owner's window, not this
+ * A buffered result releases its frames as they arrive, a cursor a frame when the caller takes it.
+ * Releases ride on the next request (`releases`), or go alone after `RELEASE_DELAY_MS` or once
+ * half the window is unreleased (ruling R22.2). Either way the owner's window, not this
  * client, bounds what is in flight.
  *
  * ## Reconnect
@@ -42,9 +43,16 @@ import {
   fromWireError,
   ownerErrorRegistry,
 } from "./errors.js";
-import { StreamDictionaries, type FramePayload, type WireFlat, type WireVector } from "./frame.js";
+import {
+  StreamDictionaries,
+  payloadBytes,
+  type FramePayload,
+  type WireFlat,
+  type WireVector,
+} from "./frame.js";
 import {
   DEFAULT_RESULT_WINDOW_BYTES,
+  RELEASE_DELAY_MS,
   PROTOCOL_VERSION,
   type OwnerMessage,
   type PreparedStatementKind,
@@ -213,6 +221,9 @@ export class ProtocolClient {
   #prepared = 0;
   /** Prepared id → its statement kind, as the owner's front end classified it (`Prepared`). */
   readonly #preparedKinds = new Map<number, PreparedStatementKind>();
+  /** Releases waiting for a request to ride on, by target. */
+  readonly #releases = new Map<number, { through: number; bytes: number }>();
+  #releaseTimer: ReturnType<typeof setTimeout> | null = null;
   #closed = false;
   onSessionAborted: ((session: number) => void) | null = null;
   /** Called whenever requests in flight or pins change (the connector's liveness and watcher). */
@@ -321,6 +332,8 @@ export class ProtocolClient {
   }
 
   #open(port: MessagePort, signal?: AbortSignal): Promise<Welcome> {
+    // Releases name the old connection's streams, which ended with it.
+    this.#takeReleases();
     this.#port?.close();
     this.#port = port;
     this.#generation++;
@@ -465,7 +478,10 @@ export class ProtocolClient {
       queue,
     );
     promise.catch(() => undefined);
-    const port = () => this.#port;
+    const window = options.windowBytes ?? DEFAULT_RESULT_WINDOW_BYTES;
+    const release = (frame: FramePayload) => {
+      this.#queueRelease(seq, frame.sequence, payloadBytes(frame), window);
+    };
     const frames: AsyncIterableIterator<FramePayload> = {
       [Symbol.asyncIterator]() {
         return this;
@@ -474,7 +490,7 @@ export class ProtocolClient {
         for (;;) {
           const frame = queue.frames.shift();
           if (frame !== undefined) {
-            port()?.postMessage({ t: "release", target: seq, through: frame.sequence });
+            release(frame);
             return { value: frame, done: false };
           }
           if (queue.error !== null) throw queue.error;
@@ -588,8 +604,10 @@ export class ProtocolClient {
 
   #send(pending: Pending, retry: boolean): void {
     if (this.#port !== null) pending.sent = true;
+    const releases = this.#takeReleases();
     this.#port?.postMessage({
       ...pending.body,
+      ...(releases === null ? {} : { releases }),
       seq: pending.seq,
       sentAtMs: pending.sentAtMs,
       resolvedThrough: this.#sequencer.resolvedThrough,
@@ -598,6 +616,44 @@ export class ProtocolClient {
       retry,
       generation: pending.generation,
     });
+  }
+
+  // ---- releases (ruling R22.2) ----
+
+  /**
+   * Queues the release of `target`'s frames through `through`. It rides on the next request; with
+   * none within `RELEASE_DELAY_MS`, or once the unreleased bytes reach half the window, it goes
+   * alone.
+   */
+  #queueRelease(target: number, through: number, bytes: number, window: number): void {
+    const queued = this.#releases.get(target);
+    const next = {
+      through: Math.max(queued?.through ?? -1, through),
+      bytes: (queued?.bytes ?? 0) + bytes,
+    };
+    this.#releases.set(target, next);
+    if (next.bytes * 2 >= window) {
+      this.#flushReleases();
+      return;
+    }
+    this.#releaseTimer ??= setTimeout(() => {
+      this.#releaseTimer = null;
+      this.#flushReleases();
+    }, RELEASE_DELAY_MS);
+  }
+
+  #takeReleases(): Array<{ target: number; through: number }> | null {
+    if (this.#releases.size === 0) return null;
+    if (this.#releaseTimer !== null) clearTimeout(this.#releaseTimer);
+    this.#releaseTimer = null;
+    const releases = [...this.#releases].map(([target, { through }]) => ({ target, through }));
+    this.#releases.clear();
+    return releases;
+  }
+
+  #flushReleases(): void {
+    for (const release of this.#takeReleases() ?? [])
+      this.#port?.postMessage({ t: "release", target: release.target, through: release.through });
   }
 
   #settle(seq: number): void {
@@ -674,9 +730,16 @@ export class ProtocolClient {
           if (message.frames.length > 0) pending.handedOut = true;
         } else {
           pending.frames.push(...message.frames);
-          // Buffered: release on receipt.
-          if (last !== undefined)
-            this.#port?.postMessage({ t: "release", target: message.seq, through: last.sequence });
+          // Buffered: released on receipt, riding on the next request when one follows soon.
+          if (last !== undefined) {
+            let bytes = 0;
+            for (const frame of message.frames) bytes += payloadBytes(frame);
+            const window =
+              "result" in pending.body
+                ? pending.body.result.windowBytes
+                : DEFAULT_RESULT_WINDOW_BYTES;
+            this.#queueRelease(message.seq, last.sequence, bytes, window);
+          }
         }
         if (message.t === "done") {
           // The owner confirmed this boundary left the session idle (a COMMIT answered from the

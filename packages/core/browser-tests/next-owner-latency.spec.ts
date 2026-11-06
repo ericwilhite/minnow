@@ -67,7 +67,17 @@ test("cross-tab warm point reads meet R6", async ({ page, context, browserName }
   await reader.waitForTimeout(50);
   const loaded = await call(reader, "pointReads", 1_000, 50);
   const ratio = uncontended.p50 / baseline.p50;
-  const result = { browser: browserName, timers, baseline, uncontended, ratio, lockCalls, loaded };
+  const crossover = await call(reader, "transferCrossover");
+  const result = {
+    browser: browserName,
+    timers,
+    baseline,
+    uncontended,
+    ratio,
+    lockCalls,
+    loaded,
+    crossover,
+  };
   console.log(JSON.stringify(result));
   await info.attach("next-owner-latency", {
     body: JSON.stringify(result, null, 2),

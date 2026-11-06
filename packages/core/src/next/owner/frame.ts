@@ -107,3 +107,62 @@ export class StreamDictionaries {
     throw new RangeError(`Code ${String(code)} is outside dictionary ${String(id)}`);
   }
 }
+
+/**
+ * Below this many transferable bytes a result message is structured-cloned, not transferred
+ * (ruling R22.1): transferring tiny buffers costs more than copying them (Chromium measured
+ * 50–80 µs per cross-process hop for a point read's four buffers, cloning 10–50 µs). Accounting is
+ * unchanged: a cloned frame stays charged until the client releases it. Measured per engine by the
+ * owner latency lane (`transferCrossover`); one constant until the engines' crossovers differ by
+ * more than noise.
+ */
+export const TRANSFER_MIN_BYTES = 1024;
+
+/** The transfer list for frames whose buffers add up to `bytes`: empty below the threshold. */
+export function transferFor(buffers: readonly ArrayBuffer[]): ArrayBuffer[] {
+  let bytes = 0;
+  for (const buffer of buffers) bytes += buffer.byteLength;
+  return bytes < TRANSFER_MIN_BYTES ? [] : [...buffers];
+}
+
+/** Bytes a payload's typed arrays occupy (the client's estimate for release pacing). */
+export function payloadBytes(payload: FramePayload): number {
+  let bytes = 0;
+  const flat = (column: WireFlat) => {
+    bytes += column.validity?.byteLength ?? 0;
+    const data = column.data;
+    switch (data.layout) {
+      case "varlen":
+        bytes += data.bytes.byteLength + data.offsets.byteLength;
+        return;
+      case "fixed16":
+        bytes += data.bytes.byteLength;
+        return;
+      case "int64":
+        bytes += data.values.values.byteLength;
+        return;
+      case "interval":
+        bytes += data.months.byteLength + data.days.byteLength + data.micros.values.byteLength;
+        return;
+      case "decimal":
+        bytes +=
+          (data.scales?.byteLength ?? 0) +
+          (data.specials?.byteLength ?? 0) +
+          (data.coefficients.repr === "int128"
+            ? data.coefficients.limbs.byteLength
+            : data.coefficients.repr === "wide"
+              ? data.coefficients.values.length * 16
+              : data.coefficients.values.byteLength);
+        return;
+      default:
+        bytes += data.values.byteLength;
+    }
+  };
+  for (const column of payload.columns) {
+    if (column.form === "flat") flat(column);
+    else if (column.form === "constant") flat(column.value);
+    else bytes += column.codes.byteLength + (column.validity?.byteLength ?? 0);
+  }
+  for (const delta of payload.dictionaries) flat(delta.values);
+  return bytes;
+}

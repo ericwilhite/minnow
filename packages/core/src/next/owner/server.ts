@@ -56,7 +56,7 @@ import {
   RecordedFailureError,
   toWireError,
 } from "./errors.js";
-import type { FramePayload } from "./frame.js";
+import { transferFor, type FramePayload } from "./frame.js";
 import { ledgerAction, ledgerIdentity, ledgerScope, type AnsweredRequest } from "./outcomes.js";
 import {
   ABANDONED_STREAM_MS,
@@ -296,9 +296,13 @@ class Connection {
     return count;
   }
 
-  post(message: OwnerMessage, transfer: Transferable[] = []): void {
+  /**
+   * Posts to the client. Result buffers are transferred, except below `TRANSFER_MIN_BYTES` in all,
+   * where cloning is cheaper (ruling R22.1); either way the frames stay charged until released.
+   */
+  post(message: OwnerMessage, transfer: ArrayBuffer[] = []): void {
     if (this.#state === "closed") return;
-    this.#port.postMessage(message, transfer);
+    this.#port.postMessage(message, transfer.length === 0 ? transfer : transferFor(transfer));
   }
 
   // ---- incoming ----
@@ -345,6 +349,9 @@ class Connection {
         this.end("bye");
         return;
       default:
+        // Releases riding on the request first (ruling R22.2): they free window for it.
+        if (message.releases !== undefined)
+          for (const release of message.releases) this.#release(release.target, release.through);
         this.#request(message);
     }
   }
@@ -996,7 +1003,7 @@ class Connection {
     this.#finishLedger(request, planned, before, session, run.outcome, false, null);
     const frames = request.result.wantRows ? run.frames : [];
     if (!request.result.wantRows) for (const frame of run.frames) frame.release();
-    const transfer: Transferable[] = [];
+    const transfer: ArrayBuffer[] = [];
     const payloads: FramePayload[] = [];
     for (const frame of frames) {
       payloads.push(frame.payload);
@@ -1056,7 +1063,7 @@ class Connection {
         pending = [];
         return;
       }
-      const transfer: Transferable[] = [];
+      const transfer: ArrayBuffer[] = [];
       for (const frame of pending) for (const buffer of frame.transfer) transfer.push(buffer);
       const columns = columnsSent
         ? null
@@ -1171,7 +1178,7 @@ class Connection {
       this.#streams.delete(request.seq);
       return;
     }
-    const transfer: Transferable[] = [];
+    const transfer: ArrayBuffer[] = [];
     for (const frame of frames) for (const buffer of frame.transfer) transfer.push(buffer);
     stream.posted.push(...frames);
     if (stream.posted.length === 0) this.#streams.delete(request.seq);

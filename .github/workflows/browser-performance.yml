@@ -6,6 +6,10 @@
 # browser before failing, and never blocks a merge: a shared runner measures itself as much as the
 # code. Unlike the Node gate it also fails at once when a Minnow store will not reopen after a
 # failed cell, or when Minnow's answer differs from the competitor's.
+#
+# The owner lane (job `owner`) is the next core's cross-tab point-read latency in Chromium, Firefox
+# and WebKit: ruling R22.3 judges R6's absolute targets here (MINNOW_PERF_LANE=1), not on loaded
+# shared hosts, where the lane records them without enforcing.
 name: Browser performance
 
 on:
@@ -67,4 +71,36 @@ jobs:
             browser-perf.txt
             browser-perf-results/
             packages/core/browser-perf-baseline.json
+          retention-days: 90
+
+  owner:
+    name: Owner latency lane (R6)
+    runs-on: ubuntu-latest
+    # The latency spec takes about two minutes per engine on a quiet runner; installs dominate.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: bash scripts/ci-install.sh
+      - name: Install the browsers
+        run: npx playwright install --with-deps chromium firefox webkit
+      - name: Run the owner latency lane
+        shell: bash
+        env:
+          MINNOW_PERF_LANE: "1"
+        run: >-
+          npm run test:browser:next-owner --
+          packages/core/browser-tests/next-owner-latency.spec.ts
+          2>&1 | tee owner-lane.txt
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: owner-lane
+          path: |
+            owner-lane.txt
+            playwright-report/
           retention-days: 90
