@@ -1386,3 +1386,19 @@ class or introducing negative zero fails at the intended operation. Reversing an
 unordered result passes. Live subscriptions, concurrent openers, crash schedules,
 native browser storage and order-dependent floating aggregates remain outside this
 serial harness; their existing suites still own those checks.
+
+### Extent-list startup at scale (rebuild core, opt-in)
+
+On Linux with Chromium, the R25 lane builds 100k and 1M zero-column groups on OPFS and IndexedDB,
+one extent per group, using the real manifest and group-directory codecs and incremental extent
+lists. Each dataset is reopened in three fresh workers. The report separates backend setup,
+fence acquisition, session/index loading and extent-space startup, against the 500 ms reopen
+target. It also reports owner-worker and whole-browser CPU ticks, coalesced list-data bytes read,
+and root payload bytes. CPU samples exclude build, module boot and cleanup; OS caches remain
+warm. Native IndexedDB index enumeration is included in time, but its physical bytes are opaque.
+This is a storage-startup measurement, not owner readiness, log replay or full query Gate A.
+
+```sh
+npm run test:prepare
+MINNOW_NEXT_STORAGE_REOPEN=1 npx playwright test --config playwright.library.config.ts packages/core/browser-tests/next-storage.spec.ts --project=chromium --workers=1 -g 'R25 list reopen'
+```

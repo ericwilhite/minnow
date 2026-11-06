@@ -1,4 +1,6 @@
 import { chaosPoster } from "./next-storage-post.js";
+import { buildListedReopenSpace, openListedReopen } from "./next-storage-listed-reopen.js";
+let reopenClose: (() => Promise<void>) | null = null;
 /**
  * The rebuild core's storage in a real dedicated worker over real OPFS sync access handles
  * (packages/core/src/next/storage). Driven by next-storage-run.ts through a small RPC; each
@@ -48,6 +50,9 @@ export type NextStorageRequest = {
   /** IndexedDB: one serialized transaction chain per connection (the default) or not. */
   readonly serialize?: boolean;
 } & (
+  | { readonly op: "listed-reopen-build"; readonly dir: string; readonly groups: number }
+  | { readonly op: "listed-reopen-measure"; readonly dir: string }
+  | { readonly op: "listed-reopen-close" }
   | { readonly op: "conformance"; readonly prefix: string }
   | { readonly op: "choose"; readonly name?: string }
   | { readonly op: "idb-scenarios" }
@@ -738,6 +743,17 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
       }
       return { error, spaceFailed: space.failed?.name ?? null, lastRoot };
     }
+    case "listed-reopen-build":
+      return buildListedReopenSpace(await backendFor(request.dir), request.groups);
+    case "listed-reopen-measure": {
+      const opened = await openListedReopen(() => backendFor(request.dir));
+      reopenClose = () => opened.close();
+      return opened.timing;
+    }
+    case "listed-reopen-close":
+      await reopenClose?.();
+      reopenClose = null;
+      return null;
     case "microbench":
       return microbench(request.dir);
     case "reopen-build":

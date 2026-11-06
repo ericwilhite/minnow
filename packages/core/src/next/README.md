@@ -598,11 +598,13 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
 - The write path keeps each root's extent list (`write/engine.ts`, an `ExtentListKeeper` built
   from the durable root at open): it prepares the list once a root's contents are fixed, encodes
   the root with it, and commits or aborts it with the publication. An injected `extentDeltas`
-  sink is told the whole delta, list pages included.
+  sink is told the whole delta, list pages included. `ExtentDeltaResult.list` carries the
+  prepared references; the engine owns the keeper, so observer sinks must return empty `list`
+  and `pages` arrays.
 
 ### Manifest codecs (`format/manifest-codec.ts`, `blob-cache.ts`, `metadata-reader.ts`)
 
-- Binary codecs (version 1) for the root (≤ 1 MiB), group roots, the paged group directory and each table's statistics blob (`TableStatistics`: per-column null counts, values, bytes and bounds over every group)
+- Binary codecs (manifest version 2; envelope version 1) for the root (≤ 1 MiB), group roots, the paged group directory and each table's statistics blob (`TableStatistics`: per-column null counts, values, bytes and bounds over every group)
   (each blob ≤ 1 MiB). Each blob lists its extents once and gives every reference into one extent
   the same `ExtentRef`. Encoding is canonical (re-encoding a decoded value gives the same bytes).
 - `TableRoot.groups` names a directory **index**; each index entry names a **page** of up to
@@ -1334,3 +1336,22 @@ branch).
 - **Group commit is essential.** `flush()` is one real disk flush on every engine: 3.4–4.7 ms.
 - **Cross-tab round trips are slow on WebKit.** Measured at about 55–65 µs on Chromium, 140 µs on
   Firefox and 280 µs on WebKit (p95 520 µs).
+
+### R25 startup measurement
+
+`MINNOW_NEXT_STORAGE_REOPEN=1` enables the Chromium storage reopen lane in
+`browser-tests/next-storage.spec.ts`: 100k and 1M real, empty-column group roots, one extent per
+group, published in batches of 16,384 through `ExtentListKeeper`. Each of three reopens uses a
+fresh worker over the disk-backed profile. It reports backend setup, fence, session/index loading, extent-space
+startup and list-cache bytes read (including coalescing gaps). Root byte counts are separate;
+IndexedDB's record-index reads are included in session time, not the list byte count. OS caches
+remain warm. This measures storage startup, not log replay or owner ready time; timings are
+observations against the 500 ms target, not a portable latency assertion.
+
+The Linux Chromium lane also samples `/proc` CPU ticks for this profile's DedicatedWorker
+threads and complete browser process tree. Samples bracket reopen after worker-ready and before
+cleanup; they include RPC handling, with the host clock's tick resolution (normally 10 ms).
+Build, module boot and cleanup are excluded. Data-read bytes count coalesced list reads; root
+payload bytes are separate. IndexedDB's native index/key enumeration is timed in session open,
+but its opaque on-disk byte count is unavailable. The fixture uses a real zero-column catalog,
+group roots, directory pages and table statistics, not a full SQL workload.

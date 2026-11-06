@@ -1,10 +1,10 @@
 /**
- * The reachability walk (manifest.ts "Reclaim"): everything a manifest root references, so the
- * extent space can rebuild its free map at open and audit it (storage/extents.ts
- * `ReachableExtents`). Crash orphans need no records: they are simply absent from every walk.
+ * The full reachability walk (manifest.ts "Reclaim"), used by audit and test-build open checks.
+ * Startup uses listedRootExtents instead: it reads list pages, never group roots. Crash orphans
+ * need no records: they are absent from the roots' reachability sources.
  *
  * What a root reaches:
- * - the catalog; each table's statistics blob;
+ * - extent-list pages and the catalog; each table's statistics blob;
  * - each table's group directory (`groups`: an index blob and its pages) and, for every staged
  *   large transaction, its group directory (`staged[].groups`) and the index runs built for it
  *   (`staged[].indexRuns`);
@@ -92,7 +92,7 @@ export interface Reached {
   /** A blob, or a column chunk's data range (`ChunkData`: inside its extent, no checksum). */
   readonly ref: BlobRef | ChunkData;
   readonly kind: ReachableKind;
-  /** The table it belongs to (null for the catalog). */
+  /** The table it belongs to (null for the root-owned catalog and extent-list pages). */
   readonly tableId: number | null;
 }
 

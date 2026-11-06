@@ -99,7 +99,7 @@ import { encodeKeyBatch, KeyBatch } from "../keys/key-encoding.js";
 import type { Grant } from "../memory/governor.js";
 import { GroupWriter } from "../page/writer.js";
 import type { StoreSession } from "../storage/contract.js";
-import { ExtentListKeeper, type ExtentList, type PreparedList } from "../storage/extent-list.js";
+import { ExtentListKeeper, type ExtentList } from "../storage/extent-list.js";
 import type { ExtentWriter } from "../storage/extents.js";
 import type { StatValue } from "../types.js";
 import { layoutOf } from "../types.js";
@@ -4156,7 +4156,7 @@ class DeltaPublication {
     const attempt = this.nextAttempt();
     this.#attempt = attempt;
     this.#sequence = sequence;
-    let prepared: PreparedList;
+    let prepared: ExtentDeltaResult;
     try {
       prepared = await this.lists.prepare(attempt, {
         added: [...writer.extents],
@@ -4183,7 +4183,7 @@ class DeltaPublication {
         throw new ExtentSinkError(error); // settle() aborts the attempt
       }
       if (result !== null) {
-        if (result.pages.length > 0)
+        if (result.pages.length > 0 || result.list.length > 0)
           throw new ExtentSinkError(
             new RangeError("The root's extent list is the write path's own (ruling R25)"),
           );

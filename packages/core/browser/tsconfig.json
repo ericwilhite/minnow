@@ -7,6 +7,7 @@
   "include": [
     "run.ts",
     "next-storage-run.ts",
+    "next-storage-listed-reopen.test.ts",
     "next-storage-worker.ts",
     "next-yield-run.ts",
     "next-agg-bench-run.ts",

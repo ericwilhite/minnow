@@ -596,7 +596,7 @@ describe("the sink's retire list (B1's question)", () => {
         }
         if (retireNow && page !== null) {
           retireNow = false;
-          return { pages: [], retire: [page] };
+          return { list: [], pages: [], retire: [page] };
         }
         return null;
       },
@@ -661,7 +661,7 @@ describe("the sink's retire list (B1's question)", () => {
           retireNow = false;
           releasedWith = [...delta.released];
           retire.at = -1;
-          return { pages: [], retire: [page] };
+          return { list: [], pages: [], retire: [page] };
         }
         return null;
       },
@@ -705,4 +705,45 @@ describe("the sink's retire list (B1's question)", () => {
     await harness.space.audit();
     await harness.close();
   });
+});
+
+it("an observer cannot substitute its own extent list for the engine's keeper", async () => {
+  const harness = new Harness("strict", "memory");
+  const calls: string[] = [];
+  harness.extentDeltas = {
+    prepare: () => {
+      calls.push("prepare");
+      return {
+        list: [
+          {
+            first: 0,
+            count: 1,
+            blob: { extent: { offset: 0, length: 1 }, offset: 0, length: 1, checksum: 0 },
+          },
+        ],
+        pages: [],
+        retire: [],
+      };
+    },
+    commit: () => calls.push("commit"),
+    abort: () => calls.push("abort"),
+  };
+  const outcome = await harness.open().then(
+    () => ({ opened: true, error: null }),
+    (error: unknown) => ({ opened: false, error }),
+  );
+  try {
+    expect(outcome.error).toBeInstanceOf(ExtentSinkError);
+    expect(calls).toEqual(["prepare", "abort"]);
+    const lease = await harness.backend.acquire();
+    try {
+      const session = await harness.backend.open(lease);
+      expect(await session.readRoot()).toBeNull();
+      await session.close();
+    } finally {
+      await lease.release();
+    }
+  } finally {
+    if (outcome.opened) await harness.close();
+  }
 });

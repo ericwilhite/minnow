@@ -1,3 +1,4 @@
+import frozenR25 from "./root-r25.fixture.json";
 import fc from "fast-check";
 import { afterAll, describe, expect, it } from "vitest";
 import { createReach } from "../../testing/reach.js";
@@ -720,6 +721,23 @@ describe("manifest codec rules", () => {
       extentList: [],
     };
     expect(() => decodeManifestRoot(encodeManifestRoot(root), tracked())).toThrow(/newer/);
+  });
+
+  it("reads the frozen R25 writer fixture and continues encoding canonically", () => {
+    const bytes = Uint8Array.from(Buffer.from(frozenR25.rootHex, "hex"));
+    const budget = tracked();
+    const parsed = decodeManifestRoot(bytes, budget);
+    expect(parsed.value.formatVersion).toBe(2);
+    expect(parsed.value.catalog.extent.offset).toBe(0);
+    expect(parsed.value.extentList).toHaveLength(1);
+    expect(encodeManifestRoot(parsed.value)).toEqual(bytes);
+    const next = { ...parsed.value, sequence: 2 };
+    budget.free(parsed.charge);
+    const reopened = decodeManifestRoot(encodeManifestRoot(next), budget);
+    expect(reopened.value.sequence).toBe(2);
+    expect(reopened.value.catalog).toEqual(next.catalog);
+    budget.free(reopened.charge);
+    expect(budget.held).toBe(0);
   });
 
   it("refuses a root of format 1, written before extent lists (ruling R25)", () => {
