@@ -119,11 +119,13 @@ import type { CommitFrameBody } from "../format/log-frame.js";
 import type { RequestLedger } from "../format/ledger.js";
 import type { MemoryGovernor } from "../memory/governor.js";
 import type { StoreSession } from "../storage/contract.js";
+import type { StatValue } from "../types.js";
 import type { Int64Values } from "../vector/vector.js";
 import type { CatalogView } from "./catalog.js";
 import type { Statement, StatementOptions } from "./modify.js";
 import type { Snapshot } from "./snapshot.js";
-import type { Space } from "./space.js";
+import type { ExtentRef } from "../storage/extents.js";
+import type { Space, SpaceWriter } from "./space.js";
 
 export type Durability = "strict" | "relaxed";
 
@@ -168,6 +170,12 @@ export interface WritePath {
    */
   flush(): Promise<void>;
   stats(): WritePathStats;
+  /**
+   * The planning summary of a committed table (ruling R17.7), synchronously, or null for a table
+   * the committed catalog lacks. Maintained at flush (from the chunks' exact statistics) plus the
+   * memtables' row counts; lowering's `PlanningStatistics` reads it (lower/statistics.ts).
+   */
+  statistics(tableId: number): TableSummary | null;
   /**
    * Flushes, writes the final header, releases pins and memtables. Rejects open transactions
    * (rolled back) and pending begins with `WritePathClosedError`. Idempotent.
@@ -240,6 +248,24 @@ export interface SequenceAccess {
   set(sequenceId: number, value: bigint, isCalled: boolean): number;
 }
 
+/** A table's planning summary (shape of lower/statistics.ts `TablePlanningStatistics`). */
+export interface TableSummary {
+  /** Live rows, approximately (published groups plus memtables, minus deletions). */
+  readonly rowCount: number;
+  column(columnId: number): ColumnSummary | null;
+}
+
+export interface ColumnSummary {
+  readonly nullCount: number;
+  /** Estimated distinct non-null values, or null when unknown. */
+  readonly distinct: number | null;
+  /** Sound bounds over the published groups (types.ts `StatValue`), or null when unknown. */
+  readonly min: StatValue | null;
+  readonly max: StatValue | null;
+  /** Average stored bytes per non-null value. */
+  readonly averageWidth: number;
+}
+
 export interface WritePathStats {
   readonly appliedLsn: number;
   readonly durableLsn: number;
@@ -275,6 +301,78 @@ export interface OpenWritePathInput {
   readonly space: Space;
   readonly governor: MemoryGovernor;
   readonly options: WritePathOptions;
+  /** Ruling R25: told each publication's extent delta (see `PublishDelta`). */
+  readonly extentDeltas?: ExtentDeltaSink;
+}
+
+/**
+ * One publication attempt's change to the set of extents its root reaches (ruling R25: each root
+ * references a paged, offset-sorted list of the extents it reaches, kept by the storage track, so
+ * startup rebuilds free space from the two roots' lists instead of walking them).
+ *
+ * Exact by construction: the extents the new root reaches are those the previous root reaches,
+ * minus `released`, plus `added`. The write path builds every root this way and never publishes
+ * one otherwise.
+ */
+export interface PublishDelta {
+  /** Extents the new root reaches and the previous one does not: every extent `writer` sealed. */
+  readonly added: readonly ExtentRef[];
+  /**
+   * Extents the previous root reaches and the new one does not: exactly the publish's `retired`.
+   * They leave the new root's list at once, but stay protected by the previous root's list and
+   * older pins (two-generation reclaim, R8): not reusable yet.
+   */
+  readonly released: readonly ExtentRef[];
+  /** The attempt's writer, still open. */
+  readonly writer: SpaceWriter;
+}
+
+/** What a sink returns for one attempt. */
+export interface ExtentDeltaResult {
+  /**
+   * The list pages to write in this publication (the write path writes them into its writer and
+   * the root references them; until the root has that field, ruling R25's format part, a
+   * non-empty list is refused as a sink failure).
+   */
+  readonly pages: readonly Uint8Array[];
+  /** List pages of the sink's own the new root no longer reaches: retired in the same publish. */
+  readonly retire: readonly ExtentRef[];
+}
+
+/**
+ * The storage track's side of R25 (ruling on review B3-p2b-3 C2), a two-phase protocol per
+ * publication attempt, in publish order:
+ * 1. `prepare(attempt, delta)`: after the root's contents are fixed, before metadata admission,
+ *    encoding and the publish. `attempt` is unique and increasing within one open write path. The sink builds a provisional
+ *    list from its last committed one and returns the pages to write;
+ * 2. exactly one of
+ *    - `commit(attempt, sequence)`: the root is durable and current; `sequence` is its root
+ *      sequence. Sequences belong to committed publications only, and are consecutive;
+ *    - `abort(attempt)`: any failure after `prepare` and before the root is durable (admission,
+ *      encoding, a refused or rejected publish, close): the provisional list is discarded. After
+ *      an aborted attempt the next attempt builds on the same committed list (a merge retries).
+ * The sink treats everything prepared as provisional until `commit`. A `prepare` that throws is
+ * aborted too, and fails the write path (a merge does not retry it): the list is storage's
+ * reachability record, and a sink that cannot keep it must not be published around. A publish
+ * that is rejected leaves the space failed (its root may or may not be durable): the owner
+ * reopens, and startup rebuilds from the durable roots' own lists, never from the last callback.
+ *
+ * A durable publication is a fact (review B3-p2b-4 D1): the write path installs its root and runs
+ * first, then calls `commit`. If `commit` throws, the publication stays installed, nothing is
+ * retried, and the write path fails (`MINNOW_EXTENT_SINK`; reopen to continue). If `abort` throws,
+ * the publication's cleanup (its lock, grants, roots) still runs, then the write path fails the
+ * same way. Neither callback is called twice for one attempt.
+ *
+ * `retire` (from `prepare`) is retired by that publication together with `released`: the same
+ * R8 hold applies (neither durable root nor any pin reaches it) before the space reuses it.
+ */
+export interface ExtentDeltaSink {
+  prepare(
+    attempt: number,
+    delta: PublishDelta,
+  ): Promise<ExtentDeltaResult | null> | ExtentDeltaResult | null;
+  commit(attempt: number, sequence: number): void;
+  abort(attempt: number): void;
 }
 
 /**

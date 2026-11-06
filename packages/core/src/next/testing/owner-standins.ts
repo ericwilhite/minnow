@@ -34,6 +34,7 @@ import type {
   PinOptions,
   Savepoint,
   SequenceAccess,
+  TableSummary,
   WritePath,
   WritePathStats,
   WriteTransaction,
@@ -542,6 +543,16 @@ export class StandinWritePath implements WritePath {
       this.#durableWaiters.splice(this.#durableWaiters.indexOf(waiter), 1);
       waiter.resolve();
     }
+  }
+
+  /**
+   * The committed table's row count, with no column summaries: the owner's composition tests need
+   * a planning summary, not real statistics (those are the write path's, `write/`).
+   */
+  statistics(tableId: number): TableSummary | null {
+    if (this.applied.catalog.table(tableId) === undefined) return null;
+    const rowCount = this.applied.tables.get(tableId)?.size ?? 0;
+    return { rowCount, column: () => null };
   }
 
   stats(): WritePathStats {

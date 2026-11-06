@@ -50,6 +50,8 @@ import {
   type ManifestRoot,
   type RunRef,
   type TableRoot,
+  type TableStatistics,
+  type ColumnTotals,
 } from "./manifest.js";
 
 export { ManifestCorruptionError };
@@ -65,6 +67,7 @@ const MAGIC = {
   index: 0x3149_474d, // "MGI1"
   page: 0x3150_474d, // "MGP1"
   group: 0x3152_474d, // "MGR1"
+  statistics: 0x3154_534d, // "MST1"
 } as const;
 const VERSION = 1;
 
@@ -483,6 +486,72 @@ export function decodeGroupRoot(bytes: Uint8Array, budget: ByteBudget): Parsed<G
   });
 }
 
+// ── Table statistics (`TableRoot.statistics`) ──────────────────────────────────────────────────
+
+/**
+ * A table's statistics blob (≤ `MAX_BLOB_BYTES`): `uint groupCount, uint columns`, then per column
+ * in ascending id `uint columnId, uint nullCount, uint values, uint bytes, flag unbounded, stat min,
+ * stat max`. An unbounded column has null bounds; a column without values has null bounds.
+ */
+export function encodeTableStatistics(statistics: TableStatistics): Uint8Array {
+  const out = new ByteWriter();
+  out.u32(MAGIC.statistics);
+  out.u8(VERSION);
+  out.uint(statistics.groupCount);
+  out.uint(statistics.columns.length);
+  let previous = -1;
+  for (const column of statistics.columns) {
+    if (column.columnId <= previous)
+      throw new RangeError("Table statistics columns are not in ascending id order");
+    previous = column.columnId;
+    const bounded = !column.unbounded && column.values > 0;
+    if (!bounded && (column.min !== null || column.max !== null))
+      throw new RangeError("Unbounded or empty column statistics carry bounds");
+    out.uint(column.columnId);
+    out.uint(column.nullCount);
+    out.uint(column.values);
+    out.uint(column.bytes);
+    out.u8(column.unbounded ? 1 : 0);
+    writeStat(out, column.min);
+    writeStat(out, column.max);
+  }
+  const bytes = out.finish();
+  if (bytes.length > MAX_BLOB_BYTES) throw new RangeError("Table statistics pass the blob cap");
+  return bytes;
+}
+
+export function decodeTableStatistics(
+  bytes: Uint8Array,
+  budget: ByteBudget,
+): Parsed<TableStatistics> {
+  return charged(bytes, budget, (reader) => {
+    valid(reader.u32() === MAGIC.statistics, "Not a table statistics blob");
+    valid(reader.u8() === VERSION, "Unknown table statistics version");
+    const groupCount = reader.uint();
+    const count = reader.count(7);
+    const columns: ColumnTotals[] = [];
+    let previous = -1;
+    for (let k = 0; k < count; k++) {
+      const columnId = reader.uint();
+      valid(columnId > previous, "Table statistics columns are not in ascending id order");
+      previous = columnId;
+      const nullCount = reader.uint();
+      const values = reader.uint();
+      const bytes = reader.uint();
+      const unbounded = readFlag(reader);
+      const min = readStat(reader);
+      const max = readStat(reader);
+      valid(
+        (min === null) === (max === null) &&
+          (unbounded || values === 0 ? min === null : min !== null),
+        "Table statistics bounds disagree with their column",
+      );
+      columns.push({ columnId, nullCount, values, bytes, unbounded, min, max });
+    }
+    return { groupCount, columns };
+  });
+}
+
 // ── Group directory pages and index ────────────────────────────────────────────────────────────
 
 /** One page of a table's group directory, as its index lists it. */
@@ -671,7 +740,8 @@ export async function writeGroupDirectory(
 // ── Root ───────────────────────────────────────────────────────────────────────────────────────
 
 function writeRun(out: RefWriter, run: RunRef): void {
-  out.body.uint(run.level);
+  // The level and the continuation flag share one integer: level × 2 + continues.
+  out.body.uint(run.level * 2 + (run.continues === true ? 1 : 0));
   out.body.uint(run.entryCount);
   out.blob(run.entries);
   out.blob(run.fences);
@@ -682,14 +752,16 @@ function writeRun(out: RefWriter, run: RunRef): void {
 
 function readRun(refs: RefReader): RunRef {
   const reader = refs.bytes;
-  const level = reader.uint();
+  const packed = reader.uint();
+  const level = Math.floor(packed / 2);
   const entryCount = reader.uint();
   const entries = refs.blob();
   const fences = refs.blob();
   const bloom = refs.blob();
   const minKey = reader.bytes();
   const maxKey = reader.bytes();
-  return { level, entryCount, entries, fences, bloom, minKey, maxKey };
+  const run = { level, entryCount, entries, fences, bloom, minKey, maxKey };
+  return packed % 2 === 1 ? { ...run, continues: true } : run;
 }
 
 function writeRuns(out: RefWriter, runs: readonly RunRef[]): void {

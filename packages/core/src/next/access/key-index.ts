@@ -8,9 +8,19 @@
  * the rows holding it. Its entries are `(key, rowId, kind)` with kind put or tombstone, in layers:
  * - in memory, per table: the memtable delta, a typed hash keyed by the key bytes, whose entries
  *   carry a visibility `seq` (snapshot.ts);
- * - on disk: immutable sorted runs (format/manifest.ts `RunRef`) merged leveled, each with fences
- *   (every Nth key and its offset) and a partitioned Bloom filter. A run is visible to every view
- *   that pins its root, so run entries need no seq.
+ * - on disk: immutable sorted runs (format/manifest.ts `RunRef`), each with fences (every Nth key
+ *   and its offset) and a partitioned Bloom filter. A run is visible to every view that pins its
+ *   root, so run entries need no seq.
+ * - **Levels (ruling on B3 increment 2a: tiering, not one run per level).** A flush adds a level-0
+ *   run; a level holding 8 sorted runs is merged into one sorted run at the next level
+ *   (write/merge.ts). With N entries and M entries per memtable flush there are
+ *   L = 1 + ⌈log₈(N / M)⌉ levels, and each entry is written L times (2 at 1M keyed rows, 3 at 5M).
+ * - **Read amplification bound.** A point read probes, per index, every memtable layer plus the
+ *   runs whose key range holds the key: at most 7 per level in steady state (7·L), and while
+ *   merges lag, at most 23 at level 0 (writers wait at 24) plus 7 per higher level
+ *   (23 + 7·(L − 1)). The split pieces of one merge have disjoint key ranges and count once.
+ *   Each probed run costs a fence search and a Bloom test; a block is read only on a Bloom hit
+ *   (~1% false positives). At 5M rows (L = 3): ≤ 21 runs steady, ≤ 37 transient.
  * Layers are ordered newest first, and a tombstone is always in the same layer as its put or a
  * newer one (a delete follows its insert; a merge keeps recency order and cancels a put with its
  * tombstone when they meet). A delete writes a tombstone into every index the row was in (the

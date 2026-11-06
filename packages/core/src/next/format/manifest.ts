@@ -59,6 +59,11 @@
  *   `globalLsn`; each table's rows are as of its `flushedThroughLsn`. A root may switch to a new
  *   log salt only when `globalLsn` and every table's `flushedThroughLsn` reach the old log's last
  *   LSN; the new incarnation records the switching root's sequence (`log.rootSequence`).
+ *   `tables` agrees with the catalog at `globalLsn`: every table it has (one dropped later stays,
+ *   as it was, since replay starts before the drop) with every index it has; a table root may
+ *   also carry an empty root for its own index built after `globalLsn`. An index build no table
+ *   checkpoint covers therefore holds `globalLsn` below it (a build on a table with no
+ *   unpublished data has no entries, and the next root settles it).
  * - **Exactly once** (ledger.ts): `clients` holds the committed outcomes as of `globalLsn`.
  */
 import type { ClientLedgerEntry } from "./ledger.js";
@@ -148,8 +153,37 @@ export interface TableRoot {
   }>;
   readonly keyIndex: IndexRoot | null;
   readonly secondaryIndexes: readonly IndexRoot[];
-  /** Mergeable table statistics (row count, distinct sketches, heavy hitters), or null. */
+  /**
+   * → `TableStatistics`: the table's planning statistics aggregated over every group in `groups`,
+   * maintained at each publish, so an open reads one blob per table instead of every group root
+   * (Gate A reopen). Null exactly when the table has no groups.
+   */
   readonly statistics: BlobRef | null;
+}
+
+/**
+ * Per-table planning statistics over the stored rows of every group (deleted rows included; sound
+ * bounds, approximate counts). One entry per column some group stores, ascending column id.
+ */
+export interface TableStatistics {
+  /** Groups summarized: the table's `groupCount` when written. */
+  readonly groupCount: number;
+  readonly columns: readonly ColumnTotals[];
+}
+
+export interface ColumnTotals {
+  readonly columnId: number;
+  /** Σ chunk null counts. */
+  readonly nullCount: number;
+  /** Σ non-null values stored. */
+  readonly values: number;
+  /** Σ chunk data bytes (average width = bytes / values). */
+  readonly bytes: number;
+  /** True when some group with values stored no bounds: `min`/`max` are then unknown. */
+  readonly unbounded: boolean;
+  /** The least and greatest bound over the groups (null when unknown or no values). */
+  readonly min: StatValue | null;
+  readonly max: StatValue | null;
 }
 
 export interface GroupRef {
@@ -231,6 +265,12 @@ export interface IndexRoot {
 
 export interface RunRef {
   readonly level: number;
+  /**
+   * Present (true) on the second and later pieces of one merge output, which follow the first
+   * piece in ascending key order (an output splits when it outgrows one run's block index, possibly
+   * inside one key's entries). The pieces of one output are one sorted run; nothing else is.
+   */
+  readonly continues?: true;
   readonly entryCount: number;
   /**
    * Sorted entries: equality-key bytes (keys/key-encoding.ts), scalar types only. Runs of an

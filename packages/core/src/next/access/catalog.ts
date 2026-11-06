@@ -21,6 +21,14 @@
  * - **Every enforced foreign key has a supporting index** on the referencing columns (role
  *   `"foreignKey"`, created with the constraint unless an index with those leading columns
  *   exists), so a parent's delete or rekey finds its children by index probe, never by a scan.
+ * - **Named types** (ruling R17.7): `CREATE TYPE … AS ENUM` is a `TypeDef`; a column of that type
+ *   has an enum `PhysicalType` with the same name and labels. A type a column uses cannot be
+ *   dropped.
+ * - **Owned identity sequences** (R17.7): a `TableInput` column with `identity` gets a sequence
+ *   created with the table, owned by that column (`SequenceDef.ownedBy`, `identitySequence`), and
+ *   dropped with it.
+ * - **Self-referencing foreign keys** (R17.7): `parentTableId: "self"` names the table being
+ *   created; its `parentIndexId` is then `"primary"` or `{ unique: name }` of the same input.
  */
 import type { SqlTypeDescriptor, PhysicalType } from "../types.js";
 import type { FlatVector } from "../vector/vector.js";
@@ -30,6 +38,10 @@ export interface CatalogView {
   readonly tables: readonly TableDef[];
   readonly sequences: readonly SequenceDef[];
   readonly views: readonly ViewDef[];
+  /** Named types (ruling R17.7). */
+  readonly types: readonly TypeDef[];
+  type(typeId: number): TypeDef | undefined;
+  typeByName(name: string): TypeDef | undefined;
   /** By id; undefined when absent (dropped ids are never reused). */
   table(tableId: number): TableDef | undefined;
   /** Case-sensitive lookup of a normalized name (the front end normalizes identifiers). */
@@ -124,6 +136,13 @@ export interface SequenceDef {
   readonly ownedBy: { readonly tableId: number; readonly columnId: number } | null;
 }
 
+/** `CREATE TYPE name AS ENUM (labels…)` (ruling R17.7). */
+export interface TypeDef {
+  readonly id: number;
+  readonly name: string;
+  readonly labels: readonly string[];
+}
+
 export interface ViewDef {
   readonly id: number;
   readonly name: string;
@@ -147,7 +166,9 @@ export type CatalogChange =
   | { readonly kind: "alterSequence"; readonly sequence: SequenceDef }
   | { readonly kind: "dropSequence"; readonly sequenceId: number }
   | { readonly kind: "createView"; readonly view: Omit<ViewDef, "id"> }
-  | { readonly kind: "dropView"; readonly viewId: number };
+  | { readonly kind: "dropView"; readonly viewId: number }
+  | { readonly kind: "createType"; readonly type: Omit<TypeDef, "id"> }
+  | { readonly kind: "dropType"; readonly typeId: number };
 
 /**
  * A table definition as DDL supplies it. Existing columns, indexes and constraints keep their ids
@@ -155,7 +176,16 @@ export type CatalogChange =
  */
 export interface TableInput {
   readonly name: string;
-  readonly columns: ReadonlyArray<Omit<ColumnDef, "id"> & { readonly id?: number }>;
+  readonly columns: ReadonlyArray<
+    Omit<ColumnDef, "id"> & {
+      readonly id?: number;
+      /**
+       * An owned identity sequence to create with the table (SERIAL, IDENTITY, AUTOINCREMENT;
+       * ruling R17.7). Then `identitySequence` is ignored and set by the write path.
+       */
+      readonly identity?: { readonly start: bigint; readonly increment: bigint } | null;
+    }
+  >;
   /** Primary key columns (by position in `columns`), or null. */
   readonly primaryKey: readonly number[] | null;
   readonly unique: ReadonlyArray<{
@@ -164,9 +194,16 @@ export interface TableInput {
     readonly columns: readonly number[];
   }>;
   readonly foreignKeys: ReadonlyArray<
-    Omit<ForeignKeyDef, "id" | "columnIds" | "supportIndexId"> & {
+    Omit<
+      ForeignKeyDef,
+      "id" | "columnIds" | "supportIndexId" | "parentTableId" | "parentIndexId"
+    > & {
       readonly id?: number;
       readonly columns: readonly number[];
+      /** `"self"`: the table this input defines (ruling R17.7). */
+      readonly parentTableId: number | "self";
+      /** For `"self"`: this input's `"primary"` key or one of its `unique` constraints by name. */
+      readonly parentIndexId: number | "primary" | { readonly unique: string };
     }
   >;
   readonly checks: ReadonlyArray<

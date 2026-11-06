@@ -310,9 +310,12 @@ function catalogAt(version: number): CatalogView {
     tables: [],
     sequences: [],
     views: [],
+    types: [],
     table: () => undefined,
     tableByName: () => undefined,
     sequence: () => undefined,
+    type: () => undefined,
+    typeByName: () => undefined,
   };
 }
 
