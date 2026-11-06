@@ -9,6 +9,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { MemoryBlockStore } from "../storage/index.js";
 import { createReach, REFUSAL_STATES } from "../testing/reach.js";
 import { MinnowDatabase } from "./database.js";
+import { compileQuery } from "./query.js";
 
 let pg: PGlite;
 
@@ -121,6 +122,134 @@ describe("READ ONLY transactions", () => {
     await database.execute("BEGIN");
     await database.execute("INSERT INTO t VALUES (1)");
     await database.execute("COMMIT");
+    expect((await database.query("SELECT count(*) AS n FROM t")).rows).toEqual([{ n: 1 }]);
+    await database.close();
+  });
+});
+
+/** Every public way to run a read inside an open transaction (review B6 stream A 2, finding 1). */
+const ENTRY_POINTS: ReadonlyArray<
+  readonly [name: string, run: (database: MinnowDatabase, sql: string) => Promise<unknown>]
+> = [
+  ["execute", (database, sql) => database.execute(sql)],
+  ["query", (database, sql) => database.query(sql)],
+  ["run", (database, sql) => database.run({ kind: "typed-query", plan: compileQuery(sql) })],
+  [
+    "queryCursor",
+    async (database, sql) => {
+      for await (const batch of database.queryCursor(sql)) void batch;
+    },
+  ],
+];
+
+/** Reads a read-only transaction refuses, or runs (review B6 stream A 2, finding 1). */
+const READS = ["SELECT count(*) AS n FROM t", "SELECT nextval('s') AS n"];
+
+/** Statement sequences where a read is the transaction's first statement (finding 1). */
+const SEQUENCES: ReadonlyArray<readonly string[]> = [
+  [
+    "BEGIN READ WRITE",
+    "SELECT 1 AS one",
+    "SET TRANSACTION READ WRITE",
+    "INSERT INTO t VALUES (9, 9)",
+  ],
+  ["BEGIN READ ONLY", "SELECT count(*) AS n FROM t", "SET TRANSACTION READ WRITE"],
+  ["BEGIN READ ONLY", "SET TRANSACTION READ WRITE", "INSERT INTO t VALUES (9, 9)"],
+];
+
+/**
+ * PostgreSQL's outcome of `statements` in a fresh schema: ok, or the first SQLSTATE, with the
+ * message for 25006 (it names the refused command, such as `nextval()`).
+ */
+async function pgRun(statements: readonly string[]): Promise<string> {
+  await pg.exec("DROP SCHEMA IF EXISTS ro CASCADE; CREATE SCHEMA ro; SET search_path TO ro");
+  for (const sql of SETUP) await pg.exec(sql);
+  try {
+    for (const sql of statements) await pg.query(sql);
+    return "ok";
+  } catch (error) {
+    const { code, message } = error as { code?: string; message?: string };
+    return code === "25006" ? `25006 ${String(message)}` : String(code);
+  } finally {
+    await pg.exec("ROLLBACK");
+  }
+}
+
+/** The same through Minnow, each SELECT through `entry` and every other statement execute(). */
+async function minnowRun(
+  statements: readonly string[],
+  entry: (database: MinnowDatabase, sql: string) => Promise<unknown>,
+): Promise<string> {
+  const database = new MinnowDatabase(new MemoryBlockStore());
+  for (const sql of SETUP) await database.execute(sql);
+  try {
+    for (const sql of statements)
+      if (sql.startsWith("SELECT") || sql.startsWith("WITH")) await entry(database, sql);
+      else await database.execute(sql);
+    return "ok";
+  } catch (error) {
+    const state = minnowClass(error);
+    return state === "25006" ? `25006 ${(error as Error).message}` : state;
+  } finally {
+    await database.execute("ROLLBACK").catch(() => undefined);
+    await database.close();
+  }
+}
+
+describe("READ ONLY across entry points (review B6 stream A 2)", () => {
+  it("refuses sequence changes through every read entry point, as PostgreSQL", async () => {
+    const mismatches: string[] = [];
+    const reach = createReach<string>("read-only reads", REFUSAL_STATES);
+    for (const begin of ["BEGIN READ ONLY", "BEGIN", "BEGIN READ WRITE"])
+      for (const read of READS) {
+        const expected = await pgRun([begin, read]);
+        for (const [name, entry] of ENTRY_POINTS) {
+          reach.beginHistory();
+          const actual = await minnowRun([begin, read], entry);
+          if (actual === expected) reach.reach(expected === "ok" ? "accepted" : "refused");
+          else
+            mismatches.push(
+              `${name}: ${begin}; ${read}\n  pglite: ${expected}\n  minnow: ${actual}`,
+            );
+        }
+      }
+    expect(mismatches.join("\n")).toBe("");
+    reach.assertReached();
+  });
+
+  it("counts a read from any entry point as the first statement", async () => {
+    const mismatches: string[] = [];
+    const reach = createReach<string>("first statement", REFUSAL_STATES);
+    for (const statements of SEQUENCES) {
+      const expected = await pgRun(statements);
+      for (const [name, entry] of ENTRY_POINTS) {
+        reach.beginHistory();
+        const actual = await minnowRun(statements, entry);
+        if (actual === expected) reach.reach(expected === "ok" ? "accepted" : "refused");
+        else
+          mismatches.push(
+            `${name}: ${statements.join("; ")}\n  pglite: ${expected}\n  minnow: ${actual}`,
+          );
+      }
+    }
+    expect(mismatches.join("\n")).toBe("");
+    reach.assertReached();
+  });
+
+  it("keeps table-method writes out of a SQL-begun transaction", async () => {
+    // insert() does not join the open BEGIN: it waits for the transaction to end and commits on
+    // its own, so a read-only transaction neither refuses it nor rolls it back.
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+    await database.execute("BEGIN READ ONLY");
+    let settled = false;
+    const inserted = database.insert("t", { id: 1, v: 10 }).finally(() => {
+      settled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(settled).toBe(false);
+    await database.execute("ROLLBACK");
+    await inserted;
     expect((await database.query("SELECT count(*) AS n FROM t")).rows).toEqual([{ n: 1 }]);
     await database.close();
   });

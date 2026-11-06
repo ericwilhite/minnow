@@ -2609,6 +2609,26 @@ function readOnlyTransactionError(command: string): TypeError {
   return new TypeError(`cannot execute ${command} in a read-only transaction`);
 }
 
+/**
+ * The one admission of a statement into an open transaction, which every entry point calls:
+ * execute (writes here, its SELECTs through `query`), `query` and `queryCursor`, and a built
+ * query's `run`. A read-only transaction refuses writes and sequence changes (25006), and the
+ * statement counts as the transaction's first for READ WRITE's 25001. SET and SHOW are session
+ * settings, not statements of the transaction, and a live set's background refresh is not a
+ * caller's statement. Table-method writes (`insert`, write scopes) never enter a SQL-begun
+ * transaction: they wait for it and commit on their own.
+ */
+function admitToTransaction(
+  open: OpenStatementTransaction,
+  statement: { readonly read: CompiledQuery } | { readonly write: CompiledStatement },
+): void {
+  if (open.readOnly) {
+    if ("write" in statement) throw readOnlyTransactionError(writeCommand(statement.write));
+    if (statement.read.usesSequenceCalls === true) throw readOnlyTransactionError("nextval()");
+  }
+  open.queried = true;
+}
+
 /** The command PostgreSQL names in that refusal: the statement's tag. */
 function writeCommand(statement: CompiledStatement): string {
   if (statement.kind === "delete" && "truncate" in statement) return "TRUNCATE TABLE";
@@ -5800,6 +5820,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
 
   /** Executes a read-only SELECT statement through the public query API. */
   async query(sql: string, options: QueryOptions = {}): Promise<QueryResult> {
+    const open = this.#openTransaction;
+    if (open !== undefined && options.version === undefined)
+      admitToTransaction(open, { read: this.#queries.compile(sql) });
     return this.#queryWithReadReservation(sql, options);
   }
 
@@ -13038,6 +13061,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           ? this.#queries.run(plan)
           : this.#memoizedQuery(plan, `typed ${planMemoKey(plan)}`, {}, probe);
       };
+      if (open !== undefined) admitToTransaction(open, { read: plan });
       const result =
         open === undefined
           ? await this.#withReadReservation(execute)
@@ -13946,16 +13970,14 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       }
       return externalizeExecuteResult(await this.runStatement(statement));
     }
-    if (current?.readOnly === true) {
-      if (statement.kind === "select") {
-        if (compileQuery(statement.sql).usesSequenceCalls === true)
-          throw readOnlyTransactionError("nextval()");
-      } else if (statement.kind !== "set" && statement.kind !== "show") {
-        throw readOnlyTransactionError(writeCommand(statement));
-      }
-    }
-    if (current !== undefined && statement.kind !== "set" && statement.kind !== "show")
-      current.queried = true;
+    // A SELECT is admitted by `query`, below; SET and SHOW are not statements of it.
+    if (
+      current !== undefined &&
+      statement.kind !== "select" &&
+      statement.kind !== "set" &&
+      statement.kind !== "show"
+    )
+      admitToTransaction(current, { write: statement });
     if (statement.kind === "select") {
       return {
         kind: "rows",

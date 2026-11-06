@@ -62,7 +62,9 @@ b.id = a.id)` was false when no row of `b` matched. An aggregate without `GROUP 
   `MERGE`, `TRUNCATE`, schema changes and `nextval` in a read-only transaction fail with "cannot
   execute … in a read-only transaction", and `SET TRANSACTION READ WRITE` after the transaction's
   first statement fails with "transaction read-write mode must be set before any query", as in
-  PostgreSQL. Open the transaction with `BEGIN` (or `READ WRITE`) to write.
+  PostgreSQL. Both rules hold however a statement arrives: `execute`, `query`, `queryCursor` or a
+  built query's `run` (a `query` call is a statement). Open the transaction with `BEGIN` (or
+  `READ WRITE`) to write.
 - **Transaction statements follow PostgreSQL's grammar.** `BEGIN`, `START TRANSACTION` and
   `SET TRANSACTION` accepted their keywords in any order and ignored anything else, so
   `BEGIN ONLY READ` and `BEGIN 'READ ONLY'` ran. They now fail with `syntax error at or near …`.
