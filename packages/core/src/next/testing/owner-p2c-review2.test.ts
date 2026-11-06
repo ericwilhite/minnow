@@ -141,7 +141,8 @@ describe("finding 3 (review): engine.close() returns the committed rule cache's 
     expect(governor.usedBytes).toBeGreaterThan(before);
     client.close();
     await engine.close();
-    expect(governor.usedBytes).toBe(before);
+    // Both retained plans and compiled rules belong to the closed engine.
+    expect(governor.usedBytes).toBe(0);
   });
 
   it("releases it even when the write path fails to close", async () => {
@@ -155,7 +156,8 @@ describe("finding 3 (review): engine.close() returns the committed rule cache's 
     writePath.close = () => Promise.reject(new Error("disk gone"));
     client.close();
     await expect(engine.close()).rejects.toThrow("disk gone");
-    expect(governor.usedBytes).toBe(before);
+    // Both retained plans and compiled rules belong to the closed engine.
+    expect(governor.usedBytes).toBe(0);
   });
 });
 

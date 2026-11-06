@@ -80,8 +80,9 @@ describe("finding 1: SQL BEGIN READ ONLY never opens a writable transaction", ()
 });
 
 /** The harness, with `lowerTableRules` counted and every statement's options recorded. */
-function spied() {
-  const h = harness();
+function spied(planCacheSize?: number) {
+  // Rule-charge assertions isolate rules; retained plans are covered by owner-plan-cache-policy.
+  const h = harness(planCacheSize === undefined ? {} : { planCacheSize });
   const compiled: Array<{ readonly tableId: number; readonly checks: number }> = [];
   const lowerTableRules = h.planner.lowerTableRules.bind(h.planner);
   h.planner.lowerTableRules = (table: TableDef, catalog: CatalogView) => {
@@ -134,7 +135,7 @@ describe("finding 2: rules follow catalog identity, not (table id, version)", ()
   });
 
   it("a rolled-back transaction's rules are not reused by the next transaction's schema", async () => {
-    const { connect, compiled, rulesOfLast, governor } = spied();
+    const { connect, compiled, rulesOfLast, governor } = spied(0);
     const client = await connect();
     await client.query("BEGIN", [], { session: 1 });
     const baseline = governor.usedBytes;
@@ -157,7 +158,7 @@ describe("finding 2: rules follow catalog identity, not (table id, version)", ()
   });
 
   it("rolling back to a savepoint drops the rules compiled after it", async () => {
-    const { connect, compiled, rulesOfLast, governor } = spied();
+    const { connect, compiled, rulesOfLast, governor } = spied(0);
     const client = await connect();
     await client.query("BEGIN", [], { session: 1 });
     await client.query("SAVEPOINT a", [], { session: 1 });
@@ -190,7 +191,7 @@ describe("finding 2: rules follow catalog identity, not (table id, version)", ()
 
 describe("finding 3: the rule cache is bounded, charged, and drops unreachable catalogs", () => {
   it("keeps only the committed catalog's entries as it moves on (600 versions)", async () => {
-    const { connect, engine, governor, rulesOfLast } = spied();
+    const { connect, engine, governor, rulesOfLast } = spied(0);
     const client = await connect();
     await client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT CHECK (n > 0))");
     const cache = (engine as unknown as { ruleCache?: { size: number; bytes: number } })

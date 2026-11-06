@@ -23,6 +23,7 @@ afterEach(() => {
 export interface HarnessOptions {
   readonly planner?: StatementPlanner;
   readonly planCacheSize?: number;
+  readonly planCacheBytes?: number;
   readonly durability?: "strict" | "relaxed";
   readonly autoFlush?: boolean;
   readonly idleMs?: number;
@@ -53,6 +54,7 @@ export function harness(options: HarnessOptions = {}) {
     spill: new MemorySpillService(),
     reads: {} as ChunkReads,
     ...(options.planCacheSize === undefined ? {} : { planCacheSize: options.planCacheSize }),
+    ...(options.planCacheBytes === undefined ? {} : { planCacheBytes: options.planCacheBytes }),
     ...(options.idleMs === undefined ? {} : { transactionIdleTimeoutMs: options.idleMs }),
   });
   const liveness = options.liveness;

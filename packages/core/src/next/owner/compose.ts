@@ -64,6 +64,7 @@ import type { SpillService } from "../spill/contract.js";
 import { PG_EPOCH_UNIX_MICROS } from "../temporal.js";
 import { UnsupportedPlanError } from "../errors.js";
 import { RuleCache } from "./rule-cache.js";
+import { PlanCache } from "./plan-cache.js";
 import { requestsReadOnly } from "./sequence.js";
 import type {
   EngineSession,
@@ -119,11 +120,12 @@ export interface ComposeOptions {
   readonly now?: () => number;
   /** Shared templates, refusal markers and full-text plans retained across catalogs; default 512. */
   readonly planCacheSize?: number;
+  /** Maximum retained plan/key/marker bytes; default 4 MiB. Zero disables retention. */
+  readonly planCacheBytes?: number;
   /** The idle-transaction timeout the server applies (reported in errors). */
   readonly transactionIdleTimeoutMs?: number;
 }
 
-const DEFAULT_PLAN_CACHE = 512;
 type CachedPlan =
   | PlannedStatement
   | NotParameterizable
@@ -273,7 +275,8 @@ class ComposedEngine implements OwnerEngine {
   }
   readonly #options: ComposeOptions & { readonly executor: Executor };
   readonly #now: () => number;
-  readonly #plans = new Map<string, CachedPlan>();
+  readonly #plans: PlanCache<CachedPlan>;
+  readonly #sessionPlans = new Set<PlanCache<PlannedStatement>>();
   readonly #statistics: PlanningStatistics;
   /** Compiled table rules for the committed catalog (rule-cache.ts). */
   readonly #rules: RuleCache;
@@ -287,6 +290,7 @@ class ComposedEngine implements OwnerEngine {
     this.#now = options.now ?? Date.now;
     this.#statistics = options.statistics ?? { table: () => null };
     this.#rules = new RuleCache(options.governor);
+    this.#plans = new PlanCache(options.governor, options.planCacheSize, options.planCacheBytes);
   }
 
   /**
@@ -364,17 +368,6 @@ class ComposedEngine implements OwnerEngine {
     );
   }
 
-  #remember(key: string, value: CachedPlan): void {
-    const max = this.#options.planCacheSize ?? DEFAULT_PLAN_CACHE;
-    if (max <= 0) return;
-    this.#plans.delete(key);
-    if (this.#plans.size >= max) {
-      const oldest = this.#plans.keys().next();
-      if (oldest.done !== true) this.#plans.delete(oldest.value);
-    }
-    this.#plans.set(key, value);
-  }
-
   /** Public lowering results/markers use normalized keys; raw constants use full text only. */
   plan(text: string, catalog: CatalogView = this.#options.writePath.catalog): PlannedStatement {
     const context = this.#context(catalog);
@@ -383,8 +376,10 @@ class ComposedEngine implements OwnerEngine {
     if (parameterized !== null) {
       const key = `${prefix}normalized\u0000${parameterized.key}`;
       let cached = this.#plans.get(key);
-      if (cached?.kind === "parameterized" && this.#drifted(cached.template.statement))
+      if (cached?.kind === "parameterized" && this.#drifted(cached.template.statement)) {
+        this.#plans.delete(key);
         cached = undefined;
+      }
       if (
         cached === undefined ||
         (cached.kind !== "parameterized" && cached.kind !== "notParameterizable")
@@ -398,7 +393,7 @@ class ComposedEngine implements OwnerEngine {
                 template: result,
                 planned: toPlanned(result.statement),
               };
-        this.#remember(key, cached);
+        this.#plans.set(key, cached);
       }
       if (cached.kind === "parameterized")
         return {
@@ -416,8 +411,9 @@ class ComposedEngine implements OwnerEngine {
       !this.#drifted(cached.lowered)
     )
       return cached;
+    if (cached !== undefined) this.#plans.delete(key);
     const planned = toPlanned(this.#options.planner.lower(text, context));
-    this.#remember(key, planned);
+    this.#plans.set(key, planned);
     return planned;
   }
 
@@ -441,6 +437,21 @@ class ComposedEngine implements OwnerEngine {
       generation,
       sessionId ?? `${clientId}:${String(this.nextSessionId())}`,
     );
+  }
+
+  privatePlans(): PlanCache<PlannedStatement> {
+    const cache = new PlanCache<PlannedStatement>(
+      this.#options.governor,
+      this.#options.planCacheSize,
+      this.#options.planCacheBytes,
+    );
+    this.#sessionPlans.add(cache);
+    return cache;
+  }
+
+  closePrivatePlans(cache: PlanCache<PlannedStatement>): void {
+    cache.close();
+    this.#sessionPlans.delete(cache);
   }
 
   readSet(statement: PlannedStatement): readonly number[] {
@@ -474,6 +485,9 @@ class ComposedEngine implements OwnerEngine {
     } finally {
       // The committed catalog's rules go with the engine, whether or not the write path closed.
       this.#rules.close();
+      this.#plans.close();
+      for (const cache of this.#sessionPlans) cache.close();
+      this.#sessionPlans.clear();
     }
   }
 }
@@ -550,7 +564,7 @@ class ComposedSession implements EngineSession {
    * Plans against this transaction's own schema changes (uncommitted DDL): private to the
    * session, dropped when the transaction ends or rolls back to a savepoint.
    */
-  readonly #privatePlans = new Map<string, PlannedStatement>();
+  #privatePlans: PlanCache<PlannedStatement> | null = null;
   /** Rules against this transaction's own schema changes, on the same lifetime as its plans. */
   #txRules: RuleCache | null = null;
   /** Affected rows per table of the open transaction, for its COMMIT's frame and outcome. */
@@ -588,10 +602,12 @@ class ComposedSession implements EngineSession {
     // transaction could reach the same version number with different contents.
     if (this.#tx === null || catalog.version === this.#writePath().catalog.version)
       return this.#engine.plan(text, catalog);
-    const cached = this.#privatePlans.get(text);
+    const cache = (this.#privatePlans ??= this.#engine.privatePlans());
+    const cached = cache.get(text);
     if (cached?.catalogVersion === catalog.version) return cached;
+    if (cached !== undefined) cache.delete(text);
     const planned = this.#engine.lower(text, catalog);
-    this.#privatePlans.set(text, planned);
+    cache.set(text, planned);
     return planned;
   }
 
@@ -662,7 +678,7 @@ class ComposedSession implements EngineSession {
     this.#readOnly = false;
     this.#startedAtMs = null;
     this.#savepoints = [];
-    this.#privatePlans.clear();
+    this.#privatePlans?.clear();
     this.#txRules?.clear();
     this.#txCounts = {};
   }
@@ -1123,7 +1139,7 @@ class ComposedSession implements EngineSession {
           if (entry.savepoint !== null) this.#tx?.rollbackTo(entry.savepoint);
           this.#savepoints.length = index + 1;
           this.#txCounts = { ...entry.counts };
-          this.#privatePlans.clear();
+          this.#privatePlans?.clear();
           this.#txRules?.clear();
           if (this.#state === "failed") this.#state = "open";
         }
@@ -1255,8 +1271,12 @@ class ComposedSession implements EngineSession {
   }
 
   close(): void {
-    this.rollback();
-    this.#txRules?.close();
-    this.#txRules = null;
+    try {
+      this.rollback();
+    } finally {
+      if (this.#privatePlans !== null) this.#engine.closePrivatePlans(this.#privatePlans);
+      this.#txRules?.close();
+      this.#txRules = null;
+    }
   }
 }
