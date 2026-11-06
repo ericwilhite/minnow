@@ -311,6 +311,12 @@ const IN_ORDER = CASES.filter((c) => !c.call.distinct);
 const SORTED = CASES.filter((c) => c.call.distinct);
 /** SUM(float8) alone: its 22003 is not masked by AVG's (which overflows on more inputs). */
 const FLOAT_SUM = CASES.filter((c) => c.sql === "sum(f)");
+/** SUM(float8) with COUNT(*): two row-layout members, so its 22003 is judged in that layout too. */
+const FLOAT_SUM_COUNT = CASES.filter((c) => c.sql === "sum(f)" || c.sql === "count(*)");
+/** COUNT and float SUM/AVG together (AVG's 22003 masks SUM's, which FLOAT_SUM_COUNT judges). */
+const EXTREME_FLOAT_CASES = CASES.filter((c) =>
+  ["count(*)", "count(n)", "sum(f)", "avg(f)"].includes(c.sql),
+);
 
 /** Our value as PostgreSQL's text (numbers by value; floats within rounding for "float"). */
 function render(type: PhysicalType, value: unknown): string {
@@ -410,7 +416,7 @@ async function judge(
   const values = rows
     .map(
       (r) =>
-        `(${r.k === null ? "null::int4" : String(r.k)}, ${r.t === null ? "null::text" : `'${r.t}'`}, ${r.i === null ? "null::int4" : `${String(r.i)}::int4`}, ${r.b === null ? "null::int8" : `${r.b.toString()}::int8`}, ${r.f === null ? "null::float8" : `'${Object.is(r.f, -0) ? "-0" : String(r.f)}'::float8`}, ${numText(r.n)}::numeric, ${r.m === null ? "null::numeric(12,2)" : `${numText(r.m)}::numeric(12,2)`}, ${r.flag === null ? "null::bool" : String(r.flag)})`,
+        `(${r.k === null ? "null::int4" : String(r.k)}, ${r.t === null ? "null::text" : `'${r.t}'`}, ${r.i === null ? "null::int4" : `${String(r.i)}::int4`}, ${r.b === null ? "null::int8" : `'${r.b.toString()}'::int8`}, ${r.f === null ? "null::float8" : `'${Object.is(r.f, -0) ? "-0" : String(r.f)}'::float8`}, ${numText(r.n)}::numeric, ${r.m === null ? "null::numeric(12,2)" : `${numText(r.m)}::numeric(12,2)`}, ${r.flag === null ? "null::bool" : String(r.flag)})`,
     )
     .join(", ");
   // An empty input: one typed NULL row, filtered out (VALUES cannot be empty).
@@ -496,6 +502,48 @@ describe("aggregation against PostgreSQL (PGlite, generated)", () => {
           },
         ),
         { seed, numRuns: 120 },
+      );
+      reach.assertReached();
+    },
+    180_000,
+  );
+
+  it.each(SEEDS)(
+    "COUNT and float SUM/AVG over extreme float8 values, grouped, against PostgreSQL (seed %i)",
+    async (seed) => {
+      // f is mostly ±1e308, ±Infinity, NaN and −0, in a few groups, so float8pl's and
+      // float8_accum's 22003 rules and SUM's −0 identity are judged per group (the main property
+      // rarely puts two overflowing finite values in one group).
+      const reach = createReach("next-aggregate-pglite-extreme-float", [
+        "float SUM overflow in a group",
+        "infinite input",
+        "negative-zero-only group",
+      ] as const);
+      const extreme = fc.constantFrom(1e308, -1e308, Infinity, -Infinity, NaN, -0, 0, 1.5, null);
+      await fc.assert(
+        fc.asyncProperty(
+          fc.array(fc.tuple(rowArb, extreme), { minLength: 1, maxLength: 12 }),
+          fc.integer({ min: 1, max: 6 }),
+          async (pairs, split) => {
+            reach.beginHistory();
+            const rows = pairs.map(([r, f]) => ({ ...r, f }));
+            const groups = new Map<string, Array<number | null>>();
+            for (const r of rows)
+              groups.set(r.t ?? "\u0000", [...(groups.get(r.t ?? "\u0000") ?? []), r.f]);
+            for (const values of groups.values()) {
+              const finite = values.filter((v): v is number => v !== null && Number.isFinite(v));
+              if (finite.length > 1 && !Number.isFinite(finite.reduce((a, b) => a + b, 0)))
+                reach.reach("float SUM overflow in a group");
+              if (values.some((v) => v === Infinity || v === -Infinity))
+                reach.reach("infinite input");
+              if (values.length > 0 && values.every((v) => Object.is(v, -0)))
+                reach.reach("negative-zero-only group");
+            }
+            await judge(rows, 1, EXTREME_FLOAT_CASES, split, false);
+            await judge(rows, 1, FLOAT_SUM_COUNT, split, false);
+          },
+        ),
+        { seed, numRuns: 80 },
       );
       reach.assertReached();
     },
