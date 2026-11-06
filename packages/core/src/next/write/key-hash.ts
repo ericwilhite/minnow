@@ -324,6 +324,34 @@ export class KeyDelta {
     }
   }
 
+  /**
+   * The smallest and largest key this delta has ever held (key slots, cached until a key is
+   * added; popped entries keep their keys, so the range may be wider: sound for skipping), or
+   * null when it has no key. For deltas that no longer change (frozen, staged, published
+   * memtables), it is computed once.
+   */
+  keyRange(): { readonly min: Uint8Array; readonly max: Uint8Array } | null {
+    if (this.keyCount === 0) return null;
+    if (this.#range !== null && this.#rangeKeys === this.keyCount) return this.#range;
+    const arena = this.#arena;
+    const starts = this.#keyStart;
+    const ends = this.#keyEnd;
+    let min = 0;
+    let max = 0;
+    for (let slot = 1; slot < this.keyCount; slot++) {
+      const start = starts[slot] ?? 0;
+      const end = ends[slot] ?? 0;
+      if (compareBytes(arena, start, end, arena, starts[min] ?? 0, ends[min] ?? 0) < 0) min = slot;
+      if (compareBytes(arena, start, end, arena, starts[max] ?? 0, ends[max] ?? 0) > 0) max = slot;
+    }
+    this.#range = { min: this.keyBytes(min).slice(), max: this.keyBytes(max).slice() };
+    this.#rangeKeys = this.keyCount;
+    return this.#range;
+  }
+
+  #range: { readonly min: Uint8Array; readonly max: Uint8Array } | null = null;
+  #rangeKeys = 0;
+
   /** Scratch for one key's entries in `forEachSorted`. */
   #scratch = new Int32Array(16);
 

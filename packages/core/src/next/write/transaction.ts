@@ -1191,10 +1191,16 @@ export class TableWriterImpl implements TableWriter {
       if (compareBytes(bytes, start, end, bytes, delta.keyStart(high), delta.keyEnd(high)) > 0)
         high = slot;
     }
-    reader.skipRunsOutside(delta.keyBytes(low), delta.keyBytes(high));
+    const lowKey = delta.keyBytes(low);
+    const highKey = delta.keyBytes(high);
+    // No other layer can hold the batch's keys (perf step 3): a key is a suspect only if its own
+    // chain in this delta holds another entry, so most keys need no lookup at all.
+    const alone = !reader.othersOverlap(lowKey, highKey, delta);
+    reader.skipRunsOutside(lowKey, highKey);
     const run = (first: number): Promise<void> | undefined => {
       for (let entry = first; entry < to; entry++) {
         const slot = delta.keyOf(entry);
+        if (alone && delta.head(slot) === entry && delta.nextEntry(entry) < 0) continue;
         const found = reader.countRange(delta.keyArena(), delta.keyStart(slot), delta.keyEnd(slot));
         if (found instanceof Promise)
           return found.then((count) => {

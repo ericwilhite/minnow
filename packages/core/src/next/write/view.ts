@@ -53,6 +53,7 @@ import { compareBytes } from "../vector/varlen.js";
 import { MEMORY_CHUNK_ROWS } from "./columns.js";
 import type { GroupDirectory } from "./groups.js";
 import { groupRootOf, type Memtable } from "./memtable.js";
+import type { KeyDelta } from "./key-hash.js";
 import type { RunEntry } from "./runs.js";
 import { groupDeletions, type Shared, type TableView, type WriteState } from "./state.js";
 import { need } from "./bytes.js";
@@ -822,6 +823,34 @@ export class ViewIndex implements IndexReader {
   }
 
   #skip: Set<RunRef> | null = null;
+
+  /**
+   * Whether any layer but the delta `own` (the live memtable's, which a statement writes into)
+   * could hold a key in `[low, high]` (byte order): durable runs, staged and published runs and
+   * other memtables' deltas are compared by their key ranges (perf step 3).
+   */
+  othersOverlap(low: Uint8Array, high: Uint8Array, own: KeyDelta): boolean {
+    const outside = (min: Uint8Array, max: Uint8Array) =>
+      compareBytes(max, 0, max.length, low, 0, low.length) < 0 ||
+      compareBytes(min, 0, min.length, high, 0, high.length) > 0;
+    for (const run of this.table.tableView.runs.get(this.def.id) ?? NO_RUNS)
+      if (!outside(run.minKey, run.maxKey)) return true;
+    for (const memtable of this.table.tableView.memtables) {
+      for (const run of memtable.staged?.runs.get(this.def.id) ?? NO_RUNS)
+        if (!outside(run.minKey, run.maxKey)) return true;
+      const published = memtable.published;
+      if (published !== null && memtable.deltasDropped) {
+        const run = published.runs.get(this.def.id);
+        if (run !== undefined && !outside(run.minKey, run.maxKey)) return true;
+        continue;
+      }
+      const delta = memtable.deltas.get(this.def.id);
+      if (delta === undefined || delta === own) continue;
+      const range = delta.keyRange();
+      if (range !== null && !outside(range.min, range.max)) return true;
+    }
+    return false;
+  }
 
   /**
    * Resolution from layer `from`, sub-layer `sub`. A memtable is one layer: sub-layer 0 is its
