@@ -15,8 +15,8 @@
  *   normalized key bytes and prefix words (key mode), and sorted as row ids (the locator): radix
  *   over the prefix, byte refinement of ties; payload is gathered only for the rows emitted.
  * - **Top-N** (k = offset + limit): rows are kept while their key beats the current k-th key (a
- *   threshold); at 2k candidates the buffer is compacted to its best k (ties kept for WITH TIES),
- *   so memory is O(k) and most rows are rejected after their key is encoded. A k too large for
+ *   threshold); periodically the buffer is compacted to its best k (ties kept for WITH TIES),
+ *   so memory is O(k) and most rows are rejected before encoding when their first numeric key is worse. Ties and unsupported first keys use the full encoded comparison. A k too large for
  *   memory falls back to the external sort, still filtering by the threshold.
  * - **Per-group top-k** compacts the same way per partition (≤ k survivors per group); if the
  *   survivors do not fit, it falls back to the external sort with the per-group cut at output.
@@ -56,6 +56,7 @@ import {
 } from "./pipeline.js";
 import {
   DirectKeyEncoder,
+  FirstKeyThreshold,
   PREFIX_WORDS,
   RadixScratch,
   SortKeyEncoder,
@@ -105,7 +106,8 @@ const COMPACT_RESERVE_ROWS = 65_536;
  * A sorter's own scratch (R23.1), charged at construction: survivor rows, partition key
  * lengths, identity rows and group survivors per batch row, and the radix histograms.
  */
-const SORTER_SCRATCH_BYTES = BATCH_ROWS * (2 + 4 + 2 + 2) + RadixScratch.BYTES;
+const SORTER_SCRATCH_BYTES =
+  BATCH_ROWS * (2 + 4 + 2 + 2) + RadixScratch.BYTES + FirstKeyThreshold.BYTES;
 
 export interface SortSpec {
   readonly types: readonly PhysicalType[];
@@ -343,6 +345,9 @@ class Sorter {
   readonly partLengths = new Int32Array(BATCH_ROWS);
   /** Rows 0 … BATCH_ROWS − 1 (never written after construction). */
   readonly #identity = Uint16Array.from({ length: BATCH_ROWS }, (_, i) => i);
+  /** Group thresholds (partition > 0), or the raw first-key gate (partition = 0).
+   * This charged buffer is distinct from keptRows, which full-key filtering overwrites.
+   */
   readonly groupKept = new Uint16Array(BATCH_ROWS);
   readonly radix = new RadixScratch();
   #groupKeptCount = 0;
@@ -365,6 +370,7 @@ class Sorter {
   #threshold: Uint8Array | null = null;
   /** Direct mode: the threshold's prefix words. */
   #thresholdWords: Uint32Array | null = null;
+  readonly #firstThreshold: FirstKeyThreshold | null;
   /** Fixed-width keys encoded straight into the prefix words (no key bytes, no refinement). */
   readonly direct: boolean;
   readonly directEncoder: DirectKeyEncoder | null;
@@ -428,6 +434,15 @@ class Sorter {
       };
     this.direct =
       this.mode === "keys" && spec.partition === 0 && directWidth(spec.types, spec.keys) !== null;
+    const first = spec.keys[0];
+    this.#firstThreshold =
+      this.mode === "keys" &&
+      spec.partition === 0 &&
+      spec.keep !== null &&
+      first !== undefined &&
+      directWidth(spec.types, [first]) !== null
+        ? new FirstKeyThreshold(first)
+        : null;
     this.directEncoder = this.direct
       ? new DirectKeyEncoder(spec.types, spec.keys, this.pool)
       : null;
@@ -506,7 +521,19 @@ class Sorter {
   }
 
   #addRows(columns: readonly Vector[], ids: Uint16Array | null, count: number): MaybePromise<void> {
-    if (this.mode === "keys") return this.#addKeyed(columns, ids, count);
+    if (this.mode === "keys") {
+      const gate = this.#firstThreshold;
+      if (gate?.ready) {
+        const vector = columns[gate.key.column];
+        if (vector !== undefined) {
+          const n = gate.filter(vector, ids, count, this.groupKept);
+          this.profile.rejected += count - n;
+          if (n === 0) return;
+          if (n !== count) return this.#addKeyed(columns, this.groupKept.subarray(0, n), n);
+        }
+      }
+      return this.#addKeyed(columns, ids, count);
+    }
     if (this.mode === "ranks" && !this.#collect(columns, ids, count)) this.#toCompare();
     return this.#append(columns, ids, count, [], 0);
   }
@@ -879,6 +906,12 @@ class Sorter {
     }
     if (this.spec.partition === 0 && keep > 0 && survivors.length >= keep) {
       const id = survivors[keep - 1] ?? 0;
+      const gate = this.#firstThreshold;
+      if (gate !== null)
+        gate.capture(
+          this.store.chunk(gate.key.column, id >>> this.store.chunkShift),
+          id & this.store.chunkMask,
+        );
       if (this.direct) this.#thresholdWords = this.#wordsOf(id);
       else {
         const [bytes, start, end] = keyOf(this.store, this.keyColumn, id);

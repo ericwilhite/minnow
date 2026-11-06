@@ -959,6 +959,10 @@ and the owner import it directly.
 - Spill pages (`spill-pages.ts`) are the spill contract's typed layout; every `VectorData`
   variant round-trips. `column-store.ts` is the chunked, charged row store operators keep rows
   in. Both are shared exec/ files (ruling R20.2) for aggregation spill and sort runs as well.
+  Store-to-store gathers bulk-copy fully checked contiguous spans of non-null int32/f64
+  storage (including safe int64), across chunk boundaries; other permutations and negative
+  row ids keep the ordinary gather. `exec/column-gather.bench.ts` isolates contiguous and
+  arbitrary gathers with prebuilt input and untimed result checks.
 - Inner, semi and right joins publish runtime filters (exact bitmap, split-block Bloom, bounds)
   when the build stays resident; a filter never drops a row that can match, and stops testing
   when it keeps over 90 % of probes.
@@ -981,8 +985,11 @@ and the owner import it directly.
   mode), in memory and across runs (DECISIONS.md C8). Compare mode decodes each row's JSONB,
   array and ICU text keys once, as the row arrives (for a merge, once per page), and charges the
   decoded values to the grant, so a run's comparisons never decode.
-- Top-N keeps rows only while they beat the k-th best key and compacts at 2k (O(k) memory, WITH
-  TIES kept). Up to 65,536 kept rows, it holds its next compaction's store in reserve, so a full
+- Top-N periodically compacts buffered candidates to the best k rows (WITH TIES kept).
+  Once a threshold is available, rows whose first fixed-width numeric key is strictly worse
+  are rejected before key encoding. First-key ties and unsupported first-key types retain the
+  full comparison. The fixed scalar snapshot is charged and retains no input buffers.
+  Up to 65,536 kept rows, it holds its next compaction's store in reserve, so a full
   grant compacts instead of spilling whenever it can hold the kept rows twice. `GroupTopKOperator` is ROW_NUMBER() ≤ k per partition (the row number appended);
   after a compaction each partition keeps its k-th key, and rows that cannot beat it are dropped.
 - Grant-or-spill: sorted runs of typed spill pages, merged with a fan-in the spill pool's room
@@ -990,6 +997,17 @@ and the owner import it directly.
 - Finish work (compaction, the sort, the merge, emission) runs in slices of `YIELD_INTERVAL_MS`
   with a real task yield between them; each slice and each resumption after backpressure checks
   the abort signal (ruling R23). Scratch that lives across a suspension belongs to the operator.
+
+The isolated CPU benchmarks `exec/sort-radix.bench.ts` and `exec/window-sort.bench.ts`
+measure prefix sorting and grouped window sorting separately from input construction and
+window evaluation. Bundle each with esbuild for Node and run with `node --expose-gc`; `ROWS`
+and `RUNS` set the input size and measured repetitions. The grouped benchmark also accepts
+`GROUPS`. Compare revision bundles in at least five interleaved rounds. These component
+measurements do not establish the whole-query browser performance gates.
+`exec/sort-direct.bench.ts` isolates fixed-width key normalization on prebuilt batches,
+checking every word against frozen sort-key bytes outside CPU timing.
+`exec/topn-filter.bench.ts` compares encode-first and raw-filter-first on prebuilt batches
+with a fixed threshold; use `MODE=encode` and `MODE=filter` in interleaved rounds.
 
 ### Windows (`exec/window.ts`, `window-sort.ts`, `window-frames.ts`, `window-stream.ts`)
 

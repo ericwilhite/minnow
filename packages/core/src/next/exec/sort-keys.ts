@@ -802,6 +802,140 @@ export class DirectKeyEncoder {
   }
 }
 
+/** Conservative first-key Top-N gate. Ties always reach the full key comparator.
+ * The owner reserves BYTES for this fixed scalar snapshot; no input buffers are retained.
+ */
+export class FirstKeyThreshold {
+  static readonly BYTES = 128;
+  ready = false;
+  #null = false;
+  #integer = false;
+  #value = 0;
+  #hi = 0;
+  #lo = 0;
+  constructor(readonly key: SortColumn) {}
+
+  capture(vector: FlatVector, row: number): void {
+    this.#null = !bit(vector.validity, row);
+    const data = vector.data;
+    this.#integer = data.layout === "int64";
+    if (data.layout === "int64") {
+      if (data.values.repr === "safe") {
+        const value = data.values.values[row] ?? 0;
+        this.#hi = Math.floor(value / 4294967296) | 0;
+        this.#lo = (value - this.#hi * 4294967296) >>> 0;
+      } else {
+        const words = wordsOf(data.values.values);
+        this.#hi = (words[row * 2 + 1] ?? 0) | 0;
+        this.#lo = (words[row * 2] ?? 0) >>> 0;
+      }
+    } else if (
+      data.layout === "f64" ||
+      data.layout === "f32" ||
+      data.layout === "i32" ||
+      data.layout === "bool"
+    ) {
+      this.#value = data.values[row] ?? 0;
+    } else {
+      this.ready = false;
+      return;
+    }
+    this.ready = true;
+  }
+
+  filter(vector: Vector, ids: Uint16Array | null, count: number, out: Uint16Array): number {
+    if (!this.ready) return count;
+    const desc = this.key.direction === "desc";
+    const nullsFirst = this.key.nulls === "first";
+    let n = 0;
+    const plain = vector.form === "flat" ? vector : null;
+    if (plain !== null && plain.validity === null && !this.#null && !this.#integer) {
+      const data = plain.data;
+      if (
+        data.layout === "f64" ||
+        data.layout === "f32" ||
+        data.layout === "i32" ||
+        data.layout === "bool"
+      ) {
+        const values = data.values;
+        const bound = this.#value;
+        const nanBound = bound !== bound;
+        for (let i = 0; i < count; i++) {
+          const row = ids === null ? i : (ids[i] ?? 0);
+          const value = values[row] ?? 0;
+          if (
+            nanBound
+              ? !desc || value !== value
+              : desc
+                ? value >= bound || value !== value
+                : value <= bound
+          )
+            out[n++] = row;
+        }
+        return n;
+      }
+    }
+    for (let i = 0; i < count; i++) {
+      const row = ids === null ? i : (ids[i] ?? 0);
+      let flat: FlatVector;
+      let slot: number;
+      if (plain !== null) {
+        flat = plain;
+        slot = bit(plain.validity, row) ? row : -1;
+      } else {
+        [flat, slot] = resolveRow(vector, row);
+        if (slot >= 0 && !bit(flat.validity, slot)) slot = -1;
+      }
+      let order = 0;
+      if (slot < 0 || this.#null) {
+        if (slot < 0 !== this.#null) order = slot < 0 === nullsFirst ? -1 : 1;
+      } else {
+        const data = flat.data;
+        if (this.#integer && data.layout === "int64") {
+          let hi: number;
+          let lo: number;
+          if (data.values.repr === "safe") {
+            const value = data.values.values[slot] ?? 0;
+            hi = Math.floor(value / 4294967296) | 0;
+            lo = (value - hi * 4294967296) >>> 0;
+          } else {
+            const words = wordsOf(data.values.values);
+            hi = (words[slot * 2 + 1] ?? 0) | 0;
+            lo = (words[slot * 2] ?? 0) >>> 0;
+          }
+          order =
+            hi < this.#hi ? -1 : hi > this.#hi ? 1 : lo < this.#lo ? -1 : lo > this.#lo ? 1 : 0;
+        } else if (
+          !this.#integer &&
+          (data.layout === "f64" ||
+            data.layout === "f32" ||
+            data.layout === "i32" ||
+            data.layout === "bool")
+        ) {
+          const value = data.values[slot] ?? 0;
+          const bound = this.#value;
+          order =
+            value < bound
+              ? -1
+              : value > bound
+                ? 1
+                : value === bound
+                  ? 0
+                  : value !== value
+                    ? bound !== bound
+                      ? 0
+                      : 1
+                    : -1;
+        }
+        // Unsupported representations conservatively tie; they go to the full comparator.
+        if (desc) order = -order;
+      }
+      if (order <= 0) out[n++] = row;
+    }
+    return n;
+  }
+}
+
 // --- MSD radix over (prefix words, row id) tuples -----------------------------------------
 
 /** Tuple stride: the prefix words then the row id. */

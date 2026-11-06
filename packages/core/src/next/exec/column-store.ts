@@ -1357,6 +1357,14 @@ function pushArray(column: Column, k = column.chunks.length - 1): void {
  * Gather kernels: `dst[at + i] = chunk(ids[from + i])[slot]`, −1 ids skipped. One per array type,
  * so every element access stays monomorphic. They return how many ids were −1.
  */
+/** A fully checked contiguous run (endpoints alone do not establish a permutation). */
+function contiguousStart(ids: ArrayLike<number>, from: number, n: number): number {
+  const first = ids[from] ?? -1;
+  if (n < 2 || first < 0 || ids[from + n - 1] !== first + n - 1) return -1;
+  for (let i = 1; i + 1 < n; i++) if (ids[from + i] !== first + i) return -1;
+  return first;
+}
+
 function gatherI32(
   arrays: Int32Array[],
   ids: ArrayLike<number>,
@@ -1367,6 +1375,20 @@ function gatherI32(
   shift: number,
   mask: number,
 ): number {
+  const first = contiguousStart(ids, from, n);
+  if (first >= 0) {
+    let copied = 0;
+    while (copied < n) {
+      const id = first + copied;
+      const values = arrays[id >>> shift];
+      if (values === undefined) break;
+      const slot = id & mask;
+      const take = Math.min(n - copied, (1 << shift) - slot);
+      dst.set(values.subarray(slot, slot + take), at + copied);
+      copied += take;
+    }
+    if (copied === n) return 0;
+  }
   let nulls = 0;
   for (let i = 0; i < n; i++) {
     const id = ids[from + i] ?? -1;
@@ -1386,6 +1408,20 @@ function gatherF64(
   shift: number,
   mask: number,
 ): number {
+  const first = contiguousStart(ids, from, n);
+  if (first >= 0) {
+    let copied = 0;
+    while (copied < n) {
+      const id = first + copied;
+      const values = arrays[id >>> shift];
+      if (values === undefined) break;
+      const slot = id & mask;
+      const take = Math.min(n - copied, (1 << shift) - slot);
+      dst.set(values.subarray(slot, slot + take), at + copied);
+      copied += take;
+    }
+    if (copied === n) return 0;
+  }
   let nulls = 0;
   for (let i = 0; i < n; i++) {
     const id = ids[from + i] ?? -1;
