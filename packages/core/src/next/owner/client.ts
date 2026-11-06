@@ -17,12 +17,15 @@
  * not seen fails with `SessionLostError` and never runs.
  *
  * ## Sessions bound to their generation
- * A session with an open transaction (any state but `idle`, or a BEGIN unanswered) belongs to the
- * connection generation it ran on. A reconnect loses it: every request on it then fails with
- * `SessionLostError("transaction")` without being sent, so nothing can fall through to
- * autocommit on the new owner, until the client ends the session explicitly (`rollback`, or a
- * ROLLBACK / ABORT statement). Requests that were in flight on it fail the same way, except a
- * COMMIT: it is resent, and the ledger answers it if it committed (ending the session).
+ * A session with an open transaction (any state but `idle`) belongs to the connection generation
+ * it ran on. Each request knows its kind (sequence.ts "Statement kinds": typed messages, the
+ * owner's `statementKind` for prepared statements, `classifyStatementText` for SQL). On a
+ * reconnect, in send order: an unanswered `begin` or `unknown` request is failed, never resent,
+ * and its session is lost; a `commit` is resent and the ledger answers it (ending the session);
+ * a `rollback` ends the session; any other request of a lost session is failed. Afterwards every
+ * request on a lost session fails with `SessionLostError("transaction")` without being sent, so
+ * nothing can fall through to autocommit on the new owner, until the client ends the session
+ * explicitly. Failures reach a cursor's consumer as well as its promise (`#fail`).
  *
  * ## Handshake
  * `connect` and `reconnect` take an optional `AbortSignal`: the connector aborts a handshake whose
@@ -43,6 +46,7 @@ import {
   DEFAULT_RESULT_WINDOW_BYTES,
   PROTOCOL_VERSION,
   type OwnerMessage,
+  type PreparedStatementKind,
   type Request,
   type StatementSummary,
   type StepDown,
@@ -51,7 +55,12 @@ import {
   type WireColumnMeta,
   type WireValue,
 } from "./protocol.js";
-import { RequestSequencer, isResendable, mayControlTransaction } from "./sequence.js";
+import {
+  RequestSequencer,
+  classifyStatementText,
+  isResendable,
+  type StatementKind,
+} from "./sequence.js";
 
 export interface ClientResult {
   readonly columns: readonly WireColumnMeta[];
@@ -86,6 +95,9 @@ interface Pending {
   readonly generation: number;
   readonly resendable: boolean;
   readonly body: Body;
+  /** What it does to its session's transaction (null: not a session request). */
+  readonly kind: StatementKind | null;
+  /** It may open, end or change a transaction: `kind` is neither `other` nor null. */
   readonly control: boolean;
   readonly session: number | null;
   columns: readonly WireColumnMeta[] | null;
@@ -190,8 +202,8 @@ export class ProtocolClient {
   #ownerId: string | null = null;
   #welcome: { resolve: (welcome: Welcome) => void; reject: (error: Error) => void } | null = null;
   #prepared = 0;
-  /** Prepared id → whether it may control a transaction (protocol.ts `Prepared`). */
-  readonly #preparedControl = new Map<number, boolean>();
+  /** Prepared id → its statement kind, as the owner's front end classified it (`Prepared`). */
+  readonly #preparedKinds = new Map<number, PreparedStatementKind>();
   #closed = false;
   onSessionAborted: ((session: number) => void) | null = null;
   /** Called whenever requests in flight or pins change (the connector's liveness and watcher). */
@@ -244,34 +256,44 @@ export class ProtocolClient {
   /** Opens the next generation on `port` and resends unanswered requests. */
   async reconnect(port: MessagePort, signal?: AbortSignal): Promise<Welcome> {
     const welcome = await this.#open(port, signal);
+    const lost = this.#lostSessions;
     // Every session with a transaction open on the old generation is lost with it.
-    for (const [session, state] of this.#sessions)
-      if (state !== "idle") this.#lostSessions.add(session);
-    if (this.#session0.transaction !== "idle") this.#lostSessions.add(0);
-    for (const pending of this.#pending.values())
-      if (pending.session !== null && pending.body.t === "begin")
-        this.#lostSessions.add(pending.session);
-    for (const session of this.#lostSessions) this.#sessions.set(session, "idle");
+    for (const [session, state] of this.#sessions) if (state !== "idle") lost.add(session);
+    if (this.#session0.transaction !== "idle") lost.add(0);
+    for (const session of lost) this.#sessions.set(session, "idle");
     this.#session0.transaction = "idle";
+    // In send order, so a BEGIN in flight makes the session's later requests part of it.
     for (const pending of [...this.#pending.values()].sort((a, b) => a.seq - b.seq)) {
-      if (pending.handedOut) {
-        this.#settle(pending.seq);
-        pending.reject(new SessionLostError("cursor", pending.seq));
-        continue;
-      }
-      if (
-        pending.session !== null &&
-        this.#lostSessions.has(pending.session) &&
-        sessionEffect(pending.body) !== "commit"
-      ) {
-        if (sessionEffect(pending.body) === "end") {
-          // The ROLLBACK the client already asked for: the transaction is gone either way.
-          this.#lostSessions.delete(pending.session);
-          this.#send(pending, true);
+      const { session, kind } = pending;
+      if (session !== null && kind !== null) {
+        if (kind === "begin" || kind === "unknown") {
+          // It may have opened a transaction (or, unknown, done anything): never resend it, and
+          // refuse what follows on the session until it is ended explicitly.
+          lost.add(session);
+          this.#fail(
+            pending,
+            new SessionLostError(
+              "transaction",
+              pending.seq,
+              kind === "unknown" ? "unknown" : "none",
+            ),
+          );
           continue;
         }
-        this.#settle(pending.seq);
-        pending.reject(new SessionLostError("transaction", pending.seq));
+        if (kind === "rollback") {
+          // The ROLLBACK the client already asked for: the transaction is gone either way.
+          lost.delete(session);
+        } else if (kind !== "commit" && lost.has(session)) {
+          // It ran, if at all, inside a transaction that rolled back with the old owner.
+          this.#fail(pending, new SessionLostError("transaction", pending.seq));
+          continue;
+        }
+        // A COMMIT is resent unchanged: the new owner's ledger answers it if it committed.
+      }
+      if (pending.handedOut) {
+        // Frames already reached the caller, so it cannot start again. An autocommit write's
+        // RETURNING frames come only after its commit: the effect is not known to be none.
+        this.#fail(pending, new SessionLostError("cursor", pending.seq, "unknown"));
         continue;
       }
       pending.frames.length = 0;
@@ -329,8 +351,10 @@ export class ProtocolClient {
     this.#closed = true;
     this.#port?.postMessage({ t: "bye" });
     this.#port?.close();
-    for (const pending of this.#pending.values()) pending.reject(new ClientClosedError());
-    this.#pending.clear();
+    const welcome = this.#welcome;
+    this.#welcome = null;
+    welcome?.reject(new ClientClosedError());
+    for (const pending of [...this.#pending.values()]) this.#fail(pending, new ClientClosedError());
   }
 
   // ---- requests ----
@@ -344,29 +368,26 @@ export class ProtocolClient {
       readonly wantRows?: boolean;
     } = {},
   ): Promise<ClientResult> {
-    return this.#request(
-      {
-        t: "statement",
-        session: options.session ?? 0,
-        text: sql,
-        prepared: null,
-        knownColumnsVersion: -1,
-        params,
-        result: {
-          windowBytes: options.windowBytes ?? DEFAULT_RESULT_WINDOW_BYTES,
-          frameRows: null,
-          wantRows: options.wantRows ?? true,
-        },
+    return this.#request({
+      t: "statement",
+      session: options.session ?? 0,
+      text: sql,
+      prepared: null,
+      knownColumnsVersion: -1,
+      params,
+      result: {
+        windowBytes: options.windowBytes ?? DEFAULT_RESULT_WINDOW_BYTES,
+        frameRows: null,
+        wantRows: options.wantRows ?? true,
       },
-      mayControlTransaction(sql),
-    ).promise;
+    }).promise;
   }
 
   async prepare(
     sql: string,
   ): Promise<{ readonly id: number; readonly columns: readonly WireColumnMeta[] }> {
     const id = ++this.#prepared;
-    const result = await this.#request({ t: "prepare", id, text: sql }, false).promise;
+    const result = await this.#request({ t: "prepare", id, text: sql }).promise;
     return { id, columns: result.columns };
   }
 
@@ -376,40 +397,32 @@ export class ProtocolClient {
     session = 0,
     knownColumnsVersion = -1,
   ): Promise<ClientResult> {
-    return this.#request(
-      {
-        t: "statement",
-        session,
-        text: null,
-        prepared: id,
-        knownColumnsVersion,
-        params,
-        result: { windowBytes: DEFAULT_RESULT_WINDOW_BYTES, frameRows: null, wantRows: true },
-      },
-      // A prepared statement may be BEGIN or COMMIT: the owner said so at prepare time; unknown
-      // is treated as control (it only costs resendability).
-      this.#preparedControl.get(id) ?? true,
-    ).promise;
+    return this.#request({
+      t: "statement",
+      session,
+      text: null,
+      prepared: id,
+      knownColumnsVersion,
+      params,
+      result: { windowBytes: DEFAULT_RESULT_WINDOW_BYTES, frameRows: null, wantRows: true },
+    }).promise;
   }
 
   begin(session: number, readOnly = false): Promise<ClientResult> {
-    return this.#request({ t: "begin", session, readOnly }, true).promise;
+    return this.#request({ t: "begin", session, readOnly }).promise;
   }
 
   commit(session: number): Promise<ClientResult> {
-    return this.#request({ t: "commit", session }, true).promise;
+    return this.#request({ t: "commit", session }).promise;
   }
 
   rollback(session: number): Promise<ClientResult> {
-    return this.#request({ t: "rollback", session }, true).promise;
+    return this.#request({ t: "rollback", session }).promise;
   }
 
   /** Sends a request and returns its seq with its promise (for cancellation and retries in tests). */
-  send(
-    body: Body,
-    control = false,
-  ): { readonly seq: number; readonly promise: Promise<ClientResult> } {
-    return this.#request(body, control);
+  send(body: Body): { readonly seq: number; readonly promise: Promise<ClientResult> } {
+    return this.#request(body);
   }
 
   /** A cursor: frames released as they are taken. */
@@ -433,7 +446,6 @@ export class ProtocolClient {
           wantRows: true,
         },
       },
-      false,
       queue,
     );
     promise.catch(() => undefined);
@@ -479,16 +491,39 @@ export class ProtocolClient {
     if (this.connected) this.#port?.postMessage({ t: "liveness", held });
   }
 
+  /** What `body` does to its session's transaction (sequence.ts "Statement kinds"). */
+  #kindOf(body: Body): StatementKind | null {
+    switch (body.t) {
+      case "begin":
+      case "commit":
+      case "rollback":
+        return body.t;
+      case "write":
+        return "other";
+      case "statement":
+        // Prepared: the owner's front end said; an id it never answered for is unknown.
+        if (body.text === null)
+          return body.prepared === null
+            ? "unknown"
+            : (this.#preparedKinds.get(body.prepared) ?? "unknown");
+        return classifyStatementText(body.text);
+      default:
+        return null;
+    }
+  }
+
   #request(
     body: Body,
-    control: boolean,
     cursor: CursorQueue | null = null,
   ): { readonly seq: number; readonly promise: Promise<ClientResult> } {
     if (this.#closed) return { seq: -1, promise: Promise.reject(new ClientClosedError()) };
     const session = "session" in body ? body.session : null;
+    const kind = this.#kindOf(body);
+    const control = kind !== null && kind !== "other";
     if (session !== null && this.#lostSessions.has(session)) {
-      // Never sent: on the new owner it would run outside the lost transaction (autocommit).
-      if (sessionEffect(body) !== "end")
+      // Never sent, so nothing took effect: on the new owner it would run outside the lost
+      // transaction (autocommit). Only an explicit end (ROLLBACK, ABORT) goes through.
+      if (kind !== "rollback")
         return { seq: -1, promise: Promise.reject(new SessionLostError("transaction")) };
       this.#lostSessions.delete(session);
     }
@@ -511,6 +546,7 @@ export class ProtocolClient {
       generation: this.#generation,
       resendable,
       body,
+      kind,
       control,
       session,
       columns: null,
@@ -558,6 +594,20 @@ export class ProtocolClient {
     queueMicrotask(() => this.onActivity?.());
   }
 
+  /**
+   * Fails a request: settles it, then rejects both its promise and its cursor queue (a cursor's
+   * consumer waits on the queue, not the promise). Every failure goes through here: an error
+   * reply, a broken frame, a reconnect, `close()`.
+   */
+  #fail(pending: Pending, error: Error): void {
+    this.#settle(pending.seq);
+    if (pending.cursor !== null) {
+      pending.cursor.error = error;
+      pending.cursor.wake?.();
+    }
+    pending.reject(error);
+  }
+
   // ---- incoming ----
 
   #receive(message: OwnerMessage): void {
@@ -585,13 +635,7 @@ export class ProtocolClient {
         } catch (error) {
           // A frame out of order or a broken delta: fail this request, never the handler.
           this.cancel(message.seq);
-          this.#settle(message.seq);
-          const failure = error instanceof Error ? error : new Error(String(error));
-          if (pending.cursor !== null) {
-            pending.cursor.error = failure;
-            pending.cursor.wake?.();
-          }
-          pending.reject(failure);
+          this.#fail(pending, error instanceof Error ? error : new Error(String(error)));
           return;
         }
         const last = message.frames.at(-1);
@@ -606,7 +650,7 @@ export class ProtocolClient {
         }
         if (message.t === "done") {
           // A COMMIT resent after a reconnect, answered (from the ledger): the session ended.
-          if (pending.session !== null && sessionEffect(pending.body) === "commit")
+          if (pending.session !== null && pending.kind === "commit")
             this.#lostSessions.delete(pending.session);
           if (pending.session === 0) this.#session0.transaction = message.summary.transaction;
           if (pending.session !== null)
@@ -627,7 +671,7 @@ export class ProtocolClient {
       case "prepared": {
         const pending = this.#pending.get(message.seq);
         if (pending === undefined) return;
-        this.#preparedControl.set(message.id, message.controlsTransaction);
+        this.#preparedKinds.set(message.id, message.statementKind);
         this.#settle(message.seq);
         pending.resolve(
           makeResult(
@@ -652,15 +696,12 @@ export class ProtocolClient {
       case "error": {
         const pending = this.#pending.get(message.seq);
         if (pending === undefined) return;
-        this.#settle(message.seq);
         if (message.t === "error") {
-          const error = fromWireError(message.error, ownerErrorRegistry);
-          if (pending.cursor !== null) {
-            pending.cursor.error = error;
-            pending.cursor.wake?.();
-          }
-          pending.reject(error);
-        } else pending.resolve(makeResult([], [], emptySummary(), pending.dictionaries));
+          this.#fail(pending, fromWireError(message.error, ownerErrorRegistry));
+          return;
+        }
+        this.#settle(message.seq);
+        pending.resolve(makeResult([], [], emptySummary(), pending.dictionaries));
         return;
       }
       case "sessionAborted":
@@ -675,20 +716,6 @@ export class ProtocolClient {
         return;
     }
   }
-}
-
-/** What a request does to its session's transaction, as far as reconnect handling needs. */
-function sessionEffect(body: Body): "commit" | "end" | null {
-  if (body.t === "commit") return "commit";
-  if (body.t === "rollback") return "end";
-  if (body.t !== "statement" || body.text === null) return null;
-  const match = /^\s*(\w+)(?:\s+(\w+))?\s*;?\s*$/u.exec(body.text);
-  const word = match?.[1]?.toLowerCase();
-  const next = match?.[2]?.toLowerCase();
-  if (word === "commit" || word === "end") return "commit";
-  // ROLLBACK and ABORT end the transaction; ROLLBACK TO a savepoint does not.
-  if ((word === "rollback" || word === "abort") && next !== "to") return "end";
-  return null;
 }
 
 function emptySummary(): StatementSummary {

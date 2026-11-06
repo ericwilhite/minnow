@@ -730,16 +730,18 @@ describe("review of increment 2 (B5-p2b-review-1)", () => {
         },
       }),
     });
-    const starting = connector.start();
+    const starting = connector.start().then(
+      () => "started",
+      (error: unknown) => (error as Error).name,
+    );
     await until(() => ready !== undefined);
     connector.close();
-    // Terminated at close, not when (if ever) it would have become ready.
+    // Terminated at close, not when (if ever) it would have become ready; and start() settles at
+    // close although this owner never reports ready (review 2, finding 4).
     expect(terminated).toBe(1);
+    expect(await Promise.race([starting, sleep(200).then(() => "hung")])).toBe("ClientClosedError");
     await sleep(1);
     expect(w.registry.held(hostLockName("late"))).toBe(false);
-    ready?.("late-owner");
-    await starting;
-    await sleep(10);
     expect({ terminated, hosting: connector.hosting }).toEqual({ terminated: 1, hosting: false });
   });
 
@@ -778,6 +780,7 @@ describe("review of increment 2 (B5-p2b-review-1)", () => {
       },
     });
     const starting = connector.start();
+    starting.catch(() => undefined);
     await sleep(10);
     const queued = () =>
       w.registry.query().pending.filter((lock) => lock.name === hostLockName("queued"));
@@ -787,7 +790,7 @@ describe("review of increment 2 (B5-p2b-review-1)", () => {
     // Withdrawn at once, not left to be granted (and released) later.
     expect(queued()).toHaveLength(0);
     release?.();
-    await starting;
+    await expect(starting).rejects.toMatchObject({ name: "ClientClosedError" });
     await sleep(10);
     expect(started).toBe(0);
     expect(w.registry.held(hostLockName("queued"))).toBe(false);
@@ -979,5 +982,40 @@ describe("review of increment 2 (B5-p2b-review-1)", () => {
     closing = true;
     connector.lifecycle("pagehide");
     expect({ terminated, hosting: connector.hosting }).toEqual({ terminated: 1, hosting: false });
+  });
+});
+
+describe("review 2 of increment 2 (B5-p2b-review-2)", () => {
+  it("2: a prepared COMMIT whose reply died with a durable commit is answered from the ledger", async () => {
+    const w = world();
+    const killOnSave = { armed: false };
+    const a: Tab = tab(w, {
+      settings: {
+        onSave: () => {
+          // The commit is durable (its frame and ledger outcome saved): the owner dies before
+          // its reply leaves.
+          if (!killOnSave.armed) return;
+          killOnSave.armed = false;
+          killTab(w, a, 0);
+        },
+      },
+    });
+    await a.connector.start();
+    await a.client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
+    await a.client.query("INSERT INTO t VALUES ($1, $2, $3)", [1, 0, "x"]);
+    const b = tab(w);
+    await b.connector.start();
+    const prepared = await b.client.prepare("COMMIT");
+    await b.client.begin(1);
+    await b.client.query("UPDATE t SET n = n + 1 WHERE id = $1", [1], { session: 1 });
+    killOnSave.armed = true;
+    const result = await b.client.execute(prepared.id, [], 1).then(
+      (answer) => answer.summary.replayed,
+      (error: unknown) => (error as Error).name,
+    );
+    expect({ result, stored: await value(b.client) }).toEqual({ result: true, stored: 1 });
+    // A successor owner answered it, and the session is usable again.
+    expect(w.owners).toHaveLength(2);
+    expect(b.client.lostSessions.has(1)).toBe(false);
   });
 });

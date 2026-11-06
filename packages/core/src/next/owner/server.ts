@@ -920,6 +920,13 @@ class Connection {
       parameters: planned.parameters,
       catalogVersion: planned.catalogVersion,
       controlsTransaction: planned.controlsTransaction,
+      statementKind:
+        planned.control === null
+          ? "other"
+          : planned.control === "other"
+            ? "savepoint"
+            : planned.control,
+      readOnly: planned.lowered.kind === "transactionControl" && planned.lowered.readOnly,
     });
   }
 
@@ -1356,10 +1363,14 @@ class Connection {
       if (stream.live || stream.posted.length === 0 || now - stream.lastActivityMs < limit)
         continue;
       for (const frame of stream.posted.splice(0)) frame.release();
-      stream.results.cancel(new SessionLostError("result", seq));
       const running = this.#running.get(seq);
-      if (running !== undefined && running.run?.reachedCommit !== true) {
-        running.lost = new SessionLostError("result", seq);
+      // "Nothing took effect" only for a run stopped here before its commit point; a statement
+      // that finished or committed may have changed data (an autocommit write's RETURNING).
+      const before = running !== undefined && running.run?.reachedCommit !== true;
+      const lost = new SessionLostError("result", seq, before ? "none" : "unknown");
+      stream.results.cancel(lost);
+      if (before) {
+        running.lost = lost;
         running.abort.abort(running.lost);
       }
       if (stream.finished) this.#streams.delete(seq);
@@ -1381,8 +1392,11 @@ class Connection {
     }
     for (const [seq, stream] of this.#streams) {
       for (const frame of stream.posted.splice(0)) frame.release();
-      if (this.#running.get(seq)?.run?.reachedCommit !== true)
-        stream.results.cancel(new SessionLostError("result"));
+      const running = this.#running.get(seq);
+      if (running?.run?.reachedCommit !== true)
+        stream.results.cancel(
+          new SessionLostError("result", seq, running === undefined ? "unknown" : "none"),
+        );
     }
     this.#streams.clear();
     this.#prepared.clear();

@@ -57,7 +57,7 @@ import {
   type LifecycleEvent,
   type SkewSignal,
 } from "./election.js";
-import { ConnectionRefusedError, OwnerUnreachableError } from "./errors.js";
+import { ClientClosedError, ConnectionRefusedError, OwnerUnreachableError } from "./errors.js";
 import type { OwnerHostInit } from "./host.js";
 import type { StepDown } from "./protocol.js";
 import { watchLock, webLocks, type WebLockManager } from "./web-locks.js";
@@ -113,7 +113,13 @@ export class OwnerConnector {
   #status: ConnectorStatus = "connecting";
   #broker: MessagePort | null = null;
   #nonce = 0;
-  readonly #brokerReplies = new Map<number, (message: BrokerMessage) => void>();
+  readonly #brokerReplies = new Map<
+    number,
+    { readonly reply: (message: BrokerMessage) => void; readonly fail: (error: Error) => void }
+  >();
+  /** Rejected by `close()`: every wait in startup and discovery races it, so none outlives close. */
+  readonly #closedWait: Promise<never>;
+  #rejectClosed: (error: Error) => void = () => undefined;
   #registered: Array<() => void> = [];
   #hosting: { readonly handle: OwnerHandle; readonly lock: HeldLock } | null = null;
   /** An owner this context is starting (not yet ready), or the host-lock wait before it. */
@@ -135,6 +141,10 @@ export class OwnerConnector {
 
   constructor(options: ConnectorOptions) {
     this.#options = options;
+    this.#closedWait = new Promise<never>((_, reject) => {
+      this.#rejectClosed = reject;
+    });
+    this.#closedWait.catch(() => undefined);
     this.#client = options.client;
     // The lock `#updateLiveness` holds is the one the owner must watch.
     this.#client.livenessLock = clientLockName(options.database, options.client.clientId);
@@ -196,6 +206,11 @@ export class OwnerConnector {
     this.#watch?.stop();
     if (this.#watchIdle !== null) clearTimeout(this.#watchIdle);
     this.#releaseLiveness();
+    // Settle every wait of startup and discovery: start() rejects with ClientClosedError.
+    this.#rejectClosed(new ClientClosedError());
+    for (const { fail } of this.#brokerReplies.values()) fail(new ClientClosedError());
+    this.#brokerReplies.clear();
+    for (const wake of this.#registered.splice(0)) wake();
     const hosting = this.#hosting;
     this.#hosting = null;
     this.#client.close();
@@ -208,27 +223,39 @@ export class OwnerConnector {
 
   // ---- connecting ----
 
+  /** `promise`, or ClientClosedError as soon as `close()` runs. */
+  #untilClosed<T>(promise: Promise<T>): Promise<T> {
+    return Promise.race([promise, this.#closedWait]);
+  }
+
+  #throwIfClosed(): void {
+    if (this.#status === "closed") throw new ClientClosedError();
+  }
+
   async #connect(): Promise<void> {
     const retryMs = this.#options.retryMs ?? 1_000;
     for (;;) {
-      if (this.#status === "closed" || this.#status === "superseded") return;
+      this.#throwIfClosed();
+      if (this.#status === "superseded") return;
       this.#status = "connecting";
       const answer =
-        this.#options.openBroker === null ? ({ t: "noOwner" } as const) : await this.#ask();
+        this.#options.openBroker === null
+          ? ({ t: "noOwner" } as const)
+          : await this.#untilClosed(this.#ask());
       if (answer.t === "port") {
         if (await this.#attach(answer.port)) return;
         continue;
       }
       if (answer.t === "unreachable") {
-        await this.#settleSkew();
-        await this.#nextRegistration(retryMs);
+        await this.#untilClosed(this.#settleSkew());
+        await this.#untilClosed(this.#nextRegistration(retryMs));
         continue;
       }
       // No live owner.
       if (this.#options.startOwner === null || !canHost(this.#options.context())) {
         if (this.#options.openBroker === null)
           throw new OwnerUnreachableError("this context cannot host and has no broker");
-        await this.#nextRegistration(retryMs);
+        await this.#untilClosed(this.#nextRegistration(retryMs));
         continue;
       }
       if (await this.#host()) return;
@@ -255,7 +282,7 @@ export class OwnerConnector {
         ? await this.#client.reconnect(port, abandon.signal)
         : await this.#client.connect(port, abandon.signal);
       done();
-      if (this.#status === "closed") return true;
+      this.#throwIfClosed();
       this.#everConnected = true;
       this.#ownerProtocol = welcome.protocol;
       this.#status = "connected";
@@ -263,7 +290,7 @@ export class OwnerConnector {
       return true;
     } catch (error) {
       done();
-      if (this.#status === "closed") return true;
+      this.#throwIfClosed();
       // The owner died or never answered: start again (a successor is elected).
       if (error instanceof OwnerUnreachableError) return false;
       if (!(error instanceof ConnectionRefusedError)) throw error;
@@ -281,7 +308,7 @@ export class OwnerConnector {
         return true;
       }
       // steppingDown or staleGeneration: try again.
-      await sleep(10);
+      await this.#untilClosed(sleep(10));
       return false;
     }
   }
@@ -328,12 +355,17 @@ export class OwnerConnector {
     });
     starting.handle = handle;
     try {
-      await handle.ready;
+      // Raced with close(): an owner that never reports ready must not keep start() pending.
+      await this.#untilClosed(handle.ready);
     } catch {
-      handle.terminate();
-      lock.release();
-      if (this.#starting === starting) this.#starting = null;
-      await sleep(50);
+      // close() already terminated it and released the lock if it took this start over.
+      if (this.#starting === starting) {
+        this.#starting = null;
+        handle.terminate();
+        lock.release();
+      }
+      this.#throwIfClosed();
+      await this.#untilClosed(sleep(50));
       return false;
     }
     // Closed while it started: `close()` already terminated it and released the lock.
@@ -364,9 +396,9 @@ export class OwnerConnector {
         return;
       }
       if ("nonce" in message) {
-        const reply = this.#brokerReplies.get(message.nonce);
+        const pending = this.#brokerReplies.get(message.nonce);
         this.#brokerReplies.delete(message.nonce);
-        reply?.(message);
+        pending?.reply(message);
       }
     };
     this.#broker = port;
@@ -380,11 +412,14 @@ export class OwnerConnector {
   > {
     const port = this.#brokerPort();
     const nonce = ++this.#nonce;
-    return new Promise((resolve) => {
-      this.#brokerReplies.set(nonce, (message) => {
-        if (message.t === "port") resolve({ t: "port", port: message.port });
-        else if (message.t === "unreachable") resolve({ t: "unreachable" });
-        else resolve({ t: "noOwner" });
+    return new Promise((resolve, reject) => {
+      this.#brokerReplies.set(nonce, {
+        reply: (message) => {
+          if (message.t === "port") resolve({ t: "port", port: message.port });
+          else if (message.t === "unreachable") resolve({ t: "unreachable" });
+          else resolve({ t: "noOwner" });
+        },
+        fail: reject,
       });
       port.postMessage({
         t: "connect",
@@ -596,6 +631,8 @@ export function workerOwner(
       },
       terminate: () => {
         worker.terminate();
+        // Terminated before it reported ready: it never will.
+        rejectReady(new Error("The owner worker was terminated before it was ready"));
         resolveStopped("pagehide");
       },
     };

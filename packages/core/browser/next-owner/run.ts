@@ -138,6 +138,68 @@ export function send(key: string, sql: string, params: WireValue[] = [], session
   sent.set(key, promise);
 }
 
+/** Prepares `sql` on the current connection; returns its id. */
+export async function prepare(sql: string): Promise<number> {
+  return (await current().client.prepare(sql)).id;
+}
+
+/** Sends prepared statement `id` without waiting; `settle(key)` later. */
+export function sendPrepared(key: string, id: number, params: WireValue[] = [], session = 0): void {
+  const promise = current().client.execute(id, params, session);
+  promise.catch(() => undefined);
+  sent.set(key, promise);
+}
+
+/**
+ * Starts a connector that must host `name`, closes it once its owner worker was spawned (before
+ * it can report ready), and reports how `start()` settled within 2 s: the error's name, or
+ * `hung` (review 2, finding 4, over the real `workerOwner`).
+ */
+export async function closeBeforeReady(name: string): Promise<string> {
+  let spawned: () => void = () => undefined;
+  const spawn = new Promise<void>((resolve) => {
+    spawned = resolve;
+  });
+  const start = workerOwner(
+    () => {
+      spawned();
+      return new Worker(new URL("./owner-worker.ts", import.meta.url), { type: "module" });
+    },
+    { mobile: false },
+  );
+  const connector = new OwnerConnector({
+    database: name,
+    client: new ProtocolClient(),
+    locks: countedLocks,
+    openBroker: null,
+    startOwner: start,
+    context: () => ({
+      kind: "page",
+      visible: true,
+      platform: { mobile: false },
+      superseded: false,
+    }),
+  });
+  const settled = connector.start().then(
+    () => "started",
+    (error: unknown) => (error instanceof Error ? error.name : "Error"),
+  );
+  await spawn;
+  connector.close();
+  const outcome = await Promise.race([
+    settled,
+    new Promise<string>((resolve) => setTimeout(() => resolve("hung"), 2_000)),
+  ]);
+  // A released Web Lock leaves the manager's state asynchronously: allow it a second.
+  const hostHeld = async () =>
+    (await navigator.locks.query()).held?.some((lock) => lock.name === `minnow:${name}:host`) ===
+    true;
+  for (let tries = 0; tries < 100 && (await hostHeld()); tries++)
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  const pending = (await navigator.locks.query()).held?.map((lock) => lock.name) ?? [];
+  return `${outcome}${(await hostHeld()) ? ` (host lock still held: ${pending.join(", ")})` : ""}`;
+}
+
 export async function settle(key: string) {
   const promise = sent.get(key);
   if (promise === undefined) throw new Error(`nothing sent as ${key}`);

@@ -126,3 +126,17 @@ export const DOUBLE_AGGREGATE_STATES = [
   "window",
   "unknown inputs",
 ] as const;
+
+/**
+ * The client's statement classifier against the front end (next/testing/owner-statement-kind
+ * .test.ts): every kind the front end compiles, multi-statement text, and text it refuses.
+ */
+export const STATEMENT_KIND_STATES = [
+  "compiled begin",
+  "compiled commit",
+  "compiled rollback",
+  "compiled savepoint",
+  "compiled other",
+  "multi-statement",
+  "refused by the front end",
+] as const;

@@ -20,8 +20,8 @@
  * ## Resendable (protocol.ts "Exactly-once")
  * A request is resendable when running it on a fresh connection means what it meant when sent:
  * - statements and writes on session 0 while session 0 is known idle: no transaction open, and no
- *   earlier session-0 request unresolved that may change that (`mayControlTransaction`), since it
- *   could have been `BEGIN`. Concurrent autocommit statements stay resendable;
+ *   earlier session-0 request unresolved that may change that (its kind is not `other`: see
+ *   `classifyStatementText`), since it could have been `BEGIN`. Concurrent autocommit statements stay resendable;
  * - `prepare`, `subscribe`, `admin`.
  * Everything that depends on session state is not: statements and writes in sessions ≥ 1, or in
  * session 0 inside (or possibly inside) a transaction; `begin`, `commit`, `rollback`. On a new
@@ -32,7 +32,7 @@
  * at-least-once (outcomes.ts). Only commits are exactly-once.
  */
 import { MAX_OUTSTANDING_REQUESTS } from "../format/ledger.js";
-import type { Request, TransactionState } from "./protocol.js";
+import type { PreparedStatementKind, Request, TransactionState } from "./protocol.js";
 
 export class RequestSequencer {
   readonly #maxOutstanding: number;
@@ -109,47 +109,134 @@ export function isResendable(
   }
 }
 
-const CONTROL_WORDS = new Set([
-  "begin",
-  "start",
-  "commit",
-  "end",
-  "rollback",
-  "abort",
-  "savepoint",
-  "release",
-]);
+/**
+ * A statement's effect on its session's transaction (protocol.ts `PreparedStatementKind`), or
+ * `unknown` when the client cannot tell: more than one statement, or text it cannot lex.
+ */
+export type StatementKind = PreparedStatementKind | "unknown";
+
+type Token =
+  | { readonly kind: "word"; readonly upper: string }
+  | { readonly kind: "semicolon" }
+  | { readonly kind: "other" };
 
 /**
- * Whether SQL `text` may open, end or change a transaction: its first keyword is a
- * transaction-control word, or it may hold more than one statement (any `;` before trailing
- * whitespace and semicolons, even inside a literal: false positives only cost resendability).
- * Prepared statements get this from the owner instead (`Prepared.controlsTransaction`).
+ * The front end's lexical rules (engine/query.ts `tokenize`, `normalizeSql`), as far as finding
+ * the leading keyword and statement separators needs: whitespace; `--` comments to the end of the
+ * line; bracketed comments, not nested (the first `* /` ends one, as in the front end); string
+ * literals `'…'` (`''` escapes), `E'…'` (backslash escapes) and `$tag$…$tag$`; quoted identifiers
+ * `"…"`, which the front end routes like keywords when they spell one; bare identifiers. Returns
+ * null for text the front end would refuse to lex (an unterminated literal or comment).
+ */
+function lex(sql: string): Token[] | null {
+  const tokens: Token[] = [];
+  let i = 0;
+  const n = sql.length;
+  while (i < n) {
+    const c = sql[i] ?? "";
+    if (/\s/u.test(c)) {
+      i++;
+    } else if ((c === "E" || c === "e") && sql[i + 1] === "'") {
+      i += 2;
+      for (;;) {
+        if (i >= n) return null;
+        const d = sql[i];
+        if (d === "'" && sql[i + 1] === "'") i += 2;
+        else if (d === "'") {
+          i++;
+          break;
+        } else if (d === "\\") i += 2;
+        else i++;
+      }
+      tokens.push({ kind: "other" });
+    } else if (/[A-Za-z_]/u.test(c)) {
+      const begin = i++;
+      while (i < n && /[A-Za-z0-9_]/u.test(sql[i] ?? "")) i++;
+      tokens.push({ kind: "word", upper: sql.slice(begin, i).toUpperCase() });
+    } else if (c === "'" || c === '"') {
+      i++;
+      let text = "";
+      for (;;) {
+        if (i >= n) return null;
+        if (sql[i] === c && sql[i + 1] === c) {
+          text += c;
+          i += 2;
+        } else if (sql[i] === c) {
+          i++;
+          break;
+        } else text += sql[i++] ?? "";
+      }
+      tokens.push(c === '"' ? { kind: "word", upper: text.toUpperCase() } : { kind: "other" });
+    } else if (c === "$") {
+      const tag = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/u.exec(sql.slice(i));
+      if (tag !== null) {
+        const close = sql.indexOf(tag[0], i + tag[0].length);
+        if (close < 0) return null;
+        i = close + tag[0].length;
+      } else {
+        i++;
+        while (i < n && /\d/u.test(sql[i] ?? "")) i++;
+      }
+      tokens.push({ kind: "other" });
+    } else if (sql.startsWith("--", i)) {
+      const newline = sql.indexOf("\n", i);
+      i = newline < 0 ? n : newline + 1;
+    } else if (sql.startsWith("/*", i)) {
+      const close = sql.indexOf("*/", i + 2);
+      if (close < 0) return null;
+      i = close + 2;
+    } else if (c === ";") {
+      tokens.push({ kind: "semicolon" });
+      i++;
+    } else {
+      tokens.push({ kind: "other" });
+      i++;
+    }
+  }
+  return tokens;
+}
+
+/**
+ * What SQL `text` does to its session's transaction, classified as the front end routes it
+ * (engine/query.ts `compileStatement`, `parseTransactionStatement`): BEGIN, START [TRANSACTION]
+ * → `begin`; COMMIT, END → `commit`; ROLLBACK, ABORT → `rollback`; ROLLBACK TO, SAVEPOINT,
+ * RELEASE → `savepoint`; any other leading word → `other`. Text with a statement separator
+ * other than one trailing `;` (the front end strips exactly one) is `unknown`, as is text the
+ * front end could not lex. The suite `owner-statement-kind.test.ts` checks it against the front
+ * end itself. Prepared statements take their kind from the owner instead (`Prepared`).
+ */
+export function classifyStatementText(text: string): StatementKind {
+  const normalized = text.trim().replace(/;$/u, "").trim();
+  const tokens = lex(normalized);
+  if (tokens === null) return "unknown";
+  if (tokens.some((token) => token.kind === "semicolon")) return "unknown";
+  const first = tokens[0];
+  if (first?.kind !== "word") return "other";
+  switch (first.upper) {
+    case "BEGIN":
+    case "START":
+      return "begin";
+    case "COMMIT":
+    case "END":
+      return "commit";
+    case "ABORT":
+      return "rollback";
+    case "ROLLBACK": {
+      const next = tokens[1];
+      return next?.kind === "word" && next.upper === "TO" ? "savepoint" : "rollback";
+    }
+    case "SAVEPOINT":
+    case "RELEASE":
+      return "savepoint";
+    default:
+      return "other";
+  }
+}
+
+/**
+ * Whether SQL `text` may open, end or change a transaction (`classifyStatementText` is not
+ * `other`): such a request is not resendable on session 0 while it is unresolved.
  */
 export function mayControlTransaction(text: string): boolean {
-  let end = text.length;
-  while (end > 0 && /[\s;]/u.test(text[end - 1] ?? "")) end--;
-  if (text.slice(0, end).includes(";")) return true;
-  let i = 0;
-  for (;;) {
-    while (i < end && /\s/u.test(text[i] ?? "")) i++;
-    if (text.startsWith("--", i)) {
-      const newline = text.indexOf("\n", i);
-      i = newline < 0 ? end : newline + 1;
-    } else if (text.startsWith("/*", i)) {
-      let depth = 1;
-      i += 2;
-      while (i < end && depth > 0) {
-        if (text.startsWith("/*", i)) {
-          depth++;
-          i += 2;
-        } else if (text.startsWith("*/", i)) {
-          depth--;
-          i += 2;
-        } else i++;
-      }
-    } else break;
-  }
-  const word = /^[A-Za-z_]+/u.exec(text.slice(i, Math.min(end, i + 16)));
-  return word !== null && CONTROL_WORDS.has(word[0].toLowerCase());
+  return classifyStatementText(text) !== "other";
 }

@@ -261,3 +261,80 @@ test("a transaction lost with its owner stays lost until ROLLBACK, never autocom
   expect(await update()).toMatchObject({ summary: { transaction: "idle" } });
   expect(await n(b)).toBe(1);
 });
+
+// ---- the second review of increment 2 (B5-p2b-review-2) ----
+
+/**
+ * Leaves a request unanswered by hanging tab `a`'s owner: an autocommit write is saved, then the
+ * worker spins forever (owner-worker.ts `dieOnSave`), so what `b` sends next is in flight when
+ * `a` closes.
+ */
+async function hangOwner(b: Page, name: string): Promise<void> {
+  await call(b, "knob", name, { t: "dieOnSave" });
+  await call(b, "send", "hang", "INSERT INTO t VALUES ($1, $2, $3)", [2, 0, "hang"]);
+  await b.waitForTimeout(300);
+}
+
+for (const [session, text] of [
+  [1, "BEGIN"],
+  [0, "/* lead */ start transaction"],
+] as const)
+  test(`an unanswered ${JSON.stringify(text)} in session ${String(session)} loses the session, never autocommit`, async ({
+    page,
+    context,
+  }) => {
+    const name = dbName(`lost-begin-${String(session)}`);
+    const a = await tab(page);
+    await call(a, "wipe", name);
+    await call(a, "open", name);
+    await seed(a);
+    const b = await tab(await context.newPage());
+    await call(b, "open", name);
+    await hangOwner(b, name);
+    await call(b, "send", "begin", text, [], session);
+    await a.close();
+    // The saved write is answered from the ledger; the BEGIN is refused, never resent.
+    expect(await call(b, "settle", "hang")).toMatchObject({ summary: { replayed: true } });
+    expect(await call(b, "settle", "begin")).toMatchObject({ error: "SessionLostError" });
+    const update = () => call(b, "query", "UPDATE t SET n = n + 1 WHERE id = $1", [1], session);
+    expect(await update()).toMatchObject({ error: "SessionLostError" });
+    expect(await call(b, "query", "SELECT * FROM t WHERE id = $1", [1], 1)).toMatchObject(
+      session === 1 ? { error: "SessionLostError" } : { rows: [[1, 0, "x"]] },
+    );
+    expect(await call(b, "query", "ROLLBACK", [], session)).toMatchObject({
+      summary: { transaction: "idle" },
+    });
+    expect(await update()).toMatchObject({ summary: { transaction: "idle" } });
+    expect(await n(b)).toBe(1);
+  });
+
+test("a prepared COMMIT whose reply died with its owner is answered from the ledger", async ({
+  page,
+  context,
+}) => {
+  const name = dbName("kill-prepared-commit");
+  const a = await tab(page);
+  await call(a, "wipe", name);
+  await call(a, "open", name);
+  await seed(a);
+  const b = await tab(await context.newPage());
+  await call(b, "open", name);
+  const commit = await call(b, "prepare", "COMMIT");
+  await call(b, "begin", 1);
+  await call(b, "query", "UPDATE t SET n = n + 1 WHERE id = $1", [1], 1);
+  await call(b, "knob", name, { t: "dieOnSave" });
+  await call(b, "sendPrepared", "commit", commit, [], 1);
+  await b.waitForTimeout(300);
+  await a.close();
+  expect(await call(b, "settle", "commit")).toMatchObject({
+    summary: { replayed: true, counts: { t: 1 } },
+  });
+  expect(await n(b)).toBe(1);
+});
+
+test("closing before the owner worker is ready settles start() and frees the host lock", async ({
+  page,
+}) => {
+  await tab(page);
+  expect(await call(page, "closeBeforeReady", dbName("close-early"))).toBe("ClientClosedError");
+});

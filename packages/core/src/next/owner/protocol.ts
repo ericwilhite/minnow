@@ -106,13 +106,21 @@
  *   resendable is refused with `SessionLostError` and never executed. So a transaction's
  *   statements never run outside it, and a COMMIT whose fate is unknown resolves from the ledger:
  *   committed, or definitely not.
- * - A session with an open transaction belongs to its connection generation (B5-p2b review,
- *   finding 1). After a reconnect, every request on it fails with
- *   `SessionLostError("transaction")` in the client, unsent, until the client ends the session
- *   explicitly (`rollback`, ROLLBACK, ABORT): nothing meant for the lost transaction reaches the
- *   new owner, where it would run in autocommit. A COMMIT in flight at the loss is the one
- *   exception: it is resent, and the ledger answers it (committed: the session ends).
- *
+ * - A session with an open transaction belongs to its connection generation (B5-p2b reviews 1
+ *   and 2). What a request does to its session's transaction comes from authority: a prepared
+ *   statement's kind from this owner's `prepared` reply (`statementKind`), SQL text from the
+ *   client's classifier, which follows the front end's lexer (sequence.ts
+ *   `classifyStatementText`; multi-statement text is `unknown`). After a reconnect, in send order:
+ *   a request in flight whose kind is `begin` or `unknown` is refused and never resent, and its
+ *   session is lost (session 0 included); `commit` is resent and the ledger answers it
+ *   (committed: the session ends); `rollback` ends the session; anything else on a lost session
+ *   is refused. Until the client ends a lost session (ROLLBACK, ABORT), every new request on it
+ *   fails with `SessionLostError("transaction")` in the client, unsent: nothing meant for the lost
+ *   transaction runs as autocommit on the new owner.
+ * - `SessionLostError.effect` says whether "nothing took effect" is proven (`none`: never sent,
+ *   ran only inside a transaction that rolled back, or no commit in the ledger) or not
+ *   (`unknown`: a multi-statement text, a cursor whose frames were handed out, a result whose
+ *   statement passed its commit point). Only `none` claims nothing took effect. *
  * ## Idle transactions (ruling R16.7)
  * - The owner rolls back a transaction left idle for `transactionIdleTimeoutMs` (default 30 s, as
  *   in 0.19): no request of its session running and none arriving. The timer starts when the
@@ -182,7 +190,7 @@ export type TransactionState = "idle" | "open" | "failed" | "timedOut";
 export const DEFAULT_TRANSACTION_IDLE_TIMEOUT_MS = 30_000;
 
 /** Bumped by every change to a message in this file or in frame.ts. */
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 /** The owner sends `alive` at least this often while a client has requests in flight. */
 export const ALIVE_INTERVAL_MS = 1_000;
@@ -515,7 +523,18 @@ export interface Prepared {
   readonly catalogVersion: number;
   /** The statement may open, end or change a transaction (sequence.ts `isResendable`). */
   readonly controlsTransaction: boolean;
+  /**
+   * What the statement does to its session's transaction, from the owner's front end: the
+   * authority the client uses for a prepared statement after a reconnect (sequence.ts
+   * "Statement kinds"). `savepoint` covers SAVEPOINT, RELEASE and ROLLBACK TO.
+   */
+  readonly statementKind: PreparedStatementKind;
+  /** A BEGIN that opens a read-only transaction. */
+  readonly readOnly: boolean;
 }
+
+/** A statement's effect on its session's transaction, as the owner's front end classified it. */
+export type PreparedStatementKind = "begin" | "commit" | "rollback" | "savepoint" | "other";
 
 export interface Value {
   readonly t: "value";

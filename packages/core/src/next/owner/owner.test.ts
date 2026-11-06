@@ -26,7 +26,12 @@ import {
   parseClientMessage,
   type StatementRequest,
 } from "./protocol.js";
-import { RequestSequencer, isResendable, mayControlTransaction } from "./sequence.js";
+import {
+  RequestSequencer,
+  classifyStatementText,
+  isResendable,
+  mayControlTransaction,
+} from "./sequence.js";
 
 /** Autocommit requests on the connection's default session, first generation. */
 const SESSION = { sessionId: "0", generation: 1, scope: "standalone" } as const;
@@ -158,29 +163,31 @@ describe("resendable requests", () => {
       expect(isResendable({ t, session: 2 }, idle)).toBe(false);
   });
 
-  it("classifies transaction control conservatively", () => {
-    for (const text of [
-      "BEGIN",
-      "  begin;",
-      "-- note\nCOMMIT",
-      "/* a /* nested */ c */ rollback",
-      "START TRANSACTION",
-      "end",
-      "SAVEPOINT a",
-      "RELEASE SAVEPOINT a",
-      "SELECT 1; BEGIN",
-      "select ';'",
-    ])
-      expect(mayControlTransaction(text), text).toBe(true);
-    for (const text of [
-      "SELECT 1",
-      "select 1;  ;\n",
-      "INSERT INTO t VALUES (1)",
-      "-- begin\nSELECT 2",
-      "WITH x AS (SELECT 1) SELECT * FROM x",
-      "beginning",
-    ])
-      expect(mayControlTransaction(text), text).toBe(false);
+  it("classifies statements as the front end routes them (owner-statement-kind.test.ts checks it against the front end)", () => {
+    const cases: ReadonlyArray<readonly [string, ReturnType<typeof classifyStatementText>]> = [
+      ["BEGIN", "begin"],
+      ["  begin;", "begin"],
+      ["-- note\nCOMMIT", "commit"],
+      // Bracketed comments do not nest: the first `*/` ends it, and `c` is not a statement.
+      ["/* a /* nested */ c */ rollback", "other"],
+      ["/* a /* b */ rollback", "rollback"],
+      ["START TRANSACTION", "begin"],
+      ["end", "commit"],
+      ["SAVEPOINT a", "savepoint"],
+      ["RELEASE SAVEPOINT a", "savepoint"],
+      ["SELECT 1; BEGIN", "unknown"],
+      ["select 1;  ;\n", "unknown"],
+      ["select ';'", "other"],
+      ["SELECT 1", "other"],
+      ["INSERT INTO t VALUES (1)", "other"],
+      ["-- begin\nSELECT 2", "other"],
+      ["WITH x AS (SELECT 1) SELECT * FROM x", "other"],
+      ["beginning", "other"],
+    ];
+    for (const [text, kind] of cases) {
+      expect(classifyStatementText(text), text).toBe(kind);
+      expect(mayControlTransaction(text), text).toBe(kind !== "other");
+    }
   });
 });
 

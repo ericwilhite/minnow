@@ -44,15 +44,31 @@ export class SessionLostError extends Error {
   readonly lost: "transaction" | "cursor" | "subscription" | "result";
   /** The request's sequence, when one request was refused. */
   readonly sequence: number | null;
-  constructor(lost: "transaction" | "cursor" | "subscription" | "result", sequence?: number) {
+  /**
+   * What is known about the request's effect. `none`: proven to have changed nothing (it was
+   * never sent, it ran only inside a transaction that rolled back, or the ledger has no commit
+   * for it). `unknown`: it may have taken effect (a multi-statement text, a result whose statement
+   * had passed its commit point): check before retrying.
+   */
+  readonly effect: "none" | "unknown";
+  constructor(
+    lost: "transaction" | "cursor" | "subscription" | "result",
+    sequence?: number,
+    effect: "none" | "unknown" = "none",
+  ) {
+    const outcome =
+      effect === "none"
+        ? "nothing took effect"
+        : "it may have taken effect before the connection changed: check before retrying";
     super(
       sequence === undefined
-        ? `The ${lost} was lost when the connection to the database owner changed; nothing took effect`
-        : `Request ${String(sequence)} belongs to a ${lost} that was lost when the connection to the database owner changed; nothing took effect`,
+        ? `The ${lost} was lost when the connection to the database owner changed; ${outcome}`
+        : `Request ${String(sequence)} belongs to a ${lost} that was lost when the connection to the database owner changed; ${outcome}`,
     );
     this.name = "SessionLostError";
     this.lost = lost;
     this.sequence = sequence ?? null;
+    this.effect = effect;
   }
 }
 

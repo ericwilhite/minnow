@@ -26,6 +26,9 @@ function fakePort(onSend: (message: Record<string, unknown>) => void = () => und
               parameters: [],
               catalogVersion: 1,
               controlsTransaction: true,
+              // The only statement this fake prepares is BEGIN.
+              statementKind: "begin",
+              readOnly: false,
             },
           }),
         );
