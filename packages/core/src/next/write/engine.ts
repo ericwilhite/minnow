@@ -520,13 +520,17 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.ledger = RequestLedger.restore(root.clients, this.#now());
     this.sequences = new Sequences({
       definition: (id) => this.#catalog.sequence(id) ?? this.#holder?.catalog.sequence(id),
-      logReservation: (sequenceId, reservedThrough) =>
-        this.#appender.append(
+      logReservation: (sequenceId, reservedThrough) => {
+        const lsn = this.#appender.append(
           encodeBody({
             request: null,
             effects: [{ kind: "sequence", sequenceId, reservedThrough }],
           }),
-        ),
+        );
+        // Standalone frames count toward the log bound too (review B3-p2b-1 #5).
+        this.#afterAppend();
+        return lsn;
+      },
       now: this.#now,
     });
     for (const { sequenceId, reservedThrough } of root.sequences)
@@ -1378,6 +1382,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       const effects = tx.effects(this.#columns);
       if (effects.length === 0) {
         this.release(tx);
+        this.#afterAppend(); // sequence frames may have grown the log meanwhile
         return Promise.resolve({ wrote: false, lsn: tx.baseLsn, durable: Promise.resolve() });
       }
       const lsn = this.#appender.append(encodeBody({ request, effects }, this.#body));
@@ -1415,7 +1420,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
           }
         }
       }
-      if (this.#appender.end >= this.#logRecycleBytes) this.#maybeRecycle();
+      this.#afterAppend();
       this.#lastCommitAt = performance.now();
       const receipt = new Receipt(lsn, this.#appender);
       if (request !== null) {
@@ -2046,6 +2051,15 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   // ── Log recycling ───────────────────────────────────────────────────────────────────────
+
+  /**
+   * After any append (a commit, a standalone sequence frame) or an empty commit: past the log
+   * bound, a recycle is scheduled (one at a time; appends deferred by a running recycle start
+   * none).
+   */
+  #afterAppend(): void {
+    if (this.#appender.end >= this.#logRecycleBytes) this.#maybeRecycle();
+  }
 
   /** Starts a log recycle unless one is running (or the write path cannot run one). */
   #maybeRecycle(): void {

@@ -270,3 +270,109 @@ describe("log recycling", () => {
     await harness.close();
   });
 });
+
+const SEQUENCE_REACH = [
+  "sequence-only-recycle",
+  "empty-commit",
+  "crash-after-sequence-recycle",
+] as const;
+const sequenceReach = createReach("next-write-log-recycle-sequences", SEQUENCE_REACH);
+
+describe("log recycling under sequence-only traffic (review B3-p2b-1 #5)", () => {
+  it("standalone sequence frames trigger recycling (the reviewer's probe)", async () => {
+    const bound = 4096;
+    const harness = new Harness("strict", "memory", undefined, undefined, {
+      logRecycleBytes: bound,
+    });
+    const path = await harness.open();
+    try {
+      const t = await create(path, "seq", [
+        { ...column("id", BIG, false), identity: { start: 1n, increment: 1n } },
+      ]);
+      const id = path.catalog.table(t)?.columns[0]?.identitySequence ?? -1;
+      for (let k = 1; k <= 300; k++) {
+        const lsn = path.sequences.set(id, BigInt(k), true);
+        await path.durable(lsn);
+      }
+      await path.quiesce();
+      expect(path.stats().logBytes).toBeLessThanOrEqual(bound + 100);
+      expect(path.maintenance.recycles).toBeGreaterThan(0);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  const SEEDS = seedsFor("next-write-log-recycle-sequences", [601, 602, 603, 604]);
+  for (const seed of SEEDS)
+    it(`sequence-only epochs and empty commits keep the log bounded (seed ${String(seed)})`, async () => {
+      const random = mulberry32(seed);
+      const int = (n: number) => Math.floor(random() * n);
+      const bound = 1024 + int(3072);
+      const harness = new Harness("strict", "sim", undefined, undefined, {
+        logRecycleBytes: bound,
+      });
+      sequenceReach.beginHistory();
+      let path = await harness.open();
+      const t = await create(path, "seq", [
+        { ...column("id", BIG, false), identity: { start: 1n, increment: 1n } },
+      ]);
+      const id = path.catalog.table(t)?.columns[0]?.identitySequence ?? -1;
+      const delivered = new Set<number>();
+      let recycledEver = false;
+      for (let step = 0; step < 150; step++) {
+        const roll = int(100);
+        if (roll < 55) {
+          const count = 1 + int(40);
+          const out = { repr: "safe" as const, values: new Float64Array(count) };
+          const lsn = path.sequences.next(id, count, out, 0);
+          await path.durable(lsn);
+          for (const value of out.values) {
+            expect(delivered.has(value), `seed ${String(seed)}: ${String(value)} again`).toBe(
+              false,
+            );
+            delivered.add(value);
+          }
+        } else if (roll < 75) {
+          // setval past everything delivered (values below it are never handed out again).
+          const next = Math.max(0, ...delivered) + 1 + int(20);
+          await path.durable(path.sequences.set(id, BigInt(next), true));
+          for (let value = 1; value <= next; value++) delivered.add(value);
+        } else if (roll < 92) {
+          // An empty commit, with or without an empty statement.
+          const tx = await path.begin();
+          if (random() < 0.5) {
+            const s = tx.statement({
+              rules: () => ({ check: () => null, generate: () => undefined }),
+            });
+            await s.end();
+          }
+          const receipt = await tx.commit(null);
+          expect(receipt.wrote).toBe(false);
+          sequenceReach.reach("empty-commit");
+        } else {
+          recycledEver ||= path.maintenance.recycles > 0;
+          const crash = random() < 0.6;
+          path = crash ? await harness.crash() : await harness.reopen();
+          if (crash && recycledEver) sequenceReach.reach("crash-after-sequence-recycle");
+        }
+        // Wait for a recycle the traffic scheduled (quiesce starts none of its own).
+        await path.quiesce();
+        expect(
+          path.stats().logBytes,
+          `seed ${String(seed)} step ${String(step)}`,
+        ).toBeLessThanOrEqual(bound + 1024);
+        if (path.maintenance.recycles > 0) {
+          recycledEver = true;
+          sequenceReach.reach("sequence-only-recycle");
+        }
+      }
+      expect(recycledEver).toBe(true);
+      await path.quiesce();
+      await harness.space.audit();
+      await harness.close();
+    }, 300_000);
+
+  it("reached every declared state", () => {
+    sequenceReach.assertReached();
+  });
+});
