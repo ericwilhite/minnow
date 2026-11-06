@@ -368,6 +368,19 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
   more entries than the rows it codes: the writer keeps a page dictionary-encoded only while its
   codes and new entries cost no more than the plain page, so a group of mostly distinct values is
   stored plain, and a map never costs more than the rows it replaces.
+- Full export (`SELECT *` over the whole table, Gate A): a sequential decode stream reads with
+  `ChunkReadOptions.once` (storage `ReadOptions.once`): nothing it misses is admitted to the
+  page cache, nothing it hits is promoted, and a directory it parses is not admitted to the
+  directory cache, so the hot working set stays (30 of 30 hot pages kept) and memory stays flat.
+  `reader.pagesAhead(from, to, bytes)` names a batch's pages plus the next ones within a byte
+  budget, so one load call reads ahead and the space coalesces neighbours (6× fewer platform
+  reads at 256 KiB per column). Pages behind the stream are released as it moves on.
+  `scripts/export-bench.mts` over files on disk (`export-bench-build.mts`, the real file store,
+  page cache and governor), 200 columns: decoding from the page cache runs at about 1M rows/s at
+  W1M; through the file reads 94–127k rows/s cold and 250–420k with the OS cache warm on this
+  host (load 12–26), readahead giving 1.4–1.9× cold; W5M (5,242,880 × 200) completes at 168k
+  rows/s with peak RSS 126 MiB and heap 29 MiB above the baseline. Without `once` the same W1M
+  export keeps 404 MiB in the page cache and peaks at +503 MiB RSS.
 - First batch (`SELECT *` first page, and `ORDER BY` the primary key, the same rows): a scan opens
   each projected column's chunk (its directory only), loads just the pages the batch covers (with
   the dictionary for dictionary pages) and decodes those rows; nothing is done for the rest of the

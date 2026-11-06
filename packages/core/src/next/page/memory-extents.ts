@@ -200,7 +200,7 @@ export class MemoryExtentSpace implements ExtentReader {
         const copy = this.bytes.slice(address, address + ref.length);
         if (copy.length !== ref.length || xxHash32(copy) !== ref.checksum)
           throw new StoreCorruptionError(`Checksum mismatch at ${String(address)}`);
-        if (this.#caching) this.#cache.set(key, copy);
+        if (this.#caching && options.once !== true) this.#cache.set(key, copy);
         return copy;
       });
     } catch (error) {

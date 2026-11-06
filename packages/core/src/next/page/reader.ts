@@ -121,6 +121,13 @@ export interface ChunkReadOptions {
    * read. Without it each `open` parses the directory.
    */
   readonly directories?: BlobCache<ChunkDirectory>;
+  /**
+   * A one-pass scan (storage/extents.ts `ReadOptions.once`): what the reader reads is not kept
+   * in the space's cache, and a directory it parses is not admitted to `directories` (cached
+   * ones are still used), so a full export leaves the hot working set alone and its memory flat.
+   * Its pages then carry no descriptor (they are parsed per load, once).
+   */
+  readonly once?: boolean;
 }
 
 /** The reader could not charge bytes it must hold (a peeked, inflated or parsed structure). */
@@ -429,7 +436,8 @@ export class ChunkReader {
         options.budget.free(charge);
         throw error;
       }
-      if (cache === undefined)
+      // A one-pass scan uses cached directories but keeps none it parsed (`options.once`).
+      if (cache === undefined || options.once === true)
         return new ChunkReader(space, chunk, directory, options, charge, null);
       // Pinned for this reader; another reader's earlier entry wins a race (same bytes, same charge).
       const shared = cache.admit(ref, directory, charge);
@@ -455,6 +463,25 @@ export class ChunkReader {
     if (to <= from) return [0, 0];
     const pages = this.directory.pages;
     return [pageIndexOf(pages, from), pageIndexOf(pages, to - 1) + 1];
+  }
+
+  /**
+   * A scan's readahead: the pages covering rows `[from, to)`, then the pages after them while
+   * their stored bytes stay within `ahead`. Loading these in one call lets the space coalesce
+   * neighbouring pages into fewer, larger platform reads (a sequential export); release pages
+   * behind the scan as it moves on.
+   */
+  pagesAhead(from: number, to: number, ahead: number): number[] {
+    const [first, end] = this.pagesInRange(from, to);
+    const out: number[] = [];
+    for (let page = first; page < end; page++) out.push(page);
+    let bytes = 0;
+    for (let page = end; page < this.directory.pages.length; page++) {
+      bytes += at(this.directory.pages, page).length;
+      if (bytes > ahead) break;
+      out.push(page);
+    }
+    return out;
   }
 
   /** The distinct pages holding `rows[start … end)` (group positions, ascending). */

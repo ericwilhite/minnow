@@ -285,7 +285,7 @@ export class PageCache implements EvictableCacheLike {
           continue;
         }
         this.#hits += 1;
-        entry.hot = true;
+        if (options.once !== true) entry.hot = true; // a one-pass scan is not a reuse
         if (entry.pins === 0) {
           uncharge += base(entry); // its descriptor stays charged here
           this.#unlist(entry);
@@ -298,7 +298,8 @@ export class PageCache implements EvictableCacheLike {
       }
       // Hits are pinned before the cache's charge goes back: a nested eviction cannot take them.
       if (uncharge > 0) this.#memory?.release(uncharge);
-      if (misses.length > 0) await this.#readMisses(misses, held, resolved, signal);
+      if (misses.length > 0)
+        await this.#readMisses(misses, held, resolved, signal, options.once === true);
     } catch (error) {
       this.#unpinAll(held);
       budget.free(total);
@@ -328,6 +329,7 @@ export class PageCache implements EvictableCacheLike {
     held: Entry[],
     resolved: Map<string, Uint8Array>,
     signal: AbortSignal | undefined,
+    once: boolean,
   ): Promise<void> {
     const ranges = misses.map(({ ref }) => ({
       offset: ref.extent.offset + ref.offset,
@@ -360,7 +362,10 @@ export class PageCache implements EvictableCacheLike {
               `The blob at ${String(address)} (extent ${String(ref.extent.offset)}, ${String(ref.length)} bytes) failed its checksum`,
             );
           this.#misses += 1;
-          const entry = this.#insertPinned(ref, address, bytes);
+          // A one-pass scan keeps what it misses to itself: never admitted, never findable.
+          const entry = once
+            ? this.#privateEntry(ref, address, bytes)
+            : this.#insertPinned(ref, address, bytes);
           held.push(entry);
           resolved.set(key, entry.bytes);
         }

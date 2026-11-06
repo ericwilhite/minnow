@@ -283,6 +283,12 @@ export interface ReadOptions {
   /** Charged for every byte the lease holds, cached or not, until `release` (ruling R5). */
   readonly budget: ByteBudget;
   readonly signal?: AbortSignal;
+  /**
+   * A one-pass scan (a full export): blobs it misses stay private to its lease and are never
+   * admitted to the cache, and blobs it hits are not marked as reused, so the scan does not
+   * evict or demote the hot working set. Default false.
+   */
+  readonly once?: boolean;
 }
 
 export interface ReadLease {
