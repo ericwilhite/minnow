@@ -73,6 +73,23 @@ jobs:
           npm run benchmark:storage 2>&1 | tee storage-microbench.txt
           grep -o 'STORAGE_MICROBENCH .*' storage-microbench.txt | sed 's/^STORAGE_MICROBENCH //' \
             > browser-perf-results/storage-microbench.json
+      - name: Export bench (rebuild core, recorded, not judged)
+        # Gate A's streaming export in real Chromium on the runner's disk: the wide table
+        # (1,048,576 rows x 200 columns, about 1.1 GB of OPFS) written through the rebuild core's
+        # OPFS backend, then cold and warm passes, per-column readahead and the row window.
+        # Recorded per pass: rows/s, the export worker's CPU seconds and rows per CPU-second,
+        # renderer RSS peak, worker heap and pool residency. Gate A's >= 190k rows/s cold is
+        # judged here once it is, not yet (lead ruling: record only, like the storage microbench).
+        # A runner whose disk cannot take the table can lower MINNOW_EXPORT_ROWS.
+        if: always()
+        shell: bash
+        env:
+          MINNOW_EXPORT_ROWS: "1048576"
+        run: |
+          mkdir -p browser-perf-results
+          npm run benchmark:export 2>&1 | tee export-bench.txt
+          grep -o 'EXPORT_BENCH .*' export-bench.txt | sed 's/^EXPORT_BENCH //' \
+            > browser-perf-results/export-bench.json
       - name: Upload the results
         if: always()
         uses: actions/upload-artifact@v7
@@ -81,6 +98,7 @@ jobs:
           path: |
             browser-perf.txt
             storage-microbench.txt
+            export-bench.txt
             browser-perf-results/
             packages/core/browser-perf-baseline.json
           retention-days: 90

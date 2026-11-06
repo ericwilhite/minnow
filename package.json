@@ -69,7 +69,8 @@
     "test:differential:nightly": "MINNOW_DIFFERENTIAL_PROFILE=nightly vitest run packages/core/src/testing/differential-harness.test.ts",
     "fixture:differential": "vite-node scripts/differential-corpus.mts",
     "benchmark:browser": "tsc -b packages/core && vite-node scripts/browser-perf.mts",
-    "benchmark:storage": "tsc -b packages/core && MINNOW_STORAGE_MICROBENCH=1 playwright test --config playwright.library.config.ts packages/core/browser-tests/next-storage.spec.ts --project=chromium -g \"storage microbench\""
+    "benchmark:storage": "tsc -b packages/core && MINNOW_STORAGE_MICROBENCH=1 playwright test --config playwright.library.config.ts packages/core/browser-tests/next-storage.spec.ts --project=chromium -g \"storage microbench\"",
+    "benchmark:export": "tsc -b packages/core && MINNOW_NEXT_EXPORT_BENCH=1 MINNOW_EXPORT_FOCUS=1 playwright test --config playwright.library.config.ts packages/core/browser-tests/next-export-bench.spec.ts --project=chromium --workers=1"
   },
   "devDependencies": {
     "@duckdb/duckdb-wasm": "1.32.0",

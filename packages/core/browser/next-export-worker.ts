@@ -69,6 +69,8 @@ export interface ExportPass {
   readonly platformReads: number;
   readonly governorPeakMiB: number;
   readonly cacheResidentMiB: number;
+  /** Idle pooled one-pass buffers at the end of the pass (charged to the cache). */
+  readonly poolMiB: number;
   /** The page cache's protected segment before the export and after this pass. */
   readonly protectedBeforeMiB: number;
   readonly protectedAfterMiB: number;
@@ -204,6 +206,7 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
       platformReads: space.stats.cache.platformReads - readsBefore,
       governorPeakMiB: governor.peakBytes / MiB,
       cacheResidentMiB: space.stats.cache.residentBytes / MiB,
+      poolMiB: space.stats.cache.poolBytes / MiB,
       protectedBeforeMiB: protectedBefore,
       protectedAfterMiB: space.stats.cache.protectedBytes / MiB,
       kept: null,
