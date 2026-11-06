@@ -28,6 +28,7 @@ import { vi } from "vitest";
 import { JoinTable } from "./join-table.js";
 import { HashJoin, hashJoinMinimumBytes, type HashJoinKind, type HashJoinSpec } from "./join.js";
 import type { Operator, PushResult } from "./pipeline.js";
+import * as pipeline from "./pipeline.js";
 import { Slice, runToEnd } from "./slices.js";
 import { TaskClock, taskClock } from "./pipeline.js";
 
@@ -983,3 +984,54 @@ describe("review B7-p2c-3 #4: encoded join keys copy text once, in steps", () =>
       );
     });
 });
+
+// R23.4/R23.5: measure every readiness chain, including chains after earlier legitimate yields.
+for (const blockEvery of [1, 2])
+  it(`resolved readiness preserves the task clock, blocked every ${String(blockEvery)} outputs`, async () => {
+    const now = taskClock.now;
+    let time = 0,
+      work = 0,
+      peak = 0;
+    taskClock.now = () => time;
+    taskClock.begin();
+    const { join, governor, spill } = await setup(spec("inner", [INT, INT]));
+    const yieldReal = pipeline.yieldTask;
+    const yielded = vi.spyOn(pipeline, "yieldTask").mockImplementation(async () => {
+      await yieldReal();
+      work = 0;
+    });
+    try {
+      await pushAll(
+        join.build,
+        [INT, INT],
+        Array.from({ length: 64 }, (_, i): Row => [7, i]),
+      );
+      await join.build.finish();
+      const sink = new CountSink(blockEvery, () => {
+        time += 3;
+        work += 3;
+        peak = Math.max(peak, work);
+      });
+      const probe = join.probe(sink);
+      await pushAll(
+        probe,
+        [INT, INT],
+        Array.from({ length: 2048 }, (_, i): Row => [7, i]),
+      );
+      await probe.finish();
+      await join.closed;
+      // One output batch costs 3 ms in this model: before a third, the shared 4 ms task
+      // deadline must have caused a genuine yield. A clock stamp alone resets no work here.
+      expect(peak).toBeLessThanOrEqual(6);
+      expect(yielded).toHaveBeenCalled();
+      expect(sink.rows).toBe(64 * 2048);
+      expect(governor.usedBytes).toBe(0);
+      expect(spill.bytesInUse).toBe(0);
+    } finally {
+      join.abort(new Error("clock test cleanup"));
+      yielded.mockRestore();
+      taskClock.now = now;
+      taskClock.begin();
+      await join.closed;
+    }
+  }, 120000);

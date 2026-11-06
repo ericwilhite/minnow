@@ -1160,8 +1160,14 @@ class Prober {
   /** Continues after `step` until the batch is done, awaiting whatever it waits on. */
   async continue(step: Step): Promise<void> {
     for (let s = step; s !== DONE; s = this.run()) {
-      if (s === BLOCKED) await this.shared.waitDownstream();
-      else await s;
+      if (s === BLOCKED) {
+        await this.shared.waitDownstream();
+        this.shared.checkAborted();
+        // Readiness may be a resolved promise in the same task. Honour its remaining
+        // deadline before doing more probe work; only a real yield can restart it.
+        const pause = this.shared.pace();
+        if (pause !== null) await pause;
+      } else await s;
       this.shared.checkAborted();
     }
   }

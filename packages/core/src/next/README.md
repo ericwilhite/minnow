@@ -771,6 +771,9 @@ and the owner import it directly.
 - Inner, semi and right joins publish runtime filters (exact bitmap, split-block Bloom, bounds)
   when the build stays resident; a filter never drops a row that can match, and stops testing
   when it keeps over 90 % of probes.
+- Probe continuations check cancellation and the remaining worker-task deadline immediately
+  after downstream readiness. An already-resolved readiness promise never restarts the clock.
+
 - Push returns `blocked` when the downstream blocks or a spill write waits; with no spill the
   whole join runs without an await.
 
