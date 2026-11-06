@@ -7,6 +7,9 @@ import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { encodeBloom } from "./runs.js";
+import { createReach, RUN_BLOOM_STEP_STATES } from "../../testing/reach.js";
+
+const reach = createReach("stored run Bloom probes", RUN_BLOOM_STEP_STATES);
 
 function reference(hashes: Uint32Array, count: number): Uint8Array {
   const keys = count / 2;
@@ -34,6 +37,13 @@ describe("encodeBloom", () => {
             maxLength: 600,
           }),
           (pairs) => {
+            reach.beginHistory();
+            const bits = Math.max(64, Math.ceil((pairs.length * 10) / 8) * 8);
+            reach.reach(bits === 64 ? "minimum bitmap" : "rounded bitmap");
+            for (const [h1, h2] of pairs) {
+              if (h1 >= 2 ** 31) reach.reach("unsigned high hash");
+              if ((h1 % bits) + (((h2 | 1) >>> 0) % bits) >= bits) reach.reach("wrapped step");
+            }
             const hashes = Uint32Array.from(pairs.flatMap(([h1, h2]) => [h1, (h2 | 1) >>> 0]));
             expect(encodeBloom(hashes, hashes.length)).toEqual(reference(hashes, hashes.length));
           },
@@ -41,4 +51,5 @@ describe("encodeBloom", () => {
         { seed, numRuns: 1000 },
       );
     });
+  it("reaches the stored-probe boundary states", () => reach.assertReached());
 });

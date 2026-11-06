@@ -387,11 +387,27 @@ export function encodeBloom(hashes: Uint32Array, count: number): Uint8Array {
   for (let k = 0; k < count; k += 2) {
     let bit = (hashes[k] ?? 0) % bits;
     const step = (hashes[k + 1] ?? 0) % bits;
-    for (let p = 0; p < BLOOM_HASHES; p++) {
-      out[5 + (bit >>> 3)] = (out[5 + (bit >>> 3)] ?? 0) | (1 << (bit & 7));
-      bit += step;
-      if (bit >= bits) bit -= bits;
-    }
+    // Seven fixed stored probes, unrolled to remove the inner loop's counter and branch.
+    // The size, seeds, arithmetic and probe order are unchanged (a stored-format contract).
+    out[5 + (bit >>> 3)] = (out[5 + (bit >>> 3)] ?? 0) | (1 << (bit & 7));
+    bit += step;
+    if (bit >= bits) bit -= bits;
+    out[5 + (bit >>> 3)] = (out[5 + (bit >>> 3)] ?? 0) | (1 << (bit & 7));
+    bit += step;
+    if (bit >= bits) bit -= bits;
+    out[5 + (bit >>> 3)] = (out[5 + (bit >>> 3)] ?? 0) | (1 << (bit & 7));
+    bit += step;
+    if (bit >= bits) bit -= bits;
+    out[5 + (bit >>> 3)] = (out[5 + (bit >>> 3)] ?? 0) | (1 << (bit & 7));
+    bit += step;
+    if (bit >= bits) bit -= bits;
+    out[5 + (bit >>> 3)] = (out[5 + (bit >>> 3)] ?? 0) | (1 << (bit & 7));
+    bit += step;
+    if (bit >= bits) bit -= bits;
+    out[5 + (bit >>> 3)] = (out[5 + (bit >>> 3)] ?? 0) | (1 << (bit & 7));
+    bit += step;
+    if (bit >= bits) bit -= bits;
+    out[5 + (bit >>> 3)] = (out[5 + (bit >>> 3)] ?? 0) | (1 << (bit & 7));
   }
   return out;
 }

@@ -46,6 +46,18 @@ includes the durable million-row load and maintenance. `node scripts/write-load-
 profile stop and serialization are outside the reported CPU/wall clock. Run with plain `node`, using the built
 modules, and set `TMPDIR` under `~/.cache`.
 
+`scripts/write-run-bench.mts --baseline <old-dist> --mode delta|bloom|encoder` isolates
+sorted-delta run encoding, Bloom bit construction, or pending-entry/block encoding. It compares
+exact output bytes before timing, then reports process CPU and wall for interleaved old/new
+rounds. Input construction is outside the clock; `node --expose-gc ... --gc-before` also collects
+setup garbage before each pass. Use `write-insert-bench.mts --mode load --load-mode tx|commits`
+for the whole-load check.
+
+Bloom partitions are stored run bytes (`write/runs.ts`, "Stored form"), including their bit
+count, seven-probe count, bit array, directory and checksums. Changing the bit sizing, seeds or
+probe formula changes that stored contract. Arithmetic-only Bloom optimizations must preserve
+every encoded part byte for byte.
+
 `scripts/write-browser-bench.mts --baseline <old-dist> --output ~/.cache/<run>` bundles those
 built modules into real OPFS workers in a persistent Chromium profile on disk. The same mode
 and durability options apply. The default is six interleaved old/new pairs after a discarded

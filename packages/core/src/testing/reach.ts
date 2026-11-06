@@ -1738,4 +1738,10 @@ export const NATIVE_CREDIT_CACHE_STATES = [
   "takeover owns real buffer",
   "transfer after takeover",
   "close leaves retained owner paid",
+/** Run Bloom arithmetic preserves the stored probes across bitmap sizes and unsigned hashes. */
+export const RUN_BLOOM_STEP_STATES = [
+  "minimum bitmap",
+  "rounded bitmap",
+  "unsigned high hash",
+  "wrapped step",
 ] as const;
