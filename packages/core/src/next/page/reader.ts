@@ -132,6 +132,15 @@ export class PageBudgetError extends Error {
   }
 }
 
+/** `translationMap`'s interner called `translationMap` with itself while its map was built. */
+export class TranslationReentryError extends Error {
+  readonly code = "MINNOW_TRANSLATION_REENTRY";
+  constructor() {
+    super("translationMap was re-entered by its own interner while building its map");
+    this.name = "TranslationReentryError";
+  }
+}
+
 /** A load that was still in flight when its reader was closed. */
 export class ReaderClosedError extends Error {
   readonly code = "MINNOW_READER_CLOSED";
@@ -353,6 +362,8 @@ export class ChunkReader {
     (bytes: Uint8Array, start: number, end: number) => number,
     Int32Array
   >();
+  /** Interners whose map is being built: a callback that re-enters with one is refused. */
+  readonly #building = new Set<(bytes: Uint8Array, start: number, end: number) => number>();
   #scratch: SelectScratch | null = null;
   #scratchCharge = 0;
   #closed = false;
@@ -802,6 +813,11 @@ export class ChunkReader {
    * budget (4 bytes per entry) until `close`; a repeated call returns the same map. Null when
    * the chunk has no dictionary; the dictionary must be loaded (`loadDictionary`, or `load` of a
    * dictionary page).
+   *
+   * `intern` may call back into the reader, but not `translationMap` with itself while its map is
+   * being built (`TranslationReentryError`). If it closes the reader, the map is not kept and the
+   * call throws `ReaderClosedError`. Whenever no map is recorded (a throw, a refused reentry, a
+   * close), its reservation is given back (review B2-p2g #1).
    */
   translationMap(
     intern: (bytes: Uint8Array, start: number, end: number) => number,
@@ -812,10 +828,13 @@ export class ChunkReader {
     if (dictionary === null) throw new RangeError("The chunk's dictionary is not loaded");
     const kept = this.#translations.get(intern);
     if (kept !== undefined) return kept;
+    if (this.#building.has(intern)) throw new TranslationReentryError();
     const bytes = dictionary.size * 4;
     if (!this.#options.budget.allocate(bytes)) throw new PageBudgetError(bytes);
-    // Provisional until every entry is interned: a throwing interner (or allocation) gives the
-    // reservation back and records nothing (review B2-p2f #1).
+    // Provisional until every entry is interned and the reader is still open: otherwise (a
+    // throwing interner or allocation, review B2-p2f #1; a close from the interner, B2-p2g #1)
+    // the reservation goes back and nothing is recorded.
+    this.#building.add(intern);
     let map: Int32Array;
     try {
       map = new Int32Array(dictionary.size);
@@ -825,9 +844,12 @@ export class ChunkReader {
         const end = offsets === null ? start + 16 : (offsets[code + 1] ?? 0);
         map[code] = intern(dictionary.bytes, start, end);
       }
+      if (this.#closed) throw new ReaderClosedError();
     } catch (error) {
       this.#options.budget.free(bytes);
       throw error;
+    } finally {
+      this.#building.delete(intern);
     }
     this.#translations.set(intern, map);
     return map;
