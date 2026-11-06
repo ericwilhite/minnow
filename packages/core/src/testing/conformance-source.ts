@@ -79,6 +79,8 @@ export interface Case {
   ordered: boolean;
   /** Oracles to skip, each for a documented semantic or dialect divergence. */
   skip?: readonly OracleName[];
+  /** Generator dimensions the case exercises (testing/reach.ts), counted when it agrees. */
+  reach?: readonly string[];
 }
 
 type Template = (rng: () => number) => Case;

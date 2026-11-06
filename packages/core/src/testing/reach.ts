@@ -312,3 +312,52 @@ export const OWNER_RELEASE_STATES = [
   "closing",
   "lockLost",
 ] as const;
+
+/**
+ * SQL conformance (engine/sql-conformance.test.ts): the generator dimensions of the qualified
+ * ORDER BY, correlated aggregate, EXISTS-over-aggregate and DISTINCT ON fixes. A state counts when
+ * a case carrying it agreed with every oracle in a corpus run.
+ */
+const JOIN_KINDS = ["JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN"] as const;
+export const QUALIFIED_ORDER_STATES = [
+  ...JOIN_KINDS.flatMap((kind) => [`${kind} ON`, `${kind} USING`]),
+  ...JOIN_KINDS.filter((kind) => kind !== "FULL JOIN").flatMap((kind) => [
+    `${kind} ON window`,
+    `${kind} USING window`,
+  ]),
+  "single table",
+  "derived FULL JOIN",
+] as const;
+
+export const CORRELATED_AGGREGATE_STATES = [
+  "bound LIMIT 1",
+  "bound LIMIT 0",
+  "bound LIMIT 1 OFFSET 1",
+  "bound OFFSET 0",
+  "bound OFFSET 1",
+  "bound ORDER BY 1 DESC LIMIT 1",
+  "equality correlation",
+  "range correlation",
+  "select list",
+  "where",
+] as const;
+
+export const EXISTS_AGGREGATE_STATES = [
+  "exists COUNT(*)",
+  "exists MAX(d.amount)",
+  "exists unbounded",
+  "exists LIMIT 0",
+  "exists OFFSET 1",
+  "where exists",
+  "where not exists",
+  "selected exists",
+] as const;
+
+export const DISTINCT_ON_STATES = [
+  "ordinal key",
+  "ordinal sort",
+  "qualified expression key",
+] as const;
+
+/** A generated refusal campaign: both outcomes, compared against PostgreSQL. */
+export const REFUSAL_STATES = ["refused", "accepted"] as const;
