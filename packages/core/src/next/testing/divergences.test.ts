@@ -19,6 +19,10 @@ const facts = (rekeyedAt = 99) => ({
     ["t", "id"],
     ["c", "id"],
   ]),
+  keyColumns: new Map([
+    ["t", 0],
+    ["c", 0],
+  ]),
   rekeyedAway: new Map([["t", new Map([[51, rekeyedAt]])]]),
   movedTo: new Map([["t", new Map([[51, 99]])]]),
 });
@@ -495,12 +499,15 @@ describe("key-forwarding matcher", () => {
   for (const seed of PARENT_SEEDS)
     it(`a parent difference matches only the effect its operation has (seed ${String(seed)})`, () => {
       const random = mulberry32(seed);
+      const coincidences = { right: 0, wrong: 0 };
       const int = (n: number) => Math.floor(random() * n);
       let positives = 0;
       let negatives = 0;
       for (let k = 0; k < 300; k++) {
-        // t(id, a, b): 51 forwards to 99; the statement goes through 51.
-        const original: unknown[] = [99, int(10), `b${String(int(5))}`];
+        // t(id, a, b): 51 forwards to 99; the statement goes through 51. Column a sometimes holds
+        // the old key's value: only the key column's position makes a column the key (A3).
+        const coincide = random() < 0.3;
+        const original: unknown[] = [99, coincide ? 99 : int(10), `b${String(int(5))}`];
         const kind = (["delete", "update", "rekey"] as const)[int(3)] ?? "delete";
         const assignedColumn = 1 + int(2); // an UPDATE assigns a or b
         const unassigned = assignedColumn === 1 ? 2 : 1;
@@ -533,9 +540,15 @@ describe("key-forwarding matcher", () => {
           // Wrong: a column the UPDATE does not assign changed too.
           if (wrong) after[unassigned] = "unassigned";
           rows = [kept(after)];
-        } else
-          // Wrong: the moved row lost a value on the way.
-          rows = [gone, arrived(wrong ? [60, "lost", original[2]] : [60, ...original.slice(1)])];
+        } else {
+          // Wrong: the moved row lost a value on the way, or a non-key column holding the old key
+          // was moved to the new key with it (the reviewer's A3 shape).
+          const lost =
+            coincide && random() < 0.5 ? [60, 60, original[2]] : [60, "lost", original[2]];
+          rows = [gone, arrived(wrong ? lost : [60, ...original.slice(1)])];
+          if (coincide && wrong) coincidences.wrong += 1;
+          if (coincide && !wrong) coincidences.right += 1;
+        }
         const matched = id(
           observation({
             statements: [
@@ -560,5 +573,35 @@ describe("key-forwarding matcher", () => {
       }
       expect(positives).toBeGreaterThan(50);
       expect(negatives).toBeGreaterThan(50);
+      // Rekeys of rows whose non-key column equals the old key, both kept and mutated.
+      expect(coincidences.right).toBeGreaterThan(3);
+      expect(coincidences.wrong).toBeGreaterThan(3);
     });
+
+  it("a rekey does not explain a non-key column equal to the old key changing (the reviewer's A3 probe)", () => {
+    const rekey = statement({
+      sql: "UPDATE t SET id=100 WHERE id=51",
+      kind: "rekey",
+      table: "t",
+      matchedKeys: [51],
+      newKeys: [100],
+    });
+    const gone: DifferingRow = {
+      table: "t",
+      key: 99,
+      authority: { values: [99, 99], references: [] },
+      oracle: null,
+    };
+    const moved = (values: unknown[]): DifferingRow => ({
+      table: "t",
+      key: 100,
+      authority: null,
+      oracle: { values, references: [] },
+    });
+    const of = (rows: DifferingRow[]) =>
+      id(observation({ statements: [rekey], rowsDiffer: true, differingRows: rows }));
+    expect(of([gone, moved([100, 100])])).toBeNull();
+    // The legitimate move keeps v = 99.
+    expect(of([gone, moved([100, 99])])).toBe("key-forwarding");
+  });
 });

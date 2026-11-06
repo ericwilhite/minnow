@@ -86,6 +86,12 @@ export interface DivergenceFacts {
   readonly nowMs: number;
   /** Each table's primary-key column (single-column keys). */
   readonly primaryKeys: ReadonlyMap<string, string>;
+  /**
+   * The same column's position in the table's column order (into `RowSide.values`): a rekey
+   * explains a change there only, never in a column that merely holds the key's value
+   * (review B3-p2b-4 A3).
+   */
+  readonly keyColumns: ReadonlyMap<string, number>;
   /** Primary keys a committed rekey moved a row away from, per table: key → when (same clock). */
   readonly rekeyedAway: ReadonlyMap<string, ReadonlyMap<number, number>>;
   /** Where each of those keys moved, per table: old key → new key (a later rekey may move it on). */
@@ -227,7 +233,8 @@ function explainedByForwarding(observation: DivergenceObservation): boolean {
     // A parent row is explained only by the effect its operation has (review B3-p2b-3 A2): a
     // forwarded DELETE removed the forwarded-to row (the current engine lacks it, PostgreSQL keeps
     // it as it was); a rekey moved it to the new key (the moved row equals PostgreSQL's original
-    // apart from the key columns); an UPDATE changed only the columns it assigns.
+    // apart from the key column, found by position: review B3-p2b-4 A3); an UPDATE changed only
+    // the columns it assigns.
     const differs = (a: readonly unknown[], b: readonly unknown[]): number[] | null => {
       if (a.length !== b.length) return null;
       const out: number[] = [];
@@ -253,16 +260,14 @@ function explainedByForwarding(observation: DivergenceObservation): boolean {
           const original = differing.find(
             (candidate) => candidate.table === row.table && candidate.key === reach.target,
           )?.authority;
-          if (original === undefined || original === null) return false;
+          const keyColumn = observation.facts.keyColumns.get(row.table);
+          if (original === undefined || original === null || keyColumn === undefined) return false;
           const changed = differs(original.values, after.values);
           return (
-            changed !== null &&
-            changed.length > 0 &&
-            changed.every(
-              (column) =>
-                Object.is(original.values[column], reach.target) &&
-                Object.is(after.values[column], row.key),
-            )
+            changed?.length === 1 &&
+            changed[0] === keyColumn &&
+            Object.is(original.values[keyColumn], reach.target) &&
+            Object.is(after.values[keyColumn], row.key)
           );
         }
         return false;

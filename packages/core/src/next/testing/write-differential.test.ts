@@ -683,6 +683,11 @@ describe("write path vs PostgreSQL and the current engine (generated)", () => {
                   ["t", "id"],
                   ["c", "id"],
                 ]),
+                // id is each table's first column.
+                keyColumns: new Map([
+                  ["t", 0],
+                  ["c", 0],
+                ]),
                 rekeyedAway: new Map([["t", rekeyedAway]]),
                 movedTo: new Map([["t", movedTo]]),
               },
