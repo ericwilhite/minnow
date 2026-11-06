@@ -585,6 +585,11 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
   in this benchmark only: neither cleared the median-versus-spread rule. The engine keeps its
   explicit little-endian `DataView` reads. Cold IO/directory coordination and fixed-width decode
   remain the next profile-led candidates; window assembly is a smaller share of this workload.
+- `scripts/scaled-width-bench.mts` screens separate dense scaled-float loops for u8/u16/u32
+  deltas against the existing shared loop. It calls the full decode function, interleaves five
+  fresh-process rounds, reports CPU and wall spreads, and compares every output byte (including
+  raw NaN patches and signed zero). The prototype keeps division, never reciprocal multiplication.
+  Its gain did not clear the spread consistently on patched pages, so it remains benchmark-only.
 - What an export reads (`scripts/export-size.mts`, 262,144 rows of W1M): 1,055 B/row as flushed.
   High-cardinality text is 34% (`h02`'s free text alone 113 B/row), float64 31%, nullable
   floats 9%, int32 9%, decimals 8%; dictionary text 3%. Compaction gzip stores 869 B/row (−18%)
