@@ -13357,14 +13357,29 @@ function assertDistinctOnLeadsOrder(
     }
     return resolveAlias(expression);
   };
-  // Column references compare by bare name at any depth (`b.id + 0` is `id + 0`): names are not
-  // bound to sources yet, and this can only let a mismatch through, never refuse a valid query.
+  // Two spellings are one target when they are the same expression with each column reference
+  // naming the same column: `b.id + 0` and `id + 0` may (names are not bound to sources yet, so
+  // a bare name matches any qualifier), but `a.id + 0` and `b.id + 0` never do — they read
+  // different sources even when the column names agree (review B6 stream A 2, finding 4).
   const bareColumns = (expression: Expression): Expression =>
     expression.kind === "column"
       ? { kind: "column", reference: expression.reference.split(".").at(-1) ?? "" }
       : mapChildExpressions(expression, bareColumns);
-  const same = (left: Expression, right: Expression) =>
-    encodeQueryIdentity(bareColumns(left)) === encodeQueryIdentity(bareColumns(right));
+  const qualifier = (reference: string) => {
+    const dot = reference.lastIndexOf(".");
+    return dot === -1 ? undefined : reference.slice(0, dot);
+  };
+  const same = (left: Expression, right: Expression) => {
+    if (encodeQueryIdentity(bareColumns(left)) !== encodeQueryIdentity(bareColumns(right)))
+      return false;
+    // Same shape, so the references pair up in order.
+    const rightColumns = expressionColumns(right);
+    return expressionColumns(left).every((reference, index) => {
+      const a = qualifier(reference);
+      const b = qualifier(rightColumns[index] ?? "");
+      return a === undefined || b === undefined || a === b;
+    });
+  };
   const keys = distinctOn.map(resolve);
   const covered: Expression[] = [];
   const seen: Expression[] = [];

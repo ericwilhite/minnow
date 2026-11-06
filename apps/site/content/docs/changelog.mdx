@@ -48,6 +48,8 @@ b.id = a.id)` was false when no row of `b` matched. An aggregate without `GROUP 
   `SELECT DISTINCT ON (id) id, v FROM b ORDER BY v, id` used to run and keep an arbitrary row
   per `id`. It now fails with "SELECT DISTINCT ON expressions must match initial ORDER BY
   expressions". Put the `DISTINCT ON` expressions first in `ORDER BY` to keep the query working.
+  The same expression spelled differently still matches (`id + 0` and `b.id + 0`), but the same
+  column name from another source does not: `DISTINCT ON (a.id + 0) … ORDER BY b.id + 0` fails.
 - **Positions in `DISTINCT ON` and its `ORDER BY` now name select-list items.**
   `SELECT DISTINCT ON (1) id, v FROM b ORDER BY 1, 2 DESC` treated `1` and `2` as constants: it
   returned a single row and ignored the sort. They now mean the first and second selected
