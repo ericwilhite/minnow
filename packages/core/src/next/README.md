@@ -578,7 +578,8 @@ and the owner import it directly.
   every aggregate (after its FILTER and DISTINCT) updates its state. `finish` emits groups in
   first-seen order in batches of at most 2,048 groups and about 1 MiB, each charged to the grant
   before it is built and released when downstream is done with it; it yields to the event loop
-  with a task every 4 ms (AVG's per-group division included) and stops when aborted. Without
+  with a task every 4 ms, checking the deadline per group inside AVG(NUMERIC)'s divisions and
+  resuming mid-batch; after an abort it rejects with the abort's reason. Without
   GROUP BY there is one row even over no input.
 - `groups.ts`: group ids from open-addressing tables chosen by key type — interleaved
   (key, id) tables for 32-bit and 64-bit integers (int8 by its two words, whatever its
@@ -594,8 +595,11 @@ and the owner import it directly.
   float8_accum, including their 22003 rules. MIN/MAX ties take the newer value, as PostgreSQL
   does (MIN(1.5, 1.50) is 1.50); int8 and NUMERIC comparisons use words and limbs.
 - `values.ts`: per-group values for MIN/MAX and NUMERIC keys: int8 and interval microseconds as
-  two words, NUMERIC as f64 or 128-bit limbs; only coefficients past 128 bits are BigInts,
-  charged at an estimated 64 bytes each.
+  two words, NUMERIC as f64 or 128-bit limbs; only coefficients past 128 bits are BigInts, each
+  charged at the governor's `bigintBytes` (its size change charged before a replacement). Exact
+  sums' offsets past 128 bits are charged the same way, and output estimates use those sizes.
+- NUMERIC results past PostgreSQL's limits (131,072 digits before the decimal point) are 22003 at
+  emission, SUM's and AVG's alike; exact intermediates may pass them and come back.
 - `distinct.ts`: exact DISTINCT through value ids and a (group, value id) set.
 - Memory: every typed array is charged before it is constructed, and a constructor that fails
   releases what it took. A refused growth fails the query until partitioned spill (milestone 3).

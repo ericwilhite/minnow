@@ -107,6 +107,9 @@ export class AggregateOperator implements Operator {
   /** The charged bytes of the output batch downstream still holds. */
   #outputHeld = 0;
   #closed = false;
+  /** Set by `abort`: a later or resumed `finish` rejects with the reason. */
+  #aborted = false;
+  #abortReason: unknown = undefined;
 
   /**
    * Throws `UnsupportedPlanError` before allocating for a shape it cannot compile; any other
@@ -160,6 +163,8 @@ export class AggregateOperator implements Operator {
     const accumulator = accumulatorFor(call.fn, call.type, argument?.type ?? null, this.#charge);
     let distinct: DistinctSet | null = null;
     let filter: Predicate | null;
+    let selection: Selection;
+    // Every fallible step after the accumulator is inside this scope, so a failure closes it.
     try {
       filter = call.filter === null ? null : new Predicate(call.filter, context);
       distinct =
@@ -167,6 +172,7 @@ export class AggregateOperator implements Operator {
           ? new DistinctSet(argument.type, this.#charge, capacity)
           : null;
       this.#takeArena(context, 2 * capacity);
+      selection = { rows: new Uint16Array(capacity), count: 0 };
     } catch (error) {
       accumulator.close();
       distinct?.close();
@@ -177,7 +183,7 @@ export class AggregateOperator implements Operator {
       argument,
       filter,
       distinct,
-      selection: { rows: new Uint16Array(capacity), count: 0 },
+      selection,
     };
   }
 
@@ -230,12 +236,20 @@ export class AggregateOperator implements Operator {
   }
 
   #emit(): MaybePromise<void> {
+    if (this.#aborted) throw this.#abortReason;
     const total = this.#groups === null ? 1 : this.#groups.groupCount;
     const sliceStart = this.#now();
+    const expired = (): boolean => this.#closed || this.#now() - sliceStart >= this.#interval;
     while (this.#emitted < total) {
-      if (this.#closed) return undefined; // aborted while yielding
+      // A downstream push may abort this operator: check before every batch.
+      if (this.#isAborted()) throw this.#abortReason;
       if (this.#now() - sliceStart >= this.#interval) return yieldTask().then(() => this.#emit());
       let count = Math.min(BATCH_ROWS, total - this.#emitted);
+      // Expensive per-group results (AVG over NUMERIC) are prepared under the slice's deadline,
+      // and the batch shrinks to what is ready: the rest resumes after a task yield.
+      for (const { accumulator } of this.#aggregates)
+        if (accumulator.prepare !== undefined)
+          count = Math.min(count, accumulator.prepare(this.#emitted, count, expired));
       let bytes = this.#outputBytes(this.#emitted, count);
       while (count > 1 && bytes > this.#target) {
         count = Math.max(1, Math.floor(count / 2));
@@ -281,6 +295,10 @@ export class AggregateOperator implements Operator {
     return this.downstream.finish();
   }
 
+  #isAborted(): boolean {
+    return this.#aborted;
+  }
+
   #releaseOutput(): void {
     if (this.#outputHeld > 0) this.#charge.free(this.#outputHeld);
     this.#outputHeld = 0;
@@ -298,6 +316,10 @@ export class AggregateOperator implements Operator {
   }
 
   abort(reason: unknown): void {
+    if (!this.#aborted) {
+      this.#aborted = true;
+      this.#abortReason = reason;
+    }
     this.#close();
     this.downstream.abort(reason);
   }

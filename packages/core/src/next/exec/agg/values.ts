@@ -11,7 +11,9 @@
  * - NUMERIC coefficients: f64 while within ±(2^53 − 1), else four 128-bit limbs per entry (the
  *   limb array is created at the first such value). Only coefficients wider than 128 bits — inputs
  *   already in the `wide` representation — are kept as BigInts, in a dense array created at the
- *   first one and charged at `HUGE_BYTES` per stored value (an estimate of a BigInt's heap size).
+ *   first one: each charged at the governor's `bigintBytes` for its magnitude (memory/governor.ts
+ *   "Accounting unit"), the size change charged before a replacement is stored, plus one 8-byte
+ *   slot per entry for the array.
  * - varlen / fixed16: bytes in one arena with per-entry start and end; an overwrite that does not
  *   fit in place appends and repoints the entry, and the arena is compacted when more than half
  *   of it is dead.
@@ -24,6 +26,7 @@
 import type { PhysicalType } from "../../types.js";
 import { layoutOf } from "../../types.js";
 import { MAX_SAFE } from "../../vector/int64.js";
+import { bigintBytes } from "../../memory/governor.js";
 import type { ByteCharge } from "../../vector/varlen.js";
 import type { FlatVector, Validity, Vector, VectorData } from "../../vector/vector.js";
 import { copy, fitsInt64, int64Words, setBigInt, setNumber, toBigInt } from "../kernels/limbs.js";
@@ -31,8 +34,10 @@ import { scaleAt, specialAt } from "../kernels/numeric.js";
 import { slotOf } from "../kernels/vectors.js";
 
 const TWO32 = 4294967296;
-/** Charged per BigInt kept for a coefficient past 128 bits (an estimate of its heap size). */
-export const HUGE_BYTES = 64;
+/** A slot of a JS array of BigInts (its pointer). */
+const SLOT_BYTES = 8;
+/** A small BigInt an emitted `wide` vector holds for a value that fits 128 bits (2 digits). */
+const SMALL_BIGINT_BYTES = 32;
 
 /** Decimal coefficient tiers per entry. */
 const SAFE = 0;
@@ -70,6 +75,8 @@ export class GroupValues {
   #tiers = new Uint8Array(0);
   #limbs: Uint32Array | null = null;
   #huge: bigint[] | null = null;
+  /** Per entry: the `bigintBytes` charged for its huge coefficient (0 when not huge). */
+  #hugeBytes = new Float64Array(0);
   #scales = new Uint16Array(0);
   #specials = new Uint8Array(0);
   /** Interval months and days. */
@@ -152,7 +159,8 @@ export class GroupValues {
         this.#specials = this.#grow(this.#specials, Uint8Array, next);
         if (this.#limbs !== null) this.#limbs = this.#grow(this.#limbs, Uint32Array, 4 * next);
         if (this.#huge !== null) {
-          this.#take(8 * (next - this.#capacity));
+          this.#hugeBytes = this.#grow(this.#hugeBytes, Float64Array, next);
+          this.#take(SLOT_BYTES * (next - this.#capacity));
           this.#huge.length = next;
           this.#huge.fill(0n, this.#capacity);
         }
@@ -258,13 +266,10 @@ export class GroupValues {
             if (value >= -BigInt(MAX_SAFE) && value <= BigInt(MAX_SAFE)) {
               this.#setTier(index, SAFE);
               this.#values[index] = Number(value);
-            } else {
+            } else if (value >= -(1n << 127n) && value < 1n << 127n) {
               this.#setTier(index, LIMBS);
-              if (!setBigInt(this.#limbStore(), index, value)) {
-                this.#setTier(index, HUGE);
-                this.#hugeStore()[index] = value;
-              }
-            }
+              setBigInt(this.#limbStore(), index, value);
+            } else this.#setHuge(index, value);
             return;
           }
         }
@@ -300,23 +305,28 @@ export class GroupValues {
     }
   }
 
-  /** Moves a decimal entry to `tier`, creating the limb or BigInt storage on first use. */
+  /** Moves a decimal entry to the SAFE or LIMBS tier (a huge value it held is released). */
   #setTier(index: number, tier: number): void {
-    const before = this.#tiers[index] ?? SAFE;
-    if (before === HUGE && tier !== HUGE) {
-      this.#hugeStore()[index] = 0n;
-      this.#give(HUGE_BYTES);
-    }
     if (tier === LIMBS && this.#limbs === null)
       this.#limbs = this.#make(Uint32Array, 4 * this.#capacity);
-    if (tier === HUGE) {
-      if (this.#huge === null) {
-        this.#take(8 * this.#capacity);
-        this.#huge = new Array<bigint>(this.#capacity).fill(0n);
-      }
-      if (before !== HUGE) this.#take(HUGE_BYTES);
+    if ((this.#tiers[index] ?? SAFE) === HUGE) {
+      this.#hugeStore()[index] = 0n;
+      this.#give(this.#hugeBytes[index] ?? 0);
+      this.#hugeBytes[index] = 0;
     }
     this.#tiers[index] = tier;
+  }
+
+  /** Stores a coefficient past 128 bits, charging its size change before it replaces anything. */
+  #setHuge(index: number, value: bigint): void {
+    const store = this.#hugeStore();
+    const bytes = bigintBytes(value);
+    const before = this.#hugeBytes[index] ?? 0;
+    if (bytes > before) this.#take(bytes - before);
+    else if (bytes < before) this.#give(before - bytes);
+    this.#hugeBytes[index] = bytes;
+    store[index] = value;
+    this.#tiers[index] = HUGE;
   }
 
   /** The limb store (created by `#setTier` before any LIMBS entry is written). */
@@ -328,7 +338,8 @@ export class GroupValues {
   /** The BigInt store (created by `#setTier` before any HUGE entry is written). */
   #hugeStore(): bigint[] {
     if (this.#huge === null) {
-      this.#take(8 * this.#capacity);
+      this.#hugeBytes = this.#make(Float64Array, this.#capacity);
+      this.#take(SLOT_BYTES * this.#capacity);
       this.#huge = new Array<bigint>(this.#capacity).fill(0n);
     }
     return this.#huge;
@@ -443,12 +454,23 @@ export class GroupValues {
       case "fixed16":
         return validity + 16 * count;
       case "decimal": {
+        // Scales and specials, then coefficients at their widest tier: 16 bytes of limbs, or, once
+        // one entry is huge, a BigInt each (its charged size, or a small one) plus its slot.
         let huge = 0;
+        let hugeBytes = 0;
         if (this.#huge !== null)
-          for (let k = 0; k < count; k++)
-            if (this.#tiers[ids === null ? from + k : (ids[k] ?? 0)] === HUGE) huge += 1;
-        // Coefficients at their widest tier (16 bytes, or a BigInt each), scales, specials.
-        return validity + count * (16 + 2 + 1) + (huge > 0 ? count * HUGE_BYTES : 0);
+          for (let k = 0; k < count; k++) {
+            const e = ids === null ? from + k : (ids[k] ?? 0);
+            if (this.#tiers[e] === HUGE) {
+              huge += 1;
+              hugeBytes += this.#hugeBytes[e] ?? 0;
+            }
+          }
+        const coefficients =
+          huge === 0
+            ? 16 * count
+            : hugeBytes + (count - huge) * SMALL_BIGINT_BYTES + SLOT_BYTES * count;
+        return validity + count * (2 + 1) + coefficients;
       }
       case "varlen": {
         let bytes = 0;
@@ -633,6 +655,7 @@ export class GroupValues {
     this.#tiers = new Uint8Array(0);
     this.#limbs = null;
     this.#huge = null;
+    this.#hugeBytes = new Float64Array(0);
     this.#bytes = new Uint8Array(0);
     this.#starts = new Int32Array(0);
     this.#ends = new Int32Array(0);
@@ -673,7 +696,7 @@ export function flatBytes(vector: FlatVector): number {
       return (
         bytes +
         (data.coefficients.repr === "wide"
-          ? HUGE_BYTES * data.coefficients.values.length
+          ? data.coefficients.values.reduce((n, v) => n + bigintBytes(v) + SLOT_BYTES, 0)
           : data.coefficients.repr === "int128"
             ? data.coefficients.limbs.byteLength
             : data.coefficients.values.byteLength)

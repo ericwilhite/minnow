@@ -193,7 +193,11 @@ describe("review B4-p2b-1", () => {
       finish: () => undefined,
       abort: () => undefined,
     };
-    const op = aggregate([TEXT], [0], [], charge, sink, { targetBytes: 256 * 1024 });
+    // A frozen clock: the slice must not end (and yield) before the blocked second batch.
+    const op = aggregate([TEXT], [0], [], charge, sink, {
+      targetBytes: 256 * 1024,
+      now: () => 0,
+    });
     for (let start = 0; start < 100; start += 20)
       op.push({
         length: 20,
@@ -282,9 +286,11 @@ describe("review B4-p2b-1", () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(timerRan).toBe(true);
     expect(batches).toBeGreaterThan(before);
-    op.abort(new Error("cancelled"));
+    const reason = new Error("cancelled");
+    op.abort(reason);
     const atAbort = batches;
-    await result;
+    // A finish resumed after an abort rejects with its reason (R23), emitting nothing more.
+    await expect(result).rejects.toBe(reason);
     await new Promise<void>((resolve) => setTimeout(resolve, 5));
     expect(batches).toBe(atAbort);
     expect(batches).toBeLessThan(100);

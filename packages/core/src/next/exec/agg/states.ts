@@ -61,7 +61,8 @@ import {
 import { POW10, coefficientAt, scaleAt, specialAt, type DecimalData } from "../kernels/numeric.js";
 import { IDENTITY, flatOf } from "../kernels/vectors.js";
 import { Charged } from "./groups.js";
-import { GroupValues, HUGE_BYTES } from "./values.js";
+import { bigintBytes } from "../../memory/governor.js";
+import { GroupValues } from "./values.js";
 
 export interface Accumulator {
   readonly type: PhysicalType;
@@ -76,6 +77,12 @@ export interface Accumulator {
   emit(from: number, count: number): FlatVector;
   /** An upper bound of the bytes `emit(from, count)` allocates (charged before emitting). */
   outputBytes(from: number, count: number): number;
+  /**
+   * Accumulators whose emit does expensive work per group (AVG over NUMERIC: an exact division
+   * each) prepare it under a deadline: returns how many groups from `from` (≤ `count`) are ready,
+   * at least one. `emit(from, k)` for k up to that is then cheap.
+   */
+  prepare?(from: number, count: number, expired: () => boolean): number;
   close(): void;
 }
 
@@ -233,6 +240,26 @@ class CountAccumulator implements Accumulator {
 // Exact integer sums (SUM(int2/int4/int8), the sum inside AVG of integers)
 
 const TWO128 = 1n << 128n;
+/**
+ * PostgreSQL's NUMERIC limits (numeric.c NUMERIC_WEIGHT_MAX / NUMERIC_DSCALE_MAX): at most 131,072
+ * digits before the decimal point and 16,383 after. A result beyond them is 22003 "value overflows
+ * numeric format" when it is produced (emitted): exact intermediates may pass it and come back.
+ */
+const NUMERIC_MAX_INTEGER_DIGITS = 131_072;
+
+/** Throws 22003 when `coefficient × 10^−scale` has more integer digits than NUMERIC allows. */
+function checkNumericRange(coefficient: bigint, scale: number): bigint {
+  // Only values far past 128 bits can be out of range (39 digits), so the digit count is rare.
+  if (coefficient > 10n ** 38n || coefficient < -(10n ** 38n)) {
+    const digits = (coefficient < 0n ? -coefficient : coefficient).toString().length;
+    if (digits - scale > NUMERIC_MAX_INTEGER_DIGITS)
+      throw new NumericOutOfRangeError("value overflows numeric format");
+  }
+  return coefficient;
+}
+
+/** A slot of a JS array of BigInts (the pointer), charged per group of a dense offset array. */
+const SLOT_BYTES = 8;
 
 /**
  * Per-group exact sum: an f64 part within ±LIMIT, plus a 128-bit limb carry, plus an exact BigInt
@@ -251,6 +278,8 @@ class ExactSums {
   carried = 0;
   /** The offsets past 128 bits, or null while every total fits the carry. */
   wide: bigint[] | null = null;
+  /** Per group: the `bigintBytes` charged for its offset (0 while it is 0n). */
+  #wideBytes: Float64Array = new Float64Array(0);
   constructor(charge: ByteCharge) {
     this.#memory = new Charged(charge);
   }
@@ -262,30 +291,65 @@ class ExactSums {
     this.carry = this.#memory.uint32(this.carry, 4 * capacity);
     this.has = this.#memory.uint8(this.has, capacity);
     if (this.wide !== null) {
-      this.#memory.take(HUGE_BYTES * (capacity - before));
+      this.#wideBytes = this.#memory.float64(this.#wideBytes, capacity);
+      this.#memory.take(SLOT_BYTES * (capacity - before));
       this.wide.length = capacity;
       this.wide.fill(0n, before);
     }
   }
   #offsets(): bigint[] {
     if (this.wide === null) {
-      this.#memory.take(HUGE_BYTES * this.sums.length);
+      this.#wideBytes = this.#memory.float64(this.#wideBytes, this.sums.length);
+      this.#memory.take(SLOT_BYTES * this.sums.length);
       this.wide = new Array<bigint>(this.sums.length).fill(0n);
     }
     return this.wide;
   }
+  /**
+   * Stores group g's new offset, charging its size change first (the governor's `bigintBytes`
+   * per retained BigInt): a refused charge throws before anything changes.
+   */
+  #setOffset(g: number, value: bigint): void {
+    const offsets = this.#offsets();
+    const bytes = value === 0n ? 0 : bigintBytes(value);
+    const before = this.#wideBytes[g] ?? 0;
+    if (bytes > before) this.#memory.take(bytes - before);
+    else if (bytes < before) this.#memory.give(before - bytes);
+    this.#wideBytes[g] = bytes;
+    offsets[g] = value;
+  }
+  /**
+   * Bytes of the BigInts a `wide` output of groups [from, from + count) holds: once any of them is
+   * past 128 bits, every value of the batch is a BigInt (its offset's size plus the carry's
+   * 128 bits, or a small one) and an array slot.
+   */
+  wideOutputBytes(from: number, count: number): number {
+    if (this.wide === null) return 0;
+    let bytes = 0;
+    let any = false;
+    for (let k = 0; k < count; k++) {
+      const offset = this.#wideBytes[from + k] ?? 0;
+      if (offset > 0) any = true;
+      bytes += (offset > 0 ? offset + 16 : 32) + SLOT_BYTES;
+    }
+    return any ? bytes : 0;
+  }
+
+  /** Bytes the offset of group g holds (its BigInt's `bigintBytes`; 0 when none). */
+  offsetBytes(g: number): number {
+    return this.#wideBytes[g] ?? 0;
+  }
   /** carry[g] += t[at] (128-bit), exact: an overflow moves ±2^128 into the offset. */
   addCarry(g: number, t: Uint32Array, at: number): void {
     if (!addTo(this.carry, g, this.carry, g, t, at, false)) {
-      const offsets = this.#offsets();
-      offsets[g] = (offsets[g] ?? 0n) + ((t[at * 4 + 3] ?? 0) >>> 31 === 1 ? -TWO128 : TWO128);
+      const offset = this.wide?.[g] ?? 0n;
+      this.#setOffset(g, offset + ((t[at * 4 + 3] ?? 0) >>> 31 === 1 ? -TWO128 : TWO128));
     }
     this.carried += 1;
   }
   /** Adds an exact value of any size (an input past 128 bits) to group g. */
   addBig(g: number, value: bigint): void {
-    const offsets = this.#offsets();
-    offsets[g] = (offsets[g] ?? 0n) + value;
+    this.#setOffset(g, (this.wide?.[g] ?? 0n) + value);
   }
   /** Moves `value` (exact, any magnitude up to 2^63) into group g's carry. */
   spill(g: number, value: number): void {
@@ -330,17 +394,18 @@ class ExactSums {
   set(g: number, value: bigint): void {
     this.sums[g] = 0;
     if (setBigInt(this.carry, g, value)) {
-      if (this.wide !== null) this.wide[g] = 0n;
+      if (this.wide !== null) this.#setOffset(g, 0n);
     } else {
       // The low 128 bits (two's complement) in the carry, the rest in the offset.
       const low = BigInt.asIntN(128, value);
       setBigInt(this.carry, g, low);
-      this.#offsets()[g] = value - low;
+      this.#setOffset(g, value - low);
     }
     this.carried += 1;
   }
   close(): void {
     this.#memory.close();
+    this.wide = null;
   }
 }
 
@@ -479,9 +544,9 @@ class IntegerSumAccumulator implements Accumulator {
     addIntegers(this.#sums, vector, gids, rows, count, scalar);
     this.#counts?.update(vector, gids, rows, count, scalar);
   }
-  outputBytes(_from: number, count: number): number {
-    // f64 or int64 coefficients, or 16 bytes of limbs, or BigInts past 128 bits; validity.
-    return validityBytes(count) + count * (this.#sums.wide === null ? 16 + 8 : HUGE_BYTES + 16);
+  outputBytes(from: number, count: number): number {
+    // f64 or int64 coefficients, 16 bytes of limbs, or (past 128 bits) a BigInt each; validity.
+    return validityBytes(count) + count * 24 + this.#sums.wideOutputBytes(from, count);
   }
   emit(from: number, count: number): FlatVector {
     const sums = this.#sums;
@@ -548,7 +613,9 @@ class IntegerSumAccumulator implements Accumulator {
           scales: null,
           coefficients: {
             repr: "wide",
-            values: Array.from({ length: count }, (_, k) => sums.big(from + k)),
+            values: Array.from({ length: count }, (_, k) =>
+              checkNumericRange(sums.big(from + k), 0),
+            ),
           },
           specials: null,
         },
@@ -1074,11 +1141,16 @@ class DecimalSumAccumulator implements Accumulator {
     } else sums.set(g, sums.big(g) * 10n ** BigInt(d));
     this.#scales[g] = scale;
   }
-  outputBytes(_from: number, count: number): number {
-    // Coefficients (16 bytes, or a BigInt each past 128 bits or for AVG), scales, specials,
-    // presence: an upper bound of what emit allocates.
-    const wide = this.average || this.#sums.wide !== null;
-    return validityBytes(count) + count * ((wide ? HUGE_BYTES : 16) + 16 + 2 + 1 + 1);
+  outputBytes(from: number, count: number): number {
+    // Scales, specials, presence and limbs per group; then the BigInts the output holds: every
+    // AVG result (the sum's digits plus its division scale, at most ~20 more digits: 24 bytes),
+    // or a SUM past 128 bits. Sizes come from what each group's state charged (`bigintBytes`).
+    const fixed = validityBytes(count) + count * (16 + 2 + 1 + 1);
+    if (!this.average) return fixed + this.#sums.wideOutputBytes(from, count);
+    let bytes = fixed;
+    for (let k = 0; k < count; k++)
+      bytes += Math.max(this.#sums.offsetBytes(from + k), 48) + 24 + 8;
+    return bytes;
   }
   emit(from: number, count: number): FlatVector {
     const sums = this.#sums;
@@ -1096,7 +1168,7 @@ class DecimalSumAccumulator implements Accumulator {
     const validity = validityFrom(present, 0, count);
     const uniform = this.#scale >= 0 ? this.#scale : null;
     const scales = uniform === null ? this.#scales.slice(from, from + count) : null;
-    if (this.average) return this.#average(from, count, validity, specials, uniform);
+    if (this.average) return this.#average(from, count, validity, specials);
     let coefficients: DecimalData["coefficients"];
     if (sums.carried === 0 && sums.wide === null)
       coefficients = { repr: "safe", values: sums.sums.slice(from, from + count) };
@@ -1111,7 +1183,9 @@ class DecimalSumAccumulator implements Accumulator {
       if (wide)
         coefficients = {
           repr: "wide",
-          values: Array.from({ length: count }, (_, k) => sums.big(from + k)),
+          values: Array.from({ length: count }, (_, k) =>
+            checkNumericRange(sums.big(from + k), uniform ?? this.#scales[from + k] ?? 0),
+          ),
         };
       else if (fits) {
         const big = new BigInt64Array(count);
@@ -1135,30 +1209,71 @@ class DecimalSumAccumulator implements Accumulator {
     };
   }
   /** AVG(numeric): sum / count with PostgreSQL's division scale, per group. */
+  /**
+   * Computes AVG results of groups from `from` on into a cache, one group at a time, until
+   * `count` are ready or `expired()` says the time slice is over (checked after every group whose
+   * sum is past 128 bits, every 256 otherwise; at least one group per call). Returns how many
+   * groups from `from` are ready: the operator emits those and resumes the rest after a yield.
+   */
+  prepare(from: number, count: number, expired: () => boolean): number {
+    if (!this.average) return count;
+    const cache = this.#prepared;
+    if (cache.from !== from) {
+      cache.from = from;
+      cache.coefficients.length = 0;
+      cache.scales.length = 0;
+    }
+    const uniform = this.#scale >= 0 ? this.#scale : null;
+    const sums = this.#sums;
+    let since = 0;
+    while (cache.coefficients.length < count) {
+      const g = from + cache.coefficients.length;
+      const f = this.#flags[g] ?? 0;
+      let coefficient = 0n;
+      let scale = 0;
+      const special = f & NAN || f & POS || f & NEG;
+      if (!special && (f & HAS) !== 0) {
+        // Per group, once: BigInt here is O(groups), never O(rows). PostgreSQL range-checks the
+        // sum itself before dividing (AVG(x, x) of the largest x is 22003, verified in PGlite).
+        const sumScale = uniform ?? this.#scales[g] ?? 0;
+        const sum = checkNumericRange(sums.big(g), sumScale);
+        const outcome = numericDivide(0, sum, sumScale, 0, BigInt(this.#counts[g] ?? 1), 0);
+        coefficient = checkNumericRange(outcome.coefficient, outcome.scale);
+        scale = outcome.scale;
+      }
+      cache.coefficients.push(coefficient);
+      cache.scales.push(scale);
+      since += 1;
+      if ((sums.offsetBytes(g) > 0 || since >= 256) && expired()) break;
+      if (since >= 256) since = 0;
+    }
+    return cache.coefficients.length;
+  }
+
+  /** AVG results prepared for groups `from …` (see `prepare`). */
+  readonly #prepared: { from: number; coefficients: bigint[]; scales: number[] } = {
+    from: -1,
+    coefficients: [],
+    scales: [],
+  };
+
   #average(
     from: number,
     count: number,
     validity: Validity | null,
     specials: Uint8Array,
-    uniform: number | null,
   ): FlatVector {
-    const sums = this.#sums;
-    const coefficients: bigint[] = new Array<bigint>(count).fill(0n);
-    const scales = new Uint16Array(count);
+    if (this.prepare(from, count, () => false) < count)
+      throw new RangeError("AVG results were not prepared");
+    const cache = this.#prepared;
+    const coefficients = cache.coefficients.slice(0, count);
+    const scales = Uint16Array.from(cache.scales.slice(0, count));
+    // The cache moves on to the groups after this batch.
+    cache.from = from + count;
+    cache.coefficients.splice(0, count);
+    cache.scales.splice(0, count);
     let anySpecial = false;
-    for (let k = 0; k < count; k++) {
-      const g = from + k;
-      if (specials[k] !== 0) {
-        anySpecial = true;
-        continue;
-      }
-      if (((this.#flags[g] ?? 0) & HAS) === 0) continue;
-      const scale = uniform ?? this.#scales[g] ?? 0;
-      // Per group, once: BigInt here is O(groups), never O(rows).
-      const outcome = numericDivide(0, sums.big(g), scale, 0, BigInt(this.#counts[g] ?? 1), 0);
-      coefficients[k] = outcome.coefficient;
-      scales[k] = outcome.scale;
-    }
+    for (let k = 0; k < count; k++) if (specials[k] !== 0) anySpecial = true;
     return {
       form: "flat",
       type: this.type,
