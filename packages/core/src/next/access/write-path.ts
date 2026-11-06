@@ -54,6 +54,9 @@
  * `receipt.wrote` is false, `lsn` is the base LSN. The owner then settles the request without an
  * outcome (format/ledger.ts `settle`); a retry runs again, which is correct for a no-op.
  *
+ * Recovery schedules the staging fold in a later task, after open has delivered ready;
+ * no group-root read begins as part of open, including its queued microtasks.
+ *
  * Retirement of unclaimed staging runs in task slices, checks close and the open signal,
  * and deduplicates extent identities in a set. It runs at the first publication after open.
  *

@@ -313,8 +313,8 @@ const isGroupRoot = (bytes: Uint8Array) =>
 
 /**
  * Counts, during the next open only, the group-root extents read through the space (`roots`) and
- * the log scans (one header read per scan). Reads by a flush the open scheduled (the fold, after
- * ready: it reads each staged root once for the table's statistics) are counted apart (`fold`).
+ * the log scans (one header read per scan). Reads initiated after stop() marks the actual
+ * open-return boundary are counted apart (`fold`), regardless of their call stack.
  */
 function watchOpen(harness: Harness): {
   roots: Set<number>;
@@ -326,23 +326,21 @@ function watchOpen(harness: Harness): {
   const fold = new Set<number>();
   let scans = 0;
   let watching = true;
-  const flushing = () => (new Error().stack ?? "").includes("#writeFlush");
+  const flushing = () => !watching;
   harness.onSpace = (space) => {
     const read = space.read.bind(space);
     space.read = async (refs, options) => {
       const byFlush = flushing();
       const lease = await read(refs, options);
-      if (watching)
-        lease.bytes.forEach((bytes, k) => {
-          if (isGroupRoot(bytes)) (byFlush ? fold : roots).add(need(refs[k]).extent.offset);
-        });
+      lease.bytes.forEach((bytes, k) => {
+        if (isGroupRoot(bytes)) (byFlush ? fold : roots).add(need(refs[k]).extent.offset);
+      });
       return lease;
     };
     const peek = space.peek.bind(space);
     space.peek = (ref) => {
       const bytes = peek(ref);
-      if (watching && bytes !== null && isGroupRoot(bytes))
-        (flushing() ? fold : roots).add(ref.extent.offset);
+      if (bytes !== null && isGroupRoot(bytes)) (flushing() ? fold : roots).add(ref.extent.offset);
       return bytes;
     };
   };
@@ -393,7 +391,8 @@ describe("an open with staging reads no group root (R25; review B3-p2c-1 #2)", (
     expect([...watch.roots], "group roots read at open").toEqual([]);
     expect(watch.scans(), "one log scan").toBe(1);
     expect(crashed.maintenance.publishedReplays).toBe(1);
-    // The fold the open scheduled reads them after ready: the watch does see such reads.
+    // Ready is now delivered; subsequent reads belong to maintenance.
+    watch.stop();
     await crashed.quiesce();
     expect(watch.fold.size, "the fold read the staged roots").toBeGreaterThan(0);
     watch.stop();

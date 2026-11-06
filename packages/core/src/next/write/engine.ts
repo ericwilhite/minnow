@@ -710,6 +710,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
       await engine.#load();
       await engine.#recover();
       engine.#recovering = false;
+      // A resolved promise would start the fold before the open result reaches the owner.
+      // Track the task delay in the flush chain so quiesce/close also wait for it.
+      engine.#flushes = new Promise<void>((resolve) => setTimeout(resolve, 0));
       engine.#scheduleFlush();
       engine.#scheduleMerge();
       if (engine.#appender.end >= engine.#logRecycleBytes) engine.#maybeRecycle();
