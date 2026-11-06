@@ -3,7 +3,7 @@
  * through the real operators, inputs prebuilt and untimed. Not a test; bundle and run:
  *
  *     npx esbuild packages/core/src/next/exec/sort.bench.ts --bundle --platform=node \
- *       --format=esm --outfile=/tmp/sort-bench.mjs && node --expose-gc /tmp/sort-bench.mjs [shape …]
+ *       --format=esm --outfile=$HOME/.cache/sort-bench.mjs && node --expose-gc $HOME/.cache/sort-bench.mjs [shape …]
  *
  * Shapes (DuckDB-Wasm single-thread W1M targets in measurements.md, whole queries):
  * - `numeric`: ORDER BY f09, id returning id, f09, d06 (≤ 252 ms)

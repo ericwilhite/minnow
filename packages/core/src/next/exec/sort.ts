@@ -55,8 +55,13 @@ import {
   type Transfer,
 } from "./pipeline.js";
 import {
+  DirectKeyEncoder,
   PREFIX_WORDS,
+  RadixScratch,
   SortKeyEncoder,
+  TUPLE_WORDS,
+  directWidth,
+  msdSort,
   collatorFor,
   compareRanges,
   compareRows,
@@ -71,9 +76,7 @@ import {
   runToEnd,
   Slice,
   SLICE_ROWS,
-  sortByPrefixJob,
   sortMode,
-  sortScratchBytes,
   type Operands,
   type SlicedJob,
   type SortColumn,
@@ -88,9 +91,17 @@ const INT: PhysicalType = { kind: "int32", bits: 32 };
 const BIGINT: PhysicalType = { kind: "int64" };
 /** Most spill runs one merge reads at once. */
 export const MAX_FAN_IN = 64;
-/** Sort scratch reserved per row as rows arrive: ids, prefix words, radix buffers. */
-const SCRATCH_PER_ROW = 4 + 4 * PREFIX_WORDS + 2 * 4 * (PREFIX_WORDS + 1);
+/**
+ * Sort scratch reserved per row as rows arrive: ids, then (prefix words, row id) tuples and the
+ * radix's copy of them (compare and ranks modes use ids and a merge buffer, 8 bytes).
+ */
+const SCRATCH_PER_ROW = 4 + 2 * 4 * TUPLE_WORDS;
 const POOL_BYTES = 1024 * 1024;
+/**
+ * A sorter's own scratch (R23.1), charged at construction: survivor rows, partition key
+ * lengths, identity rows and group survivors per batch row, and the radix histograms.
+ */
+const SORTER_SCRATCH_BYTES = BATCH_ROWS * (2 + 4 + 2 + 2) + RadixScratch.BYTES;
 
 export interface SortSpec {
   readonly types: readonly PhysicalType[];
@@ -143,6 +154,7 @@ export function sortMinimumBytes(types: readonly PhysicalType[]): number {
   for (const type of types) row += type.kind === "text" || type.kind === "bytes" ? 24 : 17;
   return (
     POOL_BYTES +
+    SORTER_SCRATCH_BYTES +
     2 * (2048 * (PREFIX_WORDS * 4 + 4) + 4096 + 260) +
     2048 * (row + SCRATCH_PER_ROW) +
     16 * 1024 * (types.length + 2) +
@@ -316,6 +328,9 @@ class Sorter {
   readonly partLengths = new Int32Array(BATCH_ROWS);
   /** Rows 0 … BATCH_ROWS − 1 (never written after construction). */
   readonly #identity = Uint16Array.from({ length: BATCH_ROWS }, (_, i) => i);
+  readonly groupKept = new Uint16Array(BATCH_ROWS);
+  readonly radix = new RadixScratch();
+  #groupKeptCount = 0;
   /**
    * Compare mode: the resident rows' decoded operands by row id, charged as the rows arrive, so
    * a run's comparisons never decode (and a full store already holds what its sort needs).
@@ -333,6 +348,14 @@ class Sorter {
   /** Longest key bytes stored: within the prefix words no full comparison is needed. */
   #maxKey = 0;
   #threshold: Uint8Array | null = null;
+  /** Direct mode: the threshold's prefix words. */
+  #thresholdWords: Uint32Array | null = null;
+  /** Fixed-width keys encoded straight into the prefix words (no key bytes, no refinement). */
+  readonly direct: boolean;
+  readonly directEncoder: DirectKeyEncoder | null;
+  /** Per-group top-k: partition key → its k-th order key so far (rows must beat it). */
+  readonly #groups: ByteSet | null;
+  #groupThresholds: Array<Uint8Array | undefined> = [];
   #lastSurvivors = 0;
   #sets: Array<ByteSet | null>;
   #aborted: unknown = undefined;
@@ -352,7 +375,7 @@ class Sorter {
     this.#partKeys = spec.keys.slice(0, spec.partition);
     this.charge = new Charge(context.grant);
     this.pool = new Pool(this.charge, POOL_BYTES);
-    if (!this.charge.allocate(BATCH_ROWS * 8))
+    if (!this.charge.allocate(SORTER_SCRATCH_BYTES))
       throw new RangeError("A sort's minimum must be admitted");
     this.files = new SpillFiles(context.spill, context.queryId, this.charge);
     this.pages = new PageWriter(this.pool, 16 * 1024);
@@ -364,7 +387,14 @@ class Sorter {
         const bytes = operandBytes(spec.types, spec.keys, staging.vectors(), 0, staging.rows);
         if (bytes > this.#pageOperands) this.#pageOperands = bytes;
       };
-    this.encoder = this.mode === "keys" ? new SortKeyEncoder(spec.keys, this.pool) : null;
+    this.direct =
+      this.mode === "keys" && spec.partition === 0 && directWidth(spec.types, spec.keys) !== null;
+    this.directEncoder = this.direct
+      ? new DirectKeyEncoder(spec.types, spec.keys, this.pool)
+      : null;
+    this.encoder =
+      this.mode === "keys" && !this.direct ? new SortKeyEncoder(spec.keys, this.pool) : null;
+    this.#groups = this.mode === "keys" && spec.partition > 0 ? new ByteSet(this.charge) : null;
     this.partEncoder =
       this.mode === "keys" && spec.partition > 0
         ? new SortKeyEncoder(spec.keys.slice(0, spec.partition), this.pool)
@@ -391,6 +421,8 @@ class Sorter {
   /** Store columns: payload, then (key mode) key bytes, prefix words, partition key length. */
   get storeTypes(): PhysicalType[] {
     if (this.mode !== "keys") return [...this.spec.types];
+    if (this.direct)
+      return [...this.spec.types, ...Array.from({ length: PREFIX_WORDS }, () => INT)];
     return [
       ...this.spec.types,
       BYTES,
@@ -405,6 +437,10 @@ class Sorter {
 
   get keyColumn(): number {
     return this.width;
+  }
+  /** First prefix-word column (after the key bytes, except in direct mode). */
+  get prefixColumn(): number {
+    return this.width + (this.direct ? 0 : 1);
   }
 
   checkAborted(): void {
@@ -434,6 +470,7 @@ class Sorter {
     ids: Uint16Array | null,
     count: number,
   ): MaybePromise<void> {
+    if (this.directEncoder !== null) return this.#addDirect(columns, ids, count);
     const encoder = this.encoder;
     if (encoder === null) return;
     let rows: Uint16Array | null = ids;
@@ -476,8 +513,89 @@ class Sorter {
       const offsets = this.partEncoder.keys.offsets;
       for (let k = 0; k < n; k++) this.partLengths[k] = (offsets[k + 1] ?? 0) - (offsets[k] ?? 0);
       tail.push(partLengthVector(this.partLengths, n));
+      if (this.#groupThresholds.length > 0 && this.#filterGroups(rows, n)) {
+        // Some rows lost to their partition's k-th key: encode the survivors again.
+        const kept = this.groupKept.subarray(0, this.#groupKeptCount);
+        this.profile.rejected += n - kept.length;
+        if (kept.length === 0) return;
+        return this.#addKeyedRows(columns, kept);
+      }
     }
     return this.#append(columns, rows, n, tail, 0);
+  }
+
+  /** Re-encodes and appends rows that passed the per-group thresholds. */
+  #addKeyedRows(columns: readonly Vector[], rows: Uint16Array): MaybePromise<void> {
+    const encoder = this.encoder;
+    const part = this.partEncoder;
+    if (encoder === null || part === null) return;
+    const n = rows.length;
+    const encoded = encoder.encode(columns, rows, 0, n);
+    if (encoded.done < n) return this.#split(columns, rows, n, encoded);
+    const parted = part.encode(columns, rows, 0, n);
+    if (parted.done < n) return this.#split(columns, rows, n, parted);
+    const offsets = part.keys.offsets;
+    for (let k = 0; k < n; k++) this.partLengths[k] = (offsets[k + 1] ?? 0) - (offsets[k] ?? 0);
+    const tail = encoder.tail;
+    tail.push(partLengthVector(this.partLengths, n));
+    return this.#append(columns, rows, n, tail, 0);
+  }
+
+  /**
+   * Per-group top-k: keeps (in `groupKept`) the rows whose key beats their partition's k-th key
+   * so far; true when some were dropped. Keys and partition lengths are in the encoders.
+   */
+  #filterGroups(rows: Uint16Array | null, n: number): boolean {
+    const groups = this.#groups;
+    const encoder = this.encoder;
+    if (groups === null || encoder === null) return false;
+    const bytes = encoder.keys.writer.bytes;
+    const offsets = encoder.keys.offsets;
+    let m = 0;
+    for (let k = 0; k < n; k++) {
+      const start = offsets[k] ?? 0;
+      const end = offsets[k + 1] ?? 0;
+      const id = groups.find(bytes, start, start + (this.partLengths[k] ?? 0));
+      const threshold = id < 0 ? undefined : this.#groupThresholds[id];
+      if (
+        threshold === undefined ||
+        compareRanges(bytes, start, end, threshold, 0, threshold.length) < 0
+      )
+        this.groupKept[m++] = rows === null ? k : (rows[k] ?? 0);
+    }
+    this.#groupKeptCount = m;
+    return m < n;
+  }
+
+  /** Direct mode: words straight from the vectors; top-N rows that cannot win are dropped. */
+  #addDirect(
+    columns: readonly Vector[],
+    ids: Uint16Array | null,
+    count: number,
+  ): MaybePromise<void> {
+    const encoder = this.directEncoder;
+    if (encoder === null) return;
+    encoder.encode(columns, ids, 0, count);
+    const threshold = this.#thresholdWords;
+    if (threshold === null) return this.#append(columns, ids, count, encoder.tail, 0);
+    const prefixes = encoder.prefixes;
+    let m = 0;
+    for (let k = 0; k < count; k++) {
+      let order = 0;
+      for (let w = 0; w < PREFIX_WORDS && order === 0; w++) {
+        const x = (prefixes[w]?.[k] ?? 0) >>> 0;
+        const y = threshold[w] ?? 0;
+        if (x !== y) order = x < y ? -1 : 1;
+      }
+      if (order < 0 || (order === 0 && this.spec.withTies))
+        this.keptRows[m++] = ids === null ? k : (ids[k] ?? 0);
+    }
+    this.profile.rejected += count - m;
+    if (m === 0) return;
+    if (m === count) return this.#append(columns, ids, count, encoder.tail, 0);
+    const kept = this.keptRows.slice(0, m);
+    encoder.encode(columns, kept, 0, m);
+    return this.#append(columns, kept, m, encoder.tail, 0);
   }
 
   /**
@@ -640,14 +758,48 @@ class Sorter {
       return false;
     }
     if (this.spec.partition === 0 && keep > 0 && survivors.length >= keep) {
-      const [bytes, start, end] = keyOf(this.store, this.keyColumn, survivors[keep - 1] ?? 0);
-      this.#threshold = bytes.slice(start, end);
+      const id = survivors[keep - 1] ?? 0;
+      if (this.direct) this.#thresholdWords = this.#wordsOf(id);
+      else {
+        const [bytes, start, end] = keyOf(this.store, this.keyColumn, id);
+        this.#threshold = bytes.slice(start, end);
+      }
     }
+    if (this.spec.partition > 0) yield* this.#setGroupThresholds(survivors, keep, slice);
     this.store.close();
     this.store = next;
     this.#lastSurvivors = survivors.length;
     this.profile.compactions++;
     return true;
+  }
+
+  /** Prefix words of store row `id`. */
+  #wordsOf(id: number): Uint32Array {
+    const store = this.store;
+    const words = new Uint32Array(PREFIX_WORDS);
+    for (let w = 0; w < PREFIX_WORDS; w++)
+      words[w] = valueAt32(store, this.prefixColumn + w, id) >>> 0;
+    return words;
+  }
+
+  /** After a per-group compaction: each partition with k survivors gets its k-th key. */
+  *#setGroupThresholds(survivors: Int32Array, keep: number, slice: Slice): SlicedJob<void> {
+    const groups = this.#groups;
+    if (groups === null) return;
+    const store = this.store;
+    let inGroup = 0;
+    for (let i = 0; i < survivors.length; i++) {
+      const id = survivors[i] ?? 0;
+      if (i > 0 && !this.samePartitionIds(survivors[i - 1] ?? 0, id)) inGroup = 0;
+      inGroup++;
+      if ((i & (SLICE_ROWS - 1)) === SLICE_ROWS - 1 && slice.due()) yield;
+      if (inGroup !== keep) continue;
+      const [bytes, start, end] = keyOf(store, this.keyColumn, id);
+      const length = valueAt32(store, this.prefixColumn + PREFIX_WORDS, id);
+      const group = groups.add(bytes, start, start + length);
+      if (group < 0) return;
+      this.#groupThresholds[group] = bytes.slice(start, end);
+    }
   }
 
   /** From sorted ids, the ones to keep: the first `keep` (with ties), or per partition. */
@@ -678,6 +830,14 @@ class Sorter {
   /** Order of store rows a, b. */
   compareIds(a: number, b: number): number {
     const store = this.store;
+    if (this.direct) {
+      for (let w = 0; w < PREFIX_WORDS; w++) {
+        const x = valueAt32(store, this.prefixColumn + w, a) >>> 0;
+        const y = valueAt32(store, this.prefixColumn + w, b) >>> 0;
+        if (x !== y) return x < y ? -1 : 1;
+      }
+      return 0;
+    }
     if (this.mode === "keys") {
       const shift = store.chunkShift;
       const mask = store.chunkMask;
@@ -779,7 +939,7 @@ class Sorter {
         ) === 0
       );
     // Direct reads: the partition key length, then that prefix of the key bytes.
-    const plen = this.keyColumn + 1 + PREFIX_WORDS;
+    const plen = this.prefixColumn + PREFIX_WORDS;
     const la = valueAt32(store, plen, a);
     if (la !== valueAt32(store, plen, b)) return false;
     const x = store.chunk(this.keyColumn, a >>> shift).data as {
@@ -806,7 +966,7 @@ class Sorter {
   ): boolean {
     if (this.mode !== "keys")
       return compareRows(this.spec.types, this.#partKeys, a, i, b, j, ao, bo) === 0;
-    const plen = this.keyColumn + 1 + PREFIX_WORDS;
+    const plen = this.prefixColumn + PREFIX_WORDS;
     const la = int32At(a[plen], i);
     if (la !== int32At(b[plen], j)) return false;
     const x = varlenOf(a[this.keyColumn]);
@@ -827,6 +987,12 @@ class Sorter {
   ): boolean {
     if (this.mode !== "keys")
       return compareRows(this.spec.types, this.spec.keys, a, i, b, j, ao, bo) === 0;
+    if (this.direct) {
+      for (let w = 0; w < PREFIX_WORDS; w++)
+        if (int32At(a[this.prefixColumn + w], i) !== int32At(b[this.prefixColumn + w], j))
+          return false;
+      return true;
+    }
     const x = varlenOf(a[this.keyColumn]);
     const y = varlenOf(b[this.keyColumn]);
     return (
@@ -867,7 +1033,8 @@ class Sorter {
     }
     // One row larger than everything the grant has left: a loan for it (rule 5).
     if (this.#rowLoan !== null) throw new RangeError("A sort row could not be stored");
-    const key = tail[0] === undefined ? 0 : varlenLength(tail[0], k);
+    // Key mode stores the key bytes first in the tail; direct mode stores only fixed words.
+    const key = this.direct || tail[0] === undefined ? 0 : varlenLength(tail[0], k);
     const operands =
       this.mode === "compare" && this.decodes
         ? operandBytes(this.spec.types, this.spec.keys, columns, row, row + 1)
@@ -880,7 +1047,7 @@ class Sorter {
   // --- sorting ---------------------------------------------------------------------------
 
   /**
-   * The in-memory sort as a sliced job (see `sortByPrefixJob`, `mergeSortJob`): row ids of the
+   * The in-memory sort as a sliced job (see `msdSort`, `mergeSortJob`): row ids of the
    * store in order, or null when its memory (rank arrays, operands) was refused. Its scratch was
    * reserved as the rows arrived.
    */
@@ -890,27 +1057,34 @@ class Sorter {
     if (!this.#reserve(n)) return null;
     const ids = new Int32Array(n);
     if (this.mode === "keys") {
-      const words = new Int32Array(n * PREFIX_WORDS);
+      // (prefix words, row id) tuples read straight from the store's word columns, then an MSD
+      // radix over them; 4 + 2 × 4 × TUPLE_WORDS bytes per row, inside the reserve.
+      const S = TUPLE_WORDS;
+      const tuples = new Uint32Array(n * S);
       for (let k = 0; k < store.chunkCount; k++) {
         const base = k * store.chunkRows;
         const length = store.chunk(0, k).length;
         for (let w = 0; w < PREFIX_WORDS; w++) {
-          const values = (store.chunk(this.keyColumn + 1 + w, k).data as { values: Int32Array })
+          const values = (store.chunk(this.prefixColumn + w, k).data as { values: Int32Array })
             .values;
-          for (let i = 0; i < length; i++) words[(base + i) * PREFIX_WORDS + w] = values[i] ?? 0;
+          for (let i = 0; i < length; i++) tuples[(base + i) * S + w] = (values[i] ?? 0) >>> 0;
         }
+        for (let i = 0; i < length; i++) tuples[(base + i) * S + PREFIX_WORDS] = base + i;
         if (slice.due()) yield;
       }
-      const covered = this.#maxKey <= 4 * PREFIX_WORDS;
-      yield* sortByPrefixJob(
+      const covered = this.direct || this.#maxKey <= 4 * PREFIX_WORDS;
+      yield* msdSort(
+        tuples,
+        new Uint32Array(n * S),
         n,
-        words,
-        ids,
-        new Uint32Array(sortScratchBytes(n) / 4),
         covered ? null : (a, b) => this.compareIds(a, b),
-        Math.ceil(this.#maxKey / 4),
         slice,
+        this.radix,
       );
+      for (let i = 0; i < n; i++) {
+        ids[i] = tuples[i * S + PREFIX_WORDS] ?? 0;
+        if ((i & (SLICE_ROWS - 1)) === SLICE_ROWS - 1 && slice.due()) yield;
+      }
       return ids;
     }
     for (let i = 0; i < n; i++) ids[i] = i;
@@ -1270,10 +1444,11 @@ class Sorter {
         b.operands,
       );
     for (let w = 0; w < PREFIX_WORDS; w++) {
-      const x = int32At(a.columns[this.keyColumn + 1 + w], i) >>> 0;
-      const y = int32At(b.columns[this.keyColumn + 1 + w], j) >>> 0;
+      const x = int32At(a.columns[this.prefixColumn + w], i) >>> 0;
+      const y = int32At(b.columns[this.prefixColumn + w], j) >>> 0;
       if (x !== y) return x < y ? -1 : 1;
     }
+    if (this.direct) return 0;
     const ka = varlenOf(a.columns[this.keyColumn]);
     const kb = varlenOf(b.columns[this.keyColumn]);
     return compareRanges(
@@ -1296,12 +1471,14 @@ class Sorter {
     this.#closed = true;
     this.store.close();
     this.encoder?.close(this.pool);
+    this.directEncoder?.close(this.pool);
+    this.#groups?.close();
     this.partEncoder?.close(this.pool);
     for (const set of this.#sets) set?.close();
     if (this.#reserved > 0) this.charge.free(this.#reserved);
     if (this.#rankBytes > 0) this.charge.free(this.#rankBytes);
     dropOperands(this.operands, this.charge);
-    this.charge.free(BATCH_ROWS * 8);
+    this.charge.free(SORTER_SCRATCH_BYTES);
     this.#operandLoan?.repay();
     this.#operandLoan = null;
     this.#reserved = 0;
@@ -1678,7 +1855,6 @@ export class SortOperator implements Operator {
     const sorter = this.#sorter;
     const slice = sorter.slice;
     const spec = this.spec;
-    if (spec.limit !== null) yield* sorter.compactJob(slice);
     const all = yield* sorter.sortJob(slice);
     if (all === null) return false;
     let end = spec.limit === null ? all.length : Math.min(all.length, spec.offset + spec.limit);
@@ -1875,7 +2051,6 @@ export class GroupTopKOperator implements Operator {
     const sorter = this.#sorter;
     const slice = sorter.slice;
     const k = this.spec.k;
-    yield* sorter.compactJob(slice);
     const ids = yield* sorter.sortJob(slice);
     if (ids === null) return false;
     const kept = sorter.mode === "keys" ? yield* sorter.cutJob(ids, slice) : ids;

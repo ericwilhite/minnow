@@ -248,96 +248,6 @@ export class Slice {
 export const SLICE_ROWS = 8192;
 
 /**
- * Sorts row ids 0 … n by unsigned prefix words (`words`, PREFIX_WORDS per row) then, among equal
- * prefixes, by `refine` (full key bytes) when given. LSD radix with 16-bit digits, skipping
- * digits every row shares; `scratch` holds 2 × n × (PREFIX_WORDS + 1) words. A generator that
- * yields when `slice` is due (checked every `SLICE_ROWS` rows), so the caller can give the event
- * loop a task between slices.
- */
-export function* sortByPrefixJob(
-  n: number,
-  words: Int32Array,
-  ids: Int32Array,
-  scratch: Uint32Array,
-  refine: ((a: number, b: number) => number) | null,
-  used: number,
-  slice: Slice,
-): Generator<void, void, void> {
-  const stride = PREFIX_WORDS + 1;
-  if (n < 512) {
-    const view = ids.subarray(0, n);
-    for (let i = 0; i < n; i++) view[i] = i;
-    view.sort((a, b) => {
-      for (let w = 0; w < PREFIX_WORDS; w++) {
-        const x = (words[a * PREFIX_WORDS + w] ?? 0) >>> 0;
-        const y = (words[b * PREFIX_WORDS + w] ?? 0) >>> 0;
-        if (x !== y) return x < y ? -1 : 1;
-      }
-      return refine === null ? 0 : refine(a, b);
-    });
-    return;
-  }
-  let from = scratch.subarray(0, n * stride);
-  let to = scratch.subarray(n * stride, 2 * n * stride);
-  for (let i = 0; i < n; i++) {
-    for (let w = 0; w < PREFIX_WORDS; w++)
-      from[i * stride + w] = (words[i * PREFIX_WORDS + w] ?? 0) >>> 0;
-    from[i * stride + PREFIX_WORDS] = i;
-    if ((i & (SLICE_ROWS - 1)) === SLICE_ROWS - 1 && slice.due()) yield;
-  }
-  // Operator-owned histogram: the job may pause between slices (R23.1).
-  const counts = new Uint32Array(65_536);
-  for (let w = Math.min(used, PREFIX_WORDS) - 1; w >= 0; w--)
-    for (let shift = 0; shift <= 16; shift += 16) {
-      counts.fill(0);
-      for (let i = 0; i < n; i++) {
-        const digit = ((from[i * stride + w] ?? 0) >>> shift) & 0xffff;
-        counts[digit] = (counts[digit] ?? 0) + 1;
-        if ((i & (SLICE_ROWS - 1)) === SLICE_ROWS - 1 && slice.due()) yield;
-      }
-      // Every row has the same digit: the pass changes nothing.
-      const first = ((from[w] ?? 0) >>> shift) & 0xffff;
-      if (counts[first] === n) continue;
-      let total = 0;
-      for (let d = 0; d < 65_536; d++) {
-        const c = counts[d] ?? 0;
-        counts[d] = total;
-        total += c;
-      }
-      for (let i = 0; i < n; i++) {
-        const base = i * stride;
-        const digit = ((from[base + w] ?? 0) >>> shift) & 0xffff;
-        const at = (counts[digit] ?? 0) * stride;
-        counts[digit] = (counts[digit] ?? 0) + 1;
-        for (let x = 0; x < stride; x++) to[at + x] = from[base + x] ?? 0;
-        if ((i & (SLICE_ROWS - 1)) === SLICE_ROWS - 1 && slice.due()) yield;
-      }
-      const swap = from;
-      from = to;
-      to = swap;
-    }
-  for (let i = 0; i < n; i++) {
-    ids[i] = from[i * stride + PREFIX_WORDS] ?? 0;
-    if ((i & (SLICE_ROWS - 1)) === SLICE_ROWS - 1 && slice.due()) yield;
-  }
-  if (refine === null) return;
-  // Runs of equal prefixes: order them by the full key, merging through the free half of the
-  // scratch (`to`, n × stride words), so refinement allocates nothing.
-  const temp = new Int32Array(to.buffer, to.byteOffset, n);
-  let start = 0;
-  for (let i = 1; i <= n; i++) {
-    let same = i < n;
-    for (let w = 0; w < PREFIX_WORDS && same; w++)
-      same = from[i * stride + w] === from[start * stride + w];
-    if ((i & (SLICE_ROWS - 1)) === 0 && slice.due()) yield;
-    if (same) continue;
-    if (i - start > 1)
-      yield* mergeSortJob(ids.subarray(start, i), temp.subarray(start, i), refine, slice);
-    start = i;
-  }
-}
-
-/**
  * Sorts `ids` by `compare` (stably) in slices: blocks of 1,024 sorted directly, then bottom-up
  * merges through `temp` (at least `ids.length`, the caller's charged scratch), yielding when
  * `slice` is due (checked every `SLICE_ROWS` elements moved).
@@ -416,11 +326,6 @@ export function runToEnd<T>(job: SlicedJob<T>): T {
     if (step.done === true) return step.value;
     if (step.value !== undefined) throw new Error("A synchronous sort job blocked");
   }
-}
-
-/** Bytes `sortByPrefixJob` needs in `scratch` for n rows. */
-export function sortScratchBytes(n: number): number {
-  return n >= 512 ? 2 * n * (PREFIX_WORDS + 1) * 4 : 0;
 }
 
 // --- compare mode -------------------------------------------------------------------------
@@ -752,4 +657,306 @@ export function compareRows(
     if (order !== 0) return key.direction === "desc" ? -order : order;
   }
   return 0;
+}
+
+// --- direct fixed-width keys -------------------------------------------------------------
+
+/** Payload bytes of a fixed-width key type in direct mode, or 0 when it has none. */
+function directBytes(type: PhysicalType): number {
+  switch (type.kind) {
+    case "bool":
+      return 1;
+    case "int32":
+    case "date":
+      return 4;
+    case "int64":
+    case "time":
+    case "timestamp":
+    case "float64":
+    case "float32":
+      return 8;
+    default:
+      return 0;
+  }
+}
+
+/**
+ * Bytes of the direct key of `keys` (a header and the payload per key), or null when a key is
+ * not fixed-width or the key passes the prefix words. Direct keys order exactly as the frozen
+ * sort-key bytes do (the same header and payload rules, keys/key-encoding.ts), except that a
+ * null keeps its zeroed payload slot so every key has one width: equal headers then compare
+ * equal payloads, so the order is unchanged.
+ */
+export function directWidth(
+  types: readonly PhysicalType[],
+  keys: readonly SortColumn[],
+): number | null {
+  let width = 0;
+  for (const key of keys) {
+    const type = types[key.column];
+    if (type === undefined || !isByteCollation(key.collation)) return null;
+    const bytes = directBytes(type);
+    if (bytes === 0) return null;
+    width += 1 + bytes;
+  }
+  return width <= 4 * PREFIX_WORDS ? width : null;
+}
+
+// Module scratch, sync-only (R23.1): written and read inside one synchronous `encode` call.
+const f64 = new Float64Array(1);
+const f64Words = new Uint32Array(f64.buffer);
+
+/**
+ * Encodes fixed-width keys straight into the prefix words (no byte keys): the direct mode of
+ * key mode. Row k of a call is `prefixes[w][k]`.
+ */
+export class DirectKeyEncoder {
+  readonly prefixes: Int32Array[];
+  readonly prefixVectors: FlatVector[];
+  readonly #bytes: Uint8Array;
+  constructor(
+    readonly types: readonly PhysicalType[],
+    readonly sortColumns: readonly SortColumn[],
+    charge: ByteCharge,
+    readonly capacity = 2048,
+  ) {
+    if (!charge.allocate(capacity * (PREFIX_WORDS * 4 + 4 * PREFIX_WORDS)))
+      throw new RangeError("A sort key encoder must be admitted");
+    this.prefixes = Array.from({ length: PREFIX_WORDS }, () => new Int32Array(capacity));
+    this.#bytes = new Uint8Array(capacity * 4 * PREFIX_WORDS);
+    this.prefixVectors = this.prefixes.map((values): FlatVector => ({
+      form: "flat",
+      type: { kind: "int32", bits: 32 },
+      length: 0,
+      validity: null,
+      data: { layout: "i32", values },
+    }));
+  }
+
+  get tail(): Vector[] {
+    return [...this.prefixVectors];
+  }
+
+  encode(columns: readonly Vector[], ids: Uint16Array | null, from: number, count: number): void {
+    const stride = 4 * PREFIX_WORDS;
+    const out = this.#bytes;
+    out.fill(0, 0, count * stride);
+    let at = 0;
+    for (const key of this.sortColumns) {
+      const vector = columnAt(columns, key.column);
+      const type = this.types[key.column];
+      if (type === undefined) throw new RangeError("Sort key column out of range");
+      const width = directBytes(type);
+      const desc = key.direction === "desc";
+      const nullHeader = key.nulls === "first" ? 0x00 : 0x02;
+      for (let k = 0; k < count; k++) {
+        const row = ids === null ? from + k : (ids[from + k] ?? 0);
+        const [flat, slot] = resolveRow(vector, row);
+        const base = k * stride + at;
+        if (slot < 0) {
+          out[base] = nullHeader;
+          continue;
+        }
+        out[base] = 0x01;
+        const data = flat.data;
+        let hi = 0;
+        let lo: number;
+        switch (data.layout) {
+          case "bool":
+            lo = data.values[slot] === 1 ? 1 : 0;
+            break;
+          case "i32":
+            lo = ((data.values[slot] ?? 0) ^ 0x8000_0000) >>> 0;
+            break;
+          case "int64": {
+            const values = data.values;
+            if (values.repr === "safe") {
+              const value = values.values[slot] ?? 0;
+              const high = Math.floor(value / 4_294_967_296);
+              hi = ((high >>> 0) ^ 0x8000_0000) >>> 0;
+              lo = (value - high * 4_294_967_296) >>> 0;
+            } else {
+              const words = wordsOf(values.values);
+              hi = ((words[slot * 2 + 1] ?? 0) ^ 0x8000_0000) >>> 0;
+              lo = (words[slot * 2] ?? 0) >>> 0;
+            }
+            break;
+          }
+          case "f64":
+          case "f32": {
+            const value = data.values[slot] ?? 0;
+            f64[0] = value !== value ? Number.NaN : value === 0 ? 0 : value;
+            hi = f64Words[1] ?? 0;
+            lo = f64Words[0] ?? 0;
+            if (hi >= 0x8000_0000) {
+              hi = ~hi >>> 0;
+              lo = ~lo >>> 0;
+            } else hi = (hi | 0x8000_0000) >>> 0;
+            break;
+          }
+          default:
+            throw new TypeError(`No direct key for ${data.layout}`);
+        }
+        // Big-endian payload after the header, inverted for DESC.
+        const flip = desc ? 0xff : 0;
+        if (width === 8) {
+          for (let b = 0; b < 4; b++) out[base + 1 + b] = ((hi >>> (24 - 8 * b)) & 0xff) ^ flip;
+          for (let b = 0; b < 4; b++) out[base + 5 + b] = ((lo >>> (24 - 8 * b)) & 0xff) ^ flip;
+        } else if (width === 4) {
+          for (let b = 0; b < 4; b++) out[base + 1 + b] = ((lo >>> (24 - 8 * b)) & 0xff) ^ flip;
+        } else out[base + 1] = lo ^ flip;
+      }
+      at += 1 + width;
+    }
+    for (let w = 0; w < PREFIX_WORDS; w++) {
+      const prefix = this.prefixes[w];
+      if (prefix === undefined) continue;
+      for (let k = 0; k < count; k++) {
+        const b = k * stride + w * 4;
+        prefix[k] =
+          ((out[b] ?? 0) << 24) |
+          ((out[b + 1] ?? 0) << 16) |
+          ((out[b + 2] ?? 0) << 8) |
+          (out[b + 3] ?? 0);
+      }
+    }
+    for (const vector of this.prefixVectors) vector.length = count;
+  }
+
+  close(charge: ByteCharge): void {
+    charge.free(this.capacity * (PREFIX_WORDS * 4 + 4 * PREFIX_WORDS));
+  }
+}
+
+// --- MSD radix over (prefix words, row id) tuples -----------------------------------------
+
+/** Tuple stride: the prefix words then the row id. */
+export const TUPLE_WORDS = PREFIX_WORDS + 1;
+
+/**
+ * An MSD sort's histogram and bucket starts (65,537 words each), owned and charged by the
+ * operator (R23.1: a sort job pauses between slices).
+ */
+export class RadixScratch {
+  static readonly BYTES = 2 * 65_537 * 4;
+  readonly counts = new Int32Array(65_537);
+  readonly starts = new Int32Array(65_537);
+}
+
+/** Unsigned order of two tuples' prefix words. */
+function compareTuples(t: Uint32Array, a: number, b: number): number {
+  for (let w = 0; w < PREFIX_WORDS; w++) {
+    const x = t[a + w] ?? 0;
+    const y = t[b + w] ?? 0;
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  return 0;
+}
+
+/**
+ * Sorts `n` tuples (PREFIX_WORDS words + row id, `TUPLE_WORDS` each) in place: MSD radix on
+ * 8-bit digits of the prefix (16-bit for large ranges; a digit every tuple shares is skipped
+ * without moving), insertion sort below 48 tuples, then (when `refine` is given) full-key order
+ * among equal prefixes. `scratch` holds n tuples; refinement sorts through it too. A sliced job:
+ * it yields when `slice` is due (R23.2). One job at a time per `radix`.
+ */
+export function* msdSort(
+  tuples: Uint32Array,
+  scratch: Uint32Array,
+  n: number,
+  refine: ((a: number, b: number) => number) | null,
+  slice: Slice,
+  radix: RadixScratch,
+): Generator<void, void, void> {
+  const S = TUPLE_WORDS;
+  const bytes = 4 * PREFIX_WORDS;
+  const { counts, starts } = radix;
+  // Explicit stack of [lo, hi, byte].
+  const stack: number[] = [0, n, 0];
+  while (stack.length > 0) {
+    const b = stack.pop() ?? 0;
+    const hi = stack.pop() ?? 0;
+    const lo = stack.pop() ?? 0;
+    if (hi - lo < 2) continue;
+    if (hi - lo <= 48 || b >= bytes) {
+      // Insertion sort by the prefix (no moves when every prefix is equal), then the full key
+      // among equal prefixes.
+      for (let i = lo + 1; i < hi; i++) {
+        for (let j = i; j > lo && compareTuples(tuples, (j - 1) * S, j * S) > 0; j--)
+          for (let x = 0; x < S; x++) {
+            const t = tuples[(j - 1) * S + x] ?? 0;
+            tuples[(j - 1) * S + x] = tuples[j * S + x] ?? 0;
+            tuples[j * S + x] = t;
+          }
+        if (((i - lo) & (SLICE_ROWS - 1)) === 0 && slice.due()) yield;
+      }
+      if (refine !== null) yield* refineRuns(tuples, scratch, lo, hi, refine, slice);
+      if (slice.due()) yield;
+      continue;
+    }
+    const word = b >>> 2;
+    // Large ranges take two bytes per pass (65,536 buckets) when both lie in one word.
+    const wide = hi - lo >= 65_536 && (b & 3) !== 3;
+    const width = wide ? 2 : 1;
+    const shift = 32 - 8 * ((b & 3) + width);
+    const mask = wide ? 0xffff : 0xff;
+    const buckets = mask + 1;
+    counts.fill(0, 0, buckets + 1);
+    for (let i = lo; i < hi; i++) {
+      const digit = ((tuples[i * S + word] ?? 0) >>> shift) & mask;
+      counts[digit + 1] = (counts[digit + 1] ?? 0) + 1;
+      if (((i - lo) & (SLICE_ROWS - 1)) === SLICE_ROWS - 1 && slice.due()) yield;
+    }
+    // Every tuple shares this digit: nothing to move.
+    const first = ((tuples[lo * S + word] ?? 0) >>> shift) & mask;
+    if (counts[first + 1] === hi - lo) {
+      stack.push(lo, hi, b + width);
+      continue;
+    }
+    for (let d = 0; d < buckets; d++) counts[d + 1] = (counts[d + 1] ?? 0) + (counts[d] ?? 0);
+    starts.set(counts.subarray(0, buckets + 1));
+    for (let i = lo; i < hi; i++) {
+      const digit = ((tuples[i * S + word] ?? 0) >>> shift) & mask;
+      const at = (lo + (counts[digit] ?? 0)) * S;
+      counts[digit] = (counts[digit] ?? 0) + 1;
+      for (let x = 0; x < S; x++) scratch[at + x] = tuples[i * S + x] ?? 0;
+      if (((i - lo) & (SLICE_ROWS - 1)) === SLICE_ROWS - 1 && slice.due()) yield;
+    }
+    tuples.set(scratch.subarray(lo * S, hi * S), lo * S);
+    for (let d = 0; d < buckets; d++) {
+      const start = lo + (starts[d] ?? 0);
+      const end = lo + (starts[d + 1] ?? 0);
+      if (end - start > 1) stack.push(start, end, b + width);
+    }
+    if (slice.due()) yield;
+  }
+}
+
+/**
+ * Orders runs of equal prefixes in tuples `lo … hi` by `refine` over their row ids, merging
+ * through the scratch tuples of the same range (free here: 2 × ids fit in TUPLE_WORDS words).
+ */
+function* refineRuns(
+  tuples: Uint32Array,
+  scratch: Uint32Array,
+  lo: number,
+  hi: number,
+  refine: (a: number, b: number) => number,
+  slice: Slice,
+): Generator<void, void, void> {
+  const S = TUPLE_WORDS;
+  let start = lo;
+  for (let i = lo + 1; i <= hi; i++) {
+    if (i < hi && compareTuples(tuples, start * S, i * S) === 0) continue;
+    const length = i - start;
+    if (length > 1) {
+      const base = scratch.byteOffset + start * S * 4;
+      const ids = new Int32Array(scratch.buffer, base, length);
+      const temp = new Int32Array(scratch.buffer, base + length * 4, length);
+      for (let k = 0; k < length; k++) ids[k] = tuples[(start + k) * S + PREFIX_WORDS] ?? 0;
+      yield* mergeSortJob(ids, temp, refine, slice);
+      for (let k = 0; k < length; k++) tuples[(start + k) * S + PREFIX_WORDS] = ids[k] ?? 0;
+    }
+    start = i;
+  }
 }

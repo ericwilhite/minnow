@@ -294,6 +294,19 @@ describe("sort", () => {
 });
 
 describe("per-group top-k (ROW_NUMBER() <= k)", () => {
+  it("per-partition thresholds reject most rows before storing them", async () => {
+    const random = mulberry32(31);
+    const rows = generate(random, 200_000, 1_000_000);
+    const order: SortColumn[] = [
+      { column: 2, direction: "desc", nulls: "last", collation: null },
+      { column: 5, direction: "asc", nulls: "last", collation: null },
+    ];
+    const result = await runSort(TYPES, order, rows, { groupBy: [3], k: 2 });
+    expect(result.profile.rejected).toBeGreaterThan(100_000);
+    const groups = new Set(rows.map((row) => JSON.stringify(row[3] ?? null)));
+    expect(result.rows.length).toBe(2 * groups.size);
+  });
+
   for (const seed of SEEDS)
     for (const tight of [undefined, 32 * 1024])
       it(`first k rows of every partition, numbered (seed ${String(seed)}${tight === undefined ? "" : ", spilled"})`, async () => {

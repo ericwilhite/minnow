@@ -679,15 +679,18 @@ and the owner import it directly.
 
 - ORDER BY follows PostgreSQL: NaN above every number, −0 = 0, NUMERIC by value, NULLS FIRST/
   LAST, DESC, text in C (byte) order. Keys are input column indexes.
-- Key mode: rows carry the frozen sort-key bytes and five prefix words; the in-memory sort is a
-  radix sort over the words, refining by bytes only when a key is longer than the prefix.
+- Key mode: rows carry the frozen sort-key bytes and five prefix words; the in-memory sort is an
+  MSD radix sort over (prefix words, row id) tuples, refining by bytes only when a key is longer
+  than the prefix. Fixed-width keys (booleans, integers, dates, times, timestamps, floats) that
+  fit the prefix skip the key bytes: they are encoded straight into the words (direct mode).
 - An ICU `COLLATE` sorts by query-wide ranks from `Intl.Collator` (ties by bytes) when the
   distinct values fit; otherwise, and for JSON and array keys, a value comparator (compare
   mode), in memory and across runs (DECISIONS.md C8). Compare mode decodes each row's JSONB,
   array and ICU text keys once, as the row arrives (for a merge, once per page), and charges the
   decoded values to the grant, so a run's comparisons never decode.
 - Top-N keeps rows only while they beat the k-th best key and compacts at 2k (O(k) memory, WITH
-  TIES kept). `GroupTopKOperator` is ROW_NUMBER() ≤ k per partition (the row number appended).
+  TIES kept). `GroupTopKOperator` is ROW_NUMBER() ≤ k per partition (the row number appended);
+  after a compaction each partition keeps its k-th key, and rows that cannot beat it are dropped.
 - Grant-or-spill: sorted runs of typed spill pages, merged with a fan-in the spill pool's room
   allows, in passes when needed; OFFSET rows are counted, not materialized.
 - Finish work (compaction, the sort, the merge, emission) runs in slices of `YIELD_INTERVAL_MS`
