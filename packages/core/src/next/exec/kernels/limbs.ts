@@ -18,7 +18,11 @@ const TWO32 = 4294967296;
 if (new Uint8Array(new Uint32Array([1]).buffer)[0] !== 1)
   throw new Error("The executor's limb arithmetic assumes a little-endian platform");
 
-/** Scratch limbs for intermediate values (offsets 0 … 7 are free for callers). */
+/**
+ * Scratch limbs for intermediate values (offsets 0 … 7 are free for callers). R23: module-level, so it is written and read only within one synchronous call that never
+ * suspends (no await, Promise or yield between): never live across a suspension point. Callers
+ * never keep a value in it across a call that could suspend.
+ */
 export const SCRATCH = new Uint32Array(4 * 16);
 
 /** A Uint32Array view over a BigInt64Array (two limbs per value, low word first). */
@@ -144,6 +148,7 @@ export function scaleUp(t: Uint32Array, at: number, e: number): boolean {
   return true;
 }
 
+/** `multiplyTo`'s scratch (one synchronous call; R23). */
 const HALVES_A = new Float64Array(8);
 const HALVES_B = new Float64Array(8);
 const COLUMNS = new Float64Array(17);
@@ -226,6 +231,21 @@ export function compare(a: Uint32Array, ai: number, b: Uint32Array, bi: number):
   return 0;
 }
 
+/**
+ * t[at] = v when v fits 128 bits (two's complement); false otherwise. For values that are already
+ * BigInts (a `wide` input), so it adds no BigInt of its own beyond the masking.
+ */
+export function setBigInt(t: Uint32Array, at: number, v: bigint): boolean {
+  if (v < -(1n << 127n) || v >= 1n << 127n) return false;
+  const u = BigInt.asUintN(128, v);
+  const o = at * 4;
+  t[o] = Number(u & 0xffff_ffffn);
+  t[o + 1] = Number((u >> 32n) & 0xffff_ffffn);
+  t[o + 2] = Number((u >> 64n) & 0xffff_ffffn);
+  t[o + 3] = Number(u >> 96n);
+  return true;
+}
+
 /** The value as a bigint (tests, and the rare wide fallback). */
 export function toBigInt(t: Uint32Array, at: number): bigint {
   const o = at * 4;
@@ -235,4 +255,127 @@ export function toBigInt(t: Uint32Array, at: number): bigint {
     (BigInt(t[o + 2] ?? 0) << 64n) |
     (BigInt(t[o + 3] ?? 0) << 96n);
   return BigInt.asIntN(128, unsigned);
+}
+
+/** t[at] as the nearest double (exact while |value| ≤ 2^53). */
+export function toDouble(t: Uint32Array, at: number): number {
+  const o = at * 4;
+  const negative = isNegative(t, at);
+  if (!negative)
+    return (
+      (t[o + 3] ?? 0) * 2 ** 96 + (t[o + 2] ?? 0) * 2 ** 64 + (t[o + 1] ?? 0) * TWO32 + (t[o] ?? 0)
+    );
+  copy(SCRATCH, 13, t, at);
+  negate(SCRATCH, 13);
+  return -toDouble(SCRATCH, 13);
+}
+
+/** 10^0 … 10^38 as limbs (every power of ten that fits 127 bits). */
+export const POWERS_OF_TEN: Uint32Array = (() => {
+  const powers = new Uint32Array(4 * 39);
+  setNumber(powers, 0, 1);
+  for (let k = 1; k < 39; k++) {
+    copy(powers, k, powers, k - 1);
+    scaleUp(powers, k, 1);
+  }
+  return powers;
+})();
+
+/** Decimal digits of |t[at]| (1 for zero); t[at] must not be MIN. */
+export function digitCount(t: Uint32Array, at: number): number {
+  copy(SCRATCH, 12, t, at);
+  if (isNegative(SCRATCH, 12)) negate(SCRATCH, 12);
+  let digits = 1;
+  while (digits < 39 && compare(SCRATCH, 12, POWERS_OF_TEN, digits) >= 0) digits += 1;
+  return digits;
+}
+
+/**
+ * q = n / d, rounded half away from zero (`round`) or truncated toward zero, written to t[to];
+ * false when the quotient may not be exact here (|q| ≥ 2^50: the caller uses BigInt). d ≠ 0;
+ * n and d must not be MIN.
+ *
+ * The quotient is first estimated in doubles (relative error < 2^−51, so off by at most one
+ * below 2^50), then corrected exactly with r = n − q·d in limbs until 0 ≤ |r| < |d| with r
+ * carrying n's sign.
+ */
+export function divideTo(
+  t: Uint32Array,
+  to: number,
+  n: Uint32Array,
+  ni: number,
+  d: Uint32Array,
+  di: number,
+  round: boolean,
+): boolean {
+  const estimate = Math.trunc(toDouble(n, ni) / toDouble(d, di));
+  if (!(Math.abs(estimate) < 2 ** 50)) return false;
+  const s = SCRATCH;
+  // |d| < 2^126 keeps 2r (for rounding) inside 127 bits.
+  if (Math.abs(toDouble(d, di)) >= 2 ** 125) return false;
+  // s[8] = |n|, s[9] = |d|, s[10] = q, s[11] = r = |n| − q·|d|.
+  copy(s, 8, n, ni);
+  copy(s, 9, d, di);
+  const negN = isNegative(s, 8);
+  const negD = isNegative(s, 9);
+  if (negN) negate(s, 8);
+  if (negD) negate(s, 9);
+  let q = Math.abs(estimate);
+  for (let attempt = 0; attempt < 4; attempt++) {
+    setNumber(s, 10, q);
+    if (!multiplyTo(s, 11, s, 10, s, 9)) return false;
+    if (!addTo(s, 11, s, 8, s, 11, true)) return false;
+    if (isNegative(s, 11)) {
+      q -= 1;
+      continue;
+    }
+    if (compare(s, 11, s, 9) >= 0) {
+      q += 1;
+      continue;
+    }
+    // 0 ≤ r < |d|: q is the truncated quotient of the magnitudes.
+    if (round) {
+      addTo(s, 11, s, 11, s, 11, false); // 2r (r < |d| < 2^127, so no overflow past 128 bits)
+      if (compare(s, 11, s, 9) >= 0) q += 1;
+    }
+    setNumber(t, to, q);
+    if (negN !== negD) negate(t, to);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * PostgreSQL's (weight, first digit) of c·10^−scale in base 10000 (numeric.c's NumericVar view):
+ * writes them to `out` [weight, firstDigit]; zero is (0, 0).
+ */
+export function leadingDigitOf(t: Uint32Array, at: number, scale: number, out: Int32Array): void {
+  if (isZero(t, at)) {
+    out[0] = 0;
+    out[1] = 0;
+    return;
+  }
+  const digits = digitCount(t, at);
+  const exponent = digits - 1 - scale; // |v| in [10^e, 10^(e+1))
+  const weight = Math.floor(exponent / 4);
+  const shift = scale + 4 * weight;
+  copy(SCRATCH, 12, t, at);
+  if (isNegative(SCRATCH, 12)) negate(SCRATCH, 12);
+  let first: number;
+  if (shift <= 0)
+    first = toDouble(SCRATCH, 12) * 10 ** -shift; // small: exact
+  else {
+    first = Math.floor(toDouble(SCRATCH, 12) / 10 ** shift);
+    // Exact correction: first · 10^shift ≤ |c| < (first + 1) · 10^shift.
+    setNumber(SCRATCH, 11, first);
+    multiplyTo(SCRATCH, 11, SCRATCH, 11, POWERS_OF_TEN, shift);
+    if (compare(SCRATCH, 11, SCRATCH, 12) > 0) first -= 1;
+    else {
+      setNumber(SCRATCH, 11, first + 1);
+      multiplyTo(SCRATCH, 11, SCRATCH, 11, POWERS_OF_TEN, shift);
+      if (compare(SCRATCH, 11, SCRATCH, 12) <= 0) first += 1;
+    }
+  }
+  out[0] = weight;
+  out[1] = first;
 }

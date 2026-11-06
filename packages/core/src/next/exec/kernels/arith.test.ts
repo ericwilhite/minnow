@@ -393,14 +393,4 @@ describe("decimal arithmetic: exact, per-slot scales, every tier (generated)", (
       [-1n, 4],
     ]);
   });
-
-  it("does not compile numeric division yet", () => {
-    const D2 = decimal(null, null);
-    expect(() =>
-      evaluate(
-        call("div", D2, col(0, D2), col(1, D2)),
-        batchOf([decimals(D2, [[1n, 0]]), decimals(D2, [[1n, 0]])]),
-      ),
-    ).toThrow(UnsupportedPlanError);
-  });
 });

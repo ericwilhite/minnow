@@ -26,7 +26,7 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | `page/`            | format                           | Page codecs, page directory and statistics, streaming group writer, chunk reader (ChunkPages), inflated-page cache                                                                                                                                                                                                                                                                                                     |
 | `spill/`           | executor (OPFS service: storage) | Spill contract (one long-lived scratch file, batching charged to the operator's budget); in-memory double                                                                                                                                                                                                                                                                                                              |
 | `memory/`          | executor                         | Memory governor: admission, progress loans, held vs allocated bytes (reference implementation)                                                                                                                                                                                                                                                                                                                         |
-| `exec/`            | executor                         | Entry point (`executor.ts`), result frames (`result.ts`), scans (`scan.ts`, `memory-scan.ts`), table rules (`rules.ts`), push driver (`pipeline.ts`), fetcher (`fetch.ts`), expression kernels (`kernels/`), filter and project (`filter.ts`), comparators, decimal SUM                                                                                                                                                |
+| `exec/`            | executor                         | Entry point (`executor.ts`), result frames (`result.ts`), scans (`scan.ts`, `memory-scan.ts`), table rules (`rules.ts`), push driver (`pipeline.ts`), fetcher (`fetch.ts`), expression kernels (`kernels/`), filter and project (`filter.ts`), aggregation (`agg/`), comparators, decimal SUM                                                                                                                          |
 | `ir/`              | lowering, executor               | Operator IR (`ir.ts`); scalar function and operator table (`functions.ts`); table rules in IR form (`rules.ts`); executor costs the planner reads (`costs.ts`)                                                                                                                                                                                                                                                         |
 | `access/`          | write path + key index           | Storage access contracts the write path implements: snapshots and segments, catalog, key-index probes and ranges, `modify` (rows, conflicts, RETURNING), transactions, group commit, sequences, delivery                                                                                                                                                                                                               |
 | `testing/`         | all                              | Differential-harness adapter for a partial new core                                                                                                                                                                                                                                                                                                                                                                    |
@@ -568,6 +568,50 @@ and the owner import it directly.
   (`UnsupportedPlanError`, stage "execute"); `bindings.test.ts` fails on an unbound entry, a
   stale binding, or a kernel binding that does not evaluate. Not implemented yet: date, time and
   interval arithmetic, text and math functions, casts to and from text, bounded text casts.
+- NUMERIC division and modulo (`decimal-div.ts`, `DecimalDivNode`): PostgreSQL's result scale
+  (`select_div_scale`: at least 16 significant digits, capped at 1000), rounded half away from
+  zero; 128-bit limbs while the scaled operands fit, BigInt past that.
+
+### Aggregation (`exec/agg/`)
+
+- `aggregate.ts`: the `aggregate` operator. Each batch maps its rows to dense group ids, then
+  every aggregate (after its FILTER and DISTINCT) updates its state. `finish` emits groups in
+  first-seen order in batches of at most 2,048 groups and about 1 MiB, each charged to the grant
+  before it is built and released when downstream is done with it; it yields to the event loop
+  with a task every 4 ms, checking the deadline per group inside AVG(NUMERIC)'s divisions and
+  resuming mid-batch (it prepares only what the next batch holds, charged by `bigintBytes`,
+  and released as the batch takes it); after an abort, or once its abort signal fires (checked at every slice and
+  after backpressure, R23), it rejects with the reason. Scratch that outlives a slice belongs to
+  the operator; module-level scratch is used only within one synchronous call (R23). Without
+  GROUP BY there is one row even over no input.
+- `groups.ts`: group ids from open-addressing tables chosen by key type — interleaved
+  (key, id) tables for 32-bit and 64-bit integers (int8 by its two words, whatever its
+  representation: no BigInt, no Map), an f64 table for floats, xxHash32 over bytes for text (a
+  dictionary column translated once per entry), key encoding for NUMERIC and the rest, and an id
+  tuple for several keys. SQL GROUP BY equality: NULLs together, −0 = 0, NaN = NaN, NUMERIC by
+  value.
+- `states.ts`: struct-of-arrays state per aggregate, no object per group. Integer and NUMERIC
+  sums are exact at any size: an f64 part within ±2^52, a 128-bit carry, and past that an exact
+  BigInt offset per group that changes only when the carry overflows (or for inputs already
+  wider than 128 bits), never per row. A scalar NUMERIC SUM over a declared precision ≤ 12 is
+  fused: four accumulators, no per-row check. Float SUM and AVG follow PostgreSQL's float8pl and
+  float8_accum, including their 22003 rules. MIN/MAX ties take the newer value, as PostgreSQL
+  does (MIN(1.5, 1.50) is 1.50); int8 and NUMERIC comparisons use words and limbs.
+- `values.ts`: per-group values for MIN/MAX and NUMERIC keys: int8 and interval microseconds as
+  two words, NUMERIC as f64 or 128-bit limbs; only coefficients past 128 bits are BigInts, each
+  charged at the governor's `bigintBytes` (its size change charged before a replacement). Exact
+  sums' offsets past 128 bits are charged the same way, and output estimates use those sizes.
+- NUMERIC results past PostgreSQL's limits (131,072 digits before the decimal point) are 22003 at
+  emission, SUM's and AVG's alike; exact intermediates may pass them and come back.
+- `distinct.ts`: exact DISTINCT through value ids and a (group, value id) set.
+- Memory: every typed array is charged before it is constructed, and a constructor that fails
+  releases what it took. A refused growth fails the query until partitioned spill (milestone 3).
+  Not yet: GROUPING SETS, ordered-set and string/array/JSON aggregates (`UnsupportedPlanError`,
+  construct `aggregate`, refused before anything is allocated).
+- `aggregate-pglite.test.ts` judges generated rows and batchings by PostgreSQL, including sums
+  across ±2^127, with declared reach; `groups.test.ts` checks the group tables against a model
+  past several growths; `review-1.test.ts` holds the review's probes.
+  `scripts/next-agg-bench.mts` measures the shapes of measurements.md.
 
 ### Owner and client protocol (`owner/`)
 

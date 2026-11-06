@@ -18,7 +18,10 @@ export const SUB = 1;
 export const MUL = 2;
 export const DIV = 3;
 
-/** Whether the last loop produced a zero (float underflow candidates). */
+/**
+ * Whether the last loop produced a zero (float underflow candidates): read by the caller right
+ * after the loop, in the same synchronous call (R23).
+ */
 export let zeroSeen = false;
 
 /** IEEE add/sub/mul/div in f64 (REAL rounds afterwards). */
