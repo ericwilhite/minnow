@@ -213,8 +213,10 @@ describe("published core tarball", () => {
       // measured), and 1,012,000 when a swept spill owner takes its pages and the conformance kit
       // checks it (1,011,923 measured), then 1,014,000 with typed integer execution
       // (1,013,733 measured), then 1,015,000 when the parser learned to record declared numeric
-      // widths for the rebuild core's lowering (1,014,321 measured); ratchets, not targets.
-      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_015_000);
+      // widths for the rebuild core's lowering (1,014,321 measured), then 1,016,500 with the
+      // PostgreSQL name-resolution and DISTINCT ON fixes (1,015,868 measured); ratchets, not
+      // targets.
+      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_016_500);
       expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_500_000);
       const emitted = await readFile(join(isolatedCore, "dist", "engine", "optimizer.js"), "utf8");
       expect(emitted).not.toContain("/**");
