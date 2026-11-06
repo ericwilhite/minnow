@@ -48,7 +48,7 @@ import { LiveAggregate } from "./live-aggregate.js";
 import { stageLiveExecution } from "./live-accept.js";
 import { QueryGenerations } from "./query-generations.js";
 import { applyWindowFunctionsAsync } from "./windows.js";
-import { crossJoinPlan } from "../plan/model.js";
+import { crossJoinPlan, type RowLocking } from "../plan/model.js";
 import {
   definedVectors,
   toColumnarBatchSteps,
@@ -2636,6 +2636,21 @@ function admitToTransaction(
       throw readOnlyTransactionError(`SELECT FOR ${statement.read.rowLocking}`);
   }
   open.queried = true;
+}
+
+/** Row lock strengths, weakest first (PostgreSQL's LockClauseStrength). */
+const ROW_LOCK_ORDER: readonly RowLocking[] = ["KEY SHARE", "SHARE", "NO KEY UPDATE", "UPDATE"];
+
+/** The strongest of these locks, as PostgreSQL names it in its refusal. */
+function strongestRowLock(locks: ReadonlyArray<RowLocking | undefined>): RowLocking | undefined {
+  let strongest: RowLocking | undefined;
+  for (const lock of locks)
+    if (
+      lock !== undefined &&
+      (strongest === undefined || ROW_LOCK_ORDER.indexOf(lock) > ROW_LOCK_ORDER.indexOf(strongest))
+    )
+      strongest = lock;
+  return strongest;
 }
 
 /** The command PostgreSQL names in that refusal: the statement's tag. */
@@ -6344,8 +6359,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     rewritten = foldIdentifierCase(rewritten, catalogColumns);
     rewritten = expandRowReferences(rewritten, (name) => catalogColumns.get(name));
     const readsViews = views.size > 0 && planReadsViews(rewritten, (name) => views.has(name));
+    const bodies = new Map<string, CompiledQuery>();
     if (readsViews) {
-      const bodies = new Map<string, CompiledQuery>();
       rewritten = expandViewSources(rewritten, (name) => {
         const sql = views.get(name);
         if (sql === undefined) return undefined;
@@ -6355,6 +6370,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         bodies.set(name, compiled);
         return compiled;
       });
+    }
+    // A read-only transaction refuses a row lock wherever it is written: in the statement, or in
+    // a view it reads, at any depth (PostgreSQL checks the planned query, views expanded).
+    if (this.#openTransaction?.readOnly === true) {
+      const locks = [plan.rowLocking, ...[...bodies.values()].map((body) => body.rowLocking)];
+      const strongest = strongestRowLock(locks);
+      if (strongest !== undefined) throw readOnlyTransactionError(`SELECT FOR ${strongest}`);
     }
     if (planReadsTable(rewritten, (name) => domains.has(name) || types.has(name))) {
       rewritten = normalizePlanDomainLiterals(rewritten, domains, types, template);
@@ -8761,13 +8783,13 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           }
           return ids;
         },
-        execute: (query, context) => {
-          this.#liveReadOnlyGuard(query);
+        execute: async (query, context) => {
+          await this.#liveReadOnlyGuard(query);
           return this.#liveExecute(query, context);
         },
         memoize: (query, result, probe) => this.#memoizeLiveResult(query, result, probe),
-        executeMaintainable: (query, context) => {
-          this.#liveReadOnlyGuard(query);
+        executeMaintainable: async (query, context) => {
+          await this.#liveReadOnlyGuard(query);
           return this.#liveExecuteMaintainable(this.#compileLiveQuery(query), context);
         },
         maintain: (_query, result, state, tableIds, after, until, probe) =>
@@ -8869,7 +8891,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * nextval is refused where it executes (#resolveSequenceCalls), so a live run cannot move a
    * sequence either.
    */
-  #liveReadOnlyGuard(query: LiveQueryInput): void {
+  async #liveReadOnlyGuard(query: LiveQueryInput): Promise<void> {
     if (this.#openTransaction?.readOnly !== true) return;
     const plan =
       typeof query === "string"
@@ -8877,8 +8899,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         : query.kind === "typed-query"
           ? query.plan
           : this.#queries.compile(query.sql);
-    if (plan.rowLocking !== undefined)
-      throw readOnlyTransactionError(`SELECT FOR ${plan.rowLocking}`);
+    // The catalog rewrites refuse a lock the statement or any view it reads asks for; run them
+    // here so a live run that would be served from a memo is checked too.
+    await this.#applyCatalogRewrites(plan);
   }
 
   async #liveExecute(

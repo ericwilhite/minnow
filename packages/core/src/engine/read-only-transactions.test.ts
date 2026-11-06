@@ -29,6 +29,11 @@ const SETUP = [
   "INSERT INTO t VALUES (1, 10), (2, 20)",
   // currval reads the session's last nextval: defined before any transaction.
   "SELECT nextval('s') AS n",
+  // Views that lock, at one and two levels, and one that does not (review B6 stream A 3, 3).
+  "CREATE VIEW vl AS SELECT * FROM t FOR UPDATE",
+  "CREATE VIEW vs AS SELECT * FROM t FOR SHARE",
+  "CREATE VIEW vp AS SELECT * FROM t",
+  "CREATE VIEW vv AS SELECT * FROM vl",
 ];
 
 /** Statements that open a transaction and set (or leave) its access mode. */
@@ -158,6 +163,13 @@ const READS = [
   "SELECT nextval('s') AS n LIMIT 0",
   "SELECT CASE WHEN true THEN nextval('s') END AS n",
   "SELECT * FROM t FOR UPDATE",
+  // A lock written in a view counts, at any depth, wherever the view is read.
+  "SELECT * FROM vl",
+  "SELECT * FROM vv",
+  "SELECT * FROM vs",
+  "SELECT * FROM vp",
+  "SELECT * FROM vp FOR UPDATE",
+  "SELECT t.id FROM t JOIN vs ON vs.id = t.id",
   "SELECT * FROM t FOR NO KEY UPDATE",
   "SELECT * FROM t FOR SHARE",
   "SELECT * FROM t FOR KEY SHARE",
@@ -431,6 +443,7 @@ describe("READ ONLY binds live subscriptions (review B6 stream A 3, finding 1)",
       for (const read of [
         "SELECT nextval('s') AS n",
         "SELECT * FROM t FOR UPDATE",
+        "SELECT * FROM vl",
         "SELECT count(*) AS n FROM t",
       ])
         for (const typed of [false, true])
