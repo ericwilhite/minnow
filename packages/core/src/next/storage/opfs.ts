@@ -78,9 +78,15 @@ const errorName = (error: unknown): string =>
 
 /**
  * A sync handle whose quota signals become `StoreQuotaError`: `QuotaExceededError` from a write
- * or a truncate, and `InvalidStateError` from a write while the lease still holds (WebKit's
- * disk-full, bug 327929). After the lease is lost, `InvalidStateError` means a closed handle and
- * passes through (the session's guard reports `OwnershipLostError` first anyway).
+ * or a truncate, `InvalidStateError` from a write while the lease still holds (WebKit's
+ * disk-full, bug 327929), and a write that reports anything but its whole length. After the
+ * lease is lost, `InvalidStateError` means a closed handle and passes through (the session's
+ * guard reports `OwnershipLostError` first anyway).
+ *
+ * The count matters: Chromium 151 does not throw for a write the quota cuts short; it writes what
+ * fits and returns 2^32 − 8 (a 1 MiB write with 0.5 MiB left; probed 2026-11-05 while adding the
+ * B1-p2d quota continuation). Taken at its word, that count is "everything and more", and a
+ * caller would publish bytes that never landed.
  */
 class QuotaMappedFile implements SyncFile {
   readonly #handle: SyncFile;
@@ -96,14 +102,20 @@ class QuotaMappedFile implements SyncFile {
   }
 
   write(buffer: Uint8Array, options: { at: number }): number {
+    let written: number;
     try {
-      return this.#handle.write(buffer, options);
+      written = this.#handle.write(buffer, options);
     } catch (error) {
       const name = errorName(error);
       if (name === "QuotaExceededError" || (name === "InvalidStateError" && !this.#lost()))
         throw new StoreQuotaError(`OPFS refused a ${String(buffer.length)}-byte write (${name})`);
       throw error;
     }
+    if (written !== buffer.length)
+      throw new StoreQuotaError(
+        `OPFS cut a ${String(buffer.length)}-byte write short (it reported ${String(written)})`,
+      );
+    return written;
   }
 
   truncate(size: number): void {

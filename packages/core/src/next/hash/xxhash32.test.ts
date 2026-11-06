@@ -68,6 +68,29 @@ describe("xxHash32", () => {
     expect(xxHash32(bytes, 0xffff_ffff)).toBeGreaterThanOrEqual(0);
   });
 
+  it("takes any number as the seed `seed >>> 0` (review B2-p2c)", () => {
+    for (const length of [0, 5, 20, 300])
+      for (const seed of [
+        1.5,
+        -0.5,
+        7.999,
+        Number.NaN,
+        Infinity,
+        -Infinity,
+        2 ** 53 - 1,
+        -(2 ** 53) + 3,
+        2 ** 40 + 5,
+        2 ** 32 + 7,
+        -1,
+      ]) {
+        const bytes = sanityBuffer(length);
+        expect(xxHash32(bytes, seed), `seed ${String(seed)}, ${String(length)} bytes`).toBe(
+          xxHash32(bytes, seed >>> 0),
+        );
+        expect(xxHash32(bytes, seed)).toBe(referenceXxHash32(bytes, seed >>> 0));
+      }
+  });
+
   it("refuses a range outside the input", () => {
     expect(() => xxHash32(new Uint8Array(4), 0, 2, 5)).toThrow(RangeError);
     expect(() => xxHash32(new Uint8Array(4), 0, 3, 2)).toThrow(RangeError);

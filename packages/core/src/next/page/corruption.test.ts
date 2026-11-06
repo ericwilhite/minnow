@@ -9,7 +9,9 @@ import { mulberry32 } from "../../testing/seeds.js";
 import type { ColumnChunk, PageEntry } from "../format/manifest.js";
 import { PageEncoding } from "../format/manifest.js";
 import type { PhysicalType } from "../types.js";
-import { decodeRange, parsePage } from "./decode.js";
+import { decodeRange, parseDictionary, parsePage } from "./decode.js";
+import { compilePredicate } from "./predicate.js";
+import { dictionaryMatches, newScratch, selectPage } from "./select.js";
 import { PageCorruptionError } from "./format.js";
 import { StoreCorruptionError } from "../storage/contract.js";
 import { blobAddress } from "../storage/extents.js";
@@ -259,5 +261,106 @@ describe("corruption is refused, never decoded", () => {
     expect(problems).toEqual([]);
     expect(structural).toBeGreaterThan(1000);
     expect(decoded).toBeGreaterThan(1000);
+  }, 120_000);
+
+  it("with the checksum bypassed, select and refine see a dictionary page only once its codes are in the dictionary (review B2-p2d #1)", async () => {
+    const bytes = written.space.bytes;
+    const problems: string[] = [];
+    let accepted = 0;
+    let refused = 0;
+    let forged = 0;
+    for (const page of pages) {
+      if (page.dictionary || (page.entry.encoding & 0x7f) !== PageEncoding.dictionary) continue;
+      if ((page.entry.encoding & PageEncoding.gzip) !== 0) continue;
+      const reader = await openChunk(written.space, page.chunk);
+      const dictionaryEntry = defined(reader.directory.dictionary ?? undefined);
+      const dictionaryAt = dataAddress(page.chunk.data) + dictionaryEntry.offset;
+      const dictionary = parseDictionary(
+        bytes.slice(dictionaryAt, dictionaryAt + dictionaryEntry.length),
+        dictionaryEntry,
+        reader.directory.tag,
+      );
+      const type = page.chunk.type;
+      // Every entry of the dictionary: a page whose codes are all in the domain selects every
+      // non-null row, so a dropped row is visible.
+      const everything = Array.from({ length: dictionary.size }, (_, code) =>
+        dictionary.offsets === null
+          ? dictionary.bytes.slice(code * 16, code * 16 + 16)
+          : dictionary.bytes.slice(
+              dictionary.offsets[code] ?? 0,
+              dictionary.offsets[code + 1] ?? 0,
+            ),
+      );
+      const compiled = defined(
+        compilePredicate(type, 0, { op: "in", values: everything }) ?? undefined,
+      );
+      const codes = dictionaryMatches(dictionary, compiled);
+      const start = dataAddress(page.chunk.data) + page.entry.offset;
+      const rows = page.entry.rowCount;
+      for (let at = start; at < start + page.entry.length; at++)
+        for (const mask of [0x01, 0x02, 0xff]) {
+          const copy = bytes.slice(start, start + page.entry.length);
+          copy[at - start] = (copy[at - start] ?? 0) ^ mask;
+          let view;
+          try {
+            view = parsePage(copy, page.entry, reader.directory.tag, 0, dictionary.size);
+          } catch (error) {
+            if (!(error instanceof PageCorruptionError)) problems.push(`parse ${String(error)}`);
+            refused++;
+            continue;
+          }
+          accepted++;
+          const context = {
+            view,
+            entry: page.entry,
+            compiled,
+            dictionary,
+            codes,
+            scratch: newScratch(rows),
+            values: null,
+            type,
+          };
+          const out = new Uint16Array(rows);
+          const selected = selectPage(context, null, 0, rows, out, 0);
+          const all = Uint16Array.from({ length: rows }, (_, row) => page.entry.firstRow + row);
+          const refined = selectPage(context, all, 0, rows, out, 0);
+          const valid = rows - view.nullCount;
+          if (selected !== valid || refined !== valid)
+            problems.push(
+              `byte ${String(at - start)} ^${String(mask)}: ${String(selected)}/${String(refined)} of ${String(valid)} rows`,
+            );
+        }
+      // A forged writer (two bytes at once): `aux` and one code raised past the dictionary.
+      const original = parsePage(
+        bytes.slice(start, start + page.entry.length),
+        page.entry,
+        reader.directory.tag,
+      );
+      if (original.width > 0)
+        for (let row = 0; row < rows; row += Math.max(1, Math.floor(rows / 64))) {
+          const copy = bytes.slice(start, start + page.entry.length);
+          const view = new DataView(copy.buffer);
+          view.setUint32(8, dictionary.size, true);
+          const codeAt = original.start + row * original.width;
+          if (original.width === 1) view.setUint8(codeAt, dictionary.size & 0xff);
+          else if (original.width === 2) view.setUint16(codeAt, dictionary.size, true);
+          else view.setUint32(codeAt, dictionary.size, true);
+          if (original.width === 1 && dictionary.size > 0xff) continue;
+          try {
+            parsePage(copy, page.entry, reader.directory.tag, 0, dictionary.size);
+            problems.push(
+              `forged code ${String(dictionary.size)} at row ${String(row)} was accepted`,
+            );
+          } catch (error) {
+            if (!(error instanceof PageCorruptionError)) problems.push(`forged: ${String(error)}`);
+            forged++;
+          }
+        }
+      reader.close();
+    }
+    expect(problems).toEqual([]);
+    expect(refused).toBeGreaterThan(100);
+    expect(accepted).toBeGreaterThan(100);
+    expect(forged).toBeGreaterThan(10);
   }, 120_000);
 });

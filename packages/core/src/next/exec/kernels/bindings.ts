@@ -108,12 +108,10 @@ export const FUNCTION_BINDINGS: Readonly<Record<string, Binding | PerOverload>> 
   }),
   div: per({
     ...each(NUMERIC, 2, ARITH),
-    "numeric,numeric": refuse("NUMERIC division (increment 2)"),
     "interval,float8": INTERVAL,
   }),
   mod: per({
-    ...each(["int2", "int4", "int8"], 2, ARITH),
-    "numeric,numeric": refuse("NUMERIC modulo (increment 2)"),
+    ...each(["int2", "int4", "int8", "numeric"], 2, ARITH),
   }),
   neg: per({ ...each(NUMERIC, 1, { kernel: "neg" }), interval: INTERVAL }),
   textcat: refuse("text concatenation (text kernels come next)"),

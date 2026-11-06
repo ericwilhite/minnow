@@ -367,3 +367,37 @@ export async function runIdbBench(
     await withWorker((worker) => worker.call({ op: "remove", dir, store: "indexeddb" }));
   }
 }
+
+/** The multi-GB run's worker: kept across steps, restarted to reopen as a new process would. */
+let heavyWorker: StorageWorker | null = null;
+
+export async function heavyStep(request: NextStorageRequest): Promise<unknown> {
+  heavyWorker ??= await spawn();
+  return heavyWorker.call(request);
+}
+
+export function heavyRestart(): void {
+  heavyWorker?.terminate();
+  heavyWorker = null;
+}
+
+export async function storageEstimate(): Promise<{ usage: number; quota: number }> {
+  const estimate = await navigator.storage.estimate();
+  return { usage: estimate.usage ?? 0, quota: estimate.quota ?? 0 };
+}
+
+/** The storage microbench on OPFS and IndexedDB (each in a fresh directory or database). */
+export async function runMicrobench(): Promise<Record<string, Record<string, number>>> {
+  const out: Record<string, Record<string, number>> = {};
+  for (const kind of ["opfs", "indexeddb"] as const) {
+    const dir = unique(`microbench-${kind}`);
+    try {
+      out[kind] = await withWorker((worker) =>
+        worker.call<Record<string, number>>({ op: "microbench", dir, store: kind }),
+      );
+    } finally {
+      await withWorker((worker) => worker.call({ op: "remove", dir, store: kind }));
+    }
+  }
+  return out;
+}

@@ -5,6 +5,7 @@
  * browser-tests/next-storage.spec.ts.
  */
 import { describe, expect, it } from "vitest";
+import { expectBytes } from "./space-test-support.js";
 import {
   OwnershipLostError,
   StoreCorruptionError,
@@ -89,12 +90,39 @@ describe("IndexedDB backend over the simulated IndexedDB", () => {
     image.fill(0, 4096, 2 * 4096);
     expect(await session.dataLength()).toBe(4 * 4096 + 50);
     const [all] = await session.readData([{ offset: 0, length: 4 * 4096 + 50 }]);
-    expect(all).toEqual(image.subarray(0, 4 * 4096 + 50));
+    expectBytes(all, image.subarray(0, 4 * 4096 + 50));
     const target = new Uint8Array(3000).fill(7);
     await session.readDataInto(4096 + 10, target);
     expect(target.every((byte) => byte === 0)).toBe(true);
     await session.releaseData([{ offset: 2 * 4096, length: 3 * 4096 }]);
     expect(await session.dataLength()).toBe(4096);
+  });
+
+  it("queues a transferred whole buffer as it is and copies everything else (p2e)", async () => {
+    const backend = backendOver(new SimDisk());
+    const session = await backend.open(await backend.acquire());
+    expect(session.keepsWrites).toBe(true);
+    // Writes are queued (batched) until the publish. A caller that changes its buffer after the
+    // call resolves changes nothing unless it transferred the buffer (which it promised not to do:
+    // the change here only shows that no copy was made).
+    const copied = bytes(4096, 1);
+    const transferred = bytes(4096, 2);
+    const view = bytes(2 * 4096, 3).subarray(4096); // not a whole buffer: copied even if offered
+    await session.writeData(0, copied);
+    await session.writeData(4096, transferred, { transfer: true });
+    await session.writeData(2 * 4096, view, { transfer: true });
+    copied.fill(9);
+    transferred.fill(9);
+    view.fill(9);
+    await session.publish(new Uint8Array([1]));
+    const [first, second, third] = await session.readData([
+      { offset: 0, length: 4096 },
+      { offset: 4096, length: 4096 },
+      { offset: 2 * 4096, length: 4096 },
+    ]);
+    expectBytes(first, bytes(4096, 1), "copied");
+    expectBytes(second, new Uint8Array(4096).fill(9), "transferred");
+    expectBytes(third, bytes(2 * 4096, 3).subarray(4096), "view");
   });
 });
 
@@ -296,7 +324,7 @@ describe("review B1-p2c: IndexedDB epochs, fencing, batching and empty ranges", 
     expect(writes).toBe(1); // 200 queued writes and the barrier: one strict transaction
     const length = await session.dataLength();
     const [read] = await session.readData([{ offset: 0, length }]);
-    expect(read).toEqual(image.subarray(0, length));
+    expectBytes(read, image.subarray(0, length));
     expect(await session.readLog(0, 100)).toEqual(Uint8Array.from({ length: 100 }, (_, i) => i));
     writes = 0;
     for (let index = 0; index < 6; index++)

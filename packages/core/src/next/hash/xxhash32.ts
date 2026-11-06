@@ -5,8 +5,8 @@
  * spill pages all use it. It is not a cryptographic hash and is never used as one.
  *
  * Contract: `xxHash32(bytes, seed, start, end)` equals the reference XXH32 of
- * `bytes.subarray(start, end)` with `seed`, as an unsigned 32-bit integer, at any alignment and
- * any byteOffset, on any platform byte order.
+ * `bytes.subarray(start, end)` with seed `seed >>> 0`, as an unsigned 32-bit integer, at any
+ * alignment and any byteOffset, on any platform byte order.
  *
  * Reading (ruling R15.8): inputs of at least `WORD_READ_BYTES` read their 16-byte stripes a
  * 32-bit word at a time through one `DataView` (explicitly little-endian, unaligned reads are
@@ -41,6 +41,9 @@ function round(accumulator: number, lane: number): number {
 export function xxHash32(bytes: Uint8Array, seed = 0, start = 0, end = bytes.length): number {
   if (start < 0 || end > bytes.length || start > end)
     throw new RangeError("xxHash32 range is outside the input");
+  // The seed is a uint32: any number is taken as `seed >>> 0` (ToUint32) before arithmetic, so
+  // a fractional, non-finite or large seed means exactly what `>>> 0` makes of it.
+  seed >>>= 0;
   const length = end - start;
   let index = start;
   let hash: number;

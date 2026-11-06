@@ -17,6 +17,7 @@
  */
 import { xxHash32 } from "../hash/xxhash32.js";
 import { DATA_ALIGN, StoreCorruptionError } from "../storage/contract.js";
+import { VERIFY_CACHED_BYTES, verifyCached } from "../storage/verify-cached.js";
 import {
   MAX_BLOB_BYTES,
   MAX_READ_BYTES,
@@ -131,9 +132,34 @@ export class MemoryExtentSpace implements ExtentReader {
     return other;
   }
 
-  /** Drops every cached blob. */
+  readonly #parsed = new Map<string, object>();
+  /** `parsed` calls that found a descriptor, and descriptors attached. */
+  parsedHits = 0;
+  attached = 0;
+
+  /** Drops every cached blob (and the descriptors attached to them). */
   evict(): void {
+    if (VERIFY_CACHED_BYTES)
+      for (const [key, bytes] of this.#cache)
+        verifyCached(bytes, Number(key.split(":")[2]), "eviction");
     this.#cache.clear();
+    this.#parsed.clear();
+  }
+
+  parsed(ref: BlobRef): object | null {
+    const found = this.#parsed.get(MemoryExtentSpace.#key(ref)) ?? null;
+    if (found !== null) this.parsedHits++;
+    return found;
+  }
+
+  /** Attaches to a cached blob only (no governor here: nothing is charged). */
+  attach(ref: BlobRef, parsed: object, bytes: number): boolean {
+    void bytes;
+    const key = MemoryExtentSpace.#key(ref);
+    if (!this.#cache.has(key) || this.#parsed.has(key)) return false;
+    this.#parsed.set(key, parsed);
+    this.attached++;
+    return true;
   }
 
   write(offset: number, bytes: Uint8Array): void {
@@ -188,6 +214,10 @@ export class MemoryExtentSpace implements ExtentReader {
       release: () => {
         if (released) return;
         released = true;
+        if (VERIFY_CACHED_BYTES)
+          refs.forEach((ref, index) =>
+            verifyCached(bytes[index] ?? new Uint8Array(0), ref.checksum, "lease release"),
+          );
         this.leased -= total;
         options.budget.free(total);
       },

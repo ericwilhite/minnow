@@ -284,6 +284,14 @@ class Space implements ExtentSpace {
     return this.#cache.peek(ref);
   }
 
+  parsed(ref: BlobRef): object | null {
+    return this.#cache.parsed(ref);
+  }
+
+  attach(ref: BlobRef, parsed: object, bytes: number): boolean {
+    return this.#cache.attachParsed(ref, parsed, bytes);
+  }
+
   // ── Writing ──────────────────────────────────────────────────────────────────────────────────
 
   beginWrite(label: string, options: WriteOptions = {}): ExtentWriter {
@@ -300,9 +308,10 @@ class Space implements ExtentSpace {
   }
 
   /** A session call that writes: ownership loss fails the space. */
-  async sessionWrite(offset: number, bytes: Uint8Array): Promise<void> {
+  /** `transfer`: the space hands `bytes` (a whole buffer it will never touch again) over. */
+  async sessionWrite(offset: number, bytes: Uint8Array, transfer = false): Promise<void> {
     try {
-      await this.#session.writeData(offset, bytes);
+      await this.#session.writeData(offset, bytes, transfer ? { transfer } : undefined);
     } catch (error) {
       if (error instanceof OwnershipLostError) this.fail(error);
       throw error;
@@ -360,16 +369,35 @@ class Space implements ExtentSpace {
   /**
    * Writes everything in a builder's own buffer: when it is full (its size is a multiple of
    * `DATA_ALIGN`, so every flush but the last ends on a sector boundary and nothing partial is
-   * left) and at seal. A write error belongs to the builder.
+   * left) and at seal. To a session that `keepsWrites`, a full buffer that maps to one contiguous
+   * range is transferred, never copied, and replaced; the builder never sees it again. A write
+   * error belongs to the builder.
    */
   async flushOwn(builder: Builder): Promise<void> {
     const own = builder.own;
     if (own === null || own.length === 0) return;
     try {
-      let done = 0;
-      for (const piece of builder.reservation.pieces(own.start, own.length)) {
-        await this.sessionWrite(piece.offset, own.buffer.subarray(done, done + piece.length));
-        done += piece.length;
+      const pieces = builder.reservation.pieces(own.start, own.length);
+      const [only] = pieces;
+      if (
+        this.#session.keepsWrites === true &&
+        pieces.length === 1 &&
+        only !== undefined &&
+        own.length === own.buffer.length
+      ) {
+        // A full buffer that is one contiguous write, to a session that keeps what it is given:
+        // hand it over whole (no copy there) and stage on in a fresh buffer of the same size; the
+        // budget charge is the same. A session that writes at once copies into its file, so the
+        // buffer is simply reused (a fresh one would cost an allocation for nothing).
+        const full = own.buffer;
+        own.buffer = new Uint8Array(full.length);
+        await this.sessionWrite(only.offset, full, true);
+      } else {
+        let done = 0;
+        for (const piece of pieces) {
+          await this.sessionWrite(piece.offset, own.buffer.subarray(done, done + piece.length));
+          done += piece.length;
+        }
       }
     } catch (error) {
       builder.failure ??= error instanceof Error ? error : new Error(String(error));
@@ -756,7 +784,7 @@ class Builder implements ExtentBuilder {
   /** The partial last sector, kept while another builder holds the slab. */
   tail: Uint8Array | null = null;
   /** Its own staging buffer (charged to the writer's budget), from aligned logical `start`. */
-  own: { readonly buffer: Uint8Array; start: number; length: number } | null = null;
+  own: { buffer: Uint8Array; start: number; length: number } | null = null;
   failure: Error | null = null;
   readonly #pending: PendingBlob[] = [];
   #state: "open" | "sealed" = "open";

@@ -320,7 +320,12 @@ describe("B2-2 #3: one cleanup owner per hold, whichever page of a cached load f
     const values = Array.from({ length: 6000 }, (_, i) => encoder.encode(`k${String(i % 40)}`));
     const w = await writeGroup([{ type: { kind: "text" }, values }], { rawPageBytes: 2048 });
     const chunk = defined(w.group.columns[0]);
-    const space = w.space.view({});
+    const cache = w.space.view({});
+    // Without parsed descriptors: a descriptor validates a page once per cache residency
+    // (reader.ts PAGE_DESCRIPTOR_BYTES; cached bytes are trusted, storage/extents.ts), so bytes
+    // changed in place after that would not be parsed again. This probe needs every load to
+    // parse, so each page's damage fails a cached load and its cleanup can be checked.
+    const space = { read: cache.read.bind(cache), peek: cache.peek.bind(cache) };
     const warm = await ChunkReader.open(space, chunk, { budget: UNLIMITED });
     const pages = warm.directory.pages.map((_, page) => page);
     await warm.load(pages);
@@ -328,7 +333,7 @@ describe("B2-2 #3: one cleanup owner per hold, whichever page of a cached load f
     const entries = [...warm.directory.pages, defined(warm.directory.dictionary ?? undefined)];
     expect(entries.length).toBeGreaterThan(3);
     for (const entry of entries) {
-      const cached = defined(space.peek(blobOf(chunk, entry)) ?? undefined);
+      const cached = defined(cache.peek(blobOf(chunk, entry)) ?? undefined);
       const original = cached[12] ?? 0;
       cached[12] = 1; // the header's reserved field: structurally invalid
       const budget = tracked();

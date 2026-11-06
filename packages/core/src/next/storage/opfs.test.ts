@@ -86,6 +86,8 @@ describe("OPFS backend over simulated handles", () => {
     };
     const disk = new SimDisk();
     let mode: string | null = null;
+    /** A count the handle reports instead of what it wrote (it writes half). */
+    let reported: number | null = null;
     const backend = createOpfsBackend({
       name: "db",
       locks: new SimLocks(),
@@ -93,8 +95,12 @@ describe("OPFS backend over simulated handles", () => {
         name === "data"
           ? {
               read: (buffer, options) => file.read(buffer, options),
-              write: (buffer, options) =>
-                mode === null ? file.write(buffer, options) : failing(mode)(),
+              write: (buffer, options) => {
+                if (mode !== null) return failing(mode)();
+                if (reported === null) return file.write(buffer, options);
+                file.write(buffer.subarray(0, buffer.length >>> 1), options);
+                return reported;
+              },
               truncate: (size) =>
                 mode === "QuotaExceededError" ? failing(mode)() : file.truncate(size),
               getSize: () => file.getSize(),
@@ -112,6 +118,14 @@ describe("OPFS backend over simulated handles", () => {
     await expect(session.writeData(0, new Uint8Array(1))).rejects.toThrow(StoreQuotaError);
     mode = "NotReadableError";
     await expect(session.writeData(0, new Uint8Array(1))).rejects.toThrow("NotReadableError");
+    // Chromium reports a write the quota cut short with a count (2^32 − 8), not an exception.
+    for (const count of [2 ** 32 - 8, 2048, 0]) {
+      mode = null;
+      reported = count;
+      await expect(session.writeData(0, new Uint8Array(4096))).rejects.toThrow(StoreQuotaError);
+    }
+    reported = null;
+    await session.writeData(0, new Uint8Array(4096));
     await lease.release();
     mode = "InvalidStateError";
     await expect(session.writeData(0, new Uint8Array(1))).rejects.toThrow(OwnershipLostError);

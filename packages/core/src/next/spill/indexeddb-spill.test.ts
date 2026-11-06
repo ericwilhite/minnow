@@ -1,5 +1,6 @@
 /** The spill service over the IndexedDB backend's `spill` store (storage/indexeddb.ts). */
 import { describe, expect, it } from "vitest";
+import { expectBytes } from "../storage/space-test-support.js";
 import { OwnershipLostError, type StorageBackend } from "../storage/contract.js";
 import { createIndexedDbBackend } from "../storage/indexeddb.js";
 import { SimDisk, SimLocks } from "../storage/sim-disk.js";
@@ -28,7 +29,7 @@ describe("spill on the IndexedDB spill store", () => {
     const refs = [];
     for (let index = 0; index < 20; index++) refs.push(await file.append(bytes(9000, index)));
     for (const [index, ref] of refs.entries())
-      expect(await file.read(ref)).toEqual(bytes(9000, index));
+      expectBytes(await file.read(ref), bytes(9000, index), `page ${String(index)}`);
     await file.close();
     await service.sweep();
     await backend.acquire({ steal: true, timeoutMs: 2_000 });

@@ -7,8 +7,9 @@
 import { storeConformanceCases } from "../src/next/storage/conformance.js";
 import type { StorageBackend } from "../src/next/storage/contract.js";
 import type { BlobRef, ExtentRef, ExtentSpace } from "../src/next/storage/extents.js";
+import type { SyncFile } from "../src/next/storage/contract.js";
 import { createOpfsBackend, webLocks, type OpfsDirectoryLike } from "../src/next/storage/opfs.js";
-import { openIndexedDb } from "../src/next/storage/idb-like.js";
+import { openIndexedDb, type IdbDatabaseLike } from "../src/next/storage/idb-like.js";
 import { createIndexedDbBackend } from "../src/next/storage/indexeddb.js";
 import { chooseBackend } from "../src/next/storage/select.js";
 import { runIdbScenarios } from "../src/next/storage/idb-scenarios.js";
@@ -52,6 +53,19 @@ export type NextStorageRequest = { readonly store?: StoreKind } & (
       readonly buffered: boolean;
     }
   | { readonly op: "remove"; readonly dir: string }
+  | {
+      readonly op: "heavy-open";
+      readonly dir: string;
+      /** The root a reopen must find (round and blob identities); a missing root is refused. */
+      readonly expect?: { readonly round: number; readonly identity: string };
+    }
+  | { readonly op: "heavy-fill"; readonly mib: number; readonly publishEveryMib: number }
+  | { readonly op: "heavy-reclaim"; readonly refillMib: number }
+  | { readonly op: "heavy-quota-write"; readonly mib: number }
+  | { readonly op: "heavy-continue"; readonly mib: number }
+  | { readonly op: "heavy-quota-publish"; readonly fillerMib: number }
+  | { readonly op: "heavy-close" }
+  | { readonly op: "microbench"; readonly dir: string }
 );
 
 const scope = self as unknown as {
@@ -70,20 +84,82 @@ const locks = webLocks(navigator.locks);
 /** The backend of the request being handled (set by `handle`). */
 let store: StoreKind = "opfs";
 
+/** Platform requests, counted below the backends: OPFS data-file reads and IndexedDB `get`s. */
+const platform = { dataFileReads: 0, idbGets: 0 };
+
+/** The directory, with the data file's sync handle counting its `read` calls. */
+function countingDirectory(inner: OpfsDirectoryLike): OpfsDirectoryLike {
+  return {
+    async getFileHandle(name, options) {
+      const handle = await inner.getFileHandle(name, options);
+      if (name !== "data") return handle;
+      return {
+        async createSyncAccessHandle(): Promise<SyncFile> {
+          const file = await handle.createSyncAccessHandle();
+          return new Proxy(file, {
+            get(target, key) {
+              const value: unknown = Reflect.get(target, key);
+              if (typeof value !== "function") return value;
+              const method = value as (...args: unknown[]) => unknown;
+              return (...args: unknown[]) => {
+                if (key === "read") platform.dataFileReads += 1;
+                return method.apply(target, args);
+              };
+            },
+          });
+        },
+      };
+    },
+  };
+}
+
+/** The database, counting every `get` request its transactions issue. */
+function countingDatabase(inner: IdbDatabaseLike): IdbDatabaseLike {
+  return {
+    transaction: (stores, mode, durability, body) =>
+      inner.transaction(stores, mode, durability, (tx) => {
+        body({
+          store: (name) => {
+            const target = tx.store(name);
+            return {
+              ...target,
+              get: (key, then) => {
+                platform.idbGets += 1;
+                target.get(key, then);
+              },
+            };
+          },
+          abort: (reason) => {
+            tx.abort(reason);
+          },
+        });
+      }),
+    close: () => {
+      inner.close();
+    },
+  };
+}
+
 async function backendFor(name: string): Promise<StorageBackend> {
   if (store === "indexeddb")
     return createIndexedDbBackend({
-      database: () => openIndexedDb(indexedDB, `next-test:${name}`),
+      database: async () => countingDatabase(await openIndexedDb(indexedDB, `next-test:${name}`)),
       name: `next-test:${name}`,
       locks,
     });
-  return createOpfsBackend({ directory: await directory(name), name: `next-test:${name}`, locks });
+  return createOpfsBackend({
+    directory: countingDirectory(await directory(name)),
+    name: `next-test:${name}`,
+    locks,
+  });
 }
 
 const decoder = new TextDecoder();
 interface TestRoot {
   readonly round: number;
   readonly blobs: readonly BlobRef[];
+  /** Padding that makes a root large (the quota-pressure publish). */
+  readonly filler?: string;
 }
 const encodeRoot = (root: TestRoot) => new TextEncoder().encode(JSON.stringify(root));
 const decodeRoot = (bytes: Uint8Array | null): TestRoot | null =>
@@ -144,6 +220,178 @@ async function readAll(space: ExtentSpace, blobs: readonly BlobRef[]): Promise<v
 }
 
 let held: Awaited<ReturnType<typeof openSpace>> | null = null;
+
+const median = (samples: number[]) => {
+  const sorted = [...samples].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)] ?? 0;
+};
+const p95 = (samples: number[]) => {
+  const sorted = [...samples].sort((a, b) => a - b);
+  return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))] ?? 0;
+};
+
+/**
+ * The storage microbench (the nightly browser lane records it): the cache's hit paths, a cold
+ * coalesced slab read, publish latency, and commit latency with and without a log flush, on the
+ * backend `store` selects. Times in microseconds unless named otherwise.
+ */
+async function microbench(dir: string): Promise<Record<string, number>> {
+  const first = await openSpace(dir);
+  const space = first.space;
+  const writer = space.beginWrite("microbench");
+  const pages = Array.from({ length: 32 }, (_, index) => bytesOf(32_768, index));
+  const written = await writer.write(pages);
+  await space.publish(encodeRoot({ round: 1, blobs: written.blobs }), {
+    writers: [writer],
+    retired: [],
+  });
+  const budget = countingBudget(Infinity);
+  const hot = written.blobs[0];
+  if (hot === undefined) throw new Error("no blob");
+  await readAll(space, [hot]);
+  let start = performance.now();
+  let sink = 0;
+  for (let index = 0; index < 100_000; index++) sink += space.peek(hot)?.length ?? 0;
+  const peekNs = ((performance.now() - start) * 1e6) / 100_000;
+  start = performance.now();
+  for (let index = 0; index < 10_000; index++) {
+    const lease = await space.read([hot], { budget });
+    sink += lease.bytes.length;
+    lease.release();
+  }
+  const leasedHitUs = ((performance.now() - start) * 1000) / 10_000;
+  // Publish latency: a small write and a publish (data flush, root slot, flush).
+  const publish: number[] = [];
+  let previous = [written.extent];
+  for (let round = 2; round < 32; round++) {
+    const small = space.beginWrite("small");
+    start = performance.now();
+    const { blobs, extent } = await small.write([bytesOf(400, round)]);
+    await space.publish(encodeRoot({ round, blobs: [...written.blobs, ...blobs] }), {
+      writers: [small],
+      retired: round > 2 ? previous : [],
+    });
+    publish.push((performance.now() - start) * 1000);
+    previous = [extent];
+  }
+  // Commit latency: 200-byte log appends, flushed each (strict) or not (relaxed).
+  const strict: number[] = [];
+  const relaxed: number[] = [];
+  const frame = bytesOf(200, 1);
+  for (let index = 0; index < 50; index++) {
+    start = performance.now();
+    await first.session.appendLog(frame);
+    await first.session.flushLog();
+    strict.push((performance.now() - start) * 1000);
+    start = performance.now();
+    await first.session.appendLog(frame);
+    relaxed.push((performance.now() - start) * 1000);
+  }
+  await space.close();
+  await first.lease.release();
+  // Cold: a new owner (empty cache) reads the 32 pages: one coalesced 1 MiB slab, so one store
+  // read (`readDataInto`). Below it, OPFS makes one file read; IndexedDB makes one `get` for the
+  // epoch and one per record the slab spans.
+  const second = await openSpace(dir);
+  platform.dataFileReads = 0;
+  platform.idbGets = 0;
+  start = performance.now();
+  await readAll(second.space, written.blobs);
+  const coldSlabMs = performance.now() - start;
+  const storeReads = second.space.stats.cache.platformReads;
+  const below =
+    store === "opfs"
+      ? { coldSlabFileReads: platform.dataFileReads }
+      : { coldSlabIdbGets: platform.idbGets };
+  await second.space.close();
+  await second.lease.release();
+  if (sink === 0) throw new Error("unreachable");
+  return {
+    peekNs,
+    leasedHitUs,
+    coldSlabMs,
+    coldSlabStoreReads: storeReads,
+    ...below,
+    publishP50Us: median(publish),
+    publishP95Us: p95(publish),
+    commitStrictP50Us: median(strict),
+    commitStrictP95Us: p95(strict),
+    commitRelaxedP50Us: median(relaxed),
+    commitRelaxedP95Us: p95(relaxed),
+  };
+}
+
+/** The multi-GB run's state: the open space and every blob its current root names. */
+let heavy: {
+  dir: string;
+  opened: Awaited<ReturnType<typeof openSpace>>;
+  blobs: BlobRef[];
+  round: number;
+} | null = null;
+
+const MIB = 1 << 20;
+/** One MiB blob whose first bytes are its sequence number (so every blob has its own checksum). */
+const heavyBlob = (() => {
+  const buffer = bytesOf(MIB, 3);
+  let sequence = 0;
+  return () => {
+    sequence += 1;
+    new DataView(buffer.buffer).setFloat64(0, sequence, true);
+    return buffer;
+  };
+})();
+
+function heavyState() {
+  if (heavy === null) throw new Error("heavy-open first");
+  return heavy;
+}
+
+/** Writes `mib` one-MiB blobs, publishing a root naming every blob each `every` MiB. */
+async function heavyFill(mib: number, every: number): Promise<void> {
+  const state = heavyState();
+  const space = state.opened.space;
+  let writer = space.beginWrite("heavy");
+  for (let written = 1; written <= mib; written++) {
+    state.blobs.push(...(await writer.write([heavyBlob()])).blobs);
+    if (written % every === 0 || written === mib) {
+      state.round += 1;
+      await space.publish(encodeRoot({ round: state.round, blobs: state.blobs }), {
+        writers: [writer],
+        retired: [],
+      });
+      writer = space.beginWrite("heavy");
+    }
+  }
+  await writer.abort();
+}
+
+/** The identity of a root's blobs: their count and a hash of every coordinate and checksum. */
+function identity(blobs: readonly BlobRef[]): string {
+  let hash = 0x811c9dc5;
+  for (const blob of blobs)
+    for (const part of [
+      blob.extent.offset,
+      blob.extent.length,
+      blob.offset,
+      blob.length,
+      blob.checksum,
+    ]) {
+      const text = String(part);
+      for (let index = 0; index < text.length; index++)
+        hash = Math.imul(hash ^ text.charCodeAt(index), 0x01000193) >>> 0;
+      hash = Math.imul(hash ^ 0x2c, 0x01000193) >>> 0;
+    }
+  return `${String(blobs.length)}:${hash.toString(16)}`;
+}
+
+/** Reads `count` random blobs of the current root (each verified by the space). */
+async function heavySample(count: number): Promise<void> {
+  const state = heavyState();
+  for (let index = 0; index < count; index++) {
+    const blob = state.blobs[Math.floor(Math.random() * state.blobs.length)];
+    if (blob !== undefined) await readAll(state.opened.space, [blob]);
+  }
+}
 
 async function handle(request: NextStorageRequest): Promise<unknown> {
   store = request.store ?? "opfs";
@@ -341,6 +589,135 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
       await space.close();
       await lease.release();
       return { appendMs, sealMs, publishMs, bytes: blobs.length * request.pageBytes };
+    }
+    case "heavy-open": {
+      const started = performance.now();
+      const opened = await openSpace(request.dir, 30_000);
+      const root = decodeRoot(opened.space.root);
+      if (request.expect !== undefined && root === null) {
+        await opened.space.close().catch(() => undefined);
+        await opened.lease.release();
+        throw new Error(
+          `Reopened without a root; expected round ${String(request.expect.round)} (${request.expect.identity})`,
+        );
+      }
+      heavy = {
+        dir: request.dir,
+        opened,
+        blobs: [...(root?.blobs ?? [])],
+        round: root?.round ?? 0,
+      };
+      const openMs = performance.now() - started;
+      await heavySample(64);
+      const auditStarted = performance.now();
+      await opened.space.audit();
+      return {
+        openMs,
+        auditMs: performance.now() - auditStarted,
+        round: heavy.round,
+        identity: identity(heavy.blobs),
+        blobs: heavy.blobs.length,
+        dataBytes: opened.space.stats.dataBytes,
+      };
+    }
+    case "heavy-fill": {
+      const started = performance.now();
+      await heavyFill(request.mib, request.publishEveryMib);
+      const state = heavyState();
+      return {
+        ms: performance.now() - started,
+        blobs: state.blobs.length,
+        dataBytes: state.opened.space.stats.dataBytes,
+      };
+    }
+    case "heavy-reclaim": {
+      // Retire half the blobs, publish once more so their space is reusable (two generations),
+      // then write `refillMib` again: the data space must not grow.
+      const state = heavyState();
+      const space = state.opened.space;
+      const filled = space.stats.dataBytes;
+      const kept = state.blobs.filter((_, index) => index % 2 === 0);
+      const retired = state.blobs.filter((_, index) => index % 2 === 1).map((blob) => blob.extent);
+      state.blobs = kept;
+      state.round += 1;
+      await space.publish(encodeRoot({ round: state.round, blobs: kept }), {
+        writers: [],
+        retired,
+      });
+      state.round += 1;
+      await space.publish(encodeRoot({ round: state.round, blobs: kept }), {
+        writers: [],
+        retired: [],
+      });
+      await (space as unknown as { settled(): Promise<void> }).settled();
+      const before = space.stats.dataBytes;
+      await heavyFill(request.refillMib, 256);
+      await space.audit();
+      return { filled, before, after: space.stats.dataBytes, freeAfter: space.stats.freeBytes };
+    }
+    case "heavy-quota-write": {
+      // Write until the platform refuses: the writer fails, the space does not. The same space
+      // then reads retained blobs and audits exactly, still under the lowered quota (review
+      // B1-p2d finding 5); `heavy-continue` writes and publishes on it.
+      const space = heavyState().opened.space;
+      const writer = space.beginWrite("over quota");
+      let error: string | null = null;
+      let writtenMib = 0;
+      try {
+        for (let index = 0; index < request.mib; index++) {
+          await writer.write([heavyBlob()]);
+          writtenMib += 1;
+        }
+      } catch (failure) {
+        error = failure instanceof Error ? failure.name : String(failure);
+      }
+      if (writer.state === "open") await writer.abort();
+      const spaceFailed = space.failed?.name ?? null;
+      await heavySample(16);
+      await space.audit();
+      return { error, spaceFailed, writtenMib, afterAudit: space.failed?.name ?? null };
+    }
+    case "heavy-continue": {
+      // The space that saw a writer refused writes and publishes again.
+      const state = heavyState();
+      const before = state.round;
+      await heavyFill(request.mib, request.mib);
+      await heavySample(4);
+      return {
+        published: state.round - before,
+        blobs: state.blobs.length,
+        spaceFailed: state.opened.space.failed?.name ?? null,
+      };
+    }
+    case "heavy-quota-publish": {
+      // A root too large for what is left fails inside publish: the space is then failed.
+      const state = heavyState();
+      const space = state.opened.space;
+      // The last successful root, captured before the attempt: recovery must find exactly it.
+      const lastRoot = { round: state.round, identity: identity(state.blobs) };
+      let error: string | null = null;
+      try {
+        await space.publish(
+          encodeRoot({
+            round: state.round + 1,
+            blobs: state.blobs,
+            filler: "x".repeat(request.fillerMib * MIB),
+          }),
+          { writers: [], retired: [] },
+        );
+      } catch (failure) {
+        error = failure instanceof Error ? failure.name : String(failure);
+      }
+      return { error, spaceFailed: space.failed?.name ?? null, lastRoot };
+    }
+    case "microbench":
+      return microbench(request.dir);
+    case "heavy-close": {
+      const state = heavyState();
+      await state.opened.space.close().catch(() => undefined);
+      await state.opened.lease.release();
+      heavy = null;
+      return null;
     }
     case "remove": {
       if (store === "indexeddb") {

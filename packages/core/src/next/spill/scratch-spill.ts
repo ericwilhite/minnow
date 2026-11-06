@@ -17,6 +17,10 @@
  *   A page still in the batch buffer is served from it.
  * - **Release.** `close` hands the file's extents to `ScratchSpace.release` and, once that
  *   resolves, back to the map. `sweep` (startup) truncates the space to zero and starts a new map.
+ * - **Memory.** The service owns an optional memory registration (`memory`), charged over its
+ *   lifetime with what the scratch space keeps per extent (`chargeTo`: IndexedDB's record index;
+ *   OPFS keeps nothing). The charge follows the index as files come and go, and `dispose` returns
+ *   it at `sweep` and at the service's `close`, which first drains every file (see `close`).
  * - **Errors.** `StoreQuotaError` from the scratch space becomes `SpillQuotaError`; the query fails,
  *   the database is unaffected. A fenced owner's scratch calls fail with `OwnershipLostError`.
  * - **Never in recovery.** Nothing is flushed and nothing durable names spill space.
@@ -28,7 +32,7 @@ import {
   type DataRange,
   type ScratchSpace,
 } from "../storage/contract.js";
-import type { ByteBudget } from "../storage/extents.js";
+import type { ByteBudget, CacheMemory } from "../storage/extents.js";
 import { FreeSpaceMap } from "../storage/free-space.js";
 import {
   SpillCorruptionError,
@@ -51,9 +55,13 @@ export class ScratchSpillService implements SpillService {
   readonly #files = new Set<ScratchSpillFile>();
   /** Bumped by `sweep`: files from before it are dead. */
   #generation = 0;
+  /** Releases in flight (a terminal close waits for them). */
+  readonly #releasing = new Set<Promise<void>>();
+  #closing: Promise<void> | null = null;
 
-  constructor(scratch: ScratchSpace) {
+  constructor(scratch: ScratchSpace, options: { readonly memory?: CacheMemory } = {}) {
     this.#scratch = scratch;
+    if (options.memory !== undefined) scratch.chargeTo?.(options.memory);
   }
 
   get bytesInUse(): number {
@@ -63,6 +71,7 @@ export class ScratchSpillService implements SpillService {
   }
 
   async create(queryId: number, budget: ByteBudget): Promise<SpillFile> {
+    if (this.#closing !== null) throw new TypeError("The spill service is closed");
     const file = new ScratchSpillFile(this, queryId, budget, this.#generation);
     this.#files.add(file);
     return file;
@@ -74,6 +83,27 @@ export class ScratchSpillService implements SpillService {
     this.#generation += 1;
     this.#map = new FreeSpaceMap(DATA_ALIGN);
     await this.#scratch.truncate(0);
+    await this.#scratch.dispose?.();
+  }
+
+  /**
+   * Terminal (the owner is closing; unlike `sweep`, nothing is reused afterwards): no new file is
+   * created, every file closes (finishing the operations that already passed its live check, then
+   * releasing its space), releases in flight finish, and only then is the scratch space's memory
+   * charge returned (review B1-p2e finding 1: disposing first let a suspended append write after
+   * it, reloading a charged index and leaving extents nobody released). Idempotent.
+   */
+  close(): Promise<void> {
+    this.#closing ??= this.#close();
+    return this.#closing;
+  }
+
+  async #close(): Promise<void> {
+    await Promise.all([...this.#files].map((file) => file.close().catch(() => undefined)));
+    await Promise.all([...this.#releasing]);
+    this.#generation += 1;
+    this.#map = new FreeSpaceMap(DATA_ALIGN);
+    await this.#scratch.dispose?.();
   }
 
   get generation(): number {
@@ -113,9 +143,17 @@ export class ScratchSpillService implements SpillService {
   async release(file: ScratchSpillFile, ranges: readonly DataRange[]): Promise<void> {
     this.#files.delete(file);
     if (ranges.length === 0 || file.generation !== this.#generation) return;
-    await this.#scratch.release(ranges);
-    if (file.generation !== this.#generation) return;
-    for (const range of ranges) this.#map.free(range.offset, range.length);
+    const run = (async () => {
+      await this.#scratch.release(ranges);
+      if (file.generation !== this.#generation) return;
+      for (const range of ranges) this.#map.free(range.offset, range.length);
+    })();
+    this.#releasing.add(run);
+    try {
+      await run;
+    } finally {
+      this.#releasing.delete(run);
+    }
   }
 }
 

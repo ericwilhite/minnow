@@ -72,7 +72,9 @@
  * 6. **Truncate and reset are durable on resolve.** A crash during either may leave any state
  *    between the old log and the result.
  * 7. **Fencing.** Once a newer owner has acquired, every mutating call of an older session
- *    rejects with `OwnershipLostError` and changes nothing.
+ *    rejects with `OwnershipLostError` and changes nothing. Its reads may reject the same way
+ *    (OPFS closes its handles; IndexedDB checks the epoch in every read transaction), and are never
+ *    answered from a store the newer owner has rearranged.
  *
  * With an honest flush every acknowledged commit survives. With a lying flush (a write-back cache
  * lost on power failure) a cleanly truncated log loses at most the newest group, and that loss is
@@ -100,10 +102,20 @@
  *   epoch fence checked inside every read-write transaction, ArrayBuffer values (never Blobs) and
  *   byte records keyed by offset; over the platform's IndexedDB in browsers, over `sim-idb.ts` (a
  *   write-ahead log on the simulated disk, same crash model) in the storage kit.
+ *   **Platform assumption** (decided 2026-11-05): data, log and spill writes commit `relaxed`;
+ *   `publish` and `flushLog` commit `strict`. Guarantees 1 and 3 then rest on each engine keeping
+ *   one write-ahead log per database and committing in order, so that a strict commit makes every
+ *   earlier relaxed commit durable too (Chromium's LevelDB log, Firefox's and WebKit's SQLite in
+ *   WAL mode; the storage probe's device-flush counts agree: relaxed transactions issue no flush,
+ *   strict ones one). It is not power-cut tested in a browser. **Backstop:** if an engine broke
+ *   it, a write lost under a durable root is still caught, never read: every blob a root names
+ *   carries its checksum, and the log is checksum-chained, so the loss surfaces as
+ *   `StoreCorruptionError` / `LogCorruptionError`.
  * - `memory-store.ts`: the file store over in-memory files (in-memory databases, the M1 suites).
  * - `select.ts` (`chooseBackend`): OPFS where sync handles work, else IndexedDB, else memory.
  * Every implementation runs `storage/conformance.ts`.
  */
+import type { CacheMemory } from "./extents.js";
 
 /** Data-space extents start at multiples of this. */
 export const DATA_ALIGN = 4096;
@@ -142,6 +154,20 @@ export interface ScratchSpace {
   release(ranges: readonly DataRange[]): Promise<void>;
   /** Drops everything at or past `size`. The sweep on open is `truncate(0)`. */
   truncate(size: number): Promise<void>;
+  /**
+   * Optional (additive): charge the space's resident bookkeeping to `memory` from now on; the spill
+   * service calls it before first use with the registration it owns. IndexedDB charges its spill
+   * record index; a file (OPFS) keeps nothing per extent and has no such method.
+   */
+  chargeTo?(memory: CacheMemory): void;
+  /** Optional (additive): drop that bookkeeping and return its charge (sweep, close). */
+  dispose?(): Promise<void>;
+}
+
+/** `StoreSession.writeData` options. */
+export interface WriteDataOptions {
+  /** The caller hands the bytes' buffer over (see `writeData`). */
+  readonly transfer?: boolean;
 }
 
 export interface DataRange {
@@ -180,6 +206,13 @@ export interface StorageBackend {
 
 export interface StoreSession {
   readonly epoch: number;
+  /**
+   * True when `writeData` keeps the caller's bytes until a later commit (the IndexedDB session
+   * queues them), so handing a buffer over (`transfer`) saves a copy. A session that writes at
+   * once copies into its file anyway; a caller then keeps reusing its buffer (an additive member,
+   * absent meaning false).
+   */
+  readonly keepsWrites?: boolean;
 
   /** The durable root, or null for a new store. */
   readRoot(): Promise<Uint8Array | null>;
@@ -197,8 +230,13 @@ export interface StoreSession {
   /**
    * Writes bytes at `offset` (a multiple of `DATA_ALIGN`). Durable at the next publish. The caller
    * may reuse `bytes` once the call resolves (the extent space writes from one reused slab).
+   *
+   * With `transfer` (an additive option), the caller hands `bytes` and its whole buffer over: the
+   * session may keep them instead of copying (the IndexedDB session queues them as they are), and
+   * the caller must never read, write or reuse that buffer again. A session that writes at once
+   * (the file store) ignores it; callers transfer only to a session that `keepsWrites`.
    */
-  writeData(offset: number, bytes: Uint8Array): Promise<void>;
+  writeData(offset: number, bytes: Uint8Array, options?: WriteDataOptions): Promise<void>;
   /**
    * Reads byte ranges. Adjacent ranges may be coalesced into one platform read. Results are in
    * request order, may share one ArrayBuffer, and must not be mutated or transferred (copy first).

@@ -23,17 +23,56 @@ export function at<T>(items: readonly T[], index: number): T {
 }
 
 /** Byte equality, fast on large arrays (the matcher's `toEqual` diffs element by element). */
-export function sameBytes(left: Uint8Array | undefined, right: Uint8Array | undefined): boolean {
-  if (left === undefined || right === undefined) return false;
-  if (left.length !== right.length) return false;
-  for (let index = 0; index < left.length; index++) if (left[index] !== right[index]) return false;
-  return true;
+/**
+ * The first offset where `actual` and `expected` differ (the shorter length when one is a prefix
+ * of the other), or -1 when they are equal. Four bytes a step where both views are aligned: a
+ * deep `toEqual` walks byte arrays element by element (14.2 s for the extent-space interleaving
+ * test, B2), and coverage counts every loop iteration.
+ */
+export function firstDifference(actual: Uint8Array, expected: Uint8Array): number {
+  const length = Math.min(actual.length, expected.length);
+  let index = 0;
+  if (actual.byteOffset % 4 === 0 && expected.byteOffset % 4 === 0) {
+    const words = length >>> 2;
+    const a = new Int32Array(actual.buffer, actual.byteOffset, words);
+    const b = new Int32Array(expected.buffer, expected.byteOffset, words);
+    let word = 0;
+    while (word < words && a[word] === b[word]) word += 1;
+    index = word << 2;
+  }
+  while (index < length && actual[index] === expected[index]) index += 1;
+  return index === length && actual.length === expected.length ? -1 : index;
 }
 
-/** `length` bytes of a pattern derived from `seed`. */
+export function sameBytes(left: Uint8Array | undefined, right: Uint8Array | undefined): boolean {
+  return left !== undefined && right !== undefined && firstDifference(left, right) === -1;
+}
+
+/**
+ * Asserts that `actual` holds exactly `expected`, naming the first differing offset on failure.
+ * Throws a plain Error (this module is also loaded by the browser worker, without vitest).
+ */
+export function expectBytes(
+  actual: Uint8Array | null | undefined,
+  expected: Uint8Array,
+  label = "bytes",
+): void {
+  if (actual === undefined || actual === null)
+    throw new Error(`${label}: expected ${String(expected.length)} bytes, got ${String(actual)}`);
+  const at = firstDifference(actual, expected);
+  if (at === -1) return;
+  throw new Error(
+    `${label}: ${String(actual.length)} bytes against ${String(expected.length)} expected; first difference at offset ${String(at)} (${String(actual[at])} vs ${String(expected[at])})`,
+  );
+}
+
+/** `length` bytes of a pattern derived from `seed` (period 256: built once, then doubled). */
 export function bytesOf(length: number, seed: number): Uint8Array {
   const bytes = new Uint8Array(length);
-  for (let index = 0; index < length; index++) bytes[index] = (seed * 131 + index * 7) & 0xff;
+  const period = Math.min(length, 256);
+  for (let index = 0; index < period; index++) bytes[index] = (seed * 131 + index * 7) & 0xff;
+  for (let filled = period; filled < length; filled *= 2)
+    bytes.copyWithin(filled, 0, Math.min(filled, length - filled));
   return bytes;
 }
 

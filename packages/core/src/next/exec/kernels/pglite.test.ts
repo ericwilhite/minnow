@@ -450,12 +450,12 @@ describe("kernels against PostgreSQL (PGlite, generated)", () => {
     });
 
   it.each(SEEDS)(
-    "numeric arithmetic, comparison and negation over every tier (seed %i)",
+    "numeric arithmetic (incl. / and %), comparison and negation over every tier (seed %i)",
     async (seed) => {
       const D = TYPES.numeric;
       await fc.assert(
         fc.asyncProperty(
-          fc.constantFrom("add", "sub", "mul", "neg", "<", "="),
+          fc.constantFrom("add", "sub", "mul", "div", "mod", "neg", "<", "="),
           rep,
           rep,
           fc.tuple(

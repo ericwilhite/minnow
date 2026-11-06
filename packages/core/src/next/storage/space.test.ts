@@ -23,6 +23,8 @@ import { xxHash32 } from "../hash/xxhash32.js";
 import {
   at,
   bytesOf,
+  expectBytes,
+  firstDifference,
   sameBytes,
   countingBudget,
   countingMemory,
@@ -30,6 +32,42 @@ import {
   openOver,
   rootOf,
 } from "./space-test-support.js";
+
+describe("test support", () => {
+  it("bytesOf is its per-byte pattern; firstDifference finds the first difference, aligned or not", () => {
+    // Both helpers avoid per-byte loops (coverage counts every iteration); they must still mean
+    // exactly what the per-byte definitions meant, or every byte check here would be vacuous.
+    for (const length of [0, 1, 255, 256, 257, 511, 513, 4095, 100_003])
+      for (const seed of [0, 1, 7, 300]) {
+        const bytes = bytesOf(length, seed);
+        const differs = bytes.findIndex(
+          (byte, index) => byte !== ((seed * 131 + index * 7) & 0xff),
+        );
+        expect(differs, `length ${String(length)} seed ${String(seed)}`).toBe(-1);
+      }
+    const base = bytesOf(10_001, 3);
+    for (const at of [0, 3, 4, 5_000, 9_999, 10_000]) {
+      const changed = base.slice();
+      changed[at] = (changed[at] ?? 0) ^ 1;
+      expect(firstDifference(changed, base)).toBe(at);
+      expect(sameBytes(base, changed)).toBe(false);
+      // Unaligned views take the bytewise path.
+      expect(firstDifference(changed.subarray(1), base.subarray(1))).toBe(at === 0 ? -1 : at - 1);
+      expect(sameBytes(base.subarray(1), changed.subarray(1))).toBe(at === 0);
+      expect(() => {
+        expectBytes(changed, base, "probe");
+      }).toThrow(`first difference at offset ${String(at)}`);
+    }
+    // A prefix differs at the shorter length.
+    expect(firstDifference(base.subarray(0, 7), base)).toBe(7);
+    expect(() => {
+      expectBytes(undefined, base);
+    }).toThrow("got undefined");
+    expect(sameBytes(base, base.slice())).toBe(true);
+    expect(sameBytes(base.subarray(2, 900), base.slice(2, 900))).toBe(true);
+    expect(sameBytes(base, base.subarray(1))).toBe(false);
+  });
+});
 
 describe("memory backend", () => {
   for (const testCase of storeConformanceCases)
@@ -52,7 +90,10 @@ describe("extent space: writing, publishing and reopening", () => {
     expect(await space.publish(rootOf(blobs), { writers: [writer], retired: [] })).toBe(1);
     expect(writer.state).toBe("published");
     const lease = await space.read(blobs, { budget });
-    expect(lease.bytes).toEqual([bytesOf(10, 1), bytesOf(5000, 2), bytesOf(30, 3)]);
+    expect(lease.bytes.length).toBe(3);
+    [bytesOf(10, 1), bytesOf(5000, 2), bytesOf(30, 3)].forEach((bytes, index) => {
+      expectBytes(lease.bytes[index], bytes, `blob ${String(index)}`);
+    });
     lease.release();
     await space.audit();
     await space.close();
@@ -60,7 +101,7 @@ describe("extent space: writing, publishing and reopening", () => {
     const again = await openOver(backend, { reuseLock: true });
     expect(again.space.root).toEqual(rootOf(blobs));
     const reread = await again.space.read(blobs, { budget: again.budget });
-    expect(reread.bytes[1]).toEqual(bytesOf(5000, 2));
+    expectBytes(reread.bytes[1], bytesOf(5000, 2), "reread blob 1");
     reread.release();
     await again.space.audit();
   });
@@ -85,14 +126,18 @@ describe("extent space: writing, publishing and reopening", () => {
     expect(moved.extent.length).toBe(4090 + 20 + 5000);
     const blobs = [...grown.blobs, ...neighbour.blobs, ...moved.blobs];
     const lease = await space.read(blobs, { budget });
-    expect(lease.bytes).toEqual([
+    const parts = [
       bytesOf(4000, 1),
       bytesOf(9000, 2),
       bytesOf(100, 4),
       bytesOf(4090, 3),
       bytesOf(20, 5),
       bytesOf(5000, 6),
-    ]);
+    ];
+    expect(lease.bytes.length).toBe(parts.length);
+    parts.forEach((bytes, index) => {
+      expectBytes(lease.bytes[index], bytes, `blob ${String(index)}`);
+    });
     lease.release();
     await space.publish(rootOf(blobs), { writers: [writer], retired: [] });
     await space.audit();
@@ -132,7 +177,7 @@ describe("extent space: writing, publishing and reopening", () => {
     const flat = expected.flat();
     for (let index = 0; index < blobs.length; index++) {
       const lease = await space.read([at(blobs, index)], { budget });
-      expect(sameBytes(lease.bytes[0], flat[index]), `blob ${String(index)}`).toBe(true);
+      expectBytes(lease.bytes[0], at(flat, index), `blob ${String(index)}`);
       lease.release();
     }
     await space.publish(rootOf(blobs), { writers: [writer], retired: [] });
@@ -222,10 +267,7 @@ describe("extent space: per-builder staging buffers (writer budget)", () => {
     expect(charge.used).toBe(0);
     for (let index = 0; index < blobs.length; index++) {
       const lease = await space.read([at(blobs, index)], { budget: reader });
-      expect(
-        sameBytes(lease.bytes[0], expected.slice(0, 3).flat()[index]),
-        `blob ${String(index)}`,
-      ).toBe(true);
+      expectBytes(lease.bytes[0], at(expected.slice(0, 3).flat(), index), `blob ${String(index)}`);
       lease.release();
     }
     const aborted = space.beginWrite("aborted", { budget: charge });
@@ -234,6 +276,96 @@ describe("extent space: per-builder staging buffers (writer budget)", () => {
     await aborted.abort();
     expect(charge.used).toBe(0);
     await writer.abort();
+    await (space as unknown as { settled(): Promise<void> }).settled();
+    await space.audit();
+  });
+
+  it("transfers nothing to a session that writes at once (it copies into its file anyway)", async () => {
+    let transfers = 0;
+    const { space } = await openOver(new MemoryBackend(), {
+      wrap: (session) =>
+        new Proxy(session, {
+          get(target, key) {
+            const value: unknown = Reflect.get(target, key);
+            if (key === "writeData")
+              return (offset: number, bytes: Uint8Array, options?: { transfer?: boolean }) => {
+                if (options?.transfer === true) transfers += 1;
+                return target.writeData(offset, bytes, options);
+              };
+            return typeof value === "function"
+              ? (value as (...args: unknown[]) => unknown).bind(target)
+              : value;
+          },
+        }),
+    });
+    const writer = space.beginWrite("t", { budget: countingBudget(Infinity) });
+    const builder = writer.open(2 << 20);
+    await builder.append([bytesOf(3 * BUILDER_BUFFER_BYTES, 1)]);
+    expect(await builder.seal()).not.toBeNull();
+    expect(transfers).toBe(0);
+    await writer.abort();
+  });
+
+  it("hands a full buffer to the session and never touches it again; budgets return exactly once", async () => {
+    // Every buffer the space transfers, with its bytes at handover.
+    const handed: Array<{ readonly bytes: Uint8Array; readonly snapshot: Uint8Array }> = [];
+    const { space, budget: reader } = await openOver(new MemoryBackend(), {
+      wrap: (session) =>
+        new Proxy(session, {
+          get(target, key) {
+            // A session that keeps what it is given (as the IndexedDB session queues writes).
+            if (key === "keepsWrites") return true;
+            if (key !== "writeData") {
+              const value: unknown = Reflect.get(target, key);
+              return typeof value === "function"
+                ? (value as (...args: unknown[]) => unknown).bind(target)
+                : value;
+            }
+            return (offset: number, bytes: Uint8Array, options?: { transfer?: boolean }) => {
+              if (options?.transfer === true) {
+                expect(bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength).toBe(
+                  true,
+                );
+                handed.push({ bytes, snapshot: bytes.slice() });
+              }
+              return target.writeData(offset, bytes, options);
+            };
+          },
+        }),
+    });
+    const charge = countingBudget(2 * BUILDER_BUFFER_BYTES);
+    const writer = space.beginWrite("columns", { budget: charge });
+    const builders = [writer.open(2 << 20), writer.open(2 << 20)];
+    const expected: Uint8Array[][] = [[], []];
+    let seed = 1;
+    // About 1.1 MiB each: four full buffers per builder.
+    for (let round = 0; round < 70; round++)
+      for (let index = 0; index < builders.length; index++) {
+        const part = bytesOf(9_000 + ((round * 977 + index * 7) % 13_000), seed++);
+        await at(builders, index).append([part]);
+        at(expected, index).push(part);
+      }
+    // Both builders filled their buffer several times: each full one was handed over.
+    expect(handed.length).toBe(8);
+    expect(new Set(handed.map(({ bytes }) => bytes.buffer)).size).toBe(handed.length);
+    const sealed = await at(builders, 0).seal();
+    if (sealed === null) throw new Error("sealed empty");
+    expect(charge.used).toBe(BUILDER_BUFFER_BYTES);
+    // The sealed builder's bytes are exact.
+    const flat = at(expected, 0);
+    for (let index = 0; index < sealed.blobs.length; index++) {
+      const lease = await space.read([at(sealed.blobs, index)], { budget: reader });
+      expectBytes(lease.bytes[0], at(flat, index), `blob ${String(index)}`);
+      lease.release();
+    }
+    // A third builder takes the freed buffer's budget, then everything still open is aborted.
+    const late = writer.open(1 << 20);
+    await late.append([bytesOf(BUILDER_BUFFER_BYTES + 5_000, 99)]);
+    await writer.abort();
+    expect(charge.used).toBe(0);
+    // Nothing wrote into a buffer after handing it over.
+    for (const [index, { bytes, snapshot }] of handed.entries())
+      expectBytes(bytes, snapshot, `handed buffer ${String(index)}`);
     await (space as unknown as { settled(): Promise<void> }).settled();
     await space.audit();
   });
@@ -520,7 +652,7 @@ describe("review B1-p2a findings", () => {
     // The previous root's data is untouched.
     expect(await session.dataLength()).toBe(8192);
     const [bytes] = await session.readData([{ offset: 0, length: 8192 }]);
-    expect(bytes).toEqual(bytesOf(8192, 1));
+    expectBytes(bytes, bytesOf(8192, 1));
   });
 
   it("2: reads distinct blobs at one address by full identity, zero-length ones included", async () => {

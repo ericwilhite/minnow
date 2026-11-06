@@ -302,6 +302,18 @@ export interface ExtentReader {
   read(refs: readonly BlobRef[], options: ReadOptions): Promise<ReadLease>;
   /** A cached blob, synchronously, or null. Valid until the caller yields; never pinned. */
   peek(ref: BlobRef): Uint8Array | null;
+  /**
+   * The parsed descriptor a reader attached to `ref`'s cache entry (`attach`), or null when the
+   * entry is not resident or has none. Optional: a reader without it parses on every load.
+   */
+  parsed?(ref: BlobRef): object | null;
+  /**
+   * Attaches a parsed descriptor of the entry's bytes (views into those same bytes, validated
+   * structure) to `ref`'s resident cache entry, charging `bytes` (the descriptor's own size) in
+   * that entry; it is dropped with the entry. False when the entry is not resident, already has
+   * one, or the charge is refused. The descriptor must not copy the entry's bytes.
+   */
+  attach?(ref: BlobRef, parsed: object, bytes: number): boolean;
 }
 
 // ── Writing ────────────────────────────────────────────────────────────────────────────────────
@@ -409,7 +421,10 @@ export interface SpaceStats {
     readonly pinnedBytes: number;
     readonly hits: number;
     readonly misses: number;
-    /** Platform read calls and bytes they read (gaps included). */
+    /**
+     * Store read calls (`readDataInto`, one per coalesced slab) and the bytes they read (gaps
+     * included). On OPFS each is one file read; on IndexedDB a transaction of several requests.
+     */
     readonly platformReads: number;
     readonly bytesRead: number;
   };
