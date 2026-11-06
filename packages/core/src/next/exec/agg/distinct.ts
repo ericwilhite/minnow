@@ -25,20 +25,29 @@ export class DistinctSet {
   readonly #values: GroupTable;
   readonly #memory: Charged;
   readonly #vids: Int32Array;
-  #slots: Int32Array = new Int32Array(1024);
+  #slots: Int32Array;
   #mask = 1023;
-  #groups: Int32Array = new Int32Array(1024);
-  #ids: Int32Array = new Int32Array(1024);
+  #groups: Int32Array;
+  #ids: Int32Array;
   #size = 0;
   /** Scalar DISTINCT: value ids already counted. */
-  #seen: Uint8Array = new Uint8Array(0);
+  #seen: Uint8Array;
   readonly #one: Vector[] = [];
 
+  /** Throws (having released everything it took) when the grant refuses its first buffers. */
   constructor(type: PhysicalType, charge: ByteCharge, capacity: number) {
     this.#values = new GroupTable([type], charge);
-    this.#memory = new Charged(charge);
-    this.#memory.take(4 * (capacity + 3 * 1024));
-    this.#vids = new Int32Array(capacity);
+    const memory = (this.#memory = new Charged(charge));
+    try {
+      this.#vids = memory.make(Int32Array, capacity);
+      this.#slots = memory.make(Int32Array, 1024);
+      this.#groups = memory.make(Int32Array, 1024);
+      this.#ids = memory.make(Int32Array, 1024);
+      this.#seen = memory.make(Uint8Array, 0);
+    } catch (error) {
+      this.close();
+      throw error;
+    }
   }
 
   /** The rows of `rows` (or every row) with a non-null value whose pair is new, into `out`. */
@@ -110,8 +119,7 @@ export class DistinctSet {
   }
 
   #rehash(size: number): void {
-    const slots = new Int32Array(size);
-    this.#memory.take(slots.byteLength);
+    const slots = this.#memory.make(Int32Array, size);
     this.#memory.give(this.#slots.byteLength);
     this.#slots = slots;
     this.#mask = size - 1;

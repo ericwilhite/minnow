@@ -226,6 +226,21 @@ export function compare(a: Uint32Array, ai: number, b: Uint32Array, bi: number):
   return 0;
 }
 
+/**
+ * t[at] = v when v fits 128 bits (two's complement); false otherwise. For values that are already
+ * BigInts (a `wide` input), so it adds no BigInt of its own beyond the masking.
+ */
+export function setBigInt(t: Uint32Array, at: number, v: bigint): boolean {
+  if (v < -(1n << 127n) || v >= 1n << 127n) return false;
+  const u = BigInt.asUintN(128, v);
+  const o = at * 4;
+  t[o] = Number(u & 0xffff_ffffn);
+  t[o + 1] = Number((u >> 32n) & 0xffff_ffffn);
+  t[o + 2] = Number((u >> 64n) & 0xffff_ffffn);
+  t[o + 3] = Number(u >> 96n);
+  return true;
+}
+
 /** The value as a bigint (tests, and the rare wide fallback). */
 export function toBigInt(t: Uint32Array, at: number): bigint {
   const o = at * 4;

@@ -8,11 +8,13 @@
  *
  * ## Structure
  * One key column maps to dense value ids through a `KeyColumn` chosen by its type:
- * - `Int32Keys` (int2, int4, date and other 32-bit layouts): one interleaved (key, id) table, so a
- *   probe reads one cache line.
- * - `NumberKeys` (bool, int8, floats, times, timestamps): open addressing over the value
- *   as f64, the key stored beside its slot (one probe reads id, hash and key at one index). Exact
- *   int64 keys past 2^53 use a side map (rare; one BigInt each).
+ * - `Int32Keys` (int2, int4, date): one interleaved (key, id) table, so a probe reads one cache
+ *   line.
+ * - `Int64Keys` (int8, time, timestamp): an interleaved (low word, high word, id) table over the
+ *   exact 64-bit value, whatever its representation (safe f64 or BigInt64Array words): no BigInt
+ *   and no Map, so wide keys are charged like any other.
+ * - `NumberKeys` (bool, float4, float8): open addressing over the value as f64, the key stored
+ *   beside its slot.
  * - `ByteKeys` (text, bytes, enum labels, uuid): open addressing over xxHash32, the hash stored in
  *   the slot array, the bytes in one arena. A dictionary column is translated once per entry and
  *   dictionary; rows then map code → id with one array read.
@@ -23,20 +25,30 @@
  * reads per row, never a byte encoding.
  *
  * A new id is inserted at the empty slot its probe stopped at; tables double at load ½ by
- * re-placing ids from their stored hashes (plain loops, no callback per id).
+ * re-placing ids from their stored hashes or keys (plain loops, no callback per id).
  *
  * ## Memory
- * Every typed array is charged to the grant before it grows. A refused growth throws `RangeError`:
- * partitioned aggregation spill is milestone 3.
+ * Every typed array is charged to the grant before it is constructed (`Charged.make`; the charge
+ * is returned if construction throws). A refused growth throws `RangeError`: partitioned
+ * aggregation spill is milestone 3. `keyBytes` bounds what `emitKey` will allocate, so the
+ * operator charges an output batch before building it.
  */
 import { xxHash32 } from "../../hash/xxhash32.js";
 import { KeyBatch, encodeKeyBatch } from "../../keys/key-encoding.js";
 import type { PhysicalType } from "../../types.js";
 import { layoutOf } from "../../types.js";
+import { MAX_SAFE } from "../../vector/int64.js";
 import type { ByteCharge } from "../../vector/varlen.js";
 import type { FlatVector, Selection, Validity, Vector, VectorData } from "../../vector/vector.js";
+import { int64Words } from "../kernels/limbs.js";
 import { IDENTITY, flatOf } from "../kernels/vectors.js";
 import { GroupValues } from "./values.js";
+
+type Typed = Uint8Array | Uint16Array | Uint32Array | Int32Array | Float64Array;
+interface TypedConstructor<T extends Typed> {
+  new (length: number): T;
+  readonly BYTES_PER_ELEMENT: number;
+}
 
 /** Charged growable typed arrays (shared by the group tables and the accumulators). */
 export class Charged {
@@ -51,29 +63,41 @@ export class Charged {
     this.charge.free(bytes);
     this.#bytes -= bytes;
   }
-  #grow<T extends Uint8Array | Uint16Array | Uint32Array | Int32Array | Float64Array>(
-    old: T,
-    next: T,
-  ): T {
-    this.take(next.byteLength);
-    next.set(old.subarray(0, Math.min(old.length, next.length)));
+  /** A new typed array, charged before it is constructed (the charge returns if that throws). */
+  make<T extends Typed>(Type: TypedConstructor<T>, length: number): T {
+    const bytes = length * Type.BYTES_PER_ELEMENT;
+    this.take(bytes);
+    try {
+      return new Type(length);
+    } catch (error) {
+      this.give(bytes);
+      throw error;
+    }
+  }
+  #grow<T extends Typed>(old: T, Type: TypedConstructor<T>, length: number): T {
+    const next = this.make(Type, length);
+    next.set(old.subarray(0, Math.min(old.length, length)) as never); // eslint-disable-line @typescript-eslint/no-unnecessary-type-assertion -- the union of typed arrays needs it
     this.give(old.byteLength);
     return next;
   }
   uint8(old: Uint8Array, length: number): Uint8Array {
-    return this.#grow(old, new Uint8Array(length));
+    return this.#grow(old, Uint8Array, length);
   }
   uint16(old: Uint16Array, length: number): Uint16Array {
-    return this.#grow(old, new Uint16Array(length));
+    return this.#grow(old, Uint16Array, length);
   }
   uint32(old: Uint32Array, length: number): Uint32Array {
-    return this.#grow(old, new Uint32Array(length));
+    return this.#grow(old, Uint32Array, length);
   }
   int32(old: Int32Array, length: number): Int32Array {
-    return this.#grow(old, new Int32Array(length));
+    return this.#grow(old, Int32Array, length);
   }
   float64(old: Float64Array, length: number): Float64Array {
-    return this.#grow(old, new Float64Array(length));
+    return this.#grow(old, Float64Array, length);
+  }
+  /** Bytes currently held. */
+  get bytes(): number {
+    return this.#bytes;
   }
   close(): void {
     if (this.#bytes > 0) this.charge.free(this.#bytes);
@@ -83,6 +107,7 @@ export class Charged {
 
 const F64 = new Float64Array(1);
 const WORDS = new Int32Array(F64.buffer);
+const TWO32 = 4294967296;
 
 function finalize(h: number): number {
   h ^= h >>> 16;
@@ -97,6 +122,19 @@ function hashNumber(value: number): number {
   if ((value | 0) === value) return finalize(Math.imul(value, 0x9e3779b1));
   F64[0] = value;
   return finalize((WORDS[0] ?? 0) ^ Math.imul(WORDS[1] ?? 0, 0x9e3779b1));
+}
+
+/** A 32-bit integer's hash (Int32Keys). */
+function hashInt32(value: number): number {
+  let h = Math.imul(value, 0x9e3779b1);
+  h ^= h >>> 15;
+  h = Math.imul(h, 0x85ebca6b);
+  return h ^ (h >>> 13);
+}
+
+/** A 64-bit value's hash from its two words (Int64Keys). */
+function hashWords(low: number, high: number): number {
+  return finalize(Math.imul(low ^ Math.imul(high, 0x85ebca6b), 0x9e3779b1) ^ high);
 }
 
 /** The NULL id's validity over the emitted ids (null when none is the NULL id). */
@@ -117,6 +155,9 @@ function validityFromNull(
   return any ? validity : null;
 }
 
+/** Bytes of a validity bitmap for `count` slots. */
+const validityBytes = (count: number): number => 4 * ((count + 31) >>> 5);
+
 /** One key column → dense value ids. */
 interface KeyColumn {
   readonly count: number;
@@ -124,16 +165,19 @@ interface KeyColumn {
   assign(key: Vector, length: number, rows: Selection | null, ids: Int32Array): void;
   /** The key values of ids from … from + count − 1, or of `ids[0 … count)` when given. */
   emit(type: PhysicalType, from: number, count: number, ids: Int32Array | null): FlatVector;
+  /** An upper bound of the bytes `emit` allocates for the same ids. */
+  outputBytes(type: PhysicalType, from: number, count: number, ids: Int32Array | null): number;
   close(): void;
 }
 
 /** Open-addressing slots: id + 1 (0 empty) and the stored hash, side by side. */
 class Slots {
-  ids: Int32Array = new Int32Array(1024);
-  hashes: Int32Array = new Int32Array(1024);
+  ids: Int32Array;
+  hashes: Int32Array;
   mask = 1023;
   constructor(readonly memory: Charged) {
-    memory.take(8 * 1024);
+    this.ids = memory.make(Int32Array, 1024);
+    this.hashes = memory.make(Int32Array, 1024);
   }
   /** Whether `used` ids need a larger table (load factor ½). */
   full(used: number): boolean {
@@ -141,14 +185,13 @@ class Slots {
   }
   /**
    * Doubles the table and re-places ids 0 … ids − 1 from their stored hashes; ids with
-   * `outside[id] === 1` (NULL, wide int64 keys) stay out of it.
+   * `outside[id] === 1` (NULL) stay out of it.
    */
   grow(idHashes: Int32Array, ids: number, outside: Uint8Array | null): void {
     const size = 2 * this.ids.length;
-    this.memory.take(8 * size);
-    this.memory.give(8 * this.ids.length);
-    const slotIds = new Int32Array(size);
-    const slotHashes = new Int32Array(size);
+    const slotIds = this.memory.make(Int32Array, size);
+    const slotHashes = this.memory.make(Int32Array, size);
+    this.memory.give(this.ids.byteLength + this.hashes.byteLength);
     const mask = size - 1;
     for (let id = 0; id < ids; id++) {
       if (outside !== null && outside[id] === 1) continue;
@@ -166,10 +209,11 @@ class Slots {
 
 /** Per-id hashes and the "outside the slot table" marks, grown together. */
 class IdColumns {
-  hashes: Int32Array = new Int32Array(1024);
-  outside: Uint8Array = new Uint8Array(1024);
+  hashes: Int32Array;
+  outside: Uint8Array;
   constructor(readonly memory: Charged) {
-    memory.take(5 * 1024);
+    this.hashes = memory.make(Int32Array, 1024);
+    this.outside = memory.make(Uint8Array, 1024);
   }
   ensure(id: number): void {
     if (id < this.hashes.length) return;
@@ -178,21 +222,21 @@ class IdColumns {
   }
 }
 
+/** bool, float4, float8 keys: f64 open addressing, the key beside its slot. */
 class NumberKeys implements KeyColumn {
   readonly #memory: Charged;
   readonly #slots: Slots;
   readonly #idColumns: IdColumns;
   /** The key of each id (output). */
-  #keys: Float64Array = new Float64Array(1024);
+  #keys: Float64Array;
   /** The key beside each slot. */
-  #slotKeys: Float64Array = new Float64Array(1024);
+  #slotKeys: Float64Array;
   count = 0;
   #nullId = -1;
-  readonly #wide = new Map<bigint, number>();
-  readonly #wideOf = new Map<number, bigint>();
   constructor(memory: Charged) {
     this.#memory = memory;
-    memory.take(8 * 1024 + 8 * 1024);
+    this.#keys = memory.make(Float64Array, 1024);
+    this.#slotKeys = memory.make(Float64Array, 1024);
     this.#slots = new Slots(memory);
     this.#idColumns = new IdColumns(memory);
   }
@@ -208,9 +252,8 @@ class NumberKeys implements KeyColumn {
   #maybeGrow(): void {
     const slots = this.#slots;
     if (!slots.full(this.count)) return;
+    const slotKeys = this.#memory.make(Float64Array, 2 * slots.ids.length);
     slots.grow(this.#idColumns.hashes, this.count, this.#idColumns.outside);
-    const slotKeys = new Float64Array(slots.ids.length);
-    this.#memory.take(slotKeys.byteLength);
     this.#memory.give(this.#slotKeys.byteLength);
     const keys = this.#keys;
     const slotIds = slots.ids;
@@ -227,19 +270,9 @@ class NumberKeys implements KeyColumn {
     const constant = key.form === "constant";
     const validity = constant ? key.value.validity : key.validity;
     const codes = key.form === "dictionary" ? key.codes : null;
-    let numbers: ArrayLike<number> | null = null;
-    let bigs: BigInt64Array | null = null;
-    if (data.layout === "int64") {
-      if (data.values.repr === "safe") numbers = data.values.values;
-      else bigs = data.values.values;
-    } else if (
-      data.layout === "bool" ||
-      data.layout === "i32" ||
-      data.layout === "f32" ||
-      data.layout === "f64"
-    )
-      numbers = data.values;
-    else throw new TypeError(`number group keys over ${data.layout}`);
+    if (data.layout !== "bool" && data.layout !== "f32" && data.layout !== "f64")
+      throw new TypeError(`number group keys over ${data.layout}`);
+    const numbers: ArrayLike<number> = data.values;
     for (let k = 0; k < count; k++) {
       const i = rows[k] ?? 0;
       const validRow = constant ? 0 : i;
@@ -249,21 +282,7 @@ class NumberKeys implements KeyColumn {
         continue;
       }
       const slot = constant ? 0 : codes !== null ? (codes[i] ?? 0) : i;
-      let value: number;
-      if (bigs !== null) {
-        const big = bigs[slot] ?? 0n;
-        if (big > 9007199254740991n || big < -9007199254740991n) {
-          let id = this.#wide.get(big);
-          if (id === undefined) {
-            id = this.#newId(true);
-            this.#wide.set(big, id);
-            this.#wideOf.set(id, big);
-          }
-          ids[i] = id;
-          continue;
-        }
-        value = Number(big);
-      } else value = (numbers?.[slot] ?? 0) + 0; // −0 groups with 0
+      const value = (numbers[slot] ?? 0) + 0; // −0 groups with 0
       const nan = value !== value;
       const h = hashNumber(nan ? NaN : value);
       const slots = this.#slots;
@@ -297,59 +316,29 @@ class NumberKeys implements KeyColumn {
       ids[i] = id;
     }
   }
+  outputBytes(type: PhysicalType, _from: number, count: number): number {
+    return validityBytes(count) + (layoutOf(type) === "bool" ? 1 : 8) * count;
+  }
   emit(type: PhysicalType, from: number, count: number, ids: Int32Array | null): FlatVector {
     const validity = validityFromNull(this.#nullId, ids, from, count);
     const keys = this.#keys;
     const nullId = this.#nullId;
-    const values = new Float64Array(count);
+    const layout = layoutOf(type);
+    const values =
+      layout === "bool"
+        ? new Uint8Array(count)
+        : layout === "f32"
+          ? new Float32Array(count)
+          : new Float64Array(count);
     for (let k = 0; k < count; k++) {
       const id = ids === null ? from + k : (ids[k] ?? 0);
       values[k] = id === nullId ? 0 : (keys[id] ?? 0);
     }
-    const layout = layoutOf(type);
-    let data: VectorData;
-    if (layout === "int64") {
-      let wide = false;
-      if (this.#wideOf.size > 0)
-        for (let k = 0; k < count; k++)
-          if (this.#wideOf.has(ids === null ? from + k : (ids[k] ?? 0))) wide = true;
-      data = wide
-        ? {
-            layout,
-            values: {
-              repr: "int64",
-              values: BigInt64Array.from(
-                { length: count },
-                (_, k) =>
-                  this.#wideOf.get(ids === null ? from + k : (ids[k] ?? 0)) ??
-                  BigInt(values[k] ?? 0),
-              ),
-            },
-          }
-        : { layout, values: { repr: "safe", values } };
-    } else
-      data =
-        layout === "bool"
-          ? { layout, values: Uint8Array.from(values) }
-          : layout === "i32"
-            ? { layout, values: Int32Array.from(values) }
-            : layout === "f32"
-              ? { layout, values: Float32Array.from(values) }
-              : { layout: "f64", values };
-    return { form: "flat", type, length: count, validity, data };
+    return { form: "flat", type, length: count, validity, data: { layout, values } as VectorData };
   }
   close(): void {
-    this.#wide.clear();
-    this.#wideOf.clear();
+    // Charged memory is freed by the owner's Charged.
   }
-}
-
-/** A 32-bit integer's hash (Int32Keys). */
-function hashInt32(value: number): number {
-  let h = Math.imul(value, 0x9e3779b1);
-  h ^= h >>> 15;
-  h = Math.imul(h, 0x85ebca6b);
-  return h ^ (h >>> 13);
 }
 
 /**
@@ -359,20 +348,20 @@ function hashInt32(value: number): number {
 class Int32Keys implements KeyColumn {
   readonly #memory: Charged;
   /** Slot s holds the key at 2s and id + 1 at 2s + 1 (0: empty). */
-  #table: Int32Array = new Int32Array(2048);
+  #table: Int32Array;
   #mask = 1023;
   /** The key of each id (output). */
-  #keys: Int32Array = new Int32Array(1024);
+  #keys: Int32Array;
   count = 0;
   #nullId = -1;
   constructor(memory: Charged) {
     this.#memory = memory;
-    memory.take(4 * 2048 + 4 * 1024);
+    this.#table = memory.make(Int32Array, 2048);
+    this.#keys = memory.make(Int32Array, 1024);
   }
   #grow(): void {
     const size = 2 * (this.#mask + 1);
-    const table = new Int32Array(2 * size);
-    this.#memory.take(table.byteLength);
+    const table = this.#memory.make(Int32Array, 2 * size);
     this.#memory.give(this.#table.byteLength);
     const mask = size - 1;
     const keys = this.#keys;
@@ -433,6 +422,9 @@ class Int32Keys implements KeyColumn {
       ids[i] = id;
     }
   }
+  outputBytes(_type: PhysicalType, _from: number, count: number): number {
+    return validityBytes(count) + 4 * count;
+  }
   emit(type: PhysicalType, from: number, count: number, ids: Int32Array | null): FlatVector {
     const validity = validityFromNull(this.#nullId, ids, from, count);
     const keys = this.#keys;
@@ -447,12 +439,161 @@ class Int32Keys implements KeyColumn {
   }
 }
 
+/**
+ * 64-bit integer keys (int8, time, timestamp): one interleaved table of (low word, high word,
+ * id + 1) triples over the exact value, read from either representation (a safe f64 is split into
+ * its two's-complement words; a BigInt64Array is read through a Uint32Array view). The same value
+ * in either representation is the same key. No BigInt, no Map: every key is in charged arrays.
+ */
+class Int64Keys implements KeyColumn {
+  readonly #memory: Charged;
+  /** Slot s: low word at 3s, high word at 3s + 1, id + 1 at 3s + 2 (0: empty). */
+  #table: Int32Array;
+  #mask = 1023;
+  /** Each id's (low, high) words, for output and rehashing. */
+  #keys: Int32Array;
+  count = 0;
+  #nullId = -1;
+  constructor(memory: Charged) {
+    this.#memory = memory;
+    this.#table = memory.make(Int32Array, 3 * 1024);
+    this.#keys = memory.make(Int32Array, 2 * 1024);
+  }
+  #grow(): void {
+    const size = 2 * (this.#mask + 1);
+    const table = this.#memory.make(Int32Array, 3 * size);
+    this.#memory.give(this.#table.byteLength);
+    const mask = size - 1;
+    const keys = this.#keys;
+    for (let id = 0; id < this.count; id++) {
+      if (id === this.#nullId) continue;
+      const low = keys[2 * id] ?? 0;
+      const high = keys[2 * id + 1] ?? 0;
+      let s = hashWords(low, high) & mask;
+      while (table[3 * s + 2] !== 0) s = (s + 1) & mask;
+      table[3 * s] = low;
+      table[3 * s + 1] = high;
+      table[3 * s + 2] = id + 1;
+    }
+    this.#table = table;
+    this.#mask = mask;
+  }
+  #newId(): number {
+    const id = this.count++;
+    if (2 * id + 1 >= this.#keys.length)
+      this.#keys = this.#memory.int32(this.#keys, 2 * this.#keys.length);
+    return id;
+  }
+  #id(low: number, high: number): number {
+    const table = this.#table;
+    const mask = this.#mask;
+    let s = hashWords(low, high) & mask;
+    for (;;) {
+      const entry = table[3 * s + 2] ?? 0;
+      if (entry === 0) break;
+      if (table[3 * s] === low && table[3 * s + 1] === high) return entry - 1;
+      s = (s + 1) & mask;
+    }
+    const id = this.#newId();
+    this.#keys[2 * id] = low;
+    this.#keys[2 * id + 1] = high;
+    table[3 * s] = low;
+    table[3 * s + 1] = high;
+    table[3 * s + 2] = id + 1;
+    if (2 * this.count > mask + 1) this.#grow();
+    return id;
+  }
+  assign(key: Vector, length: number, selection: Selection | null, ids: Int32Array): void {
+    const rows = selection === null ? IDENTITY : selection.rows;
+    const count = selection === null ? length : selection.count;
+    const data = flatOf(key).data;
+    if (data.layout !== "int64") throw new TypeError(`int64 group keys over ${data.layout}`);
+    const constant = key.form === "constant";
+    const validity = constant ? key.value.validity : key.validity;
+    const codes = key.form === "dictionary" ? key.codes : null;
+    const safe = data.values.repr === "safe" ? data.values.values : null;
+    const words = data.values.repr === "int64" ? int64Words(data.values.values) : null;
+    for (let k = 0; k < count; k++) {
+      const i = rows[k] ?? 0;
+      const validRow = constant ? 0 : i;
+      if (validity !== null && ((validity[validRow >>> 5] ?? 0) & (1 << (validRow & 31))) === 0) {
+        if (this.#nullId < 0) this.#nullId = this.#newId();
+        ids[i] = this.#nullId;
+        continue;
+      }
+      const slot = constant ? 0 : codes !== null ? (codes[i] ?? 0) : i;
+      let low: number;
+      let high: number;
+      if (safe !== null) {
+        const v = safe[slot] ?? 0;
+        const h = Math.floor(v / TWO32);
+        low = (v - h * TWO32) | 0;
+        high = h | 0;
+      } else {
+        low = (words?.[2 * slot] ?? 0) | 0;
+        high = (words?.[2 * slot + 1] ?? 0) | 0;
+      }
+      ids[i] = this.#id(low, high);
+    }
+  }
+  outputBytes(_type: PhysicalType, _from: number, count: number): number {
+    return validityBytes(count) + 8 * count;
+  }
+  emit(type: PhysicalType, from: number, count: number, ids: Int32Array | null): FlatVector {
+    const validity = validityFromNull(this.#nullId, ids, from, count);
+    const keys = this.#keys;
+    const nullId = this.#nullId;
+    const at = (k: number) => (ids === null ? from + k : (ids[k] ?? 0));
+    const valueOf = (id: number) => (keys[2 * id + 1] ?? 0) * TWO32 + ((keys[2 * id] ?? 0) >>> 0);
+    let safe = true;
+    for (let k = 0; k < count; k++) {
+      const id = at(k);
+      if (id === nullId) continue;
+      const value = valueOf(id);
+      if (value > MAX_SAFE || value < -MAX_SAFE) safe = false;
+    }
+    if (safe) {
+      const values = new Float64Array(count);
+      for (let k = 0; k < count; k++) {
+        const id = at(k);
+        values[k] = id === nullId ? 0 : valueOf(id);
+      }
+      return {
+        form: "flat",
+        type,
+        length: count,
+        validity,
+        data: { layout: "int64", values: { repr: "safe", values } },
+      };
+    }
+    const values = new BigInt64Array(count);
+    const out = int64Words(values);
+    for (let k = 0; k < count; k++) {
+      const id = at(k);
+      if (id === nullId) continue;
+      out[2 * k] = keys[2 * id] ?? 0;
+      out[2 * k + 1] = keys[2 * id + 1] ?? 0;
+    }
+    return {
+      form: "flat",
+      type,
+      length: count,
+      validity,
+      data: { layout: "int64", values: { repr: "int64", values } },
+    };
+  }
+  close(): void {
+    // Charged memory is freed by the owner's Charged.
+  }
+}
+
 /** Bytes per id in one arena: id i is `bytes[starts[i] … starts[i + 1])`. */
 class ByteArena {
-  bytes: Uint8Array = new Uint8Array(0);
-  starts: Int32Array = new Int32Array(1025);
+  bytes: Uint8Array;
+  starts: Int32Array;
   constructor(readonly memory: Charged) {
-    memory.take(4 * 1025);
+    this.bytes = memory.make(Uint8Array, 0);
+    this.starts = memory.make(Int32Array, 1025);
   }
   append(id: number, source: Uint8Array, start: number, end: number): void {
     if (id + 2 > this.starts.length)
@@ -460,13 +601,14 @@ class ByteArena {
     const at = this.starts[id] ?? 0;
     const length = end - start;
     if (at + length > this.bytes.length) {
-      const next = new Uint8Array(Math.max(4096, 2 * this.bytes.length, at + length));
-      this.memory.take(next.byteLength);
+      const next = this.memory.make(Uint8Array, Math.max(4096, 2 * this.bytes.length, at + length));
       next.set(this.bytes.subarray(0, at));
       this.memory.give(this.bytes.byteLength);
       this.bytes = next;
     }
-    this.bytes.set(source.subarray(start, end), at);
+    const bytes = this.bytes;
+    if (length <= 64) for (let b = 0; b < length; b++) bytes[at + b] = source[start + b] ?? 0;
+    else bytes.set(source.subarray(start, end), at);
     this.starts[id + 1] = at + length;
   }
   equals(id: number, source: Uint8Array, start: number, end: number): boolean {
@@ -476,6 +618,16 @@ class ByteArena {
     const bytes = this.bytes;
     for (let b = 0; b < length; b++) if (bytes[at + b] !== source[start + b]) return false;
     return true;
+  }
+  /** Bytes of ids `from … from + count − 1` (or `ids[0 … count)`). */
+  span(from: number, count: number, ids: Int32Array | null): number {
+    if (ids === null) return (this.starts[from + count] ?? 0) - (this.starts[from] ?? 0);
+    let total = 0;
+    for (let k = 0; k < count; k++) {
+      const id = ids[k] ?? 0;
+      total += (this.starts[id + 1] ?? 0) - (this.starts[id] ?? 0);
+    }
+    return total;
   }
 }
 
@@ -488,8 +640,9 @@ class ByteKeys implements KeyColumn {
   count = 0;
   #nullId = -1;
   #dictionaryId = -1;
-  #translation: Int32Array = new Int32Array(0);
+  #translation: Int32Array;
   constructor(readonly memory: Charged) {
+    this.#translation = memory.make(Int32Array, 0);
     this.#slots = new Slots(memory);
     this.#arena = new ByteArena(memory);
     this.#idColumns = new IdColumns(memory);
@@ -582,6 +735,10 @@ class ByteKeys implements KeyColumn {
       ids[i] = this.#slotId(data, slot);
     }
   }
+  outputBytes(type: PhysicalType, from: number, count: number, ids: Int32Array | null): number {
+    if (layoutOf(type) === "fixed16") return validityBytes(count) + 16 * count;
+    return validityBytes(count) + this.#arena.span(from, count, ids) + 4 * (count + 1);
+  }
   emit(type: PhysicalType, from: number, count: number, ids: Int32Array | null): FlatVector {
     const validity = validityFromNull(this.#nullId, ids, from, count);
     const arena = this.#arena;
@@ -595,12 +752,7 @@ class ByteKeys implements KeyColumn {
       }
       return { form: "flat", type, length: count, validity, data: { layout: "fixed16", bytes } };
     }
-    let total = 0;
-    for (let k = 0; k < count; k++) {
-      const id = at(k);
-      total += (arena.starts[id + 1] ?? 0) - (arena.starts[id] ?? 0);
-    }
-    const bytes = new Uint8Array(total);
+    const bytes = new Uint8Array(arena.span(from, count, ids));
     const offsets = new Int32Array(count + 1);
     let o = 0;
     for (let k = 0; k < count; k++) {
@@ -679,6 +831,9 @@ class EncodedKeys implements KeyColumn {
     if (slots.full(this.count)) slots.grow(this.#idColumns.hashes, this.count, null);
     return id;
   }
+  outputBytes(_type: PhysicalType, from: number, count: number, ids: Int32Array | null): number {
+    return this.#values.outputBytes(ids, from, count);
+  }
   emit(_type: PhysicalType, from: number, count: number, ids: Int32Array | null): FlatVector {
     return this.#values.emitAt(ids, from, count);
   }
@@ -691,8 +846,8 @@ class EncodedKeys implements KeyColumn {
 function keyColumnFor(type: PhysicalType, memory: Charged): KeyColumn {
   const layout = layoutOf(type);
   if (layout === "i32") return new Int32Keys(memory);
-  if (layout === "bool" || layout === "f32" || layout === "f64" || layout === "int64")
-    return new NumberKeys(memory);
+  if (layout === "int64") return new Int64Keys(memory);
+  if (layout === "bool" || layout === "f32" || layout === "f64") return new NumberKeys(memory);
   if (
     (layout === "varlen" || layout === "fixed16") &&
     type.kind !== "json" &&
@@ -707,15 +862,16 @@ class TupleKeys {
   readonly #slots: Slots;
   /** Per key column: the value id of each group. */
   readonly columnIds: Int32Array[];
-  #hashes: Int32Array = new Int32Array(1024);
+  #hashes: Int32Array;
   count = 0;
   constructor(
     readonly width: number,
     readonly memory: Charged,
   ) {
-    memory.take(4 * 1024 * (width + 1));
+    this.#hashes = memory.make(Int32Array, 1024);
+    this.columnIds = [];
+    for (let c = 0; c < width; c++) this.columnIds.push(memory.make(Int32Array, 1024));
     this.#slots = new Slots(memory);
-    this.columnIds = Array.from({ length: width }, () => new Int32Array(1024));
   }
   assign(ids: readonly Int32Array[], rows: Uint16Array, count: number, gids: Int32Array): void {
     const width = this.width;
@@ -770,21 +926,29 @@ class TupleKeys {
 
 export class GroupTable {
   readonly #memory: Charged;
-  readonly #columns: KeyColumn[];
-  readonly #tuple: TupleKeys | null;
+  readonly #columns: KeyColumn[] = [];
+  readonly #tuple: TupleKeys | null = null;
   /** Per key column: this batch's value ids (several keys only). */
-  readonly #ids: Int32Array[];
+  readonly #ids: Int32Array[] = [];
 
+  /** Throws (having released everything it took) when a key column cannot be built. */
   constructor(
     readonly keyTypes: readonly PhysicalType[],
     charge: ByteCharge,
     capacity = 2048,
   ) {
     this.#memory = new Charged(charge);
-    this.#columns = keyTypes.map((type) => keyColumnFor(type, this.#memory));
-    this.#tuple = keyTypes.length > 1 ? new TupleKeys(keyTypes.length, this.#memory) : null;
-    if (this.#tuple !== null) this.#memory.take(4 * capacity * keyTypes.length);
-    this.#ids = this.#tuple === null ? [] : keyTypes.map(() => new Int32Array(capacity));
+    try {
+      for (const type of keyTypes) this.#columns.push(keyColumnFor(type, this.#memory));
+      if (keyTypes.length > 1) {
+        this.#tuple = new TupleKeys(keyTypes.length, this.#memory);
+        while (this.#ids.length < keyTypes.length)
+          this.#ids.push(this.#memory.make(Int32Array, capacity));
+      }
+    } catch (error) {
+      this.close();
+      throw error;
+    }
   }
 
   get groupCount(): number {
@@ -808,15 +972,29 @@ export class GroupTable {
     );
   }
 
-  /** Key column `c` of groups [from, from + count). */
-  emitKey(c: number, from: number, count: number): FlatVector {
+  #column(c: number): [KeyColumn, PhysicalType, Int32Array | null] {
     const column = this.#columns[c];
     const type = this.keyTypes[c];
     if (column === undefined || type === undefined)
       throw new RangeError(`No key column ${String(c)}`);
-    if (this.#tuple === null) return column.emit(type, from, count, null);
+    if (this.#tuple === null) return [column, type, null];
     const ids = this.#tuple.columnIds[c];
     if (ids === undefined) throw new RangeError(`No key column ${String(c)}`);
+    return [column, type, ids];
+  }
+
+  /** An upper bound of the bytes `emitKey(c, from, count)` allocates. */
+  keyBytes(c: number, from: number, count: number): number {
+    const [column, type, ids] = this.#column(c);
+    return ids === null
+      ? column.outputBytes(type, from, count, null)
+      : column.outputBytes(type, 0, count, ids.subarray(from, from + count));
+  }
+
+  /** Key column `c` of groups [from, from + count). */
+  emitKey(c: number, from: number, count: number): FlatVector {
+    const [column, type, ids] = this.#column(c);
+    if (ids === null) return column.emit(type, from, count, null);
     return column.emit(type, 0, count, ids.subarray(from, from + count));
   }
 

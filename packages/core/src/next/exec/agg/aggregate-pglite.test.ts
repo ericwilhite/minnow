@@ -11,6 +11,7 @@
 import { PGlite } from "@electric-sql/pglite";
 import fc from "fast-check";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createReach } from "../../../testing/reach.js";
 import { seedsFor } from "../../../testing/seeds.js";
 import type { AggregateCall, OutputColumn, ScalarExpr } from "../../ir/ir.js";
 import type { PhysicalType } from "../../types.js";
@@ -84,6 +85,28 @@ const numArb: fc.Arbitrary<Num> = fc.oneof(
     ),
   },
   {
+    // Near ±2^127 (the int128 tier) and past it (the wide tier). Positive ones at scale 0:
+    // two in one group pass 2^127 through the carry (aligned values that each fit 128 bits).
+    weight: 3,
+    arbitrary: fc.oneof(
+      fc.tuple(fc.bigInt({ min: 2n ** 126n, max: 2n ** 127n - 1n }), fc.constant(0)),
+      fc.tuple(
+        fc.oneof(
+          fc.bigInt({ min: 2n ** 126n, max: 2n ** 127n - 1n }).chain((v) => fc.constantFrom(v, -v)),
+          fc.constantFrom(
+            2n ** 127n - 1n,
+            -(2n ** 127n),
+            2n ** 127n,
+            -(2n ** 127n) - 1n,
+            2n ** 127n + 12345n,
+            -(2n ** 130n),
+          ),
+        ),
+        fc.integer({ min: 0, max: 2 }),
+      ),
+    ),
+  },
+  {
     // Few values at several scales (1.5, 1.50, 1.500): ties whose display scale differs.
     weight: 3,
     arbitrary: fc
@@ -107,11 +130,12 @@ const rowArb: fc.Arbitrary<Row> = fc.record({
     fc.bigInt({ min: 2n ** 51n, max: 2n ** 53n - 1n }).map((v) => (v % 3n === 0n ? -v : v)),
   ),
   f: fc.oneof(
-    { weight: 3, arbitrary: fc.constant(null) },
-    { weight: 6, arbitrary: fc.integer({ min: -1000, max: 1000 }).map((v) => v / 8) },
-    { weight: 1, arbitrary: fc.constantFrom(0, -0) },
-    { weight: 1, arbitrary: fc.constantFrom(NaN, Infinity, -Infinity) },
-    // Rare: finite values whose sum overflows (22003), alone or before an infinity.
+    { weight: 30, arbitrary: fc.constant(null) },
+    { weight: 60, arbitrary: fc.integer({ min: -1000, max: 1000 }).map((v) => v / 8) },
+    { weight: 10, arbitrary: fc.constantFrom(0, -0) },
+    { weight: 10, arbitrary: fc.constantFrom(NaN, Infinity, -Infinity) },
+    // Rare (about 30% of 40-row cases): finite values whose sum overflows (22003, which ends the
+    // whole query, so it must not hide the other aggregates in most cases).
     { weight: 1, arbitrary: fc.constantFrom(1e308, -1e308) },
   ),
   n: numArb,
@@ -131,6 +155,20 @@ function numText(value: Num): string {
   return `'${negative ? "-" : ""}${s === 0 ? digits : `${digits.slice(0, digits.length - s)}.${digits.slice(digits.length - s)}`}'`;
 }
 
+/** The narrowest coefficient tier that holds every value. */
+function tierOf(values: readonly Num[]): "safe" | "int128" | "wide" {
+  const magnitudes = values.map((v): bigint => {
+    if (!Array.isArray(v)) return 0n;
+    const c = (v as readonly [bigint, number])[0];
+    return c < 0n ? -c : c;
+  });
+  if (magnitudes.every((m) => m < 2n ** 53n)) return "safe";
+  return magnitudes.every((m) => m < 2n ** 127n) ? "int128" : "wide";
+}
+
+/** Tiers of the NUMERIC batches the last `batches` call built (declared reach). */
+const tiers = new Set<string>();
+
 /** The batches: rows split into batches of `split` rows; text as a dictionary when `encode`. */
 function batches(rows: readonly Row[], split: number, encode: boolean): Batch[] {
   const out: Batch[] = [];
@@ -146,7 +184,8 @@ function batches(rows: readonly Row[], split: number, encode: boolean): Batch[] 
     const wide = part.some(
       (r) => r.b !== null && (r.b > 2n ** 53n - 1n || r.b < -(2n ** 53n - 1n)),
     );
-    const nSafe = part.every((r) => !Array.isArray(r.n) || Math.abs(Number(r.n[0])) < 2 ** 53);
+    const nTier = tierOf(part.map((r) => r.n));
+    tiers.add(nTier);
     out.push({
       length: part.length,
       selection: null,
@@ -176,7 +215,7 @@ function batches(rows: readonly Row[], split: number, encode: boolean): Batch[] 
         decimals(
           D,
           part.map((r) => r.n),
-          nSafe ? "safe" : "int128",
+          nTier,
         ),
         decimals(
           D12,
@@ -413,6 +452,12 @@ describe("aggregation against PostgreSQL (PGlite, generated)", () => {
   it.each(SEEDS)(
     "every aggregate, grouped by int / text / none, any batching (seed %i)",
     async (seed) => {
+      const reach = createReach("next-aggregate-pglite", [
+        "int128 batch",
+        "wide batch",
+        "safe and int128 batches",
+        "NUMERIC sum past 2^127",
+      ] as const);
       await fc.assert(
         fc.asyncProperty(
           fc.array(rowArb, { minLength: 0, maxLength: 40 }),
@@ -420,6 +465,31 @@ describe("aggregation against PostgreSQL (PGlite, generated)", () => {
           fc.integer({ min: 1, max: 16 }),
           fc.boolean(),
           async (rows, key, split, encode) => {
+            reach.beginHistory();
+            tiers.clear();
+            batches(rows, split, encode);
+            if (tiers.has("int128")) reach.reach("int128 batch");
+            if (tiers.has("wide")) reach.reach("wide batch");
+            if (tiers.has("safe") && tiers.has("int128")) reach.reach("safe and int128 batches");
+            // A group's exact NUMERIC sum past 128 bits (PostgreSQL keeps it exact), and one that
+            // gets there from aligned values that each fit 128 bits (the carry overflow path).
+            const groups = new Map<string, Array<readonly [bigint, number]>>();
+            for (const r of rows)
+              if (Array.isArray(r.n)) {
+                const g =
+                  key === null
+                    ? ""
+                    : String((r as unknown as Record<string, unknown>)[COLUMN_SQL[key] ?? ""]);
+                groups.set(g, [...(groups.get(g) ?? []), r.n as readonly [bigint, number]]);
+              }
+            for (const values of groups.values()) {
+              const scale = Math.max(...values.map(([, s]) => s));
+              const aligned = values.map(([c, s]) => c * 10n ** BigInt(scale - s));
+              const sum = aligned.reduce((a, b) => a + b, 0n);
+              if (sum >= 2n ** 127n || sum < -(2n ** 127n)) {
+                reach.reach("NUMERIC sum past 2^127");
+              }
+            }
             await judge(rows, key, IN_ORDER, split, encode);
             await judge(rows, key, SORTED, split, encode);
             await judge(rows, key, FLOAT_SUM, split, encode);
@@ -427,6 +497,78 @@ describe("aggregation against PostgreSQL (PGlite, generated)", () => {
         ),
         { seed, numRuns: 120 },
       );
+      reach.assertReached();
+    },
+    180_000,
+  );
+
+  it.each(SEEDS)(
+    "NUMERIC SUM / AVG / MIN / MAX around ±2^127 at one scale, any batching (seed %i)",
+    async (seed) => {
+      const reach = createReach("next-aggregate-int128-boundary", [
+        "carry overflow from 128-bit values",
+        "sum back inside 128 bits after an overflow",
+        "safe and int128 batches",
+      ] as const);
+      const big = fc.bigInt({ min: 2n ** 125n, max: 2n ** 127n - 1n });
+      const value = fc.oneof(
+        { weight: 3, arbitrary: big },
+        { weight: 1, arbitrary: big.map((v) => -v) },
+        { weight: 2, arbitrary: fc.bigInt({ min: -1000n, max: 1000n }) },
+        { weight: 1, arbitrary: fc.constant(null) },
+      );
+      const cases = CASES.filter((c) =>
+        ["sum(n)", "avg(n)", "min(n)", "max(n)", "count(n)"].includes(c.sql),
+      );
+      await fc.assert(
+        fc.asyncProperty(
+          fc.array(fc.tuple(fc.integer({ min: 0, max: 2 }), value), {
+            minLength: 1,
+            maxLength: 24,
+          }),
+          fc.integer({ min: 0, max: 3 }),
+          fc.integer({ min: 1, max: 8 }),
+          fc.constantFrom(null, 0),
+          async (pairs, scale, split, key) => {
+            reach.beginHistory();
+            const rows: Row[] = pairs.map(([k, n]) => ({
+              k,
+              t: null,
+              i: null,
+              b: null,
+              f: null,
+              n: n === null ? null : ([n, scale] as const),
+              m: null,
+              flag: null,
+            }));
+            tiers.clear();
+            batches(rows, split, false);
+            if (tiers.has("safe") && tiers.has("int128")) reach.reach("safe and int128 batches");
+            const groups = new Map<number, bigint[]>();
+            for (const [k, n] of pairs)
+              if (n !== null) {
+                const g = key === null ? 0 : k;
+                groups.set(g, [...(groups.get(g) ?? []), n]);
+              }
+            for (const values of groups.values()) {
+              let running = 0n;
+              let overflowed = false;
+              for (const v of values) {
+                running += v;
+                if (running >= 2n ** 127n || running < -(2n ** 127n)) overflowed = true;
+              }
+              if (overflowed) {
+                if (running >= 2n ** 127n || running < -(2n ** 127n))
+                  reach.reach("carry overflow from 128-bit values");
+                else reach.reach("sum back inside 128 bits after an overflow");
+              }
+            }
+            await judge(rows, key, cases, split, false);
+          },
+        ),
+        { seed, numRuns: 80 },
+      );
+      reach.assertReached();
     },
     180_000,
   );

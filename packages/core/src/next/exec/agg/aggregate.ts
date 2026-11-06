@@ -5,12 +5,20 @@
  *   each aggregate evaluates its argument on its rows — after its FILTER, and through its DISTINCT
  *   set — and updates its accumulator (states.ts). Synchronous; nothing is retained from the
  *   batch (keys and values are copied into the state), so every push is `ready`.
- * - finish: emits the groups in first-seen order, in batches of up to `BATCH_ROWS` groups (key
- *   columns, then one column per aggregate), waiting on downstream readiness between batches, then
- *   finishes downstream. Without GROUP BY there is exactly one output row, even over no input
- *   (COUNT 0, other aggregates NULL); with GROUP BY, no input means no rows.
- * - Not compiled yet (`UnsupportedPlanError`): GROUPING SETS with more than one set, ordered
- *   aggregates (`orderBy`), and string_agg / array_agg / json_agg / percentiles / mode.
+ * - finish: emits the groups in first-seen order (key columns, then one column per aggregate),
+ *   then finishes downstream. Without GROUP BY there is exactly one output row, even over no
+ *   input (COUNT 0, other aggregates NULL); with GROUP BY, no input means no rows.
+ *   - Each output batch is at most `BATCH_ROWS` groups and about `BATCH_TARGET_BYTES` (the
+ *     columns' `outputBytes` bounds, halving the group count until it fits), and its bytes are
+ *     charged to the grant before any of its vectors is built. A batch is borrowed: its charge is
+ *     returned once downstream is done with it (`ready`, or after its `ready()` resolves).
+ *   - Output runs in slices: after `YIELD_INTERVAL_MS` of emitting (AVG's per-group division
+ *     included) it yields with a task (`yieldTask`), never a resolved Promise, so owner messages
+ *     and cancellation get through; an `abort` meanwhile ends it.
+ * - Not compiled yet (`UnsupportedPlanError`, construct `aggregate`): GROUPING SETS with more than
+ *   one set, ordered aggregates (`orderBy`), and string_agg / array_agg / json_agg / percentiles /
+ *   mode. These are refused before anything is allocated; any later failure while constructing
+ *   releases everything already taken.
  * - Memory: group table and states grow from the grant; a refused growth fails the query until
  *   partitioned aggregation spill (milestone 3).
  */
@@ -20,6 +28,7 @@ import type { PhysicalType } from "../../types.js";
 import type { ByteCharge } from "../../vector/varlen.js";
 import {
   BATCH_ROWS,
+  BATCH_TARGET_BYTES,
   type Batch,
   type FlatVector,
   type Selection,
@@ -29,7 +38,7 @@ import { UnsupportedPlanError } from "../errors.js";
 import { Predicate } from "../filter.js";
 import { compileExpr, type CompileContext } from "../kernels/compile.js";
 import { countIn, rowsIn, type Compiled } from "../kernels/vectors.js";
-import type { Operator, PushResult } from "../pipeline.js";
+import { YIELD_INTERVAL_MS, yieldTask, type Operator, type PushResult } from "../pipeline.js";
 import { DistinctSet } from "./distinct.js";
 import { GroupTable } from "./groups.js";
 import { accumulatorFor, type Accumulator } from "./states.js";
@@ -53,46 +62,24 @@ interface CompiledAggregate {
   readonly selection: Selection;
 }
 
-export class AggregateOperator implements Operator {
-  readonly #keys: readonly number[];
-  readonly #groups: GroupTable | null;
-  readonly #aggregates: readonly CompiledAggregate[];
-  readonly #gids: Int32Array;
-  readonly #keyVectors: Vector[];
-  readonly #charge: ByteCharge;
-  #emitted = 0;
-  #closed = false;
+/** Output pacing (tests inject a clock). */
+export interface AggregateOptions {
+  /** Synchronous emitting between task yields (default `YIELD_INTERVAL_MS`). */
+  readonly yieldIntervalMs?: number;
+  /** The clock in ms (default `performance.now`). */
+  readonly now?: () => number;
+  /** The output batch byte target (default `BATCH_TARGET_BYTES`). */
+  readonly targetBytes?: number;
+}
 
-  constructor(
-    rel: AggregateRel,
-    context: CompileContext,
-    charge: ByteCharge,
-    readonly downstream: Operator,
-  ) {
-    if (
-      rel.groupingSets !== null &&
-      !(rel.groupingSets.length === 1 && rel.groupingSets[0]?.length === rel.groupBy.length)
-    )
-      throw new UnsupportedPlanError("GROUPING SETS", { construct: "aggregate" });
-    this.#charge = charge;
-    this.#keys = rel.groupBy;
-    const keyTypes: PhysicalType[] = rel.groupBy.map((index) => {
-      const type = context.input[index];
-      if (type === undefined)
-        throw new RangeError(`Group key ${String(index)} is outside the input`);
-      return type;
-    });
-    this.#groups = keyTypes.length === 0 ? null : new GroupTable(keyTypes, charge);
-    const capacity = context.arena.capacity;
-    context.arena.take(4 * capacity);
-    this.#gids = new Int32Array(capacity);
-    this.#keyVectors = new Array<Vector>(keyTypes.length);
-    this.#aggregates = rel.aggregates.map((call) => this.#compile(call, context, capacity));
-    if (this.#groups === null)
-      for (const aggregate of this.#aggregates) aggregate.accumulator.grow(1);
-  }
-
-  #compile(call: AggregateCall, context: CompileContext, capacity: number): CompiledAggregate {
+/** Refuses what the operator cannot compile, before anything is allocated. */
+function preflight(rel: AggregateRel): void {
+  if (
+    rel.groupingSets !== null &&
+    !(rel.groupingSets.length === 1 && rel.groupingSets[0]?.length === rel.groupBy.length)
+  )
+    throw new UnsupportedPlanError("GROUPING SETS", { construct: "aggregate" });
+  for (const call of rel.aggregates) {
     if (UNSUPPORTED.has(call.fn))
       throw new UnsupportedPlanError(`the aggregate ${call.fn}`, { construct: "aggregate" });
     if (call.orderBy.length > 0)
@@ -101,18 +88,95 @@ export class AggregateOperator implements Operator {
       throw new UnsupportedPlanError(`${call.fn} with ${String(call.args.length)} arguments`, {
         construct: "aggregate",
       });
+  }
+}
+
+export class AggregateOperator implements Operator {
+  readonly #keys: readonly number[];
+  readonly #groups: GroupTable | null = null;
+  readonly #aggregates: CompiledAggregate[] = [];
+  readonly #gids: Int32Array = new Int32Array(0);
+  readonly #keyVectors: Vector[];
+  readonly #charge: ByteCharge;
+  readonly #interval: number;
+  readonly #now: () => number;
+  readonly #target: number;
+  /** Bytes the operator took from the arena (gids, selections), returned on a failed build. */
+  #arenaBytes = 0;
+  #emitted = 0;
+  /** The charged bytes of the output batch downstream still holds. */
+  #outputHeld = 0;
+  #closed = false;
+
+  /**
+   * Throws `UnsupportedPlanError` before allocating for a shape it cannot compile; any other
+   * failure while building releases what was already taken, then rethrows.
+   */
+  constructor(
+    rel: AggregateRel,
+    context: CompileContext,
+    charge: ByteCharge,
+    readonly downstream: Operator,
+    options: AggregateOptions = {},
+  ) {
+    preflight(rel);
+    this.#charge = charge;
+    this.#interval = options.yieldIntervalMs ?? YIELD_INTERVAL_MS;
+    this.#now = options.now ?? (() => performance.now());
+    this.#target = options.targetBytes ?? BATCH_TARGET_BYTES;
+    this.#keys = rel.groupBy;
+    const keyTypes: PhysicalType[] = rel.groupBy.map((index) => {
+      const type = context.input[index];
+      if (type === undefined)
+        throw new RangeError(`Group key ${String(index)} is outside the input`);
+      return type;
+    });
+    const capacity = context.arena.capacity;
+    this.#keyVectors = new Array<Vector>(keyTypes.length);
+    try {
+      this.#takeArena(context, 4 * capacity);
+      this.#gids = new Int32Array(capacity);
+      for (const call of rel.aggregates)
+        this.#aggregates.push(this.#compile(call, context, capacity));
+      this.#groups = keyTypes.length === 0 ? null : new GroupTable(keyTypes, charge);
+      if (this.#groups === null)
+        for (const aggregate of this.#aggregates) aggregate.accumulator.grow(1);
+    } catch (error) {
+      this.#close();
+      context.arena.give(this.#arenaBytes);
+      throw error;
+    }
+  }
+
+  #takeArena(context: CompileContext, bytes: number): void {
+    context.arena.take(bytes);
+    this.#arenaBytes += bytes;
+  }
+
+  #compile(call: AggregateCall, context: CompileContext, capacity: number): CompiledAggregate {
     const [arg] = call.args;
     const argument =
       call.fn === "count_star" || arg === undefined ? null : compileExpr(arg, context);
-    context.arena.take(2 * capacity);
-    return {
-      accumulator: accumulatorFor(call.fn, call.type, argument?.type ?? null, this.#charge),
-      argument,
-      filter: call.filter === null ? null : new Predicate(call.filter, context),
-      distinct:
+    const accumulator = accumulatorFor(call.fn, call.type, argument?.type ?? null, this.#charge);
+    let distinct: DistinctSet | null = null;
+    let filter: Predicate | null;
+    try {
+      filter = call.filter === null ? null : new Predicate(call.filter, context);
+      distinct =
         call.distinct && argument !== null
           ? new DistinctSet(argument.type, this.#charge, capacity)
-          : null,
+          : null;
+      this.#takeArena(context, 2 * capacity);
+    } catch (error) {
+      accumulator.close();
+      distinct?.close();
+      throw error;
+    }
+    return {
+      accumulator,
+      argument,
+      filter,
+      distinct,
       selection: { rows: new Uint16Array(capacity), count: 0 },
     };
   }
@@ -149,29 +213,83 @@ export class AggregateOperator implements Operator {
     return Promise.resolve();
   }
 
-  /** Emits every group, waiting on downstream readiness between output batches. */
+  /** An upper bound of the bytes the output batch of groups [from, from + count) allocates. */
+  #outputBytes(from: number, count: number): number {
+    let bytes = 0;
+    const groups = this.#groups;
+    if (groups !== null)
+      for (let c = 0; c < this.#keys.length; c++) bytes += groups.keyBytes(c, from, count);
+    for (const aggregate of this.#aggregates)
+      bytes += aggregate.accumulator.outputBytes(from, count);
+    return bytes;
+  }
+
+  /** Emits every group in charged, byte-bounded batches and paced slices (see the header). */
   finish(): MaybePromise<void> {
+    return this.#emit();
+  }
+
+  #emit(): MaybePromise<void> {
     const total = this.#groups === null ? 1 : this.#groups.groupCount;
+    const sliceStart = this.#now();
     while (this.#emitted < total) {
-      const count = Math.min(BATCH_ROWS, total - this.#emitted);
+      if (this.#closed) return undefined; // aborted while yielding
+      if (this.#now() - sliceStart >= this.#interval) return yieldTask().then(() => this.#emit());
+      let count = Math.min(BATCH_ROWS, total - this.#emitted);
+      let bytes = this.#outputBytes(this.#emitted, count);
+      while (count > 1 && bytes > this.#target) {
+        count = Math.max(1, Math.floor(count / 2));
+        bytes = this.#outputBytes(this.#emitted, count);
+      }
+      // Charge before building; a refusal halves the batch, down to one group.
+      while (!this.#charge.allocate(bytes)) {
+        if (count === 1)
+          throw new RangeError(
+            `A ${String(bytes)}-byte aggregate output batch was refused by its grant`,
+          );
+        count = Math.max(1, Math.floor(count / 2));
+        bytes = this.#outputBytes(this.#emitted, count);
+      }
+      this.#outputHeld = bytes;
       const columns: FlatVector[] = [];
-      const groups = this.#groups;
-      if (groups !== null)
-        for (let c = 0; c < this.#keys.length; c++)
-          columns.push(groups.emitKey(c, this.#emitted, count));
-      for (const aggregate of this.#aggregates)
-        columns.push(aggregate.accumulator.emit(this.#emitted, count));
+      try {
+        const groups = this.#groups;
+        if (groups !== null)
+          for (let c = 0; c < this.#keys.length; c++)
+            columns.push(groups.emitKey(c, this.#emitted, count));
+        for (const aggregate of this.#aggregates)
+          columns.push(aggregate.accumulator.emit(this.#emitted, count));
+      } catch (error) {
+        this.#releaseOutput();
+        throw error;
+      }
       this.#emitted += count;
       if (this.downstream.push({ length: count, columns, selection: null }) === "blocked")
-        return this.downstream.ready().then(() => this.finish());
+        return this.downstream.ready().then(
+          () => {
+            this.#releaseOutput();
+            return this.#emit();
+          },
+          (error: unknown) => {
+            this.#releaseOutput();
+            throw error;
+          },
+        );
+      this.#releaseOutput();
     }
     this.#close();
     return this.downstream.finish();
   }
 
+  #releaseOutput(): void {
+    if (this.#outputHeld > 0) this.#charge.free(this.#outputHeld);
+    this.#outputHeld = 0;
+  }
+
   #close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    this.#releaseOutput();
     this.#groups?.close();
     for (const aggregate of this.#aggregates) {
       aggregate.accumulator.close();

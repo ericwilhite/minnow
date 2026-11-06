@@ -576,24 +576,34 @@ and the owner import it directly.
 
 - `aggregate.ts`: the `aggregate` operator. Each batch maps its rows to dense group ids, then
   every aggregate (after its FILTER and DISTINCT) updates its state. `finish` emits groups in
-  first-seen order, 2,048 per batch, waiting on downstream readiness. Without GROUP BY there is
-  one row even over no input.
-- `groups.ts`: group ids from open-addressing tables chosen by key type — an interleaved
-  (key, id) table for 32-bit integers, an f64 table for other numbers (int8 past 2^53 in a side
-  map), xxHash32 over bytes for text (a dictionary column translated once per entry), key
-  encoding for NUMERIC and the rest, and an id tuple for several keys. SQL GROUP BY equality:
-  NULLs together, −0 = 0, NaN = NaN, NUMERIC by value.
+  first-seen order in batches of at most 2,048 groups and about 1 MiB, each charged to the grant
+  before it is built and released when downstream is done with it; it yields to the event loop
+  with a task every 4 ms (AVG's per-group division included) and stops when aborted. Without
+  GROUP BY there is one row even over no input.
+- `groups.ts`: group ids from open-addressing tables chosen by key type — interleaved
+  (key, id) tables for 32-bit and 64-bit integers (int8 by its two words, whatever its
+  representation: no BigInt, no Map), an f64 table for floats, xxHash32 over bytes for text (a
+  dictionary column translated once per entry), key encoding for NUMERIC and the rest, and an id
+  tuple for several keys. SQL GROUP BY equality: NULLs together, −0 = 0, NaN = NaN, NUMERIC by
+  value.
 - `states.ts`: struct-of-arrays state per aggregate, no object per group. Integer and NUMERIC
-  sums are exact (an f64 part within ±2^52 plus a 128-bit carry; no BigInt per row). A scalar
-  NUMERIC SUM over a declared precision ≤ 12 is fused: four accumulators, no per-row check.
-  Float SUM and AVG follow PostgreSQL's float8pl and float8_accum, including their 22003 rules.
-  MIN/MAX ties take the newer value, as PostgreSQL does (MIN(1.5, 1.50) is 1.50).
+  sums are exact at any size: an f64 part within ±2^52, a 128-bit carry, and past that an exact
+  BigInt offset per group that changes only when the carry overflows (or for inputs already
+  wider than 128 bits), never per row. A scalar NUMERIC SUM over a declared precision ≤ 12 is
+  fused: four accumulators, no per-row check. Float SUM and AVG follow PostgreSQL's float8pl and
+  float8_accum, including their 22003 rules. MIN/MAX ties take the newer value, as PostgreSQL
+  does (MIN(1.5, 1.50) is 1.50); int8 and NUMERIC comparisons use words and limbs.
+- `values.ts`: per-group values for MIN/MAX and NUMERIC keys: int8 and interval microseconds as
+  two words, NUMERIC as f64 or 128-bit limbs; only coefficients past 128 bits are BigInts,
+  charged at an estimated 64 bytes each.
 - `distinct.ts`: exact DISTINCT through value ids and a (group, value id) set.
-- Memory is charged to the grant before every growth; a refused growth fails the query until
-  partitioned spill (milestone 3). Not yet: GROUPING SETS, ordered-set and string/array/JSON
-  aggregates, NUMERIC sums past 128 bits (`UnsupportedPlanError`, construct `aggregate`).
-- `aggregate-pglite.test.ts` judges generated rows and batchings by PostgreSQL;
-  `groups.test.ts` checks the group tables against a model past several growths.
+- Memory: every typed array is charged before it is constructed, and a constructor that fails
+  releases what it took. A refused growth fails the query until partitioned spill (milestone 3).
+  Not yet: GROUPING SETS, ordered-set and string/array/JSON aggregates (`UnsupportedPlanError`,
+  construct `aggregate`, refused before anything is allocated).
+- `aggregate-pglite.test.ts` judges generated rows and batchings by PostgreSQL, including sums
+  across ±2^127, with declared reach; `groups.test.ts` checks the group tables against a model
+  past several growths; `review-1.test.ts` holds the review's probes.
   `scripts/next-agg-bench.mts` measures the shapes of measurements.md.
 
 ### Owner and client protocol (`owner/`)

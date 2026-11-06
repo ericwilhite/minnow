@@ -12,7 +12,10 @@
  * ## Exactness
  * - Integer and NUMERIC sums keep an f64 part within ±2^52 per group plus a 128-bit limb carry
  *   (limbs.ts): every addition is exact, and the per-row check is a predictable branch taken only
- *   when the f64 part would leave its range. No BigInt is created on these paths.
+ *   when the f64 part would leave its range. A carry overflow moves ±2^128 into an exact BigInt
+ *   offset for the group (`ExactSums`), so sums of any size are exact like PostgreSQL's; BigInts
+ *   appear only at those overflows, for inputs already wider than 128 bits, at emit per group,
+ *   and for a NUMERIC alignment past 128 bits.
  * - The fused scalar NUMERIC SUM: when the input's declared precision is ≤ 12 (|coefficient| <
  *   10^12, so one batch of 2,048 values sums below 2^51 exactly) and the batch is in the safe
  *   tier with one scale, a batch is summed with four independent accumulators and no per-row
@@ -44,10 +47,12 @@ import { numericDivide } from "../kernels/decimal-div.js";
 import {
   SCRATCH,
   addTo,
+  compare as compareLimbs,
   fitsInt64,
   int64Words,
   scaleUp,
   setInt64,
+  setBigInt,
   setNumber,
   storeInt64,
   toBigInt,
@@ -56,7 +61,7 @@ import {
 import { POW10, coefficientAt, scaleAt, specialAt, type DecimalData } from "../kernels/numeric.js";
 import { IDENTITY, flatOf } from "../kernels/vectors.js";
 import { Charged } from "./groups.js";
-import { GroupValues } from "./values.js";
+import { GroupValues, HUGE_BYTES } from "./values.js";
 
 export interface Accumulator {
   readonly type: PhysicalType;
@@ -69,6 +74,8 @@ export interface Accumulator {
     scalar: boolean,
   ): void;
   emit(from: number, count: number): FlatVector;
+  /** An upper bound of the bytes `emit(from, count)` allocates (charged before emitting). */
+  outputBytes(from: number, count: number): number;
   close(): void;
 }
 
@@ -141,6 +148,9 @@ function validAt(validity: Validity | null, row: number): boolean {
 }
 
 /** Validity of `present[from … from + count)` (1: has a value); null when every one has. */
+/** Bytes of a validity bitmap for `count` slots. */
+const validityBytes = (count: number): number => 4 * ((count + 31) >>> 5);
+
 function validityFrom(present: Uint8Array, from: number, count: number): Validity | null {
   let any = false;
   for (let k = 0; k < count; k++) if (present[from + k] === 0) any = true;
@@ -199,6 +209,9 @@ class CountAccumulator implements Accumulator {
   count(g: number): number {
     return this.#counts[g] ?? 0;
   }
+  outputBytes(_from: number, count: number): number {
+    return 8 * count;
+  }
   emit(from: number, count: number): FlatVector {
     return {
       form: "flat",
@@ -219,7 +232,15 @@ class CountAccumulator implements Accumulator {
 // ---------------------------------------------------------------------------------------------
 // Exact integer sums (SUM(int2/int4/int8), the sum inside AVG of integers)
 
-/** Per-group exact integer sum: f64 part within ±LIMIT plus a 128-bit carry. */
+const TWO128 = 1n << 128n;
+
+/**
+ * Per-group exact sum: an f64 part within ±LIMIT, plus a 128-bit limb carry, plus an exact BigInt
+ * offset for whatever does not fit 128 bits (created at the first such group, charged at
+ * `HUGE_BYTES` per group). A carry addition that overflows leaves the wrapped value in the carry
+ * and moves ±2^128 into the offset (both operands had that sign), so the offset is touched once per
+ * overflow, never per row; only inputs already past 128 bits add to it directly.
+ */
 class ExactSums {
   readonly #memory: Charged;
   sums: Float64Array = new Float64Array(0);
@@ -228,29 +249,53 @@ class ExactSums {
   has: Uint8Array = new Uint8Array(0);
   /** Groups whose carry is nonzero (so emit can pick the safe tier quickly). */
   carried = 0;
+  /** The offsets past 128 bits, or null while every total fits the carry. */
+  wide: bigint[] | null = null;
   constructor(charge: ByteCharge) {
     this.#memory = new Charged(charge);
   }
   grow(groups: number): void {
     if (groups <= this.sums.length) return;
+    const before = this.sums.length;
     const capacity = Math.max(groups, 2 * this.sums.length);
     this.sums = this.#memory.float64(this.sums, capacity);
     this.carry = this.#memory.uint32(this.carry, 4 * capacity);
     this.has = this.#memory.uint8(this.has, capacity);
+    if (this.wide !== null) {
+      this.#memory.take(HUGE_BYTES * (capacity - before));
+      this.wide.length = capacity;
+      this.wide.fill(0n, before);
+    }
+  }
+  #offsets(): bigint[] {
+    if (this.wide === null) {
+      this.#memory.take(HUGE_BYTES * this.sums.length);
+      this.wide = new Array<bigint>(this.sums.length).fill(0n);
+    }
+    return this.wide;
+  }
+  /** carry[g] += t[at] (128-bit), exact: an overflow moves ±2^128 into the offset. */
+  addCarry(g: number, t: Uint32Array, at: number): void {
+    if (!addTo(this.carry, g, this.carry, g, t, at, false)) {
+      const offsets = this.#offsets();
+      offsets[g] = (offsets[g] ?? 0n) + ((t[at * 4 + 3] ?? 0) >>> 31 === 1 ? -TWO128 : TWO128);
+    }
+    this.carried += 1;
+  }
+  /** Adds an exact value of any size (an input past 128 bits) to group g. */
+  addBig(g: number, value: bigint): void {
+    const offsets = this.#offsets();
+    offsets[g] = (offsets[g] ?? 0n) + value;
   }
   /** Moves `value` (exact, any magnitude up to 2^63) into group g's carry. */
   spill(g: number, value: number): void {
     setNumber(SCRATCH, 0, value);
-    if (!addTo(this.carry, g, this.carry, g, SCRATCH, 0, false))
-      throw new NumericOutOfRangeError("bigint out of range");
-    this.carried += 1;
+    this.addCarry(g, SCRATCH, 0);
   }
   /** Adds the int64 at `index` of `words` (int64Words) to group g's carry. */
   spillWords(g: number, words: Uint32Array, index: number): void {
     setInt64(SCRATCH, 0, words, index);
-    if (!addTo(this.carry, g, this.carry, g, SCRATCH, 0, false))
-      throw new NumericOutOfRangeError("bigint out of range");
-    this.carried += 1;
+    this.addCarry(g, SCRATCH, 0);
   }
   /** Adds a number value (exact integer, |v| ≤ 2^53) to group g. */
   add(g: number, v: number): void {
@@ -264,10 +309,35 @@ class ExactSums {
       this.sums[g] = v;
     } else this.sums[g] = s;
   }
-  /** Group g's sum into limbs slot `to` of `t`. */
-  total(g: number, t: Uint32Array, to: number): void {
+  /**
+   * Group g's sum into limb slot `to` of `t` when it fits 128 bits; false when it does not (read
+   * it with `big`).
+   */
+  total(g: number, t: Uint32Array, to: number): boolean {
+    if (this.wide !== null && this.wide[g] !== 0n) return false;
     setNumber(t, to, this.sums[g] ?? 0);
-    if (this.carried > 0) addTo(t, to, t, to, this.carry, g, false);
+    return this.carried === 0 || addTo(t, to, t, to, this.carry, g, false);
+  }
+  /** Group g's exact sum (per group, at emit or rescale: never per row). */
+  big(g: number): bigint {
+    return (
+      BigInt(this.sums[g] ?? 0) +
+      (this.carried > 0 ? toBigInt(this.carry, g) : 0n) +
+      (this.wide?.[g] ?? 0n)
+    );
+  }
+  /** Replaces group g's sum with `value` (exact, any size). */
+  set(g: number, value: bigint): void {
+    this.sums[g] = 0;
+    if (setBigInt(this.carry, g, value)) {
+      if (this.wide !== null) this.wide[g] = 0n;
+    } else {
+      // The low 128 bits (two's complement) in the carry, the rest in the offset.
+      const low = BigInt.asIntN(128, value);
+      setBigInt(this.carry, g, low);
+      this.#offsets()[g] = value - low;
+    }
+    this.carried += 1;
   }
   close(): void {
     this.#memory.close();
@@ -409,6 +479,10 @@ class IntegerSumAccumulator implements Accumulator {
     addIntegers(this.#sums, vector, gids, rows, count, scalar);
     this.#counts?.update(vector, gids, rows, count, scalar);
   }
+  outputBytes(_from: number, count: number): number {
+    // f64 or int64 coefficients, or 16 bytes of limbs, or BigInts past 128 bits; validity.
+    return validityBytes(count) + count * (this.#sums.wide === null ? 16 + 8 : HUGE_BYTES + 16);
+  }
   emit(from: number, count: number): FlatVector {
     const sums = this.#sums;
     const validity = validityFrom(sums.has, from, count);
@@ -417,8 +491,8 @@ class IntegerSumAccumulator implements Accumulator {
       for (let k = 0; k < count; k++) {
         const g = from + k;
         if (sums.has[g] !== 1) continue;
-        sums.total(g, SCRATCH, 4);
-        out[k] = toDouble(SCRATCH, 4) / this.#counts.count(g);
+        const total = sums.total(g, SCRATCH, 4) ? toDouble(SCRATCH, 4) : Number(sums.big(g));
+        out[k] = total / this.#counts.count(g);
       }
       return {
         form: "flat",
@@ -430,7 +504,7 @@ class IntegerSumAccumulator implements Accumulator {
     }
     // SUM(int2/int4) is int64; SUM(int8) is NUMERIC(·, 0) (exact past 2^63).
     const decimal = this.type.kind === "decimal";
-    if (sums.carried === 0) {
+    if (sums.carried === 0 && sums.wide === null) {
       const values = sums.sums.slice(from, from + count);
       return decimal
         ? {
@@ -456,11 +530,29 @@ class IntegerSumAccumulator implements Accumulator {
     }
     const limbs = new Uint32Array(4 * count);
     let fits = true;
+    let wide = false;
     for (let k = 0; k < count; k++) {
-      sums.total(from + k, limbs, k);
-      if (!fitsInt64(limbs, k)) fits = false;
+      if (!sums.total(from + k, limbs, k)) wide = true;
+      else if (!fitsInt64(limbs, k)) fits = false;
     }
-    if (!decimal && !fits) throw new NumericOutOfRangeError("bigint out of range");
+    if (!decimal && (wide || !fits)) throw new NumericOutOfRangeError("bigint out of range");
+    if (wide)
+      return {
+        form: "flat",
+        type: this.type,
+        length: count,
+        validity,
+        data: {
+          layout: "decimal",
+          scale: 0,
+          scales: null,
+          coefficients: {
+            repr: "wide",
+            values: Array.from({ length: count }, (_, k) => sums.big(from + k)),
+          },
+          specials: null,
+        },
+      };
     if (fits) {
       const big = new BigInt64Array(count);
       const words = int64Words(big);
@@ -714,6 +806,9 @@ class FloatSumAccumulator implements Accumulator {
       counts[g] = (counts[g] ?? 0) + 1;
     }
   }
+  outputBytes(_from: number, count: number): number {
+    return validityBytes(count) + 8 * count;
+  }
   emit(from: number, count: number): FlatVector {
     const present = new Uint8Array(count);
     for (let k = 0; k < count; k++) present[k] = (this.#counts[from + k] ?? 0) > 0 ? 1 : 0;
@@ -906,13 +1001,7 @@ class DecimalSumAccumulator implements Accumulator {
       counts[g] = (counts[g] ?? 0) + 1;
       const slot = slotAt(reader, i);
       if (words !== null) sums.spillWords(g, words, slot);
-      else if (coefficients.repr === "int128") {
-        if (!addTo(sums.carry, g, sums.carry, g, coefficients.limbs, slot, false))
-          throw new UnsupportedPlanError("a NUMERIC sum past 128 bits (wide sums come with M3)", {
-            construct: "aggregate",
-          });
-        sums.carried += 1;
-      }
+      else if (coefficients.repr === "int128") sums.addCarry(g, coefficients.limbs, slot);
     }
     return true;
   }
@@ -961,35 +1050,35 @@ class DecimalSumAccumulator implements Accumulator {
           continue;
         }
       }
-      // Exact: the coefficient as limbs, aligned, into the carry.
-      if (c.repr === "wide")
-        throw new UnsupportedPlanError(
-          "a NUMERIC sum over values past 128 bits (wide sums come with M3)",
-          { construct: "aggregate" },
-        );
+      // Exact: the coefficient as limbs, aligned, into the carry; past 128 bits as a BigInt.
+      if (c.repr === "wide") {
+        sums.addBig(g, (c.values[slot] ?? 0n) * 10n ** BigInt(shift));
+        continue;
+      }
       if (c.repr === "safe") setNumber(SCRATCH, 1, c.values[slot] ?? 0);
       else if (c.repr === "int64") setInt64(SCRATCH, 1, int64Words(c.values), slot);
       else SCRATCH.set(c.limbs.subarray(slot * 4, slot * 4 + 4), 4);
-      if (!scaleUp(SCRATCH, 1, shift) || !addTo(sums.carry, g, sums.carry, g, SCRATCH, 1, false))
-        throw new UnsupportedPlanError("a NUMERIC sum past 128 bits (wide sums come with M3)", {
-          construct: "aggregate",
-        });
-      sums.carried += 1;
+      if (scaleUp(SCRATCH, 1, shift)) sums.addCarry(g, SCRATCH, 1);
+      else sums.addBig(g, coefficientAt(data, slot) * 10n ** BigInt(shift));
     }
   }
   /** Raises group g's scale to `scale`, multiplying its sum exactly. */
   #rescale(g: number, scale: number): void {
     const sums = this.#sums;
     const d = scale - (this.#scales[g] ?? 0);
-    sums.total(g, SCRATCH, 2);
-    if (!scaleUp(SCRATCH, 2, d))
-      throw new UnsupportedPlanError("a NUMERIC sum past 128 bits (wide sums come with M3)", {
-        construct: "aggregate",
-      });
-    sums.sums[g] = 0;
-    sums.carry.set(SCRATCH.subarray(8, 12), g * 4);
-    sums.carried += 1;
+    if (sums.total(g, SCRATCH, 2) && scaleUp(SCRATCH, 2, d)) {
+      sums.sums[g] = 0;
+      sums.carry.set(SCRATCH.subarray(8, 12), g * 4);
+      sums.carried += 1;
+      if (sums.wide !== null) sums.wide[g] = 0n;
+    } else sums.set(g, sums.big(g) * 10n ** BigInt(d));
     this.#scales[g] = scale;
+  }
+  outputBytes(_from: number, count: number): number {
+    // Coefficients (16 bytes, or a BigInt each past 128 bits or for AVG), scales, specials,
+    // presence: an upper bound of what emit allocates.
+    const wide = this.average || this.#sums.wide !== null;
+    return validityBytes(count) + count * ((wide ? HUGE_BYTES : 16) + 16 + 2 + 1 + 1);
   }
   emit(from: number, count: number): FlatVector {
     const sums = this.#sums;
@@ -1009,16 +1098,22 @@ class DecimalSumAccumulator implements Accumulator {
     const scales = uniform === null ? this.#scales.slice(from, from + count) : null;
     if (this.average) return this.#average(from, count, validity, specials, uniform);
     let coefficients: DecimalData["coefficients"];
-    if (sums.carried === 0)
+    if (sums.carried === 0 && sums.wide === null)
       coefficients = { repr: "safe", values: sums.sums.slice(from, from + count) };
     else {
       const limbs = new Uint32Array(4 * count);
       let fits = true;
+      let wide = false;
       for (let k = 0; k < count; k++) {
-        sums.total(from + k, limbs, k);
-        if (!fitsInt64(limbs, k)) fits = false;
+        if (!sums.total(from + k, limbs, k)) wide = true;
+        else if (!fitsInt64(limbs, k)) fits = false;
       }
-      if (fits) {
+      if (wide)
+        coefficients = {
+          repr: "wide",
+          values: Array.from({ length: count }, (_, k) => sums.big(from + k)),
+        };
+      else if (fits) {
         const big = new BigInt64Array(count);
         const words = int64Words(big);
         for (let k = 0; k < count; k++) storeInt64(limbs, k, words, k);
@@ -1058,17 +1153,9 @@ class DecimalSumAccumulator implements Accumulator {
         continue;
       }
       if (((this.#flags[g] ?? 0) & HAS) === 0) continue;
-      sums.total(g, SCRATCH, 5);
       const scale = uniform ?? this.#scales[g] ?? 0;
       // Per group, once: BigInt here is O(groups), never O(rows).
-      const outcome = numericDivide(
-        0,
-        toBigInt(SCRATCH, 5),
-        scale,
-        0,
-        BigInt(this.#counts[g] ?? 1),
-        0,
-      );
+      const outcome = numericDivide(0, sums.big(g), scale, 0, BigInt(this.#counts[g] ?? 1), 0);
       coefficients[k] = outcome.coefficient;
       scales[k] = outcome.scale;
     }
@@ -1095,7 +1182,19 @@ class DecimalSumAccumulator implements Accumulator {
 // ---------------------------------------------------------------------------------------------
 // MIN / MAX
 
-/** −1, 0, 1 for stored entry g against slot `slot` of `flat` (same type). NaN is greatest. */
+/** −1, 0, 1 for a − b, two signed 64-bit values as (high signed, low unsigned) words. */
+function compareWords(ah: number, al: number, bh: number, bl: number): number {
+  if (ah !== bh) return ah < bh ? -1 : 1;
+  return al === bl ? 0 : al < bl ? -1 : 1;
+}
+
+const TWO32 = 4294967296;
+
+/**
+ * −1, 0, 1 for stored entry g against slot `slot` of `flat` (same type). NaN is greatest. int64
+ * compares 32-bit words and NUMERIC aligns scales in 128-bit limbs: no BigInt per row, except for
+ * a coefficient past 128 bits or an alignment that overflows 128 bits.
+ */
 function compareToStored(values: GroupValues, g: number, flat: FlatVector, slot: number): number {
   const data = flat.data;
   switch (data.layout) {
@@ -1110,17 +1209,18 @@ function compareToStored(values: GroupValues, g: number, flat: FlatVector, slot:
       return a < b ? -1 : a > b ? 1 : 0;
     }
     case "int64": {
-      if (!values.isWide(g) && data.values.repr === "safe") {
-        const a = values.number(g);
-        const b = data.values.values[slot] ?? 0;
-        return a < b ? -1 : a > b ? 1 : 0;
+      let bh: number;
+      let bl: number;
+      if (data.values.repr === "safe") {
+        const v = data.values.values[slot] ?? 0;
+        bh = Math.floor(v / TWO32);
+        bl = v - bh * TWO32;
+      } else {
+        const words = int64Words(data.values.values);
+        bl = words[slot * 2] ?? 0;
+        bh = (words[slot * 2 + 1] ?? 0) | 0;
       }
-      const a = values.big(g);
-      const b =
-        data.values.repr === "safe"
-          ? BigInt(data.values.values[slot] ?? 0)
-          : (data.values.values[slot] ?? 0n);
-      return a < b ? -1 : a > b ? 1 : 0;
+      return compareWords(values.high(g), values.low(g), bh, bl);
     }
     case "decimal": {
       const rank = (special: number) =>
@@ -1130,10 +1230,19 @@ function compareToStored(values: GroupValues, g: number, flat: FlatVector, slot:
       if (ra !== rb || ra !== 0) return ra < rb ? -1 : ra > rb ? 1 : 0;
       const sa = values.scale(g);
       const sb = scaleAt(data, slot);
-      if (!values.isWide(g) && data.coefficients.repr === "safe" && sa === sb) {
+      const c = data.coefficients;
+      if (sa === sb && values.isSafe(g) && c.repr === "safe") {
         const a = values.number(g);
-        const b = data.coefficients.values[slot] ?? 0;
+        const b = c.values[slot] ?? 0;
         return a < b ? -1 : a > b ? 1 : 0;
+      }
+      if (!values.isHuge(g) && c.repr !== "wide") {
+        values.loadCoefficient(g, SCRATCH, 6);
+        if (c.repr === "safe") setNumber(SCRATCH, 7, c.values[slot] ?? 0);
+        else if (c.repr === "int64") setInt64(SCRATCH, 7, int64Words(c.values), slot);
+        else SCRATCH.set(c.limbs.subarray(slot * 4, slot * 4 + 4), 28);
+        if (scaleUp(SCRATCH, 6, Math.max(0, sb - sa)) && scaleUp(SCRATCH, 7, Math.max(0, sa - sb)))
+          return compareLimbs(SCRATCH, 6, SCRATCH, 7);
       }
       let a = values.big(g);
       let b = coefficientAt(data, slot);
@@ -1220,6 +1329,9 @@ class MinMaxAccumulator implements Accumulator {
         // (MIN(1.5, 1.50) is 1.50; MIN(0, −0) is −0).
         values.set(g, vector, i);
     }
+  }
+  outputBytes(from: number, count: number): number {
+    return this.#values.outputBytes(null, from, count);
   }
   emit(from: number, count: number): FlatVector {
     return this.#values.emit(from, count);
@@ -1333,6 +1445,9 @@ class NumberMinMaxAccumulator implements Accumulator {
       }
     }
   }
+  outputBytes(_from: number, count: number): number {
+    return validityBytes(count) + 8 * count;
+  }
   emit(from: number, count: number): FlatVector {
     const validity = validityFrom(this.#has, from, count);
     const best = this.#best.subarray(from, from + count);
@@ -1438,6 +1553,9 @@ class BoolAccumulator implements Accumulator {
       state[g] = s === 0 ? v : this.and ? Math.min(s, v) : Math.max(s, v);
     }
   }
+  outputBytes(_from: number, count: number): number {
+    return validityBytes(count) + 2 * count;
+  }
   emit(from: number, count: number): FlatVector {
     const present = new Uint8Array(count);
     const out = new Uint8Array(count);
@@ -1497,6 +1615,9 @@ class SingleValueAccumulator implements Accumulator {
       this.#seen[g] = 1;
       this.#values.set(g, vector, i);
     }
+  }
+  outputBytes(from: number, count: number): number {
+    return this.#values.outputBytes(null, from, count);
   }
   emit(from: number, count: number): FlatVector {
     return this.#values.emit(from, count);
