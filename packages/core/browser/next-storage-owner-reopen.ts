@@ -18,6 +18,7 @@ import { Governor } from "../src/next/memory/governor.js";
 import { ScratchSpillService } from "../src/next/spill/scratch-spill.js";
 import { composeEngine } from "../src/next/owner/compose.js";
 import { startOwnerHost, type OwnerHost, type OwnerEngineFactory } from "../src/next/owner/host.js";
+import { OwnerPhaseMeter } from "./next-storage-owner-phase.js";
 import { ProtocolClient } from "../src/next/owner/client.js";
 import { createLowerer } from "../src/next/lower/create.js";
 import { StandinExecutor } from "../src/next/testing/owner-standins.js";
@@ -36,11 +37,6 @@ export interface OwnerPhase {
   wallMs: number;
   reads: ReadCounts;
 }
-const difference = (a: ReadCounts, b: ReadCounts): ReadCounts => ({
-  payloadBytes: b.payloadBytes - a.payloadBytes,
-  numericBytes: b.numericBytes - a.numericBytes,
-  reads: b.reads - a.reads,
-});
 const bytesOf = (value: unknown): number => {
   if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return value.byteLength;
   if (Array.isArray(value)) return value.reduce<number>((sum, item) => sum + bytesOf(item), 0);
@@ -152,23 +148,12 @@ async function backendFor(
 export async function openRealStorage(
   store: OwnerReopenStore,
   db: string,
-  phase: (phase: OwnerPhase) => Promise<void> = async () => undefined,
+  phase: (phase: OwnerPhase) => void | Promise<void> = () => undefined,
   started = performance.now(),
 ) {
   const counts: ReadCounts = { payloadBytes: 0, numericBytes: 0, reads: 0 };
-  let last = { ...counts };
-  let since = started;
-  const finish = async (name: OwnerReopenPhase) => {
-    const value = {
-      phase: name,
-      wallMs: performance.now() - since,
-      reads: difference(last, counts),
-    };
-    await phase(value); // CPU counter barrier only in the explicitly bracketed profiling run
-    since = performance.now();
-    last = { ...counts };
-    return value;
-  };
+  const meter = new OwnerPhaseMeter(counts, phase, () => performance.now(), started);
+  const finish = (name: OwnerReopenPhase) => meter.finish(name);
   const governor = new Governor(256 << 20);
   const backend = await backendFor(store, `b1-owner-data-${db}`, counts, governor);
   const lease = await backend.acquire({ timeoutMs: 30_000 });
@@ -222,7 +207,7 @@ export async function openRealStorage(
 export async function startMeasuredOwner(
   store: OwnerReopenStore,
   db: string,
-  phase: (phase: OwnerPhase) => Promise<void>,
+  phase: (phase: OwnerPhase) => void | Promise<void>,
   onReady: () => void = () => undefined,
 ) {
   const started = performance.now();
@@ -283,7 +268,8 @@ export async function startMeasuredOwner(
     },
   };
   const channel = new MessageChannel();
-  const announcement = { ready: false };
+  const announcement = { phase: null as Promise<OwnerPhase> | null };
+  const maintenanceAtReady: Partial<WritePathImpl["maintenance"]> = {};
   let host: OwnerHost | null = null;
   try {
     host = await startOwnerHost(
@@ -300,16 +286,18 @@ export async function startMeasuredOwner(
         locks: navigator.locks,
         post: (status) => {
           if (status.t === "minnow:ready") {
-            announcement.ready = true;
+            const storage = getOpened();
+            Object.assign(maintenanceAtReady, storage.path.maintenance);
+            announcement.phase = storage.finish("host"); // exact host-ready endpoint
             onReady();
           } else if (status.t === "minnow:failed") throw new Error(JSON.stringify(status.error));
         },
       },
     );
-    if (!announcement.ready) throw new Error("Owner did not announce ready");
+    if (announcement.phase === null) throw new Error("Owner did not announce ready");
     // TypeScript cannot see the asynchronous factory assignment.
     const storage = getOpened();
-    const hostPhase = await storage.finish("host");
+    const hostPhase = await announcement.phase;
     if (executor.prepared !== 0) throw new Error("The executor was used before owner ready");
     const rootGrant = await storage.governor.admit({
       label: "bench root metadata",
@@ -323,6 +311,7 @@ export async function startMeasuredOwner(
       root === null
         ? null
         : {
+            maintenanceAtReady,
             groups: root.tables.reduce((sum, table) => sum + table.groupCount, 0),
             staged: root.tables.reduce((sum, table) => sum + table.staged.length, 0),
             listPages: root.extentList.length,
@@ -369,7 +358,7 @@ export async function firstStatisticsCount(
   const untilClose = new Promise<void>((resolve) => {
     unlock = resolve;
   });
-  const lock = navigator.locks.request(client.livenessLock, async () => {
+  const lock = navigator.locks.request(client.livenessLock, { mode: "exclusive" }, async () => {
     locked();
     await untilClose;
   });

@@ -1,9 +1,25 @@
 /** Byte accounting uses stored ByteRecord/IndexEntry shapes, not just flat numeric values. */
 import "fake-indexeddb/auto";
 import { IDBFactory } from "fake-indexeddb";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { openIndexedDb } from "../src/next/storage/idb-like.js";
-import { countDatabase } from "./next-storage-owner-reopen.js";
+import {
+  countDatabase,
+  openRealStorage,
+  startMeasuredOwner,
+  firstStatisticsCount,
+  type OwnerPhase,
+} from "./next-storage-owner-reopen.js";
+import { FakeLockRegistry } from "../src/next/testing/fake-locks.js";
+import { SimDisk } from "../src/next/storage/sim-disk.js";
+import {
+  autocommit,
+  batch,
+  ints,
+  column,
+  tableInput,
+  INT,
+} from "../src/next/write/test-support.js";
 
 it("counts cloned record bytes and the numeric fields of persisted index entries separately", async () => {
   const raw = await openIndexedDb(new IDBFactory(), "owner-read-byte-accounting");
@@ -24,5 +40,119 @@ it("counts cloned record bytes and the numeric fields of persisted index entries
     expect(counts).toEqual({ payloadBytes: 32, numericBytes: 48, reads: 4 });
   } finally {
     raw.close();
+  }
+});
+
+import { OwnerPhaseMeter } from "./next-storage-owner-phase.js";
+
+it("keeps wall time and reads between synchronous wall-only checkpoints", async () => {
+  let now = 0;
+  const counts = { payloadBytes: 0, numericBytes: 0, reads: 0 };
+  const phases: unknown[] = [];
+  const meter = new OwnerPhaseMeter(
+    counts,
+    (value) => {
+      phases.push(value);
+    },
+    () => now,
+  );
+  now = 4;
+  counts.payloadBytes = 8;
+  counts.reads = 1;
+  const first = meter.finish("backend");
+  // A background continuation runs before the caller resumes from await finish().
+  now = 11;
+  counts.payloadBytes += 32;
+  counts.reads++;
+  await first;
+  const second = await meter.finish("space");
+  expect(second).toMatchObject({ wallMs: 7, reads: { payloadBytes: 32, reads: 1 } });
+  expect(phases).toHaveLength(2);
+});
+
+it("keeps reads arriving during a CPU-sampling wait without charging the wait to phase wall", async () => {
+  let now = 0;
+  const counts = { payloadBytes: 0, numericBytes: 0, reads: 0 };
+  let resume!: () => void;
+  const checkpoint = new Promise<void>((resolve) => {
+    resume = resolve;
+  });
+  const meter = new OwnerPhaseMeter(
+    counts,
+    (phase) => (phase.phase === "backend" ? checkpoint : undefined),
+    () => now,
+  );
+  now = 4;
+  counts.payloadBytes = 8;
+  const first = meter.finish("backend");
+  now = 100;
+  counts.payloadBytes += 32;
+  resume();
+  await first;
+  now = 107;
+  counts.payloadBytes += 16;
+  const second = await meter.finish("space");
+  expect(second).toMatchObject({ wallMs: 7, reads: { payloadBytes: 48 } });
+});
+
+it("captures ready in the real host callback and counts through the real recovered write path", async () => {
+  const locks = new FakeLockRegistry().context();
+  const disk = new SimDisk();
+  const directory = {
+    getFileHandle: async (name: string) => ({
+      createSyncAccessHandle: async () => disk.open(name, true),
+    }),
+  };
+  vi.stubGlobal("navigator", {
+    locks,
+    storage: { getDirectory: async () => ({ getDirectoryHandle: async () => directory }) },
+  });
+  let owner: Awaited<ReturnType<typeof startMeasuredOwner>> | null = null;
+  try {
+    const seed = await openRealStorage("opfs", "unit-ready-endpoint");
+    try {
+      await autocommit(seed.path, (statement) =>
+        statement.changeCatalog({
+          kind: "createTable",
+          table: tableInput("tiny", [column("id", INT, false)]),
+        }),
+      );
+      const table = seed.path.catalog.tableByName("tiny");
+      if (table === undefined) throw new Error("Missing test table");
+      await autocommit(seed.path, (statement) =>
+        statement.table(table.id).insert(batch(ints([1, 2, 3])), null),
+      );
+    } finally {
+      await seed.close();
+    }
+    const phases: OwnerPhase[] = [];
+    let readyCalls = 0;
+    owner = await startMeasuredOwner(
+      "opfs",
+      "unit-ready-endpoint",
+      (value) => {
+        phases.push(value);
+      },
+      () => {
+        readyCalls++;
+        expect(phases.at(-1)?.phase).toBe("host");
+      },
+    );
+    expect(readyCalls).toBe(1);
+    expect(owner.executor.prepared).toBe(0);
+    expect(owner.rootInfo?.maintenanceAtReady).toBeDefined();
+    expect((await firstStatisticsCount(owner, "tiny")).count).toBe("3");
+    expect(phases.map((value) => value.phase)).toEqual([
+      "backend",
+      "space",
+      "recovery",
+      "host",
+      "countSetup",
+      "count",
+    ]);
+  } finally {
+    await owner?.close();
+    vi.unstubAllGlobals();
+    locks.kill();
   }
 });

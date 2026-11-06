@@ -1,6 +1,6 @@
 /** Real S5/W5M owner-ready lane. See the bench comment in next-storage-owner-reopen.ts.
  * CPU samples bracket phases using /proc ticks (10 ms resolution on this host), and therefore
- * include IPC boundary work; wall-only samples never pause for the sampler. OS caches stay warm,
+ * include IPC boundary work; wall-only samples never pause for the sampler. OS caches are not explicitly dropped,
  * but every reopen uses a fresh dedicated worker and a fresh backend connection/real write path.
  */
 import { chromium, expect, test } from "@playwright/test";

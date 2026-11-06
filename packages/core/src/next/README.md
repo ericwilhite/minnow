@@ -1390,7 +1390,7 @@ and host overhead separately, plus page-observed host ready. Three separate CPU-
 samples report worker and browser-tree CPU ticks for those phases without charging the sampler's
 barrier wait to phase wall time. Returned OPFS bytes and IndexedDB cloned byte payloads are
 counted per phase, with numeric index/meta reads separate; native IndexedDB disk bytes are opaque.
-Build, module boot, metadata collection and cleanup are outside owner-ready. Disk caches stay warm.
+Build, module boot, metadata collection and cleanup are outside owner-ready. Disk caches are not dropped; residency is not verified.
 The reported first `SELECT count(*)` uses real lowering, owner/client protocol and frame delivery,
 but a statistics-only executor stand-in: it reads the real write path's row count, not table pages.
 Client connection/metadata overhead is reported separately. This is not integrated query execution.
@@ -1401,3 +1401,9 @@ later clock rebase can measure the same stored roots. The report includes actual
 list-page and native IndexedDB record counts rather than deriving them from row counts.
 `MINNOW_OWNER_REOPEN_SMOKE=1` caps each table at 1,000 rows to verify the harness only; those
 samples are labelled and never count as Gate A measurements.
+
+The host-ready endpoint is captured in the host’s actual ready callback. Phase counters capture
+before awaiting a CPU checkpoint, so reads arriving during that wait are kept in the next
+interval. Wall-only checkpoints are synchronous. Intervals after write-path open may include
+its background maintenance; they are not causal CPU/I/O attribution to the host or count query.
+The report includes write-path maintenance counters at ready and after the first count.

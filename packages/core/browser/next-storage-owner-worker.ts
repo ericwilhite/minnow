@@ -38,13 +38,13 @@ self.onmessage = (event: MessageEvent<OwnerBenchRequest | { ack: number }>) => {
         request.testRows,
       );
     const phases: OwnerPhase[] = [];
-    const phase = async (value: OwnerPhase) => {
+    const phase = (value: OwnerPhase) => {
       phases.push(value);
       if (request.cpu) {
         const id = ++next;
         const done = new Promise<void>((resolve) => barriers.set(id, resolve));
         self.postMessage({ phase: value, id });
-        await done;
+        return done;
       }
     };
     const owner = await startMeasuredOwner(request.store, request.db, phase, () =>
@@ -55,7 +55,13 @@ self.onmessage = (event: MessageEvent<OwnerBenchRequest | { ack: number }>) => {
         owner,
         request.dataset === "S5" ? "order_items" : "events_wide",
       );
-      return { phases, root: owner.rootInfo, count, preparedAtReady: 0 };
+      return {
+        phases,
+        root: owner.rootInfo,
+        count,
+        preparedAtReady: 0,
+        maintenanceAfterCount: { ...owner.storage.path.maintenance },
+      };
     } finally {
       await owner.close();
     }
