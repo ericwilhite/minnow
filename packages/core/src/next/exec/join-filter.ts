@@ -31,6 +31,7 @@ import type { ByteCharge } from "../vector/varlen.js";
 import type { Selection, Vector } from "../vector/vector.js";
 import { KeyLayout, KeyScratch, extractKeys, fmix32 } from "./join-keys.js";
 import type { ColumnStore } from "./column-store.js";
+import { Slice, runToEnd, type SlicedJob } from "./slices.js";
 
 export const BLOOM_BITS_PER_KEY = 12;
 export const DROP_AFTER_PROBES = 65_536;
@@ -113,6 +114,29 @@ export class JoinRuntimeFilter {
     charge: ByteCharge,
     capacity: number,
   ): JoinRuntimeFilter | null {
+    return runToEnd(
+      JoinRuntimeFilter.buildJob(
+        id,
+        store,
+        column,
+        nullSafe,
+        charge,
+        capacity,
+        new Slice(Infinity),
+      ),
+    );
+  }
+
+  /** `build` as a sliced job (R23.2): it yields when `slice` is due, checked per store chunk. */
+  static *buildJob(
+    id: number,
+    store: ColumnStore,
+    column: number,
+    nullSafe: boolean,
+    charge: ByteCharge,
+    capacity: number,
+    slice: Slice,
+  ): SlicedJob<JoinRuntimeFilter | null> {
     const type = store.types[column];
     if (type === undefined) throw new RangeError("No such build column");
     const layout = new KeyLayout([type], [false]);
@@ -137,7 +161,7 @@ export class JoinRuntimeFilter {
       unsafe: false,
       keys: 0,
     };
-    const visit = (each: (k: number) => void) => {
+    function* visit(each: (k: number) => void): SlicedJob<void> {
       for (let chunk = 0; chunk < store.chunkCount; chunk++) {
         const vector = store.chunk(column, chunk);
         const count = extractKeys([vector], null, 0, vector.length, scratch);
@@ -148,9 +172,10 @@ export class JoinRuntimeFilter {
           }
           each(k);
         }
+        if (slice.due()) yield;
       }
-    };
-    visit((k) => {
+    }
+    yield* visit((k) => {
       seen.keys++;
       if (!ordered) return;
       const value = valueOf(part, scratch, k);
@@ -200,7 +225,7 @@ export class JoinRuntimeFilter {
       filter.#bits = new Uint32Array(words);
       filter.#exactBase = min;
       const bits = filter.#bits;
-      visit((k) => {
+      yield* visit((k) => {
         const index = valueOf(part, scratch, k) - min;
         bits[index >>> 5] = (bits[index >>> 5] ?? 0) | (1 << (index & 31));
       });
@@ -209,7 +234,7 @@ export class JoinRuntimeFilter {
       filter.#blockShift = 32 - Math.log2(words / 8);
       const bits = filter.#bits;
       const shift = filter.#blockShift;
-      visit((k) => {
+      yield* visit((k) => {
         bloomInsert(bits, shift, scratch.hashes[k] ?? 0);
       });
     }

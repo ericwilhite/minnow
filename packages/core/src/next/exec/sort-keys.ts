@@ -26,7 +26,7 @@ import { int128At } from "../vector/int128.js";
 import { decodeUtf8, type ByteCharge } from "../vector/varlen.js";
 import type { FlatVector, Validity, Vector } from "../vector/vector.js";
 import { wordsOf } from "./column-store.js";
-import { yieldTask } from "./pipeline.js";
+import { SLICE_ROWS, type Slice } from "./slices.js";
 import {
   compareArrays,
   compareDecimals,
@@ -225,29 +225,6 @@ function identity(from: number, count: number): { rows: Uint16Array; count: numb
 }
 
 /**
- * The deadline of one slice of synchronous work (R16.4, R23.2): `due()` once `ms` have passed
- * since the slice began. Long loops check it per chunk of rows, never per element.
- */
-export class Slice {
-  #start: number;
-  constructor(
-    readonly ms: number,
-    readonly now: () => number = () => performance.now(),
-  ) {
-    this.#start = now();
-  }
-  due(): boolean {
-    return this.now() - this.#start >= this.ms;
-  }
-  reset(): void {
-    this.#start = this.now();
-  }
-}
-
-/** Rows a sliced loop runs between deadline checks. */
-export const SLICE_ROWS = 8192;
-
-/**
  * Sorts `ids` by `compare` (stably) in slices: blocks of 1,024 sorted directly, then bottom-up
  * merges through `temp` (at least `ids.length`, the caller's charged scratch), yielding when
  * `slice` is due (checked every `SLICE_ROWS` elements moved).
@@ -288,44 +265,6 @@ export function* mergeSortJob(
     to = swap;
   }
   if (from !== ids) ids.set(from);
-}
-
-/**
- * A sliced job: yields nothing when its slice is due, or a Promise it is blocked on (a
- * downstream's `ready()`, a progress loan).
- */
-export type SlicedJob<T> = Generator<Promise<void> | void, T, void>;
-
-/**
- * Runs a sliced job: synchronously while it neither blocks nor runs out of slice (the result,
- * no Promise). A due slice gets a task yield (`yieldTask`, never a resolved Promise) and a fresh
- * slice; a blocked job awaits its Promise. `between()` (the abort check) runs at every
- * resumption.
- */
-export function runSliced<T>(job: SlicedJob<T>, slice: Slice, between: () => void): T | Promise<T> {
-  let step = job.next();
-  if (step.done === true) return step.value;
-  return (async () => {
-    for (;;) {
-      const blocked = step.value;
-      if (blocked === undefined) {
-        await yieldTask();
-        slice.reset();
-      } else await blocked;
-      between();
-      step = job.next();
-      if (step.done === true) return step.value;
-    }
-  })();
-}
-
-/** Runs a job that never blocks to completion, synchronously (no deadline). */
-export function runToEnd<T>(job: SlicedJob<T>): T {
-  for (;;) {
-    const step = job.next();
-    if (step.done === true) return step.value;
-    if (step.value !== undefined) throw new Error("A synchronous sort job blocked");
-  }
 }
 
 // --- compare mode -------------------------------------------------------------------------

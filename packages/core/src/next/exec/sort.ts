@@ -72,15 +72,11 @@ import {
   mergeSortJob,
   needsOperands,
   operandBytes,
-  runSliced,
-  runToEnd,
-  Slice,
-  SLICE_ROWS,
   sortMode,
   type Operands,
-  type SlicedJob,
   type SortColumn,
 } from "./sort-keys.js";
+import { Slice, SLICE_ROWS, runSliced, runToEnd, type SlicedJob } from "./slices.js";
 import { PageWriter, SpillFiles, SpilledRun } from "./spill-pages.js";
 import { Charge, Pool, SpillIo } from "./spill-pool.js";
 

@@ -24,6 +24,7 @@ import type { Vector } from "../vector/vector.js";
 import { KeyBatch } from "../keys/key-encoding.js";
 import { KeyScratch, bytesEqual, extractKeys, levelHash, type KeyLayout } from "./join-keys.js";
 import type { ColumnStore } from "./column-store.js";
+import { Slice, runToEnd, type SlicedJob } from "./slices.js";
 
 const MAX_LOAD = 0.7;
 const DIRECT_LIMIT = 1 << 26;
@@ -109,9 +110,37 @@ export class JoinTable {
     scratch: KeyScratch,
     options: { readonly direct?: boolean } = {},
   ): JoinTable | null {
+    return runToEnd(
+      JoinTable.buildJob(
+        store,
+        keyColumns,
+        layout,
+        level,
+        charge,
+        scratch,
+        new Slice(Infinity),
+        options,
+      ),
+    );
+  }
+
+  /**
+   * `build` as a sliced job (R23.2): it yields when `slice` is due, checked after each store
+   * chunk (2,048 rows) of the key scan and the inserts. `scratch` is the operator's.
+   */
+  static *buildJob(
+    store: ColumnStore,
+    keyColumns: readonly number[],
+    layout: KeyLayout,
+    level: number,
+    charge: ByteCharge,
+    scratch: KeyScratch,
+    slice: Slice,
+    options: { readonly direct?: boolean } = {},
+  ): SlicedJob<JoinTable | null> {
     const rows = store.rows;
     if (options.direct !== false && layout.directable && level === 0) {
-      const direct = JoinTable.#tryDirect(store, keyColumns, layout, charge, scratch);
+      const direct = yield* JoinTable.#tryDirect(store, keyColumns, layout, charge, scratch, slice);
       if (direct !== undefined) return direct;
     }
     const kind = layout.family === "words" ? "words" : "bytes";
@@ -124,7 +153,7 @@ export class JoinTable {
     table.#mask = capacity - 1;
     table.#shift = 32 - Math.log2(capacity);
     table.#touch = capacity * table.#stride * 4 > TOUCH_BYTES;
-    if (!table.#insertAll(scratch)) {
+    if (!(yield* table.#insertAll(scratch, slice))) {
       table.close();
       return null;
     }
@@ -132,13 +161,14 @@ export class JoinTable {
   }
 
   /** Direct addressing when the key range is dense enough, null when refused, else undefined. */
-  static #tryDirect(
+  static *#tryDirect(
     store: ColumnStore,
     keyColumns: readonly number[],
     layout: KeyLayout,
     charge: ByteCharge,
     scratch: KeyScratch,
-  ): JoinTable | null | undefined {
+    slice: Slice,
+  ): SlicedJob<JoinTable | null | undefined> {
     const rows = store.rows;
     const wide = layout.parts[0] === "w2i";
     let min = Infinity;
@@ -156,6 +186,7 @@ export class JoinTable {
           if (value < min) min = value;
           if (value > max) max = value;
         }
+        if (slice.due()) yield;
       }
     else
       for (let k = 0; k < store.chunkCount; k++) {
@@ -175,6 +206,7 @@ export class JoinTable {
           if (value < min) min = value;
           if (value > max) max = value;
         }
+        if (slice.due()) yield;
       }
     if (min === Infinity) min = max = 0;
     const range = max - min + 1;
@@ -189,14 +221,14 @@ export class JoinTable {
     table.#heads = new Int32Array(range);
     table.#min = min;
     table.#range = range;
-    if (!table.#insertAll(scratch)) {
+    if (!(yield* table.#insertAll(scratch, slice))) {
       table.close();
       return null;
     }
     return table;
   }
 
-  #insertAll(scratch: KeyScratch): boolean {
+  *#insertAll(scratch: KeyScratch, slice: Slice): SlicedJob<boolean> {
     const store = this.#store;
     const column = this.#keyColumns[0] ?? 0;
     if (this.kind === "direct" && store.tier(column) === 0 && !store.hasNulls(column)) {
@@ -215,6 +247,7 @@ export class JoinTable {
         }
         this.inserted += vector.length;
         if (k === store.chunkCount - 1) return true;
+        if (slice.due()) yield;
       }
       if (store.chunkCount === 0) return true;
     }
@@ -225,6 +258,7 @@ export class JoinTable {
       if (done < count) return false;
       if (this.#layout.family === "enc" && !this.#keepEncoded(scratch.encoded, count)) return false;
       if (!this.#insertChunk(scratch, k * store.chunkRows, count)) return false;
+      if (slice.due()) yield;
     }
     return true;
   }

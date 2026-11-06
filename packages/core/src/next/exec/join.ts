@@ -94,7 +94,15 @@ import {
   type Selection,
   type Vector,
 } from "../vector/vector.js";
-import { isPromise, type Operator, type PushResult, type Transfer } from "./pipeline.js";
+import {
+  YIELD_INTERVAL_MS,
+  isPromise,
+  yieldTask,
+  type Operator,
+  type PushResult,
+  type Transfer,
+} from "./pipeline.js";
+import { Slice, SLICE_ROWS, runSliced, runToEnd, type SlicedJob } from "./slices.js";
 import { JoinRuntimeFilter, kindPublishes } from "./join-filter.js";
 import { KeyLayout, KeyScratch, bytesEqual, extractKeys, levelHash } from "./join-keys.js";
 import { PageWriter, SpillFiles, SpilledRun, type DecodedPage } from "./spill-pages.js";
@@ -328,6 +336,8 @@ class Shared {
   };
   downstream: Operator | null = null;
   aborted: unknown = undefined;
+  /** The slice of the current build, probe push or finish work (R23.2). */
+  readonly slice = new Slice(YIELD_INTERVAL_MS);
 
   constructor(
     readonly spec: HashJoinSpec,
@@ -421,6 +431,23 @@ class Shared {
         ? this.aborted
         : new Error("Aborted", { cause: this.aborted });
     this.context.signal?.throwIfAborted();
+  }
+
+  /** Runs a job on a fresh slice: task yields between slices, the abort check at each resumption. */
+  sliced<T>(job: SlicedJob<T>): MaybePromise<T> {
+    this.slice.reset();
+    return runSliced(job, this.slice, () => {
+      this.checkAborted();
+    });
+  }
+
+  /** Between async steps (pages, partitions, rows): a task yield and the abort check when due. */
+  pace(): Promise<void> | null {
+    if (!this.slice.due()) return null;
+    return yieldTask().then(() => {
+      this.checkAborted();
+      this.slice.reset();
+    });
   }
 
   /** Emits one output batch downstream (nothing for an empty one). */
@@ -798,24 +825,35 @@ class Level {
   endBuild(): MaybePromise<void> {
     this.shared.checkAborted();
     if (this.parts === null) {
-      if (this.buildTable()) return;
-      return this.#overflow().then(() => this.#endPartitionedBuild());
+      const built = this.shared.sliced(this.buildTableJob());
+      const after = (ok: boolean): MaybePromise<void> =>
+        ok ? undefined : this.#overflow().then(() => this.#endPartitionedBuild());
+      return isPromise(built) ? built.then(after) : after(built);
     }
     return this.#endPartitionedBuild();
   }
 
   /** Builds table, match flags and mark groups over the resident store; false if refused. */
   buildTable(charge: ByteCharge = this.charge): boolean {
+    return runToEnd(this.buildTableJob(charge, new Slice(Infinity)));
+  }
+
+  /** `buildTable` as a sliced job (R23.2). */
+  *buildTableJob(
+    charge: ByteCharge = this.charge,
+    slice: Slice = this.shared.slice,
+  ): SlicedJob<boolean> {
     const shared = this.shared;
     this.#dropTable();
     this.#tableCharge = charge;
-    const table = JoinTable.build(
+    const table = yield* JoinTable.buildJob(
       this.store,
       shared.spec.buildKeys,
       shared.layout,
       this.level,
       this.#tableCharge,
       shared.scratch,
+      slice,
       { direct: shared.context.direct !== false },
     );
     if (table === null) return false;
@@ -826,7 +864,7 @@ class Level {
       this.#extraBytes += this.store.rows;
       this.matched = new Uint8Array(this.store.rows);
     }
-    if (shared.kind === "mark" && !this.#buildGroups()) return this.#dropTable();
+    if (shared.kind === "mark" && !(yield* this.#buildGroups(slice))) return this.#dropTable();
     return true;
   }
 
@@ -845,7 +883,7 @@ class Level {
   }
 
   /** Mark join: T-null flags, the group table on C, a memo of group null counts. */
-  #buildGroups(): boolean {
+  *#buildGroups(slice: Slice): SlicedJob<boolean> {
     const shared = this.shared;
     const rows = this.store.rows;
     const bytes = rows * 5;
@@ -861,6 +899,7 @@ class Level {
       const base = k * this.store.chunkRows;
       for (let i = 0; i < count; i++)
         if (((shared.scratch.nulls[i] ?? 0) & tMask) !== 0) this.tNull[base + i] = 1;
+      if (slice.due()) yield;
     }
     if (shared.correlated === 0) return true;
     const cLayout = new KeyLayout(
@@ -874,13 +913,14 @@ class Level {
       allocate: () => true,
       free: () => undefined,
     });
-    const groups = JoinTable.build(
+    const groups = yield* JoinTable.buildJob(
       this.store,
       shared.spec.buildKeys.slice(0, shared.correlated),
       cLayout,
       this.level,
       this.#tableCharge,
       scratch,
+      slice,
       { direct: false },
     );
     if (groups === null) return false;
@@ -907,7 +947,7 @@ class Level {
         }
         parts.resident[p] = true;
       }
-    while (!this.buildTable()) {
+    while (!(await this.shared.sliced(this.buildTableJob()))) {
       // Drop the last resident partition until the table fits.
       let last = -1;
       for (let p = parts.fanout - 1; p >= 0 && last < 0; p--)
@@ -937,6 +977,8 @@ class Level {
     const shared = this.shared;
     for (let i = 0; i < run.pages.length; i++) {
       shared.checkAborted();
+      const paced = shared.pace();
+      if (paced !== null) await paced;
       const page = await shared.readPage(run, i);
       try {
         const { rows, columns } = await shared.decode(page, shared.spec.buildTypes);
@@ -1022,6 +1064,12 @@ class Prober {
       if (this.#phase === 9) return DONE;
       const step = this.#step();
       if (step !== DONE) return step;
+      // Between steps (each at most one output batch): a task yield once the slice is due;
+      // `continue` checks the signal when it resumes.
+      if (this.#phase !== 9 && this.shared.slice.due())
+        return yieldTask().then(() => {
+          this.shared.slice.reset();
+        });
     }
   }
 
@@ -1660,37 +1708,54 @@ export class HashJoin {
 
   /** @internal */
   finishBuild(): MaybePromise<void> {
-    const done = () => {
-      this.#built = true;
-      this.#publish();
-    };
+    const shared = this.#shared;
     let result: MaybePromise<void>;
     try {
+      shared.checkAborted();
+      shared.slice.reset();
       result = this.#level.endBuild();
     } catch (error) {
       this.#fail(error);
     }
+    // Then the runtime filters, sliced too; the probe may start once they are published.
+    const publish = (): MaybePromise<void> => {
+      const published = shared.sliced(this.#publishJob());
+      if (!isPromise(published)) {
+        this.#built = true;
+        return;
+      }
+      return published.then(
+        () => {
+          this.#built = true;
+        },
+        (error: unknown) => this.#fail(error),
+      );
+    };
     if (!isPromise(result)) {
-      done();
-      return;
+      try {
+        return publish();
+      } catch (error) {
+        this.#fail(error);
+      }
     }
-    return result.then(done, (error: unknown) => this.#fail(error));
+    return result.then(publish, (error: unknown) => this.#fail(error));
   }
 
-  #publish(): void {
+  *#publishJob(): SlicedJob<void> {
     const level = this.#level;
     if (level.parts !== null || this.spec.publishes.length === 0) return;
     const filters: JoinRuntimeFilter[] = [];
     for (const { id, key } of this.spec.publishes) {
       const column = this.spec.buildKeys[key];
       if (column === undefined) throw new RangeError("Runtime filter key out of range");
-      const filter = JoinRuntimeFilter.build(
+      const filter = yield* JoinRuntimeFilter.buildJob(
         id,
         level.store,
         column,
         this.spec.nullSafe[key] === true,
         this.#shared.charge,
         BATCH_ROWS,
+        this.#shared.slice,
       );
       if (filter !== null) filters.push(filter);
     }
@@ -1701,6 +1766,8 @@ export class HashJoin {
   pushProbe(batch: Batch): PushResult {
     if (!this.#built) throw new TypeError("The join's build has not finished");
     this.#shared.checkAborted();
+    // Each probe push may run one slice before it yields (R23.2).
+    this.#shared.slice.reset();
     this.#prober.start(batch, this.#level, null);
     let step: Step;
     try {
@@ -1719,6 +1786,12 @@ export class HashJoin {
     const level = this.#level;
     const downstream = shared.downstream;
     if (downstream === null) throw new TypeError("The join's probe has no downstream");
+    try {
+      shared.checkAborted();
+    } catch (error) {
+      this.#fail(error);
+    }
+    shared.slice.reset();
     if (level.parts === null && level.matched === null) {
       this.#release();
       return downstream.finish();
@@ -1745,6 +1818,8 @@ export class HashJoin {
     if (parts === null) return;
     for (let p = 0; p < parts.fanout; p++) {
       shared.checkAborted();
+      const paced = shared.pace();
+      if (paced !== null) await paced;
       const build = parts.build[p];
       const probe = parts.probe[p];
       if (build === undefined || probe === undefined || parts.resident[p] === true) continue;
@@ -1776,6 +1851,8 @@ export class HashJoin {
     const sub = new Level(shared, level, true);
     try {
       for (let i = 0; i < build.pages.length; i++) {
+        const paced = shared.pace();
+        if (paced !== null) await paced;
         const page = await shared.readPage(build, i);
         try {
           const { rows, columns } = await shared.decode(page, this.spec.buildTypes);
@@ -1797,6 +1874,8 @@ export class HashJoin {
     const shared = this.#shared;
     let ordinal = 0;
     for (let i = 0; i < probe.pages.length; i++) {
+      const paced = shared.pace();
+      if (paced !== null) await paced;
       const page = await shared.readPage(probe, i);
       try {
         const { rows, columns } = await shared.decode(page, this.spec.probeTypes);
@@ -1857,6 +1936,8 @@ export class HashJoin {
         try {
           let reserved = false;
           while (page < build.pages.length) {
+            const paced = shared.pace();
+            if (paced !== null) await paced;
             const bytes = await shared.readPage(build, page);
             let full = false;
             let retry = 0;
@@ -1893,7 +1974,7 @@ export class HashJoin {
             if (full) break;
           }
           // The chunk's table; give rows back (halving) while it does not fit.
-          while (!sub.buildTable()) {
+          while (!(await shared.sliced(sub.buildTableJob()))) {
             if (sub.store.rows <= 1)
               throw new RangeError("A join chunk table could not be allocated for one row");
             let drop = sub.store.rows >> 1;
@@ -1931,6 +2012,8 @@ export class HashJoin {
     const kind = this.spec.kind;
     let ordinal = 0;
     for (let i = 0; i < probe.pages.length; i++) {
+      const paced = shared.pace();
+      if (paced !== null) await paced;
       const page = await shared.readPage(probe, i);
       try {
         const { rows, columns } = await shared.decode(page, this.spec.probeTypes);
@@ -1970,7 +2053,10 @@ export class HashJoin {
                   selection: out,
                 };
         }
-        if (shared.emit(batch) === BLOCKED) await shared.waitDownstream();
+        if (shared.emit(batch) === BLOCKED) {
+          await shared.waitDownstream();
+          shared.checkAborted();
+        }
         ordinal += rows;
       } finally {
         shared.releasePage(page);
@@ -2002,13 +2088,21 @@ export class HashJoin {
           ...shared.probeNulls.map((vector) => withLength(vector, taken)),
           ...shared.buildOut.vectors(),
         ];
-        if (shared.emit({ length: taken, columns, selection: null }) === BLOCKED)
+        if (shared.emit({ length: taken, columns, selection: null }) === BLOCKED) {
           await shared.waitDownstream();
+          shared.checkAborted();
+        }
         at += taken;
+        const paced = shared.pace();
+        if (paced !== null) await paced;
       }
       n = 0;
     };
     for (let row = 0; row < store.rows; row++) {
+      if ((row & (SLICE_ROWS - 1)) === SLICE_ROWS - 1) {
+        const paced = shared.pace();
+        if (paced !== null) await paced;
+      }
       if (matched[row] === 1) continue;
       ids[n++] = row;
       if (n === BATCH_ROWS) await flush();
