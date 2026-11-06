@@ -123,6 +123,9 @@ export interface WindowProfile {
 }
 
 const POOL_BYTES = 1024 * 1024;
+/** Charged bytes of one bigint array slot (the slot and a heap BigInt). */
+const BIGINT_BYTES = 40;
+const MAX_SAFE = 9007199254740991n;
 const RANKING: ReadonlySet<string> = new Set([
   "row_number",
   "rank",
@@ -444,6 +447,8 @@ class Evaluator implements Operator {
   #partChanged = new Uint8Array(BATCH_ROWS);
   #peerChanged = new Uint8Array(BATCH_ROWS);
   #scratch: Scratch | null = null;
+  /** Bytes charged for the partition's bigint arrays (exact int64 past 2^53). */
+  #bigBytes = 0;
   #scratchBytes = 0;
   #newGroupBytes = 0;
   readonly #outputs: Output[];
@@ -830,8 +835,9 @@ class Evaluator implements Operator {
     // Partition and peer boundaries for the whole batch, column by column (row 0 against the
     // last row taken).
     if (count > this.#partChanged.length) {
-      if (!this.charge.allocate(2 * (count - this.#partChanged.length)))
+      if (!this.charge.allocate(2 * count))
         throw new RangeError("Window boundary flags could not be allocated");
+      this.charge.free(2 * this.#partChanged.length);
       this.#partChanged = new Uint8Array(count);
       this.#peerChanged = new Uint8Array(count);
     }
@@ -872,11 +878,13 @@ class Evaluator implements Operator {
     if (this.#streaming) return;
     if (i >= this.#newGroup.length) {
       const size = Math.max(4096, this.#newGroup.length * 2, i + 1);
-      if (!this.charge.allocate(size - this.#newGroupBytes))
+      // Charged in full while the old flags are copied (governor rule 4), then the old freed.
+      if (!this.charge.allocate(size))
         throw new RangeError("Window peer flags could not be allocated");
       const grown = new Uint8Array(size);
       grown.set(this.#newGroup);
       this.#newGroup = grown;
+      this.charge.free(this.#newGroupBytes);
       this.#newGroupBytes = size;
     }
     this.#newGroup[i] = value;
@@ -1077,6 +1085,23 @@ class Evaluator implements Operator {
     }
     const peers = scratch.peers;
     fillPeers(peers, this.#newGroup, n);
+    // Exact int64 arguments past 2^53 keep bigint arrays (the argument, and per function a
+    // prefix and a result): charged before they exist (review B7-p2d-1 #5).
+    const wide = this.#wideArgs();
+    if (wide > 0) {
+      const bytes = n * BIGINT_BYTES * (wide + 2 * this.spec.functions.length);
+      if (!this.charge.allocate(bytes)) {
+        if (this.#loan !== null)
+          throw new RangeError("A window partition's exact values do not fit");
+        yield this.grant.borrow(bytes, this.context.signal).then((loan) => {
+          this.#loan = loan;
+          this.profile.loans++;
+        });
+        if (!this.charge.allocate(bytes))
+          throw new RangeError("A window partition's exact values could not be held");
+      }
+      this.#bigBytes = bytes;
+    }
     const args = this.#extract(scratch, n);
     yield* this.#compute(scratch, args, n);
     yield* this.#emit(scratch, n);
@@ -1135,22 +1160,47 @@ class Evaluator implements Operator {
     if (current !== null && current.capacity >= n) return current;
     const capacity = Math.max(n, 2 * (current?.capacity ?? 1024));
     const bytes = Scratch.bytes(capacity, this.spec.functions.length, this.#argColumns.length);
-    if (!this.charge.allocate(bytes - this.#scratchBytes)) {
+    // The new scratch is charged in full while the old one is live (governor rule 4), then
+    // the old one's charge goes (review B7-p2d-1 #5).
+    if (!this.charge.allocate(bytes)) {
       if (this.#canStream) return null;
       if (this.#loan !== null) throw new RangeError("A window partition's scratch does not fit");
-      yield this.grant.borrow(bytes - this.#scratchBytes, this.context.signal).then((loan) => {
+      yield this.grant.borrow(bytes, this.context.signal).then((loan) => {
         this.#loan = loan;
         this.profile.loans++;
       });
-      if (!this.charge.allocate(bytes - this.#scratchBytes))
+      if (!this.charge.allocate(bytes))
         throw new RangeError("A window partition's scratch could not be held");
     }
-    this.#scratchBytes = bytes;
     this.#scratch = new Scratch(capacity, this.spec.functions.length, this.#argColumns.length);
+    this.charge.free(this.#scratchBytes);
+    this.#scratchBytes = bytes;
     return this.#scratch;
   }
 
   /** The argument columns as numbers (and bigints for int64 past 2^53). */
+  /** Argument columns holding an int64 past 2^53 (their bigint arrays, `#extract`). */
+  #wideArgs(): number {
+    const store = this.#args;
+    let wide = 0;
+    for (let a = 0; a < this.#argColumns.length; a++)
+      for (let k = 0; k < store.chunkCount; k++) {
+        const data = store.chunk(a, k).data;
+        if (data.layout !== "int64" || data.values.repr !== "int64") continue;
+        const values = data.values.values;
+        let found = false;
+        for (let i = 0; i < values.length && !found; i++) {
+          const v = values[i] ?? 0n;
+          found = v > MAX_SAFE || v < -MAX_SAFE;
+        }
+        if (found) {
+          wide++;
+          break;
+        }
+      }
+    return wide;
+  }
+
   #extract(scratch: Scratch, n: number): NumberArg[] {
     const store = this.#args;
     return this.#argColumns.map((_, a) => {
@@ -1237,6 +1287,7 @@ class Evaluator implements Operator {
       key = {
         values: arg.values,
         valid: arg.valid,
+        big: arg.big,
         descending: first.direction === "desc",
         nullsFirst: first.nulls === "first",
       };
@@ -1511,6 +1562,8 @@ class Evaluator implements Operator {
 
   /** Empties the partition (held rows, run, arguments, sources) and repays a loan. */
   *#reset(): SlicedJob<void> {
+    if (this.#bigBytes > 0) this.charge.free(this.#bigBytes);
+    this.#bigBytes = 0;
     // Multi-chunk stores: truncate frees every chunk (reset is for one-chunk stores).
     this.#held.truncate(0);
     this.#args.truncate(0);
@@ -1561,6 +1614,8 @@ class Evaluator implements Operator {
     this.#staged = null;
     if (this.#scratchBytes > 0) this.charge.free(this.#scratchBytes);
     if (this.#newGroupBytes > 0) this.charge.free(this.#newGroupBytes);
+    if (this.#bigBytes > 0) this.charge.free(this.#bigBytes);
+    this.#bigBytes = 0;
     this.charge.free(this.spec.functions.length * BATCH_ROWS * 32 + 2 * this.#partChanged.length);
     this.#scratchBytes = 0;
     this.#newGroupBytes = 0;

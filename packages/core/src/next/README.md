@@ -824,6 +824,11 @@ and the owner import it directly.
   - for a non-NULL row, RANGE offsets treat NULL keys as below every value (NULLS FIRST) or
     above every value (NULLS LAST).
 - Float sums add a frame's members in order, as PostgreSQL does; exact sums use prefix sums.
+- int8 values stay exact past 2^53 on both paths, as bigints where a double would round:
+  sums, MIN/MAX, and RANGE keys and their offsets (RANGE over int8 compares exactly). COUNT
+  counts non-NULL rows only. Bigint state is charged (40 bytes a value), and every growing
+  array is charged in full before the old one is freed (governor rule 4).
+- lag and lead accept negative offsets (lead(x, −k) looks back), resident and streamed.
 - A partition is held in memory and evaluated over typed arrays while the grant holds it, up
   to `streamRows` (4,194,304) rows.
 - A larger partition, or one the grant cannot hold, streams from its spilled pages. Memory is

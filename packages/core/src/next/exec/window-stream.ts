@@ -117,6 +117,15 @@ interface CallState {
   nullValue?: Vector;
   readonly frame: Frame;
   readonly exact: boolean;
+  /** SUM / AVG keep cumulative sums; COUNT only counts (review B7-p2d-1 #1). */
+  readonly sums: boolean;
+  /** MIN / MAX keep extremes, exactly (bigints) once an int64 value passes 2^53 (#2). */
+  readonly extremes: boolean;
+  /** Exact argument values and running extremes by ring row, once a value passes 2^53. */
+  vBig: bigint[] | null;
+  extremeBig: bigint[] | null;
+  runExtremeBig: bigint | null;
+  totalExtremeBig: bigint | null;
   /** Ring arrays: argument value, validity, cumulative sum / count through the row, running extreme. */
   v: Float64Array;
   ok: Uint8Array;
@@ -169,6 +178,13 @@ export interface StreamHost {
 }
 
 const SAFE = 9007199254740991;
+/** Charged bytes of one bigint ring slot (the array slot and a heap BigInt). */
+const BIGINT_BYTES = 40;
+
+/** An int64 value past 2^53 (its double rounds: only its bigint is exact). */
+function wide(x: { value: number; big: bigint | null }): boolean {
+  return x.big !== null && (x.value > SAFE || x.value < -SAFE);
+}
 
 function numberAt(vector: Vector, row: number): { ok: boolean; value: number; big: bigint | null } {
   const flat =
@@ -221,6 +237,12 @@ export class PartitionStream {
   #groups = 0;
   #key = new Float64Array(0);
   #keyOk = new Uint8Array(0);
+  /** Exact RANGE keys by ring row, once a key passes 2^53 (else null). */
+  #keyBig: bigint[] | null = null;
+  /** Whether a call has a RANGE frame (its offsets compare the first key). */
+  readonly #ranged: boolean;
+  /** Bigint ring arrays live (each charged BIGINT_BYTES a ring slot). */
+  #bigArrays = 0;
   readonly #prev: ColumnStore;
   #prevVectors: Vector[] = [];
   /** The current page's peer changes (`markChanges`), charged as it grows. */
@@ -234,6 +256,7 @@ export class PartitionStream {
     readonly host: StreamHost,
   ) {
     this.#ordered = spec.orderBy.length > 0;
+    this.#ranged = spec.functions.some((call) => call.frame?.unit === "range");
     this.#orderColumns = spec.orderBy.map((key) => key.column);
     this.#prev = new ColumnStore(
       this.#orderColumns.map((c) => spec.types[c] ?? { kind: "int32", bits: 32 }),
@@ -248,6 +271,12 @@ export class PartitionStream {
         call,
         frame: effective(call, this.#ordered),
         exact: call.fn === "count" || call.fn === "count_star" || integral(type),
+        sums: call.fn === "sum" || call.fn === "avg",
+        extremes: call.fn === "min" || call.fn === "max",
+        vBig: null,
+        extremeBig: null,
+        runExtremeBig: null,
+        totalExtremeBig: null,
         v: new Float64Array(0),
         ok: new Uint8Array(0),
         sum: new Float64Array(0),
@@ -338,19 +367,29 @@ export class PartitionStream {
               const x = numberAt(vector, r);
               if (!x.ok) continue;
               state.totalCount++;
-              if (state.exact) {
+              if (state.sums) {
                 if (
-                  state.totalBig !== null ||
-                  x.big !== null ||
-                  Math.abs(state.totalSum + x.value) > SAFE
+                  state.exact &&
+                  (state.totalBig !== null ||
+                    x.big !== null ||
+                    Math.abs(state.totalSum + x.value) > SAFE)
                 ) {
                   state.totalBig =
                     (state.totalBig ?? BigInt(state.totalSum)) + (x.big ?? BigInt(x.value));
                 } else state.totalSum += x.value;
-              } else state.totalSum += x.value;
-              if (!state.totalSeen || better(x.value, state.totalExtreme, state.call.fn === "max"))
-                state.totalExtreme = x.value;
-              state.totalSeen = true;
+              }
+              if (state.extremes) {
+                const max = state.call.fn === "max";
+                if (state.totalExtremeBig !== null || wide(x)) {
+                  const v = x.big ?? BigInt(x.value);
+                  const best =
+                    state.totalExtremeBig ?? (state.totalSeen ? BigInt(state.totalExtreme) : null);
+                  state.totalExtremeBig = best === null || (max ? v > best : v < best) ? v : best;
+                  state.totalExtreme = Number(state.totalExtremeBig);
+                } else if (!state.totalSeen || better(x.value, state.totalExtreme, max))
+                  state.totalExtreme = x.value;
+                state.totalSeen = true;
+              }
             }
           }
           if (state.last !== null && arg !== null && page.rows > 0) {
@@ -415,12 +454,14 @@ export class PartitionStream {
       return;
     }
     const capacity = Math.max(1024, this.#capacity * 2);
-    const perRow = 4 + 9 + this.#calls.length * (8 + 1 + 8 + 8 + 8);
-    const bytes = capacity * perRow;
-    if (!this.host.charge.allocate(bytes - this.#ringBytes))
+    const bytes = capacity * this.#perRow();
+    // The new arrays are charged in full while the old ones are still live (governor rule 4:
+    // the overlap), and the old charge goes once they are copied (review B7-p2d-1 #5).
+    if (!this.host.charge.allocate(bytes))
       throw new RangeError(
         `A window frame's rows do not fit the grant (rows ${String(this.#base)}…${String(this.#read)} kept from ${String(keep)}; next ${String(this.#next)} ready ${String(this.#next < this.#read && this.#ready(this.#next))} bounds ${this.#next < this.#read ? this.#calls.map((c) => JSON.stringify(this.#bounds(c, this.#next))).join(" ") : "-"}; ${this.#calls.map((c) => c.call.fn + (c.call.frame === null ? "" : " " + c.frame.unit + " " + c.frame.start.kind + ".." + c.frame.end.kind)).join(", ")})`,
       );
+    const old = this.#ringBytes;
     this.#ringBytes = bytes;
     const grow = <T extends Float64Array | Int32Array | Uint8Array>(
       old: T,
@@ -441,6 +482,37 @@ export class PartitionStream {
       s.extreme = grow(s.extreme, (n) => new Float64Array(n));
     }
     this.#capacity = capacity;
+    this.host.charge.free(old);
+  }
+
+  /** Ring bytes a row: the typed arrays, and each live bigint array's slot (BIGINT_BYTES). */
+  #perRow(): number {
+    return 4 + 9 + this.#calls.length * (8 + 1 + 8 + 8 + 8) + this.#bigArrays * BIGINT_BYTES;
+  }
+
+  /**
+   * A bigint ring array goes live (exact sums, extremes or RANGE keys): its slots are charged
+   * for the ring's capacity now, and with every ring growth after.
+   */
+  #chargeBig(): void {
+    const bytes = Math.max(this.#capacity, 1024) * BIGINT_BYTES;
+    if (!this.host.charge.allocate(bytes))
+      throw new RangeError("A window frame's exact (bigint) values do not fit the grant");
+    this.#ringBytes += bytes;
+    this.#bigArrays++;
+  }
+
+  /** MIN / MAX: exact values and extremes from ring row `at` on (earlier ones were safe). */
+  #widen(s: CallState, at: number): void {
+    this.#chargeBig();
+    this.#chargeBig();
+    s.vBig = [];
+    s.extremeBig = [];
+    for (let k = 0; k < at; k++) {
+      s.vBig.push(s.ok[k] === 1 ? BigInt(s.v[k] ?? 0) : 0n);
+      s.extremeBig.push((s.count[k] ?? 0) > 0 ? BigInt(s.extreme[k] ?? 0) : 0n);
+    }
+    if (s.runSeen) s.runExtremeBig = BigInt(s.runExtreme);
   }
 
   #slide(drop: number): void {
@@ -456,7 +528,10 @@ export class PartitionStream {
       move(s.count);
       move(s.extreme);
       if (s.big !== null) s.big.splice(0, drop);
+      s.vBig?.splice(0, drop);
+      s.extremeBig?.splice(0, drop);
     }
+    this.#keyBig?.splice(0, drop);
     this.#base += drop;
   }
 
@@ -467,8 +542,9 @@ export class PartitionStream {
     if (this.#orderColumns.length === 0) return;
     if (page.rows > this.#changed.length) {
       const size = Math.max(page.rows, 2 * this.#changed.length, 512);
-      if (!this.host.charge.allocate(size - this.#changed.length))
+      if (!this.host.charge.allocate(size))
         throw new RangeError("A window stream's peer flags could not be allocated");
+      this.host.charge.free(this.#changed.length);
       this.#changed = new Uint8Array(size);
     }
     this.#changed.fill(0, 0, page.rows);
@@ -517,6 +593,13 @@ export class PartitionStream {
       );
       this.#key[at] = key.value;
       this.#keyOk[at] = key.ok ? 1 : 0;
+      // A RANGE key past 2^53 keeps its exact value (review B7-p2d-1 #3).
+      if (this.#keyBig === null && key.ok && wide(key) && this.#ranged) {
+        this.#chargeBig();
+        this.#keyBig = [];
+        for (let k = 0; k < at; k++) this.#keyBig.push(BigInt(this.#key[k] ?? 0));
+      }
+      if (this.#keyBig !== null) this.#keyBig[at] = key.ok ? (key.big ?? BigInt(key.value)) : 0n;
     }
     for (const s of this.#calls) {
       const arg = s.call.arg;
@@ -533,26 +616,39 @@ export class PartitionStream {
       const x = numberAt(columns[arg] ?? nullConstant(s.call.type, 1), r);
       s.v[at] = x.value;
       s.ok[at] = x.ok ? 1 : 0;
+      if (s.extremes && s.vBig === null && x.ok && wide(x)) this.#widen(s, at);
+      if (s.vBig !== null) s.vBig[at] = x.ok ? (x.big ?? BigInt(x.value)) : 0n;
       if (x.ok) {
         s.runCount++;
-        if (
-          s.exact &&
-          (s.runBig !== null || x.big !== null || Math.abs(s.runSum + x.value) > SAFE)
-        ) {
-          if (s.big === null) {
-            s.big = [];
-            for (let k = 0; k < at; k++) s.big.push(BigInt(s.sum[k] ?? 0));
-          }
-          s.runBig = (s.runBig ?? BigInt(s.runSum)) + (x.big ?? BigInt(x.value));
-        } else s.runSum += x.value;
-        if (!s.runSeen || better(x.value, s.runExtreme, s.call.fn === "max"))
-          s.runExtreme = x.value;
-        s.runSeen = true;
+        if (s.sums) {
+          if (
+            s.exact &&
+            (s.runBig !== null || x.big !== null || Math.abs(s.runSum + x.value) > SAFE)
+          ) {
+            if (s.big === null) {
+              this.#chargeBig();
+              s.big = [];
+              for (let k = 0; k < at; k++) s.big.push(BigInt(s.sum[k] ?? 0));
+            }
+            s.runBig = (s.runBig ?? BigInt(s.runSum)) + (x.big ?? BigInt(x.value));
+          } else s.runSum += x.value;
+        }
+        if (s.extremes) {
+          const max = s.call.fn === "max";
+          if (s.vBig !== null) {
+            const v = s.vBig[at] ?? 0n;
+            const best = s.runExtremeBig;
+            s.runExtremeBig = best === null || (max ? v > best : v < best) ? v : best;
+            s.runExtreme = Number(s.runExtremeBig);
+          } else if (!s.runSeen || better(x.value, s.runExtreme, max)) s.runExtreme = x.value;
+          s.runSeen = true;
+        }
       }
       s.sum[at] = s.runSum;
       if (s.big !== null) s.big[at] = s.runBig ?? BigInt(s.runSum);
       s.count[at] = s.runCount;
       s.extreme[at] = s.runSeen ? s.runExtreme : Number.NaN;
+      if (s.extremeBig !== null) s.extremeBig[at] = s.runExtremeBig ?? 0n;
     }
     this.#read++;
   }
@@ -640,6 +736,7 @@ export class PartitionStream {
   #rangeBound(i: number, delta: number, end: boolean, ps: number, pe: number): number | null {
     const at = i - this.#base;
     if (this.#keyOk[at] !== 1) return end ? (pe < 0 ? null : pe) : ps;
+    if (this.#keyBig !== null) return this.#rangeBoundExact(i, delta, end);
     const dir = this.spec.orderBy[0]?.direction === "desc" ? -1 : 1;
     const target = (this.#key[at] ?? 0) * dir + delta;
     // NULL keys sort below (NULLS FIRST) or above (NULLS LAST) every value (PostgreSQL).
@@ -667,6 +764,47 @@ export class PartitionStream {
     }
     let j = i;
     while (j < this.#read && (!okAt(j) || keyAt(j) < target)) j++;
+    if (j >= this.#read) return this.#ended ? this.#total() : null;
+    return j;
+  }
+
+  /**
+   * `#rangeBound` over exact int64 keys (a key passed 2^53): the same walks, in bigints, the
+   * offset applied exactly (review B7-p2d-1 #3). NULL keys are below or above every value.
+   */
+  #rangeBoundExact(i: number, delta: number, end: boolean): number | null {
+    const keys = this.#keyBig;
+    if (keys === null) return null;
+    if (!Number.isInteger(delta))
+      throw new RangeError("A RANGE offset over int8 keys is an integer");
+    const dir = this.spec.orderBy[0]?.direction === "desc" ? -1n : 1n;
+    const target = (keys[i - this.#base] ?? 0n) * dir + BigInt(delta);
+    const nullLow = this.spec.orderBy[0]?.nulls === "first";
+    // −1, 0, 1: row j's key (along the direction) against the target.
+    const cmp = (j: number): number => {
+      if (this.#keyOk[j - this.#base] !== 1) return nullLow ? -1 : 1;
+      const v = (keys[j - this.#base] ?? 0n) * dir;
+      return v < target ? -1 : v > target ? 1 : 0;
+    };
+    const okAt = (j: number) => j >= this.#base;
+    if (end) {
+      if (delta >= 0) {
+        let j = i;
+        while (j + 1 < this.#read && okAt(j + 1) && cmp(j + 1) <= 0) j++;
+        if (j + 1 >= this.#read && !this.#ended) return null;
+        return j;
+      }
+      let j = i;
+      while (j >= this.#base && (!okAt(j) || cmp(j) > 0)) j--;
+      return j < this.#base ? this.#base - 1 : j;
+    }
+    if (delta <= 0) {
+      let j = i;
+      while (j - 1 >= this.#base && okAt(j - 1) && cmp(j - 1) >= 0) j--;
+      return j;
+    }
+    let j = i;
+    while (j < this.#read && (!okAt(j) || cmp(j) < 0)) j++;
     if (j >= this.#read) return this.#ended ? this.#total() : null;
     return j;
   }
@@ -751,13 +889,14 @@ export class PartitionStream {
     const ps = this.#groupStart(g);
     for (const s of this.#calls) {
       const fn = s.call.fn;
-      if (fn === "lag") {
+      if (fn === "lag" || fn === "lead") {
+        // The target row, whichever way it lies (a negative offset reverses the direction:
+        // lead(x, −k) looks back, review B7-p2d-1 #4).
         const k = typeof s.call.amount === "number" ? s.call.amount : 1;
-        keep = Math.min(keep, i - Math.max(0, k));
+        keep = Math.min(keep, fn === "lag" ? i - k : i + k);
         continue;
       }
       if (
-        fn === "lead" ||
         fn === "row_number" ||
         fn === "rank" ||
         fn === "dense_rank" ||
@@ -1015,10 +1154,7 @@ export class PartitionStream {
           for (let r = 0; r < k; r++)
             sum += bigTo(ranges[2 * r + 1] ?? -1) - bigTo((ranges[2 * r] ?? 0) - 1);
           values[at] = fn === "avg" ? Number(sum) / count : Number(sum);
-          if (fn === "sum") {
-            const out = (bigs[f] ??= new Array<bigint>(BATCH_ROWS).fill(0n));
-            out[at] = sum;
-          }
+          if (fn === "sum") exactOut(bigs, f, at, values, valid)[at] = sum;
         } else {
           let sum = 0;
           for (let r = 0; r < k; r++)
@@ -1046,6 +1182,31 @@ export class PartitionStream {
     }
     // MIN / MAX: a head-anchored prefix from the running extreme, the rest scanned.
     const max = fn === "max";
+    if (s.vBig !== null || s.totalExtremeBig !== null) {
+      // Exact int64 extremes (a value past 2^53 was seen): compared and returned as bigints.
+      let best: bigint | null = null;
+      let r = 0;
+      if (k > 0 && (ranges[0] ?? 0) === 0) {
+        const b = ranges[1] ?? -1;
+        if (b >= this.#read)
+          best = s.totalSeen ? (s.totalExtremeBig ?? BigInt(s.totalExtreme)) : null;
+        else if (countTo(b) > 0)
+          best = s.extremeBig?.[b - this.#base] ?? BigInt(s.extreme[b - this.#base] ?? 0);
+        r = 1;
+      }
+      for (; r < k; r++) {
+        const b = ranges[2 * r + 1] ?? -1;
+        for (let j = ranges[2 * r] ?? 0; j <= b; j++) {
+          if (s.ok[j - this.#base] !== 1) continue;
+          const v = s.vBig?.[j - this.#base] ?? BigInt(s.v[j - this.#base] ?? 0);
+          if (best === null || (max ? v > best : v < best)) best = v;
+        }
+      }
+      values[at] = best === null ? 0 : Number(best);
+      valid[at] = best === null ? 0 : 1;
+      exactOut(bigs, f, at, values, valid)[at] = best ?? 0n;
+      return;
+    }
     let best = Number.NaN;
     let seen = false;
     let r = 0;
@@ -1071,6 +1232,8 @@ export class PartitionStream {
     }
     values[at] = best;
     valid[at] = seen ? 1 : 0;
+    const out = bigs[f];
+    if (out !== null && out !== undefined) out[at] = seen ? BigInt(best) : 0n;
   }
 
   /** The member row a first / last / nth value reads for row i (−1: none). */
@@ -1157,6 +1320,27 @@ export class PartitionStream {
     }
     nul();
   }
+}
+
+/**
+ * A function's exact output column for the current output chunk: made when its first row needs
+ * a bigint, the chunk's earlier rows (exact as doubles) converted then (the result vector then
+ * reads every row from it).
+ */
+function exactOut(
+  bigs: Array<bigint[] | null>,
+  f: number,
+  at: number,
+  values: Float64Array,
+  valid: Uint8Array,
+): bigint[] {
+  let out = bigs[f] ?? null;
+  if (out === null) {
+    out = new Array<bigint>(BATCH_ROWS).fill(0n);
+    for (let k = 0; k < at; k++) if (valid[k] === 1) out[k] = BigInt(values[k] ?? 0);
+    bigs[f] = out;
+  }
+  return out;
 }
 
 function better(v: number, best: number, max: boolean): boolean {

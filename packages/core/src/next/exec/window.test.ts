@@ -8,7 +8,9 @@
  * function, ROWS / RANGE / GROUPS with offsets, every EXCLUDE, NULL keys, resident and spilled
  * (tight grants spill the sort and big partitions), with and without backpressure.
  */
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
+import { Charge } from "./spill-pool.js";
+import { createReach } from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import { Governor } from "../memory/governor.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
@@ -119,15 +121,34 @@ export function oracle(spec: WindowSpec, rows: readonly Row[]): Value[][] {
       // every value with NULLS LAST; a NULL row's offset bounds are its peers'.
       const own = sortKey(rows[index] ?? []);
       if (own === null) return end ? peers[1] : peers[0];
-      const target = Number(own) + (descending ? -sign : sign) * amount;
+      const step = (descending ? -sign : sign) * amount;
+      // An int8 key compares exactly (bigints: PostgreSQL's in_range for int8), others as
+      // numbers.
+      const exact = typeof own === "bigint";
+      const target = exact ? 0 : Number(own) + step;
+      const targetBig = exact ? own + BigInt(step) : 0n;
       const nullsFirst = first?.nulls === "first";
       const inside = (candidate: Row) => {
         const key = sortKey(candidate);
         // In sort order: a NULL is before every value (NULLS FIRST) or after (NULLS LAST).
-        const value =
-          key === null ? (nullsFirst !== descending ? -Infinity : Infinity) : Number(key);
-        const before = descending ? value > target : value < target;
-        const after = descending ? value < target : value > target;
+        const c =
+          key === null
+            ? nullsFirst !== descending
+              ? -1
+              : 1
+            : exact
+              ? (key as bigint) < targetBig
+                ? -1
+                : (key as bigint) > targetBig
+                  ? 1
+                  : 0
+              : Number(key) < target
+                ? -1
+                : Number(key) > target
+                  ? 1
+                  : 0;
+        const before = descending ? c > 0 : c < 0;
+        const after = descending ? c < 0 : c > 0;
         return end ? !after : !before;
       };
       if (end) {
@@ -257,7 +278,13 @@ function fallbackValue(call: WindowFunctionSpec): Value {
 export async function runWindow(
   spec: WindowSpec,
   rows: readonly Row[],
-  options: { slack?: number; blockEvery?: number; batchRows?: number; dictionary?: boolean } = {},
+  options: {
+    slack?: number;
+    blockEvery?: number;
+    batchRows?: number;
+    dictionary?: boolean;
+    int64?: "safe" | "int64";
+  } = {},
 ) {
   const minimum = windowMinimumBytes(spec.types, spec.functions.length);
   const cap =
@@ -277,6 +304,7 @@ export async function runWindow(
       batchesOf(spec.types, rows, {
         batchRows: options.batchRows ?? 2048,
         dictionary: options.dictionary ?? false,
+        ...(options.int64 === undefined ? {} : { int64: options.int64 }),
       }),
     ),
     op,
@@ -662,6 +690,34 @@ describe("window: the grouped sort against the oracle (window-sort.ts)", () => {
     }
   }, 120_000);
 
+  it("int64 keys past 2^53 order exactly in their two normalized words (BigInt64Array)", async () => {
+    // Values one apart around ±2^53 and ±2^62 (a double cannot tell them apart), as ORDER BY
+    // keys both ways and as partition keys.
+    const values = [0n, 1n, 2n, 3n, 5n].flatMap((d) => [
+      TWO53 + d,
+      TWO53 - d,
+      -TWO53 - d,
+      (1n << 62n) + d,
+      -(1n << 62n) - d,
+    ]);
+    const rows = values.flatMap((y, i) => [0, 1].map((p): Row => [p, 0, 0, y, null, 0, 2 * i + p]));
+    for (const direction of ["asc", "desc"] as const)
+      for (const partitionBy of [[P], [Y]]) {
+        const spec: WindowSpec = {
+          types: TYPES,
+          partitionBy,
+          orderBy: [{ column: Y, direction, nulls: "last", collation: null }],
+          functions: [
+            { fn: "row_number", arg: null, frame: null, type: BIG },
+            { fn: "rank", arg: null, frame: null, type: BIG },
+          ],
+        };
+        const result = await runWindow(spec, rows, { int64: "int64", batchRows: 7 });
+        expect(result.profile.groupedRows).toBe(rows.length);
+        checkWindow(spec, rows, result.rows);
+      }
+  });
+
   it("a partition column a function reads is stored and gathered (first_value, count of it)", async () => {
     const random = mulberry32(0x91);
     const rows = generateRows(random, 2000, 7);
@@ -681,6 +737,289 @@ describe("window: the grouped sort against the oracle (window-sort.ts)", () => {
       checkWindow(spec, rows, result.rows);
     }
   });
+});
+
+// --- exact int64, wide floats, long offsets (review B7-p2d-1; the generator ruling) --------
+
+const TWO53 = 9007199254740992n;
+const BIG_VALUES = [
+  TWO53 - 1n,
+  TWO53,
+  TWO53 + 1n,
+  TWO53 + 3n,
+  -TWO53 - 1n,
+  -TWO53 - 5n,
+  (1n << 62n) + 7n,
+  -(1n << 62n) - 9n,
+  12n,
+  -40n,
+];
+const WIDE_FLOATS = [0.1, -0.3, 1e20, -1e20, 4503599627370495.5, 9007199254740991, 7.25, -2.5];
+
+/**
+ * Rows whose int64 column y holds values past ±2^53 (sent as BigInt64Array) and whose float x
+ * has fractions next to magnitudes past 2^53, so running counts and sums cross it.
+ */
+function wideRows(random: () => number, n: number, parts: number): Row[] {
+  const pick = <V>(items: readonly V[]): V => items[Math.floor(random() * items.length)] as V;
+  return Array.from({ length: n }, (_, i): Row => [
+    random() < 0.05 ? null : Math.floor(random() * parts),
+    random() < 0.08 ? null : Math.floor(random() * 20),
+    random() < 0.1 ? null : random() < 0.6 ? pick(WIDE_FLOATS) : Math.round(random() * 1e4) / 64,
+    random() < 0.08 ? null : pick(BIG_VALUES) + BigInt(Math.floor(random() * 3)),
+    random() < 0.1 ? null : `t${String(Math.floor(random() * 50))}`,
+    random() < 0.1 ? null : Math.floor(random() * 3),
+    i,
+  ]);
+}
+
+const EXACT_STATES = [
+  "int64 past 2^53 as BigInt64Array",
+  "MIN/MAX over int64 past 2^53",
+  "RANGE offsets over int64 keys past 2^53",
+  "COUNT over floats crossing 2^53",
+  "SUM over floats crossing 2^53",
+  "lag/lead looking back past the 4,096-row head",
+  "lag/lead looking ahead past the 4,096-row head",
+  "grouped sort over int64 keys past 2^53",
+] as const;
+
+describe("window: exact int64, wide floats and long offsets against the oracle", () => {
+  const reach = createReach(
+    "next-window-exact",
+    (["resident", "streamed"] as const).flatMap((path) =>
+      EXACT_STATES.map((state) => `${path}: ${state}` as const),
+    ),
+  );
+  afterAll(() => {
+    reach.assertReached();
+  });
+  const frames: Array<Frame | null> = [
+    null,
+    {
+      unit: "rows",
+      start: { kind: "unbounded-preceding", offset: null },
+      end: { kind: "current-row", offset: null },
+      exclude: "no-others",
+    },
+    {
+      unit: "rows",
+      start: { kind: "preceding", offset: 3 },
+      end: { kind: "current-row", offset: null },
+      exclude: "no-others",
+    },
+    {
+      unit: "rows",
+      start: { kind: "current-row", offset: null },
+      end: { kind: "following", offset: 2 },
+      exclude: "no-others",
+    },
+  ];
+  const DECIMAL: PhysicalType = { kind: "decimal", precision: null, scale: 0 };
+  for (const seed of seedsFor("next-window-exact", [0x5e1, 0x2a7]))
+    for (const streamed of [false, true])
+      it(`seed ${String(seed)}${streamed ? ", streamed" : ""}`, async () => {
+        const random = mulberry32(seed + (streamed ? 31 : 0));
+        const path = streamed ? "streamed" : "resident";
+        for (let round = 0; round < 14; round++) {
+          const pick = <V>(items: readonly V[]): V =>
+            items[Math.floor(random() * items.length)] as V;
+          const long = round % 4 === 3;
+          const range = !long && random() < 0.3;
+          const direction = random() < 0.5 ? "asc" : "desc";
+          const nulls = random() < 0.5 ? "first" : "last";
+          const orderBy: SortColumn[] = range
+            ? [{ column: Y, direction, nulls, collation: null }]
+            : long
+              ? [{ column: ID, direction: "asc", nulls: "last", collation: null }]
+              : pick([
+                  [
+                    { column: Y, direction, nulls, collation: null },
+                    { column: ID, direction: "asc", nulls: "last", collation: null },
+                  ],
+                  [
+                    { column: K, direction, nulls, collation: null },
+                    { column: ID, direction: "asc", nulls: "last", collation: null },
+                  ],
+                ] as SortColumn[][]);
+          let functions: WindowFunctionSpec[];
+          if (long) {
+            // Offsets past the 4,096-row head cache, either sign, both functions.
+            functions = Array.from({ length: 2 }, (): WindowFunctionSpec => ({
+              fn: pick(["lag", "lead"]),
+              arg: pick([Y, ID]),
+              amount: pick([-5000, -4500, 4500, 5000, -1, 1]),
+              frame: null,
+              type: BIG,
+            }));
+            functions = functions.map((call) => ({ ...call, type: call.arg === Y ? BIG : INT }));
+          } else if (range) {
+            const frame: Frame = {
+              unit: "range",
+              start: pick([
+                { kind: "preceding", offset: pick([0, 1, 3]) },
+                { kind: "unbounded-preceding", offset: null },
+              ] as FrameBound[]),
+              end: pick([
+                { kind: "following", offset: pick([0, 2]) },
+                { kind: "current-row", offset: null },
+              ] as FrameBound[]),
+              exclude: "no-others",
+            };
+            functions = [
+              { fn: "count_star", arg: null, frame, type: BIG },
+              { fn: pick(["min", "max"]), arg: Y, frame, type: BIG },
+              { fn: "sum", arg: Y, frame, type: DECIMAL },
+            ];
+          } else {
+            const frame = pick(frames);
+            functions = [
+              { fn: "count", arg: X, frame, type: BIG },
+              { fn: "sum", arg: X, frame, type: DBL },
+              { fn: pick(["min", "max"]), arg: Y, frame, type: BIG },
+              { fn: pick(["count", "sum", "avg"]), arg: Y, frame, type: BIG },
+            ].map((call) =>
+              call.fn === "sum" && call.arg === Y
+                ? { ...call, type: DECIMAL }
+                : call.fn === "avg"
+                  ? { ...call, type: DBL }
+                  : call,
+            );
+          }
+          const base: WindowSpec = {
+            types: TYPES,
+            partitionBy: long ? pick([[], [P]]) : random() < 0.5 ? [P] : [Y],
+            orderBy,
+            functions,
+          };
+          const spec: WindowSpec = streamed
+            ? {
+                ...base,
+                partitionBy: long ? base.partitionBy : [P],
+                functions: functions.filter((call) => streamable(base, call) === null),
+                streamRows: 64,
+              }
+            : base;
+          if (spec.functions.length === 0) continue;
+          const n = long ? 9500 + Math.floor(random() * 1500) : 200 + Math.floor(random() * 1800);
+          const rows = wideRows(random, n, long ? 2 : 1 + Math.floor(random() * 6));
+          const result = await runWindow(spec, rows, {
+            int64: "int64",
+            batchRows: 1 + Math.floor(random() * 2048),
+            blockEvery: random() < 0.3 ? 2 : 0,
+          });
+          checkWindow(spec, rows, result.rows);
+          // Reach: what this history exercised.
+          reach.beginHistory();
+          const wideY = rows.some((row) => {
+            const y = row[Y];
+            return typeof y === "bigint" && (y > TWO53 - 1n || y < 1n - TWO53);
+          });
+          const uses = (fn: string, arg: number) =>
+            spec.functions.some((call) => call.fn === fn && call.arg === arg);
+          const usesY =
+            spec.functions.some((call) => call.arg === Y) ||
+            spec.orderBy.some((key) => key.column === Y);
+          if (wideY && usesY) reach.reach(`${path}: int64 past 2^53 as BigInt64Array`);
+          if (wideY && (uses("min", Y) || uses("max", Y)))
+            reach.reach(`${path}: MIN/MAX over int64 past 2^53`);
+          if (wideY && range && spec.functions.some((call) => call.frame?.unit === "range"))
+            reach.reach(`${path}: RANGE offsets over int64 keys past 2^53`);
+          const wideX = rows.some((row) => Math.abs(Number(row[X] ?? 0)) >= 1e16);
+          if (wideX && uses("count", X)) reach.reach(`${path}: COUNT over floats crossing 2^53`);
+          if (wideX && uses("sum", X)) reach.reach(`${path}: SUM over floats crossing 2^53`);
+          const sizes = new Map<string, number>();
+          for (const row of rows) {
+            const key = spec.partitionBy.length > 0 ? String(row[P]) : "";
+            sizes.set(key, (sizes.get(key) ?? 0) + 1);
+          }
+          const largest = Math.max(...sizes.values());
+          for (const call of spec.functions) {
+            if (call.fn !== "lag" && call.fn !== "lead") continue;
+            const k = typeof call.amount === "number" ? call.amount : 1;
+            const back = call.fn === "lag" ? k > 0 : k < 0;
+            if (Math.abs(k) > 4096 && largest > 4096 + Math.abs(k))
+              reach.reach(
+                `${path}: lag/lead looking ${back ? "back" : "ahead"} past the 4,096-row head`,
+              );
+          }
+          if (
+            wideY &&
+            result.profile.groupedRows > 0 &&
+            spec.orderBy.some((key) => key.column === Y)
+          )
+            reach.reach(`${path}: grouped sort over int64 keys past 2^53`);
+        }
+      }, 600_000);
+});
+
+describe("window: growth charges the overlap (review B7-p2d-1 #5, governor rule 4)", () => {
+  // A growing array is charged in full while the old one is still live, then the old charge is
+  // freed: the charge calls must include each new size whole (not its difference).
+  async function allocations(spec: WindowSpec, rows: readonly Row[]): Promise<number[]> {
+    const sizes: number[] = [];
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- called with `this` below
+    const allocate = Charge.prototype.allocate;
+    const spy = vi.spyOn(Charge.prototype, "allocate").mockImplementation(function (
+      this: Charge,
+      bytes: number,
+    ) {
+      sizes.push(bytes);
+      return allocate.call(this, bytes);
+    });
+    try {
+      checkWindow(spec, rows, (await runWindow(spec, rows)).rows);
+    } finally {
+      spy.mockRestore();
+    }
+    return sizes;
+  }
+  const sum = (offset: number): WindowFunctionSpec => ({
+    fn: "sum",
+    arg: X,
+    frame: {
+      unit: "rows",
+      start: { kind: "preceding", offset },
+      end: { kind: "current-row", offset: null },
+      exclude: "no-others",
+    },
+    type: DBL,
+  });
+
+  it("a streamed partition's ring", async () => {
+    // ROWS 20000 PRECEDING keeps 20,001 rows: the ring grows 16,384 → 32,768.
+    const rows = generateRows(mulberry32(0x77), 30_000, 1).map((row): Row => [0, ...row.slice(1)]);
+    const spec: WindowSpec = {
+      types: TYPES,
+      partitionBy: [P],
+      orderBy: [{ column: ID, direction: "asc", nulls: "last", collation: null }],
+      functions: [sum(20_000)],
+      streamRows: 64,
+    };
+    const perRow = 4 + 9 + 1 * (8 + 1 + 8 + 8 + 8);
+    const sizes = await allocations(spec, rows);
+    expect(sizes).toContain(32_768 * perRow);
+    expect(sizes).toContain(16_384 * perRow);
+  }, 120_000);
+
+  it("a resident partition's scratch", async () => {
+    // Partitions of 3,000 then 10,000 rows: the scratch grows from 3,000 to 10,000 rows.
+    const rows = [
+      ...Array.from({ length: 3000 }, (_, i): Row => [0, i, i / 8, BigInt(i), null, 1, i]),
+      ...Array.from({ length: 10_000 }, (_, i): Row => [1, i, i / 8, BigInt(i), null, 1, 3000 + i]),
+    ];
+    const spec: WindowSpec = {
+      types: TYPES,
+      partitionBy: [P],
+      orderBy: [{ column: ID, direction: "asc", nulls: "last", collation: null }],
+      functions: [sum(3)],
+    };
+    // Scratch.bytes(capacity, functions 1, arguments 1).
+    const scratch = (capacity: number) => capacity * (20 + 8 + 22 + 9 + 12) + 12;
+    const sizes = await allocations(spec, rows);
+    expect(sizes).toContain(scratch(3000));
+    expect(sizes).toContain(scratch(10_000));
+  }, 120_000);
 });
 
 describe("window: streamed partitions against the oracle", () => {

@@ -70,6 +70,8 @@ export interface Peers {
 export interface RangeKey {
   readonly values: Float64Array;
   readonly valid: Uint8Array;
+  /** Exact keys when an int64 key passes 2^53 (its double rounds), else null. */
+  readonly big?: readonly bigint[] | null;
   readonly descending: boolean;
   /** Whether NULLs sort first (they then precede every number). */
   readonly nullsFirst: boolean;
@@ -182,6 +184,37 @@ function* rangeBounds(
 ): SlicedJob<void> {
   const n = peers.n;
   const { values, valid, descending, nullsFirst } = key;
+  const big = key.big ?? null;
+  if (big !== null) {
+    // Exact int64 keys (review B7-p2d-1 #3): the same walk in bigints, the offset exact.
+    if (!Number.isInteger(delta))
+      throw new RangeError("A RANGE offset over int8 keys is an integer");
+    const dir = descending ? -1n : 1n;
+    const step = BigInt(delta);
+    // −1, 0, 1: row j's key (along the direction) against `target`; NULLs below or above.
+    const cmp = (j: number, target: bigint): number => {
+      if (valid[j] !== 1) return nullsFirst ? -1 : 1;
+      const v = (big[j] ?? 0n) * dir;
+      return v < target ? -1 : v > target ? 1 : 0;
+    };
+    let p = 0;
+    for (let i = 0; i < n; i++) {
+      if (valid[i] === 0) {
+        out[i] = (end ? peers.end[i] : peers.start[i]) ?? i;
+        continue;
+      }
+      const target = (big[i] ?? 0n) * dir + step;
+      if (end) {
+        while (p < n && cmp(p, target) <= 0) p++;
+        out[i] = p - 1;
+      } else {
+        while (p < n && cmp(p, target) < 0) p++;
+        out[i] = p;
+      }
+      if ((i & (SLICE_ROWS - 1)) === SLICE_ROWS - 1 && slice.due()) yield;
+    }
+    return;
+  }
   // Along the sort direction, "after" means a larger key ascending, a smaller one descending.
   const dir = descending ? -1 : 1;
   const nullValue = nullsFirst ? -Infinity : Infinity;
