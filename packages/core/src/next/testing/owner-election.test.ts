@@ -7,7 +7,11 @@
  */
 import fc from "fast-check";
 import { afterEach, describe, expect, it } from "vitest";
-import { LEDGER_RESOLUTION_STATES, createReach } from "../../testing/reach.js";
+import {
+  BARRIER_RESOLUTION_STATES,
+  LEDGER_RESOLUTION_STATES,
+  createReach,
+} from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import type { ChunkReads } from "../exec/scan.js";
 import { Governor } from "../memory/governor.js";
@@ -1241,5 +1245,169 @@ describe("review 3 of increment 2 (B5-p2b-review-3): pending requests resolve th
       reach.assertReached();
     },
     120_000,
+  );
+});
+
+describe("B1 (B5-p2d review 1): after a reconnect, a session's state is the resolution of its whole unanswered sequence", () => {
+  type Op = "begin" | "inc" | "commit" | "rollback";
+  interface Step {
+    readonly session: 0 | 1;
+    readonly op: Op;
+  }
+  /** Valid interleaved scripts for two sessions, with an optional acknowledged BEGIN first. */
+  const scenario = fc
+    .record({
+      // At most one session open before the loss: the stand-in has one writer slot, and a second
+      // acknowledged BEGIN would wait for it forever.
+      openFirst: fc.constantFrom<[boolean, boolean]>([false, false], [true, false], [false, true]),
+      steps: fc.array(
+        fc.record({
+          session: fc.constantFrom<0 | 1>(0, 1),
+          // Weighted towards ends, so confirmed ends with nothing lost after them are common.
+          op: fc.oneof(
+            { weight: 3, arbitrary: fc.constant<Op>("begin") },
+            { weight: 2, arbitrary: fc.constant<Op>("inc") },
+            { weight: 4, arbitrary: fc.constant<Op>("commit") },
+            { weight: 1, arbitrary: fc.constant<Op>("rollback") },
+          ),
+        }),
+        { minLength: 1, maxLength: 8 },
+      ),
+      failover: fc.boolean(),
+      settleMs: fc.integer({ min: 10, max: 40 }),
+    })
+    .map(({ openFirst, steps, failover, settleMs }) => {
+      const open = [openFirst[0], openFirst[1]];
+      const valid: Step[] = [];
+      for (const step of steps) {
+        if (step.op === "begin" && open[step.session]) continue;
+        if ((step.op === "commit" || step.op === "rollback") && !open[step.session]) continue;
+        if (step.op === "begin") open[step.session] = true;
+        if (step.op === "commit" || step.op === "rollback") open[step.session] = false;
+        valid.push(step);
+      }
+      return { openFirst, steps: valid, failover, settleMs };
+    });
+
+  const SEEDS = seedsFor("next-owner-barrier-resolution", [0xb1b1]);
+
+  it.each(SEEDS)(
+    "generated: a fresh request runs only if the last loss before it was discharged by a confirmed end (seed %i)",
+    async (seed) => {
+      const reach = createReach("next-owner-barrier-resolution", BARRIER_RESOLUTION_STATES, {
+        minimum: 3,
+      });
+      await fc.assert(
+        fc.asyncProperty(scenario, async ({ openFirst, steps, failover, settleMs }) => {
+          const entered = new Set<string>();
+          const w = world();
+          const a: Tab = tab(w);
+          await a.connector.start();
+          await a.client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
+          await a.client.query("INSERT INTO t VALUES ($1, $2, $3)", [1, 0, "x"]);
+          const wired = wiredClient(w, 0);
+          await wired.connect();
+          const c = wired.client;
+          // A session open at the loss has written: its COMMIT, if it lands, records an outcome
+          // (a COMMIT of a transaction that wrote nothing commits nothing and records none).
+          for (const session of [0, 1] as const)
+            if (openFirst[session]) {
+              await c.query("BEGIN", [], { session });
+              await c.query("UPDATE t SET n = n + 1 WHERE id = $1", [1], { session });
+            }
+          wired.drop.all = true;
+          const sql: Record<Op, string> = {
+            begin: "BEGIN",
+            inc: "UPDATE t SET n = n + 1 WHERE id = $1",
+            commit: "COMMIT",
+            rollback: "ROLLBACK",
+          };
+          const sent = steps.map((step) => ({
+            step,
+            seq: 0,
+            result: c.query(sql[step.op], step.op === "inc" ? [1] : [], { session: step.session }),
+          }));
+          await sleep(settleMs);
+          if (failover) {
+            w.owners[0]?.kill();
+            const d = tab(w);
+            await d.connector.start();
+            await wired.reconnectTo(w.owners.length - 1);
+          } else {
+            await wired.reconnectTo(0);
+          }
+          const settled = Promise.all(
+            sent.map(({ result }) =>
+              result.then(
+                (answer) => ({ ok: true, transaction: answer.summary.transaction }),
+                () => ({ ok: false, transaction: null }),
+              ),
+            ),
+          );
+          const outcomes = await Promise.race([settled, sleep(3_000).then(() => null)]);
+          if (outcomes === null) throw new Error("pipeline outcomes did not settle");
+          // The ruling, in send order: a loss cause for a session open at the loss and for each
+          // BEGIN; an end the owner confirmed left the session idle discharges the causes before it.
+          const confirmedThenLost = [false, false];
+          const expectLost = [0, 1].map((session) => {
+            let lost = openFirst[session];
+            let confirmed = false;
+            steps.forEach((step, i) => {
+              if (step.session !== session) return;
+              if (step.op === "begin") {
+                lost = true;
+                if (confirmed) confirmedThenLost[session] = true;
+              }
+              const outcome = outcomes[i];
+              if (
+                (step.op === "commit" || step.op === "rollback") &&
+                outcome?.ok === true &&
+                outcome.transaction === "idle"
+              ) {
+                lost = false;
+                confirmed = true;
+              }
+            });
+            return lost;
+          });
+          const run = (session: 0 | 1) =>
+            c.query("UPDATE t SET n = n + 1 WHERE id = $1", [1], { session }).then(
+              (answer) => ({ ran: true, transaction: answer.summary.transaction }),
+              (error: unknown) => ({
+                ran: false,
+                transaction: `${(error as Error).name}:${String((error as { effect?: string }).effect)}`,
+              }),
+            );
+          for (const session of [0, 1] as const) {
+            expect(c.lostSessions.has(session)).toBe(expectLost[session]);
+            const fresh = await run(session);
+            const hadCause =
+              openFirst[session] ||
+              steps.some((step) => step.session === session && step.op === "begin");
+            if (expectLost[session]) {
+              entered.add(fresh.ran ? "ran while lost" : "refused while lost");
+              // The review's case: a confirmed end, then a later BEGIN lost again.
+              if (confirmedThenLost[session]) entered.add("lost again after a confirmed end");
+              expect(fresh).toEqual({ ran: false, transaction: "SessionLostError:none" });
+              // The explicit end: a ROLLBACK the owner confirms makes the session usable again.
+              const rollback = await c.query("ROLLBACK", [], { session });
+              expect(rollback.summary.transaction).toBe("idle");
+              expect(c.lostSessions.has(session)).toBe(false);
+              expect(await run(session)).toEqual({ ran: true, transaction: "idle" });
+              entered.add("ran after an explicit ROLLBACK");
+            } else {
+              entered.add(hadCause ? "ran after a confirmed end" : "ran, never lost");
+              // Never inside a transaction it did not open: an autocommit.
+              expect(fresh).toEqual({ ran: true, transaction: "idle" });
+            }
+          }
+          reach.recordHistory(entered);
+          for (const cleanup of cleanups.splice(0).reverse()) cleanup();
+        }),
+        { seed, numRuns: 100 },
+      );
+      reach.assertReached();
+    },
+    200_000,
   );
 });

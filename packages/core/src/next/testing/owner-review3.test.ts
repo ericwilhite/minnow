@@ -361,3 +361,102 @@ describe("ending a generation (found on the restacked p2c by timing)", () => {
     });
   });
 });
+
+describe("B1 (B5-p2d review 1): a confirmed end discharges only the losses before it", () => {
+  it("a replayed earlier COMMIT does not clear a later unanswered BEGIN (wire)", async () => {
+    const client = new ProtocolClient();
+    const first = fakeOwner();
+    await client.connect(first.port);
+    const begin = client.begin(0);
+    first.done(first.lastSeq(), "BEGIN", "inTransaction");
+    await begin;
+    const commit = client.commit(0).catch((error: unknown) => error);
+    const commitSeq = first.lastSeq();
+    const second = client.begin(0).catch((error: unknown) => error);
+    const beginSeq = first.lastSeq();
+    const owner = fakeOwner();
+    await client.reconnect(owner.port);
+    expect(client.lostSessions.has(0)).toBe(true);
+    owner.reply({
+      t: "done",
+      seq: commitSeq,
+      columns: null,
+      frames: [],
+      summary: {
+        command: "COMMIT",
+        rowCount: null,
+        counts: { t: 1 },
+        lsn: 1,
+        replayed: true,
+        closedEarly: false,
+        transaction: "idle",
+        catalogVersion: 1,
+      },
+    });
+    owner.reply({
+      t: "error",
+      seq: beginSeq,
+      error: {
+        name: "SessionLostError",
+        message: "lost",
+        props: {
+          code: "MINNOW_SESSION_LOST",
+          lost: "transaction",
+          sequence: beginSeq,
+          effect: "none",
+        },
+      },
+    });
+    await Promise.all([commit, second]);
+    // The COMMIT ended the first transaction; the refused BEGIN after it keeps the session lost.
+    expect(client.lostSessions.has(0)).toBe(true);
+    await expect(client.query("UPDATE t SET n = 1")).rejects.toMatchObject({
+      name: "SessionLostError",
+      effect: "none",
+    });
+    // An explicit ROLLBACK the owner confirms discharges every loss before it.
+    const rollback = client.query("ROLLBACK");
+    owner.done(owner.lastSeq(), "ROLLBACK", "idle");
+    await rollback;
+    expect(client.lostSessions.has(0)).toBe(false);
+    client.close();
+  });
+
+  it("through the composed engine: COMMIT replayed, later BEGIN refused, next UPDATE refused (the review's probe)", async () => {
+    const h = harness();
+    const { port1, port2 } = new MessageChannel();
+    const post = port1.postMessage.bind(port1);
+    let armed = false;
+    let dropped = 0;
+    port1.postMessage = ((message: { t?: string }) => {
+      if (armed && message.t === "done") {
+        dropped++;
+        return;
+      }
+      post(message);
+    }) as typeof port1.postMessage;
+    h.server.accept(port1);
+    const client = new ProtocolClient();
+    await client.connect(port2);
+    await seed(client, 1);
+    await client.begin(0);
+    await client.query("UPDATE t SET n = n + 1 WHERE id = $1", [1]);
+    armed = true;
+    const commit = client.commit(0).catch((error: unknown) => error);
+    const begin = client.begin(0).catch((error: unknown) => error);
+    for (let i = 0; i < 500 && dropped < 2; i++) await delay(2);
+    expect(dropped).toBe(2);
+    await h.reconnect(client);
+    await Promise.all([commit, begin]);
+    expect(client.lostSessions.has(0)).toBe(true);
+    const next = await client.query("UPDATE t SET n = n + 1 WHERE id = $1", [1]).then(
+      () => "executed",
+      (error: unknown) => (error as Error).name,
+    );
+    expect(next).toBe("SessionLostError");
+    // The committed increment, and nothing after it.
+    expect(h.writePath.rows("t")[0]?.[1]).toBe(1);
+    client.close();
+    port1.close();
+  });
+});

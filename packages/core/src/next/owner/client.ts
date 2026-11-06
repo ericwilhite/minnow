@@ -193,8 +193,14 @@ export class ProtocolClient {
   readonly #sequencer = new RequestSequencer();
   /** Each session's transaction state, from replies: a non-idle session pins a snapshot. */
   readonly #sessions = new Map<number, TransactionState>();
-  /** Sessions whose transaction a reconnect lost: refused until ended explicitly. */
-  readonly #lostSessions = new Set<number>();
+  /**
+   * Why each session is lost, as the sequence numbers of its loss causes (B5-p2d review 1, B1): 0
+   * for a transaction open when a connection was lost, else an unanswered BEGIN or unknown
+   * request. A boundary the owner confirms left the session idle (a ROLLBACK, a COMMIT answered
+   * from the ledger) discharges only the causes before it; the session is lost while any cause
+   * remains. So a replayed COMMIT does not clear a later lost BEGIN.
+   */
+  readonly #lostCauses = new Map<number, number[]>();
   /** Whether the connector holds the liveness lock (re-announced on every new connection). */
   #livenessHeld = false;
   #cursors = 0;
@@ -253,17 +259,36 @@ export class ProtocolClient {
 
   /** Sessions a reconnect lost, refused until ended (see "Sessions bound to their generation"). */
   get lostSessions(): ReadonlySet<number> {
-    return this.#lostSessions;
+    return new Set(this.#lostCauses.keys());
+  }
+
+  #isLost(session: number): boolean {
+    return this.#lostCauses.has(session);
+  }
+
+  #addCause(session: number, seq: number): void {
+    const causes = this.#lostCauses.get(session);
+    if (causes === undefined) this.#lostCauses.set(session, [seq]);
+    else if (!causes.includes(seq)) causes.push(seq);
+  }
+
+  /** The owner confirmed request `seq` left `session` idle: the causes before it are discharged. */
+  #discharge(session: number, seq: number): void {
+    const causes = this.#lostCauses.get(session);
+    if (causes === undefined) return;
+    const left = causes.filter((cause) => cause > seq);
+    if (left.length === 0) this.#lostCauses.delete(session);
+    else this.#lostCauses.set(session, left);
   }
 
   /** Opens the next generation on `port` and resends unanswered requests. */
   async reconnect(port: MessagePort, signal?: AbortSignal): Promise<Welcome> {
     const welcome = await this.#open(port, signal);
-    const lost = this.#lostSessions;
-    // Every session with a transaction open on the old generation is lost with it.
-    for (const [session, state] of this.#sessions) if (state !== "idle") lost.add(session);
-    if (this.#session0.transaction !== "idle") lost.add(0);
-    for (const session of lost) this.#sessions.set(session, "idle");
+    // Every session with a transaction open on the old generation is lost with it: a cause before
+    // every unanswered request.
+    for (const [session, state] of this.#sessions) if (state !== "idle") this.#addCause(session, 0);
+    if (this.#session0.transaction !== "idle") this.#addCause(0, 0);
+    for (const session of this.#lostCauses.keys()) this.#sessions.set(session, "idle");
     this.#session0.transaction = "idle";
     // In send order. Nothing is decided here: every request that was sent goes back to the new
     // owner unchanged, whose ledger answers it (a recorded outcome, or a refusal saying what its
@@ -271,10 +296,11 @@ export class ProtocolClient {
     // new owner never runs it.
     for (const pending of [...this.#pending.values()].sort((a, b) => a.seq - b.seq)) {
       const { session, kind } = pending;
-      // An unanswered BEGIN (or unknown text) may have opened a transaction there: the session
-      // is lost too, so nothing new reaches it until a confirmed ROLLBACK.
-      if (session !== null && (kind === "begin" || kind === "unknown")) lost.add(session);
-      if (!pending.sent && session !== null && lost.has(session)) {
+      // An unanswered BEGIN (or unknown text) may have opened a transaction there: a cause at its
+      // place in the sequence, discharged only by a confirmed end after it.
+      if (session !== null && (kind === "begin" || kind === "unknown"))
+        this.#addCause(session, pending.seq);
+      if (!pending.sent && session !== null && this.#isLost(session) && kind !== "rollback") {
         // Never sent, so nothing took effect; on the new owner it would run outside the lost
         // transaction.
         this.#fail(pending, new SessionLostError("transaction", pending.seq, "none"));
@@ -513,7 +539,7 @@ export class ProtocolClient {
     // Never sent, so nothing took effect: on the new owner it would run outside the lost
     // transaction (autocommit). Only an explicit end (ROLLBACK, ABORT) goes through, and the
     // session stays lost until the owner's reply confirms it.
-    if (session !== null && this.#lostSessions.has(session) && kind !== "rollback")
+    if (session !== null && this.#isLost(session) && kind !== "rollback")
       return this.#refuse(new SessionLostError("transaction", undefined, "none"), cursor);
     const seq = this.#sequencer.issue();
     if (seq === null)
@@ -653,14 +679,15 @@ export class ProtocolClient {
             this.#port?.postMessage({ t: "release", target: message.seq, through: last.sequence });
         }
         if (message.t === "done") {
-          // The owner confirmed the session ended (a COMMIT answered from the ledger, or a ROLLBACK
-          // that succeeded): a lost session is usable again. Never on send.
+          // The owner confirmed this boundary left the session idle (a COMMIT answered from the
+          // ledger, a ROLLBACK that succeeded): the loss causes before it are discharged, not the
+          // ones after it. Never on send.
           if (
             pending.session !== null &&
             (pending.kind === "commit" || pending.kind === "rollback") &&
             message.summary.transaction === "idle"
           )
-            this.#lostSessions.delete(pending.session);
+            this.#discharge(pending.session, pending.seq);
           if (pending.session === 0) this.#session0.transaction = message.summary.transaction;
           if (pending.session !== null)
             this.#sessions.set(pending.session, message.summary.transaction);

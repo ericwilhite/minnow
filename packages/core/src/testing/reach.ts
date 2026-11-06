@@ -152,3 +152,15 @@ export const LEDGER_RESOLUTION_STATES = [
   "inc replayed",
   "inc unknown",
 ] as const;
+
+/**
+ * A session's barrier after a reconnect (next/testing/owner-election.test.ts, B5-p2d review 1):
+ * a fresh request refused while a loss stands, and run after a confirmed end discharged it.
+ */
+export const BARRIER_RESOLUTION_STATES = [
+  "refused while lost",
+  "ran after a confirmed end",
+  "ran after an explicit ROLLBACK",
+  "lost again after a confirmed end",
+  "ran, never lost",
+] as const;
