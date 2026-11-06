@@ -318,6 +318,54 @@ function qualifiedOrderCases(): Case[] {
   return cases;
 }
 
+/**
+ * A correlated scalar subquery over an aggregate without GROUP BY yields one row per outer row,
+ * so its LIMIT and OFFSET apply to that row: LIMIT n ≥ 1 keeps it, LIMIT 0 or any OFFSET leaves
+ * the subquery empty and its value NULL — COUNT included (PostgreSQL). Crossed: aggregate ×
+ * LIMIT / OFFSET × equality or non-equality correlation in the select list, and the bounds that
+ * empty the subquery in WHERE. SQLite has no OFFSET without LIMIT, so those cases are PGlite's
+ * alone. These need the optimizer to run at all, so they are kept few enough that the corpus's
+ * unoptimized share (pinned below) still measures the rest.
+ */
+function correlatedAggregateLimitCases(): Case[] {
+  const aggregates = [
+    "MAX(d.amount)",
+    "MIN(d.amount)",
+    "SUM(d.amount)",
+    "COUNT(*)",
+    "COUNT(DISTINCT d.label)",
+    "MAX(d.id) - MIN(d.id)",
+  ];
+  const bounds: Array<{ sql: string; sqlite: boolean }> = [
+    { sql: "LIMIT 1", sqlite: true },
+    { sql: "LIMIT 0", sqlite: true },
+    { sql: "LIMIT 1 OFFSET 1", sqlite: true },
+    { sql: "OFFSET 0", sqlite: false },
+    { sql: "OFFSET 1", sqlite: false },
+    { sql: "ORDER BY 1 DESC LIMIT 1", sqlite: true },
+  ];
+  const correlations = ["d.region = m.region", "d.id < m.rank * 20"];
+  const cases: Case[] = [];
+  for (const aggregate of aggregates)
+    for (const bound of bounds)
+      for (const where of correlations) {
+        const skip = bound.sqlite ? {} : { skip: ["sqlite"] as const };
+        const subquery = `(SELECT ${aggregate} FROM data d WHERE ${where} ${bound.sql})`;
+        cases.push({
+          sql: `SELECT m.region, ${subquery} AS x FROM dims m ORDER BY m.region`,
+          ordered: true,
+          ...skip,
+        });
+        if (where === correlations[0] && ["LIMIT 1", "LIMIT 0", "OFFSET 1"].includes(bound.sql))
+          cases.push({
+            sql: `SELECT m.region FROM dims m WHERE ${subquery} > 1 ORDER BY m.region`,
+            ordered: true,
+            ...skip,
+          });
+      }
+  return cases;
+}
+
 /** Datetime literals and calendar arithmetic, which only PostgreSQL spells the same way. */
 function datetimeCases(): Case[] {
   const cases: Case[] = [
@@ -1346,6 +1394,7 @@ function combinationCases(): Case[] {
     ...windowCases(),
     ...joinCases(),
     ...qualifiedOrderCases(),
+    ...correlatedAggregateLimitCases(),
     ...datetimeCases(),
     ...cteCases(),
     ...derivedWindowCases(),
