@@ -406,7 +406,9 @@ export class ChunkReader {
   ): MaybePromise<ChunkReader> {
     const ref = chunk.directory;
     const cache = options.directories;
-    const hit = cache?.pin(ref) ?? null;
+    // A one-pass reader's pin leaves the directory's eviction order alone (review B2-p2h #2).
+    const pinning = options.once === true ? PEEK_ONCE : undefined;
+    const hit = cache?.pin(ref, pinning) ?? null;
     if (cache !== undefined && hit !== null) {
       // Cached and parsed already: charged to this reader while it holds it, unpinned at close.
       try {
@@ -417,11 +419,11 @@ export class ChunkReader {
         // The entry was parsed for whichever chunk read it first (review B2-p2a #1).
         checkDirectoryWithin(hit.value, chunk.data.length);
       } catch (error) {
-        cache.unpin(ref);
+        cache.unpin(ref, pinning);
         throw error;
       }
       if (!options.budget.allocate(hit.size)) {
-        cache.unpin(ref);
+        cache.unpin(ref, pinning);
         throw new PageBudgetError(hit.size);
       }
       return new ChunkReader(space, chunk, hit.value, options, hit.size, ref);
@@ -567,12 +569,12 @@ export class ChunkReader {
     const inflated = this.#options.inflated;
     const found: Array<{ bytes: Uint8Array; pinned: BlobRef | null }> = [];
     const unpin = (): void => {
-      for (const { pinned } of found) if (pinned !== null) inflated?.unpin(pinned);
+      for (const { pinned } of found) if (pinned !== null) inflated?.unpin(pinned, this.#pinning);
     };
     for (const { entry } of jobs) {
       const ref = blobOf(this.chunk, entry);
       if (isGzip(entry)) {
-        const bytes = inflated?.pin(ref) ?? null;
+        const bytes = inflated?.pin(ref, this.#pinning) ?? null;
         if (bytes === null) {
           unpin();
           return false;
@@ -611,7 +613,7 @@ export class ChunkReader {
       for (let k = installed + 1; k < found.length; k++) {
         const { bytes, pinned } = at(found, k);
         this.#options.budget.free(bytes.length);
-        if (pinned !== null) inflated?.unpin(pinned);
+        if (pinned !== null) inflated?.unpin(pinned, this.#pinning);
       }
       throw error;
     }
@@ -631,13 +633,13 @@ export class ChunkReader {
     // gzip pages already inflated in the cache need no read.
     for (const job of all) {
       const ref = blobOf(this.chunk, job.entry);
-      const bytes = isGzip(job.entry) ? (inflated?.pin(ref) ?? null) : null;
+      const bytes = isGzip(job.entry) ? (inflated?.pin(ref, this.#pinning) ?? null) : null;
       if (bytes === null) {
         jobs.push(job);
         continue;
       }
       if (!this.#options.budget.allocate(bytes.length)) {
-        inflated?.unpin(ref);
+        inflated?.unpin(ref, this.#pinning);
         throw new PageBudgetError(bytes.length);
       }
       this.#install(job.entry, job.page, bytes, {
@@ -824,6 +826,11 @@ export class ChunkReader {
     return dictionary;
   }
 
+  /** How this reader pins cached directories and inflated pages (one-pass: not a use). */
+  get #pinning(): { readonly once: true } | undefined {
+    return this.#options.once === true ? PEEK_ONCE : undefined;
+  }
+
   /** A cache hit; a one-pass reader's is not a use (review B2-p2g #2). */
   #peek(ref: BlobRef): Uint8Array | null {
     return this.#options.once === true ? this.#space.peek(ref, PEEK_ONCE) : this.#space.peek(ref);
@@ -833,7 +840,7 @@ export class ChunkReader {
     if (held === undefined || held === null) return;
     if (held.charged > 0) this.#options.budget.free(held.charged);
     held.lease?.drop();
-    if (held.inflated !== null) this.#options.inflated?.unpin(held.inflated);
+    if (held.inflated !== null) this.#options.inflated?.unpin(held.inflated, this.#pinning);
   }
 
   /** Loads the dictionary page on its own (for a dictionary vector before any page). */
@@ -951,7 +958,8 @@ export class ChunkReader {
     this.#dictionary = null;
     this.#dictionaryVector = null;
     this.#options.budget.free(this.#directoryCharge);
-    if (this.#directoryPin !== null) this.#options.directories?.unpin(this.#directoryPin);
+    if (this.#directoryPin !== null)
+      this.#options.directories?.unpin(this.#directoryPin, this.#pinning);
   }
 
   // ── Predicates on encoded pages (predicate.ts, select.ts) ─────────────────────────────

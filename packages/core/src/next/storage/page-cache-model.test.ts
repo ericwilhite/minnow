@@ -4,7 +4,8 @@
  * pins and descriptor, and the outstanding leases; after every operation the cache's charge must
  * equal the fixed slabs, plus base bytes and overhead of every unpinned resident entry, plus the
  * descriptor of every live entry (resident or pinned), and the lease budget the blob bytes of
- * the outstanding leases. Operations: cold and hot reads, several leases on one entry, attach
+ * the outstanding leases. Operations: cold and hot reads (ordinary and one-pass), several leases
+ * on one entry, attach
  * pinned and unpinned (granted and refused, and refused for a copy of the entry's bytes), peek, last and non-last release (re-admission
  * granted and refused), full eviction, drop while pinned and unpinned, close with outstanding
  * leases, and two concurrent cold reads of one blob whose second platform read is held until the
@@ -86,6 +87,8 @@ function setup() {
 
 const STATES = [
   "read",
+  "once-hit",
+  "once-miss",
   "multiple-leases",
   "attach-pinned-true",
   "attach-pinned-false",
@@ -150,9 +153,13 @@ describe.each(SEEDS)("the page cache's accounting model (seed %i)", (seed) => {
         if (ref === undefined) throw new Error("no ref");
         let entry = entries.find((each) => each.id === id && each.resident);
         if (op === 0) {
-          const lease = await cache.read([ref], { budget });
+          // A third of the reads are one-pass (review B2-p2h #1): a hit pins the entry where it
+          // is listed, a miss stays private to its lease and is never resident.
+          const once = random(3) === 0;
+          const lease = await cache.read([ref], { budget, once });
+          if (once) reach.reach(entry === undefined ? "once-miss" : "once-hit");
           if (entry === undefined) {
-            entry = { id, pins: 0, descriptor: 0, resident: true };
+            entry = { id, pins: 0, descriptor: 0, resident: !once };
             entries.push(entry);
           }
           entry.pins++;

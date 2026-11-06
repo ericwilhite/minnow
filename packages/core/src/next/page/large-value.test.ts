@@ -21,6 +21,7 @@ import {
   type BlobRef,
   type ByteBudget,
   type ExtentReader,
+  type PeekOptions,
   type ReadOptions,
 } from "../storage/extents.js";
 import type { PhysicalType } from "../types.js";
@@ -99,7 +100,7 @@ function recording(space: ExtentReader): ExtentReader & { reads: number[] } {
       reads.push(refs.reduce((sum, ref) => sum + ref.length, 0));
       return space.read(refs, options);
     },
-    peek: (ref: BlobRef) => space.peek(ref),
+    peek: (ref: BlobRef, options?: PeekOptions) => space.peek(ref, options),
   };
 }
 

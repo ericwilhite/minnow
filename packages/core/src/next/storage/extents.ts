@@ -285,8 +285,10 @@ export interface ReadOptions {
   readonly signal?: AbortSignal;
   /**
    * A one-pass scan (a full export): blobs it misses stay private to its lease and are never
-   * admitted to the cache, and blobs it hits are not marked as reused, so the scan does not
-   * evict or demote the hot working set. Default false.
+   * admitted to the cache, and its hits are not uses: while only one-pass leases pin a cached
+   * blob, it keeps its segment, its place and its last use (it cannot be evicted meanwhile), so
+   * the scan does not evict, demote or reorder the hot working set (review B2-p2h #1). An
+   * ordinary use during such a pin counts as usual. Default false.
    */
   readonly once?: boolean;
 }

@@ -55,6 +55,12 @@ interface Entry {
   readonly checksum: number;
   readonly bytes: Uint8Array;
   pins: number;
+  /**
+   * Pins held by one-pass reads (`ReadOptions.once`). While every pin is one, the entry stays
+   * listed where it was, its recency untouched (review B2-p2h #1): `segment` is then its list,
+   * not "pinned", and eviction skips it.
+   */
+  oncePins: number;
   segment: Segment;
   /** Dropped while pinned (its extent was freed): never admitted again. */
   dropped: boolean;
@@ -158,6 +164,8 @@ export class PageCache implements EvictableCacheLike {
   #memory: CacheMemory | null = null;
   #slabBusy: Promise<void> = Promise.resolve();
   #pinnedBytes = 0;
+  /** Entries pinned only by one-pass reads, still listed where they were (review B2-p2h #1). */
+  readonly #listedPinned = new Set<Entry>();
   #hits = 0;
   #misses = 0;
   #platformReads = 0;
@@ -176,10 +184,16 @@ export class PageCache implements EvictableCacheLike {
   }
 
   get stats(): CacheStats {
+    let listedPinned = 0;
+    let protectedPinned = 0;
+    for (const entry of this.#listedPinned) {
+      listedPinned += entry.length;
+      if (entry.segment === "protected") protectedPinned += entry.length + entry.parsedBytes;
+    }
     return {
       residentBytes: this.#probation.bytes + this.#protected.bytes + this.#pinnedBytes,
-      protectedBytes: this.#protected.bytes,
-      pinnedBytes: this.#pinnedBytes,
+      protectedBytes: this.#protected.bytes - protectedPinned,
+      pinnedBytes: this.#pinnedBytes + listedPinned,
       hits: this.#hits,
       misses: this.#misses,
       platformReads: this.#platformReads,
@@ -190,26 +204,37 @@ export class PageCache implements EvictableCacheLike {
   // ── Governor side ──────────────────────────────────────────────────────────────────────────
 
   get evictableBytes(): number {
+    let pinned = 0;
+    for (const entry of this.#listedPinned) pinned += charge(entry);
     return (
       this.#probation.bytes +
       this.#protected.bytes +
-      ENTRY_OVERHEAD * (this.#probation.count + this.#protected.count)
+      ENTRY_OVERHEAD * (this.#probation.count + this.#protected.count) -
+      pinned
     );
   }
 
   /** When the entry `evict` takes next was last used (the governor's cross-cache order). */
   get oldestUnusedAt(): number | undefined {
-    return (this.#probation.tail ?? this.#protected.tail)?.usedAt;
+    return this.#victim()?.usedAt;
   }
 
   evict(bytes: number): number {
     let freed = 0;
     while (freed < bytes) {
-      const victim = this.#probation.tail ?? this.#protected.tail;
+      const victim = this.#victim();
       if (victim === null) break;
       freed += this.#evictEntry(victim);
     }
     return freed;
+  }
+
+  /** The next entry to evict: least recently used of probation, then protected; never pinned. */
+  #victim(only: "probation" | null = null, except: Entry | null = null): Entry | null {
+    for (const list of only === null ? [this.#probation, this.#protected] : [this.#probation])
+      for (let entry = list.tail; entry !== null; entry = entry.prev)
+        if (entry.pins === 0 && entry !== except) return entry;
+    return null;
   }
 
   // ── Reads ──────────────────────────────────────────────────────────────────────────────────
@@ -292,14 +317,16 @@ export class PageCache implements EvictableCacheLike {
           continue;
         }
         this.#hits += 1;
-        if (options.once !== true) entry.hot = true; // a one-pass scan is not a reuse
+        const once = options.once === true;
+        if (!once) entry.hot = true; // a one-pass scan is not a reuse
         if (entry.pins === 0) {
           uncharge += base(entry); // its descriptor stays charged here
-          this.#unlist(entry);
-          entry.segment = "pinned";
-          this.#pinnedBytes += entry.length;
-        }
+          // A one-pass pin leaves the entry where it is, recency and segment untouched.
+          if (once) this.#listedPinned.add(entry);
+          else this.#unlistPinned(entry);
+        } else if (!once && entry.segment !== "pinned") this.#unlistPinned(entry);
         entry.pins += 1;
+        if (once) entry.oncePins += 1;
         held.push(entry);
         resolved.set(key, entry.bytes);
       }
@@ -308,7 +335,7 @@ export class PageCache implements EvictableCacheLike {
       if (misses.length > 0)
         await this.#readMisses(misses, held, resolved, signal, options.once === true);
     } catch (error) {
-      this.#unpinAll(held);
+      this.#unpinAll(held, options.once === true);
       budget.free(total);
       throw error;
     }
@@ -325,7 +352,7 @@ export class PageCache implements EvictableCacheLike {
         released = true;
         if (VERIFY_CACHED_BYTES)
           for (const entry of held) verifyCached(entry.bytes, entry.checksum, "lease release");
-        this.#unpinAll(held);
+        this.#unpinAll(held, options.once === true);
         budget.free(total);
       },
     };
@@ -371,7 +398,7 @@ export class PageCache implements EvictableCacheLike {
           this.#misses += 1;
           // A one-pass scan keeps what it misses to itself: never admitted, never findable.
           const entry = once
-            ? this.#privateEntry(ref, address, bytes)
+            ? this.#privateEntry(ref, address, bytes, true)
             : this.#insertPinned(ref, address, bytes);
           held.push(entry);
           resolved.set(key, entry.bytes);
@@ -387,12 +414,10 @@ export class PageCache implements EvictableCacheLike {
     const existing = this.#find(ref);
     if (existing !== null) {
       if (existing.pins === 0) {
-        this.#unlist(existing);
-        existing.segment = "pinned";
-        this.#pinnedBytes += existing.length;
+        this.#unlistPinned(existing);
         // Its blob bytes move to the lease; an attached descriptor stays charged here (B2-p2e).
         this.#memory?.release(base(existing));
-      }
+      } else if (existing.segment !== "pinned") this.#unlistPinned(existing);
       existing.pins += 1;
       return existing;
     }
@@ -408,6 +433,7 @@ export class PageCache implements EvictableCacheLike {
       checksum: ref.checksum,
       bytes,
       pins: 1,
+      oncePins: 0,
       segment: "pinned",
       dropped: false,
       hot: false,
@@ -428,7 +454,7 @@ export class PageCache implements EvictableCacheLike {
     return entry;
   }
 
-  #privateEntry(ref: BlobRef, address: number, bytes: Uint8Array): Entry {
+  #privateEntry(ref: BlobRef, address: number, bytes: Uint8Array, once = false): Entry {
     this.#pinnedBytes += ref.length;
     return {
       address,
@@ -437,6 +463,7 @@ export class PageCache implements EvictableCacheLike {
       checksum: ref.checksum,
       bytes,
       pins: 1,
+      oncePins: once ? 1 : 0,
       segment: "pinned",
       dropped: true,
       hot: false,
@@ -448,10 +475,33 @@ export class PageCache implements EvictableCacheLike {
     };
   }
 
-  #unpinAll(held: readonly Entry[]): void {
+  /** Lets go of one pin per entry; `once`: the pins were a one-pass read's. */
+  #unpinAll(held: readonly Entry[], once: boolean): void {
     for (const entry of held) {
       entry.pins -= 1;
-      if (entry.pins > 0) continue;
+      if (once) entry.oncePins -= 1;
+      const listed = entry.segment !== "pinned";
+      if (entry.pins > 0) {
+        // The last ordinary pin went while one-pass pins remain: placed now, as this release
+        // would place it, and paid for by those pins' leases until the last one goes.
+        if (!once && !listed && entry.pins === entry.oncePins && !entry.dropped && !this.#closed) {
+          this.#pinnedBytes -= entry.length;
+          this.#place(entry);
+          this.#listedPinned.add(entry);
+        }
+        continue;
+      }
+      if (listed) {
+        // Only one-pass pins since it was last placed: charged again where it is.
+        this.#listedPinned.delete(entry);
+        if (!this.#chargeBase(entry)) {
+          this.#unlist(entry);
+          entry.segment = "probation";
+          this.#forget(entry);
+          this.#releaseParsed(entry);
+        }
+        continue;
+      }
       this.#pinnedBytes -= entry.length;
       if (entry.dropped || this.#closed) {
         entry.segment = "probation";
@@ -460,6 +510,14 @@ export class PageCache implements EvictableCacheLike {
       }
       this.#admit(entry);
     }
+  }
+
+  /** A pinned entry leaves its list (an ordinary use pins it, or it is dropped while pinned). */
+  #unlistPinned(entry: Entry): void {
+    this.#unlist(entry);
+    this.#listedPinned.delete(entry);
+    entry.segment = "pinned";
+    this.#pinnedBytes += entry.length;
   }
 
   /** Gives back an entry's descriptor charge (the entry is leaving the cache). */
@@ -474,30 +532,47 @@ export class PageCache implements EvictableCacheLike {
    * probation for it, or drops it with its descriptor.
    */
   #admit(entry: Entry): void {
-    const memory = this.#memory;
-    const cost = base(entry);
-    let admitted = memory?.charge(cost) ?? false;
-    if (!admitted && memory !== null && this.#probationCharge() >= cost) {
-      // Recycle probation (a scan's own pages) to make room; never protected.
-      let freed = 0;
-      while (freed < cost && this.#probation.tail !== null)
-        freed += this.#evictEntry(this.#probation.tail);
-      admitted = freed >= cost && memory.charge(cost);
-    }
-    if (!admitted) {
+    if (!this.#chargeBase(entry)) {
       entry.segment = "probation";
       this.#forget(entry);
       this.#releaseParsed(entry);
       return;
     }
+    this.#place(entry);
+  }
+
+  /** Charges an entry's base to the cache, recycling unpinned probation to make room. */
+  #chargeBase(entry: Entry): boolean {
+    const memory = this.#memory;
+    const cost = base(entry);
+    let admitted = memory?.charge(cost) ?? false;
+    if (!admitted && memory !== null && this.#probationCharge(entry) >= cost) {
+      // Recycle probation (a scan's own pages) to make room; never protected, never pinned.
+      let freed = 0;
+      for (let victim = this.#victim("probation", entry); freed < cost && victim !== null;) {
+        freed += this.#evictEntry(victim);
+        victim = this.#victim("probation", entry);
+      }
+      admitted = freed >= cost && memory.charge(cost);
+    }
+    return admitted;
+  }
+
+  /** Lists an entry as a release does: probation front, then protected if it was reused. */
+  #place(entry: Entry): void {
     entry.segment = "probation";
     entry.usedAt = performance.now();
     this.#probation.pushFront(entry);
     if (entry.hot) this.#touch(entry);
   }
 
-  #probationCharge(): number {
-    return this.#probation.bytes + ENTRY_OVERHEAD * this.#probation.count;
+  /** What evicting probation could free, apart from pinned entries and `except`. */
+  #probationCharge(except: Entry): number {
+    let pinned = 0;
+    for (const entry of this.#listedPinned)
+      if (entry.segment === "probation" || entry === except) pinned += charge(entry);
+    if (except.segment === "probation" && !this.#listedPinned.has(except)) pinned += charge(except);
+    return this.#probation.bytes + ENTRY_OVERHEAD * this.#probation.count - pinned;
   }
 
   // ── Invalidation ───────────────────────────────────────────────────────────────────────────
@@ -519,6 +594,7 @@ export class PageCache implements EvictableCacheLike {
 
   #drop(entry: Entry): void {
     if (entry.pins > 0) {
+      if (entry.segment !== "pinned") this.#unlistPinned(entry);
       entry.dropped = true;
       this.#forget(entry);
       return;

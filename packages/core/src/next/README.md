@@ -370,8 +370,10 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
   stored plain, and a map never costs more than the rows it replaces.
 - Full export (`SELECT *` over the whole table, Gate A): a sequential decode stream reads with
   `ChunkReadOptions.once` (storage `ReadOptions.once`, `PeekOptions.once`): nothing it misses is
-  admitted to the page cache, nothing it hits is promoted (synchronous peeks included), a
-  directory it parses or a gzip page it inflates is not admitted to its cache, and it attaches no
+  admitted to the page cache, nothing it hits is promoted or reordered (synchronous peeks and
+  pins included: an entry only one-pass leases pin keeps its place and last use), a
+  directory it parses or a gzip page it inflates is not admitted to its cache (reusing a cached
+  one leaves its eviction order alone: `BlobCache` one-pass pins), and it attaches no
   descriptor (the space also refuses one whose bytes are not the resident entry's own). So the
   hot working set stays and memory stays flat: the bench's hot set, protected and outside the
   export, survives whole when everything but its size is evicted afterwards (a promoting scan
