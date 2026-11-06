@@ -2844,6 +2844,50 @@ describe("SQL conformance against SQLite and PGlite", () => {
     expect(refused).toBeLessThan(keyLists.length * orders.length);
   });
 
+  it("orders DISTINCT over a USING join by a qualified merged column exactly as PostgreSQL", async () => {
+    // The merged USING column is the left input's under INNER and LEFT joins, the right input's
+    // under RIGHT, and COALESCE under FULL: a qualified key naming the supplying side is the
+    // selected column (DISTINCT may sort by it); the other side, or any side under FULL, is not.
+    const fixture = buildFixture(DEFAULT_FIXTURE_SEED);
+    const database = await minnowFixture(fixture);
+    const postgres = await pgliteOracle(fixture);
+    const mismatches: string[] = [];
+    let refused = 0;
+    let accepted = 0;
+    try {
+      for (const kind of ["JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN"])
+        for (const key of ["d.region", "m.region", "region"])
+          for (const direction of ["NULLS FIRST", "DESC NULLS LAST"]) {
+            const sql = `SELECT DISTINCT region FROM data d ${kind} dims m USING (region) ORDER BY ${key} ${direction}`;
+            let expected: string;
+            try {
+              expected = JSON.stringify((await postgres.execute({ sql, ordered: true })).rows);
+              accepted += 1;
+            } catch (error) {
+              expected = `error ${String((error as { code?: string }).code)}`;
+              refused += 1;
+            }
+            let actual: string;
+            try {
+              actual = JSON.stringify((await database.query(sql)).rows);
+            } catch (error) {
+              actual = String(error).includes("SELECT DISTINCT orders by selected columns")
+                ? "error 42P10"
+                : `error ${String(error)}`;
+            }
+            if (actual !== expected)
+              mismatches.push(`${sql}\n  pglite: ${expected}\n  minnow: ${actual}`);
+          }
+    } finally {
+      await postgres.close();
+      await database.close();
+    }
+    expect(mismatches.slice(0, 10).join("\n"), `${String(mismatches.length)} differ`).toBe("");
+    // Both outcomes are reached: the supplying side (and the bare name) run, the other refuses.
+    expect(accepted).toBeGreaterThan(8);
+    expect(refused).toBeGreaterThan(4);
+  });
+
   it("refuses a FROM list that names a source twice, exactly as PostgreSQL", async () => {
     // PostgreSQL's 42712 ("table name … specified more than once"): one FROM level names each
     // source once, whatever joins them and wherever a parenthesized group puts it. Every pair of

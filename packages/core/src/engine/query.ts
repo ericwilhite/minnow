@@ -12866,9 +12866,12 @@ function resolveOrderByOrdinals(
  * of the block's own sources counts, and only when exactly one selected column matches, so an
  * ambiguous or misspelled reference still fails in resolution.
  *
- * Not in a block whose joins merge columns (USING, NATURAL): there an unqualified name may be
- * the merged column — COALESCE(c.k, o.k) under FULL JOIN, o.k under RIGHT JOIN — which is not
- * `c.k`, so the qualified key keeps naming its source's own column (PostgreSQL).
+ * Under USING an unqualified merged name is the merged column, which is one side's column only
+ * where PostgreSQL builds it from that side: the left input's under INNER and LEFT joins (a RIGHT
+ * join reaches here mirrored, its right input first), and neither under FULL (COALESCE). So
+ * `a.k` names the selected merged `k` for the side that supplies it, and keeps naming its own
+ * column otherwise. NATURAL joins merge names not known before schema binding: there no
+ * qualified key is rewritten.
  */
 function resolveOrderQualifiers(
   orderBy: CompiledQuery["orderBy"],
@@ -12877,7 +12880,18 @@ function resolveOrderQualifiers(
   joins: readonly JoinPlan[],
 ): CompiledQuery["orderBy"] {
   const sourceAliases = [base, ...joins].map((source) => source.alias);
-  const merges = joins.some((join) => join.using !== undefined || join.natural === true);
+  const natural = joins.some((join) => join.natural === true);
+  const merged = new Set(joins.flatMap((join) => join.using ?? []));
+  // The source the merged columns are, for one INNER or LEFT USING join; otherwise none.
+  const [only, ...more] = joins;
+  const owner =
+    only !== undefined &&
+    more.length === 0 &&
+    only.using !== undefined &&
+    only.full !== true &&
+    (only.kind === "inner" || only.kind === "left")
+      ? base.alias
+      : undefined;
   return orderBy.map((order) => {
     const expression = order.expression;
     if (expression.kind !== "column") return order;
@@ -12896,7 +12910,8 @@ function resolveOrderQualifiers(
     }
     const qualifier = expression.reference.slice(0, separator);
     const column = expression.reference.slice(separator + 1);
-    if (merges || !sourceAliases.includes(qualifier)) return order;
+    if (natural || !sourceAliases.includes(qualifier)) return order;
+    if (merged.has(column) && qualifier !== owner) return order;
     const matches = select.filter(
       (item) =>
         item.expression.kind === "column" &&
