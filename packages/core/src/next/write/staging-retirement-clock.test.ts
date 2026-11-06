@@ -1,12 +1,12 @@
 /**
  * R23.5: short cached walks share the worker task budget, including work before the first walk.
- * Derived from review 3's many-tables-clock-probe. Real tasks/timers; only monotonic work time is
- * injected: each observed group root costs 0.25 ms. Each table stays below one 4 ms slice.
+ * Derived from review 3's many-tables-clock-probe. Real timers; shared task time charges each observed group root 0.25 ms. The device clock is
+ * fixed, so a private deadline cannot silently replace the injected shared clock. Each table stays below one 4 ms slice.
  * The first publication after recovery must yield during cumulative retirement work.
  */
 import { expect, it, vi } from "vitest";
 import { createReach } from "../../testing/reach.js";
-import * as merge from "./merge.js";
+import * as pipeline from "../exec/pipeline.js";
 import {
   autocommit,
   batch,
@@ -52,18 +52,23 @@ it.each([0, 10])(
       await statement.end();
       const q = await h.crash();
       const t = tables[tables.length - 1] ?? 0;
-      let clock = priorWork;
+      let clock = 0;
       let timer = false;
       let firstRootAt = 0;
       let reads = 0;
       let yielded = false;
       const rootsAtYield: number[] = [];
-      const realYield = merge.yieldTask;
-      vi.spyOn(merge, "yieldTask").mockImplementation(async () => {
+      const realYield = pipeline.yieldTask;
+      vi.spyOn(pipeline, "yieldTask").mockImplementation(async () => {
         rootsAtYield.push(reads);
         await realYield();
       });
-      vi.spyOn(performance, "now").mockImplementation(() => clock);
+      // Keep the device clock fixed: retirement must honor the injected shared task clock.
+      vi.spyOn(performance, "now").mockReturnValue(0);
+      vi.spyOn(pipeline.taskClock, "now").mockImplementation(() => clock);
+      pipeline.beginTask(); // Model one real task entry before any prior synchronous work.
+      const epoch = pipeline.taskClock.epoch;
+      clock += priorWork;
       const observedRoot = () => {
         clock += 0.25;
         if (reads++ === 0) {
@@ -97,6 +102,9 @@ it.each([0, 10])(
       reach.reach("short walks accumulate");
       if (priorWork > 0) reach.reach("prior task work");
       expect(yielded, "a timer runs before the last short walk completes").toBe(true);
+      expect(pipeline.taskClock.epoch, "real yields advance the shared task clock").toBeGreaterThan(
+        epoch,
+      );
       if (priorWork > 0)
         expect(rootsAtYield[0], "work before the first walk is not forgotten").toBe(0);
     } finally {

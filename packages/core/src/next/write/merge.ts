@@ -30,9 +30,9 @@
  *   counted, and it is retried once with a quarter of the split bound before the inputs are left
  *   alone until they change.
  * - Charges its working memory to a grant of its own, admitted before it starts.
- * - Yields to the event loop (a task, not a microtask) after `YIELD_INTERVAL_MS` of synchronous work
- *   (ruling R23), and stops at a slice boundary when the write path closes. Its scratch is owned by
- *   the merge (never module-level), so two merges could interleave.
+ * - Yields to the event loop (a task, not a microtask) when the shared worker clock is due
+ *   (exec/pipeline.ts, ruling R23.5), and stops at a slice boundary when the write path closes.
+ *   Its scratch is owned by the merge (never module-level), so two merges could interleave.
  * - Publishes by root swap under the write path's publish lock (engine.ts), retiring its inputs'
  *   extents; the extent space's two-generation reclaim and the readers' pins keep older views'
  *   runs readable. A crash before the publish leaves orphans the next open frees.
@@ -42,13 +42,14 @@ import type { Grant } from "../memory/governor.js";
 import type { SpaceReader } from "../access/space.js";
 import type { ExtentBuilder, ExtentWriter, ReadLease } from "../storage/extents.js";
 import { compareBytes } from "../vector/varlen.js";
+import { taskClock, yieldTask } from "../exec/pipeline.js";
 import { need } from "./bytes.js";
 import { RunEncoder, type RunReader } from "./runs.js";
 
+export { yieldTask, YIELD_INTERVAL_MS } from "../exec/pipeline.js";
+
 /** Sorted runs per level before the level is merged. */
 export const FAN_IN = 8;
-/** Synchronous work between task yields (ruling R23; exec/pipeline.ts `YIELD_INTERVAL_MS`). */
-export const YIELD_INTERVAL_MS = 4;
 /** An output run is split at the next key boundary once its block index or fences pass this. */
 export const SPLIT_BYTES = 896 * 1024;
 /** Encoded parts are appended to the output extent this many bytes at a time. */
@@ -75,21 +76,6 @@ export const DEFAULT_MERGE_POLICY: MergePolicy = {
   splitEntries: null,
   sliceEntries: null,
 };
-
-/** Resolves in a later task, so pending messages and timers run first (exec/pipeline.ts). */
-export function yieldTask(): Promise<void> {
-  return new Promise<void>((resolve) => {
-    if (typeof setImmediate === "function") setImmediate(resolve);
-    else {
-      const channel = new MessageChannel();
-      channel.port1.onmessage = () => {
-        channel.port1.close();
-        resolve();
-      };
-      channel.port2.postMessage(null);
-    }
-  });
-}
 
 /**
  * Sorted runs among `runs[from, to)`, all of one level (see "Levels"): every run but the
@@ -370,7 +356,6 @@ export async function mergeRuns(input: MergeInput): Promise<MergeOutput> {
   };
   try {
     for (const cursor of cursors) if (await cursor.load()) heap.push(cursor);
-    let sliceStart = performance.now();
     let sinceCheck = 0;
     while (heap.items.length > 0) {
       const top = need(heap.items[0]);
@@ -395,13 +380,12 @@ export async function mergeRuns(input: MergeInput): Promise<MergeOutput> {
       sinceCheck += 1;
       const due =
         policy.sliceEntries === null
-          ? sinceCheck >= 256 && performance.now() - sliceStart >= YIELD_INTERVAL_MS
+          ? sinceCheck >= 256 && taskClock.due()
           : sinceCheck >= policy.sliceEntries;
       if (due) {
         await yieldTask();
         slices += 1;
         if (input.stopped()) throw new MergeAbortedError();
-        sliceStart = performance.now();
         sinceCheck = 0;
       } else if (sinceCheck >= 256 && policy.sliceEntries === null) sinceCheck = 0;
     }
