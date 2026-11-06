@@ -329,6 +329,8 @@ const IN_ORDER = CASES.filter((c) => !c.call.distinct);
 const SORTED = CASES.filter((c) => c.call.distinct);
 /** SUM(float8) alone: its 22003 is not masked by AVG's (which overflows on more inputs). */
 const FLOAT_SUM = CASES.filter((c) => c.sql === "sum(f)");
+/** AVG alone, so another aggregate cannot mask its transition. */
+const FLOAT_AVG = CASES.filter((c) => c.sql === "avg(f)");
 /** SUM(float8) with COUNT(*): two row-layout members, so its 22003 is judged in that layout too. */
 const FLOAT_SUM_COUNT = CASES.filter((c) => c.sql === "sum(f)" || c.sql === "count(*)");
 /** COUNT and float SUM/AVG together (AVG's 22003 masks SUM's, which FLOAT_SUM_COUNT judges). */
@@ -371,7 +373,9 @@ class Collect implements Operator {
   }
 }
 
-async function postgres(sql: string): Promise<string[][] | { error: string }> {
+type PgOutcome = string[][] | { error: string };
+
+async function postgres(sql: string): Promise<PgOutcome> {
   try {
     const result = await pg.query<Record<string, string | null>>(sql);
     return result.rows.map((row) => Object.values(row).map((v) => v ?? "NULL"));
@@ -396,7 +400,8 @@ async function judge(
   cases: readonly Case[],
   split: number,
   encode: boolean,
-): Promise<void> {
+  query: typeof postgres = postgres,
+): Promise<PgOutcome> {
   const keyTypes = key === null ? [] : [at(INPUT, key)];
   const output: OutputColumn[] = [
     ...keyTypes.map((type) => ({ name: "key", type, nullable: true })),
@@ -452,12 +457,12 @@ async function judge(
     "(null::int4, null::text, null::int4, null::int8, null::float8, null::numeric, null::numeric(12,2), null::bool)";
   const keySql = key === null ? "" : `${COLUMN_SQL[key] ?? ""}::text as key, `;
   const sql = `select ${keySql}${cases.map((c, k) => `(${c.sql})::text as a${String(k)}`).join(", ")} from (values ${rows.length === 0 ? empty : values}) v(${COLUMN_SQL.join(", ")})${rows.length === 0 ? " where false" : ""}${key === null ? "" : ` group by ${COLUMN_SQL[key] ?? ""}`}`;
-  const theirs = await postgres(sql);
+  const theirs = await query(sql);
   if ("error" in theirs) {
     // An error is the aggregates' only if the input relation stands on its own: every column
     // cast and output (PostgreSQL may prune what a query does not use, so not a COUNT).
     const input = `select ${COLUMN_SQL.map((c) => `${c}::text`).join(", ")} from (values ${rows.length === 0 ? empty : values}) v(${COLUMN_SQL.join(", ")})`;
-    const alone = await postgres(input);
+    const alone = await query(input);
     if ("error" in alone)
       throw new Error(
         `Harness bug: the input itself fails in PostgreSQL (${alone.error}): ${input}`,
@@ -465,7 +470,7 @@ async function judge(
   }
   if ("error" in theirs || "error" in ours) {
     expect(ours, sql).toEqual(theirs);
-    return;
+    return theirs;
   }
   // A NUMERIC group's key is one of its values (1.5 or 1.50): compare keys by value.
   const byValue = (text: string) =>
@@ -490,6 +495,7 @@ async function judge(
         expect(close(x, y), `${sql}\nrow ${String(r)} col ${String(c)}: ${x} vs ${y}`).toBe(true);
       else expect(x, `${sql}\nrow ${String(r)} col ${String(c)}`).toBe(y);
     }
+  return theirs;
 }
 
 type FloatEvent = "overflow" | "Sxx-only overflow" | "opposite infinities" | "NaN with Infinity";
@@ -557,6 +563,39 @@ function avgEvents(values: ReadonlyArray<number | null>): Set<FloatEvent> {
     sxx = sxx1;
   }
   return events;
+}
+
+type OverflowState =
+  "float SUM overflow in a group" | "AVG overflow" | "Sxx-only overflow (finite sum)";
+
+/**
+ * Credit errors only after one group and one aggregate have independently reached them in
+ * PostgreSQL and matched the executor. A query-wide 22003 cannot prove later groups ran.
+ */
+async function observedOverflows(
+  rows: readonly Row[],
+  split: number,
+  query: typeof postgres = postgres,
+): Promise<Set<OverflowState>> {
+  const groups = new Map<string | null, Row[]>();
+  for (const row of rows) groups.set(row.t, [...(groups.get(row.t) ?? []), row]);
+  const observed = new Set<OverflowState>();
+  for (const group of groups.values()) {
+    const values = group.map((row) => row.f);
+    if (sumEvents(values).has("overflow")) {
+      const outcome = await judge(group, null, FLOAT_SUM, split, false, query);
+      expect(outcome).toEqual({ error: "22003" });
+      observed.add("float SUM overflow in a group");
+    }
+    const average = avgEvents(values);
+    if (average.has("overflow")) {
+      const outcome = await judge(group, null, FLOAT_AVG, split, false, query);
+      expect(outcome).toEqual({ error: "22003" });
+      observed.add("AVG overflow");
+      if (average.has("Sxx-only overflow")) observed.add("Sxx-only overflow (finite sum)");
+    }
+  }
+  return observed;
 }
 
 describe("aggregation against PostgreSQL (PGlite, generated)", () => {
@@ -648,15 +687,123 @@ describe("aggregation against PostgreSQL (PGlite, generated)", () => {
     );
   });
 
+  it("review B4-p2d-2: refuses an invalid unused input even when SUM has the same SQLSTATE", async () => {
+    const rows: Row[] = [1e308, 1e308].map((f) => ({
+      k: 1,
+      t: "a",
+      i: -(2 ** 31),
+      b: 1n,
+      f,
+      n: null,
+      m: null,
+      flag: true,
+    }));
+    // Inject the old unquoted literal into an unused projection at the oracle boundary.
+    // A derived SELECT lets PostgreSQL prune i for COUNT(*) / SUM(f), while projecting every
+    // input column must evaluate it. A bare VALUES cast would also fail COUNT's planning.
+    const columns = COLUMN_SQL.join(", ");
+    const badInput = (sql: string) =>
+      postgres(
+        sql
+          .replace(
+            "from (values ",
+            "from (select k, t, -2147483648::int4 as i, b, f, n, m, flag from (values ",
+          )
+          .replace(`) v(${columns})`, `) input_rows(${columns})) v(${columns})`),
+      );
+    await expect(
+      judge(rows, null, FLOAT_SUM, 1, false, badInput),
+      "Harness bug: invalid input must be refused before matching aggregate SQLSTATEs",
+    ).rejects.toThrow("Harness bug: the input itself fails in PostgreSQL (22003)");
+  });
+
+  it.each(SEEDS)(
+    "review B4-p2d-2: a masked group's overflow needs an independent execution (seed %i)",
+    async (seed) => {
+      const reach = createReach("next-aggregate-overflow-masking", [
+        "positive earlier overflow",
+        "negative earlier overflow",
+        "later group masked",
+        "masked overflow independently reached",
+        "Sxx positive first",
+        "Sxx negative first",
+        "masking across batches",
+      ] as const);
+      // Sequence changes survive a failed statement. The volatile AVG input records which
+      // group's transitions PostgreSQL actually reached, without assuming its grouping plan.
+      await pg.exec(`
+        create sequence if not exists b4_mask_a;
+        create sequence if not exists b4_mask_b;
+        create or replace function b4_mask_tap(g text, x float8) returns float8
+        language plpgsql volatile as $$ begin
+          perform nextval(case when g = 'a' then 'b4_mask_a' else 'b4_mask_b' end);
+          return x;
+        end $$;
+      `);
+      const reset = () =>
+        pg.exec("select setval('b4_mask_a', 1, false), setval('b4_mask_b', 1, false)");
+      const called = async () =>
+        (await pg.query<{ is_called: boolean }>("select is_called from b4_mask_b")).rows[0]
+          ?.is_called;
+      const trace = (sql: string) => postgres(sql.replaceAll("avg(f)", "avg(b4_mask_tap(t, f))"));
+      await fc.assert(
+        fc.asyncProperty(
+          fc.constantFrom(-1, 1),
+          fc.integer({ min: 2, max: 4 }),
+          fc.constantFrom(1e154, 1.5e154),
+          fc.boolean(),
+          fc.integer({ min: 1, max: 6 }),
+          async (sign, earlyCount, magnitude, positiveFirst, split) => {
+            reach.beginHistory();
+            reach.reach(sign > 0 ? "positive earlier overflow" : "negative earlier overflow");
+            reach.reach(positiveFirst ? "Sxx positive first" : "Sxx negative first");
+            if (split < earlyCount) reach.reach("masking across batches");
+            const row = (t: string, f: number): Row => ({
+              k: 1,
+              t,
+              i: 1,
+              b: 1n,
+              f,
+              n: null,
+              m: null,
+              flag: true,
+            });
+            const first = positiveFirst ? magnitude : -magnitude;
+            const rows = [
+              ...Array.from({ length: earlyCount }, () => row("a", sign * 1e308)),
+              row("b", first),
+              row("b", -first),
+            ];
+            await reset();
+            await judge(rows, 1, EXTREME_FLOAT_CASES, split, false, trace);
+            const masked = (await called()) === false;
+            if (masked) reach.reach("later group masked");
+            await reset();
+            const observed = await observedOverflows(rows, split, trace);
+            expect(observed.has("Sxx-only overflow (finite sum)")).toBe(true);
+            expect(
+              await called(),
+              "overflow reach requires PostgreSQL to execute the later group",
+            ).toBe(true);
+            if (masked) reach.reach("masked overflow independently reached");
+          },
+        ),
+        { seed, numRuns: 40 },
+      );
+      reach.assertReached();
+    },
+    180_000,
+  );
+
   it.each(SEEDS)(
     "COUNT and float SUM/AVG over extreme float8 values, grouped, against PostgreSQL (seed %i)",
     async (seed) => {
       // f is mostly ±1e308, ±1e154, ±Infinity, NaN and −0 in two or three groups, so float8pl's
       // and float8_accum's 22003 rules (including Sxx's own overflow around 1e154, where the sum
       // stays finite) and SUM's −0 identity are judged per group; the main property rarely puts
-      // such values together in one group. Reach marks what PostgreSQL's transitions actually
-      // did, in input order (sumEvents, avgEvents), and a result state only when no group's
-      // 22003 hid the query's results.
+      // such values together in one group. Overflow reach is witnessed by isolated group /
+      // aggregate queries, never inferred from a combined query's error. Result states require
+      // the COUNT + SUM query to complete, so another group cannot hide their results.
       const reach = createReach("next-aggregate-pglite-extreme-float", [
         "float SUM overflow in a group",
         "AVG overflow",
@@ -693,15 +840,11 @@ describe("aggregation against PostgreSQL (PGlite, generated)", () => {
             const groups = new Map<string | null, Array<number | null>>();
             for (const r of rows) groups.set(r.t, [...(groups.get(r.t) ?? []), r.f]);
             const sums = [...groups.values()].map(sumEvents);
-            const avgs = [...groups.values()].map(avgEvents);
-            const sumFails = sums.some((e) => e.has("overflow"));
-            const avgFails = avgs.some((e) => e.has("overflow"));
-            if (sumFails) reach.reach("float SUM overflow in a group");
-            if (avgFails) reach.reach("AVG overflow");
-            if (avgs.some((e) => e.has("Sxx-only overflow")))
-              reach.reach("Sxx-only overflow (finite sum)");
-            // COUNT(*) + SUM(f) shows its results unless a SUM failed.
-            if (!sumFails) {
+            for (const state of await observedOverflows(rows, split)) reach.reach(state);
+            await judge(rows, 1, EXTREME_FLOAT_CASES, split, false);
+            const actualSums = await judge(rows, 1, FLOAT_SUM_COUNT, split, false);
+            // Only a successful COUNT + SUM execution proves that all its result states ran.
+            if (!("error" in actualSums)) {
               if (sums.some((e) => e.has("opposite infinities")))
                 reach.reach("opposite infinities (NaN)");
               if (sums.some((e) => e.has("NaN with Infinity"))) reach.reach("NaN with Infinity");
@@ -711,8 +854,6 @@ describe("aggregation against PostgreSQL (PGlite, generated)", () => {
                 if (values.length > 0 && values.every((v) => Object.is(v, -0)))
                   reach.reach("negative-zero-only group");
             }
-            await judge(rows, 1, EXTREME_FLOAT_CASES, split, false);
-            await judge(rows, 1, FLOAT_SUM_COUNT, split, false);
           },
         ),
         { seed, numRuns: 120 },
