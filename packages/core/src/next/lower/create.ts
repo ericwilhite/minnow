@@ -6,6 +6,7 @@ import type { CreateTableInput } from "../../engine/catalog-mutations.js";
 import type { CompiledStatement, TransactionMode } from "../../engine/query.js";
 import type { OutputColumn, PhysicalPlan, Rel } from "../ir/ir.js";
 import type { TableRuleExpressions } from "../ir/rules.js";
+import { samePhysicalType } from "../types.js";
 import { ParameterTypes } from "./coerce.js";
 import { descriptorOf, lowerDdl, tableInput } from "./ddl.js";
 import { frontEndError, PlanningError } from "./errors.js";
@@ -38,7 +39,13 @@ import {
   PlanBuilder,
   type RelColumn,
 } from "./query.js";
-import { liftedSlotsAreEquivalent, parameterize, type ParameterizedText } from "./parameterize.js";
+import {
+  liftedSlotsAreEquivalent,
+  parameterize,
+  type NotParameterizable,
+  type ParameterizedPlan,
+  type ParameterizedText,
+} from "./parameterize.js";
 import { resultColumn } from "./result.js";
 import { lowerTableRules } from "./rules.js";
 import { classifyStatement } from "./statement.js";
@@ -395,7 +402,23 @@ export function createLowerer(): Lowerer {
     lowerParameterized(
       parameterized: ParameterizedText,
       context: LoweringContext,
-    ): LoweredStatement | null {
+    ): ParameterizedPlan | NotParameterizable {
+      const refused: NotParameterizable = { kind: "notParameterizable", key: parameterized.key };
+      // Each slot takes exactly the type lowering gives its literal, by the same front end and
+      // lowering rather than a parallel rule (`-2147483648` is int8, and past 2^53 whatever the
+      // front end makes of it); where that type is not the class's, the family is not lifted.
+      for (const [index, literal] of parameterized.literals.entries()) {
+        let alone: LoweredStatement;
+        try {
+          alone = lowerStatement(`SELECT ${literal} AS v`, { ...context, parameterTypes: [] });
+        } catch {
+          return refused;
+        }
+        const type = alone.kind === "query" ? alone.plan.columns[0]?.type : undefined;
+        const slot = parameterized.types[index];
+        if (type === undefined || slot === undefined || !samePhysicalType(type, slot))
+          return refused;
+      }
       const own = context.parameterTypes ?? [];
       const parameterTypes = [
         ...Array.from({ length: parameterized.placeholders }, (_, index) => own[index] ?? null),
@@ -406,23 +429,28 @@ export function createLowerer(): Lowerer {
         lowered = lowerStatement(parameterized.text, { ...context, parameterTypes });
       } catch {
         // The original text lowers (or fails) on its own; the rewrite must not decide it.
-        return null;
+        return refused;
       }
-      if (lowered.kind !== "query" && lowered.kind !== "modify") return null;
+      if (lowered.kind !== "query" && lowered.kind !== "modify") return refused;
       const first = parameterized.placeholders;
       const lifted = new Set(parameterized.types.map((_, index) => first + index));
-      if (!liftedSlotsAreEquivalent(lowered.plan, lifted)) return null;
+      if (!liftedSlotsAreEquivalent(lowered.plan, lifted)) return refused;
       // A lifted slot whose type lowering did not keep (a placeholder typed by its context).
       if (
-        parameterized.types.some(
-          (type, index) => lowered.plan.parameters[first + index]?.kind !== type.kind,
-        )
+        parameterized.types.some((type, index) => {
+          const kept = lowered.plan.parameters[first + index];
+          return kept === undefined || !samePhysicalType(kept, type);
+        })
       )
-        return null;
+        return refused;
       return {
-        ...lowered,
-        parameters: lowered.parameters.slice(0, first),
-        liftedParameters: parameterized.types.length,
+        kind: "parameterized",
+        key: parameterized.key,
+        statement: {
+          ...lowered,
+          parameters: lowered.parameters.slice(0, first),
+          liftedParameters: parameterized.types.length,
+        },
       };
     },
   };

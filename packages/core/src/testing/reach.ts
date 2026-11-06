@@ -569,3 +569,16 @@ export const REFERENCE_DECIMAL_ARITH_STATES = [
   "large",
   "fractional",
 ] as const;
+
+/**
+ * Literal auto-parameterization over integer boundaries (next/testing/autoparameterize.test.ts):
+ * a literal lifted into an int4 or int8 slot, a family refused (the original text lowers alone),
+ * and a literal the scanner leaves as written (past int8). Reachable before and after integer
+ * literals past 2^53 lower as int8.
+ */
+export const AUTOPARAMETERIZE_LITERAL_STATES = [
+  "lifted int4",
+  "lifted int8",
+  "refused",
+  "not lifted",
+] as const;

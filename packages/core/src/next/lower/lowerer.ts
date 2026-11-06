@@ -57,7 +57,7 @@ import type { ExecutorCosts } from "../ir/costs.js";
 import type { PhysicalPlan } from "../ir/ir.js";
 import type { TableRuleExpressions } from "../ir/rules.js";
 import type { PhysicalType } from "../types.js";
-import type { ParameterizedText } from "./parameterize.js";
+import type { NotParameterizable, ParameterizedPlan, ParameterizedText } from "./parameterize.js";
 import type { ResultColumn } from "./result.js";
 import type { StatementKind } from "./statement.js";
 import type { PlanningStatistics, StatisticsBasis } from "./statistics.js";
@@ -240,15 +240,22 @@ export interface Lowerer {
    */
   parameterize(text: string): ParameterizedText | null;
   /**
-   * `parameterized.text` lowered with its lifted slots typed as their literals, or null when a
-   * lifted slot is used where it is not equivalent to the literal (or the rewritten text does not
-   * lower): the owner then lowers the original text and caches it under that text. A non-null
-   * result binds the client's parameters (`parameters`) then `parameterized.values`
-   * (`liftedParameters` slots), and serves every text with the same `key`.
+   * The plan every text with `parameterized.key` shares, or a NotParameterizable marker for the
+   * key. The plan cache rule (B5):
+   * - look the key up first; a ParameterizedPlan runs with `bindParameterized(plan,
+   *   parameterized, clientParameters)`, which refuses another key's text;
+   * - a NotParameterizable marker under the key means: lower this text with `lower(text)` and
+   *   cache that plan under the text itself, binding only the client's parameters;
+   * - on a miss, call this and cache its result (plan or marker) under the key.
+   * A plan from `lower(text)` is never cached under a normalized key: its literals are constants,
+   * so another text of the family would run with this text's values.
+   * The plan is accepted only when each lifted slot has exactly the type lowering gives its
+   * literal alone and is used where a slot is the literal (an `=` operand of the same type or an
+   * index key); otherwise, or when the rewrite does not lower, the marker.
    */
   lowerParameterized(
     parameterized: ParameterizedText,
     context: LoweringContext,
-  ): LoweredStatement | null;
+  ): ParameterizedPlan | NotParameterizable;
   lowerSchemaTable(input: CreateTableInput, catalog: CatalogView): CatalogChange;
 }

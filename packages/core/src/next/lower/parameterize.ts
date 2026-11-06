@@ -4,18 +4,26 @@
  *
  * 1. `parameterize(text)` scans the text (no parse) and lifts each integer or plain string
  *    literal that is the whole right operand of `=` into a trailing placeholder, `$k` after the
- *    statement's own. The cache key is the rewritten text plus each lifted literal's type class,
- *    so texts that differ only in those values share a key, and `42` (integer) never shares one
- *    with `5000000000` (bigint) or `'42'` (text).
- * 2. `lowerParameterized` lowers the rewritten text with every lifted slot fixed to its
- *    literal's own type (int4, int8 or text, PostgreSQL's types for those literals), then checks
- *    each use of a lifted slot in the IR. A slot may be only an operand of `=` against the same
- *    type, or a key of an index lookup or range, directly or through a widening integer cast.
- *    There a slot is equivalent to the literal for every value of its class: the comparison is
- *    the same, and no decision of lowering read the value (equality estimates use distinct
- *    counts, never the constant). Any other use (a cast, a function argument, an ordinal, a
- *    LIMIT, a range bound costed from the value), or a lowering failure, returns null: the owner
- *    lowers the original text and caches it under that text.
+ *    statement's own. The cache key is the rewritten text plus each lifted literal's class:
+ *    integers by the magnitude of their digits (to int4, to 2^53 − 1, to int8; the front end
+ *    negates in the unsigned literal's type, so `-2147483648` is in the second), or text. Texts
+ *    that differ only in those values share a key; `42` never shares one with `5000000000` or
+ *    `'42'`.
+ * 2. `lowerParameterized` first types each lifted literal as lowering types it alone (the same
+ *    front end, not a parallel rule) and refuses unless that is the class's slot type: int4,
+ *    int8 or text. Past 2^53 that holds only once the front end types those literals int8.
+ *    It then lowers the rewritten text with the slots fixed to those types and checks each use
+ *    of a lifted slot in the IR. A slot may be only an operand of `=` against the same type, or
+ *    a key of an index lookup or range, directly or through a widening integer cast. There a
+ *    slot is equivalent to the literal for every value of its class: the comparison is the
+ *    same, and no decision of lowering read the value (equality estimates use distinct counts,
+ *    never the constant). Any other use (a cast, a function argument, an ordinal, a LIMIT, a
+ *    range bound costed from the value), or a lowering failure, refuses.
+ *
+ * The result is a `ParameterizedPlan` or a `NotParameterizable` marker for the key, never a raw
+ * plan, and a plan binds only a text of its own key (`bindParameterized`). The owner caches the
+ * result under the key; for a marker it lowers each text itself and caches that plan under the
+ * text, never under the key (Lowerer.lowerParameterized states the rule).
  *
  * Not lifted: decimal and float literals, typed literals (`DATE '…'`, `'…'::int`, `E'…'`),
  * assignments (`SET a = 5`), and literals anywhere but directly after `=`. Statements other than SELECT, WITH, INSERT, UPDATE and
@@ -23,6 +31,7 @@
  */
 import type { Rel, ScalarExpr } from "../ir/ir.js";
 import type { PhysicalType } from "../types.js";
+import type { LoweredStatement } from "./lowerer.js";
 
 /** A statement with its liftable literals moved into trailing placeholders. */
 export interface ParameterizedText {
@@ -34,16 +43,55 @@ export interface ParameterizedText {
   readonly placeholders: number;
   /** The lifted literals' values, bound after the statement's own parameters. */
   readonly values: ReadonlyArray<number | bigint | string>;
-  /** The lifted slots' types: the literals' own (int4, int8, text). */
+  /**
+   * The lifted slots' candidate types, one per magnitude class (int4; int8 past int4; int8 past
+   * 2^53; text). lowerParameterized keeps a slot only if lowering gives the literal itself
+   * exactly this type, else the family is not parameterizable.
+   */
   readonly types: readonly PhysicalType[];
+  /** The lifted literals as written (with a unary minus), to type them as lowering does. */
+  readonly literals: readonly string[];
+}
+
+/**
+ * A plan for every text with this key (Lowerer.lowerParameterized): bind its values with
+ * `bindParameterized`. Only lowerParameterized makes one, so a cache keyed by `key` can only
+ * hold plans whose literals are slots.
+ */
+export interface ParameterizedPlan {
+  readonly kind: "parameterized";
+  readonly key: string;
+  readonly statement: LoweredStatement;
+}
+
+/**
+ * The family `key` names cannot share a plan: every text with this key is lowered from its own
+ * text (and cached under that text, never under `key`). Cache this marker under `key`.
+ */
+export interface NotParameterizable {
+  readonly kind: "notParameterizable";
+  readonly key: string;
+}
+
+/**
+ * The parameters to run `plan` for `parameterized` with: the client's, then the lifted values.
+ * Throws unless `parameterized` has the plan's key, so a plan never runs another family's text.
+ */
+export function bindParameterized(
+  plan: ParameterizedPlan,
+  parameterized: ParameterizedText,
+  clientParameters: readonly unknown[],
+): unknown[] {
+  if (plan.key !== parameterized.key)
+    throw new TypeError("a parameterized plan bound for another statement family");
+  return [...clientParameters, ...parameterized.values];
 }
 
 const INT4: PhysicalType = { kind: "int32", bits: 32 };
 const INT8: PhysicalType = { kind: "int64" };
 const TEXT: PhysicalType = { kind: "text" };
-const INT4_MIN = -2147483648n;
 const INT4_MAX = 2147483647n;
-const INT8_MIN = -9223372036854775808n;
+const SAFE_MAX = 9007199254740991n;
 const INT8_MAX = 9223372036854775807n;
 
 /** Statements whose `=` operands are expressions (not DDL options or SET values). */
@@ -244,6 +292,8 @@ export function parameterize(text: string): ParameterizedText | null {
     end: number;
     value: number | bigint | string;
     type: PhysicalType;
+    spelling: string;
+    family: string;
   }> = [];
   // Inside SET (UPDATE, ON CONFLICT DO UPDATE) `=` assigns: a cast of the literal, not a
   // comparison, so its literals stay (lowerParameterized would refuse the whole statement).
@@ -280,12 +330,25 @@ export function parameterize(text: string): ParameterizedText | null {
     if (!ends) continue;
     const start = negative ? (tokens[index - 1]?.start ?? token.start) : token.start;
     if (token.kind === "integer") {
+      // Classes by the digits' magnitude, sign aside: the front end types the unsigned literal,
+      // then negates it in that type (`-2147483648` is int8), so every literal of one class gets
+      // one type from lowering. Past int8 the literal is numeric, never lifted.
       const digits = BigInt(text.slice(token.start, token.end));
       const value = negative ? -digits : digits;
-      if (value >= INT4_MIN && value <= INT4_MAX)
-        lifted.push({ start, end: token.end, value: Number(value), type: INT4 });
-      else if (value >= INT8_MIN && value <= INT8_MAX)
-        lifted.push({ start, end: token.end, value, type: INT8 });
+      const spelling = text.slice(start, token.end);
+      if (digits <= INT4_MAX)
+        lifted.push({
+          start,
+          end: token.end,
+          value: Number(value),
+          type: INT4,
+          spelling,
+          family: "i",
+        });
+      else if (digits <= SAFE_MAX)
+        lifted.push({ start, end: token.end, value, type: INT8, spelling, family: "l" });
+      else if (digits <= INT8_MAX)
+        lifted.push({ start, end: token.end, value, type: INT8, spelling, family: "L" });
       continue;
     }
     lifted.push({
@@ -293,6 +356,8 @@ export function parameterize(text: string): ParameterizedText | null {
       end: token.end,
       value: text.slice(token.start + 1, token.end - 1).replaceAll("''", "'"),
       type: TEXT,
+      spelling: text.slice(token.start, token.end),
+      family: "s",
     });
   }
   if (lifted.length === 0) return null;
@@ -301,7 +366,7 @@ export function parameterize(text: string): ParameterizedText | null {
   let cursor = 0;
   for (const [position, literal] of lifted.entries()) {
     rewritten += `${text.slice(cursor, literal.start)}$${String(placeholders + position + 1)}`;
-    classes += literal.type.kind === "int32" ? "i" : literal.type.kind === "int64" ? "l" : "s";
+    classes += literal.family;
     cursor = literal.end;
   }
   rewritten += text.slice(cursor);
@@ -311,6 +376,7 @@ export function parameterize(text: string): ParameterizedText | null {
     placeholders,
     values: lifted.map((literal) => literal.value),
     types: lifted.map((literal) => literal.type),
+    literals: lifted.map((literal) => literal.spelling),
   };
 }
 

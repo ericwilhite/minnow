@@ -1269,10 +1269,13 @@ with a fixed threshold; use `MODE=encode` and `MODE=filter` in interleaved round
   decided (a unique-key lookup, a lone scan) has an empty `basis`, so its hit skips the check.
 - Literal auto-parameterization (`parameterize.ts`): `parameterize(text)` lifts each integer or
   plain string literal that is the whole operand of `=` into a trailing placeholder and returns
-  the cache key texts differing only in those values share (a text scan, ~4 µs);
-  `lowerParameterized` lowers the rewrite with the slots typed as the literals and accepts it only
-  where each lifted slot is an `=` operand of the same type or an index key (else null: lower the
-  text). A literal point-read loop over 10,000 keys lowers once.
+  the cache key texts differing only in those values share (a text scan, ~4 µs).
+  `lowerParameterized` gives a lifted slot exactly the type lowering gives its literal alone and
+  accepts the rewrite only where each slot is an `=` operand of the same type or an index key.
+  It returns a `ParameterizedPlan` (run with `bindParameterized`, which refuses another key's
+  text) or a `NotParameterizable` marker. Cache rule: cache the result under the key; on a marker
+  lower each text itself and cache that plan under the text, never under the key. A literal
+  point-read loop over 10,000 keys lowers once.
 - Every failure is a `PlanningError` with PostgreSQL's SQLSTATE (42601 syntax, 42P01 relation,
   42703 column, 42883 function, 42704 type, …) or an `UnsupportedPlanError` (0A000). Front-end
   errors are translated by message (`frontEndError`), keeping the parse position and the
