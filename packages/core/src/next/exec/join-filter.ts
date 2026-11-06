@@ -29,7 +29,14 @@ import type { JoinKind } from "../ir/ir.js";
 import type { PhysicalType } from "../types.js";
 import type { ByteCharge } from "../vector/varlen.js";
 import type { Selection, Vector } from "../vector/vector.js";
-import { KeyLayout, KeyScratch, extractKeys, fmix32 } from "./join-keys.js";
+import {
+  KeyLayout,
+  KeyScratch,
+  KeyWork,
+  extractKeys,
+  extractKeysJob,
+  fmix32,
+} from "./join-keys.js";
 import type { ColumnStore } from "./column-store.js";
 import { Slice, runToEnd, type SlicedJob } from "./slices.js";
 
@@ -161,10 +168,15 @@ export class JoinRuntimeFilter {
       unsafe: false,
       keys: 0,
     };
-    function* visit(each: (k: number) => void): SlicedJob<void> {
+    // Bytes keys hash through the resumable key job, every byte counted (review B7-p2c-3);
+    // only the Bloom pass hashes at all.
+    const work = new KeyWork();
+    function* visit(each: (k: number) => void, hash = false): SlicedJob<void> {
       for (let chunk = 0; chunk < store.chunkCount; chunk++) {
         const vector = store.chunk(column, chunk);
-        const count = extractKeys([vector], null, 0, vector.length, scratch);
+        const count = hash
+          ? yield* extractKeysJob([vector], null, 0, vector.length, scratch, work, slice)
+          : extractKeys([vector], null, 0, vector.length, scratch, false);
         for (let k = 0; k < count; k++) {
           if ((scratch.nulls[k] ?? 0) !== 0) {
             seen.hasNull = true;
@@ -236,7 +248,7 @@ export class JoinRuntimeFilter {
       const shift = filter.#blockShift;
       yield* visit((k) => {
         bloomInsert(bits, shift, scratch.hashes[k] ?? 0);
-      });
+      }, true);
     }
     return filter;
   }

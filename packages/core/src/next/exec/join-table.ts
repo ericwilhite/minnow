@@ -457,7 +457,7 @@ export class JoinTable {
           }
         }
         s = (s + 1) & mask;
-        if (work.spend(12) && slice.due()) yield;
+        if (work.spend(12, slice)) yield;
       }
       this.inserted++;
     }
@@ -732,7 +732,7 @@ export class JoinTable {
   ): SlicedJob<number> {
     if (this.kind !== "bytes") {
       const matched = this.lookup(scratch, count, heads);
-      if (work.spend(8 * count) && slice.due()) yield;
+      if (work.spend(8 * count, slice)) yield;
       return matched;
     }
     const strict = ~this.#layout.nullSafeMask;
@@ -785,7 +785,7 @@ export class JoinTable {
             }
           }
           s = (s + 1) & mask;
-          if (work.spend(12) && slice.due()) yield;
+          if (work.spend(12, slice)) yield;
         }
       }
       heads[k] = head;

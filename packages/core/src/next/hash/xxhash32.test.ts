@@ -268,6 +268,26 @@ describe("XxHash32Stream (the spec's streaming form)", () => {
     }
   });
 
+  it("takes its seed as seed >>> 0, like the one-shot hash (review B7-p2c-3 #3)", () => {
+    // Fractional, negative, non-finite and out-of-range numbers: the one-shot contract's
+    // ToUint32, compared with the hash of the normalized seed and with the raw seed.
+    const seeds = [-0.5, 0.5, -1.5, 2.9, -0, NaN, Infinity, -Infinity, 2 ** 32, 2 ** 32 + 5];
+    seeds.push(-(2 ** 31) - 1, 2 ** 53, -(2 ** 53), 1e300, 0xffff_ffff + 0.25);
+    for (const length of [0, 5, 16, 17, 300])
+      for (const seed of seeds) {
+        const bytes = sanityBuffer(length);
+        const expected = xxHash32(bytes, seed >>> 0);
+        expect(xxHash32(bytes, seed)).toBe(expected);
+        const stream = new XxHash32Stream(seed);
+        stream.update(bytes, 0, length >> 1).update(bytes, length >> 1, length);
+        expect(stream.digest(), `seed ${String(seed)} length ${String(length)}`).toBe(expected);
+        expect(new XxHash32Stream(seed).update(bytes).digest()).toBe(xxHash32(bytes, seed));
+      }
+    // The reviewer's case: empty input, seed −0.5 (ToUint32 = 0).
+    expect(new XxHash32Stream(-0.5).digest()).toBe(xxHash32(new Uint8Array(0), -0.5));
+    expect(xxHash32(new Uint8Array(0), -0.5)).toBe(xxHash32(new Uint8Array(0), 0));
+  });
+
   it("matches the published sanity vectors when fed in pieces", () => {
     // xxhsum's sanity checks (also in the one-shot tests above).
     expect(

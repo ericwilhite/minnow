@@ -659,6 +659,11 @@ and the owner import it directly.
   result, exact per column for composite keys. Its output is the probe columns plus one bool
   (the shape lowering proposes for the IR, ruling R17.5).
 - Keys are input column indexes; the executor projects key expressions first.
+- Key bytes are work in steps (R23.2): every byte hashed, copied into an encoded key or
+  compared counts toward a 256 KiB step budget, and a spent step yields when its slice is due —
+  inside one key, a collision chain, a mark join's candidates and its compatibility tests. A
+  composite key with text or bytes length-prefixes them instead of escaping them (equality
+  needs no order), so encoding a value is one copy.
 - The build store and table are allocated from the join's spillable grant. A dense integer key
   is direct-addressed; others use open addressing with the key's words inline. Matched outputs
   reuse probe key vectors for build key columns that are identical in representation.

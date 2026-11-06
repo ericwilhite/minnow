@@ -11,9 +11,13 @@
  * - uuid: four words of its 16 bytes.
  * - text, bytes, enum (one key column, `=`): the stored bytes themselves (byte equality is SQL
  *   equality under deterministic collations; an enum equals by label).
- * - decimal, interval, several varlen columns, or any mix too wide for inline words: the
- *   persisted equality-key encoding (keys/key-encoding.ts), which normalizes `1.0 = 1.00` and
- *   `1 mon = 30 days`.
+ * - decimal, interval, several varlen columns, or any mix too wide for inline words (`enc`):
+ *   the persisted equality-key encoding (keys/key-encoding.ts) of the columns that are not
+ *   text, bytes or enum, which normalizes `1.0 = 1.00` and `1 mon = 30 days`; then each text,
+ *   bytes or enum column as a header byte (0 null, 1 a value), its byte length (4 bytes) and
+ *   its bytes as stored. Each part is self-delimiting, so equal keys are exactly equal bytes.
+ *   Text is not escaped (escaping exists for memcomparable order, which equality does not
+ *   need: review B7-p2c-3 #4), so a value costs one copy, made in steps of key work.
  * - JSON, arrays and locators are not join keys here (`UnsupportedPlanError`): their equality is
  *   semantic (exec/semantic.ts), so lowering must not plan a hash join on them.
  * - NULL: a key column compared with `=` makes the row unmatched (`nulls` bit set). With
@@ -35,7 +39,7 @@ import type { ByteCharge } from "../vector/varlen.js";
 import type { FlatVector, Validity, Vector } from "../vector/vector.js";
 import { UnsupportedPlanError } from "./errors.js";
 import { hiOfSafe, wordsOf } from "./column-store.js";
-import type { Slice, SlicedJob } from "./slices.js";
+import { Slice, runToEnd, type SlicedJob } from "./slices.js";
 
 export const HASH_SEED = 0x2f0b_3c4d;
 /** Most words a key keeps inline in its hash-table slot. */
@@ -86,6 +90,9 @@ export class KeyLayout {
   readonly width: number;
   /** Word offset of each column inside the key (words family). */
   readonly offsets: readonly number[];
+  /** `enc`: the text, bytes and enum columns (length-prefixed), and the others (encoded). */
+  readonly rawColumns: readonly number[];
+  readonly encodedColumns: readonly number[];
 
   constructor(
     readonly types: readonly PhysicalType[],
@@ -117,6 +124,9 @@ export class KeyLayout {
       this.family = "enc";
       this.width = 0;
     }
+    const raw = this.family === "enc" ? this.parts.map((part) => part === "raw") : [];
+    this.rawColumns = raw.flatMap((yes, c) => (yes ? [c] : []));
+    this.encodedColumns = raw.flatMap((yes, c) => (yes ? [] : [c]));
   }
 
   /** A single integer column (int32-family or int64-family): eligible for direct addressing. */
@@ -192,6 +202,8 @@ export class KeyScratch {
   rawShared = false;
   /** `enc`: the encoded keys of the rows. */
   readonly encoded: KeyBatch | null;
+  /** `enc` with text, bytes or enum columns: the persisted encoding of the other columns. */
+  readonly encodedParts: KeyBatch | null;
   /** Rows with a null in a key compared with `=` (they never match). */
   unmatchable = 0;
   /** When `extractKeys` stopped early: the bytes the encoder was refused (else 0). */
@@ -214,12 +226,18 @@ export class KeyScratch {
     this.hashes2 = new Uint32Array(capacity);
     this.slots = new Int32Array(capacity);
     this.encoded = layout.family === "enc" ? new KeyBatch(encodedCharge, 1 << 30) : null;
+    this.encodedParts =
+      layout.rawColumns.length > 0 && layout.encodedColumns.length > 0
+        ? new KeyBatch(encodedCharge, 1 << 30)
+        : null;
   }
 
   static bytes(layout: KeyLayout, capacity: number): number {
+    const batch = 4096 + 4 * 65;
     return (
       capacity * (4 * Math.max(1, layout.width) + 16) +
-      (layout.family === "enc" ? 4096 + 4 * 65 : 0)
+      (layout.family === "enc" ? batch : 0) +
+      (layout.rawColumns.length > 0 && layout.encodedColumns.length > 0 ? batch : 0)
     );
   }
 }
@@ -300,6 +318,24 @@ function flatOf(vector: Vector): FlatVector {
       : vector.dictionary;
 }
 
+/** The null masks and unmatchable count of rows `from … from + count` (every family). */
+function extractNullMasks(
+  keys: readonly Vector[],
+  ids: ArrayLike<number> | null,
+  from: number,
+  count: number,
+  out: KeyScratch,
+): void {
+  if (count > out.capacity) throw new RangeError("More key rows than the scratch holds");
+  out.count = count;
+  out.requiredBytes = 0;
+  keyNulls(keys, ids, from, count, out.nulls);
+  const strict = ~out.layout.nullSafeMask;
+  let unmatchable = 0;
+  for (let k = 0; k < count; k++) if (((out.nulls[k] ?? 0) & strict) !== 0) unmatchable++;
+  out.unmatchable = unmatchable;
+}
+
 /**
  * Canonical keys of rows `ids[from … from + count)` (or `from …` when `ids` is null) of the key
  * vectors `keys` into `out` (positions 0 … count). Returns the rows done: `count`, or fewer when
@@ -318,26 +354,8 @@ export function extractKeys(
   const words = out.words;
   const nulls = out.nulls;
   const hashes = out.hashes;
-  if (count > out.capacity) throw new RangeError("More key rows than the scratch holds");
-  out.count = count;
-  out.requiredBytes = 0;
-  let unmatchable = 0;
   // Null masks first (every family needs them).
-  nulls.fill(0, 0, count);
-  for (let c = 0; c < keys.length; c++) {
-    const vector = keys[c];
-    if (vector === undefined) continue;
-    const validity = vector.form === "constant" ? vector.value.validity : vector.validity;
-    if (validity === null) continue;
-    const bit = 1 << c;
-    for (let k = 0; k < count; k++) {
-      const row = ids === null ? from + k : (ids[from + k] ?? 0);
-      if (sourceSlot(vector, row) < 0) nulls[k] = (nulls[k] ?? 0) | bit;
-    }
-  }
-  const strict = ~layout.nullSafeMask;
-  for (let k = 0; k < count; k++) if (((nulls[k] ?? 0) & strict) !== 0) unmatchable++;
-  out.unmatchable = unmatchable;
+  extractNullMasks(keys, ids, from, count, out);
 
   if (layout.family === "words") {
     const mask = layout.nullSafeMask;
@@ -425,23 +443,123 @@ export function extractKeys(
     return count;
   }
 
-  // enc: the persisted equality-key encoding of the active rows.
+  // enc: the key encoding of the active rows (see the module comment), all at once.
   const encoded = out.encoded;
   if (encoded === null) return count;
-  const columns: KeyColumn[] = keys.map((vector) => ({ vector, direction: "asc", nulls: "first" }));
-  const result = encodeKeyBatch(
-    "equality",
-    columns,
-    { length: Number.MAX_SAFE_INTEGER, selection: rowsSelection(ids, from, count) },
-    encoded,
-  );
-  const done = result.encoded;
-  out.requiredBytes = result.done ? 0 : result.requiredBytes;
+  const done = runToEnd(encodeJob(keys, ids, from, count, out, new KeyWork(), UNBOUNDED));
   if (hash)
     for (let k = 0; k < done; k++)
       hashInto(out, k, encoded.writer.bytes, encoded.offsets[k] ?? 0, encoded.offsets[k + 1] ?? 0);
   out.count = done;
   return done;
+}
+
+/** A slice that is never due (the synchronous paths). */
+const UNBOUNDED = new Slice(Infinity);
+
+/**
+ * The `enc` keys of rows `from … from + count` into `out.encoded` (the module comment's form):
+ * the persisted encoding of the non-varlen columns, then each text, bytes or enum column
+ * length-prefixed and copied in steps of key work, so an oversized value spans steps. Returns
+ * the rows done: fewer when the grant refused bytes (`out.requiredBytes`).
+ */
+function* encodeJob(
+  keys: readonly Vector[],
+  ids: ArrayLike<number> | null,
+  from: number,
+  count: number,
+  out: KeyScratch,
+  work: KeyWork,
+  slice: Slice,
+): SlicedJob<number> {
+  const layout = out.layout;
+  const encoded = out.encoded;
+  if (encoded === null) return count;
+  const selection = rowsSelection(ids, from, count);
+  const columnsOf = (list: readonly number[]): KeyColumn[] =>
+    list.map((c) => {
+      const vector = keys[c];
+      if (vector === undefined) throw new RangeError("Join key column out of range");
+      return { vector, direction: "asc", nulls: "first" };
+    });
+  if (layout.rawColumns.length === 0) {
+    // No varlen column: the persisted encoding is the key.
+    const result = encodeKeyBatch(
+      "equality",
+      columnsOf(layout.encodedColumns),
+      { length: Number.MAX_SAFE_INTEGER, selection },
+      encoded,
+    );
+    out.requiredBytes = result.done ? 0 : result.requiredBytes;
+    if (work.spend(encoded.writer.length + 4 * result.encoded, slice)) yield;
+    return result.encoded;
+  }
+  let n = count;
+  out.requiredBytes = 0;
+  const parts = out.encodedParts;
+  if (parts !== null) {
+    const result = encodeKeyBatch(
+      "equality",
+      columnsOf(layout.encodedColumns),
+      { length: Number.MAX_SAFE_INTEGER, selection },
+      parts,
+    );
+    if (!result.done) {
+      n = result.encoded;
+      out.requiredBytes = result.requiredBytes;
+    }
+    if (work.spend(parts.writer.length + 4 * n, slice)) yield;
+  }
+  const writer = encoded.writer;
+  writer.reset();
+  writer.limit = Infinity;
+  encoded.count = 0;
+  if (!encoded.reserveOffsets(n + 1)) {
+    out.requiredBytes = 4 * (n + 1);
+    return 0;
+  }
+  encoded.offsets[0] = 0;
+  const raw = layout.rawColumns;
+  for (let k = 0; k < n; k++) {
+    const row = selection.rows[k] ?? 0;
+    const keyStart = writer.length;
+    try {
+      if (parts !== null) {
+        const start = parts.offsets[k] ?? 0;
+        writer.fixed(parts.writer.bytes, start, (parts.offsets[k + 1] ?? 0) - start);
+      }
+      for (const c of raw) {
+        const vector = keys[c];
+        if (vector === undefined) continue;
+        const slot = sourceSlot(vector, row);
+        if (slot < 0) {
+          writer.byte(0);
+          continue;
+        }
+        const data = flatOf(vector).data as { bytes: Uint8Array; offsets: Int32Array };
+        const start = data.offsets[slot] ?? 0;
+        const end = data.offsets[slot + 1] ?? 0;
+        writer.byte(1);
+        writer.int32(end - start);
+        for (let at = start; at < end;) {
+          const piece = Math.min(end - at, Math.max(WORK_CHUNK, work.left));
+          writer.fixed(data.bytes, at, piece);
+          at += piece;
+          if (work.spend(piece, slice)) yield;
+        }
+      }
+    } catch (error) {
+      // The writer's refusal (its grant denied the growth): stop before this row.
+      if (!(error instanceof Error) || !("requiredBytes" in error)) throw error;
+      writer.length = keyStart;
+      out.requiredBytes = Number(error.requiredBytes);
+      return k;
+    }
+    encoded.offsets[k + 1] = writer.length;
+    encoded.count = k + 1;
+    if (work.spend(16, slice)) yield;
+  }
+  return n;
 }
 
 /** Key bytes one bounded step of key work scans (hashing, encoding, comparing): R23.2. */
@@ -459,20 +577,35 @@ function hashInto(out: KeyScratch, k: number, bytes: Uint8Array, start: number, 
 
 /**
  * A budget of key bytes per step (review B7-p2c-2: every byte of hashing and equality counts).
- * `spend` returns true when the step is used up: the caller checks its deadline (and yields)
- * and the budget starts again. `total` is the bytes spent overall (tests read it per step).
+ * `spend(bytes, slice)` returns true ("yield now") when the step is used up and the slice is
+ * due; the budget then starts again. Every caller must yield on true before more key work
+ * (review B7-p2c-3 #1): the next `spend` throws when the slice was not reset since a "yield
+ * now" (its runner resets it at the yield), so an ignored signal fails loudly rather than
+ * running a chain in one step. `total` is the bytes spent overall (tests read it per step).
  */
 export class KeyWork {
   left: number;
   total = 0;
+  /** The slice and its reset count when "yield now" was last returned (else null). */
+  #owedSlice: Slice | null = null;
+  #owedAt = 0;
   constructor(readonly step = KEY_STEP_BYTES) {
     this.left = step;
   }
-  spend(bytes: number): boolean {
+  spend(bytes: number, slice: Slice): boolean {
+    const owed = this.#owedSlice;
+    if (owed !== null) {
+      if (owed.resets === this.#owedAt)
+        throw new Error("Key work went on past a due slice: a caller ignored spend's yield");
+      this.#owedSlice = null;
+    }
     this.total += bytes;
     this.left -= bytes;
     if (this.left > 0) return false;
     this.left = this.step;
+    if (!slice.due()) return false;
+    this.#owedSlice = slice;
+    this.#owedAt = slice.resets;
     return true;
   }
 }
@@ -498,7 +631,7 @@ export function* hashKeyJob(
   if ((long ? 2 * length : length) <= Math.max(work.left, WORK_CHUNK)) {
     out[0] = xxHash32(bytes, HASH_SEED, start, end);
     out[1] = long ? xxHash32(bytes, HASH_SEED2, start, end) : 0;
-    if (work.spend(long ? 2 * length : length) && slice.due()) yield;
+    if (work.spend(long ? 2 * length : length, slice)) yield;
     return;
   }
   const first = new XxHash32Stream(HASH_SEED);
@@ -508,7 +641,7 @@ export function* hashKeyJob(
     first.update(bytes, at, at + n);
     second.update(bytes, at, at + n);
     at += n;
-    if (work.spend(2 * n) && slice.due()) yield;
+    if (work.spend(2 * n, slice)) yield;
   }
   out[0] = first.digest();
   out[1] = second.digest();
@@ -534,11 +667,12 @@ export function* equalJob(
     const n = Math.min(length - at, Math.max(WORK_CHUNK, work.left));
     for (let i = 0; i < n; i++)
       if (a[as + at + i] !== b[bs + at + i]) {
-        work.spend(i + 1);
+        // A mismatch spends what it compared, and honours the step like any other spend.
+        if (work.spend(i + 1, slice)) yield;
         return false;
       }
     at += n;
-    if (work.spend(n) && slice.due()) yield;
+    if (work.spend(n, slice)) yield;
   }
   return true;
 }
@@ -561,10 +695,16 @@ export function* extractKeysJob(
   const layout = out.layout;
   if (layout.family === "words") {
     const done = extractKeys(keys, ids, from, count, out, true);
-    if (work.spend(8 * Math.max(1, layout.width) * count) && slice.due()) yield;
+    if (work.spend(8 * Math.max(1, layout.width) * count, slice)) yield;
     return done;
   }
-  const done = extractKeys(keys, ids, from, count, out, false);
+  let done: number;
+  if (layout.family === "enc") {
+    // Null masks (no encoding), then the key encoding in steps of key work.
+    extractNullMasks(keys, ids, from, count, out);
+    done = yield* encodeJob(keys, ids, from, count, out, work, slice);
+    out.count = done;
+  } else done = extractKeys(keys, ids, from, count, out, false);
   const pair = new Uint32Array(2);
   const strict = ~layout.nullSafeMask;
   for (let k = 0; k < done; k++) {

@@ -28,8 +28,11 @@ export class Slice {
   tick(): boolean {
     return (++this.#ticks & (TICKS - 1)) === 0 && this.due();
   }
+  /** How many times the slice was reset (a new slice began): `KeyWork` checks yields by it. */
+  resets = 0;
   reset(): void {
     this.#start = this.now();
+    this.resets++;
   }
 }
 
@@ -68,11 +71,15 @@ export function runSliced<T>(job: SlicedJob<T>, slice: Slice, between: () => voi
   })();
 }
 
-/** Runs a job that never blocks to completion, synchronously (no deadline). */
-export function runToEnd<T>(job: SlicedJob<T>): T {
+/**
+ * Runs a job that never blocks to completion, synchronously (no deadline). `slice`, when the
+ * job has one that can come due, is reset at each of its yields, as `runSliced` does.
+ */
+export function runToEnd<T>(job: SlicedJob<T>, slice?: Slice): T {
   for (;;) {
     const step = job.next();
     if (step.done === true) return step.value;
     if (step.value !== undefined) throw new Error("A synchronous sort job blocked");
+    slice?.reset();
   }
 }

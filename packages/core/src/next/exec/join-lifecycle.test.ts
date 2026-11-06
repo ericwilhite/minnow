@@ -4,7 +4,9 @@
  * before the phase completes), resident and spilled; the abort signal is checked before each
  * finish and after downstream backpressure. The sliced jobs themselves yield per store chunk.
  */
+import fc from "fast-check";
 import { describe, expect, it } from "vitest";
+import { seedsFor } from "../../testing/seeds.js";
 import { Governor } from "../memory/governor.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
 import type { PhysicalType } from "../types.js";
@@ -26,7 +28,7 @@ import { vi } from "vitest";
 import { JoinTable } from "./join-table.js";
 import { HashJoin, hashJoinMinimumBytes, type HashJoinKind, type HashJoinSpec } from "./join.js";
 import type { Operator, PushResult } from "./pipeline.js";
-import { Slice } from "./slices.js";
+import { Slice, runToEnd } from "./slices.js";
 
 const FREE = { allocate: () => true, free: () => undefined };
 
@@ -350,25 +352,23 @@ describe("review B7-p2c-1 #3: join work is bounded by key bytes", () => {
         keyColumns.map(() => false),
       );
       const scratch = new KeyScratch(layout, 2048, FREE);
-      const job = JoinTable.buildJob(
-        store,
-        [...keyColumns],
-        layout,
-        0,
-        FREE,
-        scratch,
-        new Slice(4),
-      );
+      const slice = new Slice(4);
+      const job = JoinTable.buildJob(store, [...keyColumns], layout, 0, FREE, scratch, slice);
       const start = performance.now();
       let step = job.next();
       const first = performance.now() - start;
       let segments = 1;
       while (step.done !== true) {
+        // A runner starts a new slice at each yield (runSliced does).
+        slice.reset();
         step = job.next();
         segments++;
       }
       expect(first).toBeLessThan(100);
-      expect(segments).toBeGreaterThan(100);
+      // ~128 MiB of key bytes in 4 ms slices: many segments. The count is wall time, so it
+      // falls as the work gets cheaper (encoded keys are no longer escaped: review B7-p2c-3 #4,
+      // 72 segments on a loaded host); the per-step work bound is the B7-p2c-2 suite below.
+      expect(segments).toBeGreaterThan(20);
       expect(step.value?.inserted).toBe(2048);
       step.value?.close();
       store.close();
@@ -433,6 +433,8 @@ describe("review B7-p2c-1 #3: join work is bounded by key bytes", () => {
 
 describe("review B7-p2c-2: every byte of key work is in a step", () => {
   const types2 = [TEXT, INT];
+  /** An always-due slice; the runners below reset it at each yield, as `runSliced` does. */
+  const due = new Slice(0);
   /** Runs a job with an always-due slice, returning the most work any one step did. */
   const stepWork = <T>(
     job: Generator<Promise<void> | void, T, void>,
@@ -444,6 +446,7 @@ describe("review B7-p2c-2: every byte of key work is in a step", () => {
       const step = job.next();
       max = Math.max(max, work.total - before);
       if (step.done === true) return { max, value: step.value };
+      due.reset();
     }
   };
   // A step may end up to one chunk (4 KiB) past the budget, and a hash step spends two seeds.
@@ -465,7 +468,7 @@ describe("review B7-p2c-2: every byte of key work is in a step", () => {
       const scratch = new KeyScratch(layout, 2048, FREE);
       const work = new KeyWork();
       const built = stepWork(
-        JoinTable.buildJob(store, [0], layout, 0, FREE, scratch, new Slice(0), {}, work),
+        JoinTable.buildJob(store, [0], layout, 0, FREE, scratch, due, {}, work),
         work,
       );
       expect(built.max).toBeLessThanOrEqual(BOUND);
@@ -476,15 +479,12 @@ describe("review B7-p2c-2: every byte of key work is in a step", () => {
       if (batch === undefined) throw new Error("no batch");
       const probeWork = new KeyWork();
       const extracted = stepWork(
-        extractKeysJob(batch.columns.slice(0, 1), null, 0, 64, scratch, probeWork, new Slice(0)),
+        extractKeysJob(batch.columns.slice(0, 1), null, 0, 64, scratch, probeWork, due),
         probeWork,
       );
       expect(extracted.value).toBe(64);
       const heads = new Int32Array(64);
-      const looked = stepWork(
-        table.lookupJob(scratch, 64, heads, probeWork, new Slice(0)),
-        probeWork,
-      );
+      const looked = stepWork(table.lookupJob(scratch, 64, heads, probeWork, due), probeWork);
       expect(looked.max).toBeLessThanOrEqual(BOUND);
       expect(looked.value).toBe(64);
       expect([...heads]).toEqual(keyRows.map((_, i) => i + 1));
@@ -514,10 +514,7 @@ describe("review B7-p2c-2: every byte of key work is in a step", () => {
     // The resumable path stores the same pair.
     const again = new KeyScratch(layout, 4, FREE);
     const work = new KeyWork();
-    stepWork(
-      extractKeysJob(batch.columns.slice(0, 1), null, 0, 2, again, work, new Slice(0)),
-      work,
-    );
+    stepWork(extractKeysJob(batch.columns.slice(0, 1), null, 0, 2, again, work, due), work);
     expect([...again.hashes.subarray(0, 2)]).toEqual([...scratch.hashes.subarray(0, 2)]);
     expect([...again.hashes2.subarray(0, 2)]).toEqual([...scratch.hashes2.subarray(0, 2)]);
   });
@@ -538,7 +535,7 @@ describe("review B7-p2c-2: every byte of key work is in a step", () => {
     const scratch = new KeyScratch(layout, 2048, FREE);
     const work = new KeyWork();
     let steps = 0;
-    const job = JoinTable.buildJob(store, [0], layout, 0, FREE, scratch, new Slice(0), {}, work);
+    const job = JoinTable.buildJob(store, [0], layout, 0, FREE, scratch, due, {}, work);
     let max = 0;
     let firstMs = 0;
     for (;;) {
@@ -548,6 +545,7 @@ describe("review B7-p2c-2: every byte of key work is in a step", () => {
       if (steps === 0) firstMs = performance.now() - start;
       max = Math.max(max, work.total - before);
       steps++;
+      due.reset();
       if (step.done === true) {
         expect(step.value?.inserted).toBe(2);
         step.value?.close();
@@ -585,4 +583,272 @@ describe("review B7-p2c-2: every byte of key work is in a step", () => {
     await join.closed;
     expect(governor.usedBytes).toBe(0);
   }, 60_000);
+});
+
+describe("review B7-p2c-3: no key work past a due step", () => {
+  const due = new Slice(0);
+  /** The most key work any one step of `job` did (a runner resetting `due` at each yield). */
+  const stepWork = <T>(job: Generator<Promise<void> | void, T, void>, work: KeyWork) => {
+    let max = 0;
+    for (;;) {
+      const before = work.total;
+      const step = job.next();
+      max = Math.max(max, work.total - before);
+      if (step.done === true) return { max, value: step.value };
+      due.reset();
+    }
+  };
+  // A step may end one chunk (4 KiB) past the budget, plus a slot or two.
+  const BOUND = KEY_STEP_BYTES + 8192;
+
+  it("spend's 'yield now' must be honoured: going on without a new slice throws", () => {
+    const work = new KeyWork(100);
+    expect(work.spend(60, due)).toBe(false);
+    expect(work.spend(60, due)).toBe(true);
+    expect(() => work.spend(1, due)).toThrow("ignored spend's yield");
+    // A slice that is not due never asks for a yield (and owes nothing).
+    const later = new Slice(1e9);
+    const relaxed = new KeyWork(100);
+    for (let i = 0; i < 10; i++) expect(relaxed.spend(60, later)).toBe(false);
+    // After the runner's reset the work goes on.
+    due.reset();
+    expect(work.spend(1, due)).toBe(false);
+  });
+
+  // The reviewer's probe, generated over the carried remainder of the budget and the mismatch
+  // position: 8 colliding keys (both hashes forced to 42) one byte apart at `at`, inserted (each
+  // compared with the chain so far) and looked up (a missing key compared with all of them).
+  it("a mismatch that exhausts the budget yields: insertion and lookup, every remainder", () => {
+    const one = vi.spyOn(hashing, "xxHash32").mockReturnValue(42);
+    const digest = vi.spyOn(XxHash32Stream.prototype, "digest").mockReturnValue(42);
+    try {
+      const n = KEY_STEP_BYTES - 12;
+      const positions = [0, 1, 4095, 4096, n >> 1, n - 4097, n - 2, n - 1];
+      let cases = 0;
+      for (const at of positions) {
+        const key = (c: string) => "x".repeat(at) + c + "x".repeat(n - at - 1);
+        const keyRows: Row[] = Array.from({ length: 8 }, (_, i): Row => [key(String(i)), i]);
+        for (const left of [1, 12, 13, 4096, at + 1, at + 2, n - at, KEY_STEP_BYTES]) {
+          const store = new ColumnStore([TEXT, INT], FREE);
+          for (const batch of batchesOf([TEXT, INT], keyRows))
+            store.append(batch.columns, null, 0, batch.length);
+          const layout = new KeyLayout([TEXT], [false]);
+          const scratch = new KeyScratch(layout, 2048, FREE);
+          const work = new KeyWork();
+          work.left = Math.max(1, left);
+          const built = stepWork(
+            JoinTable.buildJob(store, [0], layout, 0, FREE, scratch, due, {}, work),
+            work,
+          );
+          expect(built.max, `insert at ${String(at)} left ${String(left)}`).toBeLessThanOrEqual(
+            BOUND,
+          );
+          const table = built.value;
+          if (table === null) throw new Error("no table");
+          const [probe] = [...batchesOf([TEXT, INT], [[key("z"), 99]])];
+          if (probe === undefined) throw new Error("no probe");
+          extractKeys([probe.columns[0] as never], null, 0, 1, scratch);
+          const lookupWork = new KeyWork();
+          lookupWork.left = Math.max(1, left);
+          const heads = new Int32Array(1);
+          const looked = stepWork(table.lookupJob(scratch, 1, heads, lookupWork, due), lookupWork);
+          expect(heads[0]).toBe(0);
+          expect(looked.max, `lookup at ${String(at)} left ${String(left)}`).toBeLessThanOrEqual(
+            BOUND,
+          );
+          table.close();
+          store.close();
+          cases++;
+        }
+      }
+      expect(cases).toBe(64);
+    } finally {
+      one.mockRestore();
+      digest.mockRestore();
+    }
+  }, 120_000);
+});
+
+describe("review B7-p2c-3 #2: mark joins hash and compare in steps", () => {
+  const types3 = [TEXT, INT, INT];
+  // The reviewer's operator probes: a 10 MiB text key and a nullable int key, build (x, NULL),
+  // probe (x, 1): the mark is NULL. No one-shot hash may cover more than a step's bytes.
+  for (const correlated of [0, 1])
+    it(`no synchronous whole-key hash (correlated ${String(correlated)})`, async () => {
+      const x = "x".repeat(10 << 20);
+      const s = spec("mark", types3, {
+        probeKeys: [0, 1],
+        buildKeys: [0, 1],
+        nullSafe: [false, false],
+        correlated,
+      });
+      const { join, governor, spill } = await setup(s);
+      await pushAll(join.build, types3, [[x, null, 1]]);
+      await join.build.finish();
+      const spy = vi.spyOn(hashing, "xxHash32");
+      const marks: Array<boolean | null> = [];
+      const sink = {
+        push(batch: Batch): PushResult {
+          for (let i = 0; i < batch.length; i++) {
+            const mark = batch.columns[3];
+            const data = mark?.form === "flat" ? mark.data : null;
+            const valid =
+              mark?.form === "flat" &&
+              (mark.validity === null || ((mark.validity[i >>> 5] ?? 0) & (1 << (i & 31))) !== 0);
+            marks.push(valid && data?.layout === "bool" ? (data.values[i] ?? 0) === 1 : null);
+          }
+          return "ready" as const;
+        },
+        ready: () => Promise.resolve(),
+        finish: () => undefined,
+        abort: () => undefined,
+      };
+      const probe = join.probe(sink);
+      try {
+        await pushAll(probe, types3, [[x, 1, 11]]);
+        await probe.finish();
+        const sizes = spy.mock.calls.map((c) => (c[3] ?? c[0].length) - (c[2] ?? 0));
+        expect(Math.max(0, ...sizes)).toBeLessThanOrEqual(KEY_STEP_BYTES);
+        expect(marks).toEqual([null]);
+        await join.closed;
+        expect(governor.usedBytes).toBe(0);
+        expect(spill.bytesInUse).toBe(0);
+      } finally {
+        spy.mockRestore();
+      }
+    }, 120_000);
+
+  it("rejected candidates are checkpointed: the walk yields at its deadline checks", async () => {
+    // 600,000 build rows in one implicit group (uncorrelated); the probe's second key is NULL,
+    // so every build row is a candidate, and every one is rejected (its first key differs).
+    const s = spec("mark", [INT, INT], {
+      probeKeys: [0, 1],
+      buildKeys: [0, 1],
+      nullSafe: [false, false],
+      correlated: 0,
+    });
+    const { join, governor } = await setup(s);
+    const rows = 600_000;
+    await pushAll(
+      join.build,
+      [INT, INT],
+      Array.from({ length: rows }, (_, i): Row => [i + 1, i]),
+    );
+    await join.build.finish();
+    const sink = new CountSink();
+    const probe = join.probe(sink);
+    // A clock that moves 10 ms per reading: every deadline check is due, so the slices begun
+    // (resets) count the checks the walk makes. Without a checkpoint per candidate the walk
+    // makes none: a handful of resets from the other phases.
+    let t = 0;
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => (t += 10));
+    const resets = vi.spyOn(Slice.prototype, "reset");
+    try {
+      await pushAll(probe, [INT, INT], [[-5, null]]);
+      await probe.finish();
+    } finally {
+      clock.mockRestore();
+    }
+    const slices = resets.mock.calls.length;
+    resets.mockRestore();
+    // Each step's budget covers KEY_STEP_BYTES / 16 candidates.
+    expect(slices).toBeGreaterThanOrEqual(Math.floor((rows * 16) / KEY_STEP_BYTES));
+    expect(sink.rows).toBe(1);
+    await join.closed;
+    expect(governor.usedBytes).toBe(0);
+  }, 60_000);
+});
+
+describe("review B7-p2c-3 #4: encoded join keys copy text once, in steps", () => {
+  const types2 = [TEXT, INT];
+  const due = new Slice(0);
+
+  for (const zero of [false, true])
+    it(`a 10 MiB ${zero ? "zero-filled " : ""}text key: one copy, never escaped, in bounded steps`, () => {
+      const text = (zero ? "\0" : "x").repeat(10 << 20);
+      const [batch] = [...batchesOf(types2, [[text, 1]])];
+      if (batch === undefined) throw new Error("no batch");
+      const scratch = new KeyScratch(new KeyLayout(types2, [false, false]), 2048, FREE);
+      const work = new KeyWork();
+      const job = extractKeysJob(batch.columns, null, 0, 1, scratch, work, due);
+      let max = 0;
+      let steps = 0;
+      for (;;) {
+        const before = work.total;
+        const step = job.next();
+        max = Math.max(max, work.total - before);
+        steps++;
+        if (step.done === true) {
+          expect(step.value).toBe(1);
+          break;
+        }
+        due.reset();
+      }
+      // The int's encoding (5 bytes), a header and a length (5), the text as stored: zeros are
+      // not doubled (escaping is for order, not equality).
+      expect(scratch.encoded?.writer.length).toBe((10 << 20) + 10);
+      // Copying (10 MiB) and both hashes (2 × 10 MiB): every step within the budget.
+      expect(max).toBeLessThanOrEqual(KEY_STEP_BYTES + 8192);
+      expect(steps).toBeGreaterThan((3 * (10 << 20)) / (KEY_STEP_BYTES + 8192));
+      // The synchronous form encodes the same bytes.
+      const sync = new KeyScratch(new KeyLayout(types2, [false, false]), 2048, FREE);
+      expect(extractKeys(batch.columns, null, 0, 1, sync, true)).toBe(1);
+      // (Buffer.compare: a deep equality over 10 MiB would take minutes.)
+      const mine = scratch.encoded?.key(0) ?? new Uint8Array(0);
+      const theirs = sync.encoded?.key(0) ?? new Uint8Array(1);
+      expect(Buffer.compare(mine, theirs)).toBe(0);
+      expect(sync.hashes[0]).toBe(scratch.hashes[0]);
+    }, 60_000);
+
+  // Law: two encoded keys are equal exactly when the tuples are equal under SQL equality (the
+  // module comment of join-keys.ts). Generated tuples of (text, text, int) with NULLs, empty
+  // strings, and 0x00 / 0x01 bytes (the null and value headers) at every boundary, where a
+  // concatenation without lengths would confuse ("a\u0001b", "") with ("a", "b\u0001").
+  for (const seed of seedsFor("next-join-encoded-keys", [0x3e4, 0x77a1]))
+    it(`equal encodings iff equal tuples (seed ${String(seed)})`, () => {
+      const types3 = [TEXT, TEXT, INT];
+      const layout = new KeyLayout(types3, [true, true, true]);
+      const piece = fc.constantFrom(
+        "",
+        "\0",
+        "\u0001",
+        "a",
+        "\0a",
+        "a\0",
+        "a\u0001",
+        "\u0001b",
+        "ab",
+        "b\0a",
+      );
+      const value = fc.option(
+        fc.array(piece, { maxLength: 3 }).map((parts) => parts.join("")),
+        { nil: null },
+      );
+      const tuple = fc.tuple(
+        value,
+        value,
+        fc.option(fc.integer({ min: -2, max: 2 }), { nil: null }),
+      );
+      fc.assert(
+        fc.property(fc.array(tuple, { minLength: 2, maxLength: 24 }), (tuples) => {
+          const rows = tuples.map((t): Row => [...t]);
+          const [batch] = [...batchesOf(types3, rows)];
+          if (batch === undefined) return;
+          const scratch = new KeyScratch(layout, 2048, FREE);
+          const work = new KeyWork();
+          runToEnd(extractKeysJob(batch.columns, null, 0, rows.length, scratch, work, due), due);
+          const keys = rows.map((_, k) => Array.from(scratch.encoded?.key(k) ?? []).join(","));
+          for (let i = 0; i < rows.length; i++)
+            for (let j = 0; j < rows.length; j++) {
+              const same = JSON.stringify(rows[i]) === JSON.stringify(rows[j]);
+              expect(
+                keys[i] === keys[j],
+                `${JSON.stringify(rows[i])} vs ${JSON.stringify(rows[j])}`,
+              ).toBe(same);
+              if (same) expect(scratch.hashes[i]).toBe(scratch.hashes[j]);
+            }
+        }),
+        { seed, numRuns: 300 },
+      );
+    });
 });

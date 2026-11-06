@@ -118,10 +118,11 @@ export class XxHash32Stream {
   #tailLength = 0;
 
   constructor(seed = 0) {
-    this.#seed = seed | 0;
+    // The seed is taken as `seed >>> 0`, exactly as `xxHash32` takes it (its contract above).
+    this.#seed = seed >>> 0;
     this.#v1 = (this.#seed + PRIME1 + PRIME2) | 0;
     this.#v2 = (this.#seed + PRIME2) | 0;
-    this.#v3 = this.#seed;
+    this.#v3 = this.#seed | 0;
     this.#v4 = (this.#seed - PRIME1) | 0;
   }
 

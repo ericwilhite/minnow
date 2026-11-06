@@ -109,7 +109,7 @@ import {
   KeyLayout,
   KeyScratch,
   KeyWork,
-  bytesEqual,
+  equalJob,
   extractKeys,
   extractKeysJob,
   keyNulls,
@@ -351,6 +351,8 @@ class Shared {
   readonly slice = new Slice(YIELD_INTERVAL_MS);
   /** The key-byte budget every hash and comparison spends (review B7-p2c-2). */
   readonly work = new KeyWork();
+  /** Mark joins: scratch for each tested key's compatibility test (index: key position). */
+  readonly compat: Array<CompatScratch | undefined> = [];
 
   constructor(
     readonly spec: HashJoinSpec,
@@ -397,6 +399,17 @@ class Shared {
       this.checkAborted();
     });
     this.scratch = new KeyScratch(this.layout, BATCH_ROWS, this.charge, this.pool);
+    if (spec.kind === "mark")
+      for (let i = this.correlated; i < keyTypes.length; i++) {
+        const type = keyTypes[i];
+        if (type === undefined) continue;
+        const layout = new KeyLayout([type], [false]);
+        this.compat[i] = {
+          probe: new KeyScratch(layout, 1, this.pool),
+          build: new KeyScratch(layout, 1, this.pool),
+          ids: new Int32Array(1),
+        };
+      }
     this.probeOut = new ColumnStore(spec.probeTypes, this.pool, {
       targetBytes: BATCH_TARGET_BYTES,
     });
@@ -1504,10 +1517,27 @@ class Prober {
 
   /**
    * Phase 4 (mark): a row without TRUE is NULL when its group holds a row that is not provably
-   * different; with a residual, such candidates are confirmed as pairs.
+   * different; with a residual, such candidates are confirmed as pairs. A resumable job (review
+   * B7-p2c-3 #2): the group lookup hashes and compares through the key jobs, every candidate
+   * visited spends key work (a deadline checkpoint per candidate, accepted or rejected), and
+   * the compatibility test compares tested keys through `equalJob`.
    */
   #markCandidates(batch: Batch, level: Level): Step {
+    this.#job ??= this.#markCandidatesJob(batch, level);
+    const step = this.#job.next();
+    if (step.done !== true) return step.value ?? this.#yieldStep();
+    this.#job = null;
+    const n = step.value;
+    if (n > 0) return this.#pairBatch(batch, level, n, NULL_CLASS);
+    if (this.#candidate >= this.shared.resident.count) this.#phase = 5;
+    return DONE;
+  }
+
+  /** The pairs (or NULL marks) of phase 4 up to one pair batch: returns the pairs found. */
+  *#markCandidatesJob(batch: Batch, level: Level): SlicedJob<number> {
     const shared = this.shared;
+    const work = shared.work;
+    const slice = shared.slice;
     const resident = shared.resident;
     const correlated = shared.correlated;
     const tests = shared.layout.types.length - correlated;
@@ -1515,19 +1545,28 @@ class Prober {
     const store = level.store;
     const groupHeads = shared.aligned;
     if (!this.#groupsLooked) {
-      this.#groupsLooked = true;
       if (level.groups !== null && level.groupScratch !== null && resident.count > 0) {
         const keys = shared.spec.probeKeys
           .slice(0, correlated)
           .map((c) => columnOf(batch.columns, c));
-        extractKeys(keys, resident.rows, 0, resident.count, level.groupScratch);
-        level.groups.lookup(level.groupScratch, resident.count, groupHeads);
+        const done = yield* extractKeysJob(
+          keys,
+          resident.rows,
+          0,
+          resident.count,
+          level.groupScratch,
+          work,
+          slice,
+        );
+        if (done < resident.count) throw new RangeError("A mark join's group keys did not fit");
+        yield* level.groups.lookupJob(level.groupScratch, resident.count, groupHeads, work, slice);
       } else
         groupHeads.fill(
           store.rows > 0 && level.groups === null && correlated === 0 ? 1 : 0,
           0,
           resident.count,
         );
+      this.#groupsLooked = true;
     }
     const groupNext = level.groups?.next ?? null;
     const implicit = correlated === 0;
@@ -1541,6 +1580,7 @@ class Prober {
       const row = resident.rows[k] ?? 0;
       const probeNulls = shared.scratch.nulls[k] ?? 0;
       const groupHead = groupHeads[k] ?? 0;
+      if (work.spend(CANDIDATE_WORK, slice)) yield;
       if (
         state[row] !== 0 ||
         groupHead === 0 ||
@@ -1552,7 +1592,10 @@ class Prober {
       }
       const probeTNull = (probeNulls & ~cMask) !== 0;
       if (!shared.conditioned && tests === 1) {
-        if (probeTNull || groupNullCount(level, groupHead - 1, nextInGroup) > 0)
+        if (
+          probeTNull ||
+          (yield* groupNullCountJob(level, groupHead - 1, nextInGroup, work, slice)) > 0
+        )
           state[row] = NULL_CLASS;
         this.#candidate++;
         continue;
@@ -1562,8 +1605,11 @@ class Prober {
       while (cursor !== 0 && n < BATCH_ROWS) {
         const buildRow = cursor - 1;
         cursor = nextInGroup(buildRow);
+        // A checkpoint per candidate, whether the tests below reject it or not.
+        this.#candidateCursor = cursor;
+        if (work.spend(CANDIDATE_WORK, slice)) yield;
         if (!probeTNull && (tNull?.[buildRow] ?? 0) !== 1) continue;
-        if (!compatible(shared, batch, row, store, buildRow)) continue;
+        if (!(yield* compatibleJob(shared, batch, row, store, buildRow))) continue;
         if (!shared.conditioned) {
           state[row] = NULL_CLASS;
           decided = true;
@@ -1580,9 +1626,7 @@ class Prober {
       this.#candidateCursor = 0;
       this.#candidate++;
     }
-    if (n > 0) return this.#pairBatch(batch, level, n, NULL_CLASS);
-    if (this.#candidate >= resident.count) this.#phase = 5;
-    return DONE;
+    return n;
   }
 
   /** Phase 5: outer misses (left/full), matched (semi), misses (anti), every row (mark). */
@@ -1664,8 +1708,20 @@ function withLength(vector: Vector, length: number): Vector {
   return vector;
 }
 
-/** Rows with a null tested key in the group starting at build row `head` (memoised). */
-function groupNullCount(level: Level, head: number, nextInGroup: (row: number) => number): number {
+/** Key work one visited mark candidate (a chain step and its tests) costs. */
+const CANDIDATE_WORK = 16;
+
+/**
+ * Rows with a null tested key in the group starting at build row `head` (memoised): a walk
+ * of the group that spends key work per row, so a large group spans steps.
+ */
+function* groupNullCountJob(
+  level: Level,
+  head: number,
+  nextInGroup: (row: number) => number,
+  work: KeyWork,
+  slice: Slice,
+): SlicedJob<number> {
   const memo = level.groupNulls;
   const cached = memo?.[head] ?? -1;
   if (cached >= 0) return cached;
@@ -1674,41 +1730,34 @@ function groupNullCount(level: Level, head: number, nextInGroup: (row: number) =
     const row = cursor - 1;
     if ((level.tNull?.[row] ?? 0) === 1) count++;
     cursor = nextInGroup(row);
+    if (work.spend(CANDIDATE_WORK, slice)) yield;
   }
   if (memo !== null) memo[head] = count;
   return count;
 }
 
-const FREE: ByteCharge = { allocate: () => true, free: () => undefined };
-// Module scratch, sync-only (R23.1): `compatible` fills and reads it inside one synchronous call,
-// so operators sharing a key type never see each other's rows.
-const compatScratch = new WeakMap<
-  PhysicalType,
-  { probe: KeyScratch; build: KeyScratch; ids: Int32Array }
->();
+/** A mark join's per-tested-key scratch (operator-owned: a comparison spans yields, R23.1). */
+export interface CompatScratch {
+  readonly probe: KeyScratch;
+  readonly build: KeyScratch;
+  readonly ids: Int32Array;
+}
 
-/** Mark NULL test: every tested key is equal, or null on one side. */
-function compatible(
+/**
+ * Mark NULL test: every tested key is equal, or null on one side. Keys are extracted without
+ * hashing and compared through `equalJob` (resumable within a key, review B7-p2c-3 #2).
+ */
+function* compatibleJob(
   shared: Shared,
   batch: Batch,
   row: number,
   store: ColumnStore,
   buildRow: number,
-): boolean {
+): SlicedJob<boolean> {
   const probeKeys = shared.spec.probeKeys;
   for (let i = shared.correlated; i < probeKeys.length; i++) {
-    const type = shared.layout.types[i];
-    if (type === undefined) continue;
-    let scratch = compatScratch.get(type);
-    if (scratch === undefined) {
-      const layout = new KeyLayout([type], [false]);
-      scratch = {
-        probe: new KeyScratch(layout, 1, FREE),
-        build: new KeyScratch(layout, 1, FREE),
-        ids: new Int32Array(1),
-      };
-      compatScratch.set(type, scratch);
-    }
+    const scratch = shared.compat[i];
+    if (scratch === undefined) continue;
     scratch.ids[0] = row;
     extractKeys(
       [columnOf(batch.columns, probeKeys[i] ?? 0)],
@@ -1726,14 +1775,20 @@ function compatible(
       0,
       1,
       scratch.build,
+      false,
     );
     if ((scratch.probe.nulls[0] ?? 0) !== 0 || (scratch.build.nulls[0] ?? 0) !== 0) continue;
-    if (!sameKey(scratch.probe, scratch.build)) return false;
+    if (!(yield* sameKeyJob(scratch.probe, scratch.build, shared.work, shared.slice))) return false;
   }
   return true;
 }
 
-function sameKey(a: KeyScratch, b: KeyScratch): boolean {
+function* sameKeyJob(
+  a: KeyScratch,
+  b: KeyScratch,
+  work: KeyWork,
+  slice: Slice,
+): SlicedJob<boolean> {
   const layout = a.layout;
   if (layout.family === "words") {
     for (let w = 0; w < layout.width; w++) if (a.words[w] !== b.words[w]) return false;
@@ -1745,25 +1800,29 @@ function sameKey(a: KeyScratch, b: KeyScratch): boolean {
     if (x === null || y === null) return false;
     const i = a.slots[0] ?? 0;
     const j = b.slots[0] ?? 0;
-    return bytesEqual(
+    return yield* equalJob(
       x.bytes,
       x.offsets[i] ?? 0,
       x.offsets[i + 1] ?? 0,
       y.bytes,
       y.offsets[j] ?? 0,
       y.offsets[j + 1] ?? 0,
+      work,
+      slice,
     );
   }
   const x = a.encoded;
   const y = b.encoded;
   if (x === null || y === null) return false;
-  return bytesEqual(
+  return yield* equalJob(
     x.writer.bytes,
     x.offsets[0] ?? 0,
     x.offsets[1] ?? 0,
     y.writer.bytes,
     y.offsets[0] ?? 0,
     y.offsets[1] ?? 0,
+    work,
+    slice,
   );
 }
 
