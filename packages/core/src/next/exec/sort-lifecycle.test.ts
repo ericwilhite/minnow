@@ -630,6 +630,70 @@ describe("review B7-p2b-2 #3: suspended sorts hold charged histograms", () => {
   }, 60_000);
 });
 
+describe("top-N under a full grant compacts instead of spilling", () => {
+  // The grant holds the kept rows about three times over (the store's, and the compaction's
+  // copy while its arenas grow): below that a top-N cannot compact and must spill. Narrow rows
+  // fit that inside the sort's minimum.
+  for (const [name, width, keyed, limit, slack] of [
+    ["a top-100, narrow rows, direct keys, minimum grant", 40, false, 100, 0],
+    ["a top-1,000, wide rows, direct keys", 2000, false, 1000, 12 << 20],
+    // Byte keys store the key bytes too: twice the reserve.
+    ["a top-1,000, wide rows, byte keys", 2000, true, 1000, 24 << 20],
+  ] as const)
+    it(`never spills: ${name}`, async () => {
+      const types = [INT, TEXT];
+      const { context: ctx, governor, spill } = await context(types, slack);
+      const sink = new CollectSink();
+      const keys = keyed ? [asc(0), asc(1)] : [asc(0)];
+      const op = new SortOperator({ types, keys, limit, offset: 0, withTies: false }, ctx, sink);
+      const n = 60_000;
+      const rows: Row[] = Array.from({ length: n }, (_, i) => [
+        (i * 7919) % n,
+        `${String(i)}-${"w".repeat(width)}`,
+      ]);
+      const start = performance.now();
+      await drive(new ArraySource(batchesOf(types, rows, { batchRows: 500 })), op);
+      const ms = performance.now() - start;
+      await op.closed;
+      process.stderr.write(
+        `top-N ${name}: ${ms.toFixed(0)} ms, ${String(op.profile.runs)} runs, ${String(op.profile.compactions)} compactions\n`,
+      );
+      expect(op.profile.runs).toBe(0);
+      expect(op.profile.compactions).toBeGreaterThan(0);
+      expect(sink.rows.map((row) => row[0])).toEqual(Array.from({ length: limit }, (_, i) => i));
+      expect(governor.usedBytes).toBe(0);
+      expect(spill.bytesInUse).toBe(0);
+    }, 120_000);
+});
+
+describe("top-N whose grant cannot hold the compaction reserve", () => {
+  it("spills about as before (byte keys, 12 MiB)", async () => {
+    // A reserve of ~12 MB does not fit beside the rows: compacting early, then letting the store
+    // fill, ends in runs as without the reserve (a9ef41a: 24; this: 25; a reserve that blocked
+    // appends regardless would write ~700).
+    const types = [INT, TEXT];
+    const { context: ctx, governor, spill } = await context(types, 12 << 20);
+    const sink = new CollectSink();
+    const op = new SortOperator(
+      { types, keys: [asc(0), asc(1)], limit: 1000, offset: 0, withTies: false },
+      ctx,
+      sink,
+    );
+    const n = 60_000;
+    const rows: Row[] = Array.from({ length: n }, (_, i) => [
+      (i * 7919) % n,
+      `${String(i)}-${"w".repeat(2000)}`,
+    ]);
+    await drive(new ArraySource(batchesOf(types, rows, { batchRows: 500 })), op);
+    await op.closed;
+    expect(op.profile.runs).toBeGreaterThan(0);
+    expect(op.profile.runs).toBeLessThanOrEqual(30);
+    expect(sink.rows.map((row) => row[0])).toEqual(Array.from({ length: 1000 }, (_, i) => i));
+    expect(governor.usedBytes).toBe(0);
+    expect(spill.bytesInUse).toBe(0);
+  }, 120_000);
+});
+
 describe("review B7-p2b-1 resource probes", () => {
   for (const group of [false, true]) {
     const make = (

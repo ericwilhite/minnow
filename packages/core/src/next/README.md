@@ -689,7 +689,8 @@ and the owner import it directly.
   array and ICU text keys once, as the row arrives (for a merge, once per page), and charges the
   decoded values to the grant, so a run's comparisons never decode.
 - Top-N keeps rows only while they beat the k-th best key and compacts at 2k (O(k) memory, WITH
-  TIES kept). `GroupTopKOperator` is ROW_NUMBER() ≤ k per partition (the row number appended);
+  TIES kept). Up to 65,536 kept rows, it holds its next compaction's store in reserve, so a full
+  grant compacts instead of spilling whenever it can hold the kept rows twice. `GroupTopKOperator` is ROW_NUMBER() ≤ k per partition (the row number appended);
   after a compaction each partition keeps its k-th key, and rows that cannot beat it are dropped.
 - Grant-or-spill: sorted runs of typed spill pages, merged with a fan-in the spill pool's room
   allows, in passes when needed; OFFSET rows are counted, not materialized.

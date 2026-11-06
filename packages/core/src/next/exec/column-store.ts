@@ -266,6 +266,16 @@ export class ColumnStore {
     this.retainedBytes -= bytes;
   }
 
+  /**
+   * Bytes an empty store of these columns charges for the chunks holding `rows` rows: the fixed
+   * arrays and the initial varlen arenas (growth past them is the values' own).
+   */
+  fixedBytes(rows: number): number {
+    let perChunk = 0;
+    for (const column of this.#columns) perChunk += this.#chunkBytes(column);
+    return Math.ceil(rows / this.chunkRows) * perChunk;
+  }
+
   /** Bytes of one chunk of a column at its current tier. */
   #chunkBytes(column: Column): number {
     const rows = this.chunkRows;

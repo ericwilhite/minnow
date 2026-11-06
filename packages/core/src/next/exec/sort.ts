@@ -37,7 +37,7 @@
 import type { Grant } from "../memory/governor.js";
 import { stringBytes } from "../memory/governor.js";
 import type { SpillService } from "../spill/contract.js";
-import type { PhysicalType } from "../types.js";
+import { layoutOf, type PhysicalType } from "../types.js";
 import {
   BATCH_ROWS,
   BATCH_TARGET_BYTES,
@@ -97,6 +97,8 @@ const POOL_BYTES = 1024 * 1024;
 const DECODE_BYTES = 256 * 1024;
 /** Most varlen bytes of an arriving batch handled in one step (encoding, filtering, copying). */
 const ARRIVAL_BYTES = 512 * 1024;
+/** Top-N up to this many rows holds its next compaction's store in reserve (never spills). */
+const COMPACT_RESERVE_ROWS = 65_536;
 /**
  * A sorter's own scratch (R23.1), charged at construction: survivor rows, partition key
  * lengths, identity rows and group survivors per batch row, and the radix histograms.
@@ -357,6 +359,18 @@ class Sorter {
   readonly #groups: ByteSet | null;
   #groupThresholds: Array<Uint8Array | undefined> = [];
   #lastSurvivors = 0;
+  /**
+   * Top-N: bytes held for the next compaction's store, so a full grant can always compact
+   * rather than spill: the chunks for `keep` rows (`fixedBytes`, initial arenas included), and
+   * per varlen column twice `keep` of its largest value so far. The compaction copies at most
+   * `SLICE_ROWS` (four whole chunks) per append, so each chunk's arena grows once, to at most
+   * twice its bytes. Freed just before the compaction allocates; held again as rows arrive.
+   */
+  #compactionHeld = 0;
+  readonly #reservesCompaction: boolean;
+  readonly #varlenColumns: readonly number[];
+  /** Largest value of each varlen payload column stored so far (for `#compactionHeld`). */
+  readonly #maxVarlen: number[];
   #sets: Array<ByteSet | null>;
   #aborted: unknown = undefined;
   #closed = false;
@@ -373,6 +387,14 @@ class Sorter {
     this.operands = emptyOperands(spec.types, spec.keys);
     this.decodes = needsOperands(spec.types, spec.keys);
     this.#partKeys = spec.keys.slice(0, spec.partition);
+    this.#reservesCompaction =
+      this.mode === "keys" &&
+      spec.partition === 0 &&
+      spec.keep !== null &&
+      spec.keep > 0 &&
+      spec.keep <= COMPACT_RESERVE_ROWS;
+    this.#varlenColumns = spec.types.flatMap((type, c) => (layoutOf(type) === "varlen" ? [c] : []));
+    this.#maxVarlen = this.#varlenColumns.map(() => 0);
     this.charge = new Charge(context.grant);
     this.pool = new Pool(this.charge, POOL_BYTES);
     if (!this.charge.allocate(SORTER_SCRATCH_BYTES))
@@ -644,6 +666,8 @@ class Sorter {
     while (done < n && (!decoding || this.#decodeStore() === 0)) {
       const want = Math.min(n - done, 2048);
       if (!this.#reserve(this.store.rows + want)) break;
+      // Top-N: rows go in only while the next compaction's store stays in reserve.
+      if (this.#reservesCompaction && !this.#holdCompaction(columns, ids, done, want)) break;
       const before = this.store.rows;
       const taken = this.store.append(
         columns,
@@ -667,6 +691,50 @@ class Sorter {
     return this.#makeRoom(columns, row, tail, done).then(() =>
       this.#append(columns, ids, n, tail, done),
     );
+  }
+
+  /**
+   * Top-N: holds the next compaction's store for rows `from … from + count` arriving; false
+   * when the grant refused and compaction would shrink the store (the caller makes room, by
+   * compacting). A grant that cannot hold the reserve beside `keep` rows ends in a run, as
+   * without it, and reserving stops: after a run, compaction no longer applies.
+   */
+  #holdCompaction(
+    columns: readonly Vector[],
+    ids: Uint16Array | null,
+    from: number,
+    count: number,
+  ): boolean {
+    // After a run, compaction no longer applies (the threshold filters arrivals instead).
+    if (this.runs.length > 0) {
+      this.#releaseCompaction();
+      return true;
+    }
+    const keep = this.spec.keep ?? 0;
+    let widest = this.#maxKey;
+    for (let v = 0; v < this.#varlenColumns.length; v++) {
+      const vector = columns[this.#varlenColumns[v] ?? 0];
+      let max = this.#maxVarlen[v] ?? 0;
+      if (vector !== undefined)
+        for (let k = 0; k < count; k++) {
+          const bytes = varlenBytes(vector, ids === null ? from + k : (ids[from + k] ?? 0));
+          if (bytes > max) max = bytes;
+        }
+      this.#maxVarlen[v] = max;
+      widest += max;
+    }
+    const need = this.store.fixedBytes(keep) + 2 * keep * widest;
+    if (need <= this.#compactionHeld) return true;
+    if (this.charge.allocate(need - this.#compactionHeld)) {
+      this.#compactionHeld = need;
+      return true;
+    }
+    return this.store.rows <= keep;
+  }
+
+  #releaseCompaction(): void {
+    if (this.#compactionHeld > 0) this.charge.free(this.#compactionHeld);
+    this.#compactionHeld = 0;
   }
 
   #collect(columns: readonly Vector[], ids: Uint16Array | null, count: number): boolean {
@@ -773,6 +841,8 @@ class Sorter {
       this.#lastSurvivors = survivors.length;
       return true;
     }
+    // The reserve becomes the new store (re-held as rows arrive after it).
+    this.#releaseCompaction();
     const next = this.#newStore();
     const columns = this.storeTypes.map((_, c) => c);
     let taken = 0;
@@ -1529,6 +1599,7 @@ class Sorter {
     if (this.#reserved > 0) this.charge.free(this.#reserved);
     if (this.#rankBytes > 0) this.charge.free(this.#rankBytes);
     dropOperands(this.operands, this.charge);
+    this.#releaseCompaction();
     this.charge.free(SORTER_SCRATCH_BYTES);
     this.#operandLoan?.repay();
     this.#operandLoan = null;
