@@ -124,6 +124,7 @@ import {
   mergeRuns,
   planMerge,
   runExtent,
+  yieldTask,
   type MergePlan,
   type MergePolicy,
 } from "./merge.js";
@@ -1308,9 +1309,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (this.#memtableBytes() > this.#memtableCap) await this.#relieve(0);
       // Level-0 runs past their stall bound make writers wait for merges (merges never wait on
       // writers, so this cannot deadlock).
+      // The wait is on a real signal (the merge chain) with a task yield per round, and ends
+      // when no merge is left that could reduce the count (review B3-p2b-2 B2).
       while (this.#mergeMode === "auto" && this.#levelZeroMax() >= this.#stallRuns) {
+        if (this.#nextMerge() === null) break;
         this.#scheduleMerge();
         await this.#merges;
+        await yieldTask();
         this.#check();
       }
     } catch (error) {
@@ -2332,8 +2337,15 @@ export class WritePathImpl implements WritePath, EngineHooks {
     for (const state of this.#tables.values()) {
       const def = this.#catalog.table(state.tableId);
       if (def === undefined) continue;
-      for (const index of def.indexes)
-        most = Math.max(most, levelZero(state.view.runs.get(index.id) ?? []));
+      for (const index of def.indexes) {
+        const runs = state.view.runs.get(index.id) ?? [];
+        // Level-0 runs whose merge failed twice are not debt writers can wait out (review
+        // B3-p2b-2 B2): no merge will reduce them until a new flush changes the level, which a
+        // waiting writer would prevent.
+        const first = runs[0];
+        if (first !== undefined && first.level === 0 && this.#unmergeable.has(first)) continue;
+        most = Math.max(most, levelZero(runs));
+      }
     }
     return most;
   }
