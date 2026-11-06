@@ -363,11 +363,13 @@ describe("finding 4: close() settles every startup and discovery wait", () => {
 
   it("settles a worker startup whose ready never arrives", async () => {
     const spawned = { started: false };
+    const posted: string[] = [];
     let terminated = 0;
     const worker = {
       onmessage: null,
       onerror: null,
-      postMessage() {
+      postMessage(message: { t: string }) {
+        posted.push(message.t);
         spawned.started = true;
       },
       terminate() {
@@ -386,6 +388,14 @@ describe("finding 4: close() settles every startup and discovery wait", () => {
     while (!spawned.started) await delay(1);
     connector.close();
     expect(await Promise.race([starting, delay().then(() => "hung")])).toBe("ClientClosedError");
+    // Close settles its caller at once; termination follows the acknowledged lease release.
+    expect(terminated).toBe(0);
+    expect(posted).toContain("minnow:stepDown");
+    worker.onmessage?.(
+      new MessageEvent("message", {
+        data: { t: "minnow:stopped", reason: "closing", stepDownMs: 1 },
+      }),
+    );
     expect(terminated).toBe(1);
   });
 

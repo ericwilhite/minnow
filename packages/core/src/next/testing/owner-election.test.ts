@@ -209,6 +209,12 @@ function inProcessOwner(world: World, engines = factory(world)): StartOwner {
         void started.then((host) => host.stop("pagehide", false));
         entry.kill();
       },
+      // Graceful (DECISIONS.md "Step-down"): the owner drains, closes and releases, then dies.
+      stepDown: async (reason) => {
+        const host = await started.catch(() => null);
+        if (host !== null) await host.stop(reason, true);
+        entry.kill();
+      },
     };
     return handle;
   };
@@ -610,7 +616,7 @@ describe("review of increment 2 (B5-p2b-review-1)", () => {
         ...base,
         closeFence(fence) {
           closes++;
-          base.closeFence(fence);
+          return base.closeFence(fence);
         },
         async open(fence, settings) {
           await new Promise<void>((resolve) => {
@@ -1040,6 +1046,11 @@ describe("review of increment 2 (B5-p2b-review-1)", () => {
           terminate: () => {
             terminated++;
             handle.terminate();
+          },
+          // Stopping it gracefully counts too (p2e: the page steps its owner down).
+          stepDown: (reason) => {
+            terminated++;
+            return handle.stepDown?.(reason) ?? Promise.resolve();
           },
         };
       },
@@ -2438,6 +2449,7 @@ describe("review P1: responsive discovery still has a deadline", () => {
             const held = registry.context();
             const ports: MessagePort[] = [];
             let requests = 0;
+            let stalled = false;
             let terminated = 0;
             let spawned = 0;
             if (mode === "lock wait" || mode.startsWith("handshake")) {
@@ -2488,6 +2500,16 @@ describe("review P1: responsive discovery still has a deadline", () => {
                         const request = event.data as { t: string; nonce: number };
                         if (request.t !== "connect") return;
                         requests++;
+                        if (requests === 2) {
+                          // Simulate a suspended event loop after responsive discovery has
+                          // demonstrably repeated. Both attempt and observation timers become
+                          // due together; the later give-up grace still needs its own turn.
+                          const until = performance.now() + 200;
+                          while (performance.now() < until) {
+                            /* suspended context */
+                          }
+                          stalled = true;
+                        }
                         if (!mode.startsWith("handshake")) {
                           channel.port1.postMessage({ t: mode, nonce: request.nonce });
                           return;
@@ -2546,33 +2568,53 @@ describe("review P1: responsive discovery still has a deadline", () => {
                 ended = true;
               });
             let startEnded = false;
+            let atEnd = {
+              status: connector.status,
+              requests,
+              spawned,
+              terminated,
+              stalled,
+              hostHeld: registry.held(hostLockName("bounded-discovery")),
+            };
             const connecting = connector
               .start()
               .catch(() => undefined)
               .finally(() => {
                 startEnded = true;
+                atEnd = {
+                  status: connector.status,
+                  requests,
+                  spawned,
+                  terminated,
+                  stalled,
+                  hostHeld: registry.held(hostLockName("bounded-discovery")),
+                };
               });
             try {
-              await sleep(bound + unresponsive + 100);
-              // Capture before close: cleanup must not provide the promised bound.
+              // Observe the attempt first, then give the grace its own timer turn. When the
+              // event loop resumes late, summing both budgets into one sleep can observe before
+              // the newly armed grace is due. Neither deadline relies on close() for settlement.
+              await sleep(bound + 1);
               expect(startEnded).toBe(true);
-              expect(ended).toBe(true);
-              expect(effect).toBe(sent ? "unknown" : "none");
-              expect(connector.status).toBe(
-                mode === "handshake newer" ? "superseded" : "unreachable",
-              );
-              if (mode === "startup throws")
-                expect(registry.held(hostLockName("bounded-discovery"))).toBe(false);
+              // giveUp changes activity and can start another attempt. Check this attempt's
+              // result and cleanup at its completion, independently of a later retry.
+              expect(atEnd.status).toBe(mode === "handshake newer" ? "superseded" : "unreachable");
+              if (mode === "startup throws") expect(atEnd.hostHeld).toBe(false);
               if (
                 mode === "noOwner" ||
                 (mode.startsWith("handshake") && mode !== "handshake newer")
               )
-                expect(requests).toBeGreaterThan(1);
+                expect(atEnd.requests).toBeGreaterThan(1);
               if (mode === "never ready") {
-                expect(spawned).toBeGreaterThan(0);
-                expect(terminated).toBe(spawned);
+                expect(atEnd.spawned).toBeGreaterThan(0);
+                expect(atEnd.terminated).toBe(atEnd.spawned);
               }
-              reach.recordHistory(new Set([mode, sent ? "sent unanswered" : "never sent"]));
+              await sleep(unresponsive + 1);
+              expect(ended).toBe(true);
+              expect(effect).toBe(sent ? "unknown" : "none");
+              const entered = new Set([mode, sent ? "sent unanswered" : "never sent"]);
+              if (atEnd.stalled) entered.add("delayed event-loop turn");
+              reach.recordHistory(entered);
             } finally {
               connector.close();
               held.kill();

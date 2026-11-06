@@ -67,11 +67,11 @@
  * - `hidden` on mobile (where hidden pages are suspended): graceful step-down: stop admitting,
  *   finish or cancel running statements up to the commit boundary, flush, send `stepDown`, close
  *   the handles, release the locks, terminate.
- * - `freeze` and `pagehide`: `terminate` at once, inside the event handler. A page host calls
- *   `worker.terminate()`, which frees the handle in 5–40 ms; a page in bfcache would otherwise
+ * - `freeze` and `pagehide`: start bounded step-down in the event handler, then terminate the
+ *   worker after release (or at STEP_DOWN_BOUND_MS). A page in bfcache would otherwise
  *   keep it (Firefox, verified) or lose only the lock (Safari). An in-place host, on the relayed
- *   event, closes its sync handles synchronously and releases its locks without flushing. Relaxed
- *   commits acknowledged since the last flush may be lost, as on power loss. Clients resend
+ *   event, follows the same release protocol. Abrupt destruction may leave no time for it; relaxed
+ *   commits acknowledged since the last flush may then be lost, as on power loss. Clients resend
  *   unanswered requests to the next owner (exactly-once through the ledger).
  * - A host returning (`pageshow`, `resume`, `visible`) does nothing: it is a client again and
  *   elects lazily on its next request.
@@ -105,6 +105,15 @@ export const randomId = (): string => {
 /** The broker message format version, independent of `PROTOCOL_VERSION`. */
 export const BROKER_PROTOCOL = 1;
 
+/**
+ * How long a page waits for its owner worker to step down gracefully (drain, close its session,
+ * release its lease; DECISIONS.md "Step-down") before it terminates the worker anyway. The storage
+ * backend drains for up to 500 ms and gives aborted transactions up to 1 s to settle. Allow
+ * another 500 ms for owner work/session close and scheduling margin; never cut release short.
+ */
+export const STEP_DOWN_BOUND_MS = 3_000;
+/** Maximum wait for owner tasks and engine close before proceeding to lease release. */
+export const STEP_DOWN_DRAIN_MS = 500;
 /** How long a client waits for `welcome` before abandoning the connection and starting over. */
 export const HANDSHAKE_TIMEOUT_MS = 5_000;
 /** Idle time after which a client releases its liveness lock. */
@@ -271,7 +280,7 @@ export interface Platform {
 
 /**
  * What the host does on `event` (module comment, "Step-down"):
- * - `terminate`: stop owning now, synchronously, inside the event handler.
+ * - `terminate`: begin the bounded release/termination protocol inside the event handler.
  * - `stepDown`: graceful step-down, then terminate.
  * - `flush`: `engine.flushPending()`; keep owning.
  * - `none`.

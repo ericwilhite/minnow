@@ -1068,8 +1068,17 @@ and the owner import it directly.
   waiter.
 - A client holds its liveness lock only while it has pins or `live` requests (plus 1 s of idle
   hysteresis). The owner watches it only then; a grant ends the client's connection.
-- On `hidden` the owner flushes pending relaxed commits; it terminates on `freeze` and `pagehide`,
-  and steps down gracefully on `hidden` only on mobile.
+- On `hidden` the owner flushes pending relaxed commits (mobile steps down instead). Deliberate
+  shutdown on `freeze`, `pagehide`, replacement or close stops new work, waits up to 500 ms for
+  active work (including disconnected clients), engine close and the factory's `closeSession`
+  adapter to `StoreSession.close()`, then awaits its `closeFence` adapter to
+  `lease.release()` before terminating the worker. Lease release drains storage for up to 500 ms,
+  then aborts remaining IndexedDB transactions and waits up to 1 s for their end. The page's
+  fallback termination bound is 3 s, including owner drain and scheduling margin. A release
+  failure (including `ReleaseUnsettledError`) or an owner drain timeout is logged and reported
+  to pending calls as `SessionLostError` with effect `unknown`, with a reload suggestion.
+  A stolen fence still forces immediate shutdown. Abrupt page destruction may prevent graceful
+  shutdown; the storage backend's serialized chain remains the defense against that kill.
 - Every request has a per-client `seq` (the ledger sequence) and exactly one terminal reply.
   Cancellation is acknowledged by that reply; the write path's `commit()` call is the point of no
   return.
@@ -1190,9 +1199,9 @@ and the owner import it directly.
   frame, not only from its timer: in WebKit a worker whose work yields through message tasks runs
   no timers at all until it stops (a strict commit beside a long statement waited 1.8 s for its
   flush timer), which the executor's yield (exec/pipeline.ts `yieldTask`) must fix.
-- `freeze` (on the document) and `pagehide` terminate the owner without calling back into the
-  page: Firefox can abandon a closing page's handler midway, and the `hidden` that follows must
-  then find no live owner to flush.
+- `freeze` (on the document) and `pagehide` start the bounded step-down without asking the page
+  for its context: Firefox can abandon a closing page's handler midway, and the `hidden` that
+  follows must then find no live owner to flush.
 - Statements go through real lowering (`lower/`, B6): the owner caches plans by (text, catalog
   version) and the executor's prepared plan per plan, so a warm prepared or parameterized read
   lowers nothing. A literal per key (`WHERE id = 7`) is a new text each time: past the plan cache

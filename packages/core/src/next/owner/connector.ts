@@ -48,13 +48,13 @@
  * `liveness { held: true }` and its release with `liveness { held: false }` first.
  *
  * ## Lifecycle
- * The host's page relays its lifecycle events here (`lifecycle`): `freeze`/`pagehide` terminate
- * the owner at once and release the host lock; `hidden` flushes (desktop) or steps down (mobile).
+ * The host's page relays its lifecycle events here (`lifecycle`): `freeze`/`pagehide` start a
+ * bounded owner step-down before termination; `hidden` flushes (desktop) or steps down (mobile).
  *
  * ## Closing
  * `close()` ends everything this context started, wherever it is: a queued host-lock request is
- * withdrawn, an owner still starting is terminated and its host lock released, a liveness grant
- * that arrives later is released at once.
+ * withdrawn, an owner still starting is stepped down before termination and host-lock release,
+ * and a liveness grant that arrives later is released at once.
  */
 import type { HeldLock } from "../storage/fence.js";
 import type { ProtocolClient } from "./client.js";
@@ -64,11 +64,11 @@ import {
   BROKER_REQUEST_TIMEOUT_MS,
   HANDSHAKE_TIMEOUT_MS,
   LIVENESS_IDLE_RELEASE_MS,
+  STEP_DOWN_BOUND_MS,
   canHost,
   clientLockName,
   compareProtocol,
   hostLockName,
-  lifecycleAction,
   openChannel,
   skewChannelName,
   type BrokerMessage,
@@ -77,7 +77,7 @@ import {
   type SkewSignal,
 } from "./election.js";
 import { ClientClosedError, ConnectionRefusedError, OwnerUnreachableError } from "./errors.js";
-import type { OwnerHostInit } from "./host.js";
+import type { OwnerHostCommand, OwnerHostInit, OwnerHostStatus } from "./host.js";
 import {
   ALIVE_INTERVAL_MS,
   DEFAULT_UNRESPONSIVE_AFTER_MS,
@@ -97,6 +97,13 @@ export interface OwnerHandle {
   lifecycle(event: LifecycleEvent): void;
   /** Stops it now, synchronously as far as the platform allows. */
   terminate(): void;
+  /**
+   * Steps it down gracefully, then stops it (DECISIONS.md "Step-down"): the owner stops starting
+   * storage work, lets what is in flight finish, closes its session and releases its lease; only
+   * then is the worker terminated, or after `STEP_DOWN_BOUND_MS` regardless. Without it (an owner
+   * that cannot step down), `terminate`.
+   */
+  stepDown?(reason: StepDown["reason"]): Promise<void>;
 }
 
 export type StartOwner = (init: Omit<OwnerHostInit, "t">) => OwnerHandle;
@@ -281,14 +288,14 @@ export class OwnerConnector {
         this.#starting = null;
         if (starting !== null) {
           starting.waiting.abort();
-          starting.handle?.terminate();
-          starting.lock?.release();
+          if (starting.handle !== null && starting.lock !== null)
+            this.#stepDown({ handle: starting.handle, lock: starting.lock }, "closing");
+          else starting.lock?.release();
         }
         if (this.#hosting !== null && this.#hosting !== previousHosting) {
           const hosting = this.#hosting;
           this.#hosting = null;
-          hosting.handle.terminate();
-          hosting.lock.release();
+          this.#stepDown(hosting, "closing");
         }
         if (this.#status === "connecting") {
           const failure =
@@ -340,22 +347,52 @@ export class OwnerConnector {
 
   /** Relays a page lifecycle event to the owner this context hosts. */
   lifecycle(event: LifecycleEvent): void {
+    if (event === "freeze" || event === "pagehide") {
+      // A worker can already own storage while its ready message is still pending. Retire the
+      // pending election synchronously, then let that worker release before terminating it.
+      const starting = this.#starting;
+      this.#starting = null;
+      starting?.waiting.abort();
+      if (starting !== null)
+        this.#attempt?.abort(new OwnerUnreachableError(`owner startup interrupted by ${event}`));
+      let hosting = this.#hosting;
+      if (hosting === null && starting !== null) {
+        const { handle, lock } = starting;
+        if (handle !== null && lock !== null) hosting = { handle, lock };
+      }
+      this.#hosting = null;
+      if (hosting !== null) this.#stepDown(hosting, event);
+      else starting?.lock?.release();
+      return;
+    }
     const hosting = this.#hosting;
     if (hosting === null) return;
-    // `freeze` and `pagehide` terminate on every platform. Decide without calling out first:
-    // Firefox can abandon a closing page's handler midway (observed inside `context()`), and the
-    // `hidden` that follows must then find nothing to flush, not a live owner.
-    const action =
-      event === "freeze" || event === "pagehide"
-        ? "terminate"
-        : lifecycleAction(event, this.#options.context().platform);
-    if (action === "terminate") {
-      this.#hosting = null;
+    hosting.handle.lifecycle(event);
+  }
+
+  /**
+   * Stops a hosted owner: gracefully and bounded where the handle can (WebKit leaves IndexedDB
+   * wedged for the browser session when a worker dies with transactions in flight: DECISIONS.md
+   * "Step-down"), else at once. The page's own host lock goes after.
+   */
+  #stepDown(
+    hosting: { readonly handle: OwnerHandle; readonly lock: HeldLock },
+    reason: StepDown["reason"],
+  ): void {
+    const stepping = hosting.handle.stepDown?.(reason);
+    if (stepping === undefined) {
       hosting.handle.terminate();
       hosting.lock.release();
       return;
     }
-    hosting.handle.lifecycle(event);
+    void stepping.then(
+      () => hosting.lock.release(),
+      (error: unknown) => {
+        console.error("Owner step-down failed; reload this page", error);
+        hosting.handle.terminate();
+        hosting.lock.release();
+      },
+    );
   }
 
   close(): void {
@@ -372,8 +409,9 @@ export class OwnerConnector {
     this.#starting = null;
     if (starting !== null) {
       starting.waiting.abort();
-      starting.handle?.terminate();
-      starting.lock?.release();
+      if (starting.handle !== null && starting.lock !== null)
+        this.#stepDown({ handle: starting.handle, lock: starting.lock }, "closing");
+      else starting.lock?.release();
     }
     this.#watch?.stop();
     if (this.#watchIdle !== null) clearTimeout(this.#watchIdle);
@@ -386,10 +424,7 @@ export class OwnerConnector {
     const hosting = this.#hosting;
     this.#hosting = null;
     this.#client.close();
-    if (hosting !== null) {
-      hosting.handle.terminate();
-      hosting.lock.release();
-    }
+    if (hosting !== null) this.#stepDown(hosting, "closing");
     this.#broker?.close();
     for (const port of this.#oldBrokers.splice(0)) port.close();
   }
@@ -578,11 +613,10 @@ export class OwnerConnector {
       // Raced with close(): an owner that never reports ready must not keep start() pending.
       await this.#untilClosed(handle.ready);
     } catch {
-      // close() already terminated it and released the lock if it took this start over.
+      // close()/lifecycle() already took responsibility for release if they retired this start.
       if (this.#starting === starting) {
         this.#starting = null;
-        handle.terminate();
-        lock.release();
+        this.#stepDown({ handle, lock }, "closing");
       }
       channel.port1.close();
       this.#throwIfClosed();
@@ -1084,34 +1118,75 @@ export function workerOwner(
     const stopped = new Promise<StepDown["reason"]>((resolve) => {
       resolveStopped = resolve;
     });
+    let finished = false;
+    let stepping: Promise<void> | null = null;
     worker.onmessage = (event: MessageEvent) => {
-      const status = event.data as { t: string; ownerId?: string; reason?: StepDown["reason"] };
-      if (status.t === "minnow:ready") resolveReady(status.ownerId ?? "");
-      else if (status.t === "minnow:failed")
-        rejectReady(new Error("The owner worker could not start"));
-      else if (status.t === "minnow:stopped") {
-        resolveStopped(status.reason ?? "closing");
-        worker.terminate();
+      const status = event.data as OwnerHostStatus;
+      switch (status.t) {
+        case "minnow:ready":
+          resolveReady(status.ownerId);
+          break;
+        case "minnow:failed":
+          rejectReady(new Error("The owner worker could not start"));
+          break;
+        case "minnow:stopped":
+          if (finished) return;
+          finished = true;
+          if (status.reloadSuggested)
+            console.error("Owner release was unsettled; reload this page");
+          rejectReady(new Error("The owner stopped before it was ready"));
+          resolveStopped(status.reason);
+          worker.terminate();
       }
     };
     worker.onerror = () => {
+      if (!finished) worker.terminate();
+      finished = true;
       rejectReady(new Error("The owner worker failed"));
       resolveStopped("closing");
     };
     const transfer: Transferable[] = [init.clientPort];
     if (init.brokerPort !== null) transfer.push(init.brokerPort);
     worker.postMessage({ ...init, t: "minnow:host" } satisfies OwnerHostInit, transfer);
+    void stopped.then(() => {
+      finished = true;
+    });
+    const terminate = () => {
+      if (finished) return;
+      finished = true;
+      worker.terminate();
+      // Terminated before it reported ready: it never will.
+      rejectReady(new Error("The owner worker was terminated before it was ready"));
+      resolveStopped("pagehide");
+    };
     return {
       ready,
       stopped,
       lifecycle: (event) => {
         worker.postMessage({ t: "minnow:lifecycle", event, platform });
       },
-      terminate: () => {
-        worker.terminate();
-        // Terminated before it reported ready: it never will.
-        rejectReady(new Error("The owner worker was terminated before it was ready"));
-        resolveStopped("pagehide");
+      terminate,
+      stepDown: (reason) => {
+        if (stepping !== null) return stepping;
+        if (finished) return Promise.resolve();
+        stepping = (async () => {
+          // The worker drains, closes, releases and reports `minnow:stopped` (then terminated
+          // above); a worker that does not answer in time is terminated anyway.
+          worker.postMessage({ t: "minnow:stepDown", reason } satisfies OwnerHostCommand);
+          let bound: ReturnType<typeof setTimeout> | undefined;
+          const outcome = await Promise.race([
+            stopped.then(() => "stopped" as const),
+            new Promise<"deadline">((resolve) => {
+              bound = setTimeout(() => resolve("deadline"), STEP_DOWN_BOUND_MS);
+            }),
+          ]);
+          clearTimeout(bound);
+          if (outcome === "deadline") {
+            console.error("Owner step-down did not settle; reload this page");
+            terminate();
+          }
+        })();
+        return stepping;
       },
     };
   };

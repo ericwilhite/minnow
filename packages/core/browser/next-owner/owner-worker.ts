@@ -9,6 +9,7 @@
  * - `{ t: "dieOnSave" }`: after the next save is written, hang the worker forever, so the commit
  *   is durable and its reply never leaves (the test then closes the tab).
  */
+import { ReleaseUnsettledError } from "../../dist/next/storage/contract.js";
 import { composeEngine } from "../../dist/next/owner/compose.js";
 import { serveOwnerWorker, type OwnerEngineFactory } from "../../dist/next/owner/host.js";
 import type { WebLockManager } from "../../dist/next/owner/web-locks.js";
@@ -25,12 +26,14 @@ import type { ChunkReads } from "../../dist/next/exec/scan.js";
 type Fence =
   | {
       readonly kind: "opfs";
+      releaseUnsettled?: boolean;
       readonly db: string;
       readonly handle: FileSystemSyncAccessHandle;
       readonly epoch: number;
     }
   | {
       readonly kind: "idb";
+      releaseUnsettled?: boolean;
       readonly db: string;
       readonly idb: IDBDatabase;
       readonly epoch: number;
@@ -131,14 +134,34 @@ const factory: OwnerEngineFactory<Fence> = {
   closeFence(fence) {
     if (fence.kind === "opfs") fence.handle.close();
     else fence.idb.close();
+    // Inject the public release error to exercise policy over real ports and connector watches.
+    // This is not an injection into an actual IndexedDB transaction's abort acknowledgement.
+    if (fence.releaseUnsettled)
+      throw new ReleaseUnsettledError({
+        drained: 0,
+        aborted: 1,
+        unsettled: 1,
+        transactions: [],
+        waitedMs: 1500,
+      });
   },
   async open(fence, settings) {
-    const gate = { held: false, dieOnSave: false };
+    fence.releaseUnsettled = settings.releaseUnsettled === true;
+    const gate = { held: false, dieOnSave: false, executing: 0 };
+    let writePath: StandinWritePath | null = null;
     const knobs = new BroadcastChannel(`minnow-next-test:${fence.db}`);
     knobs.onmessage = (event: MessageEvent) => {
-      const message = event.data as { t: string; value?: boolean };
+      const message = event.data as { t: string; value?: boolean; nonce?: string };
       if (message.t === "hold") gate.held = message.value === true;
       if (message.t === "dieOnSave") gate.dieOnSave = true;
+      if (message.t === "phase?" && message.nonce !== undefined)
+        knobs.postMessage({
+          t: "phase",
+          nonce: message.nonce,
+          held: gate.held,
+          executing: gate.executing > 0,
+          commitPending: writePath !== null && writePath.appliedLsn > writePath.durableLsn,
+        });
     };
     let text: string | null;
     if (fence.kind === "opfs") {
@@ -154,7 +177,7 @@ const factory: OwnerEngineFactory<Fence> = {
         // spin
       }
     };
-    const writePath = new StandinWritePath({
+    writePath = new StandinWritePath({
       durability: settings.durability === "relaxed" ? "relaxed" : "strict",
       flushDelayMs: typeof settings.flushDelayMs === "number" ? settings.flushDelayMs : 0,
       flushHeld: () => gate.held,
@@ -173,9 +196,31 @@ const factory: OwnerEngineFactory<Fence> = {
         },
       },
     });
+    const executor = new StandinExecutor();
+    const prepare = executor.prepare.bind(executor);
+    executor.prepare = (plan) => {
+      const prepared = prepare(plan);
+      const execute = prepared.execute.bind(prepared);
+      prepared.execute = (options) => {
+        const execution = execute(options);
+        if (execution.state === "running") {
+          gate.executing++;
+          void execution.executed.then(
+            () => {
+              gate.executing--;
+            },
+            () => {
+              gate.executing--;
+            },
+          );
+        }
+        return execution;
+      };
+      return prepared;
+    };
     return composeEngine({
       planner: withTestStatements(createLowerer()),
-      executor: new StandinExecutor(),
+      executor,
       writePath,
       governor: new Governor(64 * 1024 * 1024),
       spill: new MemorySpillService(),

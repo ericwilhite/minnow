@@ -63,6 +63,7 @@ import {
   ABANDONED_STREAM_MS,
   ALIVE_INTERVAL_MS,
   DEFAULT_TRANSACTION_IDLE_TIMEOUT_MS,
+  LEASE_RELEASE_FAILURE_CONTEXT,
   PROTOCOL_VERSION,
   ProtocolError,
   parseClientMessage,
@@ -174,6 +175,8 @@ export class OwnerServer {
   readonly #options: OwnerServerOptions;
   readonly #now: () => number;
   readonly #connections = new Set<Connection>();
+  /** Disconnected clients can still own work past the commit boundary or session cleanup. */
+  readonly #draining = new Set<Connection>();
   /** Completion of each executing request, by `clientId:seq`, for `inFlight` admissions. */
   readonly #inFlight = new Map<string, Promise<void>>();
   #steppingDown: StepDown["reason"] | null = null;
@@ -263,6 +266,32 @@ export class OwnerServer {
 
   dropped(connection: Connection): void {
     this.#connections.delete(connection);
+    if (!connection.isDrained) {
+      this.#draining.add(connection);
+      void connection.drained().then(() => this.#draining.delete(connection));
+    }
+  }
+
+  /**
+   * Refuses new work and ends sessions, but retains their ports until lease.release has settled.
+   * Running storage is allowed to finish; pre-commit work is cancelled by end(). Closing the
+   * engine waits for these tasks so session rollback never races a commit still using it.
+   */
+  quiesce(reason: StepDown["reason"]): {
+    readonly drained: Promise<void>;
+    finish(error?: unknown): void;
+  } {
+    this.#steppingDown = reason;
+    const connections = [...this.#connections];
+    for (const connection of connections) connection.end("stepDown", true);
+    return {
+      drained: Promise.all(
+        [...new Set([...connections, ...this.#draining])].map((connection) => connection.drained()),
+      ).then(() => undefined),
+      finish(error) {
+        for (const connection of connections) connection.finishStepDown(reason, error);
+      },
+    };
   }
 
   /** Tells every client the owner is leaving, then ends every connection. */
@@ -295,6 +324,8 @@ class Connection {
   #watch: { readonly gone: AbortSignal; stop(): void } | null = null;
   #watchIdle: ReturnType<typeof setTimeout> | null = null;
   #livenessHeld = false;
+  #onDrained: (() => void) | null = null;
+  #drainWait: Promise<void> | null = null;
 
   constructor(server: OwnerServer, port: ServerPort) {
     this.#server = server;
@@ -545,6 +576,7 @@ class Connection {
     const next = slot.queue.shift();
     if (next !== undefined && this.#state !== "closed") this.#runTask(slot, next);
     else if (this.#state === "closed") this.#closeSession(slot);
+    this.#checkDrained();
   }
 
   #afterTask(slot: SessionSlot): void {
@@ -850,6 +882,7 @@ class Connection {
         settleFlight();
       }
       this.#updateAlive();
+      this.#checkDrained();
     };
 
     // The commit identity goes to every run that may commit; the composition decides.
@@ -1447,7 +1480,7 @@ class Connection {
 
   // ---- ending ----
 
-  end(reason: "bye" | "reconnected" | "livenessLost" | "stepDown"): void {
+  end(reason: "bye" | "reconnected" | "livenessLost" | "stepDown", keepPort = false): void {
     if (this.#state === "closed") return;
     this.#state = "closed";
     void reason;
@@ -1484,6 +1517,42 @@ class Connection {
     this.#watchIdle = null;
     this.#server.dropped(this);
     this.#port.onmessage = null;
+    if (!keepPort) this.#port.close?.();
+  }
+
+  /** A closed connection has drained only after its tasks AND their session cleanup finished. */
+  drained(): Promise<void> {
+    this.#drainWait ??= new Promise((resolve) => {
+      this.#onDrained = resolve;
+    });
+    this.#checkDrained();
+    return this.#drainWait;
+  }
+
+  get isDrained(): boolean {
+    return this.#state === "closed" && this.#running.size === 0 && this.#sessions.size === 0;
+  }
+
+  #checkDrained(): void {
+    if (!this.isDrained) return;
+    this.#onDrained?.();
+    this.#onDrained = null;
+  }
+
+  /** The port was retained through release: report uncertainty before asking the client to leave. */
+  finishStepDown(reason: StepDown["reason"], error?: unknown): void {
+    if (error !== undefined) {
+      this.#port.postMessage(
+        {
+          t: "diagnostic",
+          kind: "coordination",
+          context: LEASE_RELEASE_FAILURE_CONTEXT,
+          error: toWireError(new SessionLostError("transaction", undefined, "unknown")),
+        } satisfies OwnerMessage,
+        [],
+      );
+    }
+    this.#port.postMessage({ t: "stepDown", reason } satisfies OwnerMessage, []);
     this.#port.close?.();
   }
 
