@@ -54,6 +54,77 @@ Install the browser binaries once before using a browser runner:
 npx playwright install chromium firefox webkit
 ```
 
+### WebKit on a Linux host Playwright does not support
+
+Playwright's Linux WebKit build is made for Ubuntu 24.04. On a distribution with newer system
+libraries (an Arch-based host with ICU 78, for one), every WebKit case fails before it runs:
+`Host system is missing dependencies to run browsers`, then
+`libicudata.so.74: cannot open shared object file`. `npx playwright install-deps` needs apt and
+root, and you do not need either. WebKit needs three libraries that are older than the system's:
+ICU 74, libxml2 2.9 (`libxml2.so.2`) and flite 2.2. Take them from Ubuntu 24.04's packages, keep
+them out of the system's library folders, and give Playwright a private browsers folder whose
+MiniBrowser wrapper puts them on the library path:
+
+```bash
+WK="${WK:-$HOME/.cache/minnow-webkit}"   # scratch for the libraries and the browser mirror
+BUILD=webkit-2336                         # the build the repo's Playwright looks for (ls ~/.cache/ms-playwright)
+SOURCE="${SOURCE:-$BUILD}"                # the build to run under that name (webkit-2359 for OPFS, below)
+mkdir -p "$WK/debs" "$WK/x" "$WK/lib"
+cd "$WK/debs"
+for deb in main/i/icu/libicu74_74.2-1ubuntu3_amd64.deb \
+           main/libx/libxml2/libxml2_2.9.14+dfsg-1.3ubuntu3_amd64.deb \
+           universe/f/flite/libflite1_2.2-6build3_amd64.deb; do
+  curl -fsSLO "http://archive.ubuntu.com/ubuntu/pool/$deb"
+done
+for deb in *.deb; do bsdtar -xOf "$deb" 'data.tar*' | bsdtar -xf - -C "$WK/x"; done
+cp -a "$WK"/x/usr/lib/x86_64-linux-gnu/*.so.* "$WK/lib/"
+# A private browsers folder: links to the installed build, with a MiniBrowser wrapper that keeps
+# these libraries on the path (the installed wrapper replaces LD_LIBRARY_PATH).
+SRC="$HOME/.cache/ms-playwright/$SOURCE"
+DST="$WK/browsers/$BUILD"
+rm -rf "$DST" && mkdir -p "$DST/minibrowser-wpe"
+for f in "$SRC"/*; do [ "$(basename "$f")" = minibrowser-wpe ] || ln -s "$f" "$DST/"; done
+for f in "$SRC"/minibrowser-wpe/*; do [ "$(basename "$f")" = MiniBrowser ] || ln -s "$f" "$DST/minibrowser-wpe/"; done
+sed -e 's|readlink -f $0|echo $0|' \
+    -e "s|^export LD_LIBRARY_PATH=\"\(.*\)\"|export LD_LIBRARY_PATH=\"\1:$WK/lib\"|" \
+    "$SRC/minibrowser-wpe/MiniBrowser" > "$DST/minibrowser-wpe/MiniBrowser"
+chmod +x "$DST/minibrowser-wpe/MiniBrowser"
+```
+
+Then run any browser runner with WebKit through that folder:
+
+```bash
+export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1
+export PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/minnow-webkit/browsers"
+npx playwright test --config playwright.next-owner.config.ts --project=webkit
+```
+
+`PLAYWRIGHT_BROWSERS_PATH` here holds only WebKit, so set it only for WebKit runs. A Playwright
+upgrade installs a new WebKit build: set `BUILD` to it and run the block again. Check with
+`ldd` that nothing else is missing (`LD_LIBRARY_PATH=<build>/minibrowser-wpe/lib:<build>/minibrowser-wpe/sys/lib:$WK/lib ldd <build>/minibrowser-wpe/bin/MiniBrowser | grep "not found"`).
+What a local WebKit run covers depends on the build:
+
+- **Build 2336** (WebKit 26.5, the one Playwright 1.62 pins) has no `navigator.storage` at all,
+  in pages or in workers. It covers WebKit's IndexedDB path only, and its OPFS cases skip.
+- **Build 2359** (WebKit 26.6, from Playwright 1.63: `npx playwright@1.63.0 install webkit`)
+  has OPFS in dedicated workers, with sync access handles: `navigator.storage.getDirectory()`
+  resolves, and `createSyncAccessHandle()` opens a handle that writes, flushes and reads back.
+  That holds in a persistent profile, which the repo's runners use. In a throwaway browser
+  context `getDirectory()` rejects with `UnknownError`, as in Safari's private browsing.
+
+To run the repo's lanes on 2359 while keeping the repo's Playwright, run the block with
+`SOURCE=webkit-2359`. It mirrors 2359 under the folder name Playwright 1.62 looks for. That pairs
+Playwright with a newer WebKit than it was released with. The library's OPFS cases
+(`opfs.spec.ts`, `audit-correctness.spec.ts`) pass on it with OPFS really in use, but a failure
+there is unconfirmed until it reproduces on macOS. Either way this is Linux WebKit, not Safari;
+CI runs WebKit on macOS.
+
+One more 2359 behaviour matters to the owner lanes: on a cross-origin isolated page, closing the tab
+that created a SharedWorker makes 2359 start a fresh instance of it, move the other tabs' ports to
+the new one and drop messages sent in the gap (roughly 80–300 ms). Build 2336, Chromium and Firefox
+keep the same instance, isolated or not, and 2359 keeps it on a page that is not isolated. A
+multi-tab owner case that hangs only on 2359 is likely this, not OPFS.
+
 The merge gate and fast SQLLogicTest profile run in `.github/workflows/ci.yml` on every push and pull
 request, spread across parallel jobs. One job runs the format, type, lint, build, API contract, and
 SQLLogicTest checks. The unit suite runs under coverage in four Vitest shards, with the maintenance
@@ -1198,10 +1269,18 @@ current measurement plus a little headroom, so growth is a deliberate edit besid
 This guards compressed download size; it does not claim a smaller uncompressed bundle or prove
 that every possible behavior is regression-free.
 
-OPFS browser cases check for the storage API inside a dedicated worker before running. The
-Linux WebKit build pinned with Playwright 1.62 (build 2336) has no `navigator.storage` at all,
-so a local run on Linux skips its OPFS cases for that missing capability, while IndexedDB cases
-still run. Runs that claim OPFS coverage do not skip: under CI (the merge gate, where WebKit runs
+OPFS browser cases check for the storage API inside a dedicated worker before running
+(`requireWorkerOpfs`: does `navigator.storage.getDirectory` exist). The Linux WebKit build
+pinned with Playwright 1.62 (build 2336) has no `navigator.storage` at all, so a local run on
+Linux skips its OPFS cases for that missing capability, while IndexedDB cases still run. Build
+2359 has worker OPFS, so the cases run there (see
+[WebKit on a Linux host Playwright does not support](#webkit-on-a-linux-host-playwright-does-not-support)).
+The check sees only whether the API exists. The rebuild's backend choice (`next/storage/select.ts`)
+goes further: it calls `getDirectory()`, requires `createSyncAccessHandle`, and treats the
+private-mode refusals (`SecurityError`, `UnknownError`, `NotSupportedError`) as no OPFS, falling
+back to IndexedDB. So in a context where the API exists but refuses (WebKit 2359 outside a
+persistent profile, Safari private browsing), the check runs an OPFS case that cannot get OPFS,
+while the rebuild's backend uses IndexedDB. Runs that claim OPFS coverage do not skip: under CI (the merge gate, where WebKit runs
 on macOS) and in the conformance profile, a missing worker OPFS API fails the test. The site's
 benchmark test follows the same rule. Worker startup errors and probe timeouts are always
 failures. Contention correctness tests allow queued durable writes a 30-second RPC deadline;
