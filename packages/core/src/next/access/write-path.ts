@@ -356,6 +356,15 @@ export interface ExtentDeltaResult {
  * reachability record, and a sink that cannot keep it must not be published around. A publish
  * that is rejected leaves the space failed (its root may or may not be durable): the owner
  * reopens, and startup rebuilds from the durable roots' own lists, never from the last callback.
+ *
+ * A durable publication is a fact (review B3-p2b-4 D1): the write path installs its root and runs
+ * first, then calls `commit`. If `commit` throws, the publication stays installed, nothing is
+ * retried, and the write path fails (`MINNOW_EXTENT_SINK`; reopen to continue). If `abort` throws,
+ * the publication's cleanup (its lock, grants, roots) still runs, then the write path fails the
+ * same way. Neither callback is called twice for one attempt.
+ *
+ * `retire` (from `prepare`) is retired by that publication together with `released`: the same
+ * R8 hold applies (neither durable root nor any pin reaches it) before the space reuses it.
  */
 export interface ExtentDeltaSink {
   prepare(

@@ -424,6 +424,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
   readonly #afterDeltaPrepared: ((kind: PublicationKind, sequence: number) => void) | null;
   /** R25 attempts so far (the initial root of a new store was attempt 1). */
   #attempts = 1;
+  /** A sink's commit or abort threw: the write path fails (a durable publication stays installed). */
+  readonly #sinkFailed = (error: ExtentSinkError): void => {
+    this.#failure ??= error;
+  };
   readonly #nextAttempt = (): number => ++this.#attempts;
   /** The armed idle-publish check (R10), if any. */
   #idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -587,7 +591,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     });
     try {
       const { space, session } = input;
-      let rootCharge: number;
+      let rootCharge = 0;
       let root: ManifestRoot;
       let catalog: Catalog;
       if (space.root === null) {
@@ -609,16 +613,34 @@ export class WritePathImpl implements WritePath, EngineHooks {
           clients: [],
         };
         await session.resetLog();
-        const delta = new DeltaPublication("initial", input.extentDeltas ?? null, () => 1);
+        const sink: { failure: ExtentSinkError | null } = { failure: null };
+        const delta = new DeltaPublication(
+          "initial",
+          input.extentDeltas ?? null,
+          () => 1,
+          input.tuning?.afterDeltaPrepared ?? null,
+          (error) => {
+            sink.failure ??= error;
+          },
+        );
+        let failed: unknown = null;
         try {
           await delta.prepare(root.sequence, writer, []);
           const bytes = encodeManifestRoot(root);
           rootCharge = parseCharge(bytes.length);
           if (!metadataGrant.allocate(rootCharge)) throw new ParseBudgetError(rootCharge);
           await delta.publish(space, bytes, writer, []);
+        } catch (error) {
+          failed = error;
         } finally {
           delta.settle();
         }
+        // A sink that failed to settle is the open's failure, as it is the write path's later.
+        if (sink.failure !== null) throw sink.failure;
+        if (failed !== null)
+          throw failed instanceof Error
+            ? failed
+            : new Error("The first root failed", { cause: failed });
       } else {
         // The decoded root stays resident for the session: its parse charge stays with it.
         const parsed = decodeManifestRoot(space.root, metadataGrant);
@@ -1850,6 +1872,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#extentDeltas,
       this.#nextAttempt,
       this.#afterDeltaPrepared,
+      this.#sinkFailed,
     );
     this.#flushesWriting += 1;
     let writing = true;
@@ -2184,6 +2207,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#extentDeltas,
       this.#nextAttempt,
       this.#afterDeltaPrepared,
+      this.#sinkFailed,
     );
     const writer = this.#space.beginWrite("idle publish");
     try {
@@ -2278,6 +2302,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#extentDeltas,
       this.#nextAttempt,
       this.#afterDeltaPrepared,
+      this.#sinkFailed,
     );
     let writer: ExtentWriter | null = null;
     try {
@@ -2537,6 +2562,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#extentDeltas,
       this.#nextAttempt,
       this.#afterDeltaPrepared,
+      this.#sinkFailed,
     );
     this.#merging = true;
     try {
@@ -3103,19 +3129,24 @@ export class ExtentSinkError extends Error {
 
 /**
  * One publication attempt's R25 conversation with the sink (access/write-path.ts
- * `ExtentDeltaSink`): `prepare`, then `publish`, which commits it once the root is durable or
- * aborts it if the publish is refused or rejected; `settle` (always called in the publication's
- * finally) aborts an attempt that never reached `publish` (admission, encoding, close).
+ * `ExtentDeltaSink`): `prepare`, then `publish`, then `settle` in the publication's `finally`,
+ * after the publisher installed what it published: it commits an attempt whose root is durable
+ * and aborts any other (admission, encoding, a refused or rejected publish, close). A durable
+ * publication is a fact (review B3-p2b-4 D1): it is installed before the sink hears of it, and
+ * a sink that throws from `commit` or `abort` fails the write path (`fail`, with
+ * `ExtentSinkError`) without undoing the install, retrying, or skipping the publisher's cleanup.
  */
 class DeltaPublication {
   #attempt: number | null = null;
   #sequence = 0;
+  #durable = false;
 
   constructor(
     readonly kind: PublicationKind,
     readonly sink: ExtentDeltaSink | null,
     readonly nextAttempt: () => number,
-    readonly afterPrepared: ((kind: PublicationKind, sequence: number) => void) | null = null,
+    readonly afterPrepared: ((kind: PublicationKind, sequence: number) => void) | null,
+    readonly fail: (error: ExtentSinkError) => void,
   ) {}
 
   async prepare(sequence: number, writer: ExtentWriter, retired: ExtentRef[]): Promise<void> {
@@ -3138,32 +3169,35 @@ class DeltaPublication {
         throw new ExtentSinkError(
           new RangeError("The root cannot reference extent-list pages yet (R25's format part)"),
         );
+      // Retired by this publication like `released`: held under R8 (both durable roots and every
+      // pin) before the space reuses them.
       retired.push(...result.retire);
     }
     this.afterPrepared?.(this.kind, sequence);
   }
 
+  /** Publishes; a refused or rejected publish propagates (`settle` aborts the attempt). */
   async publish(
     space: Space,
     root: Uint8Array,
     writer: ExtentWriter,
     retired: readonly ExtentRef[],
   ): Promise<void> {
-    try {
-      await space.publish(root, { writers: [writer], retired });
-    } catch (error) {
-      this.settle();
-      throw error;
-    }
-    const attempt = this.#attempt;
-    this.#attempt = null;
-    if (attempt !== null) this.sink?.commit(attempt, this.#sequence);
+    await space.publish(root, { writers: [writer], retired });
+    this.#durable = true;
   }
 
+  /** Commits (durable) or aborts the attempt, once. Never throws: a sink failure fails the path. */
   settle(): void {
     const attempt = this.#attempt;
     this.#attempt = null;
-    if (attempt !== null) this.sink?.abort(attempt);
+    if (attempt === null || this.sink === null) return;
+    try {
+      if (this.#durable) this.sink.commit(attempt, this.#sequence);
+      else this.sink.abort(attempt);
+    } catch (error) {
+      this.fail(new ExtentSinkError(error));
+    }
   }
 }
 

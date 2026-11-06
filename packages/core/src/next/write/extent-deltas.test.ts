@@ -25,6 +25,9 @@ import {
   tableInput,
 } from "./test-support.js";
 import { encodeKeyBatch, KeyBatch } from "../keys/key-encoding.js";
+import { decodeManifestRoot } from "../format/manifest-codec.js";
+import type { ExtentDeltaSink } from "../access/write-path.js";
+import type { PublicationKind } from "./engine.js";
 import type { Statement } from "../access/modify.js";
 
 const FREE = { allocate: () => true, free: () => undefined };
@@ -379,5 +382,230 @@ describe("extent deltas (ruling R25)", () => {
 
   it("reached every declared state", () => {
     reach.assertReached();
+  });
+});
+
+/** The durable root's sequence, decoded from the space (what the store holds now). */
+function durableSequence(harness: Harness): number {
+  return decodeManifestRoot(need(harness.space.root), FREE).value.sequence;
+}
+
+async function oneTable(path: WritePathImpl): Promise<number> {
+  let t = 0;
+  await autocommit(path, async (s) => {
+    t =
+      (
+        await s.changeCatalog({
+          kind: "createTable",
+          table: tableInput("t", [column("id", INT, false)]),
+        })
+      ).id ?? 0;
+  });
+  return t;
+}
+
+describe("a sink whose commit or abort throws (review B3-p2b-4 D1)", () => {
+  it("a throwing commit after a durable merge: installed, never retried, the path fails (the reviewer's probe)", async () => {
+    const harness = new Harness("strict", "memory", 4, undefined, {
+      merges: { mode: "manual", fanIn: 2 },
+    });
+    let armed = false;
+    const sequences: number[] = [];
+    harness.extentDeltas = {
+      prepare: () => null,
+      commit: (_attempt, sequence) => {
+        sequences.push(sequence);
+        if (armed) {
+          armed = false;
+          throw new Error("commit callback failed");
+        }
+      },
+      abort: () => undefined,
+    };
+    const path = await harness.open();
+    const t = await oneTable(path);
+    for (const ids of [[1, 2, 3, 4], [5, 6, 7, 8], [9]]) {
+      await autocommit(path, (s) => s.table(t).insert(batch(ints(ids)), null));
+      await path.quiesce();
+    }
+    armed = true;
+    await path.runMaintenance();
+    expect(path.failure).toBeInstanceOf(ExtentSinkError);
+    expect(path.maintenance.merges).toBe(1);
+    expect(path.maintenance.mergeFailures).toBe(0);
+    // The durable publication is installed: the write path's root is the store's.
+    expect(path.state().root.sequence).toBe(durableSequence(harness));
+    expect(sequences).toEqual(sequences.map((_, k) => need(sequences[0]) + k));
+    await harness.close(); // the lock and the merge's grant were released
+    harness.extentDeltas = null;
+    const reopened = await harness.reopen().catch(async () => harness.open());
+    expect(reopened.failure).toBeNull();
+    await harness.space.audit();
+    await harness.close();
+  });
+
+  const KINDS: readonly PublicationKind[] = ["initial", "flush", "merge", "recycle", "idle"];
+  for (const kind of KINDS)
+    for (const mode of ["commit", "abort"] as const)
+      it(`a ${mode} that throws for a ${kind} publication fails the path and keeps cleanup`, async () => {
+        let target = false;
+        let pending: number | null = null;
+        let armed: number | null = null;
+        const calls: string[] = [];
+        // A commit is heard only once its root is installed (D1): the path shows it already.
+        let current: WritePathImpl | null = null;
+        const uninstalled: number[] = [];
+        const sink: ExtentDeltaSink = {
+          prepare: (attempt) => {
+            pending = attempt;
+            calls.push(`prepare ${String(attempt)}`);
+            return null;
+          },
+          commit: (attempt, sequence) => {
+            calls.push(`commit ${String(attempt)}`);
+            if (current !== null && current.state().root.sequence !== sequence)
+              uninstalled.push(sequence);
+            if (attempt === armed) throw new Error("commit callback failed");
+          },
+          abort: (attempt) => {
+            calls.push(`abort ${String(attempt)}`);
+            if (attempt === armed) throw new Error("abort callback failed");
+          },
+        };
+        const harness = new Harness("strict", "memory", 4, undefined, {
+          merges: { mode: "manual", fanIn: 2 },
+          idleGarbageBytes: 1,
+          afterDeltaPrepared: (published) => {
+            if (!target || published !== kind || armed !== null) return;
+            armed = pending;
+            // An abort follows a failure after prepare: the encode step fails here.
+            if (mode === "abort") throw new Error("injected failure at encode");
+          },
+        });
+        harness.extentDeltas = sink;
+        if (kind === "initial") {
+          target = true;
+          const opened = await harness.open().then(
+            () => null,
+            (error: unknown) => error,
+          );
+          expect(opened).toBeInstanceOf(ExtentSinkError);
+          expect(calls[calls.length - 1]).toBe(`${mode} ${String(armed)}`);
+          // The lock went with the refused open: the next open takes it.
+          harness.extentDeltas = null;
+          const path = await harness.open();
+          expect(path.failure).toBeNull();
+          await harness.close();
+          return;
+        }
+        const path = await harness.open();
+        current = path;
+        const t = await oneTable(path);
+        const insert = (ids: number[]) =>
+          autocommit(path, (s) => s.table(t).insert(batch(ints(ids)), null));
+        await insert([1, 2, 3, 4]);
+        await insert([5]);
+        await path.quiesce();
+        await insert([6, 7, 8]);
+        target = true;
+        if (kind === "flush") {
+          await insert([9]);
+          await path.quiesce().catch(() => undefined);
+        } else if (kind === "merge") {
+          await insert([9]);
+          target = false;
+          await path.quiesce();
+          target = true;
+          await path.runMaintenance();
+        } else if (kind === "recycle") await path.recycleLog().catch(() => undefined);
+        else {
+          await insert([9]);
+          await path.quiesce();
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          await path.quiesce().catch(() => undefined);
+        }
+        expect(armed, `a ${kind} publication was prepared`).not.toBeNull();
+        const failure = path.failure;
+        expect(failure).toBeInstanceOf(ExtentSinkError);
+        const cause = failure?.cause;
+        expect(cause).toBeInstanceOf(Error);
+        expect((cause as Error).message).toBe(`${mode} callback failed`);
+        // Settled once, as the protocol says: the armed attempt got exactly one of the two.
+        const settled = calls.filter(
+          (call) => call === `commit ${String(armed)}` || call === `abort ${String(armed)}`,
+        );
+        expect(settled).toEqual([`${mode} ${String(armed)}`]);
+        expect(uninstalled, "commits heard before their root was installed").toEqual([]);
+        if (mode === "commit") {
+          expect(path.state().root.sequence).toBe(durableSequence(harness));
+          if (kind === "merge") expect(path.maintenance.mergeFailures).toBe(0);
+        }
+        // Cleanup ran: the lock is free (close finishes) and nothing leaked (the audit).
+        await harness.close();
+        harness.extentDeltas = null;
+        const reopened = await harness.open();
+        expect(reopened.failure).toBeNull();
+        await harness.space.audit();
+        await harness.close();
+      });
+});
+
+describe("the sink's retire list (B1's question)", () => {
+  it("an extent the sink retires is held under R8 like a released one: not reused while a pin can reach it", async () => {
+    const harness = new Harness("strict", "memory", 4, undefined, { merges: { mode: "off" } });
+    let page: { offset: number; length: number } | null = null;
+    let retireNow = false;
+    const retiredBy = new Set<number>();
+    const added: Array<{ offset: number; length: number }> = [];
+    harness.extentDeltas = {
+      // The sink writes a page into one publication and retires it in a later one (B1's list
+      // pages, until the root has a field for them).
+      prepare: async (_attempt, delta) => {
+        for (const extent of delta.added) added.push(extent);
+        if (page === null && delta.added.length > 0) {
+          page = need((await delta.writer.write([new Uint8Array([1, 2, 3])])).blobs[0]).extent;
+          return null;
+        }
+        if (retireNow && page !== null) {
+          retireNow = false;
+          return { pages: [], retire: [page] };
+        }
+        return null;
+      },
+      commit: () => undefined,
+      abort: () => undefined,
+    };
+    const path = await harness.open();
+    harness.space.publish = ((publish) => async (root, change) => {
+      for (const extent of change.retired) retiredBy.add(extent.offset);
+      return publish(root, change);
+    })(harness.space.publish.bind(harness.space));
+    const t = await oneTable(path);
+    let next = 0;
+    const flush = async () => {
+      for (const ids of [[next++, next++, next++, next++], [next++]])
+        await autocommit(path, (s) => s.table(t).insert(batch(ints(ids)), null));
+      await path.quiesce();
+    };
+    await flush();
+    expect(page).not.toBeNull();
+    const written = page as unknown as { offset: number; length: number };
+    // A reader older than the retirement.
+    const old = harness.space.pin("older reader");
+    retireNow = true;
+    retiredBy.clear();
+    await flush();
+    // Retired with the publication's other retirements, in the same list.
+    expect([...retiredBy]).toContain(written.offset);
+    added.length = 0;
+    for (let k = 0; k < 6; k++) await flush();
+    const overlaps = (extent: { offset: number; length: number }) =>
+      extent.offset < written.offset + written.length &&
+      written.offset < extent.offset + extent.length;
+    expect(added.filter(overlaps), "reused while a pin reaches it").toEqual([]);
+    old.release();
+    for (let k = 0; k < 3; k++) await flush();
+    await harness.space.audit();
+    await harness.close();
   });
 });
