@@ -47,6 +47,11 @@ export interface Scope {
   /** A column reference as the front end writes it (`a`, `t.a`), or undefined if unknown. */
   column(reference: string): Typed | undefined;
   /**
+   * Whether `qualifier` names a FROM entry here or in an enclosing query, so an unknown `t.a`
+   * is "missing FROM-clause entry" (42P01) rather than an unknown column. Absent: cannot tell.
+   */
+  knowsQualifier?(qualifier: string): boolean;
+  /**
    * A whole expression this scope already computes: a GROUP BY key or an aggregate of a grouped
    * block. Tried before the expression is lowered structurally.
    */
@@ -701,9 +706,12 @@ export function lowerExpression(
     }
     case "column": {
       const resolved = scope.column(expression.reference);
-      if (resolved === undefined)
-        throw new PlanningError(`column "${expression.reference}" does not exist`, "42703");
-      return resolved;
+      if (resolved !== undefined) return resolved;
+      const dot = expression.reference.indexOf(".");
+      const qualifier = dot === -1 ? null : expression.reference.slice(0, dot);
+      if (qualifier !== null && scope.knowsQualifier?.(qualifier) === false)
+        throw new PlanningError(`missing FROM-clause entry for table "${qualifier}"`, "42P01");
+      throw new PlanningError(`column "${expression.reference}" does not exist`, "42703");
     }
     case "wildcard":
       throw new PlanningError("* is not allowed here", "42601");

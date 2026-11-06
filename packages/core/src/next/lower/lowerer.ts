@@ -44,9 +44,11 @@
  * - **Memory.** Lowering allocates plain objects proportional to the statement; it holds no
  *   governor grant (plans are small and bounded by the statement text). The cache that holds
  *   plans is the owner's to bound.
- * - **Errors.** Front-end errors pass through (`TypeError`, `SqlCompileError`). Lowering throws
- *   `PlanningError` (SQL errors with SQLSTATE) and `UnsupportedPlanError` (a construct the new
- *   core does not translate yet; errors.ts). Neither leaves state behind.
+ * - **Errors.** `lower` throws only `PlanningError` (a SQL error with PostgreSQL's SQLSTATE:
+ *   42601 syntax, 42P01 relation, 42703 column, 42883 function, 42704 type, …) and
+ *   `UnsupportedPlanError` (0A000, a construct the new core does not translate yet). Front-end
+ *   failures are translated (errors.ts `frontEndError`): the original is the `cause`, and a parse
+ *   error keeps its `position`. Neither leaves state behind.
  * - **Cancellation.** None: lowering is bounded and synchronous.
  */
 import type { CatalogChange, CatalogView, TableDef } from "../access/catalog.js";
@@ -135,8 +137,7 @@ export interface LoweredTransactionControl extends LoweredBase {
   readonly savepoint: string | null;
   /**
    * BEGIN READ ONLY / START TRANSACTION READ ONLY: the owner pins a snapshot and takes no writer
-   * slot (ruling R11.2). Needs the front-end change "access mode" in INVENTORY.md; false for
-   * every other statement.
+   * slot (ruling R11.2). False for every other statement, READ WRITE included.
    */
   readonly readOnly: boolean;
 }

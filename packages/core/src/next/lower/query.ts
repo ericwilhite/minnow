@@ -254,6 +254,9 @@ class Grouping {
         }
         return this.#aggregateColumn(position);
       },
+      ...(this.source.knowsQualifier === undefined
+        ? {}
+        : { knowsQualifier: this.source.knowsQualifier.bind(this.source) }),
       column: (reference) => {
         const resolved = this.source.column(reference);
         if (resolved === undefined) return undefined;

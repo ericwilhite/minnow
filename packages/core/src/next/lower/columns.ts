@@ -12,7 +12,7 @@ import {
   type PhysicalType,
   type SqlTypeDescriptor,
 } from "../types.js";
-import { unsupported } from "./errors.js";
+import { PlanningError, unsupported } from "./errors.js";
 
 /** A column definition as CREATE TABLE and ALTER TABLE ADD COLUMN compile it. */
 export type FrontEndColumn = Extract<
@@ -42,8 +42,10 @@ export function declaredColumnType(column: FrontEndColumn, context: string): Dec
     ...(column.declaredLength === undefined ? {} : { declaredLength: column.declaredLength }),
   };
   requireDeclaredWidths(declared, context);
+  // The front end reads an unknown type name as an enum without labels. The new catalog has no
+  // named types (CREATE TYPE is refused, R17.7), so the name names nothing: 42704.
   if (declared.sqlDomain?.kind === "enum" && declared.sqlDomain.values.length === 0)
-    throw unsupported("enumType", `column ${context} has enum type ${declared.sqlDomain.name}`);
+    throw new PlanningError(`type "${declared.sqlDomain.name}" does not exist`, "42704");
   try {
     return { type: physicalTypeOf(declared), declared };
   } catch (error) {

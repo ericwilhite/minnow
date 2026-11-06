@@ -1,8 +1,10 @@
 import { UnsupportedPlanError } from "../errors.js";
 
 /**
- * Errors lowering raises itself. Errors from the front end (parser and passes: `TypeError`,
- * `SqlCompileError`) pass through unchanged, as they do in the current engine.
+ * Errors lowering raises. Every failure of `Lowerer.lower` is a `PlanningError` with a SQLSTATE
+ * or an `UnsupportedPlanError` (0A000): front-end failures (the parser's `SqlCompileError`, the
+ * passes' `TypeError`) are translated by `frontEndError`, keeping the original as `cause` and the
+ * parser's position.
  */
 
 /**
@@ -56,11 +58,59 @@ export function unsupported(construct: UnsupportedConstruct, detail: string): Un
  */
 export class PlanningError extends Error {
   readonly code = "MINNOW_PLANNING";
+  /** Where the parser failed: character offset and length in the statement text (additive). */
+  readonly position?: { readonly offset: number; readonly length: number };
   constructor(
     message: string,
     readonly sqlState: string,
+    options?: {
+      readonly cause?: unknown;
+      readonly position?: { readonly offset: number; readonly length: number };
+    },
   ) {
-    super(message);
+    super(message, options?.cause === undefined ? undefined : { cause: options.cause });
     this.name = "PlanningError";
+    if (options?.position !== undefined) this.position = options.position;
   }
+}
+
+/**
+ * PostgreSQL's SQLSTATE for a front-end failure, by what its message says (the front end's
+ * errors carry none). The front end checks some conditions in its own order, so a statement
+ * with two faults may report the other one PostgreSQL would report first.
+ */
+const FRONT_END_STATES: ReadonlyArray<readonly [RegExp, string]> = [
+  [/^SELECT \* requires known columns for: /u, "42P01"],
+  [/^Unknown table alias: /u, "42P01"],
+  [/^(Unknown|Unsupported) function: /u, "42883"],
+  [/ requires (exactly |at least |at most )?\w+ arguments?\b/u, "42883"],
+  [/^Unsupported CAST target: /u, "42704"],
+  [/column names must be unique/u, "42701"],
+  [/must appear in GROUP BY/u, "42803"],
+  [/^Ambiguous or missing column: /u, "42702"],
+  [/references an unavailable outer source: /u, "42P01"],
+  [
+    /not supported|is only supported|are supported only|supports? only|cannot (use|contain|select)|^Unsupported /u,
+    "0A000",
+  ],
+];
+
+/** A front-end failure as a `PlanningError` (see FRONT_END_STATES); others are returned as is. */
+export function frontEndError(error: unknown): unknown {
+  if (!(error instanceof TypeError)) return error;
+  const message = error.message;
+  const located =
+    "offset" in error && typeof error.offset === "number" && "length" in error
+      ? { offset: error.offset, length: Number(error.length) }
+      : undefined;
+  const mapped = FRONT_END_STATES.find(([pattern]) => pattern.test(message))?.[1];
+  // A positioned failure the table does not name is the parser's: a syntax error. Anything
+  // else is a refusal of the SQL by a pass, in the syntax-or-access-rule class.
+  const sqlState = mapped ?? (located === undefined ? "42000" : "42601");
+  const relation = /^SELECT \* requires known columns for: (.+)$/u.exec(message)?.[1];
+  return new PlanningError(
+    relation === undefined ? message : `relation "${relation}" does not exist`,
+    sqlState,
+    { cause: error, ...(located === undefined ? {} : { position: located }) },
+  );
 }

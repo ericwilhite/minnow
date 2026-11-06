@@ -1266,6 +1266,10 @@ with a fixed threshold; use `MODE=encode` and `MODE=filter` in interleaved round
   code that lowering replaces.
 - Pure and synchronous; the owner caches by (text, catalog version) and re-lowers when
   `statisticsDrifted` says the data moved.
+- Every failure is a `PlanningError` with PostgreSQL's SQLSTATE (42601 syntax, 42P01 relation,
+  42703 column, 42883 function, 42704 type, …) or an `UnsupportedPlanError` (0A000). Front-end
+  errors are translated by message (`frontEndError`), keeping the parse position and the
+  original as `cause`. `BEGIN READ ONLY` lowers with `readOnly: true` (R11.2).
 - Declared numeric widths and VARCHAR(n) / CHAR(n) widths come from the parser only under
   `compileWithDeclaredTypes` (engine/query.ts), so the current engine compiles exactly what it
   did (C5, R17.4).

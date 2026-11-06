@@ -183,8 +183,9 @@ false }`, CHAR(n) / CHARACTER(n) as fixed, CHAR alone as CHAR(1).
 
 ### Still needed
 
-1. **Access mode.** `BEGIN READ ONLY` / `START TRANSACTION READ ONLY` parse and are discarded;
-   the transaction statement must keep `readOnly` (R11.2). Until then `readOnly` is false.
+1. **Done in lowering: access mode.** The front end still drops `READ ONLY`; lowering reads it
+   from the statement's words (a parsed transaction statement holds only keywords), so the
+   shipped parser is unchanged (R11.2).
 2. **RETURNING from FROM / USING sources.** `UPDATE c … FROM o … RETURNING o.qty` and
    `DELETE FROM c USING o … RETURNING o.qty` are refused by the parser ("RETURNING qualifier
    must name the target table"); PostgreSQL returns them. Lowering already carries the source

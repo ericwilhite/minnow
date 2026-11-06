@@ -8,7 +8,7 @@ import type { OutputColumn, PhysicalPlan, Rel } from "../ir/ir.js";
 import type { TableRuleExpressions } from "../ir/rules.js";
 import { ParameterTypes } from "./coerce.js";
 import { descriptorOf, lowerDdl, tableInput } from "./ddl.js";
-import { PlanningError } from "./errors.js";
+import { frontEndError, PlanningError } from "./errors.js";
 import type { ExpressionState } from "./expressions.js";
 import type { CompiledQuery } from "../../plan/model.js";
 import { parseAny, parseQuery, prepareQuery } from "./frontend.js";
@@ -168,6 +168,19 @@ function lowerModify(
   };
 }
 
+/**
+ * BEGIN / START TRANSACTION … READ ONLY (R11.2). The front end accepts and drops the access mode,
+ * and a transaction statement it parsed holds only keywords and commas, so the words of the text
+ * decide, comments aside.
+ */
+function readsOnly(text: string): boolean {
+  const words = text
+    .replace(/--[^\n]*|\/\*[\s\S]*?\*\//gu, " ")
+    .toUpperCase()
+    .match(/[A-Z]+/gu);
+  return (words ?? []).some((word, index) => word === "READ" && words?.[index + 1] === "ONLY");
+}
+
 const TRANSACTION_ACTIONS = {
   begin: "begin",
   commit: "commit",
@@ -177,120 +190,130 @@ const TRANSACTION_ACTIONS = {
   release: "release",
 } as const;
 
+/** `Lowerer.lower` before its errors are translated (lower/errors.ts `frontEndError`). */
+function lowerStatement(text: string, context: LoweringContext): LoweredStatement {
+  // CREATE TABLE … AS … WITH [NO] DATA: the front end does not parse the clause (and keeps
+  // refusing it); lowering strips it and decides whether the follow-up INSERT runs.
+  const ctasData = CTAS_DATA.exec(text);
+  const source = ctasData === null ? text : text.slice(0, ctasData.index);
+  const noData = ctasData?.[1] !== undefined;
+  const parsed = parseAny(source);
+  if ("query" in parsed) return lowerSelect(text, parsed.query, context);
+  const statement = parsed.statement;
+  const statementClass = classifyStatement(statement);
+  const base = {
+    text,
+    catalogVersion: context.catalog.version,
+    command: statementClass.command,
+    controlsTransaction: statementClass.controlsTransaction,
+  };
+  switch (statement.kind) {
+    case "select":
+      return lowerSelect(text, parseQuery(statement.sql), context);
+    case "insert":
+    case "update":
+    case "delete":
+      return lowerModify(text, statement, context);
+    case "merge":
+      return lowerModify(text, statement, context);
+    case "transaction":
+      return {
+        ...base,
+        kind: "transactionControl",
+        parameters: [],
+        action: TRANSACTION_ACTIONS[statement.action],
+        savepoint: statement.name ?? null,
+        readOnly: statement.action === "begin" && readsOnly(text),
+      };
+    case "set":
+      return { ...base, kind: "utility", parameters: [], show: null };
+    case "show": {
+      const name = statement.name.toLowerCase();
+      const value = SETTINGS[name];
+      if (value === undefined)
+        throw new PlanningError(
+          `unrecognized configuration parameter "${statement.name}"`,
+          "42704",
+        );
+      return {
+        ...base,
+        kind: "utility",
+        parameters: [],
+        show: {
+          column: resultColumn({ name, type: { kind: "text" }, nullable: false }, false),
+          value,
+        },
+      };
+    }
+    case "create-table-as": {
+      if (context.catalog.tableByName(statement.table) !== undefined) {
+        if (statement.ifNotExists === true)
+          return { ...base, kind: "ddl", parameters: [], change: null, followUp: null };
+        throw new PlanningError(`relation "${statement.table}" already exists`, "42P07");
+      }
+      const plan = planning(placeholderCount(statement.query), context);
+      const block = lowerBlock(prepareQuery(statement.query, context.catalog), plan.builder);
+      const columns = block.columns.map((column) => ({
+        name: column.name,
+        type: column.type,
+        declared: descriptorOf(column.type),
+        nullable: true,
+        defaultSql: null,
+        generatedSql: null,
+        identitySequence: null,
+        missing: null,
+      }));
+      if (new Set(columns.map((column) => column.name)).size !== columns.length)
+        throw new PlanningError(
+          `column specified more than once in table "${statement.table}"`,
+          "42701",
+        );
+      const change: CatalogChange = {
+        kind: "createTable",
+        table: {
+          name: statement.table,
+          columns,
+          primaryKey: null,
+          unique: [],
+          foreignKeys: [],
+          checks: [],
+        },
+      };
+      return {
+        ...base,
+        kind: "ddl",
+        parameters: [],
+        change,
+        followUp: noData
+          ? null
+          : insertSelectText(
+              statement.table,
+              columns.map((column) => column.name),
+              ctasQueryText(source),
+            ),
+      };
+    }
+    default: {
+      const result = lowerDdl(statement, context.catalog);
+      return {
+        ...base,
+        kind: "ddl",
+        parameters: [],
+        change: result.change,
+        followUp: result.followUp,
+      };
+    }
+  }
+}
+
 export function createLowerer(): Lowerer {
   return {
     lower(text: string, context: LoweringContext): LoweredStatement {
-      // CREATE TABLE … AS … WITH [NO] DATA: the front end does not parse the clause (and keeps
-      // refusing it); lowering strips it and decides whether the follow-up INSERT runs.
-      const ctasData = CTAS_DATA.exec(text);
-      const source = ctasData === null ? text : text.slice(0, ctasData.index);
-      const noData = ctasData?.[1] !== undefined;
-      const parsed = parseAny(source);
-      if ("query" in parsed) return lowerSelect(text, parsed.query, context);
-      const statement = parsed.statement;
-      const statementClass = classifyStatement(statement);
-      const base = {
-        text,
-        catalogVersion: context.catalog.version,
-        command: statementClass.command,
-        controlsTransaction: statementClass.controlsTransaction,
-      };
-      switch (statement.kind) {
-        case "select":
-          return lowerSelect(text, parseQuery(statement.sql), context);
-        case "insert":
-        case "update":
-        case "delete":
-          return lowerModify(text, statement, context);
-        case "merge":
-          return lowerModify(text, statement, context);
-        case "transaction":
-          return {
-            ...base,
-            kind: "transactionControl",
-            parameters: [],
-            action: TRANSACTION_ACTIONS[statement.action],
-            savepoint: statement.name ?? null,
-            readOnly: false,
-          };
-        case "set":
-          return { ...base, kind: "utility", parameters: [], show: null };
-        case "show": {
-          const name = statement.name.toLowerCase();
-          const value = SETTINGS[name];
-          if (value === undefined)
-            throw new PlanningError(
-              `unrecognized configuration parameter "${statement.name}"`,
-              "42704",
-            );
-          return {
-            ...base,
-            kind: "utility",
-            parameters: [],
-            show: {
-              column: resultColumn({ name, type: { kind: "text" }, nullable: false }, false),
-              value,
-            },
-          };
-        }
-        case "create-table-as": {
-          if (context.catalog.tableByName(statement.table) !== undefined) {
-            if (statement.ifNotExists === true)
-              return { ...base, kind: "ddl", parameters: [], change: null, followUp: null };
-            throw new PlanningError(`relation "${statement.table}" already exists`, "42P07");
-          }
-          const plan = planning(placeholderCount(statement.query), context);
-          const block = lowerBlock(prepareQuery(statement.query, context.catalog), plan.builder);
-          const columns = block.columns.map((column) => ({
-            name: column.name,
-            type: column.type,
-            declared: descriptorOf(column.type),
-            nullable: true,
-            defaultSql: null,
-            generatedSql: null,
-            identitySequence: null,
-            missing: null,
-          }));
-          if (new Set(columns.map((column) => column.name)).size !== columns.length)
-            throw new PlanningError(
-              `column specified more than once in table "${statement.table}"`,
-              "42701",
-            );
-          const change: CatalogChange = {
-            kind: "createTable",
-            table: {
-              name: statement.table,
-              columns,
-              primaryKey: null,
-              unique: [],
-              foreignKeys: [],
-              checks: [],
-            },
-          };
-          return {
-            ...base,
-            kind: "ddl",
-            parameters: [],
-            change,
-            followUp: noData
-              ? null
-              : insertSelectText(
-                  statement.table,
-                  columns.map((column) => column.name),
-                  ctasQueryText(source),
-                ),
-          };
-        }
-        default: {
-          const result = lowerDdl(statement, context.catalog);
-          return {
-            ...base,
-            kind: "ddl",
-            parameters: [],
-            change: result.change,
-            followUp: result.followUp,
-          };
-        }
+      // Every failure leaves as a PlanningError with a SQLSTATE (or UnsupportedPlanError).
+      try {
+        return lowerStatement(text, context);
+      } catch (error) {
+        throw frontEndError(error);
       }
     },
 

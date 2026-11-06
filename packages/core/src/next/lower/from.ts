@@ -73,7 +73,10 @@ export const virtual = (source: number, local: number): number => source * SOURC
 export const sourceOf = (index: number): number => Math.floor(index / SOURCE_STRIDE);
 
 /** Resolves a name the clause's own sources do not have: an enclosing query's column. */
-export type OuterResolver = (reference: string) => Typed | undefined;
+export type OuterResolver = ((reference: string) => Typed | undefined) & {
+  /** Whether an enclosing query has a FROM entry of this name (Scope.knowsQualifier). */
+  knowsQualifier?: (qualifier: string) => boolean;
+};
 
 /** Lowers a whole block (query.ts), passed in so this module needs no import of it. */
 export type BlockLowerer = (
@@ -371,6 +374,8 @@ export function lowerFrom(
         throw new PlanningError(`column reference "${reference}" is ambiguous`, "42702");
       return matches[0] ?? options.outer?.(reference);
     },
+    knowsQualifier: (qualifier) =>
+      byQualifier(qualifier).length > 0 || (options.outer?.knowsQualifier?.(qualifier) ?? false),
     subquery: (request) => attachSubquery(request),
   };
 
@@ -379,17 +384,20 @@ export function lowerFrom(
     const mark = request.kind === "quantified" ? markJoin(request) : null;
     if (mark !== null) return mark;
     const bindings: Array<{ readonly slot: number; readonly typed: Typed }> = [];
-    const resolver: OuterResolver = (reference) => {
-      const outer = scope.column(reference);
-      if (outer === undefined) return undefined;
-      const slot = builder.slot(outer.expr.type);
-      bindings.push({ slot, typed: outer });
-      return {
-        expr: { op: "param", slot, type: outer.expr.type },
-        nullable: outer.nullable,
-        big: outer.big,
-      };
-    };
+    const resolver: OuterResolver = Object.assign(
+      (reference: string): Typed | undefined => {
+        const outer = scope.column(reference);
+        if (outer === undefined) return undefined;
+        const slot = builder.slot(outer.expr.type);
+        bindings.push({ slot, typed: outer });
+        return {
+          expr: { op: "param", slot, type: outer.expr.type },
+          nullable: outer.nullable,
+          big: outer.big,
+        };
+      },
+      { knowsQualifier: (qualifier: string) => scope.knowsQualifier?.(qualifier) ?? false },
+    );
     const state = builder.state;
     const wasVolatile = state.volatile;
     state.volatile = false;
