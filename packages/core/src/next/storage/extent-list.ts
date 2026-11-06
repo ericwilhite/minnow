@@ -178,14 +178,16 @@ export async function* listedExtents(
   checkOrder(list);
   reserve(budget, 512); // two bounded page-reference vectors across a generator suspension
   try {
+    let pageIndex = 0;
     for (const batch of batches(list)) {
       const decoded = await readPages(batch, reader, budget);
       try {
         for (let index = 0; index < batch.length; index++) {
           const page = batch[index];
           const extents = decoded.pages[index];
+          const next = list[pageIndex + 1];
+          pageIndex += 1;
           if (page === undefined || extents === undefined) continue;
-          const next = list[list.indexOf(page) + 1];
           const last = extents[extents.length - 1];
           if (next !== undefined && last !== undefined && last.offset >= next.first)
             throw new StoreCorruptionError(

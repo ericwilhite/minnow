@@ -1342,7 +1342,8 @@ buffer, encoded page and result metadata through `ByteBudget` before allocating 
 one touched source page and writes one output page at a time. Prepared metadata stays charged
 across publication; abort/failure returns it, commit replaces the keeper's retained reservation,
 and close releases that reservation. List readers keep decoded objects charged across generator
-suspension and release them when the consumer finishes or stops.
+suspension and release them when the consumer finishes or stops. Startup carries a single page
+cursor across read batches, so traversing the root’s page references is linear in page count.
 
 ### R25 startup measurement
 
