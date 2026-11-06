@@ -193,3 +193,18 @@ export const BROKER_RESTART_STATES = [
   "restart with a client waiting",
   "duplicate request delivered",
 ] as const;
+
+/** Discovery must finish despite responsive negative replies, failed hellos or stuck startup. */
+export const OWNER_DISCOVERY_STATES = [
+  "noOwner",
+  "unreachable",
+  "handshake timeout",
+  "handshake refusal",
+  "handshake newer",
+  "never ready",
+  "lock wait",
+  "sent unanswered",
+  "never sent",
+  "startup throws",
+  "broker throws",
+] as const;

@@ -968,7 +968,11 @@ and the owner import it directly.
   (`owner/webkit-sharedworker.md`). So every broker request is bounded: it waits
   `BROKER_REQUEST_TIMEOUT_MS` (1 s), doubling, first on the same port and then on fresh ones, and
   past `BROKER_REQUEST_BOUND_MS` (15 s) it fails with `OwnerUnreachableError` and the connector
-  becomes `unreachable` instead of staying `connecting`. The next request, a broker that announces
+  becomes `unreachable` instead of staying `connecting`. The same 15 s budget bounds the whole
+  discovery/startup attempt, including repeated `noOwner` or `unreachable` answers, refused or
+  unanswered handshakes, queued election and a worker that never reports ready. Broker or worker
+  construction failures also arm the SQL grace and release the pending election. Replies never
+  restart this budget. The next request, a broker that announces
   itself, or an owner announcement starts it again. Each broker instance has a random id it
   announces on every port: the client sends its unanswered requests again to it, and an owner
   registers again on a new id, but only while it still holds both its locks. A request id is
@@ -979,6 +983,11 @@ and the owner import it directly.
   `unknown` for an unanswered sent request. A sent BEGIN or unknown statement keeps its session
   lost until an explicit end. After the deadline, new requests fail immediately with `none` and
   trigger another connection attempt. A successful connection clears the deadline; closing cancels it.
+  A continuously disconnected request therefore waits at most 15 s plus 10 s at defaults,
+  conditional on event-loop execution. Retries do not renew the latter deadline. This is a
+  connection-availability bound, not a timeout on connected SQL execution.
+  Supersession by a newer protocol fails pending SQL immediately with the same effect rule;
+  a reload prompt never stands in for completing those calls.
 - A client learns that its owner was replaced even while idle: a new owner announces itself on
   the database's BroadcastChannel (`{t: "owner", ownerId, epoch}`, the fence epoch, strictly
   increasing). An announcement is a hint: a client acts only on an epoch above its owner's, and

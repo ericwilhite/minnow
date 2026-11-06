@@ -125,7 +125,7 @@ export interface ConnectorOptions {
   readonly announcements?: boolean;
   /** One broker request attempt's timeout (default election.ts `BROKER_REQUEST_TIMEOUT_MS`). */
   readonly brokerTimeoutMs?: number;
-  /** A broker request's total bound (default election.ts `BROKER_REQUEST_BOUND_MS`). */
+  /** Whole discovery/startup attempt bound, also bounding each ask (default 15 s). */
   readonly brokerBoundMs?: number;
   /** Called when connecting gives up (`status` becomes `unreachable`); see `ConnectorStatus`. */
   readonly onUnreachable?: (error: OwnerUnreachableError) => void;
@@ -134,19 +134,20 @@ export interface ConnectorOptions {
 }
 
 /**
- * - `connecting` ends in bounded time: every wait in it is bounded (a broker request by
- *   `BROKER_REQUEST_BOUND_MS`, the handshake by `HANDSHAKE_TIMEOUT_MS`) or ends on an event that
- *   must come (the host lock's grant while a live owner holds it, a registration). It never
- *   waits on a message that may have been lost: a broker request is sent again until it is
- *   answered, and a replaced broker (`instance`) makes it ask again at once.
- * - `unreachable`: the broker did not answer within its bound, or there is none and this context
- *   cannot host. `start()` rejected with `OwnerUnreachableError` and `onUnreachable` was called.
- *   The next request, a broker that announces itself, or an owner announcement starts connecting
- *   again. Pending requests stay queued for `unresponsiveAfterMs` (protocol.ts
- *   `DEFAULT_UNRESPONSIVE_AFTER_MS`) from the first time it became `unreachable`; with no
- *   connection by then the client gives up (client.ts `giveUp`): every waiting request fails
- *   with `OwnerUnreachableError`, effect `none` if never sent and `unknown` if sent, and new ones
- *   fail at once until the next connection. So a request, too, ends in bounded time.
+ * - `connecting` has one whole-attempt deadline, `brokerBoundMs` (15 s by default), covering
+ *   discovery, repeated negative replies, failed hellos, queued election and worker startup.
+ *   Individual broker retries back off within that budget; a reply does not renew it. Expiry
+ *   cancels outstanding asks, hellos and startup and rejects start() with OwnerUnreachableError.
+ * - `unreachable`: an attempt failed or this context cannot host. onUnreachable is called.
+ *   Requests/activity or owner/broker announcements can retry. Waiting SQL has one additional
+ *   unresponsiveAfterMs deadline (10 s by default) from the first failure since a successful
+ *   connection; retries never renew it. At that deadline waiting requests fail with
+ *   OwnerUnreachableError: none only for SQL never posted, unknown for sent unanswered SQL.
+ *   Thus a continuously disconnected request waits at most one attempt budget plus that grace,
+ *   conditional on event-loop execution. New calls after give-up fail immediately with none.
+ *   A successful connection or close cancels the grace. Connected execution is not a query timeout.
+ * - `superseded`: pending SQL fails immediately with the same sent/never-sent effect rule;
+ *   reloading is required. Reporting a reload prompt must not leave queued calls pending.
  */
 export type ConnectorStatus = "connecting" | "connected" | "unreachable" | "superseded" | "closed";
 
@@ -157,7 +158,11 @@ interface Starting {
   lock: HeldLock | null;
 }
 
-const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+/** AbortSignal.reason is untyped at the platform boundary; preserve typed owner/close errors. */
+function attemptFailure(signal: AbortSignal | undefined): Error {
+  const reason: unknown = signal?.reason;
+  return reason instanceof Error ? reason : new OwnerUnreachableError("connection attempt stopped");
+}
 
 export class OwnerConnector {
   readonly #options: ConnectorOptions;
@@ -201,6 +206,9 @@ export class OwnerConnector {
   #starting: Starting | null = null;
   #ownerProtocol: number | null = null;
   #connecting: Promise<void> | null = null;
+  #attempt: AbortController | null = null;
+  #attemptWait: Promise<never> | null = null;
+  #attemptTimer: ReturnType<typeof setTimeout> | null = null;
   #everConnected = false;
   #watch: { readonly gone: AbortSignal; stop(): void } | null = null;
   #watchIdle: ReturnType<typeof setTimeout> | null = null;
@@ -248,16 +256,59 @@ export class OwnerConnector {
 
   /** Connects (electing this context if needed). Idempotent while a connection attempt runs. */
   start(): Promise<void> {
-    this.#connecting ??= this.#connect()
+    if (this.#connecting !== null) return this.#connecting;
+    const attempt = new AbortController();
+    this.#attempt = attempt;
+    this.#attemptWait = new Promise<never>((_, reject) => {
+      attempt.signal.addEventListener("abort", () => reject(attemptFailure(attempt.signal)), {
+        once: true,
+      });
+    });
+    this.#attemptWait.catch(() => undefined);
+    const ms = this.#options.brokerBoundMs ?? BROKER_REQUEST_BOUND_MS;
+    const timer = setTimeout(
+      () =>
+        attempt.abort(
+          new OwnerUnreachableError(`discovery and startup did not finish within ${String(ms)} ms`),
+        ),
+      ms,
+    );
+    this.#attemptTimer = timer;
+    const previousHosting = this.#hosting;
+    this.#connecting = this.#connect()
       .catch((error: unknown) => {
-        if (error instanceof OwnerUnreachableError && this.#status === "connecting") {
+        const starting = this.#starting;
+        this.#starting = null;
+        if (starting !== null) {
+          starting.waiting.abort();
+          starting.handle?.terminate();
+          starting.lock?.release();
+        }
+        if (this.#hosting !== null && this.#hosting !== previousHosting) {
+          const hosting = this.#hosting;
+          this.#hosting = null;
+          hosting.handle.terminate();
+          hosting.lock.release();
+        }
+        if (this.#status === "connecting") {
+          const failure =
+            error instanceof OwnerUnreachableError
+              ? error
+              : new OwnerUnreachableError(
+                  error instanceof Error ? error.message : "discovery or startup failed",
+                );
           this.#status = "unreachable";
           this.#armUnresponsive();
-          this.#options.onUnreachable?.(error);
+          this.#options.onUnreachable?.(failure);
+          throw failure;
         }
         throw error;
       })
       .finally(() => {
+        clearTimeout(timer);
+        if (this.#attemptTimer === timer) this.#attemptTimer = null;
+        this.#attempt = null;
+        this.#attemptWait = null;
         this.#connecting = null;
       });
     return this.#connecting;
@@ -310,6 +361,9 @@ export class OwnerConnector {
   close(): void {
     if (this.#status === "closed") return;
     this.#status = "closed";
+    if (this.#attemptTimer !== null) clearTimeout(this.#attemptTimer);
+    this.#attemptTimer = null;
+    this.#attempt?.abort(new ClientClosedError());
     this.#announcements?.close();
     if (this.#silenceTimer !== null) clearTimeout(this.#silenceTimer);
     this.#silenceTimer = null;
@@ -344,11 +398,16 @@ export class OwnerConnector {
 
   /** `promise`, or ClientClosedError as soon as `close()` runs. */
   #untilClosed<T>(promise: Promise<T>): Promise<T> {
-    return Promise.race([promise, this.#closedWait]);
+    return Promise.race([
+      promise,
+      this.#closedWait,
+      ...(this.#attemptWait === null ? [] : [this.#attemptWait]),
+    ]);
   }
 
   #throwIfClosed(): void {
     if (this.#status === "closed") throw new ClientClosedError();
+    if (this.#attempt?.signal.aborted) throw attemptFailure(this.#attempt.signal);
   }
 
   async #connect(): Promise<void> {
@@ -364,10 +423,16 @@ export class OwnerConnector {
       if (answer.t === "port") {
         // The same live owner we are still connected to (D1 b): resume, never a new generation,
         // which would end the old one and roll its transactions back.
-        if (answer.ownerId === this.#client.ownerId && this.#client.connected && !this.#fresh) {
+        if (
+          answer.ownerId === this.#client.ownerId &&
+          this.#client.connected &&
+          !this.#client.gaveUp &&
+          !this.#fresh
+        ) {
           answer.port.postMessage({ t: "bye" });
           answer.port.close();
           this.#status = "connected";
+          this.#disarmUnresponsive();
           // The next deadline counts from now, with the backoff the rounds have reached: a resume
           // is not an answer (B5-p2d review 2, D2).
           this.#silence.roundAt = Date.now();
@@ -402,10 +467,14 @@ export class OwnerConnector {
       abandon.abort();
     };
     watch.gone.addEventListener("abort", onGone, { once: true });
+    const signal = this.#attempt?.signal;
+    signal?.addEventListener("abort", onGone, { once: true });
+    if (signal?.aborted) onGone();
     const timer = setTimeout(onGone, this.#options.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS);
     const done = () => {
       clearTimeout(timer);
       watch.gone.removeEventListener("abort", onGone);
+      signal?.removeEventListener("abort", onGone);
       watch.stop();
     };
     try {
@@ -447,7 +516,7 @@ export class OwnerConnector {
         return true;
       }
       // steppingDown or staleGeneration: try again.
-      await this.#untilClosed(sleep(10));
+      await this.#untilClosed(this.#nextRegistration(10));
       return false;
     }
   }
@@ -467,6 +536,9 @@ export class OwnerConnector {
       waiting.abort();
     };
     this.#registered.push(onRegistered);
+    const signal = this.#attempt?.signal;
+    signal?.addEventListener("abort", onRegistered, { once: true });
+    if (signal?.aborted) onRegistered();
     let lock: HeldLock;
     try {
       lock = await webLocks(this.#options.locks).request(hostLockName(database), {
@@ -477,21 +549,30 @@ export class OwnerConnector {
       return false; // another context registered while we queued, or closed
     } finally {
       this.#registered = this.#registered.filter((wake) => wake !== onRegistered);
+      signal?.removeEventListener("abort", onRegistered);
     }
     const start = this.#options.startOwner;
-    if (start === null || this.#starting !== starting) {
+    if (start === null || this.#starting !== starting || signal?.aborted) {
       lock.release();
+      this.#throwIfClosed();
       return false;
     }
     starting.lock = lock;
     const channel = new MessageChannel();
-    const handle = start({
-      database,
-      build: this.#options.build ?? "",
-      clientPort: channel.port2,
-      brokerPort: this.#options.openBroker?.() ?? null,
-      settings: { ...this.#options.settings, protocol: this.#client.protocol },
-    });
+    let handle: OwnerHandle;
+    try {
+      handle = start({
+        database,
+        build: this.#options.build ?? "",
+        clientPort: channel.port2,
+        brokerPort: this.#options.openBroker?.() ?? null,
+        settings: { ...this.#options.settings, protocol: this.#client.protocol },
+      });
+    } catch (error) {
+      channel.port1.close();
+      channel.port2.close();
+      throw error; // start() releases the pending election and arms the waiting-SQL deadline.
+    }
     starting.handle = handle;
     try {
       // Raced with close(): an owner that never reports ready must not keep start() pending.
@@ -503,8 +584,9 @@ export class OwnerConnector {
         handle.terminate();
         lock.release();
       }
+      channel.port1.close();
       this.#throwIfClosed();
-      await this.#untilClosed(sleep(50));
+      await this.#untilClosed(this.#nextRegistration(50));
       return false;
     }
     // Closed while it started: `close()` already terminated it and released the lock.
@@ -602,7 +684,13 @@ export class OwnerConnector {
       // how many attempts there are (a timer may fire a millisecond early or late).
       let plannedAt = 0;
       let timer: ReturnType<typeof setTimeout> | null = null;
+      const signal = this.#attempt?.signal;
+      const onAbort = () => {
+        finish();
+        reject(attemptFailure(signal));
+      };
       const finish = () => {
+        signal?.removeEventListener("abort", onAbort);
         if (timer !== null) clearTimeout(timer);
         timer = null;
         this.#brokerReplies.delete(nonce);
@@ -656,19 +744,26 @@ export class OwnerConnector {
           port.postMessage(request);
         },
       });
-      attemptNow();
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
+      else attemptNow();
     });
   }
 
   /** Resolves on the next owner registration, or after `ms`. */
   #nextRegistration(ms: number): Promise<void> {
     return new Promise((resolve) => {
-      const timer = setTimeout(done, ms);
-      function done() {
+      const signal = this.#attempt?.signal;
+      const done = () => {
         clearTimeout(timer);
+        signal?.removeEventListener("abort", done);
+        this.#registered = this.#registered.filter((wake) => wake !== done);
         resolve();
-      }
+      };
+      const timer = setTimeout(done, ms);
       this.#registered.push(done);
+      signal?.addEventListener("abort", done, { once: true });
+      if (signal?.aborted) done();
     });
   }
 
@@ -683,6 +778,7 @@ export class OwnerConnector {
 
   /** Asks who owns; supersedes an older owner, or is superseded by a newer one. */
   async #settleSkew(): Promise<void> {
+    const signal = this.#attempt?.signal;
     const channel = openChannel(skewChannelName(this.#options.database));
     if (channel === null) return;
     const owner = await new Promise<number | null>((resolve) => {
@@ -698,7 +794,7 @@ export class OwnerConnector {
       channel.postMessage({ t: "whoOwns", protocol: this.#client.protocol } satisfies SkewSignal);
     });
     channel.close();
-    if (owner === null) return;
+    if (owner === null || signal?.aborted || this.#status === "closed") return;
     const relation = compareProtocol(this.#client.protocol, owner);
     if (relation === "clientNewer") this.#supersedeOlderOwner();
     else if (relation === "clientOlder") this.#superseded();
@@ -708,6 +804,12 @@ export class OwnerConnector {
     if (this.#status === "superseded") return;
     this.#status = "superseded";
     this.#watch?.stop();
+    if (this.#silenceTimer !== null) clearTimeout(this.#silenceTimer);
+    this.#silenceTimer = null;
+    this.#disarmUnresponsive();
+    // A reload prompt is not completion of queued SQL. Preserve sent/never-sent effects even
+    // when no compatible connection can ever be made by this client version.
+    this.#client.giveUp("a newer database owner superseded this client; reload this page");
     this.#options.onSuperseded?.();
   }
 

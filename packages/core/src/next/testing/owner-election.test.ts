@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   BARRIER_RESOLUTION_STATES,
   BROKER_RESTART_STATES,
+  OWNER_DISCOVERY_STATES,
   LEDGER_RESOLUTION_STATES,
   createReach,
 } from "../../testing/reach.js";
@@ -36,6 +37,7 @@ import {
 } from "../owner/protocol.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
 import { FakeLockRegistry, type FakeLockContext } from "./fake-locks.js";
+import { harness as ownerHarness } from "./owner-harness.js";
 import { RestartingBroker } from "./restarting-broker.js";
 import { createLowerer } from "../lower/create.js";
 import { StandinExecutor, StandinWritePath, withTestStatements } from "./owner-standins.js";
@@ -2395,4 +2397,212 @@ describe("requests end in bounded time too (client.ts connect and giveUp)", () =
       timers.restore();
     }
   });
+});
+
+/** Whole-attempt liveness, independent of whether individual discovery messages are answered. */
+describe("review P1: responsive discovery still has a deadline", () => {
+  const seeds = seedsFor("next-owner-discovery-bound", [0xd15c]);
+  it.each(seeds)(
+    "generated negative replies and failed handshakes (seed %i)",
+    async (seed) => {
+      const reach = createReach("next-owner-discovery-bound", OWNER_DISCOVERY_STATES, {
+        minimum: 2,
+      });
+      await fc.assert(
+        fc.asyncProperty(
+          fc.record({
+            mode: fc.constantFrom(
+              "noOwner",
+              "unreachable",
+              "handshake timeout",
+              "handshake refusal",
+              "handshake newer",
+              "never ready",
+              "lock wait",
+              "startup throws",
+              "broker throws",
+            ),
+            bound: fc.integer({ min: 30, max: 60 }),
+            unresponsive: fc.integer({ min: 15, max: 30 }),
+            sent: fc.boolean(),
+          }),
+          async ({ mode, bound, unresponsive, sent }) => {
+            const registry = new FakeLockRegistry();
+            const held = registry.context();
+            const ports: MessagePort[] = [];
+            let requests = 0;
+            let terminated = 0;
+            let spawned = 0;
+            if (mode === "lock wait" || mode.startsWith("handshake")) {
+              await new Promise<void>((resolve) => {
+                void held.request(hostLockName("bounded-discovery"), {}, () => {
+                  resolve();
+                  return new Promise<void>(() => undefined);
+                });
+              });
+            }
+            const client = new ProtocolClient();
+            let warm: ReturnType<typeof ownerHarness> | null = null;
+            if (sent) {
+              warm = ownerHarness();
+              const channel = new MessageChannel();
+              ports.push(channel.port1, channel.port2);
+              const post = channel.port1.postMessage.bind(channel.port1);
+              channel.port1.postMessage = ((message: { t: string }, transfer?: Transferable[]) => {
+                if (message.t === "welcome") post(message, transfer ?? []);
+              }) as typeof channel.port1.postMessage;
+              warm.server.accept(channel.port1);
+              await client.connect(channel.port2);
+            }
+            const connector = new OwnerConnector({
+              database: "bounded-discovery",
+              client,
+              locks: registry.context(),
+              announcements: false,
+              brokerBoundMs: bound,
+              brokerTimeoutMs: 5,
+              retryMs: 2,
+              handshakeTimeoutMs: 5,
+              unresponsiveAfterMs: unresponsive,
+              context: () => ({
+                kind: "page",
+                visible: true,
+                superseded: false,
+                platform: { mobile: false },
+              }),
+              openBroker:
+                mode === "never ready" || mode === "lock wait" || mode === "startup throws"
+                  ? null
+                  : () => {
+                      if (mode === "broker throws") throw new Error("broker construction failed");
+                      const channel = new MessageChannel();
+                      ports.push(channel.port1, channel.port2);
+                      channel.port1.onmessage = (event) => {
+                        const request = event.data as { t: string; nonce: number };
+                        if (request.t !== "connect") return;
+                        requests++;
+                        if (!mode.startsWith("handshake")) {
+                          channel.port1.postMessage({ t: mode, nonce: request.nonce });
+                          return;
+                        }
+                        const owner = new MessageChannel();
+                        ports.push(owner.port1);
+                        owner.port1.onmessage = () => {
+                          if (mode === "handshake newer")
+                            owner.port1.postMessage({
+                              t: "refused",
+                              reason: "version",
+                              ownerProtocol: PROTOCOL_VERSION + 1,
+                              ownerBuild: "newer",
+                            });
+                          if (mode === "handshake refusal")
+                            owner.port1.postMessage({
+                              t: "refused",
+                              reason: "steppingDown",
+                              ownerProtocol: PROTOCOL_VERSION,
+                              ownerBuild: "test",
+                            });
+                        };
+                        channel.port1.postMessage(
+                          { t: "port", ownerId: "silent", nonce: request.nonce, port: owner.port2 },
+                          [owner.port2],
+                        );
+                      };
+                      return channel.port2;
+                    },
+              startOwner:
+                mode === "never ready" || mode === "lock wait" || mode === "startup throws"
+                  ? () => {
+                      spawned++;
+                      if (mode === "startup throws") throw new Error("worker construction failed");
+                      return {
+                        ready: new Promise(() => undefined),
+                        stopped: new Promise(() => undefined),
+                        lifecycle() {
+                          return undefined;
+                        },
+                        terminate() {
+                          terminated++;
+                        },
+                      };
+                    }
+                  : null,
+            });
+            let ended = false;
+            let effect: string | undefined;
+            const waiting = client
+              .query("SELECT 1")
+              .catch((error: unknown) => {
+                effect = (error as { effect?: string }).effect;
+              })
+              .finally(() => {
+                ended = true;
+              });
+            let startEnded = false;
+            const connecting = connector
+              .start()
+              .catch(() => undefined)
+              .finally(() => {
+                startEnded = true;
+              });
+            try {
+              await sleep(bound + unresponsive + 100);
+              // Capture before close: cleanup must not provide the promised bound.
+              expect(startEnded).toBe(true);
+              expect(ended).toBe(true);
+              expect(effect).toBe(sent ? "unknown" : "none");
+              expect(connector.status).toBe(
+                mode === "handshake newer" ? "superseded" : "unreachable",
+              );
+              if (mode === "startup throws")
+                expect(registry.held(hostLockName("bounded-discovery"))).toBe(false);
+              if (
+                mode === "noOwner" ||
+                (mode.startsWith("handshake") && mode !== "handshake newer")
+              )
+                expect(requests).toBeGreaterThan(1);
+              if (mode === "never ready") {
+                expect(spawned).toBeGreaterThan(0);
+                expect(terminated).toBe(spawned);
+              }
+              reach.recordHistory(new Set([mode, sent ? "sent unanswered" : "never sent"]));
+            } finally {
+              connector.close();
+              held.kill();
+              for (const port of ports) port.close();
+              warm?.server.stepDown("closing");
+              await warm?.engine.close();
+              await Promise.all([waiting, connecting]);
+            }
+          },
+        ),
+        { seed, numRuns: 80 },
+      );
+      reach.assertReached();
+    },
+    60_000,
+  );
+});
+
+it("P1: recovery to the same owner after give-up creates a usable connection", async () => {
+  const w = world();
+  const { owner } = await hosted(w);
+  const { connector, client, silent } = silentTab(w, [], {
+    silent: false,
+    unresponsiveAfterMs: 30,
+  });
+  await connector.start();
+  const generation = client.generation;
+  const waiting = client.query("SELECT spin($1)", [5_000]).catch((error: unknown) => error);
+  silent.on = true;
+  client.onStepDown?.("closing");
+  await until(() => client.gaveUp, 2_000);
+  expect(await waiting).toMatchObject({ effect: "unknown" });
+  silent.on = false;
+  await client.query("SELECT 1").catch(() => undefined); // activity retries discovery
+  await until(() => connector.status === "connected", 2_000);
+  expect(client.ownerId).toBe(owner.ownerId);
+  expect(client.gaveUp).toBe(false);
+  expect(client.generation).toBeGreaterThan(generation);
+  expect((await client.query("SELECT 1")).rows()).toEqual([[1]]);
 });
