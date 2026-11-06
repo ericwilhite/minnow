@@ -16,6 +16,23 @@ Not yet released. The next release will name its packages here.
   delete that came from `TRUNCATE`, and `declaredTypeName` and `declaredLength` on column
   definitions, which keep the declared `NUMERIC`/`DECIMAL` spelling and `VARCHAR(n)`/`CHAR(n)`
   width. They are additive; nothing needs to change.
+- **ORDER BY a qualified column you do not select now sorts by that column.** When another
+  selected column had the same name, Minnow sorted by the selected one instead. For example,
+  this query sorted by `o.id`:
+
+  ```sql
+  SELECT o.id, c.name FROM c FULL JOIN o ON o.cid = c.id ORDER BY c.id
+  ```
+
+  The same happened with a window function in the select list over any join, and with a
+  `USING` join, where `ORDER BY c.k` could sort by the merged `k` column. Results now match
+  PostgreSQL: a qualified name such as `c.id` always means that table's column, never an
+  output column with the same name.
+
+- Queries of that shape that Minnow refused with "ORDER BY requires a selected column or
+  output alias" now run. For example: `SELECT name AS id FROM c ORDER BY c.id`.
+
+No stored format changes, and no migration step is needed.
 
 ## 0.19.3 — November 5, 2026
 

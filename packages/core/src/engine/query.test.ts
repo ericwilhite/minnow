@@ -670,8 +670,10 @@ describe("public SQL queries", () => {
       { x: 1, y: "a" },
     ]);
     expect(executeRowQuery(plan, input)).toEqual(executeQuery(plan, input));
+    // `u` is no source of this block: PostgreSQL's "missing FROM-clause entry for table u". The
+    // qualified key is never matched to the output `x` by its bare name.
     expect(() => executeRowQuery(compileQuery("SELECT * FROM t ORDER BY u.x"), input)).toThrow(
-      "ORDER BY requires a selected column or output alias: u.x",
+      "Unknown table alias: u",
     );
   });
 

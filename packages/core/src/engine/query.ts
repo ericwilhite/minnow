@@ -12838,12 +12838,19 @@ function resolveOrderByOrdinals(
  * column the select list carries unqualified sorts by that output. Only a qualifier that is one
  * of the block's own sources counts, and only when exactly one selected column matches, so an
  * ambiguous or misspelled reference still fails in resolution.
+ *
+ * Not in a block whose joins merge columns (USING, NATURAL): there an unqualified name may be
+ * the merged column — COALESCE(c.k, o.k) under FULL JOIN, o.k under RIGHT JOIN — which is not
+ * `c.k`, so the qualified key keeps naming its source's own column (PostgreSQL).
  */
 function resolveOrderQualifiers(
   orderBy: CompiledQuery["orderBy"],
   select: readonly SelectItem[],
-  sourceAliases: readonly string[],
+  base: TableSource,
+  joins: readonly JoinPlan[],
 ): CompiledQuery["orderBy"] {
+  const sourceAliases = [base, ...joins].map((source) => source.alias);
+  const merges = joins.some((join) => join.using !== undefined || join.natural === true);
   return orderBy.map((order) => {
     const expression = order.expression;
     if (expression.kind !== "column") return order;
@@ -12862,7 +12869,7 @@ function resolveOrderQualifiers(
     }
     const qualifier = expression.reference.slice(0, separator);
     const column = expression.reference.slice(separator + 1);
-    if (!sourceAliases.includes(qualifier)) return order;
+    if (merges || !sourceAliases.includes(qualifier)) return order;
     const matches = select.filter(
       (item) =>
         item.expression.kind === "column" &&
@@ -13254,17 +13261,15 @@ function desugarFullJoin(parts: SelectBlockParts, nextSequence: () => number): C
   // where the branches' table aliases no longer exist. Qualified references that name a select
   // item are rewritten to its output alias, and everything else — expressions, and columns the
   // select list does not carry — takes the shared hidden-column desugar, which re-enters this
-  // function with alias-only ordering.
-  const outputAlias = (reference: string): string | undefined => {
-    const exact = parts.select.find(
+  // function with alias-only ordering. A qualified name is always an input column (PostgreSQL:
+  // output names cannot be qualified), so `c.id` names the item selecting `c.id`, never another
+  // source's column that happens to be output as `id`.
+  const outputAlias = (reference: string): string | undefined =>
+    parts.select.find(
       (item) =>
         item.alias === reference ||
         (item.expression.kind === "column" && item.expression.reference === reference),
-    );
-    if (exact !== undefined) return exact.alias;
-    const bare = reference.split(".").at(-1) ?? reference;
-    return parts.select.find((item) => item.alias === bare)?.alias;
-  };
+    )?.alias;
   parts = {
     ...parts,
     orderBy: parts.orderBy.map((order) => {
@@ -13403,7 +13408,8 @@ function lowerSelectBlock(
     orderBy: resolveOrderQualifiers(
       resolveOrderByOrdinals(parts.orderBy, parts.select),
       parts.select,
-      [parts.base, ...parts.joins].map((source) => source.alias),
+      parts.base,
+      parts.joins,
     ),
   };
   parts = unifyBlockGroupedReferences(parts);
@@ -14210,11 +14216,11 @@ function orderNeedsHiddenColumn(expression: Expression, parts: SelectBlockParts)
   if (expression.kind !== "column") return true;
   if (parts.select.some((item) => item.expression.kind === "wildcard")) return false;
   const reference = expression.reference;
-  const bare = reference.split(".").at(-1) ?? reference;
+  // An output alias answers only an unqualified name: `ORDER BY c.id` under
+  // `SELECT o.id, c.name` sorts by c's column, not by the output named `id` (PostgreSQL).
   return !parts.select.some(
     (item) =>
       item.alias === reference ||
-      item.alias === bare ||
       (item.expression.kind === "column" && item.expression.reference === reference),
   );
 }

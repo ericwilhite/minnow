@@ -266,6 +266,58 @@ function joinCases(): Case[] {
   );
 }
 
+/**
+ * ORDER BY a qualified column the select list does not carry, while another source's column is
+ * output under the same bare name. A qualified name is always an input column in PostgreSQL —
+ * output names cannot be qualified — so `ORDER BY d.label` under `SELECT m.label` sorts by
+ * data's label, and under USING `d.region` is data's own column, not the merged `region`
+ * (COALESCE under FULL JOIN, dims' column under RIGHT JOIN). Crossed: every join kind × ON and
+ * USING × which source's column sorts × direction, and a window over the block (whose desugar
+ * resolves ORDER BY again), plus the single-table and derived-table forms. The `d.id, m.rank`
+ * tail makes the order total: one side's key is non-NULL on every joined row.
+ */
+function qualifiedOrderCases(): Case[] {
+  const shapes = [
+    { on: "ON m.region = d.region", select: "m.label, d.id, m.rank", key: "d.label" },
+    { on: "ON m.region = d.region", select: "d.label, d.id, m.rank", key: "m.label" },
+    { on: "ON m.region = d.region", select: "m.region, d.id, m.rank", key: "d.region" },
+    { on: "USING (region)", select: "region, d.id, m.rank", key: "d.region" },
+    { on: "USING (region)", select: "region, d.id, m.rank", key: "m.region" },
+    { on: "USING (region)", select: "m.label, d.id, m.rank", key: "d.label" },
+  ];
+  const directions = ["NULLS FIRST", "DESC NULLS LAST"];
+  const cases: Case[] = [];
+  for (const kind of ["JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN"])
+    for (const { on, select, key } of shapes) {
+      for (const direction of directions)
+        cases.push({
+          sql: `SELECT ${select} FROM data d ${kind} dims m ${on} ORDER BY ${key} ${direction}, d.id NULLS FIRST, m.rank NULLS FIRST`,
+          ordered: true,
+        });
+      // FULL JOIN under a window is refused (it is only supported as the block's sole source).
+      if (kind !== "FULL JOIN")
+        cases.push({
+          sql: `SELECT ${select}, COUNT(*) OVER () AS n FROM data d ${kind} dims m ${on} ORDER BY ${key} NULLS FIRST, d.id NULLS FIRST, m.rank NULLS FIRST`,
+          ordered: true,
+        });
+    }
+  cases.push(
+    {
+      sql: `SELECT label AS region, id FROM data d ORDER BY d.region NULLS FIRST, d.id`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT d.label AS region, d.id FROM data d ORDER BY d.region DESC NULLS LAST, d.id`,
+      ordered: true,
+    },
+    {
+      sql: `SELECT s.label, m.rank FROM (SELECT id, region, label FROM data) s FULL JOIN dims m ON m.region = s.region ORDER BY m.label NULLS FIRST, s.id NULLS FIRST, m.rank`,
+      ordered: true,
+    },
+  );
+  return cases;
+}
+
 /** Datetime literals and calendar arithmetic, which only PostgreSQL spells the same way. */
 function datetimeCases(): Case[] {
   const cases: Case[] = [
@@ -1293,6 +1345,7 @@ function combinationCases(): Case[] {
     ...distinctCases(),
     ...windowCases(),
     ...joinCases(),
+    ...qualifiedOrderCases(),
     ...datetimeCases(),
     ...cteCases(),
     ...derivedWindowCases(),
