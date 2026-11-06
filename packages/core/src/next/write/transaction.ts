@@ -751,57 +751,107 @@ export class StatementImpl implements Statement {
    * their reference rewritten to the new key (rekey follow: always, as today's engine does). Rows
    * these actions write go through the same writers, so their own constraints and actions apply.
    */
+  /**
+   * Runs the foreign-key actions the statement's parent changes call for, in rounds: each round
+   * takes every check queued so far (an action may queue more: a cascade into a further table).
+   * - **Follow (a parent's key changed, ON UPDATE CASCADE).** Children follow their parent row's
+   *   identity (review B3-p2b-1 #1): for each child foreign key, the children of every key that
+   *   changed in the round are found in one view before any of them is updated, so a key another
+   *   parent took meanwhile (a swap, a shift, a rotation) never captures the wrong children.
+   *   PostgreSQL's row-at-a-time cascade gives the same result for every statement it accepts.
+   * - **Delete (a parent row left).** Nothing happens when the key is live again; else CASCADE,
+   *   SET NULL or RESTRICT per child foreign key.
+   * Every lookup reads the current view (review B3-p2b-1 #2): an action can freeze a memtable or
+   * replace the state, and a later action must see the rows it wrote.
+   */
   async #actions(): Promise<void> {
     while (this.parentChecks.length > 0) {
-      const check = need(this.parentChecks.shift());
-      const current = this.current();
-      const parent = current.internalTable(check.parentTableId);
-      const key = parent.def.indexes.find((index) => index.id === check.indexId);
-      // The key is live in the parent again (re-inserted, or another row took it): nothing to do.
-      if (
-        key !== undefined &&
-        (await new ViewIndex(nonUnique(key), parent).countRange(check.key, 0, check.key.length)) > 0
-      )
-        continue;
-      for (const child of this.tx.catalog.tables)
-        for (const fk of child.foreignKeys) {
-          if (!fk.enforced || fk.parentIndexId !== check.indexId || fk.supportIndexId === null)
-            continue;
-          const support = need(child.indexes.find((index) => index.id === fk.supportIndexId));
-          // A covering supporting index holds the reference as a key prefix (ruling 4).
-          const children = await new ViewIndex(
-            nonUnique(support),
-            current.internalTable(child.id),
-          ).holders(check.key, support.columnIds.length > fk.columnIds.length);
-          if (children.length === 0) continue;
-          const writer = new TableWriterImpl(this, child, { onRepeat: "first" });
-          if (check.next !== null) {
-            const parent = need(this.tx.catalog.table(check.parentTableId));
-            const index = need(parent.indexes.find((candidate) => candidate.id === check.indexId));
-            const sources = index.columnIds.map((columnId) => ({
-              vector: need(
-                check.next?.vectors[parent.columns.findIndex((column) => column.id === columnId)],
-              ),
-              row: check.next?.row ?? 0,
-            }));
-            await writer.applyUpdate(children, fk.columnIds, sources, true);
-          } else if (fk.onDelete === "cascade") await writer.applyDelete(children);
-          else if (fk.onDelete === "setNull")
-            await writer.applyUpdate(
-              children,
-              fk.columnIds,
-              fk.columnIds.map((columnId) => ({
-                vector: nullVector(
-                  need(child.columns.find((column) => column.id === columnId)).type,
-                ),
-                row: 0,
-              })),
-              true,
-            );
-          else
-            throw new ForeignKeyViolationError(check.parentTableId, fk.id, "referenced", check.key);
-        }
+      const round = this.parentChecks.splice(0);
+      const follows = round.filter((check) => check.next !== null);
+      if (follows.length > 0) await this.#follow(follows);
+      for (const check of round) if (check.next === null) await this.#deleted(check);
     }
+  }
+
+  /** Children of a statement's changed parent keys follow them (see `#actions`). */
+  async #follow(checks: readonly ParentCheck[]): Promise<void> {
+    for (const child of this.tx.catalog.tables)
+      for (const fk of child.foreignKeys) {
+        if (!fk.enforced || fk.supportIndexId === null) continue;
+        const mine = checks.filter((check) => check.indexId === fk.parentIndexId);
+        if (mine.length === 0) continue;
+        const support = need(child.indexes.find((index) => index.id === fk.supportIndexId));
+        // Every key's children, in one view, before any is moved.
+        const view = this.current();
+        const index = new ViewIndex(nonUnique(support), view.internalTable(child.id));
+        const moves: Array<{ check: ParentCheck; children: number[] }> = [];
+        for (const check of mine) {
+          const children = await index.holders(
+            check.key,
+            support.columnIds.length > fk.columnIds.length,
+          );
+          if (children.length > 0) moves.push({ check, children });
+        }
+        // A child row holds one value per foreign key, so the sets are disjoint.
+        for (const { check, children } of moves) {
+          const parent = need(this.tx.catalog.table(check.parentTableId));
+          const key = need(parent.indexes.find((candidate) => candidate.id === check.indexId));
+          const sources = key.columnIds.map((columnId) => ({
+            vector: need(
+              check.next?.vectors[parent.columns.findIndex((column) => column.id === columnId)],
+            ),
+            row: check.next?.row ?? 0,
+          }));
+          await new TableWriterImpl(this, child, { onRepeat: "first" }).applyUpdate(
+            children,
+            fk.columnIds,
+            sources,
+            true,
+          );
+        }
+      }
+  }
+
+  /** A parent row left: CASCADE, SET NULL or RESTRICT per child foreign key (see `#actions`). */
+  async #deleted(check: ParentCheck): Promise<void> {
+    const parentDef = this.current().internalTable(check.parentTableId).def;
+    const key = parentDef.indexes.find((index) => index.id === check.indexId);
+    // The key is live in the parent again (another row took it): nothing to do.
+    if (
+      key !== undefined &&
+      (await new ViewIndex(
+        nonUnique(key),
+        this.current().internalTable(check.parentTableId),
+      ).countRange(check.key, 0, check.key.length)) > 0
+    )
+      return;
+    for (const child of this.tx.catalog.tables)
+      for (const fk of child.foreignKeys) {
+        if (!fk.enforced || fk.parentIndexId !== check.indexId || fk.supportIndexId === null)
+          continue;
+        const support = need(child.indexes.find((index) => index.id === fk.supportIndexId));
+        // A covering supporting index holds the reference as a key prefix (ruling 4). The view is
+        // read now: an earlier action may have rewritten these children.
+        const children = await new ViewIndex(
+          nonUnique(support),
+          this.current().internalTable(child.id),
+        ).holders(check.key, support.columnIds.length > fk.columnIds.length);
+        if (children.length === 0) continue;
+        const writer = new TableWriterImpl(this, child, { onRepeat: "first" });
+        if (fk.onDelete === "cascade") await writer.applyDelete(children);
+        else if (fk.onDelete === "setNull")
+          await writer.applyUpdate(
+            children,
+            fk.columnIds,
+            fk.columnIds.map((columnId) => ({
+              vector: nullVector(need(child.columns.find((column) => column.id === columnId)).type),
+              row: 0,
+            })),
+            true,
+          );
+        else
+          throw new ForeignKeyViolationError(check.parentTableId, fk.id, "referenced", check.key);
+      }
   }
 
   rollback(): void {
