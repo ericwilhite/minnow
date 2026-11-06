@@ -7,9 +7,12 @@
  *
  * ## What the page knows (next-storage-run.ts)
  * Before each step the worker announces its intent and waits for the page's go; after it, it
- * reports its acknowledgement (a published root, a flushed log). Messages on one port arrive in
- * order, so when the page kills the worker it knows every acknowledged state exactly, plus at most
- * one step in flight. The next worker is handed that knowledge (`ChaosExpect`) and checks:
+ * reports its acknowledgement (a published root, a flushed log). The backends report every
+ * platform request (`postingObserver`). Messages on one port arrive in order and are numbered; the
+ * worker moves a shared counter past each one it posts, and the page, reading it just before the
+ * kill, receives every message up to it (the observation barrier). So it knows every acknowledged
+ * state posted before the kill, plus the steps in flight; anything posted after the read leaves
+ * its step in flight. The next worker is handed that knowledge (`ChaosExpect`) and checks:
  * - **Root.** The recovered root is the last acknowledged one, or the one an in-flight publish was
  *   writing; its round and the identity of every blob (coordinates and checksum) match. Every blob
  *   it names reads back and verifies, and the free map is exact (`audit`).
@@ -20,7 +23,7 @@
  * - **Spill.** The startup sweep empties it and a round trip works.
  * Any other outcome is a corruption, reported with the seed, the iteration and the kill.
  */
-import type { StorageBackend, StoreSession } from "../storage/contract.js";
+import type { StorageBackend, StorageObserver, StoreSession } from "../storage/contract.js";
 import type { BlobRef, ExtentRef, ExtentSpace } from "../storage/extents.js";
 import { openExtentSpace } from "../storage/space.js";
 import {
@@ -79,7 +82,8 @@ export interface ChaosExpect {
 export type ChaosMode = "serial" | "concurrent";
 
 /** Test-only faults (the campaign's own regression tests). */
-export type ChaosInjection = "spill-mismatch" | "stall-publish-after-go";
+export type ChaosInjection =
+  "spill-mismatch" | "stall-publish-after-go" | "stall-publish-after-began";
 
 export interface ChaosRecovery {
   /** Where the root and log were found, and the state the workload continues from. */
@@ -108,7 +112,36 @@ export type ChaosMessage =
   | { readonly chaos: "settled"; readonly sequence: number }
   | { readonly chaos: "ack"; readonly state: ChaosState }
   | { readonly chaos: "done"; readonly sequence: number }
-  | { readonly chaos: "recovered"; readonly recovery: ChaosRecovery };
+  | { readonly chaos: "recovered"; readonly recovery: ChaosRecovery }
+  /** A platform request the backend issued (`begin`) or that ended (`end`): `postingObserver`. */
+  | {
+      readonly chaos: "request";
+      readonly id: number;
+      readonly phase: "begin" | "end";
+      readonly target: string;
+      readonly op: string;
+    }
+  /** The injected failure is posted next (the failure-path regression's kill point). */
+  | { readonly chaos: "injecting" };
+
+/**
+ * The storage observer the campaign's backends report to (`StorageObserver`): every platform
+ * request is posted when it begins and when it ends, so the page knows which requests were open
+ * when it killed the worker, not only which operations had begun.
+ */
+export function postingObserver(post: (message: ChaosMessage) => void): StorageObserver {
+  let next = 0;
+  return ({ target, op }) => {
+    const id = (next += 1);
+    post({ chaos: "request", id, phase: "begin", target, op });
+    let ended = false;
+    return () => {
+      if (ended) return;
+      ended = true;
+      post({ chaos: "request", id, phase: "end", target, op });
+    };
+  };
+}
 
 interface TestRoot {
   readonly round: number;
@@ -382,6 +415,9 @@ export async function runChaos(
     if (inject === "stall-publish-after-go" && intent.step === "publish")
       await new Promise<never>(() => undefined);
     hooks.post({ chaos: "began", sequence });
+    // Review B1-p2g finding 2: one that posted `began` and stops before any storage request.
+    if (inject === "stall-publish-after-began" && intent.step === "publish")
+      await new Promise<never>(() => undefined);
     return full;
   };
   /** The step's last storage call returned (before its acknowledgement and its end). */
@@ -518,7 +554,12 @@ export async function runChaos(
       // The campaign's regression: a transient mismatch that the next sweep cannot see.
       if (inject === "spill-mismatch" && !injected) {
         injected = true;
-        fail("a spill page read back wrong (injected)");
+        // Posted at once, in this order, so the page knows the failure's message number from the
+        // marker's (review B1-p2g finding 3), then thrown as any failure is.
+        const message = "a spill page read back wrong (injected)";
+        hooks.post({ chaos: "injecting" });
+        hooks.post({ chaos: "failure", message: `ChaosCorruption: ${message}` });
+        fail(message);
       }
       await file.close();
       settledStep();

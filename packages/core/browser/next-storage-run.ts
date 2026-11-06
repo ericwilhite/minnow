@@ -458,22 +458,61 @@ async function spawnForChaos(): Promise<StorageWorker> {
 }
 
 /**
- * Where a kill landed, from the messages the worker posted before it died (drained after the
- * kill): `between` (no step in flight), or for the step in flight `before-<step>` (it had its go
- * but had not begun its storage work), `in-<step>` (it had begun and not finished: the kill
- * landed inside storage) or `after-<step>` (its storage work had returned; its end was not yet
- * posted).
+ * How long the page waits for the messages a killed worker posted before the kill (the observation
+ * barrier); past it the campaign fails, never proceeds on a partial view.
+ */
+let barrierMs = 10_000;
+
+/** For the controller's own tests (next-storage-run.test.ts): a lost message fails fast. */
+export function setChaosBarrierTimeout(ms: number): void {
+  barrierMs = ms;
+}
+
+/**
+ * What the page observed of a killed worker (review B1-p2g finding 1). The worker numbers every
+ * campaign message and moves a shared counter past each one once it is posted; the page reads the
+ * counter just before the kill and receives every message up to it before it judges anything.
+ * Messages posted after that read (while termination takes effect) are an unobserved tail: their
+ * operations stay in flight in the expectation, so recovery may find them done or not.
+ */
+export interface Observation {
+  /** Messages the worker had posted when the page decided the kill: every one was received. */
+  readonly posted: number;
+  /** Messages received before the page stopped observing (beyond `posted`: the tail seen). */
+  readonly received: number;
+}
+
+/**
+ * Where a kill landed, from every message the worker posted before it (the observation barrier):
+ * `between` (no step in flight), or for the step in flight `before-<step>` (it had its go but had
+ * not begun), `in-<step>` (it had begun and not returned, and a platform request was open: an
+ * IndexedDB transaction created and not ended, an OPFS sync call running), `window-<step>` (begun,
+ * not returned, but no platform request open: between its requests, or before its first, review
+ * B1-p2g finding 2) or `after-<step>` (its storage work had returned; its end was not yet posted).
  */
 export interface KillLanding {
   readonly landed: string;
+  /** Platform requests open at the kill (`target:op`), sorted. */
+  readonly requests: readonly string[];
   /** What the next worker is told: every acknowledgement the page received, the step in flight. */
   readonly expect: ChaosExpect;
+  readonly observation: Observation;
 }
 
 interface ChaosRun {
   readonly worker: StorageWorker;
   /** The campaign's own channel: what the worker posted before it died still arrives. */
   readonly port: MessagePort;
+  /** The worker's count of messages posted on the channel (shared memory). */
+  readonly counter: Int32Array;
+  /** The number of the last message received (messages arrive in order, numbered from 1). */
+  received: number;
+  /** Called on every message (the observation barrier waits on them). */
+  readonly waiters: Set<() => void>;
+  /** Platform requests begun and not ended, by id (`target:op`). */
+  readonly requests: Map<number, string>;
+  /** Told the number of the injected-fault marker (`chaosKillAtFault`). */
+  onInjecting: ((marker: number) => void) | null;
   state: ChaosState | null;
   /** Steps announced and not yet done, by sequence. */
   readonly inFlight: Map<number, ChaosIntent>;
@@ -486,8 +525,6 @@ interface ChaosRun {
   failure: Error | null;
   recovered: ChaosRecovery | null;
   armed: { target: ChaosStep; remaining: number; fire: (intent: ChaosIntent) => void } | null;
-  /** When the last message arrived (draining after a kill). */
-  lastMessage: number;
   /** Operations completed (throughput). */
   completed: number;
 }
@@ -509,11 +546,26 @@ export async function chaosBegin(
   serialize = true,
 ): Promise<ChaosRecovery> {
   useStore(kind);
+  // The observation barrier reads the worker's counter in shared memory, which needs a
+  // cross-origin isolated page (the spec opens it with ?isolated=1; vite.library.config.ts).
+  if (
+    typeof SharedArrayBuffer !== "function" ||
+    (globalThis as { crossOriginIsolated?: boolean }).crossOriginIsolated === false
+  )
+    throw new Error(
+      "the kill campaign needs a cross-origin isolated page (SharedArrayBuffer): open it with ?isolated=1",
+    );
+  const counter = new SharedArrayBuffer(4);
   const worker = await spawnForChaos();
   const channel = new MessageChannel();
   const run: ChaosRun = {
     worker,
     port: channel.port1,
+    counter: new Int32Array(counter),
+    received: 0,
+    waiters: new Set(),
+    requests: new Map(),
+    onInjecting: null,
     state: expect?.state ?? null,
     inFlight: new Map(),
     began: new Set(),
@@ -522,18 +574,30 @@ export async function chaosBegin(
     failure: null,
     recovered: null,
     armed: null,
-    lastMessage: performance.now(),
     completed: 0,
   };
   chaos = run;
-  channel.port1.onmessage = (event: MessageEvent<ChaosMessage>) => {
+  channel.port1.onmessage = (event: MessageEvent<ChaosMessage & { readonly n: number }>) => {
     const message = event.data;
-    run.lastMessage = performance.now();
+    if (message.n !== run.received + 1)
+      run.failure ??= new Error(
+        `campaign message ${String(message.n)} arrived after ${String(run.received)}: out of order`,
+      );
+    run.received = message.n;
+    receive(message);
+    for (const waiter of [...run.waiters]) waiter();
+  };
+  const receive = (message: ChaosMessage & { readonly n: number }) => {
     if (message.chaos === "recovered") {
       run.recovered = message.recovery;
       run.state = message.recovery.state;
     } else if (message.chaos === "ack") run.state = message.state;
     else if (message.chaos === "failure") run.failure ??= new Error(message.message);
+    else if (message.chaos === "request") {
+      if (message.phase === "begin")
+        run.requests.set(message.id, `${message.target}:${message.op}`);
+      else run.requests.delete(message.id);
+    } else if (message.chaos === "injecting") run.onInjecting?.(message.n);
     else if (message.chaos === "began") run.began.add(message.sequence);
     else if (message.chaos === "settled") run.settled.add(message.sequence);
     else if (message.chaos === "done") {
@@ -558,7 +622,7 @@ export async function chaosBegin(
       run.port.postMessage({ go: message.intent.sequence });
     }
   };
-  worker.post({ chaosPort: channel.port2 }, [channel.port2]);
+  worker.post({ chaosPort: channel.port2, counter }, [channel.port2]);
   worker
     .call({
       op: "chaos",
@@ -594,18 +658,51 @@ function landingOf(run: ChaosRun): string {
   const [current] = run.inFlight.values();
   if (current === undefined) return "between";
   if (!run.began.has(current.sequence)) return `before-${current.step}`;
-  if (!run.settled.has(current.sequence)) return `in-${current.step}`;
+  if (!run.settled.has(current.sequence))
+    return run.requests.size > 0 ? `in-${current.step}` : `window-${current.step}`;
   return `after-${current.step}`;
 }
 
-/** Waits until 30 ms pass without a message from the (dead) worker. */
-async function drain(run: ChaosRun): Promise<void> {
-  for (;;) {
-    await new Promise<void>((resolve) => {
-      setTimeout(resolve, 10);
+const openRequests = (run: ChaosRun): string[] => [...run.requests.values()].sort();
+
+/** The worker's count of posted messages: read just before the kill. */
+const postedNow = (run: ChaosRun): number => Atomics.load(run.counter, 0);
+
+/**
+ * The observation barrier: waits until every message up to `posted` has arrived (they were posted
+ * before the kill, so they must; past `barrierMs` the campaign fails), then stops observing.
+ */
+async function observeThrough(run: ChaosRun, posted: number): Promise<Observation> {
+  if (run.received < posted)
+    await new Promise<void>((resolve, reject) => {
+      const check = () => {
+        if (run.received < posted) return;
+        clearTimeout(timer);
+        run.waiters.delete(check);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        run.waiters.delete(check);
+        reject(
+          new Error(
+            `observation barrier: the worker had posted ${String(posted)} campaign messages when ` +
+              `it was killed, but only ${String(run.received)} arrived within ${String(barrierMs)} ms`,
+          ),
+        );
+      }, barrierMs);
+      run.waiters.add(check);
     });
-    if (performance.now() - run.lastMessage > 30) return;
-  }
+  run.port.onmessage = null;
+  run.port.close();
+  return { posted, received: run.received };
+}
+
+/** Terminates the worker after reading its counter, then observes everything posted before. */
+async function terminateObserved(run: ChaosRun): Promise<Observation> {
+  const posted = postedNow(run);
+  run.worker.terminate();
+  if (chaos === run) chaos = null;
+  return observeThrough(run, posted);
 }
 
 /** A workload failure the page observed (review B1-p2f finding 1): the campaign fails on it. */
@@ -617,9 +714,10 @@ function failed(run: ChaosRun): Error | null {
 
 /**
  * Kills the running chaos worker as `plan` says. Terminate: after `delayMs`, the worker is
- * terminated, the messages it posted before dying are drained, and the landing and expectation
- * are taken from all of them. Page: the page stops answering intents and returns; the caller then
- * calls `chaosPageBoundary` and closes the page. Any workload failure the page observed rejects.
+ * terminated and every message it posted before is received (the observation barrier); the
+ * landing and expectation are taken from them. Page: the page stops answering intents and
+ * returns; the caller then calls `chaosPageBoundary` and closes the page. Any workload failure the
+ * page observed rejects.
  */
 export function chaosKill(plan: KillPlan): Promise<KillLanding | null> {
   const run = chaos;
@@ -645,14 +743,17 @@ export function chaosKill(plan: KillPlan): Promise<KillLanding | null> {
         }
         run.port.postMessage({ go: intent.sequence });
         setTimeout(() => {
-          run.worker.terminate();
-          chaos = null;
-          void drain(run).then(() => {
-            run.port.close();
+          terminateObserved(run).then((observation) => {
             const failure = failed(run);
             if (failure !== null) reject(failure);
-            else resolve({ landed: landingOf(run), expect: expectOf(run) });
-          });
+            else
+              resolve({
+                landed: landingOf(run),
+                requests: openRequests(run),
+                expect: expectOf(run),
+                observation,
+              });
+          }, reject);
         }, plan.delayMs);
       },
     };
@@ -661,17 +762,24 @@ export function chaosKill(plan: KillPlan): Promise<KillLanding | null> {
 
 /** Where a concurrent kill landed: the operations whose storage work it interrupted. */
 export interface ConcurrentLanding {
-  /** Steps that had begun their storage work and not returned from it, sorted. */
+  /**
+   * Steps in their windows (began, not returned), sorted: workload windows, not platform requests
+   * (review B1-p2g finding 2).
+   */
   readonly inOperation: readonly ChaosStep[];
   /** Steps announced and not done (in operation, or returned and not yet reported done). */
   readonly inFlight: readonly ChaosStep[];
+  /** Platform requests open at the kill (`target:op`), sorted. */
+  readonly requests: readonly string[];
   readonly expect: ChaosExpect;
+  readonly observation: Observation;
 }
 
 /**
  * Kills the running concurrent chaos worker `delayMs` after it was armed (a wall-clock moment, not
- * a step boundary), drains what it posted before it died, and returns every acknowledgement and
- * the operations in flight. A workload failure observed at any time rejects.
+ * a step boundary), receives everything it posted before the kill, and returns every
+ * acknowledgement, the operations in flight and the platform requests open. A workload failure
+ * observed at any time rejects.
  */
 export async function chaosKillAfter(delayMs: number): Promise<ConcurrentLanding> {
   const run = chaos;
@@ -680,12 +788,9 @@ export async function chaosKillAfter(delayMs: number): Promise<ConcurrentLanding
     setTimeout(resolve, delayMs);
   });
   // No operation starts after this: everything the worker does until the kill takes effect was
-  // announced (terminate() is asynchronous; what the worker posts meanwhile may be dropped).
+  // announced (what it posts after the counter is read is the unobserved tail).
   run.hold = true;
-  run.worker.terminate();
-  chaos = null;
-  await drain(run);
-  run.port.close();
+  const observation = await terminateObserved(run);
   const failure = failed(run);
   if (failure !== null) throw failure;
   const intents = [...run.inFlight.values()];
@@ -695,26 +800,90 @@ export async function chaosKillAfter(delayMs: number): Promise<ConcurrentLanding
       .map((intent) => intent.step)
       .sort(),
     inFlight: intents.map((intent) => intent.step).sort(),
+    requests: openRequests(run),
     expect: expectOf(run),
+    observation,
   };
 }
 
 /**
- * The page-close boundary (review B1-p2f finding 2): the page stops processing the worker's
- * messages and returns what it received up to now; the caller closes the page next, and the page
- * processes nothing in between. Acknowledgements the worker posted after this point never reached
- * the page, so they are not required, while the step in flight may have completed (its root is
- * accepted as pending). A failure observed up to here rejects.
+ * The page-close boundary (review B1-p2f finding 2): the page stops answering intents, receives
+ * every message the worker had posted when the boundary was taken, stops observing and returns;
+ * the caller closes the page next. What the worker posts after (it lives until the page closes) is
+ * the unobserved tail: the step in flight may have completed (its root is accepted as pending).
+ * A failure observed up to here rejects.
  */
-export function chaosPageBoundary(): KillLanding {
+export async function chaosPageBoundary(): Promise<KillLanding> {
   const run = chaos;
   if (run === null) throw new Error("chaosBegin first");
-  run.port.onmessage = null;
-  run.port.close();
+  run.hold = true;
   chaos = null;
+  const observation = await observeThrough(run, postedNow(run));
   const failure = failed(run);
   if (failure !== null) throw failure;
-  return { landed: landingOf(run), expect: expectOf(run) };
+  return {
+    landed: landingOf(run),
+    requests: openRequests(run),
+    expect: expectOf(run),
+    observation,
+  };
+}
+
+/** The failure-path regression's outcome (`chaosKillAtFault`). */
+export interface FaultKill {
+  /** The failure the campaign reported, or null if it swallowed it. */
+  readonly failure: string | null;
+  /** The injected failure's message number, and how many messages had arrived at the decision. */
+  readonly failureMessage: number;
+  readonly receivedAtDecision: number;
+  readonly observation: Observation;
+}
+
+/**
+ * The failure-path regression (review B1-p2g finding 3): the worker posts the `injecting` marker
+ * and then, at once, the failure. When the marker arrives the page stops answering intents and
+ * spins (processing nothing) until the shared counter shows the failure posted, then kills the
+ * worker (terminate) or takes the page boundary (page) the way the campaign does. The failure was
+ * posted before the kill but not yet received, so it is reported only through the observation
+ * barrier.
+ */
+export function chaosKillAtFault(mode: "terminate" | "page"): Promise<FaultKill> {
+  const run = chaos;
+  if (run === null) return Promise.reject(new Error("chaosBegin first"));
+  return new Promise<FaultKill>((resolve, reject) => {
+    const stall = setTimeout(() => {
+      reject(new Error("the injected fault was never posted"));
+    }, 60_000);
+    run.onInjecting = (marker) => {
+      clearTimeout(stall);
+      run.onInjecting = null;
+      run.hold = true;
+      const failureMessage = marker + 1;
+      // A busy wait: this page handles no message until the kill decision.
+      const deadline = performance.now() + 5_000;
+      while (postedNow(run) < failureMessage)
+        if (performance.now() > deadline) {
+          reject(new Error("the worker never posted the injected failure"));
+          return;
+        }
+      const receivedAtDecision = run.received;
+      const observed =
+        mode === "terminate" ? terminateObserved(run) : chaosPageBoundaryObservation(run);
+      observed.then((observation) => {
+        resolve({
+          failure: run.failure?.message ?? null,
+          failureMessage,
+          receivedAtDecision,
+          observation,
+        });
+      }, reject);
+    };
+  });
+}
+
+function chaosPageBoundaryObservation(run: ChaosRun): Promise<Observation> {
+  if (chaos === run) chaos = null;
+  return observeThrough(run, postedNow(run));
 }
 
 /** Stops the chaos worker (the campaign is over) and removes its store. */
@@ -808,11 +977,8 @@ export async function chaosStepDown(delayMs: number): Promise<StepDown> {
       op: "chaos-release",
     },
   );
+  await terminateObserved(run);
   const failure = failed(run);
-  run.worker.terminate();
-  chaos = null;
-  await drain(run);
-  run.port.close();
   if (failure !== null) throw failure;
   return { expect: expectOf(run), quiesceMs, leftInFlight, ...released };
 }

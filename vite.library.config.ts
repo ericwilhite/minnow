@@ -1,6 +1,28 @@
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin } from "vite";
+
+/**
+ * Cross-origin isolation for the pages that ask for it (`?isolated=1`), and for every request that
+ * browser context makes after (a cookie): the storage kill campaign's observation barrier reads the
+ * worker's message counter in shared memory, which needs `SharedArrayBuffer`. Each Playwright test
+ * runs in its own profile, so no other test's pages are isolated.
+ */
+const isolatedPages: Plugin = {
+  name: "minnow-isolated-pages",
+  configureServer(server) {
+    server.middlewares.use((request, response, next) => {
+      const asked = request.url?.includes("isolated=1") === true;
+      if (asked || /(?:^|;\s*)minnow-isolated=1(?:;|$)/u.test(request.headers.cookie ?? "")) {
+        response.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+        response.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
+        if (asked) response.setHeader("Set-Cookie", "minnow-isolated=1; Path=/; SameSite=Strict");
+      }
+      next();
+    });
+  },
+};
 
 export default defineConfig({
+  plugins: [isolatedPages],
   // The browser conformance runner loads the same vendored SQLite Wasm and PGlite distributions
   // as the benchmark site. Serving this directory preserves each package's relative asset URLs.
   publicDir: "apps/site/public",

@@ -62,6 +62,7 @@ import {
   type ReleaseReport,
   type ScratchSpace,
   type StorageBackend,
+  type StorageObserver,
   type StoreSession,
   type WriteDataOptions,
 } from "./contract.js";
@@ -101,6 +102,8 @@ export interface IndexedDbBackendOptions {
    * `ReleaseUnsettledError`. Default `IDB_ABORT_SETTLE_MS` (1 s).
    */
   readonly releaseSettleMs?: number;
+  /** Told about every transaction once created, and when it ends (test instrumentation). */
+  readonly observe?: StorageObserver;
   /**
    * Charged with the resident record indexes of the data and log spaces (idb-bytes.ts, "Cost"),
    * growing and shrinking with them, released at close: the owner registers it with the memory
@@ -208,6 +211,8 @@ interface Issued {
   tx: IdbTransactionLike | null;
   /** Ends the caller's promise when the release gives up on the transaction. */
   giveUp: (error: Error) => void;
+  /** Reports the end of the platform transaction to the observer. */
+  ended: () => void;
 }
 
 /**
@@ -230,6 +235,7 @@ class TrackedConnection implements IdbDatabaseLike {
   readonly #inner: IdbDatabaseLike;
   readonly #shared: SharedConnection;
   readonly #serialize: boolean;
+  readonly #observe: StorageObserver | null;
   /** Issued and not settled. */
   readonly #inFlight = new Map<Promise<void>, Issued>();
   #closing = false;
@@ -240,9 +246,10 @@ class TrackedConnection implements IdbDatabaseLike {
   /** Transactions that ended with `#stopped` (aborted, or refused before they began). */
   #aborted = 0;
 
-  constructor(inner: IdbDatabaseLike, serialize: boolean) {
+  constructor(inner: IdbDatabaseLike, serialize: boolean, observe: StorageObserver | null = null) {
     this.#inner = inner;
     this.#serialize = serialize;
+    this.#observe = observe;
     let entry = shared.get(inner);
     if (entry === undefined) {
       entry = { users: 0, tail: Promise.resolve() };
@@ -259,15 +266,26 @@ class TrackedConnection implements IdbDatabaseLike {
     body: (tx: IdbTransactionLike) => void,
   ): Promise<void> {
     if (this.#closing) return Promise.reject(new StoreClosedError("The connection is closing"));
-    const issued: Issued = { stores, mode, durability, tx: null, giveUp: settle };
+    const issued: Issued = { stores, mode, durability, tx: null, giveUp: settle, ended: settle };
     const start = (): Promise<void> => {
       // Queued behind the chain when the release stopped waiting: never created.
       if (this.#stopped !== null) return Promise.reject(this.#stopped);
-      return this.#inner.transaction(stores, mode, durability, (tx) => {
+      const created = this.#inner.transaction(stores, mode, durability, (tx) => {
         issued.tx = tx;
+        if (this.#observe !== null)
+          issued.ended = this.#observe({
+            target: stores.filter((store) => store !== "meta").join("+") || "meta",
+            op: `${mode}/${durability}`,
+          });
         if (this.#stopped !== null) tx.abort(this.#stopped);
         else body(tx);
       });
+      // The platform's own end (complete or abort), even after a release gave up on it.
+      const ended = () => {
+        issued.ended();
+      };
+      created.then(ended, ended);
+      return created;
     };
     const run = new Promise<void>((resolve, reject) => {
       issued.giveUp = reject;
@@ -1042,7 +1060,11 @@ export function createIndexedDbBackend(options: IndexedDbBackendOptions): Storag
         `minnow:${options.name}`,
         async () => {
           // Every acquisition its own connection: releasing an obsolete lease closes only its own.
-          const db = new TrackedConnection(await options.database(), serialize);
+          const db = new TrackedConnection(
+            await options.database(),
+            serialize,
+            options.observe ?? null,
+          );
           let epoch = 0;
           // The fence: one strict transaction moves the durable epoch past every older owner's.
           await db

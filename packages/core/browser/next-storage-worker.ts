@@ -7,7 +7,7 @@
 import { storeConformanceCases } from "../src/next/storage/conformance.js";
 import type { StorageBackend } from "../src/next/storage/contract.js";
 import type { BlobRef, ExtentRef, ExtentSpace } from "../src/next/storage/extents.js";
-import type { SyncFile } from "../src/next/storage/contract.js";
+import type { StorageObserver, SyncFile } from "../src/next/storage/contract.js";
 import { createOpfsBackend, webLocks, type OpfsDirectoryLike } from "../src/next/storage/opfs.js";
 import { openIndexedDb, type IdbDatabaseLike } from "../src/next/storage/idb-like.js";
 import { createIndexedDbBackend } from "../src/next/storage/indexeddb.js";
@@ -25,7 +25,9 @@ import {
 import { ScratchSpillService } from "../src/next/spill/scratch-spill.js";
 import {
   identity,
+  postingObserver,
   runChaos,
+  type ChaosMessage,
   type ChaosExpect,
   type ChaosInjection,
   type ChaosMode,
@@ -121,6 +123,8 @@ const locks = webLocks(navigator.locks);
 /** The backend of the request being handled (set by `handle`). */
 let store: StoreKind = "opfs";
 let serializeIdb = true;
+/** The chaos campaign's observer of platform requests (null outside a chaos run). */
+let storageObserver: StorageObserver | null = null;
 
 /** Platform requests, counted below the backends: OPFS data-file reads and IndexedDB `get`s. */
 const platform = { dataFileReads: 0, idbGets: 0 };
@@ -185,11 +189,13 @@ async function backendFor(name: string): Promise<StorageBackend> {
       name: `next-test:${name}`,
       locks,
       serializeTransactions: serializeIdb,
+      ...(storageObserver === null ? {} : { observe: storageObserver }),
     });
   return createOpfsBackend({
     directory: countingDirectory(await directory(name)),
     name: `next-test:${name}`,
     locks,
+    ...(storageObserver === null ? {} : { observe: storageObserver }),
   });
 }
 
@@ -817,6 +823,15 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
     case "chaos": {
       const port = chaosPort;
       if (port === null) throw new Error("no chaos channel");
+      // Every message is numbered, and the shared counter is moved past it once it is posted: the
+      // page reads the counter just before it kills this worker and then waits for exactly the
+      // messages posted up to there (review B1-p2g finding 1).
+      const post = (message: ChaosMessage) => {
+        posted += 1;
+        port.postMessage({ ...message, n: posted });
+        if (postedCounter !== null) Atomics.store(postedCounter, 0, posted);
+      };
+      storageObserver = postingObserver(post);
       // A failure goes out on the campaign's channel too: a worker killed just after it still
       // delivers it there (the request's own reply may never leave a terminated worker).
       return runChaos(
@@ -825,9 +840,7 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
         request.expect,
         {
           backendFor,
-          post: (message) => {
-            port.postMessage(message);
-          },
+          post,
           go: (sequence) =>
             new Promise<void>((resolve) => {
               goes.set(sequence, resolve);
@@ -842,7 +855,7 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
           ...(request.lanes === undefined ? {} : { lanes: request.lanes }),
         },
       ).catch((error: unknown) => {
-        port.postMessage({
+        post({
           chaos: "failure",
           message: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
         });
@@ -883,13 +896,20 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
  */
 const goes = new Map<number, () => void>();
 let chaosPort: MessagePort | null = null;
+/** Messages posted on the campaign's channel, and the counter the page reads (shared memory). */
+let posted = 0;
+let postedCounter: Int32Array | null = null;
 /** The running chaos workload's graceful step-down (next-storage-chaos.ts). */
 let chaosRelease: (() => Promise<StepDownRelease>) | null = null;
 
 scope.addEventListener("message", (event: MessageEvent<unknown>) => {
-  const port = (event.data as { chaosPort?: MessagePort }).chaosPort;
+  const { chaosPort: port, counter } = event.data as {
+    chaosPort?: MessagePort;
+    counter?: SharedArrayBuffer;
+  };
   if (port !== undefined) {
     chaosPort = port;
+    postedCounter = counter === undefined ? null : new Int32Array(counter);
     port.onmessage = (message: MessageEvent<{ go?: number }>) => {
       const go = message.data.go;
       if (go === undefined) return;

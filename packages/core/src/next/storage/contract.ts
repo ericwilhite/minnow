@@ -203,6 +203,23 @@ export interface OwnerLease {
   release(): Promise<ReleaseReport | void>;
 }
 
+/**
+ * One request a backend issued to the platform (test instrumentation): an IndexedDB transaction
+ * (`target` its stores other than `meta`, joined by `+`; `op` its mode and durability) or an OPFS
+ * sync access handle call (`target` the file, `op` the call).
+ */
+export interface PlatformRequest {
+  readonly target: string;
+  readonly op: string;
+}
+
+/**
+ * Told when a backend issues a platform request (an IndexedDB transaction once created, an OPFS
+ * sync call before it runs); the function it returns is called when the request has ended. Test
+ * instrumentation (the storage kill campaign): it must not throw.
+ */
+export type StorageObserver = (request: PlatformRequest) => () => void;
+
 /** What a lease release did with the transactions in flight on its connection (IndexedDB). */
 export interface ReleaseReport {
   /** Transactions that settled by themselves (committed or failed) while the release waited. */

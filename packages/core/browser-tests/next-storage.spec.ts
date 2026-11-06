@@ -24,6 +24,21 @@ import { requireWorkerOpfs, test } from "./fixtures.js";
 
 type Run = typeof import("../browser/next-storage-run.js");
 const RUN = "/packages/core/browser/next-storage-run.ts";
+/**
+ * The kill campaign's page, cross-origin isolated (vite.library.config.ts): its observation
+ * barrier reads the worker's message counter in shared memory (review B1-p2g finding 1).
+ */
+const CHAOS_PAGE = "/packages/core/browser/?isolated=1";
+
+/** What a platform request (`target:op`, next-storage-run.ts) belongs to. */
+function requestKind(request: string): "publish" | "log" | "spill" | "data" | "other" {
+  const target = request.slice(0, request.indexOf(":"));
+  if (/roots|root-/u.test(target)) return "publish";
+  if (target.includes("log")) return "log";
+  if (target.includes("spill")) return "spill";
+  if (target.includes("data")) return "data";
+  return "other";
+}
 
 test.describe("rebuild core storage on OPFS", () => {
   test.beforeEach(async ({ page }) => {
@@ -438,12 +453,13 @@ test.describe("rebuild core storage kill campaign (Gate A)", () => {
         );
         test.setTimeout(Math.max(600_000, kills * 5_000));
         let page: Page = first;
-        await page.goto("/packages/core/browser/");
+        await page.goto(CHAOS_PAGE);
         if (kind === "opfs") await requireWorkerOpfs(page);
         const random = mulberry32(seed);
         const dir = `kills-${kind}-${String(seed)}-${Date.now().toString(36)}`;
         // IndexedDB's work is asynchronous: kills must land inside each phase's storage work.
-        // OPFS's is synchronous, so kills land at its edges (STORAGE_KILL_EDGE_REACH).
+        // OPFS's is synchronous, never stopped halfway through a call, so kills are required at
+        // its edges (STORAGE_KILL_EDGE_REACH).
         const reach = createReach(
           `storage kills ${kind} ${browserName}`,
           kind === "indexeddb" ? STORAGE_KILL_REACH : STORAGE_KILL_EDGE_REACH,
@@ -465,6 +481,8 @@ test.describe("rebuild core storage kill campaign (Gate A)", () => {
         let verifiedLogBytes = 0;
         let lockSteals = 0;
         let previous = "none";
+        /** Messages received past the kill decision (the tail the barrier did not wait for). */
+        let tail = 0;
         for (let iteration = 0; iteration <= kills; iteration++) {
           let recovery;
           try {
@@ -505,7 +523,7 @@ test.describe("rebuild core storage kill campaign (Gate A)", () => {
                 await new Promise<void>((resolve) => {
                   setTimeout(resolve, killPlan.delayMs);
                 });
-                return { ...run.chaosPageBoundary(), retries: run.chaosStartRetries() };
+                return { ...(await run.chaosPageBoundary()), retries: run.chaosStartRetries() };
               },
               [RUN, plan] as const,
             );
@@ -516,7 +534,8 @@ test.describe("rebuild core storage kill campaign (Gate A)", () => {
             );
           }
           expected = landing.expect;
-          previous = `kill ${String(iteration)}: ${JSON.stringify(plan)} landed ${landing.landed}, expecting ${JSON.stringify(landing.expect)}`;
+          tail += landing.observation.received - landing.observation.posted;
+          previous = `kill ${String(iteration)}: ${JSON.stringify(plan)} landed ${landing.landed} (requests ${landing.requests.join("+") || "none"}), expecting ${JSON.stringify(landing.expect)}`;
           if (plan.mode === "page") {
             workerStartRetries += landing.retries;
             // A page close (CDP's Page.crash takes the whole persistent context down under the
@@ -526,12 +545,14 @@ test.describe("rebuild core storage kill campaign (Gate A)", () => {
             await page.close({ runBeforeUnload: false });
             count(`${landing.landed} (page close)`);
             page = await context.newPage();
-            await page.goto("/packages/core/browser/");
+            await page.goto(CHAOS_PAGE);
           } else {
+            // IndexedDB: `in-<step>` needs a transaction open (review B1-p2g finding 2); a step
+            // begun with none open lands `window-<step>`, which reaches nothing. OPFS: its edges.
             reach.recordHistory([
               kind === "indexeddb"
                 ? landing.landed
-                : landing.landed.replace(/^(before|in|after)-/u, "at-"),
+                : landing.landed.replace(/^(before|in|window|after)-/u, "at-"),
             ]);
             count(landing.landed);
           }
@@ -559,6 +580,7 @@ test.describe("rebuild core storage kill campaign (Gate A)", () => {
           lockSteals,
           seconds: Math.round((Date.now() - started) / 1000),
           landed: Object.fromEntries([...table].sort(([a], [b]) => a.localeCompare(b))),
+          tailMessagesSeen: tail,
           reach: Object.fromEntries(reach.counts()),
         };
         await info.attach(`storage-kills-${kind}`, {
@@ -571,11 +593,14 @@ test.describe("rebuild core storage kill campaign (Gate A)", () => {
 });
 
 test.describe("rebuild core storage kill campaign: its own failure paths (review B1-p2f)", () => {
-  test("a workload failure after a kill is armed fails the kill, in both kill modes", async ({
+  test("a failure posted before the kill fails it, though it arrives after, in both kill modes", async ({
     page,
   }) => {
+    // Review B1-p2g finding 3: the kill is decided once the shared counter shows the injected
+    // failure posted (the page handles no message meanwhile), not on a timer, so the failure is
+    // always posted before the kill and is received only through the observation barrier.
     test.setTimeout(180_000);
-    await page.goto("/packages/core/browser/");
+    await page.goto(CHAOS_PAGE);
     for (const mode of ["terminate", "page"] as const) {
       const dir = `inject-${mode}-${Date.now().toString(36)}`;
       const outcome = await page.evaluate(
@@ -584,36 +609,51 @@ test.describe("rebuild core storage kill campaign: its own failure paths (review
           // The first spill step reports a mismatch that a later sweep could never see.
           await run.chaosBegin("indexeddb", directory, 7, null, "spill-mismatch");
           try {
-            const terminated = await run.chaosKill({
-              target: "spill",
-              occurrence: 1,
-              delayMs: 300,
-              mode: killMode,
-            });
-            if (terminated === null) {
-              await new Promise<void>((resolve) => {
-                setTimeout(resolve, 300);
-              });
-              run.chaosPageBoundary();
-            }
-            return "no failure";
-          } catch (error) {
-            return String(error);
+            return await run.chaosKillAtFault(killMode);
           } finally {
             await run.chaosEnd("indexeddb", directory);
           }
         },
         [RUN, dir, mode] as const,
       );
-      expect(outcome, mode).toContain("a spill page read back wrong (injected)");
+      expect(outcome.failure, mode).toContain("a spill page read back wrong (injected)");
+      // Posted before the decision, received after it: only the barrier delivered it.
+      expect(outcome.receivedAtDecision, mode).toBeLessThan(outcome.failureMessage);
+      expect(outcome.observation.posted, mode).toBeGreaterThanOrEqual(outcome.failureMessage);
     }
+  });
+
+  test("a step that posted began but issued no platform request lands in its window, not in it", async ({
+    page,
+  }) => {
+    // Review B1-p2g finding 2: `in-<step>` needs an open platform request, not only `began`.
+    test.setTimeout(120_000);
+    await page.goto(CHAOS_PAGE);
+    const dir = `began-${Date.now().toString(36)}`;
+    const landing = await page.evaluate(
+      async ([url, directory]) => {
+        const run = (await import(url)) as Run;
+        await run.chaosBegin("indexeddb", directory, 5, null, "stall-publish-after-began");
+        const killed = await run.chaosKill({
+          target: "publish",
+          occurrence: 1,
+          delayMs: 200,
+          mode: "terminate",
+        });
+        await run.chaosEnd("indexeddb", directory);
+        return killed;
+      },
+      [RUN, dir] as const,
+    );
+    expect(landing?.landed).toBe("window-publish");
+    expect(landing?.requests).toEqual([]);
   });
 
   test("a kill after go but before storage began is counted before the step, not in it", async ({
     page,
   }) => {
     test.setTimeout(120_000);
-    await page.goto("/packages/core/browser/");
+    await page.goto(CHAOS_PAGE);
     const dir = `stall-${Date.now().toString(36)}`;
     const landing = await page.evaluate(
       async ([url, directory]) => {
@@ -637,7 +677,7 @@ test.describe("rebuild core storage kill campaign: its own failure paths (review
     page,
   }) => {
     test.setTimeout(120_000);
-    await page.goto("/packages/core/browser/");
+    await page.goto(CHAOS_PAGE);
     const dir = `boundary-${Date.now().toString(36)}`;
     const result = await page.evaluate(
       async ([url, directory]) => {
@@ -648,7 +688,7 @@ test.describe("rebuild core storage kill campaign: its own failure paths (review
         await new Promise<void>((resolve) => {
           setTimeout(resolve, 1_000);
         });
-        const boundary = run.chaosPageBoundary();
+        const boundary = await run.chaosPageBoundary();
         await run.chaosEnd("indexeddb", directory);
         return { before: recovered.state.round, boundary };
       },
@@ -680,15 +720,16 @@ test.describe("rebuild core storage concurrent kill campaign (Gate A)", () => {
         // serialized chain per connection (serializeTransactions), and this lane runs everywhere.
         test.setTimeout(Math.max(600_000, kills * 5_000));
         const page: Page = first;
-        await page.goto("/packages/core/browser/");
+        await page.goto(CHAOS_PAGE);
         if (kind === "opfs") await requireWorkerOpfs(page);
         const random = mulberry32(seed);
         const dir = `concurrent-${kind}-${String(seed)}-${Date.now().toString(36)}`;
-        // IndexedDB's storage work is asynchronous: kills land inside interleaved operations,
-        // and every interleaving is required. OPFS's calls are synchronous: each operation starts
-        // in its own task (after its go) and its storage calls finish within it, so a kill never
-        // finds two OPFS operations inside storage; there the interleavings are the simulated
-        // power-loss sweep's (spill/chaos-crash.test.ts, STORAGE_CONCURRENT_CRASH_REACH).
+        // Reach counts platform requests open at the kill (review B1-p2g finding 2), not workload
+        // windows: on IndexedDB a transaction created and not ended (one at a time: the backend
+        // serializes them per connection), beside operations in their windows. OPFS's calls are
+        // synchronous: at most one is open at a kill and never stopped halfway; there the
+        // interleavings are the simulated power-loss sweep's (spill/chaos-crash.test.ts,
+        // STORAGE_CONCURRENT_CRASH_REACH). Windows and requests are both reported.
         const required: ReadonlyArray<(typeof STORAGE_CONCURRENT_KILL_REACH)[number]> =
           kind === "indexeddb" ? STORAGE_CONCURRENT_KILL_REACH : [];
         const reach = createReach(`concurrent storage kills ${kind} ${browserName}`, required, {
@@ -696,6 +737,9 @@ test.describe("rebuild core storage concurrent kill campaign (Gate A)", () => {
         });
         const inFlightCounts = new Map<number, number>();
         const pairs = new Map<string, number>();
+        const requestCounts = new Map<number, number>();
+        const requestKinds = new Map<string, number>();
+        let tail = 0;
         const started = Date.now();
         let expected: ChaosExpect | null = null;
         let previous = "none";
@@ -755,20 +799,22 @@ test.describe("rebuild core storage concurrent kill campaign (Gate A)", () => {
             );
           }
           expected = landing.expect;
-          previous = `kill ${String(iteration)} after ${String(delayMs)} ms, in storage ${landing.inOperation.join("+") || "nothing"}, in flight ${landing.inFlight.join("+") || "nothing"}, expecting ${JSON.stringify(landing.expect)}`;
-          // Reach counts operations inside their storage work at the kill.
+          tail += landing.observation.received - landing.observation.posted;
+          previous = `kill ${String(iteration)} after ${String(delayMs)} ms, in their windows ${landing.inOperation.join("+") || "nothing"}, requests open ${landing.requests.join("+") || "none"}, expecting ${JSON.stringify(landing.expect)}`;
+          // Workload windows (reported) and platform requests open (reach).
           const steps = landing.inOperation;
           inFlightCounts.set(steps.length, (inFlightCounts.get(steps.length) ?? 0) + 1);
           for (const step of new Set(steps)) pairs.set(step, (pairs.get(step) ?? 0) + 1);
-          const has = (step: ChaosStep) => steps.includes(step);
+          const kinds = landing.requests.map(requestKind);
+          requestCounts.set(kinds.length, (requestCounts.get(kinds.length) ?? 0) + 1);
+          for (const requestKindAt of new Set(kinds))
+            requestKinds.set(requestKindAt, (requestKinds.get(requestKindAt) ?? 0) + 1);
           const entered: string[] = [];
-          if (steps.length >= 2) entered.push("two-or-more-in-operation");
-          if ((has("publish") || has("reclaim")) && has("log-flush"))
-            entered.push("publish-with-log-flush");
-          if (has("reclaim") && has("read")) entered.push("reclaim-with-read");
-          if (steps.filter((step) => step === "write").length >= 2)
-            entered.push("write-with-write");
-          if (has("spill") && steps.length >= 2) entered.push("spill-with-another");
+          if (kinds.length >= 1) entered.push("request-open");
+          for (const open of ["publish", "log", "spill", "data"] as const)
+            if (kinds.includes(open)) entered.push(`${open}-request-open`);
+          if (kinds.length >= 1 && steps.length >= 2)
+            entered.push("request-open-with-two-operations-in-windows");
           reach.recordHistory(entered);
         }
         await page.evaluate(
@@ -787,10 +833,17 @@ test.describe("rebuild core storage concurrent kill campaign (Gate A)", () => {
           verifiedLogBytes,
           lockSteals,
           seconds: Math.round((Date.now() - started) / 1000),
-          inOperationAtKill: Object.fromEntries([...inFlightCounts].sort(([a], [b]) => a - b)),
-          stepInOperationAtKill: Object.fromEntries(
-            [...pairs].sort(([a], [b]) => a.localeCompare(b)),
+          operationsInWindowsAtKill: Object.fromEntries(
+            [...inFlightCounts].sort(([a], [b]) => a - b),
           ),
+          stepInWindowAtKill: Object.fromEntries([...pairs].sort(([a], [b]) => a.localeCompare(b))),
+          platformRequestsOpenAtKill: Object.fromEntries(
+            [...requestCounts].sort(([a], [b]) => a - b),
+          ),
+          requestKindOpenAtKill: Object.fromEntries(
+            [...requestKinds].sort(([a], [b]) => a.localeCompare(b)),
+          ),
+          tailMessagesSeen: tail,
           reach: Object.fromEntries(reach.counts()),
           reachBackedBy: required.length === 0 ? "spill/chaos-crash.test.ts" : null,
         };
@@ -839,7 +892,7 @@ test.describe("rebuild core storage graceful step-down (the WebKit IndexedDB wed
     browserName,
   }, info) => {
     test.setTimeout(600_000);
-    await page.goto("/packages/core/browser/");
+    await page.goto(CHAOS_PAGE);
     const cycles = Number(process.env.MINNOW_STEP_DOWN_CYCLES ?? "40");
     const random = mulberry32(0x57e9);
     const dir = `step-down-${Date.now().toString(36)}`;
@@ -905,7 +958,7 @@ test.describe("rebuild core storage: the cost of one serialized IndexedDB chain 
   }, info) => {
     test.skip(process.env.MINNOW_NEXT_STORAGE_BENCH !== "1", "opt-in bench");
     test.setTimeout(600_000);
-    await page.goto("/packages/core/browser/");
+    await page.goto(CHAOS_PAGE);
     const rounds = Number(process.env.MINNOW_SERIAL_BENCH_ROUNDS ?? "3");
     const results: Record<string, unknown[]> = { serialized: [], concurrent: [] };
     for (let round = 0; round < rounds; round++)

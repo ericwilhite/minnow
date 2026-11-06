@@ -221,23 +221,37 @@ is access's `Snapshot`.
   killed at seeded moments (`worker.terminate()`, sometimes a page close); the next worker reopens,
   checks the acknowledged root and every acknowledged log byte, audits exactly, and carries on. The
   worker announces each step and waits for the page's go, and posts when the step's storage work
-  begins and returns, on its own channel; after a kill the page drains what the worker posted, so
-  it knows every acknowledgement and whether the kill landed before, inside or after the storage
-  work. A page close takes its expectation at the close (the page processes nothing after it). Any
-  failure the workload reports, at any time, fails the campaign. On IndexedDB kills land inside
-  each phase's storage work; OPFS's storage calls are synchronous, so kills land at their edges
-  and the simulated physical crash sweeps cover the inside. 50 kills per store and browser in the
-  browser lane, 1,000 per store in Chromium nightly (`npm run test:storage-kills`), with declared
-  reach (`STORAGE_KILL_REACH`, `STORAGE_KILL_EDGE_REACH`).
+  begins and returns, on its own channel; the backends post every platform request (an IndexedDB
+  transaction once created and when it ends, an OPFS sync call) through a test-only observer. The
+  worker numbers every message and moves a counter in shared memory past each one it posts; the
+  page reads the counter just before the kill and receives every message up to it before it
+  judges anything (a message that never arrives fails the campaign), so it knows every
+  acknowledgement and failure posted before the kill. What the worker posts after the counter is
+  read is an unobserved tail, its operation left in flight for recovery to find done or not. The
+  page is cross-origin isolated for this (`?isolated=1`). A kill lands before, inside (a platform
+  request open), in the window (begun, no request open) or after a step's storage work. A page
+  close takes its expectation at a boundary just before the close. Any failure the workload
+  reports, at any time, fails the campaign. On IndexedDB kills land inside each phase's storage
+  work. OPFS's storage calls are synchronous: termination stops the worker between JavaScript
+  steps, so a kill can take effect after a sync call began and before its end was posted (the
+  call itself has returned), never halfway through one; kills are required at each step's edges,
+  and the simulated
+  physical crash sweeps cover the inside. 50 kills per store and browser in the browser lane,
+  1,000 per store in Chromium nightly (`npm run test:storage-kills`), with declared reach
+  (`STORAGE_KILL_REACH`, `STORAGE_KILL_EDGE_REACH`).
 - Concurrent kill campaign: the same workload as lanes that run at once (two writers with their
   builders, a pinned reader, the log, spill, settling reclaims), each operation still announced and
   given a go at once, killed at random wall-clock moments; at the kill the page stops giving gos,
   so everything the worker does before the kill takes effect was announced, and recovery accepts
-  the acknowledged root or any announced one. On IndexedDB kills land inside two to five
-  interleaved operations (reach `STORAGE_CONCURRENT_KILL_REACH`); OPFS's synchronous calls never
-  overlap at a kill, so `spill/chaos-crash.test.ts` runs the same workload in Node over the
-  simulated OPFS and IndexedDB stores, with every session call deferred by a task, and loses power
-  at a seeded physical step among interleaved operations (`STORAGE_CONCURRENT_CRASH_REACH`). The
+  the acknowledged root or any announced one. On IndexedDB kills land with a transaction open
+  (one at a time: the backend serializes them per connection) of each kind, beside two to five
+  operations in their windows; the reach counts open requests, windows are only reported
+  (`STORAGE_CONCURRENT_KILL_REACH`). OPFS's synchronous calls never overlap at a kill (at most one
+  is open, and never halfway through), so
+  `spill/chaos-crash.test.ts` runs the same workload in Node over the simulated OPFS and IndexedDB
+  stores, with every session and spill call's result handed back one to three tasks after the call
+  ran, and loses power at a seeded physical step; its reach counts the calls that had run and not
+  returned at that step (`STORAGE_CONCURRENT_CRASH_REACH`). The
   workload and recovery live in `spill/chaos-workload.ts`. `npm run benchmark:storage` records the
   storage microbench nightly (docs: reference/testing).
 - `select.ts` (`chooseBackend`) picks OPFS where a dedicated worker can open sync handles, else

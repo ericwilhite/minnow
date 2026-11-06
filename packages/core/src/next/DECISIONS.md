@@ -145,7 +145,8 @@ These rulings follow the storage probe of 2026-11-05.
     chain (`serializeTransactions`, the default everywhere): in the plain repro one chain never
     wedged (0 of 45 kills, against 3 of 45 with two chains; spill on its own connection or in its
     own database also 0 of 45), and the abrupt-kill concurrent campaign in WebKit, 2–5 workload
-    operations in flight at every kill, wedged 0 times in 100 kills (before: within 5–17). Cost
+    operations in their windows at every kill (windows, not platform requests: with one chain at
+    most one transaction is open), wedged 0 times in 100 kills (before: within 5–17). Cost
     under the concurrent workload, medians of 8 rounds: Chromium 81 vs. 92 operations/s, Firefox
     71 vs. 80 (about 11%, within a noisy spread); single-chain bulk writes and commits show no
     consistent difference.
