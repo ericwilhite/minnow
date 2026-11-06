@@ -532,6 +532,8 @@ export class SpillFiles {
   readonly #open = new Set<SpillFile>();
   readonly #inFlight = new Set<Promise<void>>();
   readonly #failures: unknown[] = [];
+  /** Each file's one close operation: a failed file contributes one failure, however many paths close it. */
+  readonly #closes = new WeakMap<SpillFile, Promise<void>>();
   #closing = false;
   #closed: Promise<void> | null = null;
   /** Bytes written, for the profile. */
@@ -564,6 +566,17 @@ export class SpillFiles {
     void tracked.then(() => this.#inFlight.delete(tracked));
   }
 
+  /** Closes `file` once (later calls share that close), tracked until it settles. */
+  #close(file: SpillFile): Promise<void> {
+    let closing = this.#closes.get(file);
+    if (closing === undefined) {
+      closing = file.close();
+      this.#closes.set(file, closing);
+      this.#track(closing);
+    }
+    return closing;
+  }
+
   async append(run: SpilledRun, page: Uint8Array, rows: number): Promise<void> {
     if (this.#closing) throw new SpillClosedError();
     if (run.file === null) {
@@ -571,13 +584,14 @@ export class SpillFiles {
       // operation, so `closed` waits for that close and sees its failure.
       const created = this.#service.create(this.#queryId, this.#budget).then(async (file) => {
         if (!this.#closing) return file;
-        await file.close();
+        // Its failure is the close's own (tracked by #close), not the creation's too.
+        await this.#close(file).catch(() => undefined);
         return null;
       });
       this.#track(created);
       const file = await created;
       if (file === null || this.isClosed) {
-        if (file !== null) this.#track(file.close());
+        if (file !== null) this.#close(file).catch(() => undefined);
         throw new SpillClosedError();
       }
       run.file = file;
@@ -598,9 +612,7 @@ export class SpillFiles {
     run.pages.length = 0;
     if (file === null) return;
     this.#open.delete(file);
-    const closing = file.close();
-    this.#track(closing);
-    await closing;
+    await this.#close(file);
   }
 
   /** Closes every file, now and created later; idempotent (returns the same Promise). */
@@ -611,7 +623,7 @@ export class SpillFiles {
       for (;;) {
         for (const file of [...this.#open]) {
           this.#open.delete(file);
-          this.#track(file.close());
+          this.#close(file).catch(() => undefined);
         }
         if (this.#inFlight.size === 0) break;
         await Promise.all([...this.#inFlight]);

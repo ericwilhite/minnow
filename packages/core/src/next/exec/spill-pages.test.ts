@@ -401,6 +401,40 @@ function gate(): { promise: Promise<void>; resolve: () => void } {
   return { promise, resolve };
 }
 
+describe("spill close failures are counted per file (review B7-p2b-2 #1)", () => {
+  it("one failed close is reported once when closeAll and release overlap (review probe)", async () => {
+    const files = new SpillFiles(new MemorySpillService(), 1, FREE);
+    const run = new SpilledRun();
+    await files.append(run, new Uint8Array(8), 1);
+    let reject: (error: Error) => void = () => undefined;
+    const failed = new Promise<void>((_, r) => {
+      reject = r;
+    });
+    const error = new Error("one file failed");
+    defined(run.file).close = () => failed;
+    const observed = files.closeAll().catch((e: unknown) => e);
+    const releasing = files.release(run).catch((e: unknown) => e);
+    reject(error);
+    expect(await releasing).toBe(error);
+    const result = await observed;
+    expect(result instanceof AggregateError ? result.errors : [result]).toEqual([error]);
+  });
+
+  it("two files failing with the same Error object are two failures", async () => {
+    const files = new SpillFiles(new MemorySpillService(), 1, FREE);
+    const runs = [new SpilledRun(), new SpilledRun()];
+    const error = new Error("shared failure");
+    for (const run of runs) {
+      await files.append(run, new Uint8Array(8), 1);
+      defined(run.file).close = () => Promise.reject(error);
+    }
+    const result: unknown = await files.closeAll().catch((e: unknown) => e);
+    expect(result).toBeInstanceOf(AggregateError);
+    expect((result as AggregateError).errors).toEqual([error, error]);
+    expect((result as AggregateError).message).toContain("(and 1 more)");
+  });
+});
+
 describe("spill file lifecycle (review B7-p2a-2 #1)", () => {
   it("closeAll waits for a late-created file's close", async () => {
     const service = new MemorySpillService();
