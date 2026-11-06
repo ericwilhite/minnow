@@ -579,7 +579,9 @@ and the owner import it directly.
   first-seen order in batches of at most 2,048 groups and about 1 MiB, each charged to the grant
   before it is built and released when downstream is done with it; it yields to the event loop
   with a task every 4 ms, checking the deadline per group inside AVG(NUMERIC)'s divisions and
-  resuming mid-batch; after an abort it rejects with the abort's reason. Without
+  resuming mid-batch; after an abort, or once its abort signal fires (checked at every slice and
+  after backpressure, R23), it rejects with the reason. Scratch that outlives a slice belongs to
+  the operator; module-level scratch is used only within one synchronous call (R23). Without
   GROUP BY there is one row even over no input.
 - `groups.ts`: group ids from open-addressing tables chosen by key type — interleaved
   (key, id) tables for 32-bit and 64-bit integers (int8 by its two words, whatever its

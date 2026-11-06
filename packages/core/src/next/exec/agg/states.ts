@@ -122,7 +122,8 @@ function slotAt(reader: Reader, row: number): number {
 
 /**
  * Row-indexed f64 scratch: one batch's number values converted by `rowValues`. Module-level and
- * used only within one synchronous `update` (16 KiB, not charged per operator).
+ * used only within one synchronous `update` (16 KiB, not charged per operator): never live
+ * across a suspension point (R23).
  */
 const ROW_VALUES = new Float64Array(BATCH_ROWS);
 

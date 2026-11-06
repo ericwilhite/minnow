@@ -50,7 +50,10 @@ interface TypedConstructor<T extends Typed> {
   readonly BYTES_PER_ELEMENT: number;
 }
 
-/** Scratch for one int64 value's words (input side of a write). */
+/**
+ * Scratch for one int64 value's words (input side of a write). R23: module-level, so it is written and read only within one synchronous call that never
+ * suspends (no await, Promise or yield between): never live across a suspension point.
+ */
 const WORDS = new Uint32Array(2);
 
 /** Writes a safe integer's two's-complement words into `words` at `index`. */

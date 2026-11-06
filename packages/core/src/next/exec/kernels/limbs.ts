@@ -18,7 +18,11 @@ const TWO32 = 4294967296;
 if (new Uint8Array(new Uint32Array([1]).buffer)[0] !== 1)
   throw new Error("The executor's limb arithmetic assumes a little-endian platform");
 
-/** Scratch limbs for intermediate values (offsets 0 … 7 are free for callers). */
+/**
+ * Scratch limbs for intermediate values (offsets 0 … 7 are free for callers). R23: module-level, so it is written and read only within one synchronous call that never
+ * suspends (no await, Promise or yield between): never live across a suspension point. Callers
+ * never keep a value in it across a call that could suspend.
+ */
 export const SCRATCH = new Uint32Array(4 * 16);
 
 /** A Uint32Array view over a BigInt64Array (two limbs per value, low word first). */
@@ -144,6 +148,7 @@ export function scaleUp(t: Uint32Array, at: number, e: number): boolean {
   return true;
 }
 
+/** `multiplyTo`'s scratch (one synchronous call; R23). */
 const HALVES_A = new Float64Array(8);
 const HALVES_B = new Float64Array(8);
 const COLUMNS = new Float64Array(17);

@@ -70,6 +70,11 @@ export interface AggregateOptions {
   readonly now?: () => number;
   /** The output batch byte target (default `BATCH_TARGET_BYTES`). */
   readonly targetBytes?: number;
+  /**
+   * The execution's cancellation (R23.2): checked at every output slice and after downstream
+   * backpressure; once aborted, `finish` rejects with its reason.
+   */
+  readonly signal?: AbortSignal;
 }
 
 /** Refuses what the operator cannot compile, before anything is allocated. */
@@ -107,6 +112,7 @@ export class AggregateOperator implements Operator {
   /** The charged bytes of the output batch downstream still holds. */
   #outputHeld = 0;
   #closed = false;
+  readonly #signal: AbortSignal | null;
   /** Set by `abort`: a later or resumed `finish` rejects with the reason. */
   #aborted = false;
   #abortReason: unknown = undefined;
@@ -127,6 +133,7 @@ export class AggregateOperator implements Operator {
     this.#interval = options.yieldIntervalMs ?? YIELD_INTERVAL_MS;
     this.#now = options.now ?? (() => performance.now());
     this.#target = options.targetBytes ?? BATCH_TARGET_BYTES;
+    this.#signal = options.signal ?? null;
     this.#keys = rel.groupBy;
     const keyTypes: PhysicalType[] = rel.groupBy.map((index) => {
       const type = context.input[index];
@@ -236,7 +243,7 @@ export class AggregateOperator implements Operator {
   }
 
   #emit(): MaybePromise<void> {
-    if (this.#aborted) throw this.#abortReason;
+    if (this.#isAborted()) throw this.#abortReason;
     const total = this.#groups === null ? 1 : this.#groups.groupCount;
     const sliceStart = this.#now();
     const expired = (): boolean => this.#closed || this.#now() - sliceStart >= this.#interval;
@@ -295,7 +302,10 @@ export class AggregateOperator implements Operator {
     return this.downstream.finish();
   }
 
+  /** Aborted by `abort` or by the signal (which then aborts the operator and downstream). */
   #isAborted(): boolean {
+    const signal = this.#signal;
+    if (!this.#aborted && signal?.aborted === true) this.abort(signal.reason);
     return this.#aborted;
   }
 

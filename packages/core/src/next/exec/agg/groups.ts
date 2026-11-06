@@ -105,6 +105,7 @@ export class Charged {
   }
 }
 
+/** `hashNumber`'s scratch (one synchronous call; R23). */
 const F64 = new Float64Array(1);
 const WORDS = new Int32Array(F64.buffer);
 const TWO32 = 4294967296;
