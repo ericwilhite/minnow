@@ -2,6 +2,7 @@
  * Foreign-key actions at statement end (access/modify.ts): ON DELETE CASCADE / SET NULL /
  * RESTRICT and rekey follow, through the same writers (their own constraints and actions apply).
  */
+import { PGlite } from "@electric-sql/pglite";
 import { describe, expect, it } from "vitest";
 import type { TableInput } from "../access/catalog.js";
 import { ForeignKeyViolationError, NotNullViolationError } from "../access/modify.js";
@@ -181,5 +182,106 @@ describe("foreign-key actions", () => {
     const reopened = await harness.reopen();
     expect(await sorted(reopened, t)).toEqual([[5, null]]);
     await harness.close();
+  });
+
+  describe("cycles end, as PostgreSQL's (review B3-p2a-2 follow-up: can the action loop hang?)", () => {
+    // The loop ends because each round consumes one parent check, and new checks come only from a
+    // live row deleted or a referenced key changed. A row is changed at most once per statement
+    // by the actions (onRepeat "first"), and deleted rows are not live. Each case here would
+    // otherwise loop; PostgreSQL gives the expected rows.
+    async function postgres(statements: readonly string[], table: string): Promise<unknown[][]> {
+      const pg = await PGlite.create();
+      try {
+        for (const text of statements) await pg.exec(text);
+        const result = await pg.query<{ id: number; ref: number | null }>(
+          `SELECT id, ref FROM ${table} ORDER BY id`,
+        );
+        return result.rows.map((row) => [row.id, row.ref]);
+      } finally {
+        await pg.close();
+      }
+    }
+
+    async function selfTable(onDelete: "restrict" | "cascade" | "setNull") {
+      const harness = new Harness();
+      const path = await harness.open();
+      const t = await create(path, "cyc", [column("id", INT, false), column("ref", INT)], {
+        foreignKeys: [fk("self", onDelete)],
+      });
+      return { harness, path, t };
+    }
+
+    const ddl = (action: string) =>
+      `CREATE TABLE cyc(id INTEGER PRIMARY KEY, ref INTEGER REFERENCES cyc(id)${action} ON UPDATE CASCADE)`;
+
+    it("a CASCADE cycle (1 → 2 → 1) and a self reference delete to nothing", async () => {
+      const { harness, path, t } = await selfTable("cascade");
+      await autocommit(path, (s) =>
+        s.table(t).insert(batch(ints([1, 2, 3]), ints([2, 1, 3])), null),
+      );
+      const [one] = await locate(path, t, [1]);
+      await autocommit(path, (s) => s.table(t).delete(batch(locators([one ?? 0], t)), null));
+      const expected = await postgres(
+        [
+          ddl(" ON DELETE CASCADE"),
+          "INSERT INTO cyc VALUES (1, 2), (2, 1), (3, 3)",
+          "DELETE FROM cyc WHERE id = 1",
+        ],
+        "cyc",
+      );
+      expect(await sorted(path, t)).toEqual(expected);
+      const [three] = await locate(path, t, [3]);
+      await autocommit(path, (s) => s.table(t).delete(batch(locators([three ?? 0], t)), null));
+      expect(await sorted(path, t)).toEqual([]);
+      await harness.close();
+    }, 30_000);
+
+    it("a SET NULL cycle", async () => {
+      const { harness, path, t } = await selfTable("setNull");
+      await autocommit(path, (s) => s.table(t).insert(batch(ints([1, 2]), ints([2, 1])), null));
+      const [one] = await locate(path, t, [1]);
+      await autocommit(path, (s) => s.table(t).delete(batch(locators([one ?? 0], t)), null));
+      expect(await sorted(path, t)).toEqual(
+        await postgres(
+          [
+            ddl(" ON DELETE SET NULL"),
+            "INSERT INTO cyc VALUES (1, 2), (2, 1)",
+            "DELETE FROM cyc WHERE id = 1",
+          ],
+          "cyc",
+        ),
+      );
+      await harness.close();
+    }, 30_000);
+
+    it("a rekey of a row that references itself, and of a cycle", async () => {
+      const { harness, path, t } = await selfTable("restrict");
+      await autocommit(path, (s) =>
+        s.table(t).insert(batch(ints([1, 2, 7, 8]), ints([1, 1, 8, 7])), null),
+      );
+      const idColumn = path.catalog.table(t)?.columns[0]?.id ?? 0;
+      const rekey = async (from: number, to: number) => {
+        const [at] = await locate(path, t, [from]);
+        await autocommit(path, (s) =>
+          s
+            .table(t, { assigned: [idColumn] })
+            .update(batch(locators([at ?? 0], t), ints([to])), null),
+        );
+      };
+      await rekey(1, 5);
+      await rekey(7, 70);
+      expect(await sorted(path, t)).toEqual(
+        await postgres(
+          [
+            ddl(""),
+            "INSERT INTO cyc VALUES (1, 1), (2, 1), (7, 8), (8, 7)",
+            "UPDATE cyc SET id = 5 WHERE id = 1",
+            "UPDATE cyc SET id = 70 WHERE id = 7",
+          ],
+          "cyc",
+        ),
+      );
+      await harness.close();
+    }, 30_000);
   });
 });

@@ -477,6 +477,8 @@ function nonUnique(def: IndexDef): IndexDef {
 
 interface FkCheck {
   readonly childTableId: number;
+  /** The child row version the check is for: skipped if the statement deleted it since. */
+  readonly rowId: number;
   readonly fkId: number;
   readonly parentTableId: number;
   readonly parentIndexId: number;
@@ -523,6 +525,8 @@ export class StatementImpl implements Statement {
   }
   readonly suspects: Array<{ tableId: number; indexId: number; key: Uint8Array }> = [];
   readonly childChecks: FkCheck[] = [];
+  /** Row ids this statement deleted, per table, while child checks were pending. */
+  readonly deleted = new Map<number, Set<number>>();
   readonly parentChecks: ParentCheck[] = [];
 
   constructor(tx: TransactionImpl, ordinal: number, options: StatementOptions) {
@@ -724,7 +728,10 @@ export class StatementImpl implements Statement {
         if ((await lookup(suspect.tableId, suspect.indexId, suspect.key)) > 1)
           throw new UniqueViolationError(suspect.tableId, suspect.indexId, suspect.key);
       for (const check of this.childChecks)
-        if ((await lookup(check.parentTableId, check.parentIndexId, check.key)) === 0)
+        if (
+          this.deleted.get(check.childTableId)?.has(check.rowId) !== true &&
+          (await lookup(check.parentTableId, check.parentIndexId, check.key)) === 0
+        )
           throw new ForeignKeyViolationError(
             check.childTableId,
             check.fkId,
@@ -919,6 +926,8 @@ export class TableWriterImpl implements TableWriter {
     const tx = this.statement.tx;
     const seq = this.statement.seq;
     let puts: Array<Promise<void>> | null = null;
+    // Row ids of the new rows, for their foreign-key checks (only tables with foreign keys).
+    const rowIds: number[] | null = this.def.foreignKeys.length > 0 ? [] : null;
     let done = 0;
     while (done < rows.length) {
       const { memtable, created, frozen } = tx.hooks.liveMemtable(this.tableId, rows.length - done);
@@ -943,13 +952,14 @@ export class TableWriterImpl implements TableWriter {
         count: take,
       });
       const firstRowId = memtable.firstRowId + before;
+      if (rowIds !== null) for (let k = 0; k < take; k++) rowIds.push(firstRowId + k);
       // Index entries go to the memtable that took the rows (its layer covers them).
       const piece = take === rows.length ? rows : rows.subarray(done, done + take);
       const put = this.putKeys(this.def.indexes, columns, piece, firstRowId, memtable);
       if (put instanceof Promise) (puts ??= []).push(put);
       done += take;
     }
-    if (this.def.foreignKeys.length > 0) this.#childChecks(columns, rows);
+    if (rowIds !== null) this.#childChecks(columns, rows, rowIds);
     return puts === null ? undefined : Promise.all(puts).then(() => undefined);
   }
 
@@ -1083,7 +1093,11 @@ export class TableWriterImpl implements TableWriter {
     return run(from);
   }
 
-  #childChecks(columns: readonly Vector[], rows: Uint16Array | null): void {
+  #childChecks(
+    columns: readonly Vector[],
+    rows: Uint16Array | null,
+    rowIds: readonly number[],
+  ): void {
     const count = rows === null ? (columns[0]?.length ?? 0) : rows.length;
     for (const fk of this.def.foreignKeys) {
       if (!fk.enforced) continue;
@@ -1098,6 +1112,7 @@ export class TableWriterImpl implements TableWriter {
         if (this.#hasNullKey(index, columns, row)) continue;
         this.statement.childChecks.push({
           childTableId: this.tableId,
+          rowId: rowIds[k] ?? 0,
           fkId: fk.id,
           parentTableId: fk.parentTableId,
           parentIndexId: fk.parentIndexId,
@@ -1294,6 +1309,12 @@ export class TableWriterImpl implements TableWriter {
   ): MaybePromise<void> {
     const tx = this.statement.tx;
     const seq = this.statement.seq;
+    // A version deleted later in the statement (an update's old row) needs no foreign-key check.
+    if (this.statement.childChecks.length > 0) {
+      let deleted = this.statement.deleted.get(this.tableId);
+      if (deleted === undefined) this.statement.deleted.set(this.tableId, (deleted = new Set()));
+      for (const rowId of rowIds) deleted.add(rowId);
+    }
     // Tombstones go to the newest memtable, full or not (no freeze just for them).
     const live = tx.hooks.liveMemtable(this.tableId, 0).memtable;
     const keysPerRow: Uint8Array[][] = rowIds.map(() => []);
