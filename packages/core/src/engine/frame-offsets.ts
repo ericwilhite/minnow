@@ -1,6 +1,10 @@
-/** Parser-owned decimal frame literals, kept outside the logical plan fields. */
+/** Parser-owned frame precision and literal types, kept outside the logical plan fields. */
 export interface FrameOffsetMetadata {
-  readonly text: string;
+  readonly text?: string;
+  /** Original PostgreSQL literal type, used to resolve RANGE over integer keys. */
+  readonly numeric?: true;
+  /** Rounded ROWS/GROUPS integer, or integer RANGE literal, beyond the safe double range. */
+  readonly exact?: bigint;
 }
 
 const frameOffsets = new WeakMap<object, FrameOffsetMetadata>();

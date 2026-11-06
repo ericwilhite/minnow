@@ -131,14 +131,15 @@ function frameOf(
   if (frame === undefined) return null;
   const bound = (input: WindowFrame["start"]): WindowFrameBound => {
     if (input.offset === undefined) return { kind: input.kind, offset: null };
-    // The exact offset past 2^53 (the front end's `offsetExact`), never its rounded double.
-    const exact = input.offsetExact ?? input.offset;
+    // Parser-owned metadata preserves the exact literal without adding public model fields.
+    const metadata = frameOffsetMetadata(input);
+    const exact = metadata?.exact ?? input.offset;
     if (frame.unit !== "range") return { kind: input.kind, offset: int(exact, INT8) };
     if (orderType === null)
       throw new PlanningError("RANGE with offset requires exactly one ORDER BY column", "42P20");
     // PostgreSQL's in_range takes an integer key with an integer offset only: a decimal literal
     // (`0.5`, `-0.0`) is numeric there, refused before its value is checked.
-    if (input.offsetNumeric === true && (orderType.kind === "int32" || orderType.kind === "int64"))
+    if (metadata?.numeric === true && (orderType.kind === "int32" || orderType.kind === "int64"))
       throw new PlanningError(
         `RANGE with offset PRECEDING/FOLLOWING is not supported for column type ${orderType.kind === "int64" ? "bigint" : orderType.bits === 16 ? "smallint" : "integer"} and offset type numeric`,
         "0A000",
@@ -156,8 +157,7 @@ function frameOf(
       return { kind: input.kind, offset: literal };
     }
     const text =
-      frameOffsetMetadata(input)?.text ??
-      (input.offsetExact === undefined ? undefined : String(input.offsetExact));
+      metadata?.text ?? (metadata?.exact === undefined ? undefined : String(metadata.exact));
     const typed: Typed = lowerExpression(
       text === undefined
         ? { kind: "literal", value: input.offset }

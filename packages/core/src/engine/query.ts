@@ -12935,22 +12935,20 @@ class Parser {
       offset = Number(rounded);
       if (rounded > 9007199254740991n) exact = rounded;
     }
-    const extra = {
-      ...(numeric ? { offsetNumeric: true as const } : {}),
-      ...(exact === undefined ? {} : { offsetExact: exact }),
-    };
+    const metadata =
+      unit === "range" || numeric || exact !== undefined
+        ? {
+            ...(unit === "range" ? { text: literal } : {}),
+            ...(numeric ? { numeric: true as const } : {}),
+            ...(exact === undefined ? {} : { exact }),
+          }
+        : undefined;
     if (this.#isKeyword("PRECEDING")) {
       this.#keyword("PRECEDING");
-      return rememberFrameOffset<WindowFrame["start"]>(
-        { kind: "preceding", offset, ...extra },
-        unit === "range" ? { text: literal } : undefined,
-      );
+      return rememberFrameOffset<WindowFrame["start"]>({ kind: "preceding", offset }, metadata);
     }
     this.#keyword("FOLLOWING");
-    return rememberFrameOffset<WindowFrame["start"]>(
-      { kind: "following", offset, ...extra },
-      unit === "range" ? { text: literal } : undefined,
-    );
+    return rememberFrameOffset<WindowFrame["start"]>({ kind: "following", offset }, metadata);
   }
 
   #comparison(): ComparisonOperator {
