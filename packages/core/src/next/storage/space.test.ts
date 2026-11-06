@@ -31,6 +31,31 @@ import {
   rootOf,
 } from "./space-test-support.js";
 
+describe("test support", () => {
+  it("bytesOf is its per-byte pattern, and sameBytes finds any difference, aligned or not", () => {
+    // Both helpers avoid per-byte loops (coverage counts every iteration); they must still mean
+    // exactly what the per-byte definitions meant, or every byte check here would be vacuous.
+    for (const length of [0, 1, 255, 256, 257, 511, 513, 4095, 100_003])
+      for (const seed of [0, 1, 7, 300]) {
+        const bytes = bytesOf(length, seed);
+        const differs = bytes.findIndex(
+          (byte, index) => byte !== ((seed * 131 + index * 7) & 0xff),
+        );
+        expect(differs, `length ${String(length)} seed ${String(seed)}`).toBe(-1);
+      }
+    const base = bytesOf(10_001, 3);
+    for (const at of [0, 3, 4, 5_000, 9_999, 10_000]) {
+      const changed = base.slice();
+      changed[at] = (changed[at] ?? 0) ^ 1;
+      expect(sameBytes(base, changed)).toBe(false);
+      expect(sameBytes(base.subarray(1), changed.subarray(1))).toBe(at === 0);
+    }
+    expect(sameBytes(base, base.slice())).toBe(true);
+    expect(sameBytes(base.subarray(2, 900), base.slice(2, 900))).toBe(true);
+    expect(sameBytes(base, base.subarray(1))).toBe(false);
+  });
+});
+
 describe("memory backend", () => {
   for (const testCase of storeConformanceCases)
     it(`conformance: ${testCase.name}`, () => testCase.run(async () => new MemoryBackend()));

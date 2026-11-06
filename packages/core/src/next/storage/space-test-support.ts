@@ -26,14 +26,27 @@ export function at<T>(items: readonly T[], index: number): T {
 export function sameBytes(left: Uint8Array | undefined, right: Uint8Array | undefined): boolean {
   if (left === undefined || right === undefined) return false;
   if (left.length !== right.length) return false;
-  for (let index = 0; index < left.length; index++) if (left[index] !== right[index]) return false;
+  // Four bytes a step where both views are aligned: under coverage every loop iteration is
+  // counted, and a per-byte loop over megabytes dominated the extent-space suites.
+  let index = 0;
+  if (left.byteOffset % 4 === 0 && right.byteOffset % 4 === 0) {
+    const words = left.length >>> 2;
+    const a = new Int32Array(left.buffer, left.byteOffset, words);
+    const b = new Int32Array(right.buffer, right.byteOffset, words);
+    for (let word = 0; word < words; word++) if (a[word] !== b[word]) return false;
+    index = words << 2;
+  }
+  for (; index < left.length; index++) if (left[index] !== right[index]) return false;
   return true;
 }
 
-/** `length` bytes of a pattern derived from `seed`. */
+/** `length` bytes of a pattern derived from `seed` (period 256: built once, then doubled). */
 export function bytesOf(length: number, seed: number): Uint8Array {
   const bytes = new Uint8Array(length);
-  for (let index = 0; index < length; index++) bytes[index] = (seed * 131 + index * 7) & 0xff;
+  const period = Math.min(length, 256);
+  for (let index = 0; index < period; index++) bytes[index] = (seed * 131 + index * 7) & 0xff;
+  for (let filled = period; filled < length; filled *= 2)
+    bytes.copyWithin(filled, 0, Math.min(filled, length - filled));
   return bytes;
 }
 
