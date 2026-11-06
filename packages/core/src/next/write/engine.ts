@@ -1317,10 +1317,17 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#check();
       // Backpressure: frozen memtables awaiting publication past their cap, or memtables across
       // every table past theirs, make writers wait (ruling 6). None of it needs the slot.
+      // Every round changes state or ends the wait, and yields a task (review B3-p2b-3 C1): a
+      // commit spanning memtables can only flush whole, so when the boundary is blocked by the
+      // live memtable that commit continues into, that (committed) tail is frozen too.
       while (this.#frozenBytes() > FROZEN_MEMTABLE_CAP_BYTES) {
+        if (this.#nextFlushReady() === null && !this.#freezeBlockingTails()) break;
+        const before = this.#flushProgress();
         this.#scheduleFlush();
         await this.#flushes;
+        await yieldTask();
         this.#check();
+        if (this.#flushProgress() === before) break;
       }
       if (this.#memtableBytes() > this.#memtableCap) await this.#relieve(0);
       // Level-0 runs past their stall bound make writers wait for merges (merges never wait on
@@ -1393,6 +1400,37 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#passSlot();
     // A frozen memtable may have waited for this writer's pending rows.
     if (this.#hasFrozen()) this.#scheduleFlush();
+  }
+
+  /** A value that changes whenever a flush makes progress (see the flush loop's invariant). */
+  #flushProgress(): string {
+    return `${String(this.publications)}:${String(this.maintenance.flushesAbandoned)}:${String(this.durableLsn)}`;
+  }
+
+  /**
+   * Freezes the live memtable of every table whose frozen memtables cannot flush because their
+   * last commit continues into it (its rows are all committed). True when it froze one.
+   */
+  #freezeBlockingTails(): boolean {
+    let froze = false;
+    for (const state of this.#tables.values()) {
+      const memtables = state.view.memtables;
+      const last = memtables[memtables.length - 1];
+      const previous = memtables[memtables.length - 2];
+      if (
+        last?.state !== "live" ||
+        previous?.state !== "frozen" ||
+        last.rowCount === 0 ||
+        last.visibleRows(MAX_LSN) < last.rowCount ||
+        minSeq(last) > maxSeq(previous, previous.rowCount)
+      )
+        continue;
+      last.state = "frozen";
+      last.measure();
+      this.#setView(state, { ...state.view });
+      froze = true;
+    }
+    return froze;
   }
 
   #hasFrozen(): boolean {
@@ -1694,12 +1732,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
           this.#armIdlePublish();
           return;
         }
+        const before = this.#flushProgress();
         try {
           await work;
         } catch (error) {
           this.#failure ??= error instanceof Error ? error : new Error(String(error));
           return;
         }
+        // Invariant: every flush the loop runs makes progress (a publication, an abandoned flush
+        // of a dropped table, or durability for a wait); otherwise it stops rather than spin.
+        if (this.#flushProgress() === before) return;
       }
     });
   }
