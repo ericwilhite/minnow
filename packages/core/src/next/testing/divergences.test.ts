@@ -5,6 +5,7 @@
 import { describe, expect, it } from "vitest";
 import {
   intendedDivergence,
+  type DifferingRow,
   type DivergenceObservation,
   type StatementFacts,
 } from "./divergences.js";
@@ -206,6 +207,7 @@ describe("key-forwarding matcher", () => {
     const restrict = {
       outcome: "foreignKey" as const,
       message: "FOREIGN KEY c_pid_fkey still has 1 c row(s)",
+      statement: 0,
     };
     expect(
       id(
@@ -223,20 +225,30 @@ describe("key-forwarding matcher", () => {
         }),
       ),
     ).toBeNull();
-    const differ = (...rows: Array<[string, number, number?]>) => ({
-      rowsDiffer: true,
-      differingRows: rows.map(([table, key, parent]) => ({
-        table,
-        key,
-        references: parent === undefined ? [] : [{ table: "t", value: parent }],
-      })),
+    const parentRow = (key: number): DifferingRow => ({
+      table: "t",
+      key,
+      oracle: { references: [] },
+      authority: { references: [] },
     });
+    /** A child whose PostgreSQL version references `before` and the current engine's `after`. */
+    const childRow = (
+      key: number,
+      before: number,
+      after: number | null | "absent",
+    ): DifferingRow => ({
+      table: "c",
+      key,
+      authority: { references: [{ table: "t", value: before }] },
+      oracle: after === "absent" ? null : { references: [{ table: "t", value: after }] },
+    });
+    const differ = (...rows: DifferingRow[]) => ({ rowsDiffer: true, differingRows: rows });
     // The UPDATE through 51 reached row 99 (where 51 moved): exactly that row differs.
     expect(
       id(
         observation({
           statements: [statement({ kind: "update", table: "t", matchedKeys: [51] })],
-          ...differ(["t", 99]),
+          ...differ(parentRow(99)),
         }),
       ),
     ).toBe("key-forwarding");
@@ -245,7 +257,7 @@ describe("key-forwarding matcher", () => {
       id(
         observation({
           statements: [statement({ kind: "delete", table: "t", matchedKeys: [51] })],
-          ...differ(["t", 99], ["c", 4, 99]),
+          ...differ(parentRow(99), childRow(4, 99, "absent")),
         }),
       ),
     ).toBe("key-forwarding");
@@ -254,7 +266,7 @@ describe("key-forwarding matcher", () => {
       id(
         observation({
           statements: [statement({ kind: "update", table: "t", matchedKeys: [51] })],
-          ...differ(["t", 99], ["t", 7]),
+          ...differ(parentRow(99), parentRow(7)),
         }),
       ),
     ).toBeNull();
@@ -270,7 +282,7 @@ describe("key-forwarding matcher", () => {
       id(
         observation({
           statements: [statement({ kind: "update", table: "t", matchedKeys: [52] })],
-          ...differ(["t", 99]),
+          ...differ(parentRow(99)),
         }),
       ),
     ).toBeNull();
@@ -282,5 +294,71 @@ describe("key-forwarding matcher", () => {
         }),
       ),
     ).toBeNull();
+    // A DELETE through the forward may set the child's reference to NULL (SET NULL); a rekey
+    // moves it to the new key, and only there.
+    const del = statement({ kind: "delete", table: "t", matchedKeys: [51] });
+    const rekey = statement({ kind: "rekey", table: "t", matchedKeys: [51], newKeys: [60] });
+    expect(id(observation({ statements: [del], ...differ(childRow(4, 99, null)) }))).toBe(
+      "key-forwarding",
+    );
+    expect(
+      id(observation({ statements: [rekey], ...differ(parentRow(60), childRow(4, 99, 60)) })),
+    ).toBe("key-forwarding");
+    expect(id(observation({ statements: [rekey], ...differ(childRow(4, 99, 61)) }))).toBeNull();
+    expect(id(observation({ statements: [del], ...differ(childRow(4, 98, "absent")) }))).toBeNull();
+  });
+
+  it("does not excuse a child's disappearance after a non-key UPDATE of a forwarded parent (review B3-p2a-4 #2)", () => {
+    // 51 forwards to 99; UPDATE t SET v = 7 WHERE id = 51 cannot delete child 123 or change it.
+    const update = statement({
+      sql: "UPDATE t SET v=7 WHERE id=51",
+      kind: "update",
+      table: "t",
+      matchedKeys: [51],
+    });
+    for (const after of ["absent", null, 7] as const)
+      expect(
+        id(
+          observation({
+            statements: [update],
+            rowsDiffer: true,
+            differingRows: [
+              {
+                table: "c",
+                key: 123,
+                authority: { references: [{ table: "t", value: 99 }] },
+                oracle: after === "absent" ? null : { references: [{ table: "t", value: after }] },
+              },
+            ],
+          }),
+        ),
+      ).toBeNull();
+  });
+
+  it("does not excuse a RESTRICT refusal of another statement (review B3-p2a-4 #1)", () => {
+    // Statement 0 deletes 999 (never forwarded, no children); statement 1 deletes forwarding 51.
+    // PostgreSQL accepts both; a defect refusing statement 0 is not forwarding.
+    const statements = [
+      statement({
+        sql: "DELETE FROM t WHERE id=999",
+        kind: "delete",
+        table: "t",
+        matchedKeys: [999],
+      }),
+      statement({
+        sql: "DELETE FROM t WHERE id=51",
+        kind: "delete",
+        table: "t",
+        matchedKeys: [51],
+      }),
+    ];
+    const refused = (at: number | null) => ({
+      outcome: "foreignKey" as const,
+      message: "FOREIGN KEY restrict",
+      statement: at,
+    });
+    expect(id(observation({ statements, oracle: refused(0) }))).toBeNull();
+    expect(id(observation({ statements, oracle: refused(null) }))).toBeNull();
+    expect(id(observation({ statements, oracle: refused(1) }))).toBe("key-forwarding");
   });
 });

@@ -10,11 +10,11 @@
  *   every unchanged chunk and copies only the chunks it changes (normally the tail), so an append
  *   copies at most one chunk plus the chunk list (`count / CHUNK_GROUPS` pointers).
  * - **Ownership.** Chunks, and each directory object with its chunk list (`directoryObjectBytes`),
- *   are refcounted by the generations (write states) that reference them. What a call makes starts
- *   with one creation reference, owned by its maker (the open, or a pending publication), which
- *   drops it (`releaseCreation`) once the generation that installs the directory has retained it,
- *   or at once when the publication fails or its table is gone. The last release returns the
- *   charge.
+ *   are refcounted by the generations (write states) that reference them. A new directory holds
+ *   one creation reference on itself and on every chunk it lists (new or shared), owned by its
+ *   maker (the open, or a pending publication), which drops it (`releaseCreation`) once the
+ *   generation that installs the directory has retained it, or at once when the publication fails
+ *   or its table is gone. The last release returns the charge.
  */
 import type { BlobRef, GroupRef } from "../format/manifest.js";
 import { ParseBudgetError } from "../format/manifest-codec.js";
@@ -201,7 +201,7 @@ export class GroupDirectory {
   readonly charge: number;
   readonly #budget: ByteBudget | null;
   #refs = 1;
-  /** Chunks this directory's maker made, with their creation references, until released. */
+  /** Chunks the maker holds a creation reference on (every chunk listed), until released. */
   #created: readonly GroupChunk[] | null;
 
   /** Charges its own object first (`ParseBudgetError` on refusal) when `budget` is given. */
@@ -446,7 +446,17 @@ export class GroupDirectory {
         rest += take;
       }
       for (const group of appended) live += group.liveRowCount;
-      return new GroupDirectory(chunks, live, budget, created);
+      // The new directory's creation reference covers every chunk it lists: the shared ones too
+      // (review B3-p2a-4 #3), so a pending publication keeps them charged while it awaits even
+      // if every installed generation lets them go meanwhile.
+      const shared = chunks.filter((chunk) => !created.includes(chunk));
+      for (const chunk of shared) chunk.retain();
+      try {
+        return new GroupDirectory(chunks, live, budget, chunks.slice());
+      } catch (error) {
+        for (const chunk of shared) chunk.release();
+        throw error;
+      }
     } catch (error) {
       for (const chunk of created) chunk.release();
       throw error;

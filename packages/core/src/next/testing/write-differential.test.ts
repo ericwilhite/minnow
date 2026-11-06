@@ -566,8 +566,8 @@ async function stepOnCurrent(
 }
 
 /**
- * Rows of `table` (value arrays, the key first) that differ between two sides, by key; `parent` is
- * the column holding a reference to t, whose values on either side the row reports.
+ * Rows of `table` (value arrays, the key first) that differ between the current engine (`left`)
+ * and PostgreSQL (`right`), by key, each side's version with its reference to t (column `parent`).
  */
 function differing(
   table: string,
@@ -579,18 +579,26 @@ function differing(
     new Map(rows.map((row) => [Number(row[0]), row] as const));
   const a = byKey(left);
   const b = byKey(right);
+  const side = (row: readonly Value[] | undefined) =>
+    row === undefined
+      ? null
+      : {
+          references:
+            parent === null
+              ? []
+              : [
+                  {
+                    table: "t",
+                    value: typeof row[parent] === "number" ? row[parent] : null,
+                  },
+                ],
+        };
   const out: DifferingRow[] = [];
   for (const key of new Set([...a.keys(), ...b.keys()])) {
     const x = a.get(key);
     const y = b.get(key);
     if (JSON.stringify(x) === JSON.stringify(y)) continue;
-    const references =
-      parent === null
-        ? []
-        : [x?.[parent], y?.[parent]]
-            .filter((value): value is number => typeof value === "number")
-            .map((value) => ({ table: "t", value }));
-    out.push({ table, key, references });
+    out.push({ table, key, oracle: side(x), authority: side(y) });
   }
   return out;
 }

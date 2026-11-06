@@ -42,13 +42,20 @@ export interface StepOutcome {
   readonly statement?: number | null;
 }
 
+/** One side's version of a differing row: its foreign-key values, in the table's FK order. */
+export interface RowSide {
+  readonly references: ReadonlyArray<{ readonly table: string; readonly value: number | null }>;
+}
+
 /** A row that differs between the two sides after a step both committed. */
 export interface DifferingRow {
   readonly table: string;
   /** Its primary key. */
   readonly key: number;
-  /** Foreign-key values it holds on either side, with the table each references. */
-  readonly references: ReadonlyArray<{ readonly table: string; readonly value: number }>;
+  /** The row on the current engine's side, or null when it lacks it. */
+  readonly oracle: RowSide | null;
+  /** The row on PostgreSQL's side, or null when it lacks it. */
+  readonly authority: RowSide | null;
 }
 
 /** One step on which the current engine and the authority disagreed. */
@@ -126,20 +133,14 @@ function forwardTarget(
  * - the current engine accepts a foreign-key write PostgreSQL refuses: the statement PostgreSQL
  *   refused writes a reference to the key PostgreSQL names as missing, and that key forwards (the
  *   engine stored the key it forwards to);
- * - the current engine refuses (RESTRICT) a DELETE or rekey PostgreSQL accepts, which matched a
- *   forwarding key (the engine reached the moved row and its children);
+ * - the current engine refuses (RESTRICT) a DELETE or rekey PostgreSQL accepts, and that refused
+ *   statement matched a forwarding key (the engine reached the moved row and its children);
  * - both succeed with different rows, and every differing row is one the current engine reached
  *   through a forwarding key an UPDATE, DELETE or rekey matched: the row it forwards to (a rekey's
  *   new key too), or a child referencing one of those.
  */
 function explainedByForwarding(observation: DivergenceObservation): boolean {
   const { oracle, authority, statements } = observation;
-  const matchedForwarding = (kinds: ReadonlyArray<StatementFacts["kind"]>) =>
-    statements.some(
-      (statement) =>
-        kinds.includes(statement.kind) &&
-        statement.matchedKeys.some((key) => forwarding(observation, statement.table, key)),
-    );
   if (oracle.outcome === "unique" && authority.outcome === "ok") {
     const duplicate = DUPLICATE.exec(oracle.message ?? "");
     if (duplicate === null) return false;
@@ -171,35 +172,69 @@ function explainedByForwarding(observation: DivergenceObservation): boolean {
       ) ?? false
     );
   }
-  if (oracle.outcome === "foreignKey" && authority.outcome === "ok")
-    return matchedForwarding(["delete", "rekey"]);
+  if (oracle.outcome === "foreignKey" && authority.outcome === "ok") {
+    // The statement the current engine refused must itself be the DELETE or rekey that reached a
+    // forwarding key (review B3-p2a-4 #1): the engine followed it to the moved row's children.
+    const at = oracle.statement;
+    const refused = at === undefined || at === null ? undefined : statements[at];
+    return (
+      refused !== undefined &&
+      (refused.kind === "delete" || refused.kind === "rekey") &&
+      refused.matchedKeys.some((key) => forwarding(observation, refused.table, key))
+    );
+  }
   if (oracle.outcome === "ok" && authority.outcome === "ok" && observation.rowsDiffer) {
-    // Every differing row must be one the current engine reached through a forwarding key: the
-    // row it forwards to (and a rekey's new key), or a child referencing one of those.
+    // Every differing row must be one the current engine reached through a forwarding key
+    // (review B3-p2a-4 #2): the parent it forwards to (or a rekey's new key), or a child whose
+    // difference is exactly what following the forward produces: a DELETE removes the child or
+    // sets its reference to NULL (CASCADE / SET NULL), a rekey moves its reference to the new key.
+    // A non-key UPDATE explains no child difference.
     const differing = observation.differingRows ?? [];
     if (differing.length === 0) return false;
-    const reached = new Map<string, Set<number>>();
-    const add = (table: string, key: number) => {
-      let keys = reached.get(table);
-      if (keys === undefined) reached.set(table, (keys = new Set()));
-      keys.add(key);
-    };
+    interface Reach {
+      readonly table: string;
+      readonly kind: StatementFacts["kind"];
+      readonly target: number;
+      readonly newKeys: readonly number[];
+    }
+    const reaches: Reach[] = [];
     for (const statement of statements) {
       if (statement.kind === "insert") continue;
       for (const key of statement.matchedKeys) {
         if (!forwarding(observation, statement.table, key)) continue;
         const target = forwardTarget(observation, statement.table, key);
-        if (target === null) continue;
-        add(statement.table, target);
-        if (statement.kind === "rekey")
-          for (const next of statement.newKeys) add(statement.table, next);
+        if (target !== null)
+          reaches.push({
+            table: statement.table,
+            kind: statement.kind,
+            target,
+            newKeys: statement.kind === "rekey" ? statement.newKeys : [],
+          });
       }
     }
-    return differing.every(
-      (row) =>
-        reached.get(row.table)?.has(row.key) === true ||
-        row.references.some((reference) => reached.get(reference.table)?.has(reference.value)),
-    );
+    if (reaches.length === 0) return false;
+    const parent = (row: DifferingRow) =>
+      reaches.some(
+        (reach) =>
+          reach.table === row.table &&
+          (reach.target === row.key || reach.newKeys.includes(row.key)),
+      );
+    const child = (row: DifferingRow) => {
+      const before = row.authority;
+      if (before === null) return false;
+      return before.references.some((reference, at) => {
+        const followed = reaches.find(
+          (reach) => reach.table === reference.table && reach.target === reference.value,
+        );
+        if (followed === undefined) return false;
+        const after = row.oracle?.references[at]?.value;
+        if (followed.kind === "delete") return row.oracle === null || after === null;
+        if (followed.kind === "rekey")
+          return after !== undefined && after !== null && followed.newKeys.includes(after);
+        return false;
+      });
+    };
+    return differing.every((row) => parent(row) || child(row));
   }
   return false;
 }
