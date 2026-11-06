@@ -10174,6 +10174,29 @@ class Parser {
     },
     tail: Omit<SelectTail, "orderBy">,
   ): CompiledQuery {
+    // An integer constant in DISTINCT ON or ORDER BY is a select-list position (PostgreSQL), so
+    // it names that item's output here, before the window and the outer block are built.
+    const position = (expression: Expression, clause: string): Expression => {
+      if (
+        expression.kind !== "literal" ||
+        typeof expression.value !== "number" ||
+        !Number.isInteger(expression.value) ||
+        parts.select.some((item) => item.expression.kind === "wildcard")
+      )
+        return expression;
+      const item = parts.select[expression.value - 1];
+      if (item === undefined)
+        throw new TypeError(`${clause} position ${String(expression.value)} is not in select list`);
+      return { kind: "column", reference: item.alias };
+    };
+    distinctOn = distinctOn.map((expression) => position(expression, "DISTINCT ON"));
+    parts = {
+      ...parts,
+      orderBy: parts.orderBy.map((order) => ({
+        ...order,
+        expression: position(order.expression, "ORDER BY"),
+      })),
+    };
     const rowNumberAlias = "\0distinct_on";
     const innerSelect: SelectItem[] = [...parts.select];
     const aliased = new Map(

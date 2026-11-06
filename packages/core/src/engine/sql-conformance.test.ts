@@ -1286,6 +1286,11 @@ function distinctOnCases(): Case[] {
     pg(
       `SELECT DISTINCT ON (region) region, amount AS label FROM data ORDER BY region NULLS LAST, label, id`,
     ),
+    // Integer constants are select-list positions in DISTINCT ON and in its ORDER BY, which
+    // decides both the row each group keeps and the order of the result.
+    pg(`SELECT DISTINCT ON (1) region, id, amount FROM data ORDER BY 1 NULLS LAST, 3 DESC, 2`),
+    pg(`SELECT DISTINCT ON (region) region, id, amount FROM data ORDER BY 1 NULLS LAST, 3, 2 DESC`),
+    pg(`SELECT DISTINCT ON (2, 1) active, region, id FROM data ORDER BY 1, 2 NULLS LAST, 3 DESC`),
   ];
 }
 
@@ -2732,8 +2737,16 @@ describe("SQL conformance against SQLite and PGlite", () => {
     const fixture = buildFixture(DEFAULT_FIXTURE_SEED);
     const database = await minnowFixture(fixture);
     const postgres = await pgliteOracle(fixture);
-    const keyLists = ["region", "region, active", "active, region", "LOWER(region)"];
-    const pool = ["region NULLS LAST", "active", "id", "LOWER(region) DESC", "place"];
+    const keyLists = ["region", "region, active", "active, region", "LOWER(region)", "1", "2, 1"];
+    const pool = [
+      "region NULLS LAST",
+      "active",
+      "id",
+      "LOWER(region) DESC",
+      "place",
+      "1",
+      "2 DESC",
+    ];
     const orders: string[][] = [];
     for (const a of pool) {
       orders.push([a]);
