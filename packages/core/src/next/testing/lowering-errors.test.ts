@@ -215,6 +215,10 @@ describe("HAVING names and frame offsets (review B6-p2b-3 finding 3)", () => {
     "CREATE TABLE e (id integer, v integer)",
     "INSERT INTO a VALUES (1, 10), (2, 20), (2, 5)",
     "INSERT INTO b VALUES (1, 7)",
+    // A NUMERIC key, where a RANGE offset is NUMERIC too and keeps its exact sign (review
+    // B6-p2b-5: -1e-400 is negative).
+    "CREATE TABLE n (id integer, v numeric)",
+    "INSERT INTO n VALUES (1, 1.5), (2, 2), (2, NULL)",
   ];
 
   it("a HAVING name is checked as PostgreSQL checks it: unknown 42703 before ungrouped 42803", async () => {
@@ -279,6 +283,11 @@ describe("HAVING names and frame offsets (review B6-p2b-3 finding 3)", () => {
       "-0.4",
       "-0.5",
       "1.5",
+      // Review B6-p2b-5: sign and zero from the digits, past what a double holds.
+      "1e-400",
+      "-1e-400",
+      "1e400",
+      "-0e-400",
     ];
     const bounds = [
       (o: string) => `BETWEEN ${o} PRECEDING AND CURRENT ROW`,
@@ -288,7 +297,7 @@ describe("HAVING names and frame offsets (review B6-p2b-3 finding 3)", () => {
     const failures: string[] = [];
     const divergences: string[] = [];
     const precedence: string[] = [];
-    for (const table of ["a", "e"])
+    for (const table of ["a", "e", "n"])
       for (const unit of ["ROWS", "RANGE", "GROUPS"])
         for (const offset of offsets)
           for (const bound of bounds) {
@@ -303,6 +312,7 @@ describe("HAVING names and frame offsets (review B6-p2b-3 finding 3)", () => {
               if (state === "accepted" && unit !== "RANGE" && offset.includes("."))
                 reach.reach("rounded offset accepted");
               if (state === "0A000") reach.reach("numeric offset on an integer key");
+              if (state === "22003") reach.reach("bigint out of range");
               if (state === "accepted") reach.reach("accepted");
               else if (state === "22004") reach.reach("null offset");
               else if (state === "22013") reach.reach("negative offset");
@@ -317,7 +327,7 @@ describe("HAVING names and frame offsets (review B6-p2b-3 finding 3)", () => {
             // the type (0A000) first; the parser, which does not know the key, the sign (22013).
             if (
               unit === "RANGE" &&
-              (offset === "-0.4" || offset === "-0.5") &&
+              (offset === "-0.4" || offset === "-0.5" || offset === "-1e-400") &&
               "error" in expected &&
               expected.error === "0A000" &&
               "error" in actual &&
@@ -345,8 +355,9 @@ describe("HAVING names and frame offsets (review B6-p2b-3 finding 3)", () => {
     expect(failures.join("\n")).toBe("");
     // Exactly the negative RANGE offsets over the empty table: two spellings, three bounds.
     expect(divergences.length).toBe(6);
-    // Exactly -0.4 and -0.5 on the integer key (RANGE does not round), three bounds, both tables.
-    expect(precedence.length).toBe(12);
+    // Exactly -0.4, -0.5 and -1e-400 on the integer key (RANGE does not round), three bounds,
+    // both tables.
+    expect(precedence.length).toBe(18);
     reach.assertReached();
   });
 });

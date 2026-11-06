@@ -105,6 +105,7 @@ export const FRONT_END_STATES: ReadonlyArray<readonly [RegExp, string]> = [
   [/^argument of (ROWS|GROUPS) must be type bigint, not type \S+$/u, "42804"],
   [/^frame (starting|ending) offset must not be negative$/u, "22013"],
   [/^frame (starting|ending) offset must not be null$/u, "22004"],
+  [/^bigint out of range$/u, "22003"],
   [/^Offset RANGE frames require exactly one ORDER BY expression$/u, "42P20"],
   [/^Ambiguous or missing column: /u, "42702"],
   [

@@ -361,6 +361,16 @@
   },
   {
     "file": "query.ts",
+    "message": "RANGE frame offsets outside double precision are not supported",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "bigint out of range",
+    "state": "22003"
+  },
+  {
+    "file": "query.ts",
     "message": "FULL JOIN is only supported as the sole join",
     "state": "0A000"
   },

@@ -477,6 +477,8 @@ export const FRAME_OFFSET_STATES = [
   "signed zero accepted",
   "rounded offset accepted",
   "numeric offset on an integer key",
+  // Review B6-p2b-5: a ROWS / GROUPS offset past bigint (1e400) is 22003.
+  "bigint out of range",
 ] as const;
 
 /** HAVING names against PostgreSQL (review B6-p2b-3 finding 3). */

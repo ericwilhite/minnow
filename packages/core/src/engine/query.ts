@@ -12888,19 +12888,35 @@ class Parser {
       this.#index += 1;
     }
     const literal = this.#take("number").text;
-    // ROWS and GROUPS take a bigint: PostgreSQL rounds a numeric literal half away from zero
-    // (`-0.4` is 0, `-0.5` is -1) before checking its sign. RANGE keeps the value.
-    const value = unit === "range" ? Number(literal) : roundedFrameOffset(literal);
-    if (!Number.isFinite(value)) {
+    // Sign and zero come from the literal's digits, never from Number(): `-1e-400` is negative
+    // (PostgreSQL's NUMERIC keeps it exactly) though Number() makes it -0.
+    const digits = frameOffsetDigits(literal);
+    if (digits === null)
       throw new TypeError(
         "Window frame offsets must be non-negative integers, or numeric RANGE offsets",
       );
+    let offset: number;
+    if (unit === "range") {
+      if (negated && !digits.zero) {
+        if (which === "starting") throw new TypeError("frame starting offset must not be negative");
+        throw new TypeError("frame ending offset must not be negative");
+      }
+      // RANGE keeps the value. One a double cannot hold (it would become 0 or Infinity) is
+      // refused rather than changed.
+      offset = digits.zero ? 0 : Number(literal);
+      if (!digits.zero && (offset === 0 || !Number.isFinite(offset)))
+        throw new TypeError("RANGE frame offsets outside double precision are not supported");
+    } else {
+      // ROWS and GROUPS take a bigint: PostgreSQL rounds a numeric literal half away from zero
+      // (`-0.4` is 0, `-0.5` is -1, `-1e-400` is 0) before checking its sign and its range.
+      const rounded = roundedFrameOffset(digits);
+      if (rounded > 9223372036854775807n) throw new TypeError("bigint out of range");
+      if (negated && rounded !== 0n) {
+        if (which === "starting") throw new TypeError("frame starting offset must not be negative");
+        throw new TypeError("frame ending offset must not be negative");
+      }
+      offset = Number(rounded);
     }
-    if (negated && value !== 0) {
-      if (which === "starting") throw new TypeError("frame starting offset must not be negative");
-      throw new TypeError("frame ending offset must not be negative");
-    }
-    const offset = value === 0 ? 0 : value;
     const numeric = /[.eE]/u.test(literal) ? { offsetNumeric: true as const } : {};
     if (this.#isKeyword("PRECEDING")) {
       this.#keyword("PRECEDING");
@@ -14970,24 +14986,40 @@ function timestampLiteral(text: string): Date {
 
 /** The parser's OFFSET range contract, shared with the typed builder. */
 /**
- * A ROWS / GROUPS frame offset literal as PostgreSQL's numeric → bigint cast reads it: rounded
- * half away from zero, exactly from the digits (`2.5` is 3, `0.4999…` is 0). NaN when the text
- * is not a plain decimal literal.
+ * A frame offset literal's significant digits and power of ten (value = digits × 10^exponent),
+ * read from its text: `zero` when every mantissa digit is 0, whatever the exponent. Null when
+ * the text is not a plain decimal literal.
  */
-function roundedFrameOffset(literal: string): number {
+function frameOffsetDigits(
+  literal: string,
+): { readonly digits: string; readonly exponent: number; readonly zero: boolean } | null {
   const match = /^(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/u.exec(literal);
-  if (match === null) return Number.NaN;
+  if (match === null) return null;
   const [, whole = "", fraction = "", exponent = "0"] = match;
-  let coefficient = BigInt(`${whole}${fraction}` || "0");
-  let scale = fraction.length - Number(exponent);
-  if (scale < 0) {
-    coefficient *= 10n ** BigInt(-scale);
-    scale = 0;
-  }
-  const divisor = 10n ** BigInt(scale);
+  if (whole === "" && fraction === "") return null;
+  const digits = `${whole}${fraction}`.replace(/^0+/u, "");
+  return { digits, exponent: Number(exponent) - fraction.length, zero: digits === "" };
+}
+
+/**
+ * A ROWS / GROUPS frame offset as PostgreSQL's numeric → bigint cast reads it: rounded half away
+ * from zero, exactly from the digits (`2.5` is 3, `0.4999…` is 0). Huge exponents never build
+ * huge numbers: past 20 integer digits the value is out of bigint range, and below 0.1 it is 0.
+ */
+function roundedFrameOffset(literal: {
+  readonly digits: string;
+  readonly exponent: number;
+}): bigint {
+  const { digits, exponent } = literal;
+  if (digits === "") return 0n;
+  if (digits.length + exponent > 20) return 10n ** 20n;
+  if (exponent >= 0) return BigInt(digits) * 10n ** BigInt(exponent);
+  if (digits.length + exponent < 0) return 0n;
+  const coefficient = BigInt(digits);
+  const divisor = 10n ** BigInt(-exponent);
   let rounded = coefficient / divisor;
   if ((coefficient % divisor) * 2n >= divisor) rounded += 1n;
-  return Number(rounded);
+  return rounded;
 }
 
 export function validateOffset(offset: number): number {

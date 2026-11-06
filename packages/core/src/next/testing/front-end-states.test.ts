@@ -122,6 +122,10 @@ const CASES: ReadonlyArray<readonly [sql: string, message: string]> = [
     "SELECT count(*) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND NULL FOLLOWING) FROM a",
     "frame ending offset must not be null",
   ],
+  [
+    "SELECT count(*) OVER (ORDER BY id ROWS BETWEEN 1e400 PRECEDING AND CURRENT ROW) FROM a",
+    "bigint out of range",
+  ],
   // Refusals of SQL PostgreSQL runs.
   [
     "SELECT id FROM a GROUP BY id HAVING max(v) > (SELECT max(v) FROM b WHERE b.id = a.id)",
