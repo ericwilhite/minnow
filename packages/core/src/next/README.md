@@ -41,14 +41,16 @@ Build core with `npx tsc -b packages/core`. Before rebuilding a candidate, copy 
 parent directory). `scripts/write-insert-bench.mts --baseline <old-dist> --mode unique` measures
 the constraint-check component in Node CPU time. `--mode single --durability relaxed|strict`
 measures prepared one-row commits after a 100k-row table; `--mode load --load-mode tx|commits`
-includes the durable million-row load and maintenance. Run with plain `node`, using the built
+includes the durable million-row load and maintenance. `node scripts/write-load-bench.mts --mode tx|commits
+--profile ~/.cache/load.cpuprofile` records a CPU profile around the load and maintenance only;
+profile stop and serialization are outside the reported CPU/wall clock. Run with plain `node`, using the built
 modules, and set `TMPDIR` under `~/.cache`.
 
 `scripts/write-browser-bench.mts --baseline <old-dist> --output ~/.cache/<run>` bundles those
 built modules into real OPFS workers in a persistent Chromium profile on disk. The same mode
 and durability options apply. The default is six interleaved old/new pairs after a discarded
 warmup pair, with 20,000 relaxed singles or 2,000 strict singles. It reports renderer CPU
-(including JIT/GC), dedicated-worker CPU, whole-browser CPU and wall time separately. `--profile`
+(including JIT/GC), dedicated-worker CPU, whole-browser CPU and wall time separately, with host load averages before and after each pass. `--profile`
 adds two untimed passes. A fresh worker reopens each completed database and checks its row and
 index counts. This is an owner-side component benchmark; it does not time SQL, the executor or
 client transport, compare SQLite, or certify power-loss safety. Neither script publishes its

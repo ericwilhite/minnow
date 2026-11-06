@@ -11,6 +11,7 @@
  * batches and 100k-row single-insert preload are outside the clock. Singles flush at the end;
  * strict singles await each durable receipt. Loads include quiesce (maintenance on).
  *
+ * Each pass records host load averages (1/5/15 minute) immediately before and after timing.
  * CPU is Linux /proc utime+stime, including JIT/GC threads: renderer CPU (owner process), whole
  * browser CPU (also storage IPC), and the dedicated worker thread separately. 10 ms USER_HZ
  * granularity is reported. Wall is measured inside the worker; CPU brackets its RPC. Profiles
@@ -24,7 +25,7 @@ import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { readdirSync, readFileSync, statfsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join, resolve, relative } from "node:path";
-import { homedir } from "node:os";
+import { homedir, loadavg } from "node:os";
 import { build } from "esbuild";
 import { chromium, type CDPSession } from "@playwright/test";
 import type { WriteBenchInput } from "../packages/core/browser/next-write-bench-worker.js";
@@ -268,9 +269,11 @@ try {
     const input = { ...config, dir: `b3-${label}-${String(round)}-${String(Date.now())}` };
     await worker(label);
     await call("prepare", input);
+    const loadAverageBefore = loadavg();
     const before = cpu();
     const result = await call("run", input, profiled);
     const after = cpu();
+    const loadAverageAfter = loadavg();
     const measured = {
       rendererCpuMs: ((after.renderer - before.renderer) * 1000) / ticks,
       browserCpuMs: ((after.browser - before.browser) * 1000) / ticks,
@@ -288,6 +291,8 @@ try {
       round,
       warmup: round < 0,
       profiled,
+      loadAverageBefore,
+      loadAverageAfter,
       ...measured,
       ...result,
       ...verified,

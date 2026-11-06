@@ -2,7 +2,7 @@
  * The write path's load and insert costs (PROPOSAL "Targets": 1M-row keyed load ≤ 1.5 s durable;
  * relaxed prepared INSERT ≤ 20 µs owner CPU), owner-side, in Node, on the in-memory store:
  *
- *   npx vite-node scripts/write-load-bench.mts [--rows 1000000] [--batch 2048]
+ *   node scripts/write-load-bench.mts [--rows 1000000] [--batch 2048]
  *     [--mode tx|commits|single] [--durability strict|relaxed] [--commit 10000] [--singles 20000]
  *
  * - `tx`: one transaction of `rows` keyed rows (id INT PRIMARY KEY, v TEXT, n INT) inserted in
@@ -11,11 +11,17 @@
  * - `single`: `singles` one-row transactions after a 100k-row table, each acknowledged as its
  *   durability says (strict: after its flush; relaxed: at commit): µs per insert (wall and process
  *   CPU), the relaxed lane's owner cost.
+ * Build core first (npx tsc -b packages/core). Optional --profile ~/.cache/load.cpuprofile
+ * records only the measured phase; Inspector stop/serialization are outside its CPU/wall clock.
  * Rows are built before the clock starts (the engine's cost alone is measured). Reported: wall
  * and CPU per phase, rows/s, staged and flushed counts. The memory store has no
  * disk: durable here means the log's flush calls complete, not a real fsync. The machine is
  * shared: compare runs made back to back.
  */
+import { Session, type Profiler } from "node:inspector";
+import { writeFile, mkdir } from "node:fs/promises";
+import { resolve, dirname, relative, join } from "node:path";
+import { homedir, loadavg } from "node:os";
 import { performance, PerformanceObserver } from "node:perf_hooks";
 import {
   autocommit,
@@ -28,12 +34,37 @@ import {
   tableInput,
   TEXT,
   texts,
-} from "../packages/core/src/next/write/test-support.ts";
+} from "../packages/core/dist/next/write/test-support.js";
 
 const args = process.argv.slice(2);
 const option = (name: string, fallback: string): string => {
   const index = args.indexOf(`--${name}`);
   return index >= 0 ? (args[index + 1] ?? fallback) : fallback;
+};
+// Build core first. Profiling includes load and quiesce, not input construction or close.
+const profileFile = option("profile", "");
+const inspector = profileFile ? new Session() : null;
+const startProfile = async () => {
+  if (!inspector) return;
+  const file = resolve(profileFile);
+  if (relative(join(homedir(), ".cache"), file).startsWith(".."))
+    throw new Error("--profile must be under ~/.cache");
+  await mkdir(dirname(file), { recursive: true });
+  inspector.connect();
+  await new Promise<void>((ok, fail) =>
+    inspector.post("Profiler.enable", (error) => (error ? fail(error) : ok())),
+  );
+  await new Promise<void>((ok, fail) =>
+    inspector.post("Profiler.start", (error) => (error ? fail(error) : ok())),
+  );
+};
+const stopProfile = async () => {
+  if (!inspector) return;
+  const profile = await new Promise<Profiler.Profile>((ok, fail) =>
+    inspector.post("Profiler.stop", (error, result) => (error ? fail(error) : ok(result.profile))),
+  );
+  inspector.disconnect();
+  await writeFile(resolve(profileFile), JSON.stringify(profile));
 };
 const ROWS = Number(option("rows", "1000000"));
 const BATCH = Number(option("batch", "2048"));
@@ -83,6 +114,10 @@ if (MODE === "single") {
   await path.quiesce();
   // Built before the clock starts: the engine's cost alone is measured.
   const singles = Array.from({ length: SINGLES }, (_, k) => columns([1_000_000 + k]));
+  await startProfile();
+  gcSoFar();
+  gcMs = 0;
+  report.loadAverageBefore = loadavg();
   const wall0 = performance.now();
   const cpu0 = cpu();
   // A commit is acknowledged as its mode says: strict after the log flush, relaxed at commit.
@@ -104,6 +139,10 @@ if (MODE === "single") {
     const ids = Array.from({ length: Math.min(BATCH, ROWS - from) }, (_, k) => from + k);
     batches.push({ commit: Math.floor(from / COMMIT), batch: columns(ids) });
   }
+  await startProfile();
+  gcSoFar();
+  gcMs = 0;
+  report.loadAverageBefore = loadavg();
   const wall0 = performance.now();
   const cpu0 = cpu();
   gcMs = 0;
@@ -145,5 +184,7 @@ if (MODE === "single") {
   report.merges = path.maintenance.merges;
   report.heapMiB = Math.round(process.memoryUsage().heapUsed / 1048576);
 }
+report.loadAverageAfter = loadavg();
+await stopProfile(); // CPU/wall fields above exclude Inspector.stop and serialization.
 console.log(JSON.stringify(report));
 await harness.close();
