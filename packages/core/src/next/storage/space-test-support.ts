@@ -22,6 +22,14 @@ export function at<T>(items: readonly T[], index: number): T {
   return item;
 }
 
+/** Byte equality, fast on large arrays (the matcher's `toEqual` diffs element by element). */
+export function sameBytes(left: Uint8Array | undefined, right: Uint8Array | undefined): boolean {
+  if (left === undefined || right === undefined) return false;
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index++) if (left[index] !== right[index]) return false;
+  return true;
+}
+
 /** `length` bytes of a pattern derived from `seed`. */
 export function bytesOf(length: number, seed: number): Uint8Array {
   const bytes = new Uint8Array(length);

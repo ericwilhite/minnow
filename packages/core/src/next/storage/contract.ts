@@ -92,12 +92,16 @@
  * - The log calls belong to the write path (group commit, recovery).
  *
  * ## Implementations
- * - `file-store.ts`: the store over four long-lived files (log, data, two root slots) through a
+ * - `file-store.ts`: the store over four long-lived files (log, data, two root slots; OPFS adds
+ *   `spill` and `epoch`) through a
  *   `SyncFile` interface with the shape of `FileSystemSyncAccessHandle`. OPFS supplies real
  *   handles (`opfs.ts`); `sim-disk.ts` supplies simulated ones with a physical crash model.
- * - IndexedDB (storage track, after OPFS; needed for Safari and Firefox private browsing): the
- *   same contract with the epoch fence, ArrayBuffer values (never Blobs), log records keyed by
- *   offset and data chunk records.
+ * - `indexeddb.ts`: the same contract on IndexedDB (Safari and Firefox private browsing), with the
+ *   epoch fence checked inside every read-write transaction, ArrayBuffer values (never Blobs) and
+ *   byte records keyed by offset; over the platform's IndexedDB in browsers, over `sim-idb.ts` (a
+ *   write-ahead log on the simulated disk, same crash model) in the storage kit.
+ * - `memory-store.ts`: the file store over in-memory files (in-memory databases, the M1 suites).
+ * - `select.ts` (`chooseBackend`): OPFS where sync handles work, else IndexedDB, else memory.
  * Every implementation runs `storage/conformance.ts`.
  */
 

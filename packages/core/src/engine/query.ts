@@ -25,6 +25,8 @@ import type {
   BinaryOperator,
   ComparisonOperator,
   CompiledQuery,
+  DeclaredNumericTypeName,
+  DeclaredTextLength,
   Expression,
   FtsStats,
   JoinPlan,
@@ -1085,6 +1087,63 @@ const createTableTypeNames: ReadonlyMap<string, SqlColumnType> = new Map([
   ["DATETIME", "datetime"],
 ]);
 
+// Numeric type words by PostgreSQL's canonical name, recorded with text widths for the new core's
+// lowering only (next/DECISIONS.md C5, R17.4; next/lower/INVENTORY.md). `FLOAT(p ≤ 24)` is real.
+const declaredNumericNames = new Map<string, DeclaredNumericTypeName>(
+  (
+    [
+      ["smallint", "SMALLINT INT2 SMALLSERIAL"],
+      ["integer", "INTEGER INT INT4 SERIAL"],
+      ["bigint", "BIGINT INT8 BIGSERIAL"],
+      ["real", "REAL FLOAT4"],
+      ["double precision", "DOUBLE FLOAT8 FLOAT"],
+    ] as const
+  ).flatMap(([name, words]) => words.split(" ").map((word) => [word, name] as const)),
+);
+let recordDeclaredTypes = false;
+
+/**
+ * Runs `compile` with `declaredTypeName` / `declaredLength` on numeric and character column
+ * definitions and CAST targets (C5, R17.4).
+ * For lowering only: outside it, compiled plans are exactly as before.
+ */
+export function compileWithDeclaredTypes<T>(compile: () => T): T {
+  const outer = recordDeclaredTypes;
+  recordDeclaredTypes = true;
+  try {
+    return compile();
+  } finally {
+    recordDeclaredTypes = outer;
+  }
+}
+
+/**
+ * Whether the current compilation runs under `compileWithDeclaredTypes`. There the parser and
+ * optimizer keep typed expressions instead of folding them with the current engine's number
+ * semantics (lowering folds after overload resolution; review B6-p2a finding 2).
+ */
+export function declaredTypesActive(): boolean {
+  return recordDeclaredTypes;
+}
+
+function declaredType(
+  word: string,
+  width?: number,
+  varying?: boolean,
+): { declaredTypeName?: DeclaredNumericTypeName; declaredLength?: DeclaredTextLength } {
+  if (!recordDeclaredTypes) return {};
+  // VARCHAR(n) and CHARACTER VARYING(n); CHAR and CHARACTER are CHAR(1) without a width.
+  if (word === "VARCHAR" || (word === "CHARACTER" && varying === true))
+    return width === undefined ? {} : { declaredLength: { length: width, fixed: false } };
+  if (word === "CHAR" || word === "CHARACTER")
+    return { declaredLength: { length: width ?? 1, fixed: true } };
+  const name = declaredNumericNames.get(word);
+  if (name === undefined) return {};
+  return {
+    declaredTypeName: word === "FLOAT" && width !== undefined && width <= 24 ? "real" : name,
+  };
+}
+
 /** PostgreSQL's integer type names, including the internal spellings pg_dump emits. */
 const integerTypeNames: ReadonlySet<string> = new Set([
   "INTEGER",
@@ -1487,6 +1546,8 @@ export type CompiledStatement =
       predicates: Array<{ left: Expression; operator: PredicateOperator; right: Expression }>;
       /** `DELETE FROM t USING sources WHERE …`: the extra sources the predicates may read. */
       from?: MutationSources;
+      /** TRUNCATE, marked only under `compileWithDeclaredTypes` (it is a DELETE elsewhere). */
+      truncate?: true;
       returning?: string[] | "*";
       /** RETURNING items that are not plain columns, evaluated over the affected rows. */
       returningItems?: ReturningItem[];
@@ -1502,6 +1563,9 @@ export type CompiledStatement =
         sqlDomain?: SqlDomain;
         /** A datetime declared TIMESTAMP (without time zone); absent for TIMESTAMPTZ. */
         withoutTimeZone?: true;
+        /** Only under `compileWithDeclaredTypes`. */
+        declaredTypeName?: DeclaredNumericTypeName;
+        declaredLength?: DeclaredTextLength;
         nullable?: boolean;
         defaultValue?: ColumnDefault;
         generatedValue?: ColumnGenerated;
@@ -1605,6 +1669,9 @@ export type CompiledStatement =
         sqlDomain?: SqlDomain;
         /** A datetime declared TIMESTAMP (without time zone); absent for TIMESTAMPTZ. */
         withoutTimeZone?: true;
+        /** Only under `compileWithDeclaredTypes`. */
+        declaredTypeName?: DeclaredNumericTypeName;
+        declaredLength?: DeclaredTextLength;
         nullable?: boolean;
         defaultValue?: ColumnDefault;
         generatedValue?: ColumnGenerated;
@@ -1762,7 +1829,9 @@ function parseTruncateStatement(tokens: Token[]): CompiledStatement {
   if (index !== words.length) {
     throw new TypeError(`Unexpected input after TRUNCATE: ${words[index]?.text ?? ""}`);
   }
-  return { kind: "delete", table: table.text, predicates: [] };
+  return recordDeclaredTypes
+    ? { kind: "delete", table: table.text, predicates: [], truncate: true }
+    : { kind: "delete", table: table.text, predicates: [] };
 }
 
 function parseTransactionStatement(keyword: string, tokens: Token[]): CompiledStatement {
@@ -3821,6 +3890,26 @@ export function createPreparedQuery(
     memory.close();
     throw error;
   }
+}
+
+/**
+ * The shape passes `createPreparedColumnarQuery` runs before binding, in the same order, for the
+ * new core's lowering, which binds against its own catalog: pending wildcard shapes, source
+ * column aliases, NATURAL joins, qualified and DISTINCT wildcards, grouped references, then the
+ * grouping check. WITH TIES and the statement clock stay in the plan (the IR has both).
+ */
+export function prepareColumnarShape(
+  plan: CompiledQuery,
+  columnsOf: (tableName: string) => readonly string[] | undefined,
+): CompiledQuery {
+  plan = bindPendingSelectShapes(plan, columnsOf);
+  plan = expandSourceColumnAliases(plan, columnsOf);
+  plan = expandNaturalJoins(plan, columnsOf);
+  plan = expandQualifiedWildcards(plan, columnsOf);
+  plan = expandDistinctWildcard(plan, columnsOf);
+  plan = unifyPlanGroupedReferences(plan, columnsOf);
+  validateGrouping(plan);
+  return plan;
 }
 
 /** Internal columnar entry point used after MinnowDatabase materializes a stable snapshot. */
@@ -8019,7 +8108,9 @@ function rewriteUpsertExpression(
   const rewrite = (node: Expression): Expression => {
     if (node.kind === "column") {
       const parts = node.reference.split(".");
-      if (parts.length === 1) return { ...node, reference: `${table}.${node.reference}` };
+      // Lowering resolves bare names itself (PostgreSQL: ambiguous with EXCLUDED, 42702).
+      if (parts.length === 1)
+        return recordDeclaredTypes ? node : { ...node, reference: `${table}.${node.reference}` };
       if (parts.length === 2 && parts[0]?.toUpperCase() === "EXCLUDED") {
         return { ...node, reference: `EXCLUDED.${parts[1] ?? ""}` };
       }
@@ -8968,7 +9059,9 @@ class Parser {
    */
   #castTargetLiteral(): Extract<Expression, { kind: "literal" }> {
     const start = this.#index;
-    const value = this.#castTarget();
+    const { value, ...declared } = this.#castTarget();
+    if (declared.declaredTypeName !== undefined || declared.declaredLength !== undefined)
+      return { kind: "literal", value, ...declared };
     if (value !== "datetime") return { kind: "literal", value };
     const words = this.tokens
       .slice(start, this.#index)
@@ -8978,8 +9071,15 @@ class Parser {
     return local ? { kind: "literal", value, timestamp: true } : { kind: "literal", value };
   }
 
-  /** A CAST target: the SqlColumnType, or "number-integer" for the truncating integer names. */
-  #castTarget(): string {
+  /**
+   * A CAST target: the SqlColumnType, or "number-integer" for the truncating integer names, and a
+   * numeric target's declared name under `compileWithDeclaredTypes`.
+   */
+  #castTarget(): {
+    value: string;
+    declaredTypeName?: DeclaredNumericTypeName;
+    declaredLength?: DeclaredTextLength;
+  } {
     const word = this.#identifier().toUpperCase();
     if (word === "NUMERIC" || word === "DECIMAL") {
       let precision: number | undefined;
@@ -8990,28 +9090,34 @@ class Parser {
         else scale = 0;
         this.#expectPunctuation(")");
       }
-      return `numeric:${precision === undefined ? "" : String(precision)}:${scale === undefined ? "" : String(scale)}`;
+      return {
+        value: `numeric:${precision === undefined ? "" : String(precision)}:${scale === undefined ? "" : String(scale)}`,
+      };
     }
     if (["JSON", "JSONB", "UUID", "DATE", "TIME", "INTERVAL"].includes(word)) {
       // `TIME WITH TIME ZONE` is the TIME domain: the zone tail is read with the type name.
       this.#multiWordTypeTail(word);
-      return word.toLowerCase();
+      return { value: word.toLowerCase() };
     }
     if (word === "DOUBLE") {
       this.#keyword("PRECISION");
-      return "number";
+      return { value: "number", ...declaredType(word) };
     }
     const mapped = createTableTypeNames.get(word);
     if (mapped === undefined) throw new TypeError(`Unsupported CAST target: ${word}`);
     const multiWord = this.#multiWordTypeTail(word);
+    let width: number | undefined;
     if (this.#punctuation("(")) {
-      this.#typeWidth();
+      width = this.#typeWidth();
       if (this.#punctuation(",")) this.#typeWidth();
       this.#expectPunctuation(")");
       // PostgreSQL writes a timestamp's precision before its zone: `TIMESTAMP(3) WITH TIME ZONE`.
       if (!multiWord && word === "TIMESTAMP") this.#multiWordTypeTail(word);
     }
-    return integerTypeNames.has(word) ? "number-integer" : mapped;
+    return {
+      value: integerTypeNames.has(word) ? "number-integer" : mapped,
+      ...declaredType(word, width, multiWord),
+    };
   }
 
   /**
@@ -9058,12 +9164,19 @@ class Parser {
     sqlDomain?: SqlDomain;
     withoutTimeZone?: true;
     serial?: true;
+    declaredTypeName?: DeclaredNumericTypeName;
+    declaredLength?: DeclaredTextLength;
   } {
     const declared = this.#identifier();
     const word = declared.toUpperCase();
     if (word === "SERIAL" || word === "BIGSERIAL" || word === "SMALLSERIAL") {
       // PostgreSQL's serial pseudo-types: an integer column fed by an auto-increment default.
-      return { type: "number", integer: true, serial: true };
+      return {
+        type: "number",
+        integer: true,
+        serial: true,
+        ...declaredType(word),
+      };
     }
     if (word === "NUMERIC" || word === "DECIMAL") {
       let precision: number | undefined;
@@ -9089,7 +9202,7 @@ class Parser {
     }
     if (word === "DOUBLE") {
       this.#keyword("PRECISION");
-      return { type: "number" };
+      return { type: "number", ...declaredType(word) };
     }
     const mapped = createTableTypeNames.get(word);
     if (mapped === undefined) {
@@ -9099,9 +9212,11 @@ class Parser {
     let zone = this.#timestampZoneTail(word);
     let multiWord = zone !== undefined || this.#multiWordTypeTail(word);
     // Character widths document intent and do not truncate values; neither does a timestamp's
-    // precision, since every datetime keeps its milliseconds.
+    // precision, since every datetime keeps its milliseconds. `FLOAT(p)` keeps p for its
+    // declared name only.
+    let width: number | undefined;
     if (this.#punctuation("(")) {
-      this.#typeWidth();
+      width = this.#typeWidth();
       if (this.#punctuation(",")) {
         throw new TypeError(`${word} takes one width`);
       }
@@ -9123,7 +9238,11 @@ class Parser {
       const zoned = word === "TIMESTAMPTZ" || zone === "with";
       return zoned ? { type: mapped } : { type: mapped, withoutTimeZone: true };
     }
-    return { type: mapped, ...(integerTypeNames.has(word) ? { integer: true } : {}) };
+    return {
+      type: mapped,
+      ...(integerTypeNames.has(word) ? { integer: true } : {}),
+      ...declaredType(word, width, multiWord),
+    };
   }
 
   parseMutation(keyword: "INSERT" | "UPDATE" | "DELETE"): CompiledStatement {
@@ -9686,6 +9805,13 @@ class Parser {
     // A bare placeholder stays a slot; the batch write binds it later. Placeholders nested in
     // arithmetic would need expression retention through the batch path, so they stay rejected.
     if (expression.kind === "parameter") return { parameter: expression.index };
+    // Lowering types every value itself: nothing is evaluated with the current engine's numbers.
+    if (
+      recordDeclaredTypes &&
+      expressionColumns(expression).length === 0 &&
+      !hasAggregate(expression)
+    )
+      return { expression: resolveStatementExpression(expression) };
     if (containsParameter(expression)) {
       throw new TypeError(`${label} take a bare ? placeholder or a constant expression`);
     }
@@ -10728,6 +10854,8 @@ class Parser {
           type: SqlColumnType;
           integer?: true;
           sqlDomain?: SqlDomain;
+          declaredTypeName?: DeclaredNumericTypeName;
+          declaredLength?: DeclaredTextLength;
           path: string;
         }> = [];
         for (;;) {
@@ -11290,7 +11418,7 @@ class Parser {
     if (this.#peek().kind === "parameter" && this.tokens[this.#index + 1]?.text === "::") {
       const parameter = this.#parameterExpression();
       this.#index += 1;
-      const target = this.#castTarget();
+      const { value: target, ...declared } = this.#castTarget();
       if (this.#peek().text !== "[") {
         throw new TypeError("An ANY/ALL placeholder cast names an array type, as in $1::int[]");
       }
@@ -11299,7 +11427,14 @@ class Parser {
       return {
         kind: "call",
         name: "CAST",
-        arguments: [parameter, { kind: "literal", value: target }],
+        arguments: [
+          parameter,
+          {
+            kind: "literal",
+            value: target,
+            ...declared,
+          },
+        ],
       };
     }
     return this.#additive();

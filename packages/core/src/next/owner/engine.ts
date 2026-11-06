@@ -5,7 +5,8 @@
  * timeout; the engine owns planning, execution, writes and storage.
  *
  * The composition root (owner/, Phase 2) implements `OwnerEngine` from:
- * - the front end + `Lowerer` (ir/lowering.ts), with a plan cache keyed by (text, catalog version);
+ * - the front end + `Lowerer` (lower/lowerer.ts), with a plan cache keyed by (text, catalog
+ *   version);
  * - the executor (B4, exec/executor.ts): `Executor.prepare(plan)` → `PreparedPlan.bind/execute`
  *   → `Execution`, whose `results` (exec/result.ts `ResultStream`) the server pulls as is;
  * - the write path (B3, access/write-path.ts): `WritePath.pin`, `begin` → `WriteTransaction`,

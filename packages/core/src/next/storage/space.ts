@@ -30,6 +30,7 @@ import {
 import {
   MAX_BLOB_BYTES,
   SpaceFailedError,
+  type WriteOptions,
   type BlobRef,
   type ByteBudget,
   type ExtentBuilder,
@@ -54,6 +55,9 @@ import { ExtentReservation, type SealPlan } from "./reservation.js";
 import { MAX_SLAB } from "./slabs.js";
 
 const alignDown = (value: number) => value - (value % DATA_ALIGN);
+
+/** A builder's own staging buffer, when its writer's budget grants one (measured on OPFS). */
+export const BUILDER_BUFFER_BYTES = 256 * 1024;
 
 /** A one-at-a-time lock over a shared buffer. */
 class Mutex {
@@ -290,9 +294,9 @@ class Space implements ExtentSpace {
 
   // ── Writing ──────────────────────────────────────────────────────────────────────────────────
 
-  beginWrite(label: string): ExtentWriter {
+  beginWrite(label: string, options: WriteOptions = {}): ExtentWriter {
     this.usable();
-    const writer = new Writer(this, label);
+    const writer = new Writer(this, label, options.budget ?? null);
     this.writers.add(writer);
     return writer;
   }
@@ -361,8 +365,54 @@ class Space implements ExtentSpace {
     }
   }
 
-  /** Copies `parts` into the slab after `builder`'s bytes, writing as the slab fills. */
+  /**
+   * Writes everything in a builder's own buffer: when it is full (its size is a multiple of
+   * `DATA_ALIGN`, so every flush but the last ends on a sector boundary and nothing partial is
+   * left) and at seal. A write error belongs to the builder.
+   */
+  async flushOwn(builder: Builder): Promise<void> {
+    const own = builder.own;
+    if (own === null || own.length === 0) return;
+    try {
+      let done = 0;
+      for (const piece of builder.reservation.pieces(own.start, own.length)) {
+        await this.sessionWrite(piece.offset, own.buffer.subarray(done, done + piece.length));
+        done += piece.length;
+      }
+    } catch (error) {
+      builder.failure ??= error instanceof Error ? error : new Error(String(error));
+      return;
+    }
+    own.start += own.length;
+    own.length = 0;
+  }
+
+  /** Copies `parts` into the builder's own buffer, writing its aligned prefix as it fills. */
+  async #stageOwn(
+    builder: Builder,
+    own: NonNullable<Builder["own"]>,
+    parts: readonly Uint8Array[],
+  ): Promise<void> {
+    for (const part of parts) {
+      let done = 0;
+      while (done < part.length) {
+        const take = Math.min(part.length - done, own.buffer.length - own.length);
+        own.buffer.set(part.subarray(done, done + take), own.length);
+        own.length += take;
+        done += take;
+        if (own.length === own.buffer.length) await this.flushOwn(builder);
+        if (builder.failure !== null) throw builder.failure;
+      }
+      builder.written += part.length;
+    }
+  }
+
+  /**
+   * Copies `parts` into the builder's own buffer, or else into the shared slab after the
+   * builder's bytes, writing as either fills.
+   */
   async stage(builder: Builder, parts: readonly Uint8Array[]): Promise<void> {
+    if (builder.own !== null) return this.#stageOwn(builder, builder.own, parts);
     if (this.staged !== null && this.staged.builder !== builder) await this.flushStaged(false);
     if (this.staged === null) {
       const tail = builder.tail ?? new Uint8Array(0);
@@ -603,9 +653,13 @@ class Writer implements ExtentWriter {
   busy = 0;
   readonly #idle: Array<() => void> = [];
 
-  constructor(space: Space, label: string) {
+  /** Charged for each builder's own staging buffer; null: builders share the space's slab. */
+  readonly budget: ByteBudget | null;
+
+  constructor(space: Space, label: string, budget: ByteBudget | null) {
     this.space = space;
     this.label = label;
+    this.budget = budget;
   }
 
   get extents(): readonly ExtentRef[] {
@@ -639,6 +693,10 @@ class Writer implements ExtentWriter {
     if (!(Number.isSafeInteger(capacity) && capacity > 0))
       throw new RangeError("A builder needs a positive capacity");
     const builder = new Builder(this, new ExtentReservation(this.space.map, capacity));
+    // Its own staging buffer when the budget grants one: no larger than the builder needs.
+    const size = Math.min(BUILDER_BUFFER_BYTES, this.space.map.sizeOf(capacity));
+    if (this.budget?.allocate(size) === true)
+      builder.own = { buffer: new Uint8Array(size), start: 0, length: 0 };
     this.builders.add(builder);
     return builder;
   }
@@ -705,6 +763,8 @@ class Builder implements ExtentBuilder {
   written = 0;
   /** The partial last sector, kept while another builder holds the slab. */
   tail: Uint8Array | null = null;
+  /** Its own staging buffer (charged to the writer's budget), from aligned logical `start`. */
+  own: { readonly buffer: Uint8Array; start: number; length: number } | null = null;
   failure: Error | null = null;
   readonly #pending: PendingBlob[] = [];
   #state: "open" | "sealed" = "open";
@@ -731,8 +791,16 @@ class Builder implements ExtentBuilder {
     if (this.failure !== null) throw this.failure;
   }
 
+  /** Returns the own staging buffer to the writer's budget. */
+  releaseBuffer(): void {
+    if (this.own === null) return;
+    this.writer.budget?.free(this.own.buffer.length);
+    this.own = null;
+  }
+
   /** Everything this builder holds, for its writer's abort. */
   abandon(): DataRange[] {
+    this.releaseBuffer();
     if (this.#leftover !== null) return this.#leftover;
     return this.reservation.abort();
   }
@@ -789,6 +857,7 @@ class Builder implements ExtentBuilder {
       if (this.#length === 0) {
         const ranges = await space.writeLock.run(async () => {
           if (space.staged?.builder === this) space.staged = null;
+          this.releaseBuffer();
           const reserved = this.reservation.abort();
           this.writer.sealed(this, null);
           return reserved;
@@ -800,7 +869,9 @@ class Builder implements ExtentBuilder {
       try {
         plan = await space.writeLock.run(async () => {
           if (space.staged?.builder === this) await space.flushStaged(false);
+          await space.flushOwn(this);
           if (this.failure !== null) throw this.failure;
+          this.releaseBuffer();
           const sealed = this.reservation.seal(this.#length);
           this.#leftover = [
             { offset: sealed.extent.offset, length: space.map.sizeOf(sealed.extent.length) },

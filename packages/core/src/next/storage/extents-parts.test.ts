@@ -110,10 +110,16 @@ describe("free space map", () => {
         // Live extents and free runs tile [0, end) exactly: no overlap, no leak.
         let cursor = 0;
         for (const range of owned) {
-          expect(range.start).toBe(cursor);
+          if (range.start !== cursor)
+            expect.fail(
+              `step ${String(step)}: space at ${String(cursor)} is ${range.start > cursor ? "lost" : "handed out twice"}`,
+            );
           cursor = range.end;
         }
-        expect(cursor).toBe(map.end);
+        if (cursor !== map.end)
+          expect.fail(
+            `step ${String(step)}: tiles end at ${String(cursor)}, not ${String(map.end)}`,
+          );
       }
     },
   );

@@ -131,7 +131,15 @@
  * 32). When another builder appends, the slab is written out and the partial last sector
  * (< 4 KiB, since the store writes at `DATA_ALIGN` offsets) is kept with its builder; so
  * builders that alternate page by page cost one platform write per page, plus at most one
- * rewritten sector per switch.
+ * rewritten sector per switch. That costs 2–9× a commit's flush time for a 200-column group on
+ * Chromium and Firefox (measured on OPFS), so a writer that interleaves builders passes a
+ * `budget` to `beginWrite`: each builder then stages up to 256 KiB of its own (charged to the
+ * budget until its seal or abort) and writes its aligned prefix as that fills. Measured on OPFS
+ * (200 columns × 8 pages of 32 KiB): own buffers bring Chromium and WebKit to parity with
+ * sequential writes; Firefox stays ~18% over sequential (its per-call cost). Accepted (lead
+ * ruling, 2026-11-05): larger per-column batching would break the page writer's ≤ 16 MiB
+ * working-set target for 200 columns; revisit only if the browser perf lane shows flush cost
+ * mattering end to end.
  *
  * ## Async, cancellation, errors
  * - Methods that touch storage are async; everything else (`beginWrite`, `open`, `pin`, `peek`,
@@ -376,6 +384,15 @@ export interface ExtentBuilder {
 
 // ── The space ──────────────────────────────────────────────────────────────────────────────────
 
+/** Options of `beginWrite` (an additive change after the Phase 1 freeze). */
+export interface WriteOptions {
+  /**
+   * Charged for each builder's own staging buffer (up to 256 KiB, no more than the builder's
+   * capacity), returned at its seal or abort. A builder the budget refuses uses the shared slab.
+   */
+  readonly budget?: ByteBudget;
+}
+
 export interface PublishChange {
   /** Every writer whose extents the new root reaches: all of their sealed extents, no builder open. */
   readonly writers: readonly ExtentWriter[];
@@ -421,8 +438,11 @@ export interface ExtentSpace extends ExtentReader {
   readonly failed: Error | null;
   readonly stats: SpaceStats;
 
-  /** A new open writer. `SpaceFailedError` if the space failed. */
-  beginWrite(label: string): ExtentWriter;
+  /**
+   * A new open writer. `SpaceFailedError` if the space failed. With `options.budget`, each of its
+   * builders asks the budget for its own staging buffer (see "Memory").
+   */
+  beginWrite(label: string, options?: WriteOptions): ExtentWriter;
   /** Atomically and durably makes `root` current; returns its generation. See "Publish". */
   publish(root: Uint8Array, change: PublishChange): Promise<number>;
   /**

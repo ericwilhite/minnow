@@ -117,7 +117,8 @@ These rulings follow the storage probe of 2026-11-05.
     Safari bfcache.
   - The owner does not step down on every visibility change.
 - **Files.**
-  - A few long-lived files (log, data, two root slots, spill), opened at acquisition and kept open.
+  - A few long-lived files (log, data, two root slots, spill, epoch), opened at acquisition and kept
+    open.
   - Space is reused inside them; only a free tail is truncated.
   - Never create or delete files per object: quota is not returned on truncate (Chromium, WebKit),
     and WebKit's IndexedDB cannot reuse space freed by deleting OPFS files.
