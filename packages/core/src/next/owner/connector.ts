@@ -27,8 +27,11 @@
  * - `stepDown` from the owner: reconnect, or stop when superseded.
  * - A watch only sees an owner's absence, not its replacement: a client whose owner died while
  *   it was idle (no watch) keeps a dead port, and its next request's watch queues behind the
- *   successor's live host lock. So a new owner announces itself on the database's
- *   BroadcastChannel and a connected client of another owner reconnects at once, idle or not.
+ *   successor's live host lock. So a new owner announces itself, with its fence epoch, on the
+ *   database's BroadcastChannel. A connected client acts on an epoch above its owner's, once the
+ *   host lock confirms its owner no longer holds it, and reconnects at once, idle or not.
+ * - Rediscovery that finds the very owner it is still connected to resumes that connection: a
+ *   new generation would end the old one and roll its transactions back.
  * - Backstop (a missed announcement, a hung port): with requests in flight and nothing heard for
  *   `SILENCE_DEADLINE_MS`, the connector compares the host lock's holder with its owner's
  *   (`Welcome.lockHolder`). The same: alive and only slow (throttled, or a WebKit owner running a
@@ -59,6 +62,7 @@ import {
   compareProtocol,
   hostLockName,
   lifecycleAction,
+  openChannel,
   skewChannelName,
   type BrokerMessage,
   type HostContext,
@@ -157,12 +161,10 @@ export class OwnerConnector {
   constructor(options: ConnectorOptions) {
     this.#options = options;
     this.#announcements =
-      options.announcements === false || typeof BroadcastChannel === "undefined"
-        ? null
-        : new BroadcastChannel(skewChannelName(options.database));
+      options.announcements === false ? null : openChannel(skewChannelName(options.database));
     if (this.#announcements !== null)
       this.#announcements.onmessage = (event: MessageEvent) => {
-        this.#announced(event.data as SkewSignal);
+        void this.#announced(event.data as SkewSignal);
       };
     this.#closedWait = new Promise<never>((_, reject) => {
       this.#rejectClosed = reject;
@@ -269,6 +271,15 @@ export class OwnerConnector {
           ? ({ t: "noOwner" } as const)
           : await this.#untilClosed(this.#ask());
       if (answer.t === "port") {
+        // The same live owner we are still connected to (D1 b): resume, never a new generation,
+        // which would end the old one and roll its transactions back.
+        if (answer.ownerId === this.#client.ownerId && this.#client.connected) {
+          answer.port.postMessage({ t: "bye" });
+          answer.port.close();
+          this.#status = "connected";
+          this.#activity();
+          return;
+        }
         if (await this.#attach(answer.port)) return;
         continue;
       }
@@ -432,7 +443,7 @@ export class OwnerConnector {
   }
 
   #ask(): Promise<
-    | { readonly t: "port"; readonly port: MessagePort }
+    | { readonly t: "port"; readonly port: MessagePort; readonly ownerId: string }
     | { readonly t: "noOwner" }
     | { readonly t: "unreachable" }
   > {
@@ -441,7 +452,8 @@ export class OwnerConnector {
     return new Promise((resolve, reject) => {
       this.#brokerReplies.set(nonce, {
         reply: (message) => {
-          if (message.t === "port") resolve({ t: "port", port: message.port });
+          if (message.t === "port")
+            resolve({ t: "port", port: message.port, ownerId: message.ownerId });
           else if (message.t === "unreachable") resolve({ t: "unreachable" });
           else resolve({ t: "noOwner" });
         },
@@ -472,16 +484,16 @@ export class OwnerConnector {
   // ---- skew ----
 
   #supersedeOlderOwner(): void {
-    if (typeof BroadcastChannel === "undefined") return;
-    const channel = new BroadcastChannel(skewChannelName(this.#options.database));
+    const channel = openChannel(skewChannelName(this.#options.database));
+    if (channel === null) return;
     channel.postMessage({ t: "supersede", protocol: this.#client.protocol } satisfies SkewSignal);
     channel.close();
   }
 
   /** Asks who owns; supersedes an older owner, or is superseded by a newer one. */
   async #settleSkew(): Promise<void> {
-    if (typeof BroadcastChannel === "undefined") return;
-    const channel = new BroadcastChannel(skewChannelName(this.#options.database));
+    const channel = openChannel(skewChannelName(this.#options.database));
+    if (channel === null) return;
     const owner = await new Promise<number | null>((resolve) => {
       const timer = setTimeout(() => {
         resolve(null);
@@ -528,10 +540,23 @@ export class OwnerConnector {
   }
 
   /** An owner announced itself (host.ts). Not ours: ours was replaced; reconnect and resend. */
-  #announced(signal: SkewSignal): void {
-    if (signal.t !== "owner" || this.#status !== "connected") return;
+  /**
+   * An owner announced itself (host.ts). A hint, never proof (B5-p2d review 1, D1): only an epoch
+   * above our owner's counts, and then only once the host lock confirms our owner no longer holds
+   * it. A stale, repeated or forged announcement leaves a live connection, and its transactions,
+   * alone.
+   */
+  async #announced(signal: SkewSignal): Promise<void> {
+    if (signal.t !== "owner" || !this.#isConnected()) return;
     const current = this.#client.ownerId;
     if (current === null || signal.ownerId === current) return;
+    if ((signal.epoch ?? 0) <= this.#client.ownerEpoch) return;
+    const generation = this.#client.generation;
+    const owner = this.#client.ownerLockHolder;
+    const holder = await this.#hostHolder();
+    if (!this.#isConnected() || this.#client.generation !== generation) return;
+    // Our owner still holds the host lock: the announcement is stale or forged.
+    if (owner !== null && owner !== "" && holder === owner) return;
     this.#ownerLeft("closing");
   }
 
@@ -570,9 +595,10 @@ export class OwnerConnector {
       return;
     }
     const owner = this.#client.ownerLockHolder;
+    const generation = this.#client.generation;
     const holder = await this.#hostHolder();
-    // The connection may have changed while the query ran.
-    if (!this.#isConnected()) {
+    // The connection may have changed while the query ran (D1 d): same connection only.
+    if (!this.#isConnected() || this.#client.generation !== generation) {
       this.#silenceTimer = null;
       return;
     }

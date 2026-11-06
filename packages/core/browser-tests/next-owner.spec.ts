@@ -13,7 +13,9 @@ type Run = typeof import("../browser/next-owner/run.js");
 const RUN = "/packages/core/browser/next-owner/run.ts";
 
 async function tab(page: Page): Promise<Page> {
-  await page.goto("/packages/core/browser/");
+  // A blank page of the origin: the library's test page (/packages/core/browser/) loads the
+  // whole current engine through the dev server on every navigation, seconds per tab in Firefox.
+  await page.goto("/packages/core/browser/next-owner/blank.html");
   return page;
 }
 

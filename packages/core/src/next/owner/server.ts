@@ -253,6 +253,11 @@ export class OwnerServer {
         connection.end("reconnected");
   }
 
+  /** Every connection sends `alive` if it is overdue (`Connection.aliveIfOverdue`). */
+  aliveIfOverdue(): void {
+    for (const connection of this.#connections) connection.aliveIfOverdue();
+  }
+
   dropped(connection: Connection): void {
     this.#connections.delete(connection);
   }
@@ -282,6 +287,7 @@ class Connection {
   readonly #queued = new Map<number, { cancelled: boolean; close: boolean }>();
   readonly #streams = new Map<number, Stream>();
   #aliveTimer: ReturnType<typeof setInterval> | null = null;
+  #lastPostAt = 0;
   #sweepTimer: ReturnType<typeof setInterval> | null = null;
   #watch: { readonly gone: AbortSignal; stop(): void } | null = null;
   #watchIdle: ReturnType<typeof setTimeout> | null = null;
@@ -304,13 +310,27 @@ class Connection {
    */
   post(message: OwnerMessage, transfer: ArrayBuffer[] = []): void {
     if (this.#state === "closed") return;
+    this.#lastPostAt = this.#server.now();
     this.#port.postMessage(message, transfer.length === 0 ? transfer : transferFor(transfer));
+  }
+
+  /**
+   * Sends `alive` now if this connection has requests running and has been sent nothing for an
+   * alive interval. Called on the request path (any incoming message), not only by the interval
+   * timer: a busy owner whose timers do not run (WebKit, while a long statement yields through
+   * message tasks) still says it is alive whenever it handles anything.
+   */
+  aliveIfOverdue(): void {
+    if (this.#state !== "open" || this.#running.size === 0) return;
+    const interval = this.#server.options.aliveIntervalMs ?? ALIVE_INTERVAL_MS;
+    if (this.#server.now() - this.#lastPostAt >= interval) this.post({ t: "alive" });
   }
 
   // ---- incoming ----
 
   receive(data: unknown): void {
     if (this.#state === "closed") return;
+    this.#server.aliveIfOverdue();
     let message: ClientMessage;
     try {
       message = parseClientMessage(data);
@@ -319,6 +339,11 @@ class Connection {
       return;
     }
     if (this.#state === "handshake") {
+      // A client that found it already had a connection to this owner leaves without one.
+      if (message.t === "bye") {
+        this.end("bye");
+        return;
+      }
       if (message.t !== "hello") {
         this.#protocolFailure(data, new ProtocolError("The first message must be hello"));
         return;
@@ -1087,6 +1112,8 @@ class Connection {
         if (frame === undefined) {
           flush();
           frame = await run.results.next();
+          // The frame path: other clients' connections may be owed an `alive` by now.
+          this.#server.aliveIfOverdue();
         }
         if (frame === null) break;
         if (this.#state === "closed") {

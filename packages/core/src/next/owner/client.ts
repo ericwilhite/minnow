@@ -218,6 +218,7 @@ export class ProtocolClient {
   #generation = 0;
   #ownerId: string | null = null;
   #ownerLockHolder: string | null = null;
+  #ownerEpoch = 0;
   #lastHeardAt = 0;
   #welcome: { resolve: (welcome: Welcome) => void; reject: (error: Error) => void } | null = null;
   #prepared = 0;
@@ -264,6 +265,11 @@ export class ProtocolClient {
   /** The current owner's id (`Welcome.ownerId`), or null before the first welcome. */
   get ownerId(): string | null {
     return this.#ownerId;
+  }
+
+  /** The current owner's fence epoch (`Welcome.epoch`), 0 before the first welcome. */
+  get ownerEpoch(): number {
+    return this.#ownerEpoch;
   }
 
   /** The Web Locks client id holding the current owner's host lock, if the owner said. */
@@ -733,6 +739,7 @@ export class ProtocolClient {
       case "welcome": {
         this.#ownerId = message.ownerId;
         this.#ownerLockHolder = message.lockHolder;
+        this.#ownerEpoch = message.epoch;
         const welcome = this.#welcome;
         this.#welcome = null;
         // Before any resend or new request: the owner watches the lock only once announced.

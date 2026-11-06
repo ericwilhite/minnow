@@ -716,8 +716,13 @@ and the owner import it directly.
   bounded (`HANDSHAKE_TIMEOUT_MS`, 5 s); either way the connector starts over. The broker holds a
   client's port only until the next registration of a database it asked about.
 - A client learns that its owner was replaced even while idle: a new owner announces itself on
-  the database's BroadcastChannel (`{t: "owner", ownerId}`), and a connected client of another
-  owner reconnects and resends at once. Without it, an idle client kept its dead owner's port
+  the database's BroadcastChannel (`{t: "owner", ownerId, epoch}`, the fence epoch, strictly
+  increasing). An announcement is a hint: a client acts only on an epoch above its owner's, and
+  only after the host lock shows its owner no longer holds it; then it reconnects and resends.
+  A stale, repeated or forged one changes nothing. Rediscovery that finds the same live owner
+  resumes the connection instead of starting a generation (which would roll its transactions
+  back). Without a usable BroadcastChannel (absent, or a constructor that throws) there are no
+  announcements, only the backstop. Without it, an idle client kept its dead owner's port
   (a port does not report its other end's death) and its next request waited forever.
 - The backstop is a silence deadline, `SILENCE_DEADLINE_MS` = 2.5 s (2.5 × `ALIVE_INTERVAL_MS`):
   a client with requests in flight that hears nothing for that long compares the host lock's
@@ -727,7 +732,10 @@ and the owner import it directly.
   at-least-once and writes go through the ledger, as on any reconnect. Measured `alive` gaps
   (headless Playwright, visible tabs; no engine here can hide a tab): Chromium and Firefox about
   1.0 s, at most 1.04 s; WebKit sends none while the owner runs a long statement, which the lock
-  confirmation covers.
+  confirmation covers. The owner also sends an overdue `alive` whenever it handles a message or
+  posts a frame, not only from its timer: in WebKit a worker whose work yields through message
+  tasks runs no timers at all until it stops (a strict commit beside a long statement waited
+  1.8 s for its flush timer), which the executor's yield (exec/pipeline.ts `yieldTask`) must fix.
 - `freeze` (on the document) and `pagehide` terminate the owner without calling back into the
   page: Firefox can abandon a closing page's handler midway, and the `hidden` that follows must
   then find no live owner to flush.

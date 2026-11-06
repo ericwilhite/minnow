@@ -158,8 +158,11 @@
  *   `ALIVE_INTERVAL_MS`. The client's deadline counts silence, not wall time:
  *   `SILENCE_DEADLINE_MS` without a message, it checks the host lock's holder against
  *   `Welcome.lockHolder`, and reconnects and resends only if the owner is no longer the holder.
- * - A new owner announces itself on the database's BroadcastChannel (`{ t: "owner", ownerId }`):
- *   a connected client of another owner reconnects at once, idle or not.
+ * - A new owner announces itself on the database's BroadcastChannel (`{ t: "owner", ownerId,
+ *   epoch }`, its fence epoch). A hint: a connected client acts on it only if the epoch is above
+ *   its owner's (`Welcome.epoch`) and the host lock no longer shows its owner's holder; then it
+ *   reconnects at once, idle or not. Rediscovering the same live owner resumes the connection.
+ * - The owner sends an overdue `alive` from the request and frame paths too, not only its timer.
  *
  * ## Version skew
  * - `PROTOCOL_VERSION` changes with any change to these messages or to frame.ts. The owner refuses

@@ -23,8 +23,54 @@ import {
 import type { ChunkReads } from "../../dist/next/exec/scan.js";
 
 type Fence =
-  | { readonly kind: "opfs"; readonly db: string; readonly handle: FileSystemSyncAccessHandle }
-  | { readonly kind: "idb"; readonly db: string; readonly idb: IDBDatabase };
+  | {
+      readonly kind: "opfs";
+      readonly db: string;
+      readonly handle: FileSystemSyncAccessHandle;
+      readonly epoch: number;
+    }
+  | {
+      readonly kind: "idb";
+      readonly db: string;
+      readonly idb: IDBDatabase;
+      readonly epoch: number;
+    };
+
+/** Bumps and returns the database's fence epoch in OPFS, under the fence (its own small file). */
+async function bumpOpfsEpoch(root: FileSystemDirectoryHandle, db: string): Promise<number> {
+  const file = await root.getFileHandle(`${FILE_PREFIX}${db}.epoch`, { create: true });
+  const handle = await file.createSyncAccessHandle();
+  try {
+    const bytes = new Float64Array(1);
+    if (handle.getSize() >= 8) handle.read(new Uint8Array(bytes.buffer), { at: 0 });
+    bytes[0] = (bytes[0] ?? 0) + 1;
+    handle.write(new Uint8Array(bytes.buffer), { at: 0 });
+    handle.flush();
+    return bytes[0];
+  } finally {
+    handle.close();
+  }
+}
+
+/** Bumps and returns the database's fence epoch in IndexedDB, in one readwrite transaction. */
+function bumpIdbEpoch(idb: IDBDatabase): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const transaction = idb.transaction("file", "readwrite", { durability: "strict" });
+    const store = transaction.objectStore("file");
+    let epoch = 0;
+    const read = store.get("epoch");
+    read.onsuccess = () => {
+      epoch = (typeof read.result === "number" ? read.result : 0) + 1;
+      store.put(epoch, "epoch");
+    };
+    transaction.oncomplete = () => {
+      resolve(epoch);
+    };
+    transaction.onerror = () => {
+      reject(transaction.error ?? new Error("IndexedDB epoch bump failed"));
+    };
+  });
+}
 
 const FILE_PREFIX = "minnow-next-standin-";
 const encoder = new TextEncoder();
@@ -74,10 +120,14 @@ const factory: OwnerEngineFactory<Fence> = {
     if (typeof navigator.storage?.getDirectory === "function") {
       const root = await navigator.storage.getDirectory();
       const file = await root.getFileHandle(`${FILE_PREFIX}${db}`, { create: true });
-      return { kind: "opfs", db, handle: await file.createSyncAccessHandle() };
+      const handle = await file.createSyncAccessHandle();
+      // The state file's handle is the fence: the epoch is bumped only while holding it.
+      return { kind: "opfs", db, handle, epoch: await bumpOpfsEpoch(root, db) };
     }
-    return { kind: "idb", db, idb: await openIdb(db) };
+    const idb = await openIdb(db);
+    return { kind: "idb", db, idb, epoch: await bumpIdbEpoch(idb) };
   },
+  epochOf: (fence) => fence.epoch,
   closeFence(fence) {
     if (fence.kind === "opfs") fence.handle.close();
     else fence.idb.close();
