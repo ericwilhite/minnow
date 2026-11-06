@@ -23,7 +23,7 @@ import {
   jsonReachable,
 } from "../src/next/storage/space-test-support.js";
 import { ScratchSpillService } from "../src/next/spill/scratch-spill.js";
-import { identity, runChaos, type ChaosExpect } from "./next-storage-chaos.js";
+import { identity, runChaos, type ChaosExpect, type ChaosInjection } from "./next-storage-chaos.js";
 
 /** Which backend an operation runs on (OPFS by default). */
 export type StoreKind = "opfs" | "indexeddb";
@@ -72,6 +72,7 @@ export type NextStorageRequest = { readonly store?: StoreKind } & (
       readonly dir: string;
       readonly seed: number;
       readonly expect: ChaosExpect | null;
+      readonly inject?: ChaosInjection;
     }
 );
 
@@ -700,17 +701,34 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
     }
     case "microbench":
       return microbench(request.dir);
-    case "chaos":
-      return runChaos(request.dir, request.seed, request.expect, {
-        backendFor,
-        post: (message) => {
-          scope.postMessage(message);
+    case "chaos": {
+      const port = chaosPort;
+      if (port === null) throw new Error("no chaos channel");
+      // A failure goes out on the campaign's channel too: a worker killed just after it still
+      // delivers it there (the request's own reply may never leave a terminated worker).
+      return runChaos(
+        request.dir,
+        request.seed,
+        request.expect,
+        {
+          backendFor,
+          post: (message) => {
+            port.postMessage(message);
+          },
+          go: (sequence) =>
+            new Promise<void>((resolve) => {
+              goes.set(sequence, resolve);
+            }),
         },
-        go: (sequence) =>
-          new Promise<void>((resolve) => {
-            goes.set(sequence, resolve);
-          }),
+        request.inject ?? null,
+      ).catch((error: unknown) => {
+        port.postMessage({
+          chaos: "failure",
+          message: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+        });
+        throw error;
       });
+    }
     case "heavy-close": {
       const state = heavyState();
       await state.opened.space.close().catch(() => undefined);
@@ -739,14 +757,23 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
   }
 }
 
-/** The page's answers to chaos intents (next-storage-chaos.ts). */
+/**
+ * The page's answers to chaos intents (next-storage-chaos.ts), on the campaign's own channel:
+ * what the worker posted on it before being killed still reaches the page.
+ */
 const goes = new Map<number, () => void>();
+let chaosPort: MessagePort | null = null;
 
 scope.addEventListener("message", (event: MessageEvent<unknown>) => {
-  const go = (event.data as { go?: number }).go;
-  if (go !== undefined) {
-    goes.get(go)?.();
-    goes.delete(go);
+  const port = (event.data as { chaosPort?: MessagePort }).chaosPort;
+  if (port !== undefined) {
+    chaosPort = port;
+    port.onmessage = (message: MessageEvent<{ go?: number }>) => {
+      const go = message.data.go;
+      if (go === undefined) return;
+      goes.get(go)?.();
+      goes.delete(go);
+    };
     return;
   }
   const { id, request } = event.data as { id: number; request: NextStorageRequest };

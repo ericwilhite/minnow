@@ -211,12 +211,17 @@ is access's `Snapshot`.
   headroom by `estimate()`, so the run records where the refusal came rather than assuming it.
 - Kill campaign (Gate A, `browser/next-storage-chaos.ts`): a worker runs a seeded random workload
   (builders, publish, retire and reclaim, log append, flush, truncate and reset, spill) and is
-  killed at seeded random moments (`worker.terminate()`, sometimes a page close); the next worker
-  reopens, checks the acknowledged root and every acknowledged log byte, audits exactly, and
-  carries on. The worker announces each step and waits for the page's go, so the page always
-  knows the acknowledged state and the one step in flight. 50 kills per store and browser in the
+  killed at seeded moments (`worker.terminate()`, sometimes a page close); the next worker reopens,
+  checks the acknowledged root and every acknowledged log byte, audits exactly, and carries on. The
+  worker announces each step and waits for the page's go, and posts when the step's storage work
+  begins and returns, on its own channel; after a kill the page drains what the worker posted, so
+  it knows every acknowledgement and whether the kill landed before, inside or after the storage
+  work. A page close takes its expectation at the close (the page processes nothing after it). Any
+  failure the workload reports, at any time, fails the campaign. On IndexedDB kills land inside
+  each phase's storage work; OPFS's storage calls are synchronous, so kills land at their edges
+  and the simulated physical crash sweeps cover the inside. 50 kills per store and browser in the
   browser lane, 1,000 per store in Chromium nightly (`npm run test:storage-kills`), with declared
-  reach (`STORAGE_KILL_REACH`). `npm run benchmark:storage` records the
+  reach (`STORAGE_KILL_REACH`, `STORAGE_KILL_EDGE_REACH`). `npm run benchmark:storage` records the
   storage microbench nightly (docs: reference/testing).
 - `select.ts` (`chooseBackend`) picks OPFS where a dedicated worker can open sync handles, else
   IndexedDB only on the private modes' refusals (`SecurityError`, `UnknownError`,

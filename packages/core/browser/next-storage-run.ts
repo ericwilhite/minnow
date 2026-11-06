@@ -6,6 +6,7 @@ import { column, schema, table } from "@minnowdb/core";
 import { MinnowDatabaseClient } from "@minnowdb/core/client";
 import type {
   ChaosExpect,
+  ChaosInjection,
   ChaosIntent,
   ChaosMessage,
   ChaosRecovery,
@@ -35,9 +36,7 @@ interface StorageWorker {
    * failure when it does not within `ms` (a stalled or failed publisher fails the test).
    */
   until(ready: () => boolean, what: string, ms?: number): Promise<void>;
-  /** Receives every chaos message (next-storage-chaos.ts). */
-  onChaos(listener: (message: ChaosMessage) => void): void;
-  post(message: unknown): void;
+  post(message: unknown, transfer?: Transferable[]): void;
   terminate(): void;
 }
 
@@ -54,7 +53,6 @@ async function spawn(): Promise<StorageWorker> {
   let terminated = false;
   /** Waiters checked on every progress message, so no phase can slip by between polls. */
   const watchers = new Set<() => void>();
-  let chaosListener: ((message: ChaosMessage) => void) | null = null;
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => {
       reject(new Error("storage worker did not start"));
@@ -63,10 +61,6 @@ async function spawn(): Promise<StorageWorker> {
       if (event.data === "next-storage-ready") {
         clearTimeout(timer);
         resolve();
-        return;
-      }
-      if (typeof event.data === "object" && event.data !== null && "chaos" in event.data) {
-        chaosListener?.(event.data as ChaosMessage);
         return;
       }
       const data = event.data as {
@@ -153,16 +147,14 @@ async function spawn(): Promise<StorageWorker> {
         check();
       });
     },
-    onChaos(listener) {
-      chaosListener = listener;
-    },
-    post(message) {
-      worker.postMessage(message);
+    post(message, transfer = []) {
+      worker.postMessage(message, transfer);
     },
     terminate() {
       terminated = true;
       worker.terminate();
-      for (const waiter of pending.values()) waiter.reject(new Error("terminated"));
+      for (const waiter of pending.values())
+        waiter.reject(Object.assign(new Error("terminated"), { name: "WorkerTerminated" }));
       pending.clear();
     },
   };
@@ -462,26 +454,37 @@ async function spawnForChaos(): Promise<StorageWorker> {
     }
 }
 
+/**
+ * Where a kill landed, from the messages the worker posted before it died (drained after the
+ * kill): `between` (no step in flight), or for the step in flight `before-<step>` (it had its go
+ * but had not begun its storage work), `in-<step>` (it had begun and not finished: the kill
+ * landed inside storage) or `after-<step>` (its storage work had returned; its end was not yet
+ * posted).
+ */
 export interface KillLanding {
-  /**
-   * Where the worker was when it was killed, as the page saw it: `mid-<step>` (that step had its
-   * go and had not reported done) or `between` (no step in flight). For a page kill, the step
-   * that was in flight when the page stopped answering (it lands there or just after).
-   */
   readonly landed: string;
-  /** What the next worker is told. */
+  /** What the next worker is told: every acknowledgement the page received, the step in flight. */
   readonly expect: ChaosExpect;
 }
 
 interface ChaosRun {
   readonly worker: StorageWorker;
+  /** The campaign's own channel: what the worker posted before it died still arrives. */
+  readonly port: MessagePort;
   state: ChaosState | null;
-  inFlight: ChaosIntent | null;
-  /** Answers no more intents (a page kill was handed back). */
+  /** Steps announced and not yet done, by sequence. */
+  readonly inFlight: Map<number, ChaosIntent>;
+  /** Steps whose storage work began, and those whose storage work returned. */
+  readonly began: Set<number>;
+  readonly settled: Set<number>;
+  /** Answers no more intents (a page kill is armed). */
   hold: boolean;
+  /** The first failure the workload reported (a corruption, an error), whenever it came. */
   failure: Error | null;
   recovered: ChaosRecovery | null;
   armed: { target: ChaosStep; remaining: number; fire: (intent: ChaosIntent) => void } | null;
+  /** When the last message arrived (draining after a kill). */
+  lastMessage: number;
 }
 
 let chaos: ChaosRun | null = null;
@@ -495,29 +498,39 @@ export async function chaosBegin(
   dir: string,
   seed: number,
   expect: ChaosExpect | null,
+  inject: ChaosInjection | null = null,
 ): Promise<ChaosRecovery> {
   useStore(kind);
   const worker = await spawnForChaos();
+  const channel = new MessageChannel();
   const run: ChaosRun = {
     worker,
+    port: channel.port1,
     state: expect?.state ?? null,
-    inFlight: null,
+    inFlight: new Map(),
+    began: new Set(),
+    settled: new Set(),
     hold: false,
     failure: null,
     recovered: null,
     armed: null,
+    lastMessage: performance.now(),
   };
   chaos = run;
-  worker.onChaos((message) => {
+  channel.port1.onmessage = (event: MessageEvent<ChaosMessage>) => {
+    const message = event.data;
+    run.lastMessage = performance.now();
     if (message.chaos === "recovered") {
       run.recovered = message.recovery;
       run.state = message.recovery.state;
     } else if (message.chaos === "ack") run.state = message.state;
-    else if (message.chaos === "done") {
-      if (run.inFlight?.sequence === message.sequence) run.inFlight = null;
-    } else {
-      if (run.hold) return; // the worker waits here until it is killed
-      run.inFlight = message.intent;
+    else if (message.chaos === "failure") run.failure ??= new Error(message.message);
+    else if (message.chaos === "began") run.began.add(message.sequence);
+    else if (message.chaos === "settled") run.settled.add(message.sequence);
+    else if (message.chaos === "done") run.inFlight.delete(message.sequence);
+    else {
+      if (run.hold) return; // armed for a page close: nothing new starts
+      run.inFlight.set(message.intent.sequence, message.intent);
       const armed = run.armed;
       if (armed !== null && armed.target === message.intent.step) {
         armed.remaining -= 1;
@@ -527,12 +540,17 @@ export async function chaosBegin(
           return;
         }
       }
-      worker.post({ go: message.intent.sequence });
+      run.port.postMessage({ go: message.intent.sequence });
     }
-  });
-  worker.call({ op: "chaos", dir, seed, expect }).catch((error: unknown) => {
-    run.failure ??= error instanceof Error ? error : new Error(String(error));
-  });
+  };
+  worker.post({ chaosPort: channel.port2 }, [channel.port2]);
+  worker
+    .call({ op: "chaos", dir, seed, expect, ...(inject === null ? {} : { inject }) })
+    .catch((error: unknown) => {
+      // Only this page's own terminate() is not a failure.
+      if (error instanceof Error && error.name === "WorkerTerminated") return;
+      run.failure ??= error instanceof Error ? error : new Error(String(error));
+    });
   await worker.until(() => run.failure !== null || run.recovered !== null, "recovery", 60_000);
   if (run.failure !== null) {
     worker.terminate();
@@ -543,19 +561,50 @@ export async function chaosBegin(
   return recovered;
 }
 
-/** Kills the running chaos worker as `plan` says; resolves with where it landed. */
-export function chaosKill(plan: KillPlan): Promise<KillLanding> {
+const expectOf = (run: ChaosRun): ChaosExpect => {
+  if (run.state === null) throw new Error("no acknowledged state");
+  return { state: run.state, inFlight: [...run.inFlight.values()] };
+};
+
+function landingOf(run: ChaosRun): string {
+  const [current] = run.inFlight.values();
+  if (current === undefined) return "between";
+  if (!run.began.has(current.sequence)) return `before-${current.step}`;
+  if (!run.settled.has(current.sequence)) return `in-${current.step}`;
+  return `after-${current.step}`;
+}
+
+/** Waits until 30 ms pass without a message from the (dead) worker. */
+async function drain(run: ChaosRun): Promise<void> {
+  for (;;) {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 10);
+    });
+    if (performance.now() - run.lastMessage > 30) return;
+  }
+}
+
+/** A workload failure the page observed (review B1-p2f finding 1): the campaign fails on it. */
+function failed(run: ChaosRun): Error | null {
+  return run.failure === null
+    ? null
+    : new Error(`the workload reported a failure: ${run.failure.message}`, { cause: run.failure });
+}
+
+/**
+ * Kills the running chaos worker as `plan` says. Terminate: after `delayMs`, the worker is
+ * terminated, the messages it posted before dying are drained, and the landing and expectation
+ * are taken from all of them. Page: the page stops answering intents and returns; the caller then
+ * calls `chaosPageBoundary` and closes the page. Any workload failure the page observed rejects.
+ */
+export function chaosKill(plan: KillPlan): Promise<KillLanding | null> {
   const run = chaos;
   if (run === null) return Promise.reject(new Error("chaosBegin first"));
-  const snapshot = (): ChaosExpect => {
-    if (run.state === null) throw new Error("no acknowledged state");
-    return { state: run.state, inFlight: run.inFlight };
-  };
-  return new Promise<KillLanding>((resolve, reject) => {
+  return new Promise<KillLanding | null>((resolve, reject) => {
     const stall = setTimeout(() => {
       run.armed = null;
       reject(
-        run.failure ??
+        failed(run) ??
           new Error(`the workload never reached ${plan.target} #${String(plan.occurrence)}`),
       );
     }, 60_000);
@@ -565,24 +614,43 @@ export function chaosKill(plan: KillPlan): Promise<KillLanding> {
       fire: (intent) => {
         clearTimeout(stall);
         if (plan.mode === "page") {
-          // Stop answering, then let the step run: the page close or crash lands in it or just
-          // after, and nothing later can start.
           run.hold = true;
-          run.worker.post({ go: intent.sequence });
-          resolve({ landed: `mid-${intent.step}`, expect: snapshot() });
+          run.port.postMessage({ go: intent.sequence });
+          resolve(null);
           return;
         }
-        run.worker.post({ go: intent.sequence });
+        run.port.postMessage({ go: intent.sequence });
         setTimeout(() => {
-          const landed = run.inFlight === null ? "between" : `mid-${run.inFlight.step}`;
-          const expect = snapshot();
           run.worker.terminate();
           chaos = null;
-          resolve({ landed, expect });
+          void drain(run).then(() => {
+            run.port.close();
+            const failure = failed(run);
+            if (failure !== null) reject(failure);
+            else resolve({ landed: landingOf(run), expect: expectOf(run) });
+          });
         }, plan.delayMs);
       },
     };
   });
+}
+
+/**
+ * The page-close boundary (review B1-p2f finding 2): the page stops processing the worker's
+ * messages and returns what it received up to now; the caller closes the page next, and the page
+ * processes nothing in between. Acknowledgements the worker posted after this point never reached
+ * the page, so they are not required, while the step in flight may have completed (its root is
+ * accepted as pending). A failure observed up to here rejects.
+ */
+export function chaosPageBoundary(): KillLanding {
+  const run = chaos;
+  if (run === null) throw new Error("chaosBegin first");
+  run.port.onmessage = null;
+  run.port.close();
+  chaos = null;
+  const failure = failed(run);
+  if (failure !== null) throw failure;
+  return { landed: landingOf(run), expect: expectOf(run) };
 }
 
 /** Stops the chaos worker (the campaign is over) and removes its store. */

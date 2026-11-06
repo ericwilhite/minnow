@@ -129,13 +129,30 @@ export const DOUBLE_AGGREGATE_STATES = [
 
 /**
  * The storage kill campaign (browser-tests/next-storage.spec.ts, Gate A): kills must land inside
- * each kind of step, or recovery is never checked there.
+ * each kind of step's storage work (the worker had posted `began` and not `settled`), or recovery
+ * is never checked there.
  */
 export const STORAGE_KILL_REACH = [
-  "mid-write",
-  "mid-publish",
-  "mid-reclaim",
-  "mid-log-flush",
-  "mid-truncate",
-  "mid-spill",
+  "in-write",
+  "in-publish",
+  "in-reclaim",
+  "in-log-flush",
+  "in-truncate",
+  "in-spill",
+] as const;
+
+/**
+ * The same campaign on OPFS, whose storage calls are synchronous: a step's storage work runs to its
+ * end within one task, and a worker's termination lands between tasks, so kills land at a step's
+ * edges (before it began, or after it returned), not inside it. Each phase must be hit at an edge;
+ * interruption inside the synchronous operations is the simulated physical crash sweeps' (the
+ * storage kit over simulated handles, space-crash.test.ts), which crash at every write step.
+ */
+export const STORAGE_KILL_EDGE_REACH = [
+  "at-write",
+  "at-publish",
+  "at-reclaim",
+  "at-log-flush",
+  "at-truncate",
+  "at-spill",
 ] as const;

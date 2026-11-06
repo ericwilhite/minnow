@@ -11,7 +11,7 @@
  */
 import { chromium, expect, firefox, webkit, type Page } from "@playwright/test";
 import { EXPECTED_IDB_OUTCOMES } from "../src/next/storage/idb-scenarios.js";
-import { createReach, STORAGE_KILL_REACH } from "../src/testing/reach.js";
+import { createReach, STORAGE_KILL_EDGE_REACH, STORAGE_KILL_REACH } from "../src/testing/reach.js";
 import { mulberry32, seedsFor } from "../src/testing/seeds.js";
 import type { ChaosExpect, ChaosStep } from "../browser/next-storage-chaos.js";
 import type { KillPlan } from "../browser/next-storage-run.js";
@@ -413,6 +413,7 @@ const KILL_TARGETS: readonly ChaosStep[] = [
   "log-flush",
   "truncate",
   "spill",
+  "spill",
   "reset",
 ];
 
@@ -436,9 +437,13 @@ test.describe("rebuild core storage kill campaign (Gate A)", () => {
         if (kind === "opfs") await requireWorkerOpfs(page);
         const random = mulberry32(seed);
         const dir = `kills-${kind}-${String(seed)}-${Date.now().toString(36)}`;
-        const reach = createReach(`storage kills ${kind} ${browserName}`, STORAGE_KILL_REACH, {
-          minimum: Math.max(1, Math.floor(kills / 50)),
-        });
+        // IndexedDB's work is asynchronous: kills must land inside each phase's storage work.
+        // OPFS's is synchronous, so kills land at its edges (STORAGE_KILL_EDGE_REACH).
+        const reach = createReach(
+          `storage kills ${kind} ${browserName}`,
+          kind === "indexeddb" ? STORAGE_KILL_REACH : STORAGE_KILL_EDGE_REACH,
+          { minimum: Math.max(1, Math.floor(kills / 50)) },
+        );
         const table = new Map<string, number>();
         const count = (key: string) => table.set(key, (table.get(key) ?? 0) + 1);
         const begin = (expected: ChaosExpect | null, iteration: number) =>
@@ -472,26 +477,45 @@ test.describe("rebuild core storage kill campaign (Gate A)", () => {
             delayMs: random() < 0.4 ? 0 : Math.floor(random() * 8),
             mode: random() < 0.1 ? "page" : "terminate",
           };
-          const landing = await page.evaluate(
-            async ([url, killPlan]) => ((await import(url)) as Run).chaosKill(killPlan),
-            [RUN, plan] as const,
-          );
+          let landing;
+          try {
+            landing = await page.evaluate(
+              async ([url, killPlan]) => {
+                const run = (await import(url)) as Run;
+                const terminated = await run.chaosKill(killPlan);
+                if (terminated !== null) return { ...terminated, retries: 0 };
+                // A page kill: the step runs on; the boundary is taken just before the close.
+                await new Promise<void>((resolve) => {
+                  setTimeout(resolve, killPlan.delayMs);
+                });
+                return { ...run.chaosPageBoundary(), retries: run.chaosStartRetries() };
+              },
+              [RUN, plan] as const,
+            );
+          } catch (error) {
+            throw new Error(
+              `${kind}/${browserName}: kill ${String(iteration)} (${JSON.stringify(plan)}) observed a workload failure (replay: MINNOW_SEED=${String(seed)}; ${previous}): ${String(error)}`,
+              { cause: error },
+            );
+          }
           expected = landing.expect;
           previous = `kill ${String(iteration)}: ${JSON.stringify(plan)} landed ${landing.landed}, expecting ${JSON.stringify(landing.expect)}`;
           if (plan.mode === "page") {
-            workerStartRetries += await page.evaluate(
-              async (url) => ((await import(url)) as Run).chaosStartRetries(),
-              RUN,
-            );
+            workerStartRetries += landing.retries;
             // A page close (CDP's Page.crash takes the whole persistent context down under the
-            // headless shell Playwright launches, so it is not used).
+            // headless shell Playwright launches, so it is not used). The page processed no
+            // message after its boundary.
             pageKills += 1;
             await page.close({ runBeforeUnload: false });
             count(`${landing.landed} (page close)`);
             page = await context.newPage();
             await page.goto("/packages/core/browser/");
           } else {
-            reach.recordHistory([landing.landed]);
+            reach.recordHistory([
+              kind === "indexeddb"
+                ? landing.landed
+                : landing.landed.replace(/^(before|in|after)-/u, "at-"),
+            ]);
             count(landing.landed);
           }
         }
@@ -526,4 +550,94 @@ test.describe("rebuild core storage kill campaign (Gate A)", () => {
         console.log(`STORAGE_KILLS ${JSON.stringify(report)}`);
         reach.assertReached();
       });
+});
+
+test.describe("rebuild core storage kill campaign: its own failure paths (review B1-p2f)", () => {
+  test("a workload failure after a kill is armed fails the kill, in both kill modes", async ({
+    page,
+  }) => {
+    test.setTimeout(180_000);
+    await page.goto("/packages/core/browser/");
+    for (const mode of ["terminate", "page"] as const) {
+      const dir = `inject-${mode}-${Date.now().toString(36)}`;
+      const outcome = await page.evaluate(
+        async ([url, directory, killMode]) => {
+          const run = (await import(url)) as Run;
+          // The first spill step reports a mismatch that a later sweep could never see.
+          await run.chaosBegin("indexeddb", directory, 7, null, "spill-mismatch");
+          try {
+            const terminated = await run.chaosKill({
+              target: "spill",
+              occurrence: 1,
+              delayMs: 300,
+              mode: killMode,
+            });
+            if (terminated === null) {
+              await new Promise<void>((resolve) => {
+                setTimeout(resolve, 300);
+              });
+              run.chaosPageBoundary();
+            }
+            return "no failure";
+          } catch (error) {
+            return String(error);
+          } finally {
+            await run.chaosEnd("indexeddb", directory);
+          }
+        },
+        [RUN, dir, mode] as const,
+      );
+      expect(outcome, mode).toContain("a spill page read back wrong (injected)");
+    }
+  });
+
+  test("a kill after go but before storage began is counted before the step, not in it", async ({
+    page,
+  }) => {
+    test.setTimeout(120_000);
+    await page.goto("/packages/core/browser/");
+    const dir = `stall-${Date.now().toString(36)}`;
+    const landing = await page.evaluate(
+      async ([url, directory]) => {
+        const run = (await import(url)) as Run;
+        await run.chaosBegin("indexeddb", directory, 5, null, "stall-publish-after-go");
+        const killed = await run.chaosKill({
+          target: "publish",
+          occurrence: 1,
+          delayMs: 200,
+          mode: "terminate",
+        });
+        await run.chaosEnd("indexeddb", directory);
+        return killed;
+      },
+      [RUN, dir] as const,
+    );
+    expect(landing?.landed).toBe("before-publish");
+  });
+
+  test("a page-close boundary includes the acknowledgements received after the kill was armed", async ({
+    page,
+  }) => {
+    test.setTimeout(120_000);
+    await page.goto("/packages/core/browser/");
+    const dir = `boundary-${Date.now().toString(36)}`;
+    const result = await page.evaluate(
+      async ([url, directory]) => {
+        const run = (await import(url)) as Run;
+        const recovered = await run.chaosBegin("indexeddb", directory, 11, null);
+        await run.chaosKill({ target: "publish", occurrence: 1, delayMs: 0, mode: "page" });
+        // The armed publish runs on and is acknowledged before the boundary is taken.
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 1_000);
+        });
+        const boundary = run.chaosPageBoundary();
+        await run.chaosEnd("indexeddb", directory);
+        return { before: recovered.state.round, boundary };
+      },
+      [RUN, dir] as const,
+    );
+    expect(result.boundary.landed).toBe("between");
+    expect(result.boundary.expect.inFlight).toEqual([]);
+    expect(result.boundary.expect.state.round).toBe(result.before + 1);
+  });
 });

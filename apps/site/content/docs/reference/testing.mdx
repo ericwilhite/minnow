@@ -1112,9 +1112,13 @@ moments while a worker builds and publishes extents, retires and reclaims them, 
 truncates and resets its log, and spills. After every kill a new worker reopens the store and
 checks that the root is the last acknowledged one (or the one a publish in flight was writing,
 every blob's coordinates and checksum included), that every acknowledged log byte reads back,
-and that the free-space audit is exact, then carries on. Any other outcome fails the run. The
-same campaign runs 50 kills per store in every browser lane. It declares reach: kills must land
-inside writes, publishes, reclaims, log flushes, truncations and spills, or the run fails. It
+and that the free-space audit is exact, then carries on. Any other outcome fails the run, and so
+does any failure the workload reports while it runs. Each kill is classed by what the worker
+posted before it died: before a step's storage work began, inside it, or after it returned. The
+same campaign runs 50 kills per store in every browser lane. It declares reach: on IndexedDB,
+kills must land inside writes, publishes, reclaims, log flushes, truncations and spills; OPFS's
+storage calls are synchronous, so there kills land at their edges, and the simulated power-loss
+sweeps cover what happens inside them. It
 prints one `STORAGE_KILLS` JSON line per store with the kill and phase table, which the nightly
 workflow saves as `browser-perf-results/storage-kills.jsonl`. A failure names its seed: set
 `MINNOW_SEED` to replay the same plan of kills (where each kill lands still depends on timing).

@@ -64,11 +64,18 @@ export interface ChaosState {
   readonly flushed: number;
 }
 
-/** What a recovering worker is told: the acknowledged state and the step in flight. */
+/**
+ * What a recovering worker is told: the acknowledged state (every strict acknowledgement the page
+ * received: a published root, a flushed, truncated or reset log; relaxed ones, appends and data
+ * writes, promise nothing after a crash) and the steps in flight.
+ */
 export interface ChaosExpect {
   readonly state: ChaosState;
-  readonly inFlight: ChaosIntent | null;
+  readonly inFlight: readonly ChaosIntent[];
 }
+
+/** Test-only faults (the campaign's own regression tests). */
+export type ChaosInjection = "spill-mismatch" | "stall-publish-after-go";
 
 export interface ChaosRecovery {
   /** Where the root and log were found, and the state the workload continues from. */
@@ -83,9 +90,16 @@ export interface ChaosRecovery {
   readonly openMs: number;
 }
 
-/** Messages to the page: an intent, an acknowledgement, the end of a step, recovery. */
+/**
+ * Messages to the page: an intent, the step's storage work beginning (`began`, posted just before
+ * its first storage call) and ending (`settled`, just after its last), an acknowledgement, the
+ * end of a step, recovery.
+ */
 export type ChaosMessage =
   | { readonly chaos: "intent"; readonly intent: ChaosIntent }
+  | { readonly chaos: "began"; readonly sequence: number }
+  | { readonly chaos: "failure"; readonly message: string }
+  | { readonly chaos: "settled"; readonly sequence: number }
   | { readonly chaos: "ack"; readonly state: ChaosState }
   | { readonly chaos: "done"; readonly sequence: number }
   | { readonly chaos: "recovered"; readonly recovery: ChaosRecovery };
@@ -196,6 +210,7 @@ export async function runChaos(
   seed: number,
   expect: ChaosExpect | null,
   hooks: ChaosHooks,
+  inject: ChaosInjection | null = null,
 ): Promise<never> {
   const started = performance.now();
   const backend = await hooks.backendFor(dir);
@@ -214,17 +229,20 @@ export async function runChaos(
   // ── The root ───────────────────────────────────────────────────────────────────────────────
   const root = space.root === null ? null : (JSON.parse(decoder.decode(space.root)) as TestRoot);
   const known = expect?.state ?? { round: 0, identity: identity([]), generation: 0, flushed: 0 };
-  const pending = expect?.inFlight?.root ?? null;
+  const inFlight = expect?.inFlight ?? [];
+  const pending = inFlight.flatMap((intent) => (intent.root === undefined ? [] : [intent.root]));
   const round = root?.round ?? 0;
   const found = root === null ? identity([]) : identity(root.blobs);
   const matchesAcked = round === known.round && found === known.identity;
-  const matchesPending = pending !== null && round === pending.round && found === pending.identity;
+  const matchesPending = pending.some(
+    (candidate) => round === candidate.round && found === candidate.identity,
+  );
   if (!matchesAcked && !matchesPending)
     fail(
       `root round ${String(round)} (${found}) is neither the acknowledged round ${String(known.round)} (${known.identity})` +
-        (pending === null
+        (pending.length === 0
           ? ""
-          : ` nor the in-flight round ${String(pending.round)} (${pending.identity})`),
+          : ` nor an in-flight one (${pending.map((candidate) => `${String(candidate.round)} ${candidate.identity}`).join(", ")})`),
     );
   let blobs: BlobRef[] = [...(root?.blobs ?? [])];
   await readAllBlobs(space, blobs);
@@ -233,16 +251,18 @@ export async function runChaos(
   // ── The log ────────────────────────────────────────────────────────────────────────────────
   const [header] = await session.readLogHeaders();
   const headerGeneration = generationOf(header);
-  const resetting = expect?.inFlight?.step === "reset";
+  const resetting = inFlight.some((intent) => intent.step === "reset");
+  const truncateTo = Math.min(
+    Number.POSITIVE_INFINITY,
+    ...inFlight.map((intent) => intent.truncateTo ?? Number.POSITIVE_INFINITY),
+  );
   let generation: number;
   let verified = 0;
   if (headerGeneration === known.generation) {
     generation = known.generation;
     // An in-flight truncate may have cut the acknowledged bytes; an in-flight reset may have run
     // and left this generation's header (it writes the header after the reset).
-    verified = resetting
-      ? 0
-      : Math.min(known.flushed, expect?.inFlight?.truncateTo ?? Number.POSITIVE_INFINITY);
+    verified = resetting ? 0 : Math.min(known.flushed, truncateTo);
   } else if (
     resetting &&
     (headerGeneration === null || headerGeneration === known.generation + 1)
@@ -303,8 +323,17 @@ export async function runChaos(
     const full = { ...intent, sequence };
     hooks.post({ chaos: "intent", intent: full });
     await hooks.go(sequence);
+    // The campaign's regression: a worker that has its go but never reaches storage.
+    if (inject === "stall-publish-after-go" && intent.step === "publish")
+      await new Promise<never>(() => undefined);
+    hooks.post({ chaos: "began", sequence });
     return full;
   };
+  /** The step's last storage call returned (before its acknowledgement and its end). */
+  const settledStep = () => {
+    hooks.post({ chaos: "settled", sequence });
+  };
+  let injected = false;
   const done = () => {
     hooks.post({ chaos: "done", sequence });
   };
@@ -346,6 +375,7 @@ export async function runChaos(
         const sealed = await builder.seal();
         if (sealed !== null) written.push(...sealed.blobs);
       }
+      settledStep();
       done();
       let retired: ExtentRef[] = [];
       let kept = blobs;
@@ -367,6 +397,7 @@ export async function runChaos(
       blobs = next;
       ack({ ...state, round: target.round, identity: target.identity });
       if (reclaiming) await (space as unknown as { settled(): Promise<void> }).settled();
+      settledStep();
       retiredLast = retired.length > 0;
       done();
     } else if (roll < 0.46 && retiredLast) {
@@ -380,6 +411,7 @@ export async function runChaos(
       currentRound = target.round;
       ack({ ...state, round: target.round, identity: target.identity });
       await (space as unknown as { settled(): Promise<void> }).settled();
+      settledStep();
       retiredLast = false;
       done();
     } else if (roll < 0.62) {
@@ -389,17 +421,20 @@ export async function runChaos(
         const length = 1 + Math.floor(random() * (random() < 0.1 ? 90_000 : 3_000));
         await session.appendLog(logBytes(state.generation, offset, length));
       }
+      settledStep();
       done();
     } else if (roll < 0.76) {
       await announce({ step: "log-flush" });
       const length = session.logLength();
       await session.flushLog();
+      settledStep();
       ack({ ...state, flushed: length });
       done();
     } else if (roll < 0.84) {
       const to = Math.floor(random() * (session.logLength() + 1));
       await announce({ step: "truncate", truncateTo: to });
       await session.truncateLog(to);
+      settledStep();
       ack({ ...state, flushed: Math.min(state.flushed, to) });
       done();
     } else if (roll < 0.87) {
@@ -408,6 +443,7 @@ export async function runChaos(
       await session.resetLog();
       await session.writeLogHeader(0, headerOf(generation));
       await session.flushLog();
+      settledStep();
       ack({ ...state, generation, flushed: 0 });
       done();
     } else if (spill !== null) {
@@ -424,7 +460,13 @@ export async function runChaos(
       for (const [ref, bytes] of refs)
         if (firstDifference(await file.read(ref), bytes) !== -1)
           fail("a spill page read back wrong");
+      // The campaign's regression: a transient mismatch that the next sweep cannot see.
+      if (inject === "spill-mismatch" && !injected) {
+        injected = true;
+        fail("a spill page read back wrong (injected)");
+      }
       await file.close();
+      settledStep();
       done();
     }
   }
