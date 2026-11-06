@@ -306,58 +306,64 @@ export interface OpenWritePathInput {
 }
 
 /**
- * One publication's change to the set of extents its root reaches (ruling R25: each root
+ * One publication attempt's change to the set of extents its root reaches (ruling R25: each root
  * references a paged, offset-sorted list of the extents it reaches, kept by the storage track, so
  * startup rebuilds free space from the two roots' lists instead of walking them).
  *
  * Exact by construction: the extents the new root reaches are those the previous root reaches,
  * minus `released`, plus `added`. The write path builds every root this way and never publishes
- * one otherwise, so replaying the deltas from an empty set gives each root's reachable set.
+ * one otherwise.
  */
 export interface PublishDelta {
-  /** The root sequence the publication will make current. */
-  readonly sequence: number;
   /** Extents the new root reaches and the previous one does not: every extent `writer` sealed. */
   readonly added: readonly ExtentRef[];
-  /** Extents the previous root reaches and the new one does not: exactly the publish's `retired`. */
-  readonly released: readonly ExtentRef[];
   /**
-   * The publication's writer, still open: the sink may write its own list pages into it. Those
-   * pages are the sink's: `added` does not include them, and the sink lists them itself.
+   * Extents the previous root reaches and the new one does not: exactly the publish's `retired`.
+   * They leave the new root's list at once, but stay protected by the previous root's list and
+   * older pins (two-generation reclaim, R8): not reusable yet.
    */
+  readonly released: readonly ExtentRef[];
+  /** The attempt's writer, still open. */
   readonly writer: SpaceWriter;
 }
 
-/** What a sink returns for one publication. */
+/** What a sink returns for one attempt. */
 export interface ExtentDeltaResult {
   /**
-   * Extents of the sink's own the new root no longer reaches (list pages it replaced): the write
-   * path retires them in the same publish. (The root's reference to the list, ruling R25, is the
-   * storage and format tracks' to add; it will come back here too.)
+   * The list pages to write in this publication (the write path writes them into its writer and
+   * the root references them; until the root has that field, ruling R25's format part, a
+   * non-empty list is refused as a sink failure).
    */
+  readonly pages: readonly Uint8Array[];
+  /** List pages of the sink's own the new root no longer reaches: retired in the same publish. */
   readonly retire: readonly ExtentRef[];
 }
 
 /**
- * The storage track's side of R25, told every publication in two phases, in publish order:
- * 1. `prepare(delta)`, after the root's contents are fixed and before it is encoded (the sink may
- *    write its list pages into `delta.writer`); a rejection fails that publication;
- * 2. exactly one of:
- *    - `published(sequence)`: the root is durable and current; the prepared change is now real;
- *    - `abandoned(sequence)`: nothing was published (the writer was aborted, its pages with it,
- *      the previous root is still current): forget the prepared change. A merge or idle publish
- *      that fails before its publish leaves the write path running, so this happens in service;
- *    - `failed(sequence, error)`: the publish was rejected; the root may or may not be durable, the
- *      space has failed and refuses further publishes. The sink's in-memory list must not be used
- *      again; the owner reopens, and startup rebuilds from the durable roots' own lists.
- * So the sink's committed list only ever changes at `published`, and never diverges from the
- * current root.
+ * The storage track's side of R25 (ruling on review B3-p2b-3 C2), a two-phase protocol per
+ * publication attempt, in publish order:
+ * 1. `prepare(attempt, delta)`: after the root's contents are fixed, before metadata admission,
+ *    encoding and the publish. `attempt` is unique and increasing within one open write path. The sink builds a provisional
+ *    list from its last committed one and returns the pages to write;
+ * 2. exactly one of
+ *    - `commit(attempt, sequence)`: the root is durable and current; `sequence` is its root
+ *      sequence. Sequences belong to committed publications only, and are consecutive;
+ *    - `abort(attempt)`: any failure after `prepare` and before the root is durable (admission,
+ *      encoding, a refused or rejected publish, close): the provisional list is discarded. After
+ *      an aborted attempt the next attempt builds on the same committed list (a merge retries).
+ * The sink treats everything prepared as provisional until `commit`. A `prepare` that throws is
+ * aborted too, and fails the write path (a merge does not retry it): the list is storage's
+ * reachability record, and a sink that cannot keep it must not be published around. A publish
+ * that is rejected leaves the space failed (its root may or may not be durable): the owner
+ * reopens, and startup rebuilds from the durable roots' own lists, never from the last callback.
  */
 export interface ExtentDeltaSink {
-  prepare(delta: PublishDelta): Promise<ExtentDeltaResult | null> | ExtentDeltaResult | null;
-  published(sequence: number): void;
-  abandoned(sequence: number): void;
-  failed(sequence: number, error: unknown): void;
+  prepare(
+    attempt: number,
+    delta: PublishDelta,
+  ): Promise<ExtentDeltaResult | null> | ExtentDeltaResult | null;
+  commit(attempt: number, sequence: number): void;
+  abort(attempt: number): void;
 }
 
 /**

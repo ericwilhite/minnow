@@ -57,6 +57,11 @@
  *   `globalLsn`; each table's rows are as of its `flushedThroughLsn`. A root may switch to a new
  *   log salt only when `globalLsn` and every table's `flushedThroughLsn` reach the old log's last
  *   LSN; the new incarnation records the switching root's sequence (`log.rootSequence`).
+ *   `tables` agrees with the catalog at `globalLsn`: every table it has (one dropped later stays,
+ *   as it was, since replay starts before the drop) with every index it has; a table root may
+ *   also carry an empty root for its own index built after `globalLsn`. An index build no table
+ *   checkpoint covers therefore holds `globalLsn` below it (a build on a table with no
+ *   unpublished data has no entries, and the next root settles it).
  * - **Exactly once** (ledger.ts): `clients` holds the committed outcomes as of `globalLsn`.
  */
 import type { ClientLedgerEntry } from "./ledger.js";

@@ -50,6 +50,7 @@ import {
   type CommitReceipt,
   type CommitRequest,
   type Durability,
+  type ExtentDeltaResult,
   type ExtentDeltaSink,
   type OpenWritePathInput,
   type PinOptions,
@@ -421,6 +422,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
   readonly #idleGarbageBytes: number;
   readonly #extentDeltas: ExtentDeltaSink | null;
   readonly #afterDeltaPrepared: ((kind: PublicationKind, sequence: number) => void) | null;
+  /** R25 attempts so far (the initial root of a new store was attempt 1). */
+  #attempts = 1;
+  readonly #nextAttempt = (): number => ++this.#attempts;
   /** The armed idle-publish check (R10), if any. */
   #idleTimer: ReturnType<typeof setTimeout> | null = null;
   /** An idle publication the timer started and that has not finished. */
@@ -465,6 +469,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
     mergesAbandoned: 0,
     /** Flushes dropped at publish because their table was dropped meanwhile. */
     flushesAbandoned: 0,
+    /** Flushes held because their table is newer than the root an index build holds back. */
+    flushesHeld: 0,
+    /** Index builds on quiet tables a published root settled (empty index, checkpoint moved). */
+    buildsSettled: 0,
     /** Merges that failed before their publish (inputs kept), and the last failure's message. */
     mergeFailures: 0,
     lastMergeFailure: null as string | null,
@@ -601,7 +609,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
           clients: [],
         };
         await session.resetLog();
-        const delta = new DeltaPublication("initial", input.extentDeltas ?? null);
+        const delta = new DeltaPublication("initial", input.extentDeltas ?? null, () => 1);
         try {
           await delta.prepare(root.sequence, writer, []);
           const bytes = encodeManifestRoot(root);
@@ -1126,15 +1134,24 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#tables.delete(tableId);
     this.#summaries.delete(tableId);
     this.#publishState();
-    // Older readers may still read its memtables (ruling 5): their memory goes when they close.
+    // Older readers may still read its memtables (ruling 5): their memory goes when they close,
+    // and after a flush of the table still writing them (it abandons at its publish).
     if (state !== undefined)
       this.shared.readers.holdUntilOlderClose(() => {
-        for (const memtable of state.view.memtables) memtable.releaseAll();
-        this.#chargeMetadata(-state.metadataBytes);
-        state.metadataBytes = 0;
-        this.#dropRunReaders([...state.view.runs.values()].flat());
+        const release = () => {
+          for (const memtable of state.view.memtables) memtable.releaseAll();
+          this.#chargeMetadata(-state.metadataBytes);
+          state.metadataBytes = 0;
+          this.#dropRunReaders([...state.view.runs.values()].flat());
+        };
+        const flushing = this.#flushing.get(state);
+        if (flushing === undefined) release();
+        else void flushing.then(release, release);
       });
   }
+
+  /** The flush writing each table now, if any (a drop releases the table's memory after it). */
+  readonly #flushing = new Map<TableState, Promise<void>>();
 
   addIndexDelta(tableId: number, indexId: number): Memtable {
     const { memtable } = this.liveMemtable(tableId);
@@ -1269,7 +1286,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
   #adoptTableRoots(root: ManifestRoot): void {
     for (const table of root.tables) {
       const state = this.#tables.get(table.tableId);
-      if (state !== undefined && state.root !== null) state.root = table;
+      if (state === undefined) continue;
+      if (state.root !== null) state.root = table;
+      state.flushedThroughLsn = Math.max(state.flushedThroughLsn, table.flushedThroughLsn);
+    }
+    this.maintenance.buildsSettled += this.#settles.get(root) ?? 0;
+    // An index build a durable table checkpoint covers has its entries in that table's runs.
+    for (const [indexId, pending] of this.#pendingIndexes) {
+      const table = root.tables.find((candidate) => candidate.tableId === pending.tableId);
+      if (table !== undefined && table.flushedThroughLsn >= pending.lsn)
+        this.#pendingIndexes.delete(indexId);
     }
   }
 
@@ -1332,7 +1358,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
       // commit spanning memtables can only flush whole, so when the boundary is blocked by the
       // live memtable that commit continues into, that (committed) tail is frozen too.
       while (this.#frozenBytes() > FROZEN_MEMTABLE_CAP_BYTES) {
-        if (this.#nextFlushReady() === null && !this.#freezeBlockingTails()) break;
+        if (
+          this.#nextFlushReady() === null &&
+          !this.#freezeBlockingTails() &&
+          !this.#freezeBuilds()
+        )
+          break;
         const before = this.#flushProgress();
         this.#scheduleFlush();
         await this.#flushes;
@@ -1553,7 +1584,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
         if (memtable.state !== "frozen" || memtable.visibleRows(MAX_LSN) < memtable.rowCount) break;
         through = Math.max(through, maxSeq(memtable, memtable.rowCount));
         const next = memtables[k + 1];
-        if (next === undefined || minSeq(next) > through) return true;
+        if (next === undefined || minSeq(next) > through) {
+          if (this.#flushable(state, Math.max(through, state.flushedThroughLsn))) return true;
+          break;
+        }
       }
     }
     return null;
@@ -1778,23 +1812,45 @@ export class WritePathImpl implements WritePath, EngineHooks {
             if (wait === null) continue;
             return wait;
           }
-          return this.#flushTable(state, set, Math.max(through, state.flushedThroughLsn));
+          const to = Math.max(through, state.flushedThroughLsn);
+          if (!this.#flushable(state, to)) {
+            this.maintenance.flushesHeld += 1;
+            // Waits for an index build elsewhere; that table's flush settles it.
+            if (this.#freezeBuilds()) return this.#nextFlush();
+            break;
+          }
+          return this.#flushTable(state, set, to);
         }
       }
     }
     return null;
   }
 
-  async #flushTable(state: TableState, set: readonly Memtable[], through: number): Promise<void> {
+  #flushTable(state: TableState, set: readonly Memtable[], through: number): Promise<void> {
+    const flush = this.#writeFlush(state, set, through);
+    this.#flushing.set(state, flush);
+    const done = () => {
+      if (this.#flushing.get(state) === flush) this.#flushing.delete(state);
+    };
+    void flush.then(done, done);
+    return flush;
+  }
+
+  async #writeFlush(state: TableState, set: readonly Memtable[], through: number): Promise<void> {
     const def = this.#catalog.table(state.tableId);
-    if (def === undefined) return;
+    if (def === undefined || !this.#flushable(state, through)) return;
     const writer = this.#space.beginWrite(`flush t${String(state.tableId)}`);
     const retired: ExtentRef[] = [];
     // Directory chunks and the root this publication made: it owns them until a state holds them.
     let created: GroupDirectory | null = null;
     let madeRoot: ManifestRoot | null = null;
     let unlock: (() => void) | null = null;
-    const delta = new DeltaPublication("flush", this.#extentDeltas, this.#afterDeltaPrepared);
+    const delta = new DeltaPublication(
+      "flush",
+      this.#extentDeltas,
+      this.#nextAttempt,
+      this.#afterDeltaPrepared,
+    );
     this.#flushesWriting += 1;
     let writing = true;
     try {
@@ -2123,7 +2179,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
     }
     const unlock = await this.#lock();
     let madeRoot: ManifestRoot | null = null;
-    const delta = new DeltaPublication("idle", this.#extentDeltas, this.#afterDeltaPrepared);
+    const delta = new DeltaPublication(
+      "idle",
+      this.#extentDeltas,
+      this.#nextAttempt,
+      this.#afterDeltaPrepared,
+    );
     const writer = this.#space.beginWrite("idle publish");
     try {
       // The lock may have waited: closed, or garbage reclaimed by a publish meanwhile.
@@ -2212,7 +2273,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
     let switched = false;
     let unlock: (() => void) | null = null;
     let madeRoot: ManifestRoot | null = null;
-    const delta = new DeltaPublication("recycle", this.#extentDeltas, this.#afterDeltaPrepared);
+    const delta = new DeltaPublication(
+      "recycle",
+      this.#extentDeltas,
+      this.#nextAttempt,
+      this.#afterDeltaPrepared,
+    );
     let writer: ExtentWriter | null = null;
     try {
       this.#check();
@@ -2226,29 +2292,27 @@ export class WritePathImpl implements WritePath, EngineHooks {
       await this.#flushes;
       this.#check();
       const quiet = new Map<number, TableRoot>();
-      for (const state of [...this.#tables.values()]) {
+      // Tables with an index build first: until they flush, the others' roots may be held back.
+      const building = new Set(
+        [...this.#pendingIndexes.values()].map((pending) => pending.tableId),
+      );
+      const states = [...this.#tables.values()].sort(
+        (a, b) => Number(building.has(b.tableId)) - Number(building.has(a.tableId)),
+      );
+      for (const state of states) {
         const def = this.#catalog.table(state.tableId);
         if (def === undefined) continue;
         const last = state.view.memtables[state.view.memtables.length - 1];
-        const pending =
-          state.view.memtables.some(
-            (memtable) =>
-              memtable.state !== "published" &&
-              (memtable.rowCount > 0 ||
-                [...memtable.deltas.values()].some((delta) => delta.entryCount > 0) ||
-                memtable.deletions.size > 0),
-          ) ||
-          [...state.view.groupDeletes.byGroup.values()].some((positions) =>
-            [...positions.values()].some((seq) => seq > state.view.foldedThrough),
-          ) ||
-          [...state.view.groupSources.values()].some((source) =>
-            [...source.deletions.values()].some((seq) => seq > state.view.foldedThrough),
-          );
-        if (!pending) {
+        if (quietTable(state)) {
           this.maintenance.recycleQuietTables += 1;
           state.flushedThroughLsn = Math.max(state.flushedThroughLsn, cut);
-          if (state.root !== null && state.root.flushedThroughLsn < cut)
-            quiet.set(state.tableId, { ...state.root, flushedThroughLsn: cut });
+          // An index built on it before the cut has no entries: its root gets the empty index.
+          const atCut = this.#catalogAt(cut).table(state.tableId);
+          if (state.root !== null && state.root.flushedThroughLsn < cut && atCut !== undefined)
+            quiet.set(state.tableId, {
+              ...withCatalogIndexes(state.root, atCut, true),
+              flushedThroughLsn: cut,
+            });
           continue;
         }
         if (last?.state === "live") {
@@ -2275,7 +2339,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
           !quiet.has(state.tableId) &&
           state.flushedThroughLsn < cut,
       );
-      if (this.#pendingIndexes.size > 0 || uncovered) {
+      const unbuilt = [...this.#pendingIndexes.values()].some(
+        (pending) => (this.#tables.get(pending.tableId)?.flushedThroughLsn ?? 0) < pending.lsn,
+      );
+      if (unbuilt || uncovered) {
         this.maintenance.recyclesAbandoned += 1;
         return;
       }
@@ -2381,6 +2448,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
             break;
           } catch (error) {
             if (error instanceof MergeAbortedError) return;
+            // The extent-list sink failed: never published around (access/write-path.ts).
+            if (error instanceof ExtentSinkError) {
+              this.#failure ??= error;
+              return;
+            }
             // The publish failed (the space refuses everything after) or something else failed.
             if (this.#space.failed !== null || this.#hasFailed()) {
               this.#failure ??= error instanceof Error ? error : new Error(String(error));
@@ -2460,7 +2532,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
     });
     let unlock: (() => void) | null = null;
     let madeRoot: ManifestRoot | null = null;
-    const delta = new DeltaPublication("merge", this.#extentDeltas, this.#afterDeltaPrepared);
+    const delta = new DeltaPublication(
+      "merge",
+      this.#extentDeltas,
+      this.#nextAttempt,
+      this.#afterDeltaPrepared,
+    );
     this.#merging = true;
     try {
       const readers: RunReader[] = [];
@@ -2645,6 +2722,81 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   /** The next root: global state as of the durable LSN, `changed` tables replaced. */
+  /** Quiet index builds each root made settles (counted once it is published). */
+  readonly #settles = new WeakMap<ManifestRoot, number>();
+
+  /**
+   * The LSN the next root can claim, given the table roots it changes: the durable LSN, held below
+   * each index build no table checkpoint covers yet (its catalog must not be in a root whose
+   * table has no runs for it). A quiet table's build never holds it: that root settles it.
+   */
+  #rootLsn(changed: ReadonlyMap<number, { readonly flushedThroughLsn: number }>): number {
+    let globalLsn = Math.max(this.#root.globalLsn, this.durableLsn);
+    for (const pending of this.#pendingIndexes.values()) {
+      const state = this.#tables.get(pending.tableId);
+      const covered =
+        changed.get(pending.tableId)?.flushedThroughLsn ?? state?.flushedThroughLsn ?? 0;
+      if (covered >= pending.lsn) continue;
+      if (!changed.has(pending.tableId) && state !== undefined && quietTable(state)) continue;
+      globalLsn = Math.min(globalLsn, pending.lsn - 1);
+    }
+    return Math.max(globalLsn, this.#root.globalLsn);
+  }
+
+  /**
+   * Whether a flush of `state` through `through` can publish now: the root it makes claims an LSN
+   * held below other tables' index builds, and its catalog must have this table as it is now (the
+   * flushed rows' schema and indexes). A table created, altered or indexed after that LSN waits
+   * for the build to flush (found by the R25 delta test: the root left the table out, and the
+   * flush's extents were allocated, reported added, and reachable from no root).
+   */
+  #flushable(state: TableState, through: number): boolean {
+    const now = this.#catalog.table(state.tableId);
+    if (now === undefined) return true; // dropped: the flush abandons itself
+    const then = this.#catalogAt(
+      this.#rootLsn(new Map([[state.tableId, { flushedThroughLsn: through }]])),
+    ).table(state.tableId);
+    if (then?.schemaVersion !== now.schemaVersion) return false;
+    // Every index the root's catalog has must still be there; an index newer than it only when it
+    // is this table's own build this flush does not reach (the flushed memtables predate it, so it
+    // has no entries in them).
+    const unbuilt = (indexId: number) => {
+      const pending = this.#pendingIndexes.get(indexId);
+      return pending?.tableId === state.tableId && pending.lsn > through;
+    };
+    return (
+      then.indexes.every((index) => now.indexes.some((other) => other.id === index.id)) &&
+      now.indexes.every(
+        (index) => then.indexes.some((other) => other.id === index.id) || unbuilt(index.id),
+      )
+    );
+  }
+
+  /**
+   * Freezes the committed live memtable of each table whose index build holds the root's LSN back,
+   * so its flush (which settles the build) can run; true when it froze any.
+   */
+  #freezeBuilds(): boolean {
+    let froze = false;
+    for (const pending of this.#pendingIndexes.values()) {
+      const state = this.#tables.get(pending.tableId);
+      const last = state?.view.memtables[state.view.memtables.length - 1];
+      if (
+        state === undefined ||
+        last?.state !== "live" ||
+        state.flushedThroughLsn >= pending.lsn ||
+        quietTable(state) ||
+        last.visibleRows(MAX_LSN) < last.rowCount
+      )
+        continue;
+      last.state = "frozen";
+      last.measure();
+      this.#setView(state, { ...state.view });
+      froze = true;
+    }
+    return froze;
+  }
+
   async #nextRoot(
     writer: ExtentWriter,
     retired: ExtentRef[],
@@ -2652,16 +2804,26 @@ export class WritePathImpl implements WritePath, EngineHooks {
     /** A new log incarnation (a recycle's switching root). */
     incarnation: ManifestRoot["log"] | null = null,
   ): Promise<ManifestRoot> {
-    let globalLsn = Math.max(this.#root.globalLsn, this.durableLsn);
+    const globalLsn = this.#rootLsn(changed);
+    // A quiet table's index build has no entries: this root settles it (an empty index root and a
+    // checkpoint past the build), so the build stops holding the root's LSN back. Without this an
+    // index on a table that gets no rows held every later root (and log recycling) back for good.
+    const settled = new Map<number, number>();
     for (const pending of this.#pendingIndexes.values()) {
-      const covered =
-        changed.get(pending.tableId)?.flushedThroughLsn ??
-        this.#tables.get(pending.tableId)?.flushedThroughLsn ??
-        0;
-      if (covered < pending.lsn) globalLsn = Math.min(globalLsn, pending.lsn - 1);
+      const state = this.#tables.get(pending.tableId);
+      if (
+        state !== undefined &&
+        !changed.has(pending.tableId) &&
+        state.flushedThroughLsn < pending.lsn &&
+        pending.lsn <= globalLsn &&
+        quietTable(state)
+      )
+        settled.set(pending.tableId, Math.max(settled.get(pending.tableId) ?? 0, pending.lsn));
     }
-    globalLsn = Math.max(globalLsn, this.#root.globalLsn);
     const catalog = this.#catalogAt(globalLsn);
+    for (const tableId of changed.keys())
+      if (this.#catalog.table(tableId) !== undefined && catalog.table(tableId) === undefined)
+        throw new TypeError("A root must carry every table root it publishes (see #flushable)");
     let catalogRef = this.#root.catalog;
     if (catalog.version !== this.#root.catalogVersion) {
       catalogRef = need((await writer.write([catalog.encode()])).blobs[0]);
@@ -2675,32 +2837,34 @@ export class WritePathImpl implements WritePath, EngineHooks {
         tables.push(replaced);
         continue;
       }
+      const settles = settled.get(def.id);
       if (state?.root !== null && state?.root !== undefined) {
         // Reconciled with this root's catalog (review B3-p2b-3 C3): an index the catalog dropped
         // leaves the table root in this publication even when the table itself did not change;
         // the index-drop pass below retires its runs.
-        tables.push(withCatalogIndexes(state.root, def));
+        const root = withCatalogIndexes(state.root, def, settles !== undefined);
+        tables.push(
+          settles === undefined
+            ? root
+            : { ...root, flushedThroughLsn: Math.max(root.flushedThroughLsn, settles) },
+        );
         continue;
       }
-      if (state === undefined) continue;
+      if (state === undefined) {
+        // Dropped after this root's LSN (an index build holds it back): replay starts before the
+        // drop and its frames name the table, so the root keeps the table as the previous root
+        // had it, and its extents stay reachable until a root covers the drop.
+        const kept = this.#root.tables.find((previous) => previous.tableId === def.id);
+        if (kept !== undefined) tables.push(withCatalogIndexes(kept, def));
+        else tables.push(emptyTableRoot(def, 1, globalLsn));
+        continue;
+      }
       // First root to include the table: an empty group directory (nothing written).
-      const directory = EMPTY_DIRECTORY;
-      const root: TableRoot = {
-        tableId: def.id,
-        schemaVersion: def.schemaVersion,
-        nextRowId: state.nextRowId,
-        flushedThroughLsn: state.flushedThroughLsn,
-        liveRowCount: 0,
-        groups: directory,
-        groupCount: 0,
-        staged: [],
-        keyIndex: indexRoot(def, def.primaryKey, new Map()),
-        secondaryIndexes: def.indexes
-          .filter((index) => index.id !== def.primaryKey)
-          .map((index) => indexRoot(def, index.id, new Map()))
-          .filter((index): index is IndexRoot => index !== null),
-        statistics: null,
-      };
+      const root: TableRoot = emptyTableRoot(
+        def,
+        state.nextRowId,
+        Math.max(state.flushedThroughLsn, settles ?? 0),
+      );
       state.root = root;
       tables.push(root);
     }
@@ -2731,7 +2895,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       ...entry,
       outcomes: entry.outcomes.filter((outcome) => outcome.lsn <= globalLsn),
     }));
-    return {
+    const next: ManifestRoot = {
       formatVersion: MANIFEST_FORMAT_VERSION,
       sequence: this.#root.sequence + 1,
       epoch: this.#session.epoch,
@@ -2744,6 +2908,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
       tables,
       clients,
     };
+    if (settled.size > 0) this.#settles.set(next, settled.size);
+    return next;
   }
 
   /** Every extent one table of the current root reaches (for a dropped table's retirement). */
@@ -2763,13 +2929,69 @@ export class WritePathImpl implements WritePath, EngineHooks {
 }
 
 /** `root` without the indexes `def` (the publication's catalog) no longer has. */
-function withCatalogIndexes(root: TableRoot, def: TableDef): TableRoot {
+/**
+ * `root` with exactly the index roots `def` (the publishing root's catalog) has: dropped ones
+ * leave. With `addBuilt`, an index the root lacks is added with no runs; only for a table with no
+ * unpublished data (`quietTable`), whose index build therefore has no entries.
+ */
+function withCatalogIndexes(root: TableRoot, def: TableDef, addBuilt = false): TableRoot {
   const ids = new Set(def.indexes.map((index) => index.id));
-  const keyIndex = root.keyIndex !== null && !ids.has(root.keyIndex.indexId) ? null : root.keyIndex;
+  let keyIndex = root.keyIndex !== null && !ids.has(root.keyIndex.indexId) ? null : root.keyIndex;
   const secondaryIndexes = root.secondaryIndexes.filter((index) => ids.has(index.indexId));
+  if (addBuilt) {
+    keyIndex ??= indexRoot(def, def.primaryKey, new Map());
+    for (const index of def.indexes)
+      if (
+        index.id !== def.primaryKey &&
+        !secondaryIndexes.some((candidate) => candidate.indexId === index.id)
+      )
+        secondaryIndexes.push(need(indexRoot(def, index.id, new Map())));
+  }
   if (keyIndex === root.keyIndex && secondaryIndexes.length === root.secondaryIndexes.length)
     return root;
   return { ...root, keyIndex, secondaryIndexes };
+}
+
+/**
+ * No unpublished data: no rows, index entries or deletions outside published memtables and the
+ * folded bitmaps. Every frame of the table so far is in its published state.
+ */
+function quietTable(state: TableState): boolean {
+  return !(
+    state.view.memtables.some(
+      (memtable) =>
+        memtable.state !== "published" &&
+        (memtable.rowCount > 0 ||
+          [...memtable.deltas.values()].some((delta) => delta.entryCount > 0) ||
+          memtable.deletions.size > 0),
+    ) ||
+    [...state.view.groupDeletes.byGroup.values()].some((positions) =>
+      [...positions.values()].some((seq) => seq > state.view.foldedThrough),
+    ) ||
+    [...state.view.groupSources.values()].some((source) =>
+      [...source.deletions.values()].some((seq) => seq > state.view.foldedThrough),
+    )
+  );
+}
+
+/** A table's root with nothing written: an empty group directory and no runs. */
+function emptyTableRoot(def: TableDef, nextRowId: number, flushedThroughLsn: number): TableRoot {
+  return {
+    tableId: def.id,
+    schemaVersion: def.schemaVersion,
+    nextRowId,
+    flushedThroughLsn,
+    liveRowCount: 0,
+    groups: EMPTY_DIRECTORY,
+    groupCount: 0,
+    staged: [],
+    keyIndex: indexRoot(def, def.primaryKey, new Map()),
+    secondaryIndexes: def.indexes
+      .filter((index) => index.id !== def.primaryKey)
+      .map((index) => indexRoot(def, index.id, new Map()))
+      .filter((index): index is IndexRoot => index !== null),
+    statistics: null,
+  };
 }
 
 function indexRoot(
@@ -2845,33 +3067,61 @@ async function readBlob(space: Space, ref: BlobRef, budget: Grant): Promise<Uint
   }
 }
 
-/**
- * One publication's R25 conversation with the sink (access/write-path.ts `ExtentDeltaSink`):
- * `prepare`, then `publish`, which settles it as published or failed; `settle` (always called in
- * the publication's finally) abandons a prepared delta that was never published.
- */
 /** What a publication is (tests and diagnostics). */
 export type PublicationKind = "initial" | "flush" | "merge" | "recycle" | "idle";
 
+/**
+ * The R25 sink failed (its `prepare` threw, or asked for what this build cannot do): the write
+ * path fails rather than publish around storage's reachability record (access/write-path.ts
+ * `ExtentDeltaSink`). A merge does not retry it.
+ */
+export class ExtentSinkError extends Error {
+  readonly code = "MINNOW_EXTENT_SINK";
+  constructor(cause: unknown) {
+    super("The extent-list sink refused a publication", { cause });
+    this.name = "ExtentSinkError";
+  }
+}
+
+/**
+ * One publication attempt's R25 conversation with the sink (access/write-path.ts
+ * `ExtentDeltaSink`): `prepare`, then `publish`, which commits it once the root is durable or
+ * aborts it if the publish is refused or rejected; `settle` (always called in the publication's
+ * finally) aborts an attempt that never reached `publish` (admission, encoding, close).
+ */
 class DeltaPublication {
-  #pending: number | null = null;
+  #attempt: number | null = null;
+  #sequence = 0;
 
   constructor(
     readonly kind: PublicationKind,
     readonly sink: ExtentDeltaSink | null,
+    readonly nextAttempt: () => number,
     readonly afterPrepared: ((kind: PublicationKind, sequence: number) => void) | null = null,
   ) {}
 
   async prepare(sequence: number, writer: ExtentWriter, retired: ExtentRef[]): Promise<void> {
     if (this.sink === null) return;
-    const result = await this.sink.prepare({
-      sequence,
-      added: [...writer.extents],
-      released: [...retired],
-      writer,
-    });
-    this.#pending = sequence;
-    if (result !== null) retired.push(...result.retire);
+    const attempt = this.nextAttempt();
+    this.#attempt = attempt;
+    this.#sequence = sequence;
+    let result: ExtentDeltaResult | null;
+    try {
+      result = await this.sink.prepare(attempt, {
+        added: [...writer.extents],
+        released: [...retired],
+        writer,
+      });
+    } catch (error) {
+      throw new ExtentSinkError(error); // settle() aborts the attempt
+    }
+    if (result !== null) {
+      if (result.pages.length > 0)
+        throw new ExtentSinkError(
+          new RangeError("The root cannot reference extent-list pages yet (R25's format part)"),
+        );
+      retired.push(...result.retire);
+    }
     this.afterPrepared?.(this.kind, sequence);
   }
 
@@ -2884,20 +3134,18 @@ class DeltaPublication {
     try {
       await space.publish(root, { writers: [writer], retired });
     } catch (error) {
-      const pending = this.#pending;
-      this.#pending = null;
-      if (pending !== null) this.sink?.failed(pending, error);
+      this.settle();
       throw error;
     }
-    const pending = this.#pending;
-    this.#pending = null;
-    if (pending !== null) this.sink?.published(pending);
+    const attempt = this.#attempt;
+    this.#attempt = null;
+    if (attempt !== null) this.sink?.commit(attempt, this.#sequence);
   }
 
   settle(): void {
-    const pending = this.#pending;
-    this.#pending = null;
-    if (pending !== null) this.sink?.abandoned(pending);
+    const attempt = this.#attempt;
+    this.#attempt = null;
+    if (attempt !== null) this.sink?.abort(attempt);
   }
 }
 

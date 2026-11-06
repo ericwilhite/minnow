@@ -12,7 +12,8 @@ import type { ExtentSpace } from "../storage/extents.js";
 import { createReach } from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import { need } from "./bytes.js";
-import type { WritePathImpl } from "./engine.js";
+import { ExtentSinkError, type WritePathImpl } from "./engine.js";
+import { yieldTask } from "./merge.js";
 import {
   autocommit,
   batch,
@@ -49,7 +50,10 @@ const REACH = [
   "drop-table",
   "drop-index",
   "abandoned",
+  "admission-refused",
   "flush-of-dropped-table",
+  "flush-held-by-build",
+  "build-settled",
   "reopen",
 ] as const;
 const reach = createReach("next-write-extent-deltas", REACH);
@@ -76,55 +80,95 @@ describe("extent deltas (ruling R25)", () => {
     it(`replaying the deltas gives each root's reachable extents (seed ${String(seed)})`, async () => {
       const random = mulberry32(seed);
       const int = (n: number) => Math.floor(random() * n);
-      // Some merges fail right after their prepare (the merge is abandoned, the path goes on).
+      // Some merge attempts fail after their prepare, at the encode step (a hook) or at metadata
+      // admission (the next allocation refused): the attempt aborts, the merge retries, the path
+      // goes on (review B3-p2b-3 C2).
+      let refuseNextAllocation = false;
       const harness = new Harness("strict", "sim", 6, undefined, {
         merges: { fanIn: 2 },
         logRecycleBytes: 1500 + int(2000),
         idleGarbageBytes: 1,
+        // Some flushes wait a few tasks before publishing, so a drop can commit while they write.
+        beforeFlushPublish: async () => {
+          for (let turns = random() < 0.5 ? int(12) : 0; turns > 0; turns--) await yieldTask();
+        },
         afterDeltaPrepared: (kind) => {
-          if (kind === "merge" && random() < 0.3) {
-            throw new Error("injected failure after prepare");
-          }
+          if (kind !== "merge") return;
+          const roll = random();
+          if (roll < 0.2) throw new Error("injected failure at encode");
+          if (roll < 0.4) refuseNextAllocation = true;
         },
       });
+      const admit = harness.governor.admit.bind(harness.governor);
+      harness.governor.admit = async (options) => {
+        const grant = await admit(options);
+        if (options.label === "write path metadata") {
+          const allocate = grant.allocate.bind(grant);
+          grant.allocate = (bytes) => {
+            // The merge's own root charge: a flush can allocate between the hook and that charge.
+            if (refuseNextAllocation && (new Error().stack ?? "").includes("#merge")) {
+              refuseNextAllocation = false;
+              reach.reach("admission-refused");
+              return false;
+            }
+            return allocate(bytes);
+          };
+        }
+        return grant;
+      };
       reach.beginHistory();
       const set = new Map<number, number>();
       let sequence = 0;
+      let lastAttempt = 0;
       const deltas: PublishDelta[] = [];
-      // The committed list changes only at published(); a prepared delta waits for its settle.
-      let pending: PublishDelta | null = null;
+      // The committed list changes only at commit(); a prepared delta is provisional until then.
+      let pending: { attempt: number; delta: PublishDelta } | null = null;
       harness.extentDeltas = {
-        prepare: (delta) => {
-          expect(pending, "one publication at a time").toBeNull();
-          expect(delta.sequence, "deltas come in publish order").toBe(sequence + 1);
-          for (const extent of delta.released)
-            expect(set.has(extent.offset), `released ${String(extent.offset)} is reached`).toBe(
-              true,
-            );
-          for (const extent of delta.added)
-            expect(set.has(extent.offset), `added ${String(extent.offset)} is new`).toBe(false);
-          pending = delta;
+        prepare: (attempt, delta) => {
+          try {
+            checkPrepare(attempt, delta);
+          } catch (error) {
+            sinkError ??= error;
+            throw error;
+          }
+          pending = { attempt, delta };
           return null;
         },
-        published: (published) => {
-          const delta = need(pending);
-          expect(published).toBe(delta.sequence);
+        commit: (attempt, committed) => {
+          const { attempt: prepared, delta } = need(pending);
+          expect(attempt).toBe(prepared);
+          expect(committed, "committed sequences are consecutive").toBe(sequence + 1);
           pending = null;
-          sequence = delta.sequence;
+          sequence = committed;
           for (const extent of delta.released) set.delete(extent.offset);
           for (const extent of delta.added) set.set(extent.offset, extent.length);
           deltas.push(delta);
           if (delta.added.length > 0) reach.reach("added");
           if (delta.released.length > 0) reach.reach("released");
         },
-        abandoned: (abandoned) => {
-          expect(abandoned).toBe(need(pending).sequence);
+        abort: (attempt) => {
+          if (sinkError !== null) return; // the sink's own check failed: reported below
+          expect(attempt).toBe(need(pending).attempt);
           pending = null;
           reach.reach("abandoned");
         },
-        failed: (_sequence, error) => {
-          throw new Error(`no publish fails in this test: ${String(error)}`, { cause: error });
-        },
+      };
+      let sinkError: unknown = null;
+      const checkPrepare = (attempt: number, delta: PublishDelta) => {
+        expect(pending, "one attempt at a time").toBeNull();
+        expect(attempt, "attempts increase").toBeGreaterThan(lastAttempt);
+        lastAttempt = attempt;
+        // Built from the last committed list, whatever was aborted before.
+        for (const extent of delta.released)
+          expect(set.has(extent.offset), `released ${String(extent.offset)} is reached`).toBe(true);
+        for (const extent of delta.added)
+          expect(set.has(extent.offset), `added ${String(extent.offset)} is new`).toBe(false);
+      };
+      // Attempt numbers are per open write path (an open may publish before it returns).
+      const open = harness.open.bind(harness);
+      harness.open = () => {
+        lastAttempt = 0;
+        return open();
       };
       let path: WritePathImpl = await harness.open();
       const check = async (label: string) => {
@@ -161,6 +205,22 @@ describe("extent deltas (ruling R25)", () => {
         });
         tables.push(t);
         rows.set(t, new Set());
+        // Sometimes indexed at once: a build on a table with no rows (no entries to flush).
+        if (random() < 0.3) {
+          const v = path.catalog.table(t)?.columns[1]?.id ?? 0;
+          await autocommit(path, (s) =>
+            s.changeCatalog({
+              kind: "createIndex",
+              index: {
+                tableId: t,
+                name: `t${String(t)}_v`,
+                columnIds: [v],
+                unique: false,
+                role: "secondary",
+              },
+            }),
+          );
+        }
       };
       await create();
       for (let step = 0; step < 60; step++) {
@@ -209,6 +269,11 @@ describe("extent deltas (ruling R25)", () => {
         } else if (roll < 82 && tables.length > 1) {
           tables.splice(tables.indexOf(t), 1);
           rows.delete(t);
+          // Sometimes a full memtable first, so the drop commits while its flush is writing.
+          if (random() < 0.5) {
+            const ids = Array.from({ length: 6 }, (_, k) => 1000 + k);
+            await autocommit(path, (s) => s.table(t).insert(batch(ints(ids), ints(ids)), null));
+          }
           await autocommit(path, (s) => s.changeCatalog({ kind: "dropTable", tableId: t }));
           reach.reach("drop-table");
         } else if (roll < 90) {
@@ -224,23 +289,24 @@ describe("extent deltas (ruling R25)", () => {
         if (path.maintenance.recycles > 0) reach.reach("recycle");
         if (path.maintenance.idlePublishes > 0) reach.reach("idle-publish");
         if (path.maintenance.flushesAbandoned > 0) reach.reach("flush-of-dropped-table");
+        if (path.maintenance.flushesHeld > 0) reach.reach("flush-held-by-build");
+        if (path.maintenance.buildsSettled > 0) reach.reach("build-settled");
       }
       await check("the end");
       expect(deltas.length).toBeGreaterThan(5);
       await harness.close();
     }, 300_000);
 
-  it("a rejected publish settles its prepared delta as failed, never as published", async () => {
+  it("a rejected publish aborts its attempt; nothing after it commits", async () => {
     const harness = new Harness("strict", "memory", 2);
     const calls: string[] = [];
     harness.extentDeltas = {
-      prepare: (delta) => {
-        calls.push(`prepare ${String(delta.sequence)}`);
+      prepare: (attempt) => {
+        calls.push(`prepare ${String(attempt)}`);
         return null;
       },
-      published: (sequence) => calls.push(`published ${String(sequence)}`),
-      abandoned: (sequence) => calls.push(`abandoned ${String(sequence)}`),
-      failed: (sequence) => calls.push(`failed ${String(sequence)}`),
+      commit: (attempt, sequence) => calls.push(`commit ${String(attempt)} as ${String(sequence)}`),
+      abort: (attempt) => calls.push(`abort ${String(attempt)}`),
     };
     const path = await harness.open();
     let t = 0;
@@ -261,7 +327,53 @@ describe("extent deltas (ruling R25)", () => {
     await path.quiesce().catch(() => undefined);
     expect(path.failure).toBe(failure);
     // The initial root, then a prepared flush that failed: nothing after it was published.
-    expect(calls).toEqual(["prepare 1", "published 1", "prepare 2", "failed 2"]);
+    expect(calls).toEqual(["prepare 1", "commit 1 as 1", "prepare 2", "abort 2"]);
+    await harness.close();
+  });
+
+  it("a sink that rejects a merge's prepare fails the write path (no retry around it)", async () => {
+    const harness = new Harness("strict", "memory", 2, undefined, { merges: { fanIn: 2 } });
+    const calls: string[] = [];
+    let reject = false;
+    let refused = 0;
+    harness.extentDeltas = {
+      prepare: (attempt) => {
+        calls.push(`prepare ${String(attempt)}`);
+        // A merge's prepare only: a retry around it would prepare (and be refused) again.
+        if (reject && (new Error().stack ?? "").includes("#merge")) {
+          refused += 1;
+          throw new Error("sink refuses");
+        }
+        return null;
+      },
+      commit: (attempt) => calls.push(`commit ${String(attempt)}`),
+      abort: (attempt) => calls.push(`abort ${String(attempt)}`),
+    };
+    const path = await harness.open();
+    let t = 0;
+    await autocommit(path, async (s) => {
+      t =
+        (
+          await s.changeCatalog({
+            kind: "createTable",
+            table: tableInput("t", [column("id", INT, false)]),
+          })
+        ).id ?? 0;
+    });
+    // Flushes commit; then the sink refuses the merge two runs make: the path fails, no retry.
+    reject = true;
+    await autocommit(path, (s) => s.table(t).insert(batch(ints([1, 2])), null));
+    await autocommit(path, (s) => s.table(t).insert(batch(ints([3, 4])), null));
+    await autocommit(path, (s) => s.table(t).insert(batch(ints([5])), null)).catch(() => undefined);
+    await path.quiesce().catch(() => undefined);
+    expect(refused).toBe(1);
+    expect(path.failure).toBeInstanceOf(ExtentSinkError);
+    expect(path.maintenance.merges).toBe(0);
+    const last = calls[calls.length - 1] ?? "";
+    expect(last.startsWith("abort")).toBe(true);
+    expect(calls.filter((call) => call.startsWith("prepare")).length).toBe(
+      calls.filter((call) => !call.startsWith("prepare")).length,
+    );
     await harness.close();
   });
 
