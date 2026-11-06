@@ -17,6 +17,7 @@
  */
 import { xxHash32 } from "../hash/xxhash32.js";
 import { DATA_ALIGN, StoreCorruptionError } from "../storage/contract.js";
+import { VERIFY_CACHED_BYTES, verifyCached } from "../storage/verify-cached.js";
 import {
   MAX_BLOB_BYTES,
   MAX_READ_BYTES,
@@ -138,6 +139,9 @@ export class MemoryExtentSpace implements ExtentReader {
 
   /** Drops every cached blob (and the descriptors attached to them). */
   evict(): void {
+    if (VERIFY_CACHED_BYTES)
+      for (const [key, bytes] of this.#cache)
+        verifyCached(bytes, Number(key.split(":")[2]), "eviction");
     this.#cache.clear();
     this.#parsed.clear();
   }
@@ -210,6 +214,10 @@ export class MemoryExtentSpace implements ExtentReader {
       release: () => {
         if (released) return;
         released = true;
+        if (VERIFY_CACHED_BYTES)
+          refs.forEach((ref, index) =>
+            verifyCached(bytes[index] ?? new Uint8Array(0), ref.checksum, "lease release"),
+          );
         this.leased -= total;
         options.budget.free(total);
       },

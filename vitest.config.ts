@@ -24,6 +24,10 @@ export default defineConfig({
     // parallelism turns CPU/heap contention into unrelated timeouts on large developer hosts.
     // Keep the existing deadlines and bound simultaneous heavy suites instead.
     maxWorkers: Math.min(4, availableParallelism()),
+    // Test builds re-verify a cached blob's checksum when its lease is released or it is evicted
+    // (packages/core/src/next/storage/verify-cached.ts): a consumer that writes into bytes the
+    // cache treats as immutable fails loudly in whichever suite does it.
+    env: { MINNOW_VERIFY_CACHED_BYTES: "1" },
     projects: [
       {
         extends: true,

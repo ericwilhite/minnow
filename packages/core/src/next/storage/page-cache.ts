@@ -6,8 +6,11 @@
  * - **Charging.** An unpinned entry is charged to the governor's cache handle (its bytes plus
  *   `ENTRY_OVERHEAD`). A pinned entry (held by at least one lease) is charged to each lease's
  *   budget instead and is not evictable: the cache uncharges it on the first pin and charges it
- *   again when the last lease releases it, or drops it if the governor has no room. The two fixed
- *   slabs (read and write, 1 MiB each) are charged once at `attach`.
+ *   again when the last lease releases it, or drops it if the governor has no room. A reader's
+ *   parsed descriptor (`attachParsed`) is charged to the cache handle from the moment it is
+ *   attached until its entry is gone, whether the entry is pinned or not: pinning moves only the
+ *   blob's bytes and overhead. The two fixed slabs (read and write, 1 MiB each) are charged once
+ *   at `attach`.
  * - **Segmented LRU.** A new entry enters probation; a second use promotes it to protected, which
  *   is held to `PROTECTED_SHARE` of resident bytes (its least recently used entries are demoted to
  *   probation). Eviction takes probation's least recently used first. A miss that cannot be
@@ -21,6 +24,7 @@
  *   and pinned entries are never in a list, so a nested eviction sees a consistent cache.
  */
 import { xxHash32 } from "../hash/xxhash32.js";
+import { VERIFY_CACHED_BYTES, verifyCached } from "./verify-cached.js";
 import { StoreClosedError, StoreCorruptionError, type StoreSession } from "./contract.js";
 import {
   MAX_BLOB_BYTES,
@@ -104,6 +108,12 @@ export interface CacheStats {
 
 /** What an unpinned entry is charged: its bytes, its overhead and any attached descriptor. */
 const charge = (entry: Entry) => entry.length + ENTRY_OVERHEAD + entry.parsedBytes;
+/**
+ * The part of that charge that moves to the leases while an entry is pinned. An attached
+ * descriptor's bytes stay charged to the cache from `attachParsed` until the entry is gone,
+ * pinned or not (review B2-p2e #1): readers' leases pay for blob bytes only.
+ */
+const base = (entry: Entry) => entry.length + ENTRY_OVERHEAD;
 
 const EMPTY = new Uint8Array(0);
 /** xxHash32 (seed 0) of no bytes: the only valid checksum of a zero-length blob. */
@@ -206,9 +216,9 @@ export class PageCache implements EvictableCacheLike {
   }
 
   /**
-   * Attaches a parsed descriptor to `ref`'s resident entry (extents.ts `ExtentReader.attach`).
-   * An unpinned entry is charged `bytes` more now; a pinned one when its last lease goes, with
-   * the rest of the entry. Evicted, dropped or forgotten with the entry.
+   * Attaches a parsed descriptor to `ref`'s resident entry (extents.ts `ExtentReader.attach`),
+   * charging `bytes` to the cache now, pinned or not; the charge stays until the entry is
+   * evicted, dropped or forgotten, with which the descriptor goes.
    */
   attachParsed(ref: BlobRef, parsed: object, bytes: number): boolean {
     const entry = this.#find(ref);
@@ -216,12 +226,11 @@ export class PageCache implements EvictableCacheLike {
     if (entry?.parsed !== null || this.#closed) return false;
     if (!(Number.isSafeInteger(bytes) && bytes >= 0))
       throw new RangeError("A descriptor's size must be a byte count");
-    if (entry.segment !== "pinned") {
-      if (this.#memory?.charge(bytes) !== true) return false;
-      // Listed: its list's bytes include the descriptor from now on.
-      if (entry.segment === "probation") this.#probation.bytes += bytes;
-      else this.#protected.bytes += bytes;
-    }
+    // Charged before it is attached, pinned or not: refused, nothing is attached.
+    if (this.#memory?.charge(bytes) !== true) return false;
+    // Listed: its list's bytes include the descriptor from now on.
+    if (entry.segment === "probation") this.#probation.bytes += bytes;
+    else if (entry.segment === "protected") this.#protected.bytes += bytes;
     entry.parsed = parsed;
     entry.parsedBytes = bytes;
     return true;
@@ -278,7 +287,7 @@ export class PageCache implements EvictableCacheLike {
         this.#hits += 1;
         entry.hot = true;
         if (entry.pins === 0) {
-          uncharge += charge(entry);
+          uncharge += base(entry); // its descriptor stays charged here
           this.#unlist(entry);
           entry.segment = "pinned";
           this.#pinnedBytes += entry.length;
@@ -306,6 +315,8 @@ export class PageCache implements EvictableCacheLike {
       release: () => {
         if (released) return;
         released = true;
+        if (VERIFY_CACHED_BYTES)
+          for (const entry of held) verifyCached(entry.bytes, entry.checksum, "lease release");
         this.#unpinAll(held);
         budget.free(total);
       },
@@ -431,16 +442,27 @@ export class PageCache implements EvictableCacheLike {
       this.#pinnedBytes -= entry.length;
       if (entry.dropped || this.#closed) {
         entry.segment = "probation";
+        this.#releaseParsed(entry);
         continue;
       }
       this.#admit(entry);
     }
   }
 
-  /** Charges an unpinned entry to the cache, evicting probation for it, or drops it. */
+  /** Gives back an entry's descriptor charge (the entry is leaving the cache). */
+  #releaseParsed(entry: Entry): void {
+    if (entry.parsedBytes > 0) this.#memory?.release(entry.parsedBytes);
+    entry.parsed = null;
+    entry.parsedBytes = 0;
+  }
+
+  /**
+   * Charges an unpinned entry to the cache (its descriptor is charged already), evicting
+   * probation for it, or drops it with its descriptor.
+   */
   #admit(entry: Entry): void {
     const memory = this.#memory;
-    const cost = charge(entry);
+    const cost = base(entry);
     let admitted = memory?.charge(cost) ?? false;
     if (!admitted && memory !== null && this.#probationCharge() >= cost) {
       // Recycle probation (a scan's own pages) to make room; never protected.
@@ -452,6 +474,7 @@ export class PageCache implements EvictableCacheLike {
     if (!admitted) {
       entry.segment = "probation";
       this.#forget(entry);
+      this.#releaseParsed(entry);
       return;
     }
     entry.segment = "probation";
@@ -492,6 +515,7 @@ export class PageCache implements EvictableCacheLike {
 
   /** Removes an unpinned, listed entry and returns its charge to the governor. */
   #evictEntry(entry: Entry): number {
+    if (VERIFY_CACHED_BYTES) verifyCached(entry.bytes, entry.checksum, "eviction");
     this.#unlist(entry);
     this.#forget(entry);
     const cost = charge(entry);
