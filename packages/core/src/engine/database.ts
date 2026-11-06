@@ -1,3 +1,4 @@
+import { expandedRowLock } from "./row-locking.js";
 import { identifyKeyChange } from "./key-change.js";
 import { normalizeForeignKeys, type ReferenceTable } from "./foreign-key-schema.js";
 import {
@@ -48,7 +49,7 @@ import { LiveAggregate } from "./live-aggregate.js";
 import { stageLiveExecution } from "./live-accept.js";
 import { QueryGenerations } from "./query-generations.js";
 import { applyWindowFunctionsAsync } from "./windows.js";
-import { crossJoinPlan, type RowLocking } from "../plan/model.js";
+import { crossJoinPlan } from "../plan/model.js";
 import {
   definedVectors,
   toColumnarBatchSteps,
@@ -2636,21 +2637,6 @@ function admitToTransaction(
       throw readOnlyTransactionError(`SELECT FOR ${statement.read.rowLocking}`);
   }
   open.queried = true;
-}
-
-/** Row lock strengths, weakest first (PostgreSQL's LockClauseStrength). */
-const ROW_LOCK_ORDER: readonly RowLocking[] = ["KEY SHARE", "SHARE", "NO KEY UPDATE", "UPDATE"];
-
-/** The strongest of these locks, as PostgreSQL names it in its refusal. */
-function strongestRowLock(locks: ReadonlyArray<RowLocking | undefined>): RowLocking | undefined {
-  let strongest: RowLocking | undefined;
-  for (const lock of locks)
-    if (
-      lock !== undefined &&
-      (strongest === undefined || ROW_LOCK_ORDER.indexOf(lock) > ROW_LOCK_ORDER.indexOf(strongest))
-    )
-      strongest = lock;
-  return strongest;
 }
 
 /** The command PostgreSQL names in that refusal: the statement's tag. */
@@ -6374,8 +6360,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     // A read-only transaction refuses a row lock wherever it is written: in the statement, or in
     // a view it reads, at any depth (PostgreSQL checks the planned query, views expanded).
     if (this.#openTransaction?.readOnly === true) {
-      const locks = [plan.rowLocking, ...[...bodies.values()].map((body) => body.rowLocking)];
-      const strongest = strongestRowLock(locks);
+      const strongest = expandedRowLock(plan, bodies.values());
       if (strongest !== undefined) throw readOnlyTransactionError(`SELECT FOR ${strongest}`);
     }
     if (planReadsTable(rewritten, (name) => domains.has(name) || types.has(name))) {

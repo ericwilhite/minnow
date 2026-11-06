@@ -7,7 +7,12 @@
 import { PGlite } from "@electric-sql/pglite";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { MemoryBlockStore } from "../storage/index.js";
-import { createReach, REFUSAL_STATES, ROW_LOCK_TARGET_STATES } from "../testing/reach.js";
+import {
+  createReach,
+  REFUSAL_STATES,
+  ROW_LOCK_TARGET_STATES,
+  ROW_LOCK_VIEW_STATES,
+} from "../testing/reach.js";
 import { MinnowDatabase } from "./database.js";
 import { compileQuery, compileStatement } from "./query.js";
 
@@ -34,6 +39,7 @@ const SETUP = [
   "CREATE VIEW vs AS SELECT * FROM t FOR SHARE",
   "CREATE VIEW vp AS SELECT * FROM t",
   "CREATE VIEW vv AS SELECT * FROM vl",
+  "CREATE VIEW vc AS SELECT 1 AS n",
 ];
 
 /** Statements that open a transaction and set (or leave) its access mode. */
@@ -153,6 +159,8 @@ const ENTRY_POINTS: ReadonlyArray<
 
 /** Reads a read-only transaction refuses, or runs (review B6 stream A 2, findings 1 and 3). */
 const LOCK_TARGETS = [
+  ["unused CTE", "WITH x AS (SELECT * FROM t FOR UPDATE) SELECT 1 AS n"],
+  ["unused CTE", "WITH x AS (SELECT * FROM vl) SELECT 1 AS n"],
   ["constant derived", "SELECT * FROM (SELECT 1 AS n) s FOR UPDATE"],
   ["CTE", "WITH x AS (SELECT * FROM t) SELECT * FROM x FOR UPDATE"],
   ["table derived", "SELECT * FROM (SELECT * FROM t) s FOR UPDATE"],
@@ -365,6 +373,28 @@ describe("READ ONLY across entry points, row locks and savepoints (review B6 str
     expect(mismatches.join("\n")).toBe("");
     reach.assertReached();
     targets.assertReached();
+  });
+
+  it("treats a constant view as a relation target in READ ONLY", async () => {
+    const reach = createReach<string>("constant view lock target", ROW_LOCK_VIEW_STATES);
+    for (const begin of ["BEGIN READ ONLY", "BEGIN", "BEGIN READ WRITE"])
+      for (const clause of ["UPDATE", "NO KEY UPDATE", "SHARE", "KEY SHARE"])
+        for (const [, entry] of ENTRY_POINTS) {
+          reach.beginHistory();
+          const sql = `SELECT * FROM vc FOR ${clause}`;
+          const expected = await pgRun([begin, sql]);
+          const actual = await minnowRun([begin, sql], entry);
+          // PG uses generic SELECT here (permission check), while Minnow names the strength.
+          // This new control compares SQLSTATE; existing exact-message campaigns stay intact.
+          expect(expected === "ok" ? "ok" : expected.split(" ")[0], sql).toBe(
+            begin === "BEGIN READ ONLY" ? "25006" : "ok",
+          );
+          expect(actual === "ok" ? "ok" : actual.split(" ")[0], sql).toBe(
+            begin === "BEGIN READ ONLY" ? "25006" : "ok",
+          );
+          reach.reach(begin === "BEGIN READ ONLY" ? "read only refused" : "read write allowed");
+        }
+    reach.assertReached();
   });
 
   it("preserves compiled transaction modes and the first-statement rule", async () => {

@@ -10,6 +10,10 @@ compatibility policy and release process.
 
 ## Unreleased
 
+A locking clause in an unused CTE no longer causes a read-only query to fail. A referenced
+CTE's own clause still counts. Parsing and view expansion share the same lock-target and
+strongest-lock rules with the internal rebuild lowerer. No stored-format change.
+
 Not yet released. Some SQL that used to run now fails, and some now answers differently, so the
 next release is a minor one, as the [versioning policy](/docs/reference/versioning) requires
 during 0.x. It will name its packages here. Each change says what to rewrite; the **Migration**

@@ -60,7 +60,8 @@ escapes, and `$tag$…$tag$` dollar quotes; `5.` and `.5` are numbers; `~~`, `!~
 `!~~*` spell `LIKE`, `NOT LIKE`, `ILIKE`, and `NOT ILIKE`; `TABLE name` is `SELECT * FROM name`;
 and a trailing `FOR UPDATE` or `FOR SHARE` takes no row locks. In a `READ ONLY` transaction,
 a clause that reaches a table or view is refused, including through FROM subqueries. An outer
-clause on a CTE reference or constant-only source locks nothing and is allowed.
+clause on a CTE reference or constant-only source locks nothing and is allowed. A referenced
+CTE's own locking clause counts, while an unused CTE's clause does not.
 
 Casts take either spelling, `CAST(total AS INTEGER)` or `total::INTEGER`; the postfix form binds
 tighter than every operator, so `-total::INTEGER * 2` is `(-(total::INTEGER)) * 2`. A double

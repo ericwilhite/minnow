@@ -364,6 +364,7 @@ export const REFUSAL_STATES = ["refused", "accepted"] as const;
 
 /** Outer locking target shapes compared with PostgreSQL in the read-only campaign. */
 export const ROW_LOCK_TARGET_STATES = [
+  "unused CTE",
   "constant derived",
   "CTE",
   "table derived",
@@ -372,3 +373,6 @@ export const ROW_LOCK_TARGET_STATES = [
   "series",
   "empty table",
 ] as const;
+
+/** A view remains a relation lock target even when its body has no table. */
+export const ROW_LOCK_VIEW_STATES = ["read only refused", "read write allowed"] as const;

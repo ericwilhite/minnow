@@ -1,3 +1,4 @@
+import { sourceLocksRelation, strongestRowLock, withRowLock } from "./row-locking.js";
 import { checkedInteger, checkedSum } from "./integer-exactness.js";
 import { castSqlValue, datetimeText } from "./sql-casts.js";
 import { parseJson } from "../block-format/json-parse.js";
@@ -48,7 +49,7 @@ import type {
   WindowFrameExclusion,
   WindowSpec,
 } from "../plan/model.js";
-import { crossJoinPlan } from "../plan/model.js";
+import { DUAL_TABLE, crossJoinPlan } from "../plan/model.js";
 export type {
   AggregateName,
   BinaryOperator,
@@ -1057,7 +1058,7 @@ interface Token {
  * table (parentheses never survive identifier parsing unquoted), and its single hidden column
  * keeps the row alive through columnar conversion, which derives row count from column vectors.
  */
-export const DUAL_TABLE = "(dual)";
+export { DUAL_TABLE } from "../plan/model.js";
 
 /** The dual source's single row, shared by every resolution path. */
 export function dualTableRows(): DatabaseRow[] {
@@ -8360,6 +8361,8 @@ class Parser {
         this.#keyword("MATERIALIZED");
       }
       this.#expectPunctuation("(");
+      const outerLocking = this.rowLocking;
+      this.rowLocking = undefined;
       if (recursive) {
         this.#recursiveCte(name, columns);
       } else {
@@ -8370,6 +8373,10 @@ class Parser {
         if (columns !== undefined) renameBlockOutputs(block, columns, name);
         this.#ctes.set(name, block);
       }
+      const body = this.#ctes.get(name) ?? this.#recursiveCtes.get(name)?.base;
+      const ownLocking = strongestRowLock([this.rowLocking]);
+      if (body !== undefined && ownLocking !== undefined) body.rowLocking = ownLocking;
+      this.rowLocking = outerLocking;
       if (!this.#punctuation(",")) break;
     }
   }
@@ -10095,22 +10102,8 @@ class Parser {
    * locks are not acquired. Retain the strongest clause that reaches a relation so a read-only
    * transaction can refuse it, as PostgreSQL does.
    */
-  #locksRelation(source: TableSource): boolean {
-    if (source.recursive !== undefined) return false;
-    if (source.derived !== undefined) {
-      return !this.#cteReferences.has(source.derived) && this.#blockLocksRelation(source.derived);
-    }
-    if (source.union !== undefined)
-      return source.union.blocks.some((block) => this.#blockLocksRelation(block));
-    if (source.windowed !== undefined) return this.#blockLocksRelation(source.windowed.block);
-    return source.table !== DUAL_TABLE;
-  }
-
-  #blockLocksRelation(block: CompiledQuery): boolean {
-    return [block.base, ...block.joins].some((source) => this.#locksRelation(source));
-  }
-
-  #lockingClause(sources: true | TableSource[]): void {
+  #lockingClause(sources: true | TableSource[]): RowLocking | undefined {
+    let local: RowLocking | undefined;
     while (this.#isKeyword("FOR")) {
       this.#keyword("FOR");
       let strength: RowLocking;
@@ -10143,20 +10136,20 @@ class Parser {
         sources === true ||
         sources.some(
           (source) =>
-            (targets.length === 0 || targets.includes(source.alias)) && this.#locksRelation(source),
+            (targets.length === 0 || targets.includes(source.alias)) &&
+            sourceLocksRelation(source, this.#cteReferences),
         );
-      if (
-        locks &&
-        (this.rowLocking === undefined ||
-          ROW_LOCKING_ORDER.indexOf(strength) > ROW_LOCKING_ORDER.indexOf(this.rowLocking))
-      )
-        this.rowLocking = strength;
+      if (locks) {
+        local = strongestRowLock([local, strength]);
+        this.rowLocking = strongestRowLock([this.rowLocking, strength]);
+      }
       if (this.#isKeyword("NOWAIT")) this.#keyword("NOWAIT");
       else if (this.#isKeyword("SKIP")) {
         this.#keyword("SKIP");
         this.#keyword("LOCKED");
       }
     }
+    return local;
   }
 
   #tailClauses(): {
@@ -10311,30 +10304,36 @@ class Parser {
     }
     const orderBy = compoundMember ? [] : this.#orderByClause();
     const tail = compoundMember ? {} : this.#tailClauses();
-    if (!compoundMember) this.#lockingClause([base, ...joins]);
+    const locking = compoundMember ? undefined : this.#lockingClause([base, ...joins]);
     if (distinctOn !== undefined) {
-      return this.#distinctOnBlock(
-        sql,
-        distinctOn,
-        { base, joins, select, predicates, groupBy, having, orderBy, groupingSets },
-        tail,
+      return withRowLock(
+        this.#distinctOnBlock(
+          sql,
+          distinctOn,
+          { base, joins, select, predicates, groupBy, having, orderBy, groupingSets },
+          tail,
+        ),
+        locking,
       );
     }
-    return assembleSelectBlock(
-      {
-        sql,
-        base,
-        joins,
-        select,
-        distinct,
-        predicates,
-        groupBy,
-        having,
-        orderBy,
-        ...tail,
-        ...(groupingSets === undefined ? {} : { groupingSets }),
-      },
-      this.nextDerivedSequence,
+    return withRowLock(
+      assembleSelectBlock(
+        {
+          sql,
+          base,
+          joins,
+          select,
+          distinct,
+          predicates,
+          groupBy,
+          having,
+          orderBy,
+          ...tail,
+          ...(groupingSets === undefined ? {} : { groupingSets }),
+        },
+        this.nextDerivedSequence,
+      ),
+      locking,
     );
   }
 
@@ -11177,6 +11176,7 @@ class Parser {
     const alias = this.#sourceAlias() ?? table;
     const cte = this.#ctes.get(table);
     if (cte !== undefined) {
+      this.rowLocking = strongestRowLock([this.rowLocking, cte.rowLocking]);
       const source = clonePlanTree(cte);
       this.#cteReferences.add(source);
       if (this.#peek().text === "(") {
@@ -11187,6 +11187,11 @@ class Parser {
     }
     const recursive = this.#recursiveCtes.get(table);
     if (recursive !== undefined) {
+      this.rowLocking = strongestRowLock([
+        this.rowLocking,
+        recursive.base.rowLocking,
+        recursive.step.rowLocking,
+      ]);
       return {
         table: `(recursive ${String(this.nextDerivedSequence())}) ${table}`,
         alias,
@@ -14850,8 +14855,6 @@ function timestampLiteral(text: string): Date {
 }
 
 /** The parser's OFFSET range contract, shared with the typed builder. */
-/** Row lock strengths, weakest first (PostgreSQL's LockClauseStrength). */
-const ROW_LOCKING_ORDER: readonly RowLocking[] = ["KEY SHARE", "SHARE", "NO KEY UPDATE", "UPDATE"];
 
 export function validateOffset(offset: number): number {
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > 100_000_000)

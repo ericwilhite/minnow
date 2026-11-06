@@ -451,6 +451,9 @@ export interface Predicate {
   escape?: string;
 }
 
+/** The dependency-free sentinel for a FROM-less SELECT. */
+export const DUAL_TABLE = "(dual)";
+
 /** A SELECT row-lock strength, as PostgreSQL names it. */
 export type RowLocking = "UPDATE" | "NO KEY UPDATE" | "SHARE" | "KEY SHARE";
 

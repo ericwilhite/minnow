@@ -217,7 +217,7 @@ describe("published core tarball", () => {
       // PostgreSQL name-resolution and DISTINCT ON fixes (1,015,868 measured), then 1,017,750 with
       // the transaction-mode grammar and READ ONLY enforcement (1,017,120 measured), then
       // 1,018,250 with PostgreSQL's name, argument and comment errors (1,017,725 measured), then
-      // 1,019,500 for the 0.20.0 SQL fixes (1,018,782 measured);
+      // 1,019,500 for the 0.20.0 SQL fixes (1,019,093 measured);
       // ratchets, not targets.
       expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_019_500);
       expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_500_000);
