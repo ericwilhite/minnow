@@ -1212,6 +1212,11 @@ columns in memory. `MINNOW_EXPORT_SCAN_RANGE_COMPARE=1` compares it against the 
 policy in five cold scan/transport rounds, with the frame adapter and owner policy held fixed.
 Contiguous compact batches can use range APIs while the scan's `gatherBatches` diagnostic still
 counts the compact-selection branch; selections with gaps continue to gather.
+The scan export requests a charged, coalesced row window from the core scan (64 MiB by default).
+`MINNOW_EXPORT_SCAN_IO_COMPARE=1` compares this one-pass policy with cached per-batch reads;
+`scripts/scan-io-bench.mts` isolates both over a fresh memory-backed page cache. Setup and warmup
+GC are outside its CPU/wall timings. The row window is optional; filters retain selective reads,
+and a refused window is released and reduced before falling back to ordinary batch loading.
 
 **Storage kill campaign.** The nightly run also runs `npm run test:storage-kills`: the rebuild
 core's storage in Chromium, on OPFS and on IndexedDB, killed 1,000 times each at seeded random

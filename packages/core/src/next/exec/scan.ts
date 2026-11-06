@@ -56,6 +56,7 @@ import type { GroupSegment } from "../access/snapshot.js";
 import type { ByteBudget, SpaceReader } from "../access/space.js";
 import type { ColumnPredicate, CompiledPredicate } from "../page/predicate.js";
 import type { FlatVector, Validity } from "../vector/vector.js";
+import { ChunkReader } from "../page/reader.js";
 
 /** A column chunk as a group segment names it (format/manifest.ts `ColumnChunk`). */
 export type ColumnChunkRef = NonNullable<ReturnType<GroupSegment["chunk"]>>;
@@ -164,6 +165,27 @@ export interface ChunkReads {
   open(
     pages: SpaceReader,
     chunk: ColumnChunkRef,
-    options: { readonly budget: ByteBudget; readonly signal?: AbortSignal },
+    options: {
+      readonly budget: ByteBudget;
+      readonly signal?: AbortSignal;
+      readonly once?: boolean;
+    },
   ): MaybePromise<ChunkPages>;
+  /** Coalesce a full scan's row window across columns; leases still belong to each reader. */
+  loadTogether?(
+    loads: ReadonlyArray<{ readonly reader: ChunkPages; readonly pages: readonly number[] }>,
+  ): MaybePromise<void>;
 }
+
+/** Ordinary B2 readers, including shared one-pass slabs for full-scan row windows. */
+export const chunkReads: ChunkReads = {
+  open: (pages, chunk, options) => ChunkReader.open(pages, chunk, options),
+  loadTogether(loads) {
+    return ChunkReader.loadTogether(
+      loads.map(({ reader, pages }) => {
+        if (!(reader instanceof ChunkReader)) throw new TypeError("Expected a B2 chunk reader");
+        return { reader, pages };
+      }),
+    );
+  },
+};

@@ -144,6 +144,10 @@ export interface ScanStats {
 }
 
 export interface TableScanOptions {
+  /** Full unfiltered scans: one-pass coalesced row windows when the reader factory supports it.
+   * Opt-in byte target; absent/zero keeps cached per-batch reads. Filtered scans stay selective.
+   */
+  readonly readWindowBytes?: number;
   readonly table: TableSnapshot;
   readonly pages: SpaceReader;
   readonly reads: ChunkReads;
@@ -191,6 +195,9 @@ interface GroupColumn {
 
 /** An open group segment and where the scan is in it. */
 interface OpenGroup {
+  windowRows: number;
+  windowEnd: number;
+  readonly releasedThrough: number[];
   readonly segment: GroupSegment;
   readonly columns: readonly GroupColumn[];
   readonly pushed: readonly PushedColumn[];
@@ -563,6 +570,11 @@ export class TableScan implements BatchSource {
     yield* this.#wait(segment.root());
     const columns: GroupColumn[] = [];
     const opened: ChunkPages[] = [];
+    const windowBytes =
+      this.#options.filter === null && this.#options.reads.loadTogether
+        ? (this.#options.readWindowBytes ?? 0)
+        : 0;
+    let storedBytes = 0;
     try {
       for (let c = 0; c < this.#defs.length; c++) {
         const def = at(this.#defs, c);
@@ -571,9 +583,13 @@ export class TableScan implements BatchSource {
           columns.push({ pages: null, missing: def.missing ?? nullOf(def.type) });
           continue;
         }
+        storedBytes += chunk.data.length;
         // Its page and value leases are charged through the scan's memory (see `ScanMemory`).
         const pages = yield* this.#wait(
-          this.#options.reads.open(this.#options.pages, chunk, { budget: this.#memory }),
+          this.#options.reads.open(this.#options.pages, chunk, {
+            budget: this.#memory,
+            ...(windowBytes > 0 ? { once: true } : {}),
+          }),
           (late) => {
             late.close();
           },
@@ -618,6 +634,20 @@ export class TableScan implements BatchSource {
       const deletions = yield* this.#wait(segment.deletions());
       this.stats.groupsRead += 1;
       return {
+        windowRows:
+          windowBytes > 0 && deletions === null
+            ? Math.min(
+                segment.rowCount,
+                Math.max(
+                  1,
+                  Math.floor(
+                    (windowBytes * segment.rowCount) / Math.max(1, storedBytes) / BATCH_ROWS,
+                  ),
+                ) * BATCH_ROWS,
+              )
+            : 0,
+        windowEnd: 0,
+        releasedThrough: columns.map(() => 0),
         segment,
         columns,
         pushed,
@@ -662,6 +692,7 @@ export class TableScan implements BatchSource {
       const to = Math.min(from + BATCH_ROWS, segment.rowCount);
       group.from = to;
       this.#releaseBefore(group, from);
+      yield* this.#prefetch(group, from);
       // Live rows, then each pushed conjunct, as group positions.
       const positions = this.#positions;
       let count: number;
@@ -702,14 +733,57 @@ export class TableScan implements BatchSource {
     }
   }
 
+  /** Plan once per window, then lease coalesced one-pass slabs across its columns. */
+  *#prefetch(group: OpenGroup, from: number): Step<void> {
+    if (group.windowRows === 0 || from < group.windowEnd) return;
+    for (;;) {
+      const end = Math.min(group.segment.rowCount, from + group.windowRows);
+      const loads = [];
+      for (const column of group.columns) {
+        const reader = column.pages;
+        if (reader === null) continue;
+        const [first, stop] = reader.pagesInRange(from, end);
+        const pages = [];
+        for (let p = first; p < stop; p++) if (!reader.isLoaded(p)) pages.push(p);
+        if (pages.length > 0) loads.push({ reader, pages });
+      }
+      try {
+        if (loads.length > 0) yield* this.#wait(this.#options.reads.loadTogether?.(loads));
+        group.windowEnd = end;
+        return;
+      } catch (error) {
+        // Prefetch is optional. A refused window gives back partial loads and shrinks; the
+        // ordinary batch path remains the fallback. Corruption/IO/abort errors still propagate.
+        if (!(
+          error instanceof Error &&
+          "code" in error &&
+          (error.code === "MINNOW_PAGE_BUDGET" || error.code === "MINNOW_READ_DENIED")
+        ))
+          throw error;
+        for (const column of group.columns) column.pages?.release();
+        group.releasedThrough.fill(0);
+        if (group.windowRows <= BATCH_ROWS) {
+          group.windowRows = 0;
+          return;
+        }
+        group.windowRows = Math.max(
+          BATCH_ROWS,
+          Math.floor(group.windowRows / 2 / BATCH_ROWS) * BATCH_ROWS,
+        );
+      }
+    }
+  }
+
   /** Pages wholly before `from` are no longer needed. */
   #releaseBefore(group: OpenGroup, from: number): void {
     if (from === 0) return;
-    for (const column of group.columns) {
+    for (const [c, column] of group.columns.entries()) {
       const pages = column.pages;
       if (pages === null) continue;
       const [first] = pages.pagesInRange(from, from + 1);
-      if (first > 0) pages.release(Array.from({ length: first }, (_, k) => k));
+      const held = group.releasedThrough[c] ?? 0;
+      if (first > held) pages.release(Array.from({ length: first - held }, (_, k) => held + k));
+      group.releasedThrough[c] = first;
     }
   }
 
@@ -728,6 +802,7 @@ export class TableScan implements BatchSource {
 
   /** Loads the pages of every output column that `spec` touches (sizing and decoding read them). */
   *#loadPages(group: OpenGroup, spec: DecodeSpec): Step<void> {
+    if (group.windowRows > 0 && "from" in spec && spec.to <= group.windowEnd) return;
     for (const column of group.columns) {
       const pages = column.pages;
       if (pages === null) continue;
@@ -744,8 +819,10 @@ export class TableScan implements BatchSource {
       const pages = at(group.columns, c).pages;
       if (pages === null) continue;
       if ("from" in spec) {
-        const [first, end] = pages.pagesInRange(spec.from, spec.to);
-        yield* this.#wait(pages.load(Array.from({ length: end - first }, (_, k) => first + k)));
+        if (!(group.windowRows > 0 && spec.to <= group.windowEnd)) {
+          const [first, end] = pages.pagesInRange(spec.from, spec.to);
+          yield* this.#wait(pages.load(Array.from({ length: end - first }, (_, k) => first + k)));
+        }
         yield* this.#wait(pages.loadValues(spec.from, spec.to));
       } else {
         yield* this.#wait(pages.load(pages.pagesForRows(spec.rows, 0, spec.count)));

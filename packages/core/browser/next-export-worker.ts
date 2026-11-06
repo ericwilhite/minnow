@@ -64,6 +64,7 @@ export type ExportRequest =
       readonly mode?: "pages" | "scan";
       readonly frameCopy?: "baseline" | "candidate";
       readonly scanRange?: "baseline" | "candidate";
+      readonly scanIO?: "batch" | "window";
       readonly resultPort?: MessagePort;
     }
   | { readonly op: "remove"; readonly dir: string };
@@ -292,6 +293,7 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
         ? await scanExport(space, request.groups, {
             budget: grant,
             resultBudget: resultGrant,
+            readWindowBytes: request.scanIO === "batch" ? 0 : (request.windowMiB ?? 64) * MiB,
             port: request.resultPort,
           })
         : await stream(space, request.groups, {

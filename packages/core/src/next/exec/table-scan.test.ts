@@ -51,6 +51,7 @@ import {
 import { OutputArena } from "./kernels/vectors.js";
 import { andThen } from "./pushdown.js";
 import type { ChunkPages, ChunkReads, ColumnChunkRef } from "./scan.js";
+import { chunkReads } from "./scan.js";
 import { TableScan, type ScanStats, type TableScanOptions } from "./table-scan.js";
 
 /** `xs[i]`, which must exist. */
@@ -407,6 +408,119 @@ function scanOf(
 }
 
 describe("table scan: pushdown, gather and late materialization never change the answer", () => {
+  it.each(seedsFor("next-scan-windows", [0xb2a1, 0xb2a2]))(
+    "one-pass row windows balance retries and cancellation (seed %i)",
+    async (seed) => {
+      const reach = createReach("next-scan-windows", [
+        "shared window",
+        "refused partial window",
+        "shrunk window",
+        "window error",
+        "abort suspended window",
+        "out-of-line text",
+      ] as const);
+      await fc.assert(
+        fc.asyncProperty(
+          fc.integer({ min: 100, max: 500 }),
+          fc.boolean(),
+          fc.integer(),
+          fc.constantFrom("normal", "refuse", "refuse-large", "error", "abort"),
+          async (count, longText, inner, mode) => {
+            reach.beginHistory();
+            const actualCount = count + (mode === "refuse-large" ? 3000 : 0);
+            const source = rowsOf(mulberry32(inner), actualCount, longText),
+              space = new MemoryExtentSpace();
+            const table: TableSnapshot = {
+              tableId: 9,
+              schemaVersion: 1,
+              columns: DEFS,
+              liveRowCount: actualCount,
+              segments: [await groupSegment(0, source, new Set(), false, space)],
+            };
+            const pages = space.view({ cache: true }),
+              budget = counting();
+            let windows = 0,
+              once = true;
+            let partial: { reader: ChunkPages; page: number } | null = null;
+            let arrived = (): void => undefined,
+              unblock = (): void => undefined;
+            const entered = new Promise<void>((r) => {
+                arrived = r;
+              }),
+              gate = new Promise<void>((r) => {
+                unblock = r;
+              });
+            const reads: ChunkReads = {
+              open: (p, c, o) => {
+                once &&= o.once === true;
+                return chunkReads.open(p, c, o);
+              },
+              loadTogether: async (loads) => {
+                windows++;
+                if (windows === 2 && partial !== null)
+                  expect(partial.reader.isLoaded(partial.page)).toBe(false);
+                if (windows === 1 && mode !== "normal") {
+                  await chunkReads.loadTogether?.(loads.slice(0, 1));
+                  const first = loads[0];
+                  if (first?.pages[0] !== undefined)
+                    partial = { reader: first.reader, page: first.pages[0] };
+                  if (mode === "refuse" || mode === "refuse-large")
+                    throw Object.assign(new Error("injected read refusal"), {
+                      code: "MINNOW_READ_DENIED",
+                    });
+                  if (mode === "error") throw new Error("injected window error");
+                  arrived();
+                  await gate;
+                  return;
+                }
+                await chunkReads.loadTogether?.(loads);
+              },
+            };
+            const scan = scanOf(table, space, null, {
+              pages,
+              reads,
+              budget,
+              readWindowBytes: 64 * 1024 * 1024,
+              targetBytes: 1024,
+            });
+            if (mode === "abort") {
+              const pending = scan.next();
+              const waiting = await Promise.race([
+                entered.then(() => true),
+                Promise.resolve(pending).then(() => false),
+              ]);
+              if (!waiting) {
+                scan.abort();
+                throw new Error("Expected a shared window before the first batch");
+              }
+              scan.abort();
+              unblock();
+              expect(await pending).toBeNull();
+              reach.reach("abort suspended window");
+            } else if (mode === "error") {
+              await expect(collect(scan)).rejects.toThrow("injected window error");
+              reach.reach("window error");
+            } else {
+              expect(await collect(scan)).toEqual(source.map((r) => expectedRow(r, false)));
+              reach.reach(mode === "normal" ? "shared window" : "refused partial window");
+              if (mode === "refuse-large") {
+                expect(windows).toBeGreaterThan(1);
+                reach.reach("shrunk window");
+              }
+              if (source.some((r) => (r.t?.length ?? 0) > 512)) reach.reach("out-of-line text");
+            }
+            expect(windows).toBeGreaterThan(0);
+            expect(once).toBe(true);
+            scan.close();
+            expect(budget.held).toBe(0);
+          },
+        ),
+        { seed, numRuns: 24 },
+      );
+      reach.assertReached();
+    },
+  );
+
   it.each(seedsFor("next-table-scan-ranges", [0x5ca92, 0x5ca93]))(
     "contiguous split prefixes use range APIs; gaps preserve positions (seed %i)",
     async (seed) => {

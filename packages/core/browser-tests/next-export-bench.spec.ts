@@ -8,8 +8,9 @@
  * MINNOW_EXPORT_SCAN_COMPARE=1 adds a second mode: B4's real TableScan and pipeline driver,
  * a labelled bench adapter standing in for the executor's future frame assembly (not yet on
  * main), real ResultChannel/frameByteLength/owner transfer policy and MessagePort credits.
- * Fixture descriptors replace SQL/catalog/group-root loading. The scan uses its normal
- * cached ChunkReader policy and byte target; the page-stream mode uses one-pass pooled reads.
+ * Fixture descriptors replace SQL/catalog/group-root loading. The scan requests a one-pass
+ * coalesced row window from TableScan (64 MiB by default), with its ordinary byte target.
+ * MINNOW_EXPORT_SCAN_IO_COMPARE=1 compares it with the parent cached per-batch policy.
  * Five interleaved cold/warm attempts per mode; sparse CDP profiles bracket setup-excluded
  * thread CPU (1-second sampling interval, not a hotspot profile). Both await all frame credits.
  * MINNOW_EXPORT_SCAN_PROFILE=1 instead profiles only the scan worker, cold and warm, requesting
@@ -64,11 +65,13 @@ const COMPARE_STREAM = process.env.MINNOW_EXPORT_COMPARE_STREAM === "1";
 const SCAN_PROFILE = process.env.MINNOW_EXPORT_SCAN_PROFILE === "1";
 const FRAME_COPY_COMPARE = process.env.MINNOW_EXPORT_FRAME_COPY_COMPARE === "1";
 const SCAN_RANGE_COMPARE = process.env.MINNOW_EXPORT_SCAN_RANGE_COMPARE === "1";
+const SCAN_IO_COMPARE = process.env.MINNOW_EXPORT_SCAN_IO_COMPARE === "1";
 const SCAN_COMPARE =
   process.env.MINNOW_EXPORT_SCAN_COMPARE === "1" ||
   SCAN_PROFILE ||
   FRAME_COPY_COMPARE ||
-  SCAN_RANGE_COMPARE;
+  SCAN_RANGE_COMPARE ||
+  SCAN_IO_COMPARE;
 const DEPTH_COMPARE = process.env.MINNOW_EXPORT_DEPTH_COMPARE === "1";
 const READ_COMPARE = process.env.MINNOW_EXPORT_READ_COMPARE === "1";
 const VARIANCE = process.env.MINNOW_EXPORT_VARIANCE === "1";
@@ -522,7 +525,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     };
 
     const base = { once: true, capMiB: 512, passes: 1, groups: exported };
-    if (FRAME_COPY_COMPARE || SCAN_RANGE_COMPARE) {
+    if (FRAME_COPY_COMPARE || SCAN_RANGE_COMPARE || SCAN_IO_COMPARE) {
       const options = {
         ...base,
         mode: "scan" as const,
@@ -536,12 +539,16 @@ test.describe("rebuild core export on OPFS (bench)", () => {
           ? (["baseline", "candidate"] as const)
           : (["candidate", "baseline"] as const))
           await measure(
-            `cold scan ${FRAME_COPY_COMPARE ? "frame copy" : "range"} ${variant} round ${String(round)}`,
+            `cold scan ${FRAME_COPY_COMPARE ? "frame copy" : SCAN_IO_COMPARE ? "IO" : "range"} ${variant} round ${String(round)}`,
             true,
             false,
             {
               ...options,
-              ...(FRAME_COPY_COMPARE ? { frameCopy: variant } : { scanRange: variant }),
+              ...(FRAME_COPY_COMPARE
+                ? { frameCopy: variant }
+                : SCAN_IO_COMPARE
+                  ? { scanIO: variant === "baseline" ? ("batch" as const) : ("window" as const) }
+                  : { scanRange: variant }),
             },
           );
     } else if (SCAN_COMPARE) {
@@ -726,13 +733,17 @@ test.describe("rebuild core export on OPFS (bench)", () => {
               "bench stand-in for future executor frame assembly; real TableScan/ResultChannel/owner transfer policy/MessagePort credits; fixture descriptors exclude SQL/catalog/root loading",
             cpuSamplingIntervalUs: SCAN_PROFILE ? 500 : 1_000_000,
             rounds:
-              FRAME_COPY_COMPARE || SCAN_RANGE_COMPARE
+              FRAME_COPY_COMPARE || SCAN_RANGE_COMPARE || SCAN_IO_COMPARE
                 ? 5
                 : Number(process.env.MINNOW_EXPORT_SCAN_ROUNDS ?? (SCAN_PROFILE ? 1 : 5)),
             scanProfile: SCAN_PROFILE,
+            ...(SCAN_IO_COMPARE
+              ? { scanIOComparison: "cached per-batch vs coalesced one-pass 64 MiB row windows" }
+              : {}),
             coldOnly:
               FRAME_COPY_COMPARE ||
               SCAN_RANGE_COMPARE ||
+              SCAN_IO_COMPARE ||
               process.env.MINNOW_EXPORT_SCAN_COLD_ONLY === "1",
             ...(SCAN_RANGE_COMPARE
               ? {

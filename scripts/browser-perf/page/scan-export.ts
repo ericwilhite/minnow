@@ -11,7 +11,7 @@ import type {
   TableSnapshot,
 } from "../../../packages/core/src/next/access/snapshot.js";
 import type { ByteBudget, ExtentReader } from "../../../packages/core/src/next/storage/extents.js";
-import { ChunkReader } from "../../../packages/core/src/next/page/reader.js";
+import { chunkReads } from "../../../packages/core/src/next/exec/scan.js";
 import { TableScan, type ScanStats } from "../../../packages/core/src/next/exec/table-scan.js";
 import { OutputArena } from "../../../packages/core/src/next/exec/kernels/vectors.js";
 import {
@@ -85,7 +85,12 @@ function tableOf(groups: readonly ExportGroup[]): TableSnapshot {
 export async function scanExport(
   space: ExtentReader,
   groups: readonly ExportGroup[],
-  options: { budget: ByteBudget; resultBudget: ByteBudget; port: MessagePort },
+  options: {
+    budget: ByteBudget;
+    resultBudget: ByteBudget;
+    port: MessagePort;
+    readWindowBytes?: number;
+  },
 ): Promise<ExportResult & { scanStats: ScanExportStats }> {
   const table = tableOf(groups),
     port = options.port;
@@ -105,7 +110,8 @@ export async function scanExport(
   const scan = new TableScan({
     table,
     pages: space,
-    reads: { open: (pages, chunk, opts) => ChunkReader.open(pages, chunk, opts) },
+    reads: chunkReads,
+    readWindowBytes: options.readWindowBytes ?? 64 * 1024 * 1024,
     budget: options.budget,
     columns: table.columns.map((c) => c.id),
     filter: null,

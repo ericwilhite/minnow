@@ -593,8 +593,13 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     returns cumulative credits at half the window or the owner's release delay. The timed
     export ends after all credits return. The client consumes typed frames, not JS row objects.
   - Table/group descriptors come from the fixture, replacing SQL lowering and B3 catalog/root
-    loading. The scan uses its normal cached chunk reads and byte-bounded batches; it does not
-    inherit the page benchmark's `once`, cross-column window or pooled read policy. Reported
+    loading. The scan requests a 64 MiB row window through `TableScan.readWindowBytes` and
+    the `chunkReads` factory: B2's shared `loadTogether` and one-pass pooled leases. The core
+    option is explicit; ordinary callers keep cached batch reads, and filtered/deleted groups
+    retain selective reads. A refused optional window drops partial loads and shrinks before
+    falling back to batch reads. `MINNOW_EXPORT_SCAN_IO_COMPARE=1` compares both policies over
+    five interleaved cold rounds; `scripts/scan-io-bench.mts` isolates the real scan/cache over
+    memory, with fresh caches, untimed warmup GC, and CPU/wall/read/charge measurements. Reported
     scan assembly/post/credit and inclusive `next()` timers can overlap; they are not exclusive
     phase shares. Raw scan statistics reveal dense/gather batches, splits and storage calls.
   - Sparse CDP profiles (one-second sample interval) bracket setup-excluded worker CPU, not
