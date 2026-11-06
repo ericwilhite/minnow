@@ -140,6 +140,33 @@ function unite(
   return { union, previousOnly };
 }
 
+/**
+ * Checks that a root's startup source (its extent list) and the full walk name exactly the same
+ * extents (ruling R25): anything else is `StoreCorruptionError`.
+ */
+function sameExtents(
+  listed: ReadonlyMap<number, number>,
+  walked: ReadonlyMap<number, number>,
+  which: string,
+): void {
+  for (const [offset, length] of walked) {
+    const listedLength = listed.get(offset);
+    if (listedLength === undefined)
+      throw new StoreCorruptionError(
+        `The ${which} root's extent list misses the extent at ${String(offset)} that it reaches`,
+      );
+    if (listedLength !== length)
+      throw new StoreCorruptionError(
+        `The ${which} root's extent list gives the extent at ${String(offset)} ${String(listedLength)} bytes, the walk ${String(length)}`,
+      );
+  }
+  for (const offset of listed.keys())
+    if (!walked.has(offset))
+      throw new StoreCorruptionError(
+        `The ${which} root's extent list names the extent at ${String(offset)}, which it does not reach`,
+      );
+}
+
 export const openExtentSpace: OpenExtentSpace = async (session, options) => {
   options.signal?.throwIfAborted();
   const root = await session.readRoot();
@@ -161,6 +188,19 @@ export const openExtentSpace: OpenExtentSpace = async (session, options) => {
       options.budget,
       dataLength,
     );
+    const walk = options.walk;
+    if (walk !== undefined && options.verifyAtOpen === true) {
+      sameExtents(
+        current,
+        await collect(root, walk, reader, options.budget, dataLength),
+        "current",
+      );
+      sameExtents(
+        previous,
+        await collect(previousRoot, walk, reader, options.budget, dataLength),
+        "previous",
+      );
+    }
     const { union, previousOnly } = unite(current, previous);
     let map: FreeSpaceMap;
     try {
@@ -185,6 +225,7 @@ export const openExtentSpace: OpenExtentSpace = async (session, options) => {
 class Space implements ExtentSpace {
   readonly #session: StoreSession;
   readonly #reachable: ReachableExtents;
+  readonly #walk: ReachableExtents | null;
   readonly #budget: ByteBudget;
   readonly #cache: PageCache;
   readonly #map: FreeSpaceMap;
@@ -222,6 +263,7 @@ class Space implements ExtentSpace {
   ) {
     this.#session = session;
     this.#reachable = options.reachable;
+    this.#walk = options.walk ?? null;
     this.#budget = options.budget;
     this.#cache = cache;
     this.#map = map;
@@ -612,6 +654,19 @@ class Space implements ExtentSpace {
       Infinity,
     );
     unite(exactCurrent, exactPrevious);
+    // Ruling R25: the lists startup read must name exactly what the full walk reaches.
+    if (this.#walk !== null) {
+      sameExtents(
+        exactCurrent,
+        await collect(this.#root, this.#walk, this, this.#budget, Infinity),
+        "current",
+      );
+      sameExtents(
+        exactPrevious,
+        await collect(this.#previousRoot, this.#walk, this, this.#budget, Infinity),
+        "previous",
+      );
+    }
     const aligned = (extents: ReadonlyMap<number, number>) =>
       new Map([...extents].map(([offset, length]) => [offset, sizeOf(length)]));
     const current = aligned(exactCurrent);

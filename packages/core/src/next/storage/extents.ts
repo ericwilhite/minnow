@@ -258,7 +258,19 @@ export type ReachableExtents = (
 ) => AsyncIterable<ExtentRef | BlobRef> | Iterable<ExtentRef | BlobRef>;
 
 export interface OpenSpaceOptions {
+  /**
+   * What each root reaches, as startup reads it: the root's extent list (ruling R25,
+   * extent-list.ts `listedExtents`), or a full walk where a root has no list.
+   */
   readonly reachable: ReachableExtents;
+  /**
+   * The full reachability walk (the format track's), when `reachable` is a list: `audit` checks
+   * that both name exactly the same extents for both roots, and so does the open when
+   * `verifyAtOpen` is set (test builds). A difference is `StoreCorruptionError`.
+   */
+  readonly walk?: ReachableExtents;
+  /** Cross-check `reachable` against `walk` at open as well as in `audit` (test builds). */
+  readonly verifyAtOpen?: boolean;
   /** Charged for the walk's leases (the owner's startup grant); `audit` uses it too. */
   readonly budget: ByteBudget;
   /** Registers the cache with the governor and returns its handle (`governor.registerCache`). */

@@ -94,6 +94,28 @@ rules, and the harness `["datetime"]` encoding at cut-over.
 | C12 | Arbitrary-version reads (`options.version`) are dropped. A read pins one root plus that moment's memtable views for one query or read transaction. Pins live in memory, and a client's pins drop when its Web Lock is released. Space is reusable only when neither the current nor the previous durable root reaches it and no pin does (two generations).                                                                                                                                                                                                                                                                                                           | `format/manifest.ts`                                           |
 | C13 | Replaced by the request ledger (review finding 5).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | `format/ledger.ts`                                             |
 
+## R25. Startup reads the roots' extent lists, not the group roots
+
+- **What.** Each published root references a paged, offset-sorted list of the exact extents it
+  reaches (`storage/extent-list.ts`): pages of up to 4,096 extents, each a blob, named in the
+  root with its first offset and count. The list names every extent the root reaches except the
+  ones its own pages live in, which the root names directly. Startup reads the current and
+  previous roots' lists (`listedExtents` as `OpenSpaceOptions.reachable`) and never a group root;
+  the audit, and the open in test builds (`verifyAtOpen`), compare them with the full walk
+  (`OpenSpaceOptions.walk`), and a difference is `StoreCorruptionError`.
+- **Kept incrementally.** The write path's extent-delta sink (`ExtentListKeeper`) rewrites only
+  the pages a publication's delta touches, through the publication's own writer, shares the rest
+  by reference, and retires replaced page extents in the same publication (the R8 hold applies,
+  as to `released`). Prepared lists are provisional until `commit`, dropped on `abort`, and the
+  keeper is rebuilt from the durable root's list at every open.
+- **Stored format.** The root gains a field (the format track's manifest codec; increment 2 of
+  R25). No supported writer of rebuild-core roots exists: `next/` is unexported, and the package
+  excludes `dist/next/**` (`files` in `packages/core/package.json`, checked by
+  `scripts/package-shape.test.ts`), so no released build wrote one. Roots written by development
+  builds and tests before R25 are refused at open rather than upgraded; pre-reset data is refused
+  by the approved policy. The first release that ships the rebuild core makes this format a
+  supported one, and from then on AGENTS.md's upgrade rules apply to every change.
+
 ## Ownership protocol facts (for the ownership track)
 
 These rulings follow the storage probe of 2026-11-05.

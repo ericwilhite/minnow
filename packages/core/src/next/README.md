@@ -146,20 +146,25 @@ is access's `Snapshot`.
 - The log has a flush barrier and two header slots.
 - **The extent space** (`extents.ts`) is the only caller of the data-space calls and of `publish`.
   - A writer reserves extents, appends checksummed blobs, seals, and either publishes once or
-    aborts. Abort frees at once; a crash before publish leaves orphans that the walk on open frees.
+    aborts. Abort frees at once; a crash before publish leaves orphans that open frees.
   - `publish(root, { writers, retired })` is serialized and atomic. Two-generation reclaim: retired
     extents are reused only after the _next_ publish is durable and no pin of an older generation
     remains, so the current and previous roots always read intact.
   - A rejected publish is indeterminate: the space keeps everything allocated and refuses writes
     until the owner reopens.
-  - Free space is rebuilt on open from the extents the current and previous roots reach (the format
-    track's `reachable`), first fit, and released to the platform only as a free tail.
+  - Free space is rebuilt on open from the extents the current and previous roots reach, first
+    fit, and released to the platform only as a free tail. Ruling R25: each root references a
+    paged, offset-sorted list of its extents (`extent-list.ts`), so open reads the two roots'
+    lists (`listedExtents`) and no group root; the audit cross-checks them against the format
+    track's full walk (`walk`), as the open does in test builds (`verifyAtOpen`). The write path's
+    extent-delta sink, `ExtentListKeeper`, keeps each list incrementally: only the pages a
+    publication touches are rewritten, the rest shared (DECISIONS.md "R25").
   - Blobs are at most 1 MiB (larger structures span several), and one read asks for at most 4 MiB.
   - It is the write path's only way to the data space: reads, `peek`, writers, `publish`, pins.
   - A builder can `extend` its extent: in place when the space after it is free, else relocated
     once at seal. Every `BlobRef` carries its extent and its offset within it.
-  - Startup: fence → store session → extent space (walks both roots) → write path (the single log
-    scan and replay) → spill sweep → ready.
+  - Startup: fence → store session → extent space (reads both roots' extent lists) → write path
+    (the single log scan and replay) → spill sweep → ready.
   - One cache of encoded, verified blobs, charged to the governor and evicted before anything
     spills. Misses are read in coalesced slabs (gaps ≤ 64 KiB, slabs ≤ 1 MiB) and copied out, so
     eviction frees exactly what it uncharges. Every leased byte is charged to the reader's budget
