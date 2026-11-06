@@ -6,7 +6,7 @@
  * across real tabs.
  */
 import fc from "fast-check";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   BARRIER_RESOLUTION_STATES,
   BROKER_RESTART_STATES,
@@ -1944,50 +1944,111 @@ describe("a broker replaced under its ports (WebKit 26.6, owner/webkit-sharedwor
   });
 });
 
-describe("a broker request is bounded (connector.ts ConnectorStatus)", () => {
-  /** A connector whose broker ports are silent while `silent.on`, the world's broker otherwise. */
-  function silentTab(w: World, unreachable: Error[]) {
-    const silent = { on: true, ports: 0, posts: 0 };
-    const client = new ProtocolClient();
-    const connector = new OwnerConnector({
-      database: "db",
-      client,
-      locks: w.registry.context(),
-      openBroker: () => {
-        const { port1, port2 } = new MessageChannel();
-        silent.ports++;
-        if (silent.on)
-          port1.onmessage = () => {
-            silent.posts++;
-          };
-        else w.broker.accept(port1);
-        cleanups.push(() => {
-          port1.close();
-          port2.close();
-        });
-        return port2;
-      },
-      startOwner: null,
-      context: (): HostContext => ({
-        kind: "page",
-        visible: true,
-        platform: { mobile: false },
-        superseded: false,
-      }),
-      announcements: false,
-      retryMs: 50,
-      brokerTimeoutMs: 20,
-      brokerBoundMs: 150,
-      onUnreachable: (error) => {
-        unreachable.push(error);
-      },
-    });
-    cleanups.push(() => {
-      connector.close();
-    });
-    return { connector, client, silent };
-  }
+/**
+ * A connector (that never hosts) whose broker ports, old and new, drop every message while
+ * `silent.on`, and reach the world's broker otherwise.
+ */
+function silentTab(
+  w: World,
+  unreachable: Error[],
+  options: { readonly silent?: boolean; readonly unresponsiveAfterMs?: number } = {},
+) {
+  /** `posts`: messages the broker side dropped; `sent`: messages the client sent (at once). */
+  const silent = { on: options.silent ?? true, ports: 0, posts: 0, sent: 0 };
+  const client = new ProtocolClient();
+  const connector = new OwnerConnector({
+    database: "db",
+    client,
+    locks: w.registry.context(),
+    openBroker: () => {
+      const { port1, port2 } = new MessageChannel();
+      silent.ports++;
+      // A port opened while silent reaches the broker (and hears its announcement) only once the
+      // silence ends; a port that reached it drops what it sends while silent.
+      let route: ((event: MessageEvent) => void) | null = null;
+      const reach = () => {
+        if (route !== null) return;
+        w.broker.accept(port1);
+        route = port1.onmessage;
+        port1.onmessage = receive;
+      };
+      const receive = (event: MessageEvent) => {
+        if (silent.on) {
+          silent.posts++;
+          return;
+        }
+        reach();
+        route?.call(port1, event);
+      };
+      if (silent.on) port1.onmessage = receive;
+      else reach();
+      const post = port2.postMessage.bind(port2);
+      port2.postMessage = ((message: unknown, transfer?: Transferable[]) => {
+        silent.sent++;
+        post(message, transfer ?? []);
+      }) as typeof port2.postMessage;
+      cleanups.push(() => {
+        port1.close();
+        port2.close();
+      });
+      return port2;
+    },
+    startOwner: null,
+    context: (): HostContext => ({
+      kind: "page",
+      visible: true,
+      platform: { mobile: false },
+      superseded: false,
+    }),
+    announcements: false,
+    retryMs: 50,
+    brokerTimeoutMs: 20,
+    brokerBoundMs: 150,
+    ...(options.unresponsiveAfterMs === undefined
+      ? {}
+      : { unresponsiveAfterMs: options.unresponsiveAfterMs }),
+    onUnreachable: (error) => {
+      unreachable.push(error);
+    },
+  });
+  cleanups.push(() => {
+    connector.close();
+  });
+  return { connector, client, silent };
+}
 
+/**
+ * Tracks the timers the connector and the client set (not earlier tests' in-process owners, which
+ * keep scheduling theirs in this worker). `pending` is what is still to fire; `restore()` puts the
+ * real functions back.
+ */
+function trackOwnerTimers() {
+  const pending = new Set<unknown>();
+  const realSet = globalThis.setTimeout;
+  const realClear = globalThis.clearTimeout;
+  globalThis.setTimeout = ((handler: () => void, ms?: number) => {
+    const id = realSet(() => {
+      pending.delete(id);
+      handler();
+    }, ms);
+    if (/owner\/(connector|client)\.ts/.test(new Error().stack ?? "")) pending.add(id);
+    return id;
+  }) as typeof setTimeout;
+  globalThis.clearTimeout = ((id: ReturnType<typeof setTimeout>) => {
+    pending.delete(id);
+    realClear(id);
+  }) as typeof clearTimeout;
+  return {
+    pending,
+    wait: (ms: number) => new Promise((resolve) => realSet(resolve, ms)),
+    restore: () => {
+      globalThis.setTimeout = realSet;
+      globalThis.clearTimeout = realClear;
+    },
+  };
+}
+
+describe("a broker request is bounded (connector.ts ConnectorStatus)", () => {
   it("a broker that never answers: OwnerUnreachableError at the bound, never left connecting", async () => {
     const w = world();
     const unreachable: Error[] = [];
@@ -2059,39 +2120,20 @@ describe("a broker request is bounded (connector.ts ConnectorStatus)", () => {
 
   it("close() mid-request leaves no timer and sends nothing more", async () => {
     const w = world();
-    const pending = new Set<unknown>();
-    const realSet = globalThis.setTimeout;
-    const realClear = globalThis.clearTimeout;
-    const tracked = ((handler: () => void, ms?: number) => {
-      const id = realSet(() => {
-        pending.delete(id);
-        handler();
-      }, ms);
-      // Only the connector's and the client's own timers: earlier tests' in-process owners keep
-      // scheduling theirs (owner-standins.ts flushes) in this worker.
-      const stack = new Error().stack ?? "";
-      if (/owner\/(connector|client)\.ts/.test(stack)) pending.add(id);
-      return id;
-    }) as typeof setTimeout;
-    globalThis.setTimeout = tracked;
-    globalThis.clearTimeout = ((id: ReturnType<typeof setTimeout>) => {
-      pending.delete(id);
-      realClear(id);
-    }) as typeof clearTimeout;
+    const timers = trackOwnerTimers();
     try {
       const { connector, silent } = silentTab(w, []);
       const start = connector.start().catch((error: unknown) => (error as Error).name);
-      await new Promise((resolve) => realSet(resolve, 50));
-      expect(pending.size).toBeGreaterThan(0);
+      await timers.wait(50);
+      expect(timers.pending.size).toBeGreaterThan(0);
       connector.close();
       expect(await start).toBe("ClientClosedError");
-      expect(pending.size).toBe(0);
-      const posts = silent.posts;
-      await new Promise((resolve) => realSet(resolve, 200));
-      expect(silent.posts).toBe(posts);
+      expect(timers.pending.size).toBe(0);
+      const sent = silent.sent;
+      await timers.wait(200);
+      expect(silent.sent).toBe(sent);
     } finally {
-      globalThis.setTimeout = realSet;
-      globalThis.clearTimeout = realClear;
+      timers.restore();
     }
   });
 });
@@ -2183,4 +2225,172 @@ describe("generated: a broker restart at any point never strands a tab", () => {
     },
     200_000,
   );
+});
+
+describe("requests end in bounded time too (client.ts connect and giveUp)", () => {
+  const settledAs = (promise: Promise<unknown>) =>
+    promise.then(
+      () => ({ ok: true as const, error: null }),
+      (error: unknown) => ({
+        ok: false as const,
+        error: error as Error & { effect?: string; code?: string; sequence?: number | null },
+      }),
+    );
+
+  it("requests made while connecting go out on the first connection, once each, in order", async () => {
+    const w = world();
+    const { a } = await hosted(w);
+    await a.client.query("INSERT INTO t VALUES ($1, $2, $3)", [2, 0, "y"]);
+    const c = tab(w);
+    // Not connected yet: none of these can be sent. Order matters: (0 × 2) + 1 = 1, but
+    // (0 + 1) × 2 = 2, and any request run twice moves n further.
+    const double = c.client.query("UPDATE t SET n = n * 2 WHERE id = $1", [1]);
+    const inc = c.client.query("UPDATE t SET n = n + 1 WHERE id = $1", [1]);
+    const read = c.client.query("SELECT * FROM t WHERE id = $1", [1]);
+    // A transaction opened before the first connection (on another row: sessions run
+    // concurrently): BEGIN never sent opened nothing, so it goes like any other request.
+    const begin = c.client.query("BEGIN", [], { session: 1 });
+    const inTx = c.client.query("UPDATE t SET n = n + 10 WHERE id = $1", [2], { session: 1 });
+    const commit = c.client.query("COMMIT", [], { session: 1 });
+    await c.connector.start();
+    await Promise.all([double, inc, begin, inTx, commit]);
+    expect((await read).rows()[0]?.[1]).toBe(1);
+    expect(c.client.lostSessions.size).toBe(0);
+    expect(await value(a.client)).toBe(1);
+    const second = await a.client.query("SELECT * FROM t WHERE id = $1", [2]);
+    expect(second.rows()[0]?.[1]).toBe(10);
+  });
+
+  it("a request issued during the first handshake is posted once, not again after the welcome", async () => {
+    const w = world();
+    const { a, owner } = await hosted(w);
+    const client = new ProtocolClient();
+    const { port1, port2 } = new MessageChannel();
+    cleanups.push(() => {
+      client.close();
+      port1.close();
+      port2.close();
+    });
+    const posts = new Map<number, number>();
+    const post = port2.postMessage.bind(port2);
+    port2.postMessage = ((message: unknown, transfer?: Transferable[]) => {
+      const seq = (message as { seq?: number }).seq;
+      if (typeof seq === "number") posts.set(seq, (posts.get(seq) ?? 0) + 1);
+      post(message, transfer ?? []);
+    }) as typeof port2.postMessage;
+    const connecting = client.connect(port2);
+    // The port is open but not welcomed: this goes right after the hello.
+    const { seq, promise } = client.send({
+      t: "statement",
+      session: 0,
+      text: "UPDATE t SET n = n + 1 WHERE id = $1",
+      prepared: null,
+      knownColumnsVersion: -1,
+      params: [1],
+      result: { windowBytes: 1 << 20, frameRows: null, wantRows: true },
+    });
+    owner.server.accept(port1);
+    await connecting;
+    await promise;
+    expect(posts.get(seq)).toBe(1);
+    expect(await value(a.client)).toBe(1);
+  });
+
+  it("the deadline (fake timers): unreachable for unresponsiveAfterMs, then waiting requests fail", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    // Over the fake timers: counts only the connector's and the client's.
+    const timers = trackOwnerTimers();
+    try {
+      const w = world();
+      const { connector, client } = silentTab(w, [], { unresponsiveAfterMs: 1_000 });
+      // Never sent: there is no connection yet.
+      const waiting = settledAs(client.query("SELECT 1"));
+      let settled = false;
+      void waiting.then(() => {
+        settled = true;
+      });
+      void connector.start().catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(150);
+      expect(connector.status).toBe("unreachable");
+      await vi.advanceTimersByTimeAsync(999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      const outcome = await waiting;
+      expect(outcome.ok).toBe(false);
+      expect(outcome.error?.name).toBe("OwnerUnreachableError");
+      expect(outcome.error?.code).toBe("MINNOW_OWNER_UNREACHABLE");
+      expect(outcome.error?.effect).toBe("none");
+      expect(typeof outcome.error?.sequence).toBe("number");
+      // Past the deadline a new request fails at once, never sent.
+      const late = await settledAs(client.query("SELECT 2"));
+      expect(late.error?.effect).toBe("none");
+      // close() leaves nothing scheduled (the deadline was armed and fired; retries stopped).
+      connector.close();
+      expect(timers.pending.size).toBe(0);
+    } finally {
+      timers.restore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("a sent, unanswered request fails unknown; the session stays lost; a reconnect recovers", async () => {
+    const w = world();
+    const { a } = await hosted(w);
+    const { connector, client, silent } = silentTab(w, [], {
+      silent: false,
+      unresponsiveAfterMs: 100,
+    });
+    await connector.start();
+    await client.query("BEGIN", [], { session: 1 });
+    await client.query("UPDATE t SET n = n + 1 WHERE id = $1", [1], { session: 1 });
+    // Sent, and its owner dies before answering.
+    const spin = settledAs(client.query("SELECT spin($1)", [5_000], { session: 1 }));
+    await sleep(20);
+    silent.on = true;
+    killTab(w, a, 0);
+    // Posted on the dead owner's port: sent, never answered. A BEGIN may have opened a
+    // transaction, so its session must stay lost.
+    const begin2 = settledAs(client.query("BEGIN", [], { session: 2 }));
+    const outcome = await Promise.race([spin, sleep(3_000).then(() => null)]);
+    expect((await begin2).error?.effect).toBe("unknown");
+    expect(outcome?.error?.name).toBe("OwnerUnreachableError");
+    // The dangerous direction: it was sent, so it may have taken effect. Never "none".
+    expect(outcome?.error?.effect).toBe("unknown");
+    expect(client.gaveUp).toBe(true);
+    // A new owner, and the broker answers again.
+    const d = tab(w);
+    await d.connector.start();
+    silent.on = false;
+    // Refused at once (never sent), and it makes the connector try again.
+    const refused = await settledAs(client.query("SELECT 1"));
+    expect(refused.error?.effect).toBe("none");
+    await until(() => connector.status === "connected", 2_000);
+    expect(client.gaveUp).toBe(false);
+    expect(client.ownerId).toBe(d.client.ownerId);
+    expect((await client.query("SELECT * FROM t WHERE id = $1", [1])).rows()[0]?.[1]).toBe(0);
+    // Session 1's transaction went with the dead owner: refused until an explicit ROLLBACK.
+    expect(client.lostSessions.has(1)).toBe(true);
+    expect(client.lostSessions.has(2)).toBe(true);
+    const inLost = await settledAs(client.query("SELECT 1", [], { session: 1 }));
+    expect(inLost.error?.name).toBe("SessionLostError");
+    await client.query("ROLLBACK", [], { session: 1 });
+    expect(client.lostSessions.has(1)).toBe(false);
+  });
+
+  it("close() while unreachable, deadline armed, leaves no timer", async () => {
+    const w = world();
+    const timers = trackOwnerTimers();
+    try {
+      const { connector, client } = silentTab(w, [], { unresponsiveAfterMs: 10_000 });
+      const waiting = settledAs(client.query("SELECT 1"));
+      await connector.start().catch(() => undefined);
+      expect(connector.status).toBe("unreachable");
+      expect(timers.pending.size).toBeGreaterThan(0);
+      connector.close();
+      expect(timers.pending.size).toBe(0);
+      expect((await waiting).error?.name).toBe("ClientClosedError");
+    } finally {
+      timers.restore();
+    }
+  });
 });

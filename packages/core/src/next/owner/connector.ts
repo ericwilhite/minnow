@@ -80,6 +80,7 @@ import { ClientClosedError, ConnectionRefusedError, OwnerUnreachableError } from
 import type { OwnerHostInit } from "./host.js";
 import {
   ALIVE_INTERVAL_MS,
+  DEFAULT_UNRESPONSIVE_AFTER_MS,
   SILENCE_DEADLINE_MS,
   SILENT_PROBES_LIMIT,
   type StepDown,
@@ -128,6 +129,8 @@ export interface ConnectorOptions {
   readonly brokerBoundMs?: number;
   /** Called when connecting gives up (`status` becomes `unreachable`); see `ConnectorStatus`. */
   readonly onUnreachable?: (error: OwnerUnreachableError) => void;
+  /** How long `unreachable` may last before waiting requests fail (protocol.ts default). */
+  readonly unresponsiveAfterMs?: number;
 }
 
 /**
@@ -138,8 +141,12 @@ export interface ConnectorOptions {
  *   answered, and a replaced broker (`instance`) makes it ask again at once.
  * - `unreachable`: the broker did not answer within its bound, or there is none and this context
  *   cannot host. `start()` rejected with `OwnerUnreachableError` and `onUnreachable` was called.
- *   Pending requests stay queued; the next request, a broker that announces itself, or an owner
- *   announcement starts connecting again.
+ *   The next request, a broker that announces itself, or an owner announcement starts connecting
+ *   again. Pending requests stay queued for `unresponsiveAfterMs` (protocol.ts
+ *   `DEFAULT_UNRESPONSIVE_AFTER_MS`) from the first time it became `unreachable`; with no
+ *   connection by then the client gives up (client.ts `giveUp`): every waiting request fails
+ *   with `OwnerUnreachableError`, effect `none` if never sent and `unknown` if sent, and new ones
+ *   fail at once until the next connection. So a request, too, ends in bounded time.
  */
 export type ConnectorStatus = "connecting" | "connected" | "unreachable" | "superseded" | "closed";
 
@@ -177,6 +184,8 @@ export class OwnerConnector {
   #registered: Array<() => void> = [];
   #hosting: { readonly handle: OwnerHandle; readonly lock: HeldLock } | null = null;
   #silenceTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The unresponsive deadline, armed when connecting first gives up, until a connection. */
+  #unresponsiveTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * The silence backstop's state for the current connection. `rounds`: probes unanswered since the
    * owner last spoke (at `messageAt`, the client's `lastMessageAt`). `roundAt`: when the last
@@ -243,6 +252,7 @@ export class OwnerConnector {
       .catch((error: unknown) => {
         if (error instanceof OwnerUnreachableError && this.#status === "connecting") {
           this.#status = "unreachable";
+          this.#armUnresponsive();
           this.#options.onUnreachable?.(error);
         }
         throw error;
@@ -251,6 +261,25 @@ export class OwnerConnector {
         this.#connecting = null;
       });
     return this.#connecting;
+  }
+
+  /**
+   * The unresponsive deadline: armed once, at the first `unreachable` since the last connection;
+   * retries in between do not restart it. A connection clears it (`#attach`), and so does close.
+   */
+  #armUnresponsive(): void {
+    if (this.#unresponsiveTimer !== null || this.#client.gaveUp) return;
+    const ms = this.#options.unresponsiveAfterMs ?? DEFAULT_UNRESPONSIVE_AFTER_MS;
+    this.#unresponsiveTimer = setTimeout(() => {
+      this.#unresponsiveTimer = null;
+      if (this.#status === "closed" || this.#status === "connected") return;
+      this.#client.giveUp(`no database owner was reachable for ${String(ms)} ms`);
+    }, ms);
+  }
+
+  #disarmUnresponsive(): void {
+    if (this.#unresponsiveTimer !== null) clearTimeout(this.#unresponsiveTimer);
+    this.#unresponsiveTimer = null;
   }
 
   /** Connects again if connecting gave up (`unreachable`): something says it may work now. */
@@ -284,6 +313,7 @@ export class OwnerConnector {
     this.#announcements?.close();
     if (this.#silenceTimer !== null) clearTimeout(this.#silenceTimer);
     this.#silenceTimer = null;
+    this.#disarmUnresponsive();
     const starting = this.#starting;
     this.#starting = null;
     if (starting !== null) {
@@ -387,6 +417,7 @@ export class OwnerConnector {
       this.#everConnected = true;
       this.#ownerProtocol = welcome.protocol;
       this.#fresh = false;
+      this.#disarmUnresponsive();
       this.#silence = {
         rounds: 0,
         messageAt: this.#client.lastMessageAt,

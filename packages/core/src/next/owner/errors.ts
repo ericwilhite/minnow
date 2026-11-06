@@ -100,8 +100,30 @@ export class SupersededError extends Error {
 export class OwnerUnreachableError extends Error {
   readonly code = "MINNOW_OWNER_UNREACHABLE";
   override readonly name = "OwnerUnreachableError";
-  constructor(detail: string) {
-    super(`Another tab owns the database and this context cannot reach it: ${detail}`);
+  /** The request it failed, when it failed one (connector.ts "unresponsive"). */
+  readonly sequence: number | null;
+  /**
+   * What is known about that request's effect, as `SessionLostError.effect`. `none`: it was never
+   * sent on any connection, so nothing took effect (safe to retry). `unknown`: it was sent and
+   * never answered; it may have taken effect: check before retrying. `none` when no request
+   * failed (a connection attempt).
+   */
+  readonly effect: "none" | "unknown";
+  constructor(
+    detail: string,
+    options: { readonly sequence?: number; readonly effect?: "none" | "unknown" } = {},
+  ) {
+    const effect = options.effect ?? "none";
+    super(
+      `Another tab owns the database and this context cannot reach it: ${detail}` +
+        (options.sequence === undefined
+          ? ""
+          : effect === "none"
+            ? `; request ${String(options.sequence)} was never sent, so nothing took effect`
+            : `; request ${String(options.sequence)} was sent and never answered: it may have taken effect, check before retrying`),
+    );
+    this.sequence = options.sequence ?? null;
+    this.effect = effect;
   }
 }
 

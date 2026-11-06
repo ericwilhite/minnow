@@ -239,7 +239,12 @@ export const SILENCE_DEADLINE_MS = 2_500;
  * time.
  */
 export const SILENT_PROBES_LIMIT = 3;
-/** Default silence after which a client reports `OwnerUnresponsiveError`. */
+/**
+ * How long a client may stay `unreachable` (connector.ts `ConnectorStatus`: no broker answer
+ * within `BROKER_REQUEST_BOUND_MS`, or no way to host) with no connection since, before every
+ * waiting request fails with `OwnerUnreachableError` (effect `none` if never sent, `unknown` if
+ * sent) and new ones fail at once, until the next connection.
+ */
 export const DEFAULT_UNRESPONSIVE_AFTER_MS = 10_000;
 /** Default result window: two frames of ~1 MiB, equal to the executor's `RESULT_WINDOW_BYTES`. */
 export const DEFAULT_RESULT_WINDOW_BYTES = 2 * 1024 * 1024;
