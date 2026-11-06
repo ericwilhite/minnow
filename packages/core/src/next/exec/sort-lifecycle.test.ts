@@ -5,7 +5,7 @@
  * after backpressure, and compare mode's decoded operands charged to the grant. Also the review's
  * resource probes: an oversized row refused cleanly, and a wide spill that stays bounded.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { Governor } from "../memory/governor.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
 import type { PhysicalType } from "../types.js";
@@ -29,7 +29,10 @@ import {
   msdStackWords,
   type SortColumn,
 } from "./sort-keys.js";
+import * as sortKeys from "./sort-keys.js";
 import { Slice } from "./slices.js";
+
+const original = sortKeys.decodeOperands;
 import { GroupTopKOperator, SortOperator, sortMinimumBytes } from "./sort.js";
 
 const JSONB: PhysicalType = { kind: "json", binary: true };
@@ -905,4 +908,99 @@ describe("review B7-p2b-1 resource probes", () => {
       expect(governor.usedBytes).toBe(0);
     }, 60_000);
   }
+});
+
+describe("the merge sort checks its deadline inside run tails (review B7-p2b-2 #2)", () => {
+  it("a long tail copy reads the clock without any comparison", () => {
+    // Sorted input: every merge exhausts its left run by comparisons, then copies the right
+    // run's tail with none. 2^19 ids take 16 merge levels (no copy back at the end), so the
+    // only clock readings without a comparison between them are the tails' checks.
+    const n = 1 << 19;
+    const ids = Int32Array.from({ length: n }, (_, i) => i);
+    let readings = 0;
+    let stretch = 0;
+    let longest = 0;
+    const slice = new Slice(Infinity, () => {
+      readings++;
+      stretch++;
+      longest = Math.max(longest, stretch);
+      return readings;
+    });
+    const job = mergeSortJob(
+      ids,
+      new Int32Array(n),
+      (a, b) => {
+        stretch = 0;
+        return a - b;
+      },
+      slice,
+    );
+    while (job.next().done !== true);
+    expect(Array.from(ids.subarray(0, 4))).toEqual([0, 1, 2, 3]);
+    // The last merge copies a 2^18-row tail: a check every 8,192 copies is 32 readings.
+    expect(longest).toBeGreaterThanOrEqual(16);
+  });
+});
+
+describe("the store-wide operand decode checks its deadline per chunk (review B7-p2b-2 #3)", () => {
+  it("an ICU sort that falls back to compare mode at its sort decodes in sliced chunks", async () => {
+    // 6,000 distinct ~400-character values under an ICU collation, with a grant that holds the
+    // rows and their distinct set but not the ranks' strings: the sort falls back to compare
+    // mode and decodes every stored row's operand (DECODE_BYTES at a time) before sorting.
+    const types = [TEXT, INT];
+    const rows: Row[] = Array.from({ length: 6000 }, (_, i) => [
+      `é${"v".repeat(400)}${String((i * 7919) % 6000)}`,
+      i,
+    ]);
+    const minimum = sortMinimumBytes(types);
+    const governor = new Governor(minimum + 12 * (1 << 20));
+    const grant = await governor.admit({ label: "sort", minimumBytes: minimum, spillable: true });
+    const sink = new CollectSink();
+    const op = new SortOperator(
+      {
+        types,
+        keys: [{ column: 0, direction: "asc", nulls: "last", collation: "en-US-x-icu" }],
+        limit: null,
+        offset: 0,
+        withTies: false,
+      },
+      { grant, spill: new MemorySpillService(), queryId: 7 },
+      sink,
+    );
+    // Per decode call, whether it decoded more than one row (a chunk of DECODE_BYTES).
+    const events: boolean[] = [];
+    const decode = vi.spyOn(sortKeys, "decodeOperands");
+    decode.mockImplementation((...args) => {
+      events.push(args[4] - args[3] > 1);
+      return original(...args);
+    });
+    const due = vi.spyOn(Slice.prototype, "due");
+    const checks: number[] = [];
+    const decodes: number[] = [];
+    try {
+      await drive(new ArraySource(batchesOf(types, rows)), op);
+    } finally {
+      // (Read before the restore, which clears them.)
+      checks.push(...due.mock.invocationCallOrder);
+      decodes.push(...decode.mock.invocationCallOrder);
+      decode.mockRestore();
+      due.mockRestore();
+    }
+    // A multi-row decode followed by a check before the next decode.
+    let checked = 0;
+    let multi = 0;
+    for (let i = 0; i < decodes.length; i++) {
+      const at = decodes[i] ?? 0;
+      const next = decodes[i + 1] ?? Infinity;
+      if (events[i] !== true) continue;
+      multi++;
+      if (checks.some((c) => c > at && c < next)) checked++;
+    }
+    expect(op.profile.mode).toBe("compare");
+    expect(multi).toBeGreaterThanOrEqual(10);
+    expect(checked).toBeGreaterThanOrEqual(multi - 2);
+    expect(sink.rows.length).toBe(6000);
+    await op.closed;
+    expect(governor.usedBytes).toBe(0);
+  }, 60_000);
 });
