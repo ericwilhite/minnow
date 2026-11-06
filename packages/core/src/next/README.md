@@ -684,6 +684,11 @@ and the owner import it directly.
   tuple for several keys: direct-mapped (the value ids bit-packed into a slot of a table of at
   most 2^16) while the columns' value counts fit, hashed column by column past that. SQL GROUP BY equality: NULLs together, −0 = 0, NaN = NaN, NUMERIC by
   value.
+- One int2/int4/date key whose range spans no more slots than the hash table would hold (twice
+  its slots, at most 2^22 values) is direct-mapped instead: slot `key − base`, no hashing or
+  probing, half the bytes. A key past the span widens it; a range too wide goes back to hashing;
+  modes change only between batches, and ids stay first-seen either way. Per-group arrays grow
+  2× while small and 4× from 65,536 elements (less fresh memory on the way to many groups).
 - With more than 4,096 groups and at least four aggregates over the batch's own rows, the
   operator hands its accumulators the rows stably sorted by group id (LSD radix, 11 bits a
   pass), so each one's state arrays are read nearly sequentially; a group's rows keep their input
@@ -700,6 +705,13 @@ and the owner import it directly.
   start from −0 (a double), so V8 keeps them unboxed. Float SUM and AVG follow PostgreSQL's float8pl and
   float8_accum, including their 22003 rules. MIN/MAX ties take the newer value, as PostgreSQL
   does (MIN(1.5, 1.50) is 1.50); int8 and NUMERIC comparisons use words and limbs.
+- MIN/MAX over dictionary-encoded text, bytea and uuid compare ranks, not codes (page
+  dictionaries are first-seen order): a dictionary small for its batch is ranked by value once,
+  and a group's best gets its place among those ranks by a binary search over values when the
+  dictionary first meets it. Groups and dictionaries are only ever compared by value.
+- SUM over int2/int4 reads the decoded Int32Array directly and, while no batch can push a part
+  past ±2^52 (a bound on every part, rescanned about once per 2^21 rows), skips the per-row
+  check; near the limit it takes the checked loop and the carry.
 - `values.ts`: per-group values for MIN/MAX and NUMERIC keys: int8 and interval microseconds as
   two words, NUMERIC as f64 or 128-bit limbs; only coefficients past 128 bits are BigInts, each
   charged at the governor's `bigintBytes` (its size change charged before a replacement). Exact

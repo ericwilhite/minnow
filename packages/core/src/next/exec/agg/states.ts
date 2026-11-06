@@ -289,6 +289,11 @@ class ExactSums {
   carry: Uint32Array = new Uint32Array(0);
   /** 1 once the group has a value. */
   has: Uint8Array = new Uint8Array(0);
+  /**
+   * An upper bound of every |sums[g]| (each stays within ±LIMIT). `addFlat32` skips its per-row
+   * check while a batch cannot push a part past LIMIT from it; every other writer raises it.
+   */
+  bound = 0;
   /** Groups whose carry is nonzero (so emit can pick the safe tier quickly). */
   carried = 0;
   /** The offsets past 128 bits, or null while every total fits the carry. */
@@ -383,10 +388,23 @@ class ExactSums {
       return;
     }
     const s = (this.sums[g] ?? 0) + v;
+    let stored = s;
     if (s > LIMIT || s < -LIMIT) {
       this.spill(g, this.sums[g] ?? 0);
-      this.sums[g] = v;
-    } else this.sums[g] = s;
+      stored = v;
+    }
+    this.sums[g] = stored;
+    const size = stored < 0 ? -stored : stored;
+    if (size > this.bound) this.bound = size;
+  }
+  /** Tightens `bound` to the largest |part| (O(groups): about once per 2^21 int32 rows). */
+  rescan(): void {
+    let bound = 0;
+    for (const v of this.sums) {
+      const size = v < 0 ? -v : v;
+      if (size > bound) bound = size;
+    }
+    this.bound = bound;
   }
   /**
    * Group g's sum into limb slot `to` of `t` when it fits 128 bits; false when it does not (read
@@ -449,6 +467,11 @@ function addIntegers(
     }
     return;
   }
+  if (!scalar && data.layout === "i32" && reader.codes === null && reader.stride === 1) {
+    // Flat int32 (int2, int4): read the decoded Int32Array as it is, no float64 copy.
+    addFlat32(sums, data.values, validity, gids, rows, count);
+    return;
+  }
   const values = rowValues(
     data.layout === "int64"
       ? (data.values as { values: Float64Array }).values
@@ -509,6 +532,8 @@ function addFlat(
 ): void {
   const parts = sums.sums;
   const has = sums.has;
+  // Parts written here stay within ±LIMIT, which is all `bound` may then assume.
+  sums.bound = LIMIT;
   if (validity === null)
     for (let k = 0; k < count; k++) {
       const i = rows[k] ?? 0;
@@ -530,6 +555,60 @@ function addFlat(
       if (total > LIMIT || total < -LIMIT) sums.add(g, v);
       else parts[g] = total;
     }
+}
+
+/** What one batch of `count` int32 values can add to any one part: `count` × 2^31. */
+const INT32_STEP = 2 ** 31;
+
+/**
+ * `addFlat` over int32 values read from their Int32Array (a separate function, so both loops
+ * stay monomorphic): the same exact rule, a ±2^31 value added to a part within ±2^52.
+ */
+function addFlat32(
+  sums: ExactSums,
+  values: Int32Array,
+  validity: Validity | null,
+  gids: Int32Array,
+  rows: Uint16Array,
+  count: number,
+): void {
+  const parts = sums.sums;
+  const has = sums.has;
+  // While every part stays within ±LIMIT whatever this batch adds (each row adds less than 2^31
+  // to one part), the loop needs no per-row check and every sum stays exact.
+  const step = INT32_STEP * count;
+  if (sums.bound + step > LIMIT) sums.rescan();
+  if (sums.bound + step <= LIMIT) {
+    sums.bound += step;
+    if (validity === null)
+      for (let k = 0; k < count; k++) {
+        const i = rows[k] ?? 0;
+        const g = gids[i] ?? 0;
+        parts[g] = (parts[g] ?? 0) + (values[i] ?? 0);
+        has[g] = 1;
+      }
+    else
+      for (let k = 0; k < count; k++) {
+        const i = rows[k] ?? 0;
+        if (((validity[i >>> 5] ?? 0) & (1 << (i & 31))) === 0) continue;
+        const g = gids[i] ?? 0;
+        parts[g] = (parts[g] ?? 0) + (values[i] ?? 0);
+        has[g] = 1;
+      }
+    return;
+  }
+  // Parts near LIMIT: the checked loop, spilling to the carry.
+  sums.bound = LIMIT;
+  for (let k = 0; k < count; k++) {
+    const i = rows[k] ?? 0;
+    if (validity !== null && ((validity[i >>> 5] ?? 0) & (1 << (i & 31))) === 0) continue;
+    const g = gids[i] ?? 0;
+    const v = values[i] ?? 0;
+    const total = (parts[g] ?? 0) + v;
+    has[g] = 1;
+    if (total > LIMIT || total < -LIMIT) sums.add(g, v);
+    else parts[g] = total;
+  }
 }
 
 class IntegerSumAccumulator implements Accumulator {
@@ -1589,10 +1668,66 @@ function compareToStored(values: GroupValues, g: number, flat: FlatVector, slot:
   }
 }
 
+/** Byte range `[start, end)` of dictionary entry `code` (varlen or fixed16 entries). */
+function entryStart(flat: FlatVector, code: number): number {
+  const data = flat.data;
+  return data.layout === "varlen" ? (data.offsets[code] ?? 0) : code * 16;
+}
+function entryEnd(flat: FlatVector, code: number): number {
+  const data = flat.data;
+  return data.layout === "varlen" ? (data.offsets[code + 1] ?? 0) : code * 16 + 16;
+}
+function entryBytes(flat: FlatVector): Uint8Array {
+  const data = flat.data;
+  if (data.layout === "varlen" || data.layout === "fixed16") return data.bytes;
+  throw new TypeError(`No entry bytes in a ${data.layout} dictionary`);
+}
+
+/**
+ * A dictionary's entries ranked by value (`compareBytes`, the order MIN/MAX compare text, bytea
+ * and uuid in): `rank[code]`, equal entries sharing a rank, and `byRank[r]` one code of each.
+ * Codes are first-seen order (page/dictionary.ts), never value order, so they are only ranked.
+ */
+interface Ranking {
+  readonly dictionaryId: number;
+  /**
+   * The ranked entries, held weakly: the same immutable dictionary under another batch's id is
+   * recognized without keeping a borrowed dictionary alive between batches (comparisons read the
+   * current batch's own entries).
+   */
+  readonly flat: WeakRef<FlatVector>;
+  readonly rank: Int32Array;
+  readonly byRank: Int32Array;
+  readonly ranks: number;
+}
+
+/**
+ * MIN / MAX over any comparable type: the best value per group in `GroupValues`, compared with
+ * the stored one per row (`compareToStored`). Ties take the new value, as PostgreSQL's
+ * float8smaller / numeric_larger… do (MIN(1.5, 1.50) is 1.50; MIN(0, −0) is −0).
+ *
+ * Text, bytea and uuid batches whose dictionary is small for the batch (at most a quarter of its
+ * rows) compare ranks instead of bytes: the dictionary is ranked by value once (`Ranking`), each
+ * row compares its entry's rank with its group's best, and only a better row stores its bytes.
+ * A group's best from another dictionary or a plain batch gets its position among this
+ * dictionary's ranks by a binary search over values the first time this dictionary meets it
+ * (`#position`, cached per group and invalidated by `#epoch`): 2r when it equals rank r, 2r − 1
+ * between ranks r − 1 and r. So groups and dictionaries are only ever compared by value; equal
+ * ranks are equal bytes, so a tie stores nothing new.
+ */
 class MinMaxAccumulator implements Accumulator {
   readonly #values: GroupValues;
   readonly #memory: Charged;
   #has: Uint8Array = new Uint8Array(0);
+  /** Byte-compared layouts (varlen, fixed16): may take the ranked path. */
+  readonly #bytes: boolean;
+  #ranking: Ranking | null = null;
+  #rankingBytes = 0;
+  /** Per group: its best's position among `#ranking`'s ranks (see above), valid at `#epoch`. */
+  #position: Float64Array = new Float64Array(0);
+  #positionEpoch: Int32Array = new Int32Array(0);
+  /** Bumped when positions go stale: a new ranking, or a best stored outside the ranked path. */
+  #epoch = 1;
   constructor(
     readonly type: PhysicalType,
     readonly max: boolean,
@@ -1607,10 +1742,18 @@ class MinMaxAccumulator implements Accumulator {
       throw new UnsupportedPlanError(`MIN/MAX over ${type.kind}`, { construct: "aggregate" });
     this.#values = new GroupValues(type, charge);
     this.#memory = new Charged(charge);
+    const layout = layoutOf(type);
+    this.#bytes = layout === "varlen" || layout === "fixed16";
   }
   grow(groups: number): void {
-    if (groups > this.#has.length)
-      this.#has = this.#memory.uint8(this.#has, grownCapacity(this.#has.length, groups));
+    if (groups > this.#has.length) {
+      const capacity = grownCapacity(this.#has.length, groups);
+      this.#has = this.#memory.uint8(this.#has, capacity);
+      if (this.#bytes) {
+        this.#position = this.#memory.float64(this.#position, capacity);
+        this.#positionEpoch = this.#memory.int32(this.#positionEpoch, capacity);
+      }
+    }
     const nothing: Vector = {
       form: "constant",
       type: this.type,
@@ -1627,11 +1770,22 @@ class MinMaxAccumulator implements Accumulator {
     scalar: boolean,
   ): void {
     if (vector === null) return;
+    if (
+      this.#bytes &&
+      vector.form === "dictionary" &&
+      vector.dictionary.validity === null &&
+      4 * vector.dictionary.length <= count
+    ) {
+      this.#updateRanked(vector, this.#rankingOf(vector), gids, rows, count, scalar);
+      return;
+    }
     const reader = readerOf(vector);
     if (reader.empty) return;
     const values = this.#values;
     const has = this.#has;
     const better = this.max ? 1 : -1;
+    // Bests stored here have no position among a ranking's ranks.
+    this.#epoch += 1;
     for (let k = 0; k < count; k++) {
       const i = rows[k] ?? 0;
       if (!validAt(reader.validity, i)) continue;
@@ -1640,12 +1794,137 @@ class MinMaxAccumulator implements Accumulator {
       if (has[g] === 0) {
         has[g] = 1;
         values.set(g, vector, i);
-      } else if (compareToStored(values, g, reader.flat, slot) !== better)
-        // Ties take the new value, as PostgreSQL's float8smaller / numeric_larger… do
-        // (MIN(1.5, 1.50) is 1.50; MIN(0, −0) is −0).
-        values.set(g, vector, i);
+      } else if (compareToStored(values, g, reader.flat, slot) !== better) values.set(g, vector, i);
     }
   }
+
+  /** The ranking of `vector`'s dictionary: kept while the dictionary is the same. */
+  #rankingOf(vector: Vector & { form: "dictionary" }): Ranking {
+    const known = this.#ranking;
+    if (
+      known !== null &&
+      (known.dictionaryId === vector.dictionaryId || known.flat.deref() === vector.dictionary)
+    )
+      return known;
+    const flat = vector.dictionary;
+    const size = flat.length;
+    const bytes = entryBytes(flat);
+    const order = Array.from({ length: size }, (_, code) => code);
+    const compare = (a: number, b: number): number =>
+      compareBytes(
+        bytes,
+        entryStart(flat, a),
+        entryEnd(flat, a),
+        bytes,
+        entryStart(flat, b),
+        entryEnd(flat, b),
+      );
+    order.sort(compare);
+    // Charged before they are built (`order` is a JS array of at most a quarter-batch of codes).
+    const charged = 8 * size;
+    const rank = this.#memory.make(Int32Array, size);
+    const byRank = this.#memory.make(Int32Array, size);
+    let ranks = 0;
+    for (let k = 0; k < size; k++) {
+      const code = order[k] ?? 0;
+      if (k === 0 || compare(order[k - 1] ?? 0, code) !== 0) byRank[ranks++] = code;
+      rank[code] = ranks - 1;
+    }
+    if (this.#rankingBytes > 0) this.#memory.give(this.#rankingBytes);
+    this.#rankingBytes = charged;
+    this.#epoch += 1;
+    this.#ranking = {
+      dictionaryId: vector.dictionaryId,
+      flat: new WeakRef(flat),
+      rank,
+      byRank,
+      ranks,
+    };
+    return this.#ranking;
+  }
+
+  /**
+   * Group g's best's position among `ranking`'s ranks (2r: equal to rank r; odd: between), over
+   * `flat`, the ranked dictionary's entries.
+   */
+  #positionOf(ranking: Ranking, flat: FlatVector, g: number): number {
+    const values = this.#values;
+    const arena = values.byteArena;
+    const start = values.start(g);
+    const end = values.end(g);
+    const bytes = entryBytes(flat);
+    // The first rank whose entry is ≥ the best.
+    let lo = 0;
+    let hi = ranking.ranks;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      const code = ranking.byRank[mid] ?? 0;
+      const c = compareBytes(
+        bytes,
+        entryStart(flat, code),
+        entryEnd(flat, code),
+        arena,
+        start,
+        end,
+      );
+      if (c < 0) lo = mid + 1;
+      else hi = mid;
+    }
+    if (lo < ranking.ranks) {
+      const code = ranking.byRank[lo] ?? 0;
+      const c = compareBytes(
+        bytes,
+        entryStart(flat, code),
+        entryEnd(flat, code),
+        arena,
+        start,
+        end,
+      );
+      if (c === 0) return 2 * lo;
+    }
+    return 2 * lo - 1;
+  }
+
+  #updateRanked(
+    vector: Vector & { form: "dictionary" },
+    ranking: Ranking,
+    gids: Int32Array,
+    rows: Uint16Array,
+    count: number,
+    scalar: boolean,
+  ): void {
+    const values = this.#values;
+    const has = this.#has;
+    const position = this.#position;
+    const positionEpoch = this.#positionEpoch;
+    const epoch = this.#epoch;
+    const rank = ranking.rank;
+    const codes = vector.codes;
+    const validity = vector.validity;
+    const max = this.max;
+    for (let k = 0; k < count; k++) {
+      const i = rows[k] ?? 0;
+      if (validity !== null && ((validity[i >>> 5] ?? 0) & (1 << (i & 31))) === 0) continue;
+      const g = scalar ? 0 : (gids[i] ?? 0);
+      const r = 2 * (rank[codes[i] ?? 0] ?? 0);
+      if (has[g] === 0) {
+        has[g] = 1;
+        values.set(g, vector, i);
+      } else {
+        if (positionEpoch[g] !== epoch) {
+          position[g] = this.#positionOf(ranking, vector.dictionary, g);
+          positionEpoch[g] = epoch;
+        }
+        const best = position[g] ?? 0;
+        // Equal ranks are equal bytes: a tie stores nothing new.
+        if (max ? r <= best : r >= best) continue;
+        values.set(g, vector, i);
+      }
+      position[g] = r;
+      positionEpoch[g] = epoch;
+    }
+  }
+
   outputBytes(from: number, count: number): number {
     return this.#values.outputBytes(null, from, count);
   }
@@ -1655,6 +1934,8 @@ class MinMaxAccumulator implements Accumulator {
   close(): void {
     this.#values.close();
     this.#memory.close();
+    this.#ranking = null;
+    this.#rankingBytes = 0;
   }
 }
 
