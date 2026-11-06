@@ -245,15 +245,21 @@ function groupsOf(pool: readonly ExtentRef[], maxLength: number): fc.Arbitrary<G
 }
 
 function run(pool: readonly ExtentRef[]): fc.Arbitrary<RunRef> {
-  return fc.record({
-    level: fc.nat({ max: 12 }),
-    entryCount: fc.nat({ max: 2 ** 40 }),
-    entries: blobIn(pool),
-    fences: blobIn(pool),
-    bloom: blobIn(pool),
-    minKey: fc.uint8Array({ maxLength: 64 }),
-    maxKey: fc.uint8Array({ maxLength: 64 }),
-  });
+  return (
+    fc
+      .record({
+        level: fc.nat({ max: 12 }),
+        entryCount: fc.nat({ max: 2 ** 40 }),
+        entries: blobIn(pool),
+        fences: blobIn(pool),
+        bloom: blobIn(pool),
+        minKey: fc.uint8Array({ maxLength: 64 }),
+        maxKey: fc.uint8Array({ maxLength: 64 }),
+        continues: fc.boolean(),
+      })
+      // `continues` is present only when true (one encoding per value).
+      .map(({ continues, ...rest }): RunRef => (continues ? { ...rest, continues: true } : rest))
+  );
 }
 
 function indexRoot(pool: readonly ExtentRef[]): fc.Arbitrary<IndexRoot> {

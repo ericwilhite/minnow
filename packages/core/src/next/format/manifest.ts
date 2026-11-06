@@ -251,6 +251,12 @@ export interface IndexRoot {
 
 export interface RunRef {
   readonly level: number;
+  /**
+   * Present (true) on the second and later pieces of one merge output, which follow the first
+   * piece in ascending key order (an output splits when it outgrows one run's block index, possibly
+   * inside one key's entries). The pieces of one output are one sorted run; nothing else is.
+   */
+  readonly continues?: true;
   readonly entryCount: number;
   /**
    * Sorted entries: equality-key bytes (keys/key-encoding.ts), scalar types only. Runs of an

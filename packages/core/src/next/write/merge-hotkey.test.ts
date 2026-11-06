@@ -200,3 +200,54 @@ it("a merge that fails before its publish keeps its inputs and the write path he
   await harness.space.audit();
   await harness.close();
 }, 120_000);
+
+it("independent merges of one popular key climb levels (review B3-p2b-2 B4, the reviewer's probe)", async () => {
+  const harness = new Harness("strict", "memory", 4, undefined, { merges: { fanIn: 2 } });
+  const path = await harness.open();
+  let t = 0;
+  await autocommit(path, async (s) => {
+    t =
+      (
+        await s.changeCatalog({
+          kind: "createTable",
+          table: tableInput("t", [column("id", INT, false), column("s", TEXT)]),
+        })
+      ).id ?? 0;
+  });
+  const s = path.catalog.table(t)?.columns[1]?.id ?? 0;
+  await autocommit(path, (statement) =>
+    statement.changeCatalog({
+      kind: "createIndex",
+      index: { tableId: t, name: "t_s", columnIds: [s], unique: false, role: "secondary" },
+    }),
+  );
+  const index = need(path.catalog.table(t)?.indexes.find((candidate) => candidate.name === "t_s"));
+  for (let k = 0; k < 33; k++) {
+    const ids = Array.from({ length: 4 }, (_, i) => k * 4 + i);
+    await autocommit(path, (statement) =>
+      statement.table(t).insert(batch(ints(ids), texts(ids.map(() => "hot"))), null),
+    );
+    await path.quiesce();
+  }
+  const runs = need(path.state().tables.get(t)?.runs.get(index.id));
+  // Tiering at fan-in 2: no level holds two sorted runs once maintenance settles.
+  const perLevel = new Map<number, number>();
+  for (const run of runs)
+    if (run.continues !== true) perLevel.set(run.level, (perLevel.get(run.level) ?? 0) + 1);
+  for (const count of perLevel.values()) expect(count).toBeLessThan(2);
+  expect(Math.max(...runs.map((run) => run.level))).toBeGreaterThanOrEqual(4);
+  const view = path.pin();
+  const keys = new KeyBatch(FREE);
+  encodeKeyBatch(
+    "equality",
+    [{ vector: texts(["hot"]), direction: "asc", nulls: "first" }],
+    { length: 1, selection: null },
+    keys,
+  );
+  const out = { probes: new Int32Array(256), locators: new Float64Array(256), count: 0 };
+  await view.index(t, index.id).probe(keys, out);
+  keys.close();
+  view.release();
+  expect(out.count).toBe(132);
+  await harness.close();
+}, 120_000);

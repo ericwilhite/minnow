@@ -740,7 +740,8 @@ export async function writeGroupDirectory(
 // ── Root ───────────────────────────────────────────────────────────────────────────────────────
 
 function writeRun(out: RefWriter, run: RunRef): void {
-  out.body.uint(run.level);
+  // The level and the continuation flag share one integer: level × 2 + continues.
+  out.body.uint(run.level * 2 + (run.continues === true ? 1 : 0));
   out.body.uint(run.entryCount);
   out.blob(run.entries);
   out.blob(run.fences);
@@ -751,14 +752,16 @@ function writeRun(out: RefWriter, run: RunRef): void {
 
 function readRun(refs: RefReader): RunRef {
   const reader = refs.bytes;
-  const level = reader.uint();
+  const packed = reader.uint();
+  const level = Math.floor(packed / 2);
   const entryCount = reader.uint();
   const entries = refs.blob();
   const fences = refs.blob();
   const bloom = refs.blob();
   const minKey = reader.bytes();
   const maxKey = reader.bytes();
-  return { level, entryCount, entries, fences, bloom, minKey, maxKey };
+  const run = { level, entryCount, entries, fences, bloom, minKey, maxKey };
+  return packed % 2 === 1 ? { ...run, continues: true } : run;
 }
 
 function writeRuns(out: RefWriter, runs: readonly RunRef[]): void {

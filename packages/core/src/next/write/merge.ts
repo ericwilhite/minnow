@@ -7,11 +7,10 @@
  * contiguous. A merge takes **every run of one level** and writes one sorted run at the next level,
  * placed where its inputs were: recency order is kept, so a tombstone stays in the same layer as its
  * put or a newer one (access/key-index.ts "Structure"), and resolution is unchanged.
- * - **Sorted runs.** At level 0 each run counts. At a higher level a run counts unless it continues
- *   the one before it in ascending key order (a merge's output may be split into several runs in
- *   ascending key order when it outgrows one run's block index, possibly inside one key's entries,
- *   so a piece may start with the key the previous one ended on; together they are one sorted
- *   run).
+ * - **Sorted runs.** Each run counts except the continuation pieces of a merge output: an output
+ *   that outgrows one run's block index is split into pieces in ascending key order (possibly
+ *   inside one key's entries), and every piece after the first carries `RunRef.continues`.
+ *   Together they are one sorted run.
  * - **Debt.** A level holding `fanIn` sorted runs (8) is debt. Merges run only while some level is
  *   in debt, lowest level first, and stop when none is. So each entry is rewritten once per level it
  *   climbs: write amplification is 1 + ⌈log₈(entries / memtable entries)⌉ (2 at 1M keyed rows, 3 at
@@ -92,16 +91,14 @@ export function yieldTask(): Promise<void> {
   });
 }
 
-/** `b` continues `a` in key order (a split piece may start with the key the previous one ended on). */
-const before = (a: RunRef, b: RunRef): boolean =>
-  compareBytes(a.maxKey, 0, a.maxKey.length, b.minKey, 0, b.minKey.length) <= 0;
-
-/** Sorted runs among `runs[from, to)`, all of one level (see "Levels"). */
+/**
+ * Sorted runs among `runs[from, to)`, all of one level (see "Levels"): every run but the
+ * continuation pieces of a merge output (`RunRef.continues`, review B3-p2b-2 B4). Equal endpoints
+ * prove nothing: independent merges of one popular key all have minKey = maxKey.
+ */
 export function sortedRuns(runs: readonly RunRef[], from: number, to: number): number {
-  if (to <= from) return 0;
-  if (need(runs[from]).level === 0) return to - from;
-  let count = 1;
-  for (let k = from + 1; k < to; k++) if (!before(need(runs[k - 1]), need(runs[k]))) count += 1;
+  let count = 0;
+  for (let k = from; k < to; k++) if (need(runs[k]).continues !== true) count += 1;
   return count;
 }
 
@@ -359,7 +356,7 @@ export async function mergeRuns(input: MergeInput): Promise<MergeOutput> {
     const blobs = sealed.blobs;
     const count = blobs.length;
     entriesOut += summary.entryCount;
-    runs.push({
+    const piece: RunRef = {
       level: input.level,
       entryCount: summary.entryCount,
       entries: need(blobs[count - 3]),
@@ -367,7 +364,9 @@ export async function mergeRuns(input: MergeInput): Promise<MergeOutput> {
       bloom: need(blobs[count - 1]),
       minKey: summary.minKey,
       maxKey: summary.maxKey,
-    });
+    };
+    // Every piece after the first continues this output's sorted run.
+    runs.push(runs.length === 0 ? piece : { ...piece, continues: true });
   };
   try {
     for (const cursor of cursors) if (await cursor.load()) heap.push(cursor);

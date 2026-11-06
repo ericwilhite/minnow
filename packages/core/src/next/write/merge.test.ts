@@ -242,8 +242,15 @@ describe("streaming merge", () => {
       minKey: key(min),
       maxKey: key(max),
     });
-    // Level 1: two split pieces of one merge (ascending, disjoint), then an older merge's run.
-    const runs = [run(0, 5, 9), run(1, 1, 3), run(1, 4, 8), run(1, 2, 6), run(2, 0, 9)];
+    // Level 1: two split pieces of one merge (the second continues it), then an older merge's
+    // run; equal or ascending endpoints alone prove nothing (review B3-p2b-2 B4).
+    const runs = [
+      run(0, 5, 9),
+      run(1, 1, 3),
+      { ...run(1, 4, 8), continues: true as const },
+      run(1, 7, 9),
+      run(2, 0, 9),
+    ];
     expect(sortedRuns(runs, 1, 4)).toBe(2);
     expect(planMerge(runs, 2)).toEqual({ from: 1, to: 4, level: 1, bottom: false });
     expect(planMerge(runs, 3)).toBeNull();
