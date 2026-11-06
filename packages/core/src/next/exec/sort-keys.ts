@@ -944,3 +944,69 @@ function* refineRuns(
     start = i;
   }
 }
+
+/**
+ * Whether row `i` of `left` and row `j` of `right` have equal values under every key (NULL
+ * equals NULL): window partitions and peers. Numbers compare as numbers (−0 = 0, NaN = NaN);
+ * text, bytes, JSONB and arrays by their bytes (deterministic collations: equal values are
+ * equal bytes; stored JSONB is normalized); other types by `compareValues`.
+ */
+export function keysEqual(
+  types: readonly PhysicalType[],
+  keys: readonly SortColumn[],
+  left: readonly Vector[],
+  i: number,
+  right: readonly Vector[],
+  j: number,
+): boolean {
+  for (const key of keys) {
+    const type = types[key.column];
+    const a = left[key.column];
+    const b = right[key.column];
+    if (type === undefined || a === undefined || b === undefined) continue;
+    const [fa, sa] = resolveRow(a, i);
+    const [fb, sb] = resolveRow(b, j);
+    if (sa < 0 || sb < 0) {
+      if (sa < 0 && sb < 0) continue;
+      return false;
+    }
+    const x = fa.data;
+    const y = fb.data;
+    switch (x.layout) {
+      case "bool":
+      case "i32":
+      case "f32":
+      case "f64":
+        if (compareNumbers(x.values[sa] ?? 0, (y as typeof x).values[sb] ?? 0) !== 0) return false;
+        continue;
+      case "int64": {
+        const p = x.values;
+        const q = (y as typeof x).values;
+        if (p.repr === "safe" && q.repr === "safe") {
+          if ((p.values[sa] ?? 0) !== (q.values[sb] ?? 0)) return false;
+        } else if (p.repr === "int64" && q.repr === "int64") {
+          if (p.values[sa] !== q.values[sb]) return false;
+        } else if (int64Of(x, sa) !== int64Of(y as typeof x, sb)) return false;
+        continue;
+      }
+      case "varlen": {
+        const yd = y as typeof x;
+        if (
+          compareRanges(
+            x.bytes,
+            x.offsets[sa] ?? 0,
+            x.offsets[sa + 1] ?? 0,
+            yd.bytes,
+            yd.offsets[sb] ?? 0,
+            yd.offsets[sb + 1] ?? 0,
+          ) !== 0
+        )
+          return false;
+        continue;
+      }
+      default:
+        if (compareValues(type, fa, sa, fb, sb, key.collation) !== 0) return false;
+    }
+  }
+  return true;
+}

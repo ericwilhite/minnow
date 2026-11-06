@@ -794,6 +794,35 @@ and the owner import it directly.
   with a real task yield between them; each slice and each resumption after backpressure checks
   the abort signal (ruling R23). Scratch that lives across a suspension belongs to the operator.
 
+### Windows (`exec/window.ts`, `window-frames.ts`, `window-stream.ts`)
+
+- `WindowOperator` evaluates a `window` rel. Its rows are sorted by (PARTITION BY, ORDER BY)
+  with the sort operator, then evaluated one partition at a time. Output is the input columns,
+  then one column per function.
+- Functions:
+  - ranking: row_number, rank, dense_rank, percent_rank, cume_dist, ntile;
+  - values: lag, lead, first_value, last_value, nth_value, over any type;
+  - aggregates: count, and sum, avg, min, max of integers and floats.
+- Frames follow PostgreSQL:
+  - ROWS, RANGE (one numeric ORDER BY key) and GROUPS, with offsets;
+  - EXCLUDE CURRENT ROW, GROUP and TIES;
+  - for a non-NULL row, RANGE offsets treat NULL keys as below every value (NULLS FIRST) or
+    above every value (NULLS LAST).
+- Float sums add a frame's members in order, as PostgreSQL does; exact sums use prefix sums.
+- A partition up to `streamRows` (65,536) rows is held in memory and evaluated over typed
+  arrays.
+- A larger partition, or one the grant cannot hold, streams from its spilled pages. Memory is
+  then bounded by the frame, not by the partition:
+  - ROWS frames and running aggregates keep the frame's rows;
+  - RANGE and GROUPS frames keep the peers plus the frame's extent;
+  - frames that need the whole partition (UNBOUNDED FOLLOWING, ntile, percent_rank,
+    cume_dist) read it twice, counting first.
+- A few combinations cannot stream: a column-valued lag, lead, ntile or nth_value amount;
+  nth_value past 4,096; and float sums or MIN/MAX over a moving frame that ends at UNBOUNDED
+  FOLLOWING. Such a partition must fit the grant.
+- Arrival, the per-partition kernels and emission run in slices, checking the abort signal
+  (ruling R23).
+
 ### Owner and client protocol (`owner/`)
 
 - One owner per database holds the store's fence: a dedicated owner worker started by a page, or
