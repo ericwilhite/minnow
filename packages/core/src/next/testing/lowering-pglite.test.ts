@@ -5,6 +5,7 @@
  * types. PostgreSQL is the authority here, so this evidence shares no code with lowering.
  */
 import { PGlite } from "@electric-sql/pglite";
+import { NAME_RESOLUTION_SETUP, NAME_RESOLUTION_CASES } from "../../testing/conformance-source.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { LoweredDatabase } from "./lowering-harness.js";
 
@@ -260,5 +261,32 @@ describe("lowering agrees with PostgreSQL on review B6-p2a's findings", () => {
       { sql: "TRUNCATE t" },
       { sql: "SELECT count(*) AS n FROM t" },
     ]);
+  });
+});
+
+describe("name errors before grouping errors", () => {
+  it("matches PostgreSQL messages for the same cases as the shipped engine", async () => {
+    schema += 1;
+    await pg.exec(`CREATE SCHEMA s${String(schema)}; SET search_path TO s${String(schema)}`);
+    const next = new LoweredDatabase();
+    for (const sql of NAME_RESOLUTION_SETUP) {
+      await pg.exec(sql);
+      next.execute(sql);
+    }
+    for (const sql of NAME_RESOLUTION_CASES) {
+      let expected = "ok";
+      try {
+        await pg.query(sql);
+      } catch (error) {
+        expected = (error as Error).message;
+      }
+      let actual = "ok";
+      try {
+        next.lower(sql);
+      } catch (error) {
+        actual = (error as Error).message;
+      }
+      expect(actual, sql).toBe(expected);
+    }
   });
 });
