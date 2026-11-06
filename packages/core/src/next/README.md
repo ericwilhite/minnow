@@ -587,6 +587,14 @@ and the owner import it directly.
   version) and the executor's prepared plan per plan, so a warm prepared or parameterized read
   lowers nothing. A literal per key (`WHERE id = 7`) is a new text each time: past the plan cache
   (512) every one is lowered again (~150 µs).
+- Table rules (CHECK, generated columns, defaults) are compiled per catalog identity, never per
+  (table id, version) (`owner/rule-cache.ts`): the committed catalog's in one bounded (512 entries)
+  cache charged to the memory governor, which drops older committed catalogs' entries and yields
+  memory on reclaim; a transaction's own schema in a session cache dropped on ROLLBACK and
+  ROLLBACK TO.
+- SQL `BEGIN READ ONLY` (and `START TRANSACTION READ ONLY`) is refused with 0A000 until lowering
+  reports a BEGIN's access mode; the protocol's read-only begin works. The refusal goes when
+  lowering's fix lands, and the owner's test then requires 25006 for a write in it.
 - Tests: in process (`testing/owner-*.test.ts`, the election ones on in-memory Web Locks) and
   across real tabs in Chromium, Firefox and WebKit (`npm run test:browser:next-owner`), over real
   lowering and the stand-in executor and write path persisted in OPFS (IndexedDB where workers

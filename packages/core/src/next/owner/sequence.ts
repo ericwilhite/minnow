@@ -239,6 +239,24 @@ export function classifyStatementText(text: string): StatementKind {
 }
 
 /**
+ * Whether SQL `text` is a BEGIN or START TRANSACTION that asks for a read-only transaction (the
+ * words READ ONLY among its modes), by the same lexical rules as `classifyStatementText`.
+ */
+export function requestsReadOnly(text: string): boolean {
+  if (classifyStatementText(text) !== "begin") return false;
+  const tokens = lex(text.trim().replace(/;$/u, "").trim()) ?? [];
+  return tokens.some((token, i) => {
+    const next = tokens[i + 1];
+    return (
+      token.kind === "word" &&
+      token.upper === "READ" &&
+      next?.kind === "word" &&
+      next.upper === "ONLY"
+    );
+  });
+}
+
+/**
  * Whether SQL `text` may open, end or change a transaction (`classifyStatementText` is not
  * `other`): such a request is not resendable on session 0 while it is unresolved.
  */

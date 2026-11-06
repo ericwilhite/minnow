@@ -378,6 +378,8 @@ export class ProtocolClient {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    // Pending releases and their timer go: `bye` makes the owner release every frame anyway.
+    this.#takeReleases();
     this.#port?.postMessage({ t: "bye" });
     this.#port?.close();
     const welcome = this.#welcome;
@@ -626,6 +628,7 @@ export class ProtocolClient {
    * alone.
    */
   #queueRelease(target: number, through: number, bytes: number, window: number): void {
+    if (this.#closed) return;
     const queued = this.#releases.get(target);
     const next = {
       through: Math.max(queued?.through ?? -1, through),

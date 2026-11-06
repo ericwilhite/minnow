@@ -55,6 +55,9 @@ import { statisticsDrifted, type PlanningStatistics } from "../lower/statistics.
 import type { MemoryGovernor } from "../memory/governor.js";
 import type { SpillService } from "../spill/contract.js";
 import { PG_EPOCH_UNIX_MICROS } from "../temporal.js";
+import { UnsupportedPlanError } from "../errors.js";
+import { RuleCache } from "./rule-cache.js";
+import { requestsReadOnly } from "./sequence.js";
 import type {
   EngineSession,
   OwnerEngine,
@@ -95,8 +98,8 @@ export interface ComposeOptions {
   readonly reads: ChunkReads;
   /**
    * The executor's row rules for a table at a catalog version. Default: exec `compileTableRules`
-   * over the planner's `lowerTableRules`, cached per (table id, catalog version); the composition
-   * passes them to every write statement.
+   * over the planner's `lowerTableRules`, cached by catalog identity (rule-cache.ts); the
+   * composition passes them to every write statement.
    */
   readonly rules?: (catalog: CatalogView, tableId: number) => TableRules;
   /** Device clock in ms (the statement clock and the ledger's). */
@@ -238,8 +241,8 @@ class ComposedEngine implements OwnerEngine {
   readonly #now: () => number;
   readonly #plans = new Map<string, PlannedStatement>();
   readonly #statistics: PlanningStatistics;
-  /** Compiled table rules by `tableId:catalogVersion`. */
-  readonly #rules = new Map<string, TableRules>();
+  /** Compiled table rules for the committed catalog (rule-cache.ts). */
+  readonly #rules: RuleCache;
   readonly #prepared = new WeakMap<PhysicalPlan, PreparedPlan>();
   readonly #commitListeners = new Set<(tables: readonly number[]) => void>();
   #queryId = 0;
@@ -249,29 +252,33 @@ class ComposedEngine implements OwnerEngine {
     this.#options = options;
     this.#now = options.now ?? Date.now;
     this.#statistics = options.statistics ?? { table: () => null };
+    this.#rules = new RuleCache(options.governor, "owner/table rules");
   }
 
   /**
    * A table's row rules at `catalog`: the composition's override, or lowering's rule expressions
-   * compiled by the executor, cached per (table id, catalog version).
+   * compiled by the executor. Cached by catalog identity (rule-cache.ts): the committed catalog's
+   * here, a transaction's own schema in `local` (the session's), anything else not at all.
    */
-  rules(catalog: CatalogView, tableId: number): TableRules {
+  rules(catalog: CatalogView, tableId: number, local: RuleCache | null = null): TableRules {
     const override = this.#options.rules;
     if (override !== undefined) return override(catalog, tableId);
-    const key = `${String(tableId)}:${String(catalog.version)}`;
-    let rules = this.#rules.get(key);
-    if (rules === undefined) {
+    const compile = () => {
       const table = catalog.table(tableId);
       if (table === undefined)
         throw new TypeError(`Table ${String(tableId)} is not in the catalog`);
-      rules = compileTableRules(
-        table,
-        catalog.version,
-        this.#options.planner.lowerTableRules(table, catalog),
-      );
-      this.#rules.set(key, rules);
-    }
-    return rules;
+      const expressions = this.#options.planner.lowerTableRules(table, catalog);
+      return { rules: compileTableRules(table, catalog.version, expressions), expressions };
+    };
+    if (catalog === this.#options.writePath.catalog)
+      return this.#rules.get(catalog, tableId, compile, true);
+    if (local !== null) return local.get(catalog, tableId, compile);
+    return compile().rules;
+  }
+
+  /** The committed catalog's rule cache (tests). */
+  get ruleCache(): RuleCache {
+    return this.#rules;
   }
 
   get durability() {
@@ -462,6 +469,8 @@ class ComposedSession implements EngineSession {
    * session, dropped when the transaction ends or rolls back to a savepoint.
    */
   readonly #privatePlans = new Map<string, PlannedStatement>();
+  /** Rules against this transaction's own schema changes, on the same lifetime as its plans. */
+  #txRules: RuleCache | null = null;
   /** Affected rows per table of the open transaction, for its COMMIT's frame and outcome. */
   #txCounts: Record<string, number> = {};
 
@@ -525,7 +534,13 @@ class ComposedSession implements EngineSession {
   }
 
   #rules(catalog: () => CatalogView) {
-    return (tableId: number) => this.#engine.rules(catalog(), tableId);
+    return (tableId: number) => this.#engine.rules(catalog(), tableId, this.#privateRules());
+  }
+
+  /** Rules compiled against this transaction's own schema: dropped with it (rule-cache.ts). */
+  #privateRules(): RuleCache {
+    this.#txRules ??= new RuleCache(this.#engine.options.governor, "owner/transaction rules");
+    return this.#txRules;
   }
 
   #execute(
@@ -565,6 +580,7 @@ class ComposedSession implements EngineSession {
     this.#startedAtMs = null;
     this.#savepoints = [];
     this.#privatePlans.clear();
+    this.#txRules?.clear();
     this.#txCounts = {};
   }
 
@@ -975,6 +991,15 @@ class ComposedSession implements EngineSession {
     switch (lowered.action) {
       case "begin": {
         if (this.#state !== "idle") return done(lowered.command); // PostgreSQL: a warning only
+        // Lowering does not report BEGIN READ ONLY's access mode yet (B6): never let it open a
+        // writable transaction. Remove when lowering sets `readOnly` (B5-p2c review 1, finding 1).
+        if (!lowered.readOnly && requestsReadOnly(lowered.text))
+          return failedRun(
+            new UnsupportedPlanError(
+              "BEGIN READ ONLY isn't supported yet; use the protocol's read-only begin",
+              { stage: "lower", construct: "readOnlyBegin" },
+            ),
+          );
         const begun = this.begin(lowered.readOnly, context.signal).then(() => ({
           command: lowered.command,
           rowCount: null,
@@ -1015,6 +1040,7 @@ class ComposedSession implements EngineSession {
           this.#savepoints.length = index + 1;
           this.#txCounts = { ...entry.counts };
           this.#privatePlans.clear();
+          this.#txRules?.clear();
           if (this.#state === "failed") this.#state = "open";
         }
         return done(lowered.command);
@@ -1136,5 +1162,7 @@ class ComposedSession implements EngineSession {
 
   close(): void {
     this.rollback();
+    this.#txRules?.close();
+    this.#txRules = null;
   }
 }

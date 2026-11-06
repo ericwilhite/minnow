@@ -245,6 +245,7 @@ class StandinTransaction {
 
   statement(options: StatementOptions): Statement {
     if (this.state !== "open") throw new TransactionStateError("The transaction is not open");
+    this.path.onStatement?.(options, this.catalog);
     return new StandinStatement(this, ++this.#statements, options) as unknown as Statement;
   }
 
@@ -311,6 +312,11 @@ export interface StandinWritePathOptions {
 
 export class StandinWritePath implements WritePath {
   readonly durability: "strict" | "relaxed";
+  /**
+   * Called with each statement's options as it opens (tests): the stand-in enforces no rules, so a
+   * test calls `options.rules(tableId)` as B3's write path would.
+   */
+  onStatement: ((options: StatementOptions, catalog: CatalogView) => void) | null = null;
   ledger: RequestLedger;
   readonly #persistence: StandinPersistence | null;
   readonly failure: Error | null = null;
