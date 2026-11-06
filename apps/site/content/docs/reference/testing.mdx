@@ -1402,3 +1402,7 @@ This is a storage-startup measurement, not owner readiness, log replay or full q
 npm run test:prepare
 MINNOW_NEXT_STORAGE_REOPEN=1 npx playwright test --config playwright.library.config.ts packages/core/browser-tests/next-storage.spec.ts --project=chromium --workers=1 -g 'R25 list reopen'
 ```
+
+The keeper admission regressions use finite governor grants. They require refusal before any
+write, bounded page-at-a-time preparation, charges held across suspended readers, and complete
+scratch cleanup after failed reads, failed writes and aborted publication attempts.

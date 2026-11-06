@@ -1337,6 +1337,13 @@ branch).
 - **Cross-tab round trips are slow on WebKit.** Measured at about 55–65 µs on Chromium, 140 µs on
   Firefox and 280 µs on WebKit (p95 520 µs).
 
+The keeper reserves its own input-copy/sort workspace, decoded page objects, bounded output
+buffer, encoded page and result metadata through `ByteBudget` before allocating them. It reads
+one touched source page and writes one output page at a time. Prepared metadata stays charged
+across publication; abort/failure returns it, commit replaces the keeper's retained reservation,
+and close releases that reservation. List readers keep decoded objects charged across generator
+suspension and release them when the consumer finishes or stops.
+
 ### R25 startup measurement
 
 `MINNOW_NEXT_STORAGE_REOPEN=1` enables the Chromium storage reopen lane in

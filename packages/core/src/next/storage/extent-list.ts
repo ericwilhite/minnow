@@ -27,6 +27,7 @@
 import { StoreCorruptionError } from "./contract.js";
 import {
   MAX_READ_BYTES,
+  ReadDeniedError,
   type BlobRef,
   type ByteBudget,
   type ExtentReader,
@@ -98,47 +99,70 @@ export function decodeListPage(bytes: Uint8Array, page: ExtentListPage): ExtentR
   return extents;
 }
 
-/** Batches of pages whose bytes fit one read. */
-function batches(pages: readonly ExtentListPage[]): ExtentListPage[][] {
-  const out: ExtentListPage[][] = [];
+// Governor accounting: 64-byte object overhead plus array slots/growth. Storage depends only
+// on the structural ByteBudget, not the governor implementation.
+const EXTENT_MEMORY_BYTES = 80;
+const PAGE_MEMORY_BYTES = 256;
+const BATCH_PAGES = 16;
+
+function reserve(budget: ByteBudget, bytes: number): void {
+  if (!budget.allocate(bytes)) throw new ReadDeniedError(bytes);
+}
+
+/** Bounded batches; the caller charges their small reference vectors before iteration. */
+function* batches(pages: readonly ExtentListPage[]): Generator<ExtentListPage[]> {
   let batch: ExtentListPage[] = [];
   let bytes = 0;
   for (const page of pages) {
-    if (batch.length > 0 && bytes + page.blob.length > MAX_READ_BYTES) {
-      out.push(batch);
+    if (
+      batch.length > 0 &&
+      (bytes + page.blob.length > MAX_READ_BYTES || batch.length === BATCH_PAGES)
+    ) {
+      yield batch;
       batch = [];
       bytes = 0;
     }
     batch.push(page);
     bytes += page.blob.length;
   }
-  if (batch.length > 0) out.push(batch);
-  return out;
+  if (batch.length > 0) yield batch;
 }
 
-/** Reads and decodes `pages` (any subset of a list), in order. */
+/** Decoded objects stay charged until the consumer releases them, including across awaits. */
 async function readPages(
   pages: readonly ExtentListPage[],
   reader: ExtentReader,
   budget: ByteBudget,
-): Promise<ExtentRef[][]> {
-  const out: ExtentRef[][] = [];
-  for (const batch of batches(pages)) {
-    const lease = await reader.read(
-      batch.map((page) => page.blob),
+): Promise<{ pages: ExtentRef[][]; release(): void }> {
+  const charge = 128 + pages.reduce((sum, page) => sum + 128 + page.count * EXTENT_MEMORY_BYTES, 0);
+  reserve(budget, charge);
+  let lease: import("./extents.js").ReadLease | null = null;
+  try {
+    lease = await reader.read(
+      pages.map((page) => page.blob),
       { budget },
     );
-    try {
-      batch.forEach((page, index) => {
-        const bytes = lease.bytes[index];
-        if (bytes === undefined) throw new StoreCorruptionError("An extent list page is missing");
-        out.push(decodeListPage(bytes, page));
-      });
-    } finally {
-      lease.release();
-    }
+    const decoded = pages.map((page, index) => {
+      const bytes = lease?.bytes[index];
+      if (bytes === undefined) throw new StoreCorruptionError("An extent list page is missing");
+      return decodeListPage(bytes, page);
+    });
+    const held = lease;
+    let released = false;
+    return {
+      pages: decoded,
+      release() {
+        if (released) return;
+        released = true;
+        held.release();
+        budget.free(charge);
+      },
+    };
+  } catch (error) {
+    lease?.release();
+    budget.free(charge);
+    throw error;
   }
-  return out;
 }
 
 /**
@@ -152,21 +176,30 @@ export async function* listedExtents(
   budget: ByteBudget,
 ): AsyncGenerator<ExtentRef | BlobRef> {
   checkOrder(list);
-  for (const batch of batches(list)) {
-    const decoded = await readPages(batch, reader, budget);
-    for (let index = 0; index < batch.length; index++) {
-      const page = batch[index];
-      const extents = decoded[index];
-      if (page === undefined || extents === undefined) continue;
-      const next = list[list.indexOf(page) + 1];
-      const last = extents[extents.length - 1];
-      if (next !== undefined && last !== undefined && last.offset >= next.first)
-        throw new StoreCorruptionError(
-          `Extent list page at ${String(page.first)} reaches past the next page's first offset`,
-        );
-      yield page.blob;
-      yield* extents;
+  reserve(budget, 512); // two bounded page-reference vectors across a generator suspension
+  try {
+    for (const batch of batches(list)) {
+      const decoded = await readPages(batch, reader, budget);
+      try {
+        for (let index = 0; index < batch.length; index++) {
+          const page = batch[index];
+          const extents = decoded.pages[index];
+          if (page === undefined || extents === undefined) continue;
+          const next = list[list.indexOf(page) + 1];
+          const last = extents[extents.length - 1];
+          if (next !== undefined && last !== undefined && last.offset >= next.first)
+            throw new StoreCorruptionError(
+              `Extent list page at ${String(page.first)} reaches past the next page's first offset`,
+            );
+          yield page.blob;
+          yield* extents;
+        }
+      } finally {
+        decoded.release();
+      }
     }
+  } finally {
+    budget.free(512);
   }
 }
 
@@ -210,7 +243,7 @@ export interface PreparedList {
 export interface ExtentListKeeperOptions {
   /** Reads the pages a delta touches (the extent space). */
   readonly reader: ExtentReader;
-  /** Charged while those pages are read. */
+  /** Admits keeper scratch, read leases and retained prepared/committed list metadata. */
   readonly budget: ByteBudget;
   /** Extents per page at most (tests use small pages); default `LIST_PAGE_EXTENTS`. */
   readonly pageExtents?: number;
@@ -227,7 +260,14 @@ export class ExtentListKeeper {
   readonly #budget: ByteBudget;
   readonly #pageExtents: number;
   #committed: ExtentList;
-  #pending: { readonly attempt: number; readonly list: ExtentList } | null = null;
+  #pending: {
+    readonly attempt: number;
+    readonly list: ExtentList;
+    readonly charge: number;
+    readonly retireCharge: number;
+  } | null = null;
+  #owned = 0;
+  #preparing = false;
   #sequence = 0;
 
   /** `list`: the durable current root's list (empty for a new store). */
@@ -245,17 +285,32 @@ export class ExtentListKeeper {
   }
 
   async prepare(attempt: number, delta: ExtentListDelta): Promise<PreparedList> {
-    if (this.#pending !== null)
+    if (this.#preparing || this.#pending !== null)
       throw new Error(
-        `Extent list: attempt ${String(attempt)} prepared before ${String(this.#pending.attempt)} settled`,
+        `Extent list: attempt ${String(attempt)} prepared before another attempt settled`,
       );
-    const list = await this.#apply(delta);
-    this.#pending = { attempt, list };
-    return { pages: [], retire: retiredPageExtents(this.#committed, list), list };
+    this.#preparing = true;
+    try {
+      const prepared = await this.#apply(delta);
+      this.#pending = {
+        attempt,
+        list: prepared.list,
+        charge: prepared.charge,
+        retireCharge: prepared.retireCharge,
+      };
+      return { pages: [], retire: prepared.retire, list: prepared.list };
+    } finally {
+      this.#preparing = false;
+    }
   }
 
   commit(attempt: number, sequence: number): void {
     const pending = this.#take(attempt);
+    if (pending.list !== this.#committed) {
+      this.#budget.free(this.#owned);
+      this.#owned = pending.charge;
+    }
+    this.#budget.free(pending.retireCharge);
     this.#committed = pending.list;
     this.#sequence = sequence;
   }
@@ -266,10 +321,25 @@ export class ExtentListKeeper {
   }
 
   abort(attempt: number): void {
-    this.#take(attempt);
+    const pending = this.#take(attempt);
+    this.#budget.free(pending.charge + pending.retireCharge);
   }
 
-  #take(attempt: number): { readonly attempt: number; readonly list: ExtentList } {
+  /** Releases keeper-owned metadata; the constructor's durable list is borrowed from its root. */
+  close(): void {
+    if (this.#preparing) throw new Error("Extent list: close while preparing");
+    if (this.#pending !== null) this.abort(this.#pending.attempt);
+    this.#budget.free(this.#owned);
+    this.#owned = 0;
+    this.#committed = [];
+  }
+
+  #take(attempt: number): {
+    readonly attempt: number;
+    readonly list: ExtentList;
+    readonly charge: number;
+    readonly retireCharge: number;
+  } {
     const pending = this.#pending;
     if (pending?.attempt !== attempt)
       throw new Error(`Extent list: attempt ${String(attempt)} was not the one prepared`);
@@ -277,175 +347,145 @@ export class ExtentListKeeper {
     return pending;
   }
 
-  /** The committed list with `delta` applied: touched pages rewritten, the rest shared. */
-  async #apply(delta: ExtentListDelta): Promise<ExtentList> {
+  /** One decoded source page and one output page at a time; untouched pages retain identity. */
+  async #apply(delta: ExtentListDelta): Promise<{
+    list: ExtentList;
+    retire: readonly ExtentRef[];
+    charge: number;
+    retireCharge: number;
+  }> {
     const pages = this.#committed;
-    const added = [...delta.added].sort(byOffset);
-    const released = [...delta.released].sort(byOffset);
-    if (added.length === 0 && released.length === 0) return pages;
-    // The page each change falls in: the last page whose first offset is at or below it (an
-    // addition below every page goes to the first one).
-    const pageOf = (offset: number): number => {
-      let low = 0;
-      let high = pages.length - 1;
-      let found = 0;
-      while (low <= high) {
-        const middle = (low + high) >>> 1;
-        if ((pages[middle]?.first ?? Infinity) <= offset) {
-          found = middle;
-          low = middle + 1;
-        } else high = middle - 1;
-      }
-      return found;
-    };
-    const touched = new Map<number, { added: ExtentRef[]; released: ExtentRef[] }>();
-    const touch = (index: number) => {
-      let entry = touched.get(index);
-      if (entry === undefined) {
-        entry = { added: [], released: [] };
-        touched.set(index, entry);
-      }
-      return entry;
-    };
-    if (pages.length === 0) {
-      if (released.length > 0)
-        throw new StoreCorruptionError(
-          `Extent list: the publication releases ${String(released.length)} extents an empty list does not name`,
-        );
-      return this.#writePages(delta.writer, this.#split(added));
-    }
-    for (const extent of added) touch(pageOf(extent.offset)).added.push(extent);
-    for (const extent of released) touch(pageOf(extent.offset)).released.push(extent);
-    // A rewritten page that ends up small takes its next neighbour along (merged when they fit).
-    const order = [...touched.keys()].sort((a, b) => a - b);
-    const loaded = await readPages(
-      order.map((index) => pageAt(pages, index)),
-      this.#reader,
-      this.#budget,
-    );
-    const runs: Array<{ from: number; to: number; extents: ExtentRef[] }> = [];
-    order.forEach((index, at) => {
-      const change = touched.get(index);
-      const current = loaded[at];
-      if (change === undefined || current === undefined) return;
-      const releasing = new Map(change.released.map((extent) => [extent.offset, extent.length]));
-      const kept: ExtentRef[] = [];
-      for (const extent of current) {
-        const length = releasing.get(extent.offset);
-        if (length === undefined) kept.push(extent);
-        else if (length !== extent.length)
+    if (delta.added.length === 0 && delta.released.length === 0)
+      return { list: pages, retire: [], charge: 0, retireCharge: 0 };
+    // Input copies + sort workspace; two pages' objects/slots and one encoded output; retained
+    // result pages plus retirement set/maps. Reserve every component before allocating it.
+    const resultCapacity = 2 * pages.length + Math.ceil(delta.added.length / this.#pageExtents) + 1;
+    const charge =
+      32 * (delta.added.length + delta.released.length) +
+      256 * this.#pageExtents +
+      1024 +
+      512 * resultCapacity +
+      128 * pages.length;
+    reserve(this.#budget, charge);
+    let retained = 0;
+    try {
+      const added = [...delta.added].sort(byOffset);
+      const released = [...delta.released].sort(byOffset);
+      const out: ExtentListPage[] = [];
+      let buffer: ExtentRef[] = [];
+      let previousEnd = -1;
+      let ai = 0;
+      let ri = 0;
+      const flush = async () => {
+        const first = buffer[0];
+        if (first === undefined) return;
+        const bytes = encodeListPage(buffer);
+        const written = await delta.writer.write([bytes]);
+        const blob = written.blobs[0];
+        if (blob === undefined) throw new Error("Extent list: a page was not written");
+        out.push({ blob, first: first.offset, count: buffer.length });
+        buffer = [];
+      };
+      const append = (extent: ExtentRef): Promise<void> | undefined => {
+        if (previousEnd > extent.offset)
           throw new StoreCorruptionError(
-            `Extent list: the publication releases ${String(extent.offset)} as ${String(length)} bytes, the list has ${String(extent.length)}`,
+            `Extent list: duplicate or overlapping addition at ${String(extent.offset)}`,
           );
-        else releasing.delete(extent.offset);
+        previousEnd = extent.offset + extent.length;
+        buffer.push(extent);
+        if (buffer.length === this.#pageExtents) return flush();
+        return undefined;
+      };
+      for (let index = 0; index < Math.max(1, pages.length); index++) {
+        const page = pages[index];
+        const next = pages[index + 1];
+        const end = next?.first ?? Infinity;
+        const addStart = ai;
+        const releaseStart = ri;
+        while ((added[ai]?.offset ?? Infinity) < end) ai++;
+        while ((released[ri]?.offset ?? Infinity) < end) ri++;
+        const mergeNeighbour =
+          page !== undefined &&
+          buffer.length > 0 &&
+          buffer.length < this.#pageExtents / 2 &&
+          buffer.length + page.count <= this.#pageExtents;
+        if (page !== undefined && ai === addStart && ri === releaseStart && !mergeNeighbour) {
+          await flush();
+          out.push(page);
+          continue;
+        }
+        const held =
+          page === undefined ? null : await readPages([page], this.#reader, this.#budget);
+        try {
+          let a = addStart;
+          let r = releaseStart;
+          for (const extent of held?.pages[0] ?? []) {
+            const removal = released[r];
+            if (r < ri && removal !== undefined && removal.offset < extent.offset)
+              throw new StoreCorruptionError(
+                `Extent list: the publication releases extents the list does not name (first at ${String(removal.offset)})`,
+              );
+            let keep = true;
+            if (r < ri && removal?.offset === extent.offset) {
+              if (removal.length !== extent.length)
+                throw new StoreCorruptionError(
+                  `Extent list: the publication releases ${String(extent.offset)} as ${String(removal.length)} bytes, the list has ${String(extent.length)}`,
+                );
+              keep = false;
+              r++;
+            }
+            while (a < ai && (added[a]?.offset ?? Infinity) < extent.offset) {
+              const addition = added[a++];
+              if (addition !== undefined) {
+                const pending = append(addition);
+                if (pending !== undefined) await pending;
+              }
+            }
+            if (keep) {
+              if (a < ai && added[a]?.offset === extent.offset)
+                throw new StoreCorruptionError(
+                  `Extent list: the publication adds the extent at ${String(extent.offset)}, which the list already names`,
+                );
+              const pending = append(extent);
+              if (pending !== undefined) await pending;
+            }
+          }
+          if (r !== ri)
+            throw new StoreCorruptionError(
+              "Extent list: the publication releases extents the list does not name",
+            );
+          while (a < ai) {
+            const addition = added[a++];
+            if (addition !== undefined) {
+              const pending = append(addition);
+              if (pending !== undefined) await pending;
+            }
+          }
+        } finally {
+          held?.release();
+        }
+        const nextTouched =
+          next !== undefined &&
+          ((added[ai]?.offset ?? Infinity) < (pages[index + 2]?.first ?? Infinity) ||
+            (released[ri]?.offset ?? Infinity) < (pages[index + 2]?.first ?? Infinity));
+        if (
+          next === undefined ||
+          nextTouched ||
+          buffer.length >= this.#pageExtents / 2 ||
+          buffer.length + next.count > this.#pageExtents
+        )
+          await flush();
       }
-      if (releasing.size > 0)
-        throw new StoreCorruptionError(
-          `Extent list: the publication releases ${String(releasing.size)} extents the list does not name (first at ${String([...releasing.keys()][0])})`,
-        );
-      const merged = mergeSorted(kept, change.added);
-      runs.push({ from: index, to: index, extents: merged });
-    });
-    // Merge a small rewritten page with an untouched next neighbour when they fit one page.
-    const neighbours: Array<{ run: (typeof runs)[number]; next: number }> = [];
-    for (const run of runs) {
-      const next = run.to + 1;
-      const page = pages[next];
-      if (
-        page !== undefined &&
-        !touched.has(next) &&
-        run.extents.length < this.#pageExtents / 2 &&
-        run.extents.length + page.count <= this.#pageExtents
-      )
-        neighbours.push({ run, next });
+      await flush();
+      const retire = retiredPageExtents(pages, out);
+      const listCharge = 128 + out.length * PAGE_MEMORY_BYTES;
+      const retireCharge = 64 + retire.length * 16;
+      retained = listCharge + retireCharge;
+      return { list: out, retire, charge: listCharge, retireCharge };
+    } finally {
+      this.#budget.free(charge - retained);
     }
-    if (neighbours.length > 0) {
-      const extra = await readPages(
-        neighbours.map(({ next }) => pageAt(pages, next)),
-        this.#reader,
-        this.#budget,
-      );
-      neighbours.forEach(({ run, next }, at) => {
-        run.extents = [...run.extents, ...(extra[at] ?? [])];
-        run.to = next;
-      });
-    }
-    const chunks: ExtentRef[][] = [];
-    for (const run of runs) chunks.push(...this.#split(run.extents));
-    const written = chunks.length === 0 ? [] : await this.#writePages(delta.writer, chunks);
-    // The new list: untouched pages by reference, each run replaced by its new pages.
-    const out: ExtentListPage[] = [];
-    let cursor = 0;
-    let at = 0;
-    for (const run of runs) {
-      for (; cursor < run.from; cursor++) {
-        const page = pages[cursor];
-        if (page !== undefined) out.push(page);
-      }
-      const count = this.#split(run.extents).length;
-      out.push(...written.slice(at, at + count));
-      at += count;
-      cursor = run.to + 1;
-    }
-    for (; cursor < pages.length; cursor++) {
-      const page = pages[cursor];
-      if (page !== undefined) out.push(page);
-    }
-    return out;
   }
-
-  /** Splits a sorted run into as few pages as fit, of near-equal sizes. */
-  #split(extents: readonly ExtentRef[]): ExtentRef[][] {
-    if (extents.length === 0) return [];
-    const parts = Math.ceil(extents.length / this.#pageExtents);
-    const size = Math.ceil(extents.length / parts);
-    const out: ExtentRef[][] = [];
-    for (let at = 0; at < extents.length; at += size) out.push(extents.slice(at, at + size));
-    return out;
-  }
-
-  async #writePages(
-    writer: ExtentWriter,
-    chunks: readonly ExtentRef[][],
-  ): Promise<ExtentListPage[]> {
-    const nonEmpty = chunks.filter((chunk) => chunk.length > 0);
-    if (nonEmpty.length === 0) return [];
-    const written = await writer.write(nonEmpty.map((chunk) => encodeListPage(chunk)));
-    return nonEmpty.map((chunk, index) => {
-      const blob = written.blobs[index];
-      const first = chunk[0];
-      if (blob === undefined || first === undefined)
-        throw new Error("Extent list: a page was not written");
-      return { blob, first: first.offset, count: chunk.length };
-    });
-  }
-}
-
-function pageAt(pages: ExtentList, index: number): ExtentListPage {
-  const page = pages[index];
-  if (page === undefined) throw new RangeError(`Extent list: no page ${String(index)}`);
-  return page;
-}
-
-function mergeSorted(a: readonly ExtentRef[], b: readonly ExtentRef[]): ExtentRef[] {
-  const out: ExtentRef[] = [];
-  let i = 0;
-  let j = 0;
-  while (i < a.length || j < b.length) {
-    const x = a[i];
-    const y = b[j];
-    if (y === undefined || (x !== undefined && x.offset < y.offset)) {
-      if (x !== undefined) out.push(x);
-      i += 1;
-    } else if (x === undefined || y.offset < x.offset) {
-      out.push(y);
-      j += 1;
-    } else
-      throw new StoreCorruptionError(
-        `Extent list: the publication adds the extent at ${String(y.offset)}, which the list already names`,
-      );
-  }
-  return out;
 }
 
 /** Extents holding pages of `before` that no page of `after` lives in. */

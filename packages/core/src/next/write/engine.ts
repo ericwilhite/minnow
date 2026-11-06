@@ -2076,6 +2076,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#currentPin?.release();
     this.#currentPin = null;
     for (const cache of this.#metadataCaches) cache.clear();
+    this.#lists.close();
     this.#metadataGrant.close();
     this.#grant.close();
   }
