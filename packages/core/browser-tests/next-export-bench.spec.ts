@@ -63,8 +63,12 @@ const DISTINCT = Number(process.env.MINNOW_EXPORT_DISTINCT ?? 4);
 const COMPARE_STREAM = process.env.MINNOW_EXPORT_COMPARE_STREAM === "1";
 const SCAN_PROFILE = process.env.MINNOW_EXPORT_SCAN_PROFILE === "1";
 const FRAME_COPY_COMPARE = process.env.MINNOW_EXPORT_FRAME_COPY_COMPARE === "1";
+const SCAN_RANGE_COMPARE = process.env.MINNOW_EXPORT_SCAN_RANGE_COMPARE === "1";
 const SCAN_COMPARE =
-  process.env.MINNOW_EXPORT_SCAN_COMPARE === "1" || SCAN_PROFILE || FRAME_COPY_COMPARE;
+  process.env.MINNOW_EXPORT_SCAN_COMPARE === "1" ||
+  SCAN_PROFILE ||
+  FRAME_COPY_COMPARE ||
+  SCAN_RANGE_COMPARE;
 const DEPTH_COMPARE = process.env.MINNOW_EXPORT_DEPTH_COMPARE === "1";
 const READ_COMPARE = process.env.MINNOW_EXPORT_READ_COMPARE === "1";
 const VARIANCE = process.env.MINNOW_EXPORT_VARIANCE === "1";
@@ -518,7 +522,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     };
 
     const base = { once: true, capMiB: 512, passes: 1, groups: exported };
-    if (FRAME_COPY_COMPARE) {
+    if (FRAME_COPY_COMPARE || SCAN_RANGE_COMPARE) {
       const options = {
         ...base,
         mode: "scan" as const,
@@ -528,13 +532,18 @@ test.describe("rebuild core export on OPFS (bench)", () => {
         profile: true,
       };
       for (let round = 0; round < 5; round++)
-        for (const frameCopy of round % 2 === 0
+        for (const variant of round % 2 === 0
           ? (["baseline", "candidate"] as const)
           : (["candidate", "baseline"] as const))
-          await measure(`cold scan frame copy ${frameCopy} round ${String(round)}`, true, false, {
-            ...options,
-            frameCopy,
-          });
+          await measure(
+            `cold scan ${FRAME_COPY_COMPARE ? "frame copy" : "range"} ${variant} round ${String(round)}`,
+            true,
+            false,
+            {
+              ...options,
+              ...(FRAME_COPY_COMPARE ? { frameCopy: variant } : { scanRange: variant }),
+            },
+          );
     } else if (SCAN_COMPARE) {
       const options = {
         ...base,
@@ -716,9 +725,21 @@ test.describe("rebuild core export on OPFS (bench)", () => {
             scanAdapter:
               "bench stand-in for future executor frame assembly; real TableScan/ResultChannel/owner transfer policy/MessagePort credits; fixture descriptors exclude SQL/catalog/root loading",
             cpuSamplingIntervalUs: SCAN_PROFILE ? 500 : 1_000_000,
-            rounds: Number(process.env.MINNOW_EXPORT_SCAN_ROUNDS ?? (SCAN_PROFILE ? 1 : 5)),
+            rounds:
+              FRAME_COPY_COMPARE || SCAN_RANGE_COMPARE
+                ? 5
+                : Number(process.env.MINNOW_EXPORT_SCAN_ROUNDS ?? (SCAN_PROFILE ? 1 : 5)),
             scanProfile: SCAN_PROFILE,
-            coldOnly: FRAME_COPY_COMPARE || process.env.MINNOW_EXPORT_SCAN_COLD_ONLY === "1",
+            coldOnly:
+              FRAME_COPY_COMPARE ||
+              SCAN_RANGE_COMPARE ||
+              process.env.MINNOW_EXPORT_SCAN_COLD_ONLY === "1",
+            ...(SCAN_RANGE_COMPARE
+              ? {
+                  scanRangeComparison:
+                    "parent gather specs vs contiguous range specs; same adapter and transfer policy",
+                }
+              : {}),
             ...(FRAME_COPY_COMPARE
               ? {
                   frameCopyComparison:

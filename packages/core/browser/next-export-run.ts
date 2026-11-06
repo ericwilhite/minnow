@@ -17,6 +17,8 @@ async function withWorker<T>(request: ExportRequest): Promise<T> {
     url.searchParams.set("readMiB", String(request.readMiB));
   if (request.op === "export" && request.frameCopy !== undefined)
     url.searchParams.set("frameCopy", request.frameCopy);
+  if (request.op === "export" && request.scanRange !== undefined)
+    url.searchParams.set("scanRange", request.scanRange);
   const worker = new Worker(url, {
     type: "module",
   });
@@ -144,6 +146,7 @@ export async function exportPass(options: {
   readonly groupDepth?: 1 | 2;
   readonly mode?: "pages" | "scan";
   readonly frameCopy?: "baseline" | "candidate";
+  readonly scanRange?: "baseline" | "candidate";
 }): Promise<ExportPass[]> {
   if (built === null) throw new Error("build the table first");
   const groups = built.groups.slice(0, options.groups ?? built.groups.length);
@@ -163,6 +166,7 @@ export async function exportPass(options: {
     passes: options.passes,
     ...(options.mode === undefined ? {} : { mode: options.mode }),
     ...(options.frameCopy === undefined ? {} : { frameCopy: options.frameCopy }),
+    ...(options.scanRange === undefined ? {} : { scanRange: options.scanRange }),
     ...(options.groupDepth === undefined ? {} : { groupDepth: options.groupDepth }),
     ...(options.readMiB === undefined ? {} : { readMiB: options.readMiB }),
     ...(options.profile === true ? { profile: true } : {}),

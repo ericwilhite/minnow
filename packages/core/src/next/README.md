@@ -613,6 +613,14 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     It compares complete frame digests and charges, without requiring a historical Git object.
     `MINNOW_EXPORT_FRAME_COPY_COMPARE=1` compares both formulas over real cold scan/transport,
     five interleaved rounds. Both own all borrowed buffers and use the same transfer policy.
+  - Compact scan batches whose selected positions are contiguous use range APIs for sizing,
+    value loading and decoding. Every position is checked; selections with gaps keep the gather
+    path. Batch sizes, byte limits, borrowing, pushdown and output values are unchanged.
+    `gatherBatches` still counts the compact-selection branch, including these contiguous spans.
+    `scripts/scan-range-bench.mts` isolates this dispatch in five interleaved CPU/wall rounds over
+    the real scan/cache/targets in memory. `MINNOW_EXPORT_SCAN_RANGE_COMPARE=1` compares the
+    parent gather policy and range dispatch through whole cold scan/transport, keeping the
+    adapter and owner transfer policy fixed. Neither comparison needs a historical Git object.
 - The checksum-load CPU hypothesis from the export profile is reproducible with
   `npx vite-node scripts/hash-load-bench.mts`: five rotating rounds in fresh processes, CPU and
   wall medians/min/max, aligned and unaligned inputs, byte offsets, stripe tails, and consumed

@@ -110,6 +110,17 @@ function at<T>(xs: readonly T[], i: number): T {
   return x;
 }
 
+/**
+ * Byte splitting can leave a compact selection that is still one contiguous range. Preserve
+ * that range through sizing, loading and decoding instead of walking its rows per column.
+ * Check every position: endpoints alone would accept a selection with interior gaps/duplicates.
+ */
+function specForRows(rows: Uint16Array, count: number): DecodeSpec {
+  const from = rows[0] ?? 0;
+  for (let k = 1; k < count; k++) if (rows[k] !== from + k) return { rows, count };
+  return count === 0 ? { rows, count } : { from, to: from + count };
+}
+
 /** At or above this share of a range's positions selected, decode the range densely (B2's 40 %). */
 export const DENSE_SELECTION = 0.4;
 
@@ -856,17 +867,17 @@ export class TableScan implements BatchSource {
       this.stats.denseBatches += 1;
       return { batch: this.#withLocators(batch, group, (k) => from + k) };
     }
-    yield* this.#loadPages(group, { rows: positions, count });
+    yield* this.#loadPages(group, specForRows(positions, count));
     // Gather: a prefix of the positions that fits the byte target (at least one row), then the
     // grant (halving until it holds the prefix's working set, or one row under a loan).
     let take = count;
     for (;;) {
       if (take <= 1) break;
-      const bytes = this.#bytesFor(group, { rows: positions, count: take });
+      const bytes = this.#bytesFor(group, specForRows(positions, take));
       if (bytes <= this.#target) break;
       take = Math.max(1, Math.min(take - 1, Math.floor((take * this.#target) / bytes)));
     }
-    while (!(yield* this.#prepay(group, { rows: positions, count: take })))
+    while (!(yield* this.#prepay(group, specForRows(positions, take))))
       take = Math.max(1, Math.floor(take / 2));
     if (take < count) this.stats.splits += 1;
     // The taken positions move to `#survivors` before `pending` is shifted (below).
@@ -877,7 +888,7 @@ export class TableScan implements BatchSource {
       // Residual columns first, for the candidates; the rest only for the survivors.
       const first = all.filter((c) => this.#residualColumns.has(c));
       const probe: Vector[] = all.map(() => this.#placeholder);
-      yield* this.#decode(group, { rows: survivors, count: take }, first, probe);
+      yield* this.#decode(group, specForRows(survivors, take), first, probe);
       const rows = this.#residual.select({ length: take, columns: probe, selection: null });
       this.stats.residualBatches += 1;
       kept = rows.count;
@@ -887,7 +898,7 @@ export class TableScan implements BatchSource {
     positions.copyWithin(0, take, count);
     group.pendingCount = count - take;
     if (kept === 0) return null;
-    yield* this.#decode(group, { rows: survivors, count: kept }, all, columns);
+    yield* this.#decode(group, specForRows(survivors, kept), all, columns);
     this.stats.gatherBatches += 1;
     return {
       batch: this.#withLocators(

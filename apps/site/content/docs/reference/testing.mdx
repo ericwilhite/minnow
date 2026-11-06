@@ -1207,6 +1207,11 @@ active sample shares estimate hotspots, not exact CPU seconds per bucket. The re
 native reads, GC and idle samples separate and records the worker's actual thread CPU bracket.
 `scripts/frame-copy-bench.mts` isolates frame ownership copies in five interleaved CPU/wall
 rounds; `MINNOW_EXPORT_FRAME_COPY_COMPARE=1` compares those policies through the whole cold scan.
+`scripts/scan-range-bench.mts` isolates the scan's contiguous-prefix dispatch over real encoded
+columns in memory. `MINNOW_EXPORT_SCAN_RANGE_COMPARE=1` compares it against the parent gather
+policy in five cold scan/transport rounds, with the frame adapter and owner policy held fixed.
+Contiguous compact batches can use range APIs while the scan's `gatherBatches` diagnostic still
+counts the compact-selection branch; selections with gaps continue to gather.
 
 **Storage kill campaign.** The nightly run also runs `npm run test:storage-kills`: the rebuild
 core's storage in Chromium, on OPFS and on IndexedDB, killed 1,000 times each at seeded random

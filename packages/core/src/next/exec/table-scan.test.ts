@@ -407,6 +407,76 @@ function scanOf(
 }
 
 describe("table scan: pushdown, gather and late materialization never change the answer", () => {
+  it.each(seedsFor("next-table-scan-ranges", [0x5ca92, 0x5ca93]))(
+    "contiguous split prefixes use range APIs; gaps preserve positions (seed %i)",
+    async (seed) => {
+      const reach = createReach("next-table-scan-ranges", [
+        "contiguous byte split",
+        "gapped gather",
+        "dictionary codes",
+        "out-of-line text",
+      ] as const);
+      await fc.assert(
+        fc.asyncProperty(
+          fc.integer({ min: 100, max: 500 }),
+          fc.boolean(),
+          fc.boolean(),
+          fc.integer(),
+          async (count, holes, longText, inner) => {
+            reach.beginHistory();
+            const source = rowsOf(mulberry32(inner), count, longText);
+            const deleted = new Set<number>();
+            if (holes) for (let k = 2; k < count; k += 3) deleted.add(k);
+            const space = new MemoryExtentSpace();
+            const table: TableSnapshot = {
+              tableId: 9,
+              schemaVersion: 1,
+              columns: DEFS,
+              liveRowCount: count - deleted.size,
+              segments: [await groupSegment(0, source, deleted, false, space)],
+            };
+            let gathered = 0,
+              codes = 0;
+            const reads: ChunkReads = {
+              open: async (_pages, chunk, options) => {
+                const reader = await ChunkReader.open(space.view({ cache: true }), chunk, options);
+                return new Proxy(reader, {
+                  get(target, key) {
+                    const member: unknown = Reflect.get(target, key, target);
+                    if (typeof member !== "function") return member;
+                    return (...args: unknown[]) => {
+                      if (key === "gather" || key === "gatherCodes") gathered++;
+                      if (key === "decodeCodes" || key === "gatherCodes") codes++;
+                      const result: unknown = Reflect.apply(member, target, args);
+                      return result;
+                    };
+                  },
+                });
+              },
+            };
+            const budget = counting(),
+              scan = scanOf(table, space, null, { reads, budget, targetBytes: 1024 });
+            const actual = await collect(scan);
+            expect(actual).toEqual(
+              source.filter((_, k) => !deleted.has(k)).map((r) => expectedRow(r, false)),
+            );
+            expect(budget.held).toBe(0);
+            expect(scan.stats.splits).toBeGreaterThan(0);
+            if (!holes) {
+              expect(gathered).toBe(0);
+              reach.reach("contiguous byte split");
+            }
+            if (holes && gathered > 0) reach.reach("gapped gather");
+            if (codes > 0) reach.reach("dictionary codes");
+            if (source.some((r) => (r.t?.length ?? 0) > 512)) reach.reach("out-of-line text");
+          },
+        ),
+        { seed, numRuns: 24 },
+      );
+      reach.assertReached();
+    },
+  );
+
   it.each(SEEDS)(
     "generated tables and filters (seed %i)",
     async (seed) => {

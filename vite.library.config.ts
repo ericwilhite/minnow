@@ -40,6 +40,26 @@ const exportBaseline =
 export default defineConfig({
   plugins: [
     isolatedPages,
+    ...(process.env.MINNOW_EXPORT_SCAN_RANGE_COMPARE === "1"
+      ? [
+          {
+            name: "export-scan-range-comparison",
+            enforce: "pre" as const,
+            transform(source: string, id: string) {
+              if (!id.endsWith("/next/exec/table-scan.ts")) return;
+              const anchor = "function specForRows(";
+              if (!source.includes(anchor)) throw new Error("Scan range anchor moved");
+              return (
+                source.replace(anchor, "function fastSpecForRows(") +
+                `
+const specForRows = new URL(globalThis.location.href).searchParams.get("scanRange") === "baseline"
+ ? (rows: Uint16Array, count: number): DecodeSpec => ({rows,count}) : fastSpecForRows;
+`
+              );
+            },
+          },
+        ]
+      : []),
     ...(process.env.MINNOW_EXPORT_FRAME_COPY_COMPARE === "1"
       ? [
           {
