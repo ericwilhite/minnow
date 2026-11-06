@@ -196,8 +196,9 @@ is access's `Snapshot`.
   ownership; the spill store's record index is charged to the spill service's registration.
   Every acquisition opens its own connection, and every transaction of it runs through one
   serialized chain. Releasing the lease lets in-flight transactions finish (up to 500 ms), aborts
-  any left and waits for their abort events, closes the connection, then releases the lock, and
-  reports how many drained and how many it aborted: WebKit can block IndexedDB for the browser
+  any left and waits for their abort events (up to 1 s more: past it, the release still closes and
+  unlocks but rejects with `ReleaseUnsettledError`, the outcome unknown), closes the connection,
+  then releases the lock, and reports how many drained and how many it aborted: WebKit can block IndexedDB for the browser
   session when a worker dies with two chains of transactions in flight on its connection
   (DECISIONS.md "Step-down").
   `sim-idb.ts` simulates IndexedDB as a

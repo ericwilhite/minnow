@@ -128,7 +128,14 @@ These rulings follow the storage probe of 2026-11-05.
     their abort events (an aborted strict commit fails: not durable), closes the connection, and
     only then releases the lock, so the next owner never starts beside a live transaction; it
     reports how many transactions drained and how many it aborted. Every acquisition opens its own
-    connection, so releasing a stolen lease never closes its successor's (review B1-p2h-1). Measured graceful step-down under the concurrent kill workload, 40 cycles each: waiting
+    connection, so releasing a stolen lease never closes its successor's (review B1-p2h-1); a
+    connection object handed to several acquisitions still has one chain (review B1-p2h-2). If an
+    aborted transaction never reports its end within 1 s more, the release closes, releases the
+    lock anyway and rejects with `ReleaseUnsettledError` (counts and the transactions' scopes); those
+    transactions' operations reject with it too, so a strict commit among them is unknown, never
+    acknowledged. Holding the lock forever would give no successor a chance; releasing it cannot
+    promise the database progresses. The owner host decides what follows (B5: log, terminate,
+    suggest a reload). Measured graceful step-down under the concurrent kill workload, 40 cycles each: waiting
     for in-flight operations median 88–153 ms, p95 200–481 ms; session close ≤ 33 ms; release
     ≤ 7 ms; the next owner recovered every time in WebKit, Chromium and Firefox. OPFS is the
     default wherever a worker has sync access handles; this matters on IndexedDB, WebKit's

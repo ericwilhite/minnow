@@ -53,6 +53,7 @@
 import {
   LOG_HEADER_SLOT_BYTES,
   OwnershipLostError,
+  ReleaseUnsettledError,
   StoreClosedError,
   StoreCorruptionError,
   type AcquireOptions,
@@ -73,7 +74,8 @@ import { chooseRoot, encodeRootSlot } from "./root-slot.js";
 export interface IndexedDbBackendOptions {
   /**
    * Opens a connection to the database: called once per acquisition, which closes it at release
-   * (an object returned more than once is closed when its last acquisition releases).
+   * (an object returned more than once, to several acquisitions or backends, keeps one serialized
+   * chain and is closed when its last acquisition releases).
    */
   readonly database: () => Promise<IdbDatabaseLike> | IdbDatabaseLike;
   /** The database name; the lock is `minnow:<name>`. */
@@ -94,6 +96,11 @@ export interface IndexedDbBackendOptions {
    * `IDB_CLOSE_DRAIN_MS` (500 ms).
    */
   readonly releaseDrainMs?: number;
+  /**
+   * How long a release then waits for the transactions it aborted to end before giving up with
+   * `ReleaseUnsettledError`. Default `IDB_ABORT_SETTLE_MS` (1 s).
+   */
+  readonly releaseSettleMs?: number;
   /**
    * Charged with the resident record indexes of the data and log spaces (idb-bytes.ts, "Cost"),
    * growing and shrinking with them, released at close: the owner registers it with the memory
@@ -156,13 +163,52 @@ async function transact(
 /** How long a lease release waits for in-flight transactions before aborting them. */
 export const IDB_CLOSE_DRAIN_MS = 500;
 
+/**
+ * How long a release waits, after aborting, for those transactions to end before giving up with
+ * `ReleaseUnsettledError` (review B1-p2h-2 finding 2: a missing terminal event held the lock).
+ */
+export const IDB_ABORT_SETTLE_MS = 1_000;
+
 const settle = () => undefined;
 
+/** Resolves true when `work` settles within `ms`, false when the bound runs out first. */
+async function within(work: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const settled = await Promise.race([
+    work.then(() => true),
+    new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => {
+        resolve(false);
+      }, ms);
+    }),
+  ]);
+  clearTimeout(timer);
+  return settled;
+}
+
 /**
- * How many trackers use each inner connection: an `options.database` that hands every acquisition
- * the same object (tests do) has it closed only when its last tracker closes.
+ * What every tracker over one inner connection object shares: how many use it (it closes when the
+ * last one closes) and, when serialized, the connection's one chain. An `options.database` that
+ * hands several acquisitions, or several backends, the same object (tests do) still gets one chain
+ * on it (review B1-p2h-2 finding 1: a tracker's own chain let a stealing acquisition's fence start
+ * beside its predecessor's transaction, two chains on one connection).
  */
-const trackers = new WeakMap<IdbDatabaseLike, number>();
+interface SharedConnection {
+  users: number;
+  tail: Promise<void>;
+}
+const shared = new WeakMap<IdbDatabaseLike, SharedConnection>();
+
+/** A transaction issued through a tracker. */
+interface Issued {
+  readonly stores: readonly string[];
+  readonly mode: "readonly" | "readwrite";
+  readonly durability: "strict" | "relaxed";
+  /** The platform transaction, once created (its body ran). */
+  tx: IdbTransactionLike | null;
+  /** Ends the caller's promise when the release gives up on the transaction. */
+  giveUp: (error: Error) => void;
+}
 
 /**
  * One acquisition's connection (review B1-p2h-1 finding 2: a stolen lease's release closed the
@@ -176,23 +222,34 @@ const trackers = new WeakMap<IdbDatabaseLike, number>();
  * waits for them, aborts any still running when the wait runs out and waits for their abort
  * events, then closes: the lock is released only after (review B1-p2h-1 finding 1). The owner
  * awaits `lease.release()` before it terminates its worker.
+ *
+ * Admission, cancellation and accounting are per tracker (releasing one acquisition never cancels
+ * another's work); the chain is per inner connection object (`SharedConnection`).
  */
 class TrackedConnection implements IdbDatabaseLike {
   readonly #inner: IdbDatabaseLike;
-  /** Issued and not settled; `tx` once the platform transaction exists (its body ran). */
-  readonly #inFlight = new Map<Promise<void>, { tx: IdbTransactionLike | null }>();
+  readonly #shared: SharedConnection;
+  readonly #serialize: boolean;
+  /** Issued and not settled. */
+  readonly #inFlight = new Map<Promise<void>, Issued>();
   #closing = false;
   #innerClosed = false;
   #released: Promise<ReleaseReport> | null = null;
   /** Set when a release stopped waiting: transactions still running abort with it. */
   #stopped: StoreClosedError | null = null;
-  /** With `serialize`: the last transaction issued; the next is created once it settles. */
-  #tail: Promise<void> | null;
+  /** Transactions that ended with `#stopped` (aborted, or refused before they began). */
+  #aborted = 0;
 
   constructor(inner: IdbDatabaseLike, serialize: boolean) {
     this.#inner = inner;
-    this.#tail = serialize ? Promise.resolve() : null;
-    trackers.set(inner, (trackers.get(inner) ?? 0) + 1);
+    this.#serialize = serialize;
+    let entry = shared.get(inner);
+    if (entry === undefined) {
+      entry = { users: 0, tail: Promise.resolve() };
+      shared.set(inner, entry);
+    }
+    entry.users += 1;
+    this.#shared = entry;
   }
 
   transaction(
@@ -202,29 +259,33 @@ class TrackedConnection implements IdbDatabaseLike {
     body: (tx: IdbTransactionLike) => void,
   ): Promise<void> {
     if (this.#closing) return Promise.reject(new StoreClosedError("The connection is closing"));
-    const entry: { tx: IdbTransactionLike | null } = { tx: null };
+    const issued: Issued = { stores, mode, durability, tx: null, giveUp: settle };
     const start = (): Promise<void> => {
       // Queued behind the chain when the release stopped waiting: never created.
       if (this.#stopped !== null) return Promise.reject(this.#stopped);
       return this.#inner.transaction(stores, mode, durability, (tx) => {
-        entry.tx = tx;
+        issued.tx = tx;
         if (this.#stopped !== null) tx.abort(this.#stopped);
         else body(tx);
       });
     };
-    let run: Promise<void>;
-    if (this.#tail === null) run = start();
-    else {
-      // One chain per connection: data, log, spill and fence transactions alike wait for the
-      // previous one to settle before they are created.
-      run = this.#tail.then(start);
-      this.#tail = run.then(settle, settle);
-    }
-    this.#inFlight.set(run, entry);
-    const forget = () => {
-      this.#inFlight.delete(run);
-    };
-    run.then(forget, forget);
+    const run = new Promise<void>((resolve, reject) => {
+      issued.giveUp = reject;
+      // One chain per connection: data, log, spill and fence transactions alike, of every
+      // acquisition using this connection object, wait for the previous one to settle.
+      (this.#serialize ? this.#shared.tail.then(start) : start()).then(resolve, reject);
+    });
+    if (this.#serialize) this.#shared.tail = run.then(settle, settle);
+    this.#inFlight.set(run, issued);
+    run.then(
+      () => {
+        this.#inFlight.delete(run);
+      },
+      (error: unknown) => {
+        this.#inFlight.delete(run);
+        if (error !== null && error === this.#stopped) this.#aborted += 1;
+      },
+    );
     return run;
   }
 
@@ -235,49 +296,58 @@ class TrackedConnection implements IdbDatabaseLike {
   }
 
   /**
-   * Starts no new transaction and waits up to `boundMs` for those issued. If some are left, aborts
-   * them (with `StoreClosedError`; queued ones are refused before they begin) and waits for each
-   * to settle. Then closes. Idempotent: every call gets the first call's report.
+   * Starts no new transaction and waits up to `drainMs` for those issued. If some are left, aborts
+   * them (with `StoreClosedError`; queued ones are refused before they begin) and waits up to
+   * `settleMs` for each to end. Then closes. If some never ended, their operations and this call
+   * reject with `ReleaseUnsettledError` (the close is still requested). Idempotent: every call
+   * gets the first call's outcome.
    */
-  drainAndClose(boundMs: number): Promise<ReleaseReport> {
-    return (this.#released ??= this.#drainAndClose(boundMs));
+  drainAndClose(drainMs: number, settleMs: number): Promise<ReleaseReport> {
+    return (this.#released ??= this.#drainAndClose(drainMs, settleMs));
   }
 
-  async #drainAndClose(boundMs: number): Promise<ReleaseReport> {
+  async #drainAndClose(drainMs: number, settleMs: number): Promise<ReleaseReport> {
+    const started = Date.now();
     this.#closing = true;
     const runs = [...this.#inFlight.keys()];
     const settled = Promise.allSettled(runs);
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const drained = await Promise.race([
-      settled.then(() => true),
-      new Promise<boolean>((resolve) => {
-        timer = setTimeout(() => {
-          resolve(false);
-        }, boundMs);
-      }),
-    ]);
-    clearTimeout(timer);
-    let aborted = 0;
-    if (!drained) {
-      const reason = new StoreClosedError("The lease was released before the transaction finished");
-      this.#stopped = reason;
-      for (const { tx } of this.#inFlight.values()) tx?.abort(reason);
+    if (!(await within(settled, drainMs))) {
+      this.#stopped = new StoreClosedError(
+        "The lease was released before the transaction finished",
+      );
+      for (const { tx } of this.#inFlight.values()) tx?.abort(this.#stopped);
       // The platform fires a terminal event (complete or abort) for every transaction it created;
       // one that was already committing completes and counts as drained.
-      const outcomes = await settled;
-      aborted = outcomes.filter((o) => o.status === "rejected" && o.reason === reason).length;
+      if (!(await within(settled, settleMs))) {
+        const left = [...this.#inFlight.values()];
+        const error = new ReleaseUnsettledError({
+          drained: runs.length - this.#aborted - left.length,
+          aborted: this.#aborted,
+          unsettled: left.length,
+          transactions: left.map(({ stores, mode, durability, tx }) => ({
+            stores,
+            mode,
+            durability,
+            created: tx !== null,
+          })),
+          waitedMs: Date.now() - started,
+        });
+        // Outcome unknown: never acknowledged, never reported as aborted.
+        for (const issued of left) issued.giveUp(error);
+        this.#closeInner();
+        throw error;
+      }
     }
     this.#closeInner();
-    return { drained: runs.length - aborted, aborted };
+    return { drained: runs.length - this.#aborted, aborted: this.#aborted };
   }
 
   #closeInner(): void {
     if (this.#innerClosed) return;
     this.#innerClosed = true;
-    const users = (trackers.get(this.#inner) ?? 1) - 1;
-    if (users > 0) trackers.set(this.#inner, users);
-    else {
-      trackers.delete(this.#inner);
+    this.#shared.users -= 1;
+    if (this.#shared.users === 0) {
+      shared.delete(this.#inner);
       this.#inner.close();
     }
   }
@@ -374,6 +444,8 @@ class IdbLease implements OwnerLease {
    * Fences this lease, settles its connection's transactions (they finish within
    * `releaseDrainMs`, or are aborted), closes the connection, then releases the lock (see
    * `TrackedConnection`). An aborted strict commit rejects with `StoreClosedError`: not durable.
+   * If aborted transactions never end (`releaseSettleMs`), the lock is still released and this
+   * rejects with `ReleaseUnsettledError`.
    */
   async release(): Promise<ReleaseReport> {
     this.lose();
@@ -955,6 +1027,7 @@ export function createIndexedDbBackend(options: IndexedDbBackendOptions): Storag
   const leases = new WeakSet<IdbLease>();
   const serialize = options.serializeTransactions ?? true;
   const drainMs = options.releaseDrainMs ?? IDB_CLOSE_DRAIN_MS;
+  const settleMs = options.releaseSettleMs ?? IDB_ABORT_SETTLE_MS;
   const own = (lease: OwnerLease): IdbLease => {
     if (!(lease instanceof IdbLease) || !leases.has(lease))
       throw new TypeError("The lease was not acquired from this backend");
@@ -1006,7 +1079,7 @@ export function createIndexedDbBackend(options: IndexedDbBackendOptions): Storag
       );
       const connection = fence.db;
       const lease = new IdbLease(lock, connection, fence.epoch, () =>
-        connection.drainAndClose(drainMs),
+        connection.drainAndClose(drainMs, settleMs),
       );
       leases.add(lease);
       return lease;

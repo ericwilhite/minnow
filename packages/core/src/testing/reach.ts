@@ -180,3 +180,14 @@ export const STORAGE_CONCURRENT_CRASH_REACH = [
   "write-with-write",
   "spill-with-another",
 ] as const;
+
+/**
+ * Acquisitions sharing one IndexedDB connection object (storage/idb-chain.test.ts): steals and
+ * releases must land while another acquisition has a transaction in flight on it, from both
+ * backends over the object.
+ */
+export const STORAGE_SHARED_CONNECTION_REACH = [
+  "steal-while-another-in-flight",
+  "release-while-another-in-flight",
+  "both-backends-owned",
+] as const;

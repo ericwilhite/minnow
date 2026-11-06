@@ -11,11 +11,18 @@
  *
  * The reviewer's probes run over fake-indexeddb (real transactions, abort events and close); the
  * concurrent (unserialized) case over a double whose transactions never finish by themselves.
+ *
+ * Review B1-p2h-2 finding 2: an aborted transaction that never reports its end must not hold the
+ * lock forever. After a second bound the release closes, releases the lock and rejects with
+ * `ReleaseUnsettledError`; the transaction's operation rejects with it too (outcome unknown, never
+ * acknowledged). A terminal event arriving later changes nothing, a repeated release rejects the
+ * same way, and a successor owns the database afterwards, on the same connection object too.
  */
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import { describe, expect, it } from "vitest";
 import {
   OwnershipLostError,
+  ReleaseUnsettledError,
   StoreClosedError,
   type OwnerLease,
   type ScratchSpace,
@@ -299,5 +306,193 @@ describe("every acquisition has its own connection (finding 2)", () => {
     const session = await backend.open(nextLease);
     await Promise.all([session.close(), nextLease.release()]);
     await expect(backend.open(nextLease)).rejects.toBeInstanceOf(OwnershipLostError);
+  });
+});
+
+/** What `promise` settled to within `ms`: its value, its error, or "pending". */
+async function outcomeWithin(promise: Promise<unknown>, ms: number): Promise<unknown> {
+  return Promise.race([
+    promise.then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    ),
+    tick(ms).then(() => "pending"),
+  ]);
+}
+
+const inert: IdbStoreLike = {
+  get: () => undefined,
+  getAll: () => undefined,
+  getAllKeys: () => undefined,
+  last: () => undefined,
+  put: () => undefined,
+  delete: () => undefined,
+  deleteRange: () => undefined,
+  clear: () => undefined,
+};
+
+/**
+ * One connection object over the simulated IndexedDB whose next transactions follow `plans`:
+ * "withhold" accepts abort but never reports an end until the test calls its finisher; "honour"
+ * ends with the abort reason when aborted. Neither answers requests. Others run normally.
+ */
+function faultyConnection() {
+  const inner = simIndexedDb(new SimDisk());
+  const state = {
+    plans: [] as Array<"withhold" | "honour">,
+    aborts: 0,
+    closes: 0,
+    finishers: [] as Array<() => void>,
+  };
+  const database: IdbDatabaseLike = {
+    transaction(stores, mode, durability, body) {
+      const plan = state.plans.shift();
+      if (plan === undefined) return inner.transaction(stores, mode, durability, body);
+      return new Promise<void>((resolve, reject) => {
+        state.finishers.push(resolve);
+        body({
+          store: () => inert,
+          abort: (reason) => {
+            state.aborts += 1;
+            if (plan === "honour") reject(reason);
+          },
+        });
+      });
+    },
+    close: () => {
+      state.closes += 1;
+    },
+  };
+  return { state, database };
+}
+
+describe("a release gives up on aborted transactions that never end (review B1-p2h-2 finding 2)", () => {
+  it("rejects with ReleaseUnsettledError after releasing the lock; late events change nothing", async () => {
+    const { state, database } = faultyConnection();
+    const locks = new SimLocks();
+    const backend = createIndexedDbBackend({
+      database: () => database,
+      locks,
+      name: "unsettled",
+      releaseDrainMs: 5,
+      releaseSettleMs: 30,
+    });
+    const lease = await backend.acquire();
+    const session = await backend.open(lease);
+    state.plans.push("withhold");
+    const publishing = session.publish(new Uint8Array([1]));
+    await tick();
+    // The next owner is already waiting for the lock.
+    const granted = locks.request("minnow:unsettled", {});
+    const released = lease.release();
+
+    const release = await outcomeWithin(released, 2_000);
+    expect(release).not.toBe("pending");
+    const error = (release as { error?: unknown }).error;
+    expect(error).toBeInstanceOf(ReleaseUnsettledError);
+    const unsettled = error as ReleaseUnsettledError;
+    expect({
+      drained: unsettled.drained,
+      aborted: unsettled.aborted,
+      unsettled: unsettled.unsettled,
+    }).toEqual({ drained: 0, aborted: 0, unsettled: 1 });
+    expect(unsettled.transactions).toEqual([
+      expect.objectContaining({ mode: "readwrite", durability: "strict", created: true }),
+    ]);
+    expect(unsettled.waitedMs).toBeGreaterThanOrEqual(30);
+    // The strict commit is reported unknown, with the same error: never acknowledged.
+    expect(await outcomeWithin(publishing, 100)).toEqual({ error: unsettled });
+    expect(state.aborts).toBe(1);
+    expect(state.closes).toBe(1);
+    const next = await outcomeWithin(granted, 1_000);
+    expect(next).not.toBe("pending");
+    // Repeated releases reject the same way.
+    await expect(lease.release()).rejects.toBe(unsettled);
+
+    // A successor owns the database on the same connection object while the old transaction is
+    // still unsettled: its chain is not held by it.
+    (next as { value: { release(): void } }).value.release();
+    const successor = await backend.acquire();
+    const own = await backend.open(successor);
+    await own.publish(new Uint8Array([2]));
+    expect(await own.readRoot()).toEqual(new Uint8Array([2]));
+    // The late terminal event: nothing changes, nothing throws.
+    for (const finish of state.finishers) finish();
+    await tick(5);
+    expect(await outcomeWithin(publishing, 100)).toEqual({ error: unsettled });
+    expect(await own.readRoot()).toEqual(new Uint8Array([2]));
+    // The old session refuses (it is fenced and holds the unknown outcome as its failure).
+    await expect(session.publish(new Uint8Array([3]))).rejects.toThrow();
+    expect(await successor.release()).toEqual({ drained: 0, aborted: 0 });
+  });
+
+  it("counts aborted and unsettled transactions apart (unserialized)", async () => {
+    const { state, database } = faultyConnection();
+    const backend = createIndexedDbBackend({
+      database: () => database,
+      locks: new SimLocks(),
+      name: "mixed",
+      serializeTransactions: false,
+      releaseDrainMs: 5,
+      releaseSettleMs: 30,
+    });
+    const lease = await backend.acquire();
+    const session = await backend.open(lease);
+    state.plans.push("honour", "withhold");
+    const outcomes = [
+      session.publish(new Uint8Array([1])),
+      scratchOf(backend, lease).write(0, new Uint8Array(8)),
+    ].map((run) =>
+      run.then(
+        () => "settled",
+        (error: unknown) => error,
+      ),
+    );
+    await tick();
+    const release = await outcomeWithin(lease.release(), 2_000);
+    expect(release).not.toBe("pending");
+    const error = (release as { error?: unknown }).error;
+    expect(error).toBeInstanceOf(ReleaseUnsettledError);
+    const unsettled = error as ReleaseUnsettledError;
+    expect([unsettled.drained, unsettled.aborted, unsettled.unsettled]).toEqual([0, 1, 1]);
+    // Each is mapped to its value or error; a "pending" one fails both checks.
+    const [first, second] = await Promise.all(
+      outcomes.map(async (run) => {
+        const outcome = await outcomeWithin(run, 1_000);
+        return outcome === "pending" ? outcome : (outcome as { value: unknown }).value;
+      }),
+    );
+    expect(first).toBeInstanceOf(StoreClosedError);
+    expect(second).toBe(unsettled);
+  });
+
+  it("a successor that stole while the transaction hung starts once the old lease gives up", async () => {
+    const { state, database } = faultyConnection();
+    const backend = createIndexedDbBackend({
+      database: () => database,
+      locks: new SimLocks(),
+      name: "steal-hung",
+      releaseDrainMs: 5,
+      releaseSettleMs: 30,
+    });
+    const lease = await backend.acquire();
+    const session = await backend.open(lease);
+    state.plans.push("withhold");
+    const publishing = session.publish(new Uint8Array([1])).catch((error: unknown) => error);
+    await tick();
+    // The steal's fence queues behind the hung transaction on the shared connection object.
+    const stealing = backend.acquire({ steal: true, timeoutMs: 3_000 });
+    await tick(10);
+    const released = await outcomeWithin(lease.release(), 1_000);
+    expect((released as { error?: unknown }).error).toBeInstanceOf(ReleaseUnsettledError);
+    const stolen = await outcomeWithin(stealing, 1_000);
+    expect(stolen).not.toBe("pending");
+    const successor = (stolen as { value: OwnerLease }).value;
+    const own = await backend.open(successor);
+    await own.publish(new Uint8Array([2]));
+    expect(await own.readRoot()).toEqual(new Uint8Array([2]));
+    expect(await publishing).toBeInstanceOf(ReleaseUnsettledError);
+    for (const finish of state.finishers) finish();
+    await successor.release();
   });
 });
