@@ -22,7 +22,15 @@
 import type { ByteCharge } from "../vector/varlen.js";
 import type { Vector } from "../vector/vector.js";
 import { KeyBatch } from "../keys/key-encoding.js";
-import { KeyScratch, bytesEqual, extractKeys, levelHash, type KeyLayout } from "./join-keys.js";
+import {
+  KEY_STEP_BYTES,
+  KeyScratch,
+  bytesEqual,
+  extractKeys,
+  keyStepRows,
+  levelHash,
+  type KeyLayout,
+} from "./join-keys.js";
 import type { ColumnStore } from "./column-store.js";
 import { Slice, runToEnd, type SlicedJob } from "./slices.js";
 
@@ -31,9 +39,11 @@ const DIRECT_LIMIT = 1 << 26;
 /** Tables larger than this get the touch pass (overlaps cache misses across a batch). */
 const TOUCH_BYTES = 1 << 20;
 
+/** One store chunk's encoded keys, appended in key-byte steps (charged as it grows). */
 interface EncodedChunk {
-  readonly bytes: Uint8Array;
+  bytes: Uint8Array;
   readonly offsets: Int32Array;
+  used: number;
 }
 
 export class JoinTable {
@@ -87,6 +97,11 @@ export class JoinTable {
     if (!this.#charge.allocate(bytes)) return false;
     this.retainedBytes += bytes;
     return true;
+  }
+
+  #release(bytes: number): void {
+    this.#charge.free(bytes);
+    this.retainedBytes -= bytes;
   }
 
   /** Bytes a table over `rows` needs at most (words / bytes shapes), for planning a grant. */
@@ -251,26 +266,57 @@ export class JoinTable {
       }
       if (store.chunkCount === 0) return true;
     }
+    // Steps of at most KEY_STEP_BYTES of key work: each row's key is hashed (or encoded) once,
+    // and an insert may compare it once with an equal key, so a step is half the budget in key
+    // bytes (review B7-p2c-1 #3).
     for (let k = 0; k < store.chunkCount; k++) {
       const count = store.chunk(0, k).length;
       const keys = chunkKeys(store, this.#keyColumns, k);
-      const done = extractKeys(keys, null, 0, count, scratch, this.kind !== "direct");
-      if (done < count) return false;
-      if (this.#layout.family === "enc" && !this.#keepEncoded(scratch.encoded, count)) return false;
-      if (!this.#insertChunk(scratch, k * store.chunkRows, count)) return false;
-      if (slice.due()) yield;
+      for (let from = 0; from < count;) {
+        const m = keyStepRows(keys, null, from, count - from, KEY_STEP_BYTES / 2);
+        const done = extractKeys(keys, null, from, m, scratch, this.kind !== "direct");
+        if (done < m) return false;
+        if (this.#layout.family === "enc" && !this.#keepEncoded(scratch.encoded, k, from, m, count))
+          return false;
+        if (!this.#insertChunk(scratch, k * store.chunkRows + from, m)) return false;
+        from += m;
+        if (slice.due()) yield;
+      }
     }
     return true;
   }
 
-  #keepEncoded(encoded: KeyBatch | null, count: number): boolean {
+  /** Appends the encoded keys of chunk k's rows `from … from + m` (of `count`), charged. */
+  #keepEncoded(
+    encoded: KeyBatch | null,
+    k: number,
+    from: number,
+    m: number,
+    count: number,
+  ): boolean {
     if (encoded === null) return false;
-    const end = encoded.offsets[count] ?? 0;
-    if (!this.#allocate(end + (count + 1) * 4)) return false;
-    this.#encoded.push({
-      bytes: encoded.writer.bytes.slice(0, end),
-      offsets: encoded.offsets.slice(0, count + 1),
-    });
+    const end = encoded.offsets[m] ?? 0;
+    let entry = this.#encoded[k];
+    if (entry === undefined) {
+      const initial = Math.max(end, 4096);
+      if (!this.#allocate(initial + (count + 1) * 4)) return false;
+      entry = { bytes: new Uint8Array(initial), offsets: new Int32Array(count + 1), used: 0 };
+      this.#encoded[k] = entry;
+    }
+    if (entry.used + end > entry.bytes.length) {
+      let size = entry.bytes.length * 2;
+      while (size < entry.used + end) size *= 2;
+      if (!this.#allocate(size)) return false;
+      const grown = new Uint8Array(size);
+      grown.set(entry.bytes.subarray(0, entry.used));
+      this.#release(entry.bytes.length);
+      entry.bytes = grown;
+    }
+    entry.bytes.set(encoded.writer.bytes.subarray(0, end), entry.used);
+    for (let i = 0; i < m; i++)
+      entry.offsets[from + i + 1] = entry.used + (encoded.offsets[i + 1] ?? 0);
+    entry.offsets[from] = entry.used + (encoded.offsets[0] ?? 0);
+    entry.used += end;
     return true;
   }
 
@@ -578,8 +624,16 @@ export class JoinTable {
     const raw = this.#layout.family === "raw";
     const probeRaw = scratch.rawData;
     const encoded = scratch.encoded;
+    // Dictionary probe keys: one lookup per distinct entry, then its head for every row.
+    const seen = raw && scratch.rawShared ? new Map<number, number>() : null;
     for (let k = 0; k < count; k++) {
       let head = 0;
+      const known = seen === null ? undefined : seen.get(scratch.slots[k] ?? -1);
+      if (known !== undefined) {
+        heads[k] = known;
+        if (known !== 0) matched++;
+        continue;
+      }
       if (((nulls[k] ?? 0) & strict) === 0) {
         const hash = hashes[k] ?? 0;
         let probeBytes: Uint8Array;
@@ -612,6 +666,7 @@ export class JoinTable {
       }
       heads[k] = head;
       if (head !== 0) matched++;
+      seen?.set(scratch.slots[k] ?? -1, head);
     }
     return matched;
   }

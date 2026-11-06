@@ -12,7 +12,7 @@ import type { Batch } from "../vector/vector.js";
 import { ColumnStore } from "./column-store.js";
 import { INT, TEXT, batchesOf, type Row } from "./join-fixtures.js";
 import { JoinRuntimeFilter } from "./join-filter.js";
-import { KeyLayout, KeyScratch } from "./join-keys.js";
+import { KeyLayout, KeyScratch, extractKeys } from "./join-keys.js";
 import { JoinTable } from "./join-table.js";
 import { HashJoin, hashJoinMinimumBytes, type HashJoinKind, type HashJoinSpec } from "./join.js";
 import type { Operator, PushResult } from "./pipeline.js";
@@ -319,4 +319,105 @@ describe("R23.2: the join's sliced jobs yield per store chunk", () => {
     expect(value).not.toBeNull();
     expect(yields).toBeGreaterThanOrEqual(20);
   });
+});
+
+describe("review B7-p2c-1 #3: join work is bounded by key bytes", () => {
+  // Two alternating 65,537-byte keys: each 2,048-row chunk holds ~128 MiB of key bytes.
+  const wide = (i: number) => "x".repeat(65_536) + String(i % 2);
+  const rows: Row[] = Array.from({ length: 2048 }, (_, i): Row => [wide(i), i]);
+  const types = [TEXT, INT];
+
+  for (const [name, keyColumns] of [
+    ["raw keys", [0]],
+    ["encoded keys", [0, 1]],
+  ] as const)
+    it(`the table build's first segment is short (${name}; reviewer: 5,642 ms)`, () => {
+      const store = new ColumnStore(types, FREE);
+      for (const batch of batchesOf(types, rows, { batchRows: 8 }))
+        expect(store.append(batch.columns, null, 0, batch.length)).toBe(batch.length);
+      const layout = new KeyLayout(
+        keyColumns.map((c) => types[c] ?? TEXT),
+        keyColumns.map(() => false),
+      );
+      const scratch = new KeyScratch(layout, 2048, FREE);
+      const job = JoinTable.buildJob(
+        store,
+        [...keyColumns],
+        layout,
+        0,
+        FREE,
+        scratch,
+        new Slice(4),
+      );
+      const start = performance.now();
+      let step = job.next();
+      const first = performance.now() - start;
+      let segments = 1;
+      while (step.done !== true) {
+        step = job.next();
+        segments++;
+      }
+      expect(first).toBeLessThan(100);
+      expect(segments).toBeGreaterThan(100);
+      expect(step.value?.inserted).toBe(2048);
+      step.value?.close();
+      store.close();
+    }, 120_000);
+
+  it("a dictionary probe batch hashes and looks up each entry once (reviewer: 3,879 ms)", () => {
+    const store = new ColumnStore(types, FREE);
+    for (const batch of batchesOf(types, rows.slice(0, 2), { batchRows: 2 }))
+      store.append(batch.columns, null, 0, batch.length);
+    const layout = new KeyLayout([TEXT], [false]);
+    const scratch = new KeyScratch(layout, 2048, FREE);
+    const table = JoinTable.build(store, [0], layout, 0, FREE, scratch);
+    const [batch] = [...batchesOf(types, rows, { dictionary: true })];
+    if (batch === undefined || table === null) throw new Error("setup");
+    const start = performance.now();
+    extractKeys(batch.columns.slice(0, 1), null, 0, 2048, scratch, true);
+    const heads = new Int32Array(2048);
+    expect(table.lookup(scratch, 2048, heads)).toBe(2048);
+    expect(performance.now() - start).toBeLessThan(100);
+    table.close();
+    store.close();
+  });
+
+  it("a flat probe batch past one step of key bytes goes through in parts, yielding", async () => {
+    const s = spec("inner", types);
+    const { join } = await setup(s);
+    await pushAll(join.build, types, rows.slice(0, 2));
+    await join.build.finish();
+    const sink = new CountSink();
+    const probe = join.probe(sink);
+    // 64 flat rows of 64 KiB keys: 4 MiB of key bytes in one batch.
+    const [batch] = [...batchesOf(types, rows.slice(0, 64), { batchRows: 64 })];
+    if (batch === undefined) throw new Error("no batch");
+    const serviced = await servicedDuring(async () => {
+      const start = performance.now();
+      const result = probe.push(batch);
+      expect(performance.now() - start).toBeLessThan(100);
+      expect(result).toBe("blocked");
+      await probe.ready();
+    });
+    expect(serviced).toBe(true);
+    await probe.finish();
+    expect(sink.rows).toBe(64);
+    // Each part pushes its own output: one batch of 4 MiB of keys becomes many steps.
+    expect(sink.pushes).toBeGreaterThan(16);
+  }, 60_000);
+
+  it("a build batch past one step of key bytes is added in parts, yielding", async () => {
+    const s = spec("inner", types);
+    const { join } = await setup(s);
+    const [batch] = [...batchesOf(types, rows.slice(0, 64), { batchRows: 64 })];
+    if (batch === undefined) throw new Error("no batch");
+    expect(join.build.push(batch)).toBe("blocked");
+    await join.build.ready();
+    await join.build.finish();
+    const sink = new CountSink();
+    const probe = join.probe(sink);
+    await pushAll(probe, types, rows.slice(0, 2));
+    await probe.finish();
+    expect(sink.rows).toBe(64);
+  }, 60_000);
 });

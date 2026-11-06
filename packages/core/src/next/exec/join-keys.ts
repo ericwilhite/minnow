@@ -179,6 +179,11 @@ export class KeyScratch {
   /** `raw`: the source slot of each row in `rawData` (−1 null). */
   readonly slots: Int32Array;
   rawData: { readonly bytes: Uint8Array; readonly offsets: Int32Array } | null = null;
+  /**
+   * `raw`: the slots index a dictionary (or a constant), so rows repeat slots: a lookup does one
+   * comparison per distinct slot (review B7-p2c-1 #3c).
+   */
+  rawShared = false;
   /** `enc`: the encoded keys of the rows. */
   readonly encoded: KeyBatch | null;
   /** Rows with a null in a key compared with `=` (they never match). */
@@ -386,14 +391,31 @@ export function extractKeys(
     const data = flat.data as { bytes: Uint8Array; offsets: Int32Array };
     out.rawData = data;
     const slots = out.slots;
+    // A dictionary (or constant) repeats slots: each distinct one is hashed once.
+    const shared = vector.form !== "flat";
+    out.rawShared = shared;
+    const seen = shared ? new Map<number, number>() : null;
     for (let k = 0; k < count; k++) {
       const row = ids === null ? from + k : (ids[from + k] ?? 0);
       const slot = sourceSlot(vector, row);
       slots[k] = slot;
-      hashes[k] =
-        slot < 0
-          ? 0
-          : xxHash32(data.bytes, HASH_SEED, data.offsets[slot] ?? 0, data.offsets[slot + 1] ?? 0);
+      if (slot < 0 || !hash) {
+        hashes[k] = 0;
+        continue;
+      }
+      const known = seen?.get(slot);
+      if (known !== undefined) {
+        hashes[k] = known;
+        continue;
+      }
+      const h = xxHash32(
+        data.bytes,
+        HASH_SEED,
+        data.offsets[slot] ?? 0,
+        data.offsets[slot + 1] ?? 0,
+      );
+      hashes[k] = h;
+      seen?.set(slot, h);
     }
     return count;
   }
@@ -419,6 +441,77 @@ export function extractKeys(
     );
   out.count = done;
   return done;
+}
+
+/** Key bytes one bounded step of key work scans (hashing, encoding, comparing): R23.2. */
+export const KEY_STEP_BYTES = 256 * 1024;
+
+function varlenOf(vector: Vector): { bytes: Uint8Array; offsets: Int32Array } | null {
+  const data = flatOf(vector).data;
+  return data.layout === "varlen" ? data : null;
+}
+
+/**
+ * How many of rows `from … from + count` (by `ids`) fit `budget` key bytes, at least one:
+ * `count` at once when no key is variable-length. `logical`: a dictionary row costs its entry's
+ * bytes (work per row, as encoding does); otherwise the dictionary counts once and a row its
+ * code (work per distinct entry, as raw keys do).
+ */
+export function keyStepRows(
+  keys: readonly Vector[],
+  ids: ArrayLike<number> | null,
+  from: number,
+  count: number,
+  budget = KEY_STEP_BYTES,
+  logical = true,
+): number {
+  const varlen = keys.filter((vector) => varlenOf(vector) !== null);
+  if (varlen.length === 0) return count;
+  let bytes = 8 * (keys.length - varlen.length) * count;
+  if (!logical)
+    for (const vector of varlen)
+      if (vector.form !== "flat") {
+        const data = varlenOf(vector);
+        const n = vector.form === "constant" ? 1 : vector.dictionary.length;
+        bytes += (data?.offsets[n] ?? 0) - (data?.offsets[0] ?? 0);
+      }
+  for (let k = 0; k < count; k++) {
+    const row = ids === null ? from + k : (ids[from + k] ?? 0);
+    for (const vector of varlen) {
+      if (!logical && vector.form !== "flat") {
+        bytes += 4;
+        continue;
+      }
+      const slot = sourceSlot(vector, row);
+      const data = varlenOf(vector);
+      if (slot >= 0 && data !== null)
+        bytes += (data.offsets[slot + 1] ?? 0) - (data.offsets[slot] ?? 0);
+    }
+    if (bytes > budget) return Math.max(1, k);
+  }
+  return count;
+}
+
+/** The null mask of each row (bit c: key column c is null), without hashing or encoding. */
+export function keyNulls(
+  keys: readonly Vector[],
+  ids: ArrayLike<number> | null,
+  from: number,
+  count: number,
+  nulls: Int32Array,
+): void {
+  nulls.fill(0, 0, count);
+  for (let c = 0; c < keys.length; c++) {
+    const vector = keys[c];
+    if (vector === undefined) continue;
+    const validity = vector.form === "constant" ? vector.value.validity : vector.validity;
+    if (validity === null) continue;
+    const bit = 1 << c;
+    for (let k = 0; k < count; k++) {
+      const row = ids === null ? from + k : (ids[from + k] ?? 0);
+      if (sourceSlot(vector, row) < 0) nulls[k] = (nulls[k] ?? 0) | bit;
+    }
+  }
 }
 
 /** A selection view over explicit row ids for the key encoder (identity rows get a scratch). */

@@ -104,7 +104,16 @@ import {
 } from "./pipeline.js";
 import { Slice, SLICE_ROWS, runSliced, runToEnd, type SlicedJob } from "./slices.js";
 import { JoinRuntimeFilter, kindPublishes } from "./join-filter.js";
-import { KeyLayout, KeyScratch, bytesEqual, extractKeys, levelHash } from "./join-keys.js";
+import {
+  KEY_STEP_BYTES,
+  KeyLayout,
+  KeyScratch,
+  bytesEqual,
+  extractKeys,
+  keyNulls,
+  keyStepRows,
+  levelHash,
+} from "./join-keys.js";
 import { PageWriter, SpillFiles, SpilledRun, type DecodedPage } from "./spill-pages.js";
 import { ColumnStore, nullConstant } from "./column-store.js";
 import { Charge, Pool, SpillIo } from "./spill-pool.js";
@@ -895,7 +904,8 @@ class Level {
     for (let k = 0; k < this.store.chunkCount; k++) {
       const keys = chunkKeys(this.store, shared.spec.buildKeys, k);
       const count = this.store.chunk(0, k).length;
-      if (extractKeys(keys, null, 0, count, shared.scratch) < count) return false;
+      // Only the null masks are needed here: no hashing or encoding of the keys.
+      keyNulls(keys, null, 0, count, shared.scratch.nulls);
       const base = k * this.store.chunkRows;
       for (let i = 0; i < count; i++)
         if (((shared.scratch.nulls[i] ?? 0) & tMask) !== 0) this.tNull[base + i] = 1;
@@ -1684,7 +1694,12 @@ export class HashJoin {
     shared.checkAborted();
     const count = batch.selection === null ? batch.length : batch.selection.count;
     shared.profile.buildRows += count;
-    const result = this.#level.addBuild(batch.columns, batch.selection?.rows ?? null, 0, count);
+    const ids = batch.selection?.rows ?? null;
+    let result: MaybePromise<void>;
+    const keys = this.spec.buildKeys.map((c) => columnOf(batch.columns, c));
+    const first = keyStepRows(keys, ids, 0, count, KEY_STEP_BYTES / 2);
+    if (first < count) result = this.#buildParts(batch.columns, ids, count, keys, first);
+    else result = this.#level.addBuild(batch.columns, ids, 0, count);
     if (!isPromise(result)) {
       transfer?.release();
       return "ready";
@@ -1697,6 +1712,31 @@ export class HashJoin {
       },
     );
     return "blocked";
+  }
+
+  /**
+   * A build batch with more key bytes than one step: added in parts of at most that (one row at
+   * least), a task yield and the abort check between them (R23.2, review B7-p2c-1 #3).
+   */
+  async #buildParts(
+    columns: readonly Vector[],
+    ids: Uint16Array | null,
+    count: number,
+    keys: readonly Vector[],
+    first: number,
+  ): Promise<void> {
+    const shared = this.#shared;
+    let at = 0;
+    let n = first;
+    for (;;) {
+      const added = this.#level.addBuild(columns, ids, at, n);
+      if (isPromise(added)) await added;
+      at += n;
+      if (at >= count) return;
+      await yieldTask();
+      shared.checkAborted();
+      n = keyStepRows(keys, ids, at, count - at, KEY_STEP_BYTES / 2);
+    }
   }
 
   /** @internal */
@@ -1768,6 +1808,20 @@ export class HashJoin {
     this.#shared.checkAborted();
     // Each probe push may run one slice before it yields (R23.2).
     this.#shared.slice.reset();
+    // More key bytes than one step: the batch goes through in parts (raw keys count a
+    // dictionary once, since they hash and look up each distinct entry once).
+    const selection = batch.selection;
+    const active = selection === null ? batch.length : selection.count;
+    const keys = this.spec.probeKeys.map((c) => columnOf(batch.columns, c));
+    const raw = this.#shared.layout.family === "raw";
+    const ids = selection?.rows ?? null;
+    const first = keyStepRows(keys, ids, 0, active, KEY_STEP_BYTES / 2, !raw);
+    if (first < active) {
+      this.#pending = this.#probeParts(batch, keys, active, first, raw).catch((error: unknown) =>
+        this.#fail(error),
+      );
+      return "blocked";
+    }
     this.#prober.start(batch, this.#level, null);
     let step: Step;
     try {
@@ -1778,6 +1832,36 @@ export class HashJoin {
     if (step === DONE) return "ready";
     this.#pending = this.#prober.continue(step).catch((error: unknown) => this.#fail(error));
     return "blocked";
+  }
+
+  /** A probe batch in parts of at most one step of key bytes (ascending sub-selections). */
+  async #probeParts(
+    batch: Batch,
+    keys: readonly Vector[],
+    active: number,
+    first: number,
+    raw: boolean,
+  ): Promise<void> {
+    const shared = this.#shared;
+    const ids = batch.selection?.rows ?? null;
+    let at = 0;
+    let n = first;
+    for (;;) {
+      const rows = new Uint16Array(n);
+      for (let k = 0; k < n; k++) rows[k] = ids === null ? at + k : (ids[at + k] ?? 0);
+      this.#prober.start(
+        { length: batch.length, columns: batch.columns, selection: { rows, count: n } },
+        this.#level,
+        null,
+      );
+      await this.#prober.continue(this.#prober.run());
+      at += n;
+      if (at >= active) return;
+      await yieldTask();
+      shared.checkAborted();
+      shared.slice.reset();
+      n = keyStepRows(keys, ids, at, active - at, KEY_STEP_BYTES / 2, !raw);
+    }
   }
 
   /** @internal */

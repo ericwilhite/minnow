@@ -152,7 +152,8 @@ describe("R23.1: two interleaved operators keep their own scratch", () => {
       expect(x.sink.rows.map((row) => row[0])).toEqual(x.expected);
       expect(x.governor.usedBytes).toBe(0);
     }
-  }, 60_000);
+    // 25-34 s on a loaded host (load ~25): 40,000 rows of 3 KB spill through an 8 MiB grant.
+  }, 180_000);
 });
 
 describe("R23.1: operator-owned scratch is charged", () => {
