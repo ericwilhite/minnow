@@ -34,6 +34,8 @@ export type EngineInput = OpenWritePathInput & {
     readonly beforeFlushPublish?: () => Promise<void>;
     /** Log bytes past which the log is recycled (default `LOG_RECYCLE_BYTES`). */
     readonly logRecycleBytes?: number;
+    /** The garbage floor of the idle publish (ruling R10; default `IDLE_GARBAGE_BYTES`). */
+    readonly idleGarbageBytes?: number;
   };
 };
 import { CatalogChangeError, type TableDef } from "../access/catalog.js";
@@ -92,7 +94,7 @@ import type { MaybePromise } from "../access/key-index.js";
 import { ByteWriter } from "./bytes.js";
 import { Catalog, decodeLogged, type LoggedChange } from "./catalog.js";
 import { decodeColumn, isNullAt, MEMORY_CHUNK_ROWS } from "./columns.js";
-import { LogAppender, type LogPosition } from "./log.js";
+import { IDLE_FLUSH_MS, LogAppender, type LogPosition } from "./log.js";
 import { BlobCache } from "../format/blob-cache.js";
 import {
   decodeManifestRoot,
@@ -144,6 +146,13 @@ import { need } from "./bytes.js";
  * waits for the writer slot.
  */
 export const LOG_RECYCLE_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Ruling R10: on an idle database whose retired space waiting for the next publish passes
+ * max(this, 5% of the data space), the write path publishes one no-change root so it becomes
+ * reusable.
+ */
+export const IDLE_GARBAGE_BYTES = 16 * 1024 * 1024;
 
 /** The write path's working memory admitted at open (scan buffer, key batches, metadata). */
 const MINIMUM_BYTES = RECOVERY_SCAN_BYTES + 4 * 1024 * 1024;
@@ -402,6 +411,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
   readonly #logRecycleBytes: number;
   /** The running log recycle, if any. */
   #recycling: Promise<void> | null = null;
+  readonly #idleGarbageBytes: number;
+  /** The armed idle-publish check (R10), if any. */
+  #idleTimer: ReturnType<typeof setTimeout> | null = null;
+  /** `performance.now()` of the last commit (idleness for R10). */
+  #lastCommitAt = 0;
   /** True while maintenance (a log recycle) holds the writer slot. */
   #maintenanceHolds = false;
   /** The merge chain (one merge at a time, beside the flush chain). */
@@ -450,6 +464,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
     deferredFrames: 0,
     /** Runs written for memtables without rows (their tombstones). */
     rowlessRuns: 0,
+    /** No-change roots published on an idle database to free waiting space (R10). */
+    idlePublishes: 0,
     mergeMs: 0,
     mergesByLevel: [] as number[],
   };
@@ -492,6 +508,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#stallRuns = merges?.stallRuns ?? 3 * this.#mergePolicy.fanIn;
     this.#beforeFlushPublish = input.tuning?.beforeFlushPublish ?? null;
     this.#logRecycleBytes = input.tuning?.logRecycleBytes ?? LOG_RECYCLE_BYTES;
+    this.#idleGarbageBytes = input.tuning?.idleGarbageBytes ?? IDLE_GARBAGE_BYTES;
     this.#now = input.options.now ?? Date.now;
     this.#root = root;
     this.#catalog = catalog;
@@ -1396,6 +1413,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         }
       }
       if (this.#appender.end >= this.#logRecycleBytes) this.#maybeRecycle();
+      this.#lastCommitAt = performance.now();
       const receipt = new Receipt(lsn, this.#appender);
       if (request !== null) {
         const record = () => {
@@ -1556,6 +1574,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    if (this.#idleTimer !== null) clearTimeout(this.#idleTimer);
+    this.#idleTimer = null;
     this.#holder?.rollback();
     for (const waiter of this.#queue.splice(0)) waiter.reject(new WritePathClosedError());
     await this.#recycling;
@@ -1634,7 +1654,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
       for (;;) {
         if (this.failure !== null || this.#closed) return;
         const work = this.#nextFlush();
-        if (work === null) return;
+        if (work === null) {
+          this.#armIdlePublish();
+          return;
+        }
         try {
           await work;
         } catch (error) {
@@ -1932,6 +1955,88 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#scheduleMerge();
   }
 
+  // ── Idle maintenance (ruling R10) ───────────────────────────────────────────────────────
+
+  /** True once `close` began. */
+  get closed(): boolean {
+    return this.#closed;
+  }
+
+  #garbageOverBound(): boolean {
+    const stats = this.#space.stats;
+    return stats.waitingBytes > Math.max(this.#idleGarbageBytes, 0.05 * stats.dataBytes);
+  }
+
+  /**
+   * Arms one idle check `IDLE_FLUSH_MS` from now when retired space waits past its bound; called
+   * when maintenance runs out of work. Nothing is armed otherwise, so an idle database with
+   * little garbage has no timer at all.
+   */
+  #armIdlePublish(): void {
+    if (this.#idleTimer !== null || this.#closed || this.failure !== null || this.#recovering)
+      return;
+    if (!this.#garbageOverBound()) return;
+    this.#idleTimer = setTimeout(() => {
+      this.#idleTimer = null;
+      this.#idlePublish().catch((error: unknown) => {
+        this.#failure ??= error instanceof Error ? error : new Error(String(error));
+      });
+    }, IDLE_FLUSH_MS);
+    (this.#idleTimer as { unref?: () => void }).unref?.();
+  }
+
+  /** Whether nothing runs or is due: no writer, maintenance, flush, merge or unflushed commit. */
+  #idle(): boolean {
+    return (
+      !this.#slotBusy &&
+      this.#queue.length === 0 &&
+      this.#recycling === null &&
+      !this.#merging &&
+      this.#flushesWriting === 0 &&
+      this.#nextFlushReady() === null &&
+      (this.#mergeMode !== "auto" || this.#nextMerge() === null) &&
+      this.#appender.durableLsn >= this.#appender.lastLsn
+    );
+  }
+
+  /** Publishes one no-change root when the database is idle and garbage is over its bound (R10). */
+  async #idlePublish(): Promise<void> {
+    if (this.#closed || this.failure !== null || !this.#garbageOverBound()) return;
+    // Busy (a writer, maintenance, unflushed commits, or a commit within the interval): look
+    // again after the interval. Once the publish is made, nothing is armed until garbage returns.
+    if (!this.#idle() || performance.now() - this.#lastCommitAt < IDLE_FLUSH_MS) {
+      this.#armIdlePublish();
+      return;
+    }
+    const unlock = await this.#lock();
+    let madeRoot: ManifestRoot | null = null;
+    const writer = this.#space.beginWrite("idle publish");
+    try {
+      // The lock may have waited: closed, or garbage reclaimed by a publish meanwhile.
+      if (this.closed || !this.#garbageOverBound()) {
+        await writer.abort();
+        return;
+      }
+      const root = await this.#nextRoot(writer, [], new Map());
+      const bytes = encodeManifestRoot(root);
+      const charge = parseCharge(bytes.length);
+      this.#chargeMetadata(charge);
+      this.#roots.set(root, { refs: 1, bytes: charge });
+      madeRoot = root;
+      await this.#space.publish(bytes, { writers: [writer], retired: [] });
+      this.#root = root;
+      this.#pruneCatalogs(root.globalLsn);
+      this.#publishState();
+      this.maintenance.idlePublishes += 1;
+    } catch (error) {
+      if (writer.state === "open") await writer.abort().catch(() => undefined);
+      throw error;
+    } finally {
+      if (madeRoot !== null) this.#releaseRoot(madeRoot);
+      unlock();
+    }
+  }
+
   // ── Log recycling ───────────────────────────────────────────────────────────────────────
 
   /** Starts a log recycle unless one is running (or the write path cannot run one). */
@@ -1945,6 +2050,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       })
       .finally(() => {
         this.#recycling = null;
+        this.#armIdlePublish();
       });
   }
 
@@ -2130,7 +2236,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
       for (;;) {
         if (this.failure !== null || this.#closed) return;
         const job = this.#nextMerge();
-        if (job === null) return;
+        if (job === null) {
+          this.#armIdlePublish();
+          return;
+        }
         try {
           await this.#merge(job.state, job.indexId, job.plan, job.inputs);
         } catch (error) {
