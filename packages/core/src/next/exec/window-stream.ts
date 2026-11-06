@@ -735,7 +735,8 @@ export class PartitionStream {
       }
       const offset = b.offset;
       if (offset === null) throw new WindowError("frame offset must not be null", "22004");
-      if (offset < 0) throw new WindowError("frame offset must not be negative", "22013");
+      if (offset < 0 || Number.isNaN(offset))
+        throw new WindowError("frame offset must not be negative or NaN", "22013");
       const sign = b.kind === "preceding" ? -1 : 1;
       if (frame.unit === "rows") {
         const at = i + sign * offset;

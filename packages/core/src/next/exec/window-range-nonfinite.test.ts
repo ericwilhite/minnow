@@ -25,6 +25,11 @@ const states = [
   "infinite offset",
   "non-finite FOLLOWING across ring slides",
   "prefix retained before peer start",
+  "NaN offset 22013",
+  "negative offset 22013",
+  "NULL offset 22004",
+  "invalid PRECEDING",
+  "invalid FOLLOWING",
 ] as const;
 const reach = createReach(
   "next-window-float-range",
@@ -186,3 +191,81 @@ for (const seed of seedsFor("next-window-float-range", [0x572, 0x9a1]))
           reach.reach(`${streamed ? "streamed" : "resident"}: prefix retained before peer start`);
       }
   }, 600_000);
+
+// Invalid offsets remain in the generator: compare SQLSTATE, rather than dropping them.
+for (const seed of seedsFor("next-window-float-range", [0x572, 0x9a1]))
+  for (const streamed of [false, true])
+    it(`invalid RANGE offsets vs PostgreSQL seed ${String(seed)} streamed=${String(streamed)}`, async () => {
+      const random = mulberry32(seed);
+      for (const offset of [NaN, -Infinity, -1 - Math.floor(random() * 100), null])
+        for (const following of [false, true]) {
+          const path = streamed ? "streamed" : "resident";
+          const code = offset === null ? "22004" : "22013";
+          const direction = random() < 0.5 ? "asc" : "desc";
+          const nulls = random() < 0.5 ? "first" : "last";
+          const frame: Frame = {
+            unit: "range",
+            start: following
+              ? { kind: "current-row", offset: null }
+              : { kind: "preceding", offset },
+            end: following ? { kind: "following", offset } : { kind: "current-row", offset: null },
+            exclude: "no-others",
+          };
+          const bound = offset === null ? "NULL::float8" : `'${String(offset)}'::float8`;
+          const sqlFrame = following
+            ? `CURRENT ROW AND (${bound}) FOLLOWING`
+            : `(${bound}) PRECEDING AND CURRENT ROW`;
+          await expect(
+            pg.query(
+              `SELECT count(*) OVER (ORDER BY x ${direction} NULLS ${nulls} RANGE BETWEEN ${sqlFrame}) FROM (VALUES (1::float8),(2::float8),('NaN'::float8),('Infinity'::float8),(NULL::float8)) t(x)`,
+            ),
+          ).rejects.toMatchObject({ code });
+          const spec: WindowSpec = {
+            types: [INT, DBL],
+            partitionBy: [],
+            orderBy: [{ column: 1, direction, nulls, collation: null }],
+            streamRows: streamed ? 1 : 100000,
+            functions: [{ fn: "count_star", arg: null, type: BIG, frame }],
+          };
+          const governor = new Governor(64 << 20);
+          const grant = await governor.admit({
+            label: "invalid range",
+            minimumBytes: windowMinimumBytes(spec.types),
+            spillable: true,
+          });
+          const spill = new MemorySpillService();
+          const op = new WindowOperator(spec, { grant, spill, queryId: 1 }, new CollectSink());
+          try {
+            await expect(
+              Promise.resolve().then(() =>
+                drive(
+                  new ArraySource(
+                    batchesOf(
+                      spec.types,
+                      [
+                        [0, 1],
+                        [1, 2],
+                        [2, NaN],
+                        [3, Infinity],
+                        [4, null],
+                      ],
+                      { batchRows: 2 },
+                    ),
+                  ),
+                  op,
+                ),
+              ),
+            ).rejects.toMatchObject({ code });
+          } finally {
+            await op.closed;
+          }
+          expect(governor.usedBytes).toBe(0);
+          expect(spill.bytesInUse).toBe(0);
+          if (streamed) expect(op.profile.streamedPartitions).toBeGreaterThan(0);
+          reach.beginHistory();
+          reach.reach(
+            `${path}: ${offset === null ? "NULL offset 22004" : Number.isNaN(offset) ? "NaN offset 22013" : "negative offset 22013"}`,
+          );
+          reach.reach(`${path}: invalid ${following ? "FOLLOWING" : "PRECEDING"}`);
+        }
+    });

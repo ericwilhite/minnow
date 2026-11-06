@@ -104,7 +104,8 @@ export function fillPeers(peers: Peers, newGroup: Uint8Array, n: number): void {
 function offsetOf(bound: FrameBound): number {
   const offset = bound.offset;
   if (offset === null) throw new WindowError("frame offset must not be null", "22004");
-  if (offset < 0) throw new WindowError("frame offset must not be negative", "22013");
+  if (offset < 0 || Number.isNaN(offset))
+    throw new WindowError("frame offset must not be negative or NaN", "22013");
   return offset;
 }
 

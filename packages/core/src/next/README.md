@@ -808,7 +808,8 @@ and the owner import it directly.
 
 - Float RANGE offsets follow PostgreSQL's `in_range_float8_float8`: NaN peers compare equal,
   NaN sorts above infinity, and NULL validity stays separate from numeric values. Infinite
-  offsets retain PostgreSQL's infinity rules on both resident and streamed paths.
+  offsets retain PostgreSQL's infinity rules on both resident and streamed paths. NaN and
+  negative offsets are rejected with SQLSTATE 22013; positive infinity offsets remain valid.
 
 - One task clock per worker (`exec/pipeline.ts` `TaskClock`, ruling R23.5): the driver, scans,
   aggregation, join, sort, top-k and window all yield once `YIELD_INTERVAL_MS` has passed since
