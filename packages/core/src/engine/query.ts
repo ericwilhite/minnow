@@ -9691,6 +9691,7 @@ class Parser {
       throw new TypeError("UPDATE assignments must set each column once");
     }
     const from = this.#mutationSources("FROM");
+    if (from !== undefined) assertDistinctSourceNames([from.base, ...from.joins], alias ?? table);
     const predicates = this.#mutationPredicates();
     return {
       kind: "update",
@@ -9738,6 +9739,7 @@ class Parser {
     const table = this.#identifier();
     const alias = this.#mutationAlias("WHERE", "USING", "RETURNING");
     const from = this.#mutationSources("USING");
+    if (from !== undefined) assertDistinctSourceNames([from.base, ...from.joins], alias ?? table);
     const predicates = this.#mutationPredicates();
     return {
       kind: "delete",
@@ -10493,6 +10495,7 @@ class Parser {
     if (rightJoins > 0 && joins.length !== 1) {
       throw new TypeError("RIGHT JOIN is only supported as the sole join");
     }
+    assertDistinctSourceNames([base, ...joins]);
     return { base, joins, rightJoins };
   }
 
@@ -13432,6 +13435,20 @@ function pendingSelectBlock(parts: SelectBlockParts): CompiledQuery {
     },
     ...(parts.distinct && wildcard ? { distinctWildcard: true } : {}),
   };
+}
+
+/**
+ * PostgreSQL's 42712: one FROM level (with a parenthesized join group's members, and an UPDATE or
+ * DELETE target beside its FROM / USING sources) names each source once. A second `a` would
+ * otherwise make `a.x` mean whichever source resolution meets first.
+ */
+function assertDistinctSourceNames(sources: readonly TableSource[], target?: string): void {
+  const seen = new Set<string>(target === undefined ? [] : [target]);
+  for (const source of sources) {
+    if (seen.has(source.alias))
+      throw new TypeError(`table name "${source.alias}" specified more than once`);
+    seen.add(source.alias);
+  }
 }
 
 export function assembleSelectBlock(

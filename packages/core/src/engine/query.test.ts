@@ -552,6 +552,24 @@ describe("public SQL queries", () => {
     expect(executeRowQuery(plan, input)).toEqual(expected);
   });
 
+  it("refuses a statement that names a source twice (42712), UPDATE and DELETE targets included", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)");
+    await database.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)");
+    for (const sql of [
+      "SELECT a.id FROM a a, b a",
+      "UPDATE a SET v = 1 FROM a WHERE a.id = 1",
+      "UPDATE a t SET v = 1 FROM b t WHERE t.id = 1",
+      "DELETE FROM a USING a WHERE a.id = 1",
+      "DELETE FROM a t USING b t WHERE t.id = 1",
+      "DELETE FROM a USING b, b WHERE a.id = b.id",
+    ])
+      await expect(database.execute(sql), sql).rejects.toThrow("specified more than once");
+    // Distinct names, and a name reused in a subquery's own FROM, are fine.
+    await database.execute("UPDATE a t SET v = 1 FROM a WHERE t.id = a.id");
+    await database.query("SELECT x.id FROM a x WHERE EXISTS (SELECT 1 FROM b x WHERE x.id = 1)");
+  });
+
   it("orders a wildcard select by a qualified column reference", async () => {
     // A wildcard select names its outputs after the source columns, so a qualified ORDER BY
     // reference has to be rewritten into that naming. Looking it up verbatim used to match no
@@ -712,7 +730,7 @@ describe("public SQL queries", () => {
     );
     await expect(
       database.query("SELECT e.value FROM events e JOIN events e ON e.value = e.value"),
-    ).rejects.toThrow("Table aliases must be unique");
+    ).rejects.toThrow('table name "e" specified more than once');
   });
 
   it("allows comment markers and statement delimiters inside string literals", () => {

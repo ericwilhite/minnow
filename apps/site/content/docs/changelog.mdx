@@ -53,6 +53,11 @@ b.id = a.id)` was false when no row of `b` matched. An aggregate without `GROUP 
   columns, as in PostgreSQL. A position past the select list fails with "DISTINCT ON position
   … is not in select list".
 
+- **A FROM clause that names a source twice is now an error**, as in PostgreSQL:
+  `SELECT a.id FROM a a, b a` ran and read `a.id` from whichever source came first. It now fails
+  with `table name "a" specified more than once`. The same applies to `UPDATE … FROM` and
+  `DELETE … USING` when a source has the target's name. Give each source its own alias.
+
 No stored format changes, and no migration step is needed.
 
 ## 0.19.3 — November 5, 2026

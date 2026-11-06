@@ -2791,6 +2791,63 @@ describe("SQL conformance against SQLite and PGlite", () => {
     expect(refused).toBeLessThan(keyLists.length * orders.length);
   });
 
+  it("refuses a FROM list that names a source twice, exactly as PostgreSQL", async () => {
+    // PostgreSQL's 42712 ("table name … specified more than once"): one FROM level names each
+    // source once, whatever joins them and wherever a parenthesized group puts it. Every pair of
+    // entries × every way to join them runs on PGlite and Minnow: both refuse, or both count the
+    // same rows.
+    const fixture = buildFixture(DEFAULT_FIXTURE_SEED);
+    const database = await minnowFixture(fixture);
+    const postgres = await pgliteOracle(fixture);
+    const entries = [
+      "data",
+      "dims",
+      "data d",
+      "dims d",
+      "dims data",
+      "data AS x",
+      "dims x",
+      "(SELECT 1 AS id) d",
+    ];
+    const joins = [
+      (l: string, r: string) => `${l}, ${r}`,
+      (l: string, r: string) => `${l} CROSS JOIN ${r}`,
+      (l: string, r: string) => `${l} JOIN ${r} ON true`,
+      (l: string, r: string) => `dims q JOIN (${l} JOIN ${r} ON true) ON true`,
+    ];
+    const mismatches: string[] = [];
+    let refused = 0;
+    try {
+      for (const left of entries)
+        for (const right of entries)
+          for (const join of joins) {
+            const sql = `SELECT COUNT(*) AS n FROM ${join(left, right)}`;
+            let expected: string;
+            try {
+              expected = `rows ${JSON.stringify((await postgres.execute({ sql, ordered: false })).rows)}`;
+            } catch (error) {
+              expected = `error ${String((error as { code?: string }).code)}`;
+            }
+            let actual: string;
+            try {
+              actual = `rows ${JSON.stringify((await database.query(sql)).rows)}`;
+            } catch (error) {
+              actual = String(error).includes("specified more than once")
+                ? "error 42712"
+                : `error ${String(error)}`;
+            }
+            if (expected === "error 42712") refused += 1;
+            if (actual !== expected)
+              mismatches.push(`${sql}\n  pglite: ${expected}\n  minnow: ${actual}`);
+          }
+    } finally {
+      await postgres.close();
+      await database.close();
+    }
+    expect(mismatches.slice(0, 10).join("\n"), `${String(mismatches.length)} differ`).toBe("");
+    expect(refused).toBeGreaterThan(20);
+  });
+
   it("keeps every select item when output names repeat, as both oracles do", async () => {
     // PostgreSQL and SQLite both return two columns named `c` for `SELECT a AS c, b AS c`. A
     // Minnow row is keyed by name, so each later repeat is numbered (`c_2`). Values are compared
