@@ -964,8 +964,11 @@ and the owner import it directly.
   mode), in memory and across runs (DECISIONS.md C8). Compare mode decodes each row's JSONB,
   array and ICU text keys once, as the row arrives (for a merge, once per page), and charges the
   decoded values to the grant, so a run's comparisons never decode.
-- Top-N keeps rows only while they beat the k-th best key and compacts at 2k (O(k) memory, WITH
-  TIES kept). Up to 65,536 kept rows, it holds its next compaction's store in reserve, so a full
+- Top-N periodically compacts buffered candidates to the best k rows (WITH TIES kept).
+  Once a threshold is available, rows whose first fixed-width numeric key is strictly worse
+  are rejected before key encoding. First-key ties and unsupported first-key types retain the
+  full comparison. The fixed scalar snapshot is charged and retains no input buffers.
+  Up to 65,536 kept rows, it holds its next compaction's store in reserve, so a full
   grant compacts instead of spilling whenever it can hold the kept rows twice. `GroupTopKOperator` is ROW_NUMBER() ≤ k per partition (the row number appended);
   after a compaction each partition keeps its k-th key, and rows that cannot beat it are dropped.
 - Grant-or-spill: sorted runs of typed spill pages, merged with a fan-in the spill pool's room
@@ -982,6 +985,8 @@ and `RUNS` set the input size and measured repetitions. The grouped benchmark al
 measurements do not establish the whole-query browser performance gates.
 `exec/sort-direct.bench.ts` isolates fixed-width key normalization on prebuilt batches,
 checking every word against frozen sort-key bytes outside CPU timing.
+`exec/topn-filter.bench.ts` compares encode-first and raw-filter-first on prebuilt batches
+with a fixed threshold; use `MODE=encode` and `MODE=filter` in interleaved rounds.
 
 ### Windows (`exec/window.ts`, `window-sort.ts`, `window-frames.ts`, `window-stream.ts`)
 
