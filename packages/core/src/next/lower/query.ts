@@ -5,6 +5,7 @@
  *
  * The FROM clause (sources, joins and their order, subqueries) is lower/from.ts.
  */
+import { strongestRowLock } from "../../engine/row-locking.js";
 import type { AggregateCall, AggregateFn, Bound, Rel, ScalarExpr, SortKey } from "../ir/ir.js";
 import { aggregateArgument, aggregateResult } from "../ir/functions.js";
 import type { PhysicalType } from "../types.js";
@@ -389,6 +390,7 @@ export function lowerBlock(
   builder: PlanBuilder,
   outer?: OuterResolver,
 ): LoweredRel & { readonly pointRead?: boolean } {
+  builder.rowLocking = strongestRowLock([builder.rowLocking, block.rowLocking]);
   if (block.pendingSelectShape !== undefined)
     throw new PlanningError("unbound select shape", "XX000");
   const state = builder.state;

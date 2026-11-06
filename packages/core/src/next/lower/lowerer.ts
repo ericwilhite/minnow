@@ -73,7 +73,12 @@ export interface LoweringContext {
   readonly parameterTypes?: ReadonlyArray<PhysicalType | null>;
 }
 
+/** Strongest SELECT row-lock intent after view/CTE expansion; no physical lock is acquired. */
+export type LoweredRowLocking = "none" | "keyShare" | "share" | "noKeyUpdate" | "update";
+
 interface LoweredBase {
+  /** B5 refuses a query with any non-none intent in READ ONLY (25006), before executing it. */
+  readonly rowLocking: LoweredRowLocking;
   readonly kind: StatementKind;
   readonly text: string;
   /** `context.catalog.version`: the plan is valid only at this version. */

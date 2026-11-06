@@ -526,3 +526,19 @@ export const FRAME_METADATA_STATES = [
   "CTE",
   "derived",
 ] as const;
+
+/** Planned locking reads: relation targets, CTE boundaries, expanded views and strongest intent. */
+export const ROW_LOCK_INTENT_STATES = [
+  "unused stronger CTE",
+  "base relation",
+  "FROM propagation",
+  "constant source",
+  "CTE boundary",
+  "CTE body",
+  "unused CTE",
+  "OF target",
+  "view clause",
+  "nested view",
+  "view target",
+  "strongest",
+] as const;

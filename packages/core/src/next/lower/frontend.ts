@@ -8,6 +8,7 @@
  * integer-division annotations (types decide both), statement-clock substitution and WITH TIES
  * expansion (the IR has `clockSlot` and `sort.withTies`).
  */
+import { expandedRowLock } from "../../engine/row-locking.js";
 import type { CatalogView } from "../access/catalog.js";
 import {
   bindPendingSelectShapes,
@@ -93,8 +94,8 @@ export function prepareQuery(parsed: CompiledQuery, catalog: CatalogView): Compi
   const columnsOf = (name: string): readonly string[] | undefined => front.columns.get(name);
   let plan = foldIdentifierCase(parsed, front.columns);
   plan = expandRowReferences(plan, columnsOf);
+  const bodies = new Map<string, CompiledQuery>();
   if (front.views.size > 0) {
-    const bodies = new Map<string, CompiledQuery>();
     plan = expandViewSources(plan, (name) => {
       const sql = front.views.get(name);
       if (sql === undefined) return undefined;
@@ -106,6 +107,8 @@ export function prepareQuery(parsed: CompiledQuery, catalog: CatalogView): Compi
       return body;
     });
   }
+  const rowLocking = expandedRowLock(parsed, bodies.values());
+  if (rowLocking !== undefined) plan.rowLocking = rowLocking;
   if (front.keys.size > 0)
     plan = extendGroupByWithKeyDependents(plan, (name) => front.keys.get(name), columnsOf);
   plan = bindPendingSelectShapes(plan, columnsOf);

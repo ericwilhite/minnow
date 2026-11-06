@@ -1470,6 +1470,7 @@ export function withTestStatements(lowerer: StatementPlanner): StatementPlanner 
       });
       return {
         kind: "query",
+        rowLocking: "none",
         text,
         catalogVersion: context.catalog.version,
         command: "SELECT",

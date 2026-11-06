@@ -1,3 +1,4 @@
+import type { RowLocking } from "../../plan/model.js";
 /**
  * Building blocks every lowering module shares: the per-statement `PlanBuilder`, lowered
  * relations with their result-descriptor columns, the lazily-collected `TableRead`, scopes over
@@ -40,6 +41,8 @@ export interface LoweredRel {
  * the statistics and costs the join order is chosen with.
  */
 export class PlanBuilder {
+  /** Aggregated while lowering queries, including DML subqueries. */
+  rowLocking: RowLocking | undefined;
   #nextId = 1;
   #nextWorkTable = 1;
   #nextSource = 1;

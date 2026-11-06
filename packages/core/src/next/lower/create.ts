@@ -10,10 +10,11 @@ import { ParameterTypes } from "./coerce.js";
 import { descriptorOf, lowerDdl, tableInput } from "./ddl.js";
 import { frontEndError, PlanningError } from "./errors.js";
 import type { ExpressionState } from "./expressions.js";
-import type { CompiledQuery } from "../../plan/model.js";
+import type { RowLocking, CompiledQuery } from "../../plan/model.js";
 import { parseAny, parseQuery, prepareQuery } from "./frontend.js";
 import type {
   LoweredModify,
+  LoweredRowLocking,
   LoweredQuery,
   LoweredStatement,
   Lowerer,
@@ -116,8 +117,19 @@ function physicalPlan(
   };
 }
 
+const ROW_LOCK_INTENT: Readonly<Record<RowLocking, LoweredRowLocking>> = {
+  "KEY SHARE": "keyShare",
+  SHARE: "share",
+  "NO KEY UPDATE": "noKeyUpdate",
+  UPDATE: "update",
+};
+function rowLockIntent(lock: RowLocking | undefined): LoweredRowLocking {
+  return lock === undefined ? "none" : ROW_LOCK_INTENT[lock];
+}
+
 function planned(plan: Planning, root: Rel, columns: readonly RelColumn[], catalog: CatalogView) {
   return {
+    rowLocking: rowLockIntent(plan.builder.rowLocking),
     plan: physicalPlan(root, outputColumns(columns), plan, catalog),
     columns: columns.map((column) => resultColumn(column, column.big)),
     reads: [...plan.builder.reads].sort((a, b) => a - b),
@@ -203,6 +215,7 @@ function lowerStatement(text: string, context: LoweringContext): LoweredStatemen
   const statement = parsed.statement;
   const statementClass = classifyStatement(statement);
   const base = {
+    rowLocking: "none" as const,
     text,
     catalogVersion: context.catalog.version,
     command: statementClass.command,
@@ -303,6 +316,7 @@ function lowerStatement(text: string, context: LoweringContext): LoweredStatemen
         kind: "ddl",
         parameters: [],
         change,
+        rowLocking: noData ? "none" : rowLockIntent(plan.builder.rowLocking),
         followUp: noData
           ? null
           : insertSelectText(

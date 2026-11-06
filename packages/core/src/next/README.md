@@ -1358,3 +1358,15 @@ branch).
 - **Group commit is essential.** `flush()` is one real disk flush on every engine: 3.4–4.7 ms.
 - **Cross-tab round trips are slow on WebKit.** Measured at about 55–65 µs on Chromium, 140 µs on
   Firefox and 280 µs on WebKit (p95 520 µs).
+
+### Row-lock admission (B6/B5)
+
+Every lowered statement carries `rowLocking`: `none`, `keyShare`, `share`, `noKeyUpdate`, or
+`update`, strongest last. The owner refuses a query whose intent is not `none` in READ ONLY
+with 25006, before executing it, including a cached or parameterized statement. Lowering does
+not acquire locks or enforce transaction access mode. DML/DDL write admission stays separate.
+The shared front end resolves targets through FROM subqueries but never pushes an outer clause
+into a CTE. A referenced CTE's own clause and a view's own clause count; unused CTEs do not.
+View bodies are included after catalog expansion. The shipped engine uses the same target and
+strength helpers. Metadata is retained even for a point read; the owner must check it before
+its synchronous fast path.
