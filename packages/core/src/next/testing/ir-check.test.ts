@@ -303,3 +303,81 @@ describe("checkPlan: slot producers and every expression position (review B6-p2b
     expect(check(recursive)).toThrow(/work table width|recursive width differs/u);
   });
 });
+
+describe("checkPlan checks every aggregate against ir/functions.ts AGGREGATES (review B6-p2b-3 finding 2)", () => {
+  /** The review's plan: SUM's argument a lowered text literal, its result and outputs text. */
+  function sumOfText(): { plan: PhysicalPlan; check: (plan: PhysicalPlan) => () => void } {
+    const { plan, check } = setup();
+    const text = plan("SELECT 'a' AS t");
+    if (text.root.op !== "project") throw new Error("Expected a project");
+    const literal = text.root.exprs[0];
+    const summed = plan("SELECT sum(id) AS s FROM a");
+    const retype = (value: unknown): void => {
+      if (typeof value !== "object" || value === null) return;
+      const node = value as Record<string, unknown>;
+      if (node.kind === "int64") node.kind = "text";
+      if (node.fn === "sum") node.args = [structuredClone(literal)];
+      for (const child of Object.values(node)) retype(child);
+    };
+    retype(summed);
+    return { plan: summed, check };
+  }
+
+  it("rejects SUM(text) → text, a coherent plan with no such overload", () => {
+    const { plan, check } = sumOfText();
+    expect(check(plan)).toThrow("aggregate sum(text): no such overload");
+  });
+
+  it("rejects every argument type an aggregate has no overload for, in GROUP BY and windows", () => {
+    const { plan, check } = setup();
+    /** A lowered expression of the type `sql` selects (a literal or a cast of one). */
+    const expression = (sql: string): ScalarExpr => {
+      const root = plan(sql).root;
+      if (root.op !== "project" || root.exprs[0] === undefined) throw new Error(sql);
+      return root.exprs[0];
+    };
+    const cases: ReadonlyArray<readonly [sql: string, arg: string, message: string]> = [
+      ["SELECT avg(id) AS x FROM a", "SELECT true AS t", "aggregate avg(bool): no such overload"],
+      [
+        "SELECT min(id) AS x FROM a",
+        "SELECT CAST('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' AS uuid) AS t",
+        "aggregate min(uuid): no such overload",
+      ],
+      ["SELECT max(id) AS x FROM a", "SELECT CAST('1' AS jsonb) AS t", "aggregate max(json)"],
+      [
+        "SELECT sum(id) OVER (ORDER BY id) AS x FROM a",
+        "SELECT 'a' AS t",
+        "window: aggregate sum(text): no such overload",
+      ],
+      [
+        "SELECT avg(id) OVER (ORDER BY id) AS x FROM a",
+        "SELECT DATE '2024-01-01' AS t",
+        "window: aggregate avg(date): no such overload",
+      ],
+    ];
+    for (const [sql, arg, message] of cases) {
+      const lowered = plan(sql);
+      for (const rel of all(lowered.root)) {
+        const calls =
+          rel.op === "aggregate" ? rel.aggregates : rel.op === "window" ? rel.functions : [];
+        for (const call of calls)
+          (call as { args: readonly ScalarExpr[] }).args = [expression(arg)];
+      }
+      expect(check(lowered), sql).toThrow(message);
+    }
+  });
+
+  it("rejects a result type the overload does not give", () => {
+    const { plan, check } = setup();
+    // sum(int8) is numeric with scale 0 (R17.2): unconstrained numeric is another type.
+    const summed = plan("SELECT sum(CAST(id AS bigint)) AS s FROM a");
+    const aggregate = all(summed.root).find((rel) => rel.op === "aggregate");
+    if (aggregate?.op !== "aggregate") throw new Error("Expected an aggregate");
+    const decimal = { kind: "decimal", precision: null, scale: null } as const;
+    (aggregate.aggregates[0] as { type: unknown }).type = decimal;
+    for (const rel of all(summed.root))
+      for (const column of rel.output)
+        if (column.type.kind === "decimal") (column as { type: unknown }).type = decimal;
+    expect(check(summed)).toThrow("aggregate sum(int64): returns decimal, not decimal");
+  });
+});

@@ -6,8 +6,9 @@
  */
 import { PGlite } from "@electric-sql/pglite";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createReach, FRAME_OFFSET_STATES, HAVING_NAME_STATES } from "../../testing/reach.js";
 import { PlanningError } from "../lower/errors.js";
-import { check } from "./pglite-oracle.js";
+import { check, nextOutcome, pgOutcome } from "./pglite-oracle.js";
 import { LoweredDatabase } from "./lowering-harness.js";
 
 let pg: PGlite;
@@ -194,5 +195,118 @@ describe("transaction modes (ruling R11.2, review B6-p2b-2 findings 1 and 2)", (
     expect(ourMode(next, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")).toBe("0A000");
     expect(ourMode(next, "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")).toBe("0A000");
     expect(ourMode(next, "SET TRANSACTION")).toBe("42601");
+  });
+});
+
+describe("HAVING names and frame offsets (review B6-p2b-3 finding 3)", () => {
+  /** A fresh schema in both with `setup`; the lowered database. */
+  const fixture = async (setup: readonly string[]): Promise<LoweredDatabase> => {
+    await pg.exec("DROP SCHEMA IF EXISTS hf CASCADE; CREATE SCHEMA hf; SET search_path TO hf");
+    const next = new LoweredDatabase();
+    for (const sql of setup) {
+      await pg.exec(sql);
+      next.execute(sql);
+    }
+    return next;
+  };
+  const DATA = [
+    "CREATE TABLE a (id integer, v integer)",
+    "CREATE TABLE b (id integer, w integer)",
+    "CREATE TABLE e (id integer, v integer)",
+    "INSERT INTO a VALUES (1, 10), (2, 20), (2, 5)",
+    "INSERT INTO b VALUES (1, 7)",
+  ];
+
+  it("a HAVING name is checked as PostgreSQL checks it: unknown 42703 before ungrouped 42803", async () => {
+    const next = await fixture(DATA);
+    const reach = createReach("HAVING names", HAVING_NAME_STATES);
+    const names = ["id", "v", "nope", "NOPE", "a.id", "a.v", "a.nope", "z.v", "b.w"];
+    const conditions = [
+      (n: string) => `${n} > 0`,
+      (n: string) => `0 < ${n}`,
+      (n: string) => `${n} IS NOT NULL`,
+      (n: string) => `sum(${n}) > 0`,
+    ];
+    const sources = ["a", "a JOIN b ON b.id = a.id"];
+    const failures: string[] = [];
+    for (const from of sources)
+      for (const name of names)
+        for (const condition of conditions) {
+          reach.beginHistory();
+          const sql = `SELECT a.id FROM ${from} GROUP BY a.id HAVING ${condition(name)} ORDER BY a.id`;
+          const expected = await pgOutcome(pg, sql);
+          const actual = nextOutcome(next, sql);
+          if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+            failures.push(
+              `${sql}\n  pglite: ${JSON.stringify(expected)}\n  next: ${JSON.stringify(actual)}`,
+            );
+            continue;
+          }
+          const state = "error" in expected ? expected.error : "accepted";
+          reach.reach(
+            state === "accepted"
+              ? "accepted"
+              : state === "42703"
+                ? "unknown column"
+                : state === "42803"
+                  ? "ungrouped column"
+                  : "unknown table",
+          );
+        }
+    expect(failures.join("\n")).toBe("");
+    reach.assertReached();
+  });
+
+  it("an invalid frame offset is 22004 or 22013, as PostgreSQL", async () => {
+    const next = await fixture(DATA);
+    const reach = createReach("frame offsets", FRAME_OFFSET_STATES);
+    const offsets = ["-1", "- 2", "NULL", "0", "1", "'1'", "INTERVAL '1 day'"];
+    const bounds = [
+      (o: string) => `BETWEEN ${o} PRECEDING AND CURRENT ROW`,
+      (o: string) => `BETWEEN CURRENT ROW AND ${o} FOLLOWING`,
+      (o: string) => `${o} PRECEDING`,
+    ];
+    const failures: string[] = [];
+    const divergences: string[] = [];
+    for (const table of ["a", "e"])
+      for (const unit of ["ROWS", "RANGE", "GROUPS"])
+        for (const offset of offsets)
+          for (const bound of bounds) {
+            reach.beginHistory();
+            const sql = `SELECT id, count(*) OVER (ORDER BY v ${unit} ${bound(offset)}) AS n FROM ${table} ORDER BY id, n`;
+            const expected = await pgOutcome(pg, sql);
+            const actual = nextOutcome(next, sql);
+            if (JSON.stringify(actual) === JSON.stringify(expected)) {
+              const state = "error" in expected ? expected.error : "accepted";
+              if (state === "accepted") reach.reach("accepted");
+              else if (state === "22004") reach.reach("null offset");
+              else if (state === "22013") reach.reach("negative offset");
+              continue;
+            }
+            // A refusal (0A000) of SQL PostgreSQL runs: interval and string offsets.
+            if ("rows" in expected && "error" in actual && actual.error === "0A000") {
+              reach.reach("refused");
+              continue;
+            }
+            // PostgreSQL checks a negative RANGE offset when a row first compares; lowering
+            // raises it at once, so over no rows it fails where PostgreSQL returns none.
+            if (
+              unit === "RANGE" &&
+              table === "e" &&
+              "rows" in expected &&
+              "error" in actual &&
+              actual.error === "22013"
+            ) {
+              divergences.push(sql);
+              continue;
+            }
+            failures.push(
+              `${sql}\n  pglite: ${JSON.stringify(expected)}\n  next: ${JSON.stringify(actual)}`,
+            );
+          }
+    expect(failures.join("\n")).toBe("");
+    // Exactly the negative RANGE offsets over the empty table: two spellings, three bounds.
+    expect(divergences.length).toBe(6);
+    reach.assertReached();
   });
 });

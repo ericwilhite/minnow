@@ -5,6 +5,10 @@
  */
 import { PGlite } from "@electric-sql/pglite";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createReach, RANGE_KEY_STATES } from "../../testing/reach.js";
+import { sqlTypeOf, type SqlType } from "../ir/functions.js";
+import { PlanningError } from "../lower/errors.js";
+import { LoweredDatabase } from "./lowering-harness.js";
 import { check as checkIn, nextOutcome, pgOutcome, type Case } from "./pglite-oracle.js";
 
 let pg: PGlite;
@@ -257,5 +261,189 @@ describe("RANGE offsets at NULL boundaries and past 2^53 (review B6-p2b-2 findin
             });
       await check(table.setup, cases);
     }
+  });
+});
+
+describe("RANGE offsets over NUMERIC, float and temporal keys (review B6-p2b-3 finding 1)", () => {
+  // Authority: PostgreSQL's window frames (sql-expressions.html#SYNTAX-WINDOW-FUNCTIONS) and its
+  // in_range support functions: exact numeric bounds, NaN above every value and peer of NaN,
+  // ±Infinity peers of themselves, an infinite key beyond every finite bound.
+  const TABLES: ReadonlyArray<{
+    readonly name: string;
+    readonly setup: readonly string[];
+    readonly offsets: readonly string[];
+    readonly states: ReadonlyArray<(typeof RANGE_KEY_STATES)[number]>;
+  }> = [
+    {
+      name: "rn",
+      setup: [
+        "CREATE TABLE rn (id integer PRIMARY KEY, k numeric)",
+        // The review's keys: distinct exact decimals one apart past 2^53.
+        "INSERT INTO rn VALUES (1, 9007199254740992), (2, 9007199254740993), (3, 9007199254740994), (4, NULL), (5, 1.25), (6, 1.5), (7, -0.5), (8, 1.50)",
+      ],
+      offsets: ["0", "1", "0.25", "0.5"],
+      states: ["numeric exact"],
+    },
+    {
+      name: "rs",
+      setup: [
+        "CREATE TABLE rs (id integer PRIMARY KEY, k numeric)",
+        "INSERT INTO rs VALUES (1, 'Infinity'), (2, 'Infinity'), (3, '-Infinity'), (4, 0), (5, 1), (6, NULL), (7, 'NaN'), (8, 'NaN')",
+      ],
+      offsets: ["0", "1"],
+      states: ["numeric special"],
+    },
+    {
+      name: "rf",
+      setup: [
+        "CREATE TABLE rf (id integer PRIMARY KEY, k double precision)",
+        // The review's keys, and NaN peers.
+        "INSERT INTO rf VALUES (1, 'Infinity'), (2, 'Infinity'), (3, '-Infinity'), (4, 0), (5, 1), (6, NULL), (7, 'NaN'), (8, 'NaN'), (9, 1.5)",
+      ],
+      offsets: ["0", "1", "0.5"],
+      states: ["float infinite", "float NaN"],
+    },
+    {
+      name: "rd",
+      setup: [
+        "CREATE TABLE rd (id integer PRIMARY KEY, k date)",
+        "INSERT INTO rd VALUES (1, DATE '2024-01-01'), (2, DATE '2024-01-02'), (3, NULL), (4, DATE '2024-01-04')",
+      ],
+      offsets: ["INTERVAL '1 day'", "INTERVAL '2 days'"],
+      states: ["temporal refused"],
+    },
+  ];
+  const ORDERS = ["k", "k NULLS FIRST", "k DESC", "k DESC NULLS LAST"];
+  const BOUNDS = [
+    (o: string) => `${o} PRECEDING AND CURRENT ROW`,
+    (o: string) => `CURRENT ROW AND ${o} FOLLOWING`,
+    (o: string) => `${o} PRECEDING AND ${o} FOLLOWING`,
+    (o: string) => `${o} FOLLOWING AND UNBOUNDED FOLLOWING`,
+    (o: string) => `UNBOUNDED PRECEDING AND ${o} PRECEDING`,
+  ];
+  const EXCLUSIONS = ["", " EXCLUDE GROUP", " EXCLUDE TIES"];
+
+  it("matches PostgreSQL for every key, placement, bound, offset and exclusion", async () => {
+    const reach = createReach("RANGE keys", RANGE_KEY_STATES);
+    const failures: string[] = [];
+    for (const table of TABLES) {
+      await pg.exec(`DROP TABLE IF EXISTS ${table.name}`);
+      const next = new LoweredDatabase();
+      for (const sql of table.setup) {
+        await pg.exec(sql);
+        // The reference has no dates: lowering refuses these frames before any row is read.
+        if (!table.states.includes("temporal refused") || sql.startsWith("CREATE"))
+          next.execute(sql);
+      }
+      for (const order of ORDERS)
+        for (const bound of BOUNDS)
+          for (const offset of table.offsets)
+            for (const exclusion of EXCLUSIONS) {
+              reach.beginHistory();
+              const frame = `ORDER BY ${order} RANGE BETWEEN ${bound(offset)}${exclusion}`;
+              const sql = `SELECT id, count(*) OVER (${frame}) AS n, min(id) OVER (${frame}) AS m FROM ${table.name} ORDER BY id`;
+              const expected = await pgOutcome(pg, sql);
+              const actual = nextOutcome(next, sql);
+              const same = JSON.stringify(actual) === JSON.stringify(expected);
+              // Interval offsets: PostgreSQL runs them; lowering refuses them (0A000) for now.
+              const refused =
+                table.states.includes("temporal refused") &&
+                "rows" in expected &&
+                "error" in actual &&
+                actual.error === "0A000";
+              if (same || refused) for (const state of table.states) reach.reach(state);
+              else
+                failures.push(
+                  `${sql}\n  pglite: ${JSON.stringify(expected)}\n  next:   ${JSON.stringify(actual)}`,
+                );
+            }
+    }
+    expect(failures.slice(0, 5).join("\n")).toBe("");
+    expect(failures.length).toBe(0);
+    reach.assertReached();
+  });
+});
+
+describe("aggregate signatures against PostgreSQL (review B6-p2b-3 finding 2)", () => {
+  // Authority: PostgreSQL's aggregate overloads (pg_typeof, 42883), except the rulings
+  // ir/functions.ts AGGREGATES records: avg of integers and floats is double precision (C11).
+  const COLUMNS: ReadonlyArray<readonly [column: string, type: string]> = [
+    ["c_bool", "boolean"],
+    ["c_int2", "smallint"],
+    ["c_int4", "integer"],
+    ["c_int8", "bigint"],
+    ["c_float4", "real"],
+    ["c_float8", "double precision"],
+    ["c_numeric", "numeric"],
+    ["c_text", "text"],
+    ["c_varchar", "varchar(5)"],
+    ["c_date", "date"],
+    ["c_time", "time"],
+    ["c_timestamp", "timestamp"],
+    ["c_timestamptz", "timestamptz"],
+    ["c_interval", "interval"],
+    ["c_json", "json"],
+    ["c_jsonb", "jsonb"],
+    ["c_uuid", "uuid"],
+    // bytea columns are not declared through the front end yet.
+  ];
+  const PG_NAMES: Readonly<Record<string, SqlType>> = {
+    boolean: "bool",
+    smallint: "int2",
+    integer: "int4",
+    bigint: "int8",
+    real: "float4",
+    "double precision": "float8",
+    numeric: "numeric",
+    text: "text",
+    "character varying": "text",
+    date: "date",
+    "time without time zone": "time",
+    "timestamp without time zone": "timestamp",
+    "timestamp with time zone": "timestamptz",
+    interval: "interval",
+    json: "json",
+    jsonb: "jsonb",
+    uuid: "uuid",
+    bytea: "bytea",
+  };
+  const RULED: Readonly<Record<string, SqlType>> = {
+    "avg(smallint)": "float8",
+    "avg(integer)": "float8",
+    "avg(bigint)": "float8",
+    "avg(real)": "float8",
+  };
+
+  it("types or refuses (42883) sum, avg, min, max and count over every column type", async () => {
+    const create = `CREATE TABLE agg (${COLUMNS.map(([c, t]) => `${c} ${t}`).join(", ")})`;
+    await pg.exec("DROP TABLE IF EXISTS agg");
+    await pg.exec(create);
+    const next = new LoweredDatabase();
+    next.execute(create);
+    const failures: string[] = [];
+    for (const fn of ["sum", "avg", "min", "max", "count"])
+      for (const [column, declared] of COLUMNS) {
+        let expected: string;
+        try {
+          const shown = await pg.query<{ t: string }>(
+            `SELECT pg_typeof(${fn}(${column}))::text AS t FROM agg`,
+          );
+          const name = shown.rows[0]?.t ?? "";
+          expected = RULED[`${fn}(${declared})`] ?? PG_NAMES[name] ?? `unmapped ${name}`;
+        } catch (error) {
+          expected = String((error as { code?: string }).code);
+        }
+        let actual: string;
+        try {
+          const lowered = next.lower(`SELECT ${fn}(${column}) AS x FROM agg`);
+          const type = lowered.kind === "query" ? lowered.plan.columns[0]?.type : undefined;
+          actual = (type === undefined ? null : sqlTypeOf(type)) ?? `no type`;
+        } catch (error) {
+          actual = error instanceof PlanningError ? error.sqlState : String(error);
+        }
+        if (actual !== expected)
+          failures.push(`${fn}(${declared}): pglite ${expected}, next ${actual}`);
+      }
+    expect(failures).toEqual([]);
   });
 });

@@ -6,6 +6,7 @@
  * The FROM clause (sources, joins and their order, subqueries) is lower/from.ts.
  */
 import type { AggregateCall, AggregateFn, Bound, Rel, ScalarExpr, SortKey } from "../ir/ir.js";
+import { aggregateArgument, aggregateResult } from "../ir/functions.js";
 import type { PhysicalType } from "../types.js";
 import { isAggregateCall } from "../../engine/query.js";
 import { encodeQueryIdentity } from "../../engine/query-identity.js";
@@ -55,7 +56,6 @@ interface AggregateDraft {
 }
 
 const INT8: PhysicalType = { kind: "int64" };
-const FLOAT8: PhysicalType = { kind: "float64" };
 
 function aggregateDraft(
   expression: Extract<Expression, { kind: "call" }>,
@@ -91,20 +91,22 @@ function aggregateDraft(
   }
   if (first === undefined)
     throw new PlanningError(`${name.toLowerCase()} needs an argument`, "42601");
-  const arg = settleArg(first);
+  const settled = settleArg(first);
+  // An argument no overload takes as is casts implicitly to the one that does (sum(time) is
+  // sum(interval), as PostgreSQL resolves it).
+  const resolved =
+    name === "SUM" || name === "AVG"
+      ? aggregateArgument(name === "SUM" ? "sum" : "avg", settled.expr.type)
+      : null;
+  const arg =
+    resolved === null || resolved === settled.expr.type
+      ? settled
+      : coerce(settled, resolved, "implicit", builder.parameters);
   const type = arg.expr.type;
   switch (name) {
     case "SUM": {
-      const result: PhysicalType | null =
-        type.kind === "int32"
-          ? INT8
-          : type.kind === "int64"
-            ? { kind: "decimal", precision: null, scale: 0 }
-            : type.kind === "decimal"
-              ? { kind: "decimal", precision: null, scale: null }
-              : type.kind === "float32" || type.kind === "float64" || type.kind === "interval"
-                ? type
-                : null;
+      // ir/functions.ts AGGREGATES (R19) types every aggregate.
+      const result = aggregateResult("sum", [type]);
       if (result === null)
         throw new PlanningError(`function sum(${type.kind}) does not exist`, "42883");
       // D2 / R17.2: SUM(int8) is exact and renders bigint; SUM(int2/int4) renders number.
@@ -119,17 +121,7 @@ function aggregateDraft(
       };
     }
     case "AVG": {
-      const result: PhysicalType | null =
-        type.kind === "int32" ||
-        type.kind === "int64" ||
-        type.kind === "float32" ||
-        type.kind === "float64"
-          ? FLOAT8
-          : type.kind === "decimal"
-            ? { kind: "decimal", precision: null, scale: null }
-            : type.kind === "interval"
-              ? type
-              : null;
+      const result = aggregateResult("avg", [type]);
       if (result === null)
         throw new PlanningError(`function avg(${type.kind}) does not exist`, "42883");
       return {
@@ -143,11 +135,14 @@ function aggregateDraft(
       };
     }
     case "MIN":
-    case "MAX":
-      if (type.kind === "json" && !type.binary)
-        throw new PlanningError(`function ${name.toLowerCase()}(json) does not exist`, "42883");
+    case "MAX": {
+      const fn = name === "MIN" ? "min" : "max";
+      // PostgreSQL has no min / max over bool, json, jsonb or uuid (42883). The result keeps
+      // the argument's modifiers (a VARCHAR(n) column's min renders as the column does).
+      if (aggregateResult(fn, [type]) === null)
+        throw new PlanningError(`function ${fn}(${type.kind}) does not exist`, "42883");
       return {
-        fn: name === "MIN" ? "min" : "max",
+        fn,
         args: [arg],
         distinct,
         orderBy: [],
@@ -155,6 +150,7 @@ function aggregateDraft(
         nullable: true,
         big: arg.big,
       };
+    }
     case "STRING_AGG": {
       const [, separator] = expression.arguments;
       if (separator === undefined) throw new PlanningError("string_agg needs a delimiter", "42601");

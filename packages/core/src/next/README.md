@@ -1271,6 +1271,9 @@ with a fixed threshold; use `MODE=encode` and `MODE=filter` in interleaved round
   errors are translated by message (`frontEndError`), keeping the parse position and the
   original as `cause`. The messages it depends on are pinned (`testing/front-end-states.test.ts`:
   a snapshot of every mapped front-end message, and per pattern a PGlite-checked statement).
+  HAVING names resolve before the grouping check, as in PostgreSQL: an unknown qualifier is
+  42P01, an unknown column 42703, an ambiguous one 42702 (`lower/frontend.ts`). A negative frame
+  offset is 22013 and a NULL one 22004.
 - Transaction modes come from the parser's AST in written order; `modes` holds what applies (the
   last of each kind). `BEGIN READ ONLY` lowers with `readOnly: true` (R11.2); `SET TRANSACTION …`
   lowers to `transactionControl` action `setTransaction` with its `modes`, for the owner to apply.
@@ -1285,6 +1288,10 @@ with a fixed threshold; use `MODE=encode` and `MODE=filter` in interleaved round
   constant that cannot be a key of the column's type keeps the scan.
 - int8 renders `bigint` only when an operand does (R17.1); SUM(int8) is `decimal(null, 0)`
   rendered `bigint` (R17.2).
+- Aggregates are typed by `ir/functions.ts` `AGGREGATES` (R19), the table the plan checker
+  reads too: PostgreSQL's overloads, with an argument cast implicitly to the one overload it
+  reaches (`sum(time)` is `sum(interval)`), and no `min` / `max` over bool, json, jsonb or uuid
+  (42883). AVG of integers and floats is double precision (C11).
 - Joins are ordered by cost (`from.ts`): every left-deep connected order up to 8 relations,
   greedy above, with the smaller estimate as the hash build side. Outer, semi and anti joins keep
   their place; a WHERE conjunct over one source is pushed into it unless an outer join
@@ -1314,10 +1321,14 @@ with a fixed threshold; use `MODE=encode` and `MODE=filter` in interleaved round
   `testing/lowering-pglite-m3.test.ts` do the same against PostgreSQL (PGlite), the authority,
   through `testing/pglite-oracle.ts`, and `testing/lowering-pglite-review.test.ts` holds review
   B6-p2b's cases (lazy init plans, set-operation types, FULL JOIN extension, window frames,
-  decimal casts, RANGE offsets at NULL boundaries and past 2^53). `testing/ir-check.ts` checks every
+  decimal casts, RANGE offsets at NULL boundaries and past 2^53, over exact NUMERIC, float
+  infinities and NaN, aggregate signatures over every column type). The reference interpreter
+  keeps NUMERIC exact (`testing/reference-decimal.ts`) and RANGE frames follow PostgreSQL's
+  in_range functions. `testing/ir-check.ts` checks every
   plan they run: every declared slot filled by exactly one producer that dominates its readers
   (placeholders, the clock, init plans without cycles, apply bindings within their apply), LIMIT /
-  OFFSET bounds, positions on both sides, aggregate FILTER / ORDER BY and signatures, window
+  OFFSET bounds, positions on both sides, aggregate FILTER / ORDER BY and signatures (every
+  aggregate an overload of `AGGREGATES`, no fallback), window
   signatures and frames, recursion widths and work tables (`ir-check.test.ts`).
 - Lowering cost (`scripts/lowering-bench.mts`, warm, median on a loaded host): a point read
   ~160 µs, a 3-way join ~350 µs, a 6- to 9-way chain 530–840 µs.

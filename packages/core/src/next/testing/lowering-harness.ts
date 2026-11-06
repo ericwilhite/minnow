@@ -14,6 +14,7 @@ import type {
 import { MemoryCatalog } from "../lower/memory-catalog.js";
 import type { PhysicalType } from "../types.js";
 import { checkPlan } from "./ir-check.js";
+import { Decimal } from "./reference-decimal.js";
 import { run, withInitPlans, type Environment, type Row, type Value } from "./ir-reference.js";
 
 export const TEST_COSTS: ExecutorCosts = {
@@ -30,6 +31,7 @@ export const TEST_COSTS: ExecutorCosts = {
 /** A reference value in the form tests compare: integers as numbers, floats to 12 digits. */
 export function comparable(value: Value): unknown {
   if (typeof value === "bigint") return Number(value);
+  if (value instanceof Decimal) return comparable(value.toNumber());
   if (typeof value === "number" && !Number.isInteger(value)) return Number(value.toPrecision(12));
   return value;
 }
@@ -40,6 +42,16 @@ export function bindValue(value: unknown, type: PhysicalType): Value {
   if (type.kind === "int32" || type.kind === "int64") return BigInt(value as number);
   if (type.kind === "float64" || type.kind === "float32") return Number(value);
   if (type.kind === "bool") return Boolean(value);
+  if (type.kind === "decimal") {
+    const decimal =
+      typeof value === "bigint"
+        ? Decimal.fromInteger(value)
+        : typeof value === "number"
+          ? Decimal.fromFloat(value)
+          : Decimal.parse(typeof value === "string" ? value : JSON.stringify(value));
+    if (decimal === null) throw new TypeError(`not a numeric: ${JSON.stringify(value)}`);
+    return decimal;
+  }
   return typeof value === "string" ? value : JSON.stringify(value);
 }
 

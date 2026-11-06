@@ -12,6 +12,7 @@
  * PRECEDING to CURRENT ROW with ORDER BY, the whole partition without).
  */
 import type { ScalarExpr, SortKey, WindowCall, WindowFrameBound } from "../ir/ir.js";
+import { aggregateArgument, aggregateResult } from "../ir/functions.js";
 import type { PhysicalType } from "../types.js";
 import type { QueryValue, TableSource, WindowFrame, WindowSpec } from "../../plan/model.js";
 import { coerce, type Typed } from "./coerce.js";
@@ -86,34 +87,20 @@ function signature(
   }
   if (arg === null)
     throw new PlanningError(`${spec.name.toLowerCase()} needs an argument`, "42601");
+  // ir/functions.ts AGGREGATES (R19) types every aggregate.
   if (name === "sum") {
-    const type: PhysicalType | null =
-      arg.kind === "int32"
-        ? INT8
-        : arg.kind === "int64"
-          ? { kind: "decimal", precision: null, scale: 0 }
-          : arg.kind === "decimal"
-            ? { kind: "decimal", precision: null, scale: null }
-            : arg.kind === "float32" || arg.kind === "float64" || arg.kind === "interval"
-              ? arg
-              : null;
+    const type = aggregateResult("sum", [arg]);
     if (type === null) throw new PlanningError(`function sum(${arg.kind}) does not exist`, "42883");
     return { fn: name, type, nullable: true, big: arg.kind === "int64" };
   }
   if (name === "avg") {
-    const type: PhysicalType | null =
-      arg.kind === "int32" ||
-      arg.kind === "int64" ||
-      arg.kind === "float32" ||
-      arg.kind === "float64"
-        ? FLOAT8
-        : arg.kind === "decimal"
-          ? { kind: "decimal", precision: null, scale: null }
-          : arg.kind === "interval"
-            ? arg
-            : null;
+    const type = aggregateResult("avg", [arg]);
     if (type === null) throw new PlanningError(`function avg(${arg.kind}) does not exist`, "42883");
     return { fn: name, type, nullable: true, big: false };
+  }
+  if (name === "min" || name === "max") {
+    if (aggregateResult(name, [arg]) === null)
+      throw new PlanningError(`function ${name}(${arg.kind}) does not exist`, "42883");
   }
   return { fn: name, type: arg, nullable: true, big: argument?.big ?? false };
 }
@@ -200,9 +187,25 @@ export function lowerWindowed(
     for (const spec of specs) {
       const argumentIndex = spec.argumentAlias === undefined ? null : position(spec.argumentAlias);
       const argument = argumentIndex === null ? null : (inner.columns[argumentIndex] ?? null);
-      const result = signature(spec, argument);
+      // sum / avg of a type no overload takes cast implicitly to the one that does (sum(time)).
+      const resolved =
+        argument !== null && (RANKING[spec.name] === "sum" || RANKING[spec.name] === "avg")
+          ? aggregateArgument(RANKING[spec.name] === "sum" ? "sum" : "avg", argument.type)
+          : null;
+      const cast =
+        argument !== null && resolved !== null && resolved !== argument.type ? resolved : null;
+      const result = signature(
+        spec,
+        argument === null || cast === null ? argument : { ...argument, type: cast },
+      );
       const args: ScalarExpr[] =
-        argument === null || argumentIndex === null ? [] : [column(argumentIndex, argument.type)];
+        argument === null || argumentIndex === null
+          ? []
+          : [
+              cast === null
+                ? column(argumentIndex, argument.type)
+                : { op: "cast", input: column(argumentIndex, argument.type), type: cast },
+            ];
       if (result.fn === "ntile") args.push(int(spec.offset ?? 1, INT4));
       if (result.fn === "lag" || result.fn === "lead") {
         args.push(int(spec.offset ?? 1, INT4));

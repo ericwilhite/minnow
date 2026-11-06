@@ -326,6 +326,41 @@
   },
   {
     "file": "query.ts",
+    "message": "frame starting offset must not be null",
+    "state": "22004"
+  },
+  {
+    "file": "query.ts",
+    "message": "frame ending offset must not be null",
+    "state": "22004"
+  },
+  {
+    "file": "query.ts",
+    "message": "frame starting offset must not be negative",
+    "state": "22013"
+  },
+  {
+    "file": "query.ts",
+    "message": "frame ending offset must not be negative",
+    "state": "22013"
+  },
+  {
+    "file": "query.ts",
+    "message": "argument of ROWS must be type bigint, not type interval",
+    "state": "42804"
+  },
+  {
+    "file": "query.ts",
+    "message": "argument of GROUPS must be type bigint, not type interval",
+    "state": "42804"
+  },
+  {
+    "file": "query.ts",
+    "message": "Window frame offsets other than numeric literals are not supported",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
     "message": "FULL JOIN is only supported as the sole join",
     "state": "0A000"
   },

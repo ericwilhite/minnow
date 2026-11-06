@@ -9,8 +9,22 @@
  * ir/functions.ts allows it. Throws a `TypeError` naming the first violation.
  */
 import type { CatalogView } from "../access/catalog.js";
-import { explicitCastAllowed, FUNCTIONS, sqlTypeOf } from "../ir/functions.js";
-import type { OutputColumn, PhysicalPlan, Rel, ScalarExpr, SortKey, WindowCall } from "../ir/ir.js";
+import {
+  AGGREGATES,
+  aggregateResult,
+  explicitCastAllowed,
+  FUNCTIONS,
+  sqlTypeOf,
+} from "../ir/functions.js";
+import type {
+  AggregateFn,
+  OutputColumn,
+  PhysicalPlan,
+  Rel,
+  ScalarExpr,
+  SortKey,
+  WindowCall,
+} from "../ir/ir.js";
 import { samePhysicalType, type PhysicalType } from "../types.js";
 
 function base(type: PhysicalType): PhysicalType {
@@ -100,57 +114,34 @@ const INT8: PhysicalType = { kind: "int64" };
 const INT4: PhysicalType = { kind: "int32", bits: 32 };
 const FLOAT8: PhysicalType = { kind: "float64" };
 
-/** An aggregate's argument and result types (PostgreSQL's, as lower/query.ts types them; C11). */
+const ORDERED_SET: ReadonlySet<string> = new Set(["percentile_cont", "percentile_disc", "mode"]);
+
+/**
+ * An aggregate's argument and result types: exactly an overload of ir/functions.ts `AGGREGATES`
+ * (R19), for every aggregate. An ordered-set aggregate's WITHIN GROUP key is its one ORDER BY.
+ */
 function checkAggregateSignature(
   fn: string,
   args: readonly ScalarExpr[],
+  orderBy: readonly SortKey[],
   type: PhysicalType,
   where: string,
 ): void {
-  const arg = args[0]?.type;
-  const expect = (ok: boolean, what: string) => {
-    if (!ok) fail(where, `aggregate ${fn}: ${what}`);
-  };
-  switch (fn) {
-    case "count_star":
-      expect(args.length === 0 && sameBase(type, INT8), "() → bigint");
-      return;
-    case "count":
-      expect(args.length === 1 && sameBase(type, INT8), "(T) → bigint");
-      return;
-    case "sum":
-      expect(
-        arg !== undefined &&
-          args.length === 1 &&
-          (arg.kind === "int32"
-            ? sameBase(type, INT8)
-            : arg.kind === "int64"
-              ? type.kind === "decimal" && type.scale === 0
-              : sameBase(type, arg)),
-        "int2/int4 → bigint, int8 → numeric(scale 0), else its argument's type",
-      );
-      return;
-    case "avg":
-      expect(
-        arg !== undefined &&
-          args.length === 1 &&
-          (arg.kind === "int32" ||
-          arg.kind === "int64" ||
-          arg.kind === "float32" ||
-          arg.kind === "float64"
-            ? sameBase(type, FLOAT8)
-            : sameBase(type, arg)),
-        "integers and floats → double precision, else its argument's type",
-      );
-      return;
-    case "min":
-    case "max":
-    case "single_value":
-      expect(arg !== undefined && args.length === 1 && sameBase(type, arg), "(T) → T");
-      return;
-    default:
-      return;
-  }
+  if (!Object.hasOwn(AGGREGATES, fn)) fail(where, `unknown aggregate ${fn}`);
+  const aggregate = fn as AggregateFn;
+  const ordered = ORDERED_SET.has(fn);
+  if (ordered && orderBy.length !== 1)
+    fail(where, `aggregate ${fn}: WITHIN GROUP takes one ORDER BY key`);
+  const signature = `${fn}(${args.map((arg) => arg.type.kind).join(", ")})`;
+  const expected = aggregateResult(
+    aggregate,
+    args.map((arg) => arg.type),
+    ordered ? orderBy[0]?.expr.type : undefined,
+  );
+  if (expected === null) fail(where, `aggregate ${signature}: no such overload`);
+  const exact = expected.kind === "decimal" && expected.scale !== null;
+  if (exact ? type.kind !== "decimal" || type.scale !== expected.scale : !sameBase(type, expected))
+    fail(where, `aggregate ${signature}: returns ${expected.kind}, not ${type.kind}`);
 }
 
 /** A window call's argument and result types (lower/windows.ts, PostgreSQL's signatures). */
@@ -205,18 +196,12 @@ function checkWindowCall(call: WindowCall, orderBy: readonly SortKey[], where: s
       );
       break;
     case "count_star":
-      expect(args.length === 0 && sameBase(call.type, INT8), "() → bigint");
-      break;
     case "count":
-      expect(args.length === 1 && sameBase(call.type, INT8), "(T) → bigint");
-      break;
     case "min":
     case "max":
-      expect(args.length === 1 && first !== undefined && sameBase(first, call.type), "(T) → T");
-      break;
     case "sum":
     case "avg":
-      expect(args.length === 1, "one argument");
+      checkAggregateSignature(call.fn, call.args, [], call.type, `${where}: window`);
       break;
     default:
       fail(where, `unknown window function ${call.fn}`);
@@ -404,7 +389,7 @@ function checkRel(rel: Rel, catalog: CatalogView): void {
           if (call.filter.type.kind !== "bool") fail(where, "aggregate FILTER is not boolean");
         }
         for (const key of call.orderBy) checkExpr(key.expr, input, where);
-        checkAggregateSignature(call.fn, call.args, call.type, where);
+        checkAggregateSignature(call.fn, call.args, call.orderBy, call.type, where);
       }
       if (rel.output.length !== rel.groupBy.length + rel.aggregates.length)
         fail(where, "output width");

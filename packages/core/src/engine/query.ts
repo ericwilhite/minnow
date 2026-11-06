@@ -12801,12 +12801,12 @@ class Parser {
       let end: WindowFrameBound;
       if (this.#isKeyword("BETWEEN")) {
         this.#keyword("BETWEEN");
-        start = this.#frameBound(unit);
+        start = this.#frameBound(unit, "starting");
         this.#keyword("AND");
-        end = this.#frameBound(unit);
+        end = this.#frameBound(unit, "ending");
       } else {
         // The single-bound shorthand: the bound is the frame start, the end is the current row.
-        start = this.#frameBound(unit);
+        start = this.#frameBound(unit, "starting");
         end = { kind: "current-row" };
       }
       if (start.kind === "unbounded-following" || end.kind === "unbounded-preceding") {
@@ -12851,7 +12851,7 @@ class Parser {
     return { partitionBy, orderBy, ...(frame === undefined ? {} : { frame }) };
   }
 
-  #frameBound(unit: "rows" | "range" | "groups"): WindowFrameBound {
+  #frameBound(unit: "rows" | "range" | "groups", which: "starting" | "ending"): WindowFrameBound {
     if (this.#isKeyword("UNBOUNDED")) {
       this.#keyword("UNBOUNDED");
       if (this.#isKeyword("PRECEDING")) {
@@ -12866,6 +12866,24 @@ class Parser {
       this.#keyword("ROW");
       return { kind: "current-row" };
     }
+    // PostgreSQL's frame offset errors (22004, 22013). A negative RANGE offset is raised here,
+    // where PostgreSQL raises it when the first row compares (so not over no rows).
+    if (this.#isKeyword("NULL")) {
+      if (which === "starting") throw new TypeError("frame starting offset must not be null");
+      throw new TypeError("frame ending offset must not be null");
+    }
+    if (this.#peek().kind === "operator" && this.#peek().text === "-") {
+      this.#index += 1;
+      this.#take("number");
+      if (which === "starting") throw new TypeError("frame starting offset must not be negative");
+      throw new TypeError("frame ending offset must not be negative");
+    }
+    if (this.#isKeyword("INTERVAL") && unit === "rows")
+      throw new TypeError("argument of ROWS must be type bigint, not type interval");
+    if (this.#isKeyword("INTERVAL") && unit === "groups")
+      throw new TypeError("argument of GROUPS must be type bigint, not type interval");
+    if (this.#isKeyword("INTERVAL") || this.#peek().kind === "string")
+      throw new TypeError("Window frame offsets other than numeric literals are not supported");
     const offset = Number(this.#take("number").text);
     if (!Number.isFinite(offset) || offset < 0 || (unit !== "range" && !Number.isInteger(offset))) {
       throw new TypeError(

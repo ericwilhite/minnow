@@ -7,10 +7,12 @@
  * window frames follow PostgreSQL's ROWS / RANGE / GROUPS and EXCLUDE rules.
  *
  * Values: null; booleans; every integer as an exact `bigint`, range-checked at its type
- * (PostgreSQL's 22003); floats as numbers; text as strings. Decimal constants are approximated
- * as numbers, and so are casts to decimal (from integers, floats, text and decimals, rounded
- * half away from zero to the scale); decimal arithmetic, intervals, dates and JSON are outside
- * the subset and throw `ReferenceUnsupportedError`.
+ * (PostgreSQL's 22003); floats as numbers (NaN sorts above every other value and equals NaN, as
+ * PostgreSQL's float order); text as strings; NUMERIC as an exact `Decimal`
+ * (reference-decimal.ts) with PostgreSQL's NaN and ±Infinity: literals, casts (rounded half
+ * away from zero to the scale), comparison, sorting, SUM and RANGE offsets are exact. Decimal
+ * arithmetic, intervals, dates and JSON are outside the subset and throw
+ * `ReferenceUnsupportedError`.
  * Tables are arrays of rows in catalog order; a locator is the row's index.
  */
 import type { CatalogView, TableDef } from "../access/catalog.js";
@@ -25,10 +27,12 @@ import {
   INT64_MIN,
   type PhysicalType,
 } from "../types.js";
+import { int128At } from "../vector/int128.js";
 import { isValid } from "../vector/validity.js";
-import type { FlatVector } from "../vector/vector.js";
+import { DecimalSpecial, type FlatVector } from "../vector/vector.js";
+import { Decimal, toDecimal } from "./reference-decimal.js";
 
-export type Value = null | boolean | bigint | number | string;
+export type Value = null | boolean | bigint | number | string | Decimal;
 export type Row = Value[];
 
 export class ReferenceUnsupportedError extends Error {
@@ -69,18 +73,20 @@ export function literalValue(vector: FlatVector): Value {
     case "varlen":
       return decoder.decode(data.bytes.subarray(data.offsets[0] ?? 0, data.offsets[1] ?? 0));
     case "decimal": {
-      // Approximated as a number: the tests only cast decimal constants to floats and integers.
+      const special = data.specials?.[0] ?? DecimalSpecial.finite;
+      if (special === DecimalSpecial.nan) return Decimal.special("nan");
+      if (special === DecimalSpecial.positiveInfinity) return Decimal.special("+inf");
+      if (special === DecimalSpecial.negativeInfinity) return Decimal.special("-inf");
       const coefficients = data.coefficients;
-      if (coefficients.repr === "int128" || data.specials !== null)
-        throw new ReferenceUnsupportedError("wide or special decimal literals");
       const coefficient =
-        coefficients.repr === "wide"
-          ? (coefficients.values[0] ?? 0n)
-          : coefficients.repr === "safe"
-            ? BigInt(coefficients.values[0] ?? 0)
-            : (coefficients.values[0] ?? 0n);
-      const scale = data.scale ?? data.scales?.[0] ?? 0;
-      return Number(coefficient) / 10 ** scale;
+        coefficients.repr === "int128"
+          ? int128At(coefficients.limbs, 0)
+          : coefficients.repr === "wide"
+            ? (coefficients.values[0] ?? 0n)
+            : coefficients.repr === "safe"
+              ? BigInt(coefficients.values[0] ?? 0)
+              : (coefficients.values[0] ?? 0n);
+      return Decimal.finite(coefficient, data.scale ?? data.scales?.[0] ?? 0);
     }
     default:
       throw new ReferenceUnsupportedError(`${data.layout} literals`);
@@ -116,6 +122,11 @@ function castValue(value: Value, from: PhysicalType, to: PhysicalType): Value {
   if (value === null) return null;
   if (isInteger(to)) {
     if (typeof value === "bigint") return checkRange(value, to);
+    if (value instanceof Decimal) {
+      if (!value.isFinite)
+        throw new ReferenceSqlError(`cannot convert ${value.toString()} to integer`, "0A000");
+      return checkRange(value.toInteger(), to);
+    }
     if (typeof value === "number")
       // PostgreSQL: float → int is rint (ties to even); numeric → int rounds half away from zero.
       return checkRange(BigInt(isFloat(from) ? roundHalfEven(value) : roundHalfAway(value)), to);
@@ -128,7 +139,7 @@ function castValue(value: Value, from: PhysicalType, to: PhysicalType): Value {
   }
   if (isFloat(to)) {
     const number =
-      typeof value === "bigint"
+      typeof value === "bigint" || value instanceof Decimal
         ? Number(value)
         : typeof value === "string"
           ? Number(value)
@@ -138,19 +149,26 @@ function castValue(value: Value, from: PhysicalType, to: PhysicalType): Value {
     return to.kind === "float32" ? Math.fround(number) : number;
   }
   if (to.kind === "decimal") {
-    // Approximated as a number, like decimal constants; PostgreSQL rounds half away from zero
-    // to the scale and raises 22003 when the integer digits exceed precision − scale.
-    let number: number;
-    if (typeof value === "bigint" || typeof value === "number") number = Number(value);
+    // Exact: PostgreSQL rounds half away from zero to the scale and raises 22003 when the
+    // integer digits exceed precision − scale (or a typmod holds an infinity).
+    let decimal: Decimal;
+    if (typeof value === "bigint" || value instanceof Decimal) decimal = toDecimal(value);
+    else if (typeof value === "number")
+      decimal = Decimal.fromFloat(value, from.kind === "float32" ? 6 : 15);
     else if (typeof value === "string") {
-      if (!/^\s*[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?\s*$/u.test(value))
+      const parsed = Decimal.parse(value);
+      if (parsed === null)
         throw new ReferenceSqlError(`invalid input syntax for type numeric: "${value}"`, "22P02");
-      number = Number(value);
+      decimal = parsed;
     } else throw new ReferenceUnsupportedError(`casts from ${from.kind} to decimal`);
-    if (to.scale === null) return number;
-    const factor = 10 ** to.scale;
-    const rounded = roundHalfAway(number * factor) / factor;
-    if (to.precision !== null && Math.abs(rounded) >= 10 ** (to.precision - to.scale))
+    if (to.scale === null || decimal.isNaN) return decimal;
+    if (!decimal.isFinite) {
+      if (to.precision !== null) throw new ReferenceSqlError("numeric field overflow", "22003");
+      return decimal;
+    }
+    const rounded = decimal.rescale(to.scale);
+    const magnitude = rounded.coefficient < 0n ? -rounded.coefficient : rounded.coefficient;
+    if (to.precision !== null && magnitude >= 10n ** BigInt(to.precision))
       throw new ReferenceSqlError("numeric field overflow", "22003");
     return rounded;
   }
@@ -180,8 +198,18 @@ function castValue(value: Value, from: PhysicalType, to: PhysicalType): Value {
 function compareValues(left: Value, right: Value): number {
   if (typeof left === "bigint" && typeof right === "bigint")
     return left < right ? -1 : left > right ? 1 : 0;
-  if (typeof left === "number" && typeof right === "number")
+  if (typeof left === "number" && typeof right === "number") {
+    // PostgreSQL's float order: NaN above every other value, and equal to NaN.
+    if (Number.isNaN(left) || Number.isNaN(right))
+      return Number(Number.isNaN(left)) - Number(Number.isNaN(right));
     return left < right ? -1 : left > right ? 1 : 0;
+  }
+  if (
+    (left instanceof Decimal || right instanceof Decimal) &&
+    (typeof left === "bigint" || typeof left === "number" || left instanceof Decimal) &&
+    (typeof right === "bigint" || typeof right === "number" || right instanceof Decimal)
+  )
+    return toDecimal(left).compare(toDecimal(right));
   if (typeof left === "string" && typeof right === "string") {
     // Byte (code point) order, C8.
     const a = Array.from(left);
@@ -533,7 +561,10 @@ function aggregate(fn: string, values: readonly Value[], type: PhysicalType): Va
           type,
         );
       if (type.kind === "decimal")
-        return present.reduce<bigint>((sum, value) => sum + (value as bigint), 0n);
+        return present.reduce<Decimal>(
+          (sum, value) => sum.add(toDecimal(value as bigint | number | Decimal)),
+          Decimal.fromInteger(0n),
+        );
       return present.reduce<number>((sum, value) => sum + (value as number), 0);
     case "avg":
       if (present.length === 0) return null;
@@ -822,9 +853,16 @@ function modifyRows(rel: Extract<Rel, { op: "modify" }>, env: Environment): Row[
   return returned;
 }
 
+/** One key per row of equal values (peers, groups, DISTINCT): NaN = NaN, 1.50 = 1.5. */
 const rowKey = (row: readonly Value[]): string =>
   JSON.stringify(row, (_key, value: unknown) =>
-    typeof value === "bigint" ? `${value.toString()}n` : value,
+    typeof value === "bigint"
+      ? `${value.toString()}n`
+      : value instanceof Decimal
+        ? `${value.key()}d`
+        : typeof value === "number" && !Number.isFinite(value)
+          ? `${String(value)}f`
+          : value,
   );
 
 function keysMatch(
@@ -972,6 +1010,57 @@ function applyRows(rel: Extract<Rel, { op: "apply" }>, env: Environment): Row[] 
   });
 }
 
+/**
+ * PostgreSQL's in_range support functions: whether `value` is <= (`less`) or >= `base` − `offset`
+ * (`sub`) or + `offset`. Integers compare exactly (a sum past the type's range is beyond every
+ * value); float8 computes the bound in floating point, with NaN above every value and the
+ * not-a-number sums of an infinite base and offset taken as containing every value
+ * (in_range_float8_float8); NUMERIC is exact, with its NaN and infinities
+ * (in_range_numeric_numeric). A negative or NaN offset is 22013.
+ */
+function inRange(value: Value, base: Value, offset: Value, sub: boolean, less: boolean): boolean {
+  if (typeof base === "bigint" && typeof value === "bigint") {
+    if (typeof offset !== "bigint")
+      throw new ReferenceUnsupportedError(`an integer RANGE key with a ${typeof offset} offset`);
+    if (offset < 0n) throw new ReferenceSqlError("invalid preceding or following size", "22013");
+    const sum = sub ? base - offset : base + offset;
+    return less ? value <= sum : value >= sum;
+  }
+  if (typeof base === "number" && typeof value === "number") {
+    const size = Number(offset);
+    if (Number.isNaN(size) || size < 0)
+      throw new ReferenceSqlError("invalid preceding or following size", "22013");
+    if (Number.isNaN(value)) return Number.isNaN(base) ? true : !less;
+    if (Number.isNaN(base)) return less;
+    if (size === Infinity && Math.abs(base) === Infinity && (sub ? base > 0 : base < 0))
+      return true;
+    const sum = sub ? base - size : base + size;
+    return less ? value <= sum : value >= sum;
+  }
+  if (base instanceof Decimal && value instanceof Decimal) {
+    if (typeof offset !== "bigint" && typeof offset !== "number" && !(offset instanceof Decimal))
+      throw new ReferenceUnsupportedError(`a numeric RANGE key with a ${typeof offset} offset`);
+    const size = toDecimal(offset);
+    if (size.isNaN || size.sign < 0)
+      throw new ReferenceSqlError("invalid preceding or following size", "22013");
+    if (value.isNaN) return base.isNaN ? true : !less;
+    if (base.isNaN) return less;
+    if (!size.isFinite) {
+      if (sub ? base.special === "+inf" : base.special === "-inf") return true;
+      if (sub) return less ? value.special === "-inf" : true;
+      return less ? true : value.special === "+inf";
+    }
+    if (!value.isFinite) {
+      if (value.special === "+inf") return base.special === "+inf" ? true : !less;
+      return base.special === "-inf" ? true : less;
+    }
+    if (!base.isFinite) return base.special === "-inf" ? !less : less;
+    const order = value.compare(base.add(sub ? size.negate() : size));
+    return less ? order <= 0 : order >= 0;
+  }
+  throw new ReferenceUnsupportedError(`RANGE offsets over ${typeof base} keys`);
+}
+
 function windowRows(rel: Extract<Rel, { op: "window" }>, env: Environment): Row[] {
   const rows = run(rel.input, env);
   const partitions = new Map<string, Row[]>();
@@ -1026,48 +1115,38 @@ function windowRows(rel: Extract<Rel, { op: "window" }>, env: Environment): Row[
         }
         const amount = offset(bound);
         if (amount === null) throw new ReferenceSqlError("frame offset must not be null", "22004");
-        if (Number(amount) < 0)
-          throw new ReferenceSqlError("frame offset must not be negative", "22013");
         const sign = bound.kind === "preceding" ? -1 : 1;
-        if (frame.unit === "rows") return index + sign * Number(amount);
-        if (frame.unit === "groups") {
+        if (frame.unit === "rows" || frame.unit === "groups") {
+          if (Number(amount) < 0)
+            throw new ReferenceSqlError("frame offset must not be negative", "22013");
+          if (frame.unit === "rows") return index + sign * Number(amount);
           const group = (groupOf[index] ?? 0) + sign * Number(amount);
           if (group < 0) return end ? -1 : 0;
           if (group >= groups.length) return end ? n - 1 : n;
           const [first, last] = at(groups, group);
           return end ? last : first;
         }
-        // RANGE with an offset (PostgreSQL's in_range): the target is this row's key moved by
-        // `amount` along the sort direction, exactly (bigint for integer keys). A frame start is
-        // the first row not before the target in sort order, a frame end the last row not after
-        // it; NULL keys sort where NULLS FIRST / LAST puts them, so a range can run into them.
-        // A NULL key's own frame is its NULL peers.
+        // RANGE with an offset, as PostgreSQL's nodeWindowAgg: a frame start is the first row
+        // for which in_range(key, own, amount, sub, less) holds, a frame end the last. `sub` is
+        // PRECEDING, flipped (with `less`) for a descending key. NULL keys sort where NULLS
+        // FIRST / LAST puts them, so a range can run into them; a NULL key's own frame is its
+        // NULL peers.
         const own = sortKey(row);
         if (own === null) return end ? peers[1] : peers[0];
-        const step = descending ? -sign : sign;
-        const target: Value =
-          typeof own === "bigint"
-            ? own + BigInt(step) * BigInt(amount)
-            : Number(own) + step * Number(amount);
-        const relative = (key: Value): number => {
-          if (key === null) return nullsFirst ? -1 : 1;
-          const order =
-            typeof key === "bigint" && typeof target === "bigint"
-              ? key < target
-                ? -1
-                : key > target
-                  ? 1
-                  : 0
-              : Math.sign(Number(key) - Number(target));
-          return descending ? -order : order;
+        const sub = (bound.kind === "preceding") !== descending;
+        const less = end !== descending;
+        const holds = (key: Value): boolean => {
+          // NULLS FIRST: before every key (never past a start, always before an end).
+          if (key === null) return nullsFirst ? end : !end;
+          return inRange(key, own, amount, sub, less);
         };
         if (end) {
           for (let candidate = n - 1; candidate >= 0; candidate -= 1)
-            if (relative(sortKey(at(sorted, candidate))) <= 0) return candidate;
+            if (holds(sortKey(at(sorted, candidate)))) return candidate;
           return -1;
         }
         for (let candidate = 0; candidate < n; candidate += 1)
-          if (relative(sortKey(at(sorted, candidate))) >= 0) return candidate;
+          if (holds(sortKey(at(sorted, candidate)))) return candidate;
         return n;
       };
       const start = Math.max(0, position(frame.start, false));

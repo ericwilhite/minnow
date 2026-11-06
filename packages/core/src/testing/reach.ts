@@ -451,3 +451,33 @@ export const TRANSACTION_ATTRIBUTE_STATES = [
   "deferrable query refusal",
   "deferrable savepoint refusal",
 ] as const;
+
+/**
+ * RANGE offset frames over non-integer keys against PostgreSQL (next/testing/
+ * lowering-pglite-review.test.ts, review B6-p2b-3 finding 1): exact NUMERIC around 2^53 and
+ * with fractions, NUMERIC NaN / ±Infinity peers, float ±Infinity and NaN peers, and temporal
+ * keys with interval offsets (refused, 0A000, until lowering takes them).
+ */
+export const RANGE_KEY_STATES = [
+  "numeric exact",
+  "numeric special",
+  "float infinite",
+  "float NaN",
+  "temporal refused",
+] as const;
+
+/** Frame offset errors against PostgreSQL (review B6-p2b-3 finding 3). */
+export const FRAME_OFFSET_STATES = [
+  "accepted",
+  "null offset",
+  "negative offset",
+  "refused",
+] as const;
+
+/** HAVING names against PostgreSQL (review B6-p2b-3 finding 3). */
+export const HAVING_NAME_STATES = [
+  "accepted",
+  "unknown column",
+  "ungrouped column",
+  "unknown table",
+] as const;

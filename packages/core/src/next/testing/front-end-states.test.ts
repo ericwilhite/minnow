@@ -94,6 +94,34 @@ const CASES: ReadonlyArray<readonly [sql: string, message: string]> = [
     "SELECT count(*) OVER (ORDER BY id, v RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM a",
     "Offset RANGE frames require exactly one ORDER BY expression",
   ],
+  // Review B6-p2b-3 finding 3: an unknown HAVING name, and invalid frame offsets.
+  ["SELECT id FROM a GROUP BY id HAVING nope > 0", 'column "nope" does not exist'],
+  ["SELECT id FROM a GROUP BY id HAVING a.nope > 0", "column a.nope does not exist"],
+  ["SELECT a.id FROM a GROUP BY a.id HAVING z.v > 0", 'missing FROM-clause entry for table "z"'],
+  [
+    "SELECT a.id FROM a JOIN b ON b.id = a.id GROUP BY a.id HAVING id > 0",
+    'column reference "id" is ambiguous',
+  ],
+  [
+    "SELECT count(*) OVER (ORDER BY id ROWS BETWEEN INTERVAL '1 day' PRECEDING AND CURRENT ROW) FROM a",
+    "argument of ROWS must be type bigint, not type interval",
+  ],
+  [
+    "SELECT count(*) OVER (ORDER BY id ROWS BETWEEN -1 PRECEDING AND CURRENT ROW) FROM a",
+    "frame starting offset must not be negative",
+  ],
+  [
+    "SELECT count(*) OVER (ORDER BY id GROUPS BETWEEN CURRENT ROW AND -2 FOLLOWING) FROM a",
+    "frame ending offset must not be negative",
+  ],
+  [
+    "SELECT count(*) OVER (ORDER BY id RANGE BETWEEN NULL PRECEDING AND CURRENT ROW) FROM a",
+    "frame starting offset must not be null",
+  ],
+  [
+    "SELECT count(*) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND NULL FOLLOWING) FROM a",
+    "frame ending offset must not be null",
+  ],
   // Refusals of SQL PostgreSQL runs.
   [
     "SELECT id FROM a GROUP BY id HAVING max(v) > (SELECT max(v) FROM b WHERE b.id = a.id)",
@@ -109,6 +137,10 @@ const CASES: ReadonlyArray<readonly [sql: string, message: string]> = [
     "SET SESSION CHARACTERISTICS AS TRANSACTION is not supported",
   ],
   ["BEGIN ISOLATION LEVEL SERIALIZABLE", "BEGIN ISOLATION LEVEL SERIALIZABLE is not supported"],
+  [
+    "SELECT count(*) OVER (ORDER BY id RANGE BETWEEN '1' PRECEDING AND CURRENT ROW) FROM a",
+    "Window frame offsets other than numeric literals are not supported",
+  ],
 ];
 
 describe("every pattern's code against PostgreSQL", () => {
