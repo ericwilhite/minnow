@@ -288,6 +288,18 @@ describe("HAVING names and frame offsets (review B6-p2b-3 finding 3)", () => {
       "-1e-400",
       "1e400",
       "-0e-400",
+      // Review B6-p2b-6: the signed bigint range, [-2^63, 2^63 - 1], exactly, with the rounding
+      // neighbourhoods on both sides.
+      "9223372036854775807",
+      "9223372036854775807.4",
+      "9223372036854775807.5",
+      "9223372036854775808",
+      "-9223372036854775807",
+      "-9223372036854775808",
+      "-9223372036854775807.5",
+      "-9223372036854775808.4",
+      "-9223372036854775808.5",
+      "-9223372036854775809",
     ];
     const bounds = [
       (o: string) => `BETWEEN ${o} PRECEDING AND CURRENT ROW`,
@@ -296,6 +308,11 @@ describe("HAVING names and frame offsets (review B6-p2b-3 finding 3)", () => {
     ];
     const failures: string[] = [];
     const divergences: string[] = [];
+    /** A negative offset PostgreSQL types numeric: a decimal, or an integer outside int8. */
+    const numericNegative = (offset: string) =>
+      /^- ?\d/u.test(offset) &&
+      offset !== "-0" &&
+      (/[.e]/u.test(offset) || BigInt(offset.replace(/^- ?/u, "")) > 9223372036854775808n);
     const precedence: string[] = [];
     for (const table of ["a", "e", "n"])
       for (const unit of ["ROWS", "RANGE", "GROUPS"])
@@ -313,6 +330,10 @@ describe("HAVING names and frame offsets (review B6-p2b-3 finding 3)", () => {
                 reach.reach("rounded offset accepted");
               if (state === "0A000") reach.reach("numeric offset on an integer key");
               if (state === "22003") reach.reach("bigint out of range");
+              if (state === "accepted" && offset.startsWith("9223372036854775807"))
+                reach.reach("bigint maximum accepted");
+              if (state === "22013" && offset.startsWith("-922337203685477580"))
+                reach.reach("bigint minimum negative");
               if (state === "accepted") reach.reach("accepted");
               else if (state === "22004") reach.reach("null offset");
               else if (state === "22013") reach.reach("negative offset");
@@ -327,7 +348,7 @@ describe("HAVING names and frame offsets (review B6-p2b-3 finding 3)", () => {
             // the type (0A000) first; the parser, which does not know the key, the sign (22013).
             if (
               unit === "RANGE" &&
-              (offset === "-0.4" || offset === "-0.5" || offset === "-1e-400") &&
+              numericNegative(offset) &&
               "error" in expected &&
               expected.error === "0A000" &&
               "error" in actual &&
@@ -353,11 +374,12 @@ describe("HAVING names and frame offsets (review B6-p2b-3 finding 3)", () => {
             );
           }
     expect(failures.join("\n")).toBe("");
-    // Exactly the negative RANGE offsets over the empty table: two spellings, three bounds.
-    expect(divergences.length).toBe(6);
-    // Exactly -0.4, -0.5 and -1e-400 on the integer key (RANGE does not round), three bounds,
-    // both tables.
-    expect(precedence.length).toBe(18);
+    // Exactly the negative integer RANGE offsets over the empty table: -1, - 2,
+    // -9223372036854775807 and -9223372036854775808 (int8 there), three bounds each.
+    expect(divergences.length).toBe(12);
+    // Exactly the negative numeric literals (RANGE does not round) on the integer key: seven
+    // offsets, three bounds, both integer-key tables.
+    expect(precedence.length).toBe(42);
     reach.assertReached();
   });
 });

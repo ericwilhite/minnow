@@ -52,8 +52,11 @@ const RANKING: Readonly<Record<string, string>> = {
   MAX: "max",
 };
 
-function int(value: number, type: PhysicalType): ScalarExpr {
-  const literal = integerLiteral(BigInt(Math.trunc(value)), type);
+function int(value: number | bigint, type: PhysicalType): ScalarExpr {
+  const literal = integerLiteral(
+    typeof value === "bigint" ? value : BigInt(Math.trunc(value)),
+    type,
+  );
   if (literal === null)
     throw new PlanningError(`window offset ${String(value)} is out of range`, "22003");
   return literal;
@@ -127,7 +130,9 @@ function frameOf(
   if (frame === undefined) return null;
   const bound = (input: WindowFrame["start"]): WindowFrameBound => {
     if (input.offset === undefined) return { kind: input.kind, offset: null };
-    if (frame.unit !== "range") return { kind: input.kind, offset: int(input.offset, INT8) };
+    // The exact offset past 2^53 (the front end's `offsetExact`), never its rounded double.
+    const exact = input.offsetExact ?? input.offset;
+    if (frame.unit !== "range") return { kind: input.kind, offset: int(exact, INT8) };
     if (orderType === null)
       throw new PlanningError("RANGE with offset requires exactly one ORDER BY column", "42P20");
     // PostgreSQL's in_range takes an integer key with an integer offset only: a decimal literal
@@ -137,8 +142,22 @@ function frameOf(
         `RANGE with offset PRECEDING/FOLLOWING is not supported for column type ${orderType.kind === "int64" ? "bigint" : orderType.bits === 16 ? "smallint" : "integer"} and offset type numeric`,
         "0A000",
       );
+    // An integer offset over an integer key is that key's type exactly. One outside the key
+    // type's range is refused: the IR's RANGE offset has the key's type, while PostgreSQL's
+    // in_range compares an int4 key with an int8 offset in int8.
+    if (orderType.kind === "int32" || orderType.kind === "int64") {
+      const literal = integerLiteral(typeof exact === "bigint" ? exact : BigInt(exact), orderType);
+      if (literal === null)
+        throw new PlanningError(
+          `RANGE offset ${String(exact)} outside the ORDER BY key's type is not supported`,
+          "0A000",
+        );
+      return { kind: input.kind, offset: literal };
+    }
     const typed: Typed = lowerExpression(
-      { kind: "literal", value: input.offset },
+      input.offsetExact === undefined
+        ? { kind: "literal", value: input.offset }
+        : { kind: "literal", value: input.offset, exactText: String(input.offsetExact) },
       { column: () => undefined },
       builder.state,
     );

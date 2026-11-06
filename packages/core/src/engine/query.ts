@@ -12895,7 +12895,13 @@ class Parser {
       throw new TypeError(
         "Window frame offsets must be non-negative integers, or numeric RANGE offsets",
       );
+    const decimal = /[.eE]/u.test(literal);
     let offset: number;
+    // The exact value when a double cannot hold it (past 2^53), so lowering never round-trips
+    // it through Number().
+    let exact: bigint | undefined;
+    // PostgreSQL types a decimal literal, or an integer outside int8, as numeric.
+    let numeric = decimal;
     if (unit === "range") {
       if (negated && !digits.zero) {
         if (which === "starting") throw new TypeError("frame starting offset must not be negative");
@@ -12906,24 +12912,37 @@ class Parser {
       offset = digits.zero ? 0 : Number(literal);
       if (!digits.zero && (offset === 0 || !Number.isFinite(offset)))
         throw new TypeError("RANGE frame offsets outside double precision are not supported");
+      if (!decimal) {
+        const value = BigInt(literal);
+        if (value > 9007199254740991n) exact = value;
+        if (value > 9223372036854775807n) numeric = true;
+      }
     } else {
       // ROWS and GROUPS take a bigint: PostgreSQL rounds a numeric literal half away from zero
       // (`-0.4` is 0, `-0.5` is -1, `-1e-400` is 0) before checking its sign and its range.
-      const rounded = roundedFrameOffset(digits);
-      if (rounded > 9223372036854775807n) throw new TypeError("bigint out of range");
-      if (negated && rounded !== 0n) {
+      // The range is signed, [-2^63, 2^63 - 1], and comes first: -9223372036854775808 is a
+      // valid bigint, so it reaches the sign check (22013).
+      const magnitude = roundedFrameOffset(digits);
+      const rounded = negated ? -magnitude : magnitude;
+      if (rounded > 9223372036854775807n || rounded < -9223372036854775808n)
+        throw new TypeError("bigint out of range");
+      if (rounded < 0n) {
         if (which === "starting") throw new TypeError("frame starting offset must not be negative");
         throw new TypeError("frame ending offset must not be negative");
       }
       offset = Number(rounded);
+      if (rounded > 9007199254740991n) exact = rounded;
     }
-    const numeric = /[.eE]/u.test(literal) ? { offsetNumeric: true as const } : {};
+    const extra = {
+      ...(numeric ? { offsetNumeric: true as const } : {}),
+      ...(exact === undefined ? {} : { offsetExact: exact }),
+    };
     if (this.#isKeyword("PRECEDING")) {
       this.#keyword("PRECEDING");
-      return { kind: "preceding", offset, ...numeric };
+      return { kind: "preceding", offset, ...extra };
     }
     this.#keyword("FOLLOWING");
-    return { kind: "following", offset, ...numeric };
+    return { kind: "following", offset, ...extra };
   }
 
   #comparison(): ComparisonOperator {

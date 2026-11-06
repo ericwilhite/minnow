@@ -365,6 +365,12 @@ export const unsupportedFeatures: readonly UnsupportedFeatureRecord[] = [
       "PostgreSQL measures a date or timestamp RANGE frame with an interval offset. Minnow takes only numeric literal offsets, so interval offsets are refused.",
   },
   {
+    id: "window.frame-range-offset-double-precision",
+    error: "RANGE frame offsets outside double precision are not supported",
+    notes:
+      "A RANGE offset must fit a double: one past its range (1e400) or nearer zero than it can hold (1e-400) is refused, never rounded to infinity or zero. Over a NUMERIC key PostgreSQL runs both. Over a DOUBLE PRECISION key PostgreSQL 18 raises 22003 (out of range for double precision) for both signs; Minnow raises this refusal for a positive offset and 'frame starting offset must not be negative' (22013) for a negative one.",
+  },
+  {
     id: "window.frame-range-string-offset",
     error: "Window frame offsets other than numeric literals are not supported",
     notes:

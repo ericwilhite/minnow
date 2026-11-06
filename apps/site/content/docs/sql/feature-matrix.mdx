@@ -49,9 +49,10 @@ and `FULL JOIN` beyond their supported sole-join forms, interval and quoted `RAN
 window aggregates, windows in `WHERE`/`GROUP BY`/`HAVING`, and `ON DELETE SET DEFAULT` — each with the
 exact error it raises.
 
-One refusal is stricter than PostgreSQL: a negative `RANGE` frame offset fails before any row is
-read. PostgreSQL raises the same error only when it compares a row, so over no rows it returns
-none.
+Two refusals are stricter than PostgreSQL. A negative `RANGE` frame offset fails before any row is
+read; PostgreSQL raises the same error only when it compares a row, so over no rows it returns
+none. And a `RANGE` offset a double cannot hold (`1e400`, `1e-400`) is refused, though PostgreSQL
+runs it over a `NUMERIC` key.
 
 ## Supported SQL
 

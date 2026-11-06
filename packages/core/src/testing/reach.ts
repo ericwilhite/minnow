@@ -479,6 +479,9 @@ export const FRAME_OFFSET_STATES = [
   "numeric offset on an integer key",
   // Review B6-p2b-5: a ROWS / GROUPS offset past bigint (1e400) is 22003.
   "bigint out of range",
+  // Review B6-p2b-6: the signed bigint range exactly: 2^63 - 1 runs, -2^63 is negative (22013).
+  "bigint maximum accepted",
+  "bigint minimum negative",
 ] as const;
 
 /** HAVING names against PostgreSQL (review B6-p2b-3 finding 3). */
