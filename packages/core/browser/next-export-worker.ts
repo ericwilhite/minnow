@@ -1,10 +1,12 @@
 /**
- * Gate A's streaming export on real OPFS (browser-tests/next-export-bench.spec.ts): the wide
- * table (200 columns, scripts/browser-perf/page/wide-vectors.ts) written through the rebuild
- * core's OPFS backend and extent space in this dedicated worker, then read back as one
- * sequential decode stream (scripts/browser-perf/page/export-stream.ts) through the space's page
- * cache under a memory governor, as an export would.
+ * Worker for the OPFS export bench: build the wide table, then run either the one-pass page
+ * stream or the real TableScan and owner-format transport. Scan frame assembly uses the
+ * labelled bench stand-in in scripts/browser-perf/page/scan-export.ts, not a production sink.
  */
+import {
+  scanExport,
+  type ScanExportStats,
+} from "../../../scripts/browser-perf/page/scan-export.js";
 import { BlobCache } from "../src/next/format/blob-cache.js";
 import { Governor, type EvictableCache } from "../src/next/memory/governor.js";
 import type { ChunkDirectory } from "../src/next/page/directory.js";
@@ -59,11 +61,14 @@ export type ExportRequest =
       readonly baselineStream?: boolean;
       readonly readMiB?: 4 | 8;
       readonly groupDepth?: 1 | 2;
+      readonly mode?: "pages" | "scan";
+      readonly resultPort?: MessagePort;
     }
   | { readonly op: "remove"; readonly dir: string };
 
 export interface BuildResult {
   readonly groups: ExportGroup[];
+  readonly generatedGroups: number;
   readonly dataBytes: number;
   readonly ms: number;
 }
@@ -89,6 +94,9 @@ export interface ExportPass {
   readonly phases?: ExportPhases;
   readonly baselineCommit?: string;
   readonly readMiB: number;
+  readonly mode: "pages" | "scan";
+  readonly scanStats?: ScanExportStats;
+  readonly afterWorkerClose?: { governorMiB: number; poolMiB: number; residentMiB: number };
 }
 
 const scope = self as unknown as {
@@ -212,7 +220,7 @@ async function build(dir: string, rows: number, distinct: number): Promise<Build
   const dataBytes = space.stats.dataBytes;
   await space.close();
   await lease.release();
-  return { groups, dataBytes, ms: performance.now() - started };
+  return { groups, generatedGroups: generated.length, dataBytes, ms: performance.now() - started };
 }
 
 async function runExport(request: Extract<ExportRequest, { op: "export" }>): Promise<ExportPass[]> {
@@ -220,6 +228,11 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
     throw new Error("Read candidate compiler is not enabled");
   if (request.profilePhases && request.passes !== 1)
     throw new Error("Phase profiling expects one pass");
+  if (
+    request.mode === "scan" &&
+    (!request.resultPort || request.profilePhases || request.passes !== 1)
+  )
+    throw new Error("Scan bench needs a result port and its own timings");
   let stream = exportStream;
   let baselineCommit: string | undefined;
   if (request.baselineStream !== undefined) {
@@ -252,6 +265,10 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
     governor.registerCache(evictable),
   );
   const grant = await governor.admit({ label: "export", minimumBytes: 32 * MiB, spillable: true });
+  const resultGrant =
+    request.mode === "scan"
+      ? await governor.admit({ label: "bench results", minimumBytes: 4 * MiB, spillable: true })
+      : null;
   const first = request.groups[0];
   if (first === undefined) throw new Error("no groups");
   const working =
@@ -268,27 +285,34 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
   for (let pass = 0; pass < request.passes; pass++) {
     const readsBefore = space.stats.cache.platformReads;
     if (phases) phases.active = true;
-    const result = await stream(space, request.groups, {
-      budget: grant,
-      directories,
-      once: request.once,
-      readahead: request.readaheadKiB * 1024,
-      windowBytes: (request.windowMiB ?? 0) * MiB,
-      ...(phases ? { phases } : {}),
-      ...(request.groupDepth === undefined ? {} : { groupDepth: request.groupDepth }),
-      ...(phases
-        ? {
-            sample: (rows: number) =>
-              phases.memory.push({
-                rows,
-                pool: space.stats.cache.poolBytes,
-                resident: space.stats.cache.residentBytes,
-                pinned: space.stats.cache.pinnedBytes,
-                governor: governor.usedBytes,
-              }),
-          }
-        : {}),
-    });
+    const result =
+      request.mode === "scan" && request.resultPort && resultGrant
+        ? await scanExport(space, request.groups, {
+            budget: grant,
+            resultBudget: resultGrant,
+            port: request.resultPort,
+          })
+        : await stream(space, request.groups, {
+            budget: grant,
+            directories,
+            once: request.once,
+            readahead: request.readaheadKiB * 1024,
+            windowBytes: (request.windowMiB ?? 0) * MiB,
+            ...(phases ? { phases } : {}),
+            ...(request.groupDepth === undefined ? {} : { groupDepth: request.groupDepth }),
+            ...(phases
+              ? {
+                  sample: (rows: number) =>
+                    phases.memory.push({
+                      rows,
+                      pool: space.stats.cache.poolBytes,
+                      resident: space.stats.cache.residentBytes,
+                      pinned: space.stats.cache.pinnedBytes,
+                      governor: governor.usedBytes,
+                    }),
+                }
+              : {}),
+          });
     if (phases) {
       phases.active = false;
       const expected = request.groups.reduce(
@@ -303,6 +327,7 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
     passes.push({
       ...(phases ? { phases: { ...phases } } : {}),
       ...(baselineCommit ? { baselineCommit } : {}),
+      mode: request.mode ?? "pages",
       readMiB: MAX_READ_BYTES / MiB,
       verifying: VERIFY_CACHED_BYTES,
       ...result,
@@ -333,8 +358,23 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
       },
     };
   }
+  resultGrant?.close();
   grant.close();
+  directories.clear();
   await space.close();
+  const afterWorkerClose = {
+    governorMiB: governor.usedBytes / MiB,
+    poolMiB: space.stats.cache.poolBytes / MiB,
+    residentMiB: space.stats.cache.residentBytes / MiB,
+  };
+  if (
+    afterWorkerClose.governorMiB !== 0 ||
+    afterWorkerClose.poolMiB !== 0 ||
+    afterWorkerClose.residentMiB !== 0
+  )
+    throw new Error("Bench memory charge survived worker close");
+  const final = passes.at(-1);
+  if (final) passes[passes.length - 1] = { ...final, afterWorkerClose };
   await lease.release();
   return passes;
 }

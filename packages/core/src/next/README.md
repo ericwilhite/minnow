@@ -457,7 +457,7 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
   more entries than the rows it codes: the writer keeps a page dictionary-encoded only while its
   codes and new entries cost no more than the plain page, so a group of mostly distinct values is
   stored plain, and a map never costs more than the rows it replaces.
-- Full export (`SELECT *` over the whole table, Gate A): a sequential decode stream reads with
+- The page-stream half of a full export (the page benchmark, not the real table scan) reads with
   `ChunkReadOptions.once` (storage `ReadOptions.once`, `PeekOptions.once`): nothing it misses is
   admitted to the page cache, nothing it hits is promoted or reordered (synchronous peeks and
   pins included: an entry only one-pass leases pin keeps its place and last use), a
@@ -527,7 +527,7 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
   - The nightly browser-performance workflow runs the export bench (`npm run benchmark:export`,
     1M × 200, five cold and five warm rounds per configuration) and records rows/s, the worker's CPU seconds and rows per CPU-second, RSS, worker
     heap and pool residency per pass in `export-bench.json`; nothing judges it yet. Locally, the
-    export is judged per CPU-second: this host gives the worker about half a core.
+    export is compared per CPU-second too; host scheduling and memory reclaim can dominate wall time.
 - Reproduce increment 10 comparisons with `scripts/gather-bench.mts` (finite float64 gathers,
   all-word / Number-only / production NaN-only copies) and `scripts/export-compare.mts --dir
 ~/.cache/minnow-export` (the whole file-backed page export against p2i on identical stored data).
@@ -578,6 +578,29 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     `scripts/readahead-bench.mts` runs the actual page-export loop and PageCache over a wide
     fixture outside IO, checks row/charge totals, and reports five CPU/wall rounds. Its memory
     peak is only the cache handle; the OPFS comparison reports the full governor and RSS.
+- Scan/transport mode: `MINNOW_EXPORT_SCAN_COMPARE=1 npm run benchmark:export` runs five
+  interleaved cold/warm attempts of the page stream and B4's real `TableScan`/pipeline driver.
+  `MINNOW_EXPORT_SCAN_COLD_ONLY=1` keeps five cold attempts of each mode; the nightly workflow
+  records these separately as `export-scan-bench.json`, without a threshold. The governor cap
+  is 512 MiB for both modes and is reported; its counter is not an RSS bound.
+  - `scripts/browser-perf/page/owner-frames.ts` is a **bench adapter standing in for the
+    executor's future frame assembly**. It stays out of `exec/` and production imports. It owns
+    each compact scan batch as the current `FramePayload`, prepays exact frame/registry bytes,
+    uses identity dictionaries up to the stream cap, then flattens text dictionaries. It does
+    not implement selected vectors or capped non-text dictionaries (outside this fixture).
+  - The real `ResultChannel`, `frameByteLength` and owner transfer policy are reused. Frames
+    go over a real `MessagePort`; the client checks sequence/dictionary/row/byte totals and
+    returns cumulative credits at half the window or the owner's release delay. The timed
+    export ends after all credits return. The client consumes typed frames, not JS row objects.
+  - Table/group descriptors come from the fixture, replacing SQL lowering and B3 catalog/root
+    loading. The scan uses its normal cached chunk reads and byte-bounded batches; it does not
+    inherit the page benchmark's `once`, cross-column window or pooled read policy. Reported
+    scan assembly/post/credit and inclusive `next()` timers can overlap; they are not exclusive
+    phase shares. Raw scan statistics reveal dense/gather batches, splits and storage calls.
+  - Sparse CDP profiles (one-second sample interval) bracket setup-excluded worker CPU, not
+    hotspots. Profile-count checks refuse missing brackets. CPU tick/notification latency
+    remains. Both modes verify zero governor/cache/pool charge after worker close. A final
+    client GC/RSS probe is after the campaign and never changes a recorded peak.
 - The checksum-load CPU hypothesis from the export profile is reproducible with
   `npx vite-node scripts/hash-load-bench.mts`: five rotating rounds in fresh processes, CPU and
   wall medians/min/max, aligned and unaligned inputs, byte offsets, stripe tails, and consumed
