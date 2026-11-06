@@ -741,7 +741,11 @@ and the owner import it directly.
 
 ### Hash join (`exec/join.ts`, `join-keys.ts`, `join-table.ts`, `join-filter.ts`) and shared heavy-operator files (`column-store.ts`, `spill-pages.ts`)
 
-- Every kind: inner, left, right, full, semi, anti and mark. Equality is SQL's: `=` never
+- Every kind: inner, left, right, full, semi, anti and mark. A join may also have no keys,
+  only a residual (ruling R24.2: PostgreSQL refuses such a FULL JOIN, 0A000, for an
+  implementation reason; the result is the LEFT JOIN plus the unmatched build rows): it runs
+  over one constant key, so every pair is a candidate and memory stays bounded by chunk mode.
+  Equality is SQL's: `=` never
   matches NULL, `nullSafe` keys use IS NOT DISTINCT FROM, floats treat −0 = 0 and NaN = NaN,
   NUMERIC and INTERVAL compare normalized. A residual ON condition is a vector predicate over
   the pairs; FALSE and NULL both reject.

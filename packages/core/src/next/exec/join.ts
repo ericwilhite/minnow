@@ -19,6 +19,9 @@
  * - mark: probe columns ++ one bool: `probe.T IN (build.T where build.C = probe.C)` with SQL's
  *   three-valued result (below). Lowering emits `NOT mark` for NOT IN.
  *
+ * - No keys (ruling R24.2): every kind but mark may have empty `probeKeys` / `buildKeys`, the
+ *   ON condition being the residual alone; such a join runs over one constant key (`Keyless`).
+ *
  * ## Semantics (law: PostgreSQL; join.pglite.test.ts compares every kind against it)
  * - A pair matches when every key is equal (`=`: NULL never matches; `nullSafe`: IS NOT
  *   DISTINCT FROM) and the residual is TRUE. FALSE and NULL residuals are both non-matches.
@@ -283,7 +286,12 @@ const SCRATCH_BYTES =
   BATCH_ROWS * (4 + 4 + 2 + 4 + 1 + 1 + 1 + 4 + 2 * 3) + 4 * (FANOUT + 1) + BATCH_ROWS;
 
 /** The bytes a join needs admitted before it runs (fixed buffers; state grows or spills). */
-export function hashJoinMinimumBytes(spec: HashJoinSpec): number {
+export function hashJoinMinimumBytes(declared: HashJoinSpec): number {
+  // A keyless join's is its keyed form's (its constant key columns).
+  const spec =
+    declared.probeKeys.length === 0 && declared.kind !== "mark"
+      ? new Keyless(declared).spec
+      : declared;
   const keyTypes = spec.probeKeys
     .map((c) => spec.probeTypes[c])
     .filter((type): type is PhysicalType => type !== undefined);
@@ -1826,6 +1834,118 @@ function* sameKeyJob(
   );
 }
 
+const KEY_TYPE: PhysicalType = { kind: "int32", bits: 32 };
+const KEY_VALUE: FlatVector = {
+  form: "flat",
+  type: KEY_TYPE,
+  length: 1,
+  validity: null,
+  data: { layout: "i32", values: new Int32Array(1) },
+};
+
+/**
+ * A join with no equality keys, only a residual (ruling R24.2: PostgreSQL refuses a FULL JOIN
+ * without a hash- or merge-joinable condition for an implementation reason; the new core keeps
+ * the well-defined result). It runs as the keyed join over one constant key: every build row
+ * is a candidate for every probe row and the residual decides, so outer rows, matched bits,
+ * spilling (one partition that does not split: chunk mode) and slicing are the keyed join's.
+ * Both inputs get a constant int column appended; the residual sees the declared columns, and
+ * the output drops the constant ones.
+ */
+class Keyless {
+  readonly spec: HashJoinSpec;
+  readonly #probeWidth: number;
+  readonly #buildWidth: number;
+
+  constructor(declared: HashJoinSpec) {
+    if (declared.kind === "mark") throw new TypeError("A mark join tests at least one key");
+    if (declared.publishes.length > 0)
+      throw new TypeError("A join without keys publishes no runtime filters");
+    const p = declared.probeTypes.length;
+    const b = declared.buildTypes.length;
+    this.#probeWidth = p;
+    this.#buildWidth = b;
+    const residual = declared.residual;
+    const unknown =
+      residual?.unknown === undefined
+        ? undefined
+        : (batch: Batch, out: Selection) => residual.unknown?.(batch, out) ?? out;
+    this.spec = {
+      ...declared,
+      probeTypes: [...declared.probeTypes, KEY_TYPE],
+      buildTypes: [...declared.buildTypes, KEY_TYPE],
+      probeKeys: [p],
+      buildKeys: [b],
+      nullSafe: [false],
+      residual:
+        residual === null
+          ? null
+          : {
+              filter: (batch, out) => residual.filter(this.#pairs(batch), out),
+              ...(unknown === undefined
+                ? {}
+                : {
+                    unknown: (batch: Batch, out: Selection) => unknown(this.#pairs(batch), out),
+                  }),
+            },
+    };
+  }
+
+  /** A pair batch (probe ++ build, each with its key) as the declared columns. */
+  #pairs(batch: Batch): Batch {
+    const p = this.#probeWidth;
+    const columns = batch.columns;
+    return {
+      ...batch,
+      columns: [...columns.slice(0, p), ...columns.slice(p + 1, p + 1 + this.#buildWidth)],
+    };
+  }
+
+  /** An input operator that appends the constant key to each batch. */
+  input(operator: Operator): Operator {
+    return {
+      push: (batch, transfer) =>
+        operator.push(
+          {
+            ...batch,
+            columns: [
+              ...batch.columns,
+              { form: "constant", type: KEY_TYPE, length: batch.length, value: KEY_VALUE },
+            ],
+          },
+          transfer,
+        ),
+      ready: () => operator.ready(),
+      finish: () => operator.finish(),
+      abort: (reason) => {
+        operator.abort(reason);
+      },
+    };
+  }
+
+  /** The downstream, seeing the declared output: the constant key columns dropped. */
+  output(downstream: Operator): Operator {
+    const p = this.#probeWidth;
+    const b = this.#buildWidth;
+    return {
+      push: (batch, transfer) => {
+        const columns = batch.columns;
+        // probe ++ key (++ build ++ key): semi and anti emit probe columns only.
+        const kept =
+          columns.length > p + 1
+            ? [...columns.slice(0, p), ...columns.slice(p + 1, p + 1 + b)]
+            : columns.slice(0, p);
+        return downstream.push({ ...batch, columns: kept }, transfer);
+      },
+      ready: () => downstream.ready(),
+      finish: () => downstream.finish(),
+      abort: (reason) => {
+        downstream.abort(reason);
+      },
+    };
+  }
+}
+
 /**
  * A hash join (see the module comment). `build` is the build pipeline's sink; `probe(down)` is
  * the probe pipeline's operator. The join owns its grant: closed when the probe finishes, or
@@ -1845,12 +1965,19 @@ export class HashJoin {
   #pending: Promise<void> | null = null;
   #closed = false;
 
+  /** A join without keys (ruling R24.2): its inputs carry one constant key column each. */
+  readonly #keyless: Keyless | null;
+
   constructor(spec: HashJoinSpec, context: HashJoinContext) {
-    this.spec = spec;
-    this.#shared = new Shared(spec, context);
+    const keyless = spec.probeKeys.length === 0 && spec.buildKeys.length === 0;
+    this.#keyless = keyless ? new Keyless(spec) : null;
+    // A keyless join runs as the keyed join over its constant key (`spec` is that form).
+    this.spec = this.#keyless?.spec ?? spec;
+    this.#shared = new Shared(this.spec, context);
     this.#prober = new Prober(this.#shared);
     this.#level = new Level(this.#shared, 0, true);
-    this.build = new BuildSink(this);
+    const build = new BuildSink(this);
+    this.build = this.#keyless?.input(build) ?? build;
   }
 
   get profile(): HashJoinProfile {
@@ -1864,8 +1991,10 @@ export class HashJoin {
 
   /** The probe pipeline's operator, emitting into `downstream`. */
   probe(downstream: Operator): Operator {
-    this.#shared.downstream = downstream;
-    return new ProbeOperator(this);
+    const keyless = this.#keyless;
+    this.#shared.downstream = keyless?.output(downstream) ?? downstream;
+    const probe = new ProbeOperator(this);
+    return keyless?.input(probe) ?? probe;
   }
 
   #fail(error: unknown): never {
