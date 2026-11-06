@@ -8,21 +8,21 @@
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import { describe, expect, it } from "vitest";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
-import { ScratchSpillService } from "../spill/scratch-spill.js";
-import { OwnershipLostError, type DataRange } from "./contract.js";
-import { CHARGE_STEP, ByteStore, IntervalIndex, type Interval } from "./idb-bytes.js";
-import { openIndexedDb, type IdbDatabaseLike } from "./idb-like.js";
-import { LOG_COALESCE_BYTES, createIndexedDbBackend } from "./indexeddb.js";
-import { SimDisk, SimLocks } from "./sim-disk.js";
-import { simIndexedDb } from "./sim-idb.js";
-import { openExtentSpace } from "./space.js";
+import { ScratchSpillService } from "./scratch-spill.js";
+import { OwnershipLostError, type DataRange } from "../storage/contract.js";
+import { CHARGE_STEP, ByteStore, IntervalIndex, type Interval } from "../storage/idb-bytes.js";
+import { openIndexedDb, type IdbDatabaseLike } from "../storage/idb-like.js";
+import { LOG_COALESCE_BYTES, createIndexedDbBackend } from "../storage/indexeddb.js";
+import { SimDisk, SimLocks } from "../storage/sim-disk.js";
+import { simIndexedDb } from "../storage/sim-idb.js";
+import { openExtentSpace } from "../storage/space.js";
 import {
   bytesOf,
   countingBudget,
   countingMemory,
   jsonReachable,
   rootOf,
-} from "./space-test-support.js";
+} from "../storage/space-test-support.js";
 
 (globalThis as { IDBKeyRange?: unknown }).IDBKeyRange ??= IDBKeyRange;
 

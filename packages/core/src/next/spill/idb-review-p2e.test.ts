@@ -6,13 +6,13 @@
  */
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import { describe, expect, it } from "vitest";
-import { ScratchSpillService } from "../spill/scratch-spill.js";
-import { ByteStore, inOrder } from "./idb-bytes.js";
-import { openIndexedDb, type IdbDatabaseLike } from "./idb-like.js";
-import { LOG_COALESCE_BYTES, RELEASE_CHUNK, createIndexedDbBackend } from "./indexeddb.js";
-import { SimDisk, SimLocks } from "./sim-disk.js";
-import { simIndexedDb } from "./sim-idb.js";
-import { openExtentSpace } from "./space.js";
+import { ScratchSpillService } from "./scratch-spill.js";
+import { ByteStore, inOrder } from "../storage/idb-bytes.js";
+import { openIndexedDb, type IdbDatabaseLike } from "../storage/idb-like.js";
+import { LOG_COALESCE_BYTES, RELEASE_CHUNK, createIndexedDbBackend } from "../storage/indexeddb.js";
+import { SimDisk, SimLocks } from "../storage/sim-disk.js";
+import { simIndexedDb } from "../storage/sim-idb.js";
+import { openExtentSpace } from "../storage/space.js";
 import {
   bytesOf,
   countingBudget,
@@ -20,7 +20,7 @@ import {
   expectBytes,
   jsonReachable,
   rootOf,
-} from "./space-test-support.js";
+} from "../storage/space-test-support.js";
 
 (globalThis as { IDBKeyRange?: unknown }).IDBKeyRange ??= IDBKeyRange;
 
