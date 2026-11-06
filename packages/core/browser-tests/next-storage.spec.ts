@@ -5,9 +5,16 @@
  * scratch file, and (opt-in, MINNOW_NEXT_STORAGE_BENCH=1) the page format's builder pattern.
  * The same scenarios run on the IndexedDB backend, on the persistent profile and where OPFS is
  * absent (Firefox private browsing, a WebKit ephemeral session as in Safari private browsing).
+ * The kill campaign (Gate A, next-storage-chaos.ts) kills a worker running a random storage
+ * workload at seeded moments and checks every reopen against what was acknowledged
+ * (MINNOW_NEXT_STORAGE_KILLS=1000 for the nightly count).
  */
 import { chromium, expect, firefox, webkit, type Page } from "@playwright/test";
 import { EXPECTED_IDB_OUTCOMES } from "../src/next/storage/idb-scenarios.js";
+import { createReach, STORAGE_KILL_REACH } from "../src/testing/reach.js";
+import { mulberry32, seedsFor } from "../src/testing/seeds.js";
+import type { ChaosExpect, ChaosStep } from "../browser/next-storage-chaos.js";
+import type { KillPlan } from "../browser/next-storage-run.js";
 import { requireWorkerOpfs, test } from "./fixtures.js";
 
 type Run = typeof import("../browser/next-storage-run.js");
@@ -389,4 +396,134 @@ test.describe("rebuild core storage microbench (recorded nightly)", () => {
     // One tagged line: the nightly workflow extracts it into the lane's results.
     console.log(`STORAGE_MICROBENCH ${JSON.stringify(result)}`);
   });
+});
+
+/** The steps a kill aims at (a reset is rare in the workload, so it is aimed at rarely). */
+const KILL_TARGETS: readonly ChaosStep[] = [
+  "write",
+  "publish",
+  "reclaim",
+  "log-append",
+  "log-flush",
+  "truncate",
+  "spill",
+  "write",
+  "publish",
+  "reclaim",
+  "log-flush",
+  "truncate",
+  "spill",
+  "reset",
+];
+
+test.describe("rebuild core storage kill campaign (Gate A)", () => {
+  const nightly = Number(process.env.MINNOW_NEXT_STORAGE_KILLS ?? "0");
+  const kills = nightly > 0 ? nightly : 50;
+  for (const kind of ["opfs", "indexeddb"] as const)
+    for (const seed of seedsFor(`next-storage-kills-${kind}`, [kind === "opfs" ? 0x6b1a : 0x1db6]))
+      test(`${kind}: the store opens after every kill, exactly as acknowledged (seed ${String(seed)})`, async ({
+        page: first,
+        context,
+        browserName,
+      }, info) => {
+        test.skip(
+          nightly > 0 && browserName !== "chromium",
+          "the nightly campaign runs in Chromium",
+        );
+        test.setTimeout(Math.max(600_000, kills * 5_000));
+        let page: Page = first;
+        await page.goto("/packages/core/browser/");
+        if (kind === "opfs") await requireWorkerOpfs(page);
+        const random = mulberry32(seed);
+        const dir = `kills-${kind}-${String(seed)}-${Date.now().toString(36)}`;
+        const reach = createReach(`storage kills ${kind} ${browserName}`, STORAGE_KILL_REACH, {
+          minimum: Math.max(1, Math.floor(kills / 50)),
+        });
+        const table = new Map<string, number>();
+        const count = (key: string) => table.set(key, (table.get(key) ?? 0) + 1);
+        const begin = (expected: ChaosExpect | null, iteration: number) =>
+          page.evaluate(
+            async ([url, store, directory, workerSeed, expectation]) =>
+              ((await import(url)) as Run).chaosBegin(store, directory, workerSeed, expectation),
+            [RUN, kind, dir, (seed + iteration * 0x9e3779b9) >>> 0, expected] as const,
+          );
+        const started = Date.now();
+        let expected: ChaosExpect | null = null;
+        let pageKills = 0;
+        let workerStartRetries = 0;
+        let verifiedLogBytes = 0;
+        let previous = "none";
+        for (let iteration = 0; iteration <= kills; iteration++) {
+          let recovery;
+          try {
+            recovery = await begin(expected, iteration);
+          } catch (error) {
+            throw new Error(
+              `${kind}/${browserName}: recovery after kill ${String(iteration)} failed (replay: MINNOW_SEED=${String(seed)}; ${previous}): ${String(error)}`,
+              { cause: error },
+            );
+          }
+          verifiedLogBytes += recovery.verifiedLogBytes;
+          if (iteration === kills) break;
+          const target = KILL_TARGETS[Math.floor(random() * KILL_TARGETS.length)] ?? "write";
+          const plan: KillPlan = {
+            target,
+            occurrence: 1 + Math.floor(random() * 3),
+            delayMs: random() < 0.4 ? 0 : Math.floor(random() * 8),
+            mode: random() < 0.1 ? "page" : "terminate",
+          };
+          const landing = await page.evaluate(
+            async ([url, killPlan]) => ((await import(url)) as Run).chaosKill(killPlan),
+            [RUN, plan] as const,
+          );
+          expected = landing.expect;
+          previous = `kill ${String(iteration)}: ${JSON.stringify(plan)} landed ${landing.landed}, expecting ${JSON.stringify(landing.expect)}`;
+          if (plan.mode === "page") {
+            workerStartRetries += await page.evaluate(
+              async (url) => ((await import(url)) as Run).chaosStartRetries(),
+              RUN,
+            );
+            // A page close (CDP's Page.crash takes the whole persistent context down under the
+            // headless shell Playwright launches, so it is not used).
+            pageKills += 1;
+            await page.close({ runBeforeUnload: false });
+            count(`${landing.landed} (page close)`);
+            page = await context.newPage();
+            await page.goto("/packages/core/browser/");
+          } else {
+            reach.recordHistory([landing.landed]);
+            count(landing.landed);
+          }
+        }
+        await page.evaluate(
+          async ([url, store, directory]) =>
+            ((await import(url)) as Run).chaosEnd(store, directory),
+          [RUN, kind, dir] as const,
+        );
+        // Workers that failed to load their module (counted per page; none ran storage code).
+        workerStartRetries += await page.evaluate(
+          async (url) => ((await import(url)) as Run).chaosStartRetries(),
+          RUN,
+        );
+        const report = {
+          browser: browserName,
+          version: page.context().browser()?.version() ?? null,
+          store: kind,
+          seed,
+          kills,
+          pageKills,
+          workerStartRetries,
+          corruptions: 0,
+          verifiedLogBytes,
+          seconds: Math.round((Date.now() - started) / 1000),
+          landed: Object.fromEntries([...table].sort(([a], [b]) => a.localeCompare(b))),
+          reach: Object.fromEntries(reach.counts()),
+        };
+        await info.attach(`storage-kills-${kind}`, {
+          body: JSON.stringify(report, null, 2),
+          contentType: "application/json",
+        });
+        console.log(`STORAGE_KILLS ${JSON.stringify(report)}`);
+        reach.assertReached();
+      });
 });

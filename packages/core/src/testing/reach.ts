@@ -126,3 +126,16 @@ export const DOUBLE_AGGREGATE_STATES = [
   "window",
   "unknown inputs",
 ] as const;
+
+/**
+ * The storage kill campaign (browser-tests/next-storage.spec.ts, Gate A): kills must land inside
+ * each kind of step, or recovery is never checked there.
+ */
+export const STORAGE_KILL_REACH = [
+  "mid-write",
+  "mid-publish",
+  "mid-reclaim",
+  "mid-log-flush",
+  "mid-truncate",
+  "mid-spill",
+] as const;

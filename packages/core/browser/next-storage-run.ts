@@ -4,6 +4,14 @@
  */
 import { column, schema, table } from "@minnowdb/core";
 import { MinnowDatabaseClient } from "@minnowdb/core/client";
+import type {
+  ChaosExpect,
+  ChaosIntent,
+  ChaosMessage,
+  ChaosRecovery,
+  ChaosState,
+  ChaosStep,
+} from "./next-storage-chaos.js";
 import type { NextStorageRequest, PublishPhase, StoreKind } from "./next-storage-worker.js";
 
 /** The backend every following scenario runs on (OPFS unless a test picks IndexedDB). */
@@ -27,6 +35,9 @@ interface StorageWorker {
    * failure when it does not within `ms` (a stalled or failed publisher fails the test).
    */
   until(ready: () => boolean, what: string, ms?: number): Promise<void>;
+  /** Receives every chaos message (next-storage-chaos.ts). */
+  onChaos(listener: (message: ChaosMessage) => void): void;
+  post(message: unknown): void;
   terminate(): void;
 }
 
@@ -43,6 +54,7 @@ async function spawn(): Promise<StorageWorker> {
   let terminated = false;
   /** Waiters checked on every progress message, so no phase can slip by between polls. */
   const watchers = new Set<() => void>();
+  let chaosListener: ((message: ChaosMessage) => void) | null = null;
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => {
       reject(new Error("storage worker did not start"));
@@ -51,6 +63,10 @@ async function spawn(): Promise<StorageWorker> {
       if (event.data === "next-storage-ready") {
         clearTimeout(timer);
         resolve();
+        return;
+      }
+      if (typeof event.data === "object" && event.data !== null && "chaos" in event.data) {
+        chaosListener?.(event.data as ChaosMessage);
         return;
       }
       const data = event.data as {
@@ -75,7 +91,12 @@ async function spawn(): Promise<StorageWorker> {
     });
     worker.addEventListener("error", (event) => {
       clearTimeout(timer);
-      failure ??= new Error(`storage worker error: ${event.message}`);
+      // A plain Event (no message) is a module that failed to load or evaluate.
+      failure ??= new Error(
+        typeof event.message === "string"
+          ? `storage worker error: ${event.message} (${event.filename}:${String(event.lineno)})`
+          : "storage worker failed to load or evaluate its module (an error event without a message)",
+      );
       reject(failure);
     });
   });
@@ -131,6 +152,12 @@ async function spawn(): Promise<StorageWorker> {
         watchers.add(check);
         check();
       });
+    },
+    onChaos(listener) {
+      chaosListener = listener;
+    },
+    post(message) {
+      worker.postMessage(message);
     },
     terminate() {
       terminated = true;
@@ -400,4 +427,168 @@ export async function runMicrobench(): Promise<Record<string, Record<string, num
     }
   }
   return out;
+}
+
+// ── The storage kill campaign (Gate A; next-storage-chaos.ts) ────────────────────────────────
+
+/** How a kill lands: terminate the worker after `delayMs`, or hand back for a page close/crash. */
+export interface KillPlan {
+  /** The step whose `occurrence`-th intent (after this kill is armed) starts the countdown. */
+  readonly target: ChaosStep;
+  readonly occurrence: number;
+  readonly delayMs: number;
+  readonly mode: "terminate" | "page";
+}
+
+/** Workers that failed before reporting ready (module load), retried by `chaosBegin`. */
+let startRetries = 0;
+
+/** How many chaos workers failed to start and were started again (none ran storage code). */
+export function chaosStartRetries(): number {
+  return startRetries;
+}
+
+/**
+ * A worker that failed before it reported ready ran no storage code: it is started again, up to
+ * twice, and counted (`chaosStartRetries`). Any later failure is the test's.
+ */
+async function spawnForChaos(): Promise<StorageWorker> {
+  for (let attempt = 0; ; attempt++)
+    try {
+      return await spawn();
+    } catch (error) {
+      if (attempt >= 2) throw error;
+      startRetries += 1;
+    }
+}
+
+export interface KillLanding {
+  /**
+   * Where the worker was when it was killed, as the page saw it: `mid-<step>` (that step had its
+   * go and had not reported done) or `between` (no step in flight). For a page kill, the step
+   * that was in flight when the page stopped answering (it lands there or just after).
+   */
+  readonly landed: string;
+  /** What the next worker is told. */
+  readonly expect: ChaosExpect;
+}
+
+interface ChaosRun {
+  readonly worker: StorageWorker;
+  state: ChaosState | null;
+  inFlight: ChaosIntent | null;
+  /** Answers no more intents (a page kill was handed back). */
+  hold: boolean;
+  failure: Error | null;
+  recovered: ChaosRecovery | null;
+  armed: { target: ChaosStep; remaining: number; fire: (intent: ChaosIntent) => void } | null;
+}
+
+let chaos: ChaosRun | null = null;
+
+/**
+ * Starts a worker on store `dir` that recovers against `expect` and then runs the seeded workload;
+ * resolves with what recovery found once it is verified. A corruption rejects with its message.
+ */
+export async function chaosBegin(
+  kind: StoreKind,
+  dir: string,
+  seed: number,
+  expect: ChaosExpect | null,
+): Promise<ChaosRecovery> {
+  useStore(kind);
+  const worker = await spawnForChaos();
+  const run: ChaosRun = {
+    worker,
+    state: expect?.state ?? null,
+    inFlight: null,
+    hold: false,
+    failure: null,
+    recovered: null,
+    armed: null,
+  };
+  chaos = run;
+  worker.onChaos((message) => {
+    if (message.chaos === "recovered") {
+      run.recovered = message.recovery;
+      run.state = message.recovery.state;
+    } else if (message.chaos === "ack") run.state = message.state;
+    else if (message.chaos === "done") {
+      if (run.inFlight?.sequence === message.sequence) run.inFlight = null;
+    } else {
+      if (run.hold) return; // the worker waits here until it is killed
+      run.inFlight = message.intent;
+      const armed = run.armed;
+      if (armed !== null && armed.target === message.intent.step) {
+        armed.remaining -= 1;
+        if (armed.remaining === 0) {
+          run.armed = null;
+          armed.fire(message.intent);
+          return;
+        }
+      }
+      worker.post({ go: message.intent.sequence });
+    }
+  });
+  worker.call({ op: "chaos", dir, seed, expect }).catch((error: unknown) => {
+    run.failure ??= error instanceof Error ? error : new Error(String(error));
+  });
+  await worker.until(() => run.failure !== null || run.recovered !== null, "recovery", 60_000);
+  if (run.failure !== null) {
+    worker.terminate();
+    throw run.failure;
+  }
+  const recovered = run.recovered;
+  if (recovered === null) throw new Error("recovery reported nothing");
+  return recovered;
+}
+
+/** Kills the running chaos worker as `plan` says; resolves with where it landed. */
+export function chaosKill(plan: KillPlan): Promise<KillLanding> {
+  const run = chaos;
+  if (run === null) return Promise.reject(new Error("chaosBegin first"));
+  const snapshot = (): ChaosExpect => {
+    if (run.state === null) throw new Error("no acknowledged state");
+    return { state: run.state, inFlight: run.inFlight };
+  };
+  return new Promise<KillLanding>((resolve, reject) => {
+    const stall = setTimeout(() => {
+      run.armed = null;
+      reject(
+        run.failure ??
+          new Error(`the workload never reached ${plan.target} #${String(plan.occurrence)}`),
+      );
+    }, 60_000);
+    run.armed = {
+      target: plan.target,
+      remaining: plan.occurrence,
+      fire: (intent) => {
+        clearTimeout(stall);
+        if (plan.mode === "page") {
+          // Stop answering, then let the step run: the page close or crash lands in it or just
+          // after, and nothing later can start.
+          run.hold = true;
+          run.worker.post({ go: intent.sequence });
+          resolve({ landed: `mid-${intent.step}`, expect: snapshot() });
+          return;
+        }
+        run.worker.post({ go: intent.sequence });
+        setTimeout(() => {
+          const landed = run.inFlight === null ? "between" : `mid-${run.inFlight.step}`;
+          const expect = snapshot();
+          run.worker.terminate();
+          chaos = null;
+          resolve({ landed, expect });
+        }, plan.delayMs);
+      },
+    };
+  });
+}
+
+/** Stops the chaos worker (the campaign is over) and removes its store. */
+export async function chaosEnd(kind: StoreKind, dir: string): Promise<void> {
+  chaos?.worker.terminate();
+  chaos = null;
+  useStore(kind);
+  await withWorker((worker) => worker.call({ op: "remove", dir }));
 }

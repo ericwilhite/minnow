@@ -1106,6 +1106,19 @@ with and without a flush. The run prints one `STORAGE_MICROBENCH` JSON line, whi
 workflow saves as `browser-perf-results/storage-microbench.json` next to the lane's results. Nothing judges them yet, and the page is not cross-origin isolated, so
 sub-millisecond numbers on Firefox are rounded to the millisecond.
 
+**Storage kill campaign.** The nightly run also runs `npm run test:storage-kills`: the rebuild
+core's storage in Chromium, on OPFS and on IndexedDB, killed 1,000 times each at seeded random
+moments while a worker builds and publishes extents, retires and reclaims them, appends, flushes,
+truncates and resets its log, and spills. After every kill a new worker reopens the store and
+checks that the root is the last acknowledged one (or the one a publish in flight was writing,
+every blob's coordinates and checksum included), that every acknowledged log byte reads back,
+and that the free-space audit is exact, then carries on. Any other outcome fails the run. The
+same campaign runs 50 kills per store in every browser lane. It declares reach: kills must land
+inside writes, publishes, reclaims, log flushes, truncations and spills, or the run fails. It
+prints one `STORAGE_KILLS` JSON line per store with the kill and phase table, which the nightly
+workflow saves as `browser-perf-results/storage-kills.jsonl`. A failure names its seed: set
+`MINNOW_SEED` to replay the same plan of kills (where each kill lands still depends on timing).
+
 **What each cell records** (one JSON line per engine per cell): the warm median and p95 over at
 least five runs; the cold first run in a fresh worker after reopening the database; renderer RSS
 after open; peak renderer RSS (`/proc/<pid>/status` VmHWM, reset with `clear_refs` before the

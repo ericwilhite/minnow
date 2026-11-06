@@ -208,7 +208,15 @@ is access's `Snapshot`.
   oversized publish fails and fails the space, and a new owner recovers exactly the last
   successful root (its round and every blob's coordinates and checksum; finding no root is
   refused) and keeps writing. Chromium refuses even the first megabyte of growth under 32 MiB of
-  headroom by `estimate()`, so the run records where the refusal came rather than assuming it. `npm run benchmark:storage` records the
+  headroom by `estimate()`, so the run records where the refusal came rather than assuming it.
+- Kill campaign (Gate A, `browser/next-storage-chaos.ts`): a worker runs a seeded random workload
+  (builders, publish, retire and reclaim, log append, flush, truncate and reset, spill) and is
+  killed at seeded random moments (`worker.terminate()`, sometimes a page close); the next worker
+  reopens, checks the acknowledged root and every acknowledged log byte, audits exactly, and
+  carries on. The worker announces each step and waits for the page's go, so the page always
+  knows the acknowledged state and the one step in flight. 50 kills per store and browser in the
+  browser lane, 1,000 per store in Chromium nightly (`npm run test:storage-kills`), with declared
+  reach (`STORAGE_KILL_REACH`). `npm run benchmark:storage` records the
   storage microbench nightly (docs: reference/testing).
 - `select.ts` (`chooseBackend`) picks OPFS where a dedicated worker can open sync handles, else
   IndexedDB only on the private modes' refusals (`SecurityError`, `UnknownError`,

@@ -23,6 +23,7 @@ import {
   jsonReachable,
 } from "../src/next/storage/space-test-support.js";
 import { ScratchSpillService } from "../src/next/spill/scratch-spill.js";
+import { identity, runChaos, type ChaosExpect } from "./next-storage-chaos.js";
 
 /** Which backend an operation runs on (OPFS by default). */
 export type StoreKind = "opfs" | "indexeddb";
@@ -66,6 +67,12 @@ export type NextStorageRequest = { readonly store?: StoreKind } & (
   | { readonly op: "heavy-quota-publish"; readonly fillerMib: number }
   | { readonly op: "heavy-close" }
   | { readonly op: "microbench"; readonly dir: string }
+  | {
+      readonly op: "chaos";
+      readonly dir: string;
+      readonly seed: number;
+      readonly expect: ChaosExpect | null;
+    }
 );
 
 const scope = self as unknown as {
@@ -363,25 +370,6 @@ async function heavyFill(mib: number, every: number): Promise<void> {
     }
   }
   await writer.abort();
-}
-
-/** The identity of a root's blobs: their count and a hash of every coordinate and checksum. */
-function identity(blobs: readonly BlobRef[]): string {
-  let hash = 0x811c9dc5;
-  for (const blob of blobs)
-    for (const part of [
-      blob.extent.offset,
-      blob.extent.length,
-      blob.offset,
-      blob.length,
-      blob.checksum,
-    ]) {
-      const text = String(part);
-      for (let index = 0; index < text.length; index++)
-        hash = Math.imul(hash ^ text.charCodeAt(index), 0x01000193) >>> 0;
-      hash = Math.imul(hash ^ 0x2c, 0x01000193) >>> 0;
-    }
-  return `${String(blobs.length)}:${hash.toString(16)}`;
 }
 
 /** Reads `count` random blobs of the current root (each verified by the space). */
@@ -712,6 +700,17 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
     }
     case "microbench":
       return microbench(request.dir);
+    case "chaos":
+      return runChaos(request.dir, request.seed, request.expect, {
+        backendFor,
+        post: (message) => {
+          scope.postMessage(message);
+        },
+        go: (sequence) =>
+          new Promise<void>((resolve) => {
+            goes.set(sequence, resolve);
+          }),
+      });
     case "heavy-close": {
       const state = heavyState();
       await state.opened.space.close().catch(() => undefined);
@@ -740,7 +739,16 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
   }
 }
 
+/** The page's answers to chaos intents (next-storage-chaos.ts). */
+const goes = new Map<number, () => void>();
+
 scope.addEventListener("message", (event: MessageEvent<unknown>) => {
+  const go = (event.data as { go?: number }).go;
+  if (go !== undefined) {
+    goes.get(go)?.();
+    goes.delete(go);
+    return;
+  }
   const { id, request } = event.data as { id: number; request: NextStorageRequest };
   handle(request).then(
     (result) => {
