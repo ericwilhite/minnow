@@ -169,6 +169,7 @@ function sameExtents(
 
 export const openExtentSpace: OpenExtentSpace = async (session, options) => {
   options.signal?.throwIfAborted();
+  if (options.verifyAtOpen === true) await session.audit?.(options.signal);
   const root = await session.readRoot();
   const previousRoot = await session.readPreviousRoot();
   const dataLength = await session.dataLength();
@@ -641,6 +642,7 @@ class Space implements ExtentSpace {
 
   async audit(): Promise<void> {
     await this.settled();
+    await this.#session.audit?.();
     const fail = (message: string): never => {
       throw new Error(`Extent audit: ${message}`);
     };

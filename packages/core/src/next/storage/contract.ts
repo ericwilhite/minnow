@@ -292,6 +292,8 @@ export interface StoreSession {
   releaseData(ranges: readonly DataRange[]): Promise<void>;
   /** Bytes in the data space (the allocator's high-water mark on open). */
   dataLength(): Promise<number>;
+  /** Optional backend-wide physical integrity check; called by audit and test-build open. */
+  audit?(signal?: AbortSignal): Promise<void>;
 
   /** Body length in bytes (excluding header slots), as this session sees it. */
   logLength(): number;

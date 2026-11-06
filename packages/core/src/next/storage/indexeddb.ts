@@ -790,6 +790,19 @@ class IdbSession implements StoreSession {
     await Promise.all(runs);
   }
 
+  /** Whole physical record/index checks are explicit, fenced, and never silently omitted. */
+  async audit(signal?: AbortSignal): Promise<void> {
+    this.#live();
+    signal?.throwIfAborted();
+    if (this.#failure === null) await this.#commit();
+    const db: IdbDatabaseLike = {
+      close: () => undefined,
+      transaction: (stores, _mode, _durability, body) => this.#lease.read(stores, body),
+    };
+    await ByteStore.audit(db, "data", signal);
+    await ByteStore.audit(db, "log", signal);
+  }
+
   async dataLength(): Promise<number> {
     this.#live();
     return this.#currentDataLength();
@@ -1112,14 +1125,16 @@ export function createIndexedDbBackend(options: IndexedDbBackendOptions): Storag
     async open(lease: OwnerLease): Promise<StoreSession> {
       const owned = own(lease);
       owned.guard();
-      // The record indexes of both byte spaces, loaded and validated once (16 bytes per
-      // ≤ 256 KiB record), charged to the owner's memory registration.
+      // R25.5: only each byte space's last-record boundary. Persisted range lookup serves
+      // reads/writes; full physical index checks run in audit and test-build open.
       const memory = options.memory ?? null;
-      const data = await ByteStore.load(owned.database, "data", memory);
-      const log = await ByteStore.load(owned.database, "log", memory).catch((error: unknown) => {
-        data.close();
-        throw error;
-      });
+      const data = await ByteStore.openLazy(owned.database, "data", memory);
+      const log = await ByteStore.openLazy(owned.database, "log", memory).catch(
+        (error: unknown) => {
+          data.close();
+          throw error;
+        },
+      );
       return new IdbSession(owned, data, log, options.batching ?? true, memory);
     },
     scratch(lease: OwnerLease): ScratchSpace {

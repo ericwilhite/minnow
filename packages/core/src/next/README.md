@@ -197,11 +197,13 @@ is access's `Snapshot`.
   byte records of ≤ 256 KiB keyed by offset, kept disjoint, ArrayBuffers only, each with an entry
   in a companion index store, so no read or write needs a cursor over record values
   (`idb-bytes.ts`: Firefox's cursor read the neighbouring record's value and held bulk writes to
-  ~6.7 MB/s; now 5× faster end to end). The index is validated at open (an orphan record, an
-  entry without its record, overlap or a malformed entry is `StoreCorruptionError`) and kept in
-  memory for writes only, in blocks of ≤ 512 entries charged to an optional memory registration
-  (streamed into blocks at open, a page at a time); reads select their records from the stored
-  index inside their own transaction and refuse a missing or mismatched record. Relaxed writes are
+  ~6.7 MB/s; now 5× faster end to end). Data/log open reads only the last-record boundaries;
+  reads and mutations select needed records from the persisted index inside their transaction.
+  No per-record data/log index remains resident. Audit and test-build open validate the full
+  physical index (an orphan record, an entry without its record, overlap or a malformed entry is
+  `StoreCorruptionError`), in bounded pages without building a resident index. Reads continue to
+  refuse a missing or mismatched selected record. Scratch uses the eager block index charged to
+  its memory registration. Relaxed writes are
   batched in call order and committed with each barrier (publish, log flush, release, truncate,
   reset) on one commit chain (this assumes each engine's one write-ahead log per database commits
   in order, so a strict commit makes earlier relaxed ones durable; checksums turn a broken
@@ -1352,17 +1354,17 @@ cursor across read batches, so traversing the root’s page references is linear
 group, published in batches of 16,384 through `ExtentListKeeper`. Each of three reopens uses a
 fresh worker over the disk-backed profile. It reports backend setup, fence, session/index loading, extent-space
 startup and list-cache bytes read (including coalescing gaps). Root byte counts are separate;
-IndexedDB's open is currently O(records): it enumerates the complete data and log record indexes
-before list startup. Those reads are included in session time, not the list byte count. The
-three bulk requests per index page are issued together; list-directed/lazy opening is a separate
-R25.5 follow-up required before claiming Gate A on IndexedDB. OS caches
-remain warm. This measures storage startup, not log replay or owner ready time; timings are
-observations against the 500 ms target, not a portable latency assertion.
+IndexedDB opens data/log byte spaces with last-record boundary lookups and selects persisted
+record entries lazily for the ranges the lists, log replay and later operations need. Whole-store
+orphan/missing/key/order checks run in audit and test-build open, in bounded 4,096-entry pages
+with three bulk requests issued together. Their O(records) cost is outside ordinary open. OS caches
+remain warm. This synthetic metadata stress lane reports storage startup. Gate A acceptance uses an actual
+S5/W5M load and owner-ready reopening, including write-path recovery and composition.
 
 The Linux Chromium lane also samples `/proc` CPU ticks for this profile's DedicatedWorker
 threads and complete browser process tree. Samples bracket reopen after worker-ready and before
 cleanup; they include RPC handling, with the host clock's tick resolution (normally 10 ms).
 Build, module boot and cleanup are excluded. Data-read bytes count coalesced list reads; root
-payload bytes are separate. IndexedDB's native index/key enumeration is timed in session open,
-but its opaque on-disk byte count is unavailable. The fixture uses a real zero-column catalog,
+payload bytes are separate. IndexedDB's native metadata/range lookup time is included, but its
+opaque on-disk byte count is unavailable. The fixture uses a real zero-column catalog,
 group roots, directory pages and table statistics, not a full SQL workload.
