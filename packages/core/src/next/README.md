@@ -26,7 +26,7 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | `page/`            | format                           | Page codecs, page directory and statistics, streaming group writer, chunk reader (ChunkPages), inflated-page cache                                                                                                                                                                                                                                                                                                     |
 | `spill/`           | executor (OPFS service: storage) | Spill contract (one long-lived scratch file, batching charged to the operator's budget); in-memory double                                                                                                                                                                                                                                                                                                              |
 | `memory/`          | executor                         | Memory governor: admission, progress loans, held vs allocated bytes (reference implementation)                                                                                                                                                                                                                                                                                                                         |
-| `exec/`            | executor                         | Entry point (`executor.ts`), result frames (`result.ts`), scans (`scan.ts`, `memory-scan.ts`), table rules (`rules.ts`), push driver (`pipeline.ts`), fetcher (`fetch.ts`), comparators, decimal SUM                                                                                                                                                                                                                   |
+| `exec/`            | executor                         | Entry point (`executor.ts`), result frames (`result.ts`), scans (`scan.ts`, `memory-scan.ts`), table rules (`rules.ts`), push driver (`pipeline.ts`), fetcher (`fetch.ts`), expression kernels (`kernels/`), filter and project (`filter.ts`), aggregation (`agg/`), comparators, decimal SUM                                                                                                                          |
 | `ir/`              | lowering, executor               | Operator IR (`ir.ts`); scalar function and operator table (`functions.ts`); table rules in IR form (`rules.ts`); executor costs the planner reads (`costs.ts`)                                                                                                                                                                                                                                                         |
 | `access/`          | write path + key index           | Storage access contracts the write path implements: snapshots and segments, catalog, key-index probes and ranges, `modify` (rows, conflicts, RETURNING), transactions, group commit, sequences, delivery                                                                                                                                                                                                               |
 | `testing/`         | all                              | Differential-harness adapter for a partial new core                                                                                                                                                                                                                                                                                                                                                                    |
@@ -114,6 +114,8 @@ is access's `Snapshot`.
   pages, spill pages). It equals the reference XXH32 for any range, alignment and byte order,
   frozen by the published `xxhsum` sanity and string vectors plus vectors derived with the
   reference CLI on both sides of the read threshold.
+- The seed is taken as `seed >>> 0` (ToUint32) before any arithmetic, so a fractional,
+  non-finite or large number means exactly what `>>> 0` makes of it.
 - Inputs of at least `WORD_READ_BYTES` (256) read 32-bit little-endian words through one
   `DataView` per call (R15.8); shorter ones read bytes, which is faster there. Words are about
   2.5–3.5× faster from 4 KiB (about 2 GB/s against 0.6 GB/s); cold page loads, which verify
@@ -344,6 +346,55 @@ is access's `Snapshot`.
   cached reads) for tests and benchmarks; `scripts/page-format-bench.mts` measures the codecs
   against today's block format.
 
+### Predicates on encoded pages (`page/predicate.ts`, `page/select.ts`)
+
+The read-side pushdown the executor's scan uses; four calls and one helper:
+
+- `reader.compilePredicate(predicate)`: one column compared with constants (`=`, `<>`, `<`, `<=`,
+  `>`, `>=`, `in`, `between`, `isNull`, `isNotNull`), compiled once per chunk into intervals in
+  the column's order. Null when the type or operator is not pushed down (interval, json, arrays,
+  mixed-scale decimals, enum ordering): the caller evaluates it on decoded values. Constants are
+  in stored form (integers as bigint or number, decimals as `{coefficient, scale}` or a special,
+  text/bytes/uuid as bytes).
+- `chunkMayMatch(compiled, rowCount, chunk.statistics)` prunes a group; `reader.pagesMatching`
+  lists the pages a range needs (load only those). Statistics prune only when they prove no row
+  qualifies; absent or differently shaped statistics never prune.
+- `reader.select(compiled, from, to, out)` writes the qualifying group positions (`Uint16Array`,
+  ascending) of loaded pages without materializing values: dictionary pages test codes against a
+  bitmap of matching dictionary entries built once per chunk; frame-of-reference pages compare
+  stored deltas with bounds moved into delta space once per page; plain int32, float, bool and
+  varlen pages compare in place. Delta, plain int64 and decimal pages decode into a reused
+  scratch and compare word pairs or 128-bit limbs. Row loops do no BigInt work: bounds become
+  numbers once per page, and the dictionary-code bitmap once per chunk. `reader.refine(compiled, rows, …)`
+  narrows a selection (in place allowed), for conjunctions across columns.
+- Semantics are PostgreSQL's: NULLs never satisfy a comparison; float NaN equals NaN and sorts
+  above +Infinity, −0 equals +0; decimals compare exactly (specials −Infinity < finite <
+  +Infinity < NaN); text, bytes and uuid in byte order (C collation).
+- Selection-aware decode: `gather` decodes only the selected rows of the other columns; at or
+  above `DENSE_SELECTION` (40 %, measured) of a span, `prefersDense` says decode the span with
+  `decodeRange` and keep the selection instead.
+- Every dictionary page's codes are checked against its chunk's dictionary once, when the page
+  is validated (`checkDictionaryCodes` in `parsePage`), so select, refine, gather and decode all
+  rely on the same check.
+- The dense path: `reader.selectMask(compiled, from, to, mask)` writes a 0/1 `Uint8Array` (null
+  rows 0) without building positions, for a fused, branch-free filter and aggregate over dense
+  decodes (`decodeRange`) of the aggregated columns (`sum += value & -mask[row]`). Bytes beat
+  Uint32 bit words for such a consumer (measured: both ≈ 3 ns/row to write; int sums 2.8 against
+  5.4 ns/row, f64 sums 3.2 against 4.2).
+- Memory: no per-row allocation. The code bitmaps and the decode scratch are charged to the
+  reader's budget and returned at `close`.
+- `scripts/pushdown-bench.mts` measures it on the W1M table's columns against decode-then-filter.
+- Parsed pages ride on their space-cache entries (`ExtentReader.parsed` / `attach`): a reader
+  attaches the page's descriptor (its `PageView`: views into the entry's own bytes, the validated
+  structure) to the entry, charged in that entry at `PAGE_DESCRIPTOR_BYTES` (768; measured
+  337–548 bytes, a fixed set of fields and at most eight views whatever the page's size), and
+  dropped with it. Later readers reuse it when it was validated against the same directory fields
+  (encoding, rows, nulls, large-value region, tag, scale, dictionary size), so a page is validated
+  once per cache residency, not once per load. Views share the cached bytes, so nothing is
+  counted twice. gzip pages (inflated per residency, R15.5) and dictionary pages are parsed per
+  reader. W1M, 0.1 % filter returning 30 columns, warm: 82.6 ms without descriptors, 52.9 ms with
+  (load ≈ 16); W5M: 235 ms warm.
+
 ### Manifest (`format/manifest.ts`)
 
 - The root is O(tables + ledger). Nothing is O(rows).
@@ -520,6 +571,83 @@ and the owner import it directly.
   scan (`memory-scan.ts`) borrows one chunk at a time, passes on async re-pointed chunks, and
   resumes a partial one (a full or denied varlen builder) at `resumeRow`. CHECK and
   generated columns are compiled by `compileTableRules` into the write path's `TableRules`.
+
+### Expression kernels (`exec/kernels/`, `exec/filter.ts`)
+
+- Prebuilt kernels, no code generation. An IR expression compiles once per pipeline instance;
+  its output buffers come from the grant at compile time and are reused for every batch.
+- Exact types: int32 with PostgreSQL's range errors; int64 as `safe` f64 while every value stays
+  within ±(2^53 − 1), recomputed exactly in BigInt64Array otherwise; floats with PostgreSQL's
+  overflow, underflow and division-by-zero errors, REAL rounded with `Math.fround`; decimals with
+  per-slot scales, never rescaled to a shared maximum: f64 while exact, then the int64 and int128
+  tiers in 32-bit limbs (no BigInt per value; rows grouped by scale pair, any number of pairs).
+  A batch is recomputed with one BigInt per value only when a value of it passes 128 bits, an
+  input is already wide, or a product passes the display-scale cap.
+- Casts carry their target type (a widened SMALLINT is an INTEGER to the call above it).
+  DATE → TIMESTAMP(TZ) is 22008 past 294276-12-31, as PostgreSQL.
+- Comparisons follow PostgreSQL: NaN equals NaN and sorts last, decimals compare by value across
+  scales, text compares bytes. A dictionary column against a constant is compared once per
+  entry.
+- AND, OR, CASE and COALESCE evaluate a later argument only on the rows still undecided, so a
+  guarded division never divides by zero. Filters narrow a selection vector conjunct by conjunct.
+- Hot loops are branch-free (a data-dependent branch mispredicts on half of random rows): range
+  checks look at the batch's largest result after the loop, and a suspicious batch is rechecked
+  row by row.
+- Memory: output buffers are allocated once per compiled expression; number paths allocate
+  nothing per row, and a batch costs tens to a few hundred bytes of small objects (measured by
+  `scripts/next-kernels-bench.mts`). Only BigInt paths (values past 128 bits, int64 past 2^53 in
+  casts and comparisons) allocate per value.
+- `pglite.test.ts` judges generated cases by PostgreSQL itself: every numeric type, casts, NULLs
+  with garbage under them, flat/dictionary/constant operands, wide values.
+- `ir/functions.ts` (lowering's) is the one table of functions, overloads and casts (R19).
+  `exec/kernels/bindings.ts` binds each entry to a kernel or refuses it with a construct key
+  (`UnsupportedPlanError`, stage "execute"); `bindings.test.ts` fails on an unbound entry, a
+  stale binding, or a kernel binding that does not evaluate. Not implemented yet: date, time and
+  interval arithmetic, text and math functions, casts to and from text, bounded text casts.
+- NUMERIC division and modulo (`decimal-div.ts`, `DecimalDivNode`): PostgreSQL's result scale
+  (`select_div_scale`: at least 16 significant digits, capped at 1000), rounded half away from
+  zero; 128-bit limbs while the scaled operands fit, BigInt past that.
+
+### Aggregation (`exec/agg/`)
+
+- `aggregate.ts`: the `aggregate` operator. Each batch maps its rows to dense group ids, then
+  every aggregate (after its FILTER and DISTINCT) updates its state. `finish` emits groups in
+  first-seen order in batches of at most 2,048 groups and about 1 MiB, each charged to the grant
+  before it is built and released when downstream is done with it; it yields to the event loop
+  with a task every 4 ms, checking the deadline per group inside AVG(NUMERIC)'s divisions and
+  resuming mid-batch (it prepares only what the next batch holds, charged by `bigintBytes`,
+  and released as the batch takes it); after an abort, or once its abort signal fires (checked at every slice and
+  after backpressure, R23), it rejects with the reason. Scratch that outlives a slice belongs to
+  the operator; module-level scratch is used only within one synchronous call (R23). Without
+  GROUP BY there is one row even over no input.
+- `groups.ts`: group ids from open-addressing tables chosen by key type — interleaved
+  (key, id) tables for 32-bit and 64-bit integers (int8 by its two words, whatever its
+  representation: no BigInt, no Map), an f64 table for floats, xxHash32 over bytes for text (a
+  dictionary column translated once per entry), key encoding for NUMERIC and the rest, and an id
+  tuple for several keys. SQL GROUP BY equality: NULLs together, −0 = 0, NaN = NaN, NUMERIC by
+  value.
+- `states.ts`: struct-of-arrays state per aggregate, no object per group. Integer and NUMERIC
+  sums are exact at any size: an f64 part within ±2^52, a 128-bit carry, and past that an exact
+  BigInt offset per group that changes only when the carry overflows (or for inputs already
+  wider than 128 bits), never per row. A scalar NUMERIC SUM over a declared precision ≤ 12 is
+  fused: four accumulators, no per-row check. Float SUM and AVG follow PostgreSQL's float8pl and
+  float8_accum, including their 22003 rules. MIN/MAX ties take the newer value, as PostgreSQL
+  does (MIN(1.5, 1.50) is 1.50); int8 and NUMERIC comparisons use words and limbs.
+- `values.ts`: per-group values for MIN/MAX and NUMERIC keys: int8 and interval microseconds as
+  two words, NUMERIC as f64 or 128-bit limbs; only coefficients past 128 bits are BigInts, each
+  charged at the governor's `bigintBytes` (its size change charged before a replacement). Exact
+  sums' offsets past 128 bits are charged the same way, and output estimates use those sizes.
+- NUMERIC results past PostgreSQL's limits (131,072 digits before the decimal point) are 22003 at
+  emission, SUM's and AVG's alike; exact intermediates may pass them and come back.
+- `distinct.ts`: exact DISTINCT through value ids and a (group, value id) set.
+- Memory: every typed array is charged before it is constructed, and a constructor that fails
+  releases what it took. A refused growth fails the query until partitioned spill (milestone 3).
+  Not yet: GROUPING SETS, ordered-set and string/array/JSON aggregates (`UnsupportedPlanError`,
+  construct `aggregate`, refused before anything is allocated).
+- `aggregate-pglite.test.ts` judges generated rows and batchings by PostgreSQL, including sums
+  across ±2^127, with declared reach; `groups.test.ts` checks the group tables against a model
+  past several growths; `review-1.test.ts` holds the review's probes.
+  `scripts/next-agg-bench.mts` measures the shapes of measurements.md.
 
 ### Owner and client protocol (`owner/`)
 

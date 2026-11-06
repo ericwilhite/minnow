@@ -284,6 +284,14 @@ class Space implements ExtentSpace {
     return this.#cache.peek(ref);
   }
 
+  parsed(ref: BlobRef): object | null {
+    return this.#cache.parsed(ref);
+  }
+
+  attach(ref: BlobRef, parsed: object, bytes: number): boolean {
+    return this.#cache.attachParsed(ref, parsed, bytes);
+  }
+
   // ── Writing ──────────────────────────────────────────────────────────────────────────────────
 
   beginWrite(label: string, options: WriteOptions = {}): ExtentWriter {
