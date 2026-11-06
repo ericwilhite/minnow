@@ -204,6 +204,13 @@ export interface ChaosHooks {
   readonly post: (message: ChaosMessage) => void;
   /** Resolves when the page answers `sequence` with a go. */
   readonly go: (sequence: number) => Promise<void>;
+  /**
+   * Receives the graceful step-down once recovery is done: close the session (its queue commits),
+   * then release the lease (the IndexedDB backend drains and closes its connection first).
+   */
+  readonly registerRelease?: (
+    release: () => Promise<{ readonly sessionMs: number; readonly releaseMs: number }>,
+  ) => void;
 }
 
 /**
@@ -216,7 +223,12 @@ export async function runChaos(
   seed: number,
   expect: ChaosExpect | null,
   hooks: ChaosHooks,
-  options: { readonly inject?: ChaosInjection; readonly mode?: ChaosMode } = {},
+  options: {
+    readonly inject?: ChaosInjection;
+    readonly mode?: ChaosMode;
+    /** Concurrent mode: the lanes to run (all by default; diagnosis narrows them). */
+    readonly lanes?: readonly string[];
+  } = {},
 ): Promise<never> {
   const inject = options.inject ?? null;
   const started = performance.now();
@@ -322,6 +334,13 @@ export async function runChaos(
   if (spill !== null && spill.bytesInUse !== 0) fail("the spill sweep left space in use");
 
   let state: ChaosState = { round, identity: found, generation, flushed: verified };
+  hooks.registerRelease?.(async () => {
+    const started = performance.now();
+    await session.close();
+    const closed = performance.now();
+    await lease.release();
+    return { sessionMs: closed - started, releaseMs: performance.now() - closed };
+  });
   hooks.post({
     chaos: "recovered",
     recovery: {
@@ -336,7 +355,12 @@ export async function runChaos(
 
   // ── The workload ───────────────────────────────────────────────────────────────────────────
   if (options.mode === "concurrent")
-    return concurrentWorkload(seed, hooks, { space, session, spill, blobs, round, state, fail });
+    return concurrentWorkload(
+      seed,
+      hooks,
+      { space, session, spill, blobs, round, state, fail },
+      options.lanes,
+    );
   const random = mulberry32(seed);
   let sequence = 0;
   const announce = async (intent: Omit<ChaosIntent, "sequence">) => {
@@ -529,6 +553,7 @@ async function concurrentWorkload(
   seed: number,
   hooks: ChaosHooks,
   recovered: Recovered,
+  only?: readonly string[],
 ): Promise<never> {
   const { space, session, spill, fail } = recovered;
   const random = mulberry32(seed);
@@ -701,7 +726,16 @@ async function concurrentWorkload(
     }
   };
 
-  const lanes = [writer(), writer(), reader(), log(), spiller()];
+  const all: Record<string, () => Promise<never>> = {
+    writer,
+    writer2: writer,
+    reader,
+    log,
+    spiller,
+  };
+  const lanes = Object.entries(all)
+    .filter(([name]) => only === undefined || only.includes(name))
+    .map(([, lane]) => lane());
   // The first failure ends the workload; the other lanes' later failures (after a crash, every
   // lane fails) are expected and not reported again.
   for (const lane of lanes) lane.catch(() => undefined);

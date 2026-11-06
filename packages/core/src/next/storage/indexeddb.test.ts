@@ -364,3 +364,48 @@ describe("review B1-p2c: IndexedDB epochs, fencing, batching and empty ranges", 
     void scratch;
   });
 });
+
+describe("release drains the connection, then closes it (the WebKit wedge mitigation)", () => {
+  it("lets in-flight transactions finish, closes, refuses new ones, and a new lease reopens", async () => {
+    const inner = simIndexedDb(new SimDisk());
+    const events: string[] = [];
+    let connections = 0;
+    const backend = createIndexedDbBackend({
+      database: () => {
+        connections += 1;
+        return {
+          transaction: async (stores, mode, durability, body) => {
+            await inner.transaction(stores, mode, durability, body);
+            // A transaction that settles a moment later, as a real one in flight would.
+            await new Promise<void>((resolve) => {
+              setTimeout(resolve, 20);
+            });
+            events.push(`settled ${mode}`);
+          },
+          close: () => {
+            events.push("closed");
+          },
+        };
+      },
+      name: "drain",
+      locks: new SimLocks(),
+    });
+    const lease = await backend.acquire();
+    const session = await backend.open(lease);
+    const publishing = session.publish(new Uint8Array([1]));
+    // One task later the publish's transaction is in flight (it settles 20 ms after committing).
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    events.length = 0;
+    await Promise.all([publishing, lease.release()]);
+    // Every transaction that was in flight settled before the connection closed.
+    expect(events.at(-1)).toBe("closed");
+    expect(events.filter((event) => event === "closed")).toHaveLength(1);
+    await expect(session.readRoot()).rejects.toThrow();
+    // The next owner opens a new connection and sees what was published.
+    const next = await backend.open(await backend.acquire());
+    expect(connections).toBe(2);
+    expect(await next.readRoot()).toEqual(new Uint8Array([1]));
+  });
+});

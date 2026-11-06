@@ -187,7 +187,11 @@ export interface OwnerLease {
   readonly epoch: number;
   /** Aborted when ownership is lost (lock stolen, epoch moved). The session refuses mutations. */
   readonly signal: AbortSignal;
-  /** Closes handles and releases the lock. Idempotent. */
+  /**
+   * Closes handles and releases the lock. Idempotent. The owner awaits it before terminating its
+   * worker (IndexedDB: in-flight transactions finish, bounded, and the connection closes first;
+   * WebKit can otherwise block IndexedDB for the session: DECISIONS.md "Step-down").
+   */
   release(): Promise<void>;
 }
 

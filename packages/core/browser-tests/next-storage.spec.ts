@@ -681,7 +681,9 @@ test.describe("rebuild core storage concurrent kill campaign (Gate A)", () => {
         // and kill 12 with 5 operations in flight; the serialized campaign, one transaction in
         // flight, never wedges). A platform finding for the ownership track, not a corruption.
         test.fixme(
-          browserName === "webkit" && kind === "indexeddb",
+          browserName === "webkit" &&
+            kind === "indexeddb" &&
+            process.env.MINNOW_WEBKIT_WEDGE !== "1",
           "WebKit wedges IndexedDB after a worker is terminated mid-transactions",
         );
         test.setTimeout(Math.max(600_000, kills * 5_000));
@@ -707,11 +709,13 @@ test.describe("rebuild core storage concurrent kill campaign (Gate A)", () => {
         let previous = "none";
         let verifiedLogBytes = 0;
         let lockSteals = 0;
+        // Diagnosis only (MINNOW_CHAOS_LANES=writer,log,...): run a subset of the lanes.
+        const lanes = process.env.MINNOW_CHAOS_LANES?.split(",") ?? null;
         for (let iteration = 0; iteration <= kills; iteration++) {
           let recovery;
           const begin = () =>
             page.evaluate(
-              async ([url, store, directory, workerSeed, expectation]) =>
+              async ([url, store, directory, workerSeed, expectation, only]) =>
                 ((await import(url)) as Run).chaosBegin(
                   store,
                   directory,
@@ -719,12 +723,24 @@ test.describe("rebuild core storage concurrent kill campaign (Gate A)", () => {
                   expectation,
                   null,
                   "concurrent",
+                  only,
                 ),
-              [RUN, kind, dir, (seed + iteration * 0x9e3779b9) >>> 0, expected] as const,
+              [RUN, kind, dir, (seed + iteration * 0x9e3779b9) >>> 0, expected, lanes] as const,
             );
           try {
             recovery = await begin();
           } catch (error) {
+            const diagnosis =
+              kind === "indexeddb"
+                ? await page
+                    .evaluate(
+                      async ([url, store, directory]) =>
+                        ((await import(url)) as Run).chaosDiagnose(store, directory),
+                      [RUN, kind, dir] as const,
+                    )
+                    .catch((failure: unknown) => String(failure))
+                : null;
+            console.log(`WEDGE ${JSON.stringify(diagnosis)}`);
             throw new Error(
               `${kind}/${browserName}: recovery after concurrent kill ${String(iteration)} failed (replay: MINNOW_SEED=${String(seed)}; ${previous}): ${String(error)}`,
               { cause: error },
@@ -823,4 +839,67 @@ test.describe("rebuild core storage reopen at a million blobs (Gate A, opt-in)",
       console.log(`STORAGE_REOPEN ${JSON.stringify(report)}`);
       expect(result.reopens).toHaveLength(3);
     });
+});
+
+test.describe("rebuild core storage graceful step-down (the WebKit IndexedDB wedge)", () => {
+  test("stop, drain, close, release, then terminate: the next owner always recovers", async ({
+    page,
+    browserName,
+  }, info) => {
+    test.setTimeout(600_000);
+    await page.goto("/packages/core/browser/");
+    const cycles = Number(process.env.MINNOW_STEP_DOWN_CYCLES ?? "40");
+    const random = mulberry32(0x57e9);
+    const dir = `step-down-${Date.now().toString(36)}`;
+    let expected: ChaosExpect | null = null;
+    const timings: Array<{ quiesceMs: number; sessionMs: number; releaseMs: number }> = [];
+    for (let cycle = 0; cycle <= cycles; cycle++) {
+      await page.evaluate(
+        async ([url, directory, workerSeed, expectation]) =>
+          ((await import(url)) as Run).chaosBegin(
+            "indexeddb",
+            directory,
+            workerSeed,
+            expectation,
+            null,
+            "concurrent",
+          ),
+        [RUN, dir, 0x57e9 + cycle, expected] as const,
+      );
+      if (cycle === cycles) break;
+      const stepDown = await page.evaluate(
+        async ([url, delay]) => ((await import(url)) as Run).chaosStepDown(delay),
+        [RUN, 20 + Math.floor(random() * 500)] as const,
+      );
+      expect(stepDown.leftInFlight).toBe(0);
+      expected = stepDown.expect;
+      timings.push(stepDown);
+    }
+    await page.evaluate(
+      async ([url, directory]) => ((await import(url)) as Run).chaosEnd("indexeddb", directory),
+      [RUN, dir] as const,
+    );
+    const sorted = (key: "quiesceMs" | "sessionMs" | "releaseMs") =>
+      timings.map((timing) => timing[key]).sort((a, b) => a - b);
+    const summary = (key: "quiesceMs" | "sessionMs" | "releaseMs") => {
+      const values = sorted(key);
+      return {
+        median: Math.round(values[Math.floor(values.length / 2)] ?? 0),
+        p95: Math.round(values[Math.floor(values.length * 0.95)] ?? 0),
+        max: Math.round(values.at(-1) ?? 0),
+      };
+    };
+    const report = {
+      browser: browserName,
+      cycles,
+      quiesceMs: summary("quiesceMs"),
+      sessionMs: summary("sessionMs"),
+      releaseMs: summary("releaseMs"),
+    };
+    await info.attach("storage-step-down", {
+      body: JSON.stringify(report, null, 2),
+      contentType: "application/json",
+    });
+    console.log(`STORAGE_STEP_DOWN ${JSON.stringify(report)}`);
+  });
 });

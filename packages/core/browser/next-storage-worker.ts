@@ -87,6 +87,8 @@ export type NextStorageRequest = { readonly store?: StoreKind } & (
     }
   | { readonly op: "reopen-measure"; readonly dir: string }
   | { readonly op: "reopen-idb-requests"; readonly dir: string }
+  | { readonly op: "diagnose-wedge"; readonly dir: string }
+  | { readonly op: "chaos-release" }
   | {
       readonly op: "chaos";
       readonly dir: string;
@@ -94,6 +96,7 @@ export type NextStorageRequest = { readonly store?: StoreKind } & (
       readonly expect: ChaosExpect | null;
       readonly inject?: ChaosInjection;
       readonly mode?: ChaosMode;
+      readonly lanes?: readonly string[];
     }
 );
 
@@ -726,6 +729,74 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
       return buildReopenSpace(await backendFor(request.dir), request.layout, request.blobs);
     case "reopen-measure":
       return measureReopen(await backendFor(request.dir));
+    case "chaos-release": {
+      if (chaosRelease === null) throw new Error("no chaos workload to release");
+      return chaosRelease();
+    }
+    case "diagnose-wedge": {
+      // Where a recovering owner is stuck (the WebKit wedge): the lock manager's view, a bounded
+      // plain lock request, and a bounded open and write on the database, each alone.
+      const lockName = `minnow:next-test:${request.dir}`;
+      const bounded = <T>(work: Promise<T>, ms: number) =>
+        Promise.race([
+          work.then((value) => ({ ok: true as const, value })),
+          new Promise<{ ok: false; value: string }>((resolve) => {
+            setTimeout(() => {
+              resolve({ ok: false, value: "timeout" });
+            }, ms);
+          }),
+        ]);
+      const query = await navigator.locks.query();
+      const describe = (list: readonly LockInfo[] | undefined) =>
+        (list ?? []).filter((info) => info.name === lockName).map((info) => info.mode);
+      const lock = await bounded(
+        navigator.locks.request(lockName, { signal: AbortSignal.timeout(3_000) }, () => "granted"),
+        3_500,
+      ).catch((error: unknown) => ({ ok: false as const, value: String(error) }));
+      // Then keep probing (one bounded write every 3 s) for up to 120 s: does it ever clear?
+      const probeStarted = performance.now();
+      let clearedAfterMs: number | null = null;
+      while (performance.now() - probeStarted < 120_000) {
+        const attempt = await bounded(
+          (async () => {
+            const db = await openIndexedDb(indexedDB, `next-test:${request.dir}`);
+            try {
+              await db.transaction(["meta"], "readwrite", "strict", (tx) => {
+                tx.store("meta").put("diagnose", 1);
+              });
+            } finally {
+              db.close();
+            }
+          })(),
+          3_000,
+        );
+        if (attempt.ok) {
+          clearedAfterMs = Math.round(performance.now() - probeStarted);
+          break;
+        }
+      }
+      const write = await bounded(
+        (async () => {
+          const db = await openIndexedDb(indexedDB, `next-test:${request.dir}`);
+          try {
+            await db.transaction(["meta"], "readwrite", "strict", (tx) => {
+              tx.store("meta").put("diagnose", 1);
+            });
+            return "committed";
+          } finally {
+            db.close();
+          }
+        })(),
+        3_000,
+      );
+      return {
+        held: describe(query.held),
+        pending: describe(query.pending),
+        lock,
+        clearedAfterMs,
+        write,
+      };
+    }
     case "reopen-idb-requests": {
       const db = await openIndexedDb(indexedDB, `next-test:${request.dir}`);
       try {
@@ -752,10 +823,14 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
             new Promise<void>((resolve) => {
               goes.set(sequence, resolve);
             }),
+          registerRelease: (release) => {
+            chaosRelease = release;
+          },
         },
         {
           ...(request.inject === undefined ? {} : { inject: request.inject }),
           ...(request.mode === undefined ? {} : { mode: request.mode }),
+          ...(request.lanes === undefined ? {} : { lanes: request.lanes }),
         },
       ).catch((error: unknown) => {
         port.postMessage({
@@ -799,6 +874,8 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
  */
 const goes = new Map<number, () => void>();
 let chaosPort: MessagePort | null = null;
+/** The running chaos workload's graceful step-down (next-storage-chaos.ts). */
+let chaosRelease: (() => Promise<{ sessionMs: number; releaseMs: number }>) | null = null;
 
 scope.addEventListener("message", (event: MessageEvent<unknown>) => {
   const port = (event.data as { chaosPort?: MessagePort }).chaosPort;

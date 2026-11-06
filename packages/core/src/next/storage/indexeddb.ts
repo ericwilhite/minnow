@@ -136,16 +136,85 @@ async function transact(
   for (const space of spaces) space.commit();
 }
 
+/** How long a lease release waits for in-flight transactions before closing the connection. */
+export const IDB_CLOSE_DRAIN_MS = 500;
+
+/**
+ * The backend's connection, tracking every transaction so a release can let them finish and then
+ * close it (`drainAndClose`). WebKit (Playwright's 26.5) leaves IndexedDB blocked for the browser
+ * session when a worker is terminated with transactions of two independent chains in flight on
+ * its connection (12.5% of such kills in a plain-IndexedDB repro); closing the connection
+ * immediately before the kill does not prevent it, letting the in-flight transactions finish
+ * first does (0 of 40). The owner awaits `lease.release()` before it terminates its worker.
+ */
+class TrackedConnection implements IdbDatabaseLike {
+  readonly #inner: IdbDatabaseLike;
+  readonly #inFlight = new Set<Promise<void>>();
+  #closing = false;
+
+  constructor(inner: IdbDatabaseLike) {
+    this.#inner = inner;
+  }
+
+  transaction(
+    stores: readonly string[],
+    mode: "readonly" | "readwrite",
+    durability: "strict" | "relaxed",
+    body: (tx: IdbTransactionLike) => void,
+  ): Promise<void> {
+    if (this.#closing) return Promise.reject(new StoreClosedError());
+    const run = this.#inner.transaction(stores, mode, durability, body);
+    this.#inFlight.add(run);
+    const forget = () => {
+      this.#inFlight.delete(run);
+    };
+    run.then(forget, forget);
+    return run;
+  }
+
+  close(): void {
+    this.#closing = true;
+    this.#inner.close();
+  }
+
+  /**
+   * Starts no new transaction, waits up to `boundMs` for those in flight, then closes; returns how
+   * many were still in flight at the close.
+   */
+  async drainAndClose(boundMs: number): Promise<number> {
+    this.#closing = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      Promise.allSettled([...this.#inFlight]),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, boundMs);
+      }),
+    ]);
+    clearTimeout(timer);
+    const left = this.#inFlight.size;
+    this.#inner.close();
+    return left;
+  }
+}
+
 class IdbLease implements OwnerLease {
   readonly epoch: number;
   readonly database: IdbDatabaseLike;
   readonly #lock: HeldLock;
   readonly #lost = new AbortController();
 
-  constructor(lock: HeldLock, database: IdbDatabaseLike, epoch: number) {
+  readonly #closeConnection: () => Promise<void>;
+
+  constructor(
+    lock: HeldLock,
+    database: IdbDatabaseLike,
+    epoch: number,
+    closeConnection: () => Promise<void>,
+  ) {
     this.#lock = lock;
     this.database = database;
     this.epoch = epoch;
+    this.#closeConnection = closeConnection;
     if (lock.lost.aborted) this.lose();
     else
       lock.lost.addEventListener("abort", () => {
@@ -215,9 +284,17 @@ class IdbLease implements OwnerLease {
     );
   }
 
+  /**
+   * Fences this lease, lets its transactions finish (up to `IDB_CLOSE_DRAIN_MS`), closes the
+   * connection, then releases the lock (see `TrackedConnection`).
+   */
   async release(): Promise<void> {
     this.lose();
-    this.#lock.release();
+    try {
+      await this.#closeConnection();
+    } finally {
+      this.#lock.release();
+    }
   }
 }
 
@@ -789,8 +866,14 @@ class IdbScratch implements ScratchSpace {
 /** The IndexedDB `StorageBackend` (epoch fence, spill store). */
 export function createIndexedDbBackend(options: IndexedDbBackendOptions): StorageBackend {
   const leases = new WeakSet<IdbLease>();
-  let opened: Promise<IdbDatabaseLike> | null = null;
-  const database = () => (opened ??= Promise.resolve(options.database()));
+  let opened: Promise<TrackedConnection> | null = null;
+  const database = () =>
+    (opened ??= Promise.resolve(options.database()).then((db) => new TrackedConnection(db)));
+  /** Drains and closes the current connection; the next acquisition opens a new one. */
+  const closeConnection = async (connection: TrackedConnection) => {
+    if (opened !== null && (await opened) === connection) opened = null;
+    await connection.drainAndClose(IDB_CLOSE_DRAIN_MS);
+  };
   const own = (lease: OwnerLease): IdbLease => {
     if (!(lease instanceof IdbLease) || !leases.has(lease))
       throw new TypeError("The lease was not acquired from this backend");
@@ -828,7 +911,8 @@ export function createIndexedDbBackend(options: IndexedDbBackendOptions): Storag
         () => undefined,
         acquire,
       );
-      const lease = new IdbLease(lock, fence.db, fence.epoch);
+      const connection = fence.db;
+      const lease = new IdbLease(lock, connection, fence.epoch, () => closeConnection(connection));
       leases.add(lease);
       return lease;
     },

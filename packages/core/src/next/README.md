@@ -194,6 +194,9 @@ is access's `Snapshot`.
   the memory registration); truncate and reset move the
   logical end when called, in order with appends. A malformed or exhausted epoch refuses
   ownership; the spill store's record index is charged to the spill service's registration.
+  Releasing the lease lets in-flight transactions finish (up to 500 ms), closes the connection,
+  then releases the lock: WebKit can block IndexedDB for the browser session when a worker is
+  terminated with transactions in flight (DECISIONS.md "Step-down").
   `sim-idb.ts` simulates IndexedDB as a
   checksum-chained write-ahead log on the simulated disk with IndexedDB's request order, activity
   and clone rules, so the IndexedDB backend passes the same storage kit and extent-space crash

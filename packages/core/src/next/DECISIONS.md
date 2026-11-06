@@ -116,6 +116,20 @@ These rulings follow the storage probe of 2026-11-05.
   - In `pagehide`, the owner's page flushes and terminates its owner worker, which matters for
     Safari bfcache.
   - The owner does not step down on every visibility change.
+  - **Before terminating its worker, the owner stops starting storage work, lets what is in
+    flight finish, closes its session and awaits `lease.release()`** (2026-11-06). WebKit
+    (Playwright's 26.5) leaves IndexedDB blocked for the rest of the browser session when a worker
+    is terminated with two independent chains of IndexedDB transactions in flight on its
+    connection: 5 of 40 such kills in a plain-IndexedDB repro (no Minnow code), 0 of 25 in
+    Chromium and in Firefox. A probe still blocked 120 s later. Closing the connection just
+    before the kill does not prevent it (2 of 40); letting the in-flight transactions finish first
+    does (0 of 40). The IndexedDB backend's `release()` does that part: it refuses new
+    transactions, waits up to 500 ms for those in flight, closes the connection, then releases the
+    lock. Measured graceful step-down under the concurrent kill workload, 40 cycles each: waiting
+    for in-flight operations median 88–153 ms, p95 200–481 ms; session close ≤ 33 ms; release
+    ≤ 7 ms; the next owner recovered every time in WebKit, Chromium and Firefox. OPFS is the
+    default wherever a worker has sync access handles; this matters on IndexedDB, WebKit's
+    private-browsing fallback.
 - **Files.**
   - A few long-lived files (log, data, two root slots, spill, epoch), opened at acquisition and kept
     open.

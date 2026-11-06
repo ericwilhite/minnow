@@ -502,6 +502,7 @@ export async function chaosBegin(
   expect: ChaosExpect | null,
   inject: ChaosInjection | null = null,
   mode: ChaosMode = "serial",
+  lanes: readonly string[] | null = null,
 ): Promise<ChaosRecovery> {
   useStore(kind);
   const worker = await spawnForChaos();
@@ -552,7 +553,15 @@ export async function chaosBegin(
   };
   worker.post({ chaosPort: channel.port2 }, [channel.port2]);
   worker
-    .call({ op: "chaos", dir, seed, expect, mode, ...(inject === null ? {} : { inject }) })
+    .call({
+      op: "chaos",
+      dir,
+      seed,
+      expect,
+      mode,
+      ...(inject === null ? {} : { inject }),
+      ...(lanes === null ? {} : { lanes }),
+    })
     .catch((error: unknown) => {
       // Only this page's own terminate() is not a failure.
       if (error instanceof Error && error.name === "WorkerTerminated") return;
@@ -745,4 +754,53 @@ export async function runReopenBench(
   } finally {
     await withWorker((worker) => worker.call({ op: "remove", dir }));
   }
+}
+
+/** Where a recovering owner of `dir` is stuck (lock manager state, a lock probe, a write probe). */
+export async function chaosDiagnose(kind: StoreKind, dir: string): Promise<unknown> {
+  useStore(kind);
+  return withWorker((worker) => worker.call({ op: "diagnose-wedge", dir }));
+}
+
+/** A graceful step-down's timings: what the owner pays before it may terminate its worker. */
+export interface StepDown {
+  readonly expect: ChaosExpect;
+  /** Waiting for the operations in flight once no new one may start. */
+  readonly quiesceMs: number;
+  /** Operations still in flight when the wait gave up (0 when it did not). */
+  readonly leftInFlight: number;
+  /** Closing the session (its queue commits) and releasing the lease (drain, close, unlock). */
+  readonly sessionMs: number;
+  readonly releaseMs: number;
+}
+
+/**
+ * A graceful step-down of the running concurrent chaos worker after `delayMs`: the page stops
+ * giving gos (nothing new starts), waits up to 3 s for the operations in flight, asks the worker to
+ * close its session and release its lease, and only then terminates it.
+ */
+export async function chaosStepDown(delayMs: number): Promise<StepDown> {
+  const run = chaos;
+  if (run === null) throw new Error("chaosBegin first");
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, delayMs);
+  });
+  run.hold = true;
+  const started = performance.now();
+  while (run.inFlight.size > 0 && performance.now() - started < 3_000)
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 2);
+    });
+  const quiesceMs = performance.now() - started;
+  const leftInFlight = run.inFlight.size;
+  const released = await run.worker.call<{ sessionMs: number; releaseMs: number }>({
+    op: "chaos-release",
+  });
+  const failure = failed(run);
+  run.worker.terminate();
+  chaos = null;
+  await drain(run);
+  run.port.close();
+  if (failure !== null) throw failure;
+  return { expect: expectOf(run), quiesceMs, leftInFlight, ...released };
 }
