@@ -21,8 +21,11 @@
  *
  * ## Cost (finding 4)
  * The in-memory index is blocks of at most `INDEX_BLOCK` entries under a directory (the block
- * array, searched by each block's last end): insert and delete are O(log n + block), and removing
- * k consecutive entries is O(k + n / block). Its estimated size (`IntervalIndex.bytes`) is charged
+ * array, searched by each block's last end): insert and delete are O(log n + block), plus
+ * O(n / block) for the directory splice when a block splits, empties or merges (one in about
+ * every `INDEX_BLOCK / 2` inserts); removing k consecutive entries is O(k + n / block). Open
+ * streams the stored index in pages of `LOAD_PAGE` entries into blocks, so it never holds the
+ * whole index twice. Its estimated size (`IntervalIndex.bytes`) is charged
  * to an optional memory registration in `CHARGE_STEP` granules; what the registration refuses is
  * counted as `overdraft` (the index must exist) and charged again as it shrinks or the registration
  * frees up.
@@ -34,7 +37,7 @@
  */
 import { StoreCorruptionError } from "./contract.js";
 import type { CacheMemory } from "./extents.js";
-import type { IdbDatabaseLike, IdbTransactionLike } from "./idb-like.js";
+import type { IdbDatabaseLike, IdbKey, IdbTransactionLike } from "./idb-like.js";
 
 /** Records are at most this long (writes are split). */
 export const IDB_RECORD_BYTES = 256 * 1024;
@@ -49,6 +52,37 @@ export const INDEX_ENTRY_BYTES = 24;
 export const INDEX_BLOCK_BYTES = 160;
 /** The memory registration is charged and released in steps of this size. */
 export const CHARGE_STEP = 64 * 1024;
+/** Open reads the stored index (entries, their keys, the record keys) this many at a time. */
+export const LOAD_PAGE = 4096;
+
+/**
+ * Runs `run(0)`, `run(1)`, … `run(count - 1)` in order, each calling `done` when finished (at once
+ * or from a request callback), then `next`. Iterative: steps that finish at once loop rather than
+ * recurse, so a list of any length uses a bounded stack (review B1-p2d-2 finding 1).
+ */
+export function inOrder(
+  count: number,
+  run: (index: number, done: () => void) => void,
+  next: () => void,
+): void {
+  let index = 0;
+  const loop = (): void => {
+    while (index < count) {
+      // Set from `done`, which may run before `run` returns or later from a request callback.
+      const step = { finished: false, waiting: false };
+      run(index++, () => {
+        step.finished = true;
+        if (step.waiting) loop();
+      });
+      if (!step.finished) {
+        step.waiting = true;
+        return;
+      }
+    }
+    next();
+  };
+  loop();
+}
 
 interface StoredRecord {
   readonly offset: number;
@@ -116,18 +150,44 @@ export class IntervalIndex {
 
   /** Builds from validated entries sorted by offset. */
   static from(entries: readonly IndexEntry[], memory: CacheMemory | null): IntervalIndex {
+    const build = IntervalIndex.builder(memory);
+    for (const entry of entries) build.push(entry.offset, entry.offset + entry.length);
+    return build.finish();
+  }
+
+  /**
+   * Builds from intervals pushed in ascending order (validated by the caller), filling whole blocks;
+   * each full block is compacted to exact-size arrays, and the charge is settled once at the end.
+   */
+  static builder(memory: CacheMemory | null): {
+    push(start: number, end: number): void;
+    finish(): IntervalIndex;
+  } {
     const index = new IntervalIndex(memory);
-    // Exact-size arrays (`map`), not grown ones: no spare capacity resident per block.
-    for (let at = 0; at < entries.length; at += INDEX_BLOCK) {
-      const slice = entries.slice(at, at + INDEX_BLOCK);
-      index.#blocks.push({
-        starts: slice.map((entry) => entry.offset),
-        ends: slice.map((entry) => entry.offset + entry.length),
-      });
-    }
-    index.#count = entries.length;
-    index.#settle();
-    return index;
+    let block: Block | null = null;
+    const seal = () => {
+      if (block === null) return;
+      block.starts = block.starts.slice();
+      block.ends = block.ends.slice();
+      block = null;
+    };
+    return {
+      push(start, end) {
+        if (block === null) {
+          block = { starts: [], ends: [] };
+          index.#blocks.push(block);
+        }
+        block.starts.push(start);
+        block.ends.push(end);
+        index.#count += 1;
+        if (block.starts.length === INDEX_BLOCK) seal();
+      },
+      finish() {
+        seal();
+        index.#settle();
+        return index;
+      },
+    };
   }
 
   get count(): number {
@@ -309,8 +369,11 @@ export class ByteStore {
   }
 
   /**
-   * Loads and validates the index of byte space `name` (finding 2): the index store's keys and
-   * entries, and the record store's keys (keys only). Any disagreement is `StoreCorruptionError`.
+   * Loads and validates the index of byte space `name` (finding 2): the index store's entries and
+   * keys, and the record store's keys (keys only, never a record), a page of `LOAD_PAGE` at a time
+   * from each, all three over the same key range, streamed into the in-memory index. Any
+   * disagreement is `StoreCorruptionError`: a page of record keys must equal the page of index
+   * keys, so an orphan record or an entry without its record shows as a difference in some page.
    */
   static async load(
     db: IdbDatabaseLike,
@@ -318,44 +381,69 @@ export class ByteStore {
     memory: CacheMemory | null = null,
   ): Promise<ByteStore> {
     const indexName = `${name}-index`;
-    let entries: unknown[] = [];
-    let indexKeys: unknown[] = [];
-    let recordKeys: unknown[] = [];
-    await db.transaction([name, indexName], "readonly", "relaxed", (tx) => {
-      tx.store(indexName).getAll({}, (values) => {
-        entries = values;
-      });
-      tx.store(indexName).getAllKeys({}, (keys) => {
-        indexKeys = keys;
-      });
-      tx.store(name).getAllKeys({}, (keys) => {
-        recordKeys = keys;
-      });
-    });
-    if (entries.length !== indexKeys.length) throw corrupt(`${indexName} changed while loading`);
+    const build = IntervalIndex.builder(memory);
     let previousEnd = 0;
-    for (let at = 0; at < entries.length; at++) {
-      const entry = entries[at];
-      if (!isEntry(entry))
-        throw corrupt(`entry ${String(indexKeys[at])} of ${indexName} is malformed`);
-      if (indexKeys[at] !== entry.offset)
-        throw corrupt(`entry ${String(entry.offset)} of ${indexName} is filed under another key`);
-      if (entry.offset < previousEnd)
-        throw corrupt(`entries of ${indexName} overlap at ${String(entry.offset)}`);
-      previousEnd = entry.offset + entry.length;
+    const check = (entries: unknown[], indexKeys: IdbKey[], recordKeys: IdbKey[]) => {
+      if (entries.length !== indexKeys.length) throw corrupt(`${indexName} changed while loading`);
+      for (let at = 0; at < entries.length; at++) {
+        const entry = entries[at];
+        if (!isEntry(entry))
+          throw corrupt(`entry ${String(indexKeys[at])} of ${indexName} is malformed`);
+        if (indexKeys[at] !== entry.offset)
+          throw corrupt(`entry ${String(entry.offset)} of ${indexName} is filed under another key`);
+        if (entry.offset < previousEnd)
+          throw corrupt(`entries of ${indexName} overlap at ${String(entry.offset)}`);
+        previousEnd = entry.offset + entry.length;
+        build.push(entry.offset, previousEnd);
+      }
+      for (let at = 0; at < Math.max(recordKeys.length, indexKeys.length); at++) {
+        const record = recordKeys[at];
+        const key = indexKeys[at];
+        if (record === key) continue;
+        throw corrupt(
+          key === undefined ||
+            (typeof record === "number" && typeof key === "number" && record < key)
+            ? `record ${String(record)} of ${name} has no index entry`
+            : `index entry ${String(key)} of ${name} has no record`,
+        );
+      }
+    };
+    let index: IntervalIndex;
+    try {
+      await db.transaction([name, indexName], "readonly", "relaxed", (tx) => {
+        const page = (after: number | null) => {
+          const range = after === null ? {} : { lower: after, lowerOpen: true };
+          tx.store(indexName).getAll(
+            range,
+            (entries) => {
+              tx.store(indexName).getAllKeys(
+                range,
+                (indexKeys) => {
+                  tx.store(name).getAllKeys(
+                    range,
+                    (recordKeys) => {
+                      check(entries, indexKeys, recordKeys);
+                      const last = indexKeys.at(-1);
+                      // A short page is the last (its record keys matched it, so none follow).
+                      if (indexKeys.length >= LOAD_PAGE && typeof last === "number") page(last);
+                    },
+                    LOAD_PAGE,
+                  );
+                },
+                LOAD_PAGE,
+              );
+            },
+            LOAD_PAGE,
+          );
+        };
+        page(null);
+      });
+      index = build.finish();
+    } catch (error) {
+      build.finish().release();
+      throw error;
     }
-    const valid = entries as IndexEntry[];
-    for (let at = 0; at < Math.max(recordKeys.length, valid.length); at++) {
-      const record = recordKeys[at];
-      const entry = valid[at]?.offset;
-      if (record === entry) continue;
-      throw corrupt(
-        entry === undefined || (typeof record === "number" && record < entry)
-          ? `record ${String(record)} of ${name} has no index entry`
-          : `index entry ${String(entry)} of ${name} has no record`,
-      );
-    }
-    return new ByteStore(name, IntervalIndex.from(valid, memory));
+    return new ByteStore(name, index);
   }
 
   /** The end of the last record (the space's length). */

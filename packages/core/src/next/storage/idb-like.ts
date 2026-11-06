@@ -46,10 +46,10 @@ export interface ByteRecord {
 
 export interface IdbStoreLike {
   get(key: IdbKey, then: (value: unknown) => void): void;
-  /** Values with numeric keys in `range`, in key order. */
-  getAll(range: IdbRange, then: (values: unknown[]) => void): void;
-  /** Keys in `range`, in key order (no values are read). */
-  getAllKeys(range: IdbRange, then: (keys: IdbKey[]) => void): void;
+  /** Values with numeric keys in `range`, in key order (at most `count` when given). */
+  getAll(range: IdbRange, then: (values: unknown[]) => void, count?: number): void;
+  /** Keys in `range`, in key order (no values are read; at most `count` when given). */
+  getAllKeys(range: IdbRange, then: (keys: IdbKey[]) => void, count?: number): void;
   /** The value with the highest key in `range` (or in the store), or undefined. */
   last(range: IdbRange | null, then: (value: unknown) => void): void;
   put(key: IdbKey, value: unknown): void;
@@ -160,12 +160,12 @@ export async function openIndexedDb(factory: IDBFactory, name: string): Promise<
               const request = store.get(key);
               request.onsuccess = () => guarded(then)(request.result);
             },
-            getAll(range, then) {
-              const request = store.getAll(keyRange(range));
+            getAll(range, then, count) {
+              const request = store.getAll(keyRange(range), count);
               request.onsuccess = () => guarded(then)(request.result);
             },
-            getAllKeys(range, then) {
-              const request = store.getAllKeys(keyRange(range));
+            getAllKeys(range, then, count) {
+              const request = store.getAllKeys(keyRange(range), count);
               request.onsuccess = () => guarded(then)(request.result as IdbKey[]);
             },
             last(range, then) {

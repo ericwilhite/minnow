@@ -106,6 +106,7 @@
  * - `select.ts` (`chooseBackend`): OPFS where sync handles work, else IndexedDB, else memory.
  * Every implementation runs `storage/conformance.ts`.
  */
+import type { CacheMemory } from "./extents.js";
 
 /** Data-space extents start at multiples of this. */
 export const DATA_ALIGN = 4096;
@@ -144,6 +145,14 @@ export interface ScratchSpace {
   release(ranges: readonly DataRange[]): Promise<void>;
   /** Drops everything at or past `size`. The sweep on open is `truncate(0)`. */
   truncate(size: number): Promise<void>;
+  /**
+   * Optional (additive): charge the space's resident bookkeeping to `memory` from now on; the spill
+   * service calls it before first use with the registration it owns. IndexedDB charges its spill
+   * record index; a file (OPFS) keeps nothing per extent and has no such method.
+   */
+  chargeTo?(memory: CacheMemory): void;
+  /** Optional (additive): drop that bookkeeping and return its charge (sweep, close). */
+  dispose?(): Promise<void>;
 }
 
 export interface DataRange {

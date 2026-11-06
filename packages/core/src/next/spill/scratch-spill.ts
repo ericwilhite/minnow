@@ -17,6 +17,10 @@
  *   A page still in the batch buffer is served from it.
  * - **Release.** `close` hands the file's extents to `ScratchSpace.release` and, once that
  *   resolves, back to the map. `sweep` (startup) truncates the space to zero and starts a new map.
+ * - **Memory.** The service owns an optional memory registration (`memory`), charged over its
+ *   lifetime with what the scratch space keeps per extent (`chargeTo`: IndexedDB's record index;
+ *   OPFS keeps nothing). The charge follows the index as files come and go, and `dispose` returns
+ *   it at `sweep` and at the service's `close`.
  * - **Errors.** `StoreQuotaError` from the scratch space becomes `SpillQuotaError`; the query fails,
  *   the database is unaffected. A fenced owner's scratch calls fail with `OwnershipLostError`.
  * - **Never in recovery.** Nothing is flushed and nothing durable names spill space.
@@ -28,7 +32,7 @@ import {
   type DataRange,
   type ScratchSpace,
 } from "../storage/contract.js";
-import type { ByteBudget } from "../storage/extents.js";
+import type { ByteBudget, CacheMemory } from "../storage/extents.js";
 import { FreeSpaceMap } from "../storage/free-space.js";
 import {
   SpillCorruptionError,
@@ -52,8 +56,9 @@ export class ScratchSpillService implements SpillService {
   /** Bumped by `sweep`: files from before it are dead. */
   #generation = 0;
 
-  constructor(scratch: ScratchSpace) {
+  constructor(scratch: ScratchSpace, options: { readonly memory?: CacheMemory } = {}) {
     this.#scratch = scratch;
+    if (options.memory !== undefined) scratch.chargeTo?.(options.memory);
   }
 
   get bytesInUse(): number {
@@ -74,6 +79,15 @@ export class ScratchSpillService implements SpillService {
     this.#generation += 1;
     this.#map = new FreeSpaceMap(DATA_ALIGN);
     await this.#scratch.truncate(0);
+    await this.#scratch.dispose?.();
+  }
+
+  /** Kills every file and returns the scratch space's memory charge (the owner is closing). */
+  async close(): Promise<void> {
+    for (const file of this.#files) file.kill();
+    this.#files.clear();
+    this.#generation += 1;
+    await this.#scratch.dispose?.();
   }
 
   get generation(): number {

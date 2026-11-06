@@ -177,11 +177,16 @@ is access's `Snapshot`.
   (`idb-bytes.ts`: Firefox's cursor read the neighbouring record's value and held bulk writes to
   ~6.7 MB/s; now 5× faster end to end). The index is validated at open (an orphan record, an
   entry without its record, overlap or a malformed entry is `StoreCorruptionError`) and kept in
-  memory for writes only, in blocks of ≤ 512 entries charged to an optional memory registration;
-  reads select their records from the stored index inside their own transaction and refuse a
-  missing or mismatched record. Relaxed writes are batched in call order (small log appends of one
-  batch share a record) and committed with each barrier (publish, log flush, release, truncate,
-  reset) on one commit chain; a malformed or exhausted epoch refuses ownership; the spill store. `sim-idb.ts` simulates IndexedDB as a
+  memory for writes only, in blocks of ≤ 512 entries charged to an optional memory registration
+  (streamed into blocks at open, a page at a time); reads select their records from the stored
+  index inside their own transaction and refuse a missing or mismatched record. Relaxed writes are
+  batched in call order and committed with each barrier (publish, log flush, release, truncate,
+  reset) on one commit chain; range lists of any length are driven iteratively. The log's last
+  record is kept in memory while under 64 KiB and rewritten whole by the next commit, so log
+  records scale with log bytes / 64 KiB rather than with commits; truncate and reset move the
+  logical end when called, in order with appends. A malformed or exhausted epoch refuses
+  ownership; the spill store's record index is charged to the spill service's registration.
+  `sim-idb.ts` simulates IndexedDB as a
   checksum-chained write-ahead log on the simulated disk with IndexedDB's request order, activity
   and clone rules, so the IndexedDB backend passes the same storage kit and extent-space crash
   sweep as the files; the browser suite checks the simulator against real IndexedDB on pinned
@@ -438,7 +443,9 @@ and the owner import it directly.
   spilling never needs memory beyond the page in hand.
 - `scratch-spill.ts` is the service over a backend's `ScratchSpace` (the OPFS `spill` file or
   IndexedDB's `spill` store): one free map, 256 KiB batches written as extents that extend
-  the file's last one, checksummed reads, `sweep` at startup.
+  the file's last one, checksummed reads, `sweep` at startup. It owns an optional memory
+  registration, charged over its lifetime with what the scratch space keeps per extent
+  (IndexedDB's record index; `chargeTo`), returned at `sweep` and `close` (`dispose`).
 
 ### Memory (`memory/governor.ts`)
 

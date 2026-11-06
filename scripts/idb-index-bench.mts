@@ -1,7 +1,7 @@
 /**
  * The IndexedDB byte space's in-memory record index (packages/core/src/next/storage/idb-bytes.ts)
- * at a million records, in Node (review B1-p2d finding 4): the cost of validating and building it
- * at open, its resident heap, fragmented reuse (splitting records in the middle), and deleting a
+ * at a million records, in Node (review B1-p2d finding 4): the cost of validating and streaming it
+ * into blocks at open (pages of LOAD_PAGE entries), its resident heap, fragmented reuse (splitting records in the middle), and deleting a
  * 100,000-record prefix. Each is measured for the blocked index and for the flat sorted arrays it
  * replaced (66dc3ca). The IndexedDB requests themselves are stubbed out: this is the CPU and heap
  * the engine adds on top of the platform's `getAll`.
@@ -12,6 +12,7 @@ import { performance } from "node:perf_hooks";
 import { ByteStore, IntervalIndex } from "../packages/core/src/next/storage/idb-bytes.ts";
 import type {
   IdbDatabaseLike,
+  IdbRange,
   IdbStoreLike,
   IdbTransactionLike,
 } from "../packages/core/src/next/storage/idb-like.ts";
@@ -40,15 +41,20 @@ function stubDatabase(count: number): IdbDatabaseLike {
     length: RECORD,
   }));
   const keys = Array.from({ length: count }, (_, at) => at * RECORD);
+  /** The slice a paged request returns (keys are `at * RECORD`; open lower bounds only). */
+  const page = <T,>(all: T[], range: IdbRange, limit = Infinity): T[] => {
+    const from = range.lower === undefined ? 0 : Math.floor(range.lower / RECORD) + 1;
+    return all.slice(from, from + Math.min(limit, all.length));
+  };
   const store = (name: string): IdbStoreLike => ({
     get: (key, then) => {
       then({ offset: key, bytes: new ArrayBuffer(RECORD) });
     },
-    getAll: (_range, then) => {
-      then(name.endsWith("-index") ? entries : []);
+    getAll: (range, then, limit) => {
+      then(name.endsWith("-index") ? page(entries, range, limit) : []);
     },
-    getAllKeys: (_range, then) => {
-      then(keys);
+    getAllKeys: (range, then, limit) => {
+      then(page(keys, range, limit));
     },
     last: (_range, then) => {
       then(undefined);

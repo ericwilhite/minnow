@@ -29,8 +29,18 @@
  * transaction always writes something (`flushLog` its marker), since an engine need not flush one
  * that changed nothing. `releaseData`, `truncateLog` and `resetLog` are barriers too (relaxed,
  * strict, strict): every transaction that touches the in-memory indexes runs on the one commit
- * chain, in call order. Log appends that follow each other in one batch become one record (up
- * to `LOG_COALESCE_BYTES`), so small group commits do not make a record each. The platforms keep one write-ahead log per database and commit in order, so a strict
+ * chain, in call order. Range lists (a release of many extents) are driven iteratively
+ * (`inOrder`), never one stack frame per range.
+ *
+ * ## Log records
+ * The log's last record is kept in memory while it is shorter than `LOG_COALESCE_BYTES` (the
+ * tail): an append that continues it is copied into it, and the next commit rewrites that one
+ * record whole (a range delete of the old record and one put, no get). Records therefore number
+ * about log bytes / 64 KiB however small the group commits; a commit rewrites at most 64 KiB.
+ * A crash during a rewrite leaves the previous complete record (the transaction is atomic).
+ * `truncateLog` and `resetLog` move the logical end when called, in call order with appends, and
+ * forget the tail; if their transaction then fails, the session fails (later appends were placed
+ * after the new end). The platforms keep one write-ahead log per database and commit in order, so a strict
  * commit makes every earlier commit durable too (idb-like.ts). Read-write transactions all
  * include `meta`, so they run in call order.
  *
@@ -52,7 +62,7 @@ import {
   type StoreSession,
 } from "./contract.js";
 import { acquireFenced, type HeldLock, type LockManagerLike } from "./fence.js";
-import { ByteStore } from "./idb-bytes.js";
+import { ByteStore, inOrder } from "./idb-bytes.js";
 import type { CacheMemory } from "./extents.js";
 import type { IdbDatabaseLike, IdbTransactionLike } from "./idb-like.js";
 import { chooseRoot, encodeRootSlot } from "./root-slot.js";
@@ -196,13 +206,13 @@ interface Barrier {
   readonly write: QueuedWrite;
 }
 
-/** Log appends being joined into one record (`LOG_COALESCE_BYTES`). */
-interface LogRun {
+/** The log's last record while it is under `LOG_COALESCE_BYTES`, with its bytes. */
+interface LogTail {
   readonly offset: number;
   readonly buffer: Uint8Array;
   length: number;
-  /** The batch it belongs to; later appends join it only while that batch is still queued. */
-  readonly batch: number;
+  /** The batch whose queue holds its rewrite (later appends in that batch just extend it). */
+  queued: number;
 }
 
 /** A batch of relaxed writes is committed once it holds this many bytes or operations. */
@@ -216,9 +226,9 @@ export const IDB_BATCH_OPERATIONS = 256;
  * backpressure), before any read, and inside the same transaction as a barrier (`publish`,
  * `flushLog`), so a barrier commits everything queued before it, atomically and in order. A
  * queued write's failure (quota, a moved epoch) fails the session: every later mutation rejects
- * with it, and nothing of the batch applied; reads go on. Releases, truncation and reset commit the
- * queue, then run alone. The queue holds copies (at most one batch, ≤ 4 MiB, plus the batch in
- * flight).
+ * with it, and nothing of the batch applied; reads go on. Releases, truncation and reset are
+ * barriers on the same chain. The queue holds copies (at most one batch, ≤ 4 MiB, plus the batch
+ * in flight) and the log's tail record (≤ 64 KiB).
  */
 class IdbSession implements StoreSession {
   readonly epoch: number;
@@ -240,9 +250,9 @@ class IdbSession implements StoreSession {
   #queuedExtra = new Set<string>();
   #queuedBytes = 0;
   #scheduled = false;
-  /** Counts drained batches (`LogRun.batch`). */
+  /** Counts drained batches (`LogTail.queued`). */
   #batch = 0;
-  #logRun: LogRun | null = null;
+  #logTail: LogTail | null = null;
   /** Every commit runs after the previous one (call order). */
   #committing: Promise<void> = Promise.resolve();
   #failure: Error | null = null;
@@ -322,14 +332,13 @@ class IdbSession implements StoreSession {
           spaces,
           barrier?.durability ?? "relaxed",
           (tx) => {
-            const next = (index: number) => {
-              const write = all[index];
-              if (write !== undefined)
-                write(tx, () => {
-                  next(index + 1);
-                });
-            };
-            next(0);
+            inOrder(
+              all.length,
+              (index, done) => {
+                all[index]?.(tx, done);
+              },
+              () => undefined,
+            );
           },
           extra,
         );
@@ -452,15 +461,15 @@ class IdbSession implements StoreSession {
       spaces: [this.#data],
       extra: [],
       write: (tx, done) => {
-        const next = (index: number) => {
-          const range = copy[index];
-          if (range === undefined) done();
-          else
-            this.#data.clear(tx, range.offset, range.offset + range.length, () => {
-              next(index + 1);
-            });
-        };
-        next(0);
+        inOrder(
+          copy.length,
+          (index, next) => {
+            const range = copy[index];
+            if (range === undefined) next();
+            else this.#data.clear(tx, range.offset, range.offset + range.length, next);
+          },
+          done,
+        );
       },
     });
   }
@@ -500,51 +509,54 @@ class IdbSession implements StoreSession {
     return headers;
   }
 
-  /**
-   * Queues the bytes. A small append that follows a queued one directly joins its record (up to
-   * `LOG_COALESCE_BYTES`) instead of making another; the record is cut from the run's buffer
-   * when the batch commits.
-   */
+  /** Queues the bytes; a small append that continues the tail record joins it ("Log records"). */
   async appendLog(bytes: Uint8Array): Promise<number> {
     this.#mutable();
     const offset = this.#logLength;
     if (bytes.length === 0) return offset;
     this.#logLength += bytes.length;
-    const run = this.#logRun;
+    const tail = this.#logTail;
     if (
-      run !== null &&
-      run.batch === this.#batch &&
-      run.offset + run.length === offset &&
-      run.length + bytes.length <= run.buffer.length
+      tail !== null &&
+      tail.offset + tail.length === offset &&
+      tail.length + bytes.length <= tail.buffer.length
     ) {
       this.#lease.guard();
-      run.buffer.set(bytes, run.length);
-      run.length += bytes.length;
-      this.#queuedBytes += bytes.length;
+      tail.buffer.set(bytes, tail.length);
+      tail.length += bytes.length;
+      if (tail.queued === this.#batch) {
+        this.#queuedBytes += bytes.length;
+        return offset;
+      }
+      tail.queued = this.#batch;
+      await this.#enqueue([this.#log], [], bytes.length, this.#rewrite(tail));
       return offset;
     }
     if (bytes.length >= LOG_COALESCE_BYTES) {
-      this.#logRun = null;
+      this.#logTail = null;
       const copy = copyOf(bytes);
       await this.#enqueue([this.#log], [], bytes.length, (tx, next) => {
         this.#log.write(tx, offset, copy, next);
       });
       return offset;
     }
-    const started: LogRun = {
+    const started: LogTail = {
       offset,
       buffer: new Uint8Array(LOG_COALESCE_BYTES),
-      length: 0,
-      batch: this.#batch,
+      length: bytes.length,
+      queued: this.#batch,
     };
     started.buffer.set(bytes);
-    started.length = bytes.length;
-    this.#logRun = started;
-    await this.#enqueue([this.#log], [], bytes.length, (tx, next) => {
-      if (this.#logRun === started) this.#logRun = null;
-      this.#log.write(tx, started.offset, started.buffer.slice(0, started.length), next);
-    });
+    this.#logTail = started;
+    await this.#enqueue([this.#log], [], bytes.length, this.#rewrite(started));
     return offset;
+  }
+
+  /** Writes the tail record whole, as long as it is when the transaction runs. */
+  #rewrite(tail: LogTail): QueuedWrite {
+    return (tx, next) => {
+      this.#log.write(tx, tail.offset, tail.buffer.slice(0, tail.length), next);
+    };
   }
 
   async writeLogHeader(slot: 0 | 1, bytes: Uint8Array): Promise<void> {
@@ -578,6 +590,9 @@ class IdbSession implements StoreSession {
     this.#mutable();
     if (length < 0 || length > this.#logLength) throw new RangeError("Truncate outside the log");
     this.#lease.guard();
+    // The logical end moves now, in call order with appends; a failure below fails the session.
+    this.#logLength = length;
+    this.#logTail = null;
     await this.#commit({
       durability: "strict",
       spaces: [this.#log],
@@ -586,12 +601,13 @@ class IdbSession implements StoreSession {
         this.#log.clear(tx, length, Infinity, next);
       },
     });
-    this.#logLength = length;
   }
 
   async resetLog(): Promise<void> {
     this.#mutable();
     this.#lease.guard();
+    this.#logLength = 0;
+    this.#logTail = null;
     await this.#commit({
       durability: "strict",
       spaces: [this.#log],
@@ -602,7 +618,6 @@ class IdbSession implements StoreSession {
         this.#log.reset(tx, next);
       },
     });
-    this.#logLength = 0;
   }
 
   async close(): Promise<void> {
@@ -622,14 +637,36 @@ class IdbScratch implements ScratchSpace {
   #space: Promise<ByteStore> | null = null;
   /** Mutations run one after another, so the in-memory index changes in call order. */
   #chain: Promise<void> = Promise.resolve();
+  /** The spill service's registration, charged with the record index (`chargeTo`). */
+  #memory: CacheMemory | null = null;
 
   constructor(lease: IdbLease) {
     this.#lease = lease;
   }
 
   #spill(): Promise<ByteStore> {
-    this.#space ??= ByteStore.load(this.#lease.database, "spill");
+    this.#space ??= ByteStore.load(this.#lease.database, "spill", this.#memory);
     return this.#space;
+  }
+
+  /** Charges the spill record index to `memory` from now on (before first use). */
+  chargeTo(memory: CacheMemory): void {
+    if (this.#space !== null) throw new TypeError("chargeTo after the spill space was opened");
+    this.#memory = memory;
+  }
+
+  /**
+   * Drops the resident index and returns its charge once every mutation has settled; the next
+   * use loads it again (charged again). The spill service calls this at sweep and close.
+   */
+  async dispose(): Promise<void> {
+    const disposing = this.#chain.then(async () => {
+      const space = this.#space;
+      this.#space = null;
+      if (space !== null) (await space.catch(() => null))?.close();
+    });
+    this.#chain = disposing.catch(() => undefined);
+    await disposing;
   }
 
   #mutate(body: (spill: ByteStore, tx: IdbTransactionLike) => void): Promise<void> {
@@ -664,14 +701,15 @@ class IdbScratch implements ScratchSpace {
   async release(ranges: readonly DataRange[]): Promise<void> {
     const copy = ranges.map(({ offset, length }) => ({ offset, length }));
     await this.#mutate((spill, tx) => {
-      const next = (index: number) => {
-        const range = copy[index];
-        if (range !== undefined)
-          spill.clear(tx, range.offset, range.offset + range.length, () => {
-            next(index + 1);
-          });
-      };
-      next(0);
+      inOrder(
+        copy.length,
+        (index, next) => {
+          const range = copy[index];
+          if (range === undefined) next();
+          else spill.clear(tx, range.offset, range.offset + range.length, next);
+        },
+        () => undefined,
+      );
     });
   }
 

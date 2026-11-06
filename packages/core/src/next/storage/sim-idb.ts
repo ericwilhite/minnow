@@ -75,12 +75,12 @@ class Store {
   }
 
   /** Numeric keys inside `range`, ascending (binary search for the lower bound). */
-  inRange(range: IdbRange | null): number[] {
+  inRange(range: IdbRange | null, count = Infinity): number[] {
     const { lower, upper, lowerOpen = false, upperOpen = false } = range ?? {};
     const out: number[] = [];
     let at = lower === undefined ? 0 : this.#index(lower);
     if (lowerOpen && this.keys[at] === lower) at += 1;
-    for (; at < this.keys.length; at++) {
+    for (; at < this.keys.length && out.length < count; at++) {
       const key = this.keys[at];
       if (typeof key !== "number") break;
       if (upper !== undefined && (key > upper || (upperOpen && key === upper))) break;
@@ -327,13 +327,13 @@ class SimDatabase {
         get: (key, then) => {
           read(() => store.values.get(key), then);
         },
-        getAll: (range, then) => {
+        getAll: (range, then, count) => {
           checkRange(range);
-          read(() => store.inRange(range).map((key) => store.values.get(key)), then);
+          read(() => store.inRange(range, count).map((key) => store.values.get(key)), then);
         },
-        getAllKeys: (range, then) => {
+        getAllKeys: (range, then, count) => {
           checkRange(range);
-          read(() => store.inRange(range), then);
+          read(() => store.inRange(range, count), then);
         },
         last: (range, then) => {
           if (range !== null) checkRange(range);
