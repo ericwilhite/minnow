@@ -66,6 +66,9 @@
  *
  * Retirement of unclaimed staging runs in task slices, checks close and the open signal,
  * and deduplicates extent identities in a set. It runs at the first publication after open.
+ * Its conservative task-start bound is retained across tables and publications, advancing only
+ * after a real task yield. This is interim integration; R23.5 requires the shared per-worker
+ * task clock before merge, without an exception for a per-operation clock.
  *
  * Closing cancels in-flight staging at write boundaries and waits for its writer to settle
  * before rolling back or releasing the memtables and grants it uses.

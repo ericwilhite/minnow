@@ -420,6 +420,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
     reject: (error: unknown) => void;
     take: () => void;
   }> = [];
+  /**
+   * Interim integration until exec/pipeline.ts supplies the per-worker task clock (R23.5).
+   * Zero is a deliberately stale task-start lower bound. Never stamp publication/table entry:
+   * only a real task yield advances it, so earlier work in the same task is not forgotten.
+   */
+  #publicationTaskStart = 0;
   #flushes: Promise<void> = Promise.resolve();
   #flushScheduled = false;
   readonly #runReaders = new Map<string, RunReader | Promise<RunReader>>();
@@ -3879,18 +3885,17 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const single: ManifestRoot = { ...this.#root, tables: [table] };
     const extents: ExtentRef[] = [];
     const seen = new Set<string>();
-    // Until the shared worker task clock lands (R23.5), keep the deadline across all
-    // cached metadata continuations, resetting only after a real task yield.
-    let start = performance.now();
+    // Share the retained deadline across every table and all earlier publication work.
+    // A cached metadata promise is not a task boundary.
     for await (const reached of walkReachable(
       single,
       manifestReader(this.#metadata, this.#grant),
     )) {
       this.#check();
       this.#signal?.throwIfAborted();
-      if (performance.now() - start >= YIELD_INTERVAL_MS) {
+      if (performance.now() - this.#publicationTaskStart >= YIELD_INTERVAL_MS) {
         await yieldTask();
-        start = performance.now();
+        this.#publicationTaskStart = performance.now();
         this.#check();
         this.#signal?.throwIfAborted();
       }
