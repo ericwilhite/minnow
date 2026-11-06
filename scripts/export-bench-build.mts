@@ -23,7 +23,8 @@ import {
 } from "../packages/core/src/next/storage/space-test-support.ts";
 import { wideSpec } from "./browser-perf/page/wide-data.ts";
 import { jsonReplacer, openFileSet } from "./node-sync-file.mts";
-import { typeOf, vectorOf } from "./wide-table.mts";
+import { rebaseExtents } from "./browser-perf/page/export-stream.ts";
+import { typeOf, vectorOf } from "./browser-perf/page/wide-vectors.ts";
 
 const args = process.argv.slice(2);
 const option = (name: string, fallback: string): string => {
@@ -72,21 +73,6 @@ for (let first = 0; first < ROWS; first += GROUP) {
   );
 }
 
-/** The chunk with every extent reference moved by `moved`. */
-function rebase(value: unknown, moved: Map<number, ExtentRef>): unknown {
-  if (Array.isArray(value)) return value.map((item) => rebase(item, moved));
-  if (value === null || typeof value !== "object" || value instanceof Uint8Array) return value;
-  const record = value as Record<string, unknown>;
-  const out: Record<string, unknown> = {};
-  for (const [key, field] of Object.entries(record)) {
-    if (key === "extent" && field !== null && typeof field === "object") {
-      const extent = field as ExtentRef;
-      out[key] = moved.get(extent.offset) ?? extent;
-    } else out[key] = rebase(field, moved);
-  }
-  return out;
-}
-
 const all: Array<{ rows: number; chunks: readonly ColumnChunk[] }> = groups.map(
   ({ rows, chunks }) => ({ rows, chunks }),
 );
@@ -105,7 +91,7 @@ for (let copy = 1; copy < COPIES; copy++)
         throw new Error("a copied extent changed length");
       moved.set(extent.offset, written.extent);
     }
-    all.push({ rows: group.rows, chunks: rebase(group.chunks, moved) as ColumnChunk[] });
+    all.push({ rows: group.rows, chunks: rebaseExtents(group.chunks, moved) });
   }
 writeFileSync(join(DIR, "groups.json"), JSON.stringify(all, jsonReplacer));
 console.log(

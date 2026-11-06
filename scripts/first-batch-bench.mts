@@ -23,7 +23,7 @@ import { targetFor } from "../packages/core/src/next/page/test-support.ts";
 import { GroupWriter } from "../packages/core/src/next/page/writer.ts";
 import type { ExtentReader } from "../packages/core/src/next/storage/extents.ts";
 import { wideSpec } from "./browser-perf/page/wide-data.ts";
-import { typeOf, vectorOf } from "./wide-table.mts";
+import { typeOf, vectorOf } from "./browser-perf/page/wide-vectors.ts";
 
 const args = process.argv.slice(2);
 const index = args.indexOf("--repeats");

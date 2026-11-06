@@ -32,7 +32,7 @@ import { targetFor } from "../packages/core/src/next/page/test-support.ts";
 import { GroupWriter } from "../packages/core/src/next/page/writer.ts";
 import type { FlatVector } from "../packages/core/src/next/vector/vector.ts";
 import { wideSpec } from "./browser-perf/page/wide-data.ts";
-import { typeOf, vectorOf } from "./wide-table.mts";
+import { typeOf, vectorOf } from "./browser-perf/page/wide-vectors.ts";
 
 const args = process.argv.slice(2);
 const option = (name: string, fallback: number): number => {

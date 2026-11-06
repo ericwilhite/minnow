@@ -387,6 +387,29 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
   12–26), readahead giving 1.4–1.9×; W5M (5,242,880 × 200, five byte copies of W1M) completes at
   168k rows/s with peak RSS 126 MiB and heap 29 MiB above the baseline. Without `once` the same
   W1M export keeps 404 MiB in the page cache and peaks at +503 MiB RSS.
+- The same export on OPFS in Chromium (`browser-tests/next-export-bench.spec.ts`, opt-in
+  `MINNOW_NEXT_EXPORT_BENCH=1`, which also turns the cached-bytes guard off for its run): the
+  table is written through the OPFS backend in a worker (W1M × 200 plus one group the export
+  does not read, 1,138 MiB; 4 groups generated, the rest byte copies), and every pass streams
+  1,048,576 rows in a fresh worker. Cold means the profile's OPFS files were synced and dropped
+  from the OS page cache (`dd iflag=nocache`, checked with `fincore`). Two runs on this host
+  (load 13–18): cold 103–127k rows/s without readahead, 116–207k at 256 KiB per column,
+  129–144k at 1 MiB; OS cache warm 123–141k, 162–225k, 121–224k; from the page cache (decode
+  only) 0.6–1.2M. Readahead cuts platform reads from 49,013 to 8,094 (256 KiB) and 6,819
+  (1 MiB); 256 KiB is the default. It is not disk-bound: dd reads the same file at 1,119 MB/s
+  cold, the export 110–241 MB/s, and loads take 68–79% of a pass warm or cold. A warm pass's
+  CPU profile: `PageCache` miss handling 29% self time, the sync access handle's `read` 9%,
+  xxHash32 11%, decode about 20%. Memory with `once`: renderer RSS +96 to +157 MiB over the
+  value before the pass, the worker's JS heap at most 28 MiB, governor peak 53–78 MiB; without
+  `once`, +621 to +656 MiB and the hot set is lost.
+- What an export reads (`scripts/export-size.mts`, 262,144 rows of W1M): 1,055 B/row as flushed.
+  High-cardinality text is 34% (`h02`'s free text alone 113 B/row), float64 31%, nullable
+  floats 9%, int32 9%, decimals 8%; dictionary text 3%. Compaction gzip stores 869 B/row (−18%)
+  but slows the decode stream from 224k to 65k rows/s from memory (inflate), so it does not pay
+  for an export. Candidates, measured on the same values and page boundaries (format changes,
+  not made): float64 pages whose values are exact decimals stored as frame-of-reference
+  integers, −103 B/row (−10%); frame of reference bit-packed instead of u8/u16/u32 widths,
+  −63 B/row (−6%).
 - First batch (`SELECT *` first page, and `ORDER BY` the primary key, the same rows): a scan opens
   each projected column's chunk (its directory only), loads just the pages the batch covers (with
   the dictionary for dictionary pages) and decodes those rows; nothing is done for the rest of the

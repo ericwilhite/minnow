@@ -442,6 +442,8 @@ export interface SpaceStats {
   readonly relocations: number;
   readonly cache: {
     readonly residentBytes: number;
+    /** Bytes in the protected segment (blobs used more than once). */
+    readonly protectedBytes: number;
     readonly pinnedBytes: number;
     readonly hits: number;
     readonly misses: number;

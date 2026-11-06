@@ -1,12 +1,13 @@
 /**
  * The W1M / W500 wide table's columns (scripts/browser-perf/page/wide-data.ts) as page-format
  * vectors: the physical type of each column and one group's vector, built straight into typed
- * arrays. Shared by scripts/pushdown-bench.mts and scripts/first-batch-bench.mts.
+ * arrays. Shared by the Node benches (scripts/pushdown-bench.mts, scripts/first-batch-bench.mts,
+ * scripts/export-bench-build.mts) and the OPFS export bench (packages/core/browser/next-export-worker.ts).
  */
-import type { PhysicalType } from "../packages/core/src/next/types.ts";
-import { allocateValidity, setValid } from "../packages/core/src/next/vector/validity.ts";
-import type { FlatVector, VectorData } from "../packages/core/src/next/vector/vector.ts";
-import { wideValue, type WideColumn } from "./browser-perf/page/wide-data.ts";
+import type { PhysicalType } from "../../../packages/core/src/next/types.js";
+import { allocateValidity, setValid } from "../../../packages/core/src/next/vector/validity.js";
+import type { FlatVector, VectorData } from "../../../packages/core/src/next/vector/vector.js";
+import { wideValue, type WideColumn } from "./wide-data.js";
 
 const encoder = new TextEncoder();
 
