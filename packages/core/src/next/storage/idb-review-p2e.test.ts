@@ -7,7 +7,6 @@
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import { describe, expect, it } from "vitest";
 import { ScratchSpillService } from "../spill/scratch-spill.js";
-import type { ScratchSpace } from "./contract.js";
 import { ByteStore, inOrder } from "./idb-bytes.js";
 import { openIndexedDb, type IdbDatabaseLike } from "./idb-like.js";
 import { LOG_COALESCE_BYTES, RELEASE_CHUNK, createIndexedDbBackend } from "./indexeddb.js";
@@ -49,7 +48,8 @@ async function spillOver(db: IdbDatabaseLike) {
     name: "spill",
     locks: new SimLocks(),
   });
-  const scratch = backend.scratch(await backend.acquire()) as ScratchSpace;
+  const scratch = backend.scratch(await backend.acquire());
+  if (scratch === null) throw new Error("IndexedDB has a spill store");
   const memory = holding();
   const service = new ScratchSpillService(scratch, { memory });
   await service.sweep();
@@ -326,7 +326,8 @@ describe("the reviewer's other probes", () => {
       name: "dispose",
       locks: new SimLocks(),
     });
-    const scratch = backend.scratch(await backend.acquire()) as ScratchSpace;
+    const scratch = backend.scratch(await backend.acquire());
+    if (scratch === null) throw new Error("IndexedDB has a spill store");
     scratch.chargeTo?.(memory);
     await scratch.write(0, new Uint8Array(1));
     expect(memory.held).toBeGreaterThan(0);
