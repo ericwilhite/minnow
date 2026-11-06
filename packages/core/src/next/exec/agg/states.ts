@@ -1503,8 +1503,11 @@ class DecimalSumAccumulator implements Accumulator {
 
   /**
    * AVG results prepared for groups `from …` (see `prepare`), and the bytes charged for them. The
-   * operator prepares only what its next output batch holds, which `#average` then takes whole:
-   * nothing prepared outlives that batch (a yield, backpressure); close and abort clear it.
+   * operator prepares at most what its next output batch holds, and `#average` takes what that
+   * batch holds. With several AVG columns the batch shrinks to the fewest any of them prepared
+   * before the deadline, so the others keep the rest of theirs (less than one batch's worth
+   * each, still charged) across the yield or backpressure that follows, for the next batch.
+   * Close and abort clear it and return its charge.
    */
   readonly #prepared: { from: number; coefficients: bigint[]; scales: number[]; bytes: number } = {
     from: -1,
@@ -1539,8 +1542,9 @@ class DecimalSumAccumulator implements Accumulator {
     // moves on to the groups after this batch.
     if (cache.coefficients.length === count) this.#clearPrepared(from + count);
     else {
-      // Only a direct emit of fewer groups than prepared (not the operator's path) keeps a rest:
-      // its charge is re-derived from what stays.
+      // A batch shorter than what was prepared keeps the rest for the next batch: with several
+      // AVG columns, the batch shrinks to the fewest any of them prepared. Its charge is
+      // re-derived from what stays.
       cache.coefficients.splice(0, count);
       cache.scales.splice(0, count);
       const kept = cache.coefficients.reduce(

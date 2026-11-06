@@ -157,8 +157,8 @@ describe("R23: the aggregate operator's finish", () => {
       const a = collector();
       const b = collector();
       // Small output batches and slices: many yields between the two instances' batches (AVG
-      // prepares only what each batch holds, so nothing prepared outlives a slice; per-instance
-      // state such as output charges and the cursor must still stay apart).
+      // prepares at most what each batch holds, charged and per instance; per-instance state such
+      // as prepared results, output charges and the cursor must stay apart).
       const opA = operator([0], AGGREGATES, a.sink, { now: () => tickA++, targetBytes: 8192 });
       const opB = operator([0], AGGREGATES, b.sink, {
         now: () => (tickB += 3),

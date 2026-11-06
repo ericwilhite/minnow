@@ -149,7 +149,8 @@ describe("review B4-p2b-3", () => {
     );
     feed(op, 10n ** 2000n, 128);
     const { result: done, arrays } = capturingBigIntArrays(() => op.finish());
-    // Yielding now: whatever was prepared went out with its batch (none outlives a slice).
+    // Yielding now: with one AVG column, whatever was prepared went out with its batch. (With
+    // several, the others may keep up to a batch's worth, charged, until the next batch.)
     expect(done).toBeInstanceOf(Promise);
     for (const cache of arrays) expect(cache.length).toBe(0);
     op.abort(reason);

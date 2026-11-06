@@ -672,8 +672,9 @@ and the owner import it directly.
   first-seen order in batches of at most 2,048 groups and about 1 MiB, each charged to the grant
   before it is built and released when downstream is done with it; it yields to the event loop
   with a task every 4 ms, checking the deadline per group inside AVG(NUMERIC)'s divisions and
-  resuming mid-batch (it prepares only what the next batch holds, charged by `bigintBytes`,
-  and released as the batch takes it); after an abort, or once its abort signal fires (checked at every slice and
+  resuming mid-batch (it prepares at most what the next batch holds, charged by `bigintBytes`,
+  and released as a batch takes it; with several AVG columns one may keep up to a batch's worth
+  across a yield or backpressure, still charged, until the next batch or close/abort); after an abort, or once its abort signal fires (checked at every slice and
   after backpressure, R23), it rejects with the reason. Scratch that outlives a slice belongs to
   the operator; module-level scratch is used only within one synchronous call (R23). Without
   GROUP BY there is one row even over no input.
