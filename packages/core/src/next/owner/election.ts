@@ -95,6 +95,20 @@ export const clientLockName = (db: string, clientId: string): string =>
   `minnow:${db}:client:${clientId}`;
 export const skewChannelName = (db: string): string => `minnow:${db}`;
 
+/**
+ * The database's BroadcastChannel, or null where there is none: no `BroadcastChannel`, or a
+ * constructor that throws (restricted contexts). Without it, announcements and skew signals are
+ * off and clients rely on the silence deadline.
+ */
+export function openChannel(name: string): BroadcastChannel | null {
+  if (typeof BroadcastChannel === "undefined") return null;
+  try {
+    return new BroadcastChannel(name);
+  } catch {
+    return null;
+  }
+}
+
 // --- Broker ------------------------------------------------------------------------------------
 
 /** A client's view of the broker. */
@@ -178,6 +192,12 @@ export type SkewSignal =
       readonly protocol: number;
       readonly build: string;
       readonly ownerId: string;
+      /**
+       * The owner's fence epoch (storage/contract.ts `OwnerLease.epoch`: strictly increasing
+       * across acquisitions of one database). A client acts only on an epoch above its own
+       * owner's; an older build that sends none is treated as epoch 0.
+       */
+      readonly epoch?: number;
     }
   /** From a newer client: owners of an older protocol step aside. */
   | { readonly t: "supersede"; readonly protocol: number };

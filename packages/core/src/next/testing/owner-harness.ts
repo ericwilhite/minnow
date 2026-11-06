@@ -27,6 +27,8 @@ export interface HarnessOptions {
   readonly liveness?: Map<string, AbortController>;
   /** Results of more rows stream asynchronously in frames of this many rows (window tests). */
   readonly rowsPerFrame?: number;
+  /** The owner's `alive` interval (protocol.ts `ALIVE_INTERVAL_MS` when absent). */
+  readonly aliveIntervalMs?: number;
 }
 
 export function harness(options: HarnessOptions = {}) {
@@ -54,6 +56,7 @@ export function harness(options: HarnessOptions = {}) {
     ownerId: "owner-1",
     epoch: 1,
     build: "test",
+    ...(options.aliveIntervalMs === undefined ? {} : { aliveIntervalMs: options.aliveIntervalMs }),
     ...(options.idleMs === undefined ? {} : { transactionIdleTimeoutMs: options.idleMs }),
     ...(options.abandonedStreamMs === undefined
       ? {}

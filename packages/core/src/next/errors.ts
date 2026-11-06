@@ -31,10 +31,11 @@ export class RequestExpiredError extends Error {
 }
 
 /**
- * Connection state a request depended on is gone, and nothing of the request took effect:
+ * Connection state a request depended on is gone. Whether anything of the request took effect is
+ * its `effect` (below): `none` only when that is proven, `unknown` otherwise. What was lost:
  * - `transaction`: a statement of an explicit transaction arrived after its session's generation
- *   ended (a reconnect, format/ledger.ts `sessionLost`), or the owner changed under it; the
- *   transaction rolled back with the old generation. The client starts it again.
+ *   ended (a reconnect, format/ledger.ts `sessionLost`), or the owner changed under it. The
+ *   session refuses work until the client sends ROLLBACK and the owner confirms it.
  * - `cursor`, `subscription`, `result`: the owner changed or dropped the client's pins (liveness
  *   lock released, a page restored from bfcache, an abandoned stream). Open it again.
  * One class for every track (ruling R18.1): the owner re-exports it and rehydrates it on the wire.

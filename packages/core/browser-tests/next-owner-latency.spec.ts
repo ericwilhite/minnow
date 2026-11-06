@@ -45,14 +45,14 @@ test.describe.configure({ timeout: 120_000 });
 test("cross-tab warm point reads meet R6", async ({ page, context, browserName }, info) => {
   const name = `latency-${String(Date.now())}`;
   const owner = page;
-  await owner.goto("/packages/core/browser/");
+  await owner.goto("/packages/core/browser/next-owner/blank.html");
   await call(owner, "wipe", name);
   await call(owner, "open", name);
   await call(owner, "query", "CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
   for (let id = 1; id <= 100; id++)
     await call(owner, "query", "INSERT INTO t VALUES ($1, $2, $3)", [id, id, `name ${String(id)}`]);
   const reader = await context.newPage();
-  await reader.goto("/packages/core/browser/");
+  await reader.goto("/packages/core/browser/next-owner/blank.html");
   expect(await call(reader, "open", name)).toEqual({ hosting: false });
   const timers = await call(reader, "timerResolution");
   const baseline = await call(reader, "brokerRoundTrips", 3_000, 500);

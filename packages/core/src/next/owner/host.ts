@@ -10,7 +10,8 @@
  *    → spill sweep. With stand-ins it loads their durable file.
  * 3. The host lock, stolen from the page that won the election: from now on the owner holds it.
  * 4. The protocol server; the host page's own client connects on `clientPort`.
- * 5. Registration with the broker; answers on the skew channel.
+ * 5. Registration with the broker; answers on the skew channel, and an `owner` announcement there,
+ *    so clients of a previous owner reconnect at once.
  * 6. `minnow:ready` to the page.
  *
  * A newer owner may steal the fence lock while startup awaits (steps 2 and 3, and the lock query
@@ -35,6 +36,7 @@ import {
   BROKER_PROTOCOL,
   hostLockName,
   lifecycleAction,
+  openChannel,
   ownerLockName,
   skewChannelName,
   type BrokerMessage,
@@ -79,6 +81,11 @@ export interface OwnerEngineFactory<F> {
   closeFence(fence: F): void;
   /** Opens the engine on the fence (recovery runs here). */
   open(fence: F, settings: Readonly<Record<string, unknown>>): OwnerEngine | Promise<OwnerEngine>;
+  /**
+   * The fence's epoch: strictly increasing across acquisitions of one database (storage/contract.ts
+   * `OwnerLease.epoch`). Announced to clients, which act only on a newer one. Absent: 1.
+   */
+  epochOf?(fence: F): number;
 }
 
 export interface OwnerHost {
@@ -176,14 +183,19 @@ export async function startOwnerHost<F>(
 
   // No await from here to `minnow:ready`: the lock checks above cover the whole startup.
   const ownerId = randomId();
+  const epoch = factory.epochOf?.(fence) ?? 1;
   const idle = init.settings.transactionIdleTimeoutMs;
   const server = new OwnerServer(engine, {
     ownerId,
-    epoch: 1,
+    epoch,
     build: init.build,
     protocol,
     ...(typeof idle === "number" ? { transactionIdleTimeoutMs: idle } : {}),
+    ...(typeof init.settings.aliveIntervalMs === "number"
+      ? { aliveIntervalMs: init.settings.aliveIntervalMs }
+      : {}),
     watchLiveness: (name) => watchLock(deps.locks, name),
+    lockHolder,
   });
   server.accept(init.clientPort);
 
@@ -204,10 +216,7 @@ export async function startOwnerHost<F>(
     } satisfies BrokerMessage);
   }
 
-  const skew =
-    typeof BroadcastChannel === "undefined"
-      ? null
-      : new BroadcastChannel(skewChannelName(database));
+  const skew = openChannel(skewChannelName(database));
 
   let stopped: Promise<void> | null = null;
   const release = (reason: StepDown["reason"]) => {
@@ -248,12 +257,29 @@ export async function startOwnerHost<F>(
     skew.onmessage = (event: MessageEvent) => {
       const signal = event.data as SkewSignal;
       if (signal.t === "whoOwns")
-        skew.postMessage({ t: "owner", protocol, build: init.build, ownerId } satisfies SkewSignal);
+        skew.postMessage({
+          t: "owner",
+          protocol,
+          build: init.build,
+          ownerId,
+          epoch,
+        } satisfies SkewSignal);
       else if (signal.t === "supersede" && signal.protocol > protocol)
         void stop("superseded", true);
     };
 
   lock.lost.addEventListener("abort", () => void stop("lockLost", false), { once: true });
+
+  // Announce this owner, now registered: a client connected to a previous owner (idle, its port
+  // dead without a word) learns of the change at once and reconnects (connector.ts "Losing the
+  // owner").
+  skew?.postMessage({
+    t: "owner",
+    protocol,
+    build: init.build,
+    ownerId,
+    epoch,
+  } satisfies SkewSignal);
 
   const host: OwnerHost = {
     ownerId,

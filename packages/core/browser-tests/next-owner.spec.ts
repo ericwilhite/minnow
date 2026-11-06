@@ -13,7 +13,9 @@ type Run = typeof import("../browser/next-owner/run.js");
 const RUN = "/packages/core/browser/next-owner/run.ts";
 
 async function tab(page: Page): Promise<Page> {
-  await page.goto("/packages/core/browser/");
+  // A blank page of the origin: the library's test page (/packages/core/browser/) loads the
+  // whole current engine through the dev server on every navigation, seconds per tab in Firefox.
+  await page.goto("/packages/core/browser/next-owner/blank.html");
   return page;
 }
 
@@ -156,7 +158,13 @@ test("pagehide terminates the owner; another tab takes over on its next request"
   });
   expect(await call(a, "status")).toMatchObject({ hosting: false });
   expect(await n(b)).toBe(0);
-  expect(await call(b, "status")).toMatchObject({ hosting: true });
+  // A synthetic pagehide leaves a's page alive, so either tab may win the election; whichever
+  // does, b is served (an idle b whose owner was replaced follows the announcement, p2d).
+  const hosts = [
+    ((await call(a, "status")) as { hosting: boolean }).hosting,
+    ((await call(b, "status")) as { hosting: boolean }).hosting,
+  ];
+  expect(hosts.filter(Boolean)).toHaveLength(1);
 });
 
 test("hidden flushes pending relaxed commits before the owner can be lost", async ({
@@ -338,4 +346,31 @@ test("closing before the owner worker is ready settles start() and frees the hos
 }) => {
   await tab(page);
   expect(await call(page, "closeBeforeReady", dbName("close-early"))).toBe("ClientClosedError");
+});
+
+// ---- p2d: a client notices that its owner was replaced ----
+
+test("an idle tab whose owner was replaced reconnects at once (the owner's tab re-elected first)", async ({
+  page,
+  context,
+}) => {
+  const name = dbName("replaced");
+  const a = await tab(page);
+  await call(a, "wipe", name);
+  await call(a, "open", name);
+  await seed(a);
+  const b = await tab(await context.newPage());
+  await call(b, "open", name);
+  // a's owner goes; a's page survives a synthetic pagehide and elects a new owner first.
+  await a.evaluate(() => {
+    window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: false }));
+  });
+  expect(await n(a)).toBe(0);
+  // b was idle, its port to the dead owner silent: the announcement moves it.
+  const started = Date.now();
+  expect(await call(b, "query", "UPDATE t SET n = n + 1 WHERE id = $1", [1])).toMatchObject({
+    summary: { counts: { t: 1 } },
+  });
+  expect(Date.now() - started).toBeLessThan(10_000);
+  expect(await n(a)).toBe(1);
 });

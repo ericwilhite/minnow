@@ -962,6 +962,39 @@ and the owner import it directly.
   connection. The handshake is watched (an owner dying mid-handshake frees the host lock) and
   bounded (`HANDSHAKE_TIMEOUT_MS`, 5 s); either way the connector starts over. The broker holds a
   client's port only until the next registration of a database it asked about.
+- A client learns that its owner was replaced even while idle: a new owner announces itself on
+  the database's BroadcastChannel (`{t: "owner", ownerId, epoch}`, the fence epoch, strictly
+  increasing). An announcement is a hint: a client acts only on an epoch above its owner's, and
+  only after the host lock shows its owner no longer holds it; then it reconnects and resends.
+  A stale, repeated or forged one changes nothing. Rediscovery that finds the same live owner
+  resumes the connection instead of starting a generation (which would roll its transactions
+  back). Without a usable BroadcastChannel (absent, or a constructor that throws) there are no
+  announcements, only the backstop. Without it, an idle client kept its dead owner's port
+  (a port does not report its other end's death) and its next request waited forever.
+- The backstop is a silence deadline, `SILENCE_DEADLINE_MS` = 2.5 s (2.5 × `ALIVE_INTERVAL_MS`):
+  a client with requests in flight that hears nothing for that long probes its connection with
+  `ping`, which the owner answers with `alive` at once from its message handler (it runs between
+  a statement's yields). Answered: the owner is alive and only slow, and the count restarts, so a
+  false alarm costs one message, not a reconnect (which would end the client's open
+  transactions). Unanswered: the client compares the host lock's holder with its owner's
+  (`Welcome.lockHolder`). Another or none: it reconnects and resends; reads stay at-least-once
+  and writes go through the ledger, as on any reconnect. Hidden holders: it rediscovers, and the
+  same owner resumes. The same holder: it waits. Each probe waits up to 1 s for its answer, and
+  each unanswered one doubles the next deadline (2.5 s, 5 s, then 10 s, counted from when the
+  last probe went unanswered). After `SILENT_PROBES_LIMIT` (3) unanswered probes the
+  connection is dead. At the production deadline: a ping at 2.5 s, unanswered at 3.5 s; a ping
+  at 8.5 s, unanswered at 9.5 s; a ping at 19.5 s, and the connection is replaced at 20.5 s.
+  That is about 20.5 s plus scheduling, lock-query and broker delays, while the client gets
+  execution time. The connection is dead whatever the lock or the broker says: a live owner is
+  not a live connection, so the client opens a new generation and resolves through the ledger.
+  Before this (B5-p2d review 2, D2), a resume left the deadline expired and rediscovery ran with
+  zero delay: 68 broker connections in 2.8 s, the request never answered. Measured `alive` gaps
+  (headless Playwright, visible tabs; no engine here can hide a tab): Chromium and Firefox about
+  1.0 s, at most 1.04 s; WebKit sends none while the owner runs a long statement, which the probe
+  covers. The owner also sends an overdue `alive` whenever it handles a message or posts a
+  frame, not only from its timer: in WebKit a worker whose work yields through message tasks runs
+  no timers at all until it stops (a strict commit beside a long statement waited 1.8 s for its
+  flush timer), which the executor's yield (exec/pipeline.ts `yieldTask`) must fix.
 - `freeze` (on the document) and `pagehide` terminate the owner without calling back into the
   page: Firefox can abandon a closing page's handler midway, and the `hidden` that follows must
   then find no live owner to flush.

@@ -7,15 +7,17 @@
  * - Sequences start at 1 and increase by one per request, in send order, for the client's whole
  *   page lifetime: across reconnects and owner changes.
  * - A seq is **resolved** when the client holds its terminal reply, or has failed it locally
- *   without ever sending it. A write failed early with `OutcomeUnknownError { reason:
- *   "unresponsive" }` is **not** resolved: its reply is still collected (or it expires, below).
+ *   without ever sending it. (The public API's early `OutcomeUnknownError { reason:
+ *   "unresponsive" }`, api.ts, increment 3, leaves a write unresolved: its reply is still
+ *   collected.)
  * - `resolvedThrough` is the highest S with every seq ≤ S resolved. The owner uses it to drop
  *   outcomes the client holds (ledger `#acknowledge`).
  * - Window: a new seq is issued only while `seq ≤ resolvedThrough + maxOutstanding`, the bound the
  *   ledger enforces (`window`). Beyond it, the client queues new requests locally.
- * - Expiry: a seq unresolved for longer than the retry window can never be answered from the
- *   ledger (the owner refuses it as `expired`, or pruned its outcome). The client then resolves it
- *   and fails it with `OutcomeUnknownError`, so one lost reply cannot stall the window forever.
+ * - Expiry: a retry sent more than the retry window after its original is refused by the owner
+ *   with `RequestExpiredError` (next/errors.ts), never answered from the ledger; that error says
+ *   the original may have committed. The client resolves the seq on that reply. It has no expiry
+ *   timer of its own that would fail a request without a reply.
  *
  * ## Resendable (protocol.ts "Exactly-once")
  * A request is resendable when running it on a fresh connection means what it meant when sent:

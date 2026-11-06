@@ -460,3 +460,43 @@ describe("B1 (B5-p2d review 1): a confirmed end discharges only the losses befor
     port1.close();
   });
 });
+
+describe("p2d: an owner whose timers do not run still says it is alive on the request path", () => {
+  it("sends an overdue alive to a busy connection when any message arrives", async () => {
+    // No interval timer at all, as in a WebKit worker whose long statement yields through
+    // message tasks: the request path is the only source of `alive`.
+    const realSetInterval = globalThis.setInterval;
+    globalThis.setInterval = (() => 0) as unknown as typeof setInterval;
+    try {
+      const { server, connect } = harness({ aliveIntervalMs: 30 });
+      await seed(await connect(), 1);
+      const busy = raw(server, "4".repeat(32), 1);
+      busy.deliver({
+        t: "statement",
+        seq: 1,
+        session: 0,
+        text: "SELECT spin($1)",
+        prepared: null,
+        knownColumnsVersion: -1,
+        params: [400],
+        result: { windowBytes: 1 << 20, frameRows: null, wantRows: true },
+        sentAtMs: Date.now(),
+        resolvedThrough: 0,
+        live: false,
+        resendable: true,
+        retry: false,
+        generation: 1,
+      });
+      await delay(100);
+      const alive = () => busy.replies.filter((message) => message.t === "alive").length;
+      expect(alive()).toBe(0);
+      // Another client's request: the owner handles a message, and owes the busy client an alive.
+      const other = raw(server, "3".repeat(32), 1);
+      other.deliver({ t: "release", target: 99, through: 0 });
+      expect(alive()).toBe(1);
+      await busy.reply(1);
+    } finally {
+      globalThis.setInterval = realSetInterval;
+    }
+  });
+});

@@ -19,9 +19,20 @@ import { Broker } from "../owner/broker.js";
 import { ProtocolClient } from "../owner/client.js";
 import { composeEngine } from "../owner/compose.js";
 import { OwnerConnector, type OwnerHandle, type StartOwner } from "../owner/connector.js";
-import { LIVENESS_IDLE_RELEASE_MS, hostLockName, type HostContext } from "../owner/election.js";
+import {
+  LIVENESS_IDLE_RELEASE_MS,
+  hostLockName,
+  skewChannelName,
+  type HostContext,
+} from "../owner/election.js";
 import { startOwnerHost, type OwnerEngineFactory, type OwnerHost } from "../owner/host.js";
-import { PROTOCOL_VERSION, type StepDown } from "../owner/protocol.js";
+import {
+  ALIVE_INTERVAL_MS,
+  PROTOCOL_VERSION,
+  SILENCE_DEADLINE_MS,
+  SILENT_PROBES_LIMIT,
+  type StepDown,
+} from "../owner/protocol.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
 import { FakeLockRegistry, type FakeLockContext } from "./fake-locks.js";
 import { createLowerer } from "../lower/create.js";
@@ -45,6 +56,10 @@ async function until(condition: () => boolean, ms = 3_000): Promise<void> {
 interface World {
   readonly registry: FakeLockRegistry;
   readonly files: Map<string, string>;
+  /** The last fence epoch handed out per database. */
+  readonly epochs: Map<string, number>;
+  /** Discovery requests (`connect` to the broker) per client. */
+  readonly connects: Map<ProtocolClient, number>;
   readonly broker: Broker;
   /** Owners started, newest last. */
   readonly owners: Array<{ host: OwnerHost | null; kill: () => void; context: FakeLockContext }>;
@@ -52,13 +67,22 @@ interface World {
 
 function world(): World {
   const registry = new FakeLockRegistry();
-  return { registry, files: new Map(), broker: new Broker(registry.context()), owners: [] };
+  return {
+    registry,
+    files: new Map(),
+    epochs: new Map(),
+    connects: new Map(),
+    broker: new Broker(registry.context()),
+    owners: [],
+  };
 }
 
 /** The engine on an in-memory file; the open "handle" is the fence (busy while open). */
-function factory(world: World): OwnerEngineFactory<{ readonly db: string }> {
+function factory(
+  world: World,
+): OwnerEngineFactory<{ readonly db: string; readonly epoch: number }> {
   /** The open fence per database: a save through a closed one is a dead owner's, and is lost. */
-  const open = new Map<string, { readonly db: string }>();
+  const open = new Map<string, { readonly db: string; readonly epoch: number }>();
   return {
     openFence(db) {
       if (open.has(db)) {
@@ -66,10 +90,14 @@ function factory(world: World): OwnerEngineFactory<{ readonly db: string }> {
         busy.name = "NoModificationAllowedError";
         throw busy;
       }
-      const fence = { db };
+      // The fence epoch: strictly increasing per database across acquisitions (OwnerLease.epoch).
+      const epoch = (world.epochs.get(db) ?? 0) + 1;
+      world.epochs.set(db, epoch);
+      const fence = { db, epoch };
       open.set(db, fence);
       return fence;
     },
+    epochOf: (fence) => fence.epoch,
     closeFence(fence) {
       if (open.get(fence.db) === fence) open.delete(fence.db);
     },
@@ -181,6 +209,9 @@ function tab(
     readonly protocol?: number;
     readonly mobile?: boolean;
     readonly onSuperseded?: () => void;
+    readonly silenceDeadlineMs?: number;
+    readonly handshakeTimeoutMs?: number;
+    readonly announcements?: boolean;
   } = {},
 ): Tab {
   const locks = world.registry.context();
@@ -195,6 +226,13 @@ function tab(
     openBroker: () => {
       const { port1, port2 } = new MessageChannel();
       world.broker.accept(port1);
+      // Count discovery: every `connect` this tab asks the broker.
+      const serve = port1.onmessage;
+      port1.onmessage = (event: MessageEvent) => {
+        if ((event.data as { t?: string }).t === "connect")
+          world.connects.set(client, (world.connects.get(client) ?? 0) + 1);
+        serve?.call(port1, event);
+      };
       cleanups.push(() => {
         port1.close();
         port2.close();
@@ -210,6 +248,13 @@ function tab(
     }),
     settings: options.settings ?? {},
     retryMs: 50,
+    ...(options.silenceDeadlineMs === undefined
+      ? {}
+      : { silenceDeadlineMs: options.silenceDeadlineMs }),
+    ...(options.handshakeTimeoutMs === undefined
+      ? {}
+      : { handshakeTimeoutMs: options.handshakeTimeoutMs }),
+    ...(options.announcements === undefined ? {} : { announcements: options.announcements }),
     onSuperseded: () => {
       state.superseded = true;
       options.onSuperseded?.();
@@ -1405,4 +1450,354 @@ describe("B1 (B5-p2d review 1): after a reconnect, a session's state is the reso
     },
     200_000,
   );
+});
+
+describe("p2d: a client notices that its owner was replaced", () => {
+  /**
+   * a hosts; b is connected to a's owner and idle. a's owner dies; a's page elects a new owner at
+   * once (a request of its own). b's port to the dead owner never says so.
+   */
+  async function replaced(options: Parameters<typeof tab>[1] = {}) {
+    const w = world();
+    const a = tab(w);
+    await a.connector.start();
+    await a.client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
+    await a.client.query("INSERT INTO t VALUES ($1, $2, $3)", [1, 0, "x"]);
+    const b = tab(w, options);
+    await b.connector.start();
+    const generation = b.client.generation;
+    const firstOwner = b.client.ownerId;
+    w.owners[0]?.kill();
+    await a.client.query("SELECT * FROM t WHERE id = $1", [1]);
+    await until(() => w.owners.length === 2 && w.owners[1]?.host !== null);
+    return { w, a, b, generation, firstOwner };
+  }
+
+  it("1: the new owner's announcement moves an idle client at once", async () => {
+    const { b, generation, firstOwner } = await replaced();
+    // Before b sends anything: it reconnected on the announcement alone.
+    // (The generation counts from the start of a reconnect; the owner id changes at its welcome.)
+    await until(() => b.client.connected && b.client.ownerId !== firstOwner, 1_000);
+    expect(b.client.generation).toBeGreaterThan(generation);
+    const started = Date.now();
+    await b.client.query("UPDATE t SET n = n + 1 WHERE id = $1", [1]);
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(await value(b.client)).toBe(1);
+  });
+
+  it("2: without the announcement, the silence deadline reconnects and the write runs once", async () => {
+    const { b, generation } = await replaced({ announcements: false, silenceDeadlineMs: 300 });
+    await sleep(100);
+    expect(b.client.generation).toBe(generation);
+    const started = Date.now();
+    // Sent to the dead owner's port: no reply, no alive. The deadline, then the lock check.
+    const write = b.client
+      .query("UPDATE t SET n = n + 1 WHERE id = $1", [1])
+      .then(() => "answered");
+    expect(await Promise.race([write, sleep(3_000).then(() => "hung")])).toBe("answered");
+    const took = Date.now() - started;
+    expect(took).toBeGreaterThanOrEqual(250);
+    expect(took).toBeLessThan(3_000);
+    expect(b.client.generation).toBeGreaterThan(generation);
+    // Resent once to the new owner, which ran it once: the ledger, not a second run.
+    expect(await value(b.client)).toBe(1);
+  });
+
+  it("2: an owner alive but silent past the deadline is confirmed by its lock, not left", async () => {
+    const w = world();
+    // An owner that sends `alive` only once a minute: silent, but alive and holding its lock.
+    const a = tab(w, { settings: { aliveIntervalMs: 60_000 } });
+    await a.connector.start();
+    await a.client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
+    await a.client.query("INSERT INTO t VALUES ($1, $2, $3)", [1, 0, "x"]);
+    const b = tab(w, { silenceDeadlineMs: 150 });
+    await b.connector.start();
+    const generation = b.client.generation;
+    await b.client.query("BEGIN", [], { session: 1 });
+    await b.client.query("UPDATE t SET n = n + 1 WHERE id = $1", [1], { session: 1 });
+    // A long statement: no message for 800 ms, five deadlines.
+    const spin = await b.client.query("SELECT spin($1)", [800], { session: 1 });
+    expect(spin.summary.command).toBe("SELECT");
+    // No reconnect: the transaction is intact and commits.
+    expect(b.client.generation).toBe(generation);
+    expect(b.client.lostSessions.size).toBe(0);
+    await b.client.query("COMMIT", [], { session: 1 });
+    expect(await value(b.client)).toBe(1);
+  });
+
+  it("2: pins the deadline at 2.5 alive intervals", () => {
+    expect(SILENCE_DEADLINE_MS).toBe(2_500);
+    expect(SILENCE_DEADLINE_MS).toBe(2.5 * ALIVE_INTERVAL_MS);
+  });
+});
+
+describe("D1 (B5-p2d review 1): announcements are hints, checked before anything is torn down", () => {
+  /** A hosts with a table; b is connected with an open transaction on session 1. */
+  async function liveTransaction(options: Parameters<typeof tab>[1] = {}) {
+    const w = world();
+    const a = tab(w);
+    await a.connector.start();
+    await a.client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
+    await a.client.query("INSERT INTO t VALUES ($1, $2, $3)", [1, 0, "x"]);
+    const b = tab(w, options);
+    await b.connector.start();
+    await b.client.query("BEGIN", [], { session: 1 });
+    await b.client.query("UPDATE t SET n = n + 1 WHERE id = $1", [1], { session: 1 });
+    const announce = (ownerId: string, epoch: number | undefined) => {
+      const channel = new BroadcastChannel(skewChannelName("db"));
+      channel.postMessage({ t: "owner", protocol: PROTOCOL_VERSION, build: "x", ownerId, epoch });
+      channel.close();
+    };
+    /** Whether b asked the broker again from now on (a rediscovery, even one that resumes). */
+    const watchStatus = () => {
+      const before = w.connects.get(b.client) ?? 0;
+      return () => (w.connects.get(b.client) ?? 0) > before;
+    };
+    return {
+      w,
+      a,
+      b,
+      announce,
+      watchStatus,
+      generation: b.client.generation,
+      owner: b.client.ownerId,
+    };
+  }
+
+  /** The transaction is intact: same connection, no lost session, and it commits. */
+  async function intact(b: Tab, generation: number) {
+    expect(b.client.generation).toBe(generation);
+    expect(b.client.lostSessions.size).toBe(0);
+    await b.client.query("COMMIT", [], { session: 1 });
+    expect(await value(b.client)).toBe(1);
+  }
+
+  it("a stale announcement (an older or equal epoch) is ignored", async () => {
+    const { b, announce, generation, watchStatus } = await liveTransaction();
+    const left = watchStatus();
+    announce("stale-1", 0);
+    announce("stale-2", b.client.ownerEpoch);
+    announce("stale-3", undefined);
+    await sleep(100);
+    expect(left()).toBe(false);
+    await intact(b, generation);
+  });
+
+  it("a repeated announcement does not repeat anything", async () => {
+    const { b, announce, generation, watchStatus } = await liveTransaction();
+    const left = watchStatus();
+    for (let i = 0; i < 20; i++) announce(`again-${String(i)}`, 0);
+    await sleep(100);
+    expect(left()).toBe(false);
+    await intact(b, generation);
+  });
+
+  it("a newer epoch is checked against the host lock: our owner still holds it, so nothing happens", async () => {
+    const { b, announce, generation, watchStatus } = await liveTransaction();
+    const left = watchStatus();
+    announce("forged", b.client.ownerEpoch + 5);
+    await sleep(100);
+    // Not even a rediscovery: the host lock answered.
+    expect(left()).toBe(false);
+    await intact(b, generation);
+  });
+
+  it("with holders hidden, a stale epoch alone keeps the connector where it is", async () => {
+    const { b, announce, generation, watchStatus } = await liveTransaction();
+    const locks = b.locks as unknown as { query?: unknown };
+    const query = locks.query;
+    locks.query = undefined;
+    const left = watchStatus();
+    announce("stale", b.client.ownerEpoch);
+    await sleep(100);
+    locks.query = query;
+    expect(left()).toBe(false);
+    await intact(b, generation);
+  });
+
+  it("rediscovering the same live owner resumes the connection, never a new generation", async () => {
+    // Locks whose holders the platform does not report: the check cannot confirm, and the
+    // connector rediscovers. The broker hands back the same live owner.
+    const { w, b, announce, generation, owner } = await liveTransaction();
+    const locks = b.locks as unknown as { query?: unknown };
+    const query = locks.query;
+    locks.query = undefined;
+    announce("forged", b.client.ownerEpoch + 5);
+    await sleep(150);
+    locks.query = query;
+    expect(b.client.ownerId).toBe(owner);
+    expect(w.owners).toHaveLength(1);
+    await intact(b, generation);
+  });
+
+  it("a BroadcastChannel whose constructor throws means no announcements, not a failure", async () => {
+    const original = globalThis.BroadcastChannel;
+    // A constructor that throws, as in a restricted context.
+    globalThis.BroadcastChannel = function refusing() {
+      throw new Error("SecurityError");
+    } as unknown as typeof BroadcastChannel;
+    try {
+      const w = world();
+      const a = tab(w);
+      await a.connector.start();
+      await a.client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
+      const b = tab(w);
+      await b.connector.start();
+      await b.client.query("INSERT INTO t VALUES ($1, $2, $3)", [1, 0, "x"]);
+      expect(await value(a.client)).toBe(0);
+    } finally {
+      globalThis.BroadcastChannel = original;
+    }
+  });
+});
+
+describe("D2 (B5-p2d review 2): a silent connection is probed, backed off, and eventually replaced", () => {
+  /**
+   * The review's probe: a hosts; b connects through an owner whose posts to b's ports (old and
+   * new) can be dropped, while the owner and its locks live. `hide()` makes `locks.query` absent,
+   * as on a platform that hides lock holders.
+   */
+  async function silentOwner(options: Parameters<typeof tab>[1] = {}) {
+    const w = world();
+    const a = tab(w);
+    await a.connector.start();
+    await a.client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
+    await a.client.query("INSERT INTO t VALUES ($1, $2, $3)", [1, 0, "x"]);
+    const host = w.owners[0]?.host;
+    if (host === null || host === undefined) throw new Error("no owner");
+    const accept = host.server.accept.bind(host.server);
+    const drop = { on: false, dropped: 0 };
+    host.server.accept = (port) => {
+      const post = port.postMessage.bind(port);
+      port.postMessage = (...args: Parameters<typeof post>) => {
+        if (drop.on) drop.dropped++;
+        else post(...args);
+      };
+      accept(port);
+    };
+    const b = tab(w, options);
+    await b.connector.start();
+    const locks = b.locks as unknown as { query?: unknown };
+    const hide = () => {
+      locks.query = undefined;
+    };
+    const connects = () => w.connects.get(b.client) ?? 0;
+    return { w, a, b, host, drop, hide, connects };
+  }
+
+  it("the review's probe at the production deadline: no rediscovery loop", async () => {
+    const { b, drop, hide, connects } = await silentOwner();
+    hide();
+    drop.on = true;
+    const before = connects();
+    const generation = b.client.generation;
+    const pending = b.client.query("SELECT 1").catch(() => undefined);
+    await sleep(2_800);
+    // Was 68. Now: the deadline (2.5 s), then a probe that waits its answer: none yet.
+    expect(connects() - before).toBeLessThanOrEqual(1);
+    expect(b.client.generation).toBe(generation);
+    b.connector.close();
+    await pending;
+  }, 10_000);
+
+  it("bounded attempts, then a new generation, and the request resolves once the owner answers", async () => {
+    const deadline = 40;
+    const { b, drop, hide, connects, w } = await silentOwner({
+      silenceDeadlineMs: deadline,
+      handshakeTimeoutMs: 200,
+    });
+    hide();
+    drop.on = true;
+    const before = connects();
+    const generation = b.client.generation;
+    const started = Date.now();
+    const pending = b.client.query("SELECT * FROM t WHERE id = $1", [1]);
+    // Three unanswered probes, backing off (deadlines × 1, 2, 4, each plus a probe's wait):
+    // two rediscoveries that resume, then the connection is dead and a new generation starts.
+    await until(() => b.client.generation > generation, 3_000);
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeGreaterThanOrEqual(deadline * (1 + 2 + 4) + deadline * 3 - 20);
+    expect(connects() - before).toBe(3);
+    // Its handshake is dropped too: one attempt per handshake timeout, never a loop.
+    await sleep(500);
+    const attempts = connects() - before;
+    expect(attempts).toBeGreaterThanOrEqual(4);
+    expect(attempts).toBeLessThanOrEqual(3 + Math.ceil(500 / 200) + 1);
+    // The owner answers again: the next handshake is welcomed and the read resent, answered.
+    drop.on = false;
+    const result = await Promise.race([pending, sleep(2_000).then(() => null)]);
+    expect(result?.rows()).toEqual([[1, 0, "x"]]);
+    expect(w.owners).toHaveLength(1);
+    expect(connects() - before).toBeLessThanOrEqual(3 + Math.ceil((Date.now() - started) / 200));
+  });
+
+  it("a healthy transaction under a long statement is kept: the probe is answered, nothing else happens", async () => {
+    const w = world();
+    // Silent owner (`alive` once a minute) on a platform that hides lock holders: only the probe
+    // can tell that the connection lives.
+    const a = tab(w, { settings: { aliveIntervalMs: 60_000 } });
+    await a.connector.start();
+    await a.client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
+    await a.client.query("INSERT INTO t VALUES ($1, $2, $3)", [1, 0, "x"]);
+    const b = tab(w, { silenceDeadlineMs: 100 });
+    await b.connector.start();
+    (b.locks as unknown as { query?: unknown }).query = undefined;
+    const generation = b.client.generation;
+    const before = w.connects.get(b.client) ?? 0;
+    await b.client.query("BEGIN", [], { session: 1 });
+    await b.client.query("UPDATE t SET n = n + 1 WHERE id = $1", [1], { session: 1 });
+    // 1.5 s without a message of the owner's own: fifteen deadlines.
+    await b.client.query("SELECT spin($1)", [1_500], { session: 1 });
+    // Each deadline's probe is answered. On a loaded host one answer can come later than its
+    // wait (100 ms): one rediscovery, which resumes; never a loop, and never a new generation.
+    expect((w.connects.get(b.client) ?? 0) - before).toBeLessThanOrEqual(1);
+    expect(b.client.generation).toBe(generation);
+    expect(b.client.lostSessions.size).toBe(0);
+    await b.client.query("COMMIT", [], { session: 1 });
+    expect(await value(b.client)).toBe(1);
+  });
+
+  it("a connection that ended without a word is replaced, even while the owner holds its lock", async () => {
+    const w = world();
+    const a = tab(w);
+    await a.connector.start();
+    await a.client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
+    await a.client.query("INSERT INTO t VALUES ($1, $2, $3)", [1, 0, "x"]);
+    const host = w.owners[0]?.host;
+    if (host === null || host === undefined) throw new Error("no owner");
+    const accept = host.server.accept.bind(host.server);
+    let endOld: () => void = () => undefined;
+    host.server.accept = (port) => {
+      accept(port);
+      const receive = port.onmessage;
+      endOld = () => {
+        receive?.call(port as MessagePort, { data: { t: "bye" } } as MessageEvent);
+      };
+    };
+    const b = tab(w, { silenceDeadlineMs: 40 });
+    await b.connector.start();
+    const generation = b.client.generation;
+    await b.client.query("BEGIN", [], { session: 1 });
+    // The owner ends b's connection (rolling its transaction back); b is not told.
+    endOld();
+    // Holders visible: the lock shows b's owner alive. The probe is what notices.
+    const outcome = await Promise.race([
+      b.client.query("SELECT 1", [], { session: 1 }).then(
+        () => "resolved",
+        (error: unknown) => (error as Error).name,
+      ),
+      sleep(3_000).then(() => "hung"),
+    ]);
+    expect(outcome).toBe("SessionLostError");
+    expect(b.client.generation).toBeGreaterThan(generation);
+    expect(b.client.ownerId).toBe(w.owners[0]?.host?.ownerId);
+    // The session is usable once its loss is acknowledged.
+    await b.client.query("ROLLBACK", [], { session: 1 });
+    await b.client.query("UPDATE t SET n = n + 1 WHERE id = $1", [1], { session: 1 });
+    expect(await value(b.client)).toBe(1);
+  });
+
+  it("pins the probe limit", () => {
+    expect(SILENT_PROBES_LIMIT).toBe(3);
+  });
 });

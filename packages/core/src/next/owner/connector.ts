@@ -25,6 +25,22 @@
  *   means the owner died (a closed tab, a terminated or crashed worker, this page's own worker
  *   included). The connector reconnects, electing itself if it may, and the client resends.
  * - `stepDown` from the owner: reconnect, or stop when superseded.
+ * - A watch only sees an owner's absence, not its replacement: a client whose owner died while
+ *   it was idle (no watch) keeps a dead port, and its next request's watch queues behind the
+ *   successor's live host lock. So a new owner announces itself, with its fence epoch, on the
+ *   database's BroadcastChannel. A connected client acts on an epoch above its owner's, once the
+ *   host lock confirms its owner no longer holds it, and reconnects at once, idle or not.
+ * - Rediscovery that finds the very owner it is still connected to resumes that connection: a
+ *   new generation would end the old one and roll its transactions back.
+ * - Backstop (a missed announcement, a hung port): with requests in flight and nothing heard for
+ *   `SILENCE_DEADLINE_MS`, the connector probes the connection (`ping`, answered by `alive` at
+ *   once). Answered: alive and only slow (throttled, or a WebKit owner running a long statement
+ *   sends no `alive` of its own); the count restarts. Unanswered: it compares the host lock's
+ *   holder with its owner's (`Welcome.lockHolder`). Another or none: reconnect and resend. Hidden:
+ *   rediscover (the same owner resumes). The same: wait. Each unanswered probe doubles the next
+ *   deadline (× 1, 2, 4), and after `SILENT_PROBES_LIMIT` of them the connection is dead
+ *   whatever the lock or the broker says (a live owner is not a live connection): a new
+ *   generation, resolved through the ledger. Any message from the owner resets the count.
  *
  * ## Liveness
  * The client's liveness lock is held while it has requests in flight or pins (open transactions,
@@ -51,6 +67,7 @@ import {
   compareProtocol,
   hostLockName,
   lifecycleAction,
+  openChannel,
   skewChannelName,
   type BrokerMessage,
   type HostContext,
@@ -59,7 +76,12 @@ import {
 } from "./election.js";
 import { ClientClosedError, ConnectionRefusedError, OwnerUnreachableError } from "./errors.js";
 import type { OwnerHostInit } from "./host.js";
-import type { StepDown } from "./protocol.js";
+import {
+  ALIVE_INTERVAL_MS,
+  SILENCE_DEADLINE_MS,
+  SILENT_PROBES_LIMIT,
+  type StepDown,
+} from "./protocol.js";
 import { watchLock, webLocks, type WebLockManager } from "./web-locks.js";
 
 /** A started owner, as the connector controls it. */
@@ -94,6 +116,10 @@ export interface ConnectorOptions {
   readonly retryMs?: number;
   /** Bound on the handshake (default `HANDSHAKE_TIMEOUT_MS`). */
   readonly handshakeTimeoutMs?: number;
+  /** The silence deadline (default protocol.ts `SILENCE_DEADLINE_MS`; shorter in tests). */
+  readonly silenceDeadlineMs?: number;
+  /** Listen for owner announcements (default true; tests turn it off to reach the backstop). */
+  readonly announcements?: boolean;
 }
 
 export type ConnectorStatus = "connecting" | "connected" | "superseded" | "closed";
@@ -122,6 +148,18 @@ export class OwnerConnector {
   #rejectClosed: (error: Error) => void = () => undefined;
   #registered: Array<() => void> = [];
   #hosting: { readonly handle: OwnerHandle; readonly lock: HeldLock } | null = null;
+  #silenceTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * The silence backstop's state for the current connection. `rounds`: probes unanswered since the
+   * owner last spoke (at `messageAt`, the client's `lastMessageAt`). `roundAt`: when the last
+   * round ended, the earliest point the next deadline counts from. `probeAt`: a `ping` awaiting
+   * its answer.
+   */
+  #silence = { rounds: 0, messageAt: 0, roundAt: 0, probeAt: null as number | null };
+  /** The next connection must be a new generation, never a resume (the old one is dead). */
+  #fresh = false;
+  /** Owner announcements on the database's channel (host.ts), or null without BroadcastChannel. */
+  readonly #announcements: BroadcastChannel | null;
   /** An owner this context is starting (not yet ready), or the host-lock wait before it. */
   #starting: Starting | null = null;
   #ownerProtocol: number | null = null;
@@ -141,6 +179,12 @@ export class OwnerConnector {
 
   constructor(options: ConnectorOptions) {
     this.#options = options;
+    this.#announcements =
+      options.announcements === false ? null : openChannel(skewChannelName(options.database));
+    if (this.#announcements !== null)
+      this.#announcements.onmessage = (event: MessageEvent) => {
+        void this.#announced(event.data as SkewSignal);
+      };
     this.#closedWait = new Promise<never>((_, reject) => {
       this.#rejectClosed = reject;
     });
@@ -196,6 +240,9 @@ export class OwnerConnector {
   close(): void {
     if (this.#status === "closed") return;
     this.#status = "closed";
+    this.#announcements?.close();
+    if (this.#silenceTimer !== null) clearTimeout(this.#silenceTimer);
+    this.#silenceTimer = null;
     const starting = this.#starting;
     this.#starting = null;
     if (starting !== null) {
@@ -243,6 +290,18 @@ export class OwnerConnector {
           ? ({ t: "noOwner" } as const)
           : await this.#untilClosed(this.#ask());
       if (answer.t === "port") {
+        // The same live owner we are still connected to (D1 b): resume, never a new generation,
+        // which would end the old one and roll its transactions back.
+        if (answer.ownerId === this.#client.ownerId && this.#client.connected && !this.#fresh) {
+          answer.port.postMessage({ t: "bye" });
+          answer.port.close();
+          this.#status = "connected";
+          // The next deadline counts from now, with the backoff the rounds have reached: a resume
+          // is not an answer (B5-p2d review 2, D2).
+          this.#silence.roundAt = Date.now();
+          this.#activity();
+          return;
+        }
         if (await this.#attach(answer.port)) return;
         continue;
       }
@@ -285,6 +344,13 @@ export class OwnerConnector {
       this.#throwIfClosed();
       this.#everConnected = true;
       this.#ownerProtocol = welcome.protocol;
+      this.#fresh = false;
+      this.#silence = {
+        rounds: 0,
+        messageAt: this.#client.lastMessageAt,
+        roundAt: 0,
+        probeAt: null,
+      };
       this.#status = "connected";
       this.#activity();
       return true;
@@ -406,7 +472,7 @@ export class OwnerConnector {
   }
 
   #ask(): Promise<
-    | { readonly t: "port"; readonly port: MessagePort }
+    | { readonly t: "port"; readonly port: MessagePort; readonly ownerId: string }
     | { readonly t: "noOwner" }
     | { readonly t: "unreachable" }
   > {
@@ -415,7 +481,8 @@ export class OwnerConnector {
     return new Promise((resolve, reject) => {
       this.#brokerReplies.set(nonce, {
         reply: (message) => {
-          if (message.t === "port") resolve({ t: "port", port: message.port });
+          if (message.t === "port")
+            resolve({ t: "port", port: message.port, ownerId: message.ownerId });
           else if (message.t === "unreachable") resolve({ t: "unreachable" });
           else resolve({ t: "noOwner" });
         },
@@ -446,16 +513,16 @@ export class OwnerConnector {
   // ---- skew ----
 
   #supersedeOlderOwner(): void {
-    if (typeof BroadcastChannel === "undefined") return;
-    const channel = new BroadcastChannel(skewChannelName(this.#options.database));
+    const channel = openChannel(skewChannelName(this.#options.database));
+    if (channel === null) return;
     channel.postMessage({ t: "supersede", protocol: this.#client.protocol } satisfies SkewSignal);
     channel.close();
   }
 
   /** Asks who owns; supersedes an older owner, or is superseded by a newer one. */
   async #settleSkew(): Promise<void> {
-    if (typeof BroadcastChannel === "undefined") return;
-    const channel = new BroadcastChannel(skewChannelName(this.#options.database));
+    const channel = openChannel(skewChannelName(this.#options.database));
+    if (channel === null) return;
     const owner = await new Promise<number | null>((resolve) => {
       const timer = setTimeout(() => {
         resolve(null);
@@ -498,6 +565,136 @@ export class OwnerConnector {
   #activity(): void {
     this.#updateWatch();
     this.#updateLiveness();
+    this.#updateSilence();
+  }
+
+  /** An owner announced itself (host.ts). Not ours: ours was replaced; reconnect and resend. */
+  /**
+   * An owner announced itself (host.ts). A hint, never proof (B5-p2d review 1, D1): only an epoch
+   * above our owner's counts, and then only once the host lock confirms our owner no longer holds
+   * it. A stale, repeated or forged announcement leaves a live connection, and its transactions,
+   * alone.
+   */
+  async #announced(signal: SkewSignal): Promise<void> {
+    if (signal.t !== "owner" || !this.#isConnected()) return;
+    const current = this.#client.ownerId;
+    if (current === null || signal.ownerId === current) return;
+    if ((signal.epoch ?? 0) <= this.#client.ownerEpoch) return;
+    const generation = this.#client.generation;
+    const owner = this.#client.ownerLockHolder;
+    const holder = await this.#hostHolder();
+    if (!this.#isConnected() || this.#client.generation !== generation) return;
+    // Our owner still holds the host lock: the announcement is stale or forged.
+    if (owner !== null && owner !== "" && holder === owner) return;
+    this.#ownerLeft("closing");
+  }
+
+  /**
+   * The backstop for an announcement missed or never sent, or a connection that ended without a
+   * word: while requests are in flight, a silence past the deadline sends a `ping`; an unanswered
+   * one asks who holds the host lock. See "Losing the owner" for the outcomes and the backoff.
+   */
+  #updateSilence(): void {
+    const needs = this.#status === "connected" && this.#client.pendingCount > 0;
+    if (!needs) {
+      if (this.#silenceTimer !== null) clearTimeout(this.#silenceTimer);
+      this.#silenceTimer = null;
+      this.#silence.probeAt = null;
+      return;
+    }
+    if (this.#silenceTimer === null) this.#armSilence(this.#silenceDueAt() - Date.now());
+  }
+
+  #silenceDeadlineMs(): number {
+    return this.#options.silenceDeadlineMs ?? SILENCE_DEADLINE_MS;
+  }
+
+  /** The deadline, doubled per unanswered probe (× 1, 2, 4, capped), from the later baseline. */
+  #silenceDueAt(): number {
+    const { rounds, roundAt } = this.#silence;
+    const from = Math.max(this.#client.lastHeardAt, roundAt);
+    return from + this.#silenceDeadlineMs() * 2 ** Math.min(rounds, 2);
+  }
+
+  #armSilence(wait: number): void {
+    this.#silenceTimer = setTimeout(
+      () => {
+        void this.#checkSilence();
+      },
+      Math.max(0, wait),
+    );
+  }
+
+  async #checkSilence(): Promise<void> {
+    this.#silenceTimer = null;
+    if (this.#status !== "connected" || this.#client.pendingCount === 0) {
+      this.#silence.probeAt = null;
+      return;
+    }
+    // The owner spoke since the count started (a probe answered included): start again.
+    if (this.#client.lastMessageAt !== this.#silence.messageAt) {
+      this.#silence = {
+        rounds: 0,
+        messageAt: this.#client.lastMessageAt,
+        roundAt: 0,
+        probeAt: null,
+      };
+    }
+    const state = this.#silence;
+    const now = Date.now();
+    if (state.probeAt === null) {
+      const due = this.#silenceDueAt();
+      if (now < due) {
+        this.#armSilence(due - now);
+        return;
+      }
+      // Silent past the deadline: is the connection still there?
+      state.probeAt = now;
+      this.#client.ping();
+      this.#armSilence(Math.min(this.#silenceDeadlineMs(), ALIVE_INTERVAL_MS));
+      return;
+    }
+    // The probe went unanswered.
+    state.probeAt = null;
+    state.rounds++;
+    state.roundAt = now;
+    if (state.rounds >= SILENT_PROBES_LIMIT) {
+      // Dead, whoever holds the lock: a new generation, never a resume.
+      this.#fresh = true;
+      this.#ownerLeft("closing");
+      return;
+    }
+    const owner = this.#client.ownerLockHolder;
+    const generation = this.#client.generation;
+    const holder = await this.#hostHolder();
+    // The connection may have changed while the query ran (D1 d): same connection only.
+    if (!this.#isConnected() || this.#client.generation !== generation) return;
+    if (owner !== null && owner !== "" && holder === owner) {
+      // The owner still holds the host lock: alive; wait, backing off.
+      this.#updateSilence();
+      return;
+    }
+    // Another holder, none, or hidden: rediscover (the same owner resumes, with the backoff).
+    this.#ownerLeft("closing");
+  }
+
+  #isConnected(): boolean {
+    return this.#status === "connected";
+  }
+
+  /** Who holds the host lock: a client id, `""` when hidden, null when free or unknown. */
+  async #hostHolder(): Promise<string | null> {
+    const query = this.#options.locks.query?.bind(this.#options.locks);
+    if (query === undefined) return null;
+    try {
+      const state = await query();
+      const held = (state.held ?? []).find(
+        (lock) => lock.name === hostLockName(this.#options.database),
+      );
+      return held === undefined ? null : (held.clientId ?? "");
+    } catch {
+      return null;
+    }
   }
 
   /**
