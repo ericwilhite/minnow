@@ -31,7 +31,16 @@
  *    rollback truncates; at commit the staging is made exact first (emptied memtables dropped,
  *    truncated tails deleted and filtered from their runs), and the commit's live tail freezes so
  *    the next flush folds the staged groups into the table. No flush ever takes a memtable
- *    holding uncommitted rows (C1's forced tail freeze included);
+ *    holding uncommitted rows (C1's forced tail freeze included).
+ *    **Limit (quadratic metadata, follow-up):** each stage publication rewrites the staging's
+ *    whole directory and its root lists every staged run again (`TableRoot.staged` names one
+ *    directory blob, so true append-only needs a format change). Over a transaction that stages
+ *    G groups that is G(G+1)/2 directory entries (about 30 B each) and the same number of run
+ *    references per index in roots (about 46 B each). Measured: 1M narrow rows at 65,536-row
+ *    memtables stage 15 groups: 120 entries, about 3.6 KB of directories and 5.5 KB of root per
+ *    index over the whole load; 100M rows stage 1,526 groups: 1.17M entries, about 35 MB of
+ *    directories and 54 MB of roots per index (a few percent of the rows' bytes). Follow-up:
+ *    a chained staged directory (append a page per stage) and run lists held by reference;
  * 3. appends the frames, makes the transaction's changes committed in memory (restamping its
  *    pending seqs to its LSN), and releases the writer slot. `commit` resolves here;
  * 4. the frames become durable with the next log flush: if none is running one starts at once;
