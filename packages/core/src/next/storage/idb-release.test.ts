@@ -397,7 +397,7 @@ describe("a release gives up on aborted transactions that never end (review B1-p
       unsettled: unsettled.unsettled,
     }).toEqual({ drained: 0, aborted: 0, unsettled: 1 });
     expect(unsettled.transactions).toEqual([
-      expect.objectContaining({ mode: "readwrite", durability: "strict", created: true }),
+      expect.objectContaining({ mode: "readwrite", durability: "strict" }),
     ]);
     expect(unsettled.waitedMs).toBeGreaterThanOrEqual(30);
     // The strict commit is reported unknown, with the same error: never acknowledged.
@@ -424,6 +424,43 @@ describe("a release gives up on aborted transactions that never end (review B1-p
     // The old session refuses (it is fenced and holds the unknown outcome as its failure).
     await expect(session.publish(new Uint8Array([3]))).rejects.toThrow();
     expect(await successor.release()).toEqual({ drained: 0, aborted: 0 });
+  });
+
+  it("the reviewer's probe: queued work behind the hung transaction is refused, not unknown", async () => {
+    const { state, database } = faultyConnection();
+    const backend = createIndexedDbBackend({
+      database: () => database,
+      locks: new SimLocks(),
+      name: "queued",
+      releaseDrainMs: 5,
+      releaseSettleMs: 30,
+    });
+    const lease = await backend.acquire();
+    const session = await backend.open(lease);
+    state.plans.push("withhold");
+    const publishing = session.publish(new Uint8Array([1])).catch((error: unknown) => error);
+    await tick();
+    // The spill's first write loads its record index: a transaction queued behind the publish.
+    const spilling = scratchOf(backend, lease)
+      .write(0, new Uint8Array(8))
+      .catch((error: unknown) => error);
+    await tick();
+    const release = await outcomeWithin(lease.release(), 2_000);
+    expect(release).not.toBe("pending");
+    const error = (release as { error?: unknown }).error;
+    expect(error).toBeInstanceOf(ReleaseUnsettledError);
+    const unsettled = error as ReleaseUnsettledError;
+    expect([unsettled.drained, unsettled.aborted, unsettled.unsettled]).toEqual([0, 1, 1]);
+    expect(unsettled.transactions).toEqual([
+      { stores: ["roots", "meta"], mode: "readwrite", durability: "strict" },
+    ]);
+    // The queued spill was refused (known); the strict publish is unknown.
+    const spilled = await outcomeWithin(spilling, 100);
+    expect((spilled as { value?: unknown }).value).toBeInstanceOf(StoreClosedError);
+    expect(await outcomeWithin(publishing, 100)).toEqual({ value: unsettled });
+    // Only the created transaction was asked to abort.
+    expect(state.aborts).toBe(1);
+    for (const finish of state.finishers) finish();
   });
 
   it("counts aborted and unsettled transactions apart (unserialized)", async () => {

@@ -297,8 +297,8 @@ class TrackedConnection implements IdbDatabaseLike {
 
   /**
    * Starts no new transaction and waits up to `drainMs` for those issued. If some are left, aborts
-   * them (with `StoreClosedError`; queued ones are refused before they begin) and waits up to
-   * `settleMs` for each to end. Then closes. If some never ended, their operations and this call
+   * those the platform created and refuses those it did not (both with `StoreClosedError`), and
+   * waits up to `settleMs` for the created ones to end. Then closes. If some never ended, their operations and this call
    * reject with `ReleaseUnsettledError` (the close is still requested). Idempotent: every call
    * gets the first call's outcome.
    */
@@ -315,21 +315,22 @@ class TrackedConnection implements IdbDatabaseLike {
       this.#stopped = new StoreClosedError(
         "The lease was released before the transaction finished",
       );
-      for (const { tx } of this.#inFlight.values()) tx?.abort(this.#stopped);
+      for (const issued of this.#inFlight.values())
+        if (issued.tx !== null) issued.tx.abort(this.#stopped);
+        // Never created (queued behind the chain, possibly behind a transaction that will not
+        // end): its outcome is known, refused now (review B1-p2h-3). If the platform was asked
+        // for it, its body aborts itself when it runs.
+        else issued.giveUp(this.#stopped);
       // The platform fires a terminal event (complete or abort) for every transaction it created;
       // one that was already committing completes and counts as drained.
       if (!(await within(settled, settleMs))) {
+        // Only created transactions are left: their outcome is unknown.
         const left = [...this.#inFlight.values()];
         const error = new ReleaseUnsettledError({
           drained: runs.length - this.#aborted - left.length,
           aborted: this.#aborted,
           unsettled: left.length,
-          transactions: left.map(({ stores, mode, durability, tx }) => ({
-            stores,
-            mode,
-            durability,
-            created: tx !== null,
-          })),
+          transactions: left.map(({ stores, mode, durability }) => ({ stores, mode, durability })),
           waitedMs: Date.now() - started,
         });
         // Outcome unknown: never acknowledged, never reported as aborted.

@@ -341,13 +341,15 @@ export class StoreClosedError extends Error {
  * `QuotaExceededError` everywhere, and `InvalidStateError` from a sync-handle *write* on WebKit
  * when the disk is full (bug 327929).
  */
-/** One transaction a release gave up on: never reported complete or abort (diagnostics). */
+/**
+ * One transaction a release gave up on (diagnostics): the platform created it, the release aborted
+ * it, and it never reported complete or abort. Work that was never created is refused instead and
+ * counted under `aborted`.
+ */
 export interface UnsettledTransaction {
   readonly stores: readonly string[];
   readonly mode: "readonly" | "readwrite";
   readonly durability: "strict" | "relaxed";
-  /** False: refused before the platform created it (cannot happen once the release stopped). */
-  readonly created: boolean;
 }
 
 /**
