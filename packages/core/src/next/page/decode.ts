@@ -1422,16 +1422,26 @@ function decodeValues(
       const values = view.plain as Float64Array | Float32Array;
       if (rows === null) out.set(values.subarray(from, to), at);
       else {
-        // Gathered as raw words, never through a JS number (ECMAScript NumericToRawBytes lets
-        // an engine store any NaN for a Number; review B2-p2i-2 #2).
+        // A non-NaN float keeps its bits through a Number (−0 and ±Infinity included); a NaN
+        // may not (ECMAScript NumericToRawBytes lets an engine store any NaN; review B2-p2i-2
+        // #2), so NaNs alone are copied as raw words. Raw words for every row cost more than
+        // the run-to-run spread (scripts/gather-bench.mts).
         const words = values.BYTES_PER_ELEMENT / 4;
-        const source = new Uint32Array(values.buffer, values.byteOffset, values.length * words);
-        const target = new Uint32Array(out.buffer, out.byteOffset, out.length * words);
+        let source: Uint32Array | null = null;
+        let target: Uint32Array | null = null;
         for (let k = 0; k < count; k++) {
-          const row = ((rows[k] ?? 0) - base0) * words;
+          const row = (rows[k] ?? 0) - base0;
+          const value = values[row] ?? 0;
+          if (value === value) {
+            out[at + k] = value;
+            continue;
+          }
+          source ??= new Uint32Array(values.buffer, values.byteOffset, values.length * words);
+          target ??= new Uint32Array(out.buffer, out.byteOffset, out.length * words);
+          const from = row * words;
           const slot = (at + k) * words;
-          target[slot] = source[row] ?? 0;
-          if (words === 2) target[slot + 1] = source[row + 1] ?? 0;
+          target[slot] = source[from] ?? 0;
+          if (words === 2) target[slot + 1] = source[from + 1] ?? 0;
         }
       }
       return;
