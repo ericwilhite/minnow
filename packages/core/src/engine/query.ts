@@ -37,6 +37,7 @@ import type {
   QueryRow,
   QueryValue,
   RecursiveCte,
+  RowLocking,
   ScalarFunctionName,
   SelectItem,
   SelectTail,
@@ -1381,6 +1382,7 @@ export function compileQuery(sql: string, options: CompileQueryOptions = {}): Co
     if (parser.usesStatementDatetime) block.usesStatementDatetime = true;
     if (parser.usesSequenceCalls) block.usesSequenceCalls = true;
     if (parser.usesVolatileFunctions) block.usesVolatileFunctions = true;
+    if (parser.rowLocking !== undefined) block.rowLocking = parser.rowLocking;
   }
   return compiled;
 }
@@ -8298,6 +8300,12 @@ class Parser {
   usesStatementDatetime = false;
   /** Set when the statement names NEXTVAL or CURRVAL. */
   usesSequenceCalls = false;
+  /**
+   * The strongest row lock a `FOR UPDATE | NO KEY UPDATE | SHARE | KEY SHARE` clause asks for
+   * over a real source, anywhere in the statement (PostgreSQL refuses it in a read-only
+   * transaction, naming the strongest). Locks are otherwise ignored.
+   */
+  rowLocking: RowLocking | undefined;
   /** Set when the statement names a volatile scalar function. */
   usesVolatileFunctions = false;
 
@@ -8462,7 +8470,7 @@ class Parser {
   /** The clauses that close a query expression: ORDER BY, then LIMIT/OFFSET or OFFSET/FETCH. */
   #compoundTail(): SelectTail {
     const tail = { orderBy: this.#orderByClause(), ...this.#tailClauses() };
-    this.#lockingClause();
+    this.#lockingClause(true);
     return tail;
   }
 
@@ -10086,21 +10094,35 @@ class Parser {
    * locks for concurrent sessions, which a single-session engine has no need of. Accepted and
    * ignored so a query written for PostgreSQL runs unchanged.
    */
-  #lockingClause(): void {
+  #lockingClause(overSource: boolean): void {
     while (this.#isKeyword("FOR")) {
       this.#keyword("FOR");
-      if (this.#isKeyword("UPDATE")) this.#keyword("UPDATE");
-      else if (this.#isKeyword("SHARE")) this.#keyword("SHARE");
-      else if (this.#isKeyword("NO")) {
+      let strength: RowLocking;
+      if (this.#isKeyword("UPDATE")) {
+        this.#keyword("UPDATE");
+        strength = "UPDATE";
+      } else if (this.#isKeyword("SHARE")) {
+        this.#keyword("SHARE");
+        strength = "SHARE";
+      } else if (this.#isKeyword("NO")) {
         this.#keyword("NO");
         this.#keyword("KEY");
         this.#keyword("UPDATE");
+        strength = "NO KEY UPDATE";
       } else if (this.#isKeyword("KEY")) {
         this.#keyword("KEY");
         this.#keyword("SHARE");
+        strength = "KEY SHARE";
       } else {
         throw new TypeError(`Expected UPDATE or SHARE after FOR, found ${this.#peek().text}`);
       }
+      // A FROM-less SELECT locks no row, so PostgreSQL runs `SELECT 1 FOR UPDATE` anywhere.
+      if (
+        overSource &&
+        (this.rowLocking === undefined ||
+          ROW_LOCKING_ORDER.indexOf(strength) > ROW_LOCKING_ORDER.indexOf(this.rowLocking))
+      )
+        this.rowLocking = strength;
       if (this.#isKeyword("OF")) {
         this.#keyword("OF");
         this.#identifier();
@@ -10266,7 +10288,7 @@ class Parser {
     }
     const orderBy = compoundMember ? [] : this.#orderByClause();
     const tail = compoundMember ? {} : this.#tailClauses();
-    if (!compoundMember) this.#lockingClause();
+    if (!compoundMember) this.#lockingClause(base.table !== DUAL_TABLE);
     if (distinctOn !== undefined) {
       return this.#distinctOnBlock(
         sql,
@@ -14168,6 +14190,7 @@ export function bindPendingSelectShapes(
       "usesStatementDatetime",
       "usesSequenceCalls",
       "usesVolatileFunctions",
+      "rowLocking",
     ] as const) {
       const value = from[key];
       if (value !== undefined) Object.assign(to, { [key]: value });
@@ -14788,6 +14811,9 @@ function timestampLiteral(text: string): Date {
 }
 
 /** The parser's OFFSET range contract, shared with the typed builder. */
+/** Row lock strengths, weakest first (PostgreSQL's LockClauseStrength). */
+const ROW_LOCKING_ORDER: readonly RowLocking[] = ["KEY SHARE", "SHARE", "NO KEY UPDATE", "UPDATE"];
+
 export function validateOffset(offset: number): number {
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > 100_000_000)
     throw new RangeError("OFFSET must be between 0 and 100,000,000");

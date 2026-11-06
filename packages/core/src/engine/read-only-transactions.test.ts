@@ -144,8 +144,23 @@ const ENTRY_POINTS: ReadonlyArray<
   ],
 ];
 
-/** Reads a read-only transaction refuses, or runs (review B6 stream A 2, finding 1). */
-const READS = ["SELECT count(*) AS n FROM t", "SELECT nextval('s') AS n"];
+/** Reads a read-only transaction refuses, or runs (review B6 stream A 2, findings 1 and 3). */
+const READS = [
+  "SELECT count(*) AS n FROM t",
+  "SELECT nextval('s') AS n",
+  "SELECT * FROM t FOR UPDATE",
+  "SELECT * FROM t FOR NO KEY UPDATE",
+  "SELECT * FROM t FOR SHARE",
+  "SELECT * FROM t FOR KEY SHARE",
+  "SELECT * FROM t FOR SHARE FOR UPDATE",
+  "SELECT * FROM t FOR KEY SHARE FOR NO KEY UPDATE",
+  "SELECT * FROM t FOR UPDATE OF t NOWAIT",
+  "SELECT * FROM t FOR UPDATE SKIP LOCKED",
+  "SELECT * FROM (SELECT * FROM t FOR UPDATE) s",
+  "SELECT * FROM t WHERE id IN (SELECT id FROM u FOR SHARE)",
+  "WITH c AS (SELECT * FROM t FOR UPDATE) SELECT * FROM c",
+  "SELECT 1 AS one FOR UPDATE",
+];
 
 /**
  * Statement sequences where a read is the transaction's first statement (finding 1), and that
@@ -245,7 +260,7 @@ const SEQUENCES: ReadonlyArray<readonly string[]> = [
 
 /**
  * PostgreSQL's outcome of `statements` in a fresh schema: ok, or the first SQLSTATE, with the
- * message for 25006 (it names the refused command, such as `nextval()`).
+ * message for 25006 (it names the refused command: `SELECT FOR UPDATE`, `nextval()`).
  */
 async function pgRun(statements: readonly string[]): Promise<string> {
   await pg.exec("DROP SCHEMA IF EXISTS ro CASCADE; CREATE SCHEMA ro; SET search_path TO ro");
@@ -282,8 +297,8 @@ async function minnowRun(
   }
 }
 
-describe("READ ONLY across entry points and savepoints (review B6 stream A 2)", () => {
-  it("refuses sequence changes through every read entry point, as PostgreSQL", async () => {
+describe("READ ONLY across entry points, row locks and savepoints (review B6 stream A 2)", () => {
+  it("refuses sequence changes and row locks through every read entry point, as PostgreSQL", async () => {
     const mismatches: string[] = [];
     const reach = createReach<string>("read-only reads", REFUSAL_STATES);
     for (const begin of ["BEGIN READ ONLY", "BEGIN", "BEGIN READ WRITE"])

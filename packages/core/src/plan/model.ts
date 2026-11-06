@@ -451,6 +451,9 @@ export interface Predicate {
   escape?: string;
 }
 
+/** A SELECT row-lock strength, as PostgreSQL names it. */
+export type RowLocking = "UPDATE" | "NO KEY UPDATE" | "SHARE" | "KEY SHARE";
+
 export interface CompiledQuery {
   sql: string;
   base: TableSource;
@@ -501,6 +504,12 @@ export interface CompiledQuery {
   parameterCount?: number;
   usesStatementDatetime?: boolean;
   usesSequenceCalls?: boolean;
+  /**
+   * The strongest `FOR UPDATE | NO KEY UPDATE | SHARE | KEY SHARE` row lock the statement asks
+   * for over a real source. Locks are ignored (one session), but a read-only transaction
+   * refuses them, as PostgreSQL does.
+   */
+  rowLocking?: RowLocking;
   usesVolatileFunctions?: boolean;
 }
 

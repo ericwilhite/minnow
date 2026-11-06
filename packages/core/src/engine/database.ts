@@ -2618,7 +2618,8 @@ function readOnlyTransactionError(command: string): TypeError {
 /**
  * The one admission of a statement into an open transaction, which every entry point calls:
  * execute (writes here, its SELECTs through `query`), `query` and `queryCursor`, and a built
- * query's `run`. A read-only transaction refuses writes and sequence changes (25006), and the
+ * query's `run`. A read-only transaction refuses writes, sequence changes and row locks (25006),
+ * and the
  * statement counts as the transaction's first for READ WRITE's 25001. SET and SHOW are session
  * settings, not statements of the transaction, and a live set's background refresh is not a
  * caller's statement. Table-method writes (`insert`, write scopes) never enter a SQL-begun
@@ -2631,6 +2632,8 @@ function admitToTransaction(
   if (open.readOnly) {
     if ("write" in statement) throw readOnlyTransactionError(writeCommand(statement.write));
     if (statement.read.usesSequenceCalls === true) throw readOnlyTransactionError("nextval()");
+    if (statement.read.rowLocking !== undefined)
+      throw readOnlyTransactionError(`SELECT FOR ${statement.read.rowLocking}`);
   }
   open.queried = true;
 }
