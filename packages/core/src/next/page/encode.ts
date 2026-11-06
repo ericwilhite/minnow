@@ -35,6 +35,7 @@ import {
   STAT_PREFIX_BYTES,
   validityBytes,
   SCALED_FLOAT_MAX_EXPONENT,
+  scaledFloatSafe,
   ValueTag,
 } from "./format.js";
 import { DistinctSketch, hashBytes, hashFloat, hashInt64, mix32 } from "./sketch.js";
@@ -780,6 +781,7 @@ function encodeScaledFloat(
   }
   if (min === Infinity) return null;
   const range = max - min;
+  if (!scaledFloatSafe(min, range)) return null; // the reader's rule (format.ts)
   const width =
     range === 0 ? 0 : range < 256 ? 1 : range < 65_536 ? 2 : range < 4_294_967_296 ? 4 : 8;
   if (width === 8) return null;

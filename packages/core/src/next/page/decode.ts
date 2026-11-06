@@ -29,6 +29,7 @@ import {
   LITTLE_ENDIAN,
   PAGE_HEADER_BYTES,
   SCALED_FLOAT_MAX_EXPONENT,
+  scaledFloatSafe,
   PageFlag,
   plainWidth,
   validityBytes,
@@ -414,14 +415,21 @@ export function parsePage(
       check(!allNull, "All-null scaled-float page");
       fits(start + 8);
       const base = new Float64Array(buffer, offset + start, 1)[0] ?? Number.NaN;
-      const top = base + (width === 0 ? 0 : 2 ** (8 * width) - 1);
-      check(
-        Number.isSafeInteger(base) && Number.isSafeInteger(top),
-        "Scaled-float base out of range",
-      );
       const deltasAt = start + 8;
       const deltaBytes = align8(rows * width);
       fits(deltasAt + deltaBytes + 8);
+      // The writer's own rule (format.ts `scaledFloatSafe`) on the stored deltas, not on what
+      // the width could hold (review B2-p2i #1).
+      const stored = width === 0 ? null : unsignedView(buffer, offset + deltasAt, width, rows);
+      const maxDelta =
+        stored === null
+          ? 0
+          : stored instanceof Uint8Array
+            ? max8(stored, rows)
+            : stored instanceof Uint16Array
+              ? max16(stored, rows)
+              : max32(stored, rows);
+      check(scaledFloatSafe(base, maxDelta), "Scaled-float integers out of the safe range");
       const header = new Uint32Array(buffer, offset + deltasAt + deltaBytes, 2);
       const patches = header[0] ?? 0;
       check(header[1] === 0 && patches <= rows, "Bad scaled-float patch count");
@@ -431,11 +439,8 @@ export function parsePage(
       fits(length);
       const lane = new Float64Array(rows);
       const power = 10 ** aux;
-      if (width === 0) lane.fill(base / power);
-      else {
-        const deltas = unsignedView(buffer, offset + deltasAt, width, rows);
-        for (let row = 0; row < rows; row++) lane[row] = (base + (deltas[row] ?? 0)) / power;
-      }
+      if (stored === null) lane.fill(base / power);
+      else for (let row = 0; row < rows; row++) lane[row] = (base + (stored[row] ?? 0)) / power;
       const positions = new Uint32Array(buffer, offset + positionsAt, patches);
       const laneBytes = new Uint8Array(lane.buffer);
       let previous = -1;

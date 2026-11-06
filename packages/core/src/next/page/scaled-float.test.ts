@@ -35,6 +35,7 @@ const STATES = [
   "width 1",
   "width 2",
   "width 4",
+  "a scaled page within 2^32 of the safe-integer bound",
 ] as const;
 const reach = createReach("next-scaled-float", STATES);
 afterAll(() => {
@@ -66,7 +67,20 @@ describe.each(SEEDS)("scaledFloat pages round-trip every float64 bit for bit (se
         fc.constantFrom(0, 0.01, 0.04, 0.3),
         fc.integer({ min: 0, max: 6 }),
         fc.constantFrom(1, 10, 300, 70_000, 2 ** 31, 2 ** 40),
-        fc.integer({ min: -1_000_000, max: 1_000_000 }),
+        // Offsets around zero, and at the positive and negative safe-integer bounds (review
+        // B2-p2i #1): a page's integers then sit within its width of 2^53.
+        fc.oneof(
+          fc.integer({ min: -1_000_000, max: 1_000_000 }),
+          fc.constantFrom(
+            Number.MAX_SAFE_INTEGER - 1,
+            Number.MAX_SAFE_INTEGER - 255,
+            Number.MAX_SAFE_INTEGER - 65_535,
+            Number.MAX_SAFE_INTEGER - 2 ** 31,
+            Number.MAX_SAFE_INTEGER - 2 ** 32 + 1,
+            -Number.MAX_SAFE_INTEGER,
+            -Number.MAX_SAFE_INTEGER + 300,
+          ),
+        ),
         fc.array(fc.bigInt({ min: 0n, max: (1n << 64n) - 1n }), { minLength: 8, maxLength: 8 }),
         async (rowCount, noise, exponent, spread, offset, randomBits) => {
           reach.beginHistory();
@@ -159,6 +173,18 @@ describe.each(SEEDS)("scaledFloat pages round-trip every float64 bit for bit (se
             const e = new Uint32Array(stored.buffer, stored.byteOffset + 8, 1)[0] ?? 0;
             lease.release();
             reach.reach(`width ${String(width)}` as (typeof STATES)[number]);
+            const base =
+              new Float64Array(
+                stored.buffer,
+                stored.byteOffset +
+                  16 +
+                  (entry.nullCount > 0
+                    ? Math.ceil((Math.ceil(entry.rowCount / 32) * 4) / 8) * 8
+                    : 0),
+                1,
+              )[0] ?? 0;
+            if (Math.abs(base) > Number.MAX_SAFE_INTEGER - 2 ** 32)
+              reach.reach("a scaled page within 2^32 of the safe-integer bound");
             if (e === 0) reach.reach("exponent 0");
             if (e >= 3) reach.reach("exponent 3 or more");
             const present = pageValues.filter((each): each is number => each !== null);

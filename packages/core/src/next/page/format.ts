@@ -63,6 +63,14 @@ export const PAGE_HEADER_BYTES = 16;
 export const DELTA_BLOCK = 128;
 /** The largest exponent of a `scaledFloat` page (10^15 is exact; integers stay safe). */
 export const SCALED_FLOAT_MAX_EXPONENT = 15;
+/**
+ * The one validity rule of a `scaledFloat` page's integers, shared by writer and reader (review
+ * B2-p2i #1): the base and base + the largest stored delta are safe integers, so every row's
+ * integer is. The writer declines any page this refuses; the reader refuses any page it refuses.
+ */
+export function scaledFloatSafe(base: number, maxDelta: number): boolean {
+  return Number.isSafeInteger(base) && Number.isSafeInteger(base + maxDelta);
+}
 /** Text and bytes statistics keep at most this many bytes of a bound. */
 export const STAT_PREFIX_BYTES = 32;
 
