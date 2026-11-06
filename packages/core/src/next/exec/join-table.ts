@@ -25,8 +25,11 @@ import { KeyBatch } from "../keys/key-encoding.js";
 import {
   KEY_STEP_BYTES,
   KeyScratch,
+  KeyWork,
   bytesEqual,
+  equalJob,
   extractKeys,
+  extractKeysJob,
   keyStepRows,
   levelHash,
   type KeyLayout,
@@ -108,7 +111,7 @@ export class JoinTable {
   static estimateBytes(layout: KeyLayout, rows: number): number {
     let capacity = 2;
     while (capacity * MAX_LOAD < rows) capacity *= 2;
-    const stride = layout.family === "words" ? 1 + layout.width : 2;
+    const stride = layout.family === "words" ? 1 + layout.width : 3;
     return capacity * stride * 4 + rows * 4;
   }
 
@@ -152,6 +155,8 @@ export class JoinTable {
     scratch: KeyScratch,
     slice: Slice,
     options: { readonly direct?: boolean } = {},
+    /** The key-byte budget (tests pass one to read the work per step). */
+    work: KeyWork = new KeyWork(),
   ): SlicedJob<JoinTable | null> {
     const rows = store.rows;
     if (options.direct !== false && layout.directable && level === 0) {
@@ -162,13 +167,14 @@ export class JoinTable {
     const table = new JoinTable(kind, store, keyColumns, layout, level, charge, scratch.capacity);
     let capacity = 2;
     while (capacity * MAX_LOAD < Math.max(1, rows)) capacity *= 2;
-    table.#stride = kind === "words" ? 1 + layout.width : 2;
+    // Bytes keys: head, hash, second hash (64 bits compared before any byte).
+    table.#stride = kind === "words" ? 1 + layout.width : 3;
     if (!table.#allocate(capacity * table.#stride * 4)) return null;
     table.#slots = new Int32Array(capacity * table.#stride);
     table.#mask = capacity - 1;
     table.#shift = 32 - Math.log2(capacity);
     table.#touch = capacity * table.#stride * 4 > TOUCH_BYTES;
-    if (!(yield* table.#insertAll(scratch, slice))) {
+    if (!(yield* table.#insertAll(scratch, slice, work))) {
       table.close();
       return null;
     }
@@ -243,7 +249,11 @@ export class JoinTable {
     return table;
   }
 
-  *#insertAll(scratch: KeyScratch, slice: Slice): SlicedJob<boolean> {
+  *#insertAll(
+    scratch: KeyScratch,
+    slice: Slice,
+    work: KeyWork = new KeyWork(),
+  ): SlicedJob<boolean> {
     const store = this.#store;
     const column = this.#keyColumns[0] ?? 0;
     if (this.kind === "direct" && store.tier(column) === 0 && !store.hasNulls(column)) {
@@ -272,13 +282,24 @@ export class JoinTable {
     for (let k = 0; k < store.chunkCount; k++) {
       const count = store.chunk(0, k).length;
       const keys = chunkKeys(store, this.#keyColumns, k);
+      const bytesKeys = this.#layout.family !== "words";
       for (let from = 0; from < count;) {
-        const m = keyStepRows(keys, null, from, count - from, KEY_STEP_BYTES / 2);
-        const done = extractKeys(keys, null, from, m, scratch, this.kind !== "direct");
+        // Encoding goes by steps of key bytes; hashing and comparing spend the work budget byte
+        // by byte, resumable within a key and a collision chain (review B7-p2c-2).
+        const m =
+          this.#layout.family === "raw"
+            ? count - from
+            : keyStepRows(keys, null, from, count - from, KEY_STEP_BYTES / 2);
+        const done = bytesKeys
+          ? yield* extractKeysJob(keys, null, from, m, scratch, work, slice)
+          : extractKeys(keys, null, from, m, scratch, this.kind !== "direct");
         if (done < m) return false;
         if (this.#layout.family === "enc" && !this.#keepEncoded(scratch.encoded, k, from, m, count))
           return false;
-        if (!this.#insertChunk(scratch, k * store.chunkRows + from, m)) return false;
+        const base = k * store.chunkRows + from;
+        if (bytesKeys) {
+          if (!(yield* this.#insertBytesJob(scratch, base, m, work, slice))) return false;
+        } else if (!this.#insertChunk(scratch, base, m)) return false;
         from += m;
         if (slice.due()) yield;
       }
@@ -385,26 +406,58 @@ export class JoinTable {
       }
       return true;
     }
+    // Bytes keys go through #insertBytesJob (resumable equality).
+    throw new TypeError("Bytes keys insert through #insertBytesJob");
+  }
+
+  /**
+   * Bytes keys: inserts rows `base … base + count` (keys in `scratch` 0 …), comparing a key with
+   * every slot of equal 64-bit hash through `equalJob`. The chain position and the comparison's
+   * byte offset survive each yield, so a collision chain is bounded work per step.
+   */
+  *#insertBytesJob(
+    scratch: KeyScratch,
+    base: number,
+    count: number,
+    work: KeyWork,
+    slice: Slice,
+  ): SlicedJob<boolean> {
+    const strict = ~this.#layout.nullSafeMask;
+    const slots = this.#slots;
+    const mask = this.#mask;
+    const shift = this.#shift;
+    const level = this.#level;
     for (let i = 0; i < count; i++) {
-      if (((nulls[i] ?? 0) & strict) !== 0) continue;
-      const hash = hashes[i] ?? 0;
-      const h = levelHash(hash, level);
-      let s = ((h << 4) >>> shift) & mask;
+      if (((scratch.nulls[i] ?? 0) & strict) !== 0) continue;
+      const hash = scratch.hashes[i] ?? 0;
+      const hash2 = scratch.hashes2[i] ?? 0;
+      let s = ((levelHash(hash, level) << 4) >>> shift) & mask;
       const row = base + i;
+      const mine = this.#buildBytes(row);
+      const ms = this.#keyStart;
+      const me = this.#keyEnd;
       for (;;) {
-        const slot = s * 2;
+        const slot = s * 3;
         const head = slots[slot] ?? 0;
         if (head === 0) {
           slots[slot] = row + 1;
           slots[slot + 1] = hash;
+          slots[slot + 2] = hash2;
           break;
         }
-        if ((slots[slot + 1] ?? 0) >>> 0 === hash && this.#sameBuildKeys(head - 1, row)) {
-          if (!this.#linkDuplicate(row, head)) return false;
-          slots[slot] = row + 1;
-          break;
+        if ((slots[slot + 1] ?? 0) >>> 0 === hash && (slots[slot + 2] ?? 0) >>> 0 === hash2) {
+          const theirs = this.#buildBytes(head - 1);
+          const ts = this.#keyStart;
+          const te = this.#keyEnd;
+          const same = yield* equalJob(theirs, ts, te, mine, ms, me, work, slice);
+          if (same) {
+            if (!this.#linkDuplicate(row, head)) return false;
+            slots[slot] = row + 1;
+            break;
+          }
         }
         s = (s + 1) & mask;
+        if (work.spend(12) && slice.due()) yield;
       }
       this.inserted++;
     }
@@ -448,14 +501,6 @@ export class JoinTable {
     this.#rawOffsets[chunk] = data.offsets;
     this.#rawBytes[chunk] = data.bytes;
     return data.offsets;
-  }
-
-  #sameBuildKeys(a: number, b: number): boolean {
-    const x = this.#buildBytes(a);
-    const xs = this.#keyStart;
-    const xe = this.#keyEnd;
-    const y = this.#buildBytes(b);
-    return bytesEqual(x, xs, xe, y, this.#keyStart, this.#keyEnd);
   }
 
   /**
@@ -649,12 +694,13 @@ export class JoinTable {
           start = encoded?.offsets[k] ?? 0;
           end = encoded?.offsets[k + 1] ?? 0;
         }
+        const hash2 = scratch.hashes2[k] ?? 0;
         let s = starts[k] ?? 0;
         for (;;) {
-          const slot = s * 2;
+          const slot = s * 3;
           const h = slots[slot] ?? 0;
           if (h === 0) break;
-          if ((slots[slot + 1] ?? 0) >>> 0 === hash) {
+          if ((slots[slot + 1] ?? 0) >>> 0 === hash && (slots[slot + 2] ?? 0) >>> 0 === hash2) {
             const bytes = this.#buildBytes(h - 1);
             if (bytesEqual(bytes, this.#keyStart, this.#keyEnd, probeBytes, start, end)) {
               head = h;
@@ -667,6 +713,84 @@ export class JoinTable {
       heads[k] = head;
       if (head !== 0) matched++;
       seen?.set(scratch.slots[k] ?? -1, head);
+    }
+    return matched;
+  }
+
+  /**
+   * `lookup` as a sliced job: bytes keys compare through `equalJob` (resumable within a key and
+   * a chain); `memo` (raw dictionary slots → heads) persists across a caller's calls for one
+   * batch. Words and direct keys look up at once.
+   */
+  *lookupJob(
+    scratch: KeyScratch,
+    count: number,
+    heads: Int32Array,
+    work: KeyWork,
+    slice: Slice,
+    memo: Map<number, number> | null = null,
+  ): SlicedJob<number> {
+    if (this.kind !== "bytes") {
+      const matched = this.lookup(scratch, count, heads);
+      if (work.spend(8 * count) && slice.due()) yield;
+      return matched;
+    }
+    const strict = ~this.#layout.nullSafeMask;
+    const slots = this.#slots;
+    const mask = this.#mask;
+    const shift = this.#shift;
+    const level = this.#level;
+    const raw = this.#layout.family === "raw";
+    const shared = raw && scratch.rawShared ? memo : null;
+    let matched = 0;
+    for (let k = 0; k < count; k++) {
+      const slotKey = scratch.slots[k] ?? -1;
+      const known = shared?.get(slotKey);
+      if (known !== undefined) {
+        heads[k] = known;
+        if (known !== 0) matched++;
+        continue;
+      }
+      let head = 0;
+      if (((scratch.nulls[k] ?? 0) & strict) === 0) {
+        const hash = scratch.hashes[k] ?? 0;
+        const hash2 = scratch.hashes2[k] ?? 0;
+        let probe: Uint8Array;
+        let start: number;
+        let end: number;
+        if (raw) {
+          const data = scratch.rawData;
+          probe = data?.bytes ?? new Uint8Array(0);
+          start = data?.offsets[slotKey] ?? 0;
+          end = data?.offsets[slotKey + 1] ?? 0;
+        } else {
+          const encoded = scratch.encoded;
+          probe = encoded?.writer.bytes ?? new Uint8Array(0);
+          start = encoded?.offsets[k] ?? 0;
+          end = encoded?.offsets[k + 1] ?? 0;
+        }
+        let s = ((levelHash(hash, level) << 4) >>> shift) & mask;
+        for (;;) {
+          const slot = s * 3;
+          const h = slots[slot] ?? 0;
+          if (h === 0) break;
+          if ((slots[slot + 1] ?? 0) >>> 0 === hash && (slots[slot + 2] ?? 0) >>> 0 === hash2) {
+            const theirs = this.#buildBytes(h - 1);
+            const ts = this.#keyStart;
+            const te = this.#keyEnd;
+            const same = yield* equalJob(theirs, ts, te, probe, start, end, work, slice);
+            if (same) {
+              head = h;
+              break;
+            }
+          }
+          s = (s + 1) & mask;
+          if (work.spend(12) && slice.due()) yield;
+        }
+      }
+      heads[k] = head;
+      if (head !== 0) matched++;
+      shared?.set(slotKey, head);
     }
     return matched;
   }

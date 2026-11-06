@@ -28,13 +28,14 @@
  * Extraction reads flat, constant and dictionary vectors, writes caller-owned scratch, and
  * allocates nothing per row.
  */
-import { xxHash32 } from "../hash/xxhash32.js";
+import { XxHash32Stream, xxHash32 } from "../hash/xxhash32.js";
 import { KeyBatch, encodeKeyBatch, type KeyColumn } from "../keys/key-encoding.js";
 import type { PhysicalType } from "../types.js";
 import type { ByteCharge } from "../vector/varlen.js";
 import type { FlatVector, Validity, Vector } from "../vector/vector.js";
 import { UnsupportedPlanError } from "./errors.js";
 import { hiOfSafe, wordsOf } from "./column-store.js";
+import type { Slice, SlicedJob } from "./slices.js";
 
 export const HASH_SEED = 0x2f0b_3c4d;
 /** Most words a key keeps inline in its hash-table slot. */
@@ -176,6 +177,11 @@ export class KeyScratch {
   /** Bit i set: key column i is null in that row. */
   readonly nulls: Int32Array;
   readonly hashes: Uint32Array;
+  /**
+   * Bytes family: a second hash (`HASH_SEED2`) of keys longer than `LONG_KEY_BYTES`, else 0:
+   * with `hashes`, 64 bits that a table compares before any byte (accidental chains vanish).
+   */
+  readonly hashes2: Uint32Array;
   /** `raw`: the source slot of each row in `rawData` (−1 null). */
   readonly slots: Int32Array;
   rawData: { readonly bytes: Uint8Array; readonly offsets: Int32Array } | null = null;
@@ -200,18 +206,19 @@ export class KeyScratch {
     encodedCharge: ByteCharge = charge,
   ) {
     this.capacity = capacity;
-    const bytes = capacity * (4 * Math.max(1, layout.width) + 12);
+    const bytes = capacity * (4 * Math.max(1, layout.width) + 16);
     if (!charge.allocate(bytes)) throw new RangeError("A join's key scratch must be admitted");
     this.words = new Int32Array(capacity * Math.max(1, layout.width));
     this.nulls = new Int32Array(capacity);
     this.hashes = new Uint32Array(capacity);
+    this.hashes2 = new Uint32Array(capacity);
     this.slots = new Int32Array(capacity);
     this.encoded = layout.family === "enc" ? new KeyBatch(encodedCharge, 1 << 30) : null;
   }
 
   static bytes(layout: KeyLayout, capacity: number): number {
     return (
-      capacity * (4 * Math.max(1, layout.width) + 12) +
+      capacity * (4 * Math.max(1, layout.width) + 16) +
       (layout.family === "enc" ? 4096 + 4 * 65 : 0)
     );
   }
@@ -395,27 +402,25 @@ export function extractKeys(
     const shared = vector.form !== "flat";
     out.rawShared = shared;
     const seen = shared ? new Map<number, number>() : null;
+    const seenAt = shared ? new Map<number, number>() : null;
     for (let k = 0; k < count; k++) {
       const row = ids === null ? from + k : (ids[from + k] ?? 0);
       const slot = sourceSlot(vector, row);
       slots[k] = slot;
       if (slot < 0 || !hash) {
         hashes[k] = 0;
+        out.hashes2[k] = 0;
         continue;
       }
       const known = seen?.get(slot);
       if (known !== undefined) {
         hashes[k] = known;
+        out.hashes2[k] = out.hashes2[seenAt?.get(slot) ?? 0] ?? 0;
         continue;
       }
-      const h = xxHash32(
-        data.bytes,
-        HASH_SEED,
-        data.offsets[slot] ?? 0,
-        data.offsets[slot + 1] ?? 0,
-      );
-      hashes[k] = h;
-      seen?.set(slot, h);
+      hashInto(out, k, data.bytes, data.offsets[slot] ?? 0, data.offsets[slot + 1] ?? 0);
+      seen?.set(slot, hashes[k] ?? 0);
+      seenAt?.set(slot, k);
     }
     return count;
   }
@@ -432,19 +437,175 @@ export function extractKeys(
   );
   const done = result.encoded;
   out.requiredBytes = result.done ? 0 : result.requiredBytes;
-  for (let k = 0; k < done; k++)
-    hashes[k] = xxHash32(
-      encoded.writer.bytes,
-      HASH_SEED,
-      encoded.offsets[k] ?? 0,
-      encoded.offsets[k + 1] ?? 0,
-    );
+  if (hash)
+    for (let k = 0; k < done; k++)
+      hashInto(out, k, encoded.writer.bytes, encoded.offsets[k] ?? 0, encoded.offsets[k + 1] ?? 0);
   out.count = done;
   return done;
 }
 
 /** Key bytes one bounded step of key work scans (hashing, encoding, comparing): R23.2. */
 export const KEY_STEP_BYTES = 256 * 1024;
+
+/** Keys longer than this get a second hash (`HASH_SEED2`): 64 bits before any byte compare. */
+export const LONG_KEY_BYTES = 64;
+export const HASH_SEED2 = 0x6a09_e667;
+
+/** Both hashes of one key, at once (the synchronous paths; the key fits a step). */
+function hashInto(out: KeyScratch, k: number, bytes: Uint8Array, start: number, end: number): void {
+  out.hashes[k] = xxHash32(bytes, HASH_SEED, start, end);
+  out.hashes2[k] = end - start > LONG_KEY_BYTES ? xxHash32(bytes, HASH_SEED2, start, end) : 0;
+}
+
+/**
+ * A budget of key bytes per step (review B7-p2c-2: every byte of hashing and equality counts).
+ * `spend` returns true when the step is used up: the caller checks its deadline (and yields)
+ * and the budget starts again. `total` is the bytes spent overall (tests read it per step).
+ */
+export class KeyWork {
+  left: number;
+  total = 0;
+  constructor(readonly step = KEY_STEP_BYTES) {
+    this.left = step;
+  }
+  spend(bytes: number): boolean {
+    this.total += bytes;
+    this.left -= bytes;
+    if (this.left > 0) return false;
+    this.left = this.step;
+    return true;
+  }
+}
+
+/** Bytes a resumable job takes at once before it spends them (at least this, to make progress). */
+const WORK_CHUNK = 4096;
+
+/**
+ * Both hashes of `bytes[start, end)` into `out[0]`, `out[1]` (the second 0 for short keys), in
+ * steps of the budget: a key longer than what is left is streamed (XxHash32Stream), so an
+ * oversized key spans many steps. Equal to `hashInto` for every key.
+ */
+export function* hashKeyJob(
+  bytes: Uint8Array,
+  start: number,
+  end: number,
+  work: KeyWork,
+  slice: Slice,
+  out: Uint32Array,
+): SlicedJob<void> {
+  const length = end - start;
+  const long = length > LONG_KEY_BYTES;
+  if ((long ? 2 * length : length) <= Math.max(work.left, WORK_CHUNK)) {
+    out[0] = xxHash32(bytes, HASH_SEED, start, end);
+    out[1] = long ? xxHash32(bytes, HASH_SEED2, start, end) : 0;
+    if (work.spend(long ? 2 * length : length) && slice.due()) yield;
+    return;
+  }
+  const first = new XxHash32Stream(HASH_SEED);
+  const second = new XxHash32Stream(HASH_SEED2);
+  for (let at = start; at < end;) {
+    const n = Math.min(end - at, Math.max(WORK_CHUNK, work.left >>> 1));
+    first.update(bytes, at, at + n);
+    second.update(bytes, at, at + n);
+    at += n;
+    if (work.spend(2 * n) && slice.due()) yield;
+  }
+  out[0] = first.digest();
+  out[1] = second.digest();
+}
+
+/**
+ * Whether `a[as, ae)` equals `b[bs, be)`, compared in steps of the budget (a cursor that may
+ * suspend mid-key; callers keep their chain position across it).
+ */
+export function* equalJob(
+  a: Uint8Array,
+  as: number,
+  ae: number,
+  b: Uint8Array,
+  bs: number,
+  be: number,
+  work: KeyWork,
+  slice: Slice,
+): SlicedJob<boolean> {
+  const length = ae - as;
+  if (length !== be - bs) return false;
+  for (let at = 0; at < length;) {
+    const n = Math.min(length - at, Math.max(WORK_CHUNK, work.left));
+    for (let i = 0; i < n; i++)
+      if (a[as + at + i] !== b[bs + at + i]) {
+        work.spend(i + 1);
+        return false;
+      }
+    at += n;
+    if (work.spend(n) && slice.due()) yield;
+  }
+  return true;
+}
+
+/**
+ * `extractKeys` as a sliced job: the bytes family's hashing goes through `hashKeyJob` (every
+ * byte counted, long keys streamed) and repeated dictionary slots are hashed once per `memo`
+ * (a caller's per-batch cache: slot → [h1, h2]); the words family is extracted at once.
+ */
+export function* extractKeysJob(
+  keys: readonly Vector[],
+  ids: ArrayLike<number> | null,
+  from: number,
+  count: number,
+  out: KeyScratch,
+  work: KeyWork,
+  slice: Slice,
+  memo: Map<number, readonly [number, number]> | null = null,
+): SlicedJob<number> {
+  const layout = out.layout;
+  if (layout.family === "words") {
+    const done = extractKeys(keys, ids, from, count, out, true);
+    if (work.spend(8 * Math.max(1, layout.width) * count) && slice.due()) yield;
+    return done;
+  }
+  const done = extractKeys(keys, ids, from, count, out, false);
+  const pair = new Uint32Array(2);
+  const strict = ~layout.nullSafeMask;
+  for (let k = 0; k < done; k++) {
+    let bytes: Uint8Array;
+    let start: number;
+    let end: number;
+    if (layout.family === "raw") {
+      const slot = out.slots[k] ?? -1;
+      if (slot < 0 || ((out.nulls[k] ?? 0) & strict) !== 0) {
+        out.hashes[k] = 0;
+        out.hashes2[k] = 0;
+        continue;
+      }
+      const known = memo?.get(slot);
+      if (known !== undefined) {
+        out.hashes[k] = known[0];
+        out.hashes2[k] = known[1];
+        continue;
+      }
+      const data = out.rawData;
+      if (data === null) continue;
+      bytes = data.bytes;
+      start = data.offsets[slot] ?? 0;
+      end = data.offsets[slot + 1] ?? 0;
+      yield* hashKeyJob(bytes, start, end, work, slice, pair);
+      out.hashes[k] = pair[0] ?? 0;
+      out.hashes2[k] = pair[1] ?? 0;
+      if (out.rawShared) memo?.set(slot, [pair[0] ?? 0, pair[1] ?? 0]);
+      continue;
+    }
+    const encoded = out.encoded;
+    if (encoded === null) break;
+    bytes = encoded.writer.bytes;
+    start = encoded.offsets[k] ?? 0;
+    end = encoded.offsets[k + 1] ?? 0;
+    yield* hashKeyJob(bytes, start, end, work, slice, pair);
+    out.hashes[k] = pair[0] ?? 0;
+    out.hashes2[k] = pair[1] ?? 0;
+  }
+  return done;
+}
 
 function varlenOf(vector: Vector): { bytes: Uint8Array; offsets: Int32Array } | null {
   const data = flatOf(vector).data;

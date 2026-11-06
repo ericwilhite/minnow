@@ -12,7 +12,17 @@ import type { Batch } from "../vector/vector.js";
 import { ColumnStore } from "./column-store.js";
 import { INT, TEXT, batchesOf, type Row } from "./join-fixtures.js";
 import { JoinRuntimeFilter } from "./join-filter.js";
-import { KeyLayout, KeyScratch, extractKeys } from "./join-keys.js";
+import {
+  KEY_STEP_BYTES,
+  KeyLayout,
+  KeyScratch,
+  KeyWork,
+  extractKeys,
+  extractKeysJob,
+} from "./join-keys.js";
+import * as hashing from "../hash/xxhash32.js";
+import { XxHash32Stream } from "../hash/xxhash32.js";
+import { vi } from "vitest";
 import { JoinTable } from "./join-table.js";
 import { HashJoin, hashJoinMinimumBytes, type HashJoinKind, type HashJoinSpec } from "./join.js";
 import type { Operator, PushResult } from "./pipeline.js";
@@ -402,22 +412,177 @@ describe("review B7-p2c-1 #3: join work is bounded by key bytes", () => {
     expect(serviced).toBe(true);
     await probe.finish();
     expect(sink.rows).toBe(64);
-    // Each part pushes its own output: one batch of 4 MiB of keys becomes many steps.
-    expect(sink.pushes).toBeGreaterThan(16);
   }, 60_000);
 
-  it("a build batch past one step of key bytes is added in parts, yielding", async () => {
+  it("a build batch of wide keys is hashed in byte steps when the table is built", async () => {
+    // A resident raw build only stores rows at arrival; its keys are hashed (and compared) by
+    // the table build, in steps of the key-byte budget.
     const s = spec("inner", types);
     const { join } = await setup(s);
     const [batch] = [...batchesOf(types, rows.slice(0, 64), { batchRows: 64 })];
     if (batch === undefined) throw new Error("no batch");
-    expect(join.build.push(batch)).toBe("blocked");
-    await join.build.ready();
-    await join.build.finish();
+    if (join.build.push(batch) === "blocked") await join.build.ready();
+    expect(await servicedDuring(() => join.build.finish())).toBe(true);
     const sink = new CountSink();
     const probe = join.probe(sink);
     await pushAll(probe, types, rows.slice(0, 2));
     await probe.finish();
     expect(sink.rows).toBe(64);
+  }, 60_000);
+});
+
+describe("review B7-p2c-2: every byte of key work is in a step", () => {
+  const types2 = [TEXT, INT];
+  /** Runs a job with an always-due slice, returning the most work any one step did. */
+  const stepWork = <T>(
+    job: Generator<Promise<void> | void, T, void>,
+    work: KeyWork,
+  ): { max: number; value: T } => {
+    let max = 0;
+    for (;;) {
+      const before = work.total;
+      const step = job.next();
+      max = Math.max(max, work.total - before);
+      if (step.done === true) return { max, value: step.value };
+    }
+  };
+  // A step may end up to one chunk (4 KiB) past the budget, and a hash step spends two seeds.
+  const BOUND = KEY_STEP_BYTES + 2 * 4096;
+
+  it("forced collisions: build and lookup stay within the budget per step (review probe)", () => {
+    // Every key hashes to 42 with both seeds: 64 distinct 64 KiB keys, one chain.
+    const one = vi.spyOn(hashing, "xxHash32").mockReturnValue(42);
+    const digest = vi.spyOn(XxHash32Stream.prototype, "digest").mockReturnValue(42);
+    try {
+      const keyRows: Row[] = Array.from({ length: 64 }, (_, i): Row => [
+        "x".repeat(65_530) + String(i).padStart(6, "0"),
+        i,
+      ]);
+      const store = new ColumnStore(types2, FREE);
+      for (const batch of batchesOf(types2, keyRows))
+        store.append(batch.columns, null, 0, batch.length);
+      const layout = new KeyLayout([TEXT], [false]);
+      const scratch = new KeyScratch(layout, 2048, FREE);
+      const work = new KeyWork();
+      const built = stepWork(
+        JoinTable.buildJob(store, [0], layout, 0, FREE, scratch, new Slice(0), {}, work),
+        work,
+      );
+      expect(built.max).toBeLessThanOrEqual(BOUND);
+      const table = built.value;
+      if (table === null) throw new Error("no table");
+      expect(table.inserted).toBe(64);
+      const [batch] = [...batchesOf(types2, keyRows)];
+      if (batch === undefined) throw new Error("no batch");
+      const probeWork = new KeyWork();
+      const extracted = stepWork(
+        extractKeysJob(batch.columns.slice(0, 1), null, 0, 64, scratch, probeWork, new Slice(0)),
+        probeWork,
+      );
+      expect(extracted.value).toBe(64);
+      const heads = new Int32Array(64);
+      const looked = stepWork(
+        table.lookupJob(scratch, 64, heads, probeWork, new Slice(0)),
+        probeWork,
+      );
+      expect(looked.max).toBeLessThanOrEqual(BOUND);
+      expect(looked.value).toBe(64);
+      expect([...heads]).toEqual(keyRows.map((_, i) => i + 1));
+      table.close();
+      store.close();
+    } finally {
+      one.mockRestore();
+      digest.mockRestore();
+    }
+  }, 60_000);
+
+  it("long keys carry a second hash (64 bits before any byte compare); short ones do not", () => {
+    const layout = new KeyLayout([TEXT], [false]);
+    const scratch = new KeyScratch(layout, 4, FREE);
+    const long = "z".repeat(100);
+    const [batch] = [
+      ...batchesOf(types2, [
+        [long, 1],
+        ["short", 2],
+      ]),
+    ];
+    if (batch === undefined) throw new Error("no batch");
+    extractKeys(batch.columns.slice(0, 1), null, 0, 2, scratch, true);
+    const bytes = new TextEncoder().encode(long);
+    expect(scratch.hashes2[0]).toBe(hashing.xxHash32(bytes, 0x6a09_e667));
+    expect(scratch.hashes2[1]).toBe(0);
+    // The resumable path stores the same pair.
+    const again = new KeyScratch(layout, 4, FREE);
+    const work = new KeyWork();
+    stepWork(
+      extractKeysJob(batch.columns.slice(0, 1), null, 0, 2, again, work, new Slice(0)),
+      work,
+    );
+    expect([...again.hashes.subarray(0, 2)]).toEqual([...scratch.hashes.subarray(0, 2)]);
+    expect([...again.hashes2.subarray(0, 2)]).toEqual([...scratch.hashes2.subarray(0, 2)]);
+  });
+
+  it("a 10 MiB key is hashed and compared across many steps", () => {
+    const big = "y".repeat(10 << 20);
+    const store = new ColumnStore(types2, FREE);
+    for (const batch of batchesOf(
+      types2,
+      [
+        [big, 1],
+        [big, 2],
+      ],
+      { batchRows: 1 },
+    ))
+      store.append(batch.columns, null, 0, batch.length);
+    const layout = new KeyLayout([TEXT], [false]);
+    const scratch = new KeyScratch(layout, 2048, FREE);
+    const work = new KeyWork();
+    let steps = 0;
+    const job = JoinTable.buildJob(store, [0], layout, 0, FREE, scratch, new Slice(0), {}, work);
+    let max = 0;
+    let firstMs = 0;
+    for (;;) {
+      const before = work.total;
+      const start = performance.now();
+      const step = job.next();
+      if (steps === 0) firstMs = performance.now() - start;
+      max = Math.max(max, work.total - before);
+      steps++;
+      if (step.done === true) {
+        expect(step.value?.inserted).toBe(2);
+        step.value?.close();
+        break;
+      }
+    }
+    // Two hashes of 10 MiB each (two seeds), and one 10 MiB comparison: over 200 steps.
+    expect(max).toBeLessThanOrEqual(BOUND);
+    expect(steps).toBeGreaterThan(200);
+    // The bound is the work per step above; wall time is only a loose check on a loaded host.
+    expect(firstMs).toBeLessThan(100);
+    store.close();
+  }, 60_000);
+
+  it("a dictionary probe batch hashes each entry once through the operator (review probe)", async () => {
+    const x = "x".repeat(65_536);
+    const keyRows: Row[] = Array.from({ length: 64 }, (_, i): Row => [x + String(i % 2), i]);
+    const s = spec("semi", types2);
+    const { join, governor } = await setup(s);
+    await pushAll(join.build, types2, keyRows.slice(0, 2));
+    await join.build.finish();
+    const one = vi.spyOn(hashing, "xxHash32");
+    const digest = vi.spyOn(XxHash32Stream.prototype, "digest");
+    const sink = new CountSink();
+    const probe = join.probe(sink);
+    for (const batch of batchesOf(types2, keyRows, { dictionary: true }))
+      if (probe.push(batch) === "blocked") await probe.ready();
+    // Two entries, two seeds each: four hashes, not one per row.
+    const hashes = one.mock.calls.length + digest.mock.calls.length;
+    one.mockRestore();
+    digest.mockRestore();
+    await probe.finish();
+    expect(sink.rows).toBe(64);
+    expect(hashes).toBeLessThanOrEqual(4);
+    await join.closed;
+    expect(governor.usedBytes).toBe(0);
   }, 60_000);
 });

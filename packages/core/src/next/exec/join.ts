@@ -108,8 +108,10 @@ import {
   KEY_STEP_BYTES,
   KeyLayout,
   KeyScratch,
+  KeyWork,
   bytesEqual,
   extractKeys,
+  extractKeysJob,
   keyNulls,
   keyStepRows,
   levelHash,
@@ -347,6 +349,8 @@ class Shared {
   aborted: unknown = undefined;
   /** The slice of the current build, probe push or finish work (R23.2). */
   readonly slice = new Slice(YIELD_INTERVAL_MS);
+  /** The key-byte budget every hash and comparison spends (review B7-p2c-2). */
+  readonly work = new KeyWork();
 
   constructor(
     readonly spec: HashJoinSpec,
@@ -1023,11 +1027,21 @@ async function extractAll(
   count: number,
   scratch: KeyScratch,
 ): Promise<void> {
-  if (extractKeys(keys, ids, from, count, scratch) === count) return;
+  // Bytes keys hash in byte steps (a task yield when the slice is due); words at once.
+  const extract = async (): Promise<number> => {
+    const done = runSliced(
+      extractKeysJob(keys, ids, from, count, scratch, shared.work, shared.slice),
+      shared.slice,
+      () => {
+        shared.checkAborted();
+      },
+    );
+    return isPromise(done) ? await done : done;
+  };
+  if ((await extract()) === count) return;
   // The batch's keys are one bounded step (≤ 2,048 keys): room for what the encoder asked.
   await shared.need(2 * scratch.requiredBytes);
-  if (extractKeys(keys, ids, from, count, scratch) !== count)
-    throw new RangeError("Join keys could not be encoded");
+  if ((await extract()) !== count) throw new RangeError("Join keys could not be encoded");
 }
 
 /**
@@ -1050,10 +1064,51 @@ class Prober {
   #groupsLooked = false;
   #candidate = 0;
   #candidateCursor = 0;
+  /** A resumable key job of the current phase (hashing, then lookups). */
+  #job: SlicedJob<number> | null = null;
+  #routeHashed = false;
+  /**
+   * The current batch's dictionary entries, hashed and looked up once each (charged for the
+   * dictionary's size, released when the next batch starts or the join ends).
+   */
+  #hashMemo: Map<number, readonly [number, number]> | null = null;
+  #headMemo: Map<number, number> | null = null;
+  #memoBytes = 0;
 
   constructor(readonly shared: Shared) {}
 
+  /** Frees the batch's dictionary memo. */
+  release(): void {
+    if (this.#memoBytes > 0) this.shared.charge.free(this.#memoBytes);
+    this.#memoBytes = 0;
+    this.#hashMemo = null;
+    this.#headMemo = null;
+    this.#job = null;
+  }
+
+  /** The memo for a raw dictionary probe key (null when not one, or not admitted). */
+  #memo(vector: Vector | undefined): Map<number, readonly [number, number]> | null {
+    if (this.shared.layout.family !== "raw" || vector === undefined || vector.form === "flat")
+      return null;
+    if (this.#hashMemo !== null) return this.#hashMemo;
+    const entries = vector.form === "constant" ? 1 : vector.dictionary.length;
+    const bytes = 64 * entries;
+    if (!this.shared.charge.allocate(bytes)) return null;
+    this.#memoBytes = bytes;
+    this.#hashMemo = new Map();
+    this.#headMemo = new Map();
+    return this.#hashMemo;
+  }
+
+  #yieldStep(): Promise<void> {
+    return yieldTask().then(() => {
+      this.shared.slice.reset();
+    });
+  }
+
   start(batch: Batch, level: Level, chunk: ChunkState | null): void {
+    this.release();
+    this.#routeHashed = false;
     this.batch = batch;
     this.level = level;
     this.chunk = chunk;
@@ -1134,9 +1189,33 @@ class Prober {
     }
     const keys = shared.spec.probeKeys.map((c) => columnOf(batch.columns, c));
     const ids = selection?.rows ?? null;
-    if (extractKeys(keys, ids, 0, active, shared.scratch) < active) {
-      this.#phase = 0;
-      return shared.need(2 * shared.scratch.requiredBytes);
+    if (!this.#routeHashed) {
+      let done: number;
+      if (shared.layout.family !== "words") {
+        // Bytes keys hash in byte steps; this phase resumes here after each yield.
+        this.#job ??= extractKeysJob(
+          keys,
+          ids,
+          0,
+          active,
+          shared.scratch,
+          shared.work,
+          shared.slice,
+          this.#memo(keys[0]),
+        );
+        const step = this.#job.next();
+        if (step.done !== true) {
+          this.#phase = 0;
+          return step.value ?? this.#yieldStep();
+        }
+        this.#job = null;
+        done = step.value;
+      } else done = extractKeys(keys, ids, 0, active, shared.scratch);
+      if (done < active) {
+        this.#phase = 0;
+        return shared.need(2 * shared.scratch.requiredBytes);
+      }
+      this.#routeHashed = true;
     }
     const counts = level.groupByPartition(ids, 0, active, false);
     const mask = level.unmatchableMask();
@@ -1190,7 +1269,15 @@ class Prober {
         table !== null && shared.kind !== "mark" && keys.length === 1
           ? table.lookupVector(columnOf(keys, 0), resident.rows, count, shared.heads)
           : -1;
-      if (direct < 0) {
+      if (direct < 0 && shared.layout.family !== "words") {
+        // Bytes keys: hashing, then lookups with resumable comparisons (review B7-p2c-2);
+        // this phase resumes here after each yield.
+        this.#job ??= this.#lookupJob(keys, resident.rows, count, table);
+        const step = this.#job.next();
+        if (step.done !== true) return step.value ?? this.#yieldStep();
+        this.#job = null;
+        if (step.value < 0) return shared.need(2 * shared.scratch.requiredBytes);
+      } else if (direct < 0) {
         const hashed = table?.hashed ?? false;
         if (extractKeys(keys, resident.rows, 0, count, shared.scratch, hashed) < count)
           return shared.need(2 * shared.scratch.requiredBytes);
@@ -1212,6 +1299,39 @@ class Prober {
     const unique = table?.unique ?? true;
     this.#phase = residual === null && (unique || kind === "semi" || kind === "anti") ? 2 : 3;
     return DONE;
+  }
+
+  /** Bytes keys of the resident rows: hashed, then looked up (−1: the encoder needs room). */
+  *#lookupJob(
+    keys: readonly Vector[],
+    rows: Uint16Array,
+    count: number,
+    table: JoinTable | null,
+  ): SlicedJob<number> {
+    const shared = this.shared;
+    const memo = this.#memo(keys[0]);
+    const done = yield* extractKeysJob(
+      keys,
+      rows,
+      0,
+      count,
+      shared.scratch,
+      shared.work,
+      shared.slice,
+      memo,
+    );
+    if (done < count) return -1;
+    if (table === null) shared.heads.fill(0, 0, count);
+    else
+      yield* table.lookupJob(
+        shared.scratch,
+        count,
+        shared.heads,
+        shared.work,
+        shared.slice,
+        this.#headMemo,
+      );
+    return count;
   }
 
   /** Phase 2: zero-copy output over the probe batch (no residual; unique keys or existence). */
@@ -1590,7 +1710,14 @@ function compatible(
       compatScratch.set(type, scratch);
     }
     scratch.ids[0] = row;
-    extractKeys([columnOf(batch.columns, probeKeys[i] ?? 0)], scratch.ids, 0, 1, scratch.probe);
+    extractKeys(
+      [columnOf(batch.columns, probeKeys[i] ?? 0)],
+      scratch.ids,
+      0,
+      1,
+      scratch.probe,
+      false,
+    );
     const column = shared.spec.buildKeys[i] ?? 0;
     scratch.ids[0] = buildRow & store.chunkMask;
     extractKeys(
@@ -1697,7 +1824,9 @@ export class HashJoin {
     const ids = batch.selection?.rows ?? null;
     let result: MaybePromise<void>;
     const keys = this.spec.buildKeys.map((c) => columnOf(batch.columns, c));
-    const first = keyStepRows(keys, ids, 0, count, KEY_STEP_BYTES / 2);
+    // Only encoded keys are worked on per part at arrival (a partitioned build encodes them).
+    const first =
+      shared.layout.family === "enc" ? keyStepRows(keys, ids, 0, count, KEY_STEP_BYTES / 2) : count;
     if (first < count) result = this.#buildParts(batch.columns, ids, count, keys, first);
     else result = this.#level.addBuild(batch.columns, ids, 0, count);
     if (!isPromise(result)) {
@@ -1813,9 +1942,11 @@ export class HashJoin {
     const selection = batch.selection;
     const active = selection === null ? batch.length : selection.count;
     const keys = this.spec.probeKeys.map((c) => columnOf(batch.columns, c));
-    const raw = this.#shared.layout.family === "raw";
+    // Encoded keys are encoded per part (by logical bytes); raw and word keys spend the work
+    // budget inside the probe itself (hashing and comparing resume across yields).
+    const raw = this.#shared.layout.family !== "enc";
     const ids = selection?.rows ?? null;
-    const first = keyStepRows(keys, ids, 0, active, KEY_STEP_BYTES / 2, !raw);
+    const first = raw ? active : keyStepRows(keys, ids, 0, active, KEY_STEP_BYTES / 2);
     if (first < active) {
       this.#pending = this.#probeParts(batch, keys, active, first, raw).catch((error: unknown) =>
         this.#fail(error),
@@ -2198,6 +2329,7 @@ export class HashJoin {
     if (this.#closed) return;
     this.#closed = true;
     const shared = this.#shared;
+    this.#prober.release();
     this.#level.close();
     for (const filter of this.runtimeFilters) filter.close();
     shared.probeOut.close();

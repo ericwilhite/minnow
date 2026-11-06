@@ -2,7 +2,7 @@ import fc from "fast-check";
 import { afterAll, describe, expect, it } from "vitest";
 import { createReach } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
-import { WORD_READ_BYTES, xxHash32 } from "./xxhash32.js";
+import { WORD_READ_BYTES, XxHash32Stream, xxHash32 } from "./xxhash32.js";
 
 const PRIME32 = 2_654_435_761;
 const ascii = (text: string): Uint8Array => new TextEncoder().encode(text);
@@ -250,4 +250,31 @@ describe("xxHash32 word reads (ruling R15.8)", () => {
       );
     },
   );
+});
+
+describe("XxHash32Stream (the spec's streaming form)", () => {
+  it("equals the one-shot hash for every split of the published sanity buffers", () => {
+    for (const length of [0, 1, 14, 15, 16, 17, 31, 32, 33, 222, 1000]) {
+      const bytes = sanityBuffer(length);
+      for (const seed of [0, 0x9e3779b1, 7]) {
+        const expected = xxHash32(bytes, seed);
+        for (const piece of [1, 3, 15, 16, 17, 100]) {
+          const stream = new XxHash32Stream(seed);
+          for (let at = 0; at < length; at += piece)
+            stream.update(bytes, at, Math.min(length, at + piece));
+          expect(stream.digest(), `length ${String(length)} piece ${String(piece)}`).toBe(expected);
+        }
+      }
+    }
+  });
+
+  it("matches the published sanity vectors when fed in pieces", () => {
+    // xxhsum's sanity checks (also in the one-shot tests above).
+    expect(
+      new XxHash32Stream(0)
+        .update(sanityBuffer(222), 0, 100)
+        .update(sanityBuffer(222), 100, 222)
+        .digest(),
+    ).toBe(xxHash32(sanityBuffer(222), 0));
+  });
 });
