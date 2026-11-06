@@ -12,6 +12,8 @@
  * cached ChunkReader policy and byte target; the page-stream mode uses one-pass pooled reads.
  * Five interleaved cold/warm attempts per mode; sparse CDP profiles bracket setup-excluded
  * thread CPU (1-second sampling interval, not a hotspot profile). Both await all frame credits.
+ * MINNOW_EXPORT_SCAN_PROFILE=1 instead profiles only the scan worker, cold and warm, requesting
+ * 500-us samples. scripts/scan-profile.mts separates native waits from active-stack shares.
  *
  * - Cold: the profile's OPFS files are synced and dropped from the OS page cache first
  *   (`dd iflag=nocache count=0`, posix_fadvise DONTNEED on a file this user owns), and `fincore`
@@ -59,7 +61,10 @@ const WARM_SHARE = 0.98;
 const DISTINCT = Number(process.env.MINNOW_EXPORT_DISTINCT ?? 4);
 /** MINNOW_EXPORT_FOCUS=1: only Gate A's configuration (cold ×5, warm ×5, a profiled pass). */
 const COMPARE_STREAM = process.env.MINNOW_EXPORT_COMPARE_STREAM === "1";
-const SCAN_COMPARE = process.env.MINNOW_EXPORT_SCAN_COMPARE === "1";
+const SCAN_PROFILE = process.env.MINNOW_EXPORT_SCAN_PROFILE === "1";
+const FRAME_COPY_COMPARE = process.env.MINNOW_EXPORT_FRAME_COPY_COMPARE === "1";
+const SCAN_COMPARE =
+  process.env.MINNOW_EXPORT_SCAN_COMPARE === "1" || SCAN_PROFILE || FRAME_COPY_COMPARE;
 const DEPTH_COMPARE = process.env.MINNOW_EXPORT_DEPTH_COMPARE === "1";
 const READ_COMPARE = process.env.MINNOW_EXPORT_READ_COMPARE === "1";
 const VARIANCE = process.env.MINNOW_EXPORT_VARIANCE === "1";
@@ -216,7 +221,7 @@ async function workers(page: Page, profileDirectory: string) {
     void send(event.sessionId, "Profiler.enable")
       .then(() =>
         send(event.sessionId, "Profiler.setSamplingInterval", {
-          interval: SCAN_COMPARE ? 1_000_000 : 500,
+          interval: SCAN_COMPARE && !SCAN_PROFILE ? 1_000_000 : 500,
         }),
       )
       .then(() =>
@@ -513,7 +518,24 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     };
 
     const base = { once: true, capMiB: 512, passes: 1, groups: exported };
-    if (SCAN_COMPARE) {
+    if (FRAME_COPY_COMPARE) {
+      const options = {
+        ...base,
+        mode: "scan" as const,
+        readaheadKiB: 256,
+        windowMiB: WINDOW_MIB,
+        auditWorkingSet: false,
+        profile: true,
+      };
+      for (let round = 0; round < 5; round++)
+        for (const frameCopy of round % 2 === 0
+          ? (["baseline", "candidate"] as const)
+          : (["candidate", "baseline"] as const))
+          await measure(`cold scan frame copy ${frameCopy} round ${String(round)}`, true, false, {
+            ...options,
+            frameCopy,
+          });
+    } else if (SCAN_COMPARE) {
       const options = {
         ...base,
         readaheadKiB: 256,
@@ -521,13 +543,15 @@ test.describe("rebuild core export on OPFS (bench)", () => {
         auditWorkingSet: false,
         profile: true,
       };
-      const rounds = Number(process.env.MINNOW_EXPORT_SCAN_ROUNDS ?? 5);
+      const rounds = Number(process.env.MINNOW_EXPORT_SCAN_ROUNDS ?? (SCAN_PROFILE ? 1 : 5));
       if (!Number.isInteger(rounds) || rounds < 1)
         throw new Error("Scan rounds must be a positive integer");
       for (let round = 0; round < rounds; round++)
-        for (const mode of round % 2 === 0
-          ? (["pages", "scan"] as const)
-          : (["scan", "pages"] as const)) {
+        for (const mode of SCAN_PROFILE
+          ? (["scan"] as const)
+          : round % 2 === 0
+            ? (["pages", "scan"] as const)
+            : (["scan", "pages"] as const)) {
           await measure(`cold ${mode} round ${String(round)}`, true, false, { ...options, mode });
           if (process.env.MINNOW_EXPORT_SCAN_COLD_ONLY !== "1")
             await measure(`warm ${mode} round ${String(round)}`, false, true, { ...options, mode });
@@ -670,7 +694,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
         body: JSON.stringify(profile),
         contentType: "application/json",
       });
-    const recorded = SCAN_COMPARE ? undefined : targets.profiles.at(-1);
+    const recorded = SCAN_COMPARE && !SCAN_PROFILE ? undefined : targets.profiles.at(-1);
     const hotspots = recorded === undefined ? [] : selfTimes(recorded, 15);
     console.log(`warm pass profile (self time):\n  ${hotspots.join("\n  ")}`);
 
@@ -691,16 +715,24 @@ test.describe("rebuild core export on OPFS (bench)", () => {
         ? {
             scanAdapter:
               "bench stand-in for future executor frame assembly; real TableScan/ResultChannel/owner transfer policy/MessagePort credits; fixture descriptors exclude SQL/catalog/root loading",
-            cpuSamplingIntervalUs: 1_000_000,
-            rounds: Number(process.env.MINNOW_EXPORT_SCAN_ROUNDS ?? 5),
-            coldOnly: process.env.MINNOW_EXPORT_SCAN_COLD_ONLY === "1",
+            cpuSamplingIntervalUs: SCAN_PROFILE ? 500 : 1_000_000,
+            rounds: Number(process.env.MINNOW_EXPORT_SCAN_ROUNDS ?? (SCAN_PROFILE ? 1 : 5)),
+            scanProfile: SCAN_PROFILE,
+            coldOnly: FRAME_COPY_COMPARE || process.env.MINNOW_EXPORT_SCAN_COLD_ONLY === "1",
+            ...(FRAME_COPY_COMPARE
+              ? {
+                  frameCopyComparison:
+                    "parent generic offset mapping vs typed copy with nonzero-bias loop",
+                }
+              : {}),
           }
         : {}),
       device,
       hotspots,
-      profileHotspots: SCAN_COMPARE
-        ? []
-        : targets.profiles.map((profile) => selfTimes(profile, 30)),
+      profileHotspots:
+        SCAN_COMPARE && !SCAN_PROFILE
+          ? []
+          : targets.profiles.map((profile) => selfTimes(profile, 30)),
       ...(campaignGc
         ? {
             afterCampaignGc: {

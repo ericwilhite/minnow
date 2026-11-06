@@ -65,6 +65,13 @@ const integers = (a: Int64Values, n: number): Int64Values =>
     ? { repr: "safe", values: f64(a.values, n) }
     : { repr: "int64", values: a.values.slice(0, n) };
 
+/** Own offsets with a typed copy; only biased slices need a subtraction pass. */
+function ownedOffsets(source: Int32Array, n: number, first: number): Int32Array {
+  const out = source.slice(0, n + 1);
+  if (first !== 0) for (let k = 0; k <= n; k++) out[k] = (out[k] ?? 0) - first;
+  return out;
+}
+
 function ownFlat(vector: FlatVector, n: number): WireFlat {
   const d = vector.data;
   let data: VectorData;
@@ -99,7 +106,7 @@ function ownFlat(vector: FlatVector, n: number): WireFlat {
       data = {
         layout: "varlen",
         bytes: d.bytes.slice(first, end),
-        offsets: Int32Array.from(d.offsets.subarray(0, n + 1), (x) => x - first),
+        offsets: ownedOffsets(d.offsets, n, first),
       };
       break;
     }

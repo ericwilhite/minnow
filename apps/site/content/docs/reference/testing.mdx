@@ -1199,6 +1199,15 @@ nine cold/warm pairs with per-pass phases, GC pauses, read shapes, residency, an
 The nightly workflow keeps the page diagnostic in `export-bench.json` and the cold comparison in
 `export-scan-bench.json`, under `browser-perf-results/`. Neither enforces a performance threshold.
 
+`MINNOW_EXPORT_SCAN_PROFILE=1` profiles only the dedicated scan worker, cold and warm, after
+setup. Its `export-cpu-N` attachments can be summarized with `scripts/scan-profile.mts`:
+top self-time functions and exclusive buckets for scan, descriptors, vectors, frame assembly,
+result accounting and transport. CDP sample durations include native waits and descheduling;
+active sample shares estimate hotspots, not exact CPU seconds per bucket. The report keeps
+native reads, GC and idle samples separate and records the worker's actual thread CPU bracket.
+`scripts/frame-copy-bench.mts` isolates frame ownership copies in five interleaved CPU/wall
+rounds; `MINNOW_EXPORT_FRAME_COPY_COMPARE=1` compares those policies through the whole cold scan.
+
 **Storage kill campaign.** The nightly run also runs `npm run test:storage-kills`: the rebuild
 core's storage in Chromium, on OPFS and on IndexedDB, killed 1,000 times each at seeded random
 moments while a worker builds and publishes extents, retires and reclaims them, appends, flushes,

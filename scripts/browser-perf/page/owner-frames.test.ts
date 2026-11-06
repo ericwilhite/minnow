@@ -38,8 +38,86 @@ afterAll(() => {
 });
 
 const littleEndian = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
+const offsetReach = createReach(
+  "export-bench-frame-offsets",
+  ["zero bias", "nonzero bias", "NULL slots", "empty value"] as const,
+  { minimum: 4 },
+);
+afterAll(() => offsetReach.assertReached());
 
 describe("bench owner frames", () => {
+  for (const seed of seedsFor("export-bench-frame-offsets", [0xb2f3, 0xb2f4]))
+    it(`owns UTF-8 bytes and biased offsets seed ${String(seed)}`, () => {
+      fc.assert(
+        fc.property(
+          fc.array(
+            fc
+              .array(fc.constantFrom("", "a", "é", "水", "😀"), { maxLength: 10 })
+              .map((xs) => xs.join("")),
+            { minLength: 1, maxLength: 80 },
+          ),
+          fc.oneof(fc.constant(0), fc.integer({ min: 1, max: 64 })),
+          fc.boolean(),
+          (strings, bias, nullable) => {
+            offsetReach.beginHistory();
+            offsetReach.reach(bias === 0 ? "zero bias" : "nonzero bias");
+            const encoded = strings.map((s) => new TextEncoder().encode(s));
+            const bytes = new Uint8Array(bias + encoded.reduce((n, s) => n + s.length, 0) + 13);
+            const offsets = new Int32Array(strings.length + 4);
+            let at = bias;
+            offsets[0] = at;
+            for (let k = 0; k < encoded.length; k++) {
+              const b = encoded[k];
+              if (!b) throw new Error("Missing UTF-8");
+              bytes.set(b, at);
+              at += b.length;
+              offsets[k + 1] = at;
+            }
+            const expectedBytes = bytes.slice(bias, at),
+              expectedOffsets = Array.from(
+                offsets.subarray(0, strings.length + 1),
+                (x) => x - bias,
+              );
+            const validity = nullable
+              ? new Uint32Array(Math.ceil(strings.length / 32)).fill(0xaaaaaaaa)
+              : null;
+            if (nullable) offsetReach.reach("NULL slots");
+            if (strings.includes("")) offsetReach.reach("empty value");
+            const source: FlatVector = {
+              form: "flat",
+              type: { kind: "text" },
+              length: strings.length,
+              validity,
+              data: { layout: "varlen", bytes, offsets },
+            };
+            const budget = countingBudget(Infinity),
+              assembler = new BenchFrameAssembler(budget);
+            const offer = assembler.offer({
+              length: strings.length,
+              selection: null,
+              columns: [source],
+            });
+            bytes.fill(0xff);
+            offsets.fill(-1);
+            validity?.fill(0);
+            const owned = offer.payload.columns[0];
+            if (owned?.form !== "flat" || owned.data.layout !== "varlen")
+              throw new Error("Wrong owned layout");
+            expect(owned.data.bytes).toEqual(expectedBytes);
+            expect([...owned.data.offsets]).toEqual(expectedOffsets);
+            expect(owned.validity).toEqual(
+              nullable ? new Uint32Array(Math.ceil(strings.length / 32)).fill(0xaaaaaaaa) : null,
+            );
+            expect(frameByteLength(offer.payload)).toBe(budget.used);
+            offer.free();
+            assembler.close();
+            expect(budget.used).toBe(0);
+          },
+        ),
+        { seed, numRuns: 48 },
+      );
+    });
+
   for (const seed of seedsFor("export-bench-frame-ownership", [0xb2f1, 0xb2f2]))
     it(`borrowing and raw float bits seed ${String(seed)}`, () => {
       fc.assert(

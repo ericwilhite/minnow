@@ -601,6 +601,18 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     hotspots. Profile-count checks refuse missing brackets. CPU tick/notification latency
     remains. Both modes verify zero governor/cache/pool charge after worker close. A final
     client GC/RSS probe is after the campaign and never changes a recorded peak.
+  - `MINNOW_EXPORT_SCAN_PROFILE=1` profiles only the scan mode, cold and warm, requesting
+    500 µs samples. `scripts/scan-profile.mts` summarizes its `export-cpu-N` attachments:
+    exclusive buckets and top self-time functions. CDP durations include descheduling and
+    native read waits; active sample-count shares are hotspot estimates, not exact CPU seconds.
+    Native reads, GC and idle/program samples remain separate. The worker's `/proc` CPU bracket
+    still reports the actual thread CPU, excluding setup.
+  - Varlen frame offsets use a typed ownership copy, with a subtraction pass only for biased
+    offsets. `scripts/frame-copy-bench.mts` compares the full assembler against the parent generic
+    mapping formula, five interleaved CPU/wall rounds over real decoded wide-column layouts.
+    It compares complete frame digests and charges, without requiring a historical Git object.
+    `MINNOW_EXPORT_FRAME_COPY_COMPARE=1` compares both formulas over real cold scan/transport,
+    five interleaved rounds. Both own all borrowed buffers and use the same transfer policy.
 - The checksum-load CPU hypothesis from the export profile is reproducible with
   `npx vite-node scripts/hash-load-bench.mts`: five rotating rounds in fresh processes, CPU and
   wall medians/min/max, aligned and unaligned inputs, byte offsets, stripe tails, and consumed

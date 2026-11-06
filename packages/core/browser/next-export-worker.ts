@@ -62,6 +62,7 @@ export type ExportRequest =
       readonly readMiB?: 4 | 8;
       readonly groupDepth?: 1 | 2;
       readonly mode?: "pages" | "scan";
+      readonly frameCopy?: "baseline" | "candidate";
       readonly resultPort?: MessagePort;
     }
   | { readonly op: "remove"; readonly dir: string };

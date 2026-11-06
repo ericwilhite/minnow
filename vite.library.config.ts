@@ -40,6 +40,27 @@ const exportBaseline =
 export default defineConfig({
   plugins: [
     isolatedPages,
+    ...(process.env.MINNOW_EXPORT_FRAME_COPY_COMPARE === "1"
+      ? [
+          {
+            name: "export-frame-copy-comparison",
+            enforce: "pre" as const,
+            transform(source: string, id: string) {
+              if (!id.endsWith("/scripts/browser-perf/page/owner-frames.ts")) return;
+              const anchor = "function ownedOffsets(";
+              if (!source.includes(anchor)) throw new Error("Frame copy anchor moved");
+              return (
+                source.replace(anchor, "function fastOwnedOffsets(") +
+                `
+const ownedOffsets = new URL(globalThis.location.href).searchParams.get("frameCopy") === "baseline"
+ ? (source: Int32Array, n: number, first: number) => Int32Array.from(source.subarray(0,n+1),x=>x-first)
+ : fastOwnedOffsets;
+`
+              );
+            },
+          },
+        ]
+      : []),
     ...(process.env.MINNOW_EXPORT_READ_COMPARE === "1"
       ? [
           {
