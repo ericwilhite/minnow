@@ -57,6 +57,9 @@ interface Entry {
   hot: boolean;
   /** When it was last used: listed after a release, or peeked (`performance.now()`). */
   usedAt: number;
+  /** A reader's parsed descriptor of `bytes` (views into them), and its charged size. */
+  parsed: object | null;
+  parsedBytes: number;
   prev: Entry | null;
   next: Entry | null;
 }
@@ -74,7 +77,7 @@ class List {
     if (this.head !== null) this.head.prev = entry;
     this.head = entry;
     this.tail ??= entry;
-    this.bytes += entry.length;
+    this.bytes += entry.length + entry.parsedBytes;
     this.count += 1;
   }
 
@@ -85,7 +88,7 @@ class List {
     else this.tail = entry.prev;
     entry.prev = null;
     entry.next = null;
-    this.bytes -= entry.length;
+    this.bytes -= entry.length + entry.parsedBytes;
     this.count -= 1;
   }
 }
@@ -99,7 +102,8 @@ export interface CacheStats {
   readonly bytesRead: number;
 }
 
-const charge = (entry: Entry) => entry.length + ENTRY_OVERHEAD;
+/** What an unpinned entry is charged: its bytes, its overhead and any attached descriptor. */
+const charge = (entry: Entry) => entry.length + ENTRY_OVERHEAD + entry.parsedBytes;
 
 const EMPTY = new Uint8Array(0);
 /** xxHash32 (seed 0) of no bytes: the only valid checksum of a zero-length blob. */
@@ -195,6 +199,33 @@ export class PageCache implements EvictableCacheLike {
   }
 
   // ── Reads ──────────────────────────────────────────────────────────────────────────────────
+
+  /** The descriptor attached to `ref`'s entry, or null (extents.ts `ExtentReader.parsed`). */
+  parsed(ref: BlobRef): object | null {
+    return this.#find(ref)?.parsed ?? null;
+  }
+
+  /**
+   * Attaches a parsed descriptor to `ref`'s resident entry (extents.ts `ExtentReader.attach`).
+   * An unpinned entry is charged `bytes` more now; a pinned one when its last lease goes, with
+   * the rest of the entry. Evicted, dropped or forgotten with the entry.
+   */
+  attachParsed(ref: BlobRef, parsed: object, bytes: number): boolean {
+    const entry = this.#find(ref);
+    // Not resident, or already carrying one: no.
+    if (entry?.parsed !== null || this.#closed) return false;
+    if (!(Number.isSafeInteger(bytes) && bytes >= 0))
+      throw new RangeError("A descriptor's size must be a byte count");
+    if (entry.segment !== "pinned") {
+      if (this.#memory?.charge(bytes) !== true) return false;
+      // Listed: its list's bytes include the descriptor from now on.
+      if (entry.segment === "probation") this.#probation.bytes += bytes;
+      else this.#protected.bytes += bytes;
+    }
+    entry.parsed = parsed;
+    entry.parsedBytes = bytes;
+    return true;
+  }
 
   peek(ref: BlobRef): Uint8Array | null {
     const entry = this.#find(ref);
@@ -357,6 +388,8 @@ export class PageCache implements EvictableCacheLike {
       dropped: false,
       hot: false,
       usedAt: 0,
+      parsed: null,
+      parsedBytes: 0,
       prev: null,
       next: null,
     };
@@ -384,6 +417,8 @@ export class PageCache implements EvictableCacheLike {
       dropped: true,
       hot: false,
       usedAt: 0,
+      parsed: null,
+      parsedBytes: 0,
       prev: null,
       next: null,
     };

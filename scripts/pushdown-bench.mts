@@ -22,6 +22,7 @@
  */
 import { performance } from "node:perf_hooks";
 import type { ColumnChunk } from "../packages/core/src/next/format/manifest.ts";
+import type { ExtentReader } from "../packages/core/src/next/storage/extents.ts";
 import { BlobCache } from "../packages/core/src/next/format/blob-cache.ts";
 import type { ChunkDirectory } from "../packages/core/src/next/page/directory.ts";
 import { MemoryExtentSpace, UNLIMITED } from "../packages/core/src/next/page/memory-extents.ts";
@@ -44,6 +45,12 @@ const ROWS = option("rows", 1_048_576);
 const ONLY = args.includes("--only") ? (args[args.indexOf("--only") + 1] ?? "") : null;
 /** Runs the gather / dense crossover only. */
 const CROSSOVER = args.includes("--crossover");
+/** `--descriptors off`: readers see a space without parsed descriptors (reader.ts), as before. */
+const DESCRIPTORS = !(
+  args.includes("--descriptors") && args[args.indexOf("--descriptors") + 1] === "off"
+);
+/** `--columns gate`: only the selective scan's columns (C30 and i09), for W5M. */
+const GATE_COLUMNS = args.includes("--columns") && args[args.indexOf("--columns") + 1] === "gate";
 /** Runs one way only (profiling). */
 const WAY = args.includes("--way") ? (args[args.indexOf("--way") + 1] ?? "") : null;
 const REPEATS = option("repeats", 5);
@@ -181,7 +188,7 @@ interface Group {
   readonly chunks: Map<string, ColumnChunk>;
 }
 
-const names = [...new Set([...C30, ...EXTRA])];
+const names = [...new Set([...C30, ...(GATE_COLUMNS ? ["i09"] : EXTRA)])];
 const space = new MemoryExtentSpace();
 const groups: Group[] = [];
 const built = performance.now();
@@ -209,8 +216,14 @@ for (let first = 0; first < ROWS; first += GROUP) {
   });
 }
 console.log(
-  `built ${String(ROWS)} rows × ${String(names.length)} columns in ${((performance.now() - built) / 1000).toFixed(1)} s`,
+  `built ${String(ROWS)} rows × ${String(names.length)} columns in ${((performance.now() - built) / 1000).toFixed(1)} s, ${(space.allocator.end / 2 ** 20).toFixed(0)} MiB stored; descriptors ${DESCRIPTORS ? "on" : "off"}`,
 );
+
+/** The space a reader sees: with or without parsed descriptors on its cache entries. */
+function readerView(view: MemoryExtentSpace): ExtentReader {
+  if (DESCRIPTORS) return view;
+  return { read: (refs, options) => view.read(refs, options), peek: (ref) => view.peek(ref) };
+}
 
 /** Parsed directories shared by every reader (ruling R15.7), as the owner keeps them. */
 const directories = new BlobCache<ChunkDirectory>(() => ({
@@ -303,12 +316,29 @@ function capacityOf(vector: FlatVector): number {
   }
 }
 
+/** before: decode then filter; after: select + gather / dense; mask: selectMask + fused sums. */
+type Way = "before" | "after" | "mask";
+
+/** Fused, branch-free filter and sum over a dense decode and a 0/1 mask (B4's shape). */
+function maskedSum(target: FlatVector, mask: Uint8Array, rows: number): number {
+  const data = target.data;
+  let sum = 0;
+  if (data.layout === "i32") {
+    const values = data.values;
+    for (let row = 0; row < rows; row++) sum += (values[row] ?? 0) & -(mask[row] ?? 0);
+  } else if (data.layout === "f64") {
+    const values = data.values;
+    for (let row = 0; row < rows; row++) sum += mask[row] === 1 ? (values[row] ?? 0) : 0;
+  }
+  return sum;
+}
+
 async function scan(
-  view: MemoryExtentSpace,
+  view: ExtentReader,
   filter: string,
   predicate: ColumnPredicate,
   project: readonly string[],
-  way: "before" | "after",
+  way: Way,
   aggregate: boolean,
 ): Promise<Stages> {
   const stages: Stages = {
@@ -322,6 +352,7 @@ async function scan(
   };
   const cpu = process.cpuUsage();
   const selection = new Uint16Array(GROUP);
+  const mask = new Uint8Array(GROUP);
   for (const group of groups) {
     const filterChunk = group.chunks.get(filter) as ColumnChunk;
     let t = performance.now();
@@ -361,7 +392,10 @@ async function scan(
       if (chunkMayMatch(compiled, group.rows, filterChunk.statistics)) {
         const pages = reader.pagesMatching(compiled);
         await reader.load(pages);
-        count = reader.select(compiled, 0, group.rows, selection);
+        count =
+          way === "mask"
+            ? reader.selectMask(compiled, 0, group.rows, mask)
+            : reader.select(compiled, 0, group.rows, selection);
         stages.filterPages += pages.length;
       }
     }
@@ -375,7 +409,13 @@ async function scan(
     for (const name of project) {
       const chunk = group.chunks.get(name) as ColumnChunk;
       const column = await ChunkReader.open(view, chunk, options);
-      if (dense) {
+      if (way === "mask") {
+        await column.load(allPages(column));
+        const target = reusedTarget(name, column, group.rows, column.varlenBytes(0, group.rows));
+        column.decodeRange(0, group.rows, target, 0);
+        stages.outputBytes += outputBytes(target, group.rows);
+        stages.check += maskedSum(target, mask, group.rows);
+      } else if (dense) {
         await column.load(allPages(column));
         const target = reusedTarget(name, column, group.rows, column.varlenBytes(0, group.rows));
         column.decodeRange(0, group.rows, target, 0);
@@ -410,8 +450,8 @@ async function measure(
   aggregate = false,
 ): Promise<void> {
   if (ONLY !== null && !label.includes(ONLY)) return;
-  const warm = space.view({ cache: true });
-  for (const way of ["before", "after"] as const) {
+  const warm = readerView(space.view({ cache: true }));
+  for (const way of (aggregate ? ["before", "after", "mask"] : ["before", "after"]) as Way[]) {
     if (WAY !== null && way !== WAY) continue;
     await scan(warm, filter, predicate, project, way, aggregate); // warm-up: pages cached
     const runs: Stages[] = [];

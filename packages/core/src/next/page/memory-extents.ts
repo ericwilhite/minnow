@@ -131,9 +131,31 @@ export class MemoryExtentSpace implements ExtentReader {
     return other;
   }
 
-  /** Drops every cached blob. */
+  readonly #parsed = new Map<string, object>();
+  /** `parsed` calls that found a descriptor, and descriptors attached. */
+  parsedHits = 0;
+  attached = 0;
+
+  /** Drops every cached blob (and the descriptors attached to them). */
   evict(): void {
     this.#cache.clear();
+    this.#parsed.clear();
+  }
+
+  parsed(ref: BlobRef): object | null {
+    const found = this.#parsed.get(MemoryExtentSpace.#key(ref)) ?? null;
+    if (found !== null) this.parsedHits++;
+    return found;
+  }
+
+  /** Attaches to a cached blob only (no governor here: nothing is charged). */
+  attach(ref: BlobRef, parsed: object, bytes: number): boolean {
+    void bytes;
+    const key = MemoryExtentSpace.#key(ref);
+    if (!this.#cache.has(key) || this.#parsed.has(key)) return false;
+    this.#parsed.set(key, parsed);
+    this.attached++;
+    return true;
   }
 
   write(offset: number, bytes: Uint8Array): void {

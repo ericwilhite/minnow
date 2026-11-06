@@ -76,6 +76,7 @@ import {
 } from "./predicate.js";
 import {
   dictionaryMatches,
+  maskPage,
   newScratch,
   scratchBytes,
   selectPage,
@@ -165,6 +166,57 @@ function at<T>(values: readonly T[], index: number): T {
   if (value === undefined) throw new RangeError("Index outside the list");
   return value;
 }
+/**
+ * What a page's parsed descriptor is charged in its cache entry: an upper bound of its own size.
+ * Measured with retained descriptors (`--expose-gc`, 20,000 per case): 337–548 bytes (text plain
+ * and dictionary, int64 delta, decimal specials with nulls, out-of-line values); it holds a
+ * fixed set of fields and at most eight typed-array views into the page's bytes, whatever the
+ * page's size.
+ */
+export const PAGE_DESCRIPTOR_BYTES = 768;
+
+/** A parsed page riding on its space-cache entry, with the directory fields it was checked against. */
+class PageDescriptor {
+  readonly #encoding: number;
+  readonly #rowCount: number;
+  readonly #nullCount: number;
+  readonly #regionOffset: number;
+  readonly #regionLength: number;
+  readonly #tag: number;
+  readonly #scale: number | null;
+  readonly #dictionarySize: number;
+  constructor(
+    readonly view: PageView,
+    entry: PageEntry,
+    tag: number,
+    scale: number | null,
+    dictionarySize: number,
+  ) {
+    this.#dictionarySize = dictionarySize;
+    this.#encoding = entry.encoding;
+    this.#rowCount = entry.rowCount;
+    this.#nullCount = entry.nullCount;
+    this.#regionOffset = entry.largeRegion?.offset ?? -1;
+    this.#regionLength = entry.largeRegion?.length ?? -1;
+    this.#tag = tag;
+    this.#scale = scale;
+  }
+
+  /** Whether `parsePage` with these arguments checked exactly what this descriptor was checked against. */
+  fits(entry: PageEntry, tag: number, scale: number | null, dictionarySize: number): boolean {
+    return (
+      dictionarySize === this.#dictionarySize &&
+      entry.encoding === this.#encoding &&
+      entry.rowCount === this.#rowCount &&
+      entry.nullCount === this.#nullCount &&
+      (entry.largeRegion?.offset ?? -1) === this.#regionOffset &&
+      (entry.largeRegion?.length ?? -1) === this.#regionLength &&
+      tag === this.#tag &&
+      scale === this.#scale
+    );
+  }
+}
+
 /** `at`, for methods whose `at` parameter shadows it. */
 const at_ = at;
 
@@ -469,7 +521,13 @@ export class ChunkReader {
     try {
       for (const [k, { entry, page }] of jobs.entries()) {
         const { bytes, pinned } = at(found, k);
-        this.#install(entry, page, bytes, { charged: bytes.length, lease: null, inflated: pinned });
+        this.#install(
+          entry,
+          page,
+          bytes,
+          { charged: bytes.length, lease: null, inflated: pinned },
+          pinned === null ? blobOf(this.chunk, entry) : null,
+        );
         installed++;
       }
     } catch (error) {
@@ -556,7 +614,13 @@ export class ChunkReader {
         lease.drop();
         throw error;
       }
-      this.#install(entry, page, bytes, { charged: 0, lease, inflated: null });
+      this.#install(
+        entry,
+        page,
+        bytes,
+        { charged: 0, lease, inflated: null },
+        blobOf(this.chunk, entry),
+      );
       return;
     }
     // gzip: charge the inflated size before allocating it, inflate, let the stored bytes go.
@@ -592,7 +656,18 @@ export class ChunkReader {
   }
 
   /** Parses and installs one page or the dictionary; on failure, gives `held` back. */
-  #install(entry: PageEntry, page: number | null, bytes: Uint8Array, held: Held): void {
+  /**
+   * Parses and installs one page or the dictionary; on failure, gives `held` back. `stored`: the
+   * blob whose cached bytes `bytes` are (null for inflated bytes), whose cache entry may carry
+   * the page's parsed descriptor.
+   */
+  #install(
+    entry: PageEntry,
+    page: number | null,
+    bytes: Uint8Array,
+    held: Held,
+    stored: BlobRef | null = null,
+  ): void {
     try {
       if (this.#closed) throw new ReaderClosedError();
       if (page === null) {
@@ -602,20 +677,43 @@ export class ChunkReader {
         this.#dictionaryVector = dictionaryVector(dictionary, this.chunk.type);
       } else {
         // Validated against the chunk, its dictionary's domain included: every consumer
-        // (select, refine, gather, decode) relies on this one check (review B2-p2d #1).
-        this.#pages[page] = parsePage(
-          bytes,
-          entry,
-          this.directory.tag,
-          this.directory.scale,
-          this.directory.dictionary?.rowCount ?? 0,
-        );
+        // (select, refine, gather, decode) relies on this one check (review B2-p2d #1), run once
+        // per cache residency when the page's descriptor rides on its cache entry.
+        this.#pages[page] = this.#parse(entry, bytes, stored);
         this.#held[page] = held;
       }
     } catch (error) {
       this.#drop(held);
       throw error;
     }
+  }
+
+  /**
+   * A page's view: the descriptor its cache entry carries when it was validated against the
+   * same directory fields, else a fresh parse, attached to the entry for the next reader.
+   * Validation thus runs once per cache residency, not once per load.
+   */
+  #parse(entry: PageEntry, bytes: Uint8Array, stored: BlobRef | null): PageView {
+    const tag = this.directory.tag;
+    const scale = this.directory.scale;
+    const dictionarySize = this.directory.dictionary?.rowCount ?? 0;
+    if (stored === null) return parsePage(bytes, entry, tag, scale, dictionarySize);
+    const cached = this.#space.parsed?.(stored) ?? null;
+    if (
+      cached instanceof PageDescriptor &&
+      cached.view.bytes === bytes &&
+      cached.fits(entry, tag, scale, dictionarySize)
+    )
+      return cached.view;
+    const view = parsePage(bytes, entry, tag, scale, dictionarySize);
+    // Only a view of the entry's own bytes may ride on the entry (parse copies a misaligned blob).
+    if (cached === null && view.bytes === bytes)
+      this.#space.attach?.(
+        stored,
+        new PageDescriptor(view, entry, tag, scale, dictionarySize),
+        PAGE_DESCRIPTOR_BYTES,
+      );
+    return view;
   }
 
   #drop(held: Held | undefined | null): void {
@@ -732,6 +830,35 @@ export class ChunkReader {
       count += selectPage(this.#context(compiled, page), null, start, stop, out, at + count);
     }
     return count;
+  }
+
+  /**
+   * The dense path: writes 1 to `mask[at + k]` when row `from + k` satisfies `compiled`, 0
+   * otherwise (null rows 0, except for `isNull`), and returns how many are 1. Pages the
+   * statistics rule out are zero-filled unread. A fused, branch-free filter and aggregate reads
+   * the mask beside dense decodes (`decodeRange`) of the aggregated columns. `mask` needs room
+   * for `to − from` bytes.
+   */
+  selectMask(
+    compiled: CompiledPredicate,
+    from: number,
+    to: number,
+    mask: Uint8Array,
+    at = 0,
+  ): number {
+    this.#live();
+    if (mask.length - at < to - from) throw new RangeError("The mask buffer is too small");
+    const [first, end] = this.pagesInRange(from, to);
+    let ones = 0;
+    for (let page = first; page < end; page++) {
+      const entry = at_(this.directory.pages, page);
+      const start = Math.max(from, entry.firstRow) - entry.firstRow;
+      const stop = Math.min(to, entry.firstRow + entry.rowCount) - entry.firstRow;
+      const offset = at + entry.firstRow + start - from;
+      if (!pageMayMatch(compiled, entry)) mask.fill(0, offset, offset + stop - start);
+      else ones += maskPage(this.#context(compiled, page), start, stop, mask, offset);
+    }
+    return ones;
   }
 
   /**

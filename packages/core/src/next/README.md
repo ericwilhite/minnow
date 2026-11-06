@@ -114,6 +114,8 @@ is access's `Snapshot`.
   pages, spill pages). It equals the reference XXH32 for any range, alignment and byte order,
   frozen by the published `xxhsum` sanity and string vectors plus vectors derived with the
   reference CLI on both sides of the read threshold.
+- The seed is taken as `seed >>> 0` (ToUint32) before any arithmetic, so a fractional,
+  non-finite or large number means exactly what `>>> 0` makes of it.
 - Inputs of at least `WORD_READ_BYTES` (256) read 32-bit little-endian words through one
   `DataView` per call (R15.8); shorter ones read bytes, which is faster there. Words are about
   2.5–3.5× faster from 4 KiB (about 2 GB/s against 0.6 GB/s); cold page loads, which verify
@@ -315,9 +317,24 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
 - Every dictionary page's codes are checked against its chunk's dictionary once, when the page
   is validated (`checkDictionaryCodes` in `parsePage`), so select, refine, gather and decode all
   rely on the same check.
+- The dense path: `reader.selectMask(compiled, from, to, mask)` writes a 0/1 `Uint8Array` (null
+  rows 0) without building positions, for a fused, branch-free filter and aggregate over dense
+  decodes (`decodeRange`) of the aggregated columns (`sum += value & -mask[row]`). Bytes beat
+  Uint32 bit words for such a consumer (measured: both ≈ 3 ns/row to write; int sums 2.8 against
+  5.4 ns/row, f64 sums 3.2 against 4.2).
 - Memory: no per-row allocation. The code bitmaps and the decode scratch are charged to the
   reader's budget and returned at `close`.
 - `scripts/pushdown-bench.mts` measures it on the W1M table's columns against decode-then-filter.
+- Parsed pages ride on their space-cache entries (`ExtentReader.parsed` / `attach`): a reader
+  attaches the page's descriptor (its `PageView`: views into the entry's own bytes, the validated
+  structure) to the entry, charged in that entry at `PAGE_DESCRIPTOR_BYTES` (768; measured
+  337–548 bytes, a fixed set of fields and at most eight views whatever the page's size), and
+  dropped with it. Later readers reuse it when it was validated against the same directory fields
+  (encoding, rows, nulls, large-value region, tag, scale, dictionary size), so a page is validated
+  once per cache residency, not once per load. Views share the cached bytes, so nothing is
+  counted twice. gzip pages (inflated per residency, R15.5) and dictionary pages are parsed per
+  reader. W1M, 0.1 % filter returning 30 columns, warm: 82.6 ms without descriptors, 52.9 ms with
+  (load ≈ 16); W5M: 235 ms warm.
 
 ### Manifest (`format/manifest.ts`)
 

@@ -532,6 +532,14 @@ describe.each(SEEDS)("predicate pushdown matches decode-then-filter (seed %i)", 
           const out = new Uint16Array(values.length);
           const count = reader.select(compiled, 0, values.length, out);
           expect(Array.from(out.subarray(0, count))).toEqual(expected);
+          // The dense path: a 0/1 mask, at an offset.
+          const mask = new Uint8Array(values.length + 3).fill(9);
+          const ones = reader.selectMask(compiled, 0, values.length, mask, 3);
+          expect(ones).toBe(expected.length);
+          expect(
+            Array.from(mask.subarray(3)).flatMap((one, row) => (one === 1 ? [row] : [])),
+          ).toEqual(expected);
+          expect(mask.subarray(3).every((one) => one === 0 || one === 1)).toBe(true);
           // Refine a subset (in place).
           const subset = Uint16Array.from(
             values.flatMap((_, row) =>

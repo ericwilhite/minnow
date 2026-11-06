@@ -51,11 +51,13 @@ export interface SelectScratch {
   specials: Uint8Array;
   /** The decoder writes validity too (pages with nulls need a target for it). */
   validity: Uint32Array;
+  /** Positions, for masks of pages without a mask kernel. */
+  positions: Uint16Array;
 }
 
 /** Bytes a scratch for `rows` rows takes. */
 export const scratchBytes = (rows: number): number =>
-  rows * (8 + 16 + 4 + 1) + ((rows + 31) >>> 5) * 4;
+  rows * (8 + 16 + 4 + 1 + 2) + ((rows + 31) >>> 5) * 4;
 
 export function newScratch(rows: number): SelectScratch {
   return {
@@ -64,6 +66,7 @@ export function newScratch(rows: number): SelectScratch {
     int32: new Int32Array(rows),
     specials: new Uint8Array(rows),
     validity: new Uint32Array((rows + 31) >>> 5),
+    positions: new Uint16Array(rows),
   };
 }
 
@@ -787,4 +790,274 @@ function decodedPage(
     }
   }
   return count;
+}
+
+// ── Masks (the dense path) ───────────────────────────────────────────────────────────────────
+
+/**
+ * Writes 1 to `mask[at + k]` when page row `from + k` satisfies the predicate and 0 otherwise,
+ * for `k < to − from`, and returns how many are 1. Null rows are 0 (except for `isNull`). A
+ * branch-free consumer (`sum += value & -mask[k]`) then filters and aggregates in one pass.
+ * Measured against Uint32 bit words (scripts/pushdown-bench.mts `--mask`): bytes are as cheap
+ * to write (≈ 3 ns/row) and up to 2× cheaper to consume.
+ */
+export function maskPage(
+  context: SelectContext,
+  from: number,
+  to: number,
+  mask: Uint8Array,
+  at: number,
+): number {
+  const { view, compiled } = context;
+  const validity = view.validity;
+  const count = to - from;
+  if (compiled.nulls !== null || compiled.empty || view.allNull) {
+    const wantNull = compiled.nulls === "isNull";
+    if (compiled.nulls === null) {
+      mask.fill(0, at, at + count);
+      return 0;
+    }
+    if (view.allNull) {
+      mask.fill(wantNull ? 1 : 0, at, at + count);
+      return wantNull ? count : 0;
+    }
+    let ones = 0;
+    for (let k = 0; k < count; k++) {
+      const row = from + k;
+      const valid = validity === null || bit(validity, row);
+      const one = valid !== wantNull ? 1 : 0;
+      mask[at + k] = one;
+      ones += one;
+    }
+    return ones;
+  }
+  let ones = -1;
+  const ranges = maskRanges(context);
+  if (ranges !== null && ranges.count === 1) {
+    const low = ranges.lows[0] ?? 0;
+    const high = ranges.highs[0] ?? 0;
+    const values = ranges.values;
+    if (values instanceof Uint8Array) ones = mask8(values, from, to, low, high, mask, at);
+    else if (values instanceof Uint16Array) ones = mask16(values, from, to, low, high, mask, at);
+    else if (values instanceof Uint32Array) ones = mask32(values, from, to, low, high, mask, at);
+    else if (values instanceof Int32Array) ones = maskI32(values, from, to, low, high, mask, at);
+  } else if (
+    view.kind === PageEncoding.dictionary &&
+    view.unsigned !== null &&
+    context.codes !== null &&
+    context.dictionary !== null
+  ) {
+    checkDictionaryCodes(view, context.dictionary.size); // as selectPage does (one check)
+    ones = maskCodes(view.unsigned, context.codes, from, to, mask, at);
+  } else if (
+    (view.tag === ValueTag.f64 || view.tag === ValueTag.f32) &&
+    view.kind === PageEncoding.plain
+  ) {
+    const single = compiled.floats.length === 1 ? compiled.floats[0] : undefined;
+    if (
+      single?.low != null &&
+      single.high !== null &&
+      !compiled.specials.nan &&
+      single.low.inclusive &&
+      single.high.inclusive
+    )
+      ones =
+        view.plain instanceof Float64Array
+          ? maskF64(view.plain, from, to, single.low.value, single.high.value, mask, at)
+          : maskF32(
+              view.plain as Float32Array,
+              from,
+              to,
+              single.low.value,
+              single.high.value,
+              mask,
+              at,
+            );
+  }
+  if (ones < 0) return maskFromPositions(context, from, to, mask, at);
+  if (validity === null) return ones;
+  // Clear what the value kernels set under null rows.
+  for (let k = 0; k < count; k++) {
+    const row = from + k;
+    if (!bit(validity, row) && mask[at + k] === 1) {
+      mask[at + k] = 0;
+      ones--;
+    }
+  }
+  return ones;
+}
+
+/** The page's values and its predicate's bounds when a range kernel applies (plain int32, FOR). */
+function maskRanges(
+  context: SelectContext,
+): (NumberRanges & { values: Int32Array | Uint8Array | Uint16Array | Uint32Array }) | null {
+  const { view, compiled } = context;
+  if (view.tag === ValueTag.i32 && view.kind === PageEncoding.plain)
+    return {
+      ...numberRanges(compiled, 0n, -(2n ** 31n), 2n ** 31n - 1n),
+      values: view.plain as Int32Array,
+    };
+  const integer =
+    view.tag === ValueTag.i32 || view.tag === ValueTag.i64 || view.tag === ValueTag.dec64;
+  if (
+    integer &&
+    view.kind === PageEncoding.frameOfReference &&
+    view.checkpoints === null &&
+    view.specials === null &&
+    view.unsigned !== null
+  ) {
+    const base = BigInt(view.baseHigh) * BigInt(TWO32) + BigInt(view.baseLow >>> 0);
+    const maxDelta = 2n ** BigInt(view.width * 8) - 1n;
+    return { ...numberRanges(compiled, base, 0n, maxDelta), values: view.unsigned };
+  }
+  return null;
+}
+
+/** Pages with no mask kernel: their positions, spread into the mask. */
+function maskFromPositions(
+  context: SelectContext,
+  from: number,
+  to: number,
+  mask: Uint8Array,
+  at: number,
+): number {
+  const positions = context.scratch.positions;
+  const first = context.entry.firstRow;
+  mask.fill(0, at, at + (to - from));
+  let ones = 0;
+  for (let start = from; start < to; start += positions.length) {
+    const end = Math.min(to, start + positions.length);
+    const count = selectPage(context, null, start, end, positions, 0);
+    for (let k = 0; k < count; k++) mask[at + (positions[k] ?? 0) - first - from] = 1;
+    ones += count;
+  }
+  return ones;
+}
+
+// One loop per array type, ternary stores (a `+(a) & +(b)` store into a Uint8Array measured
+// several times slower).
+function mask8(
+  values: Uint8Array,
+  from: number,
+  to: number,
+  low: number,
+  high: number,
+  mask: Uint8Array,
+  at: number,
+): number {
+  let ones = 0;
+  for (let row = from; row < to; row++) {
+    const value = values[row] ?? 0;
+    const one = value >= low && value <= high ? 1 : 0;
+    mask[at + row - from] = one;
+    ones += one;
+  }
+  return ones;
+}
+function mask16(
+  values: Uint16Array,
+  from: number,
+  to: number,
+  low: number,
+  high: number,
+  mask: Uint8Array,
+  at: number,
+): number {
+  let ones = 0;
+  for (let row = from; row < to; row++) {
+    const value = values[row] ?? 0;
+    const one = value >= low && value <= high ? 1 : 0;
+    mask[at + row - from] = one;
+    ones += one;
+  }
+  return ones;
+}
+function mask32(
+  values: Uint32Array,
+  from: number,
+  to: number,
+  low: number,
+  high: number,
+  mask: Uint8Array,
+  at: number,
+): number {
+  let ones = 0;
+  for (let row = from; row < to; row++) {
+    const value = values[row] ?? 0;
+    const one = value >= low && value <= high ? 1 : 0;
+    mask[at + row - from] = one;
+    ones += one;
+  }
+  return ones;
+}
+function maskI32(
+  values: Int32Array,
+  from: number,
+  to: number,
+  low: number,
+  high: number,
+  mask: Uint8Array,
+  at: number,
+): number {
+  let ones = 0;
+  for (let row = from; row < to; row++) {
+    const value = values[row] ?? 0;
+    const one = value >= low && value <= high ? 1 : 0;
+    mask[at + row - from] = one;
+    ones += one;
+  }
+  return ones;
+}
+function maskF64(
+  values: Float64Array,
+  from: number,
+  to: number,
+  low: number,
+  high: number,
+  mask: Uint8Array,
+  at: number,
+): number {
+  let ones = 0;
+  for (let row = from; row < to; row++) {
+    const value = values[row] ?? 0;
+    const one = value >= low && value <= high ? 1 : 0;
+    mask[at + row - from] = one;
+    ones += one;
+  }
+  return ones;
+}
+function maskF32(
+  values: Float32Array,
+  from: number,
+  to: number,
+  low: number,
+  high: number,
+  mask: Uint8Array,
+  at: number,
+): number {
+  let ones = 0;
+  for (let row = from; row < to; row++) {
+    const value = values[row] ?? 0;
+    const one = value >= low && value <= high ? 1 : 0;
+    mask[at + row - from] = one;
+    ones += one;
+  }
+  return ones;
+}
+function maskCodes(
+  codes: Uint8Array | Uint16Array | Uint32Array,
+  matches: Uint32Array,
+  from: number,
+  to: number,
+  mask: Uint8Array,
+  at: number,
+): number {
+  let ones = 0;
+  for (let row = from; row < to; row++) {
+    const code = codes[row] ?? 0;
+    const one = ((matches[code >>> 5] ?? 0) >>> (code & 31)) & 1;
+    mask[at + row - from] = one;
+    ones += one;
+  }
+  return ones;
 }
