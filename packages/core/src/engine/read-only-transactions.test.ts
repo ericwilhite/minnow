@@ -355,3 +355,93 @@ describe("READ ONLY across entry points, row locks and savepoints (review B6 str
     await database.close();
   });
 });
+
+describe("READ ONLY binds live subscriptions (review B6 stream A 3, finding 1)", () => {
+  /** A live subscription's outcome and the durable sequence position after it. */
+  async function liveCase(
+    begin: string,
+    read: string,
+    typed: boolean,
+    phase: "init" | "refresh",
+  ): Promise<{ outcome: string; before: number; after: number }> {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    for (const sql of SETUP) await database.execute(sql);
+    const live = database.liveQueries();
+    const input = typed ? { kind: "typed-query" as const, plan: compileQuery(read) } : read;
+    let errors = 0;
+    let deliveries = 0;
+    const options = {
+      onChange: () => {
+        deliveries += 1;
+      },
+      onError: () => {
+        errors += 1;
+      },
+    };
+    const position = async () =>
+      Number(
+        (await database.query("SELECT currval('s') AS n").catch(() => ({ rows: [{ n: 0 }] })))
+          .rows[0]?.n ?? 0,
+      );
+    try {
+      if (phase === "refresh") {
+        await live.subscribe(input, options).catch(() => {
+          errors += 1;
+        });
+        errors = 0;
+        deliveries = 0;
+      }
+      const before = await position();
+      await database.execute(begin);
+      if (phase === "init")
+        await live.subscribe(input, options).catch(() => {
+          errors += 1;
+        });
+      else
+        await live.refresh().catch(() => {
+          errors += 1;
+        });
+      await database.execute("ROLLBACK");
+      live.close();
+      // The durable position: the next nextval outside any transaction is one past it.
+      const next = Number((await database.query("SELECT nextval('s') AS n")).rows[0]?.n);
+      return {
+        outcome: errors > 0 ? "refused" : deliveries > 0 ? "ran" : "silent",
+        before,
+        after: next - 1,
+      };
+    } finally {
+      await database.close();
+    }
+  }
+
+  it("refuses nextval and row locks in live runs inside READ ONLY, and moves no sequence", async () => {
+    const mismatches: string[] = [];
+    const reach = createReach<string>("read-only live runs", REFUSAL_STATES);
+    for (const begin of ["BEGIN READ ONLY", "BEGIN"])
+      for (const read of [
+        "SELECT nextval('s') AS n",
+        "SELECT * FROM t FOR UPDATE",
+        "SELECT count(*) AS n FROM t",
+      ])
+        for (const typed of [false, true])
+          for (const phase of ["init", "refresh"] as const) {
+            reach.beginHistory();
+            const { outcome, before, after } = await liveCase(begin, read, typed, phase);
+            const refuses = begin === "BEGIN READ ONLY" && !read.startsWith("SELECT count");
+            const label = `${typed ? "typed" : "sql"} ${phase}: ${begin}; ${read}`;
+            // PostgreSQL: a refused read leaves the sequence where it was.
+            // A refresh with nothing invalidated runs nothing ("silent"); that refuses nothing
+            // and moves nothing, which is all read-only asks of it.
+            const refused = outcome === "refused" || (phase === "refresh" && outcome === "silent");
+            if (refuses && (!refused || after !== before))
+              mismatches.push(
+                `${label}: ${outcome}, sequence ${String(before)} → ${String(after)}`,
+              );
+            else if (!refuses && outcome === "refused") mismatches.push(`${label}: refused`);
+            else reach.reach(refuses ? "refused" : "accepted");
+          }
+    expect(mismatches.join("\n")).toBe("");
+    reach.assertReached();
+  });
+});

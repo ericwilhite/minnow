@@ -72,7 +72,7 @@ b.id = a.id)` was false when no row of `b` matched. An aggregate without `GROUP 
   `MERGE`, `TRUNCATE`, schema changes, `nextval` and row locks (`SELECT … FOR UPDATE`,
   `FOR SHARE`, `FOR NO KEY UPDATE`, `FOR KEY SHARE`) in a read-only transaction fail with
   "cannot execute … in a read-only transaction", as in PostgreSQL. That applies through
-  `execute`, `query`, `queryCursor` and a built query's `run` alike. Open the transaction with
+  `execute`, `query`, `queryCursor`, a built query's `run` and live subscriptions alike. Open the transaction with
   `BEGIN` (or `READ WRITE`) to write.
   - Switching back with `SET TRANSACTION READ WRITE` fails with "transaction read-write mode
     must be set before any query" once the transaction has run a statement (a `query` call

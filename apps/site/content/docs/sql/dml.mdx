@@ -331,7 +331,9 @@ satisfies those levels, while `SERIALIZABLE` is refused rather than silently dow
 `READ ONLY` transaction refuses writes, as in PostgreSQL. `INSERT`, `UPDATE`, `DELETE`, `MERGE`,
 `TRUNCATE`, schema changes, `nextval` and row locks (`SELECT … FOR UPDATE`, `FOR SHARE`, and the
 `KEY` forms) fail with "cannot execute … in a read-only transaction". This holds however the
-statement arrives: through `execute`, `query`, `queryCursor` or a built query's `run`.
+statement arrives: through `execute`, `query`, `queryCursor`, a built query's `run`, or a live
+subscription's runs (which are not statements of the transaction, so they never count for
+`READ WRITE`).
 
 `SET TRANSACTION READ ONLY` makes the open transaction read-only at any point. Switching a
 read-only transaction back with `SET TRANSACTION READ WRITE` is refused once the transaction

@@ -6527,6 +6527,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
         const record = await this.store.getTableByName(`${SEQUENCE_PREFIX}${name}`);
         if (record?.sequence === undefined) throw new TypeError(`Sequence does not exist: ${name}`);
+        // PostgreSQL refuses nextval in a read-only transaction when it executes, whatever ran
+        // it: a query, a cursor, a live subscription's first run or its refresh.
+        if (this.#openTransaction?.readOnly === true) throw readOnlyTransactionError("nextval()");
         const range = await this.store.reserveAutoIncrement(
           record.id,
           record.sequence.columnId,
@@ -8758,10 +8761,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           }
           return ids;
         },
-        execute: (query, context) => this.#liveExecute(query, context),
+        execute: (query, context) => {
+          this.#liveReadOnlyGuard(query);
+          return this.#liveExecute(query, context);
+        },
         memoize: (query, result, probe) => this.#memoizeLiveResult(query, result, probe),
-        executeMaintainable: (query, context) =>
-          this.#liveExecuteMaintainable(this.#compileLiveQuery(query), context),
+        executeMaintainable: (query, context) => {
+          this.#liveReadOnlyGuard(query);
+          return this.#liveExecuteMaintainable(this.#compileLiveQuery(query), context);
+        },
         maintain: (_query, result, state, tableIds, after, until, probe) =>
           this.#liveMaintain(result, state as LiveMaintenanceState, tableIds, after, until, probe),
         changeCanAffect: (query, tableIds, after, until) =>
@@ -8855,6 +8863,24 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * subscription per commit. The set retains the result itself, so the engine memoizes it only
    * when an adapter is about to ask for the same statement at the same version.
    */
+  /**
+   * A live run (first run or refresh) inside an open read-only transaction is no statement of it
+   * (it never counts for READ WRITE), but read-only still binds it: it may not lock rows.
+   * nextval is refused where it executes (#resolveSequenceCalls), so a live run cannot move a
+   * sequence either.
+   */
+  #liveReadOnlyGuard(query: LiveQueryInput): void {
+    if (this.#openTransaction?.readOnly !== true) return;
+    const plan =
+      typeof query === "string"
+        ? this.#queries.compile(query)
+        : query.kind === "typed-query"
+          ? query.plan
+          : this.#queries.compile(query.sql);
+    if (plan.rowLocking !== undefined)
+      throw readOnlyTransactionError(`SELECT FOR ${plan.rowLocking}`);
+  }
+
   async #liveExecute(
     query: LiveQueryInput,
     context: LiveQueryExecuteContext | undefined,
