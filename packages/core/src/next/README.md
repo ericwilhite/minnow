@@ -976,6 +976,8 @@ window evaluation. Bundle each with esbuild for Node and run with `node --expose
 and `RUNS` set the input size and measured repetitions. The grouped benchmark also accepts
 `GROUPS`. Compare revision bundles in at least five interleaved rounds. These component
 measurements do not establish the whole-query browser performance gates.
+`exec/sort-direct.bench.ts` isolates fixed-width key normalization on prebuilt batches,
+checking every word against frozen sort-key bytes outside CPU timing.
 
 ### Windows (`exec/window.ts`, `window-sort.ts`, `window-frames.ts`, `window-stream.ts`)
 
