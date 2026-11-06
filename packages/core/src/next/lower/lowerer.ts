@@ -57,6 +57,7 @@ import type { ExecutorCosts } from "../ir/costs.js";
 import type { PhysicalPlan } from "../ir/ir.js";
 import type { TableRuleExpressions } from "../ir/rules.js";
 import type { PhysicalType } from "../types.js";
+import type { ParameterizedText } from "./parameterize.js";
 import type { ResultColumn } from "./result.js";
 import type { StatementKind } from "./statement.js";
 import type { PlanningStatistics, StatisticsBasis } from "./statistics.js";
@@ -96,9 +97,18 @@ interface LoweredPlanned extends LoweredBase {
   readonly plan: PhysicalPlan;
   /** Result columns, aligned with `plan.columns` (RETURNING for DML; empty without it). */
   readonly columns: readonly ResultColumn[];
+  /**
+   * From `lowerParameterized` only: how many trailing placeholder slots hold lifted literals.
+   * They follow the client's `parameters`; the owner binds `ParameterizedText.values` there.
+   */
+  readonly liftedParameters?: number;
   /** Every table id the plan reads (scans, lookups, fetches, through views and subqueries). */
   readonly reads: readonly number[];
-  /** Row counts the plan was costed with (lower/statistics.ts). */
+  /**
+   * Row counts the plan was costed with (lower/statistics.ts). Empty when no decision about the
+   * plan's shape read statistics (a unique-key lookup, a lone scan): the owner can skip
+   * `statisticsDrifted` for it.
+   */
   readonly basis: readonly StatisticsBasis[];
 }
 
@@ -222,5 +232,23 @@ export interface Lowerer {
    * as the `createTable` change SQL's CREATE TABLE would give (additive, Phase 2). The DSL names
    * no SQL types: `column.integer()` is INTEGER and `column.number()` DOUBLE PRECISION (R17.3).
    */
+  /**
+   * Literal auto-parameterization for the plan cache (lower/parameterize.ts): the statement with
+   * each integer or plain string literal that is the whole operand of `=` lifted into a trailing
+   * placeholder, and the cache key texts differing only in those values share; null when there
+   * is nothing to lift. Pure text work, no parse: cheap enough to run on every execution.
+   */
+  parameterize(text: string): ParameterizedText | null;
+  /**
+   * `parameterized.text` lowered with its lifted slots typed as their literals, or null when a
+   * lifted slot is used where it is not equivalent to the literal (or the rewritten text does not
+   * lower): the owner then lowers the original text and caches it under that text. A non-null
+   * result binds the client's parameters (`parameters`) then `parameterized.values`
+   * (`liftedParameters` slots), and serves every text with the same `key`.
+   */
+  lowerParameterized(
+    parameterized: ParameterizedText,
+    context: LoweringContext,
+  ): LoweredStatement | null;
   lowerSchemaTable(input: CreateTableInput, catalog: CatalogView): CatalogChange;
 }

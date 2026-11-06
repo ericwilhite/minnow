@@ -115,6 +115,12 @@ class StubLowerer implements Lowerer {
   lowerWrite(): never {
     throw new Error("not used here");
   }
+  parameterize(): null {
+    return null;
+  }
+  lowerParameterized(): null {
+    return null;
+  }
   lowerSchemaTable(): never {
     throw new Error("not used here");
   }

@@ -38,6 +38,7 @@ import {
   PlanBuilder,
   type RelColumn,
 } from "./query.js";
+import { liftedSlotsAreEquivalent, parameterize, type ParameterizedText } from "./parameterize.js";
 import { resultColumn } from "./result.js";
 import { lowerTableRules } from "./rules.js";
 import { classifyStatement } from "./statement.js";
@@ -134,7 +135,10 @@ function planned(plan: Planning, root: Rel, columns: readonly RelColumn[], catal
     plan: physicalPlan(root, outputColumns(columns), plan, catalog),
     columns: columns.map((column) => resultColumn(column, column.big)),
     reads: [...plan.builder.reads].sort((a, b) => a - b),
-    basis: [...plan.builder.rowCounts].map(([tableId, rowCount]) => ({ tableId, rowCount })),
+    // Empty when no shape decision read statistics: such a plan never needs re-lowering for them.
+    basis: plan.builder.statisticsDependent
+      ? [...plan.builder.rowCounts].map(([tableId, rowCount]) => ({ tableId, rowCount }))
+      : [],
     parameters: plan.state.parameters.settled(),
   };
 }
@@ -384,6 +388,42 @@ export function createLowerer(): Lowerer {
 
     lowerSchemaTable(input: CreateTableInput, catalog: CatalogView): CatalogChange {
       return { kind: "createTable", table: tableInput(input, catalog, "schema") };
+    },
+
+    parameterize,
+
+    lowerParameterized(
+      parameterized: ParameterizedText,
+      context: LoweringContext,
+    ): LoweredStatement | null {
+      const own = context.parameterTypes ?? [];
+      const parameterTypes = [
+        ...Array.from({ length: parameterized.placeholders }, (_, index) => own[index] ?? null),
+        ...parameterized.types,
+      ];
+      let lowered: LoweredStatement;
+      try {
+        lowered = lowerStatement(parameterized.text, { ...context, parameterTypes });
+      } catch {
+        // The original text lowers (or fails) on its own; the rewrite must not decide it.
+        return null;
+      }
+      if (lowered.kind !== "query" && lowered.kind !== "modify") return null;
+      const first = parameterized.placeholders;
+      const lifted = new Set(parameterized.types.map((_, index) => first + index));
+      if (!liftedSlotsAreEquivalent(lowered.plan, lifted)) return null;
+      // A lifted slot whose type lowering did not keep (a placeholder typed by its context).
+      if (
+        parameterized.types.some(
+          (type, index) => lowered.plan.parameters[first + index]?.kind !== type.kind,
+        )
+      )
+        return null;
+      return {
+        ...lowered,
+        parameters: lowered.parameters.slice(0, first),
+        liftedParameters: parameterized.types.length,
+      };
     },
   };
 }

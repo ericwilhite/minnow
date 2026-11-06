@@ -54,7 +54,12 @@ function setup(
     return lowered.plan.root;
   };
   const tableId = (name: string) => catalog.view.tableByName(name)?.id ?? -1;
-  return { plan, tableId };
+  const basis = (sql: string) => {
+    const lowered = lowerer.lower(sql, context());
+    if (lowered.kind !== "query" && lowered.kind !== "modify") throw new Error(sql);
+    return lowered.basis;
+  };
+  return { plan, tableId, basis };
 }
 
 function all(rel: Rel): Rel[] {
@@ -240,5 +245,31 @@ describe("index ranges (ir.ts indexRange, lower/access-path.ts)", () => {
     expect(
       range?.op === "indexRange" ? [range.lower?.inclusive, range.upper?.inclusive] : null,
     ).toEqual([true, false]);
+  });
+});
+
+describe("statistics basis (lowerer.ts LoweredPlanned.basis)", () => {
+  const DDL = [...STAR, "CREATE INDEX sales_day ON sales (day)"];
+
+  it("is empty when no decision about the plan's shape read statistics", () => {
+    const { basis } = setup(DDL, { sales: 1_000_000, stores: 50 });
+    expect(basis("SELECT amount FROM sales WHERE id = 7")).toEqual([]);
+    expect(basis("SELECT amount FROM sales WHERE id IN (1, 2)")).toEqual([]);
+    expect(basis("SELECT count(*) AS n FROM sales WHERE store = 3")).toEqual([]);
+    expect(basis("DELETE FROM stores WHERE id = 3")).toEqual([]);
+  });
+
+  it("names the tables whose counts chose the shape", () => {
+    const { basis, tableId } = setup(DDL, { sales: 1_000_000, stores: 50 });
+    // A join order and build side.
+    expect(
+      basis("SELECT s.amount FROM sales s JOIN stores st ON st.id = s.store")
+        .map((entry) => entry.tableId)
+        .sort(),
+    ).toEqual([tableId("sales"), tableId("stores")].sort());
+    // An index range costed against the scan.
+    expect(basis("SELECT id FROM sales WHERE day BETWEEN 3 AND 9")).toEqual([
+      { tableId: tableId("sales"), rowCount: 1_000_000 },
+    ]);
   });
 });

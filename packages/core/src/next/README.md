@@ -1264,8 +1264,15 @@ with a fixed threshold; use `MODE=encode` and `MODE=filter` in interleaved round
   with result descriptors, read and write sets and its statistics basis; a catalog change; or a
   transaction or utility command. `lowerer.ts` lists the front-end passes that are kept and the
   code that lowering replaces.
-- Pure and synchronous; the owner caches by (text, catalog version) and re-lowers when
-  `statisticsDrifted` says the data moved.
+- Pure and synchronous; the owner caches by (text, catalog version, `parameterTypes` when sent)
+  and re-lowers when `statisticsDrifted` says the data moved. A plan whose shape no statistics
+  decided (a unique-key lookup, a lone scan) has an empty `basis`, so its hit skips the check.
+- Literal auto-parameterization (`parameterize.ts`): `parameterize(text)` lifts each integer or
+  plain string literal that is the whole operand of `=` into a trailing placeholder and returns
+  the cache key texts differing only in those values share (a text scan, ~4 µs);
+  `lowerParameterized` lowers the rewrite with the slots typed as the literals and accepts it only
+  where each lifted slot is an `=` operand of the same type or an index key (else null: lower the
+  text). A literal point-read loop over 10,000 keys lowers once.
 - Every failure is a `PlanningError` with PostgreSQL's SQLSTATE (42601 syntax, 42P01 relation,
   42703 column, 42883 function, 42704 type, …) or an `UnsupportedPlanError` (0A000). Front-end
   errors are translated by message (`frontEndError`), keeping the parse position and the

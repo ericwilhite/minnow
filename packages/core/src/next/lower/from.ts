@@ -972,6 +972,8 @@ function orderInner(
   if (units.length === 0) throw new PlanningError("empty FROM", "XX000");
   const ready = units.map(applyCovered);
   if (ready.length === 1) return at(ready, 0);
+  // Join order and build sides come from the estimates.
+  builder.dependsOnStatistics();
   const n = ready.length;
   // Every open conjunct is planned by the units it reads (indices into `ready`), computed once.
   const unitOfSource = new Map<number, number>();
