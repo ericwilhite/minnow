@@ -973,6 +973,12 @@ and the owner import it directly.
   announces on every port: the client sends its unanswered requests again to it, and an owner
   registers again on a new id, but only while it still holds both its locks. A request id is
   answered once, so a retry the same instance already saw makes no second connection.
+- Requests issued before the first connection are sent on that connection, once and in issue
+  order. After the first `unreachable` status, `unresponsiveAfterMs` (10 s by default) bounds
+  waiting requests: `OwnerUnreachableError` reports effect `none` for a never-sent request and
+  `unknown` for an unanswered sent request. A sent BEGIN or unknown statement keeps its session
+  lost until an explicit end. After the deadline, new requests fail immediately with `none` and
+  trigger another connection attempt. A successful connection clears the deadline; closing cancels it.
 - A client learns that its owner was replaced even while idle: a new owner announces itself on
   the database's BroadcastChannel (`{t: "owner", ownerId, epoch}`, the fence epoch, strictly
   increasing). An announcement is a hint: a client acts only on an epoch above its owner's, and

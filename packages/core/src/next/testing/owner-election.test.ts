@@ -2353,6 +2353,8 @@ describe("requests end in bounded time too (client.ts connect and giveUp)", () =
     const begin2 = settledAs(client.query("BEGIN", [], { session: 2 }));
     const outcome = await Promise.race([spin, sleep(3_000).then(() => null)]);
     expect((await begin2).error?.effect).toBe("unknown");
+    // Check before recovery: a missing loss cause must fail here, not hang later.
+    expect(client.lostSessions.has(2)).toBe(true);
     expect(outcome?.error?.name).toBe("OwnerUnreachableError");
     // The dangerous direction: it was sent, so it may have taken effect. Never "none".
     expect(outcome?.error?.effect).toBe("unknown");
