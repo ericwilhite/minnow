@@ -33,6 +33,7 @@ import {
   type BlobRef,
   type CacheMemory,
   type EvictableCacheLike,
+  type PeekOptions,
   type ReadLease,
   type ReadOptions,
 } from "./extents.js";
@@ -99,6 +100,8 @@ class List {
 
 export interface CacheStats {
   readonly residentBytes: number;
+  /** Bytes in the protected segment (entries used more than once), descriptors included. */
+  readonly protectedBytes: number;
   readonly pinnedBytes: number;
   readonly hits: number;
   readonly misses: number;
@@ -175,6 +178,7 @@ export class PageCache implements EvictableCacheLike {
   get stats(): CacheStats {
     return {
       residentBytes: this.#probation.bytes + this.#protected.bytes + this.#pinnedBytes,
+      protectedBytes: this.#protected.bytes,
       pinnedBytes: this.#pinnedBytes,
       hits: this.#hits,
       misses: this.#misses,
@@ -220,10 +224,11 @@ export class PageCache implements EvictableCacheLike {
    * charging `bytes` to the cache now, pinned or not; the charge stays until the entry is
    * evicted, dropped or forgotten, with which the descriptor goes.
    */
-  attachParsed(ref: BlobRef, parsed: object, bytes: number): boolean {
+  attachParsed(ref: BlobRef, parsed: object, bytes: number, of: Uint8Array): boolean {
     const entry = this.#find(ref);
-    // Not resident, or already carrying one: no.
-    if (entry?.parsed !== null || this.#closed) return false;
+    // Not resident, already carrying one, or a descriptor of other bytes (a one-pass read's
+    // private copy of this blob, review B2-p2g #3): no.
+    if (entry?.parsed !== null || entry.bytes !== of || this.#closed) return false;
     if (!(Number.isSafeInteger(bytes) && bytes >= 0))
       throw new RangeError("A descriptor's size must be a byte count");
     // Charged before it is attached, pinned or not: refused, nothing is attached.
@@ -236,10 +241,12 @@ export class PageCache implements EvictableCacheLike {
     return true;
   }
 
-  peek(ref: BlobRef): Uint8Array | null {
+  peek(ref: BlobRef, options: PeekOptions = {}): Uint8Array | null {
     const entry = this.#find(ref);
     if (entry === null) return null;
     this.#hits += 1;
+    // A one-pass scan's hit is not a use: no promotion, no move, no recency (review B2-p2g #2).
+    if (options.once === true) return entry.bytes;
     entry.hot = true;
     entry.usedAt = performance.now();
     this.#touch(entry);

@@ -5,7 +5,7 @@
  * equal the fixed slabs, plus base bytes and overhead of every unpinned resident entry, plus the
  * descriptor of every live entry (resident or pinned), and the lease budget the blob bytes of
  * the outstanding leases. Operations: cold and hot reads, several leases on one entry, attach
- * pinned and unpinned (granted and refused), peek, last and non-last release (re-admission
+ * pinned and unpinned (granted and refused, and refused for a copy of the entry's bytes), peek, last and non-last release (re-admission
  * granted and refused), full eviction, drop while pinned and unpinned, close with outstanding
  * leases, and two concurrent cold reads of one blob whose second platform read is held until the
  * first has attached and released (the interleaving the sequential model could not reach).
@@ -91,6 +91,7 @@ const STATES = [
   "attach-pinned-false",
   "attach-unpinned-true",
   "attach-unpinned-false",
+  "attach-foreign-false",
   "release-true",
   "release-false",
   "drop-pinned",
@@ -160,10 +161,16 @@ describe.each(SEEDS)("the page cache's accounting model (seed %i)", (seed) => {
           reach.reach("read");
         } else if (op === 1) {
           memory.deny = random(2) === 0;
-          const ok = cache.attachParsed(ref, {}, DESCRIPTOR);
-          expect(ok, where()).toBe(entry?.descriptor === 0 && !memory.deny);
+          // A descriptor of the entry's own bytes, or of an equal private copy (a one-pass
+          // read's, review B2-p2g #3), which must never ride on the entry.
+          const foreign = random(4) === 0;
+          const own = cache.peek(ref, { once: true });
+          const of = foreign || own === null ? data.slice(id * 4096, id * 4096 + BLOB) : own;
+          const ok = cache.attachParsed(ref, {}, DESCRIPTOR, of);
+          expect(ok, where()).toBe(entry?.descriptor === 0 && !memory.deny && !foreign);
           if (ok && entry !== undefined) entry.descriptor = DESCRIPTOR;
-          if (entry !== undefined)
+          if (entry !== undefined && foreign) reach.reach("attach-foreign-false");
+          else if (entry !== undefined)
             reach.reach(
               `attach-${entry.pins > 0 ? "pinned" : "unpinned"}-${String(ok)}` as (typeof STATES)[number],
             );
@@ -220,7 +227,7 @@ describe.each(SEEDS)("the page cache's accounting model (seed %i)", (seed) => {
           await gate.entered;
           const fresh: Shadow = { id, pins: 1, descriptor: 0, resident: true };
           entries.push(fresh);
-          if (random(2) === 0 && cache.attachParsed(ref, {}, DESCRIPTOR)) {
+          if (random(2) === 0 && cache.attachParsed(ref, {}, DESCRIPTOR, first.bytes[0] ?? data)) {
             fresh.descriptor = DESCRIPTOR;
             reach.reach("concurrent-cold-descriptor");
           }
@@ -273,7 +280,7 @@ describe("the page cache's accounting: the reviewer's race", () => {
     const two = cache.read([ref], { budget });
     const first = await one;
     await gate.entered;
-    expect(cache.attachParsed(ref, {}, DESCRIPTOR)).toBe(true);
+    expect(cache.attachParsed(ref, {}, DESCRIPTOR, first.bytes[0] ?? data)).toBe(true);
     first.release();
     gate.unblock();
     const second = await two;

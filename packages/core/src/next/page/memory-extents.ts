@@ -29,6 +29,7 @@ import {
   type ExtentReader,
   type ExtentRef,
   type ExtentWriter,
+  type PeekOptions,
   type PendingBlob,
   type ReadLease,
   type ReadOptions,
@@ -152,11 +153,11 @@ export class MemoryExtentSpace implements ExtentReader {
     return found;
   }
 
-  /** Attaches to a cached blob only (no governor here: nothing is charged). */
-  attach(ref: BlobRef, parsed: object, bytes: number): boolean {
+  /** Attaches to a cached blob's own bytes only (no governor here: nothing is charged). */
+  attach(ref: BlobRef, parsed: object, bytes: number, of: Uint8Array): boolean {
     void bytes;
     const key = MemoryExtentSpace.#key(ref);
-    if (!this.#cache.has(key) || this.#parsed.has(key)) return false;
+    if (this.#cache.get(key) !== of || this.#parsed.has(key)) return false;
     this.#parsed.set(key, parsed);
     this.attached++;
     return true;
@@ -224,7 +225,9 @@ export class MemoryExtentSpace implements ExtentReader {
     };
   }
 
-  peek(ref: BlobRef): Uint8Array | null {
+  /** No recency here, so a one-pass hit (`options.once`) is served the same way. */
+  peek(ref: BlobRef, options?: PeekOptions): Uint8Array | null {
+    void options;
     this.peeks++;
     const found = this.#cache.get(MemoryExtentSpace.#key(ref)) ?? null;
     if (found !== null) this.hits++;

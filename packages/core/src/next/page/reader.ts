@@ -125,8 +125,10 @@ export interface ChunkReadOptions {
    * A one-pass scan (storage/extents.ts `ReadOptions.once`): what the reader reads is not kept
    * in the space's cache, a directory it parses is not admitted to `directories`, and a gzip
    * page it inflates is not admitted to `inflated` (cached ones are still used), so a full export
-   * leaves the hot working set alone and its memory flat.
-   * Its pages then carry no descriptor (they are parsed per load, once).
+   * leaves the hot working set alone and its memory flat. Its cache hits are not uses either
+   * (`PeekOptions.once`: nothing is promoted), and it attaches no descriptor to any entry: its
+   * pages are parsed per load, and a descriptor another reader attached to the same bytes is
+   * still used.
    */
   readonly once?: boolean;
 }
@@ -292,6 +294,8 @@ class SharedLease {
   }
 }
 
+const PEEK_ONCE = { once: true } as const;
+
 /** The data-space address of a chunk's data range (its pages are at this + `PageEntry.offset`). */
 export function dataAddress(data: ChunkData): number {
   return data.extent.offset + data.offset;
@@ -444,7 +448,7 @@ export class ChunkReader {
       const shared = cache.admit(ref, directory, charge);
       return new ChunkReader(space, chunk, shared, options, charge, ref);
     };
-    const cached = space.peek(ref);
+    const cached = options.once === true ? space.peek(ref, PEEK_ONCE) : space.peek(ref);
     if (cached !== null) return build(cached);
     return space.read([ref], options).then((lease) => {
       try {
@@ -575,7 +579,7 @@ export class ChunkReader {
         }
         found.push({ bytes, pinned: ref });
       } else {
-        const bytes = this.#space.peek(ref);
+        const bytes = this.#peek(ref);
         if (bytes === null) {
           unpin();
           return false;
@@ -780,12 +784,15 @@ export class ChunkReader {
     )
       return cached.view;
     const view = parsePage(bytes, entry, tag, scale, dictionarySize);
-    // Only a view of the entry's own bytes may ride on the entry (parse copies a misaligned blob).
-    if (cached === null && view.bytes === bytes)
+    // Only a view of the entry's own bytes may ride on the entry: parse copies a misaligned blob,
+    // and the space refuses bytes that are not the resident entry's (a one-pass read's private
+    // copy, review B2-p2g #3). A one-pass reader attaches nothing.
+    if (cached === null && view.bytes === bytes && this.#options.once !== true)
       this.#space.attach?.(
         stored,
         new PageDescriptor(view, entry, tag, scale, dictionarySize),
         PAGE_DESCRIPTOR_BYTES,
+        bytes,
       );
     return view;
   }
@@ -806,14 +813,20 @@ export class ChunkReader {
     )
       return cached.dictionary;
     const dictionary = parseDictionary(bytes, entry, tag);
-    // Only views of the entry's own bytes may ride on it (parse copies a misaligned blob).
-    if (cached === null && dictionary.bytes.buffer === bytes.buffer)
+    // Only views of the entry's own bytes may ride on it, as for pages (`#parse`).
+    if (cached === null && dictionary.bytes.buffer === bytes.buffer && this.#options.once !== true)
       this.#space.attach?.(
         stored,
         new DictionaryDescriptor(dictionary, bytes, entry, tag),
         PAGE_DESCRIPTOR_BYTES,
+        bytes,
       );
     return dictionary;
+  }
+
+  /** A cache hit; a one-pass reader's is not a use (review B2-p2g #2). */
+  #peek(ref: BlobRef): Uint8Array | null {
+    return this.#options.once === true ? this.#space.peek(ref, PEEK_ONCE) : this.#space.peek(ref);
   }
 
   #drop(held: Held | undefined | null): void {
@@ -1331,7 +1344,7 @@ export class ChunkReader {
     for (const job of jobs) {
       const parts: Uint8Array[] = [];
       for (const ref of job.refs) {
-        const bytes = this.#space.peek(ref);
+        const bytes = this.#peek(ref);
         if (bytes === null) return false;
         parts.push(sized(bytes, ref.length));
       }
