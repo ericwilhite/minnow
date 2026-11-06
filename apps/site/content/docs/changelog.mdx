@@ -10,7 +10,10 @@ compatibility policy and release process.
 
 ## Unreleased
 
-Not yet released. The next release will name its packages here.
+Not yet released. Some SQL that used to run now fails, and some now answers differently, so the
+next release is a minor one, as the [versioning policy](/docs/reference/versioning) requires
+during 0.x. It will name its packages here. Each change says what to rewrite; the **Migration**
+list below collects them.
 
 - The exported query-plan type `CompiledStatement` gains three optional fields: `truncate` on a
   delete that came from `TRUNCATE`, and `declaredTypeName` and `declaredLength` on column
@@ -31,6 +34,11 @@ Not yet released. The next release will name its packages here.
 
 - Queries of that shape that Minnow refused with "ORDER BY requires a selected column or
   output alias" now run. For example: `SELECT name AS id FROM c ORDER BY c.id`.
+- With `SELECT DISTINCT`, such a qualified `ORDER BY` key that is not selected now fails with
+  "SELECT DISTINCT orders by selected columns or output aliases only". For example,
+  `SELECT DISTINCT o.id FROM c JOIN o ON o.cid = c.id ORDER BY c.id` used to sort by `o.id`.
+  PostgreSQL refuses it too, since sorting by `c.id` would need a column `DISTINCT` does not keep.
+  Select the sort key, or order by a selected expression.
 
 - **A correlated subquery over an aggregate now applies its LIMIT and OFFSET after
   aggregating.** `(SELECT max(v) FROM b WHERE b.id = a.id LIMIT 1)` limited the rows before
@@ -99,7 +107,22 @@ b.id = a.id)` was false when no row of `b` matched. An aggregate without `GROUP 
 - **Block comments nest**, as in PostgreSQL: `/* outer /* inner */ still outer */` is one
   comment. It used to end at the first `*/`, so the rest became part of the statement.
 
-No stored format changes, and no migration step is needed.
+**Migration.** There is no stored-data step: databases open as before. The SQL changes need
+these rewrites where an application uses the old forms:
+
+- Put the `DISTINCT ON` expressions first in `ORDER BY`, from the same sources.
+- Name the columns instead of using `DISTINCT ON` positions with `SELECT *`.
+- With `SELECT DISTINCT`, select any qualified `ORDER BY` key, or order by a selected expression.
+- Replace `count(z.*)` over a `z` that is not in `FROM` with `count(*)` or a real source alias.
+- Open transactions that write with `BEGIN` or `BEGIN READ WRITE`, not `READ ONLY`, and leave
+  savepoints before switching a read-only transaction back to `READ WRITE`.
+- Write transaction modes in PostgreSQL's grammar.
+- Close every nested `/*` with its own `*/`.
+- Expect changed answers, with no rewrite, where these fixes apply: `ORDER BY` a qualified
+  unselected column, a correlated aggregate with `LIMIT` or `OFFSET`, `EXISTS` over a
+  correlated aggregate, and `DISTINCT ON` positions.
+
+No stored format changes.
 
 ## 0.19.3 — November 5, 2026
 
