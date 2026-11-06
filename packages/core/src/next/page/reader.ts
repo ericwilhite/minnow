@@ -572,7 +572,8 @@ export class ChunkReader {
    * dictionary, or that has gzip pages to load, loads on its own (`load`). A reader may appear
    * more than once, with overlapping pages: its requests are merged. Resolves when every
    * page is loaded; a reader closed meanwhile only loses its own pages (its loads give back what
-   * they read, as `close` says), and other errors reject.
+   * they read, as `close` says). Errors reject after all started sibling loads settle, so a
+   * retry or close cannot race later installations or charges.
    */
   static loadTogether(
     loads: ReadonlyArray<{ readonly reader: ChunkReader; readonly pages: readonly number[] }>,
@@ -580,72 +581,82 @@ export class ChunkReader {
     const first = loads[0]?.reader;
     if (first === undefined) return Promise.resolve();
     const waits: Array<PromiseLike<void>> = [];
-    const jobs: TogetherJob[] = [];
-    const missingOf = new Map<ChunkReader, number[]>();
-    // One page set per reader before any work (review B2-p2i #3): a reader named twice, or
-    // overlapping page arrays, must not install a page twice (the second install would drop
-    // the first's lease share without releasing it).
-    const merged = new Map<ChunkReader, Set<number>>();
-    for (const { reader, pages } of loads) {
-      if (reader.#closed) throw new ReaderClosedError();
-      let set = merged.get(reader);
-      if (set === undefined) {
-        set = new Set();
-        merged.set(reader, set);
+    try {
+      const jobs: TogetherJob[] = [];
+      const missingOf = new Map<ChunkReader, number[]>();
+      // One page set per reader before any work (review B2-p2i #3): a reader named twice, or
+      // overlapping page arrays, must not install a page twice (the second install would drop
+      // the first's lease share without releasing it).
+      const merged = new Map<ChunkReader, Set<number>>();
+      for (const { reader, pages } of loads) {
+        if (reader.#closed) throw new ReaderClosedError();
+        let set = merged.get(reader);
+        if (set === undefined) {
+          set = new Set();
+          merged.set(reader, set);
+        }
+        for (const page of pages) set.add(page);
       }
-      for (const page of pages) set.add(page);
+      for (const [reader, requested] of merged) {
+        const pages = [...requested];
+        const entries = reader.directory.pages;
+        const missing: number[] = [];
+        let alone =
+          reader.#space !== first.#space ||
+          reader.#options.budget !== first.#options.budget ||
+          (reader.#options.once === true) !== (first.#options.once === true);
+        for (const index of pages) {
+          const entry = entries[index];
+          if (entry === undefined) throw new RangeError("Page index outside the chunk");
+          if (isDictionary(entry) && reader.#dictionary === null) alone = true;
+          if (isGzip(entry)) alone = true;
+          if (reader.#pages[index] !== undefined) continue;
+          const pending = reader.#pending.get(index);
+          if (pending !== undefined) waits.push(pending);
+          else missing.push(index);
+        }
+        if (alone) {
+          const loaded = reader.load(pages);
+          // As in the shared reads: a reader closed meanwhile only loses its own pages.
+          if (loaded !== undefined)
+            waits.push(
+              loaded.then(noop, (error: unknown) => {
+                if (!(error instanceof ReaderClosedError && reader.#closed)) throw error;
+              }),
+            );
+          continue;
+        }
+        if (missing.length === 0) continue;
+        missingOf.set(reader, missing);
+        for (const page of missing) jobs.push({ reader, entry: at(entries, page), page });
+      }
+      if (jobs.length > 0) {
+        jobs.sort(
+          (a, b) =>
+            blobAddress(blobOf(a.reader.chunk, a.entry)) -
+            blobAddress(blobOf(b.reader.chunk, b.entry)),
+        );
+        const run = ChunkReader.#readTogether(first.#space, first.#options, jobs);
+        for (const [reader, missing] of missingOf) {
+          for (const index of missing) reader.#pending.set(index, run);
+          const settle = (): void => {
+            for (const index of missing)
+              if (reader.#pending.get(index) === run) reader.#pending.delete(index);
+          };
+          run.then(settle, settle);
+        }
+        waits.push(run);
+      }
+      return Promise.all(waits).then(noop, async (error: unknown) => {
+        // A retry/close must not race sibling reads still installing pages or holding budget.
+        await Promise.allSettled(waits);
+        throw error;
+      });
+    } catch (error) {
+      return Promise.allSettled(waits).then(() => {
+        throw error;
+      });
     }
-    for (const [reader, requested] of merged) {
-      const pages = [...requested];
-      const entries = reader.directory.pages;
-      const missing: number[] = [];
-      let alone =
-        reader.#space !== first.#space ||
-        reader.#options.budget !== first.#options.budget ||
-        (reader.#options.once === true) !== (first.#options.once === true);
-      for (const index of pages) {
-        const entry = entries[index];
-        if (entry === undefined) throw new RangeError("Page index outside the chunk");
-        if (isDictionary(entry) && reader.#dictionary === null) alone = true;
-        if (isGzip(entry)) alone = true;
-        if (reader.#pages[index] !== undefined) continue;
-        const pending = reader.#pending.get(index);
-        if (pending !== undefined) waits.push(pending);
-        else missing.push(index);
-      }
-      if (alone) {
-        const loaded = reader.load(pages);
-        // As in the shared reads: a reader closed meanwhile only loses its own pages.
-        if (loaded !== undefined)
-          waits.push(
-            loaded.then(noop, (error: unknown) => {
-              if (!(error instanceof ReaderClosedError && reader.#closed)) throw error;
-            }),
-          );
-        continue;
-      }
-      if (missing.length === 0) continue;
-      missingOf.set(reader, missing);
-      for (const page of missing) jobs.push({ reader, entry: at(entries, page), page });
-    }
-    if (jobs.length > 0) {
-      jobs.sort(
-        (a, b) =>
-          blobAddress(blobOf(a.reader.chunk, a.entry)) -
-          blobAddress(blobOf(b.reader.chunk, b.entry)),
-      );
-      const run = ChunkReader.#readTogether(first.#space, first.#options, jobs);
-      for (const [reader, missing] of missingOf) {
-        for (const index of missing) reader.#pending.set(index, run);
-        const settle = (): void => {
-          for (const index of missing)
-            if (reader.#pending.get(index) === run) reader.#pending.delete(index);
-        };
-        run.then(settle, settle);
-      }
-      waits.push(run);
-    }
-    return Promise.all(waits).then(noop);
   }
 
   static async #readTogether(

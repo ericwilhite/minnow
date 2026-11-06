@@ -36,6 +36,120 @@ import { GroupWriter } from "./writer.js";
 const ints = { kind: "int32", bits: 32 } as const;
 const encoder = new TextEncoder();
 
+describe("shared-load rejection drains sibling leases", () => {
+  it.each(seedsFor("next-shared-load-drain", [0xb2a3, 0xb2a4]))(
+    "generated blocked sibling (seed %i)",
+    async (seed) => {
+      const reach = createReach("next-shared-load-drain", [
+        "shared failure",
+        "standalone failure",
+        "synchronous failure with pending sibling",
+      ] as const);
+      await fc.assert(
+        fc.asyncProperty(
+          fc.integer({ min: 1, max: 300 }),
+          fc.boolean(),
+          fc.boolean(),
+          async (rows, failShared, synchronous) => {
+            reach.beginHistory();
+            const { space, group } = await writeGroup([
+              { type: ints, values: Array.from({ length: rows }, (_, k) => k * 17) },
+              { type: ints, values: Array.from({ length: rows }, (_, k) => k * 19) },
+            ]);
+            const base = space.view({ cache: false }),
+              budget = countingBudget(Infinity);
+            let armed = false,
+              arrive = (): void => undefined,
+              release = (): void => undefined;
+            const entered = new Promise<void>((r) => {
+                arrive = r;
+              }),
+              gate = new Promise<void>((r) => {
+                release = r;
+              });
+            const pending: Array<Promise<unknown>> = [];
+            const view = (shared: boolean) => ({
+              peek: base.peek.bind(base),
+              read: (
+                refs: Parameters<typeof base.read>[0],
+                options: Parameters<typeof base.read>[1],
+              ) => {
+                if (!armed) return base.read(refs, options);
+                const p =
+                  !synchronous && shared === failShared
+                    ? Promise.reject(new Error("injected shared-load failure"))
+                    : base.read(refs, options).then(async (lease) => {
+                        arrive();
+                        await gate;
+                        return lease;
+                      });
+                pending.push(p);
+                return p;
+              },
+            });
+            const a = await ChunkReader.open(view(true), defined(group.columns[0]), {
+              budget,
+              once: true,
+            });
+            const b = await ChunkReader.open(view(false), defined(group.columns[1]), {
+              budget,
+              once: true,
+            });
+            armed = true;
+            const initial = synchronous ? a.load([0]) : undefined;
+            if (synchronous) await entered;
+            let settled = false;
+            const together = Promise.resolve()
+              .then(() =>
+                ChunkReader.loadTogether([
+                  { reader: a, pages: [0] },
+                  { reader: b, pages: [synchronous ? -1 : 0] },
+                ]),
+              )
+              .then(
+                () => {
+                  settled = true;
+                  return new Error("Expected rejection");
+                },
+                (e: unknown) => {
+                  settled = true;
+                  return e;
+                },
+              );
+            let outcome: unknown;
+            try {
+              await entered;
+              await new Promise((r) => setTimeout(r, 0));
+              expect(settled).toBe(false);
+              reach.reach(
+                synchronous
+                  ? "synchronous failure with pending sibling"
+                  : failShared
+                    ? "shared failure"
+                    : "standalone failure",
+              );
+            } finally {
+              release();
+              outcome = await together;
+              await Promise.allSettled(pending);
+              await initial;
+              a.close();
+              b.close();
+            }
+            expect(outcome).toBeInstanceOf(Error);
+            expect((outcome as Error).message).toBe(
+              synchronous ? "Page index outside the chunk" : "injected shared-load failure",
+            );
+            expect(budget.used).toBe(0);
+          },
+        ),
+        { seed, numRuns: 24 },
+      );
+      reach.assertReached();
+    },
+  );
+});
+
 /** One small-paged column (int, or plain text) on the real extent space and page cache. */
 async function onDisk(wrap?: (session: StoreSession) => StoreSession, text = false) {
   const memory = countingMemory(Number.POSITIVE_INFINITY);
