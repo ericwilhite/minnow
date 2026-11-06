@@ -6,7 +6,7 @@
  * page is charged to the reader holding it, an unpinned one to the cache, which the governor
  * evicts first.
  */
-import { BlobCache } from "../format/blob-cache.js";
+import { BlobCache, type PinOptions } from "../format/blob-cache.js";
 import type { BlobRef, CacheMemory, EvictableCacheLike } from "../storage/extents.js";
 
 export class InflatedPageCache implements EvictableCacheLike {
@@ -38,9 +38,12 @@ export class InflatedPageCache implements EvictableCacheLike {
     return this.#cache.evict(bytes);
   }
 
-  /** The inflated page, pinned for the caller (who charges its length), or null. */
-  pin(ref: BlobRef): Uint8Array | null {
-    return this.#cache.pin(ref)?.value ?? null;
+  /**
+   * The inflated page, pinned for the caller (who charges its length), or null. `options.once`:
+   * a one-pass scan's pin, which leaves the eviction order alone (format/blob-cache.ts).
+   */
+  pin(ref: BlobRef, options: PinOptions = {}): Uint8Array | null {
+    return this.#cache.pin(ref, options)?.value ?? null;
   }
 
   /** Adds a page the caller just inflated (charged to it), pinned; returns the cached bytes. */
@@ -48,8 +51,8 @@ export class InflatedPageCache implements EvictableCacheLike {
     return this.#cache.admit(ref, bytes, bytes.length);
   }
 
-  unpin(ref: BlobRef): void {
-    this.#cache.unpin(ref);
+  unpin(ref: BlobRef, options: PinOptions = {}): void {
+    this.#cache.unpin(ref, options);
   }
 
   clear(): void {

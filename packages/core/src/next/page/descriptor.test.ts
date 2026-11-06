@@ -172,6 +172,77 @@ describe("parsed page descriptors on cache entries", () => {
     expect(memory.used).toBe(before - evictable);
   });
 
+  it("keeps a chunk's parsed dictionary on its dictionary page's entry, for the next reader", async () => {
+    const encoder = new TextEncoder();
+    const text = Array.from({ length: 6000 }, (_, row) =>
+      encoder.encode(`label-${String(row % 300)}`),
+    );
+    const { space, group } = await writeGroup([{ type: { kind: "text" }, values: text }]);
+    const chunk = defined(group.columns[0]);
+    const first = await ChunkReader.open(space, chunk, { budget: UNLIMITED });
+    const dictionary = defined(first.directory.dictionary ?? undefined);
+    const ref = {
+      extent: chunk.data.extent,
+      offset: chunk.data.offset + dictionary.offset,
+      length: dictionary.length,
+      checksum: dictionary.checksum,
+    };
+    const vector = await first.loadDictionary();
+    first.close();
+    expect(space.parsed(ref)).not.toBeNull();
+    const hits = space.parsedHits;
+    const second = await ChunkReader.open(space, chunk, { budget: UNLIMITED });
+    const again = await second.loadDictionary();
+    expect(space.parsedHits).toBe(hits + 1);
+    expect(again).not.toBe(vector); // a vector per reader, over the shared dictionary
+    expect(again?.data).toEqual(vector?.data);
+    second.close();
+    // A directory whose dictionary entry disagrees is parsed afresh (and refused).
+    const forged = encodeDirectory({
+      ...first.directory,
+      dictionary: { ...dictionary, rowCount: dictionary.rowCount + 1 },
+    });
+    const blob = defined((await space.beginWrite("forged").write([forged])).blobs[0]);
+    const lying = await ChunkReader.open(
+      space,
+      { ...chunk, directory: blob },
+      { budget: UNLIMITED },
+    );
+    await expect((async () => lying.loadDictionary())()).rejects.toThrow(PageCorruptionError);
+    lying.close();
+  });
+
+  it("charges a dictionary's descriptor in its entry on the space's page cache", async () => {
+    const encoder = new TextEncoder();
+    const memory = countingMemory(Number.POSITIVE_INFINITY);
+    const { space, budget } = await openOver(new MemoryBackend(), { memory });
+    const writer = space.beginWrite("dictionary");
+    const group = new GroupWriter({
+      columns: [{ columnId: 1, type: { kind: "text" } }],
+      writer,
+      inlineBytes: 0,
+    });
+    await group.append(
+      [
+        vectorOf(
+          { kind: "text" },
+          Array.from({ length: 6000 }, (_, row) => encoder.encode(`label-${String(row % 300)}`)),
+        ),
+      ],
+      6000,
+    );
+    const chunk = defined((await group.finish()).columns[0]);
+    const reader = await ChunkReader.open(space, chunk, { budget });
+    const entry = defined(reader.directory.dictionary ?? undefined);
+    const before = memory.used;
+    await reader.loadDictionary();
+    // Cold, through a lease: only the descriptor is charged to the cache while it is held.
+    expect(memory.used - before).toBe(PAGE_DESCRIPTOR_BYTES);
+    reader.close();
+    expect(memory.used - before).toBe(entry.length + ENTRY_OVERHEAD + PAGE_DESCRIPTOR_BYTES);
+    expect(budget.used).toBe(0);
+  });
+
   it("states a bound the measured descriptors fit", () => {
     expect(PAGE_DESCRIPTOR_BYTES).toBe(768);
   });

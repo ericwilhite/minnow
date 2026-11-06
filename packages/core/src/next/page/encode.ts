@@ -34,6 +34,8 @@ import {
   PageFlag,
   STAT_PREFIX_BYTES,
   validityBytes,
+  SCALED_FLOAT_MAX_EXPONENT,
+  scaledFloatSafe,
   ValueTag,
 } from "./format.js";
 import { DistinctSketch, hashBytes, hashFloat, hashInt64, mix32 } from "./sketch.js";
@@ -649,14 +651,26 @@ export function encodeFloatPage(
   let sawNumber = false;
   let constant = true;
   let first: number | null = null;
+  // Constant means one bit pattern, not one value: NaN payloads (and ±0) differ (review B2-p2i
+  // #2), so rows are compared as raw words, never as JS numbers.
+  const words = new Uint32Array(values.buffer, values.byteOffset, rows * (wide ? 2 : 1));
+  let firstRow = -1;
   for (let row = 0; row < rows; row++) {
     if (!isValidAt(validity, row)) {
       nulls++;
       continue;
     }
     const value = values[row] ?? 0;
-    if (first === null) first = value;
-    else if (constant && !Object.is(first, value)) constant = false;
+    if (first === null) {
+      first = value;
+      firstRow = row;
+    } else if (
+      constant &&
+      (wide
+        ? words[row * 2] !== words[firstRow * 2] || words[row * 2 + 1] !== words[firstRow * 2 + 1]
+        : words[row] !== words[firstRow])
+    )
+      constant = false;
     if (value !== value) sawNaN = true;
     else {
       sawNumber = true;
@@ -673,9 +687,25 @@ export function encodeFloatPage(
     const buffer = scratch.take(start + 8);
     header(buffer, PageEncoding.constant, tag, flags, width, rows, 0);
     writeValidity(buffer, PAGE_HEADER_BYTES, validity, rows, nulls);
-    if (wide) new Float64Array(buffer, start, 1)[0] = first;
-    else new Float32Array(buffer, start, 1)[0] = first;
+    // The row's own bytes, never through a JS number (a NaN keeps its payload).
+    new Uint8Array(buffer, start, width).set(
+      new Uint8Array(values.buffer, values.byteOffset + firstRow * width, width),
+    );
     return finish(buffer, start + width, PageEncoding.constant, rows, nulls, low, high);
+  }
+  if (wide) {
+    const scaled = encodeScaledFloat(
+      values,
+      validity,
+      rows,
+      nulls,
+      flags,
+      start,
+      scratch,
+      low,
+      high,
+    );
+    if (scaled !== null) return scaled;
   }
   const size = rows * width;
   const buffer = scratch.take(start + align8(size));
@@ -683,6 +713,125 @@ export function encodeFloatPage(
   writeValidity(buffer, PAGE_HEADER_BYTES, validity, rows, nulls);
   new Uint8Array(buffer, start, size).set(new Uint8Array(values.buffer, values.byteOffset, size));
   return finish(buffer, start + size, PageEncoding.plain, rows, nulls, low, high);
+}
+
+const POWERS_OF_TEN = Array.from({ length: SCALED_FLOAT_MAX_EXPONENT + 1 }, (_, e) => 10 ** e);
+/** A `scaledFloat` page may patch at most this share of its rows; past it, plain. */
+const SCALED_FLOAT_MAX_PATCHES = 1 / 16;
+
+/**
+ * The smallest exponent e with `value` = n / 10^e exactly for a safe integer n, the decoder's
+ * own formula compared bit for bit (`Object.is`), or −1: −0, NaN, ±Infinity, subnormals and
+ * values that only look decimal never qualify.
+ */
+function scaledExponent(value: number): number {
+  if (!Number.isFinite(value) || Object.is(value, -0)) return -1;
+  for (let e = 0; e <= SCALED_FLOAT_MAX_EXPONENT; e++) {
+    const power = POWERS_OF_TEN[e] ?? 1;
+    const n = Math.round(value * power);
+    if (Number.isSafeInteger(n) && Object.is(n / power, value)) return e;
+  }
+  return -1;
+}
+
+/**
+ * float64 values as frame-of-reference integers over 10^e (page/format.ts `scaledFloat`): the
+ * smallest e that covers all but `SCALED_FLOAT_MAX_PATCHES` of the valid rows, each row checked
+ * at that e with the decoder's formula; the rows that fail are patched with their own 8 bytes.
+ * Null when it would not be smaller than plain.
+ */
+function encodeScaledFloat(
+  values: Float64Array,
+  validity: Uint32Array | null,
+  rows: number,
+  nulls: number,
+  flags: number,
+  start: number,
+  scratch: PageScratch,
+  low: number,
+  high: number,
+): EncodedPage | null {
+  const counts = new Int32Array(SCALED_FLOAT_MAX_EXPONENT + 2);
+  for (let row = 0; row < rows; row++) {
+    if (!isValidAt(validity, row)) continue;
+    const e = scaledExponent(values[row] ?? 0);
+    const slot = e < 0 ? SCALED_FLOAT_MAX_EXPONENT + 1 : e;
+    counts[slot] = (counts[slot] ?? 0) + 1;
+  }
+  const valid = rows - nulls;
+  const allowed = Math.floor(valid * SCALED_FLOAT_MAX_PATCHES);
+  let exponent = -1;
+  let covered = 0;
+  for (let e = 0; e <= SCALED_FLOAT_MAX_EXPONENT; e++) {
+    covered += counts[e] ?? 0;
+    if (valid - covered <= allowed) {
+      exponent = e;
+      break;
+    }
+  }
+  if (exponent < 0) return null;
+  const power = POWERS_OF_TEN[exponent] ?? 1;
+  // The integers at that exponent, checked one by one; the rows that fail are patches.
+  const integers = new Float64Array(rows);
+  const isPatched = new Uint8Array(rows);
+  const patched: number[] = [];
+  let min = Infinity;
+  let max = -Infinity;
+  for (let row = 0; row < rows; row++) {
+    if (!isValidAt(validity, row)) continue;
+    const value = values[row] ?? 0;
+    // −0 is always patched: n / 10^e would give it back, but base + delta cannot be −0.
+    const n =
+      Number.isFinite(value) && !Object.is(value, -0) ? Math.round(value * power) : Number.NaN;
+    if (!(Number.isSafeInteger(n) && Object.is(n / power, value))) {
+      patched.push(row);
+      isPatched[row] = 1;
+      if (patched.length > allowed) return null;
+      continue;
+    }
+    integers[row] = n;
+    if (n < min) min = n;
+    if (n > max) max = n;
+  }
+  if (min === Infinity) return null;
+  const range = max - min;
+  if (!scaledFloatSafe(min, range)) return null; // the reader's rule (format.ts)
+  const width =
+    range === 0 ? 0 : range < 256 ? 1 : range < 65_536 ? 2 : range < 4_294_967_296 ? 4 : 8;
+  if (width === 8) return null;
+  const deltas = align8(rows * width);
+  const patchPositions = align8(patched.length * 4);
+  const length = start + 8 + deltas + 8 + patchPositions + patched.length * 8;
+  if (length >= start + rows * 8) return null; // not smaller than plain
+  const buffer = scratch.take(length);
+  header(buffer, PageEncoding.scaledFloat, ValueTag.f64, flags, width, rows, exponent);
+  writeValidity(buffer, PAGE_HEADER_BYTES, validity, rows, nulls);
+  new Float64Array(buffer, start, 1)[0] = min;
+  const at = start + 8;
+  const out =
+    width === 1
+      ? new Uint8Array(buffer, at, rows)
+      : width === 2
+        ? new Uint16Array(buffer, at, rows)
+        : width === 4
+          ? new Uint32Array(buffer, at, rows)
+          : null;
+  // Null and patched rows keep delta 0 (the buffer is zeroed); patched rows' bytes follow.
+  if (out !== null)
+    for (let row = 0; row < rows; row++)
+      if (isValidAt(validity, row) && isPatched[row] === 0) out[row] = (integers[row] ?? min) - min;
+  const counts32 = new Uint32Array(buffer, at + deltas, 2);
+  counts32[0] = patched.length;
+  counts32[1] = 0;
+  const positions = new Uint32Array(buffer, at + deltas + 8, patched.length);
+  const bytes = new Uint8Array(buffer, at + deltas + 8 + patchPositions, patched.length * 8);
+  const source = new Uint8Array(values.buffer, values.byteOffset, rows * 8);
+  patched.forEach((row, k) => {
+    positions[k] = row;
+    // The value's own bytes (a NaN keeps its payload), never through a JS number.
+    bytes.set(source.subarray(row * 8, row * 8 + 8), k * 8);
+  });
+  return finish(buffer, length, PageEncoding.scaledFloat, rows, nulls, low, high);
 }
 
 // ---------------------------------------------------------------------------------------------

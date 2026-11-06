@@ -10,6 +10,8 @@
     "next-storage-worker.ts",
     "next-yield-run.ts",
     "next-yield-worker.ts",
+    "next-export-run.ts",
+    "next-export-worker.ts",
     "worker-run.ts",
     "offline-identity-run.ts",
     "write-scope-admission-run.ts",

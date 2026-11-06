@@ -283,6 +283,14 @@ export interface ReadOptions {
   /** Charged for every byte the lease holds, cached or not, until `release` (ruling R5). */
   readonly budget: ByteBudget;
   readonly signal?: AbortSignal;
+  /**
+   * A one-pass scan (a full export): blobs it misses stay private to its lease and are never
+   * admitted to the cache, and its hits are not uses: while only one-pass leases pin a cached
+   * blob, it keeps its segment, its place and its last use (it cannot be evicted meanwhile), so
+   * the scan does not evict, demote or reorder the hot working set (review B2-p2h #1). An
+   * ordinary use during such a pin counts as usual. Default false.
+   */
+  readonly once?: boolean;
 }
 
 export interface ReadLease {
@@ -290,6 +298,16 @@ export interface ReadLease {
   readonly bytes: readonly Uint8Array[];
   /** Unpins the blobs and returns budget bytes. Idempotent. Do not use `bytes` after it. */
   release(): void;
+}
+
+/** Options of `ExtentReader.peek`. */
+export interface PeekOptions {
+  /**
+   * A one-pass scan's hit (`ReadOptions.once`): not a use. The entry is not marked as reused, not
+   * moved in its segment and its last use is not updated, so a scan never promotes what it
+   * peeks. Default false.
+   */
+  readonly once?: boolean;
 }
 
 export interface ExtentReader {
@@ -300,8 +318,11 @@ export interface ExtentReader {
    * reaches. `ReadDeniedError` when `budget` cannot hold the lease.
    */
   read(refs: readonly BlobRef[], options: ReadOptions): Promise<ReadLease>;
-  /** A cached blob, synchronously, or null. Valid until the caller yields; never pinned. */
-  peek(ref: BlobRef): Uint8Array | null;
+  /**
+   * A cached blob, synchronously, or null. Valid until the caller yields; never pinned. A hit is
+   * a use (it may promote the entry) unless `options.once`.
+   */
+  peek(ref: BlobRef, options?: PeekOptions): Uint8Array | null;
   /**
    * The parsed descriptor a reader attached to `ref`'s cache entry (`attach`), or null when the
    * entry is not resident or has none. Optional: a reader without it parses on every load.
@@ -310,10 +331,13 @@ export interface ExtentReader {
   /**
    * Attaches a parsed descriptor of the entry's bytes (views into those same bytes, validated
    * structure) to `ref`'s resident cache entry, charging `bytes` (the descriptor's own size) in
-   * that entry; it is dropped with the entry. False when the entry is not resident, already has
-   * one, or the charge is refused. The descriptor must not copy the entry's bytes.
+   * that entry; it is dropped with the entry. `of` is the array the descriptor views: it must be
+   * the resident entry's own (the array `peek` and cache hits return), never a private copy of
+   * the same blob (a one-pass read's), else nothing is attached (review B2-p2g #3). False when
+   * the entry is not resident, is not `of`, already has one, or the charge is refused. The
+   * descriptor must not copy the entry's bytes.
    */
-  attach?(ref: BlobRef, parsed: object, bytes: number): boolean;
+  attach?(ref: BlobRef, parsed: object, bytes: number, of: Uint8Array): boolean;
 }
 
 // ── Writing ────────────────────────────────────────────────────────────────────────────────────
@@ -418,6 +442,8 @@ export interface SpaceStats {
   readonly relocations: number;
   readonly cache: {
     readonly residentBytes: number;
+    /** Bytes in the protected segment (blobs used more than once). */
+    readonly protectedBytes: number;
     readonly pinnedBytes: number;
     readonly hits: number;
     readonly misses: number;

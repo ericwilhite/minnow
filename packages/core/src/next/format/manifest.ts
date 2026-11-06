@@ -229,6 +229,12 @@ export const PageEncoding = {
   /** Frame of reference + delta at u8/u16/u32 widths. */
   frameOfReference: 4,
   dictionary: 5,
+  /**
+   * float64 values that are exact decimals: frame-of-reference integers over 10^exponent, with
+   * the values that are not (−0, NaN, ±Infinity, subnormals, inexact decimals) patched in as
+   * their own 8 bytes (page/format.ts). Decodes bit-identically.
+   */
+  scaledFloat: 6,
   /** Plain or dictionary, then gzip (only when it saves ≥2× on a page ≥16 KiB). */
   gzip: 128,
 } as const;

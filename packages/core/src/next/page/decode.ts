@@ -28,6 +28,8 @@ import {
   PageCorruptionError,
   LITTLE_ENDIAN,
   PAGE_HEADER_BYTES,
+  SCALED_FLOAT_MAX_EXPONENT,
+  scaledFloatSafe,
   PageFlag,
   plainWidth,
   validityBytes,
@@ -275,6 +277,8 @@ export function parsePage(
   let checkpoints: Int32Array | null = null;
   let baseLow = 0;
   let baseHigh = 0;
+  /** A `scaledFloat` page decoded into a plain f64 lane (`plain`). */
+  let materialized = false;
   const buffer = bytes.buffer;
   const offset = bytes.byteOffset;
   const fits = (end: number): void => check(bytes.length >= end, "Page payload is truncated");
@@ -401,6 +405,56 @@ export function parsePage(
       }
       break;
     }
+    case PageEncoding.scaledFloat: {
+      // Exact decimals as integers over 10^aux, plus patched rows (format.ts). Materialized here
+      // into an f64 lane, so the page is read as a plain one from now on; the reader charges the
+      // lane (8 bytes per row) and attaches no descriptor of it.
+      check(tag === ValueTag.f64, "Scaled-float page outside float64");
+      check(width === 0 || width === 1 || width === 2 || width === 4, "Bad scaled-float width");
+      check(aux <= SCALED_FLOAT_MAX_EXPONENT, "Scaled-float exponent out of range");
+      check(!allNull, "All-null scaled-float page");
+      fits(start + 8);
+      const base = new Float64Array(buffer, offset + start, 1)[0] ?? Number.NaN;
+      const deltasAt = start + 8;
+      const deltaBytes = align8(rows * width);
+      fits(deltasAt + deltaBytes + 8);
+      // The writer's own rule (format.ts `scaledFloatSafe`) on the stored deltas, not on what
+      // the width could hold (review B2-p2i #1).
+      const stored = width === 0 ? null : unsignedView(buffer, offset + deltasAt, width, rows);
+      const maxDelta =
+        stored === null
+          ? 0
+          : stored instanceof Uint8Array
+            ? max8(stored, rows)
+            : stored instanceof Uint16Array
+              ? max16(stored, rows)
+              : max32(stored, rows);
+      check(scaledFloatSafe(base, maxDelta), "Scaled-float integers out of the safe range");
+      const header = new Uint32Array(buffer, offset + deltasAt + deltaBytes, 2);
+      const patches = header[0] ?? 0;
+      check(header[1] === 0 && patches <= rows, "Bad scaled-float patch count");
+      const positionsAt = deltasAt + deltaBytes + 8;
+      const valuesAt = positionsAt + align8(patches * 4);
+      length = valuesAt + patches * 8;
+      fits(length);
+      const lane = new Float64Array(rows);
+      const power = 10 ** aux;
+      if (stored === null) lane.fill(base / power);
+      else for (let row = 0; row < rows; row++) lane[row] = (base + (stored[row] ?? 0)) / power;
+      const positions = new Uint32Array(buffer, offset + positionsAt, patches);
+      const laneBytes = new Uint8Array(lane.buffer);
+      let previous = -1;
+      for (let k = 0; k < patches; k++) {
+        const row = positions[k] ?? 0;
+        check(row > previous && row < rows, "Scaled-float patches out of order");
+        previous = row;
+        // The patched value's own 8 bytes (a NaN keeps its payload).
+        laneBytes.set(bytes.subarray(valuesAt + k * 8, valuesAt + k * 8 + 8), row * 8);
+      }
+      plain = lane;
+      materialized = true;
+      break;
+    }
     default:
       check(false, "Unknown page encoding");
   }
@@ -414,12 +468,12 @@ export function parsePage(
     headerBoundsSafe(kind, width, baseNumber, checkpoints, rows);
   const view: PageView = {
     bytes,
-    kind,
+    kind: materialized ? PageEncoding.plain : kind,
     tag,
     flags,
-    width,
+    width: materialized ? 8 : width,
     rowCount: rows,
-    aux,
+    aux: materialized ? 0 : aux,
     nullCount,
     validity,
     allNull,
@@ -970,6 +1024,57 @@ function copyBytes(
 type VarlenData = Extract<VectorData, { layout: "varlen" }>;
 
 /** Bytes `decodeRange` / `gatherRows` will append for these rows of a varlen page. */
+function countBitsRange(words: Uint32Array, from: number, to: number): number {
+  let count = 0;
+  for (let row = from; row < to; row++) count += ((words[row >>> 5] ?? 0) >>> (row & 31)) & 1;
+  return count;
+}
+function codeBytes8(
+  codes: Uint8Array,
+  entries: Int32Array,
+  validity: Uint32Array | null,
+  from: number,
+  to: number,
+): number {
+  let total = 0;
+  for (let row = from; row < to; row++) {
+    if (validity !== null && (((validity[row >>> 5] ?? 0) >>> (row & 31)) & 1) === 0) continue;
+    const code = codes[row] ?? 0;
+    total += (entries[code + 1] ?? 0) - (entries[code] ?? 0);
+  }
+  return total;
+}
+function codeBytes16(
+  codes: Uint16Array,
+  entries: Int32Array,
+  validity: Uint32Array | null,
+  from: number,
+  to: number,
+): number {
+  let total = 0;
+  for (let row = from; row < to; row++) {
+    if (validity !== null && (((validity[row >>> 5] ?? 0) >>> (row & 31)) & 1) === 0) continue;
+    const code = codes[row] ?? 0;
+    total += (entries[code + 1] ?? 0) - (entries[code] ?? 0);
+  }
+  return total;
+}
+function codeBytes32(
+  codes: Uint32Array,
+  entries: Int32Array,
+  validity: Uint32Array | null,
+  from: number,
+  to: number,
+): number {
+  let total = 0;
+  for (let row = from; row < to; row++) {
+    if (validity !== null && (((validity[row >>> 5] ?? 0) >>> (row & 31)) & 1) === 0) continue;
+    const code = codes[row] ?? 0;
+    total += (entries[code + 1] ?? 0) - (entries[code] ?? 0);
+  }
+  return total;
+}
+
 export function varlenBytesOf(
   view: PageView,
   dictionary: PageDictionary | null,
@@ -978,7 +1083,8 @@ export function varlenBytesOf(
   to: number,
   base0 = 0,
 ): number {
-  if (view.allNull) return 0;
+  // Only varlen pages have varlen bytes (a fixed-width page's target needs none).
+  if (view.allNull || view.tag !== ValueTag.varlen) return 0;
   const count = to - from;
   if (view.kind === PageEncoding.constant) return count * view.aux;
   const valueBytes = (row: number): number => {
@@ -997,6 +1103,21 @@ export function varlenBytesOf(
   if (rows === null && view.kind === PageEncoding.plain && view.large === null) {
     const offsets = view.unsigned;
     return offsets === null ? 0 : (offsets[to] ?? 0) - (offsets[from] ?? 0);
+  }
+  // A dictionary page over a range: one monomorphic loop per code width (the closure below,
+  // over a union of code arrays, ran tens of ns per row).
+  const entries = dictionary?.offsets ?? null;
+  if (rows === null && view.kind === PageEncoding.dictionary && entries !== null) {
+    const codes = view.unsigned;
+    if (codes === null) {
+      const valid = view.validity === null ? count : countBitsRange(view.validity, from, to);
+      return valid * ((entries[view.aux + 1] ?? 0) - (entries[view.aux] ?? 0));
+    }
+    return codes instanceof Uint8Array
+      ? codeBytes8(codes, entries, view.validity, from, to)
+      : codes instanceof Uint16Array
+        ? codeBytes16(codes, entries, view.validity, from, to)
+        : codeBytes32(codes, entries, view.validity, from, to);
   }
   let total = 0;
   for (let k = from; k < to; k++) {
@@ -1283,16 +1404,31 @@ function decodeValues(
       if (view.allNull) return;
       const out = data.values;
       if (view.kind === PageEncoding.constant) {
-        const value =
-          data.layout === "f64"
-            ? (new Float64Array(view.bytes.buffer, view.bytes.byteOffset + view.start, 1)[0] ?? 0)
-            : (new Float32Array(view.bytes.buffer, view.bytes.byteOffset + view.start, 1)[0] ?? 0);
-        out.fill(value, at, at + count);
+        // Copied as bytes, never through a JS number: the constant keeps its bit pattern. An
+        // empty range (checkRange allows from === to) copies nothing (review B2-p2i-2 #1).
+        if (count === 0) return;
+        const width = data.layout === "f64" ? 8 : 4;
+        const lane = new Uint8Array(out.buffer, out.byteOffset + at * width, count * width);
+        lane.set(view.bytes.subarray(view.start, view.start + width));
+        for (let filled = width; filled < lane.length; filled *= 2)
+          lane.copyWithin(filled, 0, Math.min(filled, lane.length - filled));
         return;
       }
       const values = view.plain as Float64Array | Float32Array;
       if (rows === null) out.set(values.subarray(from, to), at);
-      else for (let k = 0; k < count; k++) out[at + k] = values[(rows[k] ?? 0) - base0] ?? 0;
+      else {
+        // Gathered as raw words, never through a JS number (ECMAScript NumericToRawBytes lets
+        // an engine store any NaN for a Number; review B2-p2i-2 #2).
+        const words = values.BYTES_PER_ELEMENT / 4;
+        const source = new Uint32Array(values.buffer, values.byteOffset, values.length * words);
+        const target = new Uint32Array(out.buffer, out.byteOffset, out.length * words);
+        for (let k = 0; k < count; k++) {
+          const row = ((rows[k] ?? 0) - base0) * words;
+          const slot = (at + k) * words;
+          target[slot] = source[row] ?? 0;
+          if (words === 2) target[slot + 1] = source[row + 1] ?? 0;
+        }
+      }
       return;
     }
     case "varlen":

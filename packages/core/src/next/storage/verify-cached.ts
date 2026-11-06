@@ -14,8 +14,15 @@ import { xxHash32 } from "../hash/xxhash32.js";
 const environment = (globalThis as { process?: { env?: Record<string, string | undefined> } })
   .process?.env;
 
-/** Whether cached bytes are re-verified (test builds only). */
-export const VERIFY_CACHED_BYTES = environment?.MINNOW_VERIFY_CACHED_BYTES === "1";
+/**
+ * Whether cached bytes are re-verified (test builds only): `MINNOW_VERIFY_CACHED_BYTES=1` in a
+ * Node environment (vitest.config.ts), or `globalThis.__MINNOW_VERIFY_CACHED_BYTES__ === true` in
+ * a browser, set by a test harness before the engine loads or replaced at build time by a bundler
+ * define (vite.library.config.ts does, for every page and worker the browser lanes serve).
+ */
+export const VERIFY_CACHED_BYTES =
+  (globalThis as { __MINNOW_VERIFY_CACHED_BYTES__?: unknown }).__MINNOW_VERIFY_CACHED_BYTES__ ===
+    true || environment?.MINNOW_VERIFY_CACHED_BYTES === "1";
 
 /** A consumer wrote into bytes the cache hands out as immutable. */
 export class CachedBytesWrittenError extends Error {

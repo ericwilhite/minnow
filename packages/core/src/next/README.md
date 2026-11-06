@@ -162,6 +162,15 @@ is access's `Snapshot`.
   - Implemented in `space.ts` (writers, publication, reclaim, open walk, `audit`) and
     `page-cache.ts` (segmented LRU: a one-pass scan recycles probation and leaves hot blobs).
     `space-crash.test.ts` crashes it at every physical step of a workload and reopens.
+  - A reader's parsed descriptor rides on its entry (`attachParsed`) and is charged to the cache
+    from attachment until the entry is gone, pinned or not; pinning moves only the blob's bytes
+    and overhead to the leases. `page-cache-model.test.ts` checks every charge after each step of
+    random operation sequences, concurrent cold reads included.
+  - Cached bytes are immutable by contract. Test builds enforce it (`verify-cached.ts`): with
+    `MINNOW_VERIFY_CACHED_BYTES=1` (every Vitest suite) or `globalThis.__MINNOW_VERIFY_CACHED_BYTES__`
+    (a browser harness, or the define in `vite.library.config.ts` for the browser lanes), a lease
+    release and an eviction hash the blob again and throw `CachedBytesWrittenError` if a consumer
+    wrote into it. Off, it is one branch on a module constant.
 - **The in-memory backend** (`memory-store.ts`) is the file store over growable in-memory files:
   the store of an in-memory database and of the end-to-end suites. It has no scratch space.
 - **The OPFS backend** (`opfs.ts`: `createOpfsBackend`, `webLocks`) is the file store over real
@@ -286,8 +295,13 @@ is access's `Snapshot`.
   the directory blob), so pruning and planning never read pages.
 - Encodings (`encode.ts` has the selection rules): constant (and all-null), plain, bool bitmap,
   frame of reference at u8/u16/u32 over an int64 base, delta (FOR over successive differences,
-  a checkpoint every 128 rows), and dictionary codes (u8/u16/u32, or one code) into a
-  group-scoped dictionary.
+  a checkpoint every 128 rows), dictionary codes (u8/u16/u32, or one code) into a
+  group-scoped dictionary, and scaled float (float64 exact decimals as FOR integers over 10^e,
+  every other value patched with its own 8 bytes, bit-identical; a reader decodes it into an f64
+  lane it is charged for). Every page starts at an 8-byte offset of its extent. Bit-packed FOR
+  widths were measured and not adopted: unpacking cost +38% to +659% in the decode kernel and
+  +46% to +194% in the pushdown compare (`scripts/bitpack-bench.mts`, 7–20 bits, two runs), far
+  past the ~5% a 6% size saving was allowed to cost.
 - NUMERIC: a declared scale makes a fixed-scale chunk; an unconstrained NUMERIC keeps each
   value's scale (a per-row section, or one scale per page), and its min/max are normalized sort
   keys (value order, scale ignored, R15.10), chosen by comparing the exact key bytes. Coefficients are stored by the int64 rules when they
@@ -384,6 +398,86 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
 - Memory: no per-row allocation. The code bitmaps and the decode scratch are charged to the
   reader's budget and returned at `close`.
 - `scripts/pushdown-bench.mts` measures it on the W1M table's columns against decode-then-filter.
+- Dictionary translation: `reader.translationMap(intern)` maps the chunk's dictionary codes into
+  the query's id space (`map[code] = intern(entry bytes)`), so text GROUP BY and join keys agree
+  across groups without strings. Built once per reader and interner at O(dictionary), charged
+  (4 bytes per entry) until `close`; null for a chunk with no dictionary. A dictionary never has
+  more entries than the rows it codes: the writer keeps a page dictionary-encoded only while its
+  codes and new entries cost no more than the plain page, so a group of mostly distinct values is
+  stored plain, and a map never costs more than the rows it replaces.
+- Full export (`SELECT *` over the whole table, Gate A): a sequential decode stream reads with
+  `ChunkReadOptions.once` (storage `ReadOptions.once`, `PeekOptions.once`): nothing it misses is
+  admitted to the page cache, nothing it hits is promoted or reordered (synchronous peeks and
+  pins included: an entry only one-pass leases pin keeps its place and last use), a
+  directory it parses or a gzip page it inflates is not admitted to its cache (reusing a cached
+  one leaves its eviction order alone: `BlobCache` one-pass pins), and it attaches no
+  descriptor (the space also refuses one whose bytes are not the resident entry's own). So the
+  hot working set stays and memory stays flat: the bench's hot set, protected and outside the
+  export, survives whole when everything but its size is evicted afterwards (a promoting scan
+  loses all of it). `reader.pagesAhead(from, to, bytes)` names a batch's pages plus the next ones
+  within a byte budget, so one load call reads ahead and the space coalesces neighbours (6× fewer
+  platform reads at 256 KiB per column). Pages behind the stream are released as it moves on.
+  `scripts/export-bench.mts` over files on disk (`export-bench-build.mts`, the real file store,
+  page cache and governor), 200 columns: decoding from the page cache runs at about 1M rows/s at
+  W1M; through the file reads 94–131k rows/s on table copies not read since they were written
+  (not verified cold in the OS cache) and 230–420k on a copy just read, on this host (load
+  12–26), readahead giving 1.4–1.9×; W5M (5,242,880 × 200, five byte copies of W1M) completes at
+  168k rows/s with peak RSS 126 MiB and heap 29 MiB above the baseline. Without `once` the same
+  W1M export keeps 404 MiB in the page cache and peaks at +503 MiB RSS.
+- The same export on OPFS in Chromium (`browser-tests/next-export-bench.spec.ts`, opt-in
+  `MINNOW_NEXT_EXPORT_BENCH=1`, which also turns the cached-bytes guard off for its run): the
+  table is written through the OPFS backend in a worker (W1M × 200 plus one group the export
+  does not read, 1,138 MiB; 4 groups generated, the rest byte copies), and every pass streams
+  1,048,576 rows in a fresh worker. Cold means the profile's OPFS files were synced and dropped
+  from the OS page cache (`dd iflag=nocache`, checked with `fincore`). Two runs on this host
+  (load 13–18): cold 103–127k rows/s without readahead, 116–207k at 256 KiB per column,
+  129–144k at 1 MiB; on later passes whose OS-cache residency was not controlled (76–95% of
+  the files resident; the bench now primes and verifies a warm pass, review B2-p2h #3)
+  123–141k, 162–225k, 121–224k; from the page cache (decode only) 0.6–1.2M. Readahead cuts platform reads from 49,013 to 8,094 (256 KiB) and 6,819
+  (1 MiB); 256 KiB is the default. It is not disk-bound: dd reads the same file at 1,119 MB/s
+  cold, the export 110–241 MB/s, and loads take 68–79% of a pass warm or cold. A warm pass's
+  CPU profile: `PageCache` miss handling 29% self time, the sync access handle's `read` 9%,
+  xxHash32 11%, decode about 20%. Memory with `once`: renderer RSS +96 to +157 MiB over the
+  value before the pass, the worker's JS heap at most 28 MiB, governor peak 53–78 MiB; without
+  `once`, +621 to +656 MiB and the hot set is lost.
+- The export's read path (increment 9). Measured first: a warm W1M pass spent 0.39 s in the
+  platform reads, 0.64 s copying 57,452 blobs (1.1 GB) out of the shared slab with `slice`,
+  0.65 s in xxHash32 and 0.12 s in entries and planning; a cold one 6.25 s in the reads alone
+  (176 MB/s from a device dd reads at 1.1 GB/s), because each column read its own 256 KiB
+  window, so a batch made 200 strided synchronous reads. Now:
+  - the writer starts every page, dictionary page and directory at an 8-byte offset of its
+    extent (up to 7 zero bytes before it; directories allow the gaps), so a page read together
+    with its neighbours is viewed in place;
+  - a one-pass read's misses (storage `#readPrivate`) are read into one buffer per slab that its
+    lease alone holds (slabs up to `MAX_READ_BYTES`), every blob a verified, aligned view of it:
+    no copy, no `Entry`, no shared slab; the lease is charged for the blobs and the gaps between
+    them and gives both back on release;
+  - `ChunkReader.loadTogether` loads several readers' pages through shared reads in address
+    order, and the export stream's row window (`windowBytes`) loads every column's next rows at
+    once, so a group is read as a few large reads per column instead of one per batch.
+    In Chromium on OPFS (1M × 200, interleaved runs on a host giving the worker about half a
+    core): the miss path fell from 29% to 5% of a warm pass, the sync access handle's `read` is
+    now the largest item (28%); per CPU-second of the export worker, warm 330–376k rows/s with a
+    64 MiB window (per-column 328k), cold 200–320k; wall rows/s on this host 105–297k cold and
+    119–344k warm, renderer RSS +125 to +172 MiB at 64 MiB (one earlier run reached +268 MiB:
+    released one-pass buffers wait for the collector, and cache buffers are never pooled).
+- What an export reads (`scripts/export-size.mts`, 262,144 rows of W1M): 1,055 B/row as flushed.
+  High-cardinality text is 34% (`h02`'s free text alone 113 B/row), float64 31%, nullable
+  floats 9%, int32 9%, decimals 8%; dictionary text 3%. Compaction gzip stores 869 B/row (−18%)
+  but slows the decode stream from 224k to 65k rows/s from memory (inflate), so it does not pay
+  for an export. Candidates, measured on the same values and page boundaries: float64 pages
+  whose values are exact decimals stored as frame-of-reference integers, estimated −103 B/row
+  (−10%), now the `scaledFloat` encoding: W1M stores 926.5 B/row (−12%), the OPFS table 998 MiB
+  instead of 1,137; frame of reference bit-packed instead of u8/u16/u32 widths, −63 B/row
+  (−6%), not adopted (its decode cost, under Pages above).
+- First batch (`SELECT *` first page, and `ORDER BY` the primary key, the same rows): a scan opens
+  each projected column's chunk (its directory only), loads just the pages the batch covers (with
+  the dictionary for dictionary pages) and decodes those rows; nothing is done for the rest of the
+  group. `scripts/first-batch-bench.mts`, 2,048 rows, warm with descriptors (load 15–27): W1M
+  (200 columns) 4.2 ms, W500 (500 columns) 11.9–13.9 ms; cold (no byte or directory cache) 21–24
+  ms and 62–79 ms, about half opening (directory read, checksum and parse), most of the rest page
+  reads and their checksums. `varlenBytes` counts nothing for non-varlen pages and sums
+  dictionary entry lengths in one loop per code width.
 - Parsed pages ride on their space-cache entries (`ExtentReader.parsed` / `attach`): a reader
   attaches the page's descriptor (its `PageView`: views into the entry's own bytes, the validated
   structure) to the entry, charged in that entry at `PAGE_DESCRIPTOR_BYTES` (768; measured
@@ -391,8 +485,12 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
   dropped with it. Later readers reuse it when it was validated against the same directory fields
   (encoding, rows, nulls, large-value region, tag, scale, dictionary size), so a page is validated
   once per cache residency, not once per load. Views share the cached bytes, so nothing is
-  counted twice. gzip pages (inflated per residency, R15.5) and dictionary pages are parsed per
-  reader. W1M, 0.1 % filter returning 30 columns, warm: 82.6 ms without descriptors, 52.9 ms with
+  counted twice. A chunk's dictionary rides on its dictionary page's entry the same way (the
+  parsed dictionary, 306–413 bytes measured, charged at the same bound; each reader builds its own
+  vector over it): 83 dictionaries of the W500 table load in 1.1–1.3 ms instead of 1.4–1.7. gzip
+  pages are parsed per load: parsing inflated pages measured 1–11 % of a warm scan of a compacted
+  text column (inflating, the larger cost, already happens once per residency, R15.5), so they
+  get no descriptor. W1M, 0.1 % filter returning 30 columns, warm: 82.6 ms without descriptors, 52.9 ms with
   (load ≈ 16); W5M: 235 ms warm.
 
 ### Manifest (`format/manifest.ts`)

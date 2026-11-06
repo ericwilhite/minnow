@@ -42,6 +42,7 @@
 import type { ChunkData, ColumnChunk, PageEntry } from "../format/manifest.js";
 import { PageEncoding } from "../format/manifest.js";
 import {
+  blobAddress,
   MAX_BLOB_BYTES,
   MAX_READ_BYTES,
   type BlobRef,
@@ -121,6 +122,16 @@ export interface ChunkReadOptions {
    * read. Without it each `open` parses the directory.
    */
   readonly directories?: BlobCache<ChunkDirectory>;
+  /**
+   * A one-pass scan (storage/extents.ts `ReadOptions.once`): what the reader reads is not kept
+   * in the space's cache, a directory it parses is not admitted to `directories`, and a gzip
+   * page it inflates is not admitted to `inflated` (cached ones are still used), so a full export
+   * leaves the hot working set alone and its memory flat. Its cache hits are not uses either
+   * (`PeekOptions.once`: nothing is promoted), and it attaches no descriptor to any entry: its
+   * pages are parsed per load, and a descriptor another reader attached to the same bytes is
+   * still used.
+   */
+  readonly once?: boolean;
 }
 
 /** The reader could not charge bytes it must hold (a peeked, inflated or parsed structure). */
@@ -129,6 +140,15 @@ export class PageBudgetError extends Error {
   constructor(readonly bytes: number) {
     super(`The chunk reader needs ${String(bytes)} bytes the budget does not have`);
     this.name = "PageBudgetError";
+  }
+}
+
+/** `translationMap`'s interner called `translationMap` with itself while its map was built. */
+export class TranslationReentryError extends Error {
+  readonly code = "MINNOW_TRANSLATION_REENTRY";
+  constructor() {
+    super("translationMap was re-entered by its own interner while building its map");
+    this.name = "TranslationReentryError";
   }
 }
 
@@ -217,6 +237,34 @@ class PageDescriptor {
   }
 }
 
+/**
+ * A chunk's parsed dictionary riding on its dictionary page's cache entry, with what it was
+ * checked against (measured 306–413 bytes: a 50-entry uuid and a 1,000-entry text dictionary;
+ * charged at `PAGE_DESCRIPTOR_BYTES`).
+ */
+class DictionaryDescriptor {
+  readonly #encoding: number;
+  readonly #rowCount: number;
+  readonly #tag: number;
+  constructor(
+    readonly dictionary: PageDictionary,
+    /** The cached bytes it views. */
+    readonly source: Uint8Array,
+    entry: PageEntry,
+    tag: number,
+  ) {
+    this.#encoding = entry.encoding;
+    this.#rowCount = entry.rowCount;
+    this.#tag = tag;
+  }
+
+  fits(entry: PageEntry, tag: number): boolean {
+    return (
+      entry.encoding === this.#encoding && entry.rowCount === this.#rowCount && tag === this.#tag
+    );
+  }
+}
+
 /** `at`, for methods whose `at` parameter shadows it. */
 const at_ = at;
 
@@ -234,6 +282,13 @@ interface Held {
   readonly inflated: BlobRef | null;
 }
 
+/** One page of `ChunkReader.loadTogether`. */
+interface TogetherJob {
+  readonly reader: ChunkReader;
+  readonly entry: PageEntry;
+  readonly page: number;
+}
+
 class SharedLease {
   #holders: number;
   constructor(
@@ -246,6 +301,8 @@ class SharedLease {
     if (--this.#holders === 0) this.lease.release();
   }
 }
+
+const PEEK_ONCE = { once: true } as const;
 
 /** The data-space address of a chunk's data range (its pages are at this + `PageEntry.offset`). */
 export function dataAddress(data: ChunkData): number {
@@ -320,6 +377,13 @@ export class ChunkReader {
   readonly #streams = new Set<Stream>();
   /** Each compiled predicate's matching dictionary codes, charged until `close`. */
   readonly #codes = new Map<CompiledPredicate, Uint32Array>();
+  /** Translation maps by interner (`translationMap`), charged until `close`. */
+  readonly #translations = new Map<
+    (bytes: Uint8Array, start: number, end: number) => number,
+    Int32Array
+  >();
+  /** Interners whose map is being built: a callback that re-enters with one is refused. */
+  readonly #building = new Set<(bytes: Uint8Array, start: number, end: number) => number>();
   #scratch: SelectScratch | null = null;
   #scratchCharge = 0;
   #closed = false;
@@ -350,7 +414,9 @@ export class ChunkReader {
   ): MaybePromise<ChunkReader> {
     const ref = chunk.directory;
     const cache = options.directories;
-    const hit = cache?.pin(ref) ?? null;
+    // A one-pass reader's pin leaves the directory's eviction order alone (review B2-p2h #2).
+    const pinning = options.once === true ? PEEK_ONCE : undefined;
+    const hit = cache?.pin(ref, pinning) ?? null;
     if (cache !== undefined && hit !== null) {
       // Cached and parsed already: charged to this reader while it holds it, unpinned at close.
       try {
@@ -361,11 +427,11 @@ export class ChunkReader {
         // The entry was parsed for whichever chunk read it first (review B2-p2a #1).
         checkDirectoryWithin(hit.value, chunk.data.length);
       } catch (error) {
-        cache.unpin(ref);
+        cache.unpin(ref, pinning);
         throw error;
       }
       if (!options.budget.allocate(hit.size)) {
-        cache.unpin(ref);
+        cache.unpin(ref, pinning);
         throw new PageBudgetError(hit.size);
       }
       return new ChunkReader(space, chunk, hit.value, options, hit.size, ref);
@@ -385,13 +451,14 @@ export class ChunkReader {
         options.budget.free(charge);
         throw error;
       }
-      if (cache === undefined)
+      // A one-pass scan uses cached directories but keeps none it parsed (`options.once`).
+      if (cache === undefined || options.once === true)
         return new ChunkReader(space, chunk, directory, options, charge, null);
       // Pinned for this reader; another reader's earlier entry wins a race (same bytes, same charge).
       const shared = cache.admit(ref, directory, charge);
       return new ChunkReader(space, chunk, shared, options, charge, ref);
     };
-    const cached = space.peek(ref);
+    const cached = options.once === true ? space.peek(ref, PEEK_ONCE) : space.peek(ref);
     if (cached !== null) return build(cached);
     return space.read([ref], options).then((lease) => {
       try {
@@ -411,6 +478,25 @@ export class ChunkReader {
     if (to <= from) return [0, 0];
     const pages = this.directory.pages;
     return [pageIndexOf(pages, from), pageIndexOf(pages, to - 1) + 1];
+  }
+
+  /**
+   * A scan's readahead: the pages covering rows `[from, to)`, then the pages after them while
+   * their stored bytes stay within `ahead`. Loading these in one call lets the space coalesce
+   * neighbouring pages into fewer, larger platform reads (a sequential export); release pages
+   * behind the scan as it moves on.
+   */
+  pagesAhead(from: number, to: number, ahead: number): number[] {
+    const [first, end] = this.pagesInRange(from, to);
+    const out: number[] = [];
+    for (let page = first; page < end; page++) out.push(page);
+    let bytes = 0;
+    for (let page = end; page < this.directory.pages.length; page++) {
+      bytes += at(this.directory.pages, page).length;
+      if (bytes > ahead) break;
+      out.push(page);
+    }
+    return out;
   }
 
   /** The distinct pages holding `rows[start … end)` (group positions, ascending). */
@@ -466,6 +552,127 @@ export class ChunkReader {
   }
 
   /** Starts one read for `missing` (and the dictionary) and registers it as their pending load. */
+  /**
+   * Loads pages of several readers through shared reads (increment 9): their pages, in the
+   * order of their addresses, go to the space in batches of up to `MAX_READ_BYTES`, so the
+   * space coalesces neighbouring pages of different columns into large reads (a scan's window
+   * over every column becomes a few large, nearly sequential reads). Every page is installed in
+   * its own reader as `load` would install it, holding its share of the shared lease. Readers
+   * must share the first reader's space, budget and `once`; one that does not, that needs its
+   * dictionary, or that has gzip pages to load, loads on its own (`load`). A reader may appear
+   * more than once, with overlapping pages: its requests are merged. Resolves when every
+   * page is loaded; a reader closed meanwhile only loses its own pages (its loads give back what
+   * they read, as `close` says), and other errors reject.
+   */
+  static loadTogether(
+    loads: ReadonlyArray<{ readonly reader: ChunkReader; readonly pages: readonly number[] }>,
+  ): Promise<void> {
+    const first = loads[0]?.reader;
+    if (first === undefined) return Promise.resolve();
+    const waits: Array<PromiseLike<void>> = [];
+    const jobs: TogetherJob[] = [];
+    const missingOf = new Map<ChunkReader, number[]>();
+    // One page set per reader before any work (review B2-p2i #3): a reader named twice, or
+    // overlapping page arrays, must not install a page twice (the second install would drop
+    // the first's lease share without releasing it).
+    const merged = new Map<ChunkReader, Set<number>>();
+    for (const { reader, pages } of loads) {
+      if (reader.#closed) throw new ReaderClosedError();
+      let set = merged.get(reader);
+      if (set === undefined) {
+        set = new Set();
+        merged.set(reader, set);
+      }
+      for (const page of pages) set.add(page);
+    }
+    for (const [reader, requested] of merged) {
+      const pages = [...requested];
+      const entries = reader.directory.pages;
+      const missing: number[] = [];
+      let alone =
+        reader.#space !== first.#space ||
+        reader.#options.budget !== first.#options.budget ||
+        (reader.#options.once === true) !== (first.#options.once === true);
+      for (const index of pages) {
+        const entry = entries[index];
+        if (entry === undefined) throw new RangeError("Page index outside the chunk");
+        if (isDictionary(entry) && reader.#dictionary === null) alone = true;
+        if (isGzip(entry)) alone = true;
+        if (reader.#pages[index] !== undefined) continue;
+        const pending = reader.#pending.get(index);
+        if (pending !== undefined) waits.push(pending);
+        else missing.push(index);
+      }
+      if (alone) {
+        const loaded = reader.load(pages);
+        // As in the shared reads: a reader closed meanwhile only loses its own pages.
+        if (loaded !== undefined)
+          waits.push(
+            loaded.then(noop, (error: unknown) => {
+              if (!(error instanceof ReaderClosedError && reader.#closed)) throw error;
+            }),
+          );
+        continue;
+      }
+      if (missing.length === 0) continue;
+      missingOf.set(reader, missing);
+      for (const page of missing) jobs.push({ reader, entry: at(entries, page), page });
+    }
+    if (jobs.length > 0) {
+      jobs.sort(
+        (a, b) =>
+          blobAddress(blobOf(a.reader.chunk, a.entry)) -
+          blobAddress(blobOf(b.reader.chunk, b.entry)),
+      );
+      const run = ChunkReader.#readTogether(first.#space, first.#options, jobs);
+      for (const [reader, missing] of missingOf) {
+        for (const index of missing) reader.#pending.set(index, run);
+        const settle = (): void => {
+          for (const index of missing)
+            if (reader.#pending.get(index) === run) reader.#pending.delete(index);
+        };
+        run.then(settle, settle);
+      }
+      waits.push(run);
+    }
+    return Promise.all(waits).then(noop);
+  }
+
+  static async #readTogether(
+    space: ExtentReader,
+    options: ChunkReadOptions,
+    jobs: readonly TogetherJob[],
+  ): Promise<void> {
+    let start = 0;
+    while (start < jobs.length) {
+      let end = start;
+      let bytes = 0;
+      while (end < jobs.length && bytes + at(jobs, end).entry.length <= MAX_READ_BYTES)
+        bytes += at(jobs, end++).entry.length;
+      if (end === start) end++;
+      const batch = jobs.slice(start, end);
+      const lease = await space.read(
+        batch.map(({ reader, entry }) => blobOf(reader.chunk, entry)),
+        options,
+      );
+      const shared = new SharedLease(lease, batch.length);
+      // `#settle` takes over one hold on the lease per job, success or failure; a reader closed
+      // meanwhile gives its share back there (`#install`).
+      for (let k = 0; k < batch.length; k++) {
+        const { reader, entry, page } = at(batch, k);
+        try {
+          await reader.#settle(entry, page, lease.bytes[k], shared);
+        } catch (error) {
+          // A reader closed meanwhile only loses its own pages; the others still load.
+          if (error instanceof ReaderClosedError) continue;
+          for (let rest = k + 1; rest < batch.length; rest++) shared.drop();
+          throw error;
+        }
+      }
+      start = end;
+    }
+  }
+
   #start(missing: readonly number[], wantsDictionary: boolean): Promise<void> {
     const run = this.#loadRead(missing, wantsDictionary);
     for (const index of missing) this.#pending.set(index, run);
@@ -491,19 +698,19 @@ export class ChunkReader {
     const inflated = this.#options.inflated;
     const found: Array<{ bytes: Uint8Array; pinned: BlobRef | null }> = [];
     const unpin = (): void => {
-      for (const { pinned } of found) if (pinned !== null) inflated?.unpin(pinned);
+      for (const { pinned } of found) if (pinned !== null) inflated?.unpin(pinned, this.#pinning);
     };
     for (const { entry } of jobs) {
       const ref = blobOf(this.chunk, entry);
       if (isGzip(entry)) {
-        const bytes = inflated?.pin(ref) ?? null;
+        const bytes = inflated?.pin(ref, this.#pinning) ?? null;
         if (bytes === null) {
           unpin();
           return false;
         }
         found.push({ bytes, pinned: ref });
       } else {
-        const bytes = this.#space.peek(ref);
+        const bytes = this.#peek(ref);
         if (bytes === null) {
           unpin();
           return false;
@@ -535,7 +742,7 @@ export class ChunkReader {
       for (let k = installed + 1; k < found.length; k++) {
         const { bytes, pinned } = at(found, k);
         this.#options.budget.free(bytes.length);
-        if (pinned !== null) inflated?.unpin(pinned);
+        if (pinned !== null) inflated?.unpin(pinned, this.#pinning);
       }
       throw error;
     }
@@ -555,13 +762,13 @@ export class ChunkReader {
     // gzip pages already inflated in the cache need no read.
     for (const job of all) {
       const ref = blobOf(this.chunk, job.entry);
-      const bytes = isGzip(job.entry) ? (inflated?.pin(ref) ?? null) : null;
+      const bytes = isGzip(job.entry) ? (inflated?.pin(ref, this.#pinning) ?? null) : null;
       if (bytes === null) {
         jobs.push(job);
         continue;
       }
       if (!this.#options.budget.allocate(bytes.length)) {
-        inflated?.unpin(ref);
+        inflated?.unpin(ref, this.#pinning);
         throw new PageBudgetError(bytes.length);
       }
       this.#install(job.entry, job.page, bytes, {
@@ -635,8 +842,9 @@ export class ChunkReader {
       lease.drop();
       throw new PageBudgetError(length);
     }
-    let raw: Uint8Array = new Uint8Array(length);
+    let raw: Uint8Array;
     try {
+      raw = new Uint8Array(length); // inside: a failed allocation gives the charge back too
       await inflateInto(sized(stored, entry.length), raw);
     } catch (error) {
       this.#options.budget.free(length);
@@ -644,8 +852,9 @@ export class ChunkReader {
     } finally {
       lease.drop();
     }
-    // If the reader was closed while this page inflated, `#install` gives the charge back.
-    const cache = this.#options.inflated;
+    // If the reader was closed while this page inflated, `#install` gives the charge back. A
+    // one-pass scan keeps nothing it inflated (`options.once`): the page is its own, charged to it.
+    const cache = this.#options.once === true ? undefined : this.#options.inflated;
     const ref = blobOf(this.chunk, entry);
     if (cache !== undefined) raw = cache.admit(ref, raw);
     this.#install(entry, page, raw, {
@@ -671,7 +880,7 @@ export class ChunkReader {
     try {
       if (this.#closed) throw new ReaderClosedError();
       if (page === null) {
-        const dictionary = parseDictionary(bytes, entry, this.directory.tag);
+        const dictionary = this.#parseDictionary(entry, bytes, stored);
         this.#dictionary = dictionary;
         this.#dictionaryHeld = held;
         this.#dictionaryVector = dictionaryVector(dictionary, this.chunk.type);
@@ -679,7 +888,20 @@ export class ChunkReader {
         // Validated against the chunk, its dictionary's domain included: every consumer
         // (select, refine, gather, decode) relies on this one check (review B2-p2d #1), run once
         // per cache residency when the page's descriptor rides on its cache entry.
-        this.#pages[page] = this.#parse(entry, bytes, stored);
+        if ((entry.encoding & 0x7f) === PageEncoding.scaledFloat) {
+          // Decoded into an f64 lane the reader holds (8 bytes per row), charged before it is
+          // allocated, never attached to the cache entry (its bytes are not the entry's).
+          const lane = entry.rowCount * 8;
+          if (!this.#options.budget.allocate(lane)) throw new PageBudgetError(lane);
+          held = { ...held, charged: held.charged + lane };
+          this.#pages[page] = parsePage(
+            bytes,
+            entry,
+            this.directory.tag,
+            this.directory.scale,
+            this.directory.dictionary?.rowCount ?? 0,
+          );
+        } else this.#pages[page] = this.#parse(entry, bytes, stored);
         this.#held[page] = held;
       }
     } catch (error) {
@@ -706,21 +928,61 @@ export class ChunkReader {
     )
       return cached.view;
     const view = parsePage(bytes, entry, tag, scale, dictionarySize);
-    // Only a view of the entry's own bytes may ride on the entry (parse copies a misaligned blob).
-    if (cached === null && view.bytes === bytes)
+    // Only a view of the entry's own bytes may ride on the entry: parse copies a misaligned blob,
+    // and the space refuses bytes that are not the resident entry's (a one-pass read's private
+    // copy, review B2-p2g #3). A one-pass reader attaches nothing.
+    if (cached === null && view.bytes === bytes && this.#options.once !== true)
       this.#space.attach?.(
         stored,
         new PageDescriptor(view, entry, tag, scale, dictionarySize),
         PAGE_DESCRIPTOR_BYTES,
+        bytes,
       );
     return view;
+  }
+
+  /**
+   * The chunk's dictionary: the one its cache entry carries when it was parsed for the same
+   * entry fields and tag, else a fresh parse, attached for the next reader (as `#parse` does
+   * for pages). The dictionary vector over it is built per reader, for this chunk's type.
+   */
+  #parseDictionary(entry: PageEntry, bytes: Uint8Array, stored: BlobRef | null): PageDictionary {
+    const tag = this.directory.tag;
+    if (stored === null) return parseDictionary(bytes, entry, tag);
+    const cached = this.#space.parsed?.(stored) ?? null;
+    if (
+      cached instanceof DictionaryDescriptor &&
+      cached.source === bytes &&
+      cached.fits(entry, tag)
+    )
+      return cached.dictionary;
+    const dictionary = parseDictionary(bytes, entry, tag);
+    // Only views of the entry's own bytes may ride on it, as for pages (`#parse`).
+    if (cached === null && dictionary.bytes.buffer === bytes.buffer && this.#options.once !== true)
+      this.#space.attach?.(
+        stored,
+        new DictionaryDescriptor(dictionary, bytes, entry, tag),
+        PAGE_DESCRIPTOR_BYTES,
+        bytes,
+      );
+    return dictionary;
+  }
+
+  /** How this reader pins cached directories and inflated pages (one-pass: not a use). */
+  get #pinning(): { readonly once: true } | undefined {
+    return this.#options.once === true ? PEEK_ONCE : undefined;
+  }
+
+  /** A cache hit; a one-pass reader's is not a use (review B2-p2g #2). */
+  #peek(ref: BlobRef): Uint8Array | null {
+    return this.#options.once === true ? this.#space.peek(ref, PEEK_ONCE) : this.#space.peek(ref);
   }
 
   #drop(held: Held | undefined | null): void {
     if (held === undefined || held === null) return;
     if (held.charged > 0) this.#options.budget.free(held.charged);
     held.lease?.drop();
-    if (held.inflated !== null) this.#options.inflated?.unpin(held.inflated);
+    if (held.inflated !== null) this.#options.inflated?.unpin(held.inflated, this.#pinning);
   }
 
   /** Loads the dictionary page on its own (for a dictionary vector before any page). */
@@ -732,6 +994,56 @@ export class ChunkReader {
     if (pending !== null) return pending.then(() => this.#dictionaryVector);
     if (this.#loadCached([], true)) return this.#dictionaryVector;
     return this.#start([], true).then(() => this.#dictionaryVector);
+  }
+
+  /**
+   * A code translation map for this chunk's dictionary: `map[code] = intern(bytes, start, end)`
+   * for each entry (its stored bytes: UTF-8 text, bytes, or 16 uuid bytes), so codes of
+   * different groups translate into one id space (the executor's GROUP BY and join keys across
+   * groups). Built once per reader and `intern`, O(dictionary) whatever the rows, charged to the
+   * budget (4 bytes per entry) until `close`; a repeated call returns the same map. Null when
+   * the chunk has no dictionary; the dictionary must be loaded (`loadDictionary`, or `load` of a
+   * dictionary page).
+   *
+   * `intern` may call back into the reader, but not `translationMap` with itself while its map is
+   * being built (`TranslationReentryError`). If it closes the reader, the map is not kept and the
+   * call throws `ReaderClosedError`. Whenever no map is recorded (a throw, a refused reentry, a
+   * close), its reservation is given back (review B2-p2g #1).
+   */
+  translationMap(
+    intern: (bytes: Uint8Array, start: number, end: number) => number,
+  ): Int32Array | null {
+    this.#live();
+    if (this.directory.dictionary === null) return null;
+    const dictionary = this.#dictionary;
+    if (dictionary === null) throw new RangeError("The chunk's dictionary is not loaded");
+    const kept = this.#translations.get(intern);
+    if (kept !== undefined) return kept;
+    if (this.#building.has(intern)) throw new TranslationReentryError();
+    const bytes = dictionary.size * 4;
+    if (!this.#options.budget.allocate(bytes)) throw new PageBudgetError(bytes);
+    // Provisional until every entry is interned and the reader is still open: otherwise (a
+    // throwing interner or allocation, review B2-p2f #1; a close from the interner, B2-p2g #1)
+    // the reservation goes back and nothing is recorded.
+    this.#building.add(intern);
+    let map: Int32Array;
+    try {
+      map = new Int32Array(dictionary.size);
+      const offsets = dictionary.offsets;
+      for (let code = 0; code < dictionary.size; code++) {
+        const start = offsets === null ? code * 16 : (offsets[code] ?? 0);
+        const end = offsets === null ? start + 16 : (offsets[code + 1] ?? 0);
+        map[code] = intern(dictionary.bytes, start, end);
+      }
+      if (this.#closed) throw new ReaderClosedError();
+    } catch (error) {
+      this.#options.budget.free(bytes);
+      throw error;
+    } finally {
+      this.#building.delete(intern);
+    }
+    this.#translations.set(intern, map);
+    return map;
   }
 
   /** The chunk's dictionary as an immutable flat vector, once loaded. */
@@ -777,6 +1089,8 @@ export class ChunkReader {
     this.#streams.clear();
     for (const codes of this.#codes.values()) this.#options.budget.free(codes.byteLength);
     this.#codes.clear();
+    for (const map of this.#translations.values()) this.#options.budget.free(map.byteLength);
+    this.#translations.clear();
     this.#options.budget.free(this.#scratchCharge);
     this.#scratchCharge = 0;
     this.#scratch = null;
@@ -786,7 +1100,8 @@ export class ChunkReader {
     this.#dictionary = null;
     this.#dictionaryVector = null;
     this.#options.budget.free(this.#directoryCharge);
-    if (this.#directoryPin !== null) this.#options.directories?.unpin(this.#directoryPin);
+    if (this.#directoryPin !== null)
+      this.#options.directories?.unpin(this.#directoryPin, this.#pinning);
   }
 
   // ── Predicates on encoded pages (predicate.ts, select.ts) ─────────────────────────────
@@ -904,7 +1219,12 @@ export class ChunkReader {
           throw new RangeError("A dictionary page needs its dictionary loaded");
         const bytes = ((dictionary.size + 31) >>> 5) * 4;
         if (!this.#options.budget.allocate(bytes)) throw new PageBudgetError(bytes);
-        codes = dictionaryMatches(dictionary, compiled);
+        try {
+          codes = dictionaryMatches(dictionary, compiled);
+        } catch (error) {
+          this.#options.budget.free(bytes);
+          throw error;
+        }
         this.#codes.set(compiled, codes);
       }
     }
@@ -928,9 +1248,16 @@ export class ChunkReader {
     rows = Math.min(rows, 4096); // decoded in chunks of this many rows
     const bytes = scratchBytes(rows);
     if (!this.#options.budget.allocate(bytes)) throw new PageBudgetError(bytes);
+    let scratch: SelectScratch;
+    try {
+      scratch = newScratch(rows);
+    } catch (error) {
+      this.#options.budget.free(bytes);
+      throw error;
+    }
     this.#scratchCharge = bytes;
-    this.#scratch = newScratch(rows);
-    return this.#scratch;
+    this.#scratch = scratch;
+    return scratch;
   }
 
   // ── Out-of-line values ──────────────────────────────────────────────────────────────────
@@ -1174,7 +1501,7 @@ export class ChunkReader {
     for (const job of jobs) {
       const parts: Uint8Array[] = [];
       for (const ref of job.refs) {
-        const bytes = this.#space.peek(ref);
+        const bytes = this.#peek(ref);
         if (bytes === null) return false;
         parts.push(sized(bytes, ref.length));
       }

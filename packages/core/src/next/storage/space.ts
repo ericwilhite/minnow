@@ -39,6 +39,7 @@ import {
   type ExtentWriter,
   type OpenExtentSpace,
   type OpenSpaceOptions,
+  type PeekOptions,
   type PendingBlob,
   type PublishChange,
   type ReachableExtents,
@@ -149,7 +150,7 @@ export const openExtentSpace: OpenExtentSpace = async (session, options) => {
   try {
     const reader = {
       read: (refs: readonly BlobRef[], read: ReadOptions) => cache.read(refs, read),
-      peek: (ref: BlobRef) => cache.peek(ref),
+      peek: (ref: BlobRef, peek?: PeekOptions) => cache.peek(ref, peek),
     };
     const current = await collect(root, options.reachable, reader, options.budget, dataLength);
     options.signal?.throwIfAborted();
@@ -280,16 +281,16 @@ class Space implements ExtentSpace {
     return this.#cache.read(refs, options);
   }
 
-  peek(ref: BlobRef): Uint8Array | null {
-    return this.#cache.peek(ref);
+  peek(ref: BlobRef, options?: PeekOptions): Uint8Array | null {
+    return this.#cache.peek(ref, options);
   }
 
   parsed(ref: BlobRef): object | null {
     return this.#cache.parsed(ref);
   }
 
-  attach(ref: BlobRef, parsed: object, bytes: number): boolean {
-    return this.#cache.attachParsed(ref, parsed, bytes);
+  attach(ref: BlobRef, parsed: object, bytes: number, of: Uint8Array): boolean {
+    return this.#cache.attachParsed(ref, parsed, bytes, of);
   }
 
   // ── Writing ──────────────────────────────────────────────────────────────────────────────────

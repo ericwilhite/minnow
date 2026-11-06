@@ -75,6 +75,22 @@ export function createReach<State extends string>(
   };
 }
 
+/**
+ * The scaled-float codec at the safe-integer bounds (next/page/scaled-float.test.ts, review
+ * B2-p2i-2 #3): a stored page whose base lies within 2^32 of +(2^53 − 1) or −(2^53 − 1), for each
+ * delta width and each exponent band, read from the stored header (base sign, width byte, exponent
+ * in aux), never inferred from the generator's inputs. Width 0 is the constant-integer case and
+ * needs no bound of its own; every cell listed here is reachable: a page of n / 10^e for n within
+ * the width's range of the bound, e in the band.
+ */
+export const SCALED_FLOAT_BOUNDARY_REACH = (["positive", "negative"] as const).flatMap((sign) =>
+  ([1, 2, 4] as const).flatMap((width) =>
+    (["exponent 0", "exponents 1-6", "exponents 7-15"] as const).map(
+      (band) => `${sign} bound, width ${String(width)}, ${band}` as const,
+    ),
+  ),
+);
+
 /** Rebuild campaign: each source plus both successful and refused SQL must execute. */
 export const DIFFERENTIAL_REACH = [
   "conformance",

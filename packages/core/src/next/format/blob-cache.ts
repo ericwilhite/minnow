@@ -13,6 +13,11 @@
  *   governor evicts them before any grant grows or any operator spills, across every registered
  *   cache by `oldestUnusedAt` (memory/governor.ts rule 6).
  * One holder may pin an entry several times; each `pin` or `admit` is undone by one `unpin`.
+ *
+ * A one-pass scan's pin (`{ once: true }`, storage/extents.ts `ReadOptions.once`) is not a use
+ * (review B2-p2h #2): while every pin of an entry is one, the entry keeps its place in the
+ * eviction order and its `usedAt` (it is skipped while pinned), and the last such unpin charges it
+ * again where it is. An ordinary pin meanwhile counts as usual. Unpin with the same option.
  */
 import {
   blobAddress,
@@ -25,10 +30,17 @@ interface Entry<T> {
   readonly value: T;
   readonly size: number;
   pins: number;
+  /** Pins held by one-pass scans; while all pins are, the entry stays in the eviction order. */
+  oncePins: number;
   /** Charged to the cache (only while unpinned). */
   charged: boolean;
   /** When its last holder let go (`performance.now()`). */
   usedAt: number;
+}
+
+/** Options of `pin` and `unpin`: a one-pass scan's pin is not a use. */
+export interface PinOptions {
+  readonly once?: boolean;
 }
 
 /** A pinned cache entry: its value and the bytes its holder must have charged. */
@@ -43,7 +55,10 @@ export const blobKey = (ref: BlobRef): string =>
 export class BlobCache<T> implements EvictableCacheLike {
   readonly #memory: CacheMemory;
   readonly #entries = new Map<string, Entry<T>>();
-  /** The unpinned (charged, evictable) entries; insertion order is release order. */
+  /**
+   * The evictable entries in release order, plus those pinned only by one-pass scans, which keep
+   * their place here (skipped by eviction while pinned).
+   */
   readonly #unpinned = new Map<string, Entry<T>>();
   #evictable = 0;
   #resident = 0;
@@ -70,7 +85,7 @@ export class BlobCache<T> implements EvictableCacheLike {
 
   /** When the entry `evict` takes next was released (the governor's cross-cache order). */
   get oldestUnusedAt(): number | undefined {
-    for (const entry of this.#unpinned.values()) return entry.usedAt;
+    for (const entry of this.#unpinned.values()) if (entry.pins === 0) return entry.usedAt;
     return undefined;
   }
 
@@ -78,6 +93,7 @@ export class BlobCache<T> implements EvictableCacheLike {
     let freed = 0;
     for (const [key, entry] of this.#unpinned) {
       if (freed >= bytes) break;
+      if (entry.pins > 0) continue;
       this.#unpinned.delete(key);
       this.#entries.delete(key);
       this.#resident -= entry.size;
@@ -91,7 +107,7 @@ export class BlobCache<T> implements EvictableCacheLike {
   }
 
   /** The entry for `ref`, pinned for the caller, or null. */
-  pin(ref: BlobRef): Pinned<T> | null {
+  pin(ref: BlobRef, options: PinOptions = {}): Pinned<T> | null {
     const key = blobKey(ref);
     const entry = this.#entries.get(key);
     if (entry === undefined) {
@@ -99,18 +115,23 @@ export class BlobCache<T> implements EvictableCacheLike {
       return null;
     }
     this.hits++;
-    this.#take(key, entry);
+    this.#take(key, entry, options.once === true);
     return { value: entry.value, size: entry.size };
   }
 
-  /** One more pin; the first takes the entry off the evictable list and out of the cache's charge. */
-  #take(key: string, entry: Entry<T>): void {
-    if (entry.pins++ === 0 && entry.charged) {
+  /**
+   * One more pin; the first takes the entry out of the cache's charge and, unless it is a
+   * one-pass pin, off the eviction order. An ordinary pin takes it off the order in any case.
+   */
+  #take(key: string, entry: Entry<T>, once: boolean): void {
+    if (entry.pins === 0 && entry.charged) {
       entry.charged = false;
-      this.#unpinned.delete(key);
       this.#evictable -= entry.size;
       this.#memory.release(entry.size);
     }
+    if (!once) this.#unpinned.delete(key);
+    entry.pins++;
+    if (once) entry.oncePins++;
   }
 
   /**
@@ -122,26 +143,45 @@ export class BlobCache<T> implements EvictableCacheLike {
     const key = blobKey(ref);
     const existing = this.#entries.get(key);
     if (existing !== undefined) {
-      this.#take(key, existing);
+      this.#take(key, existing, false);
       return existing.value;
     }
-    this.#entries.set(key, { value, size, pins: 1, charged: false, usedAt: 0 });
+    this.#entries.set(key, { value, size, pins: 1, oncePins: 0, charged: false, usedAt: 0 });
     this.#resident += size;
     return value;
   }
 
-  /** The caller lets go (it frees its own charge): the entry is charged here, or dropped. */
-  unpin(ref: BlobRef): void {
+  /**
+   * The caller lets go (it frees its own charge): the entry is charged here, or dropped. `once`
+   * as it was pinned.
+   */
+  unpin(ref: BlobRef, options: PinOptions = {}): void {
     const key = blobKey(ref);
     const entry = this.#entries.get(key);
     if (entry === undefined || entry.pins === 0) throw new RangeError("unpin of an unpinned entry");
-    if (--entry.pins > 0) return;
+    const once = options.once === true;
+    if (once && entry.oncePins === 0) throw new RangeError("once unpin of an ordinary pin");
+    entry.pins--;
+    if (once) entry.oncePins--;
+    const listed = this.#unpinned.has(key);
+    if (entry.pins > 0) {
+      // The last ordinary pin went while one-pass pins remain: placed in the order now, as this
+      // release would place it; charged when the last pin goes.
+      if (!once && !listed && entry.pins === entry.oncePins) {
+        entry.usedAt = performance.now();
+        this.#unpinned.set(key, entry);
+      }
+      return;
+    }
     if (this.#memory.charge(entry.size)) {
       entry.charged = true;
-      entry.usedAt = performance.now();
-      this.#unpinned.set(key, entry);
+      if (!listed) {
+        entry.usedAt = performance.now();
+        this.#unpinned.set(key, entry);
+      }
       this.#evictable += entry.size;
     } else {
+      this.#unpinned.delete(key);
       this.#entries.delete(key);
       this.#resident -= entry.size;
     }
