@@ -1,0 +1,124 @@
+/**
+ * The write path's load and insert costs (PROPOSAL "Targets": 1M-row keyed load ≤ 1.5 s durable;
+ * relaxed prepared INSERT ≤ 20 µs owner CPU), owner-side, in Node, on the in-memory store:
+ *
+ *   npx vite-node scripts/write-load-bench.mts [--rows 1000000] [--batch 2048]
+ *     [--mode tx|commits|single] [--durability strict|relaxed] [--commit 10000] [--singles 20000]
+ *
+ * - `tx`: one transaction of `rows` keyed rows (id INT PRIMARY KEY, v TEXT, n INT) inserted in
+ *   calls of `batch` rows (staged as it goes), committed, then quiesced (the fold).
+ * - `commits`: the same rows in autocommit transactions of `commit` rows.
+ * - `single`: `singles` one-row autocommit inserts after a 100k-row table: µs per insert (wall
+ *   and process CPU), the relaxed lane's owner cost.
+ * Reported: wall and CPU per phase, rows/s, staged and flushed counts. The memory store has no
+ * disk: durable here means the log's flush calls complete, not a real fsync. The machine is
+ * shared: compare runs made back to back.
+ */
+import { performance } from "node:perf_hooks";
+import {
+  autocommit,
+  batch,
+  column,
+  Harness,
+  INT,
+  ints,
+  rules,
+  tableInput,
+  TEXT,
+  texts,
+} from "../packages/core/src/next/write/test-support.ts";
+
+const args = process.argv.slice(2);
+const option = (name: string, fallback: string): string => {
+  const index = args.indexOf(`--${name}`);
+  return index >= 0 ? (args[index + 1] ?? fallback) : fallback;
+};
+const ROWS = Number(option("rows", "1000000"));
+const BATCH = Number(option("batch", "2048"));
+const MODE = option("mode", "tx");
+const DURABILITY = option("durability", "strict") as "strict" | "relaxed";
+const COMMIT = Number(option("commit", "10000"));
+const SINGLES = Number(option("singles", "20000"));
+
+const cpu = () => {
+  const usage = process.cpuUsage();
+  return (usage.user + usage.system) / 1000;
+};
+const columns = (ids: number[]) =>
+  batch(ints(ids), texts(ids.map((id) => `value ${String(id)}`)), ints(ids.map((id) => id % 1000)));
+
+const harness = new Harness(DURABILITY, "memory", undefined, undefined, {});
+const path = await harness.open();
+let t = 0;
+await autocommit(path, async (s) => {
+  t =
+    (
+      await s.changeCatalog({
+        kind: "createTable",
+        table: tableInput("t", [column("id", INT, false), column("v", TEXT), column("n", INT)]),
+      })
+    ).id ?? 0;
+});
+
+const report: Record<string, unknown> = { mode: MODE, rows: ROWS, durability: DURABILITY };
+if (MODE === "single") {
+  for (let from = 0; from < 100_000; from += BATCH) {
+    const ids = Array.from({ length: Math.min(BATCH, 100_000 - from) }, (_, k) => from + k);
+    await autocommit(path, (s) => s.table(t).insert(columns(ids), null));
+  }
+  await path.quiesce();
+  const wall0 = performance.now();
+  const cpu0 = cpu();
+  for (let k = 0; k < SINGLES; k++) {
+    const id = 1_000_000 + k;
+    await autocommit(path, (s) => s.table(t).insert(columns([id]), null));
+  }
+  report.singleWallUs = Number((((performance.now() - wall0) * 1000) / SINGLES).toFixed(1));
+  report.singleCpuUs = Number((((cpu() - cpu0) * 1000) / SINGLES).toFixed(1));
+} else {
+  const wall0 = performance.now();
+  const cpu0 = cpu();
+  if (MODE === "tx") {
+    const tx = await path.begin();
+    const s = tx.statement({ rules });
+    for (let from = 0; from < ROWS; from += BATCH) {
+      const ids = Array.from({ length: Math.min(BATCH, ROWS - from) }, (_, k) => from + k);
+      await s.table(t).insert(columns(ids), null);
+    }
+    await s.end();
+    await (
+      await tx.commit(null)
+    ).durable;
+  } else {
+    for (let from = 0; from < ROWS; from += COMMIT) {
+      const tx = await path.begin();
+      const s = tx.statement({ rules });
+      for (let at = from; at < Math.min(ROWS, from + COMMIT); at += BATCH) {
+        const ids = Array.from(
+          { length: Math.min(BATCH, from + COMMIT - at, ROWS - at) },
+          (_, k) => at + k,
+        );
+        await s.table(t).insert(columns(ids), null);
+      }
+      await s.end();
+      await (
+        await tx.commit(null)
+      ).durable;
+    }
+  }
+  const loaded = performance.now();
+  const loadCpu = cpu();
+  await path.quiesce();
+  report.loadWallMs = Math.round(loaded - wall0);
+  report.loadCpuMs = Math.round(loadCpu - cpu0);
+  report.settleWallMs = Math.round(performance.now() - loaded);
+  report.totalWallMs = Math.round(performance.now() - wall0);
+  report.rowsPerSecond = Math.round(ROWS / ((performance.now() - wall0) / 1000));
+  report.stages = path.maintenance.stages;
+  report.stagedRows = path.maintenance.stagedRows;
+  report.flushes = path.maintenance.flushes;
+  report.merges = path.maintenance.merges;
+  report.heapMiB = Math.round(process.memoryUsage().heapUsed / 1048576);
+}
+console.log(JSON.stringify(report));
+await harness.close();
