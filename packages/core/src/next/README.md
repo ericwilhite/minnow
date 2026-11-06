@@ -26,7 +26,7 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | `page/`            | format                           | Page codecs, page directory and statistics, streaming group writer, chunk reader (ChunkPages), inflated-page cache                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `spill/`           | executor (OPFS service: storage) | Spill contract (one long-lived scratch file, batching charged to the operator's budget); in-memory double                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `memory/`          | executor                         | Memory governor: admission, progress loans, held vs allocated bytes (reference implementation)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `exec/`            | executor                         | Entry point (`executor.ts`), result frames (`result.ts`), scans (`scan.ts` contract, `table-scan.ts`, `memory-scan.ts`, `column-target.ts`, the pushdown seam `pushdown.ts`), table rules (`rules.ts`), push driver (`pipeline.ts`), fetcher (`fetch.ts`), expression kernels (`kernels/`), filter and project (`filter.ts`), aggregation (`agg/`), comparators, decimal SUM                                                                                                                                                                                                                                                                     |
+| `exec/`            | executor                         | Entry point (`executor.ts`), result frames (`result.ts`), scans (`scan.ts` contract, `table-scan.ts`, `memory-scan.ts`, `column-target.ts`, the pushdown seam `pushdown.ts`), table rules (`rules.ts`), push driver (`pipeline.ts`), fetcher (`fetch.ts`), expression kernels (`kernels/`), filter and project (`filter.ts`), aggregation (`agg/`), comparators, decimal SUM; heavy operators (track B7): hash join (`join*.ts`), sort / top-N / per-group top-k (`sort*.ts`), column store (`column-store.ts`), spill pages (`spill-pages.ts`) and the spill pool (`spill-pool.ts`) shared by join, sort and aggregation spill                  |
 | `ir/`              | lowering, executor               | Operator IR (`ir.ts`); scalar function and operator table (`functions.ts`); table rules in IR form (`rules.ts`); executor costs the planner reads (`costs.ts`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `access/`          | write path + key index           | Storage access contracts the write path implements: snapshots and segments, catalog, key-index probes and ranges, `modify` (rows, conflicts, RETURNING), transactions, group commit, sequences, delivery                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `testing/`         | all                              | Differential-harness adapter for a partial new core; stand-ins for the write path and executor that the owner's composition runs over, with real lowering, until those tracks land (`owner-standins.ts`), an in-memory Web Locks for election tests (`fake-locks.ts`)                                                                                                                                                                                                                                                                                                                                                                            |
@@ -738,6 +738,61 @@ and the owner import it directly.
   across ±2^127, with declared reach; `groups.test.ts` checks the group tables against a model
   past several growths; `review-1.test.ts` holds the review's probes.
   `scripts/next-agg-bench.mts` measures the shapes of measurements.md.
+
+### Hash join (`exec/join.ts`, `join-keys.ts`, `join-table.ts`, `join-filter.ts`) and shared heavy-operator files (`column-store.ts`, `spill-pages.ts`)
+
+- Every kind: inner, left, right, full, semi, anti and mark. Equality is SQL's: `=` never
+  matches NULL, `nullSafe` keys use IS NOT DISTINCT FROM, floats treat −0 = 0 and NaN = NaN,
+  NUMERIC and INTERVAL compare normalized. A residual ON condition is a vector predicate over
+  the pairs; FALSE and NULL both reject.
+- A mark join's mark is `T IN (build T where build C = probe C)` with SQL's three-valued
+  result, exact per column for composite keys. Its output is the probe columns plus one bool
+  (the shape lowering proposes for the IR, ruling R17.5).
+- Keys are input column indexes; the executor projects key expressions first.
+- Key bytes are work in steps (R23.2): every byte hashed, copied into an encoded key or
+  compared counts toward a 256 KiB step budget, and a spent step yields when its slice is due —
+  inside one key, a collision chain, a mark join's candidates and its compatibility tests. A
+  composite key with text or bytes length-prefixes them instead of escaping them (equality
+  needs no order). A batch's encoded keys get one buffer of their exact size, charged before it
+  is allocated, and each value is copied into it once, in budgeted pieces (no regrowth copies).
+- The build store and table are allocated from the join's spillable grant. A dense integer key
+  is direct-addressed; others use open addressing with the key's words inline. Matched outputs
+  reuse probe key vectors for build key columns that are identical in representation.
+- When refused memory the join partitions 16 ways (grace/hybrid), reads back the partitions
+  that fit, spills the rest of the probe, and joins each spilled pair one level down with
+  independent hash bits. A partition that does not split, or an oversized mark join, runs in
+  chunks with per-probe-row state. Nothing is refused for size.
+- Spill pages (`spill-pages.ts`) are the spill contract's typed layout; every `VectorData`
+  variant round-trips. `column-store.ts` is the chunked, charged row store operators keep rows
+  in. Both are shared exec/ files (ruling R20.2) for aggregation spill and sort runs as well.
+- Inner, semi and right joins publish runtime filters (exact bitmap, split-block Bloom, bounds)
+  when the build stays resident; a filter never drops a row that can match, and stops testing
+  when it keeps over 90 % of probes.
+- Push returns `blocked` when the downstream blocks or a spill write waits; with no spill the
+  whole join runs without an await.
+
+### Sort (`exec/sort.ts`, `sort-keys.ts`)
+
+- ORDER BY follows PostgreSQL: NaN above every number, −0 = 0, NUMERIC by value, NULLS FIRST/
+  LAST, DESC, text in C (byte) order. Keys are input column indexes.
+- Key mode: rows carry the frozen sort-key bytes and five prefix words; the in-memory sort is an
+  MSD radix sort over (prefix words, row id) tuples, refining by bytes only when a key is longer
+  than the prefix. Fixed-width keys (booleans, integers, dates, times, timestamps, floats) that
+  fit the prefix skip the key bytes: they are encoded straight into the words (direct mode).
+- An ICU `COLLATE` sorts by query-wide ranks from `Intl.Collator` (ties by bytes) when the
+  distinct values fit; otherwise, and for JSON and array keys, a value comparator (compare
+  mode), in memory and across runs (DECISIONS.md C8). Compare mode decodes each row's JSONB,
+  array and ICU text keys once, as the row arrives (for a merge, once per page), and charges the
+  decoded values to the grant, so a run's comparisons never decode.
+- Top-N keeps rows only while they beat the k-th best key and compacts at 2k (O(k) memory, WITH
+  TIES kept). Up to 65,536 kept rows, it holds its next compaction's store in reserve, so a full
+  grant compacts instead of spilling whenever it can hold the kept rows twice. `GroupTopKOperator` is ROW_NUMBER() ≤ k per partition (the row number appended);
+  after a compaction each partition keeps its k-th key, and rows that cannot beat it are dropped.
+- Grant-or-spill: sorted runs of typed spill pages, merged with a fan-in the spill pool's room
+  allows, in passes when needed; OFFSET rows are counted, not materialized.
+- Finish work (compaction, the sort, the merge, emission) runs in slices of `YIELD_INTERVAL_MS`
+  with a real task yield between them; each slice and each resumption after backpressure checks
+  the abort signal (ruling R23). Scratch that lives across a suspension belongs to the operator.
 
 ### Owner and client protocol (`owner/`)
 

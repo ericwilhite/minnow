@@ -100,3 +100,95 @@ export function xxHash32(bytes: Uint8Array, seed = 0, start = 0, end = bytes.len
   hash ^= hash >>> 16;
   return hash >>> 0;
 }
+
+/**
+ * XXH32 over input given in pieces (the spec's streaming form): `update` any number of ranges,
+ * then `digest`, equal to `xxHash32` of their concatenation with the same seed. Hashing a large
+ * value in bounded steps (the join's key work, R23.2) keeps four lanes and up to 15 buffered
+ * bytes between steps.
+ */
+export class XxHash32Stream {
+  #v1: number;
+  #v2: number;
+  #v3: number;
+  #v4: number;
+  readonly #seed: number;
+  #length = 0;
+  readonly #tail = new Uint8Array(16);
+  #tailLength = 0;
+
+  constructor(seed = 0) {
+    // The seed is taken as `seed >>> 0`, exactly as `xxHash32` takes it (its contract above).
+    this.#seed = seed >>> 0;
+    this.#v1 = (this.#seed + PRIME1 + PRIME2) | 0;
+    this.#v2 = (this.#seed + PRIME2) | 0;
+    this.#v3 = this.#seed | 0;
+    this.#v4 = (this.#seed - PRIME1) | 0;
+  }
+
+  update(bytes: Uint8Array, start = 0, end = bytes.length): this {
+    if (start < 0 || end > bytes.length || start > end)
+      throw new RangeError("xxHash32 range is outside the input");
+    this.#length += end - start;
+    let index = start;
+    // Fill a pending stripe first.
+    if (this.#tailLength > 0) {
+      const take = Math.min(16 - this.#tailLength, end - index);
+      this.#tail.set(bytes.subarray(index, index + take), this.#tailLength);
+      this.#tailLength += take;
+      index += take;
+      if (this.#tailLength < 16) return this;
+      this.#stripe(this.#tail, 0);
+      this.#tailLength = 0;
+    }
+    const limit = end - 16;
+    while (index <= limit) {
+      this.#stripe(bytes, index);
+      index += 16;
+    }
+    if (index < end) {
+      this.#tail.set(bytes.subarray(index, end), 0);
+      this.#tailLength = end - index;
+    }
+    return this;
+  }
+
+  #stripe(bytes: Uint8Array, index: number): void {
+    this.#v1 = round(this.#v1, read32(bytes, index));
+    this.#v2 = round(this.#v2, read32(bytes, index + 4));
+    this.#v3 = round(this.#v3, read32(bytes, index + 8));
+    this.#v4 = round(this.#v4, read32(bytes, index + 12));
+  }
+
+  /** The hash of everything given so far (the stream may continue afterwards). */
+  digest(): number {
+    let hash =
+      this.#length >= 16
+        ? (((this.#v1 << 1) | (this.#v1 >>> 31)) +
+            ((this.#v2 << 7) | (this.#v2 >>> 25)) +
+            ((this.#v3 << 12) | (this.#v3 >>> 20)) +
+            ((this.#v4 << 18) | (this.#v4 >>> 14))) |
+          0
+        : (this.#seed + PRIME5) | 0;
+    hash = (hash + this.#length) | 0;
+    const tail = this.#tail;
+    let index = 0;
+    const end = this.#tailLength;
+    while (index + 4 <= end) {
+      hash = (hash + Math.imul(read32(tail, index), PRIME3)) | 0;
+      hash = Math.imul((hash << 17) | (hash >>> 15), PRIME4);
+      index += 4;
+    }
+    while (index < end) {
+      hash = (hash + Math.imul(tail[index] ?? 0, PRIME5)) | 0;
+      hash = Math.imul((hash << 11) | (hash >>> 21), PRIME1);
+      index += 1;
+    }
+    hash ^= hash >>> 15;
+    hash = Math.imul(hash, PRIME2);
+    hash ^= hash >>> 13;
+    hash = Math.imul(hash, PRIME3);
+    hash ^= hash >>> 16;
+    return hash >>> 0;
+  }
+}
