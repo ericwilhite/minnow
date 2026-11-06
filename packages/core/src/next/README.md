@@ -938,6 +938,10 @@ and the owner import it directly.
 - Spill pages (`spill-pages.ts`) are the spill contract's typed layout; every `VectorData`
   variant round-trips. `column-store.ts` is the chunked, charged row store operators keep rows
   in. Both are shared exec/ files (ruling R20.2) for aggregation spill and sort runs as well.
+  Store-to-store gathers bulk-copy fully checked contiguous spans of non-null int32/f64
+  storage (including safe int64), across chunk boundaries; other permutations and negative
+  row ids keep the ordinary gather. `exec/column-gather.bench.ts` isolates contiguous and
+  arbitrary gathers with prebuilt input and untimed result checks.
 - Inner, semi and right joins publish runtime filters (exact bitmap, split-block Bloom, bounds)
   when the build stays resident; a filter never drops a row that can match, and stops testing
   when it keeps over 90 % of probes.

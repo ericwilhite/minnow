@@ -2,7 +2,8 @@
  * The column store (exec/column-store.ts): exact values through every representation change,
  * appends that stop at a row boundary when refused, and charges that match what it holds.
  */
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
+import { createReach } from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import type { PhysicalType } from "../types.js";
 import type { Vector } from "../vector/vector.js";
@@ -232,3 +233,57 @@ describe("column store", () => {
     expect([0, 1, 4].map((i) => valueAt(vector, i))).toEqual([null, null, null]);
   });
 });
+
+const gatherReach = createReach("next-column-gather", [
+  "contiguous",
+  "interior-permuted",
+  "null-id",
+  "cross-chunk",
+]);
+afterAll(() => gatherReach.assertReached());
+
+// A near-contiguous permutation must not be mistaken for a contiguous span from endpoints.
+for (const seed of seedsFor("next-column-gather", [0xc021, 0x154]))
+  it(`contiguous and interior-permuted store gathers (seed ${String(seed)})`, () => {
+    const random = mulberry32(seed);
+    const ledger = new Ledger();
+    const types = [INT, DBL, BIG];
+    const n = 512;
+    const floats = Array.from({ length: n }, (_, i) =>
+      i % 11 === 0 ? NaN : i % 13 === 0 ? Infinity : i % 17 === 0 ? -0 : i / 4,
+    );
+    const ints = Array.from({ length: n }, (_, i) => i - 300);
+    const bigs = Array.from({ length: n }, (_, i) => BigInt(i) * 23n);
+    const columns = [ints, floats, bigs];
+    const source = new ColumnStore(types, ledger, { chunkRows: 64 });
+    expect(
+      source.append(
+        types.map((type, c) => vectorOf(type, columns[c] ?? [])),
+        null,
+        0,
+        n,
+      ),
+    ).toBe(n);
+    for (const mode of ["contiguous", "interior-permuted", "null-id"] as const) {
+      const start = 1 + Math.floor(random() * 40);
+      const ids = Int32Array.from({ length: 200 }, (_, i) => start + i);
+      if (mode === "interior-permuted") {
+        ids[73] = start + 74;
+        ids[74] = start + 73;
+      }
+      if (mode === "null-id") ids[73] = -1;
+      const out = new ColumnStore(types, ledger, { chunkRows: 64 });
+      expect(out.appendFrom(source, [0, 1, 2], ids, 0, ids.length)).toBe(ids.length);
+      types.forEach((_, c) =>
+        expect(storeValues(out, c), mode).toEqual(
+          [...ids].map((id) => (id < 0 ? null : columns[c]?.[id])),
+        ),
+      );
+      out.close();
+      gatherReach.beginHistory();
+      gatherReach.reach(mode);
+      if (start + ids.length > source.chunkRows) gatherReach.reach("cross-chunk");
+    }
+    source.close();
+    expect(ledger.held).toBe(0);
+  });
