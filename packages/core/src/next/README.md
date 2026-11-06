@@ -34,6 +34,26 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | `lower/`      | planner lowering                 | `Lowerer` (`lowerer.ts` contract, `create.ts`): front-end passes over the catalog, typing (`coerce.ts`, `expressions.ts`), queries (`query.ts`), FROM clauses, join order and subqueries (`from.ts`), access paths (`access-path.ts`), windows (`windows.ts`), plan building (`plan.ts`), DML and MERGE (`modify.ts`), DDL, table rules, result descriptors; an in-memory catalog; front-end inventory (`INVENTORY.md`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `owner/`      | ownership                        | Owner/client protocol (`protocol.ts`), wire payloads (re-exported from exec) and stream dictionaries (`frame.ts`), ledger routing (`outcomes.ts`), wire errors (`errors.ts`), client sequencing (`sequence.ts`), election, liveness and step-down (`election.ts`), public client API (`api.ts`), engine boundary and idle-transaction timer (`engine.ts`), planner port (`planner.ts`), the composed engine (`compose.ts`), the protocol server (`server.ts`) and client (`client.ts`), the owner worker runtime (`host.ts`), the port broker (`broker.ts`), the client-side election and lifecycle (`connector.ts`), Web Locks (`web-locks.ts`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
+## Write-path measurements
+
+Build core with `npx tsc -b packages/core`. Before rebuilding a candidate, copy the parent's
+`packages/core/dist` under `~/.cache` (with a `package.json` declaring `"type": "module"` in its
+parent directory). `scripts/write-insert-bench.mts --baseline <old-dist> --mode unique` measures
+the constraint-check component in Node CPU time. `--mode single --durability relaxed|strict`
+measures prepared one-row commits after a 100k-row table; `--mode load --load-mode tx|commits`
+includes the durable million-row load and maintenance. Run with plain `node`, using the built
+modules, and set `TMPDIR` under `~/.cache`.
+
+`scripts/write-browser-bench.mts --baseline <old-dist> --output ~/.cache/<run>` bundles those
+built modules into real OPFS workers in a persistent Chromium profile on disk. The same mode
+and durability options apply. The default is six interleaved old/new pairs after a discarded
+warmup pair, with 20,000 relaxed singles or 2,000 strict singles. It reports renderer CPU
+(including JIT/GC), dedicated-worker CPU, whole-browser CPU and wall time separately. `--profile`
+adds two untimed passes. A fresh worker reopens each completed database and checks its row and
+index counts. This is an owner-side component benchmark; it does not time SQL, the executor or
+client transport, compare SQLite, or certify power-loss safety. Neither script publishes its
+local numbers to the benchmark site.
+
 ## Cross-track interfaces (owned by the implementing track)
 
 These integration interfaces are deliberately not frozen here. Each is the first deliverable of
