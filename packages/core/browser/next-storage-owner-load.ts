@@ -11,6 +11,7 @@ import { createLowerer } from "../src/next/lower/create.js";
 import { EXECUTOR_COSTS } from "../src/next/exec/executor.js";
 import { autocommit } from "../src/next/write/test-support.js";
 import type { WritePathImpl } from "../src/next/write/engine.js";
+import { KeyBatch, encodeKeyBatch } from "../src/next/keys/key-encoding.js";
 import type { PhysicalType } from "../src/next/types.js";
 import type { FlatVector, Batch } from "../src/next/vector/vector.js";
 import { openRealStorage, type OwnerReopenStore } from "./next-storage-owner-reopen.js";
@@ -81,6 +82,7 @@ export async function loadOwnerDataset(
   dataset: OwnerDataset,
   progress: (message: string) => void,
   testRows?: number,
+  resume = false,
 ) {
   const lowerer = createLowerer();
   const ddl = async (text: string) => {
@@ -102,10 +104,66 @@ export async function loadOwnerDataset(
   if (dataset === "W5M") {
     const rows = testRows ?? 5_000_000;
     const spec = wideSpec(200);
-    await ddl(
-      `CREATE TABLE events_wide (${spec.map((column) => `${column.name} ${column.minnow}`).join(", ")})`,
-    );
-    for (let start = 0; start < rows; start += BATCH_ROWS) {
+    const existing = path.catalog.tableByName("events_wide");
+    let loaded = 0;
+    if (existing === undefined) {
+      await ddl(
+        `CREATE TABLE events_wide (${spec.map((column) => `${column.name} ${column.minnow}`).join(", ")})`,
+      );
+    } else {
+      if (!resume) throw new Error("Actual-data builder requires a fresh fact table");
+      if (
+        existing.columns.length !== spec.length ||
+        existing.columns.some((column, index) => {
+          const expected = spec[index];
+          if (column.name !== expected?.name) return true;
+          const type = typeOf(expected);
+          return (
+            Object.keys(column.type).length !== Object.keys(type).length ||
+            Object.entries(type).some(([key, value]) => Reflect.get(column.type, key) !== value)
+          );
+        })
+      )
+        throw new Error("Resume refuses a fact schema that differs from the canonical generator");
+      loaded = path.statistics(existing.id)?.rowCount ?? -1;
+      if (
+        !Number.isSafeInteger(loaded) ||
+        loaded < 0 ||
+        loaded > rows ||
+        (loaded !== rows && loaded % BATCH_ROWS !== 0)
+      )
+        throw new Error("Resume requires a complete canonical batch prefix");
+      if (loaded > 0) {
+        if (existing.primaryKey === null)
+          throw new Error("Resume requires the canonical primary key");
+        const view = path.pin();
+        const keys = new KeyBatch(path.shared.budget);
+        try {
+          const ids: FlatVector = {
+            form: "flat",
+            type: { kind: "int64" },
+            length: 2,
+            validity: null,
+            data: { layout: "int64", values: { repr: "safe", values: Float64Array.of(1, loaded) } },
+          };
+          encodeKeyBatch(
+            "equality",
+            [{ vector: ids, direction: "asc", nulls: "first" }],
+            { length: 2, selection: null },
+            keys,
+          );
+          const found = { probes: new Int32Array(2), locators: new Float64Array(2), count: 0 };
+          await view.index(existing.id, existing.primaryKey).probe(keys, found);
+          if (found.count !== 2)
+            throw new Error("Resume refuses a prefix missing its first or last generated key");
+        } finally {
+          keys.close();
+          view.release();
+        }
+      }
+      progress(`resuming canonical fact prefix ${String(loaded)}/${String(rows)}`);
+    }
+    for (let start = loaded; start < rows; start += BATCH_ROWS) {
       const count = Math.min(BATCH_ROWS, rows - start);
       await insert(
         "events_wide",
@@ -114,6 +172,12 @@ export async function loadOwnerDataset(
       progress(`events_wide ${String(start + count)}/${String(rows)}`);
     }
     for (const dimension of dimensionTables()) {
+      const present = path.catalog.tableByName(dimension.name);
+      if (present !== undefined) {
+        if (!resume || path.statistics(present.id)?.rowCount !== dimension.rows.length)
+          throw new Error("Resume refuses an incomplete dimension");
+        continue;
+      }
       await ddl(
         `CREATE TABLE ${dimension.name} (k TEXT PRIMARY KEY, label TEXT, tier TEXT, weight DOUBLE PRECISION, active BOOLEAN)`,
       );
@@ -176,13 +240,28 @@ export async function buildOwnerDataset(
   dataset: OwnerDataset,
   progress: (message: string) => void,
   testRows?: number,
+  loadGovernorBytes = 256 << 20,
+  resume = false,
 ) {
-  const opened = await openRealStorage(store, db);
+  const opened = await openRealStorage(store, db, undefined, undefined, loadGovernorBytes);
   const started = performance.now();
   try {
-    if (opened.path.catalog.tables.length !== 0)
-      throw new Error("Actual-data builder requires an empty store");
-    await loadOwnerDataset(opened.path, dataset, progress, testRows);
+    const nonempty = opened.path.catalog.tables.length !== 0;
+    if (nonempty && (!resume || dataset !== "W5M"))
+      throw new Error("Actual-data builder requires an empty store unless W5M resume is explicit");
+    const resumedFromRows = nonempty
+      ? opened.path.statistics(opened.path.catalog.tableByName("events_wide")?.id ?? 0)?.rowCount
+      : 0;
+    if (nonempty) {
+      if (opened.path.catalog.tableByName("events_wide") === undefined)
+        throw new Error("Resume requires an existing canonical fact table");
+      const allowed = ["events_wide", ...dimensionTables().map((table) => table.name)];
+      if (opened.path.catalog.tables.some((table) => !allowed.includes(table.name)))
+        throw new Error("Resume refuses unrelated tables");
+      await opened.path.quiesce();
+      await opened.space.audit();
+    }
+    await loadOwnerDataset(opened.path, dataset, progress, testRows, resume);
     const records =
       store === "indexeddb"
         ? await new Promise<Record<string, number>>((resolve, reject) => {
@@ -211,6 +290,9 @@ export async function buildOwnerDataset(
           })
         : null;
     return {
+      loadGovernorBytes,
+      resumedFromRows,
+      maintenance: { ...opened.path.maintenance },
       records,
       buildMs: performance.now() - started,
       rows: opened.path.catalog.tables.map((table) => ({

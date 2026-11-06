@@ -11,6 +11,7 @@ import {
   type OwnerPhase,
 } from "./next-storage-owner-reopen.js";
 import { FakeLockRegistry } from "../src/next/testing/fake-locks.js";
+import { Governor } from "../src/next/memory/governor.js";
 import { SimDisk } from "../src/next/storage/sim-disk.js";
 import {
   autocommit,
@@ -43,6 +44,7 @@ it("counts cloned record bytes and the numeric fields of persisted index entries
   }
 });
 
+import { loadOwnerDataset } from "./next-storage-owner-load.js";
 import { OwnerPhaseMeter } from "./next-storage-owner-phase.js";
 
 it("keeps wall time and reads between synchronous wall-only checkpoints", async () => {
@@ -96,6 +98,7 @@ it("keeps reads arriving during a CPU-sampling wait without charging the wait to
 });
 
 it("captures ready in the real host callback and counts through the real recovered write path", async () => {
+  const admissions = vi.spyOn(Governor.prototype, "admit");
   const locks = new FakeLockRegistry().context();
   const disk = new SimDisk();
   const directory = {
@@ -111,6 +114,13 @@ it("captures ready in the real host callback and counts through the real recover
   try {
     const seed = await openRealStorage("opfs", "unit-ready-endpoint");
     try {
+      const startup = admissions.mock.results.find(
+        (_, index) => admissions.mock.calls[index]?.[0].label === "extent space startup",
+      );
+      if (startup?.type !== "return") throw new Error("Startup was not admitted");
+      const grant = await startup.value;
+      expect(grant.allocated).toBe(0);
+      expect(grant.held).toBe(0); // completed startup must not obstruct writer/merge admission
       await autocommit(seed.path, (statement) =>
         statement.changeCatalog({
           kind: "createTable",
@@ -152,6 +162,38 @@ it("captures ready in the real host callback and counts through the real recover
     ]);
   } finally {
     await owner?.close();
+    vi.unstubAllGlobals();
+    admissions.mockRestore();
+    locks.kill();
+  }
+});
+
+it("validates and resumes an already completed canonical load without duplicating rows", async () => {
+  const locks = new FakeLockRegistry().context();
+  const disk = new SimDisk();
+  const directory = {
+    getFileHandle: async (name: string) => ({
+      createSyncAccessHandle: async () => disk.open(name, true),
+    }),
+  };
+  vi.stubGlobal("navigator", {
+    locks,
+    storage: { getDirectory: async () => ({ getDirectoryHandle: async () => directory }) },
+  });
+  const opened = await openRealStorage("opfs", "resume-unit", undefined, undefined, 512 << 20);
+  try {
+    await loadOwnerDataset(opened.path, "W5M", () => undefined, 1000);
+    const before = opened.path.catalog.tables.map(
+      (table) => opened.path.statistics(table.id)?.rowCount,
+    );
+    await loadOwnerDataset(opened.path, "W5M", () => undefined, 1000, true);
+    expect(opened.governor.capBytes).toBe(512 << 20);
+    expect(
+      opened.path.catalog.tables.map((table) => opened.path.statistics(table.id)?.rowCount),
+    ).toEqual(before);
+    expect(before).toEqual([1000, 50, 100, 1000]);
+  } finally {
+    await opened.close();
     vi.unstubAllGlobals();
     locks.kill();
   }

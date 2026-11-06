@@ -150,11 +150,12 @@ export async function openRealStorage(
   db: string,
   phase: (phase: OwnerPhase) => void | Promise<void> = () => undefined,
   started = performance.now(),
+  capBytes = 256 << 20,
 ) {
   const counts: ReadCounts = { payloadBytes: 0, numericBytes: 0, reads: 0 };
   const meter = new OwnerPhaseMeter(counts, phase, () => performance.now(), started);
   const finish = (name: OwnerReopenPhase) => meter.finish(name);
-  const governor = new Governor(256 << 20);
+  const governor = new Governor(capBytes);
   const backend = await backendFor(store, `b1-owner-data-${db}`, counts, governor);
   const lease = await backend.acquire({ timeoutMs: 30_000 });
   const session = await backend.open(lease);
@@ -170,6 +171,9 @@ export async function openRealStorage(
     budget: startup,
     registerCache: (cache) => governor.registerCache(cache),
   });
+  // The extent-space startup pipeline has finished. Keep its spillable handle usable for an
+  // explicit later audit, but return its unused admission before the writer starts.
+  startup.release(startup.held - startup.allocated);
   await finish("space");
   const path = await WritePathImpl.open({
     session,

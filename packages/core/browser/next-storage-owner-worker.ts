@@ -13,6 +13,8 @@ export interface OwnerBenchRequest {
   dataset: OwnerDataset;
   cpu: boolean;
   testRows?: number;
+  loadGovernorBytes?: number;
+  resume?: boolean;
 }
 const barriers = new Map<number, () => void>();
 let next = 0;
@@ -36,6 +38,8 @@ self.onmessage = (event: MessageEvent<OwnerBenchRequest | { ack: number }>) => {
         request.dataset,
         (message) => self.postMessage({ progress: message }),
         request.testRows,
+        request.loadGovernorBytes,
+        request.resume,
       );
     const phases: OwnerPhase[] = [];
     const phase = (value: OwnerPhase) => {

@@ -1407,3 +1407,11 @@ before awaiting a CPU checkpoint, so reads arriving during that wait are kept in
 interval. Wall-only checkpoints are synchronous. Intervals after write-path open may include
 its background maintenance; they are not causal CPU/I/O attribution to the host or count query.
 The report includes write-path maintenance counters at ready and after the first count.
+
+The harness returns its unused extent-space startup reservation before opening the write path.
+`MINNOW_OWNER_REOPEN_LOAD_MIB` selects the load governor only; reopens remain at 256 MiB.
+`MINNOW_OWNER_REOPEN_RESUME=1` explicitly continues an interrupted W5M load after recovery,
+quiescence, physical/list audit, schema and complete-batch-prefix checks, and first/last key
+probes. It preserves the canonical 50,000-row transactions and generator values. The report
+records the load budget and resumed row count. A failed 256 MiB load is a separate result and
+is not treated as successful completion within that cap when loading continues at 512 MiB.

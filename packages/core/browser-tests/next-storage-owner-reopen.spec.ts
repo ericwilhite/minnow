@@ -61,6 +61,8 @@ for (const store of ["opfs", "indexeddb"] as const)
           dataset,
           db,
           cpu: false,
+          loadGovernorBytes: Number(process.env.MINNOW_OWNER_REOPEN_LOAD_MIB ?? 256) * 1024 * 1024,
+          resume: process.env.MINNOW_OWNER_REOPEN_RESUME === "1",
           ...(testRows === undefined ? {} : { testRows }),
         };
         const run = async (request: OwnerBenchRequest): Promise<ReopenResult> =>
@@ -115,6 +117,9 @@ for (const store of ["opfs", "indexeddb"] as const)
           store,
           testRows: testRows ?? null,
           governorBytes: 256 << 20,
+          load:
+            (build as { result?: { loadGovernorBytes?: number; resumedFromRows?: number } })
+              .result ?? null,
           executor: "unused stand-in at startup; first count is statistics-only",
           cache:
             "fresh worker/backend; OS/browser disk caches not dropped; test-only cached-byte rehash guard off",
