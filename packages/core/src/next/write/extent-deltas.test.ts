@@ -608,4 +608,73 @@ describe("the sink's retire list (B1's question)", () => {
     await harness.space.audit();
     await harness.close();
   });
+
+  it("with no pin, a retired page waits for the next publish like a released extent: the previous root stays intact (R8)", async () => {
+    // R8 (storage/extents.ts): space retired by the publish of generation g is reused only once
+    // g + 1 is durable; until then the other root slot holds g − 1, the root a reopen may choose,
+    // so whatever it reaches must stay readable. Every writer of generation g allocates before
+    // g + 1 is durable: none may get the page, nor a `released` extent of the same publication.
+    const harness = new Harness("strict", "memory", 4, undefined, { merges: { mode: "off" } });
+    let page: { offset: number; length: number } | null = null;
+    let retireNow = false;
+    // Set by the sink's callbacks: -1 while the retiring attempt is prepared, then its generation.
+    const retire = { at: null as number | null };
+    let releasedWith: Array<{ offset: number; length: number }> = [];
+    const allocated: Array<{ offset: number; length: number; generation: number }> = [];
+    harness.extentDeltas = {
+      prepare: async (_attempt, delta) => {
+        const generation = harness.space.generation;
+        for (const extent of delta.added) allocated.push({ ...extent, generation });
+        if (page === null && delta.added.length > 0) {
+          page = need((await delta.writer.write([new Uint8Array([1, 2, 3])])).blobs[0]).extent;
+          return null;
+        }
+        if (retireNow && page !== null && delta.released.length > 0) {
+          retireNow = false;
+          releasedWith = [...delta.released];
+          retire.at = -1;
+          return { pages: [], retire: [page] };
+        }
+        return null;
+      },
+      commit: () => {
+        if (retire.at === -1) retire.at = harness.space.generation;
+      },
+      abort: () => undefined,
+    };
+    const path = await harness.open();
+    const t = await oneTable(path);
+    let next = 0;
+    const flush = async () => {
+      for (const ids of [[next++, next++, next++, next++], [next++]])
+        await autocommit(path, (s) => s.table(t).insert(batch(ints(ids)), null));
+      await path.quiesce();
+    };
+    await flush();
+    retireNow = true;
+    // Deletes give the next flushes `released` extents (folded bitmaps), so the retire rides one.
+    for (let k = 0; k < 8 && (retire.at === null || retire.at < 0); k++) {
+      await autocommit(path, (s) => s.table(t).delete(batch(locators([k * 1], t)), null)).catch(
+        () => undefined,
+      );
+      await flush();
+    }
+    expect(retire.at, "a publication retired the page with released extents").not.toBeNull();
+    const g = retire.at ?? -1;
+    for (let k = 0; k < 6; k++) await flush();
+    const overlaps =
+      (target: { offset: number; length: number }) =>
+      (extent: { offset: number; length: number }) =>
+        extent.offset < target.offset + target.length &&
+        target.offset < extent.offset + extent.length;
+    // Allocated while generation g was current (before g + 1 was durable).
+    const early = allocated.filter((extent) => extent.generation === g);
+    expect(early.length, "the next publication allocated extents").toBeGreaterThan(0);
+    expect(early.filter(overlaps(page as unknown as { offset: number; length: number }))).toEqual(
+      [],
+    );
+    for (const extent of releasedWith) expect(early.filter(overlaps(extent))).toEqual([]);
+    await harness.space.audit();
+    await harness.close();
+  });
 });
