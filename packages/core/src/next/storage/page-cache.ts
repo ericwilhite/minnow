@@ -378,7 +378,8 @@ export class PageCache implements EvictableCacheLike {
         this.#unlist(existing);
         existing.segment = "pinned";
         this.#pinnedBytes += existing.length;
-        this.#memory?.release(charge(existing));
+        // Its blob bytes move to the lease; an attached descriptor stays charged here (B2-p2e).
+        this.#memory?.release(base(existing));
       }
       existing.pins += 1;
       return existing;
