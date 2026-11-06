@@ -663,7 +663,8 @@ and the owner import it directly.
   compared counts toward a 256 KiB step budget, and a spent step yields when its slice is due —
   inside one key, a collision chain, a mark join's candidates and its compatibility tests. A
   composite key with text or bytes length-prefixes them instead of escaping them (equality
-  needs no order), so encoding a value is one copy.
+  needs no order). A batch's encoded keys get one buffer of their exact size, charged before it
+  is allocated, and each value is copied into it once, in budgeted pieces (no regrowth copies).
 - The build store and table are allocated from the join's spillable grant. A dense integer key
   is direct-addressed; others use open addressing with the key's words inline. Matched outputs
   reuse probe key vectors for build key columns that are identical in representation.

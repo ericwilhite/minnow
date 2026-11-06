@@ -17,7 +17,9 @@
  *   bytes or enum column as a header byte (0 null, 1 a value), its byte length (4 bytes) and
  *   its bytes as stored. Each part is self-delimiting, so equal keys are exactly equal bytes.
  *   Text is not escaped (escaping exists for memcomparable order, which equality does not
- *   need: review B7-p2c-3 #4), so a value costs one copy, made in steps of key work.
+ *   need: review B7-p2c-3 #4). The batch's keys get one buffer of their exact size (every part's
+ *   length is known first), charged before it exists, and each value is copied into it once in
+ *   pieces of key work: no regrowth copies a written prefix (review B7-p2c-4).
  * - JSON, arrays and locators are not join keys here (`UnsupportedPlanError`): their equality is
  *   semantic (exec/semantic.ts), so lowering must not plan a hash join on them.
  * - NULL: a key column compared with `=` makes the row unmatched (`nulls` bit set). With
@@ -204,6 +206,8 @@ export class KeyScratch {
   readonly encoded: KeyBatch | null;
   /** `enc` with text, bytes or enum columns: the persisted encoding of the other columns. */
   readonly encodedParts: KeyBatch | null;
+  /** What `encoded`'s buffer is charged to (its one sized allocation per batch, `encodeJob`). */
+  readonly encodedCharge: ByteCharge;
   /** Rows with a null in a key compared with `=` (they never match). */
   unmatchable = 0;
   /** When `extractKeys` stopped early: the bytes the encoder was refused (else 0). */
@@ -225,6 +229,7 @@ export class KeyScratch {
     this.hashes = new Uint32Array(capacity);
     this.hashes2 = new Uint32Array(capacity);
     this.slots = new Int32Array(capacity);
+    this.encodedCharge = encodedCharge;
     this.encoded = layout.family === "enc" ? new KeyBatch(encodedCharge, 1 << 30) : null;
     this.encodedParts =
       layout.rawColumns.length > 0 && layout.encodedColumns.length > 0
@@ -520,6 +525,43 @@ function* encodeJob(
   }
   encoded.offsets[0] = 0;
   const raw = layout.rawColumns;
+  // Every part's encoded length is known before any copy (the persisted part, then per varlen
+  // column a header, a 4-byte length and the bytes): the batch's keys get one buffer of their
+  // exact size, charged before it exists, so no regrowth ever copies a written prefix (review
+  // B7-p2c-3 #4 / B7-p2c-4). When the grant refuses, as many leading rows as fit (at least one).
+  const ends = new Float64Array(n + 1);
+  for (let k = 0; k < n; k++) {
+    const row = selection.rows[k] ?? 0;
+    let size = parts === null ? 0 : (parts.offsets[k + 1] ?? 0) - (parts.offsets[k] ?? 0);
+    for (const c of raw) {
+      const vector = keys[c];
+      if (vector === undefined) continue;
+      const slot = sourceSlot(vector, row);
+      if (slot < 0) size += 1;
+      else {
+        const offsets = (flatOf(vector).data as { offsets: Int32Array }).offsets;
+        size += 5 + (offsets[slot + 1] ?? 0) - (offsets[slot] ?? 0);
+      }
+    }
+    ends[k + 1] = (ends[k] ?? 0) + size;
+  }
+  if (work.spend(8 * n, slice)) yield;
+  for (;;) {
+    const total = ends[n] ?? 0;
+    if (total <= writer.bytes.length) break;
+    if (out.encodedCharge.allocate(total)) {
+      // The writer is empty (reset): nothing is copied into the new buffer.
+      out.encodedCharge.free(writer.bytes.length);
+      writer.bytes = new Uint8Array(total);
+      break;
+    }
+    if (n === 1) {
+      out.requiredBytes = total;
+      return 0;
+    }
+    n = Math.max(1, n >> 1);
+    out.requiredBytes = total;
+  }
   for (let k = 0; k < n; k++) {
     const row = selection.rows[k] ?? 0;
     const keyStart = writer.length;

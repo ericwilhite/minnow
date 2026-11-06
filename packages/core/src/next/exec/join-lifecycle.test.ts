@@ -800,6 +800,74 @@ describe("review B7-p2c-3 #4: encoded join keys copy text once, in steps", () =>
       expect(sync.hashes[0]).toBe(scratch.hashes[0]);
     }, 60_000);
 
+  // Review B7-p2c-4 (its probe): every copy counts, buffer growth included. Each step's bytes
+  // copied by Uint8Array.prototype.set (the writer's pieces, and any regrowth of the buffer
+  // copying the written prefix) must stay within the budget.
+  it("a 10 MiB key's copies, buffer growth included, stay within each step's budget", () => {
+    const [batch] = [...batchesOf(types2, [["x".repeat(10 << 20), 1]])];
+    if (batch === undefined) throw new Error("no batch");
+    const scratch = new KeyScratch(new KeyLayout(types2, [false, false]), 1, FREE);
+    const work = new KeyWork();
+    const job = extractKeysJob(batch.columns, null, 0, 1, scratch, work, due);
+    let copied = 0;
+    let most = 0;
+    let largest = 0;
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- called with `this` below
+    const set = Uint8Array.prototype.set;
+    const spy = vi.spyOn(Uint8Array.prototype, "set").mockImplementation(function (
+      this: Uint8Array,
+      source: ArrayLike<number>,
+      offset?: number,
+    ) {
+      copied += source.length;
+      largest = Math.max(largest, source.length);
+      set.call(this, source, offset);
+    });
+    try {
+      for (;;) {
+        copied = 0;
+        const step = job.next();
+        most = Math.max(most, copied);
+        if (step.done === true) break;
+        due.reset();
+      }
+    } finally {
+      spy.mockRestore();
+    }
+    expect(most).toBeLessThanOrEqual(KEY_STEP_BYTES + 8192);
+    expect(largest).toBeLessThanOrEqual(KEY_STEP_BYTES + 8192);
+    expect(scratch.encoded?.writer.length).toBe((10 << 20) + 10);
+  }, 60_000);
+
+  it("a batch whose keys the grant refuses whole encodes the leading rows that fit", () => {
+    // Two 1 MiB keys; the charge holds one of them (plus the scratch), not both.
+    let held = 0;
+    const charge = {
+      allocate: (bytes: number) => {
+        if (held + bytes > 1.5 * (1 << 20)) return false;
+        held += bytes;
+        return true;
+      },
+      free: (bytes: number) => {
+        held -= bytes;
+      },
+    };
+    const rows: Row[] = [
+      ["a".repeat(1 << 20), 1],
+      ["b".repeat(1 << 20), 2],
+    ];
+    const [batch] = [...batchesOf(types2, rows)];
+    if (batch === undefined) throw new Error("no batch");
+    const scratch = new KeyScratch(new KeyLayout(types2, [false, false]), 2, charge);
+    const done = runToEnd(
+      extractKeysJob(batch.columns, null, 0, 2, scratch, new KeyWork(), due),
+      due,
+    );
+    expect(done).toBe(1);
+    expect(scratch.requiredBytes).toBeGreaterThan(2 << 20);
+    expect(scratch.encoded?.writer.length).toBe((1 << 20) + 10);
+  });
+
   // Law: two encoded keys are equal exactly when the tuples are equal under SQL equality (the
   // module comment of join-keys.ts). Generated tuples of (text, text, int) with NULLs, empty
   // strings, and 0x00 / 0x01 bytes (the null and value headers) at every boundary, where a
