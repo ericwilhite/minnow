@@ -49,6 +49,7 @@ import {
   type ByteBudget,
   type ExtentReader,
   type ReadLease,
+  type ReadOptions,
 } from "../storage/extents.js";
 import type { FlatVector, Validity } from "../vector/vector.js";
 import { provenSafe } from "../vector/int64.js";
@@ -655,7 +656,7 @@ export class ChunkReader {
       const batch = jobs.slice(start, end);
       const lease = await space.read(
         batch.map(({ reader, entry }) => blobOf(reader.chunk, entry)),
-        options,
+        options.once === true ? { ...options, reuseBuffers: true } : options,
       );
       const shared = new SharedLease(lease, batch.length);
       // `#settle` takes over one hold on the lease per job, success or failure; a reader closed
@@ -779,18 +780,26 @@ export class ChunkReader {
         inflated: ref,
       });
     }
+    // The dictionary page goes alone, never into a reused buffer (its vector is handed out and
+    // may outlive the reader); pages may (`#pageReads`).
+    jobs.sort((a, b) => (a.page === null ? 1 : 0) - (b.page === null ? 1 : 0));
     let start = 0;
     while (start < jobs.length) {
       let end = start;
       let bytes = 0;
-      while (end < jobs.length && bytes + at(jobs, end).entry.length <= MAX_READ_BYTES)
+      const dictionary = at(jobs, start).page === null;
+      while (
+        end < jobs.length &&
+        (at(jobs, end).page === null) === dictionary &&
+        bytes + at(jobs, end).entry.length <= MAX_READ_BYTES
+      )
         bytes += at(jobs, end++).entry.length;
       if (end === start) end++;
       const batch = jobs.slice(start, end);
       if (this.#closed) throw new ReaderClosedError();
       const lease = await this.#space.read(
         batch.map(({ entry }) => blobOf(this.chunk, entry)),
-        this.#options,
+        batch.some(({ page }) => page === null) ? this.#options : this.#pageReads,
       );
       const shared = new SharedLease(lease, batch.length);
       // `#settle` takes over one hold on the lease per job, success or failure.
@@ -955,6 +964,14 @@ export class ChunkReader {
         bytes,
       );
     return dictionary;
+  }
+
+  /**
+   * Read options for page loads: a one-pass reader lets the space reuse its page buffers once a
+   * lease is released (`ReadOptions.reuseBuffers`): its views of page bytes die with the page.
+   */
+  get #pageReads(): ReadOptions {
+    return this.#options.once === true ? { ...this.#options, reuseBuffers: true } : this.#options;
   }
 
   /** How this reader pins cached directories and inflated pages (one-pass: not a use). */

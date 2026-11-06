@@ -118,7 +118,9 @@
  * - `peek` serves a cached blob synchronously, with no lease and no charge, for the warm
  *   point-read path (owner-side ≤ 10 µs, ruling R6): the bytes are valid until the caller next
  *   yields. Cache buffers are never pooled or reused, so a peeked or leased array is never
- *   overwritten, only uncharged.
+ *   overwritten, only uncharged. The one exception is a one-pass read that asks for it
+ *   (`ReadOptions.reuseBuffers`): its private buffer returns to a pool when the lease is
+ *   released (in test builds it is poisoned then), so the caller keeps nothing past release.
  * - Writes go around the cache. Freeing an extent drops its cached blobs in the same step, before
  *   the space can reallocate it.
  *
@@ -291,6 +293,14 @@ export interface ReadOptions {
    * ordinary use during such a pin counts as usual. Default false.
    */
   readonly once?: boolean;
+  /**
+   * With `once`: the lease's bytes may live in a pooled buffer that is reused once the lease is
+   * released, so the caller keeps no view of them past `release` (a reader's page bytes, never
+   * a dictionary or value it hands out). The lease is charged for the whole buffer. Bounds RSS
+   * for a one-pass scan, whose released buffers would otherwise wait for the collector. Default
+   * false: every array a lease hands out is never reused.
+   */
+  readonly reuseBuffers?: boolean;
 }
 
 export interface ReadLease {
@@ -442,6 +452,8 @@ export interface SpaceStats {
   readonly relocations: number;
   readonly cache: {
     readonly residentBytes: number;
+    /** Idle pooled one-pass buffers (`ReadOptions.reuseBuffers`), charged to the cache. */
+    readonly poolBytes: number;
     /** Bytes in the protected segment (blobs used more than once). */
     readonly protectedBytes: number;
     readonly pinnedBytes: number;

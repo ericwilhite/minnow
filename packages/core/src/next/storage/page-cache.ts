@@ -109,6 +109,8 @@ export interface CacheStats {
   readonly residentBytes: number;
   /** Bytes in the protected segment (entries used more than once), descriptors included. */
   readonly protectedBytes: number;
+  /** Idle pooled one-pass buffers (`ReadOptions.reuseBuffers`), charged to the cache. */
+  readonly poolBytes: number;
   readonly pinnedBytes: number;
   readonly hits: number;
   readonly misses: number;
@@ -118,9 +120,30 @@ export interface CacheStats {
 
 /** The slab buffers a one-pass lease owns: its gap bytes, its blobs' bytes, its views. */
 interface OwnedSlabs {
+  /** Bytes charged to the lease beyond its blobs: gaps inside slabs, or a pooled buffer's rest. */
   gaps: number;
   bytes: number;
   readonly views: Array<{ readonly bytes: Uint8Array; readonly checksum: number }>;
+  /** The pooled buffer the lease's views live in (`ReadOptions.reuseBuffers`), or null. */
+  pooled: ArrayBuffer | null;
+}
+
+const align8 = (bytes: number): number => (bytes + 7) & ~7;
+
+/** Pooled one-pass buffers come in powers of two from this size... */
+export const POOL_MIN_BUFFER = 64 * 1024;
+/** ...to this (a larger read gets buffers of its own). */
+export const POOL_MAX_BUFFER = 16 * 1024 * 1024;
+/** At most this many idle pooled bytes are kept (charged to the cache); the rest are dropped. */
+export const POOL_IDLE_BYTES = 64 * 1024 * 1024;
+/** What a released pooled buffer is filled with in test builds, so a stale view reads garbage. */
+const POISON = 0xa5;
+
+/** The pooled buffer size for `bytes`, or null when it is past `POOL_MAX_BUFFER`. */
+function poolClass(bytes: number): number | null {
+  let size = POOL_MIN_BUFFER;
+  while (size < bytes) size *= 2;
+  return size <= POOL_MAX_BUFFER ? size : null;
 }
 
 /** What an unpinned entry is charged: its bytes, its overhead and any attached descriptor. */
@@ -172,6 +195,10 @@ export class PageCache implements EvictableCacheLike {
   #memory: CacheMemory | null = null;
   #slabBusy: Promise<void> = Promise.resolve();
   #pinnedBytes = 0;
+  /** Idle pooled one-pass buffers by size, and their bytes (charged to the cache). */
+  readonly #pool = new Map<number, ArrayBuffer[]>();
+  #poolIdle = 0;
+  readonly #poolLimit: number;
   /** Entries pinned only by one-pass reads, still listed where they were (review B2-p2h #1). */
   readonly #listedPinned = new Set<Entry>();
   #hits = 0;
@@ -180,8 +207,10 @@ export class PageCache implements EvictableCacheLike {
   #bytesRead = 0;
   #closed = false;
 
-  constructor(session: StoreSession) {
+  /** `poolIdleBytes`: the idle pooled bytes kept (default `POOL_IDLE_BYTES`). */
+  constructor(session: StoreSession, options: { readonly poolIdleBytes?: number } = {}) {
     this.#session = session;
+    this.#poolLimit = options.poolIdleBytes ?? POOL_IDLE_BYTES;
   }
 
   /** Connects the governor's handle and charges the fixed slabs (`RangeError` if it cannot). */
@@ -200,6 +229,7 @@ export class PageCache implements EvictableCacheLike {
     }
     return {
       residentBytes: this.#probation.bytes + this.#protected.bytes + this.#pinnedBytes,
+      poolBytes: this.#poolIdle,
       protectedBytes: this.#protected.bytes - protectedPinned,
       pinnedBytes: this.#pinnedBytes + listedPinned,
       hits: this.#hits,
@@ -215,6 +245,7 @@ export class PageCache implements EvictableCacheLike {
     let pinned = 0;
     for (const entry of this.#listedPinned) pinned += charge(entry);
     return (
+      this.#poolIdle +
       this.#probation.bytes +
       this.#protected.bytes +
       ENTRY_OVERHEAD * (this.#probation.count + this.#protected.count) -
@@ -224,11 +255,13 @@ export class PageCache implements EvictableCacheLike {
 
   /** When the entry `evict` takes next was last used (the governor's cross-cache order). */
   get oldestUnusedAt(): number | undefined {
+    // Idle pooled buffers are the cheapest bytes to give back: they go first.
+    if (this.#poolIdle > 0) return 0;
     return this.#victim()?.usedAt;
   }
 
   evict(bytes: number): number {
-    let freed = 0;
+    let freed = this.#trimPool(bytes);
     while (freed < bytes) {
       const victim = this.#victim();
       if (victim === null) break;
@@ -311,7 +344,7 @@ export class PageCache implements EvictableCacheLike {
     if (!budget.allocate(total)) throw new ReadDeniedError(total);
     const held: Entry[] = [];
     const resolved = new Map<string, Uint8Array>();
-    const owned: OwnedSlabs = { gaps: 0, bytes: 0, views: [] };
+    const owned: OwnedSlabs = { gaps: 0, bytes: 0, views: [], pooled: null };
     try {
       const misses: Array<{ readonly key: string; readonly ref: BlobRef }> = [];
       let uncharge = 0;
@@ -342,13 +375,22 @@ export class PageCache implements EvictableCacheLike {
       // Hits are pinned before the cache's charge goes back: a nested eviction cannot take them.
       if (uncharge > 0) this.#memory?.release(uncharge);
       if (misses.length > 0) {
-        if (options.once === true) await this.#readPrivate(misses, resolved, signal, budget, owned);
+        if (options.once === true)
+          await this.#readPrivate(
+            misses,
+            resolved,
+            signal,
+            budget,
+            owned,
+            options.reuseBuffers === true,
+          );
         else await this.#readMisses(misses, held, resolved, signal);
       }
     } catch (error) {
       this.#unpinAll(held, options.once === true);
       this.#pinnedBytes -= owned.bytes;
       budget.free(total + owned.gaps);
+      this.#givePooled(owned);
       throw error;
     }
     const bytes = refs.map((ref) => {
@@ -370,6 +412,7 @@ export class PageCache implements EvictableCacheLike {
         this.#unpinAll(held, options.once === true);
         this.#pinnedBytes -= owned.bytes;
         budget.free(total + owned.gaps);
+        this.#givePooled(owned);
       },
     };
   }
@@ -435,6 +478,7 @@ export class PageCache implements EvictableCacheLike {
     signal: AbortSignal | undefined,
     budget: ByteBudget,
     owned: OwnedSlabs,
+    reuse: boolean,
   ): Promise<void> {
     // Each slab is this lease's own buffer, so it may be as large as a read (not the shared slab).
     const slabs = planSlabs(
@@ -449,14 +493,27 @@ export class PageCache implements EvictableCacheLike {
       gaps += Math.max(0, slab.length - inside);
       members += inside;
     }
-    if (gaps > 0 && !budget.allocate(gaps)) throw new ReadDeniedError(gaps);
-    owned.gaps = gaps;
+    // With `reuse`, every slab goes into one pooled buffer at 8-byte offsets, and the lease is
+    // charged for the whole buffer (its rest instead of the gaps).
+    let packed = 0;
+    for (const slab of slabs) packed += align8(slab.length);
+    const size = reuse ? poolClass(packed) : null;
+    const extra = size === null ? gaps : size - members;
+    if (extra > 0 && !budget.allocate(extra)) throw new ReadDeniedError(extra);
+    owned.gaps = extra;
     owned.bytes = members;
     this.#pinnedBytes += members;
+    if (size !== null) owned.pooled = this.#takePooled(size);
+    let cursor = 0;
     for (const slab of slabs) {
       signal?.throwIfAborted();
       this.#live();
-      const buffer = new Uint8Array(slab.length);
+      let buffer: Uint8Array;
+      if (owned.pooled === null) buffer = new Uint8Array(slab.length);
+      else {
+        buffer = new Uint8Array(owned.pooled, cursor, slab.length);
+        cursor += align8(slab.length);
+      }
       await this.#session.readDataInto(slab.offset, buffer);
       this.#platformReads += 1;
       this.#bytesRead += slab.length;
@@ -476,6 +533,53 @@ export class PageCache implements EvictableCacheLike {
         if (VERIFY_CACHED_BYTES) owned.views.push({ bytes, checksum: ref.checksum });
       }
     }
+  }
+
+  /**
+   * A buffer of `size` bytes for one lease: an idle pooled one (its charge moves from the cache
+   * to the lease, which has just paid for it), else a new one.
+   */
+  #takePooled(size: number): ArrayBuffer {
+    const idle = this.#pool.get(size)?.pop();
+    if (idle === undefined) return new ArrayBuffer(size);
+    this.#poolIdle -= size;
+    this.#memory?.release(size);
+    return idle;
+  }
+
+  /**
+   * A released lease's pooled buffer back to the pool, charged to the cache while it waits; it is
+   * dropped instead when the pool is full, the cache is closed, or the governor refuses.
+   */
+  #givePooled(owned: OwnedSlabs): void {
+    const buffer = owned.pooled;
+    if (buffer === null) return;
+    owned.pooled = null;
+    if (VERIFY_CACHED_BYTES) new Uint8Array(buffer).fill(POISON);
+    const size = buffer.byteLength;
+    if (this.#closed || this.#poolIdle + size > this.#poolLimit) return;
+    if (this.#memory?.charge(size) !== true) return;
+    let list = this.#pool.get(size);
+    if (list === undefined) {
+      list = [];
+      this.#pool.set(size, list);
+    }
+    list.push(buffer);
+    this.#poolIdle += size;
+  }
+
+  /** Drops idle pooled buffers until `bytes` are freed (or none is left); returns the bytes. */
+  #trimPool(bytes: number): number {
+    let freed = 0;
+    for (const [size, list] of this.#pool) {
+      while (freed < bytes && list.pop() !== undefined) {
+        this.#poolIdle -= size;
+        this.#memory?.release(size);
+        freed += size;
+      }
+      if (freed >= bytes) break;
+    }
+    return freed;
   }
 
   /** A verified miss enters the cache pinned (another read may have inserted it meanwhile). */
@@ -658,6 +762,7 @@ export class PageCache implements EvictableCacheLike {
     if (this.#closed) return;
     this.#closed = true;
     for (const entry of [...this.#byAddress.values()]) this.#drop(entry);
+    this.#trimPool(Number.POSITIVE_INFINITY);
     this.#memory?.release(FIXED_CACHE_BYTES);
   }
 
