@@ -20,17 +20,17 @@
  * - **Spill.** The startup sweep empties it and a round trip works.
  * Any other outcome is a corruption, reported with the seed, the iteration and the kill.
  */
-import type { StorageBackend, StoreSession } from "./contract.js";
-import type { BlobRef, ExtentRef, ExtentSpace } from "./extents.js";
-import { openExtentSpace } from "./space.js";
+import type { StorageBackend, StoreSession } from "../storage/contract.js";
+import type { BlobRef, ExtentRef, ExtentSpace } from "../storage/extents.js";
+import { openExtentSpace } from "../storage/space.js";
 import {
   bytesOf,
   countingBudget,
   countingMemory,
   firstDifference,
   jsonReachable,
-} from "./space-test-support.js";
-import { ScratchSpillService } from "../spill/scratch-spill.js";
+} from "../storage/space-test-support.js";
+import { ScratchSpillService } from "./scratch-spill.js";
 
 /** The kinds of step; each is announced (`ChaosIntent`) before it starts. */
 export const CHAOS_STEPS = [

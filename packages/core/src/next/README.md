@@ -228,10 +228,10 @@ is access's `Snapshot`.
   so everything the worker does before the kill takes effect was announced, and recovery accepts
   the acknowledged root or any announced one. On IndexedDB kills land inside two to five
   interleaved operations (reach `STORAGE_CONCURRENT_KILL_REACH`); OPFS's synchronous calls never
-  overlap at a kill, so `storage/chaos-crash.test.ts` runs the same workload in Node over the
+  overlap at a kill, so `spill/chaos-crash.test.ts` runs the same workload in Node over the
   simulated OPFS and IndexedDB stores, with every session call deferred by a task, and loses power
   at a seeded physical step among interleaved operations (`STORAGE_CONCURRENT_CRASH_REACH`). The
-  workload and recovery live in `storage/chaos-workload.ts`. `npm run benchmark:storage` records the
+  workload and recovery live in `spill/chaos-workload.ts`. `npm run benchmark:storage` records the
   storage microbench nightly (docs: reference/testing).
 - `select.ts` (`chooseBackend`) picks OPFS where a dedicated worker can open sync handles, else
   IndexedDB only on the private modes' refusals (`SecurityError`, `UnknownError`,

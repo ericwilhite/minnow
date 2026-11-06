@@ -170,7 +170,7 @@ export const STORAGE_CONCURRENT_KILL_REACH = [
 ] as const;
 
 /**
- * The concurrent workload under simulated power loss (storage/chaos-crash.test.ts): the crash must
+ * The concurrent workload under simulated power loss (spill/chaos-crash.test.ts): the crash must
  * land while several operations are inside their storage work, data and log work among them.
  */
 export const STORAGE_CONCURRENT_CRASH_REACH = [

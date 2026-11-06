@@ -20,11 +20,11 @@ import {
 } from "./chaos-workload.js";
 import { createReach, STORAGE_CONCURRENT_CRASH_REACH } from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
-import type { StorageBackend } from "./contract.js";
-import { createIndexedDbBackend } from "./indexeddb.js";
-import { createOpfsBackend, type OpfsDirectoryLike } from "./opfs.js";
-import { SimDisk, SimLocks } from "./sim-disk.js";
-import { simIndexedDb } from "./sim-idb.js";
+import type { StorageBackend } from "../storage/contract.js";
+import { createIndexedDbBackend } from "../storage/indexeddb.js";
+import { createOpfsBackend, type OpfsDirectoryLike } from "../storage/opfs.js";
+import { SimDisk, SimLocks } from "../storage/sim-disk.js";
+import { simIndexedDb } from "../storage/sim-idb.js";
 
 const SEEDS = seedsFor(
   "next-storage-concurrent-crash",

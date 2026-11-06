@@ -694,7 +694,7 @@ test.describe("rebuild core storage concurrent kill campaign (Gate A)", () => {
         // and every interleaving is required. OPFS's calls are synchronous: each operation starts
         // in its own task (after its go) and its storage calls finish within it, so a kill never
         // finds two OPFS operations inside storage; there the interleavings are the simulated
-        // power-loss sweep's (storage/chaos-crash.test.ts, STORAGE_CONCURRENT_CRASH_REACH).
+        // power-loss sweep's (spill/chaos-crash.test.ts, STORAGE_CONCURRENT_CRASH_REACH).
         const required: ReadonlyArray<(typeof STORAGE_CONCURRENT_KILL_REACH)[number]> =
           kind === "indexeddb" ? STORAGE_CONCURRENT_KILL_REACH : [];
         const reach = createReach(`concurrent storage kills ${kind} ${browserName}`, required, {
@@ -784,7 +784,7 @@ test.describe("rebuild core storage concurrent kill campaign (Gate A)", () => {
             [...pairs].sort(([a], [b]) => a.localeCompare(b)),
           ),
           reach: Object.fromEntries(reach.counts()),
-          reachBackedBy: required.length === 0 ? "storage/chaos-crash.test.ts" : null,
+          reachBackedBy: required.length === 0 ? "spill/chaos-crash.test.ts" : null,
         };
         await info.attach(`storage-concurrent-kills-${kind}`, {
           body: JSON.stringify(report, null, 2),
