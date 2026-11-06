@@ -333,7 +333,8 @@ satisfies those levels, while `SERIALIZABLE` is refused rather than silently dow
 `KEY` forms) fail with "cannot execute … in a read-only transaction". This holds however the
 statement arrives: through `execute`, `query`, `queryCursor`, a built query's `run`, or a live
 subscription's runs (which are not statements of the transaction, so they never count for
-`READ WRITE`).
+`READ WRITE`). `nextval` is refused when it runs, as in PostgreSQL: `currval` works, and so does a
+`nextval` in a `CASE` branch not taken or under a false `WHERE`.
 
 `SET TRANSACTION READ ONLY` makes the open transaction read-only at any point. Switching a
 read-only transaction back with `SET TRANSACTION READ WRITE` is refused once the transaction

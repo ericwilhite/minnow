@@ -27,6 +27,8 @@ const SETUP = [
   "CREATE TABLE u (id INTEGER PRIMARY KEY, v INTEGER)",
   "CREATE SEQUENCE s",
   "INSERT INTO t VALUES (1, 10), (2, 20)",
+  // currval reads the session's last nextval: defined before any transaction.
+  "SELECT nextval('s') AS n",
 ];
 
 /** Statements that open a transaction and set (or leave) its access mode. */
@@ -148,6 +150,13 @@ const ENTRY_POINTS: ReadonlyArray<
 const READS = [
   "SELECT count(*) AS n FROM t",
   "SELECT nextval('s') AS n",
+  // Review B6 stream A 3, finding 2: only an executed nextval writes.
+  "SELECT currval('s') AS n",
+  "SELECT CASE WHEN false THEN nextval('s') END AS n",
+  "SELECT COALESCE(1, nextval('s')) AS n",
+  "SELECT nextval('s') AS n WHERE false",
+  "SELECT nextval('s') AS n LIMIT 0",
+  "SELECT CASE WHEN true THEN nextval('s') END AS n",
   "SELECT * FROM t FOR UPDATE",
   "SELECT * FROM t FOR NO KEY UPDATE",
   "SELECT * FROM t FOR SHARE",
