@@ -180,3 +180,16 @@ export const BARRIER_RESOLUTION_STATES = [
   "lost again after a confirmed end",
   "ran, never lost",
 ] as const;
+
+/**
+ * A broker replaced under its ports (next/testing/owner-election.test.ts, WebKit 26.6's
+ * SharedWorker restart, next/owner/webkit-sharedworker.md): the restart overlapped a client's
+ * broker request; it emptied a live owner's registration; it emptied a client's wait for one; a
+ * request id reached one instance twice.
+ */
+export const BROKER_RESTART_STATES = [
+  "restart during connect",
+  "restart while the owner is registered",
+  "restart with a client waiting",
+  "duplicate request delivered",
+] as const;

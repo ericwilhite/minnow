@@ -962,6 +962,17 @@ and the owner import it directly.
   connection. The handshake is watched (an owner dying mid-handshake frees the host lock) and
   bounded (`HANDSHAKE_TIMEOUT_MS`, 5 s); either way the connector starts over. The broker holds a
   client's port only until the next registration of a database it asked about.
+- The broker can be replaced under its ports: WebKit 26.6 restarts a SharedWorker on a
+  cross-origin-isolated page when the page that created it closes, with empty state, the other
+  pages' ports reattached, and messages sent during the switch dropped
+  (`owner/webkit-sharedworker.md`). So every broker request is bounded: it waits
+  `BROKER_REQUEST_TIMEOUT_MS` (1 s), doubling, first on the same port and then on fresh ones, and
+  past `BROKER_REQUEST_BOUND_MS` (15 s) it fails with `OwnerUnreachableError` and the connector
+  becomes `unreachable` instead of staying `connecting`. The next request, a broker that announces
+  itself, or an owner announcement starts it again. Each broker instance has a random id it
+  announces on every port: the client sends its unanswered requests again to it, and an owner
+  registers again on a new id, but only while it still holds both its locks. A request id is
+  answered once, so a retry the same instance already saw makes no second connection.
 - A client learns that its owner was replaced even while idle: a new owner announces itself on
   the database's BroadcastChannel (`{t: "owner", ownerId, epoch}`, the fence epoch, strictly
   increasing). An announcement is a hint: a client acts only on an epoch above its owner's, and

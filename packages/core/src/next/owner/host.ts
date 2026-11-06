@@ -11,7 +11,10 @@
  * 3. The host lock, stolen from the page that won the election: from now on the owner holds it.
  * 4. The protocol server; the host page's own client connects on `clientPort`.
  * 5. Registration with the broker; answers on the skew channel, and an `owner` announcement there,
- *    so clients of a previous owner reconnect at once.
+ *    so clients of a previous owner reconnect at once. The registration is repeated whenever the
+ *    broker port announces an instance id other than the last one seen (a replaced broker starts
+ *    empty, election.ts "Reaching the owner"), but only while this owner holds both its locks and
+ *    has not stopped: a stale owner never registers again. Registering again is idempotent.
  * 6. `minnow:ready` to the page.
  *
  * A newer owner may steal the fence lock while startup awaits (steps 2 and 3, and the lock query
@@ -38,6 +41,7 @@ import {
   lifecycleAction,
   openChannel,
   ownerLockName,
+  randomId,
   skewChannelName,
   type BrokerMessage,
   type LifecycleEvent,
@@ -105,12 +109,6 @@ export interface OwnerHostDeps {
   /** Bound for taking the fence (default `acquireFenced`'s). */
   readonly acquireTimeoutMs?: number;
 }
-
-const randomId = (): string => {
-  const bytes = new Uint8Array(8);
-  crypto.getRandomValues(bytes);
-  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-};
 
 export async function startOwnerHost<F>(
   init: OwnerHostInit,
@@ -199,26 +197,36 @@ export async function startOwnerHost<F>(
   });
   server.accept(init.clientPort);
 
+  let stopped: Promise<void> | null = null;
   const broker = init.brokerPort;
   if (broker !== null) {
+    const register = () => {
+      broker.postMessage({
+        t: "register",
+        v: BROKER_PROTOCOL,
+        db: database,
+        ownerId,
+        protocol,
+        build: init.build,
+        lockHolder,
+      } satisfies BrokerMessage);
+    };
+    let instance: string | null = null;
     broker.onmessage = (event: MessageEvent) => {
       const message = event.data as BrokerMessage;
       if (message.t === "client") server.accept(message.port);
+      else if (message.t === "instance" && message.instance !== instance) {
+        // The first id seen, or a replaced broker that lost the registration. Fenced: an owner
+        // that lost either lock or stopped is not the owner any more.
+        instance = message.instance;
+        if (stopped === null && !lock.lost.aborted && !heldHostLock.lost.aborted) register();
+      }
     };
-    broker.postMessage({
-      t: "register",
-      v: BROKER_PROTOCOL,
-      db: database,
-      ownerId,
-      protocol,
-      build: init.build,
-      lockHolder,
-    } satisfies BrokerMessage);
+    register();
   }
 
   const skew = openChannel(skewChannelName(database));
 
-  let stopped: Promise<void> | null = null;
   const release = (reason: StepDown["reason"]) => {
     factory.closeFence(fence);
     lock.release();

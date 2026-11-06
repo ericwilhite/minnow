@@ -15,8 +15,19 @@
  *   it asked about (or its `close` event, where the platform fires one), so closed tabs are not
  *   kept or broadcast to.
  * - It takes no locks itself.
+ * - Each instance has a random id (`instance`), announced first on every port it accepts: a port
+ *   that sees a new id was reattached to a replaced broker (WebKit 26.6, owner/webkit-sharedworker.md)
+ *   with no registrations, so owners register again and clients ask again.
+ * - A request id (`connect`'s `nonce`, per client) is answered once. A duplicate (a client's retry
+ *   of a request this instance already saw) makes no second connection: while the first is being
+ *   answered, or after it got a port, it is dropped (the client keeps the port it asked on until
+ *   it is answered); after `noOwner` or `unreachable` the same answer is sent again.
  */
-import { BROKER_PROTOCOL, hostLockName, type BrokerMessage } from "./election.js";
+import { BROKER_PROTOCOL, hostLockName, randomId, type BrokerMessage } from "./election.js";
+
+/** Request ids remembered per instance (oldest forgotten first). */
+const ANSWERED_LIMIT = 1_024;
+type Answer = "pending" | "port" | "noOwner" | "unreachable";
 
 /** The slice of `navigator.locks` the broker uses. */
 export interface LockQuery {
@@ -38,8 +49,24 @@ export class Broker {
   /** Per database, the ports that asked since its last registration (told of the next one). */
   readonly #waiters = new Map<string, Set<MessagePort>>();
 
+  /** This instance's id. */
+  readonly instance = randomId();
+  /** The outcome per `clientId:nonce` this instance saw, in arrival order. */
+  readonly #answered = new Map<string, Answer>();
+  #duplicates = 0;
+
   constructor(locks: LockQuery) {
     this.#locks = locks;
+  }
+
+  /** Duplicate requests this instance received (tests). */
+  get duplicates(): number {
+    return this.#duplicates;
+  }
+
+  /** The owner id registered per database (tests). */
+  get registrations(): ReadonlyMap<string, string> {
+    return new Map([...this.#owners].map(([db, owner]) => [db, owner.ownerId]));
   }
 
   /** Serves a newly connected context's port. */
@@ -47,6 +74,7 @@ export class Broker {
     port.onmessage = (event: MessageEvent) => {
       void this.#receive(port, event.data as BrokerMessage);
     };
+    port.postMessage({ t: "instance", instance: this.instance } satisfies BrokerMessage);
     // Where the platform reports an entangled port's closing (a closed tab), forget it at once.
     if (typeof port.addEventListener === "function")
       port.addEventListener("close", () => {
@@ -106,6 +134,19 @@ export class Broker {
         this.#forget(port);
         return;
       case "connect": {
+        const key = `${message.clientId}:${String(message.nonce)}`;
+        const seen = this.#answered.get(key);
+        if (seen !== undefined) {
+          this.#duplicates++;
+          if (seen === "noOwner" || seen === "unreachable")
+            port.postMessage({ t: seen, nonce: message.nonce } satisfies BrokerMessage);
+          return;
+        }
+        this.#answered.set(key, "pending");
+        if (this.#answered.size > ANSWERED_LIMIT) {
+          const oldest = this.#answered.keys().next();
+          if (oldest.done !== true) this.#answered.delete(oldest.value);
+        }
         // Whatever the answer, the asker may wait for the next owner (none yet, a successor
         // starting, a version refusal to settle): it is told once, then forgotten.
         let waiting = this.#waiters.get(message.db);
@@ -142,13 +183,13 @@ export class Broker {
             } satisfies BrokerMessage,
             [channel.port2],
           );
+          this.#answered.set(key, "port");
           return;
         }
         if (owner !== undefined && !live) this.#owners.delete(message.db);
-        port.postMessage({
-          t: held ? "unreachable" : "noOwner",
-          nonce: message.nonce,
-        } satisfies BrokerMessage);
+        const answer = held ? "unreachable" : "noOwner";
+        this.#answered.set(key, answer);
+        port.postMessage({ t: answer, nonce: message.nonce } satisfies BrokerMessage);
         return;
       }
       default:

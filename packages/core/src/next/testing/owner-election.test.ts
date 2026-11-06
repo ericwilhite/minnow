@@ -9,6 +9,7 @@ import fc from "fast-check";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   BARRIER_RESOLUTION_STATES,
+  BROKER_RESTART_STATES,
   LEDGER_RESOLUTION_STATES,
   createReach,
 } from "../../testing/reach.js";
@@ -35,6 +36,7 @@ import {
 } from "../owner/protocol.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
 import { FakeLockRegistry, type FakeLockContext } from "./fake-locks.js";
+import { RestartingBroker } from "./restarting-broker.js";
 import { createLowerer } from "../lower/create.js";
 import { StandinExecutor, StandinWritePath, withTestStatements } from "./owner-standins.js";
 
@@ -60,19 +62,27 @@ interface World {
   readonly epochs: Map<string, number>;
   /** Discovery requests (`connect` to the broker) per client. */
   readonly connects: Map<ProtocolClient, number>;
-  readonly broker: Broker;
+  /** The broker SharedWorker; it can be replaced under its ports (restarting-broker.ts). */
+  readonly broker: RestartingBroker;
+  /** Ports each client opened to the broker. */
+  readonly brokerPorts: Map<ProtocolClient, number>;
   /** Owners started, newest last. */
   readonly owners: Array<{ host: OwnerHost | null; kill: () => void; context: FakeLockContext }>;
 }
 
-function world(): World {
+function world(options: { readonly brokerQueryDelayMs?: number } = {}): World {
   const registry = new FakeLockRegistry();
+  const locks = registry.context();
+  const delay = options.brokerQueryDelayMs ?? 0;
   return {
     registry,
     files: new Map(),
     epochs: new Map(),
     connects: new Map(),
-    broker: new Broker(registry.context()),
+    broker: new RestartingBroker(
+      delay === 0 ? locks : { query: () => sleep(delay).then(() => locks.query()) },
+    ),
+    brokerPorts: new Map(),
     owners: [],
   };
 }
@@ -212,6 +222,9 @@ function tab(
     readonly silenceDeadlineMs?: number;
     readonly handshakeTimeoutMs?: number;
     readonly announcements?: boolean;
+    readonly brokerTimeoutMs?: number;
+    readonly brokerBoundMs?: number;
+    readonly retryMs?: number;
   } = {},
 ): Tab {
   const locks = world.registry.context();
@@ -225,6 +238,7 @@ function tab(
     locks,
     openBroker: () => {
       const { port1, port2 } = new MessageChannel();
+      world.brokerPorts.set(client, (world.brokerPorts.get(client) ?? 0) + 1);
       world.broker.accept(port1);
       // Count discovery: every `connect` this tab asks the broker.
       const serve = port1.onmessage;
@@ -247,7 +261,7 @@ function tab(
       superseded: state.superseded,
     }),
     settings: options.settings ?? {},
-    retryMs: 50,
+    retryMs: options.retryMs ?? 50,
     ...(options.silenceDeadlineMs === undefined
       ? {}
       : { silenceDeadlineMs: options.silenceDeadlineMs }),
@@ -255,6 +269,8 @@ function tab(
       ? {}
       : { handshakeTimeoutMs: options.handshakeTimeoutMs }),
     ...(options.announcements === undefined ? {} : { announcements: options.announcements }),
+    ...(options.brokerTimeoutMs === undefined ? {} : { brokerTimeoutMs: options.brokerTimeoutMs }),
+    ...(options.brokerBoundMs === undefined ? {} : { brokerBoundMs: options.brokerBoundMs }),
     onSuperseded: () => {
       state.superseded = true;
       options.onSuperseded?.();
@@ -301,6 +317,8 @@ describe("election and the broker", () => {
         const { port1, port2 } = new MessageChannel();
         w.broker.accept(port1);
         port2.onmessage = (event: MessageEvent) => {
+          // The instance announcement comes first on every port; the answer follows.
+          if ((event.data as { t: string }).t === "instance") return;
           resolve((event.data as { t: string }).t);
           port1.close();
           port2.close();
@@ -351,6 +369,8 @@ describe("the broker's liveness check", () => {
       const { port1, port2 } = new MessageChannel();
       w.broker.accept(port1);
       port2.onmessage = (event: MessageEvent) => {
+        // The instance announcement comes first on every port; the answer follows.
+        if ((event.data as { t: string }).t === "instance") return;
         resolve((event.data as { t: string }).t);
         port1.close();
         port2.close();
@@ -1800,4 +1820,367 @@ describe("D2 (B5-p2d review 2): a silent connection is probed, backed off, and e
   it("pins the probe limit", () => {
     expect(SILENT_PROBES_LIMIT).toBe(3);
   });
+});
+
+/** a hosts with one row; returns a's owner. */
+async function hosted(w: World, options: Parameters<typeof tab>[1] = {}) {
+  const a = tab(w, options);
+  await a.connector.start();
+  await a.client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
+  await a.client.query("INSERT INTO t VALUES ($1, $2, $3)", [1, 0, "x"]);
+  const owner = w.owners[0]?.host;
+  if (owner === null || owner === undefined) throw new Error("no owner");
+  return { a, owner };
+}
+
+describe("a broker replaced under its ports (WebKit 26.6, owner/webkit-sharedworker.md)", () => {
+  const within = <T>(promise: Promise<T>, ms: number): Promise<T | "timed out"> =>
+    Promise.race([promise, sleep(ms).then(() => "timed out" as const)]);
+
+  it("the owner's tab closes while the broker restarts: the survivor elects itself and its request resolves", async () => {
+    const w = world();
+    const { a } = await hosted(w);
+    const b = tab(w, { brokerTimeoutMs: 50 });
+    await b.connector.start();
+    // In flight, so b watches the host lock and asks the broker the moment a's owner dies.
+    const spin = b.client.query("SELECT spin($1)", [200]);
+    await sleep(30);
+    // WebKit: the page that created the SharedWorker closes, and the broker is replaced; b's
+    // question to it is sent inside the switch and lost.
+    const restarted = w.broker.restart({ dropMs: 120 });
+    killTab(w, a, 0);
+    const result = await within(spin, 3_000);
+    await restarted;
+    expect(result === "timed out" ? result : result.summary.command).toBe("SELECT");
+    expect(w.broker.dropped.get("connect") ?? 0).toBeGreaterThan(0);
+    expect(b.connector.status).toBe("connected");
+    expect(b.connector.hosting).toBe(true);
+    // The new owner registered with the new instance.
+    expect(w.broker.current?.registrations.get("db")).toBe(b.client.ownerId);
+  });
+
+  it("a new instance makes an unanswered request ask again at once, not at its timeout", async () => {
+    const w = world();
+    const { owner } = await hosted(w);
+    // The restart starts before c asks: c's question is dropped. Its retry is 5 s away; only the
+    // new instance's announcement can bring the answer sooner.
+    const restarted = w.broker.restart({ dropMs: 100 });
+    const c = tab(w, { brokerTimeoutMs: 5_000 });
+    const started = Date.now();
+    expect(await within(c.connector.start(), 2_000)).toBeUndefined();
+    await restarted;
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(w.broker.dropped.get("connect") ?? 0).toBeGreaterThan(0);
+    expect(c.client.ownerId).toBe(owner.ownerId);
+  });
+
+  it("a live owner registers again with the new instance, and a new tab reaches it", async () => {
+    const w = world();
+    const { owner } = await hosted(w);
+    await w.broker.restart({ dropMs: 30 });
+    await until(() => w.broker.current?.registrations.get("db") === owner.ownerId, 1_000);
+    const c = tab(w);
+    expect(await within(c.connector.start(), 2_000)).toBeUndefined();
+    expect(c.client.ownerId).toBe(owner.ownerId);
+    expect(await value(c.client)).toBe(0);
+  });
+
+  it("a stale owner (its host lock stolen) never registers again", async () => {
+    const w = world();
+    const { owner } = await hosted(w);
+    // A successor took the host lock; the old owner has not noticed anything else yet.
+    void w.registry
+      .context()
+      .request(hostLockName("db"), { steal: true }, () => new Promise<void>(() => undefined));
+    await sleep(5);
+    await w.broker.restart({ dropMs: 10 });
+    await sleep(50);
+    expect(w.broker.current?.registrations.has("db")).toBe(false);
+    expect(owner.ownerId).toBeDefined();
+  });
+
+  it("registering again is idempotent: one registration, one connection per client", async () => {
+    const w = world();
+    const { owner } = await hosted(w);
+    w.broker.duplicateNext("register");
+    await w.broker.restart({ dropMs: 10 });
+    await until(() => w.broker.current?.registrations.get("db") === owner.ownerId, 1_000);
+    expect(w.broker.duplicated).toBe(1);
+    expect(w.broker.current?.registrations.size).toBe(1);
+    const before = owner.server.stats.connections;
+    const c = tab(w);
+    await c.connector.start();
+    await sleep(20);
+    expect(owner.server.stats.connections).toBe(before + 1);
+  });
+
+  it("a duplicate connect reaching the same instance makes no second connection", async () => {
+    const w = world();
+    const { owner } = await hosted(w);
+    const before = owner.server.stats.connections;
+    w.broker.duplicateNext("connect");
+    const c = tab(w);
+    await c.connector.start();
+    await sleep(20);
+    // The law first: one connection for c.
+    expect(owner.server.stats.connections).toBe(before + 1);
+    expect(w.broker.duplicated).toBe(1);
+    // The injected copy, and the client's own repeat on the instance's announcement.
+    expect(w.broker.duplicates).toBeGreaterThanOrEqual(1);
+    expect(await value(c.client)).toBe(0);
+  });
+
+  it("a retry of a slow answer reaches the same instance: answered once, one connection", async () => {
+    // The broker's lock query takes 60 ms; c's first attempt times out after 15 ms.
+    const w = world({ brokerQueryDelayMs: 60 });
+    const { owner } = await hosted(w);
+    const before = owner.server.stats.connections;
+    const c = tab(w, { brokerTimeoutMs: 15 });
+    await c.connector.start();
+    await sleep(100);
+    expect(owner.server.stats.connections).toBe(before + 1);
+    expect(w.broker.duplicates).toBeGreaterThan(0);
+    expect(await value(c.client)).toBe(0);
+  });
+});
+
+describe("a broker request is bounded (connector.ts ConnectorStatus)", () => {
+  /** A connector whose broker ports are silent while `silent.on`, the world's broker otherwise. */
+  function silentTab(w: World, unreachable: Error[]) {
+    const silent = { on: true, ports: 0, posts: 0 };
+    const client = new ProtocolClient();
+    const connector = new OwnerConnector({
+      database: "db",
+      client,
+      locks: w.registry.context(),
+      openBroker: () => {
+        const { port1, port2 } = new MessageChannel();
+        silent.ports++;
+        if (silent.on)
+          port1.onmessage = () => {
+            silent.posts++;
+          };
+        else w.broker.accept(port1);
+        cleanups.push(() => {
+          port1.close();
+          port2.close();
+        });
+        return port2;
+      },
+      startOwner: null,
+      context: (): HostContext => ({
+        kind: "page",
+        visible: true,
+        platform: { mobile: false },
+        superseded: false,
+      }),
+      announcements: false,
+      retryMs: 50,
+      brokerTimeoutMs: 20,
+      brokerBoundMs: 150,
+      onUnreachable: (error) => {
+        unreachable.push(error);
+      },
+    });
+    cleanups.push(() => {
+      connector.close();
+    });
+    return { connector, client, silent };
+  }
+
+  it("a broker that never answers: OwnerUnreachableError at the bound, never left connecting", async () => {
+    const w = world();
+    const unreachable: Error[] = [];
+    const { connector, silent } = silentTab(w, unreachable);
+    const started = Date.now();
+    const error = await connector.start().then(
+      () => null,
+      (caught: unknown) => caught as Error,
+    );
+    const took = Date.now() - started;
+    expect(error?.name).toBe("OwnerUnreachableError");
+    expect((error as { code?: string } | null)?.code).toBe("MINNOW_OWNER_UNREACHABLE");
+    expect(took).toBeGreaterThanOrEqual(140);
+    expect(took).toBeLessThan(1_000);
+    expect(connector.status).toBe("unreachable");
+    expect(unreachable).toHaveLength(1);
+    // Attempts at 0, 20 and 60 ms on the first port, a fresh one, another fresh one (20+40+80 ms).
+    expect(silent.posts).toBe(4);
+    expect(silent.ports).toBe(3);
+  });
+
+  it("after giving up, the next request makes it connect again once the broker answers", async () => {
+    const w = world();
+    const { owner } = await hosted(w);
+    const unreachable: Error[] = [];
+    const { connector, client, silent } = silentTab(w, unreachable);
+    await connector.start().catch(() => undefined);
+    expect(connector.status).toBe("unreachable");
+    silent.on = false;
+    // A request is activity: connecting starts again (bounded, as always). This client never
+    // had a connection, and a request made before the first one is not sent on it (client.ts
+    // sends unsent requests on a reconnect only), so it is the next request that is answered.
+    void client.query("SELECT 1").catch(() => undefined);
+    await until(() => connector.status === "connected", 2_000);
+    expect(client.ownerId).toBe(owner.ownerId);
+    expect(await value(client)).toBe(0);
+  });
+
+  it("a second answer to a request already answered is closed with bye, never used", async () => {
+    const w = world();
+    const { owner } = await hosted(w);
+    let brokerSide: MessagePort | null = null;
+    const c = tab(w);
+    // The world's broker side of c's port: the last port the broker accepted for c.
+    const accept = w.broker.accept.bind(w.broker);
+    w.broker.accept = (port: MessagePort) => {
+      brokerSide = port;
+      accept(port);
+    };
+    await c.connector.start();
+    w.broker.accept = accept;
+    const before = owner.server.stats.connections;
+    const extra = new MessageChannel();
+    const bye = new Promise<unknown>((resolve) => {
+      extra.port2.onmessage = (event: MessageEvent) => {
+        resolve(event.data);
+      };
+    });
+    // A late answer to c's first request (nonce 1), as a dead instance's could be.
+    (brokerSide as MessagePort | null)?.postMessage(
+      { t: "port", nonce: 1, ownerId: owner.ownerId, port: extra.port1 },
+      [extra.port1],
+    );
+    expect(await Promise.race([bye, sleep(1_000).then(() => "no bye")])).toEqual({ t: "bye" });
+    expect(owner.server.stats.connections).toBe(before);
+    expect(c.connector.status).toBe("connected");
+    extra.port2.close();
+  });
+
+  it("close() mid-request leaves no timer and sends nothing more", async () => {
+    const w = world();
+    const pending = new Set<unknown>();
+    const realSet = globalThis.setTimeout;
+    const realClear = globalThis.clearTimeout;
+    const tracked = ((handler: () => void, ms?: number) => {
+      const id = realSet(() => {
+        pending.delete(id);
+        handler();
+      }, ms);
+      // Only the connector's and the client's own timers: earlier tests' in-process owners keep
+      // scheduling theirs (owner-standins.ts flushes) in this worker.
+      const stack = new Error().stack ?? "";
+      if (/owner\/(connector|client)\.ts/.test(stack)) pending.add(id);
+      return id;
+    }) as typeof setTimeout;
+    globalThis.setTimeout = tracked;
+    globalThis.clearTimeout = ((id: ReturnType<typeof setTimeout>) => {
+      pending.delete(id);
+      realClear(id);
+    }) as typeof clearTimeout;
+    try {
+      const { connector, silent } = silentTab(w, []);
+      const start = connector.start().catch((error: unknown) => (error as Error).name);
+      await new Promise((resolve) => realSet(resolve, 50));
+      expect(pending.size).toBeGreaterThan(0);
+      connector.close();
+      expect(await start).toBe("ClientClosedError");
+      expect(pending.size).toBe(0);
+      const posts = silent.posts;
+      await new Promise((resolve) => realSet(resolve, 200));
+      expect(silent.posts).toBe(posts);
+    } finally {
+      globalThis.setTimeout = realSet;
+      globalThis.clearTimeout = realClear;
+    }
+  });
+});
+
+describe("generated: a broker restart at any point never strands a tab", () => {
+  const scenario = fc.record({
+    killOwner: fc.boolean(),
+    /** When the broker is replaced, relative to the owner's tab closing (or to the write). */
+    restartAt: fc.integer({ min: -40, max: 80 }),
+    dropMs: fc.integer({ min: 0, max: 200 }),
+    duplicate: fc.constantFrom("none", "connect", "register"),
+    newTab: fc.boolean(),
+  });
+
+  const SEEDS = seedsFor("next-owner-broker-restart", [0xb0b5]);
+
+  it.each(SEEDS)(
+    "every live tab connects to one registered owner, and the write runs once (seed %i)",
+    async (seed) => {
+      const reach = createReach("next-owner-broker-restart", BROKER_RESTART_STATES, {
+        minimum: 3,
+      });
+      await fc.assert(
+        fc.asyncProperty(scenario, async ({ killOwner, restartAt, dropMs, duplicate, newTab }) => {
+          const entered = new Set<string>();
+          const w = world();
+          const { a } = await hosted(w, { brokerTimeoutMs: 30 });
+          const b = tab(w, { brokerTimeoutMs: 30 });
+          await b.connector.start();
+          if (duplicate !== "none") w.broker.duplicateNext(duplicate);
+          // b's write, in flight when the owner's tab closes (if it does).
+          const write = b.client.query("UPDATE t SET n = n + 1 WHERE id = $1", [1]);
+          const spin = b.client.query("SELECT spin($1)", [60]);
+          const events: Array<[number, () => void]> = [
+            [restartAt, () => void w.broker.restart({ dropMs })],
+          ];
+          if (killOwner) events.push([0, () => killTab(w, a, 0)]);
+          // A tab opened during the switch (set from a scheduled event, so held in an object).
+          const opened: { c: Tab | null } = { c: null };
+          if (newTab)
+            events.push([
+              restartAt + Math.floor(dropMs / 2),
+              () => {
+                const c = tab(w, { brokerTimeoutMs: 30 });
+                opened.c = c;
+                void c.connector.start().catch(() => undefined);
+              },
+            ]);
+          events.sort((x, y) => x[0] - y[0]);
+          let now = Math.min(0, ...events.map(([at]) => at));
+          for (const [at, run] of events) {
+            await sleep(at - now);
+            now = at;
+            run();
+          }
+          // Laws, within a bound: every live tab connected, all to one owner, registered with
+          // the broker instance of the moment; the write applied exactly once.
+          const live = [...(killOwner ? [] : [a]), b, ...(opened.c === null ? [] : [opened.c])];
+          await until(
+            () =>
+              w.broker.current !== null && live.every((t) => t.connector.status === "connected"),
+            3_000,
+          );
+          await Promise.all([write, spin]);
+          const ownerIds = new Set(live.map((t) => t.client.ownerId));
+          expect(ownerIds.size).toBe(1);
+          const ownerId = [...ownerIds][0] ?? null;
+          await until(() => w.broker.current?.registrations.get("db") === ownerId, 2_000);
+          expect(await value(b.client)).toBe(1);
+          // No second session from a duplicate: once unused handshakes ended, one connection per
+          // live tab.
+          const owner = w.owners.find((entry) => entry.host?.ownerId === ownerId)?.host;
+          await until(() => owner?.server.stats.connections === live.length, 2_000);
+
+          const restart = w.broker.restarts[0];
+          if ((w.broker.dropped.get("connect") ?? 0) > 0 || w.broker.lostReplies > 0)
+            entered.add("restart during connect");
+          if (restart !== undefined && restart.registered > 0)
+            entered.add("restart while the owner is registered");
+          if (restart !== undefined && restart.waiting > 0)
+            entered.add("restart with a client waiting");
+          if (w.broker.duplicates > 0) entered.add("duplicate request delivered");
+          reach.recordHistory(entered);
+          for (const cleanup of cleanups.splice(0).reverse()) cleanup();
+        }),
+        { seed, numRuns: 40 },
+      );
+      reach.assertReached();
+    },
+    200_000,
+  );
 });

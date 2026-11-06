@@ -60,6 +60,8 @@ import type { HeldLock } from "../storage/fence.js";
 import type { ProtocolClient } from "./client.js";
 import {
   BROKER_PROTOCOL,
+  BROKER_REQUEST_BOUND_MS,
+  BROKER_REQUEST_TIMEOUT_MS,
   HANDSHAKE_TIMEOUT_MS,
   LIVENESS_IDLE_RELEASE_MS,
   canHost,
@@ -120,9 +122,26 @@ export interface ConnectorOptions {
   readonly silenceDeadlineMs?: number;
   /** Listen for owner announcements (default true; tests turn it off to reach the backstop). */
   readonly announcements?: boolean;
+  /** One broker request attempt's timeout (default election.ts `BROKER_REQUEST_TIMEOUT_MS`). */
+  readonly brokerTimeoutMs?: number;
+  /** A broker request's total bound (default election.ts `BROKER_REQUEST_BOUND_MS`). */
+  readonly brokerBoundMs?: number;
+  /** Called when connecting gives up (`status` becomes `unreachable`); see `ConnectorStatus`. */
+  readonly onUnreachable?: (error: OwnerUnreachableError) => void;
 }
 
-export type ConnectorStatus = "connecting" | "connected" | "superseded" | "closed";
+/**
+ * - `connecting` ends in bounded time: every wait in it is bounded (a broker request by
+ *   `BROKER_REQUEST_BOUND_MS`, the handshake by `HANDSHAKE_TIMEOUT_MS`) or ends on an event that
+ *   must come (the host lock's grant while a live owner holds it, a registration). It never
+ *   waits on a message that may have been lost: a broker request is sent again until it is
+ *   answered, and a replaced broker (`instance`) makes it ask again at once.
+ * - `unreachable`: the broker did not answer within its bound, or there is none and this context
+ *   cannot host. `start()` rejected with `OwnerUnreachableError` and `onUnreachable` was called.
+ *   Pending requests stay queued; the next request, a broker that announces itself, or an owner
+ *   announcement starts connecting again.
+ */
+export type ConnectorStatus = "connecting" | "connected" | "unreachable" | "superseded" | "closed";
 
 /** An owner this context is starting: the host-lock wait, then the lock and the handle. */
 interface Starting {
@@ -138,10 +157,19 @@ export class OwnerConnector {
   readonly #client: ProtocolClient;
   #status: ConnectorStatus = "connecting";
   #broker: MessagePort | null = null;
+  /** Earlier broker ports, kept open until no request may still be answered on them. */
+  readonly #oldBrokers: MessagePort[] = [];
+  /** The broker instance id last announced on any of our ports. */
+  #brokerInstance: string | null = null;
   #nonce = 0;
   readonly #brokerReplies = new Map<
     number,
-    { readonly reply: (message: BrokerMessage) => void; readonly fail: (error: Error) => void }
+    {
+      readonly reply: (message: BrokerMessage) => void;
+      readonly fail: (error: Error) => void;
+      /** Sends the request again now on `port` (a replaced broker), its timer untouched. */
+      readonly resend: (port: MessagePort) => void;
+    }
   >();
   /** Rejected by `close()`: every wait in startup and discovery races it, so none outlives close. */
   readonly #closedWait: Promise<never>;
@@ -211,10 +239,23 @@ export class OwnerConnector {
 
   /** Connects (electing this context if needed). Idempotent while a connection attempt runs. */
   start(): Promise<void> {
-    this.#connecting ??= this.#connect().finally(() => {
-      this.#connecting = null;
-    });
+    this.#connecting ??= this.#connect()
+      .catch((error: unknown) => {
+        if (error instanceof OwnerUnreachableError && this.#status === "connecting") {
+          this.#status = "unreachable";
+          this.#options.onUnreachable?.(error);
+        }
+        throw error;
+      })
+      .finally(() => {
+        this.#connecting = null;
+      });
     return this.#connecting;
+  }
+
+  /** Connects again if connecting gave up (`unreachable`): something says it may work now. */
+  #retryIfUnreachable(): void {
+    if (this.#status === "unreachable") void this.start().catch(() => undefined);
   }
 
   /** Relays a page lifecycle event to the owner this context hosts. */
@@ -266,6 +307,7 @@ export class OwnerConnector {
       hosting.lock.release();
     }
     this.#broker?.close();
+    for (const port of this.#oldBrokers.splice(0)) port.close();
   }
 
   // ---- connecting ----
@@ -450,51 +492,140 @@ export class OwnerConnector {
   // ---- broker ----
 
   #brokerPort(): MessagePort {
-    if (this.#broker !== null) return this.#broker;
+    return this.#broker ?? this.#freshBrokerPort();
+  }
+
+  /** Opens a new broker port and makes it the current one; the old one stays open until idle. */
+  #freshBrokerPort(): MessagePort {
     const open = this.#options.openBroker;
     if (open === null) throw new OwnerUnreachableError("no broker");
     const port = open();
     port.onmessage = (event: MessageEvent) => {
-      const message = event.data as BrokerMessage;
-      if (message.t === "registered") {
-        if (message.db !== this.#options.database) return;
-        for (const wake of this.#registered.splice(0)) wake();
-        return;
-      }
-      if ("nonce" in message) {
-        const pending = this.#brokerReplies.get(message.nonce);
-        this.#brokerReplies.delete(message.nonce);
-        pending?.reply(message);
-      }
+      this.#brokerMessage(port, event.data as BrokerMessage);
     };
+    if (this.#broker !== null) this.#oldBrokers.push(this.#broker);
     this.#broker = port;
     return port;
   }
 
+  #brokerMessage(port: MessagePort, message: BrokerMessage): void {
+    if (this.#status === "closed") return;
+    if (message.t === "instance") {
+      // Every request still unanswered goes again to the instance that announced itself here: a
+      // port opened while a broker was being replaced may have had its request dropped, and
+      // its first announcement is the new instance's, so no id change would show it. The
+      // broker answers a request id once, so the repeat costs one message.
+      for (const pending of this.#brokerReplies.values()) pending.resend(port);
+      const previous = this.#brokerInstance;
+      this.#brokerInstance = message.instance;
+      if (previous === null || previous === message.instance) return;
+      // A replaced broker also lost every registration and everyone waiting for one.
+      for (const wake of this.#registered.splice(0)) wake();
+      this.#retryIfUnreachable();
+      return;
+    }
+    if (message.t === "registered") {
+      if (message.db !== this.#options.database) return;
+      for (const wake of this.#registered.splice(0)) wake();
+      this.#retryIfUnreachable();
+      return;
+    }
+    if ("nonce" in message) {
+      const pending = this.#brokerReplies.get(message.nonce);
+      if (pending !== undefined) {
+        pending.reply(message);
+        return;
+      }
+      // A second answer to a request already answered: its connection is not wanted.
+      if (message.t === "port") {
+        message.port.postMessage({ t: "bye" });
+        message.port.close();
+      }
+    }
+  }
+
+  /**
+   * Asks the broker for the owner. Bounded: each attempt waits `brokerTimeoutMs`, doubling; the
+   * first retry goes on the same port, later ones on fresh ports; past `brokerBoundMs` it fails
+   * with `OwnerUnreachableError`. Every attempt carries the same request id, so the broker
+   * answers it once. Every timer ends with the request (answer, failure, `close()`).
+   */
   #ask(): Promise<
     | { readonly t: "port"; readonly port: MessagePort; readonly ownerId: string }
     | { readonly t: "noOwner" }
     | { readonly t: "unreachable" }
   > {
-    const port = this.#brokerPort();
     const nonce = ++this.#nonce;
+    const timeoutMs = this.#options.brokerTimeoutMs ?? BROKER_REQUEST_TIMEOUT_MS;
+    const boundMs = this.#options.brokerBoundMs ?? BROKER_REQUEST_BOUND_MS;
+    const request = {
+      t: "connect",
+      v: BROKER_PROTOCOL,
+      db: this.#options.database,
+      clientId: this.#client.clientId,
+      nonce,
+    } satisfies BrokerMessage;
     return new Promise((resolve, reject) => {
+      let attempt = 0;
+      // When the next attempt is due, from the first one: the schedule, not the clock, decides
+      // how many attempts there are (a timer may fire a millisecond early or late).
+      let plannedAt = 0;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const finish = () => {
+        if (timer !== null) clearTimeout(timer);
+        timer = null;
+        this.#brokerReplies.delete(nonce);
+        // Old ports may still carry an answer only while some request is unanswered.
+        if (this.#brokerReplies.size === 0)
+          for (const old of this.#oldBrokers.splice(0)) old.close();
+      };
+      const attemptNow = () => {
+        timer = null;
+        if (this.#status === "closed") {
+          finish();
+          reject(new ClientClosedError());
+          return;
+        }
+        if (attempt > 0 && plannedAt >= boundMs) {
+          finish();
+          reject(
+            new OwnerUnreachableError(
+              `the broker did not answer within ${String(boundMs)} ms (${String(attempt)} attempts)`,
+            ),
+          );
+          return;
+        }
+        attempt++;
+        let port: MessagePort;
+        try {
+          port = attempt <= 2 ? this.#brokerPort() : this.#freshBrokerPort();
+        } catch (error) {
+          finish();
+          reject(error instanceof Error ? error : new Error(String(error)));
+          return;
+        }
+        port.postMessage(request);
+        const wait = Math.min(timeoutMs * 2 ** (attempt - 1), boundMs - plannedAt);
+        plannedAt += wait;
+        timer = setTimeout(attemptNow, Math.max(0, wait));
+      };
       this.#brokerReplies.set(nonce, {
         reply: (message) => {
+          finish();
           if (message.t === "port")
             resolve({ t: "port", port: message.port, ownerId: message.ownerId });
           else if (message.t === "unreachable") resolve({ t: "unreachable" });
           else resolve({ t: "noOwner" });
         },
-        fail: reject,
+        fail: (error) => {
+          finish();
+          reject(error);
+        },
+        resend: (port) => {
+          port.postMessage(request);
+        },
       });
-      port.postMessage({
-        t: "connect",
-        v: BROKER_PROTOCOL,
-        db: this.#options.database,
-        clientId: this.#client.clientId,
-        nonce,
-      } satisfies BrokerMessage);
+      attemptNow();
     });
   }
 
@@ -563,6 +694,8 @@ export class OwnerConnector {
   }
 
   #activity(): void {
+    // A new request while connecting had given up: try again (bounded, as always).
+    this.#retryIfUnreachable();
     this.#updateWatch();
     this.#updateLiveness();
     this.#updateSilence();
@@ -576,6 +709,7 @@ export class OwnerConnector {
    * alone.
    */
   async #announced(signal: SkewSignal): Promise<void> {
+    if (signal.t === "owner") this.#retryIfUnreachable();
     if (signal.t !== "owner" || !this.#isConnected()) return;
     const current = this.#client.ownerId;
     if (current === null || signal.ownerId === current) return;
