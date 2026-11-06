@@ -1,3 +1,4 @@
+import { frameOffsetMetadata } from "../../engine/frame-offsets.js";
 /**
  * Window functions: the front end's `windowed` source (an inner block computing every
  * partition, order and argument expression as a named column, plus `WindowSpec`s naming them) as
@@ -154,10 +155,13 @@ function frameOf(
         );
       return { kind: input.kind, offset: literal };
     }
+    const text =
+      frameOffsetMetadata(input)?.text ??
+      (input.offsetExact === undefined ? undefined : String(input.offsetExact));
     const typed: Typed = lowerExpression(
-      input.offsetExact === undefined
+      text === undefined
         ? { kind: "literal", value: input.offset }
-        : { kind: "literal", value: input.offset, exactText: String(input.offsetExact) },
+        : { kind: "literal", value: input.offset, exactText: text },
       { column: () => undefined },
       builder.state,
     );

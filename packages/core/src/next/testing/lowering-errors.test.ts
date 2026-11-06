@@ -6,7 +6,13 @@
  */
 import { PGlite } from "@electric-sql/pglite";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createReach, FRAME_OFFSET_STATES, HAVING_NAME_STATES } from "../../testing/reach.js";
+import {
+  createReach,
+  FRAME_OFFSET_STATES,
+  FRAME_METADATA_STATES,
+  HAVING_NAME_STATES,
+  RANGE_DECIMAL_STATES,
+} from "../../testing/reach.js";
 import { PlanningError } from "../lower/errors.js";
 import { check, nextOutcome, pgOutcome } from "./pglite-oracle.js";
 import { LoweredDatabase } from "./lowering-harness.js";
@@ -257,6 +263,112 @@ describe("HAVING names and frame offsets (review B6-p2b-3 finding 3)", () => {
                   : "unknown table",
           );
         }
+    expect(failures.join("\n")).toBe("");
+    reach.assertReached();
+  });
+
+  it("keeps decimal NUMERIC RANGE distances exact across frames and parser clones", async () => {
+    const reach = createReach<string>("exact RANGE distances", RANGE_DECIMAL_STATES);
+    const failures: string[] = [];
+    const offsets = [
+      "0.100000000000000001",
+      "9007199254740991.5",
+      "9007199254740992.5",
+      "9007199254740993.0",
+      "9.007199254740993e15",
+      "9223372036854775807.5",
+      "9223372036854775808.0",
+    ];
+    const bounds = [
+      (offset: string) => `${offset} PRECEDING`,
+      (offset: string) => `BETWEEN ${offset} PRECEDING AND CURRENT ROW`,
+      (offset: string) => `BETWEEN CURRENT ROW AND ${offset} FOLLOWING`,
+    ];
+    for (const distance of [
+      "0.100000000000000001",
+      "9007199254740992",
+      "9007199254740993",
+      "9223372036854775808",
+    ]) {
+      const next = await fixture([
+        "CREATE TABLE n (id integer, v numeric)",
+        `INSERT INTO n VALUES (1, -${distance}), (2, 0), (3, ${distance})`,
+      ]);
+      for (const offset of offsets)
+        for (const bound of bounds) {
+          const inner = `SELECT id, count(*) OVER (ORDER BY v RANGE ${bound(offset)}) AS n FROM n`;
+          const shapes = [
+            ["direct frame", `${inner} ORDER BY id`],
+            ["CTE clone", `WITH c AS (${inner}) SELECT * FROM c ORDER BY id`],
+            ["derived frame", `SELECT * FROM (${inner}) d ORDER BY id`],
+          ] as const;
+          for (const [shape, sql] of shapes) {
+            reach.beginHistory();
+            const expected = await pgOutcome(pg, sql);
+            const actual = nextOutcome(next, sql);
+            if ("rows" in expected && JSON.stringify(actual) === JSON.stringify(expected)) {
+              reach.reach(shape);
+              reach.reach(
+                distance.startsWith("0.")
+                  ? "fractional distance"
+                  : distance === "9223372036854775808"
+                    ? "2^63 distance"
+                    : "2^53 distance",
+              );
+            } else
+              failures.push(
+                `${distance}: ${sql}\nPG ${JSON.stringify(expected)}\nnext ${JSON.stringify(actual)}`,
+              );
+          }
+        }
+      const small = "count(*) OVER (ORDER BY v RANGE 9007199254740992.0 PRECEDING)";
+      const large = "count(*) OVER (ORDER BY v RANGE 9007199254740993.0 PRECEDING)";
+      const sql = `SELECT id, ${small} AS a, ${large} AS b FROM n ORDER BY ${small}, id DESC`;
+      const expected = await pgOutcome(pg, sql);
+      const actual = nextOutcome(next, sql);
+      if ("rows" in expected && JSON.stringify(actual) === JSON.stringify(expected))
+        reach.reach("adjacent frame identity");
+      else failures.push(`${sql}\nPG ${JSON.stringify(expected)}\nnext ${JSON.stringify(actual)}`);
+    }
+    expect(failures.join("\n")).toBe("");
+    reach.assertReached();
+  });
+
+  it("keeps exact integers and numeric literal types through frame clones", async () => {
+    const next = await fixture([
+      "CREATE TABLE a (id integer, v bigint)",
+      "INSERT INTO a VALUES (1, 1), (2, 2), (3, 3)",
+    ]);
+    const reach = createReach<string>("private frame metadata", FRAME_METADATA_STATES);
+    const failures: string[] = [];
+    for (const [unit, offset, state] of [
+      ["ROWS", "9223372036854775807", "exact ROWS"],
+      ["GROUPS", "9223372036854775807", "exact GROUPS"],
+      ["RANGE", "9223372036854775807", "exact RANGE"],
+      ["RANGE", "0.5", "numeric RANGE refusal"],
+      ["RANGE", "0.0", "numeric RANGE refusal"],
+    ] as const)
+      for (const bound of [
+        `${offset} PRECEDING`,
+        `BETWEEN ${offset} PRECEDING AND CURRENT ROW`,
+        `BETWEEN CURRENT ROW AND ${offset} FOLLOWING`,
+      ]) {
+        const inner = `SELECT id, count(*) OVER (ORDER BY v ${unit} ${bound}) AS n FROM a`;
+        for (const [shape, sql] of [
+          ["direct", `${inner} ORDER BY id`],
+          ["CTE", `WITH c AS (${inner}) SELECT * FROM c ORDER BY id`],
+          ["derived", `SELECT * FROM (${inner}) d ORDER BY id`],
+        ] as const) {
+          reach.beginHistory();
+          const expected = await pgOutcome(pg, sql);
+          const actual = nextOutcome(next, sql);
+          if (JSON.stringify(actual) === JSON.stringify(expected)) {
+            reach.reach(state);
+            reach.reach(shape);
+          } else
+            failures.push(`${sql}\nPG ${JSON.stringify(expected)}\nnext ${JSON.stringify(actual)}`);
+        }
+      }
     expect(failures.join("\n")).toBe("");
     reach.assertReached();
   });

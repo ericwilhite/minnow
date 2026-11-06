@@ -4,6 +4,7 @@ import {
   withRowLock,
   withRowLockCtes,
 } from "./row-locking.js";
+import { copyFrameOffset, rememberFrameOffset } from "./frame-offsets.js";
 import { checkedInteger, checkedSum } from "./integer-exactness.js";
 import { castSqlValue, datetimeText } from "./sql-casts.js";
 import { parseJson } from "../block-format/json-parse.js";
@@ -3006,6 +3007,7 @@ function cloneTreeValue(value: unknown): unknown {
   for (const key of Object.keys(value)) {
     copy[key] = cloneTreeValue((value as Record<string, unknown>)[key]);
   }
+  copyFrameOffset(value, copy);
   return copy;
 }
 
@@ -12939,10 +12941,16 @@ class Parser {
     };
     if (this.#isKeyword("PRECEDING")) {
       this.#keyword("PRECEDING");
-      return { kind: "preceding", offset, ...extra };
+      return rememberFrameOffset<WindowFrame["start"]>(
+        { kind: "preceding", offset, ...extra },
+        unit === "range" ? { text: literal } : undefined,
+      );
     }
     this.#keyword("FOLLOWING");
-    return { kind: "following", offset, ...extra };
+    return rememberFrameOffset<WindowFrame["start"]>(
+      { kind: "following", offset, ...extra },
+      unit === "range" ? { text: literal } : undefined,
+    );
   }
 
   #comparison(): ComparisonOperator {

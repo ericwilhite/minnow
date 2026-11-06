@@ -504,3 +504,25 @@ export const RANGE_NULL_STATES = [
   "nulls outside a frame",
   "null row",
 ] as const;
+
+/** Exact NUMERIC window distances, including parser clones and expression identity. */
+export const RANGE_DECIMAL_STATES = [
+  "fractional distance",
+  "2^53 distance",
+  "2^63 distance",
+  "direct frame",
+  "CTE clone",
+  "derived frame",
+  "adjacent frame identity",
+] as const;
+
+/** Private frame metadata must survive the parser's plan-copy boundaries. */
+export const FRAME_METADATA_STATES = [
+  "exact ROWS",
+  "exact GROUPS",
+  "exact RANGE",
+  "numeric RANGE refusal",
+  "direct",
+  "CTE",
+  "derived",
+] as const;
