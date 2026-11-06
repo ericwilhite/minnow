@@ -274,6 +274,33 @@ export function aggShapes(lib: ShapeLib, rows: number, only: readonly string[] =
       aggregates: [call("count", I64, 0, TEXT, true), call("count", I64, 1, TEXT, true)],
     });
 
+  if (wanted("agg_count_distinct_dictionary"))
+    // Dictionary-oriented workload: 128 entries repeated in each 2,048-row batch.
+    // Separate from h01/h05: this changes the distribution as well as the encoding.
+    shapes.push({
+      name: "agg_count_distinct_dictionary",
+      reference: "dictionary variant; no DuckDB reference",
+      rows,
+      batches: batchesOf(rows, (start, n) =>
+        [0, 1].map((column) => {
+          const entries = texts(
+            range(128, (j) =>
+              column === 0
+                ? `user${String(mix(start + j, 210) % 800000)}@mail.example.com`
+                : `acct-${String(mix(start + j, 250) % Math.max(1, Math.floor(rows / 2)))}`,
+            ),
+          );
+          return dictionary(
+            entries,
+            range(n, (j) => mix(start + j, 310 + column) % 128),
+          );
+        }),
+      ),
+      input: [TEXT, TEXT],
+      groupBy: [],
+      aggregates: [call("count", I64, 0, TEXT, true), call("count", I64, 1, TEXT, true)],
+    });
+
   if (wanted("agg_numeric_sum"))
     // SELECT SUM(n00), SUM(n01), SUM(n02), SUM(n03), AVG(n04).
     shapes.push({

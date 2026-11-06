@@ -26,5 +26,7 @@ test.describe("rebuild core aggregation microbench", () => {
     console.log(`AGG_MICROBENCH ${body}`);
     await info.attach("agg-microbench", { body, contentType: "application/json" });
     expect(results.length).toBeGreaterThan(0);
+    if (only.length === 0)
+      expect(results.map((result) => result.shape)).toContain("agg_count_distinct_dictionary");
   });
 });

@@ -1,5 +1,6 @@
 import fc from "fast-check";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { createReach } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import type { PhysicalType } from "../types.js";
 import {
@@ -205,10 +206,52 @@ describe("array validation before writing (review A1-4 follow-up)", () => {
     accept({ coefficient: 10n ** 16_383n, scale: 16_383 });
     refuse(decimal, one({ coefficient: 10n ** 131_072n, scale: 0 }), "131,073 integer digits");
     refuse(decimal, one({ coefficient: 10n ** 131_074n, scale: 2 }), "with a scale");
-    const started = performance.now();
-    refuse(decimal, one({ coefficient: 10n ** 2_000_000n, scale: 0 }), "huge");
-    expect(performance.now() - started).toBeLessThan(500);
+    // Constructing the caller's BigInt and time descheduled are not validator work.
+    const huge = one({ coefficient: 10n ** 2_000_000n, scale: 0 });
+    const started = process.cpuUsage();
+    refuse(decimal, huge, "huge");
+    const used = process.cpuUsage(started);
+    expect((used.user + used.system) / 1000).toBeLessThan(500);
   });
+
+  it.each(SEEDS)(
+    "refuses far oversized NUMERIC before converting its coefficient to text (seed %i)",
+    (seed) => {
+      const decimal: PhysicalType = { kind: "decimal", precision: null, scale: null };
+      const reach = createReach("next-array-numeric-refusal", [
+        "positive oversized",
+        "negative oversized",
+        "zero truncated tail",
+        "nonzero truncated tail",
+        "maximum scale",
+      ] as const);
+      fc.assert(
+        fc.property(
+          fc.integer({ min: 600_000, max: 1_200_000 }),
+          fc.oneof(fc.integer({ min: 0, max: 16_383 }), fc.constant(16_383)),
+          fc.boolean(),
+          fc.constantFrom(0n, 1n, -1n),
+          (bits, scale, negative, tail) => {
+            reach.beginHistory();
+            reach.reach(negative ? "negative oversized" : "positive oversized");
+            reach.reach(tail === 0n ? "zero truncated tail" : "nonzero truncated tail");
+            if (scale === 16_383) reach.reach("maximum scale");
+            const magnitude = (1n << BigInt(bits)) + tail;
+            const value = one({ coefficient: negative ? -magnitude : magnitude, scale });
+            const stringify = vi.spyOn(BigInt.prototype, "toString");
+            try {
+              refuse(decimal, value, "far beyond PostgreSQL's NUMERIC range");
+              expect(stringify).not.toHaveBeenCalled();
+            } finally {
+              stringify.mockRestore();
+            }
+          },
+        ),
+        { seed, numRuns: 100 },
+      );
+      reach.assertReached();
+    },
+  );
 
   it.each(SEEDS)(
     "bounds NUMERIC integer digits exactly at the limit (seed %i)",
@@ -216,13 +259,24 @@ describe("array validation before writing (review A1-4 follow-up)", () => {
       const decimal: PhysicalType = { kind: "decimal", precision: null, scale: null };
       let accepted = 0;
       let refused = 0;
+      const reach = createReach("next-array-numeric-boundary", [
+        "accepted",
+        "refused",
+        "maximum scale accepted",
+        "maximum scale refused",
+      ] as const);
       fc.assert(
         fc.property(
-          fc.integer({ min: 0, max: 64 }),
+          fc.oneof(
+            fc.integer({ min: 0, max: 64 }),
+            fc.integer({ min: 0, max: 16_383 }),
+            fc.constant(16_383),
+          ),
           fc.integer({ min: -3, max: 3 }),
           fc.oneof(fc.integer({ min: 1, max: 9 }), fc.constant(0)),
           fc.boolean(),
           (scale, delta, lead, negative) => {
+            reach.beginHistory();
             // `digits` digits: a leading digit then zeros, or (lead 0) all nines; integer digits
             // = digits − scale sits within 3 of the limit, where the size estimate is tightest.
             const digits = 131_072 + scale + delta;
@@ -231,9 +285,13 @@ describe("array validation before writing (review A1-4 follow-up)", () => {
             const value = one({ coefficient: negative ? -magnitude : magnitude, scale });
             if (delta <= 0) {
               accepted += 1;
+              reach.reach("accepted");
+              if (scale === 16_383) reach.reach("maximum scale accepted");
               expect(decodeArrayValue(decimal, encodeArrayValue(decimal, value))).toEqual(value);
             } else {
               refused += 1;
+              reach.reach("refused");
+              if (scale === 16_383) reach.reach("maximum scale refused");
               refuse(decimal, value, `${String(digits)} digits at scale ${String(scale)}`);
             }
           },
@@ -243,6 +301,7 @@ describe("array validation before writing (review A1-4 follow-up)", () => {
       // Declared reach: both sides of the limit.
       expect(accepted).toBeGreaterThan(50);
       expect(refused).toBeGreaterThan(50);
+      reach.assertReached();
       // 300 round trips of ~131k-digit coefficients: ~4 s alone, but well past the default 20 s
       // timeout when the machine is saturated. A load timeout is not a failure of the law.
     },

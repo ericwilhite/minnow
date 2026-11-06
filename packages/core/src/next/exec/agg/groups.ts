@@ -810,35 +810,65 @@ class Int64Keys implements KeyColumn {
 }
 
 /** Bytes per id in one arena: id i is `bytes[starts[i] … starts[i + 1])`. */
-class ByteArena {
+/** Variable-length key bytes by id (exported for its direct test). */
+export class ByteArena {
   bytes: Uint8Array;
   starts: Int32Array;
+  /** `bytes` as a DataView: keys copy and compare four bytes at a time, at any offset. */
+  #view: DataView;
   constructor(readonly memory: Charged) {
     this.bytes = memory.make(Uint8Array, 0);
     this.starts = memory.make(Int32Array, 1025);
+    this.#view = new DataView(this.bytes.buffer);
   }
-  append(id: number, source: Uint8Array, start: number, end: number): void {
+  /**
+   * Appends `source[start … end)` as id `id`'s bytes. With `view` (a DataView over exactly
+   * `source`'s bytes, so its index k is `source[k]`; the caller's, made once per source array)
+   * it copies four bytes at a time.
+   */
+  append(id: number, source: Uint8Array, start: number, end: number, view?: DataView): void {
     if (id + 2 > this.starts.length)
-      this.starts = this.memory.int32(this.starts, 2 * this.starts.length);
+      this.starts = this.memory.int32(this.starts, grownCapacity(this.starts.length, id + 2));
     const at = this.starts[id] ?? 0;
     const length = end - start;
     if (at + length > this.bytes.length) {
-      const next = this.memory.make(Uint8Array, Math.max(4096, 2 * this.bytes.length, at + length));
+      // 2× while small, 4× from LARGE_ARRAY bytes: fewer copies of a large arena.
+      const next = this.memory.make(
+        Uint8Array,
+        Math.max(4096, grownCapacity(this.bytes.length, at + length)),
+      );
       next.set(this.bytes.subarray(0, at));
       this.memory.give(this.bytes.byteLength);
       this.bytes = next;
+      this.#view = new DataView(next.buffer);
     }
     const bytes = this.bytes;
-    if (length <= 64) for (let b = 0; b < length; b++) bytes[at + b] = source[start + b] ?? 0;
-    else bytes.set(source.subarray(start, end), at);
+    if (length > 64) bytes.set(source.subarray(start, end), at);
+    else if (view === undefined)
+      for (let b = 0; b < length; b++) bytes[at + b] = source[start + b] ?? 0;
+    else {
+      const into = this.#view;
+      const from = start;
+      let b = 0;
+      for (; b + 4 <= length; b += 4) into.setUint32(at + b, view.getUint32(from + b));
+      for (; b < length; b++) bytes[at + b] = source[start + b] ?? 0;
+    }
     this.starts[id + 1] = at + length;
   }
-  equals(id: number, source: Uint8Array, start: number, end: number): boolean {
+  /** Whether id `id`'s bytes equal `source[start … end)` (four at a time with `view`). */
+  equals(id: number, source: Uint8Array, start: number, end: number, view?: DataView): boolean {
     const at = this.starts[id] ?? 0;
     const length = end - start;
     if ((this.starts[id + 1] ?? 0) - at !== length) return false;
     const bytes = this.bytes;
-    for (let b = 0; b < length; b++) if (bytes[at + b] !== source[start + b]) return false;
+    let b = 0;
+    if (view !== undefined) {
+      const mine = this.#view;
+      const from = start;
+      for (; b + 4 <= length; b += 4)
+        if (mine.getUint32(at + b) !== view.getUint32(from + b)) return false;
+    }
+    for (; b < length; b++) if (bytes[at + b] !== source[start + b]) return false;
     return true;
   }
   /** Bytes of ids `from … from + count − 1` (or `ids[0 … count)`). */
@@ -854,10 +884,14 @@ class ByteArena {
 }
 
 const EMPTY = new Uint8Array(0);
+const EMPTY_VIEW = new DataView(EMPTY.buffer);
 
 class ByteKeys implements KeyColumn {
   readonly #slots: Slots;
   readonly #arena: ByteArena;
+  /** The last key bytes array seen, and a DataView over exactly its bytes (one per array). */
+  #source: Uint8Array = EMPTY;
+  #sourceView: DataView = EMPTY_VIEW;
   readonly #idColumns: IdColumns;
   count = 0;
   #nullId = -1;
@@ -879,7 +913,15 @@ class ByteKeys implements KeyColumn {
     }
     return this.#nullId;
   }
+  #viewOf(source: Uint8Array): DataView {
+    if (source !== this.#source) {
+      this.#source = source;
+      this.#sourceView = new DataView(source.buffer, source.byteOffset, source.byteLength);
+    }
+    return this.#sourceView;
+  }
   #id(source: Uint8Array, start: number, end: number): number {
+    const view = this.#viewOf(source);
     const h = xxHash32(source, 0, start, end) | 0;
     const slots = this.#slots;
     const slotIds = slots.ids;
@@ -889,7 +931,7 @@ class ByteKeys implements KeyColumn {
     for (;;) {
       const entry = slotIds[s] ?? 0;
       if (entry === 0) break;
-      if (slotHashes[s] === h && this.#arena.equals(entry - 1, source, start, end))
+      if (slotHashes[s] === h && this.#arena.equals(entry - 1, source, start, end, view))
         return entry - 1;
       s = (s + 1) & mask;
     }
@@ -897,7 +939,7 @@ class ByteKeys implements KeyColumn {
     this.#idColumns.ensure(id);
     this.#idColumns.hashes[id] = h;
     this.#idColumns.outside[id] = 0;
-    this.#arena.append(id, source, start, end);
+    this.#arena.append(id, source, start, end, view);
     slotIds[s] = id + 1;
     slotHashes[s] = h;
     if (slots.full(this.count))
@@ -911,6 +953,15 @@ class ByteKeys implements KeyColumn {
     throw new TypeError(`byte group keys over ${data.layout}`);
   }
   assign(key: Vector, length: number, selection: Selection | null, ids: Int32Array): void {
+    try {
+      this.#assign(key, length, selection, ids);
+    } finally {
+      // Nothing of the batch outlives the call (its bytes are borrowed).
+      this.#source = EMPTY;
+      this.#sourceView = EMPTY_VIEW;
+    }
+  }
+  #assign(key: Vector, length: number, selection: Selection | null, ids: Int32Array): void {
     const rows = selection === null ? IDENTITY : selection.rows;
     const count = selection === null ? length : selection.count;
     if (key.form === "dictionary") {

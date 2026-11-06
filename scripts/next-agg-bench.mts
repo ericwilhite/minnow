@@ -120,6 +120,9 @@ const results: Array<{
   min: number;
   median: number;
   cpu: number;
+  cpuRuns: number[];
+  cpuMedian: number;
+  cpuSpread: number;
   reference: string;
 }> = [];
 
@@ -149,6 +152,9 @@ async function bench(
     min: samples[0] ?? 0,
     median: samples[Math.floor(samples.length / 2)] ?? 0,
     cpu: cpu[0] ?? 0,
+    cpuRuns: cpu,
+    cpuMedian: cpu[Math.floor(cpu.length / 2)] ?? 0,
+    cpuSpread: (cpu[cpu.length - 1] ?? 0) - (cpu[0] ?? 0),
     reference,
   });
 }
@@ -158,7 +164,7 @@ const D = decimal(null, null);
 const M = 1_048_576;
 
 // agg_numeric_sum: SUM(n00..n03) + AVG(n04) over NUMERIC(12,2).
-{
+if (!ONLY.startsWith("harness")) {
   const data = batches(M, (n) =>
     Array.from({ length: 5 }, () =>
       decimals(
@@ -205,6 +211,7 @@ for (const [groups, reference] of [
   [100, "DuckDB 8.9 ms (whole query)"],
   [20_000, "DuckDB 16.1 ms (whole query)"],
 ] as const) {
+  if (ONLY.startsWith("harness")) continue;
   const rows = 200_000;
   const data = batches(rows, (n) => [
     numbers(
@@ -222,7 +229,7 @@ for (const [groups, reference] of [
 }
 
 // agg_highcard_int: ~632k int groups, COUNT(*) + SUM(float).
-{
+if (!ONLY.startsWith("harness")) {
   const data = batches(M, (n) => [
     numbers(
       I32,
@@ -239,7 +246,7 @@ for (const [groups, reference] of [
 }
 
 // agg_3dims_20aggs: three low-cardinality text dims (dictionary pages), 20 aggregates.
-{
+if (!ONLY.startsWith("harness")) {
   const dims = [5, 20, 100].map((card) =>
     texts(Array.from({ length: card }, (_, k) => `v${String(k)}`)),
   );
@@ -289,7 +296,13 @@ for (const [groups, reference] of [
 // 1,000 groups), agg_count_distinct, agg_numeric_sum.
 {
   const lib = { I32, I64, F64, TEXT, TS, decimal, numbers, texts, dictionary, decimals, col };
-  const names = ["agg_highcard_int", "agg_3dims_20aggs", "agg_count_distinct", "agg_numeric_sum"];
+  const names = [
+    "agg_highcard_int",
+    "agg_3dims_20aggs",
+    "agg_count_distinct",
+    "agg_count_distinct_dictionary",
+    "agg_numeric_sum",
+  ];
   const breakdown = ONLY.startsWith("3dims part");
   const wanted = names.filter(
     (name) => `harness ${name}`.includes(ONLY) || (breakdown && name === "agg_3dims_20aggs"),
@@ -323,7 +336,7 @@ for (const [groups, reference] of [
 }
 
 // agg_count_distinct: COUNT(DISTINCT) over two high-cardinality text columns.
-{
+if (!ONLY.startsWith("harness")) {
   const data = batches(M, (n) => [
     texts(
       Array.from({ length: n }, () => `user${String(Math.floor(random() * 800_000))}@example.com`),
@@ -340,9 +353,13 @@ for (const [groups, reference] of [
   );
 }
 
-console.log(`| shape | rows | min ms | median ms | min CPU ms | reference |`);
-console.log(`|---|---:|---:|---:|---:|---|`);
+console.log(
+  `| shape | rows | min ms | median ms | min CPU ms | median CPU ms | CPU spread ms | reference |`,
+);
+console.log(`|---|---:|---:|---:|---:|---:|---:|---|`);
 for (const r of results)
   console.log(
-    `| ${r.shape} | ${r.rows.toLocaleString("en-US")} | ${r.min.toFixed(2)} | ${r.median.toFixed(2)} | ${r.cpu.toFixed(2)} | ${r.reference} |`,
+    `| ${r.shape} | ${r.rows.toLocaleString("en-US")} | ${r.min.toFixed(2)} | ${r.median.toFixed(2)} | ${r.cpu.toFixed(2)} | ${r.cpuMedian.toFixed(2)} | ${r.cpuSpread.toFixed(2)} | ${r.reference} |`,
   );
+
+console.log(JSON.stringify(results));

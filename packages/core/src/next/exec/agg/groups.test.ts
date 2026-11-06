@@ -27,7 +27,7 @@ import {
   texts,
   valueAt,
 } from "../kernels/test-support.js";
-import { GroupTable, type Int32KeyEvent } from "./groups.js";
+import { ByteArena, Charged, GroupTable, type Int32KeyEvent } from "./groups.js";
 
 /** `xs[i]`, which must exist. */
 function at<T>(xs: readonly T[], i: number): T {
@@ -415,5 +415,208 @@ describe("GroupTable against a GROUP BY model (generated)", () => {
     expect(assign(all)).toEqual(first);
     expect(table.groupCount).toBe(65_537);
     table.close();
+  });
+});
+
+describe("byte keys copied and compared four bytes at a time (generated)", () => {
+  const BYTE_SEEDS = seedsFor("next-group-table-bytes", [0x62, 0x63]);
+  it.each(BYTE_SEEDS)(
+    "keys of 0–80 bytes at any source offset match a byte-by-byte model (seed %i)",
+    (seed) => {
+      // Law: GROUP BY over text is byte equality (C collation); ids first-seen; the emitted key
+      // is the first-seen value's bytes (ByteKeys / ByteArena contract). The model compares and
+      // keeps bytes one at a time; the table copies and compares them four at a time through
+      // DataViews, so tail lengths (0–3 left over) and unaligned offsets are what it must get
+      // right. Each batch's bytes start 0–7 bytes into their buffer.
+      const reach = createReach("next-group-table-bytes", [
+        "tail of 1–3 bytes",
+        "unaligned source buffer",
+        "keys differing only in the tail",
+        "empty key",
+        "key over 64 bytes",
+      ] as const);
+      fc.assert(
+        fc.property(fc.integer(), fc.integer({ min: 1, max: 6 }), (inner, batches) => {
+          reach.beginHistory();
+          const random = mulberry32(inner);
+          const table = new GroupTable([TEXT], UNCHARGED);
+          const model = new Map<string, number>();
+          const first: string[] = [];
+          const gids = new Int32Array(2048);
+          // A pool of keys sharing long prefixes, so many probes compare equal heads.
+          const pool = Array.from({ length: 40 }, () => {
+            const length = Math.floor(random() * 81);
+            const prefix = "p".repeat(Math.min(length, Math.floor(random() * 4) * 16));
+            let key = prefix;
+            while (key.length < length)
+              key += String.fromCharCode(0x21 + Math.floor(random() * 90));
+            return key;
+          });
+          for (let b = 0; b < batches; b++) {
+            const length = 1 + Math.floor(random() * 500);
+            const keys = Array.from(
+              { length },
+              () => pool[Math.floor(random() * pool.length)] ?? "",
+            );
+            const pad = Math.floor(random() * 8);
+            const total = keys.reduce((n, k) => n + k.length, 0);
+            const buffer = new Uint8Array(pad + total + 8);
+            const bytes = buffer.subarray(pad, pad + total);
+            const offsets = new Int32Array(length + 1);
+            let at = 0;
+            keys.forEach((key, k) => {
+              offsets[k] = at;
+              for (let c = 0; c < key.length; c++) bytes[at + c] = key.charCodeAt(c);
+              at += key.length;
+            });
+            offsets[length] = at;
+            if (pad % 4 !== 0) reach.reach("unaligned source buffer");
+            const vector: FlatVector = {
+              form: "flat",
+              type: TEXT,
+              length,
+              validity: null,
+              data: { layout: "varlen", bytes, offsets },
+            };
+            gids.fill(-7);
+            table.assign([vector], length, null, gids);
+            for (let r = 0; r < length; r++) {
+              const key = keys[r] ?? "";
+              if (key.length % 4 !== 0) reach.reach("tail of 1–3 bytes");
+              if (key.length === 0) reach.reach("empty key");
+              if (key.length > 64) reach.reach("key over 64 bytes");
+              let id = model.get(key);
+              if (id === undefined) {
+                id = model.size;
+                model.set(key, id);
+                first.push(key);
+              }
+              if (gids[r] !== id) expect(gids[r], `row ${String(r)} key ${key}`).toBe(id);
+            }
+          }
+          // Distinct keys that share all but their last 1–3 bytes.
+          const seen = [...model.keys()];
+          if (
+            seen.some((a) =>
+              seen.some(
+                (b) =>
+                  a !== b &&
+                  a.length === b.length &&
+                  a.length % 4 !== 0 &&
+                  a.slice(0, a.length - (a.length % 4)) === b.slice(0, b.length - (b.length % 4)),
+              ),
+            )
+          )
+            reach.reach("keys differing only in the tail");
+          const out = table.emitKey(0, 0, model.size);
+          for (let k = 0; k < model.size; k++) expect(valueAt(out, k)).toBe(first[k]);
+          table.close();
+        }),
+        { seed, numRuns: 60 },
+      );
+      reach.assertReached();
+    },
+    180_000,
+  );
+});
+
+describe("ByteArena.equals four bytes at a time (generated)", () => {
+  const ARENA_SEEDS = seedsFor("next-byte-arena", [0x64, 0x65]);
+  it.each(ARENA_SEEDS)(
+    "equals is byte equality for keys of 0–80 bytes at any offset (seed %i)",
+    (seed) => {
+      // The table reaches `equals` only after a hash match, so keys differing in one byte rarely
+      // get there: this compares it directly with byte equality, the difference (if any) in the
+      // head, a word or the 1–3 byte tail.
+      const reach = createReach("next-byte-arena", [
+        "differ in the tail",
+        "differ in a word",
+        "equal",
+        "unaligned source",
+      ] as const);
+      fc.assert(
+        fc.property(
+          fc.array(
+            fc.record({
+              length: fc.integer({ min: 0, max: 80 }),
+              pad: fc.integer({ min: 0, max: 7 }),
+              at: fc.integer({ min: -1, max: 80 }),
+              seed: fc.integer(),
+            }),
+            { minLength: 1, maxLength: 30 },
+          ),
+          (cases) => {
+            reach.beginHistory();
+            const arena = new ByteArena(new Charged(UNCHARGED));
+            cases.forEach(({ length, pad, at, seed: s }, id) => {
+              const random = mulberry32(s);
+              const key = Uint8Array.from({ length }, () => Math.floor(random() * 256));
+              const buffer = new Uint8Array(pad + 2 * length + 8);
+              const source = buffer.subarray(pad);
+              source.set(key, 0);
+              arena.append(id, source, 0, length, new DataView(source.buffer, pad));
+              // The probe: the same bytes, or one byte changed at `at` (−1: none).
+              const probe = buffer.subarray(pad);
+              probe.set(key, length);
+              const change = at >= 0 && at < length;
+              if (change) probe[length + at] = ((probe[length + at] ?? 0) + 1) & 255;
+              if (pad % 4 !== 0) reach.reach("unaligned source");
+              if (!change) reach.reach("equal");
+              else if (at >= length - (length % 4)) reach.reach("differ in the tail");
+              else reach.reach("differ in a word");
+              const view = new DataView(probe.buffer, probe.byteOffset, probe.byteLength);
+              expect(arena.equals(id, probe, length, 2 * length, view)).toBe(!change);
+              expect(arena.equals(id, probe, length, 2 * length)).toBe(!change);
+            });
+          },
+        ),
+        { seed, numRuns: 200 },
+      );
+      reach.assertReached();
+    },
+    120_000,
+  );
+});
+
+describe("hashed key tables keep ids through growth past 65,536 slots", () => {
+  it("text and float8 keys keep their ids through growth past 65,536 slots", () => {
+    // Law: first-seen ids and emitted keys are independent of the table's growth (Slots, and
+    // NumberKeys' key beside each slot, resized with it). 100,000 distinct keys take the table
+    // well past 65,536 slots, checked against a model.
+    for (const kind of ["text", "float8"] as const) {
+      const table = new GroupTable([kind === "text" ? TEXT : F64], UNCHARGED);
+      const gids = new Int32Array(2048);
+      const random = mulberry32(kind === "text" ? 7 : 8);
+      const model = new Map<string | number, number>();
+      const first: Array<string | number> = [];
+      for (let batch = 0; batch < 120; batch++) {
+        const keys = Array.from({ length: 2048 }, () => {
+          const k = Math.floor(random() * 100_000);
+          return kind === "text" ? `k${String(k)}` : k / 8 + 0.5;
+        });
+        const vector = kind === "text" ? texts(keys as string[]) : numbers(F64, keys as number[]);
+        table.assign([vector], 2048, null, gids);
+        keys.forEach((key, r) => {
+          let id = model.get(key);
+          if (id === undefined) {
+            id = model.size;
+            model.set(key, id);
+            first.push(key);
+          }
+          if (gids[r] !== id) expect(gids[r], `${kind} row ${String(r)}`).toBe(id);
+        });
+      }
+      expect(model.size).toBeGreaterThan(90_000);
+      expect(table.groupCount).toBe(model.size);
+      for (let from = 0; from < model.size; from += 2048) {
+        const count = Math.min(2048, model.size - from);
+        const out = table.emitKey(0, from, count);
+        for (let k = 0; k < count; k++) {
+          const value = valueAt(out, k);
+          if (value !== first[from + k]) expect(value).toBe(first[from + k]);
+        }
+      }
+      table.close();
+    }
   });
 });
