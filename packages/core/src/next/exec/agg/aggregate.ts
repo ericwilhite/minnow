@@ -45,6 +45,9 @@ import { accumulatorFor, fusedSums, type Accumulator } from "./states.js";
 
 type AggregateRel = Extract<Rel, { op: "aggregate" }>;
 
+/** What a cleared fused-column slot holds (no borrowed array). */
+const NO_COLUMN = new Float64Array(0);
+
 const UNSUPPORTED = new Set([
   "string_agg",
   "array_agg",
@@ -208,6 +211,8 @@ export class AggregateOperator implements Operator {
         for (const aggregate of this.#aggregates)
           if (aggregate.updates) aggregate.accumulator.grow(1);
         this.#fused = this.#aggregates.filter((a) => a.fusable);
+        // Charged like the operator's other per-instance buffers (returned on a failed build).
+        this.#takeArena(context, 8 * this.#fused.length);
         this.#fusedTotals = new Float64Array(this.#fused.length);
       }
     } catch (error) {
@@ -317,22 +322,28 @@ export class AggregateOperator implements Operator {
     const columns = this.#fusedColumns;
     const members = this.#fusedMembers;
     let n = 0;
-    for (const aggregate of this.#fused) {
-      if (aggregate.argument === null) continue;
-      const value = aggregate.argument.evaluate(batch, batch.selection);
-      const values = aggregate.accumulator.fusedValues?.(value, rows, count) ?? null;
-      if (values === null) {
-        aggregate.accumulator.update(value, this.#gids, rows, count, true);
-        continue;
+    try {
+      for (const aggregate of this.#fused) {
+        if (aggregate.argument === null) continue;
+        const value = aggregate.argument.evaluate(batch, batch.selection);
+        const values = aggregate.accumulator.fusedValues?.(value, rows, count) ?? null;
+        if (values === null) {
+          aggregate.accumulator.update(value, this.#gids, rows, count, true);
+          continue;
+        }
+        columns[n] = values;
+        members[n] = aggregate;
+        n += 1;
       }
-      columns[n] = values;
-      members[n] = aggregate;
-      n += 1;
+      if (n === 0) return;
+      const totals = this.#fusedTotals;
+      fusedSums(columns, n, count, totals);
+      for (let j = 0; j < n; j++) members[j]?.accumulator.addFused?.(totals[j] ?? 0, count);
+    } finally {
+      // The batch's coefficient arrays are borrowed: keep no reference once the push returns
+      // (on every exit, an exception included), so a released input is never kept alive.
+      for (let j = 0; j < n; j++) columns[j] = NO_COLUMN;
     }
-    if (n === 0) return;
-    const totals = this.#fusedTotals;
-    fusedSums(columns, n, count, totals);
-    for (let j = 0; j < n; j++) members[j]?.accumulator.addFused?.(totals[j] ?? 0, count);
   }
 
   ready(): Promise<void> {

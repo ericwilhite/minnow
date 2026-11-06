@@ -7,6 +7,8 @@
  * non-qualifying batch between fused ones.
  */
 import { PGlite } from "@electric-sql/pglite";
+import v8 from "node:v8";
+import vm from "node:vm";
 import fc from "fast-check";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createReach } from "../../../testing/reach.js";
@@ -203,4 +205,126 @@ describe("fused scalar NUMERIC sums and shared SUM/AVG state against PostgreSQL"
     },
     180_000,
   );
+
+  it("keeps no reference to a fused batch's coefficients once push returns (review B4-p2c-1)", async () => {
+    // A forced collection: the WeakRef clears only if nothing (the operator included) holds it.
+    v8.setFlagsFromString("--expose-gc");
+    const gc = vm.runInNewContext("gc") as () => void;
+    const op = new AggregateOperator(
+      {
+        id: 1,
+        op: "aggregate",
+        output: [],
+        input: { id: 0, op: "values", output: [], rows: [] },
+        groupBy: [],
+        groupingSets: null,
+        aggregates: [0, 1].map((c) => ({
+          fn: "sum" as const,
+          args: [col(c, N12)],
+          distinct: false,
+          filter: null,
+          orderBy: [],
+          type: D,
+        })),
+      },
+      { arena: new OutputArena(UNCHARGED, 2048), input: [N12, N12], params: { slots: [] } },
+      UNCHARGED,
+      {
+        push: () => "ready",
+        ready: () => Promise.resolve(),
+        finish: () => undefined,
+        abort: () => undefined,
+      },
+    );
+    const refs: Array<WeakRef<Float64Array>> = [];
+    const push = () => {
+      const columns = [0, 1].map(() =>
+        decimals(
+          N12,
+          Array.from({ length: 2048 }, (_, i) => [BigInt(i), 2] as const),
+          "safe",
+          2,
+        ),
+      );
+      for (const column of columns)
+        if (column.data.layout === "decimal" && column.data.coefficients.repr === "safe")
+          refs.push(new WeakRef(column.data.coefficients.values));
+      op.push({ length: 2048, selection: null, columns });
+    };
+    push();
+    for (let k = 0; k < 5; k++) {
+      await new Promise((resolve) => setImmediate(resolve));
+      gc();
+    }
+    expect(refs.every((ref) => ref.deref() === undefined)).toBe(true);
+    await op.finish();
+  });
+
+  it("charges every buffer the operator builds, the fused totals included (review B4-p2c-1)", () => {
+    const counting = () => {
+      const c = {
+        held: 0,
+        allocate: (n: number) => ((c.held += n), true),
+        free: (n: number) => void (c.held -= n),
+      };
+      return c;
+    };
+    const arenaCharge = counting();
+    const stateCharge = counting();
+    const types = [
+      Uint8Array,
+      Uint16Array,
+      Uint32Array,
+      Int32Array,
+      Float64Array,
+      BigInt64Array,
+    ] as const;
+    const real: unknown[] = types.map((T) => (globalThis as Record<string, unknown>)[T.name]);
+    let built = 0;
+    types.forEach((T) => {
+      (globalThis as Record<string, unknown>)[T.name] = new Proxy(T, {
+        construct(target, args: unknown[]) {
+          const made = Reflect.construct(target, args) as { byteLength: number };
+          built += made.byteLength;
+          return made;
+        },
+      });
+    });
+    let arena: OutputArena;
+    try {
+      arena = new OutputArena(arenaCharge, 2048);
+      const before = built;
+      new AggregateOperator(
+        {
+          id: 1,
+          op: "aggregate",
+          output: [],
+          input: { id: 0, op: "values", output: [], rows: [] },
+          groupBy: [],
+          groupingSets: null,
+          aggregates: [0, 1, 2].map((c) => ({
+            fn: "sum" as const,
+            args: [col(c, N12)],
+            distinct: false,
+            filter: null,
+            orderBy: [],
+            type: D,
+          })),
+        },
+        { arena, input: [N12, N12, N12], params: { slots: [] } },
+        stateCharge,
+        {
+          push: () => "ready",
+          ready: () => Promise.resolve(),
+          finish: () => undefined,
+          abort: () => undefined,
+        },
+      );
+      expect(built - before).toBeLessThanOrEqual(arenaCharge.held + stateCharge.held);
+    } finally {
+      types.forEach((T, k) => {
+        (globalThis as Record<string, unknown>)[T.name] = real[k];
+      });
+    }
+  });
 });

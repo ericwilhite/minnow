@@ -928,6 +928,9 @@ class TupleKeys {
         this.#slots.ids[s] = g + 1;
         this.#slots.hashes[s] = h;
         if (this.#slots.full(g + 1)) this.#slots.grow(this.#hashes, g + 1, null);
+        // The table never passes half full (so every probe ends at an empty slot).
+        if (this.#slots.full(g + 1))
+          throw new Error("TupleKeys: the slot table is more than half full while migrating");
       }
       return;
     }
