@@ -45,6 +45,7 @@ import {
   numbers,
   texts,
   valueAt,
+  sqlLiteral,
 } from "./test-support.js";
 
 const INTERVAL: PhysicalType = { kind: "interval" };
@@ -71,19 +72,9 @@ const TYPES: Record<Kind, PhysicalType> = {
   numeric: decimal(null, null),
 };
 
-/** A SQL literal of `value` as PostgreSQL type `kind`. */
+/** A SQL literal of `value` as PostgreSQL type `kind` (the shared, always-quoted form). */
 function literal(kind: Kind, value: Value): string {
-  if (value === null) return `null::${kind}`;
-  if (Array.isArray(value)) {
-    const [c, s] = value as readonly [bigint, number];
-    const negative = c < 0n;
-    const digits = (negative ? -c : c).toString().padStart(s + 1, "0");
-    const text =
-      s === 0 ? digits : `${digits.slice(0, digits.length - s)}.${digits.slice(digits.length - s)}`;
-    return `'${negative ? "-" : ""}${text}'::numeric`;
-  }
-  if (typeof value === "number" && Object.is(value, -0)) return `'-0'::${kind}`;
-  return `'${String(value)}'::${kind}`;
+  return sqlLiteral(kind, value);
 }
 
 /** A vector of `values` as `kind`, with garbage under NULLs. */
