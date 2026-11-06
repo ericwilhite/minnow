@@ -132,9 +132,16 @@
  * the next commit (zero wakeups when idle).
  *
  * ## Memory (rulings R5, R16.3)
- * - Memtables, index deltas, the resident fences and Bloom filters of index runs, and scratch are
- *   one write-path grant (memory/governor.ts). It is spillable in the governor's sense: its
- *   reclaim callback flushes memtables.
+ * - Memtables, index deltas and scratch use the write-path grant (memory/governor.ts). Resident
+ *   directories, roots, fences and Bloom filters use its separate metadata grant. Every byte is
+ *   charged before allocation. Freeing buffers returns allocations to a grant; unused growth
+ *   reservations yield to governor reclaim requests, retaining the working minimum and every
+ *   allocated or loan-backed byte. This lets a bounded merge admission progress beside a writer.
+ * - Metadata allocation first uses its own grant (and the governor's cache eviction), then
+ *   returns idle writer reservations and retries. Directory construction and run-reader opens
+ *   use that same budget, as do root/statistics charges. Retained high-water estimates must not
+ *   cause a size refusal while the writer holds sufficient reclaimable capacity. Row admission
+ *   separately freezes committed memtables and waits for their flush at a writer boundary.
  * - Frozen memtables awaiting their flush's publication are charged to the write path,
  *   non-spillable, up to `FROZEN_MEMTABLE_CAP_BYTES` (writers wait past it). Once the flush
  *   publishes, readers still on that memtable are re-pointed to the published group and the

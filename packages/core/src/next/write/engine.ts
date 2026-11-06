@@ -99,6 +99,7 @@ import { Replayer, type Effect } from "../format/replay.js";
 import { walkReachable } from "../format/reachable.js";
 import { encodeKeyBatch, KeyBatch } from "../keys/key-encoding.js";
 import type { Grant } from "../memory/governor.js";
+import { MetadataBudget, releaseIdle } from "./budget.js";
 import { GroupWriter } from "../page/writer.js";
 import type { StoreSession } from "../storage/contract.js";
 import { ExtentListKeeper, type ExtentList } from "../storage/extent-list.js";
@@ -430,9 +431,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
   /**
    * The long-lived charge for metadata the engine keeps resident (the root, every table's
    * directory state), apart from the evictable caches: a grant of its own, so it shows under its
-   * label and a refusal raises `ParseBudgetError` instead of growing the heap unseen.
+   * label. MetadataBudget sheds idle write reservations before retrying a refused growth;
+   * every resident byte is still charged before it exists.
    */
   readonly #metadataGrant: Grant;
+  readonly #metadataBudget: MetadataBudget;
   /**
    * Decoded roots and their parse charges, refcounted by the write states that hold them (review
    * B3-p2a-3 #2): an older root stays charged until the last reader of its generation closes. A
@@ -569,11 +572,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
     catalog: Catalog,
     metadata: {
       readonly grant: Grant;
+      readonly budget: MetadataBudget;
       readonly rootCharge: number;
       readonly lists: ExtentListKeeper;
     },
   ) {
     this.#metadataGrant = metadata.grant;
+    this.#metadataBudget = metadata.budget;
     this.#lists = metadata.lists;
     this.#roots.set(root, { refs: 1, bytes: metadata.rootCharge });
     this.durability = input.options.durability;
@@ -655,6 +660,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
       minimumBytes: 0,
       spillable: true,
     });
+    // Growth after a wide batch is a reservation, not a live buffer. Return it on pressure.
+    const reclaimWriter = () => releaseIdle(grant, MINIMUM_BYTES);
+    grant.onReclaimRequest(reclaimWriter);
+    metadataGrant.onReclaimRequest(() => releaseIdle(metadataGrant));
+    const metadataBudget = new MetadataBudget(metadataGrant, reclaimWriter);
     try {
       const { space, session } = input;
       let rootCharge = 0;
@@ -699,7 +709,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
           root = { ...root, extentList: await delta.prepare(root.sequence, writer, []) };
           const bytes = encodeManifestRoot(root);
           rootCharge = parseCharge(bytes.length);
-          if (!metadataGrant.allocate(rootCharge)) throw new ParseBudgetError(rootCharge);
+          if (!metadataBudget.allocate(rootCharge)) throw new ParseBudgetError(rootCharge);
           await delta.publish(space, bytes, writer, []);
         } catch (error) {
           failed = error;
@@ -714,7 +724,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
             : new Error("The first root failed", { cause: failed });
       } else {
         // The decoded root stays resident for the session: its parse charge stays with it.
-        const parsed = decodeManifestRoot(space.root, metadataGrant);
+        const parsed = decodeManifestRoot(space.root, metadataBudget);
         rootCharge = parsed.charge;
         root = parsed.value;
         // Built from the durable root's list, never from earlier callbacks (ruling R25).
@@ -723,6 +733,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       }
       const engine = new WritePathImpl(input, grant, root, catalog, {
         grant: metadataGrant,
+        budget: metadataBudget,
         rootCharge,
         lists,
       });
@@ -759,7 +770,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
           }
           pages = [...index.value];
           index.release();
-          const builder = GroupDirectory.builder(this.#metadataGrant).expect(table.groupCount);
+          const builder = GroupDirectory.builder(this.#metadataBudget).expect(table.groupCount);
           try {
             for (const page of pages) {
               const held = await this.#metadata.groupPage(page.ref, this.#grant);
@@ -805,7 +816,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         if (table.statistics !== null) {
           const parsed = decodeTableStatistics(
             await readBlob(this.#space, table.statistics, this.#grant),
-            this.#metadataGrant,
+            this.#metadataBudget,
           );
           state.metadataBytes += parsed.charge;
           if (parsed.value.groupCount !== table.groupCount)
@@ -1447,8 +1458,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
 
   /** Charges (or, negative, returns) resident metadata bytes; a refusal is `ParseBudgetError`. */
   #chargeMetadata(bytes: number): void {
-    if (bytes < 0) this.#metadataGrant.free(-bytes);
-    else if (bytes > 0 && !this.#metadataGrant.allocate(bytes)) throw new ParseBudgetError(bytes);
+    if (bytes < 0) this.#metadataBudget.free(-bytes);
+    else if (bytes > 0 && !this.#metadataBudget.allocate(bytes)) throw new ParseBudgetError(bytes);
   }
 
   #dropTableState(tableId: number): void {
@@ -2148,7 +2159,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       return cached;
     }
     // Its resident parts are charged to the metadata grant before they are built (runs.ts).
-    const opened = RunReader.open(this.#space, ref, this.#grant, this.#metadataGrant);
+    const opened = RunReader.open(this.#space, ref, this.#grant, this.#metadataBudget);
     if (opened instanceof Promise) {
       const pending = opened.then((reader) => {
         // A drop while it opened took the entry away: give the charge back.
@@ -2381,7 +2392,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       // The next generation's directory: unchanged chunks shared, changed ones and the tail
       // copied, each charged before it is allocated (review B3-p2a-3 #1, #2, #6). This publication
       // owns the new chunks' creation references until a state holds them (or it fails).
-      const groups = before.with(changes, newGroups, this.#metadataGrant);
+      const groups = before.with(changes, newGroups, this.#metadataBudget);
       created = groups;
       const liveRowCount = groups.liveRowCount;
       const { directory, pages } = await this.#writeDirectory(

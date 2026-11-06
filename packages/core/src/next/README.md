@@ -68,6 +68,21 @@ index counts. This is an owner-side component benchmark; it does not time SQL, t
 client transport, compare SQLite, or certify power-loss safety. Neither script publishes its
 local numbers to the benchmark site.
 
+## Write-memory pressure
+
+The write grant keeps an admitted working minimum and charges live memtables and scratch.
+Its unused growth after a wide-batch estimate is reclaimable: a waiting merge can take that
+capacity without waiting for another writer call. Metadata has its own grant and uses the
+same retrying budget for root/statistics charges, group-directory chunks and run readers.
+If its allocation cannot grow, that budget returns idle write holdings and retries. Reclaim
+preserves both allocated bytes and outstanding loans; it never frees a reader's live buffers.
+
+`write/low-cap.test.ts` generates loads under 32/48/64 MiB caps over memory and the IndexedDB
+adapter on its fake. It exercises idle estimates, allocated working buffers, active loans,
+merges, metadata growth, exact rows and durable reopen, with declared reach. Its stored rows
+are small to bound the in-memory virtual disk; the separate native W5M reproduction covers
+the canonical 200-column workload at 256 MiB. No stored format changes are involved.
+
 ## Cross-track interfaces (owned by the implementing track)
 
 These integration interfaces are deliberately not frozen here. Each is the first deliverable of
