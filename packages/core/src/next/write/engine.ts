@@ -39,6 +39,11 @@ export type EngineInput = OpenWritePathInput & {
     readonly afterDeltaPrepared?: (kind: PublicationKind, sequence: number) => void;
     /** The garbage floor of the idle publish (ruling R10; default `IDLE_GARBAGE_BYTES`). */
     readonly idleGarbageBytes?: number;
+    /**
+     * Tests: called at each step of a staging publication, for part `part` (the memtable's index
+     * among those it stages in its table; −1 for the directory); a throw fails there.
+     */
+    readonly stageFault?: (step: "group" | "runs" | "directory", part: number) => void;
   };
 };
 import { CatalogChangeError, type TableDef } from "../access/catalog.js";
@@ -193,6 +198,12 @@ interface TableState {
   metadataBytes: number;
   /** Large transactions' staged rows not yet folded into `groups`, by staging id. */
   stagings: Map<number, Staging>;
+}
+
+/** Pins and residual deltas a staging publication made and has not installed yet. */
+interface Provisional {
+  readonly pins: SpacePin[];
+  readonly deltas: KeyDelta[];
 }
 
 /**
@@ -441,6 +452,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   readonly #idleGarbageBytes: number;
   readonly #extentDeltas: ExtentDeltaSink | null;
   readonly #afterDeltaPrepared: ((kind: PublicationKind, sequence: number) => void) | null;
+  readonly #stageFault: NonNullable<EngineInput["tuning"]>["stageFault"] | null;
   /** R25 attempts so far (the initial root of a new store was attempt 1). */
   #attempts = 1;
   /** A sink's commit or abort threw: the write path fails (a durable publication stays installed). */
@@ -572,6 +584,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#idleGarbageBytes = input.tuning?.idleGarbageBytes ?? IDLE_GARBAGE_BYTES;
     this.#extentDeltas = input.extentDeltas ?? null;
     this.#afterDeltaPrepared = input.tuning?.afterDeltaPrepared ?? null;
+    this.#stageFault = input.tuning?.stageFault ?? null;
     this.#now = input.options.now ?? Date.now;
     this.#root = root;
     this.#catalog = catalog;
@@ -1328,6 +1341,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const state = this.#tables.get(tableId);
     if (state === undefined) return;
     const memtables = state.view.memtables.filter((memtable) => memtable !== created);
+    // The emptied memtable leaves: its memory returns once no older reader can reach it.
+    if (memtables.length !== state.view.memtables.length)
+      this.shared.readers.holdUntilOlderClose(() => created.releaseAll());
     if (
       frozen !== null &&
       frozen.state === "frozen" &&
@@ -1550,6 +1566,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
       state.flushedThroughLsn = Math.max(state.flushedThroughLsn, table.flushedThroughLsn);
     }
     this.maintenance.buildsSettled += this.#settles.get(root) ?? 0;
+    const drained = this.#drainedBy.get(root);
+    if (drained !== undefined) {
+      const gone = new Set(drained);
+      this.#pendingRetire = this.#pendingRetire.filter((extent) => !gone.has(extent));
+    }
     // An index build a durable table checkpoint covers has its entries in that table's runs.
     for (const [indexId, pending] of this.#pendingIndexes) {
       const table = root.tables.find((candidate) => candidate.tableId === pending.tableId);
@@ -2622,6 +2643,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const changed = new Map<number, TableRoot>();
     const installs: Array<() => void> = [];
     const remaps = new Map<KeyDelta, { delta: KeyDelta; entries: Int32Array }>();
+    // What the new parts hold before they are installed (review B3-p2c-1 #1): a failure at any
+    // step, writing any part, gives every pin and residual delta back.
+    const owned: Provisional = { pins: [], deltas: [] };
+    let installed = false;
     let madeRoot: ManifestRoot | null = null;
     try {
       for (const state of tables) {
@@ -2654,8 +2679,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
             rewrote = true;
             this.maintenance.stagedTruncations += 1;
           }
-        for (const memtable of adds.get(state) ?? []) {
-          const written = await this.#writeStaged(writer, def, memtable, id);
+        for (const [part, memtable] of (adds.get(state) ?? []).entries()) {
+          const written = await this.#writeStaged(writer, def, memtable, id, owned, part);
           parts.set(memtable, written.part);
           residuals.set(memtable, written.residual);
           for (const [old, map] of written.remaps) remaps.set(old, map);
@@ -2667,6 +2692,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         let entry: TableRoot["staged"][number] | null = null;
         let directory: ExtentRef[] = [];
         if (memtables.length > 0) {
+          this.#stageFault?.("directory", -1);
           const refs = memtables.map((memtable, k) => ({
             ...partOf(memtable).group,
             groupId: k + 1,
@@ -2755,6 +2781,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#pruneCatalogs(root.globalLsn);
       this.#adoptTableRoots(root);
       for (const install of installs) install();
+      installed = true; // the memtables own the pins and residual deltas now
       for (const state of tables) {
         const staging = state.stagings.get(id);
         if (staging !== undefined) staging.rootSequence = root.sequence;
@@ -2769,24 +2796,32 @@ export class WritePathImpl implements WritePath, EngineHooks {
     } finally {
       delta.settle();
       if (madeRoot !== null) this.#releaseRoot(madeRoot);
+      if (!installed) {
+        for (const pin of owned.pins) pin.release();
+        for (const residual of owned.deltas) residual.releaseCharge();
+      }
     }
   }
 
   /**
    * Writes one frozen memtable of pending rows as a staged group and runs of its own puts; the
-   * other delta entries go to residual deltas (same order, so undo can be remapped).
+   * other delta entries go to residual deltas (same order, so undo can be remapped). Its pin and
+   * residual deltas are recorded in `owned` as they are made: provisional until installed.
    */
   async #writeStaged(
     writer: ExtentWriter,
     def: TableDef,
     memtable: Memtable,
     stagingId: number,
+    owned: Provisional,
+    index: number,
   ): Promise<{
     part: StagedPart;
     residual: Map<number, KeyDelta>;
     remaps: Map<KeyDelta, { delta: KeyDelta; entries: Int32Array }>;
   }> {
     const from = writer.extents.length;
+    this.#stageFault?.("group", index);
     const groupRoot = await this.#writeGroup(writer, def, memtable);
     const rootBlob = need((await writer.write([encodeGroupRoot(groupRoot)])).blobs[0]);
     const first = memtable.firstRowId;
@@ -2794,6 +2829,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const runs = new Map<number, RunRef[]>();
     const residual = new Map<number, KeyDelta>();
     const remaps = new Map<KeyDelta, { delta: KeyDelta; entries: Int32Array }>();
+    this.#stageFault?.("runs", index);
     for (const [indexId, old] of memtable.deltas) {
       const own = old
         .sorted(Infinity)
@@ -2807,6 +2843,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       const run = encodeRun(own);
       if (run !== null) runs.set(indexId, [runRef(run, (await writer.write(run.parts)).blobs)]);
       const next = memtable.newDelta();
+      owned.deltas.push(next);
       const entries = new Int32Array(old.entryCount).fill(-1);
       const arena = old.keyArena();
       for (let at = 0; at < old.entryCount; at++) {
@@ -2834,12 +2871,14 @@ export class WritePathImpl implements WritePath, EngineHooks {
       root: rootBlob,
       deletions: null,
     };
+    const pin = this.#space.pin(`staged t${String(memtable.tableId)}`);
+    owned.pins.push(pin);
     const part: StagedPart = {
       stagingId,
       group,
       groupRoot,
       runs,
-      pin: this.#space.pin(`staged t${String(memtable.tableId)}`),
+      pin,
       extents: writer.extents.slice(from),
     };
     return { part, residual, remaps };
@@ -3541,6 +3580,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   /** The next root: global state as of the durable LSN, `changed` tables replaced. */
+  /** Pending retirements each root took (they leave `#pendingRetire` once it is installed). */
+  readonly #drainedBy = new WeakMap<ManifestRoot, readonly ExtentRef[]>();
+
   /** Quiet index builds each root made settles (counted once it is published). */
   readonly #settles = new WeakMap<ManifestRoot, number>();
 
@@ -3625,11 +3667,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
   ): Promise<ManifestRoot> {
     const globalLsn = this.#rootLsn(changed);
     // Dropped staging the durable root still reaches (a rollback's), retired by this root.
-    // Never twice: a dropped table's walk below also reaches staging its root still lists.
-    if (this.#pendingRetire.length > 0) {
-      retireOnce(retired, this.#pendingRetire);
-      this.#pendingRetire = [];
-    }
+    // Never twice: a dropped table's walk below also reaches staging its root still lists. They
+    // leave the pending list only once this root is installed: a publication that fails after
+    // this point keeps them for the next one (found by the staged-failure test: they leaked).
+    const drained = [...this.#pendingRetire];
+    if (drained.length > 0) retireOnce(retired, drained);
     // A quiet table's index build has no entries: this root settles it (an empty index root and a
     // checkpoint past the build), so the build stops holding the root's LSN back. Without this an
     // index on a table that gets no rows held every later root (and log recycling) back for good.
@@ -3746,6 +3788,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       clients,
     };
     if (settled.size > 0) this.#settles.set(next, settled.size);
+    if (drained.length > 0) this.#drainedBy.set(next, drained);
     return next;
   }
 

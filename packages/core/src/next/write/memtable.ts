@@ -299,6 +299,13 @@ export class Memtable {
     }
     if (rowCount >= this.rowCount) return;
     const keepChunks = Math.ceil(rowCount / MEMORY_CHUNK_ROWS);
+    // Whole chunks past the kept rows return their memory (borrowed ones once their borrow ends).
+    const chunkCount = this.chunks[0]?.length ?? 0;
+    for (let chunk = keepChunks; chunk < chunkCount; chunk++) {
+      const stored = this.chunks.map((list) => need(list[chunk]));
+      if (this.#borrows.has(chunk)) this.#lent.set(chunk, stored);
+      else for (const column of stored) column.releaseCharge();
+    }
     for (const list of this.chunks) {
       list.length = Math.min(list.length, keepChunks);
       const last = list[keepChunks - 1];
