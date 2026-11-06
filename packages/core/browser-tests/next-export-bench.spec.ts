@@ -33,6 +33,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 // eslint-disable-next-line no-restricted-imports -- Node-only Playwright bench (cache control, /proc); never shipped.
 import { join } from "node:path";
 import { expect, type CDPSession, type Page } from "@playwright/test";
+import { exportTrace, hostSample } from "./export-diagnostics.js";
 import { requireWorkerOpfs, test } from "./fixtures.js";
 
 type Run = typeof import("../browser/next-export-run.js");
@@ -50,7 +51,8 @@ const WARM_SHARE = 0.98;
 const DISTINCT = Number(process.env.MINNOW_EXPORT_DISTINCT ?? 4);
 /** MINNOW_EXPORT_FOCUS=1: only Gate A's configuration (cold ×5, warm ×5, a profiled pass). */
 const COMPARE_STREAM = process.env.MINNOW_EXPORT_COMPARE_STREAM === "1";
-const PROFILE_ONLY = process.env.MINNOW_EXPORT_PROFILE_ONLY === "1";
+const VARIANCE = process.env.MINNOW_EXPORT_VARIANCE === "1";
+const PROFILE_ONLY = process.env.MINNOW_EXPORT_PROFILE_ONLY === "1" || VARIANCE;
 const FOCUS = process.env.MINNOW_EXPORT_FOCUS === "1";
 /** The row window of the focused passes (MINNOW_EXPORT_WINDOW_MIB, default 64). */
 const WINDOW_MIB = Number(process.env.MINNOW_EXPORT_WINDOW_MIB ?? 64);
@@ -323,6 +325,7 @@ interface Row {
   readonly phases?: Awaited<ReturnType<Run["exportPass"]>>[number]["phases"];
   /** Rows per second of that CPU: the pass's cost, whatever share of a core the host gave it. */
   readonly rowsPerCpuSecond: number;
+  readonly diagnostics?: unknown;
 }
 
 test.describe("rebuild core export on OPFS (bench)", () => {
@@ -375,7 +378,11 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       const residentBefore = resident(files);
       const share = residentBefore / onDisk;
       const established = !warm || share >= WARM_SHARE;
+      const hostBefore = VARIANCE ? hostSample() : undefined;
+      const stopTrace = VARIANCE ? await exportTrace(page) : undefined;
       const rssBefore = rendererRss(profile);
+      const samples: unknown[] = [];
+      let ticks = 0;
       let rssPeak = rssBefore;
       let heapPeak = 0;
       // The export worker's thread CPU: threads that appear during the pass, at their last sample.
@@ -385,7 +392,10 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       const sampling = { on: true };
       const sampler = (async () => {
         while (sampling.on) {
-          rssPeak = Math.max(rssPeak, rendererRss(profile));
+          const rss = rendererRss(profile);
+          rssPeak = Math.max(rssPeak, rss);
+          if (VARIANCE && ++ticks % 5 === 0)
+            samples.push({ rss, resident: resident(files), host: hostSample() });
           for (const [tid, seconds] of workerThreadCpu(profile))
             if (!threadsBefore.has(tid)) passCpu.set(tid, seconds);
           heapPeak = Math.max(heapPeak, await targets.heap());
@@ -401,6 +411,12 @@ test.describe("rebuild core export on OPFS (bench)", () => {
           sampling.on = false;
         });
       await sampler;
+      const trace = await stopTrace?.();
+      if (trace)
+        await info.attach(`gc-trace-${String(results.length)}`, {
+          body: JSON.stringify({ traceEvents: trace.events }),
+          contentType: "application/json",
+        });
       const pass = passes.at(-1);
       if (pass === undefined) throw new Error("no pass");
       // vite.library.config.ts drops the cached-bytes guard when this bench is opted in.
@@ -415,6 +431,21 @@ test.describe("rebuild core export on OPFS (bench)", () => {
           ? {
               phases: pass.phases,
               ...(exportCpu === undefined ? {} : { exportCpuSeconds: exportCpu }),
+            }
+          : {}),
+        ...(trace
+          ? {
+              diagnostics: {
+                hostBefore,
+                hostAfter: hostSample(),
+                samples,
+                rssBefore,
+                rssEnd: rendererRss(profile),
+                residentAfter: resident(files),
+                gcMs: trace.gcMs,
+                gcCount: trace.gcCount,
+                traceMs: trace.traceMs,
+              },
             }
           : {}),
         label: established
@@ -459,6 +490,23 @@ test.describe("rebuild core export on OPFS (bench)", () => {
           });
         }
       }
+    } else if (VARIANCE) {
+      const options = {
+        ...base,
+        readaheadKiB: 256,
+        windowMiB: WINDOW_MIB,
+        profile: true,
+        profilePhases: true,
+      };
+      for (let round = 0; round < 9; round++)
+        for (const cold of round % 2 === 0 ? [true, false] : [false, true])
+          await measure(
+            `${cold ? "cold" : "warm"} diagnostic round ${String(round)}`,
+            cold,
+            !cold,
+            options,
+          );
+      expect(targets.profiles).toHaveLength(18);
     } else if (PROFILE_ONLY) {
       const options = {
         ...base,

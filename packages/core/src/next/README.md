@@ -554,6 +554,17 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     without CPU profiling. `MINNOW_EXPORT_BASELINE_COMMIT` (default `18548e34`) freezes only the
     old export loop; both versions use the current engine and both loop modules are imported
     before timing. This checks disabled-probe overhead, not an arbitrary engine change.
+  - `MINNOW_EXPORT_VARIANCE=1` alternates nine cold/warm pairs (reversing order each round).
+    Each pass records read sizes, backing-buffer sizes and timings, pending promises versus
+    synchronous read concurrency, cache/pool/governor samples, file residency, host load and
+    Linux CPU/IO/memory pressure and reclaim counters. Chromium timeline traces attach the
+    exporting worker's GC pauses between user-timing marks; GC overlaps the wall phases and
+    must not be added to them. A benchmark-only compiler wrapper times xxHash separately (it
+    lives in the residual load phase). No checksum timer is shipped in the engine.
+  - The native read timer excludes xxHash. One-pass page loads already read into leased pooled
+    buffers and verify their views in place; OS cache residency does not switch on a blob copy.
+    OPFS sync reads block this worker, so outstanding promises do not mean concurrent IO or
+    decode/read overlap. The row window is also capped at one group, even when configured larger.
 - The checksum-load CPU hypothesis from the export profile is reproducible with
   `npx vite-node scripts/hash-load-bench.mts`: five rotating rounds in fresh processes, CPU and
   wall medians/min/max, aligned and unaligned inputs, byte offsets, stripe tails, and consumed

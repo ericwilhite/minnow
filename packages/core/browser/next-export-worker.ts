@@ -116,16 +116,30 @@ async function open(
   const session = await backend.open(lease);
   if (phases) {
     const read = session.readDataInto.bind(session);
+    let pending = 0;
+    let synchronous = 0;
     // This backend is FileStoreSession: its async method performs synchronous OPFS reads
     // before returning. Time that synchronous call, not overlapping promise continuations.
     session.readDataInto = (offset, target) => {
       if (!phases.active) return read(offset, target);
       const start = performance.now();
+      phases.maxPendingReads = Math.max(phases.maxPendingReads, ++pending);
+      phases.maxSyncReads = Math.max(phases.maxSyncReads, ++synchronous);
       try {
-        return read(offset, target);
+        return read(offset, target).finally(() => {
+          pending--;
+        });
       } finally {
-        phases.readMs += performance.now() - start;
+        synchronous--;
+        const ms = performance.now() - start;
+        phases.readMs += ms;
         phases.readCalls++;
+        phases.readEvents.push({
+          offset,
+          bytes: target.length,
+          backingBytes: target.buffer.byteLength,
+          ms,
+        });
       }
     };
   }
@@ -220,6 +234,7 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
   const governor = new Governor(request.capMiB * MiB);
   let cache: EvictableCache | null = null;
   const phases = request.profilePhases ? exportPhases() : undefined;
+  Object.assign(globalThis, { __minnowExportPhases: phases });
   const { lease, space } = await open(
     request.dir,
     governor,
@@ -244,6 +259,7 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
   const protectedBefore = space.stats.cache.protectedBytes / MiB;
   const passes: ExportPass[] = [];
   if (request.profile === true) console.profile("export");
+  if (phases) performance.mark("minnow-export-start");
   for (let pass = 0; pass < request.passes; pass++) {
     const readsBefore = space.stats.cache.platformReads;
     if (phases) phases.active = true;
@@ -254,6 +270,18 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
       readahead: request.readaheadKiB * 1024,
       windowBytes: (request.windowMiB ?? 0) * MiB,
       ...(phases ? { phases } : {}),
+      ...(phases
+        ? {
+            sample: (rows: number) =>
+              phases.memory.push({
+                rows,
+                pool: space.stats.cache.poolBytes,
+                resident: space.stats.cache.residentBytes,
+                pinned: space.stats.cache.pinnedBytes,
+                governor: governor.usedBytes,
+              }),
+          }
+        : {}),
     });
     if (phases) {
       phases.active = false;
@@ -280,6 +308,7 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
       kept: null,
     });
   }
+  if (phases) performance.mark("minnow-export-end");
   if (request.profile === true) {
     console.profileEnd("export");
     // Let the profile reach the inspector before the page terminates this worker.

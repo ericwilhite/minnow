@@ -51,6 +51,12 @@ export interface ExportPhases {
   gatherMs: number;
   decompressMs: number;
   transferMs: number;
+  checksumMs: number;
+  checksumCalls: number;
+  readEvents: Array<{ offset: number; bytes: number; backingBytes: number; ms: number }>;
+  maxPendingReads: number;
+  maxSyncReads: number;
+  memory: Array<{ rows: number; pool: number; resident: number; pinned: number; governor: number }>;
 }
 
 export function exportPhases(): ExportPhases {
@@ -67,6 +73,12 @@ export function exportPhases(): ExportPhases {
     gatherMs: 0,
     decompressMs: 0,
     transferMs: 0,
+    checksumMs: 0,
+    checksumCalls: 0,
+    readEvents: [],
+    maxPendingReads: 0,
+    maxSyncReads: 0,
+    memory: [],
   };
 }
 
@@ -89,7 +101,7 @@ export interface ExportOptions {
    */
   readonly windowBytes?: number;
   /** Called every 8 batches (memory sampling). */
-  readonly sample?: () => void;
+  readonly sample?: (rows: number) => void;
   readonly phases?: ExportPhases;
 }
 
@@ -266,9 +278,10 @@ export async function exportStream(
         }
       }
       rows += to - from;
-      if ((++batches & 7) === 0) options.sample?.();
+      if ((++batches & 7) === 0) options.sample?.(rows);
     }
     for (const reader of readers) reader.close();
+    options.sample?.(rows);
   }
   const ms = performance.now() - started;
   if (options.phases) {

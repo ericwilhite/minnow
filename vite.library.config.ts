@@ -38,7 +38,31 @@ const exportBaseline =
     : null;
 
 export default defineConfig({
-  plugins: [isolatedPages, ...(exportBaseline === null
+  plugins: [
+    isolatedPages,
+    ...(process.env.MINNOW_EXPORT_VARIANCE === "1"
+      ? [
+          {
+            name: "export-checksum-timer",
+            enforce: "pre" as const,
+            transform(source: string, id: string) {
+              if (!id.endsWith("/next/hash/xxhash32.ts")) return;
+              return (
+                source.replace("export function xxHash32(", "function measuredHash(") +
+                `
+export function xxHash32(bytes: Uint8Array, seed = 0, start = 0, end = bytes.length): number {
+ const state = (globalThis as typeof globalThis & {__minnowExportPhases?: {active: boolean; checksumMs: number; checksumCalls: number}}).__minnowExportPhases;
+ if (!state?.active) return measuredHash(bytes, seed, start, end);
+ const before = performance.now();
+ try { return measuredHash(bytes, seed, start, end); }
+ finally { state.checksumMs += performance.now() - before; state.checksumCalls++; }
+}`
+              );
+            },
+          },
+        ]
+      : []),
+    ...(exportBaseline === null
       ? []
       : [
           {
@@ -56,7 +80,8 @@ export default defineConfig({
                 );
             },
           },
-        ])],
+        ]),
+  ],
   // Test pages only: the next/ engine re-verifies cached bytes at every lease release and
   // eviction, so a writer into them fails in the browser lanes too
   // (packages/core/src/next/storage/verify-cached.ts). Off only for the opt-in OPFS export bench
