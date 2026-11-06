@@ -181,6 +181,8 @@ export type BrokerMessage =
     }
   | {
       readonly t: "register";
+      /** Target instance; absent only for legacy senders that do not await acknowledgement. */
+      readonly instance?: string;
       readonly v: number;
       readonly db: string;
       readonly ownerId: string;
@@ -204,6 +206,13 @@ export type BrokerMessage =
   | { readonly t: "noOwner" | "unreachable"; readonly nonce: number }
   /** Broker → owner: a new client connection. */
   | { readonly t: "client"; readonly clientId: string; readonly port: MessagePort }
+  /** Broker → owner: registration was installed by this exact instance. */
+  | {
+      readonly t: "registrationAck";
+      readonly db: string;
+      readonly ownerId: string;
+      readonly instance: string;
+    }
   /** Broker → every connected context. */
   | { readonly t: "registered"; readonly db: string; readonly ownerId: string }
   /**

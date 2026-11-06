@@ -975,8 +975,15 @@ and the owner import it directly.
   restart this budget. The next request, a broker that announces
   itself, or an owner announcement starts it again. Each broker instance has a random id it
   announces on every port: the client sends its unanswered requests again to it, and an owner
-  registers again on a new id, but only while it still holds both its locks. A request id is
-  answered once, so a retry the same instance already saw makes no second connection.
+  registers again on a new id, but only while it still holds both its locks. Registration is
+  confirmed by an acknowledgement naming that instance and owner. Unacknowledged registrations
+  retry at 1, 2, 4 and 8 s, checking both locks and the stopped state each time, and fail at 15 s.
+  A terminal failure is exposed in `OwnerHost.registration.error` and `minnow:failed`; the owner
+  steps down instead of holding the database while undiscoverable. Repeated announcements of the
+  same instance never restart the budget. An older broker without acknowledgements also reaches
+  this explicit failure; reload its contexts to replace it. A connect request id is deduplicated
+  within one instance's 1,024-entry cache; restart or eviction can create another connection,
+  while SQL commit identity remains protected by the ledger.
 - Requests issued before the first connection are sent on that connection, once and in issue
   order. After the first `unreachable` status, `unresponsiveAfterMs` (10 s by default) bounds
   waiting requests: `OwnerUnreachableError` reports effect `none` for a never-sent request and

@@ -11,6 +11,7 @@ import {
   BARRIER_RESOLUTION_STATES,
   BROKER_RESTART_STATES,
   OWNER_DISCOVERY_STATES,
+  BROKER_REGISTRATION_STATES,
   LEDGER_RESOLUTION_STATES,
   createReach,
 } from "../../testing/reach.js";
@@ -158,6 +159,12 @@ function inProcessOwner(world: World, engines = factory(world)): StartOwner {
     const entry: World["owners"][number] = { host: null, context, kill: () => undefined };
     const started = startOwnerHost({ ...init, t: "minnow:host" }, engines, {
       locks: context,
+      ...(typeof init.settings.registrationTimeoutMs === "number"
+        ? { registrationTimeoutMs: init.settings.registrationTimeoutMs }
+        : {}),
+      ...(typeof init.settings.registrationBoundMs === "number"
+        ? { registrationBoundMs: init.settings.registrationBoundMs }
+        : {}),
       post: (status) => {
         if (status.t === "minnow:stopped") resolveStopped(status.reason);
       },
@@ -241,7 +248,7 @@ function tab(
     openBroker: () => {
       const { port1, port2 } = new MessageChannel();
       world.brokerPorts.set(client, (world.brokerPorts.get(client) ?? 0) + 1);
-      world.broker.accept(port1);
+      world.broker.accept(port1, port2);
       // Count discovery: every `connect` this tab asks the broker.
       const serve = port1.onmessage;
       port1.onmessage = (event: MessageEvent) => {
@@ -2605,4 +2612,109 @@ it("P1: recovery to the same owner after give-up creates a usable connection", a
   expect(client.gaveUp).toBe(false);
   expect(client.generation).toBeGreaterThan(generation);
   expect((await client.query("SELECT 1")).rows()).toEqual([[1]]);
+});
+
+it("P2: losing one register after the instance announcement does not strand its owner", async () => {
+  const w = world();
+  const { owner } = await hosted(w, {
+    settings: { registrationTimeoutMs: 5, registrationBoundMs: 200 },
+  });
+  await until(() => w.broker.current?.registrations.get("db") === owner.ownerId);
+  w.broker.dropRegistrations(1);
+  await w.broker.restart({ dropMs: 0 });
+  await sleep(150);
+  expect(w.broker.dropped.get("register")).toBe(1);
+  expect(w.broker.current?.registrations.get("db")).toBe(owner.ownerId);
+});
+
+describe("P2: acknowledged registration survives independent loss", () => {
+  const seeds = seedsFor("next-owner-broker-registration", [0xb052]);
+  it.each(seeds)(
+    "generated registration and acknowledgement loss (seed %i)",
+    async (seed) => {
+      const reach = createReach("next-owner-broker-registration", BROKER_REGISTRATION_STATES, {
+        minimum: 2,
+      });
+      await fc.assert(
+        fc.asyncProperty(
+          fc.record({
+            outcome: fc.constantFrom("recover", "fail", "stop", "host fence"),
+            drops: fc.integer({ min: 1, max: 2 }),
+            ackDrops: fc.integer({ min: 0, max: 1 }),
+            repeatAnnouncements: fc.boolean(),
+            failureAtAck: fc.boolean(),
+          }),
+          async ({ outcome, drops, ackDrops, repeatAnnouncements, failureAtAck }) => {
+            const w = world();
+            const { owner } = await hosted(w, {
+              settings: { registrationTimeoutMs: 5, registrationBoundMs: 200 },
+            });
+            await until(() => w.broker.current?.registrations.get("db") === owner.ownerId);
+            const before = w.broker.dropped.get("register") ?? 0;
+            const beforeCurrentDrop = w.broker.currentInstanceRegistrationDrops;
+            const failAtAck = outcome === "fail" && failureAtAck;
+            w.broker.dropRegistrations(outcome === "recover" ? drops : failAtAck ? 0 : Infinity);
+            const beforeAck = w.broker.lostRegistrationAcks;
+            w.broker.dropRegistrationAcks(failAtAck ? Infinity : ackDrops);
+            await w.broker.restart({ dropMs: 0 });
+            const announcements = repeatAnnouncements
+              ? setInterval(() => w.broker.announceAgain(), 3)
+              : null;
+            const thief = w.registry.context();
+            const entered = new Set<string>();
+            try {
+              await until(() =>
+                failAtAck
+                  ? w.broker.lostRegistrationAcks > beforeAck
+                  : (w.broker.dropped.get("register") ?? 0) > before,
+              );
+              if (failAtAck) entered.add("ack lost");
+              if (w.broker.currentInstanceRegistrationDrops > beforeCurrentDrop)
+                entered.add("register lost after announcement");
+              if (outcome === "stop") await owner.stop("closing", false);
+              if (outcome === "host fence")
+                await new Promise<void>((resolve) => {
+                  void thief.request(hostLockName("db"), { steal: true }, () => {
+                    resolve();
+                    return new Promise<void>(() => undefined);
+                  });
+                });
+              const count = w.broker.registrationAttempts.get(owner.ownerId) ?? 0;
+              await sleep(outcome === "recover" || outcome === "fail" ? 300 : 50);
+              if (outcome === "recover") {
+                expect(w.broker.current?.registrations.get("db")).toBe(owner.ownerId);
+                expect(owner.registration.confirmed).toBe(true);
+                expect(owner.registration.error).toBe(null);
+                const c = tab(w);
+                await c.connector.start();
+                expect(c.client.ownerId).toBe(owner.ownerId);
+                expect(await value(c.client)).toBe(0);
+                entered.add("recovered registration");
+                if (w.broker.lostRegistrationAcks > 0) entered.add("ack lost");
+              } else if (outcome === "fail") {
+                expect(w.broker.registrationAttempts.get(owner.ownerId) ?? 0).toBeGreaterThan(1);
+                expect(owner.registration.error?.name).toBe("OwnerUnreachableError");
+                expect(owner.registration.confirmed).toBe(false);
+                entered.add("terminal failure");
+              } else {
+                expect(w.broker.registrationAttempts.get(owner.ownerId) ?? 0).toBe(count);
+                expect(w.broker.current?.registrations.get("db")).not.toBe(owner.ownerId);
+                entered.add(outcome === "stop" ? "stop cancels retry" : "host fence cancels retry");
+              }
+              if (outcome === "fail" && repeatAnnouncements && w.broker.repeatedAnnouncements > 0)
+                entered.add("same instance repeated");
+              reach.recordHistory(entered);
+            } finally {
+              if (announcements !== null) clearInterval(announcements);
+              thief.kill();
+              for (const cleanup of cleanups.splice(0).reverse()) cleanup();
+            }
+          },
+        ),
+        { seed, numRuns: 80 },
+      );
+      reach.assertReached();
+    },
+    90_000,
+  );
 });

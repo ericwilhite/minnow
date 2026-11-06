@@ -24,6 +24,12 @@ export class RestartingBroker {
   #broker: Broker | null;
   readonly #ports: Attached[] = [];
   #duplicate: string | null = null;
+  #registrationDrops = 0;
+  #ackDrops = 0;
+  lostRegistrationAcks = 0;
+  repeatedAnnouncements = 0;
+  currentInstanceRegistrationDrops = 0;
+  readonly registrationAttempts = new Map<string, number>();
   /** Instances so far (1 before any restart). */
   instances = 1;
   /** Messages dropped while no instance was there, by kind. */
@@ -46,7 +52,19 @@ export class RestartingBroker {
     return this.#broker;
   }
 
-  accept(port: MessagePort): void {
+  accept(port: MessagePort, sender?: MessagePort): void {
+    if (sender !== undefined) {
+      const post = sender.postMessage.bind(sender);
+      sender.postMessage = ((message: unknown, transfer?: Transferable[]) => {
+        const request = message as { t?: string; ownerId?: string };
+        if (request.t === "register" && request.ownerId !== undefined)
+          this.registrationAttempts.set(
+            request.ownerId,
+            (this.registrationAttempts.get(request.ownerId) ?? 0) + 1,
+          );
+        post(message, transfer ?? []);
+      }) as typeof sender.postMessage;
+    }
     const attached: Attached = { port, view: port };
     this.#ports.push(attached);
     // One router for the port's whole life: it delivers to the instance of the moment.
@@ -59,8 +77,15 @@ export class RestartingBroker {
         this.dropped.set(kind, (this.dropped.get(kind) ?? 0) + 1);
         return;
       }
-      view.onmessage?.(event);
       const kind = (event.data as { t?: string }).t;
+      if (kind === "register" && this.#registrationDrops > 0) {
+        this.#registrationDrops--;
+        if ((event.data as { instance?: string }).instance === this.#broker.instance)
+          this.currentInstanceRegistrationDrops++;
+        this.dropped.set("register", (this.dropped.get("register") ?? 0) + 1);
+        return;
+      }
+      view.onmessage?.(event);
       if (kind !== undefined && kind === this.#duplicate) {
         this.#duplicate = null;
         this.duplicated++;
@@ -98,6 +123,20 @@ export class RestartingBroker {
     this.#duplicate = kind;
   }
 
+  /** Lose registrations independently of announcement delivery (not only during restart). */
+  dropRegistrations(count: number): void {
+    this.#registrationDrops = count;
+  }
+  dropRegistrationAcks(count: number): void {
+    this.#ackDrops = count;
+  }
+  announceAgain(): void {
+    this.repeatedAnnouncements++;
+    if (this.#broker !== null)
+      for (const { port } of this.#ports)
+        port.postMessage({ t: "instance", instance: this.#broker.instance });
+  }
+
   /** Gives `broker` its own view of the port: posts from an instance that died go nowhere. */
   #attach(attached: Attached, broker: Broker): void {
     const { port } = attached;
@@ -106,6 +145,11 @@ export class RestartingBroker {
       postMessage: (message: unknown, transfer?: Transferable[]) => {
         if (this.#broker !== broker) {
           this.lostReplies++;
+          return;
+        }
+        if ((message as { t?: string }).t === "registrationAck" && this.#ackDrops > 0) {
+          this.#ackDrops--;
+          this.lostRegistrationAcks++;
           return;
         }
         port.postMessage(message, transfer ?? []);

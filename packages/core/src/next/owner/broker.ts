@@ -18,7 +18,9 @@
  * - Each instance has a random id (`instance`), announced first on every port it accepts: a port
  *   that sees a new id was reattached to a replaced broker (WebKit 26.6, owner/webkit-sharedworker.md)
  *   with no registrations, so owners register again and clients ask again.
- * - A request id (`connect`'s `nonce`, per client) is answered once. A duplicate (a client's retry
+ * - Register is acknowledged per instance; duplicate registrations re-send the acknowledgement.
+ * - A request id (`connect`'s `nonce`, per client) is deduplicated within this instance's bounded
+ *   1,024-entry cache. A duplicate (a client's retry
  *   of a request this instance already saw) makes no second connection: while the first is being
  *   answered, or after it got a port, it is dropped (the client keeps the port it asked on until
  *   it is answered); after `noOwner` or `unreachable` the same answer is sent again.
@@ -111,12 +113,19 @@ export class Broker {
         port.postMessage({ t: "pong", nonce: message.nonce } satisfies BrokerMessage);
         return;
       case "register":
+        if (message.instance !== undefined && message.instance !== this.instance) return;
         this.#owners.set(message.db, {
           ownerId: message.ownerId,
           protocol: message.protocol,
           port,
           lockHolder: message.lockHolder,
         });
+        port.postMessage({
+          t: "registrationAck",
+          db: message.db,
+          ownerId: message.ownerId,
+          instance: this.instance,
+        } satisfies BrokerMessage);
         {
           const waiting = this.#waiters.get(message.db);
           this.#waiters.delete(message.db);

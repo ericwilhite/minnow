@@ -208,3 +208,14 @@ export const OWNER_DISCOVERY_STATES = [
   "startup throws",
   "broker throws",
 ] as const;
+
+/** Registration loss is independent of instance announcements and includes lost acknowledgements. */
+export const BROKER_REGISTRATION_STATES = [
+  "register lost after announcement",
+  "ack lost",
+  "recovered registration",
+  "terminal failure",
+  "stop cancels retry",
+  "host fence cancels retry",
+  "same instance repeated",
+] as const;
