@@ -215,9 +215,10 @@ describe("published core tarball", () => {
       // (1,013,733 measured), then 1,015,000 when the parser learned to record declared numeric
       // widths for the rebuild core's lowering (1,014,321 measured), then 1,016,500 with the
       // PostgreSQL name-resolution and DISTINCT ON fixes (1,015,868 measured), then 1,017,750 with
-      // the transaction-mode grammar and READ ONLY enforcement (1,017,120 measured); ratchets,
-      // not targets.
-      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_017_750);
+      // the transaction-mode grammar and READ ONLY enforcement (1,017,120 measured), then
+      // 1,018,250 with PostgreSQL's name, argument and comment errors (1,017,725 measured);
+      // ratchets, not targets.
+      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_018_250);
       expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_500_000);
       const emitted = await readFile(join(isolatedCore, "dist", "engine", "optimizer.js"), "utf8");
       expect(emitted).not.toContain("/**");
