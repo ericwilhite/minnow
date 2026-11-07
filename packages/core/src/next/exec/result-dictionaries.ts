@@ -24,38 +24,43 @@ export interface DictionaryFrame {
 
 export class ResultDictionaries {
   #ids = new WeakMap<FlatVector, number>();
+  #pending = new WeakMap<FlatVector, Entry>();
+  #reserved = 0;
   #next = 0;
   #sent = 0;
   #registry = 0;
   constructor(readonly grant: Grant) {}
 
+  /** Resolve the wire form before a terminal source sizes and decodes its dedicated output.
+   * Reservations are bounded for the whole stream and never use a progress loan. */
+  admit(source: FlatVector): number | null {
+    if (source.type.kind !== "text" || source.data.layout !== "varlen") return null;
+    const old = this.#ids.get(source) ?? this.#pending.get(source)?.id;
+    if (old !== undefined) return old;
+    const data = source.data;
+    const size =
+      (data.offsets[source.length] ?? 0) - (data.offsets[0] ?? 0) + 4 * (source.length + 1);
+    if (
+      this.#sent + this.#reserved + this.#registry + size + ENTRY_BYTES > STREAM_DICTIONARY_BYTES ||
+      !this.grant.allocate(ENTRY_BYTES)
+    )
+      return null;
+    const entry = { source, id: this.#next++, bytes: size };
+    this.#pending.set(source, entry);
+    this.#reserved += size;
+    this.#registry += ENTRY_BYTES;
+    return entry.id;
+  }
+
   plan(types: readonly PhysicalType[], columns: readonly Vector[]): DictionaryPlan {
     const fresh = new Map<FlatVector, Entry>();
-    let bytes = 0;
     const ids = columns.map((vector) => {
-      if (
-        vector.form !== "dictionary" ||
-        vector.type.kind !== "text" ||
-        vector.dictionary.data.layout !== "varlen"
-      )
-        return null;
-      const source = vector.dictionary;
-      const old = this.#ids.get(source) ?? fresh.get(source)?.id;
-      if (old !== undefined) return old;
-      const data = source.data;
-      if (data.layout !== "varlen") return null;
-      const size =
-        (data.offsets[source.length] ?? 0) - (data.offsets[0] ?? 0) + 4 * (source.length + 1);
-      if (this.#sent + this.#registry + bytes + size + ENTRY_BYTES > STREAM_DICTIONARY_BYTES)
-        return null;
-      // Stream identities outlive individual frames. Reserve them without a progress loan;
-      // otherwise the first frame could not repay its loan while this registry remains live.
-      if (!this.grant.allocate(ENTRY_BYTES)) return null;
-      this.#registry += ENTRY_BYTES;
-      const entry = { source, id: this.#next + fresh.size, bytes: size };
-      fresh.set(source, entry);
-      bytes += size;
-      return entry.id;
+      if (vector.form !== "dictionary" || vector.type.kind !== "text") return null;
+      const id = this.admit(vector.dictionary);
+      if (id === null) return null;
+      const entry = this.#pending.get(vector.dictionary);
+      if (entry !== undefined) fresh.set(vector.dictionary, entry);
+      return id;
     });
     return {
       ids,
@@ -114,7 +119,8 @@ export class ResultDictionaries {
       if (this.#ids.has(entry.source)) continue;
       this.#ids.set(entry.source, entry.id);
       this.#sent += entry.bytes;
-      this.#next++;
+      this.#reserved -= entry.bytes;
+      this.#pending.delete(entry.source);
     }
   }
 
@@ -137,6 +143,8 @@ export class ResultDictionaries {
       if (this.#ids.has(entry.source)) continue;
       this.grant.free(ENTRY_BYTES);
       this.#registry -= ENTRY_BYTES;
+      this.#reserved -= entry.bytes;
+      this.#pending.delete(entry.source);
     }
   }
 
@@ -144,5 +152,7 @@ export class ResultDictionaries {
     this.grant.free(this.#registry);
     this.#registry = 0;
     this.#ids = new WeakMap();
+    this.#pending = new WeakMap();
+    this.#reserved = 0;
   }
 }

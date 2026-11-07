@@ -20,13 +20,19 @@ for (const shape of [
   "empty",
   "cancel",
   "pressure",
+  "preadmit",
+  "preadmit-cap",
+  "preadmit-cumulative",
 ] as const)
   for (const seed of seedsFor("next-result-dictionaries", [0xb2f1, 0xb2f2]))
     it(`dictionary result/client equality ${shape} seed ${String(seed)}`, async () => {
       const reach = createReach(`result dictionary ${shape}`, [
         RESULT_DICTIONARY_REACH.equality,
-        shape === "cap" ? RESULT_DICTIONARY_REACH.fallback : RESULT_DICTIONARY_REACH.codes,
+        shape === "cap" || shape === "preadmit-cap"
+          ? RESULT_DICTIONARY_REACH.fallback
+          : RESULT_DICTIONARY_REACH.codes,
         ...(shape === "pressure" ? [RESULT_DICTIONARY_REACH.loan] : []),
+        ...(shape.startsWith("preadmit") ? [RESULT_DICTIONARY_REACH.predecode] : []),
       ]);
       await fc.assert(
         fc.asyncProperty(
@@ -59,9 +65,15 @@ for (const shape of [
             });
             const sink = new ResultSink([TEXT], grant, channel, 0, { now: () => 0 });
             const entries = ["", "世界", `salt:${String(salt)}`, "repeated"];
-            if (shape === "large" || shape === "accumulate" || shape === "pressure")
+            if (
+              shape === "large" ||
+              shape === "accumulate" ||
+              shape === "pressure" ||
+              shape === "preadmit-cumulative"
+            )
               entries.push("y".repeat(900000));
-            if (shape === "cap") entries.push("x".repeat(STREAM_DICTIONARY_BYTES));
+            if (shape === "cap" || shape === "preadmit-cap")
+              entries.push("x".repeat(STREAM_DICTIONARY_BYTES));
             const shared = texts(entries);
             const dictionaries = new StreamDictionaries();
             const expected: unknown[] = [],
@@ -73,7 +85,7 @@ for (const shape of [
               dictColumns = 0;
             const batches: Batch[] = Array.from({ length: 2 }, (_, group) => {
               const dictionary =
-                shape === "replace" || shape === "accumulate"
+                shape === "replace" || shape === "accumulate" || shape === "preadmit-cumulative"
                   ? texts(entries.map((s) => `${s}:${String(group)}`))
                   : shared;
               const validity = new Uint32Array(Math.ceil(n / 32));
@@ -114,6 +126,13 @@ for (const shape of [
                 ];
               }),
             );
+            if (shape.startsWith("preadmit")) {
+              for (const [k, batch] of batches.entries())
+                expect(
+                  sink.admitDictionary((batch.columns[0] as DictionaryVector).dictionary),
+                ).toBe(shape === "preadmit" || (shape === "preadmit-cumulative" && k === 0));
+              reach.reach(RESULT_DICTIONARY_REACH.predecode);
+            }
             const producer = (async () => {
               for (const batch of batches) {
                 if (
@@ -177,10 +196,10 @@ for (const shape of [
                 await channel.delivered;
                 expect(actual).toEqual(expected);
                 expect(released).toBe(2);
-                if (shape === "cap") {
+                if (shape === "cap" || shape === "preadmit-cap") {
                   expect(dictColumns).toBe(0);
                   expect(deltas).toBe(0);
-                } else if (shape === "accumulate") {
+                } else if (shape === "accumulate" || shape === "preadmit-cumulative") {
                   expect(dictColumns).toBeGreaterThan(0);
                   expect(dictColumns).toBeLessThan(frames);
                   expect(deltas).toBe(1);
@@ -196,7 +215,9 @@ for (const shape of [
               expect(grant.allocated).toBe(0);
               reach.reach(RESULT_DICTIONARY_REACH.equality);
               reach.reach(
-                shape === "cap" ? RESULT_DICTIONARY_REACH.fallback : RESULT_DICTIONARY_REACH.codes,
+                shape === "cap" || shape === "preadmit-cap"
+                  ? RESULT_DICTIONARY_REACH.fallback
+                  : RESULT_DICTIONARY_REACH.codes,
               );
             } finally {
               sink.discard(reason);
@@ -212,3 +233,46 @@ for (const shape of [
       );
       reach.assertReached();
     });
+
+for (const seed of seedsFor("next-result-dictionary-unpublished", [0xb2f5, 0xb2f6]))
+  it(`returns an unpublished dictionary reservation on cancellation seed ${String(seed)}`, async () => {
+    const reach = createReach("unpublished result dictionary", [
+      RESULT_DICTIONARY_REACH.predecode,
+      RESULT_DICTIONARY_REACH.abandoned,
+    ]);
+    await fc.assert(
+      fc.asyncProperty(fc.integer({ min: 1024, max: 65536 }), async (n) => {
+        reach.beginHistory();
+        const governor = new Governor(8 * 1024 * 1024);
+        const grant = await governor.admit({
+          label: "result",
+          minimumBytes: 1024,
+          spillable: true,
+        });
+        const channel = new ResultChannel([{ name: "text", type: TEXT, nullable: true }]);
+        const sink = new ResultSink([TEXT], grant, channel, 0);
+        const source = texts([`unique:${String(n)}`, "x".repeat(n)]);
+        expect(sink.admitDictionary(source)).toBe(true);
+        const charged = grant.allocated;
+        expect(charged).toBeGreaterThan(0);
+        expect(charged).toBeLessThan(n);
+        expect(sink.admitDictionary(source)).toBe(true);
+        expect(grant.allocated).toBe(charged);
+        expect(sink.admitDictionary(texts(["y".repeat(STREAM_DICTIONARY_BYTES)]))).toBe(false);
+        expect(grant.allocated).toBe(charged);
+        expect(grant.loaned).toBe(0);
+        reach.reach(RESULT_DICTIONARY_REACH.predecode);
+        const reason = new Error("cancel before first frame");
+        sink.discard(reason);
+        channel.cancel(reason);
+        sink.discard(reason);
+        expect(grant.allocated).toBe(0);
+        expect(grant.loaned).toBe(0);
+        grant.close();
+        expect(governor.usedBytes).toBe(0);
+        reach.reach(RESULT_DICTIONARY_REACH.abandoned);
+      }),
+      { seed, numRuns: 16 },
+    );
+    reach.assertReached();
+  });

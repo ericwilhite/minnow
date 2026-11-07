@@ -633,8 +633,36 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     entries share the existing 1 MiB stream cap; subsequent dictionaries fall back to flat varlen.
     Registry entries use ordinary result-grant capacity, so a delta frame can return its progress
     loan before the stream ends. Dictionary pages and borrowed codes never enter a transfer list.
+    A direct terminal full scan decodes tight dedicated output into the result grant. The sink
+    adopts only buffers explicitly named by that source's detach permission and charged to its
+    own grant. Before returning the source token (and its query dictionary references), it
+    reclassifies the dedicated buffers into a frame charge in the same result grant. That charge
+    survives until frame credit; a refused optional reclassification keeps the copying path. Capped dictionary columns and other
+    ineligible columns are copied into the same frame. The owning sink admits dictionaries
+    before source sizing: accepted columns decode to dedicated codes, refused ones directly to
+    dedicated UTF-8. Each group's decision stays fixed across sizing, reservation and decode,
+    so the batch target reflects its wire form. A reserved dictionary id is published only with
+    its first owned delta; cancel/end returns unused registry charges.
+    If the complete batch exceeds the frame
+    byte or row limit, the ordinary copying splitter remains in use. Identity/computed projects
+    retain that safe copying path. A terminal scan may fall back to ordinary borrowed decode
+    when the result budget refuses even one dedicated row, preserving progress loans.
+    `testing/result-owned.test.ts` checks source/client equality, mixed ownership, foreign grants,
+    selections, row limits and cancellation; `testing/result-owned-bytes.test.ts` checks exact
+    transferred buffer identity and bytes across all native layouts, including NaN payload words; the real executor bridge observes cached and pooled
+    PageCache buffers through actual transfers, with poison verification off.
     Generated `testing/result-dictionaries.test.ts` checks exact client values, NULLs, selections,
     identity reuse/change, large deltas, cumulative cap fallback, pressure and cancellation.
+  - `MINNOW_EXPORT_PAGE_HEAP=/home/eric/.cache/export.heapsnapshot` adds a page-side CDP
+    heap snapshot after all frame delivery. It records pre/post snapshot heap, backing storage
+    and renderer RSS. Snapshotting performs GC: use a separate diagnostic run, not its timings
+    or post-GC snapshot as an export peak measurement. CDP `backingStorageSize` includes
+    external strings as well as ArrayBuffers. Captures label it `backingStoragePeakMiB`; the
+    historical `arrayBufferPeakMiB` key remains an alias, not a pure ArrayBuffer measurement.
+  - `scripts/result-sink-bench.mts --compare=REV --owned` isolates framing with fresh
+    authorized source buffers and mixed numeric/dictionary columns. It charges source buffers
+    before pushing and returns their charges on release. Input construction is excluded; decode
+    and OPFS are measured by the whole export instead.
   - `scripts/executor-export-bench.mts` compares the real executor/result path with the historical
     adapter over the same memory-backed PageCache. `--compare=REV` instead freezes the whole
     executor dependency family at a Git revision and compares it with the current compiler.

@@ -1,13 +1,14 @@
-/** Owned, compact result frames. Input buffers never survive readiness or enter a wire frame. Text dictionaries keep codes. */
+/** Owned, compact result frames. Borrowed input is copied; authorized dedicated input stays charged through frame credit. */
 import type { MaybePromise } from "../access/key-index.js";
 import { OBJECT_OVERHEAD_BYTES, bigintBytes, type Grant, type Loan } from "../memory/governor.js";
 import type { PhysicalType } from "../types.js";
-import { BATCH_ROWS, type Batch } from "../vector/vector.js";
+import { BATCH_ROWS, type Batch, type FlatVector } from "../vector/vector.js";
 import {
   ResultDictionaries,
   type DictionaryPlan,
   type DictionaryFrame,
 } from "./result-dictionaries.js";
+import { ownedResultColumns } from "./result-owned.js";
 import { ColumnStore } from "./column-store.js";
 import { slotOf, validAt } from "./kernels/vectors.js";
 import {
@@ -21,10 +22,17 @@ import {
   type PushResult,
   type Transfer,
 } from "./pipeline.js";
-import { RESULT_FRAME_TARGET_BYTES, ResultChannel } from "./result.js";
+import {
+  frameByteLength,
+  frameTransferList,
+  RESULT_FRAME_TARGET_BYTES,
+  ResultChannel,
+  type WireVector,
+} from "./result.js";
 
 interface FrameStore extends DictionaryFrame {
   readonly store: ColumnStore;
+  columns: WireVector[] | null;
   metadata: boolean;
   loan: Loan | null;
   freed: boolean;
@@ -84,6 +92,12 @@ export class ResultSink implements Operator {
       rows /= 2;
     }
     this.#rowsPerFrame = rows;
+  }
+
+  /** Stable per-stream admission used by a direct terminal source before output reservation. */
+  admitDictionary(dictionary: FlatVector): boolean {
+    this.#check();
+    return this.#dictionaries.admit(dictionary) !== null;
   }
 
   get rowCount(): number {
@@ -206,15 +220,16 @@ export class ResultSink implements Operator {
     for (const frame of this.#frames) this.#free(frame);
   }
 
-  #make(rows: number): FrameStore {
+  #make(rows: number, types = this.#dictionaryPlan?.types ?? this.types): FrameStore {
     const frame: FrameStore = {
-      store: new ColumnStore(this.#dictionaryPlan?.types ?? this.types, this.grant, {
+      store: new ColumnStore(types, this.grant, {
         chunkRows: rows,
         varlenBytes: 64,
         // ColumnStore permits one oversized row even with a finite target. Keeping that
         // target makes its arena grow to the actual need, rather than doubling past reserve.
         targetBytes: this.#target,
       }),
+      columns: null,
       dictionaries: [],
       extraBytes: 0,
       metadata: this.grant.allocate(this.#metadataBytes),
@@ -243,13 +258,15 @@ export class ResultSink implements Operator {
     if (this.#pending === frame) this.#pending = null;
     this.#frames.add(frame);
     try {
-      const columns = this.types.map((_, c) => {
-        const { form, length, validity, data } = frame.store.chunk(c, 0);
-        const flat = { form, length, validity, data };
-        return this.#dictionaryPlan === null
-          ? flat
-          : this.#dictionaries.wire(this.#dictionaryPlan, flat, c);
-      });
+      const columns =
+        frame.columns ??
+        this.types.map((_, c) => {
+          const { form, length, validity, data } = frame.store.chunk(c, 0);
+          const flat = { form, length, validity, data };
+          return this.#dictionaryPlan === null
+            ? flat
+            : this.#dictionaries.wire(this.#dictionaryPlan, flat, c);
+        });
       if (this.#dictionaryPlan !== null) this.#dictionaries.publish(this.#dictionaryPlan, frame);
       return this.channel.offer({
         payload: { rowCount: rows, columns, dictionaries: frame.dictionaries },
@@ -262,9 +279,73 @@ export class ResultSink implements Operator {
     }
   }
 
+  /** One compact source batch, mixing authorized buffers with owned fallback copies.
+   * The whole frame must fit the normal byte/row limits. Otherwise use the copying splitter.
+   */
+  #offerOwned(batch: Batch): PushResult | null {
+    const plan = this.#dictionaryPlan;
+    if (plan === null || (this.#maxRows !== null && batch.length > this.#maxRows)) return null;
+    const columns = ownedResultColumns(batch, plan.ids, this.#transfer, this.grant);
+    if (columns === null) return null;
+    const copies = plan.columns.filter((_, c) => columns[c] === null);
+    const types = plan.types.filter((_, c) => columns[c] === null);
+    const frame = this.#make(2 ** Math.ceil(Math.log2(batch.length)), types);
+    try {
+      if (
+        !frame.metadata ||
+        !this.#dictionaries.stage(plan, frame) ||
+        (copies.length > 0 && frame.store.append(copies, null, 0, batch.length) !== batch.length)
+      ) {
+        this.#free(frame);
+        return null;
+      }
+      let copied = 0;
+      frame.columns = columns.map((column, c) => {
+        if (column !== null) return column;
+        const { form, length, validity, data } = frame.store.chunk(copied++, 0);
+        return this.#dictionaries.wire(plan, { form, length, validity, data }, c);
+      });
+      const bytes = frameByteLength({
+        rowCount: batch.length,
+        columns: frame.columns,
+        dictionaries: frame.dictionaries,
+      });
+      if (bytes > this.#target && batch.length > 1) {
+        this.#free(frame);
+        return null;
+      }
+      // The source token also retains query dictionaries/readers. A wire frame has copied
+      // those deltas and owns only dedicated arrays: reclassify their charge before returning
+      // the source lifetime, so execution can close its query grant before frame credit.
+      const adoptedBytes = frameTransferList({
+        rowCount: batch.length,
+        columns: columns.filter((column): column is WireVector => column !== null),
+        dictionaries: [],
+      }).reduce((sum, buffer) => sum + buffer.byteLength, 0);
+      if (!this.grant.allocate(adoptedBytes)) {
+        this.#free(frame);
+        return null;
+      }
+      frame.extraBytes += adoptedBytes;
+      this.#at = batch.length;
+      this.#rows += batch.length;
+      const result = this.#offer(frame, batch.length);
+      this.#releaseInput();
+      if (result === "blocked") this.#wait(this.channel.ready());
+      return result;
+    } catch (error) {
+      this.#free(frame);
+      throw error;
+    }
+  }
+
   #drain(): PushResult {
     const batch = this.#batch;
     if (batch === null) return "ready";
+    if (this.#at === 0) {
+      const owned = this.#offerOwned(batch);
+      if (owned !== null) return owned;
+    }
     const input = this.#dictionaryPlan?.columns ?? batch.columns;
     const stage = (frame: FrameStore) =>
       this.#dictionaryPlan === null || this.#dictionaries.stage(this.#dictionaryPlan, frame);

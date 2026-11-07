@@ -51,9 +51,11 @@
 // eslint-disable-next-line no-restricted-imports -- Node-only Playwright bench (cache control, /proc); never shipped.
 import { execFileSync } from "node:child_process";
 // eslint-disable-next-line no-restricted-imports -- Node-only Playwright bench (cache control, /proc); never shipped.
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { appendFileSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 // eslint-disable-next-line no-restricted-imports -- Node-only Playwright bench (cache control, /proc); never shipped.
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
+// eslint-disable-next-line no-restricted-imports -- Node-only benchmark scratch paths.
+import { homedir } from "node:os";
 import { expect, type CDPSession, type Page } from "@playwright/test";
 import { exportTrace, hostSample } from "./export-diagnostics.js";
 import { requireWorkerOpfs, test } from "./fixtures.js";
@@ -298,6 +300,23 @@ async function workers(page: Page, profileDirectory: string) {
     ok,
     profiles,
     profileCpuSeconds,
+    /** Diagnostic only, after delivery. Snapshot collection runs GC and is never a peak sample. */
+    async snapshotPage(path: string) {
+      if (!resolve(path).startsWith(join(homedir(), ".cache") + sep))
+        throw new Error("Heap snapshot must stay under ~/.cache");
+      const before = await cdp.send("Runtime.getHeapUsage");
+      const chunk = (event: { chunk: string }) => appendFileSync(path, event.chunk);
+      writeFileSync(path, "");
+      cdp.on("HeapProfiler.addHeapSnapshotChunk", chunk);
+      try {
+        await cdp.send("HeapProfiler.enable");
+        await cdp.send("HeapProfiler.takeHeapSnapshot", { reportProgress: false });
+      } finally {
+        cdp.off("HeapProfiler.addHeapSnapshotChunk", chunk);
+      }
+      const after = await cdp.send("Runtime.getHeapUsage");
+      return { path, before, after };
+    },
     async collectPage() {
       const before = await cdp.send("Runtime.getHeapUsage");
       await cdp.send("HeapProfiler.collectGarbage");
@@ -316,7 +335,7 @@ async function workers(page: Page, profileDirectory: string) {
       }
       return used;
     },
-    /** The largest ArrayBuffer backing-store size seen since the last call (Chromium's CDP). */
+    /** The largest backing-store size (ArrayBuffers and external strings) since the last call (Chromium's CDP). */
     takeExternal(): number {
       const seen = external;
       external = 0;
@@ -376,7 +395,9 @@ interface Row {
   readonly cacheResidentMiB: number;
   /** Idle pooled one-pass buffers at the end of the pass. */
   readonly poolMiB: number;
-  /** The worker's largest ArrayBuffer backing store seen during the pass (CDP), or 0. */
+  /** CDP backing storage includes ArrayBuffers and external strings; not an ArrayBuffer total. */
+  readonly backingStoragePeakMiB: number;
+  /** Legacy capture key, same mixed counter. Prefer backingStoragePeakMiB. */
   readonly arrayBufferPeakMiB: number;
   /** The page cache's protected segment before → after the export. */
   readonly protectedMiB: string;
@@ -561,6 +582,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
         expect(targets.profiles).toHaveLength(profilesBefore + 1);
         expect(exportCpu).toBeDefined();
       }
+      const backingStoragePeakMiB = Math.round(targets.takeExternal() / MiB);
       const row: Row = {
         ...(pass.phases ? { phases: pass.phases } : {}),
         ...(options.profile && exportCpu !== undefined
@@ -606,7 +628,8 @@ test.describe("rebuild core export on OPFS (bench)", () => {
         governorPeakMiB: Math.round(pass.governorPeakMiB),
         cacheResidentMiB: Number(pass.cacheResidentMiB.toFixed(1)),
         poolMiB: Number(pass.poolMiB.toFixed(1)),
-        arrayBufferPeakMiB: Math.round(targets.takeExternal() / MiB),
+        backingStoragePeakMiB,
+        arrayBufferPeakMiB: backingStoragePeakMiB,
         protectedMiB: `${pass.protectedBeforeMiB.toFixed(1)} → ${pass.protectedAfterMiB.toFixed(1)}`,
         hotKept: pass.kept?.hot ?? "",
         scannedKept: pass.kept?.scanned ?? "",
@@ -891,6 +914,11 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     const hotspots = recorded === undefined ? [] : selfTimes(recorded, 15);
     console.log(`warm pass profile (self time):\n  ${hotspots.join("\n  ")}`);
 
+    const snapshotRssBefore = rendererRss(profile);
+    const pageHeap = process.env.MINNOW_EXPORT_PAGE_HEAP
+      ? await targets.snapshotPage(process.env.MINNOW_EXPORT_PAGE_HEAP)
+      : undefined;
+    const snapshotRssAfter = rendererRss(profile);
     const gcRssBefore = rendererRss(profile);
     const campaignGc = SCAN_COMPARE ? await targets.collectPage() : undefined;
     const gcRssAfter = rendererRss(profile);
@@ -904,6 +932,16 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       governorCapMiB: base.capMiB,
       rowWindowMiB: SCAN_COMPARE && results.some((r) => r.mode === "scan") ? null : WINDOW_MIB,
       heapSampling: targets.ok,
+      ...(pageHeap
+        ? {
+            pageHeapSnapshot: {
+              ...pageHeap,
+              scope: "page after delivery; snapshot performs GC, not a peak measurement",
+              rendererBeforeMiB: snapshotRssBefore / MiB,
+              rendererAfterMiB: snapshotRssAfter / MiB,
+            },
+          }
+        : {}),
       campaignRendererBaselineMiB,
       campaignRendererPeakMiB: Math.max(...results.map((r) => r.rendererRssAbsolutePeakMiB)),
       ...(SCAN_COMPARE

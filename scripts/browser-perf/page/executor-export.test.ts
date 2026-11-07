@@ -8,8 +8,14 @@ import {
   createReach,
   EXECUTOR_EXPORT_REACH,
   EXECUTOR_POLICY_REACH,
+  RESULT_OWNED_REACH,
 } from "../../../packages/core/src/testing/reach.js";
 import * as factory from "../../../packages/core/src/next/exec/create.js";
+import { PageCache } from "../../../packages/core/src/next/storage/page-cache.js";
+import { VERIFY_CACHED_BYTES } from "../../../packages/core/src/next/storage/verify-cached.js";
+import { ColumnTarget } from "../../../packages/core/src/next/exec/column-target.js";
+import type { StoreSession } from "../../../packages/core/src/next/storage/contract.js";
+import type { ExtentReader } from "../../../packages/core/src/next/storage/extents.js";
 import { chunkReads } from "../../../packages/core/src/next/exec/scan.js";
 import type { PhysicalPlan, ScalarExpr } from "../../../packages/core/src/next/ir/ir.js";
 import { numbers } from "../../../packages/core/src/next/exec/kernels/test-support.js";
@@ -30,6 +36,12 @@ import type { FlatVector } from "../../../packages/core/src/next/vector/vector.j
 import type { FramePayload } from "../../../packages/core/src/next/exec/result.js";
 import { prepareExecutorExport } from "./executor-export.js";
 
+// The R8 proof must fail by byte/buffer ownership, without a poison rehash detecting damage.
+vi.mock("../../../packages/core/src/next/storage/verify-cached.js", async (original) => ({
+  ...(await original<typeof import("../../../packages/core/src/next/storage/verify-cached.js")>()),
+  VERIFY_CACHED_BYTES: false,
+}));
+
 describe.each(["full", "identity", "subset", "project", "filter"] as const)(
   "terminal policy %s",
   (shape) => {
@@ -38,6 +50,8 @@ describe.each(["full", "identity", "subset", "project", "filter"] as const)(
       async (seed) => {
         const reach = createReach("next-executor-export", [
           ...EXECUTOR_EXPORT_REACH,
+          RESULT_OWNED_REACH.cache,
+          ...(shape === "full" ? [RESULT_OWNED_REACH.adopt] : []),
           shape === "full" || shape === "identity"
             ? EXECUTOR_POLICY_REACH.full
             : EXECUTOR_POLICY_REACH.cached,
@@ -98,6 +112,15 @@ describe.each(["full", "identity", "subset", "project", "filter"] as const)(
             },
           };
         });
+        const dedicated = new Set<ArrayBuffer>();
+        const actualOwned = ColumnTarget.prototype.decodeOwned;
+        const decodeOwned = vi
+          .spyOn(ColumnTarget.prototype, "decodeOwned")
+          .mockImplementation(function (this: ColumnTarget, ...args) {
+            const result = actualOwned.apply(this, args);
+            for (const buffer of result.buffers) dedicated.add(buffer);
+            return result;
+          });
         const opened = vi.spyOn(chunkReads, "open"),
           together = vi.spyOn(chunkReads, "loadTogether");
         try {
@@ -133,11 +156,27 @@ describe.each(["full", "identity", "subset", "project", "filter"] as const)(
                       (_, row) => 2n ** 60n + BigInt(group * count + row),
                     ),
                   },
+                  {
+                    type: { kind: "text" } as const,
+                    values: Array.from({ length: count }, (_, row) =>
+                      (row + salt) % 11 === 0
+                        ? null
+                        : new TextEncoder().encode(`dictionary:${String((row + salt) % 4)}`),
+                    ),
+                  },
                 ]);
                 const fixtures = [];
                 for (const columns of sources)
                   fixtures.push(await writeGroup(columns, { space, inlineBytes: 0 }));
                 expect(fixtures).toHaveLength(2);
+                for (const fixture of fixtures) {
+                  const dictionary = await openChunk(space, defined(fixture.group.columns[3]));
+                  try {
+                    expect(dictionary.directory.dictionary).not.toBeNull();
+                  } finally {
+                    dictionary.close();
+                  }
+                }
                 reach.reach("multiple source groups");
                 expect(sources.every((columns) => columns[1]?.values.some((v) => v === null))).toBe(
                   true,
@@ -154,8 +193,47 @@ describe.each(["full", "identity", "subset", "project", "filter"] as const)(
                   }
                 }
                 reach.reach("out of line >64KiB");
+                expect(VERIFY_CACHED_BYTES).toBe(false);
+                const pageBuffers = new Set<ArrayBufferLike>();
+                const cache = new PageCache({
+                  readDataInto: (offset: number, out: Uint8Array) => {
+                    out.set(space.bytes.subarray(offset, offset + out.byteLength));
+                    return Promise.resolve();
+                  },
+                } as unknown as StoreSession);
+                cache.attach(governor.registerCache(cache));
+                const pages: ExtentReader = {
+                  read: async (refs, options) => {
+                    const lease = await cache.read(refs, options);
+                    for (const bytes of lease.bytes) pageBuffers.add(bytes.buffer);
+                    return lease;
+                  },
+                  peek: (ref, options) => {
+                    const bytes = cache.peek(ref, options);
+                    if (bytes) pageBuffers.add(bytes.buffer);
+                    return bytes;
+                  },
+                  parsed: cache.parsed.bind(cache),
+                  attach: cache.attachParsed.bind(cache),
+                };
                 const ports = new MessageChannel(),
                   dictionaries = new StreamDictionaries();
+                let adopted = 0;
+                const send = ports.port1.postMessage.bind(ports.port1);
+                ports.port1.postMessage = (
+                  message: unknown,
+                  options?: Transferable[] | StructuredSerializeOptions,
+                ) => {
+                  const buffers = Array.isArray(options) ? options : (options?.transfer ?? []);
+                  expect(buffers.some((buffer) => pageBuffers.has(buffer as ArrayBuffer))).toBe(
+                    false,
+                  );
+                  adopted += buffers.filter((buffer) =>
+                    dedicated.has(buffer as ArrayBuffer),
+                  ).length;
+                  if (Array.isArray(options)) send(message, options);
+                  else send(message, options);
+                };
                 let received = 0,
                   frames = 0,
                   creditTasks = 0,
@@ -215,7 +293,7 @@ describe.each(["full", "identity", "subset", "project", "filter"] as const)(
                     openBefore = opened.mock.calls.length,
                     sharedBefore = together.mock.calls.length;
                   const run = prepareExecutorExport(
-                    space,
+                    pages,
                     fixtures.map((f) => ({ rows: count, chunks: f.group.columns })),
                     {
                       governor,
@@ -256,6 +334,13 @@ describe.each(["full", "identity", "subset", "project", "filter"] as const)(
                       (op) => op.op === "scan" && op.rowsOut === result.rows,
                     ),
                   ).toBe(true);
+                  expect(pageBuffers.size).toBeGreaterThan(0);
+                  reach.reach(RESULT_OWNED_REACH.cache);
+                  if (shape === "full") {
+                    expect(adopted).toBeGreaterThan(0);
+                    reach.reach(RESULT_OWNED_REACH.adopt);
+                  }
+                  cache.close();
                   expect(governor.usedBytes).toBe(0);
                   expect(space.leased).toBe(0);
                   reach.reach("execution charges returned");
@@ -272,6 +357,7 @@ describe.each(["full", "identity", "subset", "project", "filter"] as const)(
                   }
                   reach.reach("source survives transfer");
                 } finally {
+                  cache.close();
                   ports.port2.close();
                 }
               },
@@ -281,6 +367,7 @@ describe.each(["full", "identity", "subset", "project", "filter"] as const)(
           reach.assertReached();
         } finally {
           create.mockRestore();
+          decodeOwned.mockRestore();
           opened.mockRestore();
           together.mockRestore();
         }
