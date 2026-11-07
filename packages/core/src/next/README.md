@@ -859,7 +859,7 @@ and the owner import it directly.
 
 `createExecutor()` (`exec/create.ts`) now implements the query entry point. It prepares immutable
 recipes for VALUES, table scans with pushdown, filter/project kernels, hash aggregation and
-DISTINCT, hash joins (including keyless joins), sort/top-N, windows, and LIMIT/OFFSET. Each run
+DISTINCT (including empty tuples: zero rows over empty input, one otherwise), hash joins (including keyless joins), sort/top-N, windows, and LIMIT/OFFSET. Each run
 owns its kernels, grants and source borrows. Preparation checks immutable operator metadata,
 without admitting execution grants or building breaker pools. A bound zero LIMIT skips its
 input in both reservation and execution, including a zero stored on an ORDER BY sort;

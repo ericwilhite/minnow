@@ -525,6 +525,26 @@ export function compilePlan(plan: PhysicalPlan): Program {
       case "distinct": {
         const child = prepare(rel.input),
           input = types(rel.input);
+        if (rel.op === "distinct" && input.length === 0) {
+          // Empty tuples form one class only when at least one arrived. Scalar aggregation
+          // would invent its empty-input row. Consume the entire child (no early-stop hint).
+          const minimum = 2 * BATCH_ROWS;
+          fixed(rel, minimum);
+          return (runtime, downstream) =>
+            instantiate(
+              runtime,
+              rel,
+              input,
+              minimum,
+              BATCH_ROWS,
+              (context) =>
+                new LimitOperator(1, 0, context.arena, counted(runtime, rel, downstream)),
+              (operator) => {
+                runtime.onAbort((reason) => operator.abort(reason));
+                return child(runtime, operator, []);
+              },
+            );
+        }
         const aggregate: Extract<Rel, { op: "aggregate" }> =
           rel.op === "aggregate"
             ? rel
