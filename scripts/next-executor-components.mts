@@ -29,11 +29,18 @@ function distribution(samples: readonly number[]) {
 /** Isolate the prepared scan/sort/fetch pipeline, including owned frames and cleanup.
  * SQL, lowering, compilation and JS row decoding are outside the timed samples. The two
  * strategies share the exact pinned storage fixture, governor and operator implementations. */
-export async function lateSortComponent(core: StorageCore, rounds: number) {
+export async function lateSortComponent(core: StorageCore, rounds: number, kind = "late-sort") {
   if (!Number.isSafeInteger(rounds) || rounds < 5)
     throw new RangeError("at least five interleaved rounds required");
-  const prepared = core.prepare("SELECT * FROM events_wide ORDER BY f09 DESC,id LIMIT 100");
-  const programs = [compilePlan(prepared.plan, { lateSort: false }), compilePlan(prepared.plan)];
+  const prepared = core.prepare(
+    kind === "key-order"
+      ? "SELECT * FROM events_wide ORDER BY id LIMIT 100"
+      : "SELECT * FROM events_wide ORDER BY f09 DESC,id LIMIT 100",
+  );
+  const programs = [
+    compilePlan(prepared.plan, kind === "key-order" ? { keyOrder: false } : { lateSort: false }),
+    compilePlan(prepared.plan, kind === "key-order" ? { keyOrder: true } : {}),
+  ];
   let queryId = 1000000;
   const run = async (late: boolean, decode = false) => {
     const pin = core.harness.path.pin();
@@ -116,13 +123,22 @@ export async function lateSortComponent(core: StorageCore, rounds: number) {
       (late ? after : before).push((elapsed.user + elapsed.system) / 1000);
       if (late) lastAfter = result.profile;
       else lastBefore = result.profile;
-      order.push(late ? "keys-and-locators" : "full-payload");
+      order.push(
+        kind === "key-order"
+          ? late
+            ? "index-cursor"
+            : "scan-sort-locators"
+          : late
+            ? "keys-and-locators"
+            : "full-payload",
+      );
     }
   const baseline = distribution(before),
     optimized = distribution(after),
     delta = baseline.median - optimized.median;
   return {
     lane: "Node",
+    strategy: kind,
     component: "prepared TableScan/sort/fetch/frames pipeline; no SQL/lowering/compile/JS rows",
     rounds,
     warmupsPerVariant: 1,

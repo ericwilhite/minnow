@@ -11,7 +11,12 @@ import type {
   TableSnapshot,
 } from "../access/snapshot.js";
 import { SnapshotReleasedError } from "../access/snapshot.js";
-import { OBJECT_OVERHEAD_BYTES, type Grant } from "../memory/governor.js";
+import {
+  OBJECT_OVERHEAD_BYTES,
+  GrantClosedError,
+  type Loan,
+  type Grant,
+} from "../memory/governor.js";
 import type { SpillService } from "../spill/contract.js";
 import { sortInSlices } from "../task.js";
 import type { PhysicalType } from "../types.js";
@@ -22,7 +27,7 @@ import { isValidSlot, slotOf } from "./kernels/vectors.js";
 import { drive, type Operator, type PushResult, type Transfer } from "./pipeline.js";
 import { reclaimingReader } from "./reclaim-reader.js";
 import type { ChunkReads } from "./scan.js";
-import { SortOperator } from "./sort.js";
+import { SortOperator, sortMinimumBytes } from "./sort.js";
 import { TableScan } from "./table-scan.js";
 
 export const ORDINAL_TYPE: PhysicalType = { kind: "float64" };
@@ -136,7 +141,12 @@ class SelectedMemory implements MemorySegment {
 }
 
 /** Inner sorts return their buffers/loans; the execution owns the reusable outer account. */
-function scopedGrant(grant: Grant): Grant {
+export function scopedGrant(grant: Grant, minimum: number): Grant {
+  let closed = false;
+  let loan: Loan | null = null;
+  const abort = new AbortController();
+  const signalFor = (signal?: AbortSignal) =>
+    signal === undefined ? abort.signal : AbortSignal.any([abort.signal, signal]);
   return {
     get label() {
       return grant.label;
@@ -145,29 +155,62 @@ function scopedGrant(grant: Grant): Grant {
       return grant.spillable;
     },
     get held() {
-      return grant.held;
+      return closed ? 0 : grant.held;
     },
     get allocated() {
-      return grant.allocated;
+      return closed ? 0 : grant.allocated;
     },
     get loaned() {
-      return grant.loaned;
+      return closed ? 0 : grant.loaned;
     },
-    allocate: (n) => grant.allocate(n),
-    free: (n) => grant.free(n),
-    tryGrow: (n) => grant.tryGrow(n),
-    release: (n) => grant.release(n),
-    makeRoom: (n, signal) => grant.makeRoom?.(n, signal) ?? Promise.resolve(false),
-    borrow: (n, signal) => grant.borrow(n, signal),
-    onReclaimRequest: (callback) => grant.onReclaimRequest(callback),
+    allocate: (n) => !closed && grant.allocate(n),
+    free(n) {
+      if (!closed) grant.free(n);
+    },
+    tryGrow: (n) => !closed && grant.tryGrow(n),
+    release(n) {
+      // A sort may return unused holdings while reclaiming, before close. Its next
+      // cursor batch owns the same admission, so only the surplus can leave this view.
+      if (!closed) grant.release(Math.min(n, Math.max(0, grant.held - minimum)));
+    },
+    makeRoom: (n, signal) =>
+      closed
+        ? Promise.resolve(false)
+        : (grant.makeRoom?.(n, signalFor(signal)) ?? Promise.resolve(false)),
+    async borrow(n, signal) {
+      if (closed) throw new GrantClosedError(grant.label);
+      const value = await grant.borrow(n, signalFor(signal));
+      if (abort.signal.aborted) {
+        value.repay();
+        throw new GrantClosedError(grant.label);
+      }
+      loan = value;
+      return value;
+    },
+    onReclaimRequest(callback) {
+      if (!closed) grant.onReclaimRequest(callback);
+    },
     close() {
-      const unused = grant.held - grant.allocated - grant.loaned;
-      if (unused > 0) grant.release(unused);
+      if (closed) return;
+      closed = true;
+      abort.abort(new GrantClosedError(grant.label));
+      // Each view belongs to one inner sort; the execution retains the reusable account.
+      if (grant.allocated > 0) grant.free(grant.allocated);
+      loan?.repay();
+      loan = null;
+      const releaseSurplus = () => {
+        const unused = grant.held - grant.allocated - grant.loaned - minimum;
+        if (unused > 0) grant.release(unused);
+      };
+      releaseSurplus();
+      grant.onReclaimRequest(releaseSurplus);
     },
   };
 }
 
 export interface LateFetchContext {
+  /** Ordered index input may already be in physical order; preserve its borrowed stream. */
+  readonly orderedShortcut?: boolean;
   readonly snapshot: Snapshot;
   readonly tableId: number;
   readonly columns: readonly number[];
@@ -312,7 +355,7 @@ export class LateFetchOperator implements Operator {
         segments,
       };
       const output: Operator = {
-        push: (fetched) => {
+        push: (fetched, transfer) => {
           this.rowsOut += fetched.selection?.count ?? fetched.length;
           this.batchesOut++;
           for (let c = 0; c < context.types.length; c++) {
@@ -320,34 +363,44 @@ export class LateFetchOperator implements Operator {
             if (!column) throw new TypeError("missing fetched column");
             this.#outputColumns[c] = column;
           }
-          return this.downstream.push({
-            length: fetched.length,
-            columns: this.#outputColumns,
-            selection: fetched.selection,
-          });
+          return this.downstream.push(
+            {
+              length: fetched.length,
+              columns: this.#outputColumns,
+              selection: fetched.selection,
+            },
+            transfer,
+          );
         },
         ready: () => this.downstream.ready(),
         finish: () => undefined,
         abort: (reason) => this.downstream.abort(reason),
       };
-      const sort = new SortOperator(
-        {
-          types: [...context.types, ORDINAL_TYPE],
-          keys: [
-            { column: context.types.length, direction: "asc", nulls: "last", collation: null },
-          ],
-          limit: null,
-          offset: 0,
-          withTies: false,
-        },
-        {
-          grant: scopedGrant(context.restoreGrant),
-          spill: context.spill,
-          queryId: context.queryId,
-          signal: this.#abort.signal,
-        },
-        output,
-      );
+      const direct =
+        context.orderedShortcut === true && order.every((ordinal, index) => ordinal === index);
+      const sort = direct
+        ? null
+        : new SortOperator(
+            {
+              types: [...context.types, ORDINAL_TYPE],
+              keys: [
+                { column: context.types.length, direction: "asc", nulls: "last", collation: null },
+              ],
+              limit: null,
+              offset: 0,
+              withTies: false,
+            },
+            {
+              grant: scopedGrant(
+                context.restoreGrant,
+                sortMinimumBytes([...context.types, ORDINAL_TYPE]),
+              ),
+              spill: context.spill,
+              queryId: context.queryId,
+              signal: this.#abort.signal,
+            },
+            output,
+          );
       this.#sort = sort;
       const scan = new TableScan({
         table,
@@ -377,17 +430,18 @@ export class LateFetchOperator implements Operator {
             ordinal.data.values[fetched.selection?.rows[k] ?? k] = order[at++] ?? -1;
           ordinal.length = fetched.length;
           this.#inputColumns[context.types.length] = ordinal;
+          if (sort === null) return output.push(fetched, transfer);
           return sort.push(
             { length: fetched.length, columns: this.#inputColumns, selection: fetched.selection },
             transfer,
           );
         },
-        ready: () => sort.ready(),
+        ready: () => (sort === null ? output.ready() : sort.ready()),
         finish: () => {
           if (at !== count) throw new RangeError("fetch omitted requested rows");
-          return sort.finish();
+          return sort?.finish();
         },
-        abort: (reason) => sort.abort(reason),
+        abort: (reason) => (sort === null ? output.abort(reason) : sort.abort(reason)),
       };
       context.onPipeline();
       await drive(scan, ordered, this.#abort.signal);

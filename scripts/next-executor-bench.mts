@@ -99,12 +99,14 @@ const generator = (await import(pathToFileURL(join(harness, "gen.js")).href)) as
 const catalogue = (await import(pathToFileURL(join(harness, "queries.js")).href)) as Catalogue;
 const core = await new StorageCore(8192).open();
 const lateSort = option("--late-sort", "on") !== "off";
-if (!lateSort) core.executor.prepare = createExecutor({ lateSort: false }).prepare;
+const keyOrder = option("--key-order", "on") !== "off";
+core.executor.prepare = createExecutor({ lateSort, keyOrder }).prepare;
 const spec = generator.wideSpec(200);
 const metadata = {
   lane: "Node",
   sqlCorrections: frozenSQL ? ["S_q7", "guide-4", "guide-5"] : dataset === "star" ? ["S_q7"] : [],
   lateSort,
+  keyOrder,
   revision: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
   workingTreePatchSha256: createHash("sha256")
     .update(execFileSync("git", ["diff", "HEAD"]))
@@ -134,7 +136,7 @@ const metadata = {
         resolve("apps/site/bench/benchmark.ts"),
         resolve("packages/core/src/next/testing/executor-catalogue.json"),
         resolve("scripts/next-executor-bench.mts"),
-        ...["plan", "limit", "table-scan", "memory-scan"].map((name) =>
+        ...["plan", "limit", "table-scan", "memory-scan", "key-order", "late-fetch"].map((name) =>
           resolve(`packages/core/dist/next/exec/${name}.js`),
         ),
       ].map(async (file) => [
@@ -464,9 +466,16 @@ try {
       const sorted = [...samples].sort((a, b) => a - b),
         median = sorted[sorted.length >>> 1] ?? NaN;
       let wholeComparison = null;
-      if (option("--whole-compare", "") === "late-sort") {
+      if (["late-sort", "key-order"].includes(option("--whole-compare", ""))) {
         const saved = core.executor.prepare;
-        const strategies = [createExecutor({ lateSort: false }), createExecutor()];
+        const strategies = [
+          createExecutor(
+            option("--whole-compare", "") === "key-order"
+              ? { keyOrder: false }
+              : { lateSort: false },
+          ),
+          createExecutor(option("--whole-compare", "") === "key-order" ? { keyOrder: true } : {}),
+        ];
         const before: number[] = [],
           after: number[] = [],
           order: string[] = [];
@@ -492,7 +501,15 @@ try {
                 throw new Error("whole-query comparison lost rows or changed checksum");
               if (late) afterProfile = result.profile;
               else beforeProfile = result.profile;
-              order.push(late ? "keys-and-locators" : "full-payload");
+              order.push(
+                option("--whole-compare", "") === "key-order"
+                  ? late
+                    ? "index-cursor"
+                    : "scan-sort-locators"
+                  : late
+                    ? "keys-and-locators"
+                    : "full-payload",
+              );
               console.error(
                 JSON.stringify({ id: query.id, comparison: true, round, late, load: loadavg() }),
               );
@@ -512,6 +529,7 @@ try {
           candidate = distribution(after);
         wholeComparison = {
           lane: "Node",
+          strategy: option("--whole-compare", ""),
           rounds,
           order,
           timing: metadata.timing,
@@ -568,12 +586,13 @@ try {
     await writeFile(join(cache, "component-scan-limit.json"), JSON.stringify(component, null, 2));
     console.log(JSON.stringify(component));
   }
-  if (option("--component", "") === "late-sort") {
+  if (["late-sort", "key-order"].includes(option("--component", ""))) {
     const { lateSortComponent } = await import(
       pathToFileURL(resolve("scripts/next-executor-components.mts")).href
     );
-    const component = await lateSortComponent(core, rounds);
-    await writeFile(join(cache, "component-late-sort.json"), JSON.stringify(component, null, 2));
+    const kind = option("--component", "late-sort");
+    const component = await lateSortComponent(core, rounds, kind);
+    await writeFile(join(cache, `component-${kind}.json`), JSON.stringify(component, null, 2));
     console.log(JSON.stringify(component));
   }
 } finally {

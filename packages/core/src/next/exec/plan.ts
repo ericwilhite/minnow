@@ -39,6 +39,7 @@ import { sortMode } from "./sort-keys.js";
 import type { SortColumn } from "./sort-keys.js";
 import { windowInputLayout, remapWindowFunction, literalWindowAmount } from "./window-input.js";
 import { TableScan, memoryScanBufferBytes } from "./table-scan.js";
+import { orderedSort, indexMinimums, runIndexOrder, type IndexShape } from "./key-order.js";
 import {
   WindowOperator,
   windowMinimumBytes,
@@ -374,6 +375,7 @@ function setupWindow(
 /** Compile capability checks and recipes, never retaining a mutable kernel instance. */
 export interface CompileOptions {
   readonly lateSort?: boolean;
+  readonly keyOrder?: boolean;
   /** False retains the original window inputs for component/query benchmark controls. */
   readonly windowInputDeduplication?: boolean;
   /** Parent control for literal-amount gather benchmarks. */
@@ -432,6 +434,31 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       throw new UnsupportedPlanError("a repeated relational operator id", { construct: "plan" });
     ids.add(rel.id);
     switch (rel.op) {
+      case "indexRange": {
+        if (rel.lower !== null || rel.upper !== null || rel.emitLocator)
+          throw new UnsupportedPlanError("bounded or locator-producing index range", {
+            construct: "indexRange",
+          });
+        const shape: IndexShape = {
+          tableId: rel.tableId,
+          columns: rel.columns,
+          types: types(rel),
+          source: { id: nextPhysicalId++, op: "indexRange", profileAs: rel },
+          fetch: rel,
+          restore: { id: nextPhysicalId++, op: "sort", profileAs: rel },
+          descending: rel.descending,
+        };
+        const placeholders = indexMinimums(shape, 1);
+        for (let i = 0; i < placeholders.length; i++) {
+          const entry = placeholders[i];
+          if (!entry) throw new Error("index minimum");
+          fixed(entry.rel, (cap) => indexMinimums(shape, cap)[i]?.minimum ?? 0, rel.id);
+        }
+        return (runtime, sink, stops, demand) =>
+          runIndexOrder(runtime, sink, shape, rel.indexId, null, 0, demand, () =>
+            stops.some((stop) => stop()),
+          );
+      }
       case "values": {
         const setup = (context: CompileContext) =>
           rel.rows.map((row) => row.map((expr) => compileExpr(expr, context)));
@@ -1131,11 +1158,55 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           );
   }
   const recipe = prepare(plan.root);
+  // Main's cursor still collects the whole range before its first result. Keep this SQL
+  // strategy opt-in until B3's streaming cursor passes the first-page CPU acceptance rule.
+  // Explicit indexRange IR continues to execute its requested access path.
+  const ordered = options.keyOrder === true ? orderedSort(plan) : null;
   // Extra helper buffers must not turn a formerly admissible small-cap query into a refusal.
   // Both strategies are capability-checked at prepare; only their execution resources differ.
-  const fallback = lateSortIds.size === 0 ? null : compilePlan(plan, { lateSort: false });
+  const fallback =
+    lateSortIds.size === 0 ? null : compilePlan(plan, { ...options, lateSort: false });
   return (runtime, sink) => {
     runtime.resolveCall = resolveCall;
+    if (ordered !== null) {
+      const { rel, scan, project } = ordered;
+      const table = runtime.view.catalog.table(scan.tableId);
+      const index = table?.indexes.find((i) => i.id === table.primaryKey);
+      if (
+        index?.kind === "ordered" &&
+        index.unique &&
+        index.columnIds.length === rel.keys.length &&
+        ordered.keys.every((column, i) => column === index.columnIds[i])
+      ) {
+        const bounds = runtime.bounds(rel);
+        if (bounds.limit === 0) return sink.finish();
+        const shape: IndexShape = {
+          tableId: scan.tableId,
+          columns: ordered.columns,
+          types: types(project),
+          source: scan,
+          fetch: project,
+          restore: rel,
+          descending: rel.keys[0]?.direction === "desc",
+        };
+        const entries = indexMinimums(shape, runtime.request.governor.capBytes);
+        if (
+          entries.reduce((n, e) => n + e.minimum, 0) <=
+          runtime.request.governor.capBytes - runtime.request.governor.reserveBytes
+        )
+          return then(runtime.reserve(entries), () =>
+            then(runIndexOrder(runtime, sink, shape, index.id, bounds.limit, bounds.offset), () => {
+              for (const projection of ordered.projects) {
+                if (projection.id === project.id) continue;
+                const profile = runtime.profile(projection),
+                  output = runtime.profile(project);
+                profile.rowsOut = output.rowsOut;
+                profile.batchesOut = output.batchesOut;
+              }
+            }),
+          );
+      }
+    }
     // LIMIT zero never opens its input. Keep capability checks at prepare, but do not reserve
     // buffers for those unreachable pipelines (including when zero is a bound parameter).
     const active = new Set<number>();

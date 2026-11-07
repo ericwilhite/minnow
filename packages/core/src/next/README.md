@@ -1287,6 +1287,24 @@ IR operator, including the peak sum of simultaneous holdings.
 compares both strategies in interleaved Node CPU rounds over the same committed fixture.
 The whole-query comparison includes SQL/lowering/prepare/materialized rows; the component
 times the prepared scan/sort/fetch/frame pipeline. These are Node measurements.
+Unbounded, value-producing `indexRange` nodes use the pinned index cursor and the same
+physical-order payload fetch. The internal `keyOrder:true` option lets a direct primary-key
+ORDER BY with LIMIT select this recipe
+without changing lowering's existing sort IR: the pinned catalog must have the complete,
+ordered, unique primary key in the requested byte collation and direction. Direct projections,
+including removal of a hidden order key, are supported; computed expressions and filters keep
+the generic recipe. LIMIT/OFFSET validation precedes cursor opening, and cursor requests are
+bounded by remaining demand. The SQL recipe skips OFFSET payload. Cursor cancellation closes
+once and drains an outstanding write before its output arena closes. Restore buffers retain
+their admitted minimum between batches; physically monotonic cursor batches can stream payload
+without an ordinal sort. Otherwise the charged, spillable sort restores cursor order.
+The current write-path range cursor still collects the whole range internally before its first
+output. Early executor termination therefore bounds requested locators and payload reads, but
+does not yet bound index work or scratch by LIMIT. Streaming cursor work belongs to the write
+path; `--only scan_first_page_ordered --whole-compare key-order --component key-order` measures
+the current implementation as a Node diagnostic, not first-page performance acceptance.
+The SQL shortcut is off by default until the streaming cursor meets that acceptance rule;
+ordinary owner composition retains the scan/sort recipe.
 Small compiler probes determine
 kernel buffer minimums; the generated allocation matrix checks them against real batch-sized
 buffers. Execute accepts caller-owned parameter values (keep them unchanged until execution ends).
@@ -1299,7 +1317,8 @@ must keep that grant alive for the bound vectors' lifetime. Computed join/sort/w
 into hidden columns and removed from visible results. No runtime code generation is used.
 
 The owner composition uses it by default; protocol tests over `StandinWritePath` explicitly keep
-their synthetic executor. DML, keyed nested-loop joins, index lookup/range, fetch, init plans, apply, set operations and
+their synthetic executor. DML, keyed nested-loop joins, index lookup, bounded or locator-producing
+index ranges, fetch, init plans, apply, set operations and
 recursion are still typed prepare-time refusals, as are unsupported existing kernel overloads.
 This factory does not turn those missing capabilities into current-engine fallbacks. The
 lowerer emits joins and windows for the factory; SQL catalogue tests exercise them through
