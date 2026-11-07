@@ -12193,10 +12193,16 @@ class Parser {
         this.#expectPunctuation(")");
         this.#keyword("OVER");
         const { partitionBy, orderBy, frame } = this.#overClause();
-        if (frame !== undefined) {
+        if (frame !== undefined && !recordDeclaredTypes) {
           throw new TypeError(`${upper} does not take a window frame`);
         }
-        return { kind: "window", name: upper, partitionBy, orderBy };
+        return {
+          kind: "window",
+          name: upper,
+          partitionBy,
+          orderBy,
+          ...(frame === undefined ? {} : { frame }),
+        };
       }
       if (upper === "NTILE") {
         const bucketExpression = this.#expression();
@@ -12211,7 +12217,8 @@ class Parser {
         }
         this.#keyword("OVER");
         const { partitionBy, orderBy, frame } = this.#overClause();
-        if (frame !== undefined) throw new TypeError("NTILE does not take a window frame");
+        if (frame !== undefined && !recordDeclaredTypes)
+          throw new TypeError("NTILE does not take a window frame");
         if (orderBy.length === 0) {
           throw new TypeError("NTILE requires ORDER BY inside OVER (...)");
         }
@@ -12221,6 +12228,7 @@ class Parser {
           partitionBy,
           orderBy,
           offset: bucketExpression.value,
+          ...(frame === undefined ? {} : { frame }),
         };
       }
       if (upper === "FIRST_VALUE" || upper === "LAST_VALUE" || upper === "NTH_VALUE") {
@@ -12294,7 +12302,8 @@ class Parser {
           fallbackExpression === undefined ? null : constant(fallbackExpression, "default");
         this.#keyword("OVER");
         const { partitionBy, orderBy, frame } = this.#overClause();
-        if (frame !== undefined) throw new TypeError(`${upper} does not take a window frame`);
+        if (frame !== undefined && !recordDeclaredTypes)
+          throw new TypeError(`${upper} does not take a window frame`);
         if (orderBy.length === 0) {
           throw new TypeError(`${upper} requires ORDER BY inside OVER (...)`);
         }
@@ -12310,6 +12319,7 @@ class Parser {
           argument,
           offset,
           ...(fallback === null ? {} : { fallback }),
+          ...(frame === undefined ? {} : { frame }),
         };
       }
       if (
@@ -12803,12 +12813,12 @@ class Parser {
       let end: WindowFrameBound;
       if (this.#isKeyword("BETWEEN")) {
         this.#keyword("BETWEEN");
-        start = this.#frameBound(unit, "starting");
+        start = this.#frameBound(unit);
         this.#keyword("AND");
-        end = this.#frameBound(unit, "ending");
+        end = this.#frameBound(unit);
       } else {
         // The single-bound shorthand: the bound is the frame start, the end is the current row.
-        start = this.#frameBound(unit, "starting");
+        start = this.#frameBound(unit);
         end = { kind: "current-row" };
       }
       if (start.kind === "unbounded-following" || end.kind === "unbounded-preceding") {
@@ -12860,7 +12870,7 @@ class Parser {
     return { partitionBy, orderBy, ...(frame === undefined ? {} : { frame }) };
   }
 
-  #frameBound(unit: "rows" | "range" | "groups", which: "starting" | "ending"): WindowFrameBound {
+  #frameBound(unit: "rows" | "range" | "groups"): WindowFrameBound {
     if (this.#isKeyword("UNBOUNDED")) {
       this.#keyword("UNBOUNDED");
       if (this.#isKeyword("PRECEDING")) {
@@ -12899,11 +12909,13 @@ class Parser {
       this.#keyword(kind.toUpperCase());
       return rememberFrameOffset<WindowFrame["start"]>({ kind, offset: 0 }, { parameter });
     }
-    // PostgreSQL's frame offset errors (22004, 22013). A negative RANGE offset is raised here,
-    // where PostgreSQL raises it when the first row compares (so not over no rows).
+    // Offset values are checked when WindowAgg starts, not while parsing: LIMIT 0 and
+    // frame-independent ranking functions may never evaluate them.
     if (this.#isKeyword("NULL")) {
-      if (which === "starting") throw new TypeError("frame starting offset must not be null");
-      throw new TypeError("frame ending offset must not be null");
+      this.#keyword("NULL");
+      const kind = this.#isKeyword("PRECEDING") ? "preceding" : "following";
+      this.#keyword(kind.toUpperCase());
+      return rememberFrameOffset<WindowFrame["start"]>({ kind, offset: 0 }, { nullOffset: true });
     }
     if (this.#isKeyword("INTERVAL") && unit === "rows")
       throw new TypeError("argument of ROWS must be type bigint, not type interval");
@@ -12936,19 +12948,15 @@ class Parser {
     // PostgreSQL types a decimal literal, or an integer outside int8, as numeric.
     let numeric = decimal;
     if (unit === "range") {
-      if (negated && !digits.zero) {
-        if (which === "starting") throw new TypeError("frame starting offset must not be negative");
-        throw new TypeError("frame ending offset must not be negative");
-      }
       // RANGE keeps the value. One a double cannot hold (it would become 0 or Infinity) is
       // refused rather than changed.
-      offset = digits.zero ? 0 : Number(literal);
+      offset = digits.zero ? 0 : Number(negated ? `-${literal}` : literal);
       if (!digits.zero && (offset === 0 || !Number.isFinite(offset)))
         throw new TypeError("RANGE frame offsets outside double precision are not supported");
       if (!decimal) {
-        const value = BigInt(literal);
-        if (value > 9007199254740991n) exact = value;
-        if (value > 9223372036854775807n) numeric = true;
+        const value = BigInt(negated ? `-${literal}` : literal);
+        if (value > 9007199254740991n || value < -9007199254740991n) exact = value;
+        if (value > 9223372036854775807n || value < -9223372036854775808n) numeric = true;
       }
     } else {
       // ROWS and GROUPS take a bigint: PostgreSQL rounds a numeric literal half away from zero
@@ -12959,17 +12967,13 @@ class Parser {
       const rounded = negated ? -magnitude : magnitude;
       if (rounded > 9223372036854775807n || rounded < -9223372036854775808n)
         throw new TypeError("bigint out of range");
-      if (rounded < 0n) {
-        if (which === "starting") throw new TypeError("frame starting offset must not be negative");
-        throw new TypeError("frame ending offset must not be negative");
-      }
       offset = Number(rounded);
-      if (rounded > 9007199254740991n) exact = rounded;
+      if (rounded > 9007199254740991n || rounded < -9007199254740991n) exact = rounded;
     }
     const metadata =
       unit === "range" || numeric || exact !== undefined
         ? {
-            ...(unit === "range" ? { text: literal } : {}),
+            ...(unit === "range" ? { text: negated ? `-${literal}` : literal } : {}),
             ...(numeric ? { numeric: true as const } : {}),
             ...(exact === undefined ? {} : { exact }),
           }

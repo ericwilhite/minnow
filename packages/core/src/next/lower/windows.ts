@@ -20,7 +20,7 @@ import { coerce, type Typed } from "./coerce.js";
 import { PlanningError, unsupported } from "./errors.js";
 import { lowerExpression } from "./expressions.js";
 import type { BlockLowerer, OuterResolver } from "./from.js";
-import { floatLiteral, integerLiteral } from "./literals.js";
+import { floatLiteral, integerLiteral, nullLiteral } from "./literals.js";
 import {
   at,
   column,
@@ -135,6 +135,11 @@ function frameOf(
     if (input.offset === undefined) return { kind: input.kind, offset: null };
     // Parser-owned metadata preserves the exact literal without adding public model fields.
     const metadata = frameOffsetMetadata(input);
+    if (metadata?.nullOffset === true)
+      return {
+        kind: input.kind,
+        offset: nullLiteral(frame.unit === "range" ? (rangeOffsetType ?? INT8) : INT8),
+      };
     if (metadata?.parameter !== undefined) {
       if (frame.unit === "range" && orderType === null)
         throw new PlanningError("RANGE with offset requires exactly one ORDER BY column", "42P20");
@@ -254,10 +259,20 @@ export function lowerWindowed(
         if (fallback !== null) args.push(fallback);
       }
       if (result.fn === "nth_value") args.push(int(spec.offset ?? 1, INT4));
+      const frame = frameOf(spec.frame, orderType, builder);
+      // PostgreSQL windowfuncs.c SupportRequestOptimizeWindowClause discards these frames.
+      const independent = [
+        "row_number",
+        "rank",
+        "dense_rank",
+        "percent_rank",
+        "cume_dist",
+        "ntile",
+      ].includes(result.fn);
       functions.push({
         fn: result.fn,
         args,
-        frame: frameOf(spec.frame, orderType, builder),
+        frame: independent ? null : frame,
         type: result.type,
       });
       results.set(spec, columns.length + added.length);

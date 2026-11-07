@@ -180,7 +180,7 @@ for (const seed of seedsFor("next-lower-m3-types", [0x7733, 0x7734]))
         const sql = `SELECT id,COUNT(*)OVER(ORDER BY id ROWS BETWEEN ${offset} PRECEDING AND CURRENT ROW)AS n FROM p ORDER BY id`;
         const sqlState = offset === "NULL" ? "22004" : "22013";
         await expect(pg.query(sql)).rejects.toMatchObject({ code: sqlState });
-        expect(() => core.prepare(sql)).toThrow(expect.objectContaining({ sqlState }));
+        await expect(core.execute(sql)).rejects.toMatchObject({ sqlState });
       }
 
       for (const unit of ["ROWS", "RANGE", "GROUPS"]) {

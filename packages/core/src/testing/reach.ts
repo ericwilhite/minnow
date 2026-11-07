@@ -850,3 +850,44 @@ export const LOWER_M3_TYPES_REACH = [
   "invalid offsets",
   "released",
 ] as const;
+
+
+/** Startup checks differ from RANGE's comparison-time sign check and optimized ranking. */
+export const LOWER_M3_OFFSETS_REACH = [
+  "empty",
+  "NULL only",
+  "mixed",
+  "non-null",
+  "ROWS",
+  "RANGE",
+  "GROUPS",
+  "literal",
+  "parameter",
+  "PRECEDING",
+  "FOLLOWING",
+  "NULL offset",
+  "NaN offset",
+  "negative offset",
+  "aggregate",
+  "navigation",
+  "optimized ranking",
+  "LIMIT 0",
+  "released",
+] as const;
+
+
+/** Empty input and NULL-only keys do not invoke RANGE's sign-checking support function. */
+export const WINDOW_OFFSET_STARTUP_REACH = [
+  "resident",
+  "streamed",
+  "empty",
+  "NULL only",
+  "NULL 22004",
+  "NaN accepted",
+  "negative accepted",
+  "PRECEDING",
+  "FOLLOWING",
+  "aggregate",
+  "navigation",
+  "released",
+] as const;

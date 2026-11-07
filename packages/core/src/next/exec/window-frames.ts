@@ -147,6 +147,17 @@ export function* frameBounds(
         else out.set((end ? peers.end : peers.start).subarray(0, n));
         continue;
     }
+    // NULL offsets are startup errors; negative/NaN RANGE offsets are errors only if
+    // in_range compares non-NULL keys. A sorted NULL-only partition contains just peers.
+    if (
+      frame.unit === "range" &&
+      key !== null &&
+      bound.offset !== null &&
+      (n === 0 || (key.valid[0] !== 1 && key.valid[n - 1] !== 1))
+    ) {
+      out.set((end ? peers.end : peers.start).subarray(0, n));
+      continue;
+    }
     const offset = offsetOf(bound);
     const sign = bound.kind === "preceding" ? -1 : 1;
     if (frame.unit === "rows") {

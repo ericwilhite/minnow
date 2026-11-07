@@ -264,3 +264,8 @@ joins and windows. B7 adds exact real-executor campaigns, byte-collation join ke
 outer-join WHERE placement, and uncorrelated EXISTS/IN marks that avoid unsupported apply.
 The catalogue executes every cell it can and records each remaining refusal by class; its SQL
 and data stay frozen, including ROUND(float8,int4) cells that PostgreSQL refuses with 42883.
+
+Frame offsets follow PostgreSQL execution timing: ROWS/GROUPS and NULL offsets validate when
+WindowAgg starts; negative/NaN RANGE values validate at non-NULL comparisons. Ranking frames
+are discarded after typing when PostgreSQL optimizes them away. LIMIT 0 never starts validation.
+Generated real-executor and resident/streamed campaigns cover empty and NULL-only inputs.

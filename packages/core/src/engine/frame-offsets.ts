@@ -1,6 +1,8 @@
 /** Parser-owned frame precision and literal types, kept outside the logical plan fields. */
 export interface FrameOffsetMetadata {
   readonly text?: string;
+  /** SQL NULL is retained for execution-time offset validation. */
+  readonly nullOffset?: true;
   /** Typed-only placeholder, not a public logical-plan field. */
   readonly parameter?: number;
   /** Original PostgreSQL literal type, used to resolve RANGE over integer keys. */
