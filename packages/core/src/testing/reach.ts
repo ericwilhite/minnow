@@ -902,3 +902,22 @@ export const REFERENCE_RANGE_TYPES_REACH = [
   "NULL key",
   "rows match",
 ] as const;
+
+/** Exact NUMERIC literals and float conversion errors across planning and startup boundaries. */
+export const RANGE_LITERAL_WIDTH_REACH = [
+  "adjacent frames",
+  "cloned frames",
+  "NUMERIC",
+  "NUMERIC(12,2)",
+  "DOUBLE PRECISION",
+  "empty",
+  "NULL only",
+  "values",
+  "count(*)",
+  "row_number()",
+  "evaluated",
+  "LIMIT 0",
+  "typmod distance",
+  "tiny or negative",
+  "large",
+] as const;

@@ -16,7 +16,7 @@ import type { ScalarExpr, SortKey, WindowCall, WindowFrameBound } from "../ir/ir
 import { aggregateArgument, aggregateResult } from "../ir/functions.js";
 import type { PhysicalType } from "../types.js";
 import type { QueryValue, TableSource, WindowFrame, WindowSpec } from "../../plan/model.js";
-import { coerce, type Typed } from "./coerce.js";
+import { baseType, coerce, type Typed } from "./coerce.js";
 import { PlanningError, unsupported } from "./errors.js";
 import { lowerExpression } from "./expressions.js";
 import type { BlockLowerer, OuterResolver } from "./from.js";
@@ -130,7 +130,12 @@ function frameOf(
 ): WindowCall["frame"] {
   if (frame === undefined) return null;
   // float_ops in_range(float4,float4,float8,bool,bool) keeps the offset in float8.
-  const rangeOffsetType = orderType?.kind === "float32" ? FLOAT8 : orderType;
+  const rangeOffsetType =
+    orderType?.kind === "float32"
+      ? FLOAT8
+      : orderType?.kind === "decimal"
+        ? baseType(orderType)
+        : orderType;
   const bound = (input: WindowFrame["start"]): WindowFrameBound => {
     if (input.offset === undefined) return { kind: input.kind, offset: null };
     // Parser-owned metadata preserves the exact literal without adding public model fields.
@@ -169,8 +174,12 @@ function frameOf(
       return { kind: input.kind, offset: literal };
     }
     if (orderType.kind === "float32" || orderType.kind === "float64") {
-      const text = metadata?.text ?? String(exact);
-      return { kind: input.kind, offset: floatLiteral(Number(text), FLOAT8) };
+      const text = metadata?.text ?? String(exact),
+        value = Number(text);
+      const nonzero = /[1-9]/u.test(text.split(/[eE]/u)[0] ?? "");
+      if (metadata?.text !== undefined && (!Number.isFinite(value) || (value === 0 && nonzero)))
+        throw new PlanningError("RANGE offset is out of range for double precision", "22003");
+      return { kind: input.kind, offset: floatLiteral(value, FLOAT8) };
     }
     const text =
       metadata?.text ?? (metadata?.exact === undefined ? undefined : String(metadata.exact));
@@ -183,7 +192,7 @@ function frameOf(
     );
     return {
       kind: input.kind,
-      offset: coerce(typed, orderType, "implicit", builder.parameters).expr,
+      offset: coerce(typed, rangeOffsetType ?? orderType, "implicit", builder.parameters).expr,
     };
   };
   return {

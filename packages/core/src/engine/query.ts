@@ -12938,7 +12938,15 @@ class Parser {
       // RANGE keeps the value. One a double cannot hold (it would become 0 or Infinity) is
       // refused rather than changed.
       offset = digits.zero ? 0 : Number(signed);
-      if (!digits.zero && (offset === 0 || !Number.isFinite(offset)))
+      // Typed NUMERIC RANGE keeps the spelling until its key resolves the offset type.
+      // Bound newly admitted exponents to PostgreSQL NUMERIC's representable scale/weight.
+      const numericFits =
+        digits.exponent >= -16383 && digits.digits.length + digits.exponent <= 131072;
+      if (
+        !digits.zero &&
+        (offset === 0 || !Number.isFinite(offset)) &&
+        (!recordDeclaredTypes || !numericFits)
+      )
         throw new TypeError("RANGE frame offsets outside double precision are not supported");
       if (!decimal) {
         const value = BigInt(signed);

@@ -469,13 +469,6 @@ describe("HAVING names and frame offsets (review B6-p2b-3 finding 3)", () => {
       (o: string) => `${o} PRECEDING`,
     ];
     const failures: string[] = [];
-    const divergences: string[] = [];
-    /** A negative offset PostgreSQL types numeric: a decimal, or an integer outside int8. */
-    const numericNegative = (offset: string) =>
-      /^- ?\d/u.test(offset) &&
-      offset !== "-0" &&
-      (/[.e]/u.test(offset) || BigInt(offset.replace(/^- ?/u, "")) > 9223372036854775808n);
-    const precedence: string[] = [];
     for (const table of ["a", "e", "n"])
       for (const unit of ["ROWS", "RANGE", "GROUPS"])
         for (const offset of offsets)
@@ -506,42 +499,13 @@ describe("HAVING names and frame offsets (review B6-p2b-3 finding 3)", () => {
               reach.reach("refused");
               continue;
             }
-            // A negative decimal RANGE offset on an integer key has two faults: PostgreSQL reports
-            // the type (0A000) first; the parser, which does not know the key, the sign (22013).
-            if (
-              unit === "RANGE" &&
-              numericNegative(offset) &&
-              "error" in expected &&
-              expected.error === "0A000" &&
-              "error" in actual &&
-              actual.error === "22013"
-            ) {
-              precedence.push(sql);
-              continue;
-            }
-            // PostgreSQL checks a negative RANGE offset when a row first compares; lowering
-            // raises it at once, so over no rows it fails where PostgreSQL returns none.
-            if (
-              unit === "RANGE" &&
-              table === "e" &&
-              "rows" in expected &&
-              "error" in actual &&
-              actual.error === "22013"
-            ) {
-              divergences.push(sql);
-              continue;
-            }
             failures.push(
               `${sql}\n  pglite: ${JSON.stringify(expected)}\n  next: ${JSON.stringify(actual)}`,
             );
           }
     expect(failures.join("\n")).toBe("");
-    // Exactly the negative integer RANGE offsets over the empty table: -1, - 2,
-    // -9223372036854775807 and -9223372036854775808 (int8 there), three bounds each.
-    expect(divergences.length).toBe(12);
-    // Exactly the negative numeric literals (RANGE does not round) on the integer key: seven
-    // offsets, three bounds, both integer-key tables.
-    expect(precedence.length).toBe(42);
+    // All 810 original cases now require PostgreSQL agreement; the resolved sign/type
+    // precedence and empty-input RANGE mismatches are no longer accepted exemptions.
     reach.assertReached();
   });
 });
