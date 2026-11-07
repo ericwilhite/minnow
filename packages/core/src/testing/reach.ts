@@ -424,3 +424,25 @@ export const SHAPE_DIFFERENTIAL_REACH = [
   "empty gather",
   "same endpoints different interiors",
 ] as const;
+
+/** Rollback must not revive a memtable whose frozen rows a publication owns. */
+export const WRITE_FREEZE_ROLLBACK_STATES = [
+  "memory",
+  "indexeddb",
+  "failed statement rollback",
+  "successful statement rollback",
+  "flush owns partially full input",
+  "one later row",
+  "two later rows",
+  "secondary index checked",
+  "primary only",
+  "publication retains later rows",
+  "durable reopen",
+] as const;
+
+/** Each original write-differential seed retains all steps under all three task schedules. */
+export const WRITE_DIFFERENTIAL_CLOCK_STATES = [
+  "real clock",
+  "every third check",
+  "every seventh check",
+] as const;

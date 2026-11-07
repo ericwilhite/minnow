@@ -1388,6 +1388,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
     if (
       frozen !== null &&
       frozen.state === "frozen" &&
+      // A flush may already have copied its rows. Appending after revival would let that
+      // publication remove rows it never encoded. Keep it immutable until the flush settles.
+      !this.#flushing.has(state) &&
       memtables[memtables.length - 1] === frozen &&
       !frozen.full
     )
