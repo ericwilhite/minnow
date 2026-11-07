@@ -1,3 +1,4 @@
+import { reopenCpuSampler } from "./reopen-cpu.js";
 /**
  * The rebuild core's storage (packages/core/src/next/storage) in real browsers, over real OPFS sync
  * access handles in dedicated workers, on a persistent profile on disk (fixtures.ts):
@@ -1001,4 +1002,46 @@ test.describe("rebuild core storage: the cost of one serialized IndexedDB chain 
     });
     console.log(`SERIAL_BENCH ${JSON.stringify(report)}`);
   });
+});
+
+// Opt-in because building a million independently allocated group extents writes ~4 GB.
+test.describe("R25 list reopen (Gate A, opt-in)", () => {
+  for (const kind of ["opfs", "indexeddb"] as const)
+    for (const groups of [100_000, 1_000_000])
+      test(`${kind}, ${String(groups)} groups`, async ({ page, browserName }, info) => {
+        test.skip(
+          browserName !== "chromium" ||
+            process.platform !== "linux" ||
+            process.env.MINNOW_NEXT_STORAGE_REOPEN !== "1",
+          "opt-in Chromium measurement",
+        );
+        test.setTimeout(3_600_000);
+        await page.goto("/packages/core/browser/");
+        if (kind === "opfs") await requireWorkerOpfs(page);
+        await page.exposeFunction(
+          "r25CpuSample",
+          reopenCpuSampler(info.outputPath("storage-profile")),
+        );
+        const result = await page.evaluate(
+          async ([url, store, count]) =>
+            ((await import(url)) as Run).runListedReopenBench(store, count, 3, () =>
+              (
+                window as unknown as {
+                  r25CpuSample(): Promise<
+                    import("../browser/next-storage-listed-reopen.js").ReopenCpuSnapshot
+                  >;
+                }
+              ).r25CpuSample(),
+            ),
+          [RUN, kind, groups] as const,
+        );
+        const report = { browser: browserName, store: kind, ...result };
+        await info.attach("r25-reopen", {
+          body: JSON.stringify(report, null, 2),
+          contentType: "application/json",
+        });
+        console.log(`R25_REOPEN ${JSON.stringify(report)}`);
+        expect(result.reopens).toHaveLength(3);
+        expect(result.reopens.every((r) => r.bytesRead > 0)).toBe(true);
+      });
 });

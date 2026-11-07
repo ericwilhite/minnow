@@ -1473,3 +1473,60 @@ that pressured appends wait. Refused copy admission borrows the still-charged ca
 Separate cases cover replaced tails, failed transactions, truncation order and close-time drain.
 This checks managed buffer accounting; native IndexedDB clones and browser RSS still need the
 Gate D browser measurement.
+
+### Extent-list startup at scale (rebuild core, opt-in)
+
+On Linux with Chromium, the R25 lane builds 100k and 1M zero-column groups on OPFS and IndexedDB,
+one extent per group, using the real manifest and group-directory codecs and incremental extent
+lists. Each dataset is reopened in three fresh workers. The report separates backend setup,
+fence acquisition, session/index loading and extent-space startup, against the 500 ms reopen
+target. It also reports owner-worker and whole-browser CPU ticks, coalesced list-data bytes read,
+and root payload bytes. CPU samples exclude build, module boot and cleanup; OS caches remain
+warm. IndexedDB opens data/log byte spaces with last-record boundary lookups and loads persisted
+record entries lazily for the requested ranges. Whole-store orphan/missing/key/order checks run
+in audit and test-build open, issuing three bulk requests together per 4,096-entry page. Their
+O(records) scan is outside ordinary open. Native metadata/range lookup time is included, but its
+physical bytes are opaque.
+This is a synthetic metadata stress measurement. Gate A acceptance uses actual S5/W5M loads and
+owner-ready reopening, including write-path recovery and composition.
+
+```sh
+npm run test:prepare
+MINNOW_NEXT_STORAGE_REOPEN=1 npx playwright test --config playwright.library.config.ts packages/core/browser-tests/next-storage.spec.ts --project=chromium --workers=1 -g 'R25 list reopen'
+```
+
+The keeper admission regressions use finite governor grants. They require refusal before any
+write, bounded page-at-a-time preparation, charges held across suspended readers, and complete
+scratch cleanup after failed reads, failed writes and aborted publication attempts.
+
+Storage task-slicing regressions queue timers before large preparation and cached-list reads,
+then require service before completion. They also cancel at task turns and immediate read
+resumptions, exercise union and free-map construction independently, and verify that two
+preparations share the worker's task clock rather than starting fresh slices.
+
+The unexported rebuild core also has an opt-in owner-ready measurement:
+`MINNOW_OWNER_REOPEN=1` with `next-storage-owner-reopen.spec.ts` in Chromium. It loads the
+actual S5 commerce and W5M wide datasets through the real write path, then measures backend
+open, extent-space open, write-path recovery and owner host ready separately. CPU samples use
+separate bracketed runs; wall samples have no sampling barriers. The executor stand-in is unused
+during startup. Its first `SELECT count(*)` is explicitly statistics-only and measures the owner
+protocol around the recovered row count, not an integrated scan. Native IndexedDB disk bytes
+are unavailable; the report counts returned byte payloads and numeric index/meta reads.
+The factory acquires handles in `openFence` and recovers in `open`, following the host contract.
+The default fence deadline is unchanged; the ready timer includes acquisition and recovery.
+
+Ordered-root startup regressions require a streaming union without the unordered free-map sort,
+validate scattered list-page allocations, and refuse overlapping, descending or inconsistent
+extents before reclaim. Full audit and test-build semantic checks remain enabled separately.
+Retained free-run and previous-only retirement capacity is admitted before allocation, including
+old/new backing-store overlap. The charge transfers from the startup grant to the space and
+remains until close; deleting entries does not assume the JavaScript containers release capacity.
+Finite-budget regressions cover refusal, transfer refusal, cancellation, fragmentation,
+previous-root retirement and cleanup. Audits hold the publication lock across root enumeration
+and allocator checks, so concurrent publication cannot make their captured roots stale.
+
+The real owner-ready composition holds initial flush, merge and recycle work until the page
+acknowledges receiving ready, then resumes it. Native file/range and logical call-site tracing
+(`MINNOW_OWNER_TRACE=1`) includes in-flight maintenance state; it is diagnostic, not a timing run.
+The first statistics-only count can overlap the resumed maintenance. Standalone write-path opens
+still schedule their maintenance automatically; owner composition supplies the ready lifecycle.

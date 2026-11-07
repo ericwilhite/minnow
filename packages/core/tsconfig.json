@@ -1,5 +1,9 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": { "rootDir": "src", "outDir": "dist", "tsBuildInfoFile": "dist/.tsbuildinfo" },
-  "include": ["src/**/*.ts"]
+  "include": [
+    "src/**/*.ts",
+    "src/next/format/root-r25.fixture.json",
+    "src/next/format/root-before-r25.fixture.json"
+  ]
 }

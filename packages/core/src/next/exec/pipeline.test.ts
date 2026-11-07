@@ -5,6 +5,8 @@
  */
 import { setFlagsFromString } from "node:v8";
 import { runInNewContext } from "node:vm";
+import { taskClock } from "../task.js";
+import { taskClock as pipelineClock } from "./pipeline.js";
 import { describe, expect, it } from "vitest";
 import { Governor, type Grant } from "../memory/governor.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
@@ -509,4 +511,8 @@ describe("driver: synchronous progress and task-level yields (R16.4)", () => {
     expect(source.pulled).toBe(3);
     expect(aborted).toBeInstanceOf(Error);
   });
+});
+
+it("exports the same worker task clock used by storage", () => {
+  expect(pipelineClock).toBe(taskClock);
 });

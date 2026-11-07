@@ -28,7 +28,7 @@
  * - **Snapshots:** `pin(label)` under each access/ snapshot; `stats` for backpressure (garbage
  *   debt, oldest pin).
  * - **Startup** (storage/contract.ts "Startup order", rulings R13/R16.6): fence → store session →
- *   extent space (walks the current and previous roots) → write path (the single log scan,
+ *   extent space (reads the current and previous roots' extent lists) → write path (the single log scan,
  *   truncation and replay) → spill sweep → ready. The space reads no log.
  *
  * ## Units
@@ -161,6 +161,7 @@
  * as staged records, one transaction per call, the epoch check inside each. The space never
  * assumes a file.
  */
+import type { TaskWork } from "../task.js";
 import type { StoreSession } from "./contract.js";
 import type { RootPin } from "./reclaim.js";
 import { MAX_SLAB } from "./slabs.js";
@@ -226,6 +227,8 @@ export interface ByteBudget {
 export interface CacheMemory {
   charge(bytes: number): boolean;
   release(bytes: number): void;
+  /** Unregister a closed cache or retained metadata owner, after returning its bytes. */
+  unregister?(): void;
 }
 
 /** What the governor calls on the cache (`EvictableCache`). */
@@ -251,27 +254,46 @@ export interface EvictableCacheLike {
  * deletion bitmaps, statistics, index runs (staged ones included) and their fences and Bloom
  * filters.
  */
-export type ReachableExtents = (
+export type ReachableExtents = ((
   root: Uint8Array,
   reader: ExtentReader,
   budget: ByteBudget,
-) => AsyncIterable<ExtentRef | BlobRef> | Iterable<ExtentRef | BlobRef>;
+  work?: TaskWork,
+) => AsyncIterable<ExtentRef | BlobRef> | Iterable<ExtentRef | BlobRef>) & {
+  /** Emits nondecreasing offsets; startup validates this promise before reclaiming. */
+  readonly ordered?: boolean;
+};
 
-export interface OpenSpaceOptions {
+export interface OpenSpaceOptions extends TaskWork {
+  /**
+   * What each root reaches, as startup reads it: the root's extent list (ruling R25,
+   * extent-list.ts `listedExtents`), or a full walk where a root has no list.
+   */
   readonly reachable: ReachableExtents;
-  /** Charged for the walk's leases (the owner's startup grant); `audit` uses it too. */
+  /**
+   * The full reachability walk (the format track's), when `reachable` is a list: `audit` checks
+   * that both name exactly the same extents for both roots, and so does the open when
+   * `verifyAtOpen` is set (test builds). A difference is `StoreCorruptionError`.
+   */
+  readonly walk?: ReachableExtents;
+  /** Cross-check `reachable` against `walk` at open as well as in `audit` (test builds). */
+  readonly verifyAtOpen?: boolean;
+  /** Charged for startup leases and retained-map construction. Retained state transfers
+   * to a lifetime handle from `registerCache` before open returns; audits use this budget too. */
   readonly budget: ByteBudget;
-  /** Registers the cache with the governor and returns its handle (`governor.registerCache`). */
+  /** Registers the page cache or non-evictable metadata owner with the governor; may be called twice. */
   readonly registerCache: (cache: EvictableCacheLike) => CacheMemory;
   readonly signal?: AbortSignal;
 }
 
 /**
  * Opens the space over a freshly opened store session, before the write path's log scan
- * (storage/contract.ts "Startup order"): reads the current and previous roots, walks both, builds
+ * (storage/contract.ts "Startup order"): reads the current and previous roots, reads what each
+ * reaches (its extent list, ruling R25), builds
  * the free map, retires
  * what only the previous root reaches (`ReclaimLedger.retireAtOpen`), returns the free tail. The
- * walks read O(groups + index runs) metadata, coalesced. Nothing is written but the tail release.
+ * startup reads the kept roots' list pages, coalesced; audit/test open separately performs the
+ * full O(groups + index runs) cross-check. Nothing is written but the tail release.
  * Implemented by `openExtentSpace` (space.ts).
  */
 export type OpenExtentSpace = (
@@ -492,7 +514,8 @@ export interface ExtentSpace extends ExtentReader {
    */
   pin(label?: string): RootPin;
   /**
-   * Walks the current and previous roots with `reachable` and checks the free map against them:
+   * Serializes with publication, walks both roots from that generation with `reachable`,
+   * and checks the free map against them:
    * every extent either root reaches is allocated (the previous root's only as waiting); every
    * allocated extent is reachable, held by a writer, waiting, or being released. Throws `Error("Extent audit: …")` naming the first difference. Tests only.
    */

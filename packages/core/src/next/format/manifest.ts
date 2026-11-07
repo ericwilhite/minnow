@@ -43,11 +43,11 @@
  * - **Reclaim (two generations).** An extent is reusable only when neither the current durable root,
  *   nor the previous durable root (the other root slot), nor any pinned snapshot's root reaches
  *   it (storage/extents.ts, storage/reclaim.ts). Keeping the previous generation means a lost flush that rolls back to the previous root
- *   slot finds its extents intact instead of overwritten. At startup the owner walks both roots
- *   (crash orphans are simply unreachable: no job records) and maintains free space in memory
- *   after. Freed space is reused in place; only a free tail is ever released to the platform.
+ *   slot finds its extents intact instead of overwritten. At startup the owner reads both roots'
+ *   extent lists (`extentList`, ruling R25; crash orphans are simply unlisted: no job records)
+ *   and maintains free space in memory after. Freed space is reused in place; only a free tail is ever released to the platform.
  * - **Startup order** (one log scan): acquire the fence → open the store session → open the extent
- *   space (walk the current and previous roots from the store's root slots) → open the write path
+ *   space (read the current and previous roots' extent lists from the store's root slots) → open the write path
  *   (a single log scan and replay, `publishedRows` staging included) → spill sweep → ready.
  * - **Snapshots (C12).** A reader pins a root (and the memtable views of that moment) for the
  *   length of one query or read transaction; pins are in memory, never durable. A client's pins
@@ -68,12 +68,17 @@
  */
 import type { ClientLedgerEntry } from "./ledger.js";
 import type { LogIncarnation } from "./log-frame.js";
+import type { ExtentList } from "../storage/extent-list.js";
 import type { BlobRef } from "../storage/extents.js";
 import type { ColumnStatistics, PhysicalType, StatValue } from "../types.js";
 
 export type { ColumnStatistics, StatValue };
 
-export const MANIFEST_FORMAT_VERSION = 1;
+/**
+ * 2: the root names its extent list (ruling R25, `extentList`). Roots of format 1 were written
+ * only by development builds (no supported writer: DECISIONS.md "R25") and are refused.
+ */
+export const MANIFEST_FORMAT_VERSION = 2;
 
 /**
  * Data-space addresses are the storage track's (storage/extents.ts, ruling R15.1): an `ExtentRef`
@@ -112,6 +117,12 @@ export interface ManifestRoot {
   }>;
   readonly tables: readonly TableRoot[];
   readonly clients: readonly ClientLedgerEntry[];
+  /**
+   * Ruling R25: the paged, offset-sorted list of every extent this root reaches except the ones
+   * the list's pages live in (storage/extent-list.ts). Startup reads it, never the group roots;
+   * the full walk (reachable.ts) is the audit's cross-check.
+   */
+  readonly extentList: ExtentList;
 }
 
 export interface TableRoot {

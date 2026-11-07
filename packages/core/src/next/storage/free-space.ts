@@ -18,6 +18,9 @@
  * Cost: allocation scans the runs (O(runs)); free and exact placement are O(log runs) plus the
  * array splice. Runs stay few because placement is first fit and frees coalesce.
  */
+import { pauseIfDue, sortInSlices, type TaskWork } from "../task.js";
+import type { RetainedCapacity } from "./retained-memory.js";
+
 export class FreeSpaceMap {
   readonly align: number;
   /** Start of each free run, ascending. */
@@ -26,7 +29,10 @@ export class FreeSpaceMap {
   readonly #ends: number[] = [];
   #end = 0;
 
-  constructor(align: number) {
+  constructor(
+    align: number,
+    readonly capacity?: RetainedCapacity,
+  ) {
     if (!(Number.isSafeInteger(align) && align > 0)) throw new RangeError("Bad alignment");
     this.align = align;
   }
@@ -59,6 +65,79 @@ export class FreeSpaceMap {
       if (extent.offset > cursor) map.#push(cursor, extent.offset);
       cursor = extent.end;
       previous = extent;
+    }
+    map.#end = cursor;
+    return map;
+  }
+
+  /** Startup's task-sliced variant; cancellation is checked on every real resumption. */
+  static async fromAllocatedAsync(
+    align: number,
+    length: number,
+    allocated: Iterable<{ readonly offset: number; readonly length: number }>,
+    work?: TaskWork,
+    capacity?: RetainedCapacity,
+  ): Promise<FreeSpaceMap> {
+    const firstPause = pauseIfDue(work);
+    if (firstPause !== undefined) await firstPause;
+    const map = new FreeSpaceMap(align, capacity);
+    const extents: Array<{ offset: number; end: number }> = [];
+    for (const extent of allocated) {
+      if (extents.length % 128 === 0) {
+        const pending = pauseIfDue(work);
+        if (pending !== undefined) await pending;
+      }
+      extents.push({ offset: extent.offset, end: extent.offset + map.#round(extent.length) });
+    }
+    await sortInSlices(extents, (a, b) => a.offset - b.offset || a.end - b.end, work);
+    let cursor = 0;
+    let previous: { offset: number; end: number } | null = null;
+    for (let index = 0; index < extents.length; index++) {
+      if (index % 128 === 0) {
+        const pending = pauseIfDue(work);
+        if (pending !== undefined) await pending;
+      }
+      const extent = extents[index];
+      if (extent === undefined) continue;
+      map.#check(extent.offset);
+      if (previous !== null && previous.offset === extent.offset && previous.end === extent.end)
+        continue;
+      if (extent.offset < cursor)
+        throw new RangeError(`Extent at ${String(extent.offset)} overlaps another`);
+      if (extent.end > map.#round(length))
+        throw new RangeError(`Extent at ${String(extent.offset)} runs past the file`);
+      if (extent.offset > cursor) map.#push(cursor, extent.offset);
+      cursor = extent.end;
+      previous = extent;
+    }
+    map.#end = cursor;
+    const pending = pauseIfDue(work);
+    if (pending !== undefined) await pending;
+    return map;
+  }
+
+  /** One pass over an ordered union; no materialized extent vector or comparison sort. */
+  static async fromSortedAllocatedAsync(
+    align: number,
+    length: number,
+    allocated: AsyncIterable<{ readonly offset: number; readonly length: number }>,
+    work?: TaskWork,
+    capacity?: RetainedCapacity,
+  ): Promise<FreeSpaceMap> {
+    const map = new FreeSpaceMap(align, capacity);
+    let cursor = 0;
+    let previous: { offset: number; end: number } | null = null;
+    for await (const extent of allocated) {
+      const pending = pauseIfDue(work);
+      if (pending !== undefined) await pending;
+      map.#check(extent.offset);
+      const end = extent.offset + map.#round(extent.length);
+      if (previous !== null && previous.offset === extent.offset && previous.end === end) continue;
+      if (extent.offset < cursor) throw new RangeError("Ordered extents overlap or regress");
+      if (end > map.#round(length)) throw new RangeError("Extent runs past the file");
+      if (extent.offset > cursor) map.#push(cursor, extent.offset);
+      cursor = end;
+      previous = { offset: extent.offset, end };
     }
     map.#end = cursor;
     return map;
@@ -151,6 +230,7 @@ export class FreeSpaceMap {
     } else if (joinsBefore) this.#ends[before] = end;
     else if (joinsNext) this.#starts[next] = offset;
     else {
+      this.capacity?.ensure(this.#starts.length + 1);
       this.#starts.splice(next, 0, offset);
       this.#ends.splice(next, 0, end);
     }
@@ -194,6 +274,7 @@ export class FreeSpaceMap {
   }
 
   #push(start: number, end: number): void {
+    this.capacity?.ensure(this.#starts.length + 1);
     this.#starts.push(start);
     this.#ends.push(end);
   }
@@ -225,6 +306,7 @@ export class FreeSpaceMap {
     } else if (runStart === start) this.#starts[index] = end;
     else if (runEnd === end) this.#ends[index] = start;
     else {
+      this.capacity?.ensure(this.#starts.length + 1);
       this.#ends[index] = start;
       this.#starts.splice(index + 1, 0, end);
       this.#ends.splice(index + 1, 0, runEnd);

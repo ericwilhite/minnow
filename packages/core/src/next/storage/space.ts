@@ -18,6 +18,7 @@
  *   the range enter the free map. A free tail is then released (truncated) at once: every byte the
  *   space may still write past `end` is reserved in the map, so this never cuts live data.
  */
+import { pauseIfDue, type TaskWork } from "../task.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 import {
   DATA_ALIGN,
@@ -35,6 +36,7 @@ import {
   type ByteBudget,
   type ExtentBuilder,
   type ExtentRef,
+  type ExtentReader,
   type ExtentSpace,
   type ExtentWriter,
   type OpenExtentSpace,
@@ -54,6 +56,12 @@ import { PageCache } from "./page-cache.js";
 import { ReclaimLedger, type RootPin } from "./reclaim.js";
 import { ExtentReservation, type SealPlan } from "./reservation.js";
 import { MAX_SLAB } from "./slabs.js";
+import {
+  RetainedMemory,
+  RetainedCapacity,
+  FREE_RUN_SLOT_BYTES,
+  RETIRED_SLOT_BYTES,
+} from "./retained-memory.js";
 
 const alignDown = (value: number) => value - (value % DATA_ALIGN);
 
@@ -91,10 +99,13 @@ async function collect(
   space: { read: ExtentSpace["read"]; peek: ExtentSpace["peek"] },
   budget: ByteBudget,
   dataLength: number,
+  work?: TaskWork,
 ): Promise<Map<number, number>> {
   const extents = new Map<number, number>();
   if (root === null) return extents;
-  for await (const item of reachable(root, space, budget)) {
+  for await (const item of reachable(root, space, budget, work)) {
+    const pending = pauseIfDue(work);
+    if (pending !== undefined) await pending;
     const { offset, length } = "extent" in item ? item.extent : item;
     if (!(
       Number.isSafeInteger(offset) &&
@@ -120,14 +131,26 @@ async function collect(
  * (review B1-p2a finding 1): an offset both roots name must be the same extent in both. Returns
  * the union and the extents only the previous root reaches.
  */
-function unite(
+async function unite(
   current: ReadonlyMap<number, number>,
   previous: ReadonlyMap<number, number>,
-): { union: DataRange[]; previousOnly: DataRange[] } {
+  work?: TaskWork,
+): Promise<{ union: DataRange[]; previousOnly: DataRange[] }> {
   const union: DataRange[] = [];
   const previousOnly: DataRange[] = [];
-  for (const [offset, length] of current) union.push({ offset, length });
+  for (const [offset, length] of current) {
+    if (union.length % 128 === 0) {
+      const pending = pauseIfDue(work);
+      if (pending !== undefined) await pending;
+    }
+    union.push({ offset, length });
+  }
+  let examined = 0;
   for (const [offset, length] of previous) {
+    if (examined++ % 128 === 0) {
+      const pending = pauseIfDue(work);
+      if (pending !== undefined) await pending;
+    }
     const known = current.get(offset);
     if (known === undefined) {
       union.push({ offset, length });
@@ -140,43 +163,251 @@ function unite(
   return { union, previousOnly };
 }
 
+/**
+ * Checks that a root's startup source (its extent list) and the full walk name exactly the same
+ * extents (ruling R25): anything else is `StoreCorruptionError`.
+ */
+async function sameExtents(
+  listed: ReadonlyMap<number, number>,
+  walked: ReadonlyMap<number, number>,
+  which: string,
+  work?: TaskWork,
+): Promise<void> {
+  let examined = 0;
+  for (const [offset, length] of walked) {
+    if (examined++ % 128 === 0) {
+      const pending = pauseIfDue(work);
+      if (pending !== undefined) await pending;
+    }
+    const listedLength = listed.get(offset);
+    if (listedLength === undefined)
+      throw new StoreCorruptionError(
+        `The ${which} root's extent list misses the extent at ${String(offset)} that it reaches`,
+      );
+    if (listedLength !== length)
+      throw new StoreCorruptionError(
+        `The ${which} root's extent list gives the extent at ${String(offset)} ${String(listedLength)} bytes, the walk ${String(length)}`,
+      );
+  }
+  for (const offset of listed.keys()) {
+    if (examined++ % 128 === 0) {
+      const pending = pauseIfDue(work);
+      if (pending !== undefined) await pending;
+    }
+    if (!walked.has(offset))
+      throw new StoreCorruptionError(
+        `The ${which} root's extent list names the extent at ${String(offset)}, which it does not reach`,
+      );
+  }
+}
+
+/** Merge two already ordered roots while retaining only previous-only retirement entries. */
+async function orderedMap(
+  root: Uint8Array | null,
+  previousRoot: Uint8Array | null,
+  options: OpenSpaceOptions,
+  reader: ExtentReader,
+  dataLength: number,
+  runs: RetainedCapacity,
+  retirements: RetainedCapacity,
+): Promise<{ map: FreeSpaceMap; retired: DataRange[] }> {
+  async function* input(bytes: Uint8Array | null) {
+    if (bytes === null) return;
+    let last = -1;
+    let lastLength = 0;
+    for await (const item of options.reachable(bytes, reader, options.budget, options)) {
+      const pending = pauseIfDue(options);
+      if (pending !== undefined) await pending;
+      const ref = "extent" in item ? item.extent : item;
+      if (
+        !Number.isSafeInteger(ref.offset) ||
+        !Number.isSafeInteger(ref.length) ||
+        ref.offset < 0 ||
+        ref.offset % DATA_ALIGN !== 0 ||
+        ref.length <= 0 ||
+        ref.offset + ref.length > dataLength ||
+        ref.offset < last
+      )
+        throw new StoreCorruptionError("Invalid or unordered durable extent");
+      if (ref.offset === last) {
+        if (ref.length !== lastLength)
+          throw new StoreCorruptionError("One root disagrees on an extent length");
+        continue;
+      }
+      last = ref.offset;
+      lastLength = ref.length;
+      yield ref;
+    }
+  }
+  const current = input(root);
+  const previous = input(previousRoot);
+  const retired: DataRange[] = [];
+  async function* union() {
+    try {
+      let a = await current.next();
+      let b = await previous.next();
+      while (!a.done || !b.done) {
+        const pending = pauseIfDue(options);
+        if (pending !== undefined) await pending;
+        if (!a.done && (b.done || a.value.offset < b.value.offset)) {
+          yield a.value;
+          a = await current.next();
+        } else if (!b.done && (a.done || b.value.offset < a.value.offset)) {
+          const ref = b.value;
+          retirements.ensure(retired.length + 1);
+          retired.push({
+            offset: ref.offset,
+            length: Math.ceil(ref.length / DATA_ALIGN) * DATA_ALIGN,
+          });
+          yield ref;
+          b = await previous.next();
+        } else if (!a.done && !b.done) {
+          if (a.value.length !== b.value.length)
+            throw new StoreCorruptionError("Durable roots disagree on an extent length");
+          yield a.value;
+          a = await current.next();
+          b = await previous.next();
+        }
+      }
+    } finally {
+      try {
+        await current.return(undefined);
+      } finally {
+        await previous.return(undefined);
+      }
+    }
+  }
+  return {
+    map: await FreeSpaceMap.fromSortedAllocatedAsync(
+      DATA_ALIGN,
+      dataLength,
+      union(),
+      options,
+      runs,
+    ),
+    retired,
+  };
+}
+
 export const openExtentSpace: OpenExtentSpace = async (session, options) => {
   options.signal?.throwIfAborted();
+  if (options.verifyAtOpen === true) await session.audit?.(options.signal);
+  const beginning = pauseIfDue(options);
+  if (beginning !== undefined) await beginning;
   const root = await session.readRoot();
+  const afterRoot = pauseIfDue(options);
+  if (afterRoot !== undefined) await afterRoot;
   const previousRoot = await session.readPreviousRoot();
+  const afterPrevious = pauseIfDue(options);
+  if (afterPrevious !== undefined) await afterPrevious;
   const dataLength = await session.dataLength();
+  const afterLength = pauseIfDue(options);
+  if (afterLength !== undefined) await afterLength;
   const cache = new PageCache(session);
   cache.attach(options.registerCache(cache));
+  let opened: Space | null = null;
+  let memory: RetainedMemory | null = null;
   try {
+    memory = RetainedMemory.create(options.budget);
+    const runs = new RetainedCapacity(memory, FREE_RUN_SLOT_BYTES);
+    const retirements = new RetainedCapacity(memory, RETIRED_SLOT_BYTES);
     const reader = {
       read: (refs: readonly BlobRef[], read: ReadOptions) => cache.read(refs, read),
       peek: (ref: BlobRef, peek?: PeekOptions) => cache.peek(ref, peek),
     };
-    const current = await collect(root, options.reachable, reader, options.budget, dataLength);
-    options.signal?.throwIfAborted();
-    const previous = await collect(
-      previousRoot,
-      options.reachable,
-      reader,
-      options.budget,
-      dataLength,
-    );
-    const { union, previousOnly } = unite(current, previous);
     let map: FreeSpaceMap;
-    try {
-      map = FreeSpaceMap.fromAllocated(DATA_ALIGN, dataLength, union);
-    } catch (error) {
-      throw new StoreCorruptionError(
-        `The durable roots name inconsistent extents: ${error instanceof Error ? error.message : String(error)}`,
+    let retired: DataRange[];
+    if (options.reachable.ordered === true && options.verifyAtOpen !== true) {
+      try {
+        ({ map, retired } = await orderedMap(
+          root,
+          previousRoot,
+          options,
+          reader,
+          dataLength,
+          runs,
+          retirements,
+        ));
+      } catch (error) {
+        if (!(error instanceof RangeError) || error === options.signal?.reason) throw error;
+        throw new StoreCorruptionError(
+          `The durable roots name inconsistent extents: ${error.message}`,
+        );
+      }
+    } else {
+      const current = await collect(
+        root,
+        options.reachable,
+        reader,
+        options.budget,
+        dataLength,
+        options,
       );
+      options.signal?.throwIfAborted();
+      const previous = await collect(
+        previousRoot,
+        options.reachable,
+        reader,
+        options.budget,
+        dataLength,
+        options,
+      );
+      const walk = options.walk;
+      if (walk !== undefined && options.verifyAtOpen === true) {
+        await sameExtents(
+          current,
+          await collect(root, walk, reader, options.budget, dataLength, options),
+          "current",
+          options,
+        );
+        await sameExtents(
+          previous,
+          await collect(previousRoot, walk, reader, options.budget, dataLength, options),
+          "previous",
+          options,
+        );
+      }
+      const { union, previousOnly } = await unite(current, previous, options);
+
+      try {
+        map = await FreeSpaceMap.fromAllocatedAsync(DATA_ALIGN, dataLength, union, options, runs);
+      } catch (error) {
+        if (!(error instanceof RangeError) || error === options.signal?.reason) throw error;
+        throw new StoreCorruptionError(
+          `The durable roots name inconsistent extents: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      // Only now, with both roots validated together, may anything be retired or truncated.
+      retired = [];
+      for (const { offset, length } of previousOnly) {
+        if (retired.length % 128 === 0) {
+          const pending = pauseIfDue(options);
+          if (pending !== undefined) await pending;
+        }
+        retirements.ensure(retired.length + 1);
+        retired.push({ offset, length: map.sizeOf(length) });
+      }
     }
-    // Only now, with both roots validated together, may anything be retired or truncated.
-    const retired = previousOnly.map(({ offset, length }) => ({
-      offset,
-      length: map.sizeOf(length),
-    }));
-    return new Space(session, options, cache, map, root, previousRoot, retired, dataLength);
+    memory.transfer(options.registerCache);
+    const space = new Space(
+      session,
+      options,
+      cache,
+      map,
+      root,
+      previousRoot,
+      dataLength,
+      memory,
+      retirements,
+    );
+    opened = space;
+    await space.initialize(retired, options);
+    const ready = pauseIfDue(options);
+    if (ready !== undefined) await ready;
+    return space;
   } catch (error) {
+    await opened?.close();
+    memory?.close();
     cache.close();
     throw error;
   }
@@ -185,6 +416,7 @@ export const openExtentSpace: OpenExtentSpace = async (session, options) => {
 class Space implements ExtentSpace {
   readonly #session: StoreSession;
   readonly #reachable: ReachableExtents;
+  readonly #walk: ReachableExtents | null;
   readonly #budget: ByteBudget;
   readonly #cache: PageCache;
   readonly #map: FreeSpaceMap;
@@ -217,11 +449,13 @@ class Space implements ExtentSpace {
     map: FreeSpaceMap,
     root: Uint8Array | null,
     previousRoot: Uint8Array | null,
-    previousOnly: readonly DataRange[],
     dataLength: number,
+    readonly retainedMemory: RetainedMemory,
+    readonly retirements: RetainedCapacity,
   ) {
     this.#session = session;
     this.#reachable = options.reachable;
+    this.#walk = options.walk ?? null;
     this.#budget = options.budget;
     this.#cache = cache;
     this.#map = map;
@@ -231,7 +465,19 @@ class Space implements ExtentSpace {
     this.#ledger = new ReclaimLedger<DataRange>((ranges) => {
       this.#background_(this.free(ranges));
     });
-    for (const range of previousOnly) this.#retired.set(range.offset, range.length);
+  }
+
+  async initialize(previousOnly: readonly DataRange[], work: TaskWork): Promise<void> {
+    let count = 0;
+    for (const range of previousOnly) {
+      if (count++ % 128 === 0) {
+        const pending = pauseIfDue(work);
+        if (pending !== undefined) await pending;
+      }
+      this.#retired.set(range.offset, range.length);
+    }
+    const pending = pauseIfDue(work);
+    if (pending !== undefined) await pending;
     this.#ledger.retireAtOpen(previousOnly);
     this.#releaseTail();
   }
@@ -526,6 +772,7 @@ class Space implements ExtentSpace {
   async #publishNow(root: Uint8Array, change: PublishChange): Promise<number> {
     this.usable();
     const writers = this.#checkWriters(change.writers);
+    this.retirements.ensure(this.#retired.size + change.retired.length);
     const retired = this.#checkRetired(change.retired);
     for (const writer of writers) writer.state = "publishing";
     try {
@@ -597,10 +844,18 @@ class Space implements ExtentSpace {
 
   // ── Audit ────────────────────────────────────────────────────────────────────────────────────
 
-  async audit(): Promise<void> {
+  audit(): Promise<void> {
+    return this.#publishing.run(() => this.#auditNow());
+  }
+
+  async #auditNow(): Promise<void> {
+    const generation = this.#ledger.generation;
     await this.settled();
+    await this.#session.audit?.();
     const fail = (message: string): never => {
-      throw new Error(`Extent audit: ${message}`);
+      throw new Error(
+        `Extent audit: ${message} (generation ${String(generation)}, allocator end ${String(this.#map.end)}, retired ${String(this.#retired.size)})`,
+      );
     };
     const sizeOf = (bytes: number) => this.#map.sizeOf(bytes);
     const exactCurrent = await collect(this.#root, this.#reachable, this, this.#budget, Infinity);
@@ -611,7 +866,20 @@ class Space implements ExtentSpace {
       this.#budget,
       Infinity,
     );
-    unite(exactCurrent, exactPrevious);
+    await unite(exactCurrent, exactPrevious);
+    // Ruling R25: the lists startup read must name exactly what the full walk reaches.
+    if (this.#walk !== null) {
+      await sameExtents(
+        exactCurrent,
+        await collect(this.#root, this.#walk, this, this.#budget, Infinity),
+        "current",
+      );
+      await sameExtents(
+        exactPrevious,
+        await collect(this.#previousRoot, this.#walk, this, this.#budget, Infinity),
+        "previous",
+      );
+    }
     const aligned = (extents: ReadonlyMap<number, number>) =>
       new Map([...extents].map(([offset, length]) => [offset, sizeOf(length)]));
     const current = aligned(exactCurrent);
@@ -661,6 +929,7 @@ class Space implements ExtentSpace {
     await this.settled();
     this.#closed = true;
     this.#cache.close();
+    this.retainedMemory.close();
   }
 }
 

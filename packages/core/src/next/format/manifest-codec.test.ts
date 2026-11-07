@@ -1,3 +1,4 @@
+import frozenR25 from "./root-r25.fixture.json";
 import fc from "fast-check";
 import { afterAll, describe, expect, it } from "vitest";
 import { createReach } from "../../testing/reach.js";
@@ -60,6 +61,23 @@ const extent: fc.Arbitrary<ExtentRef> = fc
 
 /** A pool of extents per value, so references share them (the extent table). */
 const extents = fc.array(extent, { minLength: 1, maxLength: 6 });
+
+/** A root's extent list (ruling R25): pages in strictly increasing first-offset order. */
+function extentListIn(pool: readonly ExtentRef[]): fc.Arbitrary<ManifestRoot["extentList"]> {
+  return fc.uniqueArray(fc.nat({ max: 2 ** 40 }), { maxLength: 6 }).chain((firsts) =>
+    fc.tuple(
+      ...[...firsts]
+        .sort((a, b) => a - b)
+        .map((first) =>
+          fc.record({
+            blob: blobIn(pool),
+            first: fc.constant(first),
+            count: fc.integer({ min: 1, max: 4096 }),
+          }),
+        ),
+    ),
+  );
+}
 
 function blobIn(pool: readonly ExtentRef[]): fc.Arbitrary<BlobRef> {
   return fc
@@ -355,7 +373,7 @@ afterAll(() => {
 
 const manifestRoot: fc.Arbitrary<ManifestRoot> = extents.chain((pool) =>
   fc.record({
-    formatVersion: fc.constant(1),
+    formatVersion: fc.constant(2),
     sequence: lsn,
     epoch: lsn,
     log: fc.record({ salt: fc.nat({ max: 0xffff_ffff }), firstLsn: lsn, rootSequence: lsn }),
@@ -375,6 +393,7 @@ const manifestRoot: fc.Arbitrary<ManifestRoot> = extents.chain((pool) =>
       .chain((ids) => fc.tuple(...ids.map((id) => tableRoot(pool, id))))
       .map((tables): TableRoot[] => tables),
     clients: fc.array(client, { maxLength: 4 }),
+    extentList: extentListIn(pool),
   }),
 );
 
@@ -611,7 +630,7 @@ describe("manifest codec rules", () => {
     expect(() => encodeGroupPage(groups)).toThrow(RangeError);
     expect(encodeGroupPage(groups.slice(0, GROUPS_PER_PAGE)).length).toBeLessThan(1 << 20);
     const huge: ManifestRoot = {
-      formatVersion: 1,
+      formatVersion: 2,
       sequence: 1,
       epoch: 1,
       log: { salt: 1, firstLsn: 1, rootSequence: 1 },
@@ -626,6 +645,7 @@ describe("manifest codec rules", () => {
         resolvedThrough: k,
         outcomes: [],
       })),
+      extentList: [],
     };
     expect(() => encodeManifestRoot(huge)).toThrow(RangeError);
     expect(MAX_ROOT_BYTES).toBe(1 << 20);
@@ -687,7 +707,7 @@ describe("manifest codec rules", () => {
   it("refuses a root written by a newer format", () => {
     const owner = big;
     const root: ManifestRoot = {
-      formatVersion: 2,
+      formatVersion: 3,
       sequence: 1,
       epoch: 1,
       log: { salt: 1, firstLsn: 1, rootSequence: 1 },
@@ -698,7 +718,78 @@ describe("manifest codec rules", () => {
       sequences: [],
       tables: [],
       clients: [],
+      extentList: [],
     };
     expect(() => decodeManifestRoot(encodeManifestRoot(root), tracked())).toThrow(/newer/);
+  });
+
+  it("reads the frozen R25 writer fixture and continues encoding canonically", () => {
+    const bytes = Uint8Array.from(Buffer.from(frozenR25.rootHex, "hex"));
+    const budget = tracked();
+    const parsed = decodeManifestRoot(bytes, budget);
+    expect(parsed.value.formatVersion).toBe(2);
+    expect(parsed.value.catalog.extent.offset).toBe(0);
+    expect(parsed.value.extentList).toHaveLength(1);
+    expect(encodeManifestRoot(parsed.value)).toEqual(bytes);
+    const next = { ...parsed.value, sequence: 2 };
+    budget.free(parsed.charge);
+    const reopened = decodeManifestRoot(encodeManifestRoot(next), budget);
+    expect(reopened.value.sequence).toBe(2);
+    expect(reopened.value.catalog).toEqual(next.catalog);
+    budget.free(reopened.charge);
+    expect(budget.held).toBe(0);
+  });
+
+  it("refuses a root of format 1, written before extent lists (ruling R25)", () => {
+    const root: ManifestRoot = {
+      formatVersion: 1,
+      sequence: 1,
+      epoch: 1,
+      log: { salt: 1, firstLsn: 1, rootSequence: 1 },
+      globalLsn: 1,
+      catalogVersion: 1,
+      catalog: ref(big),
+      nextTableId: 1,
+      sequences: [],
+      tables: [],
+      clients: [],
+      extentList: [],
+    };
+    const budget = tracked();
+    expect(() => decodeManifestRoot(encodeManifestRoot(root), budget)).toThrow(
+      /before extent lists/,
+    );
+    expect(budget.held).toBe(0);
+  });
+
+  it("refuses an extent list out of offset order or with a bad page count", () => {
+    const page = (first: number, count: number) => ({ blob: ref(big), first, count });
+    const rootWith = (extentList: ManifestRoot["extentList"]): ManifestRoot => ({
+      formatVersion: 2,
+      sequence: 1,
+      epoch: 1,
+      log: { salt: 1, firstLsn: 1, rootSequence: 1 },
+      globalLsn: 1,
+      catalogVersion: 1,
+      catalog: ref(big),
+      nextTableId: 1,
+      sequences: [],
+      tables: [],
+      clients: [],
+      extentList,
+    });
+    const ok = rootWith([page(0, 1), page(4096, 4096)]);
+    expect(decodeManifestRoot(encodeManifestRoot(ok), tracked()).value.extentList).toEqual(
+      ok.extentList,
+    );
+    for (const bad of [
+      [page(4096, 1), page(0, 1)],
+      [page(0, 1), page(0, 1)],
+      [page(0, 0)],
+      [page(0, 4097)],
+    ])
+      expect(() => decodeManifestRoot(encodeManifestRoot(rootWith(bad)), tracked())).toThrow(
+        ManifestCorruptionError,
+      );
   });
 });

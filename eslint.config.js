@@ -98,6 +98,9 @@ export default tseslint.config(
       "packages/core/src/next/dependency-rules.test.ts",
       // Exposes the collector through node:v8/node:vm to measure the driver's live heap.
       "packages/core/src/next/exec/pipeline.test.ts",
+      // Linux process/task CPU counters for the opt-in storage reopen measurement.
+      "packages/core/browser-tests/reopen-cpu.ts",
+      "packages/core/browser-tests/next-storage-owner-reopen.spec.ts",
       // The same, to prove the aggregate keeps no reference to a pushed batch's buffers.
       "packages/core/src/next/exec/agg/fused.test.ts",
       // Bundles the built package with esbuild to prove the storage adapters tree-shake.

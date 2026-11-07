@@ -1,10 +1,10 @@
 /**
- * The reachability walk (manifest.ts "Reclaim"): everything a manifest root references, so the
- * extent space can rebuild its free map at open and audit it (storage/extents.ts
- * `ReachableExtents`). Crash orphans need no records: they are simply absent from every walk.
+ * The full reachability walk (manifest.ts "Reclaim"), used by audit and test-build open checks.
+ * Startup uses listedRootExtents instead: it reads list pages, never group roots. Crash orphans
+ * need no records: they are absent from the roots' reachability sources.
  *
  * What a root reaches:
- * - the catalog; each table's statistics blob;
+ * - extent-list pages and the catalog; each table's statistics blob;
  * - each table's group directory (`groups`: an index blob and its pages) and, for every staged
  *   large transaction, its group directory (`staged[].groups`) and the index runs built for it
  *   (`staged[].indexRuns`);
@@ -34,7 +34,14 @@
  * a time, each released (its parse charge returned) when the walk moves past it. Data pages are
  * never read.
  */
-import type { BlobRef, ByteBudget, ExtentReader, ExtentRef } from "../storage/extents.js";
+import { sortedListedExtents } from "../storage/extent-list.js";
+import type {
+  BlobRef,
+  ByteBudget,
+  ExtentReader,
+  ExtentRef,
+  ReachableExtents,
+} from "../storage/extents.js";
 import { valid } from "./bytes.js";
 import {
   decodeGroupIndex,
@@ -72,6 +79,7 @@ export interface ManifestReader {
 
 export type ReachableKind =
   | "catalog"
+  | "extent-list-page"
   | "table-statistics"
   | "group-directory"
   | "staged-group-directory"
@@ -90,7 +98,7 @@ export interface Reached {
   /** A blob, or a column chunk's data range (`ChunkData`: inside its extent, no checksum). */
   readonly ref: BlobRef | ChunkData;
   readonly kind: ReachableKind;
-  /** The table it belongs to (null for the catalog). */
+  /** The table it belongs to (null for the root-owned catalog and extent-list pages). */
   readonly tableId: number | null;
 }
 
@@ -122,6 +130,8 @@ export async function* walkReachable(
 ): AsyncGenerator<Reached> {
   const concurrency = Math.max(1, options.concurrency ?? 32);
   yield { ref: root.catalog, kind: "catalog", tableId: null };
+  for (const page of root.extentList)
+    yield { ref: page.blob, kind: "extent-list-page", tableId: null };
   for (const table of root.tables) {
     const tableId = table.tableId;
     if (table.statistics !== null)
@@ -344,4 +354,23 @@ export function reachableExtents(
       budget.free(manifest.charge);
     }
   };
+}
+
+/**
+ * Startup's source of what a root reaches (ruling R25), in the shape the extent space opens with:
+ * the root's extent list, read page by page (storage/extent-list.ts `listedExtents`). No group
+ * root is read. `reachableExtents` is the full walk the audit checks it against.
+ */
+export function listedRootExtents(
+  codecs: Pick<ManifestCodecs, "decodeRoot"> = MANIFEST_CODECS,
+): ReachableExtents {
+  const listed: ReachableExtents = async function* (root, reader, budget, work) {
+    const manifest = codecs.decodeRoot(root, budget);
+    try {
+      yield* sortedListedExtents(manifest.value.extentList, reader, budget, work);
+    } finally {
+      budget.free(manifest.charge);
+    }
+  };
+  return Object.assign(listed, { ordered: true });
 }

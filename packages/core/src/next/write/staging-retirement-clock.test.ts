@@ -6,7 +6,7 @@
  */
 import { expect, it, vi } from "vitest";
 import { createReach } from "../../testing/reach.js";
-import * as pipeline from "../exec/pipeline.js";
+import * as pipeline from "../task.js";
 import {
   autocommit,
   batch,

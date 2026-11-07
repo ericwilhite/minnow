@@ -156,7 +156,7 @@ export async function openOver(
     reachable: jsonReachable,
     budget,
     registerCache: (cache) => {
-      memory.cache = cache;
+      memory.cache ??= cache;
       return memory;
     },
   });

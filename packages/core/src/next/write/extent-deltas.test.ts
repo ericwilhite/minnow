@@ -50,12 +50,14 @@ const REACH = [
   "released",
   "merge",
   "recycle",
+  "recycle-quiet-table",
   "idle-publish",
   "drop-table",
   "drop-index",
   "abandoned",
   "admission-refused",
   "flush-of-dropped-table",
+  "flush-catalog-changed",
   "flush-held-by-build",
   "build-settled",
   "reopen",
@@ -183,6 +185,7 @@ describe("extent deltas (ruling R25)", () => {
         await new Promise((resolve) => setTimeout(resolve, 150));
         await path.quiesce();
         expect(need(harness.space.root).length).toBeGreaterThan(0);
+        await harness.space.audit();
         const walked = await walk(harness.space);
         const extra = [...set].filter(([offset]) => !walked.has(offset));
         const missing = [...walked].filter(([offset]) => !set.has(offset));
@@ -318,14 +321,74 @@ describe("extent deltas (ruling R25)", () => {
         }
         if (path.maintenance.merges > 0) reach.reach("merge");
         if (path.maintenance.recycles > 0) reach.reach("recycle");
+        if (path.maintenance.recycleQuietTables > 0) reach.reach("recycle-quiet-table");
         if (path.maintenance.idlePublishes > 0) reach.reach("idle-publish");
-        if (path.maintenance.flushesAbandoned > 0) reach.reach("flush-of-dropped-table");
+        if (path.maintenance.flushesAbandoned > path.maintenance.flushesCatalogChanged)
+          reach.reach("flush-of-dropped-table");
+        if (path.maintenance.flushesCatalogChanged > 0) reach.reach("flush-catalog-changed");
         if (path.maintenance.flushesHeld > 0) reach.reach("flush-held-by-build");
         if (path.maintenance.buildsSettled > 0) reach.reach("build-settled");
       }
       await check("the end");
       expect(deltas.length).toBeGreaterThan(5);
       await harness.close();
+
+      // Keep the full tiny-log random history above. A fresh store also coordinates
+      // drop/flush overlap without a recycler claiming the slot and waiting on the
+      // deliberately held flush. The same exact-delta observer checks this subhistory.
+      set.clear();
+      sequence = 0;
+      lastAttempt = 0;
+      pending = null;
+      let armed = false;
+      let entered!: () => void;
+      let release!: () => void;
+      const atPublish = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const width = 6 + int(4);
+      const overlap = new Harness("strict", "sim", width, undefined, {
+        beforeFlushPublish: async () => {
+          if (armed) {
+            armed = false;
+            entered();
+            await gate;
+          }
+        },
+      });
+      overlap.extentDeltas = harness.extentDeltas;
+      try {
+        const path = await overlap.open();
+        let dropped = 0;
+        await autocommit(path, async (s) => {
+          dropped =
+            (
+              await s.changeCatalog({
+                kind: "createTable",
+                table: tableInput("overlap", [column("id", INT, false)]),
+              })
+            ).id ?? 0;
+        });
+        await path.quiesce();
+        armed = true;
+        const ids = Array.from({ length: width }, (_, k) => k);
+        await autocommit(path, (s) => s.table(dropped).insert(batch(ints(ids)), null));
+        await autocommit(path, (s) => s.table(dropped).insert(batch(ints([width])), null));
+        await atPublish;
+        await autocommit(path, (s) => s.changeCatalog({ kind: "dropTable", tableId: dropped }));
+        release();
+        await path.quiesce();
+        expect(path.maintenance.flushesAbandoned).toBeGreaterThan(0);
+        reach.reach("flush-of-dropped-table");
+        expect(set).toEqual(await walk(overlap.space));
+        await overlap.space.audit();
+      } finally {
+        release();
+        await overlap.close();
+      }
     }, 300_000);
 
   it("a rejected publish aborts its attempt; nothing after it commits", async () => {
@@ -596,7 +659,7 @@ describe("the sink's retire list (B1's question)", () => {
         }
         if (retireNow && page !== null) {
           retireNow = false;
-          return { pages: [], retire: [page] };
+          return { list: [], pages: [], retire: [page] };
         }
         return null;
       },
@@ -661,7 +724,7 @@ describe("the sink's retire list (B1's question)", () => {
           retireNow = false;
           releasedWith = [...delta.released];
           retire.at = -1;
-          return { pages: [], retire: [page] };
+          return { list: [], pages: [], retire: [page] };
         }
         return null;
       },
@@ -705,4 +768,45 @@ describe("the sink's retire list (B1's question)", () => {
     await harness.space.audit();
     await harness.close();
   });
+});
+
+it("an observer cannot substitute its own extent list for the engine's keeper", async () => {
+  const harness = new Harness("strict", "memory");
+  const calls: string[] = [];
+  harness.extentDeltas = {
+    prepare: () => {
+      calls.push("prepare");
+      return {
+        list: [
+          {
+            first: 0,
+            count: 1,
+            blob: { extent: { offset: 0, length: 1 }, offset: 0, length: 1, checksum: 0 },
+          },
+        ],
+        pages: [],
+        retire: [],
+      };
+    },
+    commit: () => calls.push("commit"),
+    abort: () => calls.push("abort"),
+  };
+  const outcome = await harness.open().then(
+    () => ({ opened: true, error: null }),
+    (error: unknown) => ({ opened: false, error }),
+  );
+  try {
+    expect(outcome.error).toBeInstanceOf(ExtentSinkError);
+    expect(calls).toEqual(["prepare", "abort"]);
+    const lease = await harness.backend.acquire();
+    try {
+      const session = await harness.backend.open(lease);
+      expect(await session.readRoot()).toBeNull();
+      await session.close();
+    } finally {
+      await lease.release();
+    }
+  } finally {
+    if (outcome.opened) await harness.close();
+  }
 });

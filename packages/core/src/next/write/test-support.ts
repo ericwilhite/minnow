@@ -22,7 +22,7 @@ import { allocateFlat, type Batch, type FlatVector } from "../vector/vector.js";
 import { decodeUtf8, VarlenBuilder } from "../vector/varlen.js";
 import { MEMORY_CHUNK_ROWS } from "./columns.js";
 import { WritePathImpl, type EngineInput } from "./engine.js";
-import { reachableExtents } from "../format/reachable.js";
+import { listedRootExtents, reachableExtents } from "../format/reachable.js";
 import type { StorageBackend } from "../storage/contract.js";
 import type { ExtentSpace } from "../storage/extents.js";
 import { MemoryBackend } from "../storage/memory-store.js";
@@ -110,8 +110,12 @@ export class Harness {
       spillable: true,
     });
     const started = performance.now();
+    // Ruling R25: startup reads the roots' extent lists; every open (and audit) cross-checks
+    // them against the full walk.
     this.space = await openExtentSpace(session, {
-      reachable: reachableExtents(),
+      reachable: listedRootExtents(),
+      walk: reachableExtents(),
+      verifyAtOpen: true,
       budget: startup,
       registerCache: (cache) => this.governor.registerCache(cache),
     });

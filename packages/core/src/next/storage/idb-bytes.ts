@@ -6,7 +6,8 @@
  * values are 16 bytes.
  *
  * ## Who trusts what (review B1-p2d findings 1 and 2)
- * - **Writes** decide overlaps from the in-memory index (`IntervalIndex`). Only the owning session
+ * - **Writes** select overlaps from the persisted index in lazy mode, or the resident
+ *   `IntervalIndex` in eager mode. Only the owning session
  *   mutates it, inside its transactions, which run one at a time in call order (indexeddb.ts); a
  *   transaction that does not commit has its changes undone (`rollback`) before the next runs.
  * - **Reads never use the in-memory index.** A read selects its records from the persisted index
@@ -19,21 +20,25 @@
  *   runs only once the transaction is live, after every overlapping read-write transaction created
  *   before it has committed. Nothing here depends on the epoch get that `IdbLease.read` issues
  *   first (idb-integrity.test.ts reads through a bare transaction to pin that).
- * - **Open validates** the persisted index (safe integers, `0 < length ≤ IDB_RECORD_BYTES`, key
+ * - **Audit and test-build open validate** the persisted index (safe integers, `0 < length ≤ IDB_RECORD_BYTES`, key
  *   equal to the entry's offset, sorted, no overlap) and that the record store's keys are exactly
  *   the index's: an orphan record or an entry without its record is `StoreCorruptionError`. It
  *   reads keys and 16-byte entries, never a record.
  *
  * ## Cost (finding 4)
  * The in-memory index is blocks of at most `INDEX_BLOCK` entries under a directory (the block
- * array, searched by each block's last end): insert and delete are O(log n + block), plus
+ * array, searched by each block's last end), used by explicit eager loads: insert and delete are O(log n + block), plus
  * O(n / block) for the directory splice when a block splits, empties or merges (one in about
- * every `INDEX_BLOCK / 2` inserts); removing k consecutive entries is O(k + n / block). Open
+ * every `INDEX_BLOCK / 2` inserts); removing k consecutive entries is O(k + n / block). Eager load
  * streams the stored index in pages of `LOAD_PAGE` entries into blocks, so it never holds the
  * whole index twice. Its estimated size (`IntervalIndex.bytes`) is charged
  * to an optional memory registration in `CHARGE_STEP` granules; what the registration refuses is
  * counted as `overdraft` (the index must exist) and charged again as it shrinks or the registration
  * frees up.
+ * Ordinary data/log open reads only the last index boundary. Reads and mutations select needed
+ * records from the persisted index, so no per-record index remains resident. Full physical
+ * integrity scans run in bounded pages during audit and test-build open (R25.5), without building
+ * a resident index. Scratch retains the explicit eager mode.
  *
  * ## Clearing (finding 3)
  * `clear` deletes every record fully inside its range with one range delete per store, then trims
@@ -364,13 +369,16 @@ export class ByteStore {
   readonly name: string;
   readonly indexName: string;
   readonly #index: IntervalIndex;
+  /** Null for an eagerly loaded index; otherwise only the persisted last-record boundary. */
+  #lazyEnd: number | null;
   /** Index changes of the transaction in progress, newest last. */
   #journal: Array<() => void> = [];
 
-  private constructor(name: string, index: IntervalIndex) {
+  private constructor(name: string, index: IntervalIndex, lazyEnd: number | null = null) {
     this.name = name;
     this.indexName = `${name}-index`;
     this.#index = index;
+    this.#lazyEnd = lazyEnd;
   }
 
   /**
@@ -385,10 +393,49 @@ export class ByteStore {
     name: string,
     memory: CacheMemory | null = null,
   ): Promise<ByteStore> {
-    const indexName = `${name}-index`;
     const build = IntervalIndex.builder(memory);
+    try {
+      await ByteStore.#scan(db, name, (offset, end) => build.push(offset, end));
+      return new ByteStore(name, build.finish());
+    } catch (error) {
+      build.finish().release();
+      throw error;
+    }
+  }
+
+  /** R25.5: no whole-store enumeration. Reads and mutations select persisted records lazily. */
+  static async openLazy(
+    db: IdbDatabaseLike,
+    name: string,
+    memory: CacheMemory | null = null,
+  ): Promise<ByteStore> {
+    let end = 0;
+    await db.transaction([`${name}-index`], "readonly", "relaxed", (tx) => {
+      tx.store(`${name}-index`).last(null, (entry) => {
+        if (entry === undefined) return;
+        if (!isEntry(entry)) throw corrupt(`${name}-index has a malformed last entry`);
+        end = entry.offset + entry.length;
+      });
+    });
+    return new ByteStore(name, IntervalIndex.builder(memory).finish(), end);
+  }
+
+  /** Full physical integrity, without retaining the whole index (audit and test-build open). */
+  static async audit(db: IdbDatabaseLike, name: string, signal?: AbortSignal): Promise<void> {
+    await ByteStore.#scan(db, name, () => undefined, signal);
+  }
+
+  static async #scan(
+    db: IdbDatabaseLike,
+    name: string,
+    visit: (offset: number, end: number) => void,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    signal?.throwIfAborted();
+    const indexName = `${name}-index`;
     let previousEnd = 0;
     const check = (entries: unknown[], indexKeys: IdbKey[], recordKeys: IdbKey[]) => {
+      signal?.throwIfAborted();
       if (entries.length !== indexKeys.length) throw corrupt(`${indexName} changed while loading`);
       for (let at = 0; at < entries.length; at++) {
         const entry = entries[at];
@@ -399,7 +446,7 @@ export class ByteStore {
         if (entry.offset < previousEnd)
           throw corrupt(`entries of ${indexName} overlap at ${String(entry.offset)}`);
         previousEnd = entry.offset + entry.length;
-        build.push(entry.offset, previousEnd);
+        visit(entry.offset, previousEnd);
       }
       for (let at = 0; at < Math.max(recordKeys.length, indexKeys.length); at++) {
         const record = recordKeys[at];
@@ -413,47 +460,54 @@ export class ByteStore {
         );
       }
     };
-    let index: IntervalIndex;
-    try {
-      await db.transaction([name, indexName], "readonly", "relaxed", (tx) => {
-        const page = (after: number | null) => {
-          const range = after === null ? {} : { lower: after, lowerOpen: true };
-          tx.store(indexName).getAll(
-            range,
-            (entries) => {
-              tx.store(indexName).getAllKeys(
-                range,
-                (indexKeys) => {
-                  tx.store(name).getAllKeys(
-                    range,
-                    (recordKeys) => {
-                      check(entries, indexKeys, recordKeys);
-                      const last = indexKeys.at(-1);
-                      // A short page is the last (its record keys matched it, so none follow).
-                      if (indexKeys.length >= LOAD_PAGE && typeof last === "number") page(last);
-                    },
-                    LOAD_PAGE,
-                  );
-                },
-                LOAD_PAGE,
-              );
-            },
-            LOAD_PAGE,
-          );
+    await db.transaction([name, indexName], "readonly", "relaxed", (tx) => {
+      const page = (after: number | null) => {
+        const range = after === null ? {} : { lower: after, lowerOpen: true };
+        // Queue all three bulk requests before any callback. Their results describe one
+        // transaction snapshot; validate only after the last callback, then enqueue a page.
+        let left = 3;
+        let entries: unknown[] = [];
+        let indexKeys: IdbKey[] = [];
+        let recordKeys: IdbKey[] = [];
+        const loaded = () => {
+          if (--left !== 0) return;
+          check(entries, indexKeys, recordKeys);
+          const last = indexKeys.at(-1);
+          if (indexKeys.length >= LOAD_PAGE && typeof last === "number") page(last);
         };
-        page(null);
-      });
-      index = build.finish();
-    } catch (error) {
-      build.finish().release();
-      throw error;
-    }
-    return new ByteStore(name, index);
+        tx.store(indexName).getAll(
+          range,
+          (values) => {
+            entries = values;
+            loaded();
+          },
+          LOAD_PAGE,
+        );
+        tx.store(indexName).getAllKeys(
+          range,
+          (keys) => {
+            indexKeys = keys;
+            loaded();
+          },
+          LOAD_PAGE,
+        );
+        tx.store(name).getAllKeys(
+          range,
+          (keys) => {
+            recordKeys = keys;
+            loaded();
+          },
+          LOAD_PAGE,
+        );
+      };
+      page(null);
+    });
+    signal?.throwIfAborted();
   }
 
   /** The end of the last record (the space's length). */
   get end(): number {
-    return this.#index.end;
+    return this.#lazyEnd ?? this.#index.end;
   }
 
   get records(): number {
@@ -483,9 +537,22 @@ export class ByteStore {
   #put(tx: IdbTransactionLike, offset: number, bytes: ArrayBuffer): void {
     tx.store(this.name).put(offset, { offset, bytes } satisfies StoredRecord);
     tx.store(this.indexName).put(offset, { offset, length: bytes.byteLength } satisfies IndexEntry);
-    this.#index.insert(offset, offset + bytes.byteLength);
+    if (this.#lazyEnd !== null)
+      this.#setLazyEnd(Math.max(this.#lazyEnd, offset + bytes.byteLength));
+    else {
+      this.#index.insert(offset, offset + bytes.byteLength);
+      this.#journal.push(() => {
+        this.#index.removeStarts(offset, offset);
+      });
+    }
+  }
+
+  #setLazyEnd(end: number): void {
+    const previous = this.#lazyEnd;
+    if (previous === end) return;
+    this.#lazyEnd = end;
     this.#journal.push(() => {
-      this.#index.removeStarts(offset, offset);
+      this.#lazyEnd = previous;
     });
   }
 
@@ -499,6 +566,10 @@ export class ByteStore {
 
   /** Removes `[start, end)`, trimming straddling records, then calls `next` (see "Clearing"). */
   clear(tx: IdbTransactionLike, start: number, end: number, next: () => void): void {
+    if (this.#lazyEnd !== null) {
+      this.#clearLazy(tx, start, end, next);
+      return;
+    }
     const overlapping = end > start ? this.#index.overlapping(start, end) : [];
     let first = 0;
     let last = overlapping.length - 1;
@@ -541,6 +612,93 @@ export class ByteStore {
         left -= 1;
         if (left === 0) next();
       });
+  }
+
+  /** At most two boundary records are read; interior deletion is a native range operation. */
+  #clearLazy(tx: IdbTransactionLike, start: number, end: number, next: () => void): void {
+    if (end <= start || start >= this.end) {
+      next();
+      return;
+    }
+    const shrinks = end >= this.end;
+    const index = tx.store(this.indexName);
+    const records = tx.store(this.name);
+    let head: unknown;
+    let tail: unknown;
+    let left = 2;
+    const finish = () => {
+      if (!shrinks) {
+        next();
+        return;
+      }
+      index.last(null, (entry) => {
+        if (entry !== undefined && !isEntry(entry))
+          throw corrupt(`${this.indexName} has a malformed last entry`);
+        this.#setLazyEnd(entry === undefined ? 0 : entry.offset + entry.length);
+        next();
+      });
+    };
+    const selected = () => {
+      if (--left !== 0) return;
+      if ((head !== undefined && !isEntry(head)) || (tail !== undefined && !isEntry(tail)))
+        throw corrupt(`${this.indexName} is malformed near ${String(start)}`);
+      const before = head;
+      const after = tail;
+      if (
+        before !== undefined &&
+        after !== undefined &&
+        before.offset !== after.offset &&
+        before.offset + before.length > after.offset
+      )
+        throw corrupt(`${this.indexName} has overlapping boundary records`);
+      const straddling: IndexEntry[] = [];
+      if (before !== undefined && before.offset + before.length > start) straddling.push(before);
+      if (after !== undefined && after.offset >= start && after.offset + after.length > end)
+        straddling.push(after);
+      const found: ArrayBuffer[] = [];
+      const apply = () => {
+        const range = { lower: start, upper: end, upperOpen: true };
+        records.deleteRange(range);
+        index.deleteRange(range);
+        for (let at = 0; at < straddling.length; at++) {
+          const entry = straddling[at];
+          const bytes = found[at];
+          if (entry === undefined || bytes === undefined)
+            throw corrupt("a boundary record is missing");
+          records.delete(entry.offset);
+          index.delete(entry.offset);
+          if (entry.offset < start)
+            this.#put(tx, entry.offset, bytes.slice(0, start - entry.offset));
+          if (entry.offset + entry.length > end)
+            this.#put(tx, end, bytes.slice(end - entry.offset));
+        }
+        finish();
+      };
+      if (straddling.length === 0) {
+        apply();
+        return;
+      }
+      let pending = straddling.length;
+      straddling.forEach((entry, at) =>
+        records.get(entry.offset, (value) => {
+          const bytes = (value as StoredRecord | undefined)?.bytes;
+          if (!(bytes instanceof ArrayBuffer) || bytes.byteLength !== entry.length)
+            throw corrupt(
+              `record ${String(entry.offset)} of ${this.name} disagrees with its entry`,
+            );
+          found[at] = bytes;
+          if (--pending === 0) apply();
+        }),
+      );
+    };
+    index.last({ upper: start, upperOpen: true }, (entry) => {
+      head = entry;
+      selected();
+    });
+    index.last({ upper: end, upperOpen: true }, (entry) => {
+      tail = entry;
+      selected();
+    });
   }
 
   /** Writes `bytes` at `offset` (replacing what it overlaps), then calls `next`. */
@@ -612,7 +770,8 @@ export class ByteStore {
   reset(tx: IdbTransactionLike, next: () => void): void {
     tx.store(this.name).clear();
     tx.store(this.indexName).clear();
-    this.#removeStarts(0, Number.MAX_SAFE_INTEGER);
+    if (this.#lazyEnd !== null) this.#setLazyEnd(0);
+    else this.#removeStarts(0, Number.MAX_SAFE_INTEGER);
     next();
   }
 }

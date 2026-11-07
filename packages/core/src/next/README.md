@@ -146,20 +146,25 @@ is access's `Snapshot`.
 - The log has a flush barrier and two header slots.
 - **The extent space** (`extents.ts`) is the only caller of the data-space calls and of `publish`.
   - A writer reserves extents, appends checksummed blobs, seals, and either publishes once or
-    aborts. Abort frees at once; a crash before publish leaves orphans that the walk on open frees.
+    aborts. Abort frees at once; a crash before publish leaves orphans that open frees.
   - `publish(root, { writers, retired })` is serialized and atomic. Two-generation reclaim: retired
     extents are reused only after the _next_ publish is durable and no pin of an older generation
     remains, so the current and previous roots always read intact.
   - A rejected publish is indeterminate: the space keeps everything allocated and refuses writes
     until the owner reopens.
-  - Free space is rebuilt on open from the extents the current and previous roots reach (the format
-    track's `reachable`), first fit, and released to the platform only as a free tail.
+  - Free space is rebuilt on open from the extents the current and previous roots reach, first
+    fit, and released to the platform only as a free tail. Ruling R25: each root references a
+    paged, offset-sorted list of its extents (`extent-list.ts`), so open reads the two roots'
+    lists (`listedExtents`) and no group root; the audit cross-checks them against the format
+    track's full walk (`walk`), as the open does in test builds (`verifyAtOpen`). The write path's
+    extent-delta sink, `ExtentListKeeper`, keeps each list incrementally: only the pages a
+    publication touches are rewritten, the rest shared (DECISIONS.md "R25").
   - Blobs are at most 1 MiB (larger structures span several), and one read asks for at most 4 MiB.
   - It is the write path's only way to the data space: reads, `peek`, writers, `publish`, pins.
   - A builder can `extend` its extent: in place when the space after it is free, else relocated
     once at seal. Every `BlobRef` carries its extent and its offset within it.
-  - Startup: fence → store session → extent space (walks both roots) → write path (the single log
-    scan and replay) → spill sweep → ready.
+  - Startup: fence → store session → extent space (reads both roots' extent lists) → write path
+    (the single log scan and replay) → spill sweep → ready.
   - One cache of encoded, verified blobs, charged to the governor and evicted before anything
     spills. Misses are read in coalesced slabs (gaps ≤ 64 KiB, slabs ≤ 1 MiB) and copied out, so
     eviction frees exactly what it uncharges. Every leased byte is charged to the reader's budget
@@ -192,11 +197,13 @@ is access's `Snapshot`.
   byte records of ≤ 256 KiB keyed by offset, kept disjoint, ArrayBuffers only, each with an entry
   in a companion index store, so no read or write needs a cursor over record values
   (`idb-bytes.ts`: Firefox's cursor read the neighbouring record's value and held bulk writes to
-  ~6.7 MB/s; now 5× faster end to end). The index is validated at open (an orphan record, an
-  entry without its record, overlap or a malformed entry is `StoreCorruptionError`) and kept in
-  memory for writes only, in blocks of ≤ 512 entries charged to an optional memory registration
-  (streamed into blocks at open, a page at a time); reads select their records from the stored
-  index inside their own transaction and refuse a missing or mismatched record. Relaxed writes are
+  ~6.7 MB/s; now 5× faster end to end). Data/log open reads only the last-record boundaries;
+  reads and mutations select needed records from the persisted index inside their transaction.
+  No per-record data/log index remains resident. Audit and test-build open validate the full
+  physical index (an orphan record, an entry without its record, overlap or a malformed entry is
+  `StoreCorruptionError`), in bounded pages without building a resident index. Reads continue to
+  refuse a missing or mismatched selected record. Scratch uses the eager block index charged to
+  its memory registration. Relaxed writes are
   batched in call order and committed with each barrier (publish, log flush, release, truncate,
   reset) on one commit chain (this assumes each engine's one write-ahead log per database commits
   in order, so a strict commit makes earlier relaxed ones durable; checksums turn a broken
@@ -698,20 +705,30 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
   to their chunk's data blob.
 - Every reference carries the checksum of what it names (a chunk's pages carry theirs).
 - Space is reusable only when neither the current durable root, nor the previous one (the other
-  root slot), nor any pinned root reaches it (two generations), and startup walks both roots.
-- Startup order: acquire the fence → open the store session → open the extent space (walk the
-  current and previous roots) → open the write path (a single log scan and replay, `publishedRows`
+  root slot), nor any pinned root reaches it (two generations), and startup reads both roots'
+  extent lists (ruling R25: `ManifestRoot.extentList`, format 2; format 1 roots, written only by
+  development builds, are refused).
+- Startup order: acquire the fence → open the store session → open the extent space (read the
+  current and previous roots' extent lists) → open the write path (a single log scan and replay, `publishedRows`
   staging included) → spill sweep → ready.
 - Snapshot pins live in memory and are dropped when their client's lock is released.
 - `walkReachable(root, reader)` streams every reference a root reaches (catalog, table
   statistics, group directory indexes and pages, staged transactions' directories and index runs,
   group roots, deletion bitmaps, row-id columns, chunk data, page directories, sketches, index
-  entries, fences and Bloom filters); `reachableExtents()` is the extent space's
-  `ReachableExtents` over the real codecs. A failed metadata read rejects the walk.
+  entries, fences and Bloom filters) and the root's extent list pages; `reachableExtents()` is
+  that walk as the extent space's `ReachableExtents` over the real codecs, the audit's
+  cross-check. `listedRootExtents()` is what the space opens with: the root's extent list only,
+  no group root. A failed metadata read rejects either.
+- The write path keeps each root's extent list (`write/engine.ts`, an `ExtentListKeeper` built
+  from the durable root at open): it prepares the list once a root's contents are fixed, encodes
+  the root with it, and commits or aborts it with the publication. An injected `extentDeltas`
+  sink is told the whole delta, list pages included. `ExtentDeltaResult.list` carries the
+  prepared references; the engine owns the keeper, so observer sinks must return empty `list`
+  and `pages` arrays.
 
 ### Manifest codecs (`format/manifest-codec.ts`, `blob-cache.ts`, `metadata-reader.ts`)
 
-- Binary codecs (version 1) for the root (≤ 1 MiB), group roots, the paged group directory and each table's statistics blob (`TableStatistics`: per-column null counts, values, bytes and bounds over every group)
+- Binary codecs (manifest version 2; envelope version 1) for the root (≤ 1 MiB), group roots, the paged group directory and each table's statistics blob (`TableStatistics`: per-column null counts, values, bytes and bounds over every group)
   (each blob ≤ 1 MiB). Each blob lists its extents once and gives every reference into one extent
   the same `ExtentRef`. Encoding is canonical (re-encoding a decoded value gives the same bytes).
 - `TableRoot.groups` names a directory **index**; each index entry names a **page** of up to
@@ -1482,3 +1499,110 @@ Backend-owned log buffers total at most 4 MiB across all batches. At that bound 
 charge cannot fit, append borrows the caller's input and waits for its transaction to settle.
 The caller must keep that input immutable and charged until resolution. No size refusal or
 uncharged fallback copy is introduced. OPFS writes synchronously and retains no append copy.
+
+The keeper reserves its own input-copy/sort workspace, decoded page objects, bounded output
+buffer, encoded page and result metadata through `ByteBudget` before allocating them. It reads
+one touched source page and writes one output page at a time. Prepared metadata stays charged
+across publication; abort/failure returns it, commit replaces the keeper's retained reservation,
+and close releases that reservation. List readers keep decoded objects charged across generator
+suspension and release them when the consumer finishes or stops. Startup carries a single page
+cursor across read batches, so traversing the root’s page references is linear in page count.
+
+### R25 startup measurement
+
+`MINNOW_NEXT_STORAGE_REOPEN=1` enables the Chromium storage reopen lane in
+`browser-tests/next-storage.spec.ts`: 100k and 1M real, empty-column group roots, one extent per
+group, published in batches of 16,384 through `ExtentListKeeper`. Each of three reopens uses a
+fresh worker over the disk-backed profile. It reports backend setup, fence, session/index loading, extent-space
+startup and list-cache bytes read (including coalescing gaps). Root byte counts are separate;
+IndexedDB opens data/log byte spaces with last-record boundary lookups and selects persisted
+record entries lazily for the ranges the lists, log replay and later operations need. Whole-store
+orphan/missing/key/order checks run in audit and test-build open, in bounded 4,096-entry pages
+with three bulk requests issued together. Their O(records) cost is outside ordinary open. OS caches
+remain warm. This synthetic metadata stress lane reports storage startup. Gate A acceptance uses an actual
+S5/W5M load and owner-ready reopening, including write-path recovery and composition.
+
+The Linux Chromium lane also samples `/proc` CPU ticks for this profile's DedicatedWorker
+threads and complete browser process tree. Samples bracket reopen after worker-ready and before
+cleanup; they include RPC handling, with the host clock's tick resolution (normally 10 ms).
+Build, module boot and cleanup are excluded. Data-read bytes count coalesced list reads; root
+payload bytes are separate. IndexedDB's native metadata/range lookup time is included, but its
+opaque on-disk byte count is unavailable. The fixture uses a real zero-column catalog,
+group roots, directory pages and table statistics, not a full SQL workload.
+
+R25 preparation and startup use the worker-wide R23.5 task clock reexported by
+`exec/pipeline.ts` (implemented in `task.ts` so storage does not depend on the executor).
+No operation entry or resolved read restarts it. Bounded loops check the deadline, yield a real
+task when due, and check cancellation on resume. Delta sorting uses an in-place sliced heapsort. Normal listed-root startup stream-merges both
+ordered roots directly into the free map, decoding one page per root at a time. Scattered list-page
+allocations use seven bounded radix passes over page references, so reconstruction is O(extents +
+list pages), with no extent Maps or comparison sort. Retained free-run arrays and retirement
+state reserve conservative capacity (including growth overlap) before allocating. Startup
+transfers that charge to a non-evictable lifetime handle, released at space close. Capacity
+charges remain at their high-water mark after entries are deleted. Audits serialize with
+publication so their roots and allocator belong to one generation. Unordered reachability callbacks and full
+audit/test-open validation retain their separate collection/sort path. All paths cooperate with
+the shared clock and cancellation.
+Timer/cancellation regressions include cached reads, immediate writes and two preparations
+sharing one task's elapsed time.
+
+`MINNOW_OWNER_REOPEN=1` enables `browser-tests/next-storage-owner-reopen.spec.ts`, the
+actual S5/W5M owner-ready lane in Chromium over OPFS and IndexedDB. It loads the canonical
+commerce scale 1,667 / wide 5M × 200-column generators (three wide dimensions included), in
+50,000-row transactions through the real write path, using its default maintenance tuning and
+a 256 MiB governor. Each reopen starts a fresh worker, opens the real backend and extent space,
+recovers `WritePathImpl`, sweeps scratch, and starts the real owner host with no broker.
+The executor is a stand-in and is unused before `minnow:ready`; the harness asserts that.
+The owner factory acquires handles in `openFence` and runs session/space/write-path recovery
+in `open`, as the host contract requires. The default fence deadline is unchanged; the ready
+timer includes both acquisition and recovery.
+
+Three wall-only samples report backend/ByteStore loading, extent space, write-path recovery,
+and host overhead separately, plus page-observed host ready. Three separate CPU-bracketed
+samples report worker and browser-tree CPU ticks for those phases without charging the sampler's
+barrier wait to phase wall time. Returned OPFS bytes and IndexedDB cloned byte payloads are
+counted per phase, with numeric index/meta reads separate; native IndexedDB disk bytes are opaque.
+Build, module boot, metadata collection and cleanup are outside owner-ready. Disk caches are not dropped; residency is not verified.
+The reported first `SELECT count(*)` uses real lowering, owner/client protocol and frame delivery,
+but a statistics-only executor stand-in: it reads the real write path's row count, not table pages.
+Client connection/metadata overhead is reported separately. This is not integrated query execution.
+
+`MINNOW_OWNER_REOPEN_CACHE` can retain profiles outside Playwright's output directory;
+`MINNOW_OWNER_REOPEN_REUSE=1` explicitly reuses completed loads marked by the harness, so a
+later clock rebase can measure the same stored roots. The report includes actual group, extent,
+list-page and native IndexedDB record counts rather than deriving them from row counts.
+`MINNOW_OWNER_REOPEN_SMOKE=1` caps each table at 1,000 rows to verify the harness only; those
+samples are labelled and never count as Gate A measurements.
+
+The host-ready endpoint is captured in the host’s actual ready callback. Phase counters capture
+before awaiting a CPU checkpoint, so reads arriving during that wait are kept in the next
+interval. Wall-only checkpoints are synchronous. The owner composition opens with initial maintenance
+held, posts ready, and resumes initial flush/merge/recycle work only after the page acknowledges
+receiving that message. The work is deferred, not removed: count setup and the first count may
+overlap it. The report includes completed counters and in-flight state at ready and after count.
+`MINNOW_OWNER_TRACE=1` records native file ranges and logical read call stacks with maintenance
+state for diagnosis only; turn it off for timing. `MINNOW_OWNER_DEFER_MAINTENANCE=0` enables the
+pre-gate diagnostic comparison without changing the standalone write path's default policy.
+
+The harness returns its unused extent-space startup reservation before opening the write path.
+`MINNOW_OWNER_REOPEN_LOAD_MIB` selects the load governor only; reopens remain at 256 MiB.
+`MINNOW_OWNER_REOPEN_RESUME=1` explicitly continues an interrupted W5M load after recovery,
+quiescence, physical/list audit, schema and complete-batch-prefix checks, and first/last key
+probes. It preserves the canonical 50,000-row transactions and generator values. The report
+records the load budget and resumed row count. A failed 256 MiB load is a separate result and
+is not treated as successful completion within that cap when loading continues at 512 MiB.
+
+R25 delta preparation reserves its copy workspace before reading inputs and checks the shared
+clock and cancellation every 128 entries while copying. The write-path adapter passes its
+owned vectors directly; it does not make unsliced integration copies.
+
+A flush revalidates its captured schema and index identifiers under the publication lock.
+If concurrent DDL changed them while it encoded groups, it aborts the provisional writer
+and retries against the current catalog; the published root must carry its catalog’s indexes.
+
+Quiet-table checkpoints and first table roots stay provisional while a publication is prepared.
+Only adoption of the durable root installs them, so another flush cannot settle an index build
+from a checkpoint the recycler has not published.
+
+Resuming deferred initial maintenance joins the existing flush chain. Close and step-down still
+wait for every accepted flush and merge, including work started before the ready acknowledgement.

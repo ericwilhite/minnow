@@ -9,7 +9,8 @@
  */
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import { describe, expect, it } from "vitest";
-import { expectBytes } from "./space-test-support.js";
+import { expectBytes, countingBudget, countingMemory } from "./space-test-support.js";
+import { openExtentSpace } from "./space.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import { OwnershipLostError, StoreCorruptionError } from "./contract.js";
 import { ByteStore, IDB_RECORD_BYTES } from "./idb-bytes.js";
@@ -237,18 +238,46 @@ describe("the stored index is validated (finding 2)", () => {
     { name: "a non-object entry", records: [[0, 4]], entries: [[0, 4]] },
   ];
 
-  it.each(FIXTURES)("open refuses $name with StoreCorruptionError", async (fixture) => {
-    for (const space of ["data", "log"] as const) {
-      const db = await fakeDb();
-      await forge(db, space, fixture.records, fixture.entries);
-      await expect(ByteStore.load(db, space)).rejects.toBeInstanceOf(StoreCorruptionError);
-      const backend = backendOver(db);
-      await expect(backend.open(await backend.acquire())).rejects.toBeInstanceOf(
-        StoreCorruptionError,
-      );
-      db.close();
-    }
-  });
+  it.each(FIXTURES)(
+    "full load, audit and test-build open refuse $name with StoreCorruptionError",
+    async (fixture) => {
+      for (const space of ["data", "log"] as const) {
+        const db = await fakeDb();
+        await forge(db, space, fixture.records, fixture.entries);
+        await expect(ByteStore.load(db, space)).rejects.toBeInstanceOf(StoreCorruptionError);
+        await expect(ByteStore.audit(db, space)).rejects.toBeInstanceOf(StoreCorruptionError);
+        const backend = backendOver(db);
+        const lease = await backend.acquire();
+        try {
+          // Lazy open may already reject a malformed last-entry boundary. Otherwise the full
+          // checks are mandatory in both explicit audit and the test-build open (R25.5).
+          const opened = await backend.open(lease).then(
+            (session) => ({ session, error: null }),
+            (error: unknown) => ({ session: null, error }),
+          );
+          if (opened.session === null) expect(opened.error).toBeInstanceOf(StoreCorruptionError);
+          else {
+            expect(typeof opened.session.audit).toBe("function");
+            await expect(opened.session.audit?.()).rejects.toBeInstanceOf(StoreCorruptionError);
+            await expect(
+              openExtentSpace(opened.session, {
+                reachable: function* () {
+                  yield* [];
+                },
+                verifyAtOpen: true,
+                budget: countingBudget(Infinity),
+                registerCache: () => countingMemory(Infinity),
+              }),
+            ).rejects.toBeInstanceOf(StoreCorruptionError);
+            await opened.session.close();
+          }
+        } finally {
+          await lease.release();
+        }
+        db.close();
+      }
+    },
+  );
 
   it("open accepts a valid index with holes, and reads it back", async () => {
     const db = await fakeDb();

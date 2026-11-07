@@ -61,8 +61,10 @@
  * their out-of-line values before decoding (page/large-value.ts). The fold reuses group metadata;
  * index-run merges read keys and row ids, without decoding row chunks.
  *
- * Recovery schedules the staging fold in a later task, after open has delivered ready;
- * no group-root read begins as part of open, including its queued microtasks.
+ * Standalone recovery schedules the staging fold in a later task so open can return first.
+ * The real owner composition additionally defers initial flush/merge/recycle work until its
+ * ready message is acknowledged, then resumes it through the concrete write-path lifecycle.
+ * No group-root read is needed for recovery itself.
  *
  * Retirement of unclaimed staging runs in task slices, checks close and the open signal,
  * and deduplicates extent identities in a set. It runs at the first publication after open.
@@ -164,6 +166,7 @@ import type { Int64Values } from "../vector/vector.js";
 import type { CatalogView } from "./catalog.js";
 import type { Statement, StatementOptions } from "./modify.js";
 import type { Snapshot } from "./snapshot.js";
+import type { ExtentList } from "../storage/extent-list.js";
 import type { ExtentRef } from "../storage/extents.js";
 import type { Space, SpaceWriter } from "./space.js";
 
@@ -367,13 +370,14 @@ export interface PublishDelta {
   readonly writer: SpaceWriter;
 }
 
-/** What a sink returns for one attempt. */
+/**
+ * A prepared keeper result. The write path owns the keeper and consumes its list. Optional
+ * `extentDeltas` observers must return null or empty `list`/`pages`, not replace that list.
+ */
 export interface ExtentDeltaResult {
-  /**
-   * The list pages to write in this publication (the write path writes them into its writer and
-   * the root references them; until the root has that field, ruling R25's format part, a
-   * non-empty list is refused as a sink failure).
-   */
+  /** Prepared list whose pages were written through the publication's writer. */
+  readonly list: ExtentList;
+  /** Always empty: the keeper writes its pages before returning their references. */
   readonly pages: readonly Uint8Array[];
   /** List pages of the sink's own the new root no longer reaches: retired in the same publish. */
   readonly retire: readonly ExtentRef[];
@@ -383,8 +387,9 @@ export interface ExtentDeltaResult {
  * The storage track's side of R25 (ruling on review B3-p2b-3 C2), a two-phase protocol per
  * publication attempt, in publish order:
  * 1. `prepare(attempt, delta)`: after the root's contents are fixed, before metadata admission,
- *    encoding and the publish. `attempt` is unique and increasing within one open write path. The sink builds a provisional
- *    list from its last committed one and returns the pages to write;
+ *    encoding and the publish. `attempt` is unique and increasing within one open write path.
+ *    The keeper builds a provisional list from its last committed one and returns
+ *    `ExtentDeltaResult.list`;
  * 2. exactly one of
  *    - `commit(attempt, sequence)`: the root is durable and current; `sequence` is its root
  *      sequence. Sequences belong to committed publications only, and are consecutive;

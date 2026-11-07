@@ -1,10 +1,11 @@
 /**
- * Benchmarks the manifest codecs, the metadata reader's caches and the open walk
- * (packages/core/src/next/format), against two targets:
+ * Benchmarks the manifest codecs, the metadata reader's caches and the full audit walk
+ * (packages/core/src/next/format):
  * - R6: an owner-side cached point read ≤ 10 µs, so a cached group root / directory must cost a
  *   small fraction of that;
- * - Gate "reopen ≤ 500 ms at W5M" (PROPOSAL.md Targets): the open walk over 5M rows × 200 columns
- *   (77 groups of 65,536 rows) reads one root, one directory index and page, and 77 group roots.
+ * - The full audit walk over 5M rows × 200 columns (77 groups of 65,536 rows) reads one root,
+ *   one directory index and page, and 77 group roots. R25 startup reads extent lists instead;
+ *   this synthetic memory-space walk is not the Gate A reopen measurement.
  *
  *   npx vite-node scripts/manifest-bench.mts [--repeats 7]
  *
@@ -29,6 +30,7 @@ import type {
   ManifestRoot,
   TableRoot,
 } from "../packages/core/src/next/format/manifest.ts";
+import { MANIFEST_FORMAT_VERSION } from "../packages/core/src/next/format/manifest.ts";
 import { MetadataReader } from "../packages/core/src/next/format/metadata-reader.ts";
 import { reachableExtents } from "../packages/core/src/next/format/reachable.ts";
 import { MemoryExtentSpace, UNLIMITED } from "../packages/core/src/next/page/memory-extents.ts";
@@ -125,7 +127,7 @@ function manifestRoot(tables: number): ManifestRoot {
     statistics: blob(500, 1000),
   }));
   return {
-    formatVersion: 1,
+    formatVersion: MANIFEST_FORMAT_VERSION,
     sequence: 99,
     epoch: 3,
     log: { salt: 77, firstLsn: 1, rootSequence: 90 },
@@ -138,6 +140,7 @@ function manifestRoot(tables: number): ManifestRoot {
       reservedThrough: 10_000n,
     })),
     tables: tableRoots,
+    extentList: [], // Synthetic codec/audit input; no durable root is published here.
     clients: Array.from({ length: 50 }, (_, k) => ({
       clientId: `client-${String(k)}`,
       resolvedThrough: 1000,
@@ -223,7 +226,7 @@ report(
   0,
 );
 
-// The open walk at W5M: 77 groups × 200 columns, real blobs in the memory space.
+// The full audit walk at W5M: 77 groups × 200 columns, real blobs in the memory space.
 const w5m = new MemoryExtentSpace();
 const metadata = w5m.beginWrite("w5m");
 const roots = await metadata.write(
@@ -262,7 +265,11 @@ const walkMs = await timed(async () => {
     reached++;
   }
 });
-report(`open walk W5M (77 group roots × 200 cols, cold reads, ${String(reached)} refs)`, walkMs, 0);
+report(
+  `audit walk W5M (77 group roots × 200 cols, cold reads, ${String(reached)} refs)`,
+  walkMs,
+  0,
+);
 
 console.log(`median of ${String(REPEATS)}`);
 console.log("case | time | bytes");

@@ -121,7 +121,7 @@ describe("the in-memory index (finding 4)", () => {
     expect(charged).toBe(0);
   });
 
-  it("the backend charges both spaces' indexes and releases them at close", async () => {
+  it("the lazy backend retains only its bounded log-tail buffer and releases it at close", async () => {
     let charged = 0;
     const memory = {
       charge(bytes: number) {
@@ -143,8 +143,8 @@ describe("the in-memory index (finding 4)", () => {
     await session.writeData(0, filled(4096, 1));
     await session.appendLog(filled(10, 2));
     await session.flushLog();
-    // One granule per space's index, and the log tail's buffer.
-    expect(charged).toBe(2 * CHARGE_STEP + LOG_COALESCE_BYTES);
+    // R25.5: data/log use persisted lookup; no resident per-record index is retained.
+    expect(charged).toBe(LOG_COALESCE_BYTES);
     await session.close();
     expect(charged).toBe(0);
   });

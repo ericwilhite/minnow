@@ -1004,3 +1004,50 @@ export async function chaosThroughput(
   await chaosStepDown(0);
   return { operations, perSecond: (operations * 1000) / ms };
 }
+
+/** Fresh dedicated workers, with CPU sampled after ready and before cleanup. OS caches stay warm. */
+export async function runListedReopenBench(
+  kind: StoreKind,
+  groups: number,
+  repeats: number,
+  sampleCpu: () => Promise<import("./next-storage-listed-reopen.js").ReopenCpuSnapshot>,
+) {
+  const { cpuDelta } = await import("./next-storage-listed-reopen.js");
+  const dir = `r25-reopen-${Date.now().toString(36)}`;
+  const builder = await spawn();
+  try {
+    const build = await builder.call<
+      Awaited<ReturnType<typeof import("./next-storage-listed-reopen.js").buildListedReopenSpace>>
+    >({ store: kind, op: "listed-reopen-build", dir, groups });
+    builder.terminate();
+    const reopens = [];
+    for (let i = 0; i < repeats; i++) {
+      const worker = await spawn();
+      try {
+        const before = await sampleCpu();
+        const timing = await worker.call<
+          Awaited<
+            ReturnType<typeof import("./next-storage-listed-reopen.js").openListedReopen>
+          >["timing"]
+        >({ store: kind, op: "listed-reopen-measure", dir });
+        const after = await sampleCpu();
+        reopens.push({ ...timing, ...cpuDelta(before, after) });
+      } finally {
+        try {
+          await worker.call({ store: kind, op: "listed-reopen-close" });
+        } finally {
+          worker.terminate();
+        }
+      }
+    }
+    return { build, reopens };
+  } finally {
+    builder.terminate();
+    const cleanup = await spawn();
+    try {
+      await cleanup.call({ store: kind, op: "remove", dir });
+    } finally {
+      cleanup.terminate();
+    }
+  }
+}

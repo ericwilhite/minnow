@@ -340,6 +340,10 @@ describe("crash sweep", () => {
         if (disk.steps <= at) throw error;
         crashes += 1;
       }
+      // Real task-clock yields can give this replay fewer physical mutations than
+      // the reference. Consume its unspent fault at the completed scenario boundary,
+      // not during recovery/continued-write verification. Every case still loses power.
+      if (disk.crashes === 0) disk.powerLoss();
       try {
         await verify(make(disk), outcome);
       } catch (error) {
@@ -351,6 +355,42 @@ describe("crash sweep", () => {
     expect(crashes).toBeGreaterThan(steps / 2);
     console.info(`crash sweep: ${String(steps)} steps, ${String(crashes)} crashed mid-scenario`);
   }
+
+  it("keeps an unspent fault from a shorter replay out of recovery", async () => {
+    let reference = true;
+    let completedReplays = 0;
+    const run = async (harness: Harness, outcome: Outcome) => {
+      const path = await harness.open();
+      let t = 0;
+      await autocommit(path, async (s) => {
+        t =
+          (
+            await s.changeCatalog({
+              kind: "createTable",
+              table: tableInput("t", [column("id", INT, false), column("v", INT)]),
+            })
+          ).id ?? 0;
+      });
+      for (const id of [1, 2, 3, 4]) {
+        outcome.uncertain.set(id, ["absent", id * 10]);
+        await autocommit(path, (s) => s.table(t).insert(batch(ints([id]), ints([id * 10])), null));
+        outcome.uncertain.delete(id);
+        outcome.acked.set(id, id * 10);
+      }
+      await path.quiesce();
+      await harness.close();
+      if (reference) {
+        // Different task interleavings can publish different numbers of roots. Model
+        // a longer reference deterministically, without depending on timer speed.
+        const padding = harness.disk.open("reference-only-work", true);
+        for (let step = 0; step < 8; step++) padding.truncate(0);
+        padding.close();
+        reference = false;
+      } else completedReplays += 1;
+    };
+    await sweep((disk) => new Harness("strict", "sim", 1, disk, { merges: { mode: "off" } }), run);
+    expect(completedReplays, "a replay ends before its planned fault").toBeGreaterThan(0);
+  }, 1_800_000);
 
   it("survives a crash at every physical step of commit, flush and publish", async () => {
     await sweep(

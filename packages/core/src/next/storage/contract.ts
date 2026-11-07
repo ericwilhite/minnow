@@ -260,7 +260,7 @@ export interface StoreSession {
    * The previous durable root (the one the current replaced): the other root slot's root when that
    * slot is valid and older, else null (a new store, one publish only, or a slot torn by an
    * interrupted publish). A reopen falls back to it if the current root's slot is lost, so startup
-   * walks both and the extent space keeps the extents either reaches until the next publish is
+   * reads what both reach and the extent space keeps the extents either reaches until the next publish is
    * durable (format/manifest.ts "Reclaim": two generations).
    */
   readPreviousRoot(): Promise<Uint8Array | null>;
@@ -292,6 +292,8 @@ export interface StoreSession {
   releaseData(ranges: readonly DataRange[]): Promise<void>;
   /** Bytes in the data space (the allocator's high-water mark on open). */
   dataLength(): Promise<number>;
+  /** Optional backend-wide physical integrity check; called by audit and test-build open. */
+  audit?(signal?: AbortSignal): Promise<void>;
 
   /** Body length in bytes (excluding header slots), as this session sees it. */
   logLength(): number;

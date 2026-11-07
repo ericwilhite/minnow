@@ -18,8 +18,10 @@
  *   one in a strict transaction; the other keeps the previous root.
  * - `data`, `log`, `spill`: byte spaces (idb-bytes.ts): disjoint records of ≤ 256 KiB keyed by
  *   offset, each with an entry in `data-index`, `log-index` or `spill-index` (offset → length).
- *   Writes find overlaps in an in-memory copy of the index loaded (and validated) at open; reads
- *   select records from the stored index inside their transaction. Gaps read as zeros. Freed space
+ *   Data/log open loads only the last index boundary. Reads select records from the persisted
+ *   index; writes select at most two boundary records and delete interior ranges in the same
+ *   transaction. Full orphan/missing-record validation runs in audit and test-build open (R25.5).
+ *   Gaps read as zeros. Freed space
  *   is deleted (`releaseData`), which returns it to the platform: unlike OPFS, IndexedDB does give
  *   quota back.
  *
@@ -106,9 +108,9 @@ export interface IndexedDbBackendOptions {
   /** Told about every transaction once created, and when it ends (test instrumentation). */
   readonly observe?: StorageObserver;
   /**
-   * Charged with the resident record indexes of the data and log spaces (idb-bytes.ts, "Cost"),
-   * growing and shrinking with them, released at close: the owner registers it with the memory
-   * governor. None by default.
+   * Charged with the retained log-tail buffer; data/log use lazy persisted index lookups, with
+   * no resident record directory (idb-bytes.ts "Cost"). Released at close. The owner registers
+   * it with the memory governor. None by default.
    */
   readonly memory?: CacheMemory;
 }
@@ -831,6 +833,19 @@ class IdbSession implements StoreSession {
     await Promise.all(runs);
   }
 
+  /** Whole physical record/index checks are explicit, fenced, and never silently omitted. */
+  async audit(signal?: AbortSignal): Promise<void> {
+    this.#live();
+    signal?.throwIfAborted();
+    if (this.#failure === null) await this.#commit();
+    const db: IdbDatabaseLike = {
+      close: () => undefined,
+      transaction: (stores, _mode, _durability, body) => this.#lease.read(stores, body),
+    };
+    await ByteStore.audit(db, "data", signal);
+    await ByteStore.audit(db, "log", signal);
+  }
+
   async dataLength(): Promise<number> {
     this.#live();
     return this.#currentDataLength();
@@ -1183,14 +1198,16 @@ export function createIndexedDbBackend(options: IndexedDbBackendOptions): Storag
     async open(lease: OwnerLease): Promise<StoreSession> {
       const owned = own(lease);
       owned.guard();
-      // The record indexes of both byte spaces, loaded and validated once (16 bytes per
-      // ≤ 256 KiB record), charged to the owner's memory registration.
+      // R25.5: only each byte space's last-record boundary. Persisted range lookup serves
+      // reads/writes; full physical index checks run in audit and test-build open.
       const memory = options.memory ?? null;
-      const data = await ByteStore.load(owned.database, "data", memory);
-      const log = await ByteStore.load(owned.database, "log", memory).catch((error: unknown) => {
-        data.close();
-        throw error;
-      });
+      const data = await ByteStore.openLazy(owned.database, "data", memory);
+      const log = await ByteStore.openLazy(owned.database, "log", memory).catch(
+        (error: unknown) => {
+          data.close();
+          throw error;
+        },
+      );
       return new IdbSession(owned, data, log, options.batching ?? true, memory);
     },
     scratch(lease: OwnerLease): ScratchSpace {

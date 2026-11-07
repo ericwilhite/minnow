@@ -137,7 +137,7 @@ export function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise
   });
 }
 
-// Canonical lower-layer extraction from B1's 64bfd55f: all users share this same clock.
+// The shared worker task clock (R23.5) lives in next/task.ts so storage can use it; re-exported here.
 export {
   YIELD_INTERVAL_MS,
   TaskClock,
