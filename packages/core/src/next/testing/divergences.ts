@@ -507,3 +507,27 @@ export const KEYLESS_FULL_AUTHORITY = {
   authority:
     "PostgreSQL FULL JOIN requires a hash/merge-joinable condition; FULL's bag semantics are LEFT JOIN plus each unmatched right row exactly once. https://www.postgresql.org/docs/18/queries-table-expressions.html#QUERIES-JOIN",
 } as const;
+
+/**
+ * R21 pending owner capabilities. These are missing dependencies, not intended divergences:
+ * no differential matcher may use them to excuse an incorrect SQL result. Their real-SQL
+ * generators remain explicitly skipped until the reviewed public lowering API is supplied.
+ */
+export const PENDING_OWNER_CAPABILITIES = [
+  {
+    id: "B5-effective-row-locking",
+    reason:
+      "Awaiting B6 public rowLocking after view/CTE expansion; pinned a0192fa2 discards locks",
+    authority:
+      "PGlite rejects effective base-relation locks in READ ONLY (25006), including empty reads; an outer CTE reference and constant-only derived relation take no base lock",
+    test: "owner-lowering-pending.test.ts: next-owner-pending-locking",
+  },
+  {
+    id: "B5-ordered-transaction-modes",
+    reason:
+      "Awaiting B6 public modeItems on BEGIN, START TRANSACTION and SET TRANSACTION; pinned a0192fa2 exposes final modes only",
+    authority:
+      "PGlite: inside SAVEPOINT, SET TRANSACTION READ ONLY, READ WRITE fails 25001, while READ WRITE, READ ONLY succeeds",
+    test: "owner-lowering-pending.test.ts: next-owner-pending-ordered-modes",
+  },
+] as const;

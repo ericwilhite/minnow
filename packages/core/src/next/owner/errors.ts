@@ -209,13 +209,13 @@ export class InFailedTransactionError extends Error {
   }
 }
 
-/** SET TRANSACTION after this transaction's first data statement (PostgreSQL 25001). */
+/** A transaction attribute change forbidden by PostgreSQL snapshot/subtransaction rules (25001). */
 export class TransactionModeError extends Error {
   readonly code = "MINNOW_TRANSACTION_MODE";
   override readonly name = "TransactionModeError";
   readonly sqlState = "25001";
-  constructor() {
-    super("SET TRANSACTION must precede the transaction's first query or data statement");
+  constructor(message = "The transaction mode cannot be changed here") {
+    super(message);
   }
 }
 

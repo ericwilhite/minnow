@@ -1715,18 +1715,31 @@ with no stored-format change.
   own schema in a session cache dropped on ROLLBACK and ROLLBACK TO. Both are the governor's
   evictable caches (`registerCache`): charged at a size walked from the expressions, and evicted,
   oldest unused across caches, before growth is refused or an operator spills.
-- SQL `BEGIN` / `START TRANSACTION` and `SET TRANSACTION` apply lowering's typed modes,
-  including the last option of each kind. READ ONLY pins a snapshot and takes no writer slot;
-  READ WRITE takes the writer slot. A write in READ ONLY fails with 25006. Before data work,
-  SET can switch those resources and change isolation/deferrable modes. After the first data
-  statement starts (including synchronous point reads), SET fails with 25001 and aborts the
-  transaction; ROLLBACK TO does not reset that boundary. A savepoint keeps its modes: ROLLBACK TO
-  restores them and their resources, while RELEASE keeps subsequent changes. Modes reset at
-  transaction end. SHOW transaction_isolation reports the selected level per session; the
-  default is repeatable read. Every accepted isolation level uses the engine's snapshot level
-  (lowering refuses SERIALIZABLE), so DEFERRABLE has no execution effect. SET outside a
-  transaction changes nothing; the wire has no PostgreSQL warning notices. Other session SET
-  settings remain the lowerer's fixed utility behavior.
+- SQL `BEGIN` / `START TRANSACTION` and `SET TRANSACTION` apply lowering's typed modes.
+  READ ONLY starts with a pinned snapshot and no writer slot. Switching to it after writes
+  keeps the transaction and commits those earlier writes; subsequent writes fail with 25006.
+  Sequence mutation is checked at `SequenceAccess.next` / `set`, when execution reaches it:
+  currval and unexecuted conditional calls remain allowed. SQL lastval() is still refused
+  by the pinned lowerer (42883); it is outside this effect campaign.
+- SET follows PostgreSQL's per-attribute restrictions (verified against PGlite). READ ONLY
+  remains allowed after data work; READ WRITE is a no-op when already read-write, but switching
+  from read-only is forbidden after a snapshot or within a savepoint. An unchanged isolation
+  level remains allowed; changing it, or setting either deferrability value, is forbidden after
+  a snapshot or within a savepoint (25001). Query/data attempts, including refused writes and
+  synchronous point reads, take that boundary; SHOW does not. ROLLBACK TO restores modes and
+  prior writes without resetting the snapshot boundary; RELEASE keeps subsequent modes.
+  Modes reset at transaction end. SHOW transaction_isolation reports the selected level per
+  session; the default is repeatable read. Every accepted isolation level uses the engine's
+  snapshot level (lowering refuses SERIALIZABLE); DEFERRABLE has no execution effect.
+  SET outside a transaction changes nothing; the wire has no PostgreSQL warning notices.
+- Effective row locks and ordered duplicate SET mode instructions await reviewed B6 public
+  `rowLocking` and `modeItems` metadata. Owner checks consume those interfaces without parsing
+  SQL; interface tests run now. Real-SQL generators remain explicitly pending in the R21
+  registry (`testing/divergences.ts`, `testing/owner-lowering-pending.test.ts`), because the
+  pinned lowerer discards locking clauses and exposes only the final modes. Until that
+  dependency lands, READ ONLY locking reads and order-sensitive SET are known gaps.
+- The hidden-flush browser control terminates the worker before closing its tab. An ordinary
+  page close can flush through visibility or graceful step-down, so it cannot require data loss.
 - Tests: in process (`testing/owner-*.test.ts`, the election ones on in-memory Web Locks) and
   across real tabs in Chromium, Firefox and WebKit (`npm run test:browser:next-owner`), over real
   lowering and the stand-in executor and write path persisted in OPFS (IndexedDB where workers

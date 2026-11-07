@@ -1175,14 +1175,19 @@ export const OWNER_PRIVATE_PLAN_CACHE_STATES = [
   "private close",
 ] as const;
 
-/** Actual typed-mode transitions, data boundaries, savepoints and transaction cleanup. */
+/** PG per-attribute mode transitions, statement attempts, savepoints and transaction cleanup. */
 export const OWNER_TRANSACTION_MODE_STATES = [
   "read-only begin",
   "read-write begin",
   "read-only refusal",
-  "query boundary",
-  "modify boundary",
-  "ddl boundary",
+  "mode refusal",
+  "query work",
+  "modify work",
+  "ddl work",
+  "show work",
+  "constant snapshot",
+  "scan snapshot",
+  "point snapshot",
   "set read-only",
   "set read-write",
   "isolation metadata",
@@ -1194,4 +1199,57 @@ export const OWNER_TRANSACTION_MODE_STATES = [
   "release modes",
   "last read-only wins",
   "last read-write wins",
+  "write prefix retained",
+  "rollback snapshot boundary",
+  "failed write snapshot",
+] as const;
+
+/** Sequence effects are checked when executed; session reads and unexecuted calls stay allowed. */
+export const OWNER_SEQUENCE_EFFECT_STATES = [
+  "currval",
+  "nonexecuted inverse parameter",
+  "nextval",
+  "nonexecuted filter",
+  "nonexecuted case",
+  "executed case",
+  "nonexecuted parameter",
+  "executed parameter",
+  "read-only effects",
+  "read-write effects",
+  "savepoint effects",
+  "prepared effects",
+  "direct effects",
+  "sequence metadata",
+] as const;
+
+/** Pending B6 metadata integration: declared targets only; owner reach is not claimed until enabled. */
+export const OWNER_PENDING_LOCK_STATES = [
+  "direct",
+  "point",
+  "empty",
+  "nested",
+  "nested-body",
+  "view",
+  "view-body",
+  "cte-body",
+  "cte-reference",
+  "constants",
+  "UPDATE",
+  "NO KEY UPDATE",
+  "SHARE",
+  "KEY SHARE",
+] as const;
+export const OWNER_PENDING_ORDER_STATES = [
+  "BEGIN",
+  "START TRANSACTION",
+  "SET TRANSACTION",
+  "readOnly then readWrite",
+  "readWrite then readOnly",
+  "root SET",
+  "one savepoint SET",
+  "nested savepoint SET",
+  "read-only SET entry",
+  "read-write SET entry",
+  "readOnly then readWrite under writable savepoint",
+  "readWrite then readOnly under writable savepoint",
 ] as const;

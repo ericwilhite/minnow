@@ -10,7 +10,8 @@
  *   lowering's `MemoryCatalog`, replayed from the catalog changes lowering produced.
  * - `StandinExecutor` implements B4's `Executor` by interpreting the plans lowering produces, for
  *   the subset the owner's tests use: `values`, `scan`, `keyLookup`, `project`, `filter`, and
- *   `modify` insert/update/delete with RETURNING; comparisons, AND/OR/NOT, IS NULL, casts,
+ *   `modify` insert/update/delete with RETURNING; comparisons, DISTINCT FROM, lazy CASE,
+ *   AND/OR/NOT, IS NULL, casts,
  *   arithmetic with PostgreSQL's errors, `nextval`/`currval`/`lastval`. Anything else is
  *   `UnsupportedPlanError`. Frames go through B4's real `ResultChannel` (window, releases,
  *   cancellation), with the RETURNING spool and the result grant as B4's contract states.
@@ -982,6 +983,24 @@ export interface StandinExecutorOptions {
   readonly rowsPerFrame?: number;
 }
 
+/** Potential use in public IR, including unexecuted branches, as PreparedPlan requires. */
+function planUsesSequences(value: unknown, seen = new Set<object>()): boolean {
+  if (typeof value !== "object" || value === null || ArrayBuffer.isView(value) || seen.has(value))
+    return false;
+  seen.add(value);
+  if (Array.isArray(value)) return value.some((item: unknown) => planUsesSequences(item, seen));
+  const node = value as Record<string, unknown>;
+  if (
+    node.op === "call" &&
+    (node.fn === "nextval" ||
+      node.fn === "setval" ||
+      node.fn === "currval" ||
+      node.fn === "lastval")
+  )
+    return true;
+  return Object.values(node).some((item) => planUsesSequences(item, seen));
+}
+
 export class StandinExecutor implements Executor {
   prepared = 0;
   readonly #rowsPerFrame: number | null;
@@ -1031,7 +1050,7 @@ export class StandinExecutor implements Executor {
       plan,
       columns: program.columns,
       kind: program.kind,
-      usesSequences: false,
+      usesSequences: planUsesSequences(plan),
       bind: (values, grant) => bindParameters(plan, values, grant),
       execute: (request) => {
         if (request.parameters.length !== plan.placeholderCount)
@@ -1227,6 +1246,13 @@ function evaluate(expr: ScalarExpr, row: Tuple, context: Context): Value {
       }
       return unknown ? null : expr.op === "and";
     }
+    case "distinctFrom": {
+      const left = evaluate(expr.left, row, context);
+      const right = evaluate(expr.right, row, context);
+      const distinct =
+        left === null ? right !== null : right === null || compareValues(left, right) !== 0;
+      return expr.negated ? !distinct : distinct;
+    }
     case "not": {
       const value = evaluate(expr.arg, row, context);
       return value === null ? null : !value;
@@ -1235,6 +1261,11 @@ function evaluate(expr: ScalarExpr, row: Tuple, context: Context): Value {
       const isNull = evaluate(expr.arg, row, context) === null;
       return expr.negated ? !isNull : isNull;
     }
+    case "case":
+      for (const branch of expr.branches)
+        if (evaluate(branch.when, row, context) === true)
+          return evaluate(branch.then, row, context);
+      return expr.otherwise === null ? null : evaluate(expr.otherwise, row, context);
     case "call":
       return call(
         expr.fn,

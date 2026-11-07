@@ -7,7 +7,7 @@
  * ## What a statement does, by kind and session state
  * | Statement         | Autocommit (session idle)                                  | Inside a transaction                         |
  * | ----------------- | ---------------------------------------------------------- | -------------------------------------------- |
- * | query             | pin a read snapshot, execute, release after `executed`      | read-write: a statement view; read-only: the transaction's pin |
+ * | query             | pin a read snapshot, execute, release after `executed`      | a retained write transaction's statement view; otherwise the read-only pin |
  * | modify            | begin (writer slot) → statement → execute (`atCommit`) → `executed` → `commit()` → durable (strict) → `acknowledgeCommit()` | statement → execute (`atExecuted`) |
  * | ddl               | begin → statement → `changeCatalog` → `end` → follow-up → commit | statement → `changeCatalog` → `end`   |
  * | BEGIN / COMMIT / ROLLBACK / SAVEPOINT … | session transaction state (below)    |                                              |
@@ -37,7 +37,12 @@
 import type { CatalogView } from "../access/catalog.js";
 import type { Statement, TableRules } from "../access/modify.js";
 import type { Snapshot } from "../access/snapshot.js";
-import type { Savepoint, WritePath, WriteTransaction } from "../access/write-path.js";
+import type {
+  Savepoint,
+  SequenceAccess,
+  WritePath,
+  WriteTransaction,
+} from "../access/write-path.js";
 import {
   EXECUTOR_COSTS,
   type Execution,
@@ -63,6 +68,13 @@ import { ReturnPool } from "../exec/return-pool.js";
 import type { SpillService } from "../spill/contract.js";
 import { PG_EPOCH_UNIX_MICROS } from "../temporal.js";
 import type { TransactionModes } from "../lower/lowerer.js";
+import {
+  changedTransactionModes,
+  guardedSequences,
+  type AppliedTransactionModes,
+  type EffectiveRowLocking,
+  type OrderedTransactionModes,
+} from "./transaction-modes.js";
 import { RuleCache } from "./rule-cache.js";
 import { PlanCache } from "./plan-cache.js";
 import type {
@@ -81,7 +93,6 @@ import {
   ReadOnlyTransactionError,
   SequenceStateError,
   TransactionIdleTimeoutError,
-  TransactionModeError,
 } from "./errors.js";
 import type { WireInputColumn } from "./frame.js";
 import type { OwnerLedger } from "./outcomes.js";
@@ -126,9 +137,6 @@ export interface ComposeOptions {
   readonly transactionIdleTimeoutMs?: number;
 }
 
-type AppliedTransactionModes = {
-  readonly [K in keyof TransactionModes]: NonNullable<TransactionModes[K]>;
-};
 const DEFAULT_TRANSACTION_MODES: AppliedTransactionModes = {
   readOnly: false,
   isolation: "repeatable read",
@@ -554,21 +562,25 @@ class ComposedSession implements EngineSession {
   readonly #engine: ComposedEngine;
   #state: TransactionState = "idle";
   #modes: AppliedTransactionModes = { ...DEFAULT_TRANSACTION_MODES };
-  #startedStatement = false;
+  #snapshotTaken = false;
+  #hasWrites = false;
+  readonly #sequenceAccess: SequenceAccess;
   #tx: WriteTransaction | null = null;
   #readPin: Snapshot | null = null;
   #startedAtMs: number | null = null;
   #lastCommitLsn: number | null = null;
   /**
    * Savepoints, oldest first. Names may repeat: the newest shadows older ones, and RELEASE or
-   * ROLLBACK TO name the newest (PostgreSQL). A read-only transaction's entries carry no write
-   * path savepoint. Each keeps the transaction's counts at that point.
+   * ROLLBACK TO name the newest (PostgreSQL). A pinned read-only transaction's entries carry
+   * no write-path savepoint; a transaction retaining earlier writes keeps its tokens. Each
+   * entry keeps its access modes, write-prefix flag and counts.
    */
   #savepoints: Array<{
     readonly name: string;
     readonly savepoint: Savepoint | null;
     readonly modes: AppliedTransactionModes;
     readonly counts: Readonly<Record<string, number>>;
+    readonly hasWrites: boolean;
   }> = [];
   /**
    * Plans against this transaction's own schema changes (uncommitted DDL): private to the
@@ -582,6 +594,7 @@ class ComposedSession implements EngineSession {
 
   constructor(engine: ComposedEngine, generation: number, sessionId: string) {
     this.#engine = engine;
+    this.#sequenceAccess = guardedSequences(engine.writePath.sequences, () => this.#modes.readOnly);
     this.ledgerSession = { sessionId, generation };
   }
 
@@ -669,7 +682,7 @@ class ComposedSession implements EngineSession {
       governor: options.governor,
       spill: options.spill,
       queryId: this.#engine.nextQueryId(),
-      sequences: options.writePath.sequences,
+      sequences: this.#sequenceAccess,
       sequenceSession: this.sequences,
       signal: context.signal,
       resultWindowBytes: context.windowBytes,
@@ -686,7 +699,8 @@ class ComposedSession implements EngineSession {
     this.#readPin?.release();
     this.#readPin = null;
     this.#modes = { ...DEFAULT_TRANSACTION_MODES };
-    this.#startedStatement = false;
+    this.#snapshotTaken = false;
+    this.#hasWrites = false;
     this.#startedAtMs = null;
     this.#savepoints = [];
     this.#privatePlans?.clear();
@@ -704,6 +718,21 @@ class ComposedSession implements EngineSession {
     if (this.#state === "failed" && !ends) return new InFailedTransactionError();
     if (this.#state === "timedOut" && !ends)
       return new TransactionIdleTimeoutError(this.#engine.options.transactionIdleTimeoutMs ?? 0);
+    // A query/data attempt takes the snapshot even when its effect is refused. ROLLBACK TO
+    // restores access modes, never this transaction-wide boundary (PostgreSQL).
+    if (
+      this.#state === "open" &&
+      (lowered.kind === "query" || lowered.kind === "modify" || lowered.kind === "ddl")
+    )
+      this.#snapshotTaken = true;
+    const locking = (lowered as LoweredStatement & EffectiveRowLocking).rowLocking;
+    if (
+      this.#modes.readOnly &&
+      lowered.kind === "query" &&
+      locking !== undefined &&
+      locking !== "none"
+    )
+      return new ReadOnlyTransactionError(`SELECT FOR ${locking}`);
     if (this.#modes.readOnly && (lowered.kind === "modify" || lowered.kind === "ddl"))
       return new ReadOnlyTransactionError(lowered.command);
     return null;
@@ -726,9 +755,16 @@ class ComposedSession implements EngineSession {
   ): SyncRun | { readonly continued: Run } | null {
     const lowered = statement.lowered;
     if (lowered.kind !== "query" || !lowered.pointRead) return null;
+    const refused = this.#guard(statement);
+    if (refused !== null) {
+      this.fail();
+      throw refused;
+    }
+    // READ ONLY may follow earlier writes. Their transaction view preserves the prefix;
+    // that path cannot use a standalone snapshot or the synchronous point-read shortcut.
+    if (this.#tx !== null) return null;
     const inReadOnly = this.#state === "open" && this.#modes.readOnly;
     if (this.#state !== "idle" && !inReadOnly) return null;
-    if (inReadOnly) this.#startedStatement = true;
     const pin = inReadOnly ? this.#transactionPin() : this.#writePath().pin(this.#pinOptions());
     const releasePin = () => {
       if (!inReadOnly) pin.release();
@@ -744,6 +780,7 @@ class ComposedSession implements EngineSession {
       );
     } catch (error) {
       releasePin();
+      if (inReadOnly) this.fail();
       throw error;
     }
     const summary = execution.summary;
@@ -771,7 +808,7 @@ class ComposedSession implements EngineSession {
       counts: null,
       lsn: null,
     }));
-    run.done = done.finally(releasePin);
+    run.done = (inReadOnly ? this.#abortOnFailure(done) : done).finally(releasePin);
     return { continued: run };
   }
 
@@ -796,11 +833,8 @@ class ComposedSession implements EngineSession {
     const refused = this.#guard(statement);
     if (refused !== null) return failedRun(refused);
     const lowered = statement.lowered;
-    if (
-      this.#state === "open" &&
-      (lowered.kind === "query" || lowered.kind === "modify" || lowered.kind === "ddl")
-    )
-      this.#startedStatement = true;
+    if (this.#state === "open" && (lowered.kind === "modify" || lowered.kind === "ddl"))
+      this.#hasWrites = true;
     switch (lowered.kind) {
       case "query":
         return this.#query(lowered, boundParameters(statement, params), context);
@@ -1113,12 +1147,15 @@ class ComposedSession implements EngineSession {
     switch (lowered.action) {
       case "begin": {
         if (this.#state !== "idle") return done(lowered.command); // PostgreSQL: a warning only
-        const begun = this.begin(lowered.modes.readOnly ?? false, context.signal).then(() => {
-          this.#modes = {
-            readOnly: this.#modes.readOnly,
-            isolation: lowered.modes.isolation ?? DEFAULT_TRANSACTION_MODES.isolation,
-            deferrable: lowered.modes.deferrable ?? DEFAULT_TRANSACTION_MODES.deferrable,
-          };
+        const modes = changedTransactionModes(
+          DEFAULT_TRANSACTION_MODES,
+          lowered.modes,
+          (lowered as typeof lowered & OrderedTransactionModes).modeItems,
+          false,
+          false,
+        );
+        const begun = this.begin(modes.readOnly, context.signal).then(() => {
+          this.#modes = modes;
           return {
             command: lowered.command,
             rowCount: null,
@@ -1140,6 +1177,7 @@ class ComposedSession implements EngineSession {
           savepoint: this.#tx?.savepoint() ?? null,
           modes: { ...this.#modes },
           counts: { ...this.#txCounts },
+          hasWrites: this.#hasWrites,
         });
         return done(lowered.command);
       }
@@ -1160,6 +1198,7 @@ class ComposedSession implements EngineSession {
           if (entry.savepoint !== null) this.#tx?.rollbackTo(entry.savepoint);
           this.#savepoints.length = index + 1;
           this.#txCounts = { ...entry.counts };
+          this.#hasWrites = entry.hasWrites;
           this.#privatePlans?.clear();
           this.#txRules?.clear();
           if (this.#state === "failed") this.#state = "open";
@@ -1176,8 +1215,19 @@ class ComposedSession implements EngineSession {
       case "setTransaction": {
         // Outside BEGIN this has no effect (PostgreSQL warns; this wire has no notices).
         if (this.#state === "idle") return done(lowered.command);
-        if (this.#startedStatement) return failedRun(new TransactionModeError());
-        const changed = this.#applyModes(lowered.modes, context.signal).then(() => ({
+        let modes: AppliedTransactionModes;
+        try {
+          modes = changedTransactionModes(
+            this.#modes,
+            lowered.modes,
+            (lowered as typeof lowered & OrderedTransactionModes).modeItems,
+            this.#snapshotTaken,
+            this.#savepoints.length > 0,
+          );
+        } catch (error) {
+          return failedRun(error);
+        }
+        const changed = this.#applyModes(modes, context.signal).then(() => ({
           command: lowered.command,
           rowCount: null,
           counts: null,
@@ -1192,13 +1242,13 @@ class ComposedSession implements EngineSession {
   async #applyModes(modes: TransactionModes, signal: AbortSignal): Promise<void> {
     const readOnly = modes.readOnly ?? this.#modes.readOnly;
     if (readOnly !== this.#modes.readOnly) {
-      if (readOnly) {
+      if (readOnly && !this.#hasWrites) {
         const pin = this.#writePath().pin(this.#pinOptions());
         this.#tx?.rollback();
         this.#tx = null;
         this.#readPin = pin;
         this.#savepoints = this.#savepoints.map((entry) => ({ ...entry, savepoint: null }));
-      } else {
+      } else if (!readOnly && this.#tx === null) {
         const tx = await this.#writePath().begin({ signal });
         this.#tx = tx;
         this.#readPin?.release();
@@ -1247,7 +1297,8 @@ class ComposedSession implements EngineSession {
       this.#tx = await this.#writePath().begin({ signal });
     }
     this.#modes = { ...DEFAULT_TRANSACTION_MODES, readOnly };
-    this.#startedStatement = false;
+    this.#snapshotTaken = false;
+    this.#hasWrites = false;
     this.#startedAtMs = this.#engine.now();
     this.#state = "open";
   }

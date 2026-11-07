@@ -535,3 +535,35 @@ test("literal families and typed transaction modes cross real owner ports", asyn
     await call(a, "query", "UPDATE t SET v = $1 WHERE id = 2 RETURNING id, v", ["updated"]),
   ).toMatchObject({ rows: [[2, "updated"]] });
 });
+
+test("read-only transitions retain earlier writes and obey savepoint restrictions", async ({
+  page,
+}) => {
+  const name = dbName("mode-transitions");
+  const a = await tab(page);
+  await call(a, "wipe", name);
+  await call(a, "open", name);
+  await call(a, "query", "CREATE TABLE t (id INTEGER PRIMARY KEY)");
+  await call(a, "query", "BEGIN", [], 1);
+  await call(a, "query", "INSERT INTO t VALUES (1)", [], 1);
+  expect(await call(a, "query", "SET TRANSACTION READ ONLY", [], 1)).toMatchObject({
+    summary: { transaction: "open" },
+  });
+  expect(await call(a, "query", "SELECT id FROM t WHERE id = 1", [], 1)).toMatchObject({
+    rows: [[1]],
+  });
+  await call(a, "query", "COMMIT", [], 1);
+  expect(await call(a, "query", "SELECT id FROM t")).toMatchObject({ rows: [[1]] });
+  await call(a, "query", "BEGIN READ ONLY", [], 1);
+  await call(a, "query", "SAVEPOINT s", [], 1);
+  expect(await call(a, "query", "SET TRANSACTION READ WRITE", [], 1)).toMatchObject({
+    error: "TransactionModeError",
+  });
+  await call(a, "query", "ROLLBACK", [], 1);
+  await call(a, "query", "BEGIN", [], 1);
+  await call(a, "query", "SELECT 1", [], 1);
+  expect(await call(a, "query", "SET TRANSACTION READ ONLY", [], 1)).toMatchObject({
+    summary: { transaction: "open" },
+  });
+  await call(a, "query", "ROLLBACK", [], 1);
+});
