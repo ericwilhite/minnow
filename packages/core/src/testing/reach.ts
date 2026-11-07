@@ -709,3 +709,22 @@ export const TERMINAL_BATCH_REACH = [
   "exact received values",
   "small credit cap",
 ] as const;
+
+/** Frozen rejected packed-frame diagnostic: native bytes, dictionaries, malformed views and cleanup. */
+export const PACKED_FRAME_REACH = [
+  "all valid",
+  "sparse NULLs",
+  "large varlen",
+  "dictionary delta",
+  "dictionary append",
+  "one fresh buffer",
+  "foreign",
+  "overlap",
+  "misaligned",
+  "out of bounds",
+  "wrong type",
+  "short lane",
+  "complete",
+  "abort",
+  "cancel",
+] as const;

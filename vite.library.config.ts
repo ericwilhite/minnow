@@ -1,3 +1,4 @@
+import { packedExperiment } from "./scripts/browser-perf/packed-experiment.js";
 import { executorSnapshot } from "./scripts/browser-perf/executor-comparison.js";
 // eslint-disable-next-line no-restricted-imports -- Node-only benchmark compiler; never shipped.
 import { execFileSync } from "node:child_process";
@@ -29,6 +30,12 @@ const isolatedPages: Plugin = {
   },
 };
 
+if (
+  process.env.MINNOW_EXPORT_PACKED_EXPERIMENT === "1" &&
+  process.env.MINNOW_NEXT_EXPORT_BENCH !== "1"
+)
+  throw new Error("Rejected packed snapshot requires the explicit export bench opt-in");
+
 const exportBaselineRevision = process.env.MINNOW_EXPORT_BASELINE_COMMIT ?? "18548e34";
 const exportBaseline =
   process.env.MINNOW_EXPORT_COMPARE_STREAM === "1"
@@ -42,6 +49,7 @@ const exportBaseline =
 export default defineConfig({
   plugins: [
     isolatedPages,
+    ...(process.env.MINNOW_EXPORT_PACKED_EXPERIMENT === "1" ? [packedExperiment().vite] : []),
     ...(process.env.MINNOW_EXPORT_EXECUTOR_REFERENCE
       ? [executorSnapshot(process.env.MINNOW_EXPORT_EXECUTOR_REFERENCE).vite]
       : []),

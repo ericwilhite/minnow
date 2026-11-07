@@ -1,0 +1,1523 @@
+diff --git a/packages/core/src/next/exec/frame-memory.ts b/packages/core/src/next/exec/frame-memory.ts
+new file mode 100644
+index 00000000..443138da
+--- /dev/null
++++ b/packages/core/src/next/exec/frame-memory.ts
+@@ -0,0 +1,55 @@
++/** Reserve both raw frame buffers and their packed destination before either allocation. One
++ * progress loan therefore covers a bounded copy/pack step; sealing never asks for another loan.
++ * The dedicated source's existing reclassification reservation pays for its packed copy instead.
++ */
++import { bigintBytes, type Grant } from "../memory/governor.js";
++import { frameFlats, type UnnumberedPayload } from "../vector/frame.js";
++import { packedFrameBytes, packFrame } from "../vector/pack-frame.js";
++export class FrameMemory {
++  #used = 0;
++  #packed = false;
++  #closed = false;
++  #padded = false;
++  constructor(
++    readonly grant: Grant,
++    readonly padding: number,
++  ) {}
++  allocate(n: number): boolean {
++    return this.reserve(2 * n);
++  }
++  free(n: number): void {
++    if (this.#packed || this.#closed) return;
++    this.#used -= 2 * n;
++    this.grant.free(2 * n);
++  }
++  reserve(n: number): boolean {
++    if (!this.grant.allocate(n)) return false;
++    this.#used += n;
++    return true;
++  }
++  prepayPadding(): boolean {
++    if (this.#padded) return true;
++    return (this.#padded = this.reserve(this.padding));
++  }
++  pack(payload: UnnumberedPayload, closeRaw: () => void): UnnumberedPayload {
++    const bytes = packedFrameBytes(payload);
++    let wide = 0;
++    for (const flat of frameFlats(payload))
++      if (flat.data.layout === "decimal" && flat.data.coefficients.repr === "wide")
++        for (const value of flat.data.coefficients.values) wide += bigintBytes(value);
++    if (bytes + wide > this.#used)
++      throw new Error("Packed buffer was not reserved before allocation");
++    const packed = packFrame(payload, new ArrayBuffer(bytes));
++    this.#packed = true;
++    closeRaw();
++    this.grant.free(this.#used - bytes - wide);
++    this.#used = bytes + wide;
++    return packed;
++  }
++  close(): void {
++    if (this.#closed) return;
++    this.#closed = true;
++    this.grant.free(this.#used);
++    this.#used = 0;
++  }
++}
+diff --git a/packages/core/src/next/exec/result-dictionaries.ts b/packages/core/src/next/exec/result-dictionaries.ts
+index d3b2276a..e5ca6bc5 100644
+--- a/packages/core/src/next/exec/result-dictionaries.ts
++++ b/packages/core/src/next/exec/result-dictionaries.ts
+@@ -1,5 +1,6 @@
+ /** Per-stream UTF-8 dictionary identities. Only scalar ids survive input readiness. */
+ import { OBJECT_OVERHEAD_BYTES, type Grant } from "../memory/governor.js";
++import type { ByteCharge } from "../vector/varlen.js";
+ import type { PhysicalType } from "../types.js";
+ import type { FlatVector, Vector } from "../vector/vector.js";
+ import { STREAM_DICTIONARY_BYTES, type DictionaryDelta, type WireVector } from "./result.js";
+@@ -83,9 +84,9 @@ export class ResultDictionaries {
+     return plan.fresh.reduce((n, e) => n + (this.#ids.has(e.source) ? 0 : e.bytes), 0);
+   }
+ 
+-  stage(plan: DictionaryPlan, frame: DictionaryFrame): boolean {
++  stage(plan: DictionaryPlan, frame: DictionaryFrame, memory: ByteCharge = this.grant): boolean {
+     const needed = this.needed(plan);
+-    if (!this.grant.allocate(needed)) return false;
++    if (!memory.allocate(needed)) return false;
+     // Set charges before allocation, so the caller's failure cleanup covers a thrown copy.
+     frame.extraBytes = needed;
+     for (const entry of plan.fresh) {
+diff --git a/packages/core/src/next/exec/result-sink.ts b/packages/core/src/next/exec/result-sink.ts
+index afe95e95..21fab67b 100644
+--- a/packages/core/src/next/exec/result-sink.ts
++++ b/packages/core/src/next/exec/result-sink.ts
+@@ -9,6 +9,8 @@ import {
+   type DictionaryFrame,
+ } from "./result-dictionaries.js";
+ import { ownedResultColumns } from "./result-owned.js";
++import { FrameMemory } from "./frame-memory.js";
++import { packedFrameBytes } from "../vector/pack-frame.js";
+ import { ColumnStore } from "./column-store.js";
+ import { slotOf, validAt } from "./kernels/vectors.js";
+ import {
+@@ -23,7 +25,6 @@ import {
+   type Transfer,
+ } from "./pipeline.js";
+ import {
+-  frameByteLength,
+   frameTransferList,
+   RESULT_FRAME_TARGET_BYTES,
+   ResultChannel,
+@@ -31,6 +32,7 @@ import {
+ } from "./result.js";
+ 
+ interface FrameStore extends DictionaryFrame {
++  readonly memory: FrameMemory;
+   readonly store: ColumnStore;
+   columns: WireVector[] | null;
+   metadata: boolean;
+@@ -57,6 +59,7 @@ export class ResultSink implements Operator {
+   readonly #frames = new Set<FrameStore>();
+   readonly #metadataBytes: number;
+   readonly #rowsPerFrame: number;
++  readonly #padding: number;
+   #target: number;
+   #batch: Batch | null = null;
+   #transfer: Transfer | null = null;
+@@ -79,6 +82,7 @@ export class ResultSink implements Operator {
+     this.#clock = clockFor(options.now);
+     if (this.#maxRows !== null && (!Number.isSafeInteger(this.#maxRows) || this.#maxRows <= 0))
+       throw new TypeError("positive result frame row limit required");
++    this.#padding = 8 * (12 * types.length + 4);
+     this.#metadataBytes = OBJECT_OVERHEAD_BYTES * (3 + 2 * types.length);
+     this.#target = Math.min(RESULT_FRAME_TARGET_BYTES, channel.windowBytes);
+     let rows = 1;
+@@ -105,7 +109,7 @@ export class ResultSink implements Operator {
+     if (this.#batch !== null || this.#rows !== 0 || this.#frames.size !== 0)
+       throw new TypeError("Terminal batch target must precede input");
+     this.#target = Math.max(this.#target, Math.min(bytes, this.channel.windowBytes));
+-    return this.#target;
++    return Math.max(1, this.#target - this.#padding);
+   }
+ 
+   /** Stable per-stream admission used by a direct terminal source before output reservation. */
+@@ -190,7 +194,7 @@ export class ResultSink implements Operator {
+           this.#check();
+         }
+         frame.loan = loan;
+-        if (!this.grant.allocate(this.#metadataBytes))
++        if (!frame.memory.prepayPadding() || !this.grant.allocate(this.#metadataBytes))
+           throw new Error("result metadata reservation failed");
+         frame.metadata = true;
+         this.#pending = null;
+@@ -235,18 +239,20 @@ export class ResultSink implements Operator {
+   }
+ 
+   #make(rows: number, types = this.#dictionaryPlan?.types ?? this.types): FrameStore {
++    const memory = new FrameMemory(this.grant, this.#padding);
+     const frame: FrameStore = {
+-      store: new ColumnStore(types, this.grant, {
++      memory,
++      store: new ColumnStore(types, memory, {
+         chunkRows: rows,
+         varlenBytes: 64,
+         // ColumnStore permits one oversized row even with a finite target. Keeping that
+         // target makes its arena grow to the actual need, rather than doubling past reserve.
+-        targetBytes: this.#target,
++        targetBytes: Math.max(1, this.#target - this.#padding),
+       }),
+       columns: null,
+       dictionaries: [],
+       extraBytes: 0,
+-      metadata: this.grant.allocate(this.#metadataBytes),
++      metadata: memory.prepayPadding() && this.grant.allocate(this.#metadataBytes),
+       loan: null,
+       freed: false,
+       returned: null,
+@@ -262,7 +268,8 @@ export class ResultSink implements Operator {
+     this.#frames.delete(frame);
+     // close() uses retainedBytes, so it remains correct after transfer detached the buffers.
+     frame.store.close();
+-    this.grant.free(frame.extraBytes);
++    frame.memory.free(frame.extraBytes);
++    frame.memory.close();
+     if (frame.metadata) this.grant.free(this.#metadataBytes);
+     if (frame.loan !== null && this.grant.loaned > 0) frame.loan.repay();
+     frame.returned?.();
+@@ -283,7 +290,10 @@ export class ResultSink implements Operator {
+         });
+       if (this.#dictionaryPlan !== null) this.#dictionaries.publish(this.#dictionaryPlan, frame);
+       return this.channel.offer({
+-        payload: { rowCount: rows, columns, dictionaries: frame.dictionaries },
++        payload: frame.memory.pack(
++          { rowCount: rows, columns, dictionaries: frame.dictionaries },
++          () => frame.store.close(),
++        ),
+         requiresLsn: this.requiresLsn,
+         free: () => this.#free(frame),
+       });
+@@ -307,7 +317,7 @@ export class ResultSink implements Operator {
+     try {
+       if (
+         !frame.metadata ||
+-        !this.#dictionaries.stage(plan, frame) ||
++        !this.#dictionaries.stage(plan, frame, frame.memory) ||
+         (copies.length > 0 && frame.store.append(copies, null, 0, batch.length) !== batch.length)
+       ) {
+         this.#free(frame);
+@@ -319,7 +329,7 @@ export class ResultSink implements Operator {
+         const { form, length, validity, data } = frame.store.chunk(copied++, 0);
+         return this.#dictionaries.wire(plan, { form, length, validity, data }, c);
+       });
+-      const bytes = frameByteLength({
++      const bytes = packedFrameBytes({
+         rowCount: batch.length,
+         columns: frame.columns,
+         dictionaries: frame.dictionaries,
+@@ -336,11 +346,11 @@ export class ResultSink implements Operator {
+         columns: columns.filter((column): column is WireVector => column !== null),
+         dictionaries: [],
+       }).reduce((sum, buffer) => sum + buffer.byteLength, 0);
+-      if (!this.grant.allocate(adoptedBytes)) {
++      if (!frame.memory.reserve(adoptedBytes)) {
+         this.#free(frame);
+         return null;
+       }
+-      frame.extraBytes += adoptedBytes;
++
+       this.#at = batch.length;
+       this.#rows += batch.length;
+       const result = this.#offer(frame, batch.length);
+@@ -362,7 +372,8 @@ export class ResultSink implements Operator {
+     }
+     const input = this.#dictionaryPlan?.columns ?? batch.columns;
+     const stage = (frame: FrameStore) =>
+-      this.#dictionaryPlan === null || this.#dictionaries.stage(this.#dictionaryPlan, frame);
++      this.#dictionaryPlan === null ||
++      this.#dictionaries.stage(this.#dictionaryPlan, frame, frame.memory);
+     const count = batch.selection?.count ?? batch.length;
+     while (this.#at < count) {
+       this.#check();
+@@ -386,7 +397,8 @@ export class ResultSink implements Operator {
+       // unused capacity. Retry without advancing the borrowed selection. Only one row may
+       // exceed the target.
+       while (
+-        (copied === 0 || frame.store.retainedBytes + frame.extraBytes > this.#target) &&
++        (copied === 0 ||
++          frame.store.retainedBytes + frame.extraBytes > this.#target - this.#padding) &&
+         capacity > 1
+       ) {
+         const maximum = copied === 0 ? capacity / 2 : Math.min(capacity / 2, copied);
+@@ -408,12 +420,13 @@ export class ResultSink implements Operator {
+         this.#pending = frame;
+         const row = batch.selection?.rows[this.#at] ?? this.#at;
+         let needed =
+-          frame.store.appendNeed(input, row) + (frame.metadata ? 0 : this.#metadataBytes);
++          2 * frame.store.appendNeed(input, row) +
++          (frame.metadata ? 0 : this.#metadataBytes + this.#padding);
+         if (this.#dictionaryPlan !== null && frame.extraBytes === 0)
+-          needed += this.#dictionaries.needed(this.#dictionaryPlan);
++          needed += 2 * this.#dictionaries.needed(this.#dictionaryPlan);
+         // An empty store may not yet have observed numeric input tiers. Allow fixed-width
+         // promotions, and charge any wide decimal coefficient copied into its one row.
+-        needed += 32 * this.types.length;
++        needed += 64 * this.types.length;
+         for (const vector of batch.columns) {
+           const [source, slot] = slotOf(vector, row);
+           const data = source.data;
+@@ -422,7 +435,7 @@ export class ResultSink implements Operator {
+             data.layout === "decimal" &&
+             data.coefficients.repr === "wide"
+           )
+-            needed += bigintBytes(data.coefficients.values[slot] ?? 0n);
++            needed += 2 * bigintBytes(data.coefficients.values[slot] ?? 0n);
+         }
+         this.#wait(
+           this.grant.borrow(needed, this.#abort.signal).then((loan) => {
+@@ -432,7 +445,7 @@ export class ResultSink implements Operator {
+             }
+             frame.loan = loan;
+             if (!frame.metadata) {
+-              if (!this.grant.allocate(this.#metadataBytes))
++              if (!frame.memory.prepayPadding() || !this.grant.allocate(this.#metadataBytes))
+                 throw new Error("result metadata reservation failed");
+               frame.metadata = true;
+             }
+diff --git a/packages/core/src/next/exec/result.ts b/packages/core/src/next/exec/result.ts
+index 391f168a..8c0cfa36 100644
+--- a/packages/core/src/next/exec/result.ts
++++ b/packages/core/src/next/exec/result.ts
+@@ -69,7 +69,7 @@
+  */
+ import type { OutputColumn } from "../ir/ir.js";
+ import { bigintBytes } from "../memory/governor.js";
+-import { BATCH_TARGET_BYTES, type Validity, type VectorData } from "../vector/vector.js";
++import { BATCH_TARGET_BYTES } from "../vector/vector.js";
+ import { QueryCancelledError } from "./errors.js";
+ import type { PushResult } from "./pipeline.js";
+ 
+@@ -78,51 +78,18 @@ export const RESULT_FRAME_TARGET_BYTES = BATCH_TARGET_BYTES;
+ /** Default credit window: two frames, so the pipeline fills one while the other is in flight. */
+ export const RESULT_WINDOW_BYTES = 2 * RESULT_FRAME_TARGET_BYTES;
+ /** Most dictionary bytes one stream sends; later dictionary columns go out plain. */
+-export const STREAM_DICTIONARY_BYTES = 1024 * 1024;
++export { STREAM_DICTIONARY_BYTES } from "../vector/frame.js";
+ 
+-export interface WireFlat {
+-  readonly form: "flat";
+-  readonly length: number;
+-  /** Bit set = valid; null when every slot is valid. */
+-  readonly validity: Validity | null;
+-  readonly data: VectorData;
+-}
+-
+-export interface WireConstant {
+-  readonly form: "constant";
+-  readonly length: number;
+-  /** Length 1. */
+-  readonly value: WireFlat;
+-}
+-
+-export interface WireDictionary {
+-  readonly form: "dictionary";
+-  readonly length: number;
+-  /** Codes into stream dictionary `dictionary` (meaningful only where `validity` says valid). */
+-  readonly codes: Int32Array;
+-  readonly validity: Validity | null;
+-  readonly dictionary: number;
+-}
+-
+-export type WireVector = WireFlat | WireConstant | WireDictionary;
+-
+-/** Entries appended to stream dictionary `id` at index `from` (distinct, non-null). */
+-export interface DictionaryDelta {
+-  readonly id: number;
+-  readonly from: number;
+-  readonly values: WireFlat;
+-}
+-
+-/** Plain data: structured-clone safe, no functions. */
+-export interface FramePayload {
+-  /** 0, 1, 2… within the stream, so a protocol can detect a lost frame. */
+-  readonly sequence: number;
+-  readonly rowCount: number;
+-  /** One per output column, each `length === rowCount`. */
+-  readonly columns: readonly WireVector[];
+-  /** Dictionary entries first needed by this frame, applied before its columns are read. */
+-  readonly dictionaries: readonly DictionaryDelta[];
+-}
++export type {
++  WireFlat,
++  WireConstant,
++  WireDictionary,
++  WireVector,
++  DictionaryDelta,
++  FramePayload,
++} from "../vector/frame.js";
++export { FrameBufferError, frameTransferList } from "../vector/frame.js";
++import { frameTransferList, frameFlats, type FramePayload } from "../vector/frame.js";
+ 
+ export interface ResultFrame {
+   readonly payload: FramePayload;
+@@ -175,13 +142,6 @@ interface Waiter<T> {
+ }
+ 
+ /** Thrown when a payload would transfer bytes it does not own, or a shared buffer. */
+-export class FrameBufferError extends Error {
+-  readonly code = "MINNOW_FRAME_BUFFER";
+-  constructor(message: string) {
+-    super(message);
+-    this.name = "FrameBufferError";
+-  }
+-}
+ 
+ /**
+  * The credit window between the result sink (producer) and the owner (consumer): the production
+@@ -196,6 +156,7 @@ export class ResultChannel implements ResultStream {
+   #state: State = { kind: "open" };
+   #outstanding = 0;
+   #sequence = 0;
++  readonly #packedBuffers = new WeakSet<ArrayBuffer>();
+   #consumer: Waiter<ResultFrame | null> | null = null;
+   #producer: Waiter<void> | null = null;
+   readonly #settle: Waiter<void>;
+@@ -335,6 +296,11 @@ export class ResultChannel implements ResultStream {
+     let released = false;
+     const payload: FramePayload = { ...offer.payload, sequence: this.#sequence++ };
+     const byteLength = frameByteLength(payload);
++    if (payload.buffer) {
++      if (this.#packedBuffers.has(payload.buffer))
++        throw new Error("Packed buffer reused across frames");
++      this.#packedBuffers.add(payload.buffer);
++    }
+     return {
+       payload,
+       transfer: frameTransferList(payload),
+@@ -375,83 +341,6 @@ export class ResultChannel implements ResultStream {
+   }
+ }
+ 
+-type TypedArray =
+-  Uint8Array | Uint16Array | Uint32Array | Int32Array | Float32Array | Float64Array | BigInt64Array;
+-
+-function dataArrays(data: VectorData, into: TypedArray[]): void {
+-  switch (data.layout) {
+-    case "bool":
+-    case "i32":
+-    case "f64":
+-    case "f32":
+-      into.push(data.values);
+-      return;
+-    case "int64":
+-      into.push(data.values.values);
+-      return;
+-    case "decimal": {
+-      if (data.scales !== null) into.push(data.scales);
+-      if (data.specials !== null) into.push(data.specials);
+-      const coefficients = data.coefficients;
+-      if (coefficients.repr === "int128") into.push(coefficients.limbs);
+-      else if (coefficients.repr !== "wide") into.push(coefficients.values);
+-      return;
+-    }
+-    case "varlen":
+-      into.push(data.bytes, data.offsets);
+-      return;
+-    case "fixed16":
+-      into.push(data.bytes);
+-      return;
+-    case "interval":
+-      into.push(data.months, data.days, data.micros.values);
+-      return;
+-  }
+-}
+-
+-function flats(payload: UnnumberedPayload): WireFlat[] {
+-  const out: WireFlat[] = payload.dictionaries.map((delta) => delta.values);
+-  for (const column of payload.columns)
+-    if (column.form === "flat") out.push(column);
+-    else if (column.form === "constant") out.push(column.value);
+-  return out;
+-}
+-
+-function payloadArrays(payload: UnnumberedPayload): TypedArray[] {
+-  const arrays: TypedArray[] = [];
+-  for (const flat of flats(payload)) {
+-    dataArrays(flat.data, arrays);
+-    if (flat.validity !== null) arrays.push(flat.validity);
+-  }
+-  for (const column of payload.columns)
+-    if (column.form === "dictionary") {
+-      arrays.push(column.codes);
+-      if (column.validity !== null) arrays.push(column.validity);
+-    }
+-  return arrays;
+-}
+-
+-/**
+- * The distinct ArrayBuffers of a payload, for `postMessage`'s transfer list. Throws
+- * `FrameBufferError` if a view does not cover its whole buffer or the buffer is shared. Wide
+- * decimal coefficients (`bigint[]`) are structured-cloned, not transferred.
+- */
+-export function frameTransferList(payload: UnnumberedPayload): ArrayBuffer[] {
+-  const buffers = new Set<ArrayBuffer>();
+-  for (const view of payloadArrays(payload)) {
+-    const buffer = view.buffer;
+-    if (!(buffer instanceof ArrayBuffer))
+-      throw new FrameBufferError("Frame buffers must be ArrayBuffers, never SharedArrayBuffer");
+-    if (buffers.has(buffer)) continue;
+-    if (view.byteOffset !== 0 || view.byteLength !== buffer.byteLength)
+-      throw new FrameBufferError(
+-        `A frame view covers ${String(view.byteLength)} of its buffer's ${String(buffer.byteLength)} bytes`,
+-      );
+-    buffers.add(buffer);
+-  }
+-  return [...buffers];
+-}
+-
+ /**
+  * Bytes a payload occupies: each distinct buffer once, plus wide coefficients as the governor
+  * counts BigInts. The amount charged per frame.
+@@ -459,7 +348,7 @@ export function frameTransferList(payload: UnnumberedPayload): ArrayBuffer[] {
+ export function frameByteLength(payload: UnnumberedPayload): number {
+   let bytes = 0;
+   for (const buffer of frameTransferList(payload)) bytes += buffer.byteLength;
+-  for (const flat of flats(payload)) {
++  for (const flat of frameFlats(payload)) {
+     const data = flat.data;
+     if (data.layout === "decimal" && data.coefficients.repr === "wide")
+       for (const value of data.coefficients.values) bytes += bigintBytes(value);
+diff --git a/packages/core/src/next/owner/client.ts b/packages/core/src/next/owner/client.ts
+index 27b4fd28..36279039 100644
+--- a/packages/core/src/next/owner/client.ts
++++ b/packages/core/src/next/owner/client.ts
+@@ -845,7 +845,8 @@ export class ProtocolClient {
+         try {
+           for (const frame of message.frames) pending.dictionaries.apply(frame);
+         } catch (error) {
+-          // A frame out of order or a broken delta: fail this request, never the handler.
++          // Invalid native subviews, sequence or dictionary delta: fail this request, never
++          // publish a malformed frame to a cursor or buffered Result. apply() validates both formats.
+           this.cancel(message.seq);
+           this.#fail(pending, error instanceof Error ? error : new Error(String(error)));
+           return;
+diff --git a/packages/core/src/next/owner/frame.ts b/packages/core/src/next/owner/frame.ts
+index 60f84e37..d7bfaadc 100644
+--- a/packages/core/src/next/owner/frame.ts
++++ b/packages/core/src/next/owner/frame.ts
+@@ -28,6 +28,8 @@
+  * MiB (probe), paid once per write.
+  */
+ import type { DictionaryDelta, FramePayload, WireFlat } from "../exec/result.js";
++import { frameTransferList, STREAM_DICTIONARY_BYTES } from "../vector/frame.js";
++import { copyDictionary } from "../vector/pack-frame.js";
+ import type { WireValue } from "./protocol.js";
+ 
+ export type {
+@@ -66,15 +68,33 @@ export type WireInputColumn =
+ export class StreamDictionaries {
+   readonly #dictionaries = new Map<number, { size: number; readonly parts: WireFlat[] }>();
+   #nextSequence = 0;
++  readonly #packedBuffers = new WeakSet<ArrayBuffer>();
++  #bytes = 0;
+ 
+   /** Applies `payload.dictionaries`. Call once per frame, in sequence order, before reading it. */
+   apply(payload: FramePayload): void {
++    // The same precise native-view validator runs on send and receive.
++    frameTransferList(payload);
++    if (payload.buffer) {
++      if (this.#packedBuffers.has(payload.buffer))
++        throw new RangeError("Packed buffer reused across frames");
++      this.#packedBuffers.add(payload.buffer);
++    }
+     if (payload.sequence !== this.#nextSequence)
+       throw new RangeError(
+         `Frame ${String(payload.sequence)} arrived, expected ${String(this.#nextSequence)}`,
+       );
+     this.#nextSequence++;
+-    for (const delta of payload.dictionaries) this.#append(delta);
++    for (const delta of payload.dictionaries) {
++      const data = delta.values.data;
++      if (data.layout !== "varlen") throw new TypeError("Stream dictionary must contain UTF-8");
++      const bytes =
++        data.bytes.byteLength + data.offsets.byteLength + (delta.values.validity?.byteLength ?? 0);
++      if (this.#bytes + bytes > STREAM_DICTIONARY_BYTES)
++        throw new RangeError("Stream dictionary byte cap exceeded");
++      this.#bytes += bytes;
++      this.#append(payload.buffer ? { ...delta, values: copyDictionary(delta.values) } : delta);
++    }
+   }
+ 
+   #append(delta: DictionaryDelta): void {
+@@ -96,6 +116,11 @@ export class StreamDictionaries {
+     return this.#dictionaries.get(id)?.size ?? 0;
+   }
+ 
++  /** Immutable chunks, independent of packed frame lifetime. */
++  parts(id: number): readonly WireFlat[] {
++    return this.#dictionaries.get(id)?.parts ?? [];
++  }
++
+   /** The chunk holding `code`, and the code's index inside it. */
+   locate(id: number, code: number): { readonly entries: WireFlat; readonly index: number } {
+     let index = code;
+@@ -119,7 +144,8 @@ export class StreamDictionaries {
+ export const TRANSFER_MIN_BYTES = 1024;
+ 
+ /** The transfer list for frames whose buffers add up to `bytes`: empty below the threshold. */
+-export function transferFor(buffers: readonly ArrayBuffer[]): ArrayBuffer[] {
++export function transferFor(buffers: readonly ArrayBuffer[], packed = false): ArrayBuffer[] {
++  if (packed) return [...buffers];
+   let bytes = 0;
+   for (const buffer of buffers) bytes += buffer.byteLength;
+   return bytes < TRANSFER_MIN_BYTES ? [] : [...buffers];
+@@ -127,7 +153,7 @@ export function transferFor(buffers: readonly ArrayBuffer[]): ArrayBuffer[] {
+ 
+ /** Bytes a payload's typed arrays occupy (the client's estimate for release pacing). */
+ export function payloadBytes(payload: FramePayload): number {
+-  let bytes = 0;
++  let bytes = payload.buffer?.byteLength ?? 0;
+   const flat = (column: WireFlat) => {
+     bytes += column.validity?.byteLength ?? 0;
+     const data = column.data;
+@@ -158,6 +184,16 @@ export function payloadBytes(payload: FramePayload): number {
+         bytes += data.values.byteLength;
+     }
+   };
++  if (payload.buffer) {
++    // Native bytes are the one buffer, including alignment. Only wide JS coefficients clone.
++    for (const column of payload.columns) {
++      const flat =
++        column.form === "flat" ? column : column.form === "constant" ? column.value : null;
++      if (flat?.data.layout === "decimal" && flat.data.coefficients.repr === "wide")
++        bytes += flat.data.coefficients.values.length * 16;
++    }
++    return bytes;
++  }
+   for (const column of payload.columns) {
+     if (column.form === "flat") flat(column);
+     else if (column.form === "constant") flat(column.value);
+diff --git a/packages/core/src/next/owner/server.ts b/packages/core/src/next/owner/server.ts
+index c486a201..a36f116a 100644
+--- a/packages/core/src/next/owner/server.ts
++++ b/packages/core/src/next/owner/server.ts
+@@ -345,7 +345,16 @@ class Connection {
+   post(message: OwnerMessage, transfer: ArrayBuffer[] = []): void {
+     if (this.#state === "closed") return;
+     this.#lastPostAt = this.#server.now();
+-    this.#port.postMessage(message, transfer.length === 0 ? transfer : transferFor(transfer));
++    this.#port.postMessage(
++      message,
++      transfer.length === 0
++        ? transfer
++        : transferFor(
++            transfer,
++            (message.t === "rows" || message.t === "done") &&
++              message.frames.some((frame) => frame.buffer !== undefined),
++          ),
++    );
+   }
+ 
+   /**
+diff --git a/packages/core/src/next/testing/packed-frame.test.ts b/packages/core/src/next/testing/packed-frame.test.ts
+new file mode 100644
+index 00000000..a62b09c6
+--- /dev/null
++++ b/packages/core/src/next/testing/packed-frame.test.ts
+@@ -0,0 +1,257 @@
++import fc from "fast-check";
++import type { VectorData } from "../vector/vector.js";
++import { afterAll, expect, it } from "vitest";
++import { createReach, PACKED_FRAME_REACH, RESULT_OWNED_LAYOUT_REACH } from "../../testing/reach.js";
++import { seedsFor } from "../../testing/seeds.js";
++import {
++  FrameBufferError,
++  frameTransferList,
++  payloadArrays,
++  type FramePayload,
++} from "../vector/frame.js";
++import { packFrame, packedFrameBytes } from "../vector/pack-frame.js";
++import { StreamDictionaries, transferFor } from "../owner/frame.js";
++import { Governor } from "../memory/governor.js";
++import { ResultChannel } from "../exec/result.js";
++import { ResultSink } from "../exec/result-sink.js";
++import { packedInput } from "./packed-input.js";
++const reach = createReach("packed frames", PACKED_FRAME_REACH);
++afterAll(() => reach.assertReached());
++const bytes = (frame: FramePayload) =>
++  payloadArrays(frame).map((v) => new Uint8Array(v.buffer, v.byteOffset, v.byteLength).slice());
++for (const kind of [...RESULT_OWNED_LAYOUT_REACH, "decimal-wide"] as const)
++  for (const seed of seedsFor("packed-frame-bytes", [0xb2a0, 0xb2a1]))
++    it(`packed ${kind} is byte exact (${String(seed)})`, () => {
++      fc.assert(
++        fc.property(
++          fc.integer({ min: 33, max: 100 }),
++          fc.integer({ min: 1, max: 31 }),
++          fc.boolean(),
++          fc.boolean(),
++          (n, salt, sparse, large) => {
++            reach.beginHistory();
++            const column = packedInput(kind === "decimal-wide" ? "decimal-safe" : kind, n, salt);
++            if (!sparse) column.validity = null;
++            if (kind === "decimal-wide" && column.data.layout === "decimal")
++              (column as { data: VectorData }).data = {
++                ...column.data,
++                coefficients: {
++                  repr: "wide",
++                  values: Array.from({ length: n }, (_, r) => (1n << 5000n) + BigInt(r * salt)),
++                },
++              };
++            if (kind === "text" && large) {
++              const width = 65536 + salt;
++              (column as { data: VectorData }).data = {
++                layout: "varlen",
++                bytes: Uint8Array.from({ length: n * width }, (_, i) => (i + salt) % 251),
++                offsets: Int32Array.from({ length: n + 1 }, (_, r) => r * width),
++              };
++              reach.reach("large varlen");
++            }
++            const delta = {
++              form: "flat",
++              length: 2,
++              validity: null,
++              data: {
++                layout: "varlen",
++                bytes: new TextEncoder().encode("alphabeta"),
++                offsets: new Int32Array([0, 5, 9]),
++              },
++            } as const;
++            const original: FramePayload = {
++              sequence: 0,
++              rowCount: n,
++              columns: [
++                column,
++                {
++                  form: "dictionary",
++                  length: n,
++                  dictionary: 7,
++                  codes: Int32Array.from({ length: n }, (_, r) => r % 2),
++                  validity: column.validity?.slice() ?? null,
++                },
++              ],
++              dictionaries: [{ id: 7, from: 0, values: delta }],
++            };
++            const expected = bytes(original),
++              sourceBuffers = new Set(payloadArrays(original).map((v) => v.buffer));
++            const size = packedFrameBytes(original);
++            let charged = 0;
++            charged += size;
++            const packed = packFrame(original, new ArrayBuffer(size));
++            expect(charged).toBe(packed.buffer.byteLength);
++            expect(frameTransferList(packed)).toEqual([packed.buffer]);
++            expect(sourceBuffers.has(packed.buffer)).toBe(false);
++            // Borrowed native input can be overwritten immediately; only the new frame is transferred.
++            for (const array of payloadArrays(original))
++              new Uint8Array(array.buffer, array.byteOffset, array.byteLength).fill(0xcc);
++            const received = structuredClone(packed, {
++              transfer: transferFor([packed.buffer], true),
++            });
++            expect(packed.buffer.byteLength).toBe(0);
++            const actual = bytes(received);
++            expect(actual.length).toBe(expected.length);
++            for (let k = 0; k < actual.length; k++) {
++              const a = actual[k],
++                b = expected[k];
++              if (!a || !b) throw new Error("missing byte lane");
++              let same = a.length === b.length;
++              for (let j = 0; same && j < a.length; j++) same = a[j] === b[j];
++              if (!same) expect(a).toEqual(b);
++            }
++            const dictionaries = new StreamDictionaries();
++            dictionaries.apply(received);
++            const located = dictionaries.locate(7, 1);
++            expect(located.entries.data.layout).toBe("varlen");
++            for (const array of payloadArrays({
++              ...received,
++              columns: [],
++              dictionaries: received.dictionaries,
++            }))
++              expect(array.buffer).toBe(received.buffer);
++            const compact = dictionaries.parts(7)[0];
++            if (compact?.data.layout !== "varlen") throw new Error("dictionary fixture");
++            expect(compact.data.bytes.buffer).not.toBe(received.buffer);
++            expect(new TextDecoder().decode(compact.data.bytes)).toBe("alphabeta");
++            const appended: FramePayload = {
++              sequence: 1,
++              rowCount: 1,
++              columns: [
++                {
++                  form: "dictionary",
++                  length: 1,
++                  dictionary: 7,
++                  codes: new Int32Array([2]),
++                  validity: null,
++                },
++              ],
++              dictionaries: [
++                {
++                  id: 7,
++                  from: 2,
++                  values: {
++                    form: "flat",
++                    length: 1,
++                    validity: null,
++                    data: {
++                      layout: "varlen",
++                      bytes: new TextEncoder().encode("gamma"),
++                      offsets: new Int32Array([0, 5]),
++                    },
++                  },
++                },
++              ],
++            };
++            const next = packFrame(appended, new ArrayBuffer(packedFrameBytes(appended)));
++            dictionaries.apply(next);
++            expect(dictionaries.size(7)).toBe(3);
++            expect(dictionaries.locate(7, 2).index).toBe(0);
++            reach.reach("dictionary append");
++            reach.reach("dictionary delta");
++            reach.reach("one fresh buffer");
++            reach.reach(sparse ? "sparse NULLs" : "all valid");
++            charged -= size;
++            expect(charged).toBe(0);
++          },
++        ),
++        { seed, numRuns: 8 },
++      );
++    });
++for (const shape of [
++  "foreign",
++  "overlap",
++  "misaligned",
++  "out of bounds",
++  "wrong type",
++  "short lane",
++] as const)
++  for (const seed of seedsFor("packed-frame-corruption", [0xb2a2, 0xb2a3]))
++    it(`both endpoints refuse ${shape} (${String(seed)})`, () => {
++      fc.assert(
++        fc.property(fc.integer({ min: 2, max: 64 }), (n) => {
++          reach.beginHistory();
++          const original: FramePayload = {
++            sequence: 0,
++            rowCount: n,
++            columns: [0, 1].map((k) => ({
++              form: "flat",
++              length: n,
++              validity: null,
++              data: { layout: "i32", values: Int32Array.from({ length: n }, (_, r) => r + k) },
++            })),
++            dictionaries: [],
++          };
++          const packed = packFrame(original, new ArrayBuffer(packedFrameBytes(original))),
++            first = packed.columns[0],
++            second = packed.columns[1];
++          if (first?.form !== "flat" || first.data.layout !== "i32" || second?.form !== "flat")
++            throw new Error("fixture");
++          let view = first.data.values;
++          if (shape === "foreign") view = new Int32Array(n);
++          else if (shape === "overlap") {
++            (second as { data: VectorData }).data = {
++              layout: "i32",
++              values: new Int32Array(packed.buffer, 0, n),
++            };
++          } else if (shape === "wrong type") {
++            (first as { data: VectorData }).data = {
++              layout: "i32",
++              values: new Uint8Array(packed.buffer, 0, n) as unknown as Int32Array,
++            };
++          } else if (shape === "short lane") view = new Int32Array(packed.buffer, 0, n - 1);
++          else
++            Object.defineProperty(view, shape === "misaligned" ? "byteOffset" : "byteLength", {
++              value: shape === "misaligned" ? 1 : packed.buffer.byteLength + 8,
++            });
++          if (shape !== "wrong type")
++            (first as { data: VectorData }).data = { layout: "i32", values: view };
++          expect(() => frameTransferList(packed)).toThrow(FrameBufferError);
++          expect(() => new StreamDictionaries().apply(packed)).toThrow(FrameBufferError);
++          reach.reach(shape);
++        }),
++        { seed, numRuns: 16 },
++      );
++    });
++for (const mode of ["complete", "abort", "cancel"] as const)
++  for (const seed of seedsFor("packed-frame-cleanup", [0xb2a4, 0xb2a5]))
++    it(`packed ownership returns on ${mode} (${String(seed)})`, async () => {
++      await fc.assert(
++        fc.asyncProperty(fc.integer({ min: 33, max: 100 }), async (n) => {
++          reach.beginHistory();
++          const vector = packedInput("i32", n, 7),
++            governor = new Governor(8 * 1048576),
++            grant = await governor.admit({ label: "packed", minimumBytes: 65536, spillable: true });
++          const channel = new ResultChannel([{ name: "n", type: vector.type, nullable: true }], {
++            windowBytes: 65536,
++          });
++          channel.delivered.catch(() => undefined);
++          const sink = new ResultSink([vector.type], grant, channel, 0);
++          expect(sink.push({ length: n, columns: [vector], selection: null })).toBe("ready");
++          const frame = await channel.next();
++          if (!frame) throw new Error("frame missing");
++          expect(frame.transfer).toHaveLength(1);
++          expect(frame.transfer[0]).toBe(frame.payload.buffer);
++          expect(grant.allocated).toBeGreaterThan(0);
++          if (mode === "complete") await sink.finish();
++          else if (mode === "abort") {
++            sink.abort(new Error("abort"));
++            channel.end();
++            expect(grant.allocated).toBeGreaterThan(0);
++          } else {
++            sink.discard(new Error("cancel"));
++            channel.cancel();
++            expect(grant.allocated).toBe(0);
++          }
++          frame.release();
++          frame.release();
++          if (mode === "cancel") await expect(channel.delivered).rejects.toThrow();
++          else await channel.delivered;
++          expect(grant.allocated).toBe(0);
++          grant.close();
++          expect(governor.usedBytes).toBe(0);
++          reach.reach(mode);
++        }),
++        { seed, numRuns: 16 },
++      );
++    });
+diff --git a/packages/core/src/next/testing/packed-input.ts b/packages/core/src/next/testing/packed-input.ts
+new file mode 100644
+index 00000000..faf356c3
+--- /dev/null
++++ b/packages/core/src/next/testing/packed-input.ts
+@@ -0,0 +1,96 @@
++/** Frozen native-layout input factory for the packed-frame experiment. */
++import { RESULT_OWNED_LAYOUT_REACH } from "../../testing/reach.js";
++import type { PhysicalType } from "../types.js";
++import type { FlatVector, VectorData } from "../vector/vector.js";
++type Kind = (typeof RESULT_OWNED_LAYOUT_REACH)[number];
++export function packedInput(kind: Kind, n: number, salt: number): FlatVector {
++  const validity = new Uint32Array(Math.ceil(n / 32)).fill(0xffffffff);
++  for (let row = 0; row < n; row++)
++    if ((row + salt) % 7 === 0)
++      validity[row >>> 5] = (validity[row >>> 5] ?? 0) & ~(1 << (row & 31));
++  const i32 = () => Int32Array.from({ length: n }, (_, r) => r * salt - 19);
++  const f64 = () => Float64Array.from({ length: n }, (_, r) => (r * salt) / 8);
++  const i64 = () => BigInt64Array.from({ length: n }, (_, r) => (1n << 60n) + BigInt(r * salt));
++  let type: PhysicalType = { kind: "float64" };
++  let data: VectorData;
++  switch (kind) {
++    case "bool":
++      type = { kind: "bool" };
++      data = { layout: "bool", values: Uint8Array.from({ length: n }, (_, r) => r % 2) };
++      break;
++    case "i32":
++      type = { kind: "int32", bits: 32 };
++      data = { layout: "i32", values: i32() };
++      break;
++    case "f32": {
++      type = { kind: "float32" };
++      const words = Uint32Array.from({ length: n }, (_, r) =>
++        r % 2 === 0 ? 0x7fc00001 + r : 0x80000000,
++      );
++      data = { layout: "f32", values: new Float32Array(words.buffer) };
++      break;
++    }
++    case "f64": {
++      const words = Uint32Array.from({ length: 2 * n }, (_, r) =>
++        r % 2 === 0 ? (salt + r) >>> 0 : 0x7ff80000 + (r % 7),
++      );
++      data = { layout: "f64", values: new Float64Array(words.buffer) };
++      break;
++    }
++    case "i64-safe":
++      type = { kind: "int64" };
++      data = { layout: "int64", values: { repr: "safe", values: f64().map((v) => Math.floor(v)) } };
++      break;
++    case "i64-wide":
++      type = { kind: "int64" };
++      data = { layout: "int64", values: { repr: "int64", values: i64() } };
++      break;
++    case "fixed16":
++      type = { kind: "uuid" };
++      data = {
++        layout: "fixed16",
++        bytes: Uint8Array.from({ length: 16 * n }, (_, r) => (r * salt) % 256),
++      };
++      break;
++    case "interval":
++      type = { kind: "interval" };
++      data = {
++        layout: "interval",
++        months: i32(),
++        days: i32(),
++        micros: { repr: "int64", values: i64() },
++      };
++      break;
++    case "text":
++      type = { kind: "text" };
++      data = {
++        layout: "varlen",
++        offsets: Int32Array.from({ length: n + 1 }, (_, r) => r * 5),
++        bytes: Uint8Array.from({ length: 5 * n }, (_, r) => 65 + ((r + salt) % 26)),
++      };
++      break;
++    default: {
++      type = { kind: "decimal", precision: null, scale: null };
++      data = {
++        layout: "decimal",
++        scale: kind === "decimal-mixed" ? null : 2,
++        scales: kind === "decimal-mixed" ? Uint16Array.from({ length: n }, (_, r) => r % 5) : null,
++        specials:
++          kind === "decimal-mixed"
++            ? Uint8Array.from({ length: n }, (_, r) => (r % 11 === 0 ? 1 : 0))
++            : null,
++        coefficients:
++          kind === "decimal-i128"
++            ? {
++                repr: "int128",
++                limbs: Uint32Array.from({ length: 4 * n }, (_, r) => (r % 4 === 0 ? r * salt : 0)),
++              }
++            : kind === "decimal-i64"
++              ? { repr: "int64", values: i64() }
++              : { repr: "safe", values: f64().map((v) => Math.floor(v)) },
++      };
++      break;
++    }
++  }
++  return { form: "flat", type, length: n, validity, data };
++}
+diff --git a/packages/core/src/next/testing/storage-core.ts b/packages/core/src/next/testing/storage-core.ts
+index f67a6c9a..3abbe912 100644
+--- a/packages/core/src/next/testing/storage-core.ts
++++ b/packages/core/src/next/testing/storage-core.ts
+@@ -18,6 +18,10 @@ import { compileTableRules } from "../exec/rules.js";
+ import { createLowerer } from "../lower/create.js";
+ import { ChunkReader } from "../page/reader.js";
+ import { MemorySpillService } from "../spill/memory-spill.js";
++import type { PhysicalType } from "../types.js";
++import type { WireVector } from "../vector/frame.js";
++import { StreamDictionaries } from "../owner/frame.js";
++import { newDictionaryId } from "../vector/vector.js";
+ import { BATCH_ROWS, type Batch, type FlatVector } from "../vector/vector.js";
+ import { Harness } from "../write/test-support.js";
+ import type { NextCore, NextStatementResult } from "./differential-adapter.js";
+@@ -121,21 +125,22 @@ export class StorageCore implements NextCore {
+     const prepared = this.executor.prepare(lowered.plan);
+     const run = this.start(prepared, params);
+     const batches: Batch[] = [];
++    const dictionaries = new StreamDictionaries();
++    const dictionaryIds = new Map<number, number>();
+     try {
+       for (;;) {
+         const frame = await run.execution.results.next();
+         if (frame === null) break;
+         try {
+           const payload = structuredClone(frame.payload);
++          dictionaries.apply(payload);
+           batches.push({
+             length: payload.rowCount,
+             selection: null,
+             columns: payload.columns.map((vector, index) => {
+-              if (vector.form !== "flat")
+-                throw new TypeError("the result sink must materialize flat frames");
+               const type = prepared.columns[index]?.type;
+               if (type === undefined) throw new TypeError("missing result type");
+-              return { ...vector, type };
++              return frameVector(vector, type, dictionaries, dictionaryIds);
+             }),
+           });
+         } finally {
+@@ -231,3 +236,55 @@ export async function storageCore(store: StoreKind): Promise<StorageCore> {
+     throw new UnsupportedPlanError(`the Node adapter's ${store} store`, { construct: "storage" });
+   return new StorageCore().open();
+ }
++
++/** Keep wire dictionary/constant semantics in the oracle adapter as in the real client. */
++function frameVector(
++  vector: WireVector,
++  type: PhysicalType,
++  dictionaries: StreamDictionaries,
++  ids: Map<number, number>,
++): Batch["columns"][number] {
++  if (vector.form === "flat") return { ...vector, type };
++  if (vector.form === "constant") return { ...vector, type, value: { ...vector.value, type } };
++  const parts = dictionaries.parts(vector.dictionary),
++    length = dictionaries.size(vector.dictionary);
++  const offsets = new Int32Array(length + 1);
++  let bytes = 0,
++    row = 0;
++  for (const part of parts) {
++    if (part.data.layout !== "varlen") throw new TypeError("Expected UTF-8 dictionary");
++    const base = part.data.offsets[0] ?? 0;
++    for (let i = 0; i < part.length; i++)
++      offsets[++row] = bytes + (part.data.offsets[i + 1] ?? base) - base;
++    bytes += (part.data.offsets[part.length] ?? base) - base;
++  }
++  const data = new Uint8Array(bytes);
++  let at = 0;
++  for (const part of parts) {
++    if (part.data.layout !== "varlen") throw new TypeError("Expected UTF-8 dictionary");
++    const from = part.data.offsets[0] ?? 0,
++      to = part.data.offsets[part.length] ?? from;
++    data.set(part.data.bytes.subarray(from, to), at);
++    at += to - from;
++  }
++  let id = ids.get(vector.dictionary);
++  if (id === undefined) {
++    id = newDictionaryId();
++    ids.set(vector.dictionary, id);
++  }
++  return {
++    form: "dictionary",
++    type,
++    length: vector.length,
++    validity: vector.validity,
++    codes: vector.codes,
++    dictionaryId: id,
++    dictionary: {
++      form: "flat",
++      type,
++      length,
++      validity: null,
++      data: { layout: "varlen", bytes: data, offsets },
++    },
++  };
++}
+diff --git a/packages/core/src/next/vector/frame.ts b/packages/core/src/next/vector/frame.ts
+new file mode 100644
+index 00000000..b0bbcba6
+--- /dev/null
++++ b/packages/core/src/next/vector/frame.ts
+@@ -0,0 +1,246 @@
++/** Native wire views shared by sender and receiver. No executor/runtime dependency.
++ * Packed frames own one fixed ArrayBuffer. Every subview is aligned, bounded, disjoint and
++ * points into that buffer. Legacy whole-buffer frames remain only for A/B/reference fixtures.
++ */
++import type { Validity, VectorData } from "./vector.js";
++export const STREAM_DICTIONARY_BYTES = 1024 * 1024;
++export type UnnumberedPayload = Omit<FramePayload, "sequence">;
++export interface WireFlat {
++  readonly form: "flat";
++  readonly length: number;
++  /** Bit set = valid; null when every slot is valid. */
++  readonly validity: Validity | null;
++  readonly data: VectorData;
++}
++
++export interface WireConstant {
++  readonly form: "constant";
++  readonly length: number;
++  /** Length 1. */
++  readonly value: WireFlat;
++}
++
++export interface WireDictionary {
++  readonly form: "dictionary";
++  readonly length: number;
++  /** Codes into stream dictionary `dictionary` (meaningful only where `validity` says valid). */
++  readonly codes: Int32Array;
++  readonly validity: Validity | null;
++  readonly dictionary: number;
++}
++
++export type WireVector = WireFlat | WireConstant | WireDictionary;
++
++/** Entries appended to stream dictionary `id` at index `from` (distinct, non-null). */
++export interface DictionaryDelta {
++  readonly id: number;
++  readonly from: number;
++  readonly values: WireFlat;
++}
++
++/** Plain data: structured-clone safe, no functions. */
++export interface FramePayload {
++  /** Packed candidate: one fresh frame-owned fixed buffer; absent for legacy comparison frames. */
++  readonly buffer?: ArrayBuffer;
++  /** 0, 1, 2… within the stream, so a protocol can detect a lost frame. */
++  readonly sequence: number;
++  readonly rowCount: number;
++  /** One per output column, each `length === rowCount`. */
++  readonly columns: readonly WireVector[];
++  /** Dictionary entries first needed by this frame, applied before its columns are read. */
++  readonly dictionaries: readonly DictionaryDelta[];
++}
++
++export class FrameBufferError extends Error {
++  readonly code = "MINNOW_FRAME_BUFFER";
++  constructor(message: string) {
++    super(message);
++    this.name = "FrameBufferError";
++  }
++}
++type TypedArray =
++  Uint8Array | Uint16Array | Uint32Array | Int32Array | Float32Array | Float64Array | BigInt64Array;
++
++function add(
++  into: TypedArray[],
++  value: TypedArray,
++  Type: { new (...args: never[]): TypedArray },
++): void {
++  if (!(value instanceof Type)) throw new FrameBufferError("Wrong frame view element type");
++  into.push(value);
++}
++function dataArrays(data: VectorData, into: TypedArray[]): void {
++  switch (data.layout) {
++    case "bool":
++      add(into, data.values, Uint8Array);
++      return;
++    case "i32":
++      add(into, data.values, Int32Array);
++      return;
++    case "f32":
++      add(into, data.values, Float32Array);
++      return;
++    case "f64":
++      add(into, data.values, Float64Array);
++      return;
++    case "int64":
++      add(into, data.values.values, data.values.repr === "safe" ? Float64Array : BigInt64Array);
++      return;
++    case "decimal": {
++      if (data.scales !== null) add(into, data.scales, Uint16Array);
++      if (data.specials !== null) add(into, data.specials, Uint8Array);
++      const coefficients = data.coefficients;
++      if (coefficients.repr === "int128") add(into, coefficients.limbs, Uint32Array);
++      else if (coefficients.repr !== "wide")
++        add(into, coefficients.values, coefficients.repr === "safe" ? Float64Array : BigInt64Array);
++      return;
++    }
++    case "varlen":
++      add(into, data.bytes, Uint8Array);
++      add(into, data.offsets, Int32Array);
++      return;
++    case "fixed16":
++      add(into, data.bytes, Uint8Array);
++      return;
++    case "interval":
++      add(into, data.months, Int32Array);
++      add(into, data.days, Int32Array);
++      add(into, data.micros.values, data.micros.repr === "safe" ? Float64Array : BigInt64Array);
++      return;
++  }
++}
++
++export function frameFlats(payload: UnnumberedPayload): WireFlat[] {
++  const out: WireFlat[] = payload.dictionaries.map((delta) => delta.values);
++  for (const column of payload.columns)
++    if (column.form === "flat") out.push(column);
++    else if (column.form === "constant") out.push(column.value);
++  return out;
++}
++
++export function payloadArrays(payload: UnnumberedPayload): TypedArray[] {
++  const arrays: TypedArray[] = [];
++  for (const flat of frameFlats(payload)) {
++    dataArrays(flat.data, arrays);
++    if (flat.validity !== null) add(arrays, flat.validity, Uint32Array);
++  }
++  for (const column of payload.columns)
++    if (column.form === "dictionary") {
++      add(arrays, column.codes, Int32Array);
++      if (column.validity !== null) add(arrays, column.validity, Uint32Array);
++    }
++  return arrays;
++}
++
++/**
++ * The distinct ArrayBuffers of a payload, for `postMessage`'s transfer list. Throws
++ * `FrameBufferError` if a view does not cover its whole buffer or the buffer is shared. Wide
++ * decimal coefficients (`bigint[]`) are structured-cloned, not transferred.
++ */
++function packedLengths(payload: UnnumberedPayload): void {
++  const requireLength = (view: { readonly length: number }, n: number) => {
++    if (view.length < n) throw new FrameBufferError("Packed view is shorter than its frame lane");
++  };
++  const flat = (f: WireFlat) => {
++    const n = f.length,
++      d = f.data;
++    if (!Number.isSafeInteger(n) || n < 0) throw new FrameBufferError("Invalid frame lane length");
++    if (f.validity !== null) requireLength(f.validity, Math.ceil(n / 32));
++    switch (d.layout) {
++      case "bool":
++      case "i32":
++      case "f32":
++      case "f64":
++        requireLength(d.values, n);
++        break;
++      case "int64":
++        requireLength(d.values.values, n);
++        break;
++      case "fixed16":
++        requireLength(d.bytes, 16 * n);
++        break;
++      case "interval":
++        requireLength(d.months, n);
++        requireLength(d.days, n);
++        requireLength(d.micros.values, n);
++        break;
++      case "decimal":
++        if (d.scales) requireLength(d.scales, n);
++        if (d.specials) requireLength(d.specials, n);
++        if (d.coefficients.repr === "int128") requireLength(d.coefficients.limbs, 4 * n);
++        else requireLength(d.coefficients.values, n);
++        break;
++      case "varlen": {
++        requireLength(d.offsets, n + 1);
++        const first = d.offsets[0] ?? -1,
++          last = d.offsets[n] ?? -1;
++        if (first < 0 || last < first || last > d.bytes.length)
++          throw new FrameBufferError("Packed varlen range is out of bounds");
++        break;
++      }
++    }
++  };
++  if (!Number.isSafeInteger(payload.rowCount) || payload.rowCount < 0)
++    throw new FrameBufferError("Invalid frame row count");
++  for (const column of payload.columns) {
++    if (column.length !== payload.rowCount)
++      throw new FrameBufferError("Frame lane row count mismatch");
++    if (column.form === "flat") flat(column);
++    else if (column.form === "constant") {
++      if (column.value.length !== 1)
++        throw new FrameBufferError("Constant frame lane must have one value");
++      flat(column.value);
++    } else {
++      requireLength(column.codes, column.length);
++      if (column.validity) requireLength(column.validity, Math.ceil(column.length / 32));
++    }
++  }
++  for (const delta of payload.dictionaries) flat(delta.values);
++}
++
++export function frameTransferList(payload: UnnumberedPayload): ArrayBuffer[] {
++  const arrays = payloadArrays(payload);
++  if (payload.buffer !== undefined) {
++    packedLengths(payload);
++    const buffer = payload.buffer;
++    if (
++      !(buffer instanceof ArrayBuffer) ||
++      (buffer as ArrayBuffer & { resizable?: boolean }).resizable
++    )
++      throw new FrameBufferError("Packed frame requires a fixed ArrayBuffer");
++    // Sort views, not byte intervals: native views cannot forge bounds/alignment. Check those
++    // explicitly as well; only a strict element-type check below can establish a valid view.
++    arrays.sort((a, b) => a.byteOffset - b.byteOffset);
++    let end = 0;
++    for (const view of arrays) {
++      if (
++        !ArrayBuffer.isView(view) ||
++        !(view.buffer instanceof ArrayBuffer) ||
++        view.buffer !== buffer
++      )
++        throw new FrameBufferError("Packed view belongs to a foreign buffer");
++      if (
++        view.byteOffset % view.BYTES_PER_ELEMENT !== 0 ||
++        view.byteOffset + view.byteLength > buffer.byteLength
++      )
++        throw new FrameBufferError("Packed view is misaligned or out of bounds");
++      if (view.byteLength === 0) continue;
++      if (view.byteOffset < end) throw new FrameBufferError("Packed views overlap");
++      end = view.byteOffset + view.byteLength;
++    }
++    return [buffer];
++  }
++  const buffers = new Set<ArrayBuffer>();
++  for (const view of arrays) {
++    const buffer = view.buffer;
++    if (!(buffer instanceof ArrayBuffer))
++      throw new FrameBufferError("Frame buffers must be ArrayBuffers, never SharedArrayBuffer");
++    if (buffers.has(buffer)) continue;
++    if (view.byteOffset !== 0 || view.byteLength !== buffer.byteLength)
++      throw new FrameBufferError(
++        `A frame view covers ${String(view.byteLength)} of its buffer's ${String(buffer.byteLength)} bytes`,
++      );
++    buffers.add(buffer);
++  }
++  return [...buffers];
++}
+diff --git a/packages/core/src/next/vector/pack-frame.ts b/packages/core/src/next/vector/pack-frame.ts
+new file mode 100644
+index 00000000..9500484b
+--- /dev/null
++++ b/packages/core/src/next/vector/pack-frame.ts
+@@ -0,0 +1,119 @@
++/** Copy native frame lanes into one precharged, fresh frame-owned buffer. Float payload words
++ * are copied as bytes. No page/cache/dictionary/pool buffer becomes a transferable output.
++ */
++import type { Int64Values, VectorData } from "./vector.js";
++import {
++  payloadArrays,
++  frameTransferList,
++  type WireFlat,
++  type UnnumberedPayload,
++} from "./frame.js";
++type Native = ReturnType<typeof payloadArrays>[number];
++const align = (n: number, width: number) => Math.ceil(n / width) * width;
++export function packedFrameBytes(payload: UnnumberedPayload): number {
++  let bytes = 0;
++  for (const view of payloadArrays(payload))
++    bytes = align(bytes, view.BYTES_PER_ELEMENT) + view.byteLength;
++  return bytes;
++}
++export function packFrame<T extends UnnumberedPayload>(
++  payload: T,
++  buffer: ArrayBuffer,
++): T & { readonly buffer: ArrayBuffer } {
++  if (buffer.byteLength !== packedFrameBytes(payload))
++    throw new RangeError("Packed allocation size mismatch");
++  const copied = new Map<Native, Native[]>();
++  let cursor = 0;
++  for (const source of payloadArrays(payload)) {
++    cursor = align(cursor, source.BYTES_PER_ELEMENT);
++    const Type = source.constructor as {
++      new (buffer: ArrayBuffer, offset: number, length: number): Native;
++    };
++    const into = new Type(buffer, cursor, source.length);
++    new Uint8Array(buffer, cursor, source.byteLength).set(
++      new Uint8Array(source.buffer, source.byteOffset, source.byteLength),
++    );
++    const queue = copied.get(source) ?? [];
++    queue.push(into);
++    copied.set(source, queue);
++    cursor += source.byteLength;
++  }
++  const view = <V extends Native>(source: V): V => {
++    const next = copied.get(source)?.shift();
++    if (!next) throw new Error("Missing packed view");
++    return next as V;
++  };
++  const ints = (n: Int64Values): Int64Values =>
++    n.repr === "safe" ? { ...n, values: view(n.values) } : { ...n, values: view(n.values) };
++  const data = (d: VectorData): VectorData => {
++    switch (d.layout) {
++      case "bool":
++        return { ...d, values: view(d.values) };
++      case "i32":
++        return { ...d, values: view(d.values) };
++      case "f32":
++        return { ...d, values: view(d.values) };
++      case "f64":
++        return { ...d, values: view(d.values) };
++      case "varlen":
++        return { ...d, bytes: view(d.bytes), offsets: view(d.offsets) };
++      case "fixed16":
++        return { ...d, bytes: view(d.bytes) };
++      case "int64":
++        return { ...d, values: ints(d.values) };
++      case "interval":
++        return {
++          ...d,
++          months: view(d.months),
++          days: view(d.days),
++          micros: ints(d.micros),
++        };
++      case "decimal":
++        return {
++          ...d,
++          scales: d.scales === null ? null : view(d.scales),
++          specials: d.specials === null ? null : view(d.specials),
++          coefficients:
++            d.coefficients.repr === "int128"
++              ? { ...d.coefficients, limbs: view(d.coefficients.limbs) }
++              : d.coefficients.repr === "wide"
++                ? d.coefficients
++                : ints(d.coefficients),
++        };
++    }
++  };
++  const flat = (f: WireFlat): WireFlat => ({
++    ...f,
++    validity: f.validity === null ? null : view(f.validity),
++    data: data(f.data),
++  });
++  const packed = {
++    ...payload,
++    buffer,
++    dictionaries: payload.dictionaries.map((delta) => ({ ...delta, values: flat(delta.values) })),
++    columns: payload.columns.map((c) =>
++      c.form === "flat"
++        ? flat(c)
++        : c.form === "constant"
++          ? { ...c, value: flat(c.value) }
++          : { ...c, codes: view(c.codes), validity: c.validity === null ? null : view(c.validity) },
++    ),
++  };
++  frameTransferList(packed);
++  return packed as T & { readonly buffer: ArrayBuffer };
++}
++/** Compact dictionary storage survives the containing packed frame without retaining it. */
++export function copyDictionary(source: WireFlat): WireFlat {
++  if (source.data.layout !== "varlen") throw new TypeError("Stream dictionary must contain UTF-8");
++  const d = source.data,
++    base = d.offsets[0] ?? 0;
++  return {
++    ...source,
++    validity: source.validity?.slice() ?? null,
++    data: {
++      layout: "varlen",
++      bytes: d.bytes.slice(base, d.offsets[source.length] ?? base),
++      offsets: Int32Array.from(d.offsets.subarray(0, source.length + 1), (n) => n - base),
++    },
++  };
++}
+diff --git a/packages/core/src/testing/reach.ts b/packages/core/src/testing/reach.ts
+index 796aba38..c1610249 100644
+--- a/packages/core/src/testing/reach.ts
++++ b/packages/core/src/testing/reach.ts
+@@ -662,3 +662,22 @@ export const TERMINAL_BATCH_REACH = [
+   "exact received values",
+   "small credit cap",
+ ] as const;
++
++/** Packed-frame experiment: native bytes, dictionary lifetime, malformed views and cleanup. */
++export const PACKED_FRAME_REACH = [
++  "all valid",
++  "sparse NULLs",
++  "large varlen",
++  "dictionary delta",
++  "dictionary append",
++  "one fresh buffer",
++  "foreign",
++  "overlap",
++  "misaligned",
++  "out of bounds",
++  "wrong type",
++  "short lane",
++  "complete",
++  "abort",
++  "cancel",
++] as const;
+diff --git a/scripts/browser-perf/page/discard-receiver.ts b/scripts/browser-perf/page/discard-receiver.ts
+index 1d69d879..4b258459 100644
+--- a/scripts/browser-perf/page/discard-receiver.ts
++++ b/scripts/browser-perf/page/discard-receiver.ts
+@@ -24,6 +24,11 @@ export class DiscardReceiver {
+     return this.#disposedBytes;
+   }
+   consume(frame: FramePayload): void {
++    if (frame.buffer) {
++      this.#disposedBytes += frame.buffer.byteLength;
++      dispose(frame.buffer);
++      return;
++    }
+     for (const buffer of frameTransferList({ ...frame, columns: [] }))
+       this.#dictionaries.add(buffer);
+     for (const buffer of frameTransferList(frame)) {
+diff --git a/scripts/browser-perf/page/executor-export.ts b/scripts/browser-perf/page/executor-export.ts
+index 7f204c83..c7708751 100644
+--- a/scripts/browser-perf/page/executor-export.ts
++++ b/scripts/browser-perf/page/executor-export.ts
+@@ -194,7 +194,7 @@ export function prepareExecutorExport(
+         maxFrameBytes = Math.max(maxFrameBytes, frame.byteLength);
+         wireBytes += payloadBytes(frame.payload);
+         frameBufferBytes += frame.byteLength;
+-        const transfer = transferFor(frame.transfer);
++        const transfer = transferFor(frame.transfer, frame.payload.buffer !== undefined);
+         transferredBuffers += transfer.length;
+         const postStart = performance.now();
+         port.postMessage({ t: "rows", seq: 1, columns: null, frames: [frame.payload] }, transfer);
+diff --git a/scripts/browser-perf/page/scan-export.ts b/scripts/browser-perf/page/scan-export.ts
+index 35aac3db..b9b3fea3 100644
+--- a/scripts/browser-perf/page/scan-export.ts
++++ b/scripts/browser-perf/page/scan-export.ts
+@@ -231,7 +231,7 @@ export async function scanExport(
+       frames++;
+       maxFrameBytes = Math.max(maxFrameBytes, frame.byteLength);
+       wireBytes += frame.byteLength;
+-      const transfer = transferFor(frame.transfer);
++      const transfer = transferFor(frame.transfer, frame.payload.buffer !== undefined);
+       transferredBuffers += transfer.length;
+       const before = performance.now();
+       port.postMessage({ t: "rows", seq: 1, columns: null, frames: [frame.payload] }, transfer);

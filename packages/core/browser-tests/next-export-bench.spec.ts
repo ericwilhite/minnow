@@ -995,6 +995,15 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     const gcRssAfter = rendererRss(profile);
     const report = {
       rows,
+      ...(process.env.MINNOW_EXPORT_PACKED_EXPERIMENT === "1"
+        ? {
+            packedExperiment: {
+              base: "095f5f1c",
+              state: "rejected",
+              implementation: "copy-compaction; per-column decode remains",
+            },
+          }
+        : {}),
       ...(RSS_SERIES
         ? {
             series: {

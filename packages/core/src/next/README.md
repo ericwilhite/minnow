@@ -707,6 +707,23 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     dependency is frozen, with no fallback to current sources. Both code families load before
     timing. Use standalone current runs for absolute RSS acceptance: the paired comparison
     also retains the reference code family.
+  - The packed-frame copy-compaction experiment is **rejected**, with the production frame
+    contract unchanged. `scripts/browser-perf/experiments/packed-frame-copy.patch` and its
+    hashed base archive preserve the candidate without production imports. `MINNOW_EXPORT_PACKED_EXPERIMENT=1`
+    requires the explicit export-bench opt-in; combine it with `MINNOW_EXPORT_RSS_SERIES=1`
+    and `MINNOW_EXPORT_EXECUTOR_REFERENCE=095f5f1c` for five cold A/B rounds in one worker.
+    `scripts/executor-export-bench.mts --compare=095f5f1c --packed` replays its CPU component.
+    Every packed frame has one fresh buffer and aligned, bounded, disjoint views; both endpoints
+    validate them, and retained UTF-8 dictionary deltas are copied into compact client storage.
+    Generated diagnostics compare native bytes across layouts (including wide decimals, NaN words,
+    NULLs, constants, dictionaries and >64 KiB values), reject malformed subviews, and check
+    completion/abort/cancel charges. This is not an accepted frame format or a supported stored format.
+    It adds a compaction copy after per-column decode: measured throughput regresses and RSS
+    ranges overlap beyond the budget. Its doubled temporary-buffer reservation also refuses a
+    previously supported 550 KiB row under a 1 MiB progress reserve. That failure is preserved
+    as rejection evidence; it does not weaken the ordinary large-row properties. These results
+    concern this copy-compaction implementation, not a proof that direct decode into packed output
+    cannot work. The benchmark excludes SQL/catalog/root loading and client row-object assembly.
   - `owner-frames.ts` and `scan-export.ts` remain **historical scan-adapter diagnostics**, excluded
     from Gate A. Ownership/batch/IO/range/shape-transport/frame-copy experiment flags explicitly
     use `mode:"scan-adapter"`. No production module imports the old assembler.

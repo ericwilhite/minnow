@@ -9,6 +9,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, loadavg } from "node:os";
 import { join } from "node:path";
 import { serialize } from "node:v8";
+import { packedExperiment } from "./browser-perf/packed-experiment.js";
 import { executorSnapshot } from "./browser-perf/executor-comparison.js";
 import { build } from "esbuild";
 import { MemoryExtentSpace } from "../packages/core/src/next/page/memory-extents.js";
@@ -18,6 +19,7 @@ import { typeOf, vectorOf } from "./browser-perf/page/wide-vectors.js";
 
 const reference = process.argv.find((a) => a.startsWith("--compare="))?.slice("--compare=".length);
 const variants = reference ? ["baseline", "candidate"] : ["adapter", "executor"];
+const packed = process.argv.includes("--packed") ? packedExperiment() : null;
 const scratch = mkdtempSync(join(homedir(), ".cache", "minnow-executor-export-"));
 try {
   const count = 8192,
@@ -72,6 +74,7 @@ console.log(JSON.stringify(await run()));
     platform: "node",
     format: "esm",
     outfile: join(scratch, "worker.mjs"),
+    ...(packed ? { plugins: [packed.esbuild] } : {}),
   });
   if (reference)
     await build({
@@ -129,5 +132,6 @@ console.log(JSON.stringify(await run()));
     );
   }
 } finally {
+  packed?.close();
   rmSync(scratch, { recursive: true, force: true });
 }
