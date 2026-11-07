@@ -177,6 +177,7 @@ export interface TableScanOptions {
    * unless the terminal caller permits ordinary borrowed output with borrowOutputOnRefusal.
    */
   readonly outputBudget?: ByteBudget;
+  readonly outputBuffers?: { take(bytes: number): ArrayBuffer | null };
   /** Owning terminal consumer resolves each dictionary's wire form before sizing output. */
   readonly outputDictionary?: (dictionary: FlatVector) => boolean;
   /** Terminal transfer optimization may use ordinary borrowed decode on one-row refusal. */
@@ -262,7 +263,13 @@ interface OpenGroup {
  */
 class ScanMemory implements TargetMemory, ByteBudget {
   reserve = 0;
-  constructor(readonly budget: ByteBudget) {}
+  constructor(
+    readonly budget: ByteBudget,
+    readonly buffers?: { take(bytes: number): ArrayBuffer | null },
+  ) {}
+  reuse(bytes: number): ArrayBuffer | null {
+    return this.buffers?.take(bytes) ?? null;
+  }
   allocate(bytes: number): boolean {
     if (bytes <= this.reserve) {
       this.reserve -= bytes;
@@ -391,7 +398,7 @@ export class TableScan implements BatchSource {
     this.#ownedMemory =
       options.outputBudget === undefined || options.outputBudget === options.budget
         ? this.#memory
-        : new ScanMemory(options.outputBudget);
+        : new ScanMemory(options.outputBudget, options.outputBuffers);
     this.#targets = this.#types.map((type) => new ColumnTarget(type, BATCH_ROWS, this.#memory));
     // The scratch is charged before it is built (a refusal throws, holding nothing).
     const scratch = scratchBytes(options.emitLocator);

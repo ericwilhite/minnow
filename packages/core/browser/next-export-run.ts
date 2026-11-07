@@ -9,6 +9,7 @@ import { DEFAULT_RESULT_WINDOW_BYTES, RELEASE_DELAY_MS } from "../src/next/owner
 import type { FramePayload } from "../src/next/exec/result.js";
 import type { BuildResult, ExportPass, ExportRequest } from "./next-export-worker.js";
 
+import { recyclingFrame } from "../src/next/owner/recycling-frame.js";
 import { DiscardReceiver } from "../../../scripts/browser-perf/page/discard-receiver.js";
 
 const DIR = "wide";
@@ -60,7 +61,9 @@ async function withWorker<T>(request: ExportRequest, discard = false): Promise<T
         unreleased = 0;
       };
       if (results) {
-        results.port1.onmessage = (event: MessageEvent<{ t: string; frames: FramePayload[] }>) => {
+        results.port1.onmessage = (
+          event: MessageEvent<{ t: string; frames: FramePayload[]; bufferIds?: number[] }>,
+        ) => {
           try {
             if (event.data.t !== "rows") throw new Error("Unexpected bench result message");
             for (const frame of event.data.frames) {
@@ -70,7 +73,26 @@ async function withWorker<T>(request: ExportRequest, discard = false): Promise<T
                 frame.columns.some((c) => c.length !== frame.rowCount)
               )
                 throw new Error("Malformed bench frame");
-              dictionaries.apply(frame);
+              dictionaries.apply(
+                event.data.bufferIds
+                  ? {
+                      ...frame,
+                      dictionaries: frame.dictionaries.map((delta) => {
+                        const d = delta.values.data;
+                        if (d.layout !== "varlen")
+                          throw new Error("Recycling export expects text dictionaries");
+                        return {
+                          ...delta,
+                          values: {
+                            ...delta.values,
+                            data: { ...d, bytes: d.bytes.slice(), offsets: d.offsets.slice() },
+                            validity: delta.values.validity?.slice() ?? null,
+                          },
+                        };
+                      }),
+                    }
+                  : frame,
+              );
               receivedRows += frame.rowCount;
               receivedFrames++;
               const bytes = payloadBytes(frame);
@@ -78,6 +100,13 @@ async function withWorker<T>(request: ExportRequest, discard = false): Promise<T
               unreleased += bytes;
               through = frame.sequence;
               receiver?.consume(frame);
+              if (event.data.bufferIds)
+                recyclingFrame(frame, event.data.bufferIds, (buffers, transfer) =>
+                  results.port1.postMessage(
+                    { t: "return", target: 1, through: frame.sequence, buffers },
+                    transfer,
+                  ),
+                ).release();
             }
             if (unreleased >= DEFAULT_RESULT_WINDOW_BYTES / 2) release();
             else releaseTimer ??= setTimeout(release, RELEASE_DELAY_MS);
@@ -176,6 +205,7 @@ export async function exportPass(options: {
   readonly persistent?: boolean;
   /** Bench consumer relinquishes all column views after consuming each frame. */
   readonly discard?: boolean;
+  readonly recycle?: boolean;
   readonly once: boolean;
   readonly readaheadKiB: number;
   readonly windowMiB?: number;
@@ -200,6 +230,9 @@ export async function exportPass(options: {
   readonly scanOutput?: "borrowed" | "flat" | "dictionary";
 }): Promise<ExportPass[]> {
   if (built === null) throw new Error("build the table first");
+  if (options.recycle && options.discard) throw new Error("Choose recycling or discard disposal");
+  if (options.recycle && !options.persistent)
+    throw new Error("Return-pool experiment requires a persistent series");
   const groups = built.groups.slice(0, options.groups ?? built.groups.length);
   const tail = built.groups.at(-1);
   // The measured hot set comes from a group the export does not read, when there is one.
@@ -211,6 +244,7 @@ export async function exportPass(options: {
     groups,
     outside,
     once: options.once,
+    ...(options.recycle ? { recycle: true } : {}),
     readaheadKiB: options.readaheadKiB,
     ...(options.windowMiB === undefined ? {} : { windowMiB: options.windowMiB }),
     capMiB: options.capMiB,

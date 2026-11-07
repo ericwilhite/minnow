@@ -431,6 +431,7 @@ interface Row {
   readonly phases?: Awaited<ReturnType<Run["exportPass"]>>[number]["phases"];
   /** Rows per second of that CPU: the pass's cost, whatever share of a core the host gave it. */
   readonly rowsPerCpuSecond: number;
+  readonly forcedGc?: unknown;
   readonly series?: unknown;
   readonly memoryAfter?: unknown;
   readonly rendererRssEndMiB?: number;
@@ -677,6 +678,17 @@ test.describe("rebuild core export on OPFS (bench)", () => {
         workerCpuSeconds: Number(cpuSeconds.toFixed(2)),
         rowsPerCpuSecond: cpuSeconds > 0 ? Math.round(pass.rows / cpuSeconds) : 0,
       };
+      if (process.env.MINNOW_EXPORT_GC_EACH === "1") {
+        const before = { memory: await targets.memory(), rssMiB: rendererRss(profile) / MiB };
+        await targets.collectPage();
+        await targets.collectWorkers();
+        Object.assign(row, {
+          forcedGc: {
+            before,
+            after: { memory: await targets.memory(), rssMiB: rendererRss(profile) / MiB },
+          },
+        });
+      }
       results.push(row);
       console.log(JSON.stringify(row));
     };
@@ -692,6 +704,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
           await measure(`cold persistent ${variant} scan round ${String(round)}`, true, false, {
             ...base,
             persistent: true,
+            recycle: process.env.MINNOW_EXPORT_RECYCLE === "1",
             discard: DISCARD,
             readaheadKiB: 256,
             auditWorkingSet: false,
@@ -1008,7 +1021,10 @@ test.describe("rebuild core export on OPFS (bench)", () => {
         ? {
             series: {
               scope:
-                "one renderer and worker, space, governor and pool across five rounds (two queries per paired round); no forced GC between passes; collection only after campaign",
+                process.env.MINNOW_EXPORT_GC_EACH === "1"
+                  ? "one renderer and worker across five rounds; post-pass forced GC outside timed exports and sampled peaks (diagnostic)"
+                  : "one renderer and worker, space, governor and pool across five rounds (two queries per paired round); no forced GC between passes; collection only after campaign",
+              outputRecycling: process.env.MINNOW_EXPORT_RECYCLE === "1",
               open: seriesOpen,
               memoryBefore: seriesMemoryBefore,
               beforeCollection: seriesBeforeCollection,

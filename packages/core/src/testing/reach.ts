@@ -364,6 +364,8 @@ export const WINDOW_CANCEL_REJECTION_REACH = [
 
 /** Descriptor reuse across scan phases, endpoint page spans and residency changes. */
 export const SCAN_SHAPE_REACH = [
+  "sparse NULLs in every layout",
+  "recycled native bytes",
   "512 B raw page",
   "2 KiB raw page",
   "same page span",
@@ -702,6 +704,7 @@ export const DISCARD_RECEIVER_REACH = [
 
 /** Larger direct terminal batches keep exact values and the existing owner credit bound. */
 export const TERMINAL_BATCH_REACH = [
+  "ordinary target unchanged",
   "all valid",
   "sparse NULLs",
   "owned frame above 1MiB",
@@ -727,4 +730,31 @@ export const PACKED_FRAME_REACH = [
   "complete",
   "abort",
   "cancel",
+] as const;
+
+/** Explicit output relinquishment and one-use return capabilities. */
+export const OUTPUT_RETURN_REACH = [
+  "held",
+  "released",
+  "reused",
+  "foreign",
+  "not detached",
+  "wrong size",
+  "replay",
+  "detached reuse refused",
+  "late",
+  "cap",
+  "closed",
+] as const;
+
+export const EXPORT_RETURN_REACH = [
+  "explicit frame return",
+  "credit before frame return",
+  "cancel while retained",
+  "late return after cancel",
+] as const;
+
+export const OUTPUT_RETURN_PRESSURE_REACH = [
+  "stale size replaced",
+  "pressure close returns charges",
 ] as const;

@@ -644,9 +644,10 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     Registry entries use ordinary result-grant capacity, so a delta frame can return its progress
     loan before the stream ends. Dictionary pages and borrowed codes never enter a transfer list.
     A direct terminal full scan decodes tight dedicated output into the result grant.
-    Its owned batch target is twice the ordinary source target, bounded by the existing result
-    credit window (2 MiB at the default cap/window). This amortizes wide-column allocation without
-    changing the 2,048-row limit. Other producers and consumer pipelines keep their existing target;
+    Only the explicit recycling export experiment doubles its owned batch target, bounded by
+    the existing result credit window (2 MiB at the default cap/window). This amortizes wide-column
+    allocation without changing the 2,048-row limit. Ordinary results, other producers and
+    consumer pipelines keep their existing target;
     copying fallbacks retain conservative frame row capacities. The sink
     adopts only buffers explicitly named by that source's detach permission and charged to its
     own grant. Before returning the source token (and its query dictionary references), it
@@ -681,12 +682,43 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
   - `MINNOW_EXPORT_RSS_SERIES=1 npm run benchmark:export` keeps one worker, OPFS space,
     governor and page pool across five cold exports. RSS growth uses one fixed campaign baseline;
     each pass records page/worker heap and backing stores plus end-of-pass pool/cache charges.
-    GC runs only after the campaign, followed by space close and zero-charge checks. With
+    Without the diagnostic GC flag, collection runs only after the campaign, followed by space close and zero-charge checks. With
     `MINNOW_EXPORT_EXECUTOR_REFERENCE=REV`, five interleaved reference/current pairs share that
     actor; both source families load before the baseline. This paired scope includes both families.
     `MINNOW_EXPORT_DISCARD=1` is an explicit discard-consumer diagnostic: detach consumed column
     buffers, retaining dictionary deltas until stream close. It changes no public Result lifetime
     and does not guarantee lower RSS: backing-store disposal can still wait for GC/allocator work.
+  - `MINNOW_EXPORT_RECYCLE=1 MINNOW_EXPORT_RSS_SERIES=1` is an **opt-in return-pool experiment**,
+    not the ordinary owner client. It keeps the existing per-buffer frame contract. Its export
+    receiver exposes `recyclingFrame(...).release()`: only explicit relinquishment transfers
+    the dedicated frame buffers back. Receipt and cursor credits keep their existing timing and
+    do not end ordinary result/view lifetimes. After release, typed views are detached (length
+    zero, or `TypeError` on operations that require a live buffer); they must never be used again.
+    JavaScript value arrays contain copied values and are not reusable native storage.
+    The receiver copies dictionary deltas into compact stream storage before releasing a frame,
+    so later dictionary codes never refer to detached buffers. Callers retaining views after credit
+    hold client memory outside the worker result grant, as before; the pool does not bound arbitrary
+    consumer retention. The benchmark discards each frame
+    after counting it and explicitly releases it; normal buffered results and cursors do not.
+    Worker returns use one-use slot capabilities tied to the originally sent dedicated buffer,
+    its size and the detached sender wrapper. Unknown, duplicate, resized, detached and expired
+    returns are refused. A cooperative receiver can only return the buffers captured by its
+    handle; this is an internal protocol, not a physical-identity proof against a compromised
+    receiver sending a same-sized replacement with a stolen capability. Pages, borrowed dictionaries,
+    slabs and cached storage never receive capabilities. Only exact-size buffers are reused,
+    cleared to fresh-allocation semantics, after the output grant reserves their charge.
+    The return cache is capped at twice the 2 MiB credit window, including conservative entry
+    metadata charges; capabilities are also limited to 4,096 slots. It evicts stale size classes
+    and deletes empty ones. Refused/lost/late returns never delay execution or cancellation.
+    Closing the stream's pool returns its charges; frames still held by a caller stay valid until
+    that caller explicitly releases them. `scripts/output-return-bench.mts` records five
+    interleaved CPU/wall component rounds. Five persistent-process Chromium A/B pairs are still
+    required for throughput and fixed-baseline RSS. Five standalone recycling passes met the RSS
+    bound; paired passes can inherit ordinary-result garbage from the previous variant. The return
+    component increases CPU with disjoint ranges, and whole-export throughput does not improve
+    beyond the spread. Keep this experiment and the larger-batch change on hold.
+    `MINNOW_EXPORT_GC_EACH=1` adds post-pass forced-GC diagnostics, outside timed exports and
+    outside the sampled peak. It is diagnostic evidence, not an RSS acceptance run.
   - `scripts/vector-materialize-bench.mts --compare=REV` isolates loaded-page vector building,
     including output allocation, sizing and decode, in five interleaved CPU/wall rounds.
     `--batch` compares 512/1024-row batches over equal rows; `--offsets --reused` isolates offset

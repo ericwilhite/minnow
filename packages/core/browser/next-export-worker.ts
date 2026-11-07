@@ -12,6 +12,7 @@ import {
   type ExecutorExportStats,
 } from "../../../scripts/browser-perf/page/executor-export.js";
 import { scanCore, type ScanCoreStats } from "../../../scripts/browser-perf/page/scan-core.js";
+import { ReturnPool } from "../src/next/exec/return-pool.js";
 import { TableScan } from "../src/next/exec/table-scan.js";
 import { ColumnTarget } from "../src/next/exec/column-target.js";
 import { ChunkReader } from "../src/next/page/reader.js";
@@ -56,6 +57,7 @@ export type ExportRequest =
       /** A group the export does not read: the measured hot set comes from it. */
       readonly outside: ExportGroup;
       readonly once: boolean;
+      readonly recycle?: boolean;
       readonly readaheadKiB: number;
       /** Row-window readahead across all columns (export-stream.ts `windowBytes`); 0: per column. */
       readonly windowMiB?: number;
@@ -128,6 +130,9 @@ export interface ExportPass {
   readonly executorStats?: ExecutorExportStats;
   readonly scanCoreStats?: ScanCoreStats;
   readonly series?: {
+    readonly returnPoolMiB?: number;
+    readonly returnHits?: number;
+    readonly returnAccepted?: number;
     readonly timeOrigin: number;
     readonly pass: number;
     readonly governorMiB: number;
@@ -528,6 +533,7 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
 let series: {
   readonly opened: Awaited<ReturnType<typeof open>>;
   readonly governor: Governor;
+  readonly returns: ReturnPool;
   pass: number;
   busy: boolean;
 } | null = null;
@@ -555,6 +561,9 @@ async function seriesPass(
     const frozenExecutor = await executorReference(request);
     const execute = prepareExecutorExport(space, request.groups, {
       governor,
+      ...(request.executorVariant !== "baseline" && request.recycle
+        ? { returnPool: active.returns }
+        : {}),
       ...(request.executorVariant === "baseline" && frozenExecutor
         ? {
             executor: frozenExecutor.createExecutor(),
@@ -592,7 +601,12 @@ async function seriesPass(
         protectedBeforeMiB: 0,
         protectedAfterMiB: space.stats.cache.protectedBytes / MiB,
         kept: null,
-        series: seriesStats(),
+        series: {
+          ...seriesStats(),
+          returnPoolMiB: active.returns.evictableBytes / MiB,
+          returnHits: active.returns.hits,
+          returnAccepted: active.returns.accepted,
+        },
         ...(request.executorReference
           ? {
               executorComparison: {
@@ -615,7 +629,13 @@ async function handle(request: ExportRequest): Promise<unknown> {
       await executorReference(request.request);
       const governor = new Governor(request.request.capMiB * MiB);
       const opened = await open(request.request.dir, governor);
-      series = { governor, opened, pass: 0, busy: false };
+      series = {
+        governor,
+        opened,
+        returns: new ReturnPool(governor, 4 * MiB),
+        pass: 0,
+        busy: false,
+      };
       return seriesStats();
     }
     case "series-pass":
@@ -624,6 +644,7 @@ async function handle(request: ExportRequest): Promise<unknown> {
       const active = series;
       if (!active || active.busy) throw new Error("No idle export series to close");
       series = null;
+      active.returns.close();
       try {
         await active.opened.space.close();
       } finally {

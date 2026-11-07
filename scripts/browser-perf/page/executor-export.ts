@@ -2,8 +2,14 @@
  * policy -> real MessagePort credits. Only plan/snapshot/catalog descriptors are bench fixtures;
  * SQL lowering, B3 catalog/root reads and client row-object construction are excluded. Preparation
  * happens before profiling. Execution admission, scanning, framing, posting and credit drain count.
- * No scan-window/ownership override: this measures the executor's current production defaults.
+ * Default mode measures current production defaults. The explicit returnPool experiment supplies
+ * dedicated output reuse and always transfers buffers, including tiny frames, so release can detach
+ * every returned view. It is separate from ordinary owner credits and result lifetimes.
  */
+import type {
+  ReturnPool,
+  ReturnedBuffer,
+} from "../../../packages/core/src/next/exec/return-pool.js";
 import type { Snapshot } from "../../../packages/core/src/next/access/snapshot.js";
 import { createExecutor } from "../../../packages/core/src/next/exec/create.js";
 import type { Executor, ExecutionProfile } from "../../../packages/core/src/next/exec/executor.js";
@@ -19,6 +25,7 @@ import { benchTableOf } from "./scan-fixture.js";
 
 export interface ExecutorExportStats {
   readonly path: "production-executor";
+  readonly outputRecycling: boolean;
   readonly frames: number;
   readonly wireBytes: number;
   readonly frameBufferBytes: number;
@@ -46,6 +53,7 @@ export function prepareExecutorExport(
   groups: readonly ExportGroup[],
   options: {
     readonly governor: MemoryGovernor;
+    readonly returnPool?: ReturnPool;
     /** Bench-only frozen executor for paired comparisons, selected before timing. */
     readonly executor?: Executor;
     readonly reads?: ChunkReads;
@@ -138,6 +146,7 @@ export function prepareExecutorExport(
       sequenceSession: null,
       returning: "atExecuted",
       resultWindowBytes: DEFAULT_RESULT_WINDOW_BYTES,
+      ...(options.returnPool ? { outputBuffers: options.returnPool } : {}),
     });
     const maxima: Record<string, number> = {},
       samples: Array<Record<string, number>> = [];
@@ -155,7 +164,17 @@ export function prepareExecutorExport(
       postedBytes = 0;
     };
     port.onmessage = (event: MessageEvent<unknown>) => {
-      const message = event.data as { t?: string; target?: number; through?: number };
+      const message = event.data as {
+        t?: string;
+        target?: number;
+        through?: number;
+        buffers?: readonly ReturnedBuffer[];
+      };
+      if (message.t === "return") {
+        if (message.through !== undefined)
+          options.returnPool?.release(message.through, message.buffers ?? []);
+        return;
+      }
       if (
         message.t !== "release" ||
         message.target !== 1 ||
@@ -168,6 +187,7 @@ export function prepareExecutorExport(
       }
       if (message.through <= through) return;
       through = message.through;
+      options.returnPool?.release(through, message.buffers ?? []);
       for (const [sequence, item] of posted)
         if (sequence <= through) {
           item.frame.release();
@@ -194,10 +214,20 @@ export function prepareExecutorExport(
         maxFrameBytes = Math.max(maxFrameBytes, frame.byteLength);
         wireBytes += payloadBytes(frame.payload);
         frameBufferBytes += frame.byteLength;
-        const transfer = transferFor(frame.transfer);
+        const transfer = options.returnPool ? [...frame.transfer] : transferFor(frame.transfer);
         transferredBuffers += transfer.length;
+        const bufferIds = options.returnPool?.issue(frame.payload.sequence, transfer);
         const postStart = performance.now();
-        port.postMessage({ t: "rows", seq: 1, columns: null, frames: [frame.payload] }, transfer);
+        port.postMessage(
+          {
+            t: "rows",
+            seq: 1,
+            columns: null,
+            frames: [frame.payload],
+            ...(bufferIds ? { bufferIds } : {}),
+          },
+          transfer,
+        );
         postMs += performance.now() - postStart;
         if (transfer.some((buffer) => buffer.byteLength !== 0))
           throw new Error("Executor frame was not transferred");
@@ -219,6 +249,7 @@ export function prepareExecutorExport(
         loads: 0,
         executorStats: {
           path: "production-executor",
+          outputRecycling: options.returnPool !== undefined,
           frames,
           wireBytes,
           frameBufferBytes,

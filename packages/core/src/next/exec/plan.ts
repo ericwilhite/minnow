@@ -456,13 +456,19 @@ export function compilePlan(plan: PhysicalPlan): Program {
                   emitLocator: rel.emitLocator,
                   context,
                   loans: { borrow: (bytes) => grant.borrow(bytes, runtime.signal) },
-                  targetBytes: owner?.terminalBatchTarget(2 * target) ?? target,
+                  // Larger batches remain restricted to explicit relinquishing export consumers.
+                  targetBytes: runtime.request.outputBuffers
+                    ? (owner?.terminalBatchTarget(2 * target) ?? target)
+                    : target,
                   readWindowBytes: terminalFull ? 64 * 1024 * 1024 : 0,
                   ...(output === undefined
                     ? {}
                     : {
                         transferOutputs: "dictionary" as const,
                         outputBudget: output,
+                        ...(runtime.request.outputBuffers
+                          ? { outputBuffers: runtime.request.outputBuffers }
+                          : {}),
                         outputDictionary: (dictionary) =>
                           owner?.admitDictionary(dictionary) ?? false,
                         borrowOutputOnRefusal: true,

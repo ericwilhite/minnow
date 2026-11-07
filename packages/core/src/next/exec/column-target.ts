@@ -36,6 +36,8 @@ import { DecodeFact } from "../page/reader.js";
 export interface TargetMemory {
   take(bytes: number): void;
   give(bytes: number): void;
+  /** Exact-sized exclusive output storage, already charged to its return cache until take. */
+  reuse?(bytes: number): ArrayBuffer | null;
 }
 
 /** A row range `[from, to)`, or selected group positions `rows[0 … count)` (ascending). */
@@ -160,7 +162,8 @@ export class ColumnTarget {
       const size = n * Type.BYTES_PER_ELEMENT;
       memory.take(size);
       bytes += size;
-      const array = new Type(n);
+      const reused = memory.reuse?.(size);
+      const array = reused ? (Reflect.construct(Type, [reused]) as T) : new Type(n);
       if (!(array.buffer instanceof ArrayBuffer))
         throw new TypeError("Expected dedicated ArrayBuffer");
       buffers.push(array.buffer);
