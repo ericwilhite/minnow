@@ -220,7 +220,7 @@ export class ColumnStore {
   }
 
   get chunkCount(): number {
-    return this.#columns[0]?.chunks.length ?? 0;
+    return this.#columns[0]?.chunks.length ?? Math.ceil(this.rows / this.chunkRows);
   }
 
   /** The tier of column `c` (int64-family repr, or decimal coefficient tier). */
@@ -540,6 +540,15 @@ export class ColumnStore {
     varlenNeed: (c: number, n: number, done: number) => number,
   ): number {
     if (this.#closed) return 0;
+    // A zero-column tuple still contributes a row, but allocates no column chunks.
+    if (this.#columns.length === 0) {
+      const taken = Math.max(
+        0,
+        this.targetBytes === Infinity ? count : Math.min(count, this.chunkRows - this.rows),
+      );
+      this.rows += taken;
+      return taken;
+    }
     let done = 0;
     while (done < count) {
       if (this.rows === this.chunkCount * this.chunkRows) {
