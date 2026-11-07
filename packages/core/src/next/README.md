@@ -1296,7 +1296,8 @@ including removal of a hidden order key, are supported; computed expressions and
 the generic recipe. LIMIT/OFFSET validation precedes cursor opening, and cursor requests are
 bounded by remaining demand. The SQL recipe skips OFFSET payload. Cursor cancellation closes
 once and drains an outstanding write before its output arena closes. Restore buffers retain
-their admitted minimum between batches; physically monotonic cursor batches can stream payload
+their normal admitted minimum between batches, independently of repayable loans;
+physically monotonic cursor batches can stream payload
 without an ordinal sort. Otherwise the charged, spillable sort restores cursor order.
 The current write-path range cursor still collects the whole range internally before its first
 output. Early executor termination therefore bounds requested locators and payload reads, but

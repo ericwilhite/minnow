@@ -171,7 +171,7 @@ export function scopedGrant(grant: Grant, minimum: number): Grant {
     release(n) {
       // A sort may return unused holdings while reclaiming, before close. Its next
       // cursor batch owns the same admission, so only the surplus can leave this view.
-      if (!closed) grant.release(Math.min(n, Math.max(0, grant.held - minimum)));
+      if (!closed) grant.release(Math.min(n, Math.max(0, grant.held - grant.loaned - minimum)));
     },
     makeRoom: (n, signal) =>
       closed

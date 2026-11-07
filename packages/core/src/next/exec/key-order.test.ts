@@ -149,6 +149,7 @@ it.each(seedsFor("next-key-order-held-floor", [0xe105, 0xe106]))(
     const reach = createReach("restore floor", [
       "fixed-retained",
       "active-reclaim",
+      "loan-retained",
       "competing-holder",
       "next-batch",
       "released",
@@ -159,7 +160,8 @@ it.each(seedsFor("next-key-order-held-floor", [0xe105, 0xe106]))(
         fc.integer({ min: 64, max: 4096 }),
         fc.integer({ min: 0, max: 4 }),
         fc.boolean(),
-        async (units, bytes, growth, reclaim) => {
+        fc.boolean(),
+        async (units, bytes, growth, reclaim, borrow) => {
           reach.beginHistory();
           const governor = new Governor(8 << 20),
             minimum = units * 65536;
@@ -174,12 +176,18 @@ it.each(seedsFor("next-key-order-held-floor", [0xe105, 0xe106]))(
             expect(stage.allocate(bytes)).toBe(true);
             expect(stage.tryGrow(growth * 65536)).toBe(true);
             stage.free(bytes);
+            const loan = borrow ? await stage.borrow(bytes) : null;
             if (reclaim) {
               // Sort.reclaim releases unused holdings before its final close. The next
               // cursor batch still needs the admission floor even when this sort spilled.
               stage.release(stage.held - stage.allocated - stage.loaned);
-              expect(restore.held).toBe(minimum);
+              expect(restore.held - restore.loaned).toBe(minimum);
               reach.reach("active-reclaim");
+            }
+            if (loan !== null) {
+              loan.repay();
+              expect(restore.held).toBe(minimum + (reclaim ? 0 : growth * 65536));
+              reach.reach("loan-retained");
             }
             stage.close();
             expect(restore.held).toBe(minimum);
@@ -209,8 +217,8 @@ it.each(seedsFor("next-key-order-held-floor", [0xe105, 0xe106]))(
         seed,
         numRuns: 8,
         examples: [
-          [16, 4096, 4, true],
-          [1, 64, 0, false],
+          [16, 4096, 4, true, true],
+          [1, 64, 0, false, false],
         ],
       },
     );
