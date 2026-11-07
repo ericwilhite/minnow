@@ -242,13 +242,18 @@ even if quota or request-failure processing resumes after the abort event.
 
 ## A connection that stops answering
 
-IndexedDB requests cannot be cancelled and report no progress, so the adapter keeps one deadline
-for the whole connection: if thirty seconds pass with no storage event at all while it has work
-outstanding, every waiting call fails with `StorageUnresponsiveError` and the store refuses new
-work rather than queueing behind something that never moves. Any event resets the deadline, so a
-transaction waiting behind a genuinely long one is never mistaken for a wedge.
-Native request and transaction events count even when a bulk operation waits only for the
-transaction to finish, without awaiting each request separately.
+IndexedDB requests cannot be cancelled, so the adapter keeps one silence deadline for the whole
+connection while work is outstanding. Native request and transaction response events (`success`,
+`error`, `complete` and `abort`), and awaited request/transaction settlements, reset this deadline.
+This includes cursor continuation and prevented request errors, even when a bulk operation waits
+only for transaction completion. If thirty seconds pass without these responses, every waiting
+call fails with `StorageUnresponsiveError` and the store refuses new work.
+
+A `versionchange` notification starts superseding and closing; it does not reset this silence
+clock. An open request's `blocked` notification belongs to the separate open/upgrade wait policy,
+not this connection clock. Notifications that another tab wants the database do not prove that
+pending data requests are answering.
+
 Progress advances the deadline without replacing a native timer for every request. The timer
 checks the latest deadline when it wakes; a newly queued request does not count as progress.
 `unresponsiveAfterMs` on `IndexedDbBlockStore.open` changes the deadline. The deadline outlives

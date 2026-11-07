@@ -675,7 +675,8 @@ export interface IndexedDbBlockStoreOptions {
    */
   uniqueKeyCacheBytes?: number;
   /**
-   * How long the connection may answer nothing at all, while it has work outstanding, before
+   * How long the connection may go without request/transaction responses while work is
+   * outstanding (see `INDEXEDDB_UNRESPONSIVE_AFTER_MS`), before
    * every waiting call fails with `StorageUnresponsiveError` and the store refuses new work.
    * Defaults to `INDEXEDDB_UNRESPONSIVE_AFTER_MS`.
    */
@@ -794,7 +795,7 @@ export class IndexedDbBlockStore implements BlockStore {
     });
     stallGuards.set(db, this.#stallGuard);
     // Requests need not have an adapter-owned promise: bulk writes can wait only for the
-    // transaction's completion. Observe native request/transaction progress on this connection.
+    // transaction's completion. Observe request/transaction response events on this connection.
     // Success does not bubble, but its event path includes the transaction and connection.
     const progress = () => this.#stallGuard.progress();
     for (const type of ["success", "error", "complete", "abort"])
@@ -10164,11 +10165,12 @@ async function readIndexedDbVersion(factory: IDBFactory, name: string): Promise<
 }
 
 /**
- * How long a connection may go without a single IndexedDB event, while it has work outstanding,
- * before the adapter calls it unresponsive. Nothing in IndexedDB can be cancelled and nothing
- * reports progress, so this is the only way for a store to tell a wedged browser from a busy
- * one: any event anywhere on the connection resets the deadline, which means a transaction
- * queued behind a genuinely long one is never mistaken for a wedge — only total silence is.
+ * How long a connection may go without request/transaction responses while work is outstanding.
+ * Native success, error, complete and abort events, plus awaited request/transaction settlements,
+ * reset this connection's silence deadline. This includes cursor continuation and prevented
+ * request errors, even when the caller waits only for the transaction to finish.
+ * Enqueueing work is not a response. Versionchange starts superseding/closing instead of
+ * resetting this deadline; blocked belongs to the separate open request's wait policy.
  *
  * See `StorageUnresponsiveError` for the wedge this bounds. Thirty seconds is far longer than
  * any single request takes and comfortably inside the worker client's own request deadline, so

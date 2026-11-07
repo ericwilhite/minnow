@@ -1945,8 +1945,8 @@ each reduced to a deterministic test in `simulator-regressions.test.ts`.
   the document that created the worker goes away; until then every connection to that database
   blocks, including connections opened afterwards in other tabs, and no event ever arrives. A read
   through a replacement worker therefore never returned. The adapter now keeps one deadline for
-  the whole connection — thirty seconds of no storage event at all while work is outstanding, reset
-  by any event, so a transaction queued behind a long one is never mistaken for a wedge — and fails
+  the whole connection — thirty seconds without an observed request/transaction response while
+  work is outstanding — and fails
   every waiting call with `StorageUnresponsiveError`, then refuses new work rather than queueing
   behind it. The error says what the remedy is: reload the page, because a new worker in the same
   document opens the same wedged database.

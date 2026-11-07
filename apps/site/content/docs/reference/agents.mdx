@@ -352,11 +352,14 @@ machines: https://minnowdb.com/llms.txt
   IndexedDB transactions is still queued behind another can leave WebKit holding that
   transaction, even after its tab reloads, and every transaction that overlaps it — in new
   connections and other tabs too — blocks meanwhile. The engine bounds that wait and throws
-  `StorageUnresponsiveError` after thirty seconds of total storage silence, from `open` and
+  `StorageUnresponsiveError` after its silence budget (thirty seconds by default), from `open` and
   `ready()` too; the remedy is to close the site's tabs and open it again, not `reopen()`, which
   opens the same wedged database.
-  Native request and transaction events reset this clock, including bulk requests the caller
-  does not await separately.
+  On an open connection with work outstanding, request/transaction responses (`success`,
+  `error`, `complete`, `abort`) and awaited request/transaction settlements reset this clock,
+  including bulk requests, cursor continuation and prevented request errors. `versionchange`
+  starts superseding/closing without resetting it; open-request `blocked` notifications use
+  the separate open/upgrade wait policy. Enqueueing work does not count as a response.
 - OPFS deletion requires Web Locks and all connections closed. `OpfsDatabaseInUseError` refuses
   deletion while a current client is open; a client just closed is waited for, not refused. Close
   pre-0.9.0 clients too: they do not participate in the deletion lock protocol.

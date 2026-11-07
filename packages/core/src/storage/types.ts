@@ -3125,8 +3125,10 @@ export class StorageConnectionClosedError extends ConnectionLostError {
 }
 
 /**
- * The store stopped answering: the whole connection went the adapter's unresponsive deadline
- * without a single storage event while it had work outstanding. The remedy is to close the
+ * The store exceeded the adapter's unresponsive deadline. On an open IndexedDB connection with
+ * work outstanding, request/transaction response events and awaited request/transaction
+ * settlements reset its silence deadline. Versionchange starts superseding/closing instead;
+ * blocked notifications belong to the separate open-request wait policy. The remedy is to close the
  * site's tabs, then open the site again — not to retry: the connection cannot recover, and a
  * fresh one, in the same page or after reloading it, may be wedged by the same cause.
  *
