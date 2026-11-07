@@ -1732,12 +1732,17 @@ with no stored-format change.
   session; the default is repeatable read. Every accepted isolation level uses the engine's
   snapshot level (lowering refuses SERIALIZABLE); DEFERRABLE has no execution effect.
   SET outside a transaction changes nothing; the wire has no PostgreSQL warning notices.
-- Effective row locks and ordered duplicate SET mode instructions await reviewed B6 public
-  `rowLocking` and `modeItems` metadata. Owner checks consume those interfaces without parsing
-  SQL; interface tests run now. Real-SQL generators remain explicitly pending in the R21
-  registry (`testing/divergences.ts`, `testing/owner-lowering-pending.test.ts`), because the
-  pinned lowerer discards locking clauses and exposes only the final modes. Until that
-  dependency lands, READ ONLY locking reads and order-sensitive SET are known gaps.
+- READ ONLY refuses effective row locks (25006) before normal, cached or synchronous
+  execution. The required public `rowLocking` metadata supplies effective intent after view
+  and CTE expansion, including a locking CTE referenced only by an unused CTE. An outer lock
+  on a CTE reference does not propagate into its body; a truly unused locking CTE contributes
+  no intent. The generated PG campaign covers these controls and cache hits.
+- BEGIN, START TRANSACTION and SET consume the public `modeItems` list in written order,
+  retaining duplicates and validating every instruction before applying resources. Inside a
+  savepoint starting READ WRITE, READ WRITE then READ ONLY succeeds but READ ONLY then READ
+  WRITE fails (25001). When already READ ONLY, both orders fail. Both SQL metadata campaigns
+  in `testing/owner-lowering-metadata.test.ts` are active; the former R21 pending entries are
+  resolved. They retain their committed seed keys for replay.
 - The hidden-flush browser control terminates the worker before closing its tab. An ordinary
   page close can flush through visibility or graceful step-down, so it cannot require data loss.
 - Tests: in process (`testing/owner-*.test.ts`, the election ones on in-memory Web Locks) and
@@ -2044,8 +2049,7 @@ isolation items have the named level, and deferrable items have a boolean. Other
 controls carry an empty list. `modes` remains the final value of each kind; the owner must
 validate every item in order before using it. In a savepoint that starts READ WRITE,
 `SET TRANSACTION READ ONLY, READ WRITE` fails with 25001, while `READ WRITE, READ ONLY`
-succeeds. If it already starts READ ONLY, either list fails. This is metadata for B5;
-it does not wire owner enforcement.
+succeeds. If it already starts READ ONLY, either list fails. Lowering supplies the ordered metadata; the owner validates it before applying accepted modes.
 
 The parser records CTE reference counts before execution pruning. Referenced bodies remain
 as `CompiledQuery.rowLockingCtes`, so catalog expansion includes locking views in a CTE

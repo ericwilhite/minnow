@@ -4,11 +4,7 @@ import fc from "fast-check";
 import { expect, it, vi } from "vitest";
 import { createReach, OWNER_SEQUENCE_EFFECT_STATES } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
-import {
-  guardedSequences,
-  type EffectiveRowLocking,
-  type OrderedTransactionModes,
-} from "../owner/transaction-modes.js";
+import { guardedSequences } from "../owner/transaction-modes.js";
 import type { PlannedStatement, RunContext } from "../owner/engine.js";
 import { cleanups, harness } from "./owner-harness.js";
 
@@ -184,7 +180,7 @@ it("the sequence-access guard checks next and set at call time, before delegatin
   expect(access.set).toHaveBeenCalledTimes(1);
 });
 
-it.each(["UPDATE", "NO KEY UPDATE", "SHARE", "KEY SHARE"] as const)(
+it.each(["update", "noKeyUpdate", "share", "keyShare"] as const)(
   "owner honors public effective %s metadata on normal and point paths",
   async (rowLocking) => {
     const h = harness();
@@ -198,7 +194,7 @@ it.each(["UPDATE", "NO KEY UPDATE", "SHARE", "KEY SHARE"] as const)(
           const plan = h.engine.plan(point ? "SELECT id FROM t WHERE id=1" : "SELECT id FROM t");
           const locked: PlannedStatement = {
             ...plan,
-            lowered: { ...plan.lowered, rowLocking } as typeof plan.lowered & EffectiveRowLocking,
+            lowered: { ...plan.lowered, rowLocking },
           };
           if (point)
             expect(() => session.runNow(locked, [], context)).toThrow(
@@ -238,7 +234,7 @@ it("owner consumes ordered public mode items without collapsing access transitio
         const lowered = {
           ...plan.lowered,
           modeItems: values.map((value) => ({ kind: "access" as const, value })),
-        } as typeof plan.lowered & OrderedTransactionModes;
+        };
         const run = session.run({ ...plan, lowered }, [], context);
         if (reversed) {
           await run.done;
@@ -267,8 +263,7 @@ it("public none locking metadata leaves ordinary reads allowed", async () => {
         const plan = h.engine.plan(point ? "SELECT id FROM t WHERE id=1" : "SELECT id FROM t");
         const unlocked: PlannedStatement = {
           ...plan,
-          lowered: { ...plan.lowered, rowLocking: "none" } as typeof plan.lowered &
-            EffectiveRowLocking,
+          lowered: { ...plan.lowered, rowLocking: "none" },
         };
         if (point) {
           const run = session.runNow(unlocked, [], context);

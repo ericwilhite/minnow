@@ -67,13 +67,11 @@ import type { MemoryGovernor } from "../memory/governor.js";
 import { ReturnPool } from "../exec/return-pool.js";
 import type { SpillService } from "../spill/contract.js";
 import { PG_EPOCH_UNIX_MICROS } from "../temporal.js";
-import type { TransactionModes } from "../lower/lowerer.js";
+import type { LoweredRowLocking, TransactionModes } from "../lower/lowerer.js";
 import {
   changedTransactionModes,
   guardedSequences,
   type AppliedTransactionModes,
-  type EffectiveRowLocking,
-  type OrderedTransactionModes,
 } from "./transaction-modes.js";
 import { RuleCache } from "./rule-cache.js";
 import { PlanCache } from "./plan-cache.js";
@@ -137,6 +135,13 @@ export interface ComposeOptions {
   readonly transactionIdleTimeoutMs?: number;
 }
 
+/** Public lowering strengths, rendered as SQL in an admission error. */
+const ROW_LOCK_COMMANDS: Readonly<Record<Exclude<LoweredRowLocking, "none">, string>> = {
+  keyShare: "SELECT FOR KEY SHARE",
+  share: "SELECT FOR SHARE",
+  noKeyUpdate: "SELECT FOR NO KEY UPDATE",
+  update: "SELECT FOR UPDATE",
+};
 const DEFAULT_TRANSACTION_MODES: AppliedTransactionModes = {
   readOnly: false,
   isolation: "repeatable read",
@@ -725,14 +730,9 @@ class ComposedSession implements EngineSession {
       (lowered.kind === "query" || lowered.kind === "modify" || lowered.kind === "ddl")
     )
       this.#snapshotTaken = true;
-    const locking = (lowered as LoweredStatement & EffectiveRowLocking).rowLocking;
-    if (
-      this.#modes.readOnly &&
-      lowered.kind === "query" &&
-      locking !== undefined &&
-      locking !== "none"
-    )
-      return new ReadOnlyTransactionError(`SELECT FOR ${locking}`);
+    const locking = lowered.rowLocking;
+    if (this.#modes.readOnly && lowered.kind === "query" && locking !== "none")
+      return new ReadOnlyTransactionError(ROW_LOCK_COMMANDS[locking]);
     if (this.#modes.readOnly && (lowered.kind === "modify" || lowered.kind === "ddl"))
       return new ReadOnlyTransactionError(lowered.command);
     return null;
@@ -1149,8 +1149,7 @@ class ComposedSession implements EngineSession {
         if (this.#state !== "idle") return done(lowered.command); // PostgreSQL: a warning only
         const modes = changedTransactionModes(
           DEFAULT_TRANSACTION_MODES,
-          lowered.modes,
-          (lowered as typeof lowered & OrderedTransactionModes).modeItems,
+          lowered.modeItems,
           false,
           false,
         );
@@ -1219,8 +1218,7 @@ class ComposedSession implements EngineSession {
         try {
           modes = changedTransactionModes(
             this.#modes,
-            lowered.modes,
-            (lowered as typeof lowered & OrderedTransactionModes).modeItems,
+            lowered.modeItems,
             this.#snapshotTaken,
             this.#savepoints.length > 0,
           );

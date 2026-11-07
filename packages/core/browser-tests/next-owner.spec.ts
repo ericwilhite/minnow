@@ -567,3 +567,54 @@ test("read-only transitions retain earlier writes and obey savepoint restriction
   });
   await call(a, "query", "ROLLBACK", [], 1);
 });
+
+test("public lock intent and ordered modes survive owner cache hits", async ({ page }) => {
+  const name = dbName("locking-order");
+  const a = await tab(page);
+  await call(a, "wipe", name);
+  await call(a, "open", name);
+  await call(a, "query", "CREATE TABLE t (id INTEGER PRIMARY KEY)");
+  await call(a, "query", "INSERT INTO t VALUES (1), (2)");
+  await call(a, "query", "CREATE VIEW v AS SELECT * FROM t FOR SHARE");
+  const locking = [
+    ...["UPDATE", "NO KEY UPDATE", "SHARE", "KEY SHARE"].map(
+      (strength) => `SELECT * FROM t WHERE id = 1 FOR ${strength}`,
+    ),
+    "SELECT * FROM v",
+    "WITH x AS (SELECT * FROM t FOR UPDATE), unused AS (SELECT * FROM x) SELECT 1 AS n",
+    "WITH x AS (SELECT * FROM t FOR UPDATE), y AS (SELECT * FROM x), unused AS (SELECT * FROM y) SELECT 1 AS n",
+  ];
+  for (const sql of locking) {
+    expect(await call(a, "query", sql.replace("id = 1", "id = 2"))).toHaveProperty("rows");
+    await call(a, "query", "BEGIN READ ONLY", [], 1);
+    expect(await call(a, "query", sql, [], 1), sql).toMatchObject({
+      error: "ReadOnlyTransactionError",
+      sqlState: "25006",
+    });
+    await call(a, "query", "ROLLBACK", [], 1);
+  }
+  await call(a, "query", "BEGIN READ ONLY", [], 1);
+  expect(
+    await call(a, "query", "WITH x AS (SELECT * FROM t FOR UPDATE) SELECT 1 AS n", [], 1),
+  ).toMatchObject({ rows: [[1]] });
+  expect(
+    await call(a, "query", "WITH x AS (SELECT * FROM t) SELECT * FROM x FOR UPDATE", [], 1),
+  ).toMatchObject({ rows: [[1], [2]] });
+  await call(a, "query", "ROLLBACK", [], 1);
+  for (const initial of ["WRITE", "ONLY"])
+    for (const reversed of [false, true]) {
+      await call(a, "query", `BEGIN READ ${initial}`, [], 1);
+      await call(a, "query", "SAVEPOINT s", [], 1);
+      const sql =
+        "SET TRANSACTION " + (reversed ? "READ WRITE, READ ONLY" : "READ ONLY, READ WRITE");
+      const result = await call(a, "query", sql, [], 1);
+      if (initial === "WRITE" && reversed) {
+        expect(result).toMatchObject({ summary: { transaction: "open" } });
+        expect(await call(a, "query", "INSERT INTO t VALUES (3)", [], 1)).toMatchObject({
+          error: "ReadOnlyTransactionError",
+          sqlState: "25006",
+        });
+      } else expect(result).toMatchObject({ error: "TransactionModeError", sqlState: "25001" });
+      await call(a, "query", "ROLLBACK", [], 1);
+    }
+});

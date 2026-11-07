@@ -139,6 +139,9 @@ const plain = (result: ClientResult) => ({
 const errorOf = (error: unknown) => ({
   error: error instanceof Error ? error.name : "Error",
   message: error instanceof Error ? error.message : String(error),
+  ...(typeof error === "object" && error !== null && "sqlState" in error
+    ? { sqlState: error.sqlState }
+    : {}),
   ...(typeof error === "object" && error !== null && "effect" in error
     ? { effect: error.effect }
     : {}),

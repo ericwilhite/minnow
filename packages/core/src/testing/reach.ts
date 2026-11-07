@@ -1222,8 +1222,8 @@ export const OWNER_SEQUENCE_EFFECT_STATES = [
   "sequence metadata",
 ] as const;
 
-/** Pending B6 metadata integration: declared targets only; owner reach is not claimed until enabled. */
-export const OWNER_PENDING_LOCK_STATES = [
+/** Effective lock admission after expansion, including cached and synchronous owner paths. */
+export const OWNER_ROW_LOCK_STATES = [
   "direct",
   "point",
   "empty",
@@ -1233,13 +1233,20 @@ export const OWNER_PENDING_LOCK_STATES = [
   "view-body",
   "cte-body",
   "cte-reference",
+  "unused-cte",
+  "cte-graph-one",
+  "cte-graph-two",
   "constants",
+  "cold locking refusal",
+  "cached locking refusal",
+  "normal point refusal",
+  "synchronous point refusal",
   "UPDATE",
   "NO KEY UPDATE",
   "SHARE",
   "KEY SHARE",
 ] as const;
-export const OWNER_PENDING_ORDER_STATES = [
+export const OWNER_MODE_ORDER_STATES = [
   "BEGIN",
   "START TRANSACTION",
   "SET TRANSACTION",
@@ -1252,4 +1259,6 @@ export const OWNER_PENDING_ORDER_STATES = [
   "read-write SET entry",
   "readOnly then readWrite under writable savepoint",
   "readWrite then readOnly under writable savepoint",
+  "readOnly then readWrite under read-only savepoint",
+  "readWrite then readOnly under read-only savepoint",
 ] as const;
