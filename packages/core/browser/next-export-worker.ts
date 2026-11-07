@@ -78,6 +78,8 @@ export type ExportRequest =
       readonly scanIO?: "batch" | "window";
       readonly scanOutput?: "borrowed" | "flat" | "dictionary";
       readonly resultPort?: MessagePort;
+      readonly executorVariant?: "baseline" | "candidate";
+      readonly executorReference?: string;
     }
   | { readonly op: "remove"; readonly dir: string };
 
@@ -115,6 +117,10 @@ export interface ExportPass {
   };
   readonly readMiB: number;
   readonly mode: "pages" | "scan" | "scan-core" | "scan-adapter";
+  readonly executorComparison?: {
+    readonly reference: string;
+    readonly variant: "baseline" | "candidate" | undefined;
+  };
   readonly scanStats?: ScanExportStats;
   readonly executorStats?: ExecutorExportStats;
   readonly scanCoreStats?: ScanCoreStats;
@@ -337,10 +343,27 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
     throw new Error("Production executor export does not accept historical adapter overrides");
   // Hot-set setup is outside timing. The real execution owns its own admission/result grants.
   if (request.mode === "scan") grant.close();
+  const frozenExecutor = request.executorReference
+    ? ((await import(
+        /* @vite-ignore */ new URL("../src/next/exec/create.ts?executorBaseline", import.meta.url)
+          .href
+      )) as typeof import("../src/next/exec/create.js") & {
+        EXECUTOR_BASELINE_REVISION?: string;
+        EXECUTOR_BASELINE_READS: typeof import("../src/next/exec/scan.js").chunkReads;
+      })
+    : null;
+  if (frozenExecutor && frozenExecutor.EXECUTOR_BASELINE_REVISION !== request.executorReference)
+    throw new Error("Wrong frozen executor revision");
   const executeExport =
     request.mode === "scan" && request.resultPort
       ? prepareExecutorExport(space, request.groups, {
           governor,
+          ...(request.executorVariant === "baseline" && frozenExecutor
+            ? {
+                executor: frozenExecutor.createExecutor(),
+                reads: frozenExecutor.EXECUTOR_BASELINE_READS,
+              }
+            : {}),
           port: request.resultPort,
           memory: () => ({
             governorHeld: governor.usedBytes,
@@ -424,6 +447,14 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
       ...(phases ? { phases: { ...phases } } : {}),
       ...(baselineCommit ? { baselineCommit } : {}),
       ...(shapeComparison ? { shapeComparison } : {}),
+      ...(request.executorReference
+        ? {
+            executorComparison: {
+              reference: request.executorReference,
+              variant: request.executorVariant,
+            },
+          }
+        : {}),
       mode: request.mode ?? "pages",
       readMiB: MAX_READ_BYTES / MiB,
       verifying: VERIFY_CACHED_BYTES,

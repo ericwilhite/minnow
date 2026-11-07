@@ -437,3 +437,9 @@ export const EXECUTOR_EXPORT_REACH = [
   "source survives transfer",
   "execution charges returned",
 ] as const;
+
+/** Stratified terminal full export and nonterminal/subset/filter policy checks. */
+export const EXECUTOR_POLICY_REACH = {
+  full: "terminal one-pass window",
+  cached: "selective/consumer cache policy",
+} as const;

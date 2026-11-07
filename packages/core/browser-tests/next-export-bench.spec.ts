@@ -73,6 +73,7 @@ const WARM_SHARE = 0.98;
 const DISTINCT = Number(process.env.MINNOW_EXPORT_DISTINCT ?? 4);
 /** MINNOW_EXPORT_FOCUS=1: only Gate A's configuration (cold ×5, warm ×5, a profiled pass). */
 const COMPARE_STREAM = process.env.MINNOW_EXPORT_COMPARE_STREAM === "1";
+const EXECUTOR_REFERENCE = process.env.MINNOW_EXPORT_EXECUTOR_REFERENCE;
 const SCAN_SHAPE_TRANSPORT = process.env.MINNOW_EXPORT_SCAN_SHAPE_TRANSPORT === "1";
 const SCAN_SHAPE_COMPARE = process.env.MINNOW_EXPORT_SCAN_SHAPE_COMPARE === "1";
 const SCAN_CORE_PROFILE = process.env.MINNOW_EXPORT_SCAN_CORE_PROFILE === "1";
@@ -85,6 +86,7 @@ const SCAN_BATCH_COMPLETED = process.env.MINNOW_EXPORT_SCAN_BATCH_COMPLETED ?? "
 const SCAN_IO_COMPARE = process.env.MINNOW_EXPORT_SCAN_IO_COMPARE === "1";
 const SCAN_COMPARE =
   process.env.MINNOW_EXPORT_SCAN_COMPARE === "1" ||
+  !!EXECUTOR_REFERENCE ||
   SCAN_PROFILE ||
   SCAN_SHAPE_COMPARE ||
   FRAME_COPY_COMPARE ||
@@ -359,6 +361,9 @@ interface Row {
   readonly readMiB: number;
   readonly mode: "pages" | "scan" | "scan-core" | "scan-adapter";
   readonly scanStats?: Awaited<ReturnType<Run["exportPass"]>>[number]["scanStats"];
+  readonly executorComparison?: Awaited<
+    ReturnType<Run["exportPass"]>
+  >[number]["executorComparison"];
   readonly executorStats?: Awaited<ReturnType<Run["exportPass"]>>[number]["executorStats"];
   readonly scanCoreStats?: Awaited<ReturnType<Run["exportPass"]>>[number]["scanCoreStats"];
   readonly afterWorkerClose?: Awaited<ReturnType<Run["exportPass"]>>[number]["afterWorkerClose"];
@@ -500,6 +505,10 @@ test.describe("rebuild core export on OPFS (bench)", () => {
         expect(pass.shapeComparison?.variant).toBe(options.scanShape);
         expect(pass.shapeComparison?.classes).toHaveLength(3);
       }
+      if (EXECUTOR_REFERENCE && options.mode === "scan") {
+        expect(pass.executorComparison?.reference).toBe(EXECUTOR_REFERENCE);
+        expect(pass.executorComparison?.variant).toBe(options.executorVariant);
+      }
       if (options.mode === "scan") {
         expect(pass.scanStats, "Gate A must not run the stand-in adapter").toBeUndefined();
         expect(pass.executorStats?.path).toBe("production-executor");
@@ -585,6 +594,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
         mode: pass.mode,
         ...(pass.scanStats ? { scanStats: pass.scanStats } : {}),
         ...(pass.executorStats ? { executorStats: pass.executorStats } : {}),
+        ...(pass.executorComparison ? { executorComparison: pass.executorComparison } : {}),
         ...(pass.scanCoreStats ? { scanCoreStats: pass.scanCoreStats } : {}),
         ...(pass.afterWorkerClose ? { afterWorkerClose: pass.afterWorkerClose } : {}),
         rowsPerSecond: Math.round(pass.rows / (pass.ms / 1000)),
@@ -613,7 +623,21 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     };
 
     const base = { once: true, capMiB: 512, passes: 1, groups: exported };
-    if (SCAN_BATCH_COMPARE) {
+    if (EXECUTOR_REFERENCE) {
+      for (let round = 0; round < 5; round++)
+        for (const executorVariant of round % 2 === 0
+          ? (["baseline", "candidate"] as const)
+          : (["candidate", "baseline"] as const))
+          await measure(`cold executor ${executorVariant} round ${String(round)}`, true, false, {
+            ...base,
+            mode: "scan",
+            readaheadKiB: 256,
+            auditWorkingSet: false,
+            profile: true,
+            executorReference: EXECUTOR_REFERENCE,
+            executorVariant,
+          });
+    } else if (SCAN_BATCH_COMPARE) {
       const options = {
         ...base,
         mode: "scan-adapter" as const,

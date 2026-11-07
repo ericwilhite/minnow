@@ -154,6 +154,8 @@ export async function exportPass(options: {
   readonly scanRange?: "baseline" | "candidate";
   readonly scanShape?: "baseline" | "candidate";
   readonly scanTargetMiB?: 1 | 2 | 3;
+  readonly executorVariant?: "baseline" | "candidate";
+  readonly executorReference?: string;
   readonly scanIO?: "batch" | "window";
   readonly scanOutput?: "borrowed" | "flat" | "dictionary";
 }): Promise<ExportPass[]> {
@@ -178,6 +180,10 @@ export async function exportPass(options: {
     ...(options.scanRange === undefined ? {} : { scanRange: options.scanRange }),
     ...(options.scanShape === undefined ? {} : { scanShape: options.scanShape }),
     ...(options.scanTargetMiB === undefined ? {} : { scanTargetMiB: options.scanTargetMiB }),
+    ...(options.executorVariant === undefined ? {} : { executorVariant: options.executorVariant }),
+    ...(options.executorReference === undefined
+      ? {}
+      : { executorReference: options.executorReference }),
     ...(options.scanIO === undefined ? {} : { scanIO: options.scanIO }),
     ...(options.scanOutput === undefined ? {} : { scanOutput: options.scanOutput }),
     ...(options.groupDepth === undefined ? {} : { groupDepth: options.groupDepth }),

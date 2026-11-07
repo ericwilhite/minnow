@@ -1,3 +1,4 @@
+import { executorSnapshot } from "./scripts/browser-perf/executor-comparison.js";
 // eslint-disable-next-line no-restricted-imports -- Node-only benchmark compiler; never shipped.
 import { execFileSync } from "node:child_process";
 import { defineConfig, type Plugin } from "vite";
@@ -41,6 +42,9 @@ const exportBaseline =
 export default defineConfig({
   plugins: [
     isolatedPages,
+    ...(process.env.MINNOW_EXPORT_EXECUTOR_REFERENCE
+      ? [executorSnapshot(process.env.MINNOW_EXPORT_EXECUTOR_REFERENCE).vite]
+      : []),
     ...(process.env.MINNOW_EXPORT_SCAN_SHAPE_COMPARE === "1" ? [shapeComparison()] : []),
     ...(process.env.MINNOW_EXPORT_SCAN_RANGE_COMPARE === "1"
       ? [

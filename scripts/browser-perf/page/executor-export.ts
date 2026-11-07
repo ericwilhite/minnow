@@ -6,8 +6,8 @@
  */
 import type { Snapshot } from "../../../packages/core/src/next/access/snapshot.js";
 import { createExecutor } from "../../../packages/core/src/next/exec/create.js";
-import type { ExecutionProfile } from "../../../packages/core/src/next/exec/executor.js";
-import { chunkReads } from "../../../packages/core/src/next/exec/scan.js";
+import type { Executor, ExecutionProfile } from "../../../packages/core/src/next/exec/executor.js";
+import { chunkReads, type ChunkReads } from "../../../packages/core/src/next/exec/scan.js";
 import type { ResultFrame } from "../../../packages/core/src/next/exec/result.js";
 import type { PhysicalPlan } from "../../../packages/core/src/next/ir/ir.js";
 import type { MemoryGovernor } from "../../../packages/core/src/next/memory/governor.js";
@@ -46,6 +46,9 @@ export function prepareExecutorExport(
   groups: readonly ExportGroup[],
   options: {
     readonly governor: MemoryGovernor;
+    /** Bench-only frozen executor for paired comparisons, selected before timing. */
+    readonly executor?: Executor;
+    readonly reads?: ChunkReads;
     readonly port: MessagePort;
     readonly memory?: () => Record<string, number>;
   },
@@ -104,7 +107,7 @@ export function prepareExecutorExport(
     catalogVersion: 1,
     volatile: false,
   };
-  const prepared = createExecutor().prepare(plan);
+  const prepared = (options.executor ?? createExecutor()).prepare(plan);
   return async () => {
     const started = performance.now(),
       port = options.port;
@@ -127,7 +130,7 @@ export function prepareExecutorExport(
       statement: null,
       parameters: [],
       statementTime: 0n,
-      reads: chunkReads,
+      reads: options.reads ?? chunkReads,
       governor: options.governor,
       spill: { bytesInUse: 0, create: unsupported, sweep: async () => undefined },
       queryId: 1,

@@ -361,6 +361,15 @@ export function compilePlan(plan: PhysicalPlan): Program {
   const fixed = (rel: Rel, minimum: number | ((cap: number) => number)) =>
     admissions.push({ rel, minimum });
   const ids = new Set<number>();
+  // SQL SELECT * may retain an identity projection for output names. It neither retains
+  // source batches nor re-reads them; computed/reordered projections and other consumers stop here.
+  let terminalInput = plan.root;
+  while (
+    terminalInput.op === "project" &&
+    terminalInput.exprs.length === terminalInput.input.output.length &&
+    terminalInput.exprs.every((expr, k) => expr.op === "column" && expr.index === k)
+  )
+    terminalInput = terminalInput.input;
   const prepare = (rel: Rel): Recipe => {
     if (ids.has(rel.id))
       throw new UnsupportedPlanError("a repeated relational operator id", { construct: "plan" });
@@ -398,6 +407,14 @@ export function compilePlan(plan: PhysicalPlan): Program {
       case "scan": {
         const input = types(rel).slice(0, rel.columns.length),
           filter = rel.filter;
+        // Only the terminal full-table export has no downstream consumer that may re-read.
+        // Other scans keep their selective/cache policy; TableScan also handles deletion,
+        // reader capability, memory refusal, pacing and cancellation fallbacks itself.
+        const terminal =
+          rel === terminalInput &&
+          filter === null &&
+          rel.runtimeFilters.length === 0 &&
+          !rel.emitLocator;
         const kernelBytes =
           filter === null
             ? 0
@@ -432,6 +449,12 @@ export function compilePlan(plan: PhysicalPlan): Program {
                   context,
                   loans: { borrow: (bytes) => grant.borrow(bytes, runtime.signal) },
                   targetBytes: target,
+                  readWindowBytes:
+                    terminal &&
+                    rel.columns.length === table.columns.length &&
+                    rel.columns.every((id, k) => id === table.columns[k]?.id)
+                      ? 64 * 1024 * 1024
+                      : 0,
                 });
                 runtime.onAbort(() => scan.abort());
                 const source: BatchSource = {

@@ -623,16 +623,23 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     before timing. `execute` owns admission, TableScan, ResultSink and ResultChannel; frames use
     the unchanged owner transfer policy, real MessagePort delivery and cumulative client credits.
     Ordinary `mode:"scan"` is now Gate A's export number. Execution defaults are used, including
-    the compiler's current per-batch read policy. The bench does not override scan windows,
+    the compiler's terminal full-scan window policy. The bench does not override scan windows,
     output ownership, batch targets or result framing. Fixture preparation/SQL/catalog/root reads
     and client row-object construction remain excluded. Generated `executor-export.test.ts`
     histories check actual factory preparation, all transferred values, multiple groups, sparse
     NULLs, genuine >64 KiB values, delayed credits, storage survival and returned execution charges.
   - `scripts/executor-export-bench.mts` compares the real executor/result path with the historical
-    adapter over the same memory-backed PageCache and per-batch reads. Five interleaved fresh
+    adapter over the same memory-backed PageCache. `--compare=REV` instead freezes the whole
+    executor dependency family at a Git revision and compares it with the current compiler.
+    Physical groups have distinct addresses in both variants. Five interleaved fresh
     processes per variant exclude preparation, setup, warmup and GC and record process/thread
     CPU and wall time. This isolates worker export cost, not OPFS/renderer memory. Both use real
     in-process transfers; the adapter is not an alternative Gate A implementation.
+  - `MINNOW_EXPORT_EXECUTOR_REFERENCE=REV npm run benchmark:export` runs five interleaved
+    cold baseline/current production-executor pairs. The revision must exist locally; every core
+    dependency is frozen, with no fallback to current sources. Both code families load before
+    timing. Use standalone current runs for absolute RSS acceptance: the paired comparison
+    also retains the reference code family.
   - `owner-frames.ts` and `scan-export.ts` remain **historical scan-adapter diagnostics**, excluded
     from Gate A. Ownership/batch/IO/range/shape-transport/frame-copy experiment flags explicitly
     use `mode:"scan-adapter"`. No production module imports the old assembler.
@@ -644,7 +651,9 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     loading. The historical scan-adapter/scan-core diagnostics request a 64 MiB row window
     through `TableScan.readWindowBytes` and
     the `chunkReads` factory: B2's shared `loadTogether` and one-pass pooled leases. This
-    window stays opt-in: absent/zero `readWindowBytes` keeps cached batch reads. Filtered/deleted groups
+    window is also the production default for a terminal, unfiltered full-table scan (including
+    identity projections), with no runtime filter or locator consumer. Other plans retain cached
+    reads; direct TableScan callers still opt in with `readWindowBytes`. Filtered/deleted groups
     retain selective reads. Resident shared loads preserve synchronous `next()` steps until a task yield is due. A refused
     optional window drops partial loads and shrinks before
     falling back to batch reads. Window planning, cached installation, sorting and read/page
