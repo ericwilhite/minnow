@@ -690,3 +690,22 @@ export const RESULT_OWNED_LAYOUT_REACH = [
   "decimal-i128",
   "decimal-mixed",
 ] as const;
+
+/** Discard-only benchmark receiver: columns end at consume, dictionaries at stream close. */
+export const DISCARD_RECEIVER_REACH = [
+  "disposed columns",
+  "live dictionary",
+  "sparse",
+  "all valid",
+  "empty frame",
+] as const;
+
+/** Larger direct terminal batches keep exact values and the existing owner credit bound. */
+export const TERMINAL_BATCH_REACH = [
+  "all valid",
+  "sparse NULLs",
+  "owned frame above 1MiB",
+  "unchanged credit bound",
+  "exact received values",
+  "small credit cap",
+] as const;

@@ -86,7 +86,10 @@ const SCAN_OWNED_COMPARE = process.env.MINNOW_EXPORT_SCAN_OWNED_COMPARE === "1";
 const SCAN_BATCH_COMPARE = process.env.MINNOW_EXPORT_SCAN_BATCH_COMPARE === "1";
 const SCAN_BATCH_COMPLETED = process.env.MINNOW_EXPORT_SCAN_BATCH_COMPLETED ?? "";
 const SCAN_IO_COMPARE = process.env.MINNOW_EXPORT_SCAN_IO_COMPARE === "1";
+const DISCARD = process.env.MINNOW_EXPORT_DISCARD === "1";
+const RSS_SERIES = process.env.MINNOW_EXPORT_RSS_SERIES === "1";
 const SCAN_COMPARE =
+  RSS_SERIES ||
   process.env.MINNOW_EXPORT_SCAN_COMPARE === "1" ||
   !!EXECUTOR_REFERENCE ||
   SCAN_PROFILE ||
@@ -317,6 +320,16 @@ async function workers(page: Page, profileDirectory: string) {
       const after = await cdp.send("Runtime.getHeapUsage");
       return { path, before, after };
     },
+    async memory() {
+      const page = await cdp.send("Runtime.getHeapUsage");
+      const workers = await Promise.all(
+        [...sessions].map((session) => send(session, "Runtime.getHeapUsage")),
+      );
+      return { page, workers };
+    },
+    async collectWorkers() {
+      for (const session of sessions) await send(session, "HeapProfiler.collectGarbage");
+    },
     async collectPage() {
       const before = await cdp.send("Runtime.getHeapUsage");
       await cdp.send("HeapProfiler.collectGarbage");
@@ -418,6 +431,9 @@ interface Row {
   readonly phases?: Awaited<ReturnType<Run["exportPass"]>>[number]["phases"];
   /** Rows per second of that CPU: the pass's cost, whatever share of a core the host gave it. */
   readonly rowsPerCpuSecond: number;
+  readonly series?: unknown;
+  readonly memoryAfter?: unknown;
+  readonly rendererRssEndMiB?: number;
   readonly diagnostics?: unknown;
   readonly host?: unknown;
 }
@@ -465,6 +481,14 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       `dd of the data file: cold ${String(device.coldMBps)} MB/s, warm ${String(device.warmMBps)} MB/s`,
     );
 
+    const seriesOpen = RSS_SERIES
+      ? await page.evaluate(
+          async ([url, groups, reference]) =>
+            ((await import(url)) as Run).openSeries(groups, 512, reference),
+          [RUN, exported, EXECUTOR_REFERENCE] as const,
+        )
+      : undefined;
+    const seriesMemoryBefore = RSS_SERIES ? await targets.memory() : undefined;
     const campaignRendererBaselineMiB = rendererRss(profile) / MiB;
     const results: Row[] = [];
     const measure = async (
@@ -488,7 +512,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       let rssPeak = rssBefore;
       let heapPeak = 0;
       // The export worker's thread CPU: threads that appear during the pass, at their last sample.
-      const threadsBefore = new Set(workerThreadCpu(profile).keys());
+      const threadsBefore = workerThreadCpu(profile);
       const passCpu = new Map<string, number>();
       targets.takeExternal();
       const sampling = { on: true };
@@ -499,7 +523,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
           if (VARIANCE && ++ticks % 5 === 0)
             samples.push({ rss, resident: resident(files), host: hostSample() });
           for (const [tid, seconds] of workerThreadCpu(profile))
-            if (!threadsBefore.has(tid)) passCpu.set(tid, seconds);
+            passCpu.set(tid, Math.max(0, seconds - (threadsBefore.get(tid) ?? 0)));
           heapPeak = Math.max(heapPeak, await targets.heap());
           await new Promise((resolve) => setTimeout(resolve, 200));
         }
@@ -589,6 +613,13 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       }
       const backingStoragePeakMiB = Math.round(targets.takeExternal() / MiB);
       const row: Row = {
+        ...(pass.series
+          ? {
+              series: pass.series,
+              memoryAfter: await targets.memory(),
+              rendererRssEndMiB: rendererRss(profile) / MiB,
+            }
+          : {}),
         ...(pass.phases ? { phases: pass.phases } : {}),
         ...(options.profile && exportCpu !== undefined
           ? {
@@ -651,7 +682,26 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     };
 
     const base = { once: true, capMiB: 512, passes: 1, groups: exported };
-    if (EXECUTOR_REFERENCE) {
+    if (RSS_SERIES) {
+      for (let round = 0; round < 5; round++)
+        for (const variant of EXECUTOR_REFERENCE
+          ? round % 2 === 0
+            ? (["baseline", "candidate"] as const)
+            : (["candidate", "baseline"] as const)
+          : (["candidate"] as const))
+          await measure(`cold persistent ${variant} scan round ${String(round)}`, true, false, {
+            ...base,
+            persistent: true,
+            discard: DISCARD,
+            readaheadKiB: 256,
+            auditWorkingSet: false,
+            profile: true,
+            mode: "scan",
+            ...(EXECUTOR_REFERENCE
+              ? { executorReference: EXECUTOR_REFERENCE, executorVariant: variant }
+              : {}),
+          });
+    } else if (EXECUTOR_REFERENCE) {
       for (let round = 0; round < 5; round++)
         for (const executorVariant of round % 2 === 0
           ? (["baseline", "candidate"] as const)
@@ -919,6 +969,22 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     const hotspots = recorded === undefined ? [] : selfTimes(recorded, 15);
     console.log(`warm pass profile (self time):\n  ${hotspots.join("\n  ")}`);
 
+    const seriesBeforeCollection = RSS_SERIES
+      ? { memory: await targets.memory(), rendererMiB: rendererRss(profile) / MiB }
+      : undefined;
+    if (RSS_SERIES) {
+      await targets.collectPage();
+      await targets.collectWorkers();
+    }
+    const seriesAfterCollection = RSS_SERIES
+      ? { memory: await targets.memory(), rendererMiB: rendererRss(profile) / MiB }
+      : undefined;
+    const seriesClose = RSS_SERIES
+      ? await page.evaluate(async (url) => ((await import(url)) as Run).closeSeries(), RUN)
+      : undefined;
+    const seriesAfterClose = RSS_SERIES
+      ? { memory: await targets.memory(), rendererMiB: rendererRss(profile) / MiB }
+      : undefined;
     const snapshotRssBefore = rendererRss(profile);
     const pageHeap = process.env.MINNOW_EXPORT_PAGE_HEAP
       ? await targets.snapshotPage(process.env.MINNOW_EXPORT_PAGE_HEAP)
@@ -929,6 +995,20 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     const gcRssAfter = rendererRss(profile);
     const report = {
       rows,
+      ...(RSS_SERIES
+        ? {
+            series: {
+              scope:
+                "one renderer and worker, space, governor and pool across five rounds (two queries per paired round); no forced GC between passes; collection only after campaign",
+              open: seriesOpen,
+              memoryBefore: seriesMemoryBefore,
+              beforeCollection: seriesBeforeCollection,
+              afterCollection: seriesAfterCollection,
+              close: seriesClose,
+              afterClose: seriesAfterClose,
+            },
+          }
+        : {}),
       pageBootstrap: genericPage ? "legacy-conformance" : "export-only",
       built,
       opfsBytes: onDisk,

@@ -81,6 +81,9 @@ export type ExportRequest =
       readonly executorVariant?: "baseline" | "candidate";
       readonly executorReference?: string;
     }
+  | { readonly op: "series-open"; readonly request: Extract<ExportRequest, { op: "export" }> }
+  | { readonly op: "series-pass"; readonly request: Extract<ExportRequest, { op: "export" }> }
+  | { readonly op: "series-close" }
   | { readonly op: "remove"; readonly dir: string };
 
 export interface BuildResult {
@@ -124,6 +127,13 @@ export interface ExportPass {
   readonly scanStats?: ScanExportStats;
   readonly executorStats?: ExecutorExportStats;
   readonly scanCoreStats?: ScanCoreStats;
+  readonly series?: {
+    readonly timeOrigin: number;
+    readonly pass: number;
+    readonly governorMiB: number;
+    readonly poolMiB: number;
+    readonly residentMiB: number;
+  };
   readonly afterWorkerClose?: { governorMiB: number; poolMiB: number; residentMiB: number };
 }
 
@@ -252,6 +262,21 @@ async function build(dir: string, rows: number, distinct: number): Promise<Build
   return { groups, generatedGroups: generated.length, dataBytes, ms: performance.now() - started };
 }
 
+async function executorReference(request: Extract<ExportRequest, { op: "export" }>) {
+  const frozenExecutor = request.executorReference
+    ? ((await import(
+        /* @vite-ignore */ new URL("../src/next/exec/create.ts?executorBaseline", import.meta.url)
+          .href
+      )) as typeof import("../src/next/exec/create.js") & {
+        EXECUTOR_BASELINE_REVISION?: string;
+        EXECUTOR_BASELINE_READS: typeof import("../src/next/exec/scan.js").chunkReads;
+      })
+    : null;
+  if (frozenExecutor && frozenExecutor.EXECUTOR_BASELINE_REVISION !== request.executorReference)
+    throw new Error("Wrong frozen executor revision");
+  return frozenExecutor;
+}
+
 async function runExport(request: Extract<ExportRequest, { op: "export" }>): Promise<ExportPass[]> {
   if (request.readMiB !== undefined && request.readMiB * MiB !== MAX_READ_BYTES)
     throw new Error("Read candidate compiler is not enabled");
@@ -343,17 +368,7 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
     throw new Error("Production executor export does not accept historical adapter overrides");
   // Hot-set setup is outside timing. The real execution owns its own admission/result grants.
   if (request.mode === "scan") grant.close();
-  const frozenExecutor = request.executorReference
-    ? ((await import(
-        /* @vite-ignore */ new URL("../src/next/exec/create.ts?executorBaseline", import.meta.url)
-          .href
-      )) as typeof import("../src/next/exec/create.js") & {
-        EXECUTOR_BASELINE_REVISION?: string;
-        EXECUTOR_BASELINE_READS: typeof import("../src/next/exec/scan.js").chunkReads;
-      })
-    : null;
-  if (frozenExecutor && frozenExecutor.EXECUTOR_BASELINE_REVISION !== request.executorReference)
-    throw new Error("Wrong frozen executor revision");
+  const frozenExecutor = await executorReference(request);
   const executeExport =
     request.mode === "scan" && request.resultPort
       ? prepareExecutorExport(space, request.groups, {
@@ -509,8 +524,118 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
   return passes;
 }
 
+/** Bench-only actor: one worker, OPFS handles, governor and page pool across queries. */
+let series: {
+  readonly opened: Awaited<ReturnType<typeof open>>;
+  readonly governor: Governor;
+  pass: number;
+  busy: boolean;
+} | null = null;
+function seriesStats() {
+  if (series === null) throw new Error("No open export series");
+  return {
+    timeOrigin: performance.timeOrigin,
+    pass: series.pass,
+    governorMiB: series.governor.usedBytes / MiB,
+    poolMiB: series.opened.space.stats.cache.poolBytes / MiB,
+    residentMiB: series.opened.space.stats.cache.residentBytes / MiB,
+  };
+}
+async function seriesPass(
+  request: Extract<ExportRequest, { op: "export" }>,
+): Promise<ExportPass[]> {
+  const active = series;
+  if (!active || active.busy) throw new Error("No idle export series");
+  if (request.mode !== "scan" || request.passes !== 1 || !request.resultPort)
+    throw new Error("Series requires one production scan and a fresh result port");
+  active.busy = true;
+  const { space } = active.opened,
+    { governor } = active;
+  try {
+    const frozenExecutor = await executorReference(request);
+    const execute = prepareExecutorExport(space, request.groups, {
+      governor,
+      ...(request.executorVariant === "baseline" && frozenExecutor
+        ? {
+            executor: frozenExecutor.createExecutor(),
+            reads: frozenExecutor.EXECUTOR_BASELINE_READS,
+          }
+        : {}),
+      port: request.resultPort,
+      memory: () => ({
+        governorHeld: governor.usedBytes,
+        idlePool: space.stats.cache.poolBytes,
+        cacheResident: space.stats.cache.residentBytes,
+        cachePinned: space.stats.cache.pinnedBytes,
+      }),
+    });
+    const reads = space.stats.cache.platformReads;
+    if (request.profile) console.profile("export");
+    let result;
+    try {
+      result = await execute();
+    } finally {
+      if (request.profile) console.profileEnd("export");
+    }
+    active.pass++;
+    if (request.profile) await new Promise((resolve) => setTimeout(resolve, 150));
+    return [
+      {
+        ...result,
+        mode: "scan",
+        readMiB: MAX_READ_BYTES / MiB,
+        verifying: VERIFY_CACHED_BYTES,
+        platformReads: space.stats.cache.platformReads - reads,
+        governorPeakMiB: governor.peakBytes / MiB,
+        cacheResidentMiB: space.stats.cache.residentBytes / MiB,
+        poolMiB: space.stats.cache.poolBytes / MiB,
+        protectedBeforeMiB: 0,
+        protectedAfterMiB: space.stats.cache.protectedBytes / MiB,
+        kept: null,
+        series: seriesStats(),
+        ...(request.executorReference
+          ? {
+              executorComparison: {
+                reference: request.executorReference,
+                variant: request.executorVariant,
+              },
+            }
+          : {}),
+      },
+    ];
+  } finally {
+    active.busy = false;
+  }
+}
+
 async function handle(request: ExportRequest): Promise<unknown> {
   switch (request.op) {
+    case "series-open": {
+      if (series) throw new Error("Export series already open");
+      await executorReference(request.request);
+      const governor = new Governor(request.request.capMiB * MiB);
+      const opened = await open(request.request.dir, governor);
+      series = { governor, opened, pass: 0, busy: false };
+      return seriesStats();
+    }
+    case "series-pass":
+      return seriesPass(request.request);
+    case "series-close": {
+      const active = series;
+      if (!active || active.busy) throw new Error("No idle export series to close");
+      series = null;
+      try {
+        await active.opened.space.close();
+      } finally {
+        await active.opened.lease.release();
+      }
+      if (active.governor.usedBytes !== 0) throw new Error("Export series leaked a charge");
+      return {
+        governorMiB: active.governor.usedBytes / MiB,
+        poolMiB: active.opened.space.stats.cache.poolBytes / MiB,
+        residentMiB: active.opened.space.stats.cache.residentBytes / MiB,
+      };
+    }
     case "build":
       return build(request.dir, request.rows, request.distinct);
     case "export":

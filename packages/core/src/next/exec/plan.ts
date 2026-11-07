@@ -456,7 +456,7 @@ export function compilePlan(plan: PhysicalPlan): Program {
                   emitLocator: rel.emitLocator,
                   context,
                   loans: { borrow: (bytes) => grant.borrow(bytes, runtime.signal) },
-                  targetBytes: target,
+                  targetBytes: owner?.terminalBatchTarget(2 * target) ?? target,
                   readWindowBytes: terminalFull ? 64 * 1024 * 1024 : 0,
                   ...(output === undefined
                     ? {}

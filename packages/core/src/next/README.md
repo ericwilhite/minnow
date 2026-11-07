@@ -643,7 +643,11 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     entries share the existing 1 MiB stream cap; subsequent dictionaries fall back to flat varlen.
     Registry entries use ordinary result-grant capacity, so a delta frame can return its progress
     loan before the stream ends. Dictionary pages and borrowed codes never enter a transfer list.
-    A direct terminal full scan decodes tight dedicated output into the result grant. The sink
+    A direct terminal full scan decodes tight dedicated output into the result grant.
+    Its owned batch target is twice the ordinary source target, bounded by the existing result
+    credit window (2 MiB at the default cap/window). This amortizes wide-column allocation without
+    changing the 2,048-row limit. Other producers and consumer pipelines keep their existing target;
+    copying fallbacks retain conservative frame row capacities. The sink
     adopts only buffers explicitly named by that source's detach permission and charged to its
     own grant. Before returning the source token (and its query dictionary references), it
     reclassifies the dedicated buffers into a frame charge in the same result grant. That charge
@@ -674,6 +678,19 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     or post-GC snapshot as an export peak measurement. CDP `backingStorageSize` includes
     external strings as well as ArrayBuffers. Captures label it `backingStoragePeakMiB`; the
     historical `arrayBufferPeakMiB` key remains an alias, not a pure ArrayBuffer measurement.
+  - `MINNOW_EXPORT_RSS_SERIES=1 npm run benchmark:export` keeps one worker, OPFS space,
+    governor and page pool across five cold exports. RSS growth uses one fixed campaign baseline;
+    each pass records page/worker heap and backing stores plus end-of-pass pool/cache charges.
+    GC runs only after the campaign, followed by space close and zero-charge checks. With
+    `MINNOW_EXPORT_EXECUTOR_REFERENCE=REV`, five interleaved reference/current pairs share that
+    actor; both source families load before the baseline. This paired scope includes both families.
+    `MINNOW_EXPORT_DISCARD=1` is an explicit discard-consumer diagnostic: detach consumed column
+    buffers, retaining dictionary deltas until stream close. It changes no public Result lifetime
+    and does not guarantee lower RSS: backing-store disposal can still wait for GC/allocator work.
+  - `scripts/vector-materialize-bench.mts --compare=REV` isolates loaded-page vector building,
+    including output allocation, sizing and decode, in five interleaved CPU/wall rounds.
+    `--batch` compares 512/1024-row batches over equal rows; `--offsets --reused` isolates offset
+    decoding without output allocation. Writing/loading, frame assembly and transport are excluded.
   - `scripts/result-sink-bench.mts --compare=REV --owned` isolates framing with fresh
     authorized source buffers and mixed numeric/dictionary columns. It charges source buffers
     before pushing and returns their charges on release. Input construction is excluded; decode

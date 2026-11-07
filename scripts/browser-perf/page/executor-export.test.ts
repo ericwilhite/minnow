@@ -13,6 +13,7 @@ import {
 import * as factory from "../../../packages/core/src/next/exec/create.js";
 import { PageCache } from "../../../packages/core/src/next/storage/page-cache.js";
 import { VERIFY_CACHED_BYTES } from "../../../packages/core/src/next/storage/verify-cached.js";
+import { ResultSink } from "../../../packages/core/src/next/exec/result-sink.js";
 import { ColumnTarget } from "../../../packages/core/src/next/exec/column-target.js";
 import type { StoreSession } from "../../../packages/core/src/next/storage/contract.js";
 import type { ExtentReader } from "../../../packages/core/src/next/storage/extents.js";
@@ -121,6 +122,7 @@ describe.each(["full", "identity", "subset", "project", "filter"] as const)(
             for (const buffer of result.buffers) dedicated.add(buffer);
             return result;
           });
+        const batchTarget = vi.spyOn(ResultSink.prototype, "terminalBatchTarget");
         const opened = vi.spyOn(chunkReads, "open"),
           together = vi.spyOn(chunkReads, "loadTogether");
         try {
@@ -291,7 +293,8 @@ describe.each(["full", "identity", "subset", "project", "filter"] as const)(
                 try {
                   const before = create.mock.calls.length,
                     openBefore = opened.mock.calls.length,
-                    sharedBefore = together.mock.calls.length;
+                    sharedBefore = together.mock.calls.length,
+                    batchBefore = batchTarget.mock.calls.length;
                   const run = prepareExecutorExport(
                     pages,
                     fixtures.map((f) => ({ rows: count, chunks: f.group.columns })),
@@ -304,6 +307,9 @@ describe.each(["full", "identity", "subset", "project", "filter"] as const)(
                   reach.reach("production executor preparation");
                   const result = await run();
                   if (failure) throw failure;
+                  expect(batchTarget.mock.calls.length - batchBefore).toBe(
+                    shape === "full" ? 1 : 0,
+                  );
                   expect(result.rows).toBe(2 * count);
                   expect(
                     opened.mock.calls
@@ -368,6 +374,7 @@ describe.each(["full", "identity", "subset", "project", "filter"] as const)(
         } finally {
           create.mockRestore();
           decodeOwned.mockRestore();
+          batchTarget.mockRestore();
           opened.mockRestore();
           together.mockRestore();
         }
