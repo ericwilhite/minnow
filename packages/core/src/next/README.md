@@ -2007,6 +2007,30 @@ with their admitted caller. These components still need the live ticket and
 space composition below; they do not make lossy-map complement into ownership
 proof.
 
+### Disk-derived retirement composition
+
+`storage/extent-snapshot.ts` streams native payload pages and externally ordered
+physical page allocations into an immutable private pair chain. It refuses a
+payload that names its own list-page allocation. Generic unordered callbacks
+use the bounded external-sort adapter. Startup merges both saved roots into a
+temporary slab arena and makes one lifetime arena reservation, with no resident
+previous-only set.
+
+`storage/retirement-tickets.ts` keeps its queue links, generations and snapshot
+handles on disk. Provisional tail links are committed only with their native
+root publication, or unlinked on abort. Reclaim observes both R8 guards,
+materializes the full difference before any data release, then drains at most
+256 ranges per batch. Snapshot references outlive their original owner until
+the last ticket finishes. Publication and audit serialize workspace use; the
+live-space switch is a separate integration step.
+
+The live composition can borrow private sort/merge inputs and sort scratch from
+the paid read slab. Only two standalone control/output frames are then owned.
+W also covers one 256 KiB native response, a 60 KiB boundary copy, three bounded
+256-range vectors and headers (516,096 bytes). Startup's private cache may admit
+its final arena synchronously while holding its temporary slab view; the cache
+is not exposed yet and this never awaits an admission or a caller.
+
 ### R25 startup measurement
 
 `MINNOW_NEXT_STORAGE_REOPEN=1` enables the Chromium storage reopen lane in

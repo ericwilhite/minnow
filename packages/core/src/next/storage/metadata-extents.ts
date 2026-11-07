@@ -16,6 +16,12 @@ import {
 
 const ENTRY = 16;
 const CAPACITY = METADATA_PAYLOAD_BYTES / ENTRY;
+export interface PairSlots {
+  readonly left: number;
+  readonly right: number;
+  readonly output: number;
+}
+export const DEFAULT_PAIR_SLOTS: PairSlots = { left: 1, right: 2, output: 3 };
 type Duplicates = "exact" | "refuse";
 function coordinates(offset: number, length: number): void {
   if (
@@ -50,19 +56,25 @@ export class ExtentPairs {
     if (cursor.descriptor.length % ENTRY !== 0)
       throw new StoreCorruptionError("Truncated private extent pair");
   }
-  async next(work?: TaskWork): Promise<boolean> {
+  next(work?: TaskWork): boolean | Promise<boolean> {
     if (this.#closed) return false;
     this.cursor.journal.workspace.assertFrame(this.cursor.frame);
-    if (this.#view === null || this.#at === this.#view.byteLength) {
-      const bytes = await this.cursor.next(work);
-      if (bytes === null) {
-        this.#closed = true;
-        this.#view = null;
-        return false;
-      }
-      this.#view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-      this.#at = 0;
+    if (this.#view === null || this.#at === this.#view.byteLength) return this.#readNext(work);
+    return this.#consume();
+  }
+  async #readNext(work?: TaskWork): Promise<boolean> {
+    const bytes = await this.cursor.next(work);
+    if (bytes === null) {
+      this.#closed = true;
+      this.#view = null;
+      return false;
     }
+    this.#view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    this.#at = 0;
+    return this.#consume();
+  }
+  #consume(): boolean {
+    if (this.#view === null) throw new StoreCorruptionError("Missing private extent bytes");
     this.offset = this.#view.getFloat64(this.#at, true);
     this.length = this.#view.getFloat64(this.#at + 8, true);
     this.#at += ENTRY;
@@ -84,7 +96,7 @@ export class ExtentPairs {
 }
 
 /** A malformed pair chain cannot leak the cursor's reference or frame slot. */
-async function openPairs(
+export async function openPairs(
   journal: MetadataJournal,
   handle: number,
   slot: number,
@@ -130,18 +142,29 @@ export class ExtentPairWriter {
     readonly ordered: boolean,
     readonly duplicates: Duplicates = "refuse",
   ) {}
-  async append(offset: number, length: number, work?: TaskWork): Promise<void> {
+  append(offset: number, length: number, work?: TaskWork): void | Promise<void> {
+    const pending = pauseIfDue(work);
+    if (pending !== undefined) return pending.then(() => this.#append(offset, length, work));
+    return this.#append(offset, length, work);
+  }
+  #append(offset: number, length: number, work?: TaskWork): void | Promise<void> {
     coordinates(offset, length);
     if (this.ordered && this.#offset >= 0) {
       if (offset === this.#offset && length === this.#length && this.duplicates === "exact") return;
       if (offset < this.#offset + Math.ceil(this.#length / DATA_ALIGN) * DATA_ALIGN)
         throw new StoreCorruptionError("Repeated, overlapping or descending private extent pair");
     }
+    if (this.writer.tryAppendPair(offset, length)) {
+      this.#offset = offset;
+      this.#length = length;
+      return;
+    }
     this.#view.setFloat64(0, offset, true);
     this.#view.setFloat64(8, length, true);
-    await this.writer.append(this.#pair, work);
-    this.#offset = offset;
-    this.#length = length;
+    return this.writer.append(this.#pair, work).then(() => {
+      this.#offset = offset;
+      this.#length = length;
+    });
   }
 }
 
@@ -225,6 +248,7 @@ export async function mergeExtents(
   mode: "union" | "difference",
   work?: TaskWork,
   duplicates: Duplicates = "exact",
+  slots: PairSlots = DEFAULT_PAIR_SLOTS,
 ): Promise<number> {
   let a: ExtentPairs | null = null,
     b: ExtentPairs | null = null,
@@ -232,9 +256,9 @@ export async function mergeExtents(
   let failed = false,
     produced = 0;
   try {
-    a = await openPairs(journal, left, 1, true);
-    b = await openPairs(journal, right, 2, true);
-    writer = await journal.writer(3);
+    a = await openPairs(journal, left, slots.left, true);
+    b = await openPairs(journal, right, slots.right, true);
+    writer = await journal.writer(slots.output);
     const output = new ExtentPairWriter(writer, true, duplicates);
     let hasA = await a.next(work),
       hasB = await b.next(work),
@@ -285,6 +309,7 @@ export async function sortExtents(
   input: number,
   duplicates: Duplicates,
   work?: TaskWork,
+  slots: PairSlots = DEFAULT_PAIR_SLOTS,
 ): Promise<number> {
   let head = 0,
     tail = 0,
@@ -301,8 +326,8 @@ export async function sortExtents(
     }
   };
   try {
-    pairs = await openPairs(journal, input, 1);
-    const frame = journal.workspace.claim(2);
+    pairs = await openPairs(journal, input, slots.left);
+    const frame = journal.workspace.claim(slots.right);
     try {
       const values = new Float64Array(frame.buffer, frame.byteOffset, CAPACITY * 2);
       let more = await pairs.next(work);
@@ -316,7 +341,7 @@ export async function sortExtents(
           more = await pairs.next(work);
         }
         await sortChunk(values, count, work);
-        const writer = await journal.writer(3),
+        const writer = await journal.writer(slots.output),
           output = new ExtentPairWriter(writer, true, duplicates);
         let handle: number;
         try {
@@ -357,7 +382,7 @@ export async function sortExtents(
           head = 0;
         } else {
           const rest = (await journal.describe(right)).next;
-          handle = await mergeExtents(journal, left, right, "union", work, duplicates);
+          handle = await mergeExtents(journal, left, right, "union", work, duplicates, slots);
           head = rest;
           await journal.release(left);
           await journal.release(right);

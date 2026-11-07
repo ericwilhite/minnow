@@ -1220,3 +1220,13 @@ export const NATIVE_EXTENT_LIST_REACH = [
   "coalesced page reads",
   "synchronous scalar pairs",
 ] as const;
+
+/** R8's queue grows on disk and frees bounded batches without publication-time admission. */
+export const RETIREMENT_TICKETS_REACH = [
+  "pin delayed disk backlog",
+  "source owners released",
+  "full ordinary capacity",
+  "caller loan remains held",
+  "next generation guard",
+  "two bounded batches per ticket",
+] as const;

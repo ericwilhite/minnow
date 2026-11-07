@@ -1683,6 +1683,17 @@ cancel partway through copying and retry with the same reservation. A full
 ordinary governor must transfer the arena's existing charge without a second
 admission; source and lifetime owners return exactly their own bytes.
 
+Disk-ticket histories keep eight generations pinned while their source snapshot
+owners close. They fill ordinary governor capacity, sometimes hold a caller
+progress loan, and reject any new publication admission. Reclaim checks the
+next-durable-generation guard and pin guard separately. An independent native
+buffer-constructor probe permits only two owned frames in the slab-backed
+composition; every release batch must contain at most 256 ranges. Separate
+histories keep fragmentation debt across rebuilds, recover it when gaps
+coalesce, and fail each reconstruction native-write boundary, including cursor
+cleanup after the arena was allocated. These component histories precede the
+full extent-space and write-path integration campaign.
+
 ### Rebuild storage step-down regression
 
 The storage campaign stops its workload inside the worker, drains admitted operations, closes

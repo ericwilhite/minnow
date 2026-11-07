@@ -69,18 +69,27 @@ export class MetadataWorkspace {
     if (this.#closed || this.#memory !== null)
       throw new TypeError("Workspace already transferred or closed");
     const memory = register(this);
-    if (
-      this.#budget === null ||
-      memory.takeFrom?.(this.#budget, METADATA_WORKSPACE_BYTES) !== true
-    ) {
+    if (this.#budget === null) {
+      memory.unregister?.();
+      throw new TypeError("No workspace reservation");
+    }
+    const moved =
+      memory.takeFrom === undefined
+        ? memory.charge(METADATA_WORKSPACE_BYTES)
+        : memory.takeFrom(this.#budget, METADATA_WORKSPACE_BYTES);
+    if (!moved) {
       memory.unregister?.();
       throw new ReadDeniedError(METADATA_WORKSPACE_BYTES);
     }
+    if (memory.takeFrom === undefined) this.#budget.free(METADATA_WORKSPACE_BYTES);
     this.#budget = null;
     this.#memory = memory;
   }
   /** The external workspace lock must already be held; this method never queues or waits. */
-  async run<T>(phase: "source" | "merge" | "release", work: () => Promise<T>): Promise<T> {
+  async run<T>(
+    phase: "source" | "merge" | "release" | "spool",
+    work: () => Promise<T>,
+  ): Promise<T> {
     if (this.#active || this.#closed) throw new TypeError("Workspace busy or closed");
     this.#active = true;
     this.#epoch++;
@@ -112,7 +121,8 @@ export class MetadataWorkspace {
   }
   /** Up to six read-only metadata views can borrow the already charged read slab (S).
    * Caller holds PageCache.withReadSlab until this callback and all its cursors finish.
-   * The views allocate no backing stores; native writes still require an owned whole frame.
+   * The views allocate no backing stores and can serve as in-place sort scratch; native writes
+   * still require an owned whole frame.
    */
   async withReadFrames<T>(
     frames: readonly Uint8Array[],
@@ -420,6 +430,21 @@ export class ChainWriter {
       this.#length += take;
       at += take;
     }
+  }
+  /** Fast path for one canonical pair in an already allocated page. False asks the caller to
+   * use append(), which allocates/flushes pages with shared-clock and resume checks.
+   */
+  tryAppendPair(offset: number, length: number): boolean {
+    if (this.#closed) throw new TypeError("Chain writer is closed");
+    const frame = this.frame;
+    this.journal.workspace.assertFrame(frame);
+    if (this.#last === 0 || this.#used + 16 > METADATA_PAYLOAD_BYTES) return false;
+    const view = viewOf(frame);
+    view.setFloat64(HEADER + this.#used, offset, true);
+    view.setFloat64(HEADER + this.#used + 8, length, true);
+    this.#used += 16;
+    this.#length += 16;
+    return true;
   }
   async #flush(): Promise<void> {
     viewOf(this.frame).setUint32(16, this.#used, true);
