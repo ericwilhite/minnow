@@ -103,18 +103,18 @@ jobs:
           npm run benchmark:export 2>&1 | tee export-bench.txt
           grep -o 'EXPORT_BENCH .*' export-bench.txt | sed 's/^EXPORT_BENCH //' \
             > browser-perf-results/export-bench.json
-      - name: Scan and result-transport export (rebuild core, recorded)
-        # Closer to Gate A: real TableScan and ResultChannel, owner transfer policy and real
-        # MessagePort credits. The bench-owned frame assembler stands in for the executor's
-        # future production sink; fixture descriptors replace SQL/catalog/group-root loading.
-        # Five interleaved cold rounds of both page-stream and scan/transport modes; record
-        # rows/s, setup-excluded CPU brackets and sampled RSS. No target threshold is enforced.
+      - name: Streaming owner API export (rebuild core, recorded)
+        # Real ProtocolClient.exportStream, explicit frame release, OwnerServer, SQL lowering
+        # and executor/result transport. Fixture catalog/group descriptors replace B3 discovery.
+        # Five cold exports share one owner; record rows/s, setup-excluded worker CPU and RSS
+        # from a fixed post-setup baseline. The generated group is copied to distinct addresses.
+        # No throughput or memory threshold is enforced by this recorded-only step.
         if: always()
         shell: bash
         env:
           MINNOW_EXPORT_ROWS: "1048576"
-          MINNOW_EXPORT_SCAN_COMPARE: "1"
-          MINNOW_EXPORT_SCAN_COLD_ONLY: "1"
+          MINNOW_EXPORT_DISTINCT: "1"
+          MINNOW_EXPORT_OWNER_API: "1"
         run: |
           mkdir -p browser-perf-results
           npm run benchmark:export 2>&1 | tee export-scan-bench.txt

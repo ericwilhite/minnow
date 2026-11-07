@@ -641,13 +641,15 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     peak is only the cache handle; the OPFS comparison reports the full governor and RSS.
 - Scan/transport mode: `MINNOW_EXPORT_SCAN_COMPARE=1 npm run benchmark:export` runs five
   interleaved cold/warm attempts of the page stream and B4's production Executor/result path.
-  `MINNOW_EXPORT_SCAN_COLD_ONLY=1` keeps five cold attempts of each mode; the nightly workflow
-  records these separately as `export-scan-bench.json`, without a threshold. The governor cap
+  `MINNOW_EXPORT_SCAN_COLD_ONLY=1` keeps five cold attempts of each historical control mode.
+  The nightly `export-scan-bench.json` now uses `MINNOW_EXPORT_OWNER_API=1` instead: five cold
+  real-API exports on one owner, recorded without a threshold. The governor cap
   is 512 MiB for both modes and is reported; its counter is not an RSS bound.
   - `scripts/browser-perf/page/executor-export.ts` prepares a real scan plan with `createExecutor`
     before timing. `execute` owns admission, TableScan, ResultSink and ResultChannel; frames use
     the unchanged owner transfer policy, real MessagePort delivery and cumulative client credits.
-    Ordinary `mode:"scan"` is now Gate A's export number. Execution defaults are used, including
+    This executor-only helper is the historical control. Production API measurements use
+    `MINNOW_EXPORT_OWNER_API=1`, described beside `exportStream()` below. Execution defaults are used, including
     the compiler's terminal full-scan window policy. The bench does not override scan windows,
     output ownership, batch targets or result framing. Fixture preparation/SQL/catalog/root reads
     and client row-object construction remain excluded. Generated `executor-export.test.ts`

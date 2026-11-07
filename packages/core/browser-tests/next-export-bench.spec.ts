@@ -5,7 +5,10 @@
  * the persistent profile on disk (fixtures.ts); each pass then streams every row in a fresh
  * worker (scripts/browser-perf/page/export-stream.ts).
  *
- * MINNOW_EXPORT_SCAN_COMPARE=1 adds Gate A's production createExecutor -> ResultSink ->
+ * MINNOW_EXPORT_OWNER_API=1 measures ProtocolClient.exportStream -> OwnerServer -> SQL lowering
+ * -> composition -> production executor/result path, five cold exports in one persistent owner.
+ * MINNOW_EXPORT_OWNER_COMPARE=1 adds five interleaved historical bench-handle controls.
+ * MINNOW_EXPORT_SCAN_COMPARE=1 instead adds the historical createExecutor -> ResultSink ->
  * ResultChannel -> owner transfer policy -> MessagePort credits. Preparation and fixture
  * descriptors replace SQL/catalog/group-root loading; client JS row objects are excluded.
  * The executor's real defaults are used (no bench scan-window or ownership override).
@@ -565,7 +568,10 @@ test.describe("rebuild core export on OPFS (bench)", () => {
         expect(pass.executorComparison?.variant).toBe(options.executorVariant);
       }
       if (options.mode === "scan") {
-        expect(pass.scanStats, "Gate A must not run the stand-in adapter").toBeUndefined();
+        expect(
+          pass.scanStats,
+          "Executor/control routes must not run the stand-in adapter",
+        ).toBeUndefined();
         expect(pass.executorStats?.path).toBe(
           options.ownerAPI ? "production-owner-api" : "production-executor",
         );
@@ -1070,7 +1076,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
                 ? "scan-only diagnostic; real TableScan/driver; borrowed endpoint consumer; excludes all frame assembly, result channel, transfers and client transport; fixture descriptors exclude SQL/catalog/root loading"
                 : results.some((r) => r.mode === "scan-adapter")
                   ? "historical scan-adapter diagnostic; stand-in assembler; excluded from Gate A; fixture descriptors exclude SQL/catalog/root loading"
-                  : "Gate A: production Executor/ResultSink/ResultChannel, real owner transfer policy and MessagePort credits; prepared fixture plan/snapshot exclude SQL/catalog/root loading and client row objects",
+                  : "Historical executor-only control: production Executor/ResultSink/ResultChannel, owner transfer policy and MessagePort credits; fixture plan/snapshot excludes SQL/catalog/root discovery and client row objects; use OWNER_API for the production API metric",
             cpuSamplingIntervalUs: SCAN_PROFILE ? 500 : 1_000_000,
             rounds:
               SCAN_SHAPE_COMPARE ||
