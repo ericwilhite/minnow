@@ -1639,3 +1639,8 @@ MINNOW_STEP_DOWN_CPU_RATE=4 MINNOW_STEP_DOWN_WAKE_AFTER_CLOSE=1 \
 
 The pause is a test probe; its timings are not release-performance measurements. Each
 repetition keeps the ordinary 40 stop/reopen cycles and checks every acknowledged state.
+
+The owner idle-timeout regression keeps MessagePort delivery native and advances a fake timeout
+clock. It holds a cursor window open for 100 ms with a 20 ms idle limit, then separately checks
+the 19/20 ms boundary after the terminal reply and final frame release. Sleeping after the last
+frame tests an idle gap between requests, not whether a running request is protected.
