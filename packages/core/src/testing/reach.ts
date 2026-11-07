@@ -1244,3 +1244,9 @@ export const ROOT_CREDIT_REACH = [
   "independent descriptor accounting",
   "late snapshot release refunds its owner",
 ] as const;
+
+export const STORAGE_SERIAL_INDEX_REACH = [
+  "bounded native index page",
+  "multiple index pages",
+  "exact tiny-record image",
+] as const;

@@ -66,6 +66,8 @@ export const INDEX_BLOCK_BYTES = 160;
 export const CHARGE_STEP = 64 * 1024;
 /** Open reads the stored index (entries, their keys, the record keys) this many at a time. */
 export const LOAD_PAGE = 4096;
+/** Serial metadata reads hold at most one small index page and one native byte record. */
+export const SERIAL_READ_PAGE = 128;
 
 /**
  * Runs `run(0)`, `run(1)`, … `run(count - 1)` in order, each calling `done` when finished (at once
@@ -752,6 +754,10 @@ export class ByteStore {
       then();
       return;
     }
+    if (serial) {
+      this.#readSerial(tx, offset, target, then);
+      return;
+    }
     const end = offset + target.length;
     const index = tx.store(this.indexName);
     index.last({ upper: offset, upperOpen: true }, (before) => {
@@ -770,7 +776,6 @@ export class ByteStore {
           return;
         }
         const records = tx.store(this.name);
-        let at = 0;
         const issue = (entry: IndexEntry) =>
           records.get(entry.offset, (value) => {
             const found = value as StoredRecord | undefined;
@@ -783,16 +788,68 @@ export class ByteStore {
             target.set(new Uint8Array(found.bytes, from - entry.offset, to - from), from - offset);
             left -= 1;
             if (left === 0) then();
-            else if (serial) {
-              const next = entries[at++];
-              if (next !== undefined) issue(next);
-            }
           });
-        if (serial) {
-          const first = entries[at++];
-          if (first !== undefined) issue(first);
-        } else for (const entry of entries) issue(entry);
+        for (const entry of entries) issue(entry);
       });
+    });
+  }
+
+  #readSerial(tx: IdbTransactionLike, offset: number, target: Uint8Array, then: () => void): void {
+    const end = offset + target.length,
+      index = tx.store(this.indexName),
+      records = tx.store(this.name);
+    let previousEnd = -1;
+    const consume = (entry: unknown, done: () => void) => {
+      if (!isEntry(entry) || entry.offset < previousEnd)
+        throw corrupt(`${this.indexName} is malformed near ${String(offset)}`);
+      previousEnd = entry.offset + entry.length;
+      if (previousEnd <= offset) {
+        done();
+        return;
+      }
+      records.get(entry.offset, (value) => {
+        const found = value as StoredRecord | undefined;
+        if (!(found?.bytes instanceof ArrayBuffer) || found.bytes.byteLength !== entry.length)
+          throw corrupt(
+            `record ${String(entry.offset)} of ${this.name} is missing or disagrees with its entry`,
+          );
+        const from = Math.max(offset, entry.offset),
+          to = Math.min(end, entry.offset + entry.length);
+        target.set(new Uint8Array(found.bytes, from - entry.offset, to - from), from - offset);
+        done();
+      });
+    };
+    const page = (after: number | null) => {
+      index.getAll(
+        { lower: after ?? offset, lowerOpen: after !== null, upper: end, upperOpen: true },
+        (entries) => {
+          let last = after;
+          inOrder(
+            entries.length,
+            (at, done) => {
+              const entry = entries[at];
+              if (
+                !isEntry(entry) ||
+                entry.offset < offset ||
+                (last !== null && entry.offset <= last) ||
+                entry.offset >= end
+              )
+                throw corrupt(`${this.indexName} is malformed near ${String(offset)}`);
+              last = entry.offset;
+              consume(entry, done);
+            },
+            () => {
+              if (entries.length === SERIAL_READ_PAGE && last !== null) page(last);
+              else then();
+            },
+          );
+        },
+        SERIAL_READ_PAGE,
+      );
+    };
+    index.last({ upper: offset, upperOpen: true }, (before) => {
+      if (before === undefined) page(null);
+      else consume(before, () => page(null));
     });
   }
 

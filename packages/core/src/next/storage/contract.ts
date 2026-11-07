@@ -182,7 +182,8 @@ export interface MetadataStore {
 
 /** Raw data reads used by the prepaid list cursors. */
 export interface ReadDataOptions {
-  /** Issue record gets in callback order, so at most one native data response is live. */
+  /** Page index selection at128 entries and issue record gets in callback order,
+   * so at most one index page and one native data response are live. */
   readonly serialRecords?: boolean;
 }
 

@@ -1627,7 +1627,9 @@ The metadata-journal generator inventories frames independently at construction,
 requires admission first, and keeps the frame count constant as its disk queue
 grows. It tests multi-page inputs, empty chains, cursor references and page
 reuse; mutants that omit admission or cursor retention fail their respective
-invariants. Native-read response capacity is measured separately in its scripted
+invariants. Serial list reads also generate thousands of tiny physical records and require
+index selections of at most128 entries per page, independently of the byte target.
+Native-read response capacity is measured separately in its scripted
 store. Cancellation and failed-write tests require cleanup without a new memory
 request. These primitive tests do not yet establish live publication's bound.
 

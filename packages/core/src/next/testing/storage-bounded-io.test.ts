@@ -1,6 +1,10 @@
 /** Independent native-request/copy counters for the prepaid list/reclaim workspace. */
 import { afterAll, expect, it, vi } from "vitest";
-import { createReach, STORAGE_BOUNDED_IO_REACH } from "../../testing/reach.js";
+import {
+  createReach,
+  STORAGE_BOUNDED_IO_REACH,
+  STORAGE_SERIAL_INDEX_REACH,
+} from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import { ByteStore, IDB_RECORD_BYTES } from "../storage/idb-bytes.js";
 import type { IdbDatabaseLike } from "../storage/idb-like.js";
@@ -319,3 +323,64 @@ for (const lazy of [false, true])
     expect(entries).toBe(2);
     db.close();
   });
+
+const serialReach = createReach("serial native index page", STORAGE_SERIAL_INDEX_REACH);
+for (const seed of seedsFor("storage-serial-index", [1661, 1662, 1663, 1664]))
+  it(`bounds tiny-record index selection as well as byte responses (${String(seed)})`, async () => {
+    serialReach.beginHistory();
+    const physical = simIndexedDb(new SimDisk()),
+      count = 1024 + (seed % 257);
+    const image = new Uint8Array(count * 2);
+    await physical.transaction(["data", "data-index"], "readwrite", "relaxed", (tx) => {
+      for (let i = 0; i < count; i++) {
+        const bytes = new Uint8Array([i & 255]);
+        image[i * 2] = i & 255;
+        tx.store("data").put(i * 2, { offset: i * 2, bytes: bytes.buffer });
+        tx.store("data-index").put(i * 2, { offset: i * 2, length: 1 });
+      }
+    });
+    let largest = 0,
+      pages = 0;
+    const observed: IdbDatabaseLike = {
+      close: () => physical.close(),
+      transaction: (stores, mode, durability, body) =>
+        physical.transaction(stores, mode, durability, (tx) =>
+          body({
+            abort: (reason) => tx.abort(reason),
+            store: (name) => {
+              const store = tx.store(name);
+              return {
+                ...store,
+                getAll: (range, then, limit) =>
+                  store.getAll(
+                    range,
+                    (entries) => {
+                      if (name === "data-index") {
+                        largest = Math.max(largest, entries.length);
+                        pages++;
+                      }
+                      then(entries);
+                    },
+                    limit,
+                  ),
+              };
+            },
+          }),
+        ),
+    };
+    const store = await ByteStore.openLazy(observed, "data"),
+      target = new Uint8Array(image.length - 2);
+    await observed.transaction(["data", "data-index"], "readonly", "relaxed", (tx) =>
+      store.read(tx, 1, target, () => undefined, true),
+    );
+    expectBytes(target, image.subarray(1, image.length - 1));
+    expect(largest).toBeLessThanOrEqual(128);
+    serialReach.reach("bounded native index page");
+    expect(pages).toBeGreaterThan(1);
+    serialReach.reach("multiple index pages");
+    serialReach.reach("exact tiny-record image");
+    store.close();
+    observed.close();
+  });
+
+afterAll(() => serialReach.assertReached());
