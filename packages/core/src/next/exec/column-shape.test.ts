@@ -8,12 +8,26 @@ import { createReach, SCAN_SHAPE_REACH } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { ChunkReader, DecodeFact } from "../page/reader.js";
 import { defined, sameValue, valueAt, writeGroup, type TestValue } from "../page/test-support.js";
-import { countingBudget } from "../storage/space-test-support.js";
+import type { ByteBudget } from "../access/space.js";
 import type { PhysicalType } from "../types.js";
 import { isValid } from "../vector/validity.js";
 import type { Vector } from "../vector/vector.js";
 import { ColumnTarget, type DecodeSpec } from "./column-target.js";
 import type { ChunkPages } from "./scan.js";
+
+function countingBudget(): ByteBudget & { used: number } {
+  const budget = {
+    used: 0,
+    allocate(bytes: number) {
+      budget.used += bytes;
+      return true;
+    },
+    free(bytes: number) {
+      budget.used -= bytes;
+    },
+  };
+  return budget;
+}
 
 function rows(vector: Vector): TestValue[] {
   if (vector.form !== "flat" && vector.form !== "dictionary") throw new Error("Unexpected shape");
@@ -129,7 +143,7 @@ it.each(seedsFor("next-column-shape", [0xb2d1, 0xb2d2]))(
           });
           for (let column = 0; column < columns.length; column++) {
             const source = defined(columns[column]),
-              budget = countingBudget(Infinity);
+              budget = countingBudget();
             const reader = await ChunkReader.open(
               space.view({ cache: false }),
               defined(group.columns[column]),
