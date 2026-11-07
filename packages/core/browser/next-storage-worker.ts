@@ -1,4 +1,4 @@
-import { chaosPoster } from "./next-storage-post.js";
+import { ChaosRequestGate, gatedChaosPoster } from "./next-storage-gate.js";
 import { buildListedReopenSpace, openListedReopen } from "./next-storage-listed-reopen.js";
 let reopenClose: (() => Promise<void>) | null = null;
 /**
@@ -841,7 +841,9 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
       if (port === null) throw new Error("no chaos channel");
       // Claim each numbered message atomically BEFORE posting it (review B1-p2h-4).
       // A kill between postMessage and the next instruction cannot hide a posted ack.
-      const post = chaosPoster(port, postedCounter);
+      const gate =
+        killControl === null ? null : new ChaosRequestGate(killControl, store === "indexeddb");
+      const post = gatedChaosPoster(port, postedCounter, gate);
       storageObserver = postingObserver(post);
       // A failure goes out on the campaign's channel too: a worker killed just after it still
       // delivers it there (the request's own reply may never leave a terminated worker).
@@ -850,7 +852,27 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
         request.seed,
         request.expect,
         {
-          backendFor,
+          backendFor: async (name) => {
+            const backend = await backendFor(name);
+            if (gate === null || store !== "indexeddb") return backend;
+            const open = backend.open.bind(backend);
+            backend.open = async (lease) => {
+              const session = await open(lease);
+              const write = session.writeData.bind(session);
+              const append = session.appendLog.bind(session);
+              session.writeData = async (...args) => {
+                await write(...args);
+                await gate.queuedWrite();
+              };
+              session.appendLog = async (...args) => {
+                const offset = await append(...args);
+                await gate.queuedWrite();
+                return offset;
+              };
+              return session;
+            };
+            return backend;
+          },
           post,
           go: (sequence) =>
             new Promise<void>((resolve) => {
@@ -909,17 +931,24 @@ const goes = new Map<number, () => void>();
 let chaosPort: MessagePort | null = null;
 /** Claimed campaign-message prefix that the page reads in shared memory. */
 let postedCounter: Int32Array | null = null;
+let killControl: Int32Array | null = null;
 /** The running chaos workload's graceful step-down (next-storage-chaos.ts). */
 let chaosRelease: (() => Promise<StepDownRelease>) | null = null;
 
 scope.addEventListener("message", (event: MessageEvent<unknown>) => {
-  const { chaosPort: port, counter } = event.data as {
+  const {
+    chaosPort: port,
+    counter,
+    killGate,
+  } = event.data as {
     chaosPort?: MessagePort;
     counter?: SharedArrayBuffer;
+    killGate?: SharedArrayBuffer;
   };
   if (port !== undefined) {
     chaosPort = port;
     postedCounter = counter === undefined ? null : new Int32Array(counter);
+    killControl = killGate === undefined ? null : new Int32Array(killGate);
     port.onmessage = (message: MessageEvent<{ go?: number }>) => {
       const go = message.data.go;
       if (go === undefined) return;

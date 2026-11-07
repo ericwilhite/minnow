@@ -1325,8 +1325,8 @@ and capped text fallback still need ownership copies. The component benchmark al
 an all-flat diagnostic, which changes text policy and may change wire bytes and frame counts.
 
 **Storage kill campaign.** The nightly run also runs `npm run test:storage-kills`: the rebuild
-core's storage in Chromium, on OPFS and on IndexedDB, killed 1,000 times each at seeded random
-moments while a worker builds and publishes extents, retires and reclaims them, appends, flushes,
+core's storage in Chromium, on OPFS and on IndexedDB, killed 1,000 times each at seeded
+storage-request checkpoints while a worker builds and publishes extents, retires and reclaims them, appends, flushes,
 truncates and resets its log, and spills. After every kill a new worker reopens the store and
 checks that the root is the last acknowledged one (or the one a publish in flight was writing,
 every blob's coordinates and checksum included), that every acknowledged log byte reads back,
@@ -1339,20 +1339,42 @@ before posting; the page reads that counter just before the kill; the page then 
 acknowledgement or failure posted before that read is missed (the test page is cross-origin
 isolated for this). If a kill interrupts a claim before the post, the barrier deadline fails
 the campaign rather than passing with a missing message; the operation has an unknown outcome.
+The campaigns avoid that interruption window: a shared-memory gate parks the worker only after
+its request marker is fully posted. The page waits for the parked flag, drains the entire claimed prefix while the worker cannot
+post or resume JavaScript, then terminates it without resuming it. It never treats a missing claim as an acknowledgement.
 Messages claimed after the read are an unobserved tail: recovery accepts their operations as
 pending, whether they completed or not. The
 same campaign runs 50 kills per store in every browser lane. It declares reach: on IndexedDB,
 kills must land inside writes, publishes, reclaims, log flushes, truncations and spills; OPFS's
 storage calls are synchronous, so a kill never stops one halfway: there kills must land at each
 step's edges, and the simulated power-loss sweeps cover what happens inside a call. A concurrent mode runs the workload as lanes that operate
-at once (two writers, a reader holding a pin, the log, spill, reclaim) and kills at random
-wall-clock moments; on IndexedDB those kills must land with a transaction of each kind open while
+at once (two writers, a reader holding a pin, the log, spill, reclaim). A seeded delay arms its
+next native-request gate; successive kills target publish, log, spill and data requests, with
+at least two operation windows open on IndexedDB. There those kills must land with a transaction of each kind open while
 several operations are under way, and a Node sweep (`chaos-crash.test.ts`) loses power under the
 same interleaved workload over the simulated stores, counting the storage calls that had run and
 not yet returned. It
 prints one `STORAGE_KILLS` JSON line per store with the kill and phase table, which the nightly
 workflow saves as `browser-perf-results/storage-kills.jsonl`. A failure names its seed: set
-`MINNOW_SEED` to replay the same plan of kills (where each kill lands still depends on timing).
+`MINNOW_SEED` to replay the same plan of kills. Serial terminate kills park at a real request in
+the selected step, rather than racing a short request against a page timer. A buffered IDB write
+in that selected step stays pending until its scheduled native batch issues; batching remains
+enabled. No-op occurrences get no credit and the gate advances to the next matching step under
+the original deadline. Page-close kills retain their separately observed boundary.
+
+The IDB gate runs in a microtask after the transaction body has issued its initial requests,
+before the transaction-end callback. OPFS parks before the synchronous call and reaches an edge;
+it does not interrupt the call. These gates do not establish a particular physical disk-write
+interruption point; the simulated power-loss sweeps supply that coverage. Neither reach minima,
+state lists nor kill counts are reduced. `MINNOW_STORAGE_CPU_THROTTLE=4` applies Chromium CDP
+`Emulation.setCPUThrottlingRate` to the controller page, including replacement pages, and records
+the rate in each report. It exercises delayed controller scheduling, not a calibrated 4× disk or
+worker slowdown. The controller and gate regressions also exercise short requests and delayed
+message delivery directly.
+
+The worker gate uses 100 ms futex sleeps so the VM can process worker termination between wakes.
+Every wake keeps the worker parked; it does not advance the storage call or change the kill point.
+This avoids an indefinite wait retaining WebKit's owner during teardown.
 
 **What each cell records** (one JSON line per engine per cell): the warm median and p95 over at
 least five runs; the cold first run in a fresh worker after reopening the database; renderer RSS

@@ -256,7 +256,7 @@ export const STORAGE_KILL_EDGE_REACH = [
 ] as const;
 
 /**
- * The concurrent kill campaign on IndexedDB: kills at wall-clock moments must land with a platform
+ * The concurrent kill campaign on IndexedDB: a seeded delay arms a native-request gate; kills land with a platform
  * request open (a transaction created and not ended; the backend runs one at a time per
  * connection), of each kind, and while two or more operations are in their windows (review B1-p2g
  * finding 2: windows alone are reported, not counted).
@@ -696,4 +696,22 @@ export const STORAGE_STEP_DOWN_STATES = [
   "paused log lane",
   "admitted append",
   "go in transit",
+] as const;
+
+/** Native-request parks must be real, correctly filtered and after a fully posted prefix. */
+export const STORAGE_REQUEST_GATE_REACH = [
+  "request-after-body-issue",
+  "prefix-fully-posted",
+  "queued-write-native-batch",
+  "no-credit-for-ended-request",
+  "no-credit-for-window",
+  "concurrent-kind-and-two-windows",
+  "bounded-park-wake-never-resumes-storage",
+] as const;
+
+/** Controller-side native gate histories, including empty attempts and port teardown. */
+export const STORAGE_PHASE_CONTROLLER_REACH = [
+  "short-request-phase-parked",
+  "no-request-occurrence-advanced",
+  "parked-prefix-drained-before-teardown",
 ] as const;

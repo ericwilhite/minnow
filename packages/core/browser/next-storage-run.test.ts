@@ -11,7 +11,9 @@ import { chaosPoster } from "./next-storage-post.js";
  * - A step that posted `began` with no platform request open lands in its window, not inside it.
  * - The failure-path regression kills once the counter shows the injected failure posted.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
+import { seedsFor } from "../src/testing/seeds.js";
+import { createReach, STORAGE_PHASE_CONTROLLER_REACH } from "../src/testing/reach.js";
 import type { ChaosMessage, ChaosState } from "./next-storage-chaos.js";
 import {
   chaosBegin,
@@ -20,6 +22,8 @@ import {
   chaosKillAtFault,
   setChaosBarrierTimeout,
 } from "./next-storage-run.js";
+
+const phaseReach = createReach("request phase controller", STORAGE_PHASE_CONTROLLER_REACH);
 
 const sleep = (ms: number) =>
   new Promise<void>((resolve) => {
@@ -73,6 +77,7 @@ interface Scripted {
   /** Called when the page terminates the worker (still able to post: termination is async). */
   onTerminate: () => void;
   readonly port: PortDouble;
+  readonly gate: Int32Array;
 }
 
 let scenario: (worker: Scripted) => void = () => undefined;
@@ -93,6 +98,7 @@ class WorkerDouble {
   postMessage(message: {
     chaosPort?: PortDouble;
     counter?: SharedArrayBuffer;
+    killGate?: SharedArrayBuffer;
     request?: { op: string };
   }): void {
     if (message.chaosPort !== undefined) {
@@ -100,6 +106,7 @@ class WorkerDouble {
       const counter = new Int32Array(message.counter ?? new SharedArrayBuffer(4));
       const post = chaosPoster(port, counter);
       const scripted: Scripted = {
+        gate: new Int32Array(message.killGate ?? new SharedArrayBuffer(16)),
         port,
         post: (chaos) => {
           if (this.#dead) return;
@@ -345,3 +352,144 @@ describe("the failure-path regression kills once the failure is posted (finding 
       expect(outcome.observation.posted).toBeGreaterThanOrEqual(outcome.failureMessage);
     });
 });
+
+// A native transaction can complete before any page timer runs. The worker obeys the shared
+// request gate instead: the prefix is fully posted before PARKED, and the request stays open.
+for (const seed of seedsFor("storage-request-phase-kills", [1701, 1702, 1703, 1704]))
+  for (const target of ["publish", "truncate", "log-flush"] as const)
+    it(`parks inside the actual short ${target} request (${String(seed)})`, async () => {
+      phaseReach.beginHistory();
+      let parked = false;
+      let announce: () => void = () => undefined;
+      scenario = (worker) => {
+        announce = () => worker.post({ chaos: "intent", intent: { step: target, sequence: 1 } });
+        worker.onGo = () => {
+          worker.post({ chaos: "began", sequence: 1 });
+          worker.post({
+            chaos: "request",
+            id: seed,
+            phase: "begin",
+            target: target === "publish" ? "roots" : "log+log-index",
+            op: "readwrite/strict",
+          });
+          if (Atomics.load(worker.gate, 0) === 1) {
+            parked = true;
+            Atomics.store(worker.gate, 0, 2);
+            return;
+          }
+          worker.post({
+            chaos: "request",
+            id: seed,
+            phase: "end",
+            target: "log",
+            op: "readwrite/strict",
+          });
+          worker.post({ chaos: "settled", sequence: 1 });
+          worker.post({ chaos: "done", sequence: 1 });
+        };
+      };
+      await chaosBegin("indexeddb", `phase-${target}-${String(seed)}`, seed, null);
+      const plan = {
+        target,
+        occurrence: 1,
+        delayMs: seed % 8,
+        mode: "terminate" as const,
+        atRequest: true,
+      };
+      const killing = chaosKill(plan);
+      announce();
+      const landing = await killing;
+      expect(landing?.landed).toBe(`in-${target}`);
+      expect(parked, "worker must park after a real request begins").toBe(true);
+      expect(landing?.requests).toHaveLength(1);
+      phaseReach.reach("short-request-phase-parked");
+      expect(landing?.observation.received).toBe(landing?.observation.posted);
+    });
+
+for (const seed of seedsFor("storage-noop-request-gates", [1701, 1702, 1703, 1704]))
+  it(`advances past a no-request occurrence without granting reach (${String(seed)})`, async () => {
+    phaseReach.beginHistory();
+    let announce: () => void = () => undefined;
+    scenario = (worker) => {
+      announce = () => worker.post({ chaos: "intent", intent: { step: "publish", sequence: 1 } });
+      worker.onGo = (sequence) => {
+        worker.post({ chaos: "began", sequence });
+        if (sequence === 1) {
+          worker.post({ chaos: "settled", sequence });
+          worker.post({ chaos: "done", sequence });
+          worker.post({ chaos: "intent", intent: { step: "publish", sequence: 2 } });
+        } else {
+          worker.post({
+            chaos: "request",
+            id: seed,
+            phase: "begin",
+            target: "roots",
+            op: "readwrite/strict",
+          });
+          expect(Atomics.load(worker.gate, 1)).toBe(2);
+          Atomics.store(worker.gate, 0, 2);
+        }
+      };
+    };
+    await chaosBegin("indexeddb", `no-request-${String(seed)}`, seed, null);
+    const killing = chaosKill({
+      target: "publish",
+      occurrence: 1,
+      delayMs: 0,
+      mode: "terminate",
+      atRequest: true,
+    });
+    announce();
+    const landing = await killing;
+    expect(landing?.landed).toBe("in-publish");
+    expect(landing?.expect.inFlight.map((v) => v.sequence)).toEqual([2]);
+    phaseReach.reach("no-request-occurrence-advanced");
+  });
+
+for (const seed of seedsFor("storage-parked-prefix-drain", [1701, 1702, 1703, 1704]))
+  it(`drains a parked worker's complete prefix before teardown (${String(seed)})`, async () => {
+    phaseReach.beginHistory();
+    let announce: () => void = () => undefined;
+    let delivered = 0;
+    scenario = (worker) => {
+      const page = worker.port.peer;
+      if (page === null) throw Error("missing page port");
+      const receive = page.onmessage;
+      page.onmessage = (event) => {
+        delivered++;
+        receive?.(event);
+      };
+      announce = () => worker.post({ chaos: "intent", intent: { step: "publish", sequence: 1 } });
+      worker.onGo = () => {
+        worker.port.delayOf = () => 10 + (seed % 5);
+        worker.post({ chaos: "began", sequence: 1 });
+        worker.post({ chaos: "ack", state: ACKED });
+        worker.post({
+          chaos: "request",
+          id: seed,
+          phase: "begin",
+          target: "roots",
+          op: "readwrite/strict",
+        });
+        Atomics.store(worker.gate, 0, 2);
+      };
+      // The recovery message was already queued before this callback installed the observer.
+      worker.onTerminate = () =>
+        expect(delivered, "every posted message is delivered before teardown").toBe(5);
+    };
+    await chaosBegin("indexeddb", `parked-prefix-${String(seed)}`, seed, null);
+    const killing = chaosKill({
+      target: "publish",
+      occurrence: 1,
+      delayMs: 0,
+      mode: "terminate",
+      atRequest: true,
+    });
+    announce();
+    const landing = await killing;
+    expect(landing?.expect.state).toEqual(ACKED);
+    phaseReach.reach("parked-prefix-drained-before-teardown");
+    expect(landing?.observation.received).toBe(landing?.observation.posted);
+  });
+
+afterAll(() => phaseReach.assertReached());

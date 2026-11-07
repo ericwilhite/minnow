@@ -1,3 +1,4 @@
+import { armRequestGate, type RequestKind } from "./next-storage-gate.js";
 /**
  * Page side of the rebuild core's storage browser suite (browser-tests/next-storage.spec.ts):
  * spawns next-storage-worker.ts workers, kills them mid-publish, and verifies from fresh ones.
@@ -426,13 +427,15 @@ export async function runMicrobench(): Promise<Record<string, Record<string, num
 
 // ── The storage kill campaign (Gate A; next-storage-chaos.ts) ────────────────────────────────
 
-/** How a kill lands: terminate the worker after `delayMs`, or hand back for a page close/crash. */
+/** A request-gated termination, a legacy timer probe, or a separately observed page close. */
 export interface KillPlan {
-  /** The step whose `occurrence`-th intent (after this kill is armed) starts the countdown. */
+  /** The occurrence selects a request checkpoint, or starts the legacy probe's timer. */
   readonly target: ChaosStep;
   readonly occurrence: number;
   readonly delayMs: number;
   readonly mode: "terminate" | "page";
+  /** Park at an actual request in this step; delayMs applies only to timer kills. */
+  readonly atRequest?: boolean;
 }
 
 /** Workers that failed before reporting ready (module load), retried by `chaosBegin`. */
@@ -486,7 +489,7 @@ export interface Observation {
  * Where a kill landed, from every message the worker posted before it (the observation barrier):
  * `between` (no step in flight), or for the step in flight `before-<step>` (it had its go but had
  * not begun), `in-<step>` (it had begun and not returned, and a platform request was open: an
- * IndexedDB transaction created and not ended, an OPFS sync call running), `window-<step>` (begun,
+ * IndexedDB transaction created and not ended, an OPFS call's begin marker posted), `window-<step>` (begun,
  * not returned, but no platform request open: between its requests, or before its first, review
  * B1-p2g finding 2) or `after-<step>` (its storage work had returned; its end was not yet posted).
  */
@@ -500,11 +503,13 @@ export interface KillLanding {
 }
 
 interface ChaosRun {
+  readonly kind: StoreKind;
   readonly worker: StorageWorker;
   /** The campaign's own channel: what the worker posted before it died still arrives. */
   readonly port: MessagePort;
-  /** The worker's count of messages posted on the channel (shared memory). */
+  /** The worker's claimed message prefix (shared memory; fully posted once parked). */
   readonly counter: Int32Array;
+  readonly killGate: Int32Array;
   /** The number of the last message received (messages arrive in order, numbered from 1). */
   received: number;
   /** Called on every message (the observation barrier waits on them). */
@@ -556,12 +561,15 @@ export async function chaosBegin(
       "the kill campaign needs a cross-origin isolated page (SharedArrayBuffer): open it with ?isolated=1",
     );
   const counter = new SharedArrayBuffer(4);
+  const killGate = new SharedArrayBuffer(16);
   const worker = await spawnForChaos();
   const channel = new MessageChannel();
   const run: ChaosRun = {
+    kind,
     worker,
     port: channel.port1,
     counter: new Int32Array(counter),
+    killGate: new Int32Array(killGate),
     received: 0,
     waiters: new Set(),
     requests: new Map(),
@@ -622,7 +630,7 @@ export async function chaosBegin(
       run.port.postMessage({ go: message.intent.sequence });
     }
   };
-  worker.post({ chaosPort: channel.port2, counter }, [channel.port2]);
+  worker.post({ chaosPort: channel.port2, counter, killGate }, [channel.port2]);
   worker
     .call({
       op: "chaos",
@@ -697,12 +705,15 @@ async function observeThrough(run: ChaosRun, posted: number): Promise<Observatio
   return { posted, received: run.received };
 }
 
-/** Terminates the worker after reading its counter, then observes the claimed prefix. */
-async function terminateObserved(run: ChaosRun): Promise<Observation> {
+/** Parked kills drain the stable prefix before termination; legacy probes drain after it. */
+async function terminateObserved(run: ChaosRun, parked = false): Promise<Observation> {
   const posted = postedNow(run);
+  // A parked worker cannot post or resume JS. Drain before termination to avoid depending
+  // on native worker teardown preserving undelivered port traffic.
+  const observed = parked ? await observeThrough(run, posted) : null;
   run.worker.terminate();
   if (chaos === run) chaos = null;
-  return observeThrough(run, posted);
+  return observed ?? observeThrough(run, posted);
 }
 
 /** A workload failure the page observed (review B1-p2f finding 1): the campaign fails on it. */
@@ -713,8 +724,8 @@ function failed(run: ChaosRun): Error | null {
 }
 
 /**
- * Kills the running chaos worker as `plan` says. Terminate: after `delayMs`, the worker is
- * terminated and every message it posted before is received (the observation barrier); the
+ * Kills the running chaos worker as `plan` says. With atRequest, wait for the selected native
+ * request's fully posted prefix and parked flag. Legacy timer probes use delayMs. The worker is terminated and every message it posted before is received (the observation barrier); the
  * landing and expectation are taken from them. Page: the page stops answering intents and
  * returns; the caller then calls `chaosPageBoundary` and closes the page. Any workload failure the
  * page observed rejects.
@@ -741,9 +752,29 @@ export function chaosKill(plan: KillPlan): Promise<KillLanding | null> {
           resolve(null);
           return;
         }
-        run.port.postMessage({ go: intent.sequence });
-        setTimeout(() => {
-          terminateObserved(run).then((observation) => {
+        const gated = plan.atRequest === true;
+        const advance = (next: ChaosIntent) => {
+          // A no-op/buffered occurrence may issue no request. Keep the original bounded
+          // waiter and advance to the next occurrence, without credit for the empty window.
+          run.armed = { target: plan.target, remaining: 1, fire: advance };
+          const kind =
+            plan.target === "publish" || plan.target === "reclaim"
+              ? "publish"
+              : plan.target === "write"
+                ? "data"
+                : plan.target === "spill"
+                  ? "spill"
+                  : plan.target === "log-flush"
+                    ? undefined
+                    : "log";
+          armRequestGate(run.killGate, next.sequence, kind);
+          run.port.postMessage({ go: next.sequence });
+        };
+        if (gated) advance(intent);
+        else run.port.postMessage({ go: intent.sequence });
+        const fire = () => {
+          run.armed = null;
+          terminateObserved(run, gated).then((observation) => {
             const failure = failed(run);
             if (failure !== null) reject(failure);
             else
@@ -754,7 +785,20 @@ export function chaosKill(plan: KillPlan): Promise<KillLanding | null> {
                 observation,
               });
           }, reject);
-        }, plan.delayMs);
+        };
+        if (gated)
+          run.worker
+            .until(
+              () => run.failure !== null || Atomics.load(run.killGate, 0) === 2,
+              `request in ${plan.target}`,
+              60_000,
+            )
+            .then(() => {
+              const failure = failed(run);
+              if (failure !== null) reject(failure);
+              else fire();
+            }, reject);
+        else setTimeout(fire, plan.delayMs);
       },
     };
   });
@@ -776,21 +820,34 @@ export interface ConcurrentLanding {
 }
 
 /**
- * Kills the running concurrent chaos worker `delayMs` after it was armed (a wall-clock moment, not
- * a step boundary), receives everything it posted before the kill, and returns every
+ * With atRequest, delayMs arms a gate at the next matching native request (two operation
+ * windows on IDB; an edge on OPFS). Without it, retain the controller's legacy wall-clock probes. Receives everything it posted before the kill, and returns every
  * acknowledgement, the operations in flight and the platform requests open. A workload failure
  * observed at any time rejects.
  */
-export async function chaosKillAfter(delayMs: number): Promise<ConcurrentLanding> {
+export async function chaosKillAfter(
+  delayMs: number,
+  atRequest?: RequestKind,
+): Promise<ConcurrentLanding> {
   const run = chaos;
   if (run === null) throw new Error("chaosBegin first");
   await new Promise<void>((resolve) => {
     setTimeout(resolve, delayMs);
   });
+  if (atRequest !== undefined) {
+    armRequestGate(run.killGate, 0, atRequest, run.kind === "indexeddb" ? 2 : 0);
+    await run.worker.until(
+      () => run.failure !== null || Atomics.load(run.killGate, 0) === 2,
+      `${atRequest} request checkpoint`,
+      60_000,
+    );
+    const failure = failed(run);
+    if (failure !== null) throw failure;
+  }
   // No operation starts after this: everything the worker does until the kill takes effect was
   // announced (claims after the counter read are the unobserved tail).
   run.hold = true;
-  const observation = await terminateObserved(run);
+  const observation = await terminateObserved(run, atRequest !== undefined);
   const failure = failed(run);
   if (failure !== null) throw failure;
   const intents = [...run.inFlight.values()];
