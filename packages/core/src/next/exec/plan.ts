@@ -435,6 +435,13 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     ids.add(rel.id);
     switch (rel.op) {
       case "indexRange": {
+        if (options.keyOrder !== true)
+          throw new UnsupportedPlanError(
+            "index range requires the diagnostic keyOrder opt-in until the charged streaming cursor lands",
+            {
+              construct: "indexRange",
+            },
+          );
         if (rel.lower !== null || rel.upper !== null || rel.emitLocator)
           throw new UnsupportedPlanError("bounded or locator-producing index range", {
             construct: "indexRange",
@@ -1160,7 +1167,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
   const recipe = prepare(plan.root);
   // Main's cursor still collects the whole range before its first result. Keep this SQL
   // strategy opt-in until B3's streaming cursor passes the first-page CPU acceptance rule.
-  // Explicit indexRange IR continues to execute its requested access path.
+  // Explicit indexRange and SQL both require the diagnostic opt-in above.
   const ordered = options.keyOrder === true ? orderedSort(plan) : null;
   // Extra helper buffers must not turn a formerly admissible small-cap query into a refusal.
   // Both strategies are capability-checked at prepare; only their execution resources differ.

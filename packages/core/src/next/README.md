@@ -1287,7 +1287,10 @@ IR operator, including the peak sum of simultaneous holdings.
 compares both strategies in interleaved Node CPU rounds over the same committed fixture.
 The whole-query comparison includes SQL/lowering/prepare/materialized rows; the component
 times the prepared scan/sort/fetch/frame pipeline. These are Node measurements.
-Unbounded, value-producing `indexRange` nodes use the pinned index cursor and the same
+Unbounded, value-producing `indexRange` nodes require the same internal `keyOrder:true`
+diagnostic opt-in as SQL until the charged streaming cursor lands. The default executor
+refuses them at prepare with `UnsupportedPlanError`, including under LIMIT zero. Opted-in
+nodes use the pinned index cursor and the same
 physical-order payload fetch. The internal `keyOrder:true` option lets a direct primary-key
 ORDER BY with LIMIT select this recipe
 without changing lowering's existing sort IR: the pinned catalog must have the complete,
