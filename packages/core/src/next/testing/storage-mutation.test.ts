@@ -253,6 +253,7 @@ it("restarts an audit whose captured previous root was reclaimed by a concurrent
       )
         released = true;
     };
+    calls = 0; // only this captured generation and its concurrent publication count
     blockedOffset = first.extent.offset;
     audit = space.audit();
     await entered;
@@ -270,7 +271,7 @@ it("restarts an audit whose captured previous root was reclaimed by a concurrent
     expect(released, "the captured previous root reached native release").toBe(true);
     resume();
     await audit;
-    expect(calls).toBeGreaterThanOrEqual(4); // both roots were enumerated again after the race
+    expect(calls).toBeGreaterThanOrEqual(5); // two captured roots, one publish input, two restarted roots
   } finally {
     resume();
     await Promise.allSettled([audit, publishing]);

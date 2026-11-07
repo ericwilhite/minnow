@@ -56,7 +56,7 @@ export type EngineInput = OpenWritePathInput & {
 };
 import { CatalogChangeError, type TableDef } from "../access/catalog.js";
 import { FROZEN_MEMTABLE_CAP_BYTES, MAX_LSN } from "../access/snapshot.js";
-import type { Space, SpacePin } from "../access/space.js";
+import type { Space, SpacePin, ByteBudget } from "../access/space.js";
 import {
   WritePathClosedError,
   type BeginOptions,
@@ -692,6 +692,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
           (error) => {
             sink.failure ??= error;
           },
+          metadataGrant,
         );
         let failed: unknown = null;
         try {
@@ -1172,7 +1173,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       const runs = new Map<number, readonly RunRef[]>(
         k === 0 ? entry.indexRuns.map((index) => [index.indexId, index.runs]) : [],
       );
-      const pin = this.#space.pin(`staged t${String(def.id)}`);
+      const pin = this.#space.pin(`staged t${String(def.id)}`, this.#pinBudget);
       memtable.staged = {
         stagingId: effect.transaction,
         group: ref,
@@ -1433,6 +1434,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
    * reopen replays the build.
    */
   readonly #pendingIndexes = new Map<number, { readonly tableId: number; readonly lsn: number }>();
+
+  /** Pins use the metadata owner's admission policy, including its idle-credit reclamation. */
+  readonly #pinBudget = {
+    ordinarySource: () => this.#metadataGrant,
+    allocate: (bytes: number) => {
+      this.#chargeMetadata(bytes);
+      return true;
+    },
+    free: (bytes: number) => this.#chargeMetadata(-bytes),
+  };
 
   /** Charges (or, negative, returns) resident metadata bytes; a refusal is `ParseBudgetError`. */
   #chargeMetadata(bytes: number): void {
@@ -2117,7 +2128,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   #pinState(state: WriteState, label: string): SpacePin {
     let held = this.#statePins.get(state);
     if (held === undefined) {
-      held = { pin: this.#space.pin(label), count: 0 };
+      held = { pin: this.#space.pin(label, this.#pinBudget), count: 0 };
       this.#statePins.set(state, held);
       this.#retainState(state);
     }
@@ -2249,6 +2260,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#nextAttempt,
       this.#afterDeltaPrepared,
       this.#sinkFailed,
+      this.#pinBudget,
     );
     this.#flushesWriting += 1;
     let writing = true;
@@ -2516,7 +2528,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         this.#summaries.set(state.tableId, totals);
       } else this.#chargeMetadata(-growth);
       // Re-point readers in the same step the publish resolves (ruling R16.3).
-      const pin: SpacePin = this.#space.pin(`re-point t${String(state.tableId)}`);
+      const pin: SpacePin = this.#space.pin(`re-point t${String(state.tableId)}`, this.#pinBudget);
       const flushed = [...set];
       // Older readers keep the published group (pin) and the memtables' key deltas (ruling 2).
       for (const memtable of flushed) this.#published.add(memtable);
@@ -2755,6 +2767,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#nextAttempt,
       this.#afterDeltaPrepared,
       this.#sinkFailed,
+      this.#pinBudget,
     );
     const retired: ExtentRef[] = [];
     const changed = new Map<number, TableRoot>();
@@ -2999,7 +3012,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       root: rootBlob,
       deletions: null,
     };
-    const pin = this.#space.pin(`staged t${String(memtable.tableId)}`);
+    const pin = this.#space.pin(`staged t${String(memtable.tableId)}`, this.#pinBudget);
     owned.pins.push(pin);
     const part: StagedPart = {
       stagingId,
@@ -3176,6 +3189,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#nextAttempt,
       this.#afterDeltaPrepared,
       this.#sinkFailed,
+      this.#pinBudget,
     );
     const writer = this.#space.beginWrite("idle publish");
     try {
@@ -3272,6 +3286,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#nextAttempt,
       this.#afterDeltaPrepared,
       this.#sinkFailed,
+      this.#pinBudget,
     );
     let writer: ExtentWriter | null = null;
     try {
@@ -3549,6 +3564,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#nextAttempt,
       this.#afterDeltaPrepared,
       this.#sinkFailed,
+      this.#pinBudget,
     );
     this.#merging = true;
     try {
@@ -4197,6 +4213,7 @@ class DeltaPublication {
   #durable = false;
   /** The keeper holds a prepared list for the attempt; the sink was asked to prepare. */
   #listPrepared = false;
+  #preparedList: ExtentList | null = null;
   #sinkAsked = false;
 
   constructor(
@@ -4207,6 +4224,7 @@ class DeltaPublication {
     readonly nextAttempt: () => number,
     readonly afterPrepared: ((kind: PublicationKind, sequence: number) => void) | null,
     readonly fail: (error: ExtentSinkError) => void,
+    readonly budget: ByteBudget,
   ) {}
 
   /**
@@ -4229,6 +4247,7 @@ class DeltaPublication {
       throw new ExtentSinkError(error); // settle() aborts the attempt
     }
     this.#listPrepared = true;
+    this.#preparedList = prepared.list;
     // Retired by this publication like `released`: held under R8 (both durable roots and every
     // pin) before the space reuses them.
     retired.push(...prepared.retire);
@@ -4263,7 +4282,13 @@ class DeltaPublication {
     writer: ExtentWriter,
     retired: readonly ExtentRef[],
   ): Promise<void> {
-    await space.publish(root, { writers: [writer], retired });
+    if (this.#preparedList === null) throw new TypeError("Publish has no prepared extent list");
+    await space.publish(root, {
+      writers: [writer],
+      retired,
+      list: this.#preparedList,
+      budget: this.budget,
+    });
     this.#durable = true;
   }
 
@@ -4275,6 +4300,7 @@ class DeltaPublication {
     const listPrepared = this.#listPrepared;
     const sinkAsked = this.#sinkAsked;
     this.#listPrepared = false;
+    this.#preparedList = null;
     this.#sinkAsked = false;
     try {
       if (listPrepared) {

@@ -35,14 +35,16 @@ const EMPTY: Uint8Array[] = [];
 
 /**
  * W inventory (all bounded before any chain exists):
- * - source phase: three 60 KiB frames, a 64 KiB+16 raw list, one native data response <=256 KiB,
- *   8 KiB of bounded descriptors/views/control state: 520,208 bytes;
- * - native-list merge: four 60 KiB frames, one 256 KiB native response and 8 KiB control state:
- *   516,096 bytes. Raw list cursor views borrow the separately charged read slab (S).
- * - release phase: two 60 KiB frames, one 256 KiB native response, one <=60 KiB boundary copy,
- *   three bounded vectors of <=256 ranges at 80 bytes, and 8 KiB control: 516,096 bytes.
- * The compact native frame adds256B; a fixed eight-entry control cache adds at most2752B.
- * The worst source phase is523216B; merge/release phases are519104B, all below512KiB.
+ * - native-list source: two owned60KiB frames, one256KiB record, <=16KiB for128
+ *   selected native index entries/views,8KiB headers,2752B fixed control cache and256B I/O:
+ *   412608B. Raw list cursors borrow S, never an additional decoded E-vector.
+ * - private startup merge/sort: four60KiB frames, one60KiB native metadata response,
+ *   headers/cache/compact I/O:318400B. No data-index page is selected in this phase.
+ * - native release: two60KiB frames, one256KiB boundary response, one60KiB boundary
+ *   copy, three <=256-range vectors at80B per range, headers/cache/compact I/O:519104B.
+ *   Boundary lookup is at most two index entries, covered by the header allowance.
+ * - full physical audit: no cursor frames; <=4096 index entries/keys at96B per entry,
+ *   headers/cache/compact I/O:404416B. The workspace mutex excludes every frame phase.
  * The remaining allowance is headroom, not capacity for an O(extents) collection. The caller
  * must not overlap source reads with the merge/reclaim phase or escape a phase's frame views.
  * Native storage contents and unreachable GC garbage are not resident managed buffers.

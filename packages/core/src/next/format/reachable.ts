@@ -372,5 +372,20 @@ export function listedRootExtents(
       budget.free(manifest.charge);
     }
   };
-  return Object.assign(listed, { ordered: true });
+  return Object.assign(listed, {
+    ordered: true,
+    openList(root: Uint8Array, budget: ByteBudget) {
+      const manifest = codecs.decodeRoot(root, budget);
+      let held = true;
+      return {
+        list: manifest.value.extentList,
+        release() {
+          if (held) {
+            held = false;
+            budget.free(manifest.charge);
+          }
+        },
+      };
+    },
+  });
 }

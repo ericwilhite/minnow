@@ -45,9 +45,15 @@ export class RootPins {
   #cacheBytes = 0;
   constructor(
     readonly memory: CacheMemory,
-    readonly changed: () => void,
+    changed: () => void,
     readonly now: () => number = Date.now,
-  ) {}
+  ) {
+    this.#changed = changed;
+  }
+  #changed: (() => void) | null;
+  changed(): void {
+    this.#changed?.();
+  }
   get generation(): number {
     return this.#generation;
   }
@@ -106,6 +112,7 @@ export class RootPins {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    this.#changed = null; // late pins must not retain the closed space or its backend
     if (this.#cacheBytes === 0) this.memory.unregister?.();
   }
 }

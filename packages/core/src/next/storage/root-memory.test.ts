@@ -160,3 +160,31 @@ it("moves admitted wrapper credit from its native ordinary grant without overlap
   }
   expect(governor.usedBytes).toBe(0);
 });
+
+it("copies from prepaid ordinary credit while another owner fills headroom and holds a loan", async () => {
+  const { Governor } = await import("../memory/governor.js");
+  const governor = new Governor(8 << 20),
+    grant = await governor.admit({ label: "root credit", minimumBytes: 1 << 20, spillable: true });
+  const roots = RootMemory.create((cache) => governor.registerCache(cache));
+  const caller = await governor.admit({
+    label: "caller holds all headroom",
+    minimumBytes: governor.capBytes - governor.reserveBytes - governor.usedBytes,
+    spillable: false,
+  });
+  const loan = await caller.borrow(64 << 10),
+    before = governor.usedBytes;
+  let frame: RootFrame | null = null;
+  try {
+    frame = await roots.copy(new Uint8Array(256 << 10), grant);
+    expect(governor.usedBytes).toBe(before);
+    expect(caller.loaned).toBe(64 << 10);
+    expect(grant.allocated).toBe(0);
+  } finally {
+    frame?.release();
+    roots.close();
+    loan.repay();
+    caller.close();
+    grant.close();
+  }
+  expect(governor.usedBytes).toBe(0);
+});

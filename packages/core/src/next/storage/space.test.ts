@@ -219,13 +219,13 @@ describe("extent space: writing, publishing and reopening", () => {
     await writer.abort();
     const published = space.beginWrite("p");
     const { extent } = await published.write([bytesOf(10, 1)]);
-    await space.publish(rootOf([]), { writers: [published], retired: [] });
+    await space.publish(rootOf([], [extent]), { writers: [published], retired: [] });
     await expect(space.publish(rootOf([]), { writers: [published], retired: [] })).rejects.toThrow(
       /is published/u,
     );
     const free: ExtentRef = { offset: 64 * DATA_ALIGN, length: 1 };
     await expect(space.publish(rootOf([]), { writers: [], retired: [free] })).rejects.toThrow(
-      /not allocated/u,
+      /current\/new root difference/u,
     );
     await expect(
       space.publish(rootOf([]), { writers: [], retired: [extent, extent] }),
@@ -233,11 +233,11 @@ describe("extent space: writing, publishing and reopening", () => {
     const held = space.beginWrite("h");
     const own = await held.write([bytesOf(10, 1)]);
     await expect(space.publish(rootOf([]), { writers: [], retired: [own.extent] })).rejects.toThrow(
-      /unpublished writer/u,
+      /current\/new root difference/u,
     );
     await space.publish(rootOf([]), { writers: [], retired: [extent] });
     await expect(space.publish(rootOf([]), { writers: [], retired: [extent] })).rejects.toThrow(
-      /already retired/u,
+      /current\/new root difference/u,
     );
     expect(space.failed).toBeNull();
   });
@@ -446,24 +446,22 @@ describe("extent space: open walk and audit", () => {
 
   it("refuses to open over roots whose extents overlap", async () => {
     const backend = new MemoryBackend();
-    const { space } = await openOver(backend);
+    const { space, session } = await openOver(backend);
     const writer = space.beginWrite("t");
     const { extent } = await writer.write([bytesOf(2 * DATA_ALIGN, 1)]);
     const bogus: ExtentRef = { offset: extent.offset + DATA_ALIGN, length: 10 };
-    await space.publish(new TextEncoder().encode(JSON.stringify({ extents: [extent, bogus] })), {
-      writers: [writer],
-      retired: [],
-    });
+    // Bypass the new publication validator to model a corrupt older durable root.
+    await session.publish(new TextEncoder().encode(JSON.stringify({ extents: [extent, bogus] })));
     await space.close();
     await expect(openOver(backend, { reuseLock: true })).rejects.toThrow(StoreCorruptionError);
   });
 
   it("audit finds a published extent the root does not reach (a leak)", async () => {
     const { space } = await openOver(new MemoryBackend());
-    const writer = space.beginWrite("t");
-    await writer.write([bytesOf(10, 1)]);
-    await space.publish(rootOf([]), { writers: [writer], retired: [] });
-    await expect(space.audit()).rejects.toThrow(/unaccounted \(a leak\)/u);
+    // Deliberately break allocator ownership, rather than supply unused writer output (which
+    // publication now reclaims safely). The audit must still detect an actual unowned range.
+    (space as unknown as { map: { allocate(bytes: number): number } }).map.allocate(DATA_ALIGN);
+    await expect(space.audit()).rejects.toThrow(/unaccounted.*a leak/u);
   });
 });
 
@@ -554,13 +552,15 @@ describe("extent space: reads, leases and the cache", () => {
     const lease = await space.read(a.blobs, { budget });
     lease.release();
     expect(space.peek(at(a.blobs, 0))).not.toBeNull();
+    let previous = a.extent;
     for (let round = 2; round <= 3; round++) {
       const writer = space.beginWrite(String(round));
       const next = await writer.write([bytesOf(DATA_ALIGN, round)]);
       await space.publish(rootOf(next.blobs), {
         writers: [writer],
-        retired: round === 2 ? [a.extent] : [],
+        retired: [previous],
       });
+      previous = next.extent;
     }
     await (space as unknown as { settled(): Promise<void> }).settled();
     expect(space.peek(at(a.blobs, 0))).toBeNull();
@@ -575,26 +575,31 @@ describe("extent space: reads, leases and the cache", () => {
   it("charges unpinned blobs to the cache and pinned ones to the reader, and evicts on demand", async () => {
     const memory = countingMemory(Infinity);
     const { space } = await openOver(new MemoryBackend(), { memory });
-    expect(memory.used).toBe(FIXED_CACHE_BYTES + RETAINED_BASE_BYTES);
+    expect(memory.used).toBe(FIXED_CACHE_BYTES + space.stats.retainedBytes);
     const writer = space.beginWrite("t");
     const { blobs } = await writer.write([bytesOf(1000, 1), bytesOf(3000, 2)]);
     const budget = countingBudget(1 << 20);
     const lease = await space.read(blobs, { budget });
-    expect(memory.used).toBe(FIXED_CACHE_BYTES + RETAINED_BASE_BYTES);
+    expect(memory.used).toBe(FIXED_CACHE_BYTES + space.stats.retainedBytes);
     expect(space.stats.cache.pinnedBytes).toBe(4000);
     expect(memory.cache?.evictableBytes).toBe(0);
     lease.release();
-    expect(memory.used).toBe(FIXED_CACHE_BYTES + RETAINED_BASE_BYTES + 4000 + 2 * ENTRY_OVERHEAD);
+    expect(memory.used).toBe(
+      FIXED_CACHE_BYTES + space.stats.retainedBytes + 4000 + 2 * ENTRY_OVERHEAD,
+    );
     expect(memory.cache?.evict(1)).toBeGreaterThan(0);
-    expect(memory.used).toBe(FIXED_CACHE_BYTES + RETAINED_BASE_BYTES + 3000 + ENTRY_OVERHEAD);
+    expect(memory.used).toBe(FIXED_CACHE_BYTES + space.stats.retainedBytes + 3000 + ENTRY_OVERHEAD);
     expect(space.peek(at(blobs, 1))).not.toBeNull();
     await space.close();
     expect(memory.used).toBe(0);
   });
 
   it("keeps hot blobs through a scan larger than the cache (segmented LRU)", async () => {
-    const memory = countingMemory(FIXED_CACHE_BYTES + 40 * (DATA_ALIGN + ENTRY_OVERHEAD));
+    const memory = countingMemory(Infinity);
     const { space } = await openOver(new MemoryBackend(), { memory });
+    // Preserve this policy test's old encoded-cache capacity exactly; include the actual new
+    // prepaid startup ownership instead of assuming the old 1 KiB retained-metadata base.
+    memory.setLimit(memory.used + 40 * (DATA_ALIGN + ENTRY_OVERHEAD) - RETAINED_BASE_BYTES);
     const writer = space.beginWrite("t");
     const hot = await writer.write([bytesOf(DATA_ALIGN, 1)]);
     const cold = await writer.write(

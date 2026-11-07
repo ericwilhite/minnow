@@ -641,26 +641,24 @@ describe("a sink whose commit or abort throws (review B3-p2b-4 D1)", () => {
       });
 });
 
-describe("the sink's retire list (B1's question)", () => {
-  it("an extent the sink retires is held under R8 like a released one: not reused while a pin can reach it", async () => {
+describe("root-listed keeper pages (R8/R25)", () => {
+  it("a root-listed page is held under R8: not reused while a pin can reach it", async () => {
     const harness = new Harness("strict", "memory", 4, undefined, { merges: { mode: "off" } });
     let page: { offset: number; length: number } | null = null;
     let retireNow = false;
     const retiredBy = new Set<number>();
     const added: Array<{ offset: number; length: number }> = [];
     harness.extentDeltas = {
-      // The sink writes a page into one publication and retires it in a later one (B1's list
-      // pages, until the root has a field for them).
-      prepare: async (_attempt, delta) => {
+      // R25 now supplies the root field and real keeper pages. The observer sees their
+      // retirement in released; an extra unlisted sink allocation is never root ownership.
+      prepare: (_attempt, delta) => {
         for (const extent of delta.added) added.push(extent);
-        if (page === null && delta.added.length > 0) {
-          page = need((await delta.writer.write([new Uint8Array([1, 2, 3])])).blobs[0]).extent;
-          return null;
-        }
-        if (retireNow && page !== null) {
+        if (
+          retireNow &&
+          page !== null &&
+          delta.released.some((extent) => extent.offset === page?.offset)
+        )
           retireNow = false;
-          return { list: [], pages: [], retire: [page] };
-        }
         return null;
       },
       commit: () => undefined,
@@ -679,8 +677,9 @@ describe("the sink's retire list (B1's question)", () => {
       await path.quiesce();
     };
     await flush();
+    page = need(decodeManifestRoot(need(harness.space.root), FREE).value.extentList[0]).blob.extent;
     expect(page).not.toBeNull();
-    const written = page as unknown as { offset: number; length: number };
+    const written = page;
     // A reader older than the retirement.
     const old = harness.space.pin("older reader");
     retireNow = true;
@@ -713,18 +712,17 @@ describe("the sink's retire list (B1's question)", () => {
     let releasedWith: Array<{ offset: number; length: number }> = [];
     const allocated: Array<{ offset: number; length: number; generation: number }> = [];
     harness.extentDeltas = {
-      prepare: async (_attempt, delta) => {
+      prepare: (_attempt, delta) => {
         const generation = harness.space.generation;
         for (const extent of delta.added) allocated.push({ ...extent, generation });
-        if (page === null && delta.added.length > 0) {
-          page = need((await delta.writer.write([new Uint8Array([1, 2, 3])])).blobs[0]).extent;
-          return null;
-        }
-        if (retireNow && page !== null && delta.released.length > 0) {
+        if (
+          retireNow &&
+          page !== null &&
+          delta.released.some((extent) => extent.offset === page?.offset)
+        ) {
           retireNow = false;
           releasedWith = [...delta.released];
           retire.at = -1;
-          return { list: [], pages: [], retire: [page] };
         }
         return null;
       },
@@ -742,6 +740,7 @@ describe("the sink's retire list (B1's question)", () => {
       await path.quiesce();
     };
     await flush();
+    page = need(decodeManifestRoot(need(harness.space.root), FREE).value.extentList[0]).blob.extent;
     retireNow = true;
     // Deletes give the next flushes `released` extents (folded bitmaps), so the retire rides one.
     for (let k = 0; k < 8 && (retire.at === null || retire.at < 0); k++) {
@@ -761,9 +760,7 @@ describe("the sink's retire list (B1's question)", () => {
     // Allocated while generation g was current (before g + 1 was durable).
     const early = allocated.filter((extent) => extent.generation === g);
     expect(early.length, "the next publication allocated extents").toBeGreaterThan(0);
-    expect(early.filter(overlaps(page as unknown as { offset: number; length: number }))).toEqual(
-      [],
-    );
+    expect(early.filter(overlaps(page))).toEqual([]);
     for (const extent of releasedWith) expect(early.filter(overlaps(extent))).toEqual([]);
     await harness.space.audit();
     await harness.close();
@@ -808,5 +805,36 @@ it("an observer cannot substitute its own extent list for the engine's keeper", 
     }
   } finally {
     if (outcome.opened) await harness.close();
+  }
+});
+
+it("an observer cannot retire an unlisted unpublished allocation", async () => {
+  const harness = new Harness("strict", "memory", 4),
+    status = { armed: false };
+  harness.extentDeltas = {
+    prepare: async (_attempt, delta) =>
+      status.armed
+        ? {
+            list: [],
+            pages: [],
+            retire: [(await delta.writer.write([new Uint8Array([1, 2, 3])])).extent],
+          }
+        : null,
+    commit: () => undefined,
+    abort: () => undefined,
+  };
+  const path = await harness.open();
+  try {
+    const table = await oneTable(path),
+      before = harness.space.root?.slice();
+    status.armed = true;
+    await autocommit(path, (s) => s.table(table).insert(batch(ints([1, 2, 3, 4])), null));
+    await autocommit(path, (s) => s.table(table).insert(batch(ints([5])), null));
+    await path.quiesce().catch(() => undefined);
+    expect(path.failure).toBeInstanceOf(RangeError);
+    expect(path.failure?.message).toMatch(/retirement.*current\/new root difference/);
+    expect(harness.space.root).toEqual(before);
+  } finally {
+    await harness.close();
   }
 });

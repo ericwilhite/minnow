@@ -1231,6 +1231,27 @@ export const RETIREMENT_TICKETS_REACH = [
   "two bounded batches per ticket",
 ] as const;
 
+/** Publication/free progress with a caller that releases ordinary/loan holdings only afterwards. */
+export const STORAGE_PRESSURE_REACH = [
+  "pinned retirement backlog",
+  "no publication admission",
+  "caller loan held",
+  "abort completes at full cap",
+  "audit after reclamation",
+] as const;
+
+/** Every native I/O/task suspension of final validation/publication admits additions, never frees. */
+export const STORAGE_FINAL_HISTORY_REACH = [
+  "tracked hole consumed",
+  "monotonic open and extend",
+  "publishing writer rejects additions",
+  "queued owners retain records",
+  "task suspension",
+  "metadata suspension",
+  "native publish suspension",
+  "audit after all orderings",
+] as const;
+
 export const FLUSH_ROLLBACK_REACH = [
   "flush held before publication",
   "rollback removes the new tail",

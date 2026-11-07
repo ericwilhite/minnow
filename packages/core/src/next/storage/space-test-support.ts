@@ -118,6 +118,7 @@ export function countingBudget(limit: number): CountingBudget {
 
 export interface CountingMemory extends CacheMemory {
   used: number;
+  setLimit(bytes: number): void;
   readonly limit: number;
   cache: EvictableCacheLike | null;
 }
@@ -125,7 +126,13 @@ export interface CountingMemory extends CacheMemory {
 export function countingMemory(limit: number): CountingMemory {
   const memory = {
     used: 0,
-    limit,
+    get limit() {
+      return limit;
+    },
+    setLimit(bytes: number) {
+      if (bytes < memory.used) throw new RangeError("Limit below current use");
+      limit = bytes;
+    },
     cache: null as EvictableCacheLike | null,
     charge(bytes: number) {
       if (memory.used + bytes > limit) return false;

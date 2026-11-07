@@ -15,7 +15,12 @@
  *   Callers reserve from good estimates (page statistics) so it stays rare.
  */
 import type { DataRange } from "./contract.js";
-import type { FreeSpaceMap } from "./free-space.js";
+/** Monotonic placement only; a capped map may expose fewer reusable holes. */
+export interface ReservationMap {
+  sizeOf(bytes: number): number;
+  allocate(bytes: number): number;
+  allocateAt(offset: number, bytes: number): boolean;
+}
 
 interface Segment {
   readonly offset: number;
@@ -39,11 +44,11 @@ export interface SealPlan {
 }
 
 export class ExtentReservation {
-  readonly #map: FreeSpaceMap;
+  readonly #map: ReservationMap;
   readonly #segments: Segment[] = [];
   #state: "open" | "sealed" | "aborted" = "open";
 
-  constructor(map: FreeSpaceMap, capacity: number) {
+  constructor(map: ReservationMap, capacity: number) {
     if (!(Number.isSafeInteger(capacity) && capacity > 0)) throw new RangeError("Bad capacity");
     this.#map = map;
     const size = map.sizeOf(capacity);
@@ -123,6 +128,22 @@ export class ExtentReservation {
       }));
     const release = this.#segments.map(({ offset, capacity }) => ({ offset, length: capacity }));
     return { extent: { offset: target, length }, moves, release };
+  }
+
+  /** Scalar ownership iteration for audit; never copies the segment vector. */
+  *ownedRanges(): IterableIterator<DataRange> {
+    for (const { offset, capacity } of this.#segments) yield { offset, length: capacity };
+  }
+  /** Owner removal under the mutation barrier. A bounded consumer may release between ranges;
+   * other monotonic reservations cannot affect the remaining owned segments. */
+  *abortRanges(): IterableIterator<DataRange> {
+    this.#open();
+    this.#state = "aborted";
+    try {
+      yield* this.ownedRanges();
+    } finally {
+      this.#segments.length = 0;
+    }
   }
 
   /** Every segment, for the caller to free (nothing was published). */

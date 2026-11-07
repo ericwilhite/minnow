@@ -69,8 +69,9 @@
  *   No new memory admission or loan is awaited while the transition barrier is held.
  * - `retired` lists the extents the previous root reaches and the new root does not, each exactly
  *   once, as `ExtentRef`s the space handed out (any length that rounds to the same aligned size is
- *   accepted). Retiring space that is free, reserved or already retired is a `RangeError` before
- *   anything is written.
+ *   accepted). Validation reads only immutable current/new lists. New root extents must come
+ *   from current or supplied sealed writers, never the lossy map's complement. Invalid
+ *   retirements fail before native root publication (private preparation may already write).
  * - **Two-generation reclaim (ruling R8, reclaim.ts).** Space retired by the publish of generation
  *   g is reused only when the *next* publish (g+1) is durable **and** no pin below g remains.
  *   Until g+1 overwrites the other root slot, that slot holds g−1, the root a reopen falls back to
@@ -89,8 +90,11 @@
  *   Crash orphans, aborted writers and unpublished extents are simply unreachable. Two different
  *   reachable extents that overlap, or one past the data length, fail the open with
  *   `StoreCorruptionError`.
- * - Kept in memory after that (free-space.ts): lowest-address first fit, freed runs coalesced.
- *   Allocation never fails for fragmentation; it grows the data space at its end. Quota surfaces as
+ * - Kept in a prepaid32–256KiB run arena (bounded-free-space.ts): lowest tracked-address first
+ *   fit, freed runs coalesced. At capacity the smallest holes become untracked-free debt and are
+ *   never allocated. Reopen rebuilds all gaps, but debt can remain when fragmentation still
+ *   exceeds capacity. Full recovery requires enough coalescing to fit. Allocation grows EOF
+ *   when no tracked run fits. Quota surfaces as
  *   `StoreQuotaError` from the write that needed it.
  * - Freed space goes to `session.releaseData` (IndexedDB deletes the records; OPFS truncates only a
  *   free tail, because Chromium and WebKit do not return quota on truncate) and is reallocated only
@@ -135,9 +139,12 @@
  *   the space can reallocate it.
  *
  * ## Memory
- * Fixed: one 1 MiB read slab and one 1 MiB write slab, charged through the cache handle at open
- * (open fails with `RangeError` under a cap too small for them). The free map, pin table and cache
- * index are small (O(free runs + pins + cached blobs)). Writers stage nothing else: `append`
+ * S is the fixed read/write slabs (1MiB each), R a prepaid32–256KiB run arena,
+ * W a prepaid512KiB cursor/journal/reclaim workspace, and C root/snapshot credit. Retirement
+ * state is a disk queue; reclaim derives the immutable before/after difference in bounded
+ * batches, with list pages protected until completion. Publication and frees never grow R/W
+ * or await admission. Encoded cached blobs remain separately evictable by the governor.
+ * The fixed startup minimum must fit the cap. Writers stage nothing else: `append`
  * copies parts into the write slab, which one builder holds at a time, so a builder's consecutive
  * appends become writes of up to 1 MiB (a chunk of 32 pages costs one or two platform writes, not
  * 32). When another builder appends, the slab is written out and the partial last sector
@@ -172,6 +179,7 @@
  * assumes a file.
  */
 import type { TaskWork } from "../task.js";
+import type { ExtentList } from "./extent-list.js";
 import type { StoreSession } from "./contract.js";
 import type { RootPin } from "./reclaim.js";
 import { MAX_SLAB } from "./slabs.js";
@@ -281,6 +289,14 @@ export type ReachableExtents = ((
 ) => AsyncIterable<ExtentRef | BlobRef> | Iterable<ExtentRef | BlobRef>) & {
   /** Emits nondecreasing offsets; startup validates this promise before reclaiming. */
   readonly ordered?: boolean;
+  /** R25's immutable descriptors, admitted by the format reader before they are returned. */
+  readonly openList?: (
+    root: Uint8Array,
+    budget: ByteBudget,
+  ) => {
+    readonly list: ExtentList;
+    release(): void;
+  };
 };
 
 export interface OpenSpaceOptions extends TaskWork {
@@ -300,7 +316,7 @@ export interface OpenSpaceOptions extends TaskWork {
   /** Charged for startup leases and retained-map construction. Retained state transfers
    * to a lifetime handle from `registerCache` before open returns; audits use this budget too. */
   readonly budget: ByteBudget;
-  /** Registers the page cache or non-evictable metadata owner with the governor; may be called twice. */
+  /** Registers the page cache or non-evictable metadata owner with the governor; each fixed/state owner gets its own registration. */
   readonly registerCache: (cache: EvictableCacheLike) => CacheMemory;
   readonly signal?: AbortSignal;
 }
@@ -310,9 +326,10 @@ export interface OpenSpaceOptions extends TaskWork {
  * (storage/contract.ts "Startup order"): reads the current and previous roots, reads what each
  * reaches (its extent list, ruling R25), builds
  * the free map, retires
- * what only the previous root reaches (`ReclaimLedger.retireAtOpen`), returns the free tail. The
+ * what only the previous root reaches (a generation-zero disk ticket), returns the free tail. The
  * startup reads the kept roots' list pages, coalesced; audit/test open separately performs the
- * full O(groups + index runs) cross-check. Nothing is written but the tail release.
+ * full O(groups + index runs) cross-check. Owner-private metadata is reset/written; durable
+ * roots/data are unchanged except for the proven free-tail release.
  * Implemented by `openExtentSpace` (space.ts).
  */
 export type OpenExtentSpace = (
@@ -468,7 +485,12 @@ export interface WriteOptions {
   readonly budget?: ByteBudget;
 }
 
-export interface PublishChange {
+export interface PublishChange extends TaskWork {
+  /** Immutable, caller-admitted R25 descriptors, kept until publish settles. Avoids decoding
+   * another root model under the ownership barrier. The write path supplies its prepared list. */
+  readonly list?: ExtentList;
+  /** Preparation-only callback/codec leases; no admission or loan is awaited under the barrier. */
+  readonly budget?: ByteBudget;
   /** Every writer whose extents the new root reaches: all of their sealed extents, no builder open. */
   readonly writers: readonly ExtentWriter[];
   /** Extents the previous durable root reaches and the new one does not, each exactly once. */
@@ -480,6 +502,9 @@ export interface SpaceStats {
   readonly dataBytes: number;
   /** Free bytes below `dataBytes`. */
   readonly freeBytes: number;
+  /** Proven free bytes forgotten by the capped arena; never allocated. Debt can survive reopen
+   * when fragmentation still exceeds capacity, and disappears when the rebuilt gaps fit. */
+  readonly untrackedFreeBytes: number;
   /** Reserved or sealed by writers not yet published or aborted. */
   readonly writerBytes: number;
   /** Retired, waiting for the next publish or an older pin (garbage debt). */
@@ -491,7 +516,8 @@ export interface SpaceStats {
   readonly releasingBytes: number;
   /** Builders `seal` had to relocate after an `extend` could not grow in place. */
   readonly relocations: number;
-  /** Charged for the space's retained metadata (free runs, retirements; R25 lifetime admission). */
+  /** Space-owned prepaid arena/workspace/root credit and fallback pins. Caller-budget pins
+   * remain charged to their snapshot owner. No resident per-retirement index. */
   readonly retainedBytes: number;
   readonly cache: {
     readonly residentBytes: number;
@@ -531,9 +557,11 @@ export interface ExtentSpace extends ExtentReader {
   publish(root: Uint8Array, change: PublishChange): Promise<number>;
   /**
    * Holds the current root's extents (and so its blobs) until released. Synchronous; `label`
-   * names the holder in `stats.oldestPin`.
+   * names the holder in `stats.oldestPin`. Descriptor and label credit is reserved before
+   * allocation. Supply the snapshot owner's budget (kept alive until release), or use a
+   * separate non-evictable cache registration. Insufficient caller credit is ReadDeniedError.
    */
-  pin(label?: string): RootPin;
+  pin(label?: string, budget?: ByteBudget): RootPin;
   /**
    * Captures the mutation epoch and walks both roots from that generation with `reachable`,
    * and checks the free map against them:

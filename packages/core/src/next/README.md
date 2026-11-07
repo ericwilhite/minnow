@@ -1900,9 +1900,8 @@ cursor across read batches, so traversing the root’s page references is linear
 
 ### Bounded free-run arena
 
-`storage/bounded-free-space.ts` provides the fixed-arena allocator for the R25
-replacement. It is isolated from the live space until list-based provenance and
-the ownership-transition barrier are integrated. The arena is admitted once,
+`storage/bounded-free-space.ts` is the live extent space's fixed-arena allocator.
+The arena is admitted once,
 sized with headroom from the initial run count, between 32 and 256 KiB. It never
 grows its backing buffer during allocation or release.
 
@@ -1942,8 +1941,8 @@ own frame.
 These pages are reconstructible scratch, never a durable root or a recovery
 authority. The extent-space opener will reset them under its fence before use;
 the operator-spill sweep leaves them alone. Their page encoding is private to
-one owner and needs no stored-format migration. This backing is preparatory;
-retirement tickets still use the existing implementation until integration.
+one owner and needs no stored-format migration. The live space stores saved root
+lists, retirement tickets and reclaim worklists here.
 
 ### Prepaid metadata journal
 
@@ -1977,11 +1976,11 @@ is checked after the final descriptor write as well, and returns the unused
 output chain. Native failures preserve their original error while cleanup
 returns the resident workspace.
 
-These are tested primitives for the replacement. Root-list provenance, ticket
-eligibility, bounded data-range release and live publication still need their
-separate integration; these components alone do not establish the whole-space
-memory bound or repair the rejected compact branch. Sorting a candidate does
-not authorize it against roots, writers or the lossy map's complement.
+The live space uses these streams for root provenance, ticket eligibility and
+bounded reclaim. Sorting a candidate does not authorize it: retirement must equal
+the immutable current/new root difference, and incoming ranges must belong to
+the current root or supplied sealed writers. The lossy map's complement grants
+no authority.
 
 The fixed read slab is allocated only after its cache charge succeeds. A borrowed
 slab scope serializes with ordinary cache misses and drains before close returns
@@ -2004,9 +2003,8 @@ that slab. It reads up to two nearby pages together, verifies each checksum,
 header, coordinate and cross-page order, then exposes one scalar offset/length
 pair at a time. It creates no decoded per-extent objects. Between page reads and
 shared-clock yields, iteration is synchronous. The input page descriptors stay
-with their admitted caller. These components still need the live ticket and
-space composition below; they do not make lossy-map complement into ownership
-proof.
+with their admitted caller; the live space does not duplicate that descriptor
+list during publication.
 
 ### Disk-derived retirement composition
 
@@ -2022,14 +2020,18 @@ handles on disk. Provisional tail links are committed only with their native
 root publication, or unlinked on abort. Reclaim observes both R8 guards,
 materializes the full difference before any data release, then drains at most
 256 ranges per batch. Snapshot references outlive their original owner until
-the last ticket finishes. Publication and audit serialize workspace use; the
-live-space switch is a separate integration step.
+the last ticket finishes. Publication and audit serialize workspace use. A
+contending publication lets audit flush a bounded prefix and await its external
+producer outside the workspace; the audit restarts on mutation-epoch changes.
+No publication holds the workspace waiting for caller/governor memory.
 
 The live composition can borrow private sort/merge inputs and sort scratch from
 the paid read slab. Only two standalone control/output frames are then owned.
 W also covers one 256 KiB native response, a 60 KiB boundary copy, three bounded
 256-range vectors, compact I/O and the fixed control cache (519,104 bytes).
-The worst source phase is 523,216 bytes; both fit the 512 KiB reservation. Startup's private cache may admit
+Serial native-list reads also bound index selection to128 entries (16KiB allowance),
+so their source phase is412,608 bytes. Private merge/sort is318,400 bytes. Full physical
+audit uses W with no cursor frames (404,416 bytes). All fit512KiB. Startup's private cache may admit
 its final arena synchronously while holding its temporary slab view; the cache
 is not exposed yet and this never awaits an admission or a caller.
 
@@ -2047,9 +2049,11 @@ native slot response at a time before allocating the prepaid read slab.
 no per-generation Maps. Each descriptor and its label are charged before
 allocation to the supplied snapshot budget, or a separate non-evictable owner.
 The caller keeps its budget alive until release. Release is idempotent and
-returns its credit even after the space closes. These primitives supply C for
-the live composition; their individual tests do not establish the whole-space
-bound.
+returns its credit even after the space closes. The live bound is S + R + W + C:
+S is the two fixed 1 MiB slabs, R the 32–256 KiB arena, W the 512 KiB workspace,
+and C the root bank, larger owned frames and snapshot descriptors. Caller-owned
+snapshot budgets stay live until release. `stats.retainedBytes` reports the
+space-owned charges; caller-budget pin credit remains with that caller.
 
 ### R25 startup measurement
 
@@ -2076,16 +2080,17 @@ group roots, directory pages and table statistics, not a full SQL workload.
 R25 preparation and startup use the worker-wide R23.5 task clock reexported by
 `exec/pipeline.ts` (implemented in `task.ts` so storage does not depend on the executor).
 No operation entry or resolved read restarts it. Bounded loops check the deadline, yield a real
-task when due, and check cancellation on resume. Delta sorting uses an in-place sliced heapsort. Normal listed-root startup stream-merges both
-ordered roots directly into the free map, decoding one page per root at a time. Scattered list-page
-allocations use seven bounded radix passes over page references, so reconstruction is O(extents +
-list pages), with no extent Maps or comparison sort. Retained free-run arrays and retirement
-state reserve conservative capacity (including growth overlap) before allocating. Startup
-transfers that charge to a non-evictable lifetime handle, released at space close. Capacity
-charges remain at their high-water mark after entries are deleted. Audits serialize with
-publication so their roots and allocator belong to one generation. Unordered reachability callbacks and full
-audit/test-open validation retain their separate collection/sort path. All paths cooperate with
-the shared clock and cancellation.
+task when due, and check cancellation on resume. Delta sorting uses an in-place sliced heapsort. Normal listed-root startup decodes both payload lists incrementally into private
+immutable pair chains, orders the physical list-page allocations with bounded
+external sorting, and merges the chains directly into the free-map arena.
+Payload work is O(extents); physical page ordering is O(list pages × log(list pages)).
+There are no extent Maps or resident retirement index. Native list pages remain
+protected until their disk-derived ticket finishes. Every release batch has at
+most 256 ranges; allocation remains synchronous among the tracked free runs.
+Extreme fragmentation may leave untracked-free debt across reopen until the
+gap count fits the arena. Audits use one mutation epoch and restart on any change;
+unordered callbacks and audit inputs use bounded disk sorting rather than a
+whole-input resident collection. All loops use the shared clock and cancellation.
 Timer/cancellation regressions include cached reads, immediate writes and two preparations
 sharing one task's elapsed time.
 

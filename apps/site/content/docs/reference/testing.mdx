@@ -1604,12 +1604,31 @@ are unavailable; the report counts returned byte payloads and numeric index/meta
 The factory acquires handles in `openFence` and recovers in `open`, following the host contract.
 The default fence deadline is unchanged; the ready timer includes acquisition and recovery.
 
+The bounded-storage histories hold every remaining ordinary byte in the caller, sometimes
+with a live progress loan, while publication and abort finish without admission. Final-phase
+histories enumerate actual native I/O and task suspensions, then interleave tracked-hole/EOF
+reservations with queued abort, discard and seal transitions at every checkpoint. A free
+outside the barrier must fail these checks. Audit histories also require another publication
+to finish while the audit's external producer is blocked, and verify a restarted generation.
+
+Disk-derived retirement tests keep the before/after list pages protected through complete
+worklist construction, then release at most 256 ranges per batch. They independently check
+fragmentation debt and recovery when the gaps coalesce within the arena capacity. Private
+metadata faults, cancellation, native root copies and snapshot charges have separate checks.
+These are managed-buffer bounds; opaque native IndexedDB memory still needs Gate D browser
+measurement.
+
+The owner-ready campaign accepts `MINNOW_OWNER_REOPEN_SAMPLES=6` for six wall and six
+separate CPU samples per dataset/backend. It retains each sample and its before/after host
+load and CPU-pressure snapshot, including slow observations. Private metadata read bytes are
+included. A statistics-only first count remains labelled separately from startup.
+
 Bounded-arena histories independently track live cells and reusable runs under fragmentation,
 overflow, splitting and coalescing. They require forgotten holes to remain unavailable, check
 the single prepaid backing allocation, and recover all free space on rebuild where coalescing
 brings fragmentation within capacity. Unchanged extreme fragmentation may retain debt across
-reopen. This allocator is tested in isolation before integration with root-list provenance;
-unknown space never authorizes a root reference or retirement.
+reopen. Integrated histories also check root-list provenance: unknown space never authorizes
+a root reference or retirement.
 
 Memory-transfer histories fill ordinary capacity, queue another admission and
 move an existing allocation into a cache owner without adding or releasing a
@@ -1620,8 +1639,8 @@ closed grants cannot transfer into another owner's accounting.
 Private-metadata histories run over memory, both simulated fences, OPFS handles and
 IndexedDB. Random page rewrites must survive the operator-spill sweep; resetting
 metadata must preserve roots, log, data and operator spill. Every read, write and
-reset from a replaced owner must fail. This backing is preparatory for disk-derived
-retirement tickets, rather than an additional recovery authority.
+reset from a replaced owner must fail. This backing holds reconstructible disk-derived
+retirement tickets and is discarded at open; durable roots remain recovery authority.
 
 The metadata-journal generator inventories frames independently at construction,
 requires admission first, and keeps the frame count constant as its disk queue
