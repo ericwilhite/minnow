@@ -687,3 +687,10 @@ export const RESULT_OWNED_LAYOUT_REACH = [
   "decimal-i128",
   "decimal-mixed",
 ] as const;
+
+/** Worker-local graceful storage-campaign stop boundaries. */
+export const STORAGE_STEP_DOWN_STATES = [
+  "paused log lane",
+  "admitted append",
+  "go in transit",
+] as const;
