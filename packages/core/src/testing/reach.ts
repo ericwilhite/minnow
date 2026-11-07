@@ -364,6 +364,8 @@ export const WINDOW_CANCEL_REJECTION_REACH = [
 
 /** Descriptor reuse across scan phases, endpoint page spans and residency changes. */
 export const SCAN_SHAPE_REACH = [
+  "512 B raw page",
+  "2 KiB raw page",
   "same page span",
   "narrower page span",
   "release gap",
@@ -384,4 +386,14 @@ export const SCAN_SHAPE_LOOKUP_REACH = [
   "safe integers",
   "wide integers",
   "same endpoint pages",
+] as const;
+
+/** Density adaptation at raw buffer capacities on both sides of its 64-row preference. */
+export const SMALL_PAGE_CAPACITY_REACH = [
+  "capacity below 64",
+  "capacity at least 64",
+  "second flush",
+  "interval",
+  "fixed16",
+  "decimal128",
 ] as const;

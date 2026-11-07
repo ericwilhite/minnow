@@ -64,8 +64,10 @@ it.each(seedsFor("next-column-shape", [0xb2d1, 0xb2d2]))(
       fc.asyncProperty(
         fc.integer({ min: 300, max: 512 }),
         fc.integer({ min: 1, max: 19 }),
-        async (count, salt) => {
+        fc.constantFrom(512, 2048),
+        async (count, salt, rawPageBytes) => {
           reach.beginHistory();
+          reach.reach(rawPageBytes === 512 ? "512 B raw page" : "2 KiB raw page");
           const encoder = new TextEncoder();
           const types: PhysicalType[] = [
             { kind: "bool" },
@@ -122,7 +124,7 @@ it.each(seedsFor("next-column-shape", [0xb2d1, 0xb2d2]))(
             }),
           }));
           const { space, group } = await writeGroup(columns, {
-            rawPageBytes: 2048,
+            rawPageBytes,
             inlineBytes: 0,
           });
           for (let column = 0; column < columns.length; column++) {

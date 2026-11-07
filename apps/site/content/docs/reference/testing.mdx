@@ -1227,6 +1227,10 @@ are memoized separately; sparse selections are sized from their selected rows.
 The reader charges its bounded scalar memo separately from the shared directory cache.
 Generated source-value equality and residency histories cover this reuse in
 `next/exec/column-shape.test.ts` and `next/exec/shape-reuse.test.ts`.
+The shape histories include 512-byte and 2 KiB raw pages. The generated
+`next/page/small-pages.test.ts` also checks adaptive flushes for intervals, UUIDs
+and 128-bit decimals when the raw buffer holds fewer than 64 rows. The density-based
+row preference is capped by that buffer's capacity.
 
 `scripts/frame-copy-bench.mts` isolates frame ownership copies in five interleaved CPU/wall
 rounds; `MINNOW_EXPORT_FRAME_COPY_COMPARE=1` compares those policies through the whole cold scan.

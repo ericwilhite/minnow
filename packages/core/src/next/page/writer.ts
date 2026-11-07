@@ -494,7 +494,8 @@ abstract class ColumnWriter {
     // Next page's row target from this page's density.
     const perRow = page.bytes.length / this.rows;
     const target = Math.floor(this.writer.options.pageBytes / Math.max(perRow, 1 / 64));
-    this.pageRows = Math.max(64, Math.min(this.capacity, target - (target % 64)));
+    // The 64-row preference cannot exceed a small raw buffer's hard capacity.
+    this.pageRows = Math.min(this.capacity, Math.max(64, target - (target % 64)));
     this.rows = 0;
     this.mayHaveNulls = false;
     this.resetPage();
