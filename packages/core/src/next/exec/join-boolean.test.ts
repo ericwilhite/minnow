@@ -54,9 +54,8 @@ for (const seed of seedsFor("next-join-boolean", [0xb001, 0xb002]))
               : kind === "semi" || kind === "anti"
                 ? `SELECT p.* FROM p WHERE ${kind === "anti" ? "NOT " : ""}EXISTS(SELECT 1 FROM b WHERE p.k=b.k)`
                 : `SELECT p.*,b.* FROM p ${kind === "inner" ? "INNER" : kind.toUpperCase()} JOIN b ON p.k=b.k`;
-          const expected = (
-            await pg.query<Record<string, Value>>(sql, [], { rowMode: "array" })
-          ).rows as unknown as Row[];
+          const expected = (await pg.query<Record<string, Value>>(sql, [], { rowMode: "array" }))
+            .rows as unknown as Row[];
           for (const direct of [true, false]) {
             reach.beginHistory();
             const spec: HashJoinSpec = {
