@@ -433,7 +433,12 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     const rows = Number(process.env.MINNOW_EXPORT_ROWS ?? 1_048_576);
     if (!Number.isInteger(rows) || rows < 1 || !Number.isInteger(DISTINCT) || DISTINCT < 1)
       throw new Error("Export rows/distinct must be positive integers");
-    await page.goto("/packages/core/browser/");
+    // The generic conformance page imports the released legacy engine and inline source maps.
+    // Gate A needs only the real export receiver; keep the historical bootstrap reproducible.
+    const genericPage = process.env.MINNOW_EXPORT_GENERIC_PAGE === "1";
+    await page.goto(
+      genericPage ? "/packages/core/browser/" : "/packages/core/browser/next-export.html",
+    );
     await requireWorkerOpfs(page);
     const profile = info.outputPath("storage-profile");
     const targets = await workers(page, profile);
@@ -924,6 +929,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     const gcRssAfter = rendererRss(profile);
     const report = {
       rows,
+      pageBootstrap: genericPage ? "legacy-conformance" : "export-only",
       built,
       opfsBytes: onDisk,
       generatedGroups: built.generatedGroups,

@@ -653,6 +653,11 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     PageCache buffers through actual transfers, with poison verification off.
     Generated `testing/result-dictionaries.test.ts` checks exact client values, NULLs, selections,
     identity reuse/change, large deltas, cumulative cap fallback, pressure and cancellation.
+  - The receiver opens `browser/next-export.html`, which loads no unrelated conformance
+    runner or released legacy engine. `MINNOW_EXPORT_GENERIC_PAGE=1` reproduces the historical
+    page bootstrap; reports identify the bootstrap. This changes harness residency, not the
+    production executor, receiver, transfers or credit policy. Compare absolute RSS across
+    those scopes only with the bootstrap stated.
   - `MINNOW_EXPORT_PAGE_HEAP=/home/eric/.cache/export.heapsnapshot` adds a page-side CDP
     heap snapshot after all frame delivery. It records pre/post snapshot heap, backing storage
     and renderer RSS. Snapshotting performs GC: use a separate diagnostic run, not its timings
