@@ -2002,7 +2002,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#initialMaintenanceStarted = true;
     // Preserve B3's later-task fold scheduling. The owner may additionally hold all initial
     // flush/merge/recycle work until its ready message has actually reached the page.
-    this.#flushes = new Promise<void>((resolve) => setTimeout(resolve, 0));
+    this.#flushes = this.#flushes.then(
+      () => new Promise<void>((resolve) => setTimeout(resolve, 0)),
+    );
     this.#scheduleFlush();
     this.#scheduleMerge();
     if (this.#appender.end >= this.#logRecycleBytes) this.#maybeRecycle();

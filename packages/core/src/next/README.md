@@ -1438,3 +1438,6 @@ and retries against the current catalog; the published root must carry its catal
 Quiet-table checkpoints and first table roots stay provisional while a publication is prepared.
 Only adoption of the durable root installs them, so another flush cannot settle an index build
 from a checkpoint the recycler has not published.
+
+Resuming deferred initial maintenance joins the existing flush chain. Close and step-down still
+wait for every accepted flush and merge, including work started before the ready acknowledgement.
