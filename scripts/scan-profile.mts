@@ -93,7 +93,29 @@ function category(f: Frame, parent?: Frame): string | null {
     if (n === "#forPages") return null; // Inherit its sizing/decode/value-loading caller.
     return "storage / page loading and validation";
   }
-  if (u.includes("/page/decode.ts") || u.includes("/page/bits.ts")) return "vector materialization";
+  if (u.includes("/page/decode.ts")) {
+    // These parse/check encoded pages during loading, not batch vector decoding. The file
+    // also contains the decode kernels, so assigning its whole URL to vectors overstates them.
+    if (
+      [
+        "parsePage",
+        "parseDictionary",
+        "checkDictionaryCodes",
+        "aligned",
+        "constantWidth",
+        "nonDecreasing16",
+        "nonDecreasing32",
+        "max8",
+        "max16",
+        "max32",
+        "headerBoundsSafe",
+        "unsignedView",
+      ].includes(n)
+    )
+      return "storage / page loading and validation";
+    return "vector materialization";
+  }
+  if (u.includes("/page/bits.ts")) return "vector materialization";
   if (u.includes("/page/directory.ts")) return "pushdown / shape and descriptor work";
   if (/\/next\/(storage|format|hash|memory)\//u.test(u))
     return "storage / page loading and validation";
@@ -135,6 +157,14 @@ for (const path of process.argv.slice(2)) {
       const frame = nodes.get(ancestor)?.callFrame;
       const label = frame === undefined ? null : scanFocus(frame);
       if (label !== null) seenFocus.add(label);
+      // Shared bit helpers also run under parsePage; use their parser ancestor to keep
+      // that validation work out of vector decoding. Preserve explicit GC/native buckets.
+      if (
+        bucket === "vector materialization" &&
+        frame?.url.includes("/page/decode.ts") &&
+        ["parsePage", "parseDictionary", "checkDictionaryCodes"].includes(frame.functionName)
+      )
+        bucket = "storage / page loading and validation";
     }
     for (const label of seenFocus) {
       const v = focus.get(label) ?? { samples: 0, sampledWallMs: 0 };
@@ -161,7 +191,7 @@ for (const path of process.argv.slice(2)) {
       sampledWallMs,
       activeSamples,
       method:
-        "exclusive nearest classified ancestor; self-time functions; CDP sample durations include descheduling and native waits, not per-bucket CPU seconds; active count shares omit native read and idle/program",
+        "exclusive nearest classified ancestor, with parse/check ancestors overriding shared vector helpers; self-time functions; CDP sample durations include descheduling and native waits, not per-bucket CPU seconds; active count shares omit native read and idle/program",
       buckets: [...buckets]
         .map(([bucket, v]) => ({
           bucket,
