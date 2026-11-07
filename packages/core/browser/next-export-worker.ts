@@ -23,6 +23,7 @@ import { MAX_READ_BYTES, type ExtentRef, type ExtentWriter } from "../src/next/s
 import { createOpfsBackend, webLocks } from "../src/next/storage/opfs.js";
 import { openExtentSpace } from "../src/next/storage/space.js";
 import { countingBudget, jsonReachable } from "../src/next/storage/space-test-support.js";
+import { PageCache } from "../src/next/storage/page-cache.js";
 import { VERIFY_CACHED_BYTES } from "../src/next/storage/verify-cached.js";
 import {
   establishWorkingSet,
@@ -179,7 +180,8 @@ async function open(
     reachable: jsonReachable,
     budget: countingBudget(Number.POSITIVE_INFINITY),
     registerCache: (cache) => {
-      registered?.(cache);
+      // R25 also registers retained metadata; the hot-set audit must evict page data.
+      if (cache instanceof PageCache) registered?.(cache);
       return governor === null
         ? { charge: () => true, release: () => undefined }
         : governor.registerCache(cache);
@@ -443,7 +445,9 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
   }
   const evictable = cache as EvictableCache | null;
   const last = passes.at(-1);
-  if (evictable !== null && last !== undefined && working !== null) {
+  if (last !== undefined && working !== null) {
+    if (!(evictable instanceof PageCache))
+      throw new Error("Hot-set audit requires the actual PageCache");
     const left = survivors(space, evictable, working);
     passes[passes.length - 1] = {
       ...last,

@@ -539,6 +539,12 @@ test.describe("rebuild core export on OPFS (bench)", () => {
           );
         }
       }
+      if (pass.kept !== null && options.once) {
+        const [hot, expectedHot] = pass.kept.hot.split("/").map(Number);
+        const [scanned] = pass.kept.scanned.split("/").map(Number);
+        expect(hot, "one-pass export must preserve the protected hot set").toBe(expectedHot);
+        expect(scanned, "hot-set audit must evict probationary scanned pages").toBe(0);
+      }
       const bytes = (built.dataBytes * pass.rows) / (rows + 65_536);
       const cpuSeconds = [...passCpu.values()].reduce((sum, seconds) => sum + seconds, 0);
       const exportCpu = targets.profileCpuSeconds.at(-1);
