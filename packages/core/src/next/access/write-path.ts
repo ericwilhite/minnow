@@ -133,6 +133,9 @@
  * the next commit (zero wakeups when idle).
  *
  * ## Memory (rulings R5, R16.3)
+ * Copied input is borrowed only for the synchronous column append. Source scratch must release
+ * that reference on success and failure; charged chunks and their retained views own copies,
+ * not an uncharged reference to a producer's prior batch (vector/vector.ts ownership rule 1).
  * - Memtables and retained index deltas/ranges use the write-path grant (memory/governor.ts).
  *   Run-encoding traversal workspaces use the retrying metadata budget. Their order/chain
  *   capacities include old/new growth overlap and stay charged through the last use, including

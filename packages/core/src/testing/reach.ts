@@ -1996,3 +1996,30 @@ export const WRITE_PARTIAL_DELTA_STATES = [
   "retry accepted",
   "durable reopen",
 ] as const;
+
+/** Copied source buffers are collectible while chunks and owned views remain live. */
+export const WRITE_COLUMN_BORROW_STATES = [
+  "bool",
+  "i32",
+  "f32",
+  "f64",
+  "int64",
+  "decimal",
+  "varlen",
+  "fixed16",
+  "interval",
+  "flat",
+  "constant",
+  "dictionary",
+  "copied",
+  "full",
+  "denied",
+  "selected rows",
+  "dense rows",
+  "nullable source",
+  "all valid source",
+  "single row",
+  "partial chunk",
+  "full chunk",
+  "failed after copied prefix",
+] as const;

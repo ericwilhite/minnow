@@ -72,6 +72,14 @@ local numbers to the benchmark site.
 
 ## Write-memory pressure
 
+Column appends copy into the chunk's charged arrays and clear their borrowed source slot on
+success or failure. A live chunk or retained view must not keep an earlier input batch alive.
+The generated `scripts/write-column-lifetime.test.ts` campaign checks input-buffer collection
+in an isolated Node process while copied chunks and their views stay live, across every layout,
+flat/constant/dictionary forms, selections, nulls and successful/full/denied append exits.
+It checks copied bytes after the producer recycles its buffers; forced GC is a lifetime witness,
+not a certification of peak RSS or native storage memory.
+
 The write grant keeps an admitted working minimum and charges live memtables and scratch.
 Its unused growth after a wide-batch estimate is reclaimable: a waiting merge can take that
 capacity without waiting for another writer call. Metadata has its own grant and uses the

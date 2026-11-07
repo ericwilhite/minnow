@@ -9,6 +9,8 @@
  * must change representation (an int64 value outside the f64-safe range, a decimal coefficient past
  * int64, the first null, a varlen arena that is full), it allocates new arrays and copies; views
  * already handed out keep the old arrays, whose slots are still exactly right for their length.
+ * `append` borrows its source only until it returns or throws. Its reusable source slot is cleared
+ * on both exits: owned chunk views keep copied arrays, never a previous producer's entire batch.
  *
  * ## Frame column codec (`encodeColumn` / `decodeColumn`)
  * The write path's log body stores inserted rows column by column (format/log-frame.ts
@@ -34,9 +36,9 @@ import {
 
 export const MEMORY_CHUNK_ROWS = 2048;
 
-/** A source slot: the flat vector holding it and its index there (−1: null). */
+/** A borrowed source slot: flat exists only during append; index −1 denotes a null value. */
 interface SourceSlot {
-  flat: FlatVector;
+  flat: FlatVector | null;
   index: number;
 }
 
@@ -44,7 +46,11 @@ const bitValid = (validity: Validity | null, row: number): boolean =>
   validity === null || ((validity[row >>> 5] ?? 0) & (1 << (row & 31))) !== 0;
 
 /** Resolves row `row` of any vector form to a flat slot (index −1 for null). */
-export function sourceSlot(vector: Vector, row: number, out: SourceSlot): void {
+export function sourceSlot(
+  vector: Vector,
+  row: number,
+  out: SourceSlot,
+): asserts out is SourceSlot & { flat: FlatVector } {
   if (vector.form === "flat") {
     out.flat = vector;
     out.index = bitValid(vector.validity, row) ? row : -1;
@@ -139,7 +145,7 @@ export class ColumnChunk {
         this.safe = new Float64Array(n);
         break;
     }
-    this.#slot = { flat: null as unknown as FlatVector, index: -1 };
+    this.#slot = { flat: null, index: -1 };
   }
 
   get full(): boolean {
@@ -212,10 +218,17 @@ export class ColumnChunk {
    */
   append(vector: Vector, rows: Uint16Array | null, from: number, to: number): void {
     const slot = this.#slot;
-    for (let k = from; k < to; k++) {
-      const row = rows === null ? k : (rows[k] ?? 0);
-      sourceSlot(vector, row, slot);
-      this.#appendSlot(slot.flat, slot.index);
+    try {
+      for (let k = from; k < to; k++) {
+        const row = rows === null ? k : (rows[k] ?? 0);
+        sourceSlot(vector, row, slot);
+        this.#appendSlot(slot.flat, slot.index);
+      }
+    } finally {
+      // Values have been copied, including any prefix before a failed append. Retaining this
+      // borrowed vector would keep a whole previous input batch outside the chunk's charge.
+      this.#slot.flat = null;
+      this.#slot.index = -1;
     }
   }
 
