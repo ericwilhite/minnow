@@ -1597,3 +1597,23 @@ acknowledges receiving ready, then resumes it. Native file/range and logical cal
 (`MINNOW_OWNER_TRACE=1`) includes in-flight maintenance state; it is diagnostic, not a timing run.
 The first statistics-only count can overlap the resumed maintenance. Standalone write-path opens
 still schedule their maintenance automatically; owner composition supplies the ready lifecycle.
+
+### Rebuild storage step-down regression
+
+The storage campaign stops its workload inside the worker, drains admitted operations, closes
+the session, releases the lease, then terminates. Withholding page-side messages alone cannot
+stop a worker timer or a message already in transit. The regression checks paused lanes,
+admitted writes and delayed messages.
+
+Run ten Chromium repetitions with 4× CPU throttling and a deliberate post-close scheduling
+pause to exercise dormant workload timers:
+
+```sh
+MINNOW_STEP_DOWN_CPU_RATE=4 MINNOW_STEP_DOWN_WAKE_AFTER_CLOSE=1 \
+  npx playwright test --config playwright.library.config.ts next-storage.spec.ts \
+  --project=chromium --workers=1 --repeat-each=10 \
+  -g 'stop, drain, close, release, then terminate'
+```
+
+The pause is a test probe; its timings are not release-performance measurements. Each
+repetition keeps the ordinary 40 stop/reopen cycles and checks every acknowledged state.

@@ -85,7 +85,10 @@ export type ChaosMode = "serial" | "concurrent";
 
 /** Test-only faults (the campaign's own regression tests). */
 export type ChaosInjection =
-  "spill-mismatch" | "stall-publish-after-go" | "stall-publish-after-began";
+  | "spill-mismatch"
+  | "stall-publish-after-go"
+  | "stall-publish-after-began"
+  | "step-down-wake-after-close";
 
 export interface ChaosRecovery {
   /** Where the root and log were found, and the state the workload continues from. */
@@ -240,8 +243,8 @@ export interface ChaosHooks {
   /** Resolves when the page answers `sequence` with a go. */
   readonly go: (sequence: number) => Promise<void>;
   /**
-   * Receives the graceful step-down once recovery is done: close the session (its queue commits),
-   * then release the lease (the IndexedDB backend drains and closes its connection first);
+   * Receives the graceful step-down once recovery is done: stop and drain concurrent lanes,
+   * close the session (its queue commits), then release the lease (the IndexedDB backend drains and closes its connection first);
    * `aborted` is what the release aborted once its wait ran out (`ReleaseReport`).
    */
   readonly registerRelease?: (release: () => Promise<StepDownRelease>) => void;
@@ -249,6 +252,7 @@ export interface ChaosHooks {
 
 /** A graceful step-down's release, timed. */
 export interface StepDownRelease {
+  readonly quiesceMs: number;
   readonly sessionMs: number;
   readonly releaseMs: number;
   readonly aborted: number;
@@ -375,12 +379,33 @@ export async function runChaos(
   if (spill !== null && spill.bytesInUse !== 0) fail("the spill sweep left space in use");
 
   let state: ChaosState = { round, identity: found, generation, flushed: verified };
+  let stopWorkload: () => Promise<void> = async () => undefined;
   hooks.registerRelease?.(async () => {
+    const quiescing = performance.now();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        stopWorkload(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error("workload did not drain within 3000 ms")),
+            3_000,
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
     const started = performance.now();
     await session.close();
     const closed = performance.now();
+    if (inject === "step-down-wake-after-close")
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 20);
+      });
     const report = await lease.release();
     return {
+      quiesceMs: started - quiescing,
       sessionMs: closed - started,
       releaseMs: performance.now() - closed,
       aborted: report?.aborted ?? 0,
@@ -405,6 +430,9 @@ export async function runChaos(
       hooks,
       { space, session, spill, blobs, round, state, fail },
       options.lanes,
+      (stop) => {
+        stopWorkload = stop;
+      },
     );
   const random = mulberry32(seed);
   let sequence = 0;
@@ -606,7 +634,8 @@ async function concurrentWorkload(
   seed: number,
   hooks: ChaosHooks,
   recovered: Recovered,
-  only?: readonly string[],
+  only: readonly string[] | undefined,
+  registerStop: (stop: () => Promise<void>) => void,
 ): Promise<never> {
   const { space, session, spill, fail } = recovered;
   const random = mulberry32(seed);
@@ -615,21 +644,31 @@ async function concurrentWorkload(
   let state = recovered.state;
   let retiredLast = false;
   let sequence = 0;
+  let stopped = false;
+  let active = 0;
+  let drained: (() => void) | null = null;
+  const parked = () => new Promise<never>(() => undefined);
   // Each operation announces itself and waits for the page's go, which the page gives at once
   // (lanes stay concurrent) until it decides to kill: then nothing new starts, so whatever the
   // worker does before the kill takes effect (terminate() is asynchronous, and messages posted
   // meanwhile may be dropped) was announced. Then `began`, the storage work, `settled`, `done`.
   const begin = async (intent: Omit<ChaosIntent, "sequence">): Promise<number> => {
+    if (stopped) return parked();
     sequence += 1;
     const at = sequence;
     hooks.post({ chaos: "intent", intent: { ...intent, sequence: at } });
     await hooks.go(at);
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- stop may run while go is pending.
+    if (stopped) return parked();
+    active += 1;
     hooks.post({ chaos: "began", sequence: at });
     return at;
   };
   const end = (at: number) => {
     hooks.post({ chaos: "settled", sequence: at });
     hooks.post({ chaos: "done", sequence: at });
+    active -= 1;
+    if (active === 0) drained?.();
   };
   const ack = (next: ChaosState) => {
     state = next;
@@ -649,6 +688,7 @@ async function concurrentWorkload(
 
   const writer = async (): Promise<never> => {
     for (;;) {
+      if (stopped) return parked();
       const at = await begin({ step: "write" });
       const writer = space.beginWrite(
         "chaos",
@@ -704,6 +744,7 @@ async function concurrentWorkload(
 
   const reader = async (): Promise<never> => {
     for (;;) {
+      if (stopped) return parked();
       const at = await begin({ step: "read" });
       const pin = space.pin("chaos reader");
       const sample = blobs.filter(() => random() < 0.2).slice(0, 24);
@@ -722,6 +763,7 @@ async function concurrentWorkload(
 
   const log = async (): Promise<never> => {
     for (;;) {
+      if (stopped) return parked();
       const roll = random();
       if (roll < 0.5) {
         const at = await begin({ step: "log-append" });
@@ -759,6 +801,7 @@ async function concurrentWorkload(
   const spiller = async (): Promise<never> => {
     let query = 1;
     for (;;) {
+      if (stopped) return parked();
       if (spill === null) return new Promise<never>(() => undefined);
       const at = await begin({ step: "spill" });
       const file = await spill.create(
@@ -789,6 +832,18 @@ async function concurrentWorkload(
   const lanes = Object.entries(all)
     .filter(([name]) => only === undefined || only.includes(name))
     .map(([, lane]) => lane());
+  registerStop(async () => {
+    // The page's empty message map cannot fence worker-local timers or a go in transit.
+    // Close admission here, then drain operations that crossed begin(), before session.close().
+    stopped = true;
+    if (active > 0)
+      await Promise.race([
+        new Promise<void>((resolve) => {
+          drained = resolve;
+        }),
+        ...lanes,
+      ]);
+  });
   // The first failure ends the workload; the other lanes' later failures (after a crash, every
   // lane fails) are expected and not reported again.
   for (const lane of lanes) lane.catch(() => undefined);

@@ -944,7 +944,7 @@ export interface StepDown {
   readonly expect: ChaosExpect;
   /** Waiting for the operations in flight once no new one may start. */
   readonly quiesceMs: number;
-  /** Operations still in flight when the wait gave up (0 when it did not). */
+  /** Admitted operations still unsettled after drain; excludes refused gos in transit. */
   readonly leftInFlight: number;
   /** Closing the session (its queue commits) and releasing the lease (drain, close, unlock). */
   readonly sessionMs: number;
@@ -955,8 +955,8 @@ export interface StepDown {
 
 /**
  * A graceful step-down of the running concurrent chaos worker after `delayMs`: the page stops
- * giving gos (nothing new starts), waits up to 3 s for the operations in flight, asks the worker to
- * close its session and release its lease, and only then terminates it.
+ * giving gos, then asks the worker to stop admission locally and drain for up to 3 s before
+ * closing its session and releasing its lease. Only then does the page terminate it.
  */
 export async function chaosStepDown(delayMs: number): Promise<StepDown> {
   const run = chaos;
@@ -965,22 +965,21 @@ export async function chaosStepDown(delayMs: number): Promise<StepDown> {
     setTimeout(resolve, delayMs);
   });
   run.hold = true;
-  const started = performance.now();
-  while (run.inFlight.size > 0 && performance.now() - started < 3_000)
-    await new Promise<void>((resolve) => {
-      setTimeout(resolve, 2);
-    });
-  const quiesceMs = performance.now() - started;
-  const leftInFlight = run.inFlight.size;
-  const released = await run.worker.call<{ sessionMs: number; releaseMs: number; aborted: number }>(
-    {
-      op: "chaos-release",
-    },
-  );
+  const released = await run.worker.call<{
+    quiesceMs: number;
+    sessionMs: number;
+    releaseMs: number;
+    aborted: number;
+  }>({ op: "chaos-release" });
   await terminateObserved(run);
+  // The worker has stopped its lanes. Count actual unfinished work, not gos in transit
+  // that the local stop barrier deliberately refused before they began.
+  const leftInFlight = [...run.inFlight.keys()].filter(
+    (sequence) => run.began.has(sequence) && !run.settled.has(sequence),
+  ).length;
   const failure = failed(run);
   if (failure !== null) throw failure;
-  return { expect: expectOf(run), quiesceMs, leftInFlight, ...released };
+  return { expect: expectOf(run), leftInFlight, ...released };
 }
 
 /**

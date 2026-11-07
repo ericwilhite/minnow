@@ -911,6 +911,12 @@ test.describe("rebuild core storage graceful step-down (the WebKit IndexedDB wed
     browserName,
   }, info) => {
     test.setTimeout(600_000);
+    if (browserName === "chromium" && process.env.MINNOW_STEP_DOWN_CPU_RATE !== undefined) {
+      const cdp = await page.context().newCDPSession(page);
+      await cdp.send("Emulation.setCPUThrottlingRate", {
+        rate: Number(process.env.MINNOW_STEP_DOWN_CPU_RATE),
+      });
+    }
     await page.goto(CHAOS_PAGE);
     const cycles = Number(process.env.MINNOW_STEP_DOWN_CYCLES ?? "40");
     const random = mulberry32(0x57e9);
@@ -919,16 +925,24 @@ test.describe("rebuild core storage graceful step-down (the WebKit IndexedDB wed
     const timings: Array<{ quiesceMs: number; sessionMs: number; releaseMs: number }> = [];
     for (let cycle = 0; cycle <= cycles; cycle++) {
       await page.evaluate(
-        async ([url, directory, workerSeed, expectation]) =>
+        async ([url, directory, workerSeed, expectation, inject]) =>
           ((await import(url)) as Run).chaosBegin(
             "indexeddb",
             directory,
             workerSeed,
             expectation,
-            null,
+            inject,
             "concurrent",
           ),
-        [RUN, dir, 0x57e9 + cycle, expected] as const,
+        [
+          RUN,
+          dir,
+          0x57e9 + cycle,
+          expected,
+          process.env.MINNOW_STEP_DOWN_WAKE_AFTER_CLOSE === "1"
+            ? "step-down-wake-after-close"
+            : null,
+        ] as const,
       );
       if (cycle === cycles) break;
       const stepDown = await page.evaluate(
@@ -957,6 +971,8 @@ test.describe("rebuild core storage graceful step-down (the WebKit IndexedDB wed
     };
     const report = {
       browser: browserName,
+      cpuThrottlingRate: Number(process.env.MINNOW_STEP_DOWN_CPU_RATE ?? "1"),
+      wakeAfterClose: process.env.MINNOW_STEP_DOWN_WAKE_AFTER_CLOSE === "1",
       cycles,
       quiesceMs: summary("quiesceMs"),
       sessionMs: summary("sessionMs"),
