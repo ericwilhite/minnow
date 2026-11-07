@@ -6,7 +6,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
-import { homedir, loadavg } from "node:os";
+import { loadavg, tmpdir } from "node:os";
 import { join } from "node:path";
 import { Governor } from "../packages/core/src/next/memory/governor.js";
 import { ReturnPool } from "../packages/core/src/next/exec/return-pool.js";
@@ -56,7 +56,7 @@ if (process.argv.includes("--child")) {
   globalThis.gc?.();
   console.log(JSON.stringify(await run(reuse)));
 } else {
-  const scratch = mkdtempSync(join(homedir(), ".cache", "minnow-output-return-"));
+  const scratch = mkdtempSync(join(tmpdir(), "minnow-output-return-"));
   try {
     const { build } = await import("esbuild");
     const outfile = join(scratch, "component.mjs");

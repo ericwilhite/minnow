@@ -7,12 +7,12 @@
  */
 import { execFileSync } from "node:child_process";
 import { readFileSync, mkdtempSync, rmSync } from "node:fs";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { build } from "esbuild";
 
 const rounds = 5;
-const scratch = mkdtempSync(join(homedir(), ".cache", "minnow-hash-load-"));
+const scratch = mkdtempSync(join(tmpdir(), "minnow-hash-load-"));
 const variants = ["dataview", "aligned-words", "aligned-signed"] as const;
 interface Sample {
   size: number;

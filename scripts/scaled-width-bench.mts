@@ -4,11 +4,11 @@
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { build } from "esbuild";
 
-const scratch = mkdtempSync(join(homedir(), ".cache/minnow-scaled-width-"));
+const scratch = mkdtempSync(join(tmpdir(), "minnow-scaled-width-"));
 const anchor =
   "else for (let k = 0; k < count; k++) out[at + k] = (base + (deltas[from + k] ?? 0)) / power;";
 export function specializeScaledWidth(source: string): string {

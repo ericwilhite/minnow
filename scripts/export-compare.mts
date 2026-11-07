@@ -7,7 +7,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { build } from "esbuild";
 
@@ -19,7 +19,7 @@ const option = (name: string, fallback: string): string => {
 const baseline = option("baseline", "a01c4f86");
 const rounds = Number(option("rounds", "5"));
 if (!Number.isInteger(rounds) || rounds < 5) throw new Error("Need at least five rounds");
-const scratch = mkdtempSync(join(homedir(), ".cache", "minnow-export-compare-"));
+const scratch = mkdtempSync(join(tmpdir(), "minnow-export-compare-"));
 const variants = ["baseline", "current"] as const;
 interface Sample {
   cpuSeconds: number;
@@ -65,7 +65,7 @@ try {
           "--expose-gc",
           join(scratch, `${variant}.mjs`),
           "--dir",
-          option("dir", join(homedir(), ".cache", "minnow-export")),
+          option("dir", join(tmpdir(), "minnow-export")),
           "--groups",
           option("groups", "16"),
           "--window-mib",

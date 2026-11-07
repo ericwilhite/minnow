@@ -8,7 +8,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { serialize } from "node:v8";
 import { build } from "esbuild";
@@ -18,7 +18,7 @@ import { wideSpec } from "./browser-perf/page/wide-data.js";
 import { typeOf, vectorOf } from "./browser-perf/page/wide-vectors.js";
 
 const rounds = 5;
-const scratch = mkdtempSync(join(homedir(), ".cache/minnow-scan-batch-"));
+const scratch = mkdtempSync(join(tmpdir(), "minnow-scan-batch-"));
 try {
   const space = new MemoryExtentSpace(),
     spec = wideSpec(200),

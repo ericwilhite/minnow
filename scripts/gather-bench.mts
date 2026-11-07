@@ -7,14 +7,14 @@
  */
 import { execFileSync } from "node:child_process";
 import { readFileSync, mkdtempSync, rmSync } from "node:fs";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { build } from "esbuild";
 
 const roundArg = process.argv.indexOf("--rounds");
 const rounds = Number(roundArg < 0 ? 5 : process.argv[roundArg + 1]);
 if (!Number.isInteger(rounds) || rounds < 5) throw new Error("Need at least five rounds");
-const scratch = mkdtempSync(join(homedir(), ".cache", "minnow-gather-"));
+const scratch = mkdtempSync(join(tmpdir(), "minnow-gather-"));
 const variants = ["raw", "number", "production"] as const;
 interface Sample {
   density: number;

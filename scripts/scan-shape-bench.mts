@@ -6,7 +6,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, loadavg } from "node:os";
+import { loadavg, tmpdir } from "node:os";
 import { join } from "node:path";
 import { serialize } from "node:v8";
 import { build } from "esbuild";
@@ -31,7 +31,7 @@ const sources = new Map(
     },
   ]),
 );
-const scratch = mkdtempSync(join(homedir(), ".cache/minnow-scan-shape-"));
+const scratch = mkdtempSync(join(tmpdir(), "minnow-scan-shape-"));
 try {
   const space = new MemoryExtentSpace(),
     spec = wideSpec(200),

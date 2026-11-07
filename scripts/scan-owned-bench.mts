@@ -8,7 +8,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { serialize } from "node:v8";
 import { build } from "esbuild";
@@ -19,7 +19,7 @@ import { typeOf, vectorOf } from "./browser-perf/page/wide-vectors.js";
 
 const profiling = process.argv.includes("--profile");
 const rounds = profiling ? 1 : 5;
-const scratch = mkdtempSync(join(homedir(), ".cache/minnow-scan-owned-"));
+const scratch = mkdtempSync(join(tmpdir(), "minnow-scan-owned-"));
 try {
   const space = new MemoryExtentSpace(),
     spec = wideSpec(200),

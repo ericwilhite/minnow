@@ -3,7 +3,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { join, resolve } from "node:path";
-import { cpus, homedir, loadavg } from "node:os";
+import { cpus, homedir, loadavg, tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { Session } from "node:inspector/promises";
 import { StorageCore } from "../packages/core/dist/next/testing/storage-core.js";
@@ -58,9 +58,7 @@ const dataset = option("--dataset", "wide"),
   scale = Number(option("--scale", "333"));
 if (dataset !== "wide" && dataset !== "star") throw new Error("--dataset must be wide or star");
 if (!Number.isFinite(scale) || scale <= 0) throw new RangeError("positive star scale required");
-const cache = resolve(option("--output", join(homedir(), ".cache/b4-executor/baseline")));
-if (!cache.startsWith(join(homedir(), ".cache/")))
-  throw new Error("benchmark output must be under ~/.cache/");
+const cache = resolve(option("--output", join(tmpdir(), "b4-executor/baseline")));
 await mkdir(cache, { recursive: true });
 const generator = (await import(pathToFileURL(join(harness, "gen.js")).href)) as Generator;
 const catalogue = (await import(pathToFileURL(join(harness, "queries.js")).href)) as Catalogue;

@@ -17,7 +17,7 @@
  * but its size is evicted (the scan must have promoted none of the pages it hit).
  */
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { BlobCache } from "../packages/core/src/next/format/blob-cache.ts";
@@ -35,7 +35,7 @@ const option = (name: string, fallback: string): string => {
   const index = args.indexOf(`--${name}`);
   return index >= 0 ? (args[index + 1] ?? fallback) : fallback;
 };
-const DIR = option("dir", join(homedir(), ".cache", "minnow-export"));
+const DIR = option("dir", join(tmpdir(), "minnow-export"));
 const ONCE = option("once", "on") === "on";
 const CAP_MIB = Number(option("cap-mib", "512"));
 /** Stored bytes of pages a column loads ahead of its batch (`ChunkReader.pagesAhead`). */

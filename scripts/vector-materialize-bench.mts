@@ -6,7 +6,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, loadavg } from "node:os";
+import { loadavg, tmpdir } from "node:os";
 import { join } from "node:path";
 import { serialize } from "node:v8";
 import type { PhysicalType } from "../packages/core/src/next/types.js";
@@ -24,7 +24,7 @@ const variants = ["baseline", "candidate"];
 const reuseTarget = process.argv.includes("--reused");
 const batchComparison = process.argv.includes("--batch");
 const offsetsFixture = process.argv.includes("--offsets");
-const scratch = mkdtempSync(join(homedir(), ".cache", "minnow-materialize-"));
+const scratch = mkdtempSync(join(tmpdir(), "minnow-materialize-"));
 try {
   const count = 8192,
     space = new MemoryExtentSpace(),

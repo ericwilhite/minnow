@@ -9,7 +9,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import path from "node:path";
 
 export const LANE_DIR_ENV = "MINNOW_BROWSER_PERF_DIR";
@@ -18,7 +18,7 @@ export const LANE_DIR_ENV = "MINNOW_BROWSER_PERF_DIR";
 export function laneDirectory(env: NodeJS.ProcessEnv = process.env): string {
   const configured = env[LANE_DIR_ENV];
   if (configured !== undefined && configured.length > 0) return path.resolve(configured);
-  return path.join(homedir(), ".cache", "minnow-browser-perf");
+  return path.join(tmpdir(), "minnow-browser-perf");
 }
 
 const MEMORY_FILESYSTEMS = new Set(["tmpfs", "ramfs", "devtmpfs", "rootfs"]);

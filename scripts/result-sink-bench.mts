@@ -7,14 +7,14 @@
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
-import { homedir, loadavg } from "node:os";
+import { loadavg, tmpdir } from "node:os";
 import { join } from "node:path";
 import { build } from "esbuild";
 import { executorSnapshot } from "./browser-perf/executor-comparison.js";
 
 const revision = process.argv.find((a) => a.startsWith("--compare="))?.slice(10);
 if (!revision) throw new Error("--compare=REV is required");
-const scratch = mkdtempSync(join(homedir(), ".cache", "minnow-result-sink-"));
+const scratch = mkdtempSync(join(tmpdir(), "minnow-result-sink-"));
 const owned = process.argv.includes("--owned");
 const worker = `
 import {ResultSink} from "./packages/core/src/next/exec/result-sink.ts";

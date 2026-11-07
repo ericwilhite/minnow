@@ -9,7 +9,7 @@
  *   npx vite-node scripts/export-bench-build.mts --dir ~/.cache/minnow-export --rows 1048576 --copies 5
  */
 import { writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import type { ColumnChunk } from "../packages/core/src/next/format/manifest.ts";
@@ -31,7 +31,7 @@ const option = (name: string, fallback: string): string => {
   const index = args.indexOf(`--${name}`);
   return index >= 0 ? (args[index + 1] ?? fallback) : fallback;
 };
-const DIR = option("dir", join(homedir(), ".cache", "minnow-export"));
+const DIR = option("dir", join(tmpdir(), "minnow-export"));
 const ROWS = Number(option("rows", "1048576"));
 const COPIES = Number(option("copies", "5"));
 const GROUP = 65_536;

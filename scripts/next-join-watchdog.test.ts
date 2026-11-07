@@ -2,12 +2,12 @@
 import { build } from "esbuild";
 import { Worker } from "node:worker_threads";
 import { mkdtemp, mkdir, rm } from "node:fs/promises";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, expect, it } from "vitest";
 let scratch: string, bundle: string;
 beforeAll(async () => {
-  const base = join(homedir(), ".cache", "minnow-key-only");
+  const base = join(tmpdir(), "minnow-key-only");
   await mkdir(base, { recursive: true });
   scratch = await mkdtemp(join(base, "case-"));
   bundle = join(scratch, "watchdog.mjs");

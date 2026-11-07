@@ -4,11 +4,11 @@
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { build } from "esbuild";
 
-const scratch = mkdtempSync(join(homedir(), ".cache/minnow-read-batch-"));
+const scratch = mkdtempSync(join(tmpdir(), "minnow-read-batch-"));
 const source = `
 import { PageCache } from "./packages/core/src/next/storage/page-cache.ts";
 import { xxHash32 } from "./packages/core/src/next/hash/xxhash32.ts";

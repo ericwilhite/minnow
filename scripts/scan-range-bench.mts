@@ -5,7 +5,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { serialize } from "node:v8";
 import { build } from "esbuild";
@@ -23,7 +23,7 @@ const baseline = candidate.replace(
   anchor,
   "function specForRows(rows: Uint16Array, count: number): DecodeSpec { return { rows, count }; }",
 );
-const scratch = mkdtempSync(join(homedir(), ".cache/minnow-scan-range-"));
+const scratch = mkdtempSync(join(tmpdir(), "minnow-scan-range-"));
 try {
   const space = new MemoryExtentSpace(),
     spec = wideSpec(200),

@@ -6,7 +6,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, loadavg } from "node:os";
+import { loadavg, tmpdir } from "node:os";
 import { join } from "node:path";
 import { serialize } from "node:v8";
 import { packedExperiment } from "./browser-perf/packed-experiment.js";
@@ -20,7 +20,7 @@ import { typeOf, vectorOf } from "./browser-perf/page/wide-vectors.js";
 const reference = process.argv.find((a) => a.startsWith("--compare="))?.slice("--compare=".length);
 const variants = reference ? ["baseline", "candidate"] : ["adapter", "executor"];
 const packed = process.argv.includes("--packed") ? packedExperiment() : null;
-const scratch = mkdtempSync(join(homedir(), ".cache", "minnow-executor-export-"));
+const scratch = mkdtempSync(join(tmpdir(), "minnow-executor-export-"));
 try {
   const count = 8192,
     space = new MemoryExtentSpace(),

@@ -5,7 +5,7 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Plugin as EsbuildPlugin } from "esbuild";
@@ -16,7 +16,7 @@ export const PACKED_EXPERIMENT_BASE = "095f5f1c";
 export function packedExperiment() {
   const root = resolve("."),
     next = join(root, "packages/core/src/next") + "/";
-  const scratch = mkdtempSync(join(homedir(), ".cache", "minnow-packed-snapshot-"));
+  const scratch = mkdtempSync(join(tmpdir(), "minnow-packed-snapshot-"));
   const metadata = JSON.parse(
     readFileSync(new URL("./experiments/packed-frame-copy.json", import.meta.url), "utf8"),
   ) as {

@@ -5,7 +5,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { build } from "esbuild";
 import { serialize } from "node:v8";
@@ -14,7 +14,7 @@ import { GroupWriter } from "../packages/core/src/next/page/writer.js";
 import { wideSpec } from "./browser-perf/page/wide-data.js";
 import { typeOf, vectorOf } from "./browser-perf/page/wide-vectors.js";
 
-const scratch = mkdtempSync(join(homedir(), ".cache/minnow-readahead-"));
+const scratch = mkdtempSync(join(tmpdir(), "minnow-readahead-"));
 try {
   const space = new MemoryExtentSpace(),
     spec = wideSpec(200),

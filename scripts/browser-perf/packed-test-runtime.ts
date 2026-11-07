@@ -1,6 +1,6 @@
 /** Test-only loader for the rejected source snapshot; never imports experimental production code. */
 import { mkdtempSync, rmSync } from "node:fs";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { build } from "esbuild";
@@ -39,7 +39,7 @@ export interface PackedApi {
 }
 export async function packedTestRuntime(): Promise<PackedApi> {
   const snapshot = packedExperiment(),
-    scratch = mkdtempSync(join(homedir(), ".cache", "minnow-packed-proof-"));
+    scratch = mkdtempSync(join(tmpdir(), "minnow-packed-proof-"));
   const file = join(scratch, "candidate.mjs");
   try {
     await build({
