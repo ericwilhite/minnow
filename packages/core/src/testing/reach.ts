@@ -1922,3 +1922,20 @@ export const WRITE_PENDING_FLUSH_STATES = [
   "publication and reopen",
   "close settles",
 ] as const;
+
+/** An allocation failure after a key prefix cannot leave index effects of aborted rows. */
+export const WRITE_PARTIAL_DELTA_STATES = [
+  "memory",
+  "insert prefix",
+  "delete prefix",
+  "indexeddb",
+  "primary",
+  "unique",
+  "nonunique",
+  "native failure",
+  "budget denial",
+  "partial key prefix",
+  "all deltas rolled back",
+  "retry accepted",
+  "durable reopen",
+] as const;

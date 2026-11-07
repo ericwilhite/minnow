@@ -194,6 +194,10 @@ Index probes consume completed asynchronous metadata and block reads directly. T
 require a later synchronous cache hit to make progress. `write/async-probe.test.ts` checks
 uncached reads, continuation buffers and older pins through visible deletions.
 
+If a key allocation fails after several puts or tombstones, rollback removes that completed
+prefix in every index. `write/partial-delta-rollback.test.ts` injects budget and native faults
+in primary, unique and non-unique indexes over both stores, then checks retry and durable reopen.
+
 ## Dependency rules
 
 `dependency-rules.test.ts` enforces these.

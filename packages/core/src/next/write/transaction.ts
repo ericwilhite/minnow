@@ -1227,28 +1227,34 @@ export class TableWriterImpl implements TableWriter {
       if (delta === undefined) continue;
       const keys = this.#encode(index, columns, rows, columns[0]?.length ?? count);
       const first = delta.entryCount;
-      for (let k = 0; k < count; k++) {
-        const row = rows === null ? k : (rows[k] ?? 0);
-        if (this.#hasNullKey(index, columns, row)) continue;
-        const rowId = typeof rowIds === "number" ? rowIds + k : (rowIds[k] ?? 0);
-        delta.add(
-          keys.writer.bytes,
-          keys.offsets[k] ?? 0,
-          keys.offsets[k + 1] ?? 0,
-          rowId,
-          seq,
-          false,
-        );
+      try {
+        for (let k = 0; k < count; k++) {
+          const row = rows === null ? k : (rows[k] ?? 0);
+          if (this.#hasNullKey(index, columns, row)) continue;
+          const rowId = typeof rowIds === "number" ? rowIds + k : (rowIds[k] ?? 0);
+          delta.add(
+            keys.writer.bytes,
+            keys.offsets[k] ?? 0,
+            keys.offsets[k + 1] ?? 0,
+            rowId,
+            seq,
+            false,
+          );
+        }
+      } finally {
+        // Record completed entries even if a later allocation throws.
+        const added = delta.entryCount - first;
+        if (added > 0)
+          tx.undo.push({
+            kind: "delta",
+            statement: this.statement.ordinal,
+            delta,
+            entry: first,
+            count: added,
+          });
       }
       const added = delta.entryCount - first;
       if (added === 0) continue;
-      tx.undo.push({
-        kind: "delta",
-        statement: this.statement.ordinal,
-        delta,
-        entry: first,
-        count: added,
-      });
       if (!index.unique) continue;
       const check =
         added === 1
@@ -1557,24 +1563,27 @@ export class TableWriterImpl implements TableWriter {
       const delta = live.deltas.get(index.id);
       const keys = this.#encode(index, old, null, rowIds.length);
       const first = delta?.entryCount ?? 0;
-      for (let k = 0; k < rowIds.length; k++) {
-        if (this.#hasNullKey(index, old, k)) {
-          keysPerRow[k]?.push(NULL_KEY);
-          continue;
+      try {
+        for (let k = 0; k < rowIds.length; k++) {
+          if (this.#hasNullKey(index, old, k)) {
+            keysPerRow[k]?.push(NULL_KEY);
+            continue;
+          }
+          const start = keys.offsets[k] ?? 0;
+          const end = keys.offsets[k + 1] ?? 0;
+          keysPerRow[k]?.push(keys.writer.bytes.slice(start, end));
+          delta?.add(keys.writer.bytes, start, end, rowIds[k] ?? 0, seq, true);
         }
-        const start = keys.offsets[k] ?? 0;
-        const end = keys.offsets[k + 1] ?? 0;
-        keysPerRow[k]?.push(keys.writer.bytes.slice(start, end));
-        delta?.add(keys.writer.bytes, start, end, rowIds[k] ?? 0, seq, true);
+      } finally {
+        if (delta !== undefined && delta.entryCount > first)
+          tx.undo.push({
+            kind: "delta",
+            statement: this.statement.ordinal,
+            delta,
+            entry: first,
+            count: delta.entryCount - first,
+          });
       }
-      if (delta !== undefined && delta.entryCount > first)
-        tx.undo.push({
-          kind: "delta",
-          statement: this.statement.ordinal,
-          delta,
-          entry: first,
-          count: delta.entryCount - first,
-        });
     }
     rowIds.forEach((rowId, k) => {
       const locator = table.locator(rowId);
