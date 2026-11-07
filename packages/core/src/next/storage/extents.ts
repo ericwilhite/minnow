@@ -511,7 +511,8 @@ export interface ExtentSpace extends ExtentReader {
    */
   pin(label?: string): RootPin;
   /**
-   * Walks the current and previous roots with `reachable` and checks the free map against them:
+   * Serializes with publication, walks both roots from that generation with `reachable`,
+   * and checks the free map against them:
    * every extent either root reaches is allocated (the previous root's only as waiting); every
    * allocated extent is reachable, held by a writer, waiting, or being released. Throws `Error("Extent audit: …")` naming the first difference. Tests only.
    */

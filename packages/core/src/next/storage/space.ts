@@ -801,11 +801,18 @@ class Space implements ExtentSpace {
 
   // ── Audit ────────────────────────────────────────────────────────────────────────────────────
 
-  async audit(): Promise<void> {
+  audit(): Promise<void> {
+    return this.#publishing.run(() => this.#auditNow());
+  }
+
+  async #auditNow(): Promise<void> {
+    const generation = this.#ledger.generation;
     await this.settled();
     await this.#session.audit?.();
     const fail = (message: string): never => {
-      throw new Error(`Extent audit: ${message}`);
+      throw new Error(
+        `Extent audit: ${message} (generation ${String(generation)}, allocator end ${String(this.#map.end)}, retired ${String(this.#retired.size)})`,
+      );
     };
     const sizeOf = (bytes: number) => this.#map.sizeOf(bytes);
     const exactCurrent = await collect(this.#root, this.#reachable, this, this.#budget, Infinity);
