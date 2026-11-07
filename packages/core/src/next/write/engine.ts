@@ -2846,9 +2846,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
         await writer.abort();
         return;
       }
-      const root = await this.#nextRoot(writer, retired, changed);
+      let root = await this.#nextRoot(writer, retired, changed);
       this.#check();
-      await delta.prepare(root.sequence, writer, retired);
+      root = await this.#listed(root, (sequence) => delta.prepare(sequence, writer, retired));
       this.#check();
       const bytes = encodeManifestRoot(root);
       const charge = parseCharge(bytes.length);
@@ -3909,6 +3909,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const listed: ManifestRoot = { ...root, extentList: await prepare(root.sequence) };
     const settles = this.#settles.get(root);
     if (settles !== undefined) this.#settles.set(listed, settles);
+    const drained = this.#drainedBy.get(root);
+    if (drained !== undefined) this.#drainedBy.set(listed, drained);
     return listed;
   }
 
