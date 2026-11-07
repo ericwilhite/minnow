@@ -2614,7 +2614,11 @@ function accessMode(modes: readonly TransactionMode[] | undefined): boolean | un
   return readOnly;
 }
 
-/** PostgreSQL's refusal of a write in a read-only transaction (read_only_sql_transaction). */
+/**
+ * A read-only refusal (25006). Locking reads always name SELECT: syntax can carry a weaker
+ * strength than an expanded view, and PostgreSQL's diagnostic need not name the strongest lock.
+ * Effective strength belongs to the plan's admission metadata, not the error message.
+ */
 function readOnlyTransactionError(command: string): TypeError {
   return new TypeError(`cannot execute ${command} in a read-only transaction`);
 }
@@ -2636,9 +2640,9 @@ function admitToTransaction(
 ): void {
   if (open.readOnly) {
     if ("write" in statement) throw readOnlyTransactionError(writeCommand(statement.write));
-    // CTE graphs need catalog/view analysis before their strongest lock is known.
+    // Retained CTE bodies need catalog/view analysis before admission is decided.
     if (statement.read.rowLocking !== undefined && statement.read.rowLockingCtes === undefined)
-      throw readOnlyTransactionError(`SELECT FOR ${statement.read.rowLocking}`);
+      throw readOnlyTransactionError("SELECT");
   }
   open.queried = true;
 }
@@ -6331,7 +6335,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       bodies.values(),
       views.size === 0 ? undefined : (body) => expandRowLockCteViews(body, viewBody),
     );
-    if (lock !== undefined) throw readOnlyTransactionError(`SELECT FOR ${lock}`);
+    if (lock !== undefined) throw readOnlyTransactionError("SELECT");
   }
 
   /**
@@ -6387,7 +6391,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         bodies.values(),
         views.size === 0 ? undefined : (body) => expandRowLockCteViews(body, viewBody),
       );
-      if (strongest !== undefined) throw readOnlyTransactionError(`SELECT FOR ${strongest}`);
+      if (strongest !== undefined) throw readOnlyTransactionError("SELECT");
     }
     if (planReadsTable(rewritten, (name) => domains.has(name) || types.has(name))) {
       rewritten = normalizePlanDomainLiterals(rewritten, domains, types, template);
@@ -11354,22 +11358,25 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           let point: QueryResult | undefined;
           try {
             pointReadTestHooks.attempted += 1;
-            const table = await this.#findTable(shape.table, transaction);
-            const forwards = await this.#pointReadForwards(undefined, transaction);
-            point = await this.#withSessionVisibility(
-              transaction,
-              [table],
-              options,
-              (snapshot, visibility, realTables) =>
-                this.#pointReadAtSnapshot(
-                  shape,
-                  snapshot,
-                  realTables,
-                  visibility,
-                  options,
-                  forwards,
-                ),
-            );
+            const table = await this.#findTable(shape.table, transaction, true);
+            // A view-shaped point read needs the ordinary path's expansion and lock admission.
+            if (table !== undefined) {
+              const forwards = await this.#pointReadForwards(undefined, transaction);
+              point = await this.#withSessionVisibility(
+                transaction,
+                [table],
+                options,
+                (snapshot, visibility, realTables) =>
+                  this.#pointReadAtSnapshot(
+                    shape,
+                    snapshot,
+                    realTables,
+                    visibility,
+                    options,
+                    forwards,
+                  ),
+              );
+            }
           } catch (error) {
             // A table name that only folds case-insensitively is unknown to the fast path;
             // the general path below resolves it, so this is a miss, not a failure.
@@ -29533,7 +29540,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     return writer === undefined ? undefined : this.#writerTransactions.get(writer);
   }
 
-  async #findTable(name: string, scope?: DatabaseTransaction): Promise<TableRecord> {
+  #findTable(name: string, scope?: DatabaseTransaction): Promise<TableRecord>;
+  #findTable(
+    name: string,
+    scope: DatabaseTransaction,
+    declineViews: true,
+  ): Promise<TableRecord | undefined>;
+  async #findTable(
+    name: string,
+    scope?: DatabaseTransaction,
+    declineViews = false,
+  ): Promise<TableRecord | undefined> {
     validateName(name, "Table");
     const cache =
       scope === undefined || !this.#scopeWrites.has(scope)
@@ -29558,9 +29575,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       (await this.store.getTableByName(name)) ??
       (await this.store.getTableByName(await this.#foldTableName(name)));
     if (table === undefined) throw new UnknownTableError(name);
-    // Reads resolve a view into its query before reaching here, so a view arriving at this
-    // point is a write, a DDL statement, or a path that forgot to rewrite: all of them errors.
-    if (table.view !== undefined) throw new TypeError(`${name} is a view, not a table`);
+    // A point-read probe declines views so the ordinary read can expand them. A write or DDL
+    // still refuses them; physical table records alone belong in the scope's lookup cache.
+    if (table.view !== undefined) {
+      if (declineViews) return undefined;
+      throw new TypeError(`${name} is a view, not a table`);
+    }
     cache?.set(name, table);
     return table;
   }

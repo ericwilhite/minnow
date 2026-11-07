@@ -10,6 +10,14 @@ compatibility policy and release process.
 
 ## Unreleased
 
+Locking reads refused in a READ ONLY transaction now consistently say
+`cannot execute SELECT in a read-only transaction`. The message no longer names a lock strength
+that may be weaker than a view's own clause. Plans still retain the strongest effective intent
+after view and CTE expansion. **Migration:** update code that matches the old `SELECT FOR …`
+message; the exception remains a `TypeError`. No public type or stored-format change.
+Transaction point reads of views also reach view expansion instead of failing with
+"view, not a table", so a locking view gets the same read-only refusal as other reads.
+
 `SET TRANSACTION` now checks isolation and deferrability as well as access mode,
 through SQL and compiled commands. Changing isolation after a query or inside a
 savepoint fails with 25001; setting the already-requested level again is allowed.
