@@ -8,10 +8,20 @@ import { expect, it } from "vitest";
 import type { Grant } from "../memory/governor.js";
 import { need } from "./bytes.js";
 import { GroupDirectory } from "./groups.js";
-import { autocommit, batch, column, Harness, INT, ints, tableInput } from "./test-support.js";
+import {
+  autocommit,
+  batch,
+  column,
+  Harness,
+  countMetadataPinBytes,
+  INT,
+  ints,
+  tableInput,
+} from "./test-support.js";
 
 it("a pending publication retains its shared chunks while a drop lands during the publish", async () => {
   const harness = new Harness("strict", "memory", 1);
+  const pinCredit = countMetadataPinBytes(harness);
   let metadata: Grant | null = null;
   const admit = harness.governor.admit.bind(harness.governor);
   harness.governor.admit = async (options) => {
@@ -77,6 +87,6 @@ it("a pending publication retains its shared chunks while a drop lands during th
   // Every installed generation let the shared chunk go; the pending directory still held it.
   expect(refs).toBeGreaterThan(0);
   // After the publication resolved (into a dropped table) everything is returned.
-  expect(need(metadata as Grant | null).allocated).toBe(path.residentMetadataBytes);
+  expect(need(metadata as Grant | null).allocated).toBe(path.residentMetadataBytes + pinCredit());
   await harness.close();
 });

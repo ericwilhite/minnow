@@ -15,6 +15,7 @@ import {
   batch,
   column,
   Harness,
+  countMetadataPinBytes,
   INT,
   ints,
   locators,
@@ -24,8 +25,9 @@ import {
 import type { WritePathImpl } from "./engine.js";
 
 /** A harness whose "write path metadata" grant the test can read. */
-function metered(): { harness: Harness; grant: () => Grant } {
+function metered(): { harness: Harness; grant: () => Grant; pinCredit: () => number } {
   const harness = new Harness("strict", "memory", 2);
+  const pinCredit = countMetadataPinBytes(harness);
   let grant: Grant | null = null;
   const admit = harness.governor.admit.bind(harness.governor);
   harness.governor.admit = async (options) => {
@@ -35,6 +37,7 @@ function metered(): { harness: Harness; grant: () => Grant } {
   };
   return {
     harness,
+    pinCredit,
     grant: () => {
       if (grant === null) throw new Error("no metadata grant yet");
       return grant;
@@ -62,7 +65,7 @@ async function insert(path: WritePathImpl, t: number, ...rows: number[][]): Prom
 
 describe("review B3-p2a-3", () => {
   it("#2: an older snapshot keeps its generation's root and directory charged until it closes", async () => {
-    const { harness, grant } = metered();
+    const { harness, grant, pinCredit } = metered();
     const path = await harness.open();
     const t = await table(path);
     await insert(path, t, [1, 2], [3, 4], [5, 6]);
@@ -76,12 +79,12 @@ describe("review B3-p2a-3", () => {
     expect((await rowsOf(old, t)).length).toBe(6);
     const before = grant().allocated;
     // The old generation's root and its own directory chunk are charged beside the current ones.
-    expect(before).toBeGreaterThan(path.residentMetadataBytes);
+    expect(before - pinCredit()).toBeGreaterThan(path.residentMetadataBytes);
     old.release();
     const after = grant().allocated;
     expect(before - after).toBeGreaterThan(0);
     // With only the current generation pinned, the grant holds exactly what it reports.
-    expect(after).toBe(path.residentMetadataBytes);
+    expect(after).toBe(path.residentMetadataBytes + pinCredit());
     now.release();
     await harness.close();
   });
@@ -90,7 +93,7 @@ describe("review B3-p2a-3", () => {
   // publication grows the page index from nothing.
   for (const earlier of [3, 0])
     it(`#3: a drop during an in-flight publish leaves no orphan charge (${String(earlier)} earlier flushes)`, async () => {
-      const { harness, grant } = metered();
+      const { harness, grant, pinCredit } = metered();
       const path = await harness.open();
       const t = await table(path);
       await insert(
@@ -122,12 +125,12 @@ describe("review B3-p2a-3", () => {
       await autocommit(path, (s) => s.changeCatalog({ kind: "dropTable", tableId: t }));
       resume();
       await path.quiesce();
-      expect(grant().allocated).toBe(path.residentMetadataBytes);
+      expect(grant().allocated).toBe(path.residentMetadataBytes + pinCredit());
       await harness.close();
     });
 
   it("a drop returns its directory charge once, after the last older reader", async () => {
-    const { harness, grant } = metered();
+    const { harness, grant, pinCredit } = metered();
     const path = await harness.open();
     const t = await table(path);
     await insert(path, t, [1, 2], [3, 4]);
@@ -141,7 +144,7 @@ describe("review B3-p2a-3", () => {
     last.release();
     const after = grant().allocated;
     expect(after).toBeLessThan(before);
-    expect(after).toBe(path.residentMetadataBytes);
+    expect(after).toBe(path.residentMetadataBytes + pinCredit());
     last.release();
     expect(grant().allocated).toBe(after);
     await harness.close();

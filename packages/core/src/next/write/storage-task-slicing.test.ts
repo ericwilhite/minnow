@@ -6,6 +6,8 @@ import { MemoryBackend } from "../storage/memory-store.js";
 import { openExtentSpace } from "../storage/space.js";
 import { countingBudget, countingMemory } from "../storage/space-test-support.js";
 import type { ExtentSpace, OpenSpaceOptions } from "../storage/extents.js";
+import { BoundedFreeSpaceMap } from "../storage/bounded-free-space.js";
+import * as extentSnapshots from "../storage/extent-snapshot.js";
 import { FreeSpaceMap } from "../storage/free-space.js";
 import { TaskClock, sortInSlices } from "../task.js";
 
@@ -133,15 +135,22 @@ async function startup(
   const lease = await backend.acquire();
   const session = await backend.open(lease);
   const count = 100_000;
-  session.readRoot = async () => new Uint8Array([1]);
-  session.readPreviousRoot = async () => new Uint8Array([2]);
+  await session.publish(new Uint8Array([2]));
+  await session.publish(new Uint8Array([1]));
   session.dataLength = async () => count * 8192;
+  const reconstruct = extentSnapshots.reconstructState;
+  const phase =
+    collected === undefined
+      ? null
+      : vi.spyOn(extentSnapshots, "reconstructState").mockImplementation((...args) => {
+          collected();
+          return reconstruct(...args);
+        });
   try {
     const space = await openExtentSpace(session, {
       reachable: function* (root) {
         for (let index = 0; index < count; index++)
           yield { offset: index * 8192 + (root[0] === 1 ? 0 : 4096), length: 1000 };
-        if (root[0] === 2) collected?.();
       },
       ...extra,
       budget: budget(),
@@ -160,6 +169,8 @@ async function startup(
     await session.close();
     await lease.release();
     throw error;
+  } finally {
+    phase?.mockRestore();
   }
 }
 
@@ -245,8 +256,8 @@ it("checks the union deadline before entering free-map construction", async () =
   const controller = new AbortController();
   const reason = new Error("cancel root union");
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const original = FreeSpaceMap.fromAllocatedAsync.bind(FreeSpaceMap);
-  const spy = vi.spyOn(FreeSpaceMap, "fromAllocatedAsync").mockImplementation((...args) => {
+  const original = BoundedFreeSpaceMap.create.bind(BoundedFreeSpaceMap);
+  const spy = vi.spyOn(BoundedFreeSpaceMap, "create").mockImplementation((...args) => {
     enteredMap = true;
     return original(...args);
   });
