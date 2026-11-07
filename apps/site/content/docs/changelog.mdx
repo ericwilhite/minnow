@@ -8,7 +8,9 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
-## Unreleased
+## 0.20.0 — November 7, 2026
+
+Release packages: `@minnowdb/core@0.20.0`.
 
 Locking reads refused in a READ ONLY transaction now consistently say
 `cannot execute SELECT in a read-only transaction`. The message no longer names a lock strength
@@ -47,10 +49,9 @@ A CTE with zero references contributes no locking intent. A referenced
 CTE's own clause still counts, including a reference from a CTE the final SELECT does not use. Parsing and view expansion share the same lock-target and
 strongest-lock rules with the internal rebuild lowerer. No stored-format change.
 
-Not yet released. Some SQL that used to run now fails, and some now answers differently, so the
-next release is a minor one, as the [versioning policy](/docs/reference/versioning) requires
-during 0.x. It will name its packages here. Each change says what to rewrite; the **Migration**
-list below collects them.
+Some SQL that used to run now fails, and some now answers differently, so this is a minor
+release, as the [versioning policy](/docs/reference/versioning) requires during 0.x. Each change
+says what to rewrite; the **Migration** list below collects them.
 
 - The exported query-plan type `CompiledStatement` gains three optional fields: `truncate` on a
   delete that came from `TRUNCATE`, and `declaredTypeName` and `declaredLength` on column
