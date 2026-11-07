@@ -144,7 +144,7 @@ export async function exportPass(options: {
   readonly baselineStream?: boolean;
   readonly readMiB?: 4 | 8;
   readonly groupDepth?: 1 | 2;
-  readonly mode?: "pages" | "scan";
+  readonly mode?: "pages" | "scan" | "scan-core";
   readonly frameCopy?: "baseline" | "candidate";
   readonly scanRange?: "baseline" | "candidate";
   readonly scanTargetMiB?: 1 | 2 | 3;

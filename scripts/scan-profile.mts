@@ -16,6 +16,31 @@ interface Profile {
   timeDeltas: number[];
 }
 
+/** Inclusive focus stacks may overlap; inlined work cannot be separated by this sampler. */
+function scanFocus(f: Frame): string | null {
+  const n = f.functionName,
+    u = f.url;
+  if (u.includes("/exec/column-target.ts")) {
+    if (n === "allValid") return "validity checks / writes";
+    if (["shapeOf", "#shape", "#buffer", "buffer", "#varlen"].includes(n))
+      return "vector shape / buffer setup";
+  }
+  if (u.includes("/page/decode.ts")) {
+    if (["writeValidityRange", "gatherValidity"].includes(n)) return "validity checks / writes";
+    if (["varlenBytesOf", "decodeVarlen", "codeBytes8", "codeBytes16", "codeBytes32"].includes(n))
+      return "varlen sizing / offsets / value copying";
+  }
+  if (
+    u.includes("/page/directory.ts") ||
+    (u.includes("/page/reader.ts") &&
+      ["pagesInRange", "pagesForRows", "isSafe", "isDictionaryRange", "isAllValid"].includes(n))
+  )
+    return "page range / descriptor queries";
+  if (u.includes("/exec/table-scan.ts") && ["#bytesFor", "#workingSet"].includes(n))
+    return "batch size / working-set planning";
+  return null;
+}
+
 function category(f: Frame, parent?: Frame): string | null {
   const n = f.functionName,
     u = f.url;
@@ -28,6 +53,8 @@ function category(f: Frame, parent?: Frame): string | null {
       : "structured clone / transfer";
   if (u.includes("/next/task.ts") && !["sortInSlices", "sift", "swap", "item"].includes(n))
     return "task clock / pacing";
+  if (u.includes("/scan-core.ts")) return "bench scan-only consumer / setup";
+  if (u.includes("/scan-fixture.ts")) return "bench fixture descriptors";
   if (u.includes("/owner-frames.ts"))
     return ["flatBytes", "validityBytes", "textFlattenBytes"].includes(n)
       ? "bench frame sizing"
@@ -82,6 +109,7 @@ for (const path of process.argv.slice(2)) {
   for (const n of p.nodes) for (const c of n.children ?? []) parents.set(c, n.id);
   const buckets = new Map<string, { samples: number; sampledWallMs: number }>();
   const functions = new Map<string, { samples: number; sampledWallMs: number }>();
+  const focus = new Map<string, { samples: number; sampledWallMs: number }>();
   let sampledWallMs = 0,
     activeSamples = 0;
   for (let k = 0; k < p.samples.length; k++) {
@@ -98,6 +126,22 @@ for (const path of process.argv.slice(2)) {
     bucket ??= "idle/program/unattributed";
     const ms = (p.timeDeltas[k] ?? 0) / 1000;
     sampledWallMs += ms;
+    const seenFocus = new Set<string>();
+    for (
+      let ancestor: number | undefined = id;
+      ancestor !== undefined;
+      ancestor = parents.get(ancestor)
+    ) {
+      const frame = nodes.get(ancestor)?.callFrame;
+      const label = frame === undefined ? null : scanFocus(frame);
+      if (label !== null) seenFocus.add(label);
+    }
+    for (const label of seenFocus) {
+      const v = focus.get(label) ?? { samples: 0, sampledWallMs: 0 };
+      v.samples++;
+      v.sampledWallMs += ms;
+      focus.set(label, v);
+    }
     if (!bucket.startsWith("native read") && !bucket.startsWith("idle/")) activeSamples++;
     const b = buckets.get(bucket) ?? { samples: 0, sampledWallMs: 0 };
     b.samples++;
@@ -133,6 +177,16 @@ for (const path of process.argv.slice(2)) {
         .map(([name, v]) => ({ name, ...v, wallShare: (100 * v.sampledWallMs) / sampledWallMs }))
         .sort((a, b) => b.sampledWallMs - a.sampledWallMs)
         .slice(0, 40),
+      scanFocus: [...focus]
+        .map(([name, v]) => ({
+          name,
+          ...v,
+          activeCountShare: (100 * v.samples) / activeSamples,
+          wallShare: (100 * v.sampledWallMs) / sampledWallMs,
+        }))
+        .sort((a, b) => b.samples - a.samples),
+      scanFocusLimits:
+        "inclusive stack matches overlap; validity writes in inlined decode and offsets mixed with varlen copies cannot be isolated; zero/missing samples do not prove zero cost",
     }),
   );
 }

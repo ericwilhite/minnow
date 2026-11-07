@@ -1205,6 +1205,12 @@ top self-time functions and exclusive buckets for scan, descriptors, vectors, fr
 result accounting and transport. CDP sample durations include native waits and descheduling;
 active sample shares estimate hotspots, not exact CPU seconds per bucket. The report keeps
 native reads, GC and idle samples separate and records the worker's actual thread CPU bracket.
+`MINNOW_EXPORT_SCAN_CORE_PROFILE=1` profiles the scan side alone over the same OPFS table.
+It drives the real table scan and pipeline into a synchronous borrowed-batch consumer,
+without the frame adapter, result channel, ownership copies, or client transport. The consumer
+records batch/column counts, dictionary/validity/offset shapes, and an endpoint fingerprint;
+it does not decode text or check every value. Its rows/s is a scan diagnostic, not export
+throughput or a Gate A result. Cold/warm residency and setup-excluded CPU rules stay the same.
 `scripts/frame-copy-bench.mts` isolates frame ownership copies in five interleaved CPU/wall
 rounds; `MINNOW_EXPORT_FRAME_COPY_COMPARE=1` compares those policies through the whole cold scan.
 `scripts/scan-range-bench.mts` isolates the scan's contiguous-prefix dispatch over real encoded

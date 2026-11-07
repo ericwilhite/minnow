@@ -1,12 +1,13 @@
 /**
  * Worker for the OPFS export bench: build the wide table, then run either the one-pass page
- * stream or the real TableScan and owner-format transport. Scan frame assembly uses the
+ * stream, scan-side-only diagnostic, or real TableScan and owner-format transport. Frame assembly uses the
  * labelled bench stand-in in scripts/browser-perf/page/scan-export.ts, not a production sink.
  */
 import {
   scanExport,
   type ScanExportStats,
 } from "../../../scripts/browser-perf/page/scan-export.js";
+import { scanCore, type ScanCoreStats } from "../../../scripts/browser-perf/page/scan-core.js";
 import { BlobCache } from "../src/next/format/blob-cache.js";
 import { Governor, type EvictableCache } from "../src/next/memory/governor.js";
 import type { ChunkDirectory } from "../src/next/page/directory.js";
@@ -61,7 +62,7 @@ export type ExportRequest =
       readonly baselineStream?: boolean;
       readonly readMiB?: 4 | 8;
       readonly groupDepth?: 1 | 2;
-      readonly mode?: "pages" | "scan";
+      readonly mode?: "pages" | "scan" | "scan-core";
       readonly frameCopy?: "baseline" | "candidate";
       readonly scanRange?: "baseline" | "candidate";
       readonly scanTargetMiB?: 1 | 2 | 3;
@@ -99,8 +100,9 @@ export interface ExportPass {
   readonly phases?: ExportPhases;
   readonly baselineCommit?: string;
   readonly readMiB: number;
-  readonly mode: "pages" | "scan";
+  readonly mode: "pages" | "scan" | "scan-core";
   readonly scanStats?: ScanExportStats;
+  readonly scanCoreStats?: ScanCoreStats;
   readonly afterWorkerClose?: { governorMiB: number; poolMiB: number; residentMiB: number };
 }
 
@@ -238,6 +240,8 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
     (!request.resultPort || request.profilePhases || request.passes !== 1)
   )
     throw new Error("Scan bench needs a result port and its own timings");
+  if (request.mode === "scan-core" && (request.profilePhases || request.passes !== 1))
+    throw new Error("Scan-only diagnostic expects one pass and its own timings");
   let stream = exportStream;
   let baselineCommit: string | undefined;
   if (request.baselineStream !== undefined) {
@@ -291,50 +295,55 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
     const readsBefore = space.stats.cache.platformReads;
     if (phases) phases.active = true;
     const result =
-      request.mode === "scan" && request.resultPort && resultGrant
-        ? await scanExport(space, request.groups, {
+      request.mode === "scan-core"
+        ? await scanCore(space, request.groups, {
             budget: grant,
-            resultBudget: resultGrant,
-            ...(request.scanTargetMiB === undefined
-              ? {}
-              : { targetBytes: request.scanTargetMiB * MiB }),
             readWindowBytes: request.scanIO === "batch" ? 0 : (request.windowMiB ?? 64) * MiB,
-            transferOutputs:
-              request.scanOutput === "dictionary" ? "dictionary" : request.scanOutput === "flat",
-            memory: () => ({
-              queryAllocated: grant.allocated,
-              queryHeld: grant.held,
-              resultHeld: resultGrant.held,
-              cacheCharge: governor.usedBytes - grant.held - resultGrant.held,
-              resultAllocated: resultGrant.allocated,
-              governorHeld: governor.usedBytes,
-              idlePool: space.stats.cache.poolBytes,
-              cacheResident: space.stats.cache.residentBytes,
-              cachePinned: space.stats.cache.pinnedBytes,
-            }),
-            port: request.resultPort,
           })
-        : await stream(space, request.groups, {
-            budget: grant,
-            directories,
-            once: request.once,
-            readahead: request.readaheadKiB * 1024,
-            windowBytes: (request.windowMiB ?? 0) * MiB,
-            ...(phases ? { phases } : {}),
-            ...(request.groupDepth === undefined ? {} : { groupDepth: request.groupDepth }),
-            ...(phases
-              ? {
-                  sample: (rows: number) =>
-                    phases.memory.push({
-                      rows,
-                      pool: space.stats.cache.poolBytes,
-                      resident: space.stats.cache.residentBytes,
-                      pinned: space.stats.cache.pinnedBytes,
-                      governor: governor.usedBytes,
-                    }),
-                }
-              : {}),
-          });
+        : request.mode === "scan" && request.resultPort && resultGrant
+          ? await scanExport(space, request.groups, {
+              budget: grant,
+              resultBudget: resultGrant,
+              ...(request.scanTargetMiB === undefined
+                ? {}
+                : { targetBytes: request.scanTargetMiB * MiB }),
+              readWindowBytes: request.scanIO === "batch" ? 0 : (request.windowMiB ?? 64) * MiB,
+              transferOutputs:
+                request.scanOutput === "dictionary" ? "dictionary" : request.scanOutput === "flat",
+              memory: () => ({
+                queryAllocated: grant.allocated,
+                queryHeld: grant.held,
+                resultHeld: resultGrant.held,
+                cacheCharge: governor.usedBytes - grant.held - resultGrant.held,
+                resultAllocated: resultGrant.allocated,
+                governorHeld: governor.usedBytes,
+                idlePool: space.stats.cache.poolBytes,
+                cacheResident: space.stats.cache.residentBytes,
+                cachePinned: space.stats.cache.pinnedBytes,
+              }),
+              port: request.resultPort,
+            })
+          : await stream(space, request.groups, {
+              budget: grant,
+              directories,
+              once: request.once,
+              readahead: request.readaheadKiB * 1024,
+              windowBytes: (request.windowMiB ?? 0) * MiB,
+              ...(phases ? { phases } : {}),
+              ...(request.groupDepth === undefined ? {} : { groupDepth: request.groupDepth }),
+              ...(phases
+                ? {
+                    sample: (rows: number) =>
+                      phases.memory.push({
+                        rows,
+                        pool: space.stats.cache.poolBytes,
+                        resident: space.stats.cache.residentBytes,
+                        pinned: space.stats.cache.pinnedBytes,
+                        governor: governor.usedBytes,
+                      }),
+                  }
+                : {}),
+            });
     if (phases) {
       phases.active = false;
       const expected = request.groups.reduce(
