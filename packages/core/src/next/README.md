@@ -594,9 +594,8 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     export ends after all credits return. The client consumes typed frames, not JS row objects.
   - Table/group descriptors come from the fixture, replacing SQL lowering and B3 catalog/root
     loading. The scan requests a 64 MiB row window through `TableScan.readWindowBytes` and
-    the `chunkReads` factory: B2's shared `loadTogether` and one-pass pooled leases. Full
-    unfiltered scans default to that 64 MiB window when their reader factory supports shared
-    loads; `readWindowBytes: 0` requests cached batch reads. Filtered/deleted groups
+    the `chunkReads` factory: B2's shared `loadTogether` and one-pass pooled leases. This
+    window stays opt-in: absent/zero `readWindowBytes` keeps cached batch reads. Filtered/deleted groups
     retain selective reads. Resident shared loads preserve synchronous `next()` steps. A refused
     optional window drops partial loads and shrinks before
     falling back to batch reads. `MINNOW_EXPORT_SCAN_IO_COMPARE=1` compares both policies over

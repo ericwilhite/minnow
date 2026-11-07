@@ -409,7 +409,7 @@ function scanOf(
 
 describe("table scan: pushdown, gather and late materialization never change the answer", () => {
   it.each(seedsFor("next-scan-window-residency", [0xb2b1, 0xb2b2]))(
-    "default windows preserve cached synchronous steps and explicit opt-out (seed %i)",
+    "opt-in windows preserve cached synchronous steps; default stays cached (seed %i)",
     async (seed) => {
       const reach = createReach("next-scan-window-residency", SCAN_WINDOW_RESIDENCY_REACH);
       await fc.assert(
@@ -472,7 +472,7 @@ describe("table scan: pushdown, gather and late materialization never change the
                     actual.push(item.batch.columns.map((v) => normalize(valueAt(v, r))));
                 }
                 expect(actual).toEqual(source.map((r) => expectedRow(r, false)));
-                expect(windows > 0).toBe(policy !== "disabled");
+                expect(windows > 0).toBe(policy === "explicit");
                 reach.reach(policy === "disabled" ? "disabled" : `${policy} ${residency}`);
               } finally {
                 scan.close();
