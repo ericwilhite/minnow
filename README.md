@@ -41,7 +41,7 @@ and benchmarks that run in your browser.
 - **Deploys without stuck tabs.** When a release changes the stored format, tabs still on the
   previous release finish what they accepted, step aside, and reload themselves; the new tab
   upgrades the database in well under a second. Prefer to ask first? Opt into a reload prompt.
-- **Plain JavaScript.** The engine with its larger durable adapter is about 443 KiB gzipped, with
+- **Plain JavaScript.** The engine with its larger durable adapter is about 446 KiB gzipped, with
   no Wasm download, compile step, special headers, or server process.
 - **Direct SQL or Kysely.** Run PostgreSQL-style SQL through the engine API or use Kysely through
   `@minnowdb/kysely`. Kysely's `DB` type derives from the same schema used for migration, so

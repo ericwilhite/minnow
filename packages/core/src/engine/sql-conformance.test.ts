@@ -37,6 +37,14 @@ import { describe, expect, it, vi } from "vitest";
 import rawPostgresProfile from "../../postgres-feature-profile.json";
 import rawMatrix from "../../sql-feature-matrix.json";
 import { MemoryBlockStore } from "../storage/index.js";
+import {
+  CORRELATED_AGGREGATE_STATES,
+  createReach,
+  DISTINCT_ON_STATES,
+  EXISTS_AGGREGATE_STATES,
+  QUALIFIED_ORDER_STATES,
+  REFUSAL_STATES,
+} from "../testing/reach.js";
 import { mulberry32, seedsFor } from "../testing/seeds.js";
 import { positionalToNumbered } from "../testing/oracle.js";
 import { MinnowDatabase, type DatabaseRow } from "./database.js";
@@ -264,6 +272,153 @@ function joinCases(): Case[] {
       ordered: true,
     })),
   );
+}
+
+/**
+ * ORDER BY a qualified column the select list does not carry, while another source's column is
+ * output under the same bare name. A qualified name is always an input column in PostgreSQL —
+ * output names cannot be qualified — so `ORDER BY d.label` under `SELECT m.label` sorts by
+ * data's label, and under USING `d.region` is data's own column, not the merged `region`
+ * (COALESCE under FULL JOIN, dims' column under RIGHT JOIN). Crossed: every join kind × ON and
+ * USING × which source's column sorts × direction, and a window over the block (whose desugar
+ * resolves ORDER BY again), plus the single-table and derived-table forms. The `d.id, m.rank`
+ * tail makes the order total: one side's key is non-NULL on every joined row.
+ */
+function qualifiedOrderCases(): Case[] {
+  const shapes = [
+    { on: "ON m.region = d.region", select: "m.label, d.id, m.rank", key: "d.label" },
+    { on: "ON m.region = d.region", select: "d.label, d.id, m.rank", key: "m.label" },
+    { on: "ON m.region = d.region", select: "m.region, d.id, m.rank", key: "d.region" },
+    { on: "USING (region)", select: "region, d.id, m.rank", key: "d.region" },
+    { on: "USING (region)", select: "region, d.id, m.rank", key: "m.region" },
+    { on: "USING (region)", select: "m.label, d.id, m.rank", key: "d.label" },
+  ];
+  const directions = ["NULLS FIRST", "DESC NULLS LAST"];
+  const cases: Case[] = [];
+  for (const kind of ["JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN"])
+    for (const { on, select, key } of shapes) {
+      const shape = `${kind} ${on.startsWith("USING") ? "USING" : "ON"}`;
+      for (const direction of directions)
+        cases.push({
+          sql: `SELECT ${select} FROM data d ${kind} dims m ${on} ORDER BY ${key} ${direction}, d.id NULLS FIRST, m.rank NULLS FIRST`,
+          ordered: true,
+          reach: [shape],
+        });
+      // FULL JOIN under a window is refused (it is only supported as the block's sole source).
+      if (kind !== "FULL JOIN")
+        cases.push({
+          sql: `SELECT ${select}, COUNT(*) OVER () AS n FROM data d ${kind} dims m ${on} ORDER BY ${key} NULLS FIRST, d.id NULLS FIRST, m.rank NULLS FIRST`,
+          ordered: true,
+          reach: [`${shape} window`],
+        });
+    }
+  cases.push(
+    {
+      sql: `SELECT label AS region, id FROM data d ORDER BY d.region NULLS FIRST, d.id`,
+      ordered: true,
+      reach: ["single table"],
+    },
+    {
+      sql: `SELECT d.label AS region, d.id FROM data d ORDER BY d.region DESC NULLS LAST, d.id`,
+      ordered: true,
+      reach: ["single table"],
+    },
+    {
+      sql: `SELECT s.label, m.rank FROM (SELECT id, region, label FROM data) s FULL JOIN dims m ON m.region = s.region ORDER BY m.label NULLS FIRST, s.id NULLS FIRST, m.rank`,
+      ordered: true,
+      reach: ["derived FULL JOIN"],
+    },
+  );
+  return cases;
+}
+
+/**
+ * A correlated scalar subquery over an aggregate without GROUP BY yields one row per outer row,
+ * so its LIMIT and OFFSET apply to that row: LIMIT n ≥ 1 keeps it, LIMIT 0 or any OFFSET leaves
+ * the subquery empty and its value NULL — COUNT included (PostgreSQL). Crossed: aggregate ×
+ * LIMIT / OFFSET × equality or non-equality correlation in the select list, and the bounds that
+ * empty the subquery in WHERE. SQLite has no OFFSET without LIMIT, so those cases are PGlite's
+ * alone. These need the optimizer to run at all, so they are kept few enough that the corpus's
+ * unoptimized share (pinned below) still measures the rest.
+ */
+function correlatedAggregateLimitCases(): Case[] {
+  const aggregates = [
+    "MAX(d.amount)",
+    "MIN(d.amount)",
+    "SUM(d.amount)",
+    "COUNT(*)",
+    "COUNT(DISTINCT d.label)",
+    "MAX(d.id) - MIN(d.id)",
+  ];
+  const bounds: Array<{ sql: string; sqlite: boolean }> = [
+    { sql: "LIMIT 1", sqlite: true },
+    { sql: "LIMIT 0", sqlite: true },
+    { sql: "LIMIT 1 OFFSET 1", sqlite: true },
+    { sql: "OFFSET 0", sqlite: false },
+    { sql: "OFFSET 1", sqlite: false },
+    { sql: "ORDER BY 1 DESC LIMIT 1", sqlite: true },
+  ];
+  const correlations = ["d.region = m.region", "d.id < m.rank * 20"];
+  const cases: Case[] = [];
+  for (const aggregate of aggregates)
+    for (const bound of bounds)
+      for (const where of correlations) {
+        const skip = bound.sqlite ? {} : { skip: ["sqlite"] as const };
+        const subquery = `(SELECT ${aggregate} FROM data d WHERE ${where} ${bound.sql})`;
+        const correlation =
+          where === correlations[0] ? "equality correlation" : "range correlation";
+        cases.push({
+          sql: `SELECT m.region, ${subquery} AS x FROM dims m ORDER BY m.region`,
+          ordered: true,
+          ...skip,
+          reach: [`bound ${bound.sql}`, correlation, "select list"],
+        });
+        if (where === correlations[0] && ["LIMIT 1", "LIMIT 0", "OFFSET 1"].includes(bound.sql))
+          cases.push({
+            sql: `SELECT m.region FROM dims m WHERE ${subquery} > 1 ORDER BY m.region`,
+            ordered: true,
+            ...skip,
+            reach: [`bound ${bound.sql}`, correlation, "where"],
+          });
+      }
+  return cases;
+}
+
+/**
+ * EXISTS over a correlated aggregate without GROUP BY: the subquery yields one row whatever it
+ * reads, so EXISTS is TRUE unless LIMIT 0 or an OFFSET empties it (PostgreSQL). Crossed:
+ * aggregate × bound × EXISTS in WHERE, NOT EXISTS with a non-equality correlation, and EXISTS
+ * as a selected value. Kept few, like correlatedAggregateLimitCases, for the unoptimized share.
+ */
+function existsAggregateCases(): Case[] {
+  const cases: Case[] = [];
+  for (const aggregate of ["COUNT(*)", "MAX(d.amount)"])
+    for (const bound of ["", "LIMIT 0", "OFFSET 1"]) {
+      const skip = bound === "OFFSET 1" ? { skip: ["sqlite"] as const } : {};
+      const over = (where: string) => `(SELECT ${aggregate} FROM data d WHERE ${where} ${bound})`;
+      const tags = [`exists ${aggregate}`, `exists ${bound === "" ? "unbounded" : bound}`];
+      cases.push(
+        {
+          sql: `SELECT m.region FROM dims m WHERE EXISTS ${over("d.region = m.region")} ORDER BY m.region`,
+          ordered: true,
+          ...skip,
+          reach: [...tags, "where exists"],
+        },
+        {
+          sql: `SELECT m.region FROM dims m WHERE NOT EXISTS ${over("d.id < m.rank * 20")} ORDER BY m.region`,
+          ordered: true,
+          ...skip,
+          reach: [...tags, "where not exists"],
+        },
+        {
+          sql: `SELECT m.region, EXISTS ${over("d.region = m.region")} AS e FROM dims m ORDER BY m.region`,
+          ordered: true,
+          ...skip,
+          reach: [...tags, "selected exists"],
+        },
+      );
+    }
+  return cases;
 }
 
 /** Datetime literals and calendar arithmetic, which only PostgreSQL spells the same way. */
@@ -1153,6 +1308,29 @@ function distinctOnCases(): Case[] {
     pg(
       `SELECT DISTINCT ON (region) region, amount AS label FROM data ORDER BY region NULLS LAST, label, id`,
     ),
+    // Integer constants are select-list positions in DISTINCT ON and in its ORDER BY, which
+    // decides both the row each group keeps and the order of the result.
+    // A qualified spelling inside an expression is the same sort target (review B6-streamA-1).
+    {
+      ...pg(`SELECT DISTINCT ON (id + 0) id, amount FROM data ORDER BY data.id + 0, amount DESC`),
+      reach: ["qualified expression key"],
+    },
+    {
+      ...pg(`SELECT DISTINCT ON (1) region, id, amount FROM data ORDER BY 1 NULLS LAST, 3 DESC, 2`),
+      reach: ["ordinal key", "ordinal sort"],
+    },
+    {
+      ...pg(
+        `SELECT DISTINCT ON (region) region, id, amount FROM data ORDER BY 1 NULLS LAST, 3, 2 DESC`,
+      ),
+      reach: ["ordinal sort"],
+    },
+    {
+      ...pg(
+        `SELECT DISTINCT ON (2, 1) active, region, id FROM data ORDER BY 1, 2 NULLS LAST, 3 DESC`,
+      ),
+      reach: ["ordinal key", "ordinal sort"],
+    },
   ];
 }
 
@@ -1293,6 +1471,9 @@ function combinationCases(): Case[] {
     ...distinctCases(),
     ...windowCases(),
     ...joinCases(),
+    ...qualifiedOrderCases(),
+    ...correlatedAggregateLimitCases(),
+    ...existsAggregateCases(),
     ...datetimeCases(),
     ...cteCases(),
     ...derivedWindowCases(),
@@ -2564,6 +2745,22 @@ describe("SQL conformance against SQLite and PGlite", () => {
             failures.slice(0, 10).join("\n\n"),
         );
       }
+      // Declared reach of the generator dimensions (testing/reach.ts): a state counts when a case
+      // carrying it agreed with every oracle in this run, one history per run.
+      const diverged = new Set(failures.map((failure) => Number(/^#(\d+) /u.exec(failure)?.[1])));
+      const reached = new Set(
+        corpus.flatMap((testCase, index) => (diverged.has(index) ? [] : (testCase.reach ?? []))),
+      );
+      for (const [campaign, states] of [
+        ["sql-conformance qualified ORDER BY", QUALIFIED_ORDER_STATES],
+        ["sql-conformance correlated aggregate bounds", CORRELATED_AGGREGATE_STATES],
+        ["sql-conformance EXISTS over an aggregate", EXISTS_AGGREGATE_STATES],
+        ["sql-conformance DISTINCT ON keys", DISTINCT_ON_STATES],
+      ] as const) {
+        const reach = createReach<string>(campaign, states);
+        reach.recordHistory(reached);
+        reach.assertReached();
+      }
       // The floor is the combination layer: deleting it would otherwise quietly halve coverage.
       expect(corpus.length).toBeGreaterThan(1_000);
       expect(combinationCases().length).toBeGreaterThan(80);
@@ -2584,6 +2781,247 @@ describe("SQL conformance against SQLite and PGlite", () => {
     },
     240_000,
   );
+
+  it("refuses exactly the DISTINCT ON orderings PostgreSQL refuses", async () => {
+    // PostgreSQL (parse_clause.c transformDistinctOnClause): once an ORDER BY item that is not a
+    // DISTINCT ON expression appears, no later item may be one, and every DISTINCT ON expression
+    // must already be covered: else 42P10, "SELECT DISTINCT ON expressions must match initial
+    // ORDER BY expressions". Expressions match after ordinal and output-alias resolution. Every
+    // key list × every ORDER BY of one to three items from the pool runs on PGlite and Minnow:
+    // both refuse, or both return the same number of rows (which row a group keeps depends on
+    // ties, its count does not).
+    const fixture = buildFixture(DEFAULT_FIXTURE_SEED);
+    const database = await minnowFixture(fixture);
+    const postgres = await pgliteOracle(fixture);
+    const keyLists = ["region", "region, active", "active, region", "LOWER(region)", "1", "2, 1"];
+    const pool = [
+      "region NULLS LAST",
+      "active",
+      "id",
+      "LOWER(region) DESC",
+      "place",
+      "1",
+      "2 DESC",
+    ];
+    const orders: string[][] = [];
+    for (const a of pool) {
+      orders.push([a]);
+      for (const b of pool.filter((item) => item !== a)) {
+        orders.push([a, b]);
+        for (const c of pool.filter((item) => item !== a && item !== b)) orders.push([a, b, c]);
+      }
+    }
+    const mismatches: string[] = [];
+    // Declared reach (testing/reach.ts): both outcomes, each where it matched PostgreSQL.
+    const reach = createReach<string>("sql-conformance DISTINCT ON orderings", REFUSAL_STATES);
+    reach.beginHistory();
+    let refused = 0;
+    try {
+      for (const keys of keyLists)
+        for (const order of orders) {
+          const sql = `SELECT DISTINCT ON (${keys}) region AS place, active, id FROM data ORDER BY ${order.join(", ")}`;
+          let expected: string;
+          try {
+            expected = `rows ${String((await postgres.execute({ sql, ordered: false })).rows.length)}`;
+          } catch (error) {
+            expected = `error ${String((error as { code?: string }).code)}`;
+          }
+          let actual: string;
+          try {
+            actual = `rows ${String((await database.query(sql)).rows.length)}`;
+          } catch (error) {
+            actual = String(error).includes(
+              "SELECT DISTINCT ON expressions must match initial ORDER BY expressions",
+            )
+              ? "error 42P10"
+              : `error ${String(error)}`;
+          }
+          if (expected === "error 42P10") refused += 1;
+          if (actual === expected)
+            reach.reach(expected.startsWith("error") ? "refused" : "accepted");
+          if (actual !== expected)
+            mismatches.push(`${sql}\n  pglite: ${expected}\n  minnow: ${actual}`);
+        }
+    } finally {
+      await postgres.close();
+      await database.close();
+    }
+    expect(mismatches.slice(0, 10).join("\n"), `${String(mismatches.length)} differ`).toBe("");
+    reach.assertReached();
+    // The pool must reach both outcomes, or the comparison above checks only one of them.
+    expect(refused).toBeGreaterThan(50);
+    expect(refused).toBeLessThan(keyLists.length * orders.length);
+  });
+
+  it("matches DISTINCT ON keys to ORDER BY however the expression is spelled, as PostgreSQL", async () => {
+    // The same expression qualified or not, inside arithmetic, or through its output alias, is
+    // one sort target (PostgreSQL resolves both lists to target entries before comparing).
+    const fixture = buildFixture(DEFAULT_FIXTURE_SEED);
+    const database = await minnowFixture(fixture);
+    const postgres = await pgliteOracle(fixture);
+    const keyLists = ["id % 7", "data.id % 7", "k"];
+    const pool = ["id % 7", "data.id % 7 DESC", "k", "active", "data.region NULLS LAST"];
+    const orders: string[][] = [];
+    for (const a of pool) {
+      orders.push([a]);
+      for (const b of pool.filter((item) => item !== a)) {
+        orders.push([a, b]);
+        for (const c of pool.filter((item) => item !== a && item !== b)) orders.push([a, b, c]);
+      }
+    }
+    const mismatches: string[] = [];
+    // Declared reach (testing/reach.ts): both outcomes, each where it matched PostgreSQL.
+    const reach = createReach<string>("sql-conformance DISTINCT ON spellings", REFUSAL_STATES);
+    reach.beginHistory();
+    let refused = 0;
+    try {
+      for (const keys of keyLists)
+        for (const order of orders) {
+          const sql = `SELECT DISTINCT ON (${keys}) id % 7 AS k, active FROM data ORDER BY ${order.join(", ")}`;
+          let expected: string;
+          try {
+            expected = `rows ${String((await postgres.execute({ sql, ordered: false })).rows.length)}`;
+          } catch (error) {
+            expected = `error ${String((error as { code?: string }).code)}`;
+          }
+          let actual: string;
+          try {
+            actual = `rows ${String((await database.query(sql)).rows.length)}`;
+          } catch (error) {
+            actual = String(error).includes(
+              "SELECT DISTINCT ON expressions must match initial ORDER BY expressions",
+            )
+              ? "error 42P10"
+              : `error ${String(error)}`;
+          }
+          if (expected === "error 42P10") refused += 1;
+          if (actual === expected)
+            reach.reach(expected.startsWith("error") ? "refused" : "accepted");
+          if (actual !== expected)
+            mismatches.push(`${sql}\n  pglite: ${expected}\n  minnow: ${actual}`);
+        }
+    } finally {
+      await postgres.close();
+      await database.close();
+    }
+    expect(mismatches.slice(0, 10).join("\n"), `${String(mismatches.length)} differ`).toBe("");
+    reach.assertReached();
+    expect(refused).toBeGreaterThan(20);
+    expect(refused).toBeLessThan(keyLists.length * orders.length);
+  });
+
+  it("orders DISTINCT over a USING join by a qualified merged column exactly as PostgreSQL", async () => {
+    // The merged USING column is the left input's under INNER and LEFT joins, the right input's
+    // under RIGHT, and COALESCE under FULL: a qualified key naming the supplying side is the
+    // selected column (DISTINCT may sort by it); the other side, or any side under FULL, is not.
+    const fixture = buildFixture(DEFAULT_FIXTURE_SEED);
+    const database = await minnowFixture(fixture);
+    const postgres = await pgliteOracle(fixture);
+    const mismatches: string[] = [];
+    // Declared reach (testing/reach.ts): both outcomes, each where it matched PostgreSQL.
+    const reach = createReach<string>("sql-conformance DISTINCT over USING", REFUSAL_STATES);
+    reach.beginHistory();
+    let refused = 0;
+    let accepted = 0;
+    try {
+      for (const kind of ["JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN"])
+        for (const key of ["d.region", "m.region", "region"])
+          for (const direction of ["NULLS FIRST", "DESC NULLS LAST"]) {
+            const sql = `SELECT DISTINCT region FROM data d ${kind} dims m USING (region) ORDER BY ${key} ${direction}`;
+            let expected: string;
+            try {
+              expected = JSON.stringify((await postgres.execute({ sql, ordered: true })).rows);
+              accepted += 1;
+            } catch (error) {
+              expected = `error ${String((error as { code?: string }).code)}`;
+              refused += 1;
+            }
+            let actual: string;
+            try {
+              actual = JSON.stringify((await database.query(sql)).rows);
+            } catch (error) {
+              actual = String(error).includes("SELECT DISTINCT orders by selected columns")
+                ? "error 42P10"
+                : `error ${String(error)}`;
+            }
+            if (actual === expected)
+              reach.reach(expected.startsWith("error") ? "refused" : "accepted");
+            if (actual !== expected)
+              mismatches.push(`${sql}\n  pglite: ${expected}\n  minnow: ${actual}`);
+          }
+    } finally {
+      await postgres.close();
+      await database.close();
+    }
+    expect(mismatches.slice(0, 10).join("\n"), `${String(mismatches.length)} differ`).toBe("");
+    reach.assertReached();
+    // Both outcomes are reached: the supplying side (and the bare name) run, the other refuses.
+    expect(accepted).toBeGreaterThan(8);
+    expect(refused).toBeGreaterThan(4);
+  });
+
+  it("refuses a FROM list that names a source twice, exactly as PostgreSQL", async () => {
+    // PostgreSQL's 42712 ("table name … specified more than once"): one FROM level names each
+    // source once, whatever joins them and wherever a parenthesized group puts it. Every pair of
+    // entries × every way to join them runs on PGlite and Minnow: both refuse, or both count the
+    // same rows.
+    const fixture = buildFixture(DEFAULT_FIXTURE_SEED);
+    const database = await minnowFixture(fixture);
+    const postgres = await pgliteOracle(fixture);
+    const entries = [
+      "data",
+      "dims",
+      "data d",
+      "dims d",
+      "dims data",
+      "data AS x",
+      "dims x",
+      "(SELECT 1 AS id) d",
+    ];
+    const joins = [
+      (l: string, r: string) => `${l}, ${r}`,
+      (l: string, r: string) => `${l} CROSS JOIN ${r}`,
+      (l: string, r: string) => `${l} JOIN ${r} ON true`,
+      (l: string, r: string) => `dims q JOIN (${l} JOIN ${r} ON true) ON true`,
+    ];
+    const mismatches: string[] = [];
+    // Declared reach (testing/reach.ts): both outcomes, each where it matched PostgreSQL.
+    const reach = createReach<string>("sql-conformance duplicate FROM names", REFUSAL_STATES);
+    reach.beginHistory();
+    let refused = 0;
+    try {
+      for (const left of entries)
+        for (const right of entries)
+          for (const join of joins) {
+            const sql = `SELECT COUNT(*) AS n FROM ${join(left, right)}`;
+            let expected: string;
+            try {
+              expected = `rows ${JSON.stringify((await postgres.execute({ sql, ordered: false })).rows)}`;
+            } catch (error) {
+              expected = `error ${String((error as { code?: string }).code)}`;
+            }
+            let actual: string;
+            try {
+              actual = `rows ${JSON.stringify((await database.query(sql)).rows)}`;
+            } catch (error) {
+              actual = String(error).includes("specified more than once")
+                ? "error 42712"
+                : `error ${String(error)}`;
+            }
+            if (expected === "error 42712") refused += 1;
+            if (actual === expected)
+              reach.reach(expected.startsWith("error") ? "refused" : "accepted");
+            if (actual !== expected)
+              mismatches.push(`${sql}\n  pglite: ${expected}\n  minnow: ${actual}`);
+          }
+    } finally {
+      await postgres.close();
+      await database.close();
+    }
+    expect(mismatches.slice(0, 10).join("\n"), `${String(mismatches.length)} differ`).toBe("");
+    reach.assertReached();
+    expect(refused).toBeGreaterThan(20);
+  });
 
   it("keeps every select item when output names repeat, as both oracles do", async () => {
     // PostgreSQL and SQLite both return two columns named `c` for `SELECT a AS c, b AS c`. A

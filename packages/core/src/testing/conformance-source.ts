@@ -79,6 +79,8 @@ export interface Case {
   ordered: boolean;
   /** Oracles to skip, each for a documented semantic or dialect divergence. */
   skip?: readonly OracleName[];
+  /** Generator dimensions the case exercises (testing/reach.ts), counted when it agrees. */
+  reach?: readonly string[];
 }
 
 type Template = (rng: () => number) => Case;
@@ -661,3 +663,21 @@ export const templates: Template[] = [
     ordered: true,
   }),
 ];
+
+/** PostgreSQL name resolution must precede grouping validation in both engines. */
+export const NAME_RESOLUTION_SETUP = [
+  "CREATE TABLE a (id integer PRIMARY KEY, v integer)",
+  "INSERT INTO a VALUES (1, 10), (2, 20)",
+] as const;
+
+export const NAME_RESOLUTION_CASES = [
+  "SELECT count(z.*) FROM a",
+  "SELECT id FROM a GROUP BY z.id",
+  "SELECT id FROM a GROUP BY nope",
+  "SELECT id FROM a GROUP BY a.nope",
+  "SELECT id FROM a GROUP BY id HAVING nope > 0",
+  "SELECT id FROM a GROUP BY id HAVING z.v > 0",
+  "SELECT id FROM a GROUP BY id HAVING max(nope) > 0",
+  "SELECT count(a.*) AS n FROM a",
+  "SELECT v AS k FROM a GROUP BY k",
+] as const;

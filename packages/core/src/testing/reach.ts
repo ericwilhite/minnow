@@ -446,3 +446,142 @@ export const WRITE_DIFFERENTIAL_CLOCK_STATES = [
   "every third check",
   "every seventh check",
 ] as const;
+
+/**
+ * SQL conformance (engine/sql-conformance.test.ts): the generator dimensions of the qualified
+ * ORDER BY, correlated aggregate, EXISTS-over-aggregate and DISTINCT ON fixes. A state counts when
+ * a case carrying it agreed with every oracle in a corpus run.
+ */
+const JOIN_KINDS = ["JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN"] as const;
+export const QUALIFIED_ORDER_STATES = [
+  ...JOIN_KINDS.flatMap((kind) => [`${kind} ON`, `${kind} USING`]),
+  ...JOIN_KINDS.filter((kind) => kind !== "FULL JOIN").flatMap((kind) => [
+    `${kind} ON window`,
+    `${kind} USING window`,
+  ]),
+  "single table",
+  "derived FULL JOIN",
+] as const;
+
+export const CORRELATED_AGGREGATE_STATES = [
+  "bound LIMIT 1",
+  "bound LIMIT 0",
+  "bound LIMIT 1 OFFSET 1",
+  "bound OFFSET 0",
+  "bound OFFSET 1",
+  "bound ORDER BY 1 DESC LIMIT 1",
+  "equality correlation",
+  "range correlation",
+  "select list",
+  "where",
+] as const;
+
+export const EXISTS_AGGREGATE_STATES = [
+  "exists COUNT(*)",
+  "exists MAX(d.amount)",
+  "exists unbounded",
+  "exists LIMIT 0",
+  "exists OFFSET 1",
+  "where exists",
+  "where not exists",
+  "selected exists",
+] as const;
+
+export const DISTINCT_ON_STATES = [
+  "ordinal key",
+  "ordinal sort",
+  "qualified expression key",
+] as const;
+
+/** A generated refusal campaign: both outcomes, compared against PostgreSQL. */
+export const REFUSAL_STATES = ["refused", "accepted"] as const;
+
+/** Outer locking target shapes compared with PostgreSQL in the read-only campaign. */
+export const ROW_LOCK_TARGET_STATES = [
+  "unused CTE",
+  "constant derived",
+  "CTE",
+  "table derived",
+  "OF constant",
+  "OF table",
+  "series",
+  "empty table",
+] as const;
+
+/** A view remains a relation lock target even when its body has no table. */
+export const ROW_LOCK_VIEW_STATES = ["read only refused", "read write allowed"] as const;
+
+/** Ordered transaction-mode coverage against PostgreSQL or the lossless lowering contract. */
+export const TRANSACTION_MODE_ORDER_STATES = [
+  "top level",
+  "savepoint",
+  "after query",
+  "already read only",
+  "begin read only",
+  "begin read write",
+  "execute",
+  "compiled",
+  "accepted",
+  "refused",
+  "duplicates",
+] as const;
+
+/** PostgreSQL CTE refcounts count unused referrers, but respect the enclosing query scope. */
+export const ROW_LOCK_GRAPH_STATES = [
+  "empty view catalog",
+  "nonempty view catalog",
+  "recursive base",
+  "recursive step",
+  "recursive both",
+  "recursive none",
+  "recursive unused",
+  "recursive chain",
+  "recursive consumed",
+  "recursive nested counted",
+  "recursive discarded scope",
+  "referenced by unused",
+  "unreferenced",
+  "direct",
+  "view",
+  "nested view",
+  "view graph",
+  "materialized",
+  "not materialized",
+  "chain",
+  "multiple references",
+  "strongest final clause",
+  "point read",
+  "scalar view",
+  "dead expression",
+  "nested scope counted",
+  "nested scope discarded",
+] as const;
+
+/** PostgreSQL variable.c admission guards are per attribute and preserve idempotent isolation. */
+export const TRANSACTION_ATTRIBUTE_STATES = [
+  "begin modes",
+  "set modes",
+  "before query",
+  "after query",
+  "top level",
+  "savepoint",
+  "release",
+  "rollback to",
+  "same isolation",
+  "changed isolation",
+  "same deferrable",
+  "changed deferrable",
+  "same access",
+  "changed access",
+  "earlier write",
+  "execute",
+  "compiled",
+  "accepted",
+  "refused",
+  "duplicate item",
+  "mixed attributes",
+  "isolation query refusal",
+  "isolation savepoint refusal",
+  "deferrable query refusal",
+  "deferrable savepoint refusal",
+] as const;

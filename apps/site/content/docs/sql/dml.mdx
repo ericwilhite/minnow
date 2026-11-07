@@ -324,11 +324,41 @@ COMMIT;
 
 Statements inside see each other — a `SELECT` after the `UPDATE` reads the new value — and
 `ROLLBACK` (or `ABORT`) discards the lot (`END` commits, as `COMMIT` does). `BEGIN` and
-`SET TRANSACTION` accept `READ ONLY`, `READ WRITE`, and `ISOLATION LEVEL` below `SERIALIZABLE`:
-every transaction reads one snapshot and commits atomically, which satisfies those levels, while
-`SERIALIZABLE` is refused rather than silently downgraded. Session settings — `SET name TO
-value`, `SET LOCAL …`, `SET TRANSACTION …`, `RESET name` — are accepted and ignored, since an
-embedded single-session engine has nothing to configure by them; `SET TIME ZONE` accepts only UTC.
+`SET TRANSACTION` accept `READ ONLY`, `READ WRITE`, `[NOT] DEFERRABLE`, and `ISOLATION LEVEL`
+below `SERIALIZABLE`, in PostgreSQL's grammar: modes are separated by spaces or commas. Each
+mode item is checked in written order; when all are valid, the last one of each
+kind applies. In a savepoint that starts READ WRITE, `SET TRANSACTION READ ONLY, READ WRITE`
+fails with 25001, while `READ WRITE, READ ONLY` succeeds. If the transaction is already READ
+ONLY, both lists fail. Every transaction reads one snapshot and commits atomically, which
+satisfies those levels, while `SERIALIZABLE` is refused rather than silently downgraded. A
+`READ ONLY` transaction refuses writes, as in PostgreSQL. `INSERT`, `UPDATE`, `DELETE`, `MERGE`,
+`TRUNCATE`, schema changes, `nextval` and row locks (`SELECT … FOR UPDATE`, `FOR SHARE`, and the
+`KEY` forms) fail with "cannot execute … in a read-only transaction". This holds however the
+statement arrives: through `execute`, `query`, `queryCursor`, a built query's `run`, or a live
+subscription's runs (which are not statements of the transaction, so they never count for
+`READ WRITE`). `nextval` is refused when it runs, as in PostgreSQL: `currval` works, and so does a
+`nextval` in a `CASE` branch not taken or under a false `WHERE`.
+
+`SET TRANSACTION READ ONLY` makes the open transaction read-only at any point. Switching a
+read-only transaction back with `SET TRANSACTION READ WRITE` is refused once the transaction
+has run a statement (reads count, whichever method ran them), and always inside a savepoint.
+Setting `READ WRITE` on a transaction that is already read-write is allowed. As in PostgreSQL,
+`READ ONLY` set after `SAVEPOINT` lasts only until that savepoint ends: `ROLLBACK TO` and `RELEASE`
+both return to the mode the transaction had when the savepoint was set. Inserts and updates
+through the table methods (`insert`, `update`, …) are not SQL statements of the transaction.
+They wait for it to finish and then commit on their own.
+
+Isolation-level changes are allowed only before the first query and outside a savepoint;
+setting the already-requested isolation level again is allowed at any time. The requested
+level starts at READ COMMITTED unless BEGIN supplies one. Both `SET TRANSACTION DEFERRABLE`
+and `NOT DEFERRABLE` are refused after the first query or inside a savepoint, even when the
+value is unchanged. These admission rules follow PostgreSQL; execution still uses the same
+fixed snapshot for every accepted isolation level. Reads and writes both count as queries
+for these rules.
+
+Other session settings — `SET name TO value`, `SET LOCAL …`, `RESET name` — are accepted and
+ignored, since an embedded single-session engine has nothing to configure by them; `SET TIME ZONE`
+accepts only UTC.
 `SHOW setting` answers the questions drivers ask on connection (`server_version`, `search_path`,
 `timezone`, `transaction_isolation`, …) with the engine's fixed values. Two rules keep an open transaction from becoming a leak: schema
 changes are refused inside one, because the catalog commits outside the scope and a rollback could

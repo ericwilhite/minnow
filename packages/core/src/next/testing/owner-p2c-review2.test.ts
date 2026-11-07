@@ -7,6 +7,7 @@
  * 3. `engine.close()` returns the committed rule cache's charge, even if the write path fails.
  * 4. The READ ONLY guard reads modes as the front end does (identifier words).
  */
+import { PGlite } from "@electric-sql/pglite";
 import { describe, expect, it } from "vitest";
 import type { CatalogView } from "../access/catalog.js";
 import type { StatementOptions, TableRules } from "../access/modify.js";
@@ -179,30 +180,35 @@ describe("finding 4 (review): the READ ONLY guard reads modes as the front end d
       expect(requestsReadOnly(text), text).toBe(false);
   });
 
-  it("refuses the punctuated spellings the front end accepts (the review's probe)", async () => {
-    const lowered = createLowerer().lower("BEGIN READ ONLY", {
-      catalog: new MemoryCatalog().view,
-      statistics: { table: () => null },
-      costs: EXECUTOR_COSTS,
-    });
-    const lowersAccessMode = lowered.kind === "transactionControl" && lowered.readOnly;
-    const { connect, writePath } = harness();
-    const client = await connect();
-    await client.query("CREATE TABLE t (id INT PRIMARY KEY)");
-    for (const text of ["BEGIN READ, ONLY", "BEGIN READ (ONLY)"]) {
-      const begin = client.query(text, [], { session: 1 });
-      if (lowersAccessMode) {
-        // B6's fix: these malformed forms are refused by its grammar, or begin read-only.
-        await begin.catch(() => undefined);
-        await expect(
-          client.query("INSERT INTO t VALUES (1)", [], { session: 1 }),
-        ).rejects.toBeDefined();
-        await client.query("ROLLBACK", [], { session: 1 }).catch(() => undefined);
-      } else {
-        await expect(begin).rejects.toMatchObject({ sqlState: "0A000" });
+  it("rejects malformed access modes before opening a transaction, as PostgreSQL", async () => {
+    const pg = new PGlite();
+    await pg.waitReady;
+    try {
+      const { connect, writePath } = harness();
+      const client = await connect();
+      await client.query("CREATE TABLE t (id INT PRIMARY KEY)");
+      for (const text of ["BEGIN READ, ONLY", "BEGIN READ (ONLY)"]) {
+        await expect(pg.exec(text)).rejects.toMatchObject({ code: "42601" });
+        const error = await client.query(text, [], { session: 1 }).then(
+          () => null,
+          (failure: unknown) => failure,
+        );
+        expect(error).toBeInstanceOf(Error);
+        const failure = error as Error & { sqlState?: string };
+        // The shipped front end has a positional syntax-error class; newer lowering adds
+        // SQLSTATE. Both represent PostgreSQL's syntax error, never unsupported mode (0A000).
+        const state =
+          failure.sqlState ??
+          (failure.name === "SqlCompileError" && failure.message.startsWith("syntax error")
+            ? "42601"
+            : failure.name);
+        expect(state, text).toBe("42601");
+        expect(failure.message).toMatch(/^syntax error/u);
         expect(writePath.writerBusy).toBe(false);
       }
+      expect(writePath.rows("t")).toEqual([]);
+    } finally {
+      await pg.close();
     }
-    expect(writePath.rows("t")).toEqual([]);
   });
 });

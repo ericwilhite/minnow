@@ -40,7 +40,8 @@ Minnow deliberately excludes three PostgreSQL server or storage-model features:
 
 - `UPDATE` and `DELETE` on tables without row identity;
 - the `SERIALIZABLE` isolation level — every transaction reads one snapshot, which satisfies the
-  weaker levels, so `READ COMMITTED` and `REPEATABLE READ` are accepted and ignored;
+  weaker levels. The requested weaker level does not change snapshot execution, but
+  `SET TRANSACTION` follows PostgreSQL's per-attribute timing and savepoint admission rules;
 - roles and `GRANT` privileges.
 
 The excluded-forms list below also records the narrower forms the engine rejects — `RIGHT JOIN`

@@ -27,7 +27,7 @@ describe("SQL compilation resource limits", () => {
     ["SAVEPOINT one trailing", /Unexpected input after SAVEPOINT/],
     ["RELEASE one trailing", /Unexpected input after RELEASE/],
     ["ROLLBACK TO one trailing", /Unexpected input after ROLLBACK TO/],
-    ["BEGIN QUICKLY", /takes no QUICKLY/],
+    ["BEGIN QUICKLY", /syntax error at or near "QUICKLY"/],
     ["START WORK", /Expected START TRANSACTION/],
     ["CREATE TYPE", /needs a name/],
     ["CREATE TYPE mood TEXT", /supports AS ENUM/],

@@ -1,3 +1,4 @@
+import { expandedRowLock } from "./row-locking.js";
 import { identifyKeyChange } from "./key-change.js";
 import { normalizeForeignKeys, type ReferenceTable } from "./foreign-key-schema.js";
 import {
@@ -329,6 +330,7 @@ import {
   mergeJoinColumns,
   expandSourceColumnAliases,
   expandViewSources,
+  expandRowLockCteViews,
   forEachBlockExpression,
   forEachNestedBlock,
   planContainsFts,
@@ -374,6 +376,7 @@ import {
   extendGroupByWithKeyDependents,
   expandRowReferences,
   type MutationSources,
+  type TransactionMode,
 } from "./query.js";
 import {
   copyQueryResult,
@@ -2589,7 +2592,61 @@ interface OpenStatementTransaction {
   timer: ReturnType<typeof setInterval>;
   busy: number;
   activeAt: number;
-  savepoints: Array<{ name: string; checkpoint: TransactionCheckpoint; retainedBytes: number }>;
+  savepoints: Array<{
+    name: string;
+    checkpoint: TransactionCheckpoint;
+    retainedBytes: number;
+    /** The access mode when the savepoint was set: ROLLBACK TO and RELEASE restore it. */
+    readOnly: boolean;
+  }>;
+  /** BEGIN … READ ONLY or SET TRANSACTION READ ONLY: no write may run (PostgreSQL's 25006). */
+  readOnly: boolean;
+  /** Requested level for PG admission; execution still uses the engine's fixed snapshot. */
+  isolation: Extract<TransactionMode, { kind: "isolation" }>["level"];
+  /** A snapshot-taking statement has run: mode changes follow PostgreSQL's 25001 rules. */
+  queried: boolean;
+}
+
+/** The access mode transaction modes set, the last one written winning; undefined if none. */
+function accessMode(modes: readonly TransactionMode[] | undefined): boolean | undefined {
+  let readOnly: boolean | undefined;
+  for (const mode of modes ?? []) if (mode.kind === "access") readOnly = mode.readOnly;
+  return readOnly;
+}
+
+/** PostgreSQL's refusal of a write in a read-only transaction (read_only_sql_transaction). */
+function readOnlyTransactionError(command: string): TypeError {
+  return new TypeError(`cannot execute ${command} in a read-only transaction`);
+}
+
+/**
+ * The one admission of a statement into an open transaction, which every entry point calls:
+ * execute (writes here, its SELECTs through `query`), `query` and `queryCursor`, and a built
+ * query's `run`. A read-only transaction refuses writes and row locks here (25006), and the
+ * statement counts as the transaction's first for READ WRITE's 25001. nextval is refused where
+ * it executes (#resolveSequenceCalls), as in PostgreSQL: currval reads session state and runs,
+ * and a nextval no row evaluates (a CASE branch not taken, a false WHERE) moves nothing. SET and SHOW are session
+ * settings, not statements of the transaction, and a live set's background refresh is not a
+ * caller's statement. Table-method writes (`insert`, write scopes) never enter a SQL-begun
+ * transaction: they wait for it and commit on their own.
+ */
+function admitToTransaction(
+  open: OpenStatementTransaction,
+  statement: { readonly read: CompiledQuery } | { readonly write: CompiledStatement },
+): void {
+  if (open.readOnly) {
+    if ("write" in statement) throw readOnlyTransactionError(writeCommand(statement.write));
+    // CTE graphs need catalog/view analysis before their strongest lock is known.
+    if (statement.read.rowLocking !== undefined && statement.read.rowLockingCtes === undefined)
+      throw readOnlyTransactionError(`SELECT FOR ${statement.read.rowLocking}`);
+  }
+  open.queried = true;
+}
+
+/** The command PostgreSQL names in that refusal: the statement's tag. */
+function writeCommand(statement: CompiledStatement): string {
+  if (statement.kind === "delete" && "truncate" in statement) return "TRUNCATE TABLE";
+  return statement.kind.toUpperCase().replaceAll("-", " ");
 }
 
 export interface VisibleSegment {
@@ -5777,6 +5834,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
 
   /** Executes a read-only SELECT statement through the public query API. */
   async query(sql: string, options: QueryOptions = {}): Promise<QueryResult> {
+    const open = this.#openTransaction;
+    if (open !== undefined && options.version === undefined)
+      admitToTransaction(open, { read: this.#queries.compile(sql) });
     return this.#queryWithReadReservation(sql, options);
   }
 
@@ -6247,6 +6307,33 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     this.#cachePut(resultKey, markQueryResultExternal(copyQueryResult(result)), bytes);
   }
 
+  /** One cached resolver for execution expansion and admission-only CTE bodies. */
+  #rowLockViewBody(views: ReadonlyMap<string, string>, bodies: Map<string, CompiledQuery>) {
+    return (name: string): CompiledQuery | undefined => {
+      const sql = views.get(name);
+      if (sql === undefined) return undefined;
+      const cached = bodies.get(name);
+      if (cached !== undefined) return cached;
+      const compiled = this.#queries.compile(sql);
+      bodies.set(name, compiled);
+      return compiled;
+    };
+  }
+
+  /** Check retained bodies before a transaction's point-read or cached-plan shortcut. */
+  async #admitCteRowLocks(plan: CompiledQuery): Promise<void> {
+    if (this.#openTransaction?.readOnly !== true || plan.rowLockingCtes === undefined) return;
+    const { views } = await this.#catalogFacts();
+    const bodies = new Map<string, CompiledQuery>();
+    const viewBody = this.#rowLockViewBody(views, bodies);
+    const lock = expandedRowLock(
+      plan,
+      bodies.values(),
+      views.size === 0 ? undefined : (body) => expandRowLockCteViews(body, viewBody),
+    );
+    if (lock !== undefined) throw readOnlyTransactionError(`SELECT FOR ${lock}`);
+  }
+
   /**
    * Applies the rewrites that need the catalog rather than the statement alone: a view becomes
    * the query it stands for (F031-02), `FROM t AS y(a, b)` renames the table's columns
@@ -6289,17 +6376,18 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     rewritten = foldIdentifierCase(rewritten, catalogColumns);
     rewritten = expandRowReferences(rewritten, (name) => catalogColumns.get(name));
     const readsViews = views.size > 0 && planReadsViews(rewritten, (name) => views.has(name));
-    if (readsViews) {
-      const bodies = new Map<string, CompiledQuery>();
-      rewritten = expandViewSources(rewritten, (name) => {
-        const sql = views.get(name);
-        if (sql === undefined) return undefined;
-        const cached = bodies.get(name);
-        if (cached !== undefined) return cached;
-        const compiled = this.#queries.compile(sql);
-        bodies.set(name, compiled);
-        return compiled;
-      });
+    const bodies = new Map<string, CompiledQuery>();
+    const viewBody = this.#rowLockViewBody(views, bodies);
+    if (readsViews) rewritten = expandViewSources(rewritten, viewBody);
+    // A read-only transaction refuses a row lock wherever it is written: in the statement, or in
+    // a view it reads, at any depth (PostgreSQL checks the planned query, views expanded).
+    if (this.#openTransaction?.readOnly === true) {
+      const strongest = expandedRowLock(
+        plan,
+        bodies.values(),
+        views.size === 0 ? undefined : (body) => expandRowLockCteViews(body, viewBody),
+      );
+      if (strongest !== undefined) throw readOnlyTransactionError(`SELECT FOR ${strongest}`);
     }
     if (planReadsTable(rewritten, (name) => domains.has(name) || types.has(name))) {
       rewritten = normalizePlanDomainLiterals(rewritten, domains, types, template);
@@ -6472,6 +6560,9 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         }
         const record = await this.store.getTableByName(`${SEQUENCE_PREFIX}${name}`);
         if (record?.sequence === undefined) throw new TypeError(`Sequence does not exist: ${name}`);
+        // PostgreSQL refuses nextval in a read-only transaction when it executes, whatever ran
+        // it: a query, a cursor, a live subscription's first run or its refresh.
+        if (this.#openTransaction?.readOnly === true) throw readOnlyTransactionError("nextval()");
         const range = await this.store.reserveAutoIncrement(
           record.id,
           record.sequence.columnId,
@@ -8703,10 +8794,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           }
           return ids;
         },
-        execute: (query, context) => this.#liveExecute(query, context),
+        execute: async (query, context) => {
+          await this.#liveReadOnlyGuard(query);
+          return this.#liveExecute(query, context);
+        },
         memoize: (query, result, probe) => this.#memoizeLiveResult(query, result, probe),
-        executeMaintainable: (query, context) =>
-          this.#liveExecuteMaintainable(this.#compileLiveQuery(query), context),
+        executeMaintainable: async (query, context) => {
+          await this.#liveReadOnlyGuard(query);
+          return this.#liveExecuteMaintainable(this.#compileLiveQuery(query), context);
+        },
         maintain: (_query, result, state, tableIds, after, until, probe) =>
           this.#liveMaintain(result, state as LiveMaintenanceState, tableIds, after, until, probe),
         changeCanAffect: (query, tableIds, after, until) =>
@@ -8800,6 +8896,25 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
    * subscription per commit. The set retains the result itself, so the engine memoizes it only
    * when an adapter is about to ask for the same statement at the same version.
    */
+  /**
+   * A live run (first run or refresh) inside an open read-only transaction is no statement of it
+   * (it never counts for READ WRITE), but read-only still binds it: it may not lock rows.
+   * nextval is refused where it executes (#resolveSequenceCalls), so a live run cannot move a
+   * sequence either.
+   */
+  async #liveReadOnlyGuard(query: LiveQueryInput): Promise<void> {
+    if (this.#openTransaction?.readOnly !== true) return;
+    const plan =
+      typeof query === "string"
+        ? this.#queries.compile(query)
+        : query.kind === "typed-query"
+          ? query.plan
+          : this.#queries.compile(query.sql);
+    // The catalog rewrites refuse a lock the statement or any view it reads asks for; run them
+    // here so a live run that would be served from a memo is checked too.
+    await this.#applyCatalogRewrites(plan);
+  }
+
   async #liveExecute(
     query: LiveQueryInput,
     context: LiveQueryExecuteContext | undefined,
@@ -11013,6 +11128,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       ...operations,
       queryPlan: (plan) =>
         this.#withReadReservation(async () => {
+          if (plan.rowLockingCtes !== undefined) await this.#admitCteRowLocks(plan);
           // Before this scope stages anything, its view is exactly the catalog probe captured
           // by beginDeferred. Reuse the ordinary current-version pipeline and its compact
           // catalog/lease caches; once work is staged, switch to the overlay pipeline below.
@@ -11218,6 +11334,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     options = this.#effectiveQueryOptions(options);
     throwIfAborted(options.signal);
     const compiled = this.#queries.compile(sql);
+    if (compiled.rowLockingCtes !== undefined) await this.#admitCteRowLocks(compiled);
     // A keyed lookup takes the point-read path under the scope's overlay as it would outside
     // one: the staged segments join the visible set, and the row's history is replayed for the
     // one key. Without this, every keyed read inside a long scope scanned everything the scope
@@ -13015,6 +13132,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           ? this.#queries.run(plan)
           : this.#memoizedQuery(plan, `typed ${planMemoKey(plan)}`, {}, probe);
       };
+      if (open !== undefined) admitToTransaction(open, { read: plan });
       const result =
         open === undefined
           ? await this.#withReadReservation(execute)
@@ -13870,12 +13988,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     params?: readonly QueryParameter[],
     options: ExecuteOptions = {},
   ): Promise<ExecuteResult> {
+    return this.#serializeExecute(() => this.#executeSerial(sql, params, options));
+  }
+
+  async #serializeExecute(run: () => Promise<ExecuteResult>): Promise<ExecuteResult> {
     if (this.#closed) throw new DatabaseClosedError();
     if (this.#pendingExecutes >= MAX_DATABASE_PENDING_WRITES) {
       throw new RangeError("Too many pending SQL statements; await a statement");
     }
     this.#pendingExecutes += 1;
-    const run = () => this.#executeSerial(sql, params, options);
     const operation = this.#executeChain.then(run, run);
     this.#executeChain = operation.then(
       () => undefined,
@@ -13895,8 +14016,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   ): Promise<ExecuteResult> {
     if (this.#closed) throw new DatabaseClosedError();
     throwIfAborted(options.signal);
+    return this.#executeCompiledSerial(this.#queries.compileStatement(sql), params, options);
+  }
+
+  async #executeCompiledSerial(
+    statement: CompiledStatement,
+    params: readonly QueryParameter[] | undefined,
+    options: ExecuteOptions,
+  ): Promise<ExecuteResult> {
+    if (this.#closed) throw new DatabaseClosedError();
+    throwIfAborted(options.signal);
     await this.#settleExpiredStatementTransaction();
-    const statement = this.#queries.compileStatement(sql);
     if (this.#statementTransactionExpired) {
       if (
         statement.kind !== "transaction" ||
@@ -13908,8 +14038,61 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       if (statement.action === "rollback") return { kind: "transaction", action: "rollback" };
     }
     if (statement.kind === "transaction") {
-      return this.#runTransactionStatement(statement.action, statement.name);
+      return this.#runTransactionStatement(statement.action, statement.name, statement.modes);
     }
+    const current = this.#openTransaction;
+    if (statement.kind === "set" && statement.transactionModes !== undefined) {
+      // Outside an open transaction PostgreSQL only warns; no mode survives into BEGIN.
+      if (current !== undefined) {
+        // Validate each item against prior items before applying any final value. The
+        // attributes have different guards (PostgreSQL variable.c), including idempotence.
+        let readOnly = current.readOnly;
+        let isolation = current.isolation;
+        for (const mode of statement.transactionModes) {
+          if (mode.kind === "access") {
+            if (!mode.readOnly && readOnly && current.savepoints.length > 0)
+              throw new TypeError(
+                "cannot set transaction read-write mode inside a read-only transaction",
+              );
+            if (!mode.readOnly && readOnly && current.queried)
+              throw new TypeError("transaction read-write mode must be set before any query");
+            readOnly = mode.readOnly;
+          } else if (mode.kind === "isolation") {
+            if (mode.level !== isolation) {
+              if (current.queried)
+                throw new TypeError(
+                  "SET TRANSACTION ISOLATION LEVEL must be called before any query",
+                );
+              if (current.savepoints.length > 0)
+                throw new TypeError(
+                  "SET TRANSACTION ISOLATION LEVEL must not be called in a subtransaction",
+                );
+            }
+            isolation = mode.level;
+          } else {
+            if (current.savepoints.length > 0)
+              throw new TypeError(
+                "SET TRANSACTION [NOT] DEFERRABLE cannot be called within a subtransaction",
+              );
+            if (current.queried)
+              throw new TypeError(
+                "SET TRANSACTION [NOT] DEFERRABLE must be called before any query",
+              );
+          }
+        }
+        current.readOnly = readOnly;
+        current.isolation = isolation;
+      }
+      return { kind: "set", action: statement.action, name: statement.name };
+    }
+    // A SELECT is admitted by `query`, below; SET and SHOW are not statements of it.
+    if (
+      current !== undefined &&
+      statement.kind !== "select" &&
+      statement.kind !== "set" &&
+      statement.kind !== "show"
+    )
+      admitToTransaction(current, { write: statement });
     if (statement.kind === "select") {
       return {
         kind: "rows",
@@ -14305,6 +14488,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
   async #runTransactionStatement(
     action: "begin" | "commit" | "rollback" | "savepoint" | "rollback-to" | "release",
     name?: string,
+    modes?: readonly TransactionMode[],
   ): Promise<ExecuteResult> {
     if (action === "begin") {
       if (this.#openTransaction !== undefined) {
@@ -14339,12 +14523,17 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         failStart(error);
       });
       const session = await opened;
+      let isolation: OpenStatementTransaction["isolation"] = "read committed";
+      for (const mode of modes ?? []) if (mode.kind === "isolation") isolation = mode.level;
       const state = {
         session,
         settle,
         busy: 0,
         activeAt: dateMilliseconds(this.#now()),
         savepoints: [],
+        readOnly: accessMode(modes) === true,
+        isolation,
+        queried: false,
         finished: finished.then(
           ({ version }) => ({ version }),
           (error: unknown) => {
@@ -14395,7 +14584,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
           );
         }
         const checkpoint = await open.session.checkpoint();
-        open.savepoints.push({ name, checkpoint, retainedBytes });
+        open.savepoints.push({ name, checkpoint, retainedBytes, readOnly: open.readOnly });
       });
       return { kind: "transaction", action, name };
     }
@@ -14413,10 +14602,15 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         const checkpoint = open.savepoints[index]?.checkpoint;
         if (checkpoint === undefined) throw new Error(`Savepoint disappeared: ${name}`);
         await this.#duringTransaction(open, () => open.session.rollbackTo(checkpoint));
-        // The named marker remains usable; everything established after it is gone.
+        // The named marker remains usable; everything established after it is gone, the
+        // access mode set since included (a subtransaction's SET TRANSACTION, as PostgreSQL).
+        open.readOnly = open.savepoints[index]?.readOnly ?? open.readOnly;
         open.savepoints.splice(index + 1);
       } else {
-        // PostgreSQL RELEASE closes the named marker and every marker nested inside it.
+        // PostgreSQL RELEASE closes the named marker and every marker nested inside it. A
+        // subtransaction's access mode ends with it, released or rolled back (xact.c restores
+        // the parent's XactReadOnly either way).
+        open.readOnly = open.savepoints[index]?.readOnly ?? open.readOnly;
         open.savepoints.splice(index);
       }
       return { kind: "transaction", action, name };
@@ -15273,6 +15467,12 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     statement: CompiledStatement,
     options: RunStatementOptions = {},
   ): Promise<ExecuteResult> {
+    if (
+      statement.kind === "transaction" ||
+      (statement.kind === "set" && statement.transactionModes !== undefined)
+    ) {
+      return this.#serializeExecute(() => this.#executeCompiledSerial(statement, undefined, {}));
+    }
     // A catalog statement takes one turn as the database's writer for the whole of its
     // validation and publication, so no coordinated writer in any tab can be mid-transaction
     // against the schema it replaces. CREATE INDEX manages its own turns: it marks the index
@@ -15845,10 +16045,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         return { kind: "drop-trigger", name: statement.name };
       }
       if (statement.kind === "transaction") {
-        const action = statement.action === "rollback-to" ? "ROLLBACK TO" : statement.action;
-        return this.execute(
-          `${action}${statement.name === undefined ? "" : ` ${quoteSqlIdentifier(statement.name)}`}`,
-        );
+        return this.#serializeExecute(() => this.#executeCompiledSerial(statement, undefined, {}));
       }
       if (options.writer === undefined) {
         // Selection, assignment evaluation, constraint proofs, trigger derivation, and the write

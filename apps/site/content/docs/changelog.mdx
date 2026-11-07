@@ -10,12 +10,157 @@ compatibility policy and release process.
 
 ## Unreleased
 
-Not yet released. The next release will name its packages here.
+`SET TRANSACTION` now checks isolation and deferrability as well as access mode,
+through SQL and compiled commands. Changing isolation after a query or inside a
+savepoint fails with 25001; setting the already-requested level again is allowed.
+Both DEFERRABLE values are refused in either context, including unchanged values.
+Items are checked in written order and valid changes preserve earlier writes.
+The requested level defaults to READ COMMITTED. Execution still uses the engine's
+fixed snapshot for all accepted weaker levels; SERIALIZABLE remains unsupported.
+**Migration:** set changed isolation and DEFERRABLE before queries and savepoints.
+There is no stored-format change and no public type change.
+
+READ ONLY admission now counts a locking CTE referenced only by another CTE that the final
+SELECT does not use, as PostgreSQL does. Chains and locking views contribute their strongest
+intent even when the final query has a weaker clause. Both the base and step of a
+referenced recursive declaration count, including a step reached only by an unused referrer.
+`CompiledQuery.rowLockingCtes` is an
+optional additive field retaining these admission-only bodies for catalog/view expansion
+and compiled-plan transport; it does not add execution sources. Only a CTE with zero
+references in a planned query scope is omitted. No stored-format change.
+
+SET TRANSACTION now checks each access-mode item in written order, including through
+compiled `runStatement`. A READ ONLY item can make a later READ WRITE item invalid (25001)
+inside a savepoint or after a query, even when the final value would have matched the old
+mode. Specify only the final desired access mode before queries and savepoints. Compiled
+mode arrays retain their existing ordered shape. No stored-format change.
+
+A CTE with zero references contributes no locking intent. A referenced
+CTE's own clause still counts, including a reference from a CTE the final SELECT does not use. Parsing and view expansion share the same lock-target and
+strongest-lock rules with the internal rebuild lowerer. No stored-format change.
+
+Not yet released. Some SQL that used to run now fails, and some now answers differently, so the
+next release is a minor one, as the [versioning policy](/docs/reference/versioning) requires
+during 0.x. It will name its packages here. Each change says what to rewrite; the **Migration**
+list below collects them.
 
 - The exported query-plan type `CompiledStatement` gains three optional fields: `truncate` on a
   delete that came from `TRUNCATE`, and `declaredTypeName` and `declaredLength` on column
   definitions, which keep the declared `NUMERIC`/`DECIMAL` spelling and `VARCHAR(n)`/`CHAR(n)`
   width. They are additive; nothing needs to change.
+- **ORDER BY a qualified column you do not select now sorts by that column.** When another
+  selected column had the same name, Minnow sorted by the selected one instead. For example,
+  this query sorted by `o.id`:
+
+  ```sql
+  SELECT o.id, c.name FROM c FULL JOIN o ON o.cid = c.id ORDER BY c.id
+  ```
+
+  The same happened with a window function in the select list over any join, and with a
+  `USING` join, where `ORDER BY c.k` could sort by the merged `k` column. Results now match
+  PostgreSQL: a qualified name such as `c.id` always means that table's column, never an
+  output column with the same name.
+
+- Queries of that shape that Minnow refused with "ORDER BY requires a selected column or
+  output alias" now run. For example: `SELECT name AS id FROM c ORDER BY c.id`.
+- With `SELECT DISTINCT`, such a qualified `ORDER BY` key that is not selected now fails with
+  "SELECT DISTINCT orders by selected columns or output aliases only". For example,
+  `SELECT DISTINCT o.id FROM c JOIN o ON o.cid = c.id ORDER BY c.id` used to sort by `o.id`.
+  PostgreSQL refuses it too, since sorting by `c.id` would need a column `DISTINCT` does not keep.
+  Select the sort key, or order by a selected expression.
+
+- **A correlated subquery over an aggregate now applies its LIMIT and OFFSET after
+  aggregating.** `(SELECT max(v) FROM b WHERE b.id = a.id LIMIT 1)` limited the rows before
+  taking the maximum, so it returned the first matching value instead of the largest. `SUM`,
+  `COUNT` and the other aggregates had the same problem, in the select list and in `WHERE`.
+  An aggregate without `GROUP BY` returns one row, so `LIMIT 1` now changes nothing, and
+  `LIMIT 0` or a positive `OFFSET` makes the subquery empty and its value `NULL`, as in
+  PostgreSQL.
+  `ORDER BY 1` inside such a subquery is also accepted now.
+- **`EXISTS` over a correlated aggregate is now true.** `EXISTS (SELECT max(v) FROM b WHERE
+b.id = a.id)` was false when no row of `b` matched. An aggregate without `GROUP BY` always
+  returns one row, so the subquery is never empty, unless `LIMIT 0` or an `OFFSET` removes that
+  row. `NOT EXISTS` changes the same way.
+- **`DISTINCT ON` now requires `ORDER BY` to start with its expressions**, as PostgreSQL does.
+  `SELECT DISTINCT ON (id) id, v FROM b ORDER BY v, id` used to run and keep an arbitrary row
+  per `id`. It now fails with "SELECT DISTINCT ON expressions must match initial ORDER BY
+  expressions". Put the `DISTINCT ON` expressions first in `ORDER BY` to keep the query working.
+  The same expression spelled differently still matches (`id + 0` and `b.id + 0`), but the same
+  column name from another source does not: `DISTINCT ON (a.id + 0) … ORDER BY b.id + 0` fails.
+- **Positions in `DISTINCT ON` and its `ORDER BY` now name select-list items.**
+  `SELECT DISTINCT ON (1) id, v FROM b ORDER BY 1, 2 DESC` treated `1` and `2` as constants: it
+  returned a single row and ignored the sort. They now mean the first and second selected
+  columns, as in PostgreSQL. A position past the select list fails with "DISTINCT ON position
+  … is not in select list". With `SELECT *` such positions cannot be resolved yet, so
+  `SELECT DISTINCT ON (1) * …` (which returned one row) now fails with "DISTINCT ON positions
+  cannot be used with SELECT \*; name the columns", as plain `ORDER BY 1` over `SELECT *` already
+  did.
+
+- **`READ ONLY` transactions are read-only.** `BEGIN READ ONLY` and `SET TRANSACTION READ ONLY`
+  were accepted and ignored, so writes inside them succeeded. Now `INSERT`, `UPDATE`, `DELETE`,
+  `MERGE`, `TRUNCATE`, schema changes, `nextval` and row locks (`SELECT … FOR UPDATE`,
+  `FOR SHARE`, `FOR NO KEY UPDATE`, `FOR KEY SHARE`, also when written inside a view the statement
+  reads) in a read-only transaction fail with
+  "cannot execute … in a read-only transaction", as in PostgreSQL. That applies through
+  `execute`, `query`, `queryCursor`, a built query's `run` and live subscriptions alike.
+  Compiled `BEGIN` and `SET TRANSACTION` commands passed to `runStatement` keep their access
+  modes and use the same serial execution path as SQL text. As in
+  PostgreSQL, `nextval` is refused when it runs: `currval` works, and so does a `nextval` that no
+  row evaluates (a `CASE` branch not taken, a false `WHERE`). Open the transaction with
+  `BEGIN` (or `READ WRITE`) to write. An outer locking clause reaches tables inside FROM
+  subqueries, but leaves CTE references and constant-only sources unlocked, as in PostgreSQL.
+  - Switching back with `SET TRANSACTION READ WRITE` fails with "transaction read-write mode
+    must be set before any query" once the transaction has run a statement (a `query` call
+    counts), and with "cannot set transaction read-write mode inside a read-only transaction"
+    inside a savepoint. Setting `READ WRITE` when the transaction is already read-write is fine.
+  - A mode set after `SAVEPOINT` ends with the savepoint: `ROLLBACK TO` and `RELEASE` return to
+    the mode the transaction had when the savepoint was set, as in PostgreSQL.
+  - The exported query-plan type `CompiledQuery` gains an optional `rowLocking` field, the
+    strongest row lock the statement asks for. It is additive; nothing needs to change.
+- **Transaction statements follow PostgreSQL's grammar.** `BEGIN`, `START TRANSACTION` and
+  `SET TRANSACTION` accepted their keywords in any order and ignored anything else, so
+  `BEGIN ONLY READ` and `BEGIN 'READ ONLY'` ran. They now fail with `syntax error at or near …`.
+  Modes may be separated by spaces or commas. Mode items are checked in written
+  order; if every item is valid, the last mode of each kind applies.
+  `SET SESSION CHARACTERISTICS AS TRANSACTION` is refused with a message that says so.
+- **A FROM clause that names a source twice fails earlier, with PostgreSQL's message.**
+  `SELECT a.id FROM a a, b a` already failed when it ran, with "Table aliases must be unique".
+  It now fails while the statement compiles, with `table name "a" specified more than once`. The
+  same applies to `UPDATE … FROM` and `DELETE … USING` when a source has the target's name. No
+  query that ran before stops running; code that matched the old message must match the new one.
+  Give each source its own alias.
+
+- **Unknown names are reported before grouping errors.** `SELECT id FROM a GROUP BY nope`
+  reported that `id` must appear in `GROUP BY`; it now reports the unknown column, as
+  PostgreSQL does. The same holds for `HAVING` and unknown table qualifiers. `count(z.*)` over
+  a table `z` that is not in the `FROM` clause now fails with "missing FROM-clause entry for
+  table" instead of counting rows.
+- **Clearer errors for calls with arguments their function does not take.** `now(1)` and
+  `row_number(1) OVER ()` failed with "Expected )"; they now say the function takes no
+  arguments, `rank(1) OVER ()` says it needs `WITHIN GROUP`, and `CURRENT_TIMESTAMP(3)` says a
+  precision is not supported.
+- **`NATURAL FULL JOIN` is refused with a clear message**, "NATURAL FULL JOIN is not supported;
+  name the shared columns", instead of failing with "JOIN condition must reference the new
+  alias". Write `FULL JOIN … USING (columns)` instead.
+- **Block comments nest**, as in PostgreSQL: `/* outer /* inner */ still outer */` is one
+  comment. It used to end at the first `*/`, so the rest became part of the statement.
+
+**Migration.** There is no stored-data step: databases open as before. The SQL changes need
+these rewrites where an application uses the old forms:
+
+- Put the `DISTINCT ON` expressions first in `ORDER BY`, from the same sources.
+- Name the columns instead of using `DISTINCT ON` positions with `SELECT *`.
+- With `SELECT DISTINCT`, select any qualified `ORDER BY` key, or order by a selected expression.
+- Replace `count(z.*)` over a `z` that is not in `FROM` with `count(*)` or a real source alias.
+- Open transactions that write with `BEGIN` or `BEGIN READ WRITE`, not `READ ONLY`, and leave
+  savepoints before switching a read-only transaction back to `READ WRITE`.
+- Write transaction modes in PostgreSQL's grammar.
+- Close every nested `/*` with its own `*/`.
+- Expect changed answers, with no rewrite, where these fixes apply: `ORDER BY` a qualified
+  unselected column, a correlated aggregate with `LIMIT` or `OFFSET`, `EXISTS` over a
+  correlated aggregate, and `DISTINCT ON` positions.
+
+No stored format changes.
 
 ## 0.19.3 — November 5, 2026
 

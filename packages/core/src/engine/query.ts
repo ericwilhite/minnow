@@ -1,3 +1,9 @@
+import {
+  sourceLocksRelation,
+  strongestRowLock,
+  withRowLock,
+  withRowLockCtes,
+} from "./row-locking.js";
 import { checkedInteger, checkedSum } from "./integer-exactness.js";
 import { castSqlValue, datetimeText } from "./sql-casts.js";
 import { parseJson } from "../block-format/json-parse.js";
@@ -37,6 +43,7 @@ import type {
   QueryRow,
   QueryValue,
   RecursiveCte,
+  RowLocking,
   ScalarFunctionName,
   SelectItem,
   SelectTail,
@@ -47,7 +54,7 @@ import type {
   WindowFrameExclusion,
   WindowSpec,
 } from "../plan/model.js";
-import { crossJoinPlan } from "../plan/model.js";
+import { DUAL_TABLE, crossJoinPlan } from "../plan/model.js";
 export type {
   AggregateName,
   BinaryOperator,
@@ -1056,7 +1063,7 @@ interface Token {
  * table (parentheses never survive identifier parsing unquoted), and its single hidden column
  * keeps the row alive through columnar conversion, which derives row count from column vectors.
  */
-export const DUAL_TABLE = "(dual)";
+export { DUAL_TABLE } from "../plan/model.js";
 
 /** The dual source's single row, shared by every resolution path. */
 export function dualTableRows(): DatabaseRow[] {
@@ -1381,6 +1388,8 @@ export function compileQuery(sql: string, options: CompileQueryOptions = {}): Co
     if (parser.usesStatementDatetime) block.usesStatementDatetime = true;
     if (parser.usesSequenceCalls) block.usesSequenceCalls = true;
     if (parser.usesVolatileFunctions) block.usesVolatileFunctions = true;
+    withRowLockCtes(block, parser.rowLockingCtes);
+    withRowLock(block, parser.rowLocking);
   }
   return compiled;
 }
@@ -1630,7 +1639,14 @@ export type CompiledStatement =
     }
   | { kind: "drop-view"; view: string; ifExists?: boolean; parameterCount?: number }
   /** A session setting, accepted and ignored: `SET name TO value`, `RESET name`. */
-  | { kind: "set"; action: "set" | "reset"; name: string; parameterCount?: number }
+  | {
+      kind: "set";
+      action: "set" | "reset";
+      name: string;
+      parameterCount?: number;
+      /** SET TRANSACTION's modes, in written order: they change the current transaction. */
+      transactionModes?: TransactionMode[];
+    }
   /** `SHOW name`: the engine's value for a PostgreSQL setting, as one row. */
   | { kind: "show"; name: string; parameterCount?: number }
   | {
@@ -1638,6 +1654,8 @@ export type CompiledStatement =
       action: "begin" | "commit" | "rollback" | "savepoint" | "rollback-to" | "release";
       name?: string;
       parameterCount?: number;
+      /** BEGIN / START TRANSACTION's modes, in written order (absent when none). */
+      modes?: TransactionMode[];
     }
   | {
       kind: "merge";
@@ -1755,15 +1773,21 @@ function parseSettingStatement(keyword: string, tokens: Token[]): CompiledStatem
     }
     return { kind: "set", action: "set", name: "timezone" };
   }
-  if (upperAt(index) === "TRANSACTION" || upperAt(index) === "CONSTRAINTS") {
-    // Every transaction reads one snapshot and commits atomically, which satisfies READ
-    // UNCOMMITTED, READ COMMITTED, and REPEATABLE READ; SERIALIZABLE promises more than that.
-    if (words.some((word) => word.text.toUpperCase() === "SERIALIZABLE")) {
-      throw new TypeError(
-        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE is not supported: the engine has one isolation level",
-      );
+  if (index === 2 && upperAt(1) === "SESSION" && upperAt(2) === "CHARACTERISTICS") {
+    throw new TypeError(
+      "SET SESSION CHARACTERISTICS AS TRANSACTION is not supported: set each transaction's mode with BEGIN or SET TRANSACTION",
+    );
+  }
+  if (upperAt(index) === "TRANSACTION") {
+    const transactionModes = parseTransactionModes(words, index + 1, "SET TRANSACTION");
+    if (transactionModes.length === 0) {
+      const last = words.at(-1);
+      throw new SqlCompileError("syntax error at end of input", last?.end ?? 0, 0);
     }
-    return { kind: "set", action: "set", name: (upperAt(index) ?? "").toLowerCase() };
+    return { kind: "set", action: "set", name: "transaction", transactionModes };
+  }
+  if (upperAt(index) === "CONSTRAINTS") {
+    return { kind: "set", action: "set", name: "constraints" };
   }
   const name = words[index];
   if (name?.kind !== "identifier") {
@@ -1869,52 +1893,113 @@ function parseTransactionStatement(keyword: string, tokens: Token[]): CompiledSt
     }
     return { kind: "transaction", action: "rollback-to", name };
   }
-  const words = tokens
-    .filter((token) => token.kind === "identifier")
-    .map((token) => token.text.toUpperCase());
-  const action =
-    keyword === "START" || keyword === "BEGIN"
-      ? "begin"
-      : keyword === "END"
-        ? "commit"
-        : keyword === "ABORT"
-          ? "rollback"
-          : keyword.toLowerCase();
-  if (words.includes("SERIALIZABLE")) {
-    throw new TypeError(
-      "BEGIN ISOLATION LEVEL SERIALIZABLE is not supported: the engine has one isolation level",
-    );
+  // BEGIN [WORK | TRANSACTION] [mode [[,] mode] …], START TRANSACTION [modes],
+  // COMMIT | END | ROLLBACK | ABORT [WORK | TRANSACTION] (PostgreSQL's grammar).
+  const upper = (index: number): string | undefined => {
+    const token = tokens[index];
+    return token?.kind === "identifier" && token.quoted !== true
+      ? token.text.toUpperCase()
+      : undefined;
+  };
+  let index = 1;
+  if (keyword === "START") {
+    if (upper(index) !== "TRANSACTION") throw new TypeError("Expected START TRANSACTION");
+    index += 1;
+  } else if (upper(index) === "WORK" || upper(index) === "TRANSACTION") index += 1;
+  const begins = keyword === "START" || keyword === "BEGIN";
+  const action = begins
+    ? "begin"
+    : keyword === "END"
+      ? "commit"
+      : keyword === "ABORT"
+        ? "rollback"
+        : (keyword.toLowerCase() as "commit" | "rollback");
+  if (!begins) {
+    const extra = tokens[index];
+    if (extra !== undefined && extra.kind !== "eof")
+      throw new TypeError(`${keyword} takes no ${extra.text}: this engine has one isolation level`);
+    return { kind: "transaction", action };
   }
-  // READ ONLY / READ WRITE / [NOT] DEFERRABLE name transaction modes the engine already has.
-  const allowed = new Set([
-    "BEGIN",
-    "START",
-    "COMMIT",
-    "END",
-    "ROLLBACK",
-    "ABORT",
-    "WORK",
-    "TRANSACTION",
-    "READ",
-    "ONLY",
-    "WRITE",
-    "NOT",
-    "DEFERRABLE",
-    "ISOLATION",
-    "LEVEL",
-    "COMMITTED",
-    "UNCOMMITTED",
-    "REPEATABLE",
-  ]);
-  for (const word of words) {
-    if (!allowed.has(word)) {
-      throw new TypeError(`${keyword} takes no ${word}: this engine has one isolation level`);
+  const modes = parseTransactionModes(tokens, index, "BEGIN");
+  return { kind: "transaction", action, ...(modes.length === 0 ? {} : { modes }) };
+}
+
+/**
+ * One transaction mode as written (PostgreSQL's `transaction_mode`), in order, including
+ * duplicates. Validate each item in order before using the last value of each kind.
+ */
+export type TransactionMode =
+  | { readonly kind: "access"; readonly readOnly: boolean }
+  | {
+      readonly kind: "isolation";
+      readonly level: "read uncommitted" | "read committed" | "repeatable read";
     }
+  | { readonly kind: "deferrable"; readonly deferrable: boolean };
+
+/**
+ * `mode [[,] mode] …` from `tokens[start]` to the end. Every transaction reads one snapshot and
+ * commits atomically, which satisfies READ UNCOMMITTED, READ COMMITTED and REPEATABLE READ;
+ * SERIALIZABLE promises more than that and is refused.
+ */
+function parseTransactionModes(
+  tokens: readonly Token[],
+  start: number,
+  statement: string,
+): TransactionMode[] {
+  const upper = (index: number): string | undefined => {
+    const token = tokens[index];
+    return token?.kind === "identifier" && token.quoted !== true
+      ? token.text.toUpperCase()
+      : undefined;
+  };
+  const syntax = (index: number): never => {
+    const token = tokens[index];
+    throw new SqlCompileError(
+      `syntax error at or near "${token?.kind === "eof" || token === undefined ? "end of input" : token.text}"`,
+      token?.start ?? 0,
+      token === undefined || token.kind === "eof" ? 0 : token.end - token.start,
+    );
+  };
+  const modes: TransactionMode[] = [];
+  let index = start;
+  const done = () => tokens[index] === undefined || tokens[index]?.kind === "eof";
+  while (!done()) {
+    if (modes.length > 0 && tokens[index]?.kind === "punctuation" && tokens[index]?.text === ",") {
+      index += 1;
+      if (done()) syntax(index);
+    }
+    const word = upper(index);
+    if (word === "READ" && (upper(index + 1) === "ONLY" || upper(index + 1) === "WRITE")) {
+      modes.push({ kind: "access", readOnly: upper(index + 1) === "ONLY" });
+      index += 2;
+    } else if (word === "DEFERRABLE") {
+      modes.push({ kind: "deferrable", deferrable: true });
+      index += 1;
+    } else if (word === "NOT" && upper(index + 1) === "DEFERRABLE") {
+      modes.push({ kind: "deferrable", deferrable: false });
+      index += 2;
+    } else if (word === "ISOLATION" && upper(index + 1) === "LEVEL") {
+      const level = upper(index + 2);
+      if (level === "SERIALIZABLE")
+        throw new TypeError(
+          `${statement} ISOLATION LEVEL SERIALIZABLE is not supported: the engine has one isolation level`,
+        );
+      if (level === "REPEATABLE" && upper(index + 3) === "READ") {
+        modes.push({ kind: "isolation", level: "repeatable read" });
+        index += 4;
+      } else if (
+        level === "READ" &&
+        (upper(index + 3) === "COMMITTED" || upper(index + 3) === "UNCOMMITTED")
+      ) {
+        modes.push({
+          kind: "isolation",
+          level: upper(index + 3) === "COMMITTED" ? "read committed" : "read uncommitted",
+        });
+        index += 4;
+      } else syntax(index + 2);
+    } else syntax(index);
   }
-  if (keyword === "START" && words[1] !== "TRANSACTION") {
-    throw new TypeError("Expected START TRANSACTION");
-  }
-  return { kind: "transaction", action: action as "begin" | "commit" | "rollback" };
+  return modes;
 }
 
 /**
@@ -3703,7 +3788,6 @@ export function referencedColumns(
   if (new Set(sourceAliases).size !== sourceAliases.length)
     throw new TypeError("Table aliases must be unique");
   plan = unifyPlanGroupedReferences(plan, (tableName) => schemas.get(tableName));
-  validateGrouping(plan);
   const aliases = new Map(sources.map((source) => [source.alias, source.table]));
   const requested = new Map<string, Set<string>>(
     sources.map((source) => [source.table, new Set<string>()]),
@@ -3757,7 +3841,62 @@ export function referencedColumns(
   };
   for (const expression of expressions) collect(expression, false);
   for (const { expression } of plan.orderBy) collect(expression, true);
+  for (const expression of expressions) assertWildcardSources(expression, sourceAliases);
+  // Grouping is judged once every name resolved: an unknown name is reported as unknown
+  // (PostgreSQL), not as an ungrouped column.
+  validateGrouping(plan);
   return new Map([...requested].map(([table, columns]) => [table, [...columns]]));
+}
+
+/** A `t.*` argument (`count(t.*)`) names one of the block's sources (PostgreSQL's 42P01). */
+function assertWildcardSources(expression: Expression, aliases: readonly string[]): void {
+  for (const child of childExpressions(expression)) {
+    if (child.kind === "wildcard" && child.table !== undefined && !aliases.includes(child.table))
+      throw new TypeError(`missing FROM-clause entry for table "${child.table}"`);
+    assertWildcardSources(child, aliases);
+  }
+}
+
+/**
+ * Before grouping is judged (lowering's path, prepareColumnarShape): every name the top-level
+ * block reads resolves, else PostgreSQL's error for it — `missing FROM-clause entry for table
+ * "z"` (42P01) for a qualifier no source has, `column "x" does not exist` (42703) for a name no
+ * source has. A source whose columns are unknown here (a derived table) is assumed to have the
+ * name; a bare name may also be an output alias. The top-level block has no outer scope, so an
+ * unknown qualifier is an error there.
+ */
+function assertTopLevelNamesResolve(
+  plan: CompiledQuery,
+  columnsOf: (tableName: string) => readonly string[] | undefined,
+): void {
+  const sources = [plan.base, ...plan.joins];
+  const aliases = sources.map((source) => source.alias);
+  const known = sources.map((source) => columnsOf(source.table));
+  const outputs = new Set(plan.select.map((item) => item.alias));
+  const check = (expression: Expression): void => {
+    for (const reference of expressionColumns(expression)) {
+      const dot = reference.indexOf(".");
+      if (dot !== -1) {
+        const position = aliases.indexOf(reference.slice(0, dot));
+        if (position === -1)
+          throw new TypeError(`missing FROM-clause entry for table "${reference.slice(0, dot)}"`);
+        const columns = known[position];
+        if (columns !== undefined && !columns.includes(reference.slice(dot + 1)))
+          throw new TypeError(`column ${reference} does not exist`);
+      } else if (
+        !outputs.has(reference) &&
+        known.every((columns) => columns !== undefined && !columns.includes(reference))
+      )
+        throw new TypeError(`column "${reference}" does not exist`);
+    }
+    assertWildcardSources(expression, aliases);
+  };
+  for (const expression of plan.groupBy) check(expression);
+  for (const predicate of plan.having) {
+    check(predicate.left);
+    check(predicate.right);
+  }
+  for (const item of plan.select) if (item.expression.kind !== "wildcard") check(item.expression);
 }
 
 /**
@@ -3908,6 +4047,7 @@ export function prepareColumnarShape(
   plan = expandQualifiedWildcards(plan, columnsOf);
   plan = expandDistinctWildcard(plan, columnsOf);
   plan = unifyPlanGroupedReferences(plan, columnsOf);
+  if (plan.base.table !== DUAL_TABLE) assertTopLevelNamesResolve(plan, columnsOf);
   validateGrouping(plan);
   return plan;
 }
@@ -6092,6 +6232,15 @@ function exactConstantFold(
  * for execution to report.
  */
 function resolveExactNumericConstants(expression: Expression): Expression {
+  // Lowering types and folds constants itself, after overload resolution (PostgreSQL's types:
+  // `9007199254740993 - 1` is bigint arithmetic, not a NUMERIC constant).
+  if (
+    recordDeclaredTypes &&
+    expression.kind !== "subquery" &&
+    expression.kind !== "exists" &&
+    expression.kind !== "window"
+  )
+    return mapChildExpressions(expression, resolveExactNumericConstants);
   if (expression.kind === "call" && expression.name === "CAST") {
     const [source, target] = expression.arguments;
     if (source !== undefined && target?.kind === "literal" && target.value === "number-integer") {
@@ -8158,6 +8307,12 @@ class Parser {
   usesStatementDatetime = false;
   /** Set when the statement names NEXTVAL or CURRVAL. */
   usesSequenceCalls = false;
+  /**
+   * The strongest row lock a `FOR UPDATE | NO KEY UPDATE | SHARE | KEY SHARE` clause asks for
+   * over a real source, anywhere in the statement (PostgreSQL refuses it in a read-only
+   * transaction, naming the strongest). Locks are otherwise ignored.
+   */
+  rowLocking: RowLocking | undefined;
   /** Set when the statement names a volatile scalar function. */
   usesVolatileFunctions = false;
 
@@ -8170,7 +8325,11 @@ class Parser {
     this.#derivedSequence += 1;
     return this.#derivedSequence;
   };
+  /** CTEs planned in this query scope; nested declarations are isolated with their body. */
+  rowLockingCtes: CompiledQuery[] = [];
+  readonly #cteRefCounts = new WeakMap<CompiledQuery, number>();
   readonly #ctes = new Map<string, CompiledQuery>();
+  readonly #cteReferences = new WeakSet<CompiledQuery>();
   /** Named windows of the block being parsed: `WINDOW w AS (...)`, referenced by `OVER w`. */
   #namedWindows = new Map<string, { start: number; end: number }>();
   readonly #ctesInProgress = new Set<string>();
@@ -8185,8 +8344,9 @@ class Parser {
     this.text = text;
   }
 
-  #withClause(): void {
-    if (!this.#isKeyword("WITH")) return;
+  #withClause(): CompiledQuery[] {
+    if (!this.#isKeyword("WITH")) return [];
+    const declarations: CompiledQuery[] = [];
     this.#keyword("WITH");
     let recursive = false;
     if (this.#isKeyword("RECURSIVE")) {
@@ -8211,6 +8371,10 @@ class Parser {
         this.#keyword("MATERIALIZED");
       }
       this.#expectPunctuation("(");
+      const outerLocking = this.rowLocking;
+      const outerCtes = this.rowLockingCtes;
+      this.rowLocking = undefined;
+      this.rowLockingCtes = [];
       if (recursive) {
         this.#recursiveCte(name, columns);
       } else {
@@ -8221,8 +8385,30 @@ class Parser {
         if (columns !== undefined) renameBlockOutputs(block, columns, name);
         this.#ctes.set(name, block);
       }
+      const recursiveBody = this.#recursiveCtes.get(name);
+      const body = this.#ctes.get(name) ?? recursiveBody?.base;
+      if (body !== undefined) {
+        // Retain both members under the declaration's external reference count. Its
+        // self-reference alone does not plan it; an unused sibling's reference does.
+        if (recursiveBody !== undefined)
+          this.rowLockingCtes.push(
+            withRowLock(recursiveBody.step, expandRowLockCteViews(recursiveBody.step)),
+          );
+        withRowLockCtes(body, this.rowLockingCtes);
+        withRowLock(body, expandRowLockCteViews(body));
+        declarations.push(body);
+      }
+      this.rowLocking = outerLocking;
+      this.rowLockingCtes = outerCtes;
       if (!this.#punctuation(",")) break;
     }
+    return declarations;
+  }
+
+  /** PG skips a SELECT CTE only at refcount zero, even when its referrer is unused. */
+  #recordRowLockCtes(declarations: readonly CompiledQuery[]): void {
+    for (const body of declarations)
+      if ((this.#cteRefCounts.get(body) ?? 0) > 0) this.rowLockingCtes.push(body);
   }
 
   /** The optional `(a, b, c)` between a CTE's name and its AS. */
@@ -8255,9 +8441,10 @@ class Parser {
   }
 
   parse(sql: string): CompiledQuery {
-    this.#withClause();
+    const declarations = this.#withClause();
     const plan = this.#queryExpression(sql);
     this.#take("eof");
+    this.#recordRowLockCtes(declarations);
     return plan;
   }
 
@@ -8272,8 +8459,10 @@ class Parser {
       // restored afterwards and an inner CTE cannot leak out of the subquery that declared it.
       const outer = new Map(this.#ctes);
       try {
-        this.#withClause();
-        return this.#queryExpression(sql);
+        const declarations = this.#withClause();
+        const plan = this.#queryExpression(sql);
+        this.#recordRowLockCtes(declarations);
+        return plan;
       } finally {
         this.#ctes.clear();
         for (const [name, block] of outer) this.#ctes.set(name, block);
@@ -8322,7 +8511,7 @@ class Parser {
   /** The clauses that close a query expression: ORDER BY, then LIMIT/OFFSET or OFFSET/FETCH. */
   #compoundTail(): SelectTail {
     const tail = { orderBy: this.#orderByClause(), ...this.#tailClauses() };
-    this.#lockingClause();
+    this.#lockingClause(true);
     return tail;
   }
 
@@ -9691,6 +9880,7 @@ class Parser {
       throw new TypeError("UPDATE assignments must set each column once");
     }
     const from = this.#mutationSources("FROM");
+    if (from !== undefined) assertDistinctSourceNames([from.base, ...from.joins], alias ?? table);
     const predicates = this.#mutationPredicates();
     return {
       kind: "update",
@@ -9738,6 +9928,7 @@ class Parser {
     const table = this.#identifier();
     const alias = this.#mutationAlias("WHERE", "USING", "RETURNING");
     const from = this.#mutationSources("USING");
+    if (from !== undefined) assertDistinctSourceNames([from.base, ...from.joins], alias ?? table);
     const predicates = this.#mutationPredicates();
     return {
       kind: "delete",
@@ -9941,28 +10132,49 @@ class Parser {
   /** LIMIT/OFFSET in either dialect order: LIMIT n [OFFSET m], or OFFSET m [FETCH FIRST ...]. */
   /**
    * `FOR UPDATE | NO KEY UPDATE | SHARE | KEY SHARE [OF table, …] [NOWAIT | SKIP LOCKED]`: row
-   * locks for concurrent sessions, which a single-session engine has no need of. Accepted and
-   * ignored so a query written for PostgreSQL runs unchanged.
+   * locks are not acquired. Retain the strongest clause that reaches a relation so a read-only
+   * transaction can refuse it, as PostgreSQL does.
    */
-  #lockingClause(): void {
+  #lockingClause(sources: true | TableSource[]): RowLocking | undefined {
+    let local: RowLocking | undefined;
     while (this.#isKeyword("FOR")) {
       this.#keyword("FOR");
-      if (this.#isKeyword("UPDATE")) this.#keyword("UPDATE");
-      else if (this.#isKeyword("SHARE")) this.#keyword("SHARE");
-      else if (this.#isKeyword("NO")) {
+      let strength: RowLocking;
+      if (this.#isKeyword("UPDATE")) {
+        this.#keyword("UPDATE");
+        strength = "UPDATE";
+      } else if (this.#isKeyword("SHARE")) {
+        this.#keyword("SHARE");
+        strength = "SHARE";
+      } else if (this.#isKeyword("NO")) {
         this.#keyword("NO");
         this.#keyword("KEY");
         this.#keyword("UPDATE");
+        strength = "NO KEY UPDATE";
       } else if (this.#isKeyword("KEY")) {
         this.#keyword("KEY");
         this.#keyword("SHARE");
+        strength = "KEY SHARE";
       } else {
         throw new TypeError(`Expected UPDATE or SHARE after FOR, found ${this.#peek().text}`);
       }
+      const targets: string[] = [];
       if (this.#isKeyword("OF")) {
         this.#keyword("OF");
-        this.#identifier();
-        while (this.#punctuation(",")) this.#identifier();
+        targets.push(this.#identifier());
+        while (this.#punctuation(",")) targets.push(this.#identifier());
+      }
+      // An outer lock propagates through FROM subqueries, but never through CTE references.
+      const locks =
+        sources === true ||
+        sources.some(
+          (source) =>
+            (targets.length === 0 || targets.includes(source.alias)) &&
+            sourceLocksRelation(source, this.#cteReferences),
+        );
+      if (locks) {
+        local = strongestRowLock([local, strength]);
+        this.rowLocking = strongestRowLock([this.rowLocking, strength]);
       }
       if (this.#isKeyword("NOWAIT")) this.#keyword("NOWAIT");
       else if (this.#isKeyword("SKIP")) {
@@ -9970,6 +10182,7 @@ class Parser {
         this.#keyword("LOCKED");
       }
     }
+    return local;
   }
 
   #tailClauses(): {
@@ -10124,30 +10337,36 @@ class Parser {
     }
     const orderBy = compoundMember ? [] : this.#orderByClause();
     const tail = compoundMember ? {} : this.#tailClauses();
-    if (!compoundMember) this.#lockingClause();
+    const locking = compoundMember ? undefined : this.#lockingClause([base, ...joins]);
     if (distinctOn !== undefined) {
-      return this.#distinctOnBlock(
-        sql,
-        distinctOn,
-        { base, joins, select, predicates, groupBy, having, orderBy, groupingSets },
-        tail,
+      return withRowLock(
+        this.#distinctOnBlock(
+          sql,
+          distinctOn,
+          { base, joins, select, predicates, groupBy, having, orderBy, groupingSets },
+          tail,
+        ),
+        locking,
       );
     }
-    return assembleSelectBlock(
-      {
-        sql,
-        base,
-        joins,
-        select,
-        distinct,
-        predicates,
-        groupBy,
-        having,
-        orderBy,
-        ...tail,
-        ...(groupingSets === undefined ? {} : { groupingSets }),
-      },
-      this.nextDerivedSequence,
+    return withRowLock(
+      assembleSelectBlock(
+        {
+          sql,
+          base,
+          joins,
+          select,
+          distinct,
+          predicates,
+          groupBy,
+          having,
+          orderBy,
+          ...tail,
+          ...(groupingSets === undefined ? {} : { groupingSets }),
+        },
+        this.nextDerivedSequence,
+      ),
+      locking,
     );
   }
 
@@ -10174,6 +10393,32 @@ class Parser {
     },
     tail: Omit<SelectTail, "orderBy">,
   ): CompiledQuery {
+    // An integer constant in DISTINCT ON or ORDER BY is a select-list position (PostgreSQL), so
+    // it names that item's output here, before the window and the outer block are built.
+    const position = (expression: Expression, clause: string): Expression => {
+      if (
+        expression.kind !== "literal" ||
+        typeof expression.value !== "number" ||
+        !Number.isInteger(expression.value)
+      )
+        return expression;
+      // A position needs the select list's width, which `*` only has after schema binding; read
+      // as a constant it would be one partition (one row). Refused, as plain ORDER BY is.
+      if (parts.select.some((item) => item.expression.kind === "wildcard"))
+        throw new TypeError(`${clause} positions cannot be used with SELECT *; name the columns`);
+      const item = parts.select[expression.value - 1];
+      if (item === undefined)
+        throw new TypeError(`${clause} position ${String(expression.value)} is not in select list`);
+      return { kind: "column", reference: item.alias };
+    };
+    distinctOn = distinctOn.map((expression) => position(expression, "DISTINCT ON"));
+    parts = {
+      ...parts,
+      orderBy: parts.orderBy.map((order) => ({
+        ...order,
+        expression: position(order.expression, "ORDER BY"),
+      })),
+    };
     const rowNumberAlias = "\0distinct_on";
     const innerSelect: SelectItem[] = [...parts.select];
     const aliased = new Map(
@@ -10191,6 +10436,7 @@ class Parser {
       }
       return expression;
     };
+    assertDistinctOnLeadsOrder(distinctOn, parts.orderBy, parts.select, windowExpression);
     const outerOrderBy: CompiledQuery["orderBy"] = [];
     parts.orderBy.forEach((order, index) => {
       const expression = order.expression;
@@ -10469,6 +10715,7 @@ class Parser {
     if (rightJoins > 0 && joins.length !== 1) {
       throw new TypeError("RIGHT JOIN is only supported as the sole join");
     }
+    assertDistinctSourceNames([base, ...joins]);
     return { base, joins, rightJoins };
   }
 
@@ -10962,7 +11209,10 @@ class Parser {
     const alias = this.#sourceAlias() ?? table;
     const cte = this.#ctes.get(table);
     if (cte !== undefined) {
+      this.#cteRefCounts.set(cte, (this.#cteRefCounts.get(cte) ?? 0) + 1);
+      this.rowLocking = strongestRowLock([this.rowLocking, cte.rowLocking]);
       const source = clonePlanTree(cte);
+      this.#cteReferences.add(source);
       if (this.#peek().text === "(") {
         this.#expectPunctuation("(");
         this.#applyColumnAliases(source);
@@ -10971,6 +11221,12 @@ class Parser {
     }
     const recursive = this.#recursiveCtes.get(table);
     if (recursive !== undefined) {
+      this.#cteRefCounts.set(recursive.base, (this.#cteRefCounts.get(recursive.base) ?? 0) + 1);
+      this.rowLocking = strongestRowLock([
+        this.rowLocking,
+        recursive.base.rowLocking,
+        recursive.step.rowLocking,
+      ]);
       return {
         table: `(recursive ${String(this.nextDerivedSequence())}) ${table}`,
         alias,
@@ -11614,6 +11870,8 @@ class Parser {
         value: tagged,
         internalSqlValue: true,
         sqlDomain: { kind: "numeric" },
+        // Lowering types an integer spelling as PostgreSQL does: bigint up to int8's range.
+        ...(recordDeclaredTypes ? { exactText: token.text } : {}),
       };
     }
     if (token.kind === "string") {
@@ -11752,6 +12010,18 @@ class Parser {
       // an explicit precision is not accepted, since the engine keeps milliseconds either way.
       if (this.#peek().text === "(") {
         this.#expectPunctuation("(");
+        // NOW has no overload with arguments (PostgreSQL's 42883); CURRENT_TIME,
+        // CURRENT_TIMESTAMP, LOCALTIME and LOCALTIMESTAMP take a precision PostgreSQL accepts and
+        // this engine does not. CURRENT_DATE takes none, a syntax error below.
+        if (this.#peek().text !== ")" && upper === "NOW")
+          throw new TypeError("NOW takes no arguments");
+        if (
+          this.#peek().text !== ")" &&
+          ["CURRENT_TIME", "CURRENT_TIMESTAMP", "LOCALTIME", "LOCALTIMESTAMP"].includes(upper)
+        )
+          throw new TypeError(
+            `${upper}(precision) is not supported: the engine keeps milliseconds`,
+          );
         this.#expectPunctuation(")");
       }
       this.usesStatementDatetime = true;
@@ -11785,6 +12055,8 @@ class Parser {
       // one SUBSTR call; the comma form falls through to the ordinary call path below.
       const restore = this.#index;
       this.#expectPunctuation("(");
+      // SUBSTRING() names no overload (PostgreSQL's 42883), not a malformed expression.
+      if (this.#peek().text === ")") throw new TypeError("SUBSTRING requires a string argument");
       const operand = this.#expression();
       if (this.#isKeyword("FROM")) {
         this.#keyword("FROM");
@@ -11907,6 +12179,15 @@ class Parser {
         upper === "PERCENT_RANK" ||
         upper === "CUME_DIST"
       ) {
+        if (this.#peek().text !== ")") {
+          // PostgreSQL: rank(x) … is the ordered-set aggregate (42809 without WITHIN GROUP),
+          // row_number(x) has no such overload (42883).
+          throw new TypeError(
+            upper === "ROW_NUMBER"
+              ? "ROW_NUMBER takes no arguments"
+              : `WITHIN GROUP is required for ordered-set aggregate ${upper.toLowerCase()}`,
+          );
+        }
         this.#expectPunctuation(")");
         this.#keyword("OVER");
         const { partitionBy, orderBy, frame } = this.#overClause();
@@ -12838,12 +13119,33 @@ function resolveOrderByOrdinals(
  * column the select list carries unqualified sorts by that output. Only a qualifier that is one
  * of the block's own sources counts, and only when exactly one selected column matches, so an
  * ambiguous or misspelled reference still fails in resolution.
+ *
+ * Under USING an unqualified merged name is the merged column, which is one side's column only
+ * where PostgreSQL builds it from that side: the left input's under INNER and LEFT joins (a RIGHT
+ * join reaches here mirrored, its right input first), and neither under FULL (COALESCE). So
+ * `a.k` names the selected merged `k` for the side that supplies it, and keeps naming its own
+ * column otherwise. NATURAL joins merge names not known before schema binding: there no
+ * qualified key is rewritten.
  */
 function resolveOrderQualifiers(
   orderBy: CompiledQuery["orderBy"],
   select: readonly SelectItem[],
-  sourceAliases: readonly string[],
+  base: TableSource,
+  joins: readonly JoinPlan[],
 ): CompiledQuery["orderBy"] {
+  const sourceAliases = [base, ...joins].map((source) => source.alias);
+  const natural = joins.some((join) => join.natural === true);
+  const merged = new Set(joins.flatMap((join) => join.using ?? []));
+  // The source the merged columns are, for one INNER or LEFT USING join; otherwise none.
+  const [only, ...more] = joins;
+  const owner =
+    only !== undefined &&
+    more.length === 0 &&
+    only.using !== undefined &&
+    only.full !== true &&
+    (only.kind === "inner" || only.kind === "left")
+      ? base.alias
+      : undefined;
   return orderBy.map((order) => {
     const expression = order.expression;
     if (expression.kind !== "column") return order;
@@ -12862,7 +13164,8 @@ function resolveOrderQualifiers(
     }
     const qualifier = expression.reference.slice(0, separator);
     const column = expression.reference.slice(separator + 1);
-    if (!sourceAliases.includes(qualifier)) return order;
+    if (natural || !sourceAliases.includes(qualifier)) return order;
+    if (merged.has(column) && qualifier !== owner) return order;
     const matches = select.filter(
       (item) =>
         item.expression.kind === "column" &&
@@ -13092,6 +13395,76 @@ export function unifyPlanGroupedReferences(
 }
 
 /**
+ * PostgreSQL's DISTINCT ON rule (parse_clause.c transformDistinctOnClause): ORDER BY must lead
+ * with the DISTINCT ON expressions. Once an ORDER BY item that is not one of them appears, no
+ * later item may be one, and every DISTINCT ON expression must already have appeared — else
+ * 42P10. A repeated ORDER BY target is dropped first. Both sides are compared after output-alias
+ * and ordinal resolution. Names are not bound
+ * to sources yet, so two columns with the same bare name count as the same expression: that can
+ * only let a mismatch through, never refuse a valid query.
+ */
+function assertDistinctOnLeadsOrder(
+  distinctOn: readonly Expression[],
+  orderBy: CompiledQuery["orderBy"],
+  select: readonly SelectItem[],
+  resolveAlias: (expression: Expression) => Expression,
+): void {
+  if (orderBy.length === 0) return;
+  const resolve = (expression: Expression): Expression => {
+    if (
+      expression.kind === "literal" &&
+      typeof expression.value === "number" &&
+      Number.isInteger(expression.value)
+    ) {
+      const item = select[expression.value - 1];
+      if (item !== undefined && item.expression.kind !== "wildcard") return item.expression;
+    }
+    return resolveAlias(expression);
+  };
+  // Two spellings are one target when they are the same expression with each column reference
+  // naming the same column: `b.id + 0` and `id + 0` may (names are not bound to sources yet, so
+  // a bare name matches any qualifier), but `a.id + 0` and `b.id + 0` never do — they read
+  // different sources even when the column names agree (review B6 stream A 2, finding 4).
+  const bareColumns = (expression: Expression): Expression =>
+    expression.kind === "column"
+      ? { kind: "column", reference: expression.reference.split(".").at(-1) ?? "" }
+      : mapChildExpressions(expression, bareColumns);
+  const qualifier = (reference: string) => {
+    const dot = reference.lastIndexOf(".");
+    return dot === -1 ? undefined : reference.slice(0, dot);
+  };
+  const same = (left: Expression, right: Expression) => {
+    if (encodeQueryIdentity(bareColumns(left)) !== encodeQueryIdentity(bareColumns(right)))
+      return false;
+    // Same shape, so the references pair up in order.
+    const rightColumns = expressionColumns(right);
+    return expressionColumns(left).every((reference, index) => {
+      const a = qualifier(reference);
+      const b = qualifier(rightColumns[index] ?? "");
+      return a === undefined || b === undefined || a === b;
+    });
+  };
+  const keys = distinctOn.map(resolve);
+  const covered: Expression[] = [];
+  const seen: Expression[] = [];
+  let skipped = false;
+  const refuse = (): never => {
+    throw new TypeError("SELECT DISTINCT ON expressions must match initial ORDER BY expressions");
+  };
+  for (const order of orderBy) {
+    const expression = resolve(order.expression);
+    // A repeated sort target is dropped from the sort list, as PostgreSQL does.
+    if (seen.some((earlier) => same(earlier, expression))) continue;
+    seen.push(expression);
+    if (keys.some((key) => same(key, expression))) {
+      if (skipped) refuse();
+      covered.push(expression);
+    } else skipped = true;
+  }
+  if (skipped && keys.some((key) => !covered.some((expression) => same(key, expression)))) refuse();
+}
+
+/**
  * FULL OUTER JOIN desugars into UNION ALL of two left joins: the plain left join carries every
  * base row (matched or not), and the swapped left join filtered to a NULL-extended base side
  * carries the joined source's unmatched rows. Sound because an equality join key never matches
@@ -13231,6 +13604,12 @@ function desugarComposedFullJoin(
 }
 
 function desugarFullJoin(parts: SelectBlockParts, nextSequence: () => number): CompiledQuery {
+  // NATURAL's merged columns are known only at schema binding, after this rewrite; refused
+  // rather than run with no join condition.
+  if (parts.joins[0]?.natural === true)
+    throw new TypeError(
+      "NATURAL FULL JOIN is not supported; name the shared columns: FULL JOIN … USING (columns)",
+    );
   if (parts.joins[0]?.using !== undefined) parts = mergeFullJoinUsing(parts);
   const join = parts.joins[0];
   if (parts.joins.length !== 1 || join?.full !== true) {
@@ -13254,17 +13633,15 @@ function desugarFullJoin(parts: SelectBlockParts, nextSequence: () => number): C
   // where the branches' table aliases no longer exist. Qualified references that name a select
   // item are rewritten to its output alias, and everything else — expressions, and columns the
   // select list does not carry — takes the shared hidden-column desugar, which re-enters this
-  // function with alias-only ordering.
-  const outputAlias = (reference: string): string | undefined => {
-    const exact = parts.select.find(
+  // function with alias-only ordering. A qualified name is always an input column (PostgreSQL:
+  // output names cannot be qualified), so `c.id` names the item selecting `c.id`, never another
+  // source's column that happens to be output as `id`.
+  const outputAlias = (reference: string): string | undefined =>
+    parts.select.find(
       (item) =>
         item.alias === reference ||
         (item.expression.kind === "column" && item.expression.reference === reference),
-    );
-    if (exact !== undefined) return exact.alias;
-    const bare = reference.split(".").at(-1) ?? reference;
-    return parts.select.find((item) => item.alias === bare)?.alias;
-  };
+    )?.alias;
   parts = {
     ...parts,
     orderBy: parts.orderBy.map((order) => {
@@ -13353,6 +13730,20 @@ function pendingSelectBlock(parts: SelectBlockParts): CompiledQuery {
   };
 }
 
+/**
+ * PostgreSQL's 42712: one FROM level (with a parenthesized join group's members, and an UPDATE or
+ * DELETE target beside its FROM / USING sources) names each source once. A second `a` would
+ * otherwise make `a.x` mean whichever source resolution meets first.
+ */
+function assertDistinctSourceNames(sources: readonly TableSource[], target?: string): void {
+  const seen = new Set<string>(target === undefined ? [] : [target]);
+  for (const source of sources) {
+    if (seen.has(source.alias))
+      throw new TypeError(`table name "${source.alias}" specified more than once`);
+    seen.add(source.alias);
+  }
+}
+
 export function assembleSelectBlock(
   parts: SelectBlockParts,
   nextSequence: () => number,
@@ -13403,7 +13794,8 @@ function lowerSelectBlock(
     orderBy: resolveOrderQualifiers(
       resolveOrderByOrdinals(parts.orderBy, parts.select),
       parts.select,
-      [parts.base, ...parts.joins].map((source) => source.alias),
+      parts.base,
+      parts.joins,
     ),
   };
   parts = unifyBlockGroupedReferences(parts);
@@ -13637,6 +14029,54 @@ export function expandViewSources(
   const resolved = clonePlanTree(plan);
   expandBlock(resolved, 0);
   return resolved;
+}
+
+/** Admission inspects planned expression subqueries too; it never executes these bodies.
+ * A constant CASE/COALESCE arm that planning discards must not contribute a hidden view lock.
+ */
+export function expandRowLockCteViews(
+  plan: CompiledQuery,
+  viewFor?: (name: string) => CompiledQuery | undefined,
+): RowLocking | undefined {
+  let lock: RowLocking | undefined;
+  const expression = (node: Expression): void => {
+    if (node.kind === "subquery" || node.kind === "exists") block(node.block);
+    else if (node.kind === "case") {
+      for (const branch of node.branches) {
+        expression(branch.when);
+        let known: boolean | null | undefined;
+        try {
+          known = evaluateBooleanExpression(branch.when, (value) => {
+            if (
+              value.kind !== "literal" ||
+              (typeof value.value === "number" && !Number.isSafeInteger(value.value))
+            )
+              throw new TypeError("not a known planning constant");
+            return value.value;
+          });
+        } catch {
+          /* Keep every arm when the condition is not a known constant. */
+        }
+        if (known === false || known === null) continue;
+        expression(branch.then);
+        if (known === true) return;
+      }
+      if (node.otherwise !== undefined) expression(node.otherwise);
+    } else if (node.kind === "call" && node.name === "COALESCE") {
+      for (const argument of node.arguments) {
+        expression(argument);
+        if (argument.kind === "literal" && argument.value !== null) return;
+      }
+    } else childExpressions(node).forEach(expression);
+  };
+  const block = (query: CompiledQuery): void => {
+    lock = strongestRowLock([lock, query.rowLocking]);
+    if (viewFor !== undefined) expandViewSources(query, viewFor);
+    forEachNestedBlock(query, block);
+    forEachBlockExpression(query, expression);
+  };
+  block(plan);
+  return lock;
 }
 
 export function planHasSourceColumnAliases(plan: CompiledQuery): boolean {
@@ -13877,6 +14317,8 @@ export function bindPendingSelectShapes(
       "usesStatementDatetime",
       "usesSequenceCalls",
       "usesVolatileFunctions",
+      "rowLocking",
+      "rowLockingCtes",
     ] as const) {
       const value = from[key];
       if (value !== undefined) Object.assign(to, { [key]: value });
@@ -14210,11 +14652,11 @@ function orderNeedsHiddenColumn(expression: Expression, parts: SelectBlockParts)
   if (expression.kind !== "column") return true;
   if (parts.select.some((item) => item.expression.kind === "wildcard")) return false;
   const reference = expression.reference;
-  const bare = reference.split(".").at(-1) ?? reference;
+  // An output alias answers only an unqualified name: `ORDER BY c.id` under
+  // `SELECT o.id, c.name` sorts by c's column, not by the output named `id` (PostgreSQL).
   return !parts.select.some(
     (item) =>
       item.alias === reference ||
-      item.alias === bare ||
       (item.expression.kind === "column" && item.expression.reference === reference),
   );
 }
@@ -14497,6 +14939,7 @@ function timestampLiteral(text: string): Date {
 }
 
 /** The parser's OFFSET range contract, shared with the typed builder. */
+
 export function validateOffset(offset: number): number {
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > 100_000_000)
     throw new RangeError("OFFSET must be between 0 and 100,000,000");
@@ -15220,12 +15663,23 @@ function tokenize(sql: string): Token[] {
       continue;
     }
     if (pair === "/*") {
-      // T351: bracketed comments, which the standard does not nest.
-      const close = sql.indexOf("*/", index + 2);
-      if (close === -1) {
-        throw new SqlCompileError("Unterminated comment", index, sql.length - index);
+      // T351: bracketed comments, nested as PostgreSQL nests them (`/* a /* b */ c */` is one).
+      const start = index;
+      let depth = 0;
+      while (index < sql.length) {
+        const next = sql.slice(index, index + 2);
+        if (next === "/*") {
+          depth += 1;
+          index += 2;
+        } else if (next === "*/") {
+          depth -= 1;
+          index += 2;
+          if (depth === 0) break;
+        } else index += 1;
       }
-      index = close + 2;
+      if (depth !== 0) {
+        throw new SqlCompileError("Unterminated comment", start, sql.length - start);
+      }
       continue;
     }
     if (character === ";") {

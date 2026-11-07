@@ -451,6 +451,12 @@ export interface Predicate {
   escape?: string;
 }
 
+/** The dependency-free sentinel for a FROM-less SELECT. */
+export const DUAL_TABLE = "(dual)";
+
+/** A SELECT row-lock strength, as PostgreSQL names it. */
+export type RowLocking = "UPDATE" | "NO KEY UPDATE" | "SHARE" | "KEY SHARE";
+
 export interface CompiledQuery {
   sql: string;
   base: TableSource;
@@ -501,6 +507,16 @@ export interface CompiledQuery {
   parameterCount?: number;
   usesStatementDatetime?: boolean;
   usesSequenceCalls?: boolean;
+  /**
+   * The strongest `FOR UPDATE | NO KEY UPDATE | SHARE | KEY SHARE` row lock the statement asks
+   * for over a real source. Locks are ignored (one session), but a read-only transaction
+   * refuses them, as PostgreSQL does.
+   */
+  rowLocking?: RowLocking;
+  /** Referenced CTE bodies, including recursive base and step, retained for admission/view expansion.
+   * A reference from an unused CTE still counts (PostgreSQL SS_process_ctes).
+   */
+  rowLockingCtes?: readonly CompiledQuery[];
   usesVolatileFunctions?: boolean;
 }
 

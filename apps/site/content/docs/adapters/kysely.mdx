@@ -434,7 +434,8 @@ applied.
 
 - Reads, inserts, updates, deletes, and their `$n` parameters, including `distinctOn()`,
   `updateTable().from()`, `deleteFrom().using()`, and the row-locking modifiers (`forUpdate()`,
-  `forShare()`, `noWait()`, `skipLocked()`, and friends), which the engine accepts and ignores.
+  `forShare()`, `noWait()`, `skipLocked()`, and friends). These take no row locks; a lock
+  targeting a table or view is refused in a `READ ONLY` transaction.
 - Type-safe `MATCH` predicates and `BM25` ranking expressions.
 - Typed live queries, keyed changes, and ordered bounded windows.
 - `.stream(chunkSize)` over direct and worker-backed query cursors, and over the buffered

@@ -226,7 +226,8 @@ machines: https://minnowdb.com/llms.txt
   add/drop column — are refused when the query compiles, with the alternative named in the
   error. Follow that alternative instead of retrying the same form. `distinctOn()`,
   `updateTable().from()`, `deleteFrom().using()`, the row-locking modifiers (`forUpdate()`,
-  `forShare()`, `skipLocked()`; accepted and ignored), and `createTable().temporary()` pass
+  `forShare()`, `skipLocked()`; no locks are taken, but a lock targeting a table or view
+  is refused in `READ ONLY`), and `createTable().temporary()` pass
   through to the engine; `onCommit()` and `dropTable().temporary()` are refused.
 - Full-text search is `MATCH(column) AGAINST $1`, ranked with `BM25(column) AGAINST $1`. Pass the
   search text as a parameter. There is no full-text index DDL to write; that index builds itself.
@@ -275,7 +276,8 @@ machines: https://minnowdb.com/llms.txt
   alias as a row value (Kysely's `jsonArrayFrom`/`jsonObjectFrom`), integer division that
   truncates, `GROUP BY` a primary key with the row's other columns ungrouped, case-insensitive
   unquoted identifiers, `SET`/`RESET`/`SHOW` session settings (accepted and ignored, except a
-  non-UTC time zone), `FOR UPDATE` (ignored), and `E'…'`/`$$…$$` strings.
+  non-UTC time zone), `FOR UPDATE` (no locks taken; table/view targets are refused in
+  `READ ONLY`, including through FROM subqueries; outer CTE-reference locks are allowed; CTE bodies with positive reference counts count even through unused referrers; zero-reference CTEs do not; a recursive declaration retains both base and step, and self-reference alone does not count), and `E'…'`/`$$…$$` strings.
 - Array values use canonical JSON text. Scalar subscripts, ARRAY_AGG, typed UNNEST over
   ARRAY constructors, and `ANY`/`ALL` over arrays are supported. Pass an IN list as one array
   parameter — `WHERE id = ANY($1)` with `params: [[1, 2, 3]]`, or `$1::int[]` — rather than
@@ -288,6 +290,10 @@ machines: https://minnowdb.com/llms.txt
   `"2026-01-02T03:04:05+00:00"` against `"2026-01-02T03:04:05"` in JSON. Both kinds hold the same
   UTC instant and compare alike. INTERVAL values read and render as `1 day 02:00:00`. Query
   results return datetimes as `Date` objects; use those rather than parsing SQL text.
+- Transaction modes use PostgreSQL's admission rules: a changed isolation level requires
+  no earlier query and no savepoint; the same requested level is always allowed.
+  `[NOT] DEFERRABLE` requires no earlier query and no savepoint even when unchanged.
+  Accepted weaker isolation levels still execute with the engine's fixed snapshot.
 - Unsupported: keyless `UPDATE`/`DELETE`, `GRANT`, `SERIALIZABLE` isolation, `LOCK TABLE`, DDL
   inside `BEGIN … COMMIT`, several statements in one call, range-correlated LATERAL
   grouping/order/limit, correlated JSON_TABLE documents, array slices and multidimensional access,

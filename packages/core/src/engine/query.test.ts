@@ -552,6 +552,43 @@ describe("public SQL queries", () => {
     expect(executeRowQuery(plan, input)).toEqual(expected);
   });
 
+  it("refuses DISTINCT ON positions over SELECT * rather than reading them as constants", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute("CREATE TABLE b (id INTEGER, v INTEGER)");
+    await database.execute("INSERT INTO b VALUES (1, 2), (1, 8), (2, 7)");
+    for (const sql of [
+      "SELECT DISTINCT ON (1) * FROM b ORDER BY 1, 2 DESC",
+      "SELECT DISTINCT ON (id) * FROM b ORDER BY 1, 2 DESC",
+    ])
+      await expect(database.query(sql), sql).rejects.toThrow(
+        "positions cannot be used with SELECT *",
+      );
+    // Names work with `*`.
+    const named = await database.query("SELECT DISTINCT ON (id) * FROM b ORDER BY id, v DESC");
+    expect(named.rows).toEqual([
+      { id: 1, v: 8 },
+      { id: 2, v: 7 },
+    ]);
+  });
+
+  it("refuses a statement that names a source twice (42712), UPDATE and DELETE targets included", async () => {
+    const database = new MinnowDatabase(new MemoryBlockStore());
+    await database.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)");
+    await database.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)");
+    for (const sql of [
+      "SELECT a.id FROM a a, b a",
+      "UPDATE a SET v = 1 FROM a WHERE a.id = 1",
+      "UPDATE a t SET v = 1 FROM b t WHERE t.id = 1",
+      "DELETE FROM a USING a WHERE a.id = 1",
+      "DELETE FROM a t USING b t WHERE t.id = 1",
+      "DELETE FROM a USING b, b WHERE a.id = b.id",
+    ])
+      await expect(database.execute(sql), sql).rejects.toThrow("specified more than once");
+    // Distinct names, and a name reused in a subquery's own FROM, are fine.
+    await database.execute("UPDATE a t SET v = 1 FROM a WHERE t.id = a.id");
+    await database.query("SELECT x.id FROM a x WHERE EXISTS (SELECT 1 FROM b x WHERE x.id = 1)");
+  });
+
   it("orders a wildcard select by a qualified column reference", async () => {
     // A wildcard select names its outputs after the source columns, so a qualified ORDER BY
     // reference has to be rewritten into that naming. Looking it up verbatim used to match no
@@ -670,8 +707,10 @@ describe("public SQL queries", () => {
       { x: 1, y: "a" },
     ]);
     expect(executeRowQuery(plan, input)).toEqual(executeQuery(plan, input));
+    // `u` is no source of this block: PostgreSQL's "missing FROM-clause entry for table u". The
+    // qualified key is never matched to the output `x` by its bare name.
     expect(() => executeRowQuery(compileQuery("SELECT * FROM t ORDER BY u.x"), input)).toThrow(
-      "ORDER BY requires a selected column or output alias: u.x",
+      "Unknown table alias: u",
     );
   });
 
@@ -710,7 +749,7 @@ describe("public SQL queries", () => {
     );
     await expect(
       database.query("SELECT e.value FROM events e JOIN events e ON e.value = e.value"),
-    ).rejects.toThrow("Table aliases must be unique");
+    ).rejects.toThrow('table name "e" specified more than once');
   });
 
   it("allows comment markers and statement delimiters inside string literals", () => {

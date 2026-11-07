@@ -1260,6 +1260,13 @@ function decorrelatePredicate(
     if (node.negated) negated = !negated;
     const inner = node.block;
     if (!blockReferencesOutside(inner)) return undefined;
+    const answered = existsOverAggregateRow(inner);
+    if (answered !== undefined)
+      return {
+        left: negated ? { kind: "not", operand: answered } : answered,
+        operator: "IS TRUE",
+        right: { kind: "literal", value: true },
+      };
     rejectGroupedInner(inner, "EXISTS");
     if (!canExtractCorrelation(inner, scope, "EXISTS", true)) {
       const replacement = decorrelateExistsWithProbes(
@@ -2123,7 +2130,13 @@ function decorrelateGeneralScalar(
     projected.push({ expression: clonePlanTree(expression), alias });
     return { kind: "column", reference: `${finalRowsAlias}.${alias}` };
   };
-  const orderInputs = rows.orderBy.map((order, index) => ({
+  const grouped = hasAggregate(shape.expression);
+  // Sorting an aggregate's one row by an aggregate (`ORDER BY 1`, `ORDER BY max(v)`) changes
+  // nothing; only ungrouped keys still order the input of STRING_AGG and JSON_ARRAYAGG below.
+  const ordering = grouped
+    ? rows.orderBy.filter((order) => !hasAggregate(scalarOrderExpression(order.expression, rows)))
+    : rows.orderBy;
+  const orderInputs = ordering.map((order, index) => ({
     reference: project(scalarOrderExpression(order.expression, rows), correlationOrderAlias(index)),
     direction: order.direction,
     ...(order.nulls === undefined ? {} : { nulls: order.nulls }),
@@ -2186,7 +2199,6 @@ function decorrelateGeneralScalar(
     return mapChildExpressions(expression, aggregateResult);
   };
 
-  const grouped = hasAggregate(shape.expression);
   const valueExpression = grouped
     ? aggregateResult(shape.expression)
     : {
@@ -2250,8 +2262,11 @@ function decorrelateGeneralScalar(
         orderBy: [],
       };
 
+  // An aggregate without GROUP BY yields one row; ORDER BY, LIMIT and OFFSET apply to that row,
+  // after aggregation (PostgreSQL), never to the rows it aggregates.
+  const kept = grouped ? aggregateRowKept(rows) : true;
   let finalRows = matched;
-  if (blockHasRowWindow(rows)) {
+  if (!grouped && blockHasRowWindow(rows)) {
     const rankedAlias = nextAlias();
     const rankedTable = nextAlias();
     const ranked = {
@@ -2350,6 +2365,12 @@ function decorrelateGeneralScalar(
     groupBy: finalProbeReferences,
     having: [],
     orderBy: [],
+    ...(grouped && rows.limitParameter !== undefined
+      ? { limitValidationParameters: [rows.limitParameter] }
+      : {}),
+    ...(grouped && rows.offsetParameter !== undefined
+      ? { offsetValidationParameters: [rows.offsetParameter] }
+      : {}),
   };
   const resultAlias = nextAlias();
   pushNullSafeProbeJoin(block, resultAlias, aggregate, outerExpressions);
@@ -2357,7 +2378,7 @@ function decorrelateGeneralScalar(
     kind: "column",
     reference: `${resultAlias}.${correlationMarkerAlias}`,
   };
-  return {
+  const result: Expression = {
     kind: "case",
     branches: [
       {
@@ -2377,6 +2398,50 @@ function decorrelateGeneralScalar(
       reference: `${resultAlias}.${correlationValueAlias}`,
     },
   };
+  // A LIMIT 0 or a positive OFFSET leaves the aggregate's one row out: the subquery is empty,
+  // so its value is NULL (even for COUNT, whose value over no input rows is 0).
+  if (kept === true) return result;
+  if (kept === false) return { kind: "literal", value: null };
+  return {
+    kind: "case",
+    branches: [{ when: kept, then: result }],
+    otherwise: { kind: "literal", value: null },
+  };
+}
+
+/**
+ * Whether the one row of an aggregate without GROUP BY survives the block's LIMIT and OFFSET:
+ * a constant when both are, else a condition over their parameters. LIMIT NULL is no limit and
+ * OFFSET NULL is none, as in PostgreSQL; negative values are rejected when the parameters bind.
+ */
+function aggregateRowKept(rows: CompiledQuery): Expression | boolean {
+  const conditions: Expression[] = [];
+  const nullOr = (index: number, operator: "<=" | ">=", bound: number): Expression => ({
+    kind: "logical",
+    operator: "or",
+    left: {
+      kind: "condition",
+      operator: "IS NULL",
+      left: { kind: "parameter", index },
+      right: { kind: "literal", value: null },
+    },
+    right: {
+      kind: "condition",
+      operator,
+      left: { kind: "parameter", index },
+      right: { kind: "literal", value: bound },
+    },
+  });
+  if (rows.limitParameter !== undefined) conditions.push(nullOr(rows.limitParameter, ">=", 1));
+  else if (rows.limit !== undefined && rows.limit < 1) return false;
+  if (rows.offsetParameter !== undefined) conditions.push(nullOr(rows.offsetParameter, "<=", 0));
+  else if ((rows.offset ?? 0) > 0) return false;
+  const [first, ...rest] = conditions;
+  if (first === undefined) return true;
+  return rest.reduce<Expression>(
+    (left, right) => ({ kind: "logical", operator: "and", left, right }),
+    first,
+  );
 }
 
 /**
@@ -2477,6 +2542,8 @@ function decorrelateExistsExpression(
   nextAlias: NextAlias,
 ): Expression {
   const inner = exists.block;
+  const answered = existsOverAggregateRow(inner);
+  if (answered !== undefined) return exists.negated ? { kind: "not", operand: answered } : answered;
   rejectGroupedInner(inner, "EXISTS");
   if (!canExtractCorrelation(inner, scope, "EXISTS", true)) {
     return decorrelateExistsWithProbes(block, exists, scope, nextAlias);
@@ -3214,6 +3281,18 @@ function rewriteUncorrelatedIn(
     right: { kind: "column", reference: `${alias}.${correlationValueAlias}` },
   });
   return "consumed";
+}
+
+/**
+ * EXISTS over an aggregate without GROUP BY or HAVING: the subquery yields exactly one row
+ * whatever it reads, so EXISTS is whether its LIMIT and OFFSET keep that row — TRUE unless they
+ * empty it (PostgreSQL). Undefined for any other subquery.
+ */
+function existsOverAggregateRow(inner: CompiledQuery): Expression | undefined {
+  if (inner.groupBy.length > 0 || inner.having.length > 0) return undefined;
+  if (!inner.select.some((item) => hasAggregate(item.expression))) return undefined;
+  const kept = aggregateRowKept(inner);
+  return typeof kept === "boolean" ? { kind: "literal", value: kept } : kept;
 }
 
 function rejectGroupedInner(inner: CompiledQuery, label: string): void {
