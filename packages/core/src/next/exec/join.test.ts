@@ -359,10 +359,10 @@ describe("hash join: spill", () => {
     }
   });
 
-  for (const pad of [450, 700])
+  for (const pad of [450, 700, 850])
     it(`${String(pad)} KiB values progress in row-sized spill steps (review #1)`, async () => {
       // Keep the original 450 KiB case; eager spilling now avoids its staging loans.
-      // 700 KiB values still force actual loans at the minimum, never a page × 4.
+      // 850 KiB values force loans even when a one-row probe is borrowed instead of copied.
       const types = [INT, TEXT];
       const big = (k: number, i: number): Row => [k, `${String(i)}-${"v".repeat(pad * 1024)}`];
       const build: Row[] = Array.from({ length: 10 }, (_, i) => big(i % 3, i));
@@ -373,7 +373,7 @@ describe("hash join: spill", () => {
           slack: 0,
         });
         expect(result.join.profile.spilledBytes).toBeGreaterThan(0);
-        if (pad === 700) expect(result.join.profile.loans).toBeGreaterThan(0);
+        if (pad === 850) expect(result.join.profile.loans).toBeGreaterThan(0);
         expect(result.join.profile.largestLoan).toBeLessThan(result.governor.reserveBytes);
         // One-row pages go down a level whole: one copy of a wide row, not three.
         expect(result.join.profile.forwardedPages).toBeGreaterThan(0);

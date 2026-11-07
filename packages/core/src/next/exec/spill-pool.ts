@@ -52,8 +52,6 @@ export class Pool implements ByteCharge {
   #loan: Loan | null = null;
   /** Bytes added to the pool for the current step (from the grant or the loan). */
   #extra = 0;
-  /** Usage when the current step made room; its extra goes back once usage is back to it. */
-  #stepBase = 0;
   /** The step allocated since it made room (until then, its room is held, not given back). */
   #consumed = false;
   loans = 0;
@@ -139,17 +137,16 @@ export class Pool implements ByteCharge {
   }
 
   #beginStep(extra: number): void {
-    if (this.#extra === 0) this.#stepBase = this.#used;
     this.#extra += extra;
     this.#consumed = false;
   }
 
   /**
-   * Gives a step's extra bytes back (repaying the loan) once the step has allocated and its
-   * usage has left again (usage back to what it was when the step made room).
+   * Returns extra bytes once the step has allocated and all live pool usage fits without
+   * them. Fixed buffers first created during the step may remain inside the admitted pool.
    */
   settle(): void {
-    if (this.#extra === 0 || !this.#consumed || this.#used > this.#stepBase) return;
+    if (this.#extra === 0 || !this.#consumed || this.#used > this.#size - this.#extra) return;
     this.charge.free(this.#extra);
     this.#size -= this.#extra;
     this.#extra = 0;
