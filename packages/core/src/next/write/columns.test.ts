@@ -7,6 +7,8 @@ import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import type { PhysicalType } from "../types.js";
+import { ByteWindow } from "./window.js";
+import { columnLength } from "./stream-body.js";
 import { ByteWriter } from "./bytes.js";
 import { decodeColumn, encodeColumn } from "./columns.js";
 import { BIG, ints, texts, type Value } from "./test-support.js";
@@ -93,6 +95,15 @@ describe("column encoding", () => {
             const bytes = shared
               ? writer.bytes.slice(start, writer.length)
               : encodeColumn(vector, from, count);
+            expect(columnLength(vector, from, count)).toBe(bytes.length);
+            const windowed = new Uint8Array(bytes.length);
+            const scratch = new Uint8Array(16);
+            for (let at = 0; at < windowed.length; at += 31) {
+              const window = new ByteWindow(windowed.subarray(at, at + 31), at, scratch);
+              encodeColumn(vector, from, count, window);
+              expect(window.length).toBe(bytes.length);
+            }
+            expect(Buffer.compare(windowed, bytes)).toBe(0);
             const decoded = decodeColumn(bytes, vector.type);
             const expected = values
               .slice(from, from + count)

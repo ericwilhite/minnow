@@ -1759,4 +1759,83 @@ export const WRITE_LOW_CAP_STATES = [
   "metadata grew under pressure",
   "durable reopen",
   "allocated write above minimum",
+  "commit buffers independently charged",
+] as const;
+
+/** B3: low-cap commit encoding owns a bounded, independently counted set of actual buffers. */
+export const WRITE_COMMIT_BUFFER_STATES = [
+  "request metadata",
+  "value over 64 KiB",
+  "memory",
+  "indexeddb",
+  "catalog and rows together",
+  "streamed body",
+  "single-buffer body",
+  "strict",
+  "relaxed",
+  "durable reopen",
+  "ownership released once",
+  "streamed catalog and bigint tags",
+  "observed constructor precharge",
+  "production constructor precharge",
+] as const;
+
+/** B3: physical power loss at multipart prefixes and the complete but unacknowledged body. */
+export const WRITE_STREAM_CRASH_STATES = [
+  "strict",
+  "relaxed",
+  "prefix",
+  "complete",
+  "retry and reopen",
+] as const;
+
+/** B3: bounded canonical row-id ordering of a large deletion body. */
+export const WRITE_DELETE_STREAM_STATES = [
+  "reverse",
+  "zigzag",
+  "charged order loan",
+  "bounded rank walk",
+  "empty after reopen",
+] as const;
+
+/** B3: the bounded byte sink preserves all supported frame-column representations. */
+export const WRITE_COLUMN_WINDOW_STATES = [
+  "bool",
+  "f32",
+  "f64",
+  "int64",
+  "decimal64",
+  "decimal128",
+  "fixed16",
+  "interval",
+  "short range",
+  "long range",
+  "signaling f32",
+] as const;
+
+/** B3: string metadata uses owned UTF-8 storage or bounded streaming before stringification. */
+export const WRITE_REQUEST_BUFFER_STATES = [
+  "streamed metadata",
+  "single-buffer metadata",
+  "sequence UTF-8",
+  "no unowned string buffer",
+] as const;
+
+/** B3/B5: async sequence callers stop at cancellation before continuing batched inputs. */
+export const OWNER_SEQUENCE_PRESSURE_STATES = [
+  "last value",
+  "remaining values",
+  "no later sequence call",
+  "statement rolled back",
+] as const;
+
+/** B3: one oversized input call admits bounded pieces without changing statement atomicity. */
+export const WRITE_BATCH_ADMISSION_STATES = [
+  "memory",
+  "indexeddb",
+  "startup retained",
+  "other live working memory",
+  "oversized input",
+  "staged within call",
+  "durable reopen",
 ] as const;

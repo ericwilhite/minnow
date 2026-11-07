@@ -26,7 +26,8 @@
  *    What stages (memtable.ts "Staged"): a frozen memtable of the open transaction's rows alone,
  *    in a table whose catalog entry the transaction did not change, once a root can carry the
  *    table, and only after every earlier memtable of its rows is staged (the commit's effects
- *    stay in row-id order). It stages at the transaction's next statement call. Its own index
+ *    stay in row-id order). It stages at the next admission boundary, including between chunks
+ *    of one oversized input call. Its own index
  *    puts become the staged runs; other entries (tombstones of older rows) stay resident. A
  *    rollback truncates; at commit the staging is made exact first (emptied memtables dropped,
  *    truncated tails deleted and filtered from their runs), and the commit's live tail freezes so
@@ -132,7 +133,8 @@
  * the next commit (zero wakeups when idle).
  *
  * ## Memory (rulings R5, R16.3)
- * - Memtables, index deltas and scratch use the write-path grant (memory/governor.ts). Resident
+ * - Memtables, index deltas and their scratch use the write-path grant (memory/governor.ts).
+ *   Commit codec/log buffers and bounded codec workspaces use a separate admitted grant. Resident
  *   directories, roots, fences and Bloom filters use its separate metadata grant. Every byte is
  *   charged before allocation. Freeing buffers returns allocations to a grant; unused growth
  *   reservations yield to governor reclaim requests, retaining the working minimum and every
@@ -142,6 +144,12 @@
  *   use that same budget, as do root/statistics charges. Retained high-water estimates must not
  *   cause a size refusal while the writer holds sufficient reclaimable capacity. Row admission
  *   separately freezes committed memtables and waits for their flush at a writer boundary.
+ *   Oversized insert calls admit at most one memory chunk (2,048 rows) at a time, allowing
+ *   eligible pending chunks to stage within the call while preserving statement atomicity.
+ * - The write path charges log frame/join buffers until `StoreSession.appendLog()` resolves.
+ *   Storage owns and charges any copies it retains after that point. In particular, IndexedDB's
+ *   queued copies (currently up to a 4 MiB batch) require storage-side accounting/backpressure;
+ *   they are not part of the write path's encoding-buffer charge.
  * - Frozen memtables awaiting their flush's publication are charged to the write path,
  *   non-spillable, up to `FROZEN_MEMTABLE_CAP_BYTES` (writers wait past it). Once the flush
  *   publishes, readers still on that memtable are re-pointed to the published group and the
@@ -164,6 +172,7 @@
  * publish) and admits its grant; 5. the owner sweeps the spill space (`SpillService.sweep`);
  * 6. ready.
  */
+import type { MaybePromise } from "./key-index.js";
 import type { CommitFrameBody } from "../format/log-frame.js";
 import type { RequestLedger } from "../format/ledger.js";
 import type { MemoryGovernor } from "../memory/governor.js";
@@ -286,16 +295,17 @@ export interface CommitReceipt {
  */
 export interface SequenceAccess {
   /**
-   * Writes the next `count` values of `sequenceId` into `out` at `offset …` (synchronous: a new
-   * block is reserved in memory and its frame appended in the same step). Returns the LSN of the
-   * newest block frame the values came from: under strict durability, deliver them after
+   * Writes the next `count` values of `sequenceId` into `out` at `offset …`. Synchronous when the
+   * bounded log queue has room; otherwise waits for its storage drain (or a multipart commit).
+   * A returned Promise must settle before reading `out` or consuming the values. Returns the
+   * LSN of the newest block frame the values came from: under strict durability, deliver them after
    * `durable(lsn)`. With `out.repr === "safe"`, a value outside ±(2^53 − 1) throws `RangeError`
    * before anything is consumed: widen to `int64` and call again. Past the bound of a non-cycling
    * sequence it throws `SequenceExhaustedError` (2200H) and consumes nothing.
    */
-  next(sequenceId: number, count: number, out: Int64Values, offset: number): number;
+  next(sequenceId: number, count: number, out: Int64Values, offset: number): MaybePromise<number>;
   /** setval(): a standalone frame too; returns its LSN. */
-  set(sequenceId: number, value: bigint, isCalled: boolean): number;
+  set(sequenceId: number, value: bigint, isCalled: boolean): MaybePromise<number>;
 }
 
 /** A table's planning summary (shape of lower/statistics.ts `TablePlanningStatistics`). */

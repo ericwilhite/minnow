@@ -13,6 +13,7 @@
  * and foreign keys are checked at `Statement.end()`: during the statement a key that collides with
  * a live row is only a suspect, re-verified at the end against everything the statement wrote.
  */
+import { SMALL_COMMIT_BYTES, type BufferAllocator } from "./commit-buffers.js";
 import {
   CatalogChangeError,
   type CatalogChange,
@@ -312,6 +313,7 @@ export class TransactionImpl implements WriteTransaction {
   effects(
     scratch: ByteWriter,
     staged: (tableId: number) => PublishedRows | null = () => null,
+    allocator?: BufferAllocator,
   ): BodyEffect[] {
     scratch.reset();
     const effects: BodyEffect[] = [];
@@ -374,15 +376,21 @@ export class TransactionImpl implements WriteTransaction {
           let schemaVersion: number | undefined;
           for (const range of inserts)
             if (range.memtable.tableId === tableId) schemaVersion = range.memtable.schemaVersion;
-          schemaVersion ??= need(this.#tableVersion(tableId));
+          schemaVersion ??= need(this.tableVersion(tableId));
           list.sort((x, y) => x.rowId - y.rowId);
+          const rowIds =
+            allocator === undefined
+              ? Float64Array.from(list, (item) => item.rowId)
+              : new Float64Array(allocator.create(list.length * 8).buffer);
+          if (allocator !== undefined)
+            for (let k = 0; k < list.length; k++) rowIds[k] = need(list[k]).rowId;
           effects.push({
             kind: "rows",
             tableId,
             schemaVersion,
             inserts: null,
             deletes: {
-              rowIds: Float64Array.from(list, (item) => item.rowId),
+              rowIds,
               keys: list.map((item) => item.keys),
             },
           });
@@ -416,7 +424,7 @@ export class TransactionImpl implements WriteTransaction {
         }
         case "catalog":
           emitRows();
-          for (const change of entry.logged) effects.push(catalogEffect(change));
+          for (const change of entry.logged) effects.push(catalogEffect(change, allocator));
           break;
         default:
           break;
@@ -429,8 +437,44 @@ export class TransactionImpl implements WriteTransaction {
     return effects;
   }
 
+  /** Conservative temporary object/array bound; large workspaces use the streaming codec. */
+  commitWorkspaceBytes(): number {
+    let bytes = 512;
+    for (const entry of this.undo) {
+      bytes += 64;
+      if (entry.kind === "rows") {
+        const chunks = Math.ceil(
+          ((entry.before % MEMORY_CHUNK_ROWS) + entry.count) / MEMORY_CHUNK_ROWS,
+        );
+        bytes += chunks * (192 + entry.memtable.chunks.length * 192);
+      } else if (entry.kind === "memDelete" || entry.kind === "groupDelete") bytes += 96;
+      else if (entry.kind === "catalog") bytes += 192 * entry.logged.length;
+      if (bytes > SMALL_COMMIT_BYTES) break;
+    }
+    return bytes;
+  }
+
+  /** Large metadata must be counted before the fast codec allocates definitions or row IDs. */
+  needsCommitPreflight(): boolean {
+    let bytes = 0;
+    for (const entry of this.undo) {
+      if (entry.kind === "memDelete" || entry.kind === "groupDelete") {
+        bytes += 8;
+        for (const key of entry.keys) bytes += key.length + 8;
+      } else if (entry.kind === "catalog") {
+        for (const change of entry.logged) bytes += jsonBound(change, SMALL_COMMIT_BYTES - bytes);
+      }
+      if (bytes > SMALL_COMMIT_BYTES) return true;
+    }
+    return false;
+  }
+
+  *loggedChanges(): Generator<LoggedChange> {
+    for (const entry of this.undo) if (entry.kind === "catalog") yield* entry.logged;
+  }
+
   /** A table's schema version in the transaction's catalog, or the committed one (dropped later). */
-  #tableVersion(tableId: number): number | undefined {
+  tableVersion(tableId: number): number | undefined {
     return (this.catalog.table(tableId) ?? this.hooks.committedCatalog().table(tableId))
       ?.schemaVersion;
   }
@@ -461,11 +505,30 @@ export class TransactionImpl implements WriteTransaction {
   }
 }
 
-function catalogEffect(change: LoggedChange): BodyEffect {
+/** Conservative JSON bound without an encoded allocation; exact counting is only on this lane. */
+export function jsonBound(value: unknown, limit: number): number {
+  if (typeof value === "string") return 2 + value.length * 6;
+  if (typeof value === "bigint") return 20 + value.toString().length;
+  if (value instanceof Uint8Array) return 16 + value.length * 4;
+  if (typeof value !== "object" || value === null) return 32;
+  let bytes = 2;
+  for (const key in value) {
+    if (!Object.hasOwn(value, key)) continue;
+    bytes += key.length * 6 + 4 + jsonBound((value as Record<string, unknown>)[key], limit - bytes);
+    if (bytes > limit) break;
+  }
+  return bytes;
+}
+
+function catalogEffect(change: LoggedChange, allocator?: BufferAllocator): BodyEffect {
   if (change.op === "createTable")
-    return { kind: "createTable", tableId: change.table.id, definition: encodeLogged(change) };
+    return {
+      kind: "createTable",
+      tableId: change.table.id,
+      definition: encodeLogged(change, allocator),
+    };
   if (change.op === "dropTable") return { kind: "dropTable", tableId: change.tableId };
-  return { kind: "catalog", definition: encodeLogged(change) };
+  return { kind: "catalog", definition: encodeLogged(change, allocator) };
 }
 
 function undoEntry(tx: TransactionImpl, entry: Undo): void {
@@ -1035,9 +1098,27 @@ export class TableWriterImpl implements TableWriter {
   /** Appends `rows` of `columns` (complete, validated) and their index entries. */
   insertRows(columns: readonly Vector[], rows: Uint16Array): MaybePromise<void> {
     // Memtable memory is admitted before anything is appended (ruling 6).
-    return settle(this.statement.tx.hooks.admit(this.#estimate(columns, rows)), () =>
-      this.#insertRows(columns, rows),
-    );
+    if (rows.length <= MEMORY_CHUNK_ROWS)
+      return settle(this.statement.tx.hooks.admit(this.#estimate(columns, rows)), () =>
+        this.#insertRows(columns, rows),
+      );
+    // An input call can exceed the ordinary cap even though its individual chunks fit.
+    // Admit only the next chunk, letting completed pending chunks stage at each boundary.
+    // These are still one statement: checks and rollback include every appended piece.
+    let offset = 0;
+    const next = (): MaybePromise<void> =>
+      this.statement.guard(() => {
+        while (offset < rows.length) {
+          const piece = rows.subarray(offset, offset + MEMORY_CHUNK_ROWS);
+          offset += piece.length;
+          const pending = settle(
+            this.statement.tx.hooks.admit(this.#estimate(columns, piece)),
+            () => this.statement.guard(() => this.#insertRows(columns, piece)),
+          );
+          if (pending instanceof Promise) return pending.then(next);
+        }
+      });
+    return next();
   }
 
   /** An upper estimate of the memtable bytes `rows` of `columns` take (rows and index entries). */

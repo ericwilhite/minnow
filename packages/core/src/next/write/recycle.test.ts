@@ -143,7 +143,7 @@ describe("log recycling (generated)", () => {
           // durable: none may ever be handed out again.
           const out = { repr: "safe" as const, values: new Float64Array(4) };
           const count = 1 + int(3);
-          const lsn = path.sequences.next(sequenceId, count, out, 0);
+          const lsn = await path.sequences.next(sequenceId, count, out, 0);
           const values = Array.from(out.values.subarray(0, count));
           await path.durable(lsn);
           for (const value of values) {
@@ -291,7 +291,7 @@ describe("log recycling under sequence-only traffic (review B3-p2b-1 #5)", () =>
       ]);
       const id = path.catalog.table(t)?.columns[0]?.identitySequence ?? -1;
       for (let k = 1; k <= 300; k++) {
-        const lsn = path.sequences.set(id, BigInt(k), true);
+        const lsn = await path.sequences.set(id, BigInt(k), true);
         await path.durable(lsn);
       }
       await path.quiesce();
@@ -324,7 +324,7 @@ describe("log recycling under sequence-only traffic (review B3-p2b-1 #5)", () =>
         if (roll < 55) {
           const count = 1 + int(40);
           const out = { repr: "safe" as const, values: new Float64Array(count) };
-          const lsn = path.sequences.next(id, count, out, 0);
+          const lsn = await path.sequences.next(id, count, out, 0);
           await path.durable(lsn);
           for (const value of out.values) {
             expect(delivered.has(value), `seed ${String(seed)}: ${String(value)} again`).toBe(
@@ -335,7 +335,7 @@ describe("log recycling under sequence-only traffic (review B3-p2b-1 #5)", () =>
         } else if (roll < 75) {
           // setval past everything delivered (values below it are never handed out again).
           const next = Math.max(0, ...delivered) + 1 + int(20);
-          await path.durable(path.sequences.set(id, BigInt(next), true));
+          await path.durable(await path.sequences.set(id, BigInt(next), true));
           for (let value = 1; value <= next; value++) delivered.add(value);
         } else if (roll < 92) {
           // An empty commit, with or without an empty statement.

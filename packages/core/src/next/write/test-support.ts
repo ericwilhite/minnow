@@ -165,8 +165,11 @@ export class Harness {
   }
 
   async close(): Promise<void> {
-    await this.path.close();
-    await this.#release?.();
+    try {
+      await this.path.close();
+    } finally {
+      await this.#release?.();
+    }
   }
 }
 

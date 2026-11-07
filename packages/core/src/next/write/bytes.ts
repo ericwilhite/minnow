@@ -5,6 +5,7 @@
  * so a structural mismatch is a format or software bug, never data.
  */
 import { StoreCorruptionError } from "../storage/contract.js";
+import { SMALL_COMMIT_BYTES, StreamCommit, type BufferAllocator } from "./commit-buffers.js";
 
 /** `value`, which the caller knows is present (a broken invariant is a `TypeError`, not data). */
 export function need<T>(value: T | null | undefined): T {
@@ -36,8 +37,30 @@ export function charged(charge: Charge, bytes: number): void {
   if (!charge.allocate(bytes)) throw new MemtableMemoryError(bytes);
 }
 
+/** UTF-8 byte count without materializing an encoded copy. Lone surrogates become U+FFFD. */
+export function utf8Length(value: string): number {
+  let bytes = 0;
+  for (let k = 0; k < value.length; k++) {
+    const code = value.charCodeAt(k);
+    if (code < 0x80) bytes++;
+    else if (code < 0x800) bytes += 2;
+    else if (
+      code >= 0xd800 &&
+      code <= 0xdbff &&
+      value.charCodeAt(k + 1) >= 0xdc00 &&
+      value.charCodeAt(k + 1) <= 0xdfff
+    ) {
+      bytes += 4;
+      k++;
+    } else bytes += 3;
+  }
+  return bytes;
+}
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
+const EMPTY_BYTES = new Uint8Array(0);
+const EMPTY_VIEW = new DataView(EMPTY_BYTES.buffer);
 
 /** Copies `source[start … end)` to `target` at `at`; short ranges byte by byte (no view). */
 export function copyRange(
@@ -54,13 +77,37 @@ export function copyRange(
   for (let k = start; k < end; k++) target[at + k - start] = source[k] ?? 0;
 }
 
+/** Operations needed by the column codec, also implemented by the bounded log window. */
+export type ByteSink = Pick<
+  ByteWriter,
+  | "length"
+  | "ensure"
+  | "u8"
+  | "u16"
+  | "u32"
+  | "f64"
+  | "varuint"
+  | "varint"
+  | "bigint"
+  | "rawRange"
+  | "raw"
+  | "blob"
+  | "string"
+  | "typed"
+  | "range"
+>;
+
 export class ByteWriter {
   bytes: Uint8Array;
   view: DataView;
   length = 0;
 
-  constructor(initial = 256) {
-    this.bytes = new Uint8Array(initial);
+  constructor(
+    initial = 256,
+    readonly allocator?: BufferAllocator,
+    readonly maximum = Infinity,
+  ) {
+    this.bytes = allocator?.create(initial) ?? new Uint8Array(initial);
     this.view = new DataView(this.bytes.buffer);
   }
 
@@ -68,12 +115,22 @@ export class ByteWriter {
     this.length = 0;
   }
 
+  close(): void {
+    if (this.bytes.length === 0) return;
+    this.allocator?.release(this.bytes);
+    this.bytes = EMPTY_BYTES;
+    this.view = EMPTY_VIEW;
+    this.length = 0;
+  }
+
   ensure(extra: number): void {
     if (this.length + extra <= this.bytes.length) return;
+    if (this.length + extra > this.maximum) throw new StreamCommit();
     let size = this.bytes.length * 2;
     while (size < this.length + extra) size *= 2;
-    const grown = new Uint8Array(size);
+    const grown = this.allocator?.create(size) ?? new Uint8Array(size);
     grown.set(this.bytes.subarray(0, this.length));
+    this.allocator?.release(this.bytes);
     this.bytes = grown;
     this.view = new DataView(grown.buffer);
   }
@@ -143,7 +200,15 @@ export class ByteWriter {
   }
 
   string(value: string): void {
-    this.blob(encoder.encode(value));
+    if (this.allocator === undefined) {
+      this.blob(encoder.encode(value));
+      return;
+    }
+    const length = utf8Length(value);
+    this.varuint(length);
+    this.ensure(length);
+    encoder.encodeInto(value, this.bytes.subarray(this.length, this.length + length));
+    this.length += length;
   }
 
   /** Raw bytes of a typed array (its own byte range). */
@@ -295,16 +360,23 @@ export class ByteReader {
 }
 
 /** JSON with bigint and byte-array values tagged, for the small structures stored as JSON. */
-export function encodeJson(value: unknown): Uint8Array {
-  return encoder.encode(
-    JSON.stringify(value, (_key, item: unknown) => {
+export function encodeJson(value: unknown, allocator?: BufferAllocator): Uint8Array {
+  const release = allocator?.reserve?.(24 + 2 * (SMALL_COMMIT_BYTES + 16));
+  try {
+    const text = JSON.stringify(value, (_key, item: unknown) => {
       if (typeof item === "bigint") return { $bigint: item.toString() };
       if (typeof item === "number" && !Number.isFinite(item)) return { $number: String(item) };
       if (Object.is(item, -0)) return { $number: "-0" };
       if (item instanceof Uint8Array) return { $bytes: Array.from(item) };
       return item;
-    }),
-  );
+    });
+    if (allocator === undefined) return encoder.encode(text);
+    const bytes = allocator.create(utf8Length(text));
+    encoder.encodeInto(text, bytes);
+    return bytes;
+  } finally {
+    release?.();
+  }
 }
 
 export function decodeJson(bytes: Uint8Array): unknown {

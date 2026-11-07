@@ -15,10 +15,14 @@
  * all Node threads (including JIT/GC); wall is reported separately. The store is memory, no fsync,
  * parser, executor or owner/client transport. Optional --gc-before (node --expose-gc) collects
  * setup garbage before each clock; GC during the measured phase still counts. Each timed database is closed before the next run.
+ * Each reported pass uses its own Node worker, after one excluded same-build warmup.
+ * --in-process retains the diagnostic shared-process lane; compare isolated passes for acceptance.
  */
 import { resolve, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { spawnSync } from "node:child_process";
 import { performance } from "node:perf_hooks";
+import { loadavg } from "node:os";
 
 type Support = typeof import("../packages/core/dist/next/write/test-support.js");
 type Views = typeof import("../packages/core/dist/next/write/view.js");
@@ -220,13 +224,46 @@ async function measure(build: Build, label: Label): Promise<Result> {
     await h.close();
   }
 }
+// Separate workers keep one build's feedback/GC state out of the other's measured pass.
+const workerLabel = option("worker", "");
+if (workerLabel !== "") {
+  if (workerLabel !== "baseline" && workerLabel !== "candidate")
+    throw new Error("Invalid --worker");
+  const label: Label = workerLabel;
+  await measure(builds[label], label);
+  console.log(JSON.stringify({ isolatedWorker: true, ...(await measure(builds[label], label)) }));
+  process.exit(0);
+}
+async function measurePass(label: Label): Promise<Result> {
+  if (args.includes("--in-process")) return measure(builds[label], label);
+  const worker = spawnSync(
+    process.execPath,
+    [...process.execArgv, fileURLToPath(import.meta.url), ...args, "--worker", label],
+    { encoding: "utf8", maxBuffer: 1024 * 1024 },
+  );
+  if (worker.status !== 0)
+    throw new Error(`Benchmark worker failed: ${worker.stderr}${worker.stdout}`);
+  const line = worker.stdout.trim().split("\n").at(-1);
+  if (!line) throw new Error("Benchmark worker returned no result");
+  return JSON.parse(line) as Result;
+}
+
 const results: Record<Label, Result[]> = { baseline: [], candidate: [] };
 for (let round = -1; round < rounds; round++) {
   const order: Label[] = round % 2 === 0 ? ["baseline", "candidate"] : ["candidate", "baseline"];
   for (const label of order) {
-    const result = await measure(builds[label], label);
+    const result = await measurePass(label);
     console.log(
-      JSON.stringify({ mode, loadMode, durability, label, round, warmup: round < 0, ...result }),
+      JSON.stringify({
+        mode,
+        loadMode,
+        durability,
+        label,
+        round,
+        warmup: round < 0,
+        load: loadavg(),
+        ...result,
+      }),
     );
     if (round >= 0) results[label].push(result);
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -251,6 +288,8 @@ const operations = mode === "unique" ? iterations : mode === "single" ? singles 
 console.log(
   JSON.stringify({
     summary: true,
+    processIsolation: !args.includes("--in-process"),
+    workerWarmups: args.includes("--in-process") ? 0 : 1,
     gcBefore,
     fixtureLifetime: "per-pass",
     node: process.version,

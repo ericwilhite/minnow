@@ -41,7 +41,9 @@ Build core with `npx tsc -b packages/core`. Before rebuilding a candidate, copy 
 parent directory). `scripts/write-insert-bench.mts --baseline <old-dist> --mode unique` measures
 the constraint-check component in Node CPU time. `--mode single --durability relaxed|strict`
 measures prepared one-row commits after a 100k-row table; `--mode load --load-mode tx|commits`
-includes the durable million-row load and maintenance. `node scripts/write-load-bench.mts --mode tx|commits
+includes the durable million-row load and maintenance. Each reported Node pass runs in its own
+worker process after one excluded warmup of the same build, keeping feedback and GC state separate.
+`--in-process` retains the shared-process diagnostic lane. `node scripts/write-load-bench.mts --mode tx|commits
 --profile ~/.cache/load.cpuprofile` records a CPU profile around the load and maintenance only;
 profile stop and serialization are outside the reported CPU/wall clock. Run with plain `node`, using the built
 modules, and set `TMPDIR` under `~/.cache`.
@@ -76,12 +78,59 @@ capacity without waiting for another writer call. Metadata has its own grant and
 same retrying budget for root/statistics charges, group-directory chunks and run readers.
 If its allocation cannot grow, that budget returns idle write holdings and retries. Reclaim
 preserves both allocated bytes and outstanding loans; it never frees a reader's live buffers.
+Oversized insert calls admit at most 2,048 rows at once, so an entire call's conservative
+estimate does not need to fit beside other working grants. Eligible pending chunks stage
+between pieces of the same call; uniqueness, foreign keys and rollback still span the whole
+statement. `write/batch-admission.test.ts` generates these calls with another real working
+buffer occupying ordinary capacity, over memory and the IndexedDB fake, through durable reopen.
 
 `write/low-cap.test.ts` generates loads under 32/48/64 MiB caps over memory and the IndexedDB
 adapter on its fake. It exercises idle estimates, allocated working buffers, active loans,
 merges, metadata growth, exact rows and durable reopen, with declared reach. Its stored rows
 are small to bound the in-memory virtual disk; the separate native W5M reproduction covers
 the canonical 200-column workload at 256 MiB. No stored format changes are involved.
+
+### Commit encoding under the cap
+
+Commit encoding has a separate, fixed 6 MiB minimum, admitted before the engine runs. It charges
+buffer capacities before allocation, counts old and new buffers during growth, and returns each
+ownership charge once. The bound includes reusable column/body writers, sequence scratch, frame
+and queue metadata, a joined append buffer, headers and bounded temporary codec objects. A small
+catalog's temporary JSON spelling is reserved before stringification. The queue's 1 MiB bound
+counts frame metadata as well as payload; its caller waits for the storage drain when full.
+
+Small commits retain the single-buffer codec while their body and estimated temporary workspace
+fit about 512 KiB. Staging remains the preferred path where eligible. Other large commits encode
+the same version-1 body through bounded byte windows into one existing multipart frame at a time.
+Neither body bytes, frame sizes/checksums, effect order nor the stored format change. A partial
+multipart prefix never advances the appender's acknowledged transaction boundary; recovery drops
+it under the ordinary scanner's rules. This path streams directly and creates no spill files.
+Any future spill must use the owner's temporary spill service and remain outside recovery.
+The write-side input charge ends when `StoreSession.appendLog()` resolves. IndexedDB's queued
+copies (up to its 4 MiB batch) are storage's to charge and backpressure; B1 owns that separate
+accounting fix. Write-side ownership tests do not certify those adapter copies.
+
+Unordered deletions can use an in-place row-order index whose capacity is charged before allocation
+through one progress loan bounded by the governor's reserve. It is freed and repaid before the
+commit finishes. Beyond that index bound, the encoder uses a bounded rank walk; its performance
+on very large unordered deletions has not been measured. Stream counting, ordering and encoding
+use the worker's shared task clock and check cancellation after task yields. Close settles their
+writer before releasing its inputs and grants, including a commit still counting before append.
+
+`SequenceAccess.next/set` returns a number synchronously while the queue fits, or a Promise under
+pressure or behind a streamed commit. Callers await it before reading sequence output. The testing
+interpreter does this inside every row of a batched INSERT as well as standalone calls. It checks
+cancellation before resuming the input walk after a pressure wait. Strict
+value delivery still waits for the returned LSN's durability. Changing the sequence reservation
+policy is separate work; the existing adaptive blocks remain unchanged.
+
+The generated low-cap commit suite compares actual buffer ownership with grant allocations and
+the governor peak over memory and the IndexedDB fake, compares codec bytes (including large
+catalog defaults and owned-sequence BigInt tags), and checks durable reopen. Multipart power-loss cuts cover incomplete and complete-but-unacknowledged bodies and a
+later write. Separate probes cover queue backpressure, batched sequence evaluation and close while
+counting. `scripts/write-commit-bench.mts` isolates prepared 10k-row commit CPU; the single-insert
+lane remains in `scripts/write-insert-bench.mts`. These tests and local component measurements do
+not certify physical-disk performance or the Gate D RSS limit; those require the native lane.
 
 ## Cross-track interfaces (owned by the implementing track)
 

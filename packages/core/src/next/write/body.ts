@@ -18,6 +18,7 @@
  */
 import type { BodyEffect, CommitFrameBody } from "../format/log-frame.js";
 import { LogCorruptionError } from "../format/log-frame.js";
+import { SMALL_COMMIT_BYTES } from "./commit-buffers.js";
 import { ByteReader, ByteWriter } from "./bytes.js";
 
 const VERSION = 1;
@@ -46,7 +47,12 @@ export function encodeBody(body: CommitFrameBody, into?: ByteWriter): Uint8Array
     writer.blob(request.clientId);
     writer.varuint(request.sequence);
     writer.f64(request.sentAtMs);
-    writer.string(JSON.stringify(request.counts));
+    const release = writer.allocator?.reserve?.(24 + 2 * (SMALL_COMMIT_BYTES + 16));
+    try {
+      writer.string(JSON.stringify(request.counts));
+    } finally {
+      release?.();
+    }
   }
   writer.varuint(body.effects.length);
   for (const effect of body.effects) {

@@ -61,7 +61,31 @@ for (const backend of ["memory", "indexeddb"] as const)
             reach.beginHistory();
             reach.reach(backend);
             reach.reach(s.releaseStartup ? "startup returned" : "startup retained");
+            const grants: Grant[] = [];
+            const liveCommitBuffers = new Set<Uint8Array>();
+            let independentCommitPeak = 0;
             const harness = new Harness("strict", "memory", s.rows, undefined, {
+              onCommitBuffer: (buffer, owned) => {
+                if (owned) {
+                  expect(liveCommitBuffers.has(buffer)).toBe(false);
+                  liveCommitBuffers.add(buffer);
+                } else expect(liveCommitBuffers.delete(buffer)).toBe(true);
+                const bytes = [...liveCommitBuffers].reduce(
+                  (sum, value) => sum + value.buffer.byteLength,
+                  0,
+                );
+                const commit = grants.find((g) => g.label === "write commit buffers" && g.held > 0);
+                if (owned && (!commit || commit.allocated < bytes))
+                  throw new Error("Low-cap live commit buffers exceed governor allocation");
+                if (owned) {
+                  const other = grants
+                    .filter((g) => g !== commit)
+                    .reduce((sum, g) => sum + g.allocated, 0);
+                  independentCommitPeak = Math.max(independentCommitPeak, other + bytes);
+                  expect(governor.peakBytes).toBeGreaterThanOrEqual(independentCommitPeak);
+                  reach.reach("commit buffers independently charged");
+                }
+              },
               merges: { fanIn: s.fanIn, stallRuns: 2 * s.fanIn, sliceEntries: 32 },
               logRecycleBytes: 16 * MiB,
             });
@@ -76,7 +100,6 @@ for (const backend of ["memory", "indexeddb"] as const)
                   memory: governor.registerCache({ evictableBytes: 0, evict: () => 0 }),
                 }),
               });
-            const grants: Grant[] = [];
             let minimum = 0;
             const failures: string[] = [];
             const requests: AbortController[] = [];
@@ -222,6 +245,12 @@ for (const backend of ["memory", "indexeddb"] as const)
               loan?.repay();
               await harness.close();
             }
+            expect(liveCommitBuffers.size).toBe(0);
+            expect(
+              independentCommitPeak,
+              "Commit buffers must have independent ownership accounting",
+            ).toBeGreaterThan(0);
+            expect(governor.peakBytes).toBeGreaterThanOrEqual(independentCommitPeak);
             expect(governor.usedBytes).toBe(0);
           }),
           { seed, numRuns: 40 },

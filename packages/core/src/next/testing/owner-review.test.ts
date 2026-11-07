@@ -268,6 +268,37 @@ describe("frames and their charge (findings 9, 10, 12)", () => {
     expect(premature).toBe(false);
   });
 
+  it("awaits a pressured sequence inside every row of a batched INSERT", async () => {
+    const { connect, writePath } = harness();
+    const client = await connect();
+    await client.query("CREATE SEQUENCE s");
+    await client.query("CREATE TABLE t (id BIGINT PRIMARY KEY, n INT)");
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const original = writePath.sequences.next.bind(writePath.sequences);
+    writePath.sequences.next = async (...args) => {
+      await gate;
+      return original(...args);
+    };
+    let answered = false;
+    const insert = client
+      .query("INSERT INTO t VALUES (nextval('s'), 10), (nextval('s'), 20) RETURNING id")
+      .then((result) => {
+        answered = true;
+        return result;
+      });
+    await sleep(10);
+    expect(answered).toBe(false);
+    release();
+    expect((await insert).rows()).toEqual([[1], [2]]);
+    expect((await client.query("SELECT * FROM t")).rows()).toEqual([
+      [1, 10],
+      [2, 20],
+    ]);
+  });
+
   it("charges an autocommit write's RETURNING spool until it is delivered", async () => {
     const { connect, writePath, governor } = harness({ autoFlush: false, planCacheSize: 0 });
     const client = await connect();

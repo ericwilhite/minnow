@@ -55,7 +55,7 @@ describe("the idle flush budgets from the last append", () => {
         () => undefined,
       );
       const start = performance.now();
-      const lsn = log.append(new Uint8Array([1, 2, 3]));
+      const lsn = await log.append(new Uint8Array([1, 2, 3]));
       await vi.advanceTimersByTimeAsync(IDLE_FLUSH_MS);
       expect(headers).toHaveLength(2);
       const idle = (headers[1] ?? Infinity) - start;

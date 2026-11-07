@@ -623,9 +623,12 @@ async function readQuery<T>(
 // Executor and owner: `INSERT … RETURNING id` with id from nextval inside an explicit
 // transaction. The block's frame is standalone, so its durability never waits for COMMIT.
 
-function drawIds(sequences: SequenceAccess, count: number): { ids: number[]; waitLsn: number } {
+async function drawIds(
+  sequences: SequenceAccess,
+  count: number,
+): Promise<{ ids: number[]; waitLsn: number }> {
   const out = { repr: "safe" as const, values: new Float64Array(count) };
-  const waitLsn = sequences.next(42, count, out, 0);
+  const waitLsn = await sequences.next(42, count, out, 0);
   return { ids: Array.from(out.values), waitLsn };
 }
 
@@ -682,7 +685,7 @@ describe("owner composition", () => {
       flushed.push(lsn);
       return Promise.resolve();
     };
-    const { ids, waitLsn } = drawIds(sequences, 3);
+    const { ids, waitLsn } = await drawIds(sequences, 3);
     await durable(Math.max(5, waitLsn)); // view.observedLsn 5; no COMMIT involved
     expect(ids).toEqual([1, 2, 3]);
     expect(flushed).toEqual([9]);

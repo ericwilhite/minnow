@@ -4,7 +4,8 @@
  * - **Writer slot.** `begin()` queues FIFO; the holder's transaction writes into the shared
  *   structures under pending seqs (transaction.ts).
  * - **Commit.** The transaction's effects become one log transaction (body.ts, log.ts); its changes
- *   are restamped to the commit LSN in the same synchronous step, so the next writer sees them.
+ *   are restamped to the commit LSN once the complete body is appended, before releasing the
+ *   writer slot. Small fitting commits keep the synchronous encoding path.
  * - **Flush.** A frozen memtable whose rows and deltas are committed, durable, and not shared with
  *   a transaction that continues into the next memtable is written as a column group (page
  *   format's `GroupWriter`) plus one run per index, published in a new root through the extent
@@ -29,6 +30,8 @@ export type EngineInput = OpenWritePathInput & {
   readonly deferInitialMaintenance?: boolean;
   readonly tuning?: {
     readonly memtableRows?: number;
+    /** Tests: actual buffer ownership, independent of the governor charge. */
+    readonly onCommitBuffer?: (buffer: Uint8Array, live: boolean) => void;
     /**
      * Index run merges (merge.ts): `auto` (the default) merges whenever a level is in debt;
      * `manual` only in `runMaintenance()`; `off` never (benchmark baselines). The policy fields
@@ -98,7 +101,7 @@ import {
 import { Replayer, type Effect } from "../format/replay.js";
 import { walkReachable } from "../format/reachable.js";
 import { encodeKeyBatch, KeyBatch } from "../keys/key-encoding.js";
-import type { Grant } from "../memory/governor.js";
+import type { Grant, Loan } from "../memory/governor.js";
 import { MetadataBudget, releaseIdle } from "./budget.js";
 import { GroupWriter } from "../page/writer.js";
 import type { StoreSession } from "../storage/contract.js";
@@ -109,6 +112,14 @@ import { layoutOf } from "../types.js";
 import type { Vector } from "../vector/vector.js";
 import { compareBytes } from "../vector/varlen.js";
 import { decodeBody, encodeBody } from "./body.js";
+import {
+  COMMIT_MINIMUM_BYTES,
+  CommitBuffers,
+  SMALL_COMMIT_BYTES,
+  StreamCommit,
+} from "./commit-buffers.js";
+import { ByteWindow } from "./window.js";
+import { sortDeleteOrder, streamBody } from "./stream-body.js";
 import { MemtableMemoryError } from "./bytes.js";
 import type { MaybePromise } from "../access/key-index.js";
 import { ByteWriter } from "./bytes.js";
@@ -156,7 +167,13 @@ import {
   type TableView,
   type WriteState,
 } from "./state.js";
-import { hexId, TransactionImpl, type EngineHooks, type PublishedRows } from "./transaction.js";
+import {
+  hexId,
+  TransactionImpl,
+  jsonBound,
+  type EngineHooks,
+  type PublishedRows,
+} from "./transaction.js";
 import { SnapshotImpl } from "./view.js";
 import { need } from "./bytes.js";
 
@@ -398,8 +415,23 @@ export class WritePathImpl implements WritePath, EngineHooks {
   readonly shared: Shared;
   readonly keys: KeyBatch;
   /** Reused per commit: inserted column bytes, then the encoded body. */
-  readonly #columns = new ByteWriter(64 * 1024);
-  readonly #body = new ByteWriter(64 * 1024);
+  readonly #columns: ByteWriter;
+  readonly #body: ByteWriter;
+  readonly #sequenceBody: ByteWriter;
+  readonly #commitBuffers: CommitBuffers;
+  readonly #commitRuns = new Set<Promise<unknown>>();
+  readonly #commitTemporaries: Uint8Array[] = [];
+  readonly #commitAllocator = {
+    create: (bytes: number) => {
+      const buffer = this.#commitBuffers.create(bytes);
+      this.#commitTemporaries.push(buffer);
+      return buffer;
+    },
+    release: (buffer: Uint8Array) => this.#commitBuffers.release(buffer),
+    reserve: (bytes: number) => this.#commitBuffers.reserve(bytes),
+  };
+  readonly #commitAbort = new AbortController();
+  readonly #abortCommit = () => this.#commitAbort.abort(this.#signal?.reason);
   readonly #session: StoreSession;
   readonly #space: Space;
   readonly #grant: Grant;
@@ -416,6 +448,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   #root: ManifestRoot;
   #failure: Error | null = null;
   #closed = false;
+  #closing: Promise<void> | null = null;
   #holder: TransactionImpl | null = null;
   /** Writers and maintenance waiting for the slot, FIFO; `take` claims it for the waiter. */
   readonly #queue: Array<{
@@ -568,6 +601,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   private constructor(
     input: EngineInput,
     grant: Grant,
+    commitBuffers: CommitBuffers,
     root: ManifestRoot,
     catalog: Catalog,
     metadata: {
@@ -577,6 +611,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
       readonly lists: ExtentListKeeper;
     },
   ) {
+    this.#commitBuffers = commitBuffers;
+    this.#columns = new ByteWriter(64 * 1024, commitBuffers, SMALL_COMMIT_BYTES);
+    this.#body = new ByteWriter(64 * 1024, commitBuffers, SMALL_COMMIT_BYTES);
+    this.#sequenceBody = new ByteWriter(256, commitBuffers, SMALL_COMMIT_BYTES);
     this.#metadataGrant = metadata.grant;
     this.#metadataBudget = metadata.budget;
     this.#lists = metadata.lists;
@@ -611,23 +649,39 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#stageFault = input.tuning?.stageFault ?? null;
     this.#now = input.options.now ?? Date.now;
     this.#signal = input.options.signal;
+    this.#signal?.addEventListener("abort", this.#abortCommit, { once: true });
     this.#root = root;
     this.#catalog = catalog;
     this.#baseCatalog = catalog;
     this.#version = catalog.version;
     this.ledger = RequestLedger.restore(root.clients, this.#now());
     this.sequences = new Sequences({
+      check: () => this.#check(),
       definition: (id) => this.#catalog.sequence(id) ?? this.#holder?.catalog.sequence(id),
       logReservation: (sequenceId, reservedThrough) => {
-        const lsn = this.#appender.append(
-          encodeBody({
-            request: null,
-            effects: [{ kind: "sequence", sequenceId, reservedThrough }],
-          }),
-        );
-        // Standalone frames count toward the log bound too (review B3-p2b-1 #5).
-        this.#afterAppend();
-        return lsn;
+        if (!this.#commitBuffers.grant.allocate(1024))
+          throw new Error("Bounded sequence workspace was exhausted");
+        try {
+          const lsn = this.#appender.append(
+            encodeBody(
+              {
+                request: null,
+                effects: [{ kind: "sequence", sequenceId, reservedThrough }],
+              },
+              this.#sequenceBody,
+            ),
+          );
+          // Standalone frames count toward the log bound too (review B3-p2b-1 #5).
+          if (lsn instanceof Promise)
+            return lsn.then((value) => {
+              this.#afterAppend();
+              return value;
+            });
+          this.#afterAppend();
+          return lsn;
+        } finally {
+          this.#commitBuffers.grant.free(1024);
+        }
       },
       now: this.#now,
     });
@@ -665,7 +719,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
     grant.onReclaimRequest(reclaimWriter);
     metadataGrant.onReclaimRequest(() => releaseIdle(metadataGrant));
     const metadataBudget = new MetadataBudget(metadataGrant, reclaimWriter);
+    let commitBuffers: CommitBuffers | null = null;
+    let engine: WritePathImpl | null = null;
     try {
+      const bufferGrant = await input.governor.admit({
+        label: "write commit buffers",
+        minimumBytes: COMMIT_MINIMUM_BYTES,
+        spillable: false,
+        ...(input.options.signal === undefined ? {} : { signal: input.options.signal }),
+      });
+      commitBuffers = new CommitBuffers(bufferGrant, input.tuning?.onCommitBuffer);
       const { space, session } = input;
       let rootCharge = 0;
       let root: ManifestRoot;
@@ -731,7 +794,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         lists = new ExtentListKeeper(root.extentList, { reader: space, budget: grant });
         catalog = Catalog.decode(await readBlob(space, root.catalog, grant));
       }
-      const engine = new WritePathImpl(input, grant, root, catalog, {
+      engine = new WritePathImpl(input, grant, commitBuffers, root, catalog, {
         grant: metadataGrant,
         budget: metadataBudget,
         rootCharge,
@@ -743,6 +806,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (input.deferInitialMaintenance !== true) engine.startInitialMaintenance();
       return engine;
     } catch (error) {
+      if (engine !== null) engine.#signal?.removeEventListener("abort", engine.#abortCommit);
+      commitBuffers?.close();
       metadataGrant.close();
       grant.close();
       throw error;
@@ -927,9 +992,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
           : { end: header.ackEnd, chain: header.ackChain, lsn: header.ackLsn },
       rootSequence: root.log.rootSequence,
     };
-    this.#appender = new LogAppender(session, position, this.durability === "strict", (error) => {
-      this.#failure = error;
-    });
+    this.#appender = new LogAppender(
+      session,
+      position,
+      this.durability === "strict",
+      (error) => {
+        this.#failure = error;
+      },
+      this.#commitBuffers,
+      () => this.#check(),
+    );
   }
 
   async #replay(replayer: Replayer, lsn: number, body: CommitFrameBody): Promise<void> {
@@ -1853,88 +1925,224 @@ export class WritePathImpl implements WritePath, EngineHooks {
     tx: TransactionImpl,
     request: CommitRequest | null,
     staged: (tableId: number) => PublishedRows | null,
+    preflighted = false,
   ): Promise<CommitReceipt> {
     try {
       this.#check();
-      const effects = tx.effects(this.#columns, staged);
-      if (effects.length === 0) {
-        this.release(tx);
-        this.#afterAppend(); // sequence frames may have grown the log meanwhile
-        return Promise.resolve({ wrote: false, lsn: tx.baseLsn, durable: Promise.resolve() });
-      }
-      const lsn = this.#appender.append(encodeBody({ request, effects }, this.#body));
-      tx.restamp(lsn);
-      // Claimed by the frame. A staged commit spans memtables, and a commit flushes whole: its
-      // live tail (committed now) freezes, so the fold can run at once.
-      if (this.#txStaging.delete(tx))
-        for (const state of this.#tables.values()) {
-          const last = state.view.memtables[state.view.memtables.length - 1];
-          if (
-            last?.state === "live" &&
-            last.rowCount > 0 &&
-            last.visibleRows(MAX_LSN) === last.rowCount &&
-            state.view.memtables.some((memtable) => memtable.staged !== null)
-          ) {
-            last.state = "frozen";
-            last.measure();
-            this.#setView(state, { ...state.view });
-          }
+      const workspace = tx.commitWorkspaceBytes();
+      if (workspace > SMALL_COMMIT_BYTES)
+        return this.#trackCommit(this.#streamCommit(tx, request, staged), tx);
+      if (
+        !preflighted &&
+        (tx.needsCommitPreflight() ||
+          (request !== null && jsonBound(request.counts, SMALL_COMMIT_BYTES) > SMALL_COMMIT_BYTES))
+      )
+        return this.#trackCommit(this.#preflightCommit(tx, request, staged), tx);
+      let body: Uint8Array;
+      if (!this.#commitBuffers.grant.allocate(workspace))
+        throw new Error("Bounded commit workspace was exhausted");
+      const temporaries = this.#commitTemporaries;
+      try {
+        const effects = tx.effects(this.#columns, staged, this.#commitAllocator);
+        if (effects.length === 0) {
+          this.release(tx);
+          this.#afterAppend();
+          return Promise.resolve({ wrote: false, lsn: tx.baseLsn, durable: Promise.resolve() });
         }
-      if (tx.catalog !== this.#catalog) {
-        this.#catalog = tx.catalog;
-        this.#catalogHistory.push({ lsn, catalog: tx.catalog });
-        for (const effect of effects) {
-          if (effect.kind === "createTable") {
-            const state = this.#tables.get(effect.tableId);
-            if (state !== undefined) {
-              state.createdLsn = lsn;
-              state.flushedThroughLsn = lsn - 1;
-            }
-          }
-          if (effect.kind === "dropTable") {
-            // Strict readers pin the durable LSN: keep the state until the drop is durable.
-            const tableId = effect.tableId;
-            const wait = this.durability === "strict" ? this.#appender.durable(lsn) : null;
-            if (wait === null) this.#dropTableState(tableId);
-            else
-              void wait.then(
-                () => {
-                  if (this.#catalog.table(tableId) === undefined) this.#dropTableState(tableId);
-                },
-                () => undefined,
-              );
-          }
-          if (effect.kind === "catalog") {
-            const change = decodeLogged(effect.definition);
-            if (change.op === "dropSequence") this.sequences.drop(change.sequenceId);
-            if (change.op === "createIndex")
-              this.#pendingIndexes.set(change.index.id, { tableId: change.index.tableId, lsn });
-            if (change.op === "dropIndex") this.#pendingIndexes.delete(change.indexId);
-          }
-        }
+        body = encodeBody({ request, effects }, this.#body);
+      } catch (error) {
+        if (!(error instanceof StreamCommit)) throw error;
+        return this.#trackCommit(this.#streamCommit(tx, request, staged), tx);
+      } finally {
+        for (const buffer of temporaries) this.#commitBuffers.release(buffer);
+        temporaries.length = 0;
+        this.#commitBuffers.grant.free(workspace);
       }
-      this.#afterAppend();
-      this.#lastCommitAt = performance.now();
-      const receipt = new Receipt(lsn, this.#appender);
-      if (request !== null) {
-        const record = () => {
-          this.ledger.record(hexId(request.clientId), request.sequence, {
-            kind: "committed",
-            lsn,
-            counts: request.counts,
-            recordedAtMs: this.#now(),
-          });
-        };
-        if (this.durability === "strict") void receipt.durable.then(record, () => undefined);
-        else record();
-      }
-      this.release(tx);
-      return Promise.resolve(receipt);
+      const lsn = this.#appender.append(body);
+      if (lsn instanceof Promise)
+        return this.#trackCommit(
+          lsn.then((value) => {
+            this.#check();
+            return this.#finishCommit(tx, request, value);
+          }),
+          tx,
+        );
+      return Promise.resolve(this.#finishCommit(tx, request, lsn));
     } catch (error) {
       tx.undoTo(0);
       this.release(tx);
       return Promise.reject(error instanceof Error ? error : new Error(String(error)));
     }
+  }
+
+  async #preflightCommit(
+    tx: TransactionImpl,
+    request: CommitRequest | null,
+    staged: (tableId: number) => PublishedRows | null,
+  ): Promise<CommitReceipt> {
+    const releaseWorkspace = this.#commitBuffers.reserve(16 * 1024);
+    const scratch = this.#commitBuffers.create(4096);
+    let length: number;
+    try {
+      const counter = new ByteWindow(scratch.subarray(0, 0), 0, scratch);
+      await streamBody(tx, request, staged, counter, () => this.#check());
+      length = counter.length;
+    } finally {
+      this.#commitBuffers.release(scratch);
+      releaseWorkspace();
+    }
+    this.#check();
+    if (length > SMALL_COMMIT_BYTES || tx.commitWorkspaceBytes() > SMALL_COMMIT_BYTES)
+      return this.#streamCommit(tx, request, staged);
+    return this.#commitNow(tx, request, staged, true);
+  }
+
+  #trackCommit(run: Promise<CommitReceipt>, tx: TransactionImpl): Promise<CommitReceipt> {
+    const settled = run.catch((error: unknown) => {
+      tx.undoTo(0);
+      this.release(tx);
+      throw error;
+    });
+    this.#commitRuns.add(settled);
+    void settled.finally(() => this.#commitRuns.delete(settled)).catch(() => undefined);
+    return settled;
+  }
+
+  async #streamCommit(
+    tx: TransactionImpl,
+    request: CommitRequest | null,
+    staged: (tableId: number) => PublishedRows | null,
+  ): Promise<CommitReceipt> {
+    const releaseWorkspace = this.#commitBuffers.reserve(16 * 1024);
+    const scratch = this.#commitBuffers.create(4096);
+    let orderBytes: Uint8Array | null = null;
+    let loan: Loan | null = null;
+    try {
+      let deletes = 0;
+      let unordered = false;
+      let previousRow = -Infinity;
+      for (let k = 0; k < tx.undo.length; k++) {
+        if ((k & 1023) === 0) {
+          this.#check();
+          if (taskClock.due()) await yieldTask();
+        }
+        const entry = need(tx.undo[k]);
+        if (entry.kind === "memDelete" || entry.kind === "groupDelete") {
+          deletes++;
+          unordered ||= entry.rowId < previousRow;
+          previousRow = entry.rowId;
+        }
+        if (entry.kind === "catalog") previousRow = -Infinity;
+      }
+      let order: Int32Array | undefined;
+      if (
+        deletes > 0 &&
+        unordered &&
+        deletes * 4 <= this.#governor.reserveBytes &&
+        tx.undo.length <= 0x7fffffff
+      ) {
+        loan = await this.#commitBuffers.grant.borrow(deletes * 4, this.#commitAbort.signal);
+        this.#check();
+        orderBytes = this.#commitBuffers.create(deletes * 4);
+        order = new Int32Array(orderBytes.buffer);
+        await sortDeleteOrder(tx, staged, order, () => this.#check());
+      }
+      const counter = new ByteWindow(scratch.subarray(0, 0), 0, scratch);
+      const effectCount = await streamBody(tx, request, staged, counter, () => this.#check());
+      if (effectCount === 0) {
+        this.release(tx);
+        this.#afterAppend();
+        return { wrote: false, lsn: tx.baseLsn, durable: Promise.resolve() };
+      }
+      this.#check();
+      const lsn = await this.#appender.appendStream(counter.length, async (body, offset) => {
+        this.#check();
+        await streamBody(
+          tx,
+          request,
+          staged,
+          new ByteWindow(body, offset, scratch),
+          () => this.#check(),
+          order,
+        );
+      });
+      this.#check();
+      return this.#finishCommit(tx, request, lsn);
+    } finally {
+      if (orderBytes !== null) this.#commitBuffers.release(orderBytes);
+      loan?.repay();
+      this.#commitBuffers.release(scratch);
+      releaseWorkspace();
+    }
+  }
+
+  #finishCommit(tx: TransactionImpl, request: CommitRequest | null, lsn: number): CommitReceipt {
+    tx.restamp(lsn);
+    // Claimed by the frame. A staged commit spans memtables, and a commit flushes whole: its
+    // live tail (committed now) freezes, so the fold can run at once.
+    if (this.#txStaging.delete(tx))
+      for (const state of this.#tables.values()) {
+        const last = state.view.memtables[state.view.memtables.length - 1];
+        if (
+          last?.state === "live" &&
+          last.rowCount > 0 &&
+          last.visibleRows(MAX_LSN) === last.rowCount &&
+          state.view.memtables.some((memtable) => memtable.staged !== null)
+        ) {
+          last.state = "frozen";
+          last.measure();
+          this.#setView(state, { ...state.view });
+        }
+      }
+    if (tx.catalog !== this.#catalog) {
+      this.#catalog = tx.catalog;
+      this.#catalogHistory.push({ lsn, catalog: tx.catalog });
+      for (const change of tx.loggedChanges()) {
+        if (change.op === "createTable") {
+          const state = this.#tables.get(change.table.id);
+          if (state !== undefined) {
+            state.createdLsn = lsn;
+            state.flushedThroughLsn = lsn - 1;
+          }
+        }
+        if (change.op === "dropTable") {
+          // Strict readers pin the durable LSN: keep the state until the drop is durable.
+          const tableId = change.tableId;
+          const wait = this.durability === "strict" ? this.#appender.durable(lsn) : null;
+          if (wait === null) this.#dropTableState(tableId);
+          else
+            void wait.then(
+              () => {
+                if (this.#catalog.table(tableId) === undefined) this.#dropTableState(tableId);
+              },
+              () => undefined,
+            );
+        }
+        {
+          if (change.op === "dropSequence") this.sequences.drop(change.sequenceId);
+          if (change.op === "createIndex")
+            this.#pendingIndexes.set(change.index.id, { tableId: change.index.tableId, lsn });
+          if (change.op === "dropIndex") this.#pendingIndexes.delete(change.indexId);
+        }
+      }
+    }
+    this.#afterAppend();
+    this.#lastCommitAt = performance.now();
+    const receipt = new Receipt(lsn, this.#appender);
+    if (request !== null) {
+      const record = () => {
+        this.ledger.record(hexId(request.clientId), request.sequence, {
+          kind: "committed",
+          lsn,
+          counts: request.counts,
+          recordedAtMs: this.#now(),
+        });
+      };
+      if (this.durability === "strict") void receipt.durable.then(record, () => undefined);
+      else record();
+    }
+    this.release(tx);
+    return receipt;
   }
 
   durable(lsn: number): Promise<void> | null {
@@ -2102,13 +2310,21 @@ export class WritePathImpl implements WritePath, EngineHooks {
     return total;
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    return (this.#closing ??= this.#closeNow());
+  }
+
+  async #closeNow(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    this.#commitAbort.abort(new WritePathClosedError());
+    this.#signal?.removeEventListener("abort", this.#abortCommit);
     if (this.#idleTimer !== null) clearTimeout(this.#idleTimer);
     this.#idleTimer = null;
     // Staging owns memtables until its writer has settled. Rollback may release them.
     await Promise.allSettled(this.#stagingRuns);
+    await Promise.allSettled(this.#commitRuns);
+    await this.sequences.settled();
     this.#holder?.rollback();
     for (const waiter of this.#queue.splice(0)) waiter.reject(new WritePathClosedError());
     await this.#recycling;
@@ -2119,17 +2335,24 @@ export class WritePathImpl implements WritePath, EngineHooks {
     // An idle publication already started finishes (or, not yet publishing, sees close and
     // stops) before anything is released: nothing publishes after close resolves.
     await this.#idleRun;
-    if (this.#appender.failure === null) await this.#appender.close();
-    this.keys.close();
-    for (const state of this.#tables.values())
-      for (const memtable of state.view.memtables) memtable.releaseAll();
-    for (const memtable of this.#published) memtable.releaseAll();
-    this.#currentPin?.release();
-    this.#currentPin = null;
-    for (const cache of this.#metadataCaches) cache.clear();
-    this.#lists.close();
-    this.#metadataGrant.close();
-    this.#grant.close();
+    try {
+      if (this.#appender.failure === null) await this.#appender.close();
+    } finally {
+      this.keys.close();
+      for (const state of this.#tables.values())
+        for (const memtable of state.view.memtables) memtable.releaseAll();
+      for (const memtable of this.#published) memtable.releaseAll();
+      this.#currentPin?.release();
+      this.#currentPin = null;
+      for (const cache of this.#metadataCaches) cache.clear();
+      this.#lists.close();
+      this.#metadataGrant.close();
+      this.#columns.close();
+      this.#body.close();
+      this.#sequenceBody.close();
+      this.#commitBuffers.close();
+      this.#grant.close();
+    }
   }
 
   // ── Shared caches ────────────────────────────────────────────────────────────────────────
