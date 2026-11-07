@@ -84,6 +84,10 @@ next release is a minor one, as the [versioning policy](/docs/reference/versioni
 during 0.x. It will name its packages here. Each change says what to rewrite; the **Migration**
 list below collects them.
 
+- Window frames reject an end bound of an earlier kind than their start, as PostgreSQL does:
+  `ROWS BETWEEN CURRENT ROW AND 1 PRECEDING` is an error, including over an empty input.
+  Same-kind bounds such as `ROWS BETWEEN 1 PRECEDING AND 5 PRECEDING` remain valid empty frames.
+
 - The exported query-plan type `CompiledStatement` gains three optional fields: `truncate` on a
   delete that came from `TRUNCATE`, and `declaredTypeName` and `declaredLength` on column
   definitions, which keep the declared `NUMERIC`/`DECIMAL` spelling and `VARCHAR(n)`/`CHAR(n)`
@@ -202,6 +206,8 @@ these rewrites where an application uses the old forms:
   correlated aggregate, and `DISTINCT ON` positions.
 
 No stored format changes.
+
+No stored format changes or data migration are introduced by this fix.
 
 ## 0.19.3 — November 5, 2026
 

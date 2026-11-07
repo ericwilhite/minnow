@@ -12814,6 +12814,13 @@ class Parser {
       if (start.kind === "unbounded-following" || end.kind === "unbounded-preceding") {
         throw new TypeError("Window frame bounds are reversed");
       }
+      // SQL frame bounds are ordered by kind, even when the input is empty. Bounds of
+      // the same kind may still describe a legal empty frame (1 PRECEDING to 5 PRECEDING).
+      if (
+        (start.kind === "current-row" && end.kind === "preceding") ||
+        (start.kind === "following" && (end.kind === "preceding" || end.kind === "current-row"))
+      )
+        throw new TypeError("Window frame end cannot precede frame start");
       if (unit === "groups" && orderBy.length === 0) {
         throw new TypeError("GROUPS frames require ORDER BY inside OVER (...)");
       }

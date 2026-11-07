@@ -744,3 +744,15 @@ export const JOIN_BOOLEAN_REACH = [
   "hashed",
   "released",
 ] as const;
+
+/** Invalid bound-kind order differs from a legal same-kind frame with no members. */
+export const WINDOW_FRAME_ORDER_REACH = [
+  "shorthand",
+  "ROWS",
+  "RANGE",
+  "GROUPS",
+  "current then preceding",
+  "following then current",
+  "following then preceding",
+  "allowed empty",
+] as const;
