@@ -82,11 +82,15 @@ unknown outcome.
 
 ## A store that stops answering
 
-`StorageUnresponsiveError` means the database answered nothing at all for thirty seconds while
-the engine had work outstanding. Nothing in IndexedDB can be cancelled or timed out, so this
-deadline is what stands between a wedged browser and a call that never returns; any storage event
-resets it, so work queued behind a genuinely long transaction is never mistaken for a wedge.
-That includes native request events from bulk work that waits only for transaction completion.
+`StorageUnresponsiveError` means an IndexedDB wait exceeded its silence budget (thirty seconds by
+default). On an open connection with work outstanding, native request and transaction responses
+(`success`, `error`, `complete` and `abort`), and awaited request/transaction settlements, reset
+that budget. Bulk requests count without being awaited separately; so do cursor continuation and
+prevented request errors. A new request alone does not count as a response.
+
+`versionchange` starts superseding and closing instead of resetting that clock. An open request's
+`blocked` notification uses the separate open/upgrade wait policy. Neither notification proves
+that pending data requests are answering.
 
 The known cause is a worker terminated with `worker.terminate()` while one of its IndexedDB
 transactions was still queued — behind another of its own, or behind another tab's write that

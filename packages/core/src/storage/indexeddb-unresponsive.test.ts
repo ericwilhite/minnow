@@ -156,7 +156,15 @@ describe("an IndexedDB connection that stops answering", () => {
     let histories = 0;
     for (const budget of [40, 80])
       for (const divisor of [3, 5])
-        for (const kind of ["get", "getKey", "count", "cursor"] as const)
+        for (const kind of [
+          "get",
+          "getKey",
+          "count",
+          "cursor",
+          "cursor continuation",
+          "prevented request error",
+          "transaction abort",
+        ] as const)
           for (const sameConnection of [true, false])
             for (const waiters of [1, 2, 3, 4]) {
               reach.beginHistory();
@@ -170,6 +178,20 @@ describe("an IndexedDB connection that stops answering", () => {
               // request. Native requests then keep answering on this connection, or another
               // connection with the same name, without settling an adapter-owned promise.
               const nativeTransaction = trafficDb.transaction.bind(trafficDb);
+              const step = Math.floor(budget / divisor);
+              const rounds = Math.ceil((3 * budget) / step);
+              if (kind === "cursor continuation" || kind === "prevented request error") {
+                await new Promise<void>((resolve, reject) => {
+                  const transaction = nativeTransaction("blocks", "readwrite");
+                  const blocks = transaction.objectStore("blocks");
+                  if (kind === "cursor continuation") {
+                    for (let key = 0; key < rounds; key++) blocks.put("cursor value", key);
+                  } else blocks.put("original value", "duplicate");
+                  transaction.oncomplete = () => resolve();
+                  transaction.onabort = () =>
+                    reject(new Error("Native seed aborted", { cause: transaction.error }));
+                });
+              }
               wedge(db);
               try {
                 const failures = Array.from({ length: waiters }, (_, index) =>
@@ -181,47 +203,90 @@ describe("an IndexedDB connection that stops answering", () => {
                 void failures[0]?.then(() => {
                   settled = true;
                 });
-                const step = Math.floor(budget / divisor);
-                const rounds = Math.ceil((3 * budget) / step);
                 let observed = 0;
                 trafficDb.addEventListener(
-                  "success",
+                  kind === "prevented request error"
+                    ? "error"
+                    : kind === "transaction abort"
+                      ? "abort"
+                      : "success",
                   () => {
                     observed += 1;
                   },
                   true,
                 );
-                await new Promise<void>((resolve, reject) => {
-                  const transaction = nativeTransaction("blocks", "readonly");
-                  const blocks = transaction.objectStore("blocks");
-                  let completed = 0;
-                  const next = (): void => {
-                    const request =
-                      kind === "get"
-                        ? blocks.get("absent")
-                        : kind === "getKey"
-                          ? blocks.getKey("absent")
-                          : kind === "count"
-                            ? blocks.count()
-                            : blocks.openCursor("absent");
-                    request.onerror = () =>
-                      reject(new Error("Native request failed", { cause: request.error }));
-                    request.onsuccess = () => {
-                      completed += 1;
-                      // Advance between real success events (which do not bubble), leaving
-                      // the last event at the current time for the exact silence assertion.
-                      // No adapter request promise is released here.
-                      if (completed < rounds) {
-                        next();
-                        vi.advanceTimersByTime(step);
-                      }
+                if (kind === "transaction abort") {
+                  for (let round = 0; round < rounds; round++) {
+                    await new Promise<void>((resolve, reject) => {
+                      const transaction = nativeTransaction("blocks", "readwrite");
+                      transaction.onabort = () => resolve();
+                      transaction.oncomplete = () => reject(new Error("Expected native abort"));
+                      transaction.abort();
+                    });
+                    if (round + 1 < rounds) {
+                      await vi.advanceTimersByTimeAsync(step);
+                      if (sameConnection)
+                        expect(settled, "native abort responses keep this connection alive").toBe(
+                          false,
+                        );
+                    }
+                  }
+                } else
+                  await new Promise<void>((resolve, reject) => {
+                    const transaction = nativeTransaction(
+                      "blocks",
+                      kind === "prevented request error" ? "readwrite" : "readonly",
+                    );
+                    const blocks = transaction.objectStore("blocks");
+                    let completed = 0;
+                    const next = (): void => {
+                      const request =
+                        kind === "get"
+                          ? blocks.get("absent")
+                          : kind === "getKey"
+                            ? blocks.getKey("absent")
+                            : kind === "count"
+                              ? blocks.count()
+                              : kind === "prevented request error"
+                                ? blocks.add("replacement", "duplicate")
+                                : blocks.openCursor(
+                                    kind === "cursor continuation" ? undefined : "absent",
+                                  );
+                      request.onerror = (event) => {
+                        if (kind !== "prevented request error") {
+                          reject(new Error("Native request failed", { cause: request.error }));
+                          return;
+                        }
+                        expect(request.error?.name).toBe("ConstraintError");
+                        event.preventDefault();
+                        event.stopPropagation();
+                        response();
+                      };
+                      const response = (): void => {
+                        if (kind === "cursor continuation")
+                          expect((request.result as IDBCursorWithValue | null)?.key).toBe(
+                            completed,
+                          );
+                        completed += 1;
+                        // Advance between request responses; success does not bubble. Leave
+                        // the last response at the current time for the exact silence assertion.
+                        // No adapter request promise is released here.
+                        if (completed < rounds) {
+                          if (kind === "cursor continuation") {
+                            const cursor = request.result as IDBCursorWithValue | null;
+                            if (cursor === null) throw new Error("Populated cursor ended early");
+                            cursor.continue();
+                          } else next();
+                          vi.advanceTimersByTime(step);
+                        }
+                      };
+                      request.onsuccess = response;
                     };
-                  };
-                  transaction.oncomplete = () => resolve();
-                  transaction.onabort = () =>
-                    reject(new Error("Native transaction aborted", { cause: transaction.error }));
-                  next();
-                });
+                    transaction.oncomplete = () => resolve();
+                    transaction.onabort = () =>
+                      reject(new Error("Native transaction aborted", { cause: transaction.error }));
+                    next();
+                  });
                 await vi.advanceTimersByTimeAsync(0);
                 expect(observed, kind).toBe(rounds);
                 expect(settled, `${kind}: only this connection's native events count`).toBe(
@@ -252,7 +317,7 @@ describe("an IndexedDB connection that stops answering", () => {
                 vi.useRealTimers();
               }
             }
-    expect(histories).toBe(128);
+    expect(histories).toBe(224);
     reach.assertReached();
   });
 
