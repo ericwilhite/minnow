@@ -3,7 +3,8 @@
  * throw TypeError. No view may be used after release. The receiver must compact stream dictionaries
  * before exposing this handle, so their storage does not alias a released frame. Ordinary Result/cursor views do not use this handle.
  */
-import { frameTransferList, type FramePayload } from "../exec/result.js";
+import type { FramePayload } from "../exec/result.js";
+import { frameTransferList } from "../exec/frame-buffers.js";
 export function recyclingFrame(
   payload: FramePayload,
   ids: readonly number[],

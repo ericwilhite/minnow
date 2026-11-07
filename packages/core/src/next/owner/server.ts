@@ -38,6 +38,7 @@ import { LIVENESS_IDLE_RELEASE_MS } from "./election.js";
 import { beginTask } from "../exec/pipeline.js";
 import { QueryCancelledError } from "../exec/errors.js";
 import type { ResultFrame, ResultStream } from "../exec/result.js";
+import type { ReturnPool } from "../exec/return-pool.js";
 import type { Admission, Outcome } from "../format/ledger.js";
 import { CLIENT_RETRY_WINDOW_MS, MAX_OUTSTANDING_REQUESTS } from "../format/ledger.js";
 import { BATCH_TARGET_BYTES } from "../vector/vector.js";
@@ -63,6 +64,7 @@ import {
   ABANDONED_STREAM_MS,
   ALIVE_INTERVAL_MS,
   DEFAULT_TRANSACTION_IDLE_TIMEOUT_MS,
+  DEFAULT_RESULT_WINDOW_BYTES,
   LEASE_RELEASE_FAILURE_CONTEXT,
   PROTOCOL_VERSION,
   ProtocolError,
@@ -305,6 +307,7 @@ export class OwnerServer {
 }
 
 class Connection {
+  #returns: ReturnPool | null = null;
   readonly #server: OwnerServer;
   readonly #port: ServerPort;
   clientId = "";
@@ -340,12 +343,13 @@ class Connection {
 
   /**
    * Posts to the client. Result buffers are transferred, except below `TRANSFER_MIN_BYTES` in all,
-   * where cloning is cheaper (ruling R22.1); either way the frames stay charged until released.
+   * where cloning is cheaper (ruling R22.1). Explicit exports always transfer; either way
+   * frame credits stay charged until released, independently of export buffer returns.
    */
-  post(message: OwnerMessage, transfer: ArrayBuffer[] = []): void {
+  post(message: OwnerMessage, transfer: ArrayBuffer[] = [], recycling = false): void {
     if (this.#state === "closed") return;
     this.#lastPostAt = this.#server.now();
-    this.#port.postMessage(message, transfer.length === 0 ? transfer : transferFor(transfer));
+    this.#port.postMessage(message, recycling ? transfer : transferFor(transfer));
   }
 
   /**
@@ -394,6 +398,9 @@ class Connection {
         return;
       case "release":
         this.#release(message.target, message.through);
+        return;
+      case "returnBuffers":
+        this.#returns?.release(message.through, message.buffers);
         return;
       case "liveness":
         this.#livenessHeld = message.held;
@@ -838,7 +845,29 @@ class Connection {
         : null,
       windowBytes: result?.windowBytes ?? 2 * BATCH_TARGET_BYTES,
       frameRows: result?.frameRows ?? null,
+      ...(result?.recycle === true ? { outputBuffers: this.#returnPool() } : {}),
     };
+  }
+
+  #returnPool(): ReturnPool {
+    return (this.#returns ??= this.#server.engine.createReturnPool(
+      2 * DEFAULT_RESULT_WINDOW_BYTES,
+    ));
+  }
+
+  #frameReturns(
+    request: Request,
+    frames: readonly ResultFrame[],
+  ): {
+    readonly bufferIds?: ReadonlyArray<readonly number[]>;
+  } {
+    return "result" in request && request.result.recycle === true
+      ? {
+          bufferIds: frames.map((frame) =>
+            this.#returnPool().issue(frame.payload.sequence, frame.transfer),
+          ),
+        }
+      : {};
   }
 
   #execute(
@@ -896,6 +925,8 @@ class Connection {
       switch (request.t) {
         case "statement": {
           if (planned === null) throw new ProtocolError("A statement without a plan");
+          if (request.result.recycle === true && planned.kind !== "query")
+            throw new TypeError("Streaming export requires a query");
           const statement = planned;
           if (statement.pointRead && session !== null) {
             const now = session.runNow(statement, request.params, context);
@@ -1091,9 +1122,11 @@ class Connection {
         seq: request.seq,
         columns: this.#columnsFor(request, run.columns, planned.catalogVersion),
         frames: payloads,
+        ...this.#frameReturns(request, frames),
         summary: this.#summary(run.outcome, session, false),
       },
       transfer,
+      request.result.recycle === true,
     );
     this.#sweepIfNeeded();
   }
@@ -1137,8 +1170,15 @@ class Connection {
         : this.#columnsFor(request, columnsMeta, planned?.catalogVersion ?? -1);
       columnsSent = true;
       this.post(
-        { t: "rows", seq: request.seq, columns, frames: pending.map((frame) => frame.payload) },
+        {
+          t: "rows",
+          seq: request.seq,
+          columns,
+          frames: pending.map((frame) => frame.payload),
+          ...this.#frameReturns(request, pending),
+        },
         transfer,
+        "result" in request && request.result.recycle === true,
       );
       stream.posted.push(...pending);
       stream.lastActivityMs = this.#server.now();
@@ -1262,9 +1302,11 @@ class Connection {
           ? null
           : this.#columnsFor(request, columnsMeta, planned?.catalogVersion ?? -1),
         frames: frames.map((frame) => frame.payload),
+        ...this.#frameReturns(request, frames),
         summary: this.#summary(outcome, session, closedEarly),
       },
       transfer,
+      "result" in request && request.result.recycle === true,
     );
   }
 
@@ -1483,6 +1525,8 @@ class Connection {
   end(reason: "bye" | "reconnected" | "livenessLost" | "stepDown", keepPort = false): void {
     if (this.#state === "closed") return;
     this.#state = "closed";
+    this.#returns?.close();
+    this.#returns = null;
     void reason;
     // Requests past the commit boundary complete (their frames are released as they come).
     for (const running of this.#running.values()) {

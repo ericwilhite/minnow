@@ -54,6 +54,7 @@ import type { ExecutorCosts } from "../ir/costs.js";
 import type { OutputColumn, PhysicalPlan } from "../ir/ir.js";
 import { statisticsDrifted, type PlanningStatistics } from "../lower/statistics.js";
 import type { MemoryGovernor } from "../memory/governor.js";
+import { ReturnPool } from "../exec/return-pool.js";
 import type { SpillService } from "../spill/contract.js";
 import { PG_EPOCH_UNIX_MICROS } from "../temporal.js";
 import { UnsupportedPlanError } from "../errors.js";
@@ -239,6 +240,9 @@ export function composeEngine(options: ComposeOptions): OwnerEngine {
 }
 
 class ComposedEngine implements OwnerEngine {
+  createReturnPool(capBytes: number): ReturnPool {
+    return new ReturnPool(this.#options.governor, capBytes);
+  }
   readonly #options: ComposeOptions & { readonly executor: Executor };
   readonly #now: () => number;
   readonly #plans = new Map<string, PlannedStatement>();
@@ -573,6 +577,7 @@ class ComposedSession implements EngineSession {
       signal: context.signal,
       resultWindowBytes: context.windowBytes,
       resultFrameRows: context.frameRows,
+      ...(context.outputBuffers ? { outputBuffers: context.outputBuffers } : {}),
       returning,
       ...target,
     });

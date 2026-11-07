@@ -4,7 +4,9 @@
  *
  * ## Shapes
  * - A `Batch` is up to `BATCH_ROWS` rows and about `BATCH_TARGET_BYTES` bytes (`batchRowsFor`):
- *   one `Vector` per column plus an optional `Selection` naming the active rows. Rows outside the
+ *   an explicit terminal recycling export may target up to twice that byte budget, bounded by
+ *   its result grant and credits. There is one `Vector` per column plus an optional `Selection`
+ *   naming the active rows. Rows outside the
  *   selection are present but must be ignored. Wide rows mean fewer rows, never bigger batches;
  *   a single row larger than the target is a batch of one (memory/governor.ts admits it).
  * - A `Vector` is `flat` (one slot per row), `constant` (one value for every row), or

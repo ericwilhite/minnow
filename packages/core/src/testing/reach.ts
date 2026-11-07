@@ -758,3 +758,25 @@ export const OUTPUT_RETURN_PRESSURE_REACH = [
   "stale size replaced",
   "pressure close returns charges",
 ] as const;
+
+export const OWNER_EXPORT_REACH = [
+  "credit independent of return",
+  "ordinary lifetime",
+  "held after credit",
+  "release after cancel",
+  "early close",
+  "release after reconnect",
+  "release after owner change",
+  "lost return does not block",
+  "detached across reuse",
+  "double release",
+  "small frames",
+  "large frames",
+] as const;
+
+export const OWNER_EXPORT_DATA_REACH = {
+  real: ["real factory and SQL", "wide int64 and large text", "sparse source", "all-valid source"],
+  dictionary: ["compacted dictionary delta", "later dictionary append"],
+  views: ["first view partial", "later alias partial"],
+  preconnect: ["close before connect", "cancel before connect", "concurrent next refused"],
+} as const;

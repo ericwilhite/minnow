@@ -644,7 +644,7 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     Registry entries use ordinary result-grant capacity, so a delta frame can return its progress
     loan before the stream ends. Dictionary pages and borrowed codes never enter a transfer list.
     A direct terminal full scan decodes tight dedicated output into the result grant.
-    Only the explicit recycling export experiment doubles its owned batch target, bounded by
+    Only explicit recycling exports double its owned batch target, bounded by
     the existing result credit window (2 MiB at the default cap/window). This amortizes wide-column
     allocation without changing the 2,048-row limit. Ordinary results, other producers and
     consumer pipelines keep their existing target;
@@ -688,8 +688,8 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     `MINNOW_EXPORT_DISCARD=1` is an explicit discard-consumer diagnostic: detach consumed column
     buffers, retaining dictionary deltas until stream close. It changes no public Result lifetime
     and does not guarantee lower RSS: backing-store disposal can still wait for GC/allocator work.
-  - `MINNOW_EXPORT_RECYCLE=1 MINNOW_EXPORT_RSS_SERIES=1` is an **opt-in return-pool experiment**,
-    not the ordinary owner client. It keeps the existing per-buffer frame contract. Its export
+  - `MINNOW_EXPORT_RECYCLE=1 MINNOW_EXPORT_RSS_SERIES=1` is the dedicated executor/transport component bench for the adopted explicit return mode.
+    The production owner client exposes it through `exportStream()`, separately from `query()`. It keeps the existing per-buffer frame contract. Its export
     receiver exposes `recyclingFrame(...).release()`: only explicit relinquishment transfers
     the dedicated frame buffers back. Receipt and cursor credits keep their existing timing and
     do not end ordinary result/view lifetimes. After release, typed views are detached (length
@@ -716,7 +716,8 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     required for throughput and fixed-baseline RSS. Five standalone recycling passes met the RSS
     bound; paired passes can inherit ordinary-result garbage from the previous variant. The return
     component increases CPU with disjoint ranges, and whole-export throughput does not improve
-    beyond the spread. Keep this experiment and the larger-batch change on hold.
+    beyond the spread. The lead accepted its memory/CPU tradeoff for explicit export; ordinary
+    queries keep their batch target. Absolute Gate A throughput will be measured on a quiet host.
     `MINNOW_EXPORT_GC_EACH=1` adds post-pass forced-GC diagnostics, outside timed exports and
     outside the sampled peak. It is diagnostic evidence, not an RSS acceptance run.
   - `scripts/vector-materialize-bench.mts --compare=REV` isolates loaded-page vector building,
@@ -1481,6 +1482,59 @@ include it. Validation checks all normalized words, row multiplicity and stable 
 
 ### Owner and client protocol (`owner/`)
 
+The internal owner client is `ProtocolClient` (`owner/client.ts`). Its explicit columnar export
+API is `exportStream(sql, params?, { session?, windowBytes? })`. It is not a published package API.
+It accepts queries, including queries in a session, and rejects modifying/control statements.
+`query()` and the existing cursor retain their current lifetimes and 1 MiB source target.
+
+```ts
+const stream = client.exportStream("SELECT * FROM t");
+const columns = await stream.columns; // resolves with the first reply, before iteration completes
+try {
+  for await (const frame of stream.frames) {
+    try {
+      // Consume frame.payload's physical vectors. A dictionary column's codes use
+      // frame.dictionaries.locate(id, code); entries remain bytes, not decoded strings.
+      consume(columns, frame.payload, frame.dictionaries);
+    } finally {
+      frame.release();
+    }
+  }
+  await stream.done; // the owner's StatementSummary; it never waits for buffer returns
+} finally {
+  stream.close();
+}
+```
+
+Credits return when the iterator hands out a frame, at the existing piggyback/half-window/timer
+pacing. Only `frame.release()` relinquishes its buffers. It is idempotent and transfers all
+frame-owned buffers, even for a tiny frame that ordinary results would clone. After release,
+its typed views have length zero or throw `TypeError`; callers must not use them. Plain JS value
+arrays are copied values, not recycled storage. Per-stream dictionary deltas are copied into
+compact client storage before frame handout, so later codes remain readable after earlier frames
+are released. These dictionary chunks are shared stream storage, not frame-owned views.
+
+`close()` (also iterator `return()` on a break) ends normally and relinquishes queued frames;
+`cancel()` aborts iteration. Closing/cancelling before a request is sent rejects it locally with
+`CancelledError`, without replaying it after connect. Only one iterator `next()` may be pending.
+Both preserve frames already handed to the consumer, which remain
+valid until that consumer calls their release. A reconnect/owner change fails an already-started
+stream with `SessionLostError`; it never replays frames already received. Old frame handles
+capture their original connection. Releasing one after reconnect, client close or owner change
+still detaches locally, and never sends its capabilities to the replacement connection.
+
+Each connection creates its return pool lazily on its first export. It is charged to that owner's
+governor, capped at 4 MiB (twice the default credit window, regardless of larger user prefetch),
+and closed on connection teardown. Capabilities are one-use and bounded; expired, duplicate,
+foreign, detached or wrong-sized returns are dropped. No lost return is awaited. Client-held
+frames after credit are client memory: the cap bounds returned idle buffers, not arbitrary caller
+retention. A terminal full-table export can use the larger 2 MiB target and decode directly into
+exclusive returned output. SQL's names-only identity projection forwards that ownership and keeps
+its profile counters; computed/reordered projections retain the copying path. No page-cache or
+slab buffer is eligible. Protocol version 6 adds the explicit mode, capability lists and independent
+`returnBuffers` signal; old versions are refused during handshake. This is a wire-only change,
+with no stored-format change.
+
 - One owner per database holds the store's fence: a dedicated owner worker started by a page, or
   a dedicated worker hosting in place. Every other context is a thin client over a MessagePort
   brokered by a SharedWorker; the owner tab's own client uses a direct channel.
@@ -1520,7 +1574,7 @@ include it. Validation checks all normalized words, row multiplicity and stable 
   `CommittedWithoutResultError`, never an empty result.
 - Result frames are the executor's payloads, pulled and transferred without a copy, and charged
   until the client releases them. Dictionaries are per stream, sent as frame-level deltas.
-- A message whose buffers total less than `TRANSFER_MIN_BYTES` (1 KiB) is cloned, not
+- An ordinary message whose buffers total less than `TRANSFER_MIN_BYTES` (1 KiB) is cloned, not
   transferred: below it a copy is cheaper than detaching the buffers (R22.1; the latency lane
   measures the crossover per engine). Releases ride on the client's next request, or go alone
   after `RELEASE_DELAY_MS` (10 ms) or once half the result window is unreleased (R22.2).

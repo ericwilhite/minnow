@@ -9,7 +9,8 @@
  * A buffered result releases its frames as they arrive, a cursor a frame when the caller takes it.
  * Releases ride on the next request (`releases`), or go alone after `RELEASE_DELAY_MS` or once
  * half the window is unreleased (ruling R22.2). Either way the owner's window, not this
- * client, bounds what is in flight.
+ * client, bounds what is in flight. Explicit exports use cursor credit timing, but return their
+ * native buffers only when the consumer calls the frame handle's release().
  *
  * ## Reconnect
  * `reconnect(port)` opens the next generation and resends, unchanged, every request without a
@@ -48,6 +49,7 @@ import { SessionLostError } from "../errors.js";
 import { decodeUtf8 } from "../vector/varlen.js";
 import {
   ClientClosedError,
+  CancelledError,
   ConnectionRefusedError,
   OwnerUnreachableError,
   fromWireError,
@@ -81,6 +83,27 @@ import {
   isResendable,
   type StatementKind,
 } from "./sequence.js";
+import { recyclingFrame } from "./recycling-frame.js";
+
+/** Dedicated views remain valid until release(), including across cancellation/reconnect.
+ * release() is idempotent and detaches the frame's typed views permanently. Dictionaries have
+ * independent compact storage, shared by this stream's handles, and are not relinquished here.
+ */
+export interface ExportFrame {
+  readonly payload: FramePayload;
+  readonly dictionaries: StreamDictionaries;
+  release(): void;
+}
+
+export interface ExportStream {
+  readonly seq: number;
+  readonly columns: Promise<readonly WireColumnMeta[]>;
+  readonly frames: AsyncIterableIterator<ExportFrame>;
+  readonly done: Promise<StatementSummary>;
+  /** Stop iteration normally; only frames not yet handed to the consumer are relinquished. */
+  close(): void;
+  cancel(): void;
+}
 
 export interface ClientResult {
   readonly columns: readonly WireColumnMeta[];
@@ -145,6 +168,22 @@ class CursorQueue {
   done: StatementSummary | null = null;
   error: Error | null = null;
   wake: (() => void) | null = null;
+}
+
+class ExportQueue extends CursorQueue {
+  readonly handles = new WeakMap<FramePayload, ExportFrame>();
+  readonly columns: Promise<readonly WireColumnMeta[]>;
+  resolveColumns: (columns: readonly WireColumnMeta[]) => void = () => undefined;
+  rejectColumns: (error: Error) => void = () => undefined;
+  stopped = false;
+  constructor() {
+    super();
+    this.columns = new Promise((resolve, reject) => {
+      this.resolveColumns = resolve;
+      this.rejectColumns = reject;
+    });
+    this.columns.catch(() => undefined);
+  }
 }
 
 const randomClientId = (): string => {
@@ -439,6 +478,7 @@ export class ProtocolClient {
     this.#port = port;
     this.#generation++;
     port.onmessage = (event: MessageEvent) => {
+      if (this.#port !== port) return;
       this.#receive(event.data as OwnerMessage);
     };
     return new Promise<Welcome>((resolve, reject) => {
@@ -615,6 +655,120 @@ export class ProtocolClient {
 
   cancel(seq: number, close = false): void {
     this.#port?.postMessage({ t: "cancel", target: seq, close });
+  }
+
+  /** Explicit columnar streaming export. Credits return on handout, buffers only on release. */
+  exportStream(
+    sql: string,
+    params: readonly WireValue[] = [],
+    options: { readonly windowBytes?: number; readonly session?: number } = {},
+  ): ExportStream {
+    const queue = new ExportQueue();
+    const window = options.windowBytes ?? DEFAULT_RESULT_WINDOW_BYTES;
+    const { seq, promise } = this.#request(
+      {
+        t: "statement",
+        session: options.session ?? 0,
+        text: sql,
+        prepared: null,
+        knownColumnsVersion: -1,
+        params,
+        result: { windowBytes: window, frameRows: null, wantRows: true, recycle: true },
+      },
+      queue,
+    );
+    const done = promise.then((result) => result.summary);
+    done.catch(() => undefined);
+    const stop = (cancel: boolean) => {
+      queue.stopped = true;
+      this.#discardExport(queue, seq, window);
+      if (cancel) queue.error = new CancelledError();
+      const pending = this.#pending.get(seq);
+      if (pending !== undefined && !pending.sent) {
+        this.#fail(pending, new CancelledError());
+        return;
+      }
+      this.cancel(seq, !cancel);
+      queue.wake?.();
+    };
+    let pulling = false;
+    const frames: AsyncIterableIterator<ExportFrame> = {
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+      next: async (): Promise<IteratorResult<ExportFrame>> => {
+        if (pulling) throw new TypeError("Only one export next() may be pending");
+        pulling = true;
+        try {
+          for (;;) {
+            const frame = queue.frames.shift();
+            if (frame !== undefined) {
+              const handle = queue.handles.get(frame);
+              if (!handle) throw new Error("Missing export frame handle");
+              queue.handles.delete(frame);
+              this.#queueRelease(seq, frame.sequence, payloadBytes(frame), window);
+              return { value: handle, done: false };
+            }
+            if (queue.error !== null) throw queue.error;
+            if (queue.stopped || queue.done !== null) return { value: undefined, done: true };
+            await new Promise<void>((resolve) => {
+              queue.wake = resolve;
+            });
+          }
+        } finally {
+          pulling = false;
+        }
+      },
+      return: () => {
+        stop(false);
+        return Promise.resolve({ value: undefined, done: true });
+      },
+    };
+    return {
+      seq,
+      columns: queue.columns,
+      frames,
+      done,
+      close: () => stop(false),
+      cancel: () => stop(true),
+    };
+  }
+
+  #discardExport(queue: ExportQueue, seq: number, window: number, credit = true): void {
+    for (const frame of queue.frames.splice(0)) {
+      const bytes = payloadBytes(frame);
+      queue.handles.get(frame)?.release();
+      queue.handles.delete(frame);
+      if (credit) this.#queueRelease(seq, frame.sequence, bytes, window);
+    }
+  }
+
+  #exportFrame(
+    frame: FramePayload,
+    ids: readonly number[],
+    dictionaries: StreamDictionaries,
+  ): ExportFrame {
+    const port = this.#port,
+      generation = this.#generation;
+    const handle = recyclingFrame(frame, ids, (buffers, transfer) => {
+      // A capability belongs to the connection that issued it. Never route it through reconnect.
+      if (
+        !this.#closed &&
+        port !== null &&
+        this.#port === port &&
+        this.#generation === generation
+      ) {
+        try {
+          port.postMessage({ t: "returnBuffers", through: frame.sequence, buffers }, transfer);
+          return;
+        } catch {
+          /* A lost return is disposal, never a reason to wait or replay on another owner. */
+        }
+      }
+      const live = transfer.filter((buffer) => buffer.byteLength > 0);
+      if (live.length > 0) structuredClone(null, { transfer: live });
+    });
+    return { ...handle, dictionaries };
   }
 
   /**
@@ -797,6 +951,7 @@ export class ProtocolClient {
   ): { readonly seq: number; readonly promise: Promise<ClientResult> } {
     if (cursor !== null) {
       cursor.error = error;
+      if (cursor instanceof ExportQueue) cursor.rejectColumns(error);
       cursor.wake?.();
     }
     return { seq: -1, promise: Promise.reject(error) };
@@ -810,6 +965,17 @@ export class ProtocolClient {
   #fail(pending: Pending, error: Error): void {
     this.#settle(pending.seq);
     if (pending.cursor !== null) {
+      if (pending.cursor instanceof ExportQueue) {
+        const window =
+          "result" in pending.body ? pending.body.result.windowBytes : DEFAULT_RESULT_WINDOW_BYTES;
+        this.#discardExport(
+          pending.cursor,
+          pending.seq,
+          window,
+          pending.sentOn === this.#generation,
+        );
+        pending.cursor.rejectColumns(error);
+      }
       pending.cursor.error = error;
       pending.cursor.wake?.();
     }
@@ -843,7 +1009,29 @@ export class ProtocolClient {
         if (pending === undefined) return;
         if (message.columns !== null) pending.columns = message.columns;
         try {
-          for (const frame of message.frames) pending.dictionaries.apply(frame);
+          if (pending.cursor instanceof ExportQueue) {
+            const queue = pending.cursor;
+            if (message.frames.length !== (message.bufferIds?.length ?? 0))
+              throw new RangeError("Missing export frame capabilities");
+            for (let i = 0; i < message.frames.length; i++) {
+              const frame = message.frames[i];
+              const ids = message.bufferIds?.[i];
+              if (frame === undefined || ids === undefined)
+                throw new RangeError("Missing export frame");
+              pending.dictionaries.apply(frame, true);
+              queue.handles.set(frame, this.#exportFrame(frame, ids, pending.dictionaries));
+              queue.frames.push(frame);
+            }
+            if (pending.columns !== null || message.t === "done")
+              queue.resolveColumns(pending.columns ?? []);
+            if (queue.stopped) {
+              const window =
+                "result" in pending.body
+                  ? pending.body.result.windowBytes
+                  : DEFAULT_RESULT_WINDOW_BYTES;
+              this.#discardExport(queue, pending.seq, window);
+            }
+          } else for (const frame of message.frames) pending.dictionaries.apply(frame);
         } catch (error) {
           // A frame out of order or a broken delta: fail this request, never the handler.
           this.cancel(message.seq);
@@ -852,7 +1040,8 @@ export class ProtocolClient {
         }
         const last = message.frames.at(-1);
         if (pending.cursor !== null) {
-          pending.cursor.frames.push(...message.frames);
+          if (!(pending.cursor instanceof ExportQueue))
+            pending.cursor.frames.push(...message.frames);
           if (message.frames.length > 0) pending.handedOut = true;
         } else {
           pending.frames.push(...message.frames);

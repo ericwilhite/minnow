@@ -63,6 +63,7 @@
 import type { CommitRequest, Durability } from "../access/write-path.js";
 import type { SequenceSession } from "../exec/executor.js";
 import type { ResultFrame, ResultStream } from "../exec/result.js";
+import type { ReturnPool } from "../exec/return-pool.js";
 import type { PhysicalType } from "../types.js";
 import type { WireInputColumn } from "./frame.js";
 import type { LedgerSession, OwnerLedger } from "./outcomes.js";
@@ -86,6 +87,8 @@ export interface PlannedStatement {
 }
 
 export interface RunContext {
+  /** Only explicit relinquishing exports; ordinary credits never relinquish client views. */
+  readonly outputBuffers?: ReturnPool;
   readonly signal: AbortSignal;
   /**
    * The request identity for the commit frame, or null if this run commits nothing itself. The
@@ -196,6 +199,8 @@ export interface EngineSession {
 }
 
 export interface OwnerEngine {
+  /** A connection-owned, governor-charged cache, closed when that connection ends. */
+  createReturnPool(capBytes: number): ReturnPool;
   readonly durability: Durability;
   readonly catalogVersion: number;
   /** The write path's ledger (B3 `WritePath.ledger`), as the owner uses it. */

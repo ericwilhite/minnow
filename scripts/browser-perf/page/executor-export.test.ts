@@ -366,7 +366,7 @@ describe.each(
                   await Promise.all(released);
                   if (failure) throw failure;
                   expect(batchTarget.mock.calls.length - batchBefore).toBe(
-                    shape === "full" && recycle ? 1 : 0,
+                    (shape === "full" || shape === "identity") && recycle ? 1 : 0,
                   );
                   expect(result.rows).toBe(2 * count);
                   expect(result.executorStats.outputRecycling).toBe(recycle);
