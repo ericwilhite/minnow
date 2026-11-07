@@ -878,7 +878,8 @@ and the owner import it directly.
   `execute(request)` runs it over the access contracts: a read snapshot for a query, or an open
   `Statement` for DML, which the executor ends or rolls back. It never commits.
 - The executor admits its own pipelines with plan-bounded minimums. State that outlives a
-  pipeline is in spillable grants. Nothing is refused for size.
+  pipeline is in spillable grants. A bounded step whose required loan exceeds the reserve
+  fails with `ValueTooLargeError`.
 - A plan from another catalog version fails with `PlanStaleError` before anything runs.
 - Three completions: `executed` (the plan ran; for DML the statement ended), committed
   (`acknowledgeCommit()`: autocommit RETURNING waits in a charged, spillable spool until then),
@@ -1094,14 +1095,37 @@ and the owner import it directly.
 - When refused memory the join partitions 16 ways (grace/hybrid), reads back the partitions
   that fit, spills the rest of the probe, and joins each spilled pair one level down with
   independent hash bits. A partition that does not split, or an oversized mark join, runs in
-  chunks with per-probe-row state. Nothing is refused for size.
+  chunks with per-probe-row state. A bounded step that exceeds the governor reserve is
+  refused with `ValueTooLargeError`; a value fitting the reserve is not a general entitlement
+  to every multi-column working set.
 - Spill pages (`spill-pages.ts`) are the spill contract's typed layout; every `VectorData`
   variant round-trips. `column-store.ts` is the chunked, charged row store operators keep rows
-  in. Both are shared exec/ files (ruling R20.2) for aggregation spill and sort runs as well.
+  in. Zero-column stores still count rows and obey single-chunk limits, so key-only
+  joins can reuse their keys without a payload gather. Wide decimal copy accounting inspects
+  only decimal columns, preserving mixed numeric, boolean and text payloads. Both are shared exec/ files (ruling R20.2) for aggregation spill and sort runs as well.
+  Join abort waits for spill reads, appends and file closes before releasing borrowed pages, stores,
+  the spill pool or the grant; `closed` covers that drain, including close failures.
+  A read registers its ownership before entering the backend. Cancelled read results are
+  discarded while charged, before decoding or resuming load/replay; read leases also fence
+  per-run closes. `join-read-fence.test.ts` gates load and replay across read/close failures.
+  Oversized staging rows flush immediately, including when their first allocation fits: their
+  arenas and page buffers cannot accumulate across partitions and pin a progress loan.
+  Join staging checks the shared task deadline between oversized rows, even when every spill
+  append resolves immediately; resumption checks abort before copying another row.
+  `join-large-row.test.ts` checks generated large TEXT rows against PGlite at 8 MiB and the
+  admitted minimum, with a probe connected during build. Two-sided oversized-row chunks
+  reserve loading and replay by their peak lifetimes, borrow a single probe row during output,
+  and retire loans as soon as live usage fits ordinary pool capacity.
+  `join-oversized-pair.test.ts` checks generated neighboring widths and residuals;
+  `join-reserve-boundary.test.ts` checks the two-row 850 KiB reproduction and the complete
+  six-kind, three-sided width matrix from 65,535 through 1,048,575 bytes against PostgreSQL,
+  comparing complete payloads under immediate downstream backpressure.
   Store-to-store gathers bulk-copy fully checked contiguous spans of non-null int32/f64
   storage (including safe int64), across chunk boundaries; other permutations and negative
   row ids keep the ordinary gather. `exec/column-gather.bench.ts` isolates contiguous and
-  arbitrary gathers with prebuilt input and untimed result checks.
+  arbitrary and partition-strided gathers with prebuilt input, untimed warmup and result
+  checks. Compare revisions in at least seven interleaved rounds, recording process CPU
+  medians, max-minus-min spreads and host load for each run.
 - Inner, semi and right joins publish runtime filters (exact bitmap, split-block Bloom, bounds)
   when the build stays resident; a filter never drops a row that can match, and stops testing
   when it keeps over 90 % of probes.

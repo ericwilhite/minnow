@@ -74,9 +74,11 @@
  * units, and a page whose rows all belong to one sub-partition is forwarded without a copy. A
  * step that the pool and grant cannot hold takes one loan sized for that step (a row and its
  * page; a page, a row, its table and the replay's headroom in chunk mode), repaid when the step's
- * usage has left. In chunk mode one step can hold a build row, a probe page and an output row at
- * once, so at the minimum grant values up to about a quarter of the reserve progress; a larger
- * one is `ValueTooLargeError` (the governor's one size error).
+ * usage fits the ordinary pool again. Chunk loading and probe replay reserve the larger of
+ * their phase peaks. A single-row probe stays borrowed during pair output; completed chunks
+ * shrink output arenas before starting another step. This includes two-sided 850 KiB values
+ * at the minimum grant; a value whose required bounded step exceeds the reserve is still a
+ * `ValueTooLargeError` (the governor's size error).
  *
  * ## Limits (this increment)
  * - Runtime filters are published only when the build stays resident (a spilled build publishes
@@ -403,9 +405,16 @@ class Shared {
     this.pool = new Pool(this.charge, poolBytes(spec));
     this.files = new SpillFiles(context.spill, context.queryId, this.charge);
     this.pages = new PageWriter(this.pool, 16 * 1024);
-    this.io = new SpillIo(this.pool, this.files, this.pages, context, () => {
-      this.checkAborted();
-    });
+    this.io = new SpillIo(
+      this.pool,
+      this.files,
+      this.pages,
+      context,
+      () => {
+        this.checkAborted();
+      },
+      () => this.pace(),
+    );
     this.scratch = new KeyScratch(this.layout, BATCH_ROWS, this.charge, this.pool);
     if (spec.kind === "mark")
       for (let i = this.correlated; i < keyTypes.length; i++) {
@@ -1019,6 +1028,7 @@ class Level {
       const page = await shared.readPage(run, i);
       try {
         const { rows, columns } = await shared.decode(page, shared.spec.buildTypes);
+        shared.checkAborted();
         if (store.append(columns, null, 0, rows) < rows) return false;
       } finally {
         shared.releasePage(page);
@@ -1462,7 +1472,10 @@ class Prober {
     const buildOut = shared.buildPart;
     shared.reset(probeOut);
     shared.reset(buildOut);
-    let taken = probeOut.append(batch.columns, shared.pairProbe, 0, n);
+    // One physical probe row already has the required dense layout; keep its page borrowed
+    // through emission instead of holding a second copy of an oversized value.
+    const borrowProbe = n === 1 && batch.length === 1 && shared.pairProbe[0] === 0;
+    let taken = borrowProbe ? 1 : probeOut.append(batch.columns, shared.pairProbe, 0, n);
     const built = buildOut.appendFrom(
       level.store,
       shared.gatherColumns,
@@ -1478,11 +1491,11 @@ class Prober {
       // One output pair is one bounded step: room for exactly that row on both sides.
       this.#carry = n;
       return shared.need(
-        probeOut.appendNeed(batch.columns, shared.pairProbe[0] ?? 0) +
+        (borrowProbe ? 0 : probeOut.appendNeed(batch.columns, shared.pairProbe[0] ?? 0)) +
           buildOut.appendFromNeed(level.store, shared.gatherColumns, shared.pairBuild[0] ?? 0),
       );
     }
-    const probeColumns = probeOut.vectors();
+    const probeColumns = borrowProbe ? batch.columns : probeOut.vectors();
     const pairs: Batch = {
       length: taken,
       columns: [...probeColumns, ...shared.matchedBuildColumns(probeColumns)],
@@ -1968,6 +1981,7 @@ export class HashJoin {
   #built = false;
   #pending: Promise<void> | null = null;
   #closed = false;
+  #cleanup: Promise<void> | null = null;
 
   /** A join without keys (ruling R24.2): its inputs carry one constant key column each. */
   readonly #keyless: Keyless | null;
@@ -2260,6 +2274,7 @@ export class HashJoin {
         const page = await shared.readPage(build, i);
         try {
           const { rows, columns } = await shared.decode(page, this.spec.buildTypes);
+          shared.checkAborted();
           await sub.addPage(page.bytes, rows, columns);
         } finally {
           shared.releasePage(page);
@@ -2283,6 +2298,7 @@ export class HashJoin {
       const page = await shared.readPage(probe, i);
       try {
         const { rows, columns } = await shared.decode(page, this.spec.probeTypes);
+        shared.checkAborted();
         if (rows > BATCH_ROWS) throw new RangeError("A probe spill page holds more than a batch");
         if (chunk === null && (await level.forwardPage("probe", page.bytes, rows, columns))) {
           ordinal += rows;
@@ -2329,8 +2345,10 @@ export class HashJoin {
         // A chunk fills the pool's idle room but leaves the replay's steps theirs: one page in
         // flight and the output chunks' growth.
         const keep = 2 * POOL_PAGE_BYTES + probePage + 3 * STAGING_TARGET_BYTES;
+        // Only a reserved single-row load may use replay headroom temporarily.
+        let loadingFirst = false;
         const chunkCharge: ByteCharge = {
-          allocate: (bytes) => shared.pool.allocate(bytes, keep),
+          allocate: (bytes) => shared.pool.allocate(bytes, loadingFirst ? 0 : keep),
           free: (bytes) => {
             shared.pool.free(bytes);
           },
@@ -2347,17 +2365,19 @@ export class HashJoin {
             let retry = 0;
             try {
               const { rows, columns } = await shared.decode(bytes, this.spec.buildTypes);
-              let taken = sub.store.append(columns, null, row, rows - row);
+              shared.checkAborted();
+              loadingFirst = reserved && sub.store.rows === 0;
+              let taken = sub.store.append(columns, null, row, loadingFirst ? 1 : rows - row);
+              loadingFirst = false;
               if (taken === 0 && sub.store.rows === 0) {
                 if (reserved) throw new RangeError("A build row could not be allocated");
-                // An empty chunk that cannot take one row. The step is this page, the row, its
-                // table and the headroom the chunk leaves the replay: give the page back, make
-                // room for all of it at once, and read the page again.
+                // Give the page back before reserving the step. Loading holds the page;
+                // replay holds its headroom after that page is released. These peaks
+                // overlap the build row/table, but not each other.
                 retry =
-                  bytes.charged +
                   sub.store.appendNeed(columns, row) +
                   JoinTable.estimateBytes(shared.layout, 1) +
-                  keep;
+                  Math.max(bytes.charged, keep);
                 taken = 0;
               }
               if (taken > 0) loaded.push({ page, from: row, count: taken });
@@ -2375,10 +2395,16 @@ export class HashJoin {
               reserved = true;
               continue;
             }
-            if (full) break;
+            if (full || (reserved && sub.store.rows > 0)) break;
           }
           // The chunk's table; give rows back (halving) while it does not fit.
-          while (!(await shared.sliced(sub.buildTableJob()))) {
+          // A single row cannot be halved: its small table uses actual pool capacity,
+          // then replay can obtain its own loan after the loading loan retires.
+          while (
+            !(await shared.sliced(
+              sub.buildTableJob(sub.store.rows === 1 ? shared.pool : chunkCharge),
+            ))
+          ) {
             if (sub.store.rows <= 1)
               throw new RangeError("A join chunk table could not be allocated for one row");
             let drop = sub.store.rows >> 1;
@@ -2398,9 +2424,10 @@ export class HashJoin {
           await this.#emitUnmatchedBuild(sub);
         } finally {
           sub.close();
-          shared.reset(shared.probeOut);
-          shared.reset(shared.buildOut);
-          shared.reset(shared.buildPart);
+          shared.probeOut.reset(true);
+          shared.buildOut.reset(true);
+          shared.buildPart.reset(true);
+          shared.pool.settle();
         }
       }
       if (kind === "left" || kind === "full" || kind === "anti" || kind === "mark")
@@ -2421,6 +2448,7 @@ export class HashJoin {
       const page = await shared.readPage(probe, i);
       try {
         const { rows, columns } = await shared.decode(page, this.spec.probeTypes);
+        shared.checkAborted();
         const out = shared.out;
         out.count = 0;
         let batch: Batch;
@@ -2514,33 +2542,61 @@ export class HashJoin {
     if (n > 0) await flush();
   }
 
+  #releaseOwned(): void {
+    const shared = this.#shared;
+    try {
+      this.#prober.release();
+      this.#level.close();
+      for (const filter of this.runtimeFilters) filter.close();
+      shared.probeOut.close();
+      shared.buildOut.close();
+      shared.buildPart.close();
+      shared.pages.close();
+      shared.pool.close();
+    } finally {
+      shared.profile.peakHeldBytes = shared.charge.peak;
+      shared.context.grant.close();
+    }
+  }
+
   #release(): void {
     if (this.#closed) return;
     this.#closed = true;
     const shared = this.#shared;
-    this.#prober.release();
-    this.#level.close();
-    for (const filter of this.runtimeFilters) filter.close();
-    shared.probeOut.close();
-    shared.buildOut.close();
-    shared.buildPart.close();
-    shared.pages.close();
-    shared.pool.close();
-    // Spill files close asynchronously; a failure is kept and surfaces through `closed`.
-    const closing = shared.files.closeAll();
-    closing.catch((error: unknown) => {
+    // Publish the fence before calling external close implementations, which may reenter.
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    this.#cleanup = new Promise<void>((yes, no) => {
+      resolve = yes;
+      reject = no;
+    });
+    void this.#cleanup.catch((error: unknown) => {
       this.cleanupError ??= error;
     });
-    shared.profile.peakHeldBytes = shared.charge.peak;
-    shared.context.grant.close();
+    const drain = shared.files.needsDrain;
+    const finish = (failed: boolean, error?: unknown) => {
+      try {
+        if (drain) this.#releaseOwned();
+      } catch (releaseError) {
+        if (!failed) error = releaseError;
+        failed = true;
+      }
+      if (failed) reject(error);
+      else resolve();
+    };
+    const closing = shared.files.closeAll();
+    // Resident completion remains synchronous. Spill pages, stores, pool and grant stay
+    // owned until every append and file close has stopped borrowing their charged buffers.
+    if (!drain) this.#releaseOwned();
+    void closing.then(
+      () => finish(false),
+      (error: unknown) => finish(true, error),
+    );
   }
 
-  /**
-   * Settles when the join's spill files are all closed (including any whose creation was in
-   * flight when it ended); rejects with the first close failure. Resolved before the join ends.
-   */
+  /** After termination, settles once spill borrows drain and all charges release; resolved before termination. */
   get closed(): Promise<void> {
-    return this.#shared.files.closed ?? Promise.resolve();
+    return this.#cleanup ?? Promise.resolve();
   }
 
   /** Releases everything (grant, spill files, tables); idempotent. */

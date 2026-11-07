@@ -18,7 +18,8 @@ import type { ColumnStore } from "./column-store.js";
 import {
   decodePage,
   type DecodedPage,
-  type PageWriter,
+  PageWriter,
+  SpillClosedError,
   type SpillFiles,
   type SpilledRun,
 } from "./spill-pages.js";
@@ -52,8 +53,6 @@ export class Pool implements ByteCharge {
   #loan: Loan | null = null;
   /** Bytes added to the pool for the current step (from the grant or the loan). */
   #extra = 0;
-  /** Usage when the current step made room; its extra goes back once usage is back to it. */
-  #stepBase = 0;
   /** The step allocated since it made room (until then, its room is held, not given back). */
   #consumed = false;
   loans = 0;
@@ -139,17 +138,16 @@ export class Pool implements ByteCharge {
   }
 
   #beginStep(extra: number): void {
-    if (this.#extra === 0) this.#stepBase = this.#used;
     this.#extra += extra;
     this.#consumed = false;
   }
 
   /**
-   * Gives a step's extra bytes back (repaying the loan) once the step has allocated and its
-   * usage has left again (usage back to what it was when the step made room).
+   * Returns extra bytes once the step has allocated and all live pool usage fits without
+   * them. Fixed buffers first created during the step may remain inside the admitted pool.
    */
   settle(): void {
-    if (this.#extra === 0 || !this.#consumed || this.#used > this.#stepBase) return;
+    if (this.#extra === 0 || !this.#consumed || this.#used > this.#size - this.#extra) return;
     this.charge.free(this.#extra);
     this.#size -= this.#extra;
     this.#extra = 0;
@@ -185,6 +183,7 @@ export class SpillIo {
       readonly signal?: AbortSignal;
     },
     readonly checkAborted: () => void,
+    readonly pace?: () => Promise<void> | null,
   ) {}
 
   /** Called with each staging chunk before it is encoded as a page (the sort measures pages). */
@@ -201,20 +200,41 @@ export class SpillIo {
     this.pool.settle();
   }
 
+  /** A close or cancellation can arrive at any asynchronous read/decode resumption. */
+  #checkOpen(): void {
+    this.checkAborted();
+    if (this.files.isClosed) throw new SpillClosedError();
+  }
+
   /** Reads and verifies a page (a bounded step), charged to the pool while the caller holds it. */
   async readPage(run: SpilledRun, index: number): Promise<{ bytes: Uint8Array; charged: number }> {
+    this.#checkOpen();
     const ref = run.pages[index];
     const file = run.file;
     if (ref === undefined || file === null) throw new RangeError("No such spill page");
     if (!this.pool.allocate(ref.length)) {
       await this.need(ref.length);
+      this.#checkOpen();
       if (!this.pool.allocate(ref.length)) throw new RangeError("A spill page could not be read");
     }
+    let end: (() => void) | undefined;
+    let bytes: Uint8Array | undefined;
     try {
-      return { bytes: await file.read(ref), charged: ref.length };
+      end = this.files.beginRead(file);
+      bytes = await file.read(ref);
+      // The backend may return after cancellation. Never hand that page to a decoder.
+      this.#checkOpen();
+      return { bytes, charged: ref.length };
     } catch (error) {
+      // The cancelled result must not remain owned when its charge is released.
+      // eslint-disable-next-line no-useless-assignment
+      bytes = undefined;
       this.pool.free(ref.length);
+      this.checkAborted();
       throw error;
+    } finally {
+      // Keep the pool/grant alive until failed/cancelled results gave their bytes back.
+      end?.();
     }
   }
 
@@ -227,9 +247,11 @@ export class SpillIo {
     page: { bytes: Uint8Array; charged: number },
     types: readonly PhysicalType[],
   ): Promise<DecodedPage> {
+    this.#checkOpen();
     let decoded = decodePage(page.bytes, types, this.pool);
     if ("needed" in decoded) {
       await this.need(decoded.needed);
+      this.#checkOpen();
       decoded = decodePage(page.bytes, types, this.pool);
       if ("needed" in decoded) throw new RangeError("A spill page could not be decoded");
     }
@@ -246,6 +268,8 @@ export class SpillIo {
     if (staging.rows === 0) return;
     this.onFlush?.(staging);
     const columns = staging.vectors();
+    const oversized =
+      staging.rows === 1 && PageWriter.encodedBytes(columns, 1) > staging.targetBytes;
     const pageHeader = {
       queryId: this.context.queryId,
       run: header.run,
@@ -259,7 +283,7 @@ export class SpillIo {
       if (page === null) throw new RangeError("A spill page could not be encoded");
     }
     await this.files.append(run, page, staging.rows);
-    this.pages.shrinkIf(this.pool.owes);
+    this.pages.shrinkIf(oversized || this.pool.owes);
     this.reset(staging);
   }
 
@@ -276,7 +300,18 @@ export class SpillIo {
     let done = 0;
     while (done < count) {
       this.checkAborted();
+      const paced = this.pace?.();
+      if (paced != null) await paced;
       done += staging.append(vectors, ids, from + done, count - done);
+      // An oversized row may fit without a loan. Do not retain its arena in one partition
+      // while filling the others: together they can pin a loan past this row-sized step.
+      if (
+        staging.rows === 1 &&
+        PageWriter.encodedBytes(staging.vectors(), 1) > staging.targetBytes
+      ) {
+        await this.flush(staging, run, header);
+        continue;
+      }
       if (done >= count) break;
       if (staging.rows > 0) {
         await this.flush(staging, run, header);

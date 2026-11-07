@@ -220,7 +220,7 @@ export class ColumnStore {
   }
 
   get chunkCount(): number {
-    return this.#columns[0]?.chunks.length ?? 0;
+    return this.#columns[0]?.chunks.length ?? Math.ceil(this.rows / this.chunkRows);
   }
 
   /** The tier of column `c` (int64-family repr, or decimal coefficient tier). */
@@ -540,6 +540,15 @@ export class ColumnStore {
     varlenNeed: (c: number, n: number, done: number) => number,
   ): number {
     if (this.#closed) return 0;
+    // A zero-column tuple still contributes a row, but allocates no column chunks.
+    if (this.#columns.length === 0) {
+      const taken = Math.max(
+        0,
+        this.targetBytes === Infinity ? count : Math.min(count, this.chunkRows - this.rows),
+      );
+      this.rows += taken;
+      return taken;
+    }
     let done = 0;
     while (done < count) {
       if (this.rows === this.chunkCount * this.chunkRows) {
@@ -745,6 +754,7 @@ export class ColumnStore {
   #chargeWideRows(k: number, at: number, n: number): void {
     let bytes = 0;
     for (const column of this.#columns) {
+      if (column.layout !== "decimal") continue;
       const data = column.chunks[k]?.data as Decimal | undefined;
       if (data?.coefficients.repr !== "wide") continue;
       for (let i = at; i < at + n; i++) bytes += bigintBytes(data.coefficients.values[i] ?? 0n);
