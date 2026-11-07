@@ -1372,8 +1372,12 @@ group roots, directory pages and table statistics, not a full SQL workload.
 R25 preparation and startup use the worker-wide R23.5 task clock reexported by
 `exec/pipeline.ts` (implemented in `task.ts` so storage does not depend on the executor).
 No operation entry or resolved read restarts it. Bounded loops check the deadline, yield a real
-task when due, and check cancellation on resume. Sorting uses an in-place sliced heapsort;
-startup collection, root union, free-map construction and retirement installation also cooperate.
+task when due, and check cancellation on resume. Delta sorting uses an in-place sliced heapsort. Normal listed-root startup stream-merges both
+ordered roots directly into the free map, decoding one page per root at a time. Scattered list-page
+allocations use seven bounded radix passes over page references, so reconstruction is O(extents +
+list pages), with no extent Maps or comparison sort. Unordered reachability callbacks and full
+audit/test-open validation retain their separate collection/sort path. All paths cooperate with
+the shared clock and cancellation.
 Timer/cancellation regressions include cached reads, immediate writes and two preparations
 sharing one task's elapsed time.
 

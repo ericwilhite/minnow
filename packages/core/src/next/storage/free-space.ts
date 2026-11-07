@@ -111,6 +111,32 @@ export class FreeSpaceMap {
     return map;
   }
 
+  /** One pass over an ordered union; no materialized extent vector or comparison sort. */
+  static async fromSortedAllocatedAsync(
+    align: number,
+    length: number,
+    allocated: AsyncIterable<{ readonly offset: number; readonly length: number }>,
+    work?: TaskWork,
+  ): Promise<FreeSpaceMap> {
+    const map = new FreeSpaceMap(align);
+    let cursor = 0;
+    let previous: { offset: number; end: number } | null = null;
+    for await (const extent of allocated) {
+      const pending = pauseIfDue(work);
+      if (pending !== undefined) await pending;
+      map.#check(extent.offset);
+      const end = extent.offset + map.#round(extent.length);
+      if (previous !== null && previous.offset === extent.offset && previous.end === end) continue;
+      if (extent.offset < cursor) throw new RangeError("Ordered extents overlap or regress");
+      if (end > map.#round(length)) throw new RangeError("Extent runs past the file");
+      if (extent.offset > cursor) map.#push(cursor, extent.offset);
+      cursor = end;
+      previous = { offset: extent.offset, end };
+    }
+    map.#end = cursor;
+    return map;
+  }
+
   /** The allocator's high-water mark: bytes at or past it are free. */
   get end(): number {
     return this.#end;

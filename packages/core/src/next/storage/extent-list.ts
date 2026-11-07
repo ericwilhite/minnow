@@ -111,13 +111,16 @@ function reserve(budget: ByteBudget, bytes: number): void {
 }
 
 /** Bounded batches; the caller charges their small reference vectors before iteration. */
-function* batches(pages: readonly ExtentListPage[]): Generator<ExtentListPage[]> {
+function* batches(
+  pages: readonly ExtentListPage[],
+  pageLimit = BATCH_PAGES,
+): Generator<ExtentListPage[]> {
   let batch: ExtentListPage[] = [];
   let bytes = 0;
   for (const page of pages) {
     if (
       batch.length > 0 &&
-      (bytes + page.blob.length > MAX_READ_BYTES || batch.length === BATCH_PAGES)
+      (bytes + page.blob.length > MAX_READ_BYTES || batch.length === pageLimit)
     ) {
       yield batch;
       batch = [];
@@ -186,6 +189,8 @@ export async function* listedExtents(
   reader: ExtentReader,
   budget: ByteBudget,
   work?: TaskWork,
+  includePages = true,
+  pageLimit = BATCH_PAGES,
 ): AsyncGenerator<ExtentRef | BlobRef> {
   const firstPause = pauseIfDue(work);
   if (firstPause !== undefined) await firstPause;
@@ -202,7 +207,7 @@ export async function* listedExtents(
   reserve(budget, 512); // two bounded page-reference vectors across a generator suspension
   try {
     let pageIndex = 0;
-    for (const batch of batches(list)) {
+    for (const batch of batches(list, pageLimit)) {
       const decoded = await readPages(batch, reader, budget, work);
       try {
         for (let index = 0; index < batch.length; index++) {
@@ -218,7 +223,7 @@ export async function* listedExtents(
             );
           const pending = pauseIfDue(work);
           if (pending !== undefined) await pending;
-          yield page.blob;
+          if (includePages) yield page.blob;
           for (const extent of extents) {
             const pending = pauseIfDue(work);
             if (pending !== undefined) await pending;
@@ -626,4 +631,90 @@ async function retiredInSlices(
     out.push(extent);
   }
   return out;
+}
+
+/** Full ordered reachability, including the list pages' scattered allocations. */
+export async function* sortedListedExtents(
+  list: ExtentList,
+  reader: ExtentReader,
+  budget: ByteBudget,
+  work?: TaskWork,
+): AsyncGenerator<ExtentRef> {
+  const initial = pauseIfDue(work);
+  if (initial !== undefined) await initial;
+  const charge = 32 * list.length + 2048;
+  reserve(budget, charge);
+  try {
+    let refs: ExtentRef[] = [];
+    let scratch: ExtentRef[] = [];
+    const check = async () => {
+      const pending = pauseIfDue(work);
+      if (pending !== undefined) await pending;
+    };
+    for (let i = 0; i < list.length; i++) {
+      if (i % 128 === 0) await check();
+      const page = list[i];
+      if (page !== undefined) {
+        const ref = page.blob.extent;
+        if (
+          !Number.isSafeInteger(ref.offset) ||
+          ref.offset < 0 ||
+          !Number.isSafeInteger(ref.length) ||
+          ref.length <= 0
+        )
+          throw new StoreCorruptionError("Invalid extent-list page allocation");
+        refs.push(ref);
+      }
+    }
+    // Seven byte passes order safe-integer offsets in O(page references), not O(E log E).
+    const counts = new Uint32Array(256);
+    for (let pass = 0; pass < 7; pass++) {
+      counts.fill(0);
+      const divisor = 2 ** (pass * 8);
+      for (let i = 0; i < refs.length; i++) {
+        if (i % 128 === 0) await check();
+        const ref = refs[i];
+        if (ref !== undefined) {
+          const key = Math.floor(ref.offset / divisor) % 256;
+          counts[key] = (counts[key] ?? 0) + 1;
+        }
+      }
+      let sum = 0;
+      for (let key = 0; key < 256; key++) {
+        const n = counts[key] ?? 0;
+        counts[key] = sum;
+        sum += n;
+      }
+      for (let i = 0; i < refs.length; i++) {
+        if (i % 128 === 0) await check();
+        const ref = refs[i];
+        if (ref !== undefined) {
+          const key = Math.floor(ref.offset / divisor) % 256;
+          const at = counts[key] ?? 0;
+          scratch[at] = ref;
+          counts[key] = at + 1;
+        }
+      }
+      [refs, scratch] = [scratch, refs];
+    }
+    let at = 0;
+    for await (const item of listedExtents(list, reader, budget, work, false, 1)) {
+      const extent = "extent" in item ? item.extent : item;
+      while (at < refs.length) {
+        const page = refs[at];
+        if (page === undefined || page.offset > extent.offset) break;
+        await check();
+        yield page;
+        at++;
+      }
+      yield extent;
+    }
+    while (at < refs.length) {
+      await check();
+      const page = refs[at++];
+      if (page !== undefined) yield page;
+    }
+  } finally {
+    budget.free(charge);
+  }
 }

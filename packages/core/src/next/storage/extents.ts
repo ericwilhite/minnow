@@ -252,12 +252,15 @@ export interface EvictableCacheLike {
  * deletion bitmaps, statistics, index runs (staged ones included) and their fences and Bloom
  * filters.
  */
-export type ReachableExtents = (
+export type ReachableExtents = ((
   root: Uint8Array,
   reader: ExtentReader,
   budget: ByteBudget,
   work?: TaskWork,
-) => AsyncIterable<ExtentRef | BlobRef> | Iterable<ExtentRef | BlobRef>;
+) => AsyncIterable<ExtentRef | BlobRef> | Iterable<ExtentRef | BlobRef>) & {
+  /** Emits nondecreasing offsets; startup validates this promise before reclaiming. */
+  readonly ordered?: boolean;
+};
 
 export interface OpenSpaceOptions extends TaskWork {
   /**

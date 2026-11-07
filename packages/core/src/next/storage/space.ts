@@ -36,6 +36,7 @@ import {
   type ByteBudget,
   type ExtentBuilder,
   type ExtentRef,
+  type ExtentReader,
   type ExtentSpace,
   type ExtentWriter,
   type OpenExtentSpace,
@@ -194,6 +195,85 @@ async function sameExtents(
   }
 }
 
+/** Merge two already ordered roots while retaining only previous-only retirement entries. */
+async function orderedMap(
+  root: Uint8Array | null,
+  previousRoot: Uint8Array | null,
+  options: OpenSpaceOptions,
+  reader: ExtentReader,
+  dataLength: number,
+): Promise<{ map: FreeSpaceMap; retired: DataRange[] }> {
+  async function* input(bytes: Uint8Array | null) {
+    if (bytes === null) return;
+    let last = -1;
+    let lastLength = 0;
+    for await (const item of options.reachable(bytes, reader, options.budget, options)) {
+      const pending = pauseIfDue(options);
+      if (pending !== undefined) await pending;
+      const ref = "extent" in item ? item.extent : item;
+      if (
+        !Number.isSafeInteger(ref.offset) ||
+        !Number.isSafeInteger(ref.length) ||
+        ref.offset < 0 ||
+        ref.offset % DATA_ALIGN !== 0 ||
+        ref.length <= 0 ||
+        ref.offset + ref.length > dataLength ||
+        ref.offset < last
+      )
+        throw new StoreCorruptionError("Invalid or unordered durable extent");
+      if (ref.offset === last) {
+        if (ref.length !== lastLength)
+          throw new StoreCorruptionError("One root disagrees on an extent length");
+        continue;
+      }
+      last = ref.offset;
+      lastLength = ref.length;
+      yield ref;
+    }
+  }
+  const current = input(root);
+  const previous = input(previousRoot);
+  const retired: DataRange[] = [];
+  async function* union() {
+    try {
+      let a = await current.next();
+      let b = await previous.next();
+      while (!a.done || !b.done) {
+        const pending = pauseIfDue(options);
+        if (pending !== undefined) await pending;
+        if (!a.done && (b.done || a.value.offset < b.value.offset)) {
+          yield a.value;
+          a = await current.next();
+        } else if (!b.done && (a.done || b.value.offset < a.value.offset)) {
+          const ref = b.value;
+          retired.push({
+            offset: ref.offset,
+            length: Math.ceil(ref.length / DATA_ALIGN) * DATA_ALIGN,
+          });
+          yield ref;
+          b = await previous.next();
+        } else if (!a.done && !b.done) {
+          if (a.value.length !== b.value.length)
+            throw new StoreCorruptionError("Durable roots disagree on an extent length");
+          yield a.value;
+          a = await current.next();
+          b = await previous.next();
+        }
+      }
+    } finally {
+      try {
+        await current.return(undefined);
+      } finally {
+        await previous.return(undefined);
+      }
+    }
+  }
+  return {
+    map: await FreeSpaceMap.fromSortedAllocatedAsync(DATA_ALIGN, dataLength, union(), options),
+    retired,
+  };
+}
+
 export const openExtentSpace: OpenExtentSpace = async (session, options) => {
   options.signal?.throwIfAborted();
   if (options.verifyAtOpen === true) await session.audit?.(options.signal);
@@ -216,56 +296,69 @@ export const openExtentSpace: OpenExtentSpace = async (session, options) => {
       read: (refs: readonly BlobRef[], read: ReadOptions) => cache.read(refs, read),
       peek: (ref: BlobRef, peek?: PeekOptions) => cache.peek(ref, peek),
     };
-    const current = await collect(
-      root,
-      options.reachable,
-      reader,
-      options.budget,
-      dataLength,
-      options,
-    );
-    options.signal?.throwIfAborted();
-    const previous = await collect(
-      previousRoot,
-      options.reachable,
-      reader,
-      options.budget,
-      dataLength,
-      options,
-    );
-    const walk = options.walk;
-    if (walk !== undefined && options.verifyAtOpen === true) {
-      await sameExtents(
-        current,
-        await collect(root, walk, reader, options.budget, dataLength, options),
-        "current",
-        options,
-      );
-      await sameExtents(
-        previous,
-        await collect(previousRoot, walk, reader, options.budget, dataLength, options),
-        "previous",
-        options,
-      );
-    }
-    const { union, previousOnly } = await unite(current, previous, options);
     let map: FreeSpaceMap;
-    try {
-      map = await FreeSpaceMap.fromAllocatedAsync(DATA_ALIGN, dataLength, union, options);
-    } catch (error) {
-      if (!(error instanceof RangeError) || error === options.signal?.reason) throw error;
-      throw new StoreCorruptionError(
-        `The durable roots name inconsistent extents: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-    // Only now, with both roots validated together, may anything be retired or truncated.
-    const retired: DataRange[] = [];
-    for (const { offset, length } of previousOnly) {
-      if (retired.length % 128 === 0) {
-        const pending = pauseIfDue(options);
-        if (pending !== undefined) await pending;
+    let retired: DataRange[];
+    if (options.reachable.ordered === true && options.verifyAtOpen !== true) {
+      try {
+        ({ map, retired } = await orderedMap(root, previousRoot, options, reader, dataLength));
+      } catch (error) {
+        if (!(error instanceof RangeError) || error === options.signal?.reason) throw error;
+        throw new StoreCorruptionError(
+          `The durable roots name inconsistent extents: ${error.message}`,
+        );
       }
-      retired.push({ offset, length: map.sizeOf(length) });
+    } else {
+      const current = await collect(
+        root,
+        options.reachable,
+        reader,
+        options.budget,
+        dataLength,
+        options,
+      );
+      options.signal?.throwIfAborted();
+      const previous = await collect(
+        previousRoot,
+        options.reachable,
+        reader,
+        options.budget,
+        dataLength,
+        options,
+      );
+      const walk = options.walk;
+      if (walk !== undefined && options.verifyAtOpen === true) {
+        await sameExtents(
+          current,
+          await collect(root, walk, reader, options.budget, dataLength, options),
+          "current",
+          options,
+        );
+        await sameExtents(
+          previous,
+          await collect(previousRoot, walk, reader, options.budget, dataLength, options),
+          "previous",
+          options,
+        );
+      }
+      const { union, previousOnly } = await unite(current, previous, options);
+
+      try {
+        map = await FreeSpaceMap.fromAllocatedAsync(DATA_ALIGN, dataLength, union, options);
+      } catch (error) {
+        if (!(error instanceof RangeError) || error === options.signal?.reason) throw error;
+        throw new StoreCorruptionError(
+          `The durable roots name inconsistent extents: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      // Only now, with both roots validated together, may anything be retired or truncated.
+      retired = [];
+      for (const { offset, length } of previousOnly) {
+        if (retired.length % 128 === 0) {
+          const pending = pauseIfDue(options);
+          if (pending !== undefined) await pending;
+        }
+        retired.push({ offset, length: map.sizeOf(length) });
+      }
     }
     const space = new Space(session, options, cache, map, root, previousRoot, dataLength);
     opened = space;
