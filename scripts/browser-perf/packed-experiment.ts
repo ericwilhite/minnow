@@ -1,5 +1,5 @@
 /** Rejected packed-frame diagnostic. Rebuild its exact source snapshot from a frozen archive
- * and patch under ~/.cache. No checkout, production import or real index is changed.
+ * and patch under os.tmpdir(). No checkout, production import or real index is changed.
  * Only tests and an explicitly opted-in benchmark may load this snapshot.
  */
 import { execFileSync } from "node:child_process";
@@ -34,6 +34,9 @@ export function packedExperiment() {
   )
     throw new Error("Packed diagnostic fixture changed");
   execFileSync("tar", ["-xzf", archive, "-C", scratch]);
+  // The scratch directory may sit inside a checkout (TMPDIR under a worktree): make it its own
+  // repository so `git apply` resolves paths against the snapshot, not the enclosing checkout.
+  execFileSync("git", ["init", "-q"], { cwd: scratch });
   execFileSync("git", ["apply", "--unsafe-paths", fixture], { cwd: scratch });
   let closed = false;
   const close = () => {
