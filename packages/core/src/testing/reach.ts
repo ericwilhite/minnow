@@ -443,3 +443,11 @@ export const EXECUTOR_POLICY_REACH = {
   full: "terminal one-pass window",
   cached: "selective/consumer cache policy",
 } as const;
+
+/** Production dictionary frames remain exact through stream deltas and real detachment. */
+export const RESULT_DICTIONARY_REACH = {
+  equality: "dictionary client equality and returned charges",
+  codes: "stream dictionary codes and owned deltas",
+  fallback: "stream dictionary cap fallback",
+  loan: "dictionary delta progress loan repaid before finish",
+} as const;

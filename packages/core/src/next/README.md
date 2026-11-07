@@ -628,6 +628,13 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     and client row-object construction remain excluded. Generated `executor-export.test.ts`
     histories check actual factory preparation, all transferred values, multiple groups, sparse
     NULLs, genuine >64 KiB values, delayed credits, storage survival and returned execution charges.
+    The production sink keeps eligible UTF-8 dictionaries as copied codes and per-stream owned
+    deltas, applied by `StreamDictionaries` before client access. Dictionary bytes and registry
+    entries share the existing 1 MiB stream cap; subsequent dictionaries fall back to flat varlen.
+    Registry entries use ordinary result-grant capacity, so a delta frame can return its progress
+    loan before the stream ends. Dictionary pages and borrowed codes never enter a transfer list.
+    Generated `testing/result-dictionaries.test.ts` checks exact client values, NULLs, selections,
+    identity reuse/change, large deltas, cumulative cap fallback, pressure and cancellation.
   - `scripts/executor-export-bench.mts` compares the real executor/result path with the historical
     adapter over the same memory-backed PageCache. `--compare=REV` instead freezes the whole
     executor dependency family at a Git revision and compares it with the current compiler.
