@@ -86,6 +86,8 @@ export interface ChunkPages {
   isSafe(first?: number, end?: number): boolean;
   /** Optional proof from verified, loaded page masks; false/absent keeps an output validity mask. */
   isAllValid?(from: number, to: number): boolean;
+  /** Optional shared, verified header facts (page/reader.ts DecodeFact); invalidated on load/release. */
+  decodeFacts?(from: number, to: number): number;
   /**
    * Out-of-line values (page/large-value.ts): a decode reaching such a row needs it loaded first,
    * for a range or for the selected rows; values stay leased until `releaseValues` (all, or the

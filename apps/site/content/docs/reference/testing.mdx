@@ -1211,6 +1211,23 @@ without the frame adapter, result channel, ownership copies, or client transport
 records batch/column counts, dictionary/validity/offset shapes, and an endpoint fingerprint;
 it does not decode text or check every value. Its rows/s is a scan diagnostic, not export
 throughput or a Gate A result. Cold/warm residency and setup-excluded CPU rules stay the same.
+`scripts/scan-shape-bench.mts --planning` isolates descriptor sizing and reservation over
+real loaded pages; without `--planning` it runs the whole memory-backed scan. Both compare
+with `74c79c9b` in five interleaved fresh-process rounds, excluding setup and one warmup,
+and record CPU, wall time and host load. The comparison requires that Git object.
+`MINNOW_EXPORT_SCAN_SHAPE_COMPARE=1 npm run benchmark:export` compares the same change
+in five cold, interleaved OPFS scan-only pairs. It uses explicit 64 MiB windows and the
+same borrowed-batch consumer; it measures neither frame assembly nor export transport.
+Add `MINNOW_EXPORT_SCAN_SHAPE_TRANSPORT=1` to compare the whole stand-in adapter and
+real owner transfer path instead. Both modes assert which three module versions reached
+the worker; the transport comparison still does not use the future executor frame builder.
+The scan reuses verified header facts while the endpoint pages stay the same. Loading,
+releasing or materializing a page invalidates those facts. Exact-range varlen byte sizes
+are memoized separately; sparse selections are sized from their selected rows.
+The reader charges its bounded scalar memo separately from the shared directory cache.
+Generated source-value equality and residency histories cover this reuse in
+`next/exec/column-shape.test.ts` and `next/exec/shape-reuse.test.ts`.
+
 `scripts/frame-copy-bench.mts` isolates frame ownership copies in five interleaved CPU/wall
 rounds; `MINNOW_EXPORT_FRAME_COPY_COMPARE=1` compares those policies through the whole cold scan.
 `scripts/scan-range-bench.mts` isolates the scan's contiguous-prefix dispatch over real encoded

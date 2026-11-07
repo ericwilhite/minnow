@@ -361,3 +361,27 @@ export const WINDOW_CANCEL_REJECTION_REACH = [
   "cancel while yielded",
   "rejection observed",
 ] as const;
+
+/** Descriptor reuse across scan phases, endpoint page spans and residency changes. */
+export const SCAN_SHAPE_REACH = [
+  "same page span",
+  "narrower page span",
+  "release gap",
+  "reload gap",
+  "owned and borrowed",
+  "gather same endpoints",
+  "gather across unloaded gap",
+  "dictionary",
+  "plain varlen",
+  "mixed safe integers",
+  "all null",
+  "all valid",
+  "int128 mixed scales",
+] as const;
+
+/** One verified page-span lookup across repeated scan planning phases. */
+export const SCAN_SHAPE_LOOKUP_REACH = [
+  "safe integers",
+  "wide integers",
+  "same endpoint pages",
+] as const;

@@ -8,6 +8,9 @@ import {
   type ScanExportStats,
 } from "../../../scripts/browser-perf/page/scan-export.js";
 import { scanCore, type ScanCoreStats } from "../../../scripts/browser-perf/page/scan-core.js";
+import { TableScan } from "../src/next/exec/table-scan.js";
+import { ColumnTarget } from "../src/next/exec/column-target.js";
+import { ChunkReader } from "../src/next/page/reader.js";
 import { BlobCache } from "../src/next/format/blob-cache.js";
 import { Governor, type EvictableCache } from "../src/next/memory/governor.js";
 import type { ChunkDirectory } from "../src/next/page/directory.js";
@@ -65,6 +68,7 @@ export type ExportRequest =
       readonly mode?: "pages" | "scan" | "scan-core";
       readonly frameCopy?: "baseline" | "candidate";
       readonly scanRange?: "baseline" | "candidate";
+      readonly scanShape?: "baseline" | "candidate";
       readonly scanTargetMiB?: 1 | 2 | 3;
       readonly scanIO?: "batch" | "window";
       readonly scanOutput?: "borrowed" | "flat" | "dictionary";
@@ -99,6 +103,11 @@ export interface ExportPass {
   readonly kept: { hot: string; scanned: string } | null;
   readonly phases?: ExportPhases;
   readonly baselineCommit?: string;
+  readonly shapeComparison?: {
+    readonly reference: string;
+    readonly variant: string;
+    readonly classes: readonly string[];
+  };
   readonly readMiB: number;
   readonly mode: "pages" | "scan" | "scan-core";
   readonly scanStats?: ScanExportStats;
@@ -289,6 +298,23 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
         });
   const protectedBefore = space.stats.cache.protectedBytes / MiB;
   const passes: ExportPass[] = [];
+  const shapeComparison =
+    request.scanShape === undefined
+      ? undefined
+      : {
+          reference: "74c79c9b",
+          variant: request.scanShape,
+          classes: [ChunkReader.name, ColumnTarget.name, TableScan.name],
+        };
+  if (
+    shapeComparison?.classes.some(
+      (name, k) =>
+        name !==
+        (request.scanShape === "candidate" ? "Candidate" : "") +
+          (["ChunkReader", "ColumnTarget", "TableScan"][k] ?? ""),
+    )
+  )
+    throw new Error("Shape comparison did not select a consistent module family");
   if (request.profile === true) console.profile("export");
   if (phases) performance.mark("minnow-export-start");
   for (let pass = 0; pass < request.passes; pass++) {
@@ -358,6 +384,7 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
     passes.push({
       ...(phases ? { phases: { ...phases } } : {}),
       ...(baselineCommit ? { baselineCommit } : {}),
+      ...(shapeComparison ? { shapeComparison } : {}),
       mode: request.mode ?? "pages",
       readMiB: MAX_READ_BYTES / MiB,
       verifying: VERIFY_CACHED_BYTES,

@@ -19,7 +19,7 @@
  * It never exposes dictionary/page/cache buffers; all-valid proofs use verified loaded masks.
  * The vector returned by `decode` is valid until the next decode into the same target.
  */
-import type { PhysicalType } from "../types.js";
+import type { Layout, PhysicalType } from "../types.js";
 import { layoutOf } from "../types.js";
 import {
   newDictionaryId,
@@ -30,6 +30,7 @@ import {
   type VectorData,
 } from "../vector/vector.js";
 import type { ChunkPages } from "./scan.js";
+import { DecodeFact } from "../page/reader.js";
 
 /** Where a target's bytes are charged (an `OutputArena` or a grant-backed `Charged`). */
 export interface TargetMemory {
@@ -122,7 +123,7 @@ export interface OwnedColumn {
 }
 export class ColumnTarget {
   readonly #memory: TargetMemory;
-  readonly #layout: ReturnType<typeof layoutOf>;
+  readonly #build: ShapeBuilder;
   #charged = 0;
   /** Buffers by name, with the rows each was made for (at most `capacity`). */
   readonly #buffers = new Map<string, { array: Typed | BigInt64Array; rows: number }>();
@@ -134,7 +135,7 @@ export class ColumnTarget {
     memory: TargetMemory,
   ) {
     this.#memory = memory;
-    this.#layout = layoutOf(type);
+    this.#build = SHAPE_BUILDERS[layoutOf(type)];
   }
 
   /** Decode directly into tight, dedicated output buffers. Text stays UTF-8 bytes.
@@ -167,7 +168,7 @@ export class ColumnTarget {
     };
     try {
       const shape = shapeOf(
-        this.#layout,
+        this.#build,
         pages,
         spec,
         { buffer: (b) => create(b.Type, b.elements(count)), varlen: (n) => create(Uint8Array, n) },
@@ -294,26 +295,23 @@ export class ColumnTarget {
     dictionaryCodes = true,
     omitAllValid = false,
   ): number {
-    const rows = rowsOf(spec);
-    let bytes = 0;
-    shapeOf(
-      layoutOf(type),
+    return bytesForShape(
+      SHAPE_BUILDERS[layoutOf(type)],
       pages,
       spec,
-      {
-        buffer: (b) => {
-          bytes += b.elements(rows) * b.Type.BYTES_PER_ELEMENT;
-          return b.empty;
-        },
-        varlen: (n) => {
-          bytes += n;
-          return NO_BYTES;
-        },
-      },
       dictionaryCodes,
       omitAllValid,
     );
-    return bytes;
+  }
+
+  /** Sizing through the same once-selected builder as this column's reservation and decode. */
+  outputBytes(
+    pages: ChunkPages,
+    spec: DecodeSpec,
+    dictionaryCodes = true,
+    omitAllValid = false,
+  ): number {
+    return bytesForShape(this.#build, pages, spec, dictionaryCodes, omitAllValid);
   }
 
   /** Gives back every buffer (after an oversized row, before its loan is repaid). */
@@ -345,7 +343,7 @@ export class ColumnTarget {
   }
 
   #shape(pages: ChunkPages, spec: DecodeSpec, use: Use): Shape {
-    return shapeOf(this.#layout, pages, spec, use);
+    return shapeOf(this.#build, pages, spec, use);
   }
 
   /** Bytes a varlen decode of `spec` needs (0 for fixed-width columns). */
@@ -411,85 +409,135 @@ function varlenBytes(pages: ChunkPages, spec: DecodeSpec): number {
     : pages.gatherBytes(spec.rows, 0, spec.count);
 }
 
-/**
- * The buffers a decode of `spec` uses (through `use`): the one description both sizing
- * (`growthFor`, `outputBytes`) and decoding read, so they cannot disagree.
- */
+/** A layout's buffer recipe is selected once per scan column, not rebuilt for every phase. */
+type ShapeBuilder = (
+  pages: ChunkPages,
+  spec: DecodeSpec,
+  use: Use,
+  facts: number | undefined,
+) => VectorData;
+
+function int64Shape(
+  pages: ChunkPages,
+  spec: DecodeSpec,
+  use: Use,
+  facts: number | undefined,
+): Int64Values {
+  let safe: boolean;
+  if (facts !== undefined) safe = (facts & DecodeFact.safeInt64) !== 0;
+  else {
+    const [lo, hi] = spanOf(spec);
+    const [first, end] = pages.pagesInRange(lo, Math.max(hi, lo + 1));
+    safe = pages.isSafe(first, end);
+  }
+  return safe
+    ? { repr: "safe", values: use.buffer(F64) }
+    : { repr: "int64", values: use.buffer(I64) };
+}
+
+const SHAPE_BUILDERS: Record<Layout, ShapeBuilder> = {
+  bool: (_pages, _spec, use) => ({ layout: "bool", values: use.buffer(U8) }),
+  i32: (_pages, _spec, use) => ({ layout: "i32", values: use.buffer(I32) }),
+  f32: (_pages, _spec, use) => ({ layout: "f32", values: use.buffer(F32) }),
+  f64: (_pages, _spec, use) => ({ layout: "f64", values: use.buffer(F64) }),
+  int64: (pages, spec, use, facts) => ({
+    layout: "int64",
+    values: int64Shape(pages, spec, use, facts),
+  }),
+  interval: (pages, spec, use, facts) => ({
+    layout: "interval",
+    months: use.buffer(MONTHS),
+    days: use.buffer(DAYS),
+    micros: int64Shape(pages, spec, use, facts),
+  }),
+  fixed16: (_pages, _spec, use) => ({ layout: "fixed16", bytes: use.buffer(FIXED16) }),
+  decimal: (pages, spec, use, facts) => {
+    const scale = pages.directory.scale;
+    return {
+      layout: "decimal",
+      scale,
+      scales: scale === null ? use.buffer(SCALES) : null,
+      coefficients: pages.needsInt128
+        ? { repr: "int128", limbs: use.buffer(LIMBS) }
+        : int64Shape(pages, spec, use, facts),
+      specials: pages.hasDecimalSpecials ? use.buffer(SPECIALS) : null,
+    };
+  },
+  varlen: (pages, spec, use) => ({
+    layout: "varlen",
+    bytes: use.varlen(varlenBytes(pages, spec)),
+    offsets: use.buffer(OFFSETS),
+  }),
+};
+
+function spanOf(spec: DecodeSpec): [number, number] {
+  return "from" in spec
+    ? [spec.from, spec.to]
+    : [spec.rows[0] ?? 0, (spec.rows[Math.max(0, spec.count - 1)] ?? 0) + 1];
+}
+
+/** Shared header facts feed sizing, growth reservation and vector construction. */
 function shapeOf(
-  layout: ReturnType<typeof layoutOf>,
+  build: ShapeBuilder,
   pages: ChunkPages,
   spec: DecodeSpec,
   use: Use,
   dictionaryCodes = true,
   omitAllValid = false,
 ): Shape {
-  const count = rowsOf(spec);
-  const [lo, hi] =
-    "from" in spec
-      ? [spec.from, spec.to]
-      : [spec.rows[0] ?? 0, (spec.rows[Math.max(0, spec.count - 1)] ?? 0) + 1];
-  const needValidity = !(omitAllValid && count > 0 && pages.isAllValid?.(lo, hi) === true);
+  const count = rowsOf(spec),
+    [lo, hi] = spanOf(spec);
+  const facts = pages.decodeFacts?.(lo, Math.max(hi, lo + 1));
+  const needValidity = !(
+    omitAllValid &&
+    count > 0 &&
+    (facts === undefined
+      ? pages.isAllValid?.(lo, hi) === true
+      : (facts & DecodeFact.allValid) !== 0)
+  );
   const dictionary = pages.dictionary;
-  if (dictionaryCodes && count > 0 && dictionary !== null && pages.isDictionaryRange(lo, hi))
+  if (
+    dictionaryCodes &&
+    count > 0 &&
+    dictionary !== null &&
+    (facts === undefined ? pages.isDictionaryRange(lo, hi) : (facts & DecodeFact.dictionary) !== 0)
+  )
     return {
       codes: use.buffer(CODES),
       validity: needValidity ? use.buffer(VALIDITY) : null,
       dictionary,
     };
   const validity = needValidity ? use.buffer(VALIDITY) : null;
-  const [first, end] = pages.pagesInRange(lo, Math.max(hi, lo + 1));
-  const int64 = (): Int64Values =>
-    pages.isSafe(first, end)
-      ? { repr: "safe", values: use.buffer(F64) }
-      : { repr: "int64", values: use.buffer(I64) };
-  let data: VectorData;
-  switch (layout) {
-    case "bool":
-      data = { layout: "bool", values: use.buffer(U8) };
-      break;
-    case "i32":
-      data = { layout: "i32", values: use.buffer(I32) };
-      break;
-    case "f32":
-      data = { layout: "f32", values: use.buffer(F32) };
-      break;
-    case "f64":
-      data = { layout: "f64", values: use.buffer(F64) };
-      break;
-    case "int64":
-      data = { layout: "int64", values: int64() };
-      break;
-    case "interval":
-      data = {
-        layout: "interval",
-        months: use.buffer(MONTHS),
-        days: use.buffer(DAYS),
-        micros: int64(),
-      };
-      break;
-    case "fixed16":
-      data = { layout: "fixed16", bytes: use.buffer(FIXED16) };
-      break;
-    case "decimal": {
-      const scale = pages.directory.scale;
-      data = {
-        layout: "decimal",
-        scale,
-        scales: scale === null ? use.buffer(SCALES) : null,
-        coefficients: pages.needsInt128 ? { repr: "int128", limbs: use.buffer(LIMBS) } : int64(),
-        specials: pages.hasDecimalSpecials ? use.buffer(SPECIALS) : null,
-      };
-      break;
-    }
-    case "varlen":
-      data = {
-        layout: "varlen",
-        bytes: use.varlen(varlenBytes(pages, spec)),
-        offsets: use.buffer(OFFSETS),
-      };
-      break;
-  }
-  return { data, validity };
+  return { data: build(pages, spec, use, facts), validity };
+}
+
+function bytesForShape(
+  build: ShapeBuilder,
+  pages: ChunkPages,
+  spec: DecodeSpec,
+  dictionaryCodes: boolean,
+  omitAllValid: boolean,
+): number {
+  const rows = rowsOf(spec);
+  let bytes = 0;
+  shapeOf(
+    build,
+    pages,
+    spec,
+    {
+      buffer: (b) => {
+        bytes += b.elements(rows) * b.Type.BYTES_PER_ELEMENT;
+        return b.empty;
+      },
+      varlen: (n) => {
+        bytes += n;
+        return NO_BYTES;
+      },
+    },
+    dictionaryCodes,
+    omitAllValid,
+  );
+  return bytes;
 }
 
 function allValid(validity: Validity | null, count: number): boolean {
