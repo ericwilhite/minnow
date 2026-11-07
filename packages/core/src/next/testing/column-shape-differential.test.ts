@@ -98,7 +98,9 @@ describe.each(PROFILES)("shape differential: %s", (profile) => {
             budget: rootBudget,
             reachable: jsonReachable,
             registerCache: (cache) => {
-              memory.cache = cache;
+              // The page cache registers first; R25's retained metadata registers after it and has
+              // nothing evictable, so keep the page cache for the eviction check below.
+              memory.cache ??= cache;
               return memory;
             },
           });
