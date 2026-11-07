@@ -51,13 +51,22 @@
  * - `open` → `publishing` → `published`, or `open` → `aborted`. A writer publishes once, with
  *   every builder sealed. Space it holds is invisible to every root until its publish resolves; a
  *   crash before then leaves orphans that the next open's walk frees (no job records).
- * - Abort and discard free at once: no durable root reached that space, so no pin can.
+ * - Abort and discard free after their queued ownership transition runs: no durable root reached
+ *   that space, so no pin can. A queued discard retains its sealed extent. A queued abort retains
+ *   its records, rejects new writer work, and waits for accepted builder operations outside the
+ *   transition barrier.
  * - A rejected publish leaves its writers `indeterminate` and the space `failed` (see Publish).
  *
  * ## Publish (`ExtentSpace.publish`)
  * - Publishes run one at a time, in call order. Each one: every data write before it, then the
  *   root, become durable in that order (storage/contract.ts guarantee 1), then the next generation
  *   is current. It returns that generation.
+ * - One ownership-transition barrier spans final validation and native publication. Abort, free,
+ *   discard, relocation and seal join it. Supplied writers have no open builders or active work.
+ *   Synchronous open/extend reservations may run during final-phase awaits: they only consume
+ *   tracked free ranges or contiguous EOF and add ownership. Frees are serialized, so the free
+ *   pool can only shrink during that phase; a reservation cannot take rooted or sealed bytes.
+ *   No new memory admission or loan is awaited while the transition barrier is held.
  * - `retired` lists the extents the previous root reaches and the new root does not, each exactly
  *   once, as `ExtentRef`s the space handed out (any length that rounds to the same aligned size is
  *   accepted). Retiring space that is free, reserved or already retired is a `RangeError` before
@@ -85,7 +94,8 @@
  *   `StoreQuotaError` from the write that needed it.
  * - Freed space goes to `session.releaseData` (IndexedDB deletes the records; OPFS truncates only a
  *   free tail, because Chromium and WebKit do not return quota on truncate) and is reallocated only
- *   after that call resolves. The tail is returned only while no writer is open.
+ *   after that call resolves. A free tail is returned under the transition barrier; the map's end
+ *   already includes every writer reservation, so truncation cannot cut any of them.
  * - Engine obligation (the space cannot check it): `retired` and `reachable` are exact. A
  *   reachable extent missing from `reachable` is reused and overwritten. `audit` checks both
  *   against a fresh walk; the write path's crash sweeps run it after every publish.
@@ -522,13 +532,17 @@ export interface ExtentSpace extends ExtentReader {
    */
   pin(label?: string): RootPin;
   /**
-   * Serializes with publication, walks both roots from that generation with `reachable`,
+   * Captures the mutation epoch and walks both roots from that generation with `reachable`,
    * and checks the free map against them:
    * every extent either root reaches is allocated (the previous root's only as waiting); every
-   * allocated extent is reachable, held by a writer, waiting, or being released. Throws `Error("Extent audit: …")` naming the first difference. Tests only.
+   * allocated extent is reachable, held by a writer, waiting, or being released. Restarts if any
+   * ownership transition, reservation or physical write changes the epoch, including when a raced
+   * check failed. Throws `Error("Extent audit: …")` for a stable difference. Tests only.
    */
   audit(): Promise<void>;
-  /** Drops the cache and returns its memory. Does not close the session. Idempotent. */
+  /** Stops new work, drains accepted publication/writer/mutation work, then returns cache memory.
+   * Does not close the session. Idempotent. Late pin releases perform no backend work.
+   */
   close(): Promise<void>;
 }
 

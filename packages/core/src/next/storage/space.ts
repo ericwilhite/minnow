@@ -11,8 +11,10 @@
  *   written and the partial last sector stays in the slab; when another builder appends, everything
  *   staged is written (the last sector partially) and that partial sector (< 4 KiB) is kept with
  *   its builder, to start its next staging. Write amplification is at most one sector per switch.
- * - **Publication** is a promise chain (one at a time, in call order). Validation runs when a
- *   publish's turn comes, before any effect.
+ * - **Publication** is a promise chain (one at a time, in call order), with final validation and
+ *   native publication under the ownership-transition barrier. Free, abort, discard, seal and
+ *   relocation join it; monotonic reservations can consume tracked holes or EOF outside it.
+ * - **Audit** restarts on an ownership/reservation/write epoch change, including a raced failure.
  * - **Reclaim**: `ReclaimLedger` (reclaim.ts) decides when retired extents are reusable; freeing
  *   drops the cache's blobs of each extent, then `releaseData`, and only when that resolves does
  *   the range enter the free map. A free tail is then released (truncated) at once: every byte the
@@ -85,6 +87,11 @@ class Mutex {
       done();
     }
   }
+}
+
+/** A transition token is valid only while its own mutation callback holds the barrier. */
+interface MutationGuard {
+  readonly space: Space;
 }
 
 /**
@@ -426,6 +433,12 @@ class Space implements ExtentSpace {
   /** Writers not yet published or aborted. */
   readonly writers = new Set<Writer>();
   readonly #publishing = new Mutex();
+  readonly #mutations = new Mutex();
+  #activeMutation: MutationGuard | null = null;
+  #mutationEpoch = 0;
+  #activeWrites = 0;
+  #closing = false;
+  #closePromise: Promise<void> | null = null;
   readonly writeLock = new Mutex();
   readonly writeSlab = new Uint8Array(MAX_SLAB);
   /** The builder whose bytes the write slab holds, from its aligned logical `start`. */
@@ -463,7 +476,7 @@ class Space implements ExtentSpace {
     this.#previousRoot = previousRoot;
     this.#fileLength = dataLength;
     this.#ledger = new ReclaimLedger<DataRange>((ranges) => {
-      this.#background_(this.free(ranges));
+      if (!this.#closed && !this.#closing) this.#background_(this.free(ranges));
     });
   }
 
@@ -479,7 +492,7 @@ class Space implements ExtentSpace {
     const pending = pauseIfDue(work);
     if (pending !== undefined) await pending;
     this.#ledger.retireAtOpen(previousOnly);
-    this.#releaseTail();
+    await this.mutate((guard) => this.#releaseTail(guard));
   }
 
   get root(): Uint8Array | null {
@@ -543,9 +556,10 @@ class Space implements ExtentSpace {
   // ── Writing ──────────────────────────────────────────────────────────────────────────────────
 
   beginWrite(label: string, options: WriteOptions = {}): ExtentWriter {
-    this.usable();
+    this.accepting();
     const writer = new Writer(this, label, options.budget ?? null);
     this.writers.add(writer);
+    this.reserved();
     return writer;
   }
 
@@ -555,16 +569,53 @@ class Space implements ExtentSpace {
     if (this.#failed !== null) throw new SpaceFailedError(this.#failed);
   }
 
+  accepting(): void {
+    this.usable();
+    this.cleanupAllowed();
+  }
+  cleanupAllowed(): void {
+    if (this.#closing || this.#closed) throw new StoreClosedError();
+  }
+  /** Monotonic reservation adds ownership and only consumes tracked holes or contiguous EOF.
+   * It may run during final-phase awaits: it cannot take bytes owned by a root or sealed writer.
+   * Every removal/transition instead joins mutate(), including abort/free/discard/relocate/seal.
+   */
+  reserved(): void {
+    this.#mutationEpoch++;
+  }
+  mutate<T>(work: (guard: MutationGuard) => Promise<T>): Promise<T> {
+    return this.#mutations.run(async () => {
+      const guard: MutationGuard = { space: this };
+      this.#activeMutation = guard;
+      this.#mutationEpoch++;
+      try {
+        return await work(guard);
+      } finally {
+        this.#mutationEpoch++;
+        this.#activeMutation = null;
+      }
+    });
+  }
+  #guard(guard: MutationGuard): void {
+    if (guard !== this.#activeMutation || guard.space !== this)
+      throw new TypeError("Ownership transition outside its barrier");
+  }
+
   /** A session call that writes: ownership loss fails the space. */
   /** `transfer`: the space hands `bytes` (a whole buffer it will never touch again) over. */
   async sessionWrite(offset: number, bytes: Uint8Array, transfer = false): Promise<void> {
+    this.#mutationEpoch++;
+    this.#activeWrites++;
     try {
       await this.#session.writeData(offset, bytes, transfer ? { transfer } : undefined);
+      this.#fileLength = Math.max(this.#fileLength, offset + bytes.length);
     } catch (error) {
       if (error instanceof OwnershipLostError) this.fail(error);
       throw error;
+    } finally {
+      this.#activeWrites--;
+      this.#mutationEpoch++;
     }
-    this.#fileLength = Math.max(this.#fileLength, offset + bytes.length);
   }
 
   async sessionRead(offset: number, target: Uint8Array): Promise<void> {
@@ -709,7 +760,11 @@ class Space implements ExtentSpace {
    * Frees ranges no root, pin or writer can reach: drop their cached blobs, release them to the
    * platform, then make them allocatable.
    */
-  async free(ranges: readonly DataRange[]): Promise<void> {
+  free(ranges: readonly DataRange[]): Promise<void> {
+    return this.mutate((guard) => this.freeGuarded(ranges, guard));
+  }
+  async freeGuarded(ranges: readonly DataRange[], guard: MutationGuard): Promise<void> {
+    this.#guard(guard);
     if (ranges.length === 0) return;
     let bytes = 0;
     let retired = 0;
@@ -735,19 +790,20 @@ class Space implements ExtentSpace {
       this.#map.free(range.offset, range.length);
       this.#retired.delete(range.offset);
     }
-    this.#releaseTail();
+    await this.#releaseTail(guard);
   }
 
-  #releaseTail(): void {
+  async #releaseTail(guard: MutationGuard): Promise<void> {
+    this.#guard(guard);
     const end = this.#map.end;
     if (end >= this.#fileLength || this.#closed) return;
     const length = this.#fileLength - end;
     this.#fileLength = end;
-    this.#background_(
-      this.#session.releaseData([{ offset: end, length }]).catch((error: unknown) => {
-        this.fail(error);
-      }),
-    );
+    try {
+      await this.#session.releaseData([{ offset: end, length }]);
+    } catch (error) {
+      this.fail(error);
+    }
   }
 
   /** Tracks a release in flight; a failure fails the space (its space stays allocated). */
@@ -766,8 +822,9 @@ class Space implements ExtentSpace {
 
   // ── Publication ──────────────────────────────────────────────────────────────────────────────
 
-  publish(root: Uint8Array, change: PublishChange): Promise<number> {
-    return this.#publishing.run(() => this.#publishNow(root, change));
+  async publish(root: Uint8Array, change: PublishChange): Promise<number> {
+    this.accepting();
+    return this.#publishing.run(() => this.mutate(() => this.#publishNow(root, change)));
   }
 
   async #publishNow(root: Uint8Array, change: PublishChange): Promise<number> {
@@ -799,6 +856,8 @@ class Space implements ExtentSpace {
       if (!(candidate instanceof Writer) || candidate.space !== this)
         throw new TypeError("publish: a writer from another space");
       if (checked.has(candidate)) throw new TypeError(`publish: writer ${candidate.label} twice`);
+      if (candidate.abortRequested)
+        throw new TypeError(`publish: writer ${candidate.label} is aborting`);
       if (candidate.state !== "open")
         throw new TypeError(`publish: writer ${candidate.label} is ${candidate.state}`);
       if (candidate.builders.size > 0 || candidate.busy > 0)
@@ -845,8 +904,35 @@ class Space implements ExtentSpace {
 
   // ── Audit ────────────────────────────────────────────────────────────────────────────────────
 
-  audit(): Promise<void> {
-    return this.#publishing.run(() => this.#auditNow());
+  async audit(): Promise<void> {
+    for (;;) {
+      const turn = pauseIfDue();
+      if (turn !== undefined) await turn;
+      if (this.#activeWrites > 0) {
+        await this.writeLock.run(async () => undefined);
+        continue;
+      }
+      if (this.#activeMutation !== null) {
+        await this.#mutations.run(async () => undefined);
+        continue;
+      }
+      const epoch = this.#mutationEpoch;
+      try {
+        await this.#auditNow();
+      } catch (error) {
+        if (!this.#sameEpoch(epoch)) continue;
+        throw error;
+      }
+      if (this.#sameEpoch(epoch)) return;
+      const pause = pauseIfDue();
+      if (pause !== undefined) await pause;
+    }
+  }
+
+  #sameEpoch(epoch: number): boolean {
+    return (
+      epoch === this.#mutationEpoch && this.#activeMutation === null && this.#activeWrites === 0
+    );
   }
 
   async #auditNow(): Promise<void> {
@@ -925,9 +1011,24 @@ class Space implements ExtentSpace {
       fail(`space at ${String(cursor)} is allocated but unaccounted (a leak)`);
   }
 
-  async close(): Promise<void> {
-    if (this.#closed) return;
+  close(): Promise<void> {
+    if (this.#closePromise !== null) return this.#closePromise;
+    this.#closing = true;
+    return (this.#closePromise = this.#closeNow());
+  }
+  async #closeNow(): Promise<void> {
+    await this.#publishing.run(async () => undefined);
+    // Await busy operations outside the barrier: a queued seal/abort needs it to finish.
+    for (const writer of this.writers) {
+      try {
+        await writer.settled();
+      } catch (error) {
+        this.fail(error);
+      }
+    }
+    await this.writeLock.run(async () => undefined);
     await this.settled();
+    await this.#mutations.run(async () => undefined);
     this.#closed = true;
     this.#cache.close();
     this.retainedMemory.close();
@@ -943,6 +1044,14 @@ class Writer implements ExtentWriter {
   /** Calls in flight (appends, whole seals): abort waits for them. */
   busy = 0;
   readonly #idle: Array<() => void> = [];
+  #abortPromise: Promise<void> | null = null;
+  get abortRequested(): boolean {
+    return this.#abortPromise !== null;
+  }
+  async settled(): Promise<void> {
+    while (this.busy > 0) await new Promise<void>((resolve) => this.#idle.push(resolve));
+    await this.#abortPromise;
+  }
 
   /** Charged for each builder's own staging buffer; null: builders share the space's slab. */
   readonly budget: ByteBudget | null;
@@ -966,7 +1075,8 @@ class Writer implements ExtentWriter {
 
   usable(): void {
     if (this.state !== "open") throw new TypeError(`Writer ${this.label} is ${this.state}`);
-    this.space.usable();
+    if (this.abortRequested) throw new TypeError(`Writer ${this.label} is aborting`);
+    this.space.accepting();
   }
 
   async track<T>(work: () => Promise<T>): Promise<T> {
@@ -989,6 +1099,7 @@ class Writer implements ExtentWriter {
     if (this.budget?.allocate(size) === true)
       builder.own = { buffer: new Uint8Array(size), start: 0, length: 0 };
     this.builders.add(builder);
+    this.space.reserved();
     return builder;
   }
 
@@ -1009,39 +1120,49 @@ class Writer implements ExtentWriter {
 
   async discard(extent: ExtentRef): Promise<void> {
     this.usable();
-    const index = this.#extents.findIndex(
-      (candidate) => candidate.offset === extent.offset && candidate.length === extent.length,
-    );
-    if (index < 0) throw new RangeError(`Writer ${this.label} did not seal that extent`);
-    this.#extents.splice(index, 1);
-    await this.space.free([
-      { offset: extent.offset, length: this.space.map.sizeOf(extent.length) },
-    ]);
-  }
-
-  async abort(): Promise<void> {
-    if (this.state === "aborted") return;
-    if (this.state !== "open") throw new TypeError(`Writer ${this.label} is ${this.state}`);
-    this.state = "aborted";
-    // Every call in flight finishes first, so each range has exactly one owner when abort takes
-    // what is left (review B1-p2a finding 3).
-    while (this.busy > 0)
-      await new Promise<void>((resolve) => {
-        this.#idle.push(resolve);
-      });
-    const ranges: DataRange[] = [];
-    await this.space.writeLock.run(async () => {
-      for (const builder of this.builders) {
-        if (this.space.staged?.builder === builder) this.space.staged = null;
-        ranges.push(...builder.abandon());
-      }
+    await this.space.mutate(async (guard) => {
+      // Accepted before close; recheck ownership, without treating close's drain as new work.
+      if (this.state !== "open") throw new TypeError(`Writer ${this.label} cannot discard now`);
+      this.space.usable();
+      const index = this.#extents.findIndex(
+        (candidate) => candidate.offset === extent.offset && candidate.length === extent.length,
+      );
+      if (index < 0) throw new RangeError(`Writer ${this.label} did not seal that extent`);
+      this.#extents.splice(index, 1);
+      await this.space.freeGuarded(
+        [{ offset: extent.offset, length: this.space.map.sizeOf(extent.length) }],
+        guard,
+      );
     });
-    this.builders.clear();
-    for (const extent of this.#extents)
-      ranges.push({ offset: extent.offset, length: this.space.map.sizeOf(extent.length) });
-    this.#extents.length = 0;
-    this.space.writers.delete(this);
-    await this.space.free(ranges);
+  }
+  async abort(): Promise<void> {
+    if (this.state === "aborted") return Promise.resolve();
+    if (this.#abortPromise !== null) return this.#abortPromise;
+    if (this.state !== "open")
+      return Promise.reject(new TypeError(`Writer ${this.label} is ${this.state}`));
+    this.space.cleanupAllowed();
+    // Do not remove ownership or mark aborted until the queued transition owns the barrier.
+    return (this.#abortPromise = this.#abortNow());
+  }
+  async #abortNow(): Promise<void> {
+    while (this.busy > 0) await new Promise<void>((resolve) => this.#idle.push(resolve));
+    await this.space.writeLock.run(() =>
+      this.space.mutate(async (guard) => {
+        if (this.state !== "open") throw new TypeError(`Writer ${this.label} is ${this.state}`);
+        this.state = "aborted";
+        const ranges: DataRange[] = [];
+        for (const builder of this.builders) {
+          if (this.space.staged?.builder === builder) this.space.staged = null;
+          ranges.push(...builder.abandon());
+        }
+        this.builders.clear();
+        for (const extent of this.#extents)
+          ranges.push({ offset: extent.offset, length: this.space.map.sizeOf(extent.length) });
+        this.#extents.length = 0;
+        this.space.writers.delete(this);
+        await this.space.freeGuarded(ranges, guard);
+      }),
+    );
   }
 }
 
@@ -1099,7 +1220,9 @@ class Builder implements ExtentBuilder {
   extend(bytes: number): boolean {
     this.#usable();
     if (!(Number.isSafeInteger(bytes) && bytes >= 0)) throw new RangeError("Bad extend size");
-    return this.reservation.extend(bytes);
+    const result = this.reservation.extend(bytes);
+    this.writer.space.reserved();
+    return result;
   }
 
   async append(parts: readonly Uint8Array[]): Promise<PendingBlob[]> {
@@ -1144,55 +1267,54 @@ class Builder implements ExtentBuilder {
     if (this.#appending) throw new TypeError("seal during an append");
     this.#state = "sealed";
     const space = this.writer.space;
-    return this.writer.track(async () => {
-      if (this.#length === 0) {
-        const ranges = await space.writeLock.run(async () => {
-          if (space.staged?.builder === this) space.staged = null;
-          this.releaseBuffer();
-          const reserved = this.reservation.abort();
-          this.writer.sealed(this, null);
-          return reserved;
-        });
-        await space.free(ranges);
-        return null;
-      }
-      let plan: SealPlan;
-      try {
-        plan = await space.writeLock.run(async () => {
-          if (space.staged?.builder === this) await space.flushStaged(false);
-          await space.flushOwn(this);
-          if (this.failure !== null) throw this.failure;
-          this.releaseBuffer();
-          const sealed = this.reservation.seal(this.#length);
-          this.#leftover = [
-            { offset: sealed.extent.offset, length: space.map.sizeOf(sealed.extent.length) },
-            ...sealed.release,
-          ];
-          if (sealed.moves.length > 0) {
-            // Relocation: the slab carries every segment's bytes to the contiguous extent.
-            if (space.staged !== null) await space.flushStaged(false);
-            for (const move of sealed.moves)
-              for (let done = 0; done < move.length; done += MAX_SLAB) {
-                const chunk = space.writeSlab.subarray(0, Math.min(MAX_SLAB, move.length - done));
-                await space.sessionRead(move.from + done, chunk);
-                await space.sessionWrite(move.to + done, chunk);
-              }
-            space.relocated();
+    return this.writer.track(() =>
+      space.writeLock.run(() =>
+        space.mutate(async (guard) => {
+          if (this.#length === 0) {
+            if (space.staged?.builder === this) space.staged = null;
+            this.releaseBuffer();
+            const ranges = this.reservation.abort();
+            this.writer.sealed(this, null);
+            await space.freeGuarded(ranges, guard);
+            return null;
           }
-          this.#leftover = null;
-          this.tail = null;
-          this.writer.sealed(this, sealed.extent);
-          return sealed;
-        });
-      } catch (error) {
-        this.failure ??= error instanceof Error ? error : new Error(String(error));
-        throw error;
-      }
-      await space.free(plan.release);
-      if (this.writer.state === "aborted")
-        throw new TypeError(`Writer ${this.writer.label} was aborted during the seal`);
-      const extent: ExtentRef = plan.extent;
-      return { extent, blobs: this.#pending.map((blob) => ({ extent, ...blob })) };
-    });
+          let plan: SealPlan;
+          try {
+            if (space.staged?.builder === this) await space.flushStaged(false);
+            await space.flushOwn(this);
+            if (this.failure !== null) throw this.failure;
+            this.releaseBuffer();
+            const sealed = this.reservation.seal(this.#length);
+            this.#leftover = [
+              { offset: sealed.extent.offset, length: space.map.sizeOf(sealed.extent.length) },
+              ...sealed.release,
+            ];
+            if (sealed.moves.length > 0) {
+              // Relocation: the slab carries every segment's bytes to the contiguous extent.
+              if (space.staged !== null) await space.flushStaged(false);
+              for (const move of sealed.moves)
+                for (let done = 0; done < move.length; done += MAX_SLAB) {
+                  const chunk = space.writeSlab.subarray(0, Math.min(MAX_SLAB, move.length - done));
+                  await space.sessionRead(move.from + done, chunk);
+                  await space.sessionWrite(move.to + done, chunk);
+                }
+              space.relocated();
+            }
+            this.#leftover = null;
+            this.tail = null;
+            this.writer.sealed(this, sealed.extent);
+            plan = sealed;
+          } catch (error) {
+            this.failure ??= error instanceof Error ? error : new Error(String(error));
+            throw error;
+          }
+          await space.freeGuarded(plan.release, guard);
+          if (this.writer.abortRequested)
+            throw new TypeError(`Writer ${this.writer.label} was aborted during the seal`);
+          const extent: ExtentRef = plan.extent;
+          return { extent, blobs: this.#pending.map((blob) => ({ extent, ...blob })) };
+        }),
+      ),
+    );
   }
 }

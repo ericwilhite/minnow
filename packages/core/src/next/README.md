@@ -156,10 +156,17 @@ are exercised without requiring host contention.
 - The log has a flush barrier and two header slots.
 - **The extent space** (`extents.ts`) is the only caller of the data-space calls and of `publish`.
   - A writer reserves extents, appends checksummed blobs, seals, and either publishes once or
-    aborts. Abort frees at once; a crash before publish leaves orphans that open frees.
+    aborts. Abort frees after in-flight writes and its queued ownership transition finish;
+    a crash before publish leaves orphans that open frees.
   - `publish(root, { writers, retired })` is serialized and atomic. Two-generation reclaim: retired
     extents are reused only after the _next_ publish is durable and no pin of an older generation
     remains, so the current and previous roots always read intact.
+  - One ownership-transition barrier covers final validation and native publication. Abort,
+    discard, seal, relocation and free join it and retain ownership while queued. Synchronous
+    `open`/`extend` reservations stay available: they consume tracked holes or contiguous EOF
+    and add ownership. Supplied publishing writers have no open builders or active operations.
+    Close drains accepted work before releasing the cache; late pin releases do no backend work.
+    Audits restart on mutation-epoch changes, including reservations and physical writes.
   - A rejected publish is indeterminate: the space keeps everything allocated and refuses writes
     until the owner reopens.
   - Free space is rebuilt on open from the extents the current and previous roots reach, first

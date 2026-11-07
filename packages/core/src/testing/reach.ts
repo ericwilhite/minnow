@@ -82,6 +82,16 @@ export const METADATA_EXTENTS_REACH = [
 /** Every scripted private-journal write failure must preserve its cause and return memory. */
 export const METADATA_WRITE_FAULT_REACH = ["native error preserved", "zero final charge"] as const;
 
+/** Ownership transitions wait across native publication, while synchronous reservations progress. */
+export const STORAGE_MUTATION_REACH = [
+  "reservations during publish",
+  "abort held",
+  "discard held",
+  "seal held",
+  "transitions drain",
+  "audit after interleaving",
+] as const;
+
 /** Full-scan shared windows: the default and override must cover cold and resident reads. */
 export const SCAN_WINDOW_RESIDENCY_REACH = [
   "default cold",

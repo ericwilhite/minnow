@@ -1647,8 +1647,15 @@ Retained free-run and previous-only retirement capacity is admitted before alloc
 old/new backing-store overlap. The charge transfers from the startup grant to the space and
 remains until close; deleting entries does not assume the JavaScript containers release capacity.
 Finite-budget regressions cover refusal, transfer refusal, cancellation, fragmentation,
-previous-root retirement and cleanup. Audits hold the publication lock across root enumeration
-and allocator checks, so concurrent publication cannot make their captured roots stale.
+previous-root retirement and cleanup. Audits restart when their mutation epoch changes,
+including a raced failure, so publication, reservation and writer transitions cannot make
+their captured accounting view stale. They hold no publication lock during enumeration.
+
+Ownership-boundary histories hold native publication and interleave synchronous reservations
+with abort, discard and seal in generated orders. They drive the memory backend's task turn
+explicitly, require queued owners to retain their records, then release publication and audit
+the result. Close must retain its memory until an accepted publication settles, including a
+native failure. These tests cover the barrier; disk-derived R8 tickets are a separate integration.
 
 The real owner-ready composition holds initial flush, merge and recycle work until the page
 acknowledges receiving ready, then resumes it. Native file/range and logical call-site tracing
