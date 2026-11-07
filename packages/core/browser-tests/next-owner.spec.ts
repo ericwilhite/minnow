@@ -175,16 +175,33 @@ test("hidden flushes pending relaxed commits before the owner can be lost", asyn
     const name = dbName(`hidden-${String(flushOnHidden)}`);
     const a = await tab(flushOnHidden ? page : await context.newPage());
     await call(a, "wipe", name);
-    // Relaxed, and no timed flush for ten minutes: acknowledged commits sit in memory.
-    await call(a, "open", name, { settings: { durability: "relaxed", flushDelayMs: 600_000 } });
+    // Isolate this explicit hidden event from browser-dependent visibility/pagehide teardown.
+    await call(a, "open", name, {
+      relayLifecycle: false,
+      settings: { durability: "relaxed", flushDelayMs: 600_000 },
+    });
     await seed(a);
+    const before = await call(a, "durabilityCheckpoint");
+    expect(before.appliedLsn).toBeGreaterThan(0);
+    expect(before.durableLsn).toBe(0);
+    expect(before.flushes).toBe(0);
     if (flushOnHidden) await call(a, "lifecycle", "hidden");
-    await a.waitForTimeout(100);
+    // The checkpoint follows lifecycle on the same worker channel and awaits any existing save.
+    const after = await call(a, "durabilityCheckpoint");
+    if (flushOnHidden) {
+      expect(after.durableLsn).toBe(after.appliedLsn);
+      expect(after.flushes).toBeGreaterThan(0);
+    } else {
+      expect(after.durableLsn).toBe(0);
+      expect(after.flushes).toBe(0);
+    }
+    await call(a, "crashOwner");
     await a.close();
     const b = await tab(await context.newPage());
     await call(b, "open", name);
     const result = await call(b, "query", "SELECT id, n, name FROM t");
-    // With the flush the rows survived the owner; without it (the control) even the table is gone.
+    // Fixture-specific control: state existed only in JS memory, never in a save. This is
+    // not a claim that a real relaxed-durability commit must be lost after worker death.
     if (flushOnHidden) expect(result).toMatchObject({ rows: [[1, 0, "x"]] });
     else expect(result).toMatchObject({ error: "PlanningError" });
     await b.close();

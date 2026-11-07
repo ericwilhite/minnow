@@ -23,6 +23,9 @@ import {
 } from "../../dist/next/testing/owner-standins.js";
 import type { ChunkReads } from "../../dist/next/exec/scan.js";
 
+let durabilityCheckpoint:
+  (() => Promise<{ appliedLsn: number; durableLsn: number; flushes: number }>) | null = null;
+
 type Fence =
   | {
       readonly kind: "opfs";
@@ -148,6 +151,7 @@ const factory: OwnerEngineFactory<Fence> = {
   async open(fence, settings) {
     fence.releaseUnsettled = settings.releaseUnsettled === true;
     const gate = { held: false, dieOnSave: false, executing: 0 };
+    let saving: Promise<void> = Promise.resolve();
     let writePath: StandinWritePath | null = null;
     const knobs = new BroadcastChannel(`minnow-next-test:${fence.db}`);
     knobs.onmessage = (event: MessageEvent) => {
@@ -192,10 +196,21 @@ const factory: OwnerEngineFactory<Fence> = {
             die();
             return;
           }
-          return idbSave(fence.idb, next).then(die);
+          saving = idbSave(fence.idb, next).then(die);
+          return saving;
         },
       },
     });
+    const openedWritePath = writePath;
+    durabilityCheckpoint = async () => {
+      // Observe an already-started save. This checkpoint must never call flush().
+      await saving;
+      return {
+        appliedLsn: openedWritePath.appliedLsn,
+        durableLsn: openedWritePath.durableLsn,
+        flushes: openedWritePath.flushes,
+      };
+    };
     const executor = new StandinExecutor();
     const prepare = executor.prepare.bind(executor);
     executor.prepare = (plan) => {
@@ -248,4 +263,24 @@ stats.onmessage = (event: MessageEvent) => {
     stats.postMessage({ t: "lockCalls", count: lockCalls });
 };
 
-serveOwnerWorker(self as unknown as Parameters<typeof serveOwnerWorker>[0], factory, counted);
+const scope = self as unknown as Parameters<typeof serveOwnerWorker>[0];
+serveOwnerWorker(scope, factory, counted);
+const receiveOwner = scope.onmessage;
+scope.onmessage = (event) => {
+  const request = event.data as { t?: string; nonce?: string };
+  if (request.t !== "minnow-test:durability") {
+    receiveOwner?.(event);
+    return;
+  }
+  const checkpoint = durabilityCheckpoint;
+  if (checkpoint === null) throw new Error("No write path");
+  void checkpoint().then(
+    (state) => scope.postMessage({ t: "minnow-test:durability", nonce: request.nonce, state }),
+    (error: unknown) =>
+      scope.postMessage({
+        t: "minnow-test:durability",
+        nonce: request.nonce,
+        error: String(error),
+      }),
+  );
+};
