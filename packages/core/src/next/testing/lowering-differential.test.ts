@@ -4,13 +4,18 @@
  * identical results required. This checks lowering's semantics (names, types, constants,
  * grouping, ordering, defaults, generated columns, ON CONFLICT, RETURNING) on the milestone M1
  * surface before the executor exists. Values are compared in the oracle's representation:
- * integers as numbers, floats to 12 significant digits.
+ * integers as numbers, floats to 12 significant digits. The original IN-subquery case also
+ * runs through the real executor against PostgreSQL and the current engine, alongside
+ * B6's complete lowering/reference campaign.
  */
 import { describe, expect, it } from "vitest";
+import { PGlite } from "@electric-sql/pglite";
 import { MinnowDatabase } from "../../engine/database.js";
 import { MemoryBlockStore } from "../../storage/index.js";
 import { ReferenceSqlError } from "./ir-reference.js";
 import { LoweredDatabase } from "./lowering-harness.js";
+import { StorageCore } from "./storage-core.js";
+import { oracleRows as executionRows } from "./differential-adapter.js";
 
 /** A statement and its placeholder values. */
 type Case = readonly [string, (readonly unknown[])?];
@@ -194,6 +199,42 @@ describe("lowering agrees with the current engine (milestone M1 surface)", () =>
     }
     // Everything the queries use is lowered.
     expect(unsupported).toEqual([]);
+  });
+
+  it("executes the original IN subquery through the real executor against both SQL engines", async () => {
+    const sql = "SELECT id FROM orders WHERE customer_id IN (SELECT 1) ORDER BY id";
+    const core = await new StorageCore().open();
+    const pg = new PGlite();
+    await pg.waitReady;
+    const current = new MinnowDatabase(new MemoryBlockStore());
+    try {
+      for (const statement of [...SCHEMA, ...SEED]) {
+        await pg.exec(statement);
+        await current.execute(statement);
+      }
+      // Only these two original columns enter this SELECT. The adapter's trusted
+      // fixture omits the unrelated M1 CHECK/generated-column write features.
+      await core.execute("CREATE TABLE orders(id BIGINT PRIMARY KEY,customer_id INTEGER NOT NULL)");
+      const rows = (
+        await pg.query<{ id: number; customer_id: number }>(
+          "SELECT id,customer_id FROM orders ORDER BY id",
+        )
+      ).rows;
+      await core.writeBatch("insertBatch", "orders", rows);
+      expect(core.prepare(sql).columns[0]?.type).toEqual({ kind: "int64" });
+      const expected = (await pg.query<{ id: number | bigint | string }>(sql)).rows.map((row) => ({
+        id: Number(row.id),
+      }));
+      expect(expected).toEqual([{ id: 10 }, { id: 11 }]);
+      const actual = await core.execute(sql);
+      if (!("batches" in actual)) throw new Error("query frames expected");
+      expect(executionRows(actual)).toEqual(expected);
+      expect(await oracleRows(current, sql)).toEqual(expected);
+    } finally {
+      await core.close();
+      await pg.close();
+      await current.close();
+    }
   });
 
   it("writes identically: UPDATE, DELETE, ON CONFLICT, INSERT … SELECT", async () => {

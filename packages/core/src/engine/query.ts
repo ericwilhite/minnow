@@ -12813,24 +12813,22 @@ class Parser {
       let end: WindowFrameBound;
       if (this.#isKeyword("BETWEEN")) {
         this.#keyword("BETWEEN");
-        start = this.#frameBound(unit);
+        start = this.#frameBound(unit, "starting");
         this.#keyword("AND");
-        end = this.#frameBound(unit);
+        end = this.#frameBound(unit, "ending");
       } else {
         // The single-bound shorthand: the bound is the frame start, the end is the current row.
-        start = this.#frameBound(unit);
+        start = this.#frameBound(unit, "starting");
         end = { kind: "current-row" };
       }
-      if (start.kind === "unbounded-following" || end.kind === "unbounded-preceding") {
-        throw new TypeError("Window frame bounds are reversed");
-      }
-      // SQL frame bounds are ordered by kind, even when the input is empty. Bounds of
-      // the same kind may still describe a legal empty frame (1 PRECEDING to 5 PRECEDING).
+      // Bound kinds are ordered even for an empty input; equal kinds can form an empty frame.
       if (
+        start.kind === "unbounded-following" ||
+        end.kind === "unbounded-preceding" ||
         (start.kind === "current-row" && end.kind === "preceding") ||
         (start.kind === "following" && (end.kind === "preceding" || end.kind === "current-row"))
       )
-        throw new TypeError("Window frame end cannot precede frame start");
+        throw new TypeError("Window frame bounds are reversed");
       if (unit === "groups" && orderBy.length === 0) {
         throw new TypeError("GROUPS frames require ORDER BY inside OVER (...)");
       }
@@ -12870,7 +12868,7 @@ class Parser {
     return { partitionBy, orderBy, ...(frame === undefined ? {} : { frame }) };
   }
 
-  #frameBound(unit: "rows" | "range" | "groups"): WindowFrameBound {
+  #frameBound(unit: "rows" | "range" | "groups", which: "starting" | "ending"): WindowFrameBound {
     if (this.#isKeyword("UNBOUNDED")) {
       this.#keyword("UNBOUNDED");
       if (this.#isKeyword("PRECEDING")) {
@@ -12885,37 +12883,22 @@ class Parser {
       this.#keyword("ROW");
       return { kind: "current-row" };
     }
-    if (!recordDeclaredTypes) {
-      const offset = Number(this.#take("number").text);
-      if (
-        !Number.isFinite(offset) ||
-        offset < 0 ||
-        (unit !== "range" && !Number.isInteger(offset))
-      ) {
-        throw new TypeError(
-          "Window frame offsets must be non-negative integers, or numeric RANGE offsets",
-        );
+    if (recordDeclaredTypes && (this.#peek().kind === "parameter" || this.#isKeyword("NULL"))) {
+      let metadata;
+      if (this.#peek().kind === "parameter")
+        metadata = { parameter: this.#parameterExpression().index };
+      else {
+        this.#keyword("NULL");
+        metadata = { nullOffset: true as const };
       }
-      if (this.#isKeyword("PRECEDING")) {
-        this.#keyword("PRECEDING");
-        return { kind: "preceding", offset };
-      }
-      this.#keyword("FOLLOWING");
-      return { kind: "following", offset };
-    }
-    if (this.#peek().kind === "parameter") {
-      const parameter = this.#parameterExpression().index;
       const kind = this.#isKeyword("PRECEDING") ? "preceding" : "following";
       this.#keyword(kind.toUpperCase());
-      return rememberFrameOffset<WindowFrame["start"]>({ kind, offset: 0 }, { parameter });
+      return rememberFrameOffset<WindowFrame["start"]>({ kind, offset: 0 }, metadata);
     }
-    // Offset values are checked when WindowAgg starts, not while parsing: LIMIT 0 and
-    // frame-independent ranking functions may never evaluate them.
+    // PostgreSQL's frame offset errors (22004, 22013). A negative RANGE offset is raised here,
+    // where PostgreSQL raises it when the first row compares (so not over no rows).
     if (this.#isKeyword("NULL")) {
-      this.#keyword("NULL");
-      const kind = this.#isKeyword("PRECEDING") ? "preceding" : "following";
-      this.#keyword(kind.toUpperCase());
-      return rememberFrameOffset<WindowFrame["start"]>({ kind, offset: 0 }, { nullOffset: true });
+      frameOffsetError(which, "null");
     }
     if (this.#isKeyword("INTERVAL") && unit === "rows")
       throw new TypeError("argument of ROWS must be type bigint, not type interval");
@@ -12935,6 +12918,7 @@ class Parser {
     const literal = this.#take("number").text;
     // Sign and zero come from the literal's digits, never from Number(): `-1e-400` is negative
     // (PostgreSQL's NUMERIC keeps it exactly) though Number() makes it -0.
+    const signed = negated ? "-" + literal : literal;
     const digits = frameOffsetDigits(literal);
     if (digits === null)
       throw new TypeError(
@@ -12948,13 +12932,16 @@ class Parser {
     // PostgreSQL types a decimal literal, or an integer outside int8, as numeric.
     let numeric = decimal;
     if (unit === "range") {
+      if (!recordDeclaredTypes && negated && !digits.zero) {
+        frameOffsetError(which);
+      }
       // RANGE keeps the value. One a double cannot hold (it would become 0 or Infinity) is
       // refused rather than changed.
-      offset = digits.zero ? 0 : Number(negated ? `-${literal}` : literal);
+      offset = digits.zero ? 0 : Number(signed);
       if (!digits.zero && (offset === 0 || !Number.isFinite(offset)))
         throw new TypeError("RANGE frame offsets outside double precision are not supported");
       if (!decimal) {
-        const value = BigInt(negated ? `-${literal}` : literal);
+        const value = BigInt(signed);
         if (value > 9007199254740991n || value < -9007199254740991n) exact = value;
         if (value > 9223372036854775807n || value < -9223372036854775808n) numeric = true;
       }
@@ -12967,13 +12954,16 @@ class Parser {
       const rounded = negated ? -magnitude : magnitude;
       if (rounded > 9223372036854775807n || rounded < -9223372036854775808n)
         throw new TypeError("bigint out of range");
+      if (!recordDeclaredTypes && rounded < 0n) {
+        frameOffsetError(which);
+      }
       offset = Number(rounded);
       if (rounded > 9007199254740991n || rounded < -9007199254740991n) exact = rounded;
     }
     const metadata =
       unit === "range" || numeric || exact !== undefined
         ? {
-            ...(unit === "range" ? { text: negated ? `-${literal}` : literal } : {}),
+            ...(unit === "range" ? { text: signed } : {}),
             ...(numeric ? { numeric: true as const } : {}),
             ...(exact === undefined ? {} : { exact }),
           }
@@ -15045,12 +15035,20 @@ function timestampLiteral(text: string): Date {
   return date;
 }
 
+function frameOffsetError(
+  which: "starting" | "ending",
+  reason: "null" | "negative" = "negative",
+): never {
+  throw new TypeError(`frame ${which} offset must not be ${reason}`);
+}
+
 /** The parser's OFFSET range contract, shared with the typed builder. */
 /**
  * A frame offset literal's significant digits and power of ten (value = digits × 10^exponent),
  * read from its text: `zero` when every mantissa digit is 0, whatever the exponent. Null when
  * the text is not a plain decimal literal.
  */
+
 function frameOffsetDigits(
   literal: string,
 ): { readonly digits: string; readonly exponent: number; readonly zero: boolean } | null {
@@ -15442,13 +15440,9 @@ function mergedWildcardColumns(
       return column === undefined
         ? []
         : [
-            {
-              ...column,
-              reference:
-                recordDeclaredTypes && block.joins.some((item) => item.full === true)
-                  ? name
-                  : column.reference,
-            },
+            recordDeclaredTypes && block.joins.some((item) => item.full === true)
+              ? { name, reference: name }
+              : column,
           ];
     });
     columns = [
@@ -15490,6 +15484,7 @@ export function mergeJoinColumns(
     block.joins.forEach((join, index) => {
       if (join.using === undefined && join.natural !== true) return;
       const names = joinMergedNames(sources, index + 1, columnsFor);
+      const conditions: Expression[] | null = nativeFull ? [] : null;
       const owners = names.map((name) => {
         const owner = sources
           .slice(0, index + 1)
@@ -15500,23 +15495,20 @@ export function mergeJoinColumns(
         if (columnsFor(join)?.includes(name) !== true) {
           throw new TypeError(`Join column ${name} is not a column of ${join.alias}`);
         }
-        if (!replacements.has(name)) {
-          replacements.set(name, { kind: "column", reference: `${owner.alias}.${name}` });
+        let left = replacements.get(name);
+        if (left === undefined) {
+          left = { kind: "column", reference: `${owner.alias}.${name}` };
+          replacements.set(name, left);
         }
-        return owner;
-      });
-      if (nativeFull) {
-        const conditions = names.map<Expression>((name, key) => {
-          const left: Expression = replacements.get(name) ?? {
-            kind: "column",
-            reference: `${owners[key]?.alias ?? block.base.alias}.${name}`,
-          };
+        if (conditions !== null) {
           const right: Expression = { kind: "column", reference: `${join.alias}.${name}` };
           if (join.full === true)
             replacements.set(name, { kind: "call", name: "COALESCE", arguments: [left, right] });
-          else replacements.set(name, left);
-          return { kind: "condition", operator: "=", left, right };
-        });
+          conditions.push({ kind: "condition", operator: "=", left, right });
+        }
+        return owner;
+      });
+      if (conditions !== null) {
         // These conditions use the merged left value at this join, before later FULL joins
         // extend it. The final replacement is only for the block's unqualified references.
         join.left = { kind: "literal", value: null };

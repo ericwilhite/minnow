@@ -757,7 +757,6 @@ export const WINDOW_FRAME_ORDER_REACH = [
   "allowed empty",
 ] as const;
 
-
 /** M3 joins through actual storage/execution and both independent SQL engines. */
 export const LOWER_M3_JOINS_REACH = [
   "keyless full",
@@ -797,7 +796,6 @@ export const LOWER_M3_JOINS_REACH = [
   "complete",
 ] as const;
 
-
 /** SQL windows run through durable storage and the actual executor, not a plan interpreter. */
 export const LOWER_M3_WINDOWS_REACH = [
   "min max",
@@ -825,7 +823,6 @@ export const LOWER_M3_WINDOWS_REACH = [
   "complete",
 ] as const;
 
-
 /** Exact key families, coefficients, non-finite RANGE and parser-owned offset precision. */
 export const LOWER_M3_TYPES_REACH = [
   "int64 RANGE",
@@ -851,7 +848,6 @@ export const LOWER_M3_TYPES_REACH = [
   "released",
 ] as const;
 
-
 /** Startup checks differ from RANGE's comparison-time sign check and optimized ranking. */
 export const LOWER_M3_OFFSETS_REACH = [
   "empty",
@@ -874,7 +870,6 @@ export const LOWER_M3_OFFSETS_REACH = [
   "LIMIT 0",
   "released",
 ] as const;
-
 
 /** Empty input and NULL-only keys do not invoke RANGE's sign-checking support function. */
 export const WINDOW_OFFSET_STARTUP_REACH = [

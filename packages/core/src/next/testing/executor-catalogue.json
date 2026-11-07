@@ -26751,8 +26751,7 @@
       "id": "S_q7",
       "dataset": "star",
       "sql": "WITH product_revenue AS (SELECT p.category AS category, i.product_id AS product_id, SUM(i.quantity * i.unit_price) AS revenue FROM order_items i JOIN products p ON p.product_id = i.product_id GROUP BY p.category, i.product_id), ranked AS (SELECT category, product_id, revenue, DENSE_RANK() OVER (PARTITION BY category ORDER BY ROUND(revenue, 4) DESC, product_id) AS rank FROM product_revenue) SELECT category, product_id, revenue, rank FROM ranked WHERE rank <= 3 ORDER BY category, rank",
-      "lowered": false,
-      "construct": "window"
+      "lowered": false
     },
     {
       "id": "S_q8",
@@ -26830,22 +26829,19 @@
       "id": "guide-3",
       "dataset": "retail",
       "sql": "SELECT r.return_id,\n       CAST(r.returned_at AS TEXT) AS returned,\n       r.returned_at - o.placed_at AS elapsed,\n       (CAST(r.returned_at AS DATE) - CAST(o.placed_at AS DATE)) / 7 AS weeks_to_return\nFROM returns r\nJOIN orders o ON o.order_id = r.order_id\nORDER BY r.return_id\nLIMIT 5",
-      "lowered": false,
-      "construct": "join"
+      "lowered": true
     },
     {
       "id": "guide-4",
       "dataset": "retail",
       "sql": "SELECT s.name AS store, COUNT(*) AS orders, ROUND(SUM(o.total), 2) AS revenue\nFROM stores s\nJOIN orders o ON o.store_id = s.store_id\nLEFT JOIN employees e ON e.employee_id = o.employee_id\nWHERE o.status = 'completed'\nGROUP BY s.store_id, s.name\nORDER BY revenue DESC",
-      "lowered": false,
-      "construct": "join"
+      "lowered": false
     },
     {
       "id": "guide-5",
       "dataset": "retail",
       "sql": "SELECT p.category,\n       COUNT(*) AS lines,\n       COUNT(DISTINCT i.order_id) AS baskets,\n       ROUND(SUM(i.line_total), 2) AS revenue,\n       ROUND(AVG(i.line_total), 2) AS average_line,\n       MIN(i.unit_price) AS cheapest,\n       MAX(i.unit_price) AS dearest\nFROM order_items i\nJOIN products p ON p.product_id = i.product_id\nGROUP BY p.category\nHAVING SUM(i.line_total) > 10000\nORDER BY revenue DESC",
-      "lowered": false,
-      "construct": "join"
+      "lowered": false
     },
     {
       "id": "guide-6",
@@ -26858,14 +26854,14 @@
       "dataset": "retail",
       "sql": "SELECT JSON_OBJECT(\n  'id' VALUE o.order_id,\n  'detail' VALUE JSON_OBJECT('status' VALUE o.status),\n  'items' VALUE JSON_ARRAYAGG(JSON_OBJECT('sku' VALUE p.sku))\n) AS document\nFROM orders o\nJOIN order_items i ON i.order_id = o.order_id\nJOIN products p ON p.product_id = i.product_id\nGROUP BY o.order_id, o.status",
       "lowered": false,
-      "construct": "join"
+      "construct": "function"
     },
     {
       "id": "guide-8",
       "dataset": "retail",
       "sql": "SELECT c.customer_id,\n  (SELECT COALESCE(json_agg(agg), '[]')\n   FROM (SELECT o.order_id, o.total FROM orders o WHERE o.customer_id = c.customer_id) agg\n  ) AS orders\nFROM customers c",
       "lowered": false,
-      "construct": "join"
+      "construct": "function"
     },
     {
       "id": "guide-9",
@@ -26879,7 +26875,7 @@
       "dataset": "retail",
       "sql": "SELECT p.category,\n       PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY i.line_total) AS median_line,\n       PERCENTILE_DISC(0.9) WITHIN GROUP (ORDER BY i.line_total) AS p90_line,\n       MODE() WITHIN GROUP (ORDER BY i.quantity) AS usual_quantity\nFROM order_items i\nJOIN products p ON p.product_id = i.product_id\nGROUP BY p.category\nORDER BY median_line DESC",
       "lowered": false,
-      "construct": "join"
+      "construct": "aggregate"
     },
     {
       "id": "guide-11",
@@ -26891,8 +26887,7 @@
       "id": "guide-12",
       "dataset": "retail",
       "sql": "SELECT item.sku, item.qty\nFROM JSON_TABLE(\n  '[{\"sku\":\"A-1\",\"qty\":2},{\"sku\":\"B-4\",\"qty\":1}]',\n  '$[*]' COLUMNS (sku TEXT PATH '$.sku', qty INTEGER PATH '$.qty')\n) AS item",
-      "lowered": false,
-      "construct": "setOperation"
+      "lowered": true
     },
     {
       "id": "guide-13",
@@ -26905,14 +26900,13 @@
       "dataset": "retail",
       "sql": "WITH RECURSIVE months(month) AS (\n  SELECT TIMESTAMP '2025-01-01'\n  UNION ALL\n  SELECT month + INTERVAL '1 month' FROM months WHERE month < TIMESTAMP '2025-12-01'\n)\nSELECT month FROM months",
       "lowered": false,
-      "construct": "recursive"
+      "construct": "function"
     },
     {
       "id": "guide-15",
       "dataset": "retail",
       "sql": "SELECT day, COUNT(o.order_id) AS orders,\n       EXTRACT(EPOCH FROM MAX(o.placed_at) - MIN(o.placed_at)) / 3600 AS busy_hours\nFROM generate_series(TIMESTAMP '2025-03-01', TIMESTAMP '2025-03-31', INTERVAL '1 day') AS day\nLEFT JOIN orders o ON DATE_TRUNC('day', o.placed_at) = day\nGROUP BY day\nORDER BY day",
-      "lowered": false,
-      "construct": "join"
+      "lowered": true
     },
     {
       "id": "guide-16",
@@ -26930,8 +26924,7 @@
       "id": "guide-18",
       "dataset": "retail",
       "sql": "SELECT customer_id FROM orders WHERE placed_at >= TIMESTAMP '2025-01-01'\nEXCEPT\nSELECT customer_id FROM orders WHERE placed_at >= TIMESTAMP '2025-07-01'",
-      "lowered": false,
-      "construct": "setOperation"
+      "lowered": true
     }
   ]
 }

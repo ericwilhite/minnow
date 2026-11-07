@@ -383,6 +383,102 @@ export const CATALOGUE_AUTHORITY_REFUSALS = {
 export const ROUND_OVERLOAD_AUTHORITY =
   "PostgreSQL 18 functions-math: round(double precision) and round(numeric, integer), no round(double precision, integer); R19 keeps the overload signatures exact. https://www.postgresql.org/docs/18/functions-math.html";
 
+/** Capability refusals are not successful executions or intended result divergences.
+ * R17.6 (next/errors.ts) owns UnsupportedPlanError's stage/construct; R19 and PG's
+ * overload table own the three 42883 PlanningErrors. The frozen SQL stays unchanged. */
+export type CatalogueRefusal =
+  | { readonly class: "PlanningError"; readonly sqlState: "42883" }
+  | {
+      readonly class: "UnsupportedPlanError";
+      readonly sqlState: "0A000";
+      readonly stage: "lower" | "execute";
+      readonly construct: string | null;
+    };
+export const CATALOGUE_REFUSALS: Readonly<Record<string, CatalogueRefusal>> = {
+  win_median_pct: {
+    class: "UnsupportedPlanError",
+    sqlState: "0A000",
+    stage: "lower",
+    construct: "aggregate",
+  },
+  "guide-10": {
+    class: "UnsupportedPlanError",
+    sqlState: "0A000",
+    stage: "lower",
+    construct: "aggregate",
+  },
+  "guide-7": {
+    class: "UnsupportedPlanError",
+    sqlState: "0A000",
+    stage: "lower",
+    construct: "function",
+  },
+  "guide-8": {
+    class: "UnsupportedPlanError",
+    sqlState: "0A000",
+    stage: "lower",
+    construct: "function",
+  },
+  "guide-9": {
+    class: "UnsupportedPlanError",
+    sqlState: "0A000",
+    stage: "lower",
+    construct: "function",
+  },
+  "guide-14": {
+    class: "UnsupportedPlanError",
+    sqlState: "0A000",
+    stage: "lower",
+    construct: "function",
+  },
+  "guide-3": {
+    class: "UnsupportedPlanError",
+    sqlState: "0A000",
+    stage: "execute",
+    construct: "cast",
+  },
+  S_q2: { class: "UnsupportedPlanError", sqlState: "0A000", stage: "execute", construct: "cast" },
+  "guide-13": {
+    class: "UnsupportedPlanError",
+    sqlState: "0A000",
+    stage: "execute",
+    construct: "function",
+  },
+  "guide-17": {
+    class: "UnsupportedPlanError",
+    sqlState: "0A000",
+    stage: "execute",
+    construct: "function",
+  },
+  S_q8: {
+    class: "UnsupportedPlanError",
+    sqlState: "0A000",
+    stage: "execute",
+    construct: "function",
+  },
+  "guide-12": {
+    class: "UnsupportedPlanError",
+    sqlState: "0A000",
+    stage: "execute",
+    construct: "setOp",
+  },
+  "guide-18": {
+    class: "UnsupportedPlanError",
+    sqlState: "0A000",
+    stage: "execute",
+    construct: "setOp",
+  },
+  "guide-15": {
+    class: "UnsupportedPlanError",
+    sqlState: "0A000",
+    stage: "execute",
+    construct: "recursive",
+  },
+  "guide-4": { class: "PlanningError", sqlState: "42883" },
+  "guide-5": { class: "PlanningError", sqlState: "42883" },
+  S_q7: { class: "PlanningError", sqlState: "42883" },
+};
+
 /** R21: witnesses for four frozen catalogue cells. The new executor is still compared exactly
  * with the original PostgreSQL SQL. The legacy engine is compared exactly with these independent
  * PG answers, with no epsilon, rounding, or changed next-core expectation.

@@ -6,10 +6,13 @@ import { MinnowDatabase } from "../../engine/database.js";
 import { MemoryBlockStore } from "../../storage/index.js";
 import { encodeValue } from "../../testing/differential-harness.js";
 import { UnsupportedPlanError } from "../errors.js";
+import { PlanningError } from "../lower/errors.js";
 import { oracleRows } from "./differential-adapter.js";
 import { StorageCore } from "./storage-core.js";
 import {
   CATALOGUE_AUTHORITY_REFUSALS,
+  CATALOGUE_REFUSALS,
+  type CatalogueRefusal,
   CATALOGUE_CURRENT_AUTHORITY,
   queryAuthorityValue,
 } from "./divergences.js";
@@ -50,7 +53,7 @@ for (const dataset of ["wide", "retail", "star"])
       autoCollect: false,
     });
     const compiled: string[] = [],
-      refused: string[] = [];
+      refused: Array<{ id: string } & CatalogueRefusal> = [];
     try {
       for (const table of FIXTURE.datasets[dataset] ?? []) {
         await core.execute(table.ddl);
@@ -95,29 +98,43 @@ for (const dataset of ["wide", "retail", "star"])
           ).rows,
         ).toEqual([{ type: "numeric" }]);
       for (const query of FIXTURE.queries.filter((query) => query.dataset === dataset)) {
-        if (query.id in CATALOGUE_AUTHORITY_REFUSALS) {
-          await expect(pg.query(query.sql), query.id).rejects.toMatchObject({ code: "42883" });
-          expect(() => core.prepare(query.sql), query.id).toThrow(
-            expect.objectContaining({ sqlState: "42883" }),
+        const expectedRefusal = CATALOGUE_REFUSALS[query.id];
+        let prepared: ReturnType<StorageCore["prepare"]>;
+        let result: Awaited<ReturnType<StorageCore["execute"]>>;
+        try {
+          prepared = core.prepare(query.sql);
+          result = await core.execute(query.sql);
+        } catch (error) {
+          let actual: CatalogueRefusal;
+          if (error instanceof PlanningError) {
+            expect(error.constructor).toBe(PlanningError);
+            expect(error.sqlState, query.id).toBe("42883");
+            actual = { class: "PlanningError", sqlState: "42883" };
+          } else if (error instanceof UnsupportedPlanError) {
+            expect(error.constructor).toBe(UnsupportedPlanError);
+            actual = {
+              class: "UnsupportedPlanError",
+              sqlState: error.sqlState,
+              stage: error.stage,
+              construct: error.construct,
+            };
+          } else throw error;
+          expect(actual, query.id).toEqual(expectedRefusal);
+          expect(query.lowered, query.id).toBe(
+            actual.class === "UnsupportedPlanError" && actual.stage === "execute",
           );
-          expect((await current.query(query.sql)).rows).toBeDefined();
-          refused.push(`${query.id}: PG/R19 42883, current accepts`);
+          if (query.id in CATALOGUE_AUTHORITY_REFUSALS) {
+            await expect(pg.query(query.sql), query.id).rejects.toMatchObject({ code: "42883" });
+            expect((await current.query(query.sql)).rows).toBeDefined();
+          }
+          refused.push({ id: query.id, ...actual });
           continue;
         }
-        if (!query.lowered) {
-          expect(() => core.prepare(query.sql), query.id).toThrow(UnsupportedPlanError);
-          refused.push(query.id);
-          continue;
-        }
-        if (["S_q2", "S_q8", "guide-13", "guide-17"].includes(query.id)) {
-          // R19: text -> DATE and date_trunc timestamp bindings remain unfinished kernels,
-          // reported as unsupported, not an R21 intended semantic divergence or a passing query.
-          expect(() => core.prepare(query.sql), query.id).toThrow(UnsupportedPlanError);
-          refused.push(query.id);
-          continue;
-        }
-        const prepared = core.prepare(query.sql);
-        const result = await core.execute(query.sql);
+        expect(
+          expectedRefusal,
+          query.id + " unexpectedly executed a recorded refusal",
+        ).toBeUndefined();
+        expect(query.lowered, query.id).toBe(true);
         if (!("batches" in result)) throw new Error("catalogue SELECT did not return frames");
         const expected = await pg.query<Record<string, unknown>>(query.sql);
         const pgRows = expected.rows.map((row) =>
@@ -159,14 +176,18 @@ for (const dataset of ["wide", "retail", "star"])
         ).toEqual(canonical(legacyExpected));
         compiled.push(query.id);
       }
-      expect(compiled.length).toBe(
-        FIXTURE.queries.filter(
-          (query) =>
-            query.dataset === dataset &&
-            query.lowered &&
-            !["S_q2", "S_q8", "guide-13", "guide-17"].includes(query.id),
-        ).length,
+      const cells = FIXTURE.queries.filter((query) => query.dataset === dataset);
+      expect(compiled).toEqual(
+        cells
+          .filter((query) => CATALOGUE_REFUSALS[query.id] === undefined)
+          .map((query) => query.id),
       );
+      expect(refused.map((cell) => cell.id)).toEqual(
+        cells
+          .filter((query) => CATALOGUE_REFUSALS[query.id] !== undefined)
+          .map((query) => query.id),
+      );
+      expect(compiled.length + refused.length).toBe(cells.length);
       console.info(
         JSON.stringify({
           lane: "Node correctness",

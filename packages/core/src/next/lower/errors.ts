@@ -107,6 +107,8 @@ export const FRONT_END_STATES: ReadonlyArray<readonly [RegExp, string]> = [
   [/^frame (starting|ending) offset must not be null$/u, "22004"],
   [/^bigint out of range$/u, "22003"],
   [/^Offset RANGE frames require exactly one ORDER BY expression$/u, "42P20"],
+  [/^Window frame (bounds are reversed|end cannot precede frame start)$/u, "42P20"],
+  [/^GROUPS frames require ORDER BY inside/u, "42P20"],
   [/^Ambiguous or missing column: /u, "42702"],
   [
     /not supported|is only supported|are supported only|supports? only|cannot (use|contain|select)|^Unsupported /u,
